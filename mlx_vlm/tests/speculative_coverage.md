@@ -1,6 +1,10 @@
 # Speculative suite coverage
 
-## Shared JSON config factory
+The later model/training compaction is documented in [README.md](README.md).
+It saves another 503 Python lines, leaves this speculative suite unchanged, and
+retains the same full-suite production execution sets shown below.
+
+## Shared JSON config factory (`9d469e0f`)
 
 Against `c4f513c3`, replace the Qwen, GLM and DeepSeek config wrappers and Python
 factory lookup with `test_models.tiny_config`. Module/config-class metadata,

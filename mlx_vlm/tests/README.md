@@ -68,31 +68,56 @@ Full suite: **1,762 passed, four skipped, 39 passing subtests**. Compared with
 remain covered, with two added lines (Laguna's real chat-template property and
 Muse's public cleanup method). Coverage excludes tests, native kernels, skipped
 optional checks and subprocess execution. Black, isort, autoflake, pyflakes and
-whitespace checks pass. Current suite size is **23,111 Python + 3,099 JSON =
-26,210 lines**, across 27 test modules.
+whitespace checks pass. Current suite size is **22,608 Python + 3,099 JSON =
+25,707 lines**, across 27 test modules.
 
-`test_speculative.py` contains **1,635 formatted lines**, including its own
-model/drafter construction, native checkpoint setup and transaction doubles.
-`test_models.py` is **662 lines** and exposes `build_config` plus one shared
-`tiny_config(family, profile=None, **overrides)` factory. Qwen, GLM and DeepSeek
-module names, config classes and named language/inference profiles live under
-`shared_configs` in `model_cases.json`; `tiny_defaults` supplies common values.
-Each call constructs a fresh config, with explicit overrides applied last.
-Training and checkpoint tests use the base profile. The speculative `language`
-constructor retains Qwen's outer-config adapter. No separate fixture files or
-production changes are introduced.
+The model/training Python refactor against `9d469e0f` saves **503 formatted lines**
+without adding JSON, moving code to another module or changing production:
 
-Against `c4f513c3`, this saves **20 Python lines**, offset by **16 additional JSON
-lines**, for **four fewer combined lines** (5,338 → 5,334 across the four affected
-source/config files). This is a small size reduction; the main benefit is removing
-three model-specific config factories and the Python factory lookup table.
-Config values, model parameter shapes, cache types, mutable-config isolation,
-test assertions and parametrization remain verified. All **395 speculative
-cases** pass; the full suite passes **1,762 tests, four skips and 39 subtests**.
-Both isolated and full-suite production execution sets are identical before and
-after: **15,723 / 80,999 lines** and **2,457 / 12,836 branch outcomes**, respectively,
-with zero lost or added paths. See [speculative_coverage.md](speculative_coverage.md)
-for size accounting and the earlier intentional pruning.
+| File | Before | After | Saved |
+| --- | ---: | ---: | ---: |
+| `test_models.py` | 662 | 452 | 210 |
+| `test_trainer.py` | 716 | 423 | 293 |
+| **Combined Python** | **1,378** | **875** | **503** |
+
+Model checks use plain pytest assertions and methods named after the JSON checks,
+removing the duplicate method-name mapping. One position recorder handles chunked
+prefill, cache-index lookup and request-owned RoPE deltas. Shared component setup
+retains the same language/vision dtypes, projector dimensions, audio masks and
+shape assertions. All 45 cached-image model paths remain in the same order;
+repeated package/file names are derived from the explicit model inventory.
+
+Training shares dataset setup, batch collation, optimizer/save cases, adapter
+construction and native/legacy adapter-loading contracts. Constructor assertions
+run in the dataset fixture. Eight rotary gradient scenarios now collect as named
+pytest cases using a shared native-versus-pure-MLX comparison, retaining both
+input gradients, deterministic tensors, finite checks and 1e-4 tolerances. Gated
+delta and MoE gradient/expert-replacement checks remain. The trainer changes from
+22 tests plus eight subtests to **27 tests**: two rotary tests become eight cases,
+and the standalone constructor case moves into the shared fixture.
+
+Focused model/training/speculative validation passes **535 tests**. The full suite
+passes **1,767 tests, four existing skips and 31 subtests**, versus 1,762 tests,
+four skips and 39 subtests before. Exact production execution sets are identical:
+
+| Scope | Executed lines before/after | Branch outcomes before/after | Lost / added |
+| --- | ---: | ---: | ---: |
+| Model + training + speculative suites | 39,639 | 4,343 | 0 / 0 |
+| Full default suite | 80,999 | 12,836 | 0 / 0 |
+
+Black, isort, autoflake, pyflakes, Python 3.10 syntax parsing and whitespace checks
+pass. These offline Python coverage measurements exclude tests, native kernels,
+subprocess execution and optional skipped checks; earlier pruning remains.
+
+`test_speculative.py` remains **1,635 lines** and owns its model/drafter,
+checkpoint and transaction setup. `test_models.py` exposes `build_config` and
+`tiny_config(family, profile=None, **overrides)` for fresh JSON-backed configs.
+Module names, config classes and named profiles live under `shared_configs` in
+`model_cases.json`; `tiny_defaults` supplies common values. Training/checkpoint
+settings stay distinct from language/inference variants, and explicit overrides
+apply last. The preceding factory-only refactor saved four combined Python/JSON
+lines; see [speculative_coverage.md](speculative_coverage.md) for that measurement
+and earlier speculative pruning.
 
 `test_cli.py` contains **498 formatted lines**, down from 938 at `9383ef6c`
 (440 lines / 46.9% fewer), with **37 collected cases** before and after.

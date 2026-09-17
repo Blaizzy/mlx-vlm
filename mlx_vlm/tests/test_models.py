@@ -7,9 +7,9 @@ import importlib
 import inspect
 import json
 import math
-import unittest
 from operator import attrgetter
 from pathlib import Path
+from types import SimpleNamespace as NS
 
 import mlx.core as mx
 import pytest
@@ -18,10 +18,29 @@ from mlx.utils import tree_map
 from mlx_vlm.models.base import InputEmbeddingsFeatures
 
 
-class ModelChecks(unittest.TestCase):
+def capture_positions(
+    language_model, hidden_size, inputs, *, idx, offset, fa_idx=None, **kwargs
+):
+    class Recorder:
+        embed_tokens = NS(as_linear=lambda x: x)
+
+        def __call__(self, inputs, position_ids=None, **kwargs):
+            self.positions = position_ids
+            return mx.zeros((*inputs.shape, hidden_size))
+
+    recorder = Recorder()
+    if fa_idx is not None:
+        recorder.fa_idx = fa_idx
+    language_model.model = recorder
+    language_model.lm_head = lambda x: x
+    language_model(inputs, cache=[NS(_idx=idx, offset=mx.array(offset))], **kwargs)
+    return recorder.positions
+
+
+class ModelChecks:
     """Reusable assertions; each JSON case constructs fresh configs and models."""
 
-    def forward_cache_test_runner(self, model, vocab_size):
+    def forward_cache(self, model, vocab_size):
         model.eval()
         mx.eval(model.parameters())
         ids = mx.array([[1, 5, 9, 13, 2, 7, 11, 3]])
@@ -30,220 +49,132 @@ class ModelChecks(unittest.TestCase):
         model(ids[:, :-1], cache=cache)
         assert model(ids[:, -1:], cache=cache).logits.shape == (1, 1, vocab_size)
 
-    def _check_returns_input_embeddings_features(self, model, model_name):
-        """Helper to test get_input_embeddings returns InputEmbeddingsFeatures."""
+    def input_embeddings(self, model, model_name):
+        result = model.get_input_embeddings(input_ids=mx.array([[1, 2, 3, 4, 5]]))
+        assert isinstance(result, InputEmbeddingsFeatures), model_name
+        assert result.inputs_embeds is not None
 
-        input_ids = mx.array([[1, 2, 3, 4, 5]])
-        result = model.get_input_embeddings(input_ids=input_ids)
-        self.assertIsInstance(
-            result,
-            InputEmbeddingsFeatures,
-            f"{model_name}: expected InputEmbeddingsFeatures, got {type(result).__name__}",
+    def request_positions(self, model):
+        language = model.language_model
+        positions, deltas = mx.array([[[9, 9, 9]]], mx.int32), mx.array(
+            [[99]], mx.int32
         )
-        self.assertIsNotNone(result.inputs_embeds)
+        language._position_ids, language._rope_deltas = positions, deltas
+        result = model.get_input_embeddings(input_ids=mx.array([[1, 2, 3]], mx.int32))
+        assert result.position_ids is not None and result.rope_deltas is not None
+        assert result.position_ids.shape == (1, 3)
+        assert result.position_ids.tolist() == [[0, 1, 2]]
+        assert result.rope_deltas.tolist() == [[0]]
+        assert mx.array_equal(language._position_ids, positions).item()
+        assert mx.array_equal(language._rope_deltas, deltas).item()
 
-    def _assert_qwen_request_owned_mrope_kwargs(self, model):
-        stale_position_ids = mx.array([[[9, 9, 9]]], dtype=mx.int32)
-        stale_rope_deltas = mx.array([[99]], dtype=mx.int32)
-        model.language_model._position_ids = stale_position_ids
-        model.language_model._rope_deltas = stale_rope_deltas
-
-        result = model.get_input_embeddings(
-            input_ids=mx.array([[1, 2, 3]], dtype=mx.int32)
-        )
-
-        self.assertIsNotNone(result.position_ids)
-        self.assertIsNotNone(result.rope_deltas)
-        self.assertEqual(result.position_ids.shape, (1, 3))
-        self.assertEqual(result.position_ids.tolist(), [[0, 1, 2]])
-        self.assertEqual(result.rope_deltas.tolist(), [[0]])
-        self.assertTrue(
-            mx.array_equal(
-                model.language_model._position_ids, stale_position_ids
-            ).item()
-        )
-        self.assertTrue(
-            mx.array_equal(model.language_model._rope_deltas, stale_rope_deltas).item()
-        )
-
-    def _assert_qwen_chunked_prefill_slices_mrope_position_ids(self, model):
-        language_model = model.language_model
-        hidden_size = language_model.args.hidden_size
-        captured = {}
-
-        class _CapturingModel:
-            fa_idx = 0
-
-            class _Embed:
-                @staticmethod
-                def as_linear(x):
-                    return x
-
-            embed_tokens = _Embed()
-
-            def __call__(self, inputs, position_ids=None, **kwargs):
-                captured["position_ids"] = position_ids
-                return mx.zeros((inputs.shape[0], inputs.shape[1], hidden_size))
-
-        class _StubCache:
-            _idx = 2
-            offset = mx.array(2)
-
-        language_model.model = _CapturingModel()
-        language_model.lm_head = lambda x: x
-
-        full_position_ids = mx.arange(15, dtype=mx.int32).reshape(3, 1, 5)
-        language_model(
+    def chunked_positions(self, model):
+        language = model.language_model
+        width = language.args.hidden_size
+        positions = mx.arange(15, dtype=mx.int32).reshape(3, 1, 5)
+        actual = capture_positions(
+            language,
+            width,
             mx.array([[7, 8]], dtype=mx.int32),
-            inputs_embeds=mx.zeros((1, 2, hidden_size), dtype=mx.float32),
-            cache=[_StubCache()],
-            position_ids=full_position_ids,
+            idx=2,
+            offset=2,
+            fa_idx=0,
+            inputs_embeds=mx.zeros((1, 2, width), dtype=mx.float32),
+            position_ids=positions,
         )
+        assert actual.shape == (3, 1, 2)
+        assert actual.tolist() == positions[:, :, 2:4].tolist()
 
-        self.assertEqual(captured["position_ids"].shape, (3, 1, 2))
-        self.assertEqual(
-            captured["position_ids"].tolist(), full_position_ids[:, :, 2:4].tolist()
-        )
-
-    def language_test_runner(self, model, config, *, num_layers=None):
-        model_type = config.model_type
-        vocab_size = config.vocab_size
+    def language(self, model, config, *, num_layers=None):
         if num_layers is None:
             num_layers = config.num_hidden_layers
-        self.assertEqual(model.model_type, model_type)
-        self.assertEqual(len(model.layers), num_layers)
+        assert model.model_type == config.model_type
+        assert len(model.layers) == num_layers
+        for dtype in (mx.float32, mx.float16):
+            model.update(tree_map(lambda p: p.astype(dtype), model.parameters()))
+            logits = model(mx.array([[0, 1]])).logits
+            assert logits.shape == (1, 2, config.vocab_size) and logits.dtype == dtype
+            logits = model(
+                mx.argmax(logits[0, -1:, :], keepdims=True), cache=None
+            ).logits
+            assert logits.shape == (1, 1, config.vocab_size) and logits.dtype == dtype
 
-        batch_size = 1
-
-        for t in [mx.float32, mx.float16]:
-            model.update(tree_map(lambda p: p.astype(t), model.parameters()))
-
-            inputs = mx.array([[0, 1]])
-            outputs = model(inputs)
-            logits = outputs.logits
-            self.assertEqual(logits.shape, (batch_size, 2, vocab_size))
-            self.assertEqual(logits.dtype, t)
-
-            outputs = model(mx.argmax(logits[0, -1:, :], keepdims=True), cache=None)
-            logits = outputs.logits
-            self.assertEqual(logits.shape, (batch_size, 1, vocab_size))
-            self.assertEqual(logits.dtype, t)
-
-    def mm_projector_test_runner(
-        self,
-        mm_projector,
-        vision_hidden_size,
-        text_hidden_size,
-        *,
-        grid_hw=None,
-        downsample_ratio=1,
+    def projector(
+        self, model, input_width, output_width, *, grid_hw=None, downsample_ratio=1
     ):
-        batch_size = math.prod(grid_hw) if grid_hw else 1
-        output_tokens = (
+        batch = math.prod(grid_hw) if grid_hw else 1
+        tokens = (
             math.prod(math.ceil(n / downsample_ratio) for n in grid_hw)
             if grid_hw
             else 1
         )
         kwargs = dict(zip(("n_h", "n_w"), grid_hw)) if grid_hw else {}
+        for dtype in (mx.float32, mx.float16):
+            model.update(tree_map(lambda p: p.astype(dtype), model.parameters()))
+            inputs = mx.random.uniform(shape=(batch, input_width), dtype=dtype)
+            output = model(mx.array(inputs), **kwargs)
+            assert output.shape == (tokens, output_width) and output.dtype == dtype
 
-        for t in [mx.float32, mx.float16]:
-            mm_projector.update(
-                tree_map(lambda p: p.astype(t), mm_projector.parameters())
-            )
-
-            vision_features = mx.random.uniform(
-                shape=(batch_size, vision_hidden_size), dtype=t
-            )
-            input_tensor = mx.array(vision_features)
-
-            outputs = mm_projector(input_tensor, **kwargs)
-            self.assertEqual(outputs.shape, (output_tokens, text_hidden_size))
-            self.assertEqual(outputs.dtype, t)
-
-    def vision_test_runner(
+    def vision(
         self,
-        vision_tower,
+        model,
         model_type,
-        vision_hidden_size,
-        num_channels,
-        image_size: tuple,
+        width,
+        channels,
+        image_size,
         vision_feature_layer=-2,
         channel_first=False,
         **kwargs,
     ):
         if model_type == "llama4_vision_model":
-            vision_hidden_size = kwargs.pop("projector_output_dim", vision_hidden_size)
-        batch_size = kwargs.pop("batch_size", 1)
-
-        for t in [mx.float32, mx.float16]:
-            vision_tower.update(
-                tree_map(lambda p: p.astype(t), vision_tower.parameters())
+            width = kwargs.pop("projector_output_dim", width)
+        batch = kwargs.pop("batch_size", 1)
+        flat = (
+            "qwen2_5_vl qwen3_5 qwen3_5_moe qwen4_exp "
+            "glm4v_moe glm4v hunyuan_vl siglip2_vision_model"
+        ).split()
+        shape = (
+            image_size
+            if len(image_size) > 2 or model_type in flat
+            else (
+                (batch, channels, *image_size)
+                if channel_first
+                else (batch, *image_size, channels)
             )
+        )
+        parameters = inspect.signature(model.__call__).parameters
+        for dtype in (mx.float32, mx.float16):
+            model.update(tree_map(lambda p: p.astype(dtype), model.parameters()))
             if model_type is not None:
-                self.assertEqual(vision_tower.model_type, model_type)
-
-            if len(image_size) > 2:
-                input_tensor = mx.random.uniform(shape=image_size)
-            elif model_type in [
-                "qwen2_5_vl",
-                "qwen3_5",
-                "qwen3_5_moe",
-                "qwen4_exp",
-                "glm4v_moe",
-                "glm4v",
-                "hunyuan_vl",
-                "siglip2_vision_model",
-            ]:
-                input_tensor = mx.random.uniform(shape=(image_size[0], image_size[1]))
-            else:
-                shape = (
-                    (batch_size, num_channels, image_size[0], image_size[1])
-                    if channel_first
-                    else (batch_size, image_size[0], image_size[1], num_channels)
-                )
-                input_tensor = mx.random.uniform(shape=shape)
-
-            if "image_masks" in inspect.signature(vision_tower.__call__).parameters:
-                input_tensor = input_tensor.transpose(0, 3, 1, 2)
-                image_masks = mx.ones((batch_size, num_channels, image_size[0]))
-                kwargs["image_masks"] = image_masks
-
-            input_tensor = input_tensor.astype(t)
-
-            if (
-                "output_hidden_states"
-                in inspect.signature(vision_tower.__call__).parameters
-            ):
-                hidden_states = vision_tower(
-                    input_tensor, output_hidden_states=True, **kwargs
-                )
-            else:
-                hidden_states = vision_tower(input_tensor, **kwargs)
-
+                assert model.model_type == model_type
+            inputs = mx.random.uniform(shape=shape)
+            if "image_masks" in parameters:
+                inputs = inputs.transpose(0, 3, 1, 2)
+                kwargs["image_masks"] = mx.ones((batch, channels, image_size[0]))
+            options = (
+                {"output_hidden_states": True}
+                if "output_hidden_states" in parameters
+                else {}
+            )
+            hidden = model(inputs.astype(dtype), **options, **kwargs)
             if vision_feature_layer is not None:
-                hidden_states = hidden_states[vision_feature_layer]
-
-            # Check vision hidden feature layer's shape matches the expected hidden size
-            if channel_first:
-                self.assertEqual(hidden_states.shape[1], vision_hidden_size)
-            else:
-                self.assertEqual(hidden_states.shape[-1], vision_hidden_size)
-
-            self.assertEqual(hidden_states.dtype, t)
+                hidden = hidden[vision_feature_layer]
+            assert hidden.shape[1 if channel_first else -1] == width
+            assert hidden.dtype == dtype
 
     def _assert_audio_features(self, features, shape, dtype):
         mx.eval(features)
-        self.assertEqual(features.shape, shape)
-        self.assertEqual(features.dtype, dtype)
-        self.assertTrue(mx.all(mx.isfinite(features)).item())
+        assert features.shape == shape
+        assert features.dtype == dtype
+        assert mx.all(mx.isfinite(features)).item()
 
-    def audio_test_runner(self, model, config, model_name, *, frames=32, lengths=None):
+    def audio(self, model, config, model_name, *, frames=32, lengths=None):
         if model_name not in {"inkling", "gemma3n", "gemma4", "gemma4_unified"}:
             raise ValueError(f"Unsupported audio model: {model_name}")
         audio_config = config.audio_config
         text_width = config.text_config.hidden_size
         lengths = [frames, frames // 2] if lengths is None else lengths
-        self.assertTrue(lengths and all(0 <= n <= frames for n in lengths))
+        assert lengths and all((0 <= n <= frames for n in lengths))
         batch = len(lengths)
         valid_mask = mx.arange(frames)[None, :] < mx.array(lengths)[:, None]
         components = [
@@ -297,12 +228,10 @@ class ModelChecks(unittest.TestCase):
                 self._assert_audio_features(
                     encoded, (batch, steps, width), output_dtype
                 )
-                self.assertEqual(mask.shape, (batch, steps))
-                self.assertEqual(mask.dtype, mx.bool_)
-                self.assertTrue(mx.array_equal(mask, ~valid_mask[:, ::stride]).item())
-                self.assertTrue(
-                    mx.all(mx.where(mask[..., None], encoded == 0, True)).item()
-                )
+                assert mask.shape == (batch, steps)
+                assert mask.dtype == mx.bool_
+                assert mx.array_equal(mask, ~valid_mask[:, ::stride]).item()
+                assert mx.all(mx.where(mask[..., None], encoded == 0, True)).item()
                 features = (
                     model.embed_audio(inputs_embeds=encoded)
                     if is_gemma3n
@@ -311,126 +240,35 @@ class ModelChecks(unittest.TestCase):
                 shape = (batch, steps, text_width)
             self._assert_audio_features(features, shape, output_dtype)
 
-    def _assert_mrope_decode_uses_cache_idx(self, language_model, hidden_size):
-        """Shared assertion: MRoPE decode-step reads RoPE position from
-        ``cache[0]._idx`` (Python int) rather than ``cache[0].offset.item()``
-        — the latter forces a per-step GPU sync. Regression guard for the
-        cache._idx refactor in PR #1055.
-        """
-        # Skip the prefill branch: pretend deltas have already been computed.
+    def mrope_cache_index(self, language_model, hidden_size):
+        """Use the Python cache index (10), avoiding a GPU sync on offset (3)."""
         language_model._rope_deltas = mx.array([[0]])
         language_model._position_ids = None
+        positions = capture_positions(
+            language_model, hidden_size, mx.array([[5]]), idx=10, offset=3
+        )
+        assert positions is not None
+        assert tuple(positions.shape) in {(1, 1), (3, 1, 1)}
+        assert positions.reshape(-1)[0].item() == 10
 
-        captured = {}
-
-        class _CapturingModel:
-            """Stand-in for the inner Qwen text model — captures position_ids
-            and exposes ``embed_tokens.as_linear`` so the tied-weights branch
-            in ``LanguageModel.__call__`` doesn't crash.
-            """
-
-            class _Embed:
-                @staticmethod
-                def as_linear(x):
-                    return x
-
-            embed_tokens = _Embed()
-
-            def __call__(self, inputs, position_ids=None, **kwargs):
-                captured["position_ids"] = position_ids
-                return mx.zeros((inputs.shape[0], inputs.shape[1], hidden_size))
-
-        language_model.model = _CapturingModel()
-        language_model.lm_head = lambda x: x  # bypass the real linear (untied path)
-
-        class _StubCacheWithIdx:
-            """``_idx`` (Python int) deliberately differs from ``offset``. If
-            extraction reads ``offset.item()`` the captured position is 3;
-            reading ``_idx`` gives 10. ``offset`` is 0-d so the per-sequence
-            ``cache_offsets`` / ``cache_offset_array`` branch is skipped
-            uniformly across qwen2_vl, qwen2_5_vl, and qwen3_vl.
-            """
-
-            def __init__(self):
-                self._idx = 10
-                self.offset = mx.array(3)  # 0-d -> never the per-seq path
-
-        language_model(mx.array([[5]]), cache=[_StubCacheWithIdx()])
-
-        position_ids = captured["position_ids"]
-        self.assertIsNotNone(position_ids)
-        self.assertIn(tuple(position_ids.shape), {(1, 1), (3, 1, 1)})
-        # Decode position == cache._idx (10), not cache.offset[0].item() (3).
-        if position_ids.ndim == 3:
-            self.assertEqual(position_ids[0, 0, 0].item(), 10)
-        else:
-            self.assertEqual(position_ids[0, 0].item(), 10)
-
-    def _assert_mrope_decode_uses_rope_deltas_kwarg(self, language_model, hidden_size):
-        """Shared assertion: under continuous batching, an explicit
-        ``rope_deltas`` kwarg passed by ``GenerationBatch._step()`` must
-        override the mutable ``language_model._rope_deltas`` attribute. The
-        latter can be clobbered mid-decode when a newer request's prefill
-        runs ``get_input_embeddings`` on the same GPU thread.
-        """
-        # Stale per-model state — simulates a newer request having just
-        # prefilled and overwritten ``_rope_deltas``.
+    def mrope_deltas(self, language_model, hidden_size):
+        """The request's delta (5) must override stale model state (99)."""
         language_model._rope_deltas = mx.array([[99]])
         language_model._position_ids = None
-
-        captured = {}
-
-        class _CapturingModel:
-            class _Embed:
-                @staticmethod
-                def as_linear(x):
-                    return x
-
-            embed_tokens = _Embed()
-            # ``fa_idx`` lets the qwen3_5 / qwen3_5_moe cache-indexing path
-            # (``cache[self.model.fa_idx]``) resolve to the stub cache below.
-            fa_idx = 0
-
-            def __call__(self, inputs, position_ids=None, **kwargs):
-                captured["position_ids"] = position_ids
-                return mx.zeros((inputs.shape[0], inputs.shape[1], hidden_size))
-
-        language_model.model = _CapturingModel()
-        language_model.lm_head = lambda x: x
-
-        class _StubCacheWithIdx:
-            def __init__(self):
-                self._idx = 10
-                self.offset = mx.array(3)  # 0-d -> scalar decode branch
-
-        # Caller-supplied kwarg (the row-local delta from ``GenerationBatch``)
-        # disagrees with the stale ``_rope_deltas`` (99). Position must
-        # follow the kwarg.
-        kwarg_delta = mx.array([[5]])
-        language_model(
-            mx.array([[7]]), cache=[_StubCacheWithIdx()], rope_deltas=kwarg_delta
+        positions = capture_positions(
+            language_model,
+            hidden_size,
+            mx.array([[7]]),
+            idx=10,
+            offset=3,
+            fa_idx=0,
+            rope_deltas=mx.array([[5]]),
         )
-
-        position_ids = captured["position_ids"]
-        self.assertIsNotNone(position_ids)
-        self.assertEqual(tuple(position_ids.shape), (3, 1, 1))
-        # Position == cache._idx (10) + kwarg delta (5) == 15.
-        # Pre-fix behavior would have read self._rope_deltas (99) -> 109.
-        self.assertEqual(position_ids[0, 0, 0].item(), 15)
+        assert positions is not None
+        assert tuple(positions.shape) == (3, 1, 1)
+        assert positions[0, 0, 0].item() == 15
 
 
-CHECKS = {
-    "forward_cache": "forward_cache_test_runner",
-    "language": "language_test_runner",
-    "projector": "mm_projector_test_runner",
-    "vision": "vision_test_runner",
-    "audio": "audio_test_runner",
-    "input_embeddings": "_check_returns_input_embeddings_features",
-    "mrope_cache_index": "_assert_mrope_decode_uses_cache_idx",
-    "mrope_deltas": "_assert_mrope_decode_uses_rope_deltas_kwarg",
-    "request_positions": "_assert_qwen_request_owned_mrope_kwargs",
-    "chunked_positions": "_assert_qwen_chunked_prefill_slices_mrope_position_ids",
-}
 CONFIG_TYPES = {
     "text_config": "TextConfig",
     "vision_config": "VisionConfig",
@@ -472,44 +310,40 @@ def first_attribute(obj, *names):
 
 def check_arguments(kind, case, model, config):
     """Keep shared component selection and dimension wiring in Python."""
+    name = case["module"]
+    # Phi3-V keeps language dimensions on the outer config.
+    text = config if name == "phi3_v" else getattr(config, "text_config", config)
     if kind == "forward_cache":
-        return (model, getattr(config, "text_config", config).vocab_size), {}
+        return (model, text.vocab_size), {}
     if kind == "input_embeddings":
-        return (model, case["module"]), {}
+        return (model, name), {}
     if kind == "audio":
-        return (model, config, case["module"]), case.get("audio", {})
+        return (model, config, name), case.get("audio", {})
     if kind in {"request_positions", "chunked_positions"}:
         return (model,), {}
     if kind in {"language", "mrope_cache_index", "mrope_deltas"}:
-        language_model = model.language_model
-        text_config = getattr(config, "text_config", config)
-        # Phi3-V keeps its language dimensions on the top-level config.
-        if case["module"] == "phi3_v":
-            text_config = config
         if kind == "language":
-            options = {}
-            if not hasattr(text_config, "num_hidden_layers"):
-                options["num_layers"] = text_config.n_layers
-            return (language_model, text_config), options
-        return (language_model, text_config.hidden_size), {}
+            options = (
+                {}
+                if hasattr(text, "num_hidden_layers")
+                else {"num_layers": text.n_layers}
+            )
+            return (model.language_model, text), options
+        return (model.language_model, text.hidden_size), {}
     if kind == "projector":
         projector = attrgetter(case.get("projector_path", "multi_modal_projector"))(
             model
         )
-        if case["module"] == "deepseek_v4":
+        if name == "deepseek_v4":
             return (projector, config.vision_dim, config.hidden_size), {
                 "grid_hw": case["vision"]["grid_hw"],
                 "downsample_ratio": config.vision_downsample_ratio,
             }
-        return (
-            projector,
-            config.vision_config.hidden_size,
-            config.text_config.hidden_size,
-        ), {}
+        return (projector, config.vision_config.hidden_size, text.hidden_size), {}
     if kind == "vision":
         vision = attrgetter(case.get("vision_path", "vision_tower"))(model)
         options = case.get("vision", {})
-        if case["module"] == "deepseek_v4":
+        if name == "deepseek_v4":
             return (
                 vision,
                 None,
@@ -521,22 +355,17 @@ def check_arguments(kind, case, model, config):
                 "n_h": options["grid_hw"][0],
                 "n_w": options["grid_hw"][1],
             }
-        vision_config = config.vision_config
+        vc = config.vision_config
         image_size = options.get("input_shape")
         if image_size is None:
-            image_size = (vision_config.image_size, vision_config.image_size)
-        hidden_size = first_attribute(
-            vision_config,
-            "out_hidden_size",
-            "hidden_size",
-            "d_model",
-            "width",
-            "text_hidden_size",
+            image_size = (vc.image_size, vc.image_size)
+        width = first_attribute(
+            vc, "out_hidden_size", "hidden_size", "d_model", "width", "text_hidden_size"
         )
-        # Molmo's hidden_size is the projector intermediate width.
-        if case["module"] == "molmo":
-            hidden_size = vision_config.d_model
-        channels = first_attribute(vision_config, "num_channels", "in_channels")
+        # Molmo's hidden_size describes its projector; use d_model for vision.
+        if name == "molmo":
+            width = vc.d_model
+        channels = first_attribute(vc, "num_channels", "in_channels")
         kwargs = {}
         if "feature_layer" in options:
             kwargs["vision_feature_layer"] = options["feature_layer"]
@@ -547,16 +376,11 @@ def check_arguments(kind, case, model, config):
                 options["grid_thw"],
                 dtype=getattr(mx, options.get("grid_dtype", "int64")),
             )
-        if vision_config.model_type == "llama4_vision_model":
-            kwargs["projector_output_dim"] = vision_config.projector_output_dim
-        return (
-            vision,
-            # MiniMax's vision wrapper does not expose model_type.
-            None if case["module"] == "minimax_m3_vl" else vision_config.model_type,
-            hidden_size,
-            channels,
-            tuple(image_size),
-        ), kwargs
+        if vc.model_type == "llama4_vision_model":
+            kwargs["projector_output_dim"] = vc.projector_output_dim
+        # MiniMax's vision wrapper does not expose model_type.
+        model_type = None if name == "minimax_m3_vl" else vc.model_type
+        return (vision, model_type, width, channels, tuple(image_size)), kwargs
     raise ValueError(f"Unknown model check: {kind}")
 
 
@@ -568,7 +392,7 @@ def test_model_contract(case):
     checks = ModelChecks()
     for kind in case["checks"]:
         args, kwargs = check_arguments(kind, case, model, config)
-        getattr(checks, CHECKS[kind])(*args, **kwargs)
+        getattr(checks, kind)(*args, **kwargs)
 
 
 @pytest.mark.parametrize("name", DATA["dense"])
@@ -576,58 +400,24 @@ def test_dense_model(name):
     module = importlib.import_module("mlx_vlm.models." + name)
     config = DATA["dense"][name]
     model = module.Model(module.ModelConfig.from_dict(copy.deepcopy(config)))
-    ModelChecks().forward_cache_test_runner(model, config["vocab_size"])
+    ModelChecks().forward_cache(model, config["vocab_size"])
 
 
 @pytest.mark.parametrize(
     "model_module",
     [
-        "llava.llava",
-        "llava_bunny.llava_bunny",
-        "llava_next.llava_next",
-        "gemma3.gemma3",
-        "gemma4.gemma4",
-        "paligemma.paligemma",
-        "qwen2_5_vl.qwen2_5_vl",
-        "qwen2_vl.qwen2_vl",
-        "qwen3_vl.qwen3_vl",
-        "qwen3_5.qwen3_5",
-        "qwen3_vl_moe.qwen3_vl_moe",
-        "internvl_chat.internvl_chat",
-        "mistral3.mistral3",
-        "pixtral.pixtral",
-        "aya_vision.aya_vision",
-        "fastvlm.fastvlm",
-        "glm4v.glm4v",
-        "glm4v_moe.glm4v_moe",
-        "glm_ocr.glm_ocr",
-        "kimi_vl.kimi_vl",
-        "dots_ocr.dots_ocr",
-        "hunyuan_vl.hunyuan_vl",
-        "paddleocr_vl.paddleocr_vl",
-        "ernie4_5_moe_vl.ernie4_5_moe_vl",
-        "mllama.mllama",
-        "granite_vision.granite_vision",
-        "granite4_vision.granite4_vision",
-        "deepseek_vl_v2.deepseek_vl_v2",
-        "deepseek_v4.deepseek_v4",
-        "multi_modality.multi_modality",
-        "lfm2_vl.lfm2_vl",
-        "idefics2.idefics2",
-        "idefics3.idefics3",
-        "phi4mm.phi4mm",
-        "falcon_ocr.falcon_ocr",
-        "falcon_perception.falcon_perception",
-        "florence2.florence2",
-        "molmo.molmo",
-        "molmo2.molmo2",
-        "moondream3.moondream3",
-        "gemma3n.gemma3n",
-        "phi3_v.phi3_v",
-        "minicpmo.minicpmo",
-        "jina_vlm.jina_vlm",
-        "qwen3_omni_moe.thinker",
-    ],
+        f"{name}.{name}"
+        for name in (
+            "llava llava_bunny llava_next gemma3 gemma4 paligemma qwen2_5_vl qwen2_vl "
+            "qwen3_vl qwen3_5 qwen3_vl_moe internvl_chat mistral3 pixtral aya_vision "
+            "fastvlm glm4v glm4v_moe glm_ocr kimi_vl dots_ocr hunyuan_vl paddleocr_vl "
+            "ernie4_5_moe_vl mllama granite_vision granite4_vision deepseek_vl_v2 "
+            "deepseek_v4 multi_modality lfm2_vl idefics2 idefics3 phi4mm falcon_ocr "
+            "falcon_perception florence2 molmo molmo2 moondream3 gemma3n phi3_v minicpmo "
+            "jina_vlm "
+        ).split()
+    ]
+    + ["qwen3_omni_moe.thinker"],
 )
 def test_cached_image_features_in_source(model_module):
     """Verify cached_image_features kwarg appears in get_input_embeddings source."""
