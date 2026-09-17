@@ -19,7 +19,7 @@ Use a module path or `-k` to select a smaller group while developing.
 | `test_models.py` + `model_cases.json` | Shared language, vision, audio, projector, embedding, position, native forward/cache contracts, and cached-image source checks |
 | `test_image_generation_models.py` | Bonsai, Flux2, Ideogram4, Z-Image, ERNIE Image, and Mage Flow generation/editing, components, loading, and conversion |
 | `test_diffusion_models.py` | LLaDA, Nemotron, and DiffusionGemma model/generation contracts, including sampling, prefill, caches, numerical parity, self-conditioning, vision, sanitization, and quantization policy |
-| `test_tool_parsers.py` | ATEM, Cohere, Gemma 4, GLM, Mistral, Pythonic parsing, and parser selection |
+| `test_tool_parsers.py` | Automatic discovery of all 13 parser modules, shared parsing/extraction/selection contracts, and format-specific edge cases |
 | `test_apc.py` | Cache lookup, semantic keys, adapters, model compatibility, exact/partial prefix reuse, quantized checkpoints, memory budgets, disk persistence, trace logging, and diagnostics |
 | `test_cache.py` | Cache lifecycle, recurrence, quantization, batching, attention masks, and vision-feature LRU behavior |
 | `test_turboquant.py` | TurboQuant cache integration, batched attention, and value kernels |
@@ -55,13 +55,25 @@ structured-output processors share `test_generate.py`. Vision LRU checks live in
 Those source checks verify the keyword's presence, not runtime cache reuse.
 GLiNER and privacy-filter checks share `test_extraction_models.py`.
 
-Against `f7de22df`, this consolidation removes 427 Python lines and six test
-files, retaining both JSON files. Full-suite execution sets are identical:
+The consolidation at `6ce9f04d` removed 427 Python lines and six test files
+against `f7de22df`, retaining both JSON files. Its full-suite execution sets were identical:
 80,634 production lines and 12,715 branch outcomes, with no lost or added paths.
-Validation reports 1,852 passed, five skipped, and 41 passing subtests.
+That validation reported 1,852 passed, five skipped, and 41 passing subtests.
 These are measured execution sets, not complete production coverage. The earlier
-pruning tradeoffs still apply. The suite now contains 26,770 Python lines plus
-2,142 readable JSON lines, or 28,912 combined.
+pruning tradeoffs still apply. The suite now contains 26,763 Python lines plus
+2,142 readable JSON lines, or 28,905 combined.
+
+`test_tool_parsers.py` discovers modules under `mlx_vlm.tools.parsers` and imports
+them through `load_tool_module`. Add a literal native-format example to
+`WIRE_CALLS` for each new parser; the inventory check requires matching module,
+registry, and example names. Shared checks cover argument values/types, single and
+repeated extraction, unique IDs/indices, surrounding prose, template variants,
+processor inference, overrides, and priority over the JSON fallback. Keep special
+syntax and error cases in the same file. The 13 formats now run 49 cases in 270
+lines (previously 22 cases in 277 lines), with all prior measured paths retained.
+The full suite reports 1,879 passed, five skipped, and 41 passing subtests;
+80,919 production lines and 12,819 branch outcomes execute, adding 285 lines and
+104 branch outcomes against `6ce9f04d`, with no lost paths.
 
 MoE offload remains separate and shrinks from 615 to 305 lines. Reuse its
 checkpoint/quantization/repacking and relative-parity helpers. Separate-projection
