@@ -59,18 +59,18 @@ from .types import GenerateKwargs, ProcessorLike, Unpack
 logger = logging.getLogger("mlx_vlm.generate")
 
 DEFAULT_TOP_N_SIGMA = 0.0
-DEFAULT_BATCH_CACHE_EVAL_INTERVAL = 50
+DEFAULT_CACHE_EVAL_INTERVAL = 50
 
 
 def _get_batch_cache_eval_interval() -> int:
     raw = os.environ.get("MLX_VLM_BATCH_CACHE_EVAL_INTERVAL")
     if raw is None:
-        return DEFAULT_BATCH_CACHE_EVAL_INTERVAL
+        return DEFAULT_CACHE_EVAL_INTERVAL
     try:
         return max(0, int(raw))
     except ValueError:
         logger.warning("Ignoring invalid MLX_VLM_BATCH_CACHE_EVAL_INTERVAL=%r", raw)
-        return DEFAULT_BATCH_CACHE_EVAL_INTERVAL
+        return DEFAULT_CACHE_EVAL_INTERVAL
 
 
 def _position_seed(seed: int, row_id: int, position: int) -> int:
@@ -550,6 +550,9 @@ def generate_step(
             mx.eval(y)
         if n == max_tokens:
             break
+
+        if (n + 1) % DEFAULT_CACHE_EVAL_INTERVAL == 0:
+            mx.eval([c.state for c in prompt_cache])
 
         yield y.item(), logprobs
         if n % 256 == 0:

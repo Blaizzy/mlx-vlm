@@ -27,6 +27,7 @@ from mlx_vlm.generate import (
 from mlx_vlm.generate import ar as ar_module
 from mlx_vlm.generate import dispatch as dispatch_module
 from mlx_vlm.generate import normalize_resize_shape
+from mlx_vlm.models.base import InputEmbeddingsFeatures, LanguageModelOutput
 from mlx_vlm.models.cache import (
     BatchKVCache,
     BatchPoolingCache,
@@ -1918,6 +1919,33 @@ def test_generate_step_schedules_final_prefill_async():
         next(gen)
 
     assert events[0] == "async"
+
+
+@pytest.mark.parametrize(("max_tokens", "cache_evals"), [(49, 0), (50, 1), (100, 2)])
+def test_generate_step_evaluates_cache_periodically(max_tokens, cache_evals):
+    model = MagicMock()
+    model.language_model.return_value = LanguageModelOutput(logits=mx.zeros((1, 1, 4)))
+    model.get_input_embeddings.return_value = InputEmbeddingsFeatures(
+        inputs_embeds=mx.zeros((1, 1, 4))
+    )
+    cache_state = mx.array([1])
+
+    with patch.object(ar_module.mx, "eval", wraps=mx.eval) as eval_mock:
+        list(
+            generate_module.generate_step(
+                mx.array([[1]]),
+                model,
+                pixel_values=None,
+                mask=None,
+                prompt_cache=[SimpleNamespace(state=cache_state)],
+                max_tokens=max_tokens,
+                temperature=0,
+            )
+        )
+
+    assert eval_mock.call_count == 1 + cache_evals
+    if cache_evals:
+        eval_mock.assert_called_with([cache_state])
 
 
 def test_generate_step_preserves_explicit_prompt_position_metadata():
