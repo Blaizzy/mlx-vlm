@@ -45,8 +45,8 @@ construction is shared through `test_models.py`.
 ## Current validation
 
 Compared with `e48acdc6`, shared setup and runners reduce Python source
-**22,331 → 21,614 lines**, saving **717 formatted lines**. JSON is unchanged at
-**3,099 lines**; the combined total is **24,713 lines**, with the same 16 Python
+**22,331 → 21,611 lines**, saving **720 formatted lines**. JSON is unchanged at
+**3,099 lines**; the combined total is **24,710 lines**, with the same 16 Python
 files. All changes in this pass are tests or their documentation.
 
 | Module | Before | After | Saved |
@@ -54,7 +54,7 @@ files. All changes in this pass are tests or their documentation.
 | `test_generate.py` | 1,928 | 1,716 | 212 |
 | `test_processors.py` | 2,506 | 2,317 | 189 |
 | `test_diffusion_models.py` | 1,287 | 1,131 | 156 |
-| `test_models.py` | 1,071 | 1,014 | 57 |
+| `test_models.py` | 1,071 | 1,011 | 60 |
 | `test_audio_models.py` | 1,613 | 1,573 | 40 |
 | `test_video_generation_models.py` | 1,544 | 1,522 | 22 |
 | `test_model_ops.py` | 1,021 | 1,002 | 19 |

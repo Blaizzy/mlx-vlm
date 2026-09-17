@@ -24,10 +24,6 @@ import pytest
 from mlx.utils import tree_map
 
 from mlx_vlm.models.base import InputEmbeddingsFeatures
-from mlx_vlm.models.qwen3_5.config import ModelConfig as QwenModelConfig
-from mlx_vlm.models.qwen3_5.config import TextConfig as QwenTextConfig
-from mlx_vlm.models.qwen3_5.config import VisionConfig as QwenVisionConfig
-from mlx_vlm.models.qwen3_5.qwen3_5 import Model as QwenModel
 from mlx_vlm.utils import (
     _drop_modules_without_weights,
     _load_safetensors,
@@ -957,7 +953,8 @@ QWEN_SANITIZED_KEY = "vision_tower.patch_embed.proj.weight"
 def _qwen_patch_model(
     in_channels=3, temporal_patch_size=2, patch_size=4, hidden_size=8
 ):
-    text_config = QwenTextConfig(
+    qwen = importlib.import_module("mlx_vlm.models.qwen3_5")
+    text_config = qwen.TextConfig(
         model_type="qwen3_5_text",
         hidden_size=32,
         intermediate_size=64,
@@ -975,7 +972,7 @@ def _qwen_patch_model(
         full_attention_interval=2,
         head_dim=16,
     )
-    vision_config = QwenVisionConfig(
+    vision_config = qwen.VisionConfig(
         model_type="qwen3_5",
         depth=1,
         hidden_size=hidden_size,
@@ -988,10 +985,10 @@ def _qwen_patch_model(
         spatial_merge_size=1,
         num_position_embeddings=4,
     )
-    config = QwenModelConfig(
+    config = qwen.ModelConfig(
         text_config=text_config, vision_config=vision_config, model_type="qwen3_5"
     )
-    return QwenModel(config), vision_config
+    return qwen.Model(config), vision_config
 
 
 def test_patch_embed_is_transposed_from_ncdhw_to_ndhwc():
