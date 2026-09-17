@@ -59,8 +59,8 @@ against `f7de22df`, retaining both JSON files. Its full-suite execution sets wer
 80,634 production lines and 12,715 branch outcomes, with no lost or added paths.
 That validation reported 1,852 passed, five skipped, and 41 passing subtests.
 These are measured execution sets, not complete production coverage. The earlier
-pruning tradeoffs still apply. The suite now contains 26,737 Python lines plus
-2,142 readable JSON lines, or 28,879 combined.
+pruning tradeoffs still apply. The suite now contains 26,622 Python lines plus
+2,142 readable JSON lines, or 28,764 combined.
 
 `test_tool_parsers.py` discovers modules under `mlx_vlm.tools.parsers` and imports
 them through `load_tool_module`. Add a literal native-format example to
