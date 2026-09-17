@@ -1,84 +1,33 @@
 """APC lookup, cache adapters, prefix reuse, memory budgets, and persistence."""
 
-from __future__ import annotations
-
 import ast
 import copy
 import importlib
-import inspect
 import logging
 import os
 import pkgutil
 import shutil
 import subprocess
 import sys
-import textwrap
 import threading
+from functools import partial
+from itertools import product
 from pathlib import Path
-from types import SimpleNamespace
-from typing import List
+from types import SimpleNamespace as NS
 
 import mlx.core as mx
-import numpy as np
 import pytest
 
-import mlx_vlm.models as model_packages
-from mlx_vlm import apc
-from mlx_vlm import apc as apc_module
+import mlx_vlm.models as models
+from mlx_vlm import apc as P
 from mlx_vlm import apc_adapters as A
-from mlx_vlm.apc import (
-    APCManager,
-    DiskBlockStore,
-    _cache_nbytes,
-    _clone_cache_entry_for_apc,
-    _clone_prompt_cache_for_apc,
-    _hash_payload,
-    _hash_tokens,
-    classify_layer_for_apc,
-    extract_prompt_cache_from_batch,
-    from_env,
-    harvest_blocks_from_batch_cache,
-    hash_image_payload,
-    make_warm_batch_exact_cache_multi,
-    make_warm_batch_kv_cache,
-    make_warm_batch_kv_cache_multi,
-    make_warm_kv_cache,
-    model_apc_mode,
-    model_key_dependencies,
-    self_check_model_apc,
-    semantic_extra_hash,
-    snapshot_prompt_cache_row,
-    tenant_scoped_hash,
-)
-from mlx_vlm.apc_adapters import (
-    apc_exact_eligible,
-    build_prefix_cache_plan,
-    build_prefix_cache_plan_from_caches,
-    cache_memory_components,
-    clone_cache_entry,
-)
-from mlx_vlm.apc_storage import KVBlockHandle
-from mlx_vlm.generate.ar import _extend_cache, _make_cache
+from mlx_vlm.apc import harvest_blocks_from_batch_cache as harvest
+from mlx_vlm.apc import make_warm_batch_exact_cache_multi as warm_exact
+from mlx_vlm.apc import make_warm_batch_kv_cache_multi as warm_blocks
+from mlx_vlm.apc import snapshot_prompt_cache_row as snapshot_row
+from mlx_vlm.apc_adapters import cache_memory_components as memory_components
+from mlx_vlm.generate.ar import PromptProcessingBatch, _extend_cache, _make_cache
 from mlx_vlm.models import cache as C
-from mlx_vlm.models.cache import (
-    ArraysCache,
-    BatchKVCache,
-    BatchPoolingCache,
-    BatchQuantizedKVCache,
-    BatchRotatingKVCache,
-    BufferedRotatingKVCache,
-    CacheList,
-    ChunkedKVCache,
-    ConcatenateKVCache,
-    KVCache,
-    PoolingCache,
-    QuantizedKVCache,
-    RotatingKVCache,
-    SimpleKVCache,
-    StaticPrefixKVCache,
-    _BaseCache,
-    should_quantize_kv_layer,
-)
 from mlx_vlm.models.hy_v4.cache import HyV4KVCache
 from mlx_vlm.models.minimax_m3_vl.language import (
     MiniMaxM3BatchKVCache,
@@ -92,1962 +41,994 @@ from mlx_vlm.models.qwen4_exp.language import (
 )
 from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
 from mlx_vlm.models.z1t.language import AFTConv, Z1TCache
-from mlx_vlm.tests.test_models import DATA as MODEL_CASES
-from mlx_vlm.tests.test_models import build_config
-from mlx_vlm.turboquant import BatchTurboQuantKVCache, TurboQuantKVCache
+from mlx_vlm.tests.test_models import DATA, build_config
+from mlx_vlm.turboquant import BatchTurboQuantKVCache, TurboQuantKVCache, _SplitCodec
+
+parametrize = pytest.mark.parametrize
 
 
-def _make_fake_kv(
-    num_layers: int = 2, n_kv_heads: int = 1, seq_len: int = 32, head_dim: int = 4
-) -> tuple[list[mx.array], list[mx.array]]:
-    keys: list[mx.array] = []
-    values: list[mx.array] = []
-    for layer_idx in range(num_layers):
-        base = np.arange(n_kv_heads * seq_len * head_dim, dtype=np.float32)
-        base = base.reshape(1, n_kv_heads, seq_len, head_dim)
-        keys.append(mx.array(base + layer_idx * 1000))
-        values.append(mx.array(base + layer_idx * 1000 + 100))
-    mx.eval(keys + values)
-    return keys, values
-
-
-def _assert_allclose(a: mx.array, b: mx.array) -> None:
-    assert bool(mx.allclose(a, b).item())
-
-
-def test_hash_chain_and_image_hash_are_deterministic():
-    assert _hash_tokens(0, tuple(range(16)), 0) == _hash_tokens(0, tuple(range(16)), 0)
-    assert _hash_tokens(0, tuple(range(16)), 0) != _hash_tokens(0, tuple(range(16)), 42)
-    assert _hash_tokens(7, tuple(range(16)), 0) != _hash_tokens(8, tuple(range(16)), 0)
-
-    zeros = mx.zeros((1, 3, 8, 8))
-    ones = mx.ones((1, 3, 8, 8))
-    assert hash_image_payload(pixel_values=zeros) != hash_image_payload(
-        pixel_values=ones
-    )
-    assert hash_image_payload(None, None) == 0
-    assert hash_image_payload(image_ref=["a.png", "b.png"]) == hash_image_payload(
-        image_ref=["a.png", "b.png"]
+def forbid(monkeypatch, target, attr):
+    monkeypatch.setattr(
+        target, attr, lambda *a, **kw: pytest.fail(f"unexpected {attr}")
     )
 
 
-def test_tenant_scoped_hash_is_stable_namespaced_and_process_stable():
-    image_hash = hash_image_payload(image_ref="cat.jpg")
-
-    assert tenant_scoped_hash(None, image_hash) == image_hash
-    assert tenant_scoped_hash("tenant-a", image_hash) == tenant_scoped_hash(
-        "tenant-a", image_hash
-    )
-    assert tenant_scoped_hash("tenant-a", image_hash) != tenant_scoped_hash(
-        "tenant-b", image_hash
-    )
-    assert tenant_scoped_hash("tenant-a", image_hash) != tenant_scoped_hash(
-        "tenant-a", hash_image_payload(image_ref="dog.jpg")
-    )
-
-    code = (
-        "from mlx_vlm.apc import tenant_scoped_hash; "
-        "print(tenant_scoped_hash('tenant-a', 123456789))"
-    )
-    env_a = {**os.environ, "PYTHONHASHSEED": "1"}
-    env_b = {**os.environ, "PYTHONHASHSEED": "2"}
-    got_a = subprocess.check_output([sys.executable, "-c", code], env=env_a, text=True)
-    got_b = subprocess.check_output([sys.executable, "-c", code], env=env_b, text=True)
-    assert got_a == got_b
-
-
-def test_store_lookup_warm_cache_shapes_and_partial_block_ignored():
-    block_size = 16
-    manager = APCManager(num_blocks=16, block_size=block_size)
-    token_ids = list(range(3 * block_size + 5))
-    layer_keys, layer_values = _make_fake_kv(seq_len=len(token_ids))
-
-    matched, matched_tokens = manager.lookup_prefix(token_ids)
-    assert matched == []
-    assert matched_tokens == 0
-
-    stored = manager.store_kv_blocks(token_ids, layer_keys, layer_values)
-    assert len(stored) == 3
-    manager.release(stored)
-
-    matched, matched_tokens = manager.lookup_prefix(token_ids)
-    assert len(matched) == 3
-    assert matched_tokens == 3 * block_size
-
-    warm = make_warm_kv_cache(matched, min_capacity_tokens=3 * block_size + 17)
-    assert len(warm) == len(layer_keys)
-    assert all(c.offset == 3 * block_size for c in warm)
-    assert all(c.keys.shape[:2] == (1, 1) for c in warm)
-    assert all(c.keys.shape[2] >= 3 * block_size + 17 for c in warm)
-    manager.release(matched)
-
-
-def test_layer_major_memory_threshold_skips_block_pool(monkeypatch):
-    monkeypatch.setenv("APC_LAYER_MAJOR_MEMORY_MIN_TOKENS", "1")
-    block_size = 16
-    manager = APCManager(num_blocks=16, block_size=block_size)
-    token_ids = list(range(4 * block_size))
-    layer_keys, layer_values = _make_fake_kv(seq_len=len(token_ids))
-
-    stored = manager.store_kv_blocks(token_ids, layer_keys, layer_values)
-
-    assert stored == []
-    assert manager.lookup_prefix(token_ids)[1] == 0
-    warm, matched_tokens = manager.lookup_exact_cache(token_ids + [999])
-    expected_tokens = len(token_ids) - block_size
-    assert matched_tokens == expected_tokens
-    assert warm is not None
-    assert len(warm) == len(layer_keys)
-    assert warm[0].offset == expected_tokens
-    assert warm[0].keys.shape[2] >= len(token_ids) + 1
-    _assert_allclose(
-        warm[0].keys[..., :expected_tokens, :], layer_keys[0][..., :expected_tokens, :]
-    )
-    _assert_allclose(
-        warm[1].values[..., :expected_tokens, :],
-        layer_values[1][..., :expected_tokens, :],
-    )
-
-
-def test_single_row_prompt_batch_exact_checkpoint_stores_without_extract():
-    from mlx_vlm.generate.ar import PromptProcessingBatch
-    from mlx_vlm.models.cache import ArraysCache, KVCache, RotatingKVCache
-
-    token_ids = list(range(32))
-    arrays = ArraysCache(size=1)
-    arrays[0] = mx.ones((1, 3, 5))
-    kv = KVCache()
-    kv.keys = mx.ones((1, 1, len(token_ids), 4))
-    kv.values = mx.ones((1, 1, len(token_ids), 4)) * 2
-    kv.offset = len(token_ids)
-    rotating = RotatingKVCache(max_size=8, keep=0)
-    rotating.keys = mx.ones((1, 1, 8, 4)) * 3
-    rotating.values = mx.ones((1, 1, 8, 4)) * 4
-    rotating.offset = len(token_ids)
-    rotating._idx = 4
-
-    batch = PromptProcessingBatch.__new__(PromptProcessingBatch)
-    batch.uids = [0]
-    batch.prompt_cache = [arrays, kv, rotating]
-    batch._right_pad_per_row = None
-    batch._left_padding_per_row = [0]
-    batch._suffix_lens = [len(token_ids)]
-    batch._processed_prompt_columns = len(token_ids)
-    batch._apc_mode = "exact"
-    batch._apc_manager = APCManager(num_blocks=4, block_size=4)
-    batch._apc_meta = [
-        {
-            "full_input_ids": token_ids,
-            "prefix_len": 0,
-            "checkpoint_len": len(token_ids),
-            "extra_hash": 0,
-        }
-    ]
-
-    assert extract_prompt_cache_from_batch(batch.prompt_cache, 0) is None
-
-    batch._store_apc_exact_checkpoints()
-
-    assert batch._apc_meta[0]["checkpoint_done"] is True
-    assert batch._apc_manager.stats_snapshot()["exact_stores"] == 1
-
-
-def test_disk_writer_materializes_generation_stream_cache_on_producer(
-    tmp_path, monkeypatch
-):
-    from mlx_vlm.generate.common import generation_stream
-
-    monkeypatch.setenv("APC_MAX_POOL_TENSORS", "1")
-    block_size = 16
-    token_ids = list(range(block_size))
-    with mx.stream(generation_stream):
-        base = mx.arange(block_size * 4, dtype=mx.float32).reshape(1, 1, block_size, 4)
-        layer_keys = [base + 1, base + 2]
-        layer_values = [base + 3, base + 4]
-
-    disk = DiskBlockStore(tmp_path, namespace="generation-stream")
-    manager = APCManager(num_blocks=1, block_size=block_size, disk=disk)
-    assert manager.store_kv_blocks(token_ids, layer_keys, layer_values) == []
-    disk._q.join()
-
-    assert disk.num_blocks_indexed == 1
-    assert disk.disk_bytes > 0
-    manager.close()
-
-
-def test_disk_store_recovers_when_cache_dir_is_deleted(tmp_path):
-    block_size = 16
-    first_tokens = list(range(block_size))
-    second_tokens = list(range(100, 100 + block_size))
-    first_keys, first_values = _make_fake_kv(num_layers=2, seq_len=len(first_tokens))
-    second_keys, second_values = _make_fake_kv(num_layers=2, seq_len=len(second_tokens))
-
-    disk = DiskBlockStore(tmp_path, namespace="unit")
-    manager = APCManager(num_blocks=1, block_size=block_size, disk=disk)
-
-    stored = manager.store_kv_blocks(first_tokens, first_keys, first_values)
-    manager.release(stored)
-    disk._q.join()
-    assert disk.dir.exists()
-    assert any(disk.dir.glob(f"*{disk.SUFFIX}"))
-
-    shutil.rmtree(disk.dir)
-    assert not disk.dir.exists()
-
-    stored = manager.store_kv_blocks(second_tokens, second_keys, second_values)
-    manager.release(stored)
-    disk._q.join()
-
-    assert disk.dir.exists()
-    assert any(disk.dir.glob(f"*{disk.SUFFIX}"))
-    assert disk.disk_bytes > 0
-    manager.close()
-
-    disk = DiskBlockStore(tmp_path, namespace="unit")
-    manager = APCManager(num_blocks=1, block_size=block_size, disk=disk)
-    warm, matched_tokens = manager.lookup_prefix_disk_cache(second_tokens)
-
-    assert warm is not None
-    assert matched_tokens == len(second_tokens)
-    manager.close()
-
-
-def test_clear_and_reset_stats_keep_cache_semantics():
-    block_size = 16
-    manager = APCManager(num_blocks=4, block_size=block_size)
-    token_ids = list(range(block_size))
-    layer_keys, layer_values = _make_fake_kv(seq_len=block_size)
-
-    stored = manager.store_kv_blocks(token_ids, layer_keys, layer_values)
-    manager.release(stored)
-
-    matched, matched_tokens = manager.lookup_prefix(token_ids)
-    assert matched_tokens == block_size
-    manager.release(matched)
-    assert manager.stats_snapshot()["lookups_hit"] == 1
-
-    manager.reset_stats()
-    assert manager.stats_snapshot()["lookups_hit"] == 0
-    matched, matched_tokens = manager.lookup_prefix(token_ids)
-    assert matched_tokens == block_size
-    manager.release(matched)
-    assert manager.stats_snapshot()["lookups_hit"] == 1
-
-    manager.clear()
-    assert manager.stats_snapshot()["lookups_hit"] == 0
-    assert manager.stats_snapshot()["pool_used"] == 0
-    matched, matched_tokens = manager.lookup_prefix(token_ids)
-    assert matched == []
-    assert matched_tokens == 0
-
-
-def test_lookup_prefix_disk_cache_policy_gates(tmp_path, monkeypatch):
-    monkeypatch.setenv("APC_DISK_SHARD_MAX_BLOCKS", "3")
-    block_size = 16
-    token_ids = list(range(3 * block_size))
-    layer_keys, layer_values = _make_fake_kv(seq_len=len(token_ids))
-
-    disk = DiskBlockStore(tmp_path, namespace="unit")
-    manager = APCManager(num_blocks=8, block_size=block_size, disk=disk)
-    stored = manager.store_kv_blocks(token_ids, layer_keys, layer_values)
-    manager.release(stored)
-    disk._q.join()
-
-    warm, matched_tokens = manager.lookup_prefix_disk_cache(token_ids)
-    assert warm is None
-    assert matched_tokens == 0
-
-    warm, matched_tokens = manager.lookup_prefix_disk_cache(
-        token_ids,
-        allow_memory_overlap=True,
-        max_prefix_tokens=2 * block_size,
-        min_prefix_tokens=block_size,
-    )
-    assert warm is not None
-    assert matched_tokens == 2 * block_size
-
-    warm, matched_tokens = manager.lookup_prefix_disk_cache(
-        token_ids,
-        allow_memory_overlap=True,
-        max_prefix_tokens=2 * block_size,
-        min_prefix_tokens=2 * block_size,
-    )
-    assert warm is None
-    assert matched_tokens == 0
-
-    manager._disk_min_free_ram_bytes = 2
-    monkeypatch.setattr(apc_module, "_free_ram_bytes", lambda: 1)
-    warm, matched_tokens = manager.lookup_prefix_disk_cache(
-        token_ids, allow_memory_overlap=True
-    )
-    assert warm is None
-    assert matched_tokens == 0
-    manager.close()
-
-
-def test_exact_cache_disk_restore_preserves_qsa_state(tmp_path, monkeypatch):
-    from mlx_vlm.models.cache import ArraysCache
-    from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache, QSAKVCache
-
-    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "1")
-
-    token_ids = list(range(40))
-    arrays = ArraysCache(size=1)
-    arrays[0] = mx.arange(6, dtype=mx.int64).reshape(1, 2, 3)
-    qsa = QSAKVCache()
-    qsa.keys = mx.arange(1 * 2 * len(token_ids) * 4, dtype=mx.float32).reshape(
-        1, 2, len(token_ids), 4
-    )
-    qsa.values = qsa.keys + 1000
-    qsa.offset = len(token_ids)
-    qsa.index_keys = mx.arange(1 * len(token_ids) * 6, dtype=mx.float32).reshape(
-        1, len(token_ids), 6
-    )
-    qsa.index_position_ids = mx.arange(3 * len(token_ids), dtype=mx.int64).reshape(
-        3, 1, len(token_ids)
-    )
-    qsa.index_block_keys = mx.arange(1 * 1 * 10 * 6, dtype=mx.float32).reshape(
-        1, 1, 10, 6
-    )
-    qsa.index_block_ratio = 4
-    mx.eval(
-        arrays[0],
-        qsa.keys,
-        qsa.values,
-        qsa.index_keys,
-        qsa.index_position_ids,
-        qsa.index_block_keys,
-    )
-
-    disk = DiskBlockStore(tmp_path, namespace="qsa-exact")
-    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
-    assert manager.store_exact_cache(token_ids, [arrays, qsa], extra_hash=19)
-    disk._q.join()
-    snapshot_path = next(iter(disk._exact_index.values()))
-    _, metadata, _ = disk._open_shard_header(snapshot_path)
-    assert metadata["c1_kind"] == "checkpoint"
-    manager.close()
-
-    disk = DiskBlockStore(tmp_path, namespace="qsa-exact")
-    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
-    warm, matched_tokens = manager.lookup_exact_cache(token_ids + [999], extra_hash=19)
-
-    assert matched_tokens == len(token_ids)
-    assert warm is not None
-    assert manager.stats_snapshot()["disk_hits"] == 1
-    assert isinstance(warm[1], QSAKVCache)
-    assert warm[1].offset == len(token_ids)
-    assert warm[1].keys.shape[2] >= len(token_ids) + 1
-    _assert_allclose(warm[1].keys[..., : len(token_ids), :], qsa.keys)
-    _assert_allclose(warm[1].values[..., : len(token_ids), :], qsa.values)
-    _assert_allclose(warm[1].index_keys, qsa.index_keys)
-    assert warm[1].index_position_ids.dtype == mx.int64
-    assert bool(
-        mx.array_equal(warm[1].index_position_ids, qsa.index_position_ids).item()
-    )
-    _assert_allclose(warm[1].index_block_keys, qsa.index_block_keys)
-    assert warm[1].index_block_ratio == qsa.index_block_ratio
-
-    memory_warm, memory_matched_tokens = manager.lookup_exact_cache(
-        token_ids + [998], extra_hash=19
-    )
-    assert memory_matched_tokens == len(token_ids)
-    assert memory_warm is not None
-    assert memory_warm[1].keys.shape[2] >= len(token_ids) + 1
-    assert manager.stats_snapshot()["disk_hits"] == 1
-
-    batch_cache, max_prefix = make_warm_batch_exact_cache_multi(
-        [warm], [len(token_ids)]
-    )
-    assert max_prefix == len(token_ids)
-    assert batch_cache is not None
-    assert isinstance(batch_cache[1], BatchQSAKVCache)
-    extracted = batch_cache[1].extract(0)
-    _assert_allclose(extracted.index_keys, qsa.index_keys)
-    _assert_allclose(extracted.index_block_keys, qsa.index_block_keys)
-    assert extracted.index_block_ratio == qsa.index_block_ratio
-    assert bool(
-        mx.array_equal(extracted.index_position_ids, qsa.index_position_ids).item()
-    )
-    manager.close()
-
-
-def test_exact_cache_disk_restore_preserves_deepseek_v4_empty_values(
-    tmp_path, monkeypatch
-):
-    """DeepSeek V4's K-only local cache persists its zero-width V tensor."""
-    from mlx_vlm.models.cache import CacheList, PoolingCache, RotatingKVCache
-
-    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
-
-    token_ids = list(range(40))
-    rotating = RotatingKVCache(max_size=8, keep=0)
-    rotating.keys = (
-        mx.arange(1 * 1 * 8 * 4, dtype=mx.float32)
-        .reshape(1, 1, 8, 4)
-        .astype(mx.bfloat16)
-    )
-    rotating.values = mx.zeros((1, 1, 8, 0), dtype=mx.bfloat16)
-    rotating.offset = len(token_ids)
-    rotating._idx = 3
-
-    pooled = PoolingCache(ratio=4)
-    pooled.pooled = mx.ones((1, 6, 4), dtype=mx.bfloat16)
-    index = PoolingCache(ratio=4)
-    index.pooled = mx.ones((1, 6, 2), dtype=mx.float32)
-    cache = CacheList(rotating, pooled, index)
-    mx.eval(rotating.keys, rotating.values, pooled.pooled, index.pooled)
-
-    disk = DiskBlockStore(tmp_path, namespace="deepseek-v4-empty-values")
-    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
-    assert manager.store_exact_cache(token_ids, [cache], extra_hash=19)
-    disk._q.join()
-    stats = manager.stats_snapshot()
-    assert stats["disk_writes"] == 1
-    assert stats["disk_write_failures"] == 0
-    assert stats["disk_exact_indexed"] == 1
-    manager.close()
-
-    disk = DiskBlockStore(tmp_path, namespace="deepseek-v4-empty-values")
-    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
-    warm, matched_tokens = manager.lookup_exact_cache(token_ids + [999], extra_hash=19)
-
-    assert matched_tokens == len(token_ids)
-    assert warm is not None
-    assert manager.stats_snapshot()["disk_hits"] == 1
-    restored = warm[0]
-    assert isinstance(restored, CacheList)
-    restored_rotating = restored.caches[0]
-    assert restored_rotating.values.shape == (1, 1, 8, 0)
-    assert restored_rotating.values.dtype == mx.bfloat16
-    _assert_allclose(restored_rotating.keys, rotating.keys)
-    _assert_allclose(restored.caches[1].pooled, pooled.pooled)
-    _assert_allclose(restored.caches[2].pooled, index.pooled)
-    manager.close()
-
-
-def test_model_apc_mode_distinguishes_block_and_exact_custom_cache():
-    from mlx_vlm.models.cache import ArraysCache, KVCache, RotatingKVCache
-
-    assert model_apc_mode(object()) == "block"
-
-    class KVOnly:
-        def make_cache(self):
-            return [KVCache(), KVCache()]
-
-    class Mixed:
-        def make_cache(self):
-            return [ArraysCache(size=2), KVCache()]
-
-    class SlidingMixed:
-        def make_cache(self):
-            return [RotatingKVCache(max_size=8), KVCache()]
-
-    class Unsupported:
-        def make_cache(self):
-            return [object()]
-
-    assert model_apc_mode(KVOnly()) == "block"
-    assert model_apc_mode(Mixed()) == "exact"
-    assert model_apc_mode(SlidingMixed()) == "exact"
-    assert model_apc_mode(Unsupported()) is None
-
-
-def test_disk_restore_rebuilds_index_and_segment_eviction_preserves_prefix(
-    tmp_path, monkeypatch
-):
-    monkeypatch.setenv("APC_DISK_SHARD_MAX_BLOCKS", "1")
-    block_size = 16
-    token_ids = list(range(3 * block_size))
-    layer_keys, layer_values = _make_fake_kv(seq_len=len(token_ids))
-
-    disk = DiskBlockStore(tmp_path, namespace="unit")
-    manager = APCManager(num_blocks=1, block_size=block_size, disk=disk)
-    stored = manager.store_kv_blocks(token_ids, layer_keys, layer_values)
-    manager.release(stored)
-    disk._q.join()
-    before_bytes = disk.disk_bytes
-    manager.close()
-
-    disk = DiskBlockStore(tmp_path, namespace="unit")
-    manager = APCManager(num_blocks=8, block_size=block_size, disk=disk)
-    warm, matched_tokens = manager.lookup_prefix_disk_cache(token_ids)
-    assert warm is not None
-    assert matched_tokens == len(token_ids)
-    assert all(c.offset == len(token_ids) for c in warm)
-    assert manager.stats_snapshot()["pool_used"] == 0
-
-    disk.max_bytes = int(before_bytes * 0.75)
-    assert disk._maybe_evict() > 0
-    warm_after_evict, matched_after_evict = manager.lookup_prefix_disk_cache(token_ids)
-    assert warm_after_evict is not None
-    assert 0 < matched_after_evict < len(token_ids)
-    manager.close()
-
-
-def test_harvest_blocks_from_batch_cache_drops_left_padding():
-    block_size = 16
-    source_manager = APCManager(num_blocks=8, block_size=block_size)
-    harvest_manager = APCManager(num_blocks=8, block_size=block_size)
-    full_token_ids = list(range(2 * block_size))
-    short_token_ids = list(range(100, 100 + block_size))
-    full_keys, full_values = _make_fake_kv(seq_len=len(full_token_ids))
-    short_keys, short_values = _make_fake_kv(seq_len=len(short_token_ids))
-    full_blocks = source_manager.store_kv_blocks(full_token_ids, full_keys, full_values)
-    short_blocks = source_manager.store_kv_blocks(
-        short_token_ids, short_keys, short_values
-    )
-    caches, _ = make_warm_batch_kv_cache_multi(
-        [
-            {"matched_blocks": full_blocks, "prefix_len": 2 * block_size},
-            {"matched_blocks": short_blocks, "prefix_len": block_size},
-        ],
-        num_layers=2,
-    )
-
-    harvested = harvest_blocks_from_batch_cache(
-        harvest_manager, caches, batch_idx=1, full_token_ids=short_token_ids
-    )
-
-    assert len(harvested) == 1
-    _assert_allclose(harvested[0].keys[0], short_blocks[0].keys[0])
-    matched, matched_tokens = harvest_manager.lookup_prefix(short_token_ids)
-    assert matched_tokens == block_size
-    harvest_manager.release(matched + harvested)
-    source_manager.release(full_blocks + short_blocks)
-
-
-def test_disk_metadata_mismatch_is_a_miss(tmp_path):
-    block_size = 16
-    token_ids = list(range(block_size))
-    layer_keys, layer_values = _make_fake_kv(seq_len=block_size)
-
-    disk = DiskBlockStore(tmp_path, namespace="unit")
-    manager = APCManager(num_blocks=1, block_size=block_size, disk=disk)
-    stored = manager.store_kv_blocks(token_ids, layer_keys, layer_values, extra_hash=1)
-    manager.release(stored)
-    disk._q.join()
-    manager.close()
-
-    disk = DiskBlockStore(tmp_path, namespace="unit")
-    manager = APCManager(num_blocks=1, block_size=block_size, disk=disk)
-    warm, matched_tokens = manager.lookup_prefix_disk_cache(token_ids, extra_hash=2)
-
-    assert warm is None
-    assert matched_tokens == 0
-
-    wrong_hash = _hash_tokens(0, tuple(token_ids), 2)
-    real_hash = _hash_tokens(0, tuple(token_ids), 1)
-    disk._index[wrong_hash] = disk._index[real_hash]
-    warm, matched_tokens = manager.lookup_prefix_disk_cache(token_ids, extra_hash=2)
-    assert warm is None
-    assert matched_tokens == 0
-    manager.close()
-
-
-def test_deepseek_v4_multimodal_token_ids_cover_all_sentinels():
-    config = SimpleNamespace(
-        model_type="deepseek_v4", vision_n_layers=32, vocab_size=129280
-    )
-
-    assert apc_module.multimodal_token_ids_from_config(config) == set(
-        range(129280, 129285)
-    )
-
-
-def test_adjust_prefix_returns_zero_when_no_text_suffix_remains():
-    token_ids = [1, 42, 42]
-
-    assert (
-        apc_module.adjust_prefix_to_text_suffix_boundary(
-            token_ids,
-            desired_prefix_len=1,
-            media_token_ids={42},
-            max_prefix_tokens=len(token_ids) - 1,
-        )
-        == 0
-    )
-
-
-def test_exact_disk_hit_promotion_lru_eviction(tmp_path, monkeypatch):
-    """When _exact_cache_max=1 and a second distinct prefix is promoted, the
-    first promoted entry is evicted from memory and subsequent requests for it
-    go back to disk."""
-    from mlx_vlm.models.cache import KVCache
-
-    def _make_kv(val, n):
-        kv = KVCache()
-        kv.keys = mx.full((1, 1, n, 2), float(val))
-        kv.values = mx.full((1, 1, n, 2), float(val) + 1)
-        kv.offset = n
-        return kv
-
-    token_ids_a = list(range(20))
-    token_ids_b = list(range(100, 120))
-
-    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
-    disk = DiskBlockStore(tmp_path, namespace="lru-evict")
-    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
-    assert manager.store_exact_cache(token_ids_a, [_make_kv(1, 20)], extra_hash=0)
-    assert manager.store_exact_cache(token_ids_b, [_make_kv(2, 20)], extra_hash=0)
-    disk._q.join()
-    manager.close()
-
-    # Restart with memory capacity = 1.
-    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "1")
-    disk = DiskBlockStore(tmp_path, namespace="lru-evict")
-    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
-
-    # Disk hit A -> promoted to memory (sole slot).
-    warm_a, _ = manager.lookup_exact_cache(token_ids_a + [999], extra_hash=0)
-    assert warm_a is not None
-    assert manager.stats_snapshot()["disk_hits"] == 1
-
-    # Memory hit A -> disk_hits unchanged.
-    warm_a2, _ = manager.lookup_exact_cache(token_ids_a + [999], extra_hash=0)
-    assert warm_a2 is not None
-    assert manager.stats_snapshot()["disk_hits"] == 1
-
-    # Disk hit B -> promoted, evicts A from the single memory slot.
-    warm_b, _ = manager.lookup_exact_cache(token_ids_b + [999], extra_hash=0)
-    assert warm_b is not None
-    assert manager.stats_snapshot()["disk_hits"] == 2
-
-    # A is now evicted; its next lookup must hit disk again.
-    warm_a3, _ = manager.lookup_exact_cache(token_ids_a + [999], extra_hash=0)
-    assert warm_a3 is not None
-    assert manager.stats_snapshot()["disk_hits"] == 3
-
-    manager.close()
-
-
-def test_exact_lookup_memory_takes_priority_over_disk(tmp_path, monkeypatch):
-    """Memory entries take priority over the disk store.  When the same prefix
-    exists in both _exact_cache and on disk, the memory clone is returned and
-    disk_hits stays at zero.  This also verifies that the promotion guard
-    (skip insert if key already present) is implicitly exercised: because
-    store_exact_cache writes to both memory and disk, any subsequent lookup
-    hits memory first and never triggers a disk read."""
-    from mlx_vlm.models.cache import KVCache
-
-    token_ids = list(range(30))
-
-    def _make_kv(val):
-        kv = KVCache()
-        kv.keys = mx.ones((1, 1, len(token_ids), 2)) * val
-        kv.values = mx.ones((1, 1, len(token_ids), 2)) * (val + 1)
-        kv.offset = len(token_ids)
-        mx.eval(kv.keys, kv.values)
-        return kv
-
-    # Seed disk-only with value 7.
-    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
-    disk = DiskBlockStore(tmp_path, namespace="priority")
-    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
-    assert manager.store_exact_cache(token_ids, [_make_kv(7)], extra_hash=0)
-    disk._q.join()
-    manager.close()
-
-    # Restart with memory enabled; store an in-memory entry with value 99.
-    # store_exact_cache also writes to disk, but the memory lookup runs first.
-    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "4")
-    disk = DiskBlockStore(tmp_path, namespace="priority")
-    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
-    kv_mem = _make_kv(99)
-    manager.store_exact_cache(token_ids, [kv_mem], extra_hash=0)
-    assert manager.stats_snapshot()["exact_stores"] == 1
-
-    # Lookup must come from memory (no disk hit).
-    warm, matched = manager.lookup_exact_cache(token_ids + [999], extra_hash=0)
-    assert matched == len(token_ids)
-    assert warm is not None
-    snap = manager.stats_snapshot()
-    assert snap["disk_hits"] == 0
-    assert snap["exact_hits"] == 1
-    # Value should be 99 (memory), not 7 (disk).
-    _assert_allclose(warm[0].keys[..., : len(token_ids), :], kv_mem.keys)
-
-    manager.close()
-
-
-def test_exact_disk_roundtrip_generic_composite_cache(tmp_path, monkeypatch):
-    """Checkpoint serialization covers in-tree composite/custom cache leaves."""
-    from mlx_vlm.models.cache import CacheList, PoolingCache, SimpleKVCache
-
-    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
-    monkeypatch.setenv("APC_EXACT_MIN_TOKENS", "1")
-    token_ids = list(range(12))
-
-    simple = SimpleKVCache()
-    simple.update_and_fetch(mx.ones((1, 2, 12, 4)), mx.ones((1, 2, 12, 4)) * 2)
-
-    pooling = PoolingCache(ratio=2)
-    pooling.pooled = mx.ones((1, 5, 4)) * 3
-    pooling.buf_kv = mx.ones((1, 2, 4)) * 4
-    pooling.buf_gate = mx.ones((1, 2, 1)) * 5
-    pooling.remainder = 1
-    mx.eval(simple.keys, simple.values, pooling.state)
-
-    disk = DiskBlockStore(tmp_path, namespace="generic-checkpoint")
-    manager = APCManager(num_blocks=4, block_size=4, disk=disk)
-    assert manager.store_exact_cache(
-        token_ids, [(simple, SimpleKVCache()), CacheList(pooling)]
-    )
-    disk._q.join()
-    manager.close()
-
-    disk = DiskBlockStore(tmp_path, namespace="generic-checkpoint")
-    manager = APCManager(num_blocks=4, block_size=4, disk=disk)
-    restored, prefix_len = manager.lookup_exact_cache(token_ids + [99])
-    assert prefix_len == len(token_ids)
-    assert isinstance(restored[0], tuple)
-    assert isinstance(restored[0][0], SimpleKVCache)
-    assert restored[0][0].cache_length == len(token_ids)
-    assert isinstance(restored[1], CacheList)
-    restored_pool = restored[1].caches[0]
-    assert isinstance(restored_pool, PoolingCache)
-    assert restored_pool.ratio == 2 and restored_pool.remainder == 1
-    assert bool(mx.array_equal(restored_pool.pooled, pooling.pooled))
-    manager.close()
-
-
-def test_exact_disk_roundtrip_ring_and_indexed_kv_cache(tmp_path, monkeypatch):
-    """Subtype metadata survives checkpoint persistence and process restart."""
-    from mlx_vlm.models.minimax_m3_vl.language import MiniMaxM3KVCache
-    from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
-
-    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
-    monkeypatch.setenv("APC_EXACT_MIN_TOKENS", "1")
-    token_ids = list(range(10))
-
-    ring = RingSlidingKVCache(window_size=4)
-    ring.keys = mx.ones((1, 2, 8, 4))
-    ring.values = mx.ones((1, 2, 8, 4)) * 2
-    ring.prefill_length = 4
-    ring.offset = 11
-    ring._ring_pos = 3
-
-    indexed = MiniMaxM3KVCache()
-    indexed.kv_cache.update_and_fetch(
-        mx.ones((1, 2, 10, 4)) * 3, mx.ones((1, 2, 10, 4)) * 4
-    )
-    indexed.update_index_and_fetch(mx.ones((1, 1, 10, 4)) * 5)
-    mx.eval(ring.keys, ring.values, indexed.state)
-
-    disk = DiskBlockStore(tmp_path, namespace="special-checkpoint")
-    manager = APCManager(num_blocks=4, block_size=4, disk=disk)
-    assert manager.store_exact_cache(token_ids, [ring, indexed])
-    disk._q.join()
-    manager.close()
-
-    disk = DiskBlockStore(tmp_path, namespace="special-checkpoint")
-    manager = APCManager(num_blocks=4, block_size=4, disk=disk)
-    restored, prefix_len = manager.lookup_exact_cache(token_ids + [99])
-    assert prefix_len == len(token_ids)
-    restored_ring, restored_indexed = restored
-    assert isinstance(restored_ring, RingSlidingKVCache)
-    assert (
-        restored_ring.window_size,
-        restored_ring.prefill_length,
-        restored_ring.offset,
-        restored_ring._ring_pos,
-    ) == (4, 4, 11, 3)
-    assert isinstance(restored_indexed, MiniMaxM3KVCache)
-    assert restored_indexed.offset == 10
-    assert restored_indexed.index_offset == 10
-    assert bool(
-        mx.array_equal(
-            restored_indexed.index_keys,
-            indexed.index_keys[..., : indexed.index_offset, :],
-        )
-    )
-    manager.close()
-
-
-def _tiny_exact_cache(tokens):
-    from mlx_vlm.models.cache import ArraysCache
-
-    c = ArraysCache(size=1)
-    c[0] = mx.zeros((1, 2, max(1, len(tokens)), 32))
-    return [c]
-
-
-def test_a_short_prompt_cannot_poison_later_lookups():
-    manager = APCManager(num_blocks=8, block_size=16)
-    manager.store_exact_cache([1], _tiny_exact_cache([1]))
-
-    later = list(range(1, 400))
-    cache, reused = manager.lookup_exact_cache(later)
-
-    assert cache is None
-    assert reused == 0
-
-
-def test_model_processor_hook_contributes_and_is_defensive():
-    base = semantic_extra_hash(image_hash=5)
-
-    contributor = SimpleNamespace(apc_key_dependencies=lambda: ["adapter-x"])
-    assert semantic_extra_hash(image_hash=5, model=contributor) != base
-
-    plain = SimpleNamespace(foo=1)
-    boom = SimpleNamespace(
-        apc_key_dependencies=lambda: (_ for _ in ()).throw(ValueError)
-    )
-    not_callable = SimpleNamespace(apc_key_dependencies=5)
-    assert semantic_extra_hash(image_hash=5, model=plain) == base
-    assert semantic_extra_hash(image_hash=5, model=boom) == base
-    assert semantic_extra_hash(image_hash=5, model=not_callable) == base
-    assert model_key_dependencies(None, None) == ()
-
-
-def test_hash_payload_none_list_and_ref():
-    assert _hash_payload(None) is None
-    assert _hash_payload([]) is None
-    assert _hash_payload(["a.png", "b.png"]) == _hash_payload(["a.png", "b.png"])
-    assert _hash_payload("x") == hash_image_payload(image_ref="x")
-
-
-BLOCK_SIZE = 16
-TRACE_GROUP_SIZE = 64
-BITS = 8
-
-
-@pytest.fixture
-def _clear_apc_trace_env(monkeypatch):
-    monkeypatch.delenv("APC_TRACE", raising=False)
-    yield
-    monkeypatch.delenv("APC_TRACE", raising=False)
-
-
-@pytest.mark.usefixtures("_clear_apc_trace_env")
-def test_reject_records_emit_trace(monkeypatch, caplog):
-    monkeypatch.setenv("APC_TRACE", "1")
-    manager = APCManager(num_blocks=4, block_size=BLOCK_SIZE)
-    token_ids = list(range(BLOCK_SIZE))
-
-    class UnclonableCache:
-        keys = "not-an-array"
-        values = "not-an-array"
-
-    with caplog.at_level(logging.INFO, logger="mlx_vlm.apc"):
-        assert manager.store_exact_cache(token_ids, [UnclonableCache()]) is False
-    assert any("APC_TRACE reject" in r.message for r in caplog.records)
-    assert any("unclonable" in r.message for r in caplog.records)
-
-
-@pytest.mark.usefixtures("_clear_apc_trace_env")
-def test_quantized_with_dequant_ok():
-    # Last dim must be divisible by group_size for mx.quantize.
-    c = QuantizedKVCache(group_size=TRACE_GROUP_SIZE, bits=BITS)
-    c.update_and_fetch(
-        mx.random.normal((1, 2, 8, TRACE_GROUP_SIZE)),
-        mx.random.normal((1, 2, 8, TRACE_GROUP_SIZE)),
-    )
-    result = classify_layer_for_apc(c)
-    assert result.status == "ok"
-
-
-@pytest.mark.usefixtures("_clear_apc_trace_env")
-def test_unsupported_opaque_type():
-    class Bogus:
-        pass
-
-    result = classify_layer_for_apc(Bogus())
-    assert result.status == "unsupported"
-    assert result.reason
-
-
-@pytest.mark.usefixtures("_clear_apc_trace_env")
-def test_supported_model_ok(caplog):
-    class FakeLang:
-        def make_cache(self):
-            return [
-                BatchRotatingKVCache(32, [0]),
-                BatchQuantizedKVCache([0], group_size=TRACE_GROUP_SIZE, bits=BITS),
-                BatchKVCache([0]),
-            ]
-
-    with caplog.at_level(logging.INFO, logger="mlx_vlm.apc"):
-        result = self_check_model_apc(FakeLang(), kv_bits=8.0)
-    assert result.ok is True
-    assert result.apc_mode == "exact"
-    assert any("APC self-check ok" in r.message for r in caplog.records)
-
-
-@pytest.mark.usefixtures("_clear_apc_trace_env")
-def test_no_make_cache_not_ok(caplog):
-    class NoCache:
-        pass
-
-    result = self_check_model_apc(NoCache())
-    assert result.ok is False
-
-
-@pytest.mark.usefixtures("_clear_apc_trace_env")
-def test_does_not_raise_on_failure():
-    class FakeLang:
-        def make_cache(self):
-            raise RuntimeError("boom")
-
-    result = self_check_model_apc(FakeLang())
-    assert result.ok is False
-    assert result.notes
-
-
-B, H, D = 1, 2, 32
-GROUP_SIZE = 32
-SWA_MAX = 64
-
-
-def _rand_kv(batch=B, seq_len=32, heads=H, dim=D):
-    k = mx.random.normal((batch, heads, seq_len, dim))
-    v = mx.random.normal((batch, heads, seq_len, dim))
-    mx.eval(k, v)
-    return k, v
-
-
-def _max_abs_error(a: mx.array, b: mx.array) -> float:
-    return mx.max(mx.abs(a - b)).item()
-
-
-def test_pooling_cache_exact_apc_round_trips_warm_and_cold_rows():
-    from mlx_vlm.apc import make_warm_batch_exact_cache_multi, snapshot_prompt_cache_row
-
-    def make_row(prompt_length):
-        rotating = RotatingKVCache(max_size=16)
-        pooling = PoolingCache(ratio=4)
-        if prompt_length > 0:
-            keys = mx.arange(prompt_length * 3, dtype=mx.float32).reshape(
-                1, 1, prompt_length, 3
-            )
-            rotating.update_and_fetch(keys, keys + 1)
-            kv = keys.reshape(1, prompt_length, 3)
-            gate = mx.ones((1, prompt_length, 2), dtype=mx.float32)
-            ready_kv, _, _ = pooling.accumulate_windows(kv, gate, offset=0)
-            pooled_length = ready_kv.shape[1] // pooling.ratio
-            pooling.update_and_fetch(mx.ones((1, pooled_length, 3), dtype=mx.float32))
-        return [CacheList(rotating, pooling)]
-
-    warm = snapshot_prompt_cache_row(make_row(6), batch_idx=0)
-    cold = snapshot_prompt_cache_row(make_row(0), batch_idx=0)
-
-    assert warm is not None
-    assert cold is not None
-    merged, max_prefix = make_warm_batch_exact_cache_multi(
-        [warm, cold], prefix_lens=[6, 0]
-    )
-
-    assert merged is not None
-    assert max_prefix == 6
-    rotating, pooling = merged[0].caches
-    assert isinstance(rotating, BatchRotatingKVCache)
-    assert rotating.offset.tolist() == [6, 0]
-    assert isinstance(pooling, BatchPoolingCache)
-    assert pooling.ratio == 4
-    assert pooling.remainder == [2, 0]
-    assert pooling._pool_lengths == [1, 0]
-    assert pooling._processed == [6, 0]
-
-
-def test_batch_pooling_cache_merge_accepts_prefix_lengths():
-    merged = BatchPoolingCache.merge(
-        [PoolingCache(ratio=4), PoolingCache(ratio=4)], prefix_lens=[0, 0]
-    )
-
-    assert isinstance(merged, BatchPoolingCache)
-    assert merged.remainder == [0, 0]
-    assert merged._pool_lengths == [0, 0]
-    assert merged._processed == [0, 0]
-
-
-def test_pooling_cache_exact_batch_merge_forwards_prefix_lengths():
-    from mlx_vlm.apc_adapters import merge_cache_entries
-
-    warm = PoolingCache(ratio=4)
-    kv = mx.arange(18, dtype=mx.float32).reshape(1, 6, 3)
-    gate = mx.ones((1, 6, 2), dtype=mx.float32)
-    warm.accumulate_windows(kv, gate, offset=0)
-    warm.update_and_fetch(mx.ones((1, 1, 3), dtype=mx.float32))
-    cold = PoolingCache(ratio=4)
-
-    merged = merge_cache_entries([warm, cold], [6, 0])
-
-    assert isinstance(merged, BatchPoolingCache)
-    assert merged.remainder == [2, 0]
-    assert merged._pool_lengths == [1, 0]
-    assert merged._processed == [6, 0]
-    extracted_warm = merged.extract(0)
-    extracted_cold = merged.extract(1)
-    assert extracted_warm.remainder == 2
-    assert extracted_warm.pooled.shape == (1, 1, 3)
-    assert extracted_cold.empty()
-
-
-def _batch_cache(kind, left_padding, **kwargs):
-    if kind == "rotating":
-        return BatchRotatingKVCache(
-            kwargs.pop("max_size", SWA_MAX), list(left_padding), **kwargs
-        )
-    factory, defaults = {
-        "dense": (BatchKVCache, {}),
-        "uniform": (BatchQuantizedKVCache, dict(group_size=GROUP_SIZE, bits=BITS)),
-        "turbo": (BatchTurboQuantKVCache, dict(bits=4.0)),
-    }[kind]
-    return factory(list(left_padding), **(defaults | kwargs))
-
-
-def _fill_batch_cache(kind, left_padding, seq_len, **kwargs):
-    cache = _batch_cache(kind, left_padding, **kwargs)
-    keys, values = _rand_kv(batch=len(left_padding), seq_len=seq_len)
-    cache.update_and_fetch(keys, values)
-    mx.eval(cache.state)
-    return cache, keys, values
-
-
-@pytest.mark.parametrize("kind", ["rotating", "turbo"])
-def test_batch_cache_introspection(kind):
-    empty = _batch_cache(kind, [0, 0])
-    assert empty.empty() is True
-    assert empty.batch_size == 2
-    assert empty.is_single_row() is False
-    filled, _, _ = _fill_batch_cache(kind, [0], seq_len=8)
-    assert filled.empty() is False
-    assert filled.batch_size == 1
-    assert filled.is_single_row() is True
-
-
-@pytest.mark.parametrize(
-    "kind, expected", [("uniform", QuantizedKVCache), ("turbo", TurboQuantKVCache)]
-)
-def test_extract_empty_cache(kind, expected):
-    row = _batch_cache(kind, [0, 0]).extract(0)
-    assert isinstance(row, expected)
-    assert row.keys is None or row.offset == 0
-
-
-def test_layer_kv_float_helper_handles_quantized_tuple_keys():
-    from mlx_vlm.apc import layer_kv_for_apc
-
-    plain = KVCache()
-    k, v = _rand_kv(batch=1, seq_len=12)
-    plain.update_and_fetch(k, v)
-    pk, pv = layer_kv_for_apc(plain)
-    assert pk is not None and pv is not None
-    assert pk.shape[-2] == 12
-
-    q = QuantizedKVCache(group_size=GROUP_SIZE, bits=BITS)
-    k, v = _rand_kv(batch=1, seq_len=12)
-    q.update_and_fetch(k, v)
-    qk, qv = layer_kv_for_apc(q)
-    mx.eval(qk, qv)
-    assert qk.shape == (1, H, 12, D)
-    assert not isinstance(qk, tuple)
-
-    bq, _, _ = _fill_batch_cache("uniform", [0, 0], seq_len=12)
-    bk, bv = layer_kv_for_apc(bq, batch_idx=1)
-    mx.eval(bk, bv)
-    assert bk.shape[0] == 1
-    assert bk.shape[-2] <= 12
-
-
-def test_layer_kv_rejects_unknown_without_crashing():
-    from mlx_vlm.apc import layer_kv_for_apc
-
-    class Bogus:
-        keys = (1, 2, 3)
-        values = (4, 5, 6)
-        offset = 3
-
-    assert layer_kv_for_apc(Bogus()) == (None, None)
-
-
-def test_extract_b1_batch_rotating_equals_clone_after_extract():
-    cache, _, _ = _fill_batch_cache("rotating", [0], seq_len=16)
-    row = extract_prompt_cache_from_batch([cache], 0)
-    assert row is not None
-    cloned = _clone_prompt_cache_for_apc(row)
-    assert cloned is not None
-
-
-def _filter_reordered_row(cache):
-    cache.prepare(right_padding=[2, 0], lengths=[4, 6])
-    k, v = _rand_kv(batch=2, seq_len=3)
-    cache.update_and_fetch(k, v)
-
-    cache.filter(mx.array([1, 0], dtype=mx.int32))
-    cache.filter(mx.array([1], dtype=mx.int32))
-
-
-@pytest.mark.parametrize("kind", ["dense", "uniform"])
-def test_filter_keeps_pending_right_padding_aligned(kind):
-    cache = _batch_cache(kind, [0, 0])
-    _filter_reordered_row(cache)
-    assert cache._right_padding.tolist() == [2]
-    cache.finalize()
-    assert all(part.shape[0] == 1 for part in _array_leaves((cache.keys, cache.values)))
-    assert cache.offset.tolist() == [1]
-    assert cache.left_padding.tolist() == [2]
-
-
-def test_rotating_filter_keeps_pending_lengths_aligned():
-    cache = BatchRotatingKVCache(32, [0, 0])
-
-    _filter_reordered_row(cache)
-
-    assert cache._lengths.tolist() == [4]
-    k, v = _rand_kv(batch=1, seq_len=2)
-    out_k, out_v = cache.update_and_fetch(k, v)
-    mx.eval(out_k, out_v)
-    assert out_k.shape[0] == 1
-    assert out_v.shape[0] == 1
-
-    cache.finalize()
-    assert cache.keys.shape[0] == 1
-    assert cache.values.shape[0] == 1
-    assert cache.offset.tolist() == [4]
-    assert cache.left_padding.tolist() == [1]
-
-
-def test_extract_returns_turboquant_kv_cache():
-    from mlx_vlm.turboquant import TurboQuantKVCache
-
-    cache, k, _ = _fill_batch_cache("turbo", [0, 0], seq_len=24)
-    row = cache.extract(1)
-    assert isinstance(row, TurboQuantKVCache)
-    assert row.offset == 24
-    dk, dv = row.dequantize_for_apc()
-    mx.eval(dk, dv)
-    assert dk.shape == (1, H, 24, D)
-    # TurboQuant is lossy; keep a loose bound
-    assert _max_abs_error(dk, k[1:2]) < 2.0
-
-
-def test_snapshot_and_exact_store_multi_row():
-    from mlx_vlm.apc import snapshot_prompt_cache_row
-
-    seq_len = 2 * BLOCK_SIZE
-    token_ids = list(range(seq_len))
-    turbo, _, _ = _fill_batch_cache("turbo", [0, 0], seq_len=seq_len)
-    batch_kv, _, _ = _fill_batch_cache("dense", [0, 0], seq_len=seq_len)
-    prompt_cache = [turbo, batch_kv]
-
-    manager = APCManager(num_blocks=4, block_size=BLOCK_SIZE)
-    for bi in (0, 1):
-        snap = snapshot_prompt_cache_row(prompt_cache, batch_idx=bi)
-        assert snap is not None
-        for c in snap:
-            assert not type(c).__name__.startswith("Batch")
-        assert manager.store_exact_cache(token_ids, snap, extra_hash=bi + 1)
-
-    warm0, m0 = manager.lookup_exact_cache(token_ids + [9], extra_hash=1)
-    warm1, m1 = manager.lookup_exact_cache(token_ids + [9], extra_hash=2)
-    assert m0 == seq_len and m1 == seq_len
-    assert warm0 is not None and warm1 is not None
-
-
-def test_layer_kv_for_apc_batch_turbo():
-    from mlx_vlm.apc import layer_kv_for_apc
-
-    cache, _, _ = _fill_batch_cache("turbo", [0, 0], seq_len=12)
-    k, v = layer_kv_for_apc(cache, batch_idx=1)
-    mx.eval(k, v)
-    assert k is not None and v is not None
-    assert k.shape[0] == 1
-    assert k.shape[-2] <= 12
-    assert not isinstance(k, tuple)
-
-
-@pytest.fixture
-def _seed_component_adapters():
-    mx.random.seed(0)
-
-
-@pytest.mark.usefixtures("_seed_component_adapters")
-def test_chunked_snapshot_preserves_trimmed_offset():
-    source = C.ChunkedKVCache(chunk_size=4)
-    keys = mx.arange(48, dtype=mx.float32).reshape(1, 1, 6, 8)
-    source.update_and_fetch(keys, keys + 1)
-    source.maybe_trim_front()
-    adapter = A.CheckpointAdapter()
-    restored = C.ChunkedKVCache(chunk_size=4)
-    adapter.restore(restored, adapter.capture(source, 6))
-    assert (restored.offset, restored.start_position) == (6, 2)
-    for actual, expected in zip(
-        restored.update_and_fetch(keys[..., :1, :], keys[..., :1, :] + 1),
-        source.update_and_fetch(keys[..., :1, :], keys[..., :1, :] + 1),
-    ):
-        assert bool(mx.array_equal(actual, expected))
-
-
-@pytest.mark.usefixtures("_seed_component_adapters")
-def test_apc_mode_layouts():
-    assert A.apc_mode([C.KVCache(), C.KVCache()]) == "block"
-    assert A.apc_mode([C.KVCache(), C.ArraysCache(2), C.KVCache()]) == "exact"
-    assert A.apc_mode([C.RotatingKVCache(max_size=64)]) == "exact"
-    assert A.apc_mode([]) is None
-
-
-@pytest.mark.usefixtures("_seed_component_adapters")
-def test_build_prefix_cache_plan():
-    class _Stub:
-        def make_cache(self):
-            return [C.KVCache(), C.ArraysCache(2)]
-
-    plan = A.build_prefix_cache_plan(_Stub())
-    assert len(plan.components) == 2
-    assert plan.restorable
-    assert plan.capabilities == [A.Capability.PAGEABLE, A.Capability.CHECKPOINT]
-    assert len(plan.groups) == 2
-    assert plan.is_hybrid
-    assert plan.strategy == "checkpoint"
-    assert "PrefixCachePlan" in plan.describe()
-
-
-@pytest.mark.usefixtures("_seed_component_adapters")
-def test_dense_plan_has_one_pageable_group():
-    plan = A.build_prefix_cache_plan_from_caches([C.KVCache(), C.KVCache()])
-    assert plan.restorable
-    assert not plan.is_hybrid
-    assert plan.strategy == "block"
-    assert len(plan.groups) == 1
-    assert plan.groups[0].layer_indices == (0, 1)
-
-
-def _clone(c):
-    et = []
-    out = A.clone_cache_entry(c, min_capacity_tokens=None, eval_targets=et)
-    mx.eval(et)
-    return out
-
-
-@pytest.mark.usefixtures("_seed_component_adapters")
-@pytest.mark.parametrize("length", [0, 4, 48])
-def test_buffered_rotating_snapshot_continuation(length):
-    source = C.BufferedRotatingKVCache(max_size=8, buffer_size=3)
-    for token in range(length):
-        keys = mx.full((1, 1, 1, 4), token, dtype=mx.float32)
-        source.update_and_fetch(keys, keys + 1)
-    restored = _clone(source)
-    assert restored.meta_state == source.meta_state
-
-    for count in (3, 12, 1):
-        assert mx.array_equal(
-            restored.make_mask(2, return_array=True),
-            source.make_mask(2, return_array=True),
-        ).item()
-        keys = mx.random.normal((1, 1, count, 4))
-        for actual, expected in zip(
-            restored.update_and_fetch(keys, keys + 1),
-            source.update_and_fetch(keys, keys + 1),
-        ):
-            assert mx.array_equal(actual, expected).item()
-        restored.trim(1)
-        source.trim(1)
-        assert restored.meta_state == source.meta_state
-
-
-@pytest.mark.usefixtures("_seed_component_adapters")
-@pytest.mark.parametrize("used_slot", [None, 0, 1])
-def test_arrays_merge_preserves_optional_state(used_slot):
-    rows = [C.ArraysCache(2) for _ in range(3)]
-    if used_slot is not None:
-        rows[0][used_slot] = mx.ones((1, 4))
-        rows[2][used_slot] = mx.full((1, 4), 2.0)
-    merged = A.merge_cache_entries(rows, [4, 0, 4])
-    assert merged.empty() is (used_slot is None)
-    if used_slot is None:
-        assert merged.cache == [None, None]
-        assert merged.left_padding.tolist() == [0, 0, 0]
+def same_arrays(left, right):
+    if isinstance(left, mx.array):
+        assert (left.shape, left.dtype) == (right.shape, right.dtype)
+        assert mx.array_equal(left, right).item()
+    elif isinstance(left, (tuple, list, dict)):
+        if isinstance(left, dict):
+            assert left.keys() == right.keys()
+            left, right = left.values(), right.values()
+        for a, b in zip(left, right, strict=True):
+            same_arrays(a, b)
     else:
-        assert merged[1 - used_slot] is None
-        assert merged[used_slot].tolist() == [[1] * 4, [0] * 4, [2] * 4]
+        assert left == right
 
 
-@pytest.mark.usefixtures("_seed_component_adapters")
-def test_ring_sliding_clone_roundtrip():
-    from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
+def same_cache(left, right):
+    assert type(left) is type(right)
+    if isinstance(left, (list, tuple)):
+        for a, b in zip(left, right, strict=True):
+            same_cache(a, b)
+    else:
+        same_arrays(left.state, right.state)
+        same_arrays(left.meta_state, right.meta_state)
+        if isinstance(left, C.CacheList):
+            same_cache(left.caches, right.caches)
 
-    ring = RingSlidingKVCache(window_size=4)
-    assert A.apc_exact_eligible(ring) is True and A.apc_block_eligible(ring) is False
-    ring.update_and_fetch(
-        mx.random.normal((1, 2, 6, 8)), mx.random.normal((1, 2, 6, 8))
-    )
-    for _ in range(7):
-        ring.update_and_fetch(
-            mx.random.normal((1, 2, 1, 8)), mx.random.normal((1, 2, 1, 8))
-        )
-    mx.eval(ring.keys, ring.values)
-    cl = _clone(ring)
-    assert type(cl).__name__ == "RingSlidingKVCache"
-    assert cl.window_size == ring.window_size and cl._ring_pos == ring._ring_pos
-    assert cl.prefill_length == ring.prefill_length and cl.offset == ring.offset
-    k, v = mx.random.normal((1, 2, 1, 8)), mx.random.normal((1, 2, 1, 8))
-    ka, va = ring.update_and_fetch(k, v)
-    kb, vb = cl.update_and_fetch(k, v)
-    mx.eval(ka, va, kb, vb)
-    assert bool(mx.array_equal(ka, kb)) and bool(mx.array_equal(va, vb))
 
+def kv(length=32, batch=1, heads=2, dim=32):
+    pair = [mx.random.normal((batch, heads, length, dim)) for _ in range(2)]
+    mx.eval(pair)
+    return pair
 
-@pytest.mark.usefixtures("_seed_component_adapters")
-def test_minimax_clone_roundtrip():
-    from mlx_vlm.models.minimax_m3_vl.language import MiniMaxM3KVCache
 
-    mm = MiniMaxM3KVCache()
-    assert A.apc_exact_eligible(mm) is True
-    mm.update_and_fetch(mx.random.normal((1, 2, 5, 8)), mx.random.normal((1, 2, 5, 8)))
-    mm.update_index_and_fetch(mx.random.normal((1, 2, 5, 8)))
-    mx.eval(mm.state[0], mm.index_keys)
-    mc = _clone(mm)
-    assert (
-        type(mc).__name__ == "MiniMaxM3KVCache" and mc.index_offset == mm.index_offset
-    )
-    k, v = mx.random.normal((1, 2, 1, 8)), mx.random.normal((1, 2, 1, 8))
-    oa, _ = mm.update_and_fetch(k, v)
-    ob, _ = mc.update_and_fetch(k, v)
-    mx.eval(oa, ob)
-    assert bool(mx.array_equal(oa, ob))
+def filled(cache, length=32, batch=1, heads=2, dim=32):
+    cache.update_and_fetch(*kv(length, batch, heads, dim))
+    mx.eval(cache.state)
+    return cache
 
 
-@pytest.mark.usefixtures("_seed_component_adapters")
-def test_ring_sliding_batch_merge_rejects_instead_of_crashing():
-    from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
-
-    ring = RingSlidingKVCache(window_size=4)
-    ring.update_and_fetch(mx.ones((1, 2, 3, 4)), mx.ones((1, 2, 3, 4)))
-    assert A.merge_cache_entries([ring], [3]) is None
-
-
-@pytest.mark.usefixtures("_seed_component_adapters")
-def test_minimax_batch_merge_still_supported():
-    from mlx_vlm.models.minimax_m3_vl.language import MiniMaxM3KVCache
-
-    caches = []
-    for _ in range(2):
-        mm = MiniMaxM3KVCache()
-        k = mx.random.normal((1, 2, 5, 8))
-        v = mx.random.normal((1, 2, 5, 8))
-        idx = mx.random.normal((1, 2, 5, 8))
-        mx.eval(k, v, idx)
-        mm.update_and_fetch(k, v)
-        mm.update_index_and_fetch(idx)
-        caches.append(mm)
-    assert A.merge_cache_entries(caches, [5, 5]) is not None
-
-
-def _model_source_root() -> Path:
-    return Path(model_packages.__file__).resolve().parent
-
-
-def _call_name(node: ast.Call) -> str | None:
-    if isinstance(node.func, ast.Name):
-        return node.func.id
-    if isinstance(node.func, ast.Attribute):
-        return node.func.attr
-    return None
-
-
-def _cache_factories_by_package() -> dict[str, set[str]]:
-    """Statically discover cache constructors inside every ``make_cache``."""
-    found: dict[str, set[str]] = {}
-    for path in _model_source_root().rglob("*.py"):
-        tree = ast.parse(path.read_text())
-        package = path.relative_to(_model_source_root()).parts[0]
-        for function in ast.walk(tree):
-            if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            if function.name != "make_cache":
-                continue
-            names = found.setdefault(package, set())
-            for node in ast.walk(function):
-                if isinstance(node, ast.Call):
-                    name = _call_name(node)
-                    if name is not None and (
-                        name.endswith("Cache") or name == "CacheList"
-                    ):
-                        names.add(name)
-    return found
-
-
-def _cache_samples():
-    """One unpopulated instance of every cache family used by model sources."""
-    return {
-        "ArraysCache": ArraysCache(2),
-        "CacheList": CacheList(KVCache(), ArraysCache(1)),
-        "ChunkedKVCache": ChunkedKVCache(chunk_size=16),
-        "HyV4KVCache": HyV4KVCache(),
-        "KVCache": KVCache(),
-        "MiniMaxM3KVCache": MiniMaxM3KVCache(),
-        "PoolingCache": PoolingCache(ratio=2),
-        "QSAKVCache": QSAKVCache(),
-        "RingSlidingKVCache": RingSlidingKVCache(window_size=16),
-        "RotatingKVCache": RotatingKVCache(max_size=16),
-        "SimpleKVCache": SimpleKVCache(),
-        "StaticPrefixKVCache": StaticPrefixKVCache(max_size=16),
-        "Z1TCache": Z1TCache(),
-    }
-
-
-def _cache_names_in_callable(function) -> set[str]:
-    try:
-        tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
-    except (OSError, TypeError, IndentationError):
-        return set()
-    names = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            name = _call_name(node)
-            if name is not None and (name.endswith("Cache") or name == "CacheList"):
-                names.add(name)
-    return names
-
-
-def _model_cache_contract(model_cls: type) -> tuple[str, ...]:
-    """Resolve a wrapper's cache factory without constructing the wrapper."""
-    visited: set[type] = set()
-
-    def visit(cls: type) -> set[str]:
-        if cls in visited:
-            return set()
-        visited.add(cls)
-
-        make_cache = getattr(cls, "make_cache", None)
-        if callable(make_cache):
-            names = _cache_names_in_callable(make_cache)
-            if names:
-                return names
-
-        # Wrapper factories and LanguageModel factories often delegate to a
-        # class imported as one of these conventional names.
-        functions = [getattr(cls, "__init__", None), make_cache]
-        for function in functions:
-            namespace = getattr(function, "__globals__", {})
-            for name in ("LanguageModel", "TextModel", "Model"):
-                target = namespace.get(name)
-                if isinstance(target, type) and target is not cls:
-                    names = visit(target)
-                    if names:
-                        return names
-        return set()
-
-    # No custom factory means generation uses one ordinary KVCache per layer.
-    return tuple(sorted(visit(model_cls) or {"KVCache"}))
-
-
-def _all_generative_model_contracts(
-    local_factories: dict[str, set[str]],
-) -> list[tuple[str, tuple[str, ...]]]:
-    contracts = []
-    for info in pkgutil.iter_modules(model_packages.__path__):
-        if not info.ispkg or info.name.startswith("_"):
-            continue
-        try:
-            module = importlib.import_module(f"mlx_vlm.models.{info.name}")
-        except ModuleNotFoundError:
-            # Some Omni packages depend on a newer optional companion package
-            # than the minimum version in the lockfile. Their cache factories
-            # are still fully discoverable from local source, so keep them in
-            # the weight-free APC matrix without importing that dependency.
-            names = local_factories.get(info.name)
-            if names:
-                contracts.append((info.name, tuple(sorted(names))))
-            continue
-        model_cls = getattr(module, "Model", None)
-        if model_cls is not None and callable(
-            getattr(model_cls, "get_input_embeddings", None)
-        ):
-            names = local_factories.get(info.name) or set(
-                _model_cache_contract(model_cls)
-            )
-            contracts.append((info.name, tuple(sorted(names))))
-    return sorted(contracts)
-
-
-def _populated_cache(name: str, token_count: int):
-    shape = (1, 1, token_count, 4)
-    if name == "HyV4KVCache":
-        cache = HyV4KVCache()
-        cache.keys = mx.ones(shape)
-        cache.values = mx.ones(shape) * 2
-        cache.offset = token_count
-        return cache
-    if name == "KVCache":
-        cache = KVCache()
-        cache.keys = mx.ones(shape)
-        cache.values = mx.ones(shape) * 2
-        cache.offset = token_count
-        return cache
-    if name == "RotatingKVCache":
-        cache = RotatingKVCache(max_size=token_count * 2)
-        cache.keys = mx.ones(shape)
-        cache.values = mx.ones(shape) * 2
-        cache.offset = token_count
-        cache._idx = token_count
-        return cache
-    if name == "ChunkedKVCache":
-        cache = ChunkedKVCache(chunk_size=8)
-        cache.keys = mx.ones(shape)
-        cache.values = mx.ones(shape) * 2
-        cache.offset = token_count
-        cache.start_position = 0
-        return cache
-    if name == "ArraysCache":
-        cache = ArraysCache(2)
-        cache.cache = [mx.ones((1, 2, 4)), mx.ones((1, 1, 4)) * 2]
-        return cache
-    if name == "PoolingCache":
-        cache = PoolingCache(ratio=2)
-        cache.pooled = mx.ones((1, token_count // 2, 4))
-        cache.buf_kv = mx.ones((1, 2, 4))
-        cache.buf_gate = mx.ones((1, 2, 1))
-        cache.remainder = 1
-        return cache
-    if name == "SimpleKVCache":
-        cache = SimpleKVCache()
-        cache.update_and_fetch(mx.ones(shape), mx.ones(shape) * 2)
-        return cache
-    if name == "StaticPrefixKVCache":
-        cache = StaticPrefixKVCache(max_size=token_count)
-        cache.keys = mx.ones(shape)
-        cache.values = mx.ones(shape) * 2
-        cache.offset = token_count
-        return cache
-    if name == "RingSlidingKVCache":
-        cache = RingSlidingKVCache(window_size=token_count)
-        cache.keys = mx.ones(shape)
-        cache.values = mx.ones(shape) * 2
-        cache.offset = token_count
-        return cache
-    if name == "MiniMaxM3KVCache":
-        cache = MiniMaxM3KVCache()
-        cache.update_and_fetch(mx.ones(shape), mx.ones(shape) * 2)
-        cache.update_index_and_fetch(mx.ones(shape))
-        return cache
-    if name == "QSAKVCache":
-        cache = QSAKVCache()
-        cache.keys = mx.ones(shape)
-        cache.values = mx.ones(shape) * 2
-        cache.offset = token_count
-        cache.index_keys = mx.ones((1, token_count, 4)) * 3
-        cache.index_position_ids = mx.arange(token_count, dtype=mx.int64).reshape(
-            1, token_count
-        )
-        return cache
-    if name == "CacheList":
-        return CacheList(
-            _populated_cache("KVCache", token_count),
-            _populated_cache("ArraysCache", token_count),
-        )
-    if name == "Z1TCache":
-        cache = Z1TCache()
-        cache.offset = token_count
-        cache.cum_eKV = mx.ones((1, 4))
-        cache.cum_eK = mx.ones((1, 4)) * 2
-        cache.win_eKV = mx.ones((1, 3, 4)) * 3
-        cache.win_eK = mx.ones((1, 3, 4)) * 4
-        return cache
-    raise AssertionError(f"No populated APC sample for {name}")
-
-
-MODEL_CACHE_FACTORIES = _cache_factories_by_package()
-MODEL_CACHE_CONTRACTS = _all_generative_model_contracts(MODEL_CACHE_FACTORIES)
-CACHE_CONTRACTS = sorted({names for _, names in MODEL_CACHE_CONTRACTS})
-
-
-def test_all_generative_model_packages_discovered_without_weights():
-    """Every discovered LM/VLM/Omni contract has local architecture source."""
-    # This is intentionally a lower bound: new architectures increase it,
-    # while accidentally dropping a large family makes the audit fail loudly.
-    assert len(MODEL_CACHE_CONTRACTS) >= 120
-    for package, _ in MODEL_CACHE_CONTRACTS:
-        assert (_model_source_root() / package).is_dir()
-
-
-def test_every_model_cache_factory_has_a_restorable_apc_adapter():
-    """All cache types referenced by all model factories are APC-compatible."""
-    by_package = MODEL_CACHE_FACTORIES
-    discovered = set().union(*by_package.values())
-    samples = _cache_samples()
-    unknown = discovered - samples.keys()
-    assert not unknown, (
-        "New model cache types need an APC adapter/sample: " f"{sorted(unknown)}"
-    )
-
-    # Exercise planning and cloning, not just name registration. Empty caches
-    # are sufficient because the protocol and constructor metadata are what
-    # vary across architectures; populated round-trips live in the APC tests.
-    for name in sorted(discovered):
-        cache = samples[name]
-        plan = build_prefix_cache_plan_from_caches([cache])
-        assert plan.restorable, f"{name}: {plan.describe()}"
-        eval_targets: list[mx.array] = []
-        clone = clone_cache_entry(
-            cache, min_capacity_tokens=None, eval_targets=eval_targets
-        )
-        assert clone is not None, f"{name} cannot be cloned for APC"
-        assert all(not c.fallback for c in A.cache_memory_components([clone], 0)), name
-
-    # Also build one heterogeneous plan per model package. This catches a
-    # future combination that is individually registered but cannot be
-    # coordinated as one architecture.
-    for package, names in by_package.items():
-        if not names:
-            continue
-        plan = build_prefix_cache_plan_from_caches(
-            [samples[name] for name in sorted(names)]
-        )
-        assert plan.restorable, f"{package}: {plan.describe()}"
-
-    assert len(by_package) >= 70
-
-
-@pytest.mark.parametrize(
-    "cache_names", CACHE_CONTRACTS, ids=["+".join(names) for names in CACHE_CONTRACTS]
-)
-def test_cache_hit_for_each_model_cache_contract(cache_names, monkeypatch):
-    """A synthetic second request hits APC for every distinct cache layout."""
-    monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "2")
-    block_size = 8
-    token_count = 2 * block_size
-    token_ids = list(range(token_count))
-    caches = [_populated_cache(name, token_count) for name in cache_names]
-    plan = build_prefix_cache_plan_from_caches(caches)
-    assert plan.restorable, f"{cache_names}: {plan.describe()}"
-
-    manager = APCManager(num_blocks=8, block_size=block_size)
-
-    class SyntheticModel:
-        def make_cache(self):
-            return caches
-
-    coordinator = manager.coordinator(SyntheticModel())
-    assert coordinator.strategy == plan.strategy, cache_names
-    try:
-        if plan.strategy == "block":
-            stored = manager.store_kv_blocks(
-                token_ids,
-                [cache.keys for cache in caches],
-                [cache.values for cache in caches],
-            )
-            manager.release(stored)
-        else:
-            assert manager.store_exact_cache(token_ids, caches), cache_names
-
-        hit = coordinator.lookup(
-            token_ids + [999],
-            extra_hash=0,
-            safe_lookup_min=0,
-            suffix_is_text_only=lambda _prefix_len: True,
-            prefix_has_media=lambda _prefix_len: False,
-        )
-        assert hit is not None, cache_names
-        assert hit["prefix_len"] == token_count, cache_names
-        stats = manager.stats_snapshot()
-        if plan.strategy == "block":
-            assert stats["lookups_hit"] == 1, cache_names
-        else:
-            assert hit["warm_cache"] is not None, cache_names
-            assert stats["exact_hits"] == 1, cache_names
-        coordinator.release_hit(hit)
-    finally:
-        manager.close()
-
-
-def test_dense_models_without_make_cache_use_generation_fallback():
-    """VLM language backbones without a custom factory remain pageable."""
-
-    class DenseLanguageModel:
-        layers = [object(), object(), object()]
-
-    class VisionLanguageModel:
-        language_model = DenseLanguageModel()
-
-    plan = build_prefix_cache_plan(VisionLanguageModel())
-    assert plan.restorable
-    assert plan.strategy == "block"
-    assert len(plan.components) == len(DenseLanguageModel.layers)
-    assert len(plan.groups) == 1
-
-
-@pytest.mark.parametrize(
-    "base,kwargs",
-    [
-        (C.ConcatenateKVCache, {}),
-        (C.SimpleKVCache, {}),
-        (C.KVCache, {}),
-        (C.QuantizedKVCache, {}),
-        (C.BatchKVCache, {"left_padding": [0]}),
-        (C.BatchQuantizedKVCache, {"left_padding": [0]}),
-    ],
-)
-def test_kv_subclasses_inherit_default_memory_profile(base, kwargs):
-    class CustomKV(base):
-        pass
-
-    cache = CustomKV(**kwargs)
-    empty = A.cache_memory_components([cache], 0)[0]
-    assert not empty.fallback and empty.footprint(6000) == 0
-
-    keys = mx.ones((1, 1, 16, 64))
-    cache.update_and_fetch(keys, keys + 1)
-    profile = A.cache_memory_components([cache], 16)[0]
-    assert not profile.fallback
-    assert profile.source_bytes == C.cache_nbytes((cache.keys, cache.values))
-    future = CustomKV(**kwargs)
-    keys = mx.ones((1, 1, 6000, 64))
-    future.update_and_fetch(keys, keys + 1)
-    assert profile.footprint(6000) == C.cache_nbytes((future.keys, future.values))
-
-
-def test_subclasses_inherit_specialized_memory_profile():
-    class CustomState(C.ArraysCache):
-        pass
-
-    cache = CustomState(1)
-    cache[0] = mx.ones((1, 64))
-    profile = A.cache_memory_components([cache], 16)[0]
-    assert not profile.fallback
-    assert profile.footprint(6000) == cache.nbytes
-
-
-@pytest.mark.parametrize(
-    "make_cache,batch_size,mrope",
-    [
-        (QSAKVCache, 1, False),
-        (lambda: QSAQuantizedKVCache(32, 4), 1, True),
-        (lambda: BatchQSAKVCache([0, 0]), 2, True),
-        (lambda: BatchQSAKVCache([0, 3]), 2, False),
-    ],
-)
-@pytest.mark.parametrize("seed_length", [1, 16])
-def test_qsa_profiles_include_indexer_and_block_growth(
-    make_cache, batch_size, mrope, seed_length
-):
-    _, config = _apc_config("qwen4_exp", text_only=True)
-    indexer = Qwen4ExpAttention(config).indexer
-    cache = make_cache()
-
-    def advance(start, length):
-        positions = mx.broadcast_to(
-            mx.arange(start, start + length), (batch_size, length)
-        )
-        if mrope:
-            positions = mx.broadcast_to(positions, (3, batch_size, length))
-        indexer.select_from_projected(
-            mx.ones((batch_size, length, 24)), cache, positions
-        )
-        cache.update_and_fetch(
-            mx.ones((batch_size, 1, length, 32), dtype=mx.float16),
-            mx.ones((batch_size, 1, length, 64), dtype=mx.float16),
-        )
-        mx.eval(cache.state)
-
-    empty = cache_memory_components([cache], 0)[0]
-    assert not empty.fallback and empty.footprint(6000) == 0
-    advance(0, seed_length)
-    cache = clone_cache_entry(cache, min_capacity_tokens=None, eval_targets=[])
-    profile = cache_memory_components([cache], seed_length, batch_size=batch_size)[0]
-    assert not profile.fallback
-    assert profile.source_bytes * batch_size == cache.nbytes
-    for start in range(seed_length, 6000, 257):
-        advance(start, min(257, 6000 - start))
-    estimate = batch_size * profile.footprint(6000, 257)
-    assert cache.nbytes <= estimate < 1.3 * cache.nbytes
-
-
-def _allocated_kv(length, value=1):
-    cache = KVCache()
-    cache.step = 1  # Allocate exactly the requested length.
+def allocated(length, value=1):
+    cache = C.KVCache()
+    cache.step = 1
     cache.keys = mx.full((1, 1, length, 4), value, dtype=mx.float32)
-    cache.values = mx.full((1, 1, length, 4), value + 1, dtype=mx.float32)
+    cache.values = cache.keys + 1
     cache.offset = length
     mx.eval(cache.state)
     return cache
 
 
-def _coordinator(manager, caches):
-    return manager.coordinator(SimpleNamespace(make_cache=lambda: caches))
+def batch_cache(kind, padding=(0,), **kwargs):
+    factory, defaults = {
+        "dense": (C.BatchKVCache, {}),
+        "rotating": (C.BatchRotatingKVCache, {"max_size": 64}),
+        "uniform": (C.BatchQuantizedKVCache, {"group_size": 32, "bits": 8}),
+        "turbo": (BatchTurboQuantKVCache, {"bits": 4.0}),
+    }[kind]
+    return factory(left_padding=list(padding), **(defaults | kwargs))
+
+
+def clone(cache):
+    targets = []
+    result = A.clone_cache_entry(cache, min_capacity_tokens=None, eval_targets=targets)
+    mx.eval(targets)
+    return result
+
+
+def cache_model(caches):
+    return NS(make_cache=lambda: caches)
+
+
+def coordinate(manager, caches):
+    return manager.coordinator(cache_model(caches))
 
 
 @pytest.fixture
-def memory_manager(monkeypatch, tmp_path):
-    monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "16")
-    monkeypatch.setenv("APC_DISK_MIN_FREE_RAM_GB", "0")
-    managers = []
+def managers(tmp_path, monkeypatch):
+    """Own writers and readers, including reopened namespaces and memory budgets."""
+    owned = []
 
-    def make(*, budget=4096, disk=False):
-        store = DiskBlockStore(tmp_path, namespace="memory") if disk else None
-        manager = APCManager(num_blocks=16, block_size=16, disk=store)
-        manager.memory_max_bytes = budget
-        manager.memory_reserve_bytes = 0
-        monkeypatch.setattr(manager, "_memory_headroom", lambda: 1 << 40)
-        managers.append(manager)
+    def make(
+        tier="memory", *, blocks=8, block=16, namespace="unit", budget=None, **settings
+    ):
+        disk = None
+        if tier != "memory":
+            disk = P.DiskBlockStore(tmp_path, namespace=namespace)
+        manager = P.APCManager(num_blocks=blocks, block_size=block, disk=disk)
+        if tier == "disk-only":
+            manager._exact_cache_max = 0
+        if budget is not None:
+            manager.memory_max_bytes = budget
+            manager.memory_reserve_bytes = 0
+            monkeypatch.setattr(manager, "_memory_headroom", lambda: 1 << 40)
+        for key, value in settings.items():
+            setattr(manager, key, value)
+        owned.append(manager)
         return manager
 
     yield make
-    for manager in managers:
+    for manager in reversed(owned):
         manager.close()
 
 
 @pytest.fixture
-def disk_reader(memory_manager):
-    """Seed a disk checkpoint and return a manager with no resident entries."""
-
-    def make(tokens, caches, *, budget=1 << 20):
-        writer = memory_manager(budget=budget, disk=True)
-        assert writer.store_exact_cache(tokens, caches)
-        writer.disk.flush()
-        return memory_manager(budget=budget, disk=True)
-
-    return make
-
-
-def test_custom_state_accounting_without_snapshot_or_evaluation():
-    class CustomCache:
-        def __init__(self):
-            self.state = {"kv": mx.ones((2, 3)), "nested": [mx.zeros((4,))]}
-            self.meta_state = {"offsets": mx.zeros((2,), dtype=mx.int32)}
-
-        def prefix_cache_snapshot(self):
-            raise AssertionError("Memory accounting must not clone the state")
-
-    cache = CustomCache()
-    assert _cache_nbytes([cache]) == 48
-    assert _cache_nbytes([cache, cache]) == 48
-
-
-@pytest.mark.parametrize(
-    "make_cache",
-    [KVCache, QuantizedKVCache, lambda: RotatingKVCache(max_size=512)],
-    ids=["dense", "quantized", "windowed"],
-)
-def test_kv_growth_ignores_unused_capacity(memory_manager, make_cache):
-    capacity = 256
-    cache = make_cache()
-    cache.step = 1
-    tensor = mx.ones((1, 1, capacity, 64))
-    cache.update_and_fetch(tensor, tensor + 1)
-    cache.trim(capacity - 16)
-    cache.step = 256
-    allocated_bytes = _cache_nbytes(cache)
-    per_token = allocated_bytes // capacity
-    manager = memory_manager(budget=1 << 20)
-    coordinator = _coordinator(manager, [cache])
-    assert manager.store_exact_cache(list(range(16)), [cache])
-
-    coordinator.prepare_prefill([2000, 2000, 2000])
-    assert manager.stats_snapshot()["prefill_reserve_bytes"] == (
-        2 * 3 * 2048 * per_token
+def memory_manager(managers, monkeypatch):
+    monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "16")
+    monkeypatch.setenv("APC_DISK_MIN_FREE_RAM_GB", "0")
+    return lambda budget=4096, disk=False: managers(
+        "disk" if disk else "memory", budget=budget, blocks=16
     )
-    assert _cache_nbytes(cache) == allocated_bytes
-    assert allocated_bytes == capacity * _cache_nbytes(cache.state) // 16
 
 
-def test_disk_expansion_is_admitted_before_reserving_capacity(disk_reader, monkeypatch):
-    tokens = list(range(16))
-    reader = disk_reader(tokens, [_allocated_kv(16)], budget=4096)
-    monkeypatch.setattr(reader, "_memory_headroom", lambda: 4096)
-    monkeypatch.setattr(
-        KVCache, "prefix_cache_reserve", lambda *a: pytest.fail("expanded")
+@pytest.fixture
+def prefix_manager(managers, monkeypatch):
+    monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "2")
+    monkeypatch.setenv("APC_DISK_MIN_FREE_RAM_GB", "0")
+    return managers
+
+
+def disk_roundtrip(managers, tokens, caches, **kwargs):
+    writer = managers("disk", **kwargs)
+    assert writer.store_exact_cache(tokens, caches)
+    writer.disk.flush()
+    writer.close()
+    reader = managers("disk", **kwargs)
+    restored, count = reader.lookup_exact_cache(tokens + [999])
+    assert count == len(tokens) and restored is not None
+    assert reader.stats.disk_hits == 1
+    return restored, reader
+
+
+def store_blocks(manager, tokens, layers=2, dim=4, extra_hash=0):
+    pairs = [kv(len(tokens), heads=1, dim=dim) for _ in range(layers)]
+    return manager.store_kv_blocks(
+        tokens, *map(list, zip(*pairs)), extra_hash=extra_hash
     )
-    assert reader.lookup_exact_cache(tokens + [99] * 6000) == (None, 0)
-    assert reader.stats.memory_skips == 1
 
 
-def test_padded_kv_admission_counts_allocated_buffers(memory_manager, monkeypatch):
-    cache = _allocated_kv(256)
-    cache.offset = 16
-    manager = memory_manager(budget=1024)
-    monkeypatch.setattr(
-        apc, "_clone_prompt_cache_for_apc", lambda *a, **kw: pytest.fail("cloned")
+def apc_config(name, *, text_only=False):
+    profile = DATA["apc"][name]
+    cases = {c["id"]: c for c in DATA["cases"]}
+    case = cases[profile["case"]] if "case" in profile else profile
+
+    fields = copy.deepcopy(case["config"])
+
+    def merge(target, updates):
+        for key, value in updates.items():
+            if isinstance(value, dict) and isinstance(target.get(key), dict):
+                merge(target[key], value)
+            else:
+                target[key] = copy.deepcopy(value)
+
+    merge(fields, profile["config"])
+    module = importlib.import_module("mlx_vlm.models." + case["module"])
+    if text_only:
+        return module, build_config(module, fields["text_config"], "TextConfig")
+    return module, build_config(module, fields)
+
+
+def language_model(name):
+    module, config = apc_config(name)
+    if name == "qwen3_5":
+        return module.LanguageModel(config.text_config, config)
+    return module.Model(config).language_model
+
+
+def test_hashes_and_dependencies():
+    tokens = tuple(range(16))
+    hash_tokens = P._hash_tokens
+    assert hash_tokens(0, tokens, 0) == hash_tokens(0, tokens, 0)
+    variants = [(0, 0), (0, 42), (7, 0), (8, 0)]
+    assert len({hash_tokens(seed, tokens, extra) for seed, extra in variants}) == 4
+    image_hash, tenant_hash = P.hash_image_payload, P.tenant_scoped_hash
+    assert image_hash(pixel_values=mx.zeros((1, 3, 8, 8))) != image_hash(
+        pixel_values=mx.ones((1, 3, 8, 8))
     )
-    # Admission includes the unused portion of the 8 KiB buffer.
-    assert not manager.store_exact_cache(list(range(16)), [cache])
-    assert manager.resident_bytes() == 0
-    assert manager.stats.memory_skips == 1
-
-
-def test_batch_checkpoint_skips_extraction_without_headroom(
-    memory_manager, monkeypatch
-):
-    manager = memory_manager(disk=True)
-    coordinator = manager.coordinator(
-        SimpleNamespace(make_cache=lambda: [ArraysCache(1)])
-    )
-    cache = ArraysCache(1)
-    cache[0] = mx.ones((2, 4))
-    monkeypatch.setattr(manager, "_memory_headroom", lambda: 0)
-    monkeypatch.setattr(
-        apc, "snapshot_prompt_cache_row", lambda *a, **kw: pytest.fail("extracted")
-    )
-    assert not coordinator.store_checkpoint(list(range(32)), [cache], batch_idx=0)
-    assert manager.stats_snapshot()["memory_skips"] == 1
-
-
-@pytest.mark.parametrize("exact", [True, False])
-def test_disk_restore_checks_headroom_before_loading(
-    memory_manager, monkeypatch, exact
-):
-    manager = memory_manager(budget=0, disk=True)
-    source = _allocated_kv(32)
-    tokens = list(range(32))
-    if exact:
-        manager.store_exact_cache(tokens, [source])
-        load_method, lookup_method = "load_exact_cache", "lookup_exact_cache"
-    else:
-        manager.store_kv_blocks(tokens, [source.keys], [source.values])
-        load_method, lookup_method = (
-            "load_layer_major_prefix",
-            "lookup_prefix_disk_cache",
+    refs = ["a.png", "b.png"]
+    assert image_hash(image_ref=refs) == image_hash(image_ref=refs)
+    assert image_hash(None, None) == 0
+    assert P._hash_payload(None) is P._hash_payload([]) is None
+    assert P._hash_payload(refs) == P._hash_payload(refs)
+    assert P._hash_payload("x") == image_hash(image_ref="x")
+    image = image_hash(image_ref="cat.jpg")
+    assert tenant_hash(None, image) == image
+    assert tenant_hash("a", image) == tenant_hash("a", image)
+    variants = [("a", image), ("b", image), ("a", 42)]
+    assert len({tenant_hash(t, i) for t, i in variants}) == 3
+    code = "from mlx_vlm.apc import tenant_scoped_hash; print(tenant_scoped_hash('a', 123456789))"
+    outputs = [
+        subprocess.check_output(
+            [sys.executable, "-c", code], env={**os.environ, "PYTHONHASHSEED": seed}
         )
+        for seed in ("1", "2")
+    ]
+    assert outputs[0] == outputs[1]
+    base = P.semantic_extra_hash(image_hash=5)
+    good = NS(apc_key_dependencies=lambda: ["adapter-x"])
+    broken = NS(apc_key_dependencies=lambda: (_ for _ in ()).throw(ValueError))
+    assert P.semantic_extra_hash(image_hash=5, model=good) != base
+    for model in (NS(), NS(apc_key_dependencies=5), broken):
+        assert P.semantic_extra_hash(image_hash=5, model=model) == base
+    assert P.model_key_dependencies(None, None) == ()
+
+
+def test_blocks_and_statistics(managers):
+    manager = managers(blocks=16)
+    tokens = list(range(53))
+    assert manager.lookup_prefix(tokens) == ([], 0)
+    stored = store_blocks(manager, tokens)
+    assert len(stored) == 3
+    manager.release(stored)
+    for _ in range(2):
+        matched, count = manager.lookup_prefix(tokens)
+        assert len(matched) == 3 and count == 48
+        warm = P.make_warm_kv_cache(matched, min_capacity_tokens=65)
+        assert len(warm) == 2
+        assert all(
+            c.offset == 48 and c.keys.shape[:2] == (1, 1) and c.keys.shape[2] >= 65
+            for c in warm
+        )
+        manager.release(matched)
+        assert manager.stats_snapshot()["lookups_hit"] == 1
+        manager.reset_stats()
+        assert manager.stats_snapshot()["lookups_hit"] == 0
+    manager.clear()
+    assert manager.stats_snapshot()["pool_used"] == 0
+    assert manager.lookup_prefix(tokens) == ([], 0)
+
+
+def test_layer_major_threshold(managers, monkeypatch):
+    monkeypatch.setenv("APC_LAYER_MAJOR_MEMORY_MIN_TOKENS", "1")
+    manager = managers(blocks=16)
+    tokens = list(range(64))
+    sources = [allocated(64, value) for value in (1, 3)]
+    keys, values = [c.keys for c in sources], [c.values for c in sources]
+    assert manager.store_kv_blocks(tokens, keys, values) == []
+    assert manager.lookup_prefix(tokens)[1] == 0
+    warm, count = manager.lookup_exact_cache(tokens + [999])
+    assert count == 48 and len(warm) == 2
+    for restored, source in zip(warm, sources):
+        assert restored.offset == 48 and restored.keys.shape[2] >= 65
+        same_arrays(restored.keys[..., :48, :], source.keys[..., :48, :])
+        same_arrays(restored.values[..., :48, :], source.values[..., :48, :])
+
+
+def test_disk_block_lifecycle(managers, monkeypatch):
+    monkeypatch.setenv("APC_DISK_SHARD_MAX_BLOCKS", "1")
+    manager = managers("disk", blocks=1)
+    first, second = list(range(48)), list(range(100, 148))
+    manager.release(store_blocks(manager, first))
     manager.disk.flush()
-    monkeypatch.setattr(manager, "_memory_headroom", lambda: 0)
-    monkeypatch.setattr(
-        manager.disk, load_method, lambda *a, **kw: pytest.fail("loaded")
+    assert any(manager.disk.dir.glob(f"*{manager.disk.SUFFIX}"))
+    shutil.rmtree(manager.disk.dir)
+    assert not manager.disk.dir.exists()
+    manager.release(store_blocks(manager, second))
+    manager.disk.flush()
+    size = manager.disk.disk_bytes
+    assert size > 0 and manager.disk.dir.exists()
+    manager.close()
+    reader = managers("disk")
+    warm, count = reader.lookup_prefix_disk_cache(second)
+    assert count == 48 and all(c.offset == 48 for c in warm)
+    assert reader.stats_snapshot()["pool_used"] == 0
+    reader.disk.max_bytes = int(size * 0.75)
+    assert reader.disk._maybe_evict() > 0
+    warm, count = reader.lookup_prefix_disk_cache(second)
+    assert warm is not None and 0 < count < 48
+
+
+def test_disk_policy_and_metadata(managers, monkeypatch):
+    monkeypatch.setenv("APC_DISK_SHARD_MAX_BLOCKS", "3")
+    manager = managers("disk")
+    tokens = list(range(48))
+    manager.release(store_blocks(manager, tokens))
+    manager.disk.flush()
+    assert manager.lookup_prefix_disk_cache(tokens) == (None, 0)
+    warm, count = manager.lookup_prefix_disk_cache(
+        tokens, allow_memory_overlap=True, max_prefix_tokens=32, min_prefix_tokens=16
     )
-    assert getattr(manager, lookup_method)(tokens + [99]) == (None, 0)
-    assert manager.stats_snapshot()["memory_skips"] >= 1
-
-
-def test_memory_restore_accounts_for_extended_prompt_capacity(
-    memory_manager, monkeypatch
-):
-    manager = memory_manager()
+    assert warm is not None and count == 32
+    assert manager.lookup_prefix_disk_cache(
+        tokens, allow_memory_overlap=True, max_prefix_tokens=32, min_prefix_tokens=32
+    ) == (None, 0)
+    manager._disk_min_free_ram_bytes = 2
+    monkeypatch.setattr(P, "_free_ram_bytes", lambda: 1)
+    lookup = manager.lookup_prefix_disk_cache
+    assert lookup(tokens, allow_memory_overlap=True) == (None, 0)
+    monkeypatch.undo()
+    writer = managers("disk", namespace="metadata")
     tokens = list(range(16))
-    assert manager.store_exact_cache(tokens, [_allocated_kv(16)])
-    monkeypatch.setattr(manager, "_memory_headroom", lambda: 4096)
-    monkeypatch.setattr(
-        apc, "_clone_prompt_cache_for_apc", lambda *a, **kw: pytest.fail("cloned")
+    writer.release(store_blocks(writer, tokens, extra_hash=1))
+    writer.disk.flush()
+    writer.close()
+    reader = managers("disk", namespace="metadata")
+    assert reader.lookup_prefix_disk_cache(tokens, extra_hash=2) == (None, 0)
+    wrong, real = [P._hash_tokens(0, tuple(tokens), extra) for extra in (2, 1)]
+    reader.disk._index[wrong] = reader.disk._index[real]
+    assert reader.lookup_prefix_disk_cache(tokens, extra_hash=2) == (None, 0)
+
+
+def test_exact_promotion_and_priority(managers, monkeypatch):
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
+    tokens = [list(range(20)), list(range(100, 120))]
+    writer = managers("disk")
+    for value, ids in enumerate(tokens, 1):
+        assert writer.store_exact_cache(ids, [allocated(20, value)])
+    writer.disk.flush()
+    writer.close()
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "1")
+    reader = managers("disk")
+    for index, hits in [(0, 1), (0, 1), (1, 2), (0, 3)]:
+        warm, count = reader.lookup_exact_cache(tokens[index] + [999])
+        assert warm is not None and count == 20 and reader.stats.disk_hits == hits
+    source = allocated(20, 99)
+    assert reader.store_exact_cache(tokens[0], [source])
+    warm, count = reader.lookup_exact_cache(tokens[0] + [999])
+    assert count == 20 and reader.stats.disk_hits == 3
+    assert reader.stats.exact_stores == 1
+    same_arrays(warm[0].keys[..., :20, :], source.keys)
+
+
+def test_self_check_and_plans(managers, monkeypatch, caplog):
+    monkeypatch.delenv("APC_TRACE", raising=False)
+    layouts = [
+        ([C.KVCache(), C.KVCache()], "block"),
+        ([C.ArraysCache(2), C.KVCache()], "exact"),
+        ([C.RotatingKVCache(8), C.KVCache()], "exact"),
+        ([object()], None),
+    ]
+    assert P.model_apc_mode(object()) == "block"
+    assert A.apc_mode([]) is None
+    for caches, mode in layouts:
+        model = cache_model(caches)
+        assert P.model_apc_mode(model) == A.apc_mode(caches) == mode
+        if mode is None:
+            continue
+        plan = A.build_prefix_cache_plan(model)
+        assert plan.restorable and len(plan.components) == 2
+        assert plan.is_hybrid is (mode == "exact")
+        assert plan.strategy == ("checkpoint" if mode == "exact" else "block")
+        assert len(plan.groups) == (2 if mode == "exact" else 1)
+        if isinstance(caches[0], C.ArraysCache):
+            assert plan.capabilities == [A.Capability.CHECKPOINT, A.Capability.PAGEABLE]
+        if mode == "block":
+            assert plan.groups[0].layer_indices == (0, 1)
+        assert "PrefixCachePlan" in plan.describe()
+    plan = A.build_prefix_cache_plan(NS(language_model=NS(layers=[object()] * 3)))
+    assert plan.restorable and plan.strategy == "block"
+    assert len(plan.components) == 3 and len(plan.groups) == 1
+    assert (
+        P.classify_layer_for_apc(filled(C.QuantizedKVCache(), 8, dim=64)).status == "ok"
     )
-    # The stored 512 bytes fit, but allocating capacity for 1,000 tokens does not.
-    assert manager.lookup_exact_cache(tokens + [99] * 984) == (None, 0)
-    assert manager.stats_snapshot()["memory_skips"] == 1
+    rejected = P.classify_layer_for_apc(object())
+    assert rejected.status == "unsupported" and rejected.reason
+    with caplog.at_level(logging.INFO, logger="mlx_vlm.apc"):
+        result = P.self_check_model_apc(
+            cache_model([batch_cache(k) for k in ("rotating", "uniform", "dense")]),
+            kv_bits=8.0,
+        )
+    assert result.ok and result.apc_mode == "exact"
+    assert any("APC self-check ok" in r.message for r in caplog.records)
+    assert not P.self_check_model_apc(object()).ok
+    broken = P.self_check_model_apc(
+        NS(make_cache=lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+    )
+    assert not broken.ok and broken.notes
+    monkeypatch.setenv("APC_TRACE", "1")
+    with caplog.at_level(logging.INFO, logger="mlx_vlm.apc"):
+        assert not managers().store_exact_cache(
+            list(range(16)), [NS(keys="bad", values="bad")]
+        )
+    assert any("APC_TRACE reject" in r.message for r in caplog.records)
+    assert any("unclonable" in r.message for r in caplog.records)
 
 
-def test_byte_eviction_preserves_leased_blocks(memory_manager):
+@parametrize("kind", ["dense", "rotating", "uniform", "turbo"])
+def test_batch_protocol(kind):
+    cache = batch_cache(kind, [0, 0])
+    if kind in ("rotating", "turbo"):
+        assert cache.empty() and cache.batch_size == 2 and not cache.is_single_row()
+        single = filled(batch_cache(kind), 8)
+        assert not single.empty() and single.batch_size == 1 and single.is_single_row()
+    if kind in ("uniform", "turbo"):
+        expected = C.QuantizedKVCache if kind == "uniform" else TurboQuantKVCache
+        row = cache.extract(0)
+        assert isinstance(row, expected) and (row.keys is None or row.offset == 0)
+        assert row.dequantize_for_apc() == (None, None)
+    if kind == "turbo":
+        assert cache.dequantize_for_apc() == (None, None)
+        keys, values = kv(24, batch=2)
+        cache.update_and_fetch(keys, values)
+        row = cache.extract(1)
+        assert isinstance(row, TurboQuantKVCache) and row.offset == 24
+        k, v = row.dequantize_for_apc()
+        assert k.shape == (1, 2, 24, 32)
+        assert mx.max(mx.abs(k - keys[1:2])).item() < 2
+    else:
+        cache.prepare(right_padding=[2, 0], lengths=[4, 6])
+        cache.update_and_fetch(*kv(3, batch=2))
+        cache.filter(mx.array([1, 0], dtype=mx.int32))
+        cache.filter(mx.array([1], dtype=mx.int32))
+        if kind == "rotating":
+            assert cache._lengths.tolist() == [4]
+            assert all(x.shape[0] == 1 for x in cache.update_and_fetch(*kv(2)))
+        else:
+            assert cache._right_padding.tolist() == [2]
+        cache.finalize()
+        assert cache.offset.tolist() == [4 if kind == "rotating" else 1]
+        assert cache.left_padding.tolist() == [1 if kind == "rotating" else 2]
+    keys, values = P.layer_kv_for_apc(cache, batch_idx=0)
+    assert keys.shape[0] == values.shape[0] == 1
+    assert not isinstance(keys, tuple)
+    single = filled(batch_cache("rotating"), 16)
+    row = P.extract_prompt_cache_from_batch([single], 0)
+    assert P._clone_prompt_cache_for_apc(row) is not None
+
+
+def test_float_extraction_and_harvesting(managers):
+    for cache in (C.KVCache(), C.QuantizedKVCache(32, 8)):
+        keys, values = P.layer_kv_for_apc(filled(cache, 12))
+        assert keys.shape == values.shape == (1, 2, 12, 32)
+    bogus = NS(keys=(1, 2, 3), values=(4, 5, 6), offset=3)
+    assert P.layer_kv_for_apc(bogus) == (None, None)
+    source, target = managers(), managers()
+    full, short = list(range(32)), list(range(100, 116))
+    blocks = [store_blocks(source, ids) for ids in (full, short)]
+    cache, _ = warm_blocks(
+        [
+            {"matched_blocks": b, "prefix_len": len(ids)}
+            for b, ids in zip(blocks, (full, short))
+        ],
+        num_layers=2,
+    )
+    harvested = harvest(target, cache, batch_idx=1, full_token_ids=short)
+    assert len(harvested) == 1
+    same_arrays(harvested[0].keys[0], blocks[1][0].keys[0])
+    matched, count = target.lookup_prefix(short)
+    assert count == 16
+    target.release(matched + harvested)
+    source.release(blocks[0] + blocks[1])
+    quantized = filled(batch_cache("uniform", [3]), 35)
+    harvested = harvest(target, [quantized] * 2, full, batch_idx=0)
+    assert len(harvested) == 2
+    assert all(k.shape[2] == 16 for block in harvested for k in block.keys)
+    target.release(harvested)
+    assert harvest(target, [batch_cache("uniform")], list(range(16)), batch_idx=0) == []
+
+
+def test_pooling_merge():
+    rows = []
+    for length in (6, 0):
+        rotating, pooling = C.RotatingKVCache(16), C.PoolingCache(4)
+        if length:
+            keys = mx.arange(length * 3, dtype=mx.float32).reshape(1, 1, length, 3)
+            rotating.update_and_fetch(keys, keys + 1)
+            ready, _, _ = pooling.accumulate_windows(
+                keys.reshape(1, length, 3), mx.ones((1, length, 2)), offset=0
+            )
+            pooling.update_and_fetch(mx.ones((1, ready.shape[1] // 4, 3)))
+        rows.append(snapshot_row([C.CacheList(rotating, pooling)], 0))
+    merged, count = warm_exact(rows, [6, 0])
+    assert count == 6
+    rotating, pooling = merged[0].caches
+    assert isinstance(rotating, C.BatchRotatingKVCache)
+    assert rotating.offset.tolist() == [6, 0]
+    direct = A.merge_cache_entries([row[0].caches[1] for row in rows], [6, 0])
+    for cache in (pooling, direct):
+        assert isinstance(cache, C.BatchPoolingCache) and cache.ratio == 4
+        assert (cache.remainder, cache._pool_lengths, cache._processed) == (
+            [2, 0],
+            [1, 0],
+            [6, 0],
+        )
+        assert cache.extract(0).remainder == 2
+        assert cache.extract(0).pooled.shape == (1, 1, 3)
+        assert cache.extract(1).empty()
+    empty = C.BatchPoolingCache.merge(
+        [C.PoolingCache(4), C.PoolingCache(4)], prefix_lens=[0, 0]
+    )
+    assert empty.remainder == empty._pool_lengths == empty._processed == [0, 0]
+
+
+@parametrize("slot", [None, 0, 1])
+def test_optional_array_slots(slot):
+    rows = [C.ArraysCache(2) for _ in range(3)]
+    if slot is not None:
+        rows[0][slot], rows[2][slot] = mx.ones((1, 4)), mx.full((1, 4), 2.0)
+    merged = A.merge_cache_entries(rows, [4, 0, 4])
+    assert merged.empty() is (slot is None)
+    if slot is None:
+        assert merged.cache == [None, None]
+        assert merged.left_padding.tolist() == [0, 0, 0]
+    else:
+        assert merged[1 - slot] is None
+        assert merged[slot].tolist() == [[1] * 4, [0] * 4, [2] * 4]
+
+
+@parametrize(
+    "kind,length",
+    [("buffered", n) for n in (0, 4, 48)]
+    + [("ring", 6), ("indexed", 5), ("chunked", 6)],
+)
+def test_clone_continuation(kind, length):
+    cache = {
+        "buffered": lambda: C.BufferedRotatingKVCache(8, buffer_size=3),
+        "ring": lambda: RingSlidingKVCache(4),
+        "indexed": MiniMaxM3KVCache,
+        "chunked": lambda: C.ChunkedKVCache(4),
+    }[kind]()
+    if kind == "buffered":
+        for token in range(length):
+            keys = mx.full((1, 1, 1, 4), token, dtype=mx.float32)
+            cache.update_and_fetch(keys, keys + 1)
+    else:
+        filled(cache, length, heads=2, dim=8)
+    if kind == "ring":
+        assert A.apc_exact_eligible(cache) and not A.apc_block_eligible(cache)
+        for _ in range(7):
+            filled(cache, 1, heads=2, dim=8)
+    if kind == "indexed":
+        cache.update_index_and_fetch(kv(5, dim=8)[0])
+        assert A.apc_exact_eligible(cache)
+        assert A.merge_cache_entries([cache, clone(cache)], [5, 5]) is not None
+    if kind == "chunked":
+        cache.maybe_trim_front()
+        restored = C.ChunkedKVCache(4)
+        A.CheckpointAdapter().restore(restored, A.CheckpointAdapter().capture(cache, 6))
+        assert (restored.offset, restored.start_position) == (6, 2)
+    else:
+        restored = clone(cache)
+        assert type(restored) is type(cache)
+        assert restored.meta_state == cache.meta_state
+    for size in ((3, 12, 1) if kind == "buffered" else (1,)):
+        if kind == "buffered":
+            same_arrays(
+                restored.make_mask(2, return_array=True),
+                cache.make_mask(2, return_array=True),
+            )
+        keys, values = kv(
+            size,
+            heads=1 if kind == "buffered" else 2,
+            dim=4 if kind == "buffered" else 8,
+        )
+        same_arrays(
+            restored.update_and_fetch(keys, values),
+            cache.update_and_fetch(keys, values),
+        )
+        if kind == "buffered":
+            restored.trim(1)
+            cache.trim(1)
+            assert restored.meta_state == cache.meta_state
+    if kind == "ring":
+        assert A.merge_cache_entries([cache], [cache.offset]) is None
+
+
+def sample(name, length=0):
+    constructors = {
+        "ArraysCache": lambda: C.ArraysCache(2),
+        "CacheList": lambda: C.CacheList(
+            sample("KVCache", length), sample("ArraysCache", length)
+        ),
+        "ChunkedKVCache": lambda: C.ChunkedKVCache(8),
+        "PoolingCache": lambda: C.PoolingCache(2),
+        "RingSlidingKVCache": lambda: RingSlidingKVCache(max(16, length)),
+        "RotatingKVCache": lambda: C.RotatingKVCache(max(16, length * 2)),
+        "StaticPrefixKVCache": lambda: C.StaticPrefixKVCache(max(16, length)),
+    }
+    cache = constructors.get(name, getattr(C, name, globals().get(name)))()
+    if not length or name == "CacheList":
+        return cache
+    keys = mx.ones((1, 1, length, 4))
+    if name == "ArraysCache":
+        cache.cache = [mx.ones((1, 2, 4)), mx.ones((1, 1, 4)) * 2]
+    elif name == "PoolingCache":
+        cache.pooled = mx.ones((1, length // 2, 4))
+        cache.buf_kv, cache.buf_gate = mx.ones((1, 2, 4)), mx.ones((1, 2, 1))
+        cache.remainder = 1
+    elif name == "Z1TCache":
+        cache.offset = length
+        cache.cum_eKV, cache.cum_eK = mx.ones((1, 4)), mx.ones((1, 4)) * 2
+        cache.win_eKV, cache.win_eK = mx.ones((1, 3, 4)) * 3, mx.ones((1, 3, 4)) * 4
+    elif name in ("SimpleKVCache", "MiniMaxM3KVCache"):
+        cache.update_and_fetch(keys, keys * 2)
+        if name == "MiniMaxM3KVCache":
+            cache.update_index_and_fetch(keys)
+    else:
+        cache.keys, cache.values, cache.offset = keys, keys * 2, length
+        if name == "RotatingKVCache":
+            cache._idx = length
+        if name == "QSAKVCache":
+            cache.index_keys = mx.ones((1, length, 4)) * 3
+            cache.index_position_ids = mx.arange(length, dtype=mx.int64)[None]
+    return cache
+
+
+def cache_names(tree):
+    names = {
+        getattr(n.func, "id", getattr(n.func, "attr", ""))
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+    }
+    return {name for name in names if name.endswith("Cache") or name == "CacheList"}
+
+
+def discover_contracts():
+    """Distinct local factories cover wrappers sharing imported language backbones."""
+    root = Path(models.__file__).resolve().parent
+    local, generative = {}, 0
+    for path in root.rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == "make_cache"
+            ):
+                local.setdefault(path.relative_to(root).parts[0], set()).update(
+                    cache_names(node)
+                )
+
+    for info in pkgutil.iter_modules(models.__path__):
+        if not info.ispkg or info.name.startswith("_"):
+            continue
+        try:
+            cls = getattr(
+                importlib.import_module("mlx_vlm.models." + info.name), "Model", None
+            )
+        except ModuleNotFoundError:
+            continue
+        generative += callable(getattr(cls, "get_input_embeddings", None))
+    assert generative >= 120 and len(local) >= 70
+    return sorted({("KVCache",)} | {tuple(sorted(v)) for v in local.values() if v})
+
+
+@parametrize("names", discover_contracts(), ids=lambda names: "+".join(names))
+def test_model_cache_contract(names, managers, monkeypatch):
+    monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "2")
+    for name in names:
+        cache = sample(name)
+        assert A.build_prefix_cache_plan_from_caches([cache]).restorable
+        restored = clone(cache)
+        assert restored is not None
+        assert all(not p.fallback for p in memory_components([restored], 0))
+    caches = [sample(name, 16) for name in names]
+    plan = A.build_prefix_cache_plan_from_caches(caches)
+    assert plan.restorable, plan.describe()
+    manager = managers(block=8)
+    runner = coordinate(manager, caches)
+    assert runner.strategy == plan.strategy
+    tokens = list(range(16))
+    if plan.strategy == "block":
+        keys, values = [c.keys for c in caches], [c.values for c in caches]
+        manager.release(manager.store_kv_blocks(tokens, keys, values))
+    else:
+        assert manager.store_exact_cache(tokens, caches)
+    hit = runner.lookup(
+        tokens + [999],
+        extra_hash=0,
+        safe_lookup_min=0,
+        suffix_is_text_only=lambda _: True,
+        prefix_has_media=lambda _: False,
+    )
+    assert hit is not None and hit["prefix_len"] == 16
+    counter = "lookups_hit" if plan.strategy == "block" else "exact_hits"
+    assert manager.stats_snapshot()[counter] == 1
+    if plan.strategy != "block":
+        assert hit["warm_cache"] is not None
+    runner.release_hit(hit)
+
+
+@parametrize("kind", ["qsa", "deepseek", "composite", "ring-indexed"])
+def test_disk_custom_state(kind, managers, monkeypatch):
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "1" if kind == "qsa" else "0")
+    monkeypatch.setenv("APC_EXACT_MIN_TOKENS", "1")
+    if kind == "qsa":
+        arrays, qsa = C.ArraysCache(1), sample("QSAKVCache", 40)
+        arrays[0] = mx.arange(6, dtype=mx.int64).reshape(1, 2, 3)
+        qsa.index_position_ids = mx.arange(120, dtype=mx.int64).reshape(3, 1, 40)
+        qsa.index_block_keys, qsa.index_block_ratio = mx.ones((1, 1, 10, 4)), 4
+        caches, length = [arrays, qsa], 40
+    elif kind == "deepseek":
+        rotating = C.RotatingKVCache(8, keep=0)
+        rotating.keys, rotating.values = mx.ones((1, 1, 8, 4), mx.bfloat16), mx.zeros(
+            (1, 1, 8, 0), mx.bfloat16
+        )
+        rotating.offset, rotating._idx = 40, 3
+        pools = [C.PoolingCache(4), C.PoolingCache(4)]
+        pools[0].pooled, pools[1].pooled = mx.ones((1, 6, 4), mx.bfloat16), mx.ones(
+            (1, 6, 2)
+        )
+        caches, length = [C.CacheList(rotating, *pools)], 40
+    elif kind == "composite":
+        caches, length = [
+            (sample("SimpleKVCache", 12), C.SimpleKVCache()),
+            C.CacheList(sample("PoolingCache", 10)),
+        ], 12
+    else:
+        ring = RingSlidingKVCache(4)
+        ring.keys, ring.values = mx.ones((1, 2, 8, 4)), mx.ones((1, 2, 8, 4)) * 2
+        ring.prefill_length, ring.offset, ring._ring_pos = 4, 11, 3
+        caches, length = [ring, sample("MiniMaxM3KVCache", 10)], 10
+    restored, reader = disk_roundtrip(managers, list(range(length)), caches, block=4)
+    same_cache(restored, caches)
+    if kind == "qsa":
+        assert restored[1].keys.shape[2] >= 41 and restored[1].offset == 40
+        memory, count = reader.lookup_exact_cache(list(range(40)) + [998])
+        assert count == 40 and memory[1].keys.shape[2] >= 41
+        assert reader.stats.disk_hits == 1
+        batch, count = warm_exact([restored], [40])
+        assert count == 40 and isinstance(batch[1], BatchQSAKVCache)
+        same_cache(batch[1].extract(0), qsa)
+        path = next(iter(reader.disk._exact_index.values()))
+        assert reader.disk._open_shard_header(path)[1]["c1_kind"] == "checkpoint"
+
+
+@parametrize("family", ["builtin", "model", "qsa", "pooling", "minimax"])
+def test_memory_growth_profiles(family):
+    factories = {
+        "builtin": [
+            C.ConcatenateKVCache,
+            C.SimpleKVCache,
+            partial(C.ChunkedKVCache, 65),
+            partial(C.BufferedRotatingKVCache, 65, buffer_size=300),
+            partial(C.BufferedRotatingKVCache, 65, keep=1),
+            partial(C.StaticPrefixKVCache, 513),
+        ],
+        "model": [HyV4KVCache, partial(RingSlidingKVCache, 16)],
+        "qsa": [
+            QSAKVCache,
+            partial(QSAQuantizedKVCache, 32, 4),
+            partial(BatchQSAKVCache, [0, 0]),
+            partial(BatchQSAKVCache, [0, 3]),
+        ],
+        "pooling": [partial(C.PoolingCache, r) for r in (4, 64)]
+        + [partial(C.BatchPoolingCache, r, [0, 3, 7]) for r in (4, 64)],
+        "minimax": [MiniMaxM3KVCache, partial(MiniMaxM3BatchKVCache, [0, 3])],
+    }[family]
+    chunks = {"builtin": [37, 256], "model": [37, 256, 1024], "pooling": [37]}.get(
+        family, [257]
+    )
+    seeds = {"builtin": [1], "qsa": [1, 16], "pooling": [1, 65]}.get(family, [16])
+    for (index, factory), chunk, seed in product(enumerate(factories), chunks, seeds):
+        mrope = family == "qsa" and index in (1, 2)
+        cache = factory()
+        batch = len(cache.left_padding) if hasattr(cache, "left_padding") else 1
+        ratio = cache.ratio if family == "pooling" else 0
+
+        def advance(start, length):
+            if family == "pooling":
+                ready, _, _ = cache.accumulate_windows(
+                    mx.ones((batch, length, 8), mx.float16),
+                    mx.ones((batch, length, 4)),
+                    0,
+                )
+                cache.update_and_fetch(
+                    mx.ones((batch, ready.shape[1] // ratio, 4), mx.float16)
+                )
+                return
+            if family == "qsa":
+                positions = mx.broadcast_to(
+                    mx.arange(start, start + length), (batch, length)
+                )
+                if mrope:
+                    positions = mx.broadcast_to(positions, (3, batch, length))
+                indexer.select_from_projected(
+                    mx.ones((batch, length, 24)), cache, positions
+                )
+            kd, vd = (32, 64) if family == "qsa" else (4, 8)
+            dtype = mx.float16 if family in ("qsa", "minimax") else mx.float32
+            if isinstance(cache, C.ChunkedKVCache):
+                cache.maybe_trim_front()
+            cache.update_and_fetch(
+                mx.ones((batch, 1, length, kd), dtype),
+                mx.ones((batch, 1, length, vd), dtype),
+            )
+            if family == "minimax":
+                cache.update_index_and_fetch(mx.ones((batch, 1, length, 8)))
+
+        if family == "qsa":
+            indexer = Qwen4ExpAttention(
+                apc_config("qwen4_exp", text_only=True)[1]
+            ).indexer
+        empty = memory_components([cache], 0)[0]
+        assert not empty.fallback and empty.footprint(6000, chunk) == 0
+        advance(0, seed)
+        if family in ("qsa", "model") or (family == "minimax" and batch == 1):
+            cache = clone(cache)
+        profile = memory_components([cache], seed, batch_size=batch)[0]
+        assert not profile.fallback
+        if family == "pooling":
+            assert profile.fixed_bytes == ratio * 32
+        else:
+            assert profile.source_bytes * batch == cache.nbytes
+        peak = cache.nbytes
+        if family == "builtin":
+            assert peak <= profile.footprint(1, chunk) < peak + 24576
+        for start in range(seed, 6000, chunk):
+            advance(start, min(chunk, 6000 - start))
+            peak = max(peak, cache.nbytes)
+        estimate = batch * profile.footprint(6000, chunk)
+        measured = peak if family == "builtin" else cache.nbytes
+        upper = (
+            measured + 24576
+            if family == "builtin"
+            else measured * {"qsa": 1.3, "minimax": 1.1}.get(family, 2)
+        )
+        assert measured <= estimate, (family, chunk, seed, batch)
+        assert estimate <= upper if family in ("pooling", "model") else estimate < upper
+        if family == "builtin":
+            assert profile.footprint(0, chunk) == 0
+
+
+@parametrize("read_only", [False, True])
+def test_static_and_fixed_profiles(read_only):
+    prefix = filled(C.StaticPrefixKVCache(513), 16, heads=1, dim=4)
+    source = C.StaticPrefixKVCache.from_prefix(prefix) if read_only else prefix
+    cache = C.StaticPrefixKVCache.from_state(source.state, source.meta_state)
+    profile = memory_components([cache], 16)[0]
+    assert not profile.fallback and cache.read_only == read_only
+    if read_only:
+        assert profile.footprint(1) == profile.footprint(6000) == cache.nbytes
+    filled(cache, 1, heads=1, dim=4)
+    assert cache.offset == (16 if read_only else 17)
+    assert not C.StaticPrefixKVCache.from_state(
+        source.state, source.meta_state[:3]
+    ).read_only
+    layer, cache = AFTConv(apc_config("z1t")[1]), Z1TCache()
+    layer(mx.ones((1, 1, 8)), cache)
+    cache = clone(cache)
+    profile = memory_components([cache], 1)[0]
+    assert not profile.fallback
+    layer(mx.ones((1, 5999, 8)), cache)
+    assert profile.footprint(1) == profile.footprint(6000) == P._cache_nbytes(cache)
+
+
+@parametrize("factory", [C.KVCache, C.QuantizedKVCache, lambda: C.RotatingKVCache(512)])
+def test_unused_capacity_reservation(factory, memory_manager):
+    cache = factory()
+    cache.step = 1
+    filled(cache, 256, heads=1, dim=64)
+    cache.trim(240)
+    cache.step = 256
+    size = P._cache_nbytes(cache)
+    manager = memory_manager(budget=1 << 20)
+    assert manager.store_exact_cache(list(range(16)), [cache])
+    coordinate(manager, [cache]).prepare_prefill([2000] * 3)
+    assert manager.stats_snapshot()["prefill_reserve_bytes"] == 6 * 2048 * (size // 256)
+    assert P._cache_nbytes(cache) == size == 16 * P._cache_nbytes(cache.state)
+
+
+@parametrize(
+    "operation",
+    ["disk_expand", "padded", "batch", "exact_load", "block_load", "memory_expand"],
+)
+def test_admission_before_allocation(operation, memory_manager, monkeypatch):
+    disk = operation in ("disk_expand", "batch", "exact_load", "block_load")
+    budgets = dict(padded=1024, exact_load=0, block_load=0)
+    budget = budgets.get(operation, 4096)
+    manager = memory_manager(budget=budget, disk=disk)
+    tokens, source = list(range(16)), allocated(16)
+    if operation in ("disk_expand", "memory_expand"):
+        assert manager.store_exact_cache(tokens, [source])
+        if disk:
+            manager.disk.flush()
+            manager = memory_manager(disk=True)
+        monkeypatch.setattr(manager, "_memory_headroom", lambda: 4096)
+        attr = "prefix_cache_reserve" if disk else "_clone_prompt_cache_for_apc"
+        forbid(monkeypatch, C.KVCache if disk else P, attr)
+        request = tokens + [99] * (6000 if disk else 984)
+        assert manager.lookup_exact_cache(request) == (None, 0)
+    elif operation.endswith("load"):
+        source, tokens = allocated(32), list(range(32))
+        if operation == "exact_load":
+            manager.store_exact_cache(tokens, [source])
+            loader, lookup = "load_exact_cache", manager.lookup_exact_cache
+        else:
+            manager.store_kv_blocks(tokens, [source.keys], [source.values])
+            loader, lookup = "load_layer_major_prefix", manager.lookup_prefix_disk_cache
+        manager.disk.flush()
+        monkeypatch.setattr(manager, "_memory_headroom", lambda: 0)
+        forbid(monkeypatch, manager.disk, loader)
+        assert lookup(tokens + [99]) == (None, 0)
+    elif operation == "padded":
+        source = allocated(256)
+        source.offset = 16
+        forbid(monkeypatch, P, "_clone_prompt_cache_for_apc")
+        assert not manager.store_exact_cache(tokens, [source])
+        assert manager.resident_bytes() == 0
+    else:
+        source = C.ArraysCache(1)
+        source[0] = mx.ones((2, 4))
+        monkeypatch.setattr(manager, "_memory_headroom", lambda: 0)
+        forbid(monkeypatch, P, "snapshot_prompt_cache_row")
+        assert not coordinate(manager, [source]).store_checkpoint(
+            list(range(32)), [source], batch_idx=0
+        )
+    assert manager.stats.memory_skips >= 1
+
+
+def test_accounting_and_eviction(memory_manager, monkeypatch):
+    cache = NS(
+        state={"kv": mx.ones((2, 3)), "nested": [mx.zeros((4,))]},
+        meta_state={"offsets": mx.zeros((2,), dtype=mx.int32)},
+        prefix_cache_snapshot=lambda: pytest.fail("cloned"),
+    )
+    assert P._cache_nbytes([cache]) == P._cache_nbytes([cache, cache]) == 48
     manager = memory_manager(budget=1024)
-    source = _allocated_kv(32)
-    coordinator = _coordinator(manager, [source])
+    source = allocated(32)
+    runner = coordinate(manager, [source])
     leased = manager.store_kv_blocks(list(range(32)), [source.keys], [source.values])
     assert len(leased) == 2
     manager.release(leased[:1])
     manager.memory_max_bytes = 0
-    coordinator.prepare_prefill(100_000)
+    runner.prepare_prefill(100000)
     assert manager.resident_bytes() == 512
-    assert leased[1].ref_cnt == 1 and leased[1].keys is not None
+    assert leased[1].ref_cnt == 1
+    assert leased[1].keys is not None
     manager.release(leased[1:])
-    coordinator.prepare_prefill(100_000)
+    runner.prepare_prefill(100000)
     assert manager.resident_bytes() == 0
+    for base in (object, C._BaseCache):
+        cache = type(
+            "GrowingCache",
+            (base,),
+            {"state": mx.ones((1, 256, 1024)), "meta_state": ()},
+        )()
+        manager = memory_manager(budget=4 << 20)
+        monkeypatch.setattr(P, "_clone_prompt_cache_for_apc", lambda cache: cache)
+        runner = coordinate(manager, [cache])
+        assert manager.store_exact_cache(list(range(18)), [cache])
+        monkeypatch.setattr(manager, "_memory_headroom", lambda: 8 << 20)
+        runner.prepare_prefill(6001)
+        assert manager.resident_bytes() == 0 and not manager._make_room()
 
 
-def test_sequential_long_prefixes_remain_bounded_and_replay_from_disk(
-    memory_manager, monkeypatch
-):
+def test_single_row_checkpoint(managers):
+    tokens = list(range(32))
+    arrays = C.ArraysCache(1)
+    arrays[0] = mx.ones((1, 3, 5))
+    rotating = sample("RotatingKVCache", 8)
+    rotating.max_size, rotating.offset, rotating._idx = 8, 32, 4
+    caches = [arrays, allocated(32), rotating]
+    batch = PromptProcessingBatch.__new__(PromptProcessingBatch)
+    batch.__dict__.update(
+        uids=[0],
+        prompt_cache=caches,
+        _right_pad_per_row=None,
+        _left_padding_per_row=[0],
+        _suffix_lens=[32],
+        _processed_prompt_columns=32,
+        _apc_mode="exact",
+        _apc_manager=managers(blocks=4, block=4),
+        _apc_meta=[
+            dict(full_input_ids=tokens, prefix_len=0, checkpoint_len=32, extra_hash=0)
+        ],
+    )
+    assert P.extract_prompt_cache_from_batch(caches, 0) is None
+    batch._store_apc_exact_checkpoints()
+    assert batch._apc_meta[0]["checkpoint_done"] is True
+    assert batch._apc_manager.stats.exact_stores == 1
+
+
+def test_generation_stream_spill(managers, monkeypatch):
+    from mlx_vlm.generate.common import generation_stream
+
+    monkeypatch.setenv("APC_MAX_POOL_TENSORS", "1")
+    with mx.stream(generation_stream):
+        base = mx.arange(64, dtype=mx.float32).reshape(1, 1, 16, 4)
+        keys, values = [base + 1, base + 2], [base + 3, base + 4]
+    manager = managers("disk", blocks=1)
+    assert manager.store_kv_blocks(list(range(16)), keys, values) == []
+    manager.disk.flush()
+    assert manager.disk.num_blocks_indexed == 1 and manager.disk.disk_bytes > 0
+
+
+def test_long_prefix_pressure(memory_manager, monkeypatch):
     manager = memory_manager(budget=2 << 20, disk=True)
-    coordinator = _coordinator(manager, [KVCache()])
+    coordinator = coordinate(manager, [C.KVCache()])
     manager.disk.queue_max_bytes = 1 << 20
     live_bytes = [0]
-    # Model weights and other allocations leave 7 MiB. These synthetic caches
-    # use actual Metal tensors, but exercise pressure at a small, safe scale.
     monkeypatch.setattr(
         manager,
         "_memory_headroom",
@@ -2055,7 +1036,7 @@ def test_sequential_long_prefixes_remain_bounded_and_replay_from_disk(
     )
     for i, length in enumerate([30_000, 30_000, 50_000, 50_000, 100_000]):
         coordinator.prepare_prefill(length)
-        cache = _allocated_kv(length, i)
+        cache = allocated(length, i)
         live_bytes[0] = cache.nbytes
         assert manager.store_exact_cache([i] * length, [cache])
         assert manager.resident_bytes() <= manager.memory_max_bytes
@@ -2063,9 +1044,7 @@ def test_sequential_long_prefixes_remain_bounded_and_replay_from_disk(
         del cache
         live_bytes[0] = 0
         mx.clear_cache()
-
     coordinator.prepare_prefill(100_001)
-    # The oldest cached states are gone before the next 100k allocation.
     assert manager.resident_bytes() == 0
     restored, count = manager.lookup_exact_cache([4] * 100_000 + [99])
     assert count == 100_000
@@ -2074,14 +1053,10 @@ def test_sequential_long_prefixes_remain_bounded_and_replay_from_disk(
     assert manager.stats_snapshot()["disk_hits"] == 1
 
 
-def test_disk_queue_applies_byte_backpressure(tmp_path, monkeypatch):
-    disk = DiskBlockStore(tmp_path)
+def test_disk_backpressure(tmp_path, monkeypatch):
+    disk = P.DiskBlockStore(tmp_path)
     disk.queue_max_bytes = 512
-    started, release, second_started = (
-        threading.Event(),
-        threading.Event(),
-        threading.Event(),
-    )
+    started, release, second_started = [threading.Event() for _ in range(3)]
     original = disk._write_exact_cache_snapshot
 
     def slow_write(path, payload):
@@ -2093,7 +1068,7 @@ def test_disk_queue_applies_byte_backpressure(tmp_path, monkeypatch):
         return original(path, payload)
 
     monkeypatch.setattr(disk, "_write_exact_cache_snapshot", slow_write)
-    caches = [_allocated_kv(16), _allocated_kv(16, 2)]
+    caches = [allocated(16), allocated(16, 2)]
     producer = threading.Thread(
         target=lambda: disk.save_exact_cache(2, [2] * 16, 0, caches[1:])
     )
@@ -2115,36 +1090,31 @@ def test_disk_queue_applies_byte_backpressure(tmp_path, monkeypatch):
     assert disk.num_exact_indexed == 2
 
 
-def test_failed_direct_spill_does_not_report_a_store(memory_manager, monkeypatch):
+def test_failed_spill(memory_manager, monkeypatch):
     manager = memory_manager(budget=0, disk=True)
 
     def fail_write(*args):
         raise OSError("full")
 
     monkeypatch.setattr(manager.disk, "_write_exact_cache_snapshot", fail_write)
-    assert not manager.store_exact_cache(list(range(32)), [_allocated_kv(32)])
+    assert not manager.store_exact_cache(list(range(32)), [allocated(32)])
     stats = manager.stats_snapshot()
     assert stats["exact_stores"] == stats["resident_bytes"] == 0
     assert stats["disk_write_failures"] == 1
     assert not manager.disk._in_flight
 
 
-@pytest.mark.parametrize("synchronous", [True, False])
-def test_completed_oversized_disk_write_obeys_cap(tmp_path, synchronous):
-    disk = DiskBlockStore(tmp_path, max_bytes=512)
-    try:
-        disk.save_exact_cache(
-            1, [1] * 32, 0, [_allocated_kv(32)], synchronous=synchronous
-        )
-        disk.flush()
-        assert disk.disk_bytes <= disk.max_bytes
-        assert disk.num_exact_indexed == 0
-        assert disk.evictions == 1
-    finally:
-        disk.close()
+@parametrize("synchronous", [True, False])
+def test_oversized_write(managers, synchronous):
+    disk = managers("disk").disk
+    disk.max_bytes = 512
+    disk.save_exact_cache(1, [1] * 32, 0, [allocated(32)], synchronous=synchronous)
+    disk.flush()
+    assert disk.disk_bytes <= disk.max_bytes
+    assert disk.num_exact_indexed == 0 and disk.evictions == 1
 
 
-@pytest.mark.parametrize("opt_out", ["environment", "empty_path"])
+@parametrize("opt_out", ["environment", "empty_path"])
 def test_default_disk_opt_out(tmp_path, monkeypatch, opt_out):
     monkeypatch.setenv("MLX_VLM_CACHE_HOME", str(tmp_path))
     monkeypatch.setenv("APC_ENABLED", "1")
@@ -2153,261 +1123,23 @@ def test_default_disk_opt_out(tmp_path, monkeypatch, opt_out):
         overrides = None
     else:
         overrides = {"disk_path": ""}
-    manager = from_env(overrides=overrides)
+    manager = P.from_env(overrides=overrides)
     assert manager.disk is None
     assert not (tmp_path / "apc").exists()
 
 
-@pytest.fixture
-def _seed_block_storage():
-    mx.random.seed(0)
-
-
-@pytest.mark.usefixtures("_seed_block_storage")
-def test_kv_block_handle_empty():
-    handle = KVBlockHandle()
-    assert handle.resident_bytes() == 0
-
-
-@pytest.mark.parametrize("base", [object, _BaseCache])
-def test_unknown_checkpoint_state_keeps_conservative_growth_estimate(
-    memory_manager, monkeypatch, base
-):
-    class GrowingCache(base):
-        state = mx.ones((1, 256, 1024))
-        meta_state = ()
-
-    manager = memory_manager(budget=4 << 20)
-    # Opaque checkpoints may grow with tokens.
-    monkeypatch.setattr(apc, "_clone_prompt_cache_for_apc", lambda cache: cache)
-    cache = GrowingCache()
-    coordinator = _coordinator(manager, [cache])
-    assert manager.store_exact_cache(list(range(18)), [cache])
-    monkeypatch.setattr(manager, "_memory_headroom", lambda: 8 << 20)
-    coordinator.prepare_prefill(6001)
-    assert manager.resident_bytes() == 0
-    assert not manager._make_room()
-
-
-@pytest.mark.parametrize(
-    "make_cache",
-    [
-        ConcatenateKVCache,
-        SimpleKVCache,
-        lambda: ChunkedKVCache(65),
-        lambda: BufferedRotatingKVCache(65, buffer_size=300),
-        lambda: BufferedRotatingKVCache(65, keep=1),
-        lambda: StaticPrefixKVCache(513),
-    ],
-)
-@pytest.mark.parametrize("chunk_size", [37, 256])
-def test_builtin_kv_profiles_bound_prefill_allocations(make_cache, chunk_size):
-    cache = make_cache()
-    empty = cache_memory_components([cache], 0)[0]
-    assert not empty.fallback
-    assert empty.footprint(6000, chunk_size) == 0
-    cache.update_and_fetch(mx.ones((1, 1, 1, 4)), mx.ones((1, 1, 1, 8)))
-    profile = cache_memory_components([cache], 1)[0]
-    assert not profile.fallback
-    assert profile.source_bytes == cache.nbytes
-    estimate = profile.footprint(1, chunk_size)
-    assert cache.nbytes <= estimate < cache.nbytes + 2 * 256 * 48
-
-    peak = cache.nbytes
-    for start in range(1, 6000, chunk_size):
-        if isinstance(cache, ChunkedKVCache):
-            cache.maybe_trim_front()
-        size = min(chunk_size, 6000 - start)
-        cache.update_and_fetch(mx.ones((1, 1, size, 4)), mx.ones((1, 1, size, 8)))
-        peak = max(peak, cache.nbytes)
-    estimate = profile.footprint(6000, chunk_size)
-    assert peak <= estimate < peak + 2 * 256 * 48
-    assert profile.footprint(0, chunk_size) == 0
-
-
-@pytest.mark.parametrize("batch_size", [1, 3])
-@pytest.mark.parametrize("ratio", [4, 64])
-@pytest.mark.parametrize("seed_length", [1, 65])
-def test_pooling_profiles_separate_buffers_from_compressed_growth(
-    batch_size, ratio, seed_length
-):
-    cache = (
-        PoolingCache(ratio)
-        if batch_size == 1
-        else BatchPoolingCache(ratio, left_padding=[0, 3, 7])
-    )
-
-    def advance(length):
-        kv = mx.ones((batch_size, length, 8), dtype=mx.float16)
-        gate = mx.ones((batch_size, length, 4), dtype=mx.float32)
-        ready, _, _ = cache.accumulate_windows(kv, gate, 0)
-        cache.update_and_fetch(
-            mx.ones((batch_size, ready.shape[1] // ratio, 4), dtype=mx.float16)
-        )
-
-    empty = cache_memory_components([cache], 0)[0]
-    assert not empty.fallback and empty.footprint(6000) == 0
-    advance(seed_length)
-    profile = cache_memory_components([cache], seed_length, batch_size=batch_size)[0]
-    assert not profile.fallback
-    assert profile.fixed_bytes == ratio * 32
-
-    for start in range(seed_length, 6000, 37):
-        advance(min(37, 6000 - start))
-    estimate = batch_size * profile.footprint(6000)
-    assert cache.nbytes <= estimate <= 2 * cache.nbytes
-
-
-@pytest.mark.parametrize("read_only", [False, True])
-def test_static_prefix_profile_survives_restore(read_only):
-    prefix = StaticPrefixKVCache(513)
-    prefix.update_and_fetch(mx.ones((1, 1, 16, 4)), mx.ones((1, 1, 16, 8)))
-    source = StaticPrefixKVCache.from_prefix(prefix) if read_only else prefix
-    cache = StaticPrefixKVCache.from_state(source.state, source.meta_state)
-    assert cache.read_only == read_only
-    profile = cache_memory_components([cache], 16)[0]
-    assert not profile.fallback
-    if read_only:
-        assert profile.footprint(1) == profile.footprint(6000) == cache.nbytes
-    cache.update_and_fetch(mx.ones((1, 1, 1, 4)), mx.ones((1, 1, 1, 8)))
-    assert cache.offset == (16 if read_only else 17)
-    legacy = StaticPrefixKVCache.from_state(source.state, source.meta_state[:3])
-    assert not legacy.read_only
-
-
-@pytest.mark.parametrize("make_cache", [HyV4KVCache, lambda: RingSlidingKVCache(16)])
-@pytest.mark.parametrize("chunk_size", [37, 256, 1024])
-def test_model_kv_profiles_bound_restored_prefill(make_cache, chunk_size):
-    cache = make_cache()
-    cache.update_and_fetch(mx.ones((1, 1, 16, 4)), mx.ones((1, 1, 16, 8)))
-    cache = clone_cache_entry(cache, min_capacity_tokens=None, eval_targets=[])
-    profile = cache_memory_components([cache], 16)[0]
-    assert not profile.fallback
-    assert profile.source_bytes == cache.nbytes
-    for start in range(16, 6000, chunk_size):
-        size = min(chunk_size, 6000 - start)
-        cache.update_and_fetch(mx.ones((1, 1, size, 4)), mx.ones((1, 1, size, 8)))
-    assert cache.nbytes <= profile.footprint(6000, chunk_size) <= 2 * cache.nbytes
-
-
-def test_z1t_prefill_memory_is_fixed():
-    _, config = _apc_config("z1t")
-    layer = AFTConv(config)
-    cache = Z1TCache()
-    layer(mx.ones((1, 1, 8)), cache)
-    cache = clone_cache_entry(cache, min_capacity_tokens=None, eval_targets=[])
-    profile = cache_memory_components([cache], 1)[0]
-    assert not profile.fallback
-    layer(mx.ones((1, 5999, 8)), cache)
-    assert profile.footprint(1) == profile.footprint(6000) == _cache_nbytes(cache)
-
-
-@pytest.mark.parametrize(
-    "make_cache,batch_size",
-    [(MiniMaxM3KVCache, 1), (lambda: MiniMaxM3BatchKVCache([0, 3]), 2)],
-)
-def test_minimax_profiles_include_indexer_allocations(make_cache, batch_size):
-    cache = make_cache()
-
-    def advance(length):
-        cache.update_and_fetch(
-            mx.ones((batch_size, 1, length, 4), dtype=mx.float16),
-            mx.ones((batch_size, 1, length, 8), dtype=mx.float16),
-        )
-        cache.update_index_and_fetch(mx.ones((batch_size, 1, length, 8)))
-
-    empty = cache_memory_components([cache], 0)[0]
-    assert not empty.fallback and empty.footprint(6000) == 0
-    advance(16)
-    if batch_size == 1:
-        cache = clone_cache_entry(cache, min_capacity_tokens=None, eval_targets=[])
-    profile = cache_memory_components([cache], 16, batch_size=batch_size)[0]
-    assert not profile.fallback
-    assert profile.source_bytes * batch_size == cache.nbytes
-    for start in range(16, 6000, 257):
-        advance(min(257, 6000 - start))
-    estimate = batch_size * profile.footprint(6000, 257)
-    assert cache.nbytes <= estimate < 1.1 * cache.nbytes
-
-
-def _apc_config(name, *, text_only=False):
-    """Apply plain APC settings before config constructors derive layer layouts."""
-    profile = MODEL_CASES["apc"][name]
-    case = (
-        next(case for case in MODEL_CASES["cases"] if case["id"] == profile["case"])
-        if "case" in profile
-        else {"module": profile["module"], "config": {}}
-    )
-    fields = copy.deepcopy(case["config"])
-
-    def merge(target, overrides):
-        for key, value in overrides.items():
-            if isinstance(value, dict) and isinstance(target.get(key), dict):
-                merge(target[key], value)
-            else:
-                target[key] = copy.deepcopy(value)
-
-    merge(fields, profile["config"])
-    module = importlib.import_module("mlx_vlm.models." + case["module"])
-    if text_only:
-        return module, build_config(module, fields["text_config"], "TextConfig")
-    return module, build_config(module, fields)
-
-
-def _apc_language_model(name):
-    module, config = _apc_config(name)
-    if name == "qwen3_5":
-        return module.LanguageModel(config.text_config, config)
-    return module.Model(config).language_model
-
-
-@pytest.mark.parametrize("model_name", ["gemma4", "qwen3_5"])
-def test_apc_exact_mode_detected_for_hybrid_models(model_name):
-    """Hybrid models must route to exact mode, not block mode."""
-    lm = _apc_language_model(model_name)
-    assert model_apc_mode(lm) == "exact"
-
-
-def _token_kv(tokens):
-    cache = KVCache()
-    values = mx.array(tokens, dtype=mx.float32).reshape(1, 1, -1, 1)
-    cache.update_and_fetch(values, values + 1)
-    return cache
-
-
-@pytest.fixture
-def prefix_manager(monkeypatch, tmp_path):
-    monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "2")
-    monkeypatch.setenv("APC_DISK_MIN_FREE_RAM_GB", "0")
-    managers = []
-
-    def make(tier="memory"):
-        disk = (
-            None if tier == "memory" else DiskBlockStore(tmp_path, namespace="partial")
-        )
-        manager = APCManager(num_blocks=8, block_size=16, disk=disk)
-        if tier == "disk-only":
-            manager._exact_cache_max = 0
-        managers.append(manager)
-        return manager
-
-    yield make
-    for manager in managers:
-        if manager.disk is not None:
-            manager.close()
-
-
-@pytest.mark.parametrize("tier", ["memory", "disk", "disk-only"])
-def test_dense_checkpoint_reuses_only_common_blocks(prefix_manager, tier):
+@parametrize("tier", ["memory", "disk", "disk-only"])
+def test_divergent_dense_prefix(prefix_manager, tier):
     stored = list(range(80))
     divergent = stored[:37] + [999, 998, 997]
     manager = prefix_manager(tier)
-    assert manager.store_exact_cache(stored, [_token_kv(stored)], extra_hash=7)
+    source = C.KVCache()
+    keys = mx.array(stored, dtype=mx.float32).reshape(1, 1, -1, 1)
+    source.update_and_fetch(keys, keys + 1)
+    assert manager.store_exact_cache(stored, [source], extra_hash=7)
     if manager.disk:
         manager.close()
-        manager.disk = None
         manager = prefix_manager(tier)
-
     assert manager.lookup_exact_cache(divergent, extra_hash=8) == (None, 0)
     restored, count = manager.lookup_exact_cache(divergent, extra_hash=7)
     assert count == 32
@@ -2416,8 +1148,6 @@ def test_dense_checkpoint_reuses_only_common_blocks(prefix_manager, tier):
     assert manager.stats_snapshot()["matched_tokens"] == 32
     if manager.disk:
         assert manager.stats_snapshot()["disk_hits"] == 1
-
-    # Mutating the returned row must not alter either stored checkpoint.
     restored[0].update_and_fetch(mx.full((1, 1, 1, 1), -1), mx.full((1, 1, 1, 1), -2))
     extended, count = manager.lookup_exact_cache(stored + [1000], extra_hash=7)
     assert count == 80
@@ -2431,40 +1161,67 @@ def test_dense_checkpoint_reuses_only_common_blocks(prefix_manager, tier):
     ) == (None, 0)
 
 
-def test_checkpoint_schedule_respects_media_budget_and_opt_out(prefix_manager):
+def test_checkpoint_schedule(prefix_manager):
     manager = prefix_manager()
     manager.checkpoint_interval_tokens = 16
-    coordinator = manager.coordinator(
-        SimpleNamespace(make_cache=lambda: [ArraysCache(1)])
-    )
+    coordinator = manager.coordinator(cache_model([C.ArraysCache(1)]))
     tokens = list(range(75))
     assert coordinator.checkpoint_lengths(tokens, set()) == [64, 74]
     manager._exact_cache_max = 4
     assert coordinator.checkpoint_lengths(tokens, set()) == [32, 48, 64, 74]
-    # A media span crossing a nominal boundary must be completely prefetched.
     tokens[45:67] = [999] * 22
     assert coordinator.checkpoint_lengths(tokens, {999}) == [67, 74]
     manager.checkpoint_interval_tokens = 0
     assert coordinator.checkpoint_lengths(tokens, set()) == [74]
 
 
-def _embeddings(lm, tokens):
+def prompt_batch(lm, manager, tokens, prefixes, caches, step=16, **kwargs):
+    runner = manager.coordinator(lm)
+    suffixes = [ids[n:] for ids, n in zip(tokens, prefixes)]
+    padded = [ids + [0] * (max(map(len, suffixes)) - len(ids)) for ids in suffixes]
+    return PromptProcessingBatch(
+        model=lm,
+        uids=list(range(len(tokens))),
+        input_ids=suffixes,
+        max_tokens=[1] * len(tokens),
+        inputs_embeds=embeddings(lm, mx.array(padded)),
+        prompt_kwargs={},
+        warm_cache=caches,
+        prefill_step_size=step,
+        apc_manager=manager,
+        apc_coordinator=runner,
+        apc_meta=[
+            dict(
+                full_input_ids=ids,
+                prefix_len=n,
+                checkpoint_lengths=runner.checkpoint_lengths(ids, set()),
+            )
+            for ids, n in zip(tokens, prefixes)
+        ],
+        **kwargs,
+    )
+
+
+def finish_batch(batch, sample=None):
+    while batch.needs_processing():
+        assert batch.prompt_step() > 0
+    batch.generate(
+        sample or (lambda lp: mx.argmax(lp, axis=-1)),
+        [lambda _: False] * len(batch.uids),
+    )
+
+
+def embeddings(lm, tokens):
     return lm.model.embed_tokens(tokens) * getattr(lm.model, "embed_scale", 1)
 
 
-@pytest.mark.parametrize("prefill_step_size", [None, 4, 16, 32])
-def test_lfm_mixed_prefill_keeps_logits_before_right_padding(
-    prefix_manager, prefill_step_size
-):
-    from mlx_vlm.apc import make_warm_batch_exact_cache_multi
-    from mlx_vlm.generate.ar import PromptProcessingBatch
-
+@parametrize("prefill_step_size", [None, 4, 16, 32])
+def test_lfm_padded_prefill(prefix_manager, prefill_step_size):
     mx.random.seed(19)
-    lm = _apc_language_model("lfm2")
+    lm = language_model("lfm2")
     manager = prefix_manager()
     manager._exact_cache_max = 8
     manager.checkpoint_interval_tokens = 16
-    coordinator = manager.coordinator(lm)
     warm_tokens = [i % 50 + 1 for i in range(71)]
     cold_tokens = [i % 30 + 51 for i in range(25)]
     seed_cache = lm.make_cache()
@@ -2472,40 +1229,24 @@ def test_lfm_mixed_prefill_keeps_logits_before_right_padding(
     assert manager.store_exact_cache(warm_tokens[:64], seed_cache)
     restored, count = manager.lookup_exact_cache(warm_tokens)
     assert count == 64
-    caches, _ = make_warm_batch_exact_cache_multi([restored, lm.make_cache()], [64, 0])
-    suffixes = [warm_tokens[64:], cold_tokens]
-    padded = mx.array([suffixes[0] + [0] * 18, suffixes[1]])
-    batch = PromptProcessingBatch(
-        model=lm,
-        uids=[0, 1],
-        input_ids=suffixes,
-        max_tokens=[1, 1],
-        inputs_embeds=_embeddings(lm, padded),
-        prompt_kwargs={},
-        warm_cache=caches,
-        prefill_step_size=prefill_step_size,
+    caches, _ = warm_exact([restored, lm.make_cache()], [64, 0])
+    batch = prompt_batch(
+        lm,
+        manager,
+        [warm_tokens, cold_tokens],
+        [64, 0],
+        caches,
+        prefill_step_size,
         right_pad_per_row=[18, 0],
         suffix_lens=[7, 25],
-        apc_manager=manager,
-        apc_coordinator=coordinator,
-        apc_meta=[
-            {
-                "full_input_ids": tokens,
-                "prefix_len": prefix,
-                "checkpoint_lengths": coordinator.checkpoint_lengths(tokens, set()),
-            }
-            for tokens, prefix in [(warm_tokens, 64), (cold_tokens, 0)]
-        ],
     )
-    while batch.needs_processing():
-        assert batch.prompt_step() > 0
     sampled = []
 
     def sample(logprobs):
         sampled.append(logprobs)
         return mx.argmax(logprobs, axis=-1)
 
-    batch.generate(sample, [lambda _: False, lambda _: False])
+    finish_batch(batch, sample)
     for row, tokens in enumerate([warm_tokens, cold_tokens]):
         reference = lm.make_cache()
         for start in range(0, len(tokens) - 1, 4):
@@ -2517,14 +1258,13 @@ def test_lfm_mixed_prefill_keeps_logits_before_right_padding(
         logprobs = logits - mx.logsumexp(logits)
         assert mx.allclose(sampled[0][row], logprobs, atol=1e-4, rtol=1e-4).item()
         assert mx.argmax(sampled[0][row]).item() == mx.argmax(logits).item()
-        # Right-padding must preserve LFM's final real convolution state too.
         assert mx.allclose(
             caches[0][0][row : row + 1], reference[0][0], atol=1e-4, rtol=1e-4
         ).item()
 
 
-@pytest.mark.parametrize("tier", ["memory", "disk"])
-def test_diffusion_prefills_only_divergent_suffix(prefix_manager, tier):
+@parametrize("tier", ["memory", "disk"])
+def test_diffusion_suffix(prefix_manager, tier):
     from mlx_vlm.generate import stream_generate
     from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
     from mlx_vlm.tests.test_diffusion_models import (
@@ -2537,68 +1277,44 @@ def test_diffusion_prefills_only_divergent_suffix(prefix_manager, tier):
     model = Model(ModelConfig.from_dict(tiny_config_dict()))
     recorder = RecordingEncoder(model.model.encoder)
     model.model.encoder = recorder
-    manager = prefix_manager(tier)
-    manager.block_size = 2
-    manager.checkpoint_interval_tokens = 4
-    manager.exact_cache_min_tokens = 1
+    settings = dict(block=2, checkpoint_interval_tokens=4, exact_cache_min_tokens=1)
+    manager = prefix_manager(tier, **settings)
     tokens = list(range(2, 13))
-    kwargs = dict(max_tokens=2, max_denoising_steps=1, _apc_semantic_hash=11)
-    list(
-        stream_generate(
-            model,
-            FakeProcessor(),
-            "",
-            input_ids=mx.array([tokens]),
-            _apc_manager=manager,
-            **kwargs,
+
+    def generate(ids):
+        return list(
+            stream_generate(
+                model,
+                FakeProcessor(),
+                "",
+                input_ids=mx.array([ids]),
+                _apc_manager=manager,
+                max_tokens=2,
+                max_denoising_steps=1,
+                _apc_semantic_hash=11,
+            )
         )
-    )
-    # An identical replay has no new checkpoint to capture. It must not store
-    # a third full-prompt snapshot that evicts the divergent-prefix checkpoint.
-    repeated = list(
-        stream_generate(
-            model,
-            FakeProcessor(),
-            "",
-            input_ids=mx.array([tokens]),
-            _apc_manager=manager,
-            **kwargs,
-        )
-    )
-    assert repeated[-1].cached_tokens == 10
+
+    generate(tokens)
+    assert generate(tokens)[-1].cached_tokens == 10
     if manager.disk:
         manager.close()
-        manager.disk = None
-        manager = prefix_manager(tier)
-        manager.block_size = 2
-        manager.checkpoint_interval_tokens = 4
-        manager.exact_cache_min_tokens = 1
+        manager = prefix_manager(tier, **settings)
     recorder.input_lengths.clear()
-    warm = list(
-        stream_generate(
-            model,
-            FakeProcessor(),
-            "",
-            input_ids=mx.array([tokens[:9] + [13, 14]]),
-            _apc_manager=manager,
-            **kwargs,
-        )
-    )
-    assert warm[-1].cached_tokens == 8
+    assert generate(tokens[:9] + [13, 14])[-1].cached_tokens == 8
     assert recorder.input_lengths == [2, 1]
 
 
-@pytest.mark.parametrize("model_name", ["gemma4", "qwen3_5"])
-@pytest.mark.parametrize("tier", ["memory", "disk"])
-@pytest.mark.parametrize("path", ["stream", "batch"])
-def test_hybrid_generation_restores_before_divergence(
-    prefix_manager, model_name, tier, path
-):
-    from mlx_vlm.generate.ar import PromptProcessingBatch, generate_step
+@parametrize("model_name", ["gemma4", "qwen3_5"])
+@parametrize("tier", ["memory", "disk"])
+@parametrize("path", ["stream", "batch"])
+def test_hybrid_prefix_generation(prefix_manager, model_name, tier, path):
+    from mlx_vlm.generate.ar import generate_step
     from mlx_vlm.models.base import InputEmbeddingsFeatures
 
     mx.random.seed(13)
-    lm = _apc_language_model(model_name)
+    lm = language_model(model_name)
+    assert P.model_apc_mode(lm) == "exact"
     manager = prefix_manager(tier)
     manager.checkpoint_interval_tokens = 16
     coordinator = manager.coordinator(lm)
@@ -2606,12 +1322,11 @@ def test_hybrid_generation_restores_before_divergence(
     boundaries = coordinator.checkpoint_lengths(tokens, set())
     assert boundaries == [64, 74]
     ids = mx.array([tokens])
-
     if path == "stream":
-        wrapper = SimpleNamespace(
+        wrapper = NS(
             language_model=lm,
             get_input_embeddings=lambda ids, *a, **kw: InputEmbeddingsFeatures(
-                inputs_embeds=_embeddings(lm, ids)
+                inputs_embeds=embeddings(lm, ids)
             ),
         )
         list(
@@ -2631,43 +1346,15 @@ def test_hybrid_generation_restores_before_divergence(
             )
         )
     else:
-        batch = PromptProcessingBatch(
-            model=lm,
-            uids=[0],
-            input_ids=[tokens],
-            max_tokens=[1],
-            inputs_embeds=_embeddings(lm, ids),
-            prompt_kwargs={},
-            warm_cache=lm.make_cache(),
-            prefill_step_size=16,
-            apc_manager=manager,
-            apc_coordinator=coordinator,
-            apc_meta=[
-                {
-                    "full_input_ids": tokens,
-                    "prefix_len": 0,
-                    "checkpoint_lengths": boundaries,
-                }
-            ],
-        )
-        while batch.needs_processing():
-            assert batch.prompt_step() > 0
-        batch.generate(lambda lp: mx.argmax(lp, axis=-1), [lambda _: False])
-        # Final prompt harvest must retain the intermediate state in the LRU.
-        assert (
-            sorted(len(entry.token_ids) for entry in manager._exact_cache.values())
-            == boundaries
-        )
-
+        finish_batch(prompt_batch(lm, manager, [tokens], [0], lm.make_cache()))
+        lengths = sorted(len(e.token_ids) for e in manager._exact_cache.values())
+        assert lengths == boundaries
     if manager.disk:
         manager.close()
-        manager.disk = None
         manager = prefix_manager(tier)
     divergent = tokens[:70] + [60, 61, 62, 63]
     restored, count = manager.lookup_exact_cache(divergent)
     assert count == 64
-    # Reference computes the shared document in the same chunks, but never
-    # processes A's instructions. This detects stale recurrent/window state.
     cold_cache = lm.make_cache()
     for start in range(0, count, 16):
         lm(mx.array([divergent[start : start + 16]]), cache=cold_cache)
@@ -2679,509 +1366,134 @@ def test_hybrid_generation_restores_before_divergence(
     assert mx.array_equal(mx.argmax(cold, axis=-1), mx.argmax(warm, axis=-1)).item()
 
 
-def _array_leaves(value):
-    if isinstance(value, mx.array):
-        return [value]
-    if isinstance(value, (list, tuple)):
-        return [leaf for item in value for leaf in _array_leaves(item)]
-    if isinstance(value, dict):
-        return [leaf for item in value.values() for leaf in _array_leaves(item)]
-    return []
-
-
-def _assert_packed_state_equal(lhs, rhs):
-    lhs_leaves = _array_leaves(lhs)
-    rhs_leaves = _array_leaves(rhs)
-    assert len(lhs_leaves) == len(rhs_leaves)
-    for left, right in zip(lhs_leaves, rhs_leaves):
-        assert left.dtype == right.dtype
-        assert left.shape == right.shape
-        assert bool(mx.array_equal(left, right).item())
-
-
-def _disk_roundtrip(tmp_path, namespace, token_ids, snapshot):
-    disk = DiskBlockStore(tmp_path, namespace=namespace)
-    manager = APCManager(num_blocks=1, block_size=BLOCK_SIZE, disk=disk)
-    assert manager.store_exact_cache(token_ids, snapshot)
-    disk._q.join()
-    manager.close()
-
-    disk = DiskBlockStore(tmp_path, namespace=namespace)
-    manager = APCManager(num_blocks=1, block_size=BLOCK_SIZE, disk=disk)
-    restored = manager.lookup_exact_cache(token_ids + [999])
-    manager.close()
-    return restored
-
-
-def test_with_left_padding():
-    """Left-padding is correctly handled when harvesting from quantized cache."""
-    manager = APCManager(num_blocks=8, block_size=BLOCK_SIZE)
-    left_pad = 3
-    content_len = 2 * BLOCK_SIZE  # enough for 2 blocks after removing padding
-
-    cache = BatchQuantizedKVCache([left_pad], group_size=GROUP_SIZE, bits=BITS)
-    k, v = _rand_kv(batch=1, seq_len=content_len + left_pad)
-    cache.update_and_fetch(k, v)
-    mx.eval(cache.keys)
-
-    batch_caches = [cache, cache]  # 2 layers, same data for simplicity
-    token_ids = list(range(content_len))
-    blocks = harvest_blocks_from_batch_cache(
-        manager, batch_caches, batch_idx=0, full_token_ids=token_ids
-    )
-
-    # 2 * BLOCK_SIZE content tokens = 2 full blocks
-    assert len(blocks) == 2
-    for block in blocks:
-        for k_layer in block.keys:
-            assert k_layer.shape[2] == BLOCK_SIZE
-    manager.release(blocks)
-
-
-def test_apc_not_disabled_when_kv_bits_set():
-    """The ar.py guard that kills APC when kv_bits is set must be removed.
-
-    Checks the source of BatchGenerator.__init__ to ensure the old pattern
-    'if apc_manager is not None and kv_bits is not None: apc_manager = None'
-    is no longer present.
-    """
-    import inspect
-
-    from mlx_vlm.generate.ar import BatchGenerator
-
-    source = inspect.getsource(BatchGenerator.__init__)
-    # The old guard unconditionally disabled APC when kv_bits was set
-    assert not (
-        "kv_bits is not None" in source and "apc_manager = None" in source
-    ), "Guard still disables APC when kv_bits is set"
-
-
-def test_hybrid_batch_kv_and_quantized_exact_store():
-    """Exact store works for the --kv-bits hybrid layout (pinglin / #1534).
-
-    With kv-bits, single-row continuous-batching uses batch cache classes
-    even for B=1: ArraysCache (SSM) + BatchKVCache (unquantized last
-    attention layer) + BatchQuantizedKVCache. store_exact_cache must
-    clone this mix rather than silently returning False.
-    """
-    seq_len = 2 * BLOCK_SIZE
-    token_ids = list(range(seq_len))
-
-    arrays = ArraysCache(2)
-    arrays.cache = [mx.zeros((1, seq_len, D)), mx.zeros((1, seq_len, D))]
-    arrays.left_padding = mx.array([0])
-
-    batch_kv = BatchKVCache([0])
-    k, v = _rand_kv(batch=1, seq_len=seq_len)
-    batch_kv.update_and_fetch(k, v)
-
-    batch_q = BatchQuantizedKVCache([0], group_size=GROUP_SIZE, bits=BITS)
-    kq, vq = _rand_kv(batch=1, seq_len=seq_len)
-    batch_q.update_and_fetch(kq, vq)
-    mx.eval(batch_kv.keys, batch_q.keys)
-
-    prompt_cache = [arrays, batch_kv, batch_q]
-    assert all(apc_exact_eligible(c) for c in prompt_cache)
-
-    # Batch KV collapses to KVCache; quantized state stays packed.
-    eval_targets: list = []
-    cloned_bk = _clone_cache_entry_for_apc(
-        batch_kv, min_capacity_tokens=None, eval_targets=eval_targets
-    )
-    assert isinstance(cloned_bk, KVCache)
-    assert cloned_bk.offset == seq_len
-
-    cloned = _clone_prompt_cache_for_apc(prompt_cache)
-    assert cloned is not None
-    assert len(cloned) == 3
-    assert isinstance(cloned[0], ArraysCache)
-    assert isinstance(cloned[1], KVCache)
-    assert isinstance(cloned[2], QuantizedKVCache)
-
-    manager = APCManager(num_blocks=4, block_size=BLOCK_SIZE)
-    stored = manager.store_exact_cache(token_ids, prompt_cache, extra_hash=0)
-    assert stored is True
-    assert manager.stats.exact_stores == 1
-
-    warm, matched_tokens = manager.lookup_exact_cache(token_ids + [999], extra_hash=0)
-    assert matched_tokens == len(token_ids)
-    assert warm is not None
-    assert len(warm) == 3
-
-
-def test_uniform_roundtrip_and_merge_stay_packed(tmp_path, monkeypatch):
-    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
-    seq_len = 32
-    token_ids = list(range(seq_len))
-    source = BatchQuantizedKVCache([0], group_size=GROUP_SIZE, bits=BITS)
-    keys, values = _rand_kv(seq_len=seq_len)
-    source.update_and_fetch(keys, values)
-    mx.eval(source.state)
-    expected = source.extract(0)
-
-    def fail(*args, **kwargs):
-        raise AssertionError("native exact APC must not quantize or dequantize")
-
-    monkeypatch.setattr(QuantizedKVCache, "dequantize_for_apc", fail)
-    monkeypatch.setattr(mx, "quantize", fail)
-
-    snapshot = snapshot_prompt_cache_row([source], batch_idx=0)
-    assert snapshot is not None
-    assert isinstance(snapshot[0], QuantizedKVCache)
-    _assert_packed_state_equal(snapshot[0].state, expected.state)
-
-    warm, matched = make_warm_batch_exact_cache_multi(
-        [snapshot, [KVCache()]],
-        [seq_len, 0],
-        kv_quant_config={
-            "bits": BITS,
-            "group_size": GROUP_SIZE,
-            "scheme": "uniform",
-        },
-    )
-    assert matched == seq_len
-    assert warm is not None
-    assert isinstance(warm[0], BatchQuantizedKVCache)
-    _assert_packed_state_equal(warm[0].extract(0).state, expected.state)
-
-    restored, matched = _disk_roundtrip(tmp_path, "native-uniform", token_ids, snapshot)
-    assert matched == seq_len
-    assert restored is not None
-    assert isinstance(restored[0], QuantizedKVCache)
-    _assert_packed_state_equal(restored[0].state, snapshot[0].state)
-
-
-@pytest.mark.parametrize(
-    "bits,key_bits,value_bits",
+@parametrize(
+    "kind,bits,split",
     [
-        pytest.param(4.0, None, None, id="integer"),
-        pytest.param(3.5, None, None, id="fractional-budget"),
-        pytest.param(3.5, 3.5, 3.5, id="fractional-split-codecs"),
+        ("uniform", 8, False),
+        ("turbo", 4.0, False),
+        ("turbo", 3.5, False),
+        ("turbo", 3.5, True),
     ],
 )
-def test_turboquant_disk_roundtrip_preserves_packed_state(
-    tmp_path, monkeypatch, bits, key_bits, value_bits
-):
-    from mlx_vlm.turboquant import TurboQuantKVCache, _SplitCodec
-
+def test_packed_disk_and_batch(kind, bits, split, managers, monkeypatch):
     monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
-    seq_len = 32
-    token_ids = list(range(seq_len))
-    source = BatchTurboQuantKVCache(
-        [0], bits=bits, key_bits=key_bits, value_bits=value_bits
-    )
-    keys, values = _rand_kv(seq_len=seq_len)
-    source.update_and_fetch(keys, values)
-    mx.eval(source.state)
-    if key_bits == 3.5:
-        assert isinstance(source.key_codec, _SplitCodec)
-        assert isinstance(source.value_codec, _SplitCodec)
-
-    def fail(*args, **kwargs):
-        raise AssertionError("TurboQuant checkpoint must stay packed")
-
-    monkeypatch.setattr(TurboQuantKVCache, "dequantize_for_apc", fail)
-    snapshot = snapshot_prompt_cache_row([source], batch_idx=0)
-    assert snapshot is not None
-    assert isinstance(snapshot[0], TurboQuantKVCache)
-
-    restored, matched = _disk_roundtrip(
-        tmp_path,
-        f"native-turbo-{bits}-{key_bits}-{value_bits}",
-        token_ids,
-        snapshot,
-    )
-    assert matched == seq_len
-    assert restored is not None
-    assert isinstance(restored[0], TurboQuantKVCache)
-    _assert_packed_state_equal(restored[0].state, snapshot[0].state)
-
-    kv_quant_config = {
-        "bits": bits,
-        "group_size": GROUP_SIZE,
-        "scheme": "turboquant",
-    }
-    if key_bits is not None:
-        kv_quant_config["key_bits"] = key_bits
-    if value_bits is not None:
-        kv_quant_config["value_bits"] = value_bits
-    warm, _ = make_warm_batch_exact_cache_multi(
-        [restored, [KVCache()]], [seq_len, 0], kv_quant_config=kv_quant_config
-    )
-    assert warm is not None
-    assert isinstance(warm[0], BatchTurboQuantKVCache)
-    _assert_packed_state_equal(warm[0].extract(0).state, snapshot[0].state)
-
-    next_keys, next_values = _rand_kv(batch=2, seq_len=1)
-    updated = warm[0].update_and_fetch(next_keys, next_values)
-    mx.eval(updated)
-    assert warm[0]._idx == seq_len + 1
-
-
-def test_dequantize_for_apc_returns_none_when_empty():
-    """dequantize_for_apc() returns (None, None) on an empty cache."""
-    cache = QuantizedKVCache(group_size=GROUP_SIZE, bits=BITS)
-    dk, dv = cache.dequantize_for_apc()
-    assert dk is None
-    assert dv is None
-
-
-def test_turboquant_dequantize_for_apc_returns_none_when_empty():
-    """TurboQuantKVCache.dequantize_for_apc() returns (None, None) when empty."""
-    from mlx_vlm.turboquant import BatchTurboQuantKVCache, TurboQuantKVCache
-
-    cache = TurboQuantKVCache(bits=4)
-    dk, dv = cache.dequantize_for_apc()
-    assert dk is None
-    assert dv is None
-
-    batch_cache = BatchTurboQuantKVCache([0], bits=4)
-    dk, dv = batch_cache.dequantize_for_apc()
-    assert dk is None
-    assert dv is None
-
-
-def test_harvest_handles_empty_quantized_cache():
-    """harvest_blocks_from_batch_cache returns [] for empty quantized caches."""
-    manager = APCManager(num_blocks=8, block_size=BLOCK_SIZE)
-    empty_cache = BatchQuantizedKVCache([0], group_size=GROUP_SIZE, bits=BITS)
-    token_ids = list(range(BLOCK_SIZE))
-    blocks = harvest_blocks_from_batch_cache(
-        manager, [empty_cache], batch_idx=0, full_token_ids=token_ids
-    )
-    assert blocks == []
-
-
-def test_int_coercion_on_float_bits():
-    """Float bits value (e.g. 8.0 from JSON) doesn't crash."""
-    manager = APCManager(num_blocks=8, block_size=BLOCK_SIZE)
-    seq_len = BLOCK_SIZE
-
-    lk = [_rand_kv(seq_len=seq_len)[0]]
-    lv = [_rand_kv(seq_len=seq_len)[1]]
-    mx.eval(lk + lv)
-
-    token_ids = list(range(seq_len))
-    blocks = manager.store_kv_blocks(token_ids, lk, lv)
-    manager.release(blocks)
-
-    matched, _ = manager.lookup_prefix(token_ids)
-    # Simulate JSON-parsed config with float values
-    quant_config = {"bits": 8.0, "group_size": 32.0}
-    warm = make_warm_kv_cache(matched, kv_quant_config=quant_config)
-
-    assert len(warm) == 1
-    assert isinstance(warm[0], QuantizedKVCache)
-    assert warm[0].bits == 8
-    assert warm[0].group_size == 32
-    manager.release(matched)
-
-
-KV_CFG = {"bits": BITS, "group_size": GROUP_SIZE}
-TQ_CFG = {"bits": 3.5, "group_size": GROUP_SIZE, "scheme": "turboquant"}
-
-
-def _store_prefix_blocks(
-    manager: APCManager, num_layers: int, seq_len: int, token_ids: List[int]
-):
-    lk, lv = [], []
-    for _ in range(num_layers):
-        k, v = _rand_kv(seq_len=seq_len)
-        lk.append(k)
-        lv.append(v)
-    mx.eval(lk + lv)
-    blocks = manager.store_kv_blocks(token_ids, lk, lv)
-    manager.release(blocks)
-    matched, _ = manager.lookup_prefix(token_ids)
-    assert matched, "expected APC hit after store"
-    return matched
-
-
-def _layer_type_names(caches) -> List[str]:
-    return [type(c).__name__ for c in caches]
-
-
-def _expected_make_cache_types(num_layers: int) -> List[str]:
-    class FakeLayer:
-        pass
-
-    class FakeModel:
-        layers = [FakeLayer() for _ in range(num_layers)]
-
-    caches = _make_cache(
-        FakeModel(),
-        [0],
-        kv_bits=float(BITS),
-        kv_group_size=GROUP_SIZE,
-        kv_quant_scheme="uniform",
-    )
-    return _layer_type_names(caches)
-
-
-def test_make_warm_batch_kv_cache_multi_matches_make_cache_types():
-    num_layers = 4
-    seq_len = 2 * BLOCK_SIZE
-    manager = APCManager(num_blocks=32, block_size=BLOCK_SIZE)
-    try:
-        token_ids = list(range(seq_len))
-        matched = _store_prefix_blocks(manager, num_layers, seq_len, token_ids)
-        pick = {"matched_blocks": matched, "prefix_len": seq_len}
-        warm, max_prefix = make_warm_batch_kv_cache_multi(
-            [pick, None], num_layers=num_layers, kv_quant_config=KV_CFG
+    kwargs = {"bits": bits} | ({"key_bits": bits, "value_bits": bits} if split else {})
+    source = filled(batch_cache(kind, **kwargs))
+    expected = source.extract(0)
+    if split:
+        assert all(
+            isinstance(c, _SplitCodec) for c in (source.key_codec, source.value_codec)
         )
-        assert max_prefix == seq_len
-        assert _layer_type_names(warm) == _expected_make_cache_types(num_layers)
-        assert isinstance(warm[-1], BatchKVCache)
-        assert warm[-1].left_padding.tolist() == [0, seq_len]
-    finally:
-        manager.close()
+    factory = C.QuantizedKVCache if kind == "uniform" else TurboQuantKVCache
+    forbid(monkeypatch, factory, "dequantize_for_apc")
+    if kind == "uniform":
+        forbid(monkeypatch, mx, "quantize")
+    snapshot = snapshot_row([source], 0)
+    assert isinstance(snapshot[0], factory)
+    same_arrays(snapshot[0].state, expected.state)
+    restored, _ = disk_roundtrip(managers, list(range(32)), snapshot)
+    assert isinstance(restored[0], factory)
+    same_arrays(restored[0].state, snapshot[0].state)
+    scheme = "uniform" if kind == "uniform" else "turboquant"
+    config = dict(group_size=32, scheme=scheme, **kwargs)
+    warm, count = warm_exact([restored, [C.KVCache()]], [32, 0], kv_quant_config=config)
+    assert count == 32 and type(warm[0]) is type(source)
+    same_arrays(warm[0].extract(0).state, expected.state)
+    if kind == "turbo":
+        mx.eval(warm[0].update_and_fetch(*kv(1, batch=2)))
+        assert warm[0]._idx == 33
 
 
-def _hybrid_row_caches(seq_len: int, *, n_full_attn: int = 3):
-    """Synthetic hybrid: ArraysCache + n_full_attn KVCache layers."""
-    arrays = ArraysCache(2)
-    arrays.cache = [mx.zeros((1, seq_len, D)), mx.zeros((1, seq_len, D))]
-    rows = [arrays]
-    for _ in range(n_full_attn):
-        c = KVCache()
-        k, v = _rand_kv(batch=1, seq_len=seq_len)
-        c.keys = k
-        c.values = v
-        c.offset = seq_len
-        rows.append(c)
-    return rows
-
-
-def _live_hybrid_batch(seq_len: int, n_full_attn: int = 3):
-    """Live continuous-batching row: ArraysCache + quant full-attn + last float."""
-    arrays = ArraysCache(2)
-    arrays.cache = [mx.zeros((1, seq_len, D)), mx.zeros((1, seq_len, D))]
+def test_quantized_hybrid_snapshots(managers):
+    arrays = C.ArraysCache(2)
+    arrays.cache = [mx.zeros((1, 32, 32))] * 2
     arrays.left_padding = mx.array([0])
-    caches = [arrays]
-    n = 1 + n_full_attn
-    for i in range(n_full_attn):
-        layer_idx = 1 + i
-        quantize = should_quantize_kv_layer(layer_idx, n)
-        k, v = _rand_kv(batch=1, seq_len=seq_len)
-        if quantize:
-            c = BatchQuantizedKVCache([0], group_size=GROUP_SIZE, bits=BITS)
-        else:
-            c = BatchKVCache([0])
-        c.update_and_fetch(k, v)
-        caches.append(c)
-    return caches
-
-
-def test_exact_warm_with_kv_config_extends_live_quant():
-    seq_len = 16
-    live = _live_hybrid_batch(seq_len)
-    row = _hybrid_row_caches(seq_len)
-    warm, _ = make_warm_batch_exact_cache_multi(
-        [row], [seq_len], kv_quant_config=KV_CFG
+    caches = [arrays, filled(batch_cache("dense")), filled(batch_cache("uniform"))]
+    assert all(A.apc_exact_eligible(c) for c in caches)
+    cloned = P._clone_cache_entry_for_apc(
+        caches[1], min_capacity_tokens=None, eval_targets=[]
     )
-    assert _layer_type_names(live) == _layer_type_names(warm)
-    extended = _extend_cache(live, warm)
-    assert int(extended[1].offset.shape[0]) == 2
-    assert isinstance(extended[1], BatchQuantizedKVCache)
-    assert isinstance(extended[-1], BatchKVCache)
+    assert isinstance(cloned, C.KVCache) and cloned.offset == 32
+    cloned = P._clone_prompt_cache_for_apc(caches)
+    assert [type(c) for c in cloned] == [C.ArraysCache, C.KVCache, C.QuantizedKVCache]
+    manager = managers()
+    assert manager.store_exact_cache(list(range(32)), caches)
+    assert manager.stats.exact_stores == 1
+    warm, count = manager.lookup_exact_cache(list(range(32)) + [999])
+    assert count == 32 and len(warm) == 3
 
 
-def _live_tq_batch(seq_len: int, num_layers: int = 4, head_dim: int = D):
-    class FakeLayer:
-        pass
-
-    class FakeModel:
-        layers = [FakeLayer() for _ in range(num_layers)]
-
-    caches = _make_cache(
-        FakeModel(),
+@parametrize("scheme", ["uniform", "turboquant"])
+def test_warm_cache_quantization_policy(scheme, managers):
+    bits = 8 if scheme == "uniform" else 3.5
+    config = dict(bits=bits, group_size=32, scheme=scheme)
+    manager = managers(blocks=32)
+    tokens = list(range(32 if scheme == "uniform" else 16))
+    blocks = store_blocks(manager, tokens, layers=4, dim=32)
+    manager.release(blocks)
+    blocks, count = manager.lookup_prefix(tokens)
+    assert count == len(tokens)
+    live = _make_cache(
+        NS(layers=[NS()] * 4),
         [0],
-        kv_bits=3.5,
-        kv_group_size=GROUP_SIZE,
-        kv_quant_scheme="turboquant",
+        kv_bits=float(bits),
+        kv_group_size=32,
+        kv_quant_scheme=scheme,
     )
-    for c in caches:
-        k = mx.random.normal((1, H, seq_len, head_dim))
-        v = mx.random.normal((1, H, seq_len, head_dim))
-        mx.eval(k, v)
-        c.update_and_fetch(k, v)
-    return caches
+    for cache in live:
+        filled(cache, len(tokens))
+    if scheme == "uniform":
+        warm, count = warm_blocks(
+            [{"matched_blocks": blocks, "prefix_len": len(tokens)}, None],
+            num_layers=4,
+            kv_quant_config=config,
+        )
+        assert count == len(tokens)
+        assert warm[-1].left_padding.tolist() == [0, len(tokens)]
+        single = P.make_warm_kv_cache(
+            blocks, kv_quant_config={"bits": 8.0, "group_size": 32.0}
+        )
+        assert isinstance(single[0], C.QuantizedKVCache)
+        assert (single[0].bits, single[0].group_size) == (8, 32)
 
-
-def test_block_warm_multi_turboquant_matches_make_cache_types():
-    num_layers = 4
-    seq_len = 16
-    manager = APCManager(num_blocks=32, block_size=BLOCK_SIZE)
-    try:
-        # Store float blocks (APC always float); restore with TQ config.
-        token_ids = list(range(seq_len))
-        matched = _store_prefix_blocks(manager, num_layers, seq_len, token_ids)
-        warm = make_warm_batch_kv_cache(matched, kv_quant_config=TQ_CFG)
-        live = _live_tq_batch(seq_len, num_layers=num_layers)
-        assert _layer_type_names(warm) == _layer_type_names(live)
+    else:
+        warm = P.make_warm_batch_kv_cache(blocks, kv_quant_config=config)
         assert isinstance(warm[0], BatchTurboQuantKVCache)
-        assert isinstance(warm[-1], BatchKVCache)
-    finally:
-        manager.close()
+    assert [type(c) for c in warm] == [type(c) for c in live]
+    assert isinstance(warm[-1], C.BatchKVCache)
+    manager.release(blocks)
+    if scheme == "uniform":
+        arrays = C.ArraysCache(2)
+        arrays.cache = [mx.zeros((1, 16, 32))] * 2
+        row = [arrays] + [filled(C.KVCache(), 16) for _ in range(3)]
+        live_arrays = clone(arrays)
+        live_arrays.left_padding = mx.array([0])
+        live = [live_arrays] + [
+            filled(
+                batch_cache("uniform" if C.should_quantize_kv_layer(i, 4) else "dense"),
+                16,
+            )
+            for i in range(1, 4)
+        ]
+        warm, _ = warm_exact([row], [16], kv_quant_config=config)
+        assert [type(c) for c in warm] == [type(c) for c in live]
+        extended = _extend_cache(live, warm)
+        assert extended[1].offset.shape[0] == 2
+        assert isinstance(extended[1], C.BatchQuantizedKVCache)
+        assert isinstance(extended[-1], C.BatchKVCache)
 
 
-@pytest.mark.skipif(
-    os.environ.get("RUN_LIVE_APC_KV_JOIN", "0") != "1",
-    reason="Set RUN_LIVE_APC_KV_JOIN=1 to run live model staggered join smoke",
-)
-def test_live_batch_generator_staggered_apc_kv_join():
-    """Live repro of server concurrent APC+kv join (optional smoke)."""
-    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-    from mlx_vlm import load
-    from mlx_vlm.generate import BatchGenerator
-
-    model_id = os.environ.get("REPRO_MODEL", "mlx-community/Qwen3-0.6B-4bit")
-    model, processor = load(model_id)
-    lm = model.language_model if hasattr(model, "language_model") else model
-    tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
-
-    def ids(text: str):
-        x = tok.encode(text)
-        return list(x.ids if hasattr(x, "ids") else x)
-
-    def embeds(id_list):
-        e = model.get_input_embeddings(mx.array([id_list]))
-        return {k: v for k, v in e.to_dict().items() if v is not None}
-
-    def close(gen):
-        if hasattr(gen, "close") and callable(gen.close):
-            gen.close()
-        elif hasattr(gen, "_wire_stack"):
-            gen._wire_stack.close()
-
-    prefix = "Shared prefix for agent tools: " + ("schema " * 50)
-    a = ids(prefix + " task A")
-    b = ids(prefix + " task B")
-    apc = APCManager(num_blocks=4096, block_size=16)
-    gen = BatchGenerator(
-        lm,
-        processor,
-        max_tokens=24,
-        kv_bits=8.0,
-        kv_quant_scheme="uniform",
-        apc_manager=apc,
-        prefill_step_size=64,
-        compute_logprobs=False,
+def test_short_and_multimodal_prefixes(managers):
+    config = NS(model_type="deepseek_v4", vision_n_layers=32, vocab_size=129280)
+    assert P.multimodal_token_ids_from_config(config) == set(range(129280, 129285))
+    assert (
+        P.adjust_prefix_to_text_suffix_boundary(
+            [1, 42, 42], desired_prefix_len=1, media_token_ids={42}, max_prefix_tokens=2
+        )
+        == 0
     )
-    try:
-        gen.insert([a], max_tokens=24, prompt_kwargs=[embeds(a)])
-        steps = 0
-        while gen.has_work and steps < 200:
-            _pr, resp = gen.next()
-            steps += 1
-            if resp:
-                gen.insert([b], max_tokens=24, prompt_kwargs=[embeds(b)])
-                break
-        while gen.has_work:
-            gen.next()
-            steps += 1
-            if steps > 800:
-                raise TimeoutError("drain too long")
-    finally:
-        close(gen)
-        apc.close()
+    cache = C.ArraysCache(1)
+    cache[0] = mx.zeros((1, 2, 1, 32))
+    manager = managers()
+    manager.store_exact_cache([1], [cache])
+    assert manager.lookup_exact_cache(list(range(1, 400))) == (None, 0)

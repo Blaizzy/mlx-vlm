@@ -57,8 +57,8 @@ against `f7de22df`, retaining both JSON files. Its full-suite execution sets wer
 80,634 production lines and 12,715 branch outcomes, with no lost or added paths.
 That validation reported 1,852 passed, five skipped, and 41 passing subtests.
 These are measured execution sets, not complete production coverage. The earlier
-pruning tradeoffs still apply. The suite now contains 26,383 Python lines plus
-2,229 readable JSON lines, or 28,612 combined.
+pruning tradeoffs still apply. The suite now contains 24,695 Python lines plus
+2,229 readable JSON lines, or 26,924 combined.
 
 After removing the unused cache helper and redundant standalone mask test, the
 full suite reports 1,875 passed, five skipped, and 41 passing subtests. Coverage
@@ -220,20 +220,29 @@ python -m pytest -q mlx_vlm/tests/test_models.py -k llava_bunny
 The `apc` section supplies ordinary settings to `test_apc.py`. Gemma4, Qwen3.5,
 and Qwen4 Exp profiles name an existing `case` and override its nested `config`;
 LFM2 and Z1T profiles provide a `module` and their complete input `config`.
-`_apc_config` deep-copies and recursively merges these settings before calling
+`apc_config` deep-copies and recursively merges these settings before calling
 the shared `build_config` helper, so derived layer layouts reflect the APC
 settings and neither the base case nor the profile is mutated. The module is
 imported dynamically under `mlx_vlm.models`. Model/component construction and
 APC assertions remain in Python; these profiles do not add model-contract cases.
 
 The five effective configs, including derived fields, match their previous
-Python definitions exactly. This removes 104 Python lines and adds 87 JSON lines,
-for a net reduction of 17 lines; `test_apc.py` now has 3,187 lines. All 100 APC
-test functions remain. Against `1a7d50fe`, the combined APC/model suite reports
-295 passed and one existing skip, retaining exactly 51,308 production lines and
-3,926 branch outcomes, with no lost or added paths.
-The full suite reports 1,876 passed, five skipped, and 39 passing subtests;
-coverage retains the same 80,919 production lines and 12,819 branch outcomes.
+Python definitions exactly. The configuration migration removed 104 Python lines
+and added 87 JSON lines, saving 17 combined lines.
+
+The compact APC suite replaces the validated prototype in `test_apc.py` and runs
+under default collection. It contains **1,499 lines instead of 3,187** and
+**97 cases across 35 shared test functions**, with all helpers inline. Shared
+runners cover 19 cache layouts, disk restoration, memory-growth matrices, prefix
+generation, and packed quantization. Prototype files are removed. Coverage-based
+pruning also removes the optional live checkpoint-backed smoke, whose skipped
+coverage was not measured.
+
+The full default suite reports **1,791 passed, four skipped, and 39 passing
+subtests**. Against `eda5edef`, all 80,919 previously covered production statements
+and 12,819 branch outcomes remain covered, with seven statements and three
+branch outcomes added. See [APC coverage](apc_coverage.md) for exact measurements,
+pruned checks, retained tolerances, and reproduction commands.
 
 For a contract case, `module` names the module under `mlx_vlm.models`, `config`
 contains ordinary nested model settings, and `checks` lists check names in order:
