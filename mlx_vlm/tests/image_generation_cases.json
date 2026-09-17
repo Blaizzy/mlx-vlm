@@ -216,5 +216,34 @@
         "transformer_blocks.0.txt_mlp.net.0.proj.weight": {"target": "transformer_blocks.0.txt_mlp.linear_in.weight", "shape": [4, 1]}
       }
     }
+  ],
+  "downloads": [
+    {
+      "id": "bonsai-local",
+      "module": "bonsai.download",
+      "config": {"variant": "ternary", "max_workers": 3},
+      "repo_id": "prism-ml/bonsai-image-ternary-4B-mlx-2bit",
+      "directory_option": "models_dir",
+      "directory_name": "bonsai-image-4B-ternary-mlx"
+    },
+    {
+      "id": "bonsai-cache",
+      "module": "bonsai.download",
+      "config": {"variant": "ternary", "max_workers": 2},
+      "repo_id": "prism-ml/bonsai-image-ternary-4B-mlx-2bit"
+    },
+    {
+      "id": "flux2-cache",
+      "module": "flux2.download",
+      "config": {"variant": "flux2-klein-9b", "max_workers": 2},
+      "repo_id": "black-forest-labs/FLUX.2-klein-9B",
+      "required_patterns": ["model_index.json"]
+    },
+    {
+      "id": "mage-flow-cache",
+      "module": "mage_flow.download",
+      "config": {"variant": "mage-flow-turbo", "max_workers": 2},
+      "repo_id": "mage-flow-community/Mage-Flow-Turbo"
+    }
   ]
 }

@@ -102,6 +102,12 @@ Behavioral checks use `_ModelFamily` for dynamic submodule access, such as
 `ernie.config` or `flux.weights`. These resolve to real imported modules, so
 patches still apply to production objects without a static model import block.
 
+The four `downloads` cases use one model-independent runner. Each supplies an
+import module, download `config`, expected `repo_id`, and optional destination
+or required-pattern expectations. The runner mocks Hub access and validation,
+checks argument forwarding, destination creation, and validation calls, and
+leaves required-file checks to the existing layout tests.
+
 Reuse the parameterized discovery, dimension, download, conversion, and
 weight-loading checks with descriptive family IDs. Retain family-specific prompt,
 guidance, position, VAE, and numerical assertions next to the shared contracts,

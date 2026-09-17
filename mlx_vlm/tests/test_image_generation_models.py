@@ -547,46 +547,39 @@ def test_invalid_dimensions(family, width, height):
             config.validate_dimensions(width=width, height=height)
 
 
-@pytest.mark.parametrize(
-    "family,local",
-    [("bonsai", True), ("bonsai", False), ("flux2", False), ("mage_flow", False)],
-)
-def test_model_download(monkeypatch, tmp_path, family, local):
-    module, variant, repo = {
-        "bonsai": (
-            bonsai.download,
-            "ternary",
-            "prism-ml/bonsai-image-ternary-4B-mlx-2bit",
-        ),
-        "flux2": (flux.download, "flux2-klein-9b", "black-forest-labs/FLUX.2-klein-9B"),
-        "mage_flow": (
-            mage.download,
-            "mage-flow-turbo",
-            "mage-flow-community/Mage-Flow-Turbo",
-        ),
-    }[family]
-    cached = (
-        tmp_path / "bonsai-image-4B-ternary-mlx"
-        if local
-        else tmp_path / "hf-cache" / "snapshot"
-    )
-    _write_layout(cached, family)
+@pytest.mark.parametrize("case", IMAGE_CASES["downloads"], ids=lambda case: case["id"])
+def test_model_download(monkeypatch, tmp_path, case):
+    module = importlib.import_module(f"mlx_vlm.models.{case['module']}")
+    options = dict(case["config"])
+    directory_option = case.get("directory_option")
+    if directory_option:
+        options[directory_option] = tmp_path
+    cached = tmp_path / case.get("directory_name", "snapshot")
     snapshot = MagicMock(return_value=str(cached))
+    validate = MagicMock(return_value=cached)
     monkeypatch.setattr(module, "snapshot_download", snapshot)
-    if family == "flux2":
-        monkeypatch.setattr(module, "find_valid_cached_snapshot", lambda variant: None)
-    options = dict(models_dir=tmp_path, max_workers=3) if local else dict(max_workers=2)
-    assert module.download_model(variant, **options) == cached
+    monkeypatch.setattr(module, "validate_model_layout", validate)
+    if hasattr(module, "find_valid_cached_snapshot"):
+        monkeypatch.setattr(
+            module, "find_valid_cached_snapshot", MagicMock(return_value=None)
+        )
+
+    assert module.download_model(**options) == cached
+    snapshot.assert_called_once()
+    validate.assert_called_once_with(cached)
     kwargs = snapshot.call_args.kwargs
-    assert kwargs["repo_id"] == repo and kwargs["max_workers"] == options["max_workers"]
-    if local:
+    assert kwargs["repo_id"] == case["repo_id"]
+    assert kwargs["max_workers"] == options["max_workers"]
+    if directory_option:
         assert kwargs["local_dir"] == str(cached)
-    elif family != "mage_flow":
+        assert cached.is_dir()
+    else:
         assert "local_dir" not in kwargs
-    if family != "bonsai":
-        assert kwargs["allow_patterns"] == list(module.DOWNLOAD_PATTERNS)
-        if family == "flux2":
-            assert "model_index.json" in kwargs["allow_patterns"]
+    if patterns := getattr(module, "DOWNLOAD_PATTERNS", None):
+        assert kwargs["allow_patterns"] == list(patterns)
+    assert set(case.get("required_patterns", ())) <= set(
+        kwargs.get("allow_patterns", ())
+    )
 
 
 @pytest.mark.parametrize(
