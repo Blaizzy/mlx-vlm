@@ -36,6 +36,7 @@ Use a module path or `-k` to select a smaller group while developing.
 | `test_speculative_masks_static.py` | Gemma assistant mask offsets with fake dependencies, without importing MLX |
 | `test_rope.py` | Rotary embeddings, multimodal position IDs, and batched offsets |
 | `test_audio_generation.py` | Audio generation, loading, downmixing, and resampling |
+| `test_server.py` | Chat/Responses/Anthropic APIs, image endpoints, batching/cancellation, runtime settings, and reranking |
 | `test_server_audio.py` | HTTP audio endpoints and realtime voice sessions |
 | `test_cli.py` | CLI arguments, diffusion display/visualizer behavior, detector display options, and CLI/library default parity |
 | `test_prompt_utils.py` | Prompt construction and reasoning-template arguments |
@@ -70,6 +71,13 @@ Reuse the parameterized output, EOS-token, tiled-image, and timestamp contracts
 when adding cases. Keep distinct media, batching, serialization, and threading
 assertions explicit; related integration scenarios may share their setup. AutoProcessor routing checks assert the selected
 loader and its returned object, and exercise real incomplete-checkpoint behavior.
+
+`test_server.py` keeps its endpoint, streaming-result, and worker doubles in the
+same file. Reuse `_endpoint` and the request/result builders for API checks;
+`_worker_setup`, `_running`, and `_drain` exercise the real generation worker with
+a recording batch implementation. Parameterize protocol and model variants while
+keeping response assertions, cancellation, tokenizer locking, and cache lifecycle
+checks explicit. No separate server fixture module is needed.
 
 ## JSON model cases
 
