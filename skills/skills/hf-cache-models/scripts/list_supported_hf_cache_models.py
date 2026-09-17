@@ -5,28 +5,23 @@ import argparse
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from huggingface_hub import scan_cache_dir
 from huggingface_hub.constants import HF_HUB_CACHE
 from huggingface_hub.errors import CacheNotFound
 
-# Mirrors the opt-in server /v1/models cache filter used by
-# --model-discovery hf-cache (mlx_vlm/server/app.py: models_endpoint).
-REQUIRED_FILES = {"config.json", "tokenizer_config.json"}
 
-
-def _main_ref_files(repo) -> dict[str, Path]:
-    """Map filename -> cached path for the repo's `main` revision (empty if not a model repo)."""
-    if repo.repo_type != "model" or "main" not in repo.refs:
-        return {}
-    return {file.file_path.name: file.file_path for file in repo.refs["main"].files}
-
-
-def is_supported_model(files: dict[str, Path]) -> bool:
-    has_weights = "model.safetensors.index.json" in files or any(
-        name.endswith(".safetensors") for name in files
-    )
-    return REQUIRED_FILES.issubset(files) and has_weights
+def _discovery_helpers():
+    # Load only the metadata helper, without importing mlx_vlm or model code.
+    package = importlib.util.find_spec("mlx_vlm")
+    if package is None or not package.submodule_search_locations:
+        raise RuntimeError("Install mlx-vlm to use its model discovery helpers.")
+    path = Path(next(iter(package.submodule_search_locations))) / "model_discovery.py"
+    spec = importlib.util.spec_from_file_location("mlx_vlm_model_discovery", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _mlx_vlm_model_types() -> set[str] | None:
@@ -46,61 +41,54 @@ def _mlx_vlm_model_types() -> set[str] | None:
     }
 
 
-def _config_model_type(files: dict[str, Path]) -> str | None:
-    cfg = files.get("config.json")
-    if cfg is None:
-        return None
-    try:
-        data = json.loads(cfg.read_text())
-    except Exception:
-        return None
-    model_type = data.get("model_type") or data.get("speculators_model_type")
-    return model_type.lower() if isinstance(model_type, str) else None
-
-
 def supported_models(
-    cache_dir: str | None = None, check_arch: bool = False
+    cache_dir: str | None = None, check_arch: bool = False, model_dirs=()
 ) -> list[dict]:
     resolved_cache_dir = Path(cache_dir or HF_HUB_CACHE).expanduser()
     try:
         cache_info = scan_cache_dir(cache_dir=resolved_cache_dir)
     except CacheNotFound:
-        return []
+        cache_info = SimpleNamespace(repos=[])
 
+    helpers = _discovery_helpers()
     arch_types = _mlx_vlm_model_types() if check_arch else None
-
     models = []
-    for repo in cache_info.repos:
-        files = _main_ref_files(repo)
-        if not is_supported_model(files):
-            continue
+    for candidate in helpers.discover_models(cache_info, model_dirs):
         entry = {
-            "id": repo.repo_id,
-            "repo_type": repo.repo_type,
-            "last_modified": int(repo.last_modified),
+            "id": candidate["id"],
+            "repo_type": "model",
+            "last_modified": candidate["created"],
             "cache_dir": str(resolved_cache_dir),
+            "path": str(candidate["path"]),
         }
         if check_arch:
-            model_type = _config_model_type(files)
-            # Folder-name match; does not resolve MODEL_REMAPPING aliases, so a False
-            # here is "probably not loadable" rather than definitive.
+            config = helpers.read_json_object(candidate["path"] / "config.json")
+            raw_type = config.get("model_type") or config.get("speculators_model_type")
+            model_type = raw_type.lower() if isinstance(raw_type, str) else None
+            # This optional folder-name check is a hint, not loader validation.
             entry["model_type"] = model_type
             if arch_types is None or model_type not in arch_types:
                 continue
         models.append(entry)
-    return sorted(models, key=lambda model: model["id"].lower())
+    return models
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "List Hugging Face cache model repos that MLX-VLM can expose through "
-            "the server's opt-in hf-cache discovery mode."
+            "the server's model discovery endpoint."
         )
     )
     parser.add_argument(
         "--cache-dir",
         help="Hugging Face cache directory. Defaults to huggingface_hub's cache.",
+    )
+    parser.add_argument(
+        "--model-dir",
+        action="append",
+        default=[],
+        help="Additional model directory or parent folder; repeat for multiple paths.",
     )
     parser.add_argument(
         "--json",
@@ -117,7 +105,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    models = supported_models(args.cache_dir, check_arch=args.check_arch)
+    models = supported_models(
+        args.cache_dir, check_arch=args.check_arch, model_dirs=args.model_dir
+    )
     if args.json:
         print(json.dumps(models, indent=2))
         return

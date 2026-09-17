@@ -1022,6 +1022,9 @@ class ModelInfo(BaseModel):
     id: str
     object: str
     created: int
+    loaded: bool = Field(
+        default=False, description="Whether the model is loaded in this server process."
+    )
 
 
 class ModelsResponse(BaseModel):

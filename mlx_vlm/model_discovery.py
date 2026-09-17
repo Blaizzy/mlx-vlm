@@ -1,0 +1,128 @@
+"""Inspect local model candidates without importing checkpoint code or weights."""
+
+import json
+from pathlib import Path
+from typing import Iterable
+
+MODEL_PATHS_ENV = "MLX_VLM_MODEL_PATHS"
+
+
+def read_json_object(path: Path) -> dict:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _has_weight_files(directory: Path) -> bool:
+    def present(path):
+        return path.is_file() and path.stat().st_size > 0
+
+    indexes = list(directory.glob("*.safetensors.index.json"))
+    if indexes:
+        for index in indexes:
+            weight_map = read_json_object(index).get("weight_map")
+            if not isinstance(weight_map, dict) or not weight_map:
+                return False
+            for filename in weight_map.values():
+                if not isinstance(filename, str):
+                    return False
+                relative = Path(filename)
+                if (
+                    relative.is_absolute()
+                    or ".." in relative.parts
+                    or relative.suffix != ".safetensors"
+                    or not present(directory / relative)
+                ):
+                    return False
+        return True
+    return any(
+        present(path)
+        for path in directory.glob("*.safetensors")
+        if path.name not in {"adapter_model.safetensors", "consolidated.safetensors"}
+    )
+
+
+def is_model_directory(directory: Path) -> bool:
+    """Check metadata and weight availability, not architecture compatibility."""
+    try:
+        config = read_json_object(directory / "config.json")
+        pipeline = read_json_object(directory / "model_index.json")
+        if isinstance(pipeline.get("_class_name"), str):
+            # Pipeline weights live in component directories. Tokenizers and
+            # schedulers have no weight files and need no weight check.
+            components = [
+                child
+                for child in directory.iterdir()
+                if child.is_dir()
+                and (
+                    any(child.glob("*.safetensors"))
+                    or any(child.glob("*.safetensors.index.json"))
+                )
+            ]
+            return bool(components) and all(_has_weight_files(p) for p in components)
+        model_type = config.get("model_type") or config.get("speculators_model_type")
+        architectures = config.get("architectures")
+        has_metadata = (isinstance(model_type, str) and bool(model_type.strip())) or (
+            isinstance(architectures, list)
+            and bool(architectures)
+            and all(isinstance(a, str) and a.strip() for a in architectures)
+        )
+        return bool(has_metadata) and _has_weight_files(directory)
+    except (OSError, RuntimeError):
+        return False
+
+
+def discover_models(cache_info, paths: Iterable[str] = ()) -> list[dict]:
+    """Find HF snapshots and explicit model directories or their immediate children.
+
+    Prefer a repo's main revision. For a repo without a usable main snapshot,
+    return the newest usable snapshot's path so requests cannot fetch a different
+    revision. Local aliases are deduplicated using their resolved directory.
+    """
+    models = []
+    seen = set()
+
+    def add(model_id, path, created):
+        path = Path(path).expanduser().resolve()
+        if path in seen or not is_model_directory(path):
+            return False
+        seen.add(path)
+        models.append({"id": str(model_id), "path": path, "created": int(created)})
+        return True
+
+    for repo in sorted(cache_info.repos, key=lambda r: r.repo_id):
+        if repo.repo_type != "model":
+            continue
+        main = repo.refs.get("main")
+        revisions = sorted(
+            repo.revisions, key=lambda r: (-r.last_modified, str(r.snapshot_path))
+        )
+        if main is not None:
+            revisions = [main, *(r for r in revisions if r != main)]
+        for revision in revisions:
+            try:
+                path = Path(revision.snapshot_path)
+                model_id = repo.repo_id if revision == main else str(path.resolve())
+                if add(model_id, path, revision.last_modified):
+                    break
+            except (OSError, RuntimeError):
+                continue
+
+    for value in paths:
+        try:
+            root = Path(value).expanduser().resolve()
+            # A model directory must not have its components listed separately.
+            if (root / "config.json").exists() or (root / "model_index.json").exists():
+                candidates = [root]
+            else:
+                candidates = sorted(p for p in root.iterdir() if p.is_dir())
+            for path in candidates:
+                try:
+                    add(str(path.resolve()), path, path.stat().st_mtime)
+                except (OSError, RuntimeError):
+                    continue
+        except (OSError, RuntimeError):
+            continue
+    return sorted(models, key=lambda model: model["id"].lower())

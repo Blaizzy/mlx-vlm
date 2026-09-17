@@ -697,42 +697,52 @@ def test_ar_thread_exception_reaches_pending_client_queue(monkeypatch):
         assert worker.is_alive()
 
 
-def test_models_endpoint_lists_single_file_safetensors_models(client, monkeypatch):
-    monkeypatch.setenv("MLX_VLM_MODEL_DISCOVERY", "hf-cache")
-    repos = [
-        NS(
-            repo_id=name,
-            repo_type="model",
-            last_modified=123.0,
-            refs={
-                "main": NS(
-                    files=[
-                        NS(file_path=NS(name=f))
-                        for f in ["config.json", "tokenizer_config.json", *weights]
-                    ]
-                )
-            },
+def _discovery_repo(tmp_path, repo_id, *, sharded=False, weights=True):
+    snapshot = tmp_path / repo_id
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text('{"model_type": "qwen2_vl"}')
+    if weights:
+        (snapshot / "model.safetensors").write_bytes(b"weights")
+    if sharded:
+        (snapshot / "model.safetensors.index.json").write_text(
+            '{"weight_map": {"weight": "model.safetensors"}}'
         )
-        for name, weights in [
-            ("local/single-file-model", ["model.safetensors"]),
-            ("local/sharded-model", ["model.safetensors.index.json"]),
-            ("missing/weights", []),
-        ]
+    revision = NS(snapshot_path=snapshot, last_modified=123.0)
+    return NS(
+        repo_id=repo_id,
+        repo_type="model",
+        refs={"main": revision},
+        revisions=[revision],
+    )
+
+
+@pytest.mark.parametrize("path", ["/models", "/v1/models"])
+def test_models_endpoint_discovers_cached_models(client, monkeypatch, tmp_path, path):
+    monkeypatch.delenv("MLX_VLM_MODEL_PATHS", raising=False)
+    monkeypatch.setattr(server.runtime, "model_cache", server.ModelCacheRegistry())
+    repos = [
+        _discovery_repo(tmp_path, "local/single-file-model"),
+        _discovery_repo(tmp_path, "local/sharded-model", sharded=True),
+        _discovery_repo(tmp_path, "missing/weights", weights=False),
     ]
     monkeypatch.setattr(server, "scan_cache_dir", lambda: NS(repos=repos))
-    response = client.get("/v1/models")
+
+    response = client.get(path)
+
     assert response.status_code == 200
-    ids = {m["id"] for m in response.json()["data"]}
-    assert {
-        "local/single-file-model",
-        "local/sharded-model",
-    } <= ids and "missing/weights" not in ids
+    assert response.json() == {
+        "object": "list",
+        "data": [
+            {"id": model_id, "object": "model", "created": 123, "loaded": False}
+            for model_id in ("local/sharded-model", "local/single-file-model")
+        ],
+    }
 
 
 def test_models_endpoint_includes_loaded_local_model_without_hf_cache(
     client, monkeypatch
 ):
-    monkeypatch.delenv("MLX_VLM_MODEL_DISCOVERY", raising=False)
+    monkeypatch.delenv("MLX_VLM_MODEL_PATHS", raising=False)
     monkeypatch.setattr(
         server,
         "scan_cache_dir",
@@ -744,12 +754,217 @@ def test_models_endpoint_includes_loaded_local_model_without_hf_cache(
 
     assert response.status_code == 200
     assert response.json()["data"] == [
-        dict(
-            id="/models/local-qwen",
-            object="model",
-            created=response.json()["data"][0]["created"],
-        )
+        {
+            "id": "/models/local-qwen",
+            "object": "model",
+            "created": response.json()["data"][0]["created"],
+            "loaded": True,
+        }
     ]
+
+
+def test_models_endpoint_deduplicates_loaded_model_from_hf_cache(
+    client, monkeypatch, tmp_path
+):
+    monkeypatch.delenv("MLX_VLM_MODEL_PATHS", raising=False)
+    repo = _discovery_repo(tmp_path, "local/sharded-model", sharded=True)
+    monkeypatch.setattr(server, "scan_cache_dir", lambda: NS(repos=[repo]))
+    registry = server.ModelCacheRegistry()
+    registry.set("text_generation", {"model_path": repo.repo_id})
+    monkeypatch.setattr(server.runtime, "model_cache", registry)
+
+    response = client.get("/v1/models")
+    assert response.status_code == 200
+    assert len(response.json()["data"]) == 1
+    assert response.json()["data"][0]["id"] == repo.repo_id
+    assert response.json()["data"][0]["loaded"] is True
+
+    registry.clear()
+    response = client.get("/v1/models")
+    assert response.status_code == 200
+    assert len(response.json()["data"]) == 1
+    assert response.json()["data"][0]["id"] == repo.repo_id
+    assert response.json()["data"][0]["loaded"] is False
+
+
+def test_models_endpoint_lists_cached_and_loaded_models(client, monkeypatch, tmp_path):
+    monkeypatch.delenv("MLX_VLM_MODEL_PATHS", raising=False)
+    repo = _discovery_repo(tmp_path, "sentence-transformers/all-MiniLM-L6-v2")
+    scan_cache = MagicMock(return_value=NS(repos=[repo]))
+    monkeypatch.setattr(server, "scan_cache_dir", scan_cache)
+    registry = server.ModelCacheRegistry()
+    registry.set("text_generation", {"model_path": "/models/loaded-chat-model"})
+    monkeypatch.setattr(server.runtime, "model_cache", registry)
+
+    response = client.get("/v1/models")
+
+    assert response.status_code == 200
+    assert {m["id"]: m["loaded"] for m in response.json()["data"]} == {
+        "/models/loaded-chat-model": True,
+        repo.repo_id: False,
+    }
+    scan_cache.assert_called_once_with()
+
+
+def test_models_endpoint_marks_loaded_models_across_cache_kinds(client, monkeypatch):
+    monkeypatch.delenv("MLX_VLM_MODEL_PATHS", raising=False)
+    monkeypatch.setattr(server, "scan_cache_dir", lambda: NS(repos=[]))
+    registry = server.ModelCacheRegistry()
+    registry.set("text_generation", {"model_path": "local/chat"})
+    registry.set("embedding", {"model_path": "local/embedding"})
+    registry.set("tts", {"model_path": "local/tts"})
+    monkeypatch.setattr(server.runtime, "model_cache", registry)
+
+    response = client.get("/v1/models")
+    assert response.status_code == 200
+    assert {m["id"]: m["loaded"] for m in response.json()["data"]} == {
+        "local/chat": True,
+        "local/embedding": True,
+        "local/tts": True,
+    }
+    registry.clear("embedding")
+    response = client.get("/v1/models")
+    assert response.status_code == 200
+    assert {m["id"]: m["loaded"] for m in response.json()["data"]} == {
+        "local/chat": True,
+        "local/tts": True,
+    }
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_models_endpoint_custom_paths_keep_loaded_status(
+    client, monkeypatch, tmp_path, cached
+):
+    repo = _discovery_repo(tmp_path, "local/custom")
+    model_path = repo.refs["main"].snapshot_path
+    if cached:
+        monkeypatch.setattr(
+            server, "scan_cache_dir", lambda: NS(repos=[repo])
+        )
+    else:
+        monkeypatch.setattr(
+            server,
+            "scan_cache_dir",
+            MagicMock(side_effect=server.CacheNotFound("missing cache", "/missing")),
+        )
+    monkeypatch.setenv("MLX_VLM_MODEL_PATHS", str(model_path))
+    registry = server.ModelCacheRegistry()
+    registry.set("text_generation", {"model_path": str(model_path)})
+    monkeypatch.setattr(server.runtime, "model_cache", registry)
+
+    response = client.get("/v1/models")
+    assert response.status_code == 200
+    assert {m["id"]: m["loaded"] for m in response.json()["data"]} == {
+        str(model_path): True,
+    }
+    registry.clear()
+    response = client.get("/v1/models")
+    assert response.status_code == 200
+    assert {m["id"]: m["loaded"] for m in response.json()["data"]} == {
+        repo.repo_id if cached else str(model_path): False,
+    }
+
+
+@pytest.mark.parametrize("endpoint", ["/models", "/v1/models"])
+def test_models_endpoint_query_paths_supplement_defaults_for_one_request(
+    client, monkeypatch, tmp_path, endpoint
+):
+    cached = _discovery_repo(tmp_path, "cached/model")
+    configured = (
+        _discovery_repo(tmp_path, "configured/model").refs["main"].snapshot_path
+    )
+    requested = (
+        _discovery_repo(tmp_path, "requested/model with spaces & symbols")
+        .refs["main"]
+        .snapshot_path
+    )
+    another = _discovery_repo(tmp_path, "another/model").refs["main"].snapshot_path
+    monkeypatch.setattr(
+        server, "scan_cache_dir", lambda: NS(repos=[cached])
+    )
+    monkeypatch.setenv("MLX_VLM_MODEL_PATHS", str(configured))
+    registry = server.ModelCacheRegistry()
+    registry.set("text_generation", {"model_path": str(requested)})
+    monkeypatch.setattr(server.runtime, "model_cache", registry)
+
+    response = client.get(
+        endpoint,
+        params=[
+            ("model_dir", str(requested.parent)),
+            ("model_dir", str(requested)),
+            ("model_dir", str(another)),
+            ("model_dir", ""),
+        ],
+    )
+
+    assert response.status_code == 200
+    entries = response.json()["data"]
+    assert len(entries) == 4
+    assert {m["id"]: m["loaded"] for m in entries} == {
+        cached.repo_id: False,
+        str(configured): False,
+        str(requested): True,
+        str(another): False,
+    }
+    assert os.environ["MLX_VLM_MODEL_PATHS"] == str(configured)
+
+    # Request paths must not leak into later calls. Loaded models still appear.
+    response = client.get(endpoint)
+    assert response.status_code == 200
+    assert {m["id"] for m in response.json()["data"]} == {
+        cached.repo_id,
+        str(configured),
+        str(requested),
+    }
+
+
+def test_models_endpoint_query_paths_work_without_a_hf_cache(
+    client, monkeypatch, tmp_path
+):
+    path = _discovery_repo(tmp_path, "custom/model").refs["main"].snapshot_path
+    monkeypatch.delenv("MLX_VLM_MODEL_PATHS", raising=False)
+    monkeypatch.setattr(server.runtime, "model_cache", server.ModelCacheRegistry())
+    monkeypatch.setattr(
+        server,
+        "scan_cache_dir",
+        MagicMock(side_effect=server.CacheNotFound("missing cache", "/missing")),
+    )
+
+    response = client.get("/v1/models", params={"model_dir": str(path)})
+
+    assert response.status_code == 200
+    assert {m["id"]: m["loaded"] for m in response.json()["data"]} == {str(path): False}
+
+
+def test_models_endpoint_query_paths_require_configured_api_key(client, monkeypatch):
+    monkeypatch.setenv("MLX_VLM_SERVER_API_KEY", "test-key")
+    scanner = MagicMock()
+    monkeypatch.setattr(server, "scan_cache_dir", scanner)
+
+    response = client.get("/v1/models", params={"model_dir": "/some/models"})
+
+    assert response.status_code == 401
+    scanner.assert_not_called()
+
+
+@pytest.mark.parametrize("use_cli_paths", [False, True])
+def test_server_cli_custom_model_paths(monkeypatch, tmp_path, use_cli_paths):
+    monkeypatch.setattr(os, "environ", dict(os.environ))
+    monkeypatch.setenv("MLX_VLM_MODEL_PATHS", "/existing/models")
+    args = ["mlx_vlm.server"]
+    paths = [str(tmp_path / "model with spaces"), str(tmp_path / "other")]
+    if use_cli_paths:
+        for path in paths:
+            args.extend(["--model-dir", path])
+    monkeypatch.setattr(sys, "argv", args)
+    run = MagicMock()
+    monkeypatch.setattr(cli.uvicorn, "run", run)
+
+    cli.main()
+
+    expected = os.pathsep.join(paths) if use_cli_paths else "/existing/models"
+    assert os.environ["MLX_VLM_MODEL_PATHS"] == expected
+    run.assert_called_once()
 
 
 def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
@@ -2125,7 +2340,6 @@ class TestResponseGenerator:
             ("thinking-budget", "THINKING_BUDGET", "128"),
             ("thinking-start-token", "THINKING_START_TOKEN", "<|START_THINKING|>"),
             ("thinking-eos-token", "THINKING_END_TOKEN", "<|END_THINKING|>"),
-            ("model-discovery", "MODEL_DISCOVERY", "served"),
             ("api-key", "SERVER_API_KEY", "admin-token"),
         ]
         expected = {"MLX_VLM_" + env: value for _, env, value in flags}

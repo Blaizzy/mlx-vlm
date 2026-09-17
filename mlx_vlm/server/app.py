@@ -6,12 +6,13 @@ import secrets
 import sys
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from threading import Lock
 from types import SimpleNamespace
-from typing import List, Optional, Tuple
+from typing import Annotated, List, Optional, Tuple
 
 import mlx.core as mx
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from huggingface_hub import scan_cache_dir
 from huggingface_hub.errors import CacheNotFound, RepositoryNotFoundError
@@ -20,6 +21,7 @@ from starlette.requests import HTTPConnection
 from .. import apc as _apc
 from ..generate.edit_image import load_image_edit_model
 from ..generate.image import is_image_generation_model, load_image_generation_model
+from ..model_discovery import MODEL_PATHS_ENV, discover_models
 from ..reranker import RerankerKind, reranker_kind
 from ..structured import build_json_schema_logits_processor
 from ..tools import _infer_tool_parser_from_processor
@@ -49,12 +51,7 @@ from .realtime import register_routes as register_realtime_routes
 from .reranking import ensure_chat_template as ensure_reranker_chat_template
 from .reranking import register_routes as register_reranking_routes
 from .responses_state import _split_thinking as _split_thinking_text
-from .runtime import (
-    MODEL_DISCOVERY_ENV,
-    MODEL_DISCOVERY_MODES,
-    ModelCacheRegistry,
-    runtime,
-)
+from .runtime import ModelCacheRegistry, runtime
 from .schemas import ChatLogprobContent, ModelsResponse, TopLogprob
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
@@ -105,24 +102,13 @@ def _cache_group_for_cache(cache: dict) -> str:
     return "text_generation"
 
 
-def _model_discovery_mode() -> str:
-    mode = os.environ.get(MODEL_DISCOVERY_ENV, "served").strip().lower()
-    if mode not in MODEL_DISCOVERY_MODES:
-        logger.warning(
-            "Ignoring invalid %s=%r; using safe default 'served'.",
-            MODEL_DISCOVERY_ENV,
-            mode,
-        )
-        return "served"
-    return mode
-
-
-def _model_info(model_id: str, created: int) -> dict:
+def _model_info(model_id: str, created: int, *, loaded: bool = False) -> dict:
     model_id = str(model_id)
     return {
         "id": model_id,
         "object": "model",
         "created": created,
+        "loaded": loaded,
     }
 
 
@@ -133,7 +119,7 @@ def _served_model_entries() -> list[dict]:
         model_id = cache.get("model_path")
         if not model_id:
             continue
-        models[model_id] = _model_info(model_id, created)
+        models[model_id] = _model_info(model_id, created, loaded=True)
     return list(models.values())
 
 
@@ -997,37 +983,43 @@ register_reranking_routes(inference_router, _protocol_deps)
     response_model=ModelsResponse,
     include_in_schema=False,
 )
-def models_endpoint():
+def models_endpoint(
+    model_dir: Annotated[
+        Optional[List[str]],
+        Query(
+            description=(
+                "Additional model folder or parent containing model folders on the "
+                "server filesystem. Repeat for multiple paths. Applies only to this "
+                "request, in addition to the cache and configured model directories."
+            )
+        ),
+    ] = None,
+):
     """
-    Return models intentionally served by this process.
+    Return cached and loaded models, indicating which are loaded in this process.
 
-    Set ``MLX_VLM_MODEL_DISCOVERY=hf-cache`` to include compatible-looking
-    repositories from the shared Hugging Face cache for opt-in discovery.
+    Inspect the shared cache, configured directories, and request-specific paths.
     """
     models = {model["id"]: model for model in _served_model_entries()}
 
-    if _model_discovery_mode() == "hf-cache":
-        required_files = {"config.json", "tokenizer_config.json"}
+    try:
+        hf_cache_info = _server_package_attr("scan_cache_dir", scan_cache_dir)()
+    except CacheNotFound:
+        hf_cache_info = SimpleNamespace(repos=[])
 
-        def probably_mlx_lm(repo):
-            if repo.repo_type != "model" or "main" not in repo.refs:
-                return False
-            file_names = {f.file_path.name for f in repo.refs["main"].files}
-            has_weights = "model.safetensors.index.json" in file_names or any(
-                file_name.endswith(".safetensors") for file_name in file_names
-            )
-            return required_files.issubset(file_names) and has_weights
-
+    loaded_paths = set()
+    for model_id in models:
+        path = Path(model_id).expanduser()
         try:
-            hf_cache_info = _server_package_attr("scan_cache_dir", scan_cache_dir)()
-            for repo in hf_cache_info.repos:
-                if probably_mlx_lm(repo) and repo.repo_id not in models:
-                    models[repo.repo_id] = _model_info(
-                        repo.repo_id,
-                        int(repo.last_modified),
-                    )
-        except CacheNotFound:
-            pass
+            if path.is_dir():
+                loaded_paths.add(path.resolve())
+        except (OSError, RuntimeError):
+            continue
+    paths = [p for p in os.environ.get(MODEL_PATHS_ENV, "").split(os.pathsep) if p]
+    paths.extend(p for p in model_dir or [] if p)
+    for model in discover_models(hf_cache_info, paths):
+        if model["id"] not in models and model["path"] not in loaded_paths:
+            models[model["id"]] = _model_info(model["id"], model["created"])
 
     return {
         "object": "list",
