@@ -44,6 +44,29 @@ Use a module path or `-k` to select a smaller group while developing.
 | `test_tokenizer_utils.py` | Streaming detokenizers, decoder detection, and tokenizer wrappers |
 | `test_smoke.py` | Manual model-download runner, excluded from automated collection |
 
+`test_cli.py` contains **498 formatted lines**, down from 938 at `9383ef6c`
+(440 lines / 46.9% fewer), with **37 collected cases** before and after.
+Use `_args` for fresh real-parser defaults and `_text_cli` for dispatch doubles.
+Parameter tables cover SAM3 routing/thresholds, RF-DETR flags/annotations,
+diffusion formatting/options, native video versus sampled frames, early modality
+routing, and video reference/keyframe workflows. Helpers stay in this file.
+
+Real parser checks replace the four AST flag checks, and the text CLI checks
+actual system-prompt forwarding instead of looking for an assignment in source.
+The immutable-default identity check and private visualizer patch flag are
+removed; default-value parity and visualizer delegation remain asserted.
+Subprocess shutdown cleanup, terminal redraw/restore, audio validation before
+loading, optional-argument fallback, and unknown-frame-count progress remain.
+
+The full-suite comparison against `9383ef6c` passes **1,791 tests, four skips and
+39 subtests** on both revisions. Executed production lines increase from
+**80,947 to 80,997**, and branch outcomes from **12,834 to 12,836**, with **zero
+lost paths**. Additions come from importing/exercising the chat parser and actual
+system-prompt dispatch. Black, isort, pyflakes, autoflake and whitespace checks
+pass. These are measured Python execution sets, including imports; they exclude
+subprocess execution, native kernels and skipped optional checks. No production
+code or additional test files change.
+
 The suite has 27 test modules. Attention checks share `test_attention.py`;
 Qwen3.5 patch-weight sanitization lives with loading checks in `test_utils.py`.
 Responses normalization and tool-stream finalization share `test_server.py`;
