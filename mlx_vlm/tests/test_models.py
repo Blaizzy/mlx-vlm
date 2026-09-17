@@ -8,12 +8,18 @@ import inspect
 import json
 import math
 import unittest
+from math import prod
 from operator import attrgetter
 from pathlib import Path
+from types import SimpleNamespace as NS
 
 import mlx.core as mx
 import pytest
-from mlx.utils import tree_map
+from mlx.utils import tree_flatten, tree_map
+
+from mlx_vlm.models.base import InputEmbeddingsFeatures, LanguageModelOutput
+from mlx_vlm.speculative.cache_state import start_speculative_cache
+from mlx_vlm.utils import get_model_and_args
 
 
 class ModelChecks(unittest.TestCase):
@@ -30,7 +36,6 @@ class ModelChecks(unittest.TestCase):
 
     def _check_returns_input_embeddings_features(self, model, model_name):
         """Helper to test get_input_embeddings returns InputEmbeddingsFeatures."""
-        from mlx_vlm.models.base import InputEmbeddingsFeatures
 
         input_ids = mx.array([[1, 2, 3, 4, 5]])
         result = model.get_input_embeddings(input_ids=input_ids)
@@ -648,3 +653,277 @@ def test_cached_image_features_in_source(model_module):
         f"{model_module}.{target_cls.__name__}.get_input_embeddings "
         f"missing cached_image_features check"
     )
+
+
+# Shared tiny models and checkpoint tensors used by speculation and training.
+
+
+def module(name):
+    return importlib.import_module("mlx_vlm." + name)
+
+
+def values(name, **overrides):
+    return copy.deepcopy(
+        DATA["speculative"]["defaults"] | DATA["speculative"][name] | overrides
+    )
+
+
+def tiny_qwen_text_config():
+    return module("models.qwen3_5").TextConfig(**values("qwen"))
+
+
+def tiny_deepseek_config():
+    return module("models.deepseek_v4").ModelConfig(**values("deepseek"))
+
+
+def tiny_glm_text_config():
+    return module("models.glm5_next").TextConfig(**values("glm"))
+
+
+TEXT = {
+    "qwen": ("qwen3_5", tiny_qwen_text_config),
+    "glm": ("glm5_next", tiny_glm_text_config),
+    "deepseek": ("deepseek_v4", tiny_deepseek_config),
+}
+
+
+def dimensions(**overrides):
+    return values("defaults", **(dict(intermediate_size=32, head_dim=8) | overrides))
+
+
+def language(family, *, inference=False, **overrides):
+    name, factory = TEXT[family]
+    config = factory()
+    for key, value in overrides.items():
+        setattr(config, key, value)
+    if family == "qwen":
+        config.num_hidden_layers = config.full_attention_interval = 2
+        if inference:
+            config.linear_key_head_dim = config.linear_value_head_dim = 32
+        outer = NS(
+            model_type=name,
+            text_config=config,
+            vision_config=NS(spatial_merge_size=2),
+            image_token_id=30,
+            video_token_id=29,
+            vision_start_token_id=28,
+        )
+        return module(f"models.{name}.language").LanguageModel(config, outer), config
+    if family == "deepseek":
+        config.compress_ratios = [4]
+    return module(f"models.{name}.language").LanguageModel(config), config
+
+
+def dflash_target(family):
+    if family in ("dflash2", "dspark-qwen"):
+        model, _ = language("qwen")
+        model.set_dtype(mx.bfloat16)
+
+        def embeddings(input_ids, pixel_values=None, mask=None, **kwargs):
+            positions, deltas = model.get_rope_index(input_ids, attention_mask=mask)
+            return InputEmbeddingsFeatures(
+                inputs_embeds=model.model.embed_tokens(input_ids),
+                position_ids=positions,
+                rope_deltas=deltas,
+            )
+
+        return NS(language_model=model, get_input_embeddings=embeddings)
+    if family.startswith("dspark-lfm"):
+        config = values(family.removeprefix("dspark-"))
+        arch = module("models." + config["model_type"])
+    else:
+        arch = module("models.muse_glimmer")
+        config = dict(
+            text_config=values(
+                "glimmer",
+                layer_types=["sliding_attention", "full_attention"],
+                layer_rope_theta=[10000.0, 0],
+            ),
+            vision_config=DATA["speculative"]["glimmer_vision"],
+            image_token_id=7,
+            video_token_id=6,
+            out_hidden_size=32,
+            projector_hidden_size=16,
+        )
+    return arch.Model(build_config(arch, config))
+
+
+def dflash_config(family):
+    config = values("glimmer" if family == "glimmer" else "dflash")
+    config.update(copy.deepcopy(DATA["speculative"]["dflash_variants"][family]))
+    if family.startswith("dspark-lfm"):
+        del config["num_target_layers"]
+    return config
+
+
+def dflash_drafter(family):
+    config = dflash_config(family)
+    arch, name = get_model_and_args(config)
+    expected = (
+        "dflash2"
+        if family == "dflash2"
+        else "muse_glimmer_assistant" if family == "glimmer" else "dspark"
+    )
+    assert name == expected
+    return arch.Model(arch.ModelConfig.from_dict(config))
+
+
+def mtp_drafter(family, config):
+    arch = module(f"speculative.drafters.{TEXT[family][0]}_mtp")
+    config.mtp_num_hidden_layers = 1
+    drafter = arch.Model(arch.ModelConfig(text_config=config, block_size=4))
+    drafter.prefer_requested_block_size = True
+    return drafter
+
+
+def dspark_source(model, cfg):
+    """Build native checkpoint names from tiny tensors for the split/load round trip."""
+    text = cfg.text_config
+    proj_to_w = {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"}
+    hc = {"attn_hc": "hc_attn", "ffn_hc": "hc_ffn"}
+    src = {}
+    for key, value in tree_flatten(model.parameters()):
+        if key.startswith("markov_head."):
+            # the model-level markov head lives under the last stage on disk
+            src[f"mtp.{cfg.n_mtp_layers - 1}.{key}"] = value
+            continue
+        _, stage, body = key.split(".", 2)
+        prefix = f"mtp.{stage}."
+        if body.startswith("ffn.switch_mlp."):
+            w = proj_to_w[body.split(".")[-2]]
+            for expert in range(text.n_routed_experts):
+                src[f"{prefix}ffn.experts.{expert}.{w}.weight"] = value[expert]
+        elif body.startswith("ffn.shared_experts."):
+            w = proj_to_w[body.split(".")[-2]]
+            src[f"{prefix}ffn.shared_experts.{w}.weight"] = value
+        elif body == "ffn.gate.e_score_correction_bias":
+            src[f"{prefix}ffn.gate.bias"] = value
+        elif body == "attn.wo_a.weight":
+            src[f"{prefix}attn.wo_a.weight"] = (
+                value.reshape(text.o_groups * text.o_lora_rank, -1)
+                if value.ndim == 3
+                else value
+            )
+        elif body.startswith("attn_hc.") or body.startswith("ffn_hc."):
+            module, param = body.split(".")
+            src[f"{prefix}{hc[module]}_{param}"] = value
+        elif body.startswith("hc_head."):
+            src[f"{prefix}hc_head_{body.split('.')[-1]}"] = value
+        else:
+            src[f"{prefix}{body}"] = value
+    return src
+
+
+def native_speculative_checkpoint(family):
+    deepseek = family == "deepseek_v4"
+    cfg = (
+        tiny_deepseek_config().to_dict()
+        if deepseek
+        else copy.deepcopy(DATA["speculative"]["glm4_checkpoint"])
+    )
+    cfg["model_type"] = family
+    if deepseek:
+        weights = {
+            f"mtp.0.{key}.weight": mx.zeros((4, 4), dtype=mx.uint8)
+            for key in ("e_proj", "attn.wq_a")
+        }
+        weights.update(
+            {key.replace(".weight", ".scale"): mx.ones((1, 1)) for key in list(weights)}
+        )
+        weights["mtp.0.enorm.weight"] = mx.ones((cfg["hidden_size"],))
+        for expert in range(cfg["n_routed_experts"]):
+            for proj in ("w1", "w2", "w3"):
+                key = f"mtp.0.ffn.experts.{expert}.{proj}"
+                weights[key + ".weight"] = mx.full((4, 16), expert, dtype=mx.uint8)
+                weights[key + ".scale"] = mx.ones((4, 1), dtype=mx.uint8)
+        weights["mtp.0.ffn.gate.bias"] = mx.zeros((cfg["n_routed_experts"],))
+        weights["mtp.0.hc_attn_fn"] = mx.ones((2, 2))
+        weights["mtp.0.hc_head_scale"] = mx.ones((1,))
+    else:
+        shapes = copy.deepcopy(DATA["speculative"]["glm4_checkpoint_shapes"])
+        for expert in ["shared_experts", "experts.0", "experts.1"]:
+            for proj in ("gate", "up", "down"):
+                shapes[f"mlp.{expert}.{proj}_proj"] = (
+                    (8, 4) if proj == "down" else (4, 8)
+                )
+        weights = {
+            f"model.layers.2.{key}.weight": mx.zeros(shape)
+            for key, shape in shapes.items()
+        }
+        weights["model.layers.2.mlp.gate.e_score_correction_bias"] = mx.ones((2,))
+        weights["model.layers.2.self_attn.rotary_emb.inv_freq"] = mx.ones((2,))
+    return cfg, weights
+
+
+def glm_mtp_checkpoint_weights(cfg):
+    shapes = copy.deepcopy(DATA["speculative"]["glm_fusion_shapes"])
+    for expert in range(cfg.n_routed_experts):
+        for proj in ("gate", "up", "down"):
+            shapes[f"mlp.experts.{expert}.{proj}_proj"] = (
+                (16, 8) if proj == "down" else (8, 16)
+            )
+    weights = {
+        f"mtp_block.{key}.weight": mx.arange(prod(shape))
+        .reshape(shape)
+        .astype(mx.float32)
+        for key, shape in shapes.items()
+    }
+    return weights
+
+
+class TransactionTarget:
+    def __init__(self, token):
+        self.token, self.transaction = token, None
+
+    def __call__(self, inputs, cache, **kwargs):
+        batch, length = inputs.shape
+        self.transaction = start_speculative_cache(cache, length)
+        states = cache[0][0][:, None] + mx.arange(1, length + 1)[None, :, None]
+        cache[0][0] = states[:, -1]
+        cache[0].record_speculative_states(0, states[:, :-1], states[:, -1])
+        kv = mx.zeros((batch, 1, length, 1))
+        cache[1].update_and_fetch(kv, kv)
+        return LanguageModelOutput(
+            logits=mx.broadcast_to(mx.eye(8)[self.token], (batch, length, 8)),
+            hidden_states=[mx.zeros((batch, length, 4))],
+            shared_kv_states={},
+            gdn_states=self.transaction,
+        )
+
+    def speculative_verify_logits(self, inputs, cache, sampler):
+        output = self(inputs, cache)
+        try:
+            return (
+                output.hidden_states[0],
+                {},
+                output.gdn_states,
+                sampler(output.logits),
+            )
+        except BaseException:
+            output.gdn_states.abort()
+            raise
+
+    def rollback_speculative_cache(self, *args):
+        raise AssertionError("transactions must own cache commit")
+
+
+class TransactionDrafter:
+    prefer_requested_block_size = True
+
+    def __init__(self):
+        self.config = NS(block_size=2, target_layer_ids=[0])
+        self.accept_lens, self.draft_lens = [], []
+
+    def reset(self, model, left_padding=None):
+        return []
+
+    def make_cache(self):
+        return []
+
+    def set_shared_kv(self, *args, **kwargs):
+        pass
+
+    def draft_block(
+        self, bonus, hidden, cache, block_size, sampler, token_dtype, **kwargs
+    ):
+        return mx.full((hidden.shape[0], block_size - 1), 4, dtype=token_dtype)

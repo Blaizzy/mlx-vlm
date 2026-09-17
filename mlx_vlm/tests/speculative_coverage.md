@@ -1,5 +1,52 @@
 # Speculative suite coverage
 
+## Refactor below 1,400 lines
+
+The current refactor against `a1bbdca6` reduces `test_speculative.py` from
+**2,027 to 1,399 formatted lines**. Shared model construction, synthetic checkpoint
+tensors, and transaction doubles live in the existing `test_models.py`; training
+imports its two config factories directly from that module. Plain configuration
+and shape data use the existing `model_cases.json` under `speculative`. No new
+test or fixture files are added, and production code is unchanged.
+
+This is mainly a separation of reusable setup from assertions, not a 628-line
+reduction in the whole suite:
+
+| File | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| `test_speculative.py` | 2,027 | 1,399 | -628 |
+| `test_models.py` | 650 | 929 | +279 |
+| `model_cases.json` | 1,980 | 2,294 | +314 |
+| **Combined** | **4,657** | **4,622** | **-35** |
+
+The 413 previously collected speculative cases become **395 cases across 48
+functions**. Three dispatch identity assertions now run inside the behavioral
+round matrix. The 12 acceptance/budget combinations, three invalid-budget cases,
+and uniform/empty-batch checks share one runner, retaining every scenario and
+expected result. The unused Qwen MoE config factory and repeated successful
+compatibility/block-size checks are removed. Checkpoint splitting and loading,
+exact/tolerant numerical comparisons, and sampling call recorders are shared.
+
+All **395 speculative cases pass**. The full default suite passes **1,773 tests**,
+with **four existing skips and 39 passing subtests**, versus 1,791 tests before
+consolidation. Both isolated and full-suite production execution sets are exactly
+unchanged:
+
+| Scope | Executed lines before/after | Branch outcomes before/after | Lost / added |
+| --- | ---: | ---: | ---: |
+| Speculative suite alone | 15,723 | 2,457 | 0 / 0 |
+| Full default suite | 80,997 | 12,836 | 0 / 0 |
+
+Black, isort, pyflakes, autoflake, JSON parsing, and whitespace checks pass.
+Validation uses Python 3.12.14, MLX 0.32.2, Transformers 5.17.0, pytest 9.1.1,
+and coverage 7.16.1, with downloads disabled. These are measured Python line and
+branch sets; they exclude subprocess execution, native kernels, and skipped
+optional checks. Numerical tolerances and exact sampled-token comparisons remain.
+The earlier pruning described below is historical and is not reversed by this
+refactor.
+
+## Earlier compaction and intentional pruning
+
 `test_speculative.py` is the default speculative suite. It replaces the previous
 519-case module; the opt-in experiment and its separate report have been removed.
 Production code is unchanged. These measurements compare the compact suite with

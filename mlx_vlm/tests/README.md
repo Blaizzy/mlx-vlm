@@ -44,6 +44,22 @@ Use a module path or `-k` to select a smaller group while developing.
 | `test_tokenizer_utils.py` | Streaming detokenizers, decoder detection, and tokenizer wrappers |
 | `test_smoke.py` | Manual model-download runner, excluded from automated collection |
 
+`test_speculative.py` contains **1,399 formatted lines**, down from 2,027 at
+`a1bbdca6`. Reusable model constructors, checkpoint tensors, and transaction doubles
+share `test_models.py`, and plain config/shape profiles share `model_cases.json`.
+Together those files shrink by **35 lines**; the 628-line speculative-file
+reduction includes relocation. Training imports its two config helpers directly
+from `test_models.py`. There are no new fixture or test files.
+
+All **395 speculative cases pass**, retaining the former 413 cases' scenarios:
+dispatch assertions share the round matrix, and acceptance/budget/error scenarios
+share one runner. Full suite: **1,773 passed, four skipped, 39 passing subtests**.
+Both isolated (15,723 lines / 2,457 branches) and full-suite (80,997 / 12,836)
+production execution sets are unchanged, with zero lost or added paths. See
+[speculative_coverage.md](speculative_coverage.md) for exact size accounting,
+validation scope, and the earlier intentional pruning. Current suite size is
+**23,698 Python lines + 2,543 JSON lines = 26,241 combined**.
+
 `test_cli.py` contains **498 formatted lines**, down from 938 at `9383ef6c`
 (440 lines / 46.9% fewer), with **37 collected cases** before and after.
 Use `_args` for fresh real-parser defaults and `_text_cli` for dispatch doubles.

@@ -1,380 +1,55 @@
 """Shared speculative generation, drafter, verification, and cache contracts."""
 
-import importlib
 import json
+from contextlib import nullcontext
 from copy import deepcopy
-from math import prod
+from itertools import product
 from types import SimpleNamespace as NS
+from unittest.mock import Mock
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 import pytest
 from mlx.utils import tree_flatten
 
 import mlx_vlm.speculative.utils as speculative
 from mlx_vlm.generate.ar import _make_cache, generate_step
 from mlx_vlm.models import fast_ops
-from mlx_vlm.models.base import InputEmbeddingsFeatures, LanguageModelOutput
+from mlx_vlm.models import quantized_verifier as quantized
+from mlx_vlm.models.base import LanguageModelOutput
 from mlx_vlm.models.cache import ArraysCache, BatchKVCache, KVCache
-from mlx_vlm.models.deepseek_v4.config import ModelConfig as DeepseekConfig
-from mlx_vlm.models.glm5_next.config import TextConfig as GlmConfig
 from mlx_vlm.models.linear import native_batch_linear
-from mlx_vlm.models.quantized_verifier import (
-    decode_quantized_argmax,
-    decode_quantized_linear,
-    exact_quantized_moe_hc_expand,
-    exact_quantized_selected_linear,
-)
-from mlx_vlm.models.qwen3_5.config import TextConfig as QwenConfig
-from mlx_vlm.models.qwen3_5_moe.config import TextConfig as QwenMoeConfig
 from mlx_vlm.models.switch_layers import QuantizedSwitchLinear, SwitchGLU
+from mlx_vlm.speculative import common, mtp
 from mlx_vlm.speculative.cache_state import start_speculative_cache
-from mlx_vlm.speculative.common import _SpeculativeSamplerRNG
-from mlx_vlm.speculative.dflash import _dflash_rounds, _dflash_rounds_batch
 from mlx_vlm.speculative.drafters import (
     resolve_drafter_kind,
     validate_drafter_compatibility,
 )
-from mlx_vlm.speculative.eagle3 import _eagle3_rounds, _eagle3_rounds_batch
-from mlx_vlm.speculative.mtp import (
-    _mtp_logits_from_hidden,
-    _mtp_rounds,
-    _mtp_rounds_batch,
-)
 from mlx_vlm.speculative.ops import linear as verifier_linear
 from mlx_vlm.speculative.utils import _mtp_verify_target, _speculative_walk_batch
 from mlx_vlm.split_mtp import split_mtp
-from mlx_vlm.utils import get_model_and_args
+from mlx_vlm.tests import test_models as models
+
+parametrize = pytest.mark.parametrize
+module = models.module
 
 
-def _text_dimensions(**overrides):
-    return {
-        "vocab_size": 32,
-        "hidden_size": 16,
-        "num_hidden_layers": 1,
-        "num_attention_heads": 2,
-        "num_key_value_heads": 1,
-        "max_position_embeddings": 128,
-        **overrides,
-    }
-
-
-def _qwen_config(config_type, **overrides):
-    values = _text_dimensions(
-        linear_num_value_heads=2,
-        linear_num_key_heads=2,
-        linear_key_head_dim=4,
-        linear_value_head_dim=4,
-        linear_conv_kernel_dim=4,
-        rms_norm_eps=1e-06,
-        head_dim=8,
-        full_attention_interval=1,
-        rope_parameters={
-            "type": "default",
-            "mrope_section": [1, 0, 0],
-            "rope_theta": 10000,
-            "partial_rotary_factor": 0.25,
-        },
-    )
-    return config_type(**(values | overrides))
-
-
-def tiny_qwen_text_config():
-    return _qwen_config(
-        QwenConfig,
-        model_type="qwen3_5_text",
-        intermediate_size=32,
-        tie_word_embeddings=True,
-    )
-
-
-def tiny_qwen_moe_text_config(num_experts=4, moe_intermediate_size=8):
-    return _qwen_config(
-        QwenMoeConfig,
-        model_type="qwen3_5_moe_text",
-        num_experts=num_experts,
-        num_experts_per_tok=2,
-        shared_expert_intermediate_size=moe_intermediate_size,
-        moe_intermediate_size=moe_intermediate_size,
-    )
-
-
-def tiny_deepseek_config():
-    return DeepseekConfig(
-        **_text_dimensions(
-            intermediate_size=32,
-            moe_intermediate_size=4,
-            n_shared_experts=1,
-            n_routed_experts=2,
-            num_experts_per_tok=1,
-            q_lora_rank=8,
-            qk_rope_head_dim=4,
-            head_dim=8,
-            o_groups=1,
-            o_lora_rank=8,
-            index_n_heads=1,
-            index_head_dim=8,
-            index_topk=1,
-            num_hash_layers=0,
-            hc_mult=2,
-            hc_sinkhorn_iters=2,
-            compress_ratios=[0],
-            sliding_window=16,
-        )
-    )
-
-
-def tiny_glm_text_config():
-    return GlmConfig(
-        **_text_dimensions(
-            intermediate_size=32,
-            moe_intermediate_size=8,
-            num_hidden_layers=2,
-            num_key_value_heads=2,
-            n_shared_experts=1,
-            n_routed_experts=2,
-            num_experts_per_tok=1,
-            kv_lora_rank=4,
-            q_lora_rank=8,
-            qk_nope_head_dim=4,
-            v_head_dim=4,
-            mlp_layer_types=["dense", "sparse"],
-            layer_types=["linear_attention", "deepseek_sparse_attention"],
-            indexer_types=["full", "full"],
-            index_topk=4,
-            index_kpool=2,
-            index_head_dim=4,
-            index_n_heads=2,
-            linear_attn_config={
-                "num_heads": 2,
-                "head_dim": 4,
-                "short_conv_kernel_size": 2,
-                "gate_lower_bound": -5.0,
-            },
-            hc_mult=2,
-            max_position_embeddings=64,
-        )
-    )
-
-
-TEXT = {
-    "qwen": ("qwen3_5", tiny_qwen_text_config),
-    "glm": ("glm5_next", tiny_glm_text_config),
-    "deepseek": ("deepseek_v4", tiny_deepseek_config),
-}
-
-
-def module(name):
-    return importlib.import_module("mlx_vlm." + name)
+def equal(actual, expected, **tolerance):
+    if isinstance(actual, (list, tuple)):
+        assert len(actual) == len(expected)
+        for a, b in zip(actual, expected):
+            equal(a, b, **tolerance)
+    elif actual is None or expected is None:
+        assert actual is expected
+    else:
+        compare = mx.allclose if tolerance else mx.array_equal
+        assert compare(actual, expected, **tolerance).item()
 
 
 def greedy(logits):
     return mx.argmax(logits, axis=-1)
-
-
-def dimensions(**overrides):
-    return (
-        dict(
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            head_dim=8,
-            vocab_size=32,
-            max_position_embeddings=128,
-        )
-        | overrides
-    )
-
-
-def language(family, *, inference=False, **overrides):
-    name, factory = TEXT[family]
-    config = factory()
-    for key, value in overrides.items():
-        setattr(config, key, value)
-    if family == "qwen":
-        config.num_hidden_layers = config.full_attention_interval = 2
-        if inference:
-            config.linear_key_head_dim = config.linear_value_head_dim = 32
-        outer = NS(
-            model_type=name,
-            text_config=config,
-            vision_config=NS(spatial_merge_size=2),
-            image_token_id=30,
-            video_token_id=29,
-            vision_start_token_id=28,
-        )
-        return module(f"models.{name}.language").LanguageModel(config, outer), config
-    if family == "deepseek":
-        config.compress_ratios = [4]
-    return module(f"models.{name}.language").LanguageModel(config), config
-
-
-def dflash_target(family):
-    if family in ("dflash2", "dspark-qwen"):
-        model, _ = language("qwen")
-        model.set_dtype(mx.bfloat16)
-
-        def embeddings(input_ids, pixel_values=None, mask=None, **kwargs):
-            positions, deltas = model.get_rope_index(input_ids, attention_mask=mask)
-            return InputEmbeddingsFeatures(
-                inputs_embeds=model.model.embed_tokens(input_ids),
-                position_ids=positions,
-                rope_deltas=deltas,
-            )
-
-        return NS(language_model=model, get_input_embeddings=embeddings)
-    if family.startswith("dspark-lfm"):
-        moe = family.endswith("moe")
-        name = "lfm2_moe" if moe else "lfm2"
-        arch = module("models." + name)
-        values = dict(
-            model_type=name,
-            vocab_size=32,
-            hidden_size=8,
-            num_hidden_layers=3,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            max_position_embeddings=128,
-            norm_eps=1e-5,
-            conv_bias=False,
-            conv_L_cache=3,
-            rope_theta=10000.0,
-            layer_types=["conv", "full_attention", "conv"],
-            tie_word_embeddings=True,
-        )
-        values.update(
-            dict(
-                intermediate_size=16,
-                moe_intermediate_size=8,
-                num_experts=4,
-                num_experts_per_tok=2,
-                norm_topk_prob=True,
-                use_expert_bias=True,
-                num_dense_layers=1,
-            )
-            if moe
-            else dict(
-                block_dim=8,
-                block_ff_dim=16,
-                block_multiple_of=1,
-                block_ffn_dim_multiplier=1.0,
-                block_auto_adjust_ff_dim=False,
-                full_attn_idxs=[1],
-            )
-        )
-        return arch.Model(arch.ModelConfig(**values))
-    arch = module("models.muse_glimmer")
-    text = arch.TextConfig(
-        **dimensions(
-            num_hidden_layers=2,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            head_dim=4,
-            vocab_size=64,
-            sliding_window=8,
-            layer_types=["sliding_attention", "full_attention"],
-            layer_rope_theta=[10000.0, 0],
-        )
-    )
-    vision = arch.VisionConfig(
-        hidden_size=8,
-        intermediate_size=16,
-        num_attention_heads=2,
-        num_hidden_layers=2,
-        patch_size=2,
-        patch_temporal=2,
-        merge_size=2,
-        pos_emb_height=4,
-        pos_emb_width=4,
-        max_position_embeddings=16,
-        layer_types=["window_attention", "full_attention"],
-    )
-    return arch.Model(
-        arch.ModelConfig(
-            text_config=text,
-            vision_config=vision,
-            image_token_id=7,
-            video_token_id=6,
-            out_hidden_size=32,
-            projector_hidden_size=16,
-        )
-    )
-
-
-def dflash_config(family):
-    if family == "glimmer":
-        return dimensions(
-            model_type="muse_glimmer_assistant",
-            num_hidden_layers=2,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            head_dim=4,
-            vocab_size=64,
-            sliding_window=8,
-            block_size=4,
-            mask_token_id=63,
-            target_layer_ids=[0, 1],
-            num_target_layers=2,
-        )
-    lfm = family.startswith("dspark-lfm")
-    config = dimensions(
-        model_type="qwen3",
-        hidden_size=8 if lfm else 16,
-        intermediate_size=16 if lfm else 32,
-        head_dim=4 if lfm else 8,
-        architectures=["Lfm2DSparkDraftModel" if lfm else "DSparkDraftModel"],
-        rms_norm_eps=1e-5 if lfm else 1e-6,
-        rope_theta=10000.0,
-        layer_types=["full_attention"],
-        block_size=3,
-        markov_rank=4,
-        markov_head_type="vanilla",
-        enable_confidence_head=True,
-    )
-    config["dflash_config"] = dict(
-        mask_token_id=31, target_layer_ids=[0, 2] if lfm else [0]
-    )
-    if lfm:
-        config["rope_is_neox_style"] = False
-        config["dflash_config"]["num_target_layers"] = 3
-    else:
-        config["num_target_layers"] = 2
-        config["dflash_config"]["projector_type"] = "dspark"
-    if family == "dflash2":
-        config.update(architectures=["DFlash2DraftModel"], is_causal=False)
-        config["dflash_config"] = dict(
-            block_size=3,
-            runtime_block_size=3,
-            conv_group_size=4,
-            conv_kernel_size=2,
-            mask_token_id=31,
-            selector_rank=4,
-            selector_top_k=4,
-            target_layer_ids=[0],
-        )
-    return config
-
-
-def dflash_drafter(family):
-    config = dflash_config(family)
-    arch, name = get_model_and_args(config)
-    expected = (
-        "dflash2"
-        if family == "dflash2"
-        else "muse_glimmer_assistant" if family == "glimmer" else "dspark"
-    )
-    assert name == expected
-    return arch.Model(arch.ModelConfig.from_dict(config))
-
-
-def mtp_drafter(family, config):
-    arch = module(f"speculative.drafters.{TEXT[family][0]}_mtp")
-    config.mtp_num_hidden_layers = 1
-    drafter = arch.Model(arch.ModelConfig(text_config=config, block_size=4))
-    drafter.prefer_requested_block_size = True
-    return drafter
 
 
 def generated(target, drafter=None, *, seed=41, temperature=0):
@@ -397,15 +72,13 @@ def generated(target, drafter=None, *, seed=41, temperature=0):
     ]
 
 
-@pytest.mark.parametrize(
+@parametrize(
     "family", ["dflash2", "glimmer", "dspark-lfm2", "dspark-lfm2-moe", "dspark-qwen"]
 )
-@pytest.mark.parametrize(
-    "temperature,seed", [(0, 41), (0.5, 41), (1.0, 41), (0.7, None)]
-)
+@parametrize("temperature,seed", [(0, 41), (0.5, 41), (1.0, 41), (0.7, None)])
 def test_generation_and_request_reset(family, temperature, seed):
     mx.random.seed(37)
-    target, drafter = dflash_target(family), dflash_drafter(family)
+    target, drafter = models.dflash_target(family), models.dflash_drafter(family)
     mx.eval(target.language_model.parameters(), drafter.parameters())
     validate_drafter_compatibility(target, drafter, "dflash")
     expected = generated(target, temperature=temperature, seed=seed)
@@ -419,14 +92,14 @@ def test_generation_and_request_reset(family, temperature, seed):
         drafter.draft_lens.append(999)
 
 
-@pytest.mark.parametrize(
+@parametrize(
     "family,failure",
     [("qwen", False), ("glm", False), ("deepseek", False), ("glm", True)],
 )
 def test_mtp_generation(family, failure, monkeypatch):
     mx.random.seed(2127)
-    model, config = language(family, inference=True)
-    drafter = mtp_drafter(family, config)
+    model, config = models.language(family, inference=True)
+    drafter = models.mtp_drafter(family, config)
     model.eval()
     drafter.eval()
     prompt = mx.array([[1, 2, 3]])
@@ -445,7 +118,7 @@ def test_mtp_generation(family, failure, monkeypatch):
             raise RuntimeError("injected target failure")
 
         monkeypatch.setattr(module("speculative.mtp"), "_mtp_verify_target", fail)
-    rounds = _mtp_rounds(
+    rounds = mtp._mtp_rounds(
         model,
         drafter,
         speculative,
@@ -472,12 +145,12 @@ def test_mtp_generation(family, failure, monkeypatch):
     assert drafter._round_appended == 0
 
 
-@pytest.mark.parametrize("family", list(TEXT))
-@pytest.mark.parametrize("batch", [1, 2, 4])
-@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+@parametrize("family", list(models.TEXT))
+@parametrize("batch", [1, 2, 4])
+@parametrize("dtype", [mx.float32, mx.bfloat16])
 def test_verify_commit_matches_decode(family, batch, dtype):
     mx.random.seed(2127)
-    model, _ = language(family, inference=True)
+    model, _ = models.language(family, inference=True)
     model.load_weights(
         [
             (key, value.astype(dtype) if model.cast_predicate(key) else value)
@@ -496,11 +169,11 @@ def test_verify_commit_matches_decode(family, batch, dtype):
         )
         return (
             result.hidden,
-            _mtp_logits_from_hidden(model, result.hidden),
+            mtp._mtp_logits_from_hidden(model, result.hidden),
             result.rollback_state,
         )
 
-    def equal(actual, expected):
+    def compare(actual, expected):
         # Float32 recurrent reductions allow rounding; emitted tokens remain exact.
         if family == "qwen" and dtype == mx.float32:
             assert mx.allclose(actual, expected, atol=1e-6, rtol=1e-6).item()
@@ -518,17 +191,15 @@ def test_verify_commit_matches_decode(family, batch, dtype):
             logit_steps.append(logits)
             transaction.commit([1] * batch)
         hidden, logits, transaction = verify(tokens, actual)
-        equal(hidden, mx.concatenate(hidden_steps, 1))
-        equal(logits, mx.concatenate(logit_steps, 1))
-        assert mx.array_equal(
-            greedy(logits), greedy(mx.concatenate(logit_steps, 1))
-        ).item()
+        compare(hidden, mx.concatenate(hidden_steps, 1))
+        compare(logits, mx.concatenate(logit_steps, 1))
+        equal(greedy(logits), greedy(mx.concatenate(logit_steps, 1)))
         transaction.commit([retained] * batch)
         for i in range(retained):
             _, _, transaction = verify(tokens[:, i : i + 1], reference)
             transaction.commit([1] * batch)
         probe = mx.full((batch, 1), 20)
-        equal(model(probe, cache=reference).logits, model(probe, cache=actual).logits)
+        compare(model(probe, cache=reference).logits, model(probe, cache=actual).logits)
 
 
 def formats(groups=(64,)):
@@ -544,8 +215,8 @@ def bf16_parameters(linear):
     return linear
 
 
-@pytest.mark.parametrize("mode,bits,size", formats())
-@pytest.mark.parametrize("batch", [1, 2, 4, 5, 8, 9, 16, 32, 64, 127])
+@parametrize("mode,bits,size", formats())
+@parametrize("batch", [1, 2, 4, 5, 8, 9, 16, 32, 64, 127])
 def test_quantized_linear_and_argmax(mode, bits, size, batch):
     mx.random.seed(100 + bits + batch)
     dense = nn.Linear(512, 16, bias=False)
@@ -562,21 +233,17 @@ def test_quantized_linear_and_argmax(mode, bits, size, batch):
         if mode == "nvfp4"
         else native
     )
-    actual = decode_quantized_linear(linear, inputs)
-    assert mx.array_equal(native_batch_linear(linear, inputs), native).item()
-    assert mx.array_equal(actual, expected).item()
-    assert mx.array_equal(
-        decode_quantized_argmax(linear, inputs), greedy(expected)
-    ).item()
+    actual = quantized.decode_quantized_linear(linear, inputs)
+    equal(native_batch_linear(linear, inputs), native)
+    equal(actual, expected)
+    equal(quantized.decode_quantized_argmax(linear, inputs), greedy(expected))
     allowed = mx.arange(batch * 3, dtype=mx.int32).reshape(batch, 3) % 16
     mask = (mx.array(1, dtype=mx.int32) << allowed).reshape(-1, 1)
-    assert mx.array_equal(
-        decode_quantized_argmax(linear, inputs, token_mask=mask), allowed
-    ).item()
+    equal(quantized.decode_quantized_argmax(linear, inputs, token_mask=mask), allowed)
 
 
-@pytest.mark.parametrize("mode,bits,size", formats((32, 64, 128)))
-@pytest.mark.parametrize("batch", [1, 4, 8, 64, 127])
+@parametrize("mode,bits,size", formats((32, 64, 128)))
+@parametrize("batch", [1, 4, 8, 64, 127])
 def test_quantized_moe_hyperconnection(mode, bits, size, batch, monkeypatch):
     mx.random.seed(600 + bits + batch)
     linear = QuantizedSwitchLinear(512, 16, 4, False, size, bits, mode=mode)
@@ -588,7 +255,7 @@ def test_quantized_moe_hyperconnection(mode, bits, size, batch, monkeypatch):
     shared = mx.random.normal((batch, 2, 16)).astype(mx.bfloat16)
     residual = mx.random.normal((batch, 2, 4, 16)).astype(mx.bfloat16)
     post, comb = mx.random.normal((batch, 2, 4)), mx.random.normal((batch, 2, 4, 4))
-    routed = exact_quantized_selected_linear(linear, inputs, indices)
+    routed = quantized.exact_quantized_selected_linear(linear, inputs, indices)
     expected = fast_ops.exact_hc_expand(
         SwitchGLU._combine(routed, weights, shared), residual, post, comb
     )
@@ -599,15 +266,15 @@ def test_quantized_moe_hyperconnection(mode, bits, size, batch, monkeypatch):
     monkeypatch.setattr(
         "mlx_vlm.models.quantized_verifier.exact_quantized_selected_linear", fail
     )
-    actual = exact_quantized_moe_hc_expand(
+    actual = quantized.exact_quantized_moe_hc_expand(
         linear, inputs, indices, weights, shared, residual, post, comb
     )
-    assert mx.array_equal(actual, expected).item()
+    equal(actual, expected)
 
 
-@pytest.mark.parametrize("bits", [4, 5, 8])
-@pytest.mark.parametrize("widths", [(16, 24), (16, 24, 32), (8, 16, 24, 32)])
-@pytest.mark.parametrize("length", [2, 3, 6, 8])
+@parametrize("bits", [4, 5, 8])
+@parametrize("widths", [(16, 24), (16, 24, 32), (8, 16, 24, 32)])
+@parametrize("length", [2, 3, 6, 8])
 def test_fused_projection_parity(bits, widths, length):
     mx.random.seed(51 + bits + len(widths) + length)
     linears = [
@@ -621,72 +288,14 @@ def test_fused_projection_parity(bits, widths, length):
         verifier_linear._target_verify_timewise(linear, inputs) for linear in linears
     ]
     actual = verifier_linear._target_verify_linears(linears, inputs)
-    assert all(mx.array_equal(a, b).item() for a, b in zip(actual, expected))
+    equal(actual, expected)
 
 
-class TransactionTarget:
-    def __init__(self, token):
-        self.token, self.transaction = token, None
-
-    def __call__(self, inputs, cache, **kwargs):
-        batch, length = inputs.shape
-        self.transaction = start_speculative_cache(cache, length)
-        states = cache[0][0][:, None] + mx.arange(1, length + 1)[None, :, None]
-        cache[0][0] = states[:, -1]
-        cache[0].record_speculative_states(0, states[:, :-1], states[:, -1])
-        kv = mx.zeros((batch, 1, length, 1))
-        cache[1].update_and_fetch(kv, kv)
-        return LanguageModelOutput(
-            logits=mx.broadcast_to(mx.eye(8)[self.token], (batch, length, 8)),
-            hidden_states=[mx.zeros((batch, length, 4))],
-            shared_kv_states={},
-            gdn_states=self.transaction,
-        )
-
-    def speculative_verify_logits(self, inputs, cache, sampler):
-        output = self(inputs, cache)
-        try:
-            return (
-                output.hidden_states[0],
-                {},
-                output.gdn_states,
-                sampler(output.logits),
-            )
-        except BaseException:
-            output.gdn_states.abort()
-            raise
-
-    def rollback_speculative_cache(self, *args):
-        raise AssertionError("transactions must own cache commit")
-
-
-class TransactionDrafter:
-    prefer_requested_block_size = True
-
-    def __init__(self):
-        self.config = NS(block_size=2, target_layer_ids=[0])
-        self.accept_lens, self.draft_lens = [], []
-
-    def reset(self, model, left_padding=None):
-        return []
-
-    def make_cache(self):
-        return []
-
-    def set_shared_kv(self, *args, **kwargs):
-        pass
-
-    def draft_block(
-        self, bonus, hidden, cache, block_size, sampler, token_dtype, **kwargs
-    ):
-        return mx.full((hidden.shape[0], block_size - 1), 4, dtype=token_dtype)
-
-
-@pytest.mark.parametrize("kind", ["mtp", "dflash", "eagle3"])
-@pytest.mark.parametrize("batch", [1, 2])
-@pytest.mark.parametrize("token,failure", [(4, False), (7, False), (4, True)])
+@parametrize("kind", ["mtp", "dflash", "eagle3"])
+@parametrize("batch", [1, 2])
+@parametrize("token,failure", [(4, False), (7, False), (4, True)])
 def test_round_commit_close_and_abort(kind, batch, token, failure):
-    target = TransactionTarget(token)
+    target = models.TransactionTarget(token)
     caches = [ArraysCache(1), BatchKVCache([0] * batch) if batch > 1 else KVCache()]
     caches[0][0] = mx.zeros((batch, 1))
     initial = mx.zeros((batch, 1, 2, 1))
@@ -697,11 +306,10 @@ def test_round_commit_close_and_abort(kind, batch, token, failure):
             raise RuntimeError("injected sampler failure")
         return greedy(logits)
 
-    functions = {
-        "mtp": (_mtp_rounds, _mtp_rounds_batch),
-        "dflash": (_dflash_rounds, _dflash_rounds_batch),
-        "eagle3": (_eagle3_rounds, _eagle3_rounds_batch),
-    }
+    suffix = "_batch" if batch > 1 else ""
+    rounds = getattr(speculative, f"_{kind}_rounds{suffix}")
+    if batch > 1:
+        assert speculative.get_speculative_rounds_batch(kind) is rounds
     options = dict(
         first_bonus=1 if batch == 1 else mx.ones((batch,), dtype=mx.int32),
         max_tokens=4,
@@ -710,39 +318,42 @@ def test_round_commit_close_and_abort(kind, batch, token, failure):
     )
     if kind == "mtp":
         options["shared_kv_states"] = {}
-    generator = functions[kind][batch > 1](
-        target, TransactionDrafter(), caches, mx.zeros((batch, 1, 4)), **options
+    generator = rounds(
+        target, models.TransactionDrafter(), caches, mx.zeros((batch, 1, 4)), **options
     )
-    if failure:
-        with pytest.raises(RuntimeError, match="injected sampler failure"):
-            next(generator)
-    else:
+    error = pytest.raises(RuntimeError, match="injected sampler failure")
+    with error if failure else nullcontext():
         next(generator)
     retained = 0 if failure else 2 if token == 4 else 1
     assert not target.transaction.active and not caches[0].is_speculating
     assert caches[0][0].tolist() == [[float(retained)]] * batch
     offset = caches[1].offset
-    assert (offset.tolist() if isinstance(offset, mx.array) else [offset]) == [
-        2 + retained
-    ] * batch
+    equal(mx.array(offset).reshape(-1), mx.array([2 + retained] * batch))
     generator.close()
 
 
-@pytest.mark.parametrize("retained", [0, 1, 2, 3])
-@pytest.mark.parametrize("budget", [0, 1, 4])
-def test_acceptance_walk(retained, budget):
+def test_acceptance_walk_and_budgets():
     drafts = mx.array([[1, 2, 3], [4, 5, 6]], dtype=mx.int32)
-    targets = mx.concatenate([drafts[:, :retained], mx.full((2, 4 - retained), 9)], 1)
-    expected = [(row[:retained] + [9])[:budget] for row in drafts.tolist()]
-    accepted, tokens = _speculative_walk_batch(drafts, targets, [budget, budget])
-    assert accepted == [retained, retained]
-    assert tokens == expected
-
-
-@pytest.mark.parametrize("budgets", [[1], [1, 1, 1], [1, -1]])
-def test_invalid_budgets(budgets):
-    with pytest.raises(ValueError):
-        _speculative_walk_batch(mx.ones((2, 1)), mx.ones((2, 2)), budgets)
+    for retained, budget in product(range(4), (0, 1, 4)):
+        targets = mx.concatenate(
+            [drafts[:, :retained], mx.full((2, 4 - retained), 9)], 1
+        )
+        expected = [(row[:retained] + [9])[:budget] for row in drafts.tolist()]
+        assert _speculative_walk_batch(drafts, targets, [budget] * 2) == (
+            [retained] * 2,
+            expected,
+        )
+    for budgets in ([1], [1, 1, 1], [1, -1]):
+        with pytest.raises(ValueError):
+            _speculative_walk_batch(mx.ones((2, 1)), mx.ones((2, 2)), budgets)
+    drafts = mx.array([[10, 11, 12], [20, 21, 22]])
+    targets = mx.array([[10, 99, 98, 97], [20, 21, 77, 76]])
+    assert common._speculative_walk_batch_uniform_acceptance(
+        drafts, targets, accepted_list=[1, 2], budgets=[4, 4]
+    ) == ([1, 1], [[10, 99], [20, 21]])
+    assert _speculative_walk_batch(
+        mx.zeros((0, 2), dtype=mx.int32), mx.zeros((0, 3), dtype=mx.int32), budgets=[]
+    ) == ([], [])
 
 
 def test_sampler_rng_isolation():
@@ -753,31 +364,26 @@ def test_sampler_rng_isolation():
     mx.eval(*expected)
     mx.random.seed(123)
     drafter = NS(_seed_token=None)
-    rng = _SpeculativeSamplerRNG(drafter, enabled=True)
+    rng = common._SpeculativeSamplerRNG(drafter, enabled=True)
     actual = [sample()]
     mx.eval(*actual)
     rng.target_sampled()
     rng.draft_call(lambda: setattr(drafter, "_seed_token", sample()))
     actual.append(sample())
     mx.eval(*actual)
-    assert all(mx.array_equal(a, b).item() for a, b in zip(actual, expected))
+    equal(actual, expected)
     assert drafter._seed_token is not None
     sampler = module("server.generation")._PositionedTargetSampler(
-        temperature=1.0,
-        top_p=0.95,
-        top_k=20,
-        seed=7,
+        temperature=1.0, top_p=0.95, top_k=20, seed=7
     )
     first = sampler.sample_proposal(logits, row_ids=[0], positions=[3])
     second = sampler.sample_proposal(logits, row_ids=[0], positions=[3])
     assert first.shape == (1,) and mx.array_equal(first, second).item()
 
 
-@pytest.mark.parametrize(
-    "family,quant", [("qwen", "mxfp8"), ("glm", "affine"), ("glm", "mxfp8")]
-)
+@parametrize("family,quant", [("qwen", "mxfp8"), ("glm", "affine"), ("glm", "mxfp8")])
 def test_split_and_requantize_checkpoint(tmp_path, family, quant):
-    name, factory = TEXT[family]
+    name, factory = models.TEXT[family]
     text = factory()
     text.mtp_num_hidden_layers = 1
     prefix = (
@@ -797,15 +403,10 @@ def test_split_and_requantize_checkpoint(tmp_path, family, quant):
         weights[prefix + ".weight_scale_inv"] = mx.full(
             (1, 1), 0.125, dtype=mx.bfloat16
         )
-    (tmp_path / "config.json").write_text(json.dumps(config))
-    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
-    output = tmp_path / "draft"
     kwargs = (
         dict(q_bits=4, q_group_size=64) if quant == "affine" else dict(q_mode="mxfp8")
     )
-    split_mtp(str(tmp_path), str(output), **kwargs)
-    result = json.loads((output / "config.json").read_text())
-    written = mx.load(str(output / "model.safetensors"))
+    result, written, _ = split_checkpoint(tmp_path, config, weights, **kwargs)
     expected = (
         dict(group_size=64, bits=4, mode="affine")
         if quant == "affine"
@@ -820,15 +421,13 @@ def test_split_and_requantize_checkpoint(tmp_path, family, quant):
     assert (key + ".biases" in written) == (quant == "affine")
 
 
-@pytest.mark.parametrize("family", ["dflash2", "glimmer", "dspark-lfm2", "dspark-qwen"])
+@parametrize("family", ["dflash2", "glimmer", "dspark-lfm2", "dspark-qwen"])
 def test_checkpoint_routing_and_validation(tmp_path, family):
-    values = dflash_config(family)
-    (tmp_path / "config.json").write_text(json.dumps(values))
+    settings = models.dflash_config(family)
+    (tmp_path / "config.json").write_text(json.dumps(settings))
     assert resolve_drafter_kind(tmp_path) == "dflash"
-    drafter = dflash_drafter(family)
-    assert drafter.config.block_size >= 2
-    target = dflash_target(family)
-    validate_drafter_compatibility(target, drafter, "dflash")
+    drafter = models.dflash_drafter(family)
+    target = models.dflash_target(family)
     if family == "glimmer":
         target.language_model.config.model_type = "other"
     else:
@@ -838,88 +437,55 @@ def test_checkpoint_routing_and_validation(tmp_path, family):
         validate_drafter_compatibility(target, drafter, "dflash")
 
 
-def dspark_source(model, cfg):
-    """Reconstruct the ``mtp.<stage>.*`` checkpoint tensors from the drafter's
-    own params, so the split->load round-trip can be exercised without the real
-    (multi-GB) DeepSeek-V4-Flash-0731 checkpoint."""
-    params = dict(tree_flatten(model.parameters()))
-    text = cfg.text_config
-    n_experts, o_groups, o_lora_rank = (
-        text.n_routed_experts,
-        text.o_groups,
-        text.o_lora_rank,
-    )
-    last_stage = cfg.n_mtp_layers - 1
-    proj_to_w = {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"}
-    hc = {"attn_hc": "hc_attn", "ffn_hc": "hc_ffn"}
-    src = {}
-    for key, value in params.items():
-        if key.startswith("markov_head."):
-            # the model-level markov head lives under the last stage on disk
-            src[f"mtp.{last_stage}.{key}"] = value
-            continue
-        _, stage, body = key.split(".", 2)
-        prefix = f"mtp.{stage}."
-        if body.startswith("ffn.switch_mlp."):
-            w = proj_to_w[body.split(".")[-2]]
-            for expert in range(n_experts):
-                src[f"{prefix}ffn.experts.{expert}.{w}.weight"] = value[expert]
-        elif body.startswith("ffn.shared_experts."):
-            w = proj_to_w[body.split(".")[-2]]
-            src[f"{prefix}ffn.shared_experts.{w}.weight"] = value
-        elif body == "ffn.gate.e_score_correction_bias":
-            src[f"{prefix}ffn.gate.bias"] = value
-        elif body == "attn.wo_a.weight":
-            src[f"{prefix}attn.wo_a.weight"] = (
-                value.reshape(o_groups * o_lora_rank, -1) if value.ndim == 3 else value
-            )
-        elif body.startswith("attn_hc.") or body.startswith("ffn_hc."):
-            module, param = body.split(".")
-            src[f"{prefix}{hc[module]}_{param}"] = value
-        elif body.startswith("hc_head."):
-            src[f"{prefix}hc_head_{body.split('.')[-1]}"] = value
-        else:
-            src[f"{prefix}{body}"] = value
-    return src
+def split_checkpoint(
+    path, config, weights, *, separate=False, indexed=False, **options
+):
+    (path / "config.json").write_text(json.dumps(config))
+    shard = "mtp.safetensors" if separate else "model.safetensors"
+    mx.save_safetensors(str(path / shard), weights)
+    if separate or indexed:
+        index = (
+            {"model.foo": "model.safetensors"}
+            if separate
+            else dict.fromkeys(weights, shard)
+        )
+        (path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": index})
+        )
+    output = path / "draft"
+    split_mtp(str(path), str(output), **options)
+    config = json.loads((output / "config.json").read_text())
+    weights = {
+        k: v
+        for shard in sorted(output.glob("*.safetensors"))
+        for k, v in mx.load(str(shard)).items()
+    }
+    return config, weights, output
 
 
 def test_deepseek_dspark_split_load_and_draft(tmp_path):
     arch = module("speculative.drafters.deepseek_v4_dspark")
-    text = tiny_deepseek_config()
+    text = models.tiny_deepseek_config()
     cfg = arch.ModelConfig(
-        text_config=text,
-        n_mtp_layers=3,
-        target_layer_ids=[0, 1, 2],
-        mask_token_id=1,
-        markov_rank=8,
-        block_size=5,
+        text_config=text, **models.DATA["speculative"]["deepseek_dspark"]
     )
-    original = arch.Model(cfg)
-    source = dspark_source(original, cfg)
+    source = models.dspark_source(arch.Model(cfg), cfg)
     source["mtp.2.confidence_head.proj.weight"] = mx.zeros((1, 24))
     source["mtp.0.ffn.gate.bias_vl"] = mx.zeros((2,))
-    values = {**text.to_dict(), "model_type": "deepseek_v4"}
-    values.update(
+    settings = {**text.to_dict(), "model_type": "deepseek_v4"}
+    settings.update(
         dspark_block_size=4,
         dspark_noise_token_id=1,
         dspark_target_layer_ids=[0, 1, 2],
         dspark_markov_rank=8,
     )
-    (tmp_path / "config.json").write_text(json.dumps(values))
-    (tmp_path / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {"model.foo": "model.safetensors"}})
+    config, weights, output = split_checkpoint(
+        tmp_path, settings, source, separate=True
     )
-    mx.save_safetensors(str(tmp_path / "mtp.safetensors"), source)
-    output = tmp_path / "draft"
-    split_mtp(str(tmp_path), str(output))
-    config = json.loads((output / "config.json").read_text())
     assert config["model_type"] == "deepseek_v4_dspark"
     assert config["n_mtp_layers"] == 3 and config["target_layer_ids"] == [0, 1, 2]
-    shards = sorted(output.glob("model-*.safetensors"))
-    assert len(shards) == 3 and (output / "model.safetensors.index.json").exists()
-    weights = {
-        key: value for shard in shards for key, value in mx.load(str(shard)).items()
-    }
+    assert len(list(output.glob("model-*.safetensors"))) == 3
+    assert (output / "model.safetensors.index.json").exists()
     fresh = arch.Model(arch.ModelConfig.from_dict(config))
     weights = fresh.sanitize(weights)
     fresh.load_weights(list(weights.items()), strict=True)
@@ -934,15 +500,12 @@ def test_deepseek_dspark_split_load_and_draft(tmp_path):
     assert all(0 <= token < 32 for token in tokens[0].tolist())
 
 
-@pytest.mark.parametrize("accepted", [0, 2])
+@parametrize("accepted", [0, 2])
 def test_eagle3_draft_replay(accepted):
     arch = module("speculative.drafters.eagle3")
     cfg = arch.ModelConfig(
-        transformer_layer_config=dimensions(),
-        draft_vocab_size=16,
-        target_hidden_size=16,
-        target_layer_ids=[1, 2, 3],
-        block_size=4,
+        transformer_layer_config=models.dimensions(),
+        **models.DATA["speculative"]["eagle3"],
     )
     drafter = arch.Model(cfg)
     drafter.d2t = mx.arange(16, dtype=mx.int32)
@@ -967,10 +530,8 @@ def test_eagle3_draft_replay(accepted):
     ]
 
 
-@pytest.mark.parametrize(
-    "offsets,length", [([128], 8), ([10], 6), ([5, 8], 8), ([128, 10], 8)]
-)
-@pytest.mark.parametrize("query_len", [1, 3])
+@parametrize("offsets,length", [([128], 8), ([10], 6), ([5, 8], 8), ([128, 10], 8)])
+@parametrize("query_len", [1, 3])
 def test_drafter_masks(offsets, length, query_len):
     masks = module("speculative.drafters.gemma4_assistant.masks")
     kv = (mx.zeros((len(offsets), 1, length, 4)),) * 2
@@ -982,48 +543,21 @@ def test_drafter_masks(offsets, length, query_len):
         kv_valid_len=mx.array(offsets) if len(offsets) == 1 else None,
     )
     for kind, mask in result.items():
-        expected = []
-        for offset in offsets:
+        rows = query_len if kind == "sliding_attention" else 1
+        expected = np.full((len(offsets), 1, rows, length), -np.inf)
+        for row, offset in enumerate(offsets):
             valid = min(offset, length)
-            expected.append(
-                [
-                    [
-                        (
-                            0.0
-                            if key < valid
-                            and (
-                                kind == "full_attention" or abs(valid + query - key) < 4
-                            )
-                            else -float("inf")
-                        )
-                        for key in range(length)
-                    ]
-                    for query in range(query_len if kind == "sliding_attention" else 1)
-                ]
-            )
-        assert mask.shape == (len(offsets), 1, len(expected[0]), length)
-        assert mask[:, 0].tolist() == expected
+            for query in range(rows):
+                start = max(0, valid + query - 3) if kind == "sliding_attention" else 0
+                expected[row, 0, query, start:valid] = 0
+        assert mask.shape == expected.shape
+        equal(mask, mx.array(expected))
 
 
 def test_laguna_checkpoint_contract():
     arch = module("speculative.drafters.laguna_dflash.config")
-    values = dimensions(
-        model_type="laguna",
-        draft_vocab_size=32,
-        rope_theta=10000.0,
-        layer_types=["sliding_attention"],
-        sliding_window=8,
-        gating="per-head",
-        eagle_aux_hidden_state_layer_ids=[1],
-        dflash_config=dict(
-            block_size=3,
-            mask_token_id=31,
-            target_layer_ids=[0],
-            num_target_layers=2,
-            causal=True,
-        ),
-    )
-    config = arch.DFlashConfig.from_dict(values)
+    settings = models.values("laguna_dflash")
+    config = arch.DFlashConfig.from_dict(settings)
     expected = arch.expected_laguna_dflash_weight_shapes(config)
     weights = {key: NS(shape=shape) for key, shape in expected.items()}
     arch.validate_laguna_dflash_weights(weights, config)
@@ -1031,7 +565,7 @@ def test_laguna_checkpoint_contract():
         config, target_model_config=NS(num_hidden_layers=2, vocab_size=32)
     )
     for field in ("hidden_size", "layer_types", "dflash_config"):
-        malformed = dict(values)
+        malformed = dict(settings)
         del malformed[field]
         with pytest.raises(ValueError):
             arch.DFlashConfig.from_dict(malformed)
@@ -1040,9 +574,9 @@ def test_laguna_checkpoint_contract():
         arch.validate_laguna_dflash_weights(weights, config)
 
 
-@pytest.mark.parametrize("padding", [[5, 0], [5, 5]])
+@parametrize("padding", [[5, 0], [5, 5]])
 def test_padded_prefill_chunks(padding):
-    lm, cfg = language("qwen")
+    lm, cfg = models.language("qwen")
     recurrent = ArraysCache(2)
     recurrent.left_padding = mx.array(padding)
     caches = [recurrent, BatchKVCache(padding)]
@@ -1061,12 +595,12 @@ def test_padded_prefill_chunks(padding):
         assert caches[1].left_padding.tolist() == expected_padding
 
 
-@pytest.mark.parametrize(
+@parametrize(
     "family,accepted", [("qwen", [1, 0]), ("qwen", [1, 1]), ("deepseek", [0, 0])]
 )
 def test_batched_drafter_commit_and_filter(family, accepted):
-    cfg = TEXT[family][1]()
-    drafter = mtp_drafter(family, cfg)
+    cfg = models.TEXT[family][1]()
+    drafter = models.mtp_drafter(family, cfg)
     target = NS(model=NS(embed_tokens=nn.Embedding(cfg.vocab_size, cfg.hidden_size)))
     qwen = family == "qwen"
     drafter.reset(
@@ -1115,31 +649,18 @@ def test_batched_drafter_commit_and_filter(family, accepted):
         assert drafter._next_position == 5
 
 
-@pytest.mark.parametrize("layout", ["full_attention", "sliding_attention"])
-@pytest.mark.parametrize("nested", [False, True])
+@parametrize("layout", ["full_attention", "sliding_attention"])
+@parametrize("nested", [False, True])
 def test_gemma_dspark_contract_and_attention(layout, nested):
     arch = module("speculative.drafters.gemma4_dspark.gemma4_dspark")
-    values = dimensions(
-        model_type="gemma4_text",
-        architectures=["Gemma4DSparkModel"],
-        global_head_dim=8,
-        num_global_key_value_heads=1,
-        attention_k_eq_v=True,
+    settings = models.values(
+        "gemma_dspark",
         layer_types=[layout],
-        sliding_window=8,
-        final_logit_softcapping=30.0,
         rope_parameters={layout: dict(rope_theta=10000.0, rope_type="default")},
     )
-    draft = dict(
-        block_size=3,
-        mask_token_id=31,
-        target_layer_ids=[0],
-        num_target_layers=2,
-        markov_rank=4,
-        enable_confidence_head=True,
-    )
-    values.update({"dflash_config": draft} if nested else draft)
-    cfg = arch.ModelConfig.from_dict(values)
+    draft = deepcopy(models.DATA["speculative"]["gemma_dspark_draft"])
+    settings.update({"dflash_config": draft} if nested else draft)
+    cfg = arch.ModelConfig.from_dict(settings)
     assert (cfg.model_type, cfg.backbone_model_type) == ("gemma4_dspark", "gemma4_text")
     assert (cfg.proposal_length, cfg.block_size, cfg.target_layer_ids) == (3, 4, [0])
     drafter = arch.Model(cfg)
@@ -1154,37 +675,33 @@ def test_gemma_dspark_contract_and_attention(layout, nested):
         ("target_layer_ids", [2]),
         ("markov_rank", 0),
     ]:
-        malformed = deepcopy(values)
+        malformed = deepcopy(settings)
         malformed.get("dflash_config", malformed)[key] = value
         with pytest.raises(ValueError):
             arch.ModelConfig.from_dict(malformed)
 
 
-@pytest.mark.parametrize("uniform", [False, True])
-@pytest.mark.parametrize("positioned", [False, True])
-@pytest.mark.parametrize("reject_first", [False, True])
+def sampling_spies(positioned):
+    logits = Mock(side_effect=lambda hidden: hidden)
+    sample = Mock(side_effect=lambda logits, **kw: greedy(logits))
+    target = NS(speculative_logits_from_hidden=logits)
+    return target, NS(sample_target=sample) if positioned else greedy, logits, sample
+
+
+@parametrize("uniform", [False, True])
+@parametrize("positioned", [False, True])
+@parametrize("reject_first", [False, True])
 def test_deferred_acceptance(uniform, positioned, reject_first):
-    mtp = module("speculative.mtp")
-    head_calls, sample_calls = [], []
-
-    def logits(hidden):
-        head_calls.append(hidden.shape)
-        return hidden
-
-    def sample(logits, *, row_ids, positions):
-        sample_calls.append((list(row_ids), list(positions)))
-        return greedy(logits)
-
+    target, sampler, head_calls, sample_calls = sampling_spies(positioned)
     rows = [[2, 1, 3], [1, 2, 1] if reject_first else [0, 2, 1]]
     hidden = mx.eye(4)[mx.array(rows)] * 9
-    sampler = NS(sample_target=sample) if positioned else greedy
     walk = (
         mtp._speculative_walk_batch_deferred_uniform
         if uniform
         else mtp._speculative_walk_batch_deferred_greedy
     )
     accepted, tokens = walk(
-        NS(speculative_logits_from_hidden=logits),
+        target,
         hidden,
         mx.array([[2, 3], [0, 2]]),
         sampler,
@@ -1204,89 +721,21 @@ def test_deferred_acceptance(uniform, positioned, reject_first):
         else [[2, 1], [1]] if reject_first else [[2, 1], [0, 2]]
     )
     calls = 1 if reject_first and uniform else 2 if uniform or reject_first else 3
-    assert len(head_calls) == calls
+    assert head_calls.call_count == calls
     if positioned:
-        assert sample_calls == [([10, 11], [7 + i, 12 + i]) for i in range(calls)]
+        assert [
+            (c.kwargs["row_ids"], c.kwargs["positions"])
+            for c in sample_calls.call_args_list
+        ] == [([10, 11], [7 + i, 12 + i]) for i in range(calls)]
 
 
-@pytest.mark.parametrize("family", ["glm4_moe_lite", "deepseek_v4"])
+@parametrize("family", ["glm4_moe_lite", "deepseek_v4"])
 def test_native_checkpoint_layouts(tmp_path, family):
     deepseek = family == "deepseek_v4"
-    cfg = (
-        tiny_deepseek_config().to_dict()
-        if deepseek
-        else dict(
-            hidden_size=8,
-            vocab_size=16,
-            num_hidden_layers=2,
-            num_attention_heads=2,
-            qk_nope_head_dim=4,
-            v_head_dim=6,
-            kv_lora_rank=4,
-            moe_intermediate_size=4,
-            n_routed_experts=2,
-            num_nextn_predict_layers=1,
-            tie_word_embeddings=False,
-        )
+    cfg, weights = models.native_speculative_checkpoint(family)
+    config, out, _ = split_checkpoint(
+        tmp_path, cfg, weights, separate=deepseek, indexed=True
     )
-    cfg["model_type"] = family
-    if deepseek:
-        weights = {
-            f"mtp.0.{key}.weight": mx.zeros((4, 4), dtype=mx.uint8)
-            for key in ("e_proj", "attn.wq_a")
-        }
-        weights.update(
-            {key.replace(".weight", ".scale"): mx.ones((1, 1)) for key in list(weights)}
-        )
-        weights["mtp.0.enorm.weight"] = mx.ones((cfg["hidden_size"],))
-        for expert in range(cfg["n_routed_experts"]):
-            for proj in ("w1", "w2", "w3"):
-                key = f"mtp.0.ffn.experts.{expert}.{proj}"
-                weights[key + ".weight"] = mx.full((4, 16), expert, dtype=mx.uint8)
-                weights[key + ".scale"] = mx.ones((4, 1), dtype=mx.uint8)
-        weights["mtp.0.ffn.gate.bias"] = mx.zeros((cfg["n_routed_experts"],))
-        weights["mtp.0.hc_attn_fn"] = mx.ones((2, 2))
-        weights["mtp.0.hc_head_scale"] = mx.ones((1,))
-    else:
-        shapes = {
-            "embed_tokens": (16, 8),
-            "enorm": (8,),
-            "hnorm": (8,),
-            "eh_proj": (8, 16),
-            "input_layernorm": (8,),
-            "post_attention_layernorm": (8,),
-            "self_attn.kv_b_proj": (20, 4),
-            "self_attn.o_proj": (8, 12),
-            "mlp.gate": (2, 8),
-            "shared_head.norm": (8,),
-            "shared_head.head": (16, 8),
-        }
-        for expert in ["shared_experts", "experts.0", "experts.1"]:
-            for proj in ("gate", "up", "down"):
-                shapes[f"mlp.{expert}.{proj}_proj"] = (
-                    (8, 4) if proj == "down" else (4, 8)
-                )
-        weights = {
-            f"model.layers.2.{key}.weight": mx.zeros(shape)
-            for key, shape in shapes.items()
-        }
-        weights["model.layers.2.mlp.gate.e_score_correction_bias"] = mx.ones((2,))
-        weights["model.layers.2.self_attn.rotary_emb.inv_freq"] = mx.ones((2,))
-    (tmp_path / "config.json").write_text(json.dumps(cfg))
-    shard = "mtp.safetensors" if deepseek else "model.safetensors"
-    mx.save_safetensors(str(tmp_path / shard), weights)
-    index = (
-        {"model.foo": "model.safetensors"}
-        if deepseek
-        else {key: shard for key in weights}
-    )
-    (tmp_path / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": index})
-    )
-    output = tmp_path / "draft"
-    split_mtp(str(tmp_path), str(output))
-    config = json.loads((output / "config.json").read_text())
-    out = mx.load(str(output / "model.safetensors"))
     assert config["model_type"] == family + "_mtp" and config["block_size"] == 2
     if deepseek:
         for key in ("e_proj", "decoder.attn.wq_a"):
@@ -1319,8 +768,8 @@ def test_native_checkpoint_layouts(tmp_path, family):
         )
 
 
-@pytest.mark.parametrize("batch", [1, 2])
-@pytest.mark.parametrize("step", [1, 4])
+@parametrize("batch", [1, 2])
+@parametrize("step", [1, 4])
 def test_rotating_cache_commit_abort(batch, step):
     arch = module("models.cache")
     cache = (
@@ -1347,14 +796,12 @@ def test_rotating_cache_commit_abort(batch, step):
                 part = incoming[:, :, start : min(start + step, retained)]
                 reference.update_and_fetch(part, part)
         assert "update_and_fetch" not in cache.__dict__
-        assert all(
-            mx.array_equal(a, b).item() for a, b in zip(cache.state, reference.state)
-        )
+        equal(cache.state, reference.state)
         assert cache.meta_state == reference.meta_state
 
 
-@pytest.mark.parametrize("family", ["qwen3_5", "gemma4", "deepseek_v4"])
-@pytest.mark.parametrize("accepted", [[2, 2], [0, 2]])
+@parametrize("family", ["qwen3_5", "gemma4", "deepseek_v4"])
+@parametrize("accepted", [[2, 2], [0, 2]])
 def test_quantized_cache_rollback(family, accepted):
     cache = module("turboquant").BatchTurboQuantKVCache([0, 0], bits=3.5)
     keys = mx.arange(112, dtype=mx.float32).reshape(2, 1, 7, 8)
@@ -1446,7 +893,7 @@ def test_eagle_hot_verifier_includes_eos():
     assert tokens.tolist() == [[1, 4]] and transaction is None
 
 
-@pytest.mark.parametrize("family", ["eagle3", "dflash"])
+@parametrize("family", ["eagle3", "dflash"])
 def test_adaptive_block_policy(family):
     if family == "eagle3":
         arch = module("speculative.eagle3")
@@ -1480,9 +927,9 @@ def test_adaptive_block_policy(family):
         assert choose() == expected
 
 
-@pytest.mark.parametrize("batch", [1, 4])
-@pytest.mark.parametrize("length", [3, 7, 8])
-@pytest.mark.parametrize("bits", [4, 5])
+@parametrize("batch", [1, 4])
+@parametrize("length", [3, 7, 8])
+@parametrize("bits", [4, 5])
 def test_wide_quantized_verifier(batch, length, bits):
     mx.random.seed(43)
     linear = bf16_parameters(
@@ -1492,68 +939,34 @@ def test_wide_quantized_verifier(batch, length, bits):
     # This verifier reproduces native GEMV separately for every token and row.
     expected = verifier_linear._target_verify_singletons(linear, inputs)
     actual = verifier_linear._target_verify_linear(linear, inputs)
-    assert mx.array_equal(actual, expected).item()
-    assert mx.array_equal(
+    equal(actual, expected)
+    equal(
         verifier_linear._target_verify_quantized_argmax(linear, inputs),
         greedy(expected),
-    ).item()
+    )
 
 
 def test_glm_mtp_native_weight_fusion():
-    cfg = tiny_glm_text_config()
+    cfg = models.tiny_glm_text_config()
     arch = module("speculative.drafters.glm5_next_mtp")
-    shapes = {
-        "mlp.shared_experts.gate_proj": (8, 16),
-        "mlp.shared_experts.up_proj": (8, 16),
-        "self_attn.q_a_proj": (8, 16),
-        "self_attn.kv_a_proj_with_mqa": (4, 16),
-        "self_attn.kv_b_proj": (16, 4),
-    }
-    for expert in range(cfg.n_routed_experts):
-        for proj in ("gate", "up", "down"):
-            shapes[f"mlp.experts.{expert}.{proj}_proj"] = (
-                (16, 8) if proj == "down" else (8, 16)
-            )
-    weights = {
-        f"mtp_block.{key}.weight": mx.arange(prod(shape))
-        .reshape(shape)
-        .astype(mx.float32)
-        for key, shape in shapes.items()
-    }
+    weights = models.glm_mtp_checkpoint_weights(cfg)
     out = arch.Model.sanitize(NS(args=cfg), weights.copy())
-    expected = {
-        "mlp.shared_experts.gate_up_proj": (16, 16),
-        "mlp.switch_mlp.gate_proj": (2, 8, 16),
-        "self_attn.qkv_a_proj": (12, 16),
-        "self_attn.embed_q": (2, 4, 4),
-        "self_attn.unembed_out": (2, 4, 4),
-    }
+    expected = deepcopy(models.DATA["speculative"]["glm_fused_shapes"])
     for key, shape in expected.items():
-        assert out[f"mtp_block.{key}.weight"].shape == shape
-    assert mx.array_equal(
+        assert out[f"mtp_block.{key}.weight"].shape == tuple(shape)
+    equal(
         out["mtp_block.mlp.switch_mlp.gate_proj.weight"][1],
         weights["mtp_block.mlp.experts.1.gate_proj.weight"],
-    ).item()
+    )
 
 
-@pytest.mark.parametrize("positioned", [False, True])
+@parametrize("positioned", [False, True])
 def test_single_mtp_sampling_stops_at_rejection(positioned):
-    mtp = module("speculative.mtp")
-    head_calls, sample_calls = [], []
-
-    def logits(hidden):
-        head_calls.append(hidden.shape)
-        return hidden
-
-    def sample(logits, *, row_ids, positions):
-        sample_calls.append((list(row_ids), list(positions)))
-        return greedy(logits)
-
+    target, sampler, head_calls, sample_calls = sampling_spies(positioned)
     hidden = mx.eye(4)[mx.array([[2, 3, 1, 0]])] * 9
-    sampler = NS(sample_target=sample) if positioned else greedy
     verify = mtp._MTPVerifyResult(hidden=hidden, shared_kv_states={})
     accepted, tokens = mtp._mtp_acceptance_walk(
-        NS(speculative_logits_from_hidden=logits),
+        target,
         verify,
         mx.array([[2, 1, 3]]),
         sampler,
@@ -1562,11 +975,14 @@ def test_single_mtp_sampling_stops_at_rejection(positioned):
         base_position=7 if positioned else None,
     )
     assert (accepted, tokens) == (1, [2, 3])
-    assert len(head_calls) == (1 if positioned else 2)
-    assert sample_calls == ([([5] * 4, [7, 8, 9, 10])] if positioned else [])
+    assert head_calls.call_count == (1 if positioned else 2)
+    assert [
+        (c.kwargs["row_ids"], c.kwargs["positions"])
+        for c in sample_calls.call_args_list
+    ] == ([([5] * 4, [7, 8, 9, 10])] if positioned else [])
 
 
-@pytest.mark.parametrize(
+@parametrize(
     "batch,uniform,greedy_mode,positioned,expected",
     [
         (1, False, False, False, False),
@@ -1607,13 +1023,7 @@ def test_mixed_positions_keep_shared_kv_and_round_aligned():
 
     drafter.set_shared_kv, drafter.draft_block = set_shared, draft
     tokens = module("speculative.mtp")._mtp_draft_block_active(
-        drafter,
-        [3, 7],
-        mx.zeros((2, 1, 1)),
-        2,
-        greedy,
-        mx.int32,
-        positions=[11, 12],
+        drafter, [3, 7], mx.zeros((2, 1, 1)), 2, greedy, mx.int32, positions=[11, 12]
     )
     assert tokens.tolist() == [[13], [27]]
     assert rounds == [4, 4] and drafter._draft_round == 5
@@ -1629,14 +1039,14 @@ def test_shared_kv_metadata_and_rotating_prompt_cache():
     target = NS(model=NS(layers=[NS(layer_type="full_attention")]))
     shared = mtp._mtp_shared_kv_from_prompt_cache(target, [cache])
     assert shared["full_attention"][0] is keys
-    assert mx.array_equal(shared["full_attention"][1], keys + 1).item()
+    equal(shared["full_attention"][1], keys + 1)
     rotating = cache_module.RotatingKVCache(4, keep=0)
     rotating.update_and_fetch(keys, keys)
     caches = [cache_module.CacheList(rotating, cache_module.PoolingCache(4))]
     mtp._buffer_mtp_target_cache(caches, NS(config=NS(block_size=3)), None)
     assert isinstance(caches[0][0], cache_module.BufferedRotatingKVCache)
     assert isinstance(caches[0][1], cache_module.PoolingCache)
-    assert mx.array_equal(caches[0][0].state[0], keys).item()
+    equal(caches[0][0].state[0], keys)
 
 
 def test_rotating_ragged_commit_masks_rejected_tokens():
@@ -1688,11 +1098,11 @@ def test_temporal_cache_boundaries_and_failed_transactions():
     assert not hasattr(cache, "_qwen3_5_lengths_info")
 
 
-@pytest.mark.parametrize("batch", [1, 2])
+@parametrize("batch", [1, 2])
 def test_glm_rejection_restores_draft_pool(batch):
     mx.random.seed(2127)
-    model, cfg = language("glm")
-    drafter = mtp_drafter("glm", cfg)
+    model, cfg = models.language("glm")
+    drafter = models.mtp_drafter("glm", cfg)
     drafter.eval()
     drafter.reset(model, left_padding=[0] * batch if batch > 1 else None)
     hidden = mx.random.normal((batch, 1, cfg.hidden_size))
@@ -1712,15 +1122,14 @@ def test_glm_rejection_restores_draft_pool(batch):
         mx.eval(candidate.draft_eval_state())
     assert not transaction.active
     actual, expected = drafter._cache[0][2], reference._cache[0][2]
-    assert mx.array_equal(mx.array(actual.offset), mx.array(expected.offset)).item()
+    equal(mx.array(actual.offset), mx.array(expected.offset))
     assert actual.remainder == expected.remainder
-    for a, b in zip(actual.state, expected.state):
-        assert (a is b) if a is None or b is None else mx.array_equal(a, b).item()
-    assert mx.array_equal(drafter._seed_token, reference._seed_token).item()
-    assert mx.array_equal(drafter._seed_hidden, reference._seed_hidden).item()
+    equal(actual.state, expected.state)
+    equal(drafter._seed_token, reference._seed_token)
+    equal(drafter._seed_hidden, reference._seed_hidden)
 
 
-@pytest.mark.parametrize("ragged", [False, True])
+@parametrize("ragged", [False, True])
 def test_minimax_index_cache_rollback(ragged):
     arch = module("models.minimax_m3_vl.language")
     cache = arch.MiniMaxM3BatchKVCache([0, 0]) if ragged else arch.MiniMaxM3KVCache()
@@ -1736,9 +1145,9 @@ def test_minimax_index_cache_rollback(ragged):
         assert cache.offset == cache.index_offset == 3
 
 
-@pytest.mark.parametrize("batch", [1, 2])
+@parametrize("batch", [1, 2])
 def test_chunked_prefill_retains_all_drafter_features(batch):
-    model, _ = language("deepseek")
+    model, _ = models.language("deepseek")
     model.eval()
     tokens = mx.array([[1, 2, 3, 4, 5, 6, 7]] * batch)
     drafter = NS(config=NS(target_layer_ids=[0]))
@@ -1767,22 +1176,7 @@ def test_chunked_prefill_retains_all_drafter_features(batch):
         assert processing.prompt_step() <= 2
     generated = processing.generate(greedy, lambda *args: False, compute_logprobs=False)
     assert generated.hidden.shape[1] == tokens.shape[1]
-    assert mx.array_equal(generated.hidden, expected).item()
-
-
-def test_uniform_acceptance_and_empty_batch():
-    common = module("speculative.common")
-    drafts = mx.array([[10, 11, 12], [20, 21, 22]])
-    targets = mx.array([[10, 99, 98, 97], [20, 21, 77, 76]])
-    assert common._speculative_walk_batch_uniform_acceptance(
-        drafts,
-        targets,
-        accepted_list=[1, 2],
-        budgets=[4, 4],
-    ) == ([1, 1], [[10, 99], [20, 21]])
-    assert _speculative_walk_batch(
-        mx.zeros((0, 2), dtype=mx.int32), mx.zeros((0, 3), dtype=mx.int32), budgets=[]
-    ) == ([], [])
+    equal(generated.hidden, expected)
 
 
 def test_argmax_fallback_does_not_append_twice():
@@ -1826,7 +1220,9 @@ def test_chunked_verification_failure_restores_initial_cache():
 
 
 def test_qwen_quantized_cache_ragged_rollback():
-    model, cfg = language("qwen", hidden_size=64, intermediate_size=128, head_dim=32)
+    model, cfg = models.language(
+        "qwen", hidden_size=64, intermediate_size=128, head_dim=32
+    )
     recurrent = ArraysCache(2)
     recurrent.left_padding = mx.array([0, 0])
     kv = module("models.cache").BatchQuantizedKVCache([0, 0], group_size=32, bits=4)
@@ -1850,7 +1246,7 @@ def test_qwen_quantized_cache_ragged_rollback():
 
 def test_lfm_ragged_rollback_matches_committed_prefixes():
     mx.random.seed(5)
-    model = dflash_target("dspark-lfm2").language_model
+    model = models.dflash_target("dspark-lfm2").language_model
     prompt, verify = mx.array([[1, 2, 3, 4], [5, 6, 7, 8]]), mx.array(
         [[9, 10, 11, 12], [13, 14, 15, 16]]
     )
@@ -1871,18 +1267,16 @@ def test_lfm_ragged_rollback_matches_committed_prefixes():
             mx.concatenate([prompt[row], verify[row, :retained]])[None], cache=reference
         )
         expected.append(model(probes[row : row + 1], cache=reference).logits)
-    assert mx.allclose(
-        model(probes, cache=caches).logits, mx.concatenate(expected), atol=1e-4
-    ).item()
+    equal(model(probes, cache=caches).logits, mx.concatenate(expected), atol=1e-4)
 
 
-@pytest.mark.parametrize("family", ["glm", "qwen"])
-@pytest.mark.parametrize("step", [1, 2, 5])
+@parametrize("family", ["glm", "qwen"])
+@parametrize("step", [1, 2, 5])
 def test_temporal_layers_commit_each_row_prefix(family, step):
     mx.random.seed(2127)
-    cfg = TEXT[family][1]()
+    cfg = models.TEXT[family][1]()
     cfg.linear_head_dim = cfg.linear_key_head_dim = cfg.linear_value_head_dim = 32
-    arch = module(f"models.{TEXT[family][0]}.language")
+    arch = module(f"models.{models.TEXT[family][0]}.language")
     layer = (
         arch.Glm5NextLinearAttention(cfg)
         if family == "glm"
@@ -1907,24 +1301,17 @@ def test_temporal_layers_commit_each_row_prefix(family, step):
             expected = mx.concatenate(
                 [states[n][slot][row : row + 1] for row, n in enumerate(retained)]
             )
-            assert mx.allclose(cache[slot], expected, rtol=0, atol=1e-6).item()
-        assert mx.array_equal(cache.lengths, lengths - mx.array(retained)).item()
+            equal(cache[slot], expected, rtol=0, atol=1e-6)
+        equal(cache.lengths, lengths - mx.array(retained))
         assert cache.history_capacity == 0 and cache.nbytes == sum(
             v.nbytes for v in cache.state
         )
 
 
-@pytest.mark.parametrize("accepted", [1, 3, [0, 2]])
+@parametrize("accepted", [1, 3, [0, 2]])
 def test_laguna_rollback_and_feature_capture(accepted):
     arch = module("models.laguna.language")
-    cfg = module("models.laguna.config").ModelConfig(
-        **dimensions(
-            model_type="laguna",
-            num_hidden_layers=2,
-            sliding_window=8,
-            layer_types=["sliding_attention", "full_attention"],
-        )
-    )
+    cfg = module("models.laguna.config").ModelConfig(**models.values("laguna"))
     model = arch.LanguageModel(cfg)
     caches = model.make_cache()
     out = model(
@@ -1945,31 +1332,25 @@ def test_laguna_rollback_and_feature_capture(accepted):
         assert [c.offset for c in caches] == [accepted + 1] * 2
 
 
-@pytest.mark.parametrize("from_anchor", [False, True])
+@parametrize("from_anchor", [False, True])
 def test_dspark_samples_correct_proposal_positions(from_anchor):
-    drafter, seen = dflash_drafter("dspark-qwen"), {}
+    drafter = models.dflash_drafter("dspark-qwen")
     cfg = drafter.config
     cfg.sample_from_anchor = from_anchor
-
-    def hidden(inputs, target_hidden, cache):
-        seen["inputs"] = inputs
-        return mx.zeros((1, inputs.shape[1], cfg.hidden_size))
-
-    def logits(states):
-        seen["length"] = states.shape[1]
-        return mx.zeros((1, states.shape[1], cfg.vocab_size))
-
-    drafter._hidden, drafter._logits = hidden, logits
+    drafter._hidden = Mock(
+        side_effect=lambda ids, h, cache: mx.zeros((1, ids.shape[1], cfg.hidden_size))
+    )
+    drafter._logits = Mock(
+        side_effect=lambda h: mx.zeros((1, h.shape[1], cfg.vocab_size))
+    )
     proposals = drafter.draft_block(
         3, mx.zeros((1, 1, cfg.hidden_size)), [], cfg.block_size, greedy
     )
-    assert seen["inputs"].tolist() == [
+    assert drafter._hidden.call_args.args[0].tolist() == [
         [3] + [31] * (cfg.proposal_length - int(from_anchor))
     ]
-    assert seen["length"] == cfg.proposal_length and proposals.shape == (
-        1,
-        cfg.proposal_length,
-    )
+    assert drafter._logits.call_args.args[0].shape[1] == cfg.proposal_length
+    assert proposals.shape == (1, cfg.proposal_length)
 
 
 def test_local_mask_tracks_cache_width():
@@ -1980,7 +1361,7 @@ def test_local_mask_tracks_cache_width():
 
 
 def test_filter_batch_keeps_padding_and_positions():
-    drafter = mtp_drafter("qwen", tiny_qwen_text_config())
+    drafter = models.mtp_drafter("qwen", models.tiny_qwen_text_config())
     drafter.reset(
         NS(model=NS(embed_tokens=nn.Embedding(32, 16))), left_padding=[0, 1, 2]
     )
@@ -1994,13 +1375,6 @@ def test_filter_batch_keeps_padding_and_positions():
     assert drafter._next_position.tolist() == [4, 6]
 
 
-@pytest.mark.parametrize("kind", ["mtp", "eagle3", "dflash"])
-def test_speculative_batch_dispatch(kind):
-    assert speculative.get_speculative_rounds_batch(kind) is getattr(
-        speculative, f"_{kind}_rounds_batch"
-    )
-
-
 def test_speculative_dispatch_errors_and_hidden_state():
     with pytest.raises(ValueError):
         speculative.get_speculative_rounds_batch("nope")
@@ -2012,8 +1386,6 @@ def test_speculative_dispatch_errors_and_hidden_state():
 
 
 def test_speculative_lifetime_counters_survive_reset():
-    from mlx_vlm.speculative import common
-
     drafter = NS(accept_lens=[], draft_lens=[])
     snapshot = common.speculative_stats_snapshot(drafter)
     assert common.speculative_stats_since(drafter, snapshot) == (None, None, None)
