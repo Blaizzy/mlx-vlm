@@ -931,6 +931,18 @@ class Qwen4ExpTests(unittest.TestCase):
         self.assertEqual(quantized.index_keys.shape, (1, 12, 8))
         self.assertEqual(quantized.offset, 12)
 
+    def test_qsa_batch_filter_preserves_unprocessed_padding(self):
+        cache = BatchQSAKVCache([9, 0])
+        keys = mx.ones((2, 1, 3, 4))
+        cache.update_and_fetch(keys, keys)
+        cache.update_indexer(keys[:, 0], mx.broadcast_to(mx.arange(3)[None], (2, 3)))
+        cache.filter(mx.array([0]))
+
+        self.assertEqual(cache._idx, 0)
+        self.assertEqual(cache.index_offset, 0)
+        self.assertEqual(cache.index_keys.shape[1], 0)
+        self.assertEqual(cache.left_padding.tolist(), [6])
+
     def test_qsa_cache_merges_ragged_rows_and_round_trips_extract(self):
         rows = []
         for length in (3, 1):

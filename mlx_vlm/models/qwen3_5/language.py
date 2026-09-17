@@ -1233,6 +1233,9 @@ class Qwen3_5Model(nn.Module):
             and hidden_sink is None
             and fa_cache is not None
             and _is_single_row_batch_cache(fa_cache)
+            # A surviving prefill row may still have padding in future chunks.
+            # It must use the padded-row path below until real tokens begin.
+            and int(fa_cache.offset[0].item()) >= 0
         ):
             row_cache = []
             for cache_entry in cache:
@@ -1257,10 +1260,10 @@ class Qwen3_5Model(nn.Module):
             return row_out
 
         if (
-            h.shape[0] > 1
-            and h.shape[1] > 1
+            (h.shape[1] > 1 or h.shape[0] == 1)
             and hidden_sink is None
             and fa_cache is not None
+            and (h.shape[0] > 1 or _is_single_row_batch_cache(fa_cache))
             and hasattr(fa_cache, "extract")
             and hasattr(fa_cache.__class__, "merge")
             and isinstance(getattr(fa_cache, "offset", None), mx.array)

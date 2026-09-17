@@ -122,6 +122,18 @@ from mlx_vlm.utils import get_model_and_args
 speculative_utils = importlib.import_module("mlx_vlm.speculative.utils")
 
 
+def test_speculative_prefill_filter_keeps_hidden_chunks_aligned():
+    drafter = SimpleNamespace(config=SimpleNamespace(target_layer_ids=[0]))
+    prefill = speculative_utils.SpeculativePrefill("dflash", drafter)
+    prefill.append(SimpleNamespace(hidden_states=[mx.array([[[1]], [[2]]])]))
+    prefill.filter([1])
+    output = prefill.finish(SimpleNamespace(hidden_states=[mx.array([[[3]]])]))
+    assert output.hidden_states[0].tolist() == [[[2], [3]]]
+    prefill.append(output)
+    prefill.filter([])
+    assert prefill.chunks == []
+
+
 def test_kv_sequence_length_supports_turboquant_state_proxy():
     cache = BatchTurboQuantKVCache([0], bits=4)
     keys, _ = cache.update_and_fetch(
@@ -1172,6 +1184,24 @@ def test_qwen3_5_all_rows_fully_padded_prefill():
     out = model(mx.array([[0, 0, 0], [0, 0, 0]], dtype=mx.int32), cache=cache)
     mx.eval(out)
     assert out.shape == (2, 3, text_config.hidden_size)
+
+
+def test_qwen3_5_cancelled_prefill_row_preserves_survivor_output():
+    model, _ = _qwen3_5_hybrid_batch_model()
+    cache = _qwen3_5_batch_cache([5, 0])
+    model(mx.array([[0, 0, 0], [1, 2, 3]]), cache=cache)
+    for layer_cache in cache:
+        layer_cache.filter(mx.array([0]))
+
+    # The survivor still has two unprocessed padding columns.
+    singleton_cache = [ArraysCache(size=2), KVCache()]
+    actual = model(mx.array([[0, 0, 4]]), cache=cache)
+    expected = model(mx.array([[4]]), cache=singleton_cache)
+    assert mx.array_equal(actual[:, -1:], expected).item()
+
+    actual = model(mx.array([[5]]), cache=cache)
+    expected = model(mx.array([[5]]), cache=singleton_cache)
+    assert mx.array_equal(actual, expected).item()
 
 
 def test_qwen3_5_partially_padded_rows_match_unbatched():

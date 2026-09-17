@@ -1348,6 +1348,18 @@ def test_minimax_m3_batch_rollback_raises_on_ragged_accepts():
         )
 
 
+def test_minimax_m3_batch_filter_preserves_unprocessed_padding():
+    cache = MiniMaxM3BatchKVCache([9, 0])
+    keys = mx.ones((2, 1, 3, 4))
+    cache.update_and_fetch(keys, keys)
+    cache.update_index_and_fetch(keys)
+    cache.filter(mx.array([0]))
+
+    assert cache._idx == cache.index_offset == 0
+    assert cache.state[1].shape[2] == 0
+    assert cache.left_padding.tolist() == [6]
+
+
 def test_minimax_m3_batch_index_cache_filter_extend_extract():
     cache = MiniMaxM3BatchKVCache([1, 0])
     keys = mx.ones((2, 1, 3, 4))

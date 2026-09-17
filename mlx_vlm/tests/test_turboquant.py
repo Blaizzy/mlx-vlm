@@ -155,16 +155,18 @@ def test_batch_turboquant_extend_supports_empty_uniform_offsets():
     assert first.left_padding.tolist() == [0, 0]
 
 
-def test_batch_turboquant_filter_supports_uniform_single_item_offsets():
+@pytest.mark.parametrize("padding", [0, 9])
+def test_batch_turboquant_filter_supports_uniform_single_item_offsets(padding):
     keys = mx.ones((1, 2, 3, 8), dtype=mx.float16)
     values = mx.ones((1, 2, 3, 8), dtype=mx.float16)
-    cache = BatchTurboQuantKVCache([0], bits=3.5)
+    cache = BatchTurboQuantKVCache([padding], bits=3.5)
 
     cache.update_and_fetch(keys, values)
     cache.filter(mx.array([0]))
 
-    assert cache.offset.tolist() == [3]
-    assert cache.left_padding.tolist() == [0]
+    assert cache.offset.tolist() == [3 - padding]
+    assert cache.left_padding.tolist() == [max(0, padding - 3)]
+    assert cache._idx == max(0, 3 - padding)
 
 
 def test_batch_turboquant_uses_value_shape_for_value_codec():
