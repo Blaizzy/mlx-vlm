@@ -1805,12 +1805,14 @@ def test_sampling_filter_matches_numpy(name, values, reference, tolerance):
         actual = np.isfinite(np.asarray(output.tolist(), dtype=np.float64))
         far = distance > tolerance
         assert np.array_equal(expected[far], actual[far])
+    if name == "p_less":
+        output = sampling.apply_p_less(mx.array([10.0, 0.0, 0.0, 0.0, 0.0]), 1.0)
+        assert (output != -mx.inf).tolist() == [True, False, False, False, False]
 
 
 @pytest.mark.parametrize(
     "shape,dtype,top_p",
     [
-        ((100,), mx.float32, 0.9),
         ((100,), mx.float32, 1.0),
         ((50,), mx.bfloat16, 0.9),
         ((3, 50), mx.bfloat16, 0.9),
@@ -1838,23 +1840,16 @@ def test_sampler_selects_only_survivors(options, logits, draws, survivors):
     assert set(tokens.tolist()) <= survivors
 
 
-def test_p_less_peaked_keeps_top_only():
-    output = sampling.apply_p_less(mx.array([10.0, 0.0, 0.0, 0.0, 0.0]), 1.0)
-    mx.eval(output)
-    assert [i for i, value in enumerate(output.tolist()) if value != -mx.inf] == [0]
-
-
 @pytest.mark.parametrize(
-    "name,logits,bad",
-    [("top_n_sigma", [0.0, 1.0, 2.0, 3.0, 4.0], -1.0)]
-    + [("typical_p", [0.0, 1.0, 2.0], bad) for bad in (0.0, -0.1, 1.5)],
+    "name,bad,valid",
+    [
+        ("top_n_sigma", -1.0, 1.0),
+        ("typical_p", 0.0, 0.3),
+        ("typical_p", 1.5, 0.3),
+        ("min_p", -1.0, 0.1),
+        ("top_k", -5, 3),
+    ],
 )
-def test_sampling_filter_rejects_invalid_parameter(name, logits, bad):
-    with pytest.raises(ValueError):
-        mx.eval(getattr(sampling, f"apply_{name}")(mx.array(logits), bad))
-
-
-@pytest.mark.parametrize("name,bad,valid", [("min_p", -1.0, 0.1), ("top_k", -5, 3)])
 def test_sampling_validation_does_not_corrupt_compile(name, bad, valid):
     """A parameter error must leave MLX tracing usable by subsequent sampling."""
     logits = mx.array([[1.0, 2.0, 3.0, 4.0, 5.0]])

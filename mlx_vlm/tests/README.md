@@ -57,26 +57,29 @@ against `f7de22df`, retaining both JSON files. Its full-suite execution sets wer
 80,634 production lines and 12,715 branch outcomes, with no lost or added paths.
 That validation reported 1,852 passed, five skipped, and 41 passing subtests.
 These are measured execution sets, not complete production coverage. The earlier
-pruning tradeoffs still apply. The suite now contains 26,492 Python lines plus
-2,142 readable JSON lines, or 28,634 combined.
+pruning tradeoffs still apply. The suite now contains 26,487 Python lines plus
+2,142 readable JSON lines, or 28,629 combined.
 
 After removing the unused cache helper and redundant standalone mask test, the
 full suite reports 1,875 passed, five skipped, and 41 passing subtests. Coverage
 against `66f67781` retains exactly 80,919 production lines and 12,819 branch
 outcomes, with no lost or added paths.
 
-Sampling checks share `test_generate.py`, which contains 1,882 lines after a
-71-line reduction across generation and sampling tests. Parameterized runners
+Sampling checks share `test_generate.py`, which contains 1,877 lines after a
+76-line reduction across generation and sampling tests. Parameterized runners
 retain top-p shape/dtype checks, sampler survivor sets, invalid parameters,
 post-error compiled sampling, and the shared AR/server positioned-sampler
 contract. Independent NumPy references retain all 40 trials per filter and the
-existing numerical boundary tolerances. Grouped assertions now collect as
-20 sampling cases instead of 16, with all 117 combined generation cases passing.
-Focused coverage against `7c803f24` retains exactly 6,908 production lines and
-717 branch outcomes, with no lost or added paths.
-The full suite reports 1,879 passed, five skipped, and 39 passing subtests;
+existing numerical boundary tolerances. The peaked p-less assertion shares its
+reference test; invalid parameters and post-error sampling share one runner.
+Removing the duplicate float32 filtered-shape and negative typical-p variants
+reduces 20 sampling cases across seven functions to 17 across five, saving five
+more lines against `c9b35c2d`. All 114 generation cases pass. Focused coverage
+retains exactly 6,908 production lines and 717 branch outcomes, with no lost or
+added paths. Two former subtests now run as parameterized cases.
+The full suite reports 1,876 passed, five skipped, and 39 passing subtests;
 its execution sets remain 80,919 production lines and 12,819 branch outcomes,
-with no lost or added paths. Two former subtests now run as parameterized cases.
+with no lost or added paths.
 
 `test_tool_parsers.py` discovers modules under `mlx_vlm.tools.parsers` and imports
 them through `load_tool_module`. Add a literal native-format example to
