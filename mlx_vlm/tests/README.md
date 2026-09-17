@@ -162,8 +162,7 @@ imported dynamically under `mlx_vlm.models`. Model/component construction and
 APC assertions remain in Python; these profiles do not add model-contract cases.
 
 APC tests and their helpers now share `test_cache.py` with the cache lifecycle
-and TurboQuant checks. See [APC coverage](apc_coverage.md) for the earlier
-compaction measurements, pruned checks, and retained tolerances.
+and TurboQuant checks.
 
 For a contract case, `module` names the module under `mlx_vlm.models`, `config`
 contains ordinary nested model settings, and `checks` lists check names in order:
@@ -342,8 +341,7 @@ Module names, config classes and named profiles live under `shared_configs` in
 `model_cases.json`; `tiny_defaults` supplies common values. Training/checkpoint
 settings stay distinct from language/inference variants, and explicit overrides
 apply last. The preceding factory-only refactor saved four combined Python/JSON
-lines; see [speculative_coverage.md](speculative_coverage.md) for that measurement
-and earlier speculative pruning.
+lines.
 
 `test_cli.py` contains **498 formatted lines**, down from 938 at `9383ef6c`
 (440 lines / 46.9% fewer), with **37 collected cases** before and after.
@@ -457,8 +455,7 @@ within the suite. `test_models.tiny_config` supplies fresh JSON-backed configs
 for speculative and training tests. `test_speculative.py` also owns MiniMax
 speculative rollback checks; unrelated model tests remain in their existing
 modules. Cache/position, sampling-parity, and batched-mask checks run through
-shared contract runners. See [coverage measurements](speculative_coverage.md)
-for the retained coverage and remaining gaps from the compact rewrite.
+shared contract runners.
 
 `test_diffusion_models.py` owns the shared DiffusionGemma helpers for tiny configs,
 model construction, tokenization, encoder recording, and stream calls. CLI, APC,
@@ -487,8 +484,7 @@ response-template tool checks retain both Chat streaming and Anthropic responses
 Keep parser extraction in `test_tool_parsers.py` and prompt-only image placement
 in `test_prompt_utils.py`; Responses conversion and stream filtering stay here.
 Realtime doubles expose the event fields consumed by the server without importing
-a model-specific event class. See [server coverage measurements](server_coverage.md)
-for the current line counts and exact coverage comparison.
+a model-specific event class.
 The audio HTTP and realtime checks also live here. `audio_client` depends on
 `reset_audio_runtime` to isolate model caches, metrics, and audio-queue shutdown;
 `realtime_client` owns the voice engine lifecycle. These fixtures are scoped to
