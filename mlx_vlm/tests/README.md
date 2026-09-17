@@ -34,8 +34,7 @@ Use a module path or `-k` to select a smaller group while developing.
 | `test_speculative_masks_static.py` | Gemma assistant mask offsets with fake dependencies, without importing MLX |
 | `test_rope.py` | Rotary embeddings, multimodal position IDs, and batched offsets |
 | `test_audio_generation.py` | Audio generation, loading, downmixing, and resampling |
-| `test_server.py` | Chat/Responses/Anthropic APIs, image endpoints, batching/cancellation, runtime settings, reranking, Responses normalization, and tool stream state |
-| `test_server_audio.py` | HTTP audio endpoints and realtime voice sessions |
+| `test_server.py` | Chat/Responses/Anthropic APIs, image endpoints, batching/cancellation, runtime settings, reranking, Responses normalization, tool stream state, HTTP audio, and realtime voice sessions |
 | `test_cli.py` | Text/image/audio/video CLI routing, arguments, diffusion display/visualizer behavior, detector display options, and CLI/library default parity |
 | `test_sample_utils.py` | Sampling distributions and shared contracts for AR/server positioned samplers |
 | `test_prompt_utils.py` | Prompt construction and reasoning-template arguments |
@@ -47,7 +46,7 @@ Use a module path or `-k` to select a smaller group while developing.
 | `test_tokenizer_utils.py` | Streaming detokenizers, decoder detection, and tokenizer wrappers |
 | `test_smoke.py` | Manual model-download runner, excluded from automated collection |
 
-The suite has 30 test modules. Attention checks share `test_attention.py`;
+The suite has 29 test modules. Attention checks share `test_attention.py`;
 Qwen3.5 patch-weight sanitization lives with loading checks in `test_utils.py`.
 Responses normalization and tool-stream finalization share `test_server.py`;
 structured-output processors share `test_generate.py`. Vision LRU checks live in
@@ -60,8 +59,8 @@ against `f7de22df`, retaining both JSON files. Its full-suite execution sets wer
 80,634 production lines and 12,715 branch outcomes, with no lost or added paths.
 That validation reported 1,852 passed, five skipped, and 41 passing subtests.
 These are measured execution sets, not complete production coverage. The earlier
-pruning tradeoffs still apply. The suite now contains 26,754 Python lines plus
-2,142 readable JSON lines, or 28,896 combined.
+pruning tradeoffs still apply. The suite now contains 26,737 Python lines plus
+2,142 readable JSON lines, or 28,879 combined.
 
 `test_tool_parsers.py` discovers modules under `mlx_vlm.tools.parsers` and imports
 them through `load_tool_module`. Add a literal native-format example to
@@ -140,6 +139,16 @@ same file. Reuse `_endpoint` and the request/result builders for API checks;
 a recording batch implementation. Parameterize protocol and model variants while
 keeping response assertions, cancellation, tokenizer locking, and cache lifecycle
 checks explicit. No separate server fixture module is needed.
+The audio HTTP and realtime checks also live here. `audio_client` depends on
+`reset_audio_runtime` to isolate model caches, metrics, and audio-queue shutdown;
+`realtime_client` owns the voice engine lifecycle. These fixtures are scoped to
+their tests and do not change the ordinary server client's setup.
+
+The audio merge against `c6997db7` retains all 14 moved cases and all 208 combined
+server cases, removing one file and 17 Python lines. Isolated coverage is unchanged:
+10,563 production lines and 1,665 branch outcomes. Full-suite execution sets also
+remain 80,919 lines and 12,819 branch outcomes, with no lost or added paths;
+1,876 tests pass with the same five skips and 41 passing subtests.
 
 `test_image_generation_models.py` owns the six image-generation families and
 keeps checkpoint writers, pipeline doubles, and tiny quantization models in the
@@ -175,7 +184,7 @@ guidance, position, VAE, and numerical assertions next to the shared contracts,
 including Z-Image padding and Ernie conditioning. CLI routing and request
 forwarding for every output modality live in `test_cli.py`; image HTTP endpoints
 stay in `test_server.py`. Audio transcription formats and translation share a
-request runner in `test_server_audio.py`. Loading tests share checkpoint patches
+request runner in `test_server.py`. Loading tests share checkpoint patches
 and model doubles in `test_utils.py`, with parameterized quantization policies.
 
 ## JSON model cases
