@@ -20,6 +20,7 @@ from .common import (
     PromptCacheState,
     generation_stream,
     maybe_quantize_kv_cache,
+    resolve_generation_sampling_defaults,
     wired_limit,
 )
 from .dispatch import generate, stream_generate
@@ -105,6 +106,7 @@ __all__ = [
     "load_video_generation_model",
     "main",
     "maybe_quantize_kv_cache",
+    "resolve_generation_sampling_defaults",
     "parse_arguments",
     "save_audio",
     "save_video",

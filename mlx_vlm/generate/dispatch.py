@@ -40,6 +40,7 @@ from .common import (
     DEFAULT_TOP_P,
     GenerationResult,
     generation_stream,
+    resolve_generation_sampling_defaults,
     wired_limit,
 )
 from .image import (
@@ -393,21 +394,30 @@ def parse_arguments():
     parser.add_argument(
         "--temperature",
         type=float,
-        default=DEFAULT_TEMPERATURE,
-        help="Temperature for sampling.",
+        default=None,
+        help=(
+            "Temperature for sampling. Defaults to the checkpoint's generation "
+            f"config, or {DEFAULT_TEMPERATURE:g} when unspecified."
+        ),
     )
     parser.add_argument(
         "--top-p",
         type=float,
-        default=DEFAULT_TOP_P,
-        help="Nucleus sampling: keep the smallest set of tokens whose "
-        "probabilities sum to this. 1.0 disables it.",
+        default=None,
+        help=(
+            "Nucleus sampling: keep the smallest set of tokens whose "
+            "probabilities sum to this. Defaults to the checkpoint's "
+            f"generation config, or {DEFAULT_TOP_P:g}."
+        ),
     )
     parser.add_argument(
         "--top-k",
         type=int,
-        default=DEFAULT_TOP_K,
-        help="Keep only the k most probable tokens. 0 disables it.",
+        default=None,
+        help=(
+            "Keep only the k most probable tokens. Defaults to the checkpoint's "
+            f"generation config, or {DEFAULT_TOP_K}."
+        ),
     )
     parser.add_argument(
         "--min-p",
@@ -863,6 +873,15 @@ def stream_generate(
     )
 
     if is_diffusion_model(model, kwargs):
+        # Diffusion generation has its own config-driven defaults. Keep the
+        # legacy CLI behavior for omitted sampling flags instead of passing
+        # ``None`` through the diffusion adapter.
+        if kwargs.get("temperature") is None:
+            kwargs["temperature"] = DEFAULT_TEMPERATURE
+        if kwargs.get("top_p") is None:
+            kwargs["top_p"] = DEFAULT_TOP_P
+        if kwargs.get("top_k") is None:
+            kwargs["top_k"] = DEFAULT_TOP_K
         yield from stream_diffusion_generate_from_kwargs(
             model,
             processor,
@@ -876,6 +895,15 @@ def stream_generate(
             verbose=verbose,
         )
         return
+
+    kwargs["temperature"], kwargs["top_p"], kwargs["top_k"] = (
+        resolve_generation_sampling_defaults(
+            getattr(model, "config", None),
+            temperature=kwargs.get("temperature"),
+            top_p=kwargs.get("top_p"),
+            top_k=kwargs.get("top_k"),
+        )
+    )
 
     # Vision feature caching: reuse cached image features across turns
     if vision_cache is not None and image is not None and pixel_values is not None:
@@ -1199,7 +1227,8 @@ def generate(
        model (nn.Module): The language model.
        tokenizer (PreTrainedTokenizer): The tokenizer.
        prompt (str): The string prompt.
-       temperature (float): The temperature for sampling (default 0).
+       temperature (float): The temperature for sampling. When omitted, the
+           checkpoint generation config is used, falling back to 0.
        max_tokens (int): The maximum number of tokens (default 100).
        verbose (bool): If ``True``, print tokens and timing information
            (default ``False``).
