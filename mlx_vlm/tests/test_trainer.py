@@ -27,9 +27,7 @@ from mlx_vlm.trainer.utils import (
     find_all_linear_names,
     get_peft_model,
 )
-from mlx_vlm.utils import (
-    load,
-)
+from mlx_vlm.utils import load
 
 # Training workflows, adapter loading and numerical gradient contracts.
 

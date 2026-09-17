@@ -16,10 +16,7 @@ from mlx_vlm.generate.common import GenerationResult
 from mlx_vlm.generate.dispatch import stream_generate
 from mlx_vlm.models.cache import StaticPrefixKVCache
 from mlx_vlm.tokenizer_utils import NaiveStreamingDetokenizer
-from mlx_vlm.utils import (
-    StoppingCriteria,
-    load_config,
-)
+from mlx_vlm.utils import StoppingCriteria, load_config
 
 # Text diffusion model, generation, numerical parity, and vision contracts.
 

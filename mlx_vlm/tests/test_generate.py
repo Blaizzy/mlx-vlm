@@ -38,11 +38,7 @@ from mlx_vlm.models.cache import (
     RotatingKVCache,
 )
 from mlx_vlm.structured import ThinkingAwareLogitsProcessor
-from mlx_vlm.utils import (
-    StoppingCriteria,
-    ThinkingBudgetCriteria,
-    load_processor,
-)
+from mlx_vlm.utils import StoppingCriteria, ThinkingBudgetCriteria, load_processor
 
 # Generation, sampling, stopping criteria, structured logits, and thinking state.
 
