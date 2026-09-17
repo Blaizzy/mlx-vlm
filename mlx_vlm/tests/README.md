@@ -17,6 +17,7 @@ Use a module path or `-k` to select a smaller group while developing.
 | Test module | Scope |
 | --- | --- |
 | `test_models.py` + `model_cases.json` | Shared language, vision, audio, projector, embedding, position, and native forward/cache contracts |
+| `test_image_generation_models.py` | Bonsai, Flux2, Ideogram4, Z-Image, ERNIE Image, and Mage Flow generation/editing, components, loading, and conversion |
 | `test_diffusion_models.py` | LLaDA, Nemotron, and DiffusionGemma model/generation contracts, including sampling, prefill, caches, numerical parity, self-conditioning, vision, sanitization, and quantization policy |
 | `test_tool_parsers.py` | ATEM, Cohere, Gemma 4, GLM, Mistral, Pythonic parsing, and parser selection |
 | `test_apc.py` | Cache lookup, semantic keys, lifecycle, trace logging, and diagnostics |
@@ -78,6 +79,14 @@ same file. Reuse `_endpoint` and the request/result builders for API checks;
 a recording batch implementation. Parameterize protocol and model variants while
 keeping response assertions, cancellation, tokenizer locking, and cache lifecycle
 checks explicit. No separate server fixture module is needed.
+
+`test_image_generation_models.py` owns the six image-generation families and
+keeps checkpoint writers, packed-pipeline doubles, and tiny quantization models
+in the same file. Reuse the parameterized discovery, dimension, download,
+conversion, and weight-loading checks with descriptive family IDs. Retain
+family-specific prompt, guidance, position, VAE, and numerical assertions next to
+the shared contracts. Image CLI routing and request forwarding live in
+`test_generate.py`; image HTTP endpoints stay in `test_server.py`.
 
 ## JSON model cases
 

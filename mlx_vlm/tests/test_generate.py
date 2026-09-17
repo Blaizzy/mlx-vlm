@@ -1445,42 +1445,58 @@ def test_generate_image_cli_routes_before_vlm_load():
     mock_load.assert_not_called()
 
 
-def test_generate_image_cli_edit_task_loads_edit_model_and_saves_output(tmp_path):
-    output_path = tmp_path / "edited.png"
+@pytest.mark.parametrize("task", ["edit", "generate"])
+def test_image_cli_request_and_output(tmp_path, task):
+    edit = task == "edit"
+    output = tmp_path / ("edited.png" if edit else "image.png")
+    extras = (
+        {}
+        if edit
+        else dict(
+            gen_kwargs={"sampler_preset": "V4_TURBO_12"},
+            prompt_expansion_model="tiny-text-model",
+        )
+    )
     args = Namespace(
-        model="black-forest-labs/FLUX.2-klein-9b-kv",
-        task="edit",
-        image=["reference.png"],
-        prompt=["add", "sunglasses"],
-        output=str(output_path),
-        size="256x512",
-        steps=2,
+        model=(
+            "black-forest-labs/FLUX.2-klein-9b-kv"
+            if edit
+            else "ideogram-ai/ideogram-4-fp8"
+        ),
+        task=task,
+        prompt=["add", "sunglasses"] if edit else ["caption"],
+        image=["reference.png"] if edit else None,
+        output=str(output),
+        size="256x512" if edit else "256x256",
+        steps=2 if edit else 4,
         seed=7,
         guidance=1.0,
+        **extras,
     )
     result = SimpleNamespace(
-        path=output_path,
+        path=output,
         seed=7,
         width=256,
-        height=512,
-        steps=2,
-        variant="flux2-klein-9b-kv",
+        height=512 if edit else 256,
+        steps=2 if edit else 12,
+        variant="flux2-klein-9b-kv" if edit else "ideogram-4-fp8",
     )
-    model = SimpleNamespace()
-
     with (
-        patch.object(image_module, "load_image_model", return_value=model),
-        patch.object(image_module, "generate_image", return_value=result) as mock_edit,
+        patch.object(image_module, "load_image_model", return_value=object()),
+        patch.object(image_module, "generate_image", return_value=result) as generate,
     ):
         image_module.run_image_generation_cli(args)
-
-    edit_request = mock_edit.call_args.args[1]
-    assert edit_request.prompt == "add sunglasses"
-    assert edit_request.image_paths == ("reference.png",)
-    assert edit_request.width == 256
-    assert edit_request.height == 512
-    assert mock_edit.call_args.kwargs["task"] == "edit"
-    assert mock_edit.call_args.kwargs["output_path"] == output_path
+    request = generate.call_args.args[1]
+    if edit:
+        assert request.prompt == "add sunglasses"
+        assert request.image_paths == ("reference.png",)
+        assert (request.width, request.height) == (256, 512)
+    else:
+        assert request.extra == dict(
+            sampler_preset="V4_TURBO_12", prompt_expansion_model="tiny-text-model"
+        )
+    assert generate.call_args.kwargs["task"] == task
+    assert generate.call_args.kwargs["output_path"] == output
 
 
 def test_cached_prefix_rope_failure_falls_back_to_cold(caplog):
