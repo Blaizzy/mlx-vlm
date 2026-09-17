@@ -873,6 +873,9 @@ def _extend_cache(cache_a, cache_b):
             ca = ca.__class__.merge([ca])
         if not _is_batch_cache_entry(cb) and hasattr(cb.__class__, "merge"):
             cb = cb.__class__.merge([cb])
+        for entry in (ca, cb):
+            if not callable(getattr(entry, "extend", None)):
+                raise ValueError(f"{type(entry)} does not yet support batching")
         ca.extend(cb)
         extended.append(ca)
     return extended
