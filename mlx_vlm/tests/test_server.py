@@ -104,6 +104,19 @@ def _input_message(text, role="user"):
     return _msg([dict(type="input_text", text=text)], role, type="message")
 
 
+def _input_image(url, **options):
+    return dict(type="input_image", image_url=url, **options)
+
+
+def _function_result(output, name=None, call_id="call_view_image"):
+    items = (
+        [dict(type="function_call", name=name, arguments="{}", call_id=call_id)]
+        if name
+        else []
+    )
+    return [*items, dict(type="function_call_output", call_id=call_id, output=output)]
+
+
 def _chat_request(**options):
     return server.ChatRequest(model="demo", messages=[_msg("hi")], **options)
 
@@ -218,6 +231,29 @@ def _endpoint(
             stream=streaming,
             config=config,
         )
+
+
+def _stream_response(
+    client,
+    tokens,
+    api="/chat/completions",
+    *,
+    prompt_tokens=3,
+    endpoint=None,
+    **payload,
+):
+    with _endpoint(generator=_streaming(tokens, prompt_tokens), **(endpoint or {})):
+        return _post(client, api, stream=True, **payload)
+
+
+def _chat_events(response, reason):
+    chunks = _data(response)
+    choices = [chunk for chunk in chunks if chunk.get("choices")]
+    usage = next(chunk for chunk in chunks if chunk.get("usage") is not None)
+    finish = next(
+        chunk for chunk in choices if chunk["choices"][0]["finish_reason"] == reason
+    )
+    return choices, usage, finish
 
 
 def _assert_fields(actual, **expected):
@@ -431,15 +467,6 @@ def test_invalid_tool_choice(client, api, choice, tools, detail):
     else:
         assert detail in payload["detail"]
         fake.cache.assert_not_called()
-
-
-def test_server_passes_top_k_to_positioned_sampler():
-    generator = Generator.__new__(Generator)
-    args = generation.GenerationArguments(max_tokens=1, temperature=1.0, top_k=7)
-
-    sampler = generator._make_sampler(args)
-
-    assert sampler.top_k == 7
 
 
 def test_speculative_server_reads_batch_coalesce_env(monkeypatch):
@@ -1074,21 +1101,9 @@ def test_responses_endpoint_places_function_output_image_after_tool_result(clien
         response = _post(
             client,
             "/responses",
-            input=[
-                dict(
-                    type="function_call",
-                    name="view_image",
-                    arguments="{}",
-                    call_id="call_view_image",
-                ),
-                dict(
-                    type="function_call_output",
-                    call_id="call_view_image",
-                    output=[
-                        dict(type="input_image", image_url=image_url, detail="high")
-                    ],
-                ),
-            ],
+            input=_function_result(
+                [_input_image(image_url, detail="high")], name="view_image"
+            ),
         )
     assert response.status_code == 200
     prompt = fake.generate.call_args.kwargs["prompt"]
@@ -1100,13 +1115,7 @@ def test_responses_endpoint_rejects_image_file_id(client):
     response = _post(
         client,
         "responses",
-        input=[
-            dict(
-                type="function_call_output",
-                call_id="call_view_image",
-                output=[dict(type="input_image", file_id="file-image")],
-            )
-        ],
+        input=_function_result([dict(type="input_image", file_id="file-image")]),
     )
     assert response.status_code == 400
     assert (
@@ -1337,27 +1346,15 @@ def test_chat_completions_streaming_emits_timings_on_finish(client):
         _token(text, i, finish, prompt_tps=20.0, cached_tokens=2)
         for i, (text, finish) in enumerate([("hi", None), ("!", "stop")])
     ]
-    with _endpoint(generator=_streaming(tokens, 10)):
-        response = _post(
-            client,
-            "/chat/completions",
-            stream=True,
-            stream_options={"include_usage": True},
-        )
-    chunks = _data(response)
-    usage = next(c for c in chunks if c.get("usage") is not None)
+    response = _stream_response(
+        client, tokens, prompt_tokens=10, stream_options={"include_usage": True}
+    )
+    choices, usage, final = _chat_events(response, "stop")
     assert usage["choices"] == [] and usage["timings"]["cache_n"] == 2
     assert usage["usage"]["prompt_tokens_details"]["cached_tokens"] == 2
-    tokens = [
-        c
-        for c in chunks
-        if c["choices"] and c["choices"][0]["delta"].get("content") is not None
-    ]
+    tokens = [c for c in choices if c["choices"][0]["delta"].get("content") is not None]
     assert tokens[0]["timings"]["predicted_per_second"] is None
     assert tokens[1]["timings"]["predicted_per_second"] > 0
-    final = next(
-        c for c in chunks if c["choices"] and c["choices"][0]["finish_reason"] == "stop"
-    )
     assert final["timings"]["predicted_per_second"] > 0
     assert (
         usage["timings"]["predicted_per_second"]
@@ -1369,27 +1366,20 @@ def test_chat_completions_streaming_response_template_tool_calls(client):
     from mlx_vlm.tools.parsers import atem
 
     token = _token(_MUSE_CALL, finish_reason="stop", prompt_tps=20, cached_tokens=2)
-    with _endpoint(
-        model_type="muse_glimmer",
-        processor=NS(tokenizer=_MuseResponseTemplateTokenizer()),
-        generator=_streaming([token], 10),
-        parser=atem,
-    ):
-        response = _post(
-            client,
-            "/chat/completions",
-            tools=[_tool()],
-            stream=True,
-            stream_options={"include_usage": True},
-        )
-    chunks = _data(response)
-    tool = next(
-        c
-        for c in chunks
-        if c["choices"] and c["choices"][0]["finish_reason"] == "tool_calls"
+    response = _stream_response(
+        client,
+        [token],
+        prompt_tokens=10,
+        endpoint=dict(
+            model_type="muse_glimmer",
+            processor=NS(tokenizer=_MuseResponseTemplateTokenizer()),
+            parser=atem,
+        ),
+        tools=[_tool()],
+        stream_options={"include_usage": True},
     )
-    usage = next(c for c in chunks if c.get("usage") is not None)
-    deltas = _deltas(response)
+    choices, usage, tool = _chat_events(response, "tool_calls")
+    deltas = [c["choices"][0]["delta"] for c in choices]
     call = tool["choices"][0]["delta"]["tool_calls"][0]["function"]
     assert tool.get("usage") is None and call["name"] == "get_weather"
     assert json.loads(call["arguments"]) == {"city": "Warsaw"}
@@ -1494,17 +1484,15 @@ def test_anthropic_thinking_markers(client, custom):
         if custom
         else {}
     )
-    with _endpoint(
-        model_type="custom" if custom else "gemma4", generator=_streaming(tokens)
-    ):
-        response = _post(
-            client,
-            "messages",
-            max_tokens=16,
-            stream=True,
-            enable_thinking=True,
-            **options,
-        )
+    response = _stream_response(
+        client,
+        tokens,
+        "messages",
+        endpoint=dict(model_type="custom" if custom else "gemma4"),
+        max_tokens=16,
+        enable_thinking=True,
+        **options,
+    )
     assert _thinking_text(response, "messages") == (
         ("Custom reasoning.", "Custom answer.") if custom else ("", "7 * 8 = 56")
     )
@@ -1516,13 +1504,13 @@ def test_anthropic_messages_streaming_emits_tool_use_events(client):
         '<tool_call>{"name":"get_weather","arguments":{"location":"SF"}}</tool_call> After the call.',
         finish_reason="stop",
     )
-    with _endpoint(generator=_streaming([token]), parser=_JSON_TOOLS):
-        response = _post(
-            client,
-            "messages",
-            tools=[_tool(api="messages")],
-            stream=True,
-        )
+    response = _stream_response(
+        client,
+        [token],
+        "messages",
+        endpoint=dict(parser=_JSON_TOOLS),
+        tools=[_tool(api="messages")],
+    )
     assert response.status_code == 200
     for fragment in (
         '"type": "tool_use"',
@@ -1987,8 +1975,16 @@ class TestResponseGenerator:
                 {0: " hello", 1: "world", 2: "!"}[t] for t in tokens
             ).lstrip(),
         )
-        items = _step_tokens(tokenizer, [(0, None), (1, None), (2, None), (99, "stop")])
-        assert [t.text for t in items if t is not None] == ["hello", "world", "!", ""]
+        items = _step_tokens(
+            tokenizer,
+            [(0, None), (1, None), (2, None), (99, "stop")],
+            progress=[NS(uid=1, prompt_tps=184.431, cached_tokens=7)],
+        )
+        assert [t.text for t in items[:-1]] == ["hello", "world", "!", ""]
+        assert items[-1] is None
+        _assert_fields(
+            vars(items[0]), prompt_tps=pytest.approx(184.431), cached_tokens=7
+        )
 
     def test_finalize_flushes_incomplete_utf8(self):
         tokenizer = NS(
@@ -2059,18 +2055,6 @@ class TestResponseGenerator:
         assert [b.kwargs["sampler"] for b in batches] == ["sampler-0.0", "sampler-0.6"]
         assert batches[0].closed
 
-    def test_step_attaches_prompt_metrics(self):
-        tokenizer = NS(vocab={"hi": 0}, decode=lambda tokens: "hi" if tokens else "")
-        progress = [NS(uid=1, prompt_tps=184.431, cached_tokens=7)]
-        items = _step_tokens(
-            tokenizer, [(0, "stop")], progress=progress, trim_space=False
-        )
-        assert (
-            items[0].prompt_tps == pytest.approx(184.431)
-            and items[0].cached_tokens == 7
-        )
-        assert items[1:] == [None]
-
     def test_generate_arguments_to_generate_kwargs(self):
         args = Args()
         _assert_fields(
@@ -2098,8 +2082,9 @@ class TestResponseGenerator:
             thinking_end_token="</think>",
             logits_processors=[lambda t, logits: logits],
         )
-        kwargs = Args(**options, tenant_id="tenant-a").to_generate_kwargs()
-        _assert_fields(kwargs, **options, apc_tenant="tenant-a")
+        args = Args(**options, tenant_id="tenant-a")
+        _assert_fields(args.to_generate_kwargs(), **options, apc_tenant="tenant-a")
+        assert _generator()._make_sampler(args).top_k == options["top_k"]
 
     @pytest.mark.parametrize(
         "ids,wrapped",
@@ -2163,44 +2148,30 @@ class TestResponseGenerator:
             _assert_fields(vars(server._build_gen_args(legacy)), **expected)
 
     def test_server_cli_sets_thinking_defaults(self, monkeypatch):
-        settings = dict(
-            MODEL="demo",
-            IMAGE_MODEL="image-demo",
-            TTS_MODEL="tts-demo",
-            STT_MODEL="stt-demo",
-            RERANKER_MODEL="reranker-demo",
-        )
-        expected = {"MLX_VLM_PRELOAD_" + k: v for k, v in settings.items()}
-        expected.update(
-            MLX_VLM_ENABLE_THINKING="1",
-            MLX_VLM_THINKING_BUDGET="128",
-            MLX_VLM_THINKING_START_TOKEN="<|START_THINKING|>",
-            MLX_VLM_THINKING_END_TOKEN="<|END_THINKING|>",
-            MLX_VLM_MODEL_DISCOVERY="served",
-            MLX_VLM_SERVER_API_KEY="admin-token",
-        )
         flags = [
-            arg
-            for k, v in settings.items()
-            for arg in ("--" + k.lower().replace("_", "-"), v)
+            ("model", "PRELOAD_MODEL", "demo"),
+            ("image-model", "PRELOAD_IMAGE_MODEL", "image-demo"),
+            ("tts-model", "PRELOAD_TTS_MODEL", "tts-demo"),
+            ("stt-model", "PRELOAD_STT_MODEL", "stt-demo"),
+            ("reranker-model", "PRELOAD_RERANKER_MODEL", "reranker-demo"),
+            ("thinking-budget", "THINKING_BUDGET", "128"),
+            ("thinking-start-token", "THINKING_START_TOKEN", "<|START_THINKING|>"),
+            ("thinking-eos-token", "THINKING_END_TOKEN", "<|END_THINKING|>"),
+            ("model-discovery", "MODEL_DISCOVERY", "served"),
+            ("api-key", "SERVER_API_KEY", "admin-token"),
         ]
-        options = dict(
-            host="127.0.0.1",
-            port="8080",
-            model_discovery="served",
-            thinking_budget="128",
-            thinking_start_token="<|START_THINKING|>",
-            thinking_eos_token="<|END_THINKING|>",
-            api_key="admin-token",
-        )
-        flags += [
-            arg
-            for key, value in options.items()
-            for arg in ("--" + key.replace("_", "-"), value)
+        expected = {"MLX_VLM_" + env: value for _, env, value in flags}
+        expected["MLX_VLM_ENABLE_THINKING"] = "1"
+        argv = [
+            "mlx_vlm.server",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "8080",
+            "--enable-thinking",
         ]
-        monkeypatch.setattr(
-            sys, "argv", ["mlx_vlm.server", *flags, "--enable-thinking"]
-        )
+        argv += [arg for flag, _, value in flags for arg in ("--" + flag, value)]
+        monkeypatch.setattr(sys, "argv", argv)
         with patch.dict(os.environ), patch.object(cli.uvicorn, "run") as run:
             for key in [
                 *expected,
@@ -2328,16 +2299,17 @@ class TestResponseGenerator:
 
 
 @pytest.mark.parametrize(
-    "text,preopened,expected",
+    "text,preopened,expected,tags",
     [
-        ("<think>Thinking.</think>Answer.", False, ("Thinking.", "Answer.")),
-        ("got it<channel|>42", False, ("got it", "42")),
-        ("thought\ngot it<channel|>42", False, ("got it", "42")),
-        ("Unterminated reasoning", True, ("Unterminated reasoning", "")),
+        ("<think>Thinking.</think>Answer.", False, ("Thinking.", "Answer."), 2),
+        ("got it<channel|>42", False, ("got it", "42"), 0),
+        ("thought\ngot it<channel|>42", False, ("got it", "42"), 0),
+        ("Unterminated reasoning", True, ("Unterminated reasoning", ""), 0),
     ],
 )
-def test_split(text, preopened, expected):
+def test_thinking_text(text, preopened, expected, tags):
     assert server._split_thinking(text, starts_in_thinking=preopened) == expected
+    assert server._count_thinking_tag_tokens(text) == tags
 
 
 def _feed_thinking(state, chunks, last=False):
@@ -2432,10 +2404,6 @@ def test_minicpm5_multiple_calls_and_streamed_markup():
     )
 
 
-def test_think_tags():
-    assert server._count_thinking_tag_tokens("<think>text</think>answer") == 2
-
-
 def test_kv_bits_independent_of_model_path(monkeypatch):
     monkeypatch.setenv("KV_BITS", "3.5")
     monkeypatch.setenv("MAX_KV_SIZE", "0")
@@ -2487,26 +2455,6 @@ class TestRuntimeConfig:
         monkeypatch.setattr(server.runtime.config, "max_kv_size", None)
         monkeypatch.delenv("MAX_KV_SIZE", raising=False)
         assert generation.get_configured_context_limit() is None
-
-    def test_settings_patch_replace_semantics(self, client, monkeypatch):
-        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
-        cfg = server.runtime.config
-        assert cfg.apc_enabled is False
-
-        client.patch(
-            "/v1/settings", json={"kv_quant_scheme": "turboquant", "apc_enabled": True}
-        )
-        assert cfg.kv_quant_scheme == "turboquant"
-        assert cfg.apc_enabled is True
-
-        r = client.patch(
-            "/v1/settings",
-            json={"op": "replace", "values": {"kv_quant_scheme": "uniform"}},
-        )
-        body = r.json()
-        assert body["op"] == "replace"
-        assert cfg.kv_quant_scheme == "uniform"
-        assert cfg.apc_enabled is False
 
 
 def test_runtime_config_enum_knobs_reject_invalid():
@@ -2768,24 +2716,12 @@ def test_pipeline_preserves_nemo_segments():
         _transcription_result_from_chunks,
     )
 
+    token = dict(id=1, text="Hello", start=0.0, duration=0.4, end=0.4)
     aligned = _FakeAlignedResult(
         "Hello world. Bye.",
         [
-            dict(
-                text="Hello world.",
-                start=0.0,
-                end=0.9,
-                tokens=[
-                    dict(id=1, text="Hello", start=0.0, duration=0.4, end=0.4),
-                    dict(id=2, text=" world.", start=0.4, duration=0.5, end=0.9),
-                ],
-            ),
-            dict(
-                text="Bye.",
-                start=1.0,
-                end=1.3,
-                tokens=[dict(id=3, text="Bye.", start=1.0, duration=0.3, end=1.3)],
-            ),
+            dict(text="Hello world.", start=0.0, end=0.9, tokens=[token]),
+            dict(text="Bye.", start=1.0, end=1.3),
         ],
     )
     chunks = [
@@ -2880,9 +2816,12 @@ def settings_client(monkeypatch, tmp_path):
 
 def test_apc_patch_reaches_next_model_request(settings_client, tmp_path):
     client, generators = settings_client
+    cfg = server.runtime.config
+    assert cfg.apc_enabled is False
     server.get_cached_model("demo")
     assert server.runtime.apc_manager is None
     settings = {
+        "kv_quant_scheme": "turboquant",
         "apc_enabled": True,
         "apc_disk_enabled": True,
         "apc_disk_path": str(tmp_path / "live"),
@@ -2902,6 +2841,7 @@ def test_apc_patch_reaches_next_model_request(settings_client, tmp_path):
     assert response.json()["applied"] == settings
     assert response.json()["rejected"] == []
     assert response.json()["reload_kinds"] == ["text_generation"]
+    assert cfg.kv_quant_scheme == "turboquant" and cfg.apc_enabled is True
     assert len(generators) == 1  # Configuration changes apply at the next load.
 
     body = client.get("/v1/settings").json()
@@ -2930,7 +2870,11 @@ def test_apc_patch_reaches_next_model_request(settings_client, tmp_path):
     assert server.runtime.apc_manager.memory_max_bytes == 0
     assert all(not thread.is_alive() for thread in manager.disk._workers)
 
-    client.patch("/v1/settings", json={"apc_enabled": False})
+    body = client.patch(
+        "/v1/settings", json={"op": "replace", "values": {"kv_quant_scheme": "uniform"}}
+    ).json()
+    assert body["op"] == "replace"
+    assert cfg.kv_quant_scheme == "uniform" and cfg.apc_enabled is False
     server.get_cached_model("demo")
     assert server.runtime.apc_manager is None
     assert client.get("/v1/cache/stats").json() == {"enabled": False}
@@ -3070,18 +3014,11 @@ def test_function_output_preserves_visual_input(mixed_text):
             {"type": "image_url", "image_url": {"url": image_url}},
         ]
         if mixed_text
-        else [{"type": "input_image", "image_url": image_url, "detail": "high"}]
+        else [_input_image(image_url, detail="high")]
     )
-    items = (
-        []
-        if mixed_text
-        else [
-            dict(
-                type="function_call", name="view_image", arguments="{}", call_id=call_id
-            )
-        ]
+    items = _function_result(
+        output, name=None if mixed_text else "view_image", call_id=call_id
     )
-    items.append(dict(type="function_call_output", call_id=call_id, output=output))
     messages, images = _response_items_to_chat(items)
     assert images == [image_url]
     expected = [
@@ -3108,7 +3045,7 @@ def test_message_image_stays_on_its_original_user_turn():
         _msg(
             [
                 {"type": "input_text", "text": "First turn"},
-                {"type": "input_image", "image_url": image_url},
+                _input_image(image_url),
             ],
             type="message",
         ),
@@ -3139,13 +3076,7 @@ def test_message_image_stays_on_its_original_user_turn():
 def test_unknown_function_output_blocks_remain_text():
     unknown = {"type": "custom_output", "value": {"answer": 42}}
     messages, images = _response_items_to_chat(
-        [
-            {
-                "type": "function_call_output",
-                "call_id": "call_custom",
-                "output": [unknown],
-            }
-        ]
+        _function_result([unknown], call_id="call_custom")
     )
 
     assert images == []

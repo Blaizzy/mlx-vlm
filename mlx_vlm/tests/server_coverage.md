@@ -1,9 +1,9 @@
 # Server test consolidation
 
 Compared with `82d728b34434d919189c310db7d831d0b531299e`,
-`test_server.py` decreases from **3,749 to 3,539 formatted lines**.
+`test_server.py` decreases from **3,749 to 3,470 formatted lines**.
 Including checks moved to the existing parser, speculative, and audio model
-suites, the net reduction is **125 Python lines**. No production code changes.
+suites, the net reduction is **194 Python lines**. No production code changes.
 
 - Share protocol tool-choice validation, stream decoding, message normalization,
   runtime setup, worker setup, audio backends, and WebSocket session setup.
@@ -13,6 +13,14 @@ suites, the net reduction is **125 Python lines**. No production code changes.
   buffering to their existing suites. Helpers remain inside test files.
 - Preserve processor-free image templating and plain-object request handling:
   the coverage comparison identified these as distinct paths.
+- Fold sampler forwarding, prompt metrics, tag counting, and settings replacement
+  into related tests, retaining their assertions. Share streaming setup and
+  function-result payloads; simplify CLI flag data and the nested STT fixture.
+
+The second pass removes **69 lines** relative to `cbeb90fa`. Its 197 server cases
+pass, and the full suite retains exactly the same 80,947 production lines and
+12,834 branch outcomes as that commit. Four standalone tests are combined into
+existing cases. Concurrency and shutdown-order checks remain intact.
 
 ## Validation
 
@@ -25,7 +33,7 @@ are compared; additions do not cancel losses.
 | --- | ---: | ---: | ---: | ---: |
 | Executed production lines | 80,943 | 80,947 | 0 | 4 |
 | Executed branch outcomes | 12,831 | 12,834 | 0 | 3 |
-| Passing tests | 1,791 | 1,794 | | |
+| Passing tests | 1,791 | 1,790 | | |
 
 Both runs have four skips and 39 passing subtests. The skips are two optional
 VoiceChat checkpoint tests and two tests requiring PyTorch. Black, isort,
