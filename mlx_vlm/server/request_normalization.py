@@ -4,8 +4,7 @@ from typing import Optional, Tuple, Union
 
 from ..generate import (
     DEFAULT_REPETITION_CONTEXT_SIZE,
-    DEFAULT_TEMPERATURE,
-    DEFAULT_TOP_P,
+    resolve_generation_sampling_defaults,
 )
 from ..structured import build_json_schema_logits_processor
 from .generation import (
@@ -73,13 +72,6 @@ def _standard_reasoning_control(
             return enabled, effort, True
 
     return None, None, False
-
-
-def _model_config_field_or_default(processor, field_name: str, default):
-    config = getattr(processor, "config", None) if processor is not None else None
-    if config is None:
-        config = runtime.model_cache.get("config")
-    return getattr(config, field_name, default)
 
 
 def _as_plain_dict(value):
@@ -165,13 +157,12 @@ def _build_gen_args(
         # Preserve a model template's native default when the server default is
         # off and the request did not express a reasoning preference.
         template_reasoning = True if server_enable_thinking else None
-    default_temperature = _model_config_field_or_default(
-        processor, "temperature", DEFAULT_TEMPERATURE
+    config = getattr(processor, "config", None) if processor is not None else None
+    if config is None:
+        config = runtime.model_cache.get("config")
+    default_temperature, default_top_p, default_top_k = (
+        resolve_generation_sampling_defaults(config)
     )
-    default_top_p = _model_config_field_or_default(processor, "top_p", DEFAULT_TOP_P)
-    default_top_k = _model_config_field_or_default(processor, "top_k", 0)
-    if _model_config_field_or_default(processor, "do_sample", None) is False:
-        default_temperature = 0.0
     args = GenerationArguments(
         max_tokens=max_tokens,
         temperature=_request_field_or_default(

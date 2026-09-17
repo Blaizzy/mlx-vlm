@@ -3,7 +3,7 @@ from __future__ import annotations
 import contextlib
 import logging
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -30,6 +30,41 @@ DEFAULT_COMPLETION_BATCH_SIZE = 32
 DEFAULT_PREFILL_BATCH_SIZE = 8
 DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH = 64
 DEFAULT_DIFFUSION_MAX_DENOISING_STEPS = 48
+
+
+def resolve_generation_sampling_defaults(
+    config: Any,
+    *,
+    temperature: Optional[float] = None,
+    top_p: Optional[float] = None,
+    top_k: Optional[int] = None,
+) -> Tuple[float, float, int]:
+    """Resolve omitted sampling arguments from a model generation config.
+
+    ``None`` means that the caller did not provide an override. Explicit zero
+    values remain valid overrides, which is important for greedy decoding and
+    for disabling top-k/top-p filtering. ``do_sample=False`` only changes the
+    temperature when the caller did not provide one, matching the server's
+    request-normalization behavior.
+    """
+
+    def config_value(name: str, default):
+        value = getattr(config, name, None)
+        return default if value is None else value
+
+    if temperature is None:
+        temperature = (
+            0.0
+            if getattr(config, "do_sample", None) is False
+            else config_value("temperature", DEFAULT_TEMPERATURE)
+        )
+    if top_p is None:
+        top_p = config_value("top_p", DEFAULT_TOP_P)
+    if top_k is None:
+        top_k = config_value("top_k", DEFAULT_TOP_K)
+
+    return temperature, top_p, top_k
+
 
 # A stream on the default device just for generation
 generation_stream = mx.new_thread_local_stream(mx.default_device())

@@ -19,16 +19,16 @@ class ProcessorLike(Protocol):
 
 class GenerateKwargs(TypedDict, total=False):
     max_tokens: int
-    temperature: float
+    temperature: float | None
     repetition_penalty: float | None
     repetition_context_size: int | None
     presence_penalty: float | None
     presence_context_size: int | None
     frequency_penalty: float | None
     frequency_context_size: int | None
-    top_p: float
+    top_p: float | None
     min_p: float
-    top_k: int
+    top_k: int | None
     logit_bias: dict[int, float] | None
     prompt_cache: list[Any] | None
     max_kv_size: int | None
