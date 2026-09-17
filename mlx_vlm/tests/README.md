@@ -45,8 +45,8 @@ construction is shared through `test_models.py`.
 ## Current validation
 
 Compared with `e48acdc6`, shared setup and runners reduce Python source
-**22,331 → 21,611 lines**, saving **720 formatted lines**. JSON is unchanged at
-**3,099 lines**; the combined total is **24,710 lines**, with the same 16 Python
+**22,331 → 21,565 lines**, saving **766 formatted lines**. JSON is unchanged at
+**3,099 lines**; the combined total is **24,664 lines**, with the same 16 Python
 files. All changes in this pass are tests or their documentation.
 
 | Module | Before | After | Saved |
@@ -54,7 +54,7 @@ files. All changes in this pass are tests or their documentation.
 | `test_generate.py` | 1,928 | 1,716 | 212 |
 | `test_processors.py` | 2,506 | 2,317 | 189 |
 | `test_diffusion_models.py` | 1,287 | 1,131 | 156 |
-| `test_models.py` | 1,071 | 1,011 | 60 |
+| `test_models.py` | 1,071 | 965 | 106 |
 | `test_audio_models.py` | 1,613 | 1,573 | 40 |
 | `test_video_generation_models.py` | 1,544 | 1,522 | 22 |
 | `test_model_ops.py` | 1,021 | 1,002 | 19 |
@@ -68,22 +68,28 @@ tolerances, masks, stateful cache checks, gradients, and concurrency checks rema
 Processor cases explicitly retain both fresh and initialized tokenizer padding
 states when splitting the former sequential test into independent cases.
 
-Remove **52 selected cases**: 45 cached-image source-substring checks, four
-standalone dataclass default checks, two public annotation checks, and one
-historical video-default equality check. These declaration/default/signature
-guards are intentionally removed. Parameterization exposes five previously
-in-function scenarios as separate collected cases: **1,771 → 1,724 collected**.
-The full suite passes **1,720 tests, four existing skips, and 31 subtests**.
+Remove **53 selected cases**: 45 cached-image source-substring checks, four
+standalone dataclass default checks, two public annotation checks, one
+historical video-default equality check, and the DeepSeek-V4 quantization-alias
+regression. The alias regression was explicitly removed after the earlier
+coverage-preserving compression; the production alias implementation is unchanged.
+Parameterization exposes five previously in-function scenarios as separate
+collected cases: **1,771 → 1,723 collected**. The full suite passes **1,719 tests,
+four existing skips, and 31 subtests**.
 
-Exact production coverage sets match `e48acdc6`: **80,999 executed lines and
-12,836 branch outcomes**, with **zero lost or added paths**. This preserves
-measured Python execution at the immediate baseline; it does not restore the
-earlier intentional pruning documented below.
+Production coverage is **80,981 executed lines and 12,824 branch outcomes**.
+Compared with `a5574e2a` (and `e48acdc6`), removing the alias regression loses
+**18 lines and 12 branch outcomes**, with no added paths. This intentional
+loss covers legacy DeepSeek alias mapping and loader selection of per-module
+quantization overrides, including the explicitly disabled head. The preceding
+compression preserved all 80,999 lines and 12,836 branch outcomes; other earlier
+intentional pruning is documented below.
 
 The preceding file consolidation against `acd30322` reduced **28 → 16 Python
 files** and **22,608 → 22,331 Python lines**. Its 277-line saving comprised 263
 lines from deleting the manual smoke runner and 14 from imports/module boilerplate.
-That step preserved all 1,771 collected cases and the same coverage sets.
+That step preserved all 1,771 collected cases, 80,999 executed lines, and
+12,836 branch outcomes.
 
 Black, isort, autoflake, pyflakes, Python 3.10 syntax parsing and whitespace checks
 pass. Environment: macOS arm64/Metal, Python 3.12.14, MLX 0.32.2,

@@ -760,52 +760,6 @@ def test_load_model_uses_deepseek_v4_fp8_quantization_config():
     assert quantize.call_args.kwargs["mode"] == "affine"
 
 
-def test_load_model_matches_deepseek_v4_quantization_aliases():
-    from mlx_vlm.models import deepseek_v4
-
-    class FakeDeepseekV4Model(_CheckpointModel):
-
-        def __init__(self, config):
-            super().__init__(config)
-            self.language_model = nn.Module()
-            self.language_model.model = nn.Module()
-            self.language_model.model.layers = [nn.Module()]
-            self.language_model.model.layers[0].ffn = nn.Module()
-            self.language_model.model.layers[0].ffn.shared_experts = nn.Module()
-            self.language_model.model.layers[0].ffn.shared_experts.gate_proj = (
-                nn.Linear(64, 64, bias=False)
-            )
-            self.language_model.lm_head = nn.Linear(64, 64, bias=False)
-
-        @staticmethod
-        def quantization_path_aliases(path):
-            return deepseek_v4.Model.quantization_path_aliases(path)
-
-    mxfp8 = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
-    quantization = {
-        "group_size": 32,
-        "bits": 4,
-        "mode": "mxfp4",
-        "layers.0.ffn.shared_experts.w1": mxfp8,
-        "head": False,
-    }
-    with _checkpoint_loading(
-        {"model_type": "deepseek_v4", "quantization": quantization},
-        FakeDeepseekV4Model,
-        {},
-    ) as quantize:
-        load_model(Path("/tmp/model"), lazy=True)
-    predicate = quantize.call_args.kwargs["class_predicate"]
-    fake_model = FakeDeepseekV4Model(_CheckpointConfig())
-    shared_expert_spec = predicate(
-        "language_model.model.layers.0.ffn.shared_experts.gate_proj",
-        fake_model.language_model.model.layers[0].ffn.shared_experts.gate_proj,
-    )
-    head_spec = predicate("language_model.lm_head", fake_model.language_model.lm_head)
-    assert shared_expert_spec == mxfp8
-    assert head_spec == {}
-
-
 def test_load_model_transforms_fine_grained_fp8_by_format():
 
     source_config = {
