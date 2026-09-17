@@ -258,16 +258,21 @@ class APCCoordinator:
                 pick["warm_cache"] if pick is not None else self.fresh_cache()
                 for pick in picks
             ]
-            return make_warm_batch_exact_cache_multi(
+            caches, max_prefix = make_warm_batch_exact_cache_multi(
                 row_caches,
                 prefix_lens,
                 kv_quant_config=kv_quant_config,
             )
-        return make_warm_batch_kv_cache_multi(
-            list(picks),
-            num_layers=len(self.plan.components),
-            kv_quant_config=kv_quant_config,
-        )
+        else:
+            caches, max_prefix = make_warm_batch_kv_cache_multi(
+                list(picks),
+                num_layers=len(self.plan.components),
+                kv_quant_config=kv_quant_config,
+            )
+        if caches is not None:
+            with self.manager.lock:
+                self.manager.stats.restored_tokens += sum(prefix_lens)
+        return caches, max_prefix
 
     def materialize_single(
         self,
@@ -277,15 +282,18 @@ class APCCoordinator:
         kv_quant_config: Optional[dict] = None,
     ) -> List[Any]:
         warm_cache = hit.get("warm_cache")
-        if warm_cache is not None:
-            return warm_cache
-        from .apc import make_warm_kv_cache
+        if warm_cache is None:
+            from .apc import make_warm_kv_cache
 
-        return make_warm_kv_cache(
-            hit.get("matched_blocks", []),
-            min_capacity_tokens=min_capacity_tokens,
-            kv_quant_config=kv_quant_config,
-        )
+            warm_cache = make_warm_kv_cache(
+                hit.get("matched_blocks", []),
+                min_capacity_tokens=min_capacity_tokens,
+                kv_quant_config=kv_quant_config,
+            )
+        if warm_cache:
+            with self.manager.lock:
+                self.manager.stats.restored_tokens += hit["prefix_len"]
+        return warm_cache
 
     def store_checkpoint(
         self,
