@@ -20,23 +20,23 @@ def _has_weight_files(directory: Path) -> bool:
         return path.is_file() and path.stat().st_size > 0
 
     indexes = list(directory.glob("*.safetensors.index.json"))
-    if indexes:
-        for index in indexes:
-            weight_map = read_json_object(index).get("weight_map")
-            if not isinstance(weight_map, dict) or not weight_map:
+    shards = set()
+    for index in indexes:
+        weight_map = read_json_object(index).get("weight_map")
+        if not isinstance(weight_map, dict) or not weight_map:
+            return False
+        for filename in weight_map.values():
+            if not isinstance(filename, str):
                 return False
-            for filename in weight_map.values():
-                if not isinstance(filename, str):
-                    return False
-                relative = Path(filename)
-                if (
-                    relative.is_absolute()
-                    or ".." in relative.parts
-                    or relative.suffix != ".safetensors"
-                    or not present(directory / relative)
-                ):
-                    return False
-        return True
+            shards.add(Path(filename))
+    if indexes:
+        return all(
+            not shard.is_absolute()
+            and ".." not in shard.parts
+            and shard.suffix == ".safetensors"
+            and present(directory / shard)
+            for shard in shards
+        )
     return any(
         present(path)
         for path in directory.glob("*.safetensors")
@@ -79,16 +79,21 @@ def discover_models(cache_info, paths: Iterable[str] = ()) -> list[dict]:
     return the newest usable snapshot's path so requests cannot fetch a different
     revision. Local aliases are deduplicated using their resolved directory.
     """
-    models = []
-    seen = set()
+    models = {}
 
-    def add(model_id, path, created):
-        path = Path(path).expanduser().resolve()
-        if path in seen or not is_model_directory(path):
+    def add(path, *, model_id=None, created=None):
+        try:
+            path = Path(path).expanduser().resolve()
+            if path in models or not is_model_directory(path):
+                return False
+            models[path] = {
+                "id": str(path if model_id is None else model_id),
+                "path": path,
+                "created": int(path.stat().st_mtime if created is None else created),
+            }
+            return True
+        except (OSError, RuntimeError):
             return False
-        seen.add(path)
-        models.append({"id": str(model_id), "path": path, "created": int(created)})
-        return True
 
     for repo in sorted(cache_info.repos, key=lambda r: r.repo_id):
         if repo.repo_type != "model":
@@ -100,13 +105,12 @@ def discover_models(cache_info, paths: Iterable[str] = ()) -> list[dict]:
         if main is not None:
             revisions = [main, *(r for r in revisions if r != main)]
         for revision in revisions:
-            try:
-                path = Path(revision.snapshot_path)
-                model_id = repo.repo_id if revision == main else str(path.resolve())
-                if add(model_id, path, revision.last_modified):
-                    break
-            except (OSError, RuntimeError):
-                continue
+            if add(
+                revision.snapshot_path,
+                model_id=repo.repo_id if revision == main else None,
+                created=revision.last_modified,
+            ):
+                break
 
     for value in paths:
         try:
@@ -116,11 +120,8 @@ def discover_models(cache_info, paths: Iterable[str] = ()) -> list[dict]:
                 candidates = [root]
             else:
                 candidates = sorted(p for p in root.iterdir() if p.is_dir())
-            for path in candidates:
-                try:
-                    add(str(path.resolve()), path, path.stat().st_mtime)
-                except (OSError, RuntimeError):
-                    continue
         except (OSError, RuntimeError):
             continue
-    return sorted(models, key=lambda model: model["id"].lower())
+        for path in candidates:
+            add(path)
+    return sorted(models.values(), key=lambda model: model["id"].lower())
