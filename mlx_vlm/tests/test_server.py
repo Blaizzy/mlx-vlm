@@ -700,224 +700,223 @@ def test_ar_thread_exception_reaches_pending_client_queue(monkeypatch):
         assert worker.is_alive()
 
 
-def _model_directory(path):
-    path.mkdir(parents=True)
-    (path / "config.json").write_text('{"model_type": "qwen2_vl"}')
-    (path / "model.safetensors").write_bytes(b"weights")
-    return path
+class TestModelDiscovery:
+    @staticmethod
+    def _model_directory(path):
+        path.mkdir(parents=True)
+        (path / "config.json").write_text('{"model_type": "qwen2_vl"}')
+        (path / "model.safetensors").write_bytes(b"weights")
+        return path
 
-
-@pytest.mark.parametrize(
-    "config,valid",
-    [
-        ('{"model_type": "qwen2_vl"}', True),
-        ('{"model_type": "custom", "model_file": "model.py"}', True),
-        ("not json", False),
-        ("{}", False),
-    ],
-    ids=["no-tokenizer", "custom-code", "malformed", "empty"],
-)
-def test_model_discovery_metadata(tmp_path, config, valid):
-    model = _model_directory(tmp_path / "model")
-    (model / "config.json").write_text(config)
-    (model / "model.py").write_text("raise RuntimeError('must not execute')")
-    assert is_model_directory(model) is valid
-
-
-@pytest.mark.parametrize(
-    "shard,valid",
-    [(None, False), (b"", False), (b"weights", True)],
-    ids=["missing", "empty", "complete"],
-)
-def test_model_discovery_shards(tmp_path, shard, valid):
-    model = _model_directory(tmp_path / "model")
-    (model / "model.safetensors.index.json").write_text(
-        '{"weight_map": {"a": "model.safetensors", "b": "second.safetensors"}}'
+    @pytest.mark.parametrize(
+        "config,valid",
+        [
+            ('{"model_type": "qwen2_vl"}', True),
+            ('{"model_type": "custom", "model_file": "model.py"}', True),
+            ("not json", False),
+            ("{}", False),
+        ],
+        ids=["no-tokenizer", "custom-code", "malformed", "empty"],
     )
-    if shard is not None:
-        (model / "second.safetensors").write_bytes(shard)
-    assert is_model_directory(model) is valid
+    def test_metadata(self, tmp_path, config, valid):
+        model = self._model_directory(tmp_path / "model")
+        (model / "config.json").write_text(config)
+        (model / "model.py").write_text("raise RuntimeError('must not execute')")
+        assert is_model_directory(model) is valid
 
-
-def test_model_discovery_rejects_adapters_and_broken_links(tmp_path):
-    model = _model_directory(tmp_path / "adapter")
-    (model / "model.safetensors").rename(model / "adapter_model.safetensors")
-    assert not is_model_directory(model)
-    (model / "model.safetensors").symlink_to(model / "missing.safetensors")
-    assert not is_model_directory(model)
-
-
-def test_model_discovery_pipeline_components(tmp_path):
-    pipeline = tmp_path / "pipeline"
-    component = _model_directory(pipeline / "transformer")
-    (pipeline / "model_index.json").write_text('{"_class_name": "FluxPipeline"}')
-    (pipeline / "tokenizer").mkdir()
-    assert is_model_directory(pipeline)
-    (component / "model.safetensors").unlink()
-    assert not is_model_directory(pipeline)
-    _model_directory(pipeline / "text_encoder")
-    (component / "model.safetensors.index.json").write_text(
-        '{"weight_map": {"a": "missing.safetensors"}}'
+    @pytest.mark.parametrize(
+        "shard,valid",
+        [(None, False), (b"", False), (b"weights", True)],
+        ids=["missing", "empty", "complete"],
     )
-    assert not is_model_directory(pipeline)
-
-
-@pytest.mark.parametrize("main", ["absent", "complete", "incomplete"])
-def test_model_discovery_revisions_and_local_alias(tmp_path, main):
-    repo = tmp_path / "models--local--vision"
-    snapshots = [
-        _model_directory(repo / "snapshots" / (revision * 40)) for revision in "ab"
-    ]
-    for modified, snapshot in zip((100, 200), snapshots):
-        for path in (snapshot, *snapshot.iterdir()):
-            os.utime(path, (modified, modified))
-    if main != "absent":
-        (repo / "refs").mkdir()
-        (repo / "refs" / "main").write_text("a" * 40)
-    if main == "incomplete":
-        (snapshots[0] / "model.safetensors").unlink()
-    selected = snapshots[0] if main == "complete" else snapshots[1]
-    cache = scan_cache_dir(tmp_path)
-    found = discover_models(cache)
-    assert found == [
-        dict(
-            id="local/vision" if main == "complete" else str(selected),
-            path=selected,
-            created=100 if main == "complete" else 200,
+    def test_shards(self, tmp_path, shard, valid):
+        model = self._model_directory(tmp_path / "model")
+        (model / "model.safetensors.index.json").write_text(
+            '{"weight_map": {"a": "model.safetensors", "b": "second.safetensors"}}'
         )
-    ]
-    assert discover_models(cache, [str(selected)]) == found
+        if shard is not None:
+            (model / "second.safetensors").write_bytes(shard)
+        assert is_model_directory(model) is valid
 
+    def test_rejects_adapters_and_broken_links(self, tmp_path):
+        model = self._model_directory(tmp_path / "adapter")
+        (model / "model.safetensors").rename(model / "adapter_model.safetensors")
+        assert not is_model_directory(model)
+        (model / "model.safetensors").symlink_to(model / "missing.safetensors")
+        assert not is_model_directory(model)
 
-@pytest.mark.parametrize("source", ["parent", "home", "model", "alias", "combined"])
-def test_model_discovery_custom_roots_and_aliases(tmp_path, source):
-    root = tmp_path / "models"
-    model = _model_directory(root / "custom")
-    alias = root / "alias"
-    alias.symlink_to(model, target_is_directory=True)
-    (root / "unrelated").mkdir()
-    sources = dict(
-        parent=str(root),
-        home="~/" + os.path.relpath(root, Path.home()),
-        model=str(model),
-        alias=str(alias),
-        missing=str(root / "missing"),
-    )
-    paths = list(sources.values()) if source == "combined" else [sources[source]]
-    found = discover_models(NS(repos=[]), paths)
-    assert (
-        len(found) == 1 and found[0]["id"] == str(model) and found[0]["path"] == model
-    )
+    def test_pipeline_components(self, tmp_path):
+        pipeline = tmp_path / "pipeline"
+        component = self._model_directory(pipeline / "transformer")
+        (pipeline / "model_index.json").write_text('{"_class_name": "FluxPipeline"}')
+        (pipeline / "tokenizer").mkdir()
+        assert is_model_directory(pipeline)
+        (component / "model.safetensors").unlink()
+        assert not is_model_directory(pipeline)
+        self._model_directory(pipeline / "text_encoder")
+        (component / "model.safetensors.index.json").write_text(
+            '{"weight_map": {"a": "missing.safetensors"}}'
+        )
+        assert not is_model_directory(pipeline)
 
+    @pytest.mark.parametrize("main", ["absent", "complete", "incomplete"])
+    def test_revisions_and_local_alias(self, tmp_path, main):
+        repo = tmp_path / "models--local--vision"
+        snapshots = [
+            self._model_directory(repo / "snapshots" / (revision * 40))
+            for revision in "ab"
+        ]
+        for modified, snapshot in zip((100, 200), snapshots):
+            for path in (snapshot, *snapshot.iterdir()):
+                os.utime(path, (modified, modified))
+        if main != "absent":
+            (repo / "refs").mkdir()
+            (repo / "refs" / "main").write_text("a" * 40)
+        if main == "incomplete":
+            (snapshots[0] / "model.safetensors").unlink()
+        selected = snapshots[0] if main == "complete" else snapshots[1]
+        cache = scan_cache_dir(tmp_path)
+        found = discover_models(cache)
+        assert found == [
+            dict(
+                id="local/vision" if main == "complete" else str(selected),
+                path=selected,
+                created=100 if main == "complete" else 200,
+            )
+        ]
+        assert discover_models(cache, [str(selected)]) == found
 
-def test_model_discovery_cache_script(tmp_path):
-    script = (
-        Path(__file__).resolve().parents[2]
-        / "skills/skills/hf-cache-models/scripts/list_supported_hf_cache_models.py"
-    )
-    spec = importlib.util.spec_from_file_location("cache_model_script", script)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    model = _model_directory(tmp_path / "local")
-    found = module.supported_models(
-        str(tmp_path / "missing-cache"), model_dirs=[str(model)]
-    )
-    assert [m["id"] for m in found] == [str(model)]
+    @pytest.mark.parametrize("source", ["parent", "home", "model", "alias", "combined"])
+    def test_custom_roots_and_aliases(self, tmp_path, source):
+        root = tmp_path / "models"
+        model = self._model_directory(root / "custom")
+        alias = root / "alias"
+        alias.symlink_to(model, target_is_directory=True)
+        (root / "unrelated").mkdir()
+        sources = dict(
+            parent=str(root),
+            home="~/" + os.path.relpath(root, Path.home()),
+            model=str(model),
+            alias=str(alias),
+            missing=str(root / "missing"),
+        )
+        paths = list(sources.values()) if source == "combined" else [sources[source]]
+        found = discover_models(NS(repos=[]), paths)
+        assert (
+            len(found) == 1
+            and found[0]["id"] == str(model)
+            and found[0]["path"] == model
+        )
 
+    def test_cache_script(self, tmp_path):
+        script = (
+            Path(__file__).resolve().parents[2]
+            / "skills/skills/hf-cache-models/scripts/list_supported_hf_cache_models.py"
+        )
+        spec = importlib.util.spec_from_file_location("cache_model_script", script)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        model = self._model_directory(tmp_path / "local")
+        found = module.supported_models(
+            str(tmp_path / "missing-cache"), model_dirs=[str(model)]
+        )
+        assert [m["id"] for m in found] == [str(model)]
 
-@pytest.fixture
-def model_listing(client, monkeypatch, tmp_path):
-    _reset_runtime(monkeypatch)
-    monkeypatch.delenv("MLX_VLM_MODEL_PATHS", raising=False)
-    cache_root = tmp_path / "cache"
-    model = _model_directory(
-        cache_root / "models--local--vision" / "snapshots" / ("a" * 40)
-    )
-    refs = model.parent.parent / "refs"
-    refs.mkdir()
-    (refs / "main").write_text("a" * 40)
-    scan = Mock(side_effect=lambda: scan_cache_dir(cache_root))
-    monkeypatch.setattr(server, "scan_cache_dir", scan)
+    @pytest.fixture
+    def model_listing(self, client, monkeypatch, tmp_path):
+        _reset_runtime(monkeypatch)
+        monkeypatch.delenv("MLX_VLM_MODEL_PATHS", raising=False)
+        cache_root = tmp_path / "cache"
+        model = self._model_directory(
+            cache_root / "models--local--vision" / "snapshots" / ("a" * 40)
+        )
+        refs = model.parent.parent / "refs"
+        refs.mkdir()
+        (refs / "main").write_text("a" * 40)
+        scan = Mock(side_effect=lambda: scan_cache_dir(cache_root))
+        monkeypatch.setattr(server, "scan_cache_dir", scan)
 
-    def get(endpoint="/v1/models", **kwargs):
-        response = client.get(endpoint, **kwargs)
-        assert response.status_code == 200
-        entries = response.json()["data"]
-        ids = [m["id"] for m in entries]
-        assert ids == sorted(set(ids), key=str.lower)
-        return {m["id"]: m["loaded"] for m in entries}
+        def get(endpoint="/v1/models", **kwargs):
+            response = client.get(endpoint, **kwargs)
+            assert response.status_code == 200
+            entries = response.json()["data"]
+            ids = [m["id"] for m in entries]
+            assert ids == sorted(set(ids), key=str.lower)
+            return {m["id"]: m["loaded"] for m in entries}
 
-    return NS(get=get, scan=scan, path=model, registry=server.runtime.model_cache)
+        return NS(get=get, scan=scan, path=model, registry=server.runtime.model_cache)
 
+    def test_endpoint_cache_and_loaded_status(self, model_listing):
+        listing = model_listing
+        for kind, model in (
+            ("text_generation", "local/vision"),
+            ("embedding", "/loaded/embedding"),
+            ("tts", "/loaded/tts"),
+        ):
+            listing.registry.set(kind, {"model_path": model})
+        expected = {
+            "local/vision": True,
+            "/loaded/embedding": True,
+            "/loaded/tts": True,
+        }
+        assert listing.get("/models") == listing.get() == expected
+        listing.registry.clear()
+        assert listing.get() == {"local/vision": False}
+        (listing.path / "model.safetensors").unlink()
+        assert listing.get() == {}
 
-def test_models_endpoint_cache_and_loaded_status(model_listing):
-    listing = model_listing
-    for kind, model in (
-        ("text_generation", "local/vision"),
-        ("embedding", "/loaded/embedding"),
-        ("tts", "/loaded/tts"),
+    @pytest.mark.parametrize("cached", [False, True], ids=["missing-cache", "cached"])
+    @pytest.mark.parametrize("source", ["environment", "query"])
+    def test_endpoint_custom_paths(self, model_listing, monkeypatch, cached, source):
+        listing = model_listing
+        path = str(listing.path)
+        if not cached:
+            listing.scan.side_effect = server.CacheNotFound("missing cache", "/missing")
+        params = {"model_dir": path} if source == "query" else {}
+        if source == "environment":
+            monkeypatch.setenv("MLX_VLM_MODEL_PATHS", path)
+        listing.registry.set("text_generation", {"model_path": path})
+        listing.registry.set("embedding", {"model_path": "/loaded/embedding"})
+        assert listing.get(params=params) == {path: True, "/loaded/embedding": True}
+        listing.registry.clear()
+        assert listing.get(params=params) == {"local/vision" if cached else path: False}
+
+    def test_endpoint_query_paths_are_additive_and_temporary(
+        self, model_listing, monkeypatch, tmp_path
     ):
-        listing.registry.set(kind, {"model_path": model})
-    expected = {"local/vision": True, "/loaded/embedding": True, "/loaded/tts": True}
-    assert listing.get("/models") == listing.get() == expected
-    listing.registry.clear()
-    assert listing.get() == {"local/vision": False}
-    (listing.path / "model.safetensors").unlink()
-    assert listing.get() == {}
+        configured = self._model_directory(tmp_path / "configured")
+        requested = self._model_directory(
+            tmp_path / "requested" / "model with spaces & symbols"
+        )
+        another = self._model_directory(tmp_path / "another")
+        monkeypatch.setenv("MLX_VLM_MODEL_PATHS", str(configured))
+        baseline = {"local/vision": False, str(configured): False}
+        params = [("model_dir", str(path)) for path in (requested.parent, another, "")]
+        assert model_listing.get(params=params) == {
+            **baseline,
+            str(requested): False,
+            str(another): False,
+        }
+        assert os.environ["MLX_VLM_MODEL_PATHS"] == str(configured)
+        assert model_listing.get() == baseline
 
-
-@pytest.mark.parametrize("cached", [False, True], ids=["missing-cache", "cached"])
-@pytest.mark.parametrize("source", ["environment", "query"])
-def test_models_endpoint_custom_paths(model_listing, monkeypatch, cached, source):
-    listing = model_listing
-    path = str(listing.path)
-    if not cached:
-        listing.scan.side_effect = server.CacheNotFound("missing cache", "/missing")
-    params = {"model_dir": path} if source == "query" else {}
-    if source == "environment":
-        monkeypatch.setenv("MLX_VLM_MODEL_PATHS", path)
-    listing.registry.set("text_generation", {"model_path": path})
-    listing.registry.set("embedding", {"model_path": "/loaded/embedding"})
-    assert listing.get(params=params) == {path: True, "/loaded/embedding": True}
-    listing.registry.clear()
-    assert listing.get(params=params) == {"local/vision" if cached else path: False}
-
-
-def test_models_endpoint_query_paths_are_additive_and_temporary(
-    model_listing, monkeypatch, tmp_path
-):
-    configured = _model_directory(tmp_path / "configured")
-    requested = _model_directory(tmp_path / "requested" / "model with spaces & symbols")
-    another = _model_directory(tmp_path / "another")
-    monkeypatch.setenv("MLX_VLM_MODEL_PATHS", str(configured))
-    baseline = {"local/vision": False, str(configured): False}
-    params = [("model_dir", str(path)) for path in (requested.parent, another, "")]
-    assert model_listing.get(params=params) == {
-        **baseline,
-        str(requested): False,
-        str(another): False,
-    }
-    assert os.environ["MLX_VLM_MODEL_PATHS"] == str(configured)
-    assert model_listing.get() == baseline
-
-
-@pytest.mark.parametrize("use_cli_paths", [False, True])
-def test_server_cli_custom_model_paths(monkeypatch, tmp_path, use_cli_paths):
-    monkeypatch.setattr(os, "environ", dict(os.environ))
-    monkeypatch.setenv("MLX_VLM_MODEL_PATHS", "/existing/models")
-    paths = [str(tmp_path / "model with spaces"), str(tmp_path / "other")]
-    flags = (
-        [arg for path in paths for arg in ("--model-dir", path)]
-        if use_cli_paths
-        else []
-    )
-    monkeypatch.setattr(sys, "argv", ["mlx_vlm.server", *flags])
-    with patch.object(cli.uvicorn, "run") as run:
-        cli.main()
-    assert os.environ["MLX_VLM_MODEL_PATHS"] == (
-        os.pathsep.join(paths) if use_cli_paths else "/existing/models"
-    )
-    run.assert_called_once()
+    @pytest.mark.parametrize("use_cli_paths", [False, True])
+    def test_cli_custom_model_paths(self, monkeypatch, tmp_path, use_cli_paths):
+        monkeypatch.setattr(os, "environ", dict(os.environ))
+        monkeypatch.setenv("MLX_VLM_MODEL_PATHS", "/existing/models")
+        paths = [str(tmp_path / "model with spaces"), str(tmp_path / "other")]
+        flags = (
+            [arg for path in paths for arg in ("--model-dir", path)]
+            if use_cli_paths
+            else []
+        )
+        monkeypatch.setattr(sys, "argv", ["mlx_vlm.server", *flags])
+        with patch.object(cli.uvicorn, "run") as run:
+            cli.main()
+        assert os.environ["MLX_VLM_MODEL_PATHS"] == (
+            os.pathsep.join(paths) if use_cli_paths else "/existing/models"
+        )
+        run.assert_called_once()
 
 
 def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
