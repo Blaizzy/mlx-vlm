@@ -545,15 +545,16 @@ class LanguageModel(nn.Module):
                     else int(cache_offset)
                 )
                 window = inputs.shape[1]
-                # Slice deepstack embeds to this window too; _deepstack_process reads from offset 0.
+                # Compact features are batch-major. A chunk can select separate
+                # spans from several rows, rather than one contiguous span.
                 if deepstack_visual_embeds is not None:
-                    n_before = int(visual_pos_masks[:, :start].sum().item())
-                    n_window = int(
-                        visual_pos_masks[:, start : start + window].sum().item()
+                    columns = np.nonzero(np.array(visual_pos_masks))[1]
+                    indices = mx.array(
+                        np.flatnonzero((columns >= start) & (columns < start + window)),
+                        dtype=mx.uint32,
                     )
                     deepstack_visual_embeds = [
-                        embeds[n_before : n_before + n_window]
-                        for embeds in deepstack_visual_embeds
+                        embeds[indices] for embeds in deepstack_visual_embeds
                     ]
                 visual_pos_masks = visual_pos_masks[:, start : start + window]
             else:
