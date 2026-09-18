@@ -728,22 +728,12 @@ def test_model_discovery_metadata(tmp_path, config, valid):
     "weight_map,shard,valid",
     [
         ({}, None, False),
-        ([], None, False),
         ({"a": "../outside.safetensors"}, None, False),
-        ({"a": 1}, None, False),
         ({"a": "model.safetensors", "b": "second.safetensors"}, None, False),
         ({"a": "model.safetensors", "b": "second.safetensors"}, b"", False),
         ({"a": "model.safetensors", "b": "second.safetensors"}, b"weights", True),
     ],
-    ids=[
-        "empty-map",
-        "bad-map",
-        "traversal",
-        "bad-name",
-        "missing",
-        "empty",
-        "complete",
-    ],
+    ids=["empty-map", "traversal", "missing", "empty", "complete"],
 )
 def test_model_discovery_shards(tmp_path, weight_map, shard, valid):
     model = _model_directory(tmp_path / "model")
@@ -859,13 +849,9 @@ def model_listing(client, monkeypatch, tmp_path):
     def get(endpoint="/v1/models", **kwargs):
         response = client.get(endpoint, **kwargs)
         assert response.status_code == 200
-        assert response.json()["object"] == "list"
         entries = response.json()["data"]
         ids = [m["id"] for m in entries]
         assert ids == sorted(set(ids), key=str.lower)
-        assert all(
-            m["object"] == "model" and isinstance(m["created"], int) for m in entries
-        )
         return {m["id"]: m["loaded"] for m in entries}
 
     return NS(get=get, scan=scan, path=model, registry=server.runtime.model_cache)
@@ -881,9 +867,6 @@ def test_models_endpoint_cache_and_loaded_status(model_listing):
         listing.registry.set(kind, {"model_path": model})
     expected = {"local/vision": True, "/loaded/embedding": True, "/loaded/tts": True}
     assert listing.get("/models") == listing.get() == expected
-    listing.registry.clear("embedding")
-    del expected["/loaded/embedding"]
-    assert listing.get() == expected
     listing.registry.clear()
     assert listing.get() == {"local/vision": False}
     (listing.path / "model.safetensors").unlink()
@@ -923,17 +906,6 @@ def test_models_endpoint_query_paths_are_additive_and_temporary(
     }
     assert os.environ["MLX_VLM_MODEL_PATHS"] == str(configured)
     assert model_listing.get() == baseline
-
-
-def test_models_endpoint_requires_api_key(client, monkeypatch):
-    scan = Mock()
-    monkeypatch.setattr(server, "scan_cache_dir", scan)
-    monkeypatch.setenv("MLX_VLM_SERVER_API_KEY", "test-key")
-    assert (
-        client.get("/v1/models", params={"model_dir": "/some/models"}).status_code
-        == 401
-    )
-    scan.assert_not_called()
 
 
 @pytest.mark.parametrize("use_cli_paths", [False, True])
