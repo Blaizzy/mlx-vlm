@@ -1,9 +1,15 @@
+from dataclasses import replace
+
 import mlx.core as mx
 
 from ..cache import KVCache
 
 
 class HyV4KVCache(KVCache):
+    def memory_profile(self, token_count):
+        profile = super().memory_profile(token_count)
+        return replace(profile, bytes_per_token=2 * profile.bytes_per_token)
+
     def update_and_fetch(self, keys, values):
         previous = self.offset
         required = previous + keys.shape[2]
@@ -28,33 +34,6 @@ class HyV4KVCache(KVCache):
         self.values[..., previous : self.offset, :] = values
         return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
 
-    @property
-    def state(self):
-        if self.keys is None:
-            return None, None
-        return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
-
-    @state.setter
-    def state(self, value):
-        self.keys, self.values = value
-        self.offset = 0 if self.keys is None else self.keys.shape[2]
-
     def extract(self, idx):
-        cache = HyV4KVCache()
-        if self.keys is None:
-            if idx not in (0, -1):
-                raise IndexError("KVCache row index out of range")
-            return cache
-
-        batch_size = int(self.keys.shape[0])
-        if idx < 0:
-            idx += batch_size
-        if idx < 0 or idx >= batch_size:
-            raise IndexError(
-                f"KVCache row index {idx} out of range for batch size {batch_size}"
-            )
-
-        cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, : self.offset, :])
-        cache.values = mx.contiguous(self.values[idx : idx + 1, :, : self.offset, :])
-        cache.offset = self.offset
-        return cache
+        cache = super().extract(idx)
+        return HyV4KVCache.from_state(cache.state, cache.meta_state)

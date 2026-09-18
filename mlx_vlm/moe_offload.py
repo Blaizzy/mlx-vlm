@@ -29,13 +29,14 @@ from typing import Optional, Tuple
 _PROJ = r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight|scales|biases)$"
 _FUSED_PROJ = r"gate_up_proj\.(?P<kind>weight|scales|biases)$"
 PEREXPERT_RE = re.compile(
-    r"^.*\.layers\.(?P<layer>\d+)\..*?experts\.(?P<j>\d+)\." + _PROJ
+    r"^(?:.*\.)?layers\.(?P<layer>\d+)\..*?experts\.(?P<j>\d+)\." + _PROJ
 )
 STACKED_RE = re.compile(
-    r"^.*\.layers\.(?P<layer>\d+)\..*?(?:experts|switch_mlp)(?:\.switch_glu)?\." + _PROJ
+    r"^(?:.*\.)?layers\.(?P<layer>\d+)\..*?(?:experts|switch_mlp)(?:\.switch_glu)?\."
+    + _PROJ
 )
 STACKED_FUSED_RE = re.compile(
-    r"^.*\.layers\.(?P<layer>\d+)\..*?(?:experts|switch_mlp)(?:\.switch_glu)?\."
+    r"^(?:.*\.)?layers\.(?P<layer>\d+)\..*?(?:experts|switch_mlp)(?:\.switch_glu)?\."
     + _FUSED_PROJ
 )
 

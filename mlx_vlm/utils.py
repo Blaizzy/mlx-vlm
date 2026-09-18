@@ -35,6 +35,7 @@ ACTIVATION_QUANTIZATION_MODES = {"nvfp4", "mxfp8"}
 
 # Constants
 MODEL_REMAPPING = {
+    "moondream1": "moondream2",
     "llava_qwen2": "fastvlm",  # Apple's FastVLM, note it's different to the one below
     "llava-qwen2": "llava_bunny",
     "bunny-llama": "llava_bunny",

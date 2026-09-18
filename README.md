@@ -64,6 +64,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | K2-Horizon | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/k2_horizon/README.md) |
 | Z1T-0 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/z1t/README.md) |
 | Spark-X2.5 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/spark2_5/README.md) |
+| Ternary Bonsai 2 | [Docs](mlx_vlm/models/prism_hadamard_qwen35/README.md) |
 
 ## Installation
 
@@ -95,7 +96,7 @@ This repo ships an agent-skills bundle under `skills/` for common MLX-VLM workfl
 | `add-new-model` | Port a new architecture into `mlx_vlm/models` — config, weight-name mapping, reuse a similar model, add a test class. |
 | `benchmarking` | Produce credible, reproducible perf numbers and fork-vs-main A/B tables for PRs. |
 | `contributing` | Shape a change to pass review — code/config/test placement, pre-commit hooks, and PR expectations. |
-| `hf-cache-models` | List MLX-VLM-supported (and, with `--check-arch`, loadable) models in the local Hugging Face cache. |
+| `hf-cache-models` | List cached, custom, and loaded models through the server's model discovery endpoint. |
 | `reproducible-github-issues` | Turn CLI or server failures into concise, reproducible GitHub issues. |
 
 Validate the bundle at any time:
@@ -513,8 +514,8 @@ mlx_vlm.server --model Qwen/Qwen3.5-4B \
 # Require bearer authentication for API endpoints
 mlx_vlm.server --api-key <secret-token>
 
-# Opt into shared Hugging Face cache model discovery
-mlx_vlm.server --model-discovery hf-cache
+# Include local models outside the Hugging Face cache
+mlx_vlm.server --model-dir /Volumes/Models --model-dir ~/my-custom-model
 ```
 
 #### Server Options
@@ -525,7 +526,7 @@ mlx_vlm.server --model-discovery hf-cache
 - `--stt-model`: Preload a speech-to-text model at server startup
 - `--embedding-model`: Preload an embedding model at server startup
 - `--reranker-model`: Preload a supported reranker model at server startup
-- `--model-discovery`: Models exposed by `/v1/models`; `served` lists only models loaded by this process (default), while `hf-cache` also scans the shared Hugging Face cache
+- `--model-dir`: Additional model folder or parent containing model folders to include in discovery; repeat for multiple paths. Overrides `MLX_VLM_MODEL_PATHS` (paths separated by `os.pathsep`, `:` on macOS/Linux)
 - `--adapter-path`: Path for adapter weights to use with the preloaded model
 - `--draft-model`: Speculative drafter path or HF id (e.g. `z-lab/Qwen3.8-27B-DFlash2`, `z-lab/Qwen3.5-4B-DFlash`, `RedHatAI/gemma-4-31B-it-speculator.eagle3`, `google/gemma-4-31B-it-assistant`, `Inferact/MiniMax-M3-EAGLE3`) — enables speculative decoding for ~2× or higher throughput
 - `--draft-kind`: Drafter family — `dflash` (default), `eagle3`, or `mtp` (native/assistant MTP)
@@ -919,6 +920,14 @@ curl http://localhost:8080/v1/cache/stats
 curl -X POST http://localhost:8080/v1/cache/reset
 ```
 
+`restored_tokens` counts prefix tokens successfully materialized for generation
+across block and exact caches, in memory or on disk. A lookup alone does not
+increase it, nor does a failed batch restore. A successful restore remains counted
+if the request later fails or is cancelled.
+The previous `served_tokens` block-storage count is now `stored_tokens`;
+`token_hit_rate` retains its existing calculation,
+`matched_tokens / (matched_tokens + stored_tokens)`.
+
 Configure APC on a running server with `PATCH /v1/settings`. Use
 `GET /v1/settings` to discover supported settings and read their current values:
 
@@ -1207,7 +1216,7 @@ Structured outputs are not currently supported with speculative decoding.
 
 #### Available Endpoints
 
-- `/models` and `/v1/models` - List models intentionally served by this process
+- `/models` and `/v1/models` - Discover cached and local models, including their loaded status; accepts repeated `model_dir` query parameters
 - `/chat/completions` and `/v1/chat/completions` - OpenAI-compatible chat-style interaction endpoint with support for images, audio, and text
 - `/responses` and `/v1/responses` - OpenAI-compatible responses endpoint
 - `/embeddings` and `/v1/embeddings` - OpenAI-compatible embeddings endpoint backed by native MLX embedding models
@@ -1228,10 +1237,38 @@ Structured outputs are not currently supported with speculative decoding.
 curl "http://localhost:8080/models"
 ```
 
-By default, model discovery is isolated from the shared Hugging Face cache so
-models downloaded by other applications are not advertised by this server.
-Use `--model-discovery hf-cache` (or
-`MLX_VLM_MODEL_DISCOVERY=hf-cache`) to enable cache-wide model discovery.
+`/models` and `/v1/models` list loaded models and local model candidates from the
+Hugging Face cache and any configured or request-specific model directories. Each entry includes
+`loaded: true` when the model is currently loaded in this server process, or
+`loaded: false` when it is discovered but not loaded. Discovery does not load
+models or guarantee that every discovered architecture is supported.
+
+Discovery reads model metadata (`config.json`, or `model_index.json` for image
+pipelines) and checks for nonempty safetensors files. Sharded checkpoints must
+have every shard referenced by their weight index. Tokenizer metadata is not
+required, and checkpoint Python code is never executed by discovery.
+
+All cached revisions are considered, preferring `main`. If only another revision
+is usable, the entry's ID is its absolute snapshot path so selecting it uses that
+local revision. Custom models also use absolute paths. Symlink aliases and
+loaded local models are deduplicated by their resolved directory.
+
+Each `--model-dir` can be a model folder or a parent whose immediate children
+are model folders; it does not recursively scan arbitrary directories. Missing
+paths and invalid model folders are skipped. Hugging Face's `HF_HUB_CACHE` and
+`HF_HOME` settings select a custom Hugging Face cache directory as usual.
+
+You can also pass directories directly to either models endpoint:
+
+```sh
+curl --get "http://localhost:8080/v1/models" \
+  --data-urlencode "model_dir=/Volumes/Models" \
+  --data-urlencode "model_dir=/Users/me/my custom model"
+```
+
+These paths refer to the server's filesystem. They supplement the cache and
+configured directories for this request only; they do not change server settings.
+Use repeated `model_dir` parameters for multiple paths. Empty values are ignored.
 
 ##### Embeddings
 

@@ -966,6 +966,7 @@ def stream_generate(
             # Trim to only new tokens
             input_ids = input_ids[:, prefix_len:]
             pixel_values = None
+            kwargs.pop("pixel_values_videos", None)
             kwargs.pop("cached_image_features", None)
             kwargs["prompt_cache"] = kv_cache
 
@@ -988,6 +989,7 @@ def stream_generate(
                 reused_prefix_len = plen
                 input_ids = input_ids[:, plen:]
                 pixel_values = None
+                kwargs.pop("pixel_values_videos", None)
                 kwargs.pop("cached_image_features", None)
                 apc_blocks_in_use = matched_blocks
                 _quant_policy = kv_quant_from_legacy(

@@ -140,8 +140,8 @@ class CheckpointAdapter:
     capability = Capability.CHECKPOINT
 
     def memory(self, cache: Any, token_count: int) -> CacheMemory:
-        describe = type(cache).__dict__.get("memory_profile")
-        profile = describe(cache, token_count) if callable(describe) else None
+        describe = getattr(cache, "memory_profile", None)
+        profile = describe(token_count) if callable(describe) else None
         if profile is not None:
             return profile
         size = cache_nbytes(cache)
@@ -383,7 +383,7 @@ def apc_mode(caches: Sequence[Any]) -> Optional[str]:
 
 
 def cache_memory_components(caches, token_count, *, batch_size=1):
-    """Resolve composite layouts; unknown subclasses use opaque estimates."""
+    """Resolve composite layouts and inherited memory profiles."""
     fallback = CheckpointAdapter()
     profiles = []
     seen = set()

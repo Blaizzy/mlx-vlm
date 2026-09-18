@@ -6,6 +6,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import LanguageModelOutput
+from ..cache import CacheMemory, cache_nbytes
 from ..deepseek_v4.hyper_connection import hc_expand, hc_split_sinkhorn
 from ..deepseek_v4.language import (
     DeepseekV4MLP,
@@ -1056,6 +1057,21 @@ class DeepseekV41Cache:
     @property
     def _slots(self):
         return (self.window, self.compress, self.keys, self.kv_state, self.score_state)
+
+    def memory_profile(self, token_count):
+        """The compressor's in-progress group is the only context-free state.
+
+        ``kv_state``/``score_state`` are ``(batch, compress_ratio, head_dim)``,
+        so they do not track the context; the window, the compressed latents,
+        the index keys and the engram ids all grow with it.
+        """
+        fixed = cache_nbytes([self.kv_state, self.score_state])
+        growing = cache_nbytes(self.state) - fixed
+        return CacheMemory(
+            source_bytes=fixed + growing,
+            fixed_bytes=fixed,
+            bytes_per_token=growing / max(1, token_count),
+        )
 
     @property
     def state(self):

@@ -18,7 +18,7 @@ from .generation import (
     get_server_thinking_end_token,
     get_server_thinking_start_token,
 )
-from .runtime import MODEL_DISCOVERY_ENV, MODEL_DISCOVERY_MODES
+from .model_discovery import MODEL_PATHS_ENV
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
@@ -82,13 +82,12 @@ def main():
         help="Pre-load a supported reranker model at startup.",
     )
     parser.add_argument(
-        "--model-discovery",
-        choices=MODEL_DISCOVERY_MODES,
+        "--model-dir",
+        action="append",
         default=None,
         help=(
-            "Models exposed by /v1/models: 'served' lists only models loaded by "
-            "this process (default); 'hf-cache' also scans the shared Hugging "
-            "Face cache. Maps to MLX_VLM_MODEL_DISCOVERY."
+            "Additional model directory, or parent directory containing model folders. "
+            "Repeat for multiple paths. Overrides MLX_VLM_MODEL_PATHS."
         ),
     )
     parser.add_argument(
@@ -309,8 +308,10 @@ def main():
         os.environ["MLX_VLM_PRELOAD_EMBEDDING_MODEL"] = args.embedding_model
     if args.reranker_model:
         os.environ["MLX_VLM_PRELOAD_RERANKER_MODEL"] = args.reranker_model
-    if args.model_discovery:
-        os.environ[MODEL_DISCOVERY_ENV] = args.model_discovery
+    if args.model_dir is not None:
+        os.environ[MODEL_PATHS_ENV] = os.pathsep.join(
+            os.path.abspath(os.path.expanduser(path)) for path in args.model_dir
+        )
     os.environ["MLX_VLM_VISION_CACHE_SIZE"] = str(args.vision_cache_size)
     if args.draft_model:
         os.environ["MLX_VLM_DRAFT_MODEL"] = args.draft_model
