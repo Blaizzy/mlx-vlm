@@ -116,7 +116,7 @@ class BonsaiImageGenerationModel(ImageGenerationModel):
             else model_path_arg
         )
         pipeline = BonsaiImage.from_pretrained(
-            resolve_variant(model),
+            resolve_variant(model_path if model_path is not None else model),
             model_path=model_path,
             download=kwargs.pop("download", True),
             token=kwargs.pop("token", None),
