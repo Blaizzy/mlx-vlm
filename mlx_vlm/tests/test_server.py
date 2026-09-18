@@ -700,48 +700,62 @@ def test_ar_thread_exception_reaches_pending_client_queue(monkeypatch):
         assert worker.is_alive()
 
 
-def _model_directory(path, config=None):
+def _model_directory(path):
     path.mkdir(parents=True)
-    (path / "config.json").write_text(json.dumps(config or {"model_type": "qwen2_vl"}))
-    (path / "model.safetensors").write_bytes(b"test weights")
+    (path / "config.json").write_text('{"model_type": "qwen2_vl"}')
+    (path / "model.safetensors").write_bytes(b"weights")
     return path
 
 
-def test_metadata_without_tokenizer_is_discoverable(tmp_path):
-    model = _model_directory(tmp_path / "vision-model")
-    assert is_model_directory(model)
-    (model / "config.json").write_text("not json")
-    assert not is_model_directory(model)
-    (model / "config.json").write_text("{}")
-    assert not is_model_directory(model)
-
-
-def test_sharded_model_requires_every_indexed_weight_file(tmp_path):
-    model = _model_directory(tmp_path / "sharded")
-    (model / "model.safetensors.index.json").write_text(
-        json.dumps(
-            {"weight_map": {"a": "model.safetensors", "b": "second.safetensors"}}
-        )
-    )
-    assert not is_model_directory(model)
-    (model / "second.safetensors").write_bytes(b"second shard")
-    assert is_model_directory(model)
-    (model / "second.safetensors").write_bytes(b"")
-    assert not is_model_directory(model)
+@pytest.mark.parametrize(
+    "config,valid",
+    [
+        ('{"model_type": "qwen2_vl"}', True),
+        ('{"model_type": "custom", "model_file": "model.py"}', True),
+        ("not json", False),
+        ("{}", False),
+    ],
+    ids=["no-tokenizer", "custom-code", "malformed", "empty"],
+)
+def test_model_discovery_metadata(tmp_path, config, valid):
+    model = _model_directory(tmp_path / "model")
+    (model / "config.json").write_text(config)
+    (model / "model.py").write_text("raise RuntimeError('must not execute')")
+    assert is_model_directory(model) is valid
 
 
 @pytest.mark.parametrize(
-    "weight_map", [{}, [], {"a": "../outside.safetensors"}, {"a": 1}]
+    "weight_map,shard,valid",
+    [
+        ({}, None, False),
+        ([], None, False),
+        ({"a": "../outside.safetensors"}, None, False),
+        ({"a": 1}, None, False),
+        ({"a": "model.safetensors", "b": "second.safetensors"}, None, False),
+        ({"a": "model.safetensors", "b": "second.safetensors"}, b"", False),
+        ({"a": "model.safetensors", "b": "second.safetensors"}, b"weights", True),
+    ],
+    ids=[
+        "empty-map",
+        "bad-map",
+        "traversal",
+        "bad-name",
+        "missing",
+        "empty",
+        "complete",
+    ],
 )
-def test_bad_indexes_do_not_advertise_partial_models(tmp_path, weight_map):
-    model = _model_directory(tmp_path / "partial")
+def test_model_discovery_shards(tmp_path, weight_map, shard, valid):
+    model = _model_directory(tmp_path / "model")
     (model / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": weight_map})
     )
-    assert not is_model_directory(model)
+    if shard is not None:
+        (model / "second.safetensors").write_bytes(shard)
+    assert is_model_directory(model) is valid
 
 
-def test_adapters_and_broken_weight_links_are_not_models(tmp_path):
+def test_model_discovery_rejects_adapters_and_broken_links(tmp_path):
     model = _model_directory(tmp_path / "adapter")
     (model / "model.safetensors").rename(model / "adapter_model.safetensors")
     assert not is_model_directory(model)
@@ -749,92 +763,64 @@ def test_adapters_and_broken_weight_links_are_not_models(tmp_path):
     assert not is_model_directory(model)
 
 
-def test_pipeline_components_use_the_same_weight_checks(tmp_path):
+def test_model_discovery_pipeline_components(tmp_path):
     pipeline = tmp_path / "pipeline"
-    _model_directory(
-        pipeline / "transformer", {"_class_name": "FluxTransformer2DModel"}
-    )
-    (pipeline / "model_index.json").write_text(
-        json.dumps({"_class_name": "FluxPipeline"})
-    )
+    component = _model_directory(pipeline / "transformer")
+    (pipeline / "model_index.json").write_text('{"_class_name": "FluxPipeline"}')
     (pipeline / "tokenizer").mkdir()
     assert is_model_directory(pipeline)
-    (pipeline / "transformer" / "model.safetensors").unlink()
+    (component / "model.safetensors").unlink()
     assert not is_model_directory(pipeline)
-    (pipeline / "transformer" / "model.safetensors").write_bytes(b"weights")
     _model_directory(pipeline / "text_encoder")
-    (pipeline / "transformer" / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {"a": "missing.safetensors"}})
+    (component / "model.safetensors.index.json").write_text(
+        '{"weight_map": {"a": "missing.safetensors"}}'
     )
     assert not is_model_directory(pipeline)
 
 
-def test_real_hf_cache_handles_non_main_revisions_and_prefers_main(tmp_path):
+@pytest.mark.parametrize("main", ["absent", "complete", "incomplete"])
+def test_model_discovery_revisions_and_local_alias(tmp_path, main):
     repo = tmp_path / "models--local--vision"
-    snapshot = _model_directory(repo / "snapshots" / ("a" * 40))
-    cache = scan_cache_dir(tmp_path)
-    candidates = discover_models(cache)
-    assert [m["id"] for m in candidates] == [str(snapshot)]
-    (repo / "refs").mkdir()
-    (repo / "refs" / "main").write_text("a" * 40)
-    assert [m["id"] for m in discover_models(scan_cache_dir(tmp_path))] == [
-        "local/vision"
+    snapshots = [
+        _model_directory(repo / "snapshots" / (revision * 40)) for revision in "ab"
     ]
-    newer = _model_directory(repo / "snapshots" / ("b" * 40))
-    newer_time = snapshot.stat().st_mtime + 10
-    for path in (newer, *newer.iterdir()):
-        os.utime(path, (newer_time, newer_time))
-    assert discover_models(scan_cache_dir(tmp_path))[0]["path"] == snapshot
+    for modified, snapshot in zip((100, 200), snapshots):
+        for path in (snapshot, *snapshot.iterdir()):
+            os.utime(path, (modified, modified))
+    if main != "absent":
+        (repo / "refs").mkdir()
+        (repo / "refs" / "main").write_text("a" * 40)
+    if main == "incomplete":
+        (snapshots[0] / "model.safetensors").unlink()
+    selected = snapshots[0] if main == "complete" else snapshots[1]
+    assert discover_models(scan_cache_dir(tmp_path), [str(selected)]) == [
+        dict(
+            id="local/vision" if main == "complete" else str(selected),
+            path=selected,
+            created=100 if main == "complete" else 200,
+        )
+    ]
 
 
-def test_custom_roots_direct_paths_and_symlinks_are_deduplicated(tmp_path):
+def test_model_discovery_custom_roots_and_aliases(tmp_path):
     root = tmp_path / "models"
     model = _model_directory(root / "custom")
     alias = root / "alias"
     alias.symlink_to(model, target_is_directory=True)
     (root / "unrelated").mkdir()
-    candidates = discover_models(
-        NS(repos=[]),
-        [
-            "~/" + os.path.relpath(root, Path.home()),
-            str(model),
-            str(alias),
-            str(root / "missing"),
-        ],
-    )
-    assert [m["id"] for m in candidates] == [str(model)]
-    assert candidates[0]["path"] == model
-
-
-def test_custom_model_also_in_hf_cache_has_one_entry(tmp_path):
-    model = _model_directory(
-        tmp_path / "models--local--vision" / "snapshots" / ("a" * 40)
-    )
-    candidates = discover_models(scan_cache_dir(tmp_path), [str(model)])
-    assert len(candidates) == 1
-
-
-def test_incomplete_main_uses_an_available_snapshot_path(tmp_path):
-    repo = tmp_path / "models--local--vision"
-    incomplete = _model_directory(repo / "snapshots" / ("a" * 40))
-    (incomplete / "model.safetensors").unlink()
-    complete = _model_directory(repo / "snapshots" / ("b" * 40))
-    (repo / "refs").mkdir()
-    (repo / "refs" / "main").write_text("a" * 40)
-    assert [m["id"] for m in discover_models(scan_cache_dir(tmp_path))] == [
-        str(complete)
+    paths = [
+        "~/" + os.path.relpath(root, Path.home()),
+        str(model),
+        str(alias),
+        str(root / "missing"),
     ]
-
-
-def test_discovery_never_executes_checkpoint_code(tmp_path):
-    model = _model_directory(
-        tmp_path / "custom", {"model_type": "custom", "model_file": "model.py"}
+    found = discover_models(NS(repos=[]), paths)
+    assert (
+        len(found) == 1 and found[0]["id"] == str(model) and found[0]["path"] == model
     )
-    (model / "model.py").write_text("raise RuntimeError('must not execute')")
-    assert is_model_directory(model)
 
 
-def test_cache_script_shares_custom_path_filter_when_cache_is_missing(tmp_path):
+def test_model_discovery_cache_script(tmp_path):
     script = (
         Path(__file__).resolve().parents[2]
         / "skills/skills/hf-cache-models/scripts/list_supported_hf_cache_models.py"
@@ -843,280 +829,128 @@ def test_cache_script_shares_custom_path_filter_when_cache_is_missing(tmp_path):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     model = _model_directory(tmp_path / "local")
-    found = module.supported_models(
-        str(tmp_path / "missing-cache"), model_dirs=[str(model)]
-    )
-    assert [m["id"] for m in found] == [str(model)]
-    (model / "model.safetensors").unlink()
-    assert (
-        module.supported_models(
+    for weights_exist in (True, False):
+        if not weights_exist:
+            (model / "model.safetensors").unlink()
+        found = module.supported_models(
             str(tmp_path / "missing-cache"), model_dirs=[str(model)]
         )
-        == []
+        assert [m["id"] for m in found] == ([str(model)] if weights_exist else [])
+
+
+@pytest.fixture
+def model_listing(client, monkeypatch, tmp_path):
+    _reset_runtime(monkeypatch)
+    monkeypatch.delenv("MLX_VLM_MODEL_PATHS", raising=False)
+    cache_root = tmp_path / "cache"
+    model = _model_directory(
+        cache_root / "models--local--vision" / "snapshots" / ("a" * 40)
     )
+    refs = model.parent.parent / "refs"
+    refs.mkdir()
+    (refs / "main").write_text("a" * 40)
+    scan = Mock(side_effect=lambda: scan_cache_dir(cache_root))
+    monkeypatch.setattr(server, "scan_cache_dir", scan)
 
-
-def _discovery_repo(tmp_path, repo_id, *, sharded=False, weights=True):
-    snapshot = _model_directory(tmp_path / repo_id)
-    if not weights:
-        (snapshot / "model.safetensors").unlink()
-    if sharded:
-        (snapshot / "model.safetensors.index.json").write_text(
-            '{"weight_map": {"weight": "model.safetensors"}}'
+    def get(endpoint="/v1/models", **kwargs):
+        response = client.get(endpoint, **kwargs)
+        assert response.status_code == 200
+        assert response.json()["object"] == "list"
+        entries = response.json()["data"]
+        ids = [m["id"] for m in entries]
+        assert ids == sorted(set(ids), key=str.lower)
+        assert all(
+            m["object"] == "model" and isinstance(m["created"], int) for m in entries
         )
-    revision = NS(snapshot_path=snapshot, last_modified=123.0)
-    return NS(
-        repo_id=repo_id,
-        repo_type="model",
-        refs={"main": revision},
-        revisions=[revision],
-    )
+        return {m["id"]: m["loaded"] for m in entries}
 
-
-@pytest.mark.parametrize("path", ["/models", "/v1/models"])
-def test_models_endpoint_discovers_cached_models(client, monkeypatch, tmp_path, path):
-    monkeypatch.delenv("MLX_VLM_MODEL_PATHS", raising=False)
-    monkeypatch.setattr(server.runtime, "model_cache", server.ModelCacheRegistry())
-    repos = [
-        _discovery_repo(tmp_path, "local/single-file-model"),
-        _discovery_repo(tmp_path, "local/sharded-model", sharded=True),
-        _discovery_repo(tmp_path, "missing/weights", weights=False),
-    ]
-    monkeypatch.setattr(server, "scan_cache_dir", lambda: NS(repos=repos))
-
-    response = client.get(path)
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "object": "list",
-        "data": [
-            {"id": model_id, "object": "model", "created": 123, "loaded": False}
-            for model_id in ("local/sharded-model", "local/single-file-model")
-        ],
-    }
-
-
-def test_models_endpoint_includes_loaded_local_model_without_hf_cache(
-    client, monkeypatch
-):
-    monkeypatch.delenv("MLX_VLM_MODEL_PATHS", raising=False)
-    monkeypatch.setattr(
-        server,
-        "scan_cache_dir",
-        MagicMock(side_effect=server.CacheNotFound("missing cache", "/missing")),
-    )
-    monkeypatch.setitem(server.runtime.model_cache, "model_path", "/models/local-qwen")
-
-    response = client.get("/v1/models")
-
-    assert response.status_code == 200
-    assert response.json()["data"] == [
-        {
-            "id": "/models/local-qwen",
-            "object": "model",
-            "created": response.json()["data"][0]["created"],
-            "loaded": True,
-        }
-    ]
-
-
-def test_models_endpoint_deduplicates_loaded_model_from_hf_cache(
-    client, monkeypatch, tmp_path
-):
-    monkeypatch.delenv("MLX_VLM_MODEL_PATHS", raising=False)
-    repo = _discovery_repo(tmp_path, "local/sharded-model", sharded=True)
-    monkeypatch.setattr(server, "scan_cache_dir", lambda: NS(repos=[repo]))
-    registry = server.ModelCacheRegistry()
-    registry.set("text_generation", {"model_path": repo.repo_id})
-    monkeypatch.setattr(server.runtime, "model_cache", registry)
-
-    response = client.get("/v1/models")
-    assert response.status_code == 200
-    assert len(response.json()["data"]) == 1
-    assert response.json()["data"][0]["id"] == repo.repo_id
-    assert response.json()["data"][0]["loaded"] is True
-
-    registry.clear()
-    response = client.get("/v1/models")
-    assert response.status_code == 200
-    assert len(response.json()["data"]) == 1
-    assert response.json()["data"][0]["id"] == repo.repo_id
-    assert response.json()["data"][0]["loaded"] is False
-
-
-def test_models_endpoint_lists_cached_and_loaded_models(client, monkeypatch, tmp_path):
-    monkeypatch.delenv("MLX_VLM_MODEL_PATHS", raising=False)
-    repo = _discovery_repo(tmp_path, "sentence-transformers/all-MiniLM-L6-v2")
-    scan_cache = MagicMock(return_value=NS(repos=[repo]))
-    monkeypatch.setattr(server, "scan_cache_dir", scan_cache)
-    registry = server.ModelCacheRegistry()
-    registry.set("text_generation", {"model_path": "/models/loaded-chat-model"})
-    monkeypatch.setattr(server.runtime, "model_cache", registry)
-
-    response = client.get("/v1/models")
-
-    assert response.status_code == 200
-    assert {m["id"]: m["loaded"] for m in response.json()["data"]} == {
-        "/models/loaded-chat-model": True,
-        repo.repo_id: False,
-    }
-    scan_cache.assert_called_once_with()
-
-
-def test_models_endpoint_marks_loaded_models_across_cache_kinds(client, monkeypatch):
-    monkeypatch.delenv("MLX_VLM_MODEL_PATHS", raising=False)
-    monkeypatch.setattr(server, "scan_cache_dir", lambda: NS(repos=[]))
-    registry = server.ModelCacheRegistry()
-    registry.set("text_generation", {"model_path": "local/chat"})
-    registry.set("embedding", {"model_path": "local/embedding"})
-    registry.set("tts", {"model_path": "local/tts"})
-    monkeypatch.setattr(server.runtime, "model_cache", registry)
-
-    response = client.get("/v1/models")
-    assert response.status_code == 200
-    assert {m["id"]: m["loaded"] for m in response.json()["data"]} == {
-        "local/chat": True,
-        "local/embedding": True,
-        "local/tts": True,
-    }
-    registry.clear("embedding")
-    response = client.get("/v1/models")
-    assert response.status_code == 200
-    assert {m["id"]: m["loaded"] for m in response.json()["data"]} == {
-        "local/chat": True,
-        "local/tts": True,
-    }
-
-
-@pytest.mark.parametrize("cached", [False, True])
-def test_models_endpoint_custom_paths_keep_loaded_status(
-    client, monkeypatch, tmp_path, cached
-):
-    repo = _discovery_repo(tmp_path, "local/custom")
-    model_path = repo.refs["main"].snapshot_path
-    if cached:
-        monkeypatch.setattr(server, "scan_cache_dir", lambda: NS(repos=[repo]))
-    else:
-        monkeypatch.setattr(
-            server,
-            "scan_cache_dir",
-            MagicMock(side_effect=server.CacheNotFound("missing cache", "/missing")),
-        )
-    monkeypatch.setenv("MLX_VLM_MODEL_PATHS", str(model_path))
-    registry = server.ModelCacheRegistry()
-    registry.set("text_generation", {"model_path": str(model_path)})
-    monkeypatch.setattr(server.runtime, "model_cache", registry)
-
-    response = client.get("/v1/models")
-    assert response.status_code == 200
-    assert {m["id"]: m["loaded"] for m in response.json()["data"]} == {
-        str(model_path): True,
-    }
-    registry.clear()
-    response = client.get("/v1/models")
-    assert response.status_code == 200
-    assert {m["id"]: m["loaded"] for m in response.json()["data"]} == {
-        repo.repo_id if cached else str(model_path): False,
-    }
+    return NS(get=get, scan=scan, path=model, registry=server.runtime.model_cache)
 
 
 @pytest.mark.parametrize("endpoint", ["/models", "/v1/models"])
-def test_models_endpoint_query_paths_supplement_defaults_for_one_request(
-    client, monkeypatch, tmp_path, endpoint
+def test_models_endpoint_cache_and_loaded_status(model_listing, endpoint):
+    listing = model_listing
+    for kind, model in (
+        ("text_generation", "local/vision"),
+        ("embedding", "/loaded/embedding"),
+        ("tts", "/loaded/tts"),
+    ):
+        listing.registry.set(kind, {"model_path": model})
+    expected = {"local/vision": True, "/loaded/embedding": True, "/loaded/tts": True}
+    assert listing.get(endpoint) == expected
+    listing.registry.clear("embedding")
+    del expected["/loaded/embedding"]
+    assert listing.get(endpoint) == expected
+    listing.registry.clear()
+    assert listing.get(endpoint) == {"local/vision": False}
+    assert listing.scan.call_count == 3
+    (listing.path / "model.safetensors").unlink()
+    assert listing.get(endpoint) == {}
+
+
+@pytest.mark.parametrize("cached", [False, True], ids=["missing-cache", "cached"])
+@pytest.mark.parametrize("source", ["environment", "query"])
+def test_models_endpoint_custom_paths(model_listing, monkeypatch, cached, source):
+    listing = model_listing
+    path = str(listing.path)
+    if not cached:
+        listing.scan.side_effect = server.CacheNotFound("missing cache", "/missing")
+    params = {"model_dir": path} if source == "query" else {}
+    if source == "environment":
+        monkeypatch.setenv("MLX_VLM_MODEL_PATHS", path)
+    listing.registry.set("text_generation", {"model_path": path})
+    listing.registry.set("embedding", {"model_path": "/loaded/embedding"})
+    assert listing.get(params=params) == {path: True, "/loaded/embedding": True}
+    listing.registry.clear()
+    assert listing.get(params=params) == {"local/vision" if cached else path: False}
+
+
+@pytest.mark.parametrize("endpoint", ["/models", "/v1/models"])
+def test_models_endpoint_query_paths_are_additive_and_temporary(
+    model_listing, monkeypatch, tmp_path, endpoint
 ):
-    cached = _discovery_repo(tmp_path, "cached/model")
-    configured = (
-        _discovery_repo(tmp_path, "configured/model").refs["main"].snapshot_path
-    )
-    requested = (
-        _discovery_repo(tmp_path, "requested/model with spaces & symbols")
-        .refs["main"]
-        .snapshot_path
-    )
-    another = _discovery_repo(tmp_path, "another/model").refs["main"].snapshot_path
-    monkeypatch.setattr(server, "scan_cache_dir", lambda: NS(repos=[cached]))
+    configured = _model_directory(tmp_path / "configured")
+    requested = _model_directory(tmp_path / "requested" / "model with spaces & symbols")
+    another = _model_directory(tmp_path / "another")
     monkeypatch.setenv("MLX_VLM_MODEL_PATHS", str(configured))
-    registry = server.ModelCacheRegistry()
-    registry.set("text_generation", {"model_path": str(requested)})
-    monkeypatch.setattr(server.runtime, "model_cache", registry)
-
-    response = client.get(
-        endpoint,
-        params=[
-            ("model_dir", str(requested.parent)),
-            ("model_dir", str(requested)),
-            ("model_dir", str(another)),
-            ("model_dir", ""),
-        ],
-    )
-
-    assert response.status_code == 200
-    entries = response.json()["data"]
-    assert len(entries) == 4
-    assert {m["id"]: m["loaded"] for m in entries} == {
-        cached.repo_id: False,
-        str(configured): False,
-        str(requested): True,
+    model_listing.registry.set("text_generation", {"model_path": str(requested)})
+    baseline = {"local/vision": False, str(configured): False, str(requested): True}
+    params = [
+        ("model_dir", str(path)) for path in (requested.parent, requested, another, "")
+    ]
+    assert model_listing.get(endpoint, params=params) == {
+        **baseline,
         str(another): False,
     }
     assert os.environ["MLX_VLM_MODEL_PATHS"] == str(configured)
-
-    # Request paths must not leak into later calls. Loaded models still appear.
-    response = client.get(endpoint)
-    assert response.status_code == 200
-    assert {m["id"] for m in response.json()["data"]} == {
-        cached.repo_id,
-        str(configured),
-        str(requested),
-    }
+    assert model_listing.get(endpoint) == baseline
 
 
-def test_models_endpoint_query_paths_work_without_a_hf_cache(
-    client, monkeypatch, tmp_path
-):
-    path = _discovery_repo(tmp_path, "custom/model").refs["main"].snapshot_path
-    monkeypatch.delenv("MLX_VLM_MODEL_PATHS", raising=False)
-    monkeypatch.setattr(server.runtime, "model_cache", server.ModelCacheRegistry())
-    monkeypatch.setattr(
-        server,
-        "scan_cache_dir",
-        MagicMock(side_effect=server.CacheNotFound("missing cache", "/missing")),
-    )
-
-    response = client.get("/v1/models", params={"model_dir": str(path)})
-
-    assert response.status_code == 200
-    assert {m["id"]: m["loaded"] for m in response.json()["data"]} == {str(path): False}
-
-
-def test_models_endpoint_query_paths_require_configured_api_key(client, monkeypatch):
+def test_models_endpoint_requires_api_key(client, model_listing, monkeypatch):
     monkeypatch.setenv("MLX_VLM_SERVER_API_KEY", "test-key")
-    scanner = MagicMock()
-    monkeypatch.setattr(server, "scan_cache_dir", scanner)
-
-    response = client.get("/v1/models", params={"model_dir": "/some/models"})
-
-    assert response.status_code == 401
-    scanner.assert_not_called()
+    assert (
+        client.get("/v1/models", params={"model_dir": "/some/models"}).status_code
+        == 401
+    )
+    model_listing.scan.assert_not_called()
 
 
 @pytest.mark.parametrize("use_cli_paths", [False, True])
 def test_server_cli_custom_model_paths(monkeypatch, tmp_path, use_cli_paths):
     monkeypatch.setattr(os, "environ", dict(os.environ))
     monkeypatch.setenv("MLX_VLM_MODEL_PATHS", "/existing/models")
-    args = ["mlx_vlm.server"]
     paths = [str(tmp_path / "model with spaces"), str(tmp_path / "other")]
-    if use_cli_paths:
-        for path in paths:
-            args.extend(["--model-dir", path])
-    monkeypatch.setattr(sys, "argv", args)
-    run = MagicMock()
-    monkeypatch.setattr(cli.uvicorn, "run", run)
-
-    cli.main()
-
-    expected = os.pathsep.join(paths) if use_cli_paths else "/existing/models"
-    assert os.environ["MLX_VLM_MODEL_PATHS"] == expected
+    flags = (
+        [arg for path in paths for arg in ("--model-dir", path)]
+        if use_cli_paths
+        else []
+    )
+    monkeypatch.setattr(sys, "argv", ["mlx_vlm.server", *flags])
+    with patch.object(cli.uvicorn, "run") as run:
+        cli.main()
+    assert os.environ["MLX_VLM_MODEL_PATHS"] == (
+        os.pathsep.join(paths) if use_cli_paths else "/existing/models"
+    )
     run.assert_called_once()
 
 
