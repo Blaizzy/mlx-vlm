@@ -25,6 +25,7 @@ import numpy as np
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from huggingface_hub import scan_cache_dir
 from PIL import Image
 from transformers.utils.chat_parsing import ResponseParser, parse_response
 
@@ -45,6 +46,7 @@ from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.server import GenerationArguments as Args
 from mlx_vlm.server import ResponseGenerator as Generator
 from mlx_vlm.server import realtime
+from mlx_vlm.server.model_discovery import discover_models, is_model_directory
 from mlx_vlm.server.responses_state import ToolCallStreamState, _response_items_to_chat
 from mlx_vlm.server.runtime_config import RuntimeConfig
 from mlx_vlm.tests.test_processors import MINICPM_MULTICALL
@@ -697,59 +699,209 @@ def test_ar_thread_exception_reaches_pending_client_queue(monkeypatch):
         assert worker.is_alive()
 
 
-def test_models_endpoint_lists_single_file_safetensors_models(client, monkeypatch):
-    monkeypatch.setenv("MLX_VLM_MODEL_DISCOVERY", "hf-cache")
-    repos = [
-        NS(
-            repo_id=name,
-            repo_type="model",
-            last_modified=123.0,
-            refs={
-                "main": NS(
-                    files=[
-                        NS(file_path=NS(name=f))
-                        for f in ["config.json", "tokenizer_config.json", *weights]
-                    ]
-                )
-            },
-        )
-        for name, weights in [
-            ("local/single-file-model", ["model.safetensors"]),
-            ("local/sharded-model", ["model.safetensors.index.json"]),
-            ("missing/weights", []),
-        ]
-    ]
-    monkeypatch.setattr(server, "scan_cache_dir", lambda: NS(repos=repos))
-    response = client.get("/v1/models")
-    assert response.status_code == 200
-    ids = {m["id"] for m in response.json()["data"]}
-    assert {
-        "local/single-file-model",
-        "local/sharded-model",
-    } <= ids and "missing/weights" not in ids
+class TestModelDiscovery:
+    @staticmethod
+    def _model_directory(path):
+        path.mkdir(parents=True)
+        (path / "config.json").write_text('{"model_type": "qwen2_vl"}')
+        (path / "model.safetensors").write_bytes(b"weights")
+        return path
 
-
-def test_models_endpoint_includes_loaded_local_model_without_hf_cache(
-    client, monkeypatch
-):
-    monkeypatch.delenv("MLX_VLM_MODEL_DISCOVERY", raising=False)
-    monkeypatch.setattr(
-        server,
-        "scan_cache_dir",
-        MagicMock(side_effect=server.CacheNotFound("missing cache", "/missing")),
+    @pytest.mark.parametrize(
+        "config,valid",
+        [
+            ('{"model_type": "qwen2_vl"}', True),
+            ('{"model_type": "custom", "model_file": "model.py"}', True),
+            ("not json", False),
+            ("{}", False),
+        ],
+        ids=["no-tokenizer", "custom-code", "malformed", "empty"],
     )
-    monkeypatch.setitem(server.runtime.model_cache, "model_path", "/models/local-qwen")
+    def test_metadata(self, tmp_path, config, valid):
+        model = self._model_directory(tmp_path / "model")
+        (model / "config.json").write_text(config)
+        (model / "model.py").write_text("raise RuntimeError('must not execute')")
+        assert is_model_directory(model) is valid
 
-    response = client.get("/v1/models")
-
-    assert response.status_code == 200
-    assert response.json()["data"] == [
-        dict(
-            id="/models/local-qwen",
-            object="model",
-            created=response.json()["data"][0]["created"],
+    @pytest.mark.parametrize(
+        "shard,valid",
+        [(None, False), (b"", False), (b"weights", True)],
+        ids=["missing", "empty", "complete"],
+    )
+    def test_shards(self, tmp_path, shard, valid):
+        model = self._model_directory(tmp_path / "model")
+        (model / "model.safetensors.index.json").write_text(
+            '{"weight_map": {"a": "model.safetensors", "b": "second.safetensors"}}'
         )
-    ]
+        if shard is not None:
+            (model / "second.safetensors").write_bytes(shard)
+        assert is_model_directory(model) is valid
+
+    def test_rejects_adapters_and_broken_links(self, tmp_path):
+        model = self._model_directory(tmp_path / "adapter")
+        (model / "model.safetensors").rename(model / "adapter_model.safetensors")
+        assert not is_model_directory(model)
+        (model / "model.safetensors").symlink_to(model / "missing.safetensors")
+        assert not is_model_directory(model)
+
+    def test_pipeline_components(self, tmp_path):
+        pipeline = tmp_path / "pipeline"
+        component = self._model_directory(pipeline / "transformer")
+        (pipeline / "model_index.json").write_text('{"_class_name": "FluxPipeline"}')
+        (pipeline / "tokenizer").mkdir()
+        assert is_model_directory(pipeline)
+        (component / "model.safetensors").unlink()
+        assert not is_model_directory(pipeline)
+        self._model_directory(pipeline / "text_encoder")
+        (component / "model.safetensors.index.json").write_text(
+            '{"weight_map": {"a": "missing.safetensors"}}'
+        )
+        assert not is_model_directory(pipeline)
+
+    @pytest.mark.parametrize("main", ["absent", "complete", "incomplete"])
+    def test_revisions_and_local_alias(self, tmp_path, main):
+        repo = tmp_path / "models--local--vision"
+        snapshots = [
+            self._model_directory(repo / "snapshots" / (revision * 40))
+            for revision in "ab"
+        ]
+        for modified, snapshot in zip((100, 200), snapshots):
+            for path in (snapshot, *snapshot.iterdir()):
+                os.utime(path, (modified, modified))
+        if main != "absent":
+            (repo / "refs").mkdir()
+            (repo / "refs" / "main").write_text("a" * 40)
+        if main == "incomplete":
+            (snapshots[0] / "model.safetensors").unlink()
+        selected = snapshots[0] if main == "complete" else snapshots[1]
+        cache = scan_cache_dir(tmp_path)
+        found = discover_models(cache)
+        assert found == [
+            dict(
+                id="local/vision" if main == "complete" else str(selected),
+                path=selected,
+                created=100 if main == "complete" else 200,
+            )
+        ]
+        assert discover_models(cache, [str(selected)]) == found
+
+    @pytest.mark.parametrize("source", ["parent", "home", "model", "alias", "combined"])
+    def test_custom_roots_and_aliases(self, tmp_path, source):
+        root = tmp_path / "models"
+        model = self._model_directory(root / "custom")
+        alias = root / "alias"
+        alias.symlink_to(model, target_is_directory=True)
+        (root / "unrelated").mkdir()
+        sources = dict(
+            parent=str(root),
+            home="~/" + os.path.relpath(root, Path.home()),
+            model=str(model),
+            alias=str(alias),
+            missing=str(root / "missing"),
+        )
+        paths = list(sources.values()) if source == "combined" else [sources[source]]
+        found = discover_models(NS(repos=[]), paths)
+        assert (
+            len(found) == 1
+            and found[0]["id"] == str(model)
+            and found[0]["path"] == model
+        )
+
+    @pytest.fixture
+    def model_listing(self, client, monkeypatch, tmp_path):
+        _reset_runtime(monkeypatch)
+        monkeypatch.delenv("MLX_VLM_MODEL_PATHS", raising=False)
+        cache_root = tmp_path / "cache"
+        model = self._model_directory(
+            cache_root / "models--local--vision" / "snapshots" / ("a" * 40)
+        )
+        refs = model.parent.parent / "refs"
+        refs.mkdir()
+        (refs / "main").write_text("a" * 40)
+        scan = Mock(side_effect=lambda: scan_cache_dir(cache_root))
+        monkeypatch.setattr(server, "scan_cache_dir", scan)
+
+        def get(endpoint="/v1/models", **kwargs):
+            response = client.get(endpoint, **kwargs)
+            assert response.status_code == 200
+            entries = response.json()["data"]
+            ids = [m["id"] for m in entries]
+            assert ids == sorted(set(ids), key=str.lower)
+            return {m["id"]: m["loaded"] for m in entries}
+
+        return NS(get=get, scan=scan, path=model, registry=server.runtime.model_cache)
+
+    def test_endpoint_cache_and_loaded_status(self, model_listing):
+        listing = model_listing
+        for kind, model in (
+            ("text_generation", "local/vision"),
+            ("embedding", "/loaded/embedding"),
+            ("tts", "/loaded/tts"),
+        ):
+            listing.registry.set(kind, {"model_path": model})
+        expected = {
+            "local/vision": True,
+            "/loaded/embedding": True,
+            "/loaded/tts": True,
+        }
+        assert listing.get("/models") == listing.get() == expected
+        listing.registry.clear()
+        assert listing.get() == {"local/vision": False}
+        (listing.path / "model.safetensors").unlink()
+        assert listing.get() == {}
+
+    @pytest.mark.parametrize("cached", [False, True], ids=["missing-cache", "cached"])
+    @pytest.mark.parametrize("source", ["environment", "query"])
+    def test_endpoint_custom_paths(self, model_listing, monkeypatch, cached, source):
+        listing = model_listing
+        path = str(listing.path)
+        if not cached:
+            listing.scan.side_effect = server.CacheNotFound("missing cache", "/missing")
+        params = {"model_dir": path} if source == "query" else {}
+        if source == "environment":
+            monkeypatch.setenv("MLX_VLM_MODEL_PATHS", path)
+        listing.registry.set("text_generation", {"model_path": path})
+        listing.registry.set("embedding", {"model_path": "/loaded/embedding"})
+        assert listing.get(params=params) == {path: True, "/loaded/embedding": True}
+        listing.registry.clear()
+        assert listing.get(params=params) == {"local/vision" if cached else path: False}
+
+    def test_endpoint_query_paths_are_additive_and_temporary(
+        self, model_listing, monkeypatch, tmp_path
+    ):
+        configured = self._model_directory(tmp_path / "configured")
+        requested = self._model_directory(
+            tmp_path / "requested" / "model with spaces & symbols"
+        )
+        another = self._model_directory(tmp_path / "another")
+        monkeypatch.setenv("MLX_VLM_MODEL_PATHS", str(configured))
+        baseline = {"local/vision": False, str(configured): False}
+        params = [("model_dir", str(path)) for path in (requested.parent, another, "")]
+        assert model_listing.get(params=params) == {
+            **baseline,
+            str(requested): False,
+            str(another): False,
+        }
+        assert os.environ["MLX_VLM_MODEL_PATHS"] == str(configured)
+        assert model_listing.get() == baseline
+
+    @pytest.mark.parametrize("use_cli_paths", [False, True])
+    def test_cli_custom_model_paths(self, monkeypatch, tmp_path, use_cli_paths):
+        monkeypatch.setattr(os, "environ", dict(os.environ))
+        monkeypatch.setenv("MLX_VLM_MODEL_PATHS", "/existing/models")
+        paths = [str(tmp_path / "model with spaces"), str(tmp_path / "other")]
+        flags = (
+            [arg for path in paths for arg in ("--model-dir", path)]
+            if use_cli_paths
+            else []
+        )
+        monkeypatch.setattr(sys, "argv", ["mlx_vlm.server", *flags])
+        with patch.object(cli.uvicorn, "run") as run:
+            cli.main()
+        assert os.environ["MLX_VLM_MODEL_PATHS"] == (
+            os.pathsep.join(paths) if use_cli_paths else "/existing/models"
+        )
+        run.assert_called_once()
 
 
 def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
@@ -2125,7 +2277,6 @@ class TestResponseGenerator:
             ("thinking-budget", "THINKING_BUDGET", "128"),
             ("thinking-start-token", "THINKING_START_TOKEN", "<|START_THINKING|>"),
             ("thinking-eos-token", "THINKING_END_TOKEN", "<|END_THINKING|>"),
-            ("model-discovery", "MODEL_DISCOVERY", "served"),
             ("api-key", "SERVER_API_KEY", "admin-token"),
         ]
         expected = {"MLX_VLM_" + env: value for _, env, value in flags}
