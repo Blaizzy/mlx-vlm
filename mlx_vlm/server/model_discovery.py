@@ -50,8 +50,6 @@ def is_model_directory(directory: Path) -> bool:
         config = read_json_object(directory / "config.json")
         pipeline = read_json_object(directory / "model_index.json")
         if isinstance(pipeline.get("_class_name"), str):
-            # Pipeline weights live in component directories. Tokenizers and
-            # schedulers have no weight files and need no weight check.
             components = [
                 child
                 for child in directory.iterdir()
