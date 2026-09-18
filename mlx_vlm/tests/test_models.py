@@ -20,10 +20,12 @@ from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 import pytest
 from mlx.utils import tree_flatten, tree_map
 
 from mlx_vlm.models.base import InputEmbeddingsFeatures
+from mlx_vlm.models.cache import make_prompt_cache
 from mlx_vlm.utils import (
     _drop_modules_without_weights,
     _load_safetensors,
@@ -59,14 +61,174 @@ def capture_positions(
 class ModelChecks:
     """Reusable assertions; each JSON case constructs fresh configs and models."""
 
-    def forward_cache(self, model, vocab_size):
+    def forward_cache(self, model, vocab_size, *, chunk_sizes=()):
         model.eval()
         mx.eval(model.parameters())
         ids = mx.array([[1, 5, 9, 13, 2, 7, 11, 3]])
         assert model(ids).logits.shape == (1, 8, vocab_size)
+        if chunk_sizes:
+            for dtype in (mx.float32, mx.float16):
+                model.update(tree_map(lambda p: p.astype(dtype), model.parameters()))
+                self.prefill_parity(model, ids, {}, chunk_sizes)
+            return
         cache = model.language_model.make_cache()
         model(ids[:, :-1], cache=cache)
         assert model(ids[:, -1:], cache=cache).logits.shape == (1, 1, vocab_size)
+
+    def assert_close(self, actual, expected, *, logits=False):
+        assert actual.shape == expected.shape
+        assert mx.all(mx.isfinite(actual)).item()
+        tolerance = 5e-3 if actual.dtype == mx.float16 else 1e-4
+        # One-token attention uses a different Metal kernel from full prefill.
+        if logits:
+            tolerance = max(tolerance, 2e-3)
+        np.testing.assert_allclose(
+            np.array(actual.astype(mx.float32)),
+            np.array(expected.astype(mx.float32)),
+            atol=tolerance,
+            rtol=tolerance,
+        )
+
+    def prefill_parity(self, model, ids, media, chunk_sizes):
+        """Compare full, cached and chunked prefill, then decode one new token."""
+        language = model.language_model
+        features = model.get_input_embeddings(ids, **media).to_dict()
+        embeds = features.pop("inputs_embeds")
+        reference = model(ids, cache=make_prompt_cache(language), **media).logits
+        if ids.shape[0] > 1:
+            solo = []
+            for row in range(ids.shape[0]):
+                row_media = {
+                    key: value[row * count : (row + 1) * count]
+                    for key, value in media.items()
+                    for count in [value.shape[0] // ids.shape[0]]
+                }
+                solo.append(
+                    model(
+                        ids[row : row + 1],
+                        cache=make_prompt_cache(language),
+                        **row_media,
+                    ).logits
+                )
+            self.assert_close(reference, mx.concatenate(solo), logits=True)
+        token = mx.full((ids.shape[0], 1), 7, mx.int32)
+        extended = model(
+            mx.concatenate([ids, token], axis=1),
+            cache=make_prompt_cache(language),
+            **media,
+        ).logits[:, -1:]
+        for size in (ids.shape[1] - 1, *chunk_sizes):
+            cache, chunks = make_prompt_cache(language), []
+            for start in range(0, ids.shape[1], size):
+                stop = min(start + size, ids.shape[1])
+                chunks.append(
+                    language(
+                        ids[:, start:stop],
+                        inputs_embeds=embeds[:, start:stop],
+                        cache=cache,
+                        **features,
+                    ).logits
+                )
+            self.assert_close(mx.concatenate(chunks, axis=1), reference, logits=True)
+            decode = {k: v for k, v in features.items() if k != "position_ids"}
+            self.assert_close(
+                language(token, cache=cache, **decode).logits, extended, logits=True
+            )
+
+    def multimodal(self, model, config, *, image_grid, video_grid, chunk_sizes):
+        """Image/video fusion and DeepStack contracts across compatible models."""
+        core = getattr(model, "thinker", model)
+        config = getattr(config, "thinker_config", config)
+        vision, vc = core.vision_tower, config.vision_config
+        layers, width = len(vc.deepstack_visual_indexes), vc.out_hidden_size
+        assert layers > 0, "The multimodal case must enable DeepStack layers"
+        patch_width = vc.in_channels * vc.temporal_patch_size * vc.patch_size**2
+        tokens = {"image": config.image_token_id, "video": config.video_token_id}
+        grids = {"image": image_grid, "video": video_grid}
+        model.eval()
+        for dtype in (mx.float32, mx.float16):
+            model.update(tree_map(lambda p: p.astype(dtype), model.parameters()))
+            for layout in (
+                ("image",),
+                ("video",),
+                ("image", "video"),
+                ("video", "image"),
+            ):
+                for batch in (1, 2):
+                    rows, media, encoded = [], {}, {}
+                    for row in range(batch):
+                        order = layout if row == 0 else layout[::-1]
+                        ids = [1, 2]
+                        for kind in order:
+                            count = math.prod(grids[kind]) // vc.spatial_merge_size**2
+                            ids += [config.vision_start_token_id] + [
+                                tokens[kind]
+                            ] * count
+                            ids += [config.vision_end_token_id]
+                        rows.append(ids + [3, 4, 5])
+                    ids = mx.array(rows, mx.int32)
+                    for kind in layout:
+                        pixels = mx.random.normal(
+                            (batch * math.prod(grids[kind]), patch_width)
+                        ).astype(dtype)
+                        grid = mx.array([grids[kind]] * batch)
+                        media[
+                            "pixel_values" if kind == "image" else "pixel_values_videos"
+                        ] = pixels
+                        media[kind + "_grid_thw"] = grid
+                        encoded[kind] = vision(pixels, grid)
+                    features = model.get_input_embeddings(ids, **media)
+                    assert isinstance(features, InputEmbeddingsFeatures)
+                    mask = (ids == tokens["image"]) | (ids == tokens["video"])
+                    assert mx.array_equal(features.visual_pos_masks, mask).item()
+                    residuals = features.deepstack_visual_embeds
+                    if isinstance(residuals, (list, tuple)):
+                        residuals = mx.stack(residuals)
+                    assert residuals is not None and residuals.dtype == dtype
+                    expected = mx.zeros((*ids.shape, layers, width), dtype)
+                    expected_embeds = model.language_model.model.embed_tokens(ids)
+                    for kind in layout:
+                        positions = mx.array(
+                            [
+                                i
+                                for i, t in enumerate(ids.flatten().tolist())
+                                if t == tokens[kind]
+                            ],
+                            mx.uint32,
+                        )
+                        embeddings, layer_features = encoded[kind]
+                        assert len(layer_features) == layers
+                        flat = expected.reshape(-1, layers, width)
+                        flat[positions] = mx.stack(list(layer_features), axis=1)
+                        expected = flat.reshape(expected.shape)
+                        flat = expected_embeds.reshape(-1, width)
+                        flat[positions] = embeddings
+                        expected_embeds = flat.reshape(expected_embeds.shape)
+                    self.assert_close(features.inputs_embeds, expected_embeds)
+                    if residuals.ndim == 4:
+                        self.assert_close(residuals, expected)
+                    else:
+                        positions = mx.array(
+                            [i for i, v in enumerate(mask.flatten().tolist()) if v],
+                            mx.uint32,
+                        )
+                        self.assert_close(
+                            residuals,
+                            expected.reshape(-1, layers, width)[positions].transpose(
+                                1, 0, 2
+                            ),
+                        )
+                    for layer in range(layers):
+                        value = (
+                            residuals[:, :, layer]
+                            if residuals.ndim == 4
+                            else residuals[layer]
+                        )
+                        injected = model.language_model.model._deepstack_process(
+                            mx.zeros_like(features.inputs_embeds), mask, value
+                        )
+                        self.assert_close(injected, expected[:, :, layer])
+                    self.prefill_parity(model, ids, media, chunk_sizes)
 
     def input_embeddings(self, model, model_name):
         result = model.get_input_embeddings(input_ids=mx.array([[1, 2, 3, 4, 5]]))
@@ -331,9 +493,14 @@ def check_arguments(kind, case, model, config):
     """Keep shared component selection and dimension wiring in Python."""
     name = case["module"]
     # Phi3-V keeps language dimensions on the outer config.
-    text = config if name == "phi3_v" else getattr(config, "text_config", config)
+    core_config = getattr(config, "thinker_config", config)
+    text = (
+        config if name == "phi3_v" else getattr(core_config, "text_config", core_config)
+    )
     if kind == "forward_cache":
-        return (model, text.vocab_size), {}
+        return (model, text.vocab_size), case.get("forward_cache", {})
+    if kind == "multimodal":
+        return (model, config), case["multimodal"]
     if kind == "input_embeddings":
         return (model, name), {}
     if kind == "audio":
@@ -405,6 +572,8 @@ def check_arguments(kind, case, model, config):
 
 @pytest.mark.parametrize("case", DATA["cases"], ids=lambda case: case["id"])
 def test_model_contract(case):
+    if "multimodal" in case["checks"]:
+        mx.random.seed(17)
     module = importlib.import_module("mlx_vlm.models." + case["module"])
     config = build_config(module, case["config"])
     model = module.Model(config)

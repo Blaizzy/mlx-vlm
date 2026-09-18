@@ -1115,7 +1115,7 @@
         "text_config": {
           "model_type": "qwen3_vl_text",
           "hidden_size": 16,
-          "num_hidden_layers": 1,
+          "num_hidden_layers": 2,
           "intermediate_size": 32,
           "num_attention_heads": 2,
           "vocab_size": 32,
@@ -1124,21 +1124,46 @@
           "head_dim": 8,
           "rope_theta": 1000.0,
           "max_position_embeddings": 1000,
-          "rope_scaling": {"rope_type": "mrope", "mrope_section": [2, 1, 1]}
+          "rope_scaling": {
+            "rope_type": "mrope",
+            "mrope_section": [2, 1, 1]
+          }
         },
         "vision_config": {
-          "depth": 1,
+          "depth": 2,
           "hidden_size": 16,
           "num_heads": 2,
           "out_hidden_size": 16,
-          "num_position_embeddings": 4,
-          "deepstack_visual_indexes": []
+          "num_position_embeddings": 16,
+          "deepstack_visual_indexes": [0, 1],
+          "intermediate_size": 32,
+          "image_size": 8,
+          "patch_size": 2,
+          "spatial_patch_size": 2,
+          "spatial_merge_size": 2
         },
         "model_type": "qwen3_vl",
         "image_token_id": 31,
-        "vocab_size": 32
+        "vocab_size": 32,
+        "video_token_id": 30,
+        "vision_start_token_id": 29,
+        "vision_end_token_id": 28
       },
-      "checks": ["input_embeddings", "request_positions", "chunked_positions"]
+      "checks": [
+        "forward_cache",
+        "multimodal",
+        "input_embeddings",
+        "request_positions",
+        "chunked_positions"
+      ],
+      "forward_cache": {
+        "chunk_sizes": [1, 3, 5]
+      },
+      "multimodal": {
+        "image_grid": [1, 4, 4],
+        "video_grid": [2, 4, 4],
+        "chunk_sizes": [3, 5, 7]
+      }
     },
     {
       "id": "TestGetInputEmbeddings.mistral3_input_embeddings",
@@ -1496,7 +1521,7 @@
       "config": {
         "thinker_config": {
           "text_config": {
-            "num_hidden_layers": 1,
+            "num_hidden_layers": 2,
             "hidden_size": 16,
             "intermediate_size": 32,
             "num_attention_heads": 2,
@@ -1513,11 +1538,17 @@
             "max_position_embeddings": 128
           },
           "vision_config": {
-            "depth": 1,
+            "depth": 2,
             "hidden_size": 16,
             "intermediate_size": 32,
             "out_hidden_size": 16,
-            "num_heads": 2
+            "num_heads": 2,
+            "image_size": 8,
+            "patch_size": 2,
+            "spatial_patch_size": 2,
+            "spatial_merge_size": 2,
+            "num_position_embeddings": 16,
+            "deepstack_visual_indexes": [0, 1]
           },
           "audio_config": {
             "d_model": 16,
@@ -1526,7 +1557,12 @@
             "encoder_ffn_dim": 32,
             "num_hidden_layers": 1,
             "output_dim": 16
-          }
+          },
+          "image_token_id": 31,
+          "video_token_id": 30,
+          "vision_start_token_id": 29,
+          "vision_end_token_id": 28,
+          "audio_token_id": 27
         },
         "talker_config": {
           "text_config": {
@@ -1559,7 +1595,21 @@
         "code2wav_config": {},
         "enable_audio_output": false
       },
-      "checks": ["input_embeddings", "request_positions", "chunked_positions"]
+      "checks": [
+        "forward_cache",
+        "multimodal",
+        "input_embeddings",
+        "request_positions",
+        "chunked_positions"
+      ],
+      "forward_cache": {
+        "chunk_sizes": [1, 3, 5]
+      },
+      "multimodal": {
+        "image_grid": [1, 4, 4],
+        "video_grid": [2, 4, 4],
+        "chunk_sizes": [3, 5, 7]
+      }
     }
   ],
   "dense": {
