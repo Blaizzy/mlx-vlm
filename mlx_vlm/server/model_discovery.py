@@ -15,13 +15,14 @@ def read_json_object(path: Path) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def _has_weight_files(directory: Path) -> bool:
+def _weight_status(directory: Path) -> bool | None:
+    """Return weight validity, or None when no weight files or indexes exist."""
+
     def present(path):
         return path.is_file() and path.stat().st_size > 0
 
-    indexes = list(directory.glob("*.safetensors.index.json"))
     shards = set()
-    for index in indexes:
+    for index in directory.glob("*.safetensors.index.json"):
         weight_map = read_json_object(index).get("weight_map")
         if not isinstance(weight_map, dict) or not weight_map:
             return False
@@ -29,7 +30,7 @@ def _has_weight_files(directory: Path) -> bool:
             if not isinstance(filename, str):
                 return False
             shards.add(Path(filename))
-    if indexes:
+    if shards:
         return all(
             not shard.is_absolute()
             and ".." not in shard.parts
@@ -37,9 +38,12 @@ def _has_weight_files(directory: Path) -> bool:
             and present(directory / shard)
             for shard in shards
         )
+    weights = list(directory.glob("*.safetensors"))
+    if not weights:
+        return None
     return any(
         present(path)
-        for path in directory.glob("*.safetensors")
+        for path in weights
         if path.name not in {"adapter_model.safetensors", "consolidated.safetensors"}
     )
 
@@ -47,19 +51,15 @@ def _has_weight_files(directory: Path) -> bool:
 def is_model_directory(directory: Path) -> bool:
     """Check metadata and weight availability, not architecture compatibility."""
     try:
-        config = read_json_object(directory / "config.json")
         pipeline = read_json_object(directory / "model_index.json")
         if isinstance(pipeline.get("_class_name"), str):
             components = [
-                child
+                valid
                 for child in directory.iterdir()
-                if child.is_dir()
-                and (
-                    any(child.glob("*.safetensors"))
-                    or any(child.glob("*.safetensors.index.json"))
-                )
+                if child.is_dir() and (valid := _weight_status(child)) is not None
             ]
-            return bool(components) and all(_has_weight_files(p) for p in components)
+            return bool(components) and all(components)
+        config = read_json_object(directory / "config.json")
         model_type = config.get("model_type") or config.get("speculators_model_type")
         architectures = config.get("architectures")
         has_metadata = (isinstance(model_type, str) and bool(model_type.strip())) or (
@@ -67,17 +67,16 @@ def is_model_directory(directory: Path) -> bool:
             and bool(architectures)
             and all(isinstance(a, str) and a.strip() for a in architectures)
         )
-        return bool(has_metadata) and _has_weight_files(directory)
+        return has_metadata and _weight_status(directory) is True
     except (OSError, RuntimeError):
         return False
 
 
 def discover_models(cache_info, paths: Iterable[str] = ()) -> list[dict]:
-    """Find HF snapshots and explicit model directories or their immediate children.
+    """Discover HF snapshots and custom model folders or their immediate children.
 
-    Prefer a repo's main revision. For a repo without a usable main snapshot,
-    return the newest usable snapshot's path so requests cannot fetch a different
-    revision. Local aliases are deduplicated using their resolved directory.
+    Prefer main, then the newest usable revision. Deduplicate by resolved path,
+    also used as the ID for non-main snapshots and custom models.
     """
     models = {}
 
@@ -99,12 +98,10 @@ def discover_models(cache_info, paths: Iterable[str] = ()) -> list[dict]:
         if repo.repo_type != "model":
             continue
         main = repo.refs.get("main")
-        revisions = sorted(
-            repo.revisions, key=lambda r: (-r.last_modified, str(r.snapshot_path))
-        )
-        if main is not None:
-            revisions = [main, *(r for r in revisions if r != main)]
-        for revision in revisions:
+        for revision in sorted(
+            repo.revisions,
+            key=lambda r: (r != main, -r.last_modified, str(r.snapshot_path)),
+        ):
             if add(
                 revision.snapshot_path,
                 model_id=repo.repo_id if revision == main else None,
@@ -114,7 +111,7 @@ def discover_models(cache_info, paths: Iterable[str] = ()) -> list[dict]:
 
     for value in paths:
         try:
-            root = Path(value).expanduser().resolve()
+            root = Path(value).expanduser()
             # A model directory must not have its components listed separately.
             if (root / "config.json").exists() or (root / "model_index.json").exists():
                 candidates = [root]

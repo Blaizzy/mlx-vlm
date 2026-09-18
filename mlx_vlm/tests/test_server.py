@@ -757,7 +757,12 @@ def test_pipeline_components_use_the_same_weight_checks(tmp_path):
     (pipeline / "model_index.json").write_text(
         json.dumps({"_class_name": "FluxPipeline"})
     )
+    (pipeline / "tokenizer").mkdir()
     assert is_model_directory(pipeline)
+    (pipeline / "transformer" / "model.safetensors").unlink()
+    assert not is_model_directory(pipeline)
+    (pipeline / "transformer" / "model.safetensors").write_bytes(b"weights")
+    _model_directory(pipeline / "text_encoder")
     (pipeline / "transformer" / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": {"a": "missing.safetensors"}})
     )
@@ -775,6 +780,11 @@ def test_real_hf_cache_handles_non_main_revisions_and_prefers_main(tmp_path):
     assert [m["id"] for m in discover_models(scan_cache_dir(tmp_path))] == [
         "local/vision"
     ]
+    newer = _model_directory(repo / "snapshots" / ("b" * 40))
+    newer_time = snapshot.stat().st_mtime + 10
+    for path in (newer, *newer.iterdir()):
+        os.utime(path, (newer_time, newer_time))
+    assert discover_models(scan_cache_dir(tmp_path))[0]["path"] == snapshot
 
 
 def test_custom_roots_direct_paths_and_symlinks_are_deduplicated(tmp_path):
