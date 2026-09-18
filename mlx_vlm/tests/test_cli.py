@@ -27,6 +27,7 @@ from mlx_vlm.tests.test_diffusion_models import FakeProcessor, make_diffusion_mo
 from mlx_vlm.tests.test_video_generation_models import _result as _video_result
 
 image_generation = importlib.import_module("mlx_vlm.generate.image")
+video = importlib.import_module("mlx_vlm.generate.video")
 video_generation = importlib.import_module("mlx_vlm.generate.video_generation")
 
 
@@ -316,7 +317,7 @@ def test_text_cli_media_and_arguments(capsys, mode):
         processor.process = lambda text=None, images=None, videos=None, **kw: None
     frames = [object() for _ in range(6)]
     with (
-        patch("mlx_vlm.generate.video.sample_video_frames", return_value=(frames, 2.0)),
+        patch.object(video, "sample_video_frames", return_value=(frames, 2.0)),
         _text_cli(args, processor, "demo" if image else "gemma4") as mocks,
     ):
         dispatch.main()
