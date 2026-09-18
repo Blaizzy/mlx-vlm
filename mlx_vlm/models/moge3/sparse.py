@@ -29,6 +29,9 @@ _KERNEL_OFFSETS = mx.array(
 # Target size of the (rows, 27, Ci) im2col gather in the submanifold conv.
 _GATHER_CHUNK_BYTES = 16 << 20
 
+# A 2x2x2 pooling cell over unique voxel coords holds at most eight members.
+_CELL_MEMBERS = 8
+
 
 def _coords_to_keys(coords, shape):
     """Raster-scan int64 keys for coords (..., 4) over spatial shape (B, H, W, Z)."""
@@ -113,22 +116,18 @@ def sparse_pool2x_mean(feats, coords, shape):
     seg_sorted = mx.cumsum(is_new.astype(mx.int32)) - 1
     num_segments = int(is_new.sum().item())
 
-    parent_idx = mx.zeros(coords.shape[0], dtype=mx.int32)
+    M, C = feats.shape
+    parent_idx = mx.zeros(M, dtype=mx.int32)
     parent_idx = parent_idx.at[order].add(seg_sorted)
 
-    sorted_feats = feats[order]
-    C = feats.shape[-1]
-    sums = mx.zeros((num_segments, C), dtype=feats.dtype)
-    sums = sums.at[seg_sorted].add(sorted_feats)
-    counts = mx.zeros((num_segments, 1), dtype=feats.dtype)
-    counts = counts.at[seg_sorted].add(
-        mx.ones(coords.shape[0], dtype=feats.dtype)[:, None]
-    )
-    out_feats = sums / counts
-
-    M = coords.shape[0]
     first_pos = mx.full((num_segments,), M, dtype=mx.int32)
     first_pos = first_pos.at[seg_sorted].minimum(mx.arange(M, dtype=mx.int32))
+    counts = mx.diff(mx.concatenate([first_pos, mx.array([M], dtype=mx.int32)]))
+    slot = mx.arange(_CELL_MEMBERS, dtype=mx.int32)[None]
+    rows = order[mx.minimum(first_pos[:, None] + slot, M - 1)]
+    rows = mx.where(slot < counts[:, None], rows, M)
+    padded = mx.concatenate([feats, mx.zeros((1, C), dtype=feats.dtype)])
+    out_feats = padded[rows].sum(axis=1) / counts[:, None].astype(feats.dtype)
     out_coords = tcoords[order[first_pos]]
     return out_feats, out_coords, out_shape, parent_idx
 
