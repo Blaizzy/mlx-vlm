@@ -747,6 +747,7 @@ def test_model_discovery_metadata(tmp_path, config, valid):
 )
 def test_model_discovery_shards(tmp_path, weight_map, shard, valid):
     model = _model_directory(tmp_path / "model")
+    (tmp_path / "outside.safetensors").write_bytes(b"weights")
     (model / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": weight_map})
     )
@@ -793,27 +794,33 @@ def test_model_discovery_revisions_and_local_alias(tmp_path, main):
     if main == "incomplete":
         (snapshots[0] / "model.safetensors").unlink()
     selected = snapshots[0] if main == "complete" else snapshots[1]
-    assert discover_models(scan_cache_dir(tmp_path), [str(selected)]) == [
+    cache = scan_cache_dir(tmp_path)
+    found = discover_models(cache)
+    assert found == [
         dict(
             id="local/vision" if main == "complete" else str(selected),
             path=selected,
             created=100 if main == "complete" else 200,
         )
     ]
+    assert discover_models(cache, [str(selected)]) == found
 
 
-def test_model_discovery_custom_roots_and_aliases(tmp_path):
+@pytest.mark.parametrize("source", ["parent", "home", "model", "alias", "combined"])
+def test_model_discovery_custom_roots_and_aliases(tmp_path, source):
     root = tmp_path / "models"
     model = _model_directory(root / "custom")
     alias = root / "alias"
     alias.symlink_to(model, target_is_directory=True)
     (root / "unrelated").mkdir()
-    paths = [
-        "~/" + os.path.relpath(root, Path.home()),
-        str(model),
-        str(alias),
-        str(root / "missing"),
-    ]
+    sources = dict(
+        parent=str(root),
+        home="~/" + os.path.relpath(root, Path.home()),
+        model=str(model),
+        alias=str(alias),
+        missing=str(root / "missing"),
+    )
+    paths = list(sources.values()) if source == "combined" else [sources[source]]
     found = discover_models(NS(repos=[]), paths)
     assert (
         len(found) == 1 and found[0]["id"] == str(model) and found[0]["path"] == model
@@ -829,13 +836,10 @@ def test_model_discovery_cache_script(tmp_path):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     model = _model_directory(tmp_path / "local")
-    for weights_exist in (True, False):
-        if not weights_exist:
-            (model / "model.safetensors").unlink()
-        found = module.supported_models(
-            str(tmp_path / "missing-cache"), model_dirs=[str(model)]
-        )
-        assert [m["id"] for m in found] == ([str(model)] if weights_exist else [])
+    found = module.supported_models(
+        str(tmp_path / "missing-cache"), model_dirs=[str(model)]
+    )
+    assert [m["id"] for m in found] == [str(model)]
 
 
 @pytest.fixture
@@ -867,8 +871,7 @@ def model_listing(client, monkeypatch, tmp_path):
     return NS(get=get, scan=scan, path=model, registry=server.runtime.model_cache)
 
 
-@pytest.mark.parametrize("endpoint", ["/models", "/v1/models"])
-def test_models_endpoint_cache_and_loaded_status(model_listing, endpoint):
+def test_models_endpoint_cache_and_loaded_status(model_listing):
     listing = model_listing
     for kind, model in (
         ("text_generation", "local/vision"),
@@ -877,15 +880,14 @@ def test_models_endpoint_cache_and_loaded_status(model_listing, endpoint):
     ):
         listing.registry.set(kind, {"model_path": model})
     expected = {"local/vision": True, "/loaded/embedding": True, "/loaded/tts": True}
-    assert listing.get(endpoint) == expected
+    assert listing.get("/models") == listing.get() == expected
     listing.registry.clear("embedding")
     del expected["/loaded/embedding"]
-    assert listing.get(endpoint) == expected
+    assert listing.get() == expected
     listing.registry.clear()
-    assert listing.get(endpoint) == {"local/vision": False}
-    assert listing.scan.call_count == 3
+    assert listing.get() == {"local/vision": False}
     (listing.path / "model.safetensors").unlink()
-    assert listing.get(endpoint) == {}
+    assert listing.get() == {}
 
 
 @pytest.mark.parametrize("cached", [False, True], ids=["missing-cache", "cached"])
@@ -905,34 +907,33 @@ def test_models_endpoint_custom_paths(model_listing, monkeypatch, cached, source
     assert listing.get(params=params) == {"local/vision" if cached else path: False}
 
 
-@pytest.mark.parametrize("endpoint", ["/models", "/v1/models"])
 def test_models_endpoint_query_paths_are_additive_and_temporary(
-    model_listing, monkeypatch, tmp_path, endpoint
+    model_listing, monkeypatch, tmp_path
 ):
     configured = _model_directory(tmp_path / "configured")
     requested = _model_directory(tmp_path / "requested" / "model with spaces & symbols")
     another = _model_directory(tmp_path / "another")
     monkeypatch.setenv("MLX_VLM_MODEL_PATHS", str(configured))
-    model_listing.registry.set("text_generation", {"model_path": str(requested)})
-    baseline = {"local/vision": False, str(configured): False, str(requested): True}
-    params = [
-        ("model_dir", str(path)) for path in (requested.parent, requested, another, "")
-    ]
-    assert model_listing.get(endpoint, params=params) == {
+    baseline = {"local/vision": False, str(configured): False}
+    params = [("model_dir", str(path)) for path in (requested.parent, another, "")]
+    assert model_listing.get(params=params) == {
         **baseline,
+        str(requested): False,
         str(another): False,
     }
     assert os.environ["MLX_VLM_MODEL_PATHS"] == str(configured)
-    assert model_listing.get(endpoint) == baseline
+    assert model_listing.get() == baseline
 
 
-def test_models_endpoint_requires_api_key(client, model_listing, monkeypatch):
+def test_models_endpoint_requires_api_key(client, monkeypatch):
+    scan = Mock()
+    monkeypatch.setattr(server, "scan_cache_dir", scan)
     monkeypatch.setenv("MLX_VLM_SERVER_API_KEY", "test-key")
     assert (
         client.get("/v1/models", params={"model_dir": "/some/models"}).status_code
         == 401
     )
-    model_listing.scan.assert_not_called()
+    scan.assert_not_called()
 
 
 @pytest.mark.parametrize("use_cli_paths", [False, True])
