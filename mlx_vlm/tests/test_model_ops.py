@@ -21,6 +21,11 @@ import mlx_vlm.models.rope_utils as rope_utils
 from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
 from mlx_vlm.fp8 import _dequantize_fp8_weight, _quantize_fp8_weight
 from mlx_vlm.models.cache import KVCache
+from mlx_vlm.models.deepseek_v4.hyper_connection import (
+    _hc_sinkhorn_split_kernel,
+    _hc_split_sinkhorn_ops,
+    hc_split_sinkhorn,
+)
 from mlx_vlm.models.mla import max_absorbed_queries
 from mlx_vlm.models.paddleocr_vl.config import VisionConfig
 from mlx_vlm.models.paddleocr_vl.vision import Attention, VisionModel
@@ -43,6 +48,7 @@ from mlx_vlm.quantization.one_bit import (
     one_bit_quantized_matmul,
     replace_one_bit_modules,
 )
+from mlx_vlm.tests.test_models import tiny_config
 from mlx_vlm.utils import (
     _transform_modelopt_nvfp4_weights,
     get_model_and_args,
@@ -183,6 +189,397 @@ class TestIndexerGateUnchanged(unittest.TestCase):
                     gate,
                     f"{m}: the first-query top-k gather is no longer gated on L == 1",
                 )
+
+
+class TestDeepseekV41Indexer(unittest.TestCase):
+    @staticmethod
+    def _config():
+        return tiny_config(
+            "deepseek_v41",
+            "sparse",
+            num_hidden_layers=3,
+            compress_ratios=[2, 2, 2],
+            head_dim=16,
+            candidate_topk_blocks=4,
+        )
+
+    def test_deepseek_v41_indexer_prefill_decode(self):
+        from mlx_vlm.models.deepseek_v41.language import DeepseekV41Cache, Indexer
+
+        config = self._config()
+        indexer = Indexer(config, 0)
+        self.assertTrue(indexer.owns_k)
+        mx.eval(indexer.parameters())
+        shared = DeepseekV41Cache(8, [2] * 8)
+
+        x = mx.random.normal((1, 4, 16))
+        qr = mx.random.normal((1, 4, 8))
+        latent = mx.random.normal((1, 2, 16))
+        idxs = indexer(x, qr, latent, 0, 0, shared)
+        mx.eval(idxs)
+        self.assertEqual(idxs.shape, (1, 4, 2))
+        self.assertEqual(idxs[0, 0].tolist(), [-1, -1])
+        self.assertEqual(idxs[0, 1].tolist(), [0, -1])
+        self.assertIsNotNone(shared.index_k)
+
+        x1 = mx.random.normal((1, 1, 16))
+        qr1 = mx.random.normal((1, 1, 8))
+        idxs1 = indexer(x1, qr1, None, 4, 0, shared)
+        mx.eval(idxs1)
+        self.assertEqual(idxs1.shape, (1, 1, 2))
+
+    def test_deepseek_v41_indexer_two_level(self):
+        from mlx_vlm.models.deepseek_v41.language import DeepseekV41Cache, Indexer
+
+        config = self._config()
+        source = Indexer(config, 1)
+        self.assertTrue(source.is_candidate_source)
+        consumer = Indexer(config, 2)
+        self.assertTrue(consumer.uses_candidates)
+        mx.eval(source.parameters(), consumer.parameters())
+        shared = DeepseekV41Cache(8, [2] * 8)
+
+        seed = Indexer(config, 0)
+        mx.eval(seed.parameters())
+        x = mx.random.normal((1, 4, 16))
+        qr = mx.random.normal((1, 4, 8))
+        seed(x, qr, mx.random.normal((1, 2, 16)), 0, 0, shared)
+        source(x, qr, None, 0, 0, shared)
+        self.assertIsNotNone(shared.candidates)
+        idxs = consumer(x, qr, None, 0, 0, shared)
+        mx.eval(idxs)
+        self.assertEqual(idxs.shape, (1, 4, 2))
+
+
+class TestDeepseekV41Compressor(unittest.TestCase):
+    @staticmethod
+    def _config():
+        return tiny_config(
+            "deepseek_v41", num_hidden_layers=2, compress_ratios=[2, 1], head_dim=8
+        )
+
+    def test_deepseek_v41_compressor_prefill_decode(self):
+        from mlx_vlm.models.deepseek_v41.language import Compressor, DeepseekV41Cache
+
+        comp = Compressor(self._config(), 0)
+        mx.eval(comp.parameters())
+        cache = DeepseekV41Cache(2, [2, 1])
+
+        latent = comp(mx.random.normal((1, 5, 16)), 0, cache)
+        mx.eval(latent)
+        self.assertEqual(latent.shape, (1, 2, 8))
+
+        step = comp(mx.random.normal((1, 1, 16)), 5, cache)
+        mx.eval(step)
+        self.assertEqual(step.shape, (1, 1, 8))
+
+    def test_deepseek_v41_compressor_holds_partial_group(self):
+        from mlx_vlm.models.deepseek_v41.language import Compressor, DeepseekV41Cache
+
+        comp = Compressor(self._config(), 0)
+        mx.eval(comp.parameters())
+        cache = DeepseekV41Cache(2, [2, 1])
+
+        self.assertIsNone(comp(mx.random.normal((1, 1, 16)), 2, cache))
+        step = comp(mx.random.normal((1, 1, 16)), 3, cache)
+        mx.eval(step)
+        self.assertEqual(step.shape, (1, 1, 8))
+
+    def test_deepseek_v41_compressor_ratio_one(self):
+        from mlx_vlm.models.deepseek_v41.language import Compressor, DeepseekV41Cache
+
+        comp = Compressor(self._config(), 1)
+        mx.eval(comp.parameters())
+        self.assertFalse(hasattr(comp, "wgate"))
+
+        out = comp(mx.random.normal((1, 4, 16)), 0, DeepseekV41Cache(2, [2, 1]))
+        mx.eval(out)
+        self.assertEqual(out.shape, (1, 4, 8))
+
+
+class TestDeepseekV41Attention(unittest.TestCase):
+    def test_deepseek_v41_attention_modes(self):
+        from mlx_vlm.models.deepseek_v41.language import DeepseekV41Attention
+
+        config = tiny_config("deepseek_v41", "sparse")
+        full = DeepseekV41Attention(config, 0)
+        reindex = DeepseekV41Attention(config, 1)
+        consumer = DeepseekV41Attention(config, 2)
+        local = DeepseekV41Attention(config, 3)
+        self.assertEqual(
+            [a.mode for a in (full, reindex, consumer, local)],
+            ["full", "reindex", "reindex", "local"],
+        )
+        self.assertIsNotNone(full.compressor)
+        self.assertIsNone(reindex.compressor)
+        self.assertIsNotNone(reindex.indexer)
+        self.assertIsNone(local.indexer)
+        self.assertTrue(reindex.indexer.is_candidate_source)
+        self.assertTrue(consumer.indexer.uses_candidates)
+
+    def test_deepseek_v41_attention_prefill_decode(self):
+        from mlx_vlm.models.deepseek_v41.language import (
+            DeepseekV41Attention,
+            DeepseekV41Cache,
+        )
+
+        config = tiny_config("deepseek_v41", "sparse")
+        layers = [DeepseekV41Attention(config, i) for i in range(4)]
+        for layer in layers:
+            mx.eval(layer.parameters())
+        shared = DeepseekV41Cache(8, [2] * 8)
+
+        x = mx.random.normal((1, 5, 16))
+        for layer in layers:
+            x = layer(x, 0, shared)
+            mx.eval(x)
+            self.assertEqual(x.shape, (1, 5, 16))
+        self.assertIsNotNone(shared.compress_kv)
+        self.assertIsNotNone(shared.topk_idxs)
+        self.assertIsNotNone(shared.candidates)
+        self.assertTrue(bool(mx.all(mx.isfinite(x))))
+
+        x1 = mx.random.normal((1, 1, 16))
+        for layer in layers:
+            x1 = layer(x1, 5, shared)
+            mx.eval(x1)
+            self.assertEqual(x1.shape, (1, 1, 16))
+        self.assertTrue(bool(mx.all(mx.isfinite(x1))))
+
+
+class TestDeepseekV41Block(unittest.TestCase):
+    def test_deepseek_v41_block_prefill_decode(self):
+        from mlx_vlm.models.deepseek_v41.engram import EngramLayout
+        from mlx_vlm.models.deepseek_v41.language import (
+            DeepseekV41Block,
+            DeepseekV41Cache,
+            make_identity_pre_mix,
+        )
+
+        config = tiny_config("deepseek_v41", "sparse", engram_layer_ids=[1])
+        layout = EngramLayout.from_config(config)
+        block0 = DeepseekV41Block(config, 0, layout)
+        block1 = DeepseekV41Block(config, 1, layout)
+        self.assertIsNone(block0.engram)
+        self.assertIsNotNone(block1.engram)
+        for block in (block0, block1):
+            mx.eval(block.parameters())
+        shared = DeepseekV41Cache(8, [2] * 8)
+
+        pre_mix = make_identity_pre_mix(1, 3, 2)
+        self.assertEqual(pre_mix.shape, (1, 3, 2))
+        self.assertTrue(bool(mx.all(pre_mix[..., 0] == 1)))
+
+        h = mx.random.normal((1, 3, 2, 16))
+        h, pre_mix = block0(h, 0, pre_mix, None, shared)
+        mx.eval(h, pre_mix)
+        self.assertEqual(h.shape, (1, 3, 2, 16))
+        self.assertEqual(pre_mix.shape, (1, 3, 2))
+
+        hashes = mx.zeros((1, 3, 4), dtype=mx.int32)
+        h = block1.engram(h, hashes, None)
+        mx.eval(h)
+        h, pre_mix = block1(h, 0, pre_mix, None, shared)
+        mx.eval(h, pre_mix)
+        self.assertEqual(h.shape, (1, 3, 2, 16))
+        self.assertTrue(bool(mx.all(mx.isfinite(h))))
+
+        hd = mx.random.normal((1, 1, 2, 16))
+        pre_d = make_identity_pre_mix(1, 1, 2)
+        hd, pre_d = block0(hd, 3, pre_d, None, shared)
+        mx.eval(hd, pre_d)
+        hashes_d = mx.zeros((1, 1, 4), dtype=mx.int32)
+        hd = block1.engram(hd, hashes_d, None)
+        hd, _ = block1(hd, 3, pre_d, None, shared)
+        mx.eval(hd)
+        self.assertEqual(hd.shape, (1, 1, 2, 16))
+        self.assertTrue(bool(mx.all(mx.isfinite(hd))))
+
+
+class TestDeepseekV41MoE(unittest.TestCase):
+    def test_deepseek_v41_moe_gate_vl_bias(self):
+        from mlx_vlm.models.deepseek_v41.language import DeepseekV41MoEGate
+
+        gate = DeepseekV41MoEGate(tiny_config("deepseek_v41"))
+        mx.eval(gate.parameters())
+        gate.weight = mx.broadcast_to(mx.arange(4, dtype=mx.float32)[:, None], (4, 16))
+        gate.bias_vl = mx.array([0.0, 0.0, 0.0, 1e6], dtype=mx.float32)
+
+        x = mx.random.normal((1, 3, 16))
+        mask = mx.array([[False, True, False]])
+        inds, weights = gate(x, mask)
+        mx.eval(inds, weights)
+        self.assertEqual(inds.shape, (1, 3, 2))
+        self.assertEqual(weights.shape, (1, 3, 2))
+        self.assertIn(3, inds[0, 1].tolist())
+        self.assertTrue(
+            bool(mx.allclose(weights.sum(-1), mx.full((1, 3), 1.5), atol=1e-5))
+        )
+
+    def test_deepseek_v41_moe_forward(self):
+        from mlx_vlm.models.deepseek_v41.language import DeepseekV41MoE
+
+        moe = DeepseekV41MoE(tiny_config("deepseek_v41"))
+        mx.eval(moe.parameters())
+        x = mx.random.normal((1, 3, 16))
+        y = moe(x)
+        mx.eval(y)
+        self.assertEqual(y.shape, (1, 3, 16))
+        self.assertTrue(bool(mx.all(mx.isfinite(y))))
+        y_masked = moe(x, mx.array([[True, False, True]]))
+        mx.eval(y_masked)
+        self.assertEqual(y_masked.shape, (1, 3, 16))
+
+
+class TestDeepseekV4PooledGather(unittest.TestCase):
+    """The pooled gather must match indexing the broadcast value exactly."""
+
+    @staticmethod
+    def _reference(pooled, topk):
+        B, n_pooled, D = pooled.shape
+        _, L, _ = topk.shape
+        idx = topk[:, None, :, :, None]
+        return mx.take_along_axis(
+            mx.broadcast_to(pooled[:, None, None], (B, 1, L, n_pooled, D)),
+            mx.broadcast_to(idx, idx.shape[:-1] + (D,)),
+            axis=3,
+        ).squeeze(1)
+
+    def test_deepseek_v4_pooled_gather_matches_take_along_axis(self):
+        from mlx_vlm.models.deepseek_v4.language import _gather_pooled
+
+        for batch, length, topk_width, n_pooled, dim in (
+            (1, 7, 3, 11, 8),
+            (1, 64, 16, 128, 32),
+            (2, 5, 4, 9, 8),
+            (4, 16, 8, 32, 16),
+            (8, 3, 5, 11, 8),
+        ):
+            mx.random.seed(batch * 100 + length)
+            pooled = mx.random.normal((batch, n_pooled, dim))
+            topk = (
+                mx.random.uniform(shape=(batch, length, topk_width)) * n_pooled
+            ).astype(mx.int32)
+            got = _gather_pooled(pooled, topk)
+            want = self._reference(pooled, topk)
+            mx.eval(got, want)
+            self.assertEqual(got.shape, want.shape)
+            self.assertTrue(mx.array_equal(got, want), (batch, length))
+
+    def test_deepseek_v4_pooled_gather_wraps_the_padding_sentinel(self):
+        """V4.1 pads short rows with -1; it must wrap inside its own row."""
+        from mlx_vlm.models.deepseek_v4.language import _gather_pooled
+
+        pooled = mx.arange(2 * 6 * 4, dtype=mx.float32).reshape(2, 6, 4)
+        topk = mx.array([[[0, -1, 2]], [[1, -1, 3]]], dtype=mx.int32)
+        got = _gather_pooled(pooled, topk)
+        want = self._reference(pooled, topk)
+        mx.eval(got, want)
+        self.assertTrue(mx.array_equal(got, want))
+        self.assertTrue(mx.array_equal(got[1, 0, 1], pooled[1, -1]))
+
+        for batch in (1, 2, 4):
+            mx.random.seed(batch)
+            pooled = mx.random.normal((batch, 32, 16))
+            topk = (mx.random.uniform(shape=(batch, 9, 6)) * 32).astype(mx.int32)
+            topk = mx.where(mx.random.uniform(shape=topk.shape) < 0.3, -1, topk).astype(
+                mx.int32
+            )
+            got = _gather_pooled(pooled, topk)
+            want = self._reference(pooled, topk)
+            mx.eval(got, want)
+            self.assertTrue(mx.array_equal(got, want), batch)
+
+
+# Fused sinkhorn-split kernel for single-pass mHC
+
+# The kernel replaces a chain of small ops, so the thing to pin is that it agrees
+# with that chain rather than that it merely returns something shaped right. Each
+# comparison is against `_hc_split_sinkhorn_ops` on the same inputs.
+HC = 4
+HC_ITERS = 3
+HC_EPS = 1e-6
+HC_MIX = (2 + HC) * HC
+
+requires_hc_kernel = pytest.mark.skipif(
+    _hc_sinkhorn_split_kernel is None, reason="Metal kernel unavailable"
+)
+
+
+def _hc_inputs(batch, length, spread=1.0, seed=0):
+    mx.random.seed(seed)
+    mixes = mx.random.normal((batch, length, HC_MIX)) * spread
+    scale = mx.random.uniform(0.5, 2.0, (3,))
+    base = mx.random.normal((HC_MIX,))
+    mx.eval(mixes, scale, base)
+    return mixes, scale, base
+
+
+@requires_hc_kernel
+@pytest.mark.parametrize(
+    "batch,length,spread",
+    # One wide-spread case; the rest vary the row count the kernel tiles over.
+    [(1, 1, 1.0), (1, 4, 1.0), (2, 3, 1.0), (1, 16, 1.0), (1, 4, 10.0)],
+)
+def test_hc_kernel_matches_the_op_path(batch, length, spread):
+    mixes, scale, base = _hc_inputs(batch, length, spread)
+    want = _hc_split_sinkhorn_ops(mixes, scale, base, HC, HC_ITERS, HC_EPS)
+    got = hc_split_sinkhorn(mixes, scale, base, HC, HC_ITERS, HC_EPS)
+    mx.eval(want, got)
+    for name, a, b in zip(("pre", "post", "comb"), want, got):
+        assert a.shape == b.shape, name
+        assert float(mx.abs(a - b).max()) < 1e-5, name
+
+
+@requires_hc_kernel
+def test_hc_comb_columns_are_normalized():
+    """The last sinkhorn step is a column normalization, so columns sum to 1.
+
+    Rows only approach 1 -- three iterations do not fully converge -- so the
+    row check is that the kernel is off by the same amount as the op path, not
+    that it is close to 1.
+    """
+    mixes, scale, base = _hc_inputs(1, 2, seed=3)
+    _, _, kernel_comb = hc_split_sinkhorn(mixes, scale, base, HC, HC_ITERS, HC_EPS)
+    _, _, ops_comb = _hc_split_sinkhorn_ops(mixes, scale, base, HC, HC_ITERS, HC_EPS)
+    mx.eval(kernel_comb, ops_comb)
+
+    assert float(mx.abs(mx.sum(kernel_comb, axis=-2) - 1.0).max()) < 1e-4
+
+    kernel_rows = mx.abs(mx.sum(kernel_comb, axis=-1) - 1.0)
+    ops_rows = mx.abs(mx.sum(ops_comb, axis=-1) - 1.0)
+    assert float(mx.abs(kernel_rows - ops_rows).max()) < 1e-5
+
+
+def test_hc_falls_back_when_hc_mult_is_not_four():
+    """The kernel vectorizes comb over float4, so other widths take the ops."""
+    mx.random.seed(1)
+    hc = 2
+    mix = (2 + hc) * hc
+    mixes = mx.random.normal((1, 1, mix))
+    scale = mx.ones((3,))
+    base = mx.zeros((mix,))
+    mx.eval(mixes, scale, base)
+    got = hc_split_sinkhorn(mixes, scale, base, hc, HC_ITERS, HC_EPS)
+    want = _hc_split_sinkhorn_ops(mixes, scale, base, hc, HC_ITERS, HC_EPS)
+    mx.eval(got, want)
+    for a, b in zip(want, got):
+        assert bool(mx.array_equal(a, b).item())
+
+
+@requires_hc_kernel
+def test_hc_rows_are_independent():
+    """Each row owns a threadgroup; a batched call must equal per-row calls."""
+    mixes, scale, base = _hc_inputs(1, 5, seed=7)
+    batched = hc_split_sinkhorn(mixes, scale, base, HC, HC_ITERS, HC_EPS)
+    mx.eval(batched)
+    for i in range(mixes.shape[1]):
+        single = hc_split_sinkhorn(
+            mixes[:, i : i + 1], scale, base, HC, HC_ITERS, HC_EPS
+        )
+        mx.eval(single)
+        for a, b in zip(batched, single):
+            assert float(mx.abs(a[:, i : i + 1] - b).max()) < 1e-6
 
 
 # Ragged decode launch fallbacks
@@ -670,6 +1067,26 @@ def test_yarn_rope_runs_on_a_thread_it_was_not_built_on():
     _build_on_worker(lambda: YarnRoPE(dims=8, traditional=False, base=10000.0))
 
 
+def test_deepseek_rope_inverts_a_yarn_dict_scaling():
+    from mlx_vlm.models.deepseek_v4.language import DeepseekV4RoPE
+
+    rope = DeepseekV4RoPE(
+        64,
+        10000.0,
+        {
+            "rope_type": "yarn",
+            "factor": 16,
+            "beta_fast": 32,
+            "beta_slow": 1,
+            "original_max_position_embeddings": 65536,
+        },
+    )
+    x = mx.random.uniform(shape=(1, 2, 3, 64))
+    y = rope(x, offset=1)
+    y_inv = rope(y, offset=1, inverse=True)
+    assert mx.allclose(y_inv, x, rtol=1e-5, atol=1e-5)
+
+
 # Weight quantization
 
 # FP8 weights
@@ -712,6 +1129,56 @@ def test_fp8_reconstruction_requantizes_to_native_mxfp8():
     assert actual_weight.shape == (130, 40)
     assert actual_scales.dtype == mx.uint8
     assert actual_scales.shape == (130, 5)
+
+
+class TestDeepseekV41FakeQuant(unittest.TestCase):
+    def test_deepseek_v41_fp8_zeros_stable(self):
+        from mlx_vlm.models.deepseek_v41.fakequant import fake_quant_fp8_ue8m0
+
+        x = mx.zeros((2, 64), dtype=mx.float32)
+        out = fake_quant_fp8_ue8m0(x)
+        mx.eval(out)
+        self.assertEqual(out.shape, x.shape)
+        self.assertTrue(bool(mx.all(out == 0)))
+
+    def test_deepseek_v41_fakequant_disable(self):
+        from mlx_vlm.models.deepseek_v41 import fakequant as fq
+
+        x = mx.random.normal((2, 64))
+        mx.eval(x)
+        old = fq.DISABLE
+        fq.DISABLE = True
+        try:
+            self.assertTrue(bool(mx.all(fq.fake_quant_fp8_ue8m0(x) == x)))
+            self.assertTrue(bool(mx.all(fq.fake_quant_fp4_ue8m0(x) == x)))
+            self.assertTrue(bool(mx.all(fq.fake_quant_fp4_e4m3(x) == x)))
+        finally:
+            fq.DISABLE = old
+
+    def test_deepseek_v41_fp4_ties_to_even(self):
+        from mlx_vlm.models.deepseek_v41.fakequant import fake_quant_fp4_ue8m0
+
+        x = mx.array(
+            [[0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 0.1] * 4], dtype=mx.float32
+        )
+        out = fake_quant_fp4_ue8m0(x)
+        mx.eval(out)
+        self.assertEqual(out.shape, x.shape)
+        flat = out.reshape(-1).tolist()
+        self.assertAlmostEqual(flat[0], 0.0)
+        self.assertAlmostEqual(flat[1], 1.0)
+        self.assertAlmostEqual(flat[2], 1.0)
+        self.assertAlmostEqual(flat[3], 2.0)
+
+    def test_deepseek_v41_fp4_e4m3_bounded(self):
+        from mlx_vlm.models.deepseek_v41.fakequant import fake_quant_fp4_e4m3
+
+        x = (mx.arange(64, dtype=mx.float32) / 63.0 * 4.0 - 2.0).reshape(1, -1)
+        x = mx.concatenate([x] * 2, axis=0)
+        out = fake_quant_fp4_e4m3(x)
+        mx.eval(out)
+        self.assertEqual(out.shape, x.shape)
+        self.assertTrue(bool(mx.all(mx.abs(out) <= 6.0 + 1e-3)))
 
 
 # One-bit weights

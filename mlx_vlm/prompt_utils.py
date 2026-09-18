@@ -116,6 +116,7 @@ MODEL_CONFIG = {
     "laguna": MessageFormat.TEXT_ONLY,
     "nemotron_labs_diffusion": MessageFormat.TEXT_ONLY,
     "deepseek_v4": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "deepseek_v41": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "hrm_text": MessageFormat.TEXT_ONLY,
     "minimax_m3": MessageFormat.TEXT_ONLY,
 }
@@ -922,7 +923,7 @@ def apply_chat_template(
         if "tool_calls" in prompt or "tool_call_id" in prompt or role == "tool":
             messages.append(_normalize_tool_message(prompt))
         elif (
-            model_type == "deepseek_v4"
+            model_type in ("deepseek_v4", "deepseek_v41")
             and (message := _deepseek_message_with_images(prompt, num_images))
             is not None
         ):
@@ -995,7 +996,7 @@ def apply_chat_template(
                 if has_tool_metadata:
                     messages.append(_normalize_tool_message(p))
                 elif (
-                    model_type == "deepseek_v4"
+                    model_type in ("deepseek_v4", "deepseek_v41")
                     and (message := _deepseek_message_with_images(p, image_counts[i]))
                     is not None
                 ):

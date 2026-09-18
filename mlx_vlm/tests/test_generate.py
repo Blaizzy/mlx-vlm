@@ -38,6 +38,7 @@ from mlx_vlm.models.cache import (
     RotatingKVCache,
 )
 from mlx_vlm.structured import ThinkingAwareLogitsProcessor
+from mlx_vlm.tests.test_models import tiny_config
 from mlx_vlm.utils import StoppingCriteria, ThinkingBudgetCriteria, load_processor
 
 # Generation, sampling, stopping criteria, structured logits, and thinking state.
@@ -1738,3 +1739,60 @@ def test_generate_step_evaluates_cache_periodically(max_tokens, cache_evals):
     assert eval_mock.call_count == 1 + cache_evals
     if cache_evals:
         eval_mock.assert_called_with([cache_state])
+
+
+class TestDeepseekV41Generation:
+    @staticmethod
+    def _config():
+        return tiny_config(
+            "deepseek_v41",
+            "sparse",
+            num_hidden_layers=2,
+            compress_ratios=[2, 1],
+            dspark_target_layer_ids=[1],
+            dspark_block_size=2,
+        )
+
+    def test_generate_step_streams_tokens_and_logprobs(self):
+        from mlx_vlm.generate.ar import generate_step
+        from mlx_vlm.models import deepseek_v41
+
+        model = deepseek_v41.Model(self._config())
+        mx.eval(model.parameters())
+        out = list(
+            generate_step(
+                mx.array([[1, 2, 3]]),
+                model,
+                None,
+                None,
+                max_tokens=2,
+                temperature=0,
+            )
+        )
+        assert len(out) == 2
+        for token, logprobs in out:
+            mx.eval(logprobs)
+            assert isinstance(token, int)
+            assert 0 <= token < 64
+            assert logprobs.shape == (64,)
+
+    def test_chunked_prefill_survives_a_dflash_drafter(self):
+        """Without this the speculative path prefills in one dispatch and OOMs."""
+        from mlx_vlm.generate.common import _chunked_prefill_enabled
+        from mlx_vlm.models.deepseek_v41.language import LanguageModel
+
+        model = LanguageModel(self._config())
+        drafter = object()
+
+        assert _chunked_prefill_enabled(model)
+        assert _chunked_prefill_enabled(
+            model,
+            draft_model=drafter,
+            draft_kind="dflash",
+            prefill_kwargs={"capture_layer_ids": [0]},
+        )
+        assert not _chunked_prefill_enabled(
+            model, draft_model=drafter, draft_kind="dflash", prefill_kwargs={}
+        )
+        model.no_chunked_prefill = True
+        assert not _chunked_prefill_enabled(model)
