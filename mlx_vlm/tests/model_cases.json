@@ -1460,18 +1460,42 @@
           "num_key_value_heads": 2,
           "head_dim": 8,
           "rope_theta": 10000.0,
-          "max_position_embeddings": 128
+          "max_position_embeddings": 128,
+          "rope_scaling": {"rope_type": "mrope", "mrope_section": [2, 1, 1]}
         },
         "vision_config": {
           "depth": 1,
           "hidden_size": 16,
           "intermediate_size": 32,
           "out_hidden_size": 16,
-          "num_heads": 2
+          "num_heads": 2,
+          "num_position_embeddings": 16,
+          "deepstack_visual_indexes": [0],
+          "image_size": 8,
+          "patch_size": 2,
+          "spatial_patch_size": 2,
+          "spatial_merge_size": 2
         },
-        "model_type": "qwen3_vl_moe"
+        "model_type": "qwen3_vl_moe",
+        "image_token_id": 31,
+        "vocab_size": 32,
+        "video_token_id": 30,
+        "vision_start_token_id": 29,
+        "vision_end_token_id": 28
       },
-      "checks": ["input_embeddings", "request_positions", "chunked_positions"]
+      "checks": [
+        "input_embeddings",
+        "multimodal",
+        "request_positions",
+        "chunked_positions"
+      ],
+      "multimodal": {
+        "image_grid": [1, 4, 4],
+        "video_grid": [2, 4, 4],
+        "chunk_sizes": [3, 5, 7],
+        "batch_sizes": [1, 2],
+        "layouts": [["image"], ["video"]]
+      }
     },
     {
       "id": "qwen3_5_moe",

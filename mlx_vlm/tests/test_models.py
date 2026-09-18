@@ -136,7 +136,15 @@ class ModelChecks:
             )
 
     def multimodal(
-        self, model, config, *, image_grid, video_grid, chunk_sizes, batch_sizes=(1, 2)
+        self,
+        model,
+        config,
+        *,
+        image_grid,
+        video_grid,
+        chunk_sizes,
+        batch_sizes=(1, 2),
+        layouts=(("image",), ("video",), ("image", "video"), ("video", "image")),
     ):
         """Image/video fusion and DeepStack contracts across compatible models."""
         core = getattr(model, "thinker", model)
@@ -150,12 +158,7 @@ class ModelChecks:
         model.eval()
         for dtype in (mx.float32, mx.float16):
             model.update(tree_map(lambda p: p.astype(dtype), model.parameters()))
-            for layout in (
-                ("image",),
-                ("video",),
-                ("image", "video"),
-                ("video", "image"),
-            ):
+            for layout in (tuple(layout) for layout in layouts):
                 for batch in batch_sizes:
                     rows, media, encoded = [], {}, {}
                     for row in range(batch):
