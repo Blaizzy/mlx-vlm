@@ -96,7 +96,7 @@ This repo ships an agent-skills bundle under `skills/` for common MLX-VLM workfl
 | `add-new-model` | Port a new architecture into `mlx_vlm/models` — config, weight-name mapping, reuse a similar model, add a test class. |
 | `benchmarking` | Produce credible, reproducible perf numbers and fork-vs-main A/B tables for PRs. |
 | `contributing` | Shape a change to pass review — code/config/test placement, pre-commit hooks, and PR expectations. |
-| `hf-cache-models` | List MLX-VLM-supported (and, with `--check-arch`, loadable) models in the local Hugging Face cache. |
+| `hf-cache-models` | List cached, custom, and loaded models through the server's model discovery endpoint. |
 | `reproducible-github-issues` | Turn CLI or server failures into concise, reproducible GitHub issues. |
 
 Validate the bundle at any time:

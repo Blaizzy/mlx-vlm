@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import importlib.util
 import json
 import logging
 import math
@@ -807,20 +806,6 @@ class TestModelDiscovery:
             and found[0]["id"] == str(model)
             and found[0]["path"] == model
         )
-
-    def test_cache_script(self, tmp_path):
-        script = (
-            Path(__file__).resolve().parents[2]
-            / "skills/skills/hf-cache-models/scripts/list_supported_hf_cache_models.py"
-        )
-        spec = importlib.util.spec_from_file_location("cache_model_script", script)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        model = self._model_directory(tmp_path / "local")
-        found = module.supported_models(
-            str(tmp_path / "missing-cache"), model_dirs=[str(model)]
-        )
-        assert [m["id"] for m in found] == [str(model)]
 
     @pytest.fixture
     def model_listing(self, client, monkeypatch, tmp_path):
