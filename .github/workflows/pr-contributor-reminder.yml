@@ -324,7 +324,7 @@ jobs:
             python -m pip install pytest
             python -m pip install -e .
             cd mlx_vlm
-            pytest -s ./tests --ignore=tests/test_smoke.py
+            pytest -s ./tests
             \`\`\`
 
             If the failure is caused by this PR, fix it and push the changes. If it is unrelated, leave a note for the maintainers.`;
