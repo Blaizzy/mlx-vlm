@@ -16,7 +16,6 @@ import mlx.nn as nn
 import numpy as np
 import pytest
 from mlx.utils import tree_flatten
-from transformers import AutoProcessor
 
 import mlx_vlm.models.rope_utils as rope_utils
 from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
@@ -37,7 +36,6 @@ from mlx_vlm.models.rope_utils import (
     initialize_rope,
     mrope_position_selector,
 )
-from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.quantization.one_bit import (
     OneBitEmbedding,
     OneBitLinear,
@@ -1195,22 +1193,6 @@ def test_standard_loader_preserves_packed_weights_and_cached_decode(
     ).logits
     assert result.shape == (1, 5, 64)
     assert mx.all(mx.isfinite(result)).item()
-
-
-def test_processor_and_multimodal_prompt_registration(packed_prism_checkpoint):
-    path, config, _ = packed_prism_checkpoint
-    with patch.object(prism.Qwen3VLProcessor, "from_pretrained") as factory:
-        assert AutoProcessor.from_pretrained(path) is factory.return_value
-        factory.assert_called_once()
-    messages = apply_chat_template(
-        None, config, "Describe.", num_images=2, video="clip.mp4", return_messages=True
-    )
-    assert [entry["type"] for entry in messages[0]["content"]] == [
-        "image",
-        "image",
-        "video",
-        "text",
-    ]
 
 
 @pytest.mark.parametrize(

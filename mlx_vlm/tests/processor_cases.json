@@ -115,7 +115,8 @@
     ["phi3_v", "phi3_v.processing_phi3_v", "Phi3VProcessor"],
     ["hunyuan_vl", "hunyuan_vl.processing_hunyuan_vl", "HunYuanVLProcessor"],
     ["ernie4_5_moe_vl", "ernie4_5_moe_vl", "Ernie4_5_VLProcessor"],
-    ["qwen4_exp", "qwen4_exp", "Qwen3VLProcessor"]
+    ["qwen4_exp", "qwen4_exp", "Qwen3VLProcessor"],
+    ["prism_hadamard_qwen35", "prism_hadamard_qwen35", "Qwen3VLProcessor"]
   ],
   "cleanup": [
     ["glm4v_moe", "<|begin_of_box|>", "<|end_of_box|>"],

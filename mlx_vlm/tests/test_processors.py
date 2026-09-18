@@ -1569,6 +1569,7 @@ def test_extract_text_from_content(content, expected):
         ("nemotron_h_nano_omni", "image-audio"),
         ("nemotronh_nano_omni_reasoning_v3", "image-audio"),
         ("gemma4_unified", "video-audio"),
+        ("prism_hadamard_qwen35", "image-video"),
         ("step3p7", "patch"),
     ],
 )
@@ -1579,12 +1580,20 @@ def test_prompt_media_format(family, kind):
         options = dict(video=["clip.mp4"], fps=1, num_audios=1)
     elif kind == "patch":
         text, options = "What do you see?", dict(num_images=1)
+    elif kind == "image-video":
+        options = dict(num_images=2, video="clip.mp4")
     text_part = dict(type="text", text=text, content=text)
     expected = {
         "image-audio": [dict(type="image"), text_part, dict(type="audio")],
         "video-audio": [
             dict(type="video", video="clip.mp4", max_pixels=224 * 224, fps=1),
             dict(type="audio"),
+            text_part,
+        ],
+        "image-video": [
+            dict(type="image"),
+            dict(type="image"),
+            dict(type="video", video="clip.mp4", max_pixels=224 * 224, fps=1),
             text_part,
         ],
         "patch": "<im_patch>" + text,
