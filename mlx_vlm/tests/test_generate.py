@@ -882,8 +882,11 @@ class TestBatchGenerator:
         assert model.calls == [{}]
 
     def test_speculative_generation_batch_drains_full_round(self, monkeypatch):
+        seen = {}
+
         def fake_rounds(*args, **kwargs):
-            del args, kwargs
+            del args
+            seen.update(kwargs)
             yield [1, 10], {"round_pos": 0, "round_len": 2}
             yield [2, 11], {"round_pos": 1, "round_len": 2}
             yield [3, 12], {"round_pos": 0, "round_len": 1}
@@ -915,6 +918,51 @@ class TestBatchGenerator:
             (100, 2),
             (200, 11),
         ]
+        assert seen["token_observer"] is None
+        assert seen["forced_token_provider"] is None
+
+    def test_speculative_generation_batch_forces_budget_token_per_row(
+        self, monkeypatch
+    ):
+        class ForceAfterFirst:
+            def __init__(self):
+                self.forced_token_id = None
+
+            def __call__(self, token):
+                self.forced_token_id = 3 if token == 5 else None
+
+            def pop_forced_token_id(self):
+                token = self.forced_token_id
+                self.forced_token_id = None
+                return token
+
+        def fake_rounds(*args, **kwargs):
+            del args
+            assert kwargs["forced_token_provider"](0) == 3
+            assert kwargs["forced_token_provider"](1) is None
+            kwargs["token_observer"](0, 3)
+            kwargs["token_observer"](1, 10)
+            yield [3, 10], {"round_pos": 0, "round_len": 1}
+
+        monkeypatch.setattr(ar_module, "run_speculative_server_rounds", fake_rounds)
+        batch = SpeculativeGenerationBatch(
+            model=SimpleNamespace(),
+            draft_model=SimpleNamespace(),
+            draft_kind="mtp",
+            uids=[100, 200],
+            first_tokens=mx.array([5, 9], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            stop_criteria=lambda token: False,
+            max_tokens=[4, 4],
+            hidden=mx.zeros((2, 1, 1)),
+            shared_kv_states=None,
+            prompt_tokens=mx.array([[0], [1]], dtype=mx.int32),
+            thinking_budget_criteria=[ForceAfterFirst(), None],
+        )
+
+        assert [response.token for response in batch.next()] == [5, 9]
+        assert [response.token for response in batch.next()] == [3, 10]
 
     def test_generation_batch_extend_keeps_processor_context_aligned(self):
         class FixedLogitModel:

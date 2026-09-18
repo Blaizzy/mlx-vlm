@@ -825,6 +825,38 @@ def _unstarted_response_generator():
     return gen
 
 
+def test_server_allows_thinking_budget_for_mtp_only():
+    queued = []
+    criteria = object()
+    gen = _unstarted_response_generator()
+    gen._ready.set()
+    gen.draft_model = object()
+    gen.draft_kind = "mtp"
+    gen._preprocess_request = MagicMock(
+        return_value={"input_ids": mx.array([[1]], dtype=mx.int32)}
+    )
+    gen._make_thinking_budget_criteria = MagicMock(return_value=criteria)
+
+    class InlineQueue:
+        def put(self, request):
+            queued.append(request)
+            request.rqueue.put(server.GenerationContext(uid=7, prompt_tokens=1))
+
+    gen.requests = InlineQueue()
+    args = server.GenerationArguments(max_tokens=8, thinking_budget=4)
+
+    context, _ = gen.generate("prompt", args=args)
+
+    assert context.uid == 7
+    assert queued[0].thinking_budget_criteria is criteria
+
+    gen.draft_kind = "dflash"
+    with pytest.raises(
+        ValueError, match="only supported with MTP speculative decoding"
+    ):
+        gen.generate("prompt", args=args)
+
+
 def test_server_demotes_incompatible_mtp_drafter_to_ar(monkeypatch):
     target_config = SimpleNamespace(
         model_type="gemma4_text",

@@ -1557,6 +1557,7 @@ class SpeculativeGenerationBatch:
         draft_block_size: Optional[int] = None,
         token_dtype: mx.Dtype = mx.int32,
         greedy_sampling: bool = False,
+        thinking_budget_criteria: Optional[List[Any]] = None,
     ):
         self.model = model
         self.draft_model = draft_model
@@ -1574,6 +1575,14 @@ class SpeculativeGenerationBatch:
         self.draft_block_size = draft_block_size
         self.token_dtype = token_dtype
         self.greedy_sampling = greedy_sampling
+        if not thinking_budget_criteria:
+            thinking_budget_criteria = [None] * len(uids)
+        elif len(thinking_budget_criteria) != len(uids):
+            raise ValueError(
+                "thinking_budget_criteria must match the speculative batch size."
+            )
+        self.thinking_budget_criteria = list(thinking_budget_criteria)
+        self._forced_next_tokens: List[Optional[int]] = [None] * len(uids)
         self._num_tokens = [0] * len(uids)
         self._finished = [False] * len(uids)
         self._sent_first = False
@@ -1602,6 +1611,22 @@ class SpeculativeGenerationBatch:
 
     def cache_states(self):
         return [c.state for c in self.prompt_cache if hasattr(c, "state")]
+
+    def _observe_token(self, row: int, token: int) -> bool:
+        criteria = self.thinking_budget_criteria[row]
+        if criteria is None:
+            return False
+        criteria(int(token))
+        forced_token = criteria.pop_forced_token_id()
+        if forced_token is None:
+            return False
+        self._forced_next_tokens[row] = int(forced_token)
+        return True
+
+    def _take_forced_token(self, row: int) -> Optional[int]:
+        token = self._forced_next_tokens[row]
+        self._forced_next_tokens[row] = None
+        return token
 
     def _finish_reason(self, row: int, token: int) -> Optional[str]:
         if self.stop_criteria(token):
@@ -1643,6 +1668,7 @@ class SpeculativeGenerationBatch:
                 or self._num_tokens[seq_idx] >= self.max_tokens[seq_idx]
             )
 
+        has_token_controls = any(self.thinking_budget_criteria)
         self._rounds_iter = run_speculative_server_rounds(
             self.model,
             self.draft_model,
@@ -1660,6 +1686,10 @@ class SpeculativeGenerationBatch:
             eos_token_ids=None,
             prompt_tokens=self.prompt_tokens,
             row_ids=[0] * len(self._all_uids),
+            token_observer=self._observe_token if has_token_controls else None,
+            forced_token_provider=(
+                self._take_forced_token if has_token_controls else None
+            ),
         )
 
     def next(self) -> List[GenerationBatch.Response]:
@@ -1674,6 +1704,7 @@ class SpeculativeGenerationBatch:
                 if self._finished[row]:
                     continue
                 token = int(token)
+                self._observe_token(row, token)
                 self._num_tokens[row] += 1
                 finish_reason = self._finish_reason(row, token)
                 if finish_reason is not None:
@@ -2253,6 +2284,7 @@ class PromptProcessingBatch:
                 draft_block_size=self.draft_block_size,
                 token_dtype=self._input_ids.dtype,
                 greedy_sampling=self.greedy_sampling,
+                thinking_budget_criteria=list(self.thinking_budget_criteria),
             )
             compute_logprobs = False
         else:
