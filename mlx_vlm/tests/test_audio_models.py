@@ -26,31 +26,23 @@ from mlx_vlm.generate import audio as audio_module
 from mlx_vlm.generate import dispatch, generate_audio, save_audio
 from mlx_vlm.generate.common import GenerationResult
 from mlx_vlm.models.cache import BatchKVCache, make_prompt_cache
-from mlx_vlm.models.nemotron_h.language import NemotronHModel
-from mlx_vlm.models.nemotron_h_nano_omni import config as nemotron_config
-from mlx_vlm.models.nemotron_h_nano_omni.audio import (
-    SoundFeatureExtractor,
-    sanitize_audio_weights,
-)
-from mlx_vlm.models.nemotron_h_nano_omni.nemotron_h_nano_omni import (
-    Model as NemotronModel,
-)
-from mlx_vlm.models.nemotron_voicechat import convert
-from mlx_vlm.models.nemotron_voicechat.config import CharacterEncoderConfig, MoGConfig
-from mlx_vlm.models.nemotron_voicechat.convert import build_runtime_config
-from mlx_vlm.models.nemotron_voicechat.model import Model as VoiceChatModel
-from mlx_vlm.models.nemotron_voicechat.session import VoiceChatSession
-from mlx_vlm.models.nemotron_voicechat.streaming import (
-    VoiceChatFrameTiming,
-    VoiceChatProfile,
-)
-from mlx_vlm.models.nemotron_voicechat.tts import CharAwareSubwordEncoder, MoGHead
-from mlx_vlm.models.qwen3_omni_moe import config as qwen_config
-from mlx_vlm.models.qwen3_omni_moe.qwen3_omni_moe import Model as QwenModel
 from mlx_vlm.tests.test_generate import MockDetokenizer, MockModel, MockProcessor
 from mlx_vlm.utils import load_audio
 
-omni_language = importlib.import_module("mlx_vlm.models.qwen3_omni_moe.language")
+
+def _model_module(name):
+    return importlib.import_module("mlx_vlm.models." + name)
+
+
+nemotron_h = _model_module("nemotron_h.language")
+nemotron = _model_module("nemotron_h_nano_omni")
+nemotron_audio = _model_module("nemotron_h_nano_omni.audio")
+voicechat = _model_module("nemotron_voicechat")
+voicechat_config = _model_module("nemotron_voicechat.config")
+voicechat_convert = _model_module("nemotron_voicechat.convert")
+voicechat_tts = _model_module("nemotron_voicechat.tts")
+qwen_omni = _model_module("qwen3_omni_moe")
+omni_language = _model_module("qwen3_omni_moe.language")
 
 
 # Audio model components
@@ -524,7 +516,7 @@ VISION_END = 59
 
 def _tiny_text_config(model_type="qwen3_omni_moe_text_encoder"):
     return _small_config(
-        qwen_config.TextConfig,
+        qwen_omni.TextConfig,
         model_type=model_type,
         num_hidden_layers=2,
         num_key_value_heads=2,
@@ -542,7 +534,7 @@ def _tiny_text_config(model_type="qwen3_omni_moe_text_encoder"):
 
 
 def _qwen_vision_config(**overrides):
-    return qwen_config.VisionConfig(
+    return qwen_omni.VisionConfig(
         **(
             dict(
                 depth=0,
@@ -566,10 +558,10 @@ def _qwen_vision_config(**overrides):
 
 def _tiny_model(vision_config=None, **thinker_kwargs):
     text_config = _tiny_text_config()
-    thinker_config = qwen_config.ThinkerConfig(
+    thinker_config = qwen_omni.ThinkerConfig(
         text_config=text_config,
         vision_config=vision_config or _qwen_vision_config(),
-        audio_config=qwen_config.AudioConfig(
+        audio_config=qwen_omni.AudioConfig(
             d_model=16,
             encoder_layers=0,
             encoder_attention_heads=2,
@@ -584,10 +576,10 @@ def _tiny_model(vision_config=None, **thinker_kwargs):
         audio_token_id=62,
         **thinker_kwargs,
     )
-    talker_config = qwen_config.TalkerConfig(
+    talker_config = qwen_omni.TalkerConfig(
         text_config=_tiny_text_config("qwen3_omni_moe_talker_text"),
         code_predictor_config=_small_config(
-            qwen_config.CodePredictorConfig,
+            qwen_omni.CodePredictorConfig,
             num_key_value_heads=2,
             head_dim=8,
             vocab_size=32,
@@ -597,7 +589,7 @@ def _tiny_model(vision_config=None, **thinker_kwargs):
         thinker_hidden_size=16,
     )
     code2wav_config = _small_config(
-        qwen_config.Code2WavConfig,
+        qwen_omni.Code2WavConfig,
         num_key_value_heads=2,
         decoder_dim=16,
         codebook_dim=8,
@@ -607,8 +599,8 @@ def _tiny_model(vision_config=None, **thinker_kwargs):
         semantic_codebook_size=32,
         vector_quantization_hidden_dimension=8,
     )
-    return QwenModel(
-        qwen_config.ModelConfig(
+    return qwen_omni.Model(
+        qwen_omni.ModelConfig(
             thinker_config=thinker_config,
             talker_config=talker_config,
             code2wav_config=code2wav_config,
@@ -717,7 +709,7 @@ class Qwen3OmniMoeTest(unittest.TestCase):
 
 
 def tiny_text_config(hidden_size=24):
-    return nemotron_config.TextConfig(
+    return nemotron.TextConfig(
         model_type="nemotron_h",
         vocab_size=128,
         hidden_size=hidden_size,
@@ -743,7 +735,7 @@ def tiny_text_config(hidden_size=24):
 
 def test_nemotron_h_embeddingless_backbone_requires_inputs_embeds():
     config = tiny_text_config()
-    model = NemotronHModel(config, with_embeddings=False)
+    model = nemotron_h.NemotronHModel(config, with_embeddings=False)
     inputs_embeds = mx.zeros((1, 2, config.hidden_size))
 
     output = model(inputs_embeds=inputs_embeds)
@@ -755,7 +747,7 @@ def test_nemotron_h_embeddingless_backbone_requires_inputs_embeds():
 
 def tiny_vision_config():
     return _small_config(
-        nemotron_config.VisionConfig,
+        nemotron.VisionConfig,
         num_attention_heads=4,
         image_size=32,
         patch_size=16,
@@ -765,7 +757,7 @@ def tiny_vision_config():
 
 
 def tiny_sound_config(hidden_size=16):
-    return nemotron_config.AudioConfig(
+    return nemotron.AudioConfig(
         hidden_size=hidden_size,
         num_attention_heads=4,
         num_hidden_layers=1,
@@ -780,8 +772,8 @@ def tiny_sound_config(hidden_size=16):
 
 def test_sound_feature_extractor_shapes_and_masks():
     pytest.importorskip("mlx_audio")
-    config = nemotron_config.AudioConfig()
-    extractor = SoundFeatureExtractor(config)
+    config = nemotron.AudioConfig()
+    extractor = nemotron_audio.SoundFeatureExtractor(config)
     waveform = np.linspace(-0.5, 0.5, 1600, dtype=np.float32)
 
     features, mask, lengths = extractor([waveform])
@@ -795,8 +787,8 @@ def test_sound_feature_extractor_shapes_and_masks():
 
 @pytest.fixture
 def nemotron_audio_model():
-    model = NemotronModel(
-        nemotron_config.ModelConfig(
+    model = nemotron.Model(
+        nemotron.ModelConfig(
             text_config=tiny_text_config(),
             vision_config=tiny_vision_config(),
             sound_config=tiny_sound_config(),
@@ -846,7 +838,7 @@ def test_sanitize_audio_and_projection_weights():
         "mlp1.3.weight": mx.ones((4, 4)),
     }
 
-    audio_sanitized = sanitize_audio_weights(weights)
+    audio_sanitized = nemotron_audio.sanitize_audio_weights(weights)
     assert "sound_encoder.encoder.feature_extractor.window" not in audio_sanitized
     assert (
         "sound_encoder.encoder.layers.0.conv.norm.num_batches_tracked"
@@ -859,8 +851,8 @@ def test_sanitize_audio_and_projection_weights():
         "sound_encoder.encoder.subsampling.layers.0.weight"
     ].shape == (4, 3, 3, 1)
 
-    model = NemotronModel(
-        nemotron_config.ModelConfig(
+    model = nemotron.Model(
+        nemotron.ModelConfig(
             text_config=tiny_text_config(),
             vision_config=tiny_vision_config(),
             sound_config=None,
@@ -876,12 +868,12 @@ def test_sanitize_audio_and_projection_weights():
 
 
 def test_streaming_profile_summarizes_synchronized_stage_timings():
-    profile = VoiceChatProfile(
+    profile = voicechat.VoiceChatProfile(
         frame_duration_ms=80.0,
         frames=[
-            VoiceChatFrameTiming(0, 10, 2, 20, 30, 8, 72),
-            VoiceChatFrameTiming(1, 8, 1, 16, 24, 6, 56),
-            VoiceChatFrameTiming(2, 9, 1, 18, 27, 7, 63),
+            voicechat.VoiceChatFrameTiming(0, 10, 2, 20, 30, 8, 72),
+            voicechat.VoiceChatFrameTiming(1, 8, 1, 16, 24, 6, 56),
+            voicechat.VoiceChatFrameTiming(2, 9, 1, 18, 27, 7, 63),
         ],
     )
     summary = profile.summary(drop_first=1)
@@ -894,7 +886,7 @@ def test_streaming_profile_summarizes_synchronized_stage_timings():
 
 
 def test_character_aware_encoder_prepares_and_scatters_subwords():
-    config = CharacterEncoderConfig(
+    config = voicechat_config.CharacterEncoderConfig(
         hidden_size=8,
         intermediate_size=16,
         num_hidden_layers=1,
@@ -903,7 +895,7 @@ def test_character_aware_encoder_prepares_and_scatters_subwords():
         head_dim=4,
         char_vocab_size=4,
     )
-    encoder = CharAwareSubwordEncoder(config, out_size=8, vocab_size=6)
+    encoder = voicechat_tts.CharAwareSubwordEncoder(config, out_size=8, vocab_size=6)
     encoder.set_vocabulary({"a": 0, "b": 1, "c": 2, "ab": 3, "<s>": 4, "</s>": 5})
     ids = mx.array([[3, 4, 5]], dtype=mx.int32)
     mask = mx.array([[True, False, True]])
@@ -914,10 +906,10 @@ def test_character_aware_encoder_prepares_and_scatters_subwords():
 
 
 def test_mog_head_inference_shapes_and_finite_values():
-    config = MoGConfig(
+    config = voicechat_config.MoGConfig(
         intermediate_size=16, low_rank=2, num_layers=1, num_predictions=4
     )
-    head = MoGHead(hidden_size=8, out_size=4, config=config)
+    head = voicechat_tts.MoGHead(hidden_size=8, out_size=4, config=config)
     inputs = mx.zeros((2, 1, 8))
     mean, logs = head.infer(inputs, guidance_scale=0.2, top_p=0.95)
     mx.eval(mean, logs)
@@ -948,9 +940,9 @@ def test_model_creates_session_from_wrapped_tokenizer():
     model = SimpleNamespace(tts_model=SimpleNamespace(tts_model=tts))
     processor = SimpleNamespace(tokenizer=Tokenizer())
 
-    created = VoiceChatModel.create_session(model, processor)
+    created = voicechat.Model.create_session(model, processor)
 
-    assert isinstance(created, VoiceChatSession)
+    assert isinstance(created, voicechat.VoiceChatSession)
     assert created.model is model
     assert created.tokenizer is processor.tokenizer
     assert tts.vocabulary == vocabulary
@@ -958,7 +950,7 @@ def test_model_creates_session_from_wrapped_tokenizer():
 
 def test_model_create_session_requires_tokenizer_interface():
     with pytest.raises(TypeError, match="tokenizer-like processor"):
-        VoiceChatModel.create_session(SimpleNamespace(), object())
+        voicechat.Model.create_session(SimpleNamespace(), object())
 
 
 @pytest.mark.skipif(
@@ -1154,12 +1146,12 @@ def test_build_runtime_config_time_step_limit(limit):
     base = _base_config() | {"time_step_limit": limit}
     if not math.isfinite(limit[1]):
         with pytest.raises(ValueError, match="two finite numbers"):
-            build_runtime_config(_source_config(), base)
+            voicechat_convert.build_runtime_config(_source_config(), base)
     else:
         assert (
-            build_runtime_config(_source_config(), base)["text_config"][
-                "time_step_limit"
-            ]
+            voicechat_convert.build_runtime_config(_source_config(), base)[
+                "text_config"
+            ]["time_step_limit"]
             == limit
         )
 
@@ -1168,7 +1160,7 @@ def test_build_runtime_config_keeps_bf16_unquantized():
     source = _source_config()
     source["mlx_conversion"]["quantization"] = None
 
-    config = build_runtime_config(source, _base_config())
+    config = voicechat_convert.build_runtime_config(source, _base_config())
 
     assert "quantization" not in config
     assert "quantization_config" not in config
@@ -1199,7 +1191,7 @@ def _write_artifact_inputs(tmp_path):
 def test_prepare_artifact_layout(tmp_path, copy_weights):
     source, tokenizer, shard = _write_artifact_inputs(tmp_path)
     output = tmp_path / ("output" if copy_weights else "linked-output")
-    result = convert.prepare_artifact(
+    result = voicechat_convert.prepare_artifact(
         source, tokenizer, output, copy_weights=copy_weights
     )
     assert result == output
@@ -1217,9 +1209,9 @@ def test_prepare_artifact_layout(tmp_path, copy_weights):
 
 
 def test_streaming_session_buffers_arbitrary_chunk_boundaries():
-    from mlx_vlm.models.nemotron_voicechat.streaming import VoiceChatStreamingSession
-
-    stream = VoiceChatStreamingSession.__new__(VoiceChatStreamingSession)
+    stream = voicechat.VoiceChatStreamingSession.__new__(
+        voicechat.VoiceChatStreamingSession
+    )
     stream._closed = False
     stream.input_sample_rate = 16000
     stream.frame_samples = 4
