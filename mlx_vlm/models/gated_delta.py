@@ -357,6 +357,7 @@ def gated_delta_update(
     state_steps: Optional[int] = None,
     cache=None,
     cache_index: int = 1,
+    beta: Optional[mx.array] = None,
 ) -> Tuple[mx.array, ...]:
     if cache is not None:
         if state is not None or state_steps is not None:
@@ -377,9 +378,11 @@ def gated_delta_update(
                 use_kernel=use_kernel,
                 lower_bound=lower_bound,
                 state_steps=steps,
+                beta=beta,
             ),
         )
-    beta = mx.sigmoid(b)
+    if beta is None:
+        beta = mx.sigmoid(b)
     if lower_bound is None:
         g = compute_g(A_log, a, dt_bias)
     else:
