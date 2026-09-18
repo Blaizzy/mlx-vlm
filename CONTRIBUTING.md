@@ -64,7 +64,7 @@ that a second pass preserves the weight keys, shapes, and values.
 From the repository root, you can run the tests with:
 
 ```shell
-python -m pytest -q mlx_vlm/tests --ignore=mlx_vlm/tests/test_smoke.py
+python -m pytest -q mlx_vlm/tests
 ```
 
 ## Pull Requests
