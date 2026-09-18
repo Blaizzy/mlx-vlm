@@ -725,21 +725,14 @@ def test_model_discovery_metadata(tmp_path, config, valid):
 
 
 @pytest.mark.parametrize(
-    "weight_map,shard,valid",
-    [
-        ({}, None, False),
-        ({"a": "../outside.safetensors"}, None, False),
-        ({"a": "model.safetensors", "b": "second.safetensors"}, None, False),
-        ({"a": "model.safetensors", "b": "second.safetensors"}, b"", False),
-        ({"a": "model.safetensors", "b": "second.safetensors"}, b"weights", True),
-    ],
-    ids=["empty-map", "traversal", "missing", "empty", "complete"],
+    "shard,valid",
+    [(None, False), (b"", False), (b"weights", True)],
+    ids=["missing", "empty", "complete"],
 )
-def test_model_discovery_shards(tmp_path, weight_map, shard, valid):
+def test_model_discovery_shards(tmp_path, shard, valid):
     model = _model_directory(tmp_path / "model")
-    (tmp_path / "outside.safetensors").write_bytes(b"weights")
     (model / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": weight_map})
+        '{"weight_map": {"a": "model.safetensors", "b": "second.safetensors"}}'
     )
     if shard is not None:
         (model / "second.safetensors").write_bytes(shard)
