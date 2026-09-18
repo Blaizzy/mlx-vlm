@@ -18,7 +18,11 @@ import pytest
 from mlx.utils import tree_flatten
 
 import mlx_vlm.models.rope_utils as rope_utils
-from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
+from mlx_vlm.convert import (
+    _copy_file,
+    _preserve_existing_deepseek_v4_quantization,
+    _record_conversion_dtype,
+)
 from mlx_vlm.fp8 import _dequantize_fp8_weight, _quantize_fp8_weight
 from mlx_vlm.models.cache import KVCache
 from mlx_vlm.models.mla import max_absorbed_queries
@@ -987,6 +991,50 @@ def test_convert_preserves_existing_deepseek_v4_quantization():
         "bits": 8,
         "mode": "mxfp8",
     }
+
+
+def test_convert_copies_read_only_sidecars_as_writable(tmp_path):
+    """Hub blobs fetched through xet are cached read-only (0444).
+
+    Copying their mode across leaves a read-only ``tokenizer.json`` in the
+    output, and ``processor.save_pretrained`` then fails with "Permission
+    denied" before ``save_config`` ever runs.
+    """
+    src = tmp_path / "cache" / "tokenizer.json"
+    src.parent.mkdir(parents=True)
+    src.write_text("{}")
+    src.chmod(0o444)
+    dst = tmp_path / "out" / "tokenizer.json"
+    dst.parent.mkdir()
+    # A previous run of the buggy copy left one of those read-only files behind.
+    dst.write_text("stale")
+    dst.chmod(0o444)
+
+    _copy_file(src, dst)
+
+    assert dst.read_text() == "{}"
+    dst.write_text('{"replaced": true}')
+
+
+def test_convert_records_the_dtype_it_cast_to():
+    config = {
+        "model_type": "lfm2_vl",
+        "dtype": "bfloat16",
+        "text_config": {"dtype": "bfloat16"},
+        "vision_config": {"torch_dtype": "bfloat16"},
+        "audio_config": {"hidden_size": 8},
+        "quantization": {"bits": 4, "dtype": "uint32"},
+    }
+
+    _record_conversion_dtype(config, "float16")
+
+    assert config["dtype"] == "float16"
+    assert config["text_config"]["dtype"] == "float16"
+    assert config["vision_config"]["torch_dtype"] == "float16"
+    # A sub-config that never declared a dtype does not gain one...
+    assert config["audio_config"] == {"hidden_size": 8}
+    # ...and sections that aren't sub-configs are off limits entirely.
+    assert config["quantization"] == {"bits": 4, "dtype": "uint32"}
 
 
 def test_modelopt_mixed_drops_fp8_kv_cache_scales():

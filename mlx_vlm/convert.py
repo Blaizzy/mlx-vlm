@@ -31,6 +31,41 @@ QUANT_RECIPES = [
 ]
 
 
+def _copy_file(src: Union[str, Path], dst: Union[str, Path]) -> None:
+    """Copy a sidecar file, leaving the destination writable.
+
+    Hub blobs fetched through xet land in the cache read-only (0444), and
+    ``shutil.copy`` carries that mode across. A read-only ``tokenizer.json`` in
+    the output then makes the later ``processor.save_pretrained`` die with
+    "Permission denied (os error 13)", which also skips ``save_config`` and so
+    drops the quantization keys the conversion just computed.
+    """
+    # Converting into a directory an earlier run already wrote can hit the same
+    # wall from the other side: ``copyfile`` cannot open a read-only file for
+    # writing, so replace the destination rather than reopen it. ``copytree``
+    # hands its ``copy_function`` plain strings, hence the coercion.
+    dst = Path(dst)
+    dst.unlink(missing_ok=True)
+    shutil.copyfile(src, dst)
+
+
+def _record_conversion_dtype(config: dict, dtype: str) -> None:
+    """Point the config at the dtype the weights were just cast to.
+
+    A checkpoint declares the dtype it was published in, so without this an
+    ``--dtype float16`` conversion ships float16 weights under a config that
+    still advertises bfloat16. Sub-configs are only touched when they already
+    declare a dtype of their own.
+    """
+    config["dtype"] = dtype
+    for name, section in config.items():
+        if not name.endswith("_config") or not isinstance(section, dict):
+            continue
+        for key in ("dtype", "torch_dtype"):
+            if key in section:
+                section[key] = dtype
+
+
 def _preserve_existing_deepseek_v4_quantization(
     config: dict,
     model: nn.Module,
@@ -310,6 +345,7 @@ def convert(
         dtype = text_config.get("dtype", None)
     if dtype in MODEL_CONVERSION_DTYPES:
         print("[INFO] Using dtype:", dtype)
+        dtype_name = dtype
         dtype = getattr(mx, dtype)
         cast_predicate = getattr(model, "cast_predicate", lambda _: True)
 
@@ -320,6 +356,7 @@ def convert(
                 return v
 
         target.update(tree_map_with_path(set_dtype, target.parameters()))
+        _record_conversion_dtype(config, dtype_name)
 
     if quantize and dequantize:
         raise ValueError("Choose either quantize or dequantize, not both.")
@@ -373,7 +410,7 @@ def convert(
             # Skip the index file - save_weights() already generated the correct one
             if Path(file).name == "model.safetensors.index.json":
                 continue
-            shutil.copy(file, mlx_path)
+            _copy_file(file, mlx_path / Path(file).name)
 
     # Copy folders from the model path to the MLX path
     for item in model_path.iterdir():
@@ -381,7 +418,7 @@ def convert(
             dest = mlx_path / item.name
             if dest.exists():
                 shutil.rmtree(dest)
-            shutil.copytree(item, dest)
+            shutil.copytree(item, dest, copy_function=_copy_file)
 
     # Not every remote-code processor inherits ProcessorMixin — Mage-VL's `MageVLProcessor`
     # deliberately does not ("We deliberately do NOT inherit transformers.ProcessorMixin"), so it
@@ -399,7 +436,7 @@ def convert(
             for pattern in ("*.json", "*.txt", "*.jinja", "*.model"):
                 for f in src.glob(pattern):
                     if f.name not in ("config.json", "model.safetensors.index.json"):
-                        shutil.copy2(f, Path(mlx_path) / f.name)
+                        _copy_file(f, Path(mlx_path) / f.name)
         print("[INFO] processor lacks save_pretrained; copied processor files verbatim")
 
     save_config(config, config_path=mlx_path / "config.json")
