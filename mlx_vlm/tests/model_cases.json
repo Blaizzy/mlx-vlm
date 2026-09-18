@@ -1162,7 +1162,8 @@
       "multimodal": {
         "image_grid": [1, 4, 4],
         "video_grid": [2, 4, 4],
-        "chunk_sizes": [3, 5, 7]
+        "chunk_sizes": [3, 5, 7],
+        "batch_sizes": [1]
       }
     },
     {

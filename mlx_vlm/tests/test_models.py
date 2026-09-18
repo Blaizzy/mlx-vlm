@@ -135,7 +135,9 @@ class ModelChecks:
                 language(token, cache=cache, **decode).logits, extended, logits=True
             )
 
-    def multimodal(self, model, config, *, image_grid, video_grid, chunk_sizes):
+    def multimodal(
+        self, model, config, *, image_grid, video_grid, chunk_sizes, batch_sizes=(1, 2)
+    ):
         """Image/video fusion and DeepStack contracts across compatible models."""
         core = getattr(model, "thinker", model)
         config = getattr(config, "thinker_config", config)
@@ -154,7 +156,7 @@ class ModelChecks:
                 ("image", "video"),
                 ("video", "image"),
             ):
-                for batch in (1, 2):
+                for batch in batch_sizes:
                     rows, media, encoded = [], {}, {}
                     for row in range(batch):
                         order = layout if row == 0 else layout[::-1]
