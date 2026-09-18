@@ -8,6 +8,9 @@ Moondream2 is a compact vision-language model for visual question answering, ima
 |---|---|
 | `vikhyatk/moondream2` | Official Moondream2 repository |
 
+> The tokenizer is loaded from `moondream/starmie-v1` (the checkpoint bundles a
+> stale GPT-2 `tokenizer.json` that the model itself does not use).
+
 ## Model
 
 | | |
