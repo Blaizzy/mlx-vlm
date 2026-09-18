@@ -1196,3 +1196,111 @@ def test_glm_quantized_head_sanitization_loads_strictly():
     for key, value in sanitized.items():
         assert mx.array_equal(again[key], value).item()
     model.load_weights(list(model.sanitize(checkpoint | head).items()), strict=True)
+
+
+class TestMoondream2Sanitize(unittest.TestCase):
+    """Weight-key remapping for the moondream2 port."""
+
+    def _tiny_model(self):
+        from mlx_vlm.models.moondream2 import Model, ModelConfig
+
+        config = ModelConfig.from_dict(
+            {
+                "model_type": "moondream2",
+                "text_config": {
+                    "num_hidden_layers": 1,
+                    "hidden_size": 64,
+                    "intermediate_size": 128,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 2,
+                    "vocab_size": 128,
+                },
+                "vision_config": {
+                    "num_hidden_layers": 1,
+                    "hidden_size": 64,
+                    "intermediate_size": 128,
+                    "num_attention_heads": 2,
+                },
+            }
+        )
+        return Model(config)
+
+    def test_layout_is_remapped(self):
+        model = self._tiny_model()
+        sanitized = model.sanitize(
+            {
+                "model.text.wte": mx.zeros((1,)),
+                "model.text.blocks.0.attn.qkv.weight": mx.zeros((1,)),
+                "model.text.post_ln.weight": mx.zeros((1,)),
+                "model.text.lm_head.weight": mx.zeros((1,)),
+                "model.vision.patch_emb.weight": mx.zeros((1,)),
+                "model.vision.blocks.0.ln1.weight": mx.zeros((1,)),
+                "model.vision.proj_mlp.fc1.weight": mx.zeros((1,)),
+                "model.region.coord_decoder.fc1.weight": mx.zeros((1,)),
+            }
+        )
+        self.assertIn("text.model.embed_tokens.weight", sanitized)
+        self.assertIn("text.model.layers.0.attn.qkv.weight", sanitized)
+        self.assertIn("text.model.post_ln.weight", sanitized)
+        self.assertIn("text.lm_head.weight", sanitized)
+        self.assertIn("vision.encoder.patch_emb.weight", sanitized)
+        self.assertIn("vision.encoder.blocks.0.ln1.weight", sanitized)
+        self.assertIn("vision.proj_mlp.fc1.weight", sanitized)
+        self.assertNotIn("model.region.coord_decoder.fc1.weight", sanitized)
+
+
+class TestMoondream3Sanitize(unittest.TestCase):
+    """sanitize must be idempotent so already-converted mlx quants load."""
+
+    def _tiny_model(self):
+        from mlx_vlm.models.moondream3 import Model, ModelConfig
+
+        config = ModelConfig.from_dict(
+            {
+                "model_type": "moondream3",
+                "text_config": {
+                    "num_hidden_layers": 1,
+                    "hidden_size": 64,
+                    "intermediate_size": 128,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 2,
+                    "head_dim": 32,
+                    "vocab_size": 128,
+                    "num_experts": 2,
+                    "num_experts_per_tok": 1,
+                    "moe_intermediate_size": 32,
+                    "moe_start_layer": 1,
+                },
+                "vision_config": {
+                    "num_hidden_layers": 1,
+                    "hidden_size": 64,
+                    "intermediate_size": 128,
+                    "num_attention_heads": 2,
+                },
+            }
+        )
+        return Model(config)
+
+    def test_already_converted_keys_pass_through(self):
+        model = self._tiny_model()
+        keys = {
+            "text.model.blocks.0.attn.qkv.weight": mx.zeros((1,)),
+            "text.lm_head.weight": mx.zeros((1,)),
+            "vision.encoder.blocks.0.ln1.weight": mx.zeros((1,)),
+            "vision.proj_mlp.fc1.weight": mx.zeros((1,)),
+        }
+        once = model.sanitize(dict(keys))
+        self.assertEqual(set(once), set(keys))
+        twice = model.sanitize(once)
+        self.assertEqual(set(twice), set(once))
+
+    def test_raw_keys_are_remapped(self):
+        model = self._tiny_model()
+        sanitized = model.sanitize(
+            {
+                "model.text.blocks.0.attn.qkv.weight": mx.zeros((1,)),
+                "model.vision.blocks.0.ln1.weight": mx.zeros((1,)),
+            }
+        )
+        self.assertIn("text.model.blocks.0.attn.qkv.weight", sanitized)
+        self.assertIn("vision.encoder.blocks.0.ln1.weight", sanitized)
