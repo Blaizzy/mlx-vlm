@@ -601,6 +601,26 @@ def tiny_config(family, profile=None, **overrides):
     return build_config(module, fields | overrides, case["config_type"])
 
 
+def test_gemma3_can_preserve_caller_supplied_embedding_scale():
+    case = next(case for case in DATA["cases"] if case["module"] == "gemma3")
+    module = importlib.import_module(f"mlx_vlm.models.{case['module']}.language")
+    config = build_config(
+        module,
+        case["config"]["text_config"]
+        | TINY_DEFAULTS
+        | dict(intermediate_size=32, head_dim=8, sliding_window_pattern=1),
+        "TextConfig",
+    )
+    model = module.Gemma3Model(config, scale_inputs_embeds=False)
+    capture = MagicMock(side_effect=lambda inputs, *_: inputs)
+    model.layers, model.norm = [capture], nn.Identity()
+    expected = mx.ones((1, 1, config.hidden_size))
+    output = model(None, inputs_embeds=mx.array(expected))
+
+    assert mx.array_equal(capture.call_args.args[0], expected)
+    assert mx.array_equal(output, expected)
+
+
 # Document layout
 
 

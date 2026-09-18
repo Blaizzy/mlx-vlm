@@ -26,8 +26,6 @@ from mlx_vlm.generate import audio as audio_module
 from mlx_vlm.generate import dispatch, generate_audio, save_audio
 from mlx_vlm.generate.common import GenerationResult
 from mlx_vlm.models.cache import BatchKVCache, make_prompt_cache
-from mlx_vlm.models.gemma3.config import TextConfig as Gemma3TextConfig
-from mlx_vlm.models.gemma3.language import Gemma3Model
 from mlx_vlm.models.nemotron_h.language import NemotronHModel
 from mlx_vlm.models.nemotron_h_nano_omni import config as nemotron_config
 from mlx_vlm.models.nemotron_h_nano_omni.audio import (
@@ -927,41 +925,6 @@ def test_mog_head_inference_shapes_and_finite_values():
     assert logs.shape == (1, 1, 1)
     assert bool(mx.all(mx.isfinite(mean)))
     assert bool(mx.all(mx.isfinite(logs)))
-
-
-def test_gemma3_can_preserve_caller_supplied_embedding_scale():
-    config = Gemma3TextConfig(
-        model_type="gemma3_text",
-        vocab_size=8,
-        hidden_size=4,
-        intermediate_size=8,
-        num_hidden_layers=1,
-        num_attention_heads=1,
-        num_key_value_heads=1,
-        head_dim=4,
-        sliding_window=8,
-        sliding_window_pattern=1,
-    )
-
-    class Capture:
-        def __call__(self, inputs, mask=None, cache=None):
-            del mask, cache
-            self.inputs = inputs
-            return inputs
-
-    class Identity:
-        def __call__(self, inputs):
-            return inputs
-
-    model = Gemma3Model(config, scale_inputs_embeds=False)
-    capture = Capture()
-    model.layers = [capture]
-    model.norm = Identity()
-    inputs = mx.ones((1, 1, config.hidden_size))
-    output = model(None, inputs_embeds=inputs)
-
-    assert mx.array_equal(capture.inputs, inputs)
-    assert mx.array_equal(output, inputs)
 
 
 def test_model_creates_session_from_wrapped_tokenizer():
