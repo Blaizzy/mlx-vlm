@@ -17,8 +17,14 @@ def _discovery_helpers():
     package = importlib.util.find_spec("mlx_vlm")
     if package is None or not package.submodule_search_locations:
         raise RuntimeError("Install mlx-vlm to use its model discovery helpers.")
-    path = Path(next(iter(package.submodule_search_locations))) / "model_discovery.py"
-    spec = importlib.util.spec_from_file_location("mlx_vlm_model_discovery", path)
+    path = (
+        Path(next(iter(package.submodule_search_locations)))
+        / "server"
+        / "model_discovery.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "mlx_vlm_server_model_discovery", path
+    )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

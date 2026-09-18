@@ -10,7 +10,6 @@ from ..generate import (
     DEFAULT_PREFILL_STEP_SIZE,
     DEFAULT_QUANTIZED_KV_START,
 )
-from ..model_discovery import MODEL_PATHS_ENV
 from .generation import (
     DEFAULT_ENABLE_THINKING,
     get_log_progress_interval,
@@ -19,6 +18,7 @@ from .generation import (
     get_server_thinking_end_token,
     get_server_thinking_start_token,
 )
+from .model_discovery import MODEL_PATHS_ENV
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080

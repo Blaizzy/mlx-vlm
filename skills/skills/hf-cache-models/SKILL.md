@@ -17,7 +17,7 @@ Match the server `/v1/models` cache filter:
 - all cached revisions are checked, preferring `main`; another revision is returned using its absolute snapshot path
 - tokenizer metadata is not required
 
-The script and server share the metadata and weight checks in `mlx_vlm/model_discovery.py`. They do not load weights, execute checkpoint Python, or prove generation works. The server also includes loaded models and marks each entry with a `loaded` boolean. Pass `--check-arch` to additionally require that mlx-vlm ships an architecture for the `model_type` — this narrows the list from a *cache candidate* to *probably loadable* (folder-name match; it does not resolve `MODEL_REMAPPING` aliases, so use it as a strong hint, not proof).
+The script and server share the metadata and weight checks in `mlx_vlm/server/model_discovery.py`. They do not load weights, execute checkpoint Python, or prove generation works. The server also includes loaded models and marks each entry with a `loaded` boolean. Pass `--check-arch` to additionally require that mlx-vlm ships an architecture for the `model_type` — this narrows the list from a *cache candidate* to *probably loadable* (folder-name match; it does not resolve `MODEL_REMAPPING` aliases, so use it as a strong hint, not proof).
 
 ## Script
 

@@ -21,7 +21,6 @@ from starlette.requests import HTTPConnection
 from .. import apc as _apc
 from ..generate.edit_image import load_image_edit_model
 from ..generate.image import is_image_generation_model, load_image_generation_model
-from ..model_discovery import MODEL_PATHS_ENV, discover_models
 from ..reranker import RerankerKind, reranker_kind
 from ..structured import build_json_schema_logits_processor
 from ..tools import _infer_tool_parser_from_processor
@@ -46,6 +45,7 @@ from .generation import (
     get_quantized_kv_start,
     get_top_logprobs_k,
 )
+from .model_discovery import MODEL_PATHS_ENV, discover_models
 from .openai import register_routes as register_openai_routes
 from .realtime import register_routes as register_realtime_routes
 from .reranking import ensure_chat_template as ensure_reranker_chat_template
