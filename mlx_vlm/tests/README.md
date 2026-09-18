@@ -24,7 +24,7 @@ Use a module path or `-k` to select a smaller group while developing.
 | `test_cache.py` | Cache lifecycle, APC lookup and prefix reuse, adapters, memory budgets, disk persistence, TurboQuant, batched masks/attention, and vision-feature LRU behavior |
 | `test_processors.py` + `processor_cases.json` | Tokenizers and detokenizers, processor loading and media contracts, image/video utilities, prompt construction, and dynamically discovered tool parsers |
 | `test_audio_models.py` | Audio/omni model components, speech generation, streaming, checkpoint conversion, audio loading, downmixing, and resampling |
-| `test_video_generation_models.py` | Video model components, conditioning workflows, cached trajectories, numerical references, conversion, discovery, request/result adapters, and audio/video muxing |
+| `test_video_generation_models.py` + `video_generation_cases.json` | Video model components, conditioning workflows, cached trajectories, numerical references, conversion, discovery, request/result adapters, and audio/video muxing |
 | `test_extraction_models.py` | GLiNER candidate pools, span/schema handling, privacy tagging/quantized inference, and Sapiens2 vision extraction |
 | `test_image_generation_models.py` + `image_generation_cases.json` | Bonsai, Flux2, Ideogram4, Z-Image, ERNIE Image, and Mage Flow generation/editing, components, loading, and conversion |
 | `test_diffusion_models.py` | LLaDA, Nemotron, and DiffusionGemma models/generation, numerical parity, caches, vision, sanitization, and generation-config loading |
@@ -43,6 +43,36 @@ Speculative setup stays in `test_speculative.py`; only general JSON config
 construction is shared through `test_models.py`.
 
 ## Current validation
+
+The image/video refactor against `1dd78da2` keeps numerical references, tolerances,
+cache parity, checkpoint conversion/reload, and muxing checks. Video components
+use dynamic imports and JSON configurations; image aliases, local variants, and
+conversion cases use the existing contract runner. Both suites share the mocked
+download contract. Helpers remain in their owning Python test modules.
+
+| Source in the two suites | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| Image Python | 1,611 | 1,474 | -137 |
+| Video Python | 1,522 | 1,130 | -392 |
+| JSON | 406 | 936 | +530 |
+| Combined | 3,539 | 3,540 | +1 |
+
+This removes **529 Python lines**, primarily by moving configuration/reference
+data and sharing runners; it does not reduce combined Python/JSON source length.
+The complete suite has **22,326 Python + 3,787 JSON lines**, with the same
+**16 Python files** and no separate fixture modules.
+
+The full suite passes **1,816 tests, four skips, and 41 subtests** (previously
+1,808 tests); the two affected suites pass 174 cases. Some former loop iterations
+now collect separately, and H3 download contracts collect independently.
+Pre-commit, Python 3.10 syntax, JSON parsing, and whitespace checks pass.
+
+Full-suite production execution sets are identical before and after this pass:
+**82,142 lines and 13,175 branch outcomes**, with zero lost or added paths.
+This preserves the immediate baseline, including its earlier intentional pruning;
+the comparison with `main` below still applies.
+
+## Previous main-merge validation
 
 The merge of `main` at `10db0927` preserves the consolidated **16-file layout**,
 JSON runners, and prior deletions. New upstream tests join the existing suites:

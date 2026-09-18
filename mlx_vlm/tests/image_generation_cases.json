@@ -401,6 +401,199 @@
         "metadata": {"mlx_vlm_format": "mage_flow", "tensor_layout": "mlx_nhwc"},
         "reload": true
       }
+    ],
+    "conversion": [
+      {"id": "z_image-affine", "family": "z_image", "repo": "Tongyi-MAI/Z-Image-Turbo", "mode": "affine", "bits": 4, "group_size": 64},
+      {"id": "z_image-mxfp8", "family": "z_image", "repo": "Tongyi-MAI/Z-Image-Turbo", "mode": "mxfp8", "bits": 8, "group_size": 32},
+      {"id": "ernie_image-affine", "family": "ernie_image", "repo": "baidu/ERNIE-Image-Turbo", "mode": "affine", "bits": 4, "group_size": 64},
+      {"id": "ernie_image-mxfp8", "family": "ernie_image", "repo": "baidu/ERNIE-Image-Turbo", "mode": "mxfp8", "bits": 8, "group_size": 32}
+    ],
+    "variant": [
+      {"id": "bonsai", "family": "bonsai", "aliases": ["bonsai"], "expected": {"precision": "2bit"}},
+      {
+        "id": "bonsai-ternary",
+        "family": "bonsai",
+        "aliases": ["bonsai-ternary", "prism-ml/bonsai-image-ternary-4B-mlx-2bit"],
+        "expected": {"name": "ternary"}
+      },
+      {"id": "bonsai-unknown", "family": "bonsai", "aliases": ["binary"], "error": "Unknown Bonsai variant"},
+      {
+        "id": "ideogram-exact",
+        "family": "ideogram4",
+        "aliases": ["ideogram-ai/ideogram-4-fp8"],
+        "expected": {"repo_id": "ideogram-ai/ideogram-4-fp8"}
+      },
+      {
+        "id": "ideogram-shorthand",
+        "family": "ideogram4",
+        "aliases": ["ideogram4", "ideogram-4", "ideogram-4-fp8"],
+        "error": null
+      }
+    ],
+    "local_variant": [
+      {
+        "id": "flux-9b",
+        "family": "flux2",
+        "metadata": {"transformer/config.json": {"num_layers": 8, "num_attention_heads": 32}},
+        "files": [],
+        "expected": {"name": "flux2-klein-9b"}
+      },
+      {
+        "id": "ernie-local",
+        "family": "ernie_image",
+        "turbo": false,
+        "metadata": {},
+        "expected": {"name": "ernie-image"}
+      },
+      {
+        "id": "flux-kv",
+        "family": "flux2",
+        "metadata": {"transformer/config.json": {"num_layers": 8, "num_attention_heads": 32}},
+        "files": ["flux-2-klein-9b-kv.safetensors"],
+        "expected": {"name": "flux2-klein-9b-kv"}
+      },
+      {
+        "id": "ernie-source",
+        "family": "ernie_image",
+        "turbo": false,
+        "metadata": {
+          "mlx_ernie_image.json": {"model_type": "ernie_image", "variant": "ernie-image", "source": "baidu/ERNIE-Image-Turbo"}
+        },
+        "expected": {"name": "ernie-image-turbo"}
+      },
+      {
+        "id": "mage-local",
+        "family": "mage_flow",
+        "source_id": "community/custom-name",
+        "metadata": {"mlx_mage_flow.json": {"variant": "mage-flow-edit-turbo"}},
+        "expected": {"name": "mage-flow-edit-turbo"}
+      },
+      {
+        "id": "mage-snapshot",
+        "family": "mage_flow",
+        "path": "models--microsoft--Mage-Flow-Edit-Turbo/snapshots/hash",
+        "expected": {"name": "mage-flow-edit-turbo"}
+      },
+      {
+        "id": "z-base",
+        "family": "z_image",
+        "layout": false,
+        "metadata": {
+          "transformer/config.json": {},
+          "text_encoder/config.json": {},
+          "vae/config.json": {},
+          "scheduler/scheduler_config.json": {"shift": 6.0}
+        },
+        "expected": {"variant": "base", "default_steps": 50, "default_guidance": 4.0}
+      }
     ]
+  },
+  "layouts": {
+    "bonsai": {
+      "files": [
+        "text_encoder-mlx-4bit/model.safetensors",
+        "tokenizer/tokenizer.json",
+        "transformer-packed-mflux/diffusion_pytorch_model.safetensors",
+        "transformer-packed-mflux/quantization_config.json"
+      ],
+      "metadata": {}
+    },
+    "flux2": {
+      "files": [
+        "text_encoder/model.safetensors",
+        "tokenizer/tokenizer.json",
+        "transformer/diffusion_pytorch_model.safetensors",
+        "vae/diffusion_pytorch_model.safetensors"
+      ],
+      "metadata": {}
+    },
+    "ideogram4": {
+      "files": [
+        "text_encoder/config.json",
+        "text_encoder/model.safetensors",
+        "tokenizer/tokenizer.json",
+        "transformer/config.json",
+        "transformer/diffusion_pytorch_model.safetensors",
+        "unconditional_transformer/config.json",
+        "unconditional_transformer/diffusion_pytorch_model.safetensors",
+        "vae/config.json",
+        "vae/diffusion_pytorch_model.safetensors"
+      ],
+      "metadata": {"model_index.json": {"_class_name": "Ideogram4Pipeline"}}
+    },
+    "z_image": {
+      "files": [],
+      "metadata": {
+        "model_index.json": {"_class_name": "ZImagePipeline"},
+        "scheduler/scheduler_config.json": {"_class_name": "ZImagePipeline"},
+        "text_encoder/config.json": {"_class_name": "ZImagePipeline"},
+        "text_encoder/model.safetensors": {"_class_name": "ZImagePipeline"},
+        "tokenizer/tokenizer.json": {"_class_name": "ZImagePipeline"},
+        "transformer/config.json": {"_class_name": "ZImagePipeline"},
+        "transformer/model.safetensors": {"_class_name": "ZImagePipeline"},
+        "vae/config.json": {"_class_name": "ZImagePipeline"},
+        "vae/model.safetensors": {"_class_name": "ZImagePipeline"}
+      }
+    },
+    "ernie_image": {
+      "files": ["text_encoder/0.safetensors", "tokenizer/tokenizer.json", "transformer/0.safetensors", "vae/0.safetensors"],
+      "metadata": {
+        "mlx_ernie_image.json": {"model_type": "ernie_image", "variant": "ernie-image-turbo"},
+        "model_index.json": {"_class_name": "ErnieImagePipeline"}
+      }
+    },
+    "mage_flow": {
+      "files": [
+        "text_encoder/model.safetensors",
+        "transformer/diffusion_pytorch_model.safetensors",
+        "vae/diffusion_pytorch_model.safetensors"
+      ],
+      "metadata": {
+        "model_index.json": {"_class_name": "MageFlowPipeline"},
+        "text_encoder/config.json": {},
+        "text_encoder/tokenizer.json": {},
+        "transformer/config.json": {},
+        "vae/config.json": {}
+      }
+    }
+  },
+  "discovery_metadata": {
+    "bonsai": {
+      "manifest.json": {
+        "files": [
+          {"remote_path": "transformer-packed-mflux/diffusion_pytorch_model.safetensors"},
+          {"remote_path": "text_encoder-mlx-4bit/model.safetensors"},
+          {"remote_path": "tokenizer/tokenizer.json"}
+        ]
+      }
+    },
+    "flux2": {"text_encoder/config.json": {"hidden_size": 4096}, "model_index.json": {"_class_name": "Flux2KleinPipeline"}}
+  },
+  "caption": {
+    "high_level_description": "A detailed photo of a red cube.",
+    "style_description": {
+      "aesthetics": "minimal product photography",
+      "lighting": "soft studio lighting",
+      "photo": "close-up product photo",
+      "medium": "photograph"
+    },
+    "compositional_deconstruction": {
+      "background": "A quiet studio with a matte grey backdrop.",
+      "elements": [{"type": "obj", "desc": "A translucent red glass cube."}]
+    }
+  },
+  "conditioning_encoder": {
+    "module": "ernie_image.text_encoder",
+    "config_class": "ErnieImageTextConfig",
+    "config": {
+      "vocab_size": 4,
+      "hidden_size": 2,
+      "intermediate_size": 4,
+      "num_hidden_layers": 3,
+      "num_attention_heads": 1,
+      "num_key_value_heads": 1,
+      "head_dim": 2,
+      "rope_parameters": null
+    }
   }
 }
