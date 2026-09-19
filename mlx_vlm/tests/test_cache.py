@@ -82,17 +82,12 @@ from mlx_vlm.turboquant import (
 )
 from mlx_vlm.vision_cache import VisionFeatureCache
 
-# Public API
-
 
 def test_make_cache_is_publicly_exported():
-    # importlib bypasses __getattr__ which maps mlx_vlm.generate to the
-    # generate() function.
     gen = importlib.import_module("mlx_vlm.generate")
-    ar = importlib.import_module("mlx_vlm.generate.ar")
 
     assert "make_cache" in gen.__all__
-    assert gen.make_cache is ar.make_cache
+    assert gen.make_cache is make_cache
 
 
 # Cache lifecycle
