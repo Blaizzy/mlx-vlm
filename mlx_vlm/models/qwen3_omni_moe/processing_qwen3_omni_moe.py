@@ -25,18 +25,14 @@ from ..qwen3_vl.processing_qwen3_vl import (
 
 
 def _get_feat_extract_output_lengths(input_lengths):
-    """
-    Computes the output length of the convolutional layers and the audio encoder.
-    """
-    input_lengths_leave = input_lengths % 100
-    feat_lengths = (input_lengths_leave - 1) // 2 + 1
-    output_lengths = (
-        ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
-    )
-    return output_lengths
+    # Nonnegative ceil-divisions agree for NumPy and MLX integer arrays;
+    # MLX truncates negative division, so (length - 1) // 2 is wrong at zero.
+    return (input_lengths % 100 + 7) // 8 + (input_lengths // 100) * 13
 
 
 class Qwen3OmniMoeProcessor(ProcessorMixin):
+    supports_multiple_audio = True
+
     attributes = [
         "image_processor",
         "video_processor",
@@ -102,19 +98,46 @@ class Qwen3OmniMoeProcessor(ProcessorMixin):
                     "return_attention_mask",
                 ):
                     audio_kwargs[k] = kwargs.pop(k)
-            audio_inputs = self.feature_extractor(audio, **audio_kwargs)
-            audio_inputs["feature_attention_mask"] = audio_inputs.pop(
-                "attention_mask", None
-            )
-            audio_inputs["input_features"] = audio_inputs.pop("input_features", None)
-            mask = audio_inputs["feature_attention_mask"]
-            mel_frames = audio_inputs["input_features"].shape[-1]
-            mel_lengths = mask.sum(-1)
-            # feature_attention_mask is sample-domain; convert to mel frames via the
-            # mask/mel ratio (the hop length) so the placeholder count matches the
-            # audio encoder's true output length.
-            if mask.shape[-1] > mel_frames:
-                mel_lengths = mel_lengths // (mask.shape[-1] // mel_frames)
+            # Extract before padding: another clip must not change this clip's
+            # STFT boundary, valid-frame count, or content hash.
+            clips = [audio]
+            if isinstance(audio, np.ndarray) and audio.ndim == 2:
+                clips = list(audio)
+            elif (
+                isinstance(audio, (list, tuple)) and audio and not np.isscalar(audio[0])
+            ):
+                clips = list(audio)
+            parts = [self.feature_extractor([clip], **audio_kwargs) for clip in clips]
+            features = [np.asarray(part["input_features"]) for part in parts]
+            mel_lengths = []
+            for part, feature in zip(parts, features):
+                mask = np.asarray(part["attention_mask"])
+                lengths = mask.sum(-1)
+                if mask.shape[-1] > feature.shape[-1]:
+                    hop = getattr(
+                        self.feature_extractor,
+                        "hop_length",
+                        mask.shape[-1] // feature.shape[-1],
+                    )
+                    lengths = lengths // hop
+                mel_lengths.extend(
+                    np.minimum(lengths, feature.shape[-1]).astype(np.int32).tolist()
+                )
+            mel_lengths = np.asarray(mel_lengths, dtype=np.int32)
+            frames = max(feature.shape[-1] for feature in features)
+            audio_inputs = {
+                "input_features": np.concatenate(
+                    [
+                        np.pad(
+                            feature, ((0, 0), (0, 0), (0, frames - feature.shape[-1]))
+                        )
+                        for feature in features
+                    ]
+                ),
+                "feature_attention_mask": (
+                    np.arange(frames)[None, :] < mel_lengths[:, None]
+                ).astype(np.int32),
+            }
             audio_lengths = iter(_get_feat_extract_output_lengths(mel_lengths))
         else:
             audio_inputs = {}
@@ -129,9 +152,18 @@ class Qwen3OmniMoeProcessor(ProcessorMixin):
 
         if videos is not None:
             videos_inputs = self.video_processor(videos=videos)
+            rates = (
+                fps
+                if isinstance(fps, (list, tuple))
+                else [fps] * len(videos_inputs.get("video_grid_thw", []))
+            )
+            if len(rates) != len(videos_inputs.get("video_grid_thw", [])) or any(
+                rate <= 0 for rate in rates
+            ):
+                raise ValueError("fps must contain one positive rate per video")
             videos_inputs["video_second_per_grid"] = [
-                self.video_processor.temporal_patch_size / fps
-            ] * len(videos_inputs.get("video_grid_thw", []))
+                self.video_processor.temporal_patch_size / rate for rate in rates
+            ]
             video_grid_thw = iter(videos_inputs["video_grid_thw"])
             video_second_per_grid = iter(videos_inputs["video_second_per_grid"])
         else:

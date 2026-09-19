@@ -1,47 +1,19 @@
 """Prefix-local image identity and suffix slicing for single-request Qwen3.5 APC."""
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 import mlx.core as mx
 
 from .apc import media_token_spans, semantic_extra_hash
+from .apc_prefix import PrefixContext
 
 
 @dataclass
-class ImagePrefixContext:
-    token_ids: list[int]
-    spans: tuple[tuple[int, int], ...]
-    hashes: list[int]
+class ImagePrefixContext(PrefixContext):
     pixel_offsets: list[int]
     pixel_values: Any
     image_grid_thw: Any
-
-    @staticmethod
-    def supports_overrides(kwargs, input_ids, mask):
-        # Opaque embeddings, positions and mutable caches cannot be identified
-        # by the processed image pixels. Never store them in this namespace.
-        if any(
-            kwargs.get(key) is not None
-            for key in (
-                "position_ids",
-                "rope_deltas",
-                "cached_image_features",
-                "inputs_embeds",
-                "prompt_cache",
-                "draft_model",
-                "max_kv_size",
-                "kv_bits",
-                "kv_key_bits",
-                "kv_value_bits",
-            )
-        ):
-            return False
-        return mask is None or (
-            mask.ndim == 2
-            and mask.shape == input_ids.shape
-            and bool(mx.all(mask == 1).item())
-        )
 
     @classmethod
     def prepare(cls, model, processor, token_ids, pixel_values, kwargs, tenant):
@@ -103,52 +75,6 @@ class ImagePrefixContext:
         if pixel_values is not None and offsets[-1] != pixel_values.shape[0]:
             return None
         return cls(list(token_ids), spans, hashes, offsets, pixel_values, grid)
-
-    def prefix_hash(self, prefix_len: int) -> int:
-        completed = 0
-        for start, end in self.spans:
-            if start < prefix_len < end:
-                raise ValueError("An image prefix cannot end inside an image span")
-            completed += end <= prefix_len
-        return self.hashes[completed]
-
-    def lookup(self, manager) -> Optional[dict]:
-        # The manager's lower bound is exclusive and its upper bound inclusive.
-        # In particular max_prefix_tokens=0 means unbounded, not an empty range.
-        for k in range(len(self.spans), -1, -1):
-            lower = self.spans[k - 1][1] - 1 if k else 0
-            upper = self.spans[k][0] if k < len(self.spans) else len(self.token_ids) - 1
-            if upper <= lower or upper <= 0:
-                continue
-            cache, length = manager.lookup_exact_cache(
-                self.token_ids,
-                extra_hash=self.hashes[k],
-                min_prefix_tokens=lower,
-                max_prefix_tokens=upper,
-            )
-            if cache is not None:
-                return {
-                    "warm_cache": cache,
-                    "prefix_len": length,
-                    "matched_blocks": [],
-                    "extra_hash": self.hashes[k],
-                    "full_input_ids": self.token_ids,
-                }
-        return None
-
-    def checkpoint_lengths(self, coordinator) -> list[int]:
-        # Ordinary checkpoint spacing still applies, but a boundary only needs
-        # to pass the image containing it, not every image in the request.
-        lengths = coordinator.checkpoint_lengths(self.token_ids, set())
-        safe = set()
-        for length in lengths:
-            for start, end in self.spans:
-                if start < length < end:
-                    length = end
-                    break
-            if 0 < length < len(self.token_ids):
-                safe.add(length)
-        return sorted(safe)
 
     def suffix_inputs(self, prefix_len: int):
         self.prefix_hash(prefix_len)  # reject a split image before slicing

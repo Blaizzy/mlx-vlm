@@ -633,6 +633,42 @@ inference, checks which images were encoded, and verifies changed/reordered
 history. Quantized cold and cached execution need not be bit-identical.
 
 
+#### Appending media to a cached Qwen3-Omni conversation
+
+Use `stream_generate(..., apc_manager=apc, apc_media_prefix=True)` for Omni's
+single-request text, image, independent audio clips and video inputs. The
+model uses prefix checkpoints even though its dense KV caches also support
+block storage. Only media inside each checkpoint enters its key; suffix image,
+audio and video tensors are sliced independently, in prompt order. Old media
+content, grid or FPS changes invalidate checkpoints containing that occurrence.
+
+Omni retains full-prompt RoPE positions and aligns suffix deepstack residuals to
+absolute cache coordinates. The processor extracts audio clips independently
+before padding, and the audio tower encodes each clip independently. This makes
+an earlier clip's features stable when a longer clip is appended. Multiple audio
+clips are supported; CNN output lengths and chunk masks use the same frame counts
+as processor placeholders, including exact multiples of 100 mel frames.
+
+A video plus its separately supplied/demuxed audio is supported. Native
+`use_audio_in_video=True` interleaving and unknown layouts disable APC. The new
+path does not apply to continuous batching. The same opaque-override restrictions
+as the image-prefix option apply; an explicit `PromptCacheState` retains its
+existing separate behavior and is excluded from this new path. Disk remains a
+caller choice, with its existing persistence and retention semantics.
+
+The following example generates synthetic fixtures locally and checks repeated
+cold/hit responses, encoder calls, old-content changes and FPS changes. It needs
+macOS `say` with the Samantha voice and `ffmpeg`:
+
+```sh
+python examples/verify_omni_media_prefix.py --output /tmp/omni-prefix-results.json
+```
+
+Quantized Omni uses MoE routing, and changing prefill/encoder batch shapes can
+change output probabilities or wording. The regression suite additionally checks
+full versus restored/chunked suffix logits with tiny float32 models to isolate
+position and cache-state correctness.
+
 #### Python Script
 
 Use `APCManager` directly when calling `stream_generate`:

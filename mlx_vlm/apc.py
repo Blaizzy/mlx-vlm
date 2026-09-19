@@ -478,6 +478,12 @@ def hash_image_payload(
 def multimodal_token_ids_from_config(config: Any) -> set[int]:
     """Return token IDs that represent media placeholders in a prompt."""
     ids: set[int] = set()
+    if getattr(config, "model_type", None) == "qwen3_omni_moe":
+        thinker = config.thinker_config
+        ids.update(multimodal_token_ids_from_config(thinker))
+        ids.add(int(thinker.audio_token_id))
+    elif getattr(config, "model_type", None) == "qwen3_omni_moe_thinker":
+        ids.add(int(config.audio_token_id))
     for attr in (
         "image_token_id",
         "image_token_index",
