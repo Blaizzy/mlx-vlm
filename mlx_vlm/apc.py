@@ -4028,7 +4028,7 @@ def _fill_batch_layer_cache(
     quantize: bool,
     kv_quant_config: Optional[dict],
 ) -> Any:
-    """Build one batch-path layer cache matching ``_make_cache`` layout.
+    """Build one batch-path layer cache matching ``make_cache`` layout.
 
     When quantizing, select the same backend as live generation:
     TurboQuant (``BatchTurboQuantKVCache``) if ``turboquant_enabled(bits, scheme)``,
@@ -4161,7 +4161,7 @@ def make_warm_batch_kv_cache(
     continuous-batching path; the resulting cache list can be
     ``extend()``-ed into a running batch.
 
-    When *kv_quant_config* is provided, layer types match ``_make_cache``:
+    When *kv_quant_config* is provided, layer types match ``make_cache``:
     quantized batch caches for layers that ``should_quantize_kv_layer`` allows,
     float ``BatchKVCache`` for the last layer when ``num_layers > 2``.
     """
@@ -4203,7 +4203,7 @@ def make_warm_batch_kv_cache_multi(
     ``picks`` is per-row, with each entry being ``None`` (cold) or a dict
     with key ``matched_blocks`` (list of APCBlock) and ``prefix_len``.
 
-    When *kv_quant_config* is provided, layer types match ``_make_cache`` via
+    When *kv_quant_config* is provided, layer types match ``make_cache`` via
     ``should_quantize_kv_layer`` (last layer stays float when n > 2).
 
     Returns ``(cache_list, max_prefix)`` where ``max_prefix`` is the cache's
@@ -4304,7 +4304,7 @@ def _merge_exact_cache_entries(
 
 
 def _empty_quant_batch_cache(left_padding: List[int], kv_quant_config: dict) -> Any:
-    """Empty quantized batch cache matching live ``_make_cache`` backend."""
+    """Empty quantized batch cache matching live ``make_cache`` backend."""
     policy = kv_quant_from_config(kv_quant_config)
     from .turboquant import BatchTurboQuantKVCache
 
@@ -4329,7 +4329,7 @@ def _align_exact_batch_caches_to_kv_policy(
     caches: List[Any],
     kv_quant_config: dict,
 ) -> List[Any]:
-    """Align legacy float full-attn snapshots with live ``_make_cache``.
+    """Align legacy float full-attn snapshots with live ``make_cache``.
 
     Native quantized snapshots already merge into their matching batch cache
     and pass through unchanged. Older float snapshots still need conversion
@@ -4373,7 +4373,7 @@ def make_warm_batch_exact_cache_multi(
 
     Native quantized rows are merged in their packed representation. When
     *kv_quant_config* is provided, legacy float ``BatchKVCache`` snapshots are
-    converted to match live ``_make_cache``. Hybrid non-KV entries are
+    converted to match live ``make_cache``. Hybrid non-KV entries are
     unchanged.
     """
 
