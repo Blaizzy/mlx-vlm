@@ -150,6 +150,46 @@ class DeepseekOCRProcessor(ProcessorMixin):
     tokenizer_class = ("LlamaTokenizer", "LlamaTokenizerFast")
     attributes = ["tokenizer"]
 
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        """Build the tokenizer from the checkpoint's ``tokenizer.json``.
+
+        The declared ``LlamaTokenizerFast`` resolves to Llama's Metaspace
+        layout on transformers 5.x, which drops the prompt's whitespace, and
+        ``add_bos_token`` survives only in ``tokenizer_config.json``.
+        """
+        import inspect
+        import json
+        from pathlib import Path
+
+        from transformers import PreTrainedTokenizerFast
+
+        path = Path(pretrained_model_name_or_path)
+        if not path.exists():
+            from huggingface_hub import snapshot_download
+
+            path = Path(snapshot_download(pretrained_model_name_or_path))
+
+        def read(name):
+            file = path / name
+            return json.loads(file.read_text(encoding="utf-8")) if file.exists() else {}
+
+        # ProcessorMixin rejects keys __init__ does not name, such as base_size.
+        accepted = set(inspect.signature(cls.__init__).parameters)
+        options = {
+            k: v for k, v in read("processor_config.json").items() if k in accepted
+        }
+        options["add_bos_token"] = bool(
+            read("tokenizer_config.json").get("add_bos_token", True)
+        )
+        kwargs.pop("use_fast", None)
+        template = path / "chat_template.jinja"
+        if template.exists():
+            options["chat_template"] = template.read_text(encoding="utf-8")
+        return cls(
+            tokenizer=PreTrainedTokenizerFast.from_pretrained(path, **kwargs), **options
+        )
+
     def __init__(
         self,
         tokenizer: LlamaTokenizerFast,
@@ -165,6 +205,7 @@ class DeepseekOCRProcessor(ProcessorMixin):
         sft_format: str = "deepseek",
         mask_prompt: bool = True,
         ignore_id: int = -100,
+        add_bos_token: bool = True,
         **kwargs,
     ):
         self.candidate_resolutions = candidate_resolutions
@@ -214,6 +255,7 @@ class DeepseekOCRProcessor(ProcessorMixin):
 
         self.image_token = image_token
         self.pad_token = pad_token
+        self.add_bos_token = add_bos_token
         self.add_special_token = add_special_token
         self.sft_format = sft_format
         self.mask_prompt = mask_prompt
@@ -483,9 +525,10 @@ class DeepseekOCRProcessor(ProcessorMixin):
         images_seq_mask += [False] * len(tokenized_sep)
 
         """add the bos tokens"""
-        bos_id = 0
-        tokenized_str = [bos_id] + tokenized_str
-        images_seq_mask = [False] + images_seq_mask
+        if self.add_bos_token:
+            bos_id = self.bos_id if self.bos_id is not None else 0
+            tokenized_str = [bos_id] + tokenized_str
+            images_seq_mask = [False] + images_seq_mask
 
         images_seq_mask = mx.array(images_seq_mask)
 
