@@ -881,7 +881,7 @@ def _extend_cache(cache_a, cache_b):
     return extended
 
 
-def make_batch_cache(
+def make_cache(
     model,
     left_padding,
     kv_bits=None,
@@ -894,9 +894,7 @@ def make_batch_cache(
     quantized_kv_start=0,
     prefill_length=0,
 ):
-    """
-    Convert a list of regular caches into their corresponding
-    batch-aware caches.
+    """Convert a model's singleton caches into their batch-aware counterparts.
 
     When *kv_bits* is set, a quantized batch cache is used instead of
     ``BatchKVCache`` so that KV states are quantized on-the-fly during
@@ -910,15 +908,10 @@ def make_batch_cache(
     Quantized continuous batching with these caches raises
     ``NotImplementedError``.
 
-    This is the public entry point for schedulers that drive continuous
-    batching themselves instead of going through :func:`batch_generate` — for
-    example a server that feeds mlx-vlm models to ``mlx_lm.generate``'s
-    ``BatchGenerator``. ``mlx_lm.generate._make_cache`` recognises only
-    mlx-lm's own cache classes and rejects every mlx-vlm one (including
-    :class:`mlx_vlm.models.cache.ArraysCache`) with ``ValueError: ... does not
-    yet support batching``; this function knows the model-owned caches and
-    honours their ``to_batch()`` hooks, so a downstream scheduler can convert
-    a model's caches without reimplementing that type table.
+    This is the public entry point for external schedulers that drive
+    continuous batching themselves instead of going through :func:`batch_generate`
+    — the cache converter understands model-owned cache classes and honours their
+    ``to_batch()`` hooks.
     """
     _batch_policy = kv_quant_from_legacy(
         kv_bits,
@@ -1011,10 +1004,6 @@ def make_batch_cache(
                 for i in range(n)
             ]
         return [cache.BatchKVCache(left_padding) for _ in model.layers]
-
-
-# Private alias, kept for existing in-repo callers and importers.
-_make_cache = make_batch_cache
 
 
 @dataclass
@@ -1859,7 +1848,7 @@ class PromptProcessingBatch:
                 draft_kind=draft_kind,
                 batch_size=len(input_ids),
                 left_padding=left_padding,
-                make_cache=lambda lm, lp: make_batch_cache(
+                make_cache=lambda lm, lp: make_cache(
                     lm,
                     lp,
                     kv_bits=kv_bits,
@@ -1881,7 +1870,7 @@ class PromptProcessingBatch:
         ):
             self.prompt_cache = cache.make_prompt_cache(model)
         else:
-            self.prompt_cache = make_batch_cache(
+            self.prompt_cache = make_cache(
                 model,
                 left_padding,
                 kv_bits=kv_bits,
@@ -2736,7 +2725,7 @@ class BatchGenerator:
             merged_kwargs[k] = _concat_prompt_kwarg_rows(k, vs)
 
         apc_mode = getattr(self, "apc_mode", "block")
-        # bits + group_size + scheme so warm restore matches live _make_cache
+        # bits + group_size + scheme so warm restore matches live make_cache
         # backend (uniform BatchQuantized vs BatchTurboQuant).
         _quant_policy = kv_quant_from_legacy(
             self.kv_bits,
