@@ -12,6 +12,7 @@ import mlx.nn as nn
 from transformers import PreTrainedTokenizer
 
 from .. import apc as _apc
+from ..apc_images import ImagePrefixContext
 from ..kv_quant import from_legacy as kv_quant_from_legacy
 from ..models import cache
 from ..prompt_utils import apply_chat_template
@@ -804,6 +805,8 @@ def stream_generate(
     image: Union[str, List[str], None] = None,
     audio: Union[str, List[str], None] = None,
     video: Union[str, List[str], None] = None,
+    *,
+    apc_image_prefix: bool = False,
     **kwargs: Unpack[GenerateKwargs],
 ) -> Generator[GenerationResult, None, None]:
     """
@@ -815,6 +818,8 @@ def stream_generate(
         prompt (str): The input prompt text.
         image (Union[str, List[str]], optional): Image path(s) or URL(s).
         audio (Union[str, List[str]], optional): Audio file path(s).
+        apc_image_prefix (bool, optional): Reuse Qwen3.5 checkpoints before
+          newly appended images. Single-request text/image inputs only.
         prefill_step_size (int, optional): Number of tokens to process per prefill
           step. When set, enables chunked prefill which processes long prompts in
           smaller chunks to reduce peak memory usage.
@@ -893,6 +898,14 @@ def stream_generate(
             vision_cache.put(image, features)
             kwargs["cached_image_features"] = features
 
+    if apc_image_prefix and (
+        vision_cache is not None
+        or custom_mask is not None
+        or custom_inputs_embeds is not None
+        or not ImagePrefixContext.supports_overrides(kwargs, input_ids, mask)
+    ):
+        apc_manager = None
+
     # Prompt cache reuse: skip common prefix from previous turn
     reused_prefix_len = 0
     full_input_ids_list = input_ids.flatten().tolist()
@@ -929,7 +942,28 @@ def stream_generate(
         else:
             apc_coordinator.prepare_prefill(len(full_input_ids_list))
 
-    if apc_manager is not None:
+    image_prefix = None
+    if (
+        apc_image_prefix
+        and apc_coordinator is not None
+        and apc_coordinator.is_checkpoint
+        and input_ids.shape[0] == 1
+        and audio is None
+        and video is None
+        and kwargs.get("input_features") is None
+        and kwargs.get("pixel_values_videos") is None
+        and kwargs.get("video_grid_thw") is None
+        and kwargs.get("draft_model") is None
+        and custom_inputs_embeds is None
+        and custom_mask is None
+        and vision_cache is None
+        and prompt_cache_state is None
+    ):
+        image_prefix = ImagePrefixContext.prepare(
+            model, processor, full_input_ids_list, pixel_values, kwargs, apc_tenant
+        )
+
+    if apc_manager is not None and image_prefix is None:
         image_hash = _apc.hash_image_payload(pixel_values=pixel_values, image_ref=image)
         audio_features = kwargs.get("input_features")
         video_features = kwargs.get("pixel_values_videos")
@@ -973,13 +1007,18 @@ def stream_generate(
     # APC: cross-request, hash-based prefix lookup. Only consulted if a per-turn
     # PromptCacheState didn't already produce a hit.
     if apc_manager is not None and reused_prefix_len == 0:
-        plan = apc_coordinator.lookup(
-            full_input_ids_list,
-            extra_hash=apc_extra_hash,
-            safe_lookup_min=apc_safe_prefix_lookup_min,
-            suffix_is_text_only=_apc_suffix_is_text_only,
-            prefix_has_media=_apc_prefix_has_media_tokens,
-        )
+        if image_prefix is not None:
+            plan = image_prefix.lookup(apc_manager)
+            if plan is not None:
+                plan["cache_plan"] = apc_coordinator.plan
+        else:
+            plan = apc_coordinator.lookup(
+                full_input_ids_list,
+                extra_hash=apc_extra_hash,
+                safe_lookup_min=apc_safe_prefix_lookup_min,
+                suffix_is_text_only=_apc_suffix_is_text_only,
+                prefix_has_media=_apc_prefix_has_media_tokens,
+            )
         if plan is not None:
             plen = plan["prefix_len"]
             warm_cache = plan.get("warm_cache")
@@ -988,7 +1027,12 @@ def stream_generate(
             if primed:
                 reused_prefix_len = plen
                 input_ids = input_ids[:, plen:]
-                pixel_values = None
+                if image_prefix is not None:
+                    pixel_values, kwargs["image_grid_thw"] = image_prefix.suffix_inputs(
+                        plen
+                    )
+                else:
+                    pixel_values = None
                 kwargs.pop("pixel_values_videos", None)
                 kwargs.pop("cached_image_features", None)
                 apc_blocks_in_use = matched_blocks
@@ -1050,8 +1094,12 @@ def stream_generate(
         if apc_coordinator is not None and apc_coordinator.is_checkpoint:
             exact_checkpoint_lengths = [
                 n - reused_prefix_len
-                for n in apc_coordinator.checkpoint_lengths(
-                    full_input_ids_list, multimodal_token_ids
+                for n in (
+                    image_prefix.checkpoint_lengths(apc_coordinator)
+                    if image_prefix is not None
+                    else apc_coordinator.checkpoint_lengths(
+                        full_input_ids_list, multimodal_token_ids
+                    )
                 )
                 if n > reused_prefix_len
             ]
@@ -1062,7 +1110,11 @@ def stream_generate(
                 apc_coordinator.store_checkpoint(
                     full_input_ids_list[: reused_prefix_len + prefix_len],
                     prompt_cache,
-                    extra_hash=apc_extra_hash,
+                    extra_hash=(
+                        image_prefix.prefix_hash(reused_prefix_len + prefix_len)
+                        if image_prefix is not None
+                        else apc_extra_hash
+                    ),
                 )
 
         gen = generate_step(

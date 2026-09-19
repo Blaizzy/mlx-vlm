@@ -600,6 +600,39 @@ APC has two tiers:
 - **Warm memory**: keeps reusable `APCBlock` tensors in process memory. This is the fastest path, but it keeps both the reusable block pool and the runtime `KVCache`.
 - **Warm disk**: persists cached prefixes as safetensors shards so they survive process restarts. Warm-disk reads build the layer-major prompt cache directly without promoting restored blocks into the `APCBlock` pool; writes can still populate both memory and disk tiers.
 
+#### Appending images to a cached Qwen3.5 conversation
+
+For single-request Qwen3.5-family text/image generation, opt into prefix-local
+image identity with `stream_generate(..., apc_manager=apc, apc_image_prefix=True)`.
+This includes Qwen3.8 models that use the `qwen3_5` architecture. Use the same
+model-scoped `APCManager` and tenant across requests. Other generation paths
+retain their existing behavior.
+
+A checkpoint hashes only the processed image pixels, grid geometry and image
+positions inside that checkpoint. Appending an image can therefore restore an
+unchanged earlier checkpoint and encode only the remaining images. Changing an
+old image or its position invalidates checkpoints containing it; a checkpoint
+before it can still be reused. Checkpoints never end inside an image-token span.
+The full prompt is still tokenized and images are preprocessed before lookup.
+
+The feature currently covers `stream_generate`, not the continuous-batching
+server path. Audio/video and unknown image layouts use the ordinary conservative
+APC path. Custom positions, masks, image features, embeddings, prompt caches,
+vision caches, speculative decoding, and KV quantization/size overrides disable
+APC for that request. Memory and disk checkpoints use a separate semantic
+namespace from the ordinary whole-request media keys.
+
+Run the real-model regression and timing example on an otherwise idle GPU:
+
+```sh
+python examples/verify_image_prefix_apc.py --model mlx-community/Qwen3.8-27B-4bit
+```
+
+It compares appended-image outputs and first-token distributions with cold
+inference, checks which images were encoded, and verifies changed/reordered
+history. Quantized cold and cached execution need not be bit-identical.
+
+
 #### Python Script
 
 Use `APCManager` directly when calling `stream_generate`:
