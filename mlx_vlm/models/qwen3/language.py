@@ -9,6 +9,7 @@ from ..base import (
     create_attention_mask,
     scaled_dot_product_attention,
 )
+from ..cache import KVCache
 from ..mlp import SwiGLUMLP as MLP
 from ..rope_utils import initialize_rope
 from .config import ModelConfig
@@ -194,6 +195,9 @@ class Model(nn.Module):
     def layers(self):
         return self.model.layers
 
+    def make_cache(self):
+        return [KVCache() for _ in self.layers]
+
 
 class LanguageModel(nn.Module):
     def __init__(self, args: ModelConfig):
@@ -230,6 +234,9 @@ class LanguageModel(nn.Module):
 
     def shard(self, group=None):
         Model.shard(self, group)
+
+    def make_cache(self):
+        return Model.make_cache(self)
 
     @property
     def layers(self):
