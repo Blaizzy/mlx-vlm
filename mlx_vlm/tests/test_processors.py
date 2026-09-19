@@ -1528,6 +1528,42 @@ def test_checkpoint_loading(tmp_path, name):
         ) == [3]
 
 
+def test_auto_processor_ignores_unimportable_bundled_code(tmp_path, monkeypatch):
+    """A checkpoint's own modelling code must not be required to build ours.
+
+    These checkpoints bundle torch-based code. Executing it on an mlx-only
+    install raises ImportError, which the route used to swallow and report as
+    "Unrecognized processing class".
+    """
+    from transformers import AutoProcessor
+
+    from mlx_vlm.models.base import install_auto_processor_patch
+
+    (tmp_path / "boom.py").write_text("import a_package_that_does_not_exist\n")
+    _write_configs(
+        tmp_path,
+        config={
+            "model_type": "fake_bundled_code",
+            "auto_map": {"AutoProcessor": "boom.FakeProcessor"},
+        },
+    )
+
+    sentinel = object()
+
+    class Fake:
+        @classmethod
+        def from_pretrained(cls, path, **kwargs):
+            assert "trust_remote_code" not in kwargs, kwargs
+            return sentinel
+
+    previous = AutoProcessor.from_pretrained
+    install_auto_processor_patch("fake_bundled_code", Fake)
+    try:
+        assert AutoProcessor.from_pretrained(tmp_path) is sentinel
+    finally:
+        AutoProcessor.from_pretrained = previous
+
+
 # Prompt construction
 
 

@@ -640,7 +640,9 @@ def install_auto_processor_patch(target_model_types, processor_cls):
 
             model_type = str(cfg.get("model_type", "")).lower()
             if model_type in target_model_types:
-                kwargs.setdefault("trust_remote_code", True)
+                # This processor is implemented here, so the checkpoint's own
+                # modelling code is not needed and importing it would pull in
+                # torch on an mlx-only install.
                 return processor_cls.from_pretrained(
                     pretrained_model_name_or_path, **kwargs
                 )
