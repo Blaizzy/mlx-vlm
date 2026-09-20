@@ -23,32 +23,28 @@ def _conv2d(conv: nn.Conv2d, x: mx.array) -> mx.array:
     return x.transpose(0, 3, 1, 2)
 
 
-def _per_frame(conv: nn.Conv2d, x: mx.array) -> mx.array:
-    """Run a 2D conv independently over every frame of ``[B, C, T, H, W]``."""
-    b, c, t, h, w = x.shape
-    x = x.transpose(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
-    x = _conv2d(conv, x)
-    x = x.reshape(b, t, x.shape[1], x.shape[2], x.shape[3])
-    return x.transpose(0, 2, 1, 3, 4)
+def _to_2d(value):
+    if isinstance(value, int):
+        return (value, value)
+    return tuple(value[1:]) if len(value) == 3 else tuple(value)
 
 
-class QwenImageCausalConv(nn.Module):
-    """Image specialization of the causal 3D conv: a padded per-frame 2D conv."""
+class QwenImageCausalConv(nn.Conv2d):
+    """Image specialization of the causal 3D conv: a padded per-frame 2D conv.
+
+    Subclasses ``nn.Conv2d`` so its ``weight``/``bias`` live at the module's own
+    key, matching the checkpoint (the reference likewise subclasses Conv2d).
+    """
 
     def __init__(self, in_dim: int, out_dim: int, kernel_size, padding=0) -> None:
-        super().__init__()
-        if isinstance(kernel_size, int):
-            kernel_size = (kernel_size, kernel_size)
-        elif len(kernel_size) == 3:
-            kernel_size = kernel_size[1:]
-        if isinstance(padding, int):
-            padding = (padding, padding)
-        elif len(padding) == 3:
-            padding = padding[1:]
-        self.conv = nn.Conv2d(in_dim, out_dim, kernel_size, padding=padding)
+        super().__init__(in_dim, out_dim, _to_2d(kernel_size), padding=_to_2d(padding))
 
     def __call__(self, x: mx.array) -> mx.array:
-        return _per_frame(self.conv, x)
+        b, c, t, h, w = x.shape
+        x = x.transpose(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+        x = _conv2d(super().__call__, x)
+        x = x.reshape(b, t, x.shape[1], x.shape[2], x.shape[3])
+        return x.transpose(0, 2, 1, 3, 4)
 
 
 class QwenImageRMSNorm(nn.Module):
@@ -57,8 +53,7 @@ class QwenImageRMSNorm(nn.Module):
     def __init__(self, dim: int, images: bool = True) -> None:
         super().__init__()
         self.scale = dim**0.5
-        shape = (dim,) if images else (dim, 1)
-        self.gamma = mx.ones(shape)
+        self.gamma = mx.ones((dim,))
 
     def __call__(self, x: mx.array) -> mx.array:
         norm = mx.rsqrt(
@@ -77,8 +72,20 @@ def _upsample_nearest(x: mx.array) -> mx.array:
     return x.reshape(n, c, h * 2, w * 2)
 
 
+class _Passthrough(nn.Module):
+    """Param-less placeholder so the conv sits at ``resample.1`` (matches ckpt)."""
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return x
+
+
 class QwenImageResample(nn.Module):
-    """Spatial up/down resample (image path; the temporal conv is video-only)."""
+    """Spatial up/down resample (image path; the temporal conv is video-only).
+
+    The pad/upsample op carries no parameters, so the convolution is stored at
+    ``resample.1`` to match the reference's ``nn.Sequential`` layout. ``time_conv``
+    exists only for the temporal (video) modes and is unused on the image path.
+    """
 
     def __init__(
         self, dim: int, mode: str, upsample_out_dim: int | None = None
@@ -88,20 +95,30 @@ class QwenImageResample(nn.Module):
         if upsample_out_dim is None:
             upsample_out_dim = dim // 2
         if mode in ("upsample2d", "upsample3d"):
-            self.conv = nn.Conv2d(dim, upsample_out_dim, 3, padding=1)
+            self.resample = [
+                _Passthrough(),
+                nn.Conv2d(dim, upsample_out_dim, 3, padding=1),
+            ]
         elif mode in ("downsample2d", "downsample3d"):
-            self.conv = nn.Conv2d(dim, dim, 3, stride=2, padding=0)
+            self.resample = [
+                _Passthrough(),
+                nn.Conv2d(dim, dim, 3, stride=2, padding=0),
+            ]
         else:
-            self.conv = None
+            self.resample = [_Passthrough()]
+        if mode == "upsample3d":
+            self.time_conv = QwenImageCausalConv(dim, dim * 2, 1)
+        elif mode == "downsample3d":
+            self.time_conv = QwenImageCausalConv(dim, dim, 1)
 
     def __call__(self, x: mx.array) -> mx.array:
         b, c, t, h, w = x.shape
         x = x.transpose(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
         if self.mode in ("upsample2d", "upsample3d"):
-            x = _conv2d(self.conv, _upsample_nearest(x))
+            x = _conv2d(self.resample[1], _upsample_nearest(x))
         elif self.mode in ("downsample2d", "downsample3d"):
             x = mx.pad(x, [(0, 0), (0, 0), (0, 1), (0, 1)])
-            x = _conv2d(self.conv, x)
+            x = _conv2d(self.resample[1], x)
         x = x.reshape(b, t, x.shape[1], x.shape[2], x.shape[3])
         return x.transpose(0, 2, 1, 3, 4)
 
