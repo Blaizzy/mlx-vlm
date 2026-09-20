@@ -6,7 +6,7 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 from PIL import Image
-from transformers import AutoProcessor, AutoTokenizer
+from transformers import AutoTokenizer
 
 from mlx_vlm.models.qwen3_vl import processing_qwen3_vl  # noqa: F401
 from mlx_vlm.models.qwen3_vl.qwen3_vl import Model as Qwen3VLModel
@@ -55,20 +55,22 @@ class QwenImageTextEncoder:
         self.model = model
         self.model_path = Path(model_path).expanduser()
         self.max_length = max_length
-        encoder_dir = str(self.model_path / "text_encoder")
+        # Tokenizer/processor assets live in the pipeline's processor/ component,
+        # not alongside the text-encoder weights. The full processor (needed only
+        # for reference-image editing) is loaded lazily; it pulls in a torch-based
+        # video processor that text-to-image does not need.
+        self.processor_dir = str(self.model_path / "processor")
         self.tokenizer = AutoTokenizer.from_pretrained(
-            encoder_dir, local_files_only=True, use_fast=True
+            self.processor_dir, local_files_only=True, use_fast=True
         )
-        self.processor = AutoProcessor.from_pretrained(
-            encoder_dir, local_files_only=True
+        self._processor = None
+        # Number of leading system-turn tokens the reference drops from the hidden
+        # states, derived by tokenizing the template's system prefix directly (the
+        # processor ships no chat template).
+        system_prefix = f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
+        self.drop_idx = len(
+            self.tokenizer(system_prefix, add_special_tokens=False)["input_ids"]
         )
-        sys_message = [
-            {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]}
-        ]
-        sys_tokens = self.processor.apply_chat_template(
-            sys_message, tokenize=True, return_dict=False
-        )
-        self.drop_idx = len(sys_tokens[0])
 
     def _hidden_states(self, inputs: dict) -> mx.array:
         input_ids = _to_mx(inputs["input_ids"]).astype(mx.int32)
@@ -102,6 +104,14 @@ class QwenImageTextEncoder:
         if hidden.shape[1] <= self.drop_idx:
             raise ValueError("Qwen-Image prompt was empty after template trimming")
         return hidden[:, self.drop_idx :]
+
+    @property
+    def processor(self):
+        if self._processor is None:
+            self._processor = AutoProcessor.from_pretrained(
+                self.processor_dir, local_files_only=True
+            )
+        return self._processor
 
     def encode_edit(
         self,

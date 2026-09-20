@@ -58,9 +58,8 @@ def load_transformer(
     model_path: str | Path, variant: QwenImageVariant | str | None = None
 ) -> QwenImageTransformer:
     root = Path(model_path).expanduser()
-    variant = (
-        get_variant(variant) if not isinstance(variant, QwenImageVariant) else variant
-    )
+    if not isinstance(variant, QwenImageVariant):
+        variant = get_variant(variant if variant is not None else "qwen-image-2.1")
     model = QwenImageTransformer(**variant.transformer_overrides)
     weights = _remap_transformer(_load_shards(root / "transformer"))
     model.load_weights(weights, strict=True)
