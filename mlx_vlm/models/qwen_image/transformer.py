@@ -19,6 +19,8 @@ import math
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_vlm.models.activations import swiglu
+
 _ROPE_POS = 8192
 _ROPE_NEG = 1024
 _ROPE_ROWS = _ROPE_POS + _ROPE_NEG
@@ -83,7 +85,7 @@ class QwenImageSwiGLU(nn.Module):
         self.gate_layer = nn.Linear(hidden_size, mlp_hidden_size, bias=False)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.out(nn.silu(self.gate_layer(x)) * self.proj(x))
+        return self.out(swiglu(self.gate_layer(x), self.proj(x)))
 
 
 def _select_modulation_rows(
