@@ -167,6 +167,8 @@ def _model_type_from_id(model: str) -> str:
         "z": "z_image",
         "zimage": "z_image",
         "ernie": "ernie_image",
+        "qwen": "qwen_image",
+        "qwenimage": "qwen_image",
     }.get(model_type, model_type)
 
 
@@ -254,6 +256,8 @@ def _image_model_type_from_manifest(metadata: dict[str, Any]) -> str | None:
 def _image_model_type_from_component_indexes(root: Path) -> str | None:
     transformer_index = _load_json_file(
         root / "transformer" / "model.safetensors.index.json"
+    ) or _load_json_file(
+        root / "transformer" / "diffusion_pytorch_model.safetensors.index.json"
     )
     if transformer_index is None:
         return None
@@ -282,6 +286,13 @@ def _image_model_type_from_component_indexes(root: Path) -> str | None:
     }
     if ernie_image_markers <= keys:
         return "ernie_image"
+    qwen_image_markers = {
+        "transformer_blocks.0.img_mlp.gate_layer.weight",
+        "txt_in.text_norm.weight",
+        "txt_in.in_layer.weight",
+    }
+    if qwen_image_markers <= keys:
+        return "qwen_image"
     return None
 
 
