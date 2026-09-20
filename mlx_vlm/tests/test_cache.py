@@ -982,6 +982,63 @@ def test_blocks_and_statistics(managers):
     assert manager.lookup_prefix(tokens) == ([], 0)
 
 
+def test_unreachable_prefill_reserve_is_reported(managers, monkeypatch, caplog):
+    """An unsatisfiable reserve must be visible, not silently fatal.
+
+    Regression: declining admission for a reserve the device can never
+    satisfy is the intended policy, but it used to be indistinguishable from
+    a broken cache -- no counter, no log -- and stayed that way for as long
+    as the estimate did.
+    """
+    manager = managers(budget=1 << 20)
+    monkeypatch.setattr(manager, "_memory_headroom", lambda: 1 << 20)
+    # The physics of the failure: no eviction can cover such a requirement.
+    assert manager._make_room_for(1 << 60, 0) is False
+
+    manager.prepare_prefill(1 << 60)
+    # The estimate itself is still honored (it drives eviction decisions) and
+    # the default policy keeps declining admission.
+    assert manager._prefill_reserve_bytes == 1 << 60
+    assert manager._make_room(1 << 16) is False
+    stats = manager.stats_snapshot()
+    assert stats["reserve_unreachable"] >= 1
+    assert stats["reserve_relaxed"] == 0
+    assert stats["last_reserve_bytes"] == 1 << 60
+    assert "exceeds the budget" in caplog.text
+    assert "APC_RELAX_UNREACHABLE_RESERVE=1" in caplog.text
+
+
+def test_unreachable_prefill_reserve_can_be_relaxed(managers, monkeypatch):
+    """APC_RELAX_UNREACHABLE_RESERVE=1 bills allocations against the requirement."""
+    manager = managers(budget=1 << 20)
+    monkeypatch.setattr(manager, "_memory_headroom", lambda: 1 << 20)
+    manager.relax_unreachable_reserve = True
+    manager.prepare_prefill(1 << 60)
+    assert manager._prefill_reserve_bytes == 1 << 60
+    assert manager._make_room(1 << 16) is True
+    stats = manager.stats_snapshot()
+    assert stats["reserve_unreachable"] >= 1
+    assert stats["reserve_relaxed"] >= 1
+    assert stats["memory_skips"] == 0
+
+
+def test_achievable_prefill_reserve_is_kept_verbatim(managers):
+    manager = managers(budget=64 << 20)
+    reserve = 8 << 20
+    manager.prepare_prefill(reserve)
+    assert manager._prefill_reserve_bytes == reserve
+    assert manager._make_room(1 << 16) is True
+    stats = manager.stats_snapshot()
+    assert stats["reserve_unreachable"] == 0
+    assert stats["reserve_relaxed"] == 0
+    assert stats["last_reserve_bytes"] == 0
+    # Zero reserves stay zero and never count as unreachable.
+    manager.prepare_prefill(0)
+    assert manager._prefill_reserve_bytes == 0
+    assert manager._make_room() is True
+    assert manager.stats_snapshot()["reserve_unreachable"] == 0
+
+
 def test_layer_major_threshold(managers, monkeypatch):
     monkeypatch.setenv("APC_LAYER_MAJOR_MEMORY_MIN_TOKENS", "1")
     manager = managers(blocks=16)

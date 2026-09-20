@@ -651,6 +651,9 @@ class APCStats:
     exact_stores: int = 0
     memory_evictions: int = 0
     memory_skips: int = 0
+    reserve_unreachable: int = 0
+    reserve_relaxed: int = 0
+    last_reserve_bytes: int = 0
     rejects: int = 0
     rejects_by_reason: Dict[str, int] = field(default_factory=dict)
     last_reject: Optional[Dict[str, Any]] = None
@@ -683,6 +686,9 @@ class APCStats:
             "exact_stores": self.exact_stores,
             "memory_evictions": self.memory_evictions,
             "memory_skips": self.memory_skips,
+            "reserve_unreachable": self.reserve_unreachable,
+            "reserve_relaxed": self.reserve_relaxed,
+            "last_reserve_bytes": self.last_reserve_bytes,
             "rejects": self.rejects,
             "rejects_by_reason": dict(self.rejects_by_reason),
             "last_reject": (
@@ -3169,6 +3175,10 @@ class APCManager:
         )
         self.memory_plan = PrefillMemoryPlan()
         self._prefill_reserve_bytes = 0
+        self._reserve_relax_warned = False
+        self.relax_unreachable_reserve = os.environ.get(
+            "APC_RELAX_UNREACHABLE_RESERVE", ""
+        ).lower() in ("1", "true", "yes")
 
     def _record_disk_writes(self, count: int) -> None:
         with self.lock:
@@ -3255,13 +3265,8 @@ class APCManager:
             min(limits) if limits else self.memory_max_bytes + self.memory_reserve_bytes
         )
 
-    def _make_room(self, allocation_bytes: int = 0, *, retain_bytes: int = 0) -> bool:
-        """Evict idle APC state before allocating; never alter leased blocks."""
-        required = self.memory_reserve_bytes + (
-            self._prefill_reserve_bytes + allocation_bytes
-            if retain_bytes
-            else max(self._prefill_reserve_bytes, allocation_bytes)
-        )
+    def _make_room_for(self, required: int, retain_bytes: int) -> bool:
+        """Evict idle APC state until ``required`` bytes could be allocated."""
         with self.lock:
             resident = self._resident_bytes_locked()
             target = max(
@@ -3300,6 +3305,50 @@ class APCManager:
             resident + retain_bytes <= self.memory_max_bytes
             and self._memory_headroom() >= required
         )
+
+    def _make_room(self, allocation_bytes: int = 0, *, retain_bytes: int = 0) -> bool:
+        """Evict idle APC state before allocating; never alter leased blocks."""
+        required = self.memory_reserve_bytes + (
+            self._prefill_reserve_bytes + allocation_bytes
+            if retain_bytes
+            else max(self._prefill_reserve_bytes, allocation_bytes)
+        )
+        # A reserve larger than the budget plus the device headroom cannot be
+        # satisfied by any amount of eviction. Declining admission is the
+        # intended policy there, but doing it quietly is not: once such a
+        # reserve sticks around, every store and restore is skipped and the
+        # prefix cache looks broken with no counter or log to point at. Report
+        # it, and let operators opt into billing allocations against the real
+        # requirement instead (APC_RELAX_UNREACHABLE_RESERVE=1).
+        if required > self.memory_max_bytes + self._memory_headroom():
+            if not self._reserve_relax_warned:
+                self._reserve_relax_warned = True
+                logger.warning(
+                    "APC prefill reserve of %d bytes exceeds the budget "
+                    "(%d bytes) plus device headroom; caching is declined "
+                    "until the reserve shrinks%s",
+                    self._prefill_reserve_bytes,
+                    self.memory_max_bytes,
+                    (
+                        " (relaxing to the allocation requirement)"
+                        if self.relax_unreachable_reserve
+                        else " (set APC_RELAX_UNREACHABLE_RESERVE=1 to allocate "
+                        "against the requirement anyway)"
+                    ),
+                )
+            with self.lock:
+                self.stats.reserve_unreachable += 1
+                self.stats.last_reserve_bytes = self._prefill_reserve_bytes
+            relaxed = self.memory_reserve_bytes + allocation_bytes
+            if (
+                self.relax_unreachable_reserve
+                and relaxed < required
+                and self._make_room_for(relaxed, retain_bytes)
+            ):
+                with self.lock:
+                    self.stats.reserve_relaxed += 1
+                return True
+        return self._make_room_for(required, retain_bytes)
 
     def prepare_prefill(self, reserve_bytes: int) -> None:
         """Enforce the coordinator's byte budget before new allocations."""
