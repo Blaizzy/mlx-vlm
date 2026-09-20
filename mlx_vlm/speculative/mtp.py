@@ -15,6 +15,8 @@ from .cache_state import (
 from .common import (
     _batch_cache_left_padding,
     _dflash_block_total,
+    _emitted_speculative_batch_round,
+    _emitted_speculative_round,
     _record_speculative_round,
     _requires_uniform_batch_acceptance,
     _speculative_walk,
@@ -598,8 +600,13 @@ def _mtp_rounds(
     draft_block_size: Optional[int] = None,
     token_dtype: mx.Dtype = mx.int32,
     greedy_sampling: bool = False,
+    stop_check: Optional[Callable[[int, int], bool]] = None,
 ) -> Generator[Tuple[int, None], None, None]:
-    """Verify autoregressive MTP drafts and commit accepted state before emission."""
+    """Verify autoregressive MTP drafts and commit accepted state before emission.
+
+    ``stop_check`` is only consulted for accounting (see
+    ``_emitted_speculative_round``); the caller still applies the stop.
+    """
     lm = model.language_model if hasattr(model, "language_model") else model
 
     block_total = _dflash_block_total(draft_model, draft_block_size)
@@ -692,7 +699,10 @@ def _mtp_rounds(
             sampler_rng.target_sampled(
                 sync_draft=not _sampler_supports_positioned_target(sampler)
             )
-            _record_speculative_round(draft_model, accepted, bs - 1)
+            accepted_emitted = _emitted_speculative_round(
+                accepted, new_tokens, stop_check
+            )
+            _record_speculative_round(draft_model, accepted, bs - 1, accepted_emitted)
 
             accept_verified = getattr(draft_model, "accept_verified_tokens", None)
             if callable(accept_verified):
@@ -882,6 +892,7 @@ def _mtp_rounds_batch(
     draft_block_size: Optional[int] = None,
     token_dtype: mx.Dtype = mx.int32,
     stop_check: Optional[Callable[[int, int], bool]] = None,
+    remaining_tokens: Optional[Callable[[int], int]] = None,
     eos_token_ids: Optional[set] = None,
     greedy_sampling: bool = False,
     row_ids: Optional[List[int]] = None,
@@ -1058,6 +1069,14 @@ def _mtp_rounds_batch(
                 sampler_rng.target_sampled(
                     sync_draft=not _sampler_supports_positioned_target(sampler)
                 )
+            emitted_mean = _emitted_speculative_batch_round(
+                accepted_list,
+                new_tokens_list,
+                active_idx,
+                stop_check,
+                eos_token_ids=eos_token_ids,
+                remaining_tokens=remaining_tokens,
+            )
             # Keep the adaptive block-size history on a per-round basis so
             # batched MTP reacts like the singleton loop instead of letting
             # batch size change the controller signal.
@@ -1065,6 +1084,7 @@ def _mtp_rounds_batch(
                 draft_model,
                 sum(accepted_list) / len(accepted_list),
                 bs - 1,
+                emitted_mean,
             )
 
             max_a = max(accepted_list)

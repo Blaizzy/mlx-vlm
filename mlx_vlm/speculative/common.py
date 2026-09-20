@@ -345,12 +345,89 @@ def _requires_uniform_batch_acceptance(
     return bool(getattr(target_model, "requires_uniform_batch_acceptance", False))
 
 
+def _emitted_speculative_round(
+    accepted: int,
+    new_tokens: List[int],
+    stop_check: Optional[Callable[[int, int], bool]] = None,
+    seq_idx: int = 0,
+    *,
+    eos_token_ids: Optional[set] = None,
+    remaining_tokens: Optional[Callable[[int], int]] = None,
+) -> int:
+    """Return how many of the round's ``accepted`` drafts the consumer emits.
+
+    The walk fixes ``accepted`` at the first draft/target mismatch without
+    looking for a stop token, so a stop inside the accepted prefix leaves a
+    tail of drafts in ``new_tokens`` that the consumer discards. The bonus at
+    index ``accepted`` is not a draft. The walk trims to the batch-wide budget;
+    ``remaining_tokens`` supplies the consumer's per-row budget, or zero for
+    a finished row.
+
+    Accounting only: callers keep the untruncated ``accepted``/``new_tokens``
+    for cache commits and emission. ``stop_check`` runs here before emission
+    and again in the emission loop, so it must be pure.
+    """
+    kept = len(new_tokens)
+    if remaining_tokens is not None:
+        kept = min(kept, max(0, remaining_tokens(seq_idx)))
+    for i, tok in enumerate(new_tokens[:kept]):
+        if (eos_token_ids is not None and tok in eos_token_ids) or (
+            stop_check is not None and stop_check(seq_idx, tok)
+        ):
+            kept = i + 1
+            break
+    return min(int(accepted), kept)
+
+
+def _emitted_speculative_batch_round(
+    accepted_list: List[int],
+    new_tokens_list: List[List[int]],
+    active_idx: List[int],
+    stop_check: Optional[Callable[[int, int], bool]] = None,
+    *,
+    eos_token_ids: Optional[set] = None,
+    remaining_tokens: Optional[Callable[[int], int]] = None,
+) -> float:
+    """Return the round's mean emitted drafts over the rows that are still live.
+
+    A row the consumer already finished (``remaining_tokens`` <= 0) emits
+    nothing and is left out of the mean, so it cannot dilute the attribution
+    of the requests that are still running.
+    """
+    emitted = [
+        _emitted_speculative_round(
+            a,
+            new_tokens_list[j],
+            stop_check,
+            active_idx[j],
+            eos_token_ids=eos_token_ids,
+            remaining_tokens=remaining_tokens,
+        )
+        for j, a in enumerate(accepted_list)
+        if remaining_tokens is None or remaining_tokens(active_idx[j]) > 0
+    ]
+    return sum(emitted) / len(emitted) if emitted else 0.0
+
+
 def _record_speculative_round(
-    draft_model: nn.Module, accepted: float, draft_count: int
+    draft_model: nn.Module,
+    accepted: float,
+    draft_count: int,
+    emitted: Optional[float] = None,
 ) -> None:
+    """Record one round: ``accepted`` drafts matched the target out of
+    ``draft_count`` proposed, ``emitted`` of them reached the consumer.
+
+    ``accept_lens`` keeps the matched count: it is the drafter-quality signal
+    the adaptive block-size controllers read. The lifetime accepted counter
+    takes ``emitted`` (see ``_emitted_speculative_round``) so that per-request
+    ``predicted_n - draft_n_accepted`` is a valid target-forward count.
+    """
     draft_model.accept_lens.append(accepted)
     if hasattr(draft_model, "draft_lens"):
         draft_model.draft_lens.append(int(draft_count))
+    if emitted is None:
+        emitted = accepted
     # Monotonic lifetime counters for per-request attribution. Unlike the
     # ``accept_lens`` history, these survive ``reset()`` between requests,
     # so callers can snapshot-and-diff across a request's lifetime.
@@ -359,7 +436,7 @@ def _record_speculative_round(
     )
     draft_model.speculative_total_accepted = getattr(
         draft_model, "speculative_total_accepted", 0.0
-    ) + float(accepted)
+    ) + float(emitted)
     draft_model.speculative_total_drafted = getattr(
         draft_model, "speculative_total_drafted", 0
     ) + int(draft_count)
@@ -379,8 +456,16 @@ def speculative_stats_since(
 ) -> Tuple[Optional[int], Optional[int], Optional[int]]:
     """Return (rounds, accepted, drafted) recorded since ``snapshot``.
 
-    Rounds are batch-wide, so the attribution is exact for batch size 1 and
-    shared across concurrent requests otherwise.
+    ``accepted`` counts only drafts that were emitted, provided the round loop
+    was given the consumer's stop (``stop_check``/``eos_token_ids``, as the
+    server does; ``run_speculative_rounds`` singletons are not, so drafts past
+    a stop still count there). Drafts discarded by the stop token or
+    ``max_tokens`` are then excluded, so ``predicted_n - accepted`` is
+    the number of target forwards (``rounds + 1``, or ``rounds`` when the reply
+    ended on an accepted draft and no bonus was emitted).
+
+    The counters are global to the drafter, so the attribution is exact for
+    batch size 1 and shared across concurrent requests otherwise.
     """
     rounds0, accepted0, drafted0 = snapshot
     rounds = getattr(draft_model, "speculative_total_rounds", 0) - rounds0

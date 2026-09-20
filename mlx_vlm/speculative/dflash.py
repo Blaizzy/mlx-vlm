@@ -6,6 +6,7 @@ import mlx.nn as nn
 from .cache_state import abort_speculative_round, commit_speculative_round
 from .common import (
     _dflash_block_total,
+    _emitted_speculative_round,
     _record_speculative_round,
     _requires_uniform_batch_acceptance,
     _speculative_walk,
@@ -299,12 +300,16 @@ def _dflash_rounds(
     token_dtype: mx.Dtype = mx.int32,
     use_model_initial_block_size: bool = True,
     greedy_sampling: bool = True,
+    stop_check: Optional[Callable[[int, int], bool]] = None,
 ) -> Generator[Tuple[int, None], None, None]:
     """DFlash speculative-decoding **round loop**.
 
     draft → verify → walk → rollback. ``generate_step`` is responsible
     for prefill, sampling the first bonus token, and packaging the
     captured hidden states into ``hidden``.
+
+    ``stop_check`` is only consulted for accounting (see
+    ``_emitted_speculative_round``); the caller still applies the stop.
     """
     lm = model.language_model if hasattr(model, "language_model") else model
 
@@ -415,7 +420,10 @@ def _dflash_rounds(
                 accepted = accepted_list[0]
                 new_tokens = new_tokens_list[0]
                 sampler_rng.target_sampled(sync_draft=not positioned_sampling)
-            _record_speculative_round(draft_model, accepted, bs - 1)
+            accepted_emitted = _emitted_speculative_round(
+                accepted, new_tokens, stop_check
+            )
+            _record_speculative_round(draft_model, accepted, bs - 1, accepted_emitted)
 
             if accepted < bs - 1:
                 hidden = hidden[:, : accepted + 1, :]
@@ -455,6 +463,7 @@ def _dflash_rounds_batch(
     draft_block_size: Optional[int] = None,
     token_dtype: mx.Dtype = mx.int32,
     stop_check: Optional[Callable[[int, int], bool]] = None,
+    remaining_tokens: Optional[Callable[[int], int]] = None,
     greedy_sampling: bool = True,
     row_ids: Optional[List[int]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
@@ -465,7 +474,8 @@ def _dflash_rounds_batch(
     drafter cache is reinitialized for the new batch size.
 
     ``stop_check(seq_idx, token_id) -> bool`` is an optional callback
-    that returns True to stop a sequence (e.g. EOS detection).
+    that returns True to stop a sequence (e.g. EOS detection). It is also
+    called before emission for accounting, so it must be pure.
 
     Yields ``(tokens_list, None)`` where ``tokens_list[i]`` is the
     token for sequence ``i`` (or ``None`` if that sequence has nothing
@@ -619,8 +629,15 @@ def _dflash_rounds_batch(
                 if hidden_segments[j].shape[1] > 0:
                     hidden_by_orig[orig] = hidden_segments[j]
 
-            for a in accepted_list:
-                _record_speculative_round(draft_model, a, bs - 1)
+            for j, a in enumerate(accepted_list):
+                a_emitted = _emitted_speculative_round(
+                    a,
+                    new_tokens_list[j],
+                    stop_check,
+                    active_idx[j],
+                    remaining_tokens=remaining_tokens,
+                )
+                _record_speculative_round(draft_model, a, bs - 1, a_emitted)
 
             with mx.stream(generation_stream):
                 commit_speculative_round(

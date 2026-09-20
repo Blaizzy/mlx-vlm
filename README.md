@@ -218,6 +218,16 @@ mlx_vlm.server --model Qwen/Qwen3.5-4B \
   --draft-model z-lab/Qwen3.5-4B-DFlash
 ```
 
+With a drafter attached, the server's per-request `timings` carry the
+llama.cpp-style `draft_kind`, `draft_rounds`, `draft_n` (drafts proposed) and
+`draft_n_accepted`. `draft_n_accepted` counts only accepted drafts that were
+emitted: drafts discarded by the stop token or `max_tokens` are excluded, so
+`predicted_n - draft_n_accepted` is a valid target-forward count
+(`draft_rounds + 1`, or `draft_rounds` when the reply ended on an accepted
+draft and no bonus token was emitted). The counters are global to the drafter,
+so they are exact per request at batch size 1 and shared across concurrent
+requests otherwise.
+
 DFlash2 adds dynamic convolutions and a candidate-path selector. The published
 Qwen3.8-27B checkpoint is auto-detected and uses the shared exact DFlash target
 verification path. For the fastest quantized setup, convert the drafter to

@@ -170,6 +170,7 @@ def run_speculative_server_rounds(
     draft_block_size: Optional[int] = None,
     token_dtype: mx.Dtype = mx.int32,
     stop_check: Optional[Callable[[int, int], bool]] = None,
+    remaining_tokens: Optional[Callable[[int], int]] = None,
     greedy_sampling: bool = False,
     shared_kv_states: Optional[dict] = None,
     eos_token_ids: Optional[set] = None,
@@ -195,6 +196,7 @@ def run_speculative_server_rounds(
                     draft_block_size=draft_block_size,
                     token_dtype=token_dtype,
                     greedy_sampling=greedy_sampling,
+                    stop_check=stop_check,
                 )
             )
             return
@@ -211,6 +213,7 @@ def run_speculative_server_rounds(
             draft_block_size=draft_block_size,
             token_dtype=token_dtype,
             stop_check=stop_check,
+            remaining_tokens=remaining_tokens,
             eos_token_ids=eos_token_ids,
             greedy_sampling=greedy_sampling,
         )
@@ -230,6 +233,7 @@ def run_speculative_server_rounds(
             draft_block_size=draft_block_size,
             token_dtype=token_dtype,
             stop_check=stop_check,
+            remaining_tokens=remaining_tokens,
             eos_token_ids=eos_token_ids,
             greedy_sampling=greedy_sampling,
             row_ids=row_ids,
@@ -249,6 +253,7 @@ def run_speculative_server_rounds(
                 draft_block_size=draft_block_size,
                 token_dtype=token_dtype,
                 greedy_sampling=greedy_sampling,
+                stop_check=stop_check,
             ):
                 yield [tok], state
                 if stop_check is not None and stop_check(0, tok):
@@ -266,6 +271,7 @@ def run_speculative_server_rounds(
             draft_block_size=draft_block_size,
             token_dtype=token_dtype,
             stop_check=stop_check,
+            remaining_tokens=remaining_tokens,
             greedy_sampling=greedy_sampling,
             row_ids=row_ids,
         )

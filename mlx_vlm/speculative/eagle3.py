@@ -6,6 +6,8 @@ import mlx.nn as nn
 from .cache_state import abort_speculative_round, commit_speculative_round
 from .common import (
     _batch_cache_left_padding,
+    _emitted_speculative_batch_round,
+    _emitted_speculative_round,
     _record_speculative_round,
     _requires_uniform_batch_acceptance,
     _SpeculativeSamplerRNG,
@@ -362,7 +364,13 @@ def _eagle3_rounds(
     draft_block_size: Optional[int] = None,
     token_dtype: mx.Dtype = mx.int32,
     greedy_sampling: bool = False,
+    stop_check: Optional[Callable[[int, int], bool]] = None,
 ) -> Generator[Tuple[int, None], None, None]:
+    """EAGLE-3 speculative-decoding round loop.
+
+    ``stop_check`` is only consulted for accounting (see
+    ``_emitted_speculative_round``); the caller still applies the stop.
+    """
     lm = model.language_model if hasattr(model, "language_model") else model
     if not hasattr(lm, "rollback_speculative_cache"):
         raise RuntimeError(
@@ -453,7 +461,10 @@ def _eagle3_rounds(
                 target_tokens,
                 max_tokens - emitted,
             )
-            _record_speculative_round(draft_model, accepted, bs - 1)
+            accepted_emitted = _emitted_speculative_round(
+                accepted, new_tokens, stop_check
+            )
+            _record_speculative_round(draft_model, accepted, bs - 1, accepted_emitted)
 
             accept_verified = getattr(draft_model, "accept_verified_tokens", None)
             if callable(accept_verified):
@@ -501,6 +512,7 @@ def _eagle3_rounds_batch(
     draft_block_size: Optional[int] = None,
     token_dtype: mx.Dtype = mx.int32,
     stop_check: Optional[Callable[[int, int], bool]] = None,
+    remaining_tokens: Optional[Callable[[int], int]] = None,
     eos_token_ids: Optional[set] = None,
     greedy_sampling: bool = False,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
@@ -630,10 +642,19 @@ def _eagle3_rounds_batch(
                     accepted_list,
                     budgets,
                 )
+            emitted_mean = _emitted_speculative_batch_round(
+                accepted_list,
+                new_tokens_list,
+                active_idx,
+                stop_check,
+                eos_token_ids=eos_token_ids,
+                remaining_tokens=remaining_tokens,
+            )
             _record_speculative_round(
                 draft_model,
                 sum(accepted_list) / len(accepted_list),
                 bs - 1,
+                emitted_mean,
             )
 
             accept_verified = getattr(draft_model, "accept_verified_tokens_batch", None)

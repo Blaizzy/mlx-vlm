@@ -1636,12 +1636,13 @@ class SpeculativeGenerationBatch:
         if self._rounds_iter is not None:
             return
 
+        def remaining_tokens(seq_idx):
+            if self._finished[seq_idx]:
+                return 0
+            return self.max_tokens[seq_idx] - self._num_tokens[seq_idx]
+
         def stop_check(seq_idx, token_id):
-            return (
-                self._finished[seq_idx]
-                or self.stop_criteria(token_id)
-                or self._num_tokens[seq_idx] >= self.max_tokens[seq_idx]
-            )
+            return remaining_tokens(seq_idx) <= 0 or self.stop_criteria(token_id)
 
         self._rounds_iter = run_speculative_server_rounds(
             self.model,
@@ -1655,6 +1656,7 @@ class SpeculativeGenerationBatch:
             draft_block_size=self.draft_block_size,
             token_dtype=self.token_dtype,
             stop_check=stop_check,
+            remaining_tokens=remaining_tokens,
             greedy_sampling=self.greedy_sampling,
             shared_kv_states=self.shared_kv_states,
             eos_token_ids=None,

@@ -17,7 +17,7 @@ import pytest
 from mlx.utils import tree_flatten
 
 import mlx_vlm.speculative.utils as speculative
-from mlx_vlm.generate.ar import _make_cache, generate_step
+from mlx_vlm.generate.ar import SpeculativeGenerationBatch, _make_cache, generate_step
 from mlx_vlm.models import fast_ops
 from mlx_vlm.models import quantized_verifier as quantized
 from mlx_vlm.models.base import InputEmbeddingsFeatures, LanguageModelOutput
@@ -526,6 +526,289 @@ def test_round_commit_close_and_abort(kind, batch, token, failure):
     offset = caches[1].offset
     equal(mx.array(offset).reshape(-1), mx.array([2 + retained] * batch))
     generator.close()
+
+
+class EchoTarget(TransactionTarget):
+    """Target whose greedy pick at every position is the input token + 1."""
+
+    def __call__(self, inputs, cache, **kwargs):
+        output = super().__call__(inputs, cache, **kwargs)
+        return LanguageModelOutput(
+            logits=mx.eye(16)[(inputs + 1) % 16],
+            hidden_states=output.hidden_states,
+            shared_kv_states=output.shared_kv_states,
+            gdn_states=output.gdn_states,
+        )
+
+
+class EchoDrafter(TransactionDrafter):
+    """Drafter that proposes bonus + 1, bonus + 2, ...: EchoTarget accepts all."""
+
+    def draft_block(
+        self, bonus, hidden, cache, block_size, sampler, token_dtype, **kwargs
+    ):
+        bonus = mx.array(bonus).reshape(-1)[:, None]
+        return (bonus + mx.arange(1, block_size)[None]).astype(token_dtype)
+
+
+def echo_caches(batch):
+    caches = [ArraysCache(1), BatchKVCache([0] * batch) if batch > 1 else KVCache()]
+    caches[0][0] = mx.zeros((batch, 1))
+    initial = mx.zeros((batch, 1, 2, 1))
+    caches[1].update_and_fetch(initial, initial)
+    return caches
+
+
+@parametrize("kind", ["mtp", "dflash", "eagle3"])
+@parametrize("batch", [1, 2])
+def test_round_accounting_excludes_drafts_after_stop(kind, batch):
+    target = EchoTarget(0)
+    caches = echo_caches(batch)
+    drafter = EchoDrafter()
+    snapshot = common.speculative_stats_snapshot(drafter)
+
+    # Bonus 1 drafts [2, 3, 4]; the target picks [2, 3, 4, 5], so all three
+    # drafts match. The singleton stops on draft 2; batched rows stop on
+    # draft 1 and the bonus.
+    stops = {0: 2 if batch > 1 else 3, 1: 5}
+    seen = []
+
+    def stop_check(seq_idx, token):
+        seen.append((seq_idx, token))
+        return token == stops[seq_idx]
+
+    suffix = "_batch" if batch > 1 else ""
+    options = dict(
+        first_bonus=1 if batch == 1 else mx.ones((batch,), dtype=mx.int32),
+        max_tokens=8,
+        sampler=greedy,
+        draft_block_size=4,
+        greedy_sampling=True,
+        stop_check=stop_check,
+    )
+    if kind == "mtp":
+        options["shared_kv_states"] = {}
+    generator = getattr(speculative, f"_{kind}_rounds{suffix}")(
+        target, drafter, caches, mx.zeros((batch, 1, 4)), **options
+    )
+    first = next(generator)
+
+    # Matched drafts are unchanged: the block-size controllers still see 3.
+    assert drafter.accept_lens == [3] * (batch if kind == "dflash" else 1)
+    assert drafter.draft_lens == [3] * (batch if kind == "dflash" else 1)
+    rounds, accepted, drafted = common.speculative_stats_since(drafter, snapshot)
+    if batch == 1:
+        # Emitted [2, 3]: two drafts, no bonus. predicted_n - accepted == rounds.
+        assert (rounds, accepted, drafted) == (1, 2, 3)
+        assert first == (2, None)
+        # Emission is untouched: the loop still yields the whole round.
+        assert [first] + [next(generator) for _ in range(3)] == [
+            (2, None),
+            (3, None),
+            (4, None),
+            (5, None),
+        ]
+    elif kind == "dflash":
+        # Row 0 emitted one draft, row 1 all three plus the bonus.
+        assert (rounds, accepted, drafted) == (2, 4, 6)
+        assert first[0] == [2, 2]
+    else:
+        # eagle3/mtp record the batch mean once per round.
+        assert (rounds, accepted, drafted) == (1, 2, 3)
+        assert first[0] == [2, 2]
+    assert {seq_idx for seq_idx, _ in seen} == set(range(batch))
+    generator.close()
+
+
+@parametrize("kind", ["mtp", "dflash", "eagle3"])
+@parametrize("batch", [1, 2])
+def test_server_rounds_forward_stop_check(kind, batch):
+    drafter = EchoDrafter()
+    snapshot = common.speculative_stats_snapshot(drafter)
+    stops = {0: 3, 1: 5}
+    generator = speculative.run_speculative_server_rounds(
+        EchoTarget(0),
+        drafter,
+        echo_caches(batch),
+        mx.zeros((batch, 1, 4)),
+        draft_kind=kind,
+        first_bonus=mx.ones((batch,), dtype=mx.int32),
+        max_tokens=8,
+        sampler=greedy,
+        draft_block_size=4,
+        stop_check=lambda seq_idx, token: token == stops[seq_idx],
+        greedy_sampling=True,
+        shared_kv_states={} if kind == "mtp" else None,
+        row_ids=[0] * batch,
+    )
+    assert next(generator)[0] == [2] * batch
+    expected = (
+        (1, 2, 3)
+        if batch == 1
+        else (2, 5, 6) if kind == "dflash" else (1, round(2.5), 3)
+    )
+    assert common.speculative_stats_since(drafter, snapshot) == expected
+    generator.close()
+
+
+@parametrize("kind", ["mtp", "eagle3"])
+def test_batch_round_accounting_honours_eos_token_ids(kind):
+    drafter = EchoDrafter()
+    snapshot = common.speculative_stats_snapshot(drafter)
+    rounds = getattr(speculative, f"_{kind}_rounds_batch")
+    generator = rounds(
+        EchoTarget(0),
+        drafter,
+        echo_caches(2),
+        mx.zeros((2, 1, 4)),
+        first_bonus=mx.ones((2,), dtype=mx.int32),
+        max_tokens=8,
+        sampler=greedy,
+        draft_block_size=4,
+        eos_token_ids={2},
+        greedy_sampling=True,
+        **({"shared_kv_states": {}} if kind == "mtp" else {}),
+    )
+    assert next(generator)[0] == [2, 2]
+    # Both rows stop on their first draft: one emitted draft each.
+    assert common.speculative_stats_since(drafter, snapshot) == (1, 1, 3)
+    generator.close()
+
+
+@parametrize("kind", ["mtp", "dflash", "eagle3"])
+@parametrize(
+    "stop,max_tokens,expected_tokens,expected_stats",
+    [
+        # Stop inside round 1's drafts: emitted [1 | 2, 3], no bonus, so
+        # predicted_n - accepted == rounds.
+        (3, 8, [1, 2, 3], (1, 2, 3)),
+        # Stop as round 1's bonus: predicted_n - accepted == rounds + 1.
+        (5, 8, [1, 2, 3, 4, 5], (1, 3, 3)),
+        # No stop; max_tokens trims round 2's bonus. Round 2 drafts only 3
+        # (budget-clamped), all emitted, no bonus emitted.
+        (None, 8, [1, 2, 3, 4, 5, 6, 7, 8], (2, 6, 6)),
+        # Stop and budget in the same round: the stop wins.
+        (7, 8, [1, 2, 3, 4, 5, 6, 7], (2, 5, 6)),
+    ],
+)
+def test_consumer_forward_count_matches_accounting(
+    kind, stop, max_tokens, expected_tokens, expected_stats
+):
+    drafter = EchoDrafter()
+    snapshot = common.speculative_stats_snapshot(drafter)
+    batch = SpeculativeGenerationBatch(
+        model=EchoTarget(0),
+        draft_model=drafter,
+        draft_kind=kind,
+        uids=[7],
+        first_tokens=mx.array([1], dtype=mx.int32),
+        prompt_cache=echo_caches(1),
+        sampler=greedy,
+        stop_criteria=lambda token: token == stop,
+        max_tokens=[max_tokens],
+        hidden=mx.zeros((1, 1, 4)),
+        shared_kv_states={} if kind == "mtp" else None,
+        prompt_tokens=mx.array([[0]], dtype=mx.int32),
+        draft_block_size=4,
+        greedy_sampling=True,
+    )
+    responses = []
+    while len(batch):
+        responses.extend(batch.next())
+    emitted = [r.token for r in responses if r.token is not None]
+    assert emitted == expected_tokens
+    assert responses[-1].finish_reason == ("stop" if stop else "length")
+
+    predicted_n = len(emitted)
+    rounds, accepted, drafted = common.speculative_stats_since(drafter, snapshot)
+    assert (rounds, accepted, drafted) == expected_stats
+    assert accepted <= predicted_n - 1
+    assert predicted_n - accepted in (rounds, rounds + 1)
+
+
+@parametrize("kind", ["mtp", "dflash", "eagle3"])
+@parametrize("reverse_rows", [False, True])
+@parametrize(
+    "first_token,short_budget,long_budget,stop,expected_short,total_accepted,mean_accepted",
+    [
+        (1, 2, 8, None, [1, 2], 7, 5),
+        (1, 1, 8, None, [1], 6, 6),
+        (9, 8, 8, 9, [9], 6, 6),
+        (1, 6, 12, None, [1, 2, 3, 4, 5, 6], 13, 8),
+    ],
+)
+def test_consumer_accounting_honours_row_budgets_and_finished_state(
+    kind,
+    reverse_rows,
+    first_token,
+    short_budget,
+    long_budget,
+    stop,
+    expected_short,
+    total_accepted,
+    mean_accepted,
+):
+    rows = [
+        (first_token, short_budget, expected_short),
+        (1, long_budget, list(range(1, long_budget + 1))),
+    ]
+    if reverse_rows:
+        rows.reverse()
+    drafter = EchoDrafter()
+    snapshot = common.speculative_stats_snapshot(drafter)
+    batch = SpeculativeGenerationBatch(
+        model=EchoTarget(0),
+        draft_model=drafter,
+        draft_kind=kind,
+        uids=[7, 8],
+        first_tokens=mx.array([row[0] for row in rows], dtype=mx.int32),
+        prompt_cache=echo_caches(2),
+        sampler=greedy,
+        stop_criteria=lambda token: token == stop,
+        max_tokens=[row[1] for row in rows],
+        hidden=mx.zeros((2, 1, 4)),
+        shared_kv_states={} if kind == "mtp" else None,
+        prompt_tokens=mx.array([[0], [0]], dtype=mx.int32),
+        draft_block_size=4,
+        greedy_sampling=True,
+    )
+    responses = []
+    while len(batch):
+        responses.extend(batch.next())
+    for uid, (_, _, expected) in zip([7, 8], rows):
+        row_responses = [r for r in responses if r.uid == uid]
+        assert [r.token for r in row_responses] == expected
+        assert row_responses[-1].finish_reason == (
+            "stop" if expected[-1] == stop else "length"
+        )
+    expected_accepted = total_accepted if kind == "dflash" else mean_accepted
+    assert drafter.speculative_total_accepted == expected_accepted
+    assert common.speculative_stats_since(drafter, snapshot)[1] == round(
+        expected_accepted
+    )
+    assert all(accepted == 3 for accepted in drafter.accept_lens)
+
+
+def test_emitted_speculative_round_caps_accepted_at_the_stop():
+    stop_on = lambda seq_idx, token: token == 3
+    tokens = [1, 2, 3, 4, 5, 9]  # five accepted drafts then the bonus
+
+    assert common._emitted_speculative_round(5, tokens, stop_on) == 3
+    # Stop token as the bonus: nothing is discarded.
+    assert common._emitted_speculative_round(2, [1, 2, 3], stop_on) == 2
+    assert common._emitted_speculative_round(5, tokens) == 5
+    assert common._emitted_speculative_round(0, [9], stop_on) == 0
+    # The walk already trimmed the row to the budget, below ``accepted``.
+    assert common._emitted_speculative_round(5, [1, 2]) == 2
+    assert common._emitted_speculative_round(5, []) == 0
+    # eos_token_ids behaves like stop_check; the earlier of the two wins.
+    assert common._emitted_speculative_round(5, tokens, stop_on, eos_token_ids={2}) == 2
+    assert (
+        common._emitted_speculative_round(
+            5, tokens, lambda seq_idx, token: token == seq_idx, 4
+        )
+        == 4
+    )
 
 
 def test_acceptance_walk_and_budgets():
@@ -1632,4 +1915,10 @@ def test_speculative_lifetime_counters_survive_reset():
     assert common.speculative_stats_since(drafter, snapshot) == (3, 7, 21)
     snapshot = common.speculative_stats_snapshot(drafter)
     common._record_speculative_round(drafter, 2, 7)
+    assert common.speculative_stats_since(drafter, snapshot) == (1, 2, 7)
+    # ``emitted`` feeds the lifetime accepted counter only; the matched count
+    # stays in ``accept_lens`` for the block-size controllers.
+    snapshot = common.speculative_stats_snapshot(drafter)
+    common._record_speculative_round(drafter, 6, 7, 2)
+    assert drafter.accept_lens[-1] == 6
     assert common.speculative_stats_since(drafter, snapshot) == (1, 2, 7)
