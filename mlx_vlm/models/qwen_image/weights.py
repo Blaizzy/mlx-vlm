@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 
 import mlx.core as mx
+import mlx.nn as nn
 
 from mlx_vlm.models.qwen3_vl.config import ModelConfig as Qwen3VLConfig
 from mlx_vlm.models.qwen3_vl.qwen3_vl import Model as Qwen3VLModel
@@ -19,6 +20,40 @@ from mlx_vlm.models.qwen3_vl.qwen3_vl import Model as Qwen3VLModel
 from .config import QwenImageVariant, get_variant
 from .transformer import QwenImageTransformer
 from .vae import QwenImageVAE
+
+
+def _read_quant(directory: Path) -> dict | None:
+    config = directory / "config.json"
+    if config.exists():
+        quant = json.loads(config.read_text()).get("quantization")
+        if isinstance(quant, dict):
+            return quant
+    return None
+
+
+def _is_mlx_native(directory: Path) -> bool:
+    """True if weights are already in MLX layout (a converted checkpoint)."""
+    config = directory / "config.json"
+    return config.exists() and bool(json.loads(config.read_text()).get("mlx_format"))
+
+
+def _apply(
+    model, weights: list[tuple[str, mx.array]], quant: dict | None, *, strict: bool
+):
+    if quant is not None:
+        quantized = {
+            key[: -len(".scales")] for key, _ in weights if key.endswith(".scales")
+        }
+        nn.quantize(
+            model,
+            group_size=quant["group_size"],
+            bits=quant["bits"],
+            mode=quant.get("mode", "affine"),
+            class_predicate=lambda path, module: path in quantized,
+        )
+    model.load_weights(weights, strict=strict)
+    model.eval()
+    return model
 
 
 def _load_shards(directory: Path) -> dict[str, mx.array]:
@@ -61,10 +96,12 @@ def load_transformer(
     if not isinstance(variant, QwenImageVariant):
         variant = get_variant(variant if variant is not None else "qwen-image-2.1")
     model = QwenImageTransformer(**variant.transformer_overrides)
-    weights = _remap_transformer(_load_shards(root / "transformer"))
-    model.load_weights(weights, strict=True)
-    model.eval()
-    return model
+    shards = _load_shards(root / "transformer")
+    if _is_mlx_native(root / "transformer"):
+        weights = list(shards.items())
+    else:
+        weights = _remap_transformer(shards)
+    return _apply(model, weights, _read_quant(root / "transformer"), strict=True)
 
 
 def load_vae(model_path: str | Path) -> QwenImageVAE:
@@ -81,10 +118,12 @@ def load_vae(model_path: str | Path) -> QwenImageVAE:
         out_channels=config["out_channels"],
         is_residual=config.get("is_residual", True),
     )
-    weights = _remap_vae(_load_shards(root / "vae"))
-    model.load_weights(weights, strict=True)
-    model.eval()
-    return model
+    shards = _load_shards(root / "vae")
+    if _is_mlx_native(root / "vae"):
+        weights = list(shards.items())
+    else:
+        weights = _remap_vae(shards)
+    return _apply(model, weights, _read_quant(root / "vae"), strict=True)
 
 
 def load_text_encoder(model_path: str | Path) -> Qwen3VLModel:
@@ -92,11 +131,14 @@ def load_text_encoder(model_path: str | Path) -> Qwen3VLModel:
     config = json.loads((root / "text_encoder" / "config.json").read_text())
     model = Qwen3VLModel(Qwen3VLConfig.from_dict(config))
     weights = dict(_load_shards(root / "text_encoder"))
-    if hasattr(model, "sanitize"):
+    if not _is_mlx_native(root / "text_encoder") and hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
-    model.load_weights(list(weights.items()), strict=False)
-    model.eval()
-    return model
+    # Non-strict: the Qwen3-VL vision tower is unused for text-to-image and its
+    # conv layout is not round-tripped through conversion; the language weights
+    # that drive prompt conditioning load fully.
+    return _apply(
+        model, list(weights.items()), _read_quant(root / "text_encoder"), strict=False
+    )
 
 
 __all__ = ["load_text_encoder", "load_transformer", "load_vae"]
