@@ -612,6 +612,63 @@ def test_unsupported_model_request_does_not_crash_server(client, monkeypatch):
     assert client.get("/health").status_code == 200
 
 
+@pytest.fixture
+def _audio_config(tmp_path, monkeypatch):
+    import mlx_vlm.utils as mlx_utils
+
+    def _make(model_type):
+        (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
+        monkeypatch.setattr(mlx_utils, "get_model_path", lambda *a, **k: tmp_path)
+        return str(tmp_path)
+
+    return _make
+
+
+def test_audio_endpoint_rejects_native_chat_model(_audio_config, monkeypatch):
+    import mlx_audio.utils as mlx_audio_utils
+
+    monkeypatch.setattr(mlx_audio_utils, "get_model_category", lambda *a, **k: None)
+    path = _audio_config("qwen3_omni_moe")
+
+    with pytest.raises(ValueError, match="/v1/chat/completions"):
+        server._app_module.load_audio_model(path)
+
+
+def test_audio_endpoint_loads_dedicated_stt_model(_audio_config, monkeypatch):
+    import mlx_audio.utils as mlx_audio_utils
+
+    sentinel = object()
+    monkeypatch.setattr(mlx_audio_utils, "load_model", lambda *a, **k: sentinel)
+    path = _audio_config("whisper")
+
+    assert server._app_module.load_audio_model(path) is sentinel
+
+
+def test_audio_endpoint_loads_audio_capable_native_model(_audio_config, monkeypatch):
+    import mlx_audio.utils as mlx_audio_utils
+
+    sentinel = object()
+    monkeypatch.setattr(mlx_audio_utils, "get_model_category", lambda *a, **k: "sts")
+    monkeypatch.setattr(mlx_audio_utils, "load_model", lambda *a, **k: sentinel)
+    path = _audio_config("nemotron_voicechat")
+
+    assert server._app_module.load_audio_model(path) is sentinel
+
+
+def test_audio_stt_request_maps_native_chat_model_to_400(_audio_config, monkeypatch):
+    import mlx_audio.utils as mlx_audio_utils
+
+    monkeypatch.setattr(mlx_audio_utils, "get_model_category", lambda *a, **k: None)
+    _reset_runtime(monkeypatch, model_cache={})
+    path = _audio_config("qwen3_omni_moe")
+
+    with pytest.raises(HTTPException) as exc_info:
+        server.get_cached_model(path, model_kind="audio_stt")
+
+    assert exc_info.value.status_code == 400
+    assert "/v1/chat/completions" in exc_info.value.detail
+
+
 def _generator(**overrides):
     gen = Generator.__new__(Generator)
     gen.__dict__.update(
