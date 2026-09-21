@@ -842,7 +842,6 @@ def test_qwen3_5_cancelled_prefill_row_preserves_survivor_output():
     for layer_cache in cache:
         layer_cache.filter(mx.array([0]))
 
-    # The survivor still has two unprocessed padding columns.
     singleton_cache = [ArraysCache(2), KVCache()]
     actual = model(mx.array([[0, 0, 4]]), cache=cache)
     expected = model(mx.array([[4]]), cache=singleton_cache)

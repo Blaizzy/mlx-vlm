@@ -1233,8 +1233,6 @@ class Qwen3_5Model(nn.Module):
             and hidden_sink is None
             and fa_cache is not None
             and _is_single_row_batch_cache(fa_cache)
-            # A surviving prefill row may still have padding in future chunks.
-            # It must use the padded-row path below until real tokens begin.
             and int(fa_cache.offset[0].item()) >= 0
         ):
             row_cache = []

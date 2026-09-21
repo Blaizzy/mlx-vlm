@@ -715,7 +715,7 @@ class TestBatchGenerator:
             warm_cache=[],
             right_pad_per_row=[0, 5, 4],
         )
-        batch.prompt_step()  # Save row 11's last real-token logits.
+        batch.prompt_step()
         batch.remove(10)
         assert batch._prompt_kwargs["position_ids"].shape == (3, 2, 5)
         assert batch._prompt_kwargs["rope_deltas"].tolist() == [[11], [12]]

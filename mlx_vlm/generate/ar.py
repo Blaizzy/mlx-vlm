@@ -1932,7 +1932,6 @@ class PromptProcessingBatch:
         idx = self.uids.index(uid)
         keep = [i for i in range(batch_size) if i != idx]
         keep_arr = mx.array(keep, dtype=mx.int32)
-        # Finish pending prefill work before replacing cache/feature references.
         mx.eval(
             [c.state for c in self.prompt_cache],
             list(self._finished_prompt_logits.values()),

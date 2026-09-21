@@ -1079,8 +1079,6 @@ class ResponseGenerator:
             if batch_gen is None or uid not in active:
                 continue
             if not batch_gen.remove(uid):
-                # Keep the request tracked and retry at the next boundary.
-                # Closing its queue here would acknowledge work still running.
                 self._cancel(uid)
                 continue
             info = active.pop(uid)
