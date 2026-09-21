@@ -114,7 +114,7 @@ def main():
         action="store_true",
         default=False,
         help="Experimentally overlap prefill with decoding on supported models. "
-        "Disabled by default; requires greedy decoding without APC or speculative decoding.",
+        "Disabled by default; requires APC and speculative decoding to be off.",
     )
     parser.add_argument(
         "--log-progress-interval",

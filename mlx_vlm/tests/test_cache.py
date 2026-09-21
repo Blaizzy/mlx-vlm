@@ -2912,3 +2912,62 @@ def test_lfm_background_streams_keep_request_caches_independent():
         futures = [pool.submit(run, token, barrier) for token in (1, 2)]
         actual = [future.result(timeout=10) for future in futures]
     assert actual == expected
+
+
+@pytest.mark.parametrize("survivor", [0, 1])
+def test_lfm_background_prefill_cancellation_preserves_surviving_cache(survivor):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    from mlx.utils import tree_flatten
+
+    from mlx_vlm.generate.ar import BatchGenerator, _left_pad_prompts
+
+    model = language_model("lfm2")
+    mx.eval(model.parameters())
+
+    def prompt():
+        ids = [[1] * 7, [2] * 3]
+        embeds = model.model.embed_tokens(_left_pad_prompts(ids))
+        mx.eval(embeds)
+        return PromptProcessingBatch(
+            model,
+            [0, 1],
+            ids,
+            [4, 4],
+            embeds,
+            {},
+            prefill_step_size=2,
+        )
+
+    sampler = lambda logits: mx.argmax(logits, axis=-1)
+    serial = prompt()
+    while serial.needs_processing():
+        serial.prompt_step()
+    expected = serial.generate(sampler, lambda token: False, True, 2)
+    expected.filter([survivor])
+
+    background = prompt()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        completed = pool.submit(
+            BatchGenerator._run_background_prefill, background, Event()
+        ).result(timeout=10)
+    actual = completed.prompt_batch._generate_from_prefill(
+        completed.output,
+        sampler,
+        lambda token: False,
+        True,
+        2,
+        keep=[survivor],
+    )
+    assert actual.uids == expected.uids
+    assert actual._next_tokens.tolist() == expected._next_tokens.tolist()
+    assert actual._next_lps.tolist() == expected._next_lps.tolist()
+    for (_, a), (_, b) in zip(
+        tree_flatten(actual.cache_states()), tree_flatten(expected.cache_states())
+    ):
+        if isinstance(a, mx.array):
+            assert mx.array_equal(a, b).item()
+        else:
+            assert a == b
+    assert actual.next() == expected.next()
