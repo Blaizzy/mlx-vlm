@@ -1059,9 +1059,16 @@ class PromptProgress:
 
 
 @dataclass
+class _PrefillOutput:
+    logits: mx.array
+    model_output: Any
+    rope_deltas: Optional[mx.array]
+
+
+@dataclass
 class _CompletedPrefill:
-    generation_batch: Optional["GenerationBatch"]
-    progress: List[PromptProgress]
+    prompt_batch: "PromptProcessingBatch"
+    output: _PrefillOutput
     elapsed_s: float
 
 
@@ -2172,6 +2179,16 @@ class PromptProcessingBatch:
         self, sampler, stop_criteria, compute_logprobs=True, top_logprobs_k=0
     ) -> GenerationBatch:
         """Process final tokens and transition to GenerationBatch."""
+        return self._generate_from_prefill(
+            self._finish_prefill(),
+            sampler,
+            stop_criteria,
+            compute_logprobs,
+            top_logprobs_k,
+        )
+
+    def _finish_prefill(self) -> _PrefillOutput:
+        """Finish model execution without sampling or invoking request callbacks."""
         call_kwargs = dict(self._prompt_kwargs)
         if self.draft_model is not None and self.draft_kind is not None:
             call_kwargs.update(
@@ -2211,29 +2228,32 @@ class PromptProcessingBatch:
             self._finished_prompt_logits.clear()
         else:
             logits = logits[:, -1, :]
-        if self.logits_processors and any(self.logits_processors):
-            processed_logits = []
-            for i in range(logits.shape[0]):
-                sample_logits = logits[i : i + 1]
-                processors = self.logits_processors[i] or []
-                for processor in processors:
-                    sample_logits = processor(
-                        mx.array(self._token_context[i]), sample_logits
-                    )
-                processed_logits.append(sample_logits)
-            logits = mx.concatenate(processed_logits, axis=0)
-
-        first_tokens, logprobs = _sample_batch_tokens(
-            logits,
-            sampler,
-            greedy=self.greedy_sampling,
-            compute_logprobs=compute_logprobs,
-            top_logprobs_k=top_logprobs_k,
-            positions=[0] * len(self.uids),
+        language_model = getattr(self.model, "language_model", self.model)
+        rope_deltas = self._capture_rope_deltas_from_prompt_kwargs(
+            call_kwargs, language_model, len(self.uids)
         )
+        # Only speculative decoding consumes auxiliary model outputs. Ordinary
+        # prefill hands off the selected logits without retaining the full graph.
+        if self.draft_model is None or self.draft_kind is None:
+            output = None
+        return _PrefillOutput(logits, output, rope_deltas)
 
-        mx.async_eval(first_tokens)
-
+    def _generate_from_prefill(
+        self,
+        prefill: _PrefillOutput,
+        sampler,
+        stop_criteria,
+        compute_logprobs=True,
+        top_logprobs_k=0,
+        *,
+        keep: Optional[List[int]] = None,
+    ) -> GenerationBatch:
+        """Apply request state and sample on the scheduler thread after prefill."""
+        logits, output, rope_deltas = (
+            prefill.logits,
+            prefill.model_output,
+            prefill.rope_deltas,
+        )
         # Roll any right-padding into left-padding so the cache decoded by
         # GenerationBatch sees a canonical layout.
         if self._right_pad_per_row is not None and any(self._right_pad_per_row):
@@ -2259,6 +2279,50 @@ class PromptProcessingBatch:
                     self._right_pad_per_row,
                     self._suffix_lens,
                 )
+
+        if keep is not None:
+            # Discard cancelled background rows before callbacks or RNG draws.
+            # APC and speculative prefill still use the synchronous path.
+            assert self._apc_manager is None and self.draft_model is None
+            keep_arr = mx.array(keep, mx.int32)
+            logits = logits[keep_arr]
+            for name in (
+                "uids",
+                "max_tokens",
+                "_token_context",
+                "logits_processors",
+                "thinking_budget_criteria",
+            ):
+                values = getattr(self, name)
+                if values:
+                    setattr(self, name, [values[i] for i in keep])
+            for c in self.prompt_cache:
+                c.filter(keep_arr)
+            if rope_deltas is not None:
+                rope_deltas = rope_deltas[keep_arr]
+
+        if self.logits_processors and any(self.logits_processors):
+            processed_logits = []
+            for i in range(logits.shape[0]):
+                sample_logits = logits[i : i + 1]
+                processors = self.logits_processors[i] or []
+                for processor in processors:
+                    sample_logits = processor(
+                        mx.array(self._token_context[i]), sample_logits
+                    )
+                processed_logits.append(sample_logits)
+            logits = mx.concatenate(processed_logits, axis=0)
+
+        first_tokens, logprobs = _sample_batch_tokens(
+            logits,
+            sampler,
+            greedy=self.greedy_sampling,
+            compute_logprobs=compute_logprobs,
+            top_logprobs_k=top_logprobs_k,
+            positions=[0] * len(self.uids),
+        )
+
+        mx.async_eval(first_tokens)
 
         if self.draft_model is not None and self.draft_kind is not None:
             gen_batch = SpeculativeGenerationBatch(
@@ -2312,10 +2376,6 @@ class PromptProcessingBatch:
             gen_batch._next_top_idx = top_idx
             gen_batch._next_top_lp = top_lp
 
-        language_model = getattr(self.model, "language_model", self.model)
-        rope_deltas = self._capture_rope_deltas_from_prompt_kwargs(
-            call_kwargs, language_model, len(gen_batch.uids)
-        )
         if rope_deltas is not None:
             gen_batch._rope_deltas = rope_deltas
 
@@ -3079,42 +3139,35 @@ class BatchGenerator:
             and self.draft_model is None
             and not getattr(self._generation_batch, "is_speculative", False)
             and self.apc_manager is None
-            and self.greedy_sampling
-            and not any(batch.logits_processors)
-            and not any(self._generation_batch.logits_processors)
-            and not any(batch.thinking_budget_criteria)
-            and not any(self._generation_batch.thinking_budget_criteria)
         )
 
     @staticmethod
-    def _run_background_prefill(
-        batch, cancel, sampler, stop_criteria, compute_logprobs, top_logprobs_k
-    ) -> _CompletedPrefill:
-        # Only the prompt batch crosses threads; the scheduler and its mutable
-        # admission/cancellation state remain on the generation thread.
+    def _run_background_prefill(batch, cancel) -> Optional[_CompletedPrefill]:
+        # The worker owns model execution and this prompt's caches. Sampling,
+        # request callbacks, and scheduler bookkeeping stay on the owner thread.
         stream = mx.new_stream(mx.gpu)
         started = time.perf_counter()
         try:
             with mx.stream(stream):
                 while batch.needs_processing():
                     if cancel.is_set():
-                        return _CompletedPrefill(None, [], 0.0)
+                        return None
                     batch.prompt_step(clear_cache=False)
                     # Do not queue an entire prompt ahead of active decoding.
                     mx.synchronize(stream)
                 if cancel.is_set():
-                    return _CompletedPrefill(None, [], 0.0)
-                generation_batch = batch.generate(
-                    sampler, stop_criteria, compute_logprobs, top_logprobs_k
-                )
-                generation_batch._eval_pending_state()
+                    return None
+                output = batch._finish_prefill()
+                targets = [output.logits, [c.state for c in batch.prompt_cache]]
+                if output.rope_deltas is not None:
+                    targets.append(output.rope_deltas)
+                mx.eval(*targets)
         finally:
             # Errors and cancellation must also drain submitted GPU work before
             # the scheduler can discard this batch or shut down the executor.
             mx.synchronize(stream)
         elapsed = time.perf_counter() - started
-        batch.record_prompt_time(elapsed)
-        return _CompletedPrefill(generation_batch, batch.prompt_progress(), elapsed)
+        return _CompletedPrefill(batch, output, elapsed)
 
     def _start_background_prefill(self) -> bool:
         if not self._can_background_prefill():
@@ -3145,10 +3198,6 @@ class BatchGenerator:
             self._run_background_prefill,
             batch,
             self._prefill_cancel,
-            self.sampler,
-            self.tokenizer.stopping_criteria,
-            self.compute_logprobs,
-            self.top_logprobs_k,
         )
         self._background_prefill_uids = set(batch.uids)
         self._prompt_batch = None
@@ -3167,17 +3216,28 @@ class BatchGenerator:
             self._prefill_future = None
             self._background_prefill_uids.clear()
             self._cancelled_prefill_uids = set()
-        batch = completed.generation_batch
-        if batch is not None:
-            if cancelled:
-                batch.filter(
-                    [i for i, uid in enumerate(batch.uids) if uid not in cancelled]
-                )
-            if len(batch):
-                self._extend_generation_batch(batch)
-        self._prompt_time_counter += completed.elapsed_s
+        if completed is None:
+            return []
+        batch = completed.prompt_batch
+        keep = [i for i, uid in enumerate(batch.uids) if uid not in cancelled]
+        tic = time.perf_counter()
+        if keep:
+            generation_batch = batch._generate_from_prefill(
+                completed.output,
+                self.sampler,
+                self.tokenizer.stopping_criteria,
+                self.compute_logprobs,
+                self.top_logprobs_k,
+                keep=keep if cancelled else None,
+            )
+            self._extend_generation_batch(generation_batch)
+        elapsed = completed.elapsed_s + time.perf_counter() - tic
+        batch.record_prompt_time(elapsed)
+        self._prompt_time_counter += elapsed
         return [
-            progress for progress in completed.progress if progress.uid not in cancelled
+            progress
+            for progress in batch.prompt_progress()
+            if progress.uid not in cancelled
         ]
 
     def _advance_prompt_batch(self) -> List[PromptProgress]:

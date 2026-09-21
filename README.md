@@ -615,9 +615,12 @@ continues to advance both phases for existing callers.
 
 `--background-prefill` (or `MLX_VLM_BACKGROUND_PREFILL=1`) experimentally runs
 prefill on a separate Metal stream. It is off by default and currently supported
-only for dense LFM2 with greedy decoding, APC disabled, and no speculative
-decoding, logits processors, or thinking-budget criteria. Other configurations
-retain the regular phased scheduler. Both modes share the same prefill token
+for dense LFM2 with APC and speculative decoding disabled. Sampling (including
+nonzero temperature), logits processors, and thinking-budget criteria stay on
+the scheduler thread and work with background prefill. The worker returns
+materialized logits and request-owned caches; cancelled rows are discarded before
+sampling or request callbacks. Other configurations retain the regular phased
+scheduler. Both modes share the same prefill token
 budget. Background prefill can reduce contention for an existing stream, but is
 not a general throughput improvement.
 

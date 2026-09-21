@@ -1931,7 +1931,8 @@ class TestPrefillScheduling:
             elif restriction == "offload":
                 model.moe_offload_store = object()
             assert gen._can_background_prefill() == (
-                restriction is None and mx.metal.is_available()
+                restriction in (None, "sampling", "processor", "thinking")
+                and mx.metal.is_available()
             )
         finally:
             gen.close()
@@ -1959,31 +1960,75 @@ class TestPrefillScheduling:
             # Polling while decode is active neither blocks nor admits queued work.
             assert gen.prefill_step() == []
             assert [s[0] for s in gen.unprocessed_prompts] == [3]
-            batch = _generation_batch(model, uids=[1, 2])
+            callbacks = []
+
+            def processor(tokens, logits):
+                callbacks.append(tokens.tolist())
+                return logits
+
+            batch = PromptProcessingBatch(
+                model,
+                [1, 2],
+                [[7, 8], [9, 10]],
+                [4, 4],
+                mx.zeros((2, 2, 4)),
+                {},
+                warm_cache=[],
+                logits_processors=[[processor], [processor]],
+            )
+            sampler = MagicMock(side_effect=lambda lp: mx.argmax(lp, axis=-1))
+            sampler.sample_target = None
+            gen.sampler = sampler
+            gen.greedy_sampling = False
             future.set_result(
-                ar_module._CompletedPrefill(
-                    batch,
-                    [ar_module.PromptProgress(uid=i, prompt_tokens=2) for i in (1, 2)],
-                    0.1,
-                )
+                ar_module._CompletedPrefill(batch, batch._finish_prefill(), 0.1)
             )
             progress = gen.prefill_step()
             assert [p.uid for p in progress] == ([] if cancel_all else [2])
             assert gen._generation_batch.uids == ([0] if cancel_all else [0, 2])
+            assert callbacks == ([] if cancel_all else [[9, 10]])
+            assert sampler.call_count == (0 if cancel_all else 1)
+            if not cancel_all:
+                assert sampler.call_args.args[0].shape == (1, 4)
+                assert gen._generation_batch.token_context == [[], [9, 10]]
             assert gen._prefill_future is None
             assert gen._background_prefill_uids == gen._cancelled_prefill_uids == set()
         finally:
             gen.close()
 
-    def test_background_failure_releases_scheduler_ownership(self, mock_processor):
+    @pytest.mark.parametrize("failure", ["worker", "processor", "sampler"])
+    def test_background_failure_releases_scheduler_ownership(
+        self, mock_processor, failure
+    ):
         from concurrent.futures import Future
 
         gen = BatchGenerator(FixedLogitModel(), mock_processor)
         try:
             gen._prefill_future = future = Future()
             gen._background_prefill_uids = {1}
-            gen._cancelled_prefill_uids = {1}
-            future.set_exception(RuntimeError("prefill failed"))
+
+            def fail(*args):
+                raise RuntimeError("prefill failed")
+
+            if failure == "worker":
+                gen._cancelled_prefill_uids = {1}
+                future.set_exception(RuntimeError("prefill failed"))
+            else:
+                batch = PromptProcessingBatch(
+                    gen.model,
+                    [1],
+                    [[7, 8]],
+                    [4],
+                    mx.zeros((1, 2, 4)),
+                    {},
+                    warm_cache=[],
+                    logits_processors=[[fail]] if failure == "processor" else None,
+                )
+                if failure == "sampler":
+                    gen.sampler = fail
+                future.set_result(
+                    ar_module._CompletedPrefill(batch, batch._finish_prefill(), 0.1)
+                )
             with pytest.raises(RuntimeError, match="prefill failed"):
                 gen.prefill_step()
             assert not gen.has_pending_prompts
@@ -1995,9 +2040,8 @@ class TestPrefillScheduling:
     def test_background_worker_materializes_before_handoff(self, fail):
         from threading import Event
 
-        generated = _generation_batch(FixedLogitModel(), inputs=(5,), uids=[7])
-        materialize = MagicMock(wraps=generated._eval_pending_state)
-        generated._eval_pending_state = materialize
+        output = ar_module._PrefillOutput(mx.ones((1, 4)), None, mx.array([[2]]))
+        cache_state = mx.zeros((1, 2, 3))
         steps = []
 
         def prompt_step(*, clear_cache):
@@ -2009,25 +2053,129 @@ class TestPrefillScheduling:
         batch = SimpleNamespace(
             needs_processing=lambda: len(steps) < 2,
             prompt_step=prompt_step,
-            generate=lambda *args: generated,
+            _finish_prefill=lambda: output,
+            prompt_cache=[SimpleNamespace(state=cache_state)],
             record_prompt_time=MagicMock(),
-            prompt_progress=lambda: [ar_module.PromptProgress(uid=7, prompt_tokens=4)],
         )
-        with patch.object(mx, "synchronize", wraps=mx.synchronize) as synchronize:
+        with (
+            patch.object(mx, "synchronize", wraps=mx.synchronize) as synchronize,
+            patch.object(mx, "eval", wraps=mx.eval) as materialize,
+        ):
             if fail:
                 with pytest.raises(RuntimeError, match="model failed"):
-                    BatchGenerator._run_background_prefill(
-                        batch, Event(), None, None, False, 0
-                    )
+                    BatchGenerator._run_background_prefill(batch, Event())
                 assert synchronize.call_count == 1
             else:
-                result = BatchGenerator._run_background_prefill(
-                    batch, Event(), None, None, False, 0
-                )
-                assert result.generation_batch is generated
-                assert materialize.call_count == 1
+                result = BatchGenerator._run_background_prefill(batch, Event())
+                assert result.prompt_batch is batch and result.output is output
+                targets = materialize.call_args.args
+                assert targets[0] is output.logits
+                assert targets[1][0] is cache_state
+                assert targets[2] is output.rope_deltas
                 assert synchronize.call_count == 3
-                assert result.progress[0].uid == 7
+            batch.record_prompt_time.assert_not_called()
+
+    @pytest.mark.parametrize("sampling", [False, True])
+    def test_background_callbacks_and_sampling_stay_on_owner_thread(
+        self, mock_processor, sampling
+    ):
+        from threading import get_ident
+
+        owner = get_ident()
+
+        def run(background):
+            calls, forwards = [], []
+
+            class Model(FixedLogitModel):
+                supports_background_prefill = True
+
+                def parameters(self):
+                    return {}
+
+                def __call__(self, *args, **kwargs):
+                    forwards.append(get_ident())
+                    return super().__call__(*args, **kwargs)
+
+            def processor(tokens, logits):
+                assert get_ident() == owner
+                calls.append(("processor", tokens.tolist()))
+                return mx.broadcast_to(
+                    mx.array([-float("inf"), 0.0, 1.0, 2.0]), logits.shape
+                )
+
+            def sampler(logprobs):
+                assert get_ident() == owner
+                calls.append(("sample", logprobs.shape[0]))
+                if sampling:
+                    return mx.random.categorical(
+                        logprobs, key=mx.random.key(len(calls))
+                    )
+                return mx.argmax(logprobs, axis=-1)
+
+            class Thinking:
+                def __call__(self, token):
+                    assert get_ident() == owner
+                    calls.append(("thinking", token))
+
+                def pop_forced_token_id(self):
+                    assert get_ident() == owner
+                    return 1
+
+            model = Model()
+            gen = BatchGenerator(
+                model,
+                mock_processor,
+                sampler=sampler,
+                background_prefill=background,
+                compute_logprobs=True,
+                top_logprobs_k=2,
+            )
+            try:
+                prompt = PromptProcessingBatch(
+                    model,
+                    [7],
+                    [[7, 8, 9, 10]],
+                    [3],
+                    mx.zeros((1, 4, 4)),
+                    {},
+                    warm_cache=[],
+                    prefill_step_size=2,
+                    logits_processors=[[processor]],
+                    thinking_budget_criteria=[Thinking()],
+                )
+                if background:
+                    gen._generation_batch = _generation_batch(
+                        model, inputs=(1,), uids=[0]
+                    )
+                    gen._prompt_batch = prompt
+                    assert gen._start_background_prefill()
+                    completed = gen._prefill_future.result(timeout=10)
+                    assert completed.output.model_output is None
+                    assert calls == []
+                    assert forwards and all(thread != owner for thread in forwards)
+                    # The old request may finish while the new prompt is running.
+                    gen._generation_batch.filter([])
+                    progress = gen.prefill_step()
+                    assert [p.uid for p in progress] == [7]
+                    batch = gen._generation_batch
+                else:
+                    while prompt.needs_processing():
+                        prompt.prompt_step()
+                    batch = prompt.generate(sampler, lambda token: False, True, 2)
+                first_tokens = batch._next_tokens.tolist()
+                first_logprobs = batch._next_lps.tolist()
+                first_top = (batch._next_top_idx.tolist(), batch._next_top_lp.tolist())
+                batch.stop_criteria = lambda token: False
+                first = batch.next()
+                second = batch.next()
+                assert first[0].token == first_tokens[0]
+                assert second[0].token == 1  # Thinking criteria force the next token.
+                assert calls[0] == ("processor", [7, 8, 9, 10])
+                return first_tokens, first_logprobs, first_top, calls
+            finally:
+                gen.close()
+
+        assert run(False) == run(True)
 
     def test_close_cancels_and_joins_background_worker(self, mock_processor):
         from concurrent.futures import ThreadPoolExecutor
@@ -2040,7 +2188,7 @@ class TestPrefillScheduling:
             started.set()
             assert gen._prefill_cancel.wait(5)
             stopped.set()
-            return ar_module._CompletedPrefill(None, [], 0)
+            return None
 
         gen._prefill_executor = ThreadPoolExecutor(max_workers=1)
         gen._prefill_future = future = gen._prefill_executor.submit(run)
