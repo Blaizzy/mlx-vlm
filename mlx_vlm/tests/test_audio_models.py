@@ -1611,7 +1611,7 @@ def test_cold_batch_merge_keeps_features_when_text_row_is_first():
     assert result._next_tokens[1:].tolist() == mx.argmax(reference, axis=-1).tolist()
 
 
-def _mixed_batch(model, rows, prompts, prefix, warm_cache=None):
+def _mixed_batch(model, rows, prompts, prefix, warm_cache=None, *, prefill_budget=2):
     bg = object.__new__(ar.BatchGenerator)
     bg.model = model
     bg.apc_manager = object()
@@ -1629,7 +1629,7 @@ def _mixed_batch(model, rows, prompts, prefix, warm_cache=None):
         checkpoint_lengths=lambda *a: [],
     )
     bg.apc_mode = "exact"
-    bg.prefill_step_size = 2
+    bg.prefill_step_size = prefill_budget
     bg.kv_bits = None
     bg.kv_group_size = 64
     bg.kv_quant_scheme = "affine"
@@ -1647,12 +1647,17 @@ def _mixed_batch(model, rows, prompts, prefix, warm_cache=None):
     return batch
 
 
-def test_mixed_cached_prefix_slices_visual_features_before_merging():
+@pytest.mark.parametrize("prefill_budget", [2, 4, 8])
+def test_mixed_cached_prefix_slices_visual_features_before_merging(prefill_budget):
     # The warm row's cached prefix contains one visual token; the cold row
     # contains two visual tokens.
     calls = []
 
     def model(ids, **kwargs):
+        # The token budget covers both rows, including padding. Visual features
+        # must stay aligned with the token columns in every forward pass.
+        assert ids.size <= prefill_budget
+        assert kwargs["deepstack_visual_embeds"].shape[:2] == ids.shape
         calls.append(kwargs)
         return SimpleNamespace(logits=mx.zeros((*ids.shape, 4)))
 
@@ -1668,7 +1673,13 @@ def test_mixed_cached_prefix_slices_visual_features_before_merging():
             "deepstack_visual_embeds": mx.array([20, 0, 21, 0]).reshape(1, 4, 1, 1),
         },
     ]
-    batch = _mixed_batch(model, rows, [list(range(6)), list(range(4))], 3)
+    batch = _mixed_batch(
+        model,
+        rows,
+        [list(range(6)), list(range(4))],
+        3,
+        prefill_budget=prefill_budget,
+    )
     assert batch._prompt_kwargs["deepstack_visual_embeds"][:, :, 0, 0].tolist() == [
         [11, 12, 0, 0],
         [20, 0, 21, 0],
@@ -1676,10 +1687,13 @@ def test_mixed_cached_prefix_slices_visual_features_before_merging():
     while batch.needs_processing():
         batch.prompt_step()
     batch.generate(lambda x: mx.argmax(x, axis=-1), lambda _: False)
-    assert [c["deepstack_visual_embeds"][:, :, 0, 0].tolist() for c in calls] == [
-        [[11, 12], [20, 0]],
-        [[0], [21]],
-        [[0], [0]],
+    # Concatenating the calls must reproduce the uncached visual suffix exactly,
+    # regardless of chunk boundaries: no cached feature, lost column, or repeat.
+    assert mx.concatenate(
+        [c["deepstack_visual_embeds"][:, :, 0, 0] for c in calls], axis=1
+    ).tolist() == [
+        [11, 12, 0, 0],
+        [20, 0, 21, 0],
     ]
 
 
