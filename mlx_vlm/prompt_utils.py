@@ -161,7 +161,7 @@ def extract_text_from_content(content: Any) -> str:
             if isinstance(item, dict):
                 item_type = item.get("type", "")
                 # Extract text from text-type items
-                if item_type in ("text", "input_text"):
+                if item_type in ("text", "input_text", "output_text"):
                     text = item.get("text", "") or item.get("content", "")
                     if text:
                         text_parts.append(text)

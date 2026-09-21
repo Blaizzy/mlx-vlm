@@ -380,6 +380,33 @@ tool-call parsing, MSA index caches, and MXFP8 config loading. See
 [`mlx_vlm/models/minimax_m3_vl/README.md`](mlx_vlm/models/minimax_m3_vl/README.md)
 for model-specific conversion and runtime notes.
 
+#### Reading the server's draft counters
+
+With a drafter loaded, `mlx_vlm.server` adds four fields to a response's
+`timings`, named after llama.cpp's:
+
+| Field | Meaning |
+|---|---|
+| `draft_kind` | The drafter family that ran |
+| `draft_rounds` | Verification rounds: target forward passes after the prefill |
+| `draft_n` | Tokens proposed, `--draft-block-size` minus one per round (the block includes the anchor token) |
+| `draft_n_accepted` | Proposed tokens the target's greedy choice matched |
+
+`draft_n_accepted` is a measure of the drafter, not of the output. A round
+is recorded when the target verifies it, before the stop token or `max_tokens`
+cuts the reply, so matches past the end of the reply are counted and the field
+can exceed `predicted_n`. `predicted_n - draft_n_accepted` is therefore not
+the number of target forward passes. Use `draft_rounds`:
+
+```text
+accept_length = (predicted_n - 1) / draft_rounds
+```
+
+The first token comes from the prefill, before any draft exists, so it is
+left out of the numerator. The three counters are differences of a tally kept
+on the drafter, so they belong to one request only when one request is in
+flight; with concurrent requests they are shared across the batch.
+
 ### Chat UI with Gradio
 
 The Gradio chat UI requires the optional `ui` extra, which the base `mlx-vlm`
