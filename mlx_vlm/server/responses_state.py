@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException
 
+from ..prompt_utils import _normalize_tool_message
 from ..tools import process_tool_calls
 
 logger = logging.getLogger("mlx_vlm.server")
@@ -590,6 +591,16 @@ def _append_response_item_to_prompt(
     item_type = item.get("type")
     if item_type == "message":
         role = item.get("role") or "user"
+        message = {"role": role}
+        for field in ("tool_calls", "tool_call_id", "name"):
+            if item.get(field) is not None:
+                message[field] = item[field]
+        reasoning = item.get("reasoning_content")
+        if reasoning is None:
+            reasoning = item.get("reasoning")
+        if reasoning is not None:
+            message["reasoning_content"] = reasoning
+            message["reasoning"] = reasoning
         content = item.get("content")
         if isinstance(content, list):
             content_parts = []
@@ -613,7 +624,8 @@ def _append_response_item_to_prompt(
                 text = "\n".join(
                     part["text"] for part in content_parts if part.get("type") == "text"
                 )
-                chat_messages.append({"role": role, "content": text})
+                message["content"] = text
+                chat_messages.append(_normalize_tool_message(message))
                 chat_messages.append(_response_image_message(len(item_images)))
                 return
             if item_images:
@@ -622,7 +634,8 @@ def _append_response_item_to_prompt(
                 content = "\n".join(
                     part["text"] for part in content_parts if part.get("type") == "text"
                 )
-        chat_messages.append({"role": role, "content": content or ""})
+        message["content"] = content or ""
+        chat_messages.append(_normalize_tool_message(message))
         return
 
     if item_type in ("function_call", "shell_call", "apply_patch_call"):

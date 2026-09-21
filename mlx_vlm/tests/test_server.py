@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import json
 import logging
 import math
@@ -1326,6 +1327,97 @@ def test_anthropic_tool_result_normalization(client, image):
             ]
             == ""
         )
+
+
+def _assert_chat_and_responses_messages(client, messages, expected, **extra):
+    with _endpoint(model_type="qwen3_5") as fake:
+        for api, field in [("chat", "messages"), ("responses", "input")]:
+            fake.template.reset_mock()
+            response = _post(client, api, **{field: messages}, **extra)
+            assert response.status_code == 200, response.text
+            fake.template.assert_called_once()
+            assert fake.template.call_args.args[2] == expected, api
+            assert fake.template.call_args.kwargs["tools"] == extra.get("tools"), api
+
+
+@pytest.mark.parametrize("omitted_reasoning", ["reasoning_content", "reasoning"])
+@pytest.mark.parametrize(
+    "content", ["Inspecting.", [{"type": "output_text", "text": "Inspecting."}]]
+)
+def test_chat_and_responses_preserve_same_tool_history(
+    client, omitted_reasoning, content
+):
+    expected = [
+        {"role": "user", "content": "Where is the entry point?"},
+        {
+            "role": "assistant",
+            "content": "Inspecting.",
+            "reasoning_content": "Check the entry point first.",
+            "reasoning": "Check the entry point first.",
+            "tool_calls": [
+                {
+                    "id": "call_saved",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": {"path": "/src/app.py"},
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_saved",
+            "name": "read_file",
+            "content": "It initializes SQLite.",
+        },
+        {"role": "user", "content": "Summarize what you learned."},
+    ]
+    messages = copy.deepcopy(expected)
+    assistant = messages[1]
+    assistant["content"] = content
+    del assistant[omitted_reasoning]
+    function = assistant["tool_calls"][0]["function"]
+    function["arguments"] = json.dumps(function["arguments"])
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                },
+            },
+        }
+    ]
+    _assert_chat_and_responses_messages(
+        client,
+        messages,
+        expected,
+        tools=tools,
+        tool_choice="auto",
+    )
+
+
+@pytest.mark.parametrize(
+    "roles", [("system", "system"), ("system", "developer"), ("developer", "system")]
+)
+def test_chat_and_responses_merge_instruction_messages_identically(client, roles):
+    messages = [
+        {"role": roles[0], "content": "Be concise."},
+        {"role": roles[1], "content": "Preserve exact paths."},
+        {"role": "user", "content": "Say hello."},
+    ]
+    _assert_chat_and_responses_messages(
+        client,
+        messages,
+        [
+            {"role": "system", "content": "Be concise.\n\nPreserve exact paths."},
+            messages[2],
+        ],
+    )
 
 
 def test_responses_endpoint_places_function_output_image_after_tool_result(client):
@@ -3211,6 +3303,57 @@ def test_message_image_stays_on_its_original_user_turn():
         _msg("I see it.", "assistant"),
         _msg("Second turn"),
     ]
+
+
+def test_message_metadata_survives_image_extraction_without_mutating_input():
+    image_url = "https://example.com/result.png"
+    items = [
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Inspecting."}],
+            "reasoning_content": "Use the saved path.",
+            "reasoning": "Outdated alias.",
+            "tool_calls": [
+                {
+                    "id": "call_saved",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": '{"path":"/src/app.py"}',
+                    },
+                }
+            ],
+        },
+        {
+            "type": "message",
+            "role": "tool",
+            "tool_call_id": "call_saved",
+            "name": "read_file",
+            "content": [
+                {"type": "input_text", "text": "File preview"},
+                {"type": "input_image", "image_url": image_url},
+            ],
+        },
+    ]
+    original = copy.deepcopy(items)
+
+    messages, images = _response_items_to_chat(items)
+
+    assert images == [image_url]
+    assert messages[0]["reasoning_content"] == "Use the saved path."
+    assert messages[0]["reasoning"] == "Use the saved path."
+    assert messages[0]["tool_calls"][0]["function"]["arguments"] == {
+        "path": "/src/app.py"
+    }
+    assert messages[1] == {
+        "role": "tool",
+        "tool_call_id": "call_saved",
+        "name": "read_file",
+        "content": "File preview",
+    }
+    assert messages[2] == {"role": "user", "content": [{"type": "image"}]}
+    assert items == original
 
 
 def test_unknown_function_output_blocks_remain_text():

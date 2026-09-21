@@ -185,10 +185,11 @@ def _adapter_path_or_inherit(request):
     )
 
 
-def _normalize_response_instruction_messages(
+def _normalize_instruction_messages(
     chat_messages: List[dict],
-    instructions: Optional[str],
+    instructions: Optional[str] = None,
 ) -> Optional[str]:
+    """Combine API instructions into the leading system message for templates."""
     instruction_parts = [instructions] if instructions else []
     conversation = []
 
@@ -709,7 +710,7 @@ async def responses_input_tokens_endpoint(request: Request):
             + current_input_items
         )
         chat_messages, images = _response_items_to_chat(prompt_items)
-        _normalize_response_instruction_messages(
+        _normalize_instruction_messages(
             chat_messages,
             openai_request.instructions,
         )
@@ -870,7 +871,7 @@ async def responses_endpoint(request: Request):
             + current_input_items
         )
         chat_messages, images = _response_items_to_chat(prompt_items)
-        instructions = _normalize_response_instruction_messages(
+        instructions = _normalize_instruction_messages(
             chat_messages,
             openai_request.instructions,
         )
@@ -1591,6 +1592,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
             processed_messages.append(msg)
 
+        _normalize_instruction_messages(processed_messages)
         _ensure_effective_input(processed_messages, images=images, audio=audio)
 
         processed_messages, tools, tool_choice = _prepare_chat_tool_choice(
