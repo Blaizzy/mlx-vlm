@@ -77,6 +77,14 @@ def get_prefill_step_size():
     return int(os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE))
 
 
+def get_background_prefill():
+    return os.environ.get("MLX_VLM_BACKGROUND_PREFILL", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
 def get_max_num_seqs():
     """Max sequences allowed in the running batch at once (None = unbounded)."""
     raw = os.environ.get("MLX_VLM_MAX_NUM_SEQS", "")
@@ -1002,6 +1010,7 @@ class ResponseGenerator:
         draft_model_path: Optional[str] = None,
         draft_kind: Optional[str] = None,
         prefill_step_size: Optional[int] = None,
+        background_prefill: Optional[bool] = None,
     ):
         self.model_path = model_path
         self.adapter_path = adapter_path
@@ -1029,6 +1038,11 @@ class ResponseGenerator:
             else int(prefill_step_size)
         )
         self.apc_mode = None
+        self.background_prefill = (
+            get_background_prefill()
+            if background_prefill is None
+            else background_prefill
+        )
         self.tokenizer = None
         self.requests: Queue = Queue()
         self._stop = False
@@ -1674,7 +1688,7 @@ class ResponseGenerator:
                 clear_mlx_streams()
 
     def _run_impl(self):
-        """Single GPU thread: owns BatchGenerator, runs tight next() loop."""
+        """Own batch scheduling and publish each decode phase before prefill."""
         try:
             self._initialize_model()
         except Exception as e:
@@ -1773,6 +1787,9 @@ class ResponseGenerator:
                             draft_block_size=_get_draft_block_size_from_env(),
                             greedy_sampling=args.temperature == 0,
                             prefill_step_size=self._effective_prefill_step_size(),
+                            background_prefill=getattr(
+                                self, "background_prefill", False
+                            ),
                         )
 
                     # Vision encoder runs on the GPU thread; text tokenization
@@ -1854,6 +1871,13 @@ class ResponseGenerator:
                 )
                 _notify_queues(error_queues.values(), e, None)
                 active.clear()
+                if batch_gen is not None and callable(
+                    getattr(batch_gen, "close", None)
+                ):
+                    try:
+                        batch_gen.close()
+                    except Exception:
+                        logger.exception("Error retiring failed generation batch")
                 batch_gen = None
                 mx.clear_cache()
                 gc.collect()
@@ -2007,9 +2031,9 @@ class ResponseGenerator:
             results.close()
 
     def _step(self, batch_gen, active, gen_kwargs=None):
-        """One batch generation step: prefill + decode."""
-        kwargs = gen_kwargs or {}
-        prompt_responses, responses = batch_gen.next(**kwargs)
+        """Publish ready decode tokens before advancing bounded prompt work."""
+        self._emit_responses(batch_gen.decode_step(), active)
+        prompt_responses = batch_gen.prefill_step()
         self._log_prefill_progress(batch_gen, active)
         for prompt_response in prompt_responses:
             if prompt_response.uid in active:
@@ -2017,9 +2041,8 @@ class ResponseGenerator:
                 info["prompt_tps"] = prompt_response.prompt_tps
                 info["cached_tokens"] = getattr(prompt_response, "cached_tokens", 0)
                 self._log_prefill_completed(prompt_response.uid, info, prompt_response)
-        if not responses:
-            return
 
+    def _emit_responses(self, responses, active):
         for r in responses:
             if r.uid not in active:
                 continue

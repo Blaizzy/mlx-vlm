@@ -106,7 +106,15 @@ def main():
         "--prefill-step-size",
         type=int,
         default=DEFAULT_PREFILL_STEP_SIZE,
-        help="Tokens per prefill step (default: %(default)s).",
+        help="Prompt-token budget per batch step, including padding "
+        "(default: %(default)s). Lower values reduce pauses in active streams.",
+    )
+    parser.add_argument(
+        "--background-prefill",
+        action="store_true",
+        default=False,
+        help="Experimentally overlap prefill with decoding on supported models. "
+        "Disabled by default; requires greedy decoding without APC or speculative decoding.",
     )
     parser.add_argument(
         "--log-progress-interval",
@@ -323,6 +331,8 @@ def main():
         os.environ["MLX_VLM_MAX_NUM_SEQS"] = str(args.max_num_seqs)
     if args.prefill_step_size:
         os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
+    if args.background_prefill:
+        os.environ["MLX_VLM_BACKGROUND_PREFILL"] = "1"
     os.environ["MLX_VLM_LOG_PROGRESS_INTERVAL"] = str(args.log_progress_interval)
     os.environ["MLX_VLM_MAX_TOKENS"] = str(args.max_tokens)
     os.environ["MLX_VLM_ENABLE_THINKING"] = "1" if args.enable_thinking else "0"

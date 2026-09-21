@@ -1873,7 +1873,7 @@ class _Batch:
     def remove(self, uid):
         return self.active.pop(uid, None) is not None
 
-    def next(self, **kwargs):
+    def decode_step(self):
         self.sizes.append(len(self.active))
         responses = []
         for uid, step in sorted(self.active.items()):
@@ -1890,7 +1890,10 @@ class _Batch:
                 del self.active[uid]
             else:
                 self.active[uid] += 1
-        return [], responses
+        return responses
+
+    def prefill_step(self):
+        return []
 
 
 class _IdleBatch(_Batch):
@@ -2008,9 +2011,10 @@ def _step_tokens(tokenizer, responses, *, progress=(), trim_space=True):
             cached_tokens=0,
         )
     }
+    gen._step(NS(decode_step=lambda: [], prefill_step=lambda: progress), active)
     for token, finish in responses:
         row = NS(uid=1, token=token, token_logprob=0.0, finish_reason=finish)
-        gen._step(NS(next=lambda **kw: (progress, [row])), active)
+        gen._step(NS(decode_step=lambda: [row], prefill_step=lambda: []), active)
     return list(queue.queue)
 
 
@@ -2236,6 +2240,31 @@ class TestResponseGenerator:
         thread.join(timeout=1.0)
         assert not thread.is_alive()
         assert isinstance(result[0], StopIteration)
+
+    def test_step_publishes_completed_response_before_failing_prefill(self):
+        gen, queue = _generator(), Queue()
+        active = {
+            1: dict(
+                rqueue=queue,
+                streamer=NS(advance=lambda *args: "ready"),
+                prompt_tps=10.0,
+                cached_tokens=0,
+            )
+        }
+        response = NS(uid=1, token=7, token_logprob=0.0, finish_reason="length")
+
+        def prefill_step():
+            token = queue.get_nowait()
+            assert token.text == "ready"
+            assert token.token == 7
+            assert token.finish_reason == "length"
+            assert queue.get_nowait() is None
+            assert 1 not in active
+            raise RuntimeError("unrelated prefill failed")
+
+        batch = NS(decode_step=lambda: [response], prefill_step=prefill_step)
+        with pytest.raises(RuntimeError, match="unrelated prefill failed"):
+            gen._step(batch, active)
 
     def test_step_streams_spm_subword_tokens_immediately(self):
         tokenizer = NS(
@@ -3767,3 +3796,44 @@ def test_realtime_websocket_requires_native_pcm_rate(realtime_client):
         event = websocket.receive_json()
         assert event["type"] == "error"
         assert event["error"]["code"] == "inference_error"
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_background_prefill_cli_and_worker_are_opt_in(monkeypatch, enabled):
+    monkeypatch.delenv("MLX_VLM_BACKGROUND_PREFILL", raising=False)
+    monkeypatch.setattr(
+        sys, "argv", ["mlx_vlm.server"] + (["--background-prefill"] if enabled else [])
+    )
+    with patch.object(cli.uvicorn, "run"):
+        cli.main()
+    assert generation.get_background_prefill() is enabled
+    gen, batches = _worker_setup(monkeypatch)
+    gen.background_prefill = generation.get_background_prefill()
+    queue = _enqueue(gen, max_tokens=1, temperature=0)
+    with _running(gen):
+        _drain(queue)
+    assert batches[0].kwargs["background_prefill"] is enabled
+
+
+def test_worker_closes_failed_batch_before_reusing_model(monkeypatch):
+    gen, batches = _worker_setup(monkeypatch, idle=True)
+    original_step = gen._step
+    closed = []
+
+    def fail_once(batch, active):
+        if not closed:
+            batch.close = lambda: closed.append(batch)
+            raise RuntimeError("background prefill failed")
+        assert closed == [batches[0]]
+        original_step(batch, active)
+
+    gen._step = fail_once
+    with _running(gen):
+        queue = _enqueue(gen, max_tokens=1)
+        context = queue.get(timeout=1)
+        assert isinstance(context, server.GenerationContext)
+        assert isinstance(queue.get(timeout=1), RuntimeError)
+        assert queue.get(timeout=1) is None
+        _, tokens = _drain(_enqueue(gen, 2, max_tokens=1))
+        assert tokens[0].finish_reason == "length"
+    assert closed == [batches[0]]

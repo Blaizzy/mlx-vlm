@@ -339,6 +339,12 @@ class Lfm2Model(nn.Module):
 
 
 class LanguageModel(nn.Module):
+    @property
+    def supports_background_prefill(self):
+        # Dense LFM2 keeps convolution and attention state in caller-owned caches.
+        # Routed/offloaded experts have additional mutable weight ownership.
+        return not getattr(self.args, "num_experts", 0)
+
     def __init__(self, args: ModelConfig):
         super().__init__()
         self.args = args

@@ -2884,3 +2884,31 @@ def test_restored_tokens_count_successful_restores(
     manager.reset_stats()
     assert manager.stats_snapshot()["restored_tokens"] == 0
     assert manager.stats_snapshot()["stored_tokens"] == 0
+
+
+def test_lfm_background_streams_keep_request_caches_independent():
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    model = language_model("lfm2")
+    assert model.supports_background_prefill
+    mx.eval(model.parameters())
+
+    def run(token, barrier=None):
+        with mx.stream(mx.new_stream(mx.gpu)):
+            cache = model.make_cache()
+            if barrier is not None:
+                barrier.wait(timeout=5)
+            outputs = []
+            for width in (7, 3, 1, 1):
+                logits = model(mx.full((1, width), token, mx.int32), cache=cache).logits
+                mx.eval(logits, [entry.state for entry in cache])
+                outputs.append(logits.tolist())
+            return outputs
+
+    expected = [run(token) for token in (1, 2)]
+    barrier = Barrier(2)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(run, token, barrier) for token in (1, 2)]
+        actual = [future.result(timeout=10) for future in futures]
+    assert actual == expected

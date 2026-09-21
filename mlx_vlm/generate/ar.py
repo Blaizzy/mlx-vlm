@@ -8,7 +8,9 @@ import sys
 import time
 import warnings
 from collections.abc import Generator
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from threading import Event
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
@@ -1056,6 +1058,13 @@ class PromptProgress:
     cached_tokens: int = 0
 
 
+@dataclass
+class _CompletedPrefill:
+    generation_batch: Optional["GenerationBatch"]
+    progress: List[PromptProgress]
+    elapsed_s: float
+
+
 def _sample_with_positions(
     sampler: Callable[[mx.array], mx.array],
     logprobs: mx.array,
@@ -2061,7 +2070,7 @@ class PromptProcessingBatch:
             out[k] = _slice_sequence_aligned_prompt_kwarg(k, out[k], stop=n)
         return out
 
-    def prompt_step(self) -> int:
+    def prompt_step(self, *, clear_cache: bool = True) -> int:
         """Process one chunk of the prompt. Returns tokens processed."""
         if not self.needs_processing():
             return 0
@@ -2119,7 +2128,8 @@ class PromptProcessingBatch:
             self._prompt_kwargs[k] = _slice_sequence_aligned_prompt_kwarg(
                 k, self._prompt_kwargs[k], start=n
             )
-        mx.clear_cache()
+        if clear_cache:
+            mx.clear_cache()
         return n
 
     def record_prompt_time(self, elapsed_s: float) -> None:
@@ -2426,7 +2436,12 @@ class BatchGenerator:
     """
     Continuous batching with separate prompt processing and generation phases.
 
-    next() returns (prompt_responses, generation_responses) where:
+    ``prefill_step_size`` bounds prompt tokens per step across the whole batch.
+    Rows share this budget, including padding; ``None`` disables chunking.
+
+    Streaming callers should publish decode_step() responses before calling
+    prefill_step(). next() advances both phases and returns
+    (prompt_responses, generation_responses) where:
     - prompt_responses contains completed prompt-batch timing stats
     - generation_responses is a list of GenerationBatch.Response objects
     """
@@ -2462,6 +2477,7 @@ class BatchGenerator:
         draft_kind: Optional[str] = None,
         draft_block_size: Optional[int] = None,
         greedy_sampling: bool = False,
+        background_prefill: bool = False,
     ):
         self.model = model
         self.max_tokens = max_tokens
@@ -2503,6 +2519,7 @@ class BatchGenerator:
         self.prefill_step_size = prefill_step_size
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = completion_batch_size
+        self.background_prefill = background_prefill
 
         self._stream = stream or generation_stream
 
@@ -2518,6 +2535,11 @@ class BatchGenerator:
         )
         self._prompt_batch: Optional[PromptProcessingBatch] = None
         self._unprocessed_sequences = []
+        self._prefill_executor: Optional[ThreadPoolExecutor] = None
+        self._prefill_future: Optional[Future[_CompletedPrefill]] = None
+        self._prefill_cancel = Event()
+        self._background_prefill_uids: set[int] = set()
+        self._cancelled_prefill_uids: set[int] = set()
 
         self._prompt_tokens_counter = 0
         self._prompt_time_counter = 0
@@ -2795,7 +2817,7 @@ class BatchGenerator:
             prompt_kwargs=merged_kwargs,
             logits_processors=logits_processors,
             thinking_budget_criteria=thinking_budget_criteria,
-            prefill_step_size=self.prefill_step_size,
+            prefill_step_size=self._prefill_chunk_size(len(sequences)),
             kv_bits=self.kv_bits,
             kv_key_bits=getattr(self, "kv_key_bits", None),
             kv_value_bits=getattr(self, "kv_value_bits", None),
@@ -2851,7 +2873,16 @@ class BatchGenerator:
         return self._stream
 
     def close(self):
-        if self._wire_stack is not None:
+        executor = getattr(self, "_prefill_executor", None)
+        if executor is not None:
+            self._prefill_cancel.set()
+            # Retire the worker before releasing model memory or the wired limit.
+            executor.shutdown(wait=True, cancel_futures=False)
+            self._prefill_executor = None
+            self._prefill_future = None
+            self._background_prefill_uids.clear()
+            self._cancelled_prefill_uids.clear()
+        if getattr(self, "_wire_stack", None) is not None:
             self._wire_stack.close()
             self._wire_stack = None
 
@@ -2913,6 +2944,11 @@ class BatchGenerator:
     def remove(self, uid) -> bool:
         """Remove a sequence from the batch by uid."""
         with mx.stream(self._stream):
+            if uid in getattr(self, "_background_prefill_uids", ()):
+                self._cancelled_prefill_uids.add(uid)
+                if self._cancelled_prefill_uids == self._background_prefill_uids:
+                    self._prefill_cancel.set()
+                return True
             # Waiting in the queue.
             for i, (seq_uid, _, _, _, _, _) in enumerate(self._unprocessed_sequences):
                 if seq_uid == uid:
@@ -2945,16 +2981,16 @@ class BatchGenerator:
     @property
     def has_pending_prompts(self):
         """True if there are prompts waiting or being processed."""
-        return len(self._unprocessed_sequences) > 0 or self._prompt_batch is not None
+        return (
+            bool(self._unprocessed_sequences)
+            or self._prompt_batch is not None
+            or getattr(self, "_prefill_future", None) is not None
+        )
 
     @property
     def has_work(self):
         """True if there is any remaining work."""
-        return (
-            len(self._generation_batch) > 0
-            or self._prompt_batch is not None
-            or len(self._unprocessed_sequences) > 0
-        )
+        return len(self._generation_batch) > 0 or self.has_pending_prompts
 
     def stats(self):
         """Return accumulated batch statistics."""
@@ -2989,16 +3025,174 @@ class BatchGenerator:
         else:
             self._generation_batch.extend(gen_batch)
 
-    def _next(self, **kwargs):
-        generation_responses = []
-        prompt_responses = []
+    def _prefill_chunk_size(self, batch_size: int) -> Optional[int]:
+        if self.prefill_step_size is None:
+            return None
+        return max(1, self.prefill_step_size // batch_size)
 
-        # Decode-first: always emit a generation step before touching prefill.
-        yield_after_decode = any(
-            getattr(processor, "requires_immediate_decode_yield", False)
-            for processors in getattr(self._generation_batch, "logits_processors", [])
-            for processor in processors or []
+    def _take_prefill_sequences(self, limit: int):
+        """Admit the oldest request and peers from its prompt-length bucket."""
+        if limit <= 0 or not self._unprocessed_sequences:
+            return []
+
+        def bucket(sequence):
+            length = max(1, len(sequence[1]))
+            return 0 if length <= 512 else (length - 1).bit_length()
+
+        oldest = min(self._unprocessed_sequences, key=lambda sequence: sequence[0])
+        selected = sorted(
+            (s for s in self._unprocessed_sequences if bucket(s) == bucket(oldest)),
+            key=lambda sequence: sequence[0],
+        )[:limit]
+        selected_uids = {s[0] for s in selected}
+        self._unprocessed_sequences = [
+            s for s in self._unprocessed_sequences if s[0] not in selected_uids
+        ]
+        return selected
+
+    def _can_background_prefill(self) -> bool:
+        batch = self._prompt_batch
+        return (
+            getattr(self, "background_prefill", False)
+            and getattr(self, "_prefill_future", None) is None
+            and batch is not None
+            and len(self._generation_batch) > 0
+            and getattr(self.model, "supports_background_prefill", False) is True
+            and getattr(self.model, "moe_offload_store", None) is None
+            and mx.metal.is_available()
+            and self.draft_model is None
+            and not getattr(self._generation_batch, "is_speculative", False)
+            and self.apc_manager is None
+            and self.greedy_sampling
+            and not any(batch.logits_processors)
+            and not any(self._generation_batch.logits_processors)
+            and not any(batch.thinking_budget_criteria)
+            and not any(self._generation_batch.thinking_budget_criteria)
         )
+
+    @staticmethod
+    def _run_background_prefill(
+        batch, cancel, sampler, stop_criteria, compute_logprobs, top_logprobs_k
+    ) -> _CompletedPrefill:
+        # Only the prompt batch crosses threads; the scheduler and its mutable
+        # admission/cancellation state remain on the generation thread.
+        stream = mx.new_stream(mx.gpu)
+        started = time.perf_counter()
+        try:
+            with mx.stream(stream):
+                while batch.needs_processing():
+                    if cancel.is_set():
+                        return _CompletedPrefill(None, [], 0.0)
+                    batch.prompt_step(clear_cache=False)
+                    # Do not queue an entire prompt ahead of active decoding.
+                    mx.synchronize(stream)
+                if cancel.is_set():
+                    return _CompletedPrefill(None, [], 0.0)
+                generation_batch = batch.generate(
+                    sampler, stop_criteria, compute_logprobs, top_logprobs_k
+                )
+                generation_batch._eval_pending_state()
+        finally:
+            # Errors and cancellation must also drain submitted GPU work before
+            # the scheduler can discard this batch or shut down the executor.
+            mx.synchronize(stream)
+        elapsed = time.perf_counter() - started
+        batch.record_prompt_time(elapsed)
+        return _CompletedPrefill(generation_batch, batch.prompt_progress(), elapsed)
+
+    def _start_background_prefill(self) -> bool:
+        if not self._can_background_prefill():
+            return False
+        batch = self._prompt_batch
+        targets = []
+
+        def collect(value):
+            if isinstance(value, mx.array):
+                targets.append(value)
+            elif isinstance(value, dict):
+                for item in value.values():
+                    collect(item)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    collect(item)
+
+        collect((batch._input_ids, batch._inputs_embeds, batch._prompt_kwargs))
+        collect([c.state for c in batch.prompt_cache])
+        mx.eval(targets)
+        if self._prefill_executor is None:
+            mx.eval(self.model.parameters())
+            self._prefill_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="mlx-vlm-prefill"
+            )
+        self._prefill_cancel = Event()
+        self._prefill_future = self._prefill_executor.submit(
+            self._run_background_prefill,
+            batch,
+            self._prefill_cancel,
+            self.sampler,
+            self.tokenizer.stopping_criteria,
+            self.compute_logprobs,
+            self.top_logprobs_k,
+        )
+        self._background_prefill_uids = set(batch.uids)
+        self._prompt_batch = None
+        return True
+
+    def _poll_background_prefill(self) -> Optional[List[PromptProgress]]:
+        future = getattr(self, "_prefill_future", None)
+        if future is None:
+            return None
+        if not future.done() and len(self._generation_batch) > 0:
+            return []
+        cancelled = self._cancelled_prefill_uids
+        try:
+            completed = future.result()
+        finally:
+            self._prefill_future = None
+            self._background_prefill_uids.clear()
+            self._cancelled_prefill_uids = set()
+        batch = completed.generation_batch
+        if batch is not None:
+            if cancelled:
+                batch.filter(
+                    [i for i, uid in enumerate(batch.uids) if uid not in cancelled]
+                )
+            if len(batch):
+                self._extend_generation_batch(batch)
+        self._prompt_time_counter += completed.elapsed_s
+        return [
+            progress for progress in completed.progress if progress.uid not in cancelled
+        ]
+
+    def _advance_prompt_batch(self) -> List[PromptProgress]:
+        if self._start_background_prefill():
+            return []
+        batch = self._prompt_batch
+        needs_processing = batch.needs_processing()
+        tic = time.perf_counter()
+        if needs_processing:
+            batch.prompt_step()
+        else:
+            gen_batch = batch.generate(
+                self.sampler,
+                self.tokenizer.stopping_criteria,
+                compute_logprobs=self.compute_logprobs,
+                top_logprobs_k=self.top_logprobs_k,
+            )
+        elapsed = time.perf_counter() - tic
+        self._prompt_time_counter += elapsed
+        self._record_prompt_batch_time(batch, elapsed)
+        if needs_processing:
+            return []
+
+        prompt_responses = self._prompt_batch_progress(batch)
+        self._extend_generation_batch(gen_batch)
+        self._prompt_batch = None
+        mx.clear_cache()
+        return prompt_responses
+
+    def _decode_step(self) -> List[GenerationBatch.Response]:
+        generation_responses = []
         if len(self._generation_batch) > 0:
             generation_responses = self._generation_batch.next()
             self._gen_tokens_counter += len(generation_responses)
@@ -3006,6 +3200,7 @@ class BatchGenerator:
             if (
                 self._cache_eval_interval > 0
                 and self._steps_counter % self._cache_eval_interval == 0
+                and getattr(self, "_prefill_future", None) is None
             ):
                 cache_states = getattr(self._generation_batch, "cache_states", None)
                 if callable(cache_states):
@@ -3013,57 +3208,46 @@ class BatchGenerator:
                 else:
                     mx.eval([c.state for c in self._generation_batch.prompt_cache])
                 mx.clear_cache()
-            if yield_after_decode:
-                return prompt_responses, generation_responses
 
+        return generation_responses
+
+    def _prefill_step(self) -> List[PromptProgress]:
+        prompt_responses = []
+        background_progress = self._poll_background_prefill()
+        if background_progress is not None:
+            return background_progress
         if (
             getattr(self._generation_batch, "is_speculative", False)
             and len(self._generation_batch) > 0
         ):
-            return prompt_responses, generation_responses
+            return prompt_responses
 
         if len(self._generation_batch) >= self.completion_batch_size:
-            return prompt_responses, generation_responses
+            return prompt_responses
 
         if self._prompt_batch is not None:
-            if self._prompt_batch.needs_processing():
-                tic = time.perf_counter()
-                self._prompt_batch.prompt_step()
-                elapsed = time.perf_counter() - tic
-                self._prompt_time_counter += elapsed
-                self._record_prompt_batch_time(self._prompt_batch, elapsed)
-                return prompt_responses, generation_responses
-
-            tic = time.perf_counter()
-            gen_batch = self._prompt_batch.generate(
-                self.sampler,
-                self.tokenizer.stopping_criteria,
-                compute_logprobs=self.compute_logprobs,
-                top_logprobs_k=self.top_logprobs_k,
-            )
-            elapsed = time.perf_counter() - tic
-            self._prompt_time_counter += elapsed
-            self._record_prompt_batch_time(self._prompt_batch, elapsed)
-            prompt_responses = self._prompt_batch_progress(self._prompt_batch)
-            self._extend_generation_batch(gen_batch)
-            self._prompt_batch = None
-            mx.clear_cache()
-            return prompt_responses, generation_responses
+            return self._advance_prompt_batch()
 
         num_active = len(self._generation_batch)
         num_to_add = self.completion_batch_size - num_active
-        if self._unprocessed_sequences and num_to_add >= self.prefill_batch_size:
+        if self._unprocessed_sequences and num_to_add > 0:
             # Take up to prefill_batch_size pending sequences. If APC is on
             # and at least one of them has a prefix hit, build a mixed
             # warm/cold PromptProcessingBatch with right-padded suffixes so
             # warm and cold rows prefill in a single forward pass.
-            n = min(self.prefill_batch_size, len(self._unprocessed_sequences))
-            sequences = self._unprocessed_sequences[:n]
+            n = min(
+                self.prefill_batch_size, num_to_add, len(self._unprocessed_sequences)
+            )
+            if self.prefill_step_size is not None:
+                # Leave enough budget for at least one token from every row.
+                n = min(n, max(1, self.prefill_step_size))
+            sequences = self._take_prefill_sequences(n)
+            n = len(sequences)
             coordinator = getattr(self, "apc", None)
             if coordinator is not None:
                 coordinator.prepare_prefill(
                     [len(s[1]) for s in sequences],
-                    prefill_step_size=self.prefill_step_size,
+                    prefill_step_size=self._prefill_chunk_size(n),
                 )
             if logger.isEnabledFor(logging.DEBUG) and os.environ.get("APC_DEBUG"):
                 logger.warning(
@@ -3073,33 +3257,9 @@ class BatchGenerator:
                 )
             mixed = self._build_mixed_prompt_batch(sequences)
             if mixed is not None:
-                self._unprocessed_sequences = self._unprocessed_sequences[n:]
                 self._prompt_batch = mixed
                 self._prompt_tokens_counter += self._prompt_batch.total_prompt_tokens
-                if self._prompt_batch.needs_processing():
-                    tic = time.perf_counter()
-                    nstep = self._prompt_batch.prompt_step()
-                    elapsed = time.perf_counter() - tic
-                    self._prompt_time_counter += elapsed
-                    self._record_prompt_batch_time(self._prompt_batch, elapsed)
-                else:
-                    tic = time.perf_counter()
-                    gen_batch = self._prompt_batch.generate(
-                        self.sampler,
-                        self.tokenizer.stopping_criteria,
-                        compute_logprobs=self.compute_logprobs,
-                        top_logprobs_k=self.top_logprobs_k,
-                    )
-                    elapsed = time.perf_counter() - tic
-                    self._prompt_time_counter += elapsed
-                    self._record_prompt_batch_time(self._prompt_batch, elapsed)
-                    prompt_responses = self._prompt_batch_progress(self._prompt_batch)
-                    self._extend_generation_batch(gen_batch)
-                    self._prompt_batch = None
-                    mx.clear_cache()
-                return prompt_responses, generation_responses
-
-            self._unprocessed_sequences = self._unprocessed_sequences[n:]
+                return self._advance_prompt_batch()
 
             uids = [s[0] for s in sequences]
             input_ids = [s[1] for s in sequences]
@@ -3127,7 +3287,7 @@ class BatchGenerator:
                 prompt_kwargs=merged_kwargs,
                 logits_processors=logits_processors,
                 thinking_budget_criteria=thinking_budget_criteria,
-                prefill_step_size=self.prefill_step_size,
+                prefill_step_size=self._prefill_chunk_size(n),
                 kv_bits=self.kv_bits,
                 kv_key_bits=getattr(self, "kv_key_bits", None),
                 kv_value_bits=getattr(self, "kv_value_bits", None),
@@ -3149,33 +3309,26 @@ class BatchGenerator:
             )
             self._prompt_tokens_counter += self._prompt_batch.total_prompt_tokens
 
-            if self._prompt_batch.needs_processing():
-                tic = time.perf_counter()
-                n = self._prompt_batch.prompt_step()
-                elapsed = time.perf_counter() - tic
-                self._prompt_time_counter += elapsed
-                self._record_prompt_batch_time(self._prompt_batch, elapsed)
-            else:
-                tic = time.perf_counter()
-                gen_batch = self._prompt_batch.generate(
-                    self.sampler,
-                    self.tokenizer.stopping_criteria,
-                    compute_logprobs=self.compute_logprobs,
-                    top_logprobs_k=self.top_logprobs_k,
-                )
-                elapsed = time.perf_counter() - tic
-                self._prompt_time_counter += elapsed
-                self._record_prompt_batch_time(self._prompt_batch, elapsed)
-                prompt_responses = self._prompt_batch_progress(self._prompt_batch)
-                self._extend_generation_batch(gen_batch)
-                self._prompt_batch = None
-                mx.clear_cache()
+            return self._advance_prompt_batch()
 
-            return prompt_responses, generation_responses
+        return prompt_responses
 
-        return prompt_responses, generation_responses
+    def decode_step(self) -> List[GenerationBatch.Response]:
+        """Advance decoding so callers can publish tokens before prefill."""
+        with mx.stream(self._stream):
+            return self._decode_step()
+
+    def prefill_step(self) -> List[PromptProgress]:
+        """Admit pending prompts and advance at most one prefill step."""
+        with mx.stream(self._stream):
+            return self._prefill_step()
+
+    def _next(self, **kwargs):
+        generation_responses = self._decode_step()
+        return self._prefill_step(), generation_responses
 
     def next(self, **kwargs):
+        """Advance both phases for callers consuming results after the step."""
         with mx.stream(self._stream):
             return self._next(**kwargs)
 

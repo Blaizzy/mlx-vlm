@@ -58,10 +58,6 @@ class LLGuidanceLogitsProcessor:
     (batch, vocab).
     """
 
-    # Do not hold a latency-sensitive constrained token behind unrelated
-    # prompt-prefill work after it has been decoded.
-    requires_immediate_decode_yield = True
-
     def __init__(self, grammar: str, llg_tokenizer) -> None:
         self.grammar = grammar
         self.llg_tokenizer = llg_tokenizer
