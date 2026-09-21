@@ -59,18 +59,18 @@ from .types import GenerateKwargs, ProcessorLike, Unpack
 logger = logging.getLogger("mlx_vlm.generate")
 
 DEFAULT_TOP_N_SIGMA = 0.0
-DEFAULT_BATCH_CACHE_EVAL_INTERVAL = 50
+DEFAULT_CACHE_EVAL_INTERVAL = 50
 
 
 def _get_batch_cache_eval_interval() -> int:
     raw = os.environ.get("MLX_VLM_BATCH_CACHE_EVAL_INTERVAL")
     if raw is None:
-        return DEFAULT_BATCH_CACHE_EVAL_INTERVAL
+        return DEFAULT_CACHE_EVAL_INTERVAL
     try:
         return max(0, int(raw))
     except ValueError:
         logger.warning("Ignoring invalid MLX_VLM_BATCH_CACHE_EVAL_INTERVAL=%r", raw)
-        return DEFAULT_BATCH_CACHE_EVAL_INTERVAL
+        return DEFAULT_CACHE_EVAL_INTERVAL
 
 
 def _position_seed(seed: int, row_id: int, position: int) -> int:
@@ -551,6 +551,9 @@ def generate_step(
         if n == max_tokens:
             break
 
+        if (n + 1) % DEFAULT_CACHE_EVAL_INTERVAL == 0:
+            mx.eval([c.state for c in prompt_cache])
+
         yield y.item(), logprobs
         if n % 256 == 0:
             mx.clear_cache()
@@ -870,6 +873,9 @@ def _extend_cache(cache_a, cache_b):
             ca = ca.__class__.merge([ca])
         if not _is_batch_cache_entry(cb) and hasattr(cb.__class__, "merge"):
             cb = cb.__class__.merge([cb])
+        for entry in (ca, cb):
+            if not callable(getattr(entry, "extend", None)):
+                raise ValueError(f"{type(entry)} does not yet support batching")
         ca.extend(cb)
         extended.append(ca)
     return extended
@@ -1910,6 +1916,13 @@ class PromptProcessingBatch:
             ):
                 self.prefill_step_size = None
 
+        if self._apc_coordinator is not None:
+            self._apc_coordinator.prepare_prefill(
+                self._prompt_tokens_per_row,
+                prefix_lengths=self._cached_tokens_per_row,
+                prefill_step_size=self.prefill_step_size,
+            )
+
     def __len__(self):
         return len(self.uids)
 
@@ -2093,6 +2106,12 @@ class PromptProcessingBatch:
         eval_targets.extend(self._finished_prompt_logits[i] for i in finished_rows)
         mx.async_eval(eval_targets)
         self._processed_prompt_columns += n
+        if self._apc_coordinator is not None:
+            self._apc_coordinator.observe_cache(
+                self.prompt_cache,
+                max(self._cached_tokens_per_row) + self._processed_prompt_columns,
+                batch_size=len(self.uids),
+            )
         self._store_apc_exact_checkpoints()
         self._inputs_embeds = self._inputs_embeds[:, n:]
         self._input_ids = self._input_ids[:, n:]
@@ -3042,7 +3061,10 @@ class BatchGenerator:
             sequences = self._unprocessed_sequences[:n]
             coordinator = getattr(self, "apc", None)
             if coordinator is not None:
-                coordinator.prepare_prefill(sum(len(s[1]) for s in sequences))
+                coordinator.prepare_prefill(
+                    [len(s[1]) for s in sequences],
+                    prefill_step_size=self.prefill_step_size,
+                )
             if logger.isEnabledFor(logging.DEBUG) and os.environ.get("APC_DEBUG"):
                 logger.warning(
                     "APC admit n=%d (pending=%d)",

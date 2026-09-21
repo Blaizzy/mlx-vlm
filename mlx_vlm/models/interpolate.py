@@ -228,6 +228,26 @@ def _bicubic_weights_1d(in_size, out_size, scale):
     return idx, w
 
 
+@lru_cache(maxsize=64)
+def nearest_indices(in_size, out_size):
+    """Source indices matching ATen ``upsample_nearest2d``: the scaled output
+    index floored in float32 and clamped to the input."""
+    src = mx.floor(mx.arange(out_size) * (in_size / out_size))
+    return mx.minimum(src, in_size - 1).astype(mx.int32)
+
+
+def resize_nearest_nhwc(x, new_size):
+    """Channel-last ``F.interpolate(mode="nearest")``; a gather, so the dtype
+    and any NaN values pass through unchanged."""
+    _, H, W, _ = x.shape
+    new_height, new_width = new_size
+    if H != new_height:
+        x = mx.take(x, nearest_indices(H, new_height), axis=1)
+    if W != new_width:
+        x = mx.take(x, nearest_indices(W, new_width), axis=2)
+    return x
+
+
 def resize_bilinear_nhwc(x, new_size, align_corners=False, antialias=False):
     """Channel-last bilinear resize matching ``F.interpolate``; ``antialias``
     is PyTorch's triangle filter rather than ``resize_bilinear``'s Gaussian blur."""

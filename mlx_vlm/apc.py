@@ -61,10 +61,12 @@ import mlx.core as mx
 import numpy as np
 
 from ._stream_cleanup import clear_mlx_streams
-from .apc_coordinator import APCCoordinator
+from .apc_adapters import reserve_checkpoint_capacity
+from .apc_coordinator import APCCoordinator, PrefillMemoryPlan
 from .apc_storage import APCNode, ComponentId, StateHandle
 from .kv_quant import from_config as kv_quant_from_config
 from .kv_quant import kv_quant_fingerprint
+from .models.cache import cache_nbytes as _cache_nbytes
 
 logger = logging.getLogger("mlx_vlm.apc")
 
@@ -93,29 +95,6 @@ def _setting(overrides: Optional[dict], key: str, env: str, default: Any) -> Any
         value = overrides[key]
         return default if value is None else value
     return os.environ.get(env, default)
-
-
-def _cache_nbytes(value: Any, seen: Optional[set[int]] = None) -> int:
-    """Account cache buffers without evaluating or cloning their contents."""
-    if value is None:
-        return 0
-    seen = set() if seen is None else seen
-    if id(value) in seen:
-        return 0
-    seen.add(id(value))
-    if isinstance(value, dict):
-        return sum(_cache_nbytes(v, seen) for v in value.values())
-    if isinstance(value, (list, tuple)):
-        return sum(_cache_nbytes(v, seen) for v in value)
-    try:
-        size = value.nbytes
-        if isinstance(size, int):
-            return size
-    except (AttributeError, NotImplementedError):
-        pass
-    return _cache_nbytes(getattr(value, "state", None), seen) + _cache_nbytes(
-        getattr(value, "meta_state", None), seen
-    )
 
 
 def _metal_working_set_bytes() -> Optional[int]:
@@ -660,7 +639,8 @@ class APCStats:
     hits: int = 0
     misses: int = 0
     matched_tokens: int = 0
-    served_tokens: int = 0
+    stored_tokens: int = 0
+    restored_tokens: int = 0
     evictions: int = 0
     stores: int = 0
     pool_used: int = 0
@@ -682,7 +662,7 @@ class APCStats:
         apc_trace("reject", reason=reason, **details)
 
     def snapshot(self, num_blocks: int, block_size: int) -> dict:
-        denom = self.matched_tokens + self.served_tokens
+        denom = self.matched_tokens + self.stored_tokens
         hit_rate = self.matched_tokens / denom if denom > 0 else 0.0
         return {
             "block_size": block_size,
@@ -691,7 +671,8 @@ class APCStats:
             "lookups_hit": self.hits,
             "lookups_miss": self.misses,
             "matched_tokens": self.matched_tokens,
-            "served_tokens": self.served_tokens,
+            "stored_tokens": self.stored_tokens,
+            "restored_tokens": self.restored_tokens,
             "token_hit_rate": hit_rate,
             "evictions": self.evictions,
             "stores": self.stores,
@@ -1759,6 +1740,7 @@ class DiskBlockStore:
             c.keys = k
             c.values = v
             c.offset = off
+            c.step = step
             eval_targets.extend([k, v])
             return c
 
@@ -3185,9 +3167,8 @@ class APCManager:
                 * (1 << 30)
             ),
         )
-        self._bytes_per_token = 0.0
+        self.memory_plan = PrefillMemoryPlan()
         self._prefill_reserve_bytes = 0
-        self._prefill_tokens = 0
 
     def _record_disk_writes(self, count: int) -> None:
         with self.lock:
@@ -3320,28 +3301,11 @@ class APCManager:
             and self._memory_headroom() >= required
         )
 
-    def _observe_cache_size(self, size: int, token_count: int) -> None:
-        if token_count > 0:
-            with self.lock:
-                self._bytes_per_token = max(self._bytes_per_token, size / token_count)
-                self._prefill_reserve_bytes = int(
-                    max(0, 2 * self._prefill_tokens - token_count)
-                    * self._bytes_per_token
-                )
-
-    def prepare_prefill(self, token_count: int) -> None:
-        """Make room for the incoming request before lookup, embeddings or prefill.
-
-        Reserve two cache footprints for growth/restore temporaries in addition
-        to the device headroom. Keep this conservative reserve during snapshot
-        admission, so intermediate checkpoints cannot refill the space we freed.
-        """
+    def prepare_prefill(self, reserve_bytes: int) -> None:
+        """Enforce the coordinator's byte budget before new allocations."""
         if self.disk is not None:
             self.disk.flush()
-        self._prefill_tokens = max(0, token_count)
-        self._prefill_reserve_bytes = int(
-            2 * self._prefill_tokens * self._bytes_per_token
-        )
+        self._prefill_reserve_bytes = max(0, int(reserve_bytes))
         self._make_room()
 
     # ---------- Public API ----------
@@ -3426,12 +3390,8 @@ class APCManager:
             )
             if disk_match is not None:
                 cache_hash, disk_prefix_len = disk_match
-                # Include capacity for an extending prompt and temporary read /
-                # padding buffers, including the first restore after a restart.
-                restore_bytes = int(
-                    disk.exact_cache_bytes(cache_hash)
-                    * max(1, prompt_capacity_tokens / disk_prefix_len)
-                )
+                # Admit stored buffers before estimating expansion from their layout.
+                restore_bytes = disk.exact_cache_bytes(cache_hash)
                 if not self._make_room(2 * restore_bytes):
                     with self.lock:
                         self.stats.memory_skips += 1
@@ -3440,7 +3400,6 @@ class APCManager:
                 cache_hash, disk_prefix_len = disk_match
                 loaded = disk.load_exact_cache(
                     cache_hash,
-                    min_capacity_tokens=prompt_capacity_tokens,
                     prefix_len=disk_prefix_len,
                 )
                 if loaded is not None:
@@ -3451,58 +3410,78 @@ class APCManager:
                         and token_tuple[:disk_prefix_len] == stored_tokens
                     ):
                         size = _cache_nbytes(prompt_cache)
-                        self._observe_cache_size(size, disk_prefix_len)
-                        # Promote the disk-restored entry to the in-memory LRU
-                        # so subsequent identical requests get the fast clone
-                        # path instead of paying disk-restore latency again.
-                        # We clone before storing because the caller's copy will
-                        # be mutated in-place by generate_step as it appends
-                        # generated tokens; the stored copy must stay pristine.
-                        # Disk reads and warm-cache construction intentionally
-                        # happen outside the manager lock. If clear()/reset_stats()
-                        # races here, the restored tensors are still valid; only
-                        # the hit counter lands in the new stats window.
-                        if (
-                            self._exact_cache_max > 0
-                            and size <= self.memory_max_bytes
-                            and self._make_room(size, retain_bytes=size)
-                        ):
-                            storage_copy = _clone_prompt_cache_for_apc(prompt_cache)
-                            if storage_copy is not None:
-                                promote_key = _sequence_hash(
-                                    stored_tokens, extra_hash, self.block_size
+                        self._prefill_reserve_bytes = self.memory_plan.observe_cache(
+                            prompt_cache, disk_prefix_len, live_bytes=size
+                        )
+                        expanded_bytes = self.memory_plan.restore_bytes(
+                            prompt_cache, disk_prefix_len, prompt_capacity_tokens
+                        )
+                        if not self._make_room(2 * expanded_bytes):
+                            with self.lock:
+                                self.stats.memory_skips += 1
+                            # Drop disk buffers and credit before memory fallback.
+                            loaded = prompt_cache = None
+                            self._prefill_reserve_bytes = (
+                                self.memory_plan.reserve_bytes()
+                            )
+                        else:
+                            eval_targets = []
+                            for entry in prompt_cache:
+                                reserve_checkpoint_capacity(
+                                    entry,
+                                    min_capacity_tokens=prompt_capacity_tokens,
+                                    eval_targets=eval_targets,
                                 )
-                                with self.lock:
-                                    self.stats.exact_hits += 1
-                                    self.stats.disk_hits += 1
-                                    self.stats.hits += 1
-                                    self.stats.matched_tokens += disk_prefix_len
-                                    if promote_key not in self._exact_cache:
-                                        self._exact_cache[promote_key] = (
-                                            APCExactCacheEntry(
-                                                token_ids=stored_tokens,
-                                                extra_hash=int(extra_hash),
-                                                prompt_cache=storage_copy,
+                            if eval_targets:
+                                mx.eval(eval_targets)
+                            size = _cache_nbytes(prompt_cache)
+                            self._prefill_reserve_bytes = (
+                                self.memory_plan.reserve_bytes(size)
+                            )
+                            # Retain a copy; generation mutates the returned cache.
+                            # Reads run unlocked. Resets leave tensors valid but move
+                            # hit counts to the new stats window.
+                            if (
+                                self._exact_cache_max > 0
+                                and size <= self.memory_max_bytes
+                                and self._make_room(size, retain_bytes=size)
+                            ):
+                                storage_copy = _clone_prompt_cache_for_apc(prompt_cache)
+                                if storage_copy is not None:
+                                    promote_key = _sequence_hash(
+                                        stored_tokens, extra_hash, self.block_size
+                                    )
+                                    with self.lock:
+                                        self.stats.exact_hits += 1
+                                        self.stats.disk_hits += 1
+                                        self.stats.hits += 1
+                                        self.stats.matched_tokens += disk_prefix_len
+                                        if promote_key not in self._exact_cache:
+                                            self._exact_cache[promote_key] = (
+                                                APCExactCacheEntry(
+                                                    token_ids=stored_tokens,
+                                                    extra_hash=int(extra_hash),
+                                                    prompt_cache=storage_copy,
+                                                )
                                             )
-                                        )
-                                        self._exact_cache.move_to_end(promote_key)
-                                        while (
-                                            len(self._exact_cache)
-                                            > self._exact_cache_max
-                                        ):
-                                            self._exact_cache.popitem(last=False)
-                                return prompt_cache, disk_prefix_len
-                        with self.lock:
-                            self.stats.exact_hits += 1
-                            self.stats.disk_hits += 1
-                            self.stats.hits += 1
-                            self.stats.matched_tokens += disk_prefix_len
-                        return prompt_cache, disk_prefix_len
+                                            self._exact_cache.move_to_end(promote_key)
+                                            while (
+                                                len(self._exact_cache)
+                                                > self._exact_cache_max
+                                            ):
+                                                self._exact_cache.popitem(last=False)
+                                    return prompt_cache, disk_prefix_len
+                            with self.lock:
+                                self.stats.exact_hits += 1
+                                self.stats.disk_hits += 1
+                                self.stats.hits += 1
+                                self.stats.matched_tokens += disk_prefix_len
+                            return prompt_cache, disk_prefix_len
 
         if source_cache is None:
             return None, 0
-        restore_bytes = int(
-            _cache_nbytes(source_cache) * max(1, prompt_capacity_tokens / prefix_len)
+        restore_bytes = self.memory_plan.restore_bytes(
+            source_cache, prefix_len, prompt_capacity_tokens
         )
         if not self._make_room(restore_bytes):
             with self.lock:
@@ -3534,7 +3513,9 @@ class APCManager:
             return False
         token_tuple = tuple(int(t) for t in token_ids)
         size = _cache_nbytes(prompt_cache)
-        self._observe_cache_size(size, len(token_tuple))
+        self._prefill_reserve_bytes = self.memory_plan.observe_cache(
+            prompt_cache, len(token_tuple), live_bytes=size
+        )
         if self.disk is not None:
             self.disk.flush()
         retain = (
@@ -3692,7 +3673,9 @@ class APCManager:
                 return None, 0
 
         warm_cache = make_warm_kv_cache_from_layers(keys, values, matched_tokens)
-        self._observe_cache_size(_cache_nbytes(warm_cache), matched_tokens)
+        self._prefill_reserve_bytes = self.memory_plan.observe_cache(
+            warm_cache, matched_tokens
+        )
         # Disk reads and warm-cache construction intentionally happen outside
         # the manager lock. If clear()/reset_stats() races here, the restored
         # tensors are still valid; only the hit counter lands in the new stats
@@ -3751,7 +3734,9 @@ class APCManager:
         Returns newly acquired blocks (caller must release).
         """
         size = _cache_nbytes(layer_keys + layer_values)
-        self._observe_cache_size(size, len(token_ids))
+        self._prefill_reserve_bytes = self.memory_plan.observe_kv(
+            layer_keys, layer_values, live_bytes=size
+        )
         # Reserve no more than the pool can retain. Larger requests continue
         # directly to disk once the byte budget is exhausted.
         per_token_bytes = size / max(1, layer_keys[0].shape[2]) if layer_keys else 0
@@ -3900,7 +3885,7 @@ class APCManager:
                 memory_slots -= 1
                 new_blocks.append(b)
                 self.stats.stores += 1
-                self.stats.served_tokens += self.block_size
+                self.stats.stored_tokens += self.block_size
                 parent = h
             if self.disk is not None and disk_blocks:
                 try:

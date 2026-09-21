@@ -65,7 +65,7 @@ The server exposes more than chat — cover or route to these as needed:
 - **Audio:** `/v1/audio/speech` (TTS), `/v1/audio/transcriptions` and `/v1/audio/translations` (STT).
 - **Images:** `/v1/images/generations` and `/v1/images/edits` (diffusion image models).
 - **Cache & metrics:** `/v1/cache/stats`, `/v1/cache/reset`, `/v1/metrics`.
-- **Models:** `/v1/models` lists models loaded by this process by default. Use `--model-discovery hf-cache` for shared Hugging Face cache discovery — see `Skill("mlx-vlm-skills:hf-cache-models")`.
+- **Models:** `/v1/models` lists loaded models and model candidates in the shared Hugging Face cache, with a `loaded` boolean indicating which are in memory — see `Skill("mlx-vlm-skills:hf-cache-models")`.
 
 Match the model kind to the endpoint (an image endpoint needs a diffusion/image model, audio endpoints need an audio model); a mismatch returns a clear 4xx, not a crash.
 
@@ -81,6 +81,6 @@ Match the model kind to the endpoint (an image endpoint needs a diffusion/image 
 ## Validation
 
 - For route/schema changes, run `uv run pytest mlx_vlm/tests/test_server.py -q`.
-- For structured output changes, include `uv run pytest mlx_vlm/tests/test_structured.py -q`.
-- For tool parser changes, add compact regressions to `TestProcessToolCalls` in `mlx_vlm/tests/test_server.py` and run the shared streaming tests in `test_responses_state.py`, plus any existing tests for affected parsers. Reuse consolidated tests instead of creating a new test file.
+- For structured output changes, include `uv run pytest mlx_vlm/tests/test_generate.py -q -k 'thinking_aware or json_schema'`.
+- For tool parser changes, add compact regressions to `TestProcessToolCalls` in `mlx_vlm/tests/test_server.py` and run the shared tool streaming tests in that module, plus any existing tests for affected parsers. Reuse consolidated tests instead of creating a new test file.
 - If the result is a user-facing bug report, switch to `Skill("mlx-vlm-skills:reproducible-github-issues")`.
