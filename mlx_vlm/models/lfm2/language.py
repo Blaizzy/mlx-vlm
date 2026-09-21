@@ -360,6 +360,7 @@ class LanguageModel(nn.Module):
         cache=None,
         input_embeddings: Optional[mx.array] = None,
         inputs_embeds: Optional[mx.array] = None,
+        logits_to_keep: int = 0,
         **kwargs,
     ) -> LanguageModelOutput:
         if inputs is None:
@@ -389,6 +390,8 @@ class LanguageModel(nn.Module):
             capture_layer_ids=capture_layer_ids,
             hidden_sink=hidden_sink,
         )
+        if logits_to_keep > 0:
+            out = out[:, -logits_to_keep:, :]
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:

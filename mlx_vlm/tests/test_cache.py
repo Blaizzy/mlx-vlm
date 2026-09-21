@@ -1925,6 +1925,28 @@ def embeddings(lm, tokens):
     return lm.model.embed_tokens(tokens) * getattr(lm.model, "embed_scale", 1)
 
 
+@parametrize("tied", [False, True])
+@parametrize("keep", [0, 1, 3])
+def test_lfm_trailing_logits_preserve_cache_and_hidden_states(tied, keep):
+    from mlx_vlm.models.lfm2.language import LanguageModel
+
+    _, config = apc_config("lfm2")
+    config.tie_word_embeddings = tied
+    lm = LanguageModel(config)
+    tokens = mx.array([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]])
+    full_cache, tail_cache = lm.make_cache(), lm.make_cache()
+    full = lm(tokens, cache=full_cache, capture_layer_ids=[0])
+    tail = lm(tokens, cache=tail_cache, logits_to_keep=keep, capture_layer_ids=[0])
+    assert mx.allclose(tail.logits, full.logits[:, -keep:], atol=1e-5).item()
+    assert tail.hidden_states[0].shape == full.hidden_states[0].shape
+    next_tokens = mx.array([[11], [12]])
+    assert mx.allclose(
+        lm(next_tokens, cache=tail_cache).logits,
+        lm(next_tokens, cache=full_cache).logits,
+        atol=1e-5,
+    ).item()
+
+
 @parametrize("prefill_step_size", [None, 4, 16, 32])
 def test_lfm_padded_prefill(prefix_manager, prefill_step_size):
     mx.random.seed(19)
