@@ -358,6 +358,126 @@ def _generation_batch(model, inputs=(5, 6), uids=None, **options):
 class TestBatchGenerator:
     """Tests for BatchGenerator class."""
 
+    @pytest.mark.parametrize(
+        "greedy,compute_logprobs,top_k",
+        [(True, False, 0), (True, True, 0), (True, False, 2), (False, False, 0)],
+    )
+    def test_sampling_normalizes_only_when_needed(
+        self, greedy, compute_logprobs, top_k
+    ):
+        model = FixedLogitModel()
+        model.make_cache = lambda: []
+        sampler = MagicMock(side_effect=lambda lp: mx.argmax(lp, axis=-1))
+        sampler.sample_target = None
+
+        def force_token(tokens, logits):
+            return mx.broadcast_to(mx.array([0.0, 0.0, 0.0, 10.0]), logits.shape)
+
+        batch = PromptProcessingBatch(
+            model=model,
+            uids=[0],
+            input_ids=[[4, 5]],
+            max_tokens=[2],
+            inputs_embeds=mx.zeros((1, 2, 4)),
+            prompt_kwargs={},
+            logits_processors=[[force_token]],
+            greedy_sampling=greedy,
+        )
+        with patch.object(mx, "logsumexp", wraps=mx.logsumexp) as normalize:
+            gen = batch.generate(
+                sampler,
+                lambda _: False,
+                compute_logprobs=compute_logprobs,
+                top_logprobs_k=top_k,
+            )
+            assert gen._next_tokens.tolist() == [3]
+            if compute_logprobs:
+                assert gen._next_lps.item() == pytest.approx(-0.00013624, abs=1e-6)
+            if top_k:
+                assert gen._next_top_idx.tolist()[0][-1] != 3
+                assert gen._next_top_idx.tolist()[0][0] == 3
+            assert [r.token for r in gen.next()] == [3]
+            assert gen._next_tokens.tolist() == [3]
+
+        expected_calls = 0 if greedy and not compute_logprobs and not top_k else 2
+        assert normalize.call_count == expected_calls
+        assert sampler.call_count == expected_calls
+        for call in sampler.call_args_list:
+            assert mx.exp(call.args[0]).sum().item() == pytest.approx(1, abs=1e-6)
+
+    @pytest.mark.parametrize("budget", [1, 2, 7, None])
+    @pytest.mark.parametrize("capacity", [1, 3])
+    def test_prefill_budget_and_partial_admission(
+        self, mock_processor, budget, capacity
+    ):
+        import mlx.nn as nn
+
+        calls = []
+
+        class Model(nn.Module):
+            def make_cache(self):
+                return [KVCache()]
+
+            def __call__(self, ids, cache=None, inputs_embeds=None, **kwargs):
+                calls.append((inputs_embeds is not None, ids.shape))
+                kv = mx.zeros((ids.shape[0], 1, ids.shape[1], 4))
+                cache[0].update_and_fetch(kv, kv)
+                return SimpleNamespace(
+                    logits=mx.broadcast_to(mx.array([0.0, 10.0, 0.0]), (*ids.shape, 3))
+                )
+
+        gen = BatchGenerator(
+            Model(),
+            mock_processor,
+            completion_batch_size=capacity,
+            prefill_batch_size=8,
+            prefill_step_size=budget,
+            compute_logprobs=False,
+        )
+
+        def insert(prompts, max_tokens):
+            return gen.insert(
+                prompts,
+                max_tokens=max_tokens,
+                prompt_kwargs=[
+                    {"inputs_embeds": mx.zeros((1, len(ids), 4))} for ids in prompts
+                ],
+            )
+
+        (first,) = insert([[4, 5]], 32)
+        for _ in range(3):
+            gen.next()
+            if len(gen._generation_batch):
+                break
+        assert gen._generation_batch.uids == [first]
+
+        # Requests arriving during decoding can use the remaining slots even
+        # when fewer than prefill_batch_size are available.
+        late = insert([[6] * 7, [7] * 5, [8] * 9], 2)
+        calls.clear()
+        _, responses = gen.next()
+        assert [r.uid for r in responses] == [first]
+        assert calls[0] == (False, (1, 1))
+        if capacity > 1:
+            assert any(is_prompt for is_prompt, _ in calls)
+
+        finished = {r.uid for r in responses if r.finish_reason}
+        for _ in range(120):
+            if not gen.has_work:
+                break
+            _, responses = gen.next()
+            finished.update(r.uid for r in responses if r.finish_reason)
+            assert len(gen._generation_batch) + len(gen._prompt_batch or []) <= capacity
+
+        assert not gen.has_work
+        assert finished == {first, *late}
+        assert gen.stats().prompt_tokens == 23
+        if budget is not None:
+            assert all(b * n <= budget for is_prompt, (b, n) in calls if is_prompt)
+        if capacity > 1 and budget != 1:
+            assert any(is_prompt and b > 1 for is_prompt, (b, _) in calls)
+        gen.close()
+
     def test_insert_with_max_tokens(self, mock_model, mock_processor):
         gen = BatchGenerator(
             model=mock_model.language_model, processor=mock_processor, max_tokens=50
@@ -1116,6 +1236,7 @@ def test_prompt_processing_requests_only_required_trailing_logits(
 
     final_input_width, final_kwargs = calls[-1]
     assert final_input_width == expected_input_width
+    assert all(kwargs["logits_to_keep"] == 1 for _, kwargs in calls[:-1])
     expected_keep = 1 if not right_padded or batch_size == 1 or chunks is None else 3
     assert final_kwargs["logits_to_keep"] == expected_keep
     assert gen_batch._next_tokens.tolist() == [row[-1] for row in input_ids]
@@ -1165,7 +1286,7 @@ def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
     bg._steps_counter = 0
     bg.completion_batch_size = 4
     bg.prefill_batch_size = 4
-    bg.prefill_step_size = 1
+    bg.prefill_step_size = 4
     bg.kv_bits = None
     bg.kv_group_size = 64
     bg.kv_quant_scheme = "affine"
@@ -1263,11 +1384,12 @@ def test_prompt_processing_batch_slices_native_mrope_position_ids():
     assert step_kwargs["position_ids"].tolist() == position_ids[:, :, :2].tolist()
 
 
-def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
+@pytest.mark.parametrize("budget,chunk_size", [(None, None), (8, 4)])
+def test_mixed_apc_batch_strips_private_kwargs_before_prefill(budget, chunk_size):
     bg = object.__new__(BatchGenerator)
     bg.apc_manager = object()
     bg.model = SimpleNamespace(layers=[object()])
-    bg.prefill_step_size = None
+    bg.prefill_step_size = budget
     bg.kv_bits = None
     bg.kv_group_size = 64
     bg.kv_quant_scheme = "affine"
@@ -1328,6 +1450,7 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
         batch = bg._build_mixed_prompt_batch(sequences)
 
     assert batch is not None
+    assert captured["prefill_step_size"] == chunk_size
     assert "_apc_tenant" not in captured["prompt_kwargs"]
     assert "_apc_image_hash" not in captured["prompt_kwargs"]
     assert "_apc_semantic_hash" not in captured["prompt_kwargs"]
