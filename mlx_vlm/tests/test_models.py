@@ -477,9 +477,6 @@ if DATA["version"] != 2:
 
 TINY_DEFAULTS = DATA["tiny_defaults"]
 TINY_MODELS = DATA["shared_configs"]
-# ``shared_configs`` enrolls a family in the shared speculative contracts, so a
-# family that only needs tiny configs for its own tests belongs here instead.
-TINY_PROFILES = TINY_MODELS | DATA["model_profiles"]
 
 
 def build_config(module, values, config_type="ModelConfig"):
@@ -606,10 +603,107 @@ def test_dense_model(name):
 
 def tiny_config(family, profile=None, **overrides):
     """Build a fresh tiny config, optionally selecting a named test profile."""
-    case = TINY_PROFILES[family]
+    case = TINY_MODELS[family]
     fields = TINY_DEFAULTS | case["config"] | case.get("profiles", {}).get(profile, {})
     module = importlib.import_module("mlx_vlm.models." + case["module"])
     return build_config(module, fields | overrides, case["config_type"])
+
+
+_DEEPSEEK_V41_BASE = {
+    "vocab_size": 64,
+    "hidden_size": 16,
+    "num_hidden_layers": 1,
+    "num_nextn_predict_layers": 0,
+    "num_attention_heads": 2,
+    "head_dim": 32,
+    "qk_rope_head_dim": 8,
+    "q_lora_rank": 8,
+    "o_lora_rank": 4,
+    "o_groups": 1,
+    "sliding_window": 4,
+    "compress_ratios": [0],
+    "kv_source_layer_ids": [],
+    "index_source_layer_ids": [],
+    "index_n_heads": 2,
+    "index_head_dim": 32,
+    "index_topk": 4,
+    "moe_intermediate_size": 8,
+    "n_routed_experts": 4,
+    "num_experts_per_tok": 2,
+    "hc_mult": 2,
+    "hc_sinkhorn_iters": 2,
+    "dspark_target_layer_ids": [],
+    "engram_layer_ids": [],
+    "engram_num_embeddings": [256],
+    "engram_max_ngram_size": 3,
+    "engram_vocab_size": 512,
+    "engram_n_heads": 2,
+    "engram_head_dim": 8,
+    "engram_compressed_vocab_size": 7,
+}
+
+_DEEPSEEK_V41_PROFILES = {
+    "sparse": {
+        "num_hidden_layers": 4,
+        "compress_ratios": [2, 2, 1, 0],
+        "kv_source_layer_ids": [0],
+        "index_source_layer_ids": [0, 1, 2],
+        "candidate_source_layer_id": 1,
+        "candidate_topk_blocks": 2,
+        "candidate_block_size": 2,
+    },
+    "stack": {
+        "hidden_size": 32,
+        "num_hidden_layers": 5,
+        "compress_ratios": [0, 2, 2, 1, 0],
+        "max_position_embeddings": 64,
+        "sliding_window": 8,
+        "qk_rope_head_dim": 4,
+        "o_lora_rank": 8,
+        "o_groups": 2,
+        "moe_intermediate_size": 16,
+        "kv_source_layer_ids": [1, 3],
+        "index_source_layer_ids": [1, 2],
+        "candidate_source_layer_id": 1,
+        "candidate_topk_blocks": 4,
+        "candidate_block_size": 2,
+        "dspark_target_layer_ids": [3],
+        "engram_layer_ids": [1],
+        "engram_num_embeddings": [1024],
+    },
+    "vision": {
+        "vision_hidden_size": 8,
+        "vision_num_layers": 1,
+        "vision_num_heads": 2,
+        "vision_intermediate_size": 16,
+        "vision_patch_size": 14,
+        "vision_downsample_ratio": 3,
+        "vision_min_pixels": 1,
+        "vision_max_image_tokens": 1024,
+    },
+    "splice": {
+        "vision_hidden_size": 16,
+        "vision_num_layers": 1,
+        "vision_num_heads": 2,
+        "vision_intermediate_size": 32,
+        "vision_patch_size": 2,
+        "vision_downsample_ratio": 3,
+    },
+}
+
+
+def deepseek_v41_config(profile=None, **overrides):
+    """Tiny deepseek_v41 config for its own op/sanitize/engram/vision tests.
+
+    Deliberately not a ``shared_configs`` entry: ``test_speculative`` parametrizes
+    over every shared family and deepseek_v41 ships no speculative drafter, so it
+    would enroll in contracts it cannot satisfy.
+    """
+    module = importlib.import_module("mlx_vlm.models.deepseek_v41")
+    fields = (
+        TINY_DEFAULTS | _DEEPSEEK_V41_BASE | _DEEPSEEK_V41_PROFILES.get(profile, {})
+    )
+    return build_config(module, fields | overrides, "ModelConfig")
 
 
 def test_gemma3_can_preserve_caller_supplied_embedding_scale():
@@ -1182,7 +1276,7 @@ class TestDeepseekV41Aligner(unittest.TestCase):
         """
         from mlx_vlm.models.deepseek_v41.vision import Aligner
 
-        config = tiny_config("deepseek_v41", "vision")
+        config = deepseek_v41_config("vision")
         aligner = Aligner(config)
         mx.eval(aligner.parameters())
 
@@ -1225,7 +1319,7 @@ class TestDeepseekV41Aligner(unittest.TestCase):
             prepare_vl_inputs,
         )
 
-        config = tiny_config("deepseek_v41", "vision")
+        config = deepseek_v41_config("vision")
         r = config.vision_downsample_ratio
         for size in ((896, 896), (640, 480), (128, 900), (42, 42)):
             image = Image.new("RGB", size, (10, 120, 200))
@@ -1722,8 +1816,7 @@ class TestDeepseekV41Config(unittest.TestCase):
 class TestDeepseekV41EndToEnd(unittest.TestCase):
     @staticmethod
     def _config():
-        return tiny_config(
-            "deepseek_v41",
+        return deepseek_v41_config(
             "sparse",
             num_hidden_layers=2,
             compress_ratios=[2, 1],
@@ -1763,7 +1856,7 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
 class TestDeepseekV41Sanitize(unittest.TestCase):
     @staticmethod
     def _config():
-        return tiny_config("deepseek_v41", hidden_size=8, o_groups=2, o_lora_rank=4)
+        return deepseek_v41_config(hidden_size=8, o_groups=2, o_lora_rank=4)
 
     def test_deepseek_v41_sanitize_checkpoint_keys(self):
         from mlx_vlm.models import deepseek_v41
@@ -1857,7 +1950,7 @@ class TestDeepseekV41VisionSplice(unittest.TestCase):
     def test_deepseek_v41_vision_splice(self):
         from mlx_vlm.models import deepseek_v41
 
-        model = deepseek_v41.Model(tiny_config("deepseek_v41", "splice"))
+        model = deepseek_v41.Model(deepseek_v41_config("splice"))
         mx.eval(model.parameters())
         model.image_start = mx.ones((16,))
         model.image_end = mx.ones((16,)) * 2
@@ -1881,7 +1974,7 @@ class TestDeepseekV41VisionSplice(unittest.TestCase):
     def test_deepseek_v41_decode_skips_vision(self):
         from mlx_vlm.models import deepseek_v41
 
-        model = deepseek_v41.Model(tiny_config("deepseek_v41", "splice"))
+        model = deepseek_v41.Model(deepseek_v41_config("splice"))
         mx.eval(model.parameters())
         ids = mx.array([[5]])
         result = model.get_input_embeddings(ids, pixel_values=[[self._image_record()]])
@@ -1901,7 +1994,7 @@ class TestDeepseekV41Engram(unittest.TestCase):
 
     @staticmethod
     def _config(**overrides):
-        return tiny_config("deepseek_v41", "stack", **overrides)
+        return deepseek_v41_config("stack", **overrides)
 
     @staticmethod
     def _with_hash_state(model, config):
@@ -2063,8 +2156,7 @@ class TestDeepseekV41TokenMap(unittest.TestCase):
         from mlx_vlm.models.deepseek_v41 import engram as engram_module
         from mlx_vlm.models.deepseek_v41.language import DeepseekV41Cache
 
-        config = tiny_config(
-            "deepseek_v41",
+        config = deepseek_v41_config(
             engram_layer_ids=[0],
             engram_num_embeddings=[1024],
             engram_vocab_size=64,

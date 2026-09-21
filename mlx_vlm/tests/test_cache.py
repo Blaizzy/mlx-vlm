@@ -72,7 +72,7 @@ from mlx_vlm.models.qwen4_exp.language import (
 )
 from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
 from mlx_vlm.models.z1t.language import AFTConv, Z1TCache
-from mlx_vlm.tests.test_models import DATA, build_config, tiny_config
+from mlx_vlm.tests.test_models import DATA, build_config, deepseek_v41_config
 from mlx_vlm.turboquant import (
     BatchTurboQuantKVCache,
     TurboQuantKVCache,
@@ -467,7 +467,7 @@ def test_deepseek_v41_cache_trim_replays_the_tokens_it_dropped():
     """
     from mlx_vlm.models.deepseek_v41.language import LanguageModel
 
-    config = tiny_config("deepseek_v41", "stack")
+    config = deepseek_v41_config("stack")
     model = LanguageModel(config)
     model.head.weight = mx.random.normal(model.head.weight.shape) * 0.05
     mx.eval(model.parameters())

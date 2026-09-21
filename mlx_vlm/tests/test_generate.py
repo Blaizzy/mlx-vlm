@@ -38,7 +38,7 @@ from mlx_vlm.models.cache import (
     RotatingKVCache,
 )
 from mlx_vlm.structured import ThinkingAwareLogitsProcessor
-from mlx_vlm.tests.test_models import tiny_config
+from mlx_vlm.tests.test_models import deepseek_v41_config
 from mlx_vlm.utils import StoppingCriteria, ThinkingBudgetCriteria, load_processor
 
 # Generation, sampling, stopping criteria, structured logits, and thinking state.
@@ -1744,8 +1744,7 @@ def test_generate_step_evaluates_cache_periodically(max_tokens, cache_evals):
 class TestDeepseekV41Generation:
     @staticmethod
     def _config():
-        return tiny_config(
-            "deepseek_v41",
+        return deepseek_v41_config(
             "sparse",
             num_hidden_layers=2,
             compress_ratios=[2, 1],

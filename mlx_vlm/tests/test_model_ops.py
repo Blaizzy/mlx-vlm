@@ -48,7 +48,7 @@ from mlx_vlm.quantization.one_bit import (
     one_bit_quantized_matmul,
     replace_one_bit_modules,
 )
-from mlx_vlm.tests.test_models import tiny_config
+from mlx_vlm.tests.test_models import deepseek_v41_config
 from mlx_vlm.utils import (
     _transform_modelopt_nvfp4_weights,
     get_model_and_args,
@@ -194,8 +194,7 @@ class TestIndexerGateUnchanged(unittest.TestCase):
 class TestDeepseekV41Indexer(unittest.TestCase):
     @staticmethod
     def _config():
-        return tiny_config(
-            "deepseek_v41",
+        return deepseek_v41_config(
             "sparse",
             num_hidden_layers=3,
             compress_ratios=[2, 2, 2],
@@ -254,8 +253,8 @@ class TestDeepseekV41Indexer(unittest.TestCase):
 class TestDeepseekV41Compressor(unittest.TestCase):
     @staticmethod
     def _config():
-        return tiny_config(
-            "deepseek_v41", num_hidden_layers=2, compress_ratios=[2, 1], head_dim=8
+        return deepseek_v41_config(
+            num_hidden_layers=2, compress_ratios=[2, 1], head_dim=8
         )
 
     def test_deepseek_v41_compressor_prefill_decode(self):
@@ -301,7 +300,7 @@ class TestDeepseekV41Attention(unittest.TestCase):
     def test_deepseek_v41_attention_modes(self):
         from mlx_vlm.models.deepseek_v41.language import DeepseekV41Attention
 
-        config = tiny_config("deepseek_v41", "sparse")
+        config = deepseek_v41_config("sparse")
         full = DeepseekV41Attention(config, 0)
         reindex = DeepseekV41Attention(config, 1)
         consumer = DeepseekV41Attention(config, 2)
@@ -323,7 +322,7 @@ class TestDeepseekV41Attention(unittest.TestCase):
             DeepseekV41Cache,
         )
 
-        config = tiny_config("deepseek_v41", "sparse")
+        config = deepseek_v41_config("sparse")
         layers = [DeepseekV41Attention(config, i) for i in range(4)]
         for layer in layers:
             mx.eval(layer.parameters())
@@ -356,7 +355,7 @@ class TestDeepseekV41Block(unittest.TestCase):
             make_identity_pre_mix,
         )
 
-        config = tiny_config("deepseek_v41", "sparse", engram_layer_ids=[1])
+        config = deepseek_v41_config("sparse", engram_layer_ids=[1])
         layout = EngramLayout.from_config(config)
         block0 = DeepseekV41Block(config, 0, layout)
         block1 = DeepseekV41Block(config, 1, layout)
@@ -400,7 +399,7 @@ class TestDeepseekV41MoE(unittest.TestCase):
     def test_deepseek_v41_moe_gate_vl_bias(self):
         from mlx_vlm.models.deepseek_v41.language import DeepseekV41MoEGate
 
-        gate = DeepseekV41MoEGate(tiny_config("deepseek_v41"))
+        gate = DeepseekV41MoEGate(deepseek_v41_config())
         mx.eval(gate.parameters())
         gate.weight = mx.broadcast_to(mx.arange(4, dtype=mx.float32)[:, None], (4, 16))
         gate.bias_vl = mx.array([0.0, 0.0, 0.0, 1e6], dtype=mx.float32)
@@ -419,7 +418,7 @@ class TestDeepseekV41MoE(unittest.TestCase):
     def test_deepseek_v41_moe_forward(self):
         from mlx_vlm.models.deepseek_v41.language import DeepseekV41MoE
 
-        moe = DeepseekV41MoE(tiny_config("deepseek_v41"))
+        moe = DeepseekV41MoE(deepseek_v41_config())
         mx.eval(moe.parameters())
         x = mx.random.normal((1, 3, 16))
         y = moe(x)
