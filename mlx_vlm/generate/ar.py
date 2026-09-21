@@ -1958,11 +1958,7 @@ class PromptProcessingBatch:
         ):
             if rows:
                 rows.pop(idx)
-        self._finished_prompt_logits = {
-            new: self._finished_prompt_logits[old]
-            for new, old in enumerate(keep)
-            if old in self._finished_prompt_logits
-        }
+        self._finished_prompt_logits.pop(uid, None)
         self._speculative_prefill.filter(keep)
         self._total_prompt_tokens = sum(self._suffix_lens)
 
@@ -2156,9 +2152,13 @@ class PromptProcessingBatch:
             ]
             logits = output.logits if hasattr(output, "logits") else output
             for i in finished_rows:
-                self._finished_prompt_logits[i] = mx.contiguous(mx.array(logits[i, -1]))
+                self._finished_prompt_logits[self.uids[i]] = mx.contiguous(
+                    mx.array(logits[i, -1])
+                )
         eval_targets = [c.state for c in self.prompt_cache]
-        eval_targets.extend(self._finished_prompt_logits[i] for i in finished_rows)
+        eval_targets.extend(
+            self._finished_prompt_logits[self.uids[i]] for i in finished_rows
+        )
         mx.async_eval(eval_targets)
         self._processed_prompt_columns += n
         if self._apc_coordinator is not None:
@@ -2212,7 +2212,7 @@ class PromptProcessingBatch:
             (
                 padding
                 for i, padding in enumerate(self._right_pad_per_row or [])
-                if i not in self._finished_prompt_logits
+                if self.uids[i] not in self._finished_prompt_logits
             ),
             default=0,
         )
@@ -2231,8 +2231,8 @@ class PromptProcessingBatch:
             logits = mx.stack(
                 [
                     (
-                        self._finished_prompt_logits[i]
-                        if i in self._finished_prompt_logits
+                        self._finished_prompt_logits[self.uids[i]]
+                        if self.uids[i] in self._finished_prompt_logits
                         else logits[i, logits.shape[1] - 1 - padding]
                     )
                     for i, padding in enumerate(self._right_pad_per_row)
