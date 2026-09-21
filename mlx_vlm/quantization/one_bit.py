@@ -456,14 +456,34 @@ class OneBitEmbedding(nn.Module):
         )
 
 
+def _component_bits(quantization: dict, path: str) -> Optional[int]:
+    """Bit width for a component-wide ``<component>_bits`` override on ``path``.
+
+    A checkpoint may set e.g. ``expert_bits`` beside the base ``bits`` to pack a
+    whole family of modules at a different width. Such a key applies when its
+    component name appears as a dotted segment of ``path`` (singular or plural).
+    The most specific (longest) matching component wins, so the result does not
+    depend on dict iteration order.
+    """
+    best_component = ""
+    best_bits: Optional[int] = None
+    for key, value in quantization.items():
+        if not key.endswith("_bits") or not isinstance(value, int):
+            continue
+        component = key[: -len("_bits")]
+        applies = f".{component}." in path or f".{component}s." in path
+        if applies and len(component) > len(best_component):
+            best_component, best_bits = component, value
+    return best_bits
+
+
 def _quantization_for_path(quantization: dict, path: str) -> dict:
     """Resolve the quantization settings a module path should be packed with.
 
-    Converters disagree on the layout. Per-module overrides appear either as
-    top-level keys or nested under ``modules``, and component-wide widths are
-    written as ``<component>_bits`` (``expert_bits``, ``engram_bits``) beside
-    the base ``bits``. An explicit per-module entry wins over a component-wide
-    one.
+    Per-module overrides appear either as top-level keys or nested under
+    ``modules``; config keys from the underlying text checkpoint omit the mlx-vlm
+    ``language_model.`` wrapper prefix that loaded module paths carry. An explicit
+    per-module entry wins over a component-wide ``<component>_bits`` width.
     """
     base = {
         key: quantization[key]
@@ -475,22 +495,14 @@ def _quantization_for_path(quantization: dict, path: str) -> dict:
 
     def lookup(key):
         entry = quantization.get(key)
-        if entry is None:
-            entry = modules.get(key)
-        return entry
+        return entry if entry is not None else modules.get(key)
 
-    for key, value in quantization.items():
-        if not key.endswith("_bits") or not isinstance(value, int):
-            continue
-        component = key[: -len("_bits")]
-        if f".{component}." in path or f".{component}s." in path:
-            base["bits"] = value
-            break
+    component_bits = _component_bits(quantization, path)
+    if component_bits is not None:
+        base["bits"] = component_bits
 
     per_layer = lookup(path)
     if per_layer is None and path.startswith("language_model."):
-        # Config keys from the underlying text checkpoint omit the mlx-vlm
-        # ``language_model.`` wrapper prefix that loaded module paths carry.
         per_layer = lookup(path[len("language_model.") :])
     if isinstance(per_layer, dict):
         base.update(per_layer)
