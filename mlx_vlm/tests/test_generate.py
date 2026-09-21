@@ -358,6 +358,53 @@ def _generation_batch(model, inputs=(5, 6), uids=None, **options):
 class TestBatchGenerator:
     """Tests for BatchGenerator class."""
 
+    @pytest.mark.parametrize(
+        "greedy,compute_logprobs,top_k",
+        [(True, False, 0), (True, True, 0), (True, False, 2), (False, False, 0)],
+    )
+    def test_sampling_normalizes_only_when_needed(
+        self, greedy, compute_logprobs, top_k
+    ):
+        model = FixedLogitModel()
+        model.make_cache = lambda: []
+        sampler = MagicMock(side_effect=lambda lp: mx.argmax(lp, axis=-1))
+        sampler.sample_target = None
+
+        def force_token(tokens, logits):
+            return mx.broadcast_to(mx.array([0.0, 0.0, 0.0, 10.0]), logits.shape)
+
+        batch = PromptProcessingBatch(
+            model=model,
+            uids=[0],
+            input_ids=[[4, 5]],
+            max_tokens=[2],
+            inputs_embeds=mx.zeros((1, 2, 4)),
+            prompt_kwargs={},
+            logits_processors=[[force_token]],
+            greedy_sampling=greedy,
+        )
+        with patch.object(mx, "logsumexp", wraps=mx.logsumexp) as normalize:
+            gen = batch.generate(
+                sampler,
+                lambda _: False,
+                compute_logprobs=compute_logprobs,
+                top_logprobs_k=top_k,
+            )
+            assert gen._next_tokens.tolist() == [3]
+            if compute_logprobs:
+                assert gen._next_lps.item() == pytest.approx(-0.00013624, abs=1e-6)
+            if top_k:
+                assert gen._next_top_idx.tolist()[0][-1] != 3
+                assert gen._next_top_idx.tolist()[0][0] == 3
+            assert [r.token for r in gen.next()] == [3]
+            assert gen._next_tokens.tolist() == [3]
+
+        expected_calls = 0 if greedy and not compute_logprobs and not top_k else 2
+        assert normalize.call_count == expected_calls
+        assert sampler.call_count == expected_calls
+        for call in sampler.call_args_list:
+            assert mx.exp(call.args[0]).sum().item() == pytest.approx(1, abs=1e-6)
+
     @pytest.mark.parametrize("phased", [False, True])
     @pytest.mark.parametrize("budget", [1, 2, 7, None])
     @pytest.mark.parametrize("capacity", [1, 3])
@@ -1196,6 +1243,7 @@ def test_prompt_processing_requests_only_required_trailing_logits(
 
     final_input_width, final_kwargs = calls[-1]
     assert final_input_width == expected_input_width
+    assert all(kwargs["logits_to_keep"] == 1 for _, kwargs in calls[:-1])
     expected_keep = 1 if not right_padded or batch_size == 1 or chunks is None else 3
     assert final_kwargs["logits_to_keep"] == expected_keep
     assert gen_batch._next_tokens.tolist() == [row[-1] for row in input_ids]

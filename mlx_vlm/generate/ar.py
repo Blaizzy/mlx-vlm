@@ -1069,6 +1069,19 @@ def _sample_with_positions(
     return sampler(logprobs)
 
 
+def _sample_batch_tokens(
+    logits, sampler, *, greedy, compute_logprobs, top_logprobs_k, positions
+):
+    """Normalize only when sampling or reporting probabilities requires it."""
+    if greedy and not compute_logprobs and top_logprobs_k == 0:
+        return mx.argmax(logits, axis=-1), None
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    tokens = _sample_with_positions(
+        sampler, logprobs, row_ids=[0] * logits.shape[0], positions=positions
+    )
+    return tokens, logprobs
+
+
 class GenerationBatch:
     """
     Batched token generator with double-buffered pipelining.
@@ -1232,11 +1245,12 @@ class GenerationBatch:
                 processed_logits.append(sample_logits)
             logits = mx.concatenate(processed_logits, axis=0)
 
-        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        sampled = _sample_with_positions(
+        sampled, logprobs = _sample_batch_tokens(
+            logits,
             self.sampler,
-            logprobs,
-            row_ids=[0] * len(self.uids),
+            greedy=self.greedy_sampling,
+            compute_logprobs=self.compute_logprobs,
+            top_logprobs_k=self.top_logprobs_k,
             positions=[n + 1 for n in self._num_tokens],
         )
 
@@ -2085,6 +2099,7 @@ class PromptProcessingBatch:
         prompt_kwargs = {
             **self._prompt_kwargs_for_step(n),
             **self._speculative_prefill.kwargs,
+            "logits_to_keep": 1,
         }
         output = self.model(
             self._input_ids[:, :n],
@@ -2198,11 +2213,12 @@ class PromptProcessingBatch:
                 processed_logits.append(sample_logits)
             logits = mx.concatenate(processed_logits, axis=0)
 
-        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        first_tokens = _sample_with_positions(
+        first_tokens, logprobs = _sample_batch_tokens(
+            logits,
             sampler,
-            logprobs,
-            row_ids=[0] * len(self.uids),
+            greedy=self.greedy_sampling,
+            compute_logprobs=compute_logprobs,
+            top_logprobs_k=top_logprobs_k,
             positions=[0] * len(self.uids),
         )
 
