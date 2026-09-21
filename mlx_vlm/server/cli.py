@@ -110,13 +110,6 @@ def main():
         "(default: %(default)s). Lower values reduce pauses in active streams.",
     )
     parser.add_argument(
-        "--background-prefill",
-        action="store_true",
-        default=False,
-        help="Experimentally overlap prefill with decoding on supported models. "
-        "Disabled by default; requires APC and speculative decoding to be off.",
-    )
-    parser.add_argument(
         "--log-progress-interval",
         type=int,
         default=get_log_progress_interval(),
@@ -331,8 +324,6 @@ def main():
         os.environ["MLX_VLM_MAX_NUM_SEQS"] = str(args.max_num_seqs)
     if args.prefill_step_size:
         os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
-    if args.background_prefill:
-        os.environ["MLX_VLM_BACKGROUND_PREFILL"] = "1"
     os.environ["MLX_VLM_LOG_PROGRESS_INTERVAL"] = str(args.log_progress_interval)
     os.environ["MLX_VLM_MAX_TOKENS"] = str(args.max_tokens)
     os.environ["MLX_VLM_ENABLE_THINKING"] = "1" if args.enable_thinking else "0"
