@@ -147,8 +147,8 @@ import mlx.core as mx
 from mlx_vlm import load
 from mlx_vlm.generate import (
     _dflash_rounds_batch,
-    _make_cache,
     generation_stream,
+    make_cache,
 )
 from mlx_vlm.speculative.drafters import load_drafter
 from mlx_vlm.prompt_utils import apply_chat_template
@@ -182,7 +182,7 @@ input_ids = mx.array(padded, dtype=mx.int32)
 B = len(prompts)
 
 # Create batch-aware caches and prefill
-prompt_cache = _make_cache(lm, [0] * B)
+prompt_cache = make_cache(lm, [0] * B)
 lm._position_ids = None
 lm._rope_deltas = None
 
