@@ -455,6 +455,37 @@ class ModelChecks:
         assert positions[0, 0, 0].item() == 15
 
 
+class SystemOneChecks:
+    """Reusable contracts for models that return typed decisions."""
+
+    def questions(self, module):
+        question = module._render_question(
+            {
+                "type": "choice",
+                "instructions": "Route this request",
+                "criteria": {"billing": "payments", "technical": None},
+            }
+        )
+        assert question["options"] == ["billing: payments", "technical"]
+        records = module._annotate([{"value": i} for i in range(8)])
+        assert records[7] == {"_index": 7, "value": 7}
+
+    def checkpoint_weights(self, module):
+        weights = {
+            "model.language_model.layers.0.input_layernorm.weight": mx.zeros((2,)),
+            "model.language_model.layers.0.linear_attn.conv1d.weight": mx.zeros(
+                (2, 3, 4)
+            ),
+            "lm_head.weight": mx.zeros((2, 2)),
+        }
+        mapped = module._mapped_weights(weights)
+        assert len(mapped) == 2
+        np.testing.assert_array_equal(
+            np.asarray(mapped["model.layers.0.input_layernorm.weight"]), [1, 1]
+        )
+        assert mapped["model.layers.0.linear_attn.conv1d.weight"].shape == (2, 4, 3)
+
+
 CONFIG_TYPES = {
     "text_config": "TextConfig",
     "vision_config": "VisionConfig",
@@ -577,9 +608,14 @@ def check_arguments(kind, case, model, config):
 
 @pytest.mark.parametrize("case", DATA["cases"], ids=lambda case: case["id"])
 def test_model_contract(case):
+    module = importlib.import_module("mlx_vlm.models." + case["module"])
+    if case.get("workflow") == "system_one":
+        checks = SystemOneChecks()
+        for kind in case["checks"]:
+            getattr(checks, kind)(module)
+        return
     if "multimodal" in case["checks"]:
         mx.random.seed(17)
-    module = importlib.import_module("mlx_vlm.models." + case["module"])
     config = build_config(module, case["config"])
     model = module.Model(config)
     checks = ModelChecks()

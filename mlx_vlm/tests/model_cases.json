@@ -2,6 +2,12 @@
   "version": 2,
   "cases": [
     {
+      "id": "decider2",
+      "module": "decider2.decider2",
+      "workflow": "system_one",
+      "checks": ["questions", "checkpoint_weights"]
+    },
+    {
       "id": "indic_ocr",
       "module": "indic_ocr",
       "config": {
