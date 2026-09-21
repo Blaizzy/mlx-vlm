@@ -1343,6 +1343,17 @@ class LanguageModel(nn.Module):
             "hc_head_fn": "model.hc_head.fn",
             "hc_head_base": "model.hc_head.base",
             "hc_head_scale": "model.hc_head.scale",
+            # `normalize_checkpoint_key` drops the leading `model.` from every
+            # key and only restores it for the embedding weight, so a
+            # checkpoint already written in the Transformers namespace arrives
+            # here with these five stripped and nothing puts them back.
+            "embed.scales": "model.embed_tokens.scales",
+            "embed.biases": "model.embed_tokens.biases",
+            "embed_tokens.scales": "model.embed_tokens.scales",
+            "embed_tokens.biases": "model.embed_tokens.biases",
+            "hc_head.fn": "model.hc_head.fn",
+            "hc_head.base": "model.hc_head.base",
+            "hc_head.scale": "model.hc_head.scale",
         }
         for old, new in top_remap.items():
             if old in weights:

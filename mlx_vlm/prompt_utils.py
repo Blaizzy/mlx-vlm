@@ -49,6 +49,7 @@ MODEL_CONFIG = {
     "qwen3_vl_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "mage_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_5": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "prism_hadamard_qwen35": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_5_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen4_exp": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_omni_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
@@ -159,7 +160,7 @@ def extract_text_from_content(content: Any) -> str:
             if isinstance(item, dict):
                 item_type = item.get("type", "")
                 # Extract text from text-type items
-                if item_type in ("text", "input_text"):
+                if item_type in ("text", "input_text", "output_text"):
                     text = item.get("text", "") or item.get("content", "")
                     if text:
                         text_parts.append(text)
@@ -298,6 +299,7 @@ class MessageFormatter:
             "mage_vl",
             "qwen3_vl_moe",
             "qwen3_5",
+            "prism_hadamard_qwen35",
             "qwen3_5_moe",
             "qwen4_exp",
             "qwen3_omni_moe",

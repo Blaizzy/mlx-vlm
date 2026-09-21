@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from bisect import bisect_right
+from dataclasses import replace
 from functools import lru_cache
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -11,7 +12,14 @@ import mlx.nn as nn
 
 from ...speculative.cache_state import start_speculative_cache
 from ..base import LanguageModelOutput
-from ..cache import ArraysCache, BatchKVCache, KVCache, QuantizedKVCache, dynamic_roll
+from ..cache import (
+    ArraysCache,
+    BatchKVCache,
+    KVCache,
+    QuantizedKVCache,
+    _kv_memory_profile,
+    dynamic_roll,
+)
 from ..quantized_verifier import (
     singleton_quantized_linear,
     supports_optimized_affine_head,
@@ -63,8 +71,29 @@ def _append_indexer_positions(
     return mx.concatenate([cached, position_ids], axis=-1)
 
 
+def _qsa_memory_profile(c, token_count):
+    profile = _kv_memory_profile(getattr(c, "kv_cache", c), token_count)
+    length = 0 if c.index_keys is None else c.index_keys.shape[1]
+    index_bytes = 0
+    if length:
+        key_bytes = c.index_keys.nbytes / length
+        position_bytes = c.index_position_ids.nbytes / length
+        # Until the compression ratio is known, allow one summary per key.
+        block_bytes = key_bytes / (c.index_block_ratio or 1)
+        index_bytes = key_bytes + position_bytes + block_bytes
+    return replace(
+        profile,
+        source_bytes=c.nbytes,
+        fixed_bytes=math.ceil((profile.step - 1) * profile.bytes_per_token),
+        bytes_per_token=profile.bytes_per_token + index_bytes,
+        step=1,
+    )
+
+
 class QSAKVCache(KVCache):
     """KV cache with the raw indexer keys and multimodal positions used by QSA."""
+
+    memory_profile = _qsa_memory_profile
 
     # Hybrid/TurboQuant caches do not currently expose a way to carry the
     # indexer's unprojected keys. Uniform quantization uses the specialized
@@ -250,6 +279,7 @@ class QSAKVCache(KVCache):
 class BatchQSAKVCache:
     """Batch KV cache that keeps QSA keys and text/MRoPE positions aligned."""
 
+    memory_profile = _qsa_memory_profile
     step = BatchKVCache.step
 
     def __init__(self, left_padding):
@@ -599,6 +629,7 @@ class BatchQSAKVCache:
 class QSAQuantizedKVCache(QuantizedKVCache):
     """Uniformly quantized QSA cache that retains float indexer state."""
 
+    memory_profile = _qsa_memory_profile
     preserve_auxiliary_kv_state = True
 
     def __init__(self, group_size: int = 64, bits: int = 8):

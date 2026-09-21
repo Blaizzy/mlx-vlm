@@ -188,6 +188,11 @@ def _model_types_from_class_name(class_name: str) -> tuple[str, ...]:
     candidates: list[str] = []
     for end in range(1, len(tokens) + 1):
         _add_model_type(candidates, "_".join(tokens[:end]))
+        if end > 1:
+            # Preserve mixed-case acronyms such as LLaDA in LLaDAImagePipeline.
+            _add_model_type(
+                candidates, "".join(tokens[: end - 1]) + "_" + tokens[end - 1]
+            )
     for token in tokens:
         _add_model_type(candidates, token)
     return tuple(candidates)

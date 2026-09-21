@@ -133,8 +133,8 @@ class Model(nn.Module):
                 key = "vision_tower." + key[len("model.visual.") :]
             elif key.startswith("model.language_model."):
                 key = "language_model.model." + key[len("model.language_model.") :]
-            elif key == "lm_head.weight":
-                key = "language_model.lm_head.weight"
+            elif key.startswith("lm_head."):
+                key = "language_model." + key
             remapped[key] = value
 
         remapped = self.language_model.sanitize(remapped)

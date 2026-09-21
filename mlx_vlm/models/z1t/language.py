@@ -16,6 +16,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import LanguageModelOutput
+from ..cache import CacheMemory, cache_nbytes
 from .config import ModelConfig
 
 
@@ -92,6 +93,10 @@ class Z1TCache:
         self.cum_eK = None
         self.win_eKV = None
         self.win_eK = None
+
+    def memory_profile(self, token_count):
+        size = cache_nbytes(self.state)
+        return CacheMemory(source_bytes=size, fixed_bytes=size)
 
     # APC prefix-cache contract: snapshot/restore the streaming state so a
     # reused prefix restores the pool sums and conv window (auto-detected as a

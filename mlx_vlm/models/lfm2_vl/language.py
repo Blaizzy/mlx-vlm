@@ -1,34 +1,20 @@
-from typing import Optional
-
-import mlx.core as mx
-import mlx.nn as nn
-
-from ..base import LanguageModelOutput
-from ..cache import ArraysCache, KVCache
-from ..lfm2.language import Lfm2Model
-from .config import TextConfig
+from ..lfm2.language import LanguageModel as Lfm2LanguageModel
 
 
-class LanguageModel(nn.Module):
-    def __init__(self, config: TextConfig):
-        super().__init__()
-        self.config = config
-        self.model_type = config.model_type
-        self.model = Lfm2Model(config)
+class LanguageModel(Lfm2LanguageModel):
+    """LFM2-VL language tower.
 
-    def __call__(
-        self,
-        inputs: mx.array,
-        mask: mx.array = None,
-        cache=None,
-        inputs_embeds: Optional[mx.array] = None,
-        **kwargs,
-    ):
-        out = self.model(inputs, cache, inputs_embeds)
-        out = self.model.embed_tokens.as_linear(out)
-        return LanguageModelOutput(out)
+    Reuses the text LFM2 ``LanguageModel`` so speculative decoding support
+    (``capture_layer_ids`` hidden-state taps, ``speculative_verify`` exact
+    verification, and conv-state cache rollback) works with the VL target.
+    Only checkpoint key handling differs: VL weights carry the
+    ``language_model.`` prefix.
+    """
 
     def sanitize(self, weights):
+        if self.config.tie_word_embeddings:
+            weights.pop("language_model.lm_head.weight", None)
+
         sanitized_weights = {}
         for name, param in weights.items():
             if "conv.weight" in name:
@@ -37,13 +23,3 @@ class LanguageModel(nn.Module):
 
             sanitized_weights[name] = param
         return sanitized_weights
-
-    @property
-    def layers(self):
-        return self.model.layers
-
-    def make_cache(self):
-        return [
-            KVCache() if l.is_attention_layer else ArraysCache(size=1)
-            for l in self.layers
-        ]
