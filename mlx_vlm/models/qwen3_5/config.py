@@ -110,7 +110,7 @@ class TextConfig(BaseModelConfig):
 @dataclass
 class ModelConfig(BaseModelConfig):
     text_config: TextConfig
-    vision_config: Optional[VisionConfig]
+    vision_config: VisionConfig
     model_type: str
     ignore_index: int = -100
     image_token_id: int = 248056
@@ -147,12 +147,7 @@ class ModelConfig(BaseModelConfig):
         params["vision_config"] = _maybe_deserialize_config(
             VisionConfig, params.get("vision_config")
         )
-        text_params = params.get("text_config")
-        if text_params is None:
-            # Text-only checkpoints such as qwen3_5_text carry the decoder
-            # fields at the top level instead of nesting them.
-            text_params = params
         params["text_config"] = _maybe_deserialize_config(
-            TextConfig, text_params, require_all_fields=True
+            TextConfig, params.get("text_config"), require_all_fields=True
         )
         return cls(**_config_kwargs(cls, params))
