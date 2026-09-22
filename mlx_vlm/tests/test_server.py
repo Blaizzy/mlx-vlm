@@ -113,6 +113,11 @@ class _HarmonyResponseTemplateTokenizer:
         return ResponseParser(self.response_template, prefix=prefix)
 
 
+def _harmony_processor():
+    """A processor prepared exactly as the gpt-oss loader prepares it."""
+    return _attach_harmony_template(NS(tokenizer=_HarmonyResponseTemplateTokenizer()))
+
+
 def _msg(content="Hello", role="user", **extra):
     return dict(role=role, content=content, **extra)
 
@@ -2671,23 +2676,19 @@ _HARMONY_ANALYSIS_COMMENTARY_FINAL = (
     ],
 )
 def test_harmony_split(text, expected):
-    processor = NS(tokenizer=_HarmonyResponseTemplateTokenizer())
-    assert server._split_thinking(text, processor=processor) == expected
+    assert server._split_thinking(text, processor=_harmony_processor()) == expected
 
 
 def test_harmony_split_joins_reasoning_channels():
-    processor = NS(tokenizer=_HarmonyResponseTemplateTokenizer())
     reasoning, content = server._split_thinking(
-        _HARMONY_ANALYSIS_COMMENTARY_FINAL, processor=processor
+        _HARMONY_ANALYSIS_COMMENTARY_FINAL, processor=_harmony_processor()
     )
     assert content == "Answer."
     assert "Think A." in reasoning and "Meta B." in reasoning
 
 
 def test_harmony_response_template_stream():
-    state = server.make_response_stream_state(
-        NS(tokenizer=_HarmonyResponseTemplateTokenizer())
-    )
+    state = server.make_response_stream_state(_harmony_processor())
     deltas = _feed_thinking(
         state,
         [

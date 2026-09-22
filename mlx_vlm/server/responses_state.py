@@ -359,23 +359,6 @@ def _clean_reasoning(reasoning: str, start_marker: str) -> str:
     return reasoning.strip()
 
 
-def _join_parsed_field(value):
-    """Collapse a response-template field to a string.
-
-    A field with `repeats` (e.g. gpt-oss's analysis + commentary channels both
-    mapping to `reasoning_content`) parses to a list; join it so downstream code
-    that expects a string keeps working.
-    """
-    if isinstance(value, (list, tuple)):
-        parts = [
-            str(item).strip()
-            for item in value
-            if item is not None and str(item).strip()
-        ]
-        return "\n".join(parts) if parts else None
-    return value
-
-
 def _split_thinking(
     text: str,
     thinking_start_token: Optional[str] = None,
@@ -395,10 +378,8 @@ def _split_thinking(
                 or "reasoning" in parsed
                 or "reasoning_content" in parsed
             ):
-                reasoning = _join_parsed_field(
-                    parsed.get("reasoning_content") or parsed.get("reasoning")
-                )
-                content = _join_parsed_field(parsed.get("content"))
+                reasoning = parsed.get("reasoning_content") or parsed.get("reasoning")
+                content = parsed.get("content")
                 if reasoning is None or isinstance(reasoning, str):
                     if content is None or isinstance(content, str):
                         return (
