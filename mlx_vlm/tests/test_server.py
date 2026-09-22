@@ -43,6 +43,10 @@ from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.generate import GenerationResult
 from mlx_vlm.generate.image import ImageGenerationResult
 from mlx_vlm.models.cache import KVCache
+from mlx_vlm.models.gpt_oss.processing_gpt_oss import (
+    HARMONY_RESPONSE_TEMPLATE,
+    _attach_harmony_template,
+)
 from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.server import GenerationArguments as Args
 from mlx_vlm.server import ResponseGenerator as Generator
@@ -91,6 +95,16 @@ _MUSE_RESPONSE_TEMPLATE = {
 
 class _MuseResponseTemplateTokenizer:
     response_template = _MUSE_RESPONSE_TEMPLATE
+
+    def parse_response(self, response, prefix=None):
+        return parse_response(response, self.response_template, prefix=prefix)
+
+    def get_response_parser(self, prefix=None):
+        return ResponseParser(self.response_template, prefix=prefix)
+
+
+class _HarmonyResponseTemplateTokenizer:
+    response_template = HARMONY_RESPONSE_TEMPLATE
 
     def parse_response(self, response, prefix=None):
         return parse_response(response, self.response_template, prefix=prefix)
@@ -2633,6 +2647,67 @@ def test_response_template_thinking_stream():
     )
     assert _thoughts(deltas) == ("Muse reasoning.", "Muse answer.")
     assert any(delta.thinking_closed for delta in deltas)
+
+
+_HARMONY_ANALYSIS_FINAL = (
+    "<|channel|>analysis<|message|>We need to respond.<|end|>"
+    "<|start|>assistant<|channel|>final<|message|>Hello!"
+)
+_HARMONY_ANALYSIS_COMMENTARY_FINAL = (
+    "<|channel|>analysis<|message|>Think A.<|end|>"
+    "<|start|>assistant<|channel|>commentary<|message|>Meta B.<|end|>"
+    "<|start|>assistant<|channel|>final<|message|>Answer."
+)
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        (_HARMONY_ANALYSIS_FINAL, ("We need to respond.", "Hello!")),
+        (
+            "<|start|>assistant<|channel|>final<|message|>Just the answer.",
+            (None, "Just the answer."),
+        ),
+    ],
+)
+def test_harmony_split(text, expected):
+    processor = NS(tokenizer=_HarmonyResponseTemplateTokenizer())
+    assert server._split_thinking(text, processor=processor) == expected
+
+
+def test_harmony_split_joins_reasoning_channels():
+    processor = NS(tokenizer=_HarmonyResponseTemplateTokenizer())
+    reasoning, content = server._split_thinking(
+        _HARMONY_ANALYSIS_COMMENTARY_FINAL, processor=processor
+    )
+    assert content == "Answer."
+    assert "Think A." in reasoning and "Meta B." in reasoning
+
+
+def test_harmony_response_template_stream():
+    state = server.make_response_stream_state(
+        NS(tokenizer=_HarmonyResponseTemplateTokenizer())
+    )
+    deltas = _feed_thinking(
+        state,
+        [
+            "<|channel|>analysis<|mes",
+            "sage|>We need to respond.<|end|><|start|>assistant",
+            "<|channel|>final<|message|>Hello!",
+        ],
+        last=True,
+    )
+    assert _thoughts(deltas) == ("We need to respond.", "Hello!")
+
+
+@pytest.mark.parametrize(
+    "existing,expected",
+    [(None, HARMONY_RESPONSE_TEMPLATE), ({"kept": True}, {"kept": True})],
+)
+def test_attach_harmony_template(existing, expected):
+    tokenizer = NS(response_template=existing)
+    _attach_harmony_template(NS(tokenizer=tokenizer))
+    assert tokenizer.response_template == expected
 
 
 def test_kv_bits_independent_of_model_path(monkeypatch):
