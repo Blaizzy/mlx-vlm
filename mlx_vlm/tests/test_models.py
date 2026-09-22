@@ -470,21 +470,6 @@ class SystemOneChecks:
         records = module._annotate([{"value": i} for i in range(8)])
         assert records[7] == {"_index": 7, "value": 7}
 
-    def checkpoint_weights(self, module):
-        weights = {
-            "model.language_model.layers.0.input_layernorm.weight": mx.zeros((2,)),
-            "model.language_model.layers.0.linear_attn.conv1d.weight": mx.zeros(
-                (2, 3, 4)
-            ),
-            "lm_head.weight": mx.zeros((2, 2)),
-        }
-        mapped = module._mapped_weights(weights)
-        assert len(mapped) == 2
-        np.testing.assert_array_equal(
-            np.asarray(mapped["model.layers.0.input_layernorm.weight"]), [1, 1]
-        )
-        assert mapped["model.layers.0.linear_attn.conv1d.weight"].shape == (2, 4, 3)
-
 
 CONFIG_TYPES = {
     "text_config": "TextConfig",

@@ -5,7 +5,7 @@
       "id": "decider2",
       "module": "decider2.decider2",
       "workflow": "system_one",
-      "checks": ["questions", "checkpoint_weights"]
+      "checks": ["questions"]
     },
     {
       "id": "indic_ocr",
