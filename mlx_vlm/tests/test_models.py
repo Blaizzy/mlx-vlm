@@ -1244,6 +1244,44 @@ def test_mimo_v2_unfuses_qkv_by_tensor_parallel_shard():
             )
 
 
+def test_mimo_v2_keeps_only_the_requested_trailing_logits():
+    """Chunked prefill passes ``logits_to_keep=1``; lm_head must honor it.
+
+    Without the hint the head runs over every prompt position, so a prefill
+    step materializes a [B, T, vocab] tensor it immediately discards.
+    """
+    module = importlib.import_module("mlx_vlm.models.mimo_v2")
+    text = module.TextConfig(
+        hidden_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        v_head_dim=8,
+        swa_num_attention_heads=4,
+        swa_num_key_value_heads=2,
+        swa_head_dim=8,
+        swa_v_head_dim=8,
+        partial_rotary_factor=0.5,
+        hybrid_layer_pattern=[0, 1],
+        moe_layer_freq=[0, 0],
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+        vocab_size=16,
+        intermediate_size=64,
+        moe_intermediate_size=32,
+    )
+    language = module.language.LanguageModel(text)
+    inputs = mx.zeros((2, 6), dtype=mx.int32)
+
+    full = language(inputs).logits
+    assert full.shape == (2, 6, text.vocab_size)
+
+    kept = language(inputs, logits_to_keep=1).logits
+    assert kept.shape == (2, 1, text.vocab_size)
+    assert mx.allclose(kept, full[:, -1:, :])
+
+
 def test_glm_quantized_head_sanitization_loads_strictly():
     module = importlib.import_module("mlx_vlm.models.glm5_next")
     model = module.Model(

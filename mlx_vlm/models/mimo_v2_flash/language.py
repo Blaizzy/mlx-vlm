@@ -260,9 +260,17 @@ class LanguageModel(nn.Module):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def __call__(
-        self, inputs: mx.array, cache=None, inputs_embeds=None, mask=None, **kwargs
+        self,
+        inputs: mx.array,
+        cache=None,
+        inputs_embeds=None,
+        mask=None,
+        logits_to_keep: Optional[int] = None,
+        **kwargs,
     ):
         out = self.model(inputs, cache, inputs_embeds=inputs_embeds)
+        if logits_to_keep:
+            out = out[:, -int(logits_to_keep) :, :]
         out = self.lm_head(out)
         return LanguageModelOutput(logits=out)
 
