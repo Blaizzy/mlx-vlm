@@ -118,6 +118,7 @@ MODEL_CONFIG = {
     "deepseek_v4": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "hrm_text": MessageFormat.TEXT_ONLY,
     "minimax_m3": MessageFormat.TEXT_ONLY,
+    "qwen3_5_text": MessageFormat.TEXT_ONLY,
 }
 
 # Models that don't support multi-image
