@@ -53,21 +53,50 @@ class Model(nn.Module):
         # on reload would produce language_model.language_model.*
         if any(k.startswith("language_model.") for k in weights):
             return weights
-        # The vision and audio towers are not ported yet, so their weights are
-        # dropped rather than loaded. Remove this once vision.py lands.
-        weights = {
-            k: v
-            for k, v in weights.items()
-            if not k.startswith(
-                ("visual.", "audio_encoder.", "audio_tokenizer.", "speech_embeddings.")
-            )
+
+        vision, language = {}, {}
+        for key, value in weights.items():
+            # the audio tower and speech embeddings have no modules yet
+            if key.startswith(("audio_encoder.", "speech_embeddings.")):
+                continue
+            if key.startswith("visual."):
+                vision[key[len("visual.") :]] = value
+            else:
+                language[key] = value
+
+        sanitized = {
+            f"language_model.{k}": v
+            for k, v in self.language_model.sanitize(language).items()
         }
-        weights = self.language_model.sanitize(weights)
-        return {f"language_model.{k}": v for k, v in weights.items()}
+        if self.vision_tower is not None:
+            sanitized.update(
+                {
+                    f"vision_tower.{k}": v
+                    for k, v in self.vision_tower.sanitize(vision).items()
+                }
+            )
+        return sanitized
 
     @property
     def layers(self):
         return self.language_model.layers
+
+    @property
+    def quant_predicate(self):
+        """Quantize each half of the checkpoint on the grid it came from.
+
+        The routed experts ship as MXFP4 with block 32, so re-using that grid
+        is bit-exact; re-quantizing them affine costs ~12% per tensor. The
+        dense projections come from block-FP8 instead, where 4 bits cost ~13%
+        and 8-bit affine costs ~0.8%.
+        """
+
+        def predicate(path, module):
+            if "switch_mlp" in path:
+                return {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+            return {"group_size": 64, "bits": 8, "mode": "affine"}
+
+        return predicate
 
     @property
     def cast_predicate(self):

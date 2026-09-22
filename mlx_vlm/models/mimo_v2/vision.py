@@ -27,7 +27,7 @@ class PatchEmbed(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
         self.patch_dim = (
-            config.in_chans * config.temporal_patch_size * config.patch_size**2
+            config.in_channels * config.temporal_patch_size * config.patch_size**2
         )
         self.proj = nn.Linear(self.patch_dim, config.hidden_size, bias=False)
 

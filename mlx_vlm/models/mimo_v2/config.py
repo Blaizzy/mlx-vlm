@@ -15,7 +15,7 @@ class VisionConfig(BaseModelConfig):
     num_heads: int = 32
     num_key_value_heads: int = 8
     num_query_groups: int = 4
-    in_chans: int = 3
+    in_channels: int = 3
     patch_size: int = 16
     spatial_patch_size: int = 16
     spatial_merge_size: int = 2
@@ -106,9 +106,9 @@ class TextConfig(BaseModelConfig):
 
 @dataclass
 class ModelConfig(BaseModelConfig):
-    text_config: TextConfig
-    vision_config: VisionConfig
-    audio_config: AudioConfig
+    text_config: TextConfig = field(default_factory=TextConfig)
+    vision_config: VisionConfig = field(default_factory=VisionConfig)
+    audio_config: AudioConfig = field(default_factory=AudioConfig)
     model_type: str = "mimo_v2"
     vocab_size: int = 152576
     image_token_id: int = 151655
@@ -135,6 +135,9 @@ class ModelConfig(BaseModelConfig):
             }
         params = dict(params)
         params["text_config"] = TextConfig.from_dict(params["text_config"])
-        params["vision_config"] = VisionConfig.from_dict(params.get("vision_config"))
+        vision = dict(params.get("vision_config") or {})
+        if "in_chans" in vision:
+            vision.setdefault("in_channels", vision.pop("in_chans"))
+        params["vision_config"] = VisionConfig.from_dict(vision)
         params["audio_config"] = AudioConfig.from_dict(params.get("audio_config"))
         return super().from_dict(params)
