@@ -1286,30 +1286,28 @@ class GenerationBatch:
     def _eval_pending_state(self):
         """Materialize lazy decode outputs before mutating batch-owned state."""
         targets = []
+        stack = [
+            self._current_tokens,
+            self._current_lps,
+            self._next_tokens,
+            self._next_lps,
+            self._next_top_idx,
+            self._next_top_lp,
+            self._rope_deltas,
+        ]
+        for c in self.prompt_cache:
+            try:
+                stack.append(c.state)
+            except (AttributeError, TypeError):
+                pass
 
-        def append_arrays(value):
+        # Recursing through a local closure would retain targets in a cycle.
+        while stack:
+            value = stack.pop()
             if isinstance(value, mx.array):
                 targets.append(value)
             elif isinstance(value, (list, tuple)):
-                for item in value:
-                    append_arrays(item)
-
-        append_arrays(
-            (
-                self._current_tokens,
-                self._current_lps,
-                self._next_tokens,
-                self._next_lps,
-                self._next_top_idx,
-                self._next_top_lp,
-                self._rope_deltas,
-            )
-        )
-        for c in self.prompt_cache:
-            try:
-                append_arrays(c.state)
-            except (AttributeError, TypeError):
-                pass
+                stack.extend(value)
 
         if targets:
             mx.eval(*targets)

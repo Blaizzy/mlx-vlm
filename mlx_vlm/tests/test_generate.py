@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import contextlib
+import gc
 import importlib
 import logging
 import sys
 import types
+import weakref
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -268,6 +270,66 @@ class TestGenerationBatch:
         batch.filter([0])
 
         assert calls == [("eval", (0, 1)), ("filter-cache", [0])]
+
+    def test_filter_releases_pending_arrays_without_cyclic_gc(self):
+        batch = self._mrope_batch([0], [[0]])
+        pending_fields = (
+            "_current_tokens",
+            "_current_lps",
+            "_next_tokens",
+            "_next_lps",
+            "_next_top_idx",
+            "_next_top_lp",
+            "_rope_deltas",
+        )
+        for field in pending_fields:
+            setattr(batch, field, mx.ones((1, 2)))
+        batch.prompt_cache = [
+            SimpleNamespace(state=(mx.ones((1, 2, 3, 4)), [mx.zeros((1, 2, 3, 4))]))
+        ]
+        refs = [weakref.ref(getattr(batch, field)) for field in pending_fields]
+        refs.extend(
+            (
+                weakref.ref(batch.prompt_cache[0].state[0]),
+                weakref.ref(batch.prompt_cache[0].state[1][0]),
+            )
+        )
+
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            batch.filter([])
+            assert all(ref() is None for ref in refs)
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+            gc.collect()
+
+    def test_eval_pending_state_materializes_nested_arrays(self, monkeypatch):
+        batch = self._mrope_batch([0], [[0]])
+        batch._next_tokens = mx.array([5]) + 1
+        batch.prompt_cache = [
+            SimpleNamespace(state=(mx.array([1]) + 2, [None, mx.array([3]) + 4])),
+            SimpleNamespace(),
+        ]
+        expected = (
+            batch._next_tokens,
+            batch._rope_deltas,
+            batch.prompt_cache[0].state[0],
+            batch.prompt_cache[0].state[1][1],
+        )
+        evaluated = []
+        original_eval = mx.eval
+
+        def record_eval(*arrays):
+            evaluated.extend(id(array) for array in arrays)
+            original_eval(*arrays)
+
+        monkeypatch.setattr(mx, "eval", record_eval)
+        batch._eval_pending_state()
+        assert set(evaluated) == {id(array) for array in expected}
+        assert len(evaluated) == len(expected)
+        assert [array.tolist() for array in expected] == [[6], [[0]], [3], [7]]
 
     @staticmethod
     def _capture(value, B):
