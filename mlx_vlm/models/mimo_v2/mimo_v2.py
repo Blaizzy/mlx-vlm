@@ -49,24 +49,17 @@ class Model(nn.Module):
         )
 
     def sanitize(self, weights):
+        # The vision and audio towers are not ported yet, so their weights are
+        # dropped rather than loaded. Remove this once vision.py lands.
         weights = {
-            (
-                k.replace("model.vision_tower.", "vision_tower.")
-                if k.startswith("model.vision_tower.")
-                else k
-            ): v
+            k: v
             for k, v in weights.items()
+            if not k.startswith(
+                ("visual.", "audio_encoder.", "audio_tokenizer.", "speech_embeddings.")
+            )
         }
-        language_weights = {
-            k: v for k, v in weights.items() if not k.startswith("vision_tower.")
-        }
-        vision_weights = {
-            k: v for k, v in weights.items() if k.startswith("vision_tower.")
-        }
-        language_weights = self.language_model.sanitize(language_weights)
-        sanitized = {f"language_model.{k}": v for k, v in language_weights.items()}
-        sanitized.update(vision_weights)
-        return sanitized
+        weights = self.language_model.sanitize(weights)
+        return {f"language_model.{k}": v for k, v in weights.items()}
 
     @property
     def layers(self):
