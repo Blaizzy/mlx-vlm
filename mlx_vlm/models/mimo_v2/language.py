@@ -1,3 +1,5 @@
+import mlx.core as mx
+
 from ..mimo_v2_flash.language import LanguageModel as MiMoV2FlashLanguageModel
 from .config import TextConfig
 
@@ -53,9 +55,28 @@ class LanguageModel(MiMoV2FlashLanguageModel):
         return out
 
     def _dequant_mxfp4_experts(self, weights):
-        raise NotImplementedError(
-            "MXFP4 expert dequantization is not implemented yet; see PR description"
-        )
+        """Dequantize the routed experts, which ship as MXFP4.
+
+        The checkpoint packs two 4-bit values per ``uint8`` and stores one
+        ``uint8`` E8M0 scale per 32 elements, which is byte-for-byte what MLX's
+        ``mxfp4`` mode expects once the payload is viewed as ``uint32``.
+        """
+        out = {}
+        for k, v in weights.items():
+            if k.endswith(".weight_scale"):
+                continue
+            scale = weights.get(f"{k}_scale")
+            if scale is None:
+                out[k] = v
+                continue
+            out[k] = mx.dequantize(
+                v.view(mx.uint32),
+                scale,
+                group_size=32,
+                bits=4,
+                mode="mxfp4",
+            ).astype(mx.bfloat16)
+        return out
 
     def sanitize(self, weights):
         if any(k.endswith("weight_scale") for k in weights):
