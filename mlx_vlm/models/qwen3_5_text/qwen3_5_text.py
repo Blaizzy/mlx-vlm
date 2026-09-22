@@ -28,7 +28,7 @@ class Model(nn.Module):
         super().__init__()
         self.config = config
         self.model_type = config.model_type
-        self.language_model = LanguageModel(config.text_config, config)
+        self.language_model = LanguageModel(config, config)
 
     def get_input_embeddings(
         self,
@@ -56,7 +56,7 @@ class Model(nn.Module):
         weights = {key: value for key, value in weights.items() if "mtp." not in key}
         shift_norm_weights = should_shift_norm_weights(weights)
 
-        if self.config.text_config.tie_word_embeddings:
+        if self.config.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
 
         sanitized_weights = {}
