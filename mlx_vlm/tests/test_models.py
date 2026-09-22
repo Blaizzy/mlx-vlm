@@ -317,7 +317,7 @@ class ModelChecks:
         batch = kwargs.pop("batch_size", 1)
         flat = (
             "qwen2_5_vl qwen3_5 qwen3_5_moe qwen4_exp "
-            "glm4v_moe glm4v hunyuan_vl siglip2_vision_model"
+            "glm4v_moe glm4v hunyuan_vl siglip2_vision_model mimovl"
         ).split()
         shape = (
             image_size
@@ -1157,6 +1157,113 @@ def test_patch_embed_is_transposed_from_ncdhw_to_ndhwc():
     sanitized = model.sanitize({QWEN_PATCH_EMBED_KEY: ncdhw})
 
     assert sanitized[QWEN_SANITIZED_KEY].shape == expected
+
+
+def _mimo_v2_tiny_config():
+    module = importlib.import_module("mlx_vlm.models.mimo_v2")
+    case = next(c for c in DATA["cases"] if c["id"] == "TestModels.mimo_v2")
+    return module, build_config(module, case["config"])
+
+
+def test_mimo_v2_sanitize_reverses_the_checkpoint_layout():
+    """MXFP4 experts, a fused QKV and unported towers all land loadably."""
+    module, config = _mimo_v2_tiny_config()
+    model = module.Model(config)
+    text = config.text_config
+
+    weights = {
+        "model.embed_tokens.weight": mx.zeros((text.vocab_size, text.hidden_size)),
+        "model.norm.weight": mx.ones((text.hidden_size,)),
+        "lm_head.weight": mx.zeros((text.vocab_size, text.hidden_size)),
+        # towers with no modules to load into yet
+        "audio_encoder.layers.0.weight": mx.zeros((8, 8)),
+        "speech_embeddings.0.weight": mx.zeros((8, 8)),
+        # multi-token prediction head is not part of the base model
+        "model.mtp.0.weight": mx.zeros((8, 8)),
+    }
+
+    vision = config.vision_config
+    for key, value in tree_flatten(model.vision_tower.parameters()):
+        if key.endswith("patch_embed.proj.weight"):
+            # the checkpoint keeps the Conv3d kernel in five dimensions
+            value = value.reshape(
+                vision.hidden_size,
+                vision.in_channels,
+                vision.temporal_patch_size,
+                vision.patch_size,
+                vision.patch_size,
+            )
+        weights[f"visual.{key}"] = value
+
+    for layer in range(text.num_hidden_layers):
+        prefix = f"model.layers.{layer}"
+        swa = bool(text.hybrid_layer_pattern[layer])
+        heads = text.swa_num_attention_heads if swa else text.num_attention_heads
+        kv = text.swa_num_key_value_heads if swa else text.num_key_value_heads
+        head_dim = text.swa_head_dim if swa else text.head_dim
+        v_head_dim = text.swa_v_head_dim if swa else text.v_head_dim
+        fused = heads * head_dim + kv * head_dim + kv * v_head_dim
+
+        weights[f"{prefix}.self_attn.qkv_proj.weight"] = mx.zeros(
+            (fused, text.hidden_size)
+        )
+        weights[f"{prefix}.self_attn.o_proj.weight"] = mx.zeros(
+            (text.hidden_size, heads * v_head_dim)
+        )
+        if swa and text.add_swa_attention_sink_bias:
+            weights[f"{prefix}.self_attn.attention_sink_bias"] = mx.zeros((heads,))
+        weights[f"{prefix}.input_layernorm.weight"] = mx.ones((text.hidden_size,))
+        weights[f"{prefix}.post_attention_layernorm.weight"] = mx.ones(
+            (text.hidden_size,)
+        )
+
+        if text.moe_layer_freq[layer]:
+            weights[f"{prefix}.mlp.gate.weight"] = mx.zeros(
+                (text.n_routed_experts, text.hidden_size)
+            )
+            weights[f"{prefix}.mlp.gate.e_score_correction_bias"] = mx.zeros(
+                (text.n_routed_experts,)
+            )
+            shapes = {
+                "gate_proj": (text.moe_intermediate_size, text.hidden_size),
+                "up_proj": (text.moe_intermediate_size, text.hidden_size),
+                "down_proj": (text.hidden_size, text.moe_intermediate_size),
+            }
+            for expert in range(text.n_routed_experts):
+                for name, (rows, cols) in shapes.items():
+                    packed, scales = mx.quantize(
+                        mx.zeros((rows, cols)), group_size=32, bits=4, mode="mxfp4"
+                    )
+                    key = f"{prefix}.mlp.experts.{expert}.{name}"
+                    weights[f"{key}.weight"] = packed.view(mx.uint8)
+                    weights[f"{key}.weight_scale"] = scales
+        else:
+            for name, (rows, cols) in {
+                "gate_proj": (text.intermediate_size, text.hidden_size),
+                "up_proj": (text.intermediate_size, text.hidden_size),
+                "down_proj": (text.hidden_size, text.intermediate_size),
+            }.items():
+                weights[f"{prefix}.mlp.{name}.weight"] = mx.zeros((rows, cols))
+
+    sanitized = model.sanitize(dict(weights))
+
+    assert not any(key.endswith("qkv_proj.weight") for key in sanitized)
+    assert not any(key.endswith(".weight_scale") for key in sanitized)
+    assert not any(
+        key.startswith(("visual.", "audio_encoder.", "speech_embeddings."))
+        for key in sanitized
+    )
+    assert any(key.startswith("vision_tower.") for key in sanitized)
+    assert not any("mtp" in key for key in sanitized)
+    assert all(
+        key.startswith(("language_model.", "vision_tower.")) for key in sanitized
+    )
+
+    model.load_weights(list(sanitized.items()), strict=True)
+    mx.eval(model.parameters())
+
+    # already-prefixed checkpoints must survive a second pass unchanged
+    assert model.sanitize(dict(sanitized)) == sanitized
 
 
 def test_glm_quantized_head_sanitization_loads_strictly():
