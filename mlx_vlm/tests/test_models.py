@@ -1165,6 +1165,91 @@ def _mimo_v2_tiny_config():
     return module, build_config(module, case["config"])
 
 
+def test_mimo_v2_unfuses_qkv_by_tensor_parallel_shard():
+    """The fused qkv is shard-major: each shard holds its own q, then k, then v.
+
+    Dimensions are chosen so only a degree of 4 explains the grid: a shard is
+    160 rows, which pads to 2 block-rows, so the grid is 4 x 2 = 8 while the
+    weight is only ceil(640 / 128) = 5 blocks tall. Degrees 1 and 2 would imply
+    5 and 6 rows respectively, so neither fits.
+    """
+    module = importlib.import_module("mlx_vlm.models.mimo_v2")
+    text = module.TextConfig(
+        hidden_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=12,
+        num_key_value_heads=4,
+        head_dim=32,
+        v_head_dim=32,
+        swa_num_attention_heads=12,
+        swa_num_key_value_heads=4,
+        swa_head_dim=32,
+        swa_v_head_dim=32,
+        partial_rotary_factor=0.5,
+        hybrid_layer_pattern=[0, 1],
+        moe_layer_freq=[0, 0],
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+        vocab_size=32,
+        intermediate_size=64,
+        moe_intermediate_size=32,
+    )
+    language = module.language.LanguageModel(text)
+
+    degree, shard_rows, grid_rows = 4, 160, 8
+    q_rows, k_rows, v_rows = 96, 32, 32  # per shard
+    assert q_rows + k_rows + v_rows == shard_rows
+    assert (
+        text.num_attention_heads * text.head_dim
+        + text.num_key_value_heads * (text.head_dim + text.v_head_dim)
+        == degree * shard_rows
+    )
+
+    # tag every section with a distinct byte so the recovered order is visible
+    tags = {}
+    rows = []
+    for rank in range(degree):
+        for name, count in (("q", q_rows), ("k", k_rows), ("v", v_rows)):
+            byte = 56 + 4 * rank + {"q": 0, "k": 1, "v": 2}[name]
+            tags[(name, rank)] = byte
+            rows.append(mx.full((count, text.hidden_size), byte, dtype=mx.uint8))
+    fused = mx.concatenate(rows)
+    assert fused.shape[0] == degree * shard_rows
+
+    weights = {
+        "model.layers.0.self_attn.qkv_proj.weight": fused,
+        "model.layers.0.self_attn.qkv_proj.weight_scale_inv": mx.ones(
+            (grid_rows, text.hidden_size // 128 or 1)
+        ),
+    }
+    out = language._unfuse_qkv(dict(weights))
+
+    assert not any("qkv_proj" in key for key in out)
+    shapes = {
+        "q_proj": text.num_attention_heads * text.head_dim,
+        "k_proj": text.num_key_value_heads * text.head_dim,
+        "v_proj": text.num_key_value_heads * text.v_head_dim,
+    }
+    for name, expected_rows in shapes.items():
+        got = out[f"model.layers.0.self_attn.{name}.weight"]
+        assert got.shape[0] == expected_rows, (name, got.shape)
+
+    # each projection must be its four shard slices in rank order; a contiguous
+    # read would instead hand back one unbroken run of the first tag
+    for name, per_shard in (("q_proj", q_rows), ("k_proj", k_rows), ("v_proj", v_rows)):
+        got = out[f"model.layers.0.self_attn.{name}.weight"]
+        short = name[0]
+        for rank in range(degree):
+            block = got[rank * per_shard : (rank + 1) * per_shard]
+            expected = mx.from_fp8(
+                mx.full((1, 1), tags[(short, rank)], dtype=mx.uint8), dtype=mx.float32
+            )
+            assert mx.allclose(block.astype(mx.float32), expected.astype(mx.float32)), (
+                name,
+                rank,
+            )
+
+
 def test_mimo_v2_sanitize_reverses_the_checkpoint_layout():
     """MXFP4 experts, a fused QKV and unported towers all land loadably."""
     module, config = _mimo_v2_tiny_config()
