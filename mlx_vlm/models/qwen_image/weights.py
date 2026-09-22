@@ -133,11 +133,13 @@ def load_text_encoder(model_path: str | Path) -> Qwen3VLModel:
     weights = dict(_load_shards(root / "text_encoder"))
     if not _is_mlx_native(root / "text_encoder") and hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
-    # Non-strict: the Qwen3-VL vision tower is unused for text-to-image and its
-    # conv layout is not round-tripped through conversion; the language weights
-    # that drive prompt conditioning load fully.
+    # The vision patch convolution needs OITHW -> OTHWI, including checkpoints
+    # converted before the edit path was supported (marked mlx_format but still
+    # containing this one convolution in its original layout).
+    if model.vision_tower is not None:
+        weights = model.vision_tower.sanitize(weights)
     return _apply(
-        model, list(weights.items()), _read_quant(root / "text_encoder"), strict=False
+        model, list(weights.items()), _read_quant(root / "text_encoder"), strict=True
     )
 
 

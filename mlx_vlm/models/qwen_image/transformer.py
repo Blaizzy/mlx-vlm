@@ -1,16 +1,4 @@
-"""Qwen-Image-2.1 single-stream DiT (text-to-image path).
-
-Ported from ``diffusers`` ``QwenImage21Transformer2DModel``. Covers the core
-text-to-image forward: one shared modulation feeds every block, text and target
-image latents share a sequence, attention is block-causal (causal over the joint
-sequence, bidirectional within the image block), and positions use a 3-axis
-(frame, height, width) rotary embedding.
-
-The block-causal mask is applied in a single attention call, which is exactly
-equivalent to the reference's per-segment decomposition (a speed optimization).
-Prefix-KV caching, flex/block-sparse attention, and condition-image editing are
-follow-ups. Numeric parity against the reference weights is pending.
-"""
+"""Qwen-Image-2.1 single-stream DiT for generation and image editing."""
 
 from __future__ import annotations
 
@@ -125,7 +113,7 @@ def _apply_rope(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
     sin = sin[None, None]
     out0 = x0 * cos - x1 * sin
     out1 = x0 * sin + x1 * cos
-    return mx.stack([out0, out1], axis=-1).reshape(b, h, s, d)
+    return mx.stack([out0, out1], axis=-1).reshape(b, h, s, d).astype(x.dtype)
 
 
 class QwenImageRope(nn.Module):
@@ -153,17 +141,37 @@ class QwenImageRope(nn.Module):
         self, txt_len: int, img_shape: tuple[int, int, int]
     ) -> tuple[mx.array, mx.array]:
         _, height, width = img_shape
-        frame_index = list(range(txt_len)) + [txt_len] * (height * width)
-        height_index = list(range(txt_len))
-        width_index = list(range(txt_len))
-        h_grid = [
-            h for h in range(-(height - height // 2), height // 2) for _ in range(width)
-        ]
-        w_grid = [
-            w for _ in range(height) for w in range(-(width - width // 2), width // 2)
-        ]
-        height_index = height_index + h_grid
-        width_index = width_index + w_grid
+        return self.for_layout(txt_len + height * width, [(txt_len, height, width)])
+
+    def for_layout(
+        self, seq_len: int, image_blocks: list[tuple[int, int, int]]
+    ) -> tuple[mx.array, mx.array]:
+        """Build RoPE for interleaved text and image blocks (start, height, width)."""
+        frame_index, height_index, width_index = [], [], []
+        cursor = position = 0
+        for start, height, width in image_blocks:
+            text_positions = list(range(position, position + start - cursor))
+            frame_index.extend(text_positions)
+            height_index.extend(text_positions)
+            width_index.extend(text_positions)
+            position += start - cursor
+            frame_index.extend([position] * (height * width))
+            height_index.extend(
+                h
+                for h in range(-(height - height // 2), height // 2)
+                for _ in range(width)
+            )
+            width_index.extend(
+                w
+                for _ in range(height)
+                for w in range(-(width - width // 2), width // 2)
+            )
+            cursor = start + height * width
+            position += max(height, width)
+        tail = list(range(position, position + seq_len - cursor))
+        frame_index.extend(tail)
+        height_index.extend(tail)
+        width_index.extend(tail)
         angles = mx.concatenate(
             [
                 self._gather(self._angles[0], frame_index),
@@ -248,7 +256,7 @@ class QwenImageTransformerBlock(nn.Module):
 
 
 class QwenImageTransformer(nn.Module):
-    """Single-stream DiT, text-to-image forward."""
+    """Single-stream DiT with interleaved text, reference, and target tokens."""
 
     def __init__(
         self,
@@ -281,25 +289,87 @@ class QwenImageTransformer(nn.Module):
         self.norm_out = QwenImageAdaLayerNormContinuous(inner, inner, eps=eps)
         self.proj_out = nn.Linear(inner, out_channels, bias=False)
 
-    def _block_causal_mask(
+    def _joint_inputs(
         self,
-        txt_len: int,
-        img_tokens: int,
+        hidden_states: mx.array,
+        encoder_hidden_states: mx.array,
+        img_shape: tuple[int, int, int],
+        reference_image_shapes: list[tuple[int, int, int]],
+        image_pad_mask: mx.array | None,
         text_valid: mx.array | None,
-        dtype: mx.Dtype,
-    ) -> mx.array:
-        seq = txt_len + img_tokens
-        idx = mx.arange(seq)
+    ):
+        """Replace each VLM image slot with four spatial VAE tokens."""
+        batch, txt_len, _ = encoder_hidden_states.shape
+        slots = (
+            [False] * txt_len
+            if image_pad_mask is None
+            else image_pad_mask.reshape(-1).tolist()
+        )
+        if len(slots) != txt_len:
+            raise ValueError("image_pad_mask must describe one prompt's image slots")
+        shapes = [*reference_image_shapes, img_shape]
+        if any(f != 1 for f, _, _ in shapes):
+            raise ValueError("Qwen-Image supports single-frame images only")
+        if hidden_states.shape[1] != sum(math.prod(shape) for shape in shapes):
+            raise ValueError("Image latent count does not match image shapes")
+        text = self.txt_in(encoder_hidden_states)
+        images = self.img_in(hidden_states)
+        if text_valid is None:
+            text_valid = mx.ones((batch, txt_len), dtype=mx.bool_)
+        else:
+            text_valid = text_valid.reshape(batch, txt_len).astype(mx.bool_)
+        pieces, valid, image_ids, blocks = [], [], [], []
+        cursor = image_cursor = seq_len = 0
+        for image_id, (_, height, width) in enumerate(shapes):
+            target = image_id == len(reference_image_shapes)
+            if target:
+                start = txt_len
+                if any(slots[cursor:]):
+                    raise ValueError("Extra image slots without reference latents")
+                end = start
+            else:
+                count = height * width
+                if count % 4:
+                    raise ValueError(
+                        "Reference images must have dimensions divisible by 32"
+                    )
+                try:
+                    start = slots.index(True, cursor)
+                except ValueError as exc:
+                    raise ValueError("Missing reference-image slots in prompt") from exc
+                end = start + count // 4
+                if end > txt_len or not all(slots[start:end]):
+                    raise ValueError(
+                        "Reference-image slots do not match VAE dimensions"
+                    )
+            if start > cursor:
+                pieces.append(text[:, cursor:start])
+                valid.append(text_valid[:, cursor:start])
+                image_ids.extend([-1] * (start - cursor))
+                seq_len += start - cursor
+            count = height * width
+            pieces.append(images[:, image_cursor : image_cursor + count])
+            valid.append(mx.ones((batch, count), dtype=mx.bool_))
+            image_ids.extend([image_id] * count)
+            blocks.append((seq_len, height, width))
+            seq_len += count
+            image_cursor += count
+            cursor = end
+        return (
+            mx.concatenate(pieces, axis=1),
+            mx.array(image_ids, dtype=mx.int32),
+            mx.concatenate(valid, axis=1),
+            blocks,
+        )
+
+    @staticmethod
+    def _block_causal_mask(image_ids: mx.array, key_valid: mx.array) -> mx.array:
+        idx = mx.arange(image_ids.shape[0])
         causal = idx[:, None] >= idx[None, :]
-        is_image = idx >= txt_len
-        same_block = is_image[:, None] & is_image[None, :]
-        allowed = causal | same_block
-        if text_valid is not None:
-            key_valid = mx.concatenate(
-                [text_valid, mx.ones((img_tokens,), dtype=mx.bool_)]
-            )
-            allowed = allowed & key_valid[None, :]
-        return mx.where(allowed, mx.array(0.0, dtype), mx.array(-mx.inf, dtype))
+        same_image = (image_ids[:, None] == image_ids[None, :]) & (
+            image_ids[:, None] >= 0
+        )
+        return (causal | same_image)[None, None] & key_valid[:, None, None, :]
 
     def __call__(
         self,
@@ -308,34 +378,35 @@ class QwenImageTransformer(nn.Module):
         timestep: mx.array,
         img_shape: tuple[int, int, int],
         encoder_hidden_states_mask: mx.array | None = None,
+        reference_image_shapes: list[tuple[int, int, int]] | None = None,
+        image_pad_mask: mx.array | None = None,
     ) -> mx.array:
-        b, txt_len, _ = encoder_hidden_states.shape
-        img_tokens = img_shape[0] * img_shape[1] * img_shape[2]
-        h = mx.concatenate(
-            [self.txt_in(encoder_hidden_states), self.img_in(hidden_states)], axis=1
+        reference_image_shapes = reference_image_shapes or []
+        h, image_ids, key_valid, blocks = self._joint_inputs(
+            hidden_states,
+            encoder_hidden_states,
+            img_shape,
+            reference_image_shapes,
+            image_pad_mask,
+            encoder_hidden_states_mask,
         )
-        cos, sin = self.pos_embed(txt_len, img_shape)
-
+        cos, sin = self.pos_embed.for_layout(h.shape[1], blocks)
         target_token_mask = None
         timestep = timestep.astype(h.dtype)
         if self.causal_condition:
-            timestep = mx.concatenate(
-                [timestep, mx.zeros((1,), dtype=timestep.dtype)], axis=0
-            )
-            image_positions = mx.arange(txt_len + img_tokens) >= txt_len
-            target_token_mask = image_positions
+            timestep = mx.concatenate([timestep, mx.zeros((1,), dtype=timestep.dtype)])
+            target_token_mask = image_ids == len(reference_image_shapes)
         temb = self.time_text_embed(timestep, h.dtype)
         modulation = self.modulation[0](nn.silu(temb))
-
-        mask = self._block_causal_mask(
-            txt_len, img_tokens, encoder_hidden_states_mask, h.dtype
-        )[None, None]
-
+        mask = self._block_causal_mask(image_ids, key_valid)
         for block in self.transformer_blocks:
             h = block(h, modulation, cos, sin, mask, target_token_mask)
-
-        h = self.norm_out(h, temb, target_token_mask)
-        return self.proj_out(h)[:, txt_len:]
+        # The target is the last image block; only it is denoised.
+        h = h[:, -math.prod(img_shape) :]
+        target_mask = (
+            None if target_token_mask is None else target_token_mask[-h.shape[1] :]
+        )
+        return self.proj_out(self.norm_out(h, temb, target_mask))
 
 
 __all__ = ["QwenImageTransformer"]

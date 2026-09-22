@@ -48,6 +48,15 @@
       "index_class": "MageFlowPipeline",
       "edit": {"alias": "microsoft/Mage-Flow-Edit-Turbo", "probe": "mage-flow-edit-base"},
       "pipeline_class": "MageFlowPipeline"
+    },
+    "qwen_image": {
+      "prefix": "QwenImage",
+      "aliases": ["qwen-image-2.1", "Qwen/Qwen-Image-2.1"],
+      "invalid_dimensions": [[255, 512], [512, 2050], [513, 512]],
+      "probe": "qwen-image-2.1",
+      "index_class": "QwenImage21Pipeline",
+      "edit": {"probe": "Qwen/Qwen-Image-2.1"},
+      "pipeline_class": "QwenImagePipeline"
     }
   },
   "checks": {
@@ -553,6 +562,27 @@
         "text_encoder/config.json": {},
         "text_encoder/tokenizer.json": {},
         "transformer/config.json": {},
+        "vae/config.json": {}
+      }
+    },
+    "qwen_image": {
+      "files": [
+        "text_encoder/model.safetensors",
+        "transformer/diffusion_pytorch_model.safetensors",
+        "vae/diffusion_pytorch_model.safetensors",
+        "processor/tokenizer.json"
+      ],
+      "metadata": {
+        "model_index.json": {"_class_name": "QwenImage21Pipeline"},
+        "text_encoder/config.json": {},
+        "transformer/config.json": {"_class_name": "QwenImage21Transformer2DModel"},
+        "transformer/diffusion_pytorch_model.safetensors.index.json": {
+          "weight_map": {
+            "transformer_blocks.0.img_mlp.gate_layer.weight": "diffusion_pytorch_model.safetensors",
+            "txt_in.text_norm.weight": "diffusion_pytorch_model.safetensors",
+            "txt_in.in_layer.weight": "diffusion_pytorch_model.safetensors"
+          }
+        },
         "vae/config.json": {}
       }
     }

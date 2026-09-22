@@ -6,6 +6,7 @@ from typing import Any, ClassVar
 
 import mlx.core as mx
 
+from mlx_vlm.generate.edit_image import ImageEditRequest
 from mlx_vlm.generate.image import (
     ImageGenerationModel,
     ImageGenerationRequest,
@@ -118,4 +119,47 @@ class QwenImageGenerationModel(ImageGenerationModel):
         return cls(pipeline=pipeline, model_id=str(model))
 
 
-__all__ = ["QwenImageGenerationModel"]
+@dataclass(slots=True)
+class QwenImageEditModel(QwenImageGenerationModel):
+    is_image_generation_model: ClassVar[bool] = False
+    is_image_edit_model: ClassVar[bool] = True
+
+    def edit(self, request: ImageEditRequest) -> ImageGenerationResult:
+        seed = 0 if request.seed is None else request.seed
+        steps = request.resolve_steps(40)
+        guidance = request.resolve_guidance(1.0)
+        array = self.pipeline.edit_array(
+            request.prompt,
+            request.image_paths,
+            seed=seed,
+            steps=steps,
+            width=request.width,
+            height=request.height,
+            guidance=guidance,
+            negative_prompt=request.extra.get("negative_prompt", " "),
+            output_resolution=request.extra.get("output_resolution", 1024),
+        )
+        metadata = {
+            "model_path": str(self.pipeline.model_path),
+            "reference_count": len(request.image_paths),
+        }
+        if self.pipeline.quantization_config:
+            metadata["quantization"] = self.pipeline.quantization_config
+        return ImageGenerationResult(
+            array=array,
+            seed=seed,
+            width=array.shape[1],
+            height=array.shape[0],
+            steps=steps,
+            model=self.model_id,
+            family=self.family,
+            variant=self.variant,
+            guidance=guidance,
+            color_space="RGBA",
+            prompt_tokens=self.pipeline.count_prompt_tokens(request.prompt),
+            peak_memory=mx.get_peak_memory() / 1e9,
+            metadata=metadata,
+        )
+
+
+__all__ = ["QwenImageEditModel", "QwenImageGenerationModel"]

@@ -66,6 +66,7 @@ ideogram = _ModelFamily("ideogram4")
 z = _ModelFamily("z_image")
 ernie = _ModelFamily("ernie_image")
 mage = _ModelFamily("mage_flow")
+qwen = _ModelFamily("qwen_image")
 
 
 def _model_class(family, edit=False):
@@ -628,6 +629,18 @@ def _packed_pipeline(family):
             mx.zeros((1, 32, 4), dtype=mx.int32),
         ),
         _ensure_transformer_and_vae=lambda: None,
+    )
+
+
+def _qwen_image_transformer(num_layers=1):
+    return qwen.transformer.QwenImageTransformer(
+        in_channels=4,
+        out_channels=4,
+        num_layers=num_layers,
+        num_attention_heads=2,
+        attention_head_dim=8,
+        context_in_dim=8,
+        axes_dims_rope=(2, 2, 4),
     )
 
 
@@ -1472,3 +1485,364 @@ def test_ideogram_prompt_expansion_policy(monkeypatch, case):
             )
         else:
             expand.assert_not_called()
+
+
+# Diffusers FlowMatchEulerDiscreteScheduler with the released checkpoint config,
+# 30 steps, sampled at indices [0, 1, 5, 12, 21, 29, 30] (including final zero).
+@pytest.mark.parametrize(
+    "seq_len, expected",
+    [
+        (1024, [1, 0.979528308, 0.891533315, 0.709324002, 0.401600242, 0.02, 0]),
+        (4096, [1, 0.982250750, 0.904797077, 0.738175511, 0.436004937, 0.02, 0]),
+        (16384, [1, 0.989837408, 0.943547547, 0.831857562, 0.573614955, 0.02, 0]),
+    ],
+)
+def test_qwen_image_schedule_matches_diffusers(seq_len, expected):
+    scheduler = qwen.scheduler.FlowMatchEulerDiscreteScheduler(
+        image_seq_len=seq_len, num_inference_steps=30
+    )
+    sigmas = np.array(scheduler.sigmas)
+    assert_allclose(sigmas[[0, 1, 5, 12, 21, 29, 30]], expected, atol=2e-7)
+    assert np.all(np.diff(sigmas) < 0)
+    assert_allclose(np.array(scheduler.timesteps), sigmas[:-1] * 1000)
+
+
+def test_qwen_image_single_step_schedule_is_finite():
+    scheduler = qwen.scheduler.FlowMatchEulerDiscreteScheduler(
+        image_seq_len=4096, num_inference_steps=1
+    )
+    assert_array_equal(np.array(scheduler.sigmas), [1.0, 0.0])
+
+
+def test_qwen_image_terminal_stretch_can_be_disabled():
+    scheduler = qwen.scheduler.FlowMatchEulerDiscreteScheduler(
+        image_seq_len=4096, num_inference_steps=30, shift_terminal=None
+    )
+    assert_allclose(float(scheduler.sigmas[-2]), 0.064540349, atol=1e-7)
+
+
+@pytest.mark.parametrize(
+    "dtype, expected",
+    [
+        (mx.bfloat16, [1.1484375, -0.69140625, 2.171875]),
+        (mx.float32, [1.150087833404541, -0.6920585036277771, 2.167631149291992]),
+    ],
+)
+def test_qwen_image_euler_update_matches_diffusers(dtype, expected):
+    scheduler = qwen.scheduler.FlowMatchEulerDiscreteScheduler(
+        image_seq_len=4096, num_inference_steps=2
+    )
+    scheduler.sigmas = mx.array([0.75, 0.687123, 0.0])
+    # Golden outputs from Diffusers, including PyTorch scalar promotion when
+    # the prediction and sample have different dtypes.
+    output = scheduler.step(
+        noise=mx.array([-0.896, 0.321, 1.31], dtype=dtype),
+        latents=mx.array([1.09375, -0.671875, 2.25], dtype=mx.bfloat16),
+        step_index=0,
+    )
+    assert output.dtype == dtype
+    assert_array_equal(np.array(output.astype(mx.float32)), expected)
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+def test_qwen_image_rope_matches_complex_rotation_and_preserves_dtype(dtype):
+    rng = np.random.default_rng(7)
+    x = mx.array(rng.standard_normal((1, 2, 4, 8)).astype(np.float32)).astype(dtype)
+    angles = rng.standard_normal((4, 4)).astype(np.float32)
+    output = qwen.transformer._apply_rope(
+        x, mx.array(np.cos(angles)), mx.array(np.sin(angles))
+    )
+    pairs = np.array(x.astype(mx.float32)).reshape(1, 2, 4, 4, 2)
+    rotated = (pairs[..., 0] + 1j * pairs[..., 1]) * np.exp(1j * angles)
+    expected = np.stack([rotated.real, rotated.imag], axis=-1).reshape(x.shape)
+    expected = mx.array(expected).astype(dtype)
+    assert output.dtype == dtype
+    assert_allclose(
+        np.array(output.astype(mx.float32)),
+        np.array(expected.astype(mx.float32)),
+        atol=5e-7,
+    )
+
+
+def test_qwen_image_transformer_keeps_bfloat16_through_attention():
+    model = _qwen_image_transformer(num_layers=2)
+    model.set_dtype(mx.bfloat16)
+    output = model(
+        hidden_states=mx.ones((1, 4, 4), dtype=mx.bfloat16),
+        encoder_hidden_states=mx.ones((1, 4, 8), dtype=mx.bfloat16),
+        timestep=mx.array([0.5], dtype=mx.bfloat16),
+        img_shape=(1, 2, 2),
+    )
+    assert output.dtype == mx.bfloat16
+    assert bool(mx.all(mx.isfinite(output)))
+
+
+@pytest.mark.parametrize("shift_terminal", [0.02, 0.13])
+def test_qwen_image_pipeline_uses_checkpoint_schedule_and_reference_timesteps(
+    tmp_path, monkeypatch, shift_terminal
+):
+    _write_files(
+        tmp_path,
+        metadata={
+            "vae/config.json": {
+                "z_dim": 4,
+                "latents_mean": [0] * 4,
+                "latents_std": [1] * 4,
+            },
+            "scheduler/scheduler_config.json": {
+                "_class_name": "FlowMatchEulerDiscreteScheduler",
+                "shift_terminal": shift_terminal,
+            },
+        },
+    )
+    encoder = SimpleNamespace(encode=lambda _: mx.ones((1, 4, 8)))
+    monkeypatch.setattr(qwen.pipeline, "QwenImageTextEncoder", lambda **_: encoder)
+    timesteps = []
+
+    def transformer(*, hidden_states, timestep, **kwargs):
+        timesteps.append(timestep)
+        assert hidden_states.dtype == mx.bfloat16
+        return mx.zeros_like(hidden_states)
+
+    model = qwen.pipeline.QwenImagePipeline(
+        variant=qwen.config.get_variant(),
+        model_path=tmp_path,
+        text_encoder=None,
+        transformer=transformer,
+        vae=SimpleNamespace(decode=lambda _: mx.zeros((1, 3, 1, 16, 16))),
+    )
+    model.generate_array("a cat", width=1024, height=1024, steps=30)
+    actual = np.array(mx.concatenate(timesteps).astype(mx.float32))
+    if shift_terminal == 0.02:
+        # Recorded from the reference pipeline's BF16 cast-before-division.
+        assert_array_equal(
+            actual[[0, 1, 5, 12, 21, 29]],
+            [1.0, 0.984375, 0.90234375, 0.73828125, 0.435546875, 0.02001953125],
+        )
+    else:
+        assert actual[-1] == 0.1298828125
+
+
+def test_qwen_image_edit_layout_rope_and_causal_mask():
+    model = _qwen_image_transformer()
+    image = mx.arange(64, dtype=mx.float32).reshape(1, 16, 4)
+    text = mx.arange(56, dtype=mx.float32).reshape(1, 7, 8)
+    slots = mx.array([[False, True, False, True, True, False, False]])
+    h, ids, valid, blocks = model._joint_inputs(
+        image, text, (1, 2, 2), [(1, 2, 2), (1, 2, 4)], slots, None
+    )
+    assert blocks == [(1, 2, 2), (6, 2, 4), (16, 2, 2)]
+    assert_array_equal(
+        np.array(ids), [-1] + [0] * 4 + [-1] + [1] * 8 + [-1] * 2 + [2] * 4
+    )
+    projected_text = model.txt_in(text)
+    projected_image = model.img_in(image)
+    assert_array_equal(
+        np.array(h[:, [0, 5, 14, 15]]), np.array(projected_text[:, [0, 2, 5, 6]])
+    )
+    positions = [*range(1, 5), *range(6, 14), *range(16, 20)]
+    assert_array_equal(np.array(h[:, positions]), np.array(projected_image))
+    mask = np.array(model._block_causal_mask(ids, valid))[0, 0]
+    assert mask[1, 4]  # Within one image, attention is bidirectional.
+    assert not mask[1, 6]  # Earlier images cannot attend to later images.
+    assert not mask[14, 15]  # Text remains causal after the references.
+    assert mask[6, 1]
+    assert mask[16].all()  # Target sees all references and all target tokens.
+    cos, sin = model.pos_embed.for_layout(20, blocks)
+    frame = np.array([0] + [1] * 4 + [3] + [4] * 8 + [8, 9] + [10] * 4)
+    assert_allclose(np.array(cos[:, 0]), np.cos(frame), atol=1e-7)
+    assert_allclose(np.array(sin[:, 0]), np.sin(frame), atol=1e-7)
+
+
+def test_qwen_image_adjacent_references_remain_separate_attention_blocks():
+    model = _qwen_image_transformer()
+    _, ids, valid, blocks = model._joint_inputs(
+        mx.zeros((1, 12, 4)),
+        mx.zeros((1, 2, 8)),
+        (1, 2, 2),
+        [(1, 2, 2), (1, 2, 2)],
+        mx.array([[True, True]]),
+        None,
+    )
+    assert blocks == [(0, 2, 2), (4, 2, 2), (8, 2, 2)]
+    mask = np.array(model._block_causal_mask(ids, valid))[0, 0]
+    assert mask[0, 3] and not mask[0, 4] and mask[4, 0]
+
+
+@pytest.mark.parametrize("slots", [[False, False], [True, True]])
+def test_qwen_image_edit_rejects_inconsistent_reference_slots(slots):
+    with pytest.raises(
+        ValueError,
+        match="image slots",
+    ):
+        _qwen_image_transformer()._joint_inputs(
+            mx.zeros((1, 8, 4)),
+            mx.zeros((1, 2, 8)),
+            (1, 2, 2),
+            [(1, 2, 2)],
+            mx.array([slots]),
+            None,
+        )
+
+
+def test_qwen_image_edit_prompt_composites_alpha_and_returns_slot_mask():
+    encoder = qwen.text_encoder.QwenImageTextEncoder.__new__(
+        qwen.text_encoder.QwenImageTextEncoder
+    )
+    encoder.drop_idx = 2
+    encoder.tokenizer = SimpleNamespace(convert_tokens_to_ids=lambda _: 99)
+    observed = {}
+
+    def processor(**kwargs):
+        observed.update(kwargs)
+        return {"input_ids": mx.array([[1, 2, 3, 99, 4, 99, 5]])}
+
+    encoder._processor = processor
+    encoder._hidden_states = lambda _: mx.zeros((1, 7, 8))
+    emb, mask = encoder.encode_edit(
+        "combine them",
+        [
+            Image.new("RGBA", (32, 32), (255, 0, 0, 0)),
+            Image.new("RGB", (32, 32), (0, 0, 255)),
+        ],
+    )
+    assert emb.shape == (1, 5, 8)
+    assert_array_equal(np.array(mask), [[False, True, False, True, False]])
+    assert observed["images"][0].getpixel((0, 0)) == (255, 255, 255)
+    assert observed["images"][1].getpixel((0, 0)) == (0, 0, 255)
+    assert "<|vision_end|> <image2>" in observed["text"][0]
+
+
+def test_qwen_image_edit_pipeline_encodes_rgba_and_preserves_reference_latents(
+    tmp_path,
+):
+    paths = []
+    for i, size in enumerate([(256, 256), (512, 128)]):
+        path = tmp_path / f"reference-{i}.png"
+        Image.new("RGBA", size, (255, 0, 0, 128)).save(path)
+        paths.append(path)
+    model = _pipeline("qwen_image")
+    model.z_dim = 4
+    model.latents_mean = mx.ones((1, 4, 1, 1, 1))
+    model.latents_std = mx.full((1, 4, 1, 1, 1), 2.0)
+    model.scheduler_config = {}
+    encoded = []
+
+    def encode(pixels):
+        encoded.append(pixels)
+        _, _, _, h, w = pixels.shape
+        # Mode (mean), not stochastic posterior sampling, must be used.
+        return mx.full((1, 4, 1, h // 16, w // 16), 5.0), mx.full(
+            (1, 4, 1, h // 16, w // 16), 100.0
+        )
+
+    model.vae = SimpleNamespace(
+        encode=encode,
+        decode=lambda z: mx.zeros((1, 4, 1, z.shape[-2] * 16, z.shape[-1] * 16)),
+    )
+    prompts = []
+
+    def encode_edit(prompt, references):
+        prompts.append(prompt)
+        assert [r.size for r in references] == [(256, 256), (512, 128)]
+        length = 128 if prompt else 129
+        return mx.zeros((1, length, 8)), mx.ones((1, length), dtype=mx.bool_)
+
+    model.text_encoder = SimpleNamespace(encode_edit=encode_edit)
+    inputs = []
+
+    def transformer(*, hidden_states, img_shape, **kwargs):
+        inputs.append(np.array(hidden_states.astype(mx.float32)))
+        assert kwargs["reference_image_shapes"] == [(1, 16, 16), (1, 8, 32)]
+        assert (
+            kwargs["image_pad_mask"].shape[1]
+            == kwargs["encoder_hidden_states"].shape[1]
+        )
+        return mx.ones((1, img_shape[1] * img_shape[2], 4), dtype=mx.bfloat16)
+
+    model.transformer = transformer
+    output = model.edit_array(
+        "combine",
+        paths,
+        steps=2,
+        guidance=2.0,
+        negative_prompt="",
+        output_resolution=256,
+    )
+    assert output.shape == (128, 512, 4)  # Default aspect ratio uses the last image.
+    assert prompts == ["combine", ""]
+    assert len(inputs) == 4
+    for value in inputs:
+        assert_array_equal(value[:, :512], np.full((1, 512, 4), 2.0))
+    assert not np.array_equal(inputs[0][:, 512:], inputs[-1][:, 512:])
+    assert encoded[0].shape == (1, 4, 1, 256, 256)
+    assert_allclose(float(encoded[0][0, 3, 0, 0, 0]), 128 / 127.5 - 1, atol=2e-5)
+
+
+@pytest.mark.parametrize(
+    "native, converted", [(False, False), (True, False), (True, True)]
+)
+def test_qwen_image_text_encoder_loads_vision_convolution_strictly(
+    tmp_path, monkeypatch, native, converted
+):
+    from mlx_vlm.models.qwen3_vl.qwen3_vl import Model
+    from mlx_vlm.models.qwen3_vl.vision import VisionModel
+
+    _write_files(
+        tmp_path, metadata={"text_encoder/config.json": {"mlx_format": native}}
+    )
+    original = mx.arange(2 * 3 * 2 * 4 * 4).reshape(2, 3, 2, 4, 4)
+    expected = original.transpose(0, 2, 3, 4, 1)
+    key = (
+        "vision_tower.patch_embed.proj.weight"
+        if native
+        else "model.visual.patch_embed.proj.weight"
+    )
+    monkeypatch.setattr(
+        qwen.weights,
+        "_load_shards",
+        lambda _: {key: expected if converted else original},
+    )
+    monkeypatch.setattr(
+        qwen.weights, "Qwen3VLConfig", SimpleNamespace(from_dict=lambda c: c)
+    )
+    loaded = {}
+
+    def load_weights(items, *, strict):
+        loaded.update(items)
+        assert strict
+
+    model = SimpleNamespace(
+        sanitize=lambda w: Model.sanitize(None, w),
+        vision_tower=SimpleNamespace(sanitize=lambda w: VisionModel.sanitize(None, w)),
+        load_weights=load_weights,
+        eval=lambda: None,
+    )
+    monkeypatch.setattr(qwen.weights, "Qwen3VLModel", lambda _: model)
+    qwen.weights.load_text_encoder(tmp_path)
+    assert_array_equal(
+        np.array(loaded["vision_tower.patch_embed.proj.weight"]), np.array(expected)
+    )
+
+
+def test_qwen_image_edit_dispatch_and_rgba_save(tmp_path):
+    assert (
+        image_edit_model_class("Qwen/Qwen-Image-2.1") is qwen.model.QwenImageEditModel
+    )
+    pixels = mx.array([[[255, 0, 0, 128]]], dtype=mx.uint8)
+    fake = SimpleNamespace(
+        variant=qwen.config.get_variant(),
+        model_path=tmp_path,
+        quantization_config=None,
+        edit_array=lambda *args, **kwargs: pixels,
+        count_prompt_tokens=lambda _: 3,
+    )
+    result = qwen.model.QwenImageEditModel(fake, "qwen-image-2.1").edit(
+        ImageEditRequest("edit", ("reference.png",))
+    )
+    assert result.color_space == "RGBA"
+    assert result.metadata["reference_count"] == 1
+    saved = result.save(tmp_path / "result.png")
+    with Image.open(saved) as image:
+        assert image.mode == "RGBA"
+        assert image.getpixel((0, 0)) == (255, 0, 0, 128)

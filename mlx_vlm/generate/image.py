@@ -52,7 +52,7 @@ ImageOutputFormat = Literal["b64_json", "path"]
 ImageTask = Literal["generate", "edit"]
 ImageArrayLayout = Literal["HWC"]
 ImageArrayRange = Literal["uint8_0_255"]
-ImageColorSpace = Literal["RGB"]
+ImageColorSpace = Literal["RGB", "RGBA"]
 
 
 @dataclass(slots=True)
@@ -101,7 +101,7 @@ class ImageGenerationResult:
         return self.to_pil()
 
     def to_pil(self) -> Image.Image:
-        if self.layout != "HWC" or self.color_space != "RGB":
+        if self.layout != "HWC" or self.color_space not in ("RGB", "RGBA"):
             raise ValueError(
                 f"Cannot convert image layout={self.layout!r} "
                 f"color_space={self.color_space!r} to PIL"

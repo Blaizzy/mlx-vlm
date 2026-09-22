@@ -1,14 +1,4 @@
-"""Qwen-Image-2.1 3D-causal residual VAE (image inference path).
-
-Ported from ``diffusers`` ``AutoencoderKLQwenImage21``. The checkpoint's causal
-3D convolutions are the *image specialization* (single frame, no temporal
-feature cache), so every convolution reduces to a per-frame 2D convolution.
-Tensors are kept in the reference's channel-first ``[B, C, T, H, W]`` layout so
-the reshape/permute logic ports one-to-one; only the convolutions transpose to
-MLX's channels-last layout at their boundary.
-
-Numeric parity against the reference weights is pending (validated on load).
-"""
+"""Qwen-Image-2.1 3D-causal residual VAE (image inference path)."""
 
 from __future__ import annotations
 
