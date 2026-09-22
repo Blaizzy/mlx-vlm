@@ -1428,7 +1428,6 @@ class LanguageModel(nn.Module):
         batch_size, seq_length = input_ids.shape
         position_ids = mx.arange(seq_length, dtype=mx.int32)
         position_ids = mx.broadcast_to(position_ids[None, :], (batch_size, seq_length))
-        spatial_merge_size = self.config.vision_config.spatial_merge_size
         image_token_id = self.config.image_token_id
         video_token_id = self.config.video_token_id
         vision_start_token_id = self.config.vision_start_token_id
@@ -1445,6 +1444,7 @@ class LanguageModel(nn.Module):
             image_grid_thw is not None or video_grid_thw is not None
         ):
             total_input_ids = input_ids
+            spatial_merge_size = self.config.vision_config.spatial_merge_size
             if attention_mask is None:
                 attention_mask = mx.ones_like(input_ids)
             position_ids = mx.ones(
