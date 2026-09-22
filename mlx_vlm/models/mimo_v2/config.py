@@ -22,6 +22,10 @@ class VisionConfig(BaseModelConfig):
     temporal_patch_size: int = 2
     tokens_per_second: int = 2
     hidden_act: str = "silu"
+    # the reference reads head_dim from qk_channels, which the released
+    # configs omit; 1280/32 would give 40, but the checkpoint's qkv is 3072 = 48*64
+    qk_channels: int = 64
+    rms_norm_eps: float = 1e-6
     use_sink: bool = True
     window_size: int = 128
     visual_token_window_size: int = 64
