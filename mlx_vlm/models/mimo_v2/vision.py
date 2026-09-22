@@ -66,15 +66,30 @@ class VisionAttention(nn.Module):
             idx = mx.arange(n)
             outside = mx.abs(idx[:, None] - idx[None, :]) > self.window_size
             mask = mx.where(outside, mx.array(-mx.inf, dtype), mx.array(0, dtype))
-            mask = mx.broadcast_to(mask, (1, self.num_heads, n, n))
+            mask = mask[None, None]
         if self.sinks is not None:
-            # the sink is a bias on the first key position, not an extra logit
-            sink = mx.zeros((1, self.num_heads, n, n), dtype)
+            # the sink biases the first key position and is constant across
+            # queries, so it stays [1, H, 1, n] rather than a full [1, H, n, n]
+            sink = mx.zeros((1, self.num_heads, 1, n), dtype)
             sink[..., 0] = self.sinks.reshape(1, self.num_heads, 1).astype(dtype)
             mask = sink if mask is None else mask + sink
         return mask
 
-    def __call__(self, x: mx.array, cos, sin, full_attn: bool) -> mx.array:
+    def _attend(self, q, k, v, full_attn: bool) -> mx.array:
+        n = q.shape[0]
+        q = q.transpose(1, 0, 2)[None]
+        k = k.transpose(1, 0, 2)[None]
+        v = v.transpose(1, 0, 2)[None]
+        repeats = self.num_heads // self.num_kv_heads
+        if repeats > 1:
+            k = mx.repeat(k, repeats, axis=1)
+            v = mx.repeat(v, repeats, axis=1)
+        out = mx.fast.scaled_dot_product_attention(
+            q, k, v, scale=self.scale, mask=self._mask(n, full_attn, q.dtype)
+        )
+        return out[0].transpose(1, 0, 2).reshape(n, -1)
+
+    def __call__(self, x: mx.array, cos, sin, full_attn: bool, cu_seqlens) -> mx.array:
         n = x.shape[0]
         qkv = self.qkv(x)
         q_dim = self.num_heads * self.head_dim
@@ -85,18 +100,13 @@ class VisionAttention(nn.Module):
         v = qkv[:, q_dim + kv_dim :].reshape(n, self.num_kv_heads, self.head_dim)
         q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
 
-        q = q.transpose(1, 0, 2)[None]
-        k = k.transpose(1, 0, 2)[None]
-        v = v.transpose(1, 0, 2)[None]
-        repeats = self.num_heads // self.num_kv_heads
-        if repeats > 1:
-            k = mx.repeat(k, repeats, axis=1)
-            v = mx.repeat(v, repeats, axis=1)
-
-        out = mx.fast.scaled_dot_product_attention(
-            q, k, v, scale=self.scale, mask=self._mask(n, full_attn, q.dtype)
-        )
-        return self.proj(out[0].transpose(1, 0, 2).reshape(n, -1))
+        # attention never crosses an image boundary
+        chunks = [
+            self._attend(q[a:b], k[a:b], v[a:b], full_attn)
+            for a, b in zip(cu_seqlens[:-1], cu_seqlens[1:])
+        ]
+        attn = chunks[0] if len(chunks) == 1 else mx.concatenate(chunks, axis=0)
+        return self.proj(attn)
 
 
 class VisionBlock(nn.Module):
@@ -107,8 +117,8 @@ class VisionBlock(nn.Module):
         self.attn = VisionAttention(config, use_sinks, window_size)
         self.mlp = VisionMLP(config)
 
-    def __call__(self, x: mx.array, cos, sin, full_attn: bool) -> mx.array:
-        x = x + self.attn(self.norm1(x), cos, sin, full_attn)
+    def __call__(self, x: mx.array, cos, sin, full_attn: bool, cu_seqlens) -> mx.array:
+        x = x + self.attn(self.norm1(x), cos, sin, full_attn, cu_seqlens)
         return x + self.mlp(self.norm2(x))
 
 
@@ -176,3 +186,60 @@ class VisionModel(nn.Module):
                 v = v.reshape(v.shape[0], -1)
             out[k] = v
         return out
+
+    def _apply_index(self, x: mx.array, index: mx.array) -> mx.array:
+        x = x.reshape(-1, self.spatial_merge_unit, *x.shape[1:])
+        return x[index].reshape(-1, *x.shape[2:])
+
+    def _window_index(self, grid_thw) -> mx.array:
+        out, offset = [], 0
+        m = self.spatial_merge_size
+        for t, h, w in grid_thw:
+            gh, gw = h // m, w // m
+            index = mx.arange(t * gh * gw).reshape(t, gh, gw)
+            out.append(index.transpose(0, 2, 1).reshape(-1) + offset)
+            offset += t * gh * gw
+        return mx.concatenate(out, axis=0)
+
+    def _rot_pos_emb(self, grid_thw) -> mx.array:
+        m = self.spatial_merge_size
+        pos_ids = []
+        for t, h, w in grid_thw:
+            hpos = mx.broadcast_to(mx.arange(h)[:, None], (h, w))
+            hpos = hpos.reshape(h // m, m, w // m, m).transpose(0, 2, 1, 3).reshape(-1)
+            wpos = mx.broadcast_to(mx.arange(w)[None, :], (h, w))
+            wpos = wpos.reshape(h // m, m, w // m, m).transpose(0, 2, 1, 3).reshape(-1)
+            pos_ids.append(mx.tile(mx.stack([hpos, wpos], axis=-1), (t, 1)))
+        pos_ids = mx.concatenate(pos_ids, axis=0)
+        max_grid = int(max(max(h, w) for _, h, w in grid_thw))
+        full = self.rotary_pos_emb(max_grid)
+        return full[pos_ids].reshape(pos_ids.shape[0], -1)
+
+    def __call__(self, pixel_values: mx.array, grid_thw) -> mx.array:
+        grid_thw = [tuple(int(v) for v in row) for row in grid_thw]
+        x = self.patch_embed(pixel_values)
+
+        rotary = self._rot_pos_emb(grid_thw)
+        emb = mx.concatenate([rotary, rotary], axis=-1)
+        row_cos, row_sin = mx.cos(emb), mx.sin(emb)
+        col_index = self._window_index(grid_thw)
+        reverse_index = mx.argsort(col_index)
+        col_emb = self._apply_index(emb, col_index)
+        col_cos, col_sin = mx.cos(col_emb), mx.sin(col_emb)
+
+        cu_seqlens, total = [0], 0
+        for t, h, w in grid_thw:
+            for _ in range(t):
+                total += h * w
+                cu_seqlens.append(total)
+
+        types = self.window_attn_types
+        for i, block in enumerate(self.blocks):
+            if types[i] == 1 and (i == 0 or types[i - 1] != 1):
+                x = self._apply_index(x, col_index)
+            elif i > 0 and types[i] != 1 and types[i - 1] == 1:
+                x = self._apply_index(x, reverse_index)
+            cos, sin = (col_cos, col_sin) if types[i] == 1 else (row_cos, row_sin)
+            x = block(x, cos, sin, i in self.fullatt_block_indexes, cu_seqlens)
+
+        return self.merger(x)
