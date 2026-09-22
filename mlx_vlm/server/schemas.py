@@ -145,6 +145,18 @@ class ImageEditRequest(FlexibleBaseModel):
         None,
         description="Classifier-free guidance scale; model default if omitted.",
     )
+    negative_prompt: Optional[str] = Field(
+        None, description="Negative conditioning prompt; model default if omitted."
+    )
+    output_resolution: Optional[int] = Field(
+        None,
+        ge=256,
+        description="Reference image resolution and default output area scale.",
+    )
+    use_kv_cache: Optional[bool] = Field(
+        None,
+        description="Reuse fixed conditioning keys/values when supported by the model.",
+    )
     response_format: Literal["b64_json", "path"] = Field(
         "b64_json",
         description="Return base64 PNG data or write files and return local paths.",

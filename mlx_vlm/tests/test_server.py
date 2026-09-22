@@ -1169,6 +1169,37 @@ def test_image_generation_and_editing(
         fake.cache.assert_called_once_with(model_name, model_kind="image_edit")
 
 
+@pytest.mark.parametrize(
+    "options",
+    [
+        {},
+        {"use_kv_cache": True, "output_resolution": 512},
+        {"use_kv_cache": False, "output_resolution": 512, "negative_prompt": ""},
+    ],
+)
+def test_image_editing_forwards_model_options(client, monkeypatch, options):
+    edit = Mock(return_value=_fake_image_result(seed=7))
+    monkeypatch.setattr(openai, "edit_image", edit)
+    with _endpoint(model_type="qwen_image"):
+        response = client.post(
+            "/v1/images/edits",
+            json=dict(
+                model="Qwen/Qwen-Image-2.1",
+                prompt="edit",
+                image="reference.png",
+                seed=7,
+                size="512x512",
+                steps=30,
+                **options,
+            ),
+        )
+    assert response.status_code == 200
+    request = edit.call_args.args[1]
+    assert request.extra == options
+    assert request.width == request.height == 512
+    assert request.steps == 30
+
+
 @pytest.mark.parametrize("api", ["/responses", "/chat/completions"])
 def test_responses_endpoint_forwards_new_sampling_args(client, api):
     options = dict(

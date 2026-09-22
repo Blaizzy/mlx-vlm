@@ -631,6 +631,15 @@ async def images_edits_endpoint(request: Request):
                         height=height,
                         guidance=image_request.guidance,
                         output_format=image_request.output_format,
+                        extra={
+                            key: value
+                            for key in (
+                                "negative_prompt",
+                                "output_resolution",
+                                "use_kv_cache",
+                            )
+                            if (value := getattr(image_request, key)) is not None
+                        },
                     )
                     result = edit_image(
                         model,
