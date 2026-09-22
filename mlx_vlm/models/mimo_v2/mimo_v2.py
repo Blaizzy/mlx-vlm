@@ -49,8 +49,7 @@ class Model(nn.Module):
         )
 
     def sanitize(self, weights):
-        # already-converted checkpoints carry the prefix, so re-prefixing them
-        # on reload would produce language_model.language_model.*
+        # re-prefixing a converted checkpoint yields language_model.language_model.*
         if any(k.startswith("language_model.") for k in weights):
             return weights
 

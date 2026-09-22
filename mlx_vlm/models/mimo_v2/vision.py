@@ -68,8 +68,7 @@ class VisionAttention(nn.Module):
             mask = mx.where(outside, mx.array(-mx.inf, dtype), mx.array(0, dtype))
             mask = mask[None, None]
         if self.sinks is not None:
-            # the sink biases the first key position and is constant across
-            # queries, so it stays [1, H, 1, n] rather than a full [1, H, n, n]
+            # constant across queries, so [1, H, 1, n] rather than [1, H, n, n]
             sink = mx.zeros((1, self.num_heads, 1, n), dtype)
             sink[..., 0] = self.sinks.reshape(1, self.num_heads, 1).astype(dtype)
             mask = sink if mask is None else mask + sink

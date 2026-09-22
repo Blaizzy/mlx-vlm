@@ -22,8 +22,7 @@ class VisionConfig(BaseModelConfig):
     temporal_patch_size: int = 2
     tokens_per_second: int = 2
     hidden_act: str = "silu"
-    # the reference reads head_dim from qk_channels, which the released
-    # configs omit; 1280/32 would give 40, but the checkpoint's qkv is 3072 = 48*64
+    # released configs omit this; qkv is 3072 = 48 * 64, not 1280 / 32
     qk_channels: int = 64
     rms_norm_eps: float = 1e-6
     use_sink: bool = True
@@ -123,10 +122,13 @@ class ModelConfig(BaseModelConfig):
 
     @classmethod
     def from_dict(cls, params):
-        # MiMo-V2 keeps its text hyperparameters at the top level rather than
-        # under a "text_config" key. load_model() inserts an empty one and then
-        # rebuilds text_config from it via update_module_configs(), so the flat
-        # params are written back into the caller's mapping to survive that pass.
+        """Build the config, flattening MiMo-V2's top-level text fields.
+
+        The text hyperparameters live at the top level rather than under a
+        ``text_config`` key. ``load_model`` inserts an empty one and then
+        rebuilds ``text_config`` from it, so the flat params are written back
+        into the caller's mapping to survive that second pass.
+        """
         if not params.get("text_config"):
             params["text_config"] = {
                 k: v
