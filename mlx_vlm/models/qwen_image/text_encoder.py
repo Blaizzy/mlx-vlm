@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -8,7 +9,10 @@ import numpy as np
 from PIL import Image
 from transformers import AutoTokenizer
 
-from mlx_vlm.models.qwen3_vl import processing_qwen3_vl  # noqa: F401
+from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import (
+    Qwen3VLImageProcessor,
+    Qwen3VLProcessor,
+)
 from mlx_vlm.models.qwen3_vl.qwen3_vl import Model as Qwen3VLModel
 
 SYSTEM_PROMPT = "Comprehend and analyze the provided prompt."
@@ -55,18 +59,14 @@ class QwenImageTextEncoder:
         self.model = model
         self.model_path = Path(model_path).expanduser()
         self.max_length = max_length
-        # Tokenizer/processor assets live in the pipeline's processor/ component,
-        # not alongside the text-encoder weights. The full processor (needed only
-        # for reference-image editing) is loaded lazily; it pulls in a torch-based
-        # video processor that text-to-image does not need.
+        # Reuse the NumPy image processor so editing does not require PyTorch.
         self.processor_dir = str(self.model_path / "processor")
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.processor_dir, local_files_only=True, use_fast=True
         )
         self._processor = None
         # Number of leading system-turn tokens the reference drops from the hidden
-        # states, derived by tokenizing the template's system prefix directly (the
-        # processor ships no chat template).
+        # states, derived by tokenizing the template's system prefix directly.
         system_prefix = f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
         self.drop_idx = len(
             self.tokenizer(system_prefix, add_special_tokens=False)["input_ids"]
@@ -108,8 +108,19 @@ class QwenImageTextEncoder:
     @property
     def processor(self):
         if self._processor is None:
-            self._processor = AutoProcessor.from_pretrained(
-                self.processor_dir, local_files_only=True
+            config = json.loads(
+                (Path(self.processor_dir) / "preprocessor_config.json").read_text()
+            )
+            size = config.get("size", {})
+            config["min_pixels"] = config.get("min_pixels") or size.get(
+                "shortest_edge", 65536
+            )
+            config["max_pixels"] = config.get("max_pixels") or size.get(
+                "longest_edge", 16777216
+            )
+            self._processor = Qwen3VLProcessor(
+                image_processor=Qwen3VLImageProcessor(**config),
+                tokenizer=self.tokenizer,
             )
         return self._processor
 
@@ -117,9 +128,14 @@ class QwenImageTextEncoder:
         self,
         prompt: str,
         images: Sequence[Image.Image],
-    ) -> mx.array:
-        refs = [image.convert("RGB") for image in images]
-        prefix = "".join(
+    ) -> tuple[mx.array, mx.array]:
+        refs = []
+        for image in images:
+            rgba = image.convert("RGBA")
+            rgb = Image.new("RGB", rgba.size, "white")
+            rgb.paste(rgba, mask=rgba.getchannel("A"))
+            refs.append(rgb)
+        prefix = " ".join(
             f"<image{index}>{IMAGE_PLACEHOLDER}" for index in range(1, len(refs) + 1)
         )
         formatted = PROMPT_TEMPLATE_TI2I.format(prefix, prompt)
@@ -132,7 +148,9 @@ class QwenImageTextEncoder:
         hidden = self._hidden_states(dict(inputs))
         if hidden.shape[1] <= self.drop_idx:
             raise ValueError("Qwen-Image edit prompt was empty after template trimming")
-        return hidden[:, self.drop_idx :]
+        image_token_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        image_pad_mask = _to_mx(inputs["input_ids"]) == image_token_id
+        return hidden[:, self.drop_idx :], image_pad_mask[:, self.drop_idx :]
 
 
 __all__ = [

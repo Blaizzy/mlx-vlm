@@ -32,6 +32,7 @@ class FlowMatchEulerDiscreteScheduler:
         base_image_seq_len: int = 256,
         max_image_seq_len: int = 8192,
         num_train_timesteps: int = 1000,
+        shift_terminal: float | None = 0.02,
     ) -> None:
         sigmas = mx.linspace(
             1.0, 1.0 / num_inference_steps, num_inference_steps, dtype=mx.float32
@@ -40,16 +41,20 @@ class FlowMatchEulerDiscreteScheduler:
             image_seq_len, base_image_seq_len, max_image_seq_len, base_shift, max_shift
         )
         sigmas = mx.exp(mu) / (mx.exp(mu) + (1.0 / sigmas - 1.0))
+        # Stretch the shifted schedule before appending the final zero sigma.
+        # A one-step schedule has no interval to stretch and starts at pure noise.
+        if shift_terminal and num_inference_steps > 1:
+            one_minus_sigmas = 1.0 - sigmas
+            scale = one_minus_sigmas[-1] / (1.0 - shift_terminal)
+            sigmas = 1.0 - one_minus_sigmas / scale
         self.timesteps = sigmas * num_train_timesteps
         self.sigmas = mx.concatenate(
             [sigmas, mx.zeros((1,), dtype=sigmas.dtype)], axis=0
         )
 
     def step(self, *, noise: mx.array, step_index: int, latents: mx.array) -> mx.array:
-        dt = (self.sigmas[step_index + 1] - self.sigmas[step_index]).astype(
-            latents.dtype
-        )
-        return latents + dt * noise.astype(latents.dtype)
+        dt = (self.sigmas[step_index + 1] - self.sigmas[step_index]).astype(noise.dtype)
+        return (latents.astype(mx.float32) + dt * noise).astype(noise.dtype)
 
 
 __all__ = ["FlowMatchEulerDiscreteScheduler", "calculate_shift"]
