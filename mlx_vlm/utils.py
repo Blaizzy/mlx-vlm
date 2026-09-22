@@ -64,6 +64,7 @@ MODEL_REMAPPING = {
     "nemotron-nas": "nemotron_nas",
     "inkling_mm_model": "inkling",
     "lille-130m": "lille_130m",
+    "qwen3_5_text": "qwen3_5",
 }
 
 MAX_FILE_SIZE_GB = 5
