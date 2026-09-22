@@ -1,3 +1,4 @@
+import inspect
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -118,10 +119,18 @@ class ModelConfig(BaseModelConfig):
 
     @classmethod
     def from_dict(cls, params):
+        # MiMo-V2 keeps its text hyperparameters at the top level rather than
+        # under a "text_config" key. load_model() inserts an empty one and then
+        # rebuilds text_config from it via update_module_configs(), so the flat
+        # params are written back into the caller's mapping to survive that pass.
+        if not params.get("text_config"):
+            params["text_config"] = {
+                k: v
+                for k, v in params.items()
+                if k in inspect.signature(TextConfig).parameters
+            }
         params = dict(params)
+        params["text_config"] = TextConfig.from_dict(params["text_config"])
         params["vision_config"] = VisionConfig.from_dict(params.get("vision_config"))
         params["audio_config"] = AudioConfig.from_dict(params.get("audio_config"))
-        # MiMo-V2 keeps the text hyperparameters at the top level rather than
-        # under a "text_config" key, so TextConfig is built from the same params.
-        params["text_config"] = TextConfig.from_dict(params)
         return super().from_dict(params)
