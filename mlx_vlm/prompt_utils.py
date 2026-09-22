@@ -119,6 +119,7 @@ MODEL_CONFIG = {
     "hrm_text": MessageFormat.TEXT_ONLY,
     "minimax_m3": MessageFormat.TEXT_ONLY,
     "qwen3_5_text": MessageFormat.TEXT_ONLY,
+    "limite": MessageFormat.TEXT_ONLY,
 }
 
 # Models that don't support multi-image
