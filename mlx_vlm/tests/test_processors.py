@@ -2026,6 +2026,23 @@ def test_parser_syntax(parser, argument_type, text, expected, tools):
     assert [dict(call, arguments=_arguments(call)) for call in calls] == expected_calls
 
 
+@pytest.mark.parametrize("name", PARSER_NAMES)
+def test_parser_accepts_boolean_property_schemas(name):
+    # ``true`` is a valid JSON Schema for a property that admits any value.
+    tools = [
+        dict(
+            type="function",
+            function=dict(
+                name="get_weather",
+                parameters=dict(type="object", properties=dict(city=True, days=True)),
+            ),
+        )
+    ]
+    result = process_tool_calls(WIRE_CALLS[name], load_tool_module(name), tools)
+    assert [call["function"]["name"] for call in result.calls] == ["get_weather"]
+    assert json.loads(result.calls[0]["function"]["arguments"])["city"] == "Paris"
+
+
 @pytest.mark.parametrize(
     "template",
     [None, {}, [], 123, {"tool_use": None}, {"default": "x", "tool_use": "y"}],

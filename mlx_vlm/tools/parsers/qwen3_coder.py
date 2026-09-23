@@ -42,7 +42,7 @@ def _convert_param_value(param_value: str, param_name: str, param_config: dict) 
     if not (param := param_config.get(param_name, False)):
         return param_value
 
-    if "type" in param:
+    if isinstance(param, dict) and "type" in param:
         param_type = str(param["type"]).strip().lower()
     else:
         param_type = "string"
