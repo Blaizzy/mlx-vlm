@@ -2179,15 +2179,21 @@ def test_ming_image_layout_is_distinguished_from_z_image(tmp_path):
 
 
 def test_ming_image_scheduler_dynamic_shift():
-    from mlx_vlm.models.ming_image.scheduler import (
-        FlowMatchEulerDiscreteScheduler,
-        resolve_mu,
-    )
+    from mlx_vlm.models.ming_image.pipeline import scheduler_shift
+    from mlx_vlm.models.qwen_image.scheduler import FlowMatchEulerDiscreteScheduler
 
-    assert abs(resolve_mu(4096) - 1.35) < 1e-6
-    assert abs(resolve_mu(16384) - 1.35) < 1e-6
+    assert scheduler_shift(4096) == (4096, 1.35)
+    assert scheduler_shift(16384) == (16384, 1.35)
+    assert scheduler_shift(1024) == (4096, 1.15)
+    max_seq, max_shift = scheduler_shift(4096)
     scheduler = FlowMatchEulerDiscreteScheduler(
-        image_seq_len=4096, num_inference_steps=12
+        image_seq_len=4096,
+        num_inference_steps=12,
+        base_shift=0.5,
+        max_shift=max_shift,
+        base_image_seq_len=256,
+        max_image_seq_len=max_seq,
+        shift_terminal=None,
     )
     sigmas = [float(x) for x in scheduler.sigmas]
     assert sigmas[0] == 1.0 and sigmas[-1] == 0.0

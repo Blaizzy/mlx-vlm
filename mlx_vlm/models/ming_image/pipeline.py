@@ -8,9 +8,16 @@ from pathlib import Path
 import mlx.core as mx
 from transformers import AutoTokenizer
 
+from mlx_vlm.models.qwen_image.scheduler import FlowMatchEulerDiscreteScheduler
+
 from .config import MingImageConfig
-from .scheduler import FlowMatchEulerDiscreteScheduler
 from .weights import load_text_encoder, load_transformer, load_vae
+
+
+def scheduler_shift(image_seq_len: int) -> tuple[int, float]:
+    """Ming's dynamic-shift rule as (max_image_seq_len, max_shift) for the shared
+    flow-match scheduler: high-res prompts (seq >= 4096) clamp the shift to 1.35."""
+    return (image_seq_len, 1.35) if image_seq_len >= 4096 else (4096, 1.15)
 
 
 class MingImagePipeline:
@@ -105,10 +112,16 @@ class MingImagePipeline:
         latents = mx.random.normal(
             (1, z, 1, latent_h, latent_w), key=mx.random.key(seed), dtype=mx.float32
         )
+        max_image_seq_len, max_shift = scheduler_shift(image_seq_len)
         scheduler = FlowMatchEulerDiscreteScheduler(
             image_seq_len=image_seq_len,
             num_inference_steps=steps,
+            base_shift=0.5,
+            max_shift=max_shift,
+            base_image_seq_len=256,
+            max_image_seq_len=max_image_seq_len,
             num_train_timesteps=self.config.num_train_timesteps,
+            shift_terminal=None,
         )
         patch = self.config.dit.patch_size
         conditioning = self.transformer.prepare_conditioning(
