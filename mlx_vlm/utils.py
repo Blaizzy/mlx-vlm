@@ -20,7 +20,7 @@ import requests
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten, tree_map
 from PIL import Image, ImageOps
-from transformers import AutoProcessor, AutoTokenizer
+from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
 
 from .models.base import BaseImageProcessor
@@ -1459,12 +1459,7 @@ def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImagePro
 def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> ProcessorMixin:
-    try:
-        processor = AutoProcessor.from_pretrained(model_path, **kwargs)
-    except OSError:
-        if "vision_config" in load_config(model_path, **kwargs):
-            raise
-        processor = AutoTokenizer.from_pretrained(model_path, **kwargs)
+    processor = AutoProcessor.from_pretrained(model_path, **kwargs)
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
 

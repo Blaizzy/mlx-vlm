@@ -1672,37 +1672,6 @@ class TestMoondream3Sanitize(unittest.TestCase):
         self.assertIn("vision.encoder.blocks.0.ln1.weight", sanitized)
 
 
-def test_text_only_checkpoint_with_stale_vl_processor_class_loads_tokenizer(tmp_path):
-    from tokenizers import Tokenizer, models, pre_tokenizers
-    from transformers import PreTrainedTokenizerFast
-
-    backend = Tokenizer(models.WordLevel({f"t{i}": i for i in range(8)}, "t0"))
-    backend.pre_tokenizer = pre_tokenizers.Whitespace()
-    PreTrainedTokenizerFast(
-        tokenizer_object=backend, unk_token="t0", eos_token="t1"
-    ).save_pretrained(tmp_path)
-    tokenizer_config = tmp_path / "tokenizer_config.json"
-    data = json.loads(tokenizer_config.read_text())
-    data["processor_class"] = "Qwen3VLProcessor"
-    tokenizer_config.write_text(json.dumps(data))
-    (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3_5_text"}))
-
-    processor = load_processor(tmp_path, eos_token_ids=[1])
-    assert processor.encode("t3 t4", add_special_tokens=False) == [3, 4]
-
-    (tmp_path / "config.json").write_text(
-        json.dumps({"model_type": "qwen3_5", "vision_config": {}})
-    )
-    with (
-        patch(
-            "mlx_vlm.utils.AutoProcessor.from_pretrained",
-            side_effect=OSError("missing"),
-        ),
-        pytest.raises(OSError, match="missing"),
-    ):
-        load_processor(tmp_path, eos_token_ids=[1])
-
-
 class TestQwen3_5MoeText(unittest.TestCase):
     """Decoder-only Qwen3.5 MoE checkpoints (model_type qwen3_5_moe_text)."""
 
@@ -1804,6 +1773,32 @@ class TestQwen3_5MoeText(unittest.TestCase):
         raw["model.layers.0.mlp.experts.gate_up_proj"] = mx.zeros((123,))
         with self.assertRaisesRegex(ValueError, "expected \\[num_experts"):
             model.sanitize(raw)
+
+    def test_stale_vl_processor_class_loads_the_tokenizer(self):
+        import tempfile
+
+        from tokenizers import Tokenizer, models, pre_tokenizers
+        from transformers import PreTrainedTokenizerFast
+
+        importlib.import_module("mlx_vlm.models.qwen3_5_moe_text")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            vocab = {f"t{i}": i for i in range(32)}
+            backend = Tokenizer(models.WordLevel(vocab, unk_token="t0"))
+            backend.pre_tokenizer = pre_tokenizers.Whitespace()
+            PreTrainedTokenizerFast(
+                tokenizer_object=backend, unk_token="t0", eos_token="t1"
+            ).save_pretrained(tmp)
+            tokenizer_config = Path(tmp) / "tokenizer_config.json"
+            data = json.loads(tokenizer_config.read_text())
+            data["processor_class"] = "Qwen3VLProcessor"
+            tokenizer_config.write_text(json.dumps(data))
+            (Path(tmp) / "config.json").write_text(json.dumps(self.CONFIG))
+
+            processor = load_processor(Path(tmp), eos_token_ids=[1])
+
+        self.assertFalse(hasattr(processor, "image_processor"))
+        self.assertEqual(processor.encode("t3 t4", add_special_tokens=False), [3, 4])
 
     def test_sanitize_is_idempotent_on_converted_weights(self):
         model = self._model()
