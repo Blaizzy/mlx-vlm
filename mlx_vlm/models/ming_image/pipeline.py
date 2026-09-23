@@ -37,28 +37,25 @@ class MingImagePipeline:
         self.transformer = None
         self.vae = None
 
-    def _tokenize(self, prompt: str) -> mx.array:
+    def _prompt_ids(self, prompt: str) -> list[int]:
         text = self.tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],
             tokenize=False,
             add_generation_prompt=True,
         )
-        ids = self.tokenizer(text, add_special_tokens=False)["input_ids"]
+        return self.tokenizer(text, add_special_tokens=False)["input_ids"]
+
+    def _tokenize(self, prompt: str) -> mx.array:
         cfg = self.config
         block = (
             [cfg.image_start_token]
             + [cfg.image_patch_token] * cfg.bridge.query_token_count
             + [cfg.image_end_token]
         )
-        return mx.array([ids + block], dtype=mx.int32)
+        return mx.array([self._prompt_ids(prompt) + block], dtype=mx.int32)
 
     def count_prompt_tokens(self, prompt: str) -> int:
-        text = self.tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        return len(self.tokenizer(text, add_special_tokens=False)["input_ids"])
+        return len(self._prompt_ids(prompt))
 
     def _ensure_components(self) -> None:
         if self.transformer is None:
