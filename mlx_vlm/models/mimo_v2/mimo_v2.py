@@ -4,6 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import InputEmbeddingsFeatures, LanguageModelOutput
+from .audio import AudioEncoder, build_speech_embeddings
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
@@ -18,6 +19,27 @@ class Model(nn.Module):
         self.vision_tower = (
             None if config.skip_vision else VisionModel(config.vision_config)
         )
+        self.speech_embeddings = build_speech_embeddings(config.audio_config)
+        self.audio_encoder = AudioEncoder(config.audio_config)
+
+    def _encode_vision(self, pixel_values, grid_thw, modality):
+        if self.vision_tower is None:
+            raise ValueError(f"Cannot encode {modality} when vision is disabled")
+        if grid_thw is None:
+            raise ValueError(f"{modality}_grid_thw is required with pixel values")
+        dtype = self.vision_tower.patch_embed.proj.weight.dtype
+        return self.vision_tower(pixel_values.astype(dtype), grid_thw)
+
+    def encode_images(self, pixel_values, **kwargs):
+        return [
+            self._encode_vision(pixel_values, kwargs.get("image_grid_thw"), "image")
+        ]
+
+    def encode_video(self, pixel_values, video_grid_thw=None):
+        return self._encode_vision(pixel_values, video_grid_thw, "video")
+
+    def encode_audio(self, audio_codes):
+        return self.audio_encoder(audio_codes, self.speech_embeddings)
 
     def get_input_embeddings(
         self,
@@ -25,13 +47,68 @@ class Model(nn.Module):
         pixel_values: Optional[mx.array] = None,
         **kwargs,
     ) -> InputEmbeddingsFeatures:
-        if pixel_values is not None:
-            raise NotImplementedError(
-                "MiMo-V2.6 image input is not implemented yet; text-only for now"
-            )
-        return InputEmbeddingsFeatures(
-            inputs_embeds=self.language_model.model.embed_tokens(input_ids)
+        inputs_embeds = self.language_model.model.embed_tokens(input_ids)
+        modalities = (
+            (
+                self.config.image_token_id,
+                pixel_values,
+                kwargs.get("image_grid_thw"),
+                kwargs.get("cached_image_features"),
+                "image",
+            ),
+            (
+                self.config.video_token_id,
+                kwargs.get("pixel_values_videos", kwargs.get("video_pixel_values")),
+                kwargs.get("video_grid_thw"),
+                kwargs.get("cached_video_features"),
+                "video",
+            ),
         )
+        for token_id, pixels, grid, cached, modality in modalities:
+            if pixels is None and cached is None:
+                continue
+            if cached is None:
+                cached = self._encode_vision(pixels, grid, modality)
+            if not isinstance(cached, mx.array):
+                cached = mx.concatenate(list(cached), axis=0)
+            inputs_embeds = self._replace_modal_embeddings(
+                input_ids, inputs_embeds, token_id, cached
+            )
+        audio_codes = kwargs.get("audio_codes")
+        audio_features = kwargs.get("cached_audio_features", kwargs.get("audio_embeds"))
+        if audio_codes is not None or audio_features is not None:
+            if audio_features is None:
+                audio_features = self.encode_audio(audio_codes)
+            inputs_embeds = self._replace_modal_embeddings(
+                input_ids,
+                inputs_embeds,
+                self.config.audio_token_id,
+                audio_features,
+            )
+        return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
+
+    @staticmethod
+    def _replace_modal_embeddings(input_ids, inputs_embeds, token_id, features):
+        if features.ndim != 2:
+            raise ValueError(
+                f"Modal features must be 2D, received shape {features.shape}"
+            )
+        if features.shape[-1] != inputs_embeds.shape[-1]:
+            raise ValueError(
+                f"Modal feature width {features.shape[-1]} does not match "
+                f"text embedding width {inputs_embeds.shape[-1]}"
+            )
+        mask = input_ids == token_id
+        positions = [i for i, value in enumerate(mask.flatten().tolist()) if value]
+        if len(positions) != features.shape[0]:
+            raise ValueError(
+                f"Found {len(positions)} placeholder tokens for {features.shape[0]} features"
+            )
+        if not positions:
+            return inputs_embeds
+        flat = inputs_embeds.reshape(-1, inputs_embeds.shape[-1])
+        flat[mx.array(positions, mx.uint32)] = features.astype(inputs_embeds.dtype)
+        return flat.reshape(inputs_embeds.shape)
 
     def __call__(
         self,
@@ -53,12 +130,13 @@ class Model(nn.Module):
         if any(k.startswith("language_model.") for k in weights):
             return weights
 
-        vision, language = {}, {}
+        vision, audio, speech, language = {}, {}, {}, {}
         for key, value in weights.items():
-            # the audio tower and speech embeddings have no modules yet
-            if key.startswith(("audio_encoder.", "speech_embeddings.")):
-                continue
-            if key.startswith("visual."):
+            if key.startswith("audio_encoder."):
+                audio[key[len("audio_encoder.") :]] = value
+            elif key.startswith("speech_embeddings."):
+                speech[key] = value
+            elif key.startswith("visual."):
                 vision[key[len("visual.") :]] = value
             else:
                 language[key] = value
@@ -74,6 +152,8 @@ class Model(nn.Module):
                     for k, v in self.vision_tower.sanitize(vision).items()
                 }
             )
+        sanitized.update({f"audio_encoder.{k}": v for k, v in audio.items()})
+        sanitized.update(speech)
         return sanitized
 
     @property

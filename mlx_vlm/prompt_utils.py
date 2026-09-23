@@ -44,6 +44,7 @@ MODEL_CONFIG = {
     "paddleocr_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen2_vl": MessageFormat.LIST_WITH_IMAGE,
     "qwen2_5_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "mimo_v2": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "zaya1_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_vl_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
@@ -297,6 +298,7 @@ class MessageFormatter:
         if self.model_name in [
             "qwen2_vl",
             "qwen2_5_vl",
+            "mimo_v2",
             "qwen3_vl",
             "mage_vl",
             "qwen3_vl_moe",

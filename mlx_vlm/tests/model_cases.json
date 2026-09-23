@@ -1774,11 +1774,28 @@
             1
           ]
         },
-        "model_type": "mimo_v2"
+        "audio_config": {
+          "out_hidden_size": 256,
+          "audio_channels": 2,
+          "group_size": 2,
+          "input_full_attention": true,
+          "input_local_attn_heads": 2,
+          "input_local_dim": 16,
+          "input_local_intermediate_size": 32,
+          "input_local_layers": 2,
+          "projection_layers": 2,
+          "speech_vocab_size": 32,
+          "speech_zeroemb_idx": 0
+        },
+        "model_type": "mimo_v2",
+        "image_token_id": 124,
+        "video_token_id": 125,
+        "audio_token_id": 126
       },
       "checks": [
         "language",
-        "vision"
+        "vision",
+        "input_embeddings"
       ],
       "vision": {
         "input_shape": [

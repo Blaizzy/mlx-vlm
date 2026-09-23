@@ -2269,6 +2269,41 @@ class TestEstimateNumImageTokens:
             estimate_num_image_tokens(SimpleNamespace(), 480, 640)
 
 
+class TestMiMoV2Processor:
+    def test_processor_attributes(self):
+        from mlx_vlm.models.mimo_v2.processing import MiMoV2Processor
+
+        assert MiMoV2Processor.get_attributes() == [
+            "image_processor",
+            "tokenizer",
+            "video_processor",
+        ]
+
+    def test_audio_codes_expand_placeholders_by_grouped_length(self):
+        from mlx_vlm.models.mimo_v2.processing import MiMoV2Processor
+        from mlx_vlm.models.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor
+
+        processor = object.__new__(MiMoV2Processor)
+        processor.audio_token = "<|audio_pad|>"
+        processor._audio_tokenizer = SimpleNamespace(
+            encode=lambda *args, **kwargs: mx.zeros((20, 5), dtype=mx.int32)
+        )
+        captured = {}
+
+        def process(*args, **kwargs):
+            captured.update(kwargs)
+            return {}
+
+        with patch.object(Qwen2_5_VLProcessor, "__call__", side_effect=process):
+            result = processor(
+                text=["before<|audio_pad|>after"],
+                audio=np.zeros(1600, dtype=np.float32),
+            )
+
+        assert captured["text"] == ["before<|audio_pad|><|audio_pad|>after"]
+        assert result["audio_codes"].shape == (5, 20)
+
+
 @pytest.fixture(scope="module")
 def synthetic_video(tmp_path_factory):
     """A deterministic 600-frame 64x64 clip at 30 fps, i.e. 20 seconds."""
