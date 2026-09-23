@@ -1668,6 +1668,26 @@ def test_positioned_target_sampler_honors_top_k(module_name, top_p):
     assert set(tokens.tolist()) <= {2, 3}
 
 
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+@pytest.mark.parametrize("top_p", [1e-3, 1e-8])
+def test_tiny_top_p_keeps_the_most_likely_token(dtype, top_p):
+    # The row's mass rounds to just under 1, so an absolute 1 - top_p
+    # threshold keeps nothing.
+    logits = mx.array([[0.0, 1.0, 3.0, 2.0]])
+    logprobs = (logits - mx.logsumexp(logits, axis=-1, keepdims=True)).astype(dtype)
+
+    kept = sampling.apply_top_p(logprobs, top_p) > -mx.inf
+    assert kept.tolist() == [[False, False, True, False]]
+    assert sampling.make_sampler(temp=1.0, top_p=top_p)(logprobs).tolist() == [2]
+    assert sampling.top_p_sampling(logprobs, top_p, 1.0).tolist() == [2]
+    for module_name in ("mlx_vlm.generate.ar", "mlx_vlm.server.generation"):
+        sampler = importlib.import_module(module_name)._PositionedTargetSampler(
+            temperature=1.0, top_p=top_p, seed=0
+        )
+        tokens = sampler.sample_target(logprobs, row_ids=[0], positions=[0])
+        assert tokens.tolist() == [2]
+
+
 # Loading and utility contracts
 
 

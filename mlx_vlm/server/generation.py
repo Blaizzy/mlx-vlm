@@ -35,6 +35,7 @@ from ..generate.diffusion import (
     stream_diffusion_generate_from_kwargs,
 )
 from ..sample_utils import (
+    _top_p_mask,
     apply_top_k,
     make_logits_processors,
     make_sampler,
@@ -201,9 +202,8 @@ class _PositionedTargetSampler:
         probs = mx.softmax(logprobs / self.temperature, axis=-1)
         sorted_indices = mx.argsort(probs, axis=-1)
         sorted_probs = mx.take_along_axis(probs, sorted_indices, axis=-1)
-        cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
         top_probs = mx.where(
-            cumulative_probs > 1 - self.top_p,
+            _top_p_mask(sorted_probs, self.top_p),
             sorted_probs,
             mx.zeros_like(sorted_probs),
         )

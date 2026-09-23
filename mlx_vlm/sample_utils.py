@@ -297,11 +297,11 @@ def apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:
     Returns:
         token selected based on the top-p criterion.
     """
-    probs = mx.exp(logprobs)
+    probs = mx.exp(logprobs.astype(mx.float32))
     sorted_indices = mx.argsort(logprobs, axis=-1)
     sorted_probs = mx.take_along_axis(probs, sorted_indices, axis=-1)
 
-    cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
+    keep = _top_p_mask(sorted_probs, top_p)
 
     inverse_indices = mx.put_along_axis(
         mx.zeros_like(sorted_indices),
@@ -309,13 +309,22 @@ def apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:
         mx.arange(sorted_indices.shape[-1], dtype=sorted_indices.dtype),
         axis=-1,
     )
-    cumulative_probs = mx.take_along_axis(cumulative_probs, inverse_indices, axis=-1)
+    keep = mx.take_along_axis(keep, inverse_indices, axis=-1)
 
-    return mx.where(
-        cumulative_probs > 1 - top_p,
-        logprobs,
-        -float("inf"),
-    )
+    return mx.where(keep, logprobs, -float("inf"))
+
+
+def _top_p_mask(sorted_probs: mx.array, top_p: float) -> mx.array:
+    """Top-p mask for probabilities sorted in ascending order.
+
+    The threshold is relative to the row's own mass, which rounding can leave
+    just under 1, and the most likely token is always kept, so a small top_p
+    cannot mask every token.
+    """
+    cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
+    total = cumulative_probs[..., -1:]
+    top = mx.arange(sorted_probs.shape[-1]) == sorted_probs.shape[-1] - 1
+    return (cumulative_probs > (1 - top_p) * total) | top
 
 
 def apply_typical_p(logprobs: mx.array, typical_p: float) -> mx.array:
@@ -501,10 +510,8 @@ def top_p_sampling(logits: mx.array, top_p: float, temperature: float) -> mx.arr
     sorted_indices = mx.argsort(probs, axis=-1)
     sorted_probs = mx.take_along_axis(probs, sorted_indices, axis=-1)
 
-    cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
-
     top_probs = mx.where(
-        cumulative_probs > 1 - top_p,
+        _top_p_mask(sorted_probs, top_p),
         sorted_probs,
         mx.zeros_like(sorted_probs),
     )
