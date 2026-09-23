@@ -10,6 +10,7 @@ import mlx.nn as nn
 
 from .config import MingImageConfig
 from .transformer import MingImageTransformer, sanitize_transformer_weights
+from .vae import build_vae, sanitize_vae_weights
 
 
 def _load_shards(directory: Path) -> dict[str, mx.array]:
@@ -66,4 +67,12 @@ def load_transformer(
     return _apply(model, list(weights.items()), _read_quant(root / "transformer"))
 
 
-__all__ = ["load_transformer"]
+def load_vae(model_path: str | Path, config: MingImageConfig | None = None):
+    root = Path(model_path).expanduser()
+    config = config or MingImageConfig.from_model_path(root)
+    model = build_vae(config.vae)
+    weights = sanitize_vae_weights(_load_shards(root / "vae"))
+    return _apply(model, list(weights.items()), _read_quant(root / "vae"))
+
+
+__all__ = ["load_transformer", "load_vae"]
