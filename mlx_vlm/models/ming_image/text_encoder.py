@@ -11,8 +11,10 @@ from mlx_vlm.models.bailing_moe.language import (
     BailingMoeGate,
     aggregate_expert_outputs,
 )
-from mlx_vlm.models.base import create_attention_mask, scaled_dot_product_attention
+from mlx_vlm.models.base import create_attention_mask
 from mlx_vlm.models.mlp import SwiGLUMLP
+from mlx_vlm.models.qwen2.config import ModelConfig as Qwen2Config
+from mlx_vlm.models.qwen2.language import TransformerBlock as Qwen2Block
 from mlx_vlm.models.switch_layers import SwitchGLU
 
 from .config import MingImageConnectorConfig
@@ -86,68 +88,28 @@ class MingMLLM(nn.Module):
         return hidden_states
 
 
-class Qwen2Attention(nn.Module):
-    def __init__(self, config: MingImageConnectorConfig) -> None:
-        super().__init__()
-        self.num_heads = config.num_attention_heads
-        self.num_kv_heads = config.num_key_value_heads
-        self.head_dim = config.head_dim
-        self.scale = self.head_dim**-0.5
-        hidden = config.hidden_size
-        self.q_proj = nn.Linear(hidden, self.num_heads * self.head_dim, bias=True)
-        self.k_proj = nn.Linear(hidden, self.num_kv_heads * self.head_dim, bias=True)
-        self.v_proj = nn.Linear(hidden, self.num_kv_heads * self.head_dim, bias=True)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, hidden, bias=False)
-        self.rope = nn.RoPE(self.head_dim, traditional=False, base=config.rope_theta)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        b, length, _ = x.shape
-        q = self.q_proj(x).reshape(b, length, self.num_heads, -1).transpose(0, 2, 1, 3)
-        k = (
-            self.k_proj(x)
-            .reshape(b, length, self.num_kv_heads, -1)
-            .transpose(0, 2, 1, 3)
-        )
-        v = (
-            self.v_proj(x)
-            .reshape(b, length, self.num_kv_heads, -1)
-            .transpose(0, 2, 1, 3)
-        )
-        q = self.rope(q)
-        k = self.rope(k)
-        out = scaled_dot_product_attention(
-            q, k, v, cache=None, scale=self.scale, mask=None
-        )
-        out = out.transpose(0, 2, 1, 3).reshape(b, length, -1)
-        return self.o_proj(out)
-
-
-class Qwen2Layer(nn.Module):
-    def __init__(self, config: MingImageConnectorConfig) -> None:
-        super().__init__()
-        self.self_attn = Qwen2Attention(config)
-        self.mlp = SwiGLUMLP(config.hidden_size, config.intermediate_size)
-        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-
-    def __call__(self, x: mx.array) -> mx.array:
-        h = x + self.self_attn(self.input_layernorm(x))
-        return h + self.mlp(self.post_attention_layernorm(h))
-
-
 class Qwen2Connector(nn.Module):
-    """Bidirectional Qwen2 encoder over the 256 caption query tokens."""
+    """Bidirectional Qwen2 encoder (shared engine blocks) over the query tokens."""
 
     def __init__(self, config: MingImageConnectorConfig) -> None:
         super().__init__()
-        self.layers = [Qwen2Layer(config) for _ in range(config.num_hidden_layers)]
+        args = Qwen2Config(
+            model_type="qwen2",
+            hidden_size=config.hidden_size,
+            num_hidden_layers=config.num_hidden_layers,
+            intermediate_size=config.intermediate_size,
+            num_attention_heads=config.num_attention_heads,
+            num_key_value_heads=config.num_key_value_heads,
+            rms_norm_eps=config.rms_norm_eps,
+            rope_theta=config.rope_theta,
+            vocab_size=1,
+        )
+        self.layers = [Qwen2Block(args) for _ in range(config.num_hidden_layers)]
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def __call__(self, x: mx.array) -> mx.array:
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, mask=None)
         return self.norm(x)
 
 

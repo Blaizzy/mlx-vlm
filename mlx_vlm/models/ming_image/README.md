@@ -43,7 +43,3 @@ The conditioning is produced once per prompt:
 A Lumina/NextDiT **diffusion transformer** (`transformer`) then denoises the
 latent with joint image+caption self-attention over ~12 flow-match steps, and an
 `AutoencoderKLQwenImage` decodes the latent to a 4-channel RGBA image.
-
-The caption embedding, context refiner, and RoPE tables carry no timestep
-dependence, so they are computed once and reused across every denoising step
-(`MingImageTransformer.prepare_conditioning` / `denoise`).

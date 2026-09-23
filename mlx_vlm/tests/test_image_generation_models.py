@@ -2200,35 +2200,7 @@ def test_ming_image_scheduler_dynamic_shift():
     assert all(sigmas[i] > sigmas[i + 1] for i in range(len(sigmas) - 1))
 
 
-def test_ming_image_conditioning_cache_is_exact():
-    from mlx_vlm.models.ming_image.config import MingImageDiTConfig
-    from mlx_vlm.models.ming_image.transformer import MingImageTransformer
-
-    cfg = MingImageDiTConfig(
-        dim=128,
-        n_heads=1,
-        n_kv_heads=1,
-        n_layers=2,
-        n_refiner_layers=1,
-        intermediate_size=64,
-        cap_feat_dim=16,
-        adaln_embed_dim=32,
-    )
-    model = MingImageTransformer(cfg)
-    model.eval()
-    mx.eval(model.parameters())
-    x = mx.random.normal((1, 16, 1, 8, 8))
-    cap = mx.random.normal((1, 4, 16))
-    cap2 = mx.random.normal((1, 3, 128))
-    conditioning = model.prepare_conditioning(cap, cap2, (1, 4, 4))
-    for value in (0.9, 0.5, 0.1):
-        t = mx.array([value])
-        cached = model.denoise(x, t, conditioning)
-        fresh = model(x, t, cap, cap2)
-        assert_allclose(np.array(cached), np.array(fresh), rtol=1e-4, atol=1e-4)
-
-
-def test_ming_image_denoise_supports_batching():
+def test_ming_image_transformer_supports_batching():
     from mlx_vlm.models.ming_image.config import MingImageDiTConfig
     from mlx_vlm.models.ming_image.transformer import MingImageTransformer
 
@@ -2247,13 +2219,10 @@ def test_ming_image_denoise_supports_batching():
     mx.eval(model.parameters())
     cap = mx.random.normal((1, 4, 16))
     cap2 = mx.random.normal((1, 3, 128))
-    conditioning = model.prepare_conditioning(cap, cap2, (1, 4, 4))
     x = mx.random.normal((1, 16, 1, 8, 8))
     t = mx.array([0.5])
-    single = model.denoise(x, t, conditioning)
-    # The conditioning (batch 1) must broadcast correctly across a latent batch:
-    # duplicated latents must reproduce the single-image result row-for-row.
-    batched = model.denoise(mx.concatenate([x, x], axis=0), t, conditioning)
+    single = model(x, t, cap, cap2)
+    batched = model(mx.concatenate([x, x], axis=0), t, cap, cap2)
     assert batched.shape == (2, 16, 1, 8, 8)
     assert_allclose(np.array(batched[0]), np.array(single[0]), rtol=1e-4, atol=1e-4)
     assert_allclose(np.array(batched[1]), np.array(single[0]), rtol=1e-4, atol=1e-4)
