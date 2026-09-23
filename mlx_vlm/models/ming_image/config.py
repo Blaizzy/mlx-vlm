@@ -240,6 +240,15 @@ def detect_ming_image_layout(path: str | Path) -> bool:
     )
 
 
+def validate_dimensions(*, width: int, height: int) -> None:
+    """Reject sizes outside the model's [256, 2048] multiple-of-16 range."""
+    for label, value in (("width", width), ("height", height)):
+        if value < 256 or value > 2048:
+            raise ValueError(f"{label} must be in [256, 2048], got {value}")
+        if value % 16:
+            raise ValueError(f"{label} must be a multiple of 16, got {value}")
+
+
 __all__ = [
     "MingImageBridgeConfig",
     "MingImageConfig",
@@ -247,4 +256,5 @@ __all__ = [
     "MingImageDiTConfig",
     "MingImageVAEConfig",
     "detect_ming_image_layout",
+    "validate_dimensions",
 ]

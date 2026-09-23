@@ -10,7 +10,7 @@ from transformers import AutoTokenizer
 
 from mlx_vlm.models.qwen_image.scheduler import FlowMatchEulerDiscreteScheduler
 
-from .config import MingImageConfig
+from .config import MingImageConfig, validate_dimensions
 from .weights import load_text_encoder, load_transformer, load_vae
 
 
@@ -86,11 +86,7 @@ class MingImagePipeline:
         num_images: int = 1,
     ) -> mx.array:
         """Generate one image ([H, W, 4]) or a batch ([N, H, W, 4]) for one prompt."""
-        for name, value in (("width", width), ("height", height)):
-            if value < 16 or value % 16:
-                raise ValueError(
-                    f"{name} must be a positive multiple of 16, got {value}"
-                )
+        validate_dimensions(width=width, height=height)
         if steps < 1:
             raise ValueError(f"steps must be at least 1, got {steps}")
         if num_images < 1:
