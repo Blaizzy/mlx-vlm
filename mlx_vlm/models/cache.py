@@ -1624,7 +1624,9 @@ class BatchKVCache(_BaseCache):
             self.keys = dynamic_roll(self.keys, padding[:, None], axis=2)
             self.values = dynamic_roll(self.values, padding[:, None], axis=2)
             self.offset -= padding
-            self.left_padding += padding
+            # Rebind rather than add in place: models keep host copies of
+            # left_padding keyed by the array's identity.
+            self.left_padding = self.left_padding + padding
             self._right_padding = None
 
     @property
@@ -2392,7 +2394,7 @@ class BatchQuantizedKVCache(_BaseCache):
                 dynamic_roll(v, padding[:, None], axis=2) for v in self.values
             )
         self.offset -= padding
-        self.left_padding += padding
+        self.left_padding = self.left_padding + padding
         self._right_padding = None
 
     def update_and_fetch(self, keys: mx.array, values: mx.array):
