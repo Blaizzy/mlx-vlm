@@ -45,7 +45,12 @@ def _convert_param_value(param_value: str, param_name: str, param_config: dict) 
     if isinstance(param, dict) and "type" in param:
         param_type = str(param["type"]).strip().lower()
     else:
-        param_type = "string"
+        # Untyped: decode objects and arrays, keep scalars such as "123" as text.
+        try:
+            value = json.loads(param_value)
+        except json.JSONDecodeError:
+            return param_value
+        return value if isinstance(value, (dict, list)) else param_value
     if param_type in _string_types:
         return param_value
     elif (

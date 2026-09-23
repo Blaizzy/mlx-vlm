@@ -2006,6 +2006,30 @@ def test_invalid_calls(name, text, error):
             _call("get_weather", zip="10001", days=3),
             _weather_tools(zip="string", days="integer"),
         ),
+        (
+            "qwen3_coder",
+            dict,
+            '<function=configure>\n<parameter=options>\n{"depth": 2}\n</parameter>\n'
+            "<parameter=ids>\n[1, 2]\n</parameter>\n"
+            "<parameter=tag>\n123\n</parameter>\n</function>",
+            _call("configure", options={"depth": 2}, ids=[1, 2], tag="123"),
+            [
+                dict(
+                    type="function",
+                    function=dict(
+                        name="configure",
+                        parameters=dict(
+                            type="object",
+                            properties=dict(
+                                options=dict(description="untyped"),
+                                ids=dict(description="untyped"),
+                                tag=dict(description="untyped"),
+                            ),
+                        ),
+                    ),
+                )
+            ],
+        ),
     ],
     ids=[
         "gemma-nested",
@@ -2015,6 +2039,7 @@ def test_invalid_calls(name, text, error):
         "cohere-object",
         "cohere-array-escape",
         "glm-newline",
+        "qwen-untyped",
     ],
 )
 def test_parser_syntax(parser, argument_type, text, expected, tools):
