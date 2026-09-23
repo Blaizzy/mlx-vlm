@@ -1577,6 +1577,180 @@ def test_qwen_image_transformer_keeps_bfloat16_through_attention():
     assert bool(mx.all(mx.isfinite(output)))
 
 
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+@pytest.mark.parametrize("reference_shapes", [[(1, 2, 2)], [(1, 2, 2), (1, 2, 4)]])
+def test_qwen_image_kv_cache_matches_full_denoising(
+    dtype, reference_shapes, monkeypatch
+):
+    mx.random.seed(7)
+    model = _qwen_image_transformer(num_layers=3)
+    model.set_dtype(dtype)
+    ref_tokens = sum(np.prod(shape) for shape in reference_shapes)
+    slots = [False, True, False]
+    if len(reference_shapes) == 2:
+        slots += [True, True]
+    slots += [False, False]
+    refs = mx.random.normal((1, ref_tokens, 4)).astype(dtype)
+    text = mx.random.normal((1, len(slots), 8)).astype(dtype)
+    kwargs = dict(
+        encoder_hidden_states=text,
+        img_shape=(1, 2, 2),
+        reference_image_shapes=reference_shapes,
+        image_pad_mask=mx.array([slots]),
+        encoder_hidden_states_mask=mx.array([[True] * (len(slots) - 1) + [False]]),
+    )
+    cache = qwen.kv_cache.QwenImageKVCache(3)
+    calls = []
+    original_mlp = qwen.transformer.QwenImageSwiGLU.__call__
+
+    def record_mlp(self, x):
+        calls.append(x.shape[1])
+        return original_mlp(self, x)
+
+    monkeypatch.setattr(qwen.transformer.QwenImageSwiGLU, "__call__", record_mlp)
+    saved_prefix = None
+    for index, time in enumerate([0.9, 0.5, 0.1]):
+        target = mx.random.normal((1, 4, 4)).astype(dtype)
+        full_input = mx.concatenate([refs, target], axis=1)
+        timestep = mx.array([time], dtype=dtype)
+        expected = model(full_input, timestep=timestep, **kwargs)
+        calls.clear()
+        actual = model(
+            full_input if index == 0 else target,
+            timestep=timestep,
+            kv_cache=cache,
+            kv_cache_mode="extract" if index == 0 else "cached",
+            **kwargs,
+        )
+        mx.eval(actual, expected, cache.arrays())
+        assert actual.dtype == dtype
+        assert_allclose(
+            np.array(actual.astype(mx.float32)),
+            np.array(expected.astype(mx.float32)),
+            atol=2e-6 if dtype == mx.float32 else 0.02,
+            rtol=2e-6 if dtype == mx.float32 else 0.02,
+        )
+        prefix_len = ref_tokens + len(slots) - sum(slots)
+        assert cache.prefix_len == prefix_len
+        assert calls == [prefix_len + 4 if index == 0 else 4] * 3
+        for layer in cache.layers:
+            assert layer.key.shape == layer.value.shape == (1, 2, prefix_len, 8)
+            assert layer.key.dtype == layer.value.dtype == dtype
+        if saved_prefix is None:
+            saved_prefix = [np.array(a.astype(mx.float32)) for a in cache.arrays()]
+        else:
+            for actual_prefix, initial in zip(cache.arrays(), saved_prefix):
+                assert_array_equal(np.array(actual_prefix.astype(mx.float32)), initial)
+
+
+def test_qwen_image_kv_cache_rejects_invalid_reuse():
+    model = _qwen_image_transformer()
+    cache = qwen.kv_cache.QwenImageKVCache(1)
+    kwargs = dict(
+        hidden_states=mx.ones((1, 8, 4)),
+        encoder_hidden_states=mx.ones((1, 3, 8)),
+        timestep=mx.array([0.5]),
+        img_shape=(1, 2, 2),
+        reference_image_shapes=[(1, 2, 2)],
+        image_pad_mask=mx.array([[False, True, False]]),
+    )
+    with pytest.raises(ValueError, match="not been populated"):
+        model(**kwargs, kv_cache=cache, kv_cache_mode="cached")
+    with pytest.raises(ValueError, match="requires a kv_cache"):
+        model(**kwargs, kv_cache_mode="extract")
+    with pytest.raises(ValueError, match="must be 'extract' or 'cached'"):
+        model(**kwargs, kv_cache=cache)
+    with pytest.raises(ValueError, match="layer count"):
+        model(
+            **kwargs,
+            kv_cache=qwen.kv_cache.QwenImageKVCache(2),
+            kv_cache_mode="extract",
+        )
+    model.causal_condition = False
+    with pytest.raises(ValueError, match="causal_condition=True"):
+        model(**kwargs, kv_cache=cache, kv_cache_mode="extract")
+    model.causal_condition = True
+    output = model(**kwargs, kv_cache=cache, kv_cache_mode="extract")
+    mx.eval(output, cache.arrays())
+    with pytest.raises(ValueError, match="original target shape and dtype"):
+        model(**kwargs, kv_cache=cache, kv_cache_mode="cached")
+    cache.clear()
+    with pytest.raises(ValueError, match="not been populated"):
+        model(**kwargs, kv_cache=cache, kv_cache_mode="cached")
+
+
+@pytest.mark.parametrize(
+    "use_cache, causal, steps",
+    [(True, True, 3), (False, True, 3), (True, False, 3), (True, True, 1)],
+)
+def test_qwen_image_pipeline_scopes_kv_cache_to_each_edit_and_cfg_branch(
+    monkeypatch, use_cache, causal, steps
+):
+    mx.random.seed(4)
+    model = _pipeline("qwen_image")
+    model.z_dim = 4
+    model.latents_mean = mx.zeros((1, 4, 1, 1, 1))
+    model.latents_std = mx.ones((1, 4, 1, 1, 1))
+    model.scheduler_config = {}
+    model.transformer = _qwen_image_transformer(num_layers=2)
+    model.transformer.set_dtype(mx.bfloat16)
+    model.transformer.causal_condition = causal
+    calls, decoded = [], []
+    original = qwen.transformer.QwenImageTransformer.__call__
+
+    def record(self, **kwargs):
+        calls.append(kwargs)
+        return original(self, **kwargs)
+
+    def decode(z):
+        decoded.append(np.array(z))
+        for call in calls:
+            if cache := call.get("kv_cache"):
+                assert all(
+                    layer.key is None and layer.value is None for layer in cache.layers
+                )
+        return mx.zeros((1, 4, 1, 32, 32))
+
+    monkeypatch.setattr(qwen.transformer.QwenImageTransformer, "__call__", record)
+    model.vae = SimpleNamespace(decode=decode)
+    args = dict(
+        emb=mx.random.normal((1, 3, 8)).astype(mx.bfloat16),
+        neg=mx.random.normal((1, 4, 8)).astype(mx.bfloat16),
+        seed=7,
+        steps=steps,
+        width=32,
+        height=32,
+        guidance=2.0,
+        reference_latents=mx.random.normal((1, 4, 4)).astype(mx.bfloat16),
+        reference_image_shapes=[(1, 2, 2)],
+        image_pad_mask=mx.array([[False, True, False]]),
+        negative_image_pad_mask=mx.array([[False, False, True, False]]),
+    )
+    for _ in range(2):
+        model._sample(**args, use_kv_cache=use_cache)
+    caching = use_cache and causal and steps > 1
+    assert len(calls) == 4 * steps
+    for index, call in enumerate(calls):
+        first_step = index % (2 * steps) < 2
+        assert call["hidden_states"].shape[1] == (8 if first_step or not caching else 4)
+        if caching:
+            assert call["kv_cache_mode"] == ("extract" if first_step else "cached")
+            assert (
+                call["kv_cache"]
+                is calls[(index // (2 * steps)) * (2 * steps) + index % 2]["kv_cache"]
+            )
+        else:
+            assert "kv_cache" not in call
+    if caching:
+        assert (
+            len({id(calls[i]["kv_cache"]) for i in (0, 1, 2 * steps, 2 * steps + 1)})
+            == 4
+        )
+    assert_array_equal(decoded[0], decoded[1])
+    model._sample(**args, use_kv_cache=False)
+    assert_allclose(decoded[0], decoded[2], atol=0.04, rtol=0.04)
+
+
 @pytest.mark.parametrize("shift_terminal", [0.02, 0.13])
 def test_qwen_image_pipeline_uses_checkpoint_schedule_and_reference_timesteps(
     tmp_path, monkeypatch, shift_terminal
@@ -1768,6 +1942,7 @@ def test_qwen_image_edit_pipeline_encodes_rgba_and_preserves_reference_latents(
         guidance=2.0,
         negative_prompt="",
         output_resolution=256,
+        use_kv_cache=False,
     )
     assert output.shape == (128, 512, 4)  # Default aspect ratio uses the last image.
     assert prompts == ["combine", ""]
@@ -1825,7 +2000,8 @@ def test_qwen_image_text_encoder_loads_vision_convolution_strictly(
     )
 
 
-def test_qwen_image_edit_dispatch_and_rgba_save(tmp_path):
+@pytest.mark.parametrize("extra", [{}, {"use_kv_cache": False}])
+def test_qwen_image_edit_dispatch_and_rgba_save(tmp_path, extra):
     assert (
         image_edit_model_class("Qwen/Qwen-Image-2.1") is qwen.model.QwenImageEditModel
     )
@@ -1834,12 +2010,16 @@ def test_qwen_image_edit_dispatch_and_rgba_save(tmp_path):
         variant=qwen.config.get_variant(),
         model_path=tmp_path,
         quantization_config=None,
-        edit_array=lambda *args, **kwargs: pixels,
+        edit_array=MagicMock(return_value=pixels),
         count_prompt_tokens=lambda _: 3,
     )
     result = qwen.model.QwenImageEditModel(fake, "qwen-image-2.1").edit(
-        ImageEditRequest("edit", ("reference.png",))
+        ImageEditRequest("edit", ("reference.png",), extra=extra)
     )
+    assert fake.edit_array.call_args.kwargs["use_kv_cache"] == extra.get(
+        "use_kv_cache", True
+    )
+    assert fake.variant.uses_reference_kv_cache
     assert result.color_space == "RGBA"
     assert result.metadata["reference_count"] == 1
     saved = result.save(tmp_path / "result.png")

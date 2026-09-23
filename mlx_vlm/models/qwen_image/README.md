@@ -46,7 +46,9 @@ mlx_vlm.generate \
   --output outputs/qwen-image-edit.png
 ```
 
-`--image` accepts multiple paths for editing with multiple references.
+`--image` accepts multiple paths for editing with multiple references. Editing
+caches the fixed prompt and reference-image keys/values after the first denoising
+step. To disable caching, add `--gen-kwargs '{"use_kv_cache": false}'`.
 
 ## Python
 
@@ -89,4 +91,6 @@ Add paths to `image_paths` for multiple references. Editing defaults to roughly
 1024×1024 pixels using the last reference's aspect ratio. Set `width` and `height`
 to override the output dimensions, or `output_resolution=512` to reduce both the
 reference area and default output area. `result.array` contains the evaluated MLX
-array; `result.save(path)` saves it as a PNG.
+array; `result.save(path)` saves it as a PNG. KV caching is enabled by default for
+editing; pass `use_kv_cache=False` to disable it. Caches are separate for positive
+and negative prompts and are released after each edit's denoising loop.

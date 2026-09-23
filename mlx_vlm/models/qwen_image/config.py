@@ -52,6 +52,7 @@ VARIANTS: dict[str, QwenImageVariant] = {
         transformer_overrides=QWEN_IMAGE_2_1_TRANSFORMER,
         text_encoder_overrides=QWEN_IMAGE_2_1_TEXT_ENCODER,
         supports_edit=True,
+        uses_reference_kv_cache=True,
     ),
 }
 

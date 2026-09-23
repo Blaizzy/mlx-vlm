@@ -9,6 +9,8 @@ import mlx.nn as nn
 
 from mlx_vlm.models.activations import swiglu
 
+from .kv_cache import QwenImageKVCache, QwenImageKVLayerCache
+
 _ROPE_POS = 8192
 _ROPE_NEG = 1024
 _ROPE_ROWS = _ROPE_POS + _ROPE_NEG
@@ -197,7 +199,14 @@ class QwenImageAttention(nn.Module):
         self.norm_k = nn.RMSNorm(head_dim, eps=eps)
 
     def __call__(
-        self, x: mx.array, cos: mx.array, sin: mx.array, mask: mx.array | None
+        self,
+        x: mx.array,
+        cos: mx.array,
+        sin: mx.array,
+        mask: mx.array | None,
+        layer_cache: QwenImageKVLayerCache | None = None,
+        kv_cache_mode: str | None = None,
+        prefix_len: int = 0,
     ) -> mx.array:
         b, s, _ = x.shape
         q = self.norm_q(self.to_q(x).reshape(b, s, self.heads, self.head_dim))
@@ -208,6 +217,12 @@ class QwenImageAttention(nn.Module):
         v = v.transpose(0, 2, 1, 3)
         q = _apply_rope(q, cos, sin)
         k = _apply_rope(k, cos, sin)
+        if kv_cache_mode == "extract":
+            layer_cache.store(k, v, prefix_len)
+        elif kv_cache_mode == "cached":
+            prefix_k, prefix_v = layer_cache.get()
+            k = mx.concatenate([prefix_k, k], axis=2)
+            v = mx.concatenate([prefix_v, v], axis=2)
         out = mx.fast.scaled_dot_product_attention(
             q, k, v, scale=1.0 / math.sqrt(self.head_dim), mask=mask
         )
@@ -246,10 +261,15 @@ class QwenImageTransformerBlock(nn.Module):
         sin: mx.array,
         mask: mx.array | None,
         target_token_mask: mx.array | None,
+        layer_cache: QwenImageKVLayerCache | None = None,
+        kv_cache_mode: str | None = None,
+        prefix_len: int = 0,
     ) -> mx.array:
         mod1, mod2 = mx.split(modulation, 2, axis=-1)
         modulated, gate1 = self._modulate(self.img_norm1(x), mod1, target_token_mask)
-        x = x + mx.tanh(gate1) * self.attn(modulated, cos, sin, mask)
+        x = x + mx.tanh(gate1) * self.attn(
+            modulated, cos, sin, mask, layer_cache, kv_cache_mode, prefix_len
+        )
         modulated2, gate2 = self._modulate(self.img_norm2(x), mod2, target_token_mask)
         x = x + mx.tanh(gate2) * self.img_mlp(modulated2)
         return x
@@ -380,27 +400,92 @@ class QwenImageTransformer(nn.Module):
         encoder_hidden_states_mask: mx.array | None = None,
         reference_image_shapes: list[tuple[int, int, int]] | None = None,
         image_pad_mask: mx.array | None = None,
+        kv_cache: QwenImageKVCache | None = None,
+        kv_cache_mode: str | None = None,
     ) -> mx.array:
+        """Extract a fixed prefix once, then pass only target latents in cached mode.
+
+        Conditioning, image layout, and model weights must remain unchanged for
+        the lifetime of the cache. The pipeline owns a fresh cache per edit/CFG
+        branch and evaluates its arrays together with the first denoising step.
+        """
+        if kv_cache is not None:
+            if not self.causal_condition:
+                raise ValueError("KV caching requires causal_condition=True")
+            if kv_cache_mode not in ("extract", "cached"):
+                raise ValueError("kv_cache_mode must be 'extract' or 'cached'")
+            if len(kv_cache.layers) != len(self.transformer_blocks):
+                raise ValueError("KV cache layer count does not match the transformer")
+        elif kv_cache_mode is not None:
+            raise ValueError("kv_cache_mode requires a kv_cache")
         reference_image_shapes = reference_image_shapes or []
-        h, image_ids, key_valid, blocks = self._joint_inputs(
-            hidden_states,
-            encoder_hidden_states,
-            img_shape,
-            reference_image_shapes,
-            image_pad_mask,
-            encoder_hidden_states_mask,
-        )
-        cos, sin = self.pos_embed.for_layout(h.shape[1], blocks)
+        target_len = math.prod(img_shape)
+        prefix_len = 0
         target_token_mask = None
+        if kv_cache_mode == "cached":
+            if kv_cache.target_shape is None:
+                raise ValueError("Qwen-Image KV cache has not been populated")
+            if (
+                kv_cache.target_shape != img_shape
+                or kv_cache.input_shape != hidden_states.shape
+                or kv_cache.dtype != hidden_states.dtype
+            ):
+                raise ValueError(
+                    "Cached calls require the original target shape and dtype"
+                )
+            h = self.img_in(hidden_states)
+            cos, sin, mask = kv_cache.cos, kv_cache.sin, kv_cache.mask
+            target_token_mask = mx.ones((target_len,), dtype=mx.bool_)
+        else:
+            h, image_ids, key_valid, blocks = self._joint_inputs(
+                hidden_states,
+                encoder_hidden_states,
+                img_shape,
+                reference_image_shapes,
+                image_pad_mask,
+                encoder_hidden_states_mask,
+            )
+            cos, sin = self.pos_embed.for_layout(h.shape[1], blocks)
+            mask = self._block_causal_mask(image_ids, key_valid)
+            if self.causal_condition:
+                target_token_mask = image_ids == len(reference_image_shapes)
+            if kv_cache_mode == "extract":
+                kv_cache.clear()
+                prefix_len = h.shape[1] - target_len
+                kv_cache.prefix_len = prefix_len
+                kv_cache.target_shape = img_shape
+                kv_cache.input_shape = (
+                    hidden_states.shape[0],
+                    target_len,
+                    hidden_states.shape[2],
+                )
+                kv_cache.dtype = hidden_states.dtype
+                kv_cache.cos = mx.contiguous(cos[-target_len:])
+                kv_cache.sin = mx.contiguous(sin[-target_len:])
+                # Every target query can see the entire prefix and target block.
+                kv_cache.mask = (
+                    None
+                    if encoder_hidden_states_mask is None
+                    else key_valid[:, None, None, :]
+                )
         timestep = timestep.astype(h.dtype)
         if self.causal_condition:
             timestep = mx.concatenate([timestep, mx.zeros((1,), dtype=timestep.dtype)])
-            target_token_mask = image_ids == len(reference_image_shapes)
         temb = self.time_text_embed(timestep, h.dtype)
         modulation = self.modulation[0](nn.silu(temb))
-        mask = self._block_causal_mask(image_ids, key_valid)
-        for block in self.transformer_blocks:
-            h = block(h, modulation, cos, sin, mask, target_token_mask)
+        for index, block in enumerate(self.transformer_blocks):
+            layer_cache = None if kv_cache is None else kv_cache.layers[index]
+            h = block(
+                h,
+                modulation,
+                cos,
+                sin,
+                mask,
+                target_token_mask,
+                layer_cache,
+                kv_cache_mode,
+                prefix_len,
+            )
         # The target is the last image block; only it is denoised.
         h = h[:, -math.prod(img_shape) :]
         target_mask = (

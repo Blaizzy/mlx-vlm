@@ -138,6 +138,7 @@ class QwenImageEditModel(QwenImageGenerationModel):
             guidance=guidance,
             negative_prompt=request.extra.get("negative_prompt", " "),
             output_resolution=request.extra.get("output_resolution", 1024),
+            use_kv_cache=request.extra.get("use_kv_cache", True),
         )
         metadata = {
             "model_path": str(self.pipeline.model_path),

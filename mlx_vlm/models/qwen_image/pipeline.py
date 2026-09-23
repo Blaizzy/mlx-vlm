@@ -13,6 +13,7 @@ from PIL import Image
 
 from .config import QwenImageVariant, get_variant
 from .download import download_model, validate_model_layout
+from .kv_cache import QwenImageKVCache
 from .scheduler import FlowMatchEulerDiscreteScheduler
 from .text_encoder import QwenImageTextEncoder
 from .weights import _read_quant, load_text_encoder, load_transformer, load_vae
@@ -136,6 +137,7 @@ class QwenImagePipeline:
         guidance: float = 1.0,
         negative_prompt: str = " ",
         output_resolution: int = 1024,
+        use_kv_cache: bool = True,
     ) -> mx.array:
         """Edit one or more references; return an [H, W, 4] uint8 RGBA image."""
         if not image_paths:
@@ -186,6 +188,7 @@ class QwenImagePipeline:
             reference_image_shapes=reference_shapes,
             image_pad_mask=image_pad_mask,
             negative_image_pad_mask=negative_image_pad_mask,
+            use_kv_cache=use_kv_cache,
         )
 
     def _sample(
@@ -202,6 +205,7 @@ class QwenImagePipeline:
         reference_image_shapes=None,
         image_pad_mask=None,
         negative_image_pad_mask=None,
+        use_kv_cache=False,
     ) -> mx.array:
         z = self.z_dim
         h_lat, w_lat = height // 16, width // 16
@@ -212,15 +216,31 @@ class QwenImagePipeline:
         scheduler = FlowMatchEulerDiscreteScheduler(
             image_seq_len=tokens, num_inference_steps=steps, **self.scheduler_config
         )
+        cache = negative_cache = None
+        if (
+            use_kv_cache
+            and reference_latents is not None
+            and steps > 1
+            and self.transformer.causal_condition
+        ):
+            num_layers = len(self.transformer.transformer_blocks)
+            cache = QwenImageKVCache(num_layers)
+            if neg is not None:
+                negative_cache = QwenImageKVCache(num_layers)
         for i in range(steps):
             t = scheduler.timesteps[i : i + 1].astype(latents.dtype) / 1000
             model_input = latents
             edit_kwargs = {}
             if reference_latents is not None:
-                model_input = mx.concatenate([reference_latents, latents], axis=1)
+                if cache is None or i == 0:
+                    model_input = mx.concatenate([reference_latents, latents], axis=1)
                 edit_kwargs = dict(
                     reference_image_shapes=reference_image_shapes,
                     image_pad_mask=image_pad_mask,
+                )
+            if cache is not None:
+                edit_kwargs.update(
+                    kv_cache=cache, kv_cache_mode="extract" if i == 0 else "cached"
                 )
             pred = self.transformer(
                 hidden_states=model_input,
@@ -232,6 +252,8 @@ class QwenImagePipeline:
             if neg is not None:
                 if reference_latents is not None:
                     edit_kwargs["image_pad_mask"] = negative_image_pad_mask
+                if negative_cache is not None:
+                    edit_kwargs["kv_cache"] = negative_cache
                 neg_pred = self.transformer(
                     hidden_states=model_input,
                     encoder_hidden_states=neg,
@@ -241,7 +263,22 @@ class QwenImagePipeline:
                 )
                 pred = neg_pred + guidance * (pred - neg_pred)
             latents = scheduler.step(noise=pred, step_index=i, latents=latents)
-            mx.eval(latents)
+            if cache is not None and i == 0:
+                # Materialize compact prefix storage at the existing step boundary,
+                # releasing the extraction graph before the next denoising step.
+                mx.eval(
+                    latents,
+                    cache.arrays(),
+                    [] if negative_cache is None else negative_cache.arrays(),
+                )
+            else:
+                mx.eval(latents)
+
+        # The VAE decoder does not need the per-layer prefix buffers.
+        if cache is not None:
+            cache.clear()
+        if negative_cache is not None:
+            negative_cache.clear()
 
         z_lat = (
             latents.transpose(0, 2, 1).reshape(1, z, 1, h_lat, w_lat).astype(mx.float32)
