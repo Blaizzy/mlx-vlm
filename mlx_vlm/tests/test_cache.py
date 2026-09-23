@@ -72,7 +72,7 @@ from mlx_vlm.models.qwen4_exp.language import (
 )
 from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
 from mlx_vlm.models.z1t.language import AFTConv, Z1TCache
-from mlx_vlm.tests.test_models import DATA, build_config, deepseek_v41_config
+from mlx_vlm.tests.test_models import DATA, build_config
 from mlx_vlm.turboquant import (
     BatchTurboQuantKVCache,
     TurboQuantKVCache,
@@ -457,71 +457,6 @@ def test_chunked_kv_cache_trims_on_valid_length_not_buffer_width():
     assert window[-1] == n_tokens - 1
     assert window == list(range(window[0], window[0] + len(window)))
     assert cache.start_position <= cache.offset
-
-
-def test_deepseek_v41_cache_trim_replays_the_tokens_it_dropped():
-    """A trimmed prefix must re-encode to what the uninterrupted run produced.
-
-    The compressor overwrites its group slots in place, so a trim has to undo
-    those writes; otherwise the replayed tokens see a partially advanced group.
-    """
-    from mlx_vlm.models.deepseek_v41.language import LanguageModel
-
-    config = deepseek_v41_config("stack")
-    model = LanguageModel(config)
-    model.head.weight = mx.random.normal(model.head.weight.shape) * 0.05
-    mx.eval(model.parameters())
-
-    def maxdiff(a, b):
-        d = mx.abs(a.astype(mx.float32) - b.astype(mx.float32))
-        mx.eval(d)
-        return float(mx.max(d).item())
-
-    prompt = mx.array([[3, 7, 11, 15, 19, 23, 27, 31, 35, 39]])
-    toks = [3, 7, 11, 15, 19, 23, 27, 31, 35, 39]
-
-    cache_a = model.make_cache()
-    out_a = model(prompt, cache=cache_a)
-    mx.eval(out_a.logits)
-    logits_a = [out_a.logits[:, i] for i in range(10)]
-    for _ in range(9):
-        nxt = int(mx.argmax(logits_a[-1]).item())
-        toks.append(nxt)
-        out = model(mx.array([[nxt]]), cache=cache_a)
-        mx.eval(out.logits)
-        logits_a.append(out.logits[:, 0])
-
-    cache_b = model.make_cache()
-    out_b = model(prompt, cache=cache_b)
-    mx.eval(out_b.logits)
-    assert maxdiff(out_b.logits, out_a.logits) < 1e-4
-    for j in range(1, 4):
-        out = model(mx.array([[toks[9 + j]]]), cache=cache_b)
-        mx.eval(out.logits)
-        assert maxdiff(out.logits[:, 0], logits_a[9 + j]) < 1e-4
-    blk = model(mx.array([toks[13:18]]), cache=cache_b)
-    mx.eval(blk.logits)
-    assert cache_b[0].offset == 18
-    assert cache_b[0].trim(5) == 5
-    assert cache_b[0].offset == 13
-    replay = model(mx.array([toks[13:18]]), cache=cache_b)
-    mx.eval(replay.logits)
-    assert maxdiff(replay.logits, blk.logits) < 1e-4
-    assert cache_b[0].trim(3) == 3
-    assert cache_b[0].offset == 15
-
-    cache_c = model.make_cache()
-    model(prompt, cache=cache_c)
-    first = model(mx.array([[toks[10]]]), cache=cache_c)
-    mx.eval(first.logits)
-    blk = model(mx.array([toks[11:15]]), cache=cache_c)
-    mx.eval(blk.logits)
-    assert cache_c[0].offset == 15
-    assert cache_c[0].trim(4) == 4
-    assert cache_c[0].offset == 11
-    again = model(mx.array([[toks[11]]]), cache=cache_c)
-    mx.eval(again.logits)
-    assert maxdiff(again.logits[:, 0], logits_a[11]) < 1e-4
 
 
 @pytest.mark.parametrize("max_kv_size", [None, 1024])

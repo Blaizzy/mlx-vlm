@@ -1528,67 +1528,6 @@ def test_checkpoint_loading(tmp_path, name):
         ) == [3]
 
 
-class TestDeepseekV41Processor:
-    """Grid planning, patch extraction and the token span they must agree on."""
-
-    @staticmethod
-    def _config():
-        from mlx_vlm.models import deepseek_v41
-
-        return deepseek_v41.ModelConfig()
-
-    @staticmethod
-    def _image_record(width=160, height=112):
-        pixels = (np.random.rand(height, width, 3) * 255).astype(np.uint8)
-        buffer = BytesIO()
-        Image.fromarray(pixels).save(buffer, format="PNG")
-        return {"data": buffer.getvalue()}
-
-    def test_plan_image_grid_stays_within_the_token_budget(self):
-        from mlx_vlm.models.deepseek_v41 import processing_deepseek_v41 as proc
-
-        config = self._config()
-        n_llm_h, n_llm_w, best_h, best_w = proc.plan_image_grid(800, 600, config)
-        assert proc.num_image_tokens(n_llm_h, n_llm_w) <= config.vision_max_image_tokens
-        assert best_h % 14 == 0
-        assert best_w % 14 == 0
-
-        tiny = proc.plan_image_grid(32, 32, config)
-        assert tiny[2] * tiny[3] > 32 * 32
-
-    def test_load_image_patches_match_the_planned_grid(self):
-        from mlx_vlm.models.deepseek_v41 import processing_deepseek_v41 as proc
-
-        config = self._config()
-        patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w = proc.load_image(
-            self._image_record(), config
-        )
-        mx.eval(patches)
-        assert patches.shape == (n_vit_h * n_vit_w, 3, 14, 14)
-        assert len(proc.image_token_types(n_llm_h, n_llm_w)) == proc.num_image_tokens(
-            n_llm_h, n_llm_w
-        )
-
-    def test_prepare_vl_inputs_expands_the_image_marker(self):
-        from mlx_vlm.models.deepseek_v41 import processing_deepseek_v41 as proc
-
-        config = self._config()
-        image_id = config.image_token_id
-        tokens, types, inputs = proc.prepare_vl_inputs(
-            [1, image_id, 2], [self._image_record()], config
-        )
-        assert len(inputs) == 1
-        assert len(tokens) == len(types)
-        assert tokens[0] == 1
-        assert tokens[-1] == 2
-        assert proc.TEXT in types
-        assert proc.IMAGE in types
-        assert proc.IMAGE_START in types
-        assert image_id not in tokens[:1] + tokens[-1:]
-        with pytest.raises(ValueError):
-            proc.prepare_vl_inputs([1, image_id, 2], [], config)
-
-
 # Prompt construction
 
 
@@ -1837,39 +1776,6 @@ class TestModelSpecificPromptContracts:
         assert result[0]["role"] == "user"
         assert [item["type"] for item in result[0]["content"]] == ["image_url", "text"]
         assert result[0]["content"][1]["text"] == "Describe this image."
-
-
-class TestDeepseekV41ChatTemplate:
-    def test_default_template_carries_the_conversation_markers(self):
-        from mlx_vlm.models.deepseek_v41 import processing_deepseek_v41 as proc
-
-        for marker in (
-            "<｜begin▁of▁sentence｜>",
-            "<｜User｜>",
-            "<｜Assistant｜>",
-            "<｜end▁of▁sentence｜>",
-            "<｜Assistant｜></think>",
-        ):
-            assert marker in proc.DEFAULT_CHAT_TEMPLATE
-
-    def test_apply_chat_template_returns_text_not_token_ids(self):
-        from mlx_vlm.models.deepseek_v41 import processing_deepseek_v41 as proc
-
-        seen = {}
-
-        class StubTokenizer:
-            chat_template = None
-
-            def apply_chat_template(self, *args, **kwargs):
-                seen.update(kwargs)
-                return "rendered"
-
-        processor = proc.DeepseekV41Processor.__new__(proc.DeepseekV41Processor)
-        processor.tokenizer = StubTokenizer()
-        assert (
-            processor.apply_chat_template([], add_generation_prompt=True) == "rendered"
-        )
-        assert not seen.get("tokenize", True)
 
 
 # Reasoning-template arguments

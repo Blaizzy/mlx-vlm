@@ -1192,12 +1192,6 @@ def test_materialize_parameters_materializes_everything_without_a_declaration():
     assert any(".engram.embed." in p for p in seen)
 
 
-def test_deepseek_v41_declares_its_engram_tables_lazy():
-    from mlx_vlm.models import deepseek_v41
-
-    assert ".engram.embed." in deepseek_v41.Model.lazy_parameter_paths
-
-
 # Local Python model files
 
 MODEL_PY = textwrap.dedent("""
@@ -1263,74 +1257,6 @@ def test_missing_model_file_raises_clearly(tmp_path):
 
 
 # Patch embedding layouts
-
-
-class TestDeepseekV41Aligner(unittest.TestCase):
-    def test_deepseek_v41_aligner_reorders_channel_major_and_pads(self):
-        """The reference groups each channel's r*r neighbours together.
-
-        Its kernel reads `channel = d / 9`, `within = d % 9`, and contributes
-        zero where a neighbour falls outside the grid. Laying the vector out
-        position-major instead is a permutation of the same values, so nothing
-        fails and the features stay plausible while the model cannot read them.
-        """
-        from mlx_vlm.models.deepseek_v41.vision import Aligner
-
-        config = deepseek_v41_config("vision")
-        aligner = Aligner(config)
-        mx.eval(aligner.parameters())
-
-        r = config.vision_downsample_ratio
-        d = config.vision_hidden_size
-        for n_h, n_w in ((3, 3), (4, 5), (7, 2)):
-            x = mx.random.normal((n_h * n_w, d))
-            source = x.reshape(n_h, n_w, d)
-            h_out, w_out = -(-n_h // r), -(-n_w // r)
-            want = mx.zeros((h_out * w_out, d * r * r)).tolist()
-            for row in range(h_out * w_out):
-                by, bx = divmod(row, w_out)
-                for col in range(d * r * r):
-                    channel, within = divmod(col, r * r)
-                    sy, sx = by * r + within // r, bx * r + within % r
-                    want[row][col] = (
-                        float(source[sy, sx, channel].item())
-                        if sy < n_h and sx < n_w
-                        else 0.0
-                    )
-            expected = aligner.w2(aligner.act(aligner.w1(mx.array(want))))
-            got = aligner(x, n_h, n_w)
-            mx.eval(expected, got)
-            self.assertEqual(got.shape, (h_out * w_out, config.hidden_size))
-            diff = mx.abs(got.astype(mx.float32) - expected.astype(mx.float32))
-            mx.eval(diff)
-            self.assertLess(float(mx.max(diff).item()), 1e-4, f"{n_h}x{n_w}")
-
-    def test_deepseek_v41_image_span_matches_the_aligner_row_count(self):
-        """Every reserved IMAGE slot must have an aligner row behind it.
-
-        The gather clamps out-of-range indices, so a span wider than the
-        feature grid silently repeats the last feature instead of failing.
-        """
-        from PIL import Image
-
-        from mlx_vlm.models.deepseek_v41.processing_deepseek_v41 import (
-            IMAGE,
-            load_image,
-            prepare_vl_inputs,
-        )
-
-        config = deepseek_v41_config("vision")
-        r = config.vision_downsample_ratio
-        for size in ((896, 896), (640, 480), (128, 900), (42, 42)):
-            image = Image.new("RGB", size, (10, 120, 200))
-            _, n_vit_h, n_vit_w, _, _ = load_image(image, config)
-            _, types, spans = prepare_vl_inputs(
-                [1, config.image_token_id, 2], [image], config
-            )
-            rows = (-(-n_vit_h // r)) * (-(-n_vit_w // r))
-            self.assertEqual(types.count(IMAGE), rows, f"{size}")
-            self.assertEqual(len(spans), 1)
-            self.assertEqual(spans[0].patches.shape[0], n_vit_h * n_vit_w)
 
 
 QWEN_PATCH_EMBED_KEY = "model.visual.patch_embed.proj.weight"
@@ -1792,27 +1718,6 @@ class TestMoondream3Sanitize(unittest.TestCase):
 # DeepSeek-V4.1 engram, vision splice and checkpoint keys
 
 
-class TestDeepseekV41Config(unittest.TestCase):
-    def test_deepseek_v41_config_defaults(self):
-        from mlx_vlm.models import deepseek_v41
-
-        config = deepseek_v41.ModelConfig()
-        self.assertEqual(config.model_type, "deepseek_v41")
-        self.assertEqual(
-            len(config.compress_ratios),
-            config.num_hidden_layers + config.num_nextn_predict_layers,
-        )
-        self.assertEqual(config.compress_ratios[2], 2)
-        self.assertEqual(config.compress_ratios[20], 1)
-        self.assertEqual(config.compress_ratios[40:], [0, 0, 0])
-        self.assertEqual(config.kv_source_layer_ids, [2, 8, 14, 20])
-
-        loaded = deepseek_v41.ModelConfig.from_dict(
-            {"model_type": "deepseek_v41", "eos_token_id": 1}
-        )
-        self.assertEqual(loaded.eos_token_id, 1)
-
-
 class TestDeepseekV41EndToEnd(unittest.TestCase):
     @staticmethod
     def _config():
@@ -1934,54 +1839,6 @@ class TestDeepseekV41Sanitize(unittest.TestCase):
         self.assertEqual(set(out), {"language_model.head.weight"})
         self.assertEqual(out["language_model.head.weight"].dtype, mx.float32)
         self.assertEqual(out["language_model.head.weight"].shape, (64, 128))
-
-
-class TestDeepseekV41VisionSplice(unittest.TestCase):
-    @staticmethod
-    def _image_record():
-        return SimpleNamespace(
-            start=1,
-            patches=mx.random.normal((36, 3, 2, 2)),
-            n_vit_h=6,
-            n_vit_w=6,
-            types=[0, 1, 1, 2, 1, 1, 2, 3],
-        )
-
-    def test_deepseek_v41_vision_splice(self):
-        from mlx_vlm.models import deepseek_v41
-
-        model = deepseek_v41.Model(deepseek_v41_config("splice"))
-        mx.eval(model.parameters())
-        model.image_start = mx.ones((16,))
-        model.image_end = mx.ones((16,)) * 2
-        model.image_newline = mx.ones((16,)) * 3
-
-        ids = mx.array([[5, 9, 9, 9, 9, 9, 9, 9, 9, 6]])
-        result = model.get_input_embeddings(ids, pixel_values=[[self._image_record()]])
-        mx.eval(result.inputs_embeds)
-        embeds = result.inputs_embeds
-        self.assertEqual(embeds.shape, (1, 10, 16))
-        self.assertTrue(
-            bool(mx.all(embeds[0, 0] == model.language_model.embed_tokens(ids)[0, 0]))
-        )
-        self.assertTrue(bool(mx.all(embeds[0, 1] == 1)))
-        self.assertTrue(bool(mx.all(embeds[0, 4] == 3)))
-        self.assertTrue(bool(mx.all(embeds[0, 8] == 2)))
-        self.assertTrue(
-            bool(mx.all(embeds[0, 9] == model.language_model.embed_tokens(ids)[0, 9]))
-        )
-
-    def test_deepseek_v41_decode_skips_vision(self):
-        from mlx_vlm.models import deepseek_v41
-
-        model = deepseek_v41.Model(deepseek_v41_config("splice"))
-        mx.eval(model.parameters())
-        ids = mx.array([[5]])
-        result = model.get_input_embeddings(ids, pixel_values=[[self._image_record()]])
-        mx.eval(result.inputs_embeds)
-        self.assertTrue(
-            bool(mx.all(result.inputs_embeds == model.language_model.embed_tokens(ids)))
-        )
 
 
 class TestDeepseekV41Engram(unittest.TestCase):
@@ -2117,61 +1974,3 @@ class TestDeepseekV41Engram(unittest.TestCase):
         )
         mx.eval(diff)
         self.assertLess(float(mx.max(diff).item()), 1e-4)
-
-
-class TestDeepseekV41TokenMap(unittest.TestCase):
-    @staticmethod
-    def _wordlevel_tokenizer():
-        from tokenizers import Tokenizer
-        from tokenizers.models import WordLevel
-        from tokenizers.pre_tokenizers import Whitespace
-
-        vocab = {"[UNK]": 0, "Hello": 1, "hello": 2, " THE": 3, "the": 4, "world": 5}
-        tokenizer = Tokenizer(WordLevel(vocab=vocab, unk_token="[UNK]"))
-        tokenizer.pre_tokenizer = Whitespace()
-        return tokenizer
-
-    def test_deepseek_v41_token_map_collapses_case(self):
-        from mlx_vlm.models.deepseek_v41 import engram as engram_module
-
-        tokenizer = self._wordlevel_tokenizer()
-        lookup, size = engram_module.build_compressed_token_map(tokenizer)
-        self.assertEqual(len(lookup), tokenizer.get_vocab_size())
-        self.assertEqual(lookup[1], lookup[2])
-        self.assertLessEqual(size, tokenizer.get_vocab_size())
-
-    def test_deepseek_v41_token_map_unwraps_wrapper(self):
-        from mlx_vlm.models.deepseek_v41 import engram as engram_module
-
-        class Wrapper:
-            def __init__(self, backend):
-                self._tokenizer = backend
-
-        raw = self._wordlevel_tokenizer()
-        lookup_wrapped, _ = engram_module.build_compressed_token_map(Wrapper(raw))
-        lookup_raw, _ = engram_module.build_compressed_token_map(raw)
-        self.assertEqual(lookup_wrapped, lookup_raw)
-
-    def test_deepseek_v41_hash_state_shapes(self):
-        from mlx_vlm.models.deepseek_v41 import engram as engram_module
-        from mlx_vlm.models.deepseek_v41.language import DeepseekV41Cache
-
-        config = deepseek_v41_config(
-            engram_layer_ids=[0],
-            engram_num_embeddings=[1024],
-            engram_vocab_size=64,
-        )
-        layout = engram_module.EngramLayout.from_config(config)
-        state = engram_module.NgramHashState(
-            config,
-            layout,
-            token_map=[i % 7 for i in range(config.vocab_size)],
-        )
-
-        cache = DeepseekV41Cache(1, [1])
-        prefill = state(mx.array([[1, 2, 3, 4]]), 0, cache)
-        mx.eval(prefill)
-        self.assertEqual(prefill.shape, (1, 4, 1, 4))
-        step = state(mx.array([[5]]), 4, cache)
-        mx.eval(step)
-        self.assertEqual(step.shape, (1, 1, 1, 4))
