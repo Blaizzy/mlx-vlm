@@ -87,8 +87,14 @@ class MingImagePipeline:
         width: int = 1024,
         height: int = 1024,
         guidance: float = 1.0,
+        num_images: int = 1,
     ) -> mx.array:
-        """Generate one image, returned as an ``[H, W, 4]`` uint8 RGBA array."""
+        """Generate images for one prompt.
+
+        Returns an ``[H, W, 4]`` uint8 RGBA array for ``num_images == 1``, or a
+        batched ``[N, H, W, 4]`` array otherwise. The prompt is encoded once and
+        the conditioning is shared across the whole latent batch.
+        """
         for name, value in (("width", width), ("height", height)):
             if value < 16 or value % 16:
                 raise ValueError(
@@ -96,6 +102,8 @@ class MingImagePipeline:
                 )
         if steps < 1:
             raise ValueError(f"steps must be at least 1, got {steps}")
+        if num_images < 1:
+            raise ValueError(f"num_images must be at least 1, got {num_images}")
         if guidance != 1.0:
             raise ValueError(
                 "Ming-Image-0.1-Design is trained for guidance 1.0 (CFG off)"
@@ -110,7 +118,9 @@ class MingImagePipeline:
             latent_w // self.config.dit.patch_size
         )
         latents = mx.random.normal(
-            (1, z, 1, latent_h, latent_w), key=mx.random.key(seed), dtype=mx.float32
+            (num_images, z, 1, latent_h, latent_w),
+            key=mx.random.key(seed),
+            dtype=mx.float32,
         )
         max_image_seq_len, max_shift = scheduler_shift(image_seq_len)
         scheduler = FlowMatchEulerDiscreteScheduler(
@@ -136,14 +146,16 @@ class MingImagePipeline:
             latents = scheduler.step(noise=-pred, step_index=i, latents=latents)
             mx.eval(latents)
 
-        return self._decode(latents)
+        images = self._decode(latents)
+        return images[0] if num_images == 1 else images
 
     def _decode(self, latents: mx.array) -> mx.array:
+        """Decode ``[N, z, 1, h, w]`` latents to an ``[N, H, W, 4]`` uint8 array."""
         z = latents / self.config.vae.scaling_factor + self.config.vae.shift_factor
         decoded = self.vae.decode(z.astype(mx.float32))[:, :, 0]
-        image = (mx.clip(decoded[0], -1.0, 1.0) + 1.0) / 2.0 * 255.0
-        mx.eval(image)
-        return image.astype(mx.uint8).transpose(1, 2, 0)
+        images = (mx.clip(decoded, -1.0, 1.0) + 1.0) / 2.0 * 255.0
+        mx.eval(images)
+        return images.astype(mx.uint8).transpose(0, 2, 3, 1)
 
 
 __all__ = ["MingImagePipeline"]

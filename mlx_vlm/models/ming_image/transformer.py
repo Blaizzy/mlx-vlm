@@ -221,7 +221,12 @@ class MingImageTransformer(nn.Module):
                 t_emb,
                 conditioning.img_mask,
             )
-        unified = mx.concatenate([img_tokens, conditioning.refined_cap], axis=1)
+        # Conditioning is built once (batch 1) and shared across a latent batch.
+        refined_cap = mx.broadcast_to(
+            conditioning.refined_cap,
+            (img_tokens.shape[0], *conditioning.refined_cap.shape[1:]),
+        )
+        unified = mx.concatenate([img_tokens, refined_cap], axis=1)
         for blk in self.layers:
             unified = blk(
                 unified, conditioning.cos, conditioning.sin, t_emb, conditioning.mask
