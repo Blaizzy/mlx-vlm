@@ -2302,6 +2302,40 @@ class TestMiMoV2Processor:
 
         assert captured["text"] == ["before<|audio_pad|><|audio_pad|>after"]
         assert result["audio_codes"].shape == (5, 20)
+        assert result["audio_code_lengths"] == [5]
+
+    def test_audio_codes_preserve_batch_boundaries(self):
+        from mlx_vlm.models.mimo_v2.processing import MiMoV2Processor
+        from mlx_vlm.models.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor
+
+        processor = object.__new__(MiMoV2Processor)
+        processor.audio_token = "<|audio_pad|>"
+
+        def encode(item, **kwargs):
+            length = 5 if item == "first" else 3
+            offset = 0 if item == "first" else 100
+            return mx.arange(20 * length).reshape(20, length) + offset
+
+        processor._audio_tokenizer = SimpleNamespace(encode=encode)
+        captured = {}
+
+        def process(*args, **kwargs):
+            captured.update(kwargs)
+            return {}
+
+        with patch.object(Qwen2_5_VLProcessor, "__call__", side_effect=process):
+            result = processor(
+                text=["a<|audio_pad|>", "b<|audio_pad|>"],
+                audio=["first", "second"],
+            )
+
+        assert captured["text"] == [
+            "a<|audio_pad|><|audio_pad|>",
+            "b<|audio_pad|>",
+        ]
+        assert result["audio_codes"].shape == (8, 20)
+        assert result["audio_code_lengths"] == [5, 3]
+        assert result["audio_codes"][5, 0].item() == 100
 
 
 @pytest.fixture(scope="module")

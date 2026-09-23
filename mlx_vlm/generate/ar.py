@@ -3190,6 +3190,7 @@ def batch_generate(
     verbose: bool = False,
     group_by_shape: bool = True,
     track_image_sizes: bool = True,
+    videos: Union[str, List[str], None] = None,
     **kwargs: Unpack[GenerateKwargs],
 ) -> BatchResponse:
     """
@@ -3209,7 +3210,8 @@ def batch_generate(
        model (nn.Module): The language model.
        processor (PreTrainedTokenizer): The tokenizer/processor.
        images (Union[str, List[str]]): Images (paths, URLs, or PIL images).
-       audios (Union[str, List[str]]): Audio files (not yet supported for batching).
+       audios (Union[str, List[str]]): Audio files.
+       videos (Union[str, List[str]]): Video files.
        prompts (List[str]): The input prompts.
        max_tokens (Union[int, List[int]]): Maximum number of output tokens. This
           can be per prompt if a list is provided.
@@ -3229,6 +3231,36 @@ def batch_generate(
 
     processor.detokenizer.reset()
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+
+    if audios is not None or videos is not None:
+        images = [images] if isinstance(images, str) else images
+        audios = [audios] if isinstance(audios, str) else audios
+        videos = [videos] if isinstance(videos, str) else videos
+        for name, media in (("images", images), ("audios", audios), ("videos", videos)):
+            if media is not None and len(media) > len(prompts):
+                raise ValueError(
+                    f"Received {len(media)} {name} for {len(prompts)} prompts"
+                )
+        if (
+            audios is not None
+            and len(audios) > 1
+            and not getattr(processor, "supports_multiple_audio", False)
+        ):
+            raise ValueError(
+                f"{type(processor).__name__} does not support batched audio inputs"
+            )
+        texts, stats = _generate_batch(
+            model,
+            processor,
+            prompts,
+            images=images,
+            audios=audios,
+            videos=videos,
+            max_tokens=max_tokens,
+            verbose=verbose,
+            **kwargs,
+        )
+        return BatchResponse(texts, stats)
 
     # Handle single image case
     if isinstance(images, str):
@@ -3409,6 +3441,8 @@ def _generate_batch(
     images: List = None,
     max_tokens: Union[int, List[int]] = 100,
     verbose: bool = False,
+    audios: List = None,
+    videos: List = None,
     **kwargs,
 ) -> Tuple[List[str], BatchStats]:
 
@@ -3426,6 +3460,13 @@ def _generate_batch(
             model.config,
             p,
             num_images=num_images_list[i],
+            num_audios=1 if audios is not None and i < len(audios) else 0,
+            video=videos[i] if videos is not None and i < len(videos) else None,
+            fps=(
+                kwargs.get("fps", 1)[i]
+                if isinstance(kwargs.get("fps", 1), list)
+                else kwargs.get("fps", 1)
+            ),
         )
         for i, p in enumerate(prompts)
     ]
@@ -3438,11 +3479,13 @@ def _generate_batch(
     inputs = prepare_inputs(
         processor,
         images=images,
-        audio=None,
+        audio=audios,
+        videos=videos,
         prompts=formatted_prompts,
         image_token_index=image_token_index,
         resize_shape=resize_shape,
         add_special_tokens=add_special_tokens,
+        fps=kwargs.pop("fps", 1),
         pad_to_uniform_size=False,  # Since images are pre-grouped by shape, they're already uniform size
     )
     input_ids = inputs.get("input_ids", None)

@@ -75,10 +75,10 @@ class VisionAttention(nn.Module):
         return mask
 
     def _attend(self, q, k, v, full_attn: bool) -> mx.array:
-        n = q.shape[0]
-        q = q.transpose(1, 0, 2)[None]
-        k = k.transpose(1, 0, 2)[None]
-        v = v.transpose(1, 0, 2)[None]
+        batch_size, n = q.shape[:2]
+        q = q.transpose(0, 2, 1, 3)
+        k = k.transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
         repeats = self.num_heads // self.num_kv_heads
         if repeats > 1:
             k = mx.repeat(k, repeats, axis=1)
@@ -86,7 +86,7 @@ class VisionAttention(nn.Module):
         out = mx.fast.scaled_dot_product_attention(
             q, k, v, scale=self.scale, mask=self._mask(n, full_attn, q.dtype)
         )
-        return out[0].transpose(1, 0, 2).reshape(n, -1)
+        return out.transpose(0, 2, 1, 3).reshape(batch_size, n, -1)
 
     def __call__(self, x: mx.array, cos, sin, full_attn: bool, cu_seqlens) -> mx.array:
         n = x.shape[0]
@@ -99,12 +99,19 @@ class VisionAttention(nn.Module):
         v = qkv[:, q_dim + kv_dim :].reshape(n, self.num_kv_heads, self.head_dim)
         q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
 
-        # attention never crosses an image boundary
-        chunks = [
-            self._attend(q[a:b], k[a:b], v[a:b], full_attn)
-            for a, b in zip(cu_seqlens[:-1], cu_seqlens[1:])
-        ]
-        attn = chunks[0] if len(chunks) == 1 else mx.concatenate(chunks, axis=0)
+        spans = list(zip(cu_seqlens[:-1], cu_seqlens[1:]))
+        groups = {}
+        for index, (start, stop) in enumerate(spans):
+            groups.setdefault(stop - start, []).append((index, start, stop))
+        chunks = [None] * len(spans)
+        for items in groups.values():
+            q_batch = mx.stack([q[start:stop] for _, start, stop in items])
+            k_batch = mx.stack([k[start:stop] for _, start, stop in items])
+            v_batch = mx.stack([v[start:stop] for _, start, stop in items])
+            outputs = self._attend(q_batch, k_batch, v_batch, full_attn)
+            for output, (index, _, _) in zip(outputs, items):
+                chunks[index] = output
+        attn = mx.concatenate(chunks, axis=0)
         return self.proj(attn)
 
 

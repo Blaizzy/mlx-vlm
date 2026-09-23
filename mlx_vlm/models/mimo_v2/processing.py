@@ -7,6 +7,8 @@ from ..qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor
 
 
 class MiMoV2Processor(Qwen2_5_VLProcessor):
+    supports_multiple_audio = True
+
     def __init__(
         self,
         image_processor=None,
@@ -100,6 +102,7 @@ class MiMoV2Processor(Qwen2_5_VLProcessor):
         )
         if audio_codes is not None:
             result["audio_codes"] = audio_codes
+            result["audio_code_lengths"] = [code.shape[1] for code in codes]
         return result
 
     @classmethod

@@ -78,7 +78,22 @@ class Model(nn.Module):
         audio_features = kwargs.get("cached_audio_features", kwargs.get("audio_embeds"))
         if audio_codes is not None or audio_features is not None:
             if audio_features is None:
-                audio_features = self.encode_audio(audio_codes)
+                audio_code_lengths = kwargs.get("audio_code_lengths")
+                if audio_code_lengths is None:
+                    audio_features = self.encode_audio(audio_codes)
+                else:
+                    if sum(audio_code_lengths) != audio_codes.shape[0]:
+                        raise ValueError(
+                            "audio_code_lengths must cover every audio code frame"
+                        )
+                    offset = 0
+                    features = []
+                    for length in audio_code_lengths:
+                        features.append(
+                            self.encode_audio(audio_codes[offset : offset + length])
+                        )
+                        offset += length
+                    audio_features = mx.concatenate(features, axis=0)
             inputs_embeds = self._replace_modal_embeddings(
                 input_ids,
                 inputs_embeds,

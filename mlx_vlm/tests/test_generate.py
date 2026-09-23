@@ -708,6 +708,69 @@ def test_batch_generate_media(case, mock_model, mock_processor, capsys):
         assert "[batch_generate]" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("kind", ["audios", "videos"])
+def test_batch_generate_routes_audio_and_video(kind, mock_model, mock_processor):
+    media = [f"{kind}-0", f"{kind}-1"]
+    stats = BatchStats(prompt_tokens=20, generation_tokens=10)
+    if kind == "audios":
+        mock_processor.supports_multiple_audio = True
+    with patch.object(
+        ar_module, "_generate_batch", return_value=(["first", "second"], stats)
+    ) as run:
+        response = ar_module.batch_generate(
+            mock_model,
+            mock_processor,
+            prompts=["one", "two"],
+            **{kind: media},
+        )
+
+    assert response.texts == ["first", "second"]
+    assert run.call_args.kwargs[kind] == media
+
+
+def test_batch_generate_combines_media_and_text(mock_model, mock_processor):
+    stats = BatchStats()
+    with patch.object(
+        ar_module,
+        "_generate_batch",
+        return_value=(["media", "text"], stats),
+    ) as run:
+        response = ar_module.batch_generate(
+            mock_model,
+            mock_processor,
+            audios=["audio"],
+            videos=["video"],
+            prompts=["media prompt", "text prompt"],
+            max_tokens=[20, 10],
+        )
+
+    assert response.texts == ["media", "text"]
+    run.assert_called_once()
+    assert run.call_args.kwargs["audios"] == ["audio"]
+    assert run.call_args.kwargs["videos"] == ["video"]
+    assert run.call_args.kwargs["max_tokens"] == [20, 10]
+
+
+def test_batch_generate_rejects_more_media_than_prompts(mock_model, mock_processor):
+    with pytest.raises(ValueError, match="3 audios for 2 prompts"):
+        ar_module.batch_generate(
+            mock_model,
+            mock_processor,
+            prompts=["one", "two"],
+            audios=["a", "b", "c"],
+        )
+
+
+def test_batch_generate_rejects_unsupported_audio_batch(mock_model, mock_processor):
+    with pytest.raises(ValueError, match="does not support batched audio"):
+        ar_module.batch_generate(
+            mock_model,
+            mock_processor,
+            prompts=["one", "two"],
+            audios=["a", "b"],
+        )
+
+
 class TestBatchGenerate:
     """Tests for the batch_generate function."""
 
@@ -771,7 +834,7 @@ class TestBatchGenerate:
             patch.object(
                 ar_module,
                 "apply_chat_template",
-                side_effect=lambda processor, config, prompt, num_images=0: prompt,
+                side_effect=lambda processor, config, prompt, **kwargs: prompt,
             ),
             patch.object(
                 ar_module,

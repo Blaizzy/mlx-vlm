@@ -1347,6 +1347,34 @@ def test_mimo_v2_encodes_video_features():
     assert mx.allclose(result[0], encoded)
 
 
+class TestMiMoV2BatchedVisionAttention:
+    def test_matches_independent_sequences(self):
+        from mlx_vlm.models.mimo_v2.config import VisionConfig
+        from mlx_vlm.models.mimo_v2.vision import VisionAttention
+
+        config = VisionConfig(
+            hidden_size=64,
+            num_heads=4,
+            num_key_value_heads=2,
+            qk_channels=16,
+        )
+        attention = VisionAttention(config, use_sinks=True, window_size=4)
+        q = mx.random.normal((3, 8, 4, 16))
+        k = mx.random.normal((3, 8, 2, 16))
+        v = mx.random.normal((3, 8, 2, 16))
+
+        batched = attention._attend(q, k, v, full_attn=False)
+        independent = mx.concatenate(
+            [
+                attention._attend(q[i : i + 1], k[i : i + 1], v[i : i + 1], False)
+                for i in range(3)
+            ],
+            axis=0,
+        )
+
+        assert mx.allclose(batched, independent)
+
+
 def test_mimo_v2_combines_image_video_and_audio_features():
     module = importlib.import_module("mlx_vlm.models.mimo_v2")
     case = next(c for c in DATA["cases"] if c["id"] == "TestModels.mimo_v2")
@@ -1438,6 +1466,28 @@ def test_mimo_v2_inserts_audio_features():
         model.audio_encoder(mx.zeros((0, 2), dtype=mx.int32), model.speech_embeddings)
     with pytest.raises(ValueError, match="at least 2 channels"):
         model.audio_encoder(mx.zeros((2, 1), dtype=mx.int32), model.speech_embeddings)
+
+
+class TestMiMoV2BatchedAudio:
+    def test_encodes_samples_independently(self):
+        module = importlib.import_module("mlx_vlm.models.mimo_v2")
+        case = next(c for c in DATA["cases"] if c["id"] == "TestModels.mimo_v2")
+        config = build_config(module, case["config"])
+        model = module.Model(config)
+        first = mx.array([[1, 2], [3, 4], [5, 6], [7, 8]])
+        second = mx.array([[8, 7], [6, 5], [4, 3], [2, 1]])
+        expected = mx.concatenate(
+            [model.encode_audio(first), model.encode_audio(second)], axis=0
+        )
+        ids = mx.array([[config.audio_token_id] * expected.shape[0]])
+
+        result = model.get_input_embeddings(
+            ids,
+            audio_codes=mx.concatenate([first, second], axis=0),
+            audio_code_lengths=[first.shape[0], second.shape[0]],
+        ).inputs_embeds
+
+        assert mx.allclose(result[0], expected)
 
 
 def test_glm_quantized_head_sanitization_loads_strictly():
