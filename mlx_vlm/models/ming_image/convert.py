@@ -1,4 +1,4 @@
-"""Convert a Ming-Image-0.1-Design checkpoint to MLX (optionally quantized)."""
+"""Convert a Ming-Image-0.1-Design checkpoint."""
 
 from __future__ import annotations
 
