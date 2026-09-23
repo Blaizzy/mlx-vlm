@@ -7,9 +7,6 @@ from ..qwen3_5_moe.config import TextConfig
 class ModelConfig(TextConfig):
     def __post_init__(self):
         if self.rope_parameters and "mrope_section" not in self.rope_parameters:
-            # Many text-only checkpoints omit mrope_section. Without vision
-            # grids every position axis carries the same index, so any split
-            # is plain RoPE; give every rotary pair to the first axis.
             head_dim = self.head_dim or self.hidden_size // self.num_attention_heads
             rotary_factor = self.rope_parameters.get("partial_rotary_factor", 1.0)
             self.rope_parameters = {
