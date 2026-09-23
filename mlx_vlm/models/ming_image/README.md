@@ -4,30 +4,72 @@ MLX port of [inclusionAI/Ming-Image-0.1-Design](https://huggingface.co/inclusion
 a 6B text-to-image model for text-rich visual design (UI, posters, infographics)
 with native RGBA / transparent-background output.
 
-## Usage
+## Supported repo IDs
 
-```python
-from mlx_vlm.models.ming_image import MingImagePipeline
+| Hugging Face model | Precision | Notes |
+|---|---|---|
+| `inclusionAI/Ming-Image-0.1-Design` | bf16 | Original Diffusers checkpoint; loads directly (sanitized on the fly). |
+| `nativ-community/Ming-Image-0.1-Design-MLX-4bit` | 4-bit | Smallest download, lowest peak memory. |
+| `nativ-community/Ming-Image-0.1-Design-MLX-8bit` | 8-bit | Higher fidelity than 4-bit, still quantized. |
 
-pipe = MingImagePipeline("/path/to/Ming-Image-0.1-Design")  # local checkpoint
-image = pipe.generate_array(
-    "a minimalist poster, bold word HELLO, blue background",
-    seed=0, steps=12, width=1024, height=1024,
-)  # -> [H, W, 4] uint8 RGBA
-```
-
-It is also dispatched by the shared image-generation entry point via the
-`ming_image` model type, given a local path to the checkpoint.
+The original checkpoint loads directly; you can also pass a local checkpoint or
+MLX-converted model directory.
 
 ## Recommended settings
 
 - Resolution **1024x1024** (fast) or **2048x2048**; width/height multiples of 16.
 - Steps **12**, guidance **1.0** (the model is trained without classifier-free
   guidance; other values are rejected).
-- Precision **bf16**.
 - For a transparent background, prepend one of the model card's RGBA phrases
   (e.g. `RGBA, 4-channel, transparent background`); the 4-channel VAE decodes the
   alpha channel directly.
+
+## CLI
+
+```sh
+mlx_vlm.generate \
+  --output-modality image \
+  --model nativ-community/Ming-Image-0.1-Design-MLX-4bit \
+  --prompt "a minimalist poster, bold word HELLO, blue background" \
+  --size 1024x1024 \
+  --steps 12 \
+  --guidance 1 \
+  --seed 0 \
+  --output outputs/ming-image.png
+```
+
+## Python
+
+```python
+from mlx_vlm.generate.image import generate_image, load_image_generation_model
+
+model = load_image_generation_model("nativ-community/Ming-Image-0.1-Design-MLX-4bit")
+result = generate_image(
+    model,
+    "a minimalist poster, bold word HELLO, blue background",
+    seed=0,
+    steps=12,
+    width=1024,
+    height=1024,
+    guidance=1.0,
+    output_path="outputs/ming-image.png",
+)
+
+print(result.array.shape, result.path)
+```
+
+## Convert
+
+The bf16 checkpoint runs from the original repo, so conversion is only needed to
+reproduce the quantized variants above. Point `--model` at a local copy of the
+original checkpoint:
+
+```sh
+python -m mlx_vlm.models.ming_image.convert \
+  --model /path/to/Ming-Image-0.1-Design \
+  --output ./Ming-Image-0.1-Design-MLX-4bit \
+  --bits 4 --group-size 64
+```
 
 ## Architecture
 
