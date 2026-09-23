@@ -1313,11 +1313,87 @@ def test_mimo_v2_inserts_image_and_video_features():
     pixels = mx.random.normal((16, patch_width))
     grid = mx.array([[1, 4, 4]])
     ids = mx.array([[config.image_token_id] * 4])
-    encoded = model.vision_tower(pixels, grid)
+    encoded = model.encode_image(pixels, grid)
     result = model.get_input_embeddings(
         ids, pixel_values=pixels, image_grid_thw=grid
     ).inputs_embeds
     assert mx.allclose(result[0], encoded)
+    cached = model.encode_images(pixels, image_grid_thw=grid)
+    result = model.get_input_embeddings(ids, cached_image_features=cached).inputs_embeds
+    assert mx.allclose(result[0], encoded)
+
+
+def test_mimo_v2_encodes_video_features():
+    module = importlib.import_module("mlx_vlm.models.mimo_v2")
+    case = next(c for c in DATA["cases"] if c["id"] == "TestModels.mimo_v2")
+    config = build_config(module, case["config"])
+    model = module.Model(config)
+    vision = config.vision_config
+    patch_width = (
+        vision.in_channels
+        * vision.temporal_patch_size
+        * vision.patch_size
+        * vision.patch_size
+    )
+    pixels = mx.random.normal((32, patch_width))
+    grid = mx.array([[2, 4, 4]])
+    encoded = model.encode_video(pixels, grid)
+    ids = mx.array([[config.video_token_id] * encoded.shape[0]])
+
+    result = model.get_input_embeddings(
+        ids, pixel_values_videos=pixels, video_grid_thw=grid
+    ).inputs_embeds
+
+    assert mx.allclose(result[0], encoded)
+
+
+def test_mimo_v2_combines_image_video_and_audio_features():
+    module = importlib.import_module("mlx_vlm.models.mimo_v2")
+    case = next(c for c in DATA["cases"] if c["id"] == "TestModels.mimo_v2")
+    config = build_config(module, case["config"])
+    model = module.Model(config)
+    vision = config.vision_config
+    patch_width = (
+        vision.in_channels
+        * vision.temporal_patch_size
+        * vision.patch_size
+        * vision.patch_size
+    )
+    image_pixels = mx.random.normal((16, patch_width))
+    image_grid = mx.array([[1, 4, 4]])
+    video_pixels = mx.random.normal((32, patch_width))
+    video_grid = mx.array([[2, 4, 4]])
+    audio_codes = mx.array([[1, 2], [3, 4], [5, 6]])
+    image = model.encode_image(image_pixels, image_grid)
+    video = model.encode_video(video_pixels, video_grid)
+    audio = model.encode_audio(audio_codes)
+    ids = mx.array(
+        [
+            [1]
+            + [config.image_token_id] * image.shape[0]
+            + [2]
+            + [config.video_token_id] * video.shape[0]
+            + [3]
+            + [config.audio_token_id] * audio.shape[0]
+            + [4]
+        ]
+    )
+
+    result = model.get_input_embeddings(
+        ids,
+        pixel_values=image_pixels,
+        image_grid_thw=image_grid,
+        pixel_values_videos=video_pixels,
+        video_grid_thw=video_grid,
+        audio_codes=audio_codes,
+    ).inputs_embeds[0]
+    image_start = 1
+    video_start = image_start + image.shape[0] + 1
+    audio_start = video_start + video.shape[0] + 1
+
+    assert mx.allclose(result[image_start : image_start + image.shape[0]], image)
+    assert mx.allclose(result[video_start : video_start + video.shape[0]], video)
+    assert mx.allclose(result[audio_start : audio_start + audio.shape[0]], audio)
 
 
 def test_mimo_v2_rejects_mismatched_modal_features():
@@ -1352,7 +1428,7 @@ def test_mimo_v2_inserts_audio_features():
     ids = mx.array([[1, config.audio_token_id, config.audio_token_id, 2]])
     codes = mx.array([[1, 2], [3, 4], [5, 6]])
 
-    encoded = model.audio_encoder(codes, model.speech_embeddings)
+    encoded = model.encode_audio(codes)
     result = model.get_input_embeddings(ids, audio_codes=codes).inputs_embeds
 
     assert encoded.shape == (2, config.text_config.hidden_size)

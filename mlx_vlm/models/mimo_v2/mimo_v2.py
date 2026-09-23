@@ -22,6 +22,26 @@ class Model(nn.Module):
         self.speech_embeddings = build_speech_embeddings(config.audio_config)
         self.audio_encoder = AudioEncoder(config.audio_config)
 
+    def _encode_vision(self, pixel_values, grid_thw, modality):
+        if self.vision_tower is None:
+            raise ValueError(f"Cannot encode {modality} when vision is disabled")
+        if grid_thw is None:
+            raise ValueError(f"{modality}_grid_thw is required with pixel values")
+        dtype = self.vision_tower.patch_embed.proj.weight.dtype
+        return self.vision_tower(pixel_values.astype(dtype), grid_thw)
+
+    def encode_image(self, pixel_values, image_grid_thw=None):
+        return self._encode_vision(pixel_values, image_grid_thw, "image")
+
+    def encode_images(self, pixel_values, **kwargs):
+        return [self.encode_image(pixel_values, kwargs.get("image_grid_thw"))]
+
+    def encode_video(self, pixel_values, video_grid_thw=None):
+        return self._encode_vision(pixel_values, video_grid_thw, "video")
+
+    def encode_audio(self, audio_codes):
+        return self.audio_encoder(audio_codes, self.speech_embeddings)
+
     def get_input_embeddings(
         self,
         input_ids: Optional[mx.array] = None,
@@ -35,22 +55,23 @@ class Model(nn.Module):
                 pixel_values,
                 kwargs.get("image_grid_thw"),
                 kwargs.get("cached_image_features"),
+                self.encode_image,
             ),
             (
                 self.config.video_token_id,
                 kwargs.get("pixel_values_videos", kwargs.get("video_pixel_values")),
                 kwargs.get("video_grid_thw"),
                 kwargs.get("cached_video_features"),
+                self.encode_video,
             ),
         )
-        for token_id, pixels, grid, cached in modalities:
+        for token_id, pixels, grid, cached, encode in modalities:
             if pixels is None and cached is None:
                 continue
             if cached is None:
-                if grid is None:
-                    raise ValueError("grid_thw is required with pixel values")
-                dtype = self.vision_tower.patch_embed.proj.weight.dtype
-                cached = self.vision_tower(pixels.astype(dtype), grid)
+                cached = encode(pixels, grid)
+            if not isinstance(cached, mx.array):
+                cached = mx.concatenate(list(cached), axis=0)
             inputs_embeds = self._replace_modal_embeddings(
                 input_ids, inputs_embeds, token_id, cached
             )
@@ -58,7 +79,7 @@ class Model(nn.Module):
         audio_features = kwargs.get("cached_audio_features", kwargs.get("audio_embeds"))
         if audio_codes is not None or audio_features is not None:
             if audio_features is None:
-                audio_features = self.audio_encoder(audio_codes, self.speech_embeddings)
+                audio_features = self.encode_audio(audio_codes)
             inputs_embeds = self._replace_modal_embeddings(
                 input_ids,
                 inputs_embeds,
