@@ -1688,6 +1688,33 @@ def test_tiny_top_p_keeps_the_most_likely_token(dtype, top_p):
         assert tokens.tolist() == [2]
 
 
+@pytest.mark.parametrize("temperature", [1e-39, 1e-300])
+def test_tiny_temperature_samples_greedily(temperature):
+    logprobs = mx.log(mx.array([[0.1, 0.2, 0.6, 0.1]]))
+    assert sampling.make_sampler(temp=temperature)(logprobs).tolist() == [2]
+
+
+@pytest.mark.parametrize("seed", [None, 42])
+def test_generate_step_tiny_temperature_samples_greedily(seed):
+    model = MagicMock()
+    model.language_model.return_value = LanguageModelOutput(
+        logits=mx.array([[[0.0, 1.0, 3.0, 2.0]]])
+    )
+    model.get_input_embeddings.return_value = InputEmbeddingsFeatures(
+        inputs_embeds=mx.zeros((1, 1, 4))
+    )
+    steps = generate_module.generate_step(
+        mx.array([[1]]),
+        model,
+        pixel_values=None,
+        mask=None,
+        max_tokens=4,
+        temperature=1e-39,
+        seed=seed,
+    )
+    assert [token for token, _ in steps] == [2, 2, 2, 2]
+
+
 # Loading and utility contracts
 
 

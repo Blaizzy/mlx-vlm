@@ -2355,6 +2355,13 @@ class TestResponseGenerator:
         assert [b.kwargs["sampler"] for b in batches] == ["sampler-0.0", "sampler-0.6"]
         assert batches[0].closed
 
+    def test_tiny_temperature_batch_samples_greedily(self, monkeypatch):
+        gen, batches = _worker_setup(monkeypatch)
+        with _running(gen):
+            _, tokens = _drain(_enqueue(gen, max_tokens=1, temperature=1e-39))
+            assert len(tokens) == 1
+        _assert_fields(batches[0].kwargs, sampler=None, greedy_sampling=True)
+
     def test_generate_arguments_to_generate_kwargs(self):
         args = Args()
         _assert_fields(

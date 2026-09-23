@@ -6,6 +6,10 @@ from typing import Callable, Dict, List, Optional
 
 import mlx.core as mx
 
+# Temperatures below this sample greedily: scaling logits by 1 / temp
+# overflows to -inf for every token long before temp reaches 0.
+SAMPLING_EPS = 1e-5
+
 
 def make_sampler(
     temp: float = 0.0,
@@ -24,8 +28,8 @@ def make_sampler(
     Make a sampler function for use with ``generate_step``.
 
     Args:
-        temp (float): The temperature for sampling, if 0 the argmax is used.
-          Default: ``0``.
+        temp (float): The temperature for sampling, if below ``SAMPLING_EPS``
+          the argmax is used. Default: ``0``.
         top_p (float, optional): Nucleus sampling, higher means model considers
           more less likely words.
         min_p (float, optional): The minimum value (scaled by the top token's
@@ -60,7 +64,7 @@ def make_sampler(
     if xtc_special_tokens is None:
         xtc_special_tokens = []
 
-    if temp == 0:
+    if temp < SAMPLING_EPS:
         return lambda x: mx.argmax(x, axis=-1)
 
     sampling_methods = []

@@ -20,6 +20,7 @@ from ..kv_quant import from_legacy as kv_quant_from_legacy
 from ..models import cache
 from ..prompt_utils import apply_chat_template
 from ..sample_utils import (
+    SAMPLING_EPS,
     _top_p_mask,
     apply_top_k,
     make_logits_processors,
@@ -291,11 +292,11 @@ def generate_step(
         kv_value_scheme=kv_value_scheme,
     )
 
-    sampler_is_greedy = sampler is None and temperature == 0
+    sampler_is_greedy = sampler is None and temperature < SAMPLING_EPS
     if sampler is None:
         if (
             seed is not None
-            and temperature > 0
+            and temperature >= SAMPLING_EPS
             and min_p == DEFAULT_MIN_P
             and top_n_sigma == DEFAULT_TOP_N_SIGMA
             and not p_less

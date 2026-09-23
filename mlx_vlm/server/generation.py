@@ -35,6 +35,7 @@ from ..generate.diffusion import (
     stream_diffusion_generate_from_kwargs,
 )
 from ..sample_utils import (
+    SAMPLING_EPS,
     _top_p_mask,
     apply_top_k,
     make_logits_processors,
@@ -1434,7 +1435,7 @@ class ResponseGenerator:
         return now
 
     def _make_sampler(self, args: GenerationArguments) -> Optional[Callable]:
-        if args.temperature == 0:
+        if args.temperature < SAMPLING_EPS:
             return None
         if args.top_n_sigma > 0:
             return make_sampler(
@@ -1771,7 +1772,7 @@ class ResponseGenerator:
                             draft_model=self.draft_model,
                             draft_kind=self.draft_kind,
                             draft_block_size=_get_draft_block_size_from_env(),
-                            greedy_sampling=args.temperature == 0,
+                            greedy_sampling=args.temperature < SAMPLING_EPS,
                             prefill_step_size=self._effective_prefill_step_size(),
                         )
 
