@@ -166,6 +166,8 @@ def _model_type_from_id(model: str) -> str:
         "mageflow": "mage_flow",
         "z": "z_image",
         "zimage": "z_image",
+        "ming": "ming_image",
+        "mingimage": "ming_image",
         "ernie": "ernie_image",
         "qwen": "qwen_image",
         "qwenimage": "qwen_image",
@@ -278,6 +280,8 @@ def _image_model_type_from_component_indexes(root: Path) -> str | None:
         "noise_refiner.0.adaLN_modulation.0.weight",
     }
     if z_image_markers <= keys:
+        if (root / "mllm" / "config.json").exists():
+            return "ming_image"
         return "z_image"
     ernie_image_markers = {
         "adaln_modulation.weight",
