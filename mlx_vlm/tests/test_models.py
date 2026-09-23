@@ -1773,6 +1773,7 @@ class TestQwen3_5MoeText(unittest.TestCase):
             for fused in (True, False):
                 with self.subTest(prefix=prefix, fused=fused):
                     raw = self._raw_checkpoint(model, prefix, fused)
+                    raw[f"{prefix}layers.0.mlp.gate.input_global_scale"] = mx.ones(1)
                     sanitized = model.sanitize(raw)
                     self.assertEqual(sanitized.keys(), expected.keys())
                     for key, value in expected.items():

@@ -59,8 +59,13 @@ class Model(nn.Module):
 
     def sanitize(self, weights):
         # The MTP draft shard ships alongside the base model and must not
-        # select the base model's RMSNorm loading convention.
-        weights = {key: value for key, value in weights.items() if "mtp." not in key}
+        # select the base model's RMSNorm loading convention. W4A4 NVFP4
+        # exports carry activation scales that weight-only MLX nvfp4 ignores.
+        weights = {
+            key: value
+            for key, value in weights.items()
+            if "mtp." not in key and not key.endswith(".input_global_scale")
+        }
         shift_norm_weights = should_shift_norm_weights(weights)
 
         if self.config.tie_word_embeddings:
