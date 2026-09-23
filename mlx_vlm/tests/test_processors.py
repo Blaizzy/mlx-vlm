@@ -2030,6 +2030,22 @@ def test_invalid_calls(name, text, error):
                 )
             ],
         ),
+        (
+            "qwen3_coder",
+            dict,
+            "<function=write>\n<parameter=path>\na.txt\n"
+            "<parameter=content>\nhello\n</parameter>\n</function>",
+            _call("write", path="a.txt", content="hello"),
+            None,
+        ),
+        (
+            "qwen3_coder",
+            dict,
+            "<function=write>\n<parameter=path>\na.txt\n</parameter>\n"
+            "<parameter=content>\nhello\n</function>",
+            _call("write", path="a.txt", content="hello"),
+            None,
+        ),
     ],
     ids=[
         "gemma-nested",
@@ -2040,6 +2056,8 @@ def test_invalid_calls(name, text, error):
         "cohere-array-escape",
         "glm-newline",
         "qwen-untyped",
+        "qwen-unclosed-middle",
+        "qwen-unclosed-last",
     ],
 )
 def test_parser_syntax(parser, argument_type, text, expected, tools):
