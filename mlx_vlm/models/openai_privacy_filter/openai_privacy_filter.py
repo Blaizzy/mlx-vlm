@@ -1,17 +1,12 @@
 import math
-from dataclasses import dataclass
 from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..base import TokenClassifierOutput
 from ..switch_layers import SwitchLinear, _gather_sort, _scatter_unsort
 from .config import ModelConfig
-
-
-@dataclass
-class TokenClassifierOutput:
-    logits: mx.array
 
 
 class RMSNorm(nn.Module):
