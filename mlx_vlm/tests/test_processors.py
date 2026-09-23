@@ -1839,6 +1839,8 @@ WIRE_CALLS = {
     "]<]minimax[>[<city>Paris]<]minimax[>[</city>]<]minimax[>[<days>3"
     "]<]minimax[>[</days>]<]minimax[>[</invoke>]<]minimax[>[</tool_call>",
     "mistral": '[TOOL_CALLS]get_weather[ARGS]{"city": "Paris", "days": 3}',
+    "harmony": "<|channel|>commentary to=functions.get_weather <|constrain|>json"
+    '<|message|>{"city": "Paris", "days": 3}<|call|>',
     "pythonic": '<|tool_call_start|>[get_weather(city="Paris", days=3)]<|tool_call_end|>',
     "qwen3_coder": "<tool_call>\n<function=get_weather><parameter=city>Paris</parameter>"
     "<parameter=days>3</parameter></function></tool_call>",
@@ -2073,6 +2075,30 @@ def test_minicpm5_cdata_and_argument_types():
         "get_time",
     ]
     assert json.loads(result.calls[1]["function"]["arguments"]) == {}
+
+
+HARMONY_ANALYSIS_THEN_CALL = (
+    "<|channel|>analysis<|message|>The user wants the weather. Call get_weather."
+    "<|end|><|start|>assistant<|channel|>commentary to=functions.get_weather "
+    '<|constrain|>json<|message|>{"city": "Paris", "days": 3}<|call|>'
+)
+
+
+def test_harmony_extracts_commentary_tool_call_past_analysis():
+    result = process_tool_calls(
+        HARMONY_ANALYSIS_THEN_CALL, load_tool_module("harmony"), WEATHER_TOOLS
+    )
+    assert len(result.calls) == 1
+    assert result.calls[0]["function"]["name"] == "get_weather"
+    assert json.loads(result.calls[0]["function"]["arguments"]) == WEATHER_ARGS
+    assert "to=functions" not in result.remaining_text
+
+
+def test_harmony_ignores_plain_commentary_preamble():
+    preamble = "<|channel|>commentary<|message|>Let me look that up.<|end|>"
+    result = process_tool_calls(preamble, load_tool_module("harmony"), None)
+    assert result.calls == []
+    assert result.remaining_text == preamble
 
 
 # Loading and utility contracts
