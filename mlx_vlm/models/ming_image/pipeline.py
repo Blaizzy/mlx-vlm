@@ -15,8 +15,7 @@ from .weights import load_text_encoder, load_transformer, load_vae
 
 
 def scheduler_shift(image_seq_len: int) -> tuple[int, float]:
-    """Ming's dynamic-shift rule as (max_image_seq_len, max_shift) for the shared
-    flow-match scheduler: high-res prompts (seq >= 4096) clamp the shift to 1.35."""
+    """Ming's dynamic-shift rule as (max_image_seq_len, max_shift) for the scheduler."""
     return (image_seq_len, 1.35) if image_seq_len >= 4096 else (4096, 1.15)
 
 
@@ -89,12 +88,7 @@ class MingImagePipeline:
         guidance: float = 1.0,
         num_images: int = 1,
     ) -> mx.array:
-        """Generate images for one prompt.
-
-        Returns an ``[H, W, 4]`` uint8 RGBA array for ``num_images == 1``, or a
-        batched ``[N, H, W, 4]`` array otherwise. The prompt is encoded once and
-        the conditioning is shared across the whole latent batch.
-        """
+        """Generate one image ([H, W, 4]) or a batch ([N, H, W, 4]) for one prompt."""
         for name, value in (("width", width), ("height", height)):
             if value < 16 or value % 16:
                 raise ValueError(

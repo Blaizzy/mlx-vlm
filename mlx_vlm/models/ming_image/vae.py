@@ -1,18 +1,4 @@
-"""Ming-Image VAE: the 4-channel RGBA ``AutoencoderKLQwenImage``.
-
-The checkpoint ships the full 3D-causal (Wan-style) VAE, but text-to-image only
-ever decodes a single latent frame (T=1). Under that condition the VAE is exactly
-``qwen_image``'s validated 2D image-path VAE:
-
-* every causal 3D conv zero-pads two frames on the left and, with T=1, its output
-  reduces to the last temporal kernel tap applied per-frame; and
-* the temporal upsamplers take the first-chunk "Rep" path, which skips
-  ``time_conv`` and the temporal doubling entirely.
-
-So ``QwenImageVAE`` is reused, and the checkpoint's 3D conv weights are collapsed
-to that last temporal tap when loading. The unused ``time_conv`` weights are kept
-(collapsed too) so the strict load still validates every tensor.
-"""
+"""Ming-Image VAE: the 4-channel RGBA single-frame ``AutoencoderKLQwenImage``."""
 
 from __future__ import annotations
 

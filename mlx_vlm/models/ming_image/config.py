@@ -1,10 +1,4 @@
-"""Configuration for the Ming-Image-0.1-Design text-to-image model.
-
-Only the text-to-image path is ported. Four weight groups drive it: a BailingMoeV2
-MoE prompt encoder (``mllm``), a Qwen2 ``connector``, the ``mlp`` bridge (learnable
-query tokens + projections), a Lumina/NextDiT ``transformer``, and an
-``AutoencoderKLQwenImage`` ``vae`` (4-channel RGBA).
-"""
+"""Configuration for the Ming-Image-0.1-Design text-to-image model."""
 
 from __future__ import annotations
 

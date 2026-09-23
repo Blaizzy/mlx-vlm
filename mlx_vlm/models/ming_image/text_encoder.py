@@ -1,21 +1,4 @@
-"""Ming-Image conditioning encoder: prompt -> caption features for the DiT.
-
-The prompt is templated, and a block of 256 learnable query tokens is appended
-in the image slots. A single BailingMoeV2 forward produces per-layer hidden
-states. Two conditioning streams are derived:
-
-* **cap_feats** (learnable-token branch): the final hidden states at the 256
-  query positions -> ``proj_in`` -> a bidirectional Qwen2 connector ->
-  ``proj_out`` -> ``[1, 256, 2560]``.
-* **cap_feats_2** (direct-VLM branch): hidden states from layers [5, 12, 20]
-  concatenated over the real text tokens -> norm -> ``proj_directvlm`` ->
-  ``[1, text_len, 3840]``.
-
-The BailingMoeV2 MoE uses a per-modality MultiRouter: the 256 query tokens route
-through ``image_gate``, all other tokens through ``gate``; a shared expert is
-applied to every token. Only these two of the three routers are needed for a
-text-to-image prompt (audio is never present).
-"""
+"""Ming-Image conditioning encoder: prompt -> caption features for the DiT."""
 
 from __future__ import annotations
 

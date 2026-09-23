@@ -1,13 +1,4 @@
-"""Ming-Image NextDiT: a single-stream Lumina-2.0-style diffusion transformer.
-
-The block structure (noise/context refiners, sandwich AdaLN modulation, 3-axis
-axial RoPE, joint image+caption self-attention) is the ``z_image`` NextDiT, so
-its blocks and weight sanitizer are reused directly. Ming adds a second
-conditioning stream — the caption sequence is ``cap_embedder(cap_feats)``
-concatenated with the already-projected direct-VLM features (``cap_feats_2``) —
-and zero-fills + masks alignment padding (the checkpoint has no learnable pad
-tokens).
-"""
+"""Ming-Image NextDiT: a single-stream Lumina-2.0-style diffusion transformer."""
 
 from __future__ import annotations
 
@@ -154,12 +145,7 @@ class MingImageTransformer(nn.Module):
         cap_feats_2: mx.array | None,
         image_shape: tuple[int, int, int],
     ) -> MingImageConditioning:
-        """Precompute the step-invariant caption context, RoPE, and masks.
-
-        The context refiner carries no timestep dependence, so its output and
-        every RoPE/mask are identical across the denoising loop; the pipeline
-        builds this once and reuses it for every step.
-        """
+        """Precompute the step-invariant caption context, RoPE, and masks."""
         ft, ht, wt = image_shape
         image_len = ft * ht * wt
         padded_image_len = _round_up(image_len, SEQ_MULTIPLE)

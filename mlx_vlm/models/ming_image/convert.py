@@ -1,12 +1,4 @@
-"""Convert a Ming-Image-0.1-Design checkpoint to MLX (optionally quantized).
-
-Quantizes the diffusion transformer and the merged conditioning encoder, keeps
-the convolutional VAE at load precision, and leaves the MoE routers and the
-timestep/caption embedders unquantized (routing and those small projections are
-precision-sensitive). The converted checkpoint keeps the component config files
-so ``MingImageConfig.from_model_path`` still parses, and stores the encoder as a
-single MLX-native ``text_encoder/`` directory.
-"""
+"""Convert a Ming-Image-0.1-Design checkpoint to MLX (optionally quantized)."""
 
 from __future__ import annotations
 
