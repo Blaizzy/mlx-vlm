@@ -1,4 +1,5 @@
 import mlx.core as mx
+import mlx.nn as nn
 
 _FP8_BLOCK = 128
 
@@ -160,13 +161,7 @@ class LanguageModel(MiMoV2FlashLanguageModel):
                 out[f"{prefix}{name}.weight"] = mx.concatenate(chunks)
         return out
 
-    def _dequant_mxfp4_experts(self, weights):
-        """Dequantize the routed experts, which ship as MXFP4.
-
-        The checkpoint packs two 4-bit values per ``uint8`` and stores one
-        ``uint8`` E8M0 scale per 32 elements, which is byte-for-byte what MLX's
-        ``mxfp4`` mode expects once the payload is viewed as ``uint32``.
-        """
+    def _convert_mxfp4_experts(self, weights):
         out = {}
         for k, v in weights.items():
             if k.endswith(".weight_scale"):
@@ -175,18 +170,21 @@ class LanguageModel(MiMoV2FlashLanguageModel):
             if scale is None:
                 out[k] = v
                 continue
-            out[k] = mx.dequantize(
-                v.view(mx.uint32),
-                scale,
-                group_size=32,
-                bits=4,
-                mode="mxfp4",
-            ).astype(mx.bfloat16)
+            out[k] = v.view(mx.uint32)
+            out[k[: -len(".weight")] + ".scales"] = scale
         return out
 
     def sanitize(self, weights):
         if any(k.endswith("weight_scale") for k in weights):
-            weights = self._dequant_mxfp4_experts(weights)
+            nn.quantize(
+                self,
+                group_size=32,
+                bits=4,
+                mode="mxfp4",
+                class_predicate=lambda path, module: "switch_mlp" in path
+                and hasattr(module, "to_quantized"),
+            )
+            weights = self._convert_mxfp4_experts(weights)
         if any(k.endswith("self_attn.qkv_proj.weight") for k in weights):
             weights = self._unfuse_qkv(weights)
         return super().sanitize(weights)
