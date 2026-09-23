@@ -19,8 +19,6 @@ def sanitize_key(key):
     Qwen3.5 MoE text checkpoints keep the multimodal ``model.language_model``
     prefix; plain causal-LM exports use ``model``.
     """
-    if key.startswith("language_model."):
-        return key
     if key.startswith("model.language_model."):
         return key.replace("model.language_model.", "language_model.model.", 1)
     if key.startswith("model."):
@@ -68,9 +66,6 @@ class Model(nn.Module):
         }
         shift_norm_weights = should_shift_norm_weights(weights)
 
-        if self.config.tie_word_embeddings:
-            weights.pop("lm_head.weight", None)
-
         sanitized_weights = {}
         for key, value in weights.items():
             original_key = key
@@ -95,29 +90,21 @@ class Model(nn.Module):
             prefix = f"language_model.model.layers.{layer_idx}.mlp"
             gate_up_key = f"{prefix}.experts.gate_up_proj"
             if gate_up_key in weights:
-                for suffix in ("", "_scales"):
-                    if f"{gate_up_key}{suffix}" not in weights:
-                        continue
-                    target = "weight" if not suffix else "scales"
-                    gate_up = weights.pop(f"{gate_up_key}{suffix}")
-                    if gate_up.ndim != 3:
-                        raise ValueError(
-                            f"{gate_up_key}{suffix} has shape {gate_up.shape}; expected "
-                            "[num_experts, 2 * moe_intermediate_size, hidden_size]"
-                        )
-                    mid = gate_up.shape[-2] // 2
-                    weights[f"{prefix}.switch_mlp.gate_proj.{target}"] = gate_up[
-                        ..., :mid, :
-                    ]
-                    weights[f"{prefix}.switch_mlp.up_proj.{target}"] = gate_up[
-                        ..., mid:, :
-                    ]
-                    weights[f"{prefix}.switch_mlp.down_proj.{target}"] = weights.pop(
-                        f"{prefix}.experts.down_proj{suffix}"
+                gate_up = weights.pop(gate_up_key)
+                if gate_up.ndim != 3:
+                    raise ValueError(
+                        f"{gate_up_key} has shape {gate_up.shape}; expected "
+                        "[num_experts, 2 * moe_intermediate_size, hidden_size]"
                     )
+                mid = gate_up.shape[-2] // 2
+                weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_up[..., :mid, :]
+                weights[f"{prefix}.switch_mlp.up_proj.weight"] = gate_up[..., mid:, :]
+                weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
+                    f"{prefix}.experts.down_proj"
+                )
             elif f"{prefix}.experts.0.up_proj.weight" in weights:
                 for name in ("up_proj", "down_proj", "gate_proj"):
-                    for suffix in ("weight", "scales", "biases"):
+                    for suffix in ("weight", "scales"):
                         if f"{prefix}.experts.0.{name}.{suffix}" not in weights:
                             continue
                         weights[f"{prefix}.switch_mlp.{name}.{suffix}"] = mx.stack(

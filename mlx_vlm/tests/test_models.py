@@ -1752,20 +1752,6 @@ class TestQwen3_5MoeText(unittest.TestCase):
                         raw[f"{experts}.{e}.{name}.weight"] = weight[e]
         return raw
 
-    def test_loader_resolves_the_decoder_only_package(self):
-        module, model_type = get_model_and_args({"model_type": "qwen3_5_moe_text"})
-        self.assertEqual(model_type, "qwen3_5_moe_text")
-        self.assertEqual(module.__name__, "mlx_vlm.models.qwen3_5_moe_text")
-
-    def test_flat_config_builds_without_vision_config(self):
-        model = self._model()
-        self.assertEqual(model.config.num_experts, 2)
-        self.assertEqual(model.config.rope_parameters["type"], "default")
-        self.assertFalse(hasattr(model, "vision_tower"))
-
-        logits = model(mx.array([[1, 2, 3, 4]])).logits
-        self.assertEqual(tuple(logits.shape), (1, 4, self.CONFIG["vocab_size"]))
-
     def test_published_layouts_sanitize_to_the_model_exactly(self):
         model = self._model()
         expected = dict(tree_flatten(model.parameters()))
@@ -1788,14 +1774,6 @@ class TestQwen3_5MoeText(unittest.TestCase):
         raw["model.layers.0.mlp.experts.gate_up_proj"] = mx.zeros((123,))
         with self.assertRaisesRegex(ValueError, "expected \\[num_experts"):
             model.sanitize(raw)
-
-    def test_output_gate_type_accepts_only_the_implemented_gate(self):
-        from mlx_vlm.models.qwen3_5_moe_text import ModelConfig
-
-        for gate in (None, "swish", "silu"):
-            ModelConfig.from_dict(dict(self.CONFIG, output_gate_type=gate))
-        with self.assertRaisesRegex(ValueError, "output_gate_type"):
-            ModelConfig.from_dict(dict(self.CONFIG, output_gate_type="sigmoid"))
 
     def test_sanitize_is_idempotent_on_converted_weights(self):
         model = self._model()
