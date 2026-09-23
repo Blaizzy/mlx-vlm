@@ -3450,6 +3450,13 @@ def _generate_batch(
     batch_size = len(prompts)
     logits_processors = kwargs.pop("logits_processors", None)
 
+    video_sampling_kwargs = {
+        name: kwargs.pop(name)
+        for name in ("fps", "nframes", "min_frames", "max_frames", "frame_factor")
+        if name in kwargs
+    }
+    fps = video_sampling_kwargs.setdefault("fps", 1)
+
     num_images_list = [
         1 if i < (len(images) if images is not None else 0) else 0
         for i in range(len(prompts))
@@ -3458,17 +3465,18 @@ def _generate_batch(
         apply_chat_template(
             processor,
             model.config,
-            p,
+            prompt,
             num_images=num_images_list[i],
             num_audios=1 if audios is not None and i < len(audios) else 0,
             video=videos[i] if videos is not None and i < len(videos) else None,
             fps=(
-                kwargs.get("fps", 1)[i]
-                if isinstance(kwargs.get("fps", 1), list)
-                else kwargs.get("fps", 1)
+                fps[i]
+                if isinstance(fps, (list, tuple))
+                and i < min(len(videos or []), len(fps))
+                else 1 if isinstance(fps, (list, tuple)) else fps
             ),
         )
-        for i, p in enumerate(prompts)
+        for i, prompt in enumerate(prompts)
     ]
 
     add_special_tokens = should_add_special_tokens(model.config.model_type, processor)
@@ -3485,7 +3493,7 @@ def _generate_batch(
         image_token_index=image_token_index,
         resize_shape=resize_shape,
         add_special_tokens=add_special_tokens,
-        fps=kwargs.pop("fps", 1),
+        **video_sampling_kwargs,
         pad_to_uniform_size=False,  # Since images are pre-grouped by shape, they're already uniform size
     )
     input_ids = inputs.get("input_ids", None)

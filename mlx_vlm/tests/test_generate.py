@@ -774,6 +774,58 @@ def test_batch_generate_rejects_unsupported_audio_batch(mock_model, mock_process
 class TestBatchGenerate:
     """Tests for the batch_generate function."""
 
+    def test_video_sampling_options_are_row_safe_and_not_generation_kwargs(
+        self, mock_model, mock_processor
+    ):
+        class _StopGenerator(Exception):
+            pass
+
+        template_kwargs = []
+
+        def apply_template(processor, config, prompt, **kwargs):
+            template_kwargs.append(kwargs)
+            return prompt
+
+        def prepare(processor, **kwargs):
+            assert kwargs["fps"] == [1]
+            assert kwargs["nframes"] == 8
+            assert kwargs["max_frames"] == 16
+            return {
+                "input_ids": mx.array([[1, 2], [3, 4]]),
+                "attention_mask": mx.ones((2, 2)),
+            }
+
+        def make_generator(*args, **kwargs):
+            assert "fps" not in kwargs
+            assert "nframes" not in kwargs
+            assert "max_frames" not in kwargs
+            raise _StopGenerator
+
+        embedding_output = InputEmbeddingsFeatures(inputs_embeds=mx.zeros((2, 2, 4)))
+        with (
+            patch.object(ar_module, "apply_chat_template", side_effect=apply_template),
+            patch.object(ar_module, "prepare_inputs", side_effect=prepare),
+            patch.object(
+                mock_model, "get_input_embeddings", return_value=embedding_output
+            ),
+            patch.object(ar_module, "BatchGenerator", side_effect=make_generator),
+            pytest.raises(_StopGenerator),
+        ):
+            ar_module._generate_batch(
+                mock_model,
+                mock_processor,
+                prompts=["video", "text"],
+                videos=["clip.mp4"],
+                fps=[1],
+                nframes=8,
+                max_frames=16,
+            )
+
+        assert template_kwargs[0]["video"] == "clip.mp4"
+        assert template_kwargs[0]["fps"] == 1
+        assert template_kwargs[1]["video"] is None
+        assert template_kwargs[1]["fps"] == 1
+
     def test_generate_batch_passes_mask_and_split_prompt_kwargs_to_generator(
         self, mock_model, mock_processor
     ):

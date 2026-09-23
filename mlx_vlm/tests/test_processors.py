@@ -2377,6 +2377,43 @@ class TestResolveVideoSampling:
 
 
 class TestVideoMetadataForwarding:
+    def test_each_video_uses_its_own_sampling_rate(self):
+        class Processor:
+            tokenizer = SimpleNamespace(pad_token="<pad>")
+
+            def __call__(self, text, images=None, videos=None, fps=None, **kwargs):
+                self.fps = fps
+                self.kwargs = kwargs
+                return {
+                    "input_ids": np.array([[1], [2]]),
+                    "attention_mask": np.array([[1], [1]]),
+                }
+
+        processor = Processor()
+        video = np.zeros((2, 3, 8, 8), dtype=np.uint8)
+        samplings = []
+
+        def load(path, sampling, frame_sampler=None):
+            samplings.append(sampling)
+            return video, VideoMetadata(
+                total_num_frames=30,
+                fps=30,
+                frames_indices=[0, 29],
+            )
+
+        with patch("mlx_vlm.utils.load_video", side_effect=load):
+            prepare_inputs(
+                processor,
+                videos=["first.mp4", "second.mp4"],
+                prompts=["first", "second"],
+                fps=[1, 2],
+                nframes=2,
+            )
+
+        assert [sampling.fps for sampling in samplings] == [1, 2]
+        assert [sampling.nframes for sampling in samplings] == [2, 2]
+        assert "nframes" not in processor.kwargs
+
     def test_metadata_is_only_forwarded_to_declaring_processors(self):
         class Processor:
             tokenizer = SimpleNamespace(pad_token="<pad>")
