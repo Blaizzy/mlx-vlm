@@ -135,10 +135,15 @@ class MingImagePipeline:
             num_inference_steps=steps,
             num_train_timesteps=self.config.num_train_timesteps,
         )
+        patch = self.config.dit.patch_size
+        conditioning = self.transformer.prepare_conditioning(
+            cap_feats, cap_feats_2, (1, latent_h // patch, latent_w // patch)
+        )
+        mx.eval(conditioning.arrays())
         for i in range(steps):
             t = (1.0 - scheduler.sigmas[i]).reshape(1).astype(mx.bfloat16)
-            pred = self.transformer(
-                latents.astype(mx.bfloat16), t, cap_feats, cap_feats_2
+            pred = self.transformer.denoise(
+                latents.astype(mx.bfloat16), t, conditioning
             ).astype(mx.float32)
             latents = scheduler.step(noise=-pred, step_index=i, latents=latents)
             mx.eval(latents)

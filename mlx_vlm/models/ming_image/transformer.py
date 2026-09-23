@@ -11,6 +11,7 @@ attention (the checkpoint has no learnable pad tokens).
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -18,6 +19,27 @@ import mlx.nn as nn
 from .config import MingImageDiTConfig
 
 SEQ_MULTIPLE = 32
+
+
+@dataclass(slots=True)
+class MingImageConditioning:
+    """Step-invariant DiT inputs, built once and reused across denoising steps."""
+
+    refined_cap: mx.array
+    img_cos: mx.array
+    img_sin: mx.array
+    img_mask: mx.array | None
+    cos: mx.array
+    sin: mx.array
+    mask: mx.array | None
+    image_len: int
+    padded_image_len: int
+    image_shape: tuple[int, int, int]
+
+    def arrays(self) -> list[mx.array]:
+        values = [self.refined_cap, self.img_cos, self.img_sin, self.cos, self.sin]
+        values.extend(v for v in (self.img_mask, self.mask) if v is not None)
+        return values
 
 
 def _round_up(value: int, multiple: int) -> int:
@@ -276,16 +298,20 @@ class MingImageTransformer(nn.Module):
         img_pos = mx.stack([f_grid, h_grid, w_grid], axis=-1)[None]
         return cap_pos, img_pos
 
-    def __call__(
+    def prepare_conditioning(
         self,
-        x: mx.array,
-        t: mx.array,
         cap_feats: mx.array,
-        cap_feats_2: mx.array | None = None,
-    ) -> mx.array:
-        b = x.shape[0]
-        patches, (ft, ht, wt) = self._patchify(x)
-        image_len = patches.shape[1]
+        cap_feats_2: mx.array | None,
+        image_shape: tuple[int, int, int],
+    ) -> MingImageConditioning:
+        """Precompute the step-invariant caption context, RoPE, and masks.
+
+        The context refiner carries no timestep dependence, so its output and
+        every RoPE/mask are identical across the denoising loop. The pipeline
+        builds this once and reuses it for every step.
+        """
+        ft, ht, wt = image_shape
+        image_len = ft * ht * wt
         padded_image_len = _round_up(image_len, SEQ_MULTIPLE)
 
         cap_tokens = self.cap_embedder[1](self.cap_embedder[0](cap_feats))
@@ -293,37 +319,72 @@ class MingImageTransformer(nn.Module):
             cap_tokens = mx.concatenate([cap_tokens, cap_feats_2], axis=1)
         cap_len = cap_tokens.shape[1]
         padded_cap_len = _round_up(cap_len, SEQ_MULTIPLE)
-
-        img_tokens = self.x_embedder(patches)
-        img_tokens = self._pad_sequence(img_tokens, padded_image_len)
         cap_tokens = self._pad_sequence(cap_tokens, padded_cap_len)
 
-        t_emb = self.t_embedder(t * self.t_scale).astype(x.dtype)
-
-        cap_pos, img_pos = self._positions(padded_cap_len, (ft, ht, wt))
+        cap_pos, img_pos = self._positions(padded_cap_len, image_shape)
         img_pos = self._pad_positions(img_pos, padded_image_len)
         img_cos, img_sin = self.rope(img_pos)
         cap_cos, cap_sin = self.rope(cap_pos)
-
-        img_mask = self._key_mask(image_len, padded_image_len)
         cap_mask = self._key_mask(cap_len, padded_cap_len)
 
-        for block in self.noise_refiner:
-            img_tokens = block(img_tokens, img_cos, img_sin, t_emb, img_mask)
         for block in self.context_refiner:
             cap_tokens = block(cap_tokens, cap_cos, cap_sin, None, cap_mask)
 
-        unified = mx.concatenate([img_tokens, cap_tokens], axis=1)
-        cos = mx.concatenate([img_cos, cap_cos], axis=1)
-        sin = mx.concatenate([img_sin, cap_sin], axis=1)
-        unified_mask = self._unified_mask(
-            image_len, padded_image_len, cap_len, padded_cap_len
+        return MingImageConditioning(
+            refined_cap=cap_tokens,
+            img_cos=img_cos,
+            img_sin=img_sin,
+            img_mask=self._key_mask(image_len, padded_image_len),
+            cos=mx.concatenate([img_cos, cap_cos], axis=1),
+            sin=mx.concatenate([img_sin, cap_sin], axis=1),
+            mask=self._unified_mask(
+                image_len, padded_image_len, cap_len, padded_cap_len
+            ),
+            image_len=image_len,
+            padded_image_len=padded_image_len,
+            image_shape=image_shape,
         )
-        for block in self.layers:
-            unified = block(unified, cos, sin, t_emb, unified_mask)
 
-        img_out = self.final_layer(unified[:, :image_len], t_emb)
-        return self._unpatchify(img_out, (ft, ht, wt))
+    def denoise(
+        self, x: mx.array, t: mx.array, conditioning: MingImageConditioning
+    ) -> mx.array:
+        """One denoising step reusing a precomputed conditioning context."""
+        patches, _ = self._patchify(x)
+        img_tokens = self._pad_sequence(
+            self.x_embedder(patches), conditioning.padded_image_len
+        )
+        t_emb = self.t_embedder(t * self.t_scale).astype(img_tokens.dtype)
+        for block in self.noise_refiner:
+            img_tokens = block(
+                img_tokens,
+                conditioning.img_cos,
+                conditioning.img_sin,
+                t_emb,
+                conditioning.img_mask,
+            )
+        unified = mx.concatenate([img_tokens, conditioning.refined_cap], axis=1)
+        for block in self.layers:
+            unified = block(
+                unified, conditioning.cos, conditioning.sin, t_emb, conditioning.mask
+            )
+        img_out = self.final_layer(unified[:, : conditioning.image_len], t_emb)
+        return self._unpatchify(img_out, conditioning.image_shape)
+
+    def __call__(
+        self,
+        x: mx.array,
+        t: mx.array,
+        cap_feats: mx.array,
+        cap_feats_2: mx.array | None = None,
+    ) -> mx.array:
+        _, _, f, h, w = x.shape
+        image_shape = (
+            f // self.f_patch_size,
+            h // self.patch_size,
+            w // self.patch_size,
+        )
+        conditioning = self.prepare_conditioning(cap_feats, cap_feats_2, image_shape)
+        return self.denoise(x, t, conditioning)
 
     @staticmethod
     def _pad_sequence(tokens: mx.array, target_len: int) -> mx.array:
@@ -370,4 +431,8 @@ def sanitize_transformer_weights(weights: dict[str, mx.array]) -> dict[str, mx.a
     return sanitized
 
 
-__all__ = ["MingImageTransformer", "sanitize_transformer_weights"]
+__all__ = [
+    "MingImageConditioning",
+    "MingImageTransformer",
+    "sanitize_transformer_weights",
+]
