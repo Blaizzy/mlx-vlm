@@ -9,20 +9,8 @@ from ..qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor
 class MiMoV2Processor(Qwen2_5_VLProcessor):
     def __init__(self, *args, **kwargs):
         audio_tokenizer_path = kwargs.pop("audio_tokenizer_path", None)
-        tokenizer = kwargs.get("tokenizer")
-        if tokenizer is None and len(args) > 1:
-            tokenizer = args[1]
         super().__init__(*args, **kwargs)
-        if not hasattr(self, "tokenizer"):
-            self.image_processor = kwargs.get(
-                "image_processor", args[0] if args else None
-            )
-            self.tokenizer = tokenizer
-            self.video_processor = kwargs.get(
-                "video_processor", args[2] if len(args) > 2 else None
-            )
         self.audio_token = "<|audio_pad|>"
-        self.audio_token_id = tokenizer.convert_tokens_to_ids(self.audio_token)
         self.audio_tokenizer_path = audio_tokenizer_path
         self._audio_tokenizer = None
 

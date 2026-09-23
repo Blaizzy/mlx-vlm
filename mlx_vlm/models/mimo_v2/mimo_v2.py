@@ -30,11 +30,10 @@ class Model(nn.Module):
         dtype = self.vision_tower.patch_embed.proj.weight.dtype
         return self.vision_tower(pixel_values.astype(dtype), grid_thw)
 
-    def encode_image(self, pixel_values, image_grid_thw=None):
-        return self._encode_vision(pixel_values, image_grid_thw, "image")
-
     def encode_images(self, pixel_values, **kwargs):
-        return [self.encode_image(pixel_values, kwargs.get("image_grid_thw"))]
+        return [
+            self._encode_vision(pixel_values, kwargs.get("image_grid_thw"), "image")
+        ]
 
     def encode_video(self, pixel_values, video_grid_thw=None):
         return self._encode_vision(pixel_values, video_grid_thw, "video")
@@ -55,21 +54,21 @@ class Model(nn.Module):
                 pixel_values,
                 kwargs.get("image_grid_thw"),
                 kwargs.get("cached_image_features"),
-                self.encode_image,
+                "image",
             ),
             (
                 self.config.video_token_id,
                 kwargs.get("pixel_values_videos", kwargs.get("video_pixel_values")),
                 kwargs.get("video_grid_thw"),
                 kwargs.get("cached_video_features"),
-                self.encode_video,
+                "video",
             ),
         )
-        for token_id, pixels, grid, cached, encode in modalities:
+        for token_id, pixels, grid, cached, modality in modalities:
             if pixels is None and cached is None:
                 continue
             if cached is None:
-                cached = encode(pixels, grid)
+                cached = self._encode_vision(pixels, grid, modality)
             if not isinstance(cached, mx.array):
                 cached = mx.concatenate(list(cached), axis=0)
             inputs_embeds = self._replace_modal_embeddings(

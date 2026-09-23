@@ -1313,7 +1313,7 @@ def test_mimo_v2_inserts_image_and_video_features():
     pixels = mx.random.normal((16, patch_width))
     grid = mx.array([[1, 4, 4]])
     ids = mx.array([[config.image_token_id] * 4])
-    encoded = model.encode_image(pixels, grid)
+    encoded = model.encode_images(pixels, image_grid_thw=grid)[0]
     result = model.get_input_embeddings(
         ids, pixel_values=pixels, image_grid_thw=grid
     ).inputs_embeds
@@ -1364,7 +1364,7 @@ def test_mimo_v2_combines_image_video_and_audio_features():
     video_pixels = mx.random.normal((32, patch_width))
     video_grid = mx.array([[2, 4, 4]])
     audio_codes = mx.array([[1, 2], [3, 4], [5, 6]])
-    image = model.encode_image(image_pixels, image_grid)
+    image = model.encode_images(image_pixels, image_grid_thw=image_grid)[0]
     video = model.encode_video(video_pixels, video_grid)
     audio = model.encode_audio(audio_codes)
     ids = mx.array(
