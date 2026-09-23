@@ -34,6 +34,7 @@ from mlx_vlm.utils import (
     load,
     load_config,
     load_model,
+    load_processor,
 )
 
 # Shared model contracts
@@ -1669,3 +1670,186 @@ class TestMoondream3Sanitize(unittest.TestCase):
         )
         self.assertIn("text.model.blocks.0.attn.qkv.weight", sanitized)
         self.assertIn("vision.encoder.blocks.0.ln1.weight", sanitized)
+
+
+class TestQwen3_5MoeText(unittest.TestCase):
+    """Decoder-only Qwen3.5 MoE checkpoints (model_type qwen3_5_moe_text)."""
+
+    CONFIG = {
+        "model_type": "qwen3_5_moe_text",
+        "architectures": ["Qwen3_5MoeForCausalLM"],
+        "hidden_size": 16,
+        "linear_num_value_heads": 2,
+        "linear_num_key_heads": 2,
+        "linear_key_head_dim": 32,
+        "linear_value_head_dim": 8,
+        "linear_conv_kernel_dim": 3,
+        "num_hidden_layers": 2,
+        "full_attention_interval": 2,
+        "layer_types": ["linear_attention", "full_attention"],
+        "num_attention_heads": 2,
+        "num_experts": 2,
+        "num_experts_per_tok": 1,
+        "shared_expert_intermediate_size": 32,
+        "moe_intermediate_size": 16,
+        "rms_norm_eps": 1e-05,
+        "vocab_size": 32,
+        "num_key_value_heads": 2,
+        "max_position_embeddings": 128,
+        "head_dim": 8,
+        "tie_word_embeddings": False,
+        "rope_parameters": {
+            "rope_type": "default",
+            "mrope_interleaved": True,
+            "mrope_section": [1, 0, 0],
+            "rope_theta": 10000,
+            "partial_rotary_factor": 0.25,
+        },
+    }
+
+    def _model(self):
+        from mlx_vlm.models.qwen3_5_moe_text import Model, ModelConfig
+
+        model = Model(ModelConfig.from_dict(self.CONFIG))
+        # Quarter-integer values keep the raw-norm offset exact in float32.
+        model.update(
+            tree_map(
+                lambda p: (mx.random.randint(-8, 8, p.shape) / 4).astype(p.dtype),
+                model.parameters(),
+            )
+        )
+        return model
+
+    def _raw_checkpoint(self, model, prefix, fused):
+        """Rebuild a published checkpoint from the model's own parameters."""
+        from mlx_vlm.models.qwen3_5.qwen3_5 import NORM_WEIGHT_SUFFIXES
+
+        raw = {}
+        for key, value in tree_flatten(model.parameters()):
+            if ".switch_mlp." in key:
+                continue
+            if key.startswith("language_model.model."):
+                raw_key = prefix + key[len("language_model.model.") :]
+            else:
+                raw_key = key.replace("language_model.lm_head", "lm_head", 1)
+            if "conv1d.weight" in key:
+                value = value.swapaxes(1, 2)
+            if any(key.endswith(sfx) for sfx in NORM_WEIGHT_SUFFIXES):
+                value = value - 1.0
+            raw[raw_key] = value
+        for layer_idx, layer in enumerate(model.layers):
+            experts = f"{prefix}layers.{layer_idx}.mlp.experts"
+            switch = layer.mlp.switch_mlp
+            if fused:
+                raw[f"{experts}.gate_up_proj"] = mx.concatenate(
+                    [switch.gate_proj.weight, switch.up_proj.weight], axis=-2
+                )
+                raw[f"{experts}.down_proj"] = switch.down_proj.weight
+            else:
+                for name in ("gate_proj", "up_proj", "down_proj"):
+                    weight = getattr(switch, name).weight
+                    for e in range(weight.shape[0]):
+                        raw[f"{experts}.{e}.{name}.weight"] = weight[e]
+        return raw
+
+    def test_loader_resolves_the_decoder_only_package(self):
+        module, model_type = get_model_and_args({"model_type": "qwen3_5_moe_text"})
+        self.assertEqual(model_type, "qwen3_5_moe_text")
+        self.assertEqual(module.__name__, "mlx_vlm.models.qwen3_5_moe_text")
+
+    def test_flat_config_builds_without_vision_config(self):
+        model = self._model()
+        self.assertEqual(model.config.num_experts, 2)
+        self.assertEqual(model.config.rope_parameters["type"], "default")
+        self.assertFalse(hasattr(model, "vision_tower"))
+
+        logits = model(mx.array([[1, 2, 3, 4]])).logits
+        self.assertEqual(tuple(logits.shape), (1, 4, self.CONFIG["vocab_size"]))
+
+    def test_published_layouts_sanitize_to_the_model_exactly(self):
+        model = self._model()
+        expected = dict(tree_flatten(model.parameters()))
+        for prefix in ("model.language_model.", "model."):
+            for fused in (True, False):
+                with self.subTest(prefix=prefix, fused=fused):
+                    raw = self._raw_checkpoint(model, prefix, fused)
+                    sanitized = model.sanitize(raw)
+                    self.assertEqual(sanitized.keys(), expected.keys())
+                    for key, value in expected.items():
+                        self.assertTrue(
+                            mx.array_equal(sanitized[key], value).item(), key
+                        )
+                    model.load_weights(list(sanitized.items()), strict=True)
+
+    def test_ragged_expert_tensors_fail_clearly(self):
+        model = self._model()
+        raw = self._raw_checkpoint(model, "model.", fused=True)
+        raw["model.layers.0.mlp.experts.gate_up_proj"] = mx.zeros((123,))
+        with self.assertRaisesRegex(ValueError, "expected \\[num_experts"):
+            model.sanitize(raw)
+
+    def test_output_gate_type_accepts_only_the_implemented_gate(self):
+        from mlx_vlm.models.qwen3_5_moe_text import ModelConfig
+
+        for gate in (None, "swish", "silu"):
+            ModelConfig.from_dict(dict(self.CONFIG, output_gate_type=gate))
+        with self.assertRaisesRegex(ValueError, "output_gate_type"):
+            ModelConfig.from_dict(dict(self.CONFIG, output_gate_type="sigmoid"))
+
+    def test_sanitize_is_idempotent_on_converted_weights(self):
+        model = self._model()
+        converted = dict(tree_flatten(model.parameters()))
+        again = model.sanitize(dict(converted))
+        self.assertEqual(again.keys(), converted.keys())
+        for key, value in converted.items():
+            self.assertTrue(mx.array_equal(again[key], value).item(), key)
+
+    def test_missing_mrope_section_is_plain_rope(self):
+        from mlx_vlm.models.qwen3_5_moe_text import Model, ModelConfig
+
+        model = self._model()
+        weights = list(tree_flatten(model.parameters()))
+        ids = mx.array([[3, 1, 4, 1, 5, 9, 2, 6]])
+
+        def logits(rope_parameters):
+            config = dict(self.CONFIG, rope_parameters=rope_parameters)
+            other = Model(ModelConfig.from_dict(config))
+            other.load_weights(weights, strict=True)
+            return other(ids).logits
+
+        base = {
+            "rope_type": "default",
+            "rope_theta": 10000,
+            "partial_rotary_factor": 1.0,
+        }
+        missing = logits(dict(base))
+        for section in ([2, 1, 1], [1, 1, 2], [4, 0, 0]):
+            with self.subTest(section=section):
+                explicit = logits(dict(base, mrope_section=section))
+                self.assertTrue(mx.allclose(missing, explicit, atol=1e-5).item())
+
+    def test_stale_vl_processor_class_loads_the_tokenizer(self):
+        import tempfile
+
+        from tokenizers import Tokenizer, models, pre_tokenizers
+        from transformers import PreTrainedTokenizerFast
+
+        import mlx_vlm.models.qwen3_5_moe_text  # noqa: F401  installs the patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            vocab = {f"t{i}": i for i in range(32)}
+            backend = Tokenizer(models.WordLevel(vocab, unk_token="t0"))
+            backend.pre_tokenizer = pre_tokenizers.Whitespace()
+            PreTrainedTokenizerFast(
+                tokenizer_object=backend, unk_token="t0", eos_token="t1"
+            ).save_pretrained(tmp)
+            tokenizer_config = Path(tmp) / "tokenizer_config.json"
+            data = json.loads(tokenizer_config.read_text())
+            data["processor_class"] = "Qwen3VLProcessor"
+            tokenizer_config.write_text(json.dumps(data))
+            (Path(tmp) / "config.json").write_text(json.dumps(self.CONFIG))
+
+            processor = load_processor(Path(tmp), eos_token_ids=[1])
+
+        self.assertFalse(hasattr(processor, "image_processor"))
+        self.assertEqual(processor.encode("t3 t4", add_special_tokens=False), [3, 4])
