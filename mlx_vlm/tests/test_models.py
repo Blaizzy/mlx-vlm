@@ -1282,6 +1282,88 @@ def test_mimo_v2_keeps_only_the_requested_trailing_logits():
     assert mx.allclose(kept, full[:, -1:, :])
 
 
+def test_mimo_v2_inserts_image_and_video_features():
+    module = importlib.import_module("mlx_vlm.models.mimo_v2")
+    case = next(c for c in DATA["cases"] if c["id"] == "TestModels.mimo_v2")
+    config = build_config(module, case["config"])
+    model = module.Model(config)
+    width = config.text_config.hidden_size
+    image = mx.full((2, width), 3.0)
+    video = mx.full((1, width), 7.0)
+    ids = mx.array(
+        [[1, config.image_token_id, config.video_token_id, config.image_token_id, 2]]
+    )
+
+    result = model.get_input_embeddings(
+        ids, cached_image_features=image, cached_video_features=video
+    ).inputs_embeds
+
+    assert mx.array_equal(result[0, [1, 3]], image).item()
+    assert mx.array_equal(result[0, 2], video[0]).item()
+    expected = model.language_model.model.embed_tokens(ids)
+    assert mx.array_equal(result[0, [0, 4]], expected[0, [0, 4]]).item()
+
+    vision = config.vision_config
+    patch_width = (
+        vision.in_channels
+        * vision.temporal_patch_size
+        * vision.patch_size
+        * vision.patch_size
+    )
+    pixels = mx.random.normal((16, patch_width))
+    grid = mx.array([[1, 4, 4]])
+    ids = mx.array([[config.image_token_id] * 4])
+    encoded = model.vision_tower(pixels, grid)
+    result = model.get_input_embeddings(
+        ids, pixel_values=pixels, image_grid_thw=grid
+    ).inputs_embeds
+    assert mx.allclose(result[0], encoded)
+
+
+def test_mimo_v2_rejects_mismatched_modal_features():
+    module = importlib.import_module("mlx_vlm.models.mimo_v2")
+    case = next(c for c in DATA["cases"] if c["id"] == "TestModels.mimo_v2")
+    config = build_config(module, case["config"])
+    model = module.Model(config)
+    ids = mx.array([[config.image_token_id, config.image_token_id]])
+
+    with pytest.raises(ValueError, match="2 placeholder tokens for 1 features"):
+        model.get_input_embeddings(
+            ids,
+            cached_image_features=mx.zeros((1, config.text_config.hidden_size)),
+        )
+    with pytest.raises(ValueError, match="must be 2D"):
+        model.get_input_embeddings(
+            ids,
+            cached_image_features=mx.zeros((1, 1, config.text_config.hidden_size)),
+        )
+    with pytest.raises(ValueError, match="does not match text embedding width"):
+        model.get_input_embeddings(
+            ids,
+            cached_image_features=mx.zeros((2, config.text_config.hidden_size - 1)),
+        )
+
+
+def test_mimo_v2_inserts_audio_features():
+    module = importlib.import_module("mlx_vlm.models.mimo_v2")
+    case = next(c for c in DATA["cases"] if c["id"] == "TestModels.mimo_v2")
+    config = build_config(module, case["config"])
+    model = module.Model(config)
+    ids = mx.array([[1, config.audio_token_id, config.audio_token_id, 2]])
+    codes = mx.array([[1, 2], [3, 4], [5, 6]])
+
+    encoded = model.audio_encoder(codes, model.speech_embeddings)
+    result = model.get_input_embeddings(ids, audio_codes=codes).inputs_embeds
+
+    assert encoded.shape == (2, config.text_config.hidden_size)
+    assert mx.allclose(result[0, 1:3], encoded)
+
+    with pytest.raises(ValueError, match="at least one frame"):
+        model.audio_encoder(mx.zeros((0, 2), dtype=mx.int32), model.speech_embeddings)
+    with pytest.raises(ValueError, match="at least 2 channels"):
+        model.audio_encoder(mx.zeros((2, 1), dtype=mx.int32), model.speech_embeddings)
+
+
 def test_glm_quantized_head_sanitization_loads_strictly():
     module = importlib.import_module("mlx_vlm.models.glm5_next")
     model = module.Model(
