@@ -95,7 +95,6 @@ class MingImageConnectorConfig:
     num_hidden_layers: int = 28
     num_attention_heads: int = 12
     num_key_value_heads: int = 2
-    head_dim: int = 128
     intermediate_size: int = 8960
     rope_theta: float = 1000000.0
     rms_norm_eps: float = 1e-6
@@ -103,16 +102,15 @@ class MingImageConnectorConfig:
     @classmethod
     def from_dict(cls, c: dict[str, Any]) -> MingImageConnectorConfig:
         d = cls()
-        heads = int(c.get("num_attention_heads", d.num_attention_heads))
-        hidden = int(c.get("hidden_size", d.hidden_size))
         return cls(
-            hidden_size=hidden,
+            hidden_size=int(c.get("hidden_size", d.hidden_size)),
             num_hidden_layers=int(c.get("num_hidden_layers", d.num_hidden_layers)),
-            num_attention_heads=heads,
+            num_attention_heads=int(
+                c.get("num_attention_heads", d.num_attention_heads)
+            ),
             num_key_value_heads=int(
                 c.get("num_key_value_heads", d.num_key_value_heads)
             ),
-            head_dim=int(c.get("head_dim", hidden // heads)),
             intermediate_size=int(c.get("intermediate_size", d.intermediate_size)),
             rope_theta=float(c.get("rope_theta", d.rope_theta)),
             rms_norm_eps=float(c.get("rms_norm_eps", d.rms_norm_eps)),
