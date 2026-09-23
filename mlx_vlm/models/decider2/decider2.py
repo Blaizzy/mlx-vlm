@@ -6,11 +6,7 @@ from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
-from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer
-
-from ..qwen3_5.config import TextConfig
-from ..qwen3_5.language import LanguageModel
 
 
 def _text(value):
@@ -82,40 +78,12 @@ def _render_question(spec):
     }
 
 
-def _mapped_weights(weights):
-    result = {}
-    for key, value in weights.items():
-        if key.startswith("model.language_model."):
-            key = "model." + key[len("model.language_model.") :]
-        elif key == "lm_head.weight":
-            continue
-        if "conv1d.weight" in key and value.shape[-1] != 1:
-            value = value.moveaxis(2, 1)
-        if key.endswith(
-            (
-                ".input_layernorm.weight",
-                ".post_attention_layernorm.weight",
-                "model.norm.weight",
-                ".q_norm.weight",
-                ".k_norm.weight",
-            )
-        ):
-            value = value + 1
-        result[key] = value
-    return result
-
-
 class Decider2:
-    def __init__(self, path):
+    def __init__(self, model, tokenizer, settings, path):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.settings = settings
         self.path = Path(path)
-        config = json.loads((self.path / "config.json").read_text())
-        self.settings = json.loads((self.path / "decider_config.json").read_text())
-        self.tokenizer = AutoTokenizer.from_pretrained(self.path)
-        self.model = LanguageModel(TextConfig.from_dict(config))
-        weights = _mapped_weights(mx.load(str(self.path / "model.safetensors")))
-        self.model.load_weights(list(weights.items()), strict=True)
-        self.model.eval()
-        mx.eval(self.model.parameters())
         names = list(string.ascii_uppercase) + [
             a + b for a in string.ascii_uppercase for b in string.ascii_uppercase
         ]
@@ -355,21 +323,24 @@ class Decider2:
         }
 
 
-def load(path_or_repo, *, revision=None):
+def load(path_or_repo, *, revision=None, lazy=False):
     """Load decider-2b from a local directory or the Hub."""
-    path = Path(path_or_repo)
-    if not path.exists():
-        path = Path(
-            snapshot_download(
-                path_or_repo,
-                revision=revision,
-                allow_patterns=[
-                    "model.safetensors",
-                    "config.json",
-                    "decider_config.json",
-                    "tokenizer.json",
-                    "tokenizer_config.json",
-                ],
-            )
-        )
-    return Decider2(path)
+    from ...utils import get_model_path, load_model
+
+    path = get_model_path(
+        path_or_repo,
+        revision=revision,
+        allow_patterns=[
+            "model.safetensors",
+            "config.json",
+            "decider_config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+        ],
+    )
+    return Decider2(
+        load_model(path, lazy=lazy).language_model,
+        AutoTokenizer.from_pretrained(path),
+        json.loads((path / "decider_config.json").read_text()),
+        path,
+    )

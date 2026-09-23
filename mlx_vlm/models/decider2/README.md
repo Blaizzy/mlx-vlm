@@ -1,11 +1,11 @@
 # Decider-2b decisions on MLX
 
-Load the original `convaiinnovations/decider-2b` checkpoint directly. It uses the existing Qwen3.5 text backbone and scores only the allowed option tokens at answer slots. No converted checkpoint is required.
+Load the original `Mapika/decider-2b` checkpoint directly. It uses the existing Qwen3.5 text backbone and scores only the allowed option tokens at answer slots. No converted checkpoint is required.
 
 ```python
 from mlx_vlm.models.decider2 import load
 
-model = load("convaiinnovations/decider-2b")
+model = load("Mapika/decider-2b")
 result = model.predict(
     {"ticket": "Please refund my duplicate charge"},
     {
