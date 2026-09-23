@@ -71,17 +71,15 @@ class MingImageGenerationModel(ImageGenerationModel):
     @classmethod
     def from_model_id(cls, model: str, **kwargs: Any) -> "MingImageGenerationModel":
         model_path = kwargs.pop("model_path", None)
-        local = Path(model).expanduser()
-        if model_path is None and local.exists():
-            model_path = local
-        pipeline = MingImagePipeline.from_pretrained(
-            model_path=model_path,
-            repo_id=model if "/" in str(model) else None,
-            download=kwargs.pop("download", True),
-            token=kwargs.pop("token", None),
-            revision=kwargs.pop("revision", None),
-            force_download=kwargs.pop("force_download", False),
-            evict_text_encoder=kwargs.pop("evict_text_encoder", True),
+        if model_path is None:
+            path = Path(model).expanduser()
+            if not path.exists():
+                raise FileNotFoundError(
+                    f"Ming-Image requires a local model path. Got: {model}"
+                )
+            model_path = path
+        pipeline = MingImagePipeline(
+            model_path, evict_text_encoder=kwargs.pop("evict_text_encoder", True)
         )
         return cls(pipeline=pipeline, model_id=str(model))
 

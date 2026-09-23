@@ -32,36 +32,7 @@ from mlx_vlm.models.base import create_attention_mask, scaled_dot_product_attent
 from mlx_vlm.models.mlp import SwiGLUMLP
 from mlx_vlm.models.switch_layers import SwitchGLU
 
-from .config import MingImageConnectorConfig, MingImageMLLMConfig
-
-
-def _bailing_config(config: MingImageMLLMConfig) -> BailingConfig:
-    return BailingConfig(
-        model_type="bailing_moe_v2",
-        hidden_size=config.hidden_size,
-        intermediate_size=config.intermediate_size,
-        max_position_embeddings=config.max_position_embeddings,
-        moe_intermediate_size=config.moe_intermediate_size,
-        num_experts=config.num_experts,
-        num_shared_experts=config.num_shared_experts,
-        norm_topk_prob=config.norm_topk_prob,
-        num_attention_heads=config.num_attention_heads,
-        num_experts_per_tok=config.num_experts_per_tok,
-        num_hidden_layers=config.num_hidden_layers,
-        num_key_value_heads=config.num_key_value_heads,
-        rms_norm_eps=config.rms_norm_eps,
-        rope_theta=config.rope_theta,
-        vocab_size=config.vocab_size,
-        first_k_dense_replace=config.first_k_dense_replace,
-        rope_scaling=None,
-        use_qk_norm=config.use_qk_norm,
-        partial_rotary_factor=config.partial_rotary_factor,
-        moe_router_enable_expert_bias=config.use_expert_bias,
-        routed_scaling_factor=config.routed_scaling_factor,
-        score_function=config.score_function,
-        n_group=config.n_group,
-        topk_group=config.topk_group,
-    )
+from .config import MingImageConnectorConfig
 
 
 class MingMoeBlock(nn.Module):
@@ -198,17 +169,16 @@ class Qwen2Connector(nn.Module):
 
 
 class MingImageTextEncoder(nn.Module):
-    def __init__(
-        self, mllm: MingImageMLLMConfig, connector: MingImageConnectorConfig, bridge
-    ) -> None:
+    def __init__(self, config: MingImageConfig) -> None:
         super().__init__()
-        self.image_patch_token = mllm.image_patch_token
-        self.image_start_token = mllm.image_start_token
-        self.image_end_token = mllm.image_end_token
+        bridge = config.bridge
+        self.image_patch_token = config.image_patch_token
+        self.image_start_token = config.image_start_token
+        self.image_end_token = config.image_end_token
         self.query_token_count = bridge.query_token_count
         self.selected_layers = tuple(bridge.selected_hidden_states_layers)
-        self.mllm = MingMLLM(_bailing_config(mllm))
-        self.connector = Qwen2Connector(connector)
+        self.mllm = MingMLLM(config.mllm)
+        self.connector = Qwen2Connector(config.connector)
         self.query_tokens = mx.zeros((bridge.query_token_count, bridge.mllm_hidden))
         self.proj_in = nn.Linear(bridge.mllm_hidden, bridge.connector_hidden)
         self.proj_out = nn.Linear(bridge.connector_hidden, bridge.cap_feat_dim)

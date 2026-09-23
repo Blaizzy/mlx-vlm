@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import mlx.core as mx
@@ -26,34 +25,8 @@ def _load_shards(directory: Path) -> dict[str, mx.array]:
     return weights
 
 
-def _read_quant(directory: Path) -> dict | None:
-    config = directory / "config.json"
-    if config.exists():
-        quant = json.loads(config.read_text()).get("quantization")
-        if isinstance(quant, dict):
-            return quant
-    return None
-
-
-def _apply(
-    model: nn.Module,
-    weights: list[tuple[str, mx.array]],
-    quant: dict | None,
-    *,
-    strict: bool = True,
-) -> nn.Module:
-    if quant is not None:
-        quantized = {
-            key[: -len(".scales")] for key, _ in weights if key.endswith(".scales")
-        }
-        nn.quantize(
-            model,
-            group_size=quant["group_size"],
-            bits=quant["bits"],
-            mode=quant.get("mode", "affine"),
-            class_predicate=lambda path, module: path in quantized,
-        )
-    model.load_weights(weights, strict=strict)
+def _apply(model: nn.Module, weights: list[tuple[str, mx.array]]) -> nn.Module:
+    model.load_weights(weights, strict=True)
     model.eval()
     return model
 
@@ -65,7 +38,7 @@ def load_transformer(
     config = config or MingImageConfig.from_model_path(root)
     model = MingImageTransformer(config.dit)
     weights = sanitize_transformer_weights(_load_shards(root / "transformer"))
-    return _apply(model, list(weights.items()), _read_quant(root / "transformer"))
+    return _apply(model, list(weights.items()))
 
 
 def load_vae(model_path: str | Path, config: MingImageConfig | None = None):
@@ -73,7 +46,7 @@ def load_vae(model_path: str | Path, config: MingImageConfig | None = None):
     config = config or MingImageConfig.from_model_path(root)
     model = build_vae(config.vae)
     weights = sanitize_vae_weights(_load_shards(root / "vae"))
-    return _apply(model, list(weights.items()), _read_quant(root / "vae"))
+    return _apply(model, list(weights.items()))
 
 
 def _stack_experts(weights: dict[str, mx.array], prefix: str, num_experts: int) -> None:
@@ -144,7 +117,7 @@ def load_text_encoder(
 ) -> MingImageTextEncoder:
     root = Path(model_path).expanduser()
     config = config or MingImageConfig.from_model_path(root)
-    model = MingImageTextEncoder(config.mllm, config.connector, config.bridge)
+    model = MingImageTextEncoder(config)
     weights: dict[str, mx.array] = {}
     weights.update(
         _sanitize_mllm(
@@ -156,7 +129,7 @@ def load_text_encoder(
     )
     weights.update(_sanitize_connector(_load_shards(root / "connector")))
     weights.update(_sanitize_bridge(_load_shards(root / "mlp")))
-    return _apply(model, list(weights.items()), None)
+    return _apply(model, list(weights.items()))
 
 
 __all__ = ["load_text_encoder", "load_transformer", "load_vae"]

@@ -280,8 +280,6 @@ def _image_model_type_from_component_indexes(root: Path) -> str | None:
         "noise_refiner.0.adaLN_modulation.0.weight",
     }
     if z_image_markers <= keys:
-        # Ming-Image shares the NextDiT transformer layout with Z-Image; the mllm
-        # backbone directory is what distinguishes it.
         if (root / "mllm" / "config.json").exists():
             return "ming_image"
         return "z_image"

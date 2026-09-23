@@ -9,7 +9,7 @@ with native RGBA / transparent-background output.
 ```python
 from mlx_vlm.models.ming_image import MingImagePipeline
 
-pipe = MingImagePipeline.from_pretrained()  # downloads the checkpoint
+pipe = MingImagePipeline("/path/to/Ming-Image-0.1-Design")  # local checkpoint
 image = pipe.generate_array(
     "a minimalist poster, bold word HELLO, blue background",
     seed=0, steps=12, width=1024, height=1024,
@@ -17,7 +17,7 @@ image = pipe.generate_array(
 ```
 
 It is also dispatched by the shared image-generation entry point via the
-`ming_image` model type (`inclusionAI/Ming-Image-0.1-Design` or a local path).
+`ming_image` model type, given a local path to the checkpoint.
 
 ## Recommended settings
 

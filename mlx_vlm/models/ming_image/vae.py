@@ -43,8 +43,6 @@ def sanitize_vae_weights(weights: dict[str, mx.array]) -> dict[str, mx.array]:
         if key.endswith(".gamma"):
             value = value.reshape(-1)
         elif value.ndim == 5:
-            # 3D causal conv -> last temporal tap (exact for single-frame decode),
-            # then PyTorch OIHW -> MLX OHWI.
             value = value[:, :, -1].transpose(0, 2, 3, 1)
         elif value.ndim == 4:
             value = value.transpose(0, 2, 3, 1)

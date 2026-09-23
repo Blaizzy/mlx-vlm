@@ -9,7 +9,6 @@ import mlx.core as mx
 from transformers import AutoTokenizer
 
 from .config import MingImageConfig
-from .download import download_model, validate_model_layout
 from .scheduler import FlowMatchEulerDiscreteScheduler
 from .weights import load_text_encoder, load_transformer, load_vae
 
@@ -32,30 +31,6 @@ class MingImagePipeline:
         self.transformer = None
         self.vae = None
 
-    @classmethod
-    def from_pretrained(
-        cls,
-        model_path: str | Path | None = None,
-        *,
-        repo_id: str | None = None,
-        download: bool = True,
-        token: str | None = None,
-        revision: str | None = None,
-        force_download: bool = False,
-        evict_text_encoder: bool = True,
-    ) -> "MingImagePipeline":
-        if model_path is None:
-            if not download:
-                raise ValueError("model_path is required when download=False")
-            model_path = download_model(
-                repo_id or "inclusionAI/Ming-Image-0.1-Design",
-                token=token,
-                revision=revision,
-                force_download=force_download,
-            )
-        model_path = validate_model_layout(model_path)
-        return cls(model_path, evict_text_encoder=evict_text_encoder)
-
     def _tokenize(self, prompt: str) -> mx.array:
         text = self.tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],
@@ -63,11 +38,11 @@ class MingImagePipeline:
             add_generation_prompt=True,
         )
         ids = self.tokenizer(text, add_special_tokens=False)["input_ids"]
-        mllm = self.config.mllm
+        cfg = self.config
         block = (
-            [mllm.image_start_token]
-            + [mllm.image_patch_token] * self.config.bridge.query_token_count
-            + [mllm.image_end_token]
+            [cfg.image_start_token]
+            + [cfg.image_patch_token] * cfg.bridge.query_token_count
+            + [cfg.image_end_token]
         )
         return mx.array([ids + block], dtype=mx.int32)
 

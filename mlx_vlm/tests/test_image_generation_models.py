@@ -2142,7 +2142,8 @@ def test_ming_image_config_parses_official_fields(tmp_path):
     assert cfg.dit.dim == 3840 and cfg.dit.cap_feat_dim == 2560
     assert cfg.dit.axes_dims == (32, 48, 48) and cfg.dit.intermediate_size == 10240
     assert cfg.mllm.num_experts == 256 and cfg.mllm.score_function == "sigmoid"
-    assert cfg.mllm.use_expert_bias and cfg.mllm.routed_scaling_factor == 2.5
+    assert cfg.mllm.moe_router_enable_expert_bias
+    assert cfg.mllm.routed_scaling_factor == 2.5
     assert cfg.mllm.partial_rotary_factor == 0.5 and cfg.mllm.n_group == 8
     assert cfg.bridge.query_token_count == 256 and cfg.bridge.directvlm_in == 6144
     assert cfg.bridge.selected_hidden_states_layers == (5, 12, 20)
@@ -2205,7 +2206,6 @@ def test_ming_image_conditioning_cache_is_exact():
         n_refiner_layers=1,
         intermediate_size=64,
         cap_feat_dim=16,
-        directvlm_dim=128,
         adaln_embed_dim=32,
     )
     model = MingImageTransformer(cfg)
