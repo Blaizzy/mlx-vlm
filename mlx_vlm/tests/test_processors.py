@@ -2270,6 +2270,15 @@ class TestEstimateNumImageTokens:
 
 
 class TestMiMoV2Processor:
+    def test_processor_attributes(self):
+        from mlx_vlm.models.mimo_v2.processing import MiMoV2Processor
+
+        assert MiMoV2Processor.get_attributes() == [
+            "image_processor",
+            "tokenizer",
+            "video_processor",
+        ]
+
     def test_audio_codes_expand_placeholders_by_grouped_length(self):
         from mlx_vlm.models.mimo_v2.processing import MiMoV2Processor
         from mlx_vlm.models.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor

@@ -7,9 +7,22 @@ from ..qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor
 
 
 class MiMoV2Processor(Qwen2_5_VLProcessor):
-    def __init__(self, *args, **kwargs):
+    def __init__(
+        self,
+        image_processor=None,
+        tokenizer=None,
+        video_processor=None,
+        chat_template=None,
+        **kwargs,
+    ):
         audio_tokenizer_path = kwargs.pop("audio_tokenizer_path", None)
-        super().__init__(*args, **kwargs)
+        super().__init__(
+            image_processor=image_processor,
+            tokenizer=tokenizer,
+            video_processor=video_processor,
+            chat_template=chat_template,
+            **kwargs,
+        )
         self.audio_token = "<|audio_pad|>"
         self.audio_tokenizer_path = audio_tokenizer_path
         self._audio_tokenizer = None
