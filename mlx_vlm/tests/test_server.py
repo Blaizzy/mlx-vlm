@@ -2355,6 +2355,41 @@ class TestResponseGenerator:
         assert [b.kwargs["sampler"] for b in batches] == ["sampler-0.0", "sampler-0.6"]
         assert batches[0].closed
 
+    @pytest.mark.parametrize("temperature", [0.0, 1e-300, 1e-5, 0.009, 0.01, 0.1])
+    @pytest.mark.parametrize(
+        "options", [{}, {"top_n_sigma": 1.0}, {"p_less": True}, {"typical_p": 0.9}]
+    )
+    def test_temperature_clamp_reaches_batch_sampler(
+        self, monkeypatch, temperature, options
+    ):
+        args = Args(temperature=temperature, **options)
+        effective = 0.01 if 0 < temperature < 0.01 else temperature
+        assert args.temperature == args.to_generate_kwargs()["temperature"] == effective
+        gen, batches = _worker_setup(monkeypatch)
+        with _running(gen):
+            _, tokens = _drain(
+                _enqueue(gen, max_tokens=1, temperature=temperature, **options)
+            )
+            assert len(tokens) == 1
+        sampler = batches[0].kwargs["sampler"]
+        assert batches[0].kwargs["greedy_sampling"] == (temperature == 0)
+        if temperature == 0:
+            assert sampler is None
+        else:
+            assert sampler is not None
+            logprobs = mx.log(mx.array([[0.1, 0.449, 0.451]] * 128))
+            mx.random.seed(42)
+            actual = sampler(logprobs)
+            mx.eval(actual)
+            mx.random.seed(42)
+            expected = gen._make_sampler(Args(temperature=effective, **options))(
+                logprobs
+            )
+            assert actual.tolist() == expected.tolist()
+            if not options:
+                assert sampler.temperature == effective
+                assert set(actual.tolist()) == {1, 2}
+
     def test_generate_arguments_to_generate_kwargs(self):
         args = Args()
         _assert_fields(
