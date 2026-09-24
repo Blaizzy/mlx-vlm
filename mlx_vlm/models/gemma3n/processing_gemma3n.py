@@ -17,6 +17,7 @@ from ..base import load_chat_template, to_mlx
 
 
 class Gemma3nProcessor(ProcessorMixin):
+    supports_multiple_audio = True
     attributes = ["feature_extractor", "image_processor", "tokenizer"]
     valid_kwargs = ["chat_template", "audio_seq_length", "image_seq_length"]
     feature_extractor_class = "AutoFeatureExtractor"
@@ -99,7 +100,8 @@ class Gemma3nProcessor(ProcessorMixin):
                     "truncation",
                     "return_attention_mask",
                 ):
-                    audio_kwargs[k] = kwargs.pop(k)
+                    audio_kwargs[k] = kwargs[k]
+            kwargs.pop("sampling_rate", None)
             audio_inputs = self.feature_extractor(audio, **audio_kwargs)
 
             if not text:
@@ -116,7 +118,11 @@ class Gemma3nProcessor(ProcessorMixin):
         image_inputs = {}
         if images is not None:
             images = self.image_processor.fetch_images(images)
-            batched_images = make_nested_list_of_images(images)
+            batched_images = (
+                [[image] for image in images]
+                if len(text) > 1 and len(images) == len(text)
+                else make_nested_list_of_images(images)
+            )
 
             images_kwargs = {}
             for k in list(kwargs.keys()):

@@ -117,6 +117,7 @@
     ["hunyuan_vl", "hunyuan_vl.processing_hunyuan_vl", "HunYuanVLProcessor"],
     ["ernie4_5_moe_vl", "ernie4_5_moe_vl", "Ernie4_5_VLProcessor"],
     ["qwen4_exp", "qwen4_exp", "Qwen3VLProcessor"],
+    ["mimo_v2", "mimo_v2.processing", "MiMoV2Processor"],
     ["prism_hadamard_qwen35", "prism_hadamard_qwen35", "Qwen3VLProcessor"],
     ["deepseek_v41", "deepseek_v41.processing_deepseek_v41", "DeepseekV41Processor"]
   ],

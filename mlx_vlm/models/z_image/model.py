@@ -56,6 +56,7 @@ class ZImageGenerationModel(ImageGenerationModel):
             guidance=guidance,
             negative_prompt=request.extra.get("negative_prompt"),
             cfg_truncation=float(request.extra.get("cfg_truncation", 1.0)),
+            num_images=int(request.extra.get("num_images", 1)),
         )
         return ImageGenerationResult(
             array=array,

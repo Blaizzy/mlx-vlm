@@ -394,7 +394,7 @@ def parse_arguments():
         "--temperature",
         type=float,
         default=DEFAULT_TEMPERATURE,
-        help="Temperature for sampling.",
+        help="Temperature for sampling. Zero is greedy; positive values below 0.01 are clamped to 0.01.",
     )
     parser.add_argument(
         "--top-p",

@@ -2447,7 +2447,14 @@ def prepare_inputs(
     if has_videos:
         if not isinstance(videos, list):
             videos = [videos]
-        sampling = resolve_video_sampling(processor, kwargs)
+        sampling_overrides = {
+            name: kwargs.pop(name) for name in _VIDEO_SAMPLING_FIELDS if name in kwargs
+        }
+        fps_values = sampling_overrides.get("fps")
+        if isinstance(fps_values, (list, tuple)) and len(fps_values) != len(videos):
+            raise ValueError(
+                f"Received {len(fps_values)} fps values for {len(videos)} videos"
+            )
         if supplied_video_metadata is not None and len(supplied_video_metadata) != len(
             videos
         ):
@@ -2460,6 +2467,10 @@ def prepare_inputs(
         )
         loaded, video_fps, video_metadata = [], [], []
         for video_index, v in enumerate(videos):
+            video_sampling_overrides = dict(sampling_overrides)
+            if isinstance(fps_values, (list, tuple)):
+                video_sampling_overrides["fps"] = fps_values[video_index]
+            sampling = resolve_video_sampling(processor, video_sampling_overrides)
             if isinstance(v, (str, bytes, Path)):
                 arr, metadata = load_video(
                     str(v), sampling, frame_sampler=frame_sampler

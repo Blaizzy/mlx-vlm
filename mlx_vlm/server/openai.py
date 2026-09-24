@@ -23,7 +23,11 @@ from ..generate.edit_image import edit_image
 from ..generate.image import ImageGenerationRequest as CoreImageGenerationRequest
 from ..generate.image import generate_image, parse_size
 from ..generate.video import resolve_video_inputs
-from ..prompt_utils import apply_chat_template, extract_text_from_content
+from ..prompt_utils import (
+    apply_chat_template,
+    extract_text_from_content,
+    normalize_image_content,
+)
 from ..tools import (
     _infer_tool_parser_from_processor,
     _prepare_chat_tool_choice,
@@ -631,6 +635,15 @@ async def images_edits_endpoint(request: Request):
                         height=height,
                         guidance=image_request.guidance,
                         output_format=image_request.output_format,
+                        extra={
+                            key: value
+                            for key in (
+                                "negative_prompt",
+                                "output_resolution",
+                                "use_kv_cache",
+                            )
+                            if (value := getattr(image_request, key)) is not None
+                        },
                     )
                     result = edit_image(
                         model,
@@ -1560,7 +1573,11 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             video = _extract_video_reference(item)
                             if video:
                                 videos.append(video)
-                msg["content"] = extract_text_from_content(message.content)
+                msg["content"] = (
+                    normalize_image_content(message.content)
+                    if message.role == "user"
+                    else extract_text_from_content(message.content)
+                )
             else:
                 msg["content"] = message.content
 

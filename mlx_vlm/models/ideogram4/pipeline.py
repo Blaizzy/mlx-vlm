@@ -183,7 +183,9 @@ class Ideogram4ImagePipeline:
             mx.clear_cache()
 
         self._ensure_transformers_and_vae()
-        batch_size = 1
+        batch_size = int(kwargs.get("num_images", 1))
+        if batch_size < 1:
+            raise ValueError(f"num_images must be at least 1, got {batch_size}")
         num_image_tokens = inputs["num_image_tokens"]
         grid_h = inputs["grid_h"]
         grid_w = inputs["grid_w"]
@@ -389,4 +391,4 @@ class Ideogram4ImagePipeline:
         decoded = mx.round((decoded + 1.0) * 127.5).astype(mx.uint8)
         decoded = mx.transpose(decoded, (0, 2, 3, 1))
         mx.eval(decoded)
-        return decoded[0]
+        return decoded[0] if decoded.shape[0] == 1 else decoded
