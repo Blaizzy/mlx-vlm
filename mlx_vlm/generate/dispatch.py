@@ -901,9 +901,13 @@ def stream_generate(
     apc_coordinator: Optional[_apc.APCCoordinator] = None
 
     multimodal_token_ids = _apc.multimodal_token_ids_from_config(model.config)
+    # CLI/dispatch restore paths re-embed a reused suffix as text-only
+    # (pixel_values is dropped on a hit), so the media gate stays strict here
+    # regardless of MLX_VLM_APC_MEDIA_GATE.
     apc_safe_prefix_min = _apc.media_safe_prefix_min(
         full_input_ids_list,
         multimodal_token_ids,
+        relaxed=False,
     )
     apc_safe_prefix_lookup_min = max(0, apc_safe_prefix_min - 1)
 
@@ -912,6 +916,7 @@ def stream_generate(
             full_input_ids_list,
             prefix_len,
             multimodal_token_ids,
+            relaxed=False,
         )
 
     def _apc_prefix_has_media_tokens(prefix_len: int) -> bool:
@@ -979,6 +984,7 @@ def stream_generate(
             safe_lookup_min=apc_safe_prefix_lookup_min,
             suffix_is_text_only=_apc_suffix_is_text_only,
             prefix_has_media=_apc_prefix_has_media_tokens,
+            media_gate_relaxed=False,
         )
         if plan is not None:
             plen = plan["prefix_len"]
@@ -1051,7 +1057,7 @@ def stream_generate(
             exact_checkpoint_lengths = [
                 n - reused_prefix_len
                 for n in apc_coordinator.checkpoint_lengths(
-                    full_input_ids_list, multimodal_token_ids
+                    full_input_ids_list, multimodal_token_ids, relaxed=False
                 )
                 if n > reused_prefix_len
             ]

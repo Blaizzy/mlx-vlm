@@ -685,9 +685,12 @@ def stream_diffusion_generate(
             apc = candidate
             apc.prepare_prefill(len(full_token_ids))
             media_token_ids = multimodal_token_ids_from_config(model.config)
+            # The diffusion restore path predates full-prompt embedding reuse;
+            # keep the media gate strict here regardless of the environment.
             safe_lookup_min = max(
                 0,
-                media_safe_prefix_min(full_token_ids, media_token_ids) - 1,
+                media_safe_prefix_min(full_token_ids, media_token_ids, relaxed=False)
+                - 1,
             )
             apc_hit = apc.lookup(
                 full_token_ids,
@@ -698,6 +701,7 @@ def stream_diffusion_generate(
                         full_token_ids,
                         prefix_len,
                         media_token_ids,
+                        relaxed=False,
                     )
                 ),
                 prefix_has_media=lambda prefix_len: prefix_contains_media_tokens(
@@ -705,8 +709,11 @@ def stream_diffusion_generate(
                     prefix_len,
                     media_token_ids,
                 ),
+                media_gate_relaxed=False,
             )
-            checkpoint_lengths = apc.checkpoint_lengths(full_token_ids, media_token_ids)
+            checkpoint_lengths = apc.checkpoint_lengths(
+                full_token_ids, media_token_ids, relaxed=False
+            )
             if apc_hit is not None:
                 cached_tokens = int(apc_hit.get("prefix_len", 0) or 0)
 

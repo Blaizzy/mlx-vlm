@@ -81,6 +81,26 @@ def _env_truthy(name: str, default: str = "") -> bool:
     return os.environ.get(name, default).lower() in ("1", "true", "yes")
 
 
+def apc_media_gate_relaxed(override: Optional[bool] = None) -> bool:
+    """Media-gate mode for APC prefix reuse (``MLX_VLM_APC_MEDIA_GATE``).
+
+    ``strict`` (default) requires a reused prefix to leave a text-only
+    suffix, because most restore paths re-embed the suffix without media
+    features. ``relaxed`` lifts that requirement for callers that precompute
+    full-prompt ``inputs_embeds`` (the server continuous-batching path), where
+    a suffix containing media placeholders stays correct. Under ``relaxed``,
+    checkpoint boundaries are media-aligned — never inside a media span — so
+    prefix-scoped media hashes still cover every image a prefix contains.
+    CLI/dispatch paths pin ``relaxed=False`` explicitly regardless of the
+    environment.
+    """
+    if override is not None:
+        return bool(override)
+    return (
+        os.environ.get("MLX_VLM_APC_MEDIA_GATE", "strict").strip().lower() == "relaxed"
+    )
+
+
 def default_disk_path() -> Path:
     root = Path(
         os.environ.get("MLX_VLM_CACHE_HOME") or Path.home() / ".cache" / "mlx-vlm"
@@ -522,13 +542,19 @@ def media_token_spans(
 def media_safe_prefix_min(
     token_ids: Sequence[int],
     media_token_ids: Iterable[int],
+    relaxed: Optional[bool] = None,
 ) -> int:
     """Minimum prefix length that leaves a text-only suffix.
 
     APC restore paths consume full prompt-level image/video feature tensors. Until
     media-feature slicing is model-aware, restored prefixes must include every
-    media placeholder token so the suffix can be embedded as text-only.
+    media placeholder token so the suffix can be embedded as text-only. With
+    ``relaxed`` (see :func:`apc_media_gate_relaxed`) the minimum is 0: callers
+    that precompute full-prompt embeddings may reuse prefixes ending inside the
+    media region.
     """
+    if apc_media_gate_relaxed(relaxed):
+        return 0
     spans = media_token_spans(token_ids, media_token_ids)
     if not spans:
         return 0
@@ -539,8 +565,11 @@ def prefix_leaves_text_only_suffix(
     token_ids: Sequence[int],
     prefix_len: int,
     media_token_ids: Iterable[int],
+    relaxed: Optional[bool] = None,
 ) -> bool:
-    return int(prefix_len) >= media_safe_prefix_min(token_ids, media_token_ids)
+    return int(prefix_len) >= media_safe_prefix_min(
+        token_ids, media_token_ids, relaxed=relaxed
+    )
 
 
 def prefix_contains_media_tokens(
@@ -562,10 +591,17 @@ def adjust_prefix_to_text_suffix_boundary(
     media_token_ids: Iterable[int],
     *,
     max_prefix_tokens: Optional[int] = None,
+    relaxed: Optional[bool] = None,
 ) -> int:
     """Move an APC prefix forward until its suffix contains no media tokens.
 
     Returns ``0`` when no useful safe prefix exists within ``max_prefix_tokens``.
+    With ``relaxed`` the clamp to the last media placeholder is lifted, but the
+    boundary stays media-aligned: a desired length strictly inside a media
+    span moves forward to the span end (the prefix then fully contains that
+    image, so prefix-scoped media hashes cover it), or backward to the span
+    start when the end overshoots ``max_prefix_tokens`` (the prefix then
+    excludes the image entirely). Stored checkpoints never split a media span.
     """
     max_len = (
         len(token_ids) - 1 if max_prefix_tokens is None else int(max_prefix_tokens)
@@ -575,8 +611,18 @@ def adjust_prefix_to_text_suffix_boundary(
     if int(desired_prefix_len) <= 0:
         return 0
     desired = int(desired_prefix_len)
-    prefix_len = max(desired, media_safe_prefix_min(token_ids, media_token_ids))
-    if prefix_len > max_len:
+    if apc_media_gate_relaxed(relaxed):
+        for start, end in media_token_spans(token_ids, media_token_ids):
+            if start < desired < end:
+                prefix_len = end if end <= max_len else start
+                break
+        else:
+            prefix_len = desired
+    else:
+        prefix_len = max(
+            desired, media_safe_prefix_min(token_ids, media_token_ids, relaxed=False)
+        )
+    if prefix_len <= 0 or prefix_len > max_len:
         return 0
     return prefix_len
 
@@ -4634,6 +4680,7 @@ def apc_lookup_plan(
     safe_lookup_min: int,
     suffix_is_text_only,
     prefix_has_media,
+    media_gate_relaxed: Optional[bool] = None,
 ) -> Optional[dict]:
     """Pick the best APC prefix (disk > exact > block); shared by both generate paths, releases losers, callers apply."""
     n = len(ids_list)
@@ -4656,11 +4703,13 @@ def apc_lookup_plan(
             }
         return None
 
+    relaxed = apc_media_gate_relaxed(media_gate_relaxed)
     matched, prefix_len = manager.lookup_prefix(ids_list, extra_hash=extra_hash)
     if prefix_len > 0 and prefix_has_media(prefix_len):
-        manager.release(matched)
-        matched = []
-        prefix_len = 0
+        if not relaxed:
+            manager.release(matched)
+            matched = []
+            prefix_len = 0
     exact_cache = None
     exact_prefix_len = 0
     if prefix_len < n:

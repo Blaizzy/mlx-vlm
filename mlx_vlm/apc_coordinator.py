@@ -167,6 +167,7 @@ class APCCoordinator:
         safe_lookup_min: int,
         suffix_is_text_only: Callable[[int], bool],
         prefix_has_media: Callable[[int], bool],
+        media_gate_relaxed: Optional[bool] = None,
     ) -> Optional[dict]:
         if not self.enabled:
             return None
@@ -180,13 +181,17 @@ class APCCoordinator:
             safe_lookup_min=safe_lookup_min,
             suffix_is_text_only=suffix_is_text_only,
             prefix_has_media=prefix_has_media,
+            media_gate_relaxed=media_gate_relaxed,
         )
         if hit is not None:
             hit["cache_plan"] = self.plan
         return hit
 
     def checkpoint_len(
-        self, token_ids: Sequence[int], media_token_ids: set[int]
+        self,
+        token_ids: Sequence[int],
+        media_token_ids: set[int],
+        relaxed: Optional[bool] = None,
     ) -> int:
         """Reusable checkpoint before the final guard token(s)."""
         if not self.enabled or not self.is_checkpoint:
@@ -198,10 +203,14 @@ class APCCoordinator:
             len(token_ids) - self.manager.exact_cache_guard_tokens,
             media_token_ids,
             max_prefix_tokens=len(token_ids) - 1,
+            relaxed=relaxed,
         )
 
     def checkpoint_lengths(
-        self, token_ids: Sequence[int], media_token_ids: set[int]
+        self,
+        token_ids: Sequence[int],
+        media_token_ids: set[int],
+        relaxed: Optional[bool] = None,
     ) -> List[int]:
         """Bounded intermediate states plus the final conversation checkpoint.
 
@@ -210,7 +219,7 @@ class APCCoordinator:
         captures to the resident entry budget (two for a disk-only manager),
         rather than copying an ever-growing cache at every prefill chunk.
         """
-        final = self.checkpoint_len(token_ids, media_token_ids)
+        final = self.checkpoint_len(token_ids, media_token_ids, relaxed=relaxed)
         if final <= 0:
             return []
         interval = self.manager.checkpoint_interval_tokens
@@ -226,7 +235,11 @@ class APCCoordinator:
         lengths = {final}
         for boundary in range(first, last + 1, interval):
             boundary = adjust_prefix_to_text_suffix_boundary(
-                token_ids, boundary, media_token_ids, max_prefix_tokens=final
+                token_ids,
+                boundary,
+                media_token_ids,
+                max_prefix_tokens=final,
+                relaxed=relaxed,
             )
             if self.manager.exact_cache_min_tokens <= boundary < final:
                 lengths.add(boundary)
