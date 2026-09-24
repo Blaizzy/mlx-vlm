@@ -2226,3 +2226,42 @@ def test_ming_image_transformer_supports_batching():
     assert batched.shape == (2, 16, 1, 8, 8)
     assert_allclose(np.array(batched[0]), np.array(single[0]), rtol=1e-4, atol=1e-4)
     assert_allclose(np.array(batched[1]), np.array(single[0]), rtol=1e-4, atol=1e-4)
+
+
+def test_image_result_saves_one_file_per_batched_image(tmp_path):
+    result = image_module.ImageGenerationResult(
+        array=mx.zeros((3, 8, 8, 3), dtype=mx.uint8),
+        seed=0,
+        width=8,
+        height=8,
+        steps=1,
+        model="m",
+        family="f",
+        guidance=1.0,
+    )
+    assert len(result.images) == 3
+    saved = result.save(tmp_path / "img.png")
+    assert saved == tmp_path / "img_0.png"
+    assert sorted(p.name for p in tmp_path.glob("img_*.png")) == [
+        "img_0.png",
+        "img_1.png",
+        "img_2.png",
+    ]
+
+
+def test_ming_image_generate_forwards_num_images():
+    from mlx_vlm.models.ming_image.model import MingImageGenerationModel
+
+    pipeline = MagicMock()
+    pipeline.config.default_steps = 12
+    pipeline.config.default_guidance = 1.0
+    pipeline.count_prompt_tokens.return_value = 5
+    pipeline.model_path = "/tmp/ming"
+    pipeline.generate_array.return_value = mx.zeros((2, 8, 8, 4), dtype=mx.uint8)
+
+    model = MingImageGenerationModel(pipeline=pipeline, model_id="ming")
+    result = model.generate(
+        ImageGenerationRequest(prompt="p", width=8, height=8, extra={"num_images": 2})
+    )
+    assert pipeline.generate_array.call_args.kwargs["num_images"] == 2
+    assert result.array.shape == (2, 8, 8, 4)
