@@ -8,12 +8,13 @@ from mlx_vlm.apc import APCManager, DiskBlockStore
 from mlx_vlm.apc_images import ImagePrefixContext
 from mlx_vlm.models.cache import KVCache
 from mlx_vlm.models.qwen3_5.qwen3_5 import Model
+from mlx_vlm.models.qwen4_exp.qwen4_exp import Model as Qwen4ExpModel
 
 
-def context(tokens, values=None, grids=None, tenant="test"):
+def context(tokens, values=None, grids=None, tenant="test", model_type="qwen3_5"):
     model = SimpleNamespace(
         config=SimpleNamespace(
-            model_type="qwen3_5",
+            model_type=model_type,
             image_token_index=99,
             video_token_index=98,
             vision_config=SimpleNamespace(spatial_merge_size=2),
@@ -154,6 +155,32 @@ def test_prefix_identity_survives_disk_reopen(tmp_path):
         assert new.lookup(second)["prefix_len"] == 23
     finally:
         second.close()
+
+
+def test_qwen4_exp_uses_the_same_identity_in_its_own_namespace():
+    tokens = [1] * 8 + [99] * 4 + [2] * 8
+    pixels = mx.zeros((16, 6))
+    grid = mx.array([[1, 4, 4]])
+    flash = context(tokens, pixels, grid, model_type="qwen4_exp")
+    appended = context(
+        tokens + [3] * 4 + [99] * 4 + [4] * 8,
+        mx.concatenate([pixels, pixels + 1]),
+        mx.concatenate([grid, grid]),
+        model_type="qwen4_exp",
+    )
+    store = manager()
+    save(store, flash, 19)
+    assert appended.lookup(store)["prefix_len"] == 19
+    assert flash.prefix_hash(19) != context(tokens, pixels, grid).prefix_hash(19)
+    assert context(tokens, pixels, grid).lookup(store) is None
+
+
+def test_other_model_types_are_not_supported():
+    assert context([1, 99, 99, 99, 99, 2], model_type="qwen3_vl") is None
+
+
+def test_qwen4_exp_inherits_the_position_preserving_embedding():
+    assert Qwen4ExpModel.get_input_embeddings is Model.get_input_embeddings
 
 
 def test_qwen_image_embedding_preserves_full_prompt_positions():

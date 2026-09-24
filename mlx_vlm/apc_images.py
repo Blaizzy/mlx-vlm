@@ -1,4 +1,8 @@
-"""Prefix-local image identity and suffix slicing for single-request Qwen3.5 APC."""
+"""Prefix-local image identity and suffix slicing for single-request Qwen3.5 APC.
+
+Qwen4-Exp (Qwen3.8-Flash-Next) inherits the Qwen3.5 vision tower, image merge
+and RoPE indexing, so the same identity applies to both model types.
+"""
 
 from dataclasses import dataclass
 from typing import Any
@@ -7,6 +11,8 @@ import mlx.core as mx
 
 from .apc import media_token_spans, semantic_extra_hash
 from .apc_prefix import PrefixContext
+
+SUPPORTED_MODEL_TYPES = frozenset({"qwen3_5", "qwen4_exp"})
 
 
 @dataclass
@@ -18,7 +24,7 @@ class ImagePrefixContext(PrefixContext):
     @classmethod
     def prepare(cls, model, processor, token_ids, pixel_values, kwargs, tenant):
         config = model.config
-        if config.model_type != "qwen3_5":
+        if config.model_type not in SUPPORTED_MODEL_TYPES:
             return None
         image_id = config.image_token_index
         if config.video_token_index in token_ids:
@@ -46,7 +52,7 @@ class ImagePrefixContext(PrefixContext):
                 tenant=tenant,
                 model=model,
                 processor=processor,
-                media={"image_prefix_schema": "qwen3_5-v1"},
+                media={"image_prefix_schema": f"{config.model_type}-v1"},
             )
         ]
         for i, ((start, end), row) in enumerate(zip(spans, rows)):

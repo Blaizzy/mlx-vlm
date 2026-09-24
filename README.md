@@ -600,11 +600,14 @@ APC has two tiers:
 - **Warm memory**: keeps reusable `APCBlock` tensors in process memory. This is the fastest path, but it keeps both the reusable block pool and the runtime `KVCache`.
 - **Warm disk**: persists cached prefixes as safetensors shards so they survive process restarts. Warm-disk reads build the layer-major prompt cache directly without promoting restored blocks into the `APCBlock` pool; writes can still populate both memory and disk tiers.
 
-#### Appending images to a cached Qwen3.5 conversation
+#### Appending images to a cached Qwen3.5 or Qwen4-Exp conversation
 
-For single-request Qwen3.5-family text/image generation, opt into prefix-local
-image identity with `stream_generate(..., apc_manager=apc, apc_image_prefix=True)`.
-This includes Qwen3.8 models that use the `qwen3_5` architecture. Use the same
+For single-request Qwen3.5-family and Qwen4-Exp text/image generation, opt into
+prefix-local image identity with
+`stream_generate(..., apc_manager=apc, apc_image_prefix=True)`. This covers
+Qwen3.8 models that use the `qwen3_5` architecture and Qwen3.8-Flash-Next
+(`qwen4_exp`), which inherits the Qwen3.5 vision tower, image merge and RoPE
+indexing. Each model type uses its own checkpoint namespace. Use the same
 model-scoped `APCManager` and tenant across requests. Other generation paths
 retain their existing behavior.
 
@@ -626,11 +629,16 @@ Run the real-model regression and timing example on an otherwise idle GPU:
 
 ```sh
 python examples/verify_image_prefix_apc.py --model mlx-community/Qwen3.8-27B-4bit
+python examples/verify_image_prefix_apc.py --model mlx-community/Qwen3.8-Flash-Next-4bit
 ```
 
 It compares appended-image outputs and first-token distributions with cold
 inference, checks which images were encoded, and verifies changed/reordered
-history. Quantized cold and cached execution need not be bit-identical.
+history. Quantized cold and cached execution need not be bit-identical. On
+Qwen3.8-Flash-Next the first-token distribution already moves with the prefill
+step size alone (KL up to ~0.1 between cold runs), so the cached result is
+compared with cold runs at step sizes 2048, 512 and 256 and must match one of
+them within KL 0.05.
 
 
 #### Appending media to a cached Qwen3-Omni conversation

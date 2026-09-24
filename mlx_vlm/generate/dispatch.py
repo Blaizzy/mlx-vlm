@@ -820,8 +820,8 @@ def stream_generate(
         prompt (str): The input prompt text.
         image (Union[str, List[str]], optional): Image path(s) or URL(s).
         audio (Union[str, List[str]], optional): Audio file path(s).
-        apc_image_prefix (bool, optional): Reuse Qwen3.5 checkpoints before
-          newly appended images. Single-request text/image inputs only.
+        apc_image_prefix (bool, optional): Reuse Qwen3.5 / Qwen4-Exp checkpoints
+          before newly appended images. Single-request text/image inputs only.
         apc_media_prefix (bool, optional): Reuse Qwen3-Omni checkpoints before
           appended images, independent audio clips, or non-interleaved videos.
         prefill_step_size (int, optional): Number of tokens to process per prefill
