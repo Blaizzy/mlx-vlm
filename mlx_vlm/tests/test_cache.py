@@ -362,6 +362,43 @@ def test_empty_batch_kv_cache_ignores_unapplied_right_padding():
     assert cache._right_padding is None
 
 
+@pytest.mark.parametrize(
+    "factory", [BatchKVCache, BatchQuantizedKVCache, BatchQSAKVCache]
+)
+@pytest.mark.parametrize("trigger", ["prepare", "prefill", "ragged_commit"])
+def test_qwen3_5_padding_mask_follows_in_place_updates(factory, trigger):
+    from mlx_vlm.models.qwen3_5 import language as qwen3_5
+    from mlx_vlm.speculative.cache_state import start_speculative_cache
+
+    def kv(steps):
+        return mx.ones((2, 1, steps, 64))
+
+    cache = factory([0, 0])
+    decode = mx.zeros((2, 1, 16))
+    if trigger == "prefill":
+        cache.prepare(right_padding=[0, 3], lengths=[5, 2])
+        cache.update_and_fetch(kv(4), kv(4))
+    elif trigger == "ragged_commit":
+        cache.update_and_fetch(kv(6), kv(6))
+
+    assert qwen3_5._create_qwen3_5_attention_mask(decode, cache) is None
+    if trigger == "prepare":
+        cache.prepare(left_padding=[0, 3])
+    elif trigger == "prefill":
+        cache.update_and_fetch(kv(1), kv(1))
+        cache.finalize()
+    else:
+        # QSA exposes the padding of its inner KV cache.
+        transaction = start_speculative_cache([getattr(cache, "kv_cache", cache)], 4)
+        cache.update_and_fetch(kv(4), kv(4))
+        transaction.commit([4, 1])
+
+    assert cache.left_padding.tolist() == [0, 3]
+    assert qwen3_5._create_qwen3_5_attention_mask(decode, cache) == "left_padded_decode"
+    assert cache._qwen3_5_decode_left_padding == [0, 3]
+    assert qwen3_5._qwen3_5_left_padding_info(cache) == ((0, 3), 3)
+
+
 @pytest.mark.parametrize("window", [4, 8, 16])
 @pytest.mark.parametrize("prefix_length", [0, 3, 8, 20])
 @pytest.mark.parametrize("parts", [(3, 1), (1, 1, 1, 1)])
