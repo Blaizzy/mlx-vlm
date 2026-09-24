@@ -100,13 +100,21 @@ class ImageGenerationResult:
     def image(self) -> Image.Image:
         return self.to_pil()
 
-    def to_pil(self) -> Image.Image:
+    @property
+    def images(self) -> list[Image.Image]:
+        """Every image in the result: one for `[H, W, C]`, N for `[N, H, W, C]`."""
         if self.layout != "HWC" or self.color_space not in ("RGB", "RGBA"):
             raise ValueError(
                 f"Cannot convert image layout={self.layout!r} "
                 f"color_space={self.color_space!r} to PIL"
             )
-        return Image.fromarray(np.array(self.array))
+        array = np.array(self.array)
+        if array.ndim == 3:
+            array = array[None]
+        return [Image.fromarray(sub) for sub in array]
+
+    def to_pil(self) -> Image.Image:
+        return self.images[0]
 
     def to_png_bytes(self) -> bytes:
         buffer = BytesIO()
@@ -119,9 +127,17 @@ class ImageGenerationResult:
     def save(self, path: str | Path) -> Path:
         output_path = Path(path).expanduser()
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        self.to_pil().save(output_path)
-        self.path = output_path
-        return output_path
+        images = self.images
+        multi = len(images) > 1
+        paths = []
+        for index, image in enumerate(images):
+            target = output_path
+            if multi:
+                target = output_path.with_stem(f"{output_path.stem}_{index}")
+            image.save(target)
+            paths.append(target)
+        self.path = paths[0]
+        return paths[0]
 
 
 class ImageGenerationModel(Protocol):
