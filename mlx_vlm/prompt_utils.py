@@ -411,7 +411,8 @@ class MessageFormatter:
             content = image_tokens + content if image_first else content + image_tokens
 
         if role == "user" and not skip_audio_token and num_audios > 0:
-            content = content + [MessageBuilder.audio_message()] * num_audios
+            audio_tokens = [MessageBuilder.audio_message()] * num_audios
+            content = audio_tokens + content if image_first else content + audio_tokens
 
         return {"role": role, "content": content}
 

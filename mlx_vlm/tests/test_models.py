@@ -1090,6 +1090,47 @@ def test_missing_model_file_raises_clearly(tmp_path):
         load_model(tmp_path)
 
 
+def test_qwen3_omni_audio_batch_matches_repeated_input():
+    from mlx_vlm.models.qwen3_omni_moe.audio import AudioModel
+    from mlx_vlm.models.qwen3_omni_moe.config import AudioConfig
+
+    config = AudioConfig(
+        d_model=8,
+        encoder_layers=1,
+        encoder_attention_heads=2,
+        encoder_ffn_dim=16,
+        num_mel_bins=8,
+        output_dim=8,
+        downsample_hidden_size=4,
+        conv_chunksize=4,
+        max_source_positions=64,
+    )
+    model = AudioModel(config)
+    sample = mx.random.normal((8, 170))
+    output = model(mx.concatenate([sample, sample], axis=1), mx.array([170, 170]))
+
+    assert output.shape == (44, 8)
+    assert mx.allclose(output[:22], output[22:])
+
+
+def test_qwen3_omni_rope_delta_ignores_batch_padding():
+    from mlx_vlm.models.qwen3_omni_moe.language import LanguageModel
+
+    model = LanguageModel.__new__(LanguageModel)
+    model.config = SimpleNamespace(
+        vision_config=SimpleNamespace(spatial_merge_size=2),
+        image_token_id=10,
+        video_token_id=11,
+        vision_start_token_id=12,
+    )
+    input_ids = mx.array([[0, 0, 1, 2], [1, 2, 3, 4]])
+    attention_mask = mx.array([[0, 0, 1, 1], [1, 1, 1, 1]])
+
+    _, rope_deltas = model.get_rope_index(input_ids, attention_mask=attention_mask)
+
+    assert rope_deltas.tolist() == [[0], [0]]
+
+
 # Patch embedding layouts
 
 QWEN_PATCH_EMBED_KEY = "model.visual.patch_embed.proj.weight"
