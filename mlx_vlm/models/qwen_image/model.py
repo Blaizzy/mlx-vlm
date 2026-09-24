@@ -70,6 +70,7 @@ class QwenImageGenerationModel(ImageGenerationModel):
             height=request.height,
             guidance=guidance,
             negative_prompt=request.extra.get("negative_prompt", " "),
+            num_images=int(request.extra.get("num_images", 1)),
         )
         metadata = {"model_path": str(self.pipeline.model_path)}
         if self.pipeline.quantization_config:
