@@ -4,6 +4,7 @@ import binascii
 import gc
 import json
 import logging
+import os
 import random
 import re
 import time
@@ -1514,6 +1515,93 @@ async def responses_endpoint(request: Request):
         )
 
 
+def _preserve_media_position_enabled() -> bool:
+    """``MLX_VLM_APC_PRESERVE_MEDIA_POSITION=1`` keeps media parts on their
+    originating user message, so appending turns no longer shifts earlier
+    messages' media markers and the token prefix stays cacheable."""
+    return (
+        os.environ.get("MLX_VLM_APC_PRESERVE_MEDIA_POSITION", "0").strip().lower()
+        in ("1", "true", "yes")
+    )
+
+
+def _normalize_chat_messages(
+    messages: List[Any], *, preserve_media_position: Optional[bool] = None
+) -> Tuple[List[dict], List[Any], List[Any], List[Any]]:
+    """Split OpenAI chat messages into template messages + side-channel media.
+
+    ``preserve_media_position=None`` reads the environment. When enabled, a
+    user message's original content list is kept (media parts stay in place,
+    so chat-template media allocation keeps the markers on their originating
+    message instead of moving them to the last user message); when disabled,
+    media parts are stripped to plain text (legacy behavior). Side-channel
+    images/audio/videos are always collected in document order, matching the
+    placeholder order the chat template renders.
+    """
+    if preserve_media_position is None:
+        preserve_media_position = _preserve_media_position_enabled()
+    images = []
+    audio = []
+    videos = []
+    processed_messages = []
+    for message in messages:
+        msg = {"role": message.role}
+
+        if isinstance(message.content, str):
+            msg["content"] = message.content
+        elif isinstance(message.content, list):
+            if message.role == "user":
+                for item in message.content:
+                    if not isinstance(item, dict):
+                        continue
+                    item_type = item.get("type")
+                    if item_type == "input_image":
+                        images.append(item["image_url"])
+                    elif item_type == "image_url":
+                        images.append(item["image_url"]["url"])
+                    elif item_type == "input_audio":
+                        audio.append(_decode_input_audio_data(item["input_audio"]))
+                    elif item_type in ("input_video", "video_url", "video"):
+                        video = _extract_video_reference(item)
+                        if video:
+                            videos.append(video)
+            if preserve_media_position and message.role == "user":
+                msg["content"] = list(message.content)
+            else:
+                msg["content"] = extract_text_from_content(message.content)
+        else:
+            msg["content"] = message.content
+
+        # Preserve tool-calling metadata.
+        # Ensure arguments are dicts (not JSON strings) for Jinja templates
+        # that iterate them with |items (e.g. Qwen3.5).
+        if message.tool_calls is not None:
+            normalized_calls = []
+            for tc in message.tool_calls:
+                tc = dict(tc) if isinstance(tc, dict) else tc
+                if isinstance(tc, dict) and "function" in tc:
+                    fn = dict(tc["function"])
+                    args = fn.get("arguments", {})
+                    if isinstance(args, str):
+                        try:
+                            fn["arguments"] = json.loads(args)
+                        except (json.JSONDecodeError, TypeError):
+                            fn["arguments"] = {}
+                    tc["function"] = fn
+                normalized_calls.append(tc)
+            msg["tool_calls"] = normalized_calls
+        if message.tool_call_id is not None:
+            msg["tool_call_id"] = message.tool_call_id
+        if message.name is not None:
+            msg["name"] = message.name
+        if message.reasoning_content is not None:
+            msg["reasoning_content"] = message.reasoning_content
+            msg["reasoning"] = message.reasoning_content
+
+        processed_messages.append(msg)
+    return processed_messages, images, audio, videos
+
+
 async def chat_completions_endpoint(request: ChatRequest, http_request: Request):
     """
     Generate text based on a prompt and optional images.
@@ -1544,62 +1632,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 else tuple(request.resize_shape)
             )
 
-        images = []
-        audio = []
-        videos = []
-        processed_messages = []
-        for message in request.messages:
-            msg = {"role": message.role}
-
-            if isinstance(message.content, str):
-                msg["content"] = message.content
-            elif isinstance(message.content, list):
-                if message.role == "user":
-                    for item in message.content:
-                        if not isinstance(item, dict):
-                            continue
-                        item_type = item.get("type")
-                        if item_type == "input_image":
-                            images.append(item["image_url"])
-                        elif item_type == "image_url":
-                            images.append(item["image_url"]["url"])
-                        elif item_type == "input_audio":
-                            audio.append(_decode_input_audio_data(item["input_audio"]))
-                        elif item_type in ("input_video", "video_url", "video"):
-                            video = _extract_video_reference(item)
-                            if video:
-                                videos.append(video)
-                msg["content"] = extract_text_from_content(message.content)
-            else:
-                msg["content"] = message.content
-
-            # Preserve tool-calling metadata.
-            # Ensure arguments are dicts (not JSON strings) for Jinja templates
-            # that iterate them with |items (e.g. Qwen3.5).
-            if message.tool_calls is not None:
-                normalized_calls = []
-                for tc in message.tool_calls:
-                    tc = dict(tc) if isinstance(tc, dict) else tc
-                    if isinstance(tc, dict) and "function" in tc:
-                        fn = dict(tc["function"])
-                        args = fn.get("arguments", {})
-                        if isinstance(args, str):
-                            try:
-                                fn["arguments"] = json.loads(args)
-                            except (json.JSONDecodeError, TypeError):
-                                fn["arguments"] = {}
-                        tc["function"] = fn
-                    normalized_calls.append(tc)
-                msg["tool_calls"] = normalized_calls
-            if message.tool_call_id is not None:
-                msg["tool_call_id"] = message.tool_call_id
-            if message.name is not None:
-                msg["name"] = message.name
-            if message.reasoning_content is not None:
-                msg["reasoning_content"] = message.reasoning_content
-                msg["reasoning"] = message.reasoning_content
-
-            processed_messages.append(msg)
+        processed_messages, images, audio, videos = _normalize_chat_messages(
+            request.messages
+        )
 
         _normalize_instruction_messages(processed_messages)
         _ensure_effective_input(processed_messages, images=images, audio=audio)
