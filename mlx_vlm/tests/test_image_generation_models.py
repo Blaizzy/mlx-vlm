@@ -2265,3 +2265,54 @@ def test_ming_image_generate_forwards_num_images():
     )
     assert pipeline.generate_array.call_args.kwargs["num_images"] == 2
     assert result.array.shape == (2, 8, 8, 4)
+
+
+def test_z_image_generate_forwards_num_images():
+    from mlx_vlm.models.z_image.model import ZImageGenerationModel
+
+    pipeline = MagicMock()
+    pipeline.config.default_steps = 9
+    pipeline.config.default_guidance = 0.0
+    pipeline.config.variant = "base"
+    pipeline.count_prompt_tokens.return_value = 5
+    pipeline.model_path = "/tmp/z"
+    pipeline.generate_array.return_value = mx.zeros((2, 8, 8, 3), dtype=mx.uint8)
+
+    model = ZImageGenerationModel(pipeline=pipeline, model_id="z")
+    result = model.generate(
+        ImageGenerationRequest(prompt="p", width=8, height=8, extra={"num_images": 2})
+    )
+    assert pipeline.generate_array.call_args.kwargs["num_images"] == 2
+    assert result.array.shape == (2, 8, 8, 3)
+
+
+def test_z_image_transformer_supports_batching():
+    from mlx_vlm.models.z_image.config import ZImageTransformerConfig
+    from mlx_vlm.models.z_image.transformer import ZImageTransformer
+
+    cfg = ZImageTransformerConfig(
+        hidden_size=128,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        intermediate_size=64,
+        in_channels=16,
+        text_embed_dim=16,
+        num_hidden_layers=2,
+        n_refiner_layers=1,
+        n_context_refiner_layers=1,
+        patch_size=2,
+        f_patch_size=1,
+        adaln_embed_dim=32,
+        rope_sections=(16, 24, 24),
+    )
+    model = ZImageTransformer(cfg)
+    model.eval()
+    mx.eval(model.parameters())
+    cap = mx.random.normal((1, 4, 16))
+    x = mx.random.normal((1, 16, 1, 8, 8))
+    t = mx.array([0.5])
+    single = model(x, t, cap)
+    batched = model(mx.concatenate([x, x], axis=0), t, cap)
+    assert batched.shape == (2, 16, 1, 8, 8)
+    assert_allclose(np.array(batched[0]), np.array(single[0]), rtol=1e-4, atol=1e-4)
+    assert_allclose(np.array(batched[1]), np.array(single[0]), rtol=1e-4, atol=1e-4)
