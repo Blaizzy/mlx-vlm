@@ -200,6 +200,7 @@ class InklingProcessor(ProcessorMixin):
     tokenizer pad token is required.
     """
 
+    supports_multiple_audio = True
     attributes = ["image_processor", "tokenizer"]
     valid_kwargs = ["chat_template"]
     image_processor_class = "InklingImageProcessor"
