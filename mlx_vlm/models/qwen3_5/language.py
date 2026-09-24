@@ -139,7 +139,6 @@ def _qwen3_5_refresh_metadata(cache):
     revision = getattr(cache, "metadata_revision", 0)
     if getattr(cache, "_qwen3_5_metadata_revision", None) != revision:
         for name in (
-            "_qwen3_5_left_padding_info",
             "_qwen3_5_lengths_info",
             "_qwen3_5_ssm_no_mask_batch_size",
         ):
@@ -159,34 +158,9 @@ def _qwen3_5_left_padding_info(cache):
     ):
         return None
 
-    cached = getattr(cache, "_qwen3_5_left_padding_info", None)
-    if cached is None or cached[0] is not left_padding:
-        pads = tuple(int(p) for p in left_padding.tolist())
-        cached = (left_padding, pads, max(pads) if pads else 0)
-        cache._qwen3_5_left_padding_info = cached
-    return cached[1], cached[2]
-
-
-def _qwen3_5_set_left_padding_info(cache, pads):
-    if cache is not None:
-        _qwen3_5_refresh_metadata(cache)
-    left_padding = getattr(cache, "left_padding", None)
-    if not isinstance(left_padding, mx.array):
-        return
-    pads = tuple(int(p) for p in pads)
-    cache._qwen3_5_left_padding_info = (
-        left_padding,
-        pads,
-        max(pads) if pads else 0,
-    )
-
-
-def _qwen3_5_advance_left_padding_info(cache, steps: int):
-    cached = getattr(cache, "_qwen3_5_left_padding_info", None)
-    if cached is None:
-        return
-    _left_padding, pads, _max_pad = cached
-    _qwen3_5_set_left_padding_info(cache, (p - steps for p in pads))
+    # Padding arrays can change in place without changing their identity.
+    pads = tuple(int(p) for p in left_padding.tolist())
+    return pads, max(pads)
 
 
 def _qwen3_5_lengths_info(cache):
@@ -252,16 +226,10 @@ def _create_qwen3_5_attention_mask(h: mx.array, cache):
 
     left_padding = getattr(cache, "left_padding", None)
     if h.shape[1] == 1 and isinstance(left_padding, mx.array) and left_padding.ndim > 0:
-        padding_cache = getattr(cache, "_qwen3_5_left_padding_cache", None)
-        if padding_cache is None or padding_cache[0] is not left_padding:
-            left_padding_info = _qwen3_5_left_padding_info(cache)
-            pads = list(left_padding_info[0]) if left_padding_info else []
-            padding_cache = (left_padding, pads, max(pads) if pads else 0)
-            cache._qwen3_5_left_padding_cache = padding_cache
-        pads = padding_cache[1]
-        if padding_cache[2] <= 0:
+        left_padding_info = _qwen3_5_left_padding_info(cache)
+        if left_padding_info is None or left_padding_info[1] <= 0:
             return None
-        cache._qwen3_5_decode_left_padding = pads
+        cache._qwen3_5_decode_left_padding = list(left_padding_info[0])
         return "left_padded_decode"
     return create_attention_mask(h, cache)
 
@@ -1148,7 +1116,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         if cache is not None:
             if hasattr(cache, "advance"):
                 cache.advance(S)
-                _qwen3_5_advance_left_padding_info(cache, S)
                 _qwen3_5_advance_lengths_info(cache, S)
 
         out = self.norm(out, z)
