@@ -2884,3 +2884,38 @@ def test_restored_tokens_count_successful_restores(
     manager.reset_stats()
     assert manager.stats_snapshot()["restored_tokens"] == 0
     assert manager.stats_snapshot()["stored_tokens"] == 0
+
+
+def test_a_single_restored_row_keeps_its_own_cache(managers):
+    """One restored row gets the hit's own cache back, the object
+    materialize_single restores on the single-sequence path, not a batch
+    merge of it. Models with a single-row shortcut (qwen3_5) otherwise
+    extract() and re-merge() the full KV on every decode step. Two rows
+    still merge."""
+    manager = managers()
+    tokens = list(range(32))
+    assert manager.store_exact_cache(
+        tokens, [sample("ArraysCache", 32), sample("KVCache", 32)]
+    )
+    runner = coordinate(manager, [ArraysCache(2), KVCache()])
+
+    def hit():
+        return runner.lookup(
+            tokens + [99],
+            extra_hash=0,
+            safe_lookup_min=0,
+            suffix_is_text_only=lambda _: True,
+            prefix_has_media=lambda _: False,
+        )
+
+    one = hit()
+    caches, prefix = runner.merge_rows([one], [one["prefix_len"]])
+    assert caches is one["warm_cache"] and prefix == one["prefix_len"]
+    assert manager.stats_snapshot()["restored_tokens"] == one["prefix_len"]
+    runner.release_hit(one)
+
+    two = hit()
+    caches, _ = runner.merge_rows([two, None], [two["prefix_len"], 0])
+    assert caches is not two["warm_cache"]
+    assert any(type(c).__name__.startswith("Batch") for c in caches)
+    runner.release_hit(two)

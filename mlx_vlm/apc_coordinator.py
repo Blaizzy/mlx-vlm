@@ -240,6 +240,22 @@ class APCCoordinator:
         kv_quant_config: Optional[dict] = None,
     ) -> Tuple[Optional[List[Any]], int]:
         """Materialize a mixed warm/cold batch at the common prefix boundary."""
+        # One restored row needs no batch merge. Its warm cache is already a
+        # private clone sized for the prompt (APCManager.lookup_exact_cache),
+        # the same object the single-sequence path restores
+        # (materialize_single). Merging it into BatchKVCache sent models with
+        # a single-row shortcut (qwen3_5) through extract()/merge() of the
+        # full KV on every decode step, so a restored request decoded slower
+        # than the same request run cold, increasingly with context.
+        if (
+            len(picks) == 1
+            and picks[0] is not None
+            and kv_quant_config is None
+            and picks[0].get("warm_cache") is not None
+        ):
+            with self.manager.lock:
+                self.manager.stats.restored_tokens += prefix_lens[0]
+            return picks[0]["warm_cache"], prefix_lens[0]
         from .apc import (
             make_warm_batch_exact_cache_multi,
             make_warm_batch_kv_cache_multi,
