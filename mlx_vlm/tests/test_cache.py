@@ -663,6 +663,24 @@ def test_finalize_noop_without_prepare():
     assert cache.left_padding.tolist() == before
 
 
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6, 8])
+def test_empty_quantized_cache_matches_quantize_layout(bits, head_dim, batched):
+    if batched:
+        cache = BatchQuantizedKVCache([0, 0], group_size=64, bits=bits)
+    else:
+        cache = C.QuantizedKVCache(group_size=64, bits=bits)
+    # The first update allocates the buffers, the second grows them.
+    for steps in (3, 300):
+        new = mx.random.normal((2 if batched else 1, 2, steps, head_dim))
+        keys, _ = cache.update_and_fetch(new, new)
+    expected = mx.quantize(new, group_size=64, bits=bits)
+    assert [k.shape[-1] for k in keys] == [e.shape[-1] for e in expected]
+    stored = mx.dequantize(*(k[..., 3:, :] for k in keys), group_size=64, bits=bits)
+    assert mx.array_equal(stored, mx.dequantize(*expected, group_size=64, bits=bits))
+
+
 GROUP = 64
 
 
