@@ -1,19 +1,29 @@
-"""High-level MLX inference and span decoding for OpenAI Privacy Filter."""
+"""OpenAI Privacy Filter: constrained BIOES Viterbi decoding over the shared
+token-classification pipeline in ``mlx_vlm.token_classification``."""
 
 from __future__ import annotations
 
-import argparse
 import json
-import re
-from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
-import mlx.core as mx
 import numpy as np
 from transformers import AutoTokenizer
 
-from .utils import get_model_path, load_model
+from .token_classification import (
+    BOUNDARIES,
+    TokenClassificationResult,
+    TokenClassifier,
+    TokenSpan,
+    build_label_info,
+    is_token_classifier_config,
+    load_token_classifier,
+    run_cli,
+)
+from .utils import get_model_path, load_config, load_model
+
+PrivacySpan = TokenSpan
+PrivacyFilterResult = TokenClassificationResult
 
 VITERBI_BIAS_KEYS = (
     "transition_bias_background_stay",
@@ -25,85 +35,6 @@ VITERBI_BIAS_KEYS = (
 )
 
 
-@dataclass(frozen=True)
-class PrivacySpan:
-    label: str
-    start: int
-    end: int
-    text: str
-    placeholder: str
-
-
-@dataclass(frozen=True)
-class PrivacyFilterResult:
-    text: str
-    spans: tuple[PrivacySpan, ...]
-    redacted_text: str
-
-    def to_dict(self) -> dict:
-        return {
-            "text": self.text,
-            "spans": [asdict(span) for span in self.spans],
-            "redacted_text": self.redacted_text,
-        }
-
-
-@dataclass(frozen=True)
-class _LabelInfo:
-    labels: tuple[str, ...]
-    background: int
-    span_names: tuple[str, ...]
-    span_index: Mapping[str, int]
-    token_to_span: Mapping[int, int]
-    boundaries: Mapping[int, Optional[str]]
-    states_by_span: Mapping[str, Mapping[str, int]]
-
-
-def _build_label_info(labels: Sequence[str]) -> _LabelInfo:
-    background = None
-    span_names = ["O"]
-    span_index = {"O": 0}
-    token_to_span = {}
-    boundaries = {}
-    states_by_span: dict[str, dict[str, int]] = {}
-
-    for index, label in enumerate(labels):
-        if label == "O":
-            background = index
-            token_to_span[index] = 0
-            boundaries[index] = None
-            continue
-        if "-" not in label:
-            raise ValueError(f"Invalid token label {label!r}; expected BIOES labels")
-        boundary, span_name = label.split("-", 1)
-        if boundary not in {"B", "I", "E", "S"} or not span_name:
-            raise ValueError(f"Invalid token label {label!r}; expected BIOES labels")
-        if span_name not in span_index:
-            span_index[span_name] = len(span_names)
-            span_names.append(span_name)
-        token_to_span[index] = span_index[span_name]
-        boundaries[index] = boundary
-        states_by_span.setdefault(span_name, {})[boundary] = index
-
-    if background is None:
-        raise ValueError("Privacy Filter labels must include the background label 'O'")
-    for span_name, states in states_by_span.items():
-        missing = {"B", "I", "E", "S"} - set(states)
-        if missing:
-            raise ValueError(
-                f"Privacy Filter labels for {span_name!r} are missing {sorted(missing)}"
-            )
-    return _LabelInfo(
-        labels=tuple(labels),
-        background=background,
-        span_names=tuple(span_names),
-        span_index=span_index,
-        token_to_span=token_to_span,
-        boundaries=boundaries,
-        states_by_span=states_by_span,
-    )
-
-
 class ViterbiDecoder:
     """Linear-time constrained BIOES decoder used by Privacy Filter."""
 
@@ -112,7 +43,14 @@ class ViterbiDecoder:
         labels: Sequence[str],
         transition_biases: Optional[Mapping[str, float]] = None,
     ):
-        self.label_info = _build_label_info(labels)
+        self.label_info = build_label_info(labels)
+        for span_name, states in self.label_info.states_by_span.items():
+            missing = BOUNDARIES - set(states)
+            if missing:
+                raise ValueError(
+                    f"Privacy Filter labels for {span_name!r} are missing "
+                    f"{sorted(missing)}"
+                )
         supplied = dict(transition_biases or {})
         unknown = set(supplied) - set(VITERBI_BIAS_KEYS)
         if unknown:
@@ -234,59 +172,11 @@ def _load_transition_biases(model_path: Path, operating_point: str) -> dict[str,
     return {key: float(raw_biases[key]) for key in VITERBI_BIAS_KEYS}
 
 
-def _placeholder(label: str) -> str:
-    normalized = re.sub(r"[^A-Za-z0-9]+", "_", label.upper()).strip("_")
-    return f"<{normalized or 'REDACTED'}>"
+class PrivacyFilter(TokenClassifier):
+    """Privacy Filter pipeline: raw token windows, Viterbi decoding by default."""
 
-
-def _token_spans(path: Sequence[int], labels: _LabelInfo):
-    spans = []
-    current_span = None
-    current_start = None
-    for token_index, token_label in enumerate(path):
-        span_index = labels.token_to_span[token_label]
-        boundary = labels.boundaries[token_label]
-        if token_label == labels.background:
-            if current_span is not None:
-                spans.append((current_span, current_start, token_index))
-            current_span = current_start = None
-        elif boundary == "S":
-            if current_span is not None:
-                spans.append((current_span, current_start, token_index))
-            spans.append((span_index, token_index, token_index + 1))
-            current_span = current_start = None
-        elif boundary == "B":
-            if current_span is not None:
-                spans.append((current_span, current_start, token_index))
-            current_span, current_start = span_index, token_index
-        elif boundary == "I":
-            if current_span != span_index:
-                if current_span is not None:
-                    spans.append((current_span, current_start, token_index))
-                current_span, current_start = span_index, token_index
-        elif boundary == "E":
-            if current_span == span_index:
-                spans.append((span_index, current_start, token_index + 1))
-            else:
-                if current_span is not None:
-                    spans.append((current_span, current_start, token_index))
-                spans.append((span_index, token_index, token_index + 1))
-            current_span = current_start = None
-    if current_span is not None:
-        spans.append((current_span, current_start, len(path)))
-    return spans
-
-
-def _redact(text: str, spans: Sequence[PrivacySpan], replacement: Optional[str]) -> str:
-    output = text
-    for span in reversed(spans):
-        value = replacement if replacement is not None else span.placeholder
-        output = output[: span.start] + value + output[span.end :]
-    return output
-
-
-class PrivacyFilter:
-    """Tokenize text, run the MLX model, and return coherent privacy spans."""
+    decode_modes = ("viterbi", "argmax")
+    default_decode = "viterbi"
 
     def __init__(
         self,
@@ -296,109 +186,20 @@ class PrivacyFilter:
         transition_biases: Optional[Mapping[str, float]] = None,
         context_size: Optional[int] = None,
     ):
-        self.model = model
-        self.tokenizer = tokenizer
-        id2label = model.config.id2label
-        labels = tuple(id2label[index] for index in range(model.config.num_labels))
-        self.decoder = ViterbiDecoder(labels, transition_biases)
+        super().__init__(
+            model,
+            tokenizer,
+            context_size=context_size,
+            special_tokens=((), ()),
+            group_words=False,
+        )
+        self.decoder = ViterbiDecoder(self.labels, transition_biases)
         self.label_info = self.decoder.label_info
-        self.context_size = int(
-            context_size
-            or getattr(model.config, "default_n_ctx", None)
-            or getattr(model.config, "max_position_embeddings", 4096)
-        )
-        if self.context_size <= 0:
-            raise ValueError("context_size must be positive")
-        self.model.eval()
 
-    def _tokenize(self, text: str) -> tuple[list[int], list[tuple[int, int]]]:
-        encoded = self.tokenizer(
-            text,
-            add_special_tokens=False,
-            return_attention_mask=False,
-            return_offsets_mapping=True,
-            truncation=False,
-        )
-        if "offset_mapping" not in encoded:
-            raise ValueError("Privacy Filter requires a fast tokenizer with offsets")
-        return list(encoded["input_ids"]), [
-            tuple(item) for item in encoded["offset_mapping"]
-        ]
-
-    def __call__(
-        self,
-        text: str,
-        *,
-        decode: str = "viterbi",
-        replacement: Optional[str] = None,
-        trim_whitespace: bool = True,
-    ) -> PrivacyFilterResult:
-        if not isinstance(text, str):
-            raise TypeError("text must be a string")
-        if decode not in {"viterbi", "argmax"}:
-            raise ValueError("decode must be 'viterbi' or 'argmax'")
-        input_ids, offsets = self._tokenize(text)
-        if not input_ids:
-            return PrivacyFilterResult(text=text, spans=(), redacted_text=text)
-
-        score_chunks = []
-        for start in range(0, len(input_ids), self.context_size):
-            token_chunk = input_ids[start : start + self.context_size]
-            ids = mx.array([token_chunk], dtype=mx.int32)
-            attention_mask = mx.ones(ids.shape, dtype=mx.bool_)
-            logits = self.model(ids, attention_mask=attention_mask).logits
-            log_probs = logits.astype(mx.float32)
-            log_probs = log_probs - mx.logsumexp(log_probs, axis=-1, keepdims=True)
-            log_probs = log_probs[0]
-            mx.eval(log_probs)
-            score_chunks.append(np.asarray(log_probs))
-        scores = np.concatenate(score_chunks, axis=0)
-
+    def decode_path(self, scores: np.ndarray, decode: str) -> list[int]:
         if decode == "viterbi":
-            path = self.decoder.decode(scores)
-        else:
-            path = np.argmax(scores, axis=-1).tolist()
-
-        detected = []
-        for span_index, token_start, token_end in _token_spans(path, self.label_info):
-            char_start = int(offsets[token_start][0])
-            char_end = int(offsets[token_end - 1][1])
-            if trim_whitespace:
-                while char_start < char_end and text[char_start].isspace():
-                    char_start += 1
-                while char_end > char_start and text[char_end - 1].isspace():
-                    char_end -= 1
-            if char_end <= char_start:
-                continue
-            label = self.label_info.span_names[span_index]
-            detected.append(
-                PrivacySpan(
-                    label=label,
-                    start=char_start,
-                    end=char_end,
-                    text=text[char_start:char_end],
-                    placeholder=_placeholder(label),
-                )
-            )
-
-        # Byte-level tokenizers can give several tokens the same character
-        # range. Keep one deterministic, globally non-overlapping span set.
-        detected.sort(
-            key=lambda span: (span.start, -(span.end - span.start), span.label)
-        )
-        non_overlapping = []
-        cursor = 0
-        for span in detected:
-            if span.start < cursor:
-                continue
-            non_overlapping.append(span)
-            cursor = span.end
-        spans = tuple(non_overlapping)
-        return PrivacyFilterResult(
-            text=text,
-            spans=spans,
-            redacted_text=_redact(text, spans, replacement),
-        )
+            return self.decoder.decode(scores)
+        return super().decode_path(scores, decode)
 
 
 def load_privacy_filter(
@@ -411,8 +212,13 @@ def load_privacy_filter(
     operating_point: str = "default",
     transition_biases: Optional[Mapping[str, float]] = None,
     context_size: Optional[int] = None,
-) -> PrivacyFilter:
-    """Load a local or Hugging Face Privacy Filter checkpoint."""
+) -> TokenClassifier:
+    """Load a Privacy Filter checkpoint, or any BIO token-classification one.
+
+    ``*ForTokenClassification`` encoder checkpoints (for example Rampart) load
+    through ``load_token_classifier`` and decode with argmax; the Viterbi
+    options apply only to OpenAI Privacy Filter.
+    """
 
     model_path = get_model_path(
         path_or_hf_repo,
@@ -429,6 +235,17 @@ def load_privacy_filter(
             "viterbi_calibration.json",
         ],
     )
+    config = load_config(model_path)
+    if config.get("model_type") != "openai_privacy_filter" and (
+        is_token_classifier_config(config)
+    ):
+        if transition_biases is not None or operating_point != "default":
+            raise ValueError(
+                "Viterbi transition biases only apply to OpenAI Privacy Filter"
+            )
+        return load_token_classifier(
+            model_path, lazy=lazy, strict=strict, context_size=context_size
+        )
     model = load_model(model_path, lazy=lazy, strict=strict)
     if model.model_type != "openai_privacy_filter":
         raise ValueError(
@@ -449,20 +266,12 @@ def load_privacy_filter(
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
-    parser = argparse.ArgumentParser(description="Detect and redact PII with MLX")
-    parser.add_argument("text", help="Text to inspect")
-    parser.add_argument("--model", default="openai/privacy-filter")
-    parser.add_argument("--argmax", action="store_true")
-    parser.add_argument("--replacement", default=None)
-    args = parser.parse_args(argv)
-
-    detector = load_privacy_filter(args.model)
-    result = detector(
-        args.text,
-        decode="argmax" if args.argmax else "viterbi",
-        replacement=args.replacement,
+    run_cli(
+        argv,
+        load_privacy_filter,
+        description="Detect and redact PII with MLX",
+        default_model="openai/privacy-filter",
     )
-    print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
