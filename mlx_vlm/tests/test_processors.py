@@ -738,6 +738,22 @@ def test_processor_mlx_outputs(name, with_image):
         assert "cross_attention_mask" in result
 
 
+def test_gemma3n_batches_images_and_audio():
+    processor = _make_processor("gemma3n")
+    processor.feature_extractor = Mock(return_value={"input_features": [[0.0]] * 2})
+    images = [_make_image(), _make_image()]
+
+    result = processor(
+        text=["<image><audio>one", "<image><audio>two"],
+        images=images,
+        audio=[[0.0], [0.0]],
+        padding=True,
+    )
+
+    assert result["input_ids"].shape[0] == 2
+    assert processor.tokenizer.last_kwargs["padding"] is True
+
+
 def test_unlimited_ocr_default_chat_template_omits_trailing_space():
     Template = pytest.importorskip("jinja2").Template
     p = object.__new__(c.ocr)
