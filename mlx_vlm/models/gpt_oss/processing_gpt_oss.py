@@ -1,15 +1,4 @@
-"""gpt-oss harmony response format.
-
-gpt-oss replies in harmony channels — ``analysis``/``commentary`` (reasoning)
-and ``final`` (the answer) — wrapped in ``<|channel|>NAME<|message|>...<|end|>``
-control tokens. The HF tokenizer already exposes the parser machinery
-(``parse_response`` / ``get_response_parser``) but ships no template, so
-``response_template`` is ``None`` and the raw channels leak into message content.
-
-Registering a processor for the ``gpt_oss`` model type fills that slot at load
-and collapses the repeated reasoning channels, so the server's existing
-response-template path handles gpt-oss with no harmony-specific server code.
-"""
+"""Fill the gpt-oss tokenizer's empty ``response_template`` so the server splits harmony ``analysis``/``commentary`` reasoning from the ``final`` answer."""
 
 from ..base import install_auto_processor_patch
 
@@ -33,13 +22,7 @@ HARMONY_RESPONSE_TEMPLATE = {
 
 
 def _join_channels(value):
-    """Collapse a repeated template field to a single string.
-
-    ``reasoning_content`` matches both the analysis and commentary channels, so
-    it carries ``repeats`` and parses to a list even when only one channel is
-    present. Dropping ``repeats`` is not an alternative: the parser then keeps
-    the last match, so a reply with both channels loses the analysis entirely.
-    """
+    """Collapse a repeated (``repeats``) template field, such as the merged analysis/commentary reasoning, to a single string."""
     if isinstance(value, (list, tuple)):
         parts = [
             str(item).strip()
@@ -83,11 +66,7 @@ def _attach_harmony_template(processor):
 
 
 class GptOssProcessor:
-    """Load gpt-oss normally, then attach the harmony response template.
-
-    gpt-oss is text-only, so its "processor" is the tokenizer itself; this
-    returns exactly what transformers would and only fills the template slot.
-    """
+    """Load gpt-oss normally, then attach the harmony response template to its tokenizer."""
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
