@@ -627,6 +627,117 @@ def adjust_prefix_to_text_suffix_boundary(
     return prefix_len
 
 
+def apc_prefix_scoped_media_hash_enabled(override: Optional[bool] = None) -> bool:
+    """Prefix-scoped media-hash knob (``MLX_VLM_APC_PREFIX_SCOPED_MEDIA_HASH``).
+
+    When on, per-image content hashes scoped by token position travel
+    alongside ``extra_hash`` (whose image part is then zeroed), so appending
+    new images after a cached prefix no longer invalidates it. Toggling the
+    knob silently invalidates entries written under the other mode (the base
+    ``extra_hash`` semantics differ); no disk flush is needed — stale entries
+    simply never match and age out through the usual LRU/eviction path.
+    """
+    if override is not None:
+        return bool(override)
+    return _env_truthy("MLX_VLM_APC_PREFIX_SCOPED_MEDIA_HASH")
+
+
+def compute_prefix_scoped_media_hashes(
+    pixel_values: Any,
+    image_grid_thw: Any,
+    token_ids: Sequence[int],
+    media_token_ids: Iterable[int],
+) -> Optional[List[Tuple[int, int]]]:
+    """Per-image content hashes scoped by placeholder end position.
+
+    Splits the concatenated Qwen-VL-style ``pixel_values`` patch tensor per
+    image (``image_grid_thw`` rows give ``t*h*w`` patches each) and pairs each
+    image's content hash with the exclusive end of its placeholder span in
+    the token stream, image order matching span order. Returns ``None`` when
+    the grid is unavailable or the split cannot be aligned with the media
+    spans, so callers keep the legacy whole-payload image hash.
+    """
+    if pixel_values is None or image_grid_thw is None:
+        return None
+    try:
+        grids = np.asarray(image_grid_thw).reshape(-1, 3)
+        spans = media_token_spans(token_ids, media_token_ids)
+        if len(grids) != len(spans):
+            return None
+        rows_per_image = [int(t) * int(h) * int(w) for t, h, w in grids]
+        if sum(rows_per_image) != int(pixel_values.shape[0]):
+            return None
+        hashes: List[Tuple[int, int]] = []
+        offset = 0
+        for (_start, end), n_rows in zip(spans, rows_per_image):
+            piece = pixel_values[offset : offset + n_rows]
+            hashes.append((int(end), _tensor_content_hash(piece)))
+            offset += n_rows
+        return hashes
+    except Exception:
+        return None
+
+
+def _trim_media_hashes(
+    media_hashes: Optional[Sequence[Tuple[int, int]]],
+    prefix_len: int,
+) -> Optional[List[Tuple[int, int]]]:
+    """Keep only the media hashes whose placeholder span ends within the prefix.
+
+    A checkpoint at length L only covers images whose placeholder span ends at
+    or before L; images after it belong to the suffix. Checkpoint boundaries
+    are media-aligned (see :func:`adjust_prefix_to_text_suffix_boundary`), so
+    no stored checkpoint splits a span and this trim stays symmetric with the
+    lookup-side filter in :func:`media_hashes_match_prefix`.
+    """
+    if media_hashes is None:
+        return None
+    return [
+        (int(end), int(content_hash))
+        for end, content_hash in media_hashes
+        if int(end) <= int(prefix_len)
+    ]
+
+
+def media_hashes_match_prefix(
+    request_media_hashes: Optional[Sequence[Tuple[int, int]]],
+    entry_media_hashes: Optional[Sequence[Tuple[int, int]]],
+    prefix_len: int,
+) -> Optional[bool]:
+    """Compare media hashes scoped to ``prefix_len`` on both sides.
+
+    Only images whose placeholder span ends within the matched prefix must be
+    identical; media appended after the prefix is ignored. Returns ``None``
+    when either side lacks scoped hashes (legacy entry or a request that
+    could not be split per image), telling the caller to fall back to the
+    legacy whole-``extra_hash`` comparison — conservative, may miss, but
+    never a wrong hit.
+    """
+    if request_media_hashes is None or entry_media_hashes is None:
+        return None
+    req = [
+        (int(end), int(content_hash))
+        for end, content_hash in request_media_hashes
+        if int(end) <= int(prefix_len)
+    ]
+    ent = [
+        (int(end), int(content_hash))
+        for end, content_hash in entry_media_hashes
+        if int(end) <= int(prefix_len)
+    ]
+    return req == ent
+
+
+def _parse_media_hashes_metadata(raw: Any) -> Optional[List[Tuple[int, int]]]:
+    """Parse the ``media_hashes`` disk-metadata field; None when absent/bad."""
+    if not raw:
+        return None
+    try:
+        return [(int(end), int(content_hash)) for end, content_hash in json.loads(raw)]
+    except (TypeError, ValueError):
+        return None
+
+
 @dataclass
 class APCBlock(APCNode):
     """Pooled logical node for one fixed-size KV block; its pageable K/V lives in the "kv" component handle."""
@@ -646,6 +757,9 @@ class APCExactCacheEntry:
     token_ids: Tuple[int, ...]
     extra_hash: int
     prompt_cache: List[Any]
+    # Optional per-image (span_end, content_hash) pairs scoped to this
+    # checkpoint; None for entries stored without prefix-scoped media hashes.
+    media_hashes: Optional[List[Tuple[int, int]]] = None
 
 
 @dataclass(frozen=True)
@@ -678,6 +792,7 @@ class _DiskExactCacheSnapshot:
     token_ids: Tuple[int, ...]
     extra_hash: int
     prompt_cache: List[Any]
+    media_hashes: Optional[List[Tuple[int, int]]] = None
 
 
 @dataclass
@@ -1562,6 +1677,7 @@ class DiskBlockStore:
         max_prefix_tokens: Optional[int] = None,
         min_prefix_tokens: int = 0,
         block_size: int = DEFAULT_BLOCK_SIZE,
+        media_hashes: Optional[Sequence[Tuple[int, int]]] = None,
     ) -> Optional[Tuple[int, int]]:
         token_tuple = tuple(int(t) for t in token_ids)
         max_len = len(token_tuple) - 1
@@ -1599,6 +1715,14 @@ class DiskBlockStore:
             )
             if prefix_len <= min_prefix_tokens:
                 continue
+            if media_hashes is not None:
+                scoped = media_hashes_match_prefix(
+                    media_hashes,
+                    _parse_media_hashes_metadata(metadata.get("media_hashes")),
+                    prefix_len,
+                )
+                if scoped is False:
+                    continue
             if best is None or prefix_len > best[1]:
                 best = (int(cache_hash), prefix_len)
         return best
@@ -1610,7 +1734,9 @@ class DiskBlockStore:
         wait_in_flight_ms: float = 0.0,
         min_capacity_tokens: Optional[int] = None,
         prefix_len: Optional[int] = None,
-    ) -> Optional[Tuple[Tuple[int, ...], int, List[Any]]]:
+    ) -> Optional[
+        Tuple[Tuple[int, ...], int, List[Any], Optional[List[Tuple[int, int]]]]
+    ]:
         with self._index_lock:
             path = self._exact_index.get(cache_hash)
         if path is None:
@@ -1652,7 +1778,9 @@ class DiskBlockStore:
         *,
         min_capacity_tokens: Optional[int],
         prefix_len: Optional[int] = None,
-    ) -> Optional[Tuple[Tuple[int, ...], int, List[Any]]]:
+    ) -> Optional[
+        Tuple[Tuple[int, ...], int, List[Any], Optional[List[Tuple[int, int]]]]
+    ]:
         parsed = self._open_shard_header(path)
         if parsed is None:
             return None
@@ -1705,7 +1833,11 @@ class DiskBlockStore:
             os.utime(path, None)
         except OSError:
             pass
-        return token_ids, extra_hash, prompt_cache
+        media_hashes = _trim_media_hashes(
+            _parse_media_hashes_metadata(metadata.get("media_hashes")),
+            len(token_ids),
+        )
+        return token_ids, extra_hash, prompt_cache, media_hashes
 
     def _load_exact_cache_entry(
         self,
@@ -2548,6 +2680,7 @@ class DiskBlockStore:
         prompt_cache: Sequence[Any],
         *,
         synchronous: bool = False,
+        media_hashes: Optional[Sequence[Tuple[int, int]]] = None,
     ) -> bool:
         """Schedule an exact prompt-cache snapshot write.
 
@@ -2562,6 +2695,7 @@ class DiskBlockStore:
             token_ids=token_tuple,
             extra_hash=int(extra_hash),
             prompt_cache=list(prompt_cache),
+            media_hashes=_trim_media_hashes(media_hashes, len(token_tuple)),
         )
         return self._enqueue_exact_snapshot(snapshot, synchronous=synchronous)
 
@@ -2921,6 +3055,18 @@ class DiskBlockStore:
             ),
             "store_id": self._exact_id_for(snapshot.cache_hash),
         }
+        if snapshot.media_hashes is not None:
+            # Presence of this field marks a prefix-scoped-media-hash entry
+            # written with image identity carried per image rather than folded
+            # into extra_hash; readers without the field keep the legacy
+            # whole-extra_hash comparison.
+            metadata["media_hashes"] = json.dumps(
+                [
+                    [int(end), int(content_hash)]
+                    for end, content_hash in snapshot.media_hashes
+                ],
+                separators=(",", ":"),
+            )
         arrays: dict[str, mx.array] = {}
         for i, c in enumerate(snapshot.prompt_cache):
             if not self._snapshot_exact_cache_entry(c, f"c{i}", arrays, metadata):
@@ -3361,6 +3507,7 @@ class APCManager:
         extra_hash: int = 0,
         max_prefix_tokens: Optional[int] = None,
         min_prefix_tokens: int = 0,
+        media_hashes: Optional[Sequence[Tuple[int, int]]] = None,
     ) -> Tuple[Optional[List[Any]], int]:
         """Return the longest restorable prefix from prompt-cache snapshots.
 
@@ -3368,6 +3515,9 @@ class APCManager:
         addition to attention KV. That state is not block-concatenable, so the
         safe reuse unit is an exact prompt-cache snapshot at a prefix boundary.
         Plain dense K/V snapshots can also be sliced to the last matching block.
+        ``media_hashes`` enables prefix-scoped media comparison: only images
+        inside the matched prefix must be identical, so appending new images
+        after a cached prefix still hits.
         """
         disk = self.disk
         if self._exact_cache_max <= 0 and disk is None:
@@ -3403,6 +3553,11 @@ class APCManager:
                     )
                     if candidate_len <= max(min_prefix_tokens, prefix_len):
                         continue
+                    scoped = media_hashes_match_prefix(
+                        media_hashes, entry.media_hashes, candidate_len
+                    )
+                    if scoped is False:
+                        continue
                     best_key = key
                     best_entry = entry
                     prefix_len = candidate_len
@@ -3433,6 +3588,7 @@ class APCManager:
                 max_prefix_tokens=max_prefix_tokens,
                 min_prefix_tokens=max(min_prefix_tokens, prefix_len),
                 block_size=self.block_size,
+                media_hashes=media_hashes,
             )
             if disk_match is not None:
                 cache_hash, disk_prefix_len = disk_match
@@ -3449,7 +3605,9 @@ class APCManager:
                     prefix_len=disk_prefix_len,
                 )
                 if loaded is not None:
-                    stored_tokens, stored_extra_hash, prompt_cache = loaded
+                    stored_tokens, stored_extra_hash, prompt_cache, stored_media = (
+                        loaded
+                    )
                     if (
                         stored_extra_hash == extra_hash
                         and len(stored_tokens) == disk_prefix_len
@@ -3508,6 +3666,7 @@ class APCManager:
                                                     token_ids=stored_tokens,
                                                     extra_hash=int(extra_hash),
                                                     prompt_cache=storage_copy,
+                                                    media_hashes=stored_media,
                                                 )
                                             )
                                             self._exact_cache.move_to_end(promote_key)
@@ -3551,13 +3710,20 @@ class APCManager:
         prompt_cache: Sequence[Any],
         *,
         extra_hash: int = 0,
+        media_hashes: Optional[Sequence[Tuple[int, int]]] = None,
     ) -> bool:
-        """Store a full prompt-cache snapshot for exact-prefix reuse."""
+        """Store a full prompt-cache snapshot for exact-prefix reuse.
+
+        ``media_hashes`` (``(span_end, content_hash)`` pairs, scoped per
+        image) is trimmed to the stored checkpoint length so intermediate
+        checkpoints only carry the images they actually cover.
+        """
         if len(token_ids) < self.exact_cache_min_tokens:
             return False
         if (self._exact_cache_max <= 0 and self.disk is None) or not token_ids:
             return False
         token_tuple = tuple(int(t) for t in token_ids)
+        scoped_media_hashes = _trim_media_hashes(media_hashes, len(token_tuple))
         size = _cache_nbytes(prompt_cache)
         self._prefill_reserve_bytes = self.memory_plan.observe_cache(
             prompt_cache, len(token_tuple), live_bytes=size
@@ -3580,7 +3746,12 @@ class APCManager:
             # This path avoids a second full snapshot just to spill to disk.
             key = _sequence_hash(token_tuple, extra_hash, self.block_size)
             stored = self.disk.save_exact_cache(
-                key, token_tuple, extra_hash, prompt_cache, synchronous=True
+                key,
+                token_tuple,
+                extra_hash,
+                prompt_cache,
+                synchronous=True,
+                media_hashes=scoped_media_hashes,
             )
             if stored:
                 with self.lock:
@@ -3610,6 +3781,7 @@ class APCManager:
                     token_ids=token_tuple,
                     extra_hash=int(extra_hash),
                     prompt_cache=copied,
+                    media_hashes=scoped_media_hashes,
                 )
                 self._exact_cache.move_to_end(key)
                 while len(self._exact_cache) > self._exact_cache_max:
@@ -3625,7 +3797,13 @@ class APCManager:
             )
         if self.disk is not None:
             try:
-                self.disk.save_exact_cache(key, token_tuple, extra_hash, copied)
+                self.disk.save_exact_cache(
+                    key,
+                    token_tuple,
+                    extra_hash,
+                    copied,
+                    media_hashes=scoped_media_hashes,
+                )
                 stored = True
             except Exception as e:
                 logger.warning("APC exact disk save scheduling failed: %s", e)
@@ -4680,6 +4858,7 @@ def apc_lookup_plan(
     safe_lookup_min: int,
     suffix_is_text_only,
     prefix_has_media,
+    media_hashes: Optional[Sequence[Tuple[int, int]]] = None,
     media_gate_relaxed: Optional[bool] = None,
 ) -> Optional[dict]:
     """Pick the best APC prefix (disk > exact > block); shared by both generate paths, releases losers, callers apply."""
@@ -4689,7 +4868,10 @@ def apc_lookup_plan(
 
     if apc_mode == "exact":
         exact_cache, exact_prefix_len = manager.lookup_exact_cache(
-            ids_list, extra_hash=extra_hash, min_prefix_tokens=safe_lookup_min
+            ids_list,
+            extra_hash=extra_hash,
+            min_prefix_tokens=safe_lookup_min,
+            media_hashes=media_hashes,
         )
         if exact_cache is not None and 0 < exact_prefix_len < n:
             if not suffix_is_text_only(exact_prefix_len):
@@ -4705,8 +4887,12 @@ def apc_lookup_plan(
 
     relaxed = apc_media_gate_relaxed(media_gate_relaxed)
     matched, prefix_len = manager.lookup_prefix(ids_list, extra_hash=extra_hash)
+    # The relaxed gate skips the media drop only when image identity is still
+    # covered by the whole extra_hash. With prefix-scoped media hashes the
+    # image part is zeroed out of extra_hash and block-path hits cannot
+    # verify per-image identity, so the drop stays for them.
     if prefix_len > 0 and prefix_has_media(prefix_len):
-        if not relaxed:
+        if not (relaxed and media_hashes is None):
             manager.release(matched)
             matched = []
             prefix_len = 0
@@ -4717,6 +4903,7 @@ def apc_lookup_plan(
             ids_list,
             extra_hash=extra_hash,
             min_prefix_tokens=max(prefix_len, safe_lookup_min),
+            media_hashes=media_hashes,
         )
     warm_cache = None
     disk_prefix_len = 0
@@ -4728,17 +4915,23 @@ def apc_lookup_plan(
             allow_memory_overlap=max(prefix_len, exact_prefix_len) > 0,
         )
     if disk_prefix_len > max(prefix_len, exact_prefix_len) and disk_prefix_len < n:
-        if matched:
-            manager.release(matched)
-        if not suffix_is_text_only(disk_prefix_len):
-            return None
-        return {
-            "matched_blocks": [],
-            "warm_cache": warm_cache,
-            "prefix_len": disk_prefix_len,
-            "extra_hash": extra_hash,
-            "full_input_ids": list(ids_list),
-        }
+        if media_hashes is not None and prefix_has_media(disk_prefix_len):
+            # Layer-major disk restores cannot verify prefix-scoped media
+            # hashes; leave media-bearing prefixes to the exact path above.
+            warm_cache = None
+            disk_prefix_len = 0
+        else:
+            if matched:
+                manager.release(matched)
+            if not suffix_is_text_only(disk_prefix_len):
+                return None
+            return {
+                "matched_blocks": [],
+                "warm_cache": warm_cache,
+                "prefix_len": disk_prefix_len,
+                "extra_hash": extra_hash,
+                "full_input_ids": list(ids_list),
+            }
     if exact_prefix_len > prefix_len and exact_prefix_len < n:
         if matched:
             manager.release(matched)

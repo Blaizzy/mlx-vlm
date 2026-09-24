@@ -755,6 +755,7 @@ class QueuedGenerationRequest:
     videos: Optional[List] = None
     audio: Optional[List] = None
     apc_semantic_hash: Optional[int] = None
+    apc_media_hashes: Optional[List] = None
     request_id: Optional[str] = None
     queued_at: float = field(default_factory=time.perf_counter)
 
@@ -1174,11 +1175,28 @@ class ResponseGenerator:
         _check_configured_context_budget(prompt_tokens, args.max_tokens)
 
         apc_semantic_hash = None
+        apc_media_hashes = None
         if getattr(self, "apc_mode", None) is not None:
             pixel_values = raw_inputs.get("pixel_values")
             image_hash = 0
             if pixel_values is not None:
-                image_hash = _apc.hash_image_payload(pixel_values=pixel_values)
+                # With the prefix-scoped knob on, image identity moves out of
+                # the semantic hash into per-image (span_end, hash) pairs, so
+                # appending images after a cached prefix still matches. When
+                # the split is unavailable we keep the legacy whole-payload
+                # image hash (and knob toggling invalidates the other mode's
+                # entries by design).
+                if _apc.apc_prefix_scoped_media_hash_enabled():
+                    apc_media_hashes = _apc.compute_prefix_scoped_media_hashes(
+                        pixel_values,
+                        raw_inputs.get("image_grid_thw"),
+                        raw_inputs["input_ids"].flatten().tolist(),
+                        _apc.multimodal_token_ids_from_config(self.config),
+                    )
+                if apc_media_hashes is not None:
+                    image_hash = 0
+                else:
+                    image_hash = _apc.hash_image_payload(pixel_values=pixel_values)
             elif images is not None:
                 image_hash = _apc.hash_image_payload(image_ref=images)
             apc_semantic_hash = _apc.semantic_extra_hash(
@@ -1203,6 +1221,7 @@ class ResponseGenerator:
             videos=videos,
             audio=audio,
             apc_semantic_hash=apc_semantic_hash,
+            apc_media_hashes=apc_media_hashes,
             request_id=request_id,
             queued_at=request_started_at,
         )
@@ -1576,6 +1595,7 @@ class ResponseGenerator:
         raw_inputs: dict,
         images=None,
         apc_semantic_hash: Optional[int] = None,
+        apc_media_hashes: Optional[List] = None,
     ) -> Tuple[mx.array, dict]:
         """GPU-only: run vision encoder if needed. Must run on GPU thread."""
         input_ids = raw_inputs.get("input_ids")
@@ -1608,6 +1628,8 @@ class ResponseGenerator:
         }
         if apc_semantic_hash is not None:
             gen_kwargs["_apc_semantic_hash"] = apc_semantic_hash
+        if apc_media_hashes is not None:
+            gen_kwargs["_apc_media_hashes"] = apc_media_hashes
         return input_ids, gen_kwargs
 
     def _collect_pending_requests(
@@ -1787,6 +1809,7 @@ class ResponseGenerator:
                         raw_inputs,
                         images,
                         apc_semantic_hash=request.apc_semantic_hash,
+                        apc_media_hashes=request.apc_media_hashes,
                     )
                     has_embeds = bool(gen_kwargs.get("inputs_embeds") is not None)
                     # Preserve tenant isolation for manually queued requests
