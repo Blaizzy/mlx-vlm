@@ -1732,6 +1732,18 @@ def test_apply_chat_template_preserves_explicit_thinking_enabled():
     assert result.endswith("<think>\n")
 
 
+def test_qwen3_omni_enables_thinking_by_default():
+    processor = MagicMock(chat_template="{{ messages }}")
+    processor.apply_chat_template.return_value = "prompt"
+
+    result = apply_chat_template(
+        processor, {"model_type": "qwen3_omni_moe"}, "Describe this image."
+    )
+
+    assert result == "prompt"
+    assert processor.apply_chat_template.call_args.kwargs["enable_thinking"] is True
+
+
 def test_apply_chat_template_maps_enable_thinking_for_thinking_mode_templates():
     class ThinkingModeProcessor:
         chat_template = "{% if thinking_mode == 'enabled' %}<mm:think>{% endif %}"
