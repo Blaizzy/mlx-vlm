@@ -24,8 +24,11 @@ import numpy as np
 import pytest
 from mlx.utils import tree_flatten, tree_map
 
+from mlx_vlm import embedding_loader
 from mlx_vlm.models.base import InputEmbeddingsFeatures
 from mlx_vlm.models.cache import make_prompt_cache
+from mlx_vlm.models.lfm2_colbert import Model as Lfm2Colbert
+from mlx_vlm.models.lfm2_colbert import ModelConfig as Lfm2ColbertConfig
 from mlx_vlm.utils import (
     _drop_modules_without_weights,
     _load_safetensors,
@@ -38,6 +41,71 @@ from mlx_vlm.utils import (
 )
 
 # Shared model contracts
+
+
+class TestLfm2Colbert:
+    @staticmethod
+    def model():
+        return Lfm2Colbert(
+            Lfm2ColbertConfig(
+                model_type="lfm2_colbert",
+                vocab_size=32,
+                hidden_size=16,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                max_position_embeddings=32,
+                norm_eps=1e-5,
+                conv_bias=False,
+                conv_L_cache=3,
+                block_dim=16,
+                block_ff_dim=24,
+                block_multiple_of=8,
+                block_ffn_dim_multiplier=1.0,
+                block_auto_adjust_ff_dim=False,
+                layer_types=["conv", "full_attention"],
+                embedding_dim=8,
+            )
+        )
+
+    def test_returns_normalized_token_embeddings(self):
+        output = self.model()(mx.array([[1, 2, 3]]))
+
+        assert output.last_hidden_state.shape == (1, 3, 16)
+        assert output.text_embeds.shape == (1, 3, 8)
+        assert mx.allclose(
+            mx.linalg.norm(output.text_embeds, axis=-1), mx.array(1.0), atol=1e-5
+        )
+
+    def test_sanitize_maps_backbone_and_projection(self):
+        weights = {
+            "embed_tokens.weight": mx.zeros((32, 16)),
+            "layers.0.conv.conv.weight": mx.zeros((16, 1, 3)),
+            "1_Dense.linear.weight": mx.zeros((8, 16)),
+        }
+
+        sanitized = self.model().sanitize(weights)
+
+        assert "model.embed_tokens.weight" in sanitized
+        assert sanitized["model.layers.0.conv.conv.weight"].shape == (16, 3, 1)
+        assert "projection.weight" in sanitized
+
+    def test_embedding_loader_detects_colbert_sidecar(self, tmp_path, monkeypatch):
+        (tmp_path / "config.json").write_text(json.dumps({"model_type": "lfm2"}))
+        dense_dir = tmp_path / "1_Dense"
+        dense_dir.mkdir()
+        (dense_dir / "config.json").write_text(json.dumps({"out_features": 128}))
+        captured = {}
+
+        def fake_load(model_path, **kwargs):
+            captured.update(kwargs)
+            return object()
+
+        monkeypatch.setattr(embedding_loader, "load_encoder_model", fake_load)
+        embedding_loader.load_embedding_model(tmp_path)
+
+        assert captured["model_remapping"]["lfm2"] == "lfm2_colbert"
+        assert captured["config_overrides"]["embedding_dim"] == 128
 
 
 def capture_positions(
