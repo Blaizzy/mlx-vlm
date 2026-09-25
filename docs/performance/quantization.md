@@ -4,7 +4,7 @@ Weight and activation quantization for inference. To quantize the KV cache durin
 
 ## 1-bit Affine Inference
 
-MLX-VLM can load existing affine 1-bit MLX checkpoints without a custom MLX
+mlx-vlm can load existing affine 1-bit MLX checkpoints without a custom MLX
 build. When a checkpoint declares `"bits": 1`, compatible `Linear` and
 `Embedding` layers are replaced automatically with an inference-only module
 that JIT-compiles its Metal kernel from Python.

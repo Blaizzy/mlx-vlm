@@ -440,7 +440,7 @@ unknown names and invalid values are rejected and never applied.
 
 ## Embeddings
 
-MLX-VLM serves OpenAI-compatible embeddings from native MLX models via `/v1/embeddings`. Preload a default with `--embedding-model <repo-or-path>`.
+mlx-vlm serves OpenAI-compatible embeddings from native MLX models via `/v1/embeddings`. Preload a default with `--embedding-model <repo-or-path>`.
 
 ```sh
 curl -X POST "http://localhost:8080/v1/embeddings" \

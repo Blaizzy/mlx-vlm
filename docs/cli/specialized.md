@@ -1,6 +1,6 @@
 # Specialized CLIs
 
-Beyond the primary commands ([`generate`](generate.md), [`server`](server.md), [`convert`](convert.md), [`chat`](chat.md), [`lora`](lora.md)), MLX-VLM ships a set of advanced, model-specific, and evaluation entry points invoked as Python modules. Each is a directory rather than a full flag reference: for the authoritative, version-current options, run any command with `--help`.
+Beyond the primary commands ([`generate`](generate.md), [`server`](server.md), [`convert`](convert.md), [`chat`](chat.md), [`lora`](lora.md)), mlx-vlm ships a set of advanced, model-specific, and evaluation entry points invoked as Python modules. Each is a directory rather than a full flag reference: for the authoritative, version-current options, run any command with `--help`.
 
 ## Evaluation
 

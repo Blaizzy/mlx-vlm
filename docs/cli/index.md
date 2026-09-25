@@ -1,6 +1,6 @@
 # CLI Reference
 
-MLX-VLM ships several command-line tools. This reference is written to be a practical, agent-facing map of the CLI: what each command does, its full flag set (grouped), and copy-paste examples.
+mlx-vlm ships several command-line tools. This reference is written to be a practical, agent-facing map of the CLI: what each command does, its full flag set (grouped), and copy-paste examples.
 
 ## Invocation
 

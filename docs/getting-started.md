@@ -128,7 +128,7 @@ print(output)
 
 ## Multiple images
 
-MLX-VLM can analyze several images at once with select models, for comparison and cross-image reasoning.
+mlx-vlm can analyze several images at once with select models, for comparison and cross-image reasoning.
 
 ```python
 from mlx_vlm import load, generate
@@ -152,7 +152,7 @@ mlx_vlm.generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 10
 
 ## Video understanding
 
-MLX-VLM supports video analysis — captioning, summarization, and more — with select models (Qwen2-VL, Qwen2.5-VL, Idefics3, LLaVA, MiniMax M3, and more coming soon).
+mlx-vlm supports video analysis — captioning, summarization, and more — with select models (Qwen2-VL, Qwen2.5-VL, Idefics3, LLaVA, MiniMax M3, and more coming soon).
 
 ```sh
 mlx_vlm.generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 100 --prompt "Describe this video" --video path/to/video.mp4 --fps 1.0
@@ -198,7 +198,7 @@ See [Speculative Decoding](performance/speculative-decoding.md) for the drafter 
 
 ## Distributed inference
 
-MLX-VLM supports distributed inference across multiple computers by sharding the language model (not the vision tower) — the LLM is much larger, and vision embeddings only need to be computed once. The parallel implementation is compatible with [mlx-lm](https://github.com/ml-explore/mlx-lm) sharding primitives.
+mlx-vlm supports distributed inference across multiple computers by sharding the language model (not the vision tower) — the LLM is much larger, and vision embeddings only need to be computed once. The parallel implementation is compatible with [mlx-lm](https://github.com/ml-explore/mlx-lm) sharding primitives.
 
 For example, running Kimi K2.6 (a 1T-parameter model) across several machines (for a smaller option try `mlx-community/Qwen3-VL-30B-A3B-Instruct-bf16`):
 

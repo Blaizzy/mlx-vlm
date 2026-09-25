@@ -1,5 +1,5 @@
-site_name: MLX-VLM
-site_description: MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VLMs) on your Mac using MLX.
+site_name: mlx-vlm
+site_description: mlx-vlm is a package for inference and fine-tuning of Vision Language Models (VLMs) on your Mac using MLX.
 site_author: Prince Canuma
 repo_name: Blaizzy/mlx-vlm
 site_url: https://Blaizzy.github.io/mlx-vlm

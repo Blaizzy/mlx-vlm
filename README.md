@@ -1,7 +1,7 @@
 [![Upload Python Package](https://github.com/Blaizzy/mlx-vlm/actions/workflows/python-publish.yml/badge.svg)](https://github.com/Blaizzy/mlx-vlm/actions/workflows/python-publish.yml)
-# MLX-VLM
+# mlx-vlm
 
-MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VLMs) and Omni Models (VLMs with audio and video support) on your Mac using MLX.
+mlx-vlm is a package for inference and fine-tuning of Vision Language Models (VLMs) and Omni Models (VLMs with audio and video support) on your Mac using MLX.
 
 ## Installation
 
@@ -93,7 +93,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 
 ## Agent Skills
 
-This repo ships an agent-skills bundle under `skills/` for common MLX-VLM workflows — usage, conversion, development, and support. Skills load into a coding agent (Claude Code, Codex, Gemini) so it follows the right project conventions instead of guessing.
+This repo ships an agent-skills bundle under `skills/` for common mlx-vlm workflows — usage, conversion, development, and support. Skills load into a coding agent (Claude Code, Codex, Gemini) so it follows the right project conventions instead of guessing.
 
 | Skill | Description |
 |-------|-------------|
@@ -103,7 +103,7 @@ This repo ships an agent-skills bundle under `skills/` for common MLX-VLM workfl
 | `add-new-model` | Port a new architecture into `mlx_vlm/models` — config, weight-name mapping, reuse a similar model, add a test class. |
 | `benchmarking` | Produce credible, reproducible perf numbers and fork-vs-main A/B tables for PRs. |
 | `contributing` | Shape a change to pass review — code/config/test placement, pre-commit hooks, and PR expectations. |
-| `hf-cache-models` | List MLX-VLM-supported (and, with `--check-arch`, loadable) models in the local Hugging Face cache. |
+| `hf-cache-models` | List mlx-vlm-supported (and, with `--check-arch`, loadable) models in the local Hugging Face cache. |
 | `reproducible-github-issues` | Turn CLI or server failures into concise, reproducible GitHub issues. |
 
 Validate the bundle at any time:
@@ -209,7 +209,7 @@ mlx_vlm.chat_ui --model mlx-community/Qwen2-VL-2B-Instruct-4bit
 
 ### Python Script
 
-Here's an example of how to use MLX-VLM in a Python script:
+Here's an example of how to use mlx-vlm in a Python script:
 
 ```python
 import mlx.core as mx
@@ -294,7 +294,7 @@ print(output)
 
 ## Server (FastAPI)
 
-MLX-VLM ships an OpenAI-compatible FastAPI server with continuous batching and
+mlx-vlm ships an OpenAI-compatible FastAPI server with continuous batching and
 streaming, plus endpoints for chat, responses, embeddings, reranking, audio
 (TTS/STT), image generation, and realtime speech.
 
@@ -318,7 +318,7 @@ structured outputs:
 
 ## 1-bit Affine Inference
 
-MLX-VLM can load existing affine 1-bit MLX checkpoints without a custom MLX build.
+mlx-vlm can load existing affine 1-bit MLX checkpoints without a custom MLX build.
 
 See [Quantization](docs/performance/quantization.md#1-bit-affine-inference) for the checkpoint layout and load/generate examples.
 
@@ -329,13 +329,13 @@ When running on NVIDIA GPUs with MLX CUDA, models quantized with `mxfp8` or `nvf
 See [Quantization](docs/performance/quantization.md#activation-quantization-cuda) for the CLI flag, Python API, and supported modes.
 ## Multi-Image Chat Support
 
-MLX-VLM supports analyzing multiple images simultaneously with select models. This feature enables more complex visual reasoning tasks and comprehensive analysis across multiple images in a single conversation.
+mlx-vlm supports analyzing multiple images simultaneously with select models. This feature enables more complex visual reasoning tasks and comprehensive analysis across multiple images in a single conversation.
 
 See [Getting Started](docs/getting-started.md#multiple-images) for examples.
 
 ## Video Understanding
 
-MLX-VLM also supports video analysis such as captioning, summarization, and more, with select models.
+mlx-vlm also supports video analysis such as captioning, summarization, and more, with select models.
 
 See [Getting Started](docs/getting-started.md#video-understanding) for supported models and examples.
 
@@ -356,6 +356,6 @@ See [Getting Started](docs/getting-started.md#distributed-inference) for command
 
 ## Fine-tuning
 
-MLX-VLM supports fine-tuning models with LoRA and QLoRA.
+mlx-vlm supports fine-tuning models with LoRA and QLoRA.
 
 See [Fine-tuning](docs/fine-tuning.md) for the `mlx-vlm[train]` extra and LoRA/QLoRA usage.
