@@ -62,6 +62,18 @@ def capture_positions(
 class ModelChecks:
     """Reusable assertions; each JSON case constructs fresh configs and models."""
 
+    def system_one(self, module):
+        question = module._render_question(
+            {
+                "type": "choice",
+                "instructions": "Route this request",
+                "criteria": {"billing": "payments", "technical": None},
+            }
+        )
+        assert question["options"] == ["billing: payments", "technical"]
+        records = module._annotate([{"value": i} for i in range(8)])
+        assert records[7] == {"_index": 7, "value": 7}
+
     def forward_cache(self, model, vocab_size, *, chunk_sizes=()):
         model.eval()
         mx.eval(model.parameters())
@@ -456,22 +468,6 @@ class ModelChecks:
         assert positions[0, 0, 0].item() == 15
 
 
-class SystemOneChecks:
-    """Reusable contracts for models that return typed decisions."""
-
-    def questions(self, module):
-        question = module._render_question(
-            {
-                "type": "choice",
-                "instructions": "Route this request",
-                "criteria": {"billing": "payments", "technical": None},
-            }
-        )
-        assert question["options"] == ["billing: payments", "technical"]
-        records = module._annotate([{"value": i} for i in range(8)])
-        assert records[7] == {"_index": 7, "value": 7}
-
-
 CONFIG_TYPES = {
     "text_config": "TextConfig",
     "vision_config": "VisionConfig",
@@ -525,6 +521,8 @@ def check_arguments(kind, case, model, config):
         return (model, config), case["multimodal"]
     if kind == "input_embeddings":
         return (model, name), {}
+    if kind == "system_one":
+        return (importlib.import_module("mlx_vlm.models." + case["system_one"]),), {}
     if kind == "audio":
         return (model, config, name), case.get("audio", {})
     if kind in {"request_positions", "chunked_positions"}:
@@ -594,14 +592,9 @@ def check_arguments(kind, case, model, config):
 
 @pytest.mark.parametrize("case", DATA["cases"], ids=lambda case: case["id"])
 def test_model_contract(case):
-    module = importlib.import_module("mlx_vlm.models." + case["module"])
-    if case.get("workflow") == "system_one":
-        checks = SystemOneChecks()
-        for kind in case["checks"]:
-            getattr(checks, kind)(module)
-        return
     if "multimodal" in case["checks"]:
         mx.random.seed(17)
+    module = importlib.import_module("mlx_vlm.models." + case["module"])
     config = build_config(module, case["config"])
     model = module.Model(config)
     checks = ModelChecks()
