@@ -56,6 +56,207 @@ prism_ops = importlib.import_module(
 qwen35 = importlib.import_module("mlx_vlm.models.qwen3_5")
 
 
+def test_mistral_large3_native_config_mapping():
+    from mlx_vlm.models.mistral_large3 import ModelConfig
+    from mlx_vlm.models.mistral_large3.config import config_from_params
+
+    params = {
+        "dim": 128,
+        "hidden_dim": 256,
+        "n_layers": 5,
+        "n_heads": 4,
+        "n_kv_heads": 4,
+        "q_lora_rank": 32,
+        "kv_lora_rank": 16,
+        "qk_nope_head_dim": 24,
+        "qk_rope_head_dim": 8,
+        "v_head_dim": 16,
+        "norm_eps": 1e-6,
+        "rope_theta": 10000.0,
+        "vocab_size": 128,
+        "max_position_embeddings": 4096,
+        "moe": {
+            "expert_hidden_dim": 64,
+            "num_experts": 8,
+            "num_shared_experts": 1,
+            "num_experts_per_tok": 2,
+            "first_k_dense_replace": 3,
+        },
+        "vision_encoder": {
+            "hidden_size": 64,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "intermediate_size": 128,
+            "image_size": 28,
+            "patch_size": 14,
+            "rope_theta": 10000.0,
+            "image_token_id": 10,
+            "spatial_merge_size": 2,
+            "adapter_bias": False,
+        },
+    }
+
+    config = ModelConfig(**config_from_params(params))
+
+    assert config.text_config.moe_intermediate_size == 64
+    assert config.text_config.q_lora_rank == 32
+    assert config.text_config.first_k_dense_replace == 3
+    assert config.vision_config.head_dim == 32
+    assert config.image_token_id == 10
+
+
+def _mimo_v2_model():
+    from mlx_vlm.tests.test_models import DATA, build_config
+
+    module = importlib.import_module("mlx_vlm.models.mimo_v2")
+    case = next(c for c in DATA["cases"] if c["id"] == "TestModels.mimo_v2")
+    return module, module.Model(build_config(module, case["config"]))
+
+
+def test_mimo_v2_unfuses_tensor_parallel_qkv_shards():
+    module = importlib.import_module("mlx_vlm.models.mimo_v2")
+    text = module.TextConfig(
+        hidden_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=12,
+        num_key_value_heads=4,
+        head_dim=32,
+        v_head_dim=32,
+        swa_num_attention_heads=12,
+        swa_num_key_value_heads=4,
+        swa_head_dim=32,
+        swa_v_head_dim=32,
+        partial_rotary_factor=0.5,
+        hybrid_layer_pattern=[0, 1],
+        moe_layer_freq=[0, 0],
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+        vocab_size=32,
+        intermediate_size=64,
+        moe_intermediate_size=32,
+    )
+    language = module.language.LanguageModel(text)
+    sections = (("q", 96), ("k", 32), ("v", 32))
+    tags = {}
+    rows = []
+    for rank in range(4):
+        for name, count in sections:
+            tag = 56 + 4 * rank + {"q": 0, "k": 1, "v": 2}[name]
+            tags[name, rank] = tag
+            rows.append(mx.full((count, text.hidden_size), tag, dtype=mx.uint8))
+
+    out = language._unfuse_qkv(
+        {
+            "model.layers.0.self_attn.qkv_proj.weight": mx.concatenate(rows),
+            "model.layers.0.self_attn.qkv_proj.weight_scale_inv": mx.ones((8, 1)),
+        }
+    )
+
+    assert not any("qkv_proj" in key for key in out)
+    for projection, rows_per_shard in (
+        ("q_proj", 96),
+        ("k_proj", 32),
+        ("v_proj", 32),
+    ):
+        weight = out[f"model.layers.0.self_attn.{projection}.weight"]
+        assert weight.shape[0] == rows_per_shard * 4
+        for rank in range(4):
+            block = weight[rank * rows_per_shard : (rank + 1) * rows_per_shard]
+            expected = mx.from_fp8(
+                mx.full((1, 1), tags[projection[0], rank], dtype=mx.uint8),
+                dtype=mx.float32,
+            )
+            assert mx.allclose(block.astype(mx.float32), expected.astype(mx.float32))
+
+
+def test_mimo_v2_logits_to_keep():
+    _, model = _mimo_v2_model()
+    inputs = mx.zeros((2, 6), dtype=mx.int32)
+
+    full = model.language_model(inputs).logits
+    kept = model.language_model(inputs, logits_to_keep=1).logits
+
+    assert kept.shape == (2, 1, full.shape[-1])
+    assert mx.allclose(kept, full[:, -1:, :])
+
+
+def test_mimo_v2_batched_vision_attention_matches_independent_sequences():
+    from mlx_vlm.models.mimo_v2.config import VisionConfig
+    from mlx_vlm.models.mimo_v2.vision import VisionAttention
+
+    attention = VisionAttention(
+        VisionConfig(
+            hidden_size=64,
+            num_heads=4,
+            num_key_value_heads=2,
+            qk_channels=16,
+        ),
+        use_sinks=True,
+        window_size=4,
+    )
+    q = mx.random.normal((3, 8, 4, 16))
+    k = mx.random.normal((3, 8, 2, 16))
+    v = mx.random.normal((3, 8, 2, 16))
+
+    batched = attention._attend(q, k, v, full_attn=False)
+    independent = mx.concatenate(
+        [
+            attention._attend(q[i : i + 1], k[i : i + 1], v[i : i + 1], False)
+            for i in range(3)
+        ],
+        axis=0,
+    )
+
+    assert mx.allclose(batched, independent)
+
+
+def test_mimo_v2_combines_image_video_and_audio_features():
+    _, model = _mimo_v2_model()
+    config = model.config
+    vision = config.vision_config
+    patch_width = (
+        vision.in_channels
+        * vision.temporal_patch_size
+        * vision.patch_size
+        * vision.patch_size
+    )
+    image_pixels = mx.random.normal((16, patch_width))
+    image_grid = mx.array([[1, 4, 4]])
+    video_pixels = mx.random.normal((32, patch_width))
+    video_grid = mx.array([[2, 4, 4]])
+    audio_codes = mx.array([[1, 2], [3, 4], [5, 6]])
+    image = model.encode_images(image_pixels, image_grid_thw=image_grid)[0]
+    video = model.encode_video(video_pixels, video_grid)
+    audio = model.encode_audio(audio_codes)
+    ids = mx.array(
+        [
+            [1]
+            + [config.image_token_id] * image.shape[0]
+            + [2]
+            + [config.video_token_id] * video.shape[0]
+            + [3]
+            + [config.audio_token_id] * audio.shape[0]
+            + [4]
+        ]
+    )
+
+    result = model.get_input_embeddings(
+        ids,
+        pixel_values=image_pixels,
+        image_grid_thw=image_grid,
+        pixel_values_videos=video_pixels,
+        video_grid_thw=video_grid,
+        audio_codes=audio_codes,
+    ).inputs_embeds[0]
+    image_start = 1
+    video_start = image_start + image.shape[0] + 1
+    audio_start = video_start + video.shape[0] + 1
+
+    assert mx.allclose(result[image_start : image_start + image.shape[0]], image)
+    assert mx.allclose(result[video_start : video_start + video.shape[0]], video)
+    assert mx.allclose(result[audio_start : audio_start + audio.shape[0]], audio)
+
+
 # Attention kernels
 
 # Dims chosen only to steer the gate; they do not affect the attention maths.

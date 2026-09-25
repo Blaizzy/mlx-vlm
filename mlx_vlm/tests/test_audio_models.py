@@ -45,6 +45,28 @@ qwen_omni = _model_module("qwen3_omni_moe")
 omni_language = _model_module("qwen3_omni_moe.language")
 
 
+def test_mimo_v2_encodes_batched_audio_samples_independently():
+    from mlx_vlm.tests.test_models import DATA, build_config
+
+    module = _model_module("mimo_v2")
+    case = next(c for c in DATA["cases"] if c["id"] == "TestModels.mimo_v2")
+    model = module.Model(build_config(module, case["config"]))
+    first = mx.array([[1, 2], [3, 4], [5, 6], [7, 8]])
+    second = mx.array([[8, 7], [6, 5], [4, 3], [2, 1]])
+    expected = mx.concatenate(
+        [model.encode_audio(first), model.encode_audio(second)], axis=0
+    )
+    ids = mx.array([[model.config.audio_token_id] * expected.shape[0]])
+
+    result = model.get_input_embeddings(
+        ids,
+        audio_codes=mx.concatenate([first, second], axis=0),
+        audio_code_lengths=[first.shape[0], second.shape[0]],
+    ).inputs_embeds
+
+    assert mx.allclose(result[0], expected)
+
+
 # Audio model components
 
 
