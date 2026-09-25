@@ -1,9 +1,15 @@
-"""Text and vision extraction, privacy tagging, checkpoints, and quantized inference."""
+"""Text, vision and 3D extraction, privacy tagging, checkpoints, and quantized inference."""
 
 from __future__ import annotations
 
+import asyncio
+import io
 import json
+import pickle
+import tempfile
+import threading
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -19,6 +25,8 @@ from mlx_vlm.gliner import (
     _schema_tokens,
     _WhitespaceSplitter,
 )
+from mlx_vlm.models.bert import ModelConfig as BertConfig
+from mlx_vlm.models.bert import TokenClassificationModel as BertTokenClassifier
 from mlx_vlm.models.gliner2_5 import Model as GlinerModel
 from mlx_vlm.models.gliner2_5 import ModelConfig as GlinerConfig
 from mlx_vlm.models.gliner2_5.boundary import (
@@ -29,7 +37,20 @@ from mlx_vlm.models.gliner2_5.boundary import (
 )
 from mlx_vlm.models.openai_privacy_filter import Model as PrivacyModel
 from mlx_vlm.models.openai_privacy_filter import ModelConfig as PrivacyConfig
-from mlx_vlm.privacy_filter import PrivacyFilter
+from mlx_vlm.privacy_filter import (
+    VITERBI_BIAS_KEYS,
+    PrivacyFilter,
+    ViterbiDecoder,
+    _load_transition_biases,
+    load_privacy_filter,
+)
+from mlx_vlm.token_classification import (
+    TokenClassifier,
+    build_label_info,
+    decode_spans,
+    load_token_classification_model,
+    load_token_classifier,
+)
 from mlx_vlm.utils import get_model_and_args, load_config
 
 
@@ -411,6 +432,261 @@ def test_high_level_api_returns_offsets_and_redacted_text():
     ]
     assert result.redacted_text == ("<PRIVATE_PERSON> emailed <PRIVATE_EMAIL>")
     assert result.to_dict()["spans"][0]["text"] == "Alice"
+
+
+BIO_LABELS = {0: "O", 1: "B-NAME", 2: "I-NAME", 3: "B-PHONE", 4: "I-PHONE"}
+
+
+def _bert_token_config(**overrides):
+    values = {
+        "model_type": "bert",
+        "vocab_size": 64,
+        "hidden_size": 64,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "intermediate_size": 128,
+        "max_position_embeddings": 32,
+        "num_labels": len(BIO_LABELS),
+        "id2label": BIO_LABELS,
+    }
+    values.update(overrides)
+    return values
+
+
+def test_bert_token_classifier_scores_every_token():
+    model = BertTokenClassifier(BertConfig.from_dict(_bert_token_config()))
+    ids = mx.array([[2, 5, 6, 7, 3], [2, 8, 3, 0, 0]], dtype=mx.int32)
+    mask = mx.array([[1, 1, 1, 1, 1], [1, 1, 1, 0, 0]], dtype=mx.int32)
+    logits = model(ids, attention_mask=mask).logits
+    mx.eval(logits)
+    assert logits.shape == (2, 5, len(BIO_LABELS))
+    assert mx.all(mx.isfinite(logits)).item()
+
+    weights = model.sanitize(
+        {
+            "bert.embeddings.word_embeddings.weight": mx.zeros((64, 64)),
+            "bert.pooler.dense.weight": mx.zeros((64, 64)),
+            "cls.predictions.bias": mx.zeros((64,)),
+            "classifier.weight": mx.zeros((5, 64)),
+        }
+    )
+    assert sorted(weights) == [
+        "classifier.weight",
+        "embeddings.word_embeddings.weight",
+    ]
+
+
+BERT_EMBEDDING_PATHS = (
+    "embeddings.word_embeddings",
+    "embeddings.position_embeddings",
+    "embeddings.token_type_embeddings",
+)
+BERT_VOCAB = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]", "call", "at", "mc"]
+BERT_VOCAB += ["##kay", "ada", "-", ",", "617", "555"]
+
+
+def _write_bert_token_checkpoint(root):
+    """Save a mixed-bit (8-bit embeddings, 4-bit linears) BERT token classifier."""
+    from transformers import BertTokenizerFast
+
+    config = _bert_token_config(architectures=["BertForTokenClassification"])
+    model = BertTokenClassifier(BertConfig.from_dict(config))
+    nn.quantize(
+        model,
+        class_predicate=lambda path, module: (
+            {"group_size": 32, "bits": 8}
+            if path in BERT_EMBEDDING_PATHS
+            else (
+                {"group_size": 32, "bits": 4}
+                if isinstance(module, nn.Linear)
+                else False
+            )
+        ),
+    )
+    mx.save_safetensors(
+        str(root / "model.safetensors"), dict(tree_flatten(model.parameters()))
+    )
+    config["id2label"] = {str(k): v for k, v in BIO_LABELS.items()}
+    config["quantization"] = {
+        "group_size": 32,
+        "bits": 4,
+        **{path: {"group_size": 32, "bits": 8} for path in BERT_EMBEDDING_PATHS},
+    }
+    (root / "config.json").write_text(json.dumps(config))
+    (root / "vocab.txt").write_text("\n".join(BERT_VOCAB) + "\n")
+    BertTokenizerFast(vocab_file=str(root / "vocab.txt")).save_pretrained(root)
+    return model
+
+
+def test_mixed_bit_token_classifier_checkpoint_loads(tmp_path):
+    """Per-module quantization overrides must reach the encoder loader.
+
+    Embeddings stored at 8 bits next to 4-bit linears used to be re-quantized
+    with the global 4-bit setting and fail with a packed-shape mismatch.
+    """
+    model = _write_bert_token_checkpoint(tmp_path)
+
+    loaded = load_token_classification_model(tmp_path)
+
+    assert loaded.embeddings.word_embeddings.bits == 8
+    assert loaded.encoder.layer[0].attention.self.query.bits == 4
+    ids = mx.array([[2, 5, 6, 7, 3]], dtype=mx.int32)
+    expected = model(ids).logits
+    actual = loaded(ids).logits
+    assert mx.array_equal(actual, expected).item()
+
+
+def test_privacy_filter_loader_runs_bio_token_classifiers(tmp_path):
+    """``load_privacy_filter`` routes BERT checkpoints to the shared pipeline."""
+    _write_bert_token_checkpoint(tmp_path)
+    text = "call Ada at 617-555, McKay"
+
+    direct = load_token_classifier(tmp_path)
+    routed = load_privacy_filter(str(tmp_path))
+
+    assert type(routed) is TokenClassifier
+    assert (direct.prefix_ids, direct.suffix_ids) == ([2], [3])
+    assert routed(text).to_dict() == direct(text).to_dict()
+    with pytest.raises(ValueError, match="Viterbi"):
+        load_privacy_filter(str(tmp_path), operating_point="high_recall")
+
+
+def test_bio_labels_are_shared_but_viterbi_requires_bioes():
+    info = build_label_info(list(BIO_LABELS.values()))
+    assert info.span_names == ("O", "NAME", "PHONE")
+    assert info.states_by_span["NAME"] == {"B": 1, "I": 2}
+    with pytest.raises(ValueError, match="missing"):
+        ViterbiDecoder(list(BIO_LABELS.values()))
+    with pytest.raises(ValueError, match="expected BIO or BIOES"):
+        build_label_info(["O", "NAME"])
+
+
+def test_token_spans_group_subwords_and_touching_words():
+    """A word is tagged if any piece is: ``Mc`` is ``O`` but ``##Kay`` is a name."""
+    text = "call Mary Ann Smith at 617-555 now, McKay"
+    tokens = [
+        ((0, 4), 0, "O"),
+        ((5, 7), 1, "B-NAME"),
+        ((7, 9), 1, "B-NAME"),
+        ((10, 13), 2, "B-NAME"),
+        ((14, 19), 3, "I-NAME"),
+        ((20, 22), 4, "O"),
+        ((23, 26), 5, "B-PHONE"),
+        ((26, 27), 6, "B-PHONE"),
+        ((27, 30), 7, "I-PHONE"),
+        ((31, 34), 8, "O"),
+        ((34, 35), 9, "O"),
+        ((36, 38), 10, "O"),
+        ((38, 41), 10, "B-NAME"),
+    ]
+    offsets, word_ids, tags = zip(*tokens)
+    label_ids = {label: index for index, label in BIO_LABELS.items()}
+    path = [label_ids[tag] for tag in tags]
+    info = build_label_info(list(BIO_LABELS.values()))
+
+    spans = decode_spans(text, path, offsets, info, word_ids=word_ids)
+    token_level = decode_spans(text, path, offsets, info)
+
+    assert [(span.label, span.text) for span in spans] == [
+        ("NAME", "Mary"),
+        ("NAME", "Ann Smith"),
+        ("PHONE", "617-555"),
+        ("NAME", "McKay"),
+    ]
+    assert [span.text for span in token_level] == [
+        "Ma",
+        "ry",
+        "Ann Smith",
+        "617",
+        "-555",
+        "Kay",
+    ]
+
+
+class _Encoding(dict):
+    def __init__(self, word_ids, **kwargs):
+        super().__init__(**kwargs)
+        self._word_ids = word_ids
+
+    def word_ids(self):
+        return self._word_ids
+
+
+class _WordTokenizer:
+    """One token per whitespace word; capitalized words get id 3."""
+
+    cls_token_id = 101
+    sep_token_id = 102
+
+    def __call__(self, text, **kwargs):
+        words, offsets, start = text.split(), [], 0
+        for word in words:
+            start = text.index(word, start)
+            offsets.append((start, start + len(word)))
+            start += len(word)
+        return _Encoding(
+            list(range(len(words))),
+            input_ids=[3 if word[0].isupper() else 0 for word in words],
+            offset_mapping=offsets,
+        )
+
+
+class _CapitalizedNameModel:
+    def __init__(self):
+        self.config = SimpleNamespace(
+            id2label=BIO_LABELS, num_labels=len(BIO_LABELS), max_position_embeddings=4
+        )
+        self.windows = []
+
+    def eval(self):
+        return self
+
+    def __call__(self, input_ids, attention_mask=None):
+        ids = input_ids[0].tolist()
+        self.windows.append(ids)
+        logits = mx.full((1, len(ids), len(BIO_LABELS)), -10.0)
+        for position, token in enumerate(ids):
+            logits[0, position, 1 if token == 3 else 0] = 10.0
+        return SimpleNamespace(logits=logits)
+
+
+def test_token_classifier_windows_long_inputs_and_redacts():
+    model = _CapitalizedNameModel()
+    classifier = TokenClassifier(model, _WordTokenizer())
+
+    result = classifier("ask Ada and Grace or Linus today")
+
+    assert (classifier.context_size, classifier.window) == (4, 2)
+    assert [len(window) for window in model.windows] == [4, 4, 4, 3]
+    assert all(w[0] == 101 and w[-1] == 102 for w in model.windows)
+    assert [span.text for span in result.spans] == ["Ada", "Grace", "Linus"]
+    assert result.redacted_text == "ask <NAME> and <NAME> or <NAME> today"
+    assert classifier("ask Ada", keep_labels=("NAME",)).redacted_text == "ask Ada"
+    with pytest.raises(ValueError, match="decode must be 'argmax'"):
+        classifier("ask Ada", decode="viterbi")
+
+
+def test_viterbi_calibration_operating_points(tmp_path):
+    assert _load_transition_biases(tmp_path, "default") == dict.fromkeys(
+        VITERBI_BIAS_KEYS, 0.0
+    )
+    biases = {key: float(index) for index, key in enumerate(VITERBI_BIAS_KEYS)}
+    calibration = {"operating_points": {"high_recall": {"biases": biases}}}
+    (tmp_path / "viterbi_calibration.json").write_text(json.dumps(calibration))
+
+    assert _load_transition_biases(tmp_path, "high_recall") == biases
+    with pytest.raises(ValueError, match="operating point"):
+        _load_transition_biases(tmp_path, "default")
+
+
+def test_privacy_filter_keeps_labels_and_rejects_unknown_decode():
+    detector = PrivacyFilter(_PrivacyModel(), _PrivacyTokenizer())
+
+    kept = detector("Alice emailed bob@example.com", keep_labels=("private_email",))
+
+    assert kept.redacted_text == "<PRIVATE_PERSON> emailed bob@example.com"
+    with pytest.raises(ValueError, match="decode must be 'viterbi' or 'argmax'"):
+        detector("Alice emailed bob@example.com", decode="beam")
 
 
 class TestSapiens2(unittest.TestCase):
@@ -1047,3 +1323,683 @@ class TestSapiens2(unittest.TestCase):
             outs = list(seg.stream(path))
             self.assertEqual(len(outs), 3)
             self.assertEqual(outs[0]["segmentation"].shape, (24, 32))
+
+
+class TestSAM3DObjects(unittest.TestCase):
+    """Image-plus-mask to 3D: bundle loading, the sparse flow kernels, sampling,
+    mesh extraction and the streaming pipeline, on a tiny random model."""
+
+    def setUp(self):
+        self._device = mx.default_device()
+        # Reference comparisons run in FP32, independent of Metal kernel precision.
+        mx.set_default_device(mx.cpu)
+
+    def tearDown(self):
+        mx.set_default_device(self._device)
+
+    def _config(self, **overrides):
+        from mlx_vlm.models.sam3d_objects import ModelConfig
+
+        args = dict(
+            hidden_size=32,
+            num_heads=4,
+            num_blocks=1,
+            cond_channels=32,
+            latent_resolution=2,
+            resolution=8,
+            io_channels=8,
+            decoder_channels=32,
+            decoder_heads=4,
+            decoder_blocks=2,
+            window_size=2,
+            structure_channels=[32, 16, 8],
+            structure_res_blocks=1,
+            dino_hidden_size=32,
+            dino_heads=4,
+            dino_layers=1,
+            dino_image_size=28,
+            image_size=28,
+            point_size=16,
+            point_patch_size=4,
+            point_channels=32,
+            point_heads=4,
+            ss_steps=2,
+            slat_steps=2,
+        )
+        args.update(overrides)
+        return ModelConfig(**args)
+
+    @staticmethod
+    def _depth_config():
+        """A tiny MoGe-3 configuration in the bundle's ``config.json`` form."""
+        import dataclasses
+
+        from mlx_vlm.models.moge3.config import (
+            ConvStackConfig,
+            EncoderConfig,
+            ModelConfig,
+            RefinerConfig,
+            ScaleHeadConfig,
+        )
+
+        dims = [16, 8, 4]
+
+        def stack(dim_in, dim_out=None):
+            return ConvStackConfig(
+                dim_in=dim_in,
+                dim_res_blocks=list(dims),
+                dim_out=dim_out,
+                num_res_blocks=[0, 1, 0],
+                res_block_in_norm="none",
+                res_block_hidden_norm="none",
+                resamplers=["conv_transpose", "bilinear"],
+            )
+
+        config = ModelConfig(
+            encoder=EncoderConfig(
+                backbone="dinov2_vits14",
+                intermediate_layers=[0, 1],
+                dim_out=16,
+                depth=2,
+                embed_dim=32,
+                num_heads=4,
+            ),
+            neck=stack([18, 2, 2]),
+            points_head=stack(list(dims), [None, None, 3]),
+            mask_head=stack(list(dims), [None, None, 1]),
+            normal_head=None,
+            scale_head=ScaleHeadConfig(dims=[32, 16, 1]),
+            refiner=RefinerConfig(
+                encoder_channels=18,
+                model_channels=[8, 16, 32],
+                downsample_factors=[2, 2],
+                encoder_downsample=4,
+            ),
+        )
+        return dataclasses.asdict(config)
+
+    @staticmethod
+    def _cutout(height=48, width=64):
+        """An RGBA object cutout whose alpha channel is the mask."""
+        rgba = np.random.default_rng(0).integers(0, 255, (height, width, 4), np.uint8)
+        rgba[..., 3] = 0
+        rgba[10:40, 20:50, 3] = 255
+        return mx.array(rgba)
+
+    @staticmethod
+    def _bundle(root, config, weights):
+        """Write a converted bundle: config, one shard and its index."""
+        root = Path(root)
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "config.json").write_text(json.dumps(config.to_dict()))
+        mx.save_safetensors(str(root / "model.safetensors"), weights)
+        index = {
+            "metadata": {"total_size": 0},
+            "weight_map": {k: "model.safetensors" for k in weights},
+        }
+        (root / "model.safetensors.index.json").write_text(json.dumps(index))
+        return root
+
+    def test_config_routes_and_round_trips(self):
+        """The shared loader resolves the package; ``depth_model`` is None, a
+        MoGe-3 configuration (``{}`` selects the released ViT-L one) that
+        survives ``to_dict``/``from_dict``, or a rejected MoGe-v1 flag."""
+        from mlx_vlm.models import sam3d_objects
+        from mlx_vlm.models.sam3d_objects import ModelConfig
+        from mlx_vlm.utils import get_model_and_args
+
+        module, model_type = get_model_and_args({"model_type": "sam3d_objects"})
+        self.assertIs(module, sam3d_objects)
+        self.assertEqual(model_type, "sam3d_objects")
+        self.assertIsNone(ModelConfig().depth_model)
+        released = ModelConfig(depth_model={}).depth_model
+        self.assertEqual(released.encoder.backbone, "dinov2_vitl14")
+        self.assertEqual(released.encoder.embed_dim, 1024)
+        # Bundles converted with the retired MoGe-v1 model declared it as true.
+        with self.assertRaisesRegex(ValueError, "MoGe-v1"):
+            ModelConfig.from_dict({"depth_model": True})
+        config = self._config(depth_model=self._depth_config())
+        self.assertEqual(ModelConfig.from_dict(config.to_dict()), config)
+
+    def test_bundle_loads_frozen_strict_and_in_bf16(self):
+        """A converted bundle loads through ``from_pretrained`` and the shared
+        ``load_model`` with its bf16 weights intact; the model is inference-only
+        and a shard missing a tensor is rejected rather than left random."""
+        from mlx_vlm.models.sam3d_objects import Model
+        from mlx_vlm.utils import load_model
+
+        model = Model(self._config())
+        self.assertEqual(tree_flatten(model.trainable_parameters()), [])
+        with self.assertRaisesRegex(ValueError, "inference-only"):
+            model.train()
+        weights = {
+            k: v.astype(mx.bfloat16) for k, v in tree_flatten(model.parameters())
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._bundle(directory, model.config, weights)
+            for loaded in (Model.from_pretrained(root), load_model(root)):
+                self.assertEqual(tree_flatten(loaded.trainable_parameters()), [])
+                for name, value in tree_flatten(loaded.parameters()):
+                    self.assertEqual(value.dtype, mx.bfloat16)
+                    self.assertTrue(mx.array_equal(value, weights[name]).item(), name)
+            weights.pop(next(iter(weights)))
+            mx.save_safetensors(str(root / "model.safetensors"), weights)
+            with self.assertRaises(ValueError):
+                Model.from_pretrained(root)
+
+    def test_add_depth_extends_a_bundle_with_moge3_weights(self):
+        """``convert.add_depth`` records the MoGe-3 configuration and adds a
+        ``moge.safetensors`` shard (torch ConvTranspose layout relaid, cast to
+        the requested dtype) that loads back exactly; legacy MoGe-v1 bundles are
+        rejected at load time."""
+        from mlx_vlm.models.sam3d_objects import Model
+        from mlx_vlm.models.sam3d_objects.convert import add_depth
+
+        depth_config = self._depth_config()
+        depth = Model(self._config(depth_model=depth_config)).depth_model
+        depth_weights = dict(tree_flatten(depth.parameters()))
+        base = Model(self._config())
+        base_weights = dict(tree_flatten(base.parameters()))
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._bundle(Path(directory) / "bundle", base.config, base_weights)
+            source = Path(directory) / "moge3"
+            source.mkdir()
+            (source / "config.json").write_text(json.dumps(depth_config))
+            torch_layout = {
+                k: v.transpose(3, 0, 1, 2) if k.endswith("resamplers.0.0.weight") else v
+                for k, v in depth_weights.items()
+            }
+            mx.save_safetensors(str(source / "model.safetensors"), torch_layout)
+            add_depth(source, root, dtype="bfloat16")
+            config = json.loads((root / "config.json").read_text())
+            self.assertEqual(config["depth_model"], depth_config)
+            index = json.loads((root / "model.safetensors.index.json").read_text())
+            self.assertEqual(
+                index["weight_map"]["depth_model.neck.resamplers.0.0.weight"],
+                "moge.safetensors",
+            )
+            loaded = Model.from_pretrained(root)
+            for name, value in tree_flatten(loaded.depth_model.parameters()):
+                self.assertEqual(value.dtype, mx.bfloat16)
+                expected = depth_weights[name].astype(mx.bfloat16)
+                self.assertTrue(mx.array_equal(value, expected).item(), name)
+            for name, value in tree_flatten(loaded.parameters()):
+                if not name.startswith("depth_model."):
+                    self.assertTrue(mx.array_equal(value, base_weights[name]).item())
+            config["depth_model"] = True
+            (root / "config.json").write_text(json.dumps(config))
+            with self.assertRaisesRegex(ValueError, "MoGe-v1"):
+                Model.from_pretrained(root)
+
+    def test_prepare_inputs_accepts_documented_image_and_mask_forms(self):
+        """Masks may be boolean, 0/1 or 0/255 arrays or the alpha channel, and
+        uint8 or [0, 1] floating pixels agree; crop and full views come out
+        square at the model size; a point map is normalized by the masked
+        (lower) median, which is kept for pose decoding."""
+        from mlx_vlm.models.sam3d_objects.processing import prepare_inputs
+
+        image = self._cutout()
+        reference, metadata = prepare_inputs(image, None, size=28)
+        self.assertEqual(
+            {k: v.shape for k, v in reference.items() if v is not None},
+            {
+                "image": (1, 28, 28, 3),
+                "rgb_image": (1, 28, 28, 3),
+                "mask": (1, 28, 28, 1),
+                "rgb_image_mask": (1, 28, 28, 1),
+            },
+        )
+        self.assertFalse(metadata["pointmap_conditioned"])
+        alpha = image[..., 3]
+        pixels = image[..., :3].astype(mx.float32) / 255
+        masks = (alpha > 0, (alpha > 0).astype(mx.uint8), alpha, alpha / 255)
+        for mask in masks:
+            inputs, _ = prepare_inputs(pixels, mask, size=28)
+            for key, value in reference.items():
+                same = value is None or mx.array_equal(inputs[key], value).item()
+                self.assertTrue(same, key)
+        thin = mx.zeros(alpha.shape, mx.bool_)
+        thin[20, 20:40] = True
+        for bad_image, bad_mask in (
+            (image[..., :3], None),  # no mask and no alpha channel
+            (image[..., :3].astype(mx.float32), alpha),  # floating pixels above 1
+            (image, thin),  # foreground spanning a single row
+        ):
+            with self.assertRaises(ValueError):
+                prepare_inputs(bad_image, bad_mask, size=28)
+        xs, ys = mx.meshgrid(mx.arange(64.0), mx.arange(48.0), indexing="xy")
+        pointmap = mx.stack([xs, ys, mx.full(xs.shape, 5.0)], axis=-1)
+        inputs, metadata = prepare_inputs(image, None, pointmap, size=28)
+        self.assertTrue(metadata["pointmap_conditioned"])
+        self.assertEqual(metadata["pointmap_shift"].tolist(), [34.0, 24.0, 5.0])
+        self.assertGreater(metadata["pointmap_scale"][0].item(), 0)
+        self.assertEqual(inputs["pointmap"].shape, (1, 28, 28, 3))
+        self.assertEqual(inputs["rgb_pointmap"].shape, (1, 28, 28, 3))
+
+    def test_estimate_pointmap_uses_sam_camera_convention(self):
+        """The depth adapter is the shared MoGe-3 model: its point map (recovered
+        shift, no forced projection) mirrored from OpenCV to SAM's PyTorch3D
+        camera (+X left, +Y up), NaN where MoGe masks it out."""
+        from mlx_vlm.models.moge3.moge3 import Model as MoGe3
+        from mlx_vlm.models.sam3d_objects import Model
+        from mlx_vlm.models.sam3d_objects.depth import estimate_pointmap
+
+        depth = Model(self._config(depth_model=self._depth_config())).depth_model
+        self.assertIsInstance(depth, MoGe3)
+        image = self._cutout()
+        pointmap = estimate_pointmap(depth, image, num_tokens=12)
+        reference = depth.infer(
+            image[..., :3].astype(mx.float32) / 255,
+            num_tokens=12,
+            force_projection=False,
+            apply_mask=False,
+        )
+        flipped = reference["points"] * mx.array([-1.0, -1.0, 1.0])
+        expected = mx.where(reference["mask"][..., None], flipped, float("nan"))
+        self.assertEqual(pointmap.shape, (48, 64, 3))
+        self.assertTrue(mx.allclose(pointmap, expected, equal_nan=True).item())
+
+    def test_stream_events_and_outputs(self):
+        """``stream`` yields the staged event protocol the CLI relays and an
+        evaluated result: sparse coords with latents, a unit-quaternion pose,
+        and the requested Gaussian and mesh decodes. A bundled depth model
+        conditions on an estimated point map unless ``estimate_depth`` is off."""
+        from mlx_vlm.models.sam3d_objects import Model
+        from mlx_vlm.models.sam3d_objects.pipeline import Pipeline, Request
+
+        # Fixed random weights keep the run reproducible; every probed seed
+        # produced occupied voxels, so the structure decoder never comes up empty.
+        mx.random.seed(0)
+        config = self._config(depth_model=self._depth_config(), depth_num_tokens=12)
+        pipeline = Pipeline(Model(config))
+        image = self._cutout()
+        request = Request(image, formats=("gaussian", "gaussian_4", "mesh"))
+        events = list(pipeline.stream(request))
+        self.assertEqual(
+            [event.stage for event in events],
+            ["depth", "conditioning", "structure", "structure", "occupancy"]
+            + ["latent", "latent", "gaussian", "gaussian_4", "mesh", "complete"],
+        )
+        self.assertEqual(events[0].data["pointmap"].shape, (48, 64, 3))
+        result = events[-1].data
+        self.assertTrue(result["pointmap_conditioned"])
+        count = result["coords"].shape[0]
+        self.assertGreater(count, 0)
+        self.assertEqual(result["latents"].shape, (count, config.latent_channels))
+        voxels = result["coords"][:, 1:]
+        self.assertTrue(mx.all((voxels >= 0) & (voxels < config.resolution)).item())
+        pose = result["pose"]
+        self.assertAlmostEqual(mx.linalg.norm(pose["rotation"]).item(), 1.0, places=5)
+        rotation = pose["rotation_matrix"]
+        self.assertTrue(mx.allclose(rotation.T @ rotation, mx.eye(3), atol=1e-5).item())
+        self.assertEqual((pose["translation"].shape, pose["scale"].shape), ((3,), (3,)))
+        for kind, per_voxel in (("gaussian", 32), ("gaussian_4", 4)):
+            rows = count * per_voxel
+            self.assertEqual(
+                {key: value.shape for key, value in result[kind].items()},
+                {
+                    "positions": (rows, 3),
+                    "sh_dc": (rows, 3),
+                    "scales": (rows, 3),
+                    "rotations": (rows, 4),
+                    "opacities": (rows, 1),
+                },
+            )
+        mesh = result["mesh"]
+        vertices = mesh["vertices"].shape[0]
+        self.assertGreater(vertices, 0)
+        self.assertEqual(mesh["vertex_colors"].shape, (vertices, 6))
+        self.assertEqual((mesh["faces"].dtype, mesh["faces"].shape[1]), (mx.int32, 3))
+        self.assertTrue(mx.all(mesh["faces"] < vertices).item())
+        # Without depth estimation the conditioner uses its trained point-map dropout.
+        result = pipeline.generate(image, estimate_depth=False, formats=("mesh",))
+        self.assertFalse(result["pointmap_conditioned"])
+        self.assertEqual(
+            set(result), {"coords", "latents", "pose", "pointmap_conditioned", "mesh"}
+        )
+
+    def test_sparse_conv_and_pool_match_dense_references(self):
+        """Sparse convolution equals the dense ``conv3d`` gathered at the active
+        voxels, ``from_parents`` equals convolving the rows expanded from the
+        parent grid, and pooling averages each 2x2x2 block the way torch's
+        scatter mean does (its initial zero counts)."""
+        from mlx_vlm.models.sam3d_objects.sparse import Grid, SparseConv, pool
+
+        coords = mx.array([[0, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 1], [0, 2, 2, 2]])
+        x = mx.arange(8, dtype=mx.float32).reshape(4, 2) / 8
+        conv = SparseConv(2, 3)
+        dense = mx.zeros((1, 3, 3, 3, 2))
+        dense[coords[:, 0], coords[:, 1], coords[:, 2], coords[:, 3]] = x
+        expected = conv.conv(dense)[
+            coords[:, 0], coords[:, 1], coords[:, 2], coords[:, 3]
+        ]
+        self.assertTrue(
+            mx.allclose(conv(x, Grid(coords, 3)), expected, atol=1e-6).item()
+        )
+
+        coords = mx.array(
+            [
+                [0, i, j, k]
+                for i in range(4)
+                for j in range(4)
+                for k in range(4)
+                if (i + j + k) % 5
+            ]
+        )
+        grid = Grid(coords, 4)
+        child, parent = grid.downsample()
+        x = mx.random.normal((child.coords.shape[0], 6))
+        for kernel in (3, 1):
+            conv = SparseConv(6, 5, kernel=kernel)
+            want = conv(x[parent], grid)
+            got = conv.from_parents(x, parent, grid)
+            self.assertTrue(mx.allclose(got, want, atol=1e-5).item())
+
+        cube = mx.array(
+            [[0, i, j, k] for i in range(2) for j in range(2) for k in range(2)]
+        )
+        values, child, parent = pool(mx.full((8, 1), 7.0), Grid(cube, 2))
+        self.assertEqual((child.coords.shape, parent.tolist()), ((1, 4), [0] * 8))
+        self.assertAlmostEqual(values.item(), 8 * 7 / 9, places=5)
+
+    def test_window_attention_matches_masked_dense_attention(self):
+        """Shifted window attention over sparse voxels equals dense attention
+        masked to voxels sharing a window."""
+        from mlx_vlm.models.sam3d_objects.layers import attend
+        from mlx_vlm.models.sam3d_objects.sparse import Grid, window_attention
+
+        coords = mx.array([[0, i, j, 0] for i in range(4) for j in range(3)])
+        qkv = mx.random.normal((len(coords), 3, 2, 4))
+        grid = Grid(coords, 4)
+        for shift in (0, 1):
+            windows = (coords[:, 1:] + shift) // 2
+            mask = mx.all(windows[:, None] == windows[None, :], axis=-1)[None, None]
+            expected = attend(*(qkv[None, :, i] for i in range(3)), mask=mask)[0]
+            actual = window_attention(qkv, grid, 2, shift)
+            self.assertTrue(mx.allclose(actual, expected, atol=1e-5).item())
+
+    def test_prepared_and_guided_conditions_match_plain_calls(self):
+        """Per-request condition projection (``prepare_condition``; None is the
+        classifier-free zero condition) and the batched ``guided`` pass give the
+        same velocities as plain calls of both flows on raw tokens."""
+        from mlx_vlm.models.sam3d_objects import Model
+        from mlx_vlm.models.sam3d_objects.flow import LATENTS
+        from mlx_vlm.models.sam3d_objects.sparse import Grid
+
+        config = self._config()
+        model = Model(config)
+        tokens = mx.random.normal((1, 5, config.cond_channels))
+        raw = (tokens, mx.zeros_like(tokens))
+        time = mx.array([250.0])
+        state = {
+            n: mx.random.normal(
+                (1, config.latent_resolution**3 if n == "shape" else 1, c)
+            )
+            for n, c in LATENTS.items()
+        }
+        structure = model.ss_generator
+        prepared = [structure.prepare_condition(t) for t in (tokens, None)]
+        plain = [structure(state, time, t, mx.zeros(1)) for t in raw]
+        guided = structure.guided(state, time, *prepared, mx.zeros(1))
+        for condition, batched, want in zip(prepared, guided, plain):
+            single = structure(state, time, condition, mx.zeros(1))
+            for name in want:
+                for got in (single[name], batched[name]):
+                    self.assertTrue(
+                        mx.allclose(got, want[name], atol=1e-5).item(), name
+                    )
+
+        coords = mx.array(
+            [[0, i, j, k] for i in range(4) for j in range(4) for k in range(2)]
+        )
+        grid = Grid(coords, 8)
+        latent = mx.random.normal((coords.shape[0], config.latent_channels))
+        sparse = model.slat_generator
+        prepared = [sparse.prepare_condition(t) for t in (tokens, None)]
+        plain = [sparse(latent, grid, time, t) for t in raw]
+        guided = sparse.guided(latent, grid, time, *prepared)
+        for condition, batched, want in zip(prepared, guided, plain):
+            for got in (sparse(latent, grid, time, condition), batched):
+                self.assertTrue(mx.allclose(got, want, atol=1e-5).item())
+
+    def test_share_backbones_requires_identical_dino_weights(self):
+        """Distinct backbones stay separate; once the condition encoders hold
+        identical DINO weights they share one module and one per-request
+        feature cache without changing their embeddings."""
+        from mlx_vlm.models.sam3d_objects import Model
+
+        model = Model(self._config())
+        self.assertFalse(model.share_backbones())
+        embedders = (model.ss_condition_embedder, model.slat_condition_embedder)
+        first = embedders[0].module_list[0].backbone
+        for embedder in embedders:
+            for wrapper in embedder.module_list[:2]:
+                wrapper.backbone.update(first.parameters())
+        inputs = {
+            "image": mx.random.uniform(shape=(1, 28, 28, 3)),
+            "rgb_image": mx.random.uniform(shape=(1, 28, 28, 3)),
+            "mask": mx.random.uniform(shape=(1, 28, 28, 1)),
+            "rgb_image_mask": mx.random.uniform(shape=(1, 28, 28, 1)),
+            "pointmap": None,
+            "rgb_pointmap": None,
+        }
+        want = [embedder(inputs) for embedder in embedders]
+        self.assertTrue(model.share_backbones())
+        self.assertTrue(model.shared_backbone)
+        self.assertIs(embedders[1].module_list[1].backbone, first)
+        cache = {}
+        got = [embedder(inputs, cache=cache) for embedder in embedders]
+        self.assertEqual(set(cache), {"image", "rgb_image", "mask", "rgb_image_mask"})
+        for a, b in zip(got, want):
+            self.assertTrue(mx.allclose(a, b, atol=1e-6).item())
+
+    def test_dino_wrapper_matches_shared_backbone(self):
+        """The conditioner's DINO is the shared DINOv2 (ImageNet-normalized, cls
+        plus patch tokens without registers) with SAM's LayerNorm; features are
+        cached per request key, and the pre-norm variant keeps every token."""
+        from mlx_vlm.models.dinov2.dinov2 import Block
+        from mlx_vlm.models.sam3d_objects.layers import LayerNorm
+        from mlx_vlm.models.sam3d_objects.vision import Dino
+
+        config = self._config()
+        dino = Dino(config)
+        self.assertIsInstance(dino.backbone.blocks[0], Block)
+        self.assertIsInstance(dino.backbone.norm, LayerNorm)
+        image = mx.random.uniform(shape=(2, 28, 28, 3))
+        x = (image - mx.array([0.485, 0.456, 0.406])) / mx.array([0.229, 0.224, 0.225])
+        features = dino.backbone.forward_features(x)
+        expected = mx.concatenate(
+            [features["x_norm_clstoken"][:, None], features["x_norm_patchtokens"]],
+            axis=1,
+        )
+        self.assertEqual(expected.shape, (2, 5, 32))
+        self.assertTrue(mx.allclose(dino(image), expected, atol=1e-5).item())
+        cache = {}
+        first = dino(image, cache=cache, key="image")
+        self.assertEqual(list(cache), ["image"])
+        self.assertTrue(mx.array_equal(dino(None, cache=cache, key="image"), first))
+        prenorm = Dino(config, prenorm=True)
+        prenorm.update(dino.parameters())
+        self.assertEqual(prenorm(image).shape, (2, 9, 32))
+
+    def test_sampler_schedule_and_guidance(self):
+        """``schedule`` warps ``steps + 1`` times by the rescale factor and only
+        accepts positive integer step counts; ``sample`` takes Euler steps with
+        the ``(1 + s) * cond - s * uncond`` velocity while ``t <= 0.5`` and the
+        plain conditional velocity afterwards."""
+        from mlx_vlm.models.sam3d_objects.pipeline import sample, schedule
+
+        self.assertEqual(schedule(2, 3), [0, 0.25, 1])
+        for bad in (0, -1, 1.5, True):
+            with self.assertRaises(ValueError):
+                schedule(bad, 1)
+        seen = []
+
+        def flow(x, grid, time, condition):
+            seen.append(float(time.item()))
+            return mx.ones_like(x) * condition
+
+        outputs = list(sample(flow, mx.zeros((1, 1)), 4, 1, 2, mx.array(1.0)))
+        self.assertEqual(seen, [0, 0, 250, 250, 500, 500, 750])
+        self.assertAlmostEqual(outputs[-1][1].item(), 2.5)
+
+    def test_mesh_extraction_closes_a_sphere_and_skips_empty_surfaces(self):
+        """FlexiCubes extraction of a sphere SDF is a closed manifold (every
+        edge in exactly two non-degenerate faces); an all-outside field gives
+        no faces."""
+        from mlx_vlm.models.sam3d_objects.mesh import CORNERS, extract_mesh
+        from mlx_vlm.models.sam3d_objects.sparse import Grid
+
+        r = 6
+        coords = mx.array(
+            [[0, i, j, k] for i in range(r) for j in range(r) for k in range(r)]
+        )
+        corners = (coords[:, None, 1:] + mx.array(CORNERS)[None]) / r - 0.5
+        sdf = mx.sqrt(mx.sum(corners * corners, axis=-1)) - 0.3
+        features = mx.concatenate(
+            [sdf + 1 / r, mx.zeros((coords.shape[0], 93))], axis=-1
+        )
+        mesh = extract_mesh(features, Grid(coords, r))
+        self.assertGreater(mesh["vertices"].shape[0], 0)
+        edges = {}
+        for a, b, c in mesh["faces"].tolist():
+            self.assertEqual(len({a, b, c}), 3)
+            for pair in ((a, b), (b, c), (c, a)):
+                key = tuple(sorted(pair))
+                edges[key] = edges.get(key, 0) + 1
+        self.assertEqual(set(edges.values()), {2})
+        empty = extract_mesh(mx.ones_like(features), Grid(coords, r))
+        self.assertEqual(empty["faces"].shape, (0, 3))
+
+    def test_astream_pulls_lazily_and_releases_the_worker(self):
+        """Async iteration takes one request at a time from an async source,
+        rejects a concurrent stream, and releases the pipeline after ``aclose``
+        or task cancellation, so the same pipeline serves later requests."""
+        from mlx_vlm.models.sam3d_objects import Model
+        from mlx_vlm.models.sam3d_objects.pipeline import Event, Pipeline
+
+        started, release = threading.Event(), threading.Event()
+        release.set()
+
+        class FakePipeline(Pipeline):
+            def _run(self, request, cancel):
+                started.set()
+                release.wait(timeout=3)
+                for i in range(3):
+                    if cancel.is_set():
+                        return
+                    yield Event(str(request), "step", i, 3, {})
+
+        pipeline = FakePipeline(Model(self._config()))
+
+        async def run():
+            consumed = []
+
+            async def source():
+                for i in range(5):
+                    consumed.append(i)
+                    yield i
+
+            stream = pipeline.astream(source())
+            self.assertEqual((await anext(stream)).request_id, "0")
+            self.assertEqual(consumed, [0])
+            with self.assertRaises(RuntimeError):
+                next(pipeline.stream(None))
+            await stream.aclose()
+            events = [event async for event in pipeline.astream([7, 8])]
+            self.assertEqual([e.request_id for e in events], ["7"] * 3 + ["8"] * 3)
+            started.clear()
+            release.clear()
+            task = asyncio.create_task(anext(pipeline.astream([None])))
+            await asyncio.to_thread(started.wait)
+            task.cancel()
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            events = [event async for event in pipeline.astream([9])]
+            self.assertEqual([e.request_id for e in events], ["9"] * 3)
+
+        asyncio.run(run())
+
+    def test_checkpoint_unpickler_rejects_executable_globals(self):
+        """Torch checkpoints go through a restricted unpickler that only
+        resolves tensor storage classes, so a crafted pickle cannot import
+        ``os.system``."""
+        from mlx_vlm.models.sam3d_objects.checkpoint import TensorUnpickler
+
+        with self.assertRaises(pickle.UnpicklingError):
+            TensorUnpickler(io.BytesIO(b"cos\nsystem\n.")).load()
+
+    def test_cli_readers_and_writers(self):
+        """``read_image`` keeps alpha, ``read_mask`` reads alpha or gray as
+        booleans, ``write_gaussians`` emits the 17-field splat PLY (zero
+        normals, logit opacity, log scales) and ``write_obj`` colored vertices
+        with 1-based faces."""
+        from PIL import Image
+
+        from mlx_vlm.models.sam3d_objects.generate import (
+            read_image,
+            read_mask,
+            write_gaussians,
+            write_obj,
+        )
+
+        rgba = np.array([[[10, 20, 30, 0], [40, 50, 60, 255]]], np.uint8)
+        gaussian = {
+            "positions": mx.array([[0.0, 1.0, 2.0]]),
+            "sh_dc": mx.array([[0.1, 0.2, 0.3]]),
+            "scales": mx.array([[1.0, 2.0, 4.0]]),
+            "rotations": mx.array([[1.0, 0.0, 0.0, 0.0]]),
+            "opacities": mx.array([[0.5]]),
+        }
+        mesh = {
+            "vertices": mx.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+            "faces": mx.array([[0, 1, 2]], mx.int32),
+            "vertex_colors": mx.full((3, 6), 0.5),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            Image.fromarray(rgba, "RGBA").save(root / "cutout.png")
+            Image.fromarray(rgba[..., 3], "L").save(root / "mask.png")
+            Image.fromarray(rgba[..., :3], "RGB").save(root / "photo.jpg")
+            image = read_image(root / "cutout.png")
+            self.assertEqual((image.dtype, image.tolist()), (mx.uint8, rgba.tolist()))
+            self.assertEqual(read_image(root / "photo.jpg").shape, (1, 2, 3))
+            for name in ("cutout.png", "mask.png"):
+                self.assertEqual(read_mask(root / name).tolist(), [[False, True]])
+            write_gaussians(root / "object.ply", gaussian)
+            header, _, payload = (
+                (root / "object.ply").read_bytes().partition(b"end_header\n")
+            )
+            self.assertIn(b"element vertex 1\n", header)
+            self.assertEqual(header.count(b"property float "), 17)
+            expected = [
+                0,
+                1,
+                2,
+                0,
+                0,
+                0,
+                0.1,
+                0.2,
+                0.3,
+                0,
+                *np.log([1, 2, 4]),
+                1,
+                0,
+                0,
+                0,
+            ]
+            np.testing.assert_allclose(
+                np.frombuffer(payload, "<f4"), expected, atol=1e-6
+            )
+            write_obj(root / "object.obj", mesh)
+            self.assertEqual(
+                (root / "object.obj").read_text().splitlines(),
+                [
+                    "v 0 0 0 0.5 0.5 0.5",
+                    "v 1 0 0 0.5 0.5 0.5",
+                    "v 0 1 0 0.5 0.5 0.5",
+                    "f 1 2 3",
+                ],
+            )

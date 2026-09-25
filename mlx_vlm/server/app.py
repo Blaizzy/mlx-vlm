@@ -367,9 +367,43 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+def _reject_native_chat_model_for_audio(model_path: str) -> None:
+    """Reject chat/multimodal checkpoints pointed at the ``/v1/audio/*`` endpoints.
+
+    ``mlx_audio``'s loader autodetects an audio category partly from repo-name tokens
+    (its tts/stt models are named after backbones like ``qwen3``/``llama``/``glm``), so a
+    chat/omni model such as Qwen3-Omni is misrouted into a flat audio config and dies with
+    an opaque ``TypeError`` that surfaces as a 500. Gate on the config ``model_type`` instead:
+    if it resolves to one of mlx-vlm's own model families and ``mlx_audio`` does not recognize
+    the type as a genuine audio model, raise ``ValueError`` so the caller maps it to a 400.
+    """
+    from mlx_audio.utils import get_model_category
+
+    from ..utils import get_model_and_args, get_model_path, load_config
+
+    config = load_config(get_model_path(model_path, allow_patterns=["*.json"]))
+
+    raw_type = (config.get("model_type") or "").lower()
+    if raw_type and get_model_category(raw_type, [raw_type]):
+        return
+
+    try:
+        _, model_type = get_model_and_args(config)
+    except Exception:
+        return
+
+    raise ValueError(
+        f"{model_path!r} is a chat/multimodal model that mlx-vlm serves natively "
+        f"(model_type={model_type!r}); the /v1/audio/* endpoints only support dedicated "
+        "speech-to-text/text-to-speech checkpoints. To use audio with this model, send "
+        "POST /v1/chat/completions with an 'input_audio' content part."
+    )
+
+
 def load_audio_model(model_path: str):
     from mlx_audio.utils import load_model
 
+    _reject_native_chat_model_for_audio(model_path)
     return load_model(model_path)
 
 

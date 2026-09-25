@@ -39,3 +39,4 @@ class ModelConfig(BaseModelConfig):
     swa_head_dim: int
     swa_v_head_dim: int
     partial_rotary_factor: float
+    attention_value_scale: Optional[float] = None

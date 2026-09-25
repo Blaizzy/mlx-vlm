@@ -440,6 +440,7 @@ class _AudioProcessorStub:
 class Phi4MMProcessor(ProcessorMixin):
     """Combined processor for Phi4-Multimodal (tokenizer + NaFlex image + audio)."""
 
+    supports_multiple_audio = True
     attributes = ["image_processor", "tokenizer"]
     valid_kwargs = ["chat_template"]
     image_processor_class = "Phi4MMImageProcessor"

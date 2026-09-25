@@ -52,7 +52,7 @@ ImageOutputFormat = Literal["b64_json", "path"]
 ImageTask = Literal["generate", "edit"]
 ImageArrayLayout = Literal["HWC"]
 ImageArrayRange = Literal["uint8_0_255"]
-ImageColorSpace = Literal["RGB"]
+ImageColorSpace = Literal["RGB", "RGBA"]
 
 
 @dataclass(slots=True)
@@ -100,13 +100,21 @@ class ImageGenerationResult:
     def image(self) -> Image.Image:
         return self.to_pil()
 
-    def to_pil(self) -> Image.Image:
-        if self.layout != "HWC" or self.color_space != "RGB":
+    @property
+    def images(self) -> list[Image.Image]:
+        """Every image in the result: one for `[H, W, C]`, N for `[N, H, W, C]`."""
+        if self.layout != "HWC" or self.color_space not in ("RGB", "RGBA"):
             raise ValueError(
                 f"Cannot convert image layout={self.layout!r} "
                 f"color_space={self.color_space!r} to PIL"
             )
-        return Image.fromarray(np.array(self.array))
+        array = np.array(self.array)
+        if array.ndim == 3:
+            array = array[None]
+        return [Image.fromarray(sub) for sub in array]
+
+    def to_pil(self) -> Image.Image:
+        return self.images[0]
 
     def to_png_bytes(self) -> bytes:
         buffer = BytesIO()
@@ -119,9 +127,17 @@ class ImageGenerationResult:
     def save(self, path: str | Path) -> Path:
         output_path = Path(path).expanduser()
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        self.to_pil().save(output_path)
-        self.path = output_path
-        return output_path
+        images = self.images
+        multi = len(images) > 1
+        paths = []
+        for index, image in enumerate(images):
+            target = output_path
+            if multi:
+                target = output_path.with_stem(f"{output_path.stem}_{index}")
+            image.save(target)
+            paths.append(target)
+        self.path = paths[0]
+        return paths[0]
 
 
 class ImageGenerationModel(Protocol):
@@ -166,7 +182,11 @@ def _model_type_from_id(model: str) -> str:
         "mageflow": "mage_flow",
         "z": "z_image",
         "zimage": "z_image",
+        "ming": "ming_image",
+        "mingimage": "ming_image",
         "ernie": "ernie_image",
+        "qwen": "qwen_image",
+        "qwenimage": "qwen_image",
     }.get(model_type, model_type)
 
 
@@ -188,6 +208,11 @@ def _model_types_from_class_name(class_name: str) -> tuple[str, ...]:
     candidates: list[str] = []
     for end in range(1, len(tokens) + 1):
         _add_model_type(candidates, "_".join(tokens[:end]))
+        if end > 1:
+            # Preserve mixed-case acronyms such as LLaDA in LLaDAImagePipeline.
+            _add_model_type(
+                candidates, "".join(tokens[: end - 1]) + "_" + tokens[end - 1]
+            )
     for token in tokens:
         _add_model_type(candidates, token)
     return tuple(candidates)
@@ -249,6 +274,8 @@ def _image_model_type_from_manifest(metadata: dict[str, Any]) -> str | None:
 def _image_model_type_from_component_indexes(root: Path) -> str | None:
     transformer_index = _load_json_file(
         root / "transformer" / "model.safetensors.index.json"
+    ) or _load_json_file(
+        root / "transformer" / "diffusion_pytorch_model.safetensors.index.json"
     )
     if transformer_index is None:
         return None
@@ -269,6 +296,8 @@ def _image_model_type_from_component_indexes(root: Path) -> str | None:
         "noise_refiner.0.adaLN_modulation.0.weight",
     }
     if z_image_markers <= keys:
+        if (root / "mllm" / "config.json").exists():
+            return "ming_image"
         return "z_image"
     ernie_image_markers = {
         "adaln_modulation.weight",
@@ -277,6 +306,13 @@ def _image_model_type_from_component_indexes(root: Path) -> str | None:
     }
     if ernie_image_markers <= keys:
         return "ernie_image"
+    qwen_image_markers = {
+        "transformer_blocks.0.img_mlp.gate_layer.weight",
+        "txt_in.text_norm.weight",
+        "txt_in.in_layer.weight",
+    }
+    if qwen_image_markers <= keys:
+        return "qwen_image"
     return None
 
 

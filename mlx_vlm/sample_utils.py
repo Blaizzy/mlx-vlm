@@ -6,6 +6,15 @@ from typing import Callable, Dict, List, Optional
 
 import mlx.core as mx
 
+MIN_SAMPLING_TEMPERATURE = 0.01
+
+
+def clamp_temperature(temperature: float) -> float:
+    """Clamp positive sampling temperatures, preserving zero for greedy decoding."""
+    if 0 < temperature < MIN_SAMPLING_TEMPERATURE:
+        return MIN_SAMPLING_TEMPERATURE
+    return temperature
+
 
 def make_sampler(
     temp: float = 0.0,
@@ -25,7 +34,7 @@ def make_sampler(
 
     Args:
         temp (float): The temperature for sampling, if 0 the argmax is used.
-          Default: ``0``.
+          Positive values below 0.01 are clamped to 0.01. Default: ``0``.
         top_p (float, optional): Nucleus sampling, higher means model considers
           more less likely words.
         min_p (float, optional): The minimum value (scaled by the top token's
@@ -63,6 +72,7 @@ def make_sampler(
     if temp == 0:
         return lambda x: mx.argmax(x, axis=-1)
 
+    temp = clamp_temperature(temp)
     sampling_methods = []
     if top_n_sigma > 0.0:
         sampling_methods.append(lambda x: apply_top_n_sigma(x, top_n_sigma))
@@ -295,27 +305,17 @@ def apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:
         logprobs: A vector of log probabilities.
         top_p: The cumulative probability threshold for top-p filtering.
     Returns:
-        token selected based on the top-p criterion.
+        Log probabilities with tokens outside the nucleus masked to -inf.
     """
-    probs = mx.exp(logprobs)
-    sorted_indices = mx.argsort(logprobs, axis=-1)
-    sorted_probs = mx.take_along_axis(probs, sorted_indices, axis=-1)
-
-    cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
-
-    inverse_indices = mx.put_along_axis(
-        mx.zeros_like(sorted_indices),
-        sorted_indices,
-        mx.arange(sorted_indices.shape[-1], dtype=sorted_indices.dtype),
-        axis=-1,
-    )
-    cumulative_probs = mx.take_along_axis(cumulative_probs, inverse_indices, axis=-1)
-
-    return mx.where(
-        cumulative_probs > 1 - top_p,
-        logprobs,
-        -float("inf"),
-    )
+    # An exclusive reverse scan keeps the maximum for any
+    # positive top_p without subtracting a tiny probability from 1.
+    sorted_logprobs = mx.sort(logprobs, axis=-1)
+    sorted_probs = mx.exp(sorted_logprobs.astype(mx.float32))
+    mass_above = mx.cumsum(sorted_probs, axis=-1, reverse=True, inclusive=False)
+    total_mass = mass_above[..., :1] + sorted_probs[..., :1]
+    num_dropped = (mass_above >= top_p * total_mass).sum(axis=-1, keepdims=True)
+    threshold = mx.take_along_axis(sorted_logprobs, num_dropped, axis=-1)
+    return mx.where(logprobs < threshold, -float("inf"), logprobs)
 
 
 def apply_typical_p(logprobs: mx.array, typical_p: float) -> mx.array:
@@ -475,7 +475,13 @@ def make_frequency_penalty(penalty: float, context_size: int = 20):
     return frequency_penalty_processor
 
 
-def top_p_sampling(logits: mx.array, top_p: float, temperature: float) -> mx.array:
+def top_p_sampling(
+    logits: mx.array,
+    top_p: float,
+    temperature: float,
+    *,
+    key: Optional[mx.array] = None,
+) -> mx.array:
     """
     Apply top-p (nucleus) sampling to logits.
 
@@ -485,32 +491,16 @@ def top_p_sampling(logits: mx.array, top_p: float, temperature: float) -> mx.arr
             speculative verify output).
         top_p: The cumulative probability threshold for top-p filtering.
         temperature: Temperature parameter for softmax distribution reshaping.
+            Positive values below 0.01 are clamped to 0.01; zero is greedy.
+        key: Optional PRNG key for position-dependent sampling.
     Returns:
         token selected based on the top-p criterion. Shape matches logits
         with the trailing vocab axis removed (e.g. [], [B], or [B, T]).
     """
-    unbatched = logits.ndim == 1
-    if unbatched:
-        logits = logits[None]
-
-    if logits.dtype == mx.bfloat16:
-        logits = logits.astype(mx.float32)
-
-    probs = mx.softmax(logits / temperature, axis=-1)
-
-    sorted_indices = mx.argsort(probs, axis=-1)
-    sorted_probs = mx.take_along_axis(probs, sorted_indices, axis=-1)
-
-    cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
-
-    top_probs = mx.where(
-        cumulative_probs > 1 - top_p,
-        sorted_probs,
-        mx.zeros_like(sorted_probs),
-    )
-
-    sampled_pos = mx.random.categorical(mx.log(top_probs))
-    token = mx.take_along_axis(sorted_indices, sampled_pos[..., None], axis=-1).squeeze(
-        -1
-    )
-    return token.squeeze(0) if unbatched else token
+    if temperature == 0:
+        return mx.argmax(logits, axis=-1)
+    logits = logits.astype(mx.float32) / clamp_temperature(temperature)
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    if 0 < top_p < 1:
+        logprobs = apply_top_p(logprobs, top_p)
+    return mx.random.categorical(logprobs, key=key)

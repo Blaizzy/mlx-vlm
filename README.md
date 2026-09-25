@@ -60,6 +60,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | Granite 4.0 Vision | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite4_vision/README.md) |
 | MiniCPM-V 4.6 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minicpmv4_6/README.md) |
 | GLiNER2.5 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/gliner2_5/README.md) |
+| BERT | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/bert/README.md) |
 | LLaVA-OneVision | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/llava_onevision/README.md) |
 | K2-Horizon | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/k2_horizon/README.md) |
 | Z1T-0 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/z1t/README.md) |
@@ -379,6 +380,33 @@ MiniMax M3 also supports image/video prompts, MiniMax thinking tags, MiniMax
 tool-call parsing, MSA index caches, and MXFP8 config loading. See
 [`mlx_vlm/models/minimax_m3_vl/README.md`](mlx_vlm/models/minimax_m3_vl/README.md)
 for model-specific conversion and runtime notes.
+
+#### Reading the server's draft counters
+
+With a drafter loaded, `mlx_vlm.server` adds four fields to a response's
+`timings`, named after llama.cpp's:
+
+| Field | Meaning |
+|---|---|
+| `draft_kind` | The drafter family that ran |
+| `draft_rounds` | Verification rounds: target forward passes after the prefill |
+| `draft_n` | Tokens proposed, `--draft-block-size` minus one per round (the block includes the anchor token) |
+| `draft_n_accepted` | Proposed tokens the target's greedy choice matched |
+
+`draft_n_accepted` is a measure of the drafter, not of the output. A round
+is recorded when the target verifies it, before the stop token or `max_tokens`
+cuts the reply, so matches past the end of the reply are counted and the field
+can exceed `predicted_n`. `predicted_n - draft_n_accepted` is therefore not
+the number of target forward passes. Use `draft_rounds`:
+
+```text
+accept_length = (predicted_n - 1) / draft_rounds
+```
+
+The first token comes from the prefill, before any draft exists, so it is
+left out of the numerator. The three counters are differences of a tally kept
+on the drafter, so they belong to one request only when one request is in
+flight; with concurrent requests they are shared across the batch.
 
 ### Chat UI with Gradio
 
