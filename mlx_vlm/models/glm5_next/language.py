@@ -4,7 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import LanguageModelOutput, create_ssm_mask, scaled_dot_product_attention
-from ..cache import ArraysCache, CacheList, KVCache, PoolingCache
+from ..cache import ArraysCache, BatchKVCache, CacheList, KVCache, PoolingCache
 from ..deepseek_v4.hyper_connection import HyperConnection
 from ..gated_delta import gated_delta_update
 from ..linear import DECODE_BLOCK_SIZE, linear, tiled_linear
@@ -586,6 +586,64 @@ def _sparse_prefill_attention(q, k, v, indices, scale, chunk_size=16, use_kernel
 _MAX_PROJECTED_PREFILL_TOKENS = 32768
 
 
+class ProjectedKVCache(KVCache):
+    """Prefill-only projection; APC restores it empty for latent reprojection."""
+
+    # This optional prefill buffer stays float when persistent KV is quantized.
+    skip_kv_quantization = True
+
+    def prefix_cache_snapshot(self):
+        return {"state": (None, None), "meta_state": ""}
+
+    def extract(self, idx):
+        cache = super().extract(idx)
+        projected = ProjectedKVCache()
+        projected.keys, projected.values, projected.offset = (
+            cache.keys,
+            cache.values,
+            cache.offset,
+        )
+        return projected
+
+    def to_batch(self, left_padding):
+        return ProjectedBatchKVCache(left_padding)
+
+    @classmethod
+    def merge(cls, caches):
+        return ProjectedBatchKVCache.merge(caches)
+
+    def prefix_cache_merge(self, rows, prefix_lens):
+        return ProjectedBatchKVCache([0] * len(rows))
+
+
+class ProjectedBatchKVCache(BatchKVCache):
+    def __init__(self, left_padding=()):
+        super().__init__(left_padding)
+
+    def prefix_cache_snapshot(self):
+        return {
+            "state": (
+                None,
+                None,
+                mx.zeros_like(self.offset),
+                mx.zeros_like(self.left_padding),
+            ),
+            "meta_state": "",
+        }
+
+    def extract(self, idx):
+        if self.empty():
+            return ProjectedKVCache()
+        cache = super().extract(idx)
+        projected = ProjectedKVCache()
+        projected.keys, projected.values, projected.offset = (
+            cache.keys,
+            cache.values,
+            cache.offset,
+        )
+        return projected
+
+
 class Glm5NextAttention(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
@@ -931,7 +989,7 @@ class LanguageModel(nn.Module):
             if layer.block_type == "linear_attention":
                 caches.append(ArraysCache(size=2))
             elif layer.self_attn.indexer is None:
-                caches.append(CacheList(KVCache(), KVCache()))
+                caches.append(CacheList(KVCache(), ProjectedKVCache()))
             else:
                 indexer = layer.self_attn.indexer
                 caches.append(
@@ -939,7 +997,7 @@ class LanguageModel(nn.Module):
                         KVCache(),
                         KVCache(),
                         PoolingCache(indexer.index_kpool),
-                        KVCache(),
+                        ProjectedKVCache(),
                     )
                 )
         return caches

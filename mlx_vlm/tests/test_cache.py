@@ -2188,6 +2188,63 @@ def test_quantized_hybrid_snapshots(managers):
     assert count == 32 and len(warm) == 3
 
 
+@pytest.mark.parametrize("tier", ["memory", "disk-only"])
+def test_glm5_next_apc_excludes_projected_prefill_cache(prefix_manager, tier):
+    from mlx_vlm.models.glm5_next.language import (
+        LanguageModel as Glm5NextLanguageModel,
+        ProjectedBatchKVCache,
+        ProjectedKVCache,
+    )
+
+    layers = [
+        NS(
+            block_type="deepseek_sparse_attention",
+            self_attn=NS(indexer=NS(index_kpool=16)),
+        ),
+        NS(block_type="deepseek_sparse_attention", self_attn=NS(indexer=None)),
+    ]
+    model_caches = Glm5NextLanguageModel.make_cache(NS(layers=layers))
+    assert isinstance(model_caches[0][3], ProjectedKVCache)
+    assert isinstance(model_caches[1][1], ProjectedKVCache)
+    batch_caches = _make_cache(NS(make_cache=lambda: model_caches), [0], kv_bits=4)
+    assert isinstance(batch_caches[0][3], ProjectedBatchKVCache)
+    assert isinstance(batch_caches[1][1], ProjectedBatchKVCache)
+
+    tokens = list(range(32))
+    latent = filled(KVCache(), 32)
+    projected = filled(ProjectedKVCache(), 32)
+    source = [CacheList(latent, projected)]
+    manager = prefix_manager(tier)
+    assert manager.store_exact_cache(tokens, source)
+    if manager.disk:
+        manager.close()
+        manager = prefix_manager(tier)
+
+    restored, count = manager.lookup_exact_cache(tokens + [999])
+    assert count == 32
+    assert restored[0][0].offset == 32
+    assert isinstance(restored[0][1], ProjectedKVCache)
+    assert restored[0][1].empty()
+    assert projected.offset == 32  # APC did not discard the live prefill speedup.
+
+    batch, count = warm_exact([restored, restored], [32, 32])
+    assert count == 32
+    assert isinstance(batch[0][1], ProjectedBatchKVCache)
+    assert batch[0][1].empty()
+    row = snapshot_row(batch, 0)
+    assert row[0][0].offset == 32
+    assert isinstance(row[0][1], ProjectedKVCache)
+    assert row[0][1].empty()
+    live_batch = [
+        CacheList(
+            BatchKVCache.merge([latent, latent]),
+            ProjectedKVCache.merge([projected, projected]),
+        )
+    ]
+    assert live_batch[0][1].size() == 32
+    assert snapshot_row(live_batch, 0)[0][1].empty()
+
+
 @parametrize("scheme", ["uniform", "turboquant"])
 def test_warm_cache_quantization_policy(scheme, managers):
     bits = 8 if scheme == "uniform" else 3.5
