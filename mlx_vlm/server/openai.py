@@ -5,7 +5,6 @@ import gc
 import json
 import logging
 import random
-import re
 import time
 import uuid
 from datetime import datetime
