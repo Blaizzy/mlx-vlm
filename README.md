@@ -59,7 +59,7 @@ See the [Getting Started guide](docs/getting-started.md) for the CLI, chat UI, a
 Full reference docs live in [`docs/`](docs/) (also published at
 [Blaizzy.github.io/mlx-vlm](https://Blaizzy.github.io/mlx-vlm)):
 [Getting started](docs/getting-started.md) · [Models](docs/models.md) ·
-[Server](docs/server.md) · [CLI reference](docs/cli.md) ·
+[Server](docs/server.md) · [CLI reference](docs/cli/index.md) ·
 [Prefix caching](docs/performance/prefix-caching.md) ·
 [KV cache quantization](docs/performance/kv-cache-quantization.md).
 

@@ -46,7 +46,7 @@ mlx_vlm.generate --model mlx-community/gemma-3n-E2B-it-4bit --max-tokens 100 --p
 mlx_vlm.generate --model mlx-community/gemma-3n-E2B-it-4bit --max-tokens 100 --prompt "Describe what you see and hear" --image /path/to/image.jpg --audio /path/to/audio.wav
 ```
 
-For every flag and subcommand, see the [CLI reference](cli.md).
+For every flag and subcommand, see the [CLI reference](cli/index.md).
 
 ## Chat UI with Gradio
 
