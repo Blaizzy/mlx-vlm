@@ -602,6 +602,18 @@ The server provides multiple endpoints for different use cases and supports dyna
 
 The server supports continuous batching for higher throughput when handling multiple concurrent requests. New requests join the active batch immediately without waiting for existing requests to finish, and mixed batches of image and text-only requests are supported.
 
+Prompt processing and decoding are interleaved, with decoding taking priority. The
+server's `--prefill-step-size` (default: 2048) is a shared prompt-token budget per
+step, including padding, so increasing the batch size does not multiply the prompt
+work between decode steps. Lower it to reduce pauses in active streams while new
+requests prefill. Models that require unchunked prefill do not use this budget.
+
+Ready decode tokens are published before the next prefill step. Pending prompts
+are grouped by comparable length, starting with the oldest waiting request, to
+limit padding without starving long prompts. Python streaming integrations can
+use `BatchGenerator.decode_step()` and `prefill_step()` separately; `next()`
+continues to advance both phases for existing callers.
+
 Continuous batching is enabled automatically when the server loads a model. You can pre-load a model at startup so it's ready to serve immediately:
 
 ```sh

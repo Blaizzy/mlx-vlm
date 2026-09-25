@@ -106,7 +106,8 @@ def main():
         "--prefill-step-size",
         type=int,
         default=DEFAULT_PREFILL_STEP_SIZE,
-        help="Tokens per prefill step (default: %(default)s).",
+        help="Prompt-token budget per batch step, including padding "
+        "(default: %(default)s). Lower values reduce pauses in active streams.",
     )
     parser.add_argument(
         "--log-progress-interval",

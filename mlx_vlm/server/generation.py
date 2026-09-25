@@ -1666,7 +1666,7 @@ class ResponseGenerator:
                 clear_mlx_streams()
 
     def _run_impl(self):
-        """Single GPU thread: owns BatchGenerator, runs tight next() loop."""
+        """Own batch scheduling and publish each decode phase before prefill."""
         try:
             self._initialize_model()
         except Exception as e:
@@ -1999,9 +1999,9 @@ class ResponseGenerator:
             results.close()
 
     def _step(self, batch_gen, active, gen_kwargs=None):
-        """One batch generation step: prefill + decode."""
-        kwargs = gen_kwargs or {}
-        prompt_responses, responses = batch_gen.next(**kwargs)
+        """Publish ready decode tokens before advancing bounded prompt work."""
+        self._emit_responses(batch_gen.decode_step(), active)
+        prompt_responses = batch_gen.prefill_step()
         self._log_prefill_progress(batch_gen, active)
         for prompt_response in prompt_responses:
             if prompt_response.uid in active:
@@ -2009,9 +2009,8 @@ class ResponseGenerator:
                 info["prompt_tps"] = prompt_response.prompt_tps
                 info["cached_tokens"] = getattr(prompt_response, "cached_tokens", 0)
                 self._log_prefill_completed(prompt_response.uid, info, prompt_response)
-        if not responses:
-            return
 
+    def _emit_responses(self, responses, active):
         for r in responses:
             if r.uid not in active:
                 continue
