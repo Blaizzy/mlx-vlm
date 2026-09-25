@@ -11,15 +11,7 @@ from .vision import Aligner, ViT
 
 
 class Model(nn.Module):
-    """DeepSeek-V4.1 multimodal model.
-
-    ``lazy_parameter_paths`` keeps the engram hash tables mapped instead of
-    resident. They are ~384M rows and a decode step gathers 24 of them per
-    engram layer, so residency costs their full size (~100 GB at 4 bits) and
-    buys nothing; the reference engine keeps them on disk in every mode too.
-    """
-
-    lazy_parameter_paths = (".engram.embed.",)
+    """DeepSeek-V4.1 multimodal model."""
 
     def __init__(self, config: ModelConfig):
         super().__init__()

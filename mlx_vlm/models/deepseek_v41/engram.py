@@ -265,12 +265,7 @@ class NgramHashState(nn.Module):
 
 
 class QuantizedEngramEmbedding(nn.Module):
-    """Affine-quantized hash table whose rows are dequantized on lookup.
-
-    The tables are ~384M rows; a generic quantized embedding is too costly to
-    read from lazily-mapped storage, so gather the handful of rows a step needs
-    and dequantize only those.
-    """
+    """Affine-quantized hash table whose rows are dequantized on lookup."""
 
     def __init__(
         self,
@@ -288,14 +283,7 @@ class QuantizedEngramEmbedding(nn.Module):
         self.biases = mx.zeros((num_embeddings, dims // group_size), dtype=scale_dtype)
 
     def __call__(self, indices: mx.array) -> mx.array:
-        """Look up rows and dequantize them.
-
-        The gather runs on the CPU stream because the tables are mapped rather
-        than resident: a row lookup can fault pages in from the file, and doing
-        that inside a Metal command buffer lets the page-in outrun the GPU
-        watchdog, killing the whole buffer. The rows are tiny, so the copy
-        costs nothing next to the fault it avoids.
-        """
+        """Gather and evaluate selected rows on the CPU, then dequantize them."""
         with mx.stream(mx.cpu):
             rows = self.weight[indices]
             scales = self.scales[indices]
