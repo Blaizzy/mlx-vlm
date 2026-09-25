@@ -1,12 +1,14 @@
 # Decider-2b decisions on MLX
 
-Load the original `Mapika/decider-2b` checkpoint directly. It uses the existing Qwen3.5 text backbone and scores only the allowed option tokens at answer slots. No converted checkpoint is required.
+Load `nativ-community/decider-2b` with the general loader. It is [`Mapika/decider-2b`](https://huggingface.co/Mapika/decider-2b) v11 with its weights renamed to the standard `model.*` layout, and gives the same outputs. It uses the existing Qwen3.5 text backbone and scores only the allowed option tokens at answer slots.
 
 ```python
-from mlx_vlm.models.decider2 import load
+from mlx_vlm import load
+from mlx_vlm.models.decider2 import Decider2
 
-model = load("Mapika/decider-2b")
-result = model.predict(
+model, processor = load("nativ-community/decider-2b")
+decider = Decider2(model, processor)
+result = decider.predict(
     {"ticket": "Please refund my duplicate charge"},
     {
         "department": {

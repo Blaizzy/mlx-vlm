@@ -6,7 +6,6 @@ from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
-from transformers import AutoTokenizer
 
 
 def _text(value):
@@ -79,11 +78,11 @@ def _render_question(spec):
 
 
 class Decider2:
-    def __init__(self, model, tokenizer, settings, path):
-        self.model = model
+    def __init__(self, model, tokenizer):
+        self.model = model.language_model
         self.tokenizer = tokenizer
-        self.settings = settings
-        self.path = Path(path)
+        self.path = Path(model.model_path)
+        self.settings = json.loads((self.path / "decider_config.json").read_text())
         names = list(string.ascii_uppercase) + [
             a + b for a in string.ascii_uppercase for b in string.ascii_uppercase
         ]
@@ -321,26 +320,3 @@ class Decider2:
             "answers": answers,
             "usage": {"input_tokens": tokens, "output_tokens": 0},
         }
-
-
-def load(path_or_repo, *, revision=None, lazy=False):
-    """Load decider-2b from a local directory or the Hub."""
-    from ...utils import get_model_path, load_model
-
-    path = get_model_path(
-        path_or_repo,
-        revision=revision,
-        allow_patterns=[
-            "model.safetensors",
-            "config.json",
-            "decider_config.json",
-            "tokenizer.json",
-            "tokenizer_config.json",
-        ],
-    )
-    return Decider2(
-        load_model(path, lazy=lazy).language_model,
-        AutoTokenizer.from_pretrained(path),
-        json.loads((path / "decider_config.json").read_text()),
-        path,
-    )
