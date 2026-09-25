@@ -24,6 +24,7 @@ import numpy as np
 import pytest
 from mlx.utils import tree_flatten, tree_map
 
+from mlx_vlm import embedding_loader
 from mlx_vlm.models.base import InputEmbeddingsFeatures
 from mlx_vlm.models.cache import make_prompt_cache
 from mlx_vlm.utils import (
@@ -75,6 +76,14 @@ class ModelChecks:
         cache = model.language_model.make_cache()
         model(ids[:, :-1], cache=cache)
         assert model(ids[:, -1:], cache=cache).logits.shape == (1, 1, vocab_size)
+
+    def token_embeddings(self, model, config):
+        output = model(mx.array([[1, 2, 3]]))
+        assert output.last_hidden_state.shape == (1, 3, config.hidden_size)
+        assert output.text_embeds.shape == (1, 3, config.embedding_dim)
+        assert mx.allclose(
+            mx.linalg.norm(output.text_embeds, axis=-1), mx.array(1.0), atol=1e-5
+        )
 
     def assert_close(self, actual, expected, *, logits=False):
         assert actual.shape == expected.shape
@@ -505,6 +514,8 @@ def check_arguments(kind, case, model, config):
     )
     if kind == "forward_cache":
         return (model, text.vocab_size), case.get("forward_cache", {})
+    if kind == "token_embeddings":
+        return (model, config), {}
     if kind == "multimodal":
         return (model, config), case["multimodal"]
     if kind == "input_embeddings":
@@ -587,6 +598,35 @@ def test_model_contract(case):
     for kind in case["checks"]:
         args, kwargs = check_arguments(kind, case, model, config)
         getattr(checks, kind)(*args, **kwargs)
+
+
+def test_lfm2_colbert_sanitize_and_loader(tmp_path, monkeypatch):
+    case = next(case for case in DATA["cases"] if case["module"] == "lfm2_colbert")
+    module = importlib.import_module("mlx_vlm.models.lfm2_colbert")
+    model = module.Model(build_config(module, case["config"]))
+    weights = {
+        "embed_tokens.weight": mx.zeros((32, 16)),
+        "layers.0.conv.conv.weight": mx.zeros((16, 1, 3)),
+        "1_Dense.linear.weight": mx.zeros((8, 16)),
+    }
+    sanitized = model.sanitize(weights)
+    assert "model.embed_tokens.weight" in sanitized
+    assert sanitized["model.layers.0.conv.conv.weight"].shape == (16, 3, 1)
+    assert "projection.weight" in sanitized
+
+    dense_dir = tmp_path / "1_Dense"
+    dense_dir.mkdir()
+    (dense_dir / "config.json").write_text(json.dumps({"out_features": 128}))
+    captured = {}
+
+    def fake_load(model_path, **kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(embedding_loader, "load_encoder_model", fake_load)
+    embedding_loader.load_embedding_model(tmp_path)
+    assert captured["model_remapping"]["lfm2"] == "lfm2_colbert"
+    assert captured["config_overrides"]["embedding_dim"] == 128
 
 
 @pytest.mark.parametrize("name", DATA["dense"])
