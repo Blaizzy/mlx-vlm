@@ -265,7 +265,9 @@ class NgramHashState(nn.Module):
 
 
 class QuantizedEngramEmbedding(nn.Module):
-    """Affine-quantized hash table whose rows are dequantized on lookup."""
+    """Quantized hash table whose rows are dequantized on lookup."""
+
+    _quantize_chunk_rows = 1 << 20
 
     def __init__(
         self,
@@ -274,27 +276,73 @@ class QuantizedEngramEmbedding(nn.Module):
         group_size: int = 64,
         bits: int = 4,
         scale_dtype=mx.bfloat16,
+        mode: str = "affine",
     ):
         super().__init__()
         self.group_size = group_size
         self.bits = bits
+        self.mode = mode
         self.weight = mx.zeros((num_embeddings, dims * bits // 32), dtype=mx.uint32)
         self.scales = mx.zeros((num_embeddings, dims // group_size), dtype=scale_dtype)
-        self.biases = mx.zeros((num_embeddings, dims // group_size), dtype=scale_dtype)
+        self.biases = (
+            mx.zeros((num_embeddings, dims // group_size), dtype=scale_dtype)
+            if mode == "affine"
+            else None
+        )
+
+    def to_quantized(self, group_size=None, bits=None, mode="affine"):
+        from ...quant_utils import get_quantization_params
+
+        params = get_quantization_params(group_size, bits, mode)
+        if params == dict(group_size=self.group_size, bits=self.bits, mode=self.mode):
+            return self
+
+        rows = self.weight.shape[0]
+        dims = self.weight.shape[1] * 32 // self.bits
+        # Finish the large file reads before submitting GPU work, whose command
+        # buffer can otherwise time out while waiting for the source table.
+        mx.eval(self.weight, self.scales, self.biases)
+        parts = []
+        # A full BF16 Engram table would require another 183 GiB. Decode and
+        # quantize bounded row batches before concatenating their packed output.
+        for start in range(0, rows, self._quantize_chunk_rows):
+            end = min(start + self._quantize_chunk_rows, rows)
+            decoded = mx.dequantize(
+                self.weight[start:end],
+                self.scales[start:end],
+                self.biases[start:end] if self.biases is not None else None,
+                group_size=self.group_size,
+                bits=self.bits,
+                mode=self.mode,
+                dtype=mx.bfloat16,
+            )
+            part = mx.quantize(decoded, **params)
+            mx.eval(part)
+            parts.append(part)
+
+        values = [mx.concatenate(arrays, axis=0) for arrays in zip(*parts)]
+        mx.eval(values)
+        result = QuantizedEngramEmbedding(
+            rows, dims, scale_dtype=values[1].dtype, **params
+        )
+        result.weight, result.scales, *biases = values
+        result.biases = biases[0] if biases else None
+        return result
 
     def __call__(self, indices: mx.array) -> mx.array:
         """Gather and evaluate selected rows on the CPU, then dequantize them."""
         with mx.stream(mx.cpu):
             rows = self.weight[indices]
             scales = self.scales[indices]
-            biases = self.biases[indices]
-            mx.eval(rows, scales, biases)
+            biases = self.biases[indices] if self.biases is not None else None
+            mx.eval((rows, scales) if biases is None else (rows, scales, biases))
         return mx.dequantize(
             rows,
             scales=scales,
             biases=biases,
             group_size=self.group_size,
             bits=self.bits,
+            mode=self.mode,
         ).astype(mx.float32)
 
 

@@ -2,7 +2,7 @@ import base64
 import io
 import json
 import math
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import List, Optional, Tuple
 from urllib.request import urlopen
@@ -339,6 +339,12 @@ class DeepseekV41Processor(ProcessorMixin):
     def apply_chat_template(self, *args, **kwargs):
         kwargs.setdefault("tokenize", False)
         return self.tokenizer.apply_chat_template(*args, **kwargs)
+
+    def to_dict(self):
+        config = super().to_dict()
+        if self.config is not None:
+            config["config"] = asdict(self.config)
+        return config
 
     def encode(self, *args, **kwargs):
         return self.tokenizer.encode(*args, **kwargs)

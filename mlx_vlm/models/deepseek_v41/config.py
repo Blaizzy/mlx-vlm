@@ -82,6 +82,23 @@ class ModelConfig(BaseModelConfig):
     vision_max_image_tokens: int = 1024
     vision_max_wh_ratio: Optional[float] = None
 
+    @classmethod
+    def from_dict(cls, params):
+        params = dict(params or {})
+        text = dict(params.pop("text_config", None) or {})
+        text.pop("model_type", None)
+        vision = params.pop("vision_config", None) or {}
+        vision_names = {
+            "num_hidden_layers": "num_layers",
+            "num_attention_heads": "num_heads",
+        }
+        values = {
+            f"vision_{vision_names.get(key, key)}": value
+            for key, value in vision.items()
+            if key != "model_type"
+        }
+        return super().from_dict({**text, **values, **params})
+
     def __post_init__(self):
         if not self.compress_ratios:
             self.compress_ratios = [0, 0] + [2] * 18 + [1] * 20 + [0, 0, 0]

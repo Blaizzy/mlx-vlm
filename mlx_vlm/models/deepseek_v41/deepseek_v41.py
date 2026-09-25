@@ -10,6 +10,28 @@ from .processing_deepseek_v41 import IMAGE, IMAGE_END, IMAGE_NEW_LINE, IMAGE_STA
 from .vision import Aligner, ViT
 
 
+def _pack_source_weight(weight, scales):
+    """Repack source bytes without rounding; expand block scales over rows."""
+    if weight.ndim != 2 or scales.ndim != 2 or scales.dtype != mx.uint8:
+        raise ValueError("Expected a matrix of FP8/FP4 bytes and E8M0 scales")
+    if weight.dtype not in (mx.uint8, mx.int8):
+        raise ValueError(f"Expected FP8/FP4 bytes, got {weight.dtype}")
+    rows, cols = weight.shape
+    if scales.shape == (rows, cols // 16) and cols % 16 == 0:
+        mode = "mxfp4"
+    elif cols % 32 == 0 and scales.shape[-1] == cols // 32:
+        mode = "mxfp8"
+        if scales.shape[0] == (rows + 31) // 32:
+            scales = mx.repeat(scales, 32, axis=0)[:rows]
+        elif scales.shape[0] != rows:
+            raise ValueError(
+                f"Invalid FP8 scale rows: {scales.shape} for {weight.shape}"
+            )
+    else:
+        raise ValueError(f"Invalid scale shape: {scales.shape} for {weight.shape}")
+    return weight.view(mx.uint32, stream=mx.cpu), scales, mode
+
+
 class Model(nn.Module):
     """DeepSeek-V4.1 multimodal model."""
 
@@ -100,11 +122,7 @@ class Model(nn.Module):
             language_model._engram_source = value
 
     def _install_engram_embeddings(self, weights):
-        """Swap in the row-wise engram table when the checkpoint is quantized.
-
-        Done before ``nn.quantize`` so the generic path never claims these
-        modules; the replacement exposes no ``to_quantized``.
-        """
+        """Install quantized tables for row-wise lookup and bounded conversion."""
         from .engram import QuantizedEngramEmbedding
 
         for idx, layer in enumerate(self.language_model.layers):
@@ -120,7 +138,12 @@ class Model(nn.Module):
             bits = 32 * packed.shape[1] // dims
             group_size = dims // scales.shape[1]
             engram.embed = QuantizedEngramEmbedding(
-                packed.shape[0], dims, group_size, bits, scale_dtype=scales.dtype
+                packed.shape[0],
+                dims,
+                group_size,
+                bits,
+                scale_dtype=scales.dtype,
+                mode=f"mxfp{bits}" if scales.dtype == mx.uint8 else "affine",
             )
 
     def quantization_path_aliases(self, path: str):
@@ -150,8 +173,26 @@ class Model(nn.Module):
         weights = {
             transform_key(k): v for k, v in weights.items() if not k.startswith("mtp.")
         }
-
-        self._install_engram_embeddings(weights)
+        for key in list(weights):
+            if not key.endswith(".scale"):
+                continue
+            weight_key = key[: -len(".scale")] + ".weight"
+            packed, scales, mode = _pack_source_weight(
+                weights[weight_key], weights.pop(key)
+            )
+            if weight_key.endswith(".engram.embed.weight"):
+                weights[weight_key] = packed
+                weights[key + "s"] = scales
+                continue
+            # Leave floating-point modules available to the standard converter.
+            weights[weight_key] = mx.dequantize(
+                packed,
+                scales,
+                group_size=32,
+                bits=4 if mode == "mxfp4" else 8,
+                mode=mode,
+                dtype=mx.bfloat16,
+            )
 
         from .language import sanitize_moe_weights
 
@@ -182,6 +223,7 @@ class Model(nn.Module):
             del weights[head_s]
             del weights[head_b]
 
+        self._install_engram_embeddings(weights)
         return weights
 
     @property
