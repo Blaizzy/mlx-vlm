@@ -16,12 +16,7 @@ class Model(nn.Module):
         self.model_type = config.model_type
         self.model = Lfm2Model(config)
 
-    def __call__(
-        self,
-        input_ids: mx.array,
-        attention_mask: Optional[mx.array] = None,
-        **kwargs,
-    ):
+    def _encode(self, input_ids, attention_mask=None):
         B, L = input_ids.shape
         if attention_mask is None:
             attention_mask = mx.ones((B, L))
@@ -30,9 +25,21 @@ class Model(nn.Module):
             h.dtype
         ).min
         for layer in self.model.layers:
-            mask = attn_mask if layer.is_attention_layer else None
+            mask = (
+                attn_mask
+                if layer.is_attention_layer
+                else attention_mask.astype(mx.bool_)
+            )
             h = layer(h, mask, None)
-        h = self.model.embedding_norm(h)
+        return self.model.embedding_norm(h), attention_mask
+
+    def __call__(
+        self,
+        input_ids: mx.array,
+        attention_mask: Optional[mx.array] = None,
+        **kwargs,
+    ):
+        h, attention_mask = self._encode(input_ids, attention_mask)
         pooling_config = getattr(self, "pooling_config", None) or {
             "pooling_mode": "cls"
         }
