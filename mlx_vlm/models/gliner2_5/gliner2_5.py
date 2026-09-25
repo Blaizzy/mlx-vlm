@@ -11,42 +11,33 @@ from .config import ModelConfig
 from .deberta import DebertaModel
 
 SPECIAL_TOKENS = [
-    "[SEP_STRUCT]",
     "[SEP_TEXT]",
     "[P]",
-    "[C]",
     "[E]",
-    "[R]",
     "[L]",
-    "[EXAMPLE]",
-    "[OUTPUT]",
     "[DESCRIPTION]",
 ]
 
-
-class _WhitespaceSplitter:
-    pattern = re.compile(
+WORD_PATTERNS = {
+    "whitespace": re.compile(
         r"(?:https?://[^\s]+|www\.[^\s]+)"
         r"|[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}"
         r"|@[a-z0-9_]+|\w+(?:[-_]\w+)*|\S",
         re.IGNORECASE,
-    )
-
-    def __call__(self, text):
-        return [
-            (match.group().lower(), match.start(), match.end())
-            for match in self.pattern.finditer(text)
-        ]
+    ),
+    "char": re.compile(r"[A-Za-z0-9@._\-+]+|\S"),
+}
 
 
-class _CharSplitter:
-    pattern = re.compile(r"[A-Za-z0-9@._\-+]+|\S")
-
-    def __call__(self, text):
-        return [
-            (match.group().lower(), match.start(), match.end())
-            for match in self.pattern.finditer(text)
-        ]
+def _split_words(text, mode):
+    try:
+        pattern = WORD_PATTERNS[mode]
+    except KeyError:
+        raise ValueError("word_splitter must be 'whitespace' or 'char'") from None
+    return [
+        (match.group().lower(), match.start(), match.end())
+        for match in pattern.finditer(text)
+    ]
 
 
 @dataclass
@@ -151,12 +142,7 @@ class Model(BoundaryExtractor):
     def _prepare(
         self, processor, text, schema, max_len=None, word_splitter="whitespace"
     ):
-        if word_splitter == "whitespace":
-            splitter = _WhitespaceSplitter()
-        elif word_splitter == "char":
-            splitter = _CharSplitter()
-        else:
-            raise ValueError("word_splitter must be 'whitespace' or 'char'")
+        words = _split_words(text, word_splitter)
         added = processor.add_special_tokens(
             {"additional_special_tokens": SPECIAL_TOKENS}
         )
@@ -180,7 +166,7 @@ class Model(BoundaryExtractor):
 
         offsets = []
         word_positions = []
-        for word, start, end in splitter(text):
+        for word, start, end in words:
             pieces = processor.tokenize(word)
             if not pieces:
                 pieces = [processor.unk_token]

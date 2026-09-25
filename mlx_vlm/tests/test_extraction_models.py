@@ -29,10 +29,9 @@ from mlx_vlm.models.gliner2_5.boundary import (
     SharedPoolScorer,
 )
 from mlx_vlm.models.gliner2_5.gliner2_5 import (
-    _CharSplitter,
     _resolve_flat_overlaps,
     _schema_tokens,
-    _WhitespaceSplitter,
+    _split_words,
 )
 from mlx_vlm.models.openai_privacy_filter import Model as PrivacyModel
 from mlx_vlm.models.openai_privacy_filter import ModelConfig as PrivacyConfig
@@ -72,8 +71,8 @@ def test_checkpoint_key_sanitization():
 def test_word_splitters_preserve_offsets():
     text = "Email Me@Example.com 北京"
 
-    whitespace = _WhitespaceSplitter()(text)
-    characters = _CharSplitter()(text)
+    whitespace = _split_words(text, "whitespace")
+    characters = _split_words(text, "char")
 
     assert whitespace[1] == ("me@example.com", 6, 20)
     assert characters[-2:] == [("北", 21, 22), ("京", 22, 23)]
