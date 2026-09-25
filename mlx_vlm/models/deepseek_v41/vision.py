@@ -1,13 +1,8 @@
-from functools import lru_cache
-
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..deepseek_v4.vision import VISION_NORM_EPS, apply_rotary
-from ..deepseek_v4.vision import get_vision_cos_sin as _get_vision_cos_sin
+from ..deepseek_v4.vision import VISION_NORM_EPS, apply_rotary, get_vision_cos_sin
 from .config import ModelConfig
-
-get_vision_cos_sin = lru_cache(8)(_get_vision_cos_sin)
 
 
 class PatchEmbed(nn.Module):
