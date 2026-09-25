@@ -501,7 +501,7 @@ def _response_output_items_from_text(
                 thinking_start_token,
                 thinking_end_token,
             )
-            remaining = re.sub(r"<\|[^>]+\|>|<[^>]+>", "", remaining).strip()
+            remaining = re.sub(r"<\|[^>]+\|>", "", remaining).strip()
             return reasoning_items + items, remaining, reasoning, "tool_calls"
     item = {
         "id": message_id,

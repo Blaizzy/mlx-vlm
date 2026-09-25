@@ -2258,9 +2258,10 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             gen_args.thinking_end_token,
                         )
                         if clean_remaining:
-                            # Strip model control tokens
+                            # Strip model control tokens such as <|im_end|>.
+                            # Other <...> text is content the model wrote.
                             clean_remaining = re.sub(
-                                r"<\|[^>]+\|>|<[^>]+>", "", clean_remaining
+                                r"<\|[^>]+\|>", "", clean_remaining
                             ).strip()
                         content = clean_remaining or None
 

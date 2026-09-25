@@ -3573,6 +3573,34 @@ def test_stream_without_finish_token_flushes_held_text(client, api):
     assert text == "A <tool_call>unfinished"
 
 
+@pytest.mark.parametrize("api", ["chat", "responses"])
+def test_tool_call_content_keeps_angle_bracket_text(client, api):
+    result = _result(f"Use <b>bold</b>.<|im_end|> {_WEATHER_CALL}")
+    tool = (
+        dict(type="function", name="get_weather", parameters={"type": "object"})
+        if api == "responses"
+        else _tool()
+    )
+    with _endpoint(result=result, parser=_JSON_TOOLS):
+        response = _post(client, api, tools=[tool])
+    assert response.status_code == 200, response.text
+    body = response.json()
+    if api == "chat":
+        message = body["choices"][0]["message"]
+        assert message["content"] == "Use <b>bold</b>."
+        assert message["tool_calls"][0]["function"]["name"] == "get_weather"
+    else:
+        texts = [
+            part["text"]
+            for item in body["output"]
+            if item.get("type") == "message"
+            for part in item["content"]
+        ]
+        assert (
+            "Use <b>bold</b>." in texts or body.get("output_text") == "Use <b>bold</b>."
+        )
+
+
 # HTTP audio endpoints
 
 
