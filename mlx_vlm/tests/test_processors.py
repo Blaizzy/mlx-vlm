@@ -1665,6 +1665,150 @@ class TestApplyChatTemplateIntegration:
     Uses return_messages=True to inspect intermediate messages without mocking.
     """
 
+    @pytest.mark.parametrize(
+        "family,markers",
+        [
+            ("deepseek_v4", ("<image>", "<image>")),
+            ("qwen3_vl", ("<image>", "<image>")),
+            ("ernie4_5_moe_vl", ("<image>", "<image>")),
+            ("internvl_chat", ("<image>", "<image>")),
+            ("gemma4", ("<image>", "<image>")),
+            ("step3p7", ("<im_patch>", "<im_patch>")),
+            ("gemma3", ("<start_of_image>", "<start_of_image>")),
+            ("phi4mm", ("<|image_1|>", "<|image_2|>")),
+        ],
+    )
+    @pytest.mark.parametrize("representation", ["dict", "list", "pydantic"])
+    def test_interleaved_images_reach_renderer(self, family, markers, representation):
+        from pydantic import BaseModel
+
+        class Message(BaseModel):
+            role: str
+            content: list
+
+        message = dict(
+            role="user",
+            content=[
+                dict(type="input_text", text="before "),
+                dict(
+                    type="image_url", image_url=dict(url="data:image/png;base64,FIRST")
+                ),
+                dict(type="text", text=" between "),
+                dict(type="input_image", image_url="data:image/png;base64,SECOND"),
+                dict(type="text", text=" after"),
+            ],
+        )
+        original = deepcopy(message)
+        prompt = (
+            message
+            if representation == "dict"
+            else [Message(**message)] if representation == "pydantic" else [message]
+        )
+        normalized = apply_chat_template(
+            None, dict(model_type=family), prompt, num_images=2, return_messages=True
+        )
+        assert "base64" not in str(normalized)
+        rendered = get_chat_template(None, normalized, add_generation_prompt=True)
+        assert rendered == f"before {markers[0]} between {markers[1]} after"
+        assert message == original
+
+    def test_explicit_images_without_side_channel_count(self):
+        message = dict(
+            role="user", content=[dict(type="text", text="before "), dict(type="image")]
+        )
+        rendered = apply_chat_template(None, dict(model_type="qwen3_vl"), [message])
+        assert rendered == "before <image>"
+
+    def test_deepseek_processor_preserves_inline_image_position(self):
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]")),
+            unk_token="[UNK]",
+        )
+        processor = c.deepseek(tokenizer)
+        message = dict(
+            role="user",
+            content=[
+                dict(type="text", text="before"),
+                dict(type="image_url", image_url=dict(url="x")),
+                dict(type="text", text="after"),
+            ],
+        )
+        rendered = apply_chat_template(
+            processor, dict(model_type="deepseek_v4"), message, num_images=1
+        )
+        assert "before<｜deepseek_image｜>after" in rendered
+
+    @pytest.mark.parametrize(
+        "family,expected",
+        [
+            ("qwen3_vl", "<image> before <image> after"),
+            ("qwen2_vl", "before <image> after<image>"),
+            ("phi4mm", "<|image_1|>before <|image_2|> after"),
+        ],
+    )
+    def test_extra_side_channel_images_keep_default_placement(self, family, expected):
+        message = dict(
+            role="user",
+            content=[
+                dict(type="text", text="before "),
+                dict(type="image"),
+                dict(type="text", text=" after"),
+            ],
+        )
+        assert (
+            apply_chat_template(None, dict(model_type=family), message, num_images=2)
+            == expected
+        )
+
+    def test_interleaved_images_keep_side_channel_audio_and_video(self):
+        message = dict(
+            role="user",
+            content=[
+                dict(type="text", text="before"),
+                dict(type="image"),
+                dict(type="text", text="after"),
+            ],
+        )
+        result = apply_chat_template(
+            None,
+            dict(model_type="qwen3_vl"),
+            message,
+            num_images=1,
+            num_audios=1,
+            video="clip.mp4",
+            return_messages=True,
+        )
+        parts = result[0]["content"]
+        assert [part["type"] for part in parts] == [
+            "video",
+            "audio",
+            "text",
+            "image",
+            "text",
+        ]
+        assert parts[2]["text"] == "before" and parts[4]["text"] == "after"
+
+    def test_explicit_images_do_not_bypass_single_image_limit(self):
+        message = dict(role="user", content=[dict(type="image"), dict(type="image")])
+        with pytest.raises(ValueError, match="multi-image"):
+            apply_chat_template(None, dict(model_type="mllama"), message)
+
+    def test_tool_image_does_not_add_another_image_to_user_turn(self):
+        messages = [
+            dict(role="user", content="Inspect the result."),
+            dict(role="tool", tool_call_id="image", content=[dict(type="image")]),
+            dict(role="user", content="What changed?"),
+        ]
+        rendered = apply_chat_template(
+            None, dict(model_type="qwen3_vl"), messages, num_images=1
+        )
+        assert rendered.count("<image>") == 1
+        assert (
+            rendered.index("Tool:")
+            < rendered.index("<image>")
+            < rendered.index("What changed?")
+        )
+
     def test_image_stays_on_its_original_user_turn(self):
         messages = [
             dict(

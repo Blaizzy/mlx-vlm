@@ -1293,7 +1293,10 @@ def test_anthropic_image_normalization(client):
         client,
         "messages",
         [_msg([dict(type="text", text="Describe it."), image])],
-        [_msg("You are concise.", "system"), _msg("Describe it.")],
+        [
+            _msg("You are concise.", "system"),
+            _msg([dict(type="text", text="Describe it."), dict(type="image")]),
+        ],
         system="You are concise.",
         max_tokens=12,
     )
@@ -1311,6 +1314,46 @@ def test_anthropic_image_normalization(client):
             output_tokens=4,
         ),
     )
+
+
+@pytest.mark.parametrize("api", ["chat", "responses", "messages"])
+@pytest.mark.parametrize("family", ["deepseek_v4", "qwen3_vl", "phi4mm"])
+def test_interleaved_images_survive_endpoint_templating(client, api, family):
+    urls = ["data:image/png;base64,FIRST", "data:image/png;base64,SECOND"]
+
+    def image_part(url):
+        if api == "messages":
+            return dict(type="image", source=dict(type="url", url=url))
+        if api == "responses":
+            return _input_image(url)
+        return dict(type="image_url", image_url=dict(url=url))
+
+    text_type = "input_text" if api == "responses" else "text"
+    first = _msg(
+        [
+            dict(type=text_type, text="before "),
+            image_part(urls[0]),
+            dict(type=text_type, text=" between "),
+            image_part(urls[1]),
+            dict(type=text_type, text=" after"),
+        ]
+    )
+    messages = [first, _msg("Seen.", "assistant"), _msg("Follow up.")]
+    with _endpoint(model_type=family) as fake:
+        fake.template.side_effect = apply_chat_template
+        response = _post(
+            client, api, **{"input" if api == "responses" else "messages": messages}
+        )
+    assert response.status_code == 200, response.text
+    prompt = fake.generate.call_args.kwargs["prompt"]
+    markers = (
+        ("<|image_1|>", "<|image_2|>") if family == "phi4mm" else ("<image>", "<image>")
+    )
+    assert f"before {markers[0]} between {markers[1]} after" in prompt
+    assert prompt.index(markers[1]) < prompt.index("Seen.") < prompt.index("Follow up.")
+    assert sum(prompt.count(marker) for marker in set(markers)) == 2
+    assert "base64" not in prompt
+    assert fake.generate.call_args.kwargs["image"] == urls
 
 
 def test_anthropic_system_normalization(client):
@@ -1377,6 +1420,33 @@ def test_anthropic_tool_result_normalization(client, image):
             ]
             == ""
         )
+
+
+def test_anthropic_tool_image_payloads_follow_normalized_message_order(client):
+    def image(url):
+        return dict(type="image", source=dict(type="url", url=url))
+
+    tool_url, user_url = "https://example.com/tool.png", "https://example.com/user.png"
+    messages = [
+        _msg(
+            [
+                dict(
+                    type="tool_result", tool_use_id="image", content=[image(tool_url)]
+                ),
+                dict(type="text", text="Compare with "),
+                image(user_url),
+            ]
+        )
+    ]
+    with _endpoint() as fake:
+        fake.template.side_effect = apply_chat_template
+        response = _post(client, "messages", messages=messages)
+    assert response.status_code == 200, response.text
+    prompt = fake.generate.call_args.kwargs["prompt"]
+    assert prompt.count("<image>") == 2
+    assert "Compare with <image>" in prompt
+    assert prompt.index("Compare with") < prompt.index("Tool:")
+    assert fake.generate.call_args.kwargs["image"] == [user_url, tool_url]
 
 
 def _assert_chat_and_responses_messages(client, messages, expected, **extra):
