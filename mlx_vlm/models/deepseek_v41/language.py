@@ -1287,6 +1287,10 @@ class LanguageModel(nn.Module):
         start_pos = entry.offset
         if input_ids is None:
             input_ids = inputs
+        if image_mask is None and input_ids is not None:
+            # Expanded image spans retain image_token_id, including delimiters.
+            image_mask = input_ids == self.config.image_token_id
+        engram_mask = None if image_mask is None else ~image_mask
         if inputs_embeds is None:
             h = self.embed_tokens(input_ids)
         else:
@@ -1299,7 +1303,9 @@ class LanguageModel(nn.Module):
         if engram_hashes is None and input_ids is not None:
             self._ensure_engram_hash()
             if self.engram_hash is not None:
-                engram_hashes = self.engram_hash(input_ids, start_pos, entry)
+                engram_hashes = self.engram_hash(
+                    input_ids, start_pos, entry, token_mask=engram_mask
+                )
         main_hiddens = []
         capture_ids = (
             self.target_layer_ids if capture_layer_ids is None else capture_layer_ids
@@ -1310,7 +1316,7 @@ class LanguageModel(nn.Module):
                 h = layer.engram(
                     h,
                     engram_hashes[:, :, layer.engram.layer_hash_index, :],
-                    None if image_mask is None else ~image_mask,
+                    engram_mask,
                 )
             if i in capture_ids:
                 main_hiddens.append(h.mean(axis=2))

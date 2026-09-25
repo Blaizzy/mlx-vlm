@@ -3,7 +3,7 @@ from functools import lru_cache
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..deepseek_v4.vision import apply_rotary
+from ..deepseek_v4.vision import VISION_NORM_EPS, apply_rotary
 from ..deepseek_v4.vision import get_vision_cos_sin as _get_vision_cos_sin
 from .config import ModelConfig
 
@@ -73,9 +73,9 @@ class VisionBlock(nn.Module):
 
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.norm1 = nn.RMSNorm(config.vision_hidden_size)
+        self.norm1 = nn.RMSNorm(config.vision_hidden_size, eps=VISION_NORM_EPS)
         self.attn = VisionAttention(config)
-        self.norm2 = nn.RMSNorm(config.vision_hidden_size)
+        self.norm2 = nn.RMSNorm(config.vision_hidden_size, eps=VISION_NORM_EPS)
         self.mlp = VisionMLP(config)
 
     def __call__(self, x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
@@ -92,7 +92,7 @@ class ViT(nn.Module):
         self.rope_theta = config.vision_rope_theta
         self.patch_embed = PatchEmbed(config)
         self.blocks = [VisionBlock(config) for _ in range(config.vision_num_layers)]
-        self.norm = nn.RMSNorm(config.vision_hidden_size)
+        self.norm = nn.RMSNorm(config.vision_hidden_size, eps=VISION_NORM_EPS)
 
     def __call__(self, patches: mx.array, n_h: int, n_w: int) -> mx.array:
         x = self.patch_embed(patches)

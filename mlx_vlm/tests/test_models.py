@@ -2286,6 +2286,9 @@ class TestDeepseekV41Engram(unittest.TestCase):
     true. Nothing failed - the weights loaded and the layers were skipped.
     """
 
+    def setUp(self):
+        mx.random.seed(0)
+
     @staticmethod
     def _config(**overrides):
         return deepseek_v41_config("stack", **overrides)
@@ -2411,3 +2414,56 @@ class TestDeepseekV41Engram(unittest.TestCase):
         )
         mx.eval(diff)
         self.assertLess(float(mx.max(diff).item()), 1e-4)
+
+    def test_image_tokens_use_visual_routing_and_break_engram_history(self):
+        """The generation path supplies token ids, including during chunked prefill.
+
+        Match the reference's explicit image mask and masked n-gram hashes,
+        even when a prefill boundary falls inside an image span.
+        """
+        from mlx_vlm.models.deepseek_v41.language import LanguageModel
+
+        config = self._config(image_token_id=5)
+        model = self._with_hash_state(LanguageModel(config), config)
+        model.head.weight = mx.random.normal(model.head.weight.shape) * 0.05
+        for layer in model.layers:
+            layer.ffn.gate.bias = mx.array([10.0, 9.0, 0.0, 0.0])
+            layer.ffn.gate.bias_vl = mx.array([0.0, 0.0, 10.0, 9.0])
+
+        ids = mx.array([[3, 7, 5, 5, 5, 11, 15, 19]])
+        image_mask = ids == config.image_token_id
+        embeds = model.embed_tokens(ids)
+        embeds = mx.where(image_mask[..., None], mx.random.normal(embeds.shape), embeds)
+        reference_cache = model.make_cache()
+        hashes = model.engram_hash(ids, 0, reference_cache[0], token_mask=~image_mask)
+        expected = model(
+            ids,
+            inputs_embeds=embeds,
+            cache=reference_cache,
+            image_mask=image_mask,
+            engram_hashes=hashes,
+        ).logits
+        mx.eval(expected)
+
+        for chunks in ((8,), (3, 2, 3)):
+            with self.subTest(chunks=chunks):
+                cache = model.make_cache()
+                outputs, start = [], 0
+                for length in chunks:
+                    stop = start + length
+                    outputs.append(
+                        model(
+                            inputs=ids[:, start:stop],
+                            inputs_embeds=embeds[:, start:stop],
+                            cache=cache,
+                            n_to_process=length,
+                        ).logits
+                    )
+                    start = stop
+                actual = mx.concatenate(outputs, axis=1)
+                mx.eval(actual)
+                self.assertTrue(
+                    bool(mx.array_equal(cache[0].engram, reference_cache[0].engram))
+                )
+                self.assertTrue(bool(mx.all(cache[0].engram[:, 2:5] == -1)))
+                self.assertTrue(bool(mx.allclose(actual, expected, atol=1e-4)))

@@ -25,6 +25,7 @@ _RENDER_CONTENT = (
     "{{- content -}}"
     "{%- else -%}"
     "{%- for part in content -%}"
+    "{%- if not loop.first -%}{{- '\\n\\n' -}}{%- endif -%}"
     "{%- if part['type'] in ('image', 'image_url', 'input_image') -%}"
     "{{- '" + IMAGE_PLACEHOLDER + "' -}}"
     "{%- elif part['type'] == 'text' -%}"

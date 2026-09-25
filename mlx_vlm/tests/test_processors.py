@@ -1720,8 +1720,12 @@ class TestApplyChatTemplateIntegration:
         rendered = apply_chat_template(None, dict(model_type="qwen3_vl"), [message])
         assert rendered == "before <image>"
 
-    @pytest.mark.parametrize("family", ["deepseek", "deepseek41"])
-    def test_deepseek_processor_preserves_inline_image_position(self, family):
+    @pytest.mark.parametrize(
+        "family,separator", [("deepseek", ""), ("deepseek41", "\n\n")]
+    )
+    def test_deepseek_processor_preserves_inline_image_position(
+        self, family, separator
+    ):
         tokenizer = PreTrainedTokenizerFast(
             tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]")),
             unk_token="[UNK]",
@@ -1739,7 +1743,7 @@ class TestApplyChatTemplateIntegration:
         rendered = apply_chat_template(
             processor, dict(model_type=model_type), message, num_images=1
         )
-        assert "before<｜deepseek_image｜>after" in rendered
+        assert f"before{separator}<｜deepseek_image｜>{separator}after" in rendered
 
     @pytest.mark.parametrize(
         "family,expected",
