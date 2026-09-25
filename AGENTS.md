@@ -3,7 +3,7 @@
 Guidance for coding agents (and humans) working in the mlx-vlm repository. For the
 narrative version, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-## Start here: skills
+## skills
 
 This repo ships an agent-skills bundle under [`skills/skills/`](skills/skills) that
 encodes the project's own conventions for common workflows. **Load the relevant skill
