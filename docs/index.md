@@ -2,7 +2,9 @@
 
 mlx-vlm is a fast and simple local inference engine that supports vision, text, audio, video, omni, embedding, and re-ranking models through a single CLI, an OpenAI/Anthropic-compatible server, and a Python API built ontop of [mlx](https://github.com/ml-explore/mlx).
 
-
+- **[Run models on mlx-vlm](getting-started.md)** — install and run inference from the CLI or Python.
+- **[Build on top of mlx-vlm](server.md)** — serve models over an OpenAI/Anthropic-compatible API.
+- **[Build mlx-vlm](contributing.md)** — set up a dev environment and contribute models or fixes.
 
 ## Documentation
 
