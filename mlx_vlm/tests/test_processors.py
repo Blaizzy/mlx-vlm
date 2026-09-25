@@ -2168,6 +2168,93 @@ def test_invalid_calls(name, text, error):
             _call("get_weather", zip="10001", days=3),
             _weather_tools(zip="string", days="integer"),
         ),
+        (
+            "qwen3_coder",
+            dict,
+            '<function=configure>\n<parameter=options>\n{"depth": 2}\n</parameter>\n'
+            "<parameter=ids>\n[1, 2]\n</parameter>\n"
+            "<parameter=tag>\n123\n</parameter>\n</function>",
+            _call("configure", options={"depth": 2}, ids=[1, 2], tag="123"),
+            [
+                dict(
+                    type="function",
+                    function=dict(
+                        name="configure",
+                        parameters=dict(
+                            type="object",
+                            properties=dict(
+                                options=dict(description="untyped"),
+                                ids=dict(description="untyped"),
+                                tag=dict(description="untyped"),
+                            ),
+                        ),
+                    ),
+                )
+            ],
+        ),
+        (
+            "qwen3_coder",
+            dict,
+            "<function=write>\n<parameter=content>\nfirst\n"
+            "<parameter=name>\nlast\n</parameter>\n</function>",
+            _call("write", content="first\n<parameter=name>\nlast"),
+            None,
+        ),
+        (
+            "qwen3_coder",
+            dict,
+            "<function=write>\n<parameter=path>\na.txt\n</parameter>\n"
+            "<parameter=content>\nhello\n</function>",
+            _call("write", path="a.txt", content="hello"),
+            None,
+        ),
+        (
+            "qwen3_coder",
+            dict,
+            "<function=write>\n<parameter=path>\na.txt\n</parameter>\n"
+            "<parameter=content\n</function>",
+            _call("write", path="a.txt"),
+            None,
+        ),
+        (
+            "qwen3_coder",
+            dict,
+            "<function=get_weather>\n<parameter=zip>\n10001\n</parameter>\n"
+            "<parameter=days>\nthree\n</function>",
+            _call("get_weather", zip="10001"),
+            _weather_tools(zip="string", days="integer"),
+        ),
+        (
+            "qwen3_coder",
+            dict,
+            "<function=write><parameter=content><parameter=</parameter></function>",
+            _call("write", content="<parameter="),
+            None,
+        ),
+        (
+            "qwen3_coder",
+            dict,
+            "<function=write><parameter=content>"
+            "Use <parameter=name> in the template.</parameter></function>",
+            _call("write", content="Use <parameter=name> in the template."),
+            None,
+        ),
+        (
+            "qwen3_coder",
+            dict,
+            '<function=configure><parameter=options>{"depth": 2}</parameter>'
+            "</function>",
+            _call("configure", options={"depth": 2}),
+            [
+                dict(
+                    type="function",
+                    function=dict(
+                        name="configure",
+                        parameters=dict(type="object", properties=dict(options={})),
+                    ),
+                )
+            ],
+        ),
     ],
     ids=[
         "gemma-nested",
@@ -2177,6 +2264,14 @@ def test_invalid_calls(name, text, error):
         "cohere-object",
         "cohere-array-escape",
         "glm-newline",
+        "qwen-untyped",
+        "qwen-line-start-parameter-tag",
+        "qwen-unclosed-last",
+        "qwen-truncated-parameter-tag",
+        "qwen-unclosed-last-invalid",
+        "qwen-literal-parameter-prefix",
+        "qwen-literal-parameter-tag",
+        "qwen-empty-property-schema",
     ],
 )
 def test_parser_syntax(parser, argument_type, text, expected, tools):
@@ -2186,6 +2281,23 @@ def test_parser_syntax(parser, argument_type, text, expected, tools):
     expected_calls = expected if isinstance(expected, list) else [expected]
     assert all(isinstance(call["arguments"], argument_type) for call in calls)
     assert [dict(call, arguments=_arguments(call)) for call in calls] == expected_calls
+
+
+@pytest.mark.parametrize("name", PARSER_NAMES)
+def test_parser_accepts_boolean_property_schemas(name):
+    # ``true`` is a valid JSON Schema for a property that admits any value.
+    tools = [
+        dict(
+            type="function",
+            function=dict(
+                name="get_weather",
+                parameters=dict(type="object", properties=dict(city=True, days=True)),
+            ),
+        )
+    ]
+    result = process_tool_calls(WIRE_CALLS[name], load_tool_module(name), tools)
+    assert [call["function"]["name"] for call in result.calls] == ["get_weather"]
+    assert json.loads(result.calls[0]["function"]["arguments"])["city"] == "Paris"
 
 
 @pytest.mark.parametrize(
