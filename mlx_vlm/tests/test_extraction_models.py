@@ -18,15 +18,9 @@ import numpy as np
 import pytest
 from mlx.utils import tree_flatten
 
-from mlx_vlm.gliner import (
-    GLiNER2,
-    _CharSplitter,
-    _resolve_flat_overlaps,
-    _schema_tokens,
-    _WhitespaceSplitter,
-)
 from mlx_vlm.models.bert import ModelConfig as BertConfig
 from mlx_vlm.models.bert import TokenClassificationModel as BertTokenClassifier
+from mlx_vlm.models.gliner2_5 import GLiNER2
 from mlx_vlm.models.gliner2_5 import Model as GlinerModel
 from mlx_vlm.models.gliner2_5 import ModelConfig as GlinerConfig
 from mlx_vlm.models.gliner2_5.boundary import (
@@ -34,6 +28,12 @@ from mlx_vlm.models.gliner2_5.boundary import (
     Marginals,
     PooledCandidates,
     SharedPoolScorer,
+)
+from mlx_vlm.models.gliner2_5.gliner2_5 import (
+    _CharSplitter,
+    _resolve_flat_overlaps,
+    _schema_tokens,
+    _WhitespaceSplitter,
 )
 from mlx_vlm.models.openai_privacy_filter import Model as PrivacyModel
 from mlx_vlm.models.openai_privacy_filter import ModelConfig as PrivacyConfig

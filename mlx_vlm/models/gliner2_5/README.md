@@ -7,7 +7,7 @@ Native MLX inference for the Fastino GLiNER2.5 boundary-extractor checkpoints:
 - `fastino/gliner2.5-multi-v1`
 
 ```python
-from mlx_vlm.gliner import load_gliner
+from mlx_vlm.models.gliner2_5 import load_gliner
 
 extractor = load_gliner("fastino/gliner2.5-small-v1")
 
