@@ -16,6 +16,18 @@ pip install -U 'mlx-vlm[ui]'
 
 Quote the package name so that shells which expand square brackets, such as `zsh`, do not treat `[ui]` as a glob pattern.
 
+### Optional extras
+
+Install extra dependency groups with `pip install -U 'mlx-vlm[<extra>]'` (quote the name so shells like `zsh` don't expand the brackets). Combine them with commas, e.g. `pip install -U 'mlx-vlm[ui,train]'`.
+
+| Extra | Adds | For |
+|-------|------|-----|
+| `ui` | `gradio` | The Gradio chat UI (`mlx_vlm.chat_ui`) |
+| `train` | `datasets` (which pulls in `pandas`) | LoRA / QLoRA fine-tuning |
+| `realtime` | `sounddevice` | Realtime full-duplex speech (server `/v1/realtime`) |
+| `cuda` | `mlx-cuda` | Running on NVIDIA GPUs with MLX CUDA |
+| `cpu` | `mlx-cpu` | CPU-only MLX builds |
+
 ## Command Line Interface (CLI)
 
 Generate output from a model using the CLI:
