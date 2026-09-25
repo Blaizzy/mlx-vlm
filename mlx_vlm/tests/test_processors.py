@@ -636,6 +636,30 @@ def test_auto_processor_routes_to_custom_loader(
             AutoProcessor.from_pretrained(tmp_path)
 
 
+def test_qwen3_5_moe_text_stale_vl_processor_loads_tokenizer(tmp_path):
+    importlib.import_module("mlx_vlm.models.qwen3_5_moe_text")
+    cases = json.loads(Path(__file__).with_name("model_cases.json").read_text())
+    config = next(c for c in cases["cases"] if c["module"] == "qwen3_5_moe_text")[
+        "config"
+    ]
+    vocab = {f"t{i}": i for i in range(32)}
+    backend = Tokenizer(WordLevel(vocab, unk_token="t0"))
+    backend.pre_tokenizer = Whitespace()
+    PreTrainedTokenizerFast(
+        tokenizer_object=backend, unk_token="t0", eos_token="t1"
+    ).save_pretrained(tmp_path)
+    tokenizer_config = tmp_path / "tokenizer_config.json"
+    data = json.loads(tokenizer_config.read_text())
+    data["processor_class"] = "Qwen3VLProcessor"
+    tokenizer_config.write_text(json.dumps(data))
+    (tmp_path / "config.json").write_text(json.dumps(config))
+
+    processor = load_processor(tmp_path, eos_token_ids=[1])
+
+    assert not hasattr(processor, "image_processor")
+    assert processor.encode("t3 t4", add_special_tokens=False) == [3, 4]
+
+
 class _ImageStub:
     model_input_names = ["pixel_values"]
     merge_size, max_image_tiles = 2, 4
