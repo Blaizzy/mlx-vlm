@@ -1,6 +1,8 @@
 # mlx-vlm
 
-mlx-vlm is a package for inference and fine-tuning of Vision Language Models (VLMs) on Apple silicon using [MLX](https://github.com/ml-explore/mlx). It supports vision, text, audio, video, omni, embedding, and re-ranking models through a single CLI, an OpenAI-compatible server, and a Python API.
+mlx-vlm is a fast and simple local inference engine that supports vision, text, audio, video, omni, embedding, and re-ranking models through a single CLI, an OpenAI/Anthropic-compatible server, and a Python API built ontop of [mlx](https://github.com/ml-explore/mlx).
+
+
 
 ## Documentation
 
