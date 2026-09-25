@@ -272,8 +272,10 @@ class ToolCallStreamState:
 
     Marker fragments are buffered until they either complete or stop matching.
     Text outside calls is emitted exactly once; text and markup inside calls is
-    discarded. Parsers with no end marker keep the historical latching behavior
-    after the first start marker.
+    discarded. Whitespace-only text after a call is held back: it is dropped at
+    the end of generation, and before another call when no text has been shown,
+    as the non-streamed response strips it. Parsers with no end marker keep the
+    historical latching behavior after the first start marker.
     """
 
     def __init__(
@@ -285,6 +287,9 @@ class ToolCallStreamState:
         self.tc_end = tc_end or ""
         self.in_tool_call = False
         self.buffer = ""
+        self.after_call = False
+        self.pending_space = ""
+        self.shown_text = False
 
     def feed(self, text: Optional[str], last: bool = False) -> Optional[str]:
         if not self.tc_start:
@@ -303,25 +308,43 @@ class ToolCallStreamState:
 
             marker_at = self.buffer.find(marker)
             if marker_at >= 0:
-                if not self.in_tool_call and marker_at:
-                    visible.append(self.buffer[:marker_at])
+                if not self.in_tool_call:
+                    self._show(self.buffer[:marker_at], visible)
+                    if not self.shown_text:
+                        self.pending_space = ""
                 self.buffer = self.buffer[marker_at + len(marker) :]
                 self.in_tool_call = not self.in_tool_call
+                self.after_call = not self.in_tool_call
                 continue
 
             stable, self.buffer = self._split_partial_marker(self.buffer, marker)
-            if stable and not self.in_tool_call:
-                visible.append(stable)
+            if not self.in_tool_call:
+                self._show(stable, visible)
             break
 
-        if last and self.buffer:
-            if not self.in_tool_call:
+        if last:
+            if self.buffer and not self.in_tool_call:
                 # An unfinished start-marker prefix is ordinary content when
                 # generation ends before the marker can complete.
-                visible.append(self.buffer)
+                self._show(self.buffer, visible)
             self.buffer = ""
+            self.pending_space = ""
 
         return "".join(visible) or None
+
+    def _show(self, text: str, visible: list) -> None:
+        if not text:
+            return
+        if self.after_call:
+            if text.isspace():
+                self.pending_space += text
+                return
+            text = self.pending_space + text
+            self.pending_space = ""
+            self.after_call = False
+        if not text.isspace():
+            self.shown_text = True
+        visible.append(text)
 
     @staticmethod
     def _split_partial_marker(text: str, marker: str) -> Tuple[str, str]:
