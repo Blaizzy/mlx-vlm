@@ -53,6 +53,7 @@ from .responses_state import (
     prompt_has_open_thinking,
     response_store,
     response_store_lock,
+    strip_protocol_markers,
 )
 from .runtime import runtime
 from .schemas import (
@@ -2257,13 +2258,15 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
                         )
-                        if clean_remaining:
-                            # Strip model control tokens such as <|im_end|>.
-                            # Other <...> text is content the model wrote.
-                            clean_remaining = re.sub(
-                                r"<\|[^>]+\|>", "", clean_remaining
-                            ).strip()
-                        content = clean_remaining or None
+                        content = (
+                            strip_protocol_markers(
+                                clean_remaining,
+                                tool_module,
+                                gen_args.thinking_start_token,
+                                gen_args.thinking_end_token,
+                            )
+                            or None
+                        )
 
                 response_logprobs = None
                 if request.logprobs and collected_logprobs:

@@ -292,6 +292,7 @@ class ToolCallStreamState:
         self.call_text = ""
         self.pending_space = ""
         self.shown_text = False
+        self.closed_call = False
         self.finished = False
 
     def feed(self, text: Optional[str], last: bool = False) -> Optional[str]:
@@ -311,7 +312,10 @@ class ToolCallStreamState:
             marker_at = self.buffer.find(marker)
             if marker_at >= 0:
                 if self.in_tool_call:
+                    # process_tool_calls replaces each call with a space.
                     self.call_text = ""
+                    self.pending_space += " "
+                    self.closed_call = True
                 else:
                     self._show(self.buffer[:marker_at], visible)
                     self.call_text = marker
@@ -333,8 +337,12 @@ class ToolCallStreamState:
             if self.in_tool_call:
                 if self.tc_end:
                     # No end marker arrived, so the extractor finds no call and
-                    # keeps this text as content.
-                    self._show(self.call_text + self.buffer, visible)
+                    # keeps this text as content. Beside a parsed call the
+                    # non-streamed response strips its marker.
+                    text = self.call_text + self.buffer
+                    if self.closed_call and _is_whole_tag(self.tc_start):
+                        text = text.removeprefix(self.tc_start)
+                    self._show(text, visible)
             elif self.buffer:
                 # An unfinished start-marker prefix is ordinary content when
                 # generation ends before the marker can complete.
@@ -369,6 +377,40 @@ class ToolCallStreamState:
             if text.endswith(marker[:length]):
                 return text[:-length], text[-length:]
         return text, ""
+
+
+def _is_whole_tag(marker: str) -> bool:
+    """Whether ``marker`` is a complete tag, never a prefix of ordinary text.
+
+    MiniCPM5 starts a call with the bare prefix ``<function``, which prose can
+    contain; only markers such as ``<tool_call>`` or ``[TOOL_CALLS]`` are safe
+    to remove on sight.
+    """
+    return bool(re.fullmatch(r"<[^<>]+>|\[[^\[\]]+\]", marker))
+
+
+def strip_protocol_markers(
+    text: str,
+    tool_module: Any,
+    thinking_start_token: Optional[str] = None,
+    thinking_end_token: Optional[str] = None,
+) -> str:
+    """Remove protocol residue left beside a parsed tool call.
+
+    Drops ``<|...|>`` control tokens (a model can run past its end token), the
+    parser's own call markers, and thinking markers, when they are whole tags.
+    Other ``<...>`` text, such as ``<b>``, is content the model wrote and is
+    kept.
+    """
+    text = re.sub(r"<\|[^>]+\|>", "", text)
+    markers = [tool_module.tool_call_start, tool_module.tool_call_end]
+    for pair in ThinkingStreamState._build_open_close_markers(
+        thinking_start_token, thinking_end_token
+    ):
+        markers.extend(pair)
+    for marker in sorted(filter(_is_whole_tag, markers), key=len, reverse=True):
+        text = text.replace(marker, "")
+    return text.strip()
 
 
 def finish_content_streams(thinking_state, tool_call_state):
@@ -501,7 +543,9 @@ def _response_output_items_from_text(
                 thinking_start_token,
                 thinking_end_token,
             )
-            remaining = re.sub(r"<\|[^>]+\|>", "", remaining).strip()
+            remaining = strip_protocol_markers(
+                remaining, tool_module, thinking_start_token, thinking_end_token
+            )
             return reasoning_items + items, remaining, reasoning, "tool_calls"
     item = {
         "id": message_id,

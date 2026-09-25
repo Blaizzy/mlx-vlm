@@ -48,7 +48,11 @@ from mlx_vlm.server import GenerationArguments as Args
 from mlx_vlm.server import ResponseGenerator as Generator
 from mlx_vlm.server import realtime
 from mlx_vlm.server.model_discovery import discover_models, is_model_directory
-from mlx_vlm.server.responses_state import ToolCallStreamState, _response_items_to_chat
+from mlx_vlm.server.responses_state import (
+    ToolCallStreamState,
+    _response_items_to_chat,
+    strip_protocol_markers,
+)
 from mlx_vlm.server.runtime_config import RuntimeConfig
 from mlx_vlm.tests.test_processors import MINICPM_MULTICALL
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
@@ -3413,7 +3417,7 @@ def test_unknown_function_output_blocks_remain_text():
             [*MINICPM_MULTICALL, ""],
             "<function",
             "</function>",
-            "BeforeBetweenAfter",
+            "Before Between After",
             False,
         ),
         (
@@ -3441,7 +3445,7 @@ def test_unknown_function_output_blocks_remain_text():
             list("A<tool_call>x</tool_call> \n<tool_call>y</tool_call>B"),
             "<tool_call>",
             "</tool_call>",
-            "A \nB",
+            "A  \n B",
             False,
         ),
         (
@@ -3469,7 +3473,7 @@ def test_unknown_function_output_blocks_remain_text():
             ["Before ", "[TOOL_CALLS]foo[ARGS]{}", "\nAfter"],
             "[TOOL_CALLS]",
             "",
-            "Before After",
+            "Before  After",
             False,
         ),
     ],
@@ -3497,31 +3501,42 @@ def test_tool_stream_finalization(chunks, start_marker, end_marker, expected, in
     assert state.in_tool_call is inside
 
 
+_CALL = '<tool_call>{"name": "get_weather", "arguments": {}}</tool_call>'
+
+
 @pytest.mark.parametrize(
     "parser,text",
     [
-        ("qwen3_coder", "<tool_call>a</tool_call>\n<tool_call>b</tool_call>\n"),
-        ("qwen3_coder", "Hi <tool_call>a</tool_call>\n<tool_call>b</tool_call>\n bye"),
-        ("qwen3_coder", "<tool_call>a</tool_call> \nDone."),
-        ("qwen3_coder", "A<tool_call>x</tool_call>\nB<tool_call>unfinished"),
-        ("qwen3_coder", "No calls\n\n"),
+        ("json_tools", f"{_CALL}\n{_CALL}\n"),
+        ("json_tools", f"Hi {_CALL}\n{_CALL}\n bye"),
+        ("json_tools", f"{_CALL} \nDone."),
+        ("json_tools", f"A{_CALL}B"),
+        ("json_tools", f"A{_CALL}\nB<tool_call>unfinished"),
+        ("json_tools", "A <tool_call>unfinished"),
+        ("json_tools", "No calls\n\n"),
+        ("minicpm5", '<function name="get_time"></function>Use <function as a prefix.'),
         ("mistral", 'Before [TOOL_CALLS]foo[ARGS]{"a": 1}\nAfter'),
         ("mistral", "[TOOL_CALLS]foo[ARGS]{}\n[TOOL_CALLS]bar[ARGS]{}"),
     ],
 )
 def test_tool_stream_matches_non_streamed_content(parser, text):
-    # Streamed content equals the stripped content process_tool_calls leaves,
-    # up to the separator it substitutes for each call, whatever the chunking.
+    # Streamed content equals the non-streamed content, whatever the chunking:
+    # beside a parsed call, the text process_tool_calls leaves with protocol
+    # markers removed; otherwise the whole output. Both are stripped.
     module = load_tool_module(parser)
-    expected = " ".join(process_tool_calls(text, module, None).remaining_text.split())
+    parsed = process_tool_calls(text, module, None)
+    expected = (
+        strip_protocol_markers(parsed.remaining_text, module)
+        if parsed.calls
+        else text.strip()
+    )
     for chunks in ([text], list(text)):
         state = ToolCallStreamState(module.tool_call_start, module.tool_call_end)
         streamed = "".join(
             state.feed(chunk, last=i == len(chunks) - 1) or ""
             for i, chunk in enumerate(chunks)
         )
-        assert " ".join(streamed.split()) == expected
-        assert streamed == streamed.strip()
+        assert streamed == expected
 
 
 _WEATHER_CALL = '<tool_call>{"name": "get_weather", "arguments": {}}</tool_call>'
@@ -3575,7 +3590,10 @@ def test_stream_without_finish_token_flushes_held_text(client, api):
 
 @pytest.mark.parametrize("api", ["chat", "responses"])
 def test_tool_call_content_keeps_angle_bracket_text(client, api):
-    result = _result(f"Use <b>bold</b>.<|im_end|> {_WEATHER_CALL}")
+    result = _result(
+        f"<think>r</think>Use <b>bold</b>.<|im_end|></think> {_WEATHER_CALL}"
+        " </tool_call>"
+    )
     tool = (
         dict(type="function", name="get_weather", parameters={"type": "object"})
         if api == "responses"
