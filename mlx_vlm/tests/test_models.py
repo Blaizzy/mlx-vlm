@@ -9,11 +9,9 @@ import json
 import logging
 import math
 import struct
-import tempfile
 import textwrap
 import unittest
 from contextlib import contextmanager
-from dataclasses import asdict
 from operator import attrgetter
 from pathlib import Path
 from types import SimpleNamespace
@@ -609,85 +607,6 @@ def tiny_config(family, profile=None, **overrides):
     fields = TINY_DEFAULTS | case["config"] | case.get("profiles", {}).get(profile, {})
     module = importlib.import_module("mlx_vlm.models." + case["module"])
     return build_config(module, fields | overrides, case["config_type"])
-
-
-_DEEPSEEK_V41_BASE = {
-    "vocab_size": 64,
-    "hidden_size": 16,
-    "num_hidden_layers": 1,
-    "num_nextn_predict_layers": 0,
-    "num_attention_heads": 2,
-    "head_dim": 32,
-    "qk_rope_head_dim": 8,
-    "q_lora_rank": 8,
-    "o_lora_rank": 4,
-    "o_groups": 1,
-    "sliding_window": 4,
-    "compress_ratios": [0],
-    "kv_source_layer_ids": [],
-    "index_source_layer_ids": [],
-    "index_n_heads": 2,
-    "index_head_dim": 32,
-    "index_topk": 4,
-    "moe_intermediate_size": 8,
-    "n_routed_experts": 4,
-    "num_experts_per_tok": 2,
-    "hc_mult": 2,
-    "hc_sinkhorn_iters": 2,
-    "dspark_target_layer_ids": [],
-    "engram_layer_ids": [],
-    "engram_num_embeddings": [256],
-    "engram_max_ngram_size": 3,
-    "engram_vocab_size": 512,
-    "engram_n_heads": 2,
-    "engram_head_dim": 8,
-    "engram_compressed_vocab_size": 7,
-}
-
-_DEEPSEEK_V41_PROFILES = {
-    "sparse": {
-        "num_hidden_layers": 4,
-        "compress_ratios": [2, 2, 1, 0],
-        "kv_source_layer_ids": [0],
-        "index_source_layer_ids": [0, 1, 2],
-        "candidate_source_layer_id": 1,
-        "candidate_topk_blocks": 2,
-        "candidate_block_size": 2,
-    },
-    "stack": {
-        "hidden_size": 32,
-        "num_hidden_layers": 5,
-        "compress_ratios": [0, 2, 2, 1, 0],
-        "max_position_embeddings": 64,
-        "sliding_window": 8,
-        "qk_rope_head_dim": 4,
-        "o_lora_rank": 8,
-        "o_groups": 2,
-        "moe_intermediate_size": 16,
-        "kv_source_layer_ids": [1, 3],
-        "index_source_layer_ids": [1, 2],
-        "candidate_source_layer_id": 1,
-        "candidate_topk_blocks": 4,
-        "candidate_block_size": 2,
-        "dspark_target_layer_ids": [3],
-        "engram_layer_ids": [1],
-        "engram_num_embeddings": [1024],
-    },
-}
-
-
-def deepseek_v41_config(profile=None, **overrides):
-    """Tiny deepseek_v41 config for its own op/sanitize/engram/vision tests.
-
-    Deliberately not a ``shared_configs`` entry: ``test_speculative`` parametrizes
-    over every shared family and deepseek_v41 ships no speculative drafter, so it
-    would enroll in contracts it cannot satisfy.
-    """
-    module = importlib.import_module("mlx_vlm.models.deepseek_v41")
-    fields = (
-        TINY_DEFAULTS | _DEEPSEEK_V41_BASE | _DEEPSEEK_V41_PROFILES.get(profile, {})
-    )
-    return build_config(module, fields | overrides, "ModelConfig")
 
 
 def test_gemma3_can_preserve_caller_supplied_embedding_scale():
@@ -2135,85 +2054,12 @@ class TestQwen3_5MoeText(unittest.TestCase):
                 self.assertTrue(mx.allclose(missing, explicit, atol=1e-5).item())
 
 
-# DeepSeek-V4.1 engram, vision splice and checkpoint keys
+# DeepSeek-V4.1 regressions beyond the shared model contracts
 
 
 class TestDeepseekV41EndToEnd(unittest.TestCase):
     def setUp(self):
         mx.random.seed(0)
-
-    @staticmethod
-    def _config():
-        return deepseek_v41_config(
-            "sparse",
-            num_hidden_layers=2,
-            compress_ratios=[2, 1],
-            engram_layer_ids=[1],
-            dspark_target_layer_ids=[1],
-            dspark_block_size=2,
-        )
-
-    @staticmethod
-    def _write_source(path, weights, dtypes):
-        header, buffers, offset = {}, [], 0
-        for key, value in weights.items():
-            data = np.asarray(value.view(mx.uint8)).tobytes()
-            dtype = {mx.float32: "F32", mx.bfloat16: "BF16", mx.uint8: "U8"}[
-                value.dtype
-            ]
-            header[key] = {
-                "dtype": dtypes.get(key, dtype),
-                "shape": list(value.shape),
-                "data_offsets": [offset, offset + len(data)],
-            }
-            offset += len(data)
-            buffers.append(data)
-        encoded = json.dumps(header).encode()
-        encoded += b" " * (-len(encoded) % 8)
-        path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + b"".join(buffers))
-
-    @staticmethod
-    def _processor(config):
-        from tokenizers import Tokenizer
-        from tokenizers.models import WordLevel
-        from transformers import PreTrainedTokenizerFast
-
-        from mlx_vlm.models.deepseek_v41.processing_deepseek_v41 import (
-            DeepseekV41Processor,
-        )
-
-        tokenizer = PreTrainedTokenizerFast(
-            tokenizer_object=Tokenizer(WordLevel({"<unk>": 0}, unk_token="<unk>")),
-            unk_token="<unk>",
-        )
-        return DeepseekV41Processor(tokenizer, config=config)
-
-    def test_nested_config_preserves_text_and_vision_settings(self):
-        from mlx_vlm.models.deepseek_v41 import ModelConfig
-
-        config = ModelConfig.from_dict(
-            {
-                "model_type": "deepseek_v41",
-                "text_config": {
-                    "model_type": "deepseek_v41_text",
-                    "hidden_size": 64,
-                    "rope_scaling": {"factor": 16},
-                },
-                "vision_config": {
-                    "num_hidden_layers": 3,
-                    "num_attention_heads": 4,
-                    "hidden_size": 32,
-                    "max_wh_ratio": 5,
-                },
-            }
-        )
-        self.assertEqual(config.model_type, "deepseek_v41")
-        self.assertEqual(config.hidden_size, 64)
-        self.assertEqual(config.rope_scaling, {"factor": 16})
-        self.assertEqual((config.vision_num_layers, config.vision_num_heads), (3, 4))
-        self.assertEqual(config.vision_hidden_size, 32)
-        self.assertEqual(config.vision_max_wh_ratio, 5)
-        self.assertEqual(ModelConfig.from_dict(asdict(config)), config)
 
     def test_fp8_scale_layouts_decode_exactly(self):
         from mlx_vlm.models.deepseek_v41.deepseek_v41 import _pack_source_weight
@@ -2234,134 +2080,6 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
                 if not rowwise:
                     expected = mx.repeat(expected, 32, axis=0)
                 self.assertTrue(mx.array_equal(decoded, expected).item())
-
-    def test_native_mixed_checkpoint_conversion(self):
-        from mlx_vlm.convert import convert
-        from mlx_vlm.models.deepseek_v41 import Model, ModelConfig
-        from mlx_vlm.models.deepseek_v41.engram import QuantizedEngramEmbedding
-
-        config = ModelConfig(
-            hidden_size=64,
-            vocab_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            head_dim=64,
-            qk_rope_head_dim=8,
-            q_lora_rank=64,
-            o_lora_rank=32,
-            o_groups=2,
-            moe_intermediate_size=64,
-            n_routed_experts=2,
-            num_experts_per_tok=1,
-            compress_ratios=[0],
-            kv_source_layer_ids=[],
-            index_source_layer_ids=[],
-            num_nextn_predict_layers=0,
-            engram_layer_ids=[0],
-            engram_num_embeddings=[17],
-            engram_head_dim=256,
-            engram_n_heads=1,
-            engram_max_ngram_size=2,
-            engram_vocab_size=16,
-            vision_num_layers=1,
-            vision_hidden_size=64,
-            vision_num_heads=4,
-            vision_intermediate_size=64,
-            vision_patch_size=2,
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            tmp_path = Path(directory)
-            source = tmp_path / "source"
-            source.mkdir()
-            weights, dtypes = {}, {}
-            for key, value in tree_flatten(Model(config).parameters()):
-                key = key.removeprefix("language_model.")
-                key = key.replace("embed_tokens.", "embed.")
-                if ".switch_mlp." in key:
-                    projection = key.split(".switch_mlp.")[1].split(".")[0]
-                    src = {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"}[
-                        projection
-                    ]
-                    prefix = key.split(".switch_mlp.")[0]
-                    for expert in range(2):
-                        name = f"{prefix}.experts.{expert}.{src}"
-                        packed, scales = mx.quantize(
-                            value[expert], group_size=32, bits=4, mode="mxfp4"
-                        )
-                        weights[name + ".weight"] = packed.view(mx.uint8)
-                        weights[name + ".scale"] = scales
-                        dtypes[name + ".weight"] = "I8"
-                        dtypes[name + ".scale"] = "F8_E8M0"
-                elif key.endswith(("attn.wq_a.weight", "engram.embed.weight")):
-                    rows, cols = value.shape
-                    name = key[: -len(".weight")]
-                    weights[key] = mx.full((rows, cols), 56, dtype=mx.uint8)
-                    scale_rows = rows if ".engram." in key else rows // 32
-                    weights[name + ".scale"] = mx.full(
-                        (scale_rows, cols // 32), 124, dtype=mx.uint8
-                    )
-                    dtypes[key], dtypes[name + ".scale"] = "F8_E4M3", "F8_E8M0"
-                else:
-                    weights[key] = value
-            shard = source / "model.safetensors"
-            self._write_source(shard, weights, dtypes)
-            original = shard.read_bytes()
-            raw_config = asdict(config)
-            raw_config["quantization_config"] = {
-                "quant_method": "fp8",
-                "weight_block_size": [32, 32],
-                "scale_fmt": "ue8m0",
-                "expert_dtype": "fp4",
-            }
-            (source / "config.json").write_text(json.dumps(raw_config))
-            (source / "model.safetensors.index.json").write_text(
-                json.dumps({"weight_map": {key: shard.name for key in weights}})
-            )
-            self._processor(config).save_pretrained(source)
-
-            native = load_model(source, lazy=True)
-            layer = native.language_model.layers[0]
-            self.assertTrue(hasattr(layer.ffn.switch_mlp.gate_proj, "to_quantized"))
-            self.assertIsInstance(layer.attn.wq_a, nn.Linear)
-            self.assertIsInstance(layer.engram.embed, QuantizedEngramEmbedding)
-            self.assertEqual(layer.engram.embed.mode, "mxfp8")
-            self.assertTrue(
-                mx.array_equal(
-                    layer.engram.embed(mx.array([0, 16])), mx.full((2, 256), 0.125)
-                ).item()
-            )
-            self.assertEqual(shard.read_bytes(), original)
-
-            output = tmp_path / "converted"
-            convert(str(source), str(output), quantize=True, q_group_size=64, q_bits=4)
-            reloaded = load_model(output, lazy=True, strict=True)
-            layer = reloaded.language_model.layers[0]
-            self.assertEqual(layer.ffn.switch_mlp.gate_proj.bits, 4)
-            self.assertEqual(layer.attn.wq_a.bits, 4)
-            self.assertEqual(layer.engram.embed.bits, 4)
-            self.assertEqual(layer.ffn.switch_mlp.gate_proj.mode, "affine")
-            self.assertTrue(
-                mx.array_equal(
-                    layer.engram.embed(mx.array([0, 16])), mx.full((2, 256), 0.125)
-                ).item()
-            )
-            for name in ("vision", "aligner"):
-                before = dict(tree_flatten(getattr(native, name).parameters()))
-                after = dict(tree_flatten(getattr(reloaded, name).parameters()))
-                self.assertEqual(before.keys(), after.keys())
-                for key, value in before.items():
-                    with self.subTest(module=name, parameter=key):
-                        self.assertTrue(mx.array_equal(value, after[key]).item())
-                        self.assertTrue(mx.issubdtype(after[key].dtype, mx.floating))
-
-            patches = mx.random.normal((9, 3 * config.vision_patch_size**2))
-            self.assertTrue(
-                mx.array_equal(
-                    native.encode_image(patches, 3, 3),
-                    reloaded.encode_image(patches, 3, 3),
-                ).item()
-            )
-            self.assertEqual(shard.read_bytes(), original)
 
     def test_engram_chunked_requantization(self):
         from mlx_vlm.models.deepseek_v41.engram import QuantizedEngramEmbedding
@@ -2390,264 +2108,22 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
             self.assertTrue(mx.array_equal(actual, reference).item())
         self.assertIs(converted.to_quantized(group_size=64, bits=4), converted)
 
-    def test_deepseek_v41_full_forward(self):
-        """Shapes come from the JSON contract; this pins the extras it cannot.
-
-        A fresh cache has to reproduce the prefill it replaces, which only says
-        anything once the head is not its zero initialization.
-        """
-        from mlx_vlm.models import deepseek_v41
-
-        model = deepseek_v41.Model(self._config())
-        model.language_model.head.weight = (
-            mx.random.normal(model.language_model.head.weight.shape) * 0.05
-        )
-        mx.eval(model.parameters())
-        self.assertEqual(len(model.layers), 2)
-
-        cache = model.make_cache()
-        ids = mx.array([[1, 2, 3]])
-        out = model.language_model(ids, cache=cache)
-        mx.eval(out.logits)
-        self.assertIsNotNone(out.hidden_states)
-        self.assertEqual(out.hidden_states[0].shape, (1, 3, 16))
-
-        model.language_model(mx.array([[4]]), cache=cache)
-        again = model.language_model(ids, cache=model.make_cache())
-        mx.eval(again.logits)
-        self.assertTrue(mx.allclose(out.logits, again.logits).item())
-
-
-class TestDeepseekV41Sanitize(unittest.TestCase):
-    @staticmethod
-    def _config():
-        return deepseek_v41_config(hidden_size=8, o_groups=2, o_lora_rank=4)
-
-    def test_deepseek_v41_sanitize_checkpoint_keys(self):
-        from mlx_vlm.models import deepseek_v41
-
-        model = deepseek_v41.Model(self._config())
-        sanitized = model.sanitize(
-            {
-                "embed.weight": mx.zeros((4, 4)),
-                "head.weight": mx.zeros((4, 4)),
-                "layers.0.attn.wq_a.weight": mx.zeros((4, 4)),
-                "model.embed_tokens.weight": mx.zeros((4, 4)),
-                "lm_head.weight": mx.zeros((4, 4)),
-                "vision.blocks.0.attn.wqkv.weight": mx.zeros((4, 4)),
-                "aligner.w1.weight": mx.zeros((4, 4)),
-                "image_start": mx.zeros((4,)),
-                "mtp.0.attn.wq_a.weight": mx.zeros((4, 4)),
-            }
-        )
-        self.assertIn("language_model.embed_tokens.weight", sanitized)
-        self.assertIn("language_model.head.weight", sanitized)
-        self.assertIn("language_model.layers.0.attn.wq_a.weight", sanitized)
-        self.assertIn("language_model.model.embed_tokens.weight", sanitized)
-        self.assertIn("language_model.lm_head.weight", sanitized)
-        self.assertIn("vision.blocks.0.attn.wqkv.weight", sanitized)
-        self.assertIn("aligner.w1.weight", sanitized)
-        self.assertIn("image_start", sanitized)
-        self.assertFalse(any(k.startswith("mtp.") for k in sanitized))
-
-    def test_deepseek_v41_sanitize_stacks_experts(self):
-        from mlx_vlm.models import deepseek_v41
-
-        model = deepseek_v41.Model(self._config())
-        weights = {}
-        for e in range(4):
-            for src in ("w1", "w2", "w3"):
-                for suffix in ("weight", "scales", "biases"):
-                    weights[f"layers.0.ffn.experts.{e}.{src}.{suffix}"] = mx.zeros(
-                        (2, 2)
-                    )
-        weights["layers.0.ffn.shared_experts.w1.weight"] = mx.zeros((2, 2))
-        weights["layers.0.attn.wo_a.weight"] = mx.zeros((16, 8))
-        weights["layers.0.attn.q_norm.weight"] = mx.zeros((8,))
-        out = model.sanitize(weights)
-        mx.eval(out)
-        self.assertEqual(
-            out["language_model.layers.0.ffn.switch_mlp.gate_proj.weight"].shape,
-            (4, 2, 2),
-        )
-        self.assertEqual(
-            out["language_model.layers.0.ffn.switch_mlp.down_proj.scales"].shape,
-            (4, 2, 2),
-        )
-        self.assertIn(
-            "language_model.layers.0.ffn.shared_experts.gate_proj.weight", out
-        )
-        self.assertEqual(
-            out["language_model.layers.0.attn.wo_a.weight"].shape, (2, 4, 16)
-        )
-        self.assertFalse(any(".experts.0." in k for k in out))
-
-    def test_deepseek_v41_sanitize_dequantizes_head(self):
-        from mlx_vlm.models import deepseek_v41
-
-        model = deepseek_v41.Model(self._config())
-        wq, scales, biases = mx.quantize(
-            mx.random.normal((64, 128)), group_size=64, bits=4, mode="affine"
-        )
-        out = model.sanitize(
-            {
-                "head.weight": wq,
-                "head.scales": scales,
-                "head.biases": biases,
-            }
-        )
-        self.assertEqual(set(out), {"language_model.head.weight"})
-        self.assertEqual(out["language_model.head.weight"].dtype, mx.float32)
-        self.assertEqual(out["language_model.head.weight"].shape, (64, 128))
-
-
-class TestDeepseekV41Engram(unittest.TestCase):
-    """Engram layers must actually run.
-
-    They were wired up but unreachable: the language model was built without a
-    tokenizer, so the hash state stayed None and the call site's guard was never
-    true. Nothing failed - the weights loaded and the layers were skipped.
-    """
-
-    def setUp(self):
-        mx.random.seed(0)
-
-    @staticmethod
-    def _config(**overrides):
-        return deepseek_v41_config("stack", **overrides)
-
-    @staticmethod
-    def _with_hash_state(model, config):
-        from mlx_vlm.models.deepseek_v41 import engram as engram_mod
-
-        token_map = [i % 7 for i in range(config.vocab_size)]
-        token_map[0] = 6
-        model.engram_hash = engram_mod.NgramHashState(
-            config, model.layout, token_map=token_map
-        )
-        return model
-
-    def _model_with_engram(self):
-        from mlx_vlm.models.deepseek_v41.language import LanguageModel
-
-        config = self._config()
-        return self._with_hash_state(LanguageModel(config), config)
-
-    def test_two_caches_on_one_model_do_not_interfere(self):
-        """Generation state belongs to the cache, not the model.
-
-        While it lived on the modules, a second cache overwrote the first one's
-        buffers, so a generation depended on whatever ran beside it.
-        """
-        model = self._model_with_engram()
-        a = mx.array([[1, 2, 3, 4, 5, 6]])
-        b = mx.array([[6, 5, 4, 3, 2, 1]])
-
-        cache_a = model.make_cache()
-        model(a, cache=cache_a)
-        solo = model(mx.array([[2]]), cache=cache_a)
-        mx.eval(solo.logits)
-
-        cache_a = model.make_cache()
-        model(a, cache=cache_a)
-        cache_b = model.make_cache()
-        model(b, cache=cache_b)
-        interleaved = model(mx.array([[2]]), cache=cache_a)
-        mx.eval(interleaved.logits)
-
-        diff = mx.abs(
-            solo.logits.astype(mx.float32) - interleaved.logits.astype(mx.float32)
-        )
-        mx.eval(diff)
-        self.assertLess(float(mx.max(diff).item()), 1e-4)
-
-    def test_deepseek_v41_engram_layers_are_invoked(self):
-        from mlx_vlm.models.deepseek_v41 import engram as engram_mod
-
-        config = self._config()
-        model = self._model_with_engram()
-        self.assertEqual(len(model.layout.primes), len(config.engram_layer_ids))
-
-        calls = []
-        original = engram_mod.Engram.__call__
-
-        def counting(self, x, hash_ids, token_mask=None):
-            calls.append(hash_ids.shape)
-            return original(self, x, hash_ids, token_mask)
-
-        engram_mod.Engram.__call__ = counting
-        try:
-            out = model(mx.array([[3, 7, 11, 15, 19, 23]]), cache=model.make_cache())
-            mx.eval(out.logits)
-        finally:
-            engram_mod.Engram.__call__ = original
-
-        self.assertEqual(len(calls), len(config.engram_layer_ids))
-
-    def test_deepseek_v41_engram_hash_is_built_from_checkpoint_map(self):
-        from mlx_vlm.models.deepseek_v41.language import LanguageModel
-
-        config = self._config()
-        model = LanguageModel(config)
-        self.assertIsNone(model.engram_hash)
-
-        token_map = [i % 7 for i in range(config.vocab_size)]
-        token_map[0] = 6
-        with tempfile.TemporaryDirectory() as directory:
-            with open(f"{directory}/engram_token_map.json", "w") as handle:
-                json.dump(token_map, handle)
-            model._engram_source = directory
-            model._ensure_engram_hash()
-
-        self.assertIsNotNone(model.engram_hash)
-
-    def test_deepseek_v41_chunked_prefill_matches_whole_prompt(self):
-        """Chunked prefill names the ids `inputs`; the engram has to still see them."""
-        from mlx_vlm.models.deepseek_v41.language import LanguageModel
-
-        config = self._config(
-            num_hidden_layers=3,
-            compress_ratios=[0, 2, 0],
-            kv_source_layer_ids=[1],
-            index_source_layer_ids=[1],
-            dspark_target_layer_ids=[],
-        )
-        model = self._with_hash_state(LanguageModel(config), config)
-        model.head.weight = mx.random.normal(model.head.weight.shape) * 0.05
-        mx.eval(model.parameters())
-        prompt = mx.array([[3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47]])
-
-        whole = model(prompt, cache=model.make_cache())
-        mx.eval(whole.logits)
-
-        cache = model.make_cache()
-        embeds = model.embed_tokens(prompt)
-        for lo, hi in ((0, 5), (5, 9), (9, 12)):
-            chunked = model(
-                inputs=prompt[:, lo:hi],
-                inputs_embeds=embeds[:, lo:hi],
-                cache=cache,
-                n_to_process=hi - lo,
-            )
-        mx.eval(chunked.logits)
-
-        diff = mx.abs(
-            whole.logits[:, -1].astype(mx.float32)
-            - chunked.logits[:, -1].astype(mx.float32)
-        )
-        mx.eval(diff)
-        self.assertLess(float(mx.max(diff).item()), 1e-4)
-
     def test_image_tokens_use_visual_routing_and_break_engram_history(self):
         """The generation path supplies token ids, including during chunked prefill.
 
         Match the reference's explicit image mask and masked n-gram hashes,
         even when a prefill boundary falls inside an image span.
         """
+        from mlx_vlm.models import deepseek_v41
+        from mlx_vlm.models.deepseek_v41.engram import NgramHashState
         from mlx_vlm.models.deepseek_v41.language import LanguageModel
 
-        config = self._config(image_token_id=5)
-        model = self._with_hash_state(LanguageModel(config), config)
+        case = next(case for case in DATA["cases"] if case["module"] == "deepseek_v41")
+        config = build_config(deepseek_v41, case["config"])
+        model = LanguageModel(config)
+        token_map = [i % 7 for i in range(config.vocab_size)]
+        token_map[0] = 6
+        model.engram_hash = NgramHashState(config, model.layout, token_map=token_map)
         model.head.weight = mx.random.normal(model.head.weight.shape) * 0.05
         for layer in model.layers:
             layer.ffn.gate.bias = mx.array([10.0, 9.0, 0.0, 0.0])
@@ -2659,6 +2135,7 @@ class TestDeepseekV41Engram(unittest.TestCase):
         embeds = mx.where(image_mask[..., None], mx.random.normal(embeds.shape), embeds)
         reference_cache = model.make_cache()
         hashes = model.engram_hash(ids, 0, reference_cache[0], token_mask=~image_mask)
+        self.assertLess(mx.max(hashes).item(), config.engram_num_embeddings[0])
         expected = model(
             ids,
             inputs_embeds=embeds,
