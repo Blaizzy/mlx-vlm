@@ -2406,6 +2406,19 @@ def test_turboquant_mse_prefill_decode_matches_batch_quantized_state(dim):
     _assert_mse_states_equal(batch_values, split_values)
 
 
+def test_turboquant_fused_mse_decode_kernel_dim_gate():
+    from mlx_vlm.turboquant import _fused_mse_decode_kernel
+
+    # D <= 256 returns the single-pass cooperative kernel
+    kernel_256 = _fused_mse_decode_kernel(4, 4, 256)
+    assert kernel_256 is not None
+
+    # D > 256 (e.g. Gemma 4 full-attention head_dim=512) must return None
+    # to avoid threadgroup size (1024 > 640) register pressure crash on Apple Silicon
+    kernel_512 = _fused_mse_decode_kernel(4, 4, 512)
+    assert kernel_512 is None
+
+
 def test_turboquant_prefill_attention_matches_dequantized_attention():
     keys = mx.random.normal((1, 2, 12, 32))
     values = mx.random.normal((1, 2, 12, 32))
