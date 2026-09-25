@@ -679,6 +679,8 @@ def skip_multimodal_module(path: str) -> bool:
         bool: True if the module is multimodal and should skip quantization, False otherwise
     """
     multimodal_modules = (
+        "vision",
+        "aligner",
         "vision_model",
         "vision_tower",
         "vl_connector",

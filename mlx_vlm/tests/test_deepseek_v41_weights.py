@@ -8,10 +8,10 @@ import numpy as np
 import pytest
 from mlx.utils import tree_flatten
 
+from mlx_vlm.convert import convert
 from mlx_vlm.models.deepseek_v41 import Model, ModelConfig
 from mlx_vlm.models.deepseek_v41.deepseek_v41 import _pack_source_weight
 from mlx_vlm.models.deepseek_v41.engram import QuantizedEngramEmbedding
-from mlx_vlm.quant_utils import quantize_model
 from mlx_vlm.utils import load_model
 
 
@@ -63,7 +63,7 @@ def test_nested_config_preserves_text_and_vision_settings():
     assert ModelConfig.from_dict(asdict(config)) == config
 
 
-def test_processor_saves_model_config(tmp_path):
+def _processor(config):
     from tokenizers import Tokenizer
     from tokenizers.models import WordLevel
     from transformers import PreTrainedTokenizerFast
@@ -74,8 +74,12 @@ def test_processor_saves_model_config(tmp_path):
         tokenizer_object=Tokenizer(WordLevel({"<unk>": 0}, unk_token="<unk>")),
         unk_token="<unk>",
     )
+    return DeepseekV41Processor(tokenizer, config=config)
+
+
+def test_processor_saves_model_config(tmp_path):
     config = ModelConfig(rope_scaling={"factor": 16}, vision_max_wh_ratio=5)
-    processor = DeepseekV41Processor(tokenizer, config=config)
+    processor = _processor(config)
     processor.save_pretrained(tmp_path)
     saved = json.loads((tmp_path / "processor_config.json").read_text())
     assert saved["config"] == asdict(config)
@@ -98,7 +102,7 @@ def test_fp8_scale_layouts_decode_exactly(rowwise):
     assert mx.array_equal(decoded, expected)
 
 
-def test_native_mixed_checkpoint_load(tmp_path):
+def test_native_mixed_checkpoint_conversion(tmp_path):
     config = ModelConfig(
         hidden_size=64,
         vocab_size=32,
@@ -172,6 +176,7 @@ def test_native_mixed_checkpoint_load(tmp_path):
     (source / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": {key: shard.name for key in weights}})
     )
+    _processor(config).save_pretrained(source)
 
     native = load_model(source, lazy=True)
     layer = native.language_model.layers[0]
@@ -184,8 +189,10 @@ def test_native_mixed_checkpoint_load(tmp_path):
     )
     assert shard.read_bytes() == original
 
-    native, converted_config = quantize_model(native, raw_config, 64, 4)
-    layer = native.language_model.layers[0]
+    output = tmp_path / "converted"
+    convert(str(source), str(output), quantize=True, q_group_size=64, q_bits=4)
+    reloaded = load_model(output, lazy=True, strict=True)
+    layer = reloaded.language_model.layers[0]
     assert layer.ffn.switch_mlp.gate_proj.bits == 4
     assert layer.attn.wq_a.bits == 4
     assert layer.engram.embed.bits == 4
@@ -193,14 +200,18 @@ def test_native_mixed_checkpoint_load(tmp_path):
     assert mx.array_equal(
         layer.engram.embed(mx.array([0, 16])), mx.full((2, 256), 0.125)
     )
-    output = tmp_path / "converted"
-    output.mkdir()
-    mx.save_safetensors(
-        str(output / "model.safetensors"), dict(tree_flatten(native.parameters()))
+    for name in ("vision", "aligner"):
+        before = dict(tree_flatten(getattr(native, name).parameters()))
+        after = dict(tree_flatten(getattr(reloaded, name).parameters()))
+        assert before.keys() == after.keys()
+        assert all(mx.array_equal(before[key], after[key]) for key in before)
+        assert all(mx.issubdtype(value.dtype, mx.floating) for value in after.values())
+
+    patches = mx.random.normal((9, 3 * config.vision_patch_size**2))
+    assert mx.array_equal(
+        native.encode_image(patches, 3, 3), reloaded.encode_image(patches, 3, 3)
     )
-    (output / "config.json").write_text(json.dumps(converted_config))
-    reloaded = load_model(output, lazy=True, strict=True)
-    assert reloaded.language_model.layers[0].engram.embed.bits == 4
+    assert shard.read_bytes() == original
 
 
 def test_engram_chunked_requantization(monkeypatch):
