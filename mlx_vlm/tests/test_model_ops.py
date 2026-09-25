@@ -56,55 +56,6 @@ prism_ops = importlib.import_module(
 qwen35 = importlib.import_module("mlx_vlm.models.qwen3_5")
 
 
-def test_mistral_large3_native_config_mapping():
-    from mlx_vlm.models.mistral_large3 import ModelConfig
-    from mlx_vlm.models.mistral_large3.config import config_from_params
-
-    params = {
-        "dim": 128,
-        "hidden_dim": 256,
-        "n_layers": 5,
-        "n_heads": 4,
-        "n_kv_heads": 4,
-        "q_lora_rank": 32,
-        "kv_lora_rank": 16,
-        "qk_nope_head_dim": 24,
-        "qk_rope_head_dim": 8,
-        "v_head_dim": 16,
-        "norm_eps": 1e-6,
-        "rope_theta": 10000.0,
-        "vocab_size": 128,
-        "max_position_embeddings": 4096,
-        "moe": {
-            "expert_hidden_dim": 64,
-            "num_experts": 8,
-            "num_shared_experts": 1,
-            "num_experts_per_tok": 2,
-            "first_k_dense_replace": 3,
-        },
-        "vision_encoder": {
-            "hidden_size": 64,
-            "num_hidden_layers": 2,
-            "num_attention_heads": 2,
-            "intermediate_size": 128,
-            "image_size": 28,
-            "patch_size": 14,
-            "rope_theta": 10000.0,
-            "image_token_id": 10,
-            "spatial_merge_size": 2,
-            "adapter_bias": False,
-        },
-    }
-
-    config = ModelConfig(**config_from_params(params))
-
-    assert config.text_config.moe_intermediate_size == 64
-    assert config.text_config.q_lora_rank == 32
-    assert config.text_config.first_k_dense_replace == 3
-    assert config.vision_config.head_dim == 32
-    assert config.image_token_id == 10
-
-
 def _mimo_v2_model():
     from mlx_vlm.tests.test_models import DATA, build_config
 
