@@ -1,4 +1,6 @@
+from dataclasses import replace
 from functools import lru_cache, partial
+from math import ceil
 from typing import Any, List, Optional
 
 import mlx.core as mx
@@ -103,7 +105,10 @@ def _minimax_moe_select(
     return inds, weights * routed_scaling_factor
 
 
-@mx.compile
+# Deliberately not @mx.compile: `idx_keys` grows a position every decode step,
+# so a shape-keyed compiled function re-traces on every call and each trace
+# permanently grows MLX's compiler cache, eventually tripping
+# `[metal::malloc] Resource limit (499000) exceeded`. See the regression test.
 def _build_sparse_causal_mask_compiled(
     idx_queries: mx.array,
     idx_keys: mx.array,
@@ -188,7 +193,8 @@ def _build_sparse_causal_mask_compiled(
     return sparse_mask, topk_idx[:, None], topk_valid[:, None]
 
 
-@mx.compile
+# Deliberately not @mx.compile — same reason as
+# `_build_sparse_causal_mask_compiled` above.
 def _select_sparse_block_indices_compiled(
     idx_queries: mx.array,
     idx_keys: mx.array,
@@ -546,7 +552,22 @@ class MiniMaxRMSNorm(nn.Module):
         return mx.fast.rms_norm(x, weight, self.eps)
 
 
+def _minimax_memory_profile(c, token_count):
+    profile = c.kv_cache.memory_profile(token_count)
+    capacity = 0 if c.index_keys is None else c.index_keys.shape[2]
+    index_bytes = c.index_keys.nbytes / capacity if capacity else 0
+    per_token = profile.bytes_per_token + index_bytes
+    return replace(
+        profile,
+        source_bytes=c.nbytes,
+        fixed_bytes=ceil((c.step - 1) * per_token),
+        bytes_per_token=per_token,
+        step=1,
+    )
+
+
 class MiniMaxM3KVCache:
+    memory_profile = _minimax_memory_profile
     step = KVCache.step
 
     def __init__(self):
@@ -674,6 +695,7 @@ class MiniMaxM3KVCache:
 
 
 class MiniMaxM3BatchKVCache:
+    memory_profile = _minimax_memory_profile
     step = BatchKVCache.step
 
     def __init__(self, left_padding):
@@ -1895,6 +1917,8 @@ class MiniMaxM3Model(nn.Module):
 
 
 class LanguageModel(nn.Module):
+    requires_uniform_batch_acceptance = True
+
     def __init__(self, args: TextConfig, config: Optional[ModelConfig] = None):
         super().__init__()
         self.args = args
@@ -2162,24 +2186,15 @@ class LanguageModel(nn.Module):
                 continue
             valid_ends_list = [int(v) for v in valid_ends.tolist()]
 
-            kv_cache = getattr(cache, "kv_cache", cache)
-            if getattr(kv_cache, "keys", None) is not None:
-                for bi, valid_end in enumerate(valid_ends_list):
-                    start = verify_start + valid_end
-                    if start < kv_len:
-                        kv_cache.keys[bi, :, start:kv_len, :] = 0
-                        kv_cache.values[bi, :, start:kv_len, :] = 0
-
-            index_keys = getattr(cache, "index_keys", None)
-            if index_keys is not None:
-                idx_len = int(getattr(cache, "index_offset", kv_len))
-                idx_verify_start = idx_len - n
-                if idx_verify_start < 0:
-                    continue
-                for bi, valid_end in enumerate(valid_ends_list):
-                    start = idx_verify_start + valid_end
-                    if start < idx_len:
-                        cache.index_keys[bi, :, start:idx_len, :] = 0
+            if any(verify_start + valid_end < kv_len for valid_end in valid_ends_list):
+                raise RuntimeError(
+                    "MiniMax-M3 batched speculative rollback requires uniform "
+                    f"per-row acceptance; got ragged accepts {accepted.tolist()}. "
+                    "Zeroing a rejected row's KV (or indexer) tail leaves phantom "
+                    "keys attended (issue #1962); set "
+                    "requires_uniform_batch_acceptance on the drafter or target so "
+                    "accepts are clamped before rollback."
+                )
         return max_a
 
     @property

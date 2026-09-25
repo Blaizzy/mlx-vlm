@@ -352,106 +352,52 @@ def _detect_with_backbone(
     )
 
 
-def _init_tracker_memory(
+def _init_tracker_state(
     model,
     backbone_features: mx.array,
     detection_masks: List[np.ndarray],
-) -> List[mx.array]:
-    """Initialize tracker memory bank from detection masks."""
-    prop_fpn = model._get_tracker_features(backbone_features)
-    track_features = prop_fpn[2]  # 1x scale
-    feat_H, feat_W = track_features.shape[1], track_features.shape[2]
-
-    multiplex_count = model.config.tracker_config.multiplex_count
-    n_ch = multiplex_count * 2
-    # Mask downsampler has stride 16 total, so input must be feat_size * 16
-    target = feat_H * 16
-
-    # Build combined multiplex mask in MLX
-    N = min(len(detection_masks), multiplex_count)
-    # Stack masks → (N, H_mask, W_mask), resize once
-    masks_mx = mx.array(
-        np.stack(detection_masks[:N]).astype(np.float32)
-    )  # single conversion
-    mask_h, mask_w = masks_mx.shape[1], masks_mx.shape[2]
-    if mask_h != target or mask_w != target:
-        up = nn.Upsample(
-            scale_factor=(target / mask_h, target / mask_w), mode="nearest"
+):
+    """Initialize a multiplex tracking session from detection masks."""
+    # The tracker operates at the model's image_size (1008x1008)
+    target = model.config.tracker_config.image_size
+    masks = np.stack(detection_masks).astype(np.float32)  # (N, H, W)
+    if masks.shape[1] != target or masks.shape[2] != target:
+        masks = np.stack(
+            [
+                np.array(Image.fromarray(m).resize((target, target), Image.BILINEAR))
+                for m in masks
+            ]
         )
-        masks_mx = up(masks_mx[:, :, :, None])[:, :, :, 0]  # (N, target, target)
-
-    # Pack into multiplex channels in MLX
-    channels = []
-    for ch in range(n_ch):
-        slot = ch // 2
-        if slot < N:
-            if ch % 2 == 0:
-                channels.append(masks_mx[slot : slot + 1, :, :, None])  # mask
-            else:
-                channels.append(1.0 - masks_mx[slot : slot + 1, :, :, None])  # inverse
-        else:
-            channels.append(mx.zeros((1, target, target, 1)))
-    # (multiplex*2, target, target, 1) → (1, target, target, n_ch)
-    mask_mx = mx.concatenate(channels, axis=0)  # (n_ch, target, target, 1)
-    mask_mx = mask_mx[:, :, :, 0].transpose(1, 2, 0)[None]  # (1, target, target, n_ch)
-    memory = model.tracker_model.memory_encoder(track_features, mask_mx)
-    mx.eval(memory)
-    _, H_m, W_m, C = memory.shape
-    return [memory.reshape(1, H_m * W_m, C)]
+    state, _ = model.track_init(backbone_features, mx.array(masks))
+    return state
 
 
-def _propagate_tracker(
-    model,
-    backbone_features: mx.array,
-    memory_bank: List[mx.array],
-    n_objects: int,
-    image_size,
-) -> tuple:
-    """Run tracker propagation. Returns (DetectionResult, updated_memory_bank)."""
-    prop_fpn = model._get_tracker_features(backbone_features)
-    track_features = prop_fpn[2]
-    high_res = [prop_fpn[0], prop_fpn[1]] if len(prop_fpn) > 1 else None
-
-    result = model.tracker_model.track_step(
-        current_features=track_features,
-        memory_bank=memory_bank,
-        multimask_output=False,
-        high_res_features=high_res,
-    )
-    mx.eval(result)
-
-    # Convert tracker output to DetectionResult — stay in MLX as long as possible
-    pred_masks = result["pred_masks"]  # (B, M, num_masks, H, W) or (B, num_masks, H, W)
-    iou_scores = result["iou_scores"]
+def _masks_to_detection(
+    out: Dict[str, mx.array], n_objects: int, image_size
+) -> DetectionResult:
+    """Convert a tracker frame output to a DetectionResult."""
+    pred_masks = out["pred_masks_high_res"][:, 0]  # (N, H_t, W_t) logits
+    obj_scores = mx.sigmoid(out["object_score_logits"][:, 0])  # (N,)
 
     W, H = (
         image_size if isinstance(image_size, tuple) else (image_size[1], image_size[0])
     )
-    N = min(n_objects, 16)
+    N = min(n_objects, pred_masks.shape[0])
+    obj_masks = pred_masks[:N]
+    obj_scores = obj_scores[:N]
 
-    # Extract per-object masks and scores in MLX (batched, no per-object np.array)
-    if pred_masks.ndim == 5:
-        # (B, M, num_masks, H_out, W_out) → take best mask per object
-        obj_masks = pred_masks[0, :N, 0]  # (N, H_out, W_out) — still MLX
-        obj_scores = iou_scores[0, :N, 0]  # (N,)
-    else:
-        obj_masks = mx.broadcast_to(pred_masks[0, 0:1], (N,) + pred_masks.shape[2:])
-        obj_scores = mx.broadcast_to(iou_scores[0, 0:1], (N,))
-
-    # Resize masks in MLX using Upsample (batched, no per-object PIL)
+    # Resize masks in MLX (batched)
     mask_h, mask_w = obj_masks.shape[1], obj_masks.shape[2]
     if mask_h != H or mask_w != W:
         up = nn.Upsample(scale_factor=(H / mask_h, W / mask_w), mode="nearest")
-        obj_masks_up = up(obj_masks[:, :, :, None])[:, :, :, 0]  # (N, H, W)
-    else:
-        obj_masks_up = obj_masks
+        obj_masks = up(obj_masks[:, :, :, None])[:, :, :, 0]  # (N, H, W)
 
     # Single eval + conversion
-    mx.eval(obj_masks_up, obj_scores)
-    masks_np = (np.array(obj_masks_up) > 0).astype(np.uint8)
+    mx.eval(obj_masks, obj_scores)
+    masks_np = (np.array(obj_masks) > 0).astype(np.uint8)
     scores_np = np.array(obj_scores)
 
-    # Derive boxes from masks (numpy — needed for contour-based boxes)
+    # Derive boxes from masks
     boxes_list = []
     for i in range(N):
         ys, xs = np.where(masks_np[i])
@@ -460,49 +406,28 @@ def _propagate_tracker(
         else:
             boxes_list.append([0, 0, 0, 0])
 
-    det_result = DetectionResult(
+    return DetectionResult(
         boxes=np.array(boxes_list, dtype=np.float32),
         masks=masks_np,
         scores=scores_np,
         labels=[],
     )
 
-    # Update memory bank
-    multiplex_count = model.config.tracker_config.multiplex_count
-    n_ch = multiplex_count * 2
-    feat_H = track_features.shape[1]
-    target = feat_H * 16  # mask_downsampler has stride 16
 
-    channels = []
-    for ch in range(n_ch):
-        slot = ch // 2
-        is_inv = ch % 2 == 1
-        if slot < n_objects and pred_masks.ndim == 5:
-            slot_mask = pred_masks[:, slot, 0]  # (B, H_out, W_out)
-            up = nn.Upsample(
-                scale_factor=(target / slot_mask.shape[1], target / slot_mask.shape[2]),
-                mode="nearest",
-            )
-            sig = mx.sigmoid(up(slot_mask[:, :, :, None])[:, :, :, 0] * 20.0 - 10.0)
-            if is_inv:
-                channels.append((1.0 - sig)[:, :, :, None])
-            else:
-                channels.append(sig[:, :, :, None])
-        else:
-            channels.append(mx.zeros((1, target, target, 1)))
-
-    mask_for_mem = mx.concatenate(channels, axis=-1)
-    memory = model.tracker_model.memory_encoder(track_features, mask_for_mem)
-    mx.eval(memory)
-    B_m, H_m, W_m, C_m = memory.shape
-    new_mem = memory.reshape(1, H_m * W_m, C_m)
-
-    max_mem = model.config.tracker_config.num_maskmem
-    updated_bank = memory_bank + [new_mem]
-    if len(updated_bank) > max_mem:
-        updated_bank = updated_bank[-max_mem:]
-
-    return det_result, updated_bank
+def _propagate_tracker(
+    model,
+    state,
+    backbone_features: mx.array,
+    frame_idx: int,
+    n_objects: int,
+    image_size,
+    run_mem_encoder: bool = True,
+) -> DetectionResult:
+    """Propagate tracked objects to the next frame (memory-conditioned)."""
+    out = model.track_step(
+        state, backbone_features, frame_idx, run_mem_encoder=run_mem_encoder
+    )
+    return _masks_to_detection(out, n_objects, image_size)
 
 
 def track_video(
@@ -803,7 +728,12 @@ def track_video_realtime(
     def inference_loop_impl():
         backbone_cache = {"features": None}
         encoder_cache = {}
-        tracker_state = {"memory_bank": [], "n_objects": 0, "labels": []}
+        tracker_state = {
+            "session": None,
+            "n_objects": 0,
+            "labels": [],
+            "frame_idx": 0,
+        }
         inference_count = 0
         prop_count = 0
         id_tracker = SimpleTracker()
@@ -833,12 +763,12 @@ def track_video_realtime(
             # Step 2: Detect or propagate
             can_track = (
                 resolution >= 1008
-                and tracker_state["memory_bank"]
+                and tracker_state["session"] is not None
                 and tracker_state["n_objects"] > 0
             )
             need_detect = (
                 inference_count % detect_every == 0
-                or not tracker_state["memory_bank"]
+                or tracker_state["session"] is None
                 or not can_track  # always detect at non-native resolutions
             )
 
@@ -857,12 +787,13 @@ def track_video_realtime(
 
                 mode = "detect"
 
-                # Initialize tracker memory from detections (only at native res)
+                # Initialize tracker session from detections (only at native res)
                 if len(result.scores) > 0 and resolution >= 1008:
-                    tracker_state["memory_bank"] = _init_tracker_memory(
+                    tracker_state["session"] = _init_tracker_state(
                         model, backbone_features, list(result.masks)
                     )
                     tracker_state["n_objects"] = len(result.scores)
+                    tracker_state["frame_idx"] = 0
                     tracker_state["labels"] = (
                         result.labels
                         if result.labels
@@ -878,19 +809,20 @@ def track_video_realtime(
                     )
             else:
                 # Tracker propagation (fast path — native resolution only)
-                result, updated_bank = _propagate_tracker(
+                next_frame = tracker_state["frame_idx"] + 1
+                run_mem = (prop_count + 1) % update_memory_every == 0
+                result = _propagate_tracker(
                     model,
+                    tracker_state["session"],
                     backbone_features,
-                    tracker_state["memory_bank"],
+                    next_frame,
                     tracker_state["n_objects"],
                     image_size,
+                    run_mem_encoder=run_mem,
                 )
                 result.labels = tracker_state["labels"]
-
-                # Update memory periodically
+                tracker_state["frame_idx"] = next_frame
                 prop_count += 1
-                if prop_count % update_memory_every == 0:
-                    tracker_state["memory_bank"] = updated_bank
 
                 mode = "track"
 

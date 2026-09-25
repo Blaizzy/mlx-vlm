@@ -5,7 +5,7 @@ from typing import Dict, Optional
 
 import mlx.core as mx
 
-from ....models.qwen3_5.fp8 import make_quantization_config
+from ....fp8 import make_quantization_config
 from ..mtp_split import MTPSplitter
 from .qwen3_5_mtp import Qwen3_5MTPDraftModel
 

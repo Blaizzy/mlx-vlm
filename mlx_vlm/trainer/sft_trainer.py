@@ -442,11 +442,17 @@ def evaluate(
         ntokens += ntoks
         mx.eval(all_losses, ntokens)
 
-    all_losses = mx.distributed.all_sum(all_losses, stream=mx.cpu)
-    ntokens = mx.distributed.all_sum(ntokens, stream=mx.cpu)
+    # Reduce across ranks entirely on the CPU stream. The ring all-reduce
+    # blocks on the network, and any Metal command buffer left in flight during
+    # that wait (here the trailing divide) trips Metal's ~5s command-buffer
+    # watchdog under a slow peer. See issue #2179.
+    with mx.stream(mx.cpu):
+        all_losses = mx.distributed.all_sum(all_losses, stream=mx.cpu)
+        ntokens = mx.distributed.all_sum(ntokens, stream=mx.cpu)
+        avg_loss = all_losses / mx.maximum(ntokens, 1)
 
     mx.clear_cache()
-    return (all_losses / mx.maximum(ntokens, 1)).item()
+    return avg_loss.item()
 
 
 def train(
@@ -521,7 +527,15 @@ def train(
             grad = tree_map(lambda x, y: x + y, grad, prev_grad)
 
         if do_update:
-            grad = average_gradients(grad)
+            # Average grads across ranks entirely on the CPU stream and
+            # materialize before any GPU-stream consumer, so the blocking ring
+            # all-reduce never keeps a Metal command buffer in flight — a slow
+            # peer would otherwise stall it past Metal's ~5s command-buffer
+            # watchdog and crash the run. See issue #2179.
+            if world_size > 1:
+                with mx.stream(mx.cpu):
+                    grad = average_gradients(grad, communication_stream=mx.cpu)
+                mx.eval(grad)
             if grad_accum_steps > 1:
                 grad = tree_map(lambda x: x / grad_accum_steps, grad)
             optimizer.update(model, grad)

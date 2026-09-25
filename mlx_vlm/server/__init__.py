@@ -15,8 +15,13 @@ from ..generate import (
     stream_generate,
 )
 from ..prompt_utils import apply_chat_template, extract_text_from_content
+from ..speculative.utils import run_speculative_server_rounds
 from ..structured import build_json_schema_logits_processor
-from ..tool_parsers import _infer_tool_parser_from_processor, load_tool_module
+from ..tools import (
+    _infer_tool_parser_from_processor,
+    load_tool_module,
+    process_tool_calls,
+)
 from ..version import __version__
 from ..vision_cache import VisionFeatureCache
 from . import app as _app_module
@@ -89,7 +94,6 @@ from .generation import (
     get_top_logprobs_k,
     load_model_resources,
     make_streaming_detokenizer,
-    run_speculative_server_rounds,
 )
 from .openai import (
     chat_completions_endpoint,
@@ -105,6 +109,7 @@ from .responses_state import (
     StoredResponse,
     ThinkingStreamDelta,
     ThinkingStreamState,
+    ToolCallStreamState,
     _normalize_response_input,
     _response_chain_items,
     _response_items_to_chat,
@@ -115,12 +120,10 @@ from .responses_state import _sse_event as _response_sse_event
 from .responses_state import (
     _store_response,
     make_response_stream_state,
-    process_tool_calls,
     prompt_has_open_thinking,
     response_store,
     response_store_lock,
     response_store_order,
-    suppress_tool_call_content,
 )
 from .runtime import ModelCacheRegistry, runtime
 from .runtime_config import DEFAULT_TOKEN_QUEUE_TIMEOUT

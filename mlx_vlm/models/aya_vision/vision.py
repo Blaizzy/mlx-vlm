@@ -209,7 +209,7 @@ class VisionEmbeddings(nn.Module):
             )
 
             # Add positional embeddings to patch embeddings
-            embeddings = patch_embeds + resized_positional_embeddings
+            embeddings = patch_embeddings + resized_positional_embeddings
         return embeddings
 
 

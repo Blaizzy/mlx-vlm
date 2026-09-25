@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -274,6 +274,8 @@ class LagunaModel(nn.Module):
         inputs: mx.array,
         cache=None,
         inputs_embeds: Optional[mx.array] = None,
+        capture_layer_ids: Optional[List[int]] = None,
+        hidden_sink: Optional[list] = None,
     ) -> mx.array:
         if inputs_embeds is not None:
             h = inputs_embeds
@@ -289,13 +291,16 @@ class LagunaModel(nn.Module):
                 h, cache[self.swa_idx], window_size=self.args.sliding_window
             )
 
-        for layer, c in zip(self.layers, cache):
+        capture_set = set(capture_layer_ids) if capture_layer_ids else set()
+        for index, (layer, c) in enumerate(zip(self.layers, cache)):
             mask = (
                 sliding_mask
                 if layer.attention_type == "sliding_attention"
                 else full_mask
             )
             h = layer(h, mask, c)
+            if hidden_sink is not None and index in capture_set:
+                hidden_sink.append(h)
         return self.norm(h)
 
 
@@ -315,18 +320,27 @@ class LanguageModel(nn.Module):
         cache=None,
         input_embeddings: Optional[mx.array] = None,
         inputs_embeds: Optional[mx.array] = None,
+        capture_layer_ids: Optional[List[int]] = None,
         **kwargs,
     ) -> LanguageModelOutput:
         if inputs is None:
             inputs = kwargs.get("input_ids")
         if inputs_embeds is None:
             inputs_embeds = input_embeddings
-        out = self.model(inputs, cache, inputs_embeds)
+        kwargs.pop("speculative_verify", None)
+        hidden_sink: Optional[list] = [] if capture_layer_ids is not None else None
+        out = self.model(
+            inputs,
+            cache,
+            inputs_embeds,
+            capture_layer_ids=capture_layer_ids,
+            hidden_sink=hidden_sink,
+        )
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
             out = self.lm_head(out)
-        return LanguageModelOutput(logits=out)
+        return LanguageModelOutput(logits=out, hidden_states=hidden_sink)
 
     def sanitize(self, weights):
         if self.args.tie_word_embeddings:
@@ -553,6 +567,41 @@ class LanguageModel(nn.Module):
     @property
     def n_kv_heads(self):
         return self.args.num_key_value_heads
+
+    def rollback_speculative_cache(
+        self,
+        caches: List[Any],
+        gdn_states: Any,
+        accepted: Any,
+        block_size: int,
+    ) -> int:
+        """Commit the accepted speculative prefix and drop rejected entries.
+
+        Laguna holds only KV and RotatingKV caches, so committing is a trim.
+        ``gdn_states`` is accepted and ignored, for parity with the targets
+        that carry recurrent state.
+        """
+        del gdn_states
+        if isinstance(accepted, int):
+            accepted = mx.array([accepted], dtype=mx.int32)
+        elif not isinstance(accepted, mx.array):
+            accepted = mx.array(accepted, dtype=mx.int32)
+
+        max_accepted = int(accepted.max().item())
+        if accepted.size > 1 and int(accepted.min().item()) != max_accepted:
+            raise RuntimeError(
+                "Laguna batched speculative rollback requires uniform per-row "
+                f"acceptance; got ragged accepts {accepted.tolist()}. Set "
+                "requires_uniform_batch_acceptance on the drafter or target so "
+                "accepts are clamped before rollback."
+            )
+
+        trim = block_size - max_accepted - 1
+        if trim > 0:
+            for cache in caches:
+                if cache is not None and hasattr(cache, "trim"):
+                    cache.trim(trim)
+        return max_accepted
 
     def make_cache(self):
         return [

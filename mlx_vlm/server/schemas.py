@@ -21,6 +21,21 @@ def get_server_max_tokens():
     return int(os.environ.get("MLX_VLM_MAX_TOKENS", DEFAULT_MAX_TOKENS))
 
 
+_TOOL_PARSER_DESC = (
+    "Force a specific tool-call parser by name, bypassing chat-template inference."
+)
+
+
+def _check_tool_parser(cls, value: Optional[str]) -> Optional[str]:
+    """Reject an unknown ``tool_parser`` override, naming the known parsers."""
+    from ..tools import SPECS
+
+    if value is not None and value not in {spec.name for spec in SPECS}:
+        known = ", ".join(sorted(spec.name for spec in SPECS))
+        raise ValueError(f"unknown tool_parser {value!r}; known parsers: {known}")
+    return value
+
+
 class FlexibleBaseModel(BaseModel):
     """Base model that ignores/accepts any unknown OpenAI SDK fields."""
 
@@ -129,6 +144,18 @@ class ImageEditRequest(FlexibleBaseModel):
     guidance: Optional[float] = Field(
         None,
         description="Classifier-free guidance scale; model default if omitted.",
+    )
+    negative_prompt: Optional[str] = Field(
+        None, description="Negative conditioning prompt; model default if omitted."
+    )
+    output_resolution: Optional[int] = Field(
+        None,
+        ge=256,
+        description="Reference image resolution and default output area scale.",
+    )
+    use_kv_cache: Optional[bool] = Field(
+        None,
+        description="Reuse fixed conditioning keys/values when supported by the model.",
     )
     response_format: Literal["b64_json", "path"] = Field(
         "b64_json",
@@ -394,6 +421,8 @@ class OpenAIRequest(FlexibleBaseModel):
         None, description="Responses API tool definitions."
     )
     tool_choice: Optional[Any] = Field(None, description="Tool choice policy.")
+    tool_parser: Optional[str] = Field(None, description=_TOOL_PARSER_DESC)
+    _validate_tool_parser = field_validator("tool_parser")(_check_tool_parser)
     store: Optional[bool] = Field(
         True, description="Whether to store this response for later retrieval."
     )
@@ -850,6 +879,8 @@ class ChatRequest(GenerationRequest):
             "Controls tool use: none, auto, required, or a specific function."
         ),
     )
+    tool_parser: Optional[str] = Field(None, description=_TOOL_PARSER_DESC)
+    _validate_tool_parser = field_validator("tool_parser")(_check_tool_parser)
 
 
 class TopLogprob(BaseModel):
@@ -928,6 +959,8 @@ class AnthropicRequest(FlexibleBaseModel):
     stop_sequences: Optional[List[str]] = None
     tools: Optional[List[Any]] = None
     tool_choice: Optional[Any] = None
+    tool_parser: Optional[str] = Field(None, description=_TOOL_PARSER_DESC)
+    _validate_tool_parser = field_validator("tool_parser")(_check_tool_parser)
     metadata: Optional[Any] = None
     thinking: Optional[Any] = None
     output_config: Optional[Any] = None
@@ -1001,6 +1034,9 @@ class ModelInfo(BaseModel):
     id: str
     object: str
     created: int
+    loaded: bool = Field(
+        default=False, description="Whether the model is loaded in this server process."
+    )
 
 
 class ModelsResponse(BaseModel):

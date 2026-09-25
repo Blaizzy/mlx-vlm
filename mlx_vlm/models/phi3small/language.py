@@ -8,6 +8,7 @@ import mlx.nn as nn
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
+    dequantize_kv_state,
     scaled_dot_product_attention,
 )
 from .config import ModelConfig
@@ -150,6 +151,9 @@ class Attention(nn.Module):
             keys = self.rope(keys)
 
         if self.block_sparse:
+            # The block-sparse path builds the scores by hand, so the packed
+            # state a quantized cache returns has to be materialized first.
+            keys, values = dequantize_kv_state(cache, keys, values)
             output = self._block_sparse_attention(
                 queries, keys, values, scale=self.scale, mask=mask
             )

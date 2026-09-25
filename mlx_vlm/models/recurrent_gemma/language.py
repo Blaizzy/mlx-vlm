@@ -377,6 +377,7 @@ class Griffin(nn.Module):
 class LanguageModel(nn.Module):
 
     def __init__(self, config):
+        super().__init__()
         self.args = config
         self.model = Griffin(config)
         self.model_type = config.model_type

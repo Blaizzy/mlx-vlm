@@ -94,6 +94,7 @@ class Flux2ImageGenerationModel(ImageGenerationModel):
             guidance=guidance,
             max_sequence_length=max_sequence_length,
             tiled_vae=tiled_vae,
+            num_images=int(request.extra.get("num_images", 1)),
         )
         metadata = {
             "model_path": str(self.pipeline.model_path),

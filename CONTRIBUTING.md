@@ -56,20 +56,15 @@ Getting this wrong fails in two ways. A shape-changing conversion applied twice
 dies loudly at weight-load; a value-changing one (a norm shift, a scale rewrite)
 loads fine and generates garbage.
 
-Additionally, add a test for the new model type to the [model
-tests](https://github.com/Blaizzy/mlx-vlm/tree/main/mlx_vlm/tests/test_models.py),
-and assert the invariant above with the shared helper:
-
-```python
-from mlx_vlm.tests.sanitize_invariants import assert_sanitize_idempotent
-
-sanitized = assert_sanitize_idempotent(model, hf_weights)
-```
+Additionally, add a small configuration for the new model type to the [model
+cases](mlx_vlm/tests/model_cases.json), using the existing checks in
+[test_models.py](mlx_vlm/tests/test_models.py). For sanitizer changes, verify
+that a second pass preserves the weight keys, shapes, and values.
 
 From the repository root, you can run the tests with:
 
 ```shell
-python -m unittest discover mlx_vlm/tests/
+python -m pytest -q mlx_vlm/tests
 ```
 
 ## Pull Requests

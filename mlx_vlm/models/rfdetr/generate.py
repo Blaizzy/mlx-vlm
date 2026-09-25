@@ -619,8 +619,16 @@ def _get_annotator(
     task: str,
     opacity: float = 0.5,
     contour_thickness: int = 1,
+    show_boxes: bool = True,
 ):
-    """Build an annotator chain. Reuses SAM3's annotator system."""
+    """Build an annotator chain. Reuses SAM3's annotator system.
+
+    Args:
+        show_boxes: If False, a segment chain draws only mask overlays +
+            contours (no boxes/labels). Detect output has nothing but boxes
+            and labels, so it keeps them regardless. Ignored when ``name``
+            explicitly spells out the chain.
+    """
     from ..sam3.generate import build_annotator
 
     if name:
@@ -631,11 +639,10 @@ def _get_annotator(
     from ..sam3.annotators import BoxAnnotator, LabelAnnotator, MaskAnnotator
 
     if task == "segment":
-        return (
-            MaskAnnotator(opacity=opacity, contour_thickness=contour_thickness)
-            + BoxAnnotator()
-            + LabelAnnotator()
-        )
+        chain = MaskAnnotator(opacity=opacity, contour_thickness=contour_thickness)
+        if show_boxes:
+            chain = chain + BoxAnnotator() + LabelAnnotator()
+        return chain
     else:
         return BoxAnnotator() + LabelAnnotator()
 
@@ -679,6 +686,12 @@ def main():
         action="store_true",
         default=True,
         help="Show bounding boxes and labels (default: on)",
+    )
+    parser.add_argument(
+        "--no-show-boxes",
+        dest="show_boxes",
+        action="store_false",
+        help="Draw only mask overlays and contours on segment output",
     )
     parser.add_argument(
         "--show-fps", action="store_true", help="Show FPS overlay on video"
@@ -733,6 +746,7 @@ def main():
         effective_task,
         opacity=args.opacity,
         contour_thickness=args.contour_thickness,
+        show_boxes=args.show_boxes,
     )
 
     with wired_limit(model):
