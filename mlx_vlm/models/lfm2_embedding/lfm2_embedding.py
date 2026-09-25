@@ -3,7 +3,6 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import LanguageModelOutput
 from ..lfm2.language import Lfm2Model
 from ..pooling import EmbeddingOutput, normalize_embeddings, pool_by_config
 from .config import ModelConfig
@@ -17,7 +16,7 @@ class Model(nn.Module):
         self.model_type = config.model_type
         self.model = Lfm2Model(config)
 
-    def _encode(self, input_ids, attention_mask=None, mask_convolutions=False):
+    def _encode(self, input_ids, attention_mask=None):
         B, L = input_ids.shape
         if attention_mask is None:
             attention_mask = mx.ones((B, L))
@@ -26,9 +25,11 @@ class Model(nn.Module):
             h.dtype
         ).min
         for layer in self.model.layers:
-            mask = attn_mask if layer.is_attention_layer else None
-            if mask_convolutions and not layer.is_attention_layer:
-                mask = attention_mask.astype(mx.bool_)
+            mask = (
+                attn_mask
+                if layer.is_attention_layer
+                else attention_mask.astype(mx.bool_)
+            )
             h = layer(h, mask, None)
         return self.model.embedding_norm(h), attention_mask
 
@@ -62,18 +63,3 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.model.layers
-
-
-class MaskedLMModel(Model):
-    def __call__(
-        self,
-        input_ids: mx.array,
-        attention_mask: Optional[mx.array] = None,
-        **kwargs,
-    ) -> LanguageModelOutput:
-        h, _ = self._encode(input_ids, attention_mask, mask_convolutions=True)
-        return LanguageModelOutput(logits=self.model.embed_tokens.as_linear(h))
-
-    def sanitize(self, weights):
-        weights = {key.removeprefix("lfm2."): value for key, value in weights.items()}
-        return super().sanitize(weights)

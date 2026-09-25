@@ -26,8 +26,8 @@ from mlx.utils import tree_flatten, tree_map
 
 from mlx_vlm.models.base import InputEmbeddingsFeatures
 from mlx_vlm.models.cache import make_prompt_cache
-from mlx_vlm.models.lfm2_embedding import MaskedLMModel
-from mlx_vlm.models.lfm2_embedding import ModelConfig as Lfm2EncoderConfig
+from mlx_vlm.models.lfm2_encoder import Model as Lfm2Encoder
+from mlx_vlm.models.lfm2_encoder import ModelConfig as Lfm2EncoderConfig
 from mlx_vlm.utils import (
     _drop_modules_without_weights,
     _load_safetensors,
@@ -45,9 +45,9 @@ from mlx_vlm.utils import (
 class TestLfm2Encoder:
     @staticmethod
     def model():
-        return MaskedLMModel(
+        return Lfm2Encoder(
             Lfm2EncoderConfig(
-                model_type="lfm2_embedding",
+                model_type="lfm2",
                 vocab_size=32,
                 hidden_size=16,
                 num_hidden_layers=2,
@@ -87,6 +87,17 @@ class TestLfm2Encoder:
         assert "model.embed_tokens.weight" in sanitized
         assert sanitized["model.layers.0.conv.conv.weight"].shape == (16, 3, 1)
         assert "lm_head.weight" not in sanitized
+
+    def test_architecture_dispatch(self):
+        module, model_type = get_model_and_args(
+            {
+                "model_type": "lfm2",
+                "architectures": ["Lfm2BidirectionalForMaskedLM"],
+            }
+        )
+
+        assert module.Model is Lfm2Encoder
+        assert model_type == "lfm2_encoder"
 
 
 def capture_positions(

@@ -1,4 +1,4 @@
 from .config import ModelConfig
-from .lfm2_embedding import Model
+from .lfm2_encoder import Model
 
 __all__ = ["Model", "ModelConfig"]
