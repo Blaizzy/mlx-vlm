@@ -270,12 +270,14 @@ response_store_lock = Lock()
 class ToolCallStreamState:
     """Remove tool-call spans from streamed content, independent of chunking.
 
-    Marker fragments are buffered until they either complete or stop matching.
-    Text outside calls is emitted exactly once; text and markup inside calls is
-    discarded. Whitespace-only text after a call is held back: it is dropped at
-    the end of generation, and before another call when no text has been shown,
-    as the non-streamed response strips it. Parsers with no end marker keep the
-    historical latching behavior after the first start marker.
+    Streamed content matches what ``process_tool_calls`` leaves as the
+    non-streamed content. Marker fragments are buffered until they either
+    complete or stop matching. Text outside calls is emitted exactly once; a
+    closed call is discarded. A parser with no end marker ends a call at the
+    next newline, as the extractor does. A call still open when generation
+    ends is not a call to the extractor, so its text is emitted then.
+    Whitespace-only text after a call is held back: it is dropped at the end of
+    generation, and before another call or text when no text has been shown.
     """
 
     def __init__(
@@ -287,6 +289,7 @@ class ToolCallStreamState:
         self.tc_end = tc_end or ""
         self.in_tool_call = False
         self.buffer = ""
+        self.call_text = ""
         self.after_call = False
         self.pending_space = ""
         self.shown_text = False
@@ -299,35 +302,47 @@ class ToolCallStreamState:
         visible = []
 
         while self.buffer:
-            marker = self.tc_end if self.in_tool_call else self.tc_start
-            if not marker:
-                # A parser with no end marker treats the rest of the generation
-                # as tool-call content once its start marker has been seen.
-                self.buffer = ""
-                break
+            if self.in_tool_call:
+                marker = self.tc_end or "\n"
+            else:
+                marker = self.tc_start
 
             marker_at = self.buffer.find(marker)
             if marker_at >= 0:
-                if not self.in_tool_call:
+                if self.in_tool_call:
+                    self.call_text = ""
+                    self.after_call = True
+                else:
                     self._show(self.buffer[:marker_at], visible)
                     if not self.shown_text:
                         self.pending_space = ""
+                    self.call_text = marker
                 self.buffer = self.buffer[marker_at + len(marker) :]
                 self.in_tool_call = not self.in_tool_call
-                self.after_call = not self.in_tool_call
                 continue
 
             stable, self.buffer = self._split_partial_marker(self.buffer, marker)
-            if not self.in_tool_call:
+            if self.in_tool_call:
+                if self.tc_end:
+                    # Kept only to be emitted if the call never closes; with no
+                    # end marker the extractor always ends it, so keep nothing.
+                    self.call_text += stable
+            else:
                 self._show(stable, visible)
             break
 
         if last:
-            if self.buffer and not self.in_tool_call:
+            if self.in_tool_call:
+                if self.tc_end:
+                    # No end marker arrived, so the extractor finds no call and
+                    # keeps this text as content.
+                    self._show(self.call_text + self.buffer, visible)
+            elif self.buffer:
                 # An unfinished start-marker prefix is ordinary content when
                 # generation ends before the marker can complete.
                 self._show(self.buffer, visible)
             self.buffer = ""
+            self.call_text = ""
             self.pending_space = ""
 
         return "".join(visible) or None
@@ -339,7 +354,7 @@ class ToolCallStreamState:
             if text.isspace():
                 self.pending_space += text
                 return
-            text = self.pending_space + text
+            text = self.pending_space + text if self.shown_text else text.lstrip()
             self.pending_space = ""
             self.after_call = False
         if not text.isspace():

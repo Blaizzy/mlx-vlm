@@ -52,7 +52,7 @@ from mlx_vlm.server.responses_state import ToolCallStreamState, _response_items_
 from mlx_vlm.server.runtime_config import RuntimeConfig
 from mlx_vlm.tests.test_processors import MINICPM_MULTICALL
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
-from mlx_vlm.tools import load_tool_module
+from mlx_vlm.tools import load_tool_module, process_tool_calls
 
 _MUSE_RESPONSE_TEMPLATE = {
     "defaults": {"role": "assistant"},
@@ -1817,7 +1817,7 @@ def test_anthropic_messages_streaming_emits_tool_use_events(client):
         '"name": "get_weather"',
         '"type": "input_json_delta"',
         '"partial_json": "{\\"location\\": \\"SF\\"}"',
-        '"text": " After the call."',
+        '"text": "After the call."',
         '"stop_reason": "tool_use"',
     ):
         assert fragment in response.text
@@ -3400,7 +3400,7 @@ def test_unknown_function_output_blocks_remain_text():
 @pytest.mark.parametrize(
     "chunks,start_marker,end_marker,expected,inside",
     [
-        (["text<tool_call>"], "<tool_call>", "</tool_call>", "text", True),
+        (["text<tool_call>"], "<tool_call>", "</tool_call>", "text<tool_call>", True),
         (
             ["Before ", "<tool_call>", '{"name": "a"}', " trailing"],
             "<tool_call>",
@@ -3434,7 +3434,7 @@ def test_unknown_function_output_blocks_remain_text():
             ["<tool_call>a</tool_call>", "\n", "Done", "."],
             "<tool_call>",
             "</tool_call>",
-            "\nDone.",
+            "Done.",
             False,
         ),
         (
@@ -3442,6 +3442,20 @@ def test_unknown_function_output_blocks_remain_text():
             "<tool_call>",
             "</tool_call>",
             "A \nB",
+            False,
+        ),
+        (
+            list("A<tool_call>x</tool"),
+            "<tool_call>",
+            "</tool_call>",
+            "A<tool_call>x</tool",
+            True,
+        ),
+        (
+            ["Before ", "[TOOL_CALLS]foo[ARGS]{}", "\nAfter"],
+            "[TOOL_CALLS]",
+            "",
+            "Before After",
             False,
         ),
     ],
@@ -3454,6 +3468,8 @@ def test_unknown_function_output_blocks_remain_text():
         "whitespace-between-calls-character-chunks",
         "text-after-call",
         "whitespace-between-text",
+        "unfinished-call",
+        "no-end-marker-ends-at-newline",
     ],
 )
 def test_tool_stream_finalization(chunks, start_marker, end_marker, expected, inside):
@@ -3463,6 +3479,34 @@ def test_tool_stream_finalization(chunks, start_marker, end_marker, expected, in
     ]
     assert "".join(delta for delta in visible if delta) == expected
     assert state.in_tool_call is inside
+
+
+@pytest.mark.parametrize(
+    "parser,text",
+    [
+        ("qwen3_coder", "<tool_call>a</tool_call>\n<tool_call>b</tool_call>\n"),
+        ("qwen3_coder", "Hi <tool_call>a</tool_call>\n<tool_call>b</tool_call>\n bye"),
+        ("qwen3_coder", "<tool_call>a</tool_call> \nDone."),
+        ("qwen3_coder", "A<tool_call>x</tool_call>\nB<tool_call>unfinished"),
+        ("qwen3_coder", "No calls\n\n"),
+        ("mistral", 'Before [TOOL_CALLS]foo[ARGS]{"a": 1}\nAfter'),
+        ("mistral", "[TOOL_CALLS]foo[ARGS]{}\n[TOOL_CALLS]bar[ARGS]{}"),
+    ],
+)
+def test_tool_stream_matches_non_streamed_content(parser, text):
+    # Streamed content equals the content process_tool_calls leaves, up to the
+    # separator it substitutes for each call, whatever the chunking. Whitespace
+    # is compared loosely: text before a call and trailing whitespace are
+    # streamed before it is known whether the extractor's strip() applies.
+    module = load_tool_module(parser)
+    expected = " ".join(process_tool_calls(text, module, None).remaining_text.split())
+    for chunks in ([text], list(text)):
+        state = ToolCallStreamState(module.tool_call_start, module.tool_call_end)
+        streamed = "".join(
+            state.feed(chunk, last=i == len(chunks) - 1) or ""
+            for i, chunk in enumerate(chunks)
+        )
+        assert " ".join(streamed.split()) == expected
 
 
 # HTTP audio endpoints
