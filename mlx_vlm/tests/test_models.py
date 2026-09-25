@@ -1809,9 +1809,8 @@ def test_moondream3_sanitize_remaps_raw_and_preserves_converted_keys():
 class TestQwen3_5MoeText(unittest.TestCase):
     """Decoder-only Qwen3.5 MoE checkpoints (model_type qwen3_5_moe_text)."""
 
-    CASES = json.loads(Path(__file__).with_name("model_cases.json").read_text())
     CONFIG = next(
-        c["config"] for c in CASES["cases"] if c["module"] == "qwen3_5_moe_text"
+        case["config"] for case in DATA["cases"] if case["module"] == "qwen3_5_moe_text"
     )
 
     def _model(self):
