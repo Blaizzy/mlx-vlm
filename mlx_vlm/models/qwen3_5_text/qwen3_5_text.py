@@ -16,11 +16,6 @@ from .language import LanguageModel
 def sanitize_key(key):
     if key.startswith("language_model."):
         return key
-    if key.startswith("model.language_model."):
-        # Some decoder-only exports keep the multimodal nesting. Match this
-        # before the bare model. prefix below, which would otherwise leave the
-        # language_model level in place.
-        return key.replace("model.language_model.", "language_model.model.", 1)
     if key.startswith("model."):
         return key.replace("model.", "language_model.model.", 1)
     if key.startswith("lm_head"):
