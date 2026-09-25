@@ -3,6 +3,40 @@
 
 MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VLMs) and Omni Models (VLMs with audio and video support) on your Mac using MLX.
 
+## Installation
+
+Install the `mlx-vlm` package with pip:
+
+```sh
+pip install -U mlx-vlm
+```
+
+Optional extras — Gradio UI, training, realtime speech, and CUDA/CPU builds — are listed in the [Getting Started guide](docs/getting-started.md#optional-extras); for example `pip install -U 'mlx-vlm[ui]'` (quote the name so shells like `zsh` don't expand the brackets).
+
+## Quickstart
+
+```sh
+# Describe an image from the CLI
+mlx_vlm.generate --model mlx-community/Qwen2.5-VL-3B-Instruct-4bit \
+  --image http://images.cocodataset.org/val2017/000000039769.jpg \
+  --prompt "Describe this image." --max-tokens 100
+```
+
+```python
+from mlx_vlm import load, generate
+from mlx_vlm.prompt_utils import apply_chat_template
+from mlx_vlm.utils import load_config
+
+model, processor = load("mlx-community/Qwen2.5-VL-3B-Instruct-4bit")
+config = load_config("mlx-community/Qwen2.5-VL-3B-Instruct-4bit")
+
+image = ["http://images.cocodataset.org/val2017/000000039769.jpg"]
+prompt = apply_chat_template(processor, config, "Describe this image.", num_images=1)
+print(generate(model, processor, prompt, image, verbose=False))
+```
+
+See the [Getting Started guide](docs/getting-started.md) for the CLI, chat UI, audio, video, and Python usage.
+
 ## Table of Contents
 - [Installation](#installation)
 - [Agent Skills](#agent-skills)
@@ -56,24 +90,6 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | Granite Vision 3.2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite_vision/README.md) |
 | Granite 4.0 Vision | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite4_vision/README.md) |
 | MiniCPM-V 4.6 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minicpmv4_6/README.md) |
-
-## Installation
-
-The easiest way to get started is to install the `mlx-vlm` package using pip:
-
-```sh
-pip install -U mlx-vlm
-```
-
-The [Gradio chat UI](#chat-ui-with-gradio) needs an extra dependency that is not
-part of the base install:
-
-```sh
-pip install -U 'mlx-vlm[ui]'
-```
-
-Quote the package name so that shells which expand square brackets, such as
-`zsh`, do not treat `[ui]` as a glob pattern.
 
 ## Agent Skills
 
