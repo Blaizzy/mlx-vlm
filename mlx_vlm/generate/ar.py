@@ -544,7 +544,7 @@ def generate_step(
         if (n + 1) % DEFAULT_CACHE_EVAL_INTERVAL == 0:
             mx.eval([c.state for c in prompt_cache])
 
-        yield (y.item() if y.size == 1 else y.tolist()), logprobs
+        yield y.item(), logprobs
         if n % 256 == 0:
             mx.clear_cache()
 
