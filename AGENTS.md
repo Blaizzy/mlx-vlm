@@ -3,6 +3,24 @@
 Guidance for coding agents (and humans) working in the mlx-vlm repository. For the
 narrative version, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
+## Start here: skills
+
+This repo ships an agent-skills bundle under [`skills/skills/`](skills/skills) that
+encodes the project's own conventions for common workflows. **Load the relevant skill
+before starting a task** — it tells you the right way to do it instead of guessing:
+
+- [`add-new-model`](skills/skills/add-new-model) — port a new model to mlx-vlm.
+- [`cli-inference`](skills/skills/cli-inference) — run inference from the CLI.
+- [`server-inference`](skills/skills/server-inference) — the OpenAI/Anthropic-compatible server.
+- [`convert-quantize`](skills/skills/convert-quantize) — convert and quantize checkpoints.
+- [`benchmarking`](skills/skills/benchmarking) — measure performance.
+- [`hf-cache-models`](skills/skills/hf-cache-models) — inspect the local Hugging Face cache.
+- [`contributing`](skills/skills/contributing) — the development and contribution workflow.
+- [`reproducible-github-issues`](skills/skills/reproducible-github-issues) — reproduce and file issues.
+
+See the [Agent Skills](README.md#agent-skills) section of the README for installing them
+into Claude Code, Codex, or Gemini.
+
 ## What this is
 
 mlx-vlm is a local inference and fine-tuning engine for vision, text, audio, video,
