@@ -1,6 +1,6 @@
 # Contributing
 
-To work on MLX-VLM in editable mode run:
+To work on mlx-vlm in editable mode run:
 
 ```bash
 pip install -e .

@@ -1,5 +1,5 @@
-site_name: MLX-VLM
-site_description: MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VLMs) on your Mac using MLX.
+site_name: mlx-vlm
+site_description: mlx-vlm is a package for inference and fine-tuning of Vision Language Models (VLMs) on your Mac using MLX.
 site_author: Prince Canuma
 repo_name: Blaizzy/mlx-vlm
 site_url: https://Blaizzy.github.io/mlx-vlm
@@ -67,8 +67,6 @@ extra:
           link: https://github.com/Blaizzy
         - icon: fontawesome/brands/twitter
           link: https://twitter.com/Prince_Canuma
-    version:
-        provider: mike
     consent:
         title: Cookie consent
         description: >-
@@ -77,18 +75,26 @@ extra:
           find what they're searching for. With your consent, you're helping us to
           make our documentation better.
 
-extra_css:
-    - stylesheets/extra.css
-
 nav:
     - Home: index.md
-    - Installation: installation.md
-    - CLI Reference: cli_reference.md
-    - Examples: examples.md
-    - Speculative Decoding: speculative-decoding.md
+    - Getting Started: getting-started.md
+    - Models: models.md
+    - CLI:
+        - Overview: cli/index.md
+        - generate: cli/generate.md
+        - server: cli/server.md
+        - convert: cli/convert.md
+        - chat: cli/chat.md
+        - Fine-tune (lora): cli/lora.md
+        - Specialized: cli/specialized.md
+    - Server: server.md
+    - Fine-tuning: fine-tuning.md
+    - Performance:
+        - Speculative Decoding: performance/speculative-decoding.md
+        - Prefix Caching: performance/prefix-caching.md
+        - Quantization: performance/quantization.md
+        - KV Cache Quantization: performance/kv-cache-quantization.md
     - Contributing: contributing.md
-    - Community Projects: community_projects.md
     - Report Issues: report_issues.md
-    - Changelog: changelog.md
 
 docs_dir: docs

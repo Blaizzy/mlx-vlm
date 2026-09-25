@@ -1,4 +1,6 @@
-# LoRA Training in MLX-VLM
+# Fine-tuning
+
+Fine-tune vision-language models with LoRA and QLoRA using [`mlx_vlm/lora.py`](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/lora.py).
 
 ## Overview
 
