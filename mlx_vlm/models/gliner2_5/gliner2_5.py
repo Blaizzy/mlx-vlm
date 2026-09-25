@@ -6,8 +6,6 @@ from typing import Dict, Optional, Sequence, Union
 import mlx.core as mx
 import mlx.nn as nn
 
-from ...tokenizer_utils import load_tokenizer
-from ...utils import get_model_path, load_model
 from .boundary import BoundaryHead
 from .config import ModelConfig
 from .deberta import DebertaModel
@@ -94,7 +92,7 @@ def _resolve_flat_overlaps(spans):
     )
 
 
-class Model(nn.Module):
+class BoundaryExtractor(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
@@ -149,35 +147,31 @@ class Model(nn.Module):
         return remapped
 
 
-class GLiNER2:
-    """High-level entity extraction and classification facade."""
-
-    def __init__(self, model, tokenizer, *, word_splitter="whitespace"):
-        self.model = model
-        self.tokenizer = tokenizer
+class Model(BoundaryExtractor):
+    def _prepare(
+        self, processor, text, schema, max_len=None, word_splitter="whitespace"
+    ):
         if word_splitter == "whitespace":
-            self.word_splitter = _WhitespaceSplitter()
+            splitter = _WhitespaceSplitter()
         elif word_splitter == "char":
-            self.word_splitter = _CharSplitter()
+            splitter = _CharSplitter()
         else:
             raise ValueError("word_splitter must be 'whitespace' or 'char'")
-        added = tokenizer.add_special_tokens(
+        added = processor.add_special_tokens(
             {"additional_special_tokens": SPECIAL_TOKENS}
         )
         if added:
             raise ValueError("checkpoint tokenizer is missing GLiNER2.5 special tokens")
-
-    def _prepare(self, text, schema, max_len=None):
         if not text.rstrip().endswith((".", "!", "?")):
             text = text + "."
-        max_len = max_len or self.model.config.max_len
+        max_len = max_len or self.config.max_len
         combined = list(schema) + ["[SEP_TEXT]"]
         marker_slots = {1, *range(4, len(schema) - 2, 2)}
         subwords = []
         marker_positions = []
         for index, token in enumerate(combined):
             position = len(subwords)
-            pieces = self.tokenizer.tokenize(token)
+            pieces = processor.tokenize(token)
             if index < len(schema) and index in marker_slots:
                 marker_positions.append(position)
             subwords.extend(pieces)
@@ -186,10 +180,10 @@ class GLiNER2:
 
         offsets = []
         word_positions = []
-        for word, start, end in self.word_splitter(text):
-            pieces = self.tokenizer.tokenize(word)
+        for word, start, end in splitter(text):
+            pieces = processor.tokenize(word)
             if not pieces:
-                pieces = [self.tokenizer.unk_token]
+                pieces = [processor.unk_token]
             if len(subwords) + len(pieces) > max_len:
                 break
             word_positions.append(len(subwords))
@@ -198,7 +192,7 @@ class GLiNER2:
         if not offsets:
             raise ValueError("no text tokens fit within max_len")
         input_ids = mx.array(
-            [self.tokenizer.convert_tokens_to_ids(subwords)], dtype=mx.int32
+            [processor.convert_tokens_to_ids(subwords)], dtype=mx.int32
         )
         return _PreparedInput(
             input_ids=input_ids,
@@ -210,6 +204,7 @@ class GLiNER2:
 
     def extract_entities(
         self,
+        processor,
         text: str,
         entity_types: Union[Sequence[str], Dict[str, str]],
         threshold: float = 0.5,
@@ -217,6 +212,7 @@ class GLiNER2:
         include_confidence: bool = False,
         include_spans: bool = False,
         max_len: Optional[int] = None,
+        word_splitter: str = "whitespace",
     ):
         if isinstance(entity_types, dict):
             labels = list(entity_types)
@@ -231,13 +227,13 @@ class GLiNER2:
         if not labels:
             return {"entities": {}}
         schema = _schema_tokens("entities", labels, "[E]", descriptions=descriptions)
-        prepared = self._prepare(text, schema, max_len)
-        encoded = self.model.encode(prepared.input_ids)
+        prepared = self._prepare(processor, text, schema, max_len, word_splitter)
+        encoded = self.encode(prepared.input_ids)
         text_states = encoded[:, prepared.word_positions]
         query_states = encoded[:, prepared.marker_positions[1:]]
         text_mask = mx.ones(text_states.shape[:2], dtype=mx.bool_)
         query_mask = mx.ones(query_states.shape[:2], dtype=mx.bool_)
-        pooled, logits, null_logits = self.model.extract(
+        pooled, logits, null_logits = self.extract(
             text_states, text_mask, query_states, query_mask
         )
         probabilities = mx.sigmoid(logits.astype(mx.float32))
@@ -282,11 +278,13 @@ class GLiNER2:
 
     def classify_text(
         self,
+        processor,
         text: str,
         tasks: Dict[str, Union[Sequence[str], Dict]],
         threshold: float = 0.5,
         *,
         max_len: Optional[int] = None,
+        word_splitter: str = "whitespace",
     ):
         results = {}
         for task, spec in tasks.items():
@@ -305,12 +303,10 @@ class GLiNER2:
             schema = _schema_tokens(
                 task, labels, "[L]", prompt=prompt, descriptions=descriptions
             )
-            prepared = self._prepare(text, schema, max_len)
-            encoded = self.model.encode(prepared.input_ids)
+            prepared = self._prepare(processor, text, schema, max_len, word_splitter)
+            encoded = self.encode(prepared.input_ids)
             choices = encoded[:, prepared.marker_positions[1:]]
-            probabilities = mx.sigmoid(self.model.classify(choices).astype(mx.float32))[
-                0
-            ]
+            probabilities = mx.sigmoid(self.classify(choices).astype(mx.float32))[0]
             scores = probabilities.tolist()[: len(labels)]
             if multi_label:
                 results[task] = [
@@ -323,18 +319,4 @@ class GLiNER2:
         return results
 
 
-def load_gliner(
-    path_or_hf_repo: str,
-    *,
-    revision: Optional[str] = None,
-    lazy: bool = False,
-    word_splitter: str = "whitespace",
-):
-    """Download and load a GLiNER2.5 checkpoint and its tokenizer."""
-    model_path = get_model_path(path_or_hf_repo, revision=revision)
-    model = load_model(model_path, lazy=lazy)
-    tokenizer = load_tokenizer(model_path)
-    return GLiNER2(model, tokenizer, word_splitter=word_splitter)
-
-
-__all__ = ["GLiNER2", "Model", "ModelConfig", "load_gliner"]
+__all__ = ["Model", "ModelConfig"]

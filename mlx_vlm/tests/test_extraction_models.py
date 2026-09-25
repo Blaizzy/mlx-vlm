@@ -20,7 +20,6 @@ from mlx.utils import tree_flatten
 
 from mlx_vlm.models.bert import ModelConfig as BertConfig
 from mlx_vlm.models.bert import TokenClassificationModel as BertTokenClassifier
-from mlx_vlm.models.gliner2_5 import GLiNER2
 from mlx_vlm.models.gliner2_5 import Model as GlinerModel
 from mlx_vlm.models.gliner2_5 import ModelConfig as GlinerConfig
 from mlx_vlm.models.gliner2_5.boundary import (
@@ -199,9 +198,10 @@ def test_flat_overlap_resolution_keeps_disjoint_spans():
     [(0, {"word_splitter": "bpe"}, "word_splitter"), (4, {}, "special tokens")],
 )
 def test_gliner2_rejects_incompatible_tokenization(added, kwargs, error):
+    model = SimpleNamespace(config=SimpleNamespace(max_len=32))
     tokenizer = SimpleNamespace(add_special_tokens=lambda _: added)
     with pytest.raises(ValueError, match=error):
-        GLiNER2(object(), tokenizer, **kwargs)
+        GlinerModel._prepare(model, tokenizer, "text", (), **kwargs)
 
 
 def test_quantized_encoder_still_runs():

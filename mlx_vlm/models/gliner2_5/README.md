@@ -7,26 +7,28 @@ Native MLX inference for the Fastino GLiNER2.5 boundary-extractor checkpoints:
 - `fastino/gliner2.5-multi-v1`
 
 ```python
-from mlx_vlm.models.gliner2_5 import load_gliner
+from mlx_vlm import load
 
-extractor = load_gliner("fastino/gliner2.5-small-v1")
+model, processor = load("fastino/gliner2.5-small-v1")
 
-entities = extractor.extract_entities(
+entities = model.extract_entities(
+    processor,
     "Apple hired Sam in New York.",
     ["company", "person", "location"],
     include_confidence=True,
     include_spans=True,
 )
 
-sentiment = extractor.classify_text(
+sentiment = model.classify_text(
+    processor,
     "The launch was excellent.",
     {"sentiment": ["positive", "neutral", "negative"]},
 )
 ```
 
 Entity label descriptions can be supplied as a mapping instead of a list. For
-multilingual text without whitespace-delimited words, load the model with
-`word_splitter="char"`.
+multilingual text without whitespace-delimited words, pass
+`word_splitter="char"` to the inference method.
 
 This initial native port covers the shared-boundary entity extraction and text
 classification paths used by the collection. Relation and record decoding are
