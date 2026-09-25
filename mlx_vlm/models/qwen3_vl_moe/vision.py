@@ -334,9 +334,6 @@ class VisionModel(nn.Module):
                 weight_list[i].extend(weights[i].tolist())
 
         idx_tensor = mx.array(idx_list, dtype=mx.int32)
-        # Weight the rows in the dtype they come back in, not in pos_embed.weight.dtype:
-        # a quantized pos_embed is an nn.QuantizedEmbedding whose weight is the packed
-        # uint32 array, and casting the fractional weights to it truncates them to 0.
         pos_embeds = self.pos_embed(idx_tensor)
         weight_tensor = mx.array(weight_list, dtype=pos_embeds.dtype)
         pos_embeds = pos_embeds * weight_tensor[:, :, None]
