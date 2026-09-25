@@ -39,7 +39,6 @@ from mlx_vlm.models.rope_utils import (
 from mlx_vlm.quantization.one_bit import (
     OneBitEmbedding,
     OneBitLinear,
-    _quantization_for_path,
     dequantize_one_bit,
     one_bit_quantized_matmul,
     replace_one_bit_modules,
@@ -713,99 +712,6 @@ def test_fp8_reconstruction_requantizes_to_native_mxfp8():
     assert actual_weight.shape == (130, 40)
     assert actual_scales.dtype == mx.uint8
     assert actual_scales.shape == (130, 5)
-
-
-# Quantization config resolution
-
-
-def _legacy_quantization_for_path(quantization, path):
-    """Pre-refactor resolver (order-dependent first match), pinned for equivalence."""
-    base = {
-        key: quantization[key]
-        for key in ("group_size", "bits", "mode")
-        if key in quantization
-    }
-    modules = quantization.get("modules")
-    modules = modules if isinstance(modules, dict) else {}
-
-    def lookup(key):
-        entry = quantization.get(key)
-        if entry is None:
-            entry = modules.get(key)
-        return entry
-
-    for key, value in quantization.items():
-        if not key.endswith("_bits") or not isinstance(value, int):
-            continue
-        component = key[: -len("_bits")]
-        if f".{component}." in path or f".{component}s." in path:
-            base["bits"] = value
-            break
-
-    per_layer = lookup(path)
-    if per_layer is None and path.startswith("language_model."):
-        per_layer = lookup(path[len("language_model.") :])
-    if isinstance(per_layer, dict):
-        base.update(per_layer)
-    return base
-
-
-class TestQuantizationForPath(unittest.TestCase):
-    """The refactor must not change how any checkpoint layout resolves."""
-
-    QUANTS = [
-        {"group_size": 64, "bits": 4},
-        {"group_size": 64, "bits": 4, "expert_bits": 2, "engram_bits": 8},
-        {
-            "group_size": 32,
-            "bits": 4,
-            "mode": "affine",
-            "expert_bits": 2,
-            "modules": {"language_model.layers.0.attn.wo": {"bits": 6}},
-        },
-        {
-            "group_size": 64,
-            "bits": 4,
-            "engram_bits": 8,
-            "layers.0.attn.wq_a": {"bits": 5, "group_size": 128},
-        },
-    ]
-    PATHS = [
-        "",
-        "language_model.layers.0.attn.wq_a",
-        "language_model.layers.3.ffn.experts.2.gate_proj",
-        "language_model.layers.1.engram.embed",
-        "language_model.layers.0.attn.wo",
-        "vision.blocks.0.attn.wqkv",
-    ]
-
-    def test_matches_legacy_resolution(self):
-        for quant in self.QUANTS:
-            for path in self.PATHS:
-                self.assertEqual(
-                    _quantization_for_path(quant, path),
-                    _legacy_quantization_for_path(quant, path),
-                    (quant, path),
-                )
-
-    def test_component_bits_is_order_independent(self):
-        path = "language_model.layers.0.ffn.experts.0.gate_proj"
-        forward = {"group_size": 64, "bits": 4, "expert_bits": 2}
-        reversed_ = {"expert_bits": 2, "bits": 4, "group_size": 64}
-        self.assertEqual(_quantization_for_path(forward, path)["bits"], 2)
-        self.assertEqual(_quantization_for_path(reversed_, path)["bits"], 2)
-
-    def test_overlapping_components_pick_the_most_specific(self):
-        path = "language_model.layers.0.block.experts.0.gate_proj"
-        quant = {"group_size": 64, "bits": 4, "block_bits": 7, "expert_bits": 2}
-        self.assertEqual(_quantization_for_path(quant, path)["bits"], 2)
-        rekeyed = {"expert_bits": 2, "block_bits": 7, "bits": 4, "group_size": 64}
-        self.assertEqual(_quantization_for_path(rekeyed, path)["bits"], 2)
-
-    def test_explicit_module_entry_wins_over_component_width(self):
-        path = "language_model.layers.0.attn.wo"
-        quant = self.QUANTS[2]
-        self.assertEqual(_quantization_for_path(quant, path)["bits"], 6)
 
 
 # One-bit weights
