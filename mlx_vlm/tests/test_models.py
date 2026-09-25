@@ -91,7 +91,6 @@ class TestLfm2Colbert:
         assert "projection.weight" in sanitized
 
     def test_embedding_loader_detects_colbert_sidecar(self, tmp_path, monkeypatch):
-        (tmp_path / "config.json").write_text(json.dumps({"model_type": "lfm2"}))
         dense_dir = tmp_path / "1_Dense"
         dense_dir.mkdir()
         (dense_dir / "config.json").write_text(json.dumps({"out_features": 128}))

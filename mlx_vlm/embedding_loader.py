@@ -1,9 +1,9 @@
-import json
 from pathlib import Path
 
 import mlx.nn as nn
 
 from .encoder_loader import load_encoder_model
+from .utils import load_config
 
 EMBEDDING_MODEL_REMAPPING = {
     "qwen3": "qwen3_embedding",
@@ -19,8 +19,9 @@ def load_embedding_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.M
     dense_config = model_path / "1_Dense" / "config.json"
     config_overrides = None
     if dense_config.exists():
-        with open(dense_config) as f:
-            config_overrides = {"embedding_dim": json.load(f)["out_features"]}
+        config_overrides = {
+            "embedding_dim": load_config(dense_config.parent)["out_features"]
+        }
         model_remapping = {**model_remapping, "lfm2": "lfm2_colbert"}
     return load_encoder_model(
         model_path,

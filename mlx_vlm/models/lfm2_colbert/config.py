@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from ..lfm2.config import ModelConfig as Lfm2Config
+from ..lfm2_embedding.config import ModelConfig as Lfm2Config
 
 
 @dataclass
