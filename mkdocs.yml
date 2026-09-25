@@ -67,8 +67,6 @@ extra:
           link: https://github.com/Blaizzy
         - icon: fontawesome/brands/twitter
           link: https://twitter.com/Prince_Canuma
-    version:
-        provider: mike
     consent:
         title: Cookie consent
         description: >-
@@ -76,9 +74,6 @@ extra:
           as to measure the effectiveness of our documentation and whether users
           find what they're searching for. With your consent, you're helping us to
           make our documentation better.
-
-extra_css:
-    - stylesheets/extra.css
 
 nav:
     - Home: index.md
