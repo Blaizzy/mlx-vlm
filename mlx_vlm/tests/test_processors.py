@@ -2033,9 +2033,9 @@ def test_invalid_calls(name, text, error):
         (
             "qwen3_coder",
             dict,
-            "<function=write>\n<parameter=path>\na.txt\n"
-            "<parameter=content>\nhello\n</parameter>\n</function>",
-            _call("write", path="a.txt", content="hello"),
+            "<function=write>\n<parameter=content>\nfirst\n"
+            "<parameter=name>\nlast\n</parameter>\n</function>",
+            _call("write", content="first\n<parameter=name>\nlast"),
             None,
         ),
         (
@@ -2045,6 +2045,53 @@ def test_invalid_calls(name, text, error):
             "<parameter=content>\nhello\n</function>",
             _call("write", path="a.txt", content="hello"),
             None,
+        ),
+        (
+            "qwen3_coder",
+            dict,
+            "<function=write>\n<parameter=path>\na.txt\n</parameter>\n"
+            "<parameter=content\n</function>",
+            _call("write", path="a.txt"),
+            None,
+        ),
+        (
+            "qwen3_coder",
+            dict,
+            "<function=get_weather>\n<parameter=zip>\n10001\n</parameter>\n"
+            "<parameter=days>\nthree\n</function>",
+            _call("get_weather", zip="10001"),
+            _weather_tools(zip="string", days="integer"),
+        ),
+        (
+            "qwen3_coder",
+            dict,
+            "<function=write><parameter=content><parameter=</parameter></function>",
+            _call("write", content="<parameter="),
+            None,
+        ),
+        (
+            "qwen3_coder",
+            dict,
+            "<function=write><parameter=content>"
+            "Use <parameter=name> in the template.</parameter></function>",
+            _call("write", content="Use <parameter=name> in the template."),
+            None,
+        ),
+        (
+            "qwen3_coder",
+            dict,
+            '<function=configure><parameter=options>{"depth": 2}</parameter>'
+            "</function>",
+            _call("configure", options={"depth": 2}),
+            [
+                dict(
+                    type="function",
+                    function=dict(
+                        name="configure",
+                        parameters=dict(type="object", properties=dict(options={})),
+                    ),
+                )
+            ],
         ),
     ],
     ids=[
@@ -2056,8 +2103,13 @@ def test_invalid_calls(name, text, error):
         "cohere-array-escape",
         "glm-newline",
         "qwen-untyped",
-        "qwen-unclosed-middle",
+        "qwen-line-start-parameter-tag",
         "qwen-unclosed-last",
+        "qwen-truncated-parameter-tag",
+        "qwen-unclosed-last-invalid",
+        "qwen-literal-parameter-prefix",
+        "qwen-literal-parameter-tag",
+        "qwen-empty-property-schema",
     ],
 )
 def test_parser_syntax(parser, argument_type, text, expected, tools):
