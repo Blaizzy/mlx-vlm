@@ -305,12 +305,9 @@ class QuantizedEngramEmbedding(nn.Module):
         # Finish the large file reads before submitting GPU work, whose command
         # buffer can otherwise time out while waiting for the source table.
         mx.eval(self.weight, self.scales, self.biases)
-        parts = []
-        # A full BF16 Engram table would require another 183 GiB. Decode and
-        # quantize bounded row batches before concatenating their packed output.
-        for start in range(0, rows, self._quantize_chunk_rows):
-            end = min(start + self._quantize_chunk_rows, rows)
-            decoded = mx.dequantize(
+
+        def read_rows(start, end):
+            return mx.dequantize(
                 self.weight[start:end],
                 self.scales[start:end],
                 self.biases[start:end] if self.biases is not None else None,
@@ -319,15 +316,26 @@ class QuantizedEngramEmbedding(nn.Module):
                 mode=self.mode,
                 dtype=mx.bfloat16,
             )
-            part = mx.quantize(decoded, **params)
+
+        return self._quantize_rows(rows, dims, read_rows, **params)
+
+    @classmethod
+    def _quantize_rows(cls, rows, dims, read_rows, **params):
+        # A full BF16 Engram table would require another 183 GiB. Decode and
+        # quantize bounded row batches before concatenating their packed output.
+        parts = []
+        for start in range(0, rows, cls._quantize_chunk_rows):
+            end = min(start + cls._quantize_chunk_rows, rows)
+            part = mx.quantize(read_rows(start, end), **params)
             mx.eval(part)
             parts.append(part)
 
         values = [mx.concatenate(arrays, axis=0) for arrays in zip(*parts)]
         mx.eval(values)
-        result = QuantizedEngramEmbedding(
-            rows, dims, scale_dtype=values[1].dtype, **params
-        )
+        # Release the chunk buffers before the converter evaluates other weights.
+        del parts, part
+        mx.clear_cache()
+        result = cls(rows, dims, scale_dtype=values[1].dtype, **params)
         result.weight, result.scales, *biases = values
         result.biases = biases[0] if biases else None
         return result
@@ -425,20 +433,44 @@ class OffloadedEngramEmbedding(nn.Module):
 
         params = get_quantization_params(group_size, bits, mode)
         if "weight" in self:
-            source = self._source_embedding
-            source.update(self.parameters())
-            return source.to_quantized(**params)
+            if params == self._quantization:
+                source = self._source_embedding
+                source.update(self.parameters())
+                return source
+
+            def read_rows(start, end):
+                selected = {
+                    name: value.astype(self[name].dtype)
+                    for name, value in self._read_rows(slice(start, end)).items()
+                }
+                if self._quantization is None:
+                    return selected["weight"]
+                return mx.dequantize(
+                    selected.pop("weight"),
+                    **selected,
+                    **self._quantization,
+                    dtype=mx.bfloat16,
+                )
+
+            rows, dims = self.weight.shape
+            if self._quantization is not None:
+                dims = dims * 32 // self.bits
+            return QuantizedEngramEmbedding._quantize_rows(
+                rows, dims, read_rows, **params
+            )
         if params != self._quantization:
             raise ValueError("Cannot requantize offloaded Engram tables")
         return self
 
-    def __call__(self, indices):
-        # Synchronize the small index tensor, then copy only the requested rows.
-        ids = np.asarray(indices)
-        selected = {
-            name: mx.array(rows[ids]).view(self._dtypes[name], stream=mx.cpu)
+    def _read_rows(self, indices):
+        return {
+            name: mx.array(rows[indices]).view(self._dtypes[name], stream=mx.cpu)
             for name, rows in self._arrays.items()
         }
+
+    def __call__(self, indices):
+        # Synchronize the small index tensor, then copy only the requested rows.
+        selected = self._read_rows(np.asarray(indices))
         if self._quantization is None:
             return selected["weight"]
         return mx.dequantize(

@@ -2153,17 +2153,22 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
                 self.assertTrue(
                     mx.array_equal(lazy.layers[1].engram.embed(ids), expected).item()
                 )
-                exported = str(path / "export.safetensors")
-                lazy.save_weights(exported)
-                self.assertIn(prefix + "weight", mx.load(exported))
-
-                quantized = lazy.layers[1].engram.embed.to_quantized(
-                    group_size=32, bits=4
-                )
+                with patch.object(QuantizedEngramEmbedding, "_quantize_chunk_rows", 41):
+                    quantized = lazy.layers[1].engram.embed.to_quantized(
+                        group_size=32, bits=4
+                    )
                 resident = model.layers[1].engram.embed.to_quantized(
                     group_size=32, bits=4
                 )
+                for name in ("weight", "scales", "biases"):
+                    self.assertTrue(
+                        mx.array_equal(quantized[name], resident[name]).item()
+                    )
                 self.assertTrue(mx.array_equal(quantized(ids), resident(ids)).item())
+
+                exported = str(path / "export.safetensors")
+                lazy.save_weights(exported)
+                self.assertIn(prefix + "weight", mx.load(exported))
 
     def test_fp8_scale_layouts_decode_exactly(self):
         from mlx_vlm.models.deepseek_v41.deepseek_v41 import _pack_source_weight
