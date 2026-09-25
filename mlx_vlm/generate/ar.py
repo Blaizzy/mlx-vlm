@@ -937,7 +937,9 @@ def _make_cache(
         # Caches that ship their own batch-conversion (e.g. MiniMax M3 sparse
         # index-key side cache) know how to build the correct batch cache.
         if hasattr(c, "to_batch"):
-            if kv_bits is not None and quantize:
+            if kv_bits is not None and quantize and not getattr(
+                c, "skip_kv_quantization", False
+            ):
                 raise NotImplementedError(
                     f"{type(c).__name__} does not support quantized continuous "
                     "batching with model-specific cache state; "
