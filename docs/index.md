@@ -22,3 +22,7 @@ pip install -U mlx-vlm
 ```
 
 See [Getting Started](getting-started.md) for optional extras and the full quickstart.
+
+---
+
+<p style="text-align: right;"><a href="https://github.com/Blaizzy/mlx-vlm/issues/new?title=%5BDoc%5D%20&labels=documentation">Report an issue with these docs ↗</a></p>
