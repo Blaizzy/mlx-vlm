@@ -2762,6 +2762,40 @@ def test_incomplete_thinking_markers(chunks, field, expected):
 
 
 @pytest.mark.parametrize(
+    "chunks,enabled,expected",
+    [
+        (["<think>plan</think>\n\nAnswer."], False, ("plan", "Answer.")),
+        (
+            ["<think>", "plan", "</think>", "\n\n", "Answer."],
+            False,
+            ("plan", "Answer."),
+        ),
+        (["<think>plan</think>", "\n", "\n", "Answer."], False, ("plan", "Answer.")),
+        (["<think>plan</thi", "nk>\n", "\nAnswer."], False, ("plan", "Answer.")),
+        (["plan", "</think>", "\n\n", "Answer."], True, ("plan", "Answer.")),
+        (["<think>plan</think>", "\n\n"], False, ("plan", "")),
+        (
+            ["<think>plan</think>", "Answer.", "\n\nMore."],
+            False,
+            ("plan", "Answer.\n\nMore."),
+        ),
+    ],
+    ids=[
+        "same-chunk",
+        "separate-chunk",
+        "one-per-chunk",
+        "split-marker",
+        "preopened",
+        "only-newlines",
+        "keep-later-newlines",
+    ],
+)
+def test_thinking_stream_strips_newlines_after_close(chunks, enabled, expected):
+    state = server.ThinkingStreamState(enable_thinking=enabled)
+    assert _thoughts(_feed_thinking(state, chunks, last=True)) == expected
+
+
+@pytest.mark.parametrize(
     "family,enabled",
     [("gemma4", False), ("gemma4", True)],
 )
