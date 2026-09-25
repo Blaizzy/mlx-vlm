@@ -54,7 +54,7 @@ mlx_vlm.server --api-key <secret-token>
 - `--thinking-end-token`: Default token that closes a thinking block (`--thinking-eos-token` is also accepted)
 - `--kv-bits`: Number of bits for KV cache quantization (e.g. `8` for uniform, `3.5` for TurboQuant)
 - `--kv-quant-scheme`: KV cache quantization backend (`uniform` or `turboquant`)
-- `--kv-key-bits` / `--kv-value-bits`: Override the bit-width for keys or values individually (see [Per-tensor KV quantization](kv-cache-quantization.md#per-tensor-kv-quantization))
+- `--kv-key-bits` / `--kv-value-bits`: Override the bit-width for keys or values individually (see [Per-tensor KV quantization](performance/kv-cache-quantization.md#per-tensor-kv-quantization))
 - `--kv-key-scheme` / `--kv-value-scheme`: Override the quantization backend for keys or values individually
 - `--kv-group-size`: Group size for uniform KV cache quantization (default: `64`)
 - `--max-kv-size`: Maximum KV cache size in tokens
@@ -115,8 +115,8 @@ If `--model` is omitted, the model is loaded on the first request.
 - `/models` and `/v1/models` - List models available locally
 - `/chat/completions` and `/v1/chat/completions` - OpenAI-compatible chat-style interaction endpoint with support for images, audio, and text
 - `/responses` and `/v1/responses` - OpenAI-compatible responses endpoint
-- `/embeddings` and `/v1/embeddings` - OpenAI-compatible embeddings endpoint backed by native MLX embedding models — see [Embeddings & Reranking](embeddings-and-reranking.md)
-- `/v1/rerank` - Rank text or multimodal documents by relevance to a query — see [Embeddings & Reranking](embeddings-and-reranking.md)
+- `/embeddings` and `/v1/embeddings` - OpenAI-compatible embeddings endpoint backed by native MLX embedding models — see [Embeddings](#embeddings)
+- `/v1/rerank` - Rank text or multimodal documents by relevance to a query — see [Reranking](#reranking)
 - `/audio/speech` and `/v1/audio/speech` - OpenAI-compatible text-to-speech endpoint backed by `mlx-audio` TTS models
 - `/audio/transcriptions` and `/v1/audio/transcriptions` - OpenAI-compatible speech-to-text endpoint backed by `mlx-audio` STT models
 - `/audio/translations` and `/v1/audio/translations` - OpenAI-compatible audio translation endpoint for STT models that expose a translation task
@@ -438,8 +438,42 @@ model first — KV, APC, and speculative-decoding settings reload text models,
 The response reports which settings were applied and which were rejected;
 unknown names and invalid values are rejected and never applied.
 
+## Embeddings
+
+MLX-VLM serves OpenAI-compatible embeddings from native MLX models via `/v1/embeddings`. Preload a default with `--embedding-model <repo-or-path>`.
+
+```sh
+curl -X POST "http://localhost:8080/v1/embeddings" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "sentence-transformers/all-MiniLM-L6-v2",
+    "input": ["The quick brown fox.", "A fast auburn fox."]
+  }'
+```
+
+Supported architectures: BERT, XLM-RoBERTa, ModernBERT, Qwen3-Embedding, EmbeddingGemma (gemma3), LFM2, SigLIP (text), Qwen3-VL-Embedding, and Llama-Nemotron-VL, plus LLM2Vec bidirectional Llama. ColBERT-style multi-vector models (ColIdefics3, ColQwen2.5) are also available for late-interaction use. See [Models](models.md#embedding) for the full catalog.
+
+## Reranking
+
+Rank text or multimodal documents by relevance to a query via `/v1/rerank`. Preload a default with `--reranker-model <repo-or-path>`.
+
+```sh
+curl -X POST "http://localhost:8080/v1/rerank" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mlx-community/Qwen3-Reranker-0.6B-4bit",
+    "query": "What is the capital of France?",
+    "documents": ["Berlin is in Germany.", "Paris is the capital of France."],
+    "top_n": 1,
+    "return_documents": true
+  }'
+```
+
+Supported rerankers: one-label BERT, XLM-RoBERTa, and ModernBERT sequence-classification checkpoints, plus Qwen3 generative rerankers. Qwen3-VL rerankers also accept objects containing `text`, `image`, `image_url`, `video`, or `video_url`. Sequence-classification rerankers accept text pairs and do not support custom instructions. See [Models](models.md#re-rankers) for the full catalog.
+
 ## See also
 
-- [Automatic Prefix Caching](prefix-caching.md) — reuse K/V across shared prefixes.
-- [KV cache quantization](kv-cache-quantization.md) — `--kv-bits`, TurboQuant, per-tensor schemes.
+- [Getting Started](getting-started.md) — installation, CLI, and Python usage.
+- [Automatic Prefix Caching](performance/prefix-caching.md) — reuse K/V across shared prefixes.
+- [KV cache quantization](performance/kv-cache-quantization.md) — `--kv-bits`, TurboQuant, per-tensor schemes.
 

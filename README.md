@@ -24,9 +24,10 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
 
 Full reference docs live in [`docs/`](docs/) (also published at
 [Blaizzy.github.io/mlx-vlm](https://Blaizzy.github.io/mlx-vlm)):
-[Server](docs/server.md) · [Prefix caching](docs/prefix-caching.md) ·
-[KV cache quantization](docs/kv-cache-quantization.md) · [Usage](docs/usage.md) ·
-[CLI reference](docs/cli_reference.md).
+[Getting started](docs/getting-started.md) · [Models](docs/models.md) ·
+[Server](docs/server.md) · [CLI reference](docs/cli.md) ·
+[Prefix caching](docs/performance/prefix-caching.md) ·
+[KV cache quantization](docs/performance/kv-cache-quantization.md).
 
 ## Model-Specific Documentation
 
@@ -174,7 +175,7 @@ Requests can override the server defaults with `enable_thinking`, `thinking_budg
 
 Speed up generation by drafting several candidate tokens with a small "drafter" model and verifying them in a single target forward pass. Three drafter families are supported.
 
-See [Speculative Decoding](docs/speculative-decoding.md) for CLI/server flags, per-family setup (DFlash, Gemma 4 MTP, Gemma 4 EAGLE-3, MiniMax M3 EAGLE-3), supported pairings, and measured speedups.
+See [Speculative Decoding](docs/performance/speculative-decoding.md) for CLI/server flags, per-family setup (DFlash, Gemma 4 MTP, Gemma 4 EAGLE-3, MiniMax M3 EAGLE-3), supported pairings, and measured speedups.
 ### Chat UI with Gradio
 
 The Gradio chat UI requires the optional `ui` extra, which the base `mlx-vlm`
@@ -296,37 +297,37 @@ See the full reference for CLI flags, every endpoint, streaming, log-probs, and
 structured outputs:
 
 - **[Server reference](docs/server.md)** — all flags/endpoints, curl examples, live `/v1/settings`.
-- **[Automatic Prefix Caching](docs/prefix-caching.md)** — reuse K/V across requests that share a prefix.
-- **[KV cache quantization](docs/kv-cache-quantization.md)** — `--kv-bits`, TurboQuant, per-tensor schemes.
+- **[Automatic Prefix Caching](docs/performance/prefix-caching.md)** — reuse K/V across requests that share a prefix.
+- **[KV cache quantization](docs/performance/kv-cache-quantization.md)** — `--kv-bits`, TurboQuant, per-tensor schemes.
 
 ## 1-bit Affine Inference
 
 MLX-VLM can load existing affine 1-bit MLX checkpoints without a custom MLX build.
 
-See [Quantization](docs/quantization.md#1-bit-affine-inference) for the checkpoint layout and load/generate examples.
+See [Quantization](docs/performance/quantization.md#1-bit-affine-inference) for the checkpoint layout and load/generate examples.
 
 ## Activation Quantization (CUDA)
 
 When running on NVIDIA GPUs with MLX CUDA, models quantized with `mxfp8` or `nvfp4` modes require activation quantization to work properly.
 
-See [Quantization](docs/quantization.md#activation-quantization-cuda) for the CLI flag, Python API, and supported modes.
+See [Quantization](docs/performance/quantization.md#activation-quantization-cuda) for the CLI flag, Python API, and supported modes.
 ## Multi-Image Chat Support
 
 MLX-VLM supports analyzing multiple images simultaneously with select models. This feature enables more complex visual reasoning tasks and comprehensive analysis across multiple images in a single conversation.
 
-See [Multimodal & Vision Features](docs/multimodal.md#multi-image-chat-support) for examples.
+See [Getting Started](docs/getting-started.md#multiple-images) for examples.
 
 ## Video Understanding
 
 MLX-VLM also supports video analysis such as captioning, summarization, and more, with select models.
 
-See [Multimodal & Vision Features](docs/multimodal.md#video-understanding) for supported models and examples.
+See [Getting Started](docs/getting-started.md#video-understanding) for supported models and examples.
 
 ## Vision Feature Caching
 
 In multi-turn conversations about an image, the vision encoder runs on every turn even though the image hasn't changed. `VisionFeatureCache` stores projected vision features in an LRU cache keyed by image path, so the expensive vision encoder is only called once per unique image.
 
-See [Multimodal & Vision Features](docs/multimodal.md#vision-feature-caching) for how it works, the CLI/Python/server paths, and benchmarks.
+See [Getting Started](docs/getting-started.md#vision-feature-caching) for how it works, the CLI/Python/server paths, and benchmarks.
 
 ## Distributed Inference
 
@@ -334,7 +335,7 @@ mlx-vlm supports distributed inference across multiple computers. It works by sh
 
 The parallel implementation is compatible with [mlx-lm](https://github.com/ml-explore/mlx-lm) sharding primitives.
 
-See [docs/usage.md](https://github.com/Blaizzy/mlx-vlm/blob/main/docs/usage.md#distributed-inference) for command-line examples.
+See [Getting Started](docs/getting-started.md#distributed-inference) for command-line examples.
 
 
 ## Fine-tuning

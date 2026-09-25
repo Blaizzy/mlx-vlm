@@ -8,7 +8,7 @@ Speed up generation by drafting several candidate tokens with a small "drafter" 
 | `--draft-kind` | Drafter family — `dflash` (default), `eagle3`, or `mtp` (native/assistant MTP) |
 | `--draft-block-size` | Override the drafter's configured block size |
 
-See [docs/usage.md](usage.md) for Python API examples including batch generation.
+See [Python API](#python-api) below for streaming, acceptance stats, and batch generation.
 
 ## DFlash, DFlash2, and DSpark
 
@@ -194,4 +194,117 @@ MiniMax M3 also supports image/video prompts, MiniMax thinking tags, MiniMax
 tool-call parsing, MSA index caches, and MXFP8 config loading. See
 [`mlx_vlm/models/minimax_m3_vl/README.md`](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minimax_m3_vl/README.md)
 for model-specific conversion and runtime notes.
+
+## Python API
+
+### Single sequence
+
+```python
+from mlx_vlm import load
+from mlx_vlm.generate import stream_generate
+from mlx_vlm.speculative.drafters import load_drafter
+
+model, processor = load("Qwen/Qwen3.5-4B")
+drafter = load_drafter("z-lab/Qwen3.5-4B-DFlash")
+
+for result in stream_generate(
+    model, processor,
+    prompt="Write a quicksort in Python.",
+    max_tokens=512,
+    temperature=0,
+    draft_model=drafter,
+    enable_thinking=True,
+):
+    print(result.text, end="", flush=True)
+
+# Acceptance stats
+print(f"\nAccepted {sum(drafter.accept_lens)/len(drafter.accept_lens):.1f} tokens/round")
+```
+
+### Batch generation
+
+Process multiple prompts in parallel:
+
+```python
+import mlx.core as mx
+from mlx_vlm import load
+from mlx_vlm.generate import (
+    _dflash_rounds_batch,
+    _make_cache,
+    generation_stream,
+)
+from mlx_vlm.speculative.drafters import load_drafter
+from mlx_vlm.prompt_utils import apply_chat_template
+from mlx_vlm.sample_utils import make_sampler
+
+model, processor = load("Qwen/Qwen3.5-4B")
+drafter = load_drafter("z-lab/Qwen3.5-4B-DFlash")
+tok = processor.tokenizer
+lm = model.language_model
+sampler = make_sampler(temp=0)
+eos_id = tok.eos_token_id
+
+prompts = [
+    "Write a quicksort in Python.",
+    "What is the capital of France?",
+    "Explain hash tables in 3 sentences.",
+]
+
+# Tokenize and left-pad to uniform length
+texts = [
+    apply_chat_template(
+        processor, model.config, p,
+        num_images=0, num_audios=0, enable_thinking=True,
+    )
+    for p in prompts
+]
+encoded = [tok.encode(t) for t in texts]
+max_len = max(len(e) for e in encoded)
+padded = [[0] * (max_len - len(e)) + e for e in encoded]
+input_ids = mx.array(padded, dtype=mx.int32)
+B = len(prompts)
+
+# Create batch-aware caches and prefill
+prompt_cache = _make_cache(lm, [0] * B)
+lm._position_ids = None
+lm._rope_deltas = None
+
+target_layer_ids = list(drafter.config.target_layer_ids)
+out = lm(input_ids, cache=prompt_cache, capture_layer_ids=target_layer_ids)
+hidden = mx.concatenate(out.hidden_states, axis=-1)
+first_bonus = sampler(out.logits[:, -1:]).squeeze(-1)
+mx.eval(first_bonus, hidden, out.logits)
+
+# Generate — finished sequences are automatically removed from
+# the batch and the drafter restarts for the new batch size.
+tokens_per_seq = [[] for _ in range(B)]
+for tok_list, _ in _dflash_rounds_batch(
+    model, drafter, prompt_cache, hidden,
+    first_bonus=first_bonus,
+    max_tokens=256,
+    sampler=sampler,
+    token_dtype=mx.int32,
+    stop_check=lambda seq_idx, token_id: token_id == eos_id,
+):
+    for i, t in enumerate(tok_list):
+        if t is not None:
+            tokens_per_seq[i].append(t)
+
+# Decode results
+for i in range(B):
+    all_toks = [int(first_bonus[i].item())] + tokens_per_seq[i]
+    print(f"--- {prompts[i]}")
+    print(tok.decode(all_toks))
+```
+
+## Supported pairings
+
+| Target | Drafter | Notes |
+|--------|---------|-------|
+| `Qwen/Qwen3.5-4B` | `z-lab/Qwen3.5-4B-DFlash` | Text + image. ~2.5× speedup on code/reasoning. |
+| `LiquidAI/LFM2.5-2.6B` | `LiquidAI/LFM2.5-2.6B-DSpark` | Text. Nine Markov-corrected proposals with exact LFM2 target verification. |
+| `meta-models/Muse-Glimmer-30B` | `meta-models/Muse-Glimmer-30B-assistant` | Text + image. Native 5-layer, 16-token DFlash assistant. |
+| `MiniMaxAI/MiniMax-M3` | `Inferact/MiniMax-M3-EAGLE3` | Text, image, and video target. Uses `--draft-kind eagle3`. |
+
+The drafter is loaded via the shared `load_model` path. DFlash checkpoints are detected from `dflash_config` or the `muse_glimmer_assistant` model type; EAGLE-3 checkpoints are detected from `speculators_model_type` or EAGLE-3 architecture metadata. Native MTP sidecars for supported model families are detected from their `model_type`.
 
