@@ -7,6 +7,7 @@ from ..base import BaseModelConfig
 @dataclass
 class ModelConfig(BaseModelConfig):
     model_type: str = "deepseek_v41"
+    model_path: Optional[str] = None
     vocab_size: int = 129280
     hidden_size: int = 5120
     moe_intermediate_size: int = 2304

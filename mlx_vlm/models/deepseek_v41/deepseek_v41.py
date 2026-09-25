@@ -45,6 +45,7 @@ class Model(nn.Module):
         self.image_start = mx.zeros((config.hidden_size,))
         self.image_end = mx.zeros((config.hidden_size,))
         self.image_newline = mx.zeros((config.hidden_size,))
+        self.model_path = config.model_path
 
     def encode_image(self, patches: mx.array, n_vit_h: int, n_vit_w: int) -> mx.array:
         return self.aligner(self.vision(patches, n_vit_h, n_vit_w), n_vit_h, n_vit_w)
@@ -116,14 +117,24 @@ class Model(nn.Module):
     @model_path.setter
     def model_path(self, value):
         """The engram hash tables are built from files in the checkpoint dir."""
+        from .engram import OffloadedEngramEmbedding
+
         self._model_path = value
         language_model = getattr(self, "language_model", None)
         if language_model is not None:
             language_model._engram_source = value
+            # The loader assigns this after eager evaluation. Expose the original
+            # lazy tensors for conversion; inference still reads only mapped rows.
+            for layer in language_model.layers:
+                engram = layer.engram
+                if engram is not None and isinstance(
+                    engram.embed, OffloadedEngramEmbedding
+                ):
+                    engram.embed.restore_parameters()
 
     def _install_engram_embeddings(self, weights):
-        """Install quantized tables for row-wise lookup and bounded conversion."""
-        from .engram import QuantizedEngramEmbedding
+        """Map checkpoint tables for row-wise lookup."""
+        from .engram import OffloadedEngramEmbedding, QuantizedEngramEmbedding
 
         for idx, layer in enumerate(self.language_model.layers):
             engram = getattr(layer, "engram", None)
@@ -132,19 +143,30 @@ class Model(nn.Module):
             prefix = f"language_model.layers.{idx}.engram.embed"
             packed = weights.get(f"{prefix}.weight")
             scales = weights.get(f"{prefix}.scales")
-            if packed is None or scales is None:
+            if packed is None:
                 continue
-            dims = engram.embed.weight.shape[1]
-            bits = 32 * packed.shape[1] // dims
-            group_size = dims // scales.shape[1]
-            engram.embed = QuantizedEngramEmbedding(
-                packed.shape[0],
-                dims,
-                group_size,
-                bits,
-                scale_dtype=scales.dtype,
-                mode=f"mxfp{bits}" if scales.dtype == mx.uint8 else "affine",
-            )
+            if scales is not None:
+                dims = engram.embed.weight.shape[1]
+                bits = 32 * packed.shape[1] // dims
+                group_size = dims // scales.shape[1]
+                engram.embed = QuantizedEngramEmbedding(
+                    packed.shape[0],
+                    dims,
+                    group_size,
+                    bits,
+                    scale_dtype=scales.dtype,
+                    mode=f"mxfp{bits}" if scales.dtype == mx.uint8 else "affine",
+                )
+            if self.config.model_path is not None:
+                names = tuple(engram.embed.parameters())
+                engram.embed.load_weights(
+                    [(name, weights[f"{prefix}.{name}"]) for name in names]
+                )
+                engram.embed = OffloadedEngramEmbedding(
+                    self.config.model_path, prefix, engram.embed
+                )
+                for name in names:
+                    del weights[f"{prefix}.{name}"]
 
     def quantization_path_aliases(self, path: str):
         """Routed experts load as ``switch_mlp`` but converters key them ``experts``."""

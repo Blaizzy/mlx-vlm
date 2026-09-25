@@ -983,6 +983,8 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     modules = ["text", "vision", "perceiver", "projector", "audio"]
     model_config = update_module_configs(model_config, model_class, config, modules)
     model_config = apply_generation_config_defaults(model_config, config)
+    if hasattr(model_config, "model_path"):
+        model_config.model_path = str(model_path)
 
     model = model_class.Model(model_config)
 

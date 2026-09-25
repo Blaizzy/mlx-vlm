@@ -1,4 +1,7 @@
+import json
+import struct
 from dataclasses import dataclass
+from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -247,7 +250,7 @@ class NgramHashState(nn.Module):
         positions = mx.broadcast_to(
             mx.arange(start_pos, start_pos + seqlen), (batch, seqlen)
         )
-        tokens, blocked = [], mx.zeros_like(positions, dtype=mx.bool_)
+        tokens, blocked = [], mx.zeros(positions.shape, dtype=mx.bool_)
         rows = mx.arange(batch)[:, None]
         for shift in range(self.layout.max_ngram_size):
             idx = mx.clip(positions - shift, 0, cur.shape[1] - 1)
@@ -343,6 +346,106 @@ class QuantizedEngramEmbedding(nn.Module):
             group_size=self.group_size,
             bits=self.bits,
             mode=self.mode,
+        ).astype(mx.float32)
+
+
+class OffloadedEngramEmbedding(nn.Module):
+    """Read checkpoint rows on the CPU without making the full table resident."""
+
+    def __init__(self, path, prefix, source):
+        super().__init__()
+        # Keep the checkpoint arrays lazy and outside MLX's parameter tree until
+        # the model_path setter runs after the loader's eager evaluation.
+        object.__setattr__(self, "_source_embedding", source)
+        path = Path(path)
+        index_path = path / "model.safetensors.index.json"
+        index = (
+            json.loads(index_path.read_text())["weight_map"]
+            if index_path.exists()
+            else None
+        )
+        self._quantization = (
+            dict(group_size=source.group_size, bits=source.bits, mode=source.mode)
+            if isinstance(source, QuantizedEngramEmbedding)
+            else None
+        )
+        if self._quantization is not None:
+            for name, value in self._quantization.items():
+                setattr(self, name, value)
+        self._arrays = {}
+        self._dtypes = {}
+        headers = {}
+        dtypes = {
+            mx.uint32: np.uint32,
+            mx.uint8: np.uint8,
+            mx.bfloat16: np.uint16,
+            mx.float16: np.float16,
+            mx.float32: np.float32,
+        }
+        for name in ("weight", "scales", "biases"):
+            value = getattr(source, name, None)
+            if value is None:
+                continue
+            key = f"{prefix}.{name}"
+            native_key = f"{prefix.removeprefix('language_model.')}.{name}"
+            if name == "scales":
+                native_key = native_key.removesuffix("s")
+            if index is not None and key not in index:
+                key = native_key
+            shard = path / (index[key] if index is not None else "model.safetensors")
+            if shard not in headers:
+                with shard.open("rb") as handle:
+                    length = struct.unpack("<Q", handle.read(8))[0]
+                    headers[shard] = (8 + length, json.loads(handle.read(length)))
+            offset, header = headers[shard]
+            if key not in header:
+                key = native_key
+            tensor = header[key]
+            dtype = np.dtype(dtypes[value.dtype])
+            start, end = tensor["data_offsets"]
+            # Native FP8/FP4 weight bytes are the same packed bits, with a
+            # four-times-wider byte shape instead of the converted uint32 shape.
+            shape = tuple(tensor["shape"])
+            if name == "weight" and tensor["dtype"] in ("F8_E4M3", "I8", "U8"):
+                shape = (shape[0], shape[1] // 4)
+            if shape != value.shape or end - start != value.nbytes:
+                raise ValueError(f"Engram checkpoint tensor does not match {key}")
+            self._arrays[name] = np.memmap(
+                shard, mode="r", dtype=dtype, offset=offset + start, shape=value.shape
+            )
+            self._dtypes[name] = value.dtype
+
+    def restore_parameters(self):
+        for name, value in self._source_embedding.parameters().items():
+            if name not in self:
+                setattr(self, name, value)
+
+    def to_quantized(self, group_size=None, bits=None, mode="affine"):
+        from ...quant_utils import get_quantization_params
+
+        params = get_quantization_params(group_size, bits, mode)
+        if "weight" in self:
+            source = self._source_embedding
+            source.update(self.parameters())
+            return source.to_quantized(**params)
+        if params != self._quantization:
+            raise ValueError("Cannot requantize offloaded Engram tables")
+        return self
+
+    def __call__(self, indices):
+        # Synchronize the small index tensor, then copy only the requested rows.
+        ids = np.asarray(indices)
+        selected = {
+            name: mx.array(rows[ids]).view(self._dtypes[name], stream=mx.cpu)
+            for name, rows in self._arrays.items()
+        }
+        if self._quantization is None:
+            return selected["weight"]
+        return mx.dequantize(
+            selected["weight"],
+            selected["scales"],
+            selected.get("biases"),
+            **self._quantization,
         ).astype(mx.float32)
 
 

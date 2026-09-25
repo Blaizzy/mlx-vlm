@@ -2061,6 +2061,110 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
     def setUp(self):
         mx.random.seed(0)
 
+    def test_engram_offloading_matches_resident_rows(self):
+        import tempfile
+
+        from mlx_vlm.models import deepseek_v41
+        from mlx_vlm.models.deepseek_v41.engram import (
+            OffloadedEngramEmbedding,
+            QuantizedEngramEmbedding,
+        )
+
+        case = next(case for case in DATA["cases"] if case["module"] == "deepseek_v41")
+        prefix = "language_model.layers.1.engram.embed."
+        ids = mx.array([[0, 127, 3], [3, 1, 0]])
+        for bits, mode, sharded in (
+            (None, "affine", False),
+            (4, "affine", False),
+            (8, "affine", True),
+            (4, "mxfp4", False),
+            (8, "mxfp8", True),
+        ):
+            with (
+                self.subTest(bits=bits, mode=mode, sharded=sharded),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                path = Path(directory)
+                config = copy.deepcopy(case["config"])
+                model = deepseek_v41.Model(build_config(deepseek_v41, config))
+                table = model.layers[1].engram.embed
+                table.weight = table.weight.astype(mx.bfloat16)
+                if bits is not None:
+                    config["quantization"] = dict(group_size=32, bits=bits, mode=mode)
+                    packed = QuantizedEngramEmbedding(128, 64, **config["quantization"])
+                    packed.weight, packed.scales, *biases = mx.quantize(
+                        table.weight, **config["quantization"]
+                    )
+                    packed.biases = biases[0] if biases else None
+                    model.layers[1].engram.embed = packed
+                    config["quantization"][prefix.rstrip(".")] = dict(
+                        group_size=32, bits=bits, mode=mode
+                    )
+                expected = model.layers[1].engram.embed(ids)
+                mx.eval(expected)
+                weights = dict(tree_flatten(model.parameters()))
+                if mode.startswith("mxfp"):
+                    native_prefix = prefix.removeprefix("language_model.")
+                    weights[native_prefix + "weight"] = weights.pop(
+                        prefix + "weight"
+                    ).view(mx.uint8)
+                    weights[native_prefix + "scale"] = weights.pop(prefix + "scales")
+                (path / "config.json").write_text(json.dumps(config))
+                if sharded:
+                    tables = {
+                        key: weights.pop(key)
+                        for key in list(weights)
+                        if ".engram.embed." in key
+                    }
+                    mx.save_safetensors(str(path / "engram.safetensors"), tables)
+                    (path / "model.safetensors.index.json").write_text(
+                        json.dumps(
+                            {
+                                "weight_map": {
+                                    **dict.fromkeys(weights, "model.safetensors"),
+                                    **dict.fromkeys(tables, "engram.safetensors"),
+                                }
+                            }
+                        )
+                    )
+                mx.save_safetensors(str(path / "model.safetensors"), weights)
+
+                with patch("mlx_vlm.utils.mx.eval", wraps=mx.eval) as evaluate:
+                    loaded = load_model(path)
+                # Exportable tensors must be exposed after eager loading.
+                self.assertNotIn(
+                    prefix + "weight", dict(tree_flatten(evaluate.call_args.args[0]))
+                )
+                self.assertEqual(loaded.config.model_path, str(path))
+                self.assertIsInstance(
+                    loaded.layers[1].engram.embed, OffloadedEngramEmbedding
+                )
+                self.assertTrue(
+                    mx.array_equal(loaded.layers[1].engram.embed(ids), expected).item()
+                )
+                self.assertIn(
+                    prefix + "weight", dict(tree_flatten(loaded.parameters()))
+                )
+
+                # Conversion uses lazy loading and must keep exportable table weights.
+                lazy = load_model(path, lazy=True)
+                self.assertEqual(lazy.config.model_path, str(path))
+                self.assertIn(prefix + "weight", dict(tree_flatten(lazy.parameters())))
+                self.assertTrue(
+                    mx.array_equal(lazy.layers[1].engram.embed(ids), expected).item()
+                )
+                exported = str(path / "export.safetensors")
+                lazy.save_weights(exported)
+                self.assertIn(prefix + "weight", mx.load(exported))
+
+                quantized = lazy.layers[1].engram.embed.to_quantized(
+                    group_size=32, bits=4
+                )
+                resident = model.layers[1].engram.embed.to_quantized(
+                    group_size=32, bits=4
+                )
+                self.assertTrue(mx.array_equal(quantized(ids), resident(ids)).item())
+
     def test_fp8_scale_layouts_decode_exactly(self):
         from mlx_vlm.models.deepseek_v41.deepseek_v41 import _pack_source_weight
 

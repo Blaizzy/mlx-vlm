@@ -116,6 +116,7 @@
       "id": "deepseek_v41",
       "module": "deepseek_v41",
       "config": {
+        "model_type": "deepseek_v41",
         "vocab_size": 64,
         "hidden_size": 32,
         "moe_intermediate_size": 16,
@@ -156,7 +157,7 @@
         "engram_max_ngram_size": 3,
         "engram_vocab_size": 16,
         "engram_n_heads": 2,
-        "engram_head_dim": 8,
+        "engram_head_dim": 64,
         "engram_compressed_vocab_size": 7,
         "image_token_id": 5
       },
