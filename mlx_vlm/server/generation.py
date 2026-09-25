@@ -36,6 +36,7 @@ from ..generate.diffusion import (
 )
 from ..sample_utils import (
     apply_top_k,
+    clamp_temperature,
     make_logits_processors,
     make_sampler,
     top_p_sampling,
@@ -153,7 +154,7 @@ class _PositionedTargetSampler:
         top_k: int = 0,
         seed: Optional[int],
     ):
-        self.temperature = float(temperature)
+        self.temperature = clamp_temperature(float(temperature))
         self.top_p = float(top_p)
         self.top_k = int(top_k)
         self.seed = DEFAULT_SEED if seed is None else int(seed)
@@ -196,19 +197,7 @@ class _PositionedTargetSampler:
         return mx.random.categorical(logprobs * (1 / self.temperature), key=key)
 
     def _sample_top_p_one(self, logprobs: mx.array, key: mx.array) -> mx.array:
-        if logprobs.dtype == mx.bfloat16:
-            logprobs = logprobs.astype(mx.float32)
-        probs = mx.softmax(logprobs / self.temperature, axis=-1)
-        sorted_indices = mx.argsort(probs, axis=-1)
-        sorted_probs = mx.take_along_axis(probs, sorted_indices, axis=-1)
-        cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
-        top_probs = mx.where(
-            cumulative_probs > 1 - self.top_p,
-            sorted_probs,
-            mx.zeros_like(sorted_probs),
-        )
-        sampled_pos = mx.random.categorical(mx.log(top_probs), key=key)
-        return mx.take_along_axis(sorted_indices, sampled_pos[..., None], axis=-1)[0]
+        return top_p_sampling(logprobs, self.top_p, self.temperature, key=key)
 
 
 def get_server_enable_thinking():
@@ -650,6 +639,9 @@ class GenerationArguments:
     # cached blocks from one tenant can't be reused (or detected via timing)
     # by another. None = no salt = single-tenant behaviour.
     tenant_id: Optional[str] = None
+
+    def __post_init__(self):
+        self.temperature = clamp_temperature(self.temperature)
 
     def diffusion_kwargs(self) -> dict:
         """Diffusion-only generation kwargs explicitly supplied by a request."""

@@ -2026,3 +2026,293 @@ def test_qwen_image_edit_dispatch_and_rgba_save(tmp_path, extra):
     with Image.open(saved) as image:
         assert image.mode == "RGBA"
         assert image.getpixel((0, 0)) == (255, 0, 0, 128)
+
+
+def _write_ming_image_layout(root: Path) -> None:
+    (root / "transformer").mkdir(parents=True)
+    (root / "transformer" / "config.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "DiffusionTransformer",
+                "dim": 3840,
+                "n_heads": 30,
+                "n_kv_heads": 30,
+                "n_layers": 30,
+                "n_refiner_layers": 2,
+                "axes_dims": [32, 48, 48],
+                "cap_feat_dim": 2560,
+                "in_channels": 16,
+                "all_patch_size": [2],
+                "all_f_patch_size": [1],
+                "rope_theta": 256.0,
+                "norm_eps": 1e-5,
+                "t_scale": 1000.0,
+            }
+        )
+    )
+    (root / "mllm").mkdir()
+    (root / "mllm" / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["BailingMM2NativeForConditionalGeneration"],
+                "llm_config": {
+                    "hidden_size": 2048,
+                    "num_hidden_layers": 20,
+                    "num_experts": 256,
+                    "num_experts_per_tok": 8,
+                    "num_shared_experts": 1,
+                    "first_k_dense_replace": 1,
+                    "n_group": 8,
+                    "topk_group": 4,
+                    "moe_router_topk_scaling_factor": 2.5,
+                    "partial_rotary_factor": 0.5,
+                    "rope_theta": 600000,
+                    "num_attention_heads": 16,
+                    "num_key_value_heads": 4,
+                    "head_dim": 128,
+                    "moe_intermediate_size": 512,
+                    "intermediate_size": 5120,
+                    "vocab_size": 157184,
+                    "norm_topk_prob": True,
+                    "rms_norm_eps": 1e-6,
+                    "image_patch_token": 157157,
+                    "image_start_token": 157158,
+                    "image_end_token": 157159,
+                },
+            }
+        )
+    )
+    (root / "connector").mkdir()
+    (root / "connector" / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen2ForCausalLM"],
+                "hidden_size": 1536,
+                "num_hidden_layers": 28,
+                "num_attention_heads": 12,
+                "num_key_value_heads": 2,
+                "intermediate_size": 8960,
+                "rope_theta": 1000000.0,
+                "rms_norm_eps": 1e-6,
+                "vocab_size": 151936,
+            }
+        )
+    )
+    (root / "mlp").mkdir()
+    (root / "mlp" / "config.json").write_text(
+        json.dumps(
+            {
+                "use_identity_mlp": True,
+                "use_vlm_directvlm_condition": True,
+                "use_learnable_token_condition": True,
+                "diffusion_c_input_dim": 2560,
+                "diffusion_inner_dim": 3840,
+                "img_gen_scales": [16],
+                "selected_hidden_states_layers": [5, 12, 20],
+            }
+        )
+    )
+    (root / "vae").mkdir()
+    (root / "vae" / "config.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "AutoencoderKLQwenImage",
+                "z_dim": 16,
+                "base_dim": 96,
+                "dim_mult": [1, 2, 4, 4],
+                "num_res_blocks": 2,
+                "temperal_downsample": [False, True, True],
+                "input_channels": 4,
+                "scaling_factor": 8.0064,
+                "shift_factor": 0.0,
+            }
+        )
+    )
+    (root / "scheduler").mkdir()
+    (root / "scheduler" / "scheduler_config.json").write_text(
+        json.dumps({"num_train_timesteps": 1000, "shift": 6.0})
+    )
+
+
+def test_ming_image_config_parses_official_fields(tmp_path):
+    from mlx_vlm.models.ming_image import MingImageConfig
+
+    _write_ming_image_layout(tmp_path)
+    cfg = MingImageConfig.from_model_path(tmp_path)
+    assert cfg.dit.dim == 3840 and cfg.dit.cap_feat_dim == 2560
+    assert cfg.dit.axes_dims == (32, 48, 48) and cfg.dit.intermediate_size == 10240
+    assert cfg.mllm.num_experts == 256 and cfg.mllm.score_function == "sigmoid"
+    assert cfg.mllm.moe_router_enable_expert_bias
+    assert cfg.mllm.routed_scaling_factor == 2.5
+    assert cfg.mllm.partial_rotary_factor == 0.5 and cfg.mllm.n_group == 8
+    assert cfg.bridge.query_token_count == 256 and cfg.bridge.directvlm_in == 6144
+    assert cfg.bridge.selected_hidden_states_layers == (5, 12, 20)
+    assert cfg.vae.z_dim == 16 and cfg.vae.is_residual is False
+    assert cfg.vae.in_channels == 4 and cfg.vae.scaling_factor == 8.0064
+
+
+def test_ming_image_layout_is_distinguished_from_z_image(tmp_path):
+    from mlx_vlm.models.ming_image import (
+        MingImageGenerationModel,
+        detect_ming_image_layout,
+    )
+
+    _write_ming_image_layout(tmp_path)
+    assert detect_ming_image_layout(tmp_path)
+    assert MingImageGenerationModel.supports_model(str(tmp_path))
+    shared_markers = [
+        "layers.0.feed_forward.w1.weight",
+        "context_refiner.0.attention.to_q.weight",
+        "noise_refiner.0.adaLN_modulation.0.weight",
+    ]
+    index = {"weight_map": {k: "m.safetensors" for k in shared_markers}}
+    (
+        tmp_path / "transformer" / "diffusion_pytorch_model.safetensors.index.json"
+    ).write_text(json.dumps(index))
+    assert (
+        image_module._image_model_type_from_component_indexes(tmp_path) == "ming_image"
+    )
+    assert (
+        image_module._model_type_from_id("inclusionAI/Ming-Image-0.1-Design")
+        == "ming_image"
+    )
+
+
+def test_ming_image_scheduler_dynamic_shift():
+    from mlx_vlm.models.ming_image.pipeline import scheduler_shift
+    from mlx_vlm.models.qwen_image.scheduler import FlowMatchEulerDiscreteScheduler
+
+    assert scheduler_shift(4096) == (4096, 1.35)
+    assert scheduler_shift(16384) == (16384, 1.35)
+    assert scheduler_shift(1024) == (4096, 1.15)
+    max_seq, max_shift = scheduler_shift(4096)
+    scheduler = FlowMatchEulerDiscreteScheduler(
+        image_seq_len=4096,
+        num_inference_steps=12,
+        base_shift=0.5,
+        max_shift=max_shift,
+        base_image_seq_len=256,
+        max_image_seq_len=max_seq,
+        shift_terminal=None,
+    )
+    sigmas = [float(x) for x in scheduler.sigmas]
+    assert sigmas[0] == 1.0 and sigmas[-1] == 0.0
+    assert all(sigmas[i] > sigmas[i + 1] for i in range(len(sigmas) - 1))
+
+
+def test_ming_image_transformer_supports_batching():
+    from mlx_vlm.models.ming_image.config import MingImageDiTConfig
+    from mlx_vlm.models.ming_image.transformer import MingImageTransformer
+
+    cfg = MingImageDiTConfig(
+        dim=128,
+        n_heads=1,
+        n_kv_heads=1,
+        n_layers=2,
+        n_refiner_layers=1,
+        intermediate_size=64,
+        cap_feat_dim=16,
+        adaln_embed_dim=32,
+    )
+    model = MingImageTransformer(cfg)
+    model.eval()
+    mx.eval(model.parameters())
+    cap = mx.random.normal((1, 4, 16))
+    cap2 = mx.random.normal((1, 3, 128))
+    x = mx.random.normal((1, 16, 1, 8, 8))
+    t = mx.array([0.5])
+    single = model(x, t, cap, cap2)
+    batched = model(mx.concatenate([x, x], axis=0), t, cap, cap2)
+    assert batched.shape == (2, 16, 1, 8, 8)
+    assert_allclose(np.array(batched[0]), np.array(single[0]), rtol=1e-4, atol=1e-4)
+    assert_allclose(np.array(batched[1]), np.array(single[0]), rtol=1e-4, atol=1e-4)
+
+
+def test_image_result_saves_one_file_per_batched_image(tmp_path):
+    result = image_module.ImageGenerationResult(
+        array=mx.zeros((3, 8, 8, 3), dtype=mx.uint8),
+        seed=0,
+        width=8,
+        height=8,
+        steps=1,
+        model="m",
+        family="f",
+        guidance=1.0,
+    )
+    assert len(result.images) == 3
+    saved = result.save(tmp_path / "img.png")
+    assert saved == tmp_path / "img_0.png"
+    assert sorted(p.name for p in tmp_path.glob("img_*.png")) == [
+        "img_0.png",
+        "img_1.png",
+        "img_2.png",
+    ]
+
+
+def test_ming_image_generate_forwards_num_images():
+    from mlx_vlm.models.ming_image.model import MingImageGenerationModel
+
+    pipeline = MagicMock()
+    pipeline.config.default_steps = 12
+    pipeline.config.default_guidance = 1.0
+    pipeline.count_prompt_tokens.return_value = 5
+    pipeline.model_path = "/tmp/ming"
+    pipeline.generate_array.return_value = mx.zeros((2, 8, 8, 4), dtype=mx.uint8)
+
+    model = MingImageGenerationModel(pipeline=pipeline, model_id="ming")
+    result = model.generate(
+        ImageGenerationRequest(prompt="p", width=8, height=8, extra={"num_images": 2})
+    )
+    assert pipeline.generate_array.call_args.kwargs["num_images"] == 2
+    assert result.array.shape == (2, 8, 8, 4)
+
+
+def test_z_image_generate_forwards_num_images():
+    from mlx_vlm.models.z_image.model import ZImageGenerationModel
+
+    pipeline = MagicMock()
+    pipeline.config.default_steps = 9
+    pipeline.config.default_guidance = 0.0
+    pipeline.config.variant = "base"
+    pipeline.count_prompt_tokens.return_value = 5
+    pipeline.model_path = "/tmp/z"
+    pipeline.generate_array.return_value = mx.zeros((2, 8, 8, 3), dtype=mx.uint8)
+
+    model = ZImageGenerationModel(pipeline=pipeline, model_id="z")
+    result = model.generate(
+        ImageGenerationRequest(prompt="p", width=8, height=8, extra={"num_images": 2})
+    )
+    assert pipeline.generate_array.call_args.kwargs["num_images"] == 2
+    assert result.array.shape == (2, 8, 8, 3)
+
+
+def test_z_image_transformer_supports_batching():
+    from mlx_vlm.models.z_image.config import ZImageTransformerConfig
+    from mlx_vlm.models.z_image.transformer import ZImageTransformer
+
+    cfg = ZImageTransformerConfig(
+        hidden_size=128,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        intermediate_size=64,
+        in_channels=16,
+        text_embed_dim=16,
+        num_hidden_layers=2,
+        n_refiner_layers=1,
+        n_context_refiner_layers=1,
+        patch_size=2,
+        f_patch_size=1,
+        adaln_embed_dim=32,
+        rope_sections=(16, 24, 24),
+    )
+    model = ZImageTransformer(cfg)
+    model.eval()
+    mx.eval(model.parameters())
+    cap = mx.random.normal((1, 4, 16))
+    x = mx.random.normal((1, 16, 1, 8, 8))
+    t = mx.array([0.5])
+    single = model(x, t, cap)
+    batched = model(mx.concatenate([x, x], axis=0), t, cap)
+    assert batched.shape == (2, 16, 1, 8, 8)
+    assert_allclose(np.array(batched[0]), np.array(single[0]), rtol=1e-4, atol=1e-4)
+    assert_allclose(np.array(batched[1]), np.array(single[0]), rtol=1e-4, atol=1e-4)

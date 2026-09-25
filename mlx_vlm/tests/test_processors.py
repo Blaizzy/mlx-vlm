@@ -738,6 +738,22 @@ def test_processor_mlx_outputs(name, with_image):
         assert "cross_attention_mask" in result
 
 
+def test_gemma3n_batches_images_and_audio():
+    processor = _make_processor("gemma3n")
+    processor.feature_extractor = Mock(return_value={"input_features": [[0.0]] * 2})
+    images = [_make_image(), _make_image()]
+
+    result = processor(
+        text=["<image><audio>one", "<image><audio>two"],
+        images=images,
+        audio=[[0.0], [0.0]],
+        padding=True,
+    )
+
+    assert result["input_ids"].shape[0] == 2
+    assert processor.tokenizer.last_kwargs["padding"] is True
+
+
 def test_unlimited_ocr_default_chat_template_omits_trailing_space():
     Template = pytest.importorskip("jinja2").Template
     p = object.__new__(c.ocr)
@@ -1839,6 +1855,8 @@ WIRE_CALLS = {
     "]<]minimax[>[<city>Paris]<]minimax[>[</city>]<]minimax[>[<days>3"
     "]<]minimax[>[</days>]<]minimax[>[</invoke>]<]minimax[>[</tool_call>",
     "mistral": '[TOOL_CALLS]get_weather[ARGS]{"city": "Paris", "days": 3}',
+    "harmony": "<|channel|>commentary to=functions.get_weather <|constrain|>json"
+    '<|message|>{"city": "Paris", "days": 3}<|call|>',
     "pythonic": '<|tool_call_start|>[get_weather(city="Paris", days=3)]<|tool_call_end|>',
     "qwen3_coder": "<tool_call>\n<function=get_weather><parameter=city>Paris</parameter>"
     "<parameter=days>3</parameter></function></tool_call>",
@@ -2075,6 +2093,30 @@ def test_minicpm5_cdata_and_argument_types():
     assert json.loads(result.calls[1]["function"]["arguments"]) == {}
 
 
+HARMONY_ANALYSIS_THEN_CALL = (
+    "<|channel|>analysis<|message|>The user wants the weather. Call get_weather."
+    "<|end|><|start|>assistant<|channel|>commentary to=functions.get_weather "
+    '<|constrain|>json<|message|>{"city": "Paris", "days": 3}<|call|>'
+)
+
+
+def test_harmony_extracts_commentary_tool_call_past_analysis():
+    result = process_tool_calls(
+        HARMONY_ANALYSIS_THEN_CALL, load_tool_module("harmony"), WEATHER_TOOLS
+    )
+    assert len(result.calls) == 1
+    assert result.calls[0]["function"]["name"] == "get_weather"
+    assert json.loads(result.calls[0]["function"]["arguments"]) == WEATHER_ARGS
+    assert "to=functions" not in result.remaining_text
+
+
+def test_harmony_ignores_plain_commentary_preamble():
+    preamble = "<|channel|>commentary<|message|>Let me look that up.<|end|>"
+    result = process_tool_calls(preamble, load_tool_module("harmony"), None)
+    assert result.calls == []
+    assert result.remaining_text == preamble
+
+
 # Loading and utility contracts
 
 
@@ -2269,6 +2311,75 @@ class TestEstimateNumImageTokens:
             estimate_num_image_tokens(SimpleNamespace(), 480, 640)
 
 
+class TestMiMoV2Processor:
+    def test_processor_attributes(self):
+        from mlx_vlm.models.mimo_v2.processing import MiMoV2Processor
+
+        assert MiMoV2Processor.get_attributes() == [
+            "image_processor",
+            "tokenizer",
+            "video_processor",
+        ]
+
+    def test_audio_codes_expand_placeholders_by_grouped_length(self):
+        from mlx_vlm.models.mimo_v2.processing import MiMoV2Processor
+        from mlx_vlm.models.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor
+
+        processor = object.__new__(MiMoV2Processor)
+        processor.audio_token = "<|audio_pad|>"
+        processor._audio_tokenizer = SimpleNamespace(
+            encode=lambda *args, **kwargs: mx.zeros((20, 5), dtype=mx.int32)
+        )
+        captured = {}
+
+        def process(*args, **kwargs):
+            captured.update(kwargs)
+            return {}
+
+        with patch.object(Qwen2_5_VLProcessor, "__call__", side_effect=process):
+            result = processor(
+                text=["before<|audio_pad|>after"],
+                audio=np.zeros(1600, dtype=np.float32),
+            )
+
+        assert captured["text"] == ["before<|audio_pad|><|audio_pad|>after"]
+        assert result["audio_codes"].shape == (5, 20)
+        assert result["audio_code_lengths"] == [5]
+
+    def test_audio_codes_preserve_batch_boundaries(self):
+        from mlx_vlm.models.mimo_v2.processing import MiMoV2Processor
+        from mlx_vlm.models.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor
+
+        processor = object.__new__(MiMoV2Processor)
+        processor.audio_token = "<|audio_pad|>"
+
+        def encode(item, **kwargs):
+            length = 5 if item == "first" else 3
+            offset = 0 if item == "first" else 100
+            return mx.arange(20 * length).reshape(20, length) + offset
+
+        processor._audio_tokenizer = SimpleNamespace(encode=encode)
+        captured = {}
+
+        def process(*args, **kwargs):
+            captured.update(kwargs)
+            return {}
+
+        with patch.object(Qwen2_5_VLProcessor, "__call__", side_effect=process):
+            result = processor(
+                text=["a<|audio_pad|>", "b<|audio_pad|>"],
+                audio=["first", "second"],
+            )
+
+        assert captured["text"] == [
+            "a<|audio_pad|><|audio_pad|>",
+            "b<|audio_pad|>",
+        ]
+        assert result["audio_codes"].shape == (8, 20)
+        assert result["audio_code_lengths"] == [5, 3]
+        assert result["audio_codes"][5, 0].item() == 100
+
+
 @pytest.fixture(scope="module")
 def synthetic_video(tmp_path_factory):
     """A deterministic 600-frame 64x64 clip at 30 fps, i.e. 20 seconds."""
@@ -2308,6 +2419,43 @@ class TestResolveVideoSampling:
 
 
 class TestVideoMetadataForwarding:
+    def test_each_video_uses_its_own_sampling_rate(self):
+        class Processor:
+            tokenizer = SimpleNamespace(pad_token="<pad>")
+
+            def __call__(self, text, images=None, videos=None, fps=None, **kwargs):
+                self.fps = fps
+                self.kwargs = kwargs
+                return {
+                    "input_ids": np.array([[1], [2]]),
+                    "attention_mask": np.array([[1], [1]]),
+                }
+
+        processor = Processor()
+        video = np.zeros((2, 3, 8, 8), dtype=np.uint8)
+        samplings = []
+
+        def load(path, sampling, frame_sampler=None):
+            samplings.append(sampling)
+            return video, VideoMetadata(
+                total_num_frames=30,
+                fps=30,
+                frames_indices=[0, 29],
+            )
+
+        with patch("mlx_vlm.utils.load_video", side_effect=load):
+            prepare_inputs(
+                processor,
+                videos=["first.mp4", "second.mp4"],
+                prompts=["first", "second"],
+                fps=[1, 2],
+                nframes=2,
+            )
+
+        assert [sampling.fps for sampling in samplings] == [1, 2]
+        assert [sampling.nframes for sampling in samplings] == [2, 2]
+        assert "nframes" not in processor.kwargs
+
     def test_metadata_is_only_forwarded_to_declaring_processors(self):
         class Processor:
             tokenizer = SimpleNamespace(pad_token="<pad>")

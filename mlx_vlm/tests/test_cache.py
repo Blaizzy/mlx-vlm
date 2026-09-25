@@ -362,6 +362,43 @@ def test_empty_batch_kv_cache_ignores_unapplied_right_padding():
     assert cache._right_padding is None
 
 
+@pytest.mark.parametrize(
+    "factory", [BatchKVCache, BatchQuantizedKVCache, BatchQSAKVCache]
+)
+@pytest.mark.parametrize("trigger", ["prepare", "prefill", "ragged_commit"])
+def test_qwen3_5_padding_mask_follows_in_place_updates(factory, trigger):
+    from mlx_vlm.models.qwen3_5 import language as qwen3_5
+    from mlx_vlm.speculative.cache_state import start_speculative_cache
+
+    def kv(steps):
+        return mx.ones((2, 1, steps, 64))
+
+    cache = factory([0, 0])
+    decode = mx.zeros((2, 1, 16))
+    if trigger == "prefill":
+        cache.prepare(right_padding=[0, 3], lengths=[5, 2])
+        cache.update_and_fetch(kv(4), kv(4))
+    elif trigger == "ragged_commit":
+        cache.update_and_fetch(kv(6), kv(6))
+
+    assert qwen3_5._create_qwen3_5_attention_mask(decode, cache) is None
+    if trigger == "prepare":
+        cache.prepare(left_padding=[0, 3])
+    elif trigger == "prefill":
+        cache.update_and_fetch(kv(1), kv(1))
+        cache.finalize()
+    else:
+        # QSA exposes the padding of its inner KV cache.
+        transaction = start_speculative_cache([getattr(cache, "kv_cache", cache)], 4)
+        cache.update_and_fetch(kv(4), kv(4))
+        transaction.commit([4, 1])
+
+    assert cache.left_padding.tolist() == [0, 3]
+    assert qwen3_5._create_qwen3_5_attention_mask(decode, cache) == "left_padded_decode"
+    assert cache._qwen3_5_decode_left_padding == [0, 3]
+    assert qwen3_5._qwen3_5_left_padding_info(cache) == ((0, 3), 3)
+
+
 @pytest.mark.parametrize("window", [4, 8, 16])
 @pytest.mark.parametrize("prefix_length", [0, 3, 8, 20])
 @pytest.mark.parametrize("parts", [(3, 1), (1, 1, 1, 1)])
@@ -624,6 +661,24 @@ def test_finalize_noop_without_prepare():
     before = cache.left_padding.tolist()
     cache.finalize()
     assert cache.left_padding.tolist() == before
+
+
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6, 8])
+def test_empty_quantized_cache_matches_quantize_layout(bits, head_dim, batched):
+    if batched:
+        cache = BatchQuantizedKVCache([0, 0], group_size=64, bits=bits)
+    else:
+        cache = C.QuantizedKVCache(group_size=64, bits=bits)
+    # The first update allocates the buffers, the second grows them.
+    for steps in (3, 300):
+        new = mx.random.normal((2 if batched else 1, 2, steps, head_dim))
+        keys, _ = cache.update_and_fetch(new, new)
+    expected = mx.quantize(new, group_size=64, bits=bits)
+    assert [k.shape[-1] for k in keys] == [e.shape[-1] for e in expected]
+    stored = mx.dequantize(*(k[..., 3:, :] for k in keys), group_size=64, bits=bits)
+    assert mx.array_equal(stored, mx.dequantize(*expected, group_size=64, bits=bits))
 
 
 GROUP = 64

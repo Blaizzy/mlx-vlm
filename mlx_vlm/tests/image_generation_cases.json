@@ -57,6 +57,13 @@
       "index_class": "QwenImage21Pipeline",
       "edit": {"probe": "Qwen/Qwen-Image-2.1"},
       "pipeline_class": "QwenImagePipeline"
+    },
+    "ming_image": {
+      "prefix": "MingImage",
+      "aliases": ["inclusionAI/Ming-Image-0.1-Design"],
+      "invalid_dimensions": [[255, 512], [512, 2050], [513, 512]],
+      "index_class": "MingImagePipeline",
+      "pipeline_class": "MingImagePipeline"
     }
   },
   "checks": {
@@ -584,6 +591,20 @@
           }
         },
         "vae/config.json": {}
+      }
+    },
+    "ming_image": {
+      "files": [],
+      "metadata": {
+        "transformer/config.json": {"_class_name": "DiffusionTransformer"},
+        "mllm/config.json": {"architectures": ["BailingMM2NativeForConditionalGeneration"]},
+        "transformer/diffusion_pytorch_model.safetensors.index.json": {
+          "weight_map": {
+            "layers.0.feed_forward.w1.weight": "diffusion_pytorch_model.safetensors",
+            "context_refiner.0.attention.to_q.weight": "diffusion_pytorch_model.safetensors",
+            "noise_refiner.0.adaLN_modulation.0.weight": "diffusion_pytorch_model.safetensors"
+          }
+        }
       }
     }
   },
