@@ -48,6 +48,7 @@ from .responses_state import (
 from .responses_state import _sse_event as _response_sse_event
 from .responses_state import (
     _store_response,
+    finish_content_streams,
     make_response_stream_state,
     prompt_has_open_thinking,
     response_store,
@@ -1139,6 +1140,25 @@ async def responses_endpoint(request: Request):
                                 yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta, timings=StreamingTimings(predicted_per_second=chunk_rate)).model_dump_json()}\n\n"
                                 await asyncio.sleep(0.01)
 
+                    tail_reasoning, tail = finish_content_streams(
+                        thinking_state, tool_call_state
+                    )
+                    if tail_reasoning:
+                        streamed_reasoning += tail_reasoning
+                        yield _response_sse_event(
+                            "response.reasoning_text.delta",
+                            {
+                                "type": "response.reasoning_text.delta",
+                                "response_id": response_id,
+                                "item_id": reasoning_item_id,
+                                "output_index": 0,
+                                "content_index": 0,
+                                "delta": tail_reasoning,
+                            },
+                        )
+                    if tail:
+                        yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=tail, timings=StreamingTimings(predicted_per_second=metrics.rate)).model_dump_json()}\n\n"
+
                     output_items, clean_text, _, output_finish_reason = (
                         _response_output_items_from_text(
                             full_text,
@@ -1813,6 +1833,29 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 finish_reason = token.finish_reason
                                 break
 
+                        tail_reasoning, tail = finish_content_streams(
+                            thinking_state, tool_call_state
+                        )
+                        if tail or tail_reasoning:
+                            chunk_data = ChatStreamChunk(
+                                id=request_id,
+                                created=int(time.time()),
+                                model=request.model,
+                                choices=[
+                                    ChatStreamChoice(
+                                        delta=ChatMessage(
+                                            role="assistant",
+                                            content=tail,
+                                            reasoning=tail_reasoning,
+                                        )
+                                    )
+                                ],
+                                timings=StreamingTimings(
+                                    predicted_per_second=metrics.rate
+                                ),
+                            )
+                            yield f"data: {chunk_data.model_dump_json()}\n\n"
+
                         # Parse tool calls from full output and emit final chunk
                         terminal_emitted = False
                         if tool_module is not None:
@@ -1886,6 +1929,10 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
                         )
+                        tool_call_state = ToolCallStreamState(
+                            tool_module.tool_call_start if tool_module else None,
+                            tool_module.tool_call_end if tool_module else None,
+                        )
                         for chunk in token_iterator:
                             if chunk is None or not hasattr(chunk, "text"):
                                 continue
@@ -1901,12 +1948,15 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             thinking_delta = thinking_state.feed(
                                 chunk.text, last=bool(chunk_finish)
                             )
-                            if thinking_delta.content or thinking_delta.reasoning:
+                            delta_content = tool_call_state.feed(
+                                thinking_delta.content, last=bool(chunk_finish)
+                            )
+                            if delta_content or thinking_delta.reasoning:
                                 choices = [
                                     ChatStreamChoice(
                                         delta=ChatMessage(
                                             role="assistant",
-                                            content=thinking_delta.content,
+                                            content=delta_content,
                                             reasoning=thinking_delta.reasoning,
                                         )
                                     )
@@ -1924,13 +1974,62 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 yield f"data: {chunk_data.model_dump_json()}\n\n"
                                 await asyncio.sleep(0.01)
 
-                        finish_reason = finish_reason or "stop"
-                        chunk_data = _final_chat_chunk(
-                            request_id,
-                            request.model,
-                            finish_reason,
-                            metrics.rate,
+                        tail_reasoning, tail = finish_content_streams(
+                            thinking_state, tool_call_state
                         )
+                        if tail or tail_reasoning:
+                            chunk_data = ChatStreamChunk(
+                                id=request_id,
+                                created=int(time.time()),
+                                model=request.model,
+                                choices=[
+                                    ChatStreamChoice(
+                                        delta=ChatMessage(
+                                            role="assistant",
+                                            content=tail,
+                                            reasoning=tail_reasoning,
+                                        )
+                                    )
+                                ],
+                                timings=StreamingTimings(
+                                    predicted_per_second=metrics.rate
+                                ),
+                            )
+                            yield f"data: {chunk_data.model_dump_json()}\n\n"
+
+                        tc = (
+                            process_tool_calls(output_text, tool_module, tools)
+                            if tool_module is not None
+                            else None
+                        )
+                        if tc is not None and tc.calls:
+                            tool_calls_made = True
+                            finish_reason = "tool_calls"
+                            chunk_data = ChatStreamChunk(
+                                id=request_id,
+                                created=int(time.time()),
+                                model=request.model,
+                                choices=[
+                                    ChatStreamChoice(
+                                        finish_reason="tool_calls",
+                                        delta=ChatMessage(
+                                            role="assistant",
+                                            tool_calls=tc.calls,
+                                        ),
+                                    )
+                                ],
+                                timings=StreamingTimings(
+                                    predicted_per_second=metrics.rate
+                                ),
+                            )
+                        else:
+                            finish_reason = finish_reason or "stop"
+                            chunk_data = _final_chat_chunk(
+                                request_id,
+                                request.model,
+                                finish_reason,
+                                metrics.rate,
+                            )
                         yield f"data: {chunk_data.model_dump_json()}\n\n"
                         if emit_usage:
                             chunk_data = _chat_usage_chunk(

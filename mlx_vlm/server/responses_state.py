@@ -270,14 +270,14 @@ response_store_lock = Lock()
 class ToolCallStreamState:
     """Remove tool-call spans from streamed content, independent of chunking.
 
-    Streamed content matches what ``process_tool_calls`` leaves as the
-    non-streamed content. Marker fragments are buffered until they either
-    complete or stop matching. Text outside calls is emitted exactly once; a
-    closed call is discarded. A parser with no end marker ends a call at the
-    next newline, as the extractor does. A call still open when generation
-    ends is not a call to the extractor, so its text is emitted then.
-    Whitespace-only text after a call is held back: it is dropped at the end of
-    generation, and before another call or text when no text has been shown.
+    Streamed content matches what the non-streamed response returns:
+    ``process_tool_calls`` removes closed calls, and the content is stripped.
+    Marker fragments are buffered until they either complete or stop matching.
+    Text outside calls is emitted exactly once; a closed call is discarded. A
+    parser with no end marker ends a call at the next newline, as the extractor
+    does. A call still open when generation ends is not a call to the
+    extractor, so its text is emitted then. Whitespace leading the content is
+    dropped, and trailing whitespace is held until more text follows.
     """
 
     def __init__(
@@ -290,12 +290,13 @@ class ToolCallStreamState:
         self.in_tool_call = False
         self.buffer = ""
         self.call_text = ""
-        self.after_call = False
         self.pending_space = ""
         self.shown_text = False
+        self.finished = False
 
     def feed(self, text: Optional[str], last: bool = False) -> Optional[str]:
         if not self.tc_start:
+            self.finished = self.finished or last
             return text
 
         self.buffer += text or ""
@@ -311,11 +312,8 @@ class ToolCallStreamState:
             if marker_at >= 0:
                 if self.in_tool_call:
                     self.call_text = ""
-                    self.after_call = True
                 else:
                     self._show(self.buffer[:marker_at], visible)
-                    if not self.shown_text:
-                        self.pending_space = ""
                     self.call_text = marker
                 self.buffer = self.buffer[marker_at + len(marker) :]
                 self.in_tool_call = not self.in_tool_call
@@ -344,22 +342,25 @@ class ToolCallStreamState:
             self.buffer = ""
             self.call_text = ""
             self.pending_space = ""
+            self.finished = True
 
         return "".join(visible) or None
 
+    def finish(self) -> Optional[str]:
+        """Flush held text when the stream ended without a finish token."""
+        if self.finished:
+            return None
+        return self.feed(None, last=True)
+
     def _show(self, text: str, visible: list) -> None:
-        if not text:
-            return
-        if self.after_call:
-            if text.isspace():
-                self.pending_space += text
-                return
-            text = self.pending_space + text if self.shown_text else text.lstrip()
-            self.pending_space = ""
-            self.after_call = False
-        if not text.isspace():
+        text = self.pending_space + text
+        if not self.shown_text:
+            text = text.lstrip()
+        body = text.rstrip()
+        self.pending_space = text[len(body) :]
+        if body:
             self.shown_text = True
-        visible.append(text)
+            visible.append(body)
 
     @staticmethod
     def _split_partial_marker(text: str, marker: str) -> Tuple[str, str]:
@@ -368,6 +369,20 @@ class ToolCallStreamState:
             if text.endswith(marker[:length]):
                 return text[:-length], text[-length:]
         return text, ""
+
+
+def finish_content_streams(thinking_state, tool_call_state):
+    """``(reasoning, content)`` still held when a stream ends.
+
+    Callers finalize both states on a token with a finish reason; a token
+    iterator can also just stop. The states are fed the same ``last`` flag, so
+    once the tool-call state is finished both are, and nothing is fed again (a
+    tokenizer response parser refuses a second finalization).
+    """
+    if tool_call_state.finished:
+        return None, None
+    delta = thinking_state.feed("", last=True)
+    return delta.reasoning, tool_call_state.feed(delta.content, last=True)
 
 
 def _as_plain_dict(value):

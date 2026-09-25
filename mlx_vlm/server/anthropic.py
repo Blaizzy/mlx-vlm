@@ -28,6 +28,7 @@ from .generation import (
 )
 from .responses_state import (
     ToolCallStreamState,
+    finish_content_streams,
     make_response_stream_state,
     prompt_has_open_thinking,
 )
@@ -747,8 +748,35 @@ async def anthropic_messages_endpoint(http_request: Request):
                             finish_reason = token.finish_reason
                             break
 
+                    tail_reasoning, tail = finish_content_streams(
+                        thinking_state, tool_call_state
+                    )
                     for event in start_message_event():
                         yield event
+                    if tail_reasoning and gen_args.enable_thinking:
+                        yield open_block("thinking")
+                        yield _sse_event(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": block_index,
+                                "delta": {
+                                    "type": "thinking_delta",
+                                    "thinking": tail_reasoning,
+                                },
+                            },
+                        )
+                    if tail:
+                        text_output += tail
+                        yield open_block("text")
+                        yield _sse_event(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": block_index,
+                                "delta": {"type": "text_delta", "text": tail},
+                            },
+                        )
                     yield close_open_block()
 
                     parsed_tool_calls = None

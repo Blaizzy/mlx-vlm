@@ -3405,7 +3405,7 @@ def test_unknown_function_output_blocks_remain_text():
             ["Before ", "<tool_call>", '{"name": "a"}', " trailing"],
             "<tool_call>",
             "",
-            "Before ",
+            "Before",
             True,
         ),
         (["A literal <tool"], "<tool_call>", "</tool_call>", "A literal <tool", False),
@@ -3452,6 +3452,20 @@ def test_unknown_function_output_blocks_remain_text():
             True,
         ),
         (
+            list("  <tool_call>x</tool_call>B"),
+            "<tool_call>",
+            "</tool_call>",
+            "B",
+            False,
+        ),
+        (
+            ["<tool_call>x</tool_call> B", "  "],
+            "<tool_call>",
+            "</tool_call>",
+            "B",
+            False,
+        ),
+        (
             ["Before ", "[TOOL_CALLS]foo[ARGS]{}", "\nAfter"],
             "[TOOL_CALLS]",
             "",
@@ -3469,6 +3483,8 @@ def test_unknown_function_output_blocks_remain_text():
         "text-after-call",
         "whitespace-between-text",
         "unfinished-call",
+        "leading-whitespace",
+        "trailing-whitespace",
         "no-end-marker-ends-at-newline",
     ],
 )
@@ -3494,10 +3510,8 @@ def test_tool_stream_finalization(chunks, start_marker, end_marker, expected, in
     ],
 )
 def test_tool_stream_matches_non_streamed_content(parser, text):
-    # Streamed content equals the content process_tool_calls leaves, up to the
-    # separator it substitutes for each call, whatever the chunking. Whitespace
-    # is compared loosely: text before a call and trailing whitespace are
-    # streamed before it is known whether the extractor's strip() applies.
+    # Streamed content equals the stripped content process_tool_calls leaves,
+    # up to the separator it substitutes for each call, whatever the chunking.
     module = load_tool_module(parser)
     expected = " ".join(process_tool_calls(text, module, None).remaining_text.split())
     for chunks in ([text], list(text)):
@@ -3507,6 +3521,56 @@ def test_tool_stream_matches_non_streamed_content(parser, text):
             for i, chunk in enumerate(chunks)
         )
         assert " ".join(streamed.split()) == expected
+        assert streamed == streamed.strip()
+
+
+_WEATHER_CALL = '<tool_call>{"name": "get_weather", "arguments": {}}</tool_call>'
+
+
+def test_chat_fallback_stream_parses_tool_calls(client):
+    # Without a response generator the stream_generate fallback streamed the
+    # raw tool-call markup as content and never emitted tool_calls.
+    result = _result(f"Checking.{_WEATHER_CALL}", finish_reason="stop")
+    with _endpoint(chunks=[result], parser=_JSON_TOOLS):
+        response = _post(client, stream=True, tools=[_tool()])
+    deltas = _deltas(response)
+    assert _joined(deltas, "content") == "Checking."
+    calls = [call for delta in deltas for call in delta.get("tool_calls") or []]
+    assert [call["function"]["name"] for call in calls] == ["get_weather"]
+    reasons = [
+        choice["finish_reason"]
+        for chunk in _data(response)
+        for choice in chunk.get("choices") or []
+        if choice.get("finish_reason")
+    ]
+    assert reasons == ["tool_calls"]
+
+
+@pytest.mark.parametrize("api", ["chat", "responses", "messages"])
+def test_stream_without_finish_token_flushes_held_text(client, api):
+    # The iterator stops without a finish reason: the unfinished call is not a
+    # call, so its text is content, as in the non-streamed response.
+    tool = _tool(api="messages") if api == "messages" else _tool()
+    if api == "responses":
+        tool = dict(type="function", name="get_weather", parameters={"type": "object"})
+    response = _stream_response(
+        client,
+        [_token("A <tool_call>unfinished")],
+        api,
+        endpoint=dict(parser=_JSON_TOOLS),
+        tools=[tool],
+    )
+    deltas = _deltas(response, api)
+    if api == "chat":
+        text = _joined(deltas, "content")
+    elif api == "messages":
+        text = _joined(deltas, "text")
+    else:
+        text = _joined(
+            [d for d in deltas if d.get("type") == "response.output_text.delta"],
+            "delta",
+        )
+    assert text == "A <tool_call>unfinished"
 
 
 # HTTP audio endpoints
