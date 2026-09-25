@@ -26,6 +26,8 @@ from mlx.utils import tree_flatten, tree_map
 
 from mlx_vlm.models.base import InputEmbeddingsFeatures
 from mlx_vlm.models.cache import make_prompt_cache
+from mlx_vlm.models.lfm2_embedding import MaskedLMModel
+from mlx_vlm.models.lfm2_embedding import ModelConfig as Lfm2EncoderConfig
 from mlx_vlm.utils import (
     _drop_modules_without_weights,
     _load_safetensors,
@@ -38,6 +40,53 @@ from mlx_vlm.utils import (
 )
 
 # Shared model contracts
+
+
+class TestLfm2Encoder:
+    @staticmethod
+    def model():
+        return MaskedLMModel(
+            Lfm2EncoderConfig(
+                model_type="lfm2_embedding",
+                vocab_size=32,
+                hidden_size=16,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                max_position_embeddings=32,
+                norm_eps=1e-5,
+                conv_bias=False,
+                conv_L_cache=3,
+                block_dim=16,
+                block_ff_dim=24,
+                block_multiple_of=8,
+                block_ffn_dim_multiplier=1.0,
+                block_auto_adjust_ff_dim=False,
+                layer_types=["conv", "full_attention"],
+            )
+        )
+
+    def test_masked_lm_ignores_padded_token_values(self):
+        model = self.model()
+        mask = mx.array([[1, 1, 1, 0]])
+        first = model(mx.array([[1, 2, 3, 0]]), attention_mask=mask).logits
+        second = model(mx.array([[1, 2, 3, 9]]), attention_mask=mask).logits
+
+        assert first.shape == (1, 4, 32)
+        assert mx.allclose(first[:, :3], second[:, :3])
+
+    def test_sanitize_maps_encoder_checkpoint(self):
+        weights = {
+            "lfm2.embed_tokens.weight": mx.zeros((32, 16)),
+            "lfm2.layers.0.conv.conv.weight": mx.zeros((16, 1, 3)),
+            "lm_head.weight": mx.zeros((32, 16)),
+        }
+
+        sanitized = self.model().sanitize(weights)
+
+        assert "model.embed_tokens.weight" in sanitized
+        assert sanitized["model.layers.0.conv.conv.weight"].shape == (16, 3, 1)
+        assert "lm_head.weight" not in sanitized
 
 
 def capture_positions(
