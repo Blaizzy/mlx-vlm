@@ -1977,9 +1977,11 @@ def _worker_setup(
 
     if initialize:
         gen._initialize_model = fake_initialize
-    gen._gpu_embed = lambda raw, images=None, apc_semantic_hash=None: (
-        mx.array([[raw["request_id"]]], dtype=mx.int32),
-        {},
+    gen._gpu_embed = (
+        lambda raw, images=None, apc_semantic_hash=None, apc_media_hashes=None: (
+            mx.array([[raw["request_id"]]], dtype=mx.int32),
+            {},
+        )
     )
     return gen, instances
 

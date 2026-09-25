@@ -167,6 +167,8 @@ class APCCoordinator:
         safe_lookup_min: int,
         suffix_is_text_only: Callable[[int], bool],
         prefix_has_media: Callable[[int], bool],
+        media_hashes: Optional[Sequence[Tuple[int, int]]] = None,
+        media_gate_relaxed: Optional[bool] = None,
     ) -> Optional[dict]:
         if not self.enabled:
             return None
@@ -180,13 +182,18 @@ class APCCoordinator:
             safe_lookup_min=safe_lookup_min,
             suffix_is_text_only=suffix_is_text_only,
             prefix_has_media=prefix_has_media,
+            media_hashes=media_hashes,
+            media_gate_relaxed=media_gate_relaxed,
         )
         if hit is not None:
             hit["cache_plan"] = self.plan
         return hit
 
     def checkpoint_len(
-        self, token_ids: Sequence[int], media_token_ids: set[int]
+        self,
+        token_ids: Sequence[int],
+        media_token_ids: set[int],
+        relaxed: Optional[bool] = None,
     ) -> int:
         """Reusable checkpoint before the final guard token(s)."""
         if not self.enabled or not self.is_checkpoint:
@@ -198,10 +205,14 @@ class APCCoordinator:
             len(token_ids) - self.manager.exact_cache_guard_tokens,
             media_token_ids,
             max_prefix_tokens=len(token_ids) - 1,
+            relaxed=relaxed,
         )
 
     def checkpoint_lengths(
-        self, token_ids: Sequence[int], media_token_ids: set[int]
+        self,
+        token_ids: Sequence[int],
+        media_token_ids: set[int],
+        relaxed: Optional[bool] = None,
     ) -> List[int]:
         """Bounded intermediate states plus the final conversation checkpoint.
 
@@ -210,7 +221,7 @@ class APCCoordinator:
         captures to the resident entry budget (two for a disk-only manager),
         rather than copying an ever-growing cache at every prefill chunk.
         """
-        final = self.checkpoint_len(token_ids, media_token_ids)
+        final = self.checkpoint_len(token_ids, media_token_ids, relaxed=relaxed)
         if final <= 0:
             return []
         interval = self.manager.checkpoint_interval_tokens
@@ -226,7 +237,11 @@ class APCCoordinator:
         lengths = {final}
         for boundary in range(first, last + 1, interval):
             boundary = adjust_prefix_to_text_suffix_boundary(
-                token_ids, boundary, media_token_ids, max_prefix_tokens=final
+                token_ids,
+                boundary,
+                media_token_ids,
+                max_prefix_tokens=final,
+                relaxed=relaxed,
             )
             if self.manager.exact_cache_min_tokens <= boundary < final:
                 lengths.add(boundary)
@@ -302,6 +317,7 @@ class APCCoordinator:
         *,
         extra_hash: int = 0,
         batch_idx: Optional[int] = None,
+        media_hashes: Optional[Sequence[Tuple[int, int]]] = None,
     ) -> bool:
         if not self.enabled or not self.is_checkpoint:
             return False
@@ -324,7 +340,7 @@ class APCCoordinator:
         if snapshot is None:
             return False
         return self.manager.store_exact_cache(
-            token_ids, snapshot, extra_hash=extra_hash
+            token_ids, snapshot, extra_hash=extra_hash, media_hashes=media_hashes
         )
 
     def commit(
@@ -336,6 +352,7 @@ class APCCoordinator:
         extra_hash: int = 0,
         skip_first_n_tokens: int = 0,
         blocks_in_use: Sequence[Any] = (),
+        media_hashes: Optional[Sequence[Tuple[int, int]]] = None,
     ) -> bool:
         """Store one completed prefix and release any block leases."""
         if not self.enabled:
@@ -347,6 +364,7 @@ class APCCoordinator:
                     prompt_cache,
                     batch_idx=batch_idx,
                     extra_hash=extra_hash,
+                    media_hashes=media_hashes,
                 )
             finally:
                 self.manager.release(blocks_in_use)

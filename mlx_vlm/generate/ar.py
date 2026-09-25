@@ -617,6 +617,7 @@ APC_PRIVATE_PROMPT_KEYS = (
     "_apc_tenant",
     "_apc_image_hash",
     "_apc_semantic_hash",
+    "_apc_media_hashes",
 )
 
 
@@ -2023,6 +2024,7 @@ class PromptProcessingBatch:
                     self.prompt_cache,
                     batch_idx=batch_idx,
                     extra_hash=meta.get("extra_hash", 0),
+                    media_hashes=meta.get("media_hashes"),
                 )
             else:
                 prompt_cache = self._apc_prompt_cache_for_store(batch_idx)
@@ -2032,6 +2034,7 @@ class PromptProcessingBatch:
                     meta["full_input_ids"][:checkpoint_len],
                     prompt_cache,
                     extra_hash=meta.get("extra_hash", 0),
+                    media_hashes=meta.get("media_hashes"),
                 )
             meta["checkpoint_stored"] = checkpoint_len
             meta["checkpoint_saved"] = meta.get("checkpoint_saved", False) or stored
@@ -2330,6 +2333,7 @@ class PromptProcessingBatch:
                             extra_hash=meta.get("extra_hash", 0),
                             skip_first_n_tokens=meta.get("prefix_len", 0),
                             blocks_in_use=meta.get("apc_blocks", []),
+                            media_hashes=meta.get("media_hashes"),
                         )
                     elif self._apc_mode == "exact":
                         prompt_cache = self._apc_prompt_cache_for_store(batch_idx)
@@ -2338,6 +2342,7 @@ class PromptProcessingBatch:
                                 meta["full_input_ids"],
                                 prompt_cache,
                                 extra_hash=meta.get("extra_hash", 0),
+                                media_hashes=meta.get("media_hashes"),
                             )
                         self._apc_manager.release(meta.get("apc_blocks", []))
                     else:
@@ -2613,6 +2618,7 @@ class BatchGenerator:
             "prefix_has_media": lambda pl: self._apc_prefix_has_media_tokens(
                 ids_list, pl
             ),
+            "media_hashes": (prompt_kwargs or {}).get("_apc_media_hashes"),
         }
         if coordinator is not None:
             return coordinator.lookup(ids_list, **lookup_kwargs)
@@ -2764,6 +2770,7 @@ class BatchGenerator:
                     if picks[i]
                     else self._apc_extra_hash(prompt_kwargs_list[i] or {})
                 ),
+                "media_hashes": (prompt_kwargs_list[i] or {}).get("_apc_media_hashes"),
                 "apc_blocks": picks[i].get("matched_blocks", []) if picks[i] else [],
                 "checkpoint_len": self._apc_exact_checkpoint_len(full_ids[i]),
                 "checkpoint_lengths": self._apc_exact_checkpoint_lengths(full_ids[i]),
@@ -2825,6 +2832,7 @@ class BatchGenerator:
                     "full_input_ids": list(ids_list),
                     "prefix_len": 0,
                     "extra_hash": extra_hash,
+                    "media_hashes": (kw or {}).get("_apc_media_hashes"),
                     "apc_blocks": [],
                     "checkpoint_len": self._apc_exact_checkpoint_len(list(ids_list)),
                     "checkpoint_lengths": self._apc_exact_checkpoint_lengths(
