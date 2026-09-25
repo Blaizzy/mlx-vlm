@@ -1809,14 +1809,13 @@ def test_moondream3_sanitize_remaps_raw_and_preserves_converted_keys():
 class TestQwen3_5MoeText(unittest.TestCase):
     """Decoder-only Qwen3.5 MoE checkpoints (model_type qwen3_5_moe_text)."""
 
-    CONFIG = next(
-        case["config"] for case in DATA["cases"] if case["module"] == "qwen3_5_moe_text"
-    )
-
     def _model(self):
         from mlx_vlm.models.qwen3_5_moe_text import Model, ModelConfig
 
-        model = Model(ModelConfig.from_dict(copy.deepcopy(self.CONFIG)))
+        case = next(
+            case for case in DATA["cases"] if case["module"] == "qwen3_5_moe_text"
+        )
+        model = Model(ModelConfig.from_dict(copy.deepcopy(case["config"])))
         model.update(
             tree_map(
                 lambda p: (mx.random.randint(-8, 8, p.shape) / 4).astype(p.dtype),
@@ -1896,7 +1895,7 @@ class TestQwen3_5MoeText(unittest.TestCase):
         ids = mx.array([[3, 1, 4, 1, 5, 9, 2, 6]])
 
         def logits(rope_parameters):
-            config = dict(self.CONFIG, rope_parameters=rope_parameters)
+            config = vars(model.config) | {"rope_parameters": rope_parameters}
             other = Model(ModelConfig.from_dict(config))
             other.load_weights(weights, strict=True)
             return other(ids).logits
