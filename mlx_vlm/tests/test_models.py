@@ -1769,3 +1769,146 @@ class TestMistralLarge3(unittest.TestCase):
         model = Model(self._config())
         final = dict(tree_flatten(model.parameters()))
         assert model.sanitize(final).keys() == final.keys()
+
+
+def test_moondream2_sanitize_remaps_checkpoint_layout():
+    from mlx_vlm.models.moondream2 import Model
+
+    source = {
+        "model.text.wte": "text.model.embed_tokens.weight",
+        "model.text.blocks.0.attn.qkv.weight": "text.model.layers.0.attn.qkv.weight",
+        "model.text.post_ln.weight": "text.model.post_ln.weight",
+        "model.text.lm_head.weight": "text.lm_head.weight",
+        "model.vision.patch_emb.weight": "vision.encoder.patch_emb.weight",
+        "model.vision.blocks.0.ln1.weight": "vision.encoder.blocks.0.ln1.weight",
+        "model.vision.proj_mlp.fc1.weight": "vision.proj_mlp.fc1.weight",
+    }
+    weights = {key: mx.zeros((1,)) for key in source}
+    weights["model.region.coord_decoder.fc1.weight"] = mx.zeros((1,))
+
+    assert set(Model.sanitize(None, weights)) == set(source.values())
+
+
+def test_moondream3_sanitize_remaps_raw_and_preserves_converted_keys():
+    from mlx_vlm.models.moondream3 import Model
+
+    raw = {
+        "model.text.blocks.0.attn.qkv.weight": mx.zeros((1,)),
+        "model.vision.blocks.0.ln1.weight": mx.zeros((1,)),
+    }
+    converted = Model.sanitize(None, raw)
+    assert set(converted) == {
+        "text.model.blocks.0.attn.qkv.weight",
+        "vision.encoder.blocks.0.ln1.weight",
+    }
+    converted["text.lm_head.weight"] = mx.zeros((1,))
+    converted["vision.proj_mlp.fc1.weight"] = mx.zeros((1,))
+    assert Model.sanitize(None, converted).keys() == converted.keys()
+
+
+class TestQwen3_5MoeText(unittest.TestCase):
+    """Decoder-only Qwen3.5 MoE checkpoints (model_type qwen3_5_moe_text)."""
+
+    CASES = json.loads(Path(__file__).with_name("model_cases.json").read_text())
+    CONFIG = next(
+        c["config"] for c in CASES["cases"] if c["module"] == "qwen3_5_moe_text"
+    )
+
+    def _model(self):
+        from mlx_vlm.models.qwen3_5_moe_text import Model, ModelConfig
+
+        model = Model(ModelConfig.from_dict(copy.deepcopy(self.CONFIG)))
+        model.update(
+            tree_map(
+                lambda p: (mx.random.randint(-8, 8, p.shape) / 4).astype(p.dtype),
+                model.parameters(),
+            )
+        )
+        return model
+
+    def _raw_checkpoint(self, model, prefix, fused):
+        """Rebuild a published checkpoint from the model's own parameters."""
+        from mlx_vlm.models.qwen3_5.qwen3_5 import NORM_WEIGHT_SUFFIXES
+
+        raw = {}
+        for key, value in tree_flatten(model.parameters()):
+            if ".switch_mlp." in key:
+                continue
+            if key.startswith("language_model.model."):
+                raw_key = prefix + key[len("language_model.model.") :]
+            else:
+                raw_key = key.replace("language_model.lm_head", "lm_head", 1)
+            if "conv1d.weight" in key:
+                value = value.swapaxes(1, 2)
+            if any(key.endswith(sfx) for sfx in NORM_WEIGHT_SUFFIXES):
+                value = value - 1.0
+            raw[raw_key] = value
+        for layer_idx, layer in enumerate(model.layers):
+            experts = f"{prefix}layers.{layer_idx}.mlp.experts"
+            switch = layer.mlp.switch_mlp
+            if fused:
+                raw[f"{experts}.gate_up_proj"] = mx.concatenate(
+                    [switch.gate_proj.weight, switch.up_proj.weight], axis=-2
+                )
+                raw[f"{experts}.down_proj"] = switch.down_proj.weight
+            else:
+                for name in ("gate_proj", "up_proj", "down_proj"):
+                    weight = getattr(switch, name).weight
+                    for e in range(weight.shape[0]):
+                        raw[f"{experts}.{e}.{name}.weight"] = weight[e]
+        return raw
+
+    def test_published_layouts_sanitize_to_the_model_exactly(self):
+        model = self._model()
+        expected = dict(tree_flatten(model.parameters()))
+        for prefix in ("model.language_model.", "model."):
+            for fused in (True, False):
+                with self.subTest(prefix=prefix, fused=fused):
+                    raw = self._raw_checkpoint(model, prefix, fused)
+                    raw[f"{prefix}layers.0.mlp.gate.input_global_scale"] = mx.ones(1)
+                    sanitized = model.sanitize(raw)
+                    self.assertEqual(sanitized.keys(), expected.keys())
+                    for key, value in expected.items():
+                        self.assertTrue(
+                            mx.array_equal(sanitized[key], value).item(), key
+                        )
+                    model.load_weights(list(sanitized.items()), strict=True)
+
+    def test_ragged_expert_tensors_fail_clearly(self):
+        model = self._model()
+        raw = self._raw_checkpoint(model, "model.", fused=True)
+        raw["model.layers.0.mlp.experts.gate_up_proj"] = mx.zeros((123,))
+        with self.assertRaisesRegex(ValueError, "expected \\[num_experts"):
+            model.sanitize(raw)
+
+    def test_sanitize_is_idempotent_on_converted_weights(self):
+        model = self._model()
+        converted = dict(tree_flatten(model.parameters()))
+        again = model.sanitize(dict(converted))
+        self.assertEqual(again.keys(), converted.keys())
+        for key, value in converted.items():
+            self.assertTrue(mx.array_equal(again[key], value).item(), key)
+
+    def test_missing_mrope_section_is_plain_rope(self):
+        from mlx_vlm.models.qwen3_5_moe_text import Model, ModelConfig
+
+        model = self._model()
+        weights = list(tree_flatten(model.parameters()))
+        ids = mx.array([[3, 1, 4, 1, 5, 9, 2, 6]])
+
+        def logits(rope_parameters):
+            config = dict(self.CONFIG, rope_parameters=rope_parameters)
+            other = Model(ModelConfig.from_dict(config))
+            other.load_weights(weights, strict=True)
+            return other(ids).logits
+
+        base = {
+            "rope_type": "default",
+            "rope_theta": 10000,
+            "partial_rotary_factor": 1.0,
+        }
+        missing = logits(dict(base))
+        for section in ([2, 1, 1], [1, 1, 2], [4, 0, 0]):
+            with self.subTest(section=section):
+                explicit = logits(dict(base, mrope_section=section))
+                self.assertTrue(mx.allclose(missing, explicit, atol=1e-5).item())
