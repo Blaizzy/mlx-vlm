@@ -310,8 +310,12 @@ class LanguageModel(nn.Module):
             return logits
         sorted_indices = mx.argsort(-logits, axis=-1)
         sorted_logits = mx.take_along_axis(logits, sorted_indices, axis=-1)
+        # Sum in float32: a float16/bfloat16 running sum stops growing once the
+        # remaining probabilities are below its precision, so it may never
+        # reach p and every token would be kept.
         cumulative_probs = mx.cumsum(
-            mx.softmax(sorted_logits, axis=-1, precise=True), axis=-1
+            mx.softmax(sorted_logits.astype(mx.float32), axis=-1, precise=True),
+            axis=-1,
         )
         sorted_mask = cumulative_probs > p
         sorted_mask = mx.concatenate(
