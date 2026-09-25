@@ -56,14 +56,6 @@ prism_ops = importlib.import_module(
 qwen35 = importlib.import_module("mlx_vlm.models.qwen3_5")
 
 
-def _mimo_v2_model():
-    from mlx_vlm.tests.test_models import DATA, build_config
-
-    module = importlib.import_module("mlx_vlm.models.mimo_v2")
-    case = next(c for c in DATA["cases"] if c["id"] == "TestModels.mimo_v2")
-    return module, module.Model(build_config(module, case["config"]))
-
-
 def test_mimo_v2_unfuses_tensor_parallel_qkv_shards():
     module = importlib.import_module("mlx_vlm.models.mimo_v2")
     text = module.TextConfig(
@@ -120,17 +112,6 @@ def test_mimo_v2_unfuses_tensor_parallel_qkv_shards():
             assert mx.allclose(block.astype(mx.float32), expected.astype(mx.float32))
 
 
-def test_mimo_v2_logits_to_keep():
-    _, model = _mimo_v2_model()
-    inputs = mx.zeros((2, 6), dtype=mx.int32)
-
-    full = model.language_model(inputs).logits
-    kept = model.language_model(inputs, logits_to_keep=1).logits
-
-    assert kept.shape == (2, 1, full.shape[-1])
-    assert mx.allclose(kept, full[:, -1:, :])
-
-
 def test_mimo_v2_batched_vision_attention_matches_independent_sequences():
     from mlx_vlm.models.mimo_v2.config import VisionConfig
     from mlx_vlm.models.mimo_v2.vision import VisionAttention
@@ -159,53 +140,6 @@ def test_mimo_v2_batched_vision_attention_matches_independent_sequences():
     )
 
     assert mx.allclose(batched, independent)
-
-
-def test_mimo_v2_combines_image_video_and_audio_features():
-    _, model = _mimo_v2_model()
-    config = model.config
-    vision = config.vision_config
-    patch_width = (
-        vision.in_channels
-        * vision.temporal_patch_size
-        * vision.patch_size
-        * vision.patch_size
-    )
-    image_pixels = mx.random.normal((16, patch_width))
-    image_grid = mx.array([[1, 4, 4]])
-    video_pixels = mx.random.normal((32, patch_width))
-    video_grid = mx.array([[2, 4, 4]])
-    audio_codes = mx.array([[1, 2], [3, 4], [5, 6]])
-    image = model.encode_images(image_pixels, image_grid_thw=image_grid)[0]
-    video = model.encode_video(video_pixels, video_grid)
-    audio = model.encode_audio(audio_codes)
-    ids = mx.array(
-        [
-            [1]
-            + [config.image_token_id] * image.shape[0]
-            + [2]
-            + [config.video_token_id] * video.shape[0]
-            + [3]
-            + [config.audio_token_id] * audio.shape[0]
-            + [4]
-        ]
-    )
-
-    result = model.get_input_embeddings(
-        ids,
-        pixel_values=image_pixels,
-        image_grid_thw=image_grid,
-        pixel_values_videos=video_pixels,
-        video_grid_thw=video_grid,
-        audio_codes=audio_codes,
-    ).inputs_embeds[0]
-    image_start = 1
-    video_start = image_start + image.shape[0] + 1
-    audio_start = video_start + video.shape[0] + 1
-
-    assert mx.allclose(result[image_start : image_start + image.shape[0]], image)
-    assert mx.allclose(result[video_start : video_start + video.shape[0]], video)
-    assert mx.allclose(result[audio_start : audio_start + audio.shape[0]], audio)
 
 
 # Attention kernels

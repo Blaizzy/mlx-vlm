@@ -46,11 +46,10 @@ omni_language = _model_module("qwen3_omni_moe.language")
 
 
 def test_mimo_v2_encodes_batched_audio_samples_independently():
-    from mlx_vlm.tests.test_models import DATA, build_config
-
     module = _model_module("mimo_v2")
-    case = next(c for c in DATA["cases"] if c["id"] == "TestModels.mimo_v2")
-    model = module.Model(build_config(module, case["config"]))
+    cases = json.loads(Path(__file__).with_name("model_cases.json").read_text())
+    case = next(c for c in cases["cases"] if c["module"] == "mimo_v2")
+    model = module.Model(module.ModelConfig.from_dict(case["config"]))
     first = mx.array([[1, 2], [3, 4], [5, 6], [7, 8]])
     second = mx.array([[8, 7], [6, 5], [4, 3], [2, 1]])
     expected = mx.concatenate(
