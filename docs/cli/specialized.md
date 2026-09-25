@@ -4,7 +4,7 @@ Beyond the primary commands ([`generate`](generate.md), [`server`](server.md), [
 
 ## Evaluation
 
-Multimodal benchmark harnesses, run as `python -m mlx_vlm.evals.<name>`.
+Multimodal benchmark harnesses, run as `python -m mlx_vlm.evals.<name>`. They require the `train` extra: `pip install -U 'mlx-vlm[train]'`.
 
 | Command | Purpose |
 |---------|---------|
@@ -15,7 +15,7 @@ Multimodal benchmark harnesses, run as `python -m mlx_vlm.evals.<name>`.
 
 ## Model-specific scripts
 
-Per-model conversion and inference scripts, run as `python -m mlx_vlm.models.<model>.<script>`.
+Per-model conversion and inference scripts, run as `python -m mlx_vlm.models.<model>.<script>`. Some conversion scripts (e.g. the SAM `convert_weights` scripts) read PyTorch checkpoints and require `torch` to be installed.
 
 | Command | Purpose |
 |---------|---------|
@@ -33,6 +33,7 @@ Per-model conversion and inference scripts, run as `python -m mlx_vlm.models.<mo
 | `python -m mlx_vlm.models.sam3_1.convert_weights` | Convert a SAM 3.1 Meta checkpoint to MLX safetensors. |
 | `python -m mlx_vlm.models.sam3d_body.convert_weights` | Convert SAM 3D Body weights to MLX safetensors. |
 | `python -m mlx_vlm.models.sam3d_objects.convert` | Convert released SAM 3D Objects inference checkpoints to MLX. |
+| `python -m mlx_vlm.models.sam3d_objects.bundle` | Write the Hub model card beside converted SAM 3D Objects weights. |
 | `python -m mlx_vlm.models.yolo11.convert` | Convert the OmniParser icon_detect (YOLO11) checkpoint to MLX safetensors. |
 | `python -m mlx_vlm.models.z_image.convert` | Convert a Z-Image Diffusers checkpoint to MLX. |
 | `python -m mlx_vlm.models.rfdetr.generate` | Run RF-DETR object detection / segmentation on an image. |
@@ -62,3 +63,4 @@ Extract native multi-token-prediction (MTP) tensors into standalone MLX drafter 
 | Command | Purpose |
 |---------|---------|
 | `python -m mlx_vlm.token_classification` | Tag and redact entities with an MLX token classifier (windowed inference + span decoding). |
+| `python -m mlx_vlm.privacy_filter` | Redact PII with constrained BIOES Viterbi decoding over a token classifier. |
