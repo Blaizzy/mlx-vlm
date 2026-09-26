@@ -52,11 +52,15 @@ from mlx_vlm.server import GenerationArguments as Args
 from mlx_vlm.server import ResponseGenerator as Generator
 from mlx_vlm.server import realtime
 from mlx_vlm.server.model_discovery import discover_models, is_model_directory
-from mlx_vlm.server.responses_state import ToolCallStreamState, _response_items_to_chat
+from mlx_vlm.server.responses_state import (
+    ToolCallStreamState,
+    _response_items_to_chat,
+    strip_protocol_markers,
+)
 from mlx_vlm.server.runtime_config import RuntimeConfig
 from mlx_vlm.tests.test_processors import MINICPM_MULTICALL
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
-from mlx_vlm.tools import load_tool_module
+from mlx_vlm.tools import load_tool_module, process_tool_calls
 
 _MUSE_RESPONSE_TEMPLATE = {
     "defaults": {"role": "assistant"},
@@ -1906,7 +1910,7 @@ def test_anthropic_messages_streaming_emits_tool_use_events(client):
         '"name": "get_weather"',
         '"type": "input_json_delta"',
         '"partial_json": "{\\"location\\": \\"SF\\"}"',
-        '"text": " After the call."',
+        '"text": "After the call."',
         '"stop_reason": "tool_use"',
     ):
         assert fragment in response.text
@@ -3581,12 +3585,12 @@ def test_unknown_function_output_blocks_remain_text():
 @pytest.mark.parametrize(
     "chunks,start_marker,end_marker,expected,inside",
     [
-        (["text<tool_call>"], "<tool_call>", "</tool_call>", "text", True),
+        (["text<tool_call>"], "<tool_call>", "</tool_call>", "text<tool_call>", True),
         (
             ["Before ", "<tool_call>", '{"name": "a"}', " trailing"],
             "<tool_call>",
             "",
-            "Before ",
+            "Before",
             True,
         ),
         (["A literal <tool"], "<tool_call>", "</tool_call>", "A literal <tool", False),
@@ -3594,7 +3598,7 @@ def test_unknown_function_output_blocks_remain_text():
             [*MINICPM_MULTICALL, ""],
             "<function",
             "</function>",
-            "BeforeBetweenAfter",
+            "Before Between After",
             False,
         ),
         (
@@ -3615,14 +3619,42 @@ def test_unknown_function_output_blocks_remain_text():
             ["<tool_call>a</tool_call>", "\n", "Done", "."],
             "<tool_call>",
             "</tool_call>",
-            "\nDone.",
+            "Done.",
             False,
         ),
         (
             list("A<tool_call>x</tool_call> \n<tool_call>y</tool_call>B"),
             "<tool_call>",
             "</tool_call>",
-            "A \nB",
+            "A  \n B",
+            False,
+        ),
+        (
+            list("A<tool_call>x</tool"),
+            "<tool_call>",
+            "</tool_call>",
+            "A<tool_call>x</tool",
+            True,
+        ),
+        (
+            list("  <tool_call>x</tool_call>B"),
+            "<tool_call>",
+            "</tool_call>",
+            "B",
+            False,
+        ),
+        (
+            ["<tool_call>x</tool_call> B", "  "],
+            "<tool_call>",
+            "</tool_call>",
+            "B",
+            False,
+        ),
+        (
+            ["Before ", "[TOOL_CALLS]foo[ARGS]{}", "\nAfter"],
+            "[TOOL_CALLS]",
+            "",
+            "Before  After",
             False,
         ),
     ],
@@ -3635,6 +3667,10 @@ def test_unknown_function_output_blocks_remain_text():
         "whitespace-between-calls-character-chunks",
         "text-after-call",
         "whitespace-between-text",
+        "unfinished-call",
+        "leading-whitespace",
+        "trailing-whitespace",
+        "no-end-marker-ends-at-newline",
     ],
 )
 def test_tool_stream_finalization(chunks, start_marker, end_marker, expected, inside):
@@ -3644,6 +3680,124 @@ def test_tool_stream_finalization(chunks, start_marker, end_marker, expected, in
     ]
     assert "".join(delta for delta in visible if delta) == expected
     assert state.in_tool_call is inside
+
+
+_CALL = '<tool_call>{"name": "get_weather", "arguments": {}}</tool_call>'
+
+
+@pytest.mark.parametrize(
+    "parser,text",
+    [
+        ("json_tools", f"{_CALL}\n{_CALL}\n"),
+        ("json_tools", f"Hi {_CALL}\n{_CALL}\n bye"),
+        ("json_tools", f"{_CALL} \nDone."),
+        ("json_tools", f"A{_CALL}B"),
+        ("json_tools", f"A{_CALL}\nB<tool_call>unfinished"),
+        ("json_tools", "A <tool_call>unfinished"),
+        ("json_tools", "No calls\n\n"),
+        ("minicpm5", '<function name="get_time"></function>Use <function as a prefix.'),
+        ("mistral", 'Before [TOOL_CALLS]foo[ARGS]{"a": 1}\nAfter'),
+        ("mistral", "[TOOL_CALLS]foo[ARGS]{}\n[TOOL_CALLS]bar[ARGS]{}"),
+    ],
+)
+def test_tool_stream_matches_non_streamed_content(parser, text):
+    # Streamed content equals the non-streamed content, whatever the chunking:
+    # beside a parsed call, the text process_tool_calls leaves with protocol
+    # markers removed; otherwise the whole output. Both are stripped.
+    module = load_tool_module(parser)
+    parsed = process_tool_calls(text, module, None)
+    expected = (
+        strip_protocol_markers(parsed.remaining_text, module)
+        if parsed.calls
+        else text.strip()
+    )
+    for chunks in ([text], list(text)):
+        state = ToolCallStreamState(module.tool_call_start, module.tool_call_end)
+        streamed = "".join(
+            state.feed(chunk, last=i == len(chunks) - 1) or ""
+            for i, chunk in enumerate(chunks)
+        )
+        assert streamed == expected
+
+
+_WEATHER_CALL = '<tool_call>{"name": "get_weather", "arguments": {}}</tool_call>'
+
+
+def test_chat_fallback_stream_parses_tool_calls(client):
+    # Without a response generator the stream_generate fallback streamed the
+    # raw tool-call markup as content and never emitted tool_calls.
+    result = _result(f"Checking.{_WEATHER_CALL}", finish_reason="stop")
+    with _endpoint(chunks=[result], parser=_JSON_TOOLS):
+        response = _post(client, stream=True, tools=[_tool()])
+    deltas = _deltas(response)
+    assert _joined(deltas, "content") == "Checking."
+    calls = [call for delta in deltas for call in delta.get("tool_calls") or []]
+    assert [call["function"]["name"] for call in calls] == ["get_weather"]
+    reasons = [
+        choice["finish_reason"]
+        for chunk in _data(response)
+        for choice in chunk.get("choices") or []
+        if choice.get("finish_reason")
+    ]
+    assert reasons == ["tool_calls"]
+
+
+@pytest.mark.parametrize("api", ["chat", "responses", "messages"])
+def test_stream_without_finish_token_flushes_held_text(client, api):
+    # The iterator stops without a finish reason: the unfinished call is not a
+    # call, so its text is content, as in the non-streamed response.
+    tool = _tool(api="messages") if api == "messages" else _tool()
+    if api == "responses":
+        tool = dict(type="function", name="get_weather", parameters={"type": "object"})
+    response = _stream_response(
+        client,
+        [_token("A <tool_call>unfinished")],
+        api,
+        endpoint=dict(parser=_JSON_TOOLS),
+        tools=[tool],
+    )
+    deltas = _deltas(response, api)
+    if api == "chat":
+        text = _joined(deltas, "content")
+    elif api == "messages":
+        text = _joined(deltas, "text")
+    else:
+        text = _joined(
+            [d for d in deltas if d.get("type") == "response.output_text.delta"],
+            "delta",
+        )
+    assert text == "A <tool_call>unfinished"
+
+
+@pytest.mark.parametrize("api", ["chat", "responses"])
+def test_tool_call_content_keeps_angle_bracket_text(client, api):
+    result = _result(
+        f"<think>r</think>Use <b>bold</b>.<|im_end|></think> {_WEATHER_CALL}"
+        " </tool_call>"
+    )
+    tool = (
+        dict(type="function", name="get_weather", parameters={"type": "object"})
+        if api == "responses"
+        else _tool()
+    )
+    with _endpoint(result=result, parser=_JSON_TOOLS):
+        response = _post(client, api, tools=[tool])
+    assert response.status_code == 200, response.text
+    body = response.json()
+    if api == "chat":
+        message = body["choices"][0]["message"]
+        assert message["content"] == "Use <b>bold</b>."
+        assert message["tool_calls"][0]["function"]["name"] == "get_weather"
+    else:
+        texts = [
+            part["text"]
+            for item in body["output"]
+            if item.get("type") == "message"
+            for part in item["content"]
+        ]
+        assert (
+            "Use <b>bold</b>." in texts or body.get("output_text") == "Use <b>bold</b>."
+        )
 
 
 # HTTP audio endpoints

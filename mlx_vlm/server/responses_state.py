@@ -270,12 +270,14 @@ response_store_lock = Lock()
 class ToolCallStreamState:
     """Remove tool-call spans from streamed content, independent of chunking.
 
+    Streamed content matches what the non-streamed response returns:
+    ``process_tool_calls`` removes closed calls, and the content is stripped.
     Marker fragments are buffered until they either complete or stop matching.
-    Text outside calls is emitted exactly once; text and markup inside calls is
-    discarded. Whitespace-only text after a call is held back: it is dropped at
-    the end of generation, and before another call when no text has been shown,
-    as the non-streamed response strips it. Parsers with no end marker keep the
-    historical latching behavior after the first start marker.
+    Text outside calls is emitted exactly once; a closed call is discarded. A
+    parser with no end marker ends a call at the next newline, as the extractor
+    does. A call still open when generation ends is not a call to the
+    extractor, so its text is emitted then. Whitespace leading the content is
+    dropped, and trailing whitespace is held until more text follows.
     """
 
     def __init__(
@@ -287,64 +289,86 @@ class ToolCallStreamState:
         self.tc_end = tc_end or ""
         self.in_tool_call = False
         self.buffer = ""
-        self.after_call = False
+        self.call_text = ""
         self.pending_space = ""
         self.shown_text = False
+        self.closed_call = False
+        self.finished = False
 
     def feed(self, text: Optional[str], last: bool = False) -> Optional[str]:
         if not self.tc_start:
+            self.finished = self.finished or last
             return text
 
         self.buffer += text or ""
         visible = []
 
         while self.buffer:
-            marker = self.tc_end if self.in_tool_call else self.tc_start
-            if not marker:
-                # A parser with no end marker treats the rest of the generation
-                # as tool-call content once its start marker has been seen.
-                self.buffer = ""
-                break
+            if self.in_tool_call:
+                marker = self.tc_end or "\n"
+            else:
+                marker = self.tc_start
 
             marker_at = self.buffer.find(marker)
             if marker_at >= 0:
-                if not self.in_tool_call:
+                if self.in_tool_call:
+                    # process_tool_calls replaces each call with a space.
+                    self.call_text = ""
+                    self.pending_space += " "
+                    self.closed_call = True
+                else:
                     self._show(self.buffer[:marker_at], visible)
-                    if not self.shown_text:
-                        self.pending_space = ""
+                    self.call_text = marker
                 self.buffer = self.buffer[marker_at + len(marker) :]
                 self.in_tool_call = not self.in_tool_call
-                self.after_call = not self.in_tool_call
                 continue
 
             stable, self.buffer = self._split_partial_marker(self.buffer, marker)
-            if not self.in_tool_call:
+            if self.in_tool_call:
+                if self.tc_end:
+                    # Kept only to be emitted if the call never closes; with no
+                    # end marker the extractor always ends it, so keep nothing.
+                    self.call_text += stable
+            else:
                 self._show(stable, visible)
             break
 
         if last:
-            if self.buffer and not self.in_tool_call:
+            if self.in_tool_call:
+                if self.tc_end:
+                    # No end marker arrived, so the extractor finds no call and
+                    # keeps this text as content. Beside a parsed call the
+                    # non-streamed response strips its marker.
+                    text = self.call_text + self.buffer
+                    if self.closed_call and _is_whole_tag(self.tc_start):
+                        text = text.removeprefix(self.tc_start)
+                    self._show(text, visible)
+            elif self.buffer:
                 # An unfinished start-marker prefix is ordinary content when
                 # generation ends before the marker can complete.
                 self._show(self.buffer, visible)
             self.buffer = ""
+            self.call_text = ""
             self.pending_space = ""
+            self.finished = True
 
         return "".join(visible) or None
 
+    def finish(self) -> Optional[str]:
+        """Flush held text when the stream ended without a finish token."""
+        if self.finished:
+            return None
+        return self.feed(None, last=True)
+
     def _show(self, text: str, visible: list) -> None:
-        if not text:
-            return
-        if self.after_call:
-            if text.isspace():
-                self.pending_space += text
-                return
-            text = self.pending_space + text
-            self.pending_space = ""
-            self.after_call = False
-        if not text.isspace():
+        text = self.pending_space + text
+        if not self.shown_text:
+            text = text.lstrip()
+        body = text.rstrip()
+        self.pending_space = text[len(body) :]
+        if body:
             self.shown_text = True
-        visible.append(text)
+            visible.append(body)
 
     @staticmethod
     def _split_partial_marker(text: str, marker: str) -> Tuple[str, str]:
@@ -353,6 +377,54 @@ class ToolCallStreamState:
             if text.endswith(marker[:length]):
                 return text[:-length], text[-length:]
         return text, ""
+
+
+def _is_whole_tag(marker: str) -> bool:
+    """Whether ``marker`` is a complete tag, never a prefix of ordinary text.
+
+    MiniCPM5 starts a call with the bare prefix ``<function``, which prose can
+    contain; only markers such as ``<tool_call>`` or ``[TOOL_CALLS]`` are safe
+    to remove on sight.
+    """
+    return bool(re.fullmatch(r"<[^<>]+>|\[[^\[\]]+\]", marker))
+
+
+def strip_protocol_markers(
+    text: str,
+    tool_module: Any,
+    thinking_start_token: Optional[str] = None,
+    thinking_end_token: Optional[str] = None,
+) -> str:
+    """Remove protocol residue left beside a parsed tool call.
+
+    Drops ``<|...|>`` control tokens (a model can run past its end token), the
+    parser's own call markers, and thinking markers, when they are whole tags.
+    Other ``<...>`` text, such as ``<b>``, is content the model wrote and is
+    kept.
+    """
+    text = re.sub(r"<\|[^>]+\|>", "", text)
+    markers = [tool_module.tool_call_start, tool_module.tool_call_end]
+    for pair in ThinkingStreamState._build_open_close_markers(
+        thinking_start_token, thinking_end_token
+    ):
+        markers.extend(pair)
+    for marker in sorted(filter(_is_whole_tag, markers), key=len, reverse=True):
+        text = text.replace(marker, "")
+    return text.strip()
+
+
+def finish_content_streams(thinking_state, tool_call_state):
+    """``(reasoning, content)`` still held when a stream ends.
+
+    Callers finalize both states on a token with a finish reason; a token
+    iterator can also just stop. The states are fed the same ``last`` flag, so
+    once the tool-call state is finished both are, and nothing is fed again (a
+    tokenizer response parser refuses a second finalization).
+    """
+    if tool_call_state.finished:
+        return None, None
+    delta = thinking_state.feed("", last=True)
+    return delta.reasoning, tool_call_state.feed(delta.content, last=True)
 
 
 def _as_plain_dict(value):
@@ -471,7 +543,9 @@ def _response_output_items_from_text(
                 thinking_start_token,
                 thinking_end_token,
             )
-            remaining = re.sub(r"<\|[^>]+\|>|<[^>]+>", "", remaining).strip()
+            remaining = strip_protocol_markers(
+                remaining, tool_module, thinking_start_token, thinking_end_token
+            )
             return reasoning_items + items, remaining, reasoning, "tool_calls"
     item = {
         "id": message_id,
