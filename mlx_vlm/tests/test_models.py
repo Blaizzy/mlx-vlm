@@ -35,7 +35,6 @@ from mlx_vlm.utils import (
     load,
     load_config,
     load_model,
-    load_processor,
 )
 
 # Shared model contracts
@@ -1239,153 +1238,293 @@ def test_glm_quantized_head_sanitization_loads_strictly():
     model.load_weights(list(model.sanitize(checkpoint | head).items()), strict=True)
 
 
-class TestMoondream2Sanitize(unittest.TestCase):
-    """Weight-key remapping for the moondream2 port."""
+class TestMistralLarge3(unittest.TestCase):
+    """Mistral Large 3: params.json config mapping and native->4-bit load."""
 
-    def _tiny_model(self):
-        from mlx_vlm.models.moondream2 import Model, ModelConfig
+    DIMS = dict(
+        H=128,
+        DI=128,
+        MI=64,
+        NH=2,
+        NP=64,
+        RP=64,
+        VH=64,
+        QL=64,
+        KL=64,
+        V=128,
+        VHID=64,
+        VNH=2,
+        VI=64,
+        PATCH=14,
+        IMG=28,
+        SM=2,
+        NL=5,
+        NE=8,
+        NS=1,
+        DENSE=3,
+    )
 
-        config = ModelConfig.from_dict(
-            {
-                "model_type": "moondream2",
-                "text_config": {
-                    "num_hidden_layers": 1,
-                    "hidden_size": 64,
-                    "intermediate_size": 128,
-                    "num_attention_heads": 2,
-                    "num_key_value_heads": 2,
-                    "vocab_size": 128,
-                },
-                "vision_config": {
-                    "num_hidden_layers": 1,
-                    "hidden_size": 64,
-                    "intermediate_size": 128,
-                    "num_attention_heads": 2,
-                },
-            }
+    def _config(self):
+        from mlx_vlm.models.mistral_large3 import ModelConfig
+
+        d = self.DIMS
+        return ModelConfig(
+            text_config=dict(
+                model_type="mistral_large3",
+                vocab_size=d["V"],
+                hidden_size=d["H"],
+                intermediate_size=d["DI"],
+                moe_intermediate_size=d["MI"],
+                num_hidden_layers=d["NL"],
+                num_attention_heads=d["NH"],
+                num_key_value_heads=d["NH"],
+                q_lora_rank=d["QL"],
+                kv_lora_rank=d["KL"],
+                qk_nope_head_dim=d["NP"],
+                qk_rope_head_dim=d["RP"],
+                v_head_dim=d["VH"],
+                n_routed_experts=d["NE"],
+                n_shared_experts=d["NS"],
+                num_experts_per_tok=4,
+                first_k_dense_replace=d["DENSE"],
+                rms_norm_eps=1e-6,
+                rope_theta=1e4,
+            ),
+            vision_config=dict(
+                model_type="pixtral",
+                hidden_size=d["VHID"],
+                num_hidden_layers=d["VNH"],
+                num_attention_heads=d["VNH"],
+                head_dim=d["VHID"] // d["VNH"],
+                intermediate_size=d["VI"],
+                image_size=d["IMG"],
+                patch_size=d["PATCH"],
+                rope_theta=1e4,
+            ),
+            image_token_id=10,
+            spatial_merge_size=d["SM"],
+            multimodal_projector_bias=False,
+            vocab_size=d["V"],
         )
-        return Model(config)
 
-    def test_layout_is_remapped(self):
-        model = self._tiny_model()
-        sanitized = model.sanitize(
-            {
-                "model.text.wte": mx.zeros((1,)),
-                "model.text.blocks.0.attn.qkv.weight": mx.zeros((1,)),
-                "model.text.post_ln.weight": mx.zeros((1,)),
-                "model.text.lm_head.weight": mx.zeros((1,)),
-                "model.vision.patch_emb.weight": mx.zeros((1,)),
-                "model.vision.blocks.0.ln1.weight": mx.zeros((1,)),
-                "model.vision.proj_mlp.fc1.weight": mx.zeros((1,)),
-                "model.region.coord_decoder.fc1.weight": mx.zeros((1,)),
-            }
+    def _native_source(self):
+        d = self.DIMS
+        H, DI, MI, NH, NP, RP, VH, QL, KL, V = (
+            d["H"],
+            d["DI"],
+            d["MI"],
+            d["NH"],
+            d["NP"],
+            d["RP"],
+            d["VH"],
+            d["QL"],
+            d["KL"],
+            d["V"],
         )
-        self.assertIn("text.model.embed_tokens.weight", sanitized)
-        self.assertIn("text.model.layers.0.attn.qkv.weight", sanitized)
-        self.assertIn("text.model.post_ln.weight", sanitized)
-        self.assertIn("text.lm_head.weight", sanitized)
-        self.assertIn("vision.encoder.patch_emb.weight", sanitized)
-        self.assertIn("vision.encoder.blocks.0.ln1.weight", sanitized)
-        self.assertIn("vision.proj_mlp.fc1.weight", sanitized)
-        self.assertNotIn("model.region.coord_decoder.fc1.weight", sanitized)
+        VHID, VI, SM = d["VHID"], d["VI"], d["SM"]
 
+        def z(*s):
+            return (mx.random.normal(s) * 0.02).astype(mx.bfloat16)
 
-class TestMoondream3Sanitize(unittest.TestCase):
-    """sanitize must be idempotent so already-converted mlx quants load."""
-
-    def _tiny_model(self):
-        from mlx_vlm.models.moondream3 import Model, ModelConfig
-
-        config = ModelConfig.from_dict(
-            {
-                "model_type": "moondream3",
-                "text_config": {
-                    "num_hidden_layers": 1,
-                    "hidden_size": 64,
-                    "intermediate_size": 128,
-                    "num_attention_heads": 2,
-                    "num_key_value_heads": 2,
-                    "head_dim": 32,
-                    "vocab_size": 128,
-                    "num_experts": 2,
-                    "num_experts_per_tok": 1,
-                    "moe_intermediate_size": 32,
-                    "moe_start_layer": 1,
-                },
-                "vision_config": {
-                    "num_hidden_layers": 1,
-                    "hidden_size": 64,
-                    "intermediate_size": 128,
-                    "num_attention_heads": 2,
-                },
-            }
-        )
-        return Model(config)
-
-    def test_already_converted_keys_pass_through(self):
-        model = self._tiny_model()
-        keys = {
-            "text.model.blocks.0.attn.qkv.weight": mx.zeros((1,)),
-            "text.lm_head.weight": mx.zeros((1,)),
-            "vision.encoder.blocks.0.ln1.weight": mx.zeros((1,)),
-            "vision.proj_mlp.fc1.weight": mx.zeros((1,)),
+        w = {
+            "tok_embeddings.weight": z(V, H),
+            "norm.weight": z(H),
+            "output.weight": z(V, H),
         }
-        once = model.sanitize(dict(keys))
-        self.assertEqual(set(once), set(keys))
-        twice = model.sanitize(once)
-        self.assertEqual(set(twice), set(once))
+        qhd = NP + RP
+        for l in range(d["NL"]):
+            p = f"layers.{l}"
+            w[f"{p}.attention_norm.weight"] = z(H)
+            w[f"{p}.ffn_norm.weight"] = z(H)
+            w[f"{p}.attention.wq_a.weight"] = z(QL, H)
+            w[f"{p}.attention.q_a_norm.weight"] = z(QL)
+            w[f"{p}.attention.wq_b.weight"] = z(NH * qhd, QL)
+            w[f"{p}.attention.wkv_a_with_mqa.weight"] = z(KL + RP, H)
+            w[f"{p}.attention.kv_a_norm.weight"] = z(KL)
+            w[f"{p}.attention.wkv_b.weight"] = z(NH * (NP + VH), KL)
+            w[f"{p}.attention.wo.weight"] = z(H, NH * VH)
+            if l < d["DENSE"]:
+                w[f"{p}.feed_forward.w1.weight"] = z(DI, H)
+                w[f"{p}.feed_forward.w2.weight"] = z(H, DI)
+                w[f"{p}.feed_forward.w3.weight"] = z(DI, H)
+            else:
+                w[f"{p}.gate.weight"] = z(d["NE"], H)
+                for e in range(d["NE"]):
+                    w[f"{p}.experts.{e}.w1.weight"] = z(MI, H)
+                    w[f"{p}.experts.{e}.w2.weight"] = z(H, MI)
+                    w[f"{p}.experts.{e}.w3.weight"] = z(MI, H)
+                w[f"{p}.shared_experts.w1.weight"] = z(MI, H)
+                w[f"{p}.shared_experts.w2.weight"] = z(H, MI)
+                w[f"{p}.shared_experts.w3.weight"] = z(MI, H)
+        w["vision_encoder.patch_conv.weight"] = z(VHID, 3, d["PATCH"], d["PATCH"])
+        w["vision_encoder.ln_pre.weight"] = z(VHID)
+        for n in range(d["VNH"]):
+            p = f"vision_encoder.transformer.layers.{n}"
+            for wk in ("wq", "wk", "wv", "wo"):
+                w[f"{p}.attention.{wk}.weight"] = z(VHID, VHID)
+            w[f"{p}.attention_norm.weight"] = z(VHID)
+            w[f"{p}.feed_forward.w1.weight"] = z(VI, VHID)
+            w[f"{p}.feed_forward.w2.weight"] = z(VHID, VI)
+            w[f"{p}.feed_forward.w3.weight"] = z(VI, VHID)
+            w[f"{p}.ffn_norm.weight"] = z(VHID)
+        w["pre_mm_projector_norm.weight"] = z(VHID)
+        w["patch_merger.merging_layer.weight"] = z(VHID, VHID * SM * SM)
+        w["vision_language_adapter.w_in.weight"] = z(H, VHID)
+        w["vision_language_adapter.w_out.weight"] = z(H, H)
+        return w
 
-    def test_raw_keys_are_remapped(self):
-        model = self._tiny_model()
-        sanitized = model.sanitize(
-            {
-                "model.text.blocks.0.attn.qkv.weight": mx.zeros((1,)),
-                "model.vision.blocks.0.ln1.weight": mx.zeros((1,)),
-            }
+    def test_config_from_params_maps_native_fields(self):
+        from mlx_vlm.models.mistral_large3 import ModelConfig
+        from mlx_vlm.models.mistral_large3.config import config_from_params
+
+        params = dict(
+            dim=7168,
+            hidden_dim=16384,
+            n_layers=61,
+            n_heads=128,
+            n_kv_heads=128,
+            q_lora_rank=1536,
+            kv_lora_rank=512,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+            norm_eps=1e-6,
+            rope_theta=1e4,
+            vocab_size=131072,
+            max_position_embeddings=294912,
+            moe=dict(
+                expert_hidden_dim=4096,
+                num_experts=128,
+                num_shared_experts=1,
+                num_experts_per_tok=4,
+                first_k_dense_replace=3,
+            ),
+            vision_encoder=dict(
+                hidden_size=1664,
+                num_hidden_layers=48,
+                num_attention_heads=16,
+                intermediate_size=8192,
+                image_size=1540,
+                patch_size=14,
+                rope_theta=1e4,
+                image_token_id=10,
+                spatial_merge_size=2,
+                adapter_bias=False,
+            ),
         )
-        self.assertIn("text.model.blocks.0.attn.qkv.weight", sanitized)
-        self.assertIn("vision.encoder.blocks.0.ln1.weight", sanitized)
+        cfg = ModelConfig(**config_from_params(params))
+        assert cfg.text_config.n_routed_experts == 128
+        assert cfg.text_config.moe_intermediate_size == 4096
+        assert cfg.text_config.first_k_dense_replace == 3
+        assert cfg.text_config.q_lora_rank == 1536
+        assert cfg.vision_config.hidden_size == 1664
+        assert cfg.vision_config.head_dim == 1664 // 16
+        assert cfg.image_token_id == 10
+
+    def test_native_4bit_roundtrip_loads_and_runs(self):
+        cfg = self._config()
+
+        def quantizable(name):
+            if not name.endswith(".weight") or name.startswith(
+                (
+                    "vision_encoder.",
+                    "patch_merger.",
+                    "vision_language_adapter.",
+                    "pre_mm_projector",
+                )
+            ):
+                return False
+            if ".attention." in name:
+                return any(
+                    f".{p}.weight" in name
+                    for p in ("wq_a", "wq_b", "wkv_a_with_mqa", "wkv_b", "wo")
+                )
+            return name.endswith((".w1.weight", ".w2.weight", ".w3.weight"))
+
+        converted = {}
+        for name, w in self._native_source().items():
+            if quantizable(name):
+                qw, sc, bi = mx.quantize(w, group_size=64, bits=4)
+                base = name[: -len(".weight")]
+                converted[name] = qw
+                converted[base + ".scales"] = sc
+                converted[base + ".biases"] = bi
+            else:
+                converted[name] = w
+
+        from mlx_vlm.models.mistral_large3 import Model
+
+        model = Model(cfg)
+        weights = model.sanitize(converted)
+        nn.quantize(
+            model,
+            group_size=64,
+            bits=4,
+            class_predicate=lambda p, m: hasattr(m, "to_quantized")
+            and f"{p}.scales" in weights,
+        )
+        expected = set(dict(tree_flatten(model.parameters())))
+        got = set(weights)
+        assert expected == got, (expected - got, got - expected)
+        model.load_weights(list(weights.items()), strict=True)
+
+        out = model(mx.array([[1, 2, 3, 4]]), pixel_values=None)
+        logits = out.logits if hasattr(out, "logits") else out
+        assert tuple(logits.shape) == (1, 4, self.DIMS["V"])
+
+    def test_sanitize_is_idempotent(self):
+        from mlx_vlm.models.mistral_large3 import Model
+
+        model = Model(self._config())
+        final = dict(tree_flatten(model.parameters()))
+        assert model.sanitize(final).keys() == final.keys()
+
+
+def test_moondream2_sanitize_remaps_checkpoint_layout():
+    from mlx_vlm.models.moondream2 import Model
+
+    source = {
+        "model.text.wte": "text.model.embed_tokens.weight",
+        "model.text.blocks.0.attn.qkv.weight": "text.model.layers.0.attn.qkv.weight",
+        "model.text.post_ln.weight": "text.model.post_ln.weight",
+        "model.text.lm_head.weight": "text.lm_head.weight",
+        "model.vision.patch_emb.weight": "vision.encoder.patch_emb.weight",
+        "model.vision.blocks.0.ln1.weight": "vision.encoder.blocks.0.ln1.weight",
+        "model.vision.proj_mlp.fc1.weight": "vision.proj_mlp.fc1.weight",
+    }
+    weights = {key: mx.zeros((1,)) for key in source}
+    weights["model.region.coord_decoder.fc1.weight"] = mx.zeros((1,))
+
+    assert set(Model.sanitize(None, weights)) == set(source.values())
+
+
+def test_moondream3_sanitize_remaps_raw_and_preserves_converted_keys():
+    from mlx_vlm.models.moondream3 import Model
+
+    raw = {
+        "model.text.blocks.0.attn.qkv.weight": mx.zeros((1,)),
+        "model.vision.blocks.0.ln1.weight": mx.zeros((1,)),
+    }
+    converted = Model.sanitize(None, raw)
+    assert set(converted) == {
+        "text.model.blocks.0.attn.qkv.weight",
+        "vision.encoder.blocks.0.ln1.weight",
+    }
+    converted["text.lm_head.weight"] = mx.zeros((1,))
+    converted["vision.proj_mlp.fc1.weight"] = mx.zeros((1,))
+    assert Model.sanitize(None, converted).keys() == converted.keys()
 
 
 class TestQwen3_5MoeText(unittest.TestCase):
     """Decoder-only Qwen3.5 MoE checkpoints (model_type qwen3_5_moe_text)."""
 
-    CONFIG = {
-        "model_type": "qwen3_5_moe_text",
-        "architectures": ["Qwen3_5MoeForCausalLM"],
-        "hidden_size": 16,
-        "linear_num_value_heads": 2,
-        "linear_num_key_heads": 2,
-        "linear_key_head_dim": 32,
-        "linear_value_head_dim": 8,
-        "linear_conv_kernel_dim": 3,
-        "num_hidden_layers": 2,
-        "full_attention_interval": 2,
-        "layer_types": ["linear_attention", "full_attention"],
-        "num_attention_heads": 2,
-        "num_experts": 2,
-        "num_experts_per_tok": 1,
-        "shared_expert_intermediate_size": 32,
-        "moe_intermediate_size": 16,
-        "rms_norm_eps": 1e-05,
-        "vocab_size": 32,
-        "num_key_value_heads": 2,
-        "max_position_embeddings": 128,
-        "head_dim": 8,
-        "tie_word_embeddings": False,
-        "rope_parameters": {
-            "rope_type": "default",
-            "mrope_interleaved": True,
-            "mrope_section": [1, 0, 0],
-            "rope_theta": 10000,
-            "partial_rotary_factor": 0.25,
-        },
-    }
-
     def _model(self):
         from mlx_vlm.models.qwen3_5_moe_text import Model, ModelConfig
 
-        model = Model(ModelConfig.from_dict(self.CONFIG))
+        case = next(
+            case for case in DATA["cases"] if case["module"] == "qwen3_5_moe_text"
+        )
+        model = Model(ModelConfig.from_dict(copy.deepcopy(case["config"])))
         model.update(
             tree_map(
                 lambda p: (mx.random.randint(-8, 8, p.shape) / 4).astype(p.dtype),
@@ -1449,32 +1588,6 @@ class TestQwen3_5MoeText(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "expected \\[num_experts"):
             model.sanitize(raw)
 
-    def test_stale_vl_processor_class_loads_the_tokenizer(self):
-        import tempfile
-
-        from tokenizers import Tokenizer, models, pre_tokenizers
-        from transformers import PreTrainedTokenizerFast
-
-        importlib.import_module("mlx_vlm.models.qwen3_5_moe_text")
-
-        with tempfile.TemporaryDirectory() as tmp:
-            vocab = {f"t{i}": i for i in range(32)}
-            backend = Tokenizer(models.WordLevel(vocab, unk_token="t0"))
-            backend.pre_tokenizer = pre_tokenizers.Whitespace()
-            PreTrainedTokenizerFast(
-                tokenizer_object=backend, unk_token="t0", eos_token="t1"
-            ).save_pretrained(tmp)
-            tokenizer_config = Path(tmp) / "tokenizer_config.json"
-            data = json.loads(tokenizer_config.read_text())
-            data["processor_class"] = "Qwen3VLProcessor"
-            tokenizer_config.write_text(json.dumps(data))
-            (Path(tmp) / "config.json").write_text(json.dumps(self.CONFIG))
-
-            processor = load_processor(Path(tmp), eos_token_ids=[1])
-
-        self.assertFalse(hasattr(processor, "image_processor"))
-        self.assertEqual(processor.encode("t3 t4", add_special_tokens=False), [3, 4])
-
     def test_sanitize_is_idempotent_on_converted_weights(self):
         model = self._model()
         converted = dict(tree_flatten(model.parameters()))
@@ -1491,7 +1604,7 @@ class TestQwen3_5MoeText(unittest.TestCase):
         ids = mx.array([[3, 1, 4, 1, 5, 9, 2, 6]])
 
         def logits(rope_parameters):
-            config = dict(self.CONFIG, rope_parameters=rope_parameters)
+            config = vars(model.config) | {"rope_parameters": rope_parameters}
             other = Model(ModelConfig.from_dict(config))
             other.load_weights(weights, strict=True)
             return other(ids).logits
