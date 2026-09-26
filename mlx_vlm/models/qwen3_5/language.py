@@ -13,7 +13,7 @@ from ..base import (
     create_attention_mask,
     scaled_dot_product_attention,
 )
-from ..cache import ArraysCache, KVCache
+from ..cache import ArraysCache, BatchKVCache, KVCache
 from ..rope_utils import MRoPERotaryEmbedding
 from ..rope_utils import apply_multimodal_rotary_pos_emb as _apply_mrope
 from .config import ModelConfig, TextConfig
@@ -105,6 +105,22 @@ def _is_single_row_batch_cache(cache_entry) -> bool:
         and left_padding.size == 1
         and not hasattr(cache_entry, "bits")
     )
+
+
+def _borrow_singleton_kv_cache(cache_entry):
+    """Borrow an ordinary unpadded batch row without discarding spare capacity."""
+    if (
+        type(cache_entry) is not BatchKVCache
+        or cache_entry.keys is None
+        or cache_entry.keys.shape[0] != 1
+        or cache_entry.left_padding.tolist() != [0]
+        or cache_entry._right_padding is not None
+    ):
+        return None
+    row = KVCache()
+    row.keys, row.values = cache_entry.keys, cache_entry.values
+    row.offset = cache_entry._idx
+    return row
 
 
 def _pad_row_time(x: mx.array, pad: int, target_length: int) -> mx.array:
@@ -1202,11 +1218,21 @@ class Qwen3_5Model(nn.Module):
             and _is_single_row_batch_cache(fa_cache)
         ):
             row_cache = []
-            for cache_entry in cache:
+            borrowed = {}
+            for i, cache_entry in enumerate(cache):
                 if cache_entry is None:
                     row_cache.append(None)
                 elif _is_single_row_batch_cache(cache_entry):
-                    row_cache.append(_extract_row_cache(cache_entry, 0))
+                    row = (
+                        _borrow_singleton_kv_cache(cache_entry)
+                        if h.shape[1] == 1 and capture_layer_ids is None
+                        else None
+                    )
+                    if row is not None:
+                        borrowed[i] = cache_entry
+                        row_cache.append(row)
+                    else:
+                        row_cache.append(_extract_row_cache(cache_entry, 0))
                 else:
                     row_cache.append(cache_entry)
 
@@ -1219,7 +1245,15 @@ class Qwen3_5Model(nn.Module):
             for i, cache_entry in enumerate(row_cache):
                 if cache[i] is None or cache_entry is None:
                     continue
-                if hasattr(cache[i].__class__, "merge"):
+                if i in borrowed:
+                    # Keep the original batch object, including its metadata.
+                    # extract()/merge() would copy the entire used prefix and
+                    # trim its allocation on every surviving decode token.
+                    batch = borrowed[i]
+                    batch.keys, batch.values = cache_entry.keys, cache_entry.values
+                    batch.offset += cache_entry.offset - batch._idx
+                    batch._idx = cache_entry.offset
+                elif hasattr(cache[i].__class__, "merge"):
                     cache[i] = cache[i].__class__.merge([cache_entry])
             return row_out
 
