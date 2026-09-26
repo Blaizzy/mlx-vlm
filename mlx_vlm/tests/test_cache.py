@@ -35,7 +35,7 @@ from mlx_vlm.apc_adapters import cache_memory_components
 from mlx_vlm.apc_adapters import cache_memory_components as memory_components
 from mlx_vlm.apc_adapters import clone_cache_entry
 from mlx_vlm.generate import generate_step, maybe_quantize_kv_cache
-from mlx_vlm.generate.ar import PromptProcessingBatch, _extend_cache, _make_cache
+from mlx_vlm.generate.ar import PromptProcessingBatch, _extend_cache, make_cache
 from mlx_vlm.models import cache as C
 from mlx_vlm.models.base import (
     InputEmbeddingsFeatures,
@@ -81,6 +81,14 @@ from mlx_vlm.turboquant import (
     resolve_kv_bits,
 )
 from mlx_vlm.vision_cache import VisionFeatureCache
+
+
+def test_make_cache_is_publicly_exported():
+    gen = importlib.import_module("mlx_vlm.generate")
+
+    assert "make_cache" in gen.__all__
+    assert gen.make_cache is make_cache
+
 
 # Cache lifecycle
 
@@ -2198,7 +2206,7 @@ def test_warm_cache_quantization_policy(scheme, managers):
     manager.release(blocks)
     blocks, count = manager.lookup_prefix(tokens)
     assert count == len(tokens)
-    live = _make_cache(
+    live = make_cache(
         NS(layers=[NS()] * 4),
         [0],
         kv_bits=float(bits),
@@ -2641,9 +2649,9 @@ def test_hybrid_cache_meta_state_round_trips_policy():
 def test_batch_generator_accepts_scheme_overrides():
     import inspect
 
-    from mlx_vlm.generate.ar import BatchGenerator, _make_cache
+    from mlx_vlm.generate.ar import BatchGenerator, make_cache
 
-    for target in (BatchGenerator.__init__, _make_cache):
+    for target in (BatchGenerator.__init__, make_cache):
         params = inspect.signature(target).parameters
         assert "kv_key_scheme" in params
         assert "kv_value_scheme" in params
@@ -2657,7 +2665,7 @@ def test_batch_cache_rejects_mixed_schemes(builder, message):
 
     with pytest.raises(NotImplementedError, match=message):
         if builder == "live":
-            _make_cache(
+            make_cache(
                 NS(make_cache=lambda: [KVCache()]),
                 [0],
                 kv_bits=8,

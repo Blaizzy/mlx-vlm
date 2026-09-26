@@ -17,7 +17,7 @@ import pytest
 from mlx.utils import tree_flatten
 
 import mlx_vlm.speculative.utils as speculative
-from mlx_vlm.generate.ar import _make_cache, generate_step
+from mlx_vlm.generate.ar import generate_step, make_cache
 from mlx_vlm.models import fast_ops
 from mlx_vlm.models import quantized_verifier as quantized
 from mlx_vlm.models.base import InputEmbeddingsFeatures, LanguageModelOutput
@@ -354,7 +354,7 @@ def test_verify_commit_matches_decode(family, batch, dtype):
         ]
     )
     model.eval()
-    reference, actual = [_make_cache(model, [0] * batch) for _ in range(2)]
+    reference, actual = [make_cache(model, [0] * batch) for _ in range(2)]
     prefix = mx.broadcast_to((mx.arange(19)[None] % 30) + 1, (batch, 19))
     for cache in (reference, actual):
         mx.eval(model(prefix, cache=cache).logits)
@@ -1389,7 +1389,7 @@ def test_chunked_prefill_retains_all_drafter_features(batch):
     model.eval()
     tokens = mx.array([[1, 2, 3, 4, 5, 6, 7]] * batch)
     drafter = NS(config=NS(target_layer_ids=[0]))
-    cache = _make_cache(model, [0] * batch)
+    cache = make_cache(model, [0] * batch)
     expected = mx.concatenate(
         [
             model(
