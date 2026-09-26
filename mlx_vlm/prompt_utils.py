@@ -468,7 +468,8 @@ class MessageFormatter:
             content = image_tokens + content if image_first else content + image_tokens
 
         if role == "user" and not skip_audio_token and num_audios > 0:
-            content = content + [MessageBuilder.audio_message()] * num_audios
+            audio_tokens = [MessageBuilder.audio_message()] * num_audios
+            content = audio_tokens + content if image_first else content + audio_tokens
 
         return {"role": role, "content": content}
 
@@ -1102,5 +1103,8 @@ def apply_chat_template(
     # Some models only need the last message
     if model_type in ["paligemma", "florence2", "falcon_ocr"]:
         return messages[-1]
+
+    if model_type == "qwen3_omni_moe" and "enable_thinking" not in kwargs:
+        kwargs["enable_thinking"] = True
 
     return get_chat_template(processor, messages, add_generation_prompt, **kwargs)

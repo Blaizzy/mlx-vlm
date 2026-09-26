@@ -1604,6 +1604,7 @@ def test_extract_text_from_content(content, expected):
     [
         ("nemotron_h_nano_omni", "image-audio"),
         ("nemotronh_nano_omni_reasoning_v3", "image-audio"),
+        ("qwen3_omni_moe", "qwen-image-audio"),
         ("gemma4_unified", "video-audio"),
         ("prism_hadamard_qwen35", "image-video"),
         ("step3p7", "patch"),
@@ -1621,6 +1622,7 @@ def test_prompt_media_format(family, kind):
     text_part = dict(type="text", text=text, content=text)
     expected = {
         "image-audio": [dict(type="image"), text_part, dict(type="audio")],
+        "qwen-image-audio": [dict(type="audio"), dict(type="image"), text_part],
         "video-audio": [
             dict(type="video", video="clip.mp4", max_pixels=224 * 224, fps=1),
             dict(type="audio"),
@@ -1908,6 +1910,18 @@ def test_apply_chat_template_preserves_explicit_thinking_enabled():
 
     assert processor.kwargs["enable_thinking"] is True
     assert result.endswith("<think>\n")
+
+
+def test_qwen3_omni_enables_thinking_by_default():
+    processor = MagicMock(chat_template="{{ messages }}")
+    processor.apply_chat_template.return_value = "prompt"
+
+    result = apply_chat_template(
+        processor, {"model_type": "qwen3_omni_moe"}, "Describe this image."
+    )
+
+    assert result == "prompt"
+    assert processor.apply_chat_template.call_args.kwargs["enable_thinking"] is True
 
 
 def test_apply_chat_template_maps_enable_thinking_for_thinking_mode_templates():

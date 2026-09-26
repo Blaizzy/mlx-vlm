@@ -37,6 +37,7 @@ def _get_feat_extract_output_lengths(input_lengths):
 
 
 class Qwen3OmniMoeProcessor(ProcessorMixin):
+    supports_multiple_audio = True
     attributes = [
         "image_processor",
         "video_processor",
@@ -82,6 +83,7 @@ class Qwen3OmniMoeProcessor(ProcessorMixin):
         images: Optional[ImageInput] = None,
         videos=None,
         audio=None,
+        padding_side: str = "left",
         **kwargs,
     ) -> BatchFeature:
         if text is None:
@@ -101,7 +103,8 @@ class Qwen3OmniMoeProcessor(ProcessorMixin):
                     "truncation",
                     "return_attention_mask",
                 ):
-                    audio_kwargs[k] = kwargs.pop(k)
+                    audio_kwargs[k] = kwargs[k]
+            kwargs.pop("sampling_rate", None)
             audio_inputs = self.feature_extractor(audio, **audio_kwargs)
             audio_inputs["feature_attention_mask"] = audio_inputs.pop(
                 "attention_mask", None
@@ -154,7 +157,7 @@ class Qwen3OmniMoeProcessor(ProcessorMixin):
         )
 
         return_tensors = kwargs.pop("return_tensors", None)
-        texts_inputs = self.tokenizer(text, **kwargs)
+        texts_inputs = self.tokenizer(text, padding_side=padding_side, **kwargs)
 
         return BatchFeature(
             data=to_mlx(
