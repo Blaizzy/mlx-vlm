@@ -709,7 +709,11 @@ class DeepseekV41Attention(nn.Module):
             )
         return pool, idxs
 
-    def __call__(self, x: mx.array, start_pos: int, cache: "DeepseekV41Cache"):
+    def __call__(self, x: mx.array, cache):
+        out = cache.map(self._attention, x)
+        return mx.zeros_like(x) if out is None else out
+
+    def _attention(self, cache: "DeepseekV41Cache", x: mx.array):
         """Sparse attention over the pooled compressor cache, or the sliding window alone.
 
         The window cache is float32 and the queries are the model dtype; the cast
@@ -717,9 +721,7 @@ class DeepseekV41Attention(nn.Module):
         fused attention path. It is lossless: the cache holds fake-quantized fp8
         values, whose mantissa and exponent both fit the narrower type.
         """
-        if isinstance(cache, BatchDeepseekV41Cache):
-            out = cache.map(lambda row, values: self(values, row.offset, row), x)
-            return mx.zeros_like(x) if out is None else out
+        start_pos = cache.offset
         batch, seqlen = x.shape[0], x.shape[1]
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr).reshape(batch, seqlen, self.n_heads, self.head_dim)
@@ -982,7 +984,6 @@ class DeepseekV41Block(nn.Module):
     def __call__(
         self,
         h: mx.array,
-        start_pos: int,
         pre_mix: mx.array,
         image_mask: Optional[mx.array],
         cache: "DeepseekV41Cache",
@@ -993,7 +994,7 @@ class DeepseekV41Block(nn.Module):
         )
         x = self.hc_pre(h, pre_mix)
         x = self.attn_norm(x)
-        x = self.attn(x, start_pos, cache)
+        x = self.attn(x, cache)
         x = hc_expand(x, residual, attn_post, attn_comb)
 
         residual = x
@@ -1044,6 +1045,12 @@ class DeepseekV41Cache:
         self.score_state = [None] * n_layers
         self.engram = None
         self.reset_handoff()
+
+    def map(self, function, *arrays):
+        return function(self, *arrays)
+
+    def advance(self, width):
+        self.offset += width
 
     def reset_handoff(self):
         """Clear the cross-layer handoff.
@@ -1439,8 +1446,6 @@ class LanguageModel(nn.Module):
                 len(self.layers), [l.attn.compress_ratio for l in self.layers]
             )
         )
-        batched = isinstance(entry, BatchDeepseekV41Cache)
-        start_pos = 0 if batched else entry.offset
         if input_ids is None:
             input_ids = inputs
         if image_mask is None and input_ids is not None:
@@ -1459,18 +1464,13 @@ class LanguageModel(nn.Module):
         if engram_hashes is None and input_ids is not None:
             self._ensure_engram_hash()
             if self.engram_hash is not None:
-                if batched:
-                    engram_hashes = entry.map(
-                        lambda row, ids, mask: self.engram_hash(
-                            ids, row.offset, row, token_mask=mask
-                        ),
-                        input_ids,
-                        engram_mask,
-                    )
-                else:
-                    engram_hashes = self.engram_hash(
-                        input_ids, start_pos, entry, token_mask=engram_mask
-                    )
+                engram_hashes = entry.map(
+                    lambda row, ids, mask: self.engram_hash(
+                        ids, row.offset, row, token_mask=mask
+                    ),
+                    input_ids,
+                    engram_mask,
+                )
         main_hiddens = []
         capture_ids = (
             self.target_layer_ids if capture_layer_ids is None else capture_layer_ids
@@ -1485,12 +1485,9 @@ class LanguageModel(nn.Module):
                 )
             if i in capture_ids:
                 main_hiddens.append(h.mean(axis=2))
-            h, pre_mix = layer(h, start_pos, pre_mix, image_mask, entry)
+            h, pre_mix = layer(h, pre_mix, image_mask, entry)
         h = DeepseekV41Block.hc_pre(h, pre_mix)
         logits = self.head(self.norm(h))
-        if batched:
-            entry.advance(seqlen)
-        else:
-            entry.offset = start_pos + seqlen
+        entry.advance(seqlen)
         hidden = [mx.concatenate(main_hiddens, axis=-1)] if main_hiddens else None
         return LanguageModelOutput(logits=logits, hidden_states=hidden)
