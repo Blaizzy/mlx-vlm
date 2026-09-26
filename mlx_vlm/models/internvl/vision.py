@@ -2,6 +2,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import interpolate
+from ..internvl_chat.vision import MLP, check_array_shape
 from .config import VisionConfig
 
 
@@ -116,17 +117,6 @@ class Attention(nn.Module):
         return self.projection_layer(output)
 
 
-class MLP(nn.Module):
-    def __init__(self, config: VisionConfig):
-        super().__init__()
-        self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size)
-        self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size)
-        self.activation = nn.GELU(approx="precise")
-
-    def __call__(self, hidden_states):
-        return self.fc2(self.activation(self.fc1(hidden_states)))
-
-
 class EncoderLayer(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
@@ -168,21 +158,15 @@ class VisionModel(nn.Module):
         self.model_type = config.model_type
         self.embeddings = Embeddings(config)
         self.encoder = Encoder(config)
-        self.layernorm = (
-            nn.Identity()
-            if config.use_mean_pooling
-            else nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        )
 
     def __call__(self, pixel_values, output_hidden_states=False):
         hidden_states = self.embeddings(pixel_values)
-        hidden_states, states = self.encoder(hidden_states, output_hidden_states)
-        return self.layernorm(hidden_states), states
+        return self.encoder(hidden_states, output_hidden_states)
 
     def sanitize(self, weights):
         for key in list(weights):
             if key.endswith("patch_embeddings.projection.weight"):
                 weight = weights[key]
-                if weight.shape[1] <= 4:
+                if not check_array_shape(weight):
                     weights[key] = weight.transpose(0, 2, 3, 1)
         return weights

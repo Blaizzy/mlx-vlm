@@ -53,8 +53,7 @@ class Model(nn.Module):
             self.vision_tower.embeddings.patch_embeddings.projection.weight.dtype
         )
         image_features, _ = self.vision_tower(pixel_values)
-        if self.config.vision_feature_select_strategy == "default":
-            image_features = image_features[:, 1:]
+        image_features = image_features[:, 1:]
         image_features = pixel_shuffle(image_features, self.config.downsample_ratio)
         image_features = self.multi_modal_projector(image_features).reshape(
             -1, inputs_embeds.shape[-1]
@@ -91,7 +90,3 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.language_model.layers
-
-
-VisionModel = VisionModel
-LanguageModel = LanguageModel

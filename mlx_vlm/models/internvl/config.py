@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from typing import List, Optional
 
 from ..base import BaseModelConfig
 from ..qwen3.config import ModelConfig as TextConfig
@@ -24,11 +23,6 @@ class VisionConfig(BaseModelConfig):
     norm_type: str = "layer_norm"
     attention_bias: bool = True
     use_qk_norm: bool = False
-    use_absolute_position_embeddings: bool = True
-    use_mean_pooling: bool = True
-    hidden_dropout_prob: float = 0.0
-    attention_dropout: float = 0.0
-    projection_dropout: float = 0.0
 
     @classmethod
     def from_dict(cls, params):
@@ -45,7 +39,3 @@ class ModelConfig(BaseModelConfig):
     model_type: str
     downsample_ratio: float = 0.5
     image_token_id: int = 151671
-    projector_hidden_act: str = "gelu"
-    vision_feature_layer: int = -1
-    vision_feature_select_strategy: str = "default"
-    eos_token_id: Optional[List[int]] = None
