@@ -628,12 +628,10 @@ def test_auto_processor_routes_to_custom_loader(
         assert (
             AutoProcessor.from_pretrained(tmp_path, trust_remote_code=False) is sentinel
         )
-    loader.assert_called_once_with(tmp_path, trust_remote_code=False)
-    if model_type in ("hunyuan_vl", "qwen4_exp"):
-        assert isinstance(AutoProcessor.from_pretrained(tmp_path), cls)
-    else:
-        with pytest.raises(ValueError, match="Unrecognized processing class"):
-            AutoProcessor.from_pretrained(tmp_path)
+        loader.assert_called_once_with(tmp_path, trust_remote_code=False)
+        loader.reset_mock()
+        assert AutoProcessor.from_pretrained(tmp_path) is sentinel
+        loader.assert_called_once_with(tmp_path, trust_remote_code=True)
 
 
 def test_qwen3_5_moe_text_stale_vl_processor_loads_tokenizer(tmp_path):

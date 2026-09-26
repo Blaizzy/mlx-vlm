@@ -1514,7 +1514,10 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
                 decoded = mx.dequantize(
                     packed, expanded, group_size=32, bits=8, mode=mode
                 )
-                expected = mx.power(2.0, scales.astype(mx.float32) - 127)
+                # Keep the reference exact, independent of GPU pow rounding.
+                expected = mx.array([0.25, 0.5, 1.0, 2.0])[
+                    scales.astype(mx.int32) - 125
+                ]
                 expected = mx.repeat(expected, 32, axis=-1)
                 if not rowwise:
                     expected = mx.repeat(expected, 32, axis=0)
