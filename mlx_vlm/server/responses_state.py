@@ -62,6 +62,9 @@ class ThinkingStreamState:
         self.close_markers = tuple(marker for _, marker in self.open_close_markers)
         self.in_thinking = bool(enable_thinking)
         self.thinking_done = False
+        # Newlines right after the close marker are dropped, even when they
+        # arrive in later chunks than the marker itself.
+        self.strip_leading_newlines = False
         self.buffer = ""
 
     def feed(self, text: str, last: bool = False) -> ThinkingStreamDelta:
@@ -86,13 +89,19 @@ class ThinkingStreamState:
                 if before:
                     reasoning.append(before)
 
-                self.buffer = self.buffer[idx + len(marker) :].lstrip("\n")
+                self.buffer = self.buffer[idx + len(marker) :]
                 self.in_thinking = False
                 self.thinking_done = True
+                self.strip_leading_newlines = True
                 thinking_closed = True
                 continue
 
             if self.thinking_done:
+                if self.strip_leading_newlines:
+                    self.buffer = self.buffer.lstrip("\n")
+                    if not self.buffer:
+                        break
+                    self.strip_leading_newlines = False
                 emit, self.buffer = self._split_partial(self.buffer, _CONTENT_MARKERS)
                 emit = _strip_content_markers(emit)
                 if emit:
