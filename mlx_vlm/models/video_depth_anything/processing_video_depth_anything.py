@@ -18,9 +18,16 @@ IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 class VideoDepthProcessor:
     """Preprocess RGB frames (H, W, 3) uint8/float for the depth model."""
 
-    def __init__(self, input_size: int = 518, ensure_multiple_of: int = 14):
+    def __init__(
+        self,
+        input_size: int = 518,
+        ensure_multiple_of: int = 14,
+        use_metal_preprocessing: bool = False,
+    ):
         self.input_size = input_size
         self.ensure_multiple_of = ensure_multiple_of
+        # Opt in to fused RGB preprocessing; keep the OpenCV path by default.
+        self.use_metal_preprocessing = use_metal_preprocessing
 
     @classmethod
     def from_pretrained(cls, path, **kwargs):
@@ -32,7 +39,7 @@ class VideoDepthProcessor:
         if cfg_path.exists():
             config = json.loads(cfg_path.read_text())
         config.update(kwargs)
-        known = ("input_size", "ensure_multiple_of")
+        known = ("input_size", "ensure_multiple_of", "use_metal_preprocessing")
         return cls(**{k: v for k, v in config.items() if k in known})
 
     def target_size(self, height: int, width: int) -> Tuple[int, int]:
@@ -60,6 +67,24 @@ class VideoDepthProcessor:
 
     def preprocess(self, frames: np.ndarray) -> Dict[str, mx.array]:
         """frames: (T, H, W, 3) uint8 RGB -> pixel_values (T, H', W', 3)."""
+        if (
+            getattr(self, "use_metal_preprocessing", False)
+            and getattr(self.preprocess_frame, "__func__", None)
+            is VideoDepthProcessor.preprocess_frame
+        ):
+            from .preprocessing import preprocess_frames
+
+            if len(frames) == 0:
+                raise ValueError("Expected at least one RGB frame")
+            return {
+                "pixel_values": preprocess_frames(
+                    frames,
+                    self.target_size(*frames[0].shape[:2]),
+                    IMAGENET_MEAN,
+                    IMAGENET_STD,
+                )
+            }
+        # A custom per-frame transform must not be bypassed by the fused path.
         out = [self.preprocess_frame(f) for f in frames]
         return {"pixel_values": mx.array(np.stack(out))}
 

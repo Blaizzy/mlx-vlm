@@ -1619,3 +1619,299 @@ class TestQwen3_5MoeText(unittest.TestCase):
             with self.subTest(section=section):
                 explicit = logits(dict(base, mrope_section=section))
                 self.assertTrue(mx.allclose(missing, explicit, atol=1e-5).item())
+
+
+class TestVideoDepthPreprocessing(unittest.TestCase):
+    @staticmethod
+    def _processor(**kwargs):
+        from mlx_vlm.models.video_depth_anything.processing_video_depth_anything import (
+            VideoDepthProcessor,
+        )
+
+        return VideoDepthProcessor(**kwargs)
+
+    def _reference(self, frames, input_size=28):
+        processor = self._processor(input_size=input_size)
+        return np.stack([processor.preprocess_frame(frame) for frame in frames])
+
+    def _assert_close(self, actual, expected):
+        actual = np.array(actual)
+        self.assertEqual(actual.shape, expected.shape)
+        self.assertEqual(actual.dtype, np.float32)
+        self.assertTrue(np.isfinite(actual).all())
+        error = np.abs(actual - expected)
+        self.assertLessEqual(float(error.max()), 2e-5)
+        self.assertLessEqual(float(error.mean()), 1e-6)
+
+    def test_default_preprocessing_uses_opencv(self):
+        from unittest import mock
+
+        import cv2
+
+        frames = np.random.default_rng(2180).integers(
+            0, 256, (3, 17, 23, 3), dtype=np.uint8
+        )
+        expected = self._reference(frames)
+        processor = self._processor(input_size=28)
+        self.assertFalse(processor.use_metal_preprocessing)
+        with mock.patch.object(cv2, "resize", wraps=cv2.resize) as resize:
+            actual = processor.preprocess(frames)["pixel_values"]
+        self.assertEqual(resize.call_count, len(frames))
+        np.testing.assert_array_equal(np.array(actual), expected)
+
+    def test_from_pretrained_reads_local_flag_and_kwargs_override(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.models.video_depth_anything.processing_video_depth_anything import (
+            VideoDepthProcessor,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            default = VideoDepthProcessor.from_pretrained(directory)
+            self.assertFalse(default.use_metal_preprocessing)
+            Path(directory, "preprocessor_config.json").write_text(
+                json.dumps(
+                    {
+                        "input_size": 28,
+                        "use_metal_preprocessing": True,
+                        "processor_class": "VideoDepthProcessor",
+                    }
+                )
+            )
+            configured = VideoDepthProcessor.from_pretrained(directory)
+            self.assertTrue(configured.use_metal_preprocessing)
+            self.assertEqual(configured.input_size, 28)
+            overridden = VideoDepthProcessor.from_pretrained(
+                directory, use_metal_preprocessing=False, input_size=14
+            )
+            self.assertFalse(overridden.use_metal_preprocessing)
+            self.assertEqual(overridden.input_size, 14)
+
+    @unittest.skipUnless(mx.metal.is_available(), "Requires Metal preprocessing")
+    def test_opt_in_preprocess_and_call_do_not_use_opencv_resize(self):
+        from unittest import mock
+
+        import cv2
+
+        frames = np.random.default_rng(2180).integers(
+            0, 256, (2, 17, 23, 3), dtype=np.uint8
+        )
+        expected = self._reference(frames)
+        processor = self._processor(input_size=28, use_metal_preprocessing=True)
+        with mock.patch.object(
+            cv2, "resize", side_effect=AssertionError("Metal path called OpenCV")
+        ):
+            self._assert_close(processor.preprocess(frames)["pixel_values"], expected)
+            self._assert_close(processor(frames)["pixel_values"], expected)
+
+    @unittest.skipUnless(mx.metal.is_available(), "Requires Metal preprocessing")
+    def test_tiny_images_match_opencv(self):
+        processor = self._processor(input_size=28, use_metal_preprocessing=True)
+        for height, width in [(1, 1), (1, 2), (2, 1), (2, 2)]:
+            checker = (np.indices((height, width)).sum(axis=0) % 2 * 255).astype(
+                np.uint8
+            )
+            ramp = np.linspace(0, 255, height * width).reshape(height, width)
+            for name, pattern in [("checkerboard", checker), ("ramp", ramp)]:
+                rgb = np.stack([pattern, 255 - pattern, pattern], axis=-1)
+                for dtype in [np.uint8, np.float32]:
+                    with self.subTest(shape=(height, width), pattern=name, dtype=dtype):
+                        frames = np.stack([rgb, 255 - rgb]).astype(dtype)
+                        if dtype == np.float32:
+                            frames += np.float32(0.125)
+                        self._assert_close(
+                            processor(frames)["pixel_values"], self._reference(frames)
+                        )
+
+    @unittest.skipUnless(mx.metal.is_available(), "Requires Metal preprocessing")
+    def test_resize_up_down_and_identity_match_opencv(self):
+        rng = np.random.default_rng(2180)
+        for height, width, input_size in [(3, 4, 28), (56, 84, 14), (14, 28, 14)]:
+            for dtype in [np.uint8, np.float32]:
+                with self.subTest(shape=(height, width), size=input_size, dtype=dtype):
+                    frames = rng.integers(
+                        0, 256, (2, height, width, 3), dtype=np.uint8
+                    ).astype(dtype)
+                    if dtype == np.float32:
+                        frames += np.float32(0.125)
+                    processor = self._processor(
+                        input_size=input_size, use_metal_preprocessing=True
+                    )
+                    self._assert_close(
+                        processor(frames)["pixel_values"],
+                        self._reference(frames, input_size),
+                    )
+
+    @unittest.skipUnless(mx.metal.is_available(), "Requires Metal preprocessing")
+    def test_noncontiguous_frames_and_lists_match_opencv(self):
+        frames = (
+            np.random.default_rng(2180)
+            .integers(0, 256, (3, 34, 46, 3), dtype=np.uint8)
+            .astype(np.float32)
+        )
+        frames += np.float32(0.125)
+        processor = self._processor(input_size=28, use_metal_preprocessing=True)
+        for view in [frames[:, ::2, 1::2], frames[:, ::-1, ::-1]]:
+            self.assertFalse(view.flags.c_contiguous)
+            expected = self._reference(view)
+            original = view.copy()
+            for container in [view, list(view)]:
+                with self.subTest(strides=view.strides, container=type(container)):
+                    self._assert_close(processor(container)["pixel_values"], expected)
+                    np.testing.assert_array_equal(view, original)
+
+    @unittest.skipUnless(mx.metal.is_available(), "Requires Metal preprocessing")
+    def test_returned_windows_own_independent_storage(self):
+        frames = np.random.default_rng(2180).integers(
+            0, 256, (3, 17, 23, 3), dtype=np.uint8
+        )
+        original = frames.copy()
+        processor = self._processor(input_size=28, use_metal_preprocessing=True)
+        first = processor(frames)["pixel_values"]
+        snapshot = np.array(first)
+        second = processor(np.zeros_like(frames))["pixel_values"]
+        mx.eval(mx.sum(first), mx.sum(second))
+        np.testing.assert_array_equal(np.array(first), snapshot)
+        self.assertFalse(np.array_equal(np.array(second), snapshot))
+        np.testing.assert_array_equal(frames, original)
+        frames.fill(0)
+        np.testing.assert_array_equal(np.array(first), snapshot)
+
+    def test_subclass_frame_override_is_preserved(self):
+        from mlx_vlm.models.video_depth_anything.processing_video_depth_anything import (
+            VideoDepthProcessor,
+        )
+
+        class CustomProcessor(VideoDepthProcessor):
+            def preprocess_frame(self, frame):
+                return frame.astype(np.float32) + 100
+
+        frames = np.arange(2 * 4 * 5 * 3, dtype=np.uint8).reshape(2, 4, 5, 3)
+        for enabled in [False, True]:
+            with self.subTest(enabled=enabled):
+                processor = CustomProcessor(
+                    input_size=28, use_metal_preprocessing=enabled
+                )
+                np.testing.assert_array_equal(
+                    np.array(processor(frames)["pixel_values"]),
+                    frames.astype(np.float32) + 100,
+                )
+
+    def test_subclass_without_base_initialization_is_preserved(self):
+        from mlx_vlm.models.video_depth_anything.processing_video_depth_anything import (
+            VideoDepthProcessor,
+        )
+
+        class CustomProcessor(VideoDepthProcessor):
+            def __init__(self):
+                pass
+
+            def preprocess_frame(self, frame):
+                return frame.astype(np.float32) + 100
+
+        frames = np.arange(2 * 4 * 5 * 3, dtype=np.uint8).reshape(2, 4, 5, 3)
+        np.testing.assert_array_equal(
+            np.array(CustomProcessor()(frames)["pixel_values"]),
+            frames.astype(np.float32) + 100,
+        )
+
+    def test_instance_frame_override_is_preserved(self):
+        frames = np.arange(2 * 4 * 5 * 3, dtype=np.uint8).reshape(2, 4, 5, 3)
+        for enabled in [False, True]:
+            with self.subTest(enabled=enabled):
+                calls = []
+
+                def preprocess_frame(frame):
+                    calls.append(int(frame[0, 0, 0]))
+                    return frame.astype(np.float32) + 100
+
+                processor = self._processor(
+                    input_size=28, use_metal_preprocessing=enabled
+                )
+                processor.preprocess_frame = preprocess_frame
+                np.testing.assert_array_equal(
+                    np.array(processor.preprocess(frames)["pixel_values"]),
+                    frames.astype(np.float32) + 100,
+                )
+                self.assertEqual(calls, [0, 60])
+
+    @unittest.skipUnless(mx.metal.is_available(), "Requires Metal preprocessing")
+    def test_predictor_45_frames_preserves_keyframes_and_padding(self):
+        from unittest import mock
+
+        from mlx_vlm.models.video_depth_anything.generate import VideoDepthPredictor
+
+        class RecordingModel:
+            config = SimpleNamespace(metric=True)
+
+            def __init__(self):
+                self.inputs = []
+
+            def __call__(self, values):
+                self.inputs.append(np.array(values))
+                return mx.mean(values, axis=-1) + 3
+
+        frames = np.broadcast_to(
+            np.arange(45, dtype=np.uint8)[:, None, None, None], (45, 17, 23, 3)
+        ).copy()
+        original = frames.copy()
+        reference_frames = self._reference(frames, input_size=14)
+        expected_indices = [
+            list(range(32)),
+            [0, 12, 24, 25, 26, 27, 28, 29, 30, 31] + list(range(32, 45)) + [44] * 9,
+            [0, 34] + [44] * 30,
+        ]
+        depths = []
+        for enabled in [False, True]:
+            with self.subTest(enabled=enabled):
+                model = RecordingModel()
+                processor = self._processor(
+                    input_size=14, use_metal_preprocessing=enabled
+                )
+                with mock.patch.object(
+                    processor, "preprocess", wraps=processor.preprocess
+                ) as preprocess:
+                    depth = VideoDepthPredictor(model, processor).infer(
+                        frames, progress=False
+                    )
+                self.assertEqual(preprocess.call_count, 3 if enabled else 0)
+                self.assertEqual(len(model.inputs), 3)
+                for actual, indices in zip(model.inputs, expected_indices):
+                    self._assert_close(actual, reference_frames[indices][None])
+                self.assertEqual(depth.shape, (45, 17, 23))
+                self.assertTrue(np.isfinite(depth).all())
+                depths.append(depth)
+        self._assert_close(depths[1], depths[0])
+        np.testing.assert_array_equal(frames, original)
+
+    @unittest.skipUnless(mx.metal.is_available(), "Requires MLX predictor operations")
+    def test_predictor_accepts_a_frame_only_processor(self):
+        from mlx_vlm.models.video_depth_anything.generate import VideoDepthPredictor
+
+        class FrameOnlyProcessor:
+            def preprocess_frame(self, frame):
+                return frame.astype(np.float32) / 255
+
+        class RecordingModel:
+            config = SimpleNamespace(metric=True)
+
+            def __init__(self):
+                self.inputs = []
+
+            def __call__(self, values):
+                self.inputs.append(np.array(values))
+                return mx.mean(values, axis=-1) + 1
+
+        frames = np.full((1, 4, 5, 3), 51, dtype=np.uint8)
+        model = RecordingModel()
+        result = VideoDepthPredictor(model, FrameOnlyProcessor()).infer(
+            frames, progress=False
+        )
+        self.assertEqual(result.shape, (1, 4, 5))
+        self.assertEqual(len(model.inputs), 1)
+        np.testing.assert_array_equal(
+            model.inputs[0], np.full((1, 32, 4, 5, 3), np.float32(0.2))
+        )
+        np.testing.assert_allclose(result, 1.2, rtol=0, atol=1e-6)
