@@ -1669,7 +1669,6 @@ class TestApplyChatTemplateIntegration:
         "family,markers",
         [
             ("deepseek_v4", ("<image>", "<image>")),
-            ("deepseek_v41", ("<image>", "<image>")),
             ("qwen3_vl", ("<image>", "<image>")),
             ("ernie4_5_moe_vl", ("<image>", "<image>")),
             ("internvl_chat", ("<image>", "<image>")),

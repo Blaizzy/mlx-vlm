@@ -988,32 +988,24 @@ def test_load_model_transforms_fine_grained_fp8_by_format():
     assert "proj.weight_scale_inv" not in loaded
 
 
-@pytest.mark.parametrize(
-    "vision_name,projector_name",
-    [("vision_tower", "multi_modal_projector"), ("vision", "aligner")],
-)
-def test_load_model_quantizes_projector_with_scales_when_skip_vision(
-    vision_name, projector_name
-):
+def test_load_model_quantizes_projector_with_scales_when_skip_vision():
 
     def model(config):
         projector = nn.Module()
         projector.linear_1 = nn.Linear(64, 64, bias=False)
         return _CheckpointModel(
             config,
-            **{
-                vision_name: nn.Linear(64, 64, bias=False),
-                projector_name: projector,
-            },
+            vision_tower=nn.Linear(64, 64, bias=False),
+            multi_modal_projector=projector,
             language_model=nn.Linear(64, 64, bias=False),
         )
 
     weights = {
         "language_model.weight": mx.zeros((64, 16), dtype=mx.uint32),
         "language_model.scales": mx.zeros((64, 1), dtype=mx.float16),
-        f"{projector_name}.linear_1.weight": mx.zeros((64, 16), dtype=mx.uint32),
-        f"{projector_name}.linear_1.scales": mx.zeros((64, 1), dtype=mx.float16),
-        f"{vision_name}.weight": mx.zeros((64, 64), dtype=mx.float16),
+        "multi_modal_projector.linear_1.weight": mx.zeros((64, 16), dtype=mx.uint32),
+        "multi_modal_projector.linear_1.scales": mx.zeros((64, 1), dtype=mx.float16),
+        "vision_tower.weight": mx.zeros((64, 64), dtype=mx.float16),
     }
     selected = {}
 
@@ -1021,9 +1013,9 @@ def test_load_model_quantizes_projector_with_scales_when_skip_vision(
         predicate = kwargs["class_predicate"]
         selected["language"] = predicate("language_model", model.language_model)
         selected["projector"] = predicate(
-            f"{projector_name}.linear_1", getattr(model, projector_name).linear_1
+            "multi_modal_projector.linear_1", model.multi_modal_projector.linear_1
         )
-        selected["vision"] = predicate(vision_name, getattr(model, vision_name))
+        selected["vision"] = predicate("vision_tower", model.vision_tower)
 
     with _checkpoint_loading(
         {

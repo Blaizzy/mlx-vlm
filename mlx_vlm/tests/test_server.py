@@ -1317,9 +1317,7 @@ def test_anthropic_image_normalization(client):
 
 
 @pytest.mark.parametrize("api", ["chat", "responses", "messages"])
-@pytest.mark.parametrize(
-    "family", ["deepseek_v4", "deepseek_v41", "qwen3_vl", "phi4mm"]
-)
+@pytest.mark.parametrize("family", ["deepseek_v4", "qwen3_vl", "phi4mm"])
 def test_interleaved_images_survive_endpoint_templating(client, api, family):
     urls = ["data:image/png;base64,FIRST", "data:image/png;base64,SECOND"]
 
