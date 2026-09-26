@@ -60,13 +60,6 @@ class ModelConfig(BaseModelConfig):
     engram_head_dim: int = 256
     engram_pad_token_id: int = 2
     engram_compressed_vocab_size: int = 99092
-    num_nextn_predict_layers: int = 3
-    dspark_block_size: int = 5
-    dspark_noise_token_id: int = 128799
-    dspark_target_layer_ids: List[int] = field(default_factory=lambda: [37, 38, 39])
-    dspark_markov_rank: int = 256
-    dspark_n_routed_experts: int = 128
-    dspark_num_experts_per_tok: int = 3
     image_token_id: int = 129264
     tie_word_embeddings: bool = False
     bos_token_id: Optional[int] = None
@@ -102,15 +95,12 @@ class ModelConfig(BaseModelConfig):
 
     def __post_init__(self):
         if not self.compress_ratios:
-            self.compress_ratios = [0, 0] + [2] * 18 + [1] * 20 + [0, 0, 0]
+            self.compress_ratios = [0, 0] + [2] * 18 + [1] * 20
         n = self.num_hidden_layers
-        if len(self.compress_ratios) == n:
-            self.compress_ratios = list(self.compress_ratios) + [0] * (
-                self.num_nextn_predict_layers
-            )
-        if len(self.compress_ratios) != n + self.num_nextn_predict_layers:
+        if len(self.compress_ratios) < n:
             raise ValueError(
-                "`compress_ratios` must cover the backbone plus the MTP stages, "
-                f"got {len(self.compress_ratios)} for {n} + "
-                f"{self.num_nextn_predict_layers} layers."
+                "`compress_ratios` must cover every backbone layer, "
+                f"got {len(self.compress_ratios)} for {n} layers."
             )
+        # Native checkpoints also include ratios for unused prediction layers.
+        self.compress_ratios = list(self.compress_ratios[:n])

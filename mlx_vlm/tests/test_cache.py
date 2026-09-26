@@ -167,7 +167,6 @@ def test_deepseek_v41_batch_cache_matches_independent_requests(right_pad, chunks
     from mlx_vlm.models import deepseek_v41
     from mlx_vlm.models.deepseek_v41.engram import NgramHashState
     from mlx_vlm.models.deepseek_v41.language import LanguageModel
-    from mlx_vlm.speculative.cache_state import start_speculative_cache
 
     mx.random.seed(0)
     case = next(case for case in DATA["cases"] if case["module"] == "deepseek_v41")
@@ -249,9 +248,9 @@ def test_deepseek_v41_batch_cache_matches_independent_requests(right_pad, chunks
         for row in (cache[0].extract(0), cache[0].extract(1))
     ]
     cache = [DeepseekV41Cache.merge(restored, [row.offset for row in restored])]
-    # A rejected speculative block must restore each compression phase.
-    with start_speculative_cache(cache, 3):
-        mx.eval(model(mx.array([[47, 49, 51], [53, 55, 57]]), cache=cache).logits)
+    assert not cache[0].is_trimmable()
+    assert all(not row.is_trimmable() for row in restored)
+    # Restored compressor state must continue from each request's exact prefix.
     assert_logits(
         model(tokens, cache=cache).logits,
         model(tokens, cache=merged).logits,
@@ -1468,7 +1467,7 @@ def sample(name, length=0):
             sample("KVCache", length), sample("ArraysCache", length)
         ),
         "ChunkedKVCache": lambda: C.ChunkedKVCache(8),
-        "DeepseekV41Cache": lambda: DeepseekV41Cache(1, [2]),
+        "DeepseekV41Cache": lambda: DeepseekV41Cache(1),
         "PoolingCache": lambda: C.PoolingCache(2),
         "RingSlidingKVCache": lambda: RingSlidingKVCache(max(16, length)),
         "RotatingKVCache": lambda: C.RotatingKVCache(max(16, length * 2)),

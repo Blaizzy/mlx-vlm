@@ -1391,6 +1391,16 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
     def setUp(self):
         mx.random.seed(0)
 
+    def test_config_accepts_unused_prediction_layers(self):
+        from mlx_vlm.models import deepseek_v41
+
+        case = next(case for case in DATA["cases"] if case["module"] == "deepseek_v41")
+        source = copy.deepcopy(case["config"])
+        source["compress_ratios"] += [0, 0, 0]
+        source["num_nextn_predict_layers"] = 3
+        config = deepseek_v41.ModelConfig.from_dict(source)
+        self.assertEqual(config.compress_ratios, case["config"]["compress_ratios"])
+
     def test_engram_offloading_matches_resident_rows(self):
         import tempfile
 
@@ -1556,6 +1566,7 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
         Match the reference's explicit image mask and masked n-gram hashes,
         even when a prefill boundary falls inside an image span.
         """
+        from mlx_vlm.generate.common import _chunked_prefill_enabled
         from mlx_vlm.models import deepseek_v41
         from mlx_vlm.models.deepseek_v41.engram import NgramHashState
         from mlx_vlm.models.deepseek_v41.language import LanguageModel
@@ -1563,6 +1574,7 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
         case = next(case for case in DATA["cases"] if case["module"] == "deepseek_v41")
         config = build_config(deepseek_v41, case["config"])
         model = LanguageModel(config)
+        self.assertTrue(_chunked_prefill_enabled(model))
         token_map = [i % 7 for i in range(config.vocab_size)]
         token_map[0] = 6
         model.engram_hash = NgramHashState(config, model.layout, token_map=token_map)
@@ -1578,13 +1590,15 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
         reference_cache = model.make_cache()
         hashes = model.engram_hash(ids, 0, reference_cache[0], token_mask=~image_mask)
         self.assertLess(mx.max(hashes).item(), config.engram_num_embeddings[0])
-        expected = model(
+        output = model(
             ids,
             inputs_embeds=embeds,
             cache=reference_cache,
             image_mask=image_mask,
             engram_hashes=hashes,
-        ).logits
+        )
+        self.assertIsNone(output.hidden_states)
+        expected = output.logits
         mx.eval(expected)
 
         for chunks in ((8,), (3, 2, 3)):

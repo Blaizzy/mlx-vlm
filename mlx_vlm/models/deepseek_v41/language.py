@@ -1,6 +1,6 @@
 import math
 from functools import lru_cache
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -24,10 +24,9 @@ from .fakequant import fake_quant_fp4_e4m3, fake_quant_fp4_ue8m0, fake_quant_fp8
 def _write_span(buffer, values, batch: int, start: int, fill=0, dtype=None):
     """Write ``values`` into ``buffer`` at ``start``, growing it to fit.
 
-    Every per-generation buffer here is position-addressed: a step rewrites the
-    span it owns and leaves the rest alone, which is what lets a rejected
-    speculative block be dropped by moving the offset back. Rows past ``batch``
-    are preserved so a filtered batch can grow again.
+    Every per-generation buffer here is position-addressed: a step writes the
+    span it owns and leaves the rest alone. Rows past ``batch`` are preserved
+    so a filtered batch can grow again.
 
     The buffer ends exactly ``start + length`` wide. Readers slice it with a
     length derived from their own compression ratio, which can run past what
@@ -641,8 +640,8 @@ class DeepseekV41Attention(nn.Module):
         """Window KV slice for this step plus its validity mask.
 
         Prefill attends over the current chunk; later steps attend the last
-        `window_size` tokens. The buffer keeps every token in order (not a
-        fixed ring) so speculative rollback can truncate it.
+        `window_size` tokens. The buffer stores tokens in position order so
+        each query can select its own visible window.
         """
         batch, seqlen = x.shape[0], x.shape[1]
         win = self.window_size
@@ -783,22 +782,6 @@ class Compressor(nn.Module):
             self.wgate = nn.Linear(config.hidden_size, config.head_dim, bias=False)
         self.layer_idx = layer_idx
 
-    def _push_undo(self, batch: int, slot: int, cache):
-        """Record a slot's prior contents so a rejected position can be undone.
-
-        Slots are position-addressed (``pos % ratio``), so a speculative block
-        that crosses a compression boundary overwrites slots belonging to
-        already-committed positions. Those are not recoverable by replay.
-        """
-        i = self.layer_idx
-        kv_state, score_state = cache.kv_state[i], cache.score_state[i]
-        kv = None if kv_state is None else kv_state[:batch, slot : slot + 1]
-        sc = None if score_state is None else score_state[:batch, slot : slot + 1]
-        undo = cache.undo[i]
-        undo.append((slot, batch, kv, sc))
-        if len(undo) > 64:
-            del undo[:-64]
-
     def _grow_state(self, batch: int, cache):
         i = self.layer_idx
         if cache.kv_state[i] is None:
@@ -858,7 +841,6 @@ class Compressor(nn.Module):
         kv, score = self.wkv(xf), self.wgate(xf)
         if start_pos == 0:
             should_compress = seqlen >= ratio
-            cache.undo[i].clear()
             remainder = seqlen % ratio
             cutoff = seqlen - remainder
             if remainder:
@@ -878,7 +860,6 @@ class Compressor(nn.Module):
             for n in range(seqlen):
                 pos = start_pos + n
                 slot = pos % ratio
-                self._push_undo(batch, slot, cache)
                 cache.kv_state[i] = self._write_slot(
                     cache.kv_state[i], batch, slot, kv[:, n : n + 1, :]
                 )
@@ -1033,11 +1014,9 @@ class DeepseekV41Cache:
     N_SLOTS = 5
     HANDOFF = ("index_k", "candidates", "compress_kv", "topk_idxs")
 
-    def __init__(self, n_layers: int = 0, ratios=()):
+    def __init__(self, n_layers: int = 0):
         self.offset = 0
         self.n_layers = n_layers
-        self.ratios = list(ratios)
-        self.undo = [[] for _ in range(n_layers)]
         self.window = [None] * n_layers
         self.compress = [None] * n_layers
         self.keys = [None] * n_layers
@@ -1114,19 +1093,17 @@ class DeepseekV41Cache:
         ) = restored
         engram = value[self.N_SLOTS * n]
         self.engram = None if engram.size == 0 else engram
-        self.undo = [[] for _ in range(n)]
         self.reset_handoff()
         for name, array in zip(self.HANDOFF, value[self.N_SLOTS * n + 1 :]):
             setattr(self, name, None if array.size == 0 else array)
 
     @property
     def meta_state(self):
-        return (str(self.offset), ",".join(str(r) for r in self.ratios))
+        return (str(self.offset),)
 
     @meta_state.setter
     def meta_state(self, value):
         self.offset = int(value[0])
-        self.ratios = [int(r) for r in value[1].split(",") if r]
 
     @classmethod
     def from_state(cls, state, meta_state):
@@ -1139,17 +1116,13 @@ class DeepseekV41Cache:
         def take(array):
             return None if array is None else mx.array(array[index : index + 1])
 
-        cache = type(self)(self.n_layers, self.ratios)
+        cache = type(self)(self.n_layers)
         cache.offset = self.offset
         for target, source in zip(cache._slots, self._slots):
             target[:] = [take(array) for array in source]
         cache.engram = take(self.engram)
         for name in self.HANDOFF:
             setattr(cache, name, take(getattr(self, name)))
-        cache.undo = [
-            [(slot, 1, take(kv), take(score)) for slot, _, kv, score in history]
-            for history in self.undo
-        ]
         return cache
 
     def to_batch(self, left_padding):
@@ -1158,7 +1131,7 @@ class DeepseekV41Cache:
                 raise ValueError("A populated DeepSeek cache must be merged by request")
             rows = [self.extract(0)]
         else:
-            rows = [type(self)(self.n_layers, self.ratios) for _ in left_padding]
+            rows = [type(self)(self.n_layers) for _ in left_padding]
         return BatchDeepseekV41Cache(rows, left_padding)
 
     @classmethod
@@ -1168,50 +1141,7 @@ class DeepseekV41Cache:
         return BatchDeepseekV41Cache([cache.extract(0) for cache in caches])
 
     def is_trimmable(self) -> bool:
-        return True
-
-    def _restore_slots(self, layer: int, n: int):
-        """Put back the compressor slots the last ``n`` positions overwrote."""
-        undo = self.undo[layer]
-        for _ in range(min(int(n), len(undo))):
-            slot, batch, kv, score = undo.pop()
-            for buffers, value in ((self.kv_state, kv), (self.score_state, score)):
-                state = buffers[layer]
-                if value is None or state is None:
-                    continue
-                parts = []
-                if slot > 0:
-                    parts.append(state[:batch, :slot])
-                parts.append(value)
-                if slot + 1 < state.shape[1]:
-                    parts.append(state[:batch, slot + 1 :])
-                head = mx.concatenate(parts, axis=1) if len(parts) > 1 else parts[0]
-                buffers[layer] = (
-                    mx.concatenate([head, state[batch:]], axis=0)
-                    if state.shape[0] > batch
-                    else head
-                )
-
-    def trim(self, n: int) -> int:
-        """Drop the last `n` appended tokens so a speculative block rolls back.
-
-        The framework calls this with the rejected-token count on commit and the
-        whole-block advance on abort. Prefix-addressed buffers truncate; the
-        compressor's slots are position-addressed, so a block that crossed a
-        compression boundary has to put back what it overwrote.
-        """
-        n = min(self.offset, int(n))
-        if n <= 0:
-            return 0
-        self.offset -= n
-        for layer in range(len(self.window)):
-            if self.window[layer] is not None:
-                self.window[layer] = self.window[layer][:, : self.offset]
-            ratio = self.ratios[layer] if layer < len(self.ratios) else 0
-            if ratio and self.compress[layer] is not None:
-                self.compress[layer] = self.compress[layer][:, : self.offset // ratio]
-            self._restore_slots(layer, n)
-        return n
+        return False
 
 
 class BatchDeepseekV41Cache:
@@ -1316,22 +1246,14 @@ class BatchDeepseekV41Cache:
         )
 
     def is_trimmable(self):
-        return True
+        return False
 
     def size(self):
         return max((row.offset for row in self.rows), default=0)
 
-    def trim(self, n):
-        n = min(n, min((row.offset for row in self.rows), default=0))
-        for row in self.rows:
-            row.trim(n)
-        return n
-
 
 class LanguageModel(nn.Module):
     """Embed, expand to hc copies, run the blocks, collapse, project to logits."""
-
-    requires_uniform_batch_acceptance = True
 
     def __init__(self, config: ModelConfig, tokenizer=None):
         super().__init__()
@@ -1349,7 +1271,6 @@ class LanguageModel(nn.Module):
         ]
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.head = ParallelHead(config)
-        self.target_layer_ids = list(config.dspark_target_layer_ids)
 
     def _ensure_engram_hash(self):
         """Build the n-gram hash state on first use from the checkpoint directory.
@@ -1384,40 +1305,7 @@ class LanguageModel(nn.Module):
         )
 
     def make_cache(self):
-        return [
-            DeepseekV41Cache(
-                len(self.layers), [l.attn.compress_ratio for l in self.layers]
-            )
-        ]
-
-    def chunked_prefill_policy(
-        self,
-        *,
-        input_ids=None,
-        inputs_embeds=None,
-        prompt_cache=None,
-        draft_model=None,
-        draft_kind=None,
-        prefill_kwargs=None,
-    ) -> bool:
-        """Chunking is safe here with a drafter attached, not just without one.
-
-        The engram reads the ids chunked prefill passes as ``inputs`` and its
-        hash state is position-indexed, so a chunk boundary changes nothing. A
-        dflash drafter additionally needs the per-layer hidden states, which are
-        captured per chunk and concatenated, so it needs only that the capture
-        was requested. Without this the speculative path prefills the whole
-        prompt in one dispatch and runs out of memory well before the
-        autoregressive path does.
-        """
-        del input_ids, inputs_embeds, prompt_cache
-        if getattr(self, "no_chunked_prefill", False):
-            return False
-        if draft_model is None:
-            return True
-        return draft_kind == "dflash" and bool(
-            (prefill_kwargs or {}).get("capture_layer_ids")
-        )
+        return [DeepseekV41Cache(len(self.layers))]
 
     def __call__(
         self,
@@ -1428,7 +1316,6 @@ class LanguageModel(nn.Module):
         engram_hashes: Optional[mx.array] = None,
         inputs: Optional[mx.array] = None,
         n_to_process: Optional[int] = None,
-        capture_layer_ids: Optional[List[int]] = None,
         **kwargs,
     ) -> LanguageModelOutput:
         """Extra `inputs`/`n_to_process` are generate-protocol passengers.
@@ -1439,13 +1326,7 @@ class LanguageModel(nn.Module):
         and a chunked prompt encodes differently from an unchunked one.
         `n_to_process` is implied by the slice and is not needed.
         """
-        entry = (
-            cache[0]
-            if cache
-            else DeepseekV41Cache(
-                len(self.layers), [l.attn.compress_ratio for l in self.layers]
-            )
-        )
+        entry = cache[0] if cache else DeepseekV41Cache(len(self.layers))
         if input_ids is None:
             input_ids = inputs
         if image_mask is None and input_ids is not None:
@@ -1471,23 +1352,16 @@ class LanguageModel(nn.Module):
                     input_ids,
                     engram_mask,
                 )
-        main_hiddens = []
-        capture_ids = (
-            self.target_layer_ids if capture_layer_ids is None else capture_layer_ids
-        )
         pre_mix = make_identity_pre_mix(batch, seqlen, self.config.hc_mult)
-        for i, layer in enumerate(self.layers):
+        for layer in self.layers:
             if layer.engram is not None and engram_hashes is not None:
                 h = layer.engram(
                     h,
                     engram_hashes[:, :, layer.engram.layer_hash_index, :],
                     engram_mask,
                 )
-            if i in capture_ids:
-                main_hiddens.append(h.mean(axis=2))
             h, pre_mix = layer(h, pre_mix, image_mask, entry)
         h = DeepseekV41Block.hc_pre(h, pre_mix)
         logits = self.head(self.norm(h))
         entry.advance(seqlen)
-        hidden = [mx.concatenate(main_hiddens, axis=-1)] if main_hiddens else None
-        return LanguageModelOutput(logits=logits, hidden_states=hidden)
+        return LanguageModelOutput(logits=logits)
