@@ -88,10 +88,10 @@ class Ideogram4ImagePipeline:
         prompt: str,
         *,
         seed: int = 0,
-        steps: int = 4,
+        steps: int | None = None,
         width: int = 1024,
         height: int = 1024,
-        guidance: float = 1.0,
+        guidance: float | None = None,
         **kwargs: Any,
     ) -> Image.Image:
         array, _ = self.generate_array(
@@ -129,10 +129,10 @@ class Ideogram4ImagePipeline:
         prompt: str,
         *,
         seed: int = 0,
-        steps: int = 4,
+        steps: int | None = None,
         width: int = 1024,
         height: int = 1024,
-        guidance: float = 1.0,
+        guidance: float | None = None,
         **kwargs: Any,
     ) -> tuple[mx.array, dict[str, Any]]:
         validate_dimensions(width=width, height=height)
@@ -149,18 +149,28 @@ class Ideogram4ImagePipeline:
             height=height,
         )
 
-        preset = get_preset(kwargs.get("sampler_preset"))
+        preset = get_preset(
+            kwargs.get("sampler_preset", self.variant.default_sampler_preset)
+        )
         num_steps = int(
-            kwargs.get("num_steps") or (preset.num_steps if steps == 4 else steps)
+            kwargs.get("num_steps", preset.num_steps if steps is None else steps)
         )
         if num_steps < 1:
             raise ValueError(f"steps must be >= 1, got {num_steps}")
 
         guidance_schedule = kwargs.get("guidance_schedule")
-        if guidance_schedule is None and num_steps == preset.num_steps:
+        if (
+            guidance_schedule is None
+            and guidance is None
+            and "guidance_scale" not in kwargs
+            and num_steps == preset.num_steps
+        ):
             guidance_schedule = preset.guidance_schedule
         guidance_scale = float(
-            kwargs.get("guidance_scale", guidance if guidance != 1.0 else 7.0)
+            kwargs.get(
+                "guidance_scale",
+                preset.guidance_schedule[-1] if guidance is None else guidance,
+            )
         )
         if guidance_schedule is not None:
             guidance_schedule = tuple(float(item) for item in guidance_schedule)

@@ -11,8 +11,9 @@ from mlx_vlm.generate.image import (
     ImageGenerationRequest,
     ImageGenerationResult,
 )
+from mlx_vlm.generate.image_defaults import ImageSamplingDefaults, image_metadata_path
 
-from .config import detect_ming_image_layout
+from .config import MingImageConfig, detect_ming_image_layout
 from .pipeline import MingImagePipeline
 
 _KNOWN_IDS = {
@@ -31,10 +32,22 @@ class MingImageGenerationModel(ImageGenerationModel):
     model_id: str
     family: str = "ming_image"
 
+    @property
+    def default_sampling(self) -> ImageSamplingDefaults:
+        return ImageSamplingDefaults.from_config(self.pipeline.config)
+
+    @classmethod
+    def resolve_defaults(
+        cls, model: str, *, model_path: Path | None = None
+    ) -> ImageSamplingDefaults:
+        config = MingImageConfig.from_model_path(image_metadata_path(model, model_path))
+        return ImageSamplingDefaults.from_config(config)
+
     def generate(self, request: ImageGenerationRequest) -> ImageGenerationResult:
         seed = 0 if request.seed is None else request.seed
-        steps = request.resolve_steps(self.pipeline.config.default_steps)
-        guidance = request.resolve_guidance(self.pipeline.config.default_guidance)
+        defaults = self.default_sampling
+        steps = request.resolve_steps(defaults.steps)
+        guidance = request.resolve_guidance(defaults.guidance)
         array = self.pipeline.generate_array(
             request.prompt,
             seed=seed,

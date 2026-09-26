@@ -1845,6 +1845,105 @@ def test_positioned_target_sampler_honors_top_k(module_name, top_p):
     assert set(tokens.tolist()) <= {2, 3}
 
 
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("top_p", [1e-8, 1e-3, 0.7])
+def test_top_p_preserves_tied_maxima_and_dtype(dtype, top_p):
+    # Include pre-filtered and unnormalized rows: use each row's own mass.
+    logprobs = mx.log(mx.array([[0.1, 0.45, 0.45], [0.0, 0.2, 0.8]])) - 0.2
+    logprobs = logprobs.astype(dtype)
+    filtered = sampling.apply_top_p(logprobs, top_p)
+    assert filtered.dtype == dtype
+    assert (filtered > -mx.inf).tolist() == [
+        [False, True, True],
+        [False, False, True],
+    ]
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("top_p", [1e-8, 1e-3])
+def test_tiny_top_p_across_sampling_paths(dtype, top_p):
+    logits = mx.array([[0.0, 1.0, 3.0, 2.0]])
+    logprobs = (logits - mx.logsumexp(logits, axis=-1, keepdims=True)).astype(dtype)
+    assert sampling.make_sampler(temp=1.0, top_p=top_p)(logprobs).tolist() == [2]
+    assert sampling.top_p_sampling(logprobs, top_p, 1.0).tolist() == [2]
+    for module_name in ("mlx_vlm.generate.ar", "mlx_vlm.server.generation"):
+        sampler = importlib.import_module(module_name)._PositionedTargetSampler(
+            temperature=1.0, top_p=top_p, seed=42
+        )
+        assert sampler(logprobs).tolist() == [2]
+        assert sampler.sample_target(logprobs, row_ids=[0], positions=[0]).tolist() == [
+            2
+        ]
+
+
+@pytest.mark.parametrize(
+    "module_name", ["mlx_vlm.generate.ar", "mlx_vlm.server.generation"]
+)
+def test_positioned_top_p_samples_both_tied_maxima(module_name):
+    sampler = importlib.import_module(module_name)._PositionedTargetSampler(
+        temperature=1.0, top_p=1e-8, seed=42
+    )
+    logprobs = mx.log(mx.array([[0.1, 0.45, 0.45]]))
+    draws = 128
+    samples = sampler.sample_target(
+        mx.repeat(logprobs, draws, axis=0),
+        row_ids=[0] * draws,
+        positions=list(range(draws)),
+    )
+    assert set(samples.tolist()) == {1, 2}
+
+
+@pytest.mark.parametrize("temperature", [0.0, 1e-300, 1e-39, 1e-5, 0.009, 0.01, 0.1])
+@pytest.mark.parametrize("options", [{}, {"top_p": 0.9}, {"p_less": True}])
+def test_sampler_clamps_positive_temperature(temperature, options):
+    logprobs = mx.log(mx.array([[0.1, 0.449, 0.451]] * 128))
+    effective = 0.01 if 0 < temperature < 0.01 else temperature
+    mx.random.seed(42)
+    actual = sampling.make_sampler(temp=temperature, **options)(logprobs)
+    mx.eval(actual)
+    mx.random.seed(42)
+    expected = sampling.make_sampler(temp=effective, **options)(logprobs)
+    assert actual.tolist() == expected.tolist()
+    if temperature > 0 and not options.get("p_less"):
+        assert set(actual.tolist()) == {1, 2}
+    if temperature == 0:
+        assert set(actual.tolist()) == {2}
+
+
+@pytest.mark.parametrize("seed", [None, 42])
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("top_p", [0.0, 0.9])
+@pytest.mark.parametrize("temperature", [1e-39, 1e-5])
+def test_generate_step_clamps_temperature(seed, dtype, top_p, temperature):
+    model = MagicMock()
+    model.language_model.return_value = LanguageModelOutput(
+        logits=mx.array([[[-4.0, 0.0, 0.003]]], dtype=dtype)
+    )
+    model.get_input_embeddings.return_value = InputEmbeddingsFeatures(
+        inputs_embeds=mx.zeros((1, 1, 4))
+    )
+
+    def sample(temp):
+        mx.random.seed(42)
+        return [
+            token
+            for token, _ in generate_module.generate_step(
+                mx.array([[1]]),
+                model,
+                pixel_values=None,
+                mask=None,
+                max_tokens=32,
+                temperature=temp,
+                top_p=top_p,
+                seed=seed,
+            )
+        ]
+
+    actual = sample(temperature)
+    assert actual == sample(0.01)
+    assert set(actual) == {1, 2}
+
+
 # Loading and utility contracts
 
 

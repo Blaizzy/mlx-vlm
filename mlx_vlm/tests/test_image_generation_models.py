@@ -5,18 +5,21 @@ from __future__ import annotations
 import importlib
 import json
 from collections import OrderedDict
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, Mock
 
 import mlx.core as mx
 import numpy as np
 import pytest
+from fastapi.testclient import TestClient
 from mlx import nn
 from mlx.utils import tree_flatten
 from numpy.testing import assert_allclose, assert_array_equal
 from PIL import Image
 
+from mlx_vlm.generate import ImageSamplingDefaults, resolve_image_defaults
 from mlx_vlm.generate.edit_image import (
     ImageEditRequest,
     image_edit_model_class,
@@ -40,6 +43,59 @@ IMAGE_CASES = json.loads(
     Path(__file__).with_name("image_generation_cases.json").read_text()
 )
 IMAGE_FAMILIES = IMAGE_CASES["families"]
+
+
+@pytest.fixture
+def no_image_defaults_io(monkeypatch):
+    monkeypatch.setattr(
+        mx, "load", Mock(side_effect=AssertionError("Defaults must not read weights"))
+    )
+    utils = importlib.import_module("mlx_vlm.utils")
+    monkeypatch.setattr(
+        utils,
+        "snapshot_download",
+        Mock(side_effect=AssertionError("Unexpected download")),
+    )
+
+
+def _assert_discovery_matches_wrapper_inference(model, task, prefix, override):
+    family = {"MageFlow": "mage_flow", "Flux2": "flux2", "Qwen": "qwen_image"}[prefix]
+    module = importlib.import_module(f"mlx_vlm.models.{family}.model")
+    variant = module.resolve_variant(model)
+    call = Mock(return_value=mx.zeros((16, 16, 3), dtype=mx.uint8))
+    pipeline = SimpleNamespace(
+        variant=variant,
+        generate_array=call,
+        edit_array=call,
+        model_path=Path("/not-loaded"),
+        quantization_config=None,
+        count_prompt_tokens=lambda _, **kwargs: 1,
+        tokenizer=SimpleNamespace(count_tokens=lambda _: 1),
+    )
+    cls = getattr(
+        module,
+        prefix + "Image" + ("EditModel" if task == "edit" else "GenerationModel"),
+    )
+    instance = cls(pipeline=pipeline, model_id=model)
+    defaults = resolve_image_defaults(model, task)
+    assert instance.default_sampling == defaults
+    args = dict(
+        prompt="a cat",
+        steps=11 if override else None,
+        guidance=0.0 if override else None,
+    )
+    request = (
+        ImageGenerationRequest(**args)
+        if task == "generate"
+        else ImageEditRequest(image_paths=("reference.png",), **args)
+    )
+    result = (
+        instance.generate(request) if task == "generate" else instance.edit(request)
+    )
+    assert result.steps == (11 if override else defaults.steps)
+    assert result.guidance == (0 if override else defaults.guidance)
+    assert call.call_args.kwargs["steps"] == result.steps
+    assert call.call_args.kwargs["guidance"] == result.guidance
 
 
 def _assert_attributes(value, expected):
@@ -503,6 +559,8 @@ class _RecordingPipeline:
                 scheduler_shift=shift,
                 variant=variant,
             )
+        elif family == "ideogram4":
+            self.variant = ideogram.config.get_variant("ideogram-ai/" + variant)
         elif family == "ernie_image":
             self.variant = ernie.config.get_variant(variant)
             self.runtime_config = ernie.pipeline.ErnieImageRuntimeConfig(
@@ -515,7 +573,9 @@ class _RecordingPipeline:
         self.calls.append(dict(prompt=prompt, **kwargs))
         if self.family == "ideogram4":
             return mx.zeros((8, 10, 3), dtype=mx.uint8), dict(
-                steps=kwargs["steps"], guidance=kwargs["guidance"], prompt_tokens=3
+                steps=kwargs["steps"],
+                guidance=7.0 if kwargs["guidance"] is None else kwargs["guidance"],
+                prompt_tokens=3,
             )
         return mx.zeros((16, 16, 3), dtype=mx.uint8)
 
@@ -733,6 +793,101 @@ def test_generation_model_dispatch(monkeypatch, tmp_path, family):
             )
 
 
+@pytest.mark.usefixtures("no_image_defaults_io")
+def test_remote_discovery_downloads_only_json(tmp_path, monkeypatch):
+    _write_files(
+        tmp_path, metadata={"model_index.json": {"_class_name": "LLaDAImagePipeline"}}
+    )
+    _write_files(
+        tmp_path,
+        metadata={"scheduler/scheduler_config.json": {"use_uniform_sigmas": True}},
+    )
+    download = Mock(return_value=str(tmp_path))
+    monkeypatch.setattr(
+        importlib.import_module("mlx_vlm.utils"), "snapshot_download", download
+    )
+    assert resolve_image_defaults(
+        "some-org/custom-checkpoint"
+    ) == ImageSamplingDefaults(4, 1)
+    download.assert_called_once()
+    assert download.call_args.kwargs["allow_patterns"] == ["*.json"]
+
+
+@pytest.mark.usefixtures("no_image_defaults_io")
+def test_unknown_local_model_does_not_silently_get_four_steps(tmp_path):
+    _write_files(tmp_path, metadata={"config.json": {"model_type": "unrecognized"}})
+    with pytest.raises(ValueError):
+        resolve_image_defaults(str(tmp_path))
+
+
+@pytest.mark.usefixtures("no_image_defaults_io")
+@pytest.mark.parametrize(
+    "steps,guidance",
+    [
+        (0, 1),
+        (-1, 1),
+        (True, 1),
+        (2.5, 1),
+        (4, float("nan")),
+        (4, float("inf")),
+        (4, -1),
+    ],
+)
+def test_invalid_provider_defaults_are_rejected(steps, guidance):
+    with pytest.raises(ValueError):
+        ImageSamplingDefaults(steps, guidance)
+
+
+@pytest.mark.usefixtures("no_image_defaults_io")
+@pytest.mark.parametrize("path", ["/images/defaults", "/v1/images/defaults"])
+def test_defaults_endpoint_is_authenticated_and_does_not_load_models(path, monkeypatch):
+    app = importlib.import_module("mlx_vlm.server.app")
+    monkeypatch.setenv("MLX_VLM_SERVER_API_KEY", "test-key")
+    load = Mock(side_effect=AssertionError("Defaults must not load model weights"))
+    monkeypatch.setattr(app, "get_cached_model", load)
+    with TestClient(app.app) as client:
+        params = dict(model="mage-flow-base", task="generate")
+        assert client.get(path, params=params).status_code == 401
+        headers = {"Authorization": "Bearer test-key"}
+        response = client.get(path, params=params, headers=headers)
+        assert response.status_code == 200
+        assert response.json() == {"steps": 30, "guidance": 5.0}
+        assert (
+            client.get(
+                path, params={**params, "task": "video"}, headers=headers
+            ).status_code
+            == 422
+        )
+        assert (
+            client.get(
+                path, params={**params, "task": "edit"}, headers=headers
+            ).status_code
+            == 400
+        )
+        assert (
+            client.get(path, params={"model": " "}, headers=headers).status_code == 400
+        )
+        assert client.get(path, headers=headers).status_code == 422
+    load.assert_not_called()
+
+
+@pytest.mark.usefixtures("no_image_defaults_io")
+@pytest.mark.parametrize(
+    "model,task,steps,guidance", [("bonsai-ternary", "generate", 4, 1.0)]
+)
+def test_bonsai_sampling_defaults_without_weights(model, task, steps, guidance):
+    assert asdict(resolve_image_defaults(model, task)) == dict(
+        steps=steps, guidance=guidance
+    )
+
+
+@pytest.mark.usefixtures("no_image_defaults_io")
+@pytest.mark.parametrize("model,task", [("bonsai-ternary", "edit")])
+def test_bonsai_defaults_reject_wrong_task_without_downloading(model, task):
+    with pytest.raises(ValueError, match="does not support"):
+        resolve_image_defaults(model, task)
+
+
 def test_bonsai_parse_size():
     assert bonsai.config.parse_size("1248x832") == (1248, 832)
     assert bonsai.config.parse_size("832x1248") == (832, 1248)
@@ -744,6 +899,48 @@ DISCOVERY_PATTERNS = [
     "manifest.json",
     "**/config.json",
 ]
+
+
+@pytest.mark.usefixtures("no_image_defaults_io")
+@pytest.mark.parametrize(
+    "model,task,steps,guidance",
+    [
+        ("flux2-klein-4b", "generate", 4, 1.0),
+        ("flux2-klein-base-4b", "generate", 50, 4.0),
+        ("flux2-klein-base-9b", "edit", 50, 4.0),
+    ],
+)
+def test_flux2_sampling_defaults_without_weights(model, task, steps, guidance):
+    assert asdict(resolve_image_defaults(model, task)) == dict(
+        steps=steps, guidance=guidance
+    )
+
+
+@pytest.mark.usefixtures("no_image_defaults_io")
+@pytest.mark.parametrize("model,task", [("flux2-klein-base-4b", "generate")])
+@pytest.mark.parametrize("override", [False, True])
+def test_flux2_defaults_match_wrapper_inference(model, task, override):
+    _assert_discovery_matches_wrapper_inference(model, task, "Flux2", override)
+
+
+@pytest.mark.usefixtures("no_image_defaults_io")
+@pytest.mark.parametrize("distilled,steps,guidance", [(True, 4, 1), (False, 50, 4)])
+def test_flux2_renamed_checkpoint_uses_distillation_metadata(
+    tmp_path, distilled, steps, guidance
+):
+    _write_files(
+        tmp_path,
+        metadata={
+            "model_index.json": {
+                "_class_name": "Flux2KleinPipeline",
+                "is_distilled": distilled,
+            }
+        },
+    )
+    _write_files(tmp_path, metadata={"transformer/config.json": {"num_layers": 5}})
+    assert resolve_image_defaults(str(tmp_path)) == ImageSamplingDefaults(
+        steps, guidance
+    )
 
 
 def test_flux2_remote_component_index_is_a_metadata_fallback(monkeypatch, tmp_path):
@@ -866,6 +1063,16 @@ def test_flux2_reference_image_array_keeps_float32_input():
     assert np.array(array).shape == (1, 3, 1, 1)
 
 
+@pytest.mark.usefixtures("no_image_defaults_io")
+@pytest.mark.parametrize(
+    "model,task,steps,guidance", [("ideogram-ai/ideogram-4-fp8", "generate", 20, 7.0)]
+)
+def test_ideogram4_sampling_defaults_without_weights(model, task, steps, guidance):
+    assert asdict(resolve_image_defaults(model, task)) == dict(
+        steps=steps, guidance=guidance
+    )
+
+
 def test_ideogram4_plain_prompt_wraps_as_minimal_json_caption():
     prepared = ideogram.prompting.normalize_prompt(
         "A red cube on a marble plinth.", warn=False
@@ -976,10 +1183,21 @@ def test_ideogram4_build_inputs_packs_text_and_image_tokens():
     )
 
 
-def test_ideogram4_pipeline_uses_prepared_prompt_and_reports_metadata():
+@pytest.mark.parametrize(
+    "steps,guidance,expected_steps,expected_guidance",
+    [
+        (1, 7.0, 1, 7.0),
+        (4, 1.0, 4, 1.0),
+        (None, None, 20, 7.0),
+    ],
+)
+def test_ideogram4_pipeline_uses_prepared_prompt_and_reports_metadata(
+    steps, guidance, expected_steps, expected_guidance
+):
     pipeline = _pipeline(
         "ideogram4",
         model_path=Path("/tmp/fake-ideogram"),
+        variant=ideogram.config.get_variant(),
         runtime_config=ideogram.pipeline.Ideogram4RuntimeConfig(
             evict_text_encoder=False, evict_transformers=False
         ),
@@ -1016,13 +1234,16 @@ def test_ideogram4_pipeline_uses_prepared_prompt_and_reports_metadata():
 
     array, metadata = pipeline.generate_array(
         "plain prompt",
-        steps=1,
+        steps=steps,
         width=256,
         height=256,
-        guidance=7.0,
+        guidance=guidance,
         prompt_expansion_model="tiny-text-model",
     )
 
+    assert metadata["steps"] == expected_steps
+    assert metadata["guidance"] == expected_guidance
+    assert (metadata["guidance_schedule"] is not None) == (guidance is None)
     assert array.shape == (16, 16, 3)
     assert pipeline.prepare_prompt.call_args.args == ("plain prompt",)
     assert (
@@ -1051,6 +1272,30 @@ def test_ideogram4_decode_uses_ideogram_latent_norm_path():
     )
     assert array.shape == (32, 32, 3)
     assert decode.call_args.args[0].shape == (1, 32, 32, 32)
+
+
+@pytest.mark.usefixtures("no_image_defaults_io")
+@pytest.mark.parametrize(
+    "shift,task,steps,guidance",
+    [
+        (3, "generate", 9, 0),
+        (3, "edit", 8, 0),
+        (6, "generate", 50, 4),
+        (6, "edit", 50, 4),
+    ],
+)
+def test_z_image_uses_scheduler_and_task(tmp_path, shift, task, steps, guidance):
+    _write_files(
+        tmp_path, metadata={"model_index.json": {"_class_name": "ZImagePipeline"}}
+    )
+    _write_files(
+        tmp_path, metadata={"scheduler/scheduler_config.json": {"shift": shift}}
+    )
+    for component in ["transformer", "text_encoder", "vae"]:
+        _write_files(tmp_path, metadata={f"{component}/config.json": {}})
+    assert resolve_image_defaults(str(tmp_path), task) == ImageSamplingDefaults(
+        steps, guidance
+    )
 
 
 def test_detects_diffusers_z_image_model_index(tmp_path):
@@ -1113,6 +1358,21 @@ def test_z_image_conversion_preserves_native_vae_layout(tmp_path):
 
     assert converted["encoder.conv_in.weight"].shape == native.shape
     assert mx.array_equal(converted["encoder.conv_in.weight"], native)
+
+
+@pytest.mark.usefixtures("no_image_defaults_io")
+@pytest.mark.parametrize(
+    "model,task,steps,guidance",
+    [
+        ("baidu/ERNIE-Image-Turbo", "generate", 8, 1.0),
+        ("baidu/ERNIE-Image-Turbo", "edit", 8, 3.0),
+        ("baidu/ERNIE-Image", "generate", 50, 4.0),
+    ],
+)
+def test_ernie_image_sampling_defaults_without_weights(model, task, steps, guidance):
+    assert asdict(resolve_image_defaults(model, task)) == dict(
+        steps=steps, guidance=guidance
+    )
 
 
 def test_ernie_dispatches_from_weight_index(tmp_path):
@@ -1349,6 +1609,51 @@ def test_ernie_image_conversion_detection_and_layout_metadata(tmp_path):
     )
 
 
+@pytest.mark.usefixtures("no_image_defaults_io")
+@pytest.mark.parametrize(
+    "model,task,steps,guidance",
+    [
+        ("microsoft/Mage-Flow-Base", "generate", 30, 5.0),
+        ("microsoft/Mage-Flow", "generate", 20, 5.0),
+        ("microsoft/Mage-Flow-Turbo", "generate", 4, 1.0),
+        ("microsoft/Mage-Flow-Edit", "edit", 30, 5.0),
+        ("microsoft/Mage-Flow-Edit-Turbo", "edit", 4, 1.0),
+    ],
+)
+def test_mage_flow_sampling_defaults_without_weights(model, task, steps, guidance):
+    assert asdict(resolve_image_defaults(model, task)) == dict(
+        steps=steps, guidance=guidance
+    )
+
+
+@pytest.mark.usefixtures("no_image_defaults_io")
+@pytest.mark.parametrize(
+    "model,task", [("mage-flow-base", "generate"), ("mage-flow-edit", "edit")]
+)
+@pytest.mark.parametrize("override", [False, True])
+def test_mage_flow_defaults_match_wrapper_inference(model, task, override):
+    _assert_discovery_matches_wrapper_inference(model, task, "MageFlow", override)
+
+
+@pytest.mark.usefixtures("no_image_defaults_io")
+@pytest.mark.parametrize(
+    "model,task", [("mage-flow-edit", "generate"), ("mage-flow-turbo", "edit")]
+)
+def test_mage_flow_defaults_reject_wrong_task_without_downloading(model, task):
+    with pytest.raises(ValueError, match="does not support"):
+        resolve_image_defaults(model, task)
+
+
+@pytest.mark.usefixtures("no_image_defaults_io")
+def test_mage_flow_native_variant_metadata_beats_directory_name(tmp_path):
+    root = tmp_path / "Mage-Flow-Turbo"
+    _write_files(
+        root, metadata={"model_index.json": {"_class_name": "MageFlowPipeline"}}
+    )
+    _write_files(root, metadata={"mlx_mage_flow.json": {"variant": "mage-flow-base"}})
+    assert resolve_image_defaults(str(root)) == ImageSamplingDefaults(30, 5)
+
+
 def test_mage_flow_scheduler_matches_static_shift():
     scheduler = mage.scheduler.FlowMatchEulerDiscreteScheduler(
         num_inference_steps=4, shift=6.0
@@ -1485,6 +1790,29 @@ def test_ideogram_prompt_expansion_policy(monkeypatch, case):
             )
         else:
             expand.assert_not_called()
+
+
+@pytest.mark.usefixtures("no_image_defaults_io")
+@pytest.mark.parametrize(
+    "model,task,steps,guidance",
+    [
+        ("Qwen/Qwen-Image-2.1", "generate", 30, 1.0),
+        ("Qwen/Qwen-Image-2.1", "edit", 40, 1.0),
+    ],
+)
+def test_qwen_image_sampling_defaults_without_weights(model, task, steps, guidance):
+    assert asdict(resolve_image_defaults(model, task)) == dict(
+        steps=steps, guidance=guidance
+    )
+
+
+@pytest.mark.usefixtures("no_image_defaults_io")
+@pytest.mark.parametrize(
+    "model,task", [("qwen-image-2.1", "generate"), ("qwen-image-2.1", "edit")]
+)
+@pytest.mark.parametrize("override", [False, True])
+def test_qwen_image_defaults_match_wrapper_inference(model, task, override):
+    _assert_discovery_matches_wrapper_inference(model, task, "Qwen", override)
 
 
 # Diffusers FlowMatchEulerDiscreteScheduler with the released checkpoint config,
@@ -2026,6 +2354,24 @@ def test_qwen_image_edit_dispatch_and_rgba_save(tmp_path, extra):
     with Image.open(saved) as image:
         assert image.mode == "RGBA"
         assert image.getpixel((0, 0)) == (255, 0, 0, 128)
+
+
+@pytest.mark.usefixtures("no_image_defaults_io")
+@pytest.mark.parametrize("turbo,steps,guidance", [(False, 50, 5.0), (True, 4, 1.0)])
+@pytest.mark.parametrize("task", ["generate", "edit"])
+def test_llada_uses_scheduler_metadata_in_renamed_directory(
+    tmp_path, turbo, steps, guidance, task
+):
+    _write_files(
+        tmp_path, metadata={"model_index.json": {"_class_name": "LLaDAImagePipeline"}}
+    )
+    _write_files(
+        tmp_path,
+        metadata={"scheduler/scheduler_config.json": {"use_uniform_sigmas": turbo}},
+    )
+    assert resolve_image_defaults(str(tmp_path), task) == ImageSamplingDefaults(
+        steps, guidance
+    )
 
 
 def _write_ming_image_layout(root: Path) -> None:

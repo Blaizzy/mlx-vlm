@@ -30,8 +30,8 @@ def _is_string_type(
             params = func["parameters"]
             if params is None:
                 return False
-            arg_type = params.get("properties", {}).get(arg_name, {}).get("type", None)
-            return arg_type == "string"
+            schema = params.get("properties", {}).get(arg_name, {})
+            return isinstance(schema, dict) and schema.get("type") == "string"
     return False
 
 

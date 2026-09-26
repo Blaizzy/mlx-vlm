@@ -1309,7 +1309,7 @@ curl -X POST "http://localhost:8080/v1/embeddings" \
   }'
 ```
 
-Preload a default with `--embedding-model <repo-or-path>`. Supported architectures: BERT, XLM-RoBERTa, ModernBERT, Qwen3-Embedding, EmbeddingGemma (gemma3), LFM2, SigLIP (text), Qwen3-VL-Embedding, and Llama-Nemotron-VL, plus LLM2Vec bidirectional Llama. ColBERT-style multi-vector models (ColIdefics3, ColQwen2.5) are also available for late-interaction use.
+Preload a default with `--embedding-model <repo-or-path>`. Supported architectures: BERT, XLM-RoBERTa, ModernBERT, Qwen3-Embedding, EmbeddingGemma (gemma3), LFM2, SigLIP (text), Qwen3-VL-Embedding, and Llama-Nemotron-VL, plus LLM2Vec bidirectional Llama. ColBERT-style multi-vector models (ColIdefics3, ColQwen2.5, LFM2-ColBERT) are also available for late-interaction use.
 
 ##### Reranking
 

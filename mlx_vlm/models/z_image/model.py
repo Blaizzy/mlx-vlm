@@ -12,8 +12,9 @@ from mlx_vlm.generate.image import (
     ImageGenerationRequest,
     ImageGenerationResult,
 )
+from mlx_vlm.generate.image_defaults import ImageSamplingDefaults, image_metadata_path
 
-from .config import detect_z_image_layout
+from .config import ZImageConfig, detect_z_image_layout
 from .pipeline import ZImagePipeline
 
 # Known model IDs / aliases
@@ -35,13 +36,25 @@ class ZImageGenerationModel(ImageGenerationModel):
     family: str = "z_image"
 
     @property
+    def default_sampling(self) -> ImageSamplingDefaults:
+        return ImageSamplingDefaults.from_config(self.pipeline.config)
+
+    @classmethod
+    def resolve_defaults(
+        cls, model: str, *, model_path: Path | None = None
+    ) -> ImageSamplingDefaults:
+        config = ZImageConfig.from_model_path(image_metadata_path(model, model_path))
+        return ImageSamplingDefaults.from_config(config)
+
+    @property
     def variant(self) -> str | None:
         return self.pipeline.config.variant
 
     def generate(self, request: ImageGenerationRequest) -> ImageGenerationResult:
         seed = 0 if request.seed is None else request.seed
-        steps = request.resolve_steps(self.pipeline.config.default_steps)
-        guidance = request.resolve_guidance(self.pipeline.config.default_guidance)
+        defaults = self.default_sampling
+        steps = request.resolve_steps(defaults.steps)
+        guidance = request.resolve_guidance(defaults.guidance)
         if self.variant == "turbo" and not 0.0 <= guidance <= 1.0:
             raise ValueError(
                 "Z-Image Turbo does not support classifier-free guidance; "
@@ -113,13 +126,30 @@ class ZImageEditModel(ImageEditModel):
     family: str = "z_image"
 
     @property
+    def default_sampling(self) -> ImageSamplingDefaults:
+        return ImageSamplingDefaults(
+            8 if self.pipeline.config.variant == "turbo" else 50,
+            self.pipeline.config.default_guidance,
+        )
+
+    @classmethod
+    def resolve_defaults(
+        cls, model: str, *, model_path: Path | None = None
+    ) -> ImageSamplingDefaults:
+        config = ZImageConfig.from_model_path(image_metadata_path(model, model_path))
+        return ImageSamplingDefaults(
+            8 if config.variant == "turbo" else 50, config.default_guidance
+        )
+
+    @property
     def variant(self) -> str | None:
         return self.pipeline.config.variant
 
     def edit(self, request: ImageEditRequest) -> ImageGenerationResult:
         seed = 0 if request.seed is None else request.seed
-        steps = request.resolve_steps(8 if self.variant == "turbo" else 50)
-        guidance = request.resolve_guidance(self.pipeline.config.default_guidance)
+        defaults = self.default_sampling
+        steps = request.resolve_steps(defaults.steps)
+        guidance = request.resolve_guidance(defaults.guidance)
         if self.variant == "turbo" and not 0.0 <= guidance <= 1.0:
             raise ValueError(
                 "Z-Image Turbo does not support classifier-free guidance; "

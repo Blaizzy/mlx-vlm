@@ -16,7 +16,7 @@ class Model(nn.Module):
         self.model_type = config.model_type
         self.model = Lfm2Model(config)
 
-    def _encode(self, input_ids, attention_mask=None):
+    def _encode(self, input_ids, attention_mask=None, mask_convolutions=True):
         B, L = input_ids.shape
         if attention_mask is None:
             attention_mask = mx.ones((B, L))
@@ -25,11 +25,9 @@ class Model(nn.Module):
             h.dtype
         ).min
         for layer in self.model.layers:
-            mask = (
-                attn_mask
-                if layer.is_attention_layer
-                else attention_mask.astype(mx.bool_)
-            )
+            mask = attn_mask if layer.is_attention_layer else None
+            if mask_convolutions and not layer.is_attention_layer:
+                mask = attention_mask.astype(mx.bool_)
             h = layer(h, mask, None)
         return self.model.embedding_norm(h), attention_mask
 
