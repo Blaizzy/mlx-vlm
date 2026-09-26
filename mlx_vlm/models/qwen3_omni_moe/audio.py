@@ -9,12 +9,9 @@ from mlx_vlm.models.qwen3_omni_moe.config import AudioConfig
 
 
 def _get_feat_extract_output_lengths(input_lengths):
-    input_lengths_leave = input_lengths % 100
-    feat_lengths = (input_lengths_leave - 1) // 2 + 1
-    output_lengths = (
-        ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
-    )
-    return output_lengths
+    # Nonnegative ceil-divisions agree for NumPy and MLX integer arrays;
+    # MLX truncates negative division, so (length - 1) // 2 is wrong at zero.
+    return (input_lengths % 100 + 7) // 8 + (input_lengths // 100) * 13
 
 
 class Attention(nn.Module):
@@ -243,10 +240,11 @@ class AudioModel(nn.Module):
 
         feature_lens_after_cnn = _get_feat_extract_output_lengths(feature_lens)
         max_len_after_cnn = int(feature_lens_after_cnn.max())
+        chunk_output_lengths = _get_feat_extract_output_lengths(chunk_lengths)
         padded_mask_after_cnn = mx.zeros(
-            (total_chunks, max_len_after_cnn), dtype=mx.bool_
+            (total_chunks, int(chunk_output_lengths.max())), dtype=mx.bool_
         )
-        for i, length in enumerate(feature_lens_after_cnn):
+        for i, length in enumerate(chunk_output_lengths):
             padded_mask_after_cnn[i, : int(length)] = True
 
         padded_embeds = []

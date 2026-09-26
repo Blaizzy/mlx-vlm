@@ -33,6 +33,8 @@ def masked_scatter(
 
 
 class Model(nn.Module):
+    supports_media_prefix_apc = True
+
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
