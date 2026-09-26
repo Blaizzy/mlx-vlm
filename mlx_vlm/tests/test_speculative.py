@@ -801,6 +801,18 @@ def test_laguna_checkpoint_contract():
         arch.validate_laguna_dflash_weights(weights, config)
 
 
+def test_speculative_prefill_filter_keeps_hidden_chunks_aligned():
+    drafter = NS(config=NS(target_layer_ids=[0]))
+    prefill = speculative.SpeculativePrefill("dflash", drafter)
+    prefill.append(NS(hidden_states=[mx.array([[[1]], [[2]]])]))
+    prefill.filter([1])
+    output = prefill.finish(NS(hidden_states=[mx.array([[[3]]])]))
+    assert output.hidden_states[0].tolist() == [[[2], [3]]]
+    prefill.append(output)
+    prefill.filter([])
+    assert prefill.chunks == []
+
+
 @parametrize("padding", [[5, 0], [5, 5]])
 def test_padded_prefill_chunks(padding):
     lm, cfg = language("qwen")
@@ -820,6 +832,24 @@ def test_padded_prefill_chunks(padding):
             padding if padding[1] == 0 else [max(5 - 3 * (step + 1), 0)] * 2
         )
         assert caches[1].left_padding.tolist() == expected_padding
+
+
+def test_qwen3_5_cancelled_prefill_row_preserves_survivor_output():
+    lm, _ = language("qwen")
+    model = lm.model
+    cache = [ArraysCache(2, left_padding=[5, 0]), BatchKVCache([5, 0])]
+    model(mx.array([[0, 0, 0], [1, 2, 3]]), cache=cache)
+    for layer_cache in cache:
+        layer_cache.filter(mx.array([0]))
+
+    singleton_cache = [ArraysCache(2), KVCache()]
+    actual = model(mx.array([[0, 0, 4]]), cache=cache)
+    expected = model(mx.array([[4]]), cache=singleton_cache)
+    assert mx.array_equal(actual[:, -1:], expected).item()
+
+    actual = model(mx.array([[5]]), cache=cache)
+    expected = model(mx.array([[5]]), cache=singleton_cache)
+    assert mx.array_equal(actual, expected).item()
 
 
 @parametrize(

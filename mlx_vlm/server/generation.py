@@ -1066,6 +1066,24 @@ class ResponseGenerator:
             pending, self._cancelled = self._cancelled, set()
             return pending
 
+    def _apply_cancellations(self, batch_gen, active):
+        for uid in self._drain_cancellations():
+            if batch_gen is None or uid not in active:
+                continue
+            if not batch_gen.remove(uid):
+                self._cancel(uid)
+                continue
+            info = active.pop(uid)
+            logger.info(
+                "Generation cancelled: request=%s generated_tokens=%d",
+                info.get("request_id", uid),
+                int(info.get("generated_tokens", 0) or 0),
+            )
+            try:
+                info["rqueue"].put(None)
+            except Exception:
+                pass
+
     def _initialize_model(self):
         model, processor, config = load_model_resources(
             self.model_path, self.adapter_path
@@ -1712,21 +1730,7 @@ class ResponseGenerator:
                     break
 
                 # Drop abandoned requests before doing more work.
-                cancelled = self._drain_cancellations()
-                if cancelled and batch_gen is not None:
-                    for uid in cancelled:
-                        if uid in active:
-                            batch_gen.remove(uid)
-                            info = active.pop(uid)
-                            logger.info(
-                                "Generation cancelled: request=%s generated_tokens=%d",
-                                info.get("request_id", uid),
-                                int(info.get("generated_tokens", 0) or 0),
-                            )
-                            try:
-                                info["rqueue"].put(None)
-                            except Exception:
-                                pass
+                self._apply_cancellations(batch_gen, active)
 
                 if new_items and batch_gen is not None and not active:
                     if not batch_gen.has_work:

@@ -58,6 +58,40 @@ from mlx_vlm.tests.test_processors import MINICPM_MULTICALL
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
 from mlx_vlm.tools import load_tool_module
 
+
+def test_cancellation_is_acknowledged_only_after_removal():
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen._cancelled = {7}
+    gen._cancel_lock = Lock()
+    rqueue = Queue()
+    active = {7: {"rqueue": rqueue}}
+    batch_gen = NS(remove=MagicMock(side_effect=[False, True]))
+
+    gen._apply_cancellations(batch_gen, active)
+    assert 7 in active
+    assert rqueue.empty()
+    assert gen._cancelled == {7}
+
+    gen._apply_cancellations(batch_gen, active)
+    assert active == {}
+    assert rqueue.get_nowait() is None
+    assert rqueue.empty()
+    assert gen._cancelled == set()
+    assert batch_gen.remove.call_count == 2
+
+
+def test_cancellation_of_finished_request_is_ignored():
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen._cancelled = {7}
+    gen._cancel_lock = Lock()
+    batch_gen = NS(remove=MagicMock())
+
+    gen._apply_cancellations(batch_gen, {})
+
+    batch_gen.remove.assert_not_called()
+    assert gen._cancelled == set()
+
+
 _MUSE_RESPONSE_TEMPLATE = {
     "defaults": {"role": "assistant"},
     "fields": {

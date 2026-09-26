@@ -1914,6 +1914,57 @@ class PromptProcessingBatch:
     def __len__(self):
         return len(self.uids)
 
+    def remove(self, uid):
+        """Remove one prefill row without restarting the remaining prompts."""
+        batch_size = len(self.uids)
+        idx = self.uids.index(uid)
+        keep = [i for i in range(batch_size) if i != idx]
+        keep_arr = mx.array(keep, dtype=mx.int32)
+        mx.eval(
+            [c.state for c in self.prompt_cache],
+            list(self._finished_prompt_logits.values()),
+            self._speculative_prefill.chunks,
+        )
+        if self._apc_manager is not None and self._apc_meta:
+            meta = self._apc_meta[idx]
+            if meta is not None:
+                self._apc_manager.release(meta.get("apc_blocks", []))
+
+        for rows in (
+            self.uids,
+            self._prompt_uids,
+            self.max_tokens,
+            self.logits_processors,
+            self.thinking_budget_criteria,
+            self._token_context,
+            self._left_padding_per_row,
+            self._right_pad_per_row,
+            self._suffix_lens,
+            self._apc_meta,
+            self._prompt_tokens_per_row,
+            self._cached_tokens_per_row,
+        ):
+            if rows:
+                rows.pop(idx)
+        self._finished_prompt_logits.pop(uid, None)
+        self._speculative_prefill.filter(keep)
+        self._total_prompt_tokens = sum(self._suffix_lens)
+
+        if not keep:
+            self.prompt_cache.clear()
+        for c in self.prompt_cache:
+            c.filter(keep_arr)
+        self._input_ids = self._input_ids[keep_arr]
+        if self._inputs_embeds is not None:
+            self._inputs_embeds = self._inputs_embeds[keep_arr]
+        for key, value in self._prompt_kwargs.items():
+            if (
+                isinstance(value, mx.array)
+                and _prompt_kwarg_batch_size(key, value) == batch_size
+            ):
+                axis = 1 if _is_mrope_position_ids_prompt_kwarg(key, value) else 0
+                self._prompt_kwargs[key] = mx.take(value, keep_arr, axis=axis)
+
     def _release_apc_meta_blocks(self):
         if self._apc_manager is None:
             return
@@ -2089,9 +2140,13 @@ class PromptProcessingBatch:
             ]
             logits = output.logits if hasattr(output, "logits") else output
             for i in finished_rows:
-                self._finished_prompt_logits[i] = mx.contiguous(mx.array(logits[i, -1]))
+                self._finished_prompt_logits[self.uids[i]] = mx.contiguous(
+                    mx.array(logits[i, -1])
+                )
         eval_targets = [c.state for c in self.prompt_cache]
-        eval_targets.extend(self._finished_prompt_logits[i] for i in finished_rows)
+        eval_targets.extend(
+            self._finished_prompt_logits[self.uids[i]] for i in finished_rows
+        )
         mx.async_eval(eval_targets)
         self._processed_prompt_columns += n
         if self._apc_coordinator is not None:
@@ -2145,7 +2200,7 @@ class PromptProcessingBatch:
             (
                 padding
                 for i, padding in enumerate(self._right_pad_per_row or [])
-                if i not in self._finished_prompt_logits
+                if self.uids[i] not in self._finished_prompt_logits
             ),
             default=0,
         )
@@ -2164,8 +2219,8 @@ class PromptProcessingBatch:
             logits = mx.stack(
                 [
                     (
-                        self._finished_prompt_logits[i]
-                        if i in self._finished_prompt_logits
+                        self._finished_prompt_logits[self.uids[i]]
+                        if self.uids[i] in self._finished_prompt_logits
                         else logits[i, logits.shape[1] - 1 - padding]
                     )
                     for i, padding in enumerate(self._right_pad_per_row)
@@ -2909,12 +2964,11 @@ class BatchGenerator:
 
             # Being prefilled
             if self._prompt_batch is not None and uid in self._prompt_batch.uids:
-                if len(self._prompt_batch.uids) == 1:
-                    self._prompt_batch.uids = []
-                    self._prompt_batch.prompt_cache = []
+                self._prompt_batch.remove(uid)
+                if not self._prompt_batch.uids:
                     self._prompt_batch = None
-                    mx.clear_cache()
-                    return True
+                mx.clear_cache()
+                return True
 
             # Already decoding.
             if uid in self._generation_batch.uids:

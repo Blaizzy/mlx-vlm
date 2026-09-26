@@ -779,13 +779,14 @@ class MiniMaxM3BatchKVCache:
         return self.kv_cache.make_mask(*args, **kwargs)
 
     def filter(self, batch_indices):
-        min_left_pad = self.left_padding[batch_indices].min().item()
+        previous_length = self.kv_cache._idx
         self.kv_cache.filter(batch_indices)
+        trimmed = previous_length - self.kv_cache._idx
         if self.index_keys is not None:
             self.index_keys = self.index_keys[batch_indices]
-            if min_left_pad > 0:
-                self.index_keys = self.index_keys[..., min_left_pad:, :]
-                self.index_offset -= min_left_pad
+            if trimmed > 0:
+                self.index_keys = self.index_keys[..., trimmed:, :]
+                self.index_offset -= trimmed
 
     def extend(self, other):
         if not isinstance(other, MiniMaxM3BatchKVCache):

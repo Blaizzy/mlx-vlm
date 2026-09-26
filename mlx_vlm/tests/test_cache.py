@@ -126,6 +126,44 @@ def test_kv_cache_extracts_one_active_row(factory):
     assert mx.array_equal(extracted.values, values[1:2]).item()
 
 
+@pytest.mark.parametrize("processed", [0, 3, 12])
+@pytest.mark.parametrize("kind", ["dense", "uniform"])
+def test_batch_filter_only_trims_processed_padding(processed, kind):
+    cache = batch_cache(kind, [9, 0])
+    if processed:
+        keys = mx.ones((2, 1, processed, 32))
+        cache.update_and_fetch(keys, keys)
+    cache.filter(mx.array([0]))
+
+    assert cache._idx == max(0, processed - 9)
+    assert cache.left_padding.tolist() == [max(0, 9 - processed)]
+    assert cache.offset.tolist() == [processed - 9]
+
+
+def test_minimax_m3_batch_filter_preserves_unprocessed_padding():
+    cache = MiniMaxM3BatchKVCache([9, 0])
+    keys = mx.ones((2, 1, 3, 4))
+    cache.update_and_fetch(keys, keys)
+    cache.update_index_and_fetch(keys)
+    cache.filter(mx.array([0]))
+
+    assert cache._idx == cache.index_offset == 0
+    assert cache.state[1].shape[2] == 0
+    assert cache.left_padding.tolist() == [6]
+
+
+def test_qsa_batch_filter_preserves_unprocessed_padding():
+    cache = BatchQSAKVCache([9, 0])
+    keys = mx.ones((2, 1, 3, 4))
+    cache.update_and_fetch(keys, keys)
+    cache.update_indexer(keys[:, 0], mx.broadcast_to(mx.arange(3)[None], (2, 3)))
+    cache.filter(mx.array([0]))
+
+    assert cache._idx == cache.index_offset == 0
+    assert cache.index_keys.shape[1] == 0
+    assert cache.left_padding.tolist() == [6]
+
+
 def test_cache_list_can_extract_an_already_extracted_kv_cache():
     first, _, _ = _make_kv_cache()
     second, _, _ = _make_kv_cache()
@@ -2315,16 +2353,18 @@ def test_turboquant_skips_non_kv_cache_entries():
     assert isinstance(prompt_cache[1], TurboQuantKVCache)
 
 
-def test_batch_turboquant_filter_supports_uniform_single_item_offsets():
+@pytest.mark.parametrize("padding", [0, 9])
+def test_batch_turboquant_filter_supports_uniform_single_item_offsets(padding):
     keys = mx.ones((1, 2, 3, 8), dtype=mx.float16)
     values = mx.ones((1, 2, 3, 8), dtype=mx.float16)
-    cache = BatchTurboQuantKVCache([0], bits=3.5)
+    cache = BatchTurboQuantKVCache([padding], bits=3.5)
 
     cache.update_and_fetch(keys, values)
     cache.filter(mx.array([0]))
 
-    assert cache.offset.tolist() == [3]
-    assert cache.left_padding.tolist() == [0]
+    assert cache.offset.tolist() == [3 - padding]
+    assert cache.left_padding.tolist() == [max(0, padding - 3)]
+    assert cache._idx == max(0, 3 - padding)
 
 
 def test_batch_turboquant_cache_supports_uniform_right_trim():
