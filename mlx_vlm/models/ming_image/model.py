@@ -42,6 +42,7 @@ class MingImageGenerationModel(ImageGenerationModel):
             width=request.width,
             height=request.height,
             guidance=guidance,
+            num_images=int(request.extra.get("num_images", 1)),
         )
         return ImageGenerationResult(
             array=array,

@@ -94,6 +94,11 @@ class MiMoV2Processor(Qwen2_5_VLProcessor):
             if index != len(codes):
                 raise ValueError("Audio inputs do not match prompt audio tokens")
             audio_codes = mx.concatenate(codes, axis=1).T
+            # The server runs the processor on the request thread and the model
+            # on the generation thread; a lazy graph built on this thread's
+            # stream fails there with "There is no Stream(gpu, N) in current
+            # thread". Materialise the codes where they are built.
+            mx.eval(audio_codes)
         result = super().__call__(
             images=images,
             text=text,

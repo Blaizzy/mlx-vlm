@@ -105,8 +105,9 @@ class QwenImagePipeline:
         height: int = 512,
         guidance: float = 1.0,
         negative_prompt: str = " ",
+        num_images: int = 1,
     ) -> mx.array:
-        """Generate one image, returned as an ``[H, W, 3]`` uint8 RGB array."""
+        """Generate one ``[H, W, 3]`` image, or ``[N, H, W, 3]`` when num_images > 1."""
         emb = self.text_encoder.encode(prompt).astype(mx.bfloat16)
         do_cfg = guidance is not None and guidance > 1.0
         neg = (
@@ -123,7 +124,8 @@ class QwenImagePipeline:
             width=width,
             height=height,
             guidance=guidance,
-        )[:, :, :3]
+            num_images=num_images,
+        )[..., :3]
 
     def edit_array(
         self,
@@ -201,6 +203,7 @@ class QwenImagePipeline:
         width,
         height,
         guidance,
+        num_images=1,
         reference_latents=None,
         reference_image_shapes=None,
         image_pad_mask=None,
@@ -211,8 +214,12 @@ class QwenImagePipeline:
         h_lat, w_lat = height // 16, width // 16
         tokens = h_lat * w_lat
         mx.random.seed(seed)
-        latents = mx.random.normal((1, 1, z, h_lat, w_lat)).astype(mx.bfloat16)
-        latents = latents.reshape(1, z, tokens).transpose(0, 2, 1)
+        latents = mx.random.normal((num_images, 1, z, h_lat, w_lat)).astype(mx.bfloat16)
+        latents = latents.reshape(num_images, z, tokens).transpose(0, 2, 1)
+        if num_images > 1:
+            emb = mx.broadcast_to(emb, (num_images, *emb.shape[1:]))
+            if neg is not None:
+                neg = mx.broadcast_to(neg, (num_images, *neg.shape[1:]))
         scheduler = FlowMatchEulerDiscreteScheduler(
             image_seq_len=tokens, num_inference_steps=steps, **self.scheduler_config
         )
@@ -281,12 +288,15 @@ class QwenImagePipeline:
             negative_cache.clear()
 
         z_lat = (
-            latents.transpose(0, 2, 1).reshape(1, z, 1, h_lat, w_lat).astype(mx.float32)
+            latents.transpose(0, 2, 1)
+            .reshape(num_images, z, 1, h_lat, w_lat)
+            .astype(mx.float32)
         )
         z_lat = z_lat * self.latents_std + self.latents_mean
         image = self.vae.decode(z_lat)[:, :, 0]
         image = ((mx.clip(image, -1.0, 1.0) + 1.0) / 2.0 * 255).astype(mx.uint8)
-        return image[0].transpose(1, 2, 0)
+        images = image.transpose(0, 2, 3, 1)
+        return images[0] if num_images == 1 else images
 
 
 __all__ = ["QwenImagePipeline"]

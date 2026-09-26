@@ -43,6 +43,10 @@ from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.generate import GenerationResult
 from mlx_vlm.generate.image import ImageGenerationResult
 from mlx_vlm.models.cache import KVCache
+from mlx_vlm.models.gpt_oss.processing_gpt_oss import (
+    HARMONY_RESPONSE_TEMPLATE,
+    _attach_harmony_template,
+)
 from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.server import GenerationArguments as Args
 from mlx_vlm.server import ResponseGenerator as Generator
@@ -97,6 +101,21 @@ class _MuseResponseTemplateTokenizer:
 
     def get_response_parser(self, prefix=None):
         return ResponseParser(self.response_template, prefix=prefix)
+
+
+class _HarmonyResponseTemplateTokenizer:
+    response_template = HARMONY_RESPONSE_TEMPLATE
+
+    def parse_response(self, response, prefix=None):
+        return parse_response(response, self.response_template, prefix=prefix)
+
+    def get_response_parser(self, prefix=None):
+        return ResponseParser(self.response_template, prefix=prefix)
+
+
+def _harmony_processor():
+    """A processor prepared exactly as the gpt-oss loader prepares it."""
+    return _attach_harmony_template(NS(tokenizer=_HarmonyResponseTemplateTokenizer()))
 
 
 def _msg(content="Hello", role="user", **extra):
@@ -1274,7 +1293,10 @@ def test_anthropic_image_normalization(client):
         client,
         "messages",
         [_msg([dict(type="text", text="Describe it."), image])],
-        [_msg("You are concise.", "system"), _msg("Describe it.")],
+        [
+            _msg("You are concise.", "system"),
+            _msg([dict(type="text", text="Describe it."), dict(type="image")]),
+        ],
         system="You are concise.",
         max_tokens=12,
     )
@@ -1292,6 +1314,46 @@ def test_anthropic_image_normalization(client):
             output_tokens=4,
         ),
     )
+
+
+@pytest.mark.parametrize("api", ["chat", "responses", "messages"])
+@pytest.mark.parametrize("family", ["deepseek_v4", "qwen3_vl", "phi4mm"])
+def test_interleaved_images_survive_endpoint_templating(client, api, family):
+    urls = ["data:image/png;base64,FIRST", "data:image/png;base64,SECOND"]
+
+    def image_part(url):
+        if api == "messages":
+            return dict(type="image", source=dict(type="url", url=url))
+        if api == "responses":
+            return _input_image(url)
+        return dict(type="image_url", image_url=dict(url=url))
+
+    text_type = "input_text" if api == "responses" else "text"
+    first = _msg(
+        [
+            dict(type=text_type, text="before "),
+            image_part(urls[0]),
+            dict(type=text_type, text=" between "),
+            image_part(urls[1]),
+            dict(type=text_type, text=" after"),
+        ]
+    )
+    messages = [first, _msg("Seen.", "assistant"), _msg("Follow up.")]
+    with _endpoint(model_type=family) as fake:
+        fake.template.side_effect = apply_chat_template
+        response = _post(
+            client, api, **{"input" if api == "responses" else "messages": messages}
+        )
+    assert response.status_code == 200, response.text
+    prompt = fake.generate.call_args.kwargs["prompt"]
+    markers = (
+        ("<|image_1|>", "<|image_2|>") if family == "phi4mm" else ("<image>", "<image>")
+    )
+    assert f"before {markers[0]} between {markers[1]} after" in prompt
+    assert prompt.index(markers[1]) < prompt.index("Seen.") < prompt.index("Follow up.")
+    assert sum(prompt.count(marker) for marker in set(markers)) == 2
+    assert "base64" not in prompt
+    assert fake.generate.call_args.kwargs["image"] == urls
 
 
 def test_anthropic_system_normalization(client):
@@ -1358,6 +1420,33 @@ def test_anthropic_tool_result_normalization(client, image):
             ]
             == ""
         )
+
+
+def test_anthropic_tool_image_payloads_follow_normalized_message_order(client):
+    def image(url):
+        return dict(type="image", source=dict(type="url", url=url))
+
+    tool_url, user_url = "https://example.com/tool.png", "https://example.com/user.png"
+    messages = [
+        _msg(
+            [
+                dict(
+                    type="tool_result", tool_use_id="image", content=[image(tool_url)]
+                ),
+                dict(type="text", text="Compare with "),
+                image(user_url),
+            ]
+        )
+    ]
+    with _endpoint() as fake:
+        fake.template.side_effect = apply_chat_template
+        response = _post(client, "messages", messages=messages)
+    assert response.status_code == 200, response.text
+    prompt = fake.generate.call_args.kwargs["prompt"]
+    assert prompt.count("<image>") == 2
+    assert "Compare with <image>" in prompt
+    assert prompt.index("Compare with") < prompt.index("Tool:")
+    assert fake.generate.call_args.kwargs["image"] == [user_url, tool_url]
 
 
 def _assert_chat_and_responses_messages(client, messages, expected, **extra):
@@ -2355,6 +2444,41 @@ class TestResponseGenerator:
         assert [b.kwargs["sampler"] for b in batches] == ["sampler-0.0", "sampler-0.6"]
         assert batches[0].closed
 
+    @pytest.mark.parametrize("temperature", [0.0, 1e-300, 1e-5, 0.009, 0.01, 0.1])
+    @pytest.mark.parametrize(
+        "options", [{}, {"top_n_sigma": 1.0}, {"p_less": True}, {"typical_p": 0.9}]
+    )
+    def test_temperature_clamp_reaches_batch_sampler(
+        self, monkeypatch, temperature, options
+    ):
+        args = Args(temperature=temperature, **options)
+        effective = 0.01 if 0 < temperature < 0.01 else temperature
+        assert args.temperature == args.to_generate_kwargs()["temperature"] == effective
+        gen, batches = _worker_setup(monkeypatch)
+        with _running(gen):
+            _, tokens = _drain(
+                _enqueue(gen, max_tokens=1, temperature=temperature, **options)
+            )
+            assert len(tokens) == 1
+        sampler = batches[0].kwargs["sampler"]
+        assert batches[0].kwargs["greedy_sampling"] == (temperature == 0)
+        if temperature == 0:
+            assert sampler is None
+        else:
+            assert sampler is not None
+            logprobs = mx.log(mx.array([[0.1, 0.449, 0.451]] * 128))
+            mx.random.seed(42)
+            actual = sampler(logprobs)
+            mx.eval(actual)
+            mx.random.seed(42)
+            expected = gen._make_sampler(Args(temperature=effective, **options))(
+                logprobs
+            )
+            assert actual.tolist() == expected.tolist()
+            if not options:
+                assert sampler.temperature == effective
+                assert set(actual.tolist()) == {1, 2}
+
     def test_generate_arguments_to_generate_kwargs(self):
         args = Args()
         _assert_fields(
@@ -2664,6 +2788,63 @@ def test_response_template_thinking_stream():
     )
     assert _thoughts(deltas) == ("Muse reasoning.", "Muse answer.")
     assert any(delta.thinking_closed for delta in deltas)
+
+
+_HARMONY_ANALYSIS_FINAL = (
+    "<|channel|>analysis<|message|>We need to respond.<|end|>"
+    "<|start|>assistant<|channel|>final<|message|>Hello!"
+)
+_HARMONY_ANALYSIS_COMMENTARY_FINAL = (
+    "<|channel|>analysis<|message|>Think A.<|end|>"
+    "<|start|>assistant<|channel|>commentary<|message|>Meta B.<|end|>"
+    "<|start|>assistant<|channel|>final<|message|>Answer."
+)
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        (_HARMONY_ANALYSIS_FINAL, ("We need to respond.", "Hello!")),
+        (
+            "<|start|>assistant<|channel|>final<|message|>Just the answer.",
+            (None, "Just the answer."),
+        ),
+    ],
+)
+def test_harmony_split(text, expected):
+    assert server._split_thinking(text, processor=_harmony_processor()) == expected
+
+
+def test_harmony_split_joins_reasoning_channels():
+    reasoning, content = server._split_thinking(
+        _HARMONY_ANALYSIS_COMMENTARY_FINAL, processor=_harmony_processor()
+    )
+    assert content == "Answer."
+    assert "Think A." in reasoning and "Meta B." in reasoning
+
+
+def test_harmony_response_template_stream():
+    state = server.make_response_stream_state(_harmony_processor())
+    deltas = _feed_thinking(
+        state,
+        [
+            "<|channel|>analysis<|mes",
+            "sage|>We need to respond.<|end|><|start|>assistant",
+            "<|channel|>final<|message|>Hello!",
+        ],
+        last=True,
+    )
+    assert _thoughts(deltas) == ("We need to respond.", "Hello!")
+
+
+@pytest.mark.parametrize(
+    "existing,expected",
+    [(None, HARMONY_RESPONSE_TEMPLATE), ({"kept": True}, {"kept": True})],
+)
+def test_attach_harmony_template(existing, expected):
+    tokenizer = NS(response_template=existing)
+    _attach_harmony_template(NS(tokenizer=tokenizer))
+    assert tokenizer.response_template == expected
 
 
 def test_kv_bits_independent_of_model_path(monkeypatch):
@@ -3416,12 +3597,44 @@ def test_unknown_function_output_blocks_remain_text():
             "BeforeBetweenAfter",
             False,
         ),
+        (
+            ["<tool_call>a</tool_call>", "\n", "<tool_call>b</tool_call>", "\n"],
+            "<tool_call>",
+            "</tool_call>",
+            "",
+            False,
+        ),
+        (
+            list("<tool_call>a</tool_call>\n<tool_call>b</tool_call>\n"),
+            "<tool_call>",
+            "</tool_call>",
+            "",
+            False,
+        ),
+        (
+            ["<tool_call>a</tool_call>", "\n", "Done", "."],
+            "<tool_call>",
+            "</tool_call>",
+            "\nDone.",
+            False,
+        ),
+        (
+            list("A<tool_call>x</tool_call> \n<tool_call>y</tool_call>B"),
+            "<tool_call>",
+            "</tool_call>",
+            "A \nB",
+            False,
+        ),
     ],
     ids=[
         "start-marker",
         "missing-end-marker",
         "unfinished-start-marker",
         "minicpm-character-chunks",
+        "whitespace-between-calls",
+        "whitespace-between-calls-character-chunks",
+        "text-after-call",
+        "whitespace-between-text",
     ],
 )
 def test_tool_stream_finalization(chunks, start_marker, end_marker, expected, inside):
