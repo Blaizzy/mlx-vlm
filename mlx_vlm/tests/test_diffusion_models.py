@@ -739,8 +739,8 @@ class TestDiffusionGemma:
 
     @pytest.mark.parametrize(
         "temperature,expected",
-        [(0.0, [[1, 0]]), (0.7, [[2, 1]])],
-        ids=["argmax", "categorical"],
+        [(0.0, [[1, 0]]), (0.7, [[2, 1]]), (1e-39, [[2, 1]])],
+        ids=["argmax", "categorical", "clamped"],
     )
     def test_diffusion_samples_canvas(self, temperature, expected):
         logits = mx.array([[[0.0, 2.0, 1.0], [3.0, 1.0, 2.0]]])
@@ -753,6 +753,9 @@ class TestDiffusionGemma:
             mx.eval(sampled)
         assert categorical.call_count == (1 if temperature else 0)
         assert sampled.tolist() == expected
+        if temperature:
+            expected_logits = logits / max(temperature, 0.01)
+            assert mx.array_equal(categorical.call_args.args[0], expected_logits)
 
     def test_stream_generate_with_mxfp4_quantized_embeddings(self):
         import mlx.nn as nn

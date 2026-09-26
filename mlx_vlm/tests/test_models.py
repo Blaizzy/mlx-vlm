@@ -24,6 +24,7 @@ import numpy as np
 import pytest
 from mlx.utils import tree_flatten, tree_map
 
+from mlx_vlm import embedding_loader
 from mlx_vlm.models.base import InputEmbeddingsFeatures
 from mlx_vlm.models.cache import make_prompt_cache
 from mlx_vlm.utils import (
@@ -75,6 +76,14 @@ class ModelChecks:
         cache = model.language_model.make_cache()
         model(ids[:, :-1], cache=cache)
         assert model(ids[:, -1:], cache=cache).logits.shape == (1, 1, vocab_size)
+
+    def token_embeddings(self, model, config):
+        output = model(mx.array([[1, 2, 3]]))
+        assert output.last_hidden_state.shape == (1, 3, config.hidden_size)
+        assert output.text_embeds.shape == (1, 3, config.embedding_dim)
+        assert mx.allclose(
+            mx.linalg.norm(output.text_embeds, axis=-1), mx.array(1.0), atol=1e-5
+        )
 
     def assert_close(self, actual, expected, *, logits=False):
         assert actual.shape == expected.shape
@@ -505,6 +514,8 @@ def check_arguments(kind, case, model, config):
     )
     if kind == "forward_cache":
         return (model, text.vocab_size), case.get("forward_cache", {})
+    if kind == "token_embeddings":
+        return (model, config), {}
     if kind == "multimodal":
         return (model, config), case["multimodal"]
     if kind == "input_embeddings":
@@ -587,6 +598,35 @@ def test_model_contract(case):
     for kind in case["checks"]:
         args, kwargs = check_arguments(kind, case, model, config)
         getattr(checks, kind)(*args, **kwargs)
+
+
+def test_lfm2_colbert_sanitize_and_loader(tmp_path, monkeypatch):
+    case = next(case for case in DATA["cases"] if case["module"] == "lfm2_colbert")
+    module = importlib.import_module("mlx_vlm.models.lfm2_colbert")
+    model = module.Model(build_config(module, case["config"]))
+    weights = {
+        "embed_tokens.weight": mx.zeros((32, 16)),
+        "layers.0.conv.conv.weight": mx.zeros((16, 1, 3)),
+        "1_Dense.linear.weight": mx.zeros((8, 16)),
+    }
+    sanitized = model.sanitize(weights)
+    assert "model.embed_tokens.weight" in sanitized
+    assert sanitized["model.layers.0.conv.conv.weight"].shape == (16, 3, 1)
+    assert "projection.weight" in sanitized
+
+    dense_dir = tmp_path / "1_Dense"
+    dense_dir.mkdir()
+    (dense_dir / "config.json").write_text(json.dumps({"out_features": 128}))
+    captured = {}
+
+    def fake_load(model_path, **kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(embedding_loader, "load_encoder_model", fake_load)
+    embedding_loader.load_embedding_model(tmp_path)
+    assert captured["model_remapping"]["lfm2"] == "lfm2_colbert"
+    assert captured["config_overrides"]["embedding_dim"] == 128
 
 
 @pytest.mark.parametrize("name", DATA["dense"])
@@ -1160,337 +1200,6 @@ def test_patch_embed_is_transposed_from_ncdhw_to_ndhwc():
     assert sanitized[QWEN_SANITIZED_KEY].shape == expected
 
 
-def test_mimo_v2_unfuses_qkv_by_tensor_parallel_shard():
-    """The fused qkv is shard-major: each shard holds its own q, then k, then v.
-
-    Dimensions are chosen so only a degree of 4 explains the grid: a shard is
-    160 rows, which pads to 2 block-rows, so the grid is 4 x 2 = 8 while the
-    weight is only ceil(640 / 128) = 5 blocks tall. Degrees 1 and 2 would imply
-    5 and 6 rows respectively, so neither fits.
-    """
-    module = importlib.import_module("mlx_vlm.models.mimo_v2")
-    text = module.TextConfig(
-        hidden_size=128,
-        num_hidden_layers=2,
-        num_attention_heads=12,
-        num_key_value_heads=4,
-        head_dim=32,
-        v_head_dim=32,
-        swa_num_attention_heads=12,
-        swa_num_key_value_heads=4,
-        swa_head_dim=32,
-        swa_v_head_dim=32,
-        partial_rotary_factor=0.5,
-        hybrid_layer_pattern=[0, 1],
-        moe_layer_freq=[0, 0],
-        n_routed_experts=4,
-        num_experts_per_tok=2,
-        vocab_size=32,
-        intermediate_size=64,
-        moe_intermediate_size=32,
-    )
-    language = module.language.LanguageModel(text)
-
-    degree, shard_rows, grid_rows = 4, 160, 8
-    q_rows, k_rows, v_rows = 96, 32, 32  # per shard
-    assert q_rows + k_rows + v_rows == shard_rows
-    assert (
-        text.num_attention_heads * text.head_dim
-        + text.num_key_value_heads * (text.head_dim + text.v_head_dim)
-        == degree * shard_rows
-    )
-
-    # tag every section with a distinct byte so the recovered order is visible
-    tags = {}
-    rows = []
-    for rank in range(degree):
-        for name, count in (("q", q_rows), ("k", k_rows), ("v", v_rows)):
-            byte = 56 + 4 * rank + {"q": 0, "k": 1, "v": 2}[name]
-            tags[(name, rank)] = byte
-            rows.append(mx.full((count, text.hidden_size), byte, dtype=mx.uint8))
-    fused = mx.concatenate(rows)
-    assert fused.shape[0] == degree * shard_rows
-
-    weights = {
-        "model.layers.0.self_attn.qkv_proj.weight": fused,
-        "model.layers.0.self_attn.qkv_proj.weight_scale_inv": mx.ones(
-            (grid_rows, text.hidden_size // 128 or 1)
-        ),
-    }
-    out = language._unfuse_qkv(dict(weights))
-
-    assert not any("qkv_proj" in key for key in out)
-    shapes = {
-        "q_proj": text.num_attention_heads * text.head_dim,
-        "k_proj": text.num_key_value_heads * text.head_dim,
-        "v_proj": text.num_key_value_heads * text.v_head_dim,
-    }
-    for name, expected_rows in shapes.items():
-        got = out[f"model.layers.0.self_attn.{name}.weight"]
-        assert got.shape[0] == expected_rows, (name, got.shape)
-
-    # each projection must be its four shard slices in rank order; a contiguous
-    # read would instead hand back one unbroken run of the first tag
-    for name, per_shard in (("q_proj", q_rows), ("k_proj", k_rows), ("v_proj", v_rows)):
-        got = out[f"model.layers.0.self_attn.{name}.weight"]
-        short = name[0]
-        for rank in range(degree):
-            block = got[rank * per_shard : (rank + 1) * per_shard]
-            expected = mx.from_fp8(
-                mx.full((1, 1), tags[(short, rank)], dtype=mx.uint8), dtype=mx.float32
-            )
-            assert mx.allclose(block.astype(mx.float32), expected.astype(mx.float32)), (
-                name,
-                rank,
-            )
-
-
-def test_mimo_v2_keeps_only_the_requested_trailing_logits():
-    """Chunked prefill passes ``logits_to_keep=1``; lm_head must honor it.
-
-    Without the hint the head runs over every prompt position, so a prefill
-    step materializes a [B, T, vocab] tensor it immediately discards.
-    """
-    module = importlib.import_module("mlx_vlm.models.mimo_v2")
-    text = module.TextConfig(
-        hidden_size=32,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=8,
-        v_head_dim=8,
-        swa_num_attention_heads=4,
-        swa_num_key_value_heads=2,
-        swa_head_dim=8,
-        swa_v_head_dim=8,
-        partial_rotary_factor=0.5,
-        hybrid_layer_pattern=[0, 1],
-        moe_layer_freq=[0, 0],
-        n_routed_experts=4,
-        num_experts_per_tok=2,
-        vocab_size=16,
-        intermediate_size=64,
-        moe_intermediate_size=32,
-    )
-    language = module.language.LanguageModel(text)
-    inputs = mx.zeros((2, 6), dtype=mx.int32)
-
-    full = language(inputs).logits
-    assert full.shape == (2, 6, text.vocab_size)
-
-    kept = language(inputs, logits_to_keep=1).logits
-    assert kept.shape == (2, 1, text.vocab_size)
-    assert mx.allclose(kept, full[:, -1:, :])
-
-
-def test_mimo_v2_inserts_image_and_video_features():
-    module = importlib.import_module("mlx_vlm.models.mimo_v2")
-    case = next(c for c in DATA["cases"] if c["id"] == "TestModels.mimo_v2")
-    config = build_config(module, case["config"])
-    model = module.Model(config)
-    width = config.text_config.hidden_size
-    image = mx.full((2, width), 3.0)
-    video = mx.full((1, width), 7.0)
-    ids = mx.array(
-        [[1, config.image_token_id, config.video_token_id, config.image_token_id, 2]]
-    )
-
-    result = model.get_input_embeddings(
-        ids, cached_image_features=image, cached_video_features=video
-    ).inputs_embeds
-
-    assert mx.array_equal(result[0, [1, 3]], image).item()
-    assert mx.array_equal(result[0, 2], video[0]).item()
-    expected = model.language_model.model.embed_tokens(ids)
-    assert mx.array_equal(result[0, [0, 4]], expected[0, [0, 4]]).item()
-
-    vision = config.vision_config
-    patch_width = (
-        vision.in_channels
-        * vision.temporal_patch_size
-        * vision.patch_size
-        * vision.patch_size
-    )
-    pixels = mx.random.normal((16, patch_width))
-    grid = mx.array([[1, 4, 4]])
-    ids = mx.array([[config.image_token_id] * 4])
-    encoded = model.encode_images(pixels, image_grid_thw=grid)[0]
-    result = model.get_input_embeddings(
-        ids, pixel_values=pixels, image_grid_thw=grid
-    ).inputs_embeds
-    assert mx.allclose(result[0], encoded)
-    cached = model.encode_images(pixels, image_grid_thw=grid)
-    result = model.get_input_embeddings(ids, cached_image_features=cached).inputs_embeds
-    assert mx.allclose(result[0], encoded)
-
-
-def test_mimo_v2_encodes_video_features():
-    module = importlib.import_module("mlx_vlm.models.mimo_v2")
-    case = next(c for c in DATA["cases"] if c["id"] == "TestModels.mimo_v2")
-    config = build_config(module, case["config"])
-    model = module.Model(config)
-    vision = config.vision_config
-    patch_width = (
-        vision.in_channels
-        * vision.temporal_patch_size
-        * vision.patch_size
-        * vision.patch_size
-    )
-    pixels = mx.random.normal((32, patch_width))
-    grid = mx.array([[2, 4, 4]])
-    encoded = model.encode_video(pixels, grid)
-    ids = mx.array([[config.video_token_id] * encoded.shape[0]])
-
-    result = model.get_input_embeddings(
-        ids, pixel_values_videos=pixels, video_grid_thw=grid
-    ).inputs_embeds
-
-    assert mx.allclose(result[0], encoded)
-
-
-class TestMiMoV2BatchedVisionAttention:
-    def test_matches_independent_sequences(self):
-        from mlx_vlm.models.mimo_v2.config import VisionConfig
-        from mlx_vlm.models.mimo_v2.vision import VisionAttention
-
-        config = VisionConfig(
-            hidden_size=64,
-            num_heads=4,
-            num_key_value_heads=2,
-            qk_channels=16,
-        )
-        attention = VisionAttention(config, use_sinks=True, window_size=4)
-        q = mx.random.normal((3, 8, 4, 16))
-        k = mx.random.normal((3, 8, 2, 16))
-        v = mx.random.normal((3, 8, 2, 16))
-
-        batched = attention._attend(q, k, v, full_attn=False)
-        independent = mx.concatenate(
-            [
-                attention._attend(q[i : i + 1], k[i : i + 1], v[i : i + 1], False)
-                for i in range(3)
-            ],
-            axis=0,
-        )
-
-        assert mx.allclose(batched, independent)
-
-
-def test_mimo_v2_combines_image_video_and_audio_features():
-    module = importlib.import_module("mlx_vlm.models.mimo_v2")
-    case = next(c for c in DATA["cases"] if c["id"] == "TestModels.mimo_v2")
-    config = build_config(module, case["config"])
-    model = module.Model(config)
-    vision = config.vision_config
-    patch_width = (
-        vision.in_channels
-        * vision.temporal_patch_size
-        * vision.patch_size
-        * vision.patch_size
-    )
-    image_pixels = mx.random.normal((16, patch_width))
-    image_grid = mx.array([[1, 4, 4]])
-    video_pixels = mx.random.normal((32, patch_width))
-    video_grid = mx.array([[2, 4, 4]])
-    audio_codes = mx.array([[1, 2], [3, 4], [5, 6]])
-    image = model.encode_images(image_pixels, image_grid_thw=image_grid)[0]
-    video = model.encode_video(video_pixels, video_grid)
-    audio = model.encode_audio(audio_codes)
-    ids = mx.array(
-        [
-            [1]
-            + [config.image_token_id] * image.shape[0]
-            + [2]
-            + [config.video_token_id] * video.shape[0]
-            + [3]
-            + [config.audio_token_id] * audio.shape[0]
-            + [4]
-        ]
-    )
-
-    result = model.get_input_embeddings(
-        ids,
-        pixel_values=image_pixels,
-        image_grid_thw=image_grid,
-        pixel_values_videos=video_pixels,
-        video_grid_thw=video_grid,
-        audio_codes=audio_codes,
-    ).inputs_embeds[0]
-    image_start = 1
-    video_start = image_start + image.shape[0] + 1
-    audio_start = video_start + video.shape[0] + 1
-
-    assert mx.allclose(result[image_start : image_start + image.shape[0]], image)
-    assert mx.allclose(result[video_start : video_start + video.shape[0]], video)
-    assert mx.allclose(result[audio_start : audio_start + audio.shape[0]], audio)
-
-
-def test_mimo_v2_rejects_mismatched_modal_features():
-    module = importlib.import_module("mlx_vlm.models.mimo_v2")
-    case = next(c for c in DATA["cases"] if c["id"] == "TestModels.mimo_v2")
-    config = build_config(module, case["config"])
-    model = module.Model(config)
-    ids = mx.array([[config.image_token_id, config.image_token_id]])
-
-    with pytest.raises(ValueError, match="2 placeholder tokens for 1 features"):
-        model.get_input_embeddings(
-            ids,
-            cached_image_features=mx.zeros((1, config.text_config.hidden_size)),
-        )
-    with pytest.raises(ValueError, match="must be 2D"):
-        model.get_input_embeddings(
-            ids,
-            cached_image_features=mx.zeros((1, 1, config.text_config.hidden_size)),
-        )
-    with pytest.raises(ValueError, match="does not match text embedding width"):
-        model.get_input_embeddings(
-            ids,
-            cached_image_features=mx.zeros((2, config.text_config.hidden_size - 1)),
-        )
-
-
-def test_mimo_v2_inserts_audio_features():
-    module = importlib.import_module("mlx_vlm.models.mimo_v2")
-    case = next(c for c in DATA["cases"] if c["id"] == "TestModels.mimo_v2")
-    config = build_config(module, case["config"])
-    model = module.Model(config)
-    ids = mx.array([[1, config.audio_token_id, config.audio_token_id, 2]])
-    codes = mx.array([[1, 2], [3, 4], [5, 6]])
-
-    encoded = model.encode_audio(codes)
-    result = model.get_input_embeddings(ids, audio_codes=codes).inputs_embeds
-
-    assert encoded.shape == (2, config.text_config.hidden_size)
-    assert mx.allclose(result[0, 1:3], encoded)
-
-    with pytest.raises(ValueError, match="at least one frame"):
-        model.audio_encoder(mx.zeros((0, 2), dtype=mx.int32), model.speech_embeddings)
-    with pytest.raises(ValueError, match="at least 2 channels"):
-        model.audio_encoder(mx.zeros((2, 1), dtype=mx.int32), model.speech_embeddings)
-
-
-class TestMiMoV2BatchedAudio:
-    def test_encodes_samples_independently(self):
-        module = importlib.import_module("mlx_vlm.models.mimo_v2")
-        case = next(c for c in DATA["cases"] if c["id"] == "TestModels.mimo_v2")
-        config = build_config(module, case["config"])
-        model = module.Model(config)
-        first = mx.array([[1, 2], [3, 4], [5, 6], [7, 8]])
-        second = mx.array([[8, 7], [6, 5], [4, 3], [2, 1]])
-        expected = mx.concatenate(
-            [model.encode_audio(first), model.encode_audio(second)], axis=0
-        )
-        ids = mx.array([[config.audio_token_id] * expected.shape[0]])
-
-        result = model.get_input_embeddings(
-            ids,
-            audio_codes=mx.concatenate([first, second], axis=0),
-            audio_code_lengths=[first.shape[0], second.shape[0]],
-        ).inputs_embeds
-
-        assert mx.allclose(result[0], expected)
-
-
 def test_glm_quantized_head_sanitization_loads_strictly():
     module = importlib.import_module("mlx_vlm.models.glm5_next")
     model = module.Model(
@@ -1528,248 +1237,6 @@ def test_glm_quantized_head_sanitization_loads_strictly():
     for key, value in sanitized.items():
         assert mx.array_equal(again[key], value).item()
     model.load_weights(list(model.sanitize(checkpoint | head).items()), strict=True)
-
-
-class TestMistralLarge3(unittest.TestCase):
-    """Mistral Large 3: params.json config mapping and native->4-bit load."""
-
-    DIMS = dict(
-        H=128,
-        DI=128,
-        MI=64,
-        NH=2,
-        NP=64,
-        RP=64,
-        VH=64,
-        QL=64,
-        KL=64,
-        V=128,
-        VHID=64,
-        VNH=2,
-        VI=64,
-        PATCH=14,
-        IMG=28,
-        SM=2,
-        NL=5,
-        NE=8,
-        NS=1,
-        DENSE=3,
-    )
-
-    def _config(self):
-        from mlx_vlm.models.mistral_large3 import ModelConfig
-
-        d = self.DIMS
-        return ModelConfig(
-            text_config=dict(
-                model_type="mistral_large3",
-                vocab_size=d["V"],
-                hidden_size=d["H"],
-                intermediate_size=d["DI"],
-                moe_intermediate_size=d["MI"],
-                num_hidden_layers=d["NL"],
-                num_attention_heads=d["NH"],
-                num_key_value_heads=d["NH"],
-                q_lora_rank=d["QL"],
-                kv_lora_rank=d["KL"],
-                qk_nope_head_dim=d["NP"],
-                qk_rope_head_dim=d["RP"],
-                v_head_dim=d["VH"],
-                n_routed_experts=d["NE"],
-                n_shared_experts=d["NS"],
-                num_experts_per_tok=4,
-                first_k_dense_replace=d["DENSE"],
-                rms_norm_eps=1e-6,
-                rope_theta=1e4,
-            ),
-            vision_config=dict(
-                model_type="pixtral",
-                hidden_size=d["VHID"],
-                num_hidden_layers=d["VNH"],
-                num_attention_heads=d["VNH"],
-                head_dim=d["VHID"] // d["VNH"],
-                intermediate_size=d["VI"],
-                image_size=d["IMG"],
-                patch_size=d["PATCH"],
-                rope_theta=1e4,
-            ),
-            image_token_id=10,
-            spatial_merge_size=d["SM"],
-            multimodal_projector_bias=False,
-            vocab_size=d["V"],
-        )
-
-    def _native_source(self):
-        d = self.DIMS
-        H, DI, MI, NH, NP, RP, VH, QL, KL, V = (
-            d["H"],
-            d["DI"],
-            d["MI"],
-            d["NH"],
-            d["NP"],
-            d["RP"],
-            d["VH"],
-            d["QL"],
-            d["KL"],
-            d["V"],
-        )
-        VHID, VI, SM = d["VHID"], d["VI"], d["SM"]
-
-        def z(*s):
-            return (mx.random.normal(s) * 0.02).astype(mx.bfloat16)
-
-        w = {
-            "tok_embeddings.weight": z(V, H),
-            "norm.weight": z(H),
-            "output.weight": z(V, H),
-        }
-        qhd = NP + RP
-        for l in range(d["NL"]):
-            p = f"layers.{l}"
-            w[f"{p}.attention_norm.weight"] = z(H)
-            w[f"{p}.ffn_norm.weight"] = z(H)
-            w[f"{p}.attention.wq_a.weight"] = z(QL, H)
-            w[f"{p}.attention.q_a_norm.weight"] = z(QL)
-            w[f"{p}.attention.wq_b.weight"] = z(NH * qhd, QL)
-            w[f"{p}.attention.wkv_a_with_mqa.weight"] = z(KL + RP, H)
-            w[f"{p}.attention.kv_a_norm.weight"] = z(KL)
-            w[f"{p}.attention.wkv_b.weight"] = z(NH * (NP + VH), KL)
-            w[f"{p}.attention.wo.weight"] = z(H, NH * VH)
-            if l < d["DENSE"]:
-                w[f"{p}.feed_forward.w1.weight"] = z(DI, H)
-                w[f"{p}.feed_forward.w2.weight"] = z(H, DI)
-                w[f"{p}.feed_forward.w3.weight"] = z(DI, H)
-            else:
-                w[f"{p}.gate.weight"] = z(d["NE"], H)
-                for e in range(d["NE"]):
-                    w[f"{p}.experts.{e}.w1.weight"] = z(MI, H)
-                    w[f"{p}.experts.{e}.w2.weight"] = z(H, MI)
-                    w[f"{p}.experts.{e}.w3.weight"] = z(MI, H)
-                w[f"{p}.shared_experts.w1.weight"] = z(MI, H)
-                w[f"{p}.shared_experts.w2.weight"] = z(H, MI)
-                w[f"{p}.shared_experts.w3.weight"] = z(MI, H)
-        w["vision_encoder.patch_conv.weight"] = z(VHID, 3, d["PATCH"], d["PATCH"])
-        w["vision_encoder.ln_pre.weight"] = z(VHID)
-        for n in range(d["VNH"]):
-            p = f"vision_encoder.transformer.layers.{n}"
-            for wk in ("wq", "wk", "wv", "wo"):
-                w[f"{p}.attention.{wk}.weight"] = z(VHID, VHID)
-            w[f"{p}.attention_norm.weight"] = z(VHID)
-            w[f"{p}.feed_forward.w1.weight"] = z(VI, VHID)
-            w[f"{p}.feed_forward.w2.weight"] = z(VHID, VI)
-            w[f"{p}.feed_forward.w3.weight"] = z(VI, VHID)
-            w[f"{p}.ffn_norm.weight"] = z(VHID)
-        w["pre_mm_projector_norm.weight"] = z(VHID)
-        w["patch_merger.merging_layer.weight"] = z(VHID, VHID * SM * SM)
-        w["vision_language_adapter.w_in.weight"] = z(H, VHID)
-        w["vision_language_adapter.w_out.weight"] = z(H, H)
-        return w
-
-    def test_config_from_params_maps_native_fields(self):
-        from mlx_vlm.models.mistral_large3 import ModelConfig
-        from mlx_vlm.models.mistral_large3.config import config_from_params
-
-        params = dict(
-            dim=7168,
-            hidden_dim=16384,
-            n_layers=61,
-            n_heads=128,
-            n_kv_heads=128,
-            q_lora_rank=1536,
-            kv_lora_rank=512,
-            qk_nope_head_dim=128,
-            qk_rope_head_dim=64,
-            v_head_dim=128,
-            norm_eps=1e-6,
-            rope_theta=1e4,
-            vocab_size=131072,
-            max_position_embeddings=294912,
-            moe=dict(
-                expert_hidden_dim=4096,
-                num_experts=128,
-                num_shared_experts=1,
-                num_experts_per_tok=4,
-                first_k_dense_replace=3,
-            ),
-            vision_encoder=dict(
-                hidden_size=1664,
-                num_hidden_layers=48,
-                num_attention_heads=16,
-                intermediate_size=8192,
-                image_size=1540,
-                patch_size=14,
-                rope_theta=1e4,
-                image_token_id=10,
-                spatial_merge_size=2,
-                adapter_bias=False,
-            ),
-        )
-        cfg = ModelConfig(**config_from_params(params))
-        assert cfg.text_config.n_routed_experts == 128
-        assert cfg.text_config.moe_intermediate_size == 4096
-        assert cfg.text_config.first_k_dense_replace == 3
-        assert cfg.text_config.q_lora_rank == 1536
-        assert cfg.vision_config.hidden_size == 1664
-        assert cfg.vision_config.head_dim == 1664 // 16
-        assert cfg.image_token_id == 10
-
-    def test_native_4bit_roundtrip_loads_and_runs(self):
-        cfg = self._config()
-
-        def quantizable(name):
-            if not name.endswith(".weight") or name.startswith(
-                (
-                    "vision_encoder.",
-                    "patch_merger.",
-                    "vision_language_adapter.",
-                    "pre_mm_projector",
-                )
-            ):
-                return False
-            if ".attention." in name:
-                return any(
-                    f".{p}.weight" in name
-                    for p in ("wq_a", "wq_b", "wkv_a_with_mqa", "wkv_b", "wo")
-                )
-            return name.endswith((".w1.weight", ".w2.weight", ".w3.weight"))
-
-        converted = {}
-        for name, w in self._native_source().items():
-            if quantizable(name):
-                qw, sc, bi = mx.quantize(w, group_size=64, bits=4)
-                base = name[: -len(".weight")]
-                converted[name] = qw
-                converted[base + ".scales"] = sc
-                converted[base + ".biases"] = bi
-            else:
-                converted[name] = w
-
-        from mlx_vlm.models.mistral_large3 import Model
-
-        model = Model(cfg)
-        weights = model.sanitize(converted)
-        nn.quantize(
-            model,
-            group_size=64,
-            bits=4,
-            class_predicate=lambda p, m: hasattr(m, "to_quantized")
-            and f"{p}.scales" in weights,
-        )
-        expected = set(dict(tree_flatten(model.parameters())))
-        got = set(weights)
-        assert expected == got, (expected - got, got - expected)
-        model.load_weights(list(weights.items()), strict=True)
-
-        out = model(mx.array([[1, 2, 3, 4]]), pixel_values=None)
-        logits = out.logits if hasattr(out, "logits") else out
-        assert tuple(logits.shape) == (1, 4, self.DIMS["V"])
-
-    def test_sanitize_is_idempotent(self):
-        from mlx_vlm.models.mistral_large3 import Model
-
-        model = Model(self._config())
-        final = dict(tree_flatten(model.parameters()))
-        assert model.sanitize(final).keys() == final.keys()
 
 
 class TestMoondream2Sanitize(unittest.TestCase):
