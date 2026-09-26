@@ -1560,6 +1560,69 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
             self.assertTrue(mx.array_equal(actual, reference).item())
         self.assertIs(converted.to_quantized(group_size=64, bits=4), converted)
 
+    def test_indexer_uses_unrotated_latents_and_adjacent_pair_rope(self):
+        from mlx_vlm.models import deepseek_v41
+        from mlx_vlm.models.deepseek_v41 import language
+        from mlx_vlm.models.deepseek_v41.fakequant import (
+            fake_quant_fp4_e4m3,
+            fake_quant_fp4_ue8m0,
+        )
+
+        case = next(case for case in DATA["cases"] if case["module"] == "deepseek_v41")
+        config = build_config(deepseek_v41, case["config"])
+
+        def rotate(value, positions):
+            # DeepSeek's reference apply_rotary_emb views adjacent pairs as complex.
+            dtype = value.dtype
+            value = np.array(value.astype(mx.float32))
+            rd = config.qk_rope_head_dim
+            frequencies = config.compress_rope_theta ** (
+                -np.arange(0, rd, 2, dtype=np.float32) / rd
+            )
+            angles = np.asarray(positions, dtype=np.float32)[:, None] * frequencies
+            phases = np.exp(1j * angles).astype(np.complex64)
+            phases = phases.reshape(1, len(positions), *((1,) * (value.ndim - 3)), -1)
+            pairs = np.ascontiguousarray(value[..., -rd:]).view(np.complex64)
+            rotated = np.ascontiguousarray(pairs * phases).view(np.float32)
+            return mx.array(
+                np.concatenate([value[..., :-rd], rotated], axis=-1)
+            ).astype(dtype)
+
+        for dtype in (mx.float32, mx.bfloat16):
+            with self.subTest(dtype=dtype):
+                attn = language.DeepseekV41Attention(config, 1)
+                attn.update(tree_map(lambda p: p.astype(dtype), attn.parameters()))
+                # Ratio-2 pooling projections remain FP32 in the reference.
+                attn.compressor.wkv.weight = attn.compressor.wkv.weight.astype(
+                    mx.float32
+                )
+                attn.compressor.wgate.weight = attn.compressor.wgate.weight.astype(
+                    mx.float32
+                )
+                x = mx.random.normal((2, 16, config.hidden_size)).astype(dtype)
+                qr = attn.q_norm(attn.wq_a(x))
+                cache = language.DeepseekV41Cache(config.num_hidden_layers)
+                latent = attn.compressor(x, 0, cache)
+                positions = range(0, x.shape[1], attn.compress_ratio)
+                expected_keys = fake_quant_fp4_ue8m0(
+                    rotate(attn.indexer.k_norm(attn.indexer.wk(latent)), positions)
+                )
+                q = attn.indexer.wq_b(qr).reshape(
+                    *x.shape[:2], config.index_n_heads, config.index_head_dim
+                )
+                expected_queries = fake_quant_fp4_ue8m0(rotate(q, range(x.shape[1])))
+                expected_pool = fake_quant_fp4_e4m3(rotate(latent, positions))
+                with patch.object(
+                    language, "_index_scores", wraps=language._index_scores
+                ) as score:
+                    pool, _ = attn._compress_part(x, qr, 0, cache)
+                for actual, expected in (
+                    (cache.index_k, expected_keys),
+                    (score.call_args.args[0], expected_queries),
+                    (pool, expected_pool),
+                ):
+                    self.assertTrue(mx.allclose(actual, expected, atol=1e-6).item())
+
     def test_image_tokens_use_visual_routing_and_break_engram_history(self):
         """The generation path supplies token ids, including during chunked prefill.
 
@@ -1601,7 +1664,7 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
         expected = output.logits
         mx.eval(expected)
 
-        for chunks in ((8,), (3, 2, 3)):
+        for chunks in ((8,), (3, 2, 3), (1,) * 8):
             with self.subTest(chunks=chunks):
                 cache = model.make_cache()
                 outputs, start = [], 0

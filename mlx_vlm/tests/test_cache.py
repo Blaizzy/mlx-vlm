@@ -204,6 +204,8 @@ def test_deepseek_v41_batch_cache_matches_independent_requests(right_pad, chunks
                 expected = model(
                     ids[index : index + 1, begin:end], cache=reference
                 ).logits
+                full = model(mx.array([prompt[: end - first]])).logits
+                assert_logits(expected, full[:, -(end - begin) :])
                 assert_logits(
                     actual[index : index + 1, begin - start : end - start],
                     expected,
@@ -213,15 +215,18 @@ def test_deepseek_v41_batch_cache_matches_independent_requests(right_pad, chunks
     assert cache[0].offset.tolist() == [9, 3]
 
     # Exercise different compression phases, then admit a new request.
+    histories = [list(prompt) for prompt in prompts]
     for step in range(6):
         if step == 2:
             joined = model.make_cache()
             mx.eval(model(mx.array([[17, 5, 21, 25]]), cache=joined).logits)
             cache = _extend_cache(cache, joined)
             references.append([joined[0].extract(0)])
+            histories.append([17, 5, 21, 25])
         if step == 4:
             cache[0].filter(mx.array([2, 0]))
             references = [references[2], references[0]]
+            histories = [histories[2], histories[0]]
         tokens = mx.array([[31 + index + step] for index in range(len(references))])
         actual = model(tokens, cache=cache).logits
         expected = mx.concatenate(
@@ -232,6 +237,9 @@ def test_deepseek_v41_batch_cache_matches_independent_requests(right_pad, chunks
         )
         assert_logits(actual, expected)
         for index, reference in enumerate(references):
+            histories[index].append(31 + index + step)
+            full = model(mx.array([histories[index]])).logits[:, -1:]
+            assert_logits(actual[index : index + 1], full)
             row = cache[0].extract(index)
             assert row.offset == reference[0].offset
             assert mx.array_equal(row.engram, reference[0].engram).item()

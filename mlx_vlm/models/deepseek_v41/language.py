@@ -238,12 +238,14 @@ def _yarn_params(config: ModelConfig):
 def _apply_index_rotary(
     x: mx.array, cos: mx.array, sin: mx.array, rope_dim: int
 ) -> mx.array:
-    """Rotate the trailing `rope_dim` entries of each head, halves style."""
+    """Rotate adjacent pairs in the trailing `rope_dim` entries of each head."""
     dtype = x.dtype
     x = x.astype(mx.float32)
     passive, rot = x[..., :-rope_dim], x[..., -rope_dim:]
-    x1, x2 = mx.split(rot, 2, axis=-1)
-    out = mx.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
+    pairs = rot.reshape(*rot.shape[:-1], rope_dim // 2, 2)
+    x1, x2 = pairs[..., 0], pairs[..., 1]
+    out = mx.stack([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
+    out = out.reshape(rot.shape)
     return mx.concatenate([passive, out], axis=-1).astype(dtype)
 
 
@@ -330,7 +332,7 @@ class Indexer(nn.Module):
             self.rope_theta,
             self.yarn,
         )
-        k = self.k_norm(self.wk(latent)).astype(mx.float32)
+        k = self.k_norm(self.wk(latent))
         k = _apply_index_rotary(
             k,
             cos[positions][None, :, :],
@@ -358,8 +360,10 @@ class Indexer(nn.Module):
         batch, seqlen = x.shape[0], x.shape[1]
         ratio, end_pos = self.compress_ratio, start_pos + seqlen
 
-        if self.owns_k and latent is not None:
-            cache.index_k = self._publish_keys(latent, start_pos, batch, cache)
+        if self.owns_k:
+            if latent is not None:
+                self._publish_keys(latent, start_pos, batch, cache)
+            cache.index_k = cache.keys[self.layer_idx]
 
         cos, sin = _index_cos_sin(
             end_pos, self.rope_head_dim, self.rope_theta, self.yarn
@@ -367,7 +371,7 @@ class Indexer(nn.Module):
         positions = mx.arange(start_pos, end_pos)
         q = self.wq_b(qr).reshape(batch, seqlen, self.n_heads, self.index_head_dim)
         q = _apply_index_rotary(
-            q.astype(mx.float32),
+            q,
             cos[positions][None, :, None, :],
             sin[positions][None, :, None, :],
             self.rope_head_dim,
@@ -675,23 +679,24 @@ class DeepseekV41Attention(nn.Module):
             if latent is not None:
                 n_latent = latent.shape[1]
                 positions = (start_pos // ratio + mx.arange(n_latent)) * ratio
-                latent = _apply_rope_at_positions(
-                    latent.astype(mx.float32),
+                # The indexer consumes the original, unrotated compressor output.
+                pool_kv = _apply_rope_at_positions(
+                    latent,
                     positions,
                     self.config.qk_rope_head_dim,
                     self._latent_theta,
                     self._latent_yarn,
                 )
-                latent = fake_quant_fp4_e4m3(latent)
+                pool_kv = fake_quant_fp4_e4m3(pool_kv)
                 pool_kv = _write_span(
                     cache.compress[self.layer_idx],
-                    latent,
+                    pool_kv,
                     batch,
                     start_pos // ratio,
                     dtype=mx.float32,
                 )
                 cache.compress[self.layer_idx] = pool_kv
-                cache.compress_kv = pool_kv
+            cache.compress_kv = cache.compress[self.layer_idx]
         compress_len = (start_pos + seqlen) // ratio
         if compress_len == 0 or cache.compress_kv is None:
             pool = mx.zeros((batch, 0, self.head_dim), dtype=x.dtype)
