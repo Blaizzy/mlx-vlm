@@ -439,17 +439,11 @@ class InternVLChatProcessor(ProcessorMixin):
             ):
                 if k in proc_cfg:
                     proc_kwargs[k] = proc_cfg[k]
-            if "num_image_token" not in proc_kwargs and "image_seq_length" in proc_cfg:
-                proc_kwargs["num_image_token"] = proc_cfg["image_seq_length"]
 
         # proc_kwargs override config.json values if present
         image_size = proc_kwargs.pop("image_size", image_size)
         patch_size = proc_kwargs.pop("patch_size", patch_size)
         downsample_ratio = proc_kwargs.pop("downsample_ratio", downsample_ratio)
-        if isinstance(image_size, (list, tuple)):
-            image_size = image_size[0]
-        if isinstance(patch_size, (list, tuple)):
-            patch_size = patch_size[0]
 
         image_processor = InternVLImageProcessor(
             size=image_size,
