@@ -42,6 +42,21 @@ def _convert_to_rgb(image):
     return image.convert("RGB")
 
 
+def _to_numpy_with_format(image):
+    """Convert an image to numpy and return it with its channel layout.
+
+    PIL images are always HWC, so their layout must not be inferred: a 3- or
+    1-pixel-tall image would otherwise be mistaken for channels-first.
+    """
+    from PIL import Image
+
+    is_pil = isinstance(image, Image.Image)
+    image = to_numpy_array(image)
+    if is_pil and image.ndim == 3:
+        return image, ChannelDimension.LAST
+    return image, infer_channel_dimension_format(image)
+
+
 def _to_channel_first(image, input_format):
     if input_format == ChannelDimension.FIRST:
         return image
@@ -214,13 +229,11 @@ class Gemma4ImageProcessor(HFBaseImageProcessor):
         if self.do_convert_rgb:
             images = [_convert_to_rgb(img) for img in images]
 
-        images = [to_numpy_array(img) for img in images]
-
         processed = []
         num_soft_tokens_per_image = []
 
         for image in images:
-            input_data_format = infer_channel_dimension_format(image)
+            image, input_data_format = _to_numpy_with_format(image)
 
             if self.do_resize:
                 image = self.aspect_ratio_preserving_resize(

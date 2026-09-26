@@ -829,6 +829,18 @@ class TestGemma4UnifiedProcessor:
             [x, y] for y in range(2) for x in range(2)
         ]
 
+    @pytest.mark.parametrize("height", [1, 3], ids=["1px-tall", "3px-tall"])
+    def test_short_pil_images_stay_channels_last(self, height):
+        pixels = np.arange(height * 4 * 3, dtype=np.uint8).reshape(height, 4, 3)
+        p = m.g4.Gemma4ImageProcessor(do_resize=False, do_rescale=False)
+        data, _ = p(Image.fromarray(pixels))
+        equal(data["pixel_values"][0], pixels.transpose(2, 0, 1))
+
+        p = _gemma_image()
+        p.do_resize = True
+        data, _ = p(Image.new("RGB", (900, height)))
+        assert data["image_position_ids"][0].max(axis=0).tolist() == [3, 0]
+
     def test_video_padding_and_positions(self):
         video = np.zeros((2, 3, 4, 8), np.uint8)
         p = _gemma_image(m.g4.Gemma4VideoProcessor, max_soft_tokens=70)
