@@ -1,0 +1,256 @@
+from typing import List, Optional
+
+import mlx.core as mx
+import mlx.nn as nn
+
+from ..base import InputEmbeddingsFeatures, LanguageModelOutput
+from .config import ModelConfig
+from .language import LanguageModel
+from .processing_deepseek_v41 import IMAGE, IMAGE_END, IMAGE_NEW_LINE, IMAGE_START
+from .vision import Aligner, ViT
+
+
+def _pack_source_weight(weight, scales):
+    """Repack source bytes without rounding; expand block scales over rows."""
+    if weight.ndim != 2 or scales.ndim != 2 or scales.dtype != mx.uint8:
+        raise ValueError("Expected a matrix of FP8/FP4 bytes and E8M0 scales")
+    if weight.dtype not in (mx.uint8, mx.int8):
+        raise ValueError(f"Expected FP8/FP4 bytes, got {weight.dtype}")
+    rows, cols = weight.shape
+    if scales.shape == (rows, cols // 16) and cols % 16 == 0:
+        mode = "mxfp4"
+    elif cols % 32 == 0 and scales.shape[-1] == cols // 32:
+        mode = "mxfp8"
+        if scales.shape[0] == (rows + 31) // 32:
+            scales = mx.repeat(scales, 32, axis=0)[:rows]
+        elif scales.shape[0] != rows:
+            raise ValueError(
+                f"Invalid FP8 scale rows: {scales.shape} for {weight.shape}"
+            )
+    else:
+        raise ValueError(f"Invalid scale shape: {scales.shape} for {weight.shape}")
+    return weight.view(mx.uint32, stream=mx.cpu), scales, mode
+
+
+class Model(nn.Module):
+    """DeepSeek-V4.1 multimodal model."""
+
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.config = config
+        self.model_type = config.model_type
+        self.language_model = LanguageModel(config)
+        self.vision = ViT(config)
+        self.aligner = Aligner(config)
+        self.image_start = mx.zeros((config.hidden_size,))
+        self.image_end = mx.zeros((config.hidden_size,))
+        self.image_newline = mx.zeros((config.hidden_size,))
+        self.model_path = config.model_path
+
+    def encode_image(self, patches: mx.array, n_vit_h: int, n_vit_w: int) -> mx.array:
+        return self.aligner(self.vision(patches, n_vit_h, n_vit_w), n_vit_h, n_vit_w)
+
+    def merge_image_embeddings(self, images, h: mx.array) -> mx.array:
+        """Overwrite each image's token span with ViT features and span markers.
+
+        `images` is a per-batch list of records with `start`, `patches`,
+        `n_vit_h`, `n_vit_w`, and `types` (IMAGE_START/IMAGE/NEWLINE/END codes).
+        IMAGE slots take aligner rows in reading order; delimiters take the
+        learned span embeddings.
+        """
+        dtype = h.dtype
+        marks = {
+            IMAGE_START: self.image_start,
+            IMAGE_END: self.image_end,
+            IMAGE_NEW_LINE: self.image_newline,
+        }
+        rows = []
+        for b, sample in enumerate(images):
+            row = h[b]
+            for img in sample or []:
+                codes = mx.array(img.types)
+                end = img.start + len(img.types)
+                span = row[img.start : end]
+                is_image = codes == IMAGE
+                order = mx.cumsum(is_image.astype(mx.int32), axis=0) - 1
+                embeds = self.encode_image(img.patches, img.n_vit_h, img.n_vit_w)
+                gathered = embeds[mx.clip(order, 0, embeds.shape[0] - 1)]
+                span = mx.where(is_image[:, None], gathered.astype(dtype), span)
+                for code, mark in marks.items():
+                    span = mx.where((codes == code)[:, None], mark.astype(dtype), span)
+                row = mx.concatenate([row[: img.start], span, row[end:]], axis=0)
+            rows.append(row)
+        return mx.stack(rows, axis=0).astype(dtype)
+
+    def get_input_embeddings(
+        self,
+        input_ids: Optional[mx.array] = None,
+        pixel_values: Optional[List] = None,
+        **kwargs,
+    ) -> InputEmbeddingsFeatures:
+        inputs_embeds = self.language_model.embed_tokens(input_ids)
+        if pixel_values is not None and input_ids.shape[1] != 1:
+            inputs_embeds = self.merge_image_embeddings(pixel_values, inputs_embeds)
+        return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
+
+    def __call__(
+        self,
+        input_ids: mx.array,
+        pixel_values: mx.array = None,
+        mask: mx.array = None,
+        cache=None,
+        **kwargs,
+    ) -> LanguageModelOutput:
+        inputs_embeds = kwargs.pop("inputs_embeds", None)
+        if inputs_embeds is None:
+            inputs_embeds = self.get_input_embeddings(
+                input_ids, pixel_values
+            ).inputs_embeds
+        return self.language_model(
+            input_ids, inputs_embeds=inputs_embeds, cache=cache, **kwargs
+        )
+
+    @property
+    def model_path(self):
+        return getattr(self, "_model_path", None)
+
+    @model_path.setter
+    def model_path(self, value):
+        """The engram hash tables are built from files in the checkpoint dir."""
+        from .engram import OffloadedEngramEmbedding
+
+        self._model_path = value
+        language_model = getattr(self, "language_model", None)
+        if language_model is not None:
+            language_model._engram_source = value
+            # The loader assigns this after eager evaluation. Expose the original
+            # lazy tensors for conversion; inference still reads only mapped rows.
+            for layer in language_model.layers:
+                engram = layer.engram
+                if engram is not None and isinstance(
+                    engram.embed, OffloadedEngramEmbedding
+                ):
+                    engram.embed.restore_parameters()
+
+    def _install_engram_embeddings(self, weights):
+        """Map checkpoint tables for row-wise lookup."""
+        from .engram import OffloadedEngramEmbedding, QuantizedEngramEmbedding
+
+        for idx, layer in enumerate(self.language_model.layers):
+            engram = getattr(layer, "engram", None)
+            if engram is None:
+                continue
+            prefix = f"language_model.layers.{idx}.engram.embed"
+            packed = weights.get(f"{prefix}.weight")
+            scales = weights.get(f"{prefix}.scales")
+            if packed is None:
+                continue
+            if scales is not None:
+                dims = engram.embed.weight.shape[1]
+                bits = 32 * packed.shape[1] // dims
+                group_size = dims // scales.shape[1]
+                engram.embed = QuantizedEngramEmbedding(
+                    packed.shape[0],
+                    dims,
+                    group_size,
+                    bits,
+                    scale_dtype=scales.dtype,
+                    mode=f"mxfp{bits}" if scales.dtype == mx.uint8 else "affine",
+                )
+            if self.config.model_path is not None:
+                names = tuple(engram.embed.parameters())
+                engram.embed.load_weights(
+                    [(name, weights[f"{prefix}.{name}"]) for name in names]
+                )
+                engram.embed = OffloadedEngramEmbedding(
+                    self.config.model_path, prefix, engram.embed
+                )
+                for name in names:
+                    del weights[f"{prefix}.{name}"]
+
+    def quantization_path_aliases(self, path: str):
+        """Routed experts load as ``switch_mlp`` but converters key them ``experts``."""
+        if path.startswith("language_model."):
+            path = path[len("language_model.") :]
+        if ".switch_mlp." in path:
+            return [path.replace(".switch_mlp.", ".experts.")]
+        return []
+
+    def sanitize(self, weights):
+        def transform_key(key):
+            if key.startswith("language_model."):
+                return key
+            if key.startswith("model.") or key.startswith("lm_head."):
+                return f"language_model.{key}"
+            if key.startswith("embed."):
+                return f"language_model.embed_tokens.{key[len('embed.'):]}"
+            if key.startswith("head."):
+                return f"language_model.head.{key[len('head.'):]}"
+            if key.startswith("norm."):
+                return f"language_model.norm.{key[len('norm.'):]}"
+            if key.startswith("layers."):
+                return f"language_model.{key}"
+            return key
+
+        weights = {
+            transform_key(k): v for k, v in weights.items() if not k.startswith("mtp.")
+        }
+        for key in list(weights):
+            if not key.endswith(".scale"):
+                continue
+            weight_key = key[: -len(".scale")] + ".weight"
+            packed, scales, mode = _pack_source_weight(
+                weights[weight_key], weights.pop(key)
+            )
+            if weight_key.endswith(".engram.embed.weight"):
+                weights[weight_key] = packed
+                weights[key + "s"] = scales
+                continue
+            # Leave floating-point modules available to the standard converter.
+            weights[weight_key] = mx.dequantize(
+                packed,
+                scales,
+                group_size=32,
+                bits=4 if mode == "mxfp4" else 8,
+                mode=mode,
+                dtype=mx.bfloat16,
+            )
+
+        from .language import sanitize_moe_weights
+
+        n_layers = self.config.num_hidden_layers
+        n_routed = self.config.n_routed_experts
+        for layer_idx in range(n_layers):
+            weights = sanitize_moe_weights(
+                weights, f"language_model.layers.{layer_idx}.ffn", n_routed
+            )
+
+        for layer_idx in range(n_layers):
+            prefix = f"language_model.layers.{layer_idx}.attn.wo_a"
+            for key in (f"{prefix}.weight", f"{prefix}.scales", f"{prefix}.biases"):
+                if key in weights and weights[key].ndim == 2:
+                    weights[key] = weights[key].reshape(
+                        self.config.o_groups, self.config.o_lora_rank, -1
+                    )
+
+        head_w = "language_model.head.weight"
+        head_s = "language_model.head.scales"
+        head_b = "language_model.head.biases"
+        if head_s in weights and head_b in weights and head_w in weights:
+            in_dim = weights[head_s].shape[-1] * 64
+            bits = 32 * weights[head_w].shape[-1] // in_dim
+            weights[head_w] = mx.dequantize(
+                weights[head_w], weights[head_s], weights[head_b], 64, bits
+            ).astype(mx.float32)
+            del weights[head_s]
+            del weights[head_b]
+
+        self._install_engram_embeddings(weights)
+        return weights
+
+    @property
+    def layers(self):
+        return self.language_model.layers
+
+    def make_cache(self):
+        return self.language_model.make_cache()
