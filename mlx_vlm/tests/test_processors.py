@@ -1564,6 +1564,73 @@ def test_checkpoint_loading(tmp_path, name):
         ) == [3]
 
 
+class TestDeepseekOCRProcessorTokenizer:
+    """The byte-level tokenizer.json must outrank the declared LlamaTokenizerFast."""
+
+    @staticmethod
+    def _checkpoint(path, add_bos_token=None, chat_template=None):
+        from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        alphabet = sorted(pre_tokenizers.ByteLevel.alphabet())
+        backend = Tokenizer(
+            models.BPE(vocab={ch: i for i, ch in enumerate(alphabet)}, merges=[])
+        )
+        backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+        backend.decoder = decoders.ByteLevel()
+        backend.save(str(path / "tokenizer.json"))
+
+        tokenizer_config = {"tokenizer_class": "LlamaTokenizerFast"}
+        if add_bos_token is not None:
+            tokenizer_config["add_bos_token"] = add_bos_token
+        if chat_template is not None:
+            (path / "chat_template.jinja").write_text(chat_template)
+        _write_configs(
+            path,
+            tokenizer_config=tokenizer_config,
+            processor_config={
+                "candidate_resolutions": [[1024, 1024]],
+                "patch_size": 16,
+                "downsample_ratio": 4,
+            },
+        )
+        return m.deepseekocr.DeepseekOCRProcessor.from_pretrained(path)
+
+    def test_prompt_whitespace_survives_the_declared_tokenizer_class(self, tmp_path):
+        processor = self._checkpoint(tmp_path)
+        text = "Transcribe the provided document"
+        ids = processor.tokenizer.encode(text, add_special_tokens=False)
+        assert processor.tokenizer.decode(ids) == text
+
+    def test_checkpoint_chat_template_outranks_the_builtin_default(self, tmp_path):
+        """A fine-tune shipping its own template must not get DeepSeek-OCR's."""
+        default = self._checkpoint(tmp_path / "plain")
+        assert default.chat_template == default.default_chat_template
+
+        template = "{% for m in messages %}<|User|>:{{m['content']}}{% endfor %}"
+        custom = self._checkpoint(tmp_path / "custom", chat_template=template)
+        assert custom.chat_template == template
+
+    def test_bos_follows_the_checkpoint(self, tmp_path):
+        """Only the leading BOS may differ; the prompt itself must be identical."""
+        image = Image.new("RGB", (64, 64))
+
+        def encode(name, add_bos_token):
+            path = tmp_path / name
+            path.mkdir()
+            processor = self._checkpoint(path, add_bos_token=add_bos_token)
+            output = processor(text="a b<image>", images=[image], cropping=False)
+            return processor, output["input_ids"][0].tolist()
+
+        default, default_ids = encode("default", None)
+        disabled, disabled_ids = encode("disabled", False)
+
+        assert default.add_bos_token and not disabled.add_bos_token
+        assert default_ids[0] == (default.bos_id if default.bos_id is not None else 0)
+        assert default_ids[1:] == disabled_ids
+
+
 # Prompt construction
 
 
