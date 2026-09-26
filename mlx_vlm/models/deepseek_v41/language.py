@@ -717,6 +717,9 @@ class DeepseekV41Attention(nn.Module):
         fused attention path. It is lossless: the cache holds fake-quantized fp8
         values, whose mantissa and exponent both fit the narrower type.
         """
+        if isinstance(cache, BatchDeepseekV41Cache):
+            out = cache.map(lambda row, values: self(values, row.offset, row), x)
+            return mx.zeros_like(x) if out is None else out
         batch, seqlen = x.shape[0], x.shape[1]
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr).reshape(batch, seqlen, self.n_heads, self.head_dim)
@@ -1027,6 +1030,7 @@ class DeepseekV41Cache:
     """
 
     N_SLOTS = 5
+    HANDOFF = ("index_k", "candidates", "compress_kv", "topk_idxs")
 
     def __init__(self, n_layers: int = 0, ratios=()):
         self.offset = 0
@@ -1081,11 +1085,13 @@ class DeepseekV41Cache:
         from becoming one command buffer, so it cannot contain ``None``.
         """
         flat = [array for slot in self._slots for array in slot] + [self.engram]
+        flat.extend(getattr(self, name) for name in self.HANDOFF)
         return [mx.zeros((0,)) if array is None else array for array in flat]
 
     @state.setter
     def state(self, value):
         value = list(value)
+        # Older snapshots ended at Engram; the four trailing handoffs are optional.
         n = (len(value) - 1) // self.N_SLOTS
         self.n_layers = n
         restored = [
@@ -1099,9 +1105,12 @@ class DeepseekV41Cache:
             self.kv_state,
             self.score_state,
         ) = restored
-        self.engram = None if value[-1].size == 0 else value[-1]
+        engram = value[self.N_SLOTS * n]
+        self.engram = None if engram.size == 0 else engram
         self.undo = [[] for _ in range(n)]
         self.reset_handoff()
+        for name, array in zip(self.HANDOFF, value[self.N_SLOTS * n + 1 :]):
+            setattr(self, name, None if array.size == 0 else array)
 
     @property
     def meta_state(self):
@@ -1118,6 +1127,38 @@ class DeepseekV41Cache:
         cache.state = state
         cache.meta_state = meta_state
         return cache
+
+    def extract(self, index):
+        def take(array):
+            return None if array is None else mx.array(array[index : index + 1])
+
+        cache = type(self)(self.n_layers, self.ratios)
+        cache.offset = self.offset
+        for target, source in zip(cache._slots, self._slots):
+            target[:] = [take(array) for array in source]
+        cache.engram = take(self.engram)
+        for name in self.HANDOFF:
+            setattr(cache, name, take(getattr(self, name)))
+        cache.undo = [
+            [(slot, 1, take(kv), take(score)) for slot, _, kv, score in history]
+            for history in self.undo
+        ]
+        return cache
+
+    def to_batch(self, left_padding):
+        if self.offset:
+            if len(left_padding) != 1 or any(left_padding):
+                raise ValueError("A populated DeepSeek cache must be merged by request")
+            rows = [self.extract(0)]
+        else:
+            rows = [type(self)(self.n_layers, self.ratios) for _ in left_padding]
+        return BatchDeepseekV41Cache(rows, left_padding)
+
+    @classmethod
+    def merge(cls, caches, prefix_lens=None):
+        # Each row already carries its exact prefix offset.
+        del prefix_lens
+        return BatchDeepseekV41Cache([cache.extract(0) for cache in caches])
 
     def is_trimmable(self) -> bool:
         return True
@@ -1163,6 +1204,120 @@ class DeepseekV41Cache:
             if ratio and self.compress[layer] is not None:
                 self.compress[layer] = self.compress[layer][:, : self.offset // ratio]
             self._restore_slots(layer, n)
+        return n
+
+
+class BatchDeepseekV41Cache:
+    """Keep each request's compression phase and Engram history independent.
+
+    Attention visits the unpadded rows; token-wise layers, including the experts,
+    still run together. This also lets requests join at different offsets without
+    padding or shifting their partially filled compression groups.
+    """
+
+    def __init__(self, rows, left_padding=None):
+        self.rows = list(rows)
+        self.left_padding = (
+            [0] * len(rows) if left_padding is None else list(left_padding)
+        )
+        self._lengths = [None] * len(rows)
+
+    @property
+    def offset(self):
+        return mx.array([row.offset for row in self.rows])
+
+    def _bounds(self, index, width):
+        start = min(self.left_padding[index], width)
+        length = self._lengths[index]
+        stop = width if length is None else min(width, start + length)
+        return start, stop
+
+    def map(self, function, *arrays):
+        width = next(array.shape[1] for array in arrays if array is not None)
+        outputs = []
+        for index, row in enumerate(self.rows):
+            start, stop = self._bounds(index, width)
+            if start == stop:
+                outputs.append(None)
+                continue
+            output = function(
+                row,
+                *(
+                    None if array is None else array[index : index + 1, start:stop]
+                    for array in arrays
+                ),
+            )
+            outputs.append(
+                mx.pad(
+                    output,
+                    [(0, 0), (start, width - stop)] + [(0, 0)] * (output.ndim - 2),
+                )
+            )
+        template = next((output for output in outputs if output is not None), None)
+        if template is None:
+            return None
+        return mx.concatenate(
+            [
+                mx.zeros_like(template) if output is None else output
+                for output in outputs
+            ]
+        )
+
+    def advance(self, width):
+        for index, row in enumerate(self.rows):
+            start, stop = self._bounds(index, width)
+            row.offset += stop - start
+            self.left_padding[index] = max(0, self.left_padding[index] - width)
+            if self._lengths[index] is not None:
+                self._lengths[index] -= stop - start
+
+    def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
+        if left_padding is not None:
+            if any(row.offset for row in self.rows):
+                raise ValueError("Left padding can only be added to an empty cache")
+            self.left_padding = [a + b for a, b in zip(self.left_padding, left_padding)]
+        if right_padding is not None:
+            self._lengths = list(lengths)
+
+    def finalize(self):
+        self._lengths = [None] * len(self.rows)
+
+    def filter(self, indices):
+        indices = indices.tolist() if isinstance(indices, mx.array) else indices
+        self.rows = [self.rows[index] for index in indices]
+        self.left_padding = [self.left_padding[index] for index in indices]
+        self._lengths = [self._lengths[index] for index in indices]
+
+    def extend(self, other):
+        self.rows.extend(other.rows)
+        self.left_padding.extend(other.left_padding)
+        self._lengths.extend(other._lengths)
+
+    def extract(self, index):
+        return self.rows[index].extract(0)
+
+    @property
+    def state(self):
+        return [row.state for row in self.rows]
+
+    def memory_profile(self, token_count):
+        profiles = [row.memory_profile(token_count) for row in self.rows]
+        return CacheMemory(
+            source_bytes=sum(profile.source_bytes for profile in profiles),
+            fixed_bytes=sum(profile.fixed_bytes for profile in profiles),
+            bytes_per_token=sum(profile.bytes_per_token for profile in profiles),
+        )
+
+    def is_trimmable(self):
+        return True
+
+    def size(self):
+        return max((row.offset for row in self.rows), default=0)
+
+    def trim(self, n):
+        n = min(n, min((row.offset for row in self.rows), default=0))
+        for row in self.rows:
+            row.trim(n)
         return n
 
 
@@ -1284,7 +1439,8 @@ class LanguageModel(nn.Module):
                 len(self.layers), [l.attn.compress_ratio for l in self.layers]
             )
         )
-        start_pos = entry.offset
+        batched = isinstance(entry, BatchDeepseekV41Cache)
+        start_pos = 0 if batched else entry.offset
         if input_ids is None:
             input_ids = inputs
         if image_mask is None and input_ids is not None:
@@ -1303,9 +1459,18 @@ class LanguageModel(nn.Module):
         if engram_hashes is None and input_ids is not None:
             self._ensure_engram_hash()
             if self.engram_hash is not None:
-                engram_hashes = self.engram_hash(
-                    input_ids, start_pos, entry, token_mask=engram_mask
-                )
+                if batched:
+                    engram_hashes = entry.map(
+                        lambda row, ids, mask: self.engram_hash(
+                            ids, row.offset, row, token_mask=mask
+                        ),
+                        input_ids,
+                        engram_mask,
+                    )
+                else:
+                    engram_hashes = self.engram_hash(
+                        input_ids, start_pos, entry, token_mask=engram_mask
+                    )
         main_hiddens = []
         capture_ids = (
             self.target_layer_ids if capture_layer_ids is None else capture_layer_ids
@@ -1323,6 +1488,9 @@ class LanguageModel(nn.Module):
             h, pre_mix = layer(h, start_pos, pre_mix, image_mask, entry)
         h = DeepseekV41Block.hc_pre(h, pre_mix)
         logits = self.head(self.norm(h))
-        entry.offset = start_pos + seqlen
+        if batched:
+            entry.advance(seqlen)
+        else:
+            entry.offset = start_pos + seqlen
         hidden = [mx.concatenate(main_hiddens, axis=-1)] if main_hiddens else None
         return LanguageModelOutput(logits=logits, hidden_states=hidden)

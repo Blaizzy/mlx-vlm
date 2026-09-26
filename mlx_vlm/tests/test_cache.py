@@ -161,6 +161,103 @@ def test_arrays_cache_advance_matches_decremented_values():
     assert cache.left_padding is None and cache.lengths is None
 
 
+@pytest.mark.parametrize("right_pad", [False, True])
+@pytest.mark.parametrize("chunks", [((0, 9),), ((0, 2), (2, 5), (5, 8), (8, 9))])
+def test_deepseek_v41_batch_cache_matches_independent_requests(right_pad, chunks):
+    from mlx_vlm.models import deepseek_v41
+    from mlx_vlm.models.deepseek_v41.engram import NgramHashState
+    from mlx_vlm.models.deepseek_v41.language import LanguageModel
+    from mlx_vlm.speculative.cache_state import start_speculative_cache
+
+    mx.random.seed(0)
+    case = next(case for case in DATA["cases"] if case["module"] == "deepseek_v41")
+    config = build_config(deepseek_v41, case["config"])
+    model = LanguageModel(config)
+    model.engram_hash = NgramHashState(
+        config, model.layout, token_map=[i % 7 for i in range(config.vocab_size)]
+    )
+    model.head.weight = mx.random.normal(model.head.weight.shape) * 0.05
+    prompts = [[3, 7, 5, 5, 11, 15, 19, 23, 27], [9, 5, 13]]
+
+    def assert_logits(actual, expected):
+        mx.eval(actual, expected)
+        assert mx.allclose(actual, expected, atol=1e-4).item()
+
+    references = [model.make_cache() for _ in prompts]
+    padding = [0, 6]
+    cache = _make_cache(model, [0, 0] if right_pad else padding)
+    if right_pad:
+        cache[0].prepare(lengths=[9, 3], right_padding=padding)
+    ids = mx.array(
+        [
+            prompt + [0] * pad if right_pad else [0] * pad + prompt
+            for prompt, pad in zip(prompts, padding)
+        ]
+    )
+    # One row is entirely padding in two of these chunks.
+    for start, stop in chunks:
+        actual = model(ids[:, start:stop], cache=cache).logits
+        mx.eval(actual, cache[0].state)
+        for index, (prompt, reference) in enumerate(zip(prompts, references)):
+            first = 0 if right_pad else padding[index]
+            begin, end = max(start, first), min(stop, first + len(prompt))
+            if begin < end:
+                expected = model(
+                    ids[index : index + 1, begin:end], cache=reference
+                ).logits
+                assert_logits(
+                    actual[index : index + 1, begin - start : end - start],
+                    expected,
+                )
+    if right_pad:
+        cache[0].finalize()
+    assert cache[0].offset.tolist() == [9, 3]
+
+    # Exercise different compression phases, then admit a new request.
+    for step in range(6):
+        if step == 2:
+            joined = model.make_cache()
+            mx.eval(model(mx.array([[17, 5, 21, 25]]), cache=joined).logits)
+            cache = _extend_cache(cache, joined)
+            references.append([joined[0].extract(0)])
+        if step == 4:
+            cache[0].filter(mx.array([2, 0]))
+            references = [references[2], references[0]]
+        tokens = mx.array([[31 + index + step] for index in range(len(references))])
+        actual = model(tokens, cache=cache).logits
+        expected = mx.concatenate(
+            [
+                model(tokens[index : index + 1], cache=reference).logits
+                for index, reference in enumerate(references)
+            ]
+        )
+        assert_logits(actual, expected)
+        for index, reference in enumerate(references):
+            row = cache[0].extract(index)
+            assert row.offset == reference[0].offset
+            assert mx.array_equal(row.engram, reference[0].engram).item()
+
+    # Merging already-populated scalar caches is the server join path.
+    merged = _extend_cache(references[0], references[1])
+    tokens = mx.array([[41], [43]])
+    assert_logits(
+        model(tokens, cache=merged).logits,
+        model(tokens, cache=cache).logits,
+    )
+    restored = [
+        DeepseekV41Cache.from_state(row.state, row.meta_state)
+        for row in (cache[0].extract(0), cache[0].extract(1))
+    ]
+    cache = [DeepseekV41Cache.merge(restored, [row.offset for row in restored])]
+    # A rejected speculative block must restore each compression phase.
+    with start_speculative_cache(cache, 3):
+        mx.eval(model(mx.array([[47, 49, 51], [53, 55, 57]]), cache=cache).logits)
+    assert_logits(
+        model(tokens, cache=cache).logits,
+        model(tokens, cache=merged).logits,
+    )
+
+
 @pytest.mark.parametrize("family", ["shared", "qwen"])
 @pytest.mark.parametrize("use_kernel", [False, True])
 @pytest.mark.parametrize("parts", [(4,), (1, 1, 1, 1), (1, 3), (2, 2)])
