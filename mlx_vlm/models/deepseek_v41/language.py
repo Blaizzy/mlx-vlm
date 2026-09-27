@@ -4,10 +4,11 @@ from typing import Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 from ..base import LanguageModelOutput
 from ..cache import CacheMemory, cache_nbytes
-from ..deepseek_v4.hyper_connection import hc_expand, hc_split_sinkhorn
+from ..deepseek_v4.hyper_connection import hc_split_sinkhorn
 from ..deepseek_v4.language import (
     DeepseekV4MLP,
     DeepseekV4RoPE,
@@ -73,11 +74,22 @@ def _write_span(buffer, values, batch: int, start: int, fill=0, dtype=None):
     return head
 
 
-@lru_cache(64)
 def _index_cos_sin(length: int, rope_dim: int, theta: float, yarn: tuple):
     """RoPE tables with DeepSeek-YaRN interpolation, one row per position."""
+    # Reuse the high-precision CPU work across successive decode positions.
+    capacity = ((length + 255) // 256) * 256
+    cos, sin = _cached_index_cos_sin(capacity, rope_dim, theta, yarn)
+    return cos[:length], sin[:length]
+
+
+@lru_cache(64)
+def _cached_index_cos_sin(length: int, rope_dim: int, theta: float, yarn: tuple):
     dims = rope_dim
-    inv_freq = 1.0 / (theta ** (mx.arange(0, dims, 2, dtype=mx.float32) / dims))
+    # GPU power approximation errors grow into phase errors at long positions.
+    powers = np.array(
+        [theta ** (i / dims) for i in range(0, dims, 2)], dtype=np.float32
+    )
+    inv_freq = 1.0 / powers
     factor, beta_fast, beta_slow, orig_len = yarn
 
     def correction_dim(num_rotations):
@@ -87,16 +99,20 @@ def _index_cos_sin(length: int, rope_dim: int, theta: float, yarn: tuple):
             / (2 * math.log(theta))
         )
 
-    low = max(math.floor(correction_dim(beta_fast)), 0)
-    high = min(math.ceil(correction_dim(beta_slow)), dims - 1)
-    if low == high:
-        high += 0.001
-    ramp = (mx.arange(dims // 2, dtype=mx.float32) - low) / (high - low)
-    smooth = 1 - mx.clip(ramp, 0, 1)
-    inv_freq = inv_freq / factor * (1 - smooth) + inv_freq * smooth
+    if orig_len > 0:
+        low = max(math.floor(correction_dim(beta_fast)), 0)
+        high = min(math.ceil(correction_dim(beta_slow)), dims - 1)
+        ramp = (np.arange(dims // 2, dtype=np.float32) - low) / max(high - low, 1e-3)
+        smooth = 1 - np.clip(ramp, 0, 1)
+        inv_freq = inv_freq / factor * (1 - smooth) + inv_freq * smooth
 
-    freqs = mx.arange(length, dtype=mx.float32)[:, None] * inv_freq[None, :]
-    return mx.cos(freqs), mx.sin(freqs)
+    # Keep the source's FP32 phases, then evaluate trig accurately before
+    # rounding back to FP32. Small table errors can change BF16/FP4 rounding.
+    freqs = np.arange(length, dtype=np.float32)[:, None] * inv_freq[None, :]
+    freqs = freqs.astype(np.float64)
+    return mx.array(np.cos(freqs).astype(np.float32)), mx.array(
+        np.sin(freqs).astype(np.float32)
+    )
 
 
 INDEX_SCORE_TILE = 4096
@@ -171,11 +187,11 @@ def _apply_index_rotary(
 ) -> mx.array:
     """Rotate adjacent pairs in the trailing `rope_dim` entries of each head."""
     dtype = x.dtype
-    passive, rot = x[..., :-rope_dim], x[..., -rope_dim:].astype(mx.float32)
-    pairs = rot.reshape(*rot.shape[:-1], rope_dim // 2, 2)
-    x1, x2 = pairs[..., 0], pairs[..., 1]
-    out = mx.stack([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
-    out = out.reshape(rot.shape)
+    passive = x[..., :-rope_dim]
+    rot = x[..., -rope_dim:].astype(mx.float32).view(mx.complex64)
+    freqs = mx.stack([cos, sin], axis=-1)
+    freqs = freqs.reshape(*cos.shape[:-1], rope_dim).view(mx.complex64)
+    out = (rot * freqs).view(mx.float32)
     return mx.concatenate([passive, out.astype(dtype)], axis=-1)
 
 
@@ -859,6 +875,16 @@ class Compressor(nn.Module):
         if not should_compress:
             return None
         return self.norm(kv.astype(dtype))
+
+
+@mx.compile
+def hc_expand(x, residual, post, comb):
+    # Preserve the source's FP32 multiply-then-sum rounding. A matmul fuses
+    # these products into its accumulation, changing some BF16 residuals.
+    mixed = (comb[..., None] * residual.astype(mx.float32)[..., None, :]).sum(axis=2)
+    return (post[..., None] * x.astype(mx.float32)[:, :, None, :] + mixed).astype(
+        x.dtype
+    )
 
 
 def make_identity_pre_mix(batch: int, seqlen: int, hc_mult: int) -> mx.array:

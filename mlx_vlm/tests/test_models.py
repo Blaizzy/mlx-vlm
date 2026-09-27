@@ -1391,6 +1391,77 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
     def setUp(self):
         mx.random.seed(0)
 
+    def test_index_rotary_matches_reference_at_long_positions(self):
+        from mlx_vlm.models.deepseek_v41.language import (
+            _apply_index_rotary,
+            _index_cos_sin,
+        )
+
+        dim, length, theta = 64, 32769, 160000
+        factor, beta_fast, beta_slow, original_length = 16, 32, 1, 65536
+
+        def correction(rotations):
+            return (
+                dim
+                * np.log(original_length / (rotations * 2 * np.pi))
+                / (2 * np.log(theta))
+            )
+
+        low = int(np.floor(correction(beta_fast)))
+        high = int(np.ceil(correction(beta_slow)))
+        ramp = (np.arange(dim // 2, dtype=np.float32) - low) / (high - low)
+        smooth = 1 - np.clip(ramp, 0, 1)
+        powers = np.power(np.float64(theta), np.arange(0, dim, 2) / dim)
+        inv = 1 / powers.astype(np.float32)
+        inv = inv / factor * (1 - smooth) + inv * smooth
+        phase = np.arange(length, dtype=np.float32)[:, None] * inv[None, :]
+        cos, sin = _index_cos_sin(
+            length, dim, theta, (factor, beta_fast, beta_slow, original_length)
+        )
+        phase = phase.astype(np.float64)
+        np.testing.assert_array_equal(np.array(cos), np.cos(phase).astype(np.float32))
+        np.testing.assert_array_equal(np.array(sin), np.sin(phase).astype(np.float32))
+
+        for batch, count in ((1, 1), (2, 17)):
+            with self.subTest(batch=batch, length=count):
+                x = mx.random.normal((batch, count, 4, 80)).astype(mx.bfloat16)
+                c, s = cos[None, -count:, None], sin[None, -count:, None]
+                data = np.array(x.astype(mx.float32))
+                rotated = data[..., -dim:].copy().view(np.complex64)
+                frequencies = np.array(c) + np.complex64(1j) * np.array(s)
+                rotated = (rotated * frequencies).view(np.float32)
+                expected = np.concatenate([data[..., :-dim], rotated], axis=-1)
+                actual = _apply_index_rotary(x, c, s, dim)
+                self.assertEqual(actual.dtype, x.dtype)
+                self.assertTrue(
+                    mx.array_equal(actual, mx.array(expected).astype(x.dtype)).item()
+                )
+
+    def test_hc_expansion_preserves_reference_rounding(self):
+        from mlx_vlm.models.deepseek_v41.language import hc_expand
+
+        for dtype in (mx.float32, mx.float16, mx.bfloat16):
+            for batch, length in ((1, 1), (2, 5), (1, 256)):
+                with self.subTest(dtype=dtype, batch=batch, length=length):
+                    x = mx.random.normal((batch, length, 128)).astype(dtype)
+                    residual = mx.random.normal((batch, length, 4, 128)).astype(dtype)
+                    post = mx.random.uniform(low=0, high=2, shape=(batch, length, 4))
+                    comb = mx.softmax(mx.random.normal((batch, length, 4, 4)), axis=-1)
+                    xx, rr, pp, cc = [
+                        np.array(a.astype(mx.float32))
+                        for a in (x, residual, post, comb)
+                    ]
+                    # Independent CPU evaluation of the source's explicit
+                    # products and reduction; matmul changes the rounding.
+                    expected = pp[..., None] * xx[:, :, None, :] + np.sum(
+                        cc[..., None] * rr[..., None, :], axis=2, dtype=np.float32
+                    )
+                    actual = hc_expand(x, residual, post, comb)
+                    self.assertEqual(actual.dtype, dtype)
+                    self.assertTrue(
+                        mx.array_equal(actual, mx.array(expected).astype(dtype)).item()
+                    )
+
     def test_activation_fp8_rounding_matches_reference(self):
         from mlx_vlm.models.deepseek_v41.fakequant import fake_quant_fp8_ue8m0
 
