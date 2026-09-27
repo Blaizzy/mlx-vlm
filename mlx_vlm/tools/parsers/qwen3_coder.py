@@ -13,7 +13,10 @@ from typing import Any, Optional
 import regex as re
 
 _function_regex = re.compile(r"<function=(.*?)</function>$", re.DOTALL)
-_parameter_regex = re.compile(r"<parameter=(.*?)</parameter>", re.DOTALL)
+# A parameter ends at </parameter>. Only an unclosed last parameter ends at
+# the end of the function body: splitting at an inner "<parameter=" would
+# corrupt closed values that contain that text.
+_parameter_regex = re.compile(r"<parameter=(.*?)(</parameter>|\Z)", re.DOTALL)
 
 _string_types = {"string", "str", "text", "varchar", "char", "enum"}
 _bool_types = {"boolean", "bool", "binary"}
@@ -39,13 +42,19 @@ def _convert_param_value(param_value: str, param_name: str, param_config: dict) 
     if param_value.lower() == "null":
         return None
 
-    if not (param := param_config.get(param_name, False)):
+    if param_name not in param_config:
         return param_value
+    param = param_config[param_name]
 
-    if "type" in param:
+    if isinstance(param, dict) and "type" in param:
         param_type = str(param["type"]).strip().lower()
     else:
-        param_type = "string"
+        # Untyped: decode objects and arrays, keep scalars such as "123" as text.
+        try:
+            value = json.loads(param_value)
+        except json.JSONDecodeError:
+            return param_value
+        return value if isinstance(value, (dict, list)) else param_value
     if param_type in _string_types:
         return param_value
     elif (
@@ -86,18 +95,25 @@ def _parse_xml_function_call(function_call_str: str, tools: Optional[Any]):
     param_config = _get_arguments_config(function_name, tools)
     parameters = function_call_str[end_index + 1 :]
     param_dict = {}
-    for match_text in _parameter_regex.findall(parameters):
-        idx = match_text.index(">")
+    for match_text, closer in _parameter_regex.findall(parameters):
+        if (idx := match_text.find(">")) == -1:
+            continue
         param_name = match_text[:idx]
-        param_value = str(match_text[idx + 1 :])
+        param_value = match_text[idx + 1 :]
         if param_value.startswith("\n"):
             param_value = param_value[1:]
         if param_value.endswith("\n"):
             param_value = param_value[:-1]
 
-        param_dict[param_name] = _convert_param_value(
-            param_value, param_name, param_config
-        )
+        try:
+            param_dict[param_name] = _convert_param_value(
+                param_value, param_name, param_config
+            )
+        except (ValueError, SyntaxError, TypeError):
+            # An unclosed last parameter may be cut short; drop it as main did
+            # rather than fail the whole call.
+            if closer:
+                raise
     return dict(name=function_name, arguments=param_dict)
 
 

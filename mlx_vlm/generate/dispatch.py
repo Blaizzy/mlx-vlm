@@ -42,12 +42,7 @@ from .common import (
     generation_stream,
     wired_limit,
 )
-from .image import (
-    DEFAULT_IMAGE_SIZE,
-    DEFAULT_IMAGE_STEPS,
-    DEFAULT_IMAGE_TASK,
-    run_image_generation_cli,
-)
+from .image import DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_TASK, run_image_generation_cli
 from .video_generation import DEFAULT_VIDEO_STEPS, run_video_generation_cli
 
 logger = logging.getLogger("mlx_vlm.generate")
@@ -150,8 +145,8 @@ def parse_arguments():
         type=int,
         default=None,
         help=(
-            "Number of inference steps. Defaults to "
-            f"{DEFAULT_IMAGE_STEPS} for images and {DEFAULT_VIDEO_STEPS} for videos."
+            "Number of inference steps. Uses the model default for images "
+            f"and {DEFAULT_VIDEO_STEPS} for videos when omitted."
         ),
     )
     parser.add_argument(

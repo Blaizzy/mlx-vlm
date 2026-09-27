@@ -18,13 +18,6 @@ import numpy as np
 import pytest
 from mlx.utils import tree_flatten
 
-from mlx_vlm.gliner import (
-    GLiNER2,
-    _CharSplitter,
-    _resolve_flat_overlaps,
-    _schema_tokens,
-    _WhitespaceSplitter,
-)
 from mlx_vlm.models.bert import ModelConfig as BertConfig
 from mlx_vlm.models.bert import TokenClassificationModel as BertTokenClassifier
 from mlx_vlm.models.gliner2_5 import Model as GlinerModel
@@ -34,6 +27,11 @@ from mlx_vlm.models.gliner2_5.boundary import (
     Marginals,
     PooledCandidates,
     SharedPoolScorer,
+)
+from mlx_vlm.models.gliner2_5.gliner2_5 import (
+    _resolve_flat_overlaps,
+    _schema_tokens,
+    _split_words,
 )
 from mlx_vlm.models.openai_privacy_filter import Model as PrivacyModel
 from mlx_vlm.models.openai_privacy_filter import ModelConfig as PrivacyConfig
@@ -73,8 +71,8 @@ def test_checkpoint_key_sanitization():
 def test_word_splitters_preserve_offsets():
     text = "Email Me@Example.com 北京"
 
-    whitespace = _WhitespaceSplitter()(text)
-    characters = _CharSplitter()(text)
+    whitespace = _split_words(text, "whitespace")
+    characters = _split_words(text, "char")
 
     assert whitespace[1] == ("me@example.com", 6, 20)
     assert characters[-2:] == [("北", 21, 22), ("京", 22, 23)]
@@ -199,9 +197,10 @@ def test_flat_overlap_resolution_keeps_disjoint_spans():
     [(0, {"word_splitter": "bpe"}, "word_splitter"), (4, {}, "special tokens")],
 )
 def test_gliner2_rejects_incompatible_tokenization(added, kwargs, error):
+    model = SimpleNamespace(config=SimpleNamespace(max_len=32))
     tokenizer = SimpleNamespace(add_special_tokens=lambda _: added)
     with pytest.raises(ValueError, match=error):
-        GLiNER2(object(), tokenizer, **kwargs)
+        GlinerModel._prepare(model, tokenizer, "text", (), **kwargs)
 
 
 def test_quantized_encoder_still_runs():

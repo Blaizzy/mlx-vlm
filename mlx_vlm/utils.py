@@ -755,7 +755,9 @@ def get_model_and_args(config: dict, model_path: Optional[Path] = None):
 
     architectures = set(config.get("architectures") or ())
     dflash_config = config.get("dflash_config")
-    if "BoundaryExtractor" in architectures:
+    if "Lfm2BidirectionalForMaskedLM" in architectures:
+        model_type = "lfm2_encoder"
+    elif "BoundaryExtractor" in architectures:
         model_type = "gliner2_5"
     elif "DFlash2DraftModel" in architectures:
         model_type = "dflash2"

@@ -56,6 +56,92 @@ prism_ops = importlib.import_module(
 qwen35 = importlib.import_module("mlx_vlm.models.qwen3_5")
 
 
+def test_mimo_v2_unfuses_tensor_parallel_qkv_shards():
+    module = importlib.import_module("mlx_vlm.models.mimo_v2")
+    text = module.TextConfig(
+        hidden_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=12,
+        num_key_value_heads=4,
+        head_dim=32,
+        v_head_dim=32,
+        swa_num_attention_heads=12,
+        swa_num_key_value_heads=4,
+        swa_head_dim=32,
+        swa_v_head_dim=32,
+        partial_rotary_factor=0.5,
+        hybrid_layer_pattern=[0, 1],
+        moe_layer_freq=[0, 0],
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+        vocab_size=32,
+        intermediate_size=64,
+        moe_intermediate_size=32,
+    )
+    language = module.language.LanguageModel(text)
+    sections = (("q", 96), ("k", 32), ("v", 32))
+    tags = {}
+    rows = []
+    for rank in range(4):
+        for name, count in sections:
+            tag = 56 + 4 * rank + {"q": 0, "k": 1, "v": 2}[name]
+            tags[name, rank] = tag
+            rows.append(mx.full((count, text.hidden_size), tag, dtype=mx.uint8))
+
+    out = language._unfuse_qkv(
+        {
+            "model.layers.0.self_attn.qkv_proj.weight": mx.concatenate(rows),
+            "model.layers.0.self_attn.qkv_proj.weight_scale_inv": mx.ones((8, 1)),
+        }
+    )
+
+    assert not any("qkv_proj" in key for key in out)
+    for projection, rows_per_shard in (
+        ("q_proj", 96),
+        ("k_proj", 32),
+        ("v_proj", 32),
+    ):
+        weight = out[f"model.layers.0.self_attn.{projection}.weight"]
+        assert weight.shape[0] == rows_per_shard * 4
+        for rank in range(4):
+            block = weight[rank * rows_per_shard : (rank + 1) * rows_per_shard]
+            expected = mx.from_fp8(
+                mx.full((1, 1), tags[projection[0], rank], dtype=mx.uint8),
+                dtype=mx.float32,
+            )
+            assert mx.allclose(block.astype(mx.float32), expected.astype(mx.float32))
+
+
+def test_mimo_v2_batched_vision_attention_matches_independent_sequences():
+    from mlx_vlm.models.mimo_v2.config import VisionConfig
+    from mlx_vlm.models.mimo_v2.vision import VisionAttention
+
+    attention = VisionAttention(
+        VisionConfig(
+            hidden_size=64,
+            num_heads=4,
+            num_key_value_heads=2,
+            qk_channels=16,
+        ),
+        use_sinks=True,
+        window_size=4,
+    )
+    q = mx.random.normal((3, 8, 4, 16))
+    k = mx.random.normal((3, 8, 2, 16))
+    v = mx.random.normal((3, 8, 2, 16))
+
+    batched = attention._attend(q, k, v, full_attn=False)
+    independent = mx.concatenate(
+        [
+            attention._attend(q[i : i + 1], k[i : i + 1], v[i : i + 1], False)
+            for i in range(3)
+        ],
+        axis=0,
+    )
+
+    assert mx.allclose(batched, independent)
+
+
 # Attention kernels
 
 # Dims chosen only to steer the gate; they do not affect the attention maths.
