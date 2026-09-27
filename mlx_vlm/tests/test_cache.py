@@ -2190,8 +2190,8 @@ def test_quantized_hybrid_snapshots(managers):
 
 @pytest.mark.parametrize("tier", ["memory", "disk-only"])
 def test_glm5_next_apc_excludes_projected_prefill_cache(prefix_manager, tier):
+    from mlx_vlm.models.glm5_next.language import LanguageModel as Glm5NextLanguageModel
     from mlx_vlm.models.glm5_next.language import (
-        LanguageModel as Glm5NextLanguageModel,
         ProjectedBatchKVCache,
         ProjectedKVCache,
     )
