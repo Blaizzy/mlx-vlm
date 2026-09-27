@@ -3255,29 +3255,57 @@ class APCManager:
             min(limits) if limits else self.memory_max_bytes + self.memory_reserve_bytes
         )
 
-    def _make_room(self, allocation_bytes: int = 0, *, retain_bytes: int = 0) -> bool:
+    def _make_room(
+        self,
+        allocation_bytes: int = 0,
+        *,
+        retain_bytes: int = 0,
+        prefill_reserve_bytes: Optional[int] = None,
+        protected_exact_keys: Optional[set[int]] = None,
+    ) -> bool:
         """Evict idle APC state before allocating; never alter leased blocks."""
+        prefill_reserve = (
+            self._prefill_reserve_bytes
+            if prefill_reserve_bytes is None
+            else max(0, int(prefill_reserve_bytes))
+        )
         required = self.memory_reserve_bytes + (
-            self._prefill_reserve_bytes + allocation_bytes
+            prefill_reserve + allocation_bytes
             if retain_bytes
-            else max(self._prefill_reserve_bytes, allocation_bytes)
+            else max(prefill_reserve, allocation_bytes)
         )
         with self.lock:
+            headroom = self._memory_headroom()
             resident = self._resident_bytes_locked()
-            target = max(
-                0,
-                min(
-                    self.memory_max_bytes - retain_bytes,
-                    resident + self._memory_headroom() - required,
-                ),
+            protected = protected_exact_keys or set()
+            target = min(
+                self.memory_max_bytes - retain_bytes,
+                resident + headroom - required,
             )
+            reclaimable = sum(
+                _cache_nbytes(entry.prompt_cache)
+                for key, entry in self._exact_cache.items()
+                if key not in protected
+            )
+            block = self._free_head
+            while block is not None:
+                if block.block_hash is not None:
+                    reclaimable += block.resident_bytes()
+                block = block.next
+            if target < 0 or resident - reclaimable > target:
+                return False
+            target = max(0, target)
             evicted = 0
+            evicted_bytes = 0
             while resident > target:
-                if self._exact_cache:
-                    resident -= _cache_nbytes(
-                        self._exact_cache[next(iter(self._exact_cache))].prompt_cache
-                    )
-                    self._exact_cache.popitem(last=False)
+                exact_key = next(
+                    (key for key in self._exact_cache if key not in protected), None
+                )
+                if exact_key is not None:
+                    released = _cache_nbytes(self._exact_cache[exact_key].prompt_cache)
+                    resident -= released
+                    evicted_bytes += released
+                    del self._exact_cache[exact_key]
                 else:
                     block = self._free_head
                     while block is not None and block.block_hash is None:
@@ -3285,7 +3313,9 @@ class APCManager:
                     if block is None:
                         break
                     self._free_remove(block)
-                    resident -= block.resident_bytes()
+                    released = block.resident_bytes()
+                    resident -= released
+                    evicted_bytes += released
                     self.hash_table.pop(block.block_hash, None)
                     block.block_hash = None
                     block.token_ids = ()
@@ -3294,19 +3324,81 @@ class APCManager:
                 self.stats.evictions += 1
                 self.stats.memory_evictions += 1
                 evicted += 1
-        if evicted or self._memory_headroom() < required:
+        if evicted or headroom < required:
             mx.clear_cache()
         return (
             resident + retain_bytes <= self.memory_max_bytes
-            and self._memory_headroom() >= required
+            and headroom + evicted_bytes >= required
         )
 
-    def prepare_prefill(self, reserve_bytes: int) -> None:
+    def prepare_prefill(
+        self,
+        reserve_bytes: int,
+        *,
+        evict: bool = True,
+        protected_exact_keys: Optional[set[int]] = None,
+    ) -> None:
         """Enforce the coordinator's byte budget before new allocations."""
         if self.disk is not None:
             self.disk.flush()
         self._prefill_reserve_bytes = max(0, int(reserve_bytes))
-        self._make_room()
+        if evict:
+            self._make_room(protected_exact_keys=protected_exact_keys)
+
+    def exact_prefix_plan(
+        self,
+        token_ids: Sequence[int],
+        extra_hash: int = 0,
+        max_prefix_tokens: Optional[int] = None,
+        min_prefix_tokens: int = 0,
+    ) -> Tuple[int, Optional[int]]:
+        """Return the longest exact prefix and the resident entry it depends on."""
+        disk = self.disk
+        if self._exact_cache_max <= 0 and disk is None:
+            return 0, None
+        token_tuple = tuple(int(t) for t in token_ids)
+        max_len = len(token_tuple) - 1
+        if max_prefix_tokens is not None and max_prefix_tokens > 0:
+            max_len = min(max_len, int(max_prefix_tokens))
+        if max_len <= min_prefix_tokens:
+            return 0, None
+        best_key: Optional[int] = None
+        prefix_len = 0
+        with self.lock:
+            if self._exact_cache_max > 0:
+                for key, entry in self._exact_cache.items():
+                    if entry.extra_hash != extra_hash:
+                        continue
+                    candidate_len = _checkpoint_match_len(
+                        token_tuple,
+                        entry.token_ids,
+                        max_len,
+                        self.block_size,
+                        _dense_checkpoint_trimmable(
+                            entry.prompt_cache, len(entry.token_ids)
+                        ),
+                    )
+                    if candidate_len > max(min_prefix_tokens, prefix_len):
+                        best_key = key
+                        prefix_len = candidate_len
+        can_try_disk = disk is not None and prefix_len < max_len
+        if can_try_disk and self._disk_min_free_ram_bytes > 0:
+            free_now = _free_ram_bytes()
+            can_try_disk = free_now is None or free_now >= self._disk_min_free_ram_bytes
+        if can_try_disk and disk is not None:
+            disk_match = disk.find_exact_prefix(
+                token_tuple,
+                extra_hash=extra_hash,
+                max_prefix_tokens=max_prefix_tokens,
+                min_prefix_tokens=max(min_prefix_tokens, prefix_len),
+                block_size=self.block_size,
+            )
+            if disk_match is not None:
+                _, disk_prefix_len = disk_match
+                if disk_prefix_len > prefix_len:
+                    prefix_len = disk_prefix_len
+                    best_key = None
+        return prefix_len, best_key
 
     # ---------- Public API ----------
     def lookup_exact_cache(
@@ -3315,6 +3407,7 @@ class APCManager:
         extra_hash: int = 0,
         max_prefix_tokens: Optional[int] = None,
         min_prefix_tokens: int = 0,
+        protected_exact_keys: Optional[set[int]] = None,
     ) -> Tuple[Optional[List[Any]], int]:
         """Return the longest restorable prefix from prompt-cache snapshots.
 
@@ -3339,6 +3432,7 @@ class APCManager:
 
         source_cache: Optional[List[Any]] = None
         prefix_len = 0
+        protected = set(protected_exact_keys or ())
         with self.lock:
             best_key: Optional[int] = None
             best_entry: Optional[APCExactCacheEntry] = None
@@ -3361,7 +3455,9 @@ class APCManager:
                     best_entry = entry
                     prefix_len = candidate_len
 
+                entry = None
                 if best_entry is not None and best_key is not None:
+                    protected.add(best_key)
                     self._exact_cache.move_to_end(best_key)
                     source_cache = best_entry.prompt_cache
                     if prefix_len < len(best_entry.token_ids):
@@ -3392,7 +3488,10 @@ class APCManager:
                 cache_hash, disk_prefix_len = disk_match
                 # Admit stored buffers before estimating expansion from their layout.
                 restore_bytes = disk.exact_cache_bytes(cache_hash)
-                if not self._make_room(2 * restore_bytes):
+                if not self._make_room(
+                    2 * restore_bytes,
+                    protected_exact_keys=protected,
+                ):
                     with self.lock:
                         self.stats.memory_skips += 1
                     disk_match = None
@@ -3416,7 +3515,10 @@ class APCManager:
                         expanded_bytes = self.memory_plan.restore_bytes(
                             prompt_cache, disk_prefix_len, prompt_capacity_tokens
                         )
-                        if not self._make_room(2 * expanded_bytes):
+                        if not self._make_room(
+                            2 * expanded_bytes,
+                            protected_exact_keys=protected,
+                        ):
                             with self.lock:
                                 self.stats.memory_skips += 1
                             # Drop disk buffers and credit before memory fallback.
@@ -3444,7 +3546,11 @@ class APCManager:
                             if (
                                 self._exact_cache_max > 0
                                 and size <= self.memory_max_bytes
-                                and self._make_room(size, retain_bytes=size)
+                                and self._make_room(
+                                    size,
+                                    retain_bytes=size,
+                                    protected_exact_keys=protected,
+                                )
                             ):
                                 storage_copy = _clone_prompt_cache_for_apc(prompt_cache)
                                 if storage_copy is not None:
@@ -3483,7 +3589,12 @@ class APCManager:
         restore_bytes = self.memory_plan.restore_bytes(
             source_cache, prefix_len, prompt_capacity_tokens
         )
-        if not self._make_room(restore_bytes):
+        restore_reserve = self.memory_plan.reserve_bytes(restore_bytes)
+        if not self._make_room(
+            restore_bytes,
+            prefill_reserve_bytes=restore_reserve,
+            protected_exact_keys=protected,
+        ):
             with self.lock:
                 self.stats.memory_skips += 1
             return None, 0
@@ -3524,7 +3635,6 @@ class APCManager:
             and self._make_room(size, retain_bytes=size)
         )
         if not retain:
-            self._make_room()
             with self.lock:
                 self.stats.memory_skips += 1
             if self.disk is None:
@@ -4634,6 +4744,7 @@ def apc_lookup_plan(
     safe_lookup_min: int,
     suffix_is_text_only,
     prefix_has_media,
+    protected_exact_keys: Optional[set[int]] = None,
 ) -> Optional[dict]:
     """Pick the best APC prefix (disk > exact > block); shared by both generate paths, releases losers, callers apply."""
     n = len(ids_list)
@@ -4642,7 +4753,10 @@ def apc_lookup_plan(
 
     if apc_mode == "exact":
         exact_cache, exact_prefix_len = manager.lookup_exact_cache(
-            ids_list, extra_hash=extra_hash, min_prefix_tokens=safe_lookup_min
+            ids_list,
+            extra_hash=extra_hash,
+            min_prefix_tokens=safe_lookup_min,
+            protected_exact_keys=protected_exact_keys,
         )
         if exact_cache is not None and 0 < exact_prefix_len < n:
             if not suffix_is_text_only(exact_prefix_len):
@@ -4668,6 +4782,7 @@ def apc_lookup_plan(
             ids_list,
             extra_hash=extra_hash,
             min_prefix_tokens=max(prefix_len, safe_lookup_min),
+            protected_exact_keys=protected_exact_keys,
         )
     warm_cache = None
     disk_prefix_len = 0

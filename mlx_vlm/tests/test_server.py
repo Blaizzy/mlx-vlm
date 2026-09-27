@@ -2450,7 +2450,9 @@ class TestResponseGenerator:
             apc_manager=manager,
         )
         assert batch.apc.prepare_prefill.call_count == 2 and batch.sizes == [2]
-        batch.apc.prepare_prefill.assert_called_with(1, prefill_step_size=3072)
+        batch.apc.prepare_prefill.assert_called_with(
+            1, prefill_step_size=3072, evict=False
+        )
         manager.close.assert_called_once_with()
 
     def test_new_sampler_recreates_idle_batch(self, monkeypatch):

@@ -1637,6 +1637,7 @@ def _mixed_batch(model, rows, prompts, prefix, warm_cache=None):
     bg.model = model
     bg.apc_manager = object()
     bg.apc = SimpleNamespace(
+        lookup_many=lambda *a: [{"prefix_len": prefix, "extra_hash": 0}, None],
         prepare_prefill=lambda *a, **k: None,
         observe_cache=lambda *a, **k: None,
         merge_rows=lambda *a, **k: (
@@ -1658,10 +1659,7 @@ def _mixed_batch(model, rows, prompts, prefix, warm_cache=None):
     sequences = [
         (i, ids, 1, kw, [], None) for i, (ids, kw) in enumerate(zip(prompts, rows))
     ]
-    with patch.object(
-        bg, "_apc_pick_for", side_effect=[{"prefix_len": prefix, "extra_hash": 0}, None]
-    ):
-        batch = bg._build_mixed_prompt_batch(sequences)
+    batch = bg._build_mixed_prompt_batch(sequences)
     # Limit this fixture to cache restoration and prompt processing.
     batch._apc_meta = []
     batch._apc_manager = None
