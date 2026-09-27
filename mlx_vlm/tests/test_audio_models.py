@@ -83,6 +83,45 @@ def _small_config(factory, **overrides):
     )
 
 
+def test_gemma4_model_constructs_with_no_vision_tower():
+    """A text-and-audio-only checkpoint carries vision_config: null."""
+    from mlx_vlm.models.gemma4.config import AudioConfig, ModelConfig, TextConfig
+    from mlx_vlm.models.gemma4.gemma4 import Model
+
+    config = ModelConfig(
+        text_config=_small_config(
+            TextConfig,
+            vocab_size=32,
+            vocab_size_per_layer_input=32,
+            hidden_size_per_layer_input=0,
+            num_kv_shared_layers=0,
+            num_key_value_heads=1,
+            head_dim=8,
+            global_head_dim=8,
+            sliding_window_pattern=1,
+            max_position_embeddings=64,
+        ),
+        vision_config=None,
+        audio_config=AudioConfig(
+            hidden_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            attention_chunk_size=4,
+            attention_context_left=2,
+            attention_context_right=0,
+            output_proj_dims=None,
+        ),
+        vocab_size=32,
+    )
+
+    model = Model(config)
+
+    assert model.vision_tower is None
+    assert model.embed_vision is None
+    assert model.audio_tower is not None
+    assert model.embed_audio is not None
+
+
 class TestMiniCPMOTTS(unittest.TestCase):
     def test_reference_voice_prompt_preserves_messages_and_audio_order(self):
         from mlx_vlm.models.minicpmo.processing_minicpmo import MiniCPMOProcessor

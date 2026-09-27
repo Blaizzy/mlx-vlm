@@ -45,12 +45,16 @@ class Model(nn.Module):
         self.vocab_size = config.text_config.vocab_size
 
         # Vision
-        self.vision_tower = VisionModel(config.vision_config)
-        self.embed_vision = MultimodalEmbedder(
-            embedding_dim=config.vision_config.hidden_size,
-            text_hidden_size=config.text_config.hidden_size,
-            eps=config.vision_config.rms_norm_eps,
-        )
+        if config.vision_config is not None:
+            self.vision_tower = VisionModel(config.vision_config)
+            self.embed_vision = MultimodalEmbedder(
+                embedding_dim=config.vision_config.hidden_size,
+                text_hidden_size=config.text_config.hidden_size,
+                eps=config.vision_config.rms_norm_eps,
+            )
+        else:
+            self.vision_tower = None
+            self.embed_vision = None
 
         # Audio
         if config.audio_config is not None:
@@ -134,20 +138,21 @@ class Model(nn.Module):
         def _encode_video(pixels):
             return _encode_vision(pixels, video_position_ids)
 
-        inputs_embeds = _scatter(
-            pixel_values,
-            self.config.image_token_id,
-            _encode_image,
-            "cached_image_features",
-            "_image_key",
-        )
-        inputs_embeds = _scatter(
-            pixel_values_videos,
-            video_token_id,
-            _encode_video,
-            "cached_video_features",
-            "_video_key",
-        )
+        if self.vision_tower is not None and self.embed_vision is not None:
+            inputs_embeds = _scatter(
+                pixel_values,
+                self.config.image_token_id,
+                _encode_image,
+                "cached_image_features",
+                "_image_key",
+            )
+            inputs_embeds = _scatter(
+                pixel_values_videos,
+                video_token_id,
+                _encode_video,
+                "cached_video_features",
+                "_video_key",
+            )
 
         if self.audio_tower is not None and self.embed_audio is not None:
 
@@ -235,6 +240,10 @@ class Model(nn.Module):
                 if "vision_tower" not in k and "audio_tower" not in k:
                     continue
             if "rotary_emb.inv_freq" in k or "rotary_emb" in k:
+                continue
+            if self.vision_tower is None and (
+                "vision_tower" in k or "embed_vision" in k
+            ):
                 continue
             if self.audio_tower is None and ("audio_tower" in k or "embed_audio" in k):
                 continue
