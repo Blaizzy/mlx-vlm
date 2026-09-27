@@ -12,14 +12,7 @@ import pytest
 
 from mlx_vlm.models import deepseek_v3, laguna, minimax
 from mlx_vlm.models.laguna.language import LagunaPackedSwitchGLU
-from mlx_vlm.moe_offload import (
-    ExpertStore,
-    _warn_if_fits,
-    patch_model,
-    plan,
-    repack,
-    resolve_offload,
-)
+from mlx_vlm.moe_offload import ExpertStore, patch_model, plan, repack, resolve_offload
 from mlx_vlm.utils import load_model, save_weights
 
 
@@ -369,10 +362,3 @@ def test_load_model_moe_offload_memmap_fallback_with_parity(tmp_path):
     assert store.stats()["backend"] == "memmap"
     assert not (tmp_path / "build-offload").exists()
     _assert_offload_parity(resident, model(prompt).logits)
-
-
-def test_warn_if_fits_warns_for_small_model(tmp_path):
-    build = _build(tmp_path)
-    messages = []
-    _warn_if_fits(str(build), messages.append)
-    assert any("resident" in m for m in messages)

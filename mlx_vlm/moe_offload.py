@@ -459,29 +459,11 @@ def repack(build: str, out: str, resident_shard_gb: float = 5.0) -> None:
     )
 
 
-def _warn_if_fits(model_path: str, log) -> None:
-    try:
-        model_bytes = sum(
-            os.path.getsize(f)
-            for f in glob.glob(os.path.join(model_path, "*.safetensors"))
-        )
-        ram_bytes = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-    except (OSError, ValueError, AttributeError):
-        return
-    if model_bytes and model_bytes < 0.7 * ram_bytes:
-        log(
-            f"[moe-offload] {model_path} (~{model_bytes / 1e9:.0f} GB) likely "
-            f"fits in this machine's RAM (~{ram_bytes / 1e9:.0f} GB); a resident "
-            "load (drop --moe-offload) decodes far faster."
-        )
-
-
 def resolve_offload(model_path: str, log=None) -> Tuple[str, str]:
     """Return ``(serve_path, "repack"|"memmap")``: reuse/build a per-expert offload dir, else page the original checkpoint if disk is short."""
     if log is None:
         log = logging.getLogger(__name__).warning
     model_path = str(model_path).rstrip("/")
-    _warn_if_fits(model_path, log)
     target = model_path + "-offload"
     if os.path.exists(os.path.join(target, "offload_index.json")):
         log(f"[moe-offload] reusing {target} (fast, bounded).")
