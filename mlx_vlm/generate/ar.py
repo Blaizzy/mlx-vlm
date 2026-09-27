@@ -542,7 +542,12 @@ def generate_step(
             break
 
         if (n + 1) % DEFAULT_CACHE_EVAL_INTERVAL == 0:
-            mx.eval([c.state for c in prompt_cache])
+            mx.eval(
+                [
+                    (cache.CacheList(*c) if isinstance(c, tuple) else c).state
+                    for c in prompt_cache
+                ]
+            )
 
         yield y.item(), logprobs
         if n % 256 == 0:

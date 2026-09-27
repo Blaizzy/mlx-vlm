@@ -2014,3 +2014,32 @@ def test_generate_step_evaluates_cache_periodically(max_tokens, cache_evals):
     assert eval_mock.call_count == 1 + cache_evals
     if cache_evals:
         eval_mock.assert_called_with([cache_state])
+
+
+def test_generate_step_evaluates_tuple_caches():
+    # Florence-2 and Nemotron-Parse keep a (self-attention, cross-attention)
+    # cache pair per decoder layer.
+    model = MagicMock()
+    model.language_model.return_value = LanguageModelOutput(logits=mx.zeros((1, 1, 4)))
+    model.get_input_embeddings.return_value = InputEmbeddingsFeatures(
+        inputs_embeds=mx.zeros((1, 1, 4))
+    )
+    self_state, cross_state = mx.array([1]), mx.array([2])
+    prompt_cache = [
+        (SimpleNamespace(state=self_state), SimpleNamespace(state=cross_state))
+    ]
+
+    with patch.object(ar_module.mx, "eval", wraps=mx.eval) as eval_mock:
+        list(
+            generate_module.generate_step(
+                mx.array([[1]]),
+                model,
+                pixel_values=None,
+                mask=None,
+                prompt_cache=prompt_cache,
+                max_tokens=50,
+                temperature=0,
+            )
+        )
+
+    eval_mock.assert_called_with([[self_state, cross_state]])
