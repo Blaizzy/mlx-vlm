@@ -165,6 +165,7 @@ def _yarn_params(config: ModelConfig):
     )
 
 
+@mx.compile
 def _apply_index_rotary(
     x: mx.array, cos: mx.array, sin: mx.array, rope_dim: int
 ) -> mx.array:
@@ -528,14 +529,7 @@ def _apply_rope_at_positions(
     shape = (1,) * (x.ndim - positions.ndim - 1) + positions.shape + (cos.shape[-1],)
     cos_rows = cos[positions].reshape(shape)
     sin_rows = sin[positions].reshape(shape)
-    dtype = x.dtype
-    passive, rot = x[..., :-rope_dim], x[..., -rope_dim:].astype(mx.float32)
-    pairs = rot.reshape(*rot.shape[:-1], rope_dim // 2, 2)
-    even, odd = pairs[..., 0], pairs[..., 1]
-    rotated = mx.stack(
-        [even * cos_rows - odd * sin_rows, odd * cos_rows + even * sin_rows], axis=-1
-    ).reshape(rot.shape)
-    return mx.concatenate([passive, rotated.astype(dtype)], axis=-1)
+    return _apply_index_rotary(x, cos_rows, sin_rows, rope_dim)
 
 
 class DeepseekV41Attention(nn.Module):

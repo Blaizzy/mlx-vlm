@@ -82,11 +82,13 @@ def _pow2(e: mx.array) -> mx.array:
     return ((e + 127) << 23).astype(mx.uint32).view(mx.float32)
 
 
+@mx.compile
 def _ue8m0_scale(amax: mx.array, max_inv: mx.array) -> mx.array:
     """2**ceil(log2(amax * (1/max)))."""
     return _pow2(_log2_ceil_bits(amax * max_inv))
 
 
+@mx.compile
 def _e2m1_round(v: mx.array) -> mx.array:
     """Round |v| <= 6 to the nearest e2m1 value, ties to even, keeping the sign."""
     mag = mx.abs(v)
