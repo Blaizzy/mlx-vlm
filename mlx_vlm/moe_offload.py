@@ -18,11 +18,45 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import logging
 import os
 import re
 import shutil
+import struct
 from collections import OrderedDict
 from typing import Optional, Tuple
+
+import numpy as np
+
+# safetensors dtype -> numpy dtype of the same byte width (bf16/fp8 have no
+# native numpy dtype, so read the raw bytes and reinterpret via mx.view after).
+_ST_NP = {
+    "F64": "float64",
+    "F32": "float32",
+    "F16": "float16",
+    "BF16": "uint16",
+    "I64": "int64",
+    "I32": "int32",
+    "I16": "int16",
+    "I8": "int8",
+    "U64": "uint64",
+    "U32": "uint32",
+    "U16": "uint16",
+    "U8": "uint8",
+    "F8_E4M3": "uint8",
+    "F8_E5M2": "uint8",
+    "BOOL": "bool",
+}
+
+
+def _st_header(path: str) -> Tuple[int, dict]:
+    """(data_start, header) for a safetensors file, read without loading data."""
+    with open(path, "rb") as handle:
+        n = struct.unpack("<Q", handle.read(8))[0]
+        header = json.loads(handle.read(n))
+    header.pop("__metadata__", None)
+    return 8 + n, header
+
 
 # stacked: switch_mlp.gate_proj.weight [E,out,in]; per-expert: experts.{j}.gate_proj.weight;
 # stacked-fused: switch_mlp.gate_up_proj.weight [E,2*out,in], gate = first half of axis 1.
@@ -425,6 +459,49 @@ def repack(build: str, out: str, resident_shard_gb: float = 5.0) -> None:
     )
 
 
+def _warn_if_fits(model_path: str, log) -> None:
+    try:
+        model_bytes = sum(
+            os.path.getsize(f)
+            for f in glob.glob(os.path.join(model_path, "*.safetensors"))
+        )
+        ram_bytes = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError, AttributeError):
+        return
+    if model_bytes and model_bytes < 0.7 * ram_bytes:
+        log(
+            f"[moe-offload] {model_path} (~{model_bytes / 1e9:.0f} GB) likely "
+            f"fits in this machine's RAM (~{ram_bytes / 1e9:.0f} GB); a resident "
+            "load (drop --moe-offload) decodes far faster."
+        )
+
+
+def resolve_offload(model_path: str, log=None) -> Tuple[str, str]:
+    """Return ``(serve_path, "repack"|"memmap")``: reuse/build a per-expert offload dir, else page the original checkpoint if disk is short."""
+    if log is None:
+        log = logging.getLogger(__name__).warning
+    model_path = str(model_path).rstrip("/")
+    _warn_if_fits(model_path, log)
+    target = model_path + "-offload"
+    if os.path.exists(os.path.join(target, "offload_index.json")):
+        log(f"[moe-offload] reusing {target} (fast, bounded).")
+        return target, "repack"
+    try:
+        _check_disk_headroom(model_path, model_path)
+    except ValueError as e:
+        log(
+            f"[moe-offload] {e} Falling back to runtime memmap "
+            "(bounded, ~1.6x slower decode)."
+        )
+        return model_path, "memmap"
+    log(
+        f"[moe-offload] no repack found -> repacking to {target} "
+        "(one-time; fast + bounded thereafter)."
+    )
+    repack(model_path, target)
+    return target, "repack"
+
+
 _PROJ_KEYS = tuple(
     f"{p}.{k}"
     for p in ("gate_proj", "up_proj", "down_proj")
@@ -688,11 +765,147 @@ class ExpertStore:
         }
 
 
+class RuntimeExpertStore(ExpertStore):
+    """Bounded no-repack offload: page routed-expert rows from the stacked checkpoint via ``np.memmap`` (OS page cache is residency), ~1.6x slower than a repack()'d store; fast-path expert naming only."""
+
+    def __init__(
+        self,
+        model_path: str,
+        expert_cache_bytes: Optional[int] = None,
+        kv_reserve_bytes: int = 0,
+    ):
+        idx_path = os.path.join(model_path, "model.safetensors.index.json")
+        if os.path.exists(idx_path):
+            shard_of = {
+                name: os.path.join(model_path, shard)
+                for name, shard in json.load(open(idx_path))["weight_map"].items()
+            }
+        else:
+            shard_of = {}
+            for f in glob.glob(os.path.join(model_path, "*.safetensors")):
+                if f.endswith("consolidated.safetensors"):
+                    continue
+                for name in _st_header(f)[1]:
+                    shard_of[name] = f
+        if not shard_of:
+            raise ValueError(f"No safetensors found under {model_path}")
+
+        p = plan(list(shard_of))
+        if not p["layers"]:
+            raise ValueError(
+                f"{model_path} needs sanitize() to expose experts; runtime offload "
+                "is fast-path only -- repack() this checkpoint instead."
+            )
+        self._entries = p["experts"]
+        self._shard_of = shard_of
+
+        # One np.memmap per shard, not per tensor: per-tensor memmaps burn an fd
+        # each and hit the OS limit. Views alias the shard mmap (no fd) and page
+        # lazily, so only touched rows enter the evictable OS cache.
+        headers: dict = {}
+        self._shard_mm: dict = {}
+
+        def memmap(name):
+            shard = self._shard_of[name]
+            if shard not in headers:
+                headers[shard] = _st_header(shard)
+            if shard not in self._shard_mm:
+                self._shard_mm[shard] = np.memmap(shard, mode="r", dtype=np.uint8)
+            data_start, header = headers[shard]
+            meta = header[name]
+            view = np.ndarray(
+                tuple(meta["shape"]),
+                dtype=_ST_NP[meta["dtype"]],
+                buffer=self._shard_mm[shard],
+                offset=data_start + meta["data_offsets"][0],
+            )
+            return (view, meta["dtype"])
+
+        self._mm: dict = {}
+        self._layer_reads: dict = {}
+        num_experts = 0
+        for lid, ents in self._entries.items():
+            stacked, perexpert = [], {}
+            for key, name, mode in ents:
+                self._mm[name] = memmap(name)
+                mm = self._mm[name][0]
+                if mode == "STACK":
+                    m = STACKED_RE.match(name)
+                    stacked.append((m["proj"], m["kind"], "STACK", name))
+                    num_experts = max(num_experts, mm.shape[0])
+                elif mode == "STACK_FUSED":
+                    m = STACKED_FUSED_RE.match(name)
+                    stacked.append(("gate_proj", m["kind"], "FUSED_GATE", name))
+                    stacked.append(("up_proj", m["kind"], "FUSED_UP", name))
+                    num_experts = max(num_experts, mm.shape[0])
+                else:
+                    j, proj, kind = key[1:].split(".")
+                    perexpert[(int(j), proj, kind)] = name
+                    num_experts = max(num_experts, int(j) + 1)
+            self._layer_reads[lid] = (stacked, perexpert)
+
+        self.num_experts = num_experts
+        self._maps = {lid: True for lid in self._entries}
+        self.swapped = 0
+        self._served = 0
+
+    @staticmethod
+    def _to_mx(rows, st_dtype: str):
+        import mlx.core as mx
+
+        arr = mx.array(np.ascontiguousarray(rows))
+        if st_dtype == "BF16":
+            arr = arr.view(mx.bfloat16)
+        return arr
+
+    def experts_present(self, layer_id: int) -> bool:
+        return layer_id in self._entries
+
+    def _expert(self, layer_id: int, j: int):
+        stacked, perexpert = self._layer_reads[layer_id]
+        acc: dict = {}
+        for proj, kind, mode, name in stacked:
+            mm, dt = self._mm[name]
+            if mode == "STACK":
+                rows = mm[j]
+            else:
+                half = mm.shape[1] // 2
+                rows = mm[j, :half] if mode == "FUSED_GATE" else mm[j, half:]
+            acc[(proj, kind)] = self._to_mx(rows, dt)
+        for (jj, proj, kind), name in perexpert.items():
+            if jj == j:
+                mm, dt = self._mm[name]
+                acc[(proj, kind)] = self._to_mx(mm[:], dt)
+        self._served += 1
+        trip = lambda p: (
+            acc.get((p, "weight")),
+            acc.get((p, "scales")),
+            acc.get((p, "biases")),
+        )
+        return (trip("gate_proj"), trip("up_proj"), trip("down_proj"))
+
+    def get(self, layer_id: int, j: int):
+        return self._expert(int(layer_id), int(j))
+
+    def get_all(self, layer_id: int, needed) -> dict:
+        return {int(j): self._expert(int(layer_id), int(j)) for j in needed}
+
+    def stats(self) -> dict:
+        return {
+            "backend": "memmap",
+            "num_experts": self.num_experts,
+            "num_layers": len(self._entries),
+            "experts_served": self._served,
+            "residency": "os_page_cache",
+        }
+
+
 def patch_model(
     model,
     offload_dir: str,
     expert_cache_gb: Optional[float] = None,
     max_kv_size: Optional[int] = None,
+    store: Optional["ExpertStore"] = None,
 ) -> "ExpertStore":
     """Swap every switch layer in ``model`` for an offloaded one (see module
     docstring for separate-vs-fused handling). group_size/bits/mode are
@@ -735,7 +948,8 @@ def patch_model(
         if expert_cache_bytes is not None
         else _estimate_kv_reserve_bytes(model, max_kv_size)
     )
-    store = ExpertStore(offload_dir, expert_cache_bytes, kv_reserve_bytes)
+    if store is None:
+        store = ExpertStore(offload_dir, expert_cache_bytes, kv_reserve_bytes)
     if not store._maps:
         raise ValueError(
             f"No expert files found under {offload_dir}/experts -- this "

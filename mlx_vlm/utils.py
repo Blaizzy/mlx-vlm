@@ -905,12 +905,20 @@ def load_model(
         ValueError: If the model class or args class are not found or cannot be instantiated.
     """
     strict = kwargs.pop("strict", True)
-    # An expert-offload dir (mlx_vlm.moe_offload) is missing routed-expert
-    # keys by design; defer eval until patch_model swaps those modules, or
-    # their random-init resident weights get eagerly materialized -- the OOM
-    # this feature exists to avoid.
+    moe_offload = kwargs.pop("moe_offload", False)
     is_offload_dir = (model_path / "offload_index.json").exists()
-    if is_offload_dir:
+    is_runtime_offload = False
+    if moe_offload and not is_offload_dir:
+        from .moe_offload import resolve_offload
+
+        serve_path, mode = resolve_offload(model_path)
+        model_path = Path(serve_path)
+        is_offload_dir = mode == "repack"
+        is_runtime_offload = mode == "memmap"
+    # Routed-expert weights are absent (repack dir) or dropped below (runtime
+    # memmap) until patch_model swaps those modules; a strict load + eager eval
+    # would OOM materializing random-init experts -- the OOM offload avoids.
+    if is_offload_dir or is_runtime_offload:
         strict = False
         requested_lazy, lazy = lazy, True
     config = load_config(model_path, **kwargs)
@@ -1169,6 +1177,18 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 "repack() output?): " + ", ".join(sorted(unexpected_missing)[:10])
             )
 
+    if is_runtime_offload:
+        from .moe_offload import PEREXPERT_RE, STACKED_FUSED_RE, STACKED_RE
+
+        def _is_routed_expert(k: str) -> bool:
+            return "shared_expert" not in k and bool(
+                PEREXPERT_RE.match(k)
+                or STACKED_RE.match(k)
+                or STACKED_FUSED_RE.match(k)
+            )
+
+        weights = {k: v for k, v in weights.items() if not _is_routed_expert(k)}
+
     _drop_modules_without_weights(model, weights, declared_keys)
 
     model.load_weights(list(weights.items()), strict=strict)
@@ -1181,6 +1201,35 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             str(model_path),
             expert_cache_gb=kwargs.get("expert_cache_gb"),
             max_kv_size=kwargs.get("max_kv_size"),
+        )
+        lazy = requested_lazy
+
+    if is_runtime_offload:
+        from .moe_offload import (
+            RuntimeExpertStore,
+            _estimate_kv_reserve_bytes,
+            patch_model,
+        )
+
+        expert_cache_gb = kwargs.get("expert_cache_gb")
+        max_kv_size = kwargs.get("max_kv_size")
+        expert_cache_bytes = (
+            int(expert_cache_gb * 1e9) if expert_cache_gb is not None else None
+        )
+        kv_reserve_bytes = (
+            0
+            if expert_cache_bytes is not None
+            else _estimate_kv_reserve_bytes(model, max_kv_size)
+        )
+        store = RuntimeExpertStore(
+            str(model_path), expert_cache_bytes, kv_reserve_bytes
+        )
+        model.moe_offload_store = patch_model(
+            model,
+            str(model_path),
+            expert_cache_gb=expert_cache_gb,
+            max_kv_size=max_kv_size,
+            store=store,
         )
         lazy = requested_lazy
 
