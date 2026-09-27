@@ -905,16 +905,21 @@ def load_model(
         ValueError: If the model class or args class are not found or cannot be instantiated.
     """
     strict = kwargs.pop("strict", True)
-    moe_offload = kwargs.pop("moe_offload", False)
+    moe_offload = kwargs.pop("moe_offload", None)
     is_offload_dir = (model_path / "offload_index.json").exists()
     is_runtime_offload = False
     if moe_offload and not is_offload_dir:
-        from .moe_offload import resolve_offload
+        if moe_offload not in ("repack", "mmap"):
+            raise ValueError(
+                f"moe_offload must be 'repack' or 'mmap', got {moe_offload!r}"
+            )
+        if moe_offload == "mmap":
+            is_runtime_offload = True
+        else:
+            from .moe_offload import resolve_repack
 
-        serve_path, mode = resolve_offload(model_path)
-        model_path = Path(serve_path)
-        is_offload_dir = mode == "repack"
-        is_runtime_offload = mode == "memmap"
+            model_path = Path(resolve_repack(model_path))
+            is_offload_dir = True
     # Routed-expert weights are absent (repack dir) or dropped below (runtime
     # memmap) until patch_model swaps those modules; a strict load + eager eval
     # would OOM materializing random-init experts -- the OOM offload avoids.

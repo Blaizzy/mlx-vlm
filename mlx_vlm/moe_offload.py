@@ -459,29 +459,22 @@ def repack(build: str, out: str, resident_shard_gb: float = 5.0) -> None:
     )
 
 
-def resolve_offload(model_path: str, log=None) -> Tuple[str, str]:
-    """Return ``(serve_path, "repack"|"memmap")``: reuse/build a per-expert offload dir, else page the original checkpoint if disk is short."""
+def resolve_repack(model_path: str, log=None) -> str:
+    """Reuse or build the per-expert offload dir ``<model>-offload`` and return its path; raises if disk can't hold the repack."""
     if log is None:
         log = logging.getLogger(__name__).warning
     model_path = str(model_path).rstrip("/")
     target = model_path + "-offload"
     if os.path.exists(os.path.join(target, "offload_index.json")):
         log(f"[moe-offload] reusing {target} (fast, bounded).")
-        return target, "repack"
-    try:
-        _check_disk_headroom(model_path, model_path)
-    except ValueError as e:
-        log(
-            f"[moe-offload] {e} Falling back to runtime memmap "
-            "(bounded, ~1.6x slower decode)."
-        )
-        return model_path, "memmap"
+        return target
+    _check_disk_headroom(model_path, model_path)
     log(
         f"[moe-offload] no repack found -> repacking to {target} "
         "(one-time; fast + bounded thereafter)."
     )
     repack(model_path, target)
-    return target, "repack"
+    return target
 
 
 _PROJ_KEYS = tuple(

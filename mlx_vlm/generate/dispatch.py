@@ -552,12 +552,14 @@ def parse_arguments():
     )
     parser.add_argument(
         "--moe-offload",
-        action="store_true",
+        choices=["repack", "mmap"],
+        default=None,
         help="Serve MoE routed experts from disk to bound memory for models "
-        "that don't fit in RAM. Repacks the checkpoint once into a sibling "
-        "'<model>-offload' dir (fast, bounded) and reuses it after; falls back "
-        "to runtime paging if disk is short. Slower than a resident load, so "
-        "prefer a resident load when the model fits in RAM.",
+        "that don't fit in RAM (no default -- choose explicitly). 'repack' "
+        "reorganizes the checkpoint once into a sibling '<model>-offload' dir "
+        "(faster when RAM can cache most experts). 'mmap' pages experts "
+        "straight from the original checkpoint (lighter, no extra disk, better "
+        "under tight memory). Both are slower than a resident load.",
     )
     parser.add_argument(
         "--expert-cache-gb",

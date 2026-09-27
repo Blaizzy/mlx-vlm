@@ -12,7 +12,7 @@ import pytest
 
 from mlx_vlm.models import deepseek_v3, laguna, minimax
 from mlx_vlm.models.laguna.language import LagunaPackedSwitchGLU
-from mlx_vlm.moe_offload import ExpertStore, patch_model, plan, repack, resolve_offload
+from mlx_vlm.moe_offload import ExpertStore, patch_model, plan, repack, resolve_repack
 from mlx_vlm.utils import load_model, save_weights
 
 
@@ -311,54 +311,58 @@ def test_repack_sanitizes_raw_mixtral_style_expert_naming(tmp_path):
     _assert_offload_parity(resident, offloaded(prompt).logits)
 
 
-def test_resolve_offload_reuses_existing_repack_dir(tmp_path):
+def test_resolve_repack_reuses_existing_dir(tmp_path):
     build = _build(tmp_path)
     target = str(build) + "-offload"
     repack(str(build), target)
     with patch("mlx_vlm.moe_offload.repack") as repack_spy:
-        serve, mode = resolve_offload(str(build))
-    assert (serve, mode) == (target, "repack")
+        serve = resolve_repack(str(build))
+    assert serve == target
     repack_spy.assert_not_called()
 
 
-def test_resolve_offload_auto_repacks_when_missing(tmp_path):
+def test_resolve_repack_builds_when_missing(tmp_path):
     build = _build(tmp_path)
-    serve, mode = resolve_offload(str(build))
-    assert (serve, mode) == (str(build) + "-offload", "repack")
+    serve = resolve_repack(str(build))
+    assert serve == str(build) + "-offload"
     assert (tmp_path / "build-offload" / "offload_index.json").exists()
 
 
-def test_resolve_offload_falls_back_to_memmap_without_disk(tmp_path):
+def test_resolve_repack_raises_without_disk(tmp_path):
     build = _build(tmp_path)
     fake_usage = shutil.disk_usage(tmp_path)._replace(free=0)
     with patch("mlx_vlm.moe_offload.shutil.disk_usage", return_value=fake_usage):
-        serve, mode = resolve_offload(str(build))
-    assert (serve, mode) == (str(build), "memmap")
+        with pytest.raises(ValueError):
+            resolve_repack(str(build))
     assert not (tmp_path / "build-offload").exists()
 
 
-def test_load_model_moe_offload_auto_repacks_with_parity(tmp_path):
+def test_load_model_moe_offload_repack_with_parity(tmp_path):
     build = _build(tmp_path)
     prompt = mx.array([[1, 2, 3, 4, 5, 6]])
     resident = load_model(build)(prompt).logits
     mx.eval(resident)
-    model = load_model(build, moe_offload=True)
+    model = load_model(build, moe_offload="repack")
     store = getattr(model, "moe_offload_store", None)
     assert store is not None
     assert (tmp_path / "build-offload" / "offload_index.json").exists()
     _assert_offload_parity(resident, model(prompt).logits)
 
 
-def test_load_model_moe_offload_memmap_fallback_with_parity(tmp_path):
+def test_load_model_moe_offload_mmap_with_parity(tmp_path):
     build = _build(tmp_path)
     prompt = mx.array([[1, 2, 3, 4, 5, 6]])
     resident = load_model(build)(prompt).logits
     mx.eval(resident)
-    fake_usage = shutil.disk_usage(tmp_path)._replace(free=0)
-    with patch("mlx_vlm.moe_offload.shutil.disk_usage", return_value=fake_usage):
-        model = load_model(build, moe_offload=True)
+    model = load_model(build, moe_offload="mmap")
     store = getattr(model, "moe_offload_store", None)
     assert store is not None
     assert store.stats()["backend"] == "memmap"
     assert not (tmp_path / "build-offload").exists()
     _assert_offload_parity(resident, model(prompt).logits)
+
+
+def test_load_model_moe_offload_rejects_bad_mode(tmp_path):
+    build = _build(tmp_path)
+    with pytest.raises(ValueError, match="repack.*mmap|mmap.*repack"):
+        load_model(build, moe_offload=True)
