@@ -11,7 +11,6 @@ from ..deepseek_v4.hyper_connection import hc_expand, hc_split_sinkhorn
 from ..deepseek_v4.language import (
     DeepseekV4MLP,
     DeepseekV4RoPE,
-    LimitedSwiGLU,
     _sparse_pooled_attention,
 )
 from ..mla import MultiLinear
@@ -66,75 +65,6 @@ def _write_span(buffer, values, batch: int, start: int, fill=0, dtype=None):
     if start > 0:
         parts.append(buffer[:batch, :start])
     parts.append(values.astype(buffer.dtype))
-    if buffer.shape[1] > need:
-        parts.append(buffer[:batch, need:])
-    head = mx.concatenate(parts, axis=1) if len(parts) > 1 else parts[0]
-    if buffer.shape[0] > batch:
-        return mx.concatenate([head, buffer[batch:]], axis=0)
-    return head
-
-
-WINDOW_INPLACE_MAX_SPAN = 64
-WINDOW_SLACK_ROWS = 512
-
-
-def _write_window(buffer, values, batch: int, start: int):
-    """Append this step's window KV.
-
-    The window is only read back as ``[:start + length]`` by the layer that
-    wrote it, so capacity past that is invisible and a short span can go in
-    place. That is what decode needs: rebuilding the buffer to add one row
-    copies the whole context, per layer, per token.
-
-    A prefill-sized span keeps the original rebuild. It is already
-    proportional to the span, happens once per chunk rather than once per
-    token, and at ``start == 0`` it hands back ``values`` untouched -- which is
-    also what fixes the buffer's dtype to the model's, so the span write must
-    never widen it.
-    """
-    length, dim = values.shape[1], values.shape[2]
-    need = start + length
-    if (
-        length <= WINDOW_INPLACE_MAX_SPAN
-        and buffer is not None
-        and buffer.shape[0] >= batch
-    ):
-        if buffer.shape[1] < need:
-            grown = mx.zeros(
-                (buffer.shape[0], need + WINDOW_SLACK_ROWS, dim), dtype=buffer.dtype
-            )
-            if buffer.shape[1]:
-                grown[:, : buffer.shape[1]] = buffer
-            buffer = grown
-        buffer[:batch, start:need] = values.astype(buffer.dtype)
-        return buffer
-
-    if buffer is None:
-        buffer = mx.zeros((batch, 0, dim), dtype=values.dtype)
-    if buffer.shape[0] < batch:
-        buffer = mx.concatenate(
-            [
-                buffer,
-                mx.zeros(
-                    (batch - buffer.shape[0], buffer.shape[1], dim), dtype=buffer.dtype
-                ),
-            ],
-            axis=0,
-        )
-    if buffer.shape[1] < need:
-        buffer = mx.concatenate(
-            [
-                buffer,
-                mx.zeros(
-                    (buffer.shape[0], need - buffer.shape[1], dim), dtype=buffer.dtype
-                ),
-            ],
-            axis=1,
-        )
-    parts = []
-    if start > 0:
-        parts.append(buffer[:batch, :start])
-    parts.append(values)
     if buffer.shape[1] > need:
         parts.append(buffer[:batch, need:])
     head = mx.concatenate(parts, axis=1) if len(parts) > 1 else parts[0]
@@ -240,13 +170,12 @@ def _apply_index_rotary(
 ) -> mx.array:
     """Rotate adjacent pairs in the trailing `rope_dim` entries of each head."""
     dtype = x.dtype
-    x = x.astype(mx.float32)
-    passive, rot = x[..., :-rope_dim], x[..., -rope_dim:]
+    passive, rot = x[..., :-rope_dim], x[..., -rope_dim:].astype(mx.float32)
     pairs = rot.reshape(*rot.shape[:-1], rope_dim // 2, 2)
     x1, x2 = pairs[..., 0], pairs[..., 1]
     out = mx.stack([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
     out = out.reshape(rot.shape)
-    return mx.concatenate([passive, out], axis=-1).astype(dtype)
+    return mx.concatenate([passive, out.astype(dtype)], axis=-1)
 
 
 def select_candidate_blocks(
@@ -340,7 +269,7 @@ class Indexer(nn.Module):
             self.rope_head_dim,
         )
         k = fake_quant_fp4_ue8m0(k)
-        keys = _write_span(cache.keys[self.layer_idx], k, batch, base, dtype=mx.float32)
+        keys = _write_span(cache.keys[self.layer_idx], k, batch, base)
         cache.keys[self.layer_idx] = keys
         return keys
 
@@ -369,7 +298,9 @@ class Indexer(nn.Module):
             end_pos, self.rope_head_dim, self.rope_theta, self.yarn
         )
         positions = mx.arange(start_pos, end_pos)
-        q = self.wq_b(qr).reshape(batch, seqlen, self.n_heads, self.index_head_dim)
+        q = self.wq_b(fake_quant_fp8_ue8m0(qr)).reshape(
+            batch, seqlen, self.n_heads, self.index_head_dim
+        )
         q = _apply_index_rotary(
             q,
             cos[positions][None, :, None, :],
@@ -378,10 +309,8 @@ class Indexer(nn.Module):
         )
         q = fake_quant_fp4_ue8m0(q)
 
-        index_k = cache.index_k[:batch, : end_pos // ratio].astype(mx.float32)
-        weights = self.weights_proj(x).astype(mx.float32) * (
-            self.scale * self.n_heads**-0.5
-        )
+        index_k = cache.index_k[:batch, : end_pos // ratio]
+        weights = self.weights_proj(x) * (self.scale * self.n_heads**-0.5)
         compress_lens = (mx.arange(start_pos + 1, end_pos + 1) // ratio)[:, None]
         scores = _index_scores(
             q,
@@ -500,6 +429,54 @@ class DeepseekV41MoEGate(nn.Module):
         return inds, weights * self.routed_scaling_factor
 
 
+@mx.compile
+def _swiglu(gate, up, limit):
+    # The reference keeps the activation and routing multiplication in FP32.
+    gate, up = gate.astype(mx.float32), up.astype(mx.float32)
+    if limit > 0:
+        gate = mx.minimum(gate, limit)
+        up = mx.clip(up, -limit, limit)
+    return nn.silu(gate) * up
+
+
+class DeepseekV41MLP(DeepseekV4MLP):
+    def __call__(self, x):
+        dtype = x.dtype
+        x = fake_quant_fp8_ue8m0(x)
+        activated = _swiglu(self.gate_proj(x), self.up_proj(x), self.swiglu_limit)
+        return self.down_proj(fake_quant_fp8_ue8m0(activated.astype(dtype)))
+
+
+class DeepseekV41SwiGLU(nn.Module):
+    def __init__(self, limit):
+        super().__init__()
+        self.limit = limit
+
+    def __call__(self, up, gate, weights):
+        activated = _swiglu(gate, up, self.limit)
+        # Weight before the BF16 cast and FP8 rounding of the down-projection input.
+        return fake_quant_fp8_ue8m0((activated * weights).astype(up.dtype))
+
+
+class DeepseekV41SwitchGLU(SwitchGLU):
+    def __call__(self, x, inds, weights):
+        shape = inds.shape
+        inputs = mx.expand_dims(x, (-2, -3))
+        do_sort = inds.size >= 64
+        if do_sort:
+            order = mx.argsort(inds.flatten())
+            inputs = inputs.flatten(0, -3)[order // shape[-1]]
+            inds = inds.flatten()[order]
+            weights = weights.flatten()[order]
+        up = self.up_proj(inputs, inds, sorted_indices=do_sort)
+        gate = self.gate_proj(inputs, inds, sorted_indices=do_sort)
+        activated = self.activation(up, gate, weights[..., None, None])
+        y = self.down_proj(activated, inds, sorted_indices=do_sort)
+        if do_sort:
+            y = mx.unflatten(y[mx.argsort(order)], 0, shape)
+        return y.squeeze(-2)
+
+
 class DeepseekV41MoE(nn.Module):
     """Top-k routed experts plus one shared expert every token goes through."""
 
@@ -520,13 +497,13 @@ class DeepseekV41MoE(nn.Module):
             self.gate.bias_vl = mx.zeros((n_routed_experts,), dtype=mx.float32)
         inter = moe_intermediate_size or config.moe_intermediate_size
         routed = n_routed_experts or config.n_routed_experts
-        self.switch_mlp = SwitchGLU(
+        self.switch_mlp = DeepseekV41SwitchGLU(
             config.hidden_size,
             inter,
             routed,
-            activation=LimitedSwiGLU(config.swiglu_limit),
+            activation=DeepseekV41SwiGLU(config.swiglu_limit),
         )
-        self.shared_experts = DeepseekV4MLP(
+        self.shared_experts = DeepseekV41MLP(
             config,
             intermediate_size=inter,
             swiglu_limit=config.swiglu_limit,
@@ -534,9 +511,9 @@ class DeepseekV41MoE(nn.Module):
 
     def __call__(self, x: mx.array, image_mask: Optional[mx.array] = None) -> mx.array:
         inds, scores = self.gate(x, image_mask)
-        y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None].astype(y.dtype)).sum(-2)
-        return y + self.shared_experts(x)
+        y = self.switch_mlp(fake_quant_fp8_ue8m0(x), inds, scores)
+        y = y.astype(mx.float32).sum(-2)
+        return (y + self.shared_experts(x).astype(mx.float32)).astype(x.dtype)
 
 
 def _apply_rope_at_positions(
@@ -552,14 +529,13 @@ def _apply_rope_at_positions(
     cos_rows = cos[positions].reshape(shape)
     sin_rows = sin[positions].reshape(shape)
     dtype = x.dtype
-    x = x.astype(mx.float32)
-    passive, rot = x[..., :-rope_dim], x[..., -rope_dim:]
+    passive, rot = x[..., :-rope_dim], x[..., -rope_dim:].astype(mx.float32)
     pairs = rot.reshape(*rot.shape[:-1], rope_dim // 2, 2)
     even, odd = pairs[..., 0], pairs[..., 1]
     rotated = mx.stack(
         [even * cos_rows - odd * sin_rows, odd * cos_rows + even * sin_rows], axis=-1
     ).reshape(rot.shape)
-    return mx.concatenate([passive, rotated], axis=-1).astype(dtype)
+    return mx.concatenate([passive, rotated.astype(dtype)], axis=-1)
 
 
 class DeepseekV41Attention(nn.Module):
@@ -569,10 +545,9 @@ class DeepseekV41Attention(nn.Module):
     index-source non-owners run Reindex (shared KV and K, own rescoring), the rest
     run Reuse (shared KV and shared Top-K, no indexer), and ratio-0 layers run
     window-only. Every mode computes its own queries and sliding-window KV.
-    Deliberate deviations from the reference: an ordered shift ring replaces the
-    indexed ring buffer (same visible sets, mask-addressed); window and compressed
-    KV stay in separate gathers so no concatenation offset is needed; the extra
-    query rms-norm in the V4 port is omitted (the reference has none).
+    Window and compressed KV stay in separate gathers so no concatenation
+    offset is needed. The window uses a fixed-size ring, including when prefill
+    arrives in chunks.
     """
 
     def __init__(self, config: ModelConfig, layer_idx: int):
@@ -641,31 +616,31 @@ class DeepseekV41Attention(nn.Module):
         )
 
     def _window_part(self, x: mx.array, start_pos: int, cache):
-        """Window KV slice for this step plus its validity mask.
-
-        Prefill attends over the current chunk; later steps attend the last
-        `window_size` tokens. The buffer stores tokens in position order so
-        each query can select its own visible window.
-        """
+        """Read the preceding window before overwriting its ring with this chunk."""
         batch, seqlen = x.shape[0], x.shape[1]
         win = self.window_size
-        kv = self.kv_norm(self.wkv(x)).reshape(batch, 1, seqlen, self.head_dim)
-        kv = self.rope(kv, start_pos).reshape(batch, seqlen, self.head_dim)
-        kv = fake_quant_fp8_ue8m0(kv.astype(mx.float32)).astype(kv.dtype)
-        need_len = start_pos + seqlen
-        buffer = _write_window(cache.window[self.layer_idx], kv, batch, start_pos)
-        cache.window[self.layer_idx] = buffer
-        if start_pos == 0:
-            part, base = buffer[:batch, :need_len], 0
+        kv = self.kv_norm(self.wkv(fake_quant_fp8_ue8m0(x)))
+        kv = self.rope(kv[:, None], start_pos).reshape(batch, seqlen, self.head_dim)
+        kv = fake_quant_fp8_ue8m0(kv)
+        buffer = cache.window[self.layer_idx]
+        if buffer is None:
+            buffer = mx.zeros((batch, win, self.head_dim), dtype=kv.dtype)
+        elif buffer.shape[0] < batch:
+            buffer = mx.pad(buffer, [(0, batch - buffer.shape[0]), (0, 0), (0, 0)])
+        base = max(0, start_pos - win + 1)
+        if start_pos:
+            history = mx.take(buffer[:batch], mx.arange(base, start_pos) % win, axis=1)
+            part = mx.concatenate([history, kv], axis=1)
         else:
-            base = max(0, start_pos - win + 1)
-            part = buffer[:batch, base:need_len]
-        positions = mx.arange(base, base + part.shape[1])
-        queries = mx.arange(start_pos, start_pos + seqlen)
-        valid = (
-            (positions[None, :] <= queries[:, None])
-            & (positions[None, :] > queries[:, None] - win)
-            & (positions[None, :] >= 0)
+            part = kv
+        end_pos = start_pos + seqlen
+        retained = min(seqlen, win)
+        buffer[:batch, mx.arange(end_pos - retained, end_pos) % win] = kv[:, -retained:]
+        cache.window[self.layer_idx] = buffer
+        positions = mx.arange(base, end_pos)
+        queries = mx.arange(start_pos, end_pos)
+        valid = (positions[None, :] <= queries[:, None]) & (
+            positions[None, :] > queries[:, None] - win
         )
         return part, valid[None, None]
 
@@ -693,7 +668,6 @@ class DeepseekV41Attention(nn.Module):
                     pool_kv,
                     batch,
                     start_pos // ratio,
-                    dtype=mx.float32,
                 )
                 cache.compress[self.layer_idx] = pool_kv
             cache.compress_kv = cache.compress[self.layer_idx]
@@ -717,18 +691,28 @@ class DeepseekV41Attention(nn.Module):
         out = cache.map(self._attention, x)
         return mx.zeros_like(x) if out is None else out
 
-    def _attention(self, cache: "DeepseekV41Cache", x: mx.array):
-        """Sparse attention over the pooled compressor cache, or the sliding window alone.
+    def _sparse_attention(self, q, window, pool, indices, window_mask):
+        # Keep KV storage in the model dtype, but scores and softmax in FP32.
+        # MLX's fused BF16 attention does not cover the model's 512-wide heads.
+        return _sparse_pooled_attention(
+            q.astype(mx.float32),
+            window[:, None],
+            pool,
+            indices,
+            window_mask,
+            (indices != -1)[:, None],
+            self.scale,
+            self.attn_sink.astype(mx.float32),
+        ).astype(q.dtype)
 
-        The window cache is float32 and the queries are the model dtype; the cast
-        below keeps them equal, because a dtype mismatch drops the call off the
-        fused attention path. It is lossless: the cache holds fake-quantized fp8
-        values, whose mantissa and exponent both fit the narrower type.
-        """
+    def _attention(self, cache: "DeepseekV41Cache", x: mx.array):
+        """Sparse attention over compressed positions and the sliding window."""
         start_pos = cache.offset
         batch, seqlen = x.shape[0], x.shape[1]
-        qr = self.q_norm(self.wq_a(x))
-        q = self.wq_b(qr).reshape(batch, seqlen, self.n_heads, self.head_dim)
+        qr = self.q_norm(self.wq_a(fake_quant_fp8_ue8m0(x)))
+        q = self.wq_b(fake_quant_fp8_ue8m0(qr)).reshape(
+            batch, seqlen, self.n_heads, self.head_dim
+        )
         q = q.transpose(0, 2, 1, 3)
         q = self.rope(q, start_pos)
 
@@ -737,15 +721,12 @@ class DeepseekV41Attention(nn.Module):
         if self.compress_ratio:
             pool, idxs = self._compress_part(x, qr, start_pos, cache)
             if pool.shape[1]:
-                out = _sparse_pooled_attention(
+                out = self._sparse_attention(
                     q,
-                    window_kv[:, None],
+                    window_kv,
                     pool,
                     idxs,
                     window_mask,
-                    (idxs != -1)[:, None],
-                    self.scale,
-                    self.attn_sink.astype(q.dtype),
                 )
         if out is None:
             kv = window_kv[:, None].astype(q.dtype)
@@ -763,7 +744,7 @@ class DeepseekV41Attention(nn.Module):
         out = out.transpose(0, 1, 3, 2, 4).flatten(-2)
         out = self.wo_a(out)
         out = out.transpose(0, 2, 1, 3).flatten(-2)
-        return self.wo_b(out)
+        return self.wo_b(fake_quant_fp8_ue8m0(out))
 
 
 class Compressor(nn.Module):
@@ -894,6 +875,7 @@ def make_identity_pre_mix(batch: int, seqlen: int, hc_mult: int) -> mx.array:
     )
 
 
+@mx.compile
 def hc_mix_coeffs(
     x: mx.array,
     hc_fn: mx.array,
@@ -959,6 +941,7 @@ class DeepseekV41Block(nn.Module):
         )
 
     @staticmethod
+    @mx.compile
     def hc_pre(x: mx.array, pre_mix: mx.array) -> mx.array:
         """Collapse the hc copies into one, weighted by pre_mix."""
         return (
@@ -1054,13 +1037,8 @@ class DeepseekV41Cache:
         return (self.window, self.compress, self.keys, self.kv_state, self.score_state)
 
     def memory_profile(self, token_count):
-        """The compressor's in-progress group is the only context-free state.
-
-        ``kv_state``/``score_state`` are ``(batch, compress_ratio, head_dim)``,
-        so they do not track the context; the window, the compressed latents,
-        the index keys and the engram ids all grow with it.
-        """
-        fixed = cache_nbytes([self.kv_state, self.score_state])
+        """Window rings and incomplete compression groups have fixed capacity."""
+        fixed = cache_nbytes([self.window, self.kv_state, self.score_state])
         growing = cache_nbytes(self.state) - fixed
         return CacheMemory(
             source_bytes=fixed + growing,

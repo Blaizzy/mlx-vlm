@@ -8,6 +8,7 @@ import mlx.nn as nn
 import numpy as np
 
 from .config import ModelConfig
+from .fakequant import fake_quant_fp8_ue8m0
 
 
 def _is_prime(n: int) -> bool:
@@ -354,7 +355,8 @@ class QuantizedEngramEmbedding(nn.Module):
             group_size=self.group_size,
             bits=self.bits,
             mode=self.mode,
-        ).astype(mx.float32)
+            dtype=mx.bfloat16,
+        )
 
 
 class OffloadedEngramEmbedding(nn.Module):
@@ -478,7 +480,8 @@ class OffloadedEngramEmbedding(nn.Module):
             selected["scales"],
             selected.get("biases"),
             **self._quantization,
-        ).astype(mx.float32)
+            dtype=mx.bfloat16,
+        )
 
 
 class Engram(nn.Module):
@@ -515,9 +518,12 @@ class Engram(nn.Module):
         the gate so those positions pass through untouched."""
         dtype = x.dtype
         n_cols = hash_ids.shape[-1]
-        kv = self.wkv(
-            self.embed(hash_ids).reshape(*hash_ids.shape[:-1], n_cols * self.head_dim)
+        embeddings = (
+            self.embed(hash_ids)
+            .astype(dtype)
+            .reshape(*hash_ids.shape[:-1], n_cols * self.head_dim)
         )
+        kv = self.wkv(fake_quant_fp8_ue8m0(embeddings))
         key, value = mx.split(kv, [self.hc_mult * self.dim], axis=-1)
         key = key.astype(mx.float32).reshape(*key.shape[:-1], self.hc_mult, self.dim)
         weight = self.q_weight.astype(mx.float32) * self.k_weight.astype(mx.float32)

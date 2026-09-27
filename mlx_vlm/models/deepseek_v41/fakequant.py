@@ -4,6 +4,9 @@ The reference *simulates* its training-time quantization on several activations:
 they are rounded through FP8 or FP4 and written back before use. Skipping them
 changes the numbers the model was trained to see. V4.1 applies:
 
+* **native FP8/FP4 linear inputs** -- FP8 e4m3, blocks of 32, ue8m0 scales;
+  retained when the source weights are converted to MLX weight-only formats;
+
 * **window KV** -- FP8 e4m3, blocks of 32, ue8m0 (power-of-two) scales, over the
   *whole* head vector, rope tail included;
 * **compressed KV latents** -- FP4 e2m1, blocks of **16**, **e4m3** scales;
@@ -34,6 +37,36 @@ FP8_MAX_INV = mx.array(1.0 / 448.0, dtype=mx.float32)
 FP4_MAX_INV = mx.array(1.0 / 6.0, dtype=mx.float32)
 
 _E2M1_LUT = mx.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=mx.float32)
+
+
+def _make_fp8_roundtrip_kernel():
+    if not mx.metal.is_available():
+        return None
+    return mx.fast.metal_kernel(
+        name="deepseek_v41_fp8_roundtrip",
+        input_names=["x"],
+        output_names=["out"],
+        source="""
+            uint i = thread_position_in_grid.x;
+            float value = float(x[i]);
+            // One SIMD group owns one 32-element quantization block.
+            float amax = metal::max(metal::simd_max(metal::abs(value)), 1e-4f);
+            uint bits = as_type<uint>(amax * (1.0f / 448.0f));
+            uint exponent = (bits >> 23) + ((bits & 0x7fffff) != 0);
+            float scale = as_type<float>(exponent << 23);
+            float v = metal::clamp(value / scale, -448.0f, 448.0f);
+            // E4M3 spacing is 2**(exponent-3), floored at 2**-9 for
+            // subnormals. rint preserves round-to-nearest-even ties.
+            uint vbits = as_type<uint>(metal::abs(v));
+            uint qexp = metal::max(int(vbits >> 23) - 3, 118);
+            float step = as_type<float>(qexp << 23);
+            out[i] = T((metal::rint(v / step) * step) * scale);
+        """,
+        ensure_row_contiguous=True,
+    )
+
+
+_fp8_roundtrip_kernel = _make_fp8_roundtrip_kernel()
 
 
 def _log2_ceil_bits(x: mx.array) -> mx.array:
@@ -76,6 +109,21 @@ def fake_quant_fp8_ue8m0(x: mx.array, block: int = 32) -> mx.array:
     """FP8 round-trip with pow2 scales."""
     if DISABLE:
         return x
+    if (
+        _fp8_roundtrip_kernel is not None
+        and mx.default_device() == mx.gpu
+        and block == 32
+        and x.shape[-1] % block == 0
+        and x.size
+    ):
+        return _fp8_roundtrip_kernel(
+            inputs=[x],
+            template=[("T", x.dtype)],
+            grid=(x.size, 1, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[x.shape],
+            output_dtypes=[x.dtype],
+        )[0]
     dtype = x.dtype
     shape = x.shape
     xb = _blockify(x.astype(mx.float32), block)

@@ -224,6 +224,10 @@ class Model(nn.Module):
             weights = sanitize_moe_weights(
                 weights, f"language_model.layers.{layer_idx}.ffn", n_routed
             )
+            gate_w = f"language_model.layers.{layer_idx}.ffn.gate.weight"
+            if gate_w in weights:
+                # Router scores use FP32; promote the fixed weights only once.
+                weights[gate_w] = weights[gate_w].astype(mx.float32)
 
         for layer_idx in range(n_layers):
             prefix = f"language_model.layers.{layer_idx}.attn.wo_a"
@@ -241,9 +245,13 @@ class Model(nn.Module):
             bits = 32 * weights[head_w].shape[-1] // in_dim
             weights[head_w] = mx.dequantize(
                 weights[head_w], weights[head_s], weights[head_b], 64, bits
-            ).astype(mx.float32)
+            )
             del weights[head_s]
             del weights[head_b]
+        if head_w in weights:
+            # MLX replaces the initialized dtype when loading BF16 checkpoint
+            # weights. Convert once, rather than promoting this matrix per token.
+            weights[head_w] = weights[head_w].astype(mx.float32)
 
         self._install_engram_embeddings(weights)
         return weights

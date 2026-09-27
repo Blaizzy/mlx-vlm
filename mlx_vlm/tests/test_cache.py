@@ -242,6 +242,10 @@ def test_deepseek_v41_batch_cache_matches_independent_requests(right_pad, chunks
             assert_logits(actual[index : index + 1], full)
             row = cache[0].extract(index)
             assert row.offset == reference[0].offset
+            for ring in row.window:
+                assert ring.shape == (1, config.sliding_window, config.head_dim)
+            fixed = C.cache_nbytes([row.window, row.kv_state, row.score_state])
+            assert row.memory_profile(row.offset).fixed_bytes == fixed
             assert mx.array_equal(row.engram, reference[0].engram).item()
 
     # Merging already-populated scalar caches is the server join path.

@@ -284,7 +284,8 @@ class OffloadedSwitchGLU(nn.Module):
     router-selected experts, paged from an on-disk :class:`ExpertStore`
     (see ``mlx_vlm.moe_offload``) instead of holding all experts resident.
     Matches ``SwitchGLU.__call__(x, indices) -> [..., K, D]`` exactly (no
-    weighting/sum -- the caller already does that).
+    weighting/sum -- the caller already does that). When ``weights`` are supplied,
+    they are passed to the custom activation before the down projection.
 
     ``gate_scale``/``out_scale`` are Inkling's resident NVFP4 correction
     vectors; ``gate_bias``/``up_bias``/``down_bias`` are ``SwitchLinear``'s
@@ -340,11 +341,13 @@ class OffloadedSwitchGLU(nn.Module):
             mode=mode,
         )
 
-    def __call__(self, x, indices) -> mx.array:
+    def __call__(self, x, indices, weights=None) -> mx.array:
         lead, D = x.shape[:-1], x.shape[-1]
         K = indices.shape[-1]
         xf = x.reshape(-1, D)
         idx = np.asarray(indices).reshape(-1, K)
+        if weights is not None:
+            weights = weights.reshape(-1, K)
         N = xf.shape[0]
         out = mx.zeros((N, K, D), dtype=x.dtype)
         uniq = np.unique(idx)
@@ -374,11 +377,16 @@ class OffloadedSwitchGLU(nn.Module):
             x_up = self._proj(xr, uw, usc, ub, self.up_quant)
             if self.up_bias is not None:
                 x_up = x_up + self.up_bias[j].astype(x_up.dtype)
-            h = (
-                self.activation(x_up, x_gate)
-                if self.activation is not None
-                else (nn.silu(x_gate) * x_up)
-            )
+            if weights is not None:
+                h = self.activation(
+                    x_up, x_gate, weights[mx.array(tok), mx.array(slot), None]
+                )
+            else:
+                h = (
+                    self.activation(x_up, x_gate)
+                    if self.activation is not None
+                    else (nn.silu(x_gate) * x_up)
+                )
             d = self._proj(h, dw, dsc, db, self.down_quant)
             if self.down_bias is not None:
                 d = d + self.down_bias[j].astype(d.dtype)
