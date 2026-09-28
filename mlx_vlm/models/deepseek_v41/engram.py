@@ -484,6 +484,28 @@ class OffloadedEngramEmbedding(nn.Module):
         )
 
 
+@mx.compile
+def _engram_gate_score(x, key, q_weight, k_weight, scale, eps, clamp_value):
+    h = x.astype(mx.float32)
+    key = key.astype(mx.float32)
+    weight = q_weight.astype(mx.float32) * k_weight.astype(mx.float32)
+    rstd = mx.rsqrt(mx.mean(mx.square(h), axis=-1) + eps) * mx.rsqrt(
+        mx.mean(mx.square(key), axis=-1) + eps
+    )
+    dot = mx.sum(h * weight * key, axis=-1) * rstd * scale
+    magnitude = mx.sqrt(mx.maximum(mx.abs(dot), clamp_value))
+    return mx.where(dot >= 0, magnitude, -magnitude)
+
+
+@mx.compile
+def _engram_apply_gate(x, value, gate, token_mask=None):
+    if token_mask is not None:
+        gate = mx.where(token_mask[..., None], gate, 0)
+    return (
+        x.astype(mx.float32) + gate[..., None] * value.astype(mx.float32)[:, :, None, :]
+    ).astype(x.dtype)
+
+
 class Engram(nn.Module):
     """Writes an n-gram lookup into the residual stream, gated by how well it matches that stream.
 
@@ -525,21 +547,14 @@ class Engram(nn.Module):
         )
         kv = self.wkv(fake_quant_fp8_ue8m0(embeddings))
         key, value = mx.split(kv, [self.hc_mult * self.dim], axis=-1)
-        key = key.astype(mx.float32).reshape(*key.shape[:-1], self.hc_mult, self.dim)
-        weight = self.q_weight.astype(mx.float32) * self.k_weight.astype(mx.float32)
-        h = x.astype(mx.float32)
-        rstd = mx.rsqrt(mx.mean(mx.square(h), axis=-1) + self.eps) * mx.rsqrt(
-            mx.mean(mx.square(key), axis=-1) + self.eps
+        key = key.reshape(*key.shape[:-1], self.hc_mult, self.dim)
+        score = _engram_gate_score(
+            x,
+            key,
+            self.q_weight,
+            self.k_weight,
+            mx.array(self.dim**-0.5, dtype=mx.float32),
+            self.eps,
+            self.clamp_value,
         )
-        dot = mx.sum(h * weight * key, axis=-1) * rstd * self.dim**-0.5
-        signed = mx.where(
-            dot >= 0,
-            mx.sqrt(mx.maximum(mx.abs(dot), self.clamp_value)),
-            -mx.sqrt(mx.maximum(mx.abs(dot), self.clamp_value)),
-        )
-        gate = mx.sigmoid(signed)
-        if token_mask is not None:
-            gate = mx.where(token_mask[..., None], gate, 0)
-        return (h + gate[..., None] * value.astype(mx.float32)[:, :, None, :]).astype(
-            dtype
-        )
+        return _engram_apply_gate(x, value, mx.sigmoid(score), token_mask)
