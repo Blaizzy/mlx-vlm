@@ -88,6 +88,9 @@ sub-1% combined difference between BF16 and 8-bit. All four formats still rank
 the documented Mars passage above Venus in the single
 retrieval smoke test.
 
+For batch-size sweeps across all four modalities, see
+[batch scaling measurements](BATCHED_BENCHMARKS.md).
+
 ## Reproduce
 
 Install the EAP wheel and audio/video dependencies described in the

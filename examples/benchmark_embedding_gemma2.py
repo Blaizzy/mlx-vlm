@@ -70,6 +70,21 @@ def prepare_cases(processor, assets):
     return cases
 
 
+def prepare_batch_sweep(originals, batch_sizes):
+    """Repeat homogeneous fixtures; each row is encoded independently by the model."""
+    for name in ("text_1x128", "text_1x512", "image", "audio", "video"):
+        single = originals[name]
+        for batch_size in batch_sizes:
+            # Video patch tensors contain all frames on axis zero, so repeating
+            # the whole tensor preserves frame order for each repeated clip.
+            inputs = {
+                key: mx.concatenate([value] * batch_size, axis=0)
+                for key, value in single.items()
+            }
+            mx.eval(inputs)
+            yield f"{name}_batch{batch_size}", inputs
+
+
 def measure(model, inputs, warmups, repeats):
     def forward():
         result = model(**inputs)
@@ -99,6 +114,7 @@ def measure(model, inputs, warmups, repeats):
             else []
         ),
         "median_ms": median * 1000,
+        "ms_per_embedding": median * 1000 / batch,
         "p90_ms": float(np.percentile(samples, 90)) * 1000,
         "samples_ms": [sample * 1000 for sample in samples],
         "embeddings_per_second": batch / median,
@@ -115,12 +131,25 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--warmups", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=10)
+    parser.add_argument(
+        "--batch-sizes",
+        type=int,
+        nargs="+",
+        help="Sweep these batch sizes for 128/512-token text, image, audio, and video",
+    )
     args = parser.parse_args()
     if args.warmups < 1 or args.repeats < 1:
         parser.error("warmups and repeats must be positive")
+    if args.batch_sizes and any(size < 1 for size in args.batch_sizes):
+        parser.error("batch sizes must be positive")
     processor = AutoProcessor.from_pretrained(args.model_path)
     start = time.perf_counter()
-    cases = prepare_cases(processor, args.assets)
+    prepared = prepare_cases(processor, args.assets)
+    cases = (
+        prepare_batch_sweep(prepared, args.batch_sizes)
+        if args.batch_sizes
+        else prepared.items()
+    )
     preparation_seconds = time.perf_counter() - start
     start = time.perf_counter()
     model = load_embedding_model(args.model_path)
@@ -135,6 +164,12 @@ def main():
         "quantization": config.get("quantization"),
         "warmups": args.warmups,
         "repeats": args.repeats,
+        "batch_sizes": args.batch_sizes,
+        "batch_fixture": (
+            "Repeated identical inputs; preprocessing excluded; no feature caching"
+            if args.batch_sizes
+            else None
+        ),
         "weight_bytes": sum(value.nbytes for _, value in parameters),
         "text_weight_bytes": sum(
             value.nbytes
@@ -150,8 +185,23 @@ def main():
     }
     gc.collect()
     mx.clear_cache()
-    for name, inputs in cases.items():
+    single_embeddings = {}
+    for name, inputs in cases:
         result = measure(model, inputs, args.warmups, args.repeats)
+        if args.batch_sizes:
+            base = name.rsplit("_batch", 1)[0]
+            if base not in single_embeddings:
+                single_embeddings[base] = np.array(
+                    model(**prepared[base]).text_embeds, dtype=np.float64
+                )
+            expected = single_embeddings[base]
+            actual = np.array(model(**inputs).text_embeds, dtype=np.float64)
+            cosine = (actual * expected).sum(-1) / (
+                np.linalg.norm(actual, axis=-1) * np.linalg.norm(expected, axis=-1)
+            )
+            result["batch_vs_single_min_cosine"] = float(cosine.min())
+            result["batch_vs_single_max_abs"] = float(np.abs(actual - expected).max())
+            assert result["batch_vs_single_min_cosine"] >= 0.999, result
         report["cases"][name] = result
         print(name, json.dumps(result), flush=True)
         args.output.parent.mkdir(parents=True, exist_ok=True)
