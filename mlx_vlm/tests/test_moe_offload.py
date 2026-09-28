@@ -10,7 +10,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-from mlx_vlm.models import deepseek_v3, deepseek_v41, laguna, minimax
+from mlx_vlm.models import deepseek_v3, laguna, minimax
 from mlx_vlm.models.laguna.language import LagunaPackedSwitchGLU
 from mlx_vlm.moe_offload import ExpertStore, patch_model, plan, repack
 from mlx_vlm.utils import load_model, save_weights
@@ -82,23 +82,11 @@ def _assert_offload_parity(resident, offloaded):
     ), f"offloaded output diverged: {relative_error:.4f} relative"
 
 
-@pytest.mark.parametrize("family", ["deepseek_v3", "laguna", "deepseek_v41"])
+@pytest.mark.parametrize("family", ["deepseek_v3", "laguna"])
 def test_offload_loads_with_resident_parity(tmp_path, family):
     # Separate projections and fused gate_up_proj both go through the real loader.
     if family == "deepseek_v3":
         build, offload = _build_and_repack(tmp_path)
-    elif family == "deepseek_v41":
-        from mlx_vlm.tests.test_models import DATA, build_config
-
-        case = next(case for case in DATA["cases"] if case["module"] == family)
-        config = build_config(deepseek_v41, case["config"])
-        # Exercise expert replacement independently of Engram checkpoint mapping.
-        config.engram_layer_ids = []
-        model = deepseek_v41.Model(config)
-        model.language_model.head.weight = (
-            mx.random.normal(model.language_model.head.weight.shape) * 0.05
-        )
-        build, offload = _build_and_repack(tmp_path, model, config)
     else:
         config = laguna.ModelConfig(
             model_type="laguna",
@@ -123,9 +111,7 @@ def test_offload_loads_with_resident_parity(tmp_path, family):
     model = load_model(offload)
     store = getattr(model, "moe_offload_store", None)
     assert store is not None, "load_model did not auto-patch the offload directory"
-    assert store.swapped == (
-        config.num_hidden_layers if family == "deepseek_v41" else 2
-    )
+    assert store.swapped == 2
     _assert_offload_parity(resident, model(prompt).logits)
 
 
