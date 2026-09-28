@@ -613,6 +613,17 @@ _SEQUENCE_ALIGNED_PROMPT_KWARGS = {
     "token_type_ids",
 }
 
+# Sequence-aligned kwargs for which a zero row is the neutral value: token type
+# 0 is text, a zero visual mask marks no vision tokens. When a batched prefill
+# mixes rows that carry one of these with rows that do not (a text-only
+# request beside image requests), the rows without it get zeros in their own
+# position, so the key keeps one row per request in batch order.
+_ZERO_NEUTRAL_PROMPT_KWARGS = {
+    "mm_token_type_ids",
+    "token_type_ids",
+    "visual_pos_masks",
+}
+
 APC_PRIVATE_PROMPT_KEYS = (
     "_apc_tenant",
     "_apc_image_hash",
@@ -833,13 +844,36 @@ def _merge_prefill_prompt_kwargs(
                     row_v = _pad_sequence_aligned_prompt_kwarg(
                         k, row_v, max_length, left=True
                     )
-                per_row_keys.setdefault(k, []).append(row_v)
+                per_row_keys.setdefault(k, {})[i] = row_v
             elif k not in merged_kwargs:
                 merged_kwargs[k] = v
-    for k, vs in per_row_keys.items():
-        merged_kwargs[k] = _concat_prompt_kwarg_rows(k, vs)
+    merged_kwargs.update(
+        _stack_prompt_kwarg_rows(per_row_keys, batch_size, max_length)
+    )
 
     return inputs_embeds, merged_kwargs
+
+
+def _stack_prompt_kwarg_rows(
+    per_row_keys: dict, batch_size: int, sequence_length: int
+) -> dict:
+    """Stack ``{key: {row_idx: row}}`` into one batched array per key.
+
+    Rows stay in batch order. For a zero-neutral key that some rows lack
+    (a text-only request has no ``mm_token_type_ids``), the missing rows get
+    zeros, so the key has exactly one row per request instead of fewer rows
+    than the batch - which crashed a mask broadcast, or silently broadcast one
+    request's row over another's.
+    """
+    stacked = {}
+    for k, rows in per_row_keys.items():
+        if k in _ZERO_NEUTRAL_PROMPT_KWARGS and len(rows) < batch_size:
+            template = next(iter(rows.values()))
+            if template.ndim >= 2 and template.shape[1] == sequence_length:
+                zero_row = mx.zeros(template.shape, dtype=template.dtype)
+                rows = {i: rows.get(i, zero_row) for i in range(batch_size)}
+        stacked[k] = _concat_prompt_kwarg_rows(k, [rows[i] for i in sorted(rows)])
+    return stacked
 
 
 def _is_batch_cache_entry(entry) -> bool:
@@ -2705,11 +2739,12 @@ class BatchGenerator:
                             max_suffix_len,
                             left=False,
                         )
-                    per_row_keys.setdefault(k, []).append(row_v)
+                    per_row_keys.setdefault(k, {})[i] = row_v
                 elif k not in merged_kwargs:
                     merged_kwargs[k] = v
-        for k, vs in per_row_keys.items():
-            merged_kwargs[k] = _concat_prompt_kwarg_rows(k, vs)
+        merged_kwargs.update(
+            _stack_prompt_kwarg_rows(per_row_keys, batch_size, max_suffix_len)
+        )
 
         apc_mode = getattr(self, "apc_mode", "block")
         # bits + group_size + scheme so warm restore matches live _make_cache

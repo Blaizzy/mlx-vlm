@@ -1428,6 +1428,52 @@ def test_cold_batch_merges_mixed_text_and_mrope_position_ids():
     assert prompt_kwargs["position_ids"][0, 1].tolist() == [7, 7, 7]
 
 
+def test_cold_batch_zero_fills_token_type_ids_for_rows_without_them():
+    # A text-only request has no mm_token_type_ids. Stacking only the rows
+    # that carry it left the key with fewer rows than the batch: gemma4's
+    # bidirectional image mask then failed to broadcast (3 rows vs 2).
+    inputs_embeds, prompt_kwargs = ar_module._merge_prefill_prompt_kwargs(
+        [
+            {
+                "inputs_embeds": mx.ones((1, 3, 2)),
+                "mm_token_type_ids": mx.array([[1, 1, 0]], dtype=mx.int32),
+            },
+            {"inputs_embeds": mx.ones((1, 2, 2))},
+            {
+                "inputs_embeds": mx.ones((1, 3, 2)),
+                "mm_token_type_ids": mx.array([[0, 1, 1]], dtype=mx.int32),
+            },
+        ],
+        [[1, 2, 3], [4, 5], [6, 7, 8]],
+    )
+
+    assert inputs_embeds.shape == (3, 3, 2)
+    types = prompt_kwargs["mm_token_type_ids"]
+    assert types.shape == (3, 3)
+    assert types.dtype == mx.int32
+    assert types.tolist() == [[1, 1, 0], [0, 0, 0], [0, 1, 1]]
+
+
+def test_cold_batch_never_broadcasts_one_rows_token_types_to_another():
+    # Two rows, one carrying mm_token_type_ids: a (1, L) array silently
+    # broadcast over both rows, giving the text-only request the image
+    # request's bidirectional mask - a wrong answer with no error.
+    _, prompt_kwargs = ar_module._merge_prefill_prompt_kwargs(
+        [
+            {"inputs_embeds": mx.ones((1, 2, 2))},
+            {
+                "inputs_embeds": mx.ones((1, 2, 2)),
+                "mm_token_type_ids": mx.array([[1, 1]], dtype=mx.int32),
+                "token_type_ids": mx.array([[1, 0]], dtype=mx.int32),
+            },
+        ],
+        [[1, 2], [3, 4]],
+    )
+
+    assert prompt_kwargs["mm_token_type_ids"].tolist() == [[0, 0], [1, 1]]
+    assert prompt_kwargs["token_type_ids"].tolist() == [[0, 0], [1, 0]]
+
+
 def test_prompt_processing_batch_slices_native_mrope_position_ids():
     batch = object.__new__(PromptProcessingBatch)
     position_ids = mx.arange(3 * 2 * 5, dtype=mx.int32).reshape(3, 2, 5)
@@ -1509,6 +1555,79 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
     assert "_apc_image_hash" not in captured["prompt_kwargs"]
     assert "_apc_semantic_hash" not in captured["prompt_kwargs"]
     assert captured["prompt_kwargs"]["keep_tensor"].shape == (2, 1)
+
+
+def test_mixed_apc_batch_zero_fills_token_type_ids_for_rows_without_them():
+    # The warm/cold mixed prefill merged per-row kwargs the same way as the
+    # cold path: a row without mm_token_type_ids left the key short of rows.
+    bg = object.__new__(BatchGenerator)
+    bg.apc_manager = object()
+    bg.model = SimpleNamespace(layers=[object()])
+    bg.prefill_step_size = None
+    bg.kv_bits = None
+    bg.kv_group_size = 64
+    bg.kv_quant_scheme = "affine"
+    bg._wire_stack = None
+
+    captured = {}
+
+    def fake_prompt_batch(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    sequences = [
+        (
+            1,
+            list(range(8)),
+            1,
+            {
+                "inputs_embeds": mx.ones((1, 8, 4)),
+                "keep_tensor": mx.ones((1, 1)),
+                "mm_token_type_ids": mx.array([[0, 0, 0, 0, 1, 1, 0, 0]]),
+                "_apc_tenant": "tenant-a",
+                "_apc_image_hash": 123,
+                "_apc_semantic_hash": 7,
+            },
+            [],
+            None,
+        ),
+        (
+            2,
+            list(range(6)),
+            1,
+            {
+                "inputs_embeds": mx.ones((1, 6, 4)),
+                "keep_tensor": mx.zeros((1, 1)),
+                "_apc_tenant": "tenant-b",
+                "_apc_image_hash": 456,
+            },
+            [],
+            None,
+        ),
+    ]
+    picks = [
+        {
+            "matched_blocks": [],
+            "prefix_len": 4,
+            "extra_hash": 7,
+            "full_input_ids": list(range(8)),
+        },
+        None,
+    ]
+
+    with (
+        patch.object(BatchGenerator, "_apc_pick_for", side_effect=picks),
+        patch.object(
+            ar_module._apc, "make_warm_batch_kv_cache_multi", return_value=([], 4)
+        ),
+        patch.object(generate_module, "PromptProcessingBatch", fake_prompt_batch),
+    ):
+        batch = bg._build_mixed_prompt_batch(sequences)
+
+    assert batch is not None
+    types = captured["prompt_kwargs"]["mm_token_type_ids"]
+    assert types.shape == (2, 6)
+    assert types.tolist() == [[1, 1, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0]]
 
 
 def test_apc_pick_rejects_image_tokens_and_releases_blocks():
