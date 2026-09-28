@@ -92,6 +92,17 @@ class ModelChecks:
             mx.linalg.norm(output.text_embeds, axis=-1), mx.array(1.0), atol=1e-5
         )
 
+    def sentence_embeddings(self, model, config):
+        mask = mx.array([[1, 1, 1, 0]])
+        output = model(mx.array([[1, 2, 3, 0]]), attention_mask=mask)
+        changed_padding = model(mx.array([[1, 2, 3, 9]]), attention_mask=mask)
+        width = config.text_config.embedding_dim
+        assert output.last_hidden_state.shape == (1, 4, width)
+        assert output.text_embeds.shape == (1, width)
+        assert output.text_embeds.dtype == mx.float32
+        self.assert_close(output.text_embeds, changed_padding.text_embeds)
+        self.assert_close(mx.linalg.norm(output.text_embeds, axis=-1), mx.ones((1,)))
+
     def assert_close(self, actual, expected, *, logits=False):
         assert actual.shape == expected.shape
         assert mx.all(mx.isfinite(actual)).item()
@@ -521,7 +532,7 @@ def check_arguments(kind, case, model, config):
     )
     if kind == "forward_cache":
         return (model, text.vocab_size), case.get("forward_cache", {})
-    if kind in {"masked_lm", "token_embeddings"}:
+    if kind in {"masked_lm", "token_embeddings", "sentence_embeddings"}:
         return (model, config), {}
     if kind == "multimodal":
         return (model, config), case["multimodal"]
