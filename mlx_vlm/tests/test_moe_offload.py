@@ -12,7 +12,14 @@ import pytest
 
 from mlx_vlm.models import deepseek_v3, laguna, minimax
 from mlx_vlm.models.laguna.language import LagunaPackedSwitchGLU
-from mlx_vlm.moe_offload import ExpertStore, patch_model, plan, repack, resolve_repack
+from mlx_vlm.moe_offload import (
+    ExpertStore,
+    _expand_expert_layer,
+    patch_model,
+    plan,
+    repack,
+    resolve_repack,
+)
 from mlx_vlm.utils import load_model, save_weights
 
 
@@ -366,3 +373,42 @@ def test_load_model_moe_offload_rejects_bad_mode(tmp_path):
     build = _build(tmp_path)
     with pytest.raises(ValueError, match="repack.*mmap|mmap.*repack"):
         load_model(build, moe_offload=True)
+
+
+def test_plan_recognizes_bare_fused_and_glm_layouts():
+    # Qwen3.5/3.6-MoE: bare bf16 fused experts (no .weight suffix).
+    qwen = [
+        "model.language_model.layers.5.mlp.experts.gate_up_proj",
+        "model.language_model.layers.5.mlp.experts.down_proj",
+        "model.language_model.layers.5.mlp.shared_expert.gate_proj.weight",
+    ]
+    # GLM-4.6 (glm4_moe): standard separate stacked switch_mlp, quantized.
+    glm = [
+        "model.layers.3.mlp.switch_mlp.gate_proj.weight",
+        "model.layers.3.mlp.switch_mlp.up_proj.weight",
+        "model.layers.3.mlp.switch_mlp.down_proj.weight",
+    ]
+    p = plan(qwen + glm)
+    assert p["layers"] == [3, 5]
+    assert "shared_expert.gate_proj.weight" in " ".join(p["resident"])
+    assert sorted(m for _, _, m in p["experts"][5]) == ["STACK", "STACK_FUSED"]
+    assert sorted(m for _, _, m in p["experts"][3]) == ["STACK", "STACK", "STACK"]
+
+
+def test_expand_unstacks_bare_fused_bf16_experts():
+    E, mid, hidden, out = 4, 6, 8, 8
+    prefix = "model.language_model.layers.0.mlp"
+    gate_up = mx.random.normal((E, 2 * mid, hidden))
+    down = mx.random.normal((E, out, mid))
+    mx.eval(gate_up, down)
+    src = {
+        f"{prefix}.experts.gate_up_proj": gate_up,
+        f"{prefix}.experts.down_proj": down,
+    }
+    p = plan(list(src))
+    layer, n_experts = _expand_expert_layer(p["experts"][0], lambda name: src[name])
+    assert n_experts == E
+    for j in range(E):
+        assert mx.array_equal(layer[f"e{j}.gate_proj.weight"], gate_up[j, :mid])
+        assert mx.array_equal(layer[f"e{j}.up_proj.weight"], gate_up[j, mid:])
+        assert mx.array_equal(layer[f"e{j}.down_proj.weight"], down[j])
