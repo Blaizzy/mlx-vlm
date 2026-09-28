@@ -2,6 +2,7 @@
   "modules": {
     "aya_vision": ["aya_vision", "AyaVisionProcessor"],
     "deepseek": ["deepseek_v4", "DeepseekV4Processor"],
+    "deepseekocr": ["deepseekocr", "DeepseekOCRProcessor"],
     "diffusion": ["diffusion_gemma", "DiffusionGemma4Processor"],
     "dots_ocr": ["dots_ocr", "DotsVLProcessor"],
     "ernie": ["ernie4_5_moe_vl", "Ernie4_5_VLProcessor"],
