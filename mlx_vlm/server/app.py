@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from threading import Lock
 from types import SimpleNamespace
-from typing import Annotated, List, Optional, Tuple
+from typing import Annotated, List, Literal, Optional, Tuple
 
 import mlx.core as mx
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
@@ -21,6 +21,7 @@ from starlette.requests import HTTPConnection
 from .. import apc as _apc
 from ..generate.edit_image import load_image_edit_model
 from ..generate.image import is_image_generation_model, load_image_generation_model
+from ..generate.image_defaults import ImageSamplingDefaults, resolve_image_defaults
 from ..reranker import RerankerKind, reranker_kind
 from ..structured import build_json_schema_logits_processor
 from ..tools import _infer_tool_parser_from_processor
@@ -1059,6 +1060,23 @@ def models_endpoint(
         "object": "list",
         "data": sorted(models.values(), key=lambda model: model["id"].lower()),
     }
+
+
+@inference_router.get("/images/defaults", response_model=ImageSamplingDefaults)
+@inference_router.get(
+    "/v1/images/defaults", response_model=ImageSamplingDefaults, include_in_schema=False
+)
+def image_defaults_endpoint(
+    model: Annotated[str, Query(min_length=1)],
+    task: Literal["generate", "edit"] = "generate",
+):
+    """Resolve sampling defaults using metadata only, without loading weights."""
+    try:
+        return resolve_image_defaults(model, task=task)
+    except NotImplementedError as error:
+        raise HTTPException(status_code=501, detail=str(error)) from error
+    except (ValueError, FileNotFoundError) as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
 
 
 app.include_router(inference_router)

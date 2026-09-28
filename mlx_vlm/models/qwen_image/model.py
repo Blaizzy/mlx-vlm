@@ -12,6 +12,7 @@ from mlx_vlm.generate.image import (
     ImageGenerationRequest,
     ImageGenerationResult,
 )
+from mlx_vlm.generate.image_defaults import ImageSamplingDefaults
 
 from .config import QwenImageVariant, get_variant, variant_from_local_path
 from .download import validate_model_layout
@@ -54,14 +55,23 @@ class QwenImageGenerationModel(ImageGenerationModel):
     model_id: str
     family: str = "qwen_image"
 
+    default_sampling: ClassVar[ImageSamplingDefaults] = ImageSamplingDefaults(30, 1.0)
+
+    @classmethod
+    def resolve_defaults(
+        cls, model: str, *, model_path: Path | None = None
+    ) -> ImageSamplingDefaults:
+        return cls.default_sampling
+
     @property
     def variant(self) -> str:
         return self.pipeline.variant.name
 
     def generate(self, request: ImageGenerationRequest) -> ImageGenerationResult:
         seed = 0 if request.seed is None else request.seed
-        steps = request.resolve_steps()
-        guidance = request.resolve_guidance(1.0)
+        defaults = self.default_sampling
+        steps = request.resolve_steps(defaults.steps)
+        guidance = request.resolve_guidance(defaults.guidance)
         array = self.pipeline.generate_array(
             request.prompt,
             seed=seed,
@@ -125,10 +135,19 @@ class QwenImageEditModel(QwenImageGenerationModel):
     is_image_generation_model: ClassVar[bool] = False
     is_image_edit_model: ClassVar[bool] = True
 
+    default_sampling: ClassVar[ImageSamplingDefaults] = ImageSamplingDefaults(40, 1.0)
+
+    @classmethod
+    def resolve_defaults(
+        cls, model: str, *, model_path: Path | None = None
+    ) -> ImageSamplingDefaults:
+        return cls.default_sampling
+
     def edit(self, request: ImageEditRequest) -> ImageGenerationResult:
         seed = 0 if request.seed is None else request.seed
-        steps = request.resolve_steps(40)
-        guidance = request.resolve_guidance(1.0)
+        defaults = self.default_sampling
+        steps = request.resolve_steps(defaults.steps)
+        guidance = request.resolve_guidance(defaults.guidance)
         array = self.pipeline.edit_array(
             request.prompt,
             request.image_paths,

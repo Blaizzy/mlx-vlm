@@ -28,8 +28,10 @@ from .generation import (
 )
 from .responses_state import (
     ToolCallStreamState,
+    finish_content_streams,
     make_response_stream_state,
     prompt_has_open_thinking,
+    strip_protocol_markers,
 )
 from .runtime import runtime
 from .schemas import AnthropicMessageResponse, AnthropicRequest, AnthropicUsage
@@ -578,8 +580,10 @@ async def anthropic_messages_endpoint(http_request: Request):
                     gen_args.thinking_start_token,
                     gen_args.thinking_end_token,
                 )
-                tc_start = tool_module.tool_call_start if tool_module else None
-                tc_end = tool_module.tool_call_end if tool_module else None
+                tc_start = (
+                    tool_module.tool_call_start if tool_module and tools else None
+                )
+                tc_end = tool_module.tool_call_end if tool_module and tools else None
                 tool_call_state = ToolCallStreamState(tc_start, tc_end)
                 message_started = False
 
@@ -759,8 +763,35 @@ async def anthropic_messages_endpoint(http_request: Request):
                             finish_reason = token.finish_reason
                             break
 
+                    tail_reasoning, tail = finish_content_streams(
+                        thinking_state, tool_call_state
+                    )
                     for event in start_message_event():
                         yield event
+                    if tail_reasoning and gen_args.enable_thinking:
+                        yield open_block("thinking")
+                        yield _sse_event(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": block_index,
+                                "delta": {
+                                    "type": "thinking_delta",
+                                    "thinking": tail_reasoning,
+                                },
+                            },
+                        )
+                    if tail:
+                        text_output += tail
+                        yield open_block("text")
+                        yield _sse_event(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": block_index,
+                                "delta": {"type": "text_delta", "text": tail},
+                            },
+                        )
                     yield close_open_block()
 
                     parsed_tool_calls = None
@@ -990,6 +1021,12 @@ async def anthropic_messages_endpoint(http_request: Request):
                         gen_args.thinking_start_token,
                         gen_args.thinking_end_token,
                         processor=processor,
+                    )
+                    content = strip_protocol_markers(
+                        content,
+                        tool_module,
+                        gen_args.thinking_start_token,
+                        gen_args.thinking_end_token,
                     )
 
             content, stop_sequence = _apply_stop_sequences(

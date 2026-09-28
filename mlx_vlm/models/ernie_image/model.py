@@ -12,6 +12,7 @@ from mlx_vlm.generate.image import (
     ImageGenerationRequest,
     ImageGenerationResult,
 )
+from mlx_vlm.generate.image_defaults import ImageSamplingDefaults, image_metadata_path
 
 from .config import ErnieImageVariant, get_variant, variant_from_local_path
 from .download import validate_model_layout
@@ -31,6 +32,15 @@ def resolve_variant(
     return get_variant(model)
 
 
+def _defaults_variant(model: str, model_path: Path | None):
+    if model_path is not None:
+        return variant_from_local_path(model_path)
+    try:
+        return resolve_variant(model)
+    except ValueError:
+        return variant_from_local_path(image_metadata_path(model))
+
+
 @dataclass(slots=True)
 class ErnieImageGenerationModel(ImageGenerationModel):
     is_image_generation_model: ClassVar[bool] = True
@@ -38,6 +48,16 @@ class ErnieImageGenerationModel(ImageGenerationModel):
     pipeline: ErnieImagePipeline
     model_id: str
     family: str = "ernie_image"
+
+    @property
+    def default_sampling(self) -> ImageSamplingDefaults:
+        return ImageSamplingDefaults.from_config(self.pipeline.variant)
+
+    @classmethod
+    def resolve_defaults(
+        cls, model: str, *, model_path: Path | None = None
+    ) -> ImageSamplingDefaults:
+        return ImageSamplingDefaults.from_config(_defaults_variant(model, model_path))
 
     @property
     def variant(self) -> str:
@@ -53,10 +73,9 @@ class ErnieImageGenerationModel(ImageGenerationModel):
 
     def generate(self, request: ImageGenerationRequest) -> ImageGenerationResult:
         seed = 0 if request.seed is None else request.seed
-        steps = self.default_steps if request.steps is None else request.steps
-        guidance = (
-            self.default_guidance if request.guidance is None else request.guidance
-        )
+        defaults = self.default_sampling
+        steps = request.resolve_steps(defaults.steps)
+        guidance = request.resolve_guidance(defaults.guidance)
         array = self.pipeline.generate_array(
             request.prompt,
             seed=seed,
@@ -147,6 +166,22 @@ class ErnieImageEditModel(ImageEditModel):
     family: str = "ernie_image"
 
     @property
+    def default_sampling(self) -> ImageSamplingDefaults:
+        return ImageSamplingDefaults(
+            self.pipeline.variant.default_steps,
+            self.pipeline.variant.edit_default_guidance,
+        )
+
+    @classmethod
+    def resolve_defaults(
+        cls, model: str, *, model_path: Path | None = None
+    ) -> ImageSamplingDefaults:
+        variant = _defaults_variant(model, model_path)
+        return ImageSamplingDefaults(
+            variant.default_steps, variant.edit_default_guidance
+        )
+
+    @property
     def variant(self) -> str:
         return self.pipeline.variant.name
 
@@ -167,10 +202,9 @@ class ErnieImageEditModel(ImageEditModel):
         if len(request.image_paths) != 1:
             raise ValueError("ERNIE-Image img2img accepts exactly one source image")
         seed = 0 if request.seed is None else request.seed
-        steps = request.steps or self.default_steps
-        guidance = (
-            self.default_guidance if request.guidance is None else request.guidance
-        )
+        defaults = self.default_sampling
+        steps = request.resolve_steps(defaults.steps)
+        guidance = request.resolve_guidance(defaults.guidance)
         # ``image_strength`` is the canonical key; ``strength`` is accepted as
         # an alias so the edit command lines up with the z_image model and
         # matches the naming used in the documentation.

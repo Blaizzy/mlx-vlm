@@ -17,6 +17,7 @@ import numpy as np
 from PIL import Image
 
 from ..utils import get_model_path
+from .image_defaults import ImageSamplingDefaults
 
 DEFAULT_IMAGE_SIZE = "512x512"
 DEFAULT_IMAGE_STEPS = 4
@@ -146,6 +147,16 @@ class ImageGenerationModel(Protocol):
     model_id: str
     family: str
 
+    @property
+    def default_sampling(self) -> ImageSamplingDefaults:
+        raise NotImplementedError("This model does not expose image sampling defaults")
+
+    @classmethod
+    def resolve_defaults(
+        cls, model: str, *, model_path: Path | None = None
+    ) -> ImageSamplingDefaults:
+        raise NotImplementedError("This model does not expose image sampling defaults")
+
     @classmethod
     def supports_model(cls, model: str) -> bool: ...
 
@@ -185,6 +196,7 @@ def _model_type_from_id(model: str) -> str:
         "ming": "ming_image",
         "mingimage": "ming_image",
         "ernie": "ernie_image",
+        "ideogram": "ideogram4",
         "qwen": "qwen_image",
         "qwenimage": "qwen_image",
     }.get(model_type, model_type)
