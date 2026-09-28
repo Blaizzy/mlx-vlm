@@ -120,6 +120,14 @@ mlx_vlm.convert --hf-path gg-hf-em/embeddinggemma-2 \
 
 Both `load_embedding_model` and `mlx_vlm.load` accept the converted directory.
 
+## Performance and quantization
+
+See [measured latency, memory, and quantization accuracy](BENCHMARKS.md) for
+BF16 and affine 4/6/8-bit results on Apple M5 Max. BF16 is fastest for text,
+image, and audio in these tests. 8-bit reduces full-model weight storage by
+17.1% with minimum embedding cosine 0.99966 against the float32 reference;
+plain 4-bit falls to 0.96716 and fails the documented accuracy limits.
+
 ## Reference validation
 
 Validation uses checkpoint revision `fc77679a26fcb86250765859d04ce2fcc6cb0b2c`,

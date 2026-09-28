@@ -75,9 +75,12 @@ def unit_vectors(value):
 
 
 class Validator:
-    def __init__(self, model_path, dtype):
+    def __init__(self, model_path, dtype, mlx_model_path=None, tolerances=None):
         self.model_path = model_path
+        self.mlx_model_path = mlx_model_path or model_path
         self.dtype = dtype
+        self.cast_weights = mlx_model_path is None
+        self.tolerances = tolerances or {}
         self.load = AutoModel.from_pretrained
         self.forward = EmbeddingGemma2Model.forward
         self.process = EmbeddingGemma2Processor.__call__
@@ -85,6 +88,7 @@ class Validator:
         self.references = {}
         self.models = {}
         self.checks = []
+        self.accuracy_failures = []
         self.prepared = []
         self.example = 0
 
@@ -113,17 +117,18 @@ class Validator:
             reference.config.audio_config is not None,
         )
         if key not in self.models:
-            config = json.loads((self.model_path / "config.json").read_text())
+            config = json.loads((self.mlx_model_path / "config.json").read_text())
             if not key[0]:
                 config["vision_config"] = None
             if not key[1]:
                 config["audio_config"] = None
-            model = load_embedding_model(self.model_path, config=config)
-            model.update(
-                tree_map(
-                    lambda x: x.astype(getattr(mx, self.dtype)), model.parameters()
+            model = load_embedding_model(self.mlx_model_path, config=config)
+            if self.cast_weights:
+                model.update(
+                    tree_map(
+                        lambda x: x.astype(getattr(mx, self.dtype)), model.parameters()
+                    )
                 )
-            )
             self.models[key] = model
         actual = self.models[key](
             **{k: to_mlx(v) for k, v in inputs.items() if v is not None}
@@ -167,20 +172,34 @@ class Validator:
             for dim in (128, 256, 512)
         )
         self.checks.append(check)
-        print("CHECK", json.dumps(check), flush=True)
         assert np.isfinite(tokens).all() and np.isfinite(embeddings).all(), check
         np.testing.assert_allclose(np.linalg.norm(embeddings, axis=-1), 1, atol=2e-6)
         full_precision = self.dtype == "float32"
-        assert check["embedding_max_abs"] <= (1e-5 if full_precision else 0.01), check
-        assert check["embedding_min_cosine"] >= (
-            0.999999 if full_precision else 0.999
-        ), check
-        assert check["prefix_min_cosine"] >= (
-            0.999999 if full_precision else 0.999
-        ), check
+        min_cosine = self.tolerances.get(
+            "min_cosine", 0.999999 if full_precision else 0.999
+        )
+        max_error = self.tolerances.get("max_error", 1e-5 if full_precision else 0.01)
+        max_token_error = self.tolerances.get(
+            "max_token_error", 1e-4 if full_precision else 0.2
+        )
         # Unnormalized token magnitudes are more sensitive to BF16 rounding than
         # the normalized sentence vectors; retain and bound both measurements.
-        assert check["token_relative_l2"] <= (1e-4 if full_precision else 0.2), check
+        failures = [
+            metric
+            for metric, passed in (
+                ("embedding_max_abs", check["embedding_max_abs"] <= max_error),
+                ("embedding_min_cosine", check["embedding_min_cosine"] >= min_cosine),
+                ("prefix_min_cosine", check["prefix_min_cosine"] >= min_cosine),
+                ("token_relative_l2", check["token_relative_l2"] <= max_token_error),
+            )
+            if not passed
+        ]
+        check["failed_metrics"] = failures
+        if failures:
+            self.accuracy_failures.append(
+                {"example": self.example, "metrics": failures}
+            )
+        print("CHECK", json.dumps(check), flush=True)
 
     def checked_forward(self, model, *args, **kwargs):
         bound = self.signature.bind(model, *args, **kwargs)
@@ -226,6 +245,14 @@ def main():
     )
     parser.add_argument("--dtype", choices=("float32", "bfloat16"), default="float32")
     parser.add_argument(
+        "--mlx-model-path",
+        type=Path,
+        help="Validate a converted/quantized checkpoint without casting its stored weights",
+    )
+    parser.add_argument("--min-cosine", type=float)
+    parser.add_argument("--max-error", type=float)
+    parser.add_argument("--max-token-error", type=float)
+    parser.add_argument(
         "--output-dir", type=Path, default=Path("embeddinggemma2-validation")
     )
     args = parser.parse_args()
@@ -265,7 +292,16 @@ def main():
             filename,
             repo_type="dataset",
         )
-    validator = Validator(model_path, args.dtype)
+    tolerances = {
+        key: value
+        for key, value in {
+            "min_cosine": args.min_cosine,
+            "max_error": args.max_error,
+            "max_token_error": args.max_token_error,
+        }.items()
+        if value is not None
+    }
+    validator = Validator(model_path, args.dtype, args.mlx_model_path, tolerances)
     results = []
     args.output_dir.mkdir(parents=True, exist_ok=True)
     report = {
@@ -274,6 +310,11 @@ def main():
         "document_sha256": DOCUMENT_SHA256,
         "dtype": args.dtype,
         "reference_dtype": "float32",
+        "mlx_model_path": str(validator.mlx_model_path),
+        "quantization": json.loads(
+            (validator.mlx_model_path / "config.json").read_text()
+        ).get("quantization"),
+        "tolerance_overrides": tolerances,
         "transformers": transformers.__version__,
         "torch": torch.__version__,
         "mlx": mx.__version__,
@@ -299,6 +340,7 @@ def main():
             validator.example = index
             validator.prepared.clear()
             start, before = time.monotonic(), len(validator.checks)
+            before_failures = len(validator.accuracy_failures)
             print("EXAMPLE", index, flush=True)
             result = {"example": index, "status": "passed"}
             try:
@@ -308,6 +350,8 @@ def main():
                 exec(compile(tree, f"upstream-example-{index}", "exec"), {})
                 validator.check_preprocessing_examples()
                 assert len(validator.checks) > before, "No paired forward was checked"
+                failures = validator.accuracy_failures[before_failures:]
+                assert not failures, f"Accuracy thresholds failed: {failures}"
             except Exception as error:
                 traceback.print_exc()
                 result.update(status="failed", error=str(error))

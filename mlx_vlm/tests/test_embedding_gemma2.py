@@ -158,3 +158,30 @@ def test_sanitize_and_converted_checkpoint_roundtrip(tmp_path):
     np.testing.assert_allclose(
         reduced(ids).text_embeds, model(ids).text_embeds, atol=1e-6
     )
+
+
+@pytest.mark.parametrize("bits", [4, 6, 8])
+def test_quantized_checkpoint_roundtrip(tmp_path, bits):
+    from dataclasses import asdict
+
+    from mlx_vlm.quant_utils import quantize_model
+
+    config = tiny_config()
+    config.text_config.hidden_size = 64
+    config.text_config.intermediate_size = 128
+    config.text_config.hidden_size_per_layer_input = 64
+    config.text_config.head_dim = 32
+    config.text_config.per_layer_config = {"01": {"head_dim": 64}}
+    model, saved_config = quantize_model(Model(config), asdict(config), 64, bits)
+    assert model.language_model.embed_tokens.bits == bits
+    (tmp_path / "config.json").write_text(json.dumps(saved_config))
+    mx.save_safetensors(
+        str(tmp_path / "model.safetensors"), dict(tree_flatten(model.parameters()))
+    )
+    reloaded = load_embedding_model(tmp_path)
+    ids = mx.array([[1, 2, 3], [4, 5, 6]])
+    expected = model(ids).text_embeds
+    actual = reloaded(ids).text_embeds
+    assert reloaded.language_model.embed_tokens.bits == bits
+    np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_allclose(mx.linalg.norm(actual, axis=-1), 1, atol=1e-6)
