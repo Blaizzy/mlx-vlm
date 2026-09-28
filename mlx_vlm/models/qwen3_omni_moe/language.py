@@ -17,6 +17,21 @@ from ..switch_layers import SwitchGLU
 from .config import TextConfig, ThinkerConfig
 
 
+def expand_deepstack_visual_embeds(visual_pos_masks, embeddings, dtype=None):
+    """Place visual features in a [batch, tokens, layers, hidden] residual tensor."""
+    masks = visual_pos_masks
+    if masks.ndim == 3:
+        masks = masks[..., 0]
+    batch, length = masks.shape
+    features = mx.stack(embeddings, axis=1)
+    if dtype is not None:
+        features = features.astype(dtype)
+    residuals = mx.zeros((batch * length, *features.shape[1:]), dtype=features.dtype)
+    positions = mx.array(np.flatnonzero(np.array(masks).reshape(-1)), dtype=mx.uint32)
+    residuals[positions] = features
+    return residuals.reshape(batch, length, *features.shape[1:])
+
+
 class Qwen3OmniMoeThinkerTextRotaryEmbedding(MRoPERotaryEmbedding):
     def __init__(
         self,
@@ -248,18 +263,21 @@ class Qwen3VLMoEModel(nn.Module):
         ):
             position_embeddings = self.layers[0].self_attn.rotary_emb(h, position_ids)
 
+        num_deepstack_layers = (
+            deepstack_visual_embeds.shape[2]
+            if deepstack_visual_embeds is not None
+            else 0
+        )
         for layer_idx, (layer, c) in enumerate(zip(self.layers, cache)):
             if output_hidden_states:
                 all_hidden_states.append(h)
             h = layer(h, mask, c, position_ids, position_embeddings)
 
-            if deepstack_visual_embeds is not None and layer_idx in range(
-                len(deepstack_visual_embeds)
-            ):
+            if layer_idx < num_deepstack_layers:
                 h = self._deepstack_process(
                     h,
                     visual_pos_masks,
-                    deepstack_visual_embeds[layer_idx],
+                    deepstack_visual_embeds[:, :, layer_idx, :],
                 )
 
             if layer_idx % 4 == 0:
@@ -287,37 +305,8 @@ class Qwen3VLMoEModel(nn.Module):
         visual_pos_masks: mx.array,
         visual_embeds: mx.array,
     ):
-        if visual_pos_masks.ndim == 3:
-            visual_pos_masks = visual_pos_masks[..., 0]
-        visual_embeds = visual_embeds.astype(hidden_states.dtype)
-
-        batch_size = hidden_states.shape[0]
-
-        updated_batches = []
-        offset = 0
-        for b in range(batch_size):
-            batch_mask = visual_pos_masks[b]
-            batch_hidden = hidden_states[b]
-
-            batch_indices = mx.array(np.where(batch_mask)[0], dtype=mx.uint32)
-
-            n_visual = len(batch_indices)
-            if n_visual == 0:
-                updated_batches.append(batch_hidden)
-                continue
-
-            sample_embeds = visual_embeds[offset : offset + n_visual]
-            offset += n_visual
-            if sample_embeds.shape[0] != n_visual:
-                updated_batches.append(batch_hidden)
-                continue
-
-            batch_result = mx.array(batch_hidden)  # avoid modifying in-place
-            batch_result = batch_result.at[batch_indices].add(sample_embeds)
-
-            updated_batches.append(batch_result)
-
-        return mx.stack(updated_batches, axis=0)
+        # Text and padding positions contain zero residuals.
+        return hidden_states + visual_embeds.astype(hidden_states.dtype)
 
 
 class LanguageModel(nn.Module):
@@ -540,8 +529,7 @@ class LanguageModel(nn.Module):
         if rope_deltas_kw is not None:
             self._rope_deltas = rope_deltas_kw
 
-        # Use ``cache._idx`` — the Python-int token counter — instead of
-        # syncing on ``cache[0].offset``. See Qwen2.5-VL for details.
+        # Batched cache._idx counts physical columns, including left padding.
         cache_offset = 0
         cache_offsets = None
         if cache and cache[0] is not None:
@@ -554,8 +542,7 @@ class LanguageModel(nn.Module):
             ):
                 cache_offsets = c0.offset
 
-        # Chunked prefill passes the full-prompt position_ids to every chunk;
-        # slice it down to this chunk's [offset, offset + len) window.
+        # Slice full-prompt position IDs to the current prefill window.
         if position_ids is not None and cache_offsets is None:
             seq_length = (
                 inputs.shape[-1] if inputs is not None else inputs_embeds.shape[1]
@@ -564,6 +551,19 @@ class LanguageModel(nn.Module):
                 position_ids = position_ids[
                     ..., cache_offset : cache_offset + seq_length
                 ]
+
+        if deepstack_visual_embeds is not None:
+            seq_length = (
+                inputs.shape[-1] if inputs_embeds is None else inputs_embeds.shape[1]
+            )
+            # Full-prompt residuals use physical cache columns, including
+            # left padding. Chunk-sized tensors describe the current inputs.
+            if deepstack_visual_embeds.shape[1] != seq_length:
+                deepstack_visual_embeds = deepstack_visual_embeds[
+                    :, cache_offset : cache_offset + seq_length
+                ]
+            if deepstack_visual_embeds.shape[1] == 0:
+                deepstack_visual_embeds = None
 
         rope_mask = mask
         if mask is not None and mask.shape[-1] != inputs.shape[-1]:

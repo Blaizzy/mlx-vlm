@@ -144,8 +144,8 @@ class Llama(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        # if mask is None:
-        mask = create_attention_mask(h, cache)
+        if mask is None:
+            mask = create_attention_mask(h, cache)
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)

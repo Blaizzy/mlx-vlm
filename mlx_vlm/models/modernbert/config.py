@@ -21,3 +21,7 @@ class ModelConfig(BaseModelConfig):
     global_attn_every_n_layers: int = 3
     local_attention: int = 128
     mlp_bias: bool = False
+    num_labels: int = 1
+    classifier_pooling: str = "cls"
+    classifier_activation: str = "gelu"
+    classifier_bias: bool = False

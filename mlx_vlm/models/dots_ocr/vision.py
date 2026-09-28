@@ -283,7 +283,7 @@ class VisionModel(nn.Module):
         cu_seqlens = []
         for i in range(grid_thw.shape[0]):
             seq_len = grid_thw[i, 1] * grid_thw[i, 2]
-            cu_seqlens.append(mx.repeat(seq_len, grid_thw[i, 0]))
+            cu_seqlens.append(mx.repeat(seq_len, int(grid_thw[i, 0])))
         cu_seqlens = mx.concatenate(cu_seqlens).astype(mx.int32)
         cu_seqlens = mx.cumsum(cu_seqlens, axis=0)
         cu_seqlens = mx.pad(cu_seqlens, (1, 0), constant_values=0)

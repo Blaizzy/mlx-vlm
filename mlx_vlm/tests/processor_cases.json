@@ -1,0 +1,531 @@
+{
+  "modules": {
+    "aya_vision": ["aya_vision", "AyaVisionProcessor"],
+    "deepseek": ["deepseek_v4", "DeepseekV4Processor"],
+    "diffusion": ["diffusion_gemma", "DiffusionGemma4Processor"],
+    "dots_ocr": ["dots_ocr", "DotsVLProcessor"],
+    "ernie": ["ernie4_5_moe_vl", "Ernie4_5_VLProcessor"],
+    "g4": ["gemma4", "Gemma4Processor"],
+    "g4u": ["gemma4_unified", "Gemma4UnifiedProcessor"],
+    "glm4v_moe": ["glm4v_moe.processing", "Glm46VMoEProcessor"],
+    "glm_ocr": ["glm_ocr.processing", "GlmOcrProcessor"],
+    "idefics3": ["idefics3", "Idefics3Processor"],
+    "kimi_k3": ["kimi_k3", "KimiK3Processor"],
+    "kimi_vl": ["kimi_vl", "KimiVLProcessor"],
+    "laguna": ["laguna", "LagunaProcessor"],
+    "lfm": ["lfm2_vl", "Lfm2VlProcessor"],
+    "locate_ip": ["locateanything.image_processing_locateanything", null],
+    "locateanything": ["locateanything", "LocateAnythingProcessor"],
+    "mage_config": ["mage_vl.config", null],
+    "mage_model": ["mage_vl.mage_vl", null],
+    "mage": ["mage_vl", "MageVLProcessor"],
+    "mage_vision": ["mage_vl.vision", null],
+    "minicpm": ["minicpmv4_6", "MiniCPMVProcessor"],
+    "mistral3": ["mistral3", "Mistral3Processor"],
+    "mllama": ["mllama", "MllamaProcessor"],
+    "molmo_point": ["molmo_point", "MolmoPointProcessor"],
+    "muse_glimmer": ["muse_glimmer", "MuseGlimmerProcessor"],
+    "paddleocr_vl": ["paddleocr_vl", "PaddleOCRVLProcessor"],
+    "pixtral_ip": ["pixtral.image_processing_pixtral", null],
+    "omni": ["qwen3_omni_moe", "Qwen3OmniMoeProcessor"],
+    "qwen3": ["qwen3_vl", "Qwen3VLProcessor"],
+    "smolvlm": ["smolvlm", "SmolVLMProcessor"],
+    "step3p7": ["step3p7", "Step3VLProcessor"],
+    "ocr": ["unlimited_ocr.processing_unlimitedocr", "UnlimitedOCRProcessor"],
+    "nemotron": [
+      "nemotron_h_nano_omni.processing_nemotron_h_nano_omni",
+      "NemotronHNanoOmniProcessor"
+    ]
+  },
+  "smoke": {
+    "llava": {"class": "LlavaProcessor", "family": "llava"},
+    "llava_next": {"class": "LlavaNextProcessor", "stub": "next", "family": "llava"},
+    "llava_onevision": {
+      "class": "LlavaOnevisionProcessor",
+      "kwargs": {
+        "num_image_tokens": 729,
+        "vision_aspect_ratio": "anyres_max_9",
+        "vision_feature_select_strategy": "full"
+      },
+      "stub": "onevision"
+    },
+    "paligemma": {"class": "PaliGemmaProcessor", "modes": ["image"]},
+    "gemma3": {
+      "class": "Gemma3Processor",
+      "kwargs": {"image_seq_length": 4},
+      "outputs": {"num_crops": [0]}
+    },
+    "gemma3n": {
+      "class": "Gemma3nProcessor",
+      "kwargs": {"image_seq_length": 4, "feature_extractor": null, "audio_seq_length": 4},
+      "outputs": {"num_crops": [0]}
+    },
+    "smolvlm": {
+      "class": "SmolVLMProcessor",
+      "outputs": {"rows": [[0]], "cols": [[0]]},
+      "family": "idefics"
+    },
+    "mllama": {
+      "class": "MllamaProcessor",
+      "tokenizer": {
+        "tokens": {"<|image|>": 128256},
+        "skip_spaces": true,
+        "image_token": "<|image|>",
+        "image_token_id": 128256
+      },
+      "stub": "mllama"
+    },
+    "qwen2_vl": {"class": "Qwen2VLProcessor", "family": "qwen_vl"},
+    "qwen2_5_vl": {"class": "Qwen2_5_VLProcessor", "family": "qwen_vl"},
+    "qwen3_vl": {"class": "Qwen3VLProcessor", "modes": ["image"], "family": "qwen_vl"},
+    "qwen3_omni_moe": {
+      "class": "Qwen3OmniMoeProcessor",
+      "tokenizer": {
+        "image_token": "<|image|>",
+        "audio_token": "<|audio|>",
+        "video_token": "<|video|>",
+        "vision_bos_token": "<|vb|>",
+        "vision_eos_token": "<|ve|>",
+        "audio_bos_token": "<|ab|>",
+        "audio_eos_token": "<|ae|>"
+      }
+    },
+    "idefics2": {"class": "Idefics2Processor", "family": "idefics"},
+    "idefics3": {
+      "class": "Idefics3Processor",
+      "outputs": {"rows": [[0]], "cols": [[0]]},
+      "family": "idefics"
+    },
+    "aya_vision": {"class": "AyaVisionProcessor", "outputs": {"num_patches": [1]}},
+    "llama4": {"class": "Llama4Processor", "outputs": {"aspect_ratios": [[1, 1]]}},
+    "pixtral": {"class": "PixtralProcessor", "outputs": {"image_sizes": [[[224, 224]]]}},
+    "mistral3": {
+      "class": "Mistral3Processor",
+      "outputs": {"image_sizes": [[[224, 224]]]},
+      "modes": ["text"]
+    },
+    "multi_modality": {"class": "MultiModalityProcessor", "kwargs": {"num_image_tokens": 4}},
+    "ernie4_5_moe_vl": {"class": "Ernie4_5_VLProcessor"}
+  },
+  "routes": [
+    ["internvl_chat", "internvl_chat", "InternVLChatProcessor"],
+    ["molmo", "molmo.processing_molmo", "MolmoProcessor"],
+    ["kimi_vl", "kimi_vl.processing_kimi_vl", "KimiVLProcessor"],
+    ["kimi_k3", "kimi_k3.processing_kimi_k3", "KimiK3Processor"],
+    ["phi3_v", "phi3_v.processing_phi3_v", "Phi3VProcessor"],
+    ["hunyuan_vl", "hunyuan_vl.processing_hunyuan_vl", "HunYuanVLProcessor"],
+    ["ernie4_5_moe_vl", "ernie4_5_moe_vl", "Ernie4_5_VLProcessor"],
+    ["qwen4_exp", "qwen4_exp", "Qwen3VLProcessor"],
+    ["mimo_v2", "mimo_v2.processing", "MiMoV2Processor"],
+    ["prism_hadamard_qwen35", "prism_hadamard_qwen35", "Qwen3VLProcessor"]
+  ],
+  "cleanup": [
+    ["glm4v_moe", "<|begin_of_box|>", "<|end_of_box|>"],
+    ["aya_vision", "<|START_RESPONSE|>", "<|END_RESPONSE|>"],
+    ["aya_output", "<|START_RESPONSE|>", "<|END_RESPONSE|>"],
+    ["diffusion", "", ""],
+    ["muse_glimmer", "to=user<|message|>", "<|return|>"],
+    ["muse_glimmer", "", ""]
+  ],
+  "checkpoints": {
+    "glm_ocr": {
+      "processor_config": {
+        "image_processor": {
+          "patch_size": 14,
+          "temporal_patch_size": 2,
+          "merge_size": 2,
+          "size": {"shortest_edge": 12544, "longest_edge": 9633792},
+          "image_mean": [0.48145466, 0.4578275, 0.40821073],
+          "image_std": [0.26862954, 0.26130258, 0.27577711]
+        },
+        "processor_class": "GlmOcrProcessor"
+      }
+    },
+    "paddleocr_vl": {
+      "config": {"model_type": "paddleocr_vl"},
+      "preprocessor_config": {
+        "min_pixels": 64,
+        "max_pixels": 4096,
+        "patch_size": 16,
+        "temporal_patch_size": 2,
+        "merge_size": 4,
+        "image_mean": [0.1, 0.2, 0.3],
+        "image_std": [0.9, 0.8, 0.7],
+        "do_convert_rgb": false
+      }
+    },
+    "mistral3": {
+      "processor_config": {
+        "patch_size": 16,
+        "spatial_merge_size": 1,
+        "image_token": "[IMG]",
+        "image_break_token": "[IMG_BREAK]",
+        "image_end_token": "[IMG_END]",
+        "image_processor": {
+          "image_processor_type": "PixtralImageProcessorFast",
+          "patch_size": 14,
+          "size": {"longest_edge": 64}
+        }
+      },
+      "config": {
+        "model_type": "mistral3",
+        "spatial_merge_size": 2,
+        "vision_config": {"patch_size": 14}
+      }
+    },
+    "lfm": {
+      "processor_config": {"processor_class": "Lfm2VlProcessor", "use_image_special_tokens": true},
+      "preprocessor_config": {
+        "image_processor_type": "Lfm2VlImageProcessorFast",
+        "resample": 3,
+        "do_resize": false,
+        "max_image_tokens": 128,
+        "max_pixels_tolerance": 1.5,
+        "image_mean": [0.4, 0.4, 0.4]
+      }
+    },
+    "lfm_override": {
+      "processor_config": {"processor_class": "Lfm2VlProcessor", "use_image_special_tokens": true}
+    },
+    "muse_glimmer": {
+      "config": {
+        "model_type": "muse_glimmer",
+        "text_config": {"vocab_size": 1234, "eos_token_id": 99}
+      }
+    },
+    "dots_ocr": {"chat_template": {"chat_template": "{{ messages[0].content }}"}},
+    "omni": {
+      "config": {"model_type": "qwen3_omni_moe"},
+      "preprocessor_config": {
+        "feature_extractor_type": "WhisperFeatureExtractor",
+        "image_processor_type": "Qwen2VLImageProcessor",
+        "processor_class": "Qwen3OmniMoeProcessor"
+      }
+    },
+    "diffusion": {
+      "config": {"model_type": "diffusion_gemma"},
+      "processor_config": {
+        "image_processor": {"max_soft_tokens": 140, "patch_size": 16, "pooling_kernel_size": 3},
+        "video_processor": {"max_soft_tokens": 70, "num_frames": 8}
+      }
+    },
+    "mage": {
+      "config": {"model_type": "mage_vl"},
+      "preprocessor_config": {
+        "patch_size": 16,
+        "temporal_patch_size": 1,
+        "merge_size": 2,
+        "min_pixels": 1024,
+        "max_pixels": 8192
+      }
+    },
+    "deepseek": {"config": {"model_type": "deepseek_v4"}},
+    "nemotron": {
+      "config": {"model_type": "NemotronH_Nano_Omni_Reasoning_V3"},
+      "processor_config": {"processor_class": "NemotronH_Nano_Omni_Reasoning_V3Processor"},
+      "preprocessor_config": {
+        "image_processor_type": "NemotronH_Nano_Omni_Reasoning_V3ImageProcessor",
+        "patch_size": 16,
+        "downsample_ratio": 0.5,
+        "norm_mean": [0.48145466, 0.4578275, 0.40821073],
+        "norm_std": [0.26862954, 0.26130258, 0.27577711],
+        "min_num_patches": 64,
+        "max_num_patches": 64,
+        "max_model_len": 128
+      }
+    }
+  },
+  "loader_attributes": {
+    "glm_ocr": {"image_processor.patch_size": 14, "image_processor.max_pixels": 9633792},
+    "paddleocr_vl": {
+      "image_token": "<paddle-image>",
+      "image_processor.min_pixels": 64,
+      "image_processor.max_pixels": 4096,
+      "image_processor.patch_size": 16,
+      "image_processor.temporal_patch_size": 2,
+      "image_processor.merge_size": 4,
+      "image_processor.image_mean": [0.1, 0.2, 0.3],
+      "image_processor.image_std": [0.9, 0.8, 0.7],
+      "image_processor.do_convert_rgb": false
+    },
+    "mistral3": {"patch_size": 14, "spatial_merge_size": 2},
+    "lfm": {
+      "image_processor.resample": 3,
+      "image_processor.do_resize": true,
+      "image_processor.max_image_tokens": 128,
+      "image_processor.max_pixels_tolerance": 1.5,
+      "image_processor.image_mean": [0.4, 0.4, 0.4]
+    },
+    "lfm_override": {
+      "image_processor.do_image_splitting": false,
+      "image_processor.use_thumbnail": true
+    },
+    "muse_glimmer": {
+      "config.model_type": "muse_glimmer",
+      "config.vocab_size": 1234,
+      "config.eos_token_id": 99,
+      "config.thinking_start_token": "to=self<|message|>",
+      "config.thinking_end_token": "<|eom|>"
+    },
+    "diffusion": {"image_processor.max_soft_tokens": 140, "video_processor.num_frames": 8}
+  },
+  "loader_components": {
+    "glm_ocr": {"image_processor": "Glm46VImageProcessor"},
+    "mistral3": {"image_processor": "PixtralImageProcessor"},
+    "dots_ocr": {"video_processor": "DotsDummyVideoProcessor"},
+    "omni": {"video_processor": "Qwen3VLVideoProcessor"},
+    "diffusion": {
+      "image_processor": "Gemma4ImageProcessor",
+      "video_processor": "Gemma4VideoProcessor"
+    }
+  },
+  "profiles": {
+    "gemma_image": {
+      "patch_size": 2,
+      "pooling_kernel_size": 2,
+      "do_resize": false,
+      "do_rescale": false
+    },
+    "lfm_tokens": {
+      "image_token": "<image>",
+      "image_start_token": "<|image_start|>",
+      "image_end_token": "<|image_end|>",
+      "image_thumbnail_token": "<|img_thumbnail|>"
+    },
+    "minicpm_tokenizer": {
+      "tokens": {
+        "<image>": 11,
+        "</image>": 12,
+        "<slice>": 13,
+        "</slice>": 14,
+        "<image_id>": 15,
+        "</image_id>": 16,
+        "<unk>": 99,
+        "<|image_pad|>": 101,
+        "<|video_pad|>": 102,
+        "<|listen|>": 99,
+        "\n": 2
+      },
+      "skip_spaces": true,
+      "unk_token_id": 99,
+      "image_token": "<|image_pad|>",
+      "image_token_id": 101,
+      "video_token": "<|video_pad|>"
+    },
+    "minicpm_image": {
+      "slice_mode": false,
+      "use_image_id": false,
+      "scale_resolution": 56,
+      "patch_size": 14
+    },
+    "diffusion_tokenizer": {
+      "tokens": {"<image>": 60, "<video>": 61, "<boi>": 62, "<eoi>": 63, "<pad>": 0, "<eos>": 1},
+      "skip_spaces": true,
+      "image_token_id": 60,
+      "video_token_id": 61,
+      "eos_token_id": 1,
+      "unk_token_id": 2,
+      "audio_token": null,
+      "audio_token_id": null,
+      "boa_token": null,
+      "eoa_token": null
+    },
+    "qwen_video": {
+      "patch_size": 14,
+      "temporal_patch_size": 2,
+      "merge_size": 2,
+      "do_rescale": false,
+      "do_normalize": false
+    },
+    "pixtral_image": {
+      "size": {"longest_edge": 40},
+      "patch_size": 14,
+      "image_mean": [0, 0, 0],
+      "image_std": [1, 1, 1]
+    },
+    "generation_chunk": {
+      "text": "<|channel>thought\n<channel|>Title: A calm river cruise",
+      "token": 1,
+      "prompt_tokens": 3,
+      "generation_tokens": 8,
+      "total_tokens": 11,
+      "prompt_tps": 10.0,
+      "generation_tps": 5.0
+    },
+    "mage_text": {
+      "hidden_size": 64,
+      "num_hidden_layers": 1,
+      "num_attention_heads": 2,
+      "intermediate_size": 128,
+      "num_key_value_heads": 1,
+      "head_dim": 32,
+      "vocab_size": 32
+    },
+    "mage_vision": {
+      "hidden_size": 64,
+      "num_hidden_layers": 1,
+      "num_attention_heads": 2,
+      "intermediate_size": 128,
+      "out_hidden_size": 64,
+      "text_hidden_size": 64
+    },
+    "chat_kwargs": {
+      "tokenize": true,
+      "add_generation_prompt": true,
+      "return_dict": true,
+      "return_tensors": "mlx",
+      "enable_thinking": false
+    }
+  },
+  "mage_errors": [
+    [2, 1, {}, "placeholder"],
+    [1, 2, {}, "placeholder"],
+    [1, 1, {"video_metadata": []}, "one video_metadata"],
+    [
+      1,
+      1,
+      {"video_metadata": [{"total_num_frames": 10, "fps": 30, "frames_indices": [0, 9]}]},
+      "frame count"
+    ],
+    [1, 1, {"fps": 0}, "positive and finite"]
+  ],
+  "stubs": {
+    "mllama": {
+      "shapes": {"pixel_values": [1, 4, 3, 560, 560]},
+      "values": {"num_tiles": [[2]]},
+      "arrays": {"aspect_ratio_ids": [[1]], "aspect_ratio_mask": [[1, 1, 1, 1]]}
+    },
+    "lfm_scalar": {
+      "shapes": {"pixel_values": [1, 16, 768]},
+      "arrays": {"image_rows": [1], "image_cols": [1]},
+      "values": {"image_sizes": [[416, 576]]},
+      "attrs": {
+        "patch_size": 16,
+        "downsample_factor": 2,
+        "tile_size": 512,
+        "max_image_tokens": 256,
+        "min_image_tokens": 64,
+        "encoder_patch_size": 16,
+        "use_thumbnail": false
+      }
+    },
+    "molmo": {
+      "shapes": {"pixel_values": [1, 729, 588], "image_token_pooling": [1, 729]},
+      "arrays": {"image_grids": [[1, 1, 1, 1]], "image_num_crops": [1]}
+    },
+    "qwen_video": {
+      "shapes": {"pixel_values_videos": [1, 4]},
+      "arrays": {"video_grid_thw": [[2, 2, 2]]},
+      "attrs": {"temporal_patch_size": 2, "fps": 2.0}
+    },
+    "diffusion_video": {
+      "shapes": {"pixel_values_videos": [2, 3, 4, 4]},
+      "values": {
+        "num_frames_per_video": [2],
+        "num_soft_tokens_per_frame": [1],
+        "frame_timestamps": [[0.0, 1.0]]
+      },
+      "attrs": {"model_input_names": ["pixel_values_videos"]}
+    },
+    "next": {
+      "shapes": {"pixel_values": [1, 5, 3, 224, 224]},
+      "values": {"image_sizes": [[224, 224]]},
+      "attrs": {
+        "image_grid_pinpoints": [[224, 224], [224, 448], [448, 224], [448, 448]],
+        "size": {"height": 224, "width": 224}
+      }
+    },
+    "onevision": {
+      "shapes": {"pixel_values": [1, 5, 3, 384, 384]},
+      "values": {"image_sizes": [[768, 768]]},
+      "attrs": {
+        "image_grid_pinpoints": [[384, 384], [384, 768], [768, 384], [768, 768], [1536, 1536]],
+        "size": {"height": 384, "width": 384}
+      }
+    }
+  },
+  "qwen_image_errors": [
+    {
+      "grouped": false,
+      "text": [
+        "first <|image_pad|>",
+        "stale <|image_pad|> first <|image_pad|> second <|image_pad|>"
+      ],
+      "error": "Cannot unambiguously map"
+    },
+    {
+      "grouped": true,
+      "text": ["first <|image_pad|>", "second <|image_pad|>"],
+      "error": "Text entry 0 contains 1 image placeholders, but 2 images were supplied"
+    }
+  ],
+  "mage_chat_template": "{% for message in messages %}{% for item in message['content'] %}{% if item['type'] == 'image' %}<|vision_start|><|image_pad|><|vision_end|>{% elif item['type'] == 'video' %}<|vision_start|><|video_pad|><|vision_end|>{% else %}{{ item['text'] }}{% endif %}{% endfor %}{% endfor %}",
+  "gemma_multimodal": [
+    {
+      "shapes": {"pixel_values": [1, 4, 48], "image_position_ids": [1, 4, 2]},
+      "pixels": "pixel_values",
+      "marker": "<boi><|image|><|image|><|image|><|image|><eoi>"
+    },
+    {
+      "shapes": {"pixel_values_videos": [2, 70, 48], "video_position_ids": [2, 70, 2]},
+      "pixels": "pixel_values_videos",
+      "marker": "<boi><|video|><|video|><eoi>"
+    }
+  ],
+  "loader_kwargs": {
+    "lfm_override": {"do_image_splitting": false},
+    "dots_ocr": {"use_fast": true},
+    "mistral3": {"trust_remote_code": true}
+  },
+  "loader_tokenizers": {
+    "glm_ocr": {"chat_template": "{{ messages }}", "image_token": "<|image|>"},
+    "paddleocr_vl": {"chat_template": "{{ messages }}", "image_token": "<paddle-image>"},
+    "omni": {
+      "image_token": "<|image_pad|>",
+      "audio_token": "<|audio_pad|>",
+      "video_token": "<|video_pad|>",
+      "vision_bos_token": "<|vision_start|>",
+      "vision_eos_token": "<|vision_end|>",
+      "audio_bos_token": "<|audio_bos|>",
+      "audio_eos_token": "<|audio_eos|>"
+    },
+    "nemotron": {"image_token_id": 18}
+  },
+  "eos_tokens": [
+    ["kimi_vl", "<|im_assistant|>", 163586],
+    ["idefics3", "<end_of_utterance>", 128258]
+  ],
+  "mllama_prompts": [
+    ["Hello", "<bos>Hello"],
+    ["<|image|>Hello", "<|image|><bos>Hello"],
+    ["<bos>Hello", "<bos>Hello"]
+  ],
+  "ocr_messages": [
+    {"role": "user", "content": "<image>document parsing."},
+    {"role": "assistant", "content": "partial"},
+    {"role": "user", "content": "continue"}
+  ],
+  "smoke_defaults": {
+    "qwen_vl": {
+      "tokenizer": {
+        "image_token": "<|image_pad|>",
+        "video_token": "<|video_pad|>",
+        "vision_start_token": "<|vs|>",
+        "vision_end_token": "<|ve|>",
+        "vision_start_token_id": 200,
+        "vision_end_token_id": 201
+      }
+    },
+    "llava": {
+      "kwargs": {
+        "patch_size": 14,
+        "vision_feature_select_strategy": "default",
+        "num_additional_image_tokens": 1
+      }
+    },
+    "idefics": {
+      "kwargs": {"image_seq_len": 4},
+      "tokenizer": {"image_boundary_token": "<fake_token_around_image>"}
+    }
+  }
+}

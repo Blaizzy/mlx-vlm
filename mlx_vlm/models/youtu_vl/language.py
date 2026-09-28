@@ -10,7 +10,7 @@ from ..base import (
     create_attention_mask,
     scaled_dot_product_attention,
 )
-from ..mla import MultiLinear
+from ..mla import MultiLinear, latent_length, max_absorbed_queries
 from ..rope_utils import initialize_rope
 from ..switch_layers import SwitchGLU
 from .config import ModelConfig, TextConfig
@@ -66,6 +66,11 @@ class YoutuAttention(nn.Module):
         self.unembed_out = MultiLinear(
             self.kv_lora_rank, self.v_head_dim, self.num_heads
         )
+        self._absorbed_dims = (
+            self.kv_lora_rank,
+            self.qk_nope_head_dim,
+            self.v_head_dim,
+        )
 
         self.o_proj = nn.Linear(
             self.num_heads * self.v_head_dim,
@@ -119,7 +124,10 @@ class YoutuAttention(nn.Module):
                 mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
             )
 
-        if L == 1:
+        absorbed = L == 1 or L <= max_absorbed_queries(
+            *self._absorbed_dims, latent_length(kv_latent)
+        )
+        if absorbed:
             q_nope = self.embed_q(q_nope)
             k = v = kv_latent
         else:
@@ -129,7 +137,7 @@ class YoutuAttention(nn.Module):
         output = scaled_dot_product_attention(
             q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
         )
-        if L == 1:
+        if absorbed:
             output = self.unembed_out(output)
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)

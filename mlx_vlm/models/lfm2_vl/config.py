@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..base import BaseModelConfig
 
@@ -22,7 +22,7 @@ class TextConfig(BaseModelConfig):
     use_pos_enc: bool = True
     block_auto_adjust_ff_dim: bool = True
     block_dim: int = 1024
-    block_ff_dim: int = 6656
+    block_ff_dim: Optional[int] = None
     block_ffn_dim_multiplier: float = 1.0
     block_mlp_init_scale: float = 1.0
     block_multiple_of: int = 256
@@ -38,8 +38,25 @@ class TextConfig(BaseModelConfig):
     layer_types: List[str] = None
     num_heads: int = 16
     full_attn_idxs: List[int] = None
+    rope_parameters: Optional[Dict[str, Any]] = None
+    tie_word_embeddings: Optional[bool] = True
 
     def __post_init__(self):
+
+        # Every LFM2-VL checkpoint ties the embeddings; the flag is either
+        # absent or explicitly true, and a serialized ``null`` means the same.
+        if self.tie_word_embeddings is None:
+            self.tie_word_embeddings = True
+
+        # LFM2.5-VL text configs carry rope settings under ``rope_parameters``
+        # and drop the top-level ``rope_theta``.
+        if self.rope_parameters is not None and "rope_theta" in self.rope_parameters:
+            self.rope_theta = self.rope_parameters["rope_theta"]
+
+        # LFM2.5-VL checkpoints expose the MLP width as ``intermediate_size``
+        # and omit the legacy ``block_ff_dim`` field.
+        if self.block_ff_dim is None:
+            self.block_ff_dim = self.intermediate_size
 
         if self.full_attn_idxs is None:
             self.full_attn_idxs = [
@@ -76,7 +93,8 @@ class ModelConfig(BaseModelConfig):
     do_image_splitting: bool = True
     downsample_factor: int = 2
     encoder_patch_size: int = 16
-    image_token_index: int = 396
+    image_token_id: int = 396
+    image_token_index: Optional[int] = None
     max_image_tokens: int = 256
     max_num_patches: int = 1024
     max_pixels_tolerance: float = 2.0
@@ -92,3 +110,7 @@ class ModelConfig(BaseModelConfig):
     projector_hidden_size: int = 2560
     eos_token_id: int = 7
     projector_use_layernorm: bool = True
+
+    def __post_init__(self):
+        if self.image_token_index is None:
+            self.image_token_index = self.image_token_id

@@ -14,6 +14,9 @@ from ..base import (
 from ..cache import KVCache, RotatingKVCache
 from ..rope_utils import initialize_rope
 from .config import TextConfig
+from .speculative_verifier import Gemma4ExactSpeculativeVerifier
+
+_EXACT_SPECULATIVE_VERIFIER = Gemma4ExactSpeculativeVerifier()
 
 
 @partial(mx.compile, shapeless=True)
@@ -558,6 +561,7 @@ class Gemma4TextModel(nn.Module):
         capture_layer_ids: Optional[List[int]] = None,
         hidden_sink: Optional[list] = None,
         shared_kv_sink: Optional[dict] = None,
+        logits_to_keep: Optional[int] = None,
         **kwargs,
     ):
         if inputs_embeds is None:
@@ -609,6 +613,16 @@ class Gemma4TextModel(nn.Module):
             per_layer_inputs = [None] * len(self.layers)
 
         capture_set = set(capture_layer_ids) if capture_layer_ids else set()
+        keep = int(logits_to_keep) if logits_to_keep else 0
+        trim_before_layer = self.first_kv_shared_layer_idx
+        if hidden_sink is not None:
+            if capture_set:
+                trim_before_layer = max(trim_before_layer, max(capture_set) + 1)
+            else:
+                # return_hidden without explicit capture ids records the final
+                # decoder output, whose historical full-width shape is public.
+                trim_before_layer = len(self.layers)
+        trimmed_prefix = 0
         intermediates = [(None, None)] * len(self.layers)
         for idx, (layer, c, m, prev_idx, pli) in enumerate(
             zip(
@@ -619,7 +633,16 @@ class Gemma4TextModel(nn.Module):
                 per_layer_inputs,
             )
         ):
+            if 0 < keep < h.shape[1] and idx == trim_before_layer:
+                trimmed_prefix = h.shape[1] - keep
+                h = h[:, -keep:, :]
+            if pli is not None and pli.shape[1] != h.shape[1]:
+                pli = pli[:, -h.shape[1] :, :]
+            if isinstance(m, mx.array) and m.shape[-2] != h.shape[1]:
+                m = m[..., -h.shape[1] :, :]
             kvs, offset = intermediates[prev_idx]
+            if trimmed_prefix:
+                offset = offset + trimmed_prefix
             h, kvs, offset = layer(
                 h, m, c, per_layer_input=pli, shared_kv=kvs, offset=offset
             )
@@ -650,7 +673,7 @@ class Gemma4TextModel(nn.Module):
 
 
 class LanguageModel(nn.Module):
-    supports_logits_to_keep = True
+    requires_uniform_batch_acceptance = True
 
     def __init__(self, config: TextConfig):
         super().__init__()
@@ -717,6 +740,17 @@ class LanguageModel(nn.Module):
         capture_layer_ids: Optional[List[int]] = None,
         **kwargs,
     ):
+        if kwargs.pop("speculative_verify", False) and getattr(
+            self.config, "exact_speculative_verify", False
+        ):
+            return _EXACT_SPECULATIVE_VERIFIER(
+                self,
+                inputs,
+                cache=cache,
+                input_embeddings=inputs_embeds,
+                capture_layer_ids=capture_layer_ids,
+            )
+
         hidden_sink: Optional[list] = (
             []
             if capture_layer_ids is not None or kwargs.pop("return_hidden", False)
@@ -739,6 +773,7 @@ class LanguageModel(nn.Module):
             capture_layer_ids=capture_layer_ids,
             hidden_sink=hidden_sink,
             shared_kv_sink=shared_kv_sink,
+            logits_to_keep=logits_to_keep,
             **kwargs,
         )
         if logits_to_keep:
@@ -785,15 +820,18 @@ class LanguageModel(nn.Module):
                 kv_len = c._idx
                 ve = valid_ends.tolist()
                 verify_start = kv_len - n
-                for bi in range(accepted.shape[0]):
-                    start = verify_start + int(ve[bi])
-                    if start < kv_len:
-                        zero_row_tail = getattr(c, "zero_row_tail", None)
-                        if callable(zero_row_tail):
-                            zero_row_tail(bi, start, kv_len)
-                        else:
-                            c.keys[bi, :, start:kv_len, :] = 0
-                            c.values[bi, :, start:kv_len, :] = 0
+                if any(
+                    verify_start + int(ve[bi]) < kv_len
+                    for bi in range(accepted.shape[0])
+                ):
+                    raise RuntimeError(
+                        "Gemma 4 batched speculative rollback requires uniform "
+                        f"per-row acceptance; got ragged accepts {accepted.tolist()}. "
+                        "Zeroing a rejected row's KV tail leaves phantom keys "
+                        "attended (issue #1962); set "
+                        "requires_uniform_batch_acceptance on the drafter or target "
+                        "so accepts are clamped before rollback."
+                    )
         return max_a
 
     def sanitize(self, weights):

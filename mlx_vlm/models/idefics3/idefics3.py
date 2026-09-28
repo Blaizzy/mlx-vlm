@@ -155,6 +155,7 @@ class Model(nn.Module):
 
             image_features = pooler_output.astype(pixel_values.dtype)
             image_features = self.connector(image_features)
+            image_features = image_features.reshape(-1, image_features.shape[-1])
 
         final_inputs_embeds = self._prepare_inputs_for_multimodal(
             image_features, inputs_embeds, input_ids
@@ -188,6 +189,7 @@ class Model(nn.Module):
         self,
         input_ids: mx.array,
         pixel_values: mx.array,
+        mask: Optional[mx.array] = None,
         cache=None,
         **kwargs,
     ):
@@ -196,6 +198,7 @@ class Model(nn.Module):
         )
         logits = self.language_model(
             inputs=input_ids,
+            mask=mask,
             cache=cache,
             inputs_embeds=input_embeddings_features.inputs_embeds,
         )

@@ -12,6 +12,7 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import KVCache, RotatingKVCache
+from ..rope_utils import initialize_rope
 from .config import TextConfig
 
 
@@ -107,12 +108,14 @@ class Gemma3nAttention(nn.Module):
 
         self.is_kv_shared_layer = is_kv_shared_layer
 
-        self.rope = nn.RoPE(
-            head_dim,
+        self.rope = initialize_rope(
+            dims=head_dim,
             traditional=False,
             base=(
                 config.rope_local_base_freq if self.is_sliding else config.rope_theta
             ),
+            scaling_config=None if self.is_sliding else config.rope_scaling,
+            max_position_embeddings=config.max_position_embeddings,
         )
 
     def __call__(

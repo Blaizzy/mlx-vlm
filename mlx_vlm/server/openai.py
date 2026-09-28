@@ -5,7 +5,6 @@ import gc
 import json
 import logging
 import random
-import re
 import time
 import uuid
 from datetime import datetime
@@ -22,8 +21,18 @@ from ..generate.edit_image import ImageEditRequest as CoreImageEditRequest
 from ..generate.edit_image import edit_image
 from ..generate.image import ImageGenerationRequest as CoreImageGenerationRequest
 from ..generate.image import generate_image, parse_size
-from ..prompt_utils import apply_chat_template, extract_text_from_content
-from ..tool_parsers import _infer_tool_parser_from_processor, load_tool_module
+from ..generate.video import resolve_video_inputs
+from ..prompt_utils import (
+    apply_chat_template,
+    extract_text_from_content,
+    normalize_image_content,
+)
+from ..tools import (
+    _infer_tool_parser_from_processor,
+    _prepare_chat_tool_choice,
+    load_tool_module,
+    process_tool_calls,
+)
 from ..utils import prepare_inputs
 from .generation import (
     GenerationMetrics,
@@ -32,7 +41,7 @@ from .generation import (
     _count_prompt_tokens,
 )
 from .responses_state import (
-    ThinkingStreamState,
+    ToolCallStreamState,
     _normalize_response_input,
     _response_chain_items,
     _response_items_to_chat,
@@ -42,11 +51,12 @@ from .responses_state import (
 from .responses_state import _sse_event as _response_sse_event
 from .responses_state import (
     _store_response,
-    process_tool_calls,
+    finish_content_streams,
+    make_response_stream_state,
     prompt_has_open_thinking,
     response_store,
     response_store_lock,
-    suppress_tool_call_content,
+    strip_protocol_markers,
 )
 from .runtime import runtime
 from .schemas import (
@@ -158,110 +168,6 @@ def _ensure_effective_input(messages, *, images=None, audio=None):
     raise HTTPException(status_code=400, detail=_MISSING_INPUT_DETAIL)
 
 
-def _tool_function_name(tool: Any) -> Optional[str]:
-    if hasattr(tool, "model_dump"):
-        tool = tool.model_dump(exclude_none=True)
-    if not isinstance(tool, dict) or tool.get("type") != "function":
-        return None
-    function = tool.get("function")
-    if hasattr(function, "model_dump"):
-        function = function.model_dump(exclude_none=True)
-    if not isinstance(function, dict):
-        return None
-    name = function.get("name")
-    return name if isinstance(name, str) and name else None
-
-
-def _with_tool_choice_instruction(messages, instruction: str):
-    messages = [dict(message) for message in messages]
-    if messages and messages[0].get("role") == "system":
-        content = messages[0].get("content") or ""
-        messages[0]["content"] = f"{content}\n\n{instruction}".strip()
-    user_instruction_added = False
-    for message in reversed(messages):
-        if message.get("role") == "user" and isinstance(message.get("content"), str):
-            message["content"] = f"{message['content']}\n\n{instruction}".strip()
-            user_instruction_added = True
-            break
-    if not user_instruction_added and not (
-        messages and messages[0].get("role") == "system"
-    ):
-        messages.insert(0, {"role": "system", "content": instruction})
-    return messages
-
-
-def _prepare_chat_tool_choice(messages, tools, tool_choice):
-    """Validate and enforce OpenAI Chat Completions tool_choice semantics."""
-    available_tools = list(tools or [])
-    if tool_choice is None:
-        return messages, available_tools or None, None
-
-    if hasattr(tool_choice, "model_dump"):
-        tool_choice = tool_choice.model_dump(exclude_none=True)
-
-    if isinstance(tool_choice, str):
-        if tool_choice not in ("none", "auto", "required"):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Invalid tool_choice. Expected 'none', 'auto', 'required', "
-                    "or a specific function."
-                ),
-            )
-        if tool_choice == "none":
-            return messages, None, tool_choice
-        if tool_choice == "auto":
-            return messages, available_tools or None, tool_choice
-        if not available_tools:
-            raise HTTPException(
-                status_code=400,
-                detail="tool_choice 'required' requires at least one tool.",
-            )
-        instruction = (
-            "You must call one or more of the available functions to answer the "
-            "user's request. Do not answer directly without calling a function."
-        )
-        return (
-            _with_tool_choice_instruction(messages, instruction),
-            available_tools,
-            tool_choice,
-        )
-
-    if not isinstance(tool_choice, dict):
-        raise HTTPException(status_code=400, detail="Invalid tool_choice.")
-
-    function = tool_choice.get("function")
-    if hasattr(function, "model_dump"):
-        function = function.model_dump(exclude_none=True)
-    name = function.get("name") if isinstance(function, dict) else None
-    if tool_choice.get("type") != "function" or not isinstance(name, str) or not name:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "A specific tool_choice must be "
-                "{'type':'function','function':{'name':'...'}}."
-            ),
-        )
-
-    selected_tools = [
-        tool for tool in available_tools if _tool_function_name(tool) == name
-    ]
-    if not selected_tools:
-        raise HTTPException(
-            status_code=400,
-            detail=f"tool_choice references unknown function {name!r}.",
-        )
-    instruction = (
-        f"You must call the {name!r} function to answer the user's request. "
-        "Do not call any other function and do not answer directly."
-    )
-    return (
-        _with_tool_choice_instruction(messages, instruction),
-        selected_tools,
-        tool_choice,
-    )
-
-
 def _runtime_cache_get(key, default=None, *, kind=None):
     cache = runtime.model_cache
     try:
@@ -284,10 +190,11 @@ def _adapter_path_or_inherit(request):
     )
 
 
-def _normalize_response_instruction_messages(
+def _normalize_instruction_messages(
     chat_messages: List[dict],
-    instructions: Optional[str],
+    instructions: Optional[str] = None,
 ) -> Optional[str]:
+    """Combine API instructions into the leading system message for templates."""
     instruction_parts = [instructions] if instructions else []
     conversation = []
 
@@ -729,6 +636,15 @@ async def images_edits_endpoint(request: Request):
                         height=height,
                         guidance=image_request.guidance,
                         output_format=image_request.output_format,
+                        extra={
+                            key: value
+                            for key in (
+                                "negative_prompt",
+                                "output_resolution",
+                                "use_kv_cache",
+                            )
+                            if (value := getattr(image_request, key)) is not None
+                        },
                     )
                     result = edit_image(
                         model,
@@ -808,7 +724,7 @@ async def responses_input_tokens_endpoint(request: Request):
             + current_input_items
         )
         chat_messages, images = _response_items_to_chat(prompt_items)
-        _normalize_response_instruction_messages(
+        _normalize_instruction_messages(
             chat_messages,
             openai_request.instructions,
         )
@@ -969,7 +885,7 @@ async def responses_endpoint(request: Request):
             + current_input_items
         )
         chat_messages, images = _response_items_to_chat(prompt_items)
-        instructions = _normalize_response_instruction_messages(
+        instructions = _normalize_instruction_messages(
             chat_messages,
             openai_request.instructions,
         )
@@ -981,7 +897,9 @@ async def responses_endpoint(request: Request):
         )
 
         chat_tools, tool_registry = _response_tool_registry(openai_request.tools)
-        tool_parser_type = _infer_tool_parser_from_processor(processor)
+        tool_parser_type = _infer_tool_parser_from_processor(
+            processor, override=openai_request.tool_parser
+        )
         tool_module = load_tool_module(tool_parser_type) if tool_parser_type else None
 
         try:
@@ -1089,13 +1007,19 @@ async def responses_endpoint(request: Request):
                     # Stream text deltas using ResponseGenerator (continuous batching)
                     full_text = ""
                     usage_stats = {"input_tokens": 0, "output_tokens": 0}
-                    in_tool_call = False
                     tc_start = (
                         tool_module.tool_call_start
                         if tool_module is not None and chat_tools
                         else None
                     )
-                    thinking_state = ThinkingStreamState(
+                    tc_end = (
+                        tool_module.tool_call_end
+                        if tool_module is not None and chat_tools
+                        else None
+                    )
+                    tool_call_state = ToolCallStreamState(tc_start, tc_end)
+                    thinking_state = make_response_stream_state(
+                        processor,
                         prompt_has_open_thinking(
                             formatted_prompt,
                             gen_args.enable_thinking,
@@ -1136,7 +1060,9 @@ async def responses_endpoint(request: Request):
                             raw_delta = token.text
                             full_text += raw_delta
                             chunk_rate = metrics.record_chunk(token)
-                            thinking_delta = thinking_state.feed(raw_delta)
+                            thinking_delta = thinking_state.feed(
+                                raw_delta, last=bool(token.finish_reason)
+                            )
                             if thinking_delta.reasoning:
                                 streamed_reasoning += thinking_delta.reasoning
                                 yield _response_sse_event(
@@ -1152,8 +1078,8 @@ async def responses_endpoint(request: Request):
                                     },
                                 )
                             delta = thinking_delta.content
-                            in_tool_call, delta = suppress_tool_call_content(
-                                full_text, in_tool_call, tc_start, delta
+                            delta = tool_call_state.feed(
+                                delta, last=bool(token.finish_reason)
                             )
                             usage_stats = {
                                 "input_tokens": ctx.prompt_tokens,
@@ -1187,7 +1113,10 @@ async def responses_endpoint(request: Request):
                             raw_delta = chunk.text
                             full_text += raw_delta
                             chunk_rate = metrics.record_chunk(chunk)
-                            thinking_delta = thinking_state.feed(raw_delta)
+                            chunk_finish = getattr(chunk, "finish_reason", None)
+                            thinking_delta = thinking_state.feed(
+                                raw_delta, last=bool(chunk_finish)
+                            )
                             if thinking_delta.reasoning:
                                 streamed_reasoning += thinking_delta.reasoning
                                 yield _response_sse_event(
@@ -1203,10 +1132,7 @@ async def responses_endpoint(request: Request):
                                     },
                                 )
                             delta = thinking_delta.content
-                            in_tool_call, delta = suppress_tool_call_content(
-                                full_text, in_tool_call, tc_start, delta
-                            )
-                            chunk_finish = getattr(chunk, "finish_reason", None)
+                            delta = tool_call_state.feed(delta, last=bool(chunk_finish))
                             if chunk_finish is not None:
                                 finish_reason = chunk_finish
                             usage_stats = {
@@ -1218,6 +1144,25 @@ async def responses_endpoint(request: Request):
                                 yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta, timings=StreamingTimings(predicted_per_second=chunk_rate)).model_dump_json()}\n\n"
                                 await asyncio.sleep(0.01)
 
+                    tail_reasoning, tail = finish_content_streams(
+                        thinking_state, tool_call_state
+                    )
+                    if tail_reasoning:
+                        streamed_reasoning += tail_reasoning
+                        yield _response_sse_event(
+                            "response.reasoning_text.delta",
+                            {
+                                "type": "response.reasoning_text.delta",
+                                "response_id": response_id,
+                                "item_id": reasoning_item_id,
+                                "output_index": 0,
+                                "content_index": 0,
+                                "delta": tail_reasoning,
+                            },
+                        )
+                    if tail:
+                        yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=tail, timings=StreamingTimings(predicted_per_second=metrics.rate)).model_dump_json()}\n\n"
+
                     output_items, clean_text, _, output_finish_reason = (
                         _response_output_items_from_text(
                             full_text,
@@ -1228,6 +1173,7 @@ async def responses_endpoint(request: Request):
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
                             reasoning_item_id,
+                            processor=processor,
                         )
                     )
                     tool_output_items = [
@@ -1486,6 +1432,7 @@ async def responses_endpoint(request: Request):
                         tool_registry,
                         gen_args.thinking_start_token,
                         gen_args.thinking_end_token,
+                        processor=processor,
                     )
                 )
                 if output_finish_reason == "tool_calls":
@@ -1646,7 +1593,11 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             video = _extract_video_reference(item)
                             if video:
                                 videos.append(video)
-                msg["content"] = extract_text_from_content(message.content)
+                msg["content"] = (
+                    normalize_image_content(message.content)
+                    if message.role == "user"
+                    else extract_text_from_content(message.content)
+                )
             else:
                 msg["content"] = message.content
 
@@ -1678,6 +1629,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
             processed_messages.append(msg)
 
+        _normalize_instruction_messages(processed_messages)
         _ensure_effective_input(processed_messages, images=images, audio=audio)
 
         processed_messages, tools, tool_choice = _prepare_chat_tool_choice(
@@ -1688,8 +1640,27 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
         model, processor, config = get_cached_model(request.model, adapter_path)
 
+        video_resolution = resolve_video_inputs(
+            processor,
+            videos,
+            images=images,
+            fps=2.0,
+            max_frames=16,
+        )
+        images, videos = video_resolution.images, video_resolution.videos
+        if video_resolution.used_fallback:
+            logger.info(
+                "Processor %s has no native video support; sending %d of %d "
+                "sampled frames as ordered images.",
+                processor.__class__.__name__,
+                video_resolution.selected_count,
+                video_resolution.sampled_count,
+            )
+
         # Detect tool parser from chat template
-        tool_parser_type = _infer_tool_parser_from_processor(processor)
+        tool_parser_type = _infer_tool_parser_from_processor(
+            processor, override=request.tool_parser
+        )
         tool_module = load_tool_module(tool_parser_type) if tool_parser_type else None
         if not tools:
             tool_module = None
@@ -1779,7 +1750,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                         output_tokens = 0
                         request_id = f"chatcmpl-{uuid.uuid4()}"
-                        thinking_state = ThinkingStreamState(
+                        thinking_state = make_response_stream_state(
+                            processor,
                             prompt_has_open_thinking(
                                 formatted_prompt,
                                 gen_args.enable_thinking,
@@ -1791,9 +1763,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         )
                         full_output = ""  # raw output for tool call parsing
                         # Track tool-call state to suppress markup from content
-                        in_tool_call = False
                         tc_start = tool_module.tool_call_start if tool_module else None
                         tc_end = tool_module.tool_call_end if tool_module else None
+                        tool_call_state = ToolCallStreamState(tc_start, tc_end)
 
                         def _next_token():
                             try:
@@ -1810,13 +1782,15 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             chunk_rate = metrics.record_chunk(token)
 
                             # Detect thinking boundaries
-                            thinking_delta = thinking_state.feed(token.text)
+                            thinking_delta = thinking_state.feed(
+                                token.text, last=bool(token.finish_reason)
+                            )
                             delta_reasoning = thinking_delta.reasoning
                             delta_content = thinking_delta.content
 
                             # Suppress tool-call markup from content
-                            in_tool_call, delta_content = suppress_tool_call_content(
-                                full_output, in_tool_call, tc_start, delta_content
+                            delta_content = tool_call_state.feed(
+                                delta_content, last=bool(token.finish_reason)
                             )
 
                             chunk_logprobs = None
@@ -1867,11 +1841,34 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 finish_reason = token.finish_reason
                                 break
 
+                        tail_reasoning, tail = finish_content_streams(
+                            thinking_state, tool_call_state
+                        )
+                        if tail or tail_reasoning:
+                            chunk_data = ChatStreamChunk(
+                                id=request_id,
+                                created=int(time.time()),
+                                model=request.model,
+                                choices=[
+                                    ChatStreamChoice(
+                                        delta=ChatMessage(
+                                            role="assistant",
+                                            content=tail,
+                                            reasoning=tail_reasoning,
+                                        )
+                                    )
+                                ],
+                                timings=StreamingTimings(
+                                    predicted_per_second=metrics.rate
+                                ),
+                            )
+                            yield f"data: {chunk_data.model_dump_json()}\n\n"
+
                         # Parse tool calls from full output and emit final chunk
                         terminal_emitted = False
                         if tool_module is not None:
                             tc = process_tool_calls(full_output, tool_module, tools)
-                            if tc["calls"]:
+                            if tc.calls:
                                 tool_calls_made = True
                                 finish_reason = "tool_calls"
                                 terminal_emitted = True
@@ -1880,7 +1877,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                         finish_reason="tool_calls",
                                         delta=ChatMessage(
                                             role="assistant",
-                                            tool_calls=tc["calls"],
+                                            tool_calls=tc.calls,
                                         ),
                                     )
                                 ]
@@ -1929,7 +1926,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                         request_id = f"chatcmpl-{uuid.uuid4()}"
                         output_text = ""
-                        thinking_state = ThinkingStreamState(
+                        thinking_state = make_response_stream_state(
+                            processor,
                             prompt_has_open_thinking(
                                 formatted_prompt,
                                 gen_args.enable_thinking,
@@ -1938,6 +1936,10 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             ),
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
+                        )
+                        tool_call_state = ToolCallStreamState(
+                            tool_module.tool_call_start if tool_module else None,
+                            tool_module.tool_call_end if tool_module else None,
                         )
                         for chunk in token_iterator:
                             if chunk is None or not hasattr(chunk, "text"):
@@ -1951,13 +1953,18 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             if chunk_finish is not None:
                                 finish_reason = chunk_finish
 
-                            thinking_delta = thinking_state.feed(chunk.text)
-                            if thinking_delta.content or thinking_delta.reasoning:
+                            thinking_delta = thinking_state.feed(
+                                chunk.text, last=bool(chunk_finish)
+                            )
+                            delta_content = tool_call_state.feed(
+                                thinking_delta.content, last=bool(chunk_finish)
+                            )
+                            if delta_content or thinking_delta.reasoning:
                                 choices = [
                                     ChatStreamChoice(
                                         delta=ChatMessage(
                                             role="assistant",
-                                            content=thinking_delta.content,
+                                            content=delta_content,
                                             reasoning=thinking_delta.reasoning,
                                         )
                                     )
@@ -1975,13 +1982,62 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 yield f"data: {chunk_data.model_dump_json()}\n\n"
                                 await asyncio.sleep(0.01)
 
-                        finish_reason = finish_reason or "stop"
-                        chunk_data = _final_chat_chunk(
-                            request_id,
-                            request.model,
-                            finish_reason,
-                            metrics.rate,
+                        tail_reasoning, tail = finish_content_streams(
+                            thinking_state, tool_call_state
                         )
+                        if tail or tail_reasoning:
+                            chunk_data = ChatStreamChunk(
+                                id=request_id,
+                                created=int(time.time()),
+                                model=request.model,
+                                choices=[
+                                    ChatStreamChoice(
+                                        delta=ChatMessage(
+                                            role="assistant",
+                                            content=tail,
+                                            reasoning=tail_reasoning,
+                                        )
+                                    )
+                                ],
+                                timings=StreamingTimings(
+                                    predicted_per_second=metrics.rate
+                                ),
+                            )
+                            yield f"data: {chunk_data.model_dump_json()}\n\n"
+
+                        tc = (
+                            process_tool_calls(output_text, tool_module, tools)
+                            if tool_module is not None
+                            else None
+                        )
+                        if tc is not None and tc.calls:
+                            tool_calls_made = True
+                            finish_reason = "tool_calls"
+                            chunk_data = ChatStreamChunk(
+                                id=request_id,
+                                created=int(time.time()),
+                                model=request.model,
+                                choices=[
+                                    ChatStreamChoice(
+                                        finish_reason="tool_calls",
+                                        delta=ChatMessage(
+                                            role="assistant",
+                                            tool_calls=tc.calls,
+                                        ),
+                                    )
+                                ],
+                                timings=StreamingTimings(
+                                    predicted_per_second=metrics.rate
+                                ),
+                            )
+                        else:
+                            finish_reason = finish_reason or "stop"
+                            chunk_data = _final_chat_chunk(
+                                request_id,
+                                request.model,
+                                finish_reason,
+                                metrics.rate,
+                            )
                         yield f"data: {chunk_data.model_dump_json()}\n\n"
                         if emit_usage:
                             chunk_data = _chat_usage_chunk(
@@ -2179,6 +2235,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         gen_args.thinking_start_token,
                         gen_args.thinking_end_token,
                     ),
+                    processor=processor,
                 )
 
                 # Count raw generated tokens minus thinking tag tokens
@@ -2200,20 +2257,23 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         tool_module=tool_module,
                         tools=tools,
                     )
-                    if tc["calls"]:
-                        parsed_tool_calls = tc["calls"]
+                    if tc.calls:
+                        parsed_tool_calls = tc.calls
                         # Clean thinking tags and control tokens from remaining text
                         _, clean_remaining = _split_thinking(
-                            tc["remaining_text"] or "",
+                            tc.remaining_text or "",
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
                         )
-                        if clean_remaining:
-                            # Strip model control tokens
-                            clean_remaining = re.sub(
-                                r"<\|[^>]+\|>|<[^>]+>", "", clean_remaining
-                            ).strip()
-                        content = clean_remaining or None
+                        content = (
+                            strip_protocol_markers(
+                                clean_remaining,
+                                tool_module,
+                                gen_args.thinking_start_token,
+                                gen_args.thinking_end_token,
+                            )
+                            or None
+                        )
 
                 response_logprobs = None
                 if request.logprobs and collected_logprobs:

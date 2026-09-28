@@ -1,12 +1,12 @@
-# Qwen3.5 / Qwen3.6 MTP Drafter
+# Qwen3.5 / Qwen3.6 / Qwen3.8 MTP Drafter
 
-MLX support for Qwen3.5 and Qwen3.6 native Multi-Token Prediction (MTP)
-drafters used by the speculative decoding path.
+MLX support for Qwen3.5, Qwen3.6, and Qwen3.8 native Multi-Token Prediction
+(MTP) drafters used by the speculative decoding path.
 
 ## What it is
 
-Qwen3.5 and Qwen3.6 checkpoints can include native `mtp.*` weights in the
-target model. Those weights are split into a standalone drafter folder with:
+These checkpoints can include native `mtp.*` weights in the target model. Those
+weights are split into a standalone drafter folder with:
 
 - `config.json` using `model_type: "qwen3_5_mtp"`
 - `model.safetensors` containing only the sanitized MTP weights
@@ -68,5 +68,6 @@ uv run mlx_vlm.server \
 - Greedy decoding (`temperature=0`) uses exact target verification.
 - The drafter is tied to the target family and tokenizer it was split from.
 - Batched Qwen MTP uses uniform acceptance to keep the drafter cache aligned.
+- Official block-FP8 MTP weights are dequantized to BF16 while splitting.
 - Multimodal prompts are supported, but image/video prefill still runs through
   the target model; MTP accelerates the text decode tail.
