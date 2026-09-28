@@ -352,17 +352,13 @@ class OffloadedSwitchGLU(nn.Module):
         # decode's few-expert steps go through the byte-budgeted per-expert cache.
         if len(uniq) * 2 > self.store.num_experts:
             bulk = self.store.get_all(self.layer_id, uniq)
-        elif hasattr(self.store, "get_many"):
-            bulk = self.store.get_many(self.layer_id, uniq)
         else:
-            bulk = None
+            bulk = self.store.get_many(self.layer_id, uniq)
         for j in uniq:
             j = int(j)
             tok, slot = np.where(idx == j)
             xr = xf[mx.array(tok)]
-            (gw, gsc, gb), (uw, usc, ub), (dw, dsc, db) = (
-                bulk[j] if bulk is not None else self.store.get(self.layer_id, j)
-            )
+            (gw, gsc, gb), (uw, usc, ub), (dw, dsc, db) = bulk[j]
             x_gate = self._proj(xr, gw, gsc, gb, self.gate_quant)
             if self.gate_bias is not None:
                 x_gate = x_gate + self.gate_bias[j].astype(x_gate.dtype)
