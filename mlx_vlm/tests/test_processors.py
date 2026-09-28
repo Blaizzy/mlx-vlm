@@ -628,12 +628,10 @@ def test_auto_processor_routes_to_custom_loader(
         assert (
             AutoProcessor.from_pretrained(tmp_path, trust_remote_code=False) is sentinel
         )
-    loader.assert_called_once_with(tmp_path, trust_remote_code=False)
-    if model_type in ("hunyuan_vl", "qwen4_exp"):
-        assert isinstance(AutoProcessor.from_pretrained(tmp_path), cls)
-    else:
-        with pytest.raises(ValueError, match="Unrecognized processing class"):
-            AutoProcessor.from_pretrained(tmp_path)
+        loader.assert_called_once_with(tmp_path, trust_remote_code=False)
+        loader.reset_mock()
+        assert AutoProcessor.from_pretrained(tmp_path) is sentinel
+        loader.assert_called_once_with(tmp_path, trust_remote_code=True)
 
 
 def test_qwen3_5_moe_text_stale_vl_processor_loads_tokenizer(tmp_path):
@@ -1739,12 +1737,17 @@ class TestApplyChatTemplateIntegration:
         rendered = apply_chat_template(None, dict(model_type="qwen3_vl"), [message])
         assert rendered == "before <image>"
 
-    def test_deepseek_processor_preserves_inline_image_position(self):
+    @pytest.mark.parametrize(
+        "family,separator", [("deepseek", ""), ("deepseek41", "\n\n")]
+    )
+    def test_deepseek_processor_preserves_inline_image_position(
+        self, family, separator
+    ):
         tokenizer = PreTrainedTokenizerFast(
             tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]")),
             unk_token="[UNK]",
         )
-        processor = c.deepseek(tokenizer)
+        processor = getattr(c, family)(tokenizer)
         message = dict(
             role="user",
             content=[
@@ -1753,10 +1756,11 @@ class TestApplyChatTemplateIntegration:
                 dict(type="text", text="after"),
             ],
         )
+        model_type = "deepseek_v4" if family == "deepseek" else "deepseek_v41"
         rendered = apply_chat_template(
-            processor, dict(model_type="deepseek_v4"), message, num_images=1
+            processor, dict(model_type=model_type), message, num_images=1
         )
-        assert "before<｜deepseek_image｜>after" in rendered
+        assert f"before{separator}<｜deepseek_image｜>{separator}after" in rendered
 
     @pytest.mark.parametrize(
         "family,expected",
