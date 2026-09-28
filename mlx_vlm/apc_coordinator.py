@@ -108,9 +108,10 @@ class APCCoordinator:
     boundary.  The distinction is deliberately private to this class.
     """
 
-    def __init__(self, manager: Any, model: Any):
+    def __init__(self, manager: Any, model: Any, *, prefer_checkpoints: bool = False):
         self.manager = manager
         self.model = model
+        self._prefer_checkpoints = prefer_checkpoints
         self.plan: PrefixCachePlan = build_prefix_cache_plan(model)
 
     def prepare_prefill(
@@ -138,6 +139,8 @@ class APCCoordinator:
 
     @property
     def strategy(self) -> Optional[str]:
+        if self.enabled and self._prefer_checkpoints:
+            return "checkpoint"
         return self.plan.strategy if self.enabled else None
 
     @property
@@ -146,7 +149,11 @@ class APCCoordinator:
 
     @property
     def legacy_mode(self) -> Optional[str]:
-        return self.plan.legacy_mode if self.enabled else None
+        return (
+            "exact"
+            if self.is_checkpoint
+            else (self.plan.legacy_mode if self.enabled else None)
+        )
 
     def fresh_cache(self) -> List[Any]:
         language_model = getattr(self.model, "language_model", self.model)

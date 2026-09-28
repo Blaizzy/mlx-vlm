@@ -628,6 +628,83 @@ APC has two tiers:
 - **Warm memory**: keeps reusable `APCBlock` tensors in process memory. This is the fastest path, but it keeps both the reusable block pool and the runtime `KVCache`.
 - **Warm disk**: persists cached prefixes as safetensors shards so they survive process restarts. Warm-disk reads build the layer-major prompt cache directly without promoting restored blocks into the `APCBlock` pool; writes can still populate both memory and disk tiers.
 
+#### Appending images to a cached Qwen3.5 or Qwen4-Exp conversation
+
+For single-request Qwen3.5-family and Qwen4-Exp text/image generation, opt into
+prefix-local image identity with
+`stream_generate(..., apc_manager=apc, apc_image_prefix=True)`. This covers
+Qwen3.8 models that use the `qwen3_5` architecture and Qwen3.8-Flash-Next
+(`qwen4_exp`), which inherits the Qwen3.5 vision tower, image merge and RoPE
+indexing. Each model type uses its own checkpoint namespace. Use the same
+model-scoped `APCManager` and tenant across requests. Other generation paths
+retain their existing behavior.
+
+A checkpoint hashes only the processed image pixels, grid geometry and image
+positions inside that checkpoint. Appending an image can therefore restore an
+unchanged earlier checkpoint and encode only the remaining images. Changing an
+old image or its position invalidates checkpoints containing it; a checkpoint
+before it can still be reused. Checkpoints never end inside an image-token span.
+The full prompt is still tokenized and images are preprocessed before lookup.
+
+The feature currently covers `stream_generate`, not the continuous-batching
+server path. Audio/video and unknown image layouts use the ordinary conservative
+APC path. Custom positions, masks, image features, embeddings, prompt caches,
+vision caches, speculative decoding, and KV quantization/size overrides disable
+APC for that request. Memory and disk checkpoints use a separate semantic
+namespace from the ordinary whole-request media keys.
+
+Run the real-model regression and timing example on an otherwise idle GPU:
+
+```sh
+python examples/verify_image_prefix_apc.py --model mlx-community/Qwen3.8-27B-4bit
+python examples/verify_image_prefix_apc.py --model mlx-community/Qwen3.8-Flash-Next-4bit
+```
+
+It compares appended-image outputs and first-token distributions with cold
+inference, checks which images were encoded, and verifies changed/reordered
+history. Quantized cold and cached execution need not be bit-identical. On
+Qwen3.8-Flash-Next the first-token distribution already moves with the prefill
+step size alone (KL up to ~0.1 between cold runs), so the cached result is
+compared with cold runs at step sizes 2048, 512 and 256 and must match one of
+them within KL 0.05.
+
+
+#### Appending media to a cached Qwen3-Omni conversation
+
+Use `stream_generate(..., apc_manager=apc, apc_media_prefix=True)` for Omni's
+single-request text, image, independent audio clips and video inputs. The
+model uses prefix checkpoints even though its dense KV caches also support
+block storage. Only media inside each checkpoint enters its key; suffix image,
+audio and video tensors are sliced independently, in prompt order. Old media
+content, grid or FPS changes invalidate checkpoints containing that occurrence.
+
+Omni retains full-prompt RoPE positions and aligns suffix deepstack residuals to
+absolute cache coordinates. The processor extracts audio clips independently
+before padding, and the audio tower encodes each clip independently. This makes
+an earlier clip's features stable when a longer clip is appended. Multiple audio
+clips are supported; CNN output lengths and chunk masks use the same frame counts
+as processor placeholders, including exact multiples of 100 mel frames.
+
+A video plus its separately supplied/demuxed audio is supported. Native
+`use_audio_in_video=True` interleaving and unknown layouts disable APC. The new
+path does not apply to continuous batching. The same opaque-override restrictions
+as the image-prefix option apply; an explicit `PromptCacheState` retains its
+existing separate behavior and is excluded from this new path. Disk remains a
+caller choice, with its existing persistence and retention semantics.
+
+The following example generates synthetic fixtures locally and checks repeated
+cold/hit responses, encoder calls, old-content changes and FPS changes. It needs
+macOS `say` with the Samantha voice and `ffmpeg`:
+
+```sh
+python examples/verify_omni_media_prefix.py --output /tmp/omni-prefix-results.json
+```
+
+Quantized Omni uses MoE routing, and changing prefill/encoder batch shapes can
+change output probabilities or wording. The regression suite additionally checks
+full versus restored/chunked suffix logits with tiny float32 models to isolate
+position and cache-state correctness.
+
 #### Python Script
 
 Use `APCManager` directly when calling `stream_generate`:

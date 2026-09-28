@@ -68,6 +68,19 @@ class Thinker(nn.Module):
 
             lens = [int(v) for v in np.array(audio_feature_lengths)]
             segments = [input_features[i, : lens[i]] for i in range(batch_size)]
+            if batch_size > 1:
+                # CNN padding depends on the longest chunk. Keep each clip's
+                # encoding identical to standalone inference when clips grow.
+                return mx.concatenate(
+                    [
+                        self.audio_tower(
+                            mx.transpose(segment, (1, 0)),
+                            feature_lens=mx.array([length], dtype=mx.int32),
+                        )
+                        for segment, length in zip(segments, lens)
+                    ],
+                    axis=0,
+                )
             input_features = mx.transpose(mx.concatenate(segments, axis=0), (1, 0))
             feature_lens = mx.array(lens, dtype=mx.int32)
         else:
@@ -262,9 +275,15 @@ class Thinker(nn.Module):
                 visual_embeds_multiscale = tuple(visual_embeds_multiscale_joint)
 
         mask = kwargs.get("mask", None)
-        position_ids, rope_deltas = self.language_model.get_rope_index(
-            input_ids, image_grid_thw, video_grid_thw, mask
-        )
+        position_ids = kwargs.get("position_ids")
+        rope_deltas = kwargs.get("rope_deltas")
+        prefix_len = 0
+        if position_ids is not None and rope_deltas is not None:
+            prefix_len = max(0, position_ids.shape[-1] - input_ids.shape[-1])
+        else:
+            position_ids, rope_deltas = self.language_model.get_rope_index(
+                input_ids, image_grid_thw, video_grid_thw, mask
+            )
         if image_grid_thw is None and video_grid_thw is None and position_ids.ndim == 3:
             position_ids = position_ids[0]
 
@@ -285,6 +304,14 @@ class Thinker(nn.Module):
             )
         else:
             visual_embeds_multiscale = None
+
+        if prefix_len and visual_embeds_multiscale is not None:
+            # LanguageModel windows dense residuals in absolute cache coordinates.
+            visual_embeds_multiscale = mx.pad(
+                visual_embeds_multiscale, ((0, 0), (prefix_len, 0), (0, 0), (0, 0))
+            )
+            if visual_pos_masks is not None:
+                visual_pos_masks = mx.pad(visual_pos_masks, ((0, 0), (prefix_len, 0)))
 
         return InputEmbeddingsFeatures(
             inputs_embeds=inputs_embeds,
