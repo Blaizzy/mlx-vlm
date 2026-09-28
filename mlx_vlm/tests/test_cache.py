@@ -245,7 +245,12 @@ def test_deepseek_v41_batch_cache_matches_independent_requests(right_pad, chunks
             for ring in row.window:
                 assert ring.shape == (1, config.sliding_window, config.head_dim)
             fixed = C.cache_nbytes([row.window, row.kv_state, row.score_state])
-            assert row.memory_profile(row.offset).fixed_bytes == fixed
+            reserve = sum(
+                (row.step - 1) * array.nbytes // array.shape[1]
+                for array in row.compress + row.keys
+                if array is not None and array.shape[1]
+            )
+            assert row.memory_profile(row.offset).fixed_bytes == fixed + reserve
             assert mx.array_equal(row.engram, reference[0].engram).item()
 
     # Merging already-populated scalar caches is the server join path.
@@ -267,6 +272,50 @@ def test_deepseek_v41_batch_cache_matches_independent_requests(right_pad, chunks
         model(tokens, cache=cache).logits,
         model(tokens, cache=merged).logits,
     )
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+def test_deepseek_v41_cache_append_preserves_prefix_and_snapshots(dtype):
+    cache = DeepseekV41Cache(2)
+    expected = mx.zeros((2, 0, 4), dtype=dtype)
+    snapshots = []
+    for length in (255, 1, 1, 259):
+        start = expected.shape[1]
+        values = mx.arange(2 * length * 4).reshape(2, length, 4).astype(dtype)
+        expected = mx.concatenate([expected, values], axis=1)
+        cache.compress_kv = cache.append_compressed(1, values)
+        cache.index_k = cache.append_index_keys(1, values[..., :2])
+        cache.offset += length
+        mx.eval(cache.state)
+
+        assert mx.array_equal(cache.compress_kv, expected).item()
+        assert mx.array_equal(cache.index_k, expected[..., :2]).item()
+        assert cache.compress[1].shape[1] == start + length
+        assert cache._compress_buffers[1].shape[1] % cache.step == 0
+        assert cache._compress_buffers[1].shape[1] - expected.shape[1] < cache.step
+        profile = cache.memory_profile(cache.offset)
+        allocated = cache._compress_buffers[1].nbytes + cache._key_buffers[1].nbytes
+        assert profile.source_bytes == allocated
+        assert profile.footprint(cache.offset) >= allocated
+
+        snapshots.append(
+            (
+                DeepseekV41Cache.from_state(cache.state, cache.meta_state),
+                mx.array(expected),
+            )
+        )
+
+    for snapshot, reference in snapshots:
+        assert snapshot.offset == reference.shape[1]
+        assert mx.array_equal(snapshot.compress[1], reference).item()
+        assert mx.array_equal(snapshot.keys[1], reference[..., :2]).item()
+    for restored, reference in (*snapshots, (cache.extract(1), expected[1:])):
+        values = mx.full((reference.shape[0], 2, 4), -1, dtype=dtype)
+        actual = restored.append_compressed(1, values)
+        assert mx.array_equal(
+            actual, mx.concatenate([reference, values], axis=1)
+        ).item()
+        assert restored.state[restored.n_layers + 1].shape == actual.shape
 
 
 @pytest.mark.parametrize("family", ["shared", "qwen"])

@@ -7,7 +7,7 @@ import mlx.nn as nn
 import numpy as np
 
 from ..base import LanguageModelOutput
-from ..cache import CacheMemory, cache_nbytes
+from ..cache import CacheMemory, KVCache, cache_nbytes
 from ..deepseek_v4.hyper_connection import hc_split_sinkhorn
 from ..deepseek_v4.language import (
     DeepseekV4MLP,
@@ -19,59 +19,6 @@ from ..switch_layers import SwitchGLU
 from .config import ModelConfig
 from .engram import Engram, EngramLayout, NgramHashState
 from .fakequant import fake_quant_fp4_e4m3, fake_quant_fp4_ue8m0, fake_quant_fp8_ue8m0
-
-
-def _write_span(buffer, values, batch: int, start: int, fill=0, dtype=None):
-    """Write ``values`` into ``buffer`` at ``start``, growing it to fit.
-
-    Every per-generation buffer here is position-addressed: a step writes the
-    span it owns and leaves the rest alone. Rows past ``batch`` are preserved
-    so a filtered batch can grow again.
-
-    The buffer ends exactly ``start + length`` wide. Readers slice it with a
-    length derived from their own compression ratio, which can run past what
-    the writing layer covered, so the width is what keeps those slices honest.
-    """
-    length, tail = values.shape[1], values.shape[2:]
-    need = start + length
-    if buffer is None:
-        buffer = mx.full(
-            (batch, need, *tail), fill, dtype=values.dtype if dtype is None else dtype
-        )
-    if buffer.shape[0] < batch:
-        buffer = mx.concatenate(
-            [
-                buffer,
-                mx.full(
-                    (batch - buffer.shape[0], buffer.shape[1], *tail),
-                    fill,
-                    dtype=buffer.dtype,
-                ),
-            ],
-            axis=0,
-        )
-    if buffer.shape[1] < need:
-        buffer = mx.concatenate(
-            [
-                buffer,
-                mx.full(
-                    (buffer.shape[0], need - buffer.shape[1], *tail),
-                    fill,
-                    dtype=buffer.dtype,
-                ),
-            ],
-            axis=1,
-        )
-    parts = []
-    if start > 0:
-        parts.append(buffer[:batch, :start])
-    parts.append(values.astype(buffer.dtype))
-    if buffer.shape[1] > need:
-        parts.append(buffer[:batch, need:])
-    head = mx.concatenate(parts, axis=1) if len(parts) > 1 else parts[0]
-    if buffer.shape[0] > batch:
-        return mx.concatenate([head, buffer[batch:]], axis=0)
-    return head
 
 
 def _index_cos_sin(length: int, rope_dim: int, theta: float, yarn: tuple):
@@ -267,7 +214,7 @@ class Indexer(nn.Module):
             self.k_norm = nn.RMSNorm(self.index_head_dim, eps=config.rms_norm_eps)
         self.layer_idx = layer_idx
 
-    def _publish_keys(self, latent: mx.array, start_pos: int, batch: int, cache):
+    def _publish_keys(self, latent: mx.array, start_pos: int, cache):
         ratio = self.compress_ratio
         n_latent = latent.shape[1]
         base = start_pos // ratio
@@ -286,9 +233,7 @@ class Indexer(nn.Module):
             self.rope_head_dim,
         )
         k = fake_quant_fp4_ue8m0(k)
-        keys = _write_span(cache.keys[self.layer_idx], k, batch, base)
-        cache.keys[self.layer_idx] = keys
-        return keys
+        return cache.append_index_keys(self.layer_idx, k)
 
     def __call__(
         self,
@@ -308,7 +253,7 @@ class Indexer(nn.Module):
 
         if self.owns_k:
             if latent is not None:
-                self._publish_keys(latent, start_pos, batch, cache)
+                self._publish_keys(latent, start_pos, cache)
             cache.index_k = cache.keys[self.layer_idx]
 
         cos, sin = _index_cos_sin(
@@ -673,13 +618,7 @@ class DeepseekV41Attention(nn.Module):
                     self._latent_yarn,
                 )
                 pool_kv = fake_quant_fp4_e4m3(pool_kv)
-                pool_kv = _write_span(
-                    cache.compress[self.layer_idx],
-                    pool_kv,
-                    batch,
-                    start_pos // ratio,
-                )
-                cache.compress[self.layer_idx] = pool_kv
+                cache.append_compressed(self.layer_idx, pool_kv)
             cache.compress_kv = cache.compress[self.layer_idx]
         compress_len = (start_pos + seqlen) // ratio
         if compress_len == 0 or cache.compress_kv is None:
@@ -1021,6 +960,7 @@ class DeepseekV41Cache:
 
     N_SLOTS = 5
     HANDOFF = ("index_k", "candidates", "compress_kv", "topk_idxs")
+    step = KVCache.step
 
     def __init__(self, n_layers: int = 0):
         self.offset = 0
@@ -1028,10 +968,38 @@ class DeepseekV41Cache:
         self.window = [None] * n_layers
         self.compress = [None] * n_layers
         self.keys = [None] * n_layers
+        self._compress_buffers = [None] * n_layers
+        self._key_buffers = [None] * n_layers
         self.kv_state = [None] * n_layers
         self.score_state = [None] * n_layers
         self.engram = None
         self.reset_handoff()
+
+    def _append(self, arrays, buffers, layer_idx, values):
+        """Retain block capacity while publishing only the populated prefix."""
+        previous = arrays[layer_idx]
+        start = 0 if previous is None else previous.shape[1]
+        end = start + values.shape[1]
+        buffer = buffers[layer_idx]
+        if buffer is None:
+            buffer = previous
+        if buffer is None or end > buffer.shape[1]:
+            capacity = ((end + self.step - 1) // self.step) * self.step
+            shape = (values.shape[0], capacity, *values.shape[2:])
+            dtype = values.dtype if buffer is None else buffer.dtype
+            buffer = mx.zeros(shape, dtype=dtype)
+            if previous is not None:
+                buffer[:, :start] = previous
+        buffer[:, start:end] = values
+        buffers[layer_idx] = buffer
+        arrays[layer_idx] = buffer[:, :end]
+        return arrays[layer_idx]
+
+    def append_compressed(self, layer_idx, values):
+        return self._append(self.compress, self._compress_buffers, layer_idx, values)
+
+    def append_index_keys(self, layer_idx, values):
+        return self._append(self.keys, self._key_buffers, layer_idx, values)
 
     def map(self, function, *arrays):
         return function(self, *arrays)
@@ -1057,12 +1025,22 @@ class DeepseekV41Cache:
         return (self.window, self.compress, self.keys, self.kv_state, self.score_state)
 
     def memory_profile(self, token_count):
-        """Window rings and incomplete compression groups have fixed capacity."""
+        """Include allocated slack and budget one partial block per growing array."""
         fixed = cache_nbytes([self.window, self.kv_state, self.score_state])
         growing = cache_nbytes(self.state) - fixed
+        spare = reserve = 0
+        for arrays, buffers in (
+            (self.compress, self._compress_buffers),
+            (self.keys, self._key_buffers),
+        ):
+            for array, buffer in zip(arrays, buffers):
+                if array is not None and array.shape[1]:
+                    reserve += (self.step - 1) * array.nbytes // array.shape[1]
+                    if buffer is not None:
+                        spare += buffer.nbytes - array.nbytes
         return CacheMemory(
-            source_bytes=fixed + growing,
-            fixed_bytes=fixed,
+            source_bytes=fixed + growing + spare,
+            fixed_bytes=fixed + reserve,
             bytes_per_token=growing / max(1, token_count),
         )
 
@@ -1094,6 +1072,8 @@ class DeepseekV41Cache:
             self.kv_state,
             self.score_state,
         ) = restored
+        self._compress_buffers = list(self.compress)
+        self._key_buffers = list(self.keys)
         engram = value[self.N_SLOTS * n]
         self.engram = None if engram.size == 0 else engram
         self.reset_handoff()
