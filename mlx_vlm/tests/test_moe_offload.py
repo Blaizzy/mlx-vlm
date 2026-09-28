@@ -364,7 +364,7 @@ def test_load_model_moe_offload_mmap_with_parity(tmp_path):
     model = load_model(build, moe_offload="mmap")
     store = getattr(model, "moe_offload_store", None)
     assert store is not None
-    assert store.stats()["backend"] == "memmap"
+    assert store.stats()["backend"] == "memmap+cache"
     assert not (tmp_path / "build-offload").exists()
     _assert_offload_parity(resident, model(prompt).logits)
 
@@ -373,6 +373,17 @@ def test_load_model_moe_offload_rejects_bad_mode(tmp_path):
     build = _build(tmp_path)
     with pytest.raises(ValueError, match="repack.*mmap|mmap.*repack"):
         load_model(build, moe_offload=True)
+
+
+def test_default_expert_cache_budget_caps_at_third_of_ram():
+    import mlx.core as mx
+
+    from mlx_vlm.moe_offload import _default_expert_cache_bytes
+
+    ram = int(mx.device_info().get("memory_size", 0))
+    if not ram:
+        pytest.skip("device_info has no memory_size")
+    assert _default_expert_cache_bytes() <= ram // 3
 
 
 def test_plan_recognizes_bare_fused_and_glm_layouts():

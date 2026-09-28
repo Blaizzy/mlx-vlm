@@ -348,16 +348,14 @@ class OffloadedSwitchGLU(nn.Module):
         N = xf.shape[0]
         out = mx.zeros((N, K, D), dtype=x.dtype)
         uniq = np.unique(idx)
-        # A large prefill chunk routes over most of num_experts regardless of
-        # top-k -- per-expert caching buys nothing there (everything gets
-        # touched anyway) and its LRU/eviction bookkeeping just thrashes.
-        # Bulk-load the whole layer once instead; decode's later selective
-        # get() calls are unaffected (see ExpertStore.get_all).
-        bulk = (
-            self.store.get_all(self.layer_id, uniq)
-            if len(uniq) * 2 > self.store.num_experts
-            else None
-        )
+        # A prefill chunk routing over most experts is served in one bulk read;
+        # decode's few-expert steps go through the byte-budgeted per-expert cache.
+        if len(uniq) * 2 > self.store.num_experts:
+            bulk = self.store.get_all(self.layer_id, uniq)
+        elif hasattr(self.store, "get_many"):
+            bulk = self.store.get_many(self.layer_id, uniq)
+        else:
+            bulk = None
         for j in uniq:
             j = int(j)
             tok, slot = np.where(idx == j)

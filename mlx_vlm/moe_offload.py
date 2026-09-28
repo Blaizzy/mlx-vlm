@@ -569,10 +569,16 @@ def _default_expert_cache_bytes(
     import mlx.core as mx
 
     try:
-        recommended = mx.device_info()["max_recommended_working_set_size"]
+        info = mx.device_info()
+        recommended = info["max_recommended_working_set_size"]
+        ram = int(info.get("memory_size", 0))
     except Exception:
         return 0
     budget = int(0.8 * recommended) - resident_bytes - kv_reserve_bytes
+    # An expert cache past ~1/3 of physical RAM competes with the compute working
+    # set and collapses under memory pressure; override for a model that fits.
+    if ram:
+        budget = min(budget, ram // 3)
     return max(0, budget)
 
 
@@ -743,7 +749,7 @@ class ExpertStore:
 
 
 class RuntimeExpertStore(ExpertStore):
-    """Bounded no-repack offload: page routed-expert rows from the stacked checkpoint via ``np.memmap`` (OS page cache is residency), ~1.6x slower than a repack()'d store; fast-path expert naming only."""
+    """No-repack offload: pread routed-expert rows from the stacked checkpoint, converting and byte-budgeted-LRU-caching them; fast-path expert naming only."""
 
     def __init__(
         self,
@@ -776,27 +782,24 @@ class RuntimeExpertStore(ExpertStore):
         self._entries = p["experts"]
         self._shard_of = shard_of
 
-        # One np.memmap per shard, not per tensor: per-tensor memmaps burn an fd
-        # each and hit the OS limit. Views alias the shard mmap (no fd) and page
-        # lazily, so only touched rows enter the evictable OS cache.
         headers: dict = {}
-        self._shard_mm: dict = {}
+        self._shard_fd: dict = {}
 
-        def memmap(name):
+        def tensor_info(name):
             shard = self._shard_of[name]
             if shard not in headers:
                 headers[shard] = _st_header(shard)
-            if shard not in self._shard_mm:
-                self._shard_mm[shard] = np.memmap(shard, mode="r", dtype=np.uint8)
+            if shard not in self._shard_fd:
+                self._shard_fd[shard] = os.open(shard, os.O_RDONLY)
             data_start, header = headers[shard]
             meta = header[name]
-            view = np.ndarray(
+            return (
+                self._shard_fd[shard],
+                data_start + meta["data_offsets"][0],
                 tuple(meta["shape"]),
-                dtype=_ST_NP[meta["dtype"]],
-                buffer=self._shard_mm[shard],
-                offset=data_start + meta["data_offsets"][0],
+                _ST_NP[meta["dtype"]],
+                meta["dtype"],
             )
-            return (view, meta["dtype"])
 
         self._mm: dict = {}
         self._layer_reads: dict = {}
@@ -804,18 +807,18 @@ class RuntimeExpertStore(ExpertStore):
         for lid, ents in self._entries.items():
             stacked, perexpert = [], {}
             for key, name, mode in ents:
-                self._mm[name] = memmap(name)
-                mm = self._mm[name][0]
+                self._mm[name] = tensor_info(name)
+                shape = self._mm[name][2]
                 if mode == "STACK":
                     m = STACKED_RE.match(name)
                     stacked.append((m["proj"], m["kind"] or "weight", "STACK", name))
-                    num_experts = max(num_experts, mm.shape[0])
+                    num_experts = max(num_experts, shape[0])
                 elif mode == "STACK_FUSED":
                     m = STACKED_FUSED_RE.match(name)
                     kind = m["kind"] or "weight"
                     stacked.append(("gate_proj", kind, "FUSED_GATE", name))
                     stacked.append(("up_proj", kind, "FUSED_UP", name))
-                    num_experts = max(num_experts, mm.shape[0])
+                    num_experts = max(num_experts, shape[0])
                 else:
                     j, proj, kind = key[1:].split(".")
                     perexpert[(int(j), proj, kind)] = name
@@ -826,6 +829,33 @@ class RuntimeExpertStore(ExpertStore):
         self._maps = {lid: True for lid in self._entries}
         self.swapped = 0
         self._served = 0
+        self._cache: "OrderedDict[Tuple[int, int], tuple]" = OrderedDict()
+        self._cache_bytes = 0
+        self._hits = 0
+        self._misses = 0
+        self._budget = (
+            int(expert_cache_bytes)
+            if expert_cache_bytes is not None
+            else _default_expert_cache_bytes(kv_reserve_bytes=kv_reserve_bytes)
+        )
+
+    def _evict_cache(self, incoming: int) -> None:
+        import mlx.core as mx
+
+        if self._budget <= 0:
+            return
+        evicted = False
+        while self._cache and self._cache_bytes + incoming > self._budget:
+            _, trip = self._cache.popitem(last=False)
+            self._cache_bytes -= sum(
+                t.nbytes for grp in trip for t in grp if t is not None
+            )
+            evicted = True
+        if evicted:
+            try:
+                mx.clear_cache()
+            except Exception:
+                pass
 
     @staticmethod
     def _to_mx(rows, st_dtype: str):
@@ -839,21 +869,32 @@ class RuntimeExpertStore(ExpertStore):
     def experts_present(self, layer_id: int) -> bool:
         return layer_id in self._entries
 
+    def _read_expert_rows(self, name: str, j: int):
+        fd, base, shape, np_dt, st_dt = self._mm[name]
+        stride = int(np.prod(shape[1:])) * np.dtype(np_dt).itemsize
+        buf = os.pread(fd, stride, base + j * stride)
+        return np.frombuffer(buf, dtype=np_dt).reshape(shape[1:]), st_dt
+
     def _expert(self, layer_id: int, j: int):
         stacked, perexpert = self._layer_reads[layer_id]
         acc: dict = {}
+        rows_cache: dict = {}
         for proj, kind, mode, name in stacked:
-            mm, dt = self._mm[name]
+            if name not in rows_cache:
+                rows_cache[name] = self._read_expert_rows(name, j)
+            rows, dt = rows_cache[name]
             if mode == "STACK":
-                rows = mm[j]
+                acc[(proj, kind)] = self._to_mx(rows, dt)
             else:
-                half = mm.shape[1] // 2
-                rows = mm[j, :half] if mode == "FUSED_GATE" else mm[j, half:]
-            acc[(proj, kind)] = self._to_mx(rows, dt)
+                half = rows.shape[0] // 2
+                sub = rows[:half] if mode == "FUSED_GATE" else rows[half:]
+                acc[(proj, kind)] = self._to_mx(sub, dt)
         for (jj, proj, kind), name in perexpert.items():
             if jj == j:
-                mm, dt = self._mm[name]
-                acc[(proj, kind)] = self._to_mx(mm[:], dt)
+                fd, base, shape, np_dt, st_dt = self._mm[name]
+                buf = os.pread(fd, int(np.prod(shape)) * np.dtype(np_dt).itemsize, base)
+                rows = np.frombuffer(buf, dtype=np_dt).reshape(shape)
+                acc[(proj, kind)] = self._to_mx(rows, st_dt)
         self._served += 1
         trip = lambda p: (
             acc.get((p, "weight")),
@@ -863,18 +904,122 @@ class RuntimeExpertStore(ExpertStore):
         return (trip("gate_proj"), trip("up_proj"), trip("down_proj"))
 
     def get(self, layer_id: int, j: int):
-        return self._expert(int(layer_id), int(j))
+        key = (int(layer_id), int(j))
+        cached = self._cache.get(key)
+        if cached is not None:
+            self._cache.move_to_end(key)
+            self._hits += 1
+            return cached
+        self._misses += 1
+        trip = self._expert(key[0], key[1])
+        if self._budget > 0:
+            import mlx.core as mx
+
+            nbytes = sum(t.nbytes for grp in trip for t in grp if t is not None)
+            self._evict_cache(nbytes)
+            mx.eval(*(t for grp in trip for t in grp if t is not None))
+            self._cache[key] = trip
+            self._cache_bytes += nbytes
+        return trip
+
+    def _assemble_trip(self, rows: dict, pe: dict, stacked) -> tuple:
+        acc: dict = {}
+        for proj, kind, mode, name in stacked:
+            rr, dt = rows[name]
+            if mode == "STACK":
+                acc[(proj, kind)] = self._to_mx(rr, dt)
+            else:
+                half = rr.shape[0] // 2
+                sub = rr[:half] if mode == "FUSED_GATE" else rr[half:]
+                acc[(proj, kind)] = self._to_mx(sub, dt)
+        for (proj, kind), (rr, dt) in pe.items():
+            acc[(proj, kind)] = self._to_mx(rr, dt)
+        t = lambda p: (
+            acc.get((p, "weight")),
+            acc.get((p, "scales")),
+            acc.get((p, "biases")),
+        )
+        return (t("gate_proj"), t("up_proj"), t("down_proj"))
+
+    def get_many(self, layer_id: int, needed) -> dict:
+        """Batched get(): pread the decode step's cache-missed experts in parallel (thread-safe on a shared fd), then convert + cache on the calling thread."""
+        import mlx.core as mx
+
+        lid = int(layer_id)
+        out: dict = {}
+        misses = []
+        for j in needed:
+            j = int(j)
+            cached = self._cache.get((lid, j))
+            if cached is not None:
+                self._cache.move_to_end((lid, j))
+                self._hits += 1
+                out[j] = cached
+            else:
+                self._misses += 1
+                misses.append(j)
+        if not misses:
+            return out
+        stacked, perexpert = self._layer_reads[lid]
+
+        def read_raw(j):
+            rows = {}
+            for _, _, _, name in stacked:
+                if name not in rows:
+                    rows[name] = self._read_expert_rows(name, j)
+            pe = {}
+            for (jj, proj, kind), name in perexpert.items():
+                if jj == j:
+                    fd, base, shape, np_dt, st_dt = self._mm[name]
+                    nb = int(np.prod(shape)) * np.dtype(np_dt).itemsize
+                    buf = os.pread(fd, nb, base)
+                    pe[(proj, kind)] = (
+                        np.frombuffer(buf, dtype=np_dt).reshape(shape),
+                        st_dt,
+                    )
+            return j, rows, pe
+
+        if len(misses) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=min(8, len(misses))) as ex:
+                raws = list(ex.map(read_raw, misses))
+        else:
+            raws = [read_raw(misses[0])]
+
+        new_trips = []
+        for j, rows, pe in raws:
+            trip = self._assemble_trip(rows, pe, stacked)
+            self._served += 1
+            out[j] = trip
+            new_trips.append(((lid, j), trip))
+        if self._budget > 0:
+            mx.eval(
+                *(t for _, tr in new_trips for grp in tr for t in grp if t is not None)
+            )
+            for key, trip in new_trips:
+                nbytes = sum(t.nbytes for grp in trip for t in grp if t is not None)
+                self._evict_cache(nbytes)
+                self._cache[key] = trip
+                self._cache_bytes += nbytes
+        return out
 
     def get_all(self, layer_id: int, needed) -> dict:
         return {int(j): self._expert(int(layer_id), int(j)) for j in needed}
 
     def stats(self) -> dict:
+        total = self._hits + self._misses
         return {
-            "backend": "memmap",
+            "backend": "memmap+cache",
             "num_experts": self.num_experts,
             "num_layers": len(self._entries),
             "experts_served": self._served,
-            "residency": "os_page_cache",
+            "residency": "os_page_cache+lru",
+            "budget_bytes": self._budget,
+            "cache_bytes": self._cache_bytes,
+            "hits": self._hits,
+            "misses": self._misses,
+            "hit_rate": (self._hits / total) if total else None,
         }
 
 
