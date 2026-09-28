@@ -28,8 +28,6 @@ from typing import Optional, Tuple
 
 import numpy as np
 
-# safetensors dtype -> numpy dtype of the same byte width (bf16/fp8 have no
-# native numpy dtype, so read the raw bytes and reinterpret via mx.view after).
 _ST_NP = {
     "F64": "float64",
     "F32": "float32",
@@ -60,8 +58,6 @@ def _st_header(path: str) -> Tuple[int, dict]:
 
 # stacked: switch_mlp.gate_proj.weight [E,out,in]; per-expert: experts.{j}.gate_proj.weight;
 # stacked-fused: switch_mlp.gate_up_proj.weight [E,2*out,in], gate = first half of axis 1.
-# kind is optional: bf16 fused-expert checkpoints (Qwen3.5/3.6-MoE) name the
-# stacked tensor bare (``experts.gate_up_proj``, no ``.weight``); default to weight.
 _PROJ = r"(?P<proj>gate_proj|up_proj|down_proj)(?:\.(?P<kind>weight|scales|biases))?$"
 _FUSED_PROJ = r"gate_up_proj(?:\.(?P<kind>weight|scales|biases))?$"
 PEREXPERT_RE = re.compile(
@@ -577,6 +573,7 @@ def _estimate_kv_reserve_bytes(model, max_kv_size: Optional[int]) -> int:
 def _default_expert_cache_bytes(
     resident_bytes: int = 0, kv_reserve_bytes: int = 0
 ) -> int:
+    """Auto expert-cache budget, capped at a third of physical RAM so it can't grow into the compute working set and collapse under memory pressure."""
     import mlx.core as mx
 
     try:
@@ -586,8 +583,6 @@ def _default_expert_cache_bytes(
     except Exception:
         return 0
     budget = int(0.8 * recommended) - resident_bytes - kv_reserve_bytes
-    # An expert cache past ~1/3 of physical RAM competes with the compute working
-    # set and collapses under memory pressure; override for a model that fits.
     if ram:
         budget = min(budget, ram // 3)
     return max(0, budget)

@@ -348,8 +348,6 @@ class OffloadedSwitchGLU(nn.Module):
         N = xf.shape[0]
         out = mx.zeros((N, K, D), dtype=x.dtype)
         uniq = np.unique(idx)
-        # A prefill chunk routing over most experts is served in one bulk read;
-        # decode's few-expert steps go through the byte-budgeted per-expert cache.
         if len(uniq) * 2 > self.store.num_experts:
             bulk = self.store.get_all(self.layer_id, uniq)
         else:
