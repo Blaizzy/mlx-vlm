@@ -24,7 +24,7 @@ class TextConfig(BaseModelConfig):
     hidden_activation: str = "gelu_pytorch_tanh"
     pad_token_id: int = 0
     layer_types: Optional[List[str]] = None
-    per_layer_config: Dict = field(default_factory=dict)
+    per_layer_config: Optional[Dict] = None
     rope_parameters: Optional[Dict] = None
 
     def __post_init__(self):
@@ -35,6 +35,17 @@ class TextConfig(BaseModelConfig):
             ]
         if len(self.layer_types) != self.num_hidden_layers:
             raise ValueError("layer_types must have one entry per text layer")
+        self.layer_types = list(self.layer_types)
+        self.layer_types[-1] = "full_attention"
+        if self.per_layer_config is None:
+            self.per_layer_config = {
+                f"{i:02d}": {"head_dim": 512, "num_key_value_heads": 1}
+                for i, kind in enumerate(self.layer_types)
+                if kind == "full_attention"
+            }
+        self.per_layer_config = {
+            f"{int(i):02d}": value for i, value in self.per_layer_config.items()
+        }
         if self.rope_parameters is None:
             self.rope_parameters = {
                 "full_attention": {"rope_theta": 1_000_000.0, "rope_type": "default"},

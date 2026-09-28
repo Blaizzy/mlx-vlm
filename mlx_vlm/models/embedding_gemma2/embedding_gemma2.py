@@ -84,6 +84,7 @@ class Model(nn.Module):
         video_position_ids: Optional[mx.array] = None,
         input_features: Optional[mx.array] = None,
         input_features_mask: Optional[mx.array] = None,
+        position_ids: Optional[mx.array] = None,
         **kwargs,
     ) -> EmbeddingOutput:
         if attention_mask is None:
@@ -92,8 +93,16 @@ class Model(nn.Module):
             attention_mask = mx.ones_like(input_ids)
         if attention_mask.shape != input_ids.shape:
             raise ValueError("attention_mask must have the same shape as input_ids")
-        embeddings = self.language_model.embed_tokens(input_ids)
-        embeddings = embeddings * self.config.text_config.hidden_size**0.5
+        media_mask = (
+            (input_ids == self.config.image_token_id)
+            | (input_ids == self.config.video_token_id)
+            | (input_ids == self.config.audio_token_id)
+        )
+        text_ids = mx.where(media_mask, self.config.text_config.pad_token_id, input_ids)
+        embeddings = self.language_model.embed_tokens(text_ids)
+        embeddings = embeddings * mx.array(
+            self.config.text_config.hidden_size**0.5, dtype=embeddings.dtype
+        )
         if pixel_values is not None:
             embeddings = self._scatter(
                 embeddings,
@@ -115,7 +124,7 @@ class Model(nn.Module):
                 self.config.audio_token_id,
                 self.get_audio_features(input_features, input_features_mask),
             )
-        hidden_states = self.language_model(embeddings, attention_mask)
+        hidden_states = self.language_model(embeddings, attention_mask, position_ids)
         pooled = mean_pooling(hidden_states, attention_mask)
         return EmbeddingOutput(
             last_hidden_state=hidden_states,

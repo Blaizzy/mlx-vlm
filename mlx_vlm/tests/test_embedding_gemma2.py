@@ -54,6 +54,47 @@ def test_attention_is_bidirectional():
     assert not mx.allclose(first[:, 0], second[:, 0])
 
 
+def test_sliding_attention_includes_window_boundary():
+    mx.random.seed(42)
+    model = Model(tiny_config())
+    # Isolate the first (sliding) layer so the full layer cannot mix distant tokens.
+    model.language_model.layers = model.language_model.layers[:1]
+    baseline = model(mx.array([[1, 2, 3, 4, 5]])).last_hidden_state[:, 0]
+    boundary = model(mx.array([[1, 2, 3, 6, 5]])).last_hidden_state[:, 0]
+    outside = model(mx.array([[1, 2, 3, 4, 6]])).last_hidden_state[:, 0]
+    assert not mx.allclose(baseline, boundary)
+    np.testing.assert_allclose(baseline, outside, atol=1e-6)
+
+
+def test_explicit_position_ids():
+    mx.random.seed(42)
+    model = Model(tiny_config())
+    ids = mx.array([[1, 2, 3]])
+    default = model(ids).last_hidden_state
+    explicit = model(ids, position_ids=mx.array([[0, 1, 2]])).last_hidden_state
+    spaced = model(ids, position_ids=mx.array([[0, 2, 4]])).last_hidden_state
+    np.testing.assert_array_equal(default, explicit)
+    assert not mx.allclose(default, spaced)
+
+
+def test_full_attention_config_defaults_and_index_normalization():
+    config = TextConfig(
+        num_hidden_layers=7,
+        vocab_size=64,
+        hidden_size=16,
+        intermediate_size=32,
+        hidden_size_per_layer_input=8,
+    )
+    model = Model(ModelConfig(text_config=config))
+    assert config.layer_types[-1] == "full_attention"
+    assert model.layers[5].self_attn.head_dim == 512
+    assert model.layers[5].self_attn.num_kv_heads == 1
+    config = tiny_config()
+    config.text_config.per_layer_config = {1: {"head_dim": 16}}
+    config.text_config.__post_init__()
+    assert Model(config).layers[1].self_attn.head_dim == 16
+
+
 def test_media_scatter_preserves_batch_order_and_validates_counts():
     ids = mx.array([[1, 60, 60], [60, 2, 0]])
     embeddings = mx.zeros((2, 3, 4))

@@ -1,21 +1,35 @@
-# EmbeddingGemma 2 (work in progress)
+# EmbeddingGemma 2
 
-Native MLX implementation for `gg-hf-em/embeddinggemma-2`, with a bidirectional
-text encoder, per-layer projections, a 768-dimensional token projection, and
-the shared Gemma 4 vision and audio towers. The model returns token embeddings
-in `last_hidden_state` and normalized, mask-aware mean pooled embeddings in
-`text_embeds`.
+Native MLX embeddings for `gg-hf-em/embeddinggemma-2`: text, images, audio,
+video, and combinations of these modalities in a shared 768-dimensional space.
+The bidirectional encoder uses alternating local/full attention, projection-only
+per-layer inputs, and the Gemma 4 vision and audio towers.
 
-**Reference validation is pending.** The implementation was reconstructed from
-the checkpoint configuration, weight shapes, documentation, and existing Gemma 4
-components. Transformers 5.17.0 and public Transformers main did not contain
-`EmbeddingGemma2Model` or `EmbeddingGemma2Processor` when this port was prepared.
-The source branch providing those classes is required before this implementation
-can be considered verified. The 20 Python examples in the
-[upstream documentation](https://huggingface.co/gg-hf-em/embeddinggemma-2/blob/main/embedding_gemma2_documentation.md)
-have **not** been validated end to end.
+The model returns projected token representations in `last_hidden_state` and
+mask-aware mean-pooled, L2-normalized float32 vectors in `text_embeds`. Prompts
+and media tokens participate in pooling; padding does not.
 
-## Text retrieval
+## Setup
+
+The checkpoint's processor requires the Transformers build supplied in the
+[EmbeddingGemma 2 EAP extras dataset](https://huggingface.co/datasets/gg-hf-em/embeddinggemma-2-eap-extras).
+Install that wheel in your MLX-VLM environment:
+
+```sh
+hf download gg-hf-em/embeddinggemma-2-eap-extras \
+  transformers-5.18.0.dev0-py3-none-any.whl --repo-type dataset \
+  --revision f6c512df20896fd06f85d39db10c45a0a9849ef8 \
+  --local-dir embeddinggemma2-extras
+python -m pip install embeddinggemma2-extras/transformers-5.18.0.dev0-py3-none-any.whl
+```
+
+Audio/video preprocessing also needs the upstream optional dependencies, including
+`torchaudio`, `librosa`, `soundfile`, and `torchcodec`, with a compatible FFmpeg
+installation. On macOS with Homebrew FFmpeg 8, set
+`DYLD_LIBRARY_PATH="$(brew --prefix ffmpeg@8)/lib"` when launching Python if
+TorchCodec cannot locate the FFmpeg libraries.
+
+## Text retrieval and Matryoshka embeddings
 
 ```python
 import mlx.core as mx
@@ -36,53 +50,118 @@ inputs = tokenizer(
     padding=True,
     return_tensors="np",
 )
-output = model(**{key: mx.array(value) for key, value in inputs.items()})
-embeddings = output.text_embeds
+embeddings = model(**{key: mx.array(value) for key, value in inputs.items()}).text_embeds
 print(embeddings[:1] @ embeddings[1:].T)
 
-# Matryoshka prefixes must be normalized again after truncation.
+# Use the same dimension for queries and documents: 128, 256, 512, or 768.
 embeddings = embeddings[:, :256]
 embeddings /= mx.linalg.norm(embeddings, axis=-1, keepdims=True)
 ```
 
-The forward method also accepts `pixel_values`, `image_position_ids`,
-`pixel_values_videos`, `video_position_ids`, `input_features`, and
-`input_features_mask`. These must be paired with the corresponding expanded
-media placeholders in `input_ids`; mismatched media token counts raise an error.
-Use the upstream EmbeddingGemma2 processor once its implementation is available.
+Task prompts are optional. The checkpoint's `config_sentence_transformers.json`
+contains the prompt catalog. For native MLX calls, prepend the chosen prompt to
+plain text or supply it as a system message to the processor. Sentence
+Transformers itself runs the reference PyTorch model.
 
-## Selective tower loading
+## Multimodal inputs
+
+Use the upstream processor to expand media placeholders, compute patch positions
+and audio features, and sample video frames. Convert its NumPy tensors to MLX:
+
+```python
+import mlx.core as mx
+from mlx_vlm import load
+
+model, processor = load("gg-hf-em/embeddinggemma-2")
+conversations = [
+    [
+        {"role": "system", "content": "title: none | text: "},
+        {"role": "user", "content": [
+            {"type": "text", "text": "A photo of a cat"},
+            {"type": "image", "url": "cat.jpg"},
+        ]},
+    ],
+    [{"role": "user", "content": [{"type": "audio", "url": "speech.wav"}]}],
+    [{"role": "user", "content": [{"type": "video", "url": "sample_video.mp4"}]}],
+]
+inputs = processor.apply_chat_template(
+    conversations, tokenize=True, return_dict=True, return_tensors="np"
+)
+embeddings = model(**{key: mx.array(value) for key, value in inputs.items()}).text_embeds
+print(embeddings.shape)  # (3, 768)
+```
+
+The processor preserves content order and supports manual `<|image|>`,
+`<|audio|>`, and `<|video|>` placeholders for interleaving. Direct `processor(...)`
+calls support media-only and nested per-sample inputs. Pass `max_soft_tokens`
+(70, 140, 280, 560, or 1120) to control visual budgets; video also accepts `fps`,
+`max_frames`, `overflow_strategy`, and `add_timestamps`, as described in the
+[upstream documentation](https://huggingface.co/gg-hf-em/embeddinggemma-2/blob/main/embedding_gemma2_documentation.md).
+Mismatched expanded media-token and feature counts raise an error.
+
+## Selective tower loading and conversion
 
 ```python
 from mlx_vlm.utils import load_config
 
 config = load_config(path)
 config["audio_config"] = None
-config["vision_config"] = None
+config["vision_config"] = None  # Omit this assignment to retain images/video.
 text_model = load_embedding_model(path, config=config)
 ```
 
-Omitted tower weights are discarded during sanitization. Converted MLX convolution
-weights are accepted without applying the PyTorch-to-MLX transpose a second time.
+Unused tower weights are discarded during loading. The complete checkpoint can
+also be converted and reloaded with the standard CLI:
 
-## Validation completed so far
+```sh
+mlx_vlm.convert --hf-path gg-hf-em/embeddinggemma-2 \
+  --mlx-path embeddinggemma2-mlx --dtype bfloat16
+```
 
-- Downloaded checkpoint revision `fc77679a26fcb86250765859d04ce2fcc6cb0b2c` and
-  loaded all weights with strict checking on an Apple M5 Max.
-- Text retrieval smoke test: the documented Mars passage ranks above Venus
-  (cosine similarities approximately 0.853 and 0.677 with the BF16 checkpoint).
-- A manually prepared text/image/audio/video batch produces four finite,
-  normalized 768-dimensional embeddings. This checks the model tensor interface,
-  not the unavailable EmbeddingGemma2 processor.
-- Unit tests cover padding, bidirectional attention, media placement, disabled
-  towers, sanitization idempotence, and strict checkpoint reloads.
+Both `load_embedding_model` and `mlx_vlm.load` accept the converted directory.
 
-Still required: comparison against the actual EmbeddingGemma2 reference,
-confirmation of text attention/PLE semantics, all upstream Sentence Transformers
-and AutoModel examples, processor ordering and video sampling controls, and
-conversion through the complete model/processor loader.
+## Reference validation
 
-Run the focused regression tests with:
+Validation uses checkpoint revision `fc77679a26fcb86250765859d04ce2fcc6cb0b2c`,
+extras revision `f6c512df20896fd06f85d39db10c45a0a9849ef8`, and the supplied
+Transformers 5.18.0.dev0 reference on CPU. The reference always runs in float32;
+MLX runs on an Apple M5 Max with float32 or BF16 weights/activations.
+
+All **20 Python examples pass in both precisions**, with **32 paired forward
+comparisons per precision**. This covers both Sentence Transformers and AutoModel
+examples: retrieval, prompts, Matryoshka, single/composed modalities, ordering,
+manual interleaving, heterogeneous batches, selective towers, image budgets,
+video sampling/timestamps, and direct/nested processor calls. Processor-only
+examples are additionally forwarded through both models. All 128/256/512 prefixes
+are compared after renormalization on every forward pass.
+
+| MLX precision vs float32 reference | Max embedding absolute error | Min embedding cosine | Max token relative L2 error |
+| --- | ---: | ---: | ---: |
+| Float32 | 5.79e-07 | 0.99999999999 | 3.58e-05 |
+| BF16 | 0.00271 | 0.99979058879 | 0.167 |
+
+Unnormalized token states are more sensitive to BF16 rounding than the normalized
+sentence embeddings. Float32 comparisons disable MLX's default TF32 matmul on M5
+(`MLX_ENABLE_TF32=0`); the library does not change users' precision settings.
+BF16 conversion/reload produces bit-identical embeddings for text, image, audio,
+and video. A heterogeneous BF16 batch versus individual encoding has minimum
+cosine similarity 0.99997.
+
+Reproduce the full documentation comparison (the script downloads the pinned
+checkpoint and sample assets, verifies the documentation hash, and writes JSON):
+
+```sh
+python -m pip install 'sentence-transformers>=6.1' torch torchaudio torchcodec librosa soundfile
+python examples/validate_embedding_gemma2.py --dtype float32 --output-dir validation
+python examples/validate_embedding_gemma2.py --dtype bfloat16 --output-dir validation
+```
+
+The runner only adapts model/media locations and reference execution device/dtype;
+it executes the original example logic. Acceptance thresholds are cosine >=
+0.999999 / 0.999 and embedding max error <= 1e-5 / 0.01 for float32 / BF16,
+respectively; token relative L2 bounds are 1e-4 / 0.2. Unit regressions cover
+bidirectional attention, the inclusive local-window boundary, explicit positions,
+padding, media placement, disabled towers, and checkpoint sanitization/reloading:
 
 ```sh
 python -m pytest -q mlx_vlm/tests/test_embedding_gemma2.py \

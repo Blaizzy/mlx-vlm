@@ -5,6 +5,24 @@ from ..gemma4.language import RMSNormNoScale
 from .config import TextConfig
 
 
+class RotaryEmbedding(nn.Module):
+    """Keep the reference's FP32 angles and activation-dtype cos/sin rounding."""
+
+    def __init__(self, dims, base):
+        super().__init__()
+        self._frequencies = 1.0 / (
+            base ** (mx.arange(0, dims, 2, dtype=mx.float32) / dims)
+        )
+
+    def __call__(self, x, position_ids):
+        angles = position_ids.astype(mx.float32)[..., None] * self._frequencies
+        angles = mx.concatenate([angles, angles], axis=-1)[:, None]
+        cos, sin = mx.cos(angles).astype(x.dtype), mx.sin(angles).astype(x.dtype)
+        half = x.shape[-1] // 2
+        rotated = mx.concatenate([-x[..., half:], x[..., :half]], axis=-1)
+        return x * cos + rotated * sin
+
+
 class Attention(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
@@ -40,19 +58,18 @@ class Attention(nn.Module):
         self.k_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.v_norm = RMSNormNoScale(self.head_dim, eps=config.rms_norm_eps)
         layer_type = config.layer_types[layer_idx]
-        self.rope = nn.RoPE(
+        self.rope = RotaryEmbedding(
             self.head_dim,
-            traditional=False,
             base=config.rope_parameters[layer_type]["rope_theta"],
         )
 
-    def __call__(self, x, mask):
+    def __call__(self, x, mask, position_ids):
         batch, length, _ = x.shape
         q = self.q_norm(self.q_proj(x).reshape(batch, length, self.num_heads, -1))
         k = self.k_norm(self.k_proj(x).reshape(batch, length, self.num_kv_heads, -1))
         v = self.v_norm(self.v_proj(x).reshape(batch, length, self.num_kv_heads, -1))
-        q = self.rope(q.transpose(0, 2, 1, 3))
-        k = self.rope(k.transpose(0, 2, 1, 3))
+        q = self.rope(q.transpose(0, 2, 1, 3), position_ids)
+        k = self.rope(k.transpose(0, 2, 1, 3), position_ids)
         v = v.transpose(0, 2, 1, 3)
         out = mx.fast.scaled_dot_product_attention(q, k, v, scale=1.0, mask=mask)
         return self.o_proj(out.transpose(0, 2, 1, 3).reshape(batch, length, -1))
@@ -130,9 +147,9 @@ class EncoderLayer(nn.Module):
         )
         self.layer_scalar = mx.ones((1,))
 
-    def __call__(self, x, mask, per_layer_input=None):
+    def __call__(self, x, mask, position_ids, per_layer_input=None):
         x = x + self.post_attention_layernorm(
-            self.self_attn(self.input_layernorm(x), mask)
+            self.self_attn(self.input_layernorm(x), mask, position_ids)
         )
         x = x + self.post_feedforward_layernorm(
             self.mlp(self.pre_feedforward_layernorm(x))
@@ -156,12 +173,15 @@ class TextModel(nn.Module):
             config.hidden_size, config.embedding_dim, bias=False
         )
 
-    def __call__(self, inputs_embeds, attention_mask):
+    def __call__(self, inputs_embeds, attention_mask, position_ids=None):
         length = inputs_embeds.shape[1]
         full_mask = attention_mask[:, None, None, :].astype(mx.bool_)
         positions = mx.arange(length)
+        if position_ids is None:
+            position_ids = positions[None]
         sliding_mask = full_mask & (
-            mx.abs(positions[:, None] - positions[None, :]) < self.config.sliding_window
+            mx.abs(positions[:, None] - positions[None, :])
+            <= self.config.sliding_window
         )
         per_layer_inputs = self.ple(inputs_embeds) if self.ple is not None else None
         h = inputs_embeds
@@ -172,6 +192,9 @@ class TextModel(nn.Module):
                 else full_mask
             )
             h = layer(
-                h, mask, None if per_layer_inputs is None else per_layer_inputs[:, :, i]
+                h,
+                mask,
+                position_ids,
+                None if per_layer_inputs is None else per_layer_inputs[:, :, i],
             )
         return self.embedding_projection(self.norm(h))
