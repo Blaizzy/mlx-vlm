@@ -873,11 +873,17 @@ class RuntimeExpertStore(ExpertStore):
     def experts_present(self, layer_id: int) -> bool:
         return layer_id in self._entries
 
-    def _read_expert_rows(self, name: str, j: int):
+    def _pread_array(self, name: str, row: Optional[int] = None):
+        """(numpy, st_dtype) for ``name`` -- one stacked row if ``row`` is set, else the whole tensor."""
         fd, base, shape, np_dt, st_dt = self._mm[name]
-        stride = int(np.prod(shape[1:])) * np.dtype(np_dt).itemsize
-        buf = os.pread(fd, stride, base + j * stride)
-        return np.frombuffer(buf, dtype=np_dt).reshape(shape[1:]), st_dt
+        item = np.dtype(np_dt).itemsize
+        if row is None:
+            nbytes, off, out_shape = int(np.prod(shape)) * item, base, shape
+        else:
+            stride = int(np.prod(shape[1:])) * item
+            nbytes, off, out_shape = stride, base + row * stride, shape[1:]
+        rows = np.frombuffer(os.pread(fd, nbytes, off), dtype=np_dt).reshape(out_shape)
+        return rows, st_dt
 
     def _read_raw(self, layer_id: int, j: int) -> Tuple[dict, dict]:
         """Raw numpy reads for expert ``j``: stacked rows keyed by tensor name, plus whole-tensor per-expert reads keyed by (proj, kind)."""
@@ -885,16 +891,12 @@ class RuntimeExpertStore(ExpertStore):
         rows: dict = {}
         for _, _, _, name in stacked:
             if name not in rows:
-                rows[name] = self._read_expert_rows(name, j)
-        pe: dict = {}
-        for (jj, proj, kind), name in perexpert.items():
-            if jj == j:
-                fd, base, shape, np_dt, st_dt = self._mm[name]
-                buf = os.pread(fd, int(np.prod(shape)) * np.dtype(np_dt).itemsize, base)
-                pe[(proj, kind)] = (
-                    np.frombuffer(buf, dtype=np_dt).reshape(shape),
-                    st_dt,
-                )
+                rows[name] = self._pread_array(name, j)
+        pe = {
+            (proj, kind): self._pread_array(name)
+            for (jj, proj, kind), name in perexpert.items()
+            if jj == j
+        }
         return rows, pe
 
     def _assemble_trip(self, layer_id: int, rows: dict, pe: dict) -> tuple:
@@ -915,12 +917,17 @@ class RuntimeExpertStore(ExpertStore):
         rows, pe = self._read_raw(layer_id, j)
         return self._assemble_trip(layer_id, rows, pe)
 
-    def get(self, layer_id: int, j: int):
-        key = (int(layer_id), int(j))
+    def _take_cached(self, key):
         cached = self._cache.get(key)
         if cached is not None:
             self._cache.move_to_end(key)
             self._hits += 1
+        return cached
+
+    def get(self, layer_id: int, j: int):
+        key = (int(layer_id), int(j))
+        cached = self._take_cached(key)
+        if cached is not None:
             return cached
         self._misses += 1
         trip = self._expert(*key)
@@ -940,10 +947,8 @@ class RuntimeExpertStore(ExpertStore):
         misses = []
         for j in needed:
             j = int(j)
-            cached = self._cache.get((lid, j))
+            cached = self._take_cached((lid, j))
             if cached is not None:
-                self._cache.move_to_end((lid, j))
-                self._hits += 1
                 out[j] = cached
             else:
                 self._misses += 1
