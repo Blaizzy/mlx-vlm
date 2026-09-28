@@ -60,8 +60,10 @@ def _st_header(path: str) -> Tuple[int, dict]:
 
 # stacked: switch_mlp.gate_proj.weight [E,out,in]; per-expert: experts.{j}.gate_proj.weight;
 # stacked-fused: switch_mlp.gate_up_proj.weight [E,2*out,in], gate = first half of axis 1.
-_PROJ = r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight|scales|biases)$"
-_FUSED_PROJ = r"gate_up_proj\.(?P<kind>weight|scales|biases)$"
+# kind is optional: bf16 fused-expert checkpoints (Qwen3.5/3.6-MoE) name the
+# stacked tensor bare (``experts.gate_up_proj``, no ``.weight``); default to weight.
+_PROJ = r"(?P<proj>gate_proj|up_proj|down_proj)(?:\.(?P<kind>weight|scales|biases))?$"
+_FUSED_PROJ = r"gate_up_proj(?:\.(?P<kind>weight|scales|biases))?$"
 PEREXPERT_RE = re.compile(
     r"^(?:.*\.)?layers\.(?P<layer>\d+)\..*?experts\.(?P<j>\d+)\." + _PROJ
 )
@@ -89,7 +91,7 @@ def plan(tensor_names) -> dict:
             continue
         m = PEREXPERT_RE.match(name)
         if m:
-            key = f"e{int(m['j'])}.{m['proj']}.{m['kind']}"
+            key = f"e{int(m['j'])}.{m['proj']}.{m['kind'] or 'weight'}"
             experts.setdefault(int(m["layer"]), []).append((key, name, None))
             continue
         m = STACKED_FUSED_RE.match(name)
@@ -230,14 +232,14 @@ def _expand_expert_layer(entries, get_value) -> Tuple[dict, int]:
             n_experts = max(n_experts, E)
             mm = STACKED_RE.match(src)
             for j in range(E):
-                layer[f"e{j}.{mm['proj']}.{mm['kind']}"] = arr[j]
+                layer[f"e{j}.{mm['proj']}.{mm['kind'] or 'weight'}"] = arr[j]
         elif mode == "STACK_FUSED":
             # gate = first half of axis 1 (the doubled output dim), up = second.
             E = arr.shape[0]
             half = arr.shape[1] // 2
             n_experts = max(n_experts, E)
             mm = STACKED_FUSED_RE.match(src)
-            kind = mm["kind"]
+            kind = mm["kind"] or "weight"
             gate_half, up_half = arr[:, :half, ...], arr[:, half:, ...]
             for j in range(E):
                 layer[f"e{j}.gate_proj.{kind}"] = gate_half[j]
@@ -806,12 +808,13 @@ class RuntimeExpertStore(ExpertStore):
                 mm = self._mm[name][0]
                 if mode == "STACK":
                     m = STACKED_RE.match(name)
-                    stacked.append((m["proj"], m["kind"], "STACK", name))
+                    stacked.append((m["proj"], m["kind"] or "weight", "STACK", name))
                     num_experts = max(num_experts, mm.shape[0])
                 elif mode == "STACK_FUSED":
                     m = STACKED_FUSED_RE.match(name)
-                    stacked.append(("gate_proj", m["kind"], "FUSED_GATE", name))
-                    stacked.append(("up_proj", m["kind"], "FUSED_UP", name))
+                    kind = m["kind"] or "weight"
+                    stacked.append(("gate_proj", kind, "FUSED_GATE", name))
+                    stacked.append(("up_proj", kind, "FUSED_UP", name))
                     num_experts = max(num_experts, mm.shape[0])
                 else:
                     j, proj, kind = key[1:].split(".")
