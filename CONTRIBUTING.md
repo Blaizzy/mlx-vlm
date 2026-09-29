@@ -56,10 +56,23 @@ Getting this wrong fails in two ways. A shape-changing conversion applied twice
 dies loudly at weight-load; a value-changing one (a norm shift, a scale rewrite)
 loads fine and generates garbage.
 
-Additionally, add a small configuration for the new model type to the [model
-cases](mlx_vlm/tests/model_cases.json), using the existing checks in
-[test_models.py](mlx_vlm/tests/test_models.py). For sanitizer changes, verify
-that a second pass preserves the weight keys, shapes, and values.
+Additionally, register the new model type with the case file that matches it,
+using the existing checks in the test module beside it. For sanitizer changes,
+verify that a second pass preserves the weight keys, shapes, and values — the
+`sanitize` check does this for you.
+
+| the model | case file | checks |
+|---|---|---|
+| generates text (has a language model) | [model_cases.json](mlx_vlm/tests/model_cases.json) | [test_models.py](mlx_vlm/tests/test_models.py) |
+| generates images | [image_generation_cases.json](mlx_vlm/tests/image_generation_cases.json) | [test_image_generation_models.py](mlx_vlm/tests/test_image_generation_models.py) |
+| extracts depth, geometry, masks or spans | [extraction_cases.json](mlx_vlm/tests/extraction_cases.json) | [test_extraction_models.py](mlx_vlm/tests/test_extraction_models.py) |
+
+The last two key their cases by check rather than by model
+(`checks: {name: [case, ...]}`), because these models share no common
+`__call__`: a named adapter builds the inputs for each call shape. Put case
+data in the JSON and keep anything numeric — reference implementations,
+tolerances — in Python. A contract a model cannot satisfy yet is recorded with
+an `"xfail"` reason rather than left out, so it starts failing once fixed.
 
 From the repository root, you can run the tests with:
 
