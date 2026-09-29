@@ -192,11 +192,13 @@ class Model(nn.Module):
             images_in_this_batch = []
             for jdx in range(images_spatial_crop.shape[1]):
                 # Extract global & local features
-                num_width_tiles, num_height_tiles = images_spatial_crop[idx, jdx]
+                num_width_tiles, num_height_tiles = (
+                    int(dim) for dim in images_spatial_crop[idx, jdx]
+                )
                 if num_width_tiles == 0 or num_height_tiles == 0:
                     break
 
-                num_tiles_in_image = (num_width_tiles * num_height_tiles).tolist()
+                num_tiles_in_image = num_width_tiles * num_height_tiles
 
                 # Get global features [hw, D]
                 global_features = images_embeds[tile_index]
