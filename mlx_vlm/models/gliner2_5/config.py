@@ -1,4 +1,4 @@
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
 from ..base import BaseModelConfig
@@ -45,9 +45,6 @@ class ModelConfig(BaseModelConfig):
         params = dict(params or {})
         params["model_type"] = "gliner2_5"
         return super().from_dict(params)
-
-    def to_dict(self):
-        return asdict(self)
 
 
 __all__ = ["EncoderConfig", "ModelConfig"]

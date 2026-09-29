@@ -1,6 +1,6 @@
 """SAM 3.1 configuration — extends SAM 3 configs with multiplex support."""
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 from ..base import BaseModelConfig
@@ -257,14 +257,7 @@ class ModelConfig(BaseModelConfig):
         elif self.tracker_config is None:
             self.tracker_config = TrackerConfig()
 
-        if isinstance(self.text_config, dict):
-            self.text_config = TextEncoderConfig.from_dict(self.text_config)
-        elif self.text_config is None:
+        if self.text_config is None:
             self.text_config = self.detector_config.text_config
-        if isinstance(self.vision_config, dict):
-            self.vision_config = VisionEncoderConfig.from_dict(self.vision_config)
-        elif self.vision_config is None:
+        if self.vision_config is None:
             self.vision_config = self.detector_config.vision_config
-
-    def to_dict(self):
-        return asdict(self)

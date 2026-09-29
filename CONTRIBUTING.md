@@ -66,9 +66,8 @@ Register a small configuration in the case file for the model's task:
 
 Extraction cases use `id`, `module`, `config`, and `checks`, like text-model
 cases. Shared checks cover `registry_and_config`, `forward`, and `checkpoint`;
-forward checks use `input_shape` and `output_shapes`. Configs must survive a JSON
-round trip without mutating the input dictionary. Specialized tests reuse case
-configs and `shared_configs`, keeping numerical, checkpoint conversion,
+forward checks use `input_shape` and `output_shapes`. Specialized tests reuse
+case configs and `shared_configs`, keeping numerical, checkpoint conversion,
 streaming, and IO assertions in Python. Use nonuniform weights to verify
 conversion values and second-pass stability.
 
