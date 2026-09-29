@@ -64,6 +64,7 @@ MODEL_CONFIG = {
     "dots_ocr": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "ernie4_5_moe_vl": MessageFormat.LIST_WITH_IMAGE_URL_FIRST,
     "internvl_chat": MessageFormat.LIST_WITH_IMAGE_TYPE,
+    "internvl": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "llmjpvl": MessageFormat.IMAGE_TOKEN,
     "nemotron_h_nano_omni": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "nemotronh_nano_omni_reasoning_v3": MessageFormat.LIST_WITH_IMAGE_TYPE,
@@ -117,6 +118,7 @@ MODEL_CONFIG = {
     "laguna": MessageFormat.TEXT_ONLY,
     "nemotron_labs_diffusion": MessageFormat.TEXT_ONLY,
     "deepseek_v4": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "deepseek_v41": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "hrm_text": MessageFormat.TEXT_ONLY,
     "minimax_m3": MessageFormat.TEXT_ONLY,
     "qwen3_5_text": MessageFormat.TEXT_ONLY,
@@ -468,7 +470,8 @@ class MessageFormatter:
             content = image_tokens + content if image_first else content + image_tokens
 
         if role == "user" and not skip_audio_token and num_audios > 0:
-            content = content + [MessageBuilder.audio_message()] * num_audios
+            audio_tokens = [MessageBuilder.audio_message()] * num_audios
+            content = audio_tokens + content if image_first else content + audio_tokens
 
         return {"role": role, "content": content}
 
@@ -1102,5 +1105,8 @@ def apply_chat_template(
     # Some models only need the last message
     if model_type in ["paligemma", "florence2", "falcon_ocr"]:
         return messages[-1]
+
+    if model_type == "qwen3_omni_moe" and "enable_thinking" not in kwargs:
+        kwargs["enable_thinking"] = True
 
     return get_chat_template(processor, messages, add_generation_prompt, **kwargs)

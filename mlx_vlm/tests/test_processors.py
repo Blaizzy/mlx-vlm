@@ -628,12 +628,10 @@ def test_auto_processor_routes_to_custom_loader(
         assert (
             AutoProcessor.from_pretrained(tmp_path, trust_remote_code=False) is sentinel
         )
-    loader.assert_called_once_with(tmp_path, trust_remote_code=False)
-    if model_type in ("hunyuan_vl", "qwen4_exp"):
-        assert isinstance(AutoProcessor.from_pretrained(tmp_path), cls)
-    else:
-        with pytest.raises(ValueError, match="Unrecognized processing class"):
-            AutoProcessor.from_pretrained(tmp_path)
+        loader.assert_called_once_with(tmp_path, trust_remote_code=False)
+        loader.reset_mock()
+        assert AutoProcessor.from_pretrained(tmp_path) is sentinel
+        loader.assert_called_once_with(tmp_path, trust_remote_code=True)
 
 
 def test_qwen3_5_moe_text_stale_vl_processor_loads_tokenizer(tmp_path):
@@ -1604,6 +1602,7 @@ def test_extract_text_from_content(content, expected):
     [
         ("nemotron_h_nano_omni", "image-audio"),
         ("nemotronh_nano_omni_reasoning_v3", "image-audio"),
+        ("qwen3_omni_moe", "qwen-image-audio"),
         ("gemma4_unified", "video-audio"),
         ("prism_hadamard_qwen35", "image-video"),
         ("step3p7", "patch"),
@@ -1621,6 +1620,7 @@ def test_prompt_media_format(family, kind):
     text_part = dict(type="text", text=text, content=text)
     expected = {
         "image-audio": [dict(type="image"), text_part, dict(type="audio")],
+        "qwen-image-audio": [dict(type="audio"), dict(type="image"), text_part],
         "video-audio": [
             dict(type="video", video="clip.mp4", max_pixels=224 * 224, fps=1),
             dict(type="audio"),
@@ -1739,12 +1739,17 @@ class TestApplyChatTemplateIntegration:
         rendered = apply_chat_template(None, dict(model_type="qwen3_vl"), [message])
         assert rendered == "before <image>"
 
-    def test_deepseek_processor_preserves_inline_image_position(self):
+    @pytest.mark.parametrize(
+        "family,separator", [("deepseek", ""), ("deepseek41", "\n\n")]
+    )
+    def test_deepseek_processor_preserves_inline_image_position(
+        self, family, separator
+    ):
         tokenizer = PreTrainedTokenizerFast(
             tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]")),
             unk_token="[UNK]",
         )
-        processor = c.deepseek(tokenizer)
+        processor = getattr(c, family)(tokenizer)
         message = dict(
             role="user",
             content=[
@@ -1753,10 +1758,11 @@ class TestApplyChatTemplateIntegration:
                 dict(type="text", text="after"),
             ],
         )
+        model_type = "deepseek_v4" if family == "deepseek" else "deepseek_v41"
         rendered = apply_chat_template(
-            processor, dict(model_type="deepseek_v4"), message, num_images=1
+            processor, dict(model_type=model_type), message, num_images=1
         )
-        assert "before<｜deepseek_image｜>after" in rendered
+        assert f"before{separator}<｜deepseek_image｜>{separator}after" in rendered
 
     @pytest.mark.parametrize(
         "family,expected",
@@ -1908,6 +1914,18 @@ def test_apply_chat_template_preserves_explicit_thinking_enabled():
 
     assert processor.kwargs["enable_thinking"] is True
     assert result.endswith("<think>\n")
+
+
+def test_qwen3_omni_enables_thinking_by_default():
+    processor = MagicMock(chat_template="{{ messages }}")
+    processor.apply_chat_template.return_value = "prompt"
+
+    result = apply_chat_template(
+        processor, {"model_type": "qwen3_omni_moe"}, "Describe this image."
+    )
+
+    assert result == "prompt"
+    assert processor.apply_chat_template.call_args.kwargs["enable_thinking"] is True
 
 
 def test_apply_chat_template_maps_enable_thinking_for_thinking_mode_templates():
