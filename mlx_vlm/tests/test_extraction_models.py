@@ -53,6 +53,26 @@ from mlx_vlm.token_classification import (
 from mlx_vlm.utils import get_model_and_args, load_config
 
 
+def sync_trap():
+    """Context that fails on any host <-> device synchronization.
+
+    Shared by every model whose ``infer`` promises to only build a graph.
+    """
+    from contextlib import ExitStack
+    from unittest import mock
+
+    def boom(*args, **kwargs):
+        raise AssertionError("host sync during graph construction")
+
+    stack = ExitStack()
+    for name in ("eval", "async_eval", "synchronize"):
+        stack.enter_context(mock.patch.object(mx, name, boom))
+    for name in ("tolist", "item", "__bool__", "__float__", "__int__"):
+        if hasattr(mx.array, name):
+            stack.enter_context(mock.patch.object(mx.array, name, boom))
+    return stack
+
+
 def test_checkpoint_key_sanitization():
     weights = {
         "encoder.embeddings.LayerNorm.weight": mx.ones((4,)),
@@ -752,19 +772,6 @@ class TestSapiens2(unittest.TestCase):
     def _image(h=40, w=30):
         return np.random.default_rng(0).integers(0, 255, (h, w, 3), np.uint8)
 
-    def test_registry_exposes_model(self):
-        """The package resolves through the shared loader like other models."""
-        import dataclasses
-
-        from mlx_vlm.utils import get_model_and_args
-
-        model_module, model_type = get_model_and_args({"model_type": "sapiens2"})
-        self.assertEqual(model_type, "sapiens2")
-        config = model_module.ModelConfig.from_dict(
-            dataclasses.asdict(self._tiny_config())
-        )
-        self.assertIsInstance(model_module.Model(config), model_module.Model)
-
     def test_config_from_hf_dict(self):
         """from_dict parses an official-style config.json (nested head_config,
         unknown keys ignored, num_labels from id2label)."""
@@ -1231,22 +1238,6 @@ class TestSapiens2(unittest.TestCase):
         self.assertEqual((got.shape, got.dtype), ((40, 30, 3), mx.uint8))
         self.assertIs(to_array(got), got)
 
-    def _sync_trap(self):
-        """Context that fails on any host <-> device synchronization."""
-        from contextlib import ExitStack
-        from unittest import mock
-
-        def boom(*args, **kwargs):
-            raise AssertionError("host sync during graph construction")
-
-        stack = ExitStack()
-        for name in ("eval", "async_eval", "synchronize"):
-            stack.enter_context(mock.patch.object(mx, name, boom))
-        for name in ("tolist", "item", "__bool__", "__float__", "__int__"):
-            if hasattr(mx.array, name):
-                stack.enter_context(mock.patch.object(mx.array, name, boom))
-        return stack
-
     def test_infer_builds_graphs_without_host_sync(self):
         """Every task's ``infer`` only builds a graph: no eval, item or
         tolist on the way, including the first call (weight relayouts,
@@ -1261,7 +1252,7 @@ class TestSapiens2(unittest.TestCase):
         ]
         for task, head, labels, kw in cases:
             predictor = self._predictor(task, head, labels, **kw)
-            with self._sync_trap():
+            with sync_trap():
                 first = predictor.infer(image)
                 second = predictor.infer(mx.array(image))
             mx.eval(first, second)  # and the graphs are valid

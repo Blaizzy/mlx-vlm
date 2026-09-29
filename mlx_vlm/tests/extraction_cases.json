@@ -66,6 +66,28 @@
         "model_type": "sam3d_body",
         "config": {},
         "xfail": "ModelConfig.to_dict() leaves nested VisionConfig/TextConfig as objects, so from_dict(to_dict()) raises and the dict is not JSON-serializable"
+      },
+      {
+        "id": "sapiens2",
+        "module": "sapiens2",
+        "model_type": "sapiens2",
+        "config": {
+          "architectures": [
+            "Sapiens2Model"
+          ],
+          "hidden_size": 64,
+          "num_hidden_layers": 3,
+          "num_attention_heads": 4,
+          "num_first_full_attention_layers": 1,
+          "num_last_full_attention_layers": 1,
+          "intermediate_size": 128,
+          "image_size": [
+            32,
+            24
+          ],
+          "patch_size": 8,
+          "num_register_tokens": 2
+        }
       }
     ],
     "forward": [
@@ -146,6 +168,47 @@
           28,
           28
         ]
+      },
+      {
+        "id": "sapiens2-backbone",
+        "module": "sapiens2",
+        "adapter": "pixel_values",
+        "config": {
+          "architectures": [
+            "Sapiens2Model"
+          ],
+          "hidden_size": 64,
+          "num_hidden_layers": 3,
+          "num_attention_heads": 4,
+          "num_first_full_attention_layers": 1,
+          "num_last_full_attention_layers": 1,
+          "intermediate_size": 128,
+          "image_size": [
+            32,
+            24
+          ],
+          "patch_size": 8,
+          "num_register_tokens": 2
+        },
+        "input": {
+          "shape": [
+            1,
+            32,
+            24,
+            3
+          ]
+        },
+        "expected": {
+          "last_hidden_state": [
+            1,
+            15,
+            64
+          ],
+          "pooler_output": [
+            1,
+            64
+          ]
+        }
       }
     ],
     "sanitize": [
@@ -184,6 +247,27 @@
           ],
           "num_frames": 4,
           "norm_num_groups": 8
+        }
+      },
+      {
+        "id": "sapiens2-idempotent",
+        "module": "sapiens2",
+        "config": {
+          "architectures": [
+            "Sapiens2Model"
+          ],
+          "hidden_size": 64,
+          "num_hidden_layers": 3,
+          "num_attention_heads": 4,
+          "num_first_full_attention_layers": 1,
+          "num_last_full_attention_layers": 1,
+          "intermediate_size": 128,
+          "image_size": [
+            32,
+            24
+          ],
+          "patch_size": 8,
+          "num_register_tokens": 2
         }
       }
     ]
