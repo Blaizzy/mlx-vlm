@@ -1179,24 +1179,16 @@ class TestSAM3DObjects(unittest.TestCase):
         (root / "model.safetensors.index.json").write_text(json.dumps(index))
         return root
 
-    def test_config_routes_and_round_trips(self):
-        """The shared loader resolves the package; ``depth_model`` is None, a
-        MoGe-3 configuration (``{}`` selects the released ViT-L one) that
-        survives ``to_dict``/``from_dict``, or a rejected MoGe-v1 flag."""
-        from mlx_vlm.models import sam3d_objects
-        from mlx_vlm.models.sam3d_objects import ModelConfig
-        from mlx_vlm.utils import get_model_and_args
+    def test_populated_depth_model_survives_a_config_round_trip(self):
+        """A bundle's own MoGe-3 configuration survives ``to_dict``/
+        ``from_dict``, nested dataclasses and all.
 
-        module, model_type = get_model_and_args({"model_type": "sam3d_objects"})
-        self.assertIs(module, sam3d_objects)
-        self.assertEqual(model_type, "sam3d_objects")
-        self.assertIsNone(ModelConfig().depth_model)
-        released = ModelConfig(depth_model={}).depth_model
-        self.assertEqual(released.encoder.backbone, "dinov2_vitl14")
-        self.assertEqual(released.encoder.embed_dim, 1024)
-        # Bundles converted with the retired MoGe-v1 model declared it as true.
-        with self.assertRaisesRegex(ValueError, "MoGe-v1"):
-            ModelConfig.from_dict({"depth_model": True})
+        Loader routing and the ``None`` / ``{}`` / MoGe-v1 cases are
+        ``registry-sam3d_objects`` and ``config-test_config_routes_and_round_trips``;
+        this keeps the part that needs a fully populated depth config.
+        """
+        from mlx_vlm.models.sam3d_objects import ModelConfig
+
         config = self._config(depth_model=self._depth_config())
         self.assertEqual(ModelConfig.from_dict(config.to_dict()), config)
 
@@ -1440,22 +1432,6 @@ class TestSAM3DObjects(unittest.TestCase):
         values, child, parent = pool(mx.full((8, 1), 7.0), Grid(cube, 2))
         self.assertEqual((child.coords.shape, parent.tolist()), ((1, 4), [0] * 8))
         self.assertAlmostEqual(values.item(), 8 * 7 / 9, places=5)
-
-    def test_window_attention_matches_masked_dense_attention(self):
-        """Shifted window attention over sparse voxels equals dense attention
-        masked to voxels sharing a window."""
-        from mlx_vlm.models.sam3d_objects.layers import attend
-        from mlx_vlm.models.sam3d_objects.sparse import Grid, window_attention
-
-        coords = mx.array([[0, i, j, 0] for i in range(4) for j in range(3)])
-        qkv = mx.random.normal((len(coords), 3, 2, 4))
-        grid = Grid(coords, 4)
-        for shift in (0, 1):
-            windows = (coords[:, 1:] + shift) // 2
-            mask = mx.all(windows[:, None] == windows[None, :], axis=-1)[None, None]
-            expected = attend(*(qkv[None, :, i] for i in range(3)), mask=mask)[0]
-            actual = window_attention(qkv, grid, 2, shift)
-            self.assertTrue(mx.allclose(actual, expected, atol=1e-5).item())
 
     def test_prepared_and_guided_conditions_match_plain_calls(self):
         """Per-request condition projection (``prepare_condition``; None is the
@@ -1834,6 +1810,26 @@ class References:
     def conv_transpose_stride2_pad1(layer, x):
         return mx.conv_transpose2d(x, layer.weight, stride=2, padding=1)
 
+    @staticmethod
+    def sparse_window_attention(case):
+        """Shifted window attention over sparse voxels, against dense
+        attention masked to the voxels sharing a window."""
+        from mlx_vlm.models.sam3d_objects.layers import attend
+        from mlx_vlm.models.sam3d_objects.sparse import Grid, window_attention
+
+        rows, cols = case["grid"]
+        size = case["window"]
+        coords = mx.array([[0, i, j, 0] for i in range(rows) for j in range(cols)])
+        qkv = mx.random.normal((len(coords), 3, *case["heads_dim"]))
+        grid = Grid(coords, rows)
+        actual, expected = [], []
+        for shift in case["shifts"]:
+            windows = (coords[:, 1:] + shift) // size
+            mask = mx.all(windows[:, None] == windows[None, :], axis=-1)[None, None]
+            expected.append(attend(*(qkv[None, :, i] for i in range(3)), mask=mask)[0])
+            actual.append(window_attention(qkv, grid, size, shift))
+        return mx.concatenate(actual), mx.concatenate(expected)
+
 
 class ExtractionChecks:
     """Shared contracts for models that do not generate text."""
@@ -1844,13 +1840,12 @@ class ExtractionChecks:
     def registry(self, case):
         """The shared loader resolves the model type and the config round-trips."""
         module = _extraction_module(case)
-        _, model_type = get_model_and_args({"model_type": case["model_type"]})
+        resolved, model_type = get_model_and_args({"model_type": case["model_type"]})
         assert model_type == case["model_type"]
+        assert resolved is module
         assert hasattr(module, "Model") and hasattr(module, "ModelConfig")
 
-        from mlx_vlm.tests.test_models import build_config
-
-        config = build_config(module, case["config"])
+        config = _extraction_config(module, case["config"])
         assert module.ModelConfig.from_dict(config.to_dict()) == config
         if "invalid" in case:
             with pytest.raises(ValueError):
@@ -1916,7 +1911,17 @@ class ExtractionChecks:
 
         ``variants`` re-runs the same comparison with attributes overridden,
         which is how the im2col layers exercise their large-map fallback.
+
+        A case whose two sides both need building names a ``builder`` in
+        ``References`` instead, which returns the pair to compare.
         """
+        if "builder" in case:
+            actual, expected = getattr(References, case["builder"])(case)
+            assert np.allclose(
+                np.array(actual), np.array(expected), atol=case.get("atol", 1e-5)
+            ), case["id"]
+            return
+
         module_path, _, name = case["component"].rpartition(".")
         module = importlib.import_module("mlx_vlm.models." + module_path)
         layer = getattr(module, name)(*case["args"])

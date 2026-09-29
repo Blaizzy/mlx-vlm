@@ -96,6 +96,12 @@
         "module": "openai_privacy_filter",
         "model_type": "openai_privacy_filter",
         "config": {}
+      },
+      {
+        "id": "sam3d_objects",
+        "module": "sam3d_objects",
+        "model_type": "sam3d_objects",
+        "config": {}
       }
     ],
     "forward": [
@@ -643,6 +649,24 @@
           5
         ],
         "zero_weight_gives_zero": true
+      },
+      {
+        "id": "test_window_attention_matches_masked_dense_attention",
+        "builder": "sparse_window_attention",
+        "grid": [
+          4,
+          3
+        ],
+        "window": 2,
+        "shifts": [
+          0,
+          1
+        ],
+        "heads_dim": [
+          2,
+          4
+        ],
+        "atol": 1e-05
       }
     ],
     "config": [
@@ -790,6 +814,31 @@
         "expect_type": {
           "head_config": "HeadConfig"
         }
+      },
+      {
+        "id": "test_config_routes_and_round_trips",
+        "module": "sam3d_objects",
+        "config": {},
+        "expect": {
+          "depth_model": null
+        },
+        "variants": [
+          {
+            "config": {
+              "depth_model": {}
+            },
+            "expect": {
+              "depth_model.encoder.backbone": "dinov2_vitl14",
+              "depth_model.encoder.embed_dim": 1024
+            }
+          },
+          {
+            "from_dict": {
+              "depth_model": true
+            },
+            "raises": "MoGe-v1"
+          }
+        ]
       }
     ],
     "weight_names": [
