@@ -268,7 +268,7 @@
         }
       },
       {
-        "id": "sapiens2-idempotent",
+        "id": "test_sanitize_unifies_mixed_dtypes",
         "module": "sapiens2",
         "config": {
           "architectures": [
@@ -286,6 +286,13 @@
           ],
           "patch_size": 8,
           "num_register_tokens": 2
+        },
+        "mixed_dtype": {
+          "float32_suffixes": [
+            ".bias",
+            "ln1.weight",
+            "ln2.weight"
+          ]
         }
       }
     ],

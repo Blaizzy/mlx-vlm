@@ -1006,21 +1006,6 @@ class TestSapiens2(unittest.TestCase):
         again = model.sanitize(out)
         self.assertEqual(set(again), set(out))
 
-    def test_sanitize_unifies_mixed_dtypes(self):
-        """A bf16 checkpoint with float32 norms/biases loads as all-bf16."""
-        from mlx_vlm.models.sapiens2.sapiens2 import Model
-
-        model = Model(self._tiny_config())
-        weights = {}
-        for k, v in tree_flatten(model.parameters()):
-            keep = k.endswith((".bias", "ln1.weight", "ln2.weight"))
-            weights[k] = v.astype(mx.float32 if keep else mx.bfloat16)
-        out = model.sanitize(weights)
-        self.assertTrue(all(v.dtype == mx.bfloat16 for v in out.values()))
-        # single-dtype checkpoints are left alone
-        out32 = model.sanitize(dict(tree_flatten(model.parameters())))
-        self.assertTrue(all(v.dtype == mx.float32 for v in out32.values()))
-
     def test_attention_matches_unfused_reference(self):
         """Fused qkv + kernel-side GQA + packed full-sequence RoPE equal the
         original formulation (separate projections, repeated kv heads,
@@ -2102,7 +2087,20 @@ class ExtractionChecks:
         assert set(once) == set(converted)
         for key, value in converted.items():
             assert once[key].shape == value.shape, key
+            assert once[key].dtype == value.dtype, key
             assert mx.array_equal(once[key], value).item(), key
+
+        # A checkpoint saved with float32 norms and biases alongside bf16
+        # weights has to come back in one dtype.
+        if "mixed_dtype" in case:
+            suffixes = tuple(case["mixed_dtype"]["float32_suffixes"])
+            mixed = {
+                key: value.astype(mx.float32 if key.endswith(suffixes) else mx.bfloat16)
+                for key, value in converted.items()
+            }
+            assert {v.dtype for v in mixed.values()} == {mx.float32, mx.bfloat16}
+            unified = model.sanitize(mixed)
+            assert {v.dtype for v in unified.values()} == {mx.bfloat16}
 
 
 @pytest.mark.parametrize(
