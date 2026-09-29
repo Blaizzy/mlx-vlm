@@ -12,9 +12,11 @@ from mlx_vlm.generate.image import (
     ImageGenerationRequest,
     ImageGenerationResult,
 )
+from mlx_vlm.generate.image_defaults import ImageSamplingDefaults, image_metadata_path
 
 from .config import read_config
 from .pipeline import LLaDAImagePipeline
+from .scheduler import LLaDAImageScheduler
 
 
 @dataclass
@@ -25,6 +27,20 @@ class LLaDAImageGenerationModel(ImageGenerationModel):
     family: ClassVar[str] = "llada_image"
     pipeline: LLaDAImagePipeline
     model_id: str
+
+    @property
+    def default_sampling(self) -> ImageSamplingDefaults:
+        return ImageSamplingDefaults.from_config(self.pipeline.scheduler)
+
+    @classmethod
+    def resolve_defaults(
+        cls, model: str, *, model_path: Path | None = None
+    ) -> ImageSamplingDefaults:
+        path = image_metadata_path(model, model_path)
+        scheduler = LLaDAImageScheduler(
+            read_config(path / "scheduler/scheduler_config.json")
+        )
+        return ImageSamplingDefaults.from_config(scheduler)
 
     @property
     def variant(self) -> str:
@@ -49,8 +65,9 @@ class LLaDAImageGenerationModel(ImageGenerationModel):
                 "Generation supports text or vq mode; use edit_image for editing"
             )
         seed = 0 if request.seed is None else request.seed
-        steps = request.resolve_steps(self.default_steps)
-        guidance = request.resolve_guidance(self.default_guidance)
+        defaults = self.default_sampling
+        steps = request.resolve_steps(defaults.steps)
+        guidance = request.resolve_guidance(defaults.guidance)
         array = self.pipeline.generate_array(
             request.prompt,
             seed=seed,
@@ -70,8 +87,9 @@ class LLaDAImageGenerationModel(ImageGenerationModel):
         if request.extra.get("generation_mode", "editing") != "editing":
             raise ValueError("Image editing requires generation_mode='editing'")
         seed = 0 if request.seed is None else request.seed
-        steps = request.resolve_steps(self.default_steps)
-        guidance = request.resolve_guidance(self.default_guidance)
+        defaults = self.default_sampling
+        steps = request.resolve_steps(defaults.steps)
+        guidance = request.resolve_guidance(defaults.guidance)
         array = self.pipeline.edit_array(
             request.prompt,
             request.image_paths[0],

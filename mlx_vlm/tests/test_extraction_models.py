@@ -18,13 +18,8 @@ import numpy as np
 import pytest
 from mlx.utils import tree_flatten
 
-from mlx_vlm.gliner import (
-    GLiNER2,
-    _CharSplitter,
-    _resolve_flat_overlaps,
-    _schema_tokens,
-    _WhitespaceSplitter,
-)
+from mlx_vlm.models.bert import ModelConfig as BertConfig
+from mlx_vlm.models.bert import TokenClassificationModel as BertTokenClassifier
 from mlx_vlm.models.gliner2_5 import Model as GlinerModel
 from mlx_vlm.models.gliner2_5 import ModelConfig as GlinerConfig
 from mlx_vlm.models.gliner2_5.boundary import (
@@ -33,9 +28,27 @@ from mlx_vlm.models.gliner2_5.boundary import (
     PooledCandidates,
     SharedPoolScorer,
 )
+from mlx_vlm.models.gliner2_5.gliner2_5 import (
+    _resolve_flat_overlaps,
+    _schema_tokens,
+    _split_words,
+)
 from mlx_vlm.models.openai_privacy_filter import Model as PrivacyModel
 from mlx_vlm.models.openai_privacy_filter import ModelConfig as PrivacyConfig
-from mlx_vlm.privacy_filter import PrivacyFilter
+from mlx_vlm.privacy_filter import (
+    VITERBI_BIAS_KEYS,
+    PrivacyFilter,
+    ViterbiDecoder,
+    _load_transition_biases,
+    load_privacy_filter,
+)
+from mlx_vlm.token_classification import (
+    TokenClassifier,
+    build_label_info,
+    decode_spans,
+    load_token_classification_model,
+    load_token_classifier,
+)
 from mlx_vlm.utils import get_model_and_args, load_config
 
 
@@ -58,8 +71,8 @@ def test_checkpoint_key_sanitization():
 def test_word_splitters_preserve_offsets():
     text = "Email Me@Example.com 北京"
 
-    whitespace = _WhitespaceSplitter()(text)
-    characters = _CharSplitter()(text)
+    whitespace = _split_words(text, "whitespace")
+    characters = _split_words(text, "char")
 
     assert whitespace[1] == ("me@example.com", 6, 20)
     assert characters[-2:] == [("北", 21, 22), ("京", 22, 23)]
@@ -184,9 +197,10 @@ def test_flat_overlap_resolution_keeps_disjoint_spans():
     [(0, {"word_splitter": "bpe"}, "word_splitter"), (4, {}, "special tokens")],
 )
 def test_gliner2_rejects_incompatible_tokenization(added, kwargs, error):
+    model = SimpleNamespace(config=SimpleNamespace(max_len=32))
     tokenizer = SimpleNamespace(add_special_tokens=lambda _: added)
     with pytest.raises(ValueError, match=error):
-        GLiNER2(object(), tokenizer, **kwargs)
+        GlinerModel._prepare(model, tokenizer, "text", (), **kwargs)
 
 
 def test_quantized_encoder_still_runs():
@@ -417,6 +431,261 @@ def test_high_level_api_returns_offsets_and_redacted_text():
     ]
     assert result.redacted_text == ("<PRIVATE_PERSON> emailed <PRIVATE_EMAIL>")
     assert result.to_dict()["spans"][0]["text"] == "Alice"
+
+
+BIO_LABELS = {0: "O", 1: "B-NAME", 2: "I-NAME", 3: "B-PHONE", 4: "I-PHONE"}
+
+
+def _bert_token_config(**overrides):
+    values = {
+        "model_type": "bert",
+        "vocab_size": 64,
+        "hidden_size": 64,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "intermediate_size": 128,
+        "max_position_embeddings": 32,
+        "num_labels": len(BIO_LABELS),
+        "id2label": BIO_LABELS,
+    }
+    values.update(overrides)
+    return values
+
+
+def test_bert_token_classifier_scores_every_token():
+    model = BertTokenClassifier(BertConfig.from_dict(_bert_token_config()))
+    ids = mx.array([[2, 5, 6, 7, 3], [2, 8, 3, 0, 0]], dtype=mx.int32)
+    mask = mx.array([[1, 1, 1, 1, 1], [1, 1, 1, 0, 0]], dtype=mx.int32)
+    logits = model(ids, attention_mask=mask).logits
+    mx.eval(logits)
+    assert logits.shape == (2, 5, len(BIO_LABELS))
+    assert mx.all(mx.isfinite(logits)).item()
+
+    weights = model.sanitize(
+        {
+            "bert.embeddings.word_embeddings.weight": mx.zeros((64, 64)),
+            "bert.pooler.dense.weight": mx.zeros((64, 64)),
+            "cls.predictions.bias": mx.zeros((64,)),
+            "classifier.weight": mx.zeros((5, 64)),
+        }
+    )
+    assert sorted(weights) == [
+        "classifier.weight",
+        "embeddings.word_embeddings.weight",
+    ]
+
+
+BERT_EMBEDDING_PATHS = (
+    "embeddings.word_embeddings",
+    "embeddings.position_embeddings",
+    "embeddings.token_type_embeddings",
+)
+BERT_VOCAB = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]", "call", "at", "mc"]
+BERT_VOCAB += ["##kay", "ada", "-", ",", "617", "555"]
+
+
+def _write_bert_token_checkpoint(root):
+    """Save a mixed-bit (8-bit embeddings, 4-bit linears) BERT token classifier."""
+    from transformers import BertTokenizerFast
+
+    config = _bert_token_config(architectures=["BertForTokenClassification"])
+    model = BertTokenClassifier(BertConfig.from_dict(config))
+    nn.quantize(
+        model,
+        class_predicate=lambda path, module: (
+            {"group_size": 32, "bits": 8}
+            if path in BERT_EMBEDDING_PATHS
+            else (
+                {"group_size": 32, "bits": 4}
+                if isinstance(module, nn.Linear)
+                else False
+            )
+        ),
+    )
+    mx.save_safetensors(
+        str(root / "model.safetensors"), dict(tree_flatten(model.parameters()))
+    )
+    config["id2label"] = {str(k): v for k, v in BIO_LABELS.items()}
+    config["quantization"] = {
+        "group_size": 32,
+        "bits": 4,
+        **{path: {"group_size": 32, "bits": 8} for path in BERT_EMBEDDING_PATHS},
+    }
+    (root / "config.json").write_text(json.dumps(config))
+    (root / "vocab.txt").write_text("\n".join(BERT_VOCAB) + "\n")
+    BertTokenizerFast(vocab_file=str(root / "vocab.txt")).save_pretrained(root)
+    return model
+
+
+def test_mixed_bit_token_classifier_checkpoint_loads(tmp_path):
+    """Per-module quantization overrides must reach the encoder loader.
+
+    Embeddings stored at 8 bits next to 4-bit linears used to be re-quantized
+    with the global 4-bit setting and fail with a packed-shape mismatch.
+    """
+    model = _write_bert_token_checkpoint(tmp_path)
+
+    loaded = load_token_classification_model(tmp_path)
+
+    assert loaded.embeddings.word_embeddings.bits == 8
+    assert loaded.encoder.layer[0].attention.self.query.bits == 4
+    ids = mx.array([[2, 5, 6, 7, 3]], dtype=mx.int32)
+    expected = model(ids).logits
+    actual = loaded(ids).logits
+    assert mx.array_equal(actual, expected).item()
+
+
+def test_privacy_filter_loader_runs_bio_token_classifiers(tmp_path):
+    """``load_privacy_filter`` routes BERT checkpoints to the shared pipeline."""
+    _write_bert_token_checkpoint(tmp_path)
+    text = "call Ada at 617-555, McKay"
+
+    direct = load_token_classifier(tmp_path)
+    routed = load_privacy_filter(str(tmp_path))
+
+    assert type(routed) is TokenClassifier
+    assert (direct.prefix_ids, direct.suffix_ids) == ([2], [3])
+    assert routed(text).to_dict() == direct(text).to_dict()
+    with pytest.raises(ValueError, match="Viterbi"):
+        load_privacy_filter(str(tmp_path), operating_point="high_recall")
+
+
+def test_bio_labels_are_shared_but_viterbi_requires_bioes():
+    info = build_label_info(list(BIO_LABELS.values()))
+    assert info.span_names == ("O", "NAME", "PHONE")
+    assert info.states_by_span["NAME"] == {"B": 1, "I": 2}
+    with pytest.raises(ValueError, match="missing"):
+        ViterbiDecoder(list(BIO_LABELS.values()))
+    with pytest.raises(ValueError, match="expected BIO or BIOES"):
+        build_label_info(["O", "NAME"])
+
+
+def test_token_spans_group_subwords_and_touching_words():
+    """A word is tagged if any piece is: ``Mc`` is ``O`` but ``##Kay`` is a name."""
+    text = "call Mary Ann Smith at 617-555 now, McKay"
+    tokens = [
+        ((0, 4), 0, "O"),
+        ((5, 7), 1, "B-NAME"),
+        ((7, 9), 1, "B-NAME"),
+        ((10, 13), 2, "B-NAME"),
+        ((14, 19), 3, "I-NAME"),
+        ((20, 22), 4, "O"),
+        ((23, 26), 5, "B-PHONE"),
+        ((26, 27), 6, "B-PHONE"),
+        ((27, 30), 7, "I-PHONE"),
+        ((31, 34), 8, "O"),
+        ((34, 35), 9, "O"),
+        ((36, 38), 10, "O"),
+        ((38, 41), 10, "B-NAME"),
+    ]
+    offsets, word_ids, tags = zip(*tokens)
+    label_ids = {label: index for index, label in BIO_LABELS.items()}
+    path = [label_ids[tag] for tag in tags]
+    info = build_label_info(list(BIO_LABELS.values()))
+
+    spans = decode_spans(text, path, offsets, info, word_ids=word_ids)
+    token_level = decode_spans(text, path, offsets, info)
+
+    assert [(span.label, span.text) for span in spans] == [
+        ("NAME", "Mary"),
+        ("NAME", "Ann Smith"),
+        ("PHONE", "617-555"),
+        ("NAME", "McKay"),
+    ]
+    assert [span.text for span in token_level] == [
+        "Ma",
+        "ry",
+        "Ann Smith",
+        "617",
+        "-555",
+        "Kay",
+    ]
+
+
+class _Encoding(dict):
+    def __init__(self, word_ids, **kwargs):
+        super().__init__(**kwargs)
+        self._word_ids = word_ids
+
+    def word_ids(self):
+        return self._word_ids
+
+
+class _WordTokenizer:
+    """One token per whitespace word; capitalized words get id 3."""
+
+    cls_token_id = 101
+    sep_token_id = 102
+
+    def __call__(self, text, **kwargs):
+        words, offsets, start = text.split(), [], 0
+        for word in words:
+            start = text.index(word, start)
+            offsets.append((start, start + len(word)))
+            start += len(word)
+        return _Encoding(
+            list(range(len(words))),
+            input_ids=[3 if word[0].isupper() else 0 for word in words],
+            offset_mapping=offsets,
+        )
+
+
+class _CapitalizedNameModel:
+    def __init__(self):
+        self.config = SimpleNamespace(
+            id2label=BIO_LABELS, num_labels=len(BIO_LABELS), max_position_embeddings=4
+        )
+        self.windows = []
+
+    def eval(self):
+        return self
+
+    def __call__(self, input_ids, attention_mask=None):
+        ids = input_ids[0].tolist()
+        self.windows.append(ids)
+        logits = mx.full((1, len(ids), len(BIO_LABELS)), -10.0)
+        for position, token in enumerate(ids):
+            logits[0, position, 1 if token == 3 else 0] = 10.0
+        return SimpleNamespace(logits=logits)
+
+
+def test_token_classifier_windows_long_inputs_and_redacts():
+    model = _CapitalizedNameModel()
+    classifier = TokenClassifier(model, _WordTokenizer())
+
+    result = classifier("ask Ada and Grace or Linus today")
+
+    assert (classifier.context_size, classifier.window) == (4, 2)
+    assert [len(window) for window in model.windows] == [4, 4, 4, 3]
+    assert all(w[0] == 101 and w[-1] == 102 for w in model.windows)
+    assert [span.text for span in result.spans] == ["Ada", "Grace", "Linus"]
+    assert result.redacted_text == "ask <NAME> and <NAME> or <NAME> today"
+    assert classifier("ask Ada", keep_labels=("NAME",)).redacted_text == "ask Ada"
+    with pytest.raises(ValueError, match="decode must be 'argmax'"):
+        classifier("ask Ada", decode="viterbi")
+
+
+def test_viterbi_calibration_operating_points(tmp_path):
+    assert _load_transition_biases(tmp_path, "default") == dict.fromkeys(
+        VITERBI_BIAS_KEYS, 0.0
+    )
+    biases = {key: float(index) for index, key in enumerate(VITERBI_BIAS_KEYS)}
+    calibration = {"operating_points": {"high_recall": {"biases": biases}}}
+    (tmp_path / "viterbi_calibration.json").write_text(json.dumps(calibration))
+
+    assert _load_transition_biases(tmp_path, "high_recall") == biases
+    with pytest.raises(ValueError, match="operating point"):
+        _load_transition_biases(tmp_path, "default")
+
+
+def test_privacy_filter_keeps_labels_and_rejects_unknown_decode():
+    detector = PrivacyFilter(_PrivacyModel(), _PrivacyTokenizer())
+
+    kept = detector("Alice emailed bob@example.com", keep_labels=("private_email",))
+
+    assert kept.redacted_text == "<PRIVATE_PERSON> emailed bob@example.com"
+    with pytest.raises(ValueError, match="decode must be 'viterbi' or 'argmax'"):
+        detector("Alice emailed bob@example.com", decode="beam")
 
 
 class TestSapiens2(unittest.TestCase):

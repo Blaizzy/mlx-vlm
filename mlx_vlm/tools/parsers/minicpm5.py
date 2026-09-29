@@ -20,7 +20,7 @@ def _argument_properties(name, tools):
 
 
 def _parse_value(value, schema):
-    param_type = schema.get("type")
+    param_type = schema.get("type") if isinstance(schema, dict) else None
     if param_type == "string" or (
         isinstance(param_type, list) and "string" in param_type
     ):

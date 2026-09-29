@@ -44,6 +44,7 @@ from .image import (
     load_image_generation_model,
     load_image_model,
 )
+from .image_defaults import ImageSamplingDefaults, resolve_image_defaults
 from .types import GenerateKwargs, ProcessorLike
 from .video_generation import (
     VideoGenerationModel,
@@ -88,6 +89,8 @@ __all__ = [
     "generate",
     "generate_audio",
     "generate_image",
+    "ImageSamplingDefaults",
+    "resolve_image_defaults",
     "generate_step",
     "generate_video",
     "generation_stream",

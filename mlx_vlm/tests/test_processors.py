@@ -628,12 +628,30 @@ def test_auto_processor_routes_to_custom_loader(
         assert (
             AutoProcessor.from_pretrained(tmp_path, trust_remote_code=False) is sentinel
         )
-    loader.assert_called_once_with(tmp_path, trust_remote_code=False)
-    if model_type in ("hunyuan_vl", "qwen4_exp"):
-        assert isinstance(AutoProcessor.from_pretrained(tmp_path), cls)
-    else:
-        with pytest.raises(ValueError, match="Unrecognized processing class"):
-            AutoProcessor.from_pretrained(tmp_path)
+        loader.assert_called_once_with(tmp_path, trust_remote_code=False)
+        loader.reset_mock()
+        assert AutoProcessor.from_pretrained(tmp_path) is sentinel
+        loader.assert_called_once_with(tmp_path, trust_remote_code=True)
+
+
+def test_qwen3_5_moe_text_stale_vl_processor_loads_tokenizer(tmp_path):
+    importlib.import_module("mlx_vlm.models.qwen3_5_moe_text")
+    _write_configs(tmp_path, config={"model_type": "qwen3_5_moe_text"})
+    vocab = {f"t{i}": i for i in range(32)}
+    backend = Tokenizer(WordLevel(vocab, unk_token="t0"))
+    backend.pre_tokenizer = Whitespace()
+    PreTrainedTokenizerFast(
+        tokenizer_object=backend, unk_token="t0", eos_token="t1"
+    ).save_pretrained(tmp_path)
+    tokenizer_config = tmp_path / "tokenizer_config.json"
+    data = json.loads(tokenizer_config.read_text())
+    data["processor_class"] = "Qwen3VLProcessor"
+    tokenizer_config.write_text(json.dumps(data))
+
+    processor = load_processor(tmp_path, eos_token_ids=[1])
+
+    assert not hasattr(processor, "image_processor")
+    assert processor.encode("t3 t4", add_special_tokens=False) == [3, 4]
 
 
 class _ImageStub:
@@ -736,6 +754,22 @@ def test_processor_mlx_outputs(name, with_image):
     _assert_all_mx(result, *(["pixel_values"] if with_image else []))
     if name == "mllama" and with_image:
         assert "cross_attention_mask" in result
+
+
+def test_gemma3n_batches_images_and_audio():
+    processor = _make_processor("gemma3n")
+    processor.feature_extractor = Mock(return_value={"input_features": [[0.0]] * 2})
+    images = [_make_image(), _make_image()]
+
+    result = processor(
+        text=["<image><audio>one", "<image><audio>two"],
+        images=images,
+        audio=[[0.0], [0.0]],
+        padding=True,
+    )
+
+    assert result["input_ids"].shape[0] == 2
+    assert processor.tokenizer.last_kwargs["padding"] is True
 
 
 def test_unlimited_ocr_default_chat_template_omits_trailing_space():
@@ -1568,6 +1602,7 @@ def test_extract_text_from_content(content, expected):
     [
         ("nemotron_h_nano_omni", "image-audio"),
         ("nemotronh_nano_omni_reasoning_v3", "image-audio"),
+        ("qwen3_omni_moe", "qwen-image-audio"),
         ("gemma4_unified", "video-audio"),
         ("prism_hadamard_qwen35", "image-video"),
         ("step3p7", "patch"),
@@ -1585,6 +1620,7 @@ def test_prompt_media_format(family, kind):
     text_part = dict(type="text", text=text, content=text)
     expected = {
         "image-audio": [dict(type="image"), text_part, dict(type="audio")],
+        "qwen-image-audio": [dict(type="audio"), dict(type="image"), text_part],
         "video-audio": [
             dict(type="video", video="clip.mp4", max_pixels=224 * 224, fps=1),
             dict(type="audio"),
@@ -1648,6 +1684,156 @@ class TestApplyChatTemplateIntegration:
     These tests verify the actual bug fix works end-to-end, not just the helper.
     Uses return_messages=True to inspect intermediate messages without mocking.
     """
+
+    @pytest.mark.parametrize(
+        "family,markers",
+        [
+            ("deepseek_v4", ("<image>", "<image>")),
+            ("qwen3_vl", ("<image>", "<image>")),
+            ("ernie4_5_moe_vl", ("<image>", "<image>")),
+            ("internvl_chat", ("<image>", "<image>")),
+            ("gemma4", ("<image>", "<image>")),
+            ("step3p7", ("<im_patch>", "<im_patch>")),
+            ("gemma3", ("<start_of_image>", "<start_of_image>")),
+            ("phi4mm", ("<|image_1|>", "<|image_2|>")),
+        ],
+    )
+    @pytest.mark.parametrize("representation", ["dict", "list", "pydantic"])
+    def test_interleaved_images_reach_renderer(self, family, markers, representation):
+        from pydantic import BaseModel
+
+        class Message(BaseModel):
+            role: str
+            content: list
+
+        message = dict(
+            role="user",
+            content=[
+                dict(type="input_text", text="before "),
+                dict(
+                    type="image_url", image_url=dict(url="data:image/png;base64,FIRST")
+                ),
+                dict(type="text", text=" between "),
+                dict(type="input_image", image_url="data:image/png;base64,SECOND"),
+                dict(type="text", text=" after"),
+            ],
+        )
+        original = deepcopy(message)
+        prompt = (
+            message
+            if representation == "dict"
+            else [Message(**message)] if representation == "pydantic" else [message]
+        )
+        normalized = apply_chat_template(
+            None, dict(model_type=family), prompt, num_images=2, return_messages=True
+        )
+        assert "base64" not in str(normalized)
+        rendered = get_chat_template(None, normalized, add_generation_prompt=True)
+        assert rendered == f"before {markers[0]} between {markers[1]} after"
+        assert message == original
+
+    def test_explicit_images_without_side_channel_count(self):
+        message = dict(
+            role="user", content=[dict(type="text", text="before "), dict(type="image")]
+        )
+        rendered = apply_chat_template(None, dict(model_type="qwen3_vl"), [message])
+        assert rendered == "before <image>"
+
+    @pytest.mark.parametrize(
+        "family,separator", [("deepseek", ""), ("deepseek41", "\n\n")]
+    )
+    def test_deepseek_processor_preserves_inline_image_position(
+        self, family, separator
+    ):
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]")),
+            unk_token="[UNK]",
+        )
+        processor = getattr(c, family)(tokenizer)
+        message = dict(
+            role="user",
+            content=[
+                dict(type="text", text="before"),
+                dict(type="image_url", image_url=dict(url="x")),
+                dict(type="text", text="after"),
+            ],
+        )
+        model_type = "deepseek_v4" if family == "deepseek" else "deepseek_v41"
+        rendered = apply_chat_template(
+            processor, dict(model_type=model_type), message, num_images=1
+        )
+        assert f"before{separator}<｜deepseek_image｜>{separator}after" in rendered
+
+    @pytest.mark.parametrize(
+        "family,expected",
+        [
+            ("qwen3_vl", "<image> before <image> after"),
+            ("qwen2_vl", "before <image> after<image>"),
+            ("phi4mm", "<|image_1|>before <|image_2|> after"),
+        ],
+    )
+    def test_extra_side_channel_images_keep_default_placement(self, family, expected):
+        message = dict(
+            role="user",
+            content=[
+                dict(type="text", text="before "),
+                dict(type="image"),
+                dict(type="text", text=" after"),
+            ],
+        )
+        assert (
+            apply_chat_template(None, dict(model_type=family), message, num_images=2)
+            == expected
+        )
+
+    def test_interleaved_images_keep_side_channel_audio_and_video(self):
+        message = dict(
+            role="user",
+            content=[
+                dict(type="text", text="before"),
+                dict(type="image"),
+                dict(type="text", text="after"),
+            ],
+        )
+        result = apply_chat_template(
+            None,
+            dict(model_type="qwen3_vl"),
+            message,
+            num_images=1,
+            num_audios=1,
+            video="clip.mp4",
+            return_messages=True,
+        )
+        parts = result[0]["content"]
+        assert [part["type"] for part in parts] == [
+            "video",
+            "audio",
+            "text",
+            "image",
+            "text",
+        ]
+        assert parts[2]["text"] == "before" and parts[4]["text"] == "after"
+
+    def test_explicit_images_do_not_bypass_single_image_limit(self):
+        message = dict(role="user", content=[dict(type="image"), dict(type="image")])
+        with pytest.raises(ValueError, match="multi-image"):
+            apply_chat_template(None, dict(model_type="mllama"), message)
+
+    def test_tool_image_does_not_add_another_image_to_user_turn(self):
+        messages = [
+            dict(role="user", content="Inspect the result."),
+            dict(role="tool", tool_call_id="image", content=[dict(type="image")]),
+            dict(role="user", content="What changed?"),
+        ]
+        rendered = apply_chat_template(
+            None, dict(model_type="qwen3_vl"), messages, num_images=1
+        )
+        assert rendered.count("<image>") == 1
+        assert (
+            rendered.index("Tool:")
+            < rendered.index("<image>")
+            < rendered.index("What changed?")
+        )
 
     def test_image_stays_on_its_original_user_turn(self):
         messages = [
@@ -1728,6 +1914,18 @@ def test_apply_chat_template_preserves_explicit_thinking_enabled():
 
     assert processor.kwargs["enable_thinking"] is True
     assert result.endswith("<think>\n")
+
+
+def test_qwen3_omni_enables_thinking_by_default():
+    processor = MagicMock(chat_template="{{ messages }}")
+    processor.apply_chat_template.return_value = "prompt"
+
+    result = apply_chat_template(
+        processor, {"model_type": "qwen3_omni_moe"}, "Describe this image."
+    )
+
+    assert result == "prompt"
+    assert processor.apply_chat_template.call_args.kwargs["enable_thinking"] is True
 
 
 def test_apply_chat_template_maps_enable_thinking_for_thinking_mode_templates():
@@ -1839,6 +2037,8 @@ WIRE_CALLS = {
     "]<]minimax[>[<city>Paris]<]minimax[>[</city>]<]minimax[>[<days>3"
     "]<]minimax[>[</days>]<]minimax[>[</invoke>]<]minimax[>[</tool_call>",
     "mistral": '[TOOL_CALLS]get_weather[ARGS]{"city": "Paris", "days": 3}',
+    "harmony": "<|channel|>commentary to=functions.get_weather <|constrain|>json"
+    '<|message|>{"city": "Paris", "days": 3}<|call|>',
     "pythonic": '<|tool_call_start|>[get_weather(city="Paris", days=3)]<|tool_call_end|>',
     "qwen3_coder": "<tool_call>\n<function=get_weather><parameter=city>Paris</parameter>"
     "<parameter=days>3</parameter></function></tool_call>",
@@ -2006,6 +2206,93 @@ def test_invalid_calls(name, text, error):
             _call("get_weather", zip="10001", days=3),
             _weather_tools(zip="string", days="integer"),
         ),
+        (
+            "qwen3_coder",
+            dict,
+            '<function=configure>\n<parameter=options>\n{"depth": 2}\n</parameter>\n'
+            "<parameter=ids>\n[1, 2]\n</parameter>\n"
+            "<parameter=tag>\n123\n</parameter>\n</function>",
+            _call("configure", options={"depth": 2}, ids=[1, 2], tag="123"),
+            [
+                dict(
+                    type="function",
+                    function=dict(
+                        name="configure",
+                        parameters=dict(
+                            type="object",
+                            properties=dict(
+                                options=dict(description="untyped"),
+                                ids=dict(description="untyped"),
+                                tag=dict(description="untyped"),
+                            ),
+                        ),
+                    ),
+                )
+            ],
+        ),
+        (
+            "qwen3_coder",
+            dict,
+            "<function=write>\n<parameter=content>\nfirst\n"
+            "<parameter=name>\nlast\n</parameter>\n</function>",
+            _call("write", content="first\n<parameter=name>\nlast"),
+            None,
+        ),
+        (
+            "qwen3_coder",
+            dict,
+            "<function=write>\n<parameter=path>\na.txt\n</parameter>\n"
+            "<parameter=content>\nhello\n</function>",
+            _call("write", path="a.txt", content="hello"),
+            None,
+        ),
+        (
+            "qwen3_coder",
+            dict,
+            "<function=write>\n<parameter=path>\na.txt\n</parameter>\n"
+            "<parameter=content\n</function>",
+            _call("write", path="a.txt"),
+            None,
+        ),
+        (
+            "qwen3_coder",
+            dict,
+            "<function=get_weather>\n<parameter=zip>\n10001\n</parameter>\n"
+            "<parameter=days>\nthree\n</function>",
+            _call("get_weather", zip="10001"),
+            _weather_tools(zip="string", days="integer"),
+        ),
+        (
+            "qwen3_coder",
+            dict,
+            "<function=write><parameter=content><parameter=</parameter></function>",
+            _call("write", content="<parameter="),
+            None,
+        ),
+        (
+            "qwen3_coder",
+            dict,
+            "<function=write><parameter=content>"
+            "Use <parameter=name> in the template.</parameter></function>",
+            _call("write", content="Use <parameter=name> in the template."),
+            None,
+        ),
+        (
+            "qwen3_coder",
+            dict,
+            '<function=configure><parameter=options>{"depth": 2}</parameter>'
+            "</function>",
+            _call("configure", options={"depth": 2}),
+            [
+                dict(
+                    type="function",
+                    function=dict(
+                        name="configure",
+                        parameters=dict(type="object", properties=dict(options={})),
+                    ),
+                )
+            ],
+        ),
     ],
     ids=[
         "gemma-nested",
@@ -2015,6 +2302,14 @@ def test_invalid_calls(name, text, error):
         "cohere-object",
         "cohere-array-escape",
         "glm-newline",
+        "qwen-untyped",
+        "qwen-line-start-parameter-tag",
+        "qwen-unclosed-last",
+        "qwen-truncated-parameter-tag",
+        "qwen-unclosed-last-invalid",
+        "qwen-literal-parameter-prefix",
+        "qwen-literal-parameter-tag",
+        "qwen-empty-property-schema",
     ],
 )
 def test_parser_syntax(parser, argument_type, text, expected, tools):
@@ -2024,6 +2319,23 @@ def test_parser_syntax(parser, argument_type, text, expected, tools):
     expected_calls = expected if isinstance(expected, list) else [expected]
     assert all(isinstance(call["arguments"], argument_type) for call in calls)
     assert [dict(call, arguments=_arguments(call)) for call in calls] == expected_calls
+
+
+@pytest.mark.parametrize("name", PARSER_NAMES)
+def test_parser_accepts_boolean_property_schemas(name):
+    # ``true`` is a valid JSON Schema for a property that admits any value.
+    tools = [
+        dict(
+            type="function",
+            function=dict(
+                name="get_weather",
+                parameters=dict(type="object", properties=dict(city=True, days=True)),
+            ),
+        )
+    ]
+    result = process_tool_calls(WIRE_CALLS[name], load_tool_module(name), tools)
+    assert [call["function"]["name"] for call in result.calls] == ["get_weather"]
+    assert json.loads(result.calls[0]["function"]["arguments"])["city"] == "Paris"
 
 
 @pytest.mark.parametrize(
@@ -2073,6 +2385,30 @@ def test_minicpm5_cdata_and_argument_types():
         "get_time",
     ]
     assert json.loads(result.calls[1]["function"]["arguments"]) == {}
+
+
+HARMONY_ANALYSIS_THEN_CALL = (
+    "<|channel|>analysis<|message|>The user wants the weather. Call get_weather."
+    "<|end|><|start|>assistant<|channel|>commentary to=functions.get_weather "
+    '<|constrain|>json<|message|>{"city": "Paris", "days": 3}<|call|>'
+)
+
+
+def test_harmony_extracts_commentary_tool_call_past_analysis():
+    result = process_tool_calls(
+        HARMONY_ANALYSIS_THEN_CALL, load_tool_module("harmony"), WEATHER_TOOLS
+    )
+    assert len(result.calls) == 1
+    assert result.calls[0]["function"]["name"] == "get_weather"
+    assert json.loads(result.calls[0]["function"]["arguments"]) == WEATHER_ARGS
+    assert "to=functions" not in result.remaining_text
+
+
+def test_harmony_ignores_plain_commentary_preamble():
+    preamble = "<|channel|>commentary<|message|>Let me look that up.<|end|>"
+    result = process_tool_calls(preamble, load_tool_module("harmony"), None)
+    assert result.calls == []
+    assert result.remaining_text == preamble
 
 
 # Loading and utility contracts
@@ -2269,6 +2605,75 @@ class TestEstimateNumImageTokens:
             estimate_num_image_tokens(SimpleNamespace(), 480, 640)
 
 
+class TestMiMoV2Processor:
+    def test_processor_attributes(self):
+        from mlx_vlm.models.mimo_v2.processing import MiMoV2Processor
+
+        assert MiMoV2Processor.get_attributes() == [
+            "image_processor",
+            "tokenizer",
+            "video_processor",
+        ]
+
+    def test_audio_codes_expand_placeholders_by_grouped_length(self):
+        from mlx_vlm.models.mimo_v2.processing import MiMoV2Processor
+        from mlx_vlm.models.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor
+
+        processor = object.__new__(MiMoV2Processor)
+        processor.audio_token = "<|audio_pad|>"
+        processor._audio_tokenizer = SimpleNamespace(
+            encode=lambda *args, **kwargs: mx.zeros((20, 5), dtype=mx.int32)
+        )
+        captured = {}
+
+        def process(*args, **kwargs):
+            captured.update(kwargs)
+            return {}
+
+        with patch.object(Qwen2_5_VLProcessor, "__call__", side_effect=process):
+            result = processor(
+                text=["before<|audio_pad|>after"],
+                audio=np.zeros(1600, dtype=np.float32),
+            )
+
+        assert captured["text"] == ["before<|audio_pad|><|audio_pad|>after"]
+        assert result["audio_codes"].shape == (5, 20)
+        assert result["audio_code_lengths"] == [5]
+
+    def test_audio_codes_preserve_batch_boundaries(self):
+        from mlx_vlm.models.mimo_v2.processing import MiMoV2Processor
+        from mlx_vlm.models.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor
+
+        processor = object.__new__(MiMoV2Processor)
+        processor.audio_token = "<|audio_pad|>"
+
+        def encode(item, **kwargs):
+            length = 5 if item == "first" else 3
+            offset = 0 if item == "first" else 100
+            return mx.arange(20 * length).reshape(20, length) + offset
+
+        processor._audio_tokenizer = SimpleNamespace(encode=encode)
+        captured = {}
+
+        def process(*args, **kwargs):
+            captured.update(kwargs)
+            return {}
+
+        with patch.object(Qwen2_5_VLProcessor, "__call__", side_effect=process):
+            result = processor(
+                text=["a<|audio_pad|>", "b<|audio_pad|>"],
+                audio=["first", "second"],
+            )
+
+        assert captured["text"] == [
+            "a<|audio_pad|><|audio_pad|>",
+            "b<|audio_pad|>",
+        ]
+        assert result["audio_codes"].shape == (8, 20)
+        assert result["audio_code_lengths"] == [5, 3]
+        assert result["audio_codes"][5, 0].item() == 100
+
+
 @pytest.fixture(scope="module")
 def synthetic_video(tmp_path_factory):
     """A deterministic 600-frame 64x64 clip at 30 fps, i.e. 20 seconds."""
@@ -2308,6 +2713,43 @@ class TestResolveVideoSampling:
 
 
 class TestVideoMetadataForwarding:
+    def test_each_video_uses_its_own_sampling_rate(self):
+        class Processor:
+            tokenizer = SimpleNamespace(pad_token="<pad>")
+
+            def __call__(self, text, images=None, videos=None, fps=None, **kwargs):
+                self.fps = fps
+                self.kwargs = kwargs
+                return {
+                    "input_ids": np.array([[1], [2]]),
+                    "attention_mask": np.array([[1], [1]]),
+                }
+
+        processor = Processor()
+        video = np.zeros((2, 3, 8, 8), dtype=np.uint8)
+        samplings = []
+
+        def load(path, sampling, frame_sampler=None):
+            samplings.append(sampling)
+            return video, VideoMetadata(
+                total_num_frames=30,
+                fps=30,
+                frames_indices=[0, 29],
+            )
+
+        with patch("mlx_vlm.utils.load_video", side_effect=load):
+            prepare_inputs(
+                processor,
+                videos=["first.mp4", "second.mp4"],
+                prompts=["first", "second"],
+                fps=[1, 2],
+                nframes=2,
+            )
+
+        assert [sampling.fps for sampling in samplings] == [1, 2]
+        assert [sampling.nframes for sampling in samplings] == [2, 2]
+        assert "nframes" not in processor.kwargs
+
     def test_metadata_is_only_forwarded_to_declaring_processors(self):
         class Processor:
             tokenizer = SimpleNamespace(pad_token="<pad>")

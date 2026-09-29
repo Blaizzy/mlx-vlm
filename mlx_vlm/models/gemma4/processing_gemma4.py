@@ -440,6 +440,7 @@ class Gemma4VideoProcessor(BaseVideoProcessor):
 class Gemma4Processor(ProcessorMixin):
     """Combined processor for Gemma 4 (image + text + audio + video)."""
 
+    supports_multiple_audio = True
     model_type = "gemma4"
     attributes = ["image_processor", "tokenizer", "video_processor"]
     image_processor_class = "Gemma4ImageProcessor"

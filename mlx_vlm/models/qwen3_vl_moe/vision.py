@@ -334,9 +334,9 @@ class VisionModel(nn.Module):
                 weight_list[i].extend(weights[i].tolist())
 
         idx_tensor = mx.array(idx_list, dtype=mx.int32)
-        weight_tensor = mx.array(weight_list, dtype=self.pos_embed.weight.dtype)
-
-        pos_embeds = self.pos_embed(idx_tensor) * weight_tensor[:, :, None]
+        pos_embeds = self.pos_embed(idx_tensor)
+        weight_tensor = mx.array(weight_list, dtype=pos_embeds.dtype)
+        pos_embeds = pos_embeds * weight_tensor[:, :, None]
         patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
 
         split_sizes = [int(h * w) for t, h, w in grid_thw_list]

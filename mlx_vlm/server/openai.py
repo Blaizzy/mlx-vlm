@@ -5,7 +5,6 @@ import gc
 import json
 import logging
 import random
-import re
 import time
 import uuid
 from datetime import datetime
@@ -23,7 +22,11 @@ from ..generate.edit_image import edit_image
 from ..generate.image import ImageGenerationRequest as CoreImageGenerationRequest
 from ..generate.image import generate_image, parse_size
 from ..generate.video import resolve_video_inputs
-from ..prompt_utils import apply_chat_template, extract_text_from_content
+from ..prompt_utils import (
+    apply_chat_template,
+    extract_text_from_content,
+    normalize_image_content,
+)
 from ..tools import (
     _infer_tool_parser_from_processor,
     _prepare_chat_tool_choice,
@@ -48,10 +51,12 @@ from .responses_state import (
 from .responses_state import _sse_event as _response_sse_event
 from .responses_state import (
     _store_response,
+    finish_content_streams,
     make_response_stream_state,
     prompt_has_open_thinking,
     response_store,
     response_store_lock,
+    strip_protocol_markers,
 )
 from .runtime import runtime
 from .schemas import (
@@ -185,10 +190,11 @@ def _adapter_path_or_inherit(request):
     )
 
 
-def _normalize_response_instruction_messages(
+def _normalize_instruction_messages(
     chat_messages: List[dict],
-    instructions: Optional[str],
+    instructions: Optional[str] = None,
 ) -> Optional[str]:
+    """Combine API instructions into the leading system message for templates."""
     instruction_parts = [instructions] if instructions else []
     conversation = []
 
@@ -630,6 +636,15 @@ async def images_edits_endpoint(request: Request):
                         height=height,
                         guidance=image_request.guidance,
                         output_format=image_request.output_format,
+                        extra={
+                            key: value
+                            for key in (
+                                "negative_prompt",
+                                "output_resolution",
+                                "use_kv_cache",
+                            )
+                            if (value := getattr(image_request, key)) is not None
+                        },
                     )
                     result = edit_image(
                         model,
@@ -709,7 +724,7 @@ async def responses_input_tokens_endpoint(request: Request):
             + current_input_items
         )
         chat_messages, images = _response_items_to_chat(prompt_items)
-        _normalize_response_instruction_messages(
+        _normalize_instruction_messages(
             chat_messages,
             openai_request.instructions,
         )
@@ -870,7 +885,7 @@ async def responses_endpoint(request: Request):
             + current_input_items
         )
         chat_messages, images = _response_items_to_chat(prompt_items)
-        instructions = _normalize_response_instruction_messages(
+        instructions = _normalize_instruction_messages(
             chat_messages,
             openai_request.instructions,
         )
@@ -1128,6 +1143,25 @@ async def responses_endpoint(request: Request):
                             if delta:
                                 yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta, timings=StreamingTimings(predicted_per_second=chunk_rate)).model_dump_json()}\n\n"
                                 await asyncio.sleep(0.01)
+
+                    tail_reasoning, tail = finish_content_streams(
+                        thinking_state, tool_call_state
+                    )
+                    if tail_reasoning:
+                        streamed_reasoning += tail_reasoning
+                        yield _response_sse_event(
+                            "response.reasoning_text.delta",
+                            {
+                                "type": "response.reasoning_text.delta",
+                                "response_id": response_id,
+                                "item_id": reasoning_item_id,
+                                "output_index": 0,
+                                "content_index": 0,
+                                "delta": tail_reasoning,
+                            },
+                        )
+                    if tail:
+                        yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=tail, timings=StreamingTimings(predicted_per_second=metrics.rate)).model_dump_json()}\n\n"
 
                     output_items, clean_text, _, output_finish_reason = (
                         _response_output_items_from_text(
@@ -1559,7 +1593,11 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             video = _extract_video_reference(item)
                             if video:
                                 videos.append(video)
-                msg["content"] = extract_text_from_content(message.content)
+                msg["content"] = (
+                    normalize_image_content(message.content)
+                    if message.role == "user"
+                    else extract_text_from_content(message.content)
+                )
             else:
                 msg["content"] = message.content
 
@@ -1591,6 +1629,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
             processed_messages.append(msg)
 
+        _normalize_instruction_messages(processed_messages)
         _ensure_effective_input(processed_messages, images=images, audio=audio)
 
         processed_messages, tools, tool_choice = _prepare_chat_tool_choice(
@@ -1802,6 +1841,29 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 finish_reason = token.finish_reason
                                 break
 
+                        tail_reasoning, tail = finish_content_streams(
+                            thinking_state, tool_call_state
+                        )
+                        if tail or tail_reasoning:
+                            chunk_data = ChatStreamChunk(
+                                id=request_id,
+                                created=int(time.time()),
+                                model=request.model,
+                                choices=[
+                                    ChatStreamChoice(
+                                        delta=ChatMessage(
+                                            role="assistant",
+                                            content=tail,
+                                            reasoning=tail_reasoning,
+                                        )
+                                    )
+                                ],
+                                timings=StreamingTimings(
+                                    predicted_per_second=metrics.rate
+                                ),
+                            )
+                            yield f"data: {chunk_data.model_dump_json()}\n\n"
+
                         # Parse tool calls from full output and emit final chunk
                         terminal_emitted = False
                         if tool_module is not None:
@@ -1875,6 +1937,10 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
                         )
+                        tool_call_state = ToolCallStreamState(
+                            tool_module.tool_call_start if tool_module else None,
+                            tool_module.tool_call_end if tool_module else None,
+                        )
                         for chunk in token_iterator:
                             if chunk is None or not hasattr(chunk, "text"):
                                 continue
@@ -1890,12 +1956,15 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             thinking_delta = thinking_state.feed(
                                 chunk.text, last=bool(chunk_finish)
                             )
-                            if thinking_delta.content or thinking_delta.reasoning:
+                            delta_content = tool_call_state.feed(
+                                thinking_delta.content, last=bool(chunk_finish)
+                            )
+                            if delta_content or thinking_delta.reasoning:
                                 choices = [
                                     ChatStreamChoice(
                                         delta=ChatMessage(
                                             role="assistant",
-                                            content=thinking_delta.content,
+                                            content=delta_content,
                                             reasoning=thinking_delta.reasoning,
                                         )
                                     )
@@ -1913,13 +1982,62 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 yield f"data: {chunk_data.model_dump_json()}\n\n"
                                 await asyncio.sleep(0.01)
 
-                        finish_reason = finish_reason or "stop"
-                        chunk_data = _final_chat_chunk(
-                            request_id,
-                            request.model,
-                            finish_reason,
-                            metrics.rate,
+                        tail_reasoning, tail = finish_content_streams(
+                            thinking_state, tool_call_state
                         )
+                        if tail or tail_reasoning:
+                            chunk_data = ChatStreamChunk(
+                                id=request_id,
+                                created=int(time.time()),
+                                model=request.model,
+                                choices=[
+                                    ChatStreamChoice(
+                                        delta=ChatMessage(
+                                            role="assistant",
+                                            content=tail,
+                                            reasoning=tail_reasoning,
+                                        )
+                                    )
+                                ],
+                                timings=StreamingTimings(
+                                    predicted_per_second=metrics.rate
+                                ),
+                            )
+                            yield f"data: {chunk_data.model_dump_json()}\n\n"
+
+                        tc = (
+                            process_tool_calls(output_text, tool_module, tools)
+                            if tool_module is not None
+                            else None
+                        )
+                        if tc is not None and tc.calls:
+                            tool_calls_made = True
+                            finish_reason = "tool_calls"
+                            chunk_data = ChatStreamChunk(
+                                id=request_id,
+                                created=int(time.time()),
+                                model=request.model,
+                                choices=[
+                                    ChatStreamChoice(
+                                        finish_reason="tool_calls",
+                                        delta=ChatMessage(
+                                            role="assistant",
+                                            tool_calls=tc.calls,
+                                        ),
+                                    )
+                                ],
+                                timings=StreamingTimings(
+                                    predicted_per_second=metrics.rate
+                                ),
+                            )
+                        else:
+                            finish_reason = finish_reason or "stop"
+                            chunk_data = _final_chat_chunk(
+                                request_id,
+                                request.model,
+                                finish_reason,
+                                metrics.rate,
+                            )
                         yield f"data: {chunk_data.model_dump_json()}\n\n"
                         if emit_usage:
                             chunk_data = _chat_usage_chunk(
@@ -2147,12 +2265,15 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
                         )
-                        if clean_remaining:
-                            # Strip model control tokens
-                            clean_remaining = re.sub(
-                                r"<\|[^>]+\|>|<[^>]+>", "", clean_remaining
-                            ).strip()
-                        content = clean_remaining or None
+                        content = (
+                            strip_protocol_markers(
+                                clean_remaining,
+                                tool_module,
+                                gen_args.thinking_start_token,
+                                gen_args.thinking_end_token,
+                            )
+                            or None
+                        )
 
                 response_logprobs = None
                 if request.logprobs and collected_logprobs:

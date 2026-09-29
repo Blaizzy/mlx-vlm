@@ -15,6 +15,7 @@ from ..models.diffusion_visualizer import (
     display_width,
     escape_carriage_returns,
 )
+from ..sample_utils import clamp_temperature
 from ..tokenizer_utils import make_streaming_detokenizer
 from .common import (
     DEFAULT_DIFFUSION_MAX_DENOISING_STEPS,
@@ -363,6 +364,7 @@ def _diffusion_sample_canvas(
     dtype,
     temperature: float,
 ) -> mx.array:
+    temperature = clamp_temperature(temperature)
     logits = processed_logits.astype(mx.float32)
     if temperature <= 0:
         return mx.argmax(logits, axis=-1).astype(dtype)

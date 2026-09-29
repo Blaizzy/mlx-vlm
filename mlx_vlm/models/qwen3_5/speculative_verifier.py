@@ -285,7 +285,6 @@ class Qwen3_5BatchInvariantForward:
         if cache is not None:
             if hasattr(cache, "advance"):
                 cache.advance(length)
-                helpers._qwen3_5_advance_left_padding_info(cache, length)
                 helpers._qwen3_5_advance_lengths_info(cache, length)
 
         output = layer.norm(output, z)

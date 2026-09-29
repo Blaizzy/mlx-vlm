@@ -679,6 +679,8 @@ def skip_multimodal_module(path: str) -> bool:
         bool: True if the module is multimodal and should skip quantization, False otherwise
     """
     multimodal_modules = (
+        "vision",
+        "aligner",
         "vision_model",
         "vision_tower",
         "vl_connector",
@@ -755,7 +757,9 @@ def get_model_and_args(config: dict, model_path: Optional[Path] = None):
 
     architectures = set(config.get("architectures") or ())
     dflash_config = config.get("dflash_config")
-    if "BoundaryExtractor" in architectures:
+    if "Lfm2BidirectionalForMaskedLM" in architectures:
+        model_type = "lfm2_encoder"
+    elif "BoundaryExtractor" in architectures:
         model_type = "gliner2_5"
     elif "DFlash2DraftModel" in architectures:
         model_type = "dflash2"
@@ -981,6 +985,8 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     modules = ["text", "vision", "perceiver", "projector", "audio"]
     model_config = update_module_configs(model_config, model_class, config, modules)
     model_config = apply_generation_config_defaults(model_config, config)
+    if hasattr(model_config, "model_path"):
+        model_config.model_path = str(model_path)
 
     model = model_class.Model(model_config)
 
@@ -2423,7 +2429,14 @@ def prepare_inputs(
     if has_videos:
         if not isinstance(videos, list):
             videos = [videos]
-        sampling = resolve_video_sampling(processor, kwargs)
+        sampling_overrides = {
+            name: kwargs.pop(name) for name in _VIDEO_SAMPLING_FIELDS if name in kwargs
+        }
+        fps_values = sampling_overrides.get("fps")
+        if isinstance(fps_values, (list, tuple)) and len(fps_values) != len(videos):
+            raise ValueError(
+                f"Received {len(fps_values)} fps values for {len(videos)} videos"
+            )
         if supplied_video_metadata is not None and len(supplied_video_metadata) != len(
             videos
         ):
@@ -2436,6 +2449,10 @@ def prepare_inputs(
         )
         loaded, video_fps, video_metadata = [], [], []
         for video_index, v in enumerate(videos):
+            video_sampling_overrides = dict(sampling_overrides)
+            if isinstance(fps_values, (list, tuple)):
+                video_sampling_overrides["fps"] = fps_values[video_index]
+            sampling = resolve_video_sampling(processor, video_sampling_overrides)
             if isinstance(v, (str, bytes, Path)):
                 arr, metadata = load_video(
                     str(v), sampling, frame_sampler=frame_sampler

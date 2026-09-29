@@ -340,13 +340,12 @@ class QuantizedKVCache(_BaseCache):
         prev = self.offset
 
         if self.keys is None or (prev + num_steps) > self.keys[0].shape[-2]:
-            el_per_int = 8 * mx.uint32.size // self.bits
             new_steps = (self.step + num_steps - 1) // self.step * self.step
             shape = (B, n_kv_heads, new_steps)
 
             def init_quant(dim):
                 return (
-                    mx.zeros((*shape, dim // el_per_int), dtype=mx.uint32),
+                    mx.zeros((*shape, dim * self.bits // 32), dtype=mx.uint32),
                     mx.zeros((*shape, dim // self.group_size), dtype=keys.dtype),
                     mx.zeros((*shape, dim // self.group_size), dtype=keys.dtype),
                 )
@@ -2408,7 +2407,6 @@ class BatchQuantizedKVCache(_BaseCache):
         B, n_kv_heads, num_steps, k_head_dim = keys.shape
         v_head_dim = values.shape[-1]
         prev = self._idx
-        el_per_int = 8 * mx.uint32.size // self.bits
 
         if self.keys is None or (prev + num_steps) > self.keys[0].shape[-2]:
             new_steps = (self.step + num_steps - 1) // self.step * self.step
@@ -2416,7 +2414,7 @@ class BatchQuantizedKVCache(_BaseCache):
 
             def _init(dim):
                 return (
-                    mx.zeros((*shape, dim // el_per_int), dtype=mx.uint32),
+                    mx.zeros((*shape, dim * self.bits // 32), dtype=mx.uint32),
                     mx.zeros((*shape, dim // self.group_size), dtype=keys.dtype),
                     mx.zeros((*shape, dim // self.group_size), dtype=keys.dtype),
                 )

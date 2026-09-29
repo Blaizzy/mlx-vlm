@@ -36,6 +36,7 @@ class Attention(nn.Module):
             rope_theta = args.rope_theta
 
         self.scale = head_dim**-0.5
+        self.v_scale = args.attention_value_scale
 
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
         self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
@@ -65,6 +66,8 @@ class Attention(nn.Module):
         queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
         keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        if self.v_scale is not None:
+            values = values * self.v_scale
 
         if cache is not None:
             queries = self.rope(queries, offset=cache.offset)
@@ -257,9 +260,17 @@ class LanguageModel(nn.Module):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def __call__(
-        self, inputs: mx.array, cache=None, inputs_embeds=None, mask=None, **kwargs
+        self,
+        inputs: mx.array,
+        cache=None,
+        inputs_embeds=None,
+        mask=None,
+        logits_to_keep: Optional[int] = None,
+        **kwargs,
     ):
         out = self.model(inputs, cache, inputs_embeds=inputs_embeds)
+        if logits_to_keep:
+            out = out[:, -int(logits_to_keep) :, :]
         out = self.lm_head(out)
         return LanguageModelOutput(logits=out)
 
