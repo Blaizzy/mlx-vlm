@@ -53,6 +53,19 @@
         "invalid": {
           "encoder": "vitxl"
         }
+      },
+      {
+        "id": "sam3_1",
+        "module": "sam3_1",
+        "model_type": "sam3_1",
+        "config": {}
+      },
+      {
+        "id": "sam3d_body",
+        "module": "sam3d_body",
+        "model_type": "sam3d_body",
+        "config": {},
+        "xfail": "ModelConfig.to_dict() leaves nested VisionConfig/TextConfig as objects, so from_dict(to_dict()) raises and the dict is not JSON-serializable"
       }
     ],
     "forward": [

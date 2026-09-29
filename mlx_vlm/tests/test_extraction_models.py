@@ -2105,7 +2105,18 @@ class ExtractionChecks:
 @pytest.mark.parametrize(
     "check,case",
     [
-        pytest.param(check, case, id=f"{check}-{case['id']}")
+        pytest.param(
+            check,
+            case,
+            id=f"{check}-{case['id']}",
+            # A known gap is recorded as a strict xfail so the contract stays
+            # written down and the case fails once the model is fixed.
+            marks=(
+                [pytest.mark.xfail(reason=case["xfail"], strict=True)]
+                if "xfail" in case
+                else []
+            ),
+        )
         for check, cases in EXTRACTION_CASES["checks"].items()
         for case in cases
     ],
