@@ -786,62 +786,6 @@ class TestSapiens2(unittest.TestCase):
         # grid 4x4, window 4 -> 1 token + 3 prefix
         self.assertEqual(out["last_hidden_state"].shape, (1, 4, 64))
 
-    def test_weight_names_match_checkpoint(self):
-        """Parameter names follow the official checkpoint layout, except the
-        q/k/v projections which ``sanitize`` merges into ``wqkv``."""
-        from mlx_vlm.models.sapiens2.sapiens2 import Model
-
-        config = self._tiny_config(
-            "seg",
-            head_config=self._deconv_head(),
-            num_labels=29,
-        )
-        keys = {k for k, _ in tree_flatten(Model(config).parameters())}
-        expected = {
-            "backbone.patch_embed.projection.weight",
-            "backbone.cls_token",
-            "backbone.storage_tokens",
-            "backbone.rope_embed.periods",
-            "backbone.blocks.0.ln1.weight",
-            "backbone.blocks.0.attn.wqkv.weight",
-            "backbone.blocks.0.attn.q_norm.weight",
-            "backbone.blocks.0.attn.gamma.weight",
-            "backbone.blocks.0.ffn.w12.weight",
-            "backbone.blocks.0.ffn.w3.weight",
-            "backbone.ln1.weight",
-            "decode_head.deconv_layers.0.weight",
-            "decode_head.deconv_layers.3.weight",
-            "decode_head.conv_layers.0.weight",
-            "decode_head.conv_seg.weight",
-        }
-        self.assertTrue(expected.issubset(keys))
-
-    def test_sanitize_relays_conv_weights(self):
-        """sanitize converts torch conv layouts and prefixes bare backbone keys."""
-        from mlx_vlm.models.sapiens2.sapiens2 import Model
-
-        config = self._tiny_config(
-            "seg", head_config=self._deconv_head(), num_labels=29
-        )
-        model = Model(config)
-        params = dict(tree_flatten(model.parameters()))
-
-        weights = {}
-        for k, v in params.items():
-            if k.endswith("projection.weight"):
-                weights[k] = mx.zeros((v.shape[0], v.shape[3], 8, 8))  # torch Conv2d
-            elif "deconv_layers" in k:
-                weights[k] = mx.zeros((v.shape[3], v.shape[0], 4, 4))  # torch ConvT
-            else:
-                weights[k] = v
-        sanitized = model.sanitize(weights)
-        for k, v in sanitized.items():
-            self.assertEqual(v.shape, params[k].shape, f"{k} not relayed out correctly")
-
-        # bare (pretrain-style) keys get the backbone. prefix
-        bare = model.sanitize({"patch_embed.projection.bias": mx.zeros((64,))})
-        self.assertIn("backbone.patch_embed.projection.bias", bare)
-
     def test_pixel_shuffle_matches_torch_layout(self):
         """Channel-last PixelShuffle equals torch's channel-last view."""
 
@@ -879,38 +823,6 @@ class TestSapiens2(unittest.TestCase):
 
         idx = flip_indices_from_pairs(4, [[1, 2]])
         self.assertEqual(idx.tolist(), [0, 2, 1, 3])
-
-    def test_sanitize_merges_qkv(self):
-        """Checkpoint wq/wk/wv (weight + bias) become one wqkv, q|k|v order."""
-        from mlx_vlm.models.sapiens2.sapiens2 import Model
-
-        model = Model(self._tiny_config())
-        attn = model.backbone.blocks[1].attn  # GQA layer: 4 q heads, 2 kv heads
-        d, kv = attn.embed_dims, attn.kv_size
-        parts = {
-            "q": (mx.ones((d, 64)), mx.full((d,), 1.0)),
-            "k": (mx.full((kv, 64), 2.0), mx.full((kv,), 2.0)),
-            "v": (mx.full((kv, 64), 3.0), mx.full((kv,), 3.0)),
-        }
-        weights = {}
-        for name, (w, b) in parts.items():
-            weights[f"backbone.blocks.1.attn.w{name}.weight"] = w
-            weights[f"backbone.blocks.1.attn.w{name}.bias"] = b
-        out = model.sanitize(weights)
-        self.assertEqual(
-            set(out),
-            {
-                "backbone.blocks.1.attn.wqkv.weight",
-                "backbone.blocks.1.attn.wqkv.bias",
-            },
-        )
-        w = np.array(out["backbone.blocks.1.attn.wqkv.weight"])
-        self.assertEqual(w.shape, (d + 2 * kv, 64))
-        self.assertTrue((w[:d] == 1).all() and (w[d : d + kv] == 2).all())
-        self.assertTrue((w[d + kv :] == 3).all())
-        # already-merged keys pass through
-        again = model.sanitize(out)
-        self.assertEqual(set(again), set(out))
 
     def test_attention_matches_unfused_reference(self):
         """Fused qkv + kernel-side GQA + packed full-sequence RoPE equal the
@@ -1877,6 +1789,13 @@ def _extraction_module(case):
     return importlib.import_module("mlx_vlm.models." + case["module"])
 
 
+def _resolve(obj, path):
+    """Dotted lookup that also indexes lists, as in ``blocks.1.attn``."""
+    for part in path.split("."):
+        obj = obj[int(part)] if part.isdigit() else getattr(obj, part)
+    return obj
+
+
 # Nested config fields these models use on top of the VLM ones.
 _EXTRA_CONFIG_TYPES = {"head_config": "HeadConfig"}
 
@@ -2062,6 +1981,70 @@ class ExtractionChecks:
             assert {v.dtype for v in mixed.values()} == {mx.float32, mx.bfloat16}
             unified = model.sanitize(mixed)
             assert {v.dtype for v in unified.values()} == {mx.bfloat16}
+
+    def weight_names(self, case):
+        """Parameter names follow the official checkpoint layout."""
+        model = _extraction_model(case)
+        keys = {key for key, _ in tree_flatten(model.parameters())}
+        missing = set(case["expect_keys"]) - keys
+        assert not missing, sorted(missing)
+
+    def relayout(self, case):
+        """``sanitize`` moves torch conv kernels to the MLX layout, and gives
+        bare pretrain-style keys their module prefix."""
+        model = _extraction_model(case)
+        params = dict(tree_flatten(model.parameters()))
+
+        weights = {}
+        for key, value in params.items():
+            for rule in case["torch_layout"]:
+                if rule["match"] not in key:
+                    continue
+                k = rule["kernel"]
+                # torch Conv2d is (O, I, kh, kw); ConvTranspose2d is (I, O, kh, kw)
+                shape = (
+                    (value.shape[3], value.shape[0], k, k)
+                    if rule["layout"] == "conv_transpose"
+                    else (value.shape[0], value.shape[3], k, k)
+                )
+                weights[key] = mx.zeros(shape)
+                break
+            else:
+                weights[key] = value
+        for key, value in model.sanitize(weights).items():
+            assert value.shape == params[key].shape, key
+
+        for bare, (shape, expected) in case.get("bare_keys", {}).items():
+            assert expected in model.sanitize({bare: mx.zeros(tuple(shape))})
+
+    def merge_qkv(self, case):
+        """Separate checkpoint q/k/v projections merge into one fused weight,
+        in order, and an already-merged checkpoint passes through."""
+        model = _extraction_model(case)
+        layer = _resolve(model, case["layer"])
+        sizes = {p: getattr(layer, attr) for p, attr in case["sizes"].items()}
+        fill = {part: i + 1.0 for i, part in enumerate(case["order"])}
+
+        weights = {}
+        for part, rows in sizes.items():
+            weights[f"{case['source'].format(part=part)}.weight"] = mx.full(
+                (rows, case["in_features"]), fill[part]
+            )
+            weights[f"{case['source'].format(part=part)}.bias"] = mx.full(
+                (rows,), fill[part]
+            )
+        out = model.sanitize(weights)
+        assert set(out) == {f"{case['target']}.weight", f"{case['target']}.bias"}
+
+        merged = np.array(out[f"{case['target']}.weight"])
+        total = sum(sizes[p] for p in case["order"])
+        assert merged.shape == (total, case["in_features"])
+        start = 0
+        for part in case["order"]:
+            rows = sizes[part]
+            assert (merged[start : start + rows] == fill[part]).all(), part
+            start += rows
+        assert set(model.sanitize(out)) == set(out)
 
 
 @pytest.mark.parametrize(

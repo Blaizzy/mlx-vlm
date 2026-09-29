@@ -801,6 +801,160 @@
           "head_config": "HeadConfig"
         }
       }
+    ],
+    "weight_names": [
+      {
+        "id": "test_weight_names_match_checkpoint",
+        "module": "sapiens2",
+        "config": {
+          "architectures": [
+            "Sapiens2ForSemanticSegmentation"
+          ],
+          "hidden_size": 64,
+          "num_hidden_layers": 3,
+          "num_attention_heads": 4,
+          "num_first_full_attention_layers": 1,
+          "num_last_full_attention_layers": 1,
+          "intermediate_size": 128,
+          "image_size": [
+            32,
+            24
+          ],
+          "patch_size": 8,
+          "num_register_tokens": 2,
+          "head_config": {
+            "upsample_out_channels": [
+              32,
+              16
+            ],
+            "upsample_kernel_sizes": [
+              4,
+              4
+            ],
+            "conv_out_channels": [
+              8
+            ],
+            "conv_kernel_sizes": [
+              1
+            ]
+          },
+          "num_labels": 29
+        },
+        "expect_keys": [
+          "backbone.patch_embed.projection.weight",
+          "backbone.cls_token",
+          "backbone.storage_tokens",
+          "backbone.rope_embed.periods",
+          "backbone.blocks.0.ln1.weight",
+          "backbone.blocks.0.attn.wqkv.weight",
+          "backbone.blocks.0.attn.q_norm.weight",
+          "backbone.blocks.0.attn.gamma.weight",
+          "backbone.blocks.0.ffn.w12.weight",
+          "backbone.blocks.0.ffn.w3.weight",
+          "backbone.ln1.weight",
+          "decode_head.deconv_layers.0.weight",
+          "decode_head.deconv_layers.3.weight",
+          "decode_head.conv_layers.0.weight",
+          "decode_head.conv_seg.weight"
+        ]
+      }
+    ],
+    "relayout": [
+      {
+        "id": "test_sanitize_relays_conv_weights",
+        "module": "sapiens2",
+        "config": {
+          "architectures": [
+            "Sapiens2ForSemanticSegmentation"
+          ],
+          "hidden_size": 64,
+          "num_hidden_layers": 3,
+          "num_attention_heads": 4,
+          "num_first_full_attention_layers": 1,
+          "num_last_full_attention_layers": 1,
+          "intermediate_size": 128,
+          "image_size": [
+            32,
+            24
+          ],
+          "patch_size": 8,
+          "num_register_tokens": 2,
+          "head_config": {
+            "upsample_out_channels": [
+              32,
+              16
+            ],
+            "upsample_kernel_sizes": [
+              4,
+              4
+            ],
+            "conv_out_channels": [
+              8
+            ],
+            "conv_kernel_sizes": [
+              1
+            ]
+          },
+          "num_labels": 29
+        },
+        "torch_layout": [
+          {
+            "match": "projection.weight",
+            "layout": "conv2d",
+            "kernel": 8
+          },
+          {
+            "match": "deconv_layers",
+            "layout": "conv_transpose",
+            "kernel": 4
+          }
+        ],
+        "bare_keys": {
+          "patch_embed.projection.bias": [
+            [
+              64
+            ],
+            "backbone.patch_embed.projection.bias"
+          ]
+        }
+      }
+    ],
+    "merge_qkv": [
+      {
+        "id": "test_sanitize_merges_qkv",
+        "module": "sapiens2",
+        "config": {
+          "architectures": [
+            "Sapiens2Model"
+          ],
+          "hidden_size": 64,
+          "num_hidden_layers": 3,
+          "num_attention_heads": 4,
+          "num_first_full_attention_layers": 1,
+          "num_last_full_attention_layers": 1,
+          "intermediate_size": 128,
+          "image_size": [
+            32,
+            24
+          ],
+          "patch_size": 8,
+          "num_register_tokens": 2
+        },
+        "layer": "backbone.blocks.1.attn",
+        "sizes": {
+          "q": "embed_dims",
+          "k": "kv_size",
+          "v": "kv_size"
+        },
+        "order": [
+          "q",
+          "k",
+          "v"
+        ],
+        "in_features": 64,
+        "source": "backbone.blocks.1.attn.w{part}",
+        "target": "backbone.blocks.1.attn.wqkv"
+      }
     ]
   }
 }
