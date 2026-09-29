@@ -1,1163 +1,238 @@
 {
-  "version": 1,
-  "checks": {
-    "registry": [
-      {
-        "id": "dinov2",
-        "module": "dinov2",
-        "model_type": "dinov2",
-        "config": {
-          "hidden_size": 32,
-          "num_hidden_layers": 2,
-          "num_attention_heads": 2,
-          "patch_size": 16,
-          "image_size": 64,
-          "mlp_ratio": 2.0
-        }
+  "cases": [
+    {
+      "id": "dinov2",
+      "module": "dinov2",
+      "config": {
+        "hidden_size": 32,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "patch_size": 16,
+        "image_size": 64,
+        "mlp_ratio": 2.0
       },
-      {
-        "id": "video_depth_anything",
-        "module": "video_depth_anything",
-        "model_type": "video_depth_anything",
-        "config": {
-          "encoder": "vits",
+      "input_shape": [1, 64, 64, 3],
+      "output_shapes": {
+        "last_hidden_state": [1, 17, 32],
+        "pooler_output": [1, 32],
+        "hidden_patch_tokens": [1, 16, 32]
+      },
+      "checks": ["registry_and_config", "forward", "checkpoint"]
+    },
+    {
+      "id": "video_depth_anything",
+      "module": "video_depth_anything",
+      "config": {
+        "encoder": "vits",
+        "embed_dim": 32,
+        "depth": 4,
+        "num_heads": 2,
+        "intermediate_layer_idx": [0, 1, 2, 3],
+        "features": 8,
+        "out_channels": [8, 16, 32, 32],
+        "num_frames": 4,
+        "norm_num_groups": 8
+      },
+      "input_shape": [1, 2, 28, 28, 3],
+      "output_shapes": [1, 2, 28, 28],
+      "checks": ["registry_and_config", "forward", "checkpoint"]
+    },
+    {
+      "id": "sam3_1",
+      "module": "sam3_1",
+      "config": {},
+      "checks": ["registry_and_config"]
+    },
+    {
+      "id": "sam3d_body",
+      "module": "sam3d_body",
+      "config": {},
+      "checks": ["registry_and_config"]
+    },
+    {
+      "id": "sapiens2",
+      "module": "sapiens2",
+      "config": {
+        "architectures": ["Sapiens2Model"],
+        "hidden_size": 64,
+        "num_hidden_layers": 3,
+        "num_attention_heads": 4,
+        "num_first_full_attention_layers": 1,
+        "num_last_full_attention_layers": 1,
+        "intermediate_size": 128,
+        "image_size": [32, 24],
+        "patch_size": 8,
+        "num_register_tokens": 2
+      },
+      "input_shape": [2, 32, 24, 3],
+      "output_shapes": {
+        "last_hidden_state": [2, 15, 64],
+        "pooler_output": [2, 64]
+      },
+      "checks": ["registry_and_config", "forward", "checkpoint"]
+    },
+    {
+      "id": "moge3",
+      "module": "moge3",
+      "config": {
+        "encoder": {
+          "backbone": "dinov2_vits14",
+          "intermediate_layers": [0, 1],
+          "dim_out": 16,
+          "depth": 2,
           "embed_dim": 32,
-          "depth": 4,
-          "num_heads": 2,
-          "intermediate_layer_idx": [
-            0,
-            1,
-            2,
-            3
-          ],
-          "features": 8,
-          "out_channels": [
-            8,
-            16,
-            32,
-            32
-          ],
-          "num_frames": 4,
-          "norm_num_groups": 8
+          "num_heads": 4
         },
-        "invalid": {
-          "encoder": "vitxl"
+        "neck": {
+          "dim_in": [18, 2, 2],
+          "dim_res_blocks": [16, 8, 4],
+          "dim_out": null,
+          "num_res_blocks": [0, 1, 0],
+          "res_block_in_norm": "none",
+          "res_block_hidden_norm": "none",
+          "resamplers": ["conv_transpose", "bilinear"]
+        },
+        "points_head": {
+          "dim_in": [16, 8, 4],
+          "dim_res_blocks": [16, 8, 4],
+          "dim_out": [null, null, 3],
+          "num_res_blocks": [0, 1, 0],
+          "res_block_in_norm": "none",
+          "res_block_hidden_norm": "none",
+          "resamplers": ["conv_transpose", "bilinear"]
+        },
+        "mask_head": {
+          "dim_in": [16, 8, 4],
+          "dim_res_blocks": [16, 8, 4],
+          "dim_out": [null, null, 1],
+          "num_res_blocks": [0, 1, 0],
+          "res_block_in_norm": "none",
+          "res_block_hidden_norm": "none",
+          "resamplers": ["conv_transpose", "bilinear"]
+        },
+        "normal_head": null,
+        "scale_head": {
+          "dims": [32, 16, 1]
+        },
+        "refiner": {
+          "encoder_channels": 18,
+          "model_channels": [8, 16, 32],
+          "downsample_factors": [2, 2],
+          "encoder_downsample": 4
         }
       },
-      {
-        "id": "sam3_1",
-        "module": "sam3_1",
-        "model_type": "sam3_1",
-        "config": {}
-      },
-      {
-        "id": "sam3d_body",
-        "module": "sam3d_body",
-        "model_type": "sam3d_body",
-        "config": {},
-        "xfail": "ModelConfig.to_dict() leaves nested VisionConfig/TextConfig as objects, so from_dict(to_dict()) raises and the dict is not JSON-serializable"
-      },
-      {
-        "id": "sapiens2",
-        "module": "sapiens2",
-        "model_type": "sapiens2",
-        "config": {
-          "architectures": [
-            "Sapiens2Model"
-          ],
-          "hidden_size": 64,
-          "num_hidden_layers": 3,
+      "checks": ["registry_and_config"]
+    },
+    {
+      "id": "gliner2_5",
+      "module": "gliner2_5",
+      "config": {
+        "architecture": "boundary",
+        "encoder_config": {
+          "vocab_size": 512,
+          "hidden_size": 128,
           "num_attention_heads": 4,
-          "num_first_full_attention_layers": 1,
-          "num_last_full_attention_layers": 1,
-          "intermediate_size": 128,
-          "image_size": [
-            32,
-            24
-          ],
-          "patch_size": 8,
-          "num_register_tokens": 2
-        }
-      },
-      {
-        "id": "moge3",
-        "module": "moge3",
-        "model_type": "moge3",
-        "config": {}
-      },
-      {
-        "id": "gliner2_5",
-        "module": "gliner2_5",
-        "model_type": "gliner2_5",
-        "config": {}
-      },
-      {
-        "id": "openai_privacy_filter",
-        "module": "openai_privacy_filter",
-        "model_type": "openai_privacy_filter",
-        "config": {}
-      },
-      {
-        "id": "sam3d_objects",
-        "module": "sam3d_objects",
-        "model_type": "sam3d_objects",
-        "config": {}
-      }
-    ],
-    "forward": [
-      {
-        "id": "dinov2-encoder",
-        "module": "dinov2",
-        "adapter": "uniform",
-        "config": {
-          "hidden_size": 32,
           "num_hidden_layers": 2,
-          "num_attention_heads": 2,
-          "patch_size": 16,
-          "image_size": 64,
-          "mlp_ratio": 2.0
-        },
-        "input": {
-          "shape": [
-            1,
-            64,
-            64,
-            3
-          ]
-        },
-        "expected": {
-          "last_hidden_state": [
-            1,
-            17,
-            32
-          ],
-          "pooler_output": [
-            1,
-            32
-          ],
-          "hidden_patch_tokens": [
-            1,
-            16,
-            32
-          ]
+          "intermediate_size": 256,
+          "position_buckets": 64,
+          "max_relative_positions": 128
         }
       },
-      {
-        "id": "video_depth_anything-clip",
-        "module": "video_depth_anything",
-        "adapter": "uniform",
-        "config": {
-          "encoder": "vits",
-          "embed_dim": 32,
-          "depth": 4,
-          "num_heads": 2,
-          "intermediate_layer_idx": [
-            0,
-            1,
-            2,
-            3
-          ],
-          "features": 8,
-          "out_channels": [
-            8,
-            16,
-            32,
-            32
-          ],
-          "num_frames": 4,
-          "norm_num_groups": 8
+      "checks": ["registry_and_config"]
+    },
+    {
+      "id": "openai_privacy_filter",
+      "module": "openai_privacy_filter",
+      "config": {
+        "vocab_size": 32,
+        "hidden_size": 8,
+        "intermediate_size": 8,
+        "num_hidden_layers": 1,
+        "num_local_experts": 4,
+        "num_experts_per_tok": 2,
+        "head_dim": 4,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "sliding_window": 2,
+        "max_position_embeddings": 32,
+        "default_n_ctx": 32,
+        "pad_token_id": 31,
+        "eos_token_id": 31,
+        "num_labels": 5,
+        "id2label": {
+          "0": "O",
+          "1": "B-x",
+          "2": "I-x",
+          "3": "E-x",
+          "4": "S-x"
         },
-        "input": {
-          "shape": [
-            1,
-            2,
-            28,
-            28,
-            3
-          ]
-        },
-        "expected": [
-          1,
-          2,
-          28,
-          28
-        ]
+        "attention_chunk_size": 3,
+        "moe_chunk_size": 3
       },
-      {
-        "id": "test_backbone_shapes",
-        "module": "sapiens2",
-        "adapter": "uniform",
-        "config": {
-          "architectures": [
-            "Sapiens2Model"
-          ],
-          "hidden_size": 64,
-          "num_hidden_layers": 3,
-          "num_attention_heads": 4,
-          "num_first_full_attention_layers": 1,
-          "num_last_full_attention_layers": 1,
-          "intermediate_size": 128,
-          "image_size": [
-            32,
-            24
-          ],
-          "patch_size": 8,
-          "num_register_tokens": 2
-        },
-        "input": {
-          "shape": [
-            2,
-            32,
-            24,
-            3
-          ]
-        },
-        "expected": {
-          "last_hidden_state": [
-            2,
-            15,
-            64
-          ],
-          "pooler_output": [
-            2,
-            64
-          ]
-        }
+      "checks": ["registry_and_config"]
+    },
+    {
+      "id": "sam3d_objects",
+      "module": "sam3d_objects",
+      "config": {
+        "hidden_size": 32,
+        "num_heads": 4,
+        "num_blocks": 1,
+        "cond_channels": 32,
+        "latent_resolution": 2,
+        "resolution": 8,
+        "io_channels": 8,
+        "decoder_channels": 32,
+        "decoder_heads": 4,
+        "decoder_blocks": 2,
+        "window_size": 2,
+        "structure_channels": [32, 16, 8],
+        "structure_res_blocks": 1,
+        "dino_hidden_size": 32,
+        "dino_heads": 4,
+        "dino_layers": 1,
+        "dino_image_size": 28,
+        "image_size": 28,
+        "point_size": 16,
+        "point_patch_size": 4,
+        "point_channels": 32,
+        "point_heads": 4,
+        "ss_steps": 2,
+        "slat_steps": 2
       },
-      {
-        "id": "test_deconv_head_shapes",
-        "module": "sapiens2",
-        "adapter": "uniform",
-        "config": {
-          "architectures": [
-            "Sapiens2ForSemanticSegmentation"
-          ],
-          "hidden_size": 64,
-          "num_hidden_layers": 3,
-          "num_attention_heads": 4,
-          "num_first_full_attention_layers": 1,
-          "num_last_full_attention_layers": 1,
-          "intermediate_size": 128,
-          "image_size": [
-            32,
-            24
-          ],
-          "patch_size": 8,
-          "num_register_tokens": 2,
-          "head_config": {
-            "upsample_out_channels": [
-              32,
-              16
-            ],
-            "upsample_kernel_sizes": [
-              4,
-              4
-            ],
-            "conv_out_channels": [
-              8
-            ],
-            "conv_kernel_sizes": [
-              1
-            ]
-          },
-          "num_labels": 29
-        },
-        "input": {
-          "shape": [
-            1,
-            32,
-            24,
-            3
-          ]
-        },
-        "expected": {
-          "logits": [
-            1,
-            16,
-            12,
-            29
-          ]
-        },
-        "variants": [
-          {
-            "config": {
-              "architectures": [
-                "Sapiens2ForPoseEstimation"
-              ],
-              "hidden_size": 64,
-              "num_hidden_layers": 3,
-              "num_attention_heads": 4,
-              "num_first_full_attention_layers": 1,
-              "num_last_full_attention_layers": 1,
-              "intermediate_size": 128,
-              "image_size": [
-                32,
-                24
-              ],
-              "patch_size": 8,
-              "num_register_tokens": 2,
-              "head_config": {
-                "upsample_out_channels": [
-                  32,
-                  16
-                ],
-                "upsample_kernel_sizes": [
-                  4,
-                  4
-                ],
-                "conv_out_channels": [
-                  8
-                ],
-                "conv_kernel_sizes": [
-                  1
-                ]
-              },
-              "num_labels": 308
-            },
-            "expected": {
-              "heatmaps": [
-                1,
-                16,
-                12,
-                308
-              ]
-            }
-          }
-        ]
-      },
-      {
-        "id": "test_pixel_shuffle_head_shapes",
-        "module": "sapiens2",
-        "adapter": "uniform",
-        "config": {
-          "architectures": [
-            "Sapiens2ForNormalEstimation"
-          ],
-          "hidden_size": 64,
-          "num_hidden_layers": 3,
-          "num_attention_heads": 4,
-          "num_first_full_attention_layers": 1,
-          "num_last_full_attention_layers": 1,
-          "intermediate_size": 128,
-          "image_size": [
-            32,
-            24
-          ],
-          "patch_size": 8,
-          "num_register_tokens": 2,
-          "head_config": {
-            "upsample_out_channels": [
-              32,
-              16,
-              8
-            ],
-            "upsample_kernel_sizes": [
-              3,
-              3,
-              3
-            ],
-            "conv_out_channels": [
-              8
-            ],
-            "conv_kernel_sizes": [
-              3
-            ],
-            "use_pixel_shuffle": true
-          },
-          "num_labels": 3
-        },
-        "input": {
-          "shape": [
-            1,
-            32,
-            24,
-            3
-          ]
-        },
-        "expected": {
-          "normals": [
-            1,
-            32,
-            24,
-            3
-          ]
-        },
-        "variants": [
-          {
-            "config": {
-              "architectures": [
-                "Sapiens2ForImageMatting"
-              ],
-              "hidden_size": 64,
-              "num_hidden_layers": 3,
-              "num_attention_heads": 4,
-              "num_first_full_attention_layers": 1,
-              "num_last_full_attention_layers": 1,
-              "intermediate_size": 128,
-              "image_size": [
-                32,
-                24
-              ],
-              "patch_size": 8,
-              "num_register_tokens": 2,
-              "head_config": {
-                "upsample_out_channels": [
-                  32,
-                  16,
-                  8
-                ],
-                "upsample_kernel_sizes": [
-                  3,
-                  3,
-                  3
-                ],
-                "conv_out_channels": [
-                  8
-                ],
-                "conv_kernel_sizes": [
-                  3
-                ],
-                "use_pixel_shuffle": true
-              },
-              "num_labels": 4
-            },
-            "expected": {
-              "alphas": [
-                1,
-                32,
-                24,
-                1
-              ],
-              "foregrounds": [
-                1,
-                32,
-                24,
-                3
-              ]
-            },
-            "expect_range": {
-              "alphas": [
-                0.0,
-                1.0
-              ]
-            }
-          }
-        ]
-      },
-      {
-        "id": "test_pointmap_scale_branch",
-        "module": "sapiens2",
-        "adapter": "uniform",
-        "config": {
-          "architectures": [
-            "Sapiens2ForPointmapEstimation"
-          ],
-          "hidden_size": 64,
-          "num_hidden_layers": 3,
-          "num_attention_heads": 4,
-          "num_first_full_attention_layers": 1,
-          "num_last_full_attention_layers": 1,
-          "intermediate_size": 128,
-          "image_size": [
-            32,
-            24
-          ],
-          "patch_size": 8,
-          "num_register_tokens": 2,
-          "head_config": {
-            "upsample_out_channels": [
-              32,
-              16,
-              8
-            ],
-            "upsample_kernel_sizes": [
-              3,
-              3,
-              3
-            ],
-            "conv_out_channels": [
-              8
-            ],
-            "conv_kernel_sizes": [
-              3
-            ],
-            "use_pixel_shuffle": true,
-            "scale_conv_out_channels": [
-              32,
-              16,
-              8
-            ],
-            "scale_conv_kernel_sizes": [
-              1,
-              1,
-              1
-            ],
-            "scale_final_input_size": 8,
-            "scale_final_hidden_sizes": [
-              16,
-              8
-            ]
-          },
-          "num_labels": 3
-        },
-        "input": {
-          "shape": [
-            1,
-            32,
-            24,
-            3
-          ]
-        },
-        "expected": {
-          "pointmaps": [
-            1,
-            32,
-            24,
-            3
-          ],
-          "scales": [
-            1,
-            1
-          ]
-        }
+      "checks": ["registry_and_config"]
+    }
+  ],
+  "shared_configs": {
+    "bert_token_classifier": {
+      "model_type": "bert",
+      "vocab_size": 64,
+      "hidden_size": 64,
+      "num_hidden_layers": 2,
+      "num_attention_heads": 4,
+      "intermediate_size": 128,
+      "max_position_embeddings": 32,
+      "num_labels": 5,
+      "id2label": {
+        "0": "O",
+        "1": "B-NAME",
+        "2": "I-NAME",
+        "3": "B-PHONE",
+        "4": "I-PHONE"
       }
-    ],
-    "sanitize": [
-      {
-        "id": "dinov2-idempotent",
-        "module": "dinov2",
-        "config": {
-          "hidden_size": 32,
-          "num_hidden_layers": 2,
-          "num_attention_heads": 2,
-          "patch_size": 16,
-          "image_size": 64,
-          "mlp_ratio": 2.0
-        }
-      },
-      {
-        "id": "video_depth_anything-idempotent",
-        "module": "video_depth_anything",
-        "config": {
-          "encoder": "vits",
-          "embed_dim": 32,
-          "depth": 4,
-          "num_heads": 2,
-          "intermediate_layer_idx": [
-            0,
-            1,
-            2,
-            3
-          ],
-          "features": 8,
-          "out_channels": [
-            8,
-            16,
-            32,
-            32
-          ],
-          "num_frames": 4,
-          "norm_num_groups": 8
-        }
-      },
-      {
-        "id": "test_sanitize_unifies_mixed_dtypes",
-        "module": "sapiens2",
-        "config": {
-          "architectures": [
-            "Sapiens2Model"
-          ],
-          "hidden_size": 64,
-          "num_hidden_layers": 3,
-          "num_attention_heads": 4,
-          "num_first_full_attention_layers": 1,
-          "num_last_full_attention_layers": 1,
-          "intermediate_size": 128,
-          "image_size": [
-            32,
-            24
-          ],
-          "patch_size": 8,
-          "num_register_tokens": 2
-        },
-        "mixed_dtype": {
-          "float32_suffixes": [
-            ".bias",
-            "ln1.weight",
-            "ln2.weight"
-          ]
-        }
-      }
-    ],
-    "parity": [
-      {
-        "id": "test_conv1x1_matches_conv2d",
-        "component": "sapiens2.heads.Conv1x1",
-        "args": [
-          6,
-          4
-        ],
-        "input": [
-          2,
-          5,
-          3,
-          6
-        ],
-        "reference": "conv2d",
-        "atol": 1e-05
-      },
-      {
-        "id": "test_conv3x3_matches_conv2d",
-        "component": "sapiens2.heads.Conv3x3",
-        "args": [
-          6,
-          4
-        ],
-        "input": [
-          2,
-          7,
-          5,
-          6
-        ],
-        "reference": "conv2d_pad1",
-        "atol": 0.0001,
-        "variants": [
-          {
-            "max_im2col_elements": 1
-          }
-        ]
-      },
-      {
-        "id": "test_deconv_upsample_matches_conv_transpose",
-        "component": "sapiens2.heads.DeconvUpsample",
-        "args": [
-          6,
-          5
-        ],
-        "input": [
-          2,
-          7,
-          5,
-          6
-        ],
-        "reference": "conv_transpose_stride2_pad1",
-        "atol": 0.0001,
-        "expected_shape": [
-          2,
-          14,
-          10,
-          5
-        ],
-        "zero_weight_gives_zero": true
-      },
-      {
-        "id": "test_window_attention_matches_masked_dense_attention",
-        "builder": "sparse_window_attention",
-        "grid": [
-          4,
-          3
-        ],
-        "window": 2,
-        "shifts": [
-          0,
-          1
-        ],
-        "heads_dim": [
-          2,
-          4
-        ],
-        "atol": 1e-05
-      }
-    ],
-    "config": [
-      {
-        "id": "test_kv_heads_per_layer",
-        "module": "sapiens2",
-        "config": {
-          "architectures": [
-            "Sapiens2Model"
-          ],
-          "hidden_size": 64,
-          "num_hidden_layers": 3,
-          "num_attention_heads": 4,
-          "num_first_full_attention_layers": 1,
-          "num_last_full_attention_layers": 1,
-          "intermediate_size": 128,
-          "image_size": [
-            32,
-            24
-          ],
-          "patch_size": 8,
-          "num_register_tokens": 2
-        },
-        "expect": {
-          "kv_heads_per_layer": [
-            4,
-            2,
-            4
-          ]
-        },
-        "variants": [
-          {
-            "config": {
-              "architectures": [
-                "Sapiens2Model"
-              ],
-              "hidden_size": 64,
-              "num_hidden_layers": 3,
-              "num_attention_heads": 4,
-              "num_first_full_attention_layers": 1,
-              "num_last_full_attention_layers": 1,
-              "intermediate_size": 128,
-              "image_size": [
-                32,
-                24
-              ],
-              "patch_size": 8,
-              "num_register_tokens": 2,
-              "num_key_value_heads_per_layer": [
-                4,
-                4,
-                4
-              ]
-            },
-            "expect": {
-              "kv_heads_per_layer": [
-                4,
-                4,
-                4
-              ]
-            }
-          }
-        ]
-      },
-      {
-        "id": "test_config_from_hf_dict",
-        "module": "sapiens2",
-        "from_dict": {
-          "model_type": "sapiens2",
-          "architectures": [
-            "Sapiens2ForSemanticSegmentation"
-          ],
-          "hidden_size": 1024,
-          "stage_names": [
-            "stem",
-            "stage1"
-          ],
-          "id2label": {
-            "0": "L0",
-            "1": "L1",
-            "2": "L2",
-            "3": "L3",
-            "4": "L4",
-            "5": "L5",
-            "6": "L6",
-            "7": "L7",
-            "8": "L8",
-            "9": "L9",
-            "10": "L10",
-            "11": "L11",
-            "12": "L12",
-            "13": "L13",
-            "14": "L14",
-            "15": "L15",
-            "16": "L16",
-            "17": "L17",
-            "18": "L18",
-            "19": "L19",
-            "20": "L20",
-            "21": "L21",
-            "22": "L22",
-            "23": "L23",
-            "24": "L24",
-            "25": "L25",
-            "26": "L26",
-            "27": "L27",
-            "28": "L28"
-          },
-          "head_config": {
-            "model_type": "sapiens2_head",
-            "upsample_out_channels": [
-              512,
-              256,
-              128,
-              64
-            ],
-            "upsample_kernel_sizes": [
-              4,
-              4,
-              4,
-              4
-            ],
-            "conv_out_channels": [
-              64,
-              64
-            ],
-            "conv_kernel_sizes": [
-              1,
-              1
-            ],
-            "use_pixel_shuffle": null,
-            "chunk_size_feed_forward": 0
-          }
-        },
-        "expect": {
-          "task": "seg",
-          "num_labels": 29,
-          "head_config.upsample_out_channels": [
-            512,
-            256,
-            128,
-            64
-          ]
-        },
-        "expect_type": {
-          "head_config": "HeadConfig"
-        }
-      },
-      {
-        "id": "test_config_routes_and_round_trips",
-        "module": "sam3d_objects",
-        "config": {},
-        "expect": {
-          "depth_model": null
-        },
-        "variants": [
-          {
-            "config": {
-              "depth_model": {}
-            },
-            "expect": {
-              "depth_model.encoder.backbone": "dinov2_vitl14",
-              "depth_model.encoder.embed_dim": 1024
-            }
-          },
-          {
-            "from_dict": {
-              "depth_model": true
-            },
-            "raises": "MoGe-v1"
-          }
-        ]
-      }
-    ],
-    "weight_names": [
-      {
-        "id": "test_weight_names_match_checkpoint",
-        "module": "sapiens2",
-        "config": {
-          "architectures": [
-            "Sapiens2ForSemanticSegmentation"
-          ],
-          "hidden_size": 64,
-          "num_hidden_layers": 3,
-          "num_attention_heads": 4,
-          "num_first_full_attention_layers": 1,
-          "num_last_full_attention_layers": 1,
-          "intermediate_size": 128,
-          "image_size": [
-            32,
-            24
-          ],
-          "patch_size": 8,
-          "num_register_tokens": 2,
-          "head_config": {
-            "upsample_out_channels": [
-              32,
-              16
-            ],
-            "upsample_kernel_sizes": [
-              4,
-              4
-            ],
-            "conv_out_channels": [
-              8
-            ],
-            "conv_kernel_sizes": [
-              1
-            ]
-          },
-          "num_labels": 29
-        },
-        "expect_keys": [
-          "backbone.patch_embed.projection.weight",
-          "backbone.cls_token",
-          "backbone.storage_tokens",
-          "backbone.rope_embed.periods",
-          "backbone.blocks.0.ln1.weight",
-          "backbone.blocks.0.attn.wqkv.weight",
-          "backbone.blocks.0.attn.q_norm.weight",
-          "backbone.blocks.0.attn.gamma.weight",
-          "backbone.blocks.0.ffn.w12.weight",
-          "backbone.blocks.0.ffn.w3.weight",
-          "backbone.ln1.weight",
-          "decode_head.deconv_layers.0.weight",
-          "decode_head.deconv_layers.3.weight",
-          "decode_head.conv_layers.0.weight",
-          "decode_head.conv_seg.weight"
-        ]
-      }
-    ],
-    "relayout": [
-      {
-        "id": "test_sanitize_relays_conv_weights",
-        "module": "sapiens2",
-        "config": {
-          "architectures": [
-            "Sapiens2ForSemanticSegmentation"
-          ],
-          "hidden_size": 64,
-          "num_hidden_layers": 3,
-          "num_attention_heads": 4,
-          "num_first_full_attention_layers": 1,
-          "num_last_full_attention_layers": 1,
-          "intermediate_size": 128,
-          "image_size": [
-            32,
-            24
-          ],
-          "patch_size": 8,
-          "num_register_tokens": 2,
-          "head_config": {
-            "upsample_out_channels": [
-              32,
-              16
-            ],
-            "upsample_kernel_sizes": [
-              4,
-              4
-            ],
-            "conv_out_channels": [
-              8
-            ],
-            "conv_kernel_sizes": [
-              1
-            ]
-          },
-          "num_labels": 29
-        },
-        "torch_layout": [
-          {
-            "match": "projection.weight",
-            "layout": "conv2d",
-            "kernel": 8
-          },
-          {
-            "match": "deconv_layers",
-            "layout": "conv_transpose",
-            "kernel": 4
-          }
-        ],
-        "bare_keys": {
-          "patch_embed.projection.bias": [
-            [
-              64
-            ],
-            "backbone.patch_embed.projection.bias"
-          ]
-        }
-      }
-    ],
-    "merge_qkv": [
-      {
-        "id": "test_sanitize_merges_qkv",
-        "module": "sapiens2",
-        "config": {
-          "architectures": [
-            "Sapiens2Model"
-          ],
-          "hidden_size": 64,
-          "num_hidden_layers": 3,
-          "num_attention_heads": 4,
-          "num_first_full_attention_layers": 1,
-          "num_last_full_attention_layers": 1,
-          "intermediate_size": 128,
-          "image_size": [
-            32,
-            24
-          ],
-          "patch_size": 8,
-          "num_register_tokens": 2
-        },
-        "layer": "backbone.blocks.1.attn",
-        "sizes": {
-          "q": "embed_dims",
-          "k": "kv_size",
-          "v": "kv_size"
-        },
-        "order": [
-          "q",
-          "k",
-          "v"
-        ],
-        "in_features": 64,
-        "source": "backbone.blocks.1.attn.w{part}",
-        "target": "backbone.blocks.1.attn.wqkv"
-      }
-    ],
-    "predictor": [
-      {
-        "id": "test_dense_predictor_outputs",
-        "module": "sapiens2",
-        "predictor": "Sapiens2Predictor",
-        "image": [
-          40,
-          30
-        ],
-        "config": {
-          "architectures": [
-            "Sapiens2ForSemanticSegmentation"
-          ],
-          "hidden_size": 64,
-          "num_hidden_layers": 3,
-          "num_attention_heads": 4,
-          "num_first_full_attention_layers": 1,
-          "num_last_full_attention_layers": 1,
-          "intermediate_size": 128,
-          "image_size": [
-            32,
-            24
-          ],
-          "patch_size": 8,
-          "num_register_tokens": 2,
-          "head_config": {
-            "upsample_out_channels": [
-              32,
-              16
-            ],
-            "upsample_kernel_sizes": [
-              4,
-              4
-            ],
-            "conv_out_channels": [
-              8
-            ],
-            "conv_kernel_sizes": [
-              1
-            ]
-          },
-          "num_labels": 5
-        },
-        "expected": {
-          "segmentation": {
-            "shape": [
-              40,
-              30
-            ],
-            "dtype": "int32",
-            "max_below": 5
-          }
-        },
-        "variants": [
-          {
-            "config": {
-              "architectures": [
-                "Sapiens2ForNormalEstimation"
-              ],
-              "hidden_size": 64,
-              "num_hidden_layers": 3,
-              "num_attention_heads": 4,
-              "num_first_full_attention_layers": 1,
-              "num_last_full_attention_layers": 1,
-              "intermediate_size": 128,
-              "image_size": [
-                32,
-                24
-              ],
-              "patch_size": 8,
-              "num_register_tokens": 2,
-              "head_config": {
-                "upsample_out_channels": [
-                  32,
-                  16,
-                  8
-                ],
-                "upsample_kernel_sizes": [
-                  3,
-                  3,
-                  3
-                ],
-                "conv_out_channels": [
-                  8
-                ],
-                "conv_kernel_sizes": [
-                  3
-                ],
-                "use_pixel_shuffle": true
-              },
-              "num_labels": 3
-            },
-            "expected": {
-              "normals": {
-                "shape": [
-                  40,
-                  30,
-                  3
-                ],
-                "norm_below": 1.01
-              }
-            }
-          },
-          {
-            "config": {
-              "architectures": [
-                "Sapiens2ForImageMatting"
-              ],
-              "hidden_size": 64,
-              "num_hidden_layers": 3,
-              "num_attention_heads": 4,
-              "num_first_full_attention_layers": 1,
-              "num_last_full_attention_layers": 1,
-              "intermediate_size": 128,
-              "image_size": [
-                32,
-                24
-              ],
-              "patch_size": 8,
-              "num_register_tokens": 2,
-              "head_config": {
-                "upsample_out_channels": [
-                  32,
-                  16,
-                  8
-                ],
-                "upsample_kernel_sizes": [
-                  3,
-                  3,
-                  3
-                ],
-                "conv_out_channels": [
-                  8
-                ],
-                "conv_kernel_sizes": [
-                  3
-                ],
-                "use_pixel_shuffle": true
-              },
-              "num_labels": 4
-            },
-            "expected": {
-              "alphas": {
-                "shape": [
-                  40,
-                  30
-                ],
-                "range": [
-                  0,
-                  1
-                ]
-              },
-              "foregrounds": {
-                "shape": [
-                  40,
-                  30,
-                  3
-                ]
-              }
-            }
-          }
-        ]
-      }
-    ]
+    },
+    "sapiens2_deconv_head": {
+      "upsample_out_channels": [32, 16],
+      "upsample_kernel_sizes": [4, 4],
+      "conv_out_channels": [8],
+      "conv_kernel_sizes": [1]
+    },
+    "sapiens2_pixel_shuffle_head": {
+      "upsample_out_channels": [32, 16, 8],
+      "upsample_kernel_sizes": [3, 3, 3],
+      "conv_out_channels": [8],
+      "conv_kernel_sizes": [3],
+      "use_pixel_shuffle": true
+    }
   }
 }

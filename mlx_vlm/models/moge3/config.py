@@ -4,7 +4,7 @@ Mirrors the ``model_config`` dict stored in the official ``model.pt``
 checkpoints. Defaults reproduce the released MoGe-3 ViT-L model.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import List, Optional, Union
 
 from ..base import BaseModelConfig
@@ -141,3 +141,6 @@ class ModelConfig(BaseModelConfig):
             if isinstance(params.get(key), dict):
                 params[key] = sub_cls.from_dict(params[key])
         return super().from_dict(params)
+
+    def to_dict(self):
+        return asdict(self)

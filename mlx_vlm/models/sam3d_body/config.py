@@ -100,10 +100,14 @@ class SAM3DConfig(BaseModelConfig):
     vision_config: VisionConfig = field(default_factory=VisionConfig)
     text_config: TextConfig = field(default_factory=TextConfig)
 
+    def to_dict(self):
+        return asdict(self)
+
     @classmethod
     def from_dict(cls, params):
         if not params:
             return cls()
+        params = dict(params)
         vision_params = params.pop("vision_config", {})
         text_params = params.pop("text_config", {})
         filtered = {

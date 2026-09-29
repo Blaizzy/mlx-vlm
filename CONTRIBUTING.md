@@ -56,23 +56,21 @@ Getting this wrong fails in two ways. A shape-changing conversion applied twice
 dies loudly at weight-load; a value-changing one (a norm shift, a scale rewrite)
 loads fine and generates garbage.
 
-Additionally, register the new model type with the case file that matches it,
-using the existing checks in the test module beside it. For sanitizer changes,
-verify that a second pass preserves the weight keys, shapes, and values — the
-`sanitize` check does this for you.
+Register a small configuration in the case file for the model's task:
 
-| the model | case file | checks |
+| Task | Case file | Tests |
 |---|---|---|
-| generates text (has a language model) | [model_cases.json](mlx_vlm/tests/model_cases.json) | [test_models.py](mlx_vlm/tests/test_models.py) |
-| generates images | [image_generation_cases.json](mlx_vlm/tests/image_generation_cases.json) | [test_image_generation_models.py](mlx_vlm/tests/test_image_generation_models.py) |
-| extracts depth, geometry, masks or spans | [extraction_cases.json](mlx_vlm/tests/extraction_cases.json) | [test_extraction_models.py](mlx_vlm/tests/test_extraction_models.py) |
+| Text generation | [model_cases.json](mlx_vlm/tests/model_cases.json) | [test_models.py](mlx_vlm/tests/test_models.py) |
+| Image generation | [image_generation_cases.json](mlx_vlm/tests/image_generation_cases.json) | [test_image_generation_models.py](mlx_vlm/tests/test_image_generation_models.py) |
+| Depth, geometry, masks, or spans | [extraction_cases.json](mlx_vlm/tests/extraction_cases.json) | [test_extraction_models.py](mlx_vlm/tests/test_extraction_models.py) |
 
-The last two key their cases by check rather than by model
-(`checks: {name: [case, ...]}`), because these models share no common
-`__call__`: a named adapter builds the inputs for each call shape. Put case
-data in the JSON and keep anything numeric — reference implementations,
-tolerances — in Python. A contract a model cannot satisfy yet is recorded with
-an `"xfail"` reason rather than left out, so it starts failing once fixed.
+Extraction cases use `id`, `module`, `config`, and `checks`, like text-model
+cases. Shared checks cover `registry_and_config`, `forward`, and `checkpoint`;
+forward checks use `input_shape` and `output_shapes`. Configs must survive a JSON
+round trip without mutating the input dictionary. Specialized tests reuse case
+configs and `shared_configs`, keeping numerical, checkpoint conversion,
+streaming, and IO assertions in Python. Use nonuniform weights to verify
+conversion values and second-pass stability.
 
 From the repository root, you can run the tests with:
 
