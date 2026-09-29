@@ -188,7 +188,7 @@
         ]
       },
       {
-        "id": "sapiens2-backbone",
+        "id": "test_backbone_shapes",
         "module": "sapiens2",
         "adapter": "pixel_values",
         "config": {
@@ -210,7 +210,7 @@
         },
         "input": {
           "shape": [
-            1,
+            2,
             32,
             24,
             3
@@ -218,13 +218,310 @@
         },
         "expected": {
           "last_hidden_state": [
-            1,
+            2,
             15,
             64
           ],
           "pooler_output": [
-            1,
+            2,
             64
+          ]
+        }
+      },
+      {
+        "id": "test_deconv_head_shapes",
+        "module": "sapiens2",
+        "adapter": "pixel_values",
+        "config": {
+          "architectures": [
+            "Sapiens2ForSemanticSegmentation"
+          ],
+          "hidden_size": 64,
+          "num_hidden_layers": 3,
+          "num_attention_heads": 4,
+          "num_first_full_attention_layers": 1,
+          "num_last_full_attention_layers": 1,
+          "intermediate_size": 128,
+          "image_size": [
+            32,
+            24
+          ],
+          "patch_size": 8,
+          "num_register_tokens": 2,
+          "head_config": {
+            "upsample_out_channels": [
+              32,
+              16
+            ],
+            "upsample_kernel_sizes": [
+              4,
+              4
+            ],
+            "conv_out_channels": [
+              8
+            ],
+            "conv_kernel_sizes": [
+              1
+            ]
+          },
+          "num_labels": 29
+        },
+        "input": {
+          "shape": [
+            1,
+            32,
+            24,
+            3
+          ]
+        },
+        "expected": {
+          "logits": [
+            1,
+            16,
+            12,
+            29
+          ]
+        },
+        "variants": [
+          {
+            "config": {
+              "architectures": [
+                "Sapiens2ForPoseEstimation"
+              ],
+              "hidden_size": 64,
+              "num_hidden_layers": 3,
+              "num_attention_heads": 4,
+              "num_first_full_attention_layers": 1,
+              "num_last_full_attention_layers": 1,
+              "intermediate_size": 128,
+              "image_size": [
+                32,
+                24
+              ],
+              "patch_size": 8,
+              "num_register_tokens": 2,
+              "head_config": {
+                "upsample_out_channels": [
+                  32,
+                  16
+                ],
+                "upsample_kernel_sizes": [
+                  4,
+                  4
+                ],
+                "conv_out_channels": [
+                  8
+                ],
+                "conv_kernel_sizes": [
+                  1
+                ]
+              },
+              "num_labels": 308
+            },
+            "expected": {
+              "heatmaps": [
+                1,
+                16,
+                12,
+                308
+              ]
+            }
+          }
+        ]
+      },
+      {
+        "id": "test_pixel_shuffle_head_shapes",
+        "module": "sapiens2",
+        "adapter": "pixel_values",
+        "config": {
+          "architectures": [
+            "Sapiens2ForNormalEstimation"
+          ],
+          "hidden_size": 64,
+          "num_hidden_layers": 3,
+          "num_attention_heads": 4,
+          "num_first_full_attention_layers": 1,
+          "num_last_full_attention_layers": 1,
+          "intermediate_size": 128,
+          "image_size": [
+            32,
+            24
+          ],
+          "patch_size": 8,
+          "num_register_tokens": 2,
+          "head_config": {
+            "upsample_out_channels": [
+              32,
+              16,
+              8
+            ],
+            "upsample_kernel_sizes": [
+              3,
+              3,
+              3
+            ],
+            "conv_out_channels": [
+              8
+            ],
+            "conv_kernel_sizes": [
+              3
+            ],
+            "use_pixel_shuffle": true
+          },
+          "num_labels": 3
+        },
+        "input": {
+          "shape": [
+            1,
+            32,
+            24,
+            3
+          ]
+        },
+        "expected": {
+          "normals": [
+            1,
+            32,
+            24,
+            3
+          ]
+        },
+        "variants": [
+          {
+            "config": {
+              "architectures": [
+                "Sapiens2ForImageMatting"
+              ],
+              "hidden_size": 64,
+              "num_hidden_layers": 3,
+              "num_attention_heads": 4,
+              "num_first_full_attention_layers": 1,
+              "num_last_full_attention_layers": 1,
+              "intermediate_size": 128,
+              "image_size": [
+                32,
+                24
+              ],
+              "patch_size": 8,
+              "num_register_tokens": 2,
+              "head_config": {
+                "upsample_out_channels": [
+                  32,
+                  16,
+                  8
+                ],
+                "upsample_kernel_sizes": [
+                  3,
+                  3,
+                  3
+                ],
+                "conv_out_channels": [
+                  8
+                ],
+                "conv_kernel_sizes": [
+                  3
+                ],
+                "use_pixel_shuffle": true
+              },
+              "num_labels": 4
+            },
+            "expected": {
+              "alphas": [
+                1,
+                32,
+                24,
+                1
+              ],
+              "foregrounds": [
+                1,
+                32,
+                24,
+                3
+              ]
+            },
+            "expect_range": {
+              "alphas": [
+                0.0,
+                1.0
+              ]
+            }
+          }
+        ]
+      },
+      {
+        "id": "test_pointmap_scale_branch",
+        "module": "sapiens2",
+        "adapter": "pixel_values",
+        "config": {
+          "architectures": [
+            "Sapiens2ForPointmapEstimation"
+          ],
+          "hidden_size": 64,
+          "num_hidden_layers": 3,
+          "num_attention_heads": 4,
+          "num_first_full_attention_layers": 1,
+          "num_last_full_attention_layers": 1,
+          "intermediate_size": 128,
+          "image_size": [
+            32,
+            24
+          ],
+          "patch_size": 8,
+          "num_register_tokens": 2,
+          "head_config": {
+            "upsample_out_channels": [
+              32,
+              16,
+              8
+            ],
+            "upsample_kernel_sizes": [
+              3,
+              3,
+              3
+            ],
+            "conv_out_channels": [
+              8
+            ],
+            "conv_kernel_sizes": [
+              3
+            ],
+            "use_pixel_shuffle": true,
+            "scale_conv_out_channels": [
+              32,
+              16,
+              8
+            ],
+            "scale_conv_kernel_sizes": [
+              1,
+              1,
+              1
+            ],
+            "scale_final_input_size": 8,
+            "scale_final_hidden_sizes": [
+              16,
+              8
+            ]
+          },
+          "num_labels": 3
+        },
+        "input": {
+          "shape": [
+            1,
+            32,
+            24,
+            3
+          ]
+        },
+        "expected": {
+          "pointmaps": [
+            1,
+            32,
+            24,
+            3
+          ],
+          "scales": [
+            1,
+            1
           ]
         }
       }
@@ -356,6 +653,153 @@
           5
         ],
         "zero_weight_gives_zero": true
+      }
+    ],
+    "config": [
+      {
+        "id": "test_kv_heads_per_layer",
+        "module": "sapiens2",
+        "config": {
+          "architectures": [
+            "Sapiens2Model"
+          ],
+          "hidden_size": 64,
+          "num_hidden_layers": 3,
+          "num_attention_heads": 4,
+          "num_first_full_attention_layers": 1,
+          "num_last_full_attention_layers": 1,
+          "intermediate_size": 128,
+          "image_size": [
+            32,
+            24
+          ],
+          "patch_size": 8,
+          "num_register_tokens": 2
+        },
+        "expect": {
+          "kv_heads_per_layer": [
+            4,
+            2,
+            4
+          ]
+        },
+        "variants": [
+          {
+            "config": {
+              "architectures": [
+                "Sapiens2Model"
+              ],
+              "hidden_size": 64,
+              "num_hidden_layers": 3,
+              "num_attention_heads": 4,
+              "num_first_full_attention_layers": 1,
+              "num_last_full_attention_layers": 1,
+              "intermediate_size": 128,
+              "image_size": [
+                32,
+                24
+              ],
+              "patch_size": 8,
+              "num_register_tokens": 2,
+              "num_key_value_heads_per_layer": [
+                4,
+                4,
+                4
+              ]
+            },
+            "expect": {
+              "kv_heads_per_layer": [
+                4,
+                4,
+                4
+              ]
+            }
+          }
+        ]
+      },
+      {
+        "id": "test_config_from_hf_dict",
+        "module": "sapiens2",
+        "from_dict": {
+          "model_type": "sapiens2",
+          "architectures": [
+            "Sapiens2ForSemanticSegmentation"
+          ],
+          "hidden_size": 1024,
+          "stage_names": [
+            "stem",
+            "stage1"
+          ],
+          "id2label": {
+            "0": "L0",
+            "1": "L1",
+            "2": "L2",
+            "3": "L3",
+            "4": "L4",
+            "5": "L5",
+            "6": "L6",
+            "7": "L7",
+            "8": "L8",
+            "9": "L9",
+            "10": "L10",
+            "11": "L11",
+            "12": "L12",
+            "13": "L13",
+            "14": "L14",
+            "15": "L15",
+            "16": "L16",
+            "17": "L17",
+            "18": "L18",
+            "19": "L19",
+            "20": "L20",
+            "21": "L21",
+            "22": "L22",
+            "23": "L23",
+            "24": "L24",
+            "25": "L25",
+            "26": "L26",
+            "27": "L27",
+            "28": "L28"
+          },
+          "head_config": {
+            "model_type": "sapiens2_head",
+            "upsample_out_channels": [
+              512,
+              256,
+              128,
+              64
+            ],
+            "upsample_kernel_sizes": [
+              4,
+              4,
+              4,
+              4
+            ],
+            "conv_out_channels": [
+              64,
+              64
+            ],
+            "conv_kernel_sizes": [
+              1,
+              1
+            ],
+            "use_pixel_shuffle": null,
+            "chunk_size_feed_forward": 0
+          }
+        },
+        "expect": {
+          "task": "seg",
+          "num_labels": 29,
+          "head_config.upsample_out_channels": [
+            512,
+            256,
+            128,
+            64
+          ]
+        },
+        "expect_type": {
+          "head_config": "HeadConfig"
+        }
       }
     ]
   }

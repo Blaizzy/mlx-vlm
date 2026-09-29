@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import importlib
 import io
 import json
@@ -10,6 +11,7 @@ import pickle
 import tempfile
 import threading
 import unittest
+from operator import attrgetter
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -771,102 +773,6 @@ class TestSapiens2(unittest.TestCase):
     @staticmethod
     def _image(h=40, w=30):
         return np.random.default_rng(0).integers(0, 255, (h, w, 3), np.uint8)
-
-    def test_config_from_hf_dict(self):
-        """from_dict parses an official-style config.json (nested head_config,
-        unknown keys ignored, num_labels from id2label)."""
-        from mlx_vlm.models.sapiens2.config import HeadConfig, ModelConfig
-
-        config = ModelConfig.from_dict(
-            {
-                "model_type": "sapiens2",
-                "architectures": ["Sapiens2ForSemanticSegmentation"],
-                "hidden_size": 1024,
-                "stage_names": ["stem", "stage1"],  # unknown key
-                "id2label": {str(i): f"L{i}" for i in range(29)},
-                "head_config": {
-                    "model_type": "sapiens2_head",
-                    "upsample_out_channels": [512, 256, 128, 64],
-                    "upsample_kernel_sizes": [4, 4, 4, 4],
-                    "conv_out_channels": [64, 64],
-                    "conv_kernel_sizes": [1, 1],
-                    "use_pixel_shuffle": None,
-                    "chunk_size_feed_forward": 0,  # unknown key
-                },
-            }
-        )
-        self.assertEqual(config.task, "seg")
-        self.assertEqual(config.num_labels, 29)
-        self.assertIsInstance(config.head_config, HeadConfig)
-        self.assertEqual(config.head_config.upsample_out_channels, [512, 256, 128, 64])
-
-    def test_kv_heads_per_layer(self):
-        """Middle layers use half the query heads (GQA); edges full MHSA."""
-        config = self._tiny_config()
-        self.assertEqual(config.kv_heads_per_layer, [4, 2, 4])
-        explicit = self._tiny_config(num_key_value_heads_per_layer=[4, 4, 4])
-        self.assertEqual(explicit.kv_heads_per_layer, [4, 4, 4])
-
-    def test_backbone_shapes(self):
-        """Tokens include 1 cls + R register + H*W/patch^2 patch tokens."""
-        from mlx_vlm.models.sapiens2.sapiens2 import Model
-
-        model = Model(self._tiny_config())
-        out = model(mx.random.normal((2, 32, 24, 3)))
-        # grid 4x3 = 12 patches + 3 prefix tokens
-        self.assertEqual(out["last_hidden_state"].shape, (2, 15, 64))
-        self.assertEqual(out["pooler_output"].shape, (2, 64))
-
-    def test_deconv_head_shapes(self):
-        """Seg/pose heads upsample x2 per deconv block."""
-        from mlx_vlm.models.sapiens2.sapiens2 import Model
-
-        for task, labels in (("seg", 29), ("pose", 308)):
-            config = self._tiny_config(
-                task, head_config=self._deconv_head(), num_labels=labels
-            )
-            model = Model(config)
-            out = model(mx.random.normal((1, 32, 24, 3)))
-            key = "logits" if task == "seg" else "heatmaps"
-            self.assertEqual(out[key].shape, (1, 16, 12, labels))
-
-    def test_pixel_shuffle_head_shapes(self):
-        """Normal/matting heads upsample x2 per PixelShuffle block."""
-        from mlx_vlm.models.sapiens2.sapiens2 import Model
-
-        config = self._tiny_config(
-            "normal", head_config=self._pixel_shuffle_head(), num_labels=3
-        )
-        model = Model(config)
-        out = model(mx.random.normal((1, 32, 24, 3)))
-        self.assertEqual(out["normals"].shape, (1, 32, 24, 3))
-
-        config = self._tiny_config(
-            "matting", head_config=self._pixel_shuffle_head(), num_labels=4
-        )
-        model = Model(config)
-        out = model(mx.random.normal((1, 32, 24, 3)))
-        self.assertEqual(out["alphas"].shape, (1, 32, 24, 1))
-        self.assertEqual(out["foregrounds"].shape, (1, 32, 24, 3))
-        # sigmoid output range
-        self.assertLessEqual(float(out["alphas"].max()), 1.0)
-        self.assertGreaterEqual(float(out["alphas"].min()), 0.0)
-
-    def test_pointmap_scale_branch(self):
-        """Pointmap head also returns a per-image scale."""
-        from mlx_vlm.models.sapiens2.sapiens2 import Model
-
-        head = self._pixel_shuffle_head(
-            scale_conv_out_channels=[32, 16, 8],
-            scale_conv_kernel_sizes=[1, 1, 1],
-            scale_final_input_size=8,  # grid 4x3 -> 1x1 after 3 stride-2 convs
-            scale_final_hidden_sizes=[16, 8],
-        )
-        config = self._tiny_config("pointmap", head_config=head, num_labels=3)
-        model = Model(config)
-        out = model(mx.random.normal((1, 32, 24, 3)))
-        self.assertEqual(out["pointmaps"].shape, (1, 32, 24, 3))
-        self.assertEqual(out["scales"].shape, (1, 1))
 
     def test_tokenizer_backbone(self):
         """The 4K tokenizer reduces the token grid by the window size."""
@@ -1971,11 +1877,25 @@ def _extraction_module(case):
     return importlib.import_module("mlx_vlm.models." + case["module"])
 
 
-def _extraction_model(case):
-    from mlx_vlm.tests.test_models import build_config
+# Nested config fields these models use on top of the VLM ones.
+_EXTRA_CONFIG_TYPES = {"head_config": "HeadConfig"}
 
+
+def _extraction_config(module, values, config_type="ModelConfig"):
+    """``build_config`` with the extraction families' nested config fields."""
+    from mlx_vlm.tests.test_models import CONFIG_TYPES
+
+    types = {**CONFIG_TYPES, **_EXTRA_CONFIG_TYPES}
+    fields = copy.deepcopy(values)
+    for name, value in fields.items():
+        if name in types and isinstance(value, dict):
+            fields[name] = _extraction_config(module, value, types[name])
+    return attrgetter(config_type)(module)(**fields)
+
+
+def _extraction_model(case, config=None):
     module = _extraction_module(case)
-    model = module.Model(build_config(module, case["config"]))
+    model = module.Model(_extraction_config(module, config or case["config"]))
     model.eval()
     mx.eval(model.parameters())
     return model
@@ -2035,18 +1955,59 @@ class ExtractionChecks:
                 module.ModelConfig(**case["invalid"])
 
     def forward(self, case):
-        """Output shapes, dtype and finiteness for one forward pass."""
-        model = _extraction_model(case)
-        output = getattr(ForwardAdapters, case["adapter"])(model, case["input"])
-        mx.eval(output)
-        expected = case["expected"]
-        outputs = output if isinstance(expected, dict) else {None: output}
-        expected = expected if isinstance(expected, dict) else {None: expected}
-        for key, shape in expected.items():
-            value = outputs[key]
-            assert value.shape == tuple(shape), key
-            assert value.dtype == mx.float32, key
-            assert bool(mx.all(mx.isfinite(value))), key
+        """Output shapes, dtype, finiteness and value range for one pass.
+
+        ``variants`` re-runs the case with parts of it overridden, which is
+        how one head is checked across its tasks.
+        """
+        for spec in [case, *case.get("variants", [])]:
+            merged = {**case, **spec}
+            model = _extraction_model(merged, merged["config"])
+            output = getattr(ForwardAdapters, merged["adapter"])(model, merged["input"])
+            mx.eval(output)
+            expected = merged["expected"]
+            outputs = output if isinstance(expected, dict) else {None: output}
+            expected = expected if isinstance(expected, dict) else {None: expected}
+            for key, shape in expected.items():
+                value = outputs[key]
+                assert value.shape == tuple(shape), (merged["id"], key)
+                assert value.dtype == mx.float32, (merged["id"], key)
+                assert bool(mx.all(mx.isfinite(value))), (merged["id"], key)
+            for key, (low, high) in merged.get("expect_range", {}).items():
+                value = outputs[key]
+                assert float(value.min()) >= low, (merged["id"], key)
+                assert float(value.max()) <= high, (merged["id"], key)
+
+    def config(self, case):
+        """Config semantics: derived attributes, parsed checkpoint dicts and
+        the inputs a config has to reject."""
+        module = _extraction_module(case)
+
+        def build(spec):
+            if "from_dict" in spec:
+                return module.ModelConfig.from_dict(spec["from_dict"])
+            from mlx_vlm.tests.test_models import build_config
+
+            return build_config(module, spec.get("config", {}))
+
+        for spec in [case, *case.get("variants", [])]:
+            if "raises" in spec:
+                with pytest.raises(ValueError, match=spec["raises"]):
+                    build(spec)
+                continue
+            config = build(spec)
+            for path, want in spec.get("expect", {}).items():
+                value = config
+                for part in path.split("."):
+                    value = getattr(value, part)
+                assert value == want, path
+            for path, name in spec.get("expect_type", {}).items():
+                value = config
+                for part in path.split("."):
+                    value = getattr(value, part)
+                assert type(value).__name__ == name, path
+            if spec.get("round_trip"):
+                assert module.ModelConfig.from_dict(config.to_dict()) == config
 
     def parity(self, case):
         """A hand-written component equals the MLX op it replaces.
