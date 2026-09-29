@@ -955,27 +955,6 @@ class TestSapiens2(unittest.TestCase):
             self.assertTrue(np.allclose(kps[b][valid], ref_kps[valid], atol=1e-3))
             self.assertTrue(np.allclose(scores[b], ref_scores))
 
-    def test_dense_predictor_outputs(self):
-        """Dense tasks post-process on device and return MLX arrays at the
-        input resolution."""
-        image = self._image()
-        seg = self._predictor("seg", self._deconv_head(), 5).infer(image)[
-            "segmentation"
-        ]
-        self.assertIsInstance(seg, mx.array)
-        self.assertEqual((seg.shape, seg.dtype), ((40, 30), mx.int32))
-        self.assertTrue(seg.max() < 5)
-
-        normals = self._predictor("normal", self._pixel_shuffle_head(), 3).infer(image)
-        normals = normals["normals"]
-        self.assertEqual(normals.shape, (40, 30, 3))
-        self.assertTrue(mx.all(mx.linalg.norm(normals, axis=-1) < 1.01))
-
-        matting = self._predictor("matting", self._pixel_shuffle_head(), 4).infer(image)
-        self.assertEqual(matting["alphas"].shape, (40, 30))
-        self.assertEqual(matting["foregrounds"].shape, (40, 30, 3))
-        self.assertTrue(0 <= matting["alphas"].min() and matting["alphas"].max() <= 1)
-
     def test_pose_predictor_flip_test(self):
         """Pose inference batches the flipped crops; both modes run."""
         predictor = self._predictor("pose", self._deconv_head(), 4, flip_pairs=[[1, 2]])
@@ -1981,6 +1960,37 @@ class ExtractionChecks:
             assert {v.dtype for v in mixed.values()} == {mx.float32, mx.bfloat16}
             unified = model.sanitize(mixed)
             assert {v.dtype for v in unified.values()} == {mx.bfloat16}
+
+    def predictor(self, case):
+        """A task predictor post-processes on device and returns MLX arrays
+        at the input resolution."""
+        for spec in [case, *case.get("variants", [])]:
+            merged = {**case, **spec}
+            generate = importlib.import_module(
+                f"mlx_vlm.models.{merged['module']}.generate"
+            )
+            model = _extraction_model(merged, merged["config"])
+            height, width = merged["image"]
+            image = np.random.default_rng(0).integers(
+                0, 255, (height, width, 3), np.uint8
+            )
+            out = getattr(generate, merged["predictor"])(model).infer(image)
+            for key, want in merged["expected"].items():
+                value = out[key]
+                assert isinstance(value, mx.array), (merged["id"], key)
+                if "shape" in want:
+                    assert value.shape == tuple(want["shape"]), (merged["id"], key)
+                if "dtype" in want:
+                    assert value.dtype == getattr(mx, want["dtype"]), key
+                if "max_below" in want:
+                    assert float(value.max()) < want["max_below"], key
+                if "range" in want:
+                    low, high = want["range"]
+                    assert low <= float(value.min()), key
+                    assert float(value.max()) <= high, key
+                if "norm_below" in want:
+                    norms = mx.linalg.norm(value, axis=-1)
+                    assert bool(mx.all(norms < want["norm_below"])), key
 
     def weight_names(self, case):
         """Parameter names follow the official checkpoint layout."""

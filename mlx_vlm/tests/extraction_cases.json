@@ -955,6 +955,170 @@
         "source": "backbone.blocks.1.attn.w{part}",
         "target": "backbone.blocks.1.attn.wqkv"
       }
+    ],
+    "predictor": [
+      {
+        "id": "test_dense_predictor_outputs",
+        "module": "sapiens2",
+        "predictor": "Sapiens2Predictor",
+        "image": [
+          40,
+          30
+        ],
+        "config": {
+          "architectures": [
+            "Sapiens2ForSemanticSegmentation"
+          ],
+          "hidden_size": 64,
+          "num_hidden_layers": 3,
+          "num_attention_heads": 4,
+          "num_first_full_attention_layers": 1,
+          "num_last_full_attention_layers": 1,
+          "intermediate_size": 128,
+          "image_size": [
+            32,
+            24
+          ],
+          "patch_size": 8,
+          "num_register_tokens": 2,
+          "head_config": {
+            "upsample_out_channels": [
+              32,
+              16
+            ],
+            "upsample_kernel_sizes": [
+              4,
+              4
+            ],
+            "conv_out_channels": [
+              8
+            ],
+            "conv_kernel_sizes": [
+              1
+            ]
+          },
+          "num_labels": 5
+        },
+        "expected": {
+          "segmentation": {
+            "shape": [
+              40,
+              30
+            ],
+            "dtype": "int32",
+            "max_below": 5
+          }
+        },
+        "variants": [
+          {
+            "config": {
+              "architectures": [
+                "Sapiens2ForNormalEstimation"
+              ],
+              "hidden_size": 64,
+              "num_hidden_layers": 3,
+              "num_attention_heads": 4,
+              "num_first_full_attention_layers": 1,
+              "num_last_full_attention_layers": 1,
+              "intermediate_size": 128,
+              "image_size": [
+                32,
+                24
+              ],
+              "patch_size": 8,
+              "num_register_tokens": 2,
+              "head_config": {
+                "upsample_out_channels": [
+                  32,
+                  16,
+                  8
+                ],
+                "upsample_kernel_sizes": [
+                  3,
+                  3,
+                  3
+                ],
+                "conv_out_channels": [
+                  8
+                ],
+                "conv_kernel_sizes": [
+                  3
+                ],
+                "use_pixel_shuffle": true
+              },
+              "num_labels": 3
+            },
+            "expected": {
+              "normals": {
+                "shape": [
+                  40,
+                  30,
+                  3
+                ],
+                "norm_below": 1.01
+              }
+            }
+          },
+          {
+            "config": {
+              "architectures": [
+                "Sapiens2ForImageMatting"
+              ],
+              "hidden_size": 64,
+              "num_hidden_layers": 3,
+              "num_attention_heads": 4,
+              "num_first_full_attention_layers": 1,
+              "num_last_full_attention_layers": 1,
+              "intermediate_size": 128,
+              "image_size": [
+                32,
+                24
+              ],
+              "patch_size": 8,
+              "num_register_tokens": 2,
+              "head_config": {
+                "upsample_out_channels": [
+                  32,
+                  16,
+                  8
+                ],
+                "upsample_kernel_sizes": [
+                  3,
+                  3,
+                  3
+                ],
+                "conv_out_channels": [
+                  8
+                ],
+                "conv_kernel_sizes": [
+                  3
+                ],
+                "use_pixel_shuffle": true
+              },
+              "num_labels": 4
+            },
+            "expected": {
+              "alphas": {
+                "shape": [
+                  40,
+                  30
+                ],
+                "range": [
+                  0,
+                  1
+                ]
+              },
+              "foregrounds": {
+                "shape": [
+                  40,
+                  30,
+                  3
+                ]
+              }
+            }
+          }
+        ]
+      }
     ]
   }
 }
