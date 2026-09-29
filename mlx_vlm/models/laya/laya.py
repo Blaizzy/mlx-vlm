@@ -5,7 +5,6 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer
 
 from ..modernbert import ModelConfig
@@ -286,20 +285,17 @@ class Laya:
 
 
 def load(path_or_repo, *, subfolder=None, revision=None):
-    """Load a published Laya checkpoint or one of its bundled variants."""
-    path = Path(path_or_repo)
-    if not path.exists():
-        prefix = f"{subfolder}/" if subfolder else ""
-        path = Path(
-            snapshot_download(
-                path_or_repo,
-                revision=revision,
-                allow_patterns=[
-                    f"{prefix}model.safetensors",
-                    f"{prefix}rl_agent_config.json",
-                    f"{prefix}encoder/*",
-                    f"{prefix}tokenizer/*",
-                ],
-            )
-        )
+    from ...utils import get_model_path
+
+    prefix = f"{subfolder}/" if subfolder else ""
+    path = get_model_path(
+        path_or_repo,
+        revision=revision,
+        allow_patterns=[
+            f"{prefix}model.safetensors",
+            f"{prefix}rl_agent_config.json",
+            f"{prefix}encoder/*",
+            f"{prefix}tokenizer/*",
+        ],
+    )
     return Laya(path / subfolder if subfolder else path)

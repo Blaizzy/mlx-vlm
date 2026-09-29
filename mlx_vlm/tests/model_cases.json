@@ -2392,5 +2392,18 @@
       "markov_rank": 4,
       "enable_confidence_head": true
     }
+  },
+  "laya": {
+    "head_layers": 1,
+    "config": {
+      "model_type": "modernbert",
+      "vocab_size": 32,
+      "hidden_size": 64,
+      "num_hidden_layers": 2,
+      "intermediate_size": 128,
+      "num_attention_heads": 1,
+      "local_attention": 16,
+      "global_attn_every_n_layers": 2
+    }
   }
 }

@@ -1310,17 +1310,10 @@ class TestLayaDecisionModel(unittest.TestCase):
     def test_padding_does_not_change_option_logits(self):
         from mlx_vlm.models.laya.laya import DecisionModel
 
-        config = {
-            "model_type": "modernbert",
-            "vocab_size": 32,
-            "hidden_size": 64,
-            "num_hidden_layers": 2,
-            "intermediate_size": 128,
-            "num_attention_heads": 1,
-            "local_attention": 16,
-            "global_attn_every_n_layers": 2,
-        }
-        model = DecisionModel(config, head_layers=1)
+        spec = DATA["laya"]
+        model = DecisionModel(
+            copy.deepcopy(spec["config"]), head_layers=spec["head_layers"]
+        )
         model.eval()
         single, _ = model(
             mx.array([[1, 2, 3]]),
