@@ -1,0 +1,178 @@
+{
+  "version": 1,
+  "families": {
+    "dinov2": {
+      "module": "dinov2",
+      "adapter": "pixel_values"
+    },
+    "video_depth_anything": {
+      "module": "video_depth_anything",
+      "adapter": "video_clip"
+    }
+  },
+  "checks": {
+    "registry": [
+      {
+        "id": "dinov2",
+        "module": "dinov2",
+        "model_type": "dinov2",
+        "config": {
+          "hidden_size": 32,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 2,
+          "patch_size": 16,
+          "image_size": 64,
+          "mlp_ratio": 2.0
+        }
+      },
+      {
+        "id": "video_depth_anything",
+        "module": "video_depth_anything",
+        "model_type": "video_depth_anything",
+        "config": {
+          "encoder": "vits",
+          "embed_dim": 32,
+          "depth": 4,
+          "num_heads": 2,
+          "intermediate_layer_idx": [
+            0,
+            1,
+            2,
+            3
+          ],
+          "features": 8,
+          "out_channels": [
+            8,
+            16,
+            32,
+            32
+          ],
+          "num_frames": 4,
+          "norm_num_groups": 8
+        },
+        "invalid": {
+          "encoder": "vitxl"
+        }
+      }
+    ],
+    "forward": [
+      {
+        "id": "dinov2-encoder",
+        "module": "dinov2",
+        "adapter": "pixel_values",
+        "config": {
+          "hidden_size": 32,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 2,
+          "patch_size": 16,
+          "image_size": 64,
+          "mlp_ratio": 2.0
+        },
+        "input": {
+          "shape": [
+            1,
+            64,
+            64,
+            3
+          ]
+        },
+        "expected": {
+          "last_hidden_state": [
+            1,
+            17,
+            32
+          ],
+          "pooler_output": [
+            1,
+            32
+          ],
+          "hidden_patch_tokens": [
+            1,
+            16,
+            32
+          ]
+        }
+      },
+      {
+        "id": "video_depth_anything-clip",
+        "module": "video_depth_anything",
+        "adapter": "video_clip",
+        "config": {
+          "encoder": "vits",
+          "embed_dim": 32,
+          "depth": 4,
+          "num_heads": 2,
+          "intermediate_layer_idx": [
+            0,
+            1,
+            2,
+            3
+          ],
+          "features": 8,
+          "out_channels": [
+            8,
+            16,
+            32,
+            32
+          ],
+          "num_frames": 4,
+          "norm_num_groups": 8
+        },
+        "input": {
+          "shape": [
+            1,
+            2,
+            28,
+            28,
+            3
+          ]
+        },
+        "expected": [
+          1,
+          2,
+          28,
+          28
+        ]
+      }
+    ],
+    "sanitize": [
+      {
+        "id": "dinov2-idempotent",
+        "module": "dinov2",
+        "config": {
+          "hidden_size": 32,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 2,
+          "patch_size": 16,
+          "image_size": 64,
+          "mlp_ratio": 2.0
+        }
+      },
+      {
+        "id": "video_depth_anything-idempotent",
+        "module": "video_depth_anything",
+        "config": {
+          "encoder": "vits",
+          "embed_dim": 32,
+          "depth": 4,
+          "num_heads": 2,
+          "intermediate_layer_idx": [
+            0,
+            1,
+            2,
+            3
+          ],
+          "features": 8,
+          "out_channels": [
+            8,
+            16,
+            32,
+            32
+          ],
+          "num_frames": 4,
+          "norm_num_groups": 8
+        }
+      }
+    ]
+  }
+}

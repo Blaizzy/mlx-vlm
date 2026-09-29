@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import io
 import json
 import pickle
@@ -2002,3 +2003,112 @@ class TestSAM3DObjects(unittest.TestCase):
                     "f 1 2 3",
                 ],
             )
+
+
+# --------------------------------------------------------------------------
+# Declarative contract for extraction models.
+#
+# Extraction models have no common ``__call__``: dinov2 takes an image and
+# returns a dict, video_depth_anything takes a clip and returns an array,
+# moge3 takes (image, num_tokens). A fixed signature cannot cover them, so
+# ``ForwardAdapters`` supplies one named builder per shape, the way
+# ``ForwardInputs`` does for the image-generation families. Case data lives in
+# ``extraction_cases.json``; anything numeric stays here in Python.
+# --------------------------------------------------------------------------
+
+EXTRACTION_CASES = json.loads(
+    Path(__file__).with_name("extraction_cases.json").read_text(encoding="utf-8")
+)
+if EXTRACTION_CASES["version"] != 1:
+    raise ValueError(
+        f"Unsupported extraction_cases.json version: {EXTRACTION_CASES['version']}"
+    )
+
+
+def _extraction_module(case):
+    return importlib.import_module("mlx_vlm.models." + case["module"])
+
+
+def _extraction_model(case):
+    from mlx_vlm.tests.test_models import build_config
+
+    module = _extraction_module(case)
+    model = module.Model(build_config(module, case["config"]))
+    model.eval()
+    mx.eval(model.parameters())
+    return model
+
+
+class ForwardAdapters:
+    """Build inputs for the call shapes the JSON cases cover."""
+
+    @staticmethod
+    def pixel_values(model, inputs):
+        return model(mx.random.uniform(shape=tuple(inputs["shape"])))
+
+    @staticmethod
+    def video_clip(model, inputs):
+        return model(mx.random.uniform(shape=tuple(inputs["shape"])))
+
+
+class ExtractionChecks:
+    """Shared contracts for models that do not generate text."""
+
+    def __init__(self, tmp_path):
+        self.tmp_path = tmp_path
+
+    def registry(self, case):
+        """The shared loader resolves the model type and the config round-trips."""
+        module = _extraction_module(case)
+        _, model_type = get_model_and_args({"model_type": case["model_type"]})
+        assert model_type == case["model_type"]
+        assert hasattr(module, "Model") and hasattr(module, "ModelConfig")
+
+        from mlx_vlm.tests.test_models import build_config
+
+        config = build_config(module, case["config"])
+        assert module.ModelConfig.from_dict(config.to_dict()) == config
+        if "invalid" in case:
+            with pytest.raises(ValueError):
+                module.ModelConfig(**case["invalid"])
+
+    def forward(self, case):
+        """Output shapes, dtype and finiteness for one forward pass."""
+        model = _extraction_model(case)
+        output = getattr(ForwardAdapters, case["adapter"])(model, case["input"])
+        mx.eval(output)
+        expected = case["expected"]
+        outputs = output if isinstance(expected, dict) else {None: output}
+        expected = expected if isinstance(expected, dict) else {None: expected}
+        for key, shape in expected.items():
+            value = outputs[key]
+            assert value.shape == tuple(shape), key
+            assert value.dtype == mx.float32, key
+            assert bool(mx.all(mx.isfinite(value))), key
+
+    def sanitize(self, case):
+        """``sanitize`` must be idempotent.
+
+        ``load_model`` calls it on every checkpoint, including one already in
+        MLX layout, so running it over the model's own parameters has to be a
+        no-op. See the conversion table in CONTRIBUTING.md.
+        """
+        model = _extraction_model(case)
+        converted = dict(tree_flatten(model.parameters()))
+        once = model.sanitize(dict(converted))
+        assert set(once) == set(converted)
+        for key, value in converted.items():
+            assert once[key].shape == value.shape, key
+            assert mx.array_equal(once[key], value).item(), key
+
+
+@pytest.mark.parametrize(
+    "check,case",
+    [
+        pytest.param(check, case, id=f"{check}-{case['id']}")
+        for check, cases in EXTRACTION_CASES["checks"].items()
+        for case in cases
+    ],
+)
+def test_extraction_contract(check, case, tmp_path):
+    getattr(ExtractionChecks(tmp_path), check)(case)
