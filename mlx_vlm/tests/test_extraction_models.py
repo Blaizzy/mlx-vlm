@@ -1780,7 +1780,11 @@ _EXTRA_CONFIG_TYPES = {"head_config": "HeadConfig"}
 
 
 def _extraction_config(module, values, config_type="ModelConfig"):
-    """``build_config`` with the extraction families' nested config fields."""
+    """``build_config`` plus the nested config fields these models add.
+
+    Kept separate rather than extending the shared ``CONFIG_TYPES`` in place,
+    so registering an extraction field cannot change how a VLM case builds.
+    """
     from mlx_vlm.tests.test_models import CONFIG_TYPES
 
     types = {**CONFIG_TYPES, **_EXTRA_CONFIG_TYPES}
@@ -1800,14 +1804,14 @@ def _extraction_model(case, config=None):
 
 
 class ForwardAdapters:
-    """Build inputs for the call shapes the JSON cases cover."""
+    """Build inputs for the call shapes the JSON cases cover.
+
+    One entry per call signature, not per model: ``uniform`` covers every
+    family whose ``__call__`` takes a single array, whatever its rank.
+    """
 
     @staticmethod
-    def pixel_values(model, inputs):
-        return model(mx.random.uniform(shape=tuple(inputs["shape"])))
-
-    @staticmethod
-    def video_clip(model, inputs):
+    def uniform(model, inputs):
         return model(mx.random.uniform(shape=tuple(inputs["shape"])))
 
 

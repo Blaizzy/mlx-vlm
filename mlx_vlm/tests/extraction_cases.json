@@ -1,15 +1,5 @@
 {
   "version": 1,
-  "families": {
-    "dinov2": {
-      "module": "dinov2",
-      "adapter": "pixel_values"
-    },
-    "video_depth_anything": {
-      "module": "video_depth_anything",
-      "adapter": "video_clip"
-    }
-  },
   "checks": {
     "registry": [
       {
@@ -112,7 +102,7 @@
       {
         "id": "dinov2-encoder",
         "module": "dinov2",
-        "adapter": "pixel_values",
+        "adapter": "uniform",
         "config": {
           "hidden_size": 32,
           "num_hidden_layers": 2,
@@ -149,7 +139,7 @@
       {
         "id": "video_depth_anything-clip",
         "module": "video_depth_anything",
-        "adapter": "video_clip",
+        "adapter": "uniform",
         "config": {
           "encoder": "vits",
           "embed_dim": 32,
@@ -190,7 +180,7 @@
       {
         "id": "test_backbone_shapes",
         "module": "sapiens2",
-        "adapter": "pixel_values",
+        "adapter": "uniform",
         "config": {
           "architectures": [
             "Sapiens2Model"
@@ -231,7 +221,7 @@
       {
         "id": "test_deconv_head_shapes",
         "module": "sapiens2",
-        "adapter": "pixel_values",
+        "adapter": "uniform",
         "config": {
           "architectures": [
             "Sapiens2ForSemanticSegmentation"
@@ -332,7 +322,7 @@
       {
         "id": "test_pixel_shuffle_head_shapes",
         "module": "sapiens2",
-        "adapter": "pixel_values",
+        "adapter": "uniform",
         "config": {
           "architectures": [
             "Sapiens2ForNormalEstimation"
@@ -451,7 +441,7 @@
       {
         "id": "test_pointmap_scale_branch",
         "module": "sapiens2",
-        "adapter": "pixel_values",
+        "adapter": "uniform",
         "config": {
           "architectures": [
             "Sapiens2ForPointmapEstimation"
