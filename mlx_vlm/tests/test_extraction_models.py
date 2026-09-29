@@ -288,9 +288,6 @@ def test_boundary_architecture_selects_the_gliner_module():
     assert model_type == "gliner2_5"
 
 
-LABELS = {0: "O", 1: "B-x", 2: "I-x", 3: "E-x", 4: "S-x"}
-
-
 def _privacy_config(**overrides):
     values = _extraction_config("openai_privacy_filter")
     values.update(overrides)
@@ -475,7 +472,6 @@ def _write_bert_token_checkpoint(root):
     mx.save_safetensors(
         str(root / "model.safetensors"), dict(tree_flatten(model.parameters()))
     )
-    config["id2label"] = {str(k): v for k, v in BIO_LABELS.items()}
     config["quantization"] = {
         "group_size": 32,
         "bits": 4,
