@@ -1084,40 +1084,6 @@ class TestSapiens2(unittest.TestCase):
         out = model(mx.random.normal((1, 32, 24, 3)))  # float32 pixels
         self.assertEqual(out["last_hidden_state"].dtype, mx.bfloat16)
 
-    def test_deconv_upsample_matches_conv_transpose(self):
-        """The im2col/matmul deconv equals mx.conv_transpose2d(k4, s2, p1)."""
-        from mlx_vlm.models.sapiens2.heads import DeconvUpsample
-
-        layer = DeconvUpsample(6, 5)
-        x = mx.random.normal((2, 7, 5, 6))
-        ref = mx.conv_transpose2d(x, layer.weight, stride=2, padding=1)
-        out = layer(x)
-        self.assertEqual(out.shape, (2, 14, 10, 5))
-        self.assertTrue(np.allclose(np.array(out), np.array(ref), atol=1e-4))
-        # cached gemm weight is rebuilt when the parameter changes
-        layer.update({"weight": mx.zeros_like(layer.weight)})
-        self.assertTrue(np.all(np.array(layer(x)) == 0))
-
-    def test_conv3x3_matches_conv2d(self):
-        """The im2col 3x3 conv equals mx.conv2d on both the gemm path and the
-        large-map fallback."""
-        from mlx_vlm.models.sapiens2.heads import Conv3x3
-
-        layer = Conv3x3(6, 4)
-        x = mx.random.normal((2, 7, 5, 6))
-        ref = mx.conv2d(x, layer.weight, padding=1) + layer.bias
-        self.assertTrue(np.allclose(np.array(layer(x)), np.array(ref), atol=1e-4))
-        layer.max_im2col_elements = 1  # force the conv fallback
-        self.assertTrue(np.allclose(np.array(layer(x)), np.array(ref), atol=1e-4))
-
-    def test_conv1x1_matches_conv2d(self):
-        from mlx_vlm.models.sapiens2.heads import Conv1x1
-
-        layer = Conv1x1(6, 4)
-        x = mx.random.normal((2, 5, 3, 6))
-        ref = mx.conv2d(x, layer.weight) + layer.bias
-        self.assertTrue(np.allclose(np.array(layer(x)), np.array(ref), atol=1e-5))
-
     def test_udp_decode_batch_matches_reference_codec(self):
         """Device decode == the mmpose UDP/DARK codec (cv2 blur, numpy)."""
         from mlx_vlm.models.sapiens2.pose import udp_decode_batch
@@ -2042,6 +2008,26 @@ class ForwardAdapters:
         return model(mx.random.uniform(shape=tuple(inputs["shape"])))
 
 
+class References:
+    """Reference implementations a ``parity`` case can name.
+
+    The math stays here in Python; the JSON case only supplies the component,
+    its arguments, the input shape and a tolerance.
+    """
+
+    @staticmethod
+    def conv2d(layer, x):
+        return mx.conv2d(x, layer.weight) + layer.bias
+
+    @staticmethod
+    def conv2d_pad1(layer, x):
+        return mx.conv2d(x, layer.weight, padding=1) + layer.bias
+
+    @staticmethod
+    def conv_transpose_stride2_pad1(layer, x):
+        return mx.conv_transpose2d(x, layer.weight, stride=2, padding=1)
+
+
 class ExtractionChecks:
     """Shared contracts for models that do not generate text."""
 
@@ -2076,6 +2062,32 @@ class ExtractionChecks:
             assert value.shape == tuple(shape), key
             assert value.dtype == mx.float32, key
             assert bool(mx.all(mx.isfinite(value))), key
+
+    def parity(self, case):
+        """A hand-written component equals the MLX op it replaces.
+
+        ``variants`` re-runs the same comparison with attributes overridden,
+        which is how the im2col layers exercise their large-map fallback.
+        """
+        module_path, _, name = case["component"].rpartition(".")
+        module = importlib.import_module("mlx_vlm.models." + module_path)
+        layer = getattr(module, name)(*case["args"])
+        x = mx.random.normal(tuple(case["input"]), key=mx.random.key(0))
+        expected = getattr(References, case["reference"])(layer, x)
+        atol = case.get("atol", 1e-5)
+        for overrides in [{}, *case.get("variants", [])]:
+            for attribute, value in overrides.items():
+                setattr(layer, attribute, value)
+            actual = layer(x)
+            if "expected_shape" in case:
+                assert actual.shape == tuple(case["expected_shape"])
+            assert np.allclose(np.array(actual), np.array(expected), atol=atol), (
+                case["id"],
+                overrides,
+            )
+        if case.get("zero_weight_gives_zero"):
+            layer.update({"weight": mx.zeros_like(layer.weight)})
+            assert np.all(np.array(layer(x)) == 0)
 
     def sanitize(self, case):
         """``sanitize`` must be idempotent.

@@ -88,6 +88,24 @@
           "patch_size": 8,
           "num_register_tokens": 2
         }
+      },
+      {
+        "id": "moge3",
+        "module": "moge3",
+        "model_type": "moge3",
+        "config": {}
+      },
+      {
+        "id": "gliner2_5",
+        "module": "gliner2_5",
+        "model_type": "gliner2_5",
+        "config": {}
+      },
+      {
+        "id": "openai_privacy_filter",
+        "module": "openai_privacy_filter",
+        "model_type": "openai_privacy_filter",
+        "config": {}
       }
     ],
     "forward": [
@@ -269,6 +287,68 @@
           "patch_size": 8,
           "num_register_tokens": 2
         }
+      }
+    ],
+    "parity": [
+      {
+        "id": "test_conv1x1_matches_conv2d",
+        "component": "sapiens2.heads.Conv1x1",
+        "args": [
+          6,
+          4
+        ],
+        "input": [
+          2,
+          5,
+          3,
+          6
+        ],
+        "reference": "conv2d",
+        "atol": 1e-05
+      },
+      {
+        "id": "test_conv3x3_matches_conv2d",
+        "component": "sapiens2.heads.Conv3x3",
+        "args": [
+          6,
+          4
+        ],
+        "input": [
+          2,
+          7,
+          5,
+          6
+        ],
+        "reference": "conv2d_pad1",
+        "atol": 0.0001,
+        "variants": [
+          {
+            "max_im2col_elements": 1
+          }
+        ]
+      },
+      {
+        "id": "test_deconv_upsample_matches_conv_transpose",
+        "component": "sapiens2.heads.DeconvUpsample",
+        "args": [
+          6,
+          5
+        ],
+        "input": [
+          2,
+          7,
+          5,
+          6
+        ],
+        "reference": "conv_transpose_stride2_pad1",
+        "atol": 0.0001,
+        "expected_shape": [
+          2,
+          14,
+          10,
+          5
+        ],
+        "zero_weight_gives_zero": true
       }
     ]
   }
