@@ -220,10 +220,8 @@ class Laya:
             mx.array(valid),
             types,
         )
+        act = mx.softmax(act.astype(mx.float32), -1)
         mx.eval(logits, act)
-        logits, act = np.asarray(logits), np.asarray(
-            mx.softmax(act.astype(mx.float32), -1)
-        )
         answers = {}
         for i, (key, question, labels, _, markers) in enumerate(rows):
             kind = question["type"]
@@ -237,23 +235,23 @@ class Laya:
                 f"{kind}:{bucket}", self.config["temperature"][QUESTION_TYPES[kind]]
             )
             z = logits[i, :count] / temperature
-            probabilities = np.exp(z - z.max())
+            probabilities = mx.exp(z - z.max())
             probabilities /= probabilities.sum()
             confidence = round(
-                float(
+                (
                     1
-                    + np.sum(probabilities * np.log(np.clip(probabilities, 1e-12, 1)))
+                    + mx.sum(probabilities * mx.log(mx.clip(probabilities, 1e-12, 1)))
                     / math.log(count)
-                ),
+                ).item(),
                 4,
             )
-            extra = {"rl_agent": {"act_probability": float(act[i, 0])}}
+            extra = {"rl_agent": {"act_probability": act[i, 0].item()}}
             if kind == "choice":
                 answers[key] = {
                     "type": kind,
-                    "choice": labels[int(probabilities.argmax())],
+                    "choice": labels[probabilities.argmax().item()],
                     "probabilities": dict(
-                        zip(labels, [round(float(p), 4) for p in probabilities])
+                        zip(labels, [round(p.item(), 4) for p in probabilities])
                     ),
                     "confidence": confidence,
                     **extra,
@@ -261,12 +259,12 @@ class Laya:
             elif kind == "score":
                 answers[key] = {
                     "type": kind,
-                    "score": round(float(np.dot(np.arange(count), probabilities)), 4),
+                    "score": round(mx.sum(mx.arange(count) * probabilities).item(), 4),
                     "legend": {
                         str(n): text for n, text in enumerate(question["criteria"])
                     },
                     "probabilities": {
-                        str(n): round(float(p), 4) for n, p in enumerate(probabilities)
+                        str(n): round(p.item(), 4) for n, p in enumerate(probabilities)
                     },
                     "confidence": confidence,
                     **extra,
@@ -274,7 +272,7 @@ class Laya:
             else:
                 answers[key] = {
                     "type": kind,
-                    "noul": round(float(probabilities[1]), 4),
+                    "noul": round(probabilities[1].item(), 4),
                     **extra,
                 }
         return {
