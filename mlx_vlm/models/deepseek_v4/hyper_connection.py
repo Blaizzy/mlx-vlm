@@ -164,6 +164,129 @@ def _make_hc_sinkhorn_collapse_kernel():
 _hc_sinkhorn_collapse_kernel = _make_hc_sinkhorn_collapse_kernel()
 
 
+def _make_hc_sinkhorn_split_kernel():
+    """Sinkhorn without the collapse: returns pre/post/comb.
+
+    Single-pass mHC (DeepSeek-V4.1) hands `pre` to the *next* sublayer rather
+    than collapsing with it here, so `hc_sinkhorn_collapse`'s second phase would
+    be wasted work and its `collapsed` output unused. Phase 1 is identical; one
+    simd group per row is enough because nothing touches the D axis.
+    """
+    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return None
+
+    source = """
+        uint lane = thread_position_in_threadgroup.x;
+        uint row  = threadgroup_position_in_grid.x;
+
+        constexpr int MIX      = (2 + HC) * HC;
+        constexpr int BASE_OFF = 2 * HC;
+        constexpr float EPS = EPS_INT * 1e-9;
+
+        const device float* mix      = (const device float*)mixes + row * MIX;
+        device float*       pre_out  = (device float*)pre + row * HC;
+        device float*       post_out = (device float*)post + row * HC;
+        device float*       comb_out = (device float*)comb + row * HC * HC;
+
+        const float pre_scale  = scale[0];
+        const float post_scale = scale[1];
+        const float comb_scale = scale[2];
+
+        const float active = (lane < (uint)HC) ? 1.0f : 0.0f;
+        const uint  llane  = metal::min(lane, (uint)(HC - 1));
+
+        float pre_z  = mix[llane]      * pre_scale  + base[llane];
+        float post_z = mix[HC + llane] * post_scale + base[HC + llane];
+        float pre_v  = 1.0f / (1.0f + metal::fast::exp(-pre_z)) + EPS;
+        float post_v = 2.0f / (1.0f + metal::fast::exp(-post_z));
+
+        if (lane < (uint)HC) {
+            pre_out[lane]  = pre_v;
+            post_out[lane] = post_v;
+        }
+
+        float4 v = (*(const device float4*)(mix  + BASE_OFF + llane * HC)
+                        * comb_scale
+                  + *(const device float4*)(base + BASE_OFF + llane * HC))
+                 * active;
+
+        float row_max = metal::max(metal::max(v.x, v.y),
+                                   metal::max(v.z, v.w));
+        float4 e = metal::fast::exp(v - row_max) * active;
+        float4 r = e * (1.0f / (e.x + e.y + e.z + e.w + EPS))
+                 + EPS * active;
+
+        float4 col_inv = 1.0f / (float4(
+            simd_sum(r.x), simd_sum(r.y),
+            simd_sum(r.z), simd_sum(r.w)
+        ) + EPS);
+        r *= col_inv;
+
+        for (int iter = 1; iter < ITERS; ++iter) {
+            r *= (1.0f / (r.x + r.y + r.z + r.w + EPS)) * active;
+            col_inv = 1.0f / (float4(
+                simd_sum(r.x), simd_sum(r.y),
+                simd_sum(r.z), simd_sum(r.w)
+            ) + EPS);
+            r *= col_inv;
+        }
+
+        if (lane < (uint)HC) {
+            *(device float4*)(comb_out + lane * HC) = r;
+        }
+    """
+
+    return mx.fast.metal_kernel(
+        name="hc_sinkhorn_split",
+        input_names=["mixes", "scale", "base"],
+        output_names=["pre", "post", "comb"],
+        source=source,
+        ensure_row_contiguous=True,
+    )
+
+
+_hc_sinkhorn_split_kernel = _make_hc_sinkhorn_split_kernel()
+
+
+def hc_split_sinkhorn(mixes, scale, base, hc_mult, sinkhorn_iters, eps):
+    """pre/post/comb for single-pass mHC, fused when the kernel applies.
+
+    The kernel vectorizes comb over float4 and so requires `hc_mult == 4`;
+    everything else falls back to the op path.
+    """
+    eligible = (
+        _hc_sinkhorn_split_kernel is not None
+        and hc_mult == 4
+        and mixes.ndim == 3
+        and mx.default_device() == mx.gpu
+        and mx.metal.is_available()
+    )
+    if not eligible:
+        return _hc_split_sinkhorn_ops(mixes, scale, base, hc_mult, sinkhorn_iters, eps)
+
+    batch, length, _ = mixes.shape
+    return _hc_sinkhorn_split_kernel(
+        inputs=[
+            mixes.astype(mx.float32),
+            scale.astype(mx.float32),
+            base.astype(mx.float32),
+        ],
+        template=[
+            ("HC", hc_mult),
+            ("ITERS", sinkhorn_iters),
+            ("EPS_INT", round(eps / 1e-9)),
+        ],
+        grid=(batch * length * 32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[
+            (batch, length, hc_mult),
+            (batch, length, hc_mult),
+            (batch, length, hc_mult, hc_mult),
+        ],
+        output_dtypes=[mx.float32, mx.float32, mx.float32],
+    )
+
+
 def _hc_kernel(x, y, mixes, scale, base, hc_mult, sinkhorn_iters, eps):
     B, L, H, D = x.shape
 
