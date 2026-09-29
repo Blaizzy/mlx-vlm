@@ -260,23 +260,40 @@ def resize_bilinear_nhwc(x, new_size, align_corners=False, antialias=False):
     return separable_interpolate(x, iy, wy, ix, wx)
 
 
+def _keys_cubic_weight(t):
+    return _cubic_weight(t, a=-0.5)
+
+
+def _lanczos_weight(t):
+    """Pillow's ``LANCZOS`` kernel: sinc(t) * sinc(t / 3) on [-3, 3)."""
+
+    def sinc(x):
+        safe = mx.where(x == 0, 1.0, x) * math.pi
+        return mx.where(x == 0, 1.0, mx.sin(safe) / safe)
+
+    return mx.where((t >= -3) & (t < 3), sinc(t) * sinc(t / 3), 0.0)
+
+
 @lru_cache(maxsize=64)
-def _bicubic_aa_weights_1d(in_size, out_size):
-    """(out, taps) indices and a=-0.5 cubic weights matching ATen
-    ``_upsample_bicubic2d_aa``: stretched kernel, normalized per output pixel."""
+def _antialias_weights_1d(in_size, out_size, kernel, kernel_support):
+    """(out, taps) indices and weights of a Pillow-style filter (ATen's
+    ``_upsample_*_aa``): the kernel stretched by the downscale factor and
+    normalized per output pixel."""
+    if in_size == out_size:
+        return mx.arange(in_size, dtype=mx.int32)[:, None], mx.ones((in_size, 1))
     scale = in_size / out_size
-    support = 2.0 * scale if scale >= 1.0 else 2.0
+    support = kernel_support * max(scale, 1.0)
     max_taps = math.ceil(support) * 2 + 1
-    invscale = 1.0 / scale if scale >= 1.0 else 1.0
+    invscale = 1.0 / max(scale, 1.0)
     center = scale * (mx.arange(out_size, dtype=mx.float32) + 0.5)
     xmin = mx.maximum(mx.floor(center - support + 0.5), 0.0)
     xmax = mx.minimum(mx.floor(center + support + 0.5), float(in_size))
     xsize = mx.clip(xmax - xmin, 0, max_taps)
     pos = xmin[:, None] + mx.arange(max_taps, dtype=mx.float32)[None, :]
-    w = _cubic_weight((pos - center[:, None] + 0.5) * invscale, a=-0.5)
+    w = kernel((pos - center[:, None] + 0.5) * invscale)
     w = mx.where(pos - xmin[:, None] < xsize[:, None], w, 0.0)
     total = w.sum(axis=1, keepdims=True)
-    w = mx.where(total > 0, w / mx.maximum(total, 1e-30), w)
+    w = w / mx.where(total != 0, total, 1.0)
     idx = mx.minimum(pos, in_size - 1).astype(mx.int32)
     return idx, w
 
@@ -293,9 +310,20 @@ def resize_bicubic_nhwc(x, new_size=None, scale_factor=None, antialias=False):
     if (in_h, in_w) == tuple(new_size):
         return x
     if antialias:
-        iy, wy = _bicubic_aa_weights_1d(in_h, new_size[0])
-        ix, wx = _bicubic_aa_weights_1d(in_w, new_size[1])
+        iy, wy = _antialias_weights_1d(in_h, new_size[0], _keys_cubic_weight, 2.0)
+        ix, wx = _antialias_weights_1d(in_w, new_size[1], _keys_cubic_weight, 2.0)
     else:
         iy, wy = _bicubic_weights_1d(in_h, new_size[0], scale_h)
         ix, wx = _bicubic_weights_1d(in_w, new_size[1], scale_w)
+    return separable_interpolate(x, iy, wy, ix, wx)
+
+
+def resize_lanczos_nhwc(x, new_size):
+    """Channel-last Lanczos-3 resize with Pillow's ``LANCZOS`` weights (both
+    axes in one pass, float32 out, no rounding)."""
+    _, in_h, in_w, _ = x.shape
+    if (in_h, in_w) == tuple(new_size):
+        return x
+    iy, wy = _antialias_weights_1d(in_h, new_size[0], _lanczos_weight, 3.0)
+    ix, wx = _antialias_weights_1d(in_w, new_size[1], _lanczos_weight, 3.0)
     return separable_interpolate(x, iy, wy, ix, wx)
