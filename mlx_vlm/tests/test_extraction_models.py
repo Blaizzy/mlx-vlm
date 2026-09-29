@@ -63,6 +63,23 @@ def _extraction_config(name):
     return copy.deepcopy(EXTRACTION_CASES[name]["config"])
 
 
+def sync_trap():
+    """Context that fails on any host <-> device synchronization."""
+    from contextlib import ExitStack
+    from unittest import mock
+
+    def boom(*args, **kwargs):
+        raise AssertionError("host sync during graph construction")
+
+    stack = ExitStack()
+    for name in ("eval", "async_eval", "synchronize"):
+        stack.enter_context(mock.patch.object(mx, name, boom))
+    for name in ("tolist", "item", "__bool__", "__float__", "__int__"):
+        if hasattr(mx.array, name):
+            stack.enter_context(mock.patch.object(mx.array, name, boom))
+    return stack
+
+
 def test_checkpoint_key_sanitization():
     weights = {
         "encoder.embeddings.LayerNorm.weight": mx.ones((4,)),
@@ -1150,22 +1167,6 @@ class TestSapiens2(unittest.TestCase):
         self.assertEqual((got.shape, got.dtype), ((40, 30, 3), mx.uint8))
         self.assertIs(to_array(got), got)
 
-    def _sync_trap(self):
-        """Context that fails on any host <-> device synchronization."""
-        from contextlib import ExitStack
-        from unittest import mock
-
-        def boom(*args, **kwargs):
-            raise AssertionError("host sync during graph construction")
-
-        stack = ExitStack()
-        for name in ("eval", "async_eval", "synchronize"):
-            stack.enter_context(mock.patch.object(mx, name, boom))
-        for name in ("tolist", "item", "__bool__", "__float__", "__int__"):
-            if hasattr(mx.array, name):
-                stack.enter_context(mock.patch.object(mx.array, name, boom))
-        return stack
-
     def test_infer_builds_graphs_without_host_sync(self):
         """Every task's ``infer`` only builds a graph: no eval, item or
         tolist on the way, including the first call (weight relayouts,
@@ -1180,7 +1181,7 @@ class TestSapiens2(unittest.TestCase):
         ]
         for task, head, labels, kw in cases:
             predictor = self._predictor(task, head, labels, **kw)
-            with self._sync_trap():
+            with sync_trap():
                 first = predictor.infer(image)
                 second = predictor.infer(mx.array(image))
             mx.eval(first, second)  # and the graphs are valid
@@ -1857,6 +1858,354 @@ class TestSAM3DObjects(unittest.TestCase):
                     "f 1 2 3",
                 ],
             )
+
+
+class TestVGGTOmega(unittest.TestCase):
+    @staticmethod
+    def _config(**overrides):
+        from mlx_vlm.models.vggt_omega.config import ModelConfig
+
+        args = _extraction_config("vggt_omega")
+        args.update(overrides)
+        return ModelConfig(**args)
+
+    def _model(self, **overrides):
+        from mlx_vlm.models.vggt_omega import Model
+
+        mx.random.seed(0)
+        model = Model(self._config(**overrides))
+        mx.eval(model.parameters())
+        return model
+
+    @staticmethod
+    def _images(S=2, H=32, W=48):
+        return mx.random.uniform(shape=(S, H, W, 3), key=mx.random.key(1))
+
+    @staticmethod
+    def _torch_state_dict(model):
+        """The model's weights in the official checkpoint layout."""
+        from mlx_vlm.models.vggt_omega.convert import _CONV_TRANSPOSE_KEY
+
+        state = {}
+        for k, v in tree_flatten(model.parameters()):
+            if v.ndim == 4 and _CONV_TRANSPOSE_KEY.search(k):
+                v = v.transpose(3, 0, 1, 2)  # ConvTranspose2d (in, out, kh, kw)
+            elif v.ndim == 4 and k.endswith(".weight"):
+                v = v.transpose(0, 3, 1, 2)  # Conv2d (out, in, kh, kw)
+            state[k] = v
+            if k.endswith("qkv.bias"):
+                if k.startswith("aggregator."):
+                    mask = mx.zeros_like(v)  # as in the released checkpoints
+                else:
+                    mask = mx.ones_like(v)
+                    third = v.shape[0] // 3
+                    mask[third : 2 * third] = 0  # standard K-bias mask
+                state[k + "_mask"] = mask
+        dim = model.config.embed_dim
+        state["aggregator.patch_embed.mask_token"] = mx.zeros((1, dim))
+        return state
+
+    def test_config_round_trips_and_rejects_uncached_last_layer(self):
+        """Configs round-trip, and a cached-layer list that misses the last
+        layer is rejected."""
+        from mlx_vlm.models.vggt_omega.config import ModelConfig
+
+        config = self._config()
+        self.assertEqual(ModelConfig.from_dict(config.to_dict()), config)
+        with self.assertRaises(ValueError):
+            self._config(cached_layer_indices=[0, 1, 2])
+
+    def test_forward_output_ranges(self):
+        """Output activations of every head; shapes and dtypes are in the
+        ``vggt_omega`` extraction case."""
+        model = self._model()
+        out = model(self._images())
+        mx.eval(out)
+        self.assertTrue(mx.all(out["depth"] > 0).item())
+        self.assertTrue(mx.all(out["depth_conf"] > 1).item())
+        self.assertTrue(mx.all(out["pose_enc"][..., 7:] >= 0.01).item())
+        norm = mx.linalg.norm(out["text_alignment_embedding"], axis=-1)
+        self.assertAlmostEqual(norm.item(), 1.0, places=5)
+        # One frame and a batched (B, S, ...) input also work.
+        self.assertEqual(model(self._images(S=1))["depth"].shape[1], 1)
+        batched = model(mx.stack([self._images(), self._images()]))
+        self.assertEqual(batched["pose_enc"].shape, (2, 2, 9))
+
+    @unittest.skipUnless(mx.metal.is_available(), "Metal kernels")
+    def test_fused_kernels_match_mlx_ops(self):
+        """``prepare_qk`` equals Q/K LayerNorm + RoPE + transpose in MLX ops,
+        and ``add_layer_norm`` equals the float32 residual update + norm."""
+        from mlx_vlm.models.sapiens2.backbone import RopePositionEmbedding, _rope_apply
+        from mlx_vlm.models.vggt_omega.kernels import add_layer_norm, prepare_qk
+        from mlx_vlm.models.vggt_omega.layers import norm32
+
+        B, N, H, P = 2, 3 + 4 * 5, 2, 3
+        cases = [
+            (D, dtype, use_norm, use_rope)
+            for D in (64, 128)  # head dims that are multiples of 64
+            for dtype in (mx.float32, mx.bfloat16)
+            for use_norm, use_rope in ((True, True), (True, False), (False, True))
+        ]
+        for D, dtype, use_norm, use_rope in cases:
+            with self.subTest(D=D, dtype=dtype, norm=use_norm, rope=use_rope):
+                qkv = mx.random.normal((B, N, 3, H, D), key=mx.random.key(D))
+                norms = (nn.LayerNorm(D), nn.LayerNorm(D))
+                for i, norm in enumerate(norms):
+                    norm.weight = mx.random.normal((D,), key=mx.random.key(3 + i))
+                    norm.bias = mx.random.normal((D,), key=mx.random.key(5 + i))
+                rope = RopePositionEmbedding(H * D, H, normalize_coords="max")
+                rope = rope(4, 5, prefix=P)
+                x = qkv.astype(dtype)
+                q, k = prepare_qk(
+                    x, norms if use_norm else None, rope if use_rope else None, dtype
+                )
+                want = []
+                for i, norm in enumerate(norms):
+                    t = x[:, :, i].transpose(0, 2, 1, 3)
+                    if use_norm:
+                        t = norm32(norm, t)
+                    if use_rope:
+                        t = _rope_apply(t, *rope)
+                    want.append(t.astype(dtype))
+                tol = 1e-5 if dtype == mx.float32 else 2e-2
+                self.assertEqual(q.dtype, dtype)
+                np.testing.assert_allclose(
+                    q.astype(mx.float32), want[0].astype(mx.float32), atol=tol
+                )
+                np.testing.assert_allclose(
+                    k.astype(mx.float32), want[1].astype(mx.float32), atol=tol
+                )
+
+        norm = nn.LayerNorm(512)
+        norm.weight = mx.random.normal((512,), key=mx.random.key(7))
+        x = mx.random.normal((5, 512), key=mx.random.key(8)) * 3 + 1
+        h = mx.random.normal((5, 512), key=mx.random.key(9)).astype(mx.bfloat16)
+        gamma = mx.random.normal((512,), key=mx.random.key(10)).astype(mx.bfloat16)
+        np.testing.assert_allclose(
+            add_layer_norm(x, norm, mx.float32), norm32(norm, x), atol=1e-5
+        )
+        x_new, y = add_layer_norm(x, norm, mx.bfloat16, h, gamma)
+        want = x + h.astype(mx.float32) * gamma
+        np.testing.assert_allclose(x_new, want, atol=1e-5)
+        self.assertEqual(y.dtype, mx.bfloat16)
+        np.testing.assert_allclose(
+            y.astype(mx.float32), norm32(norm, want), atol=3e-2, rtol=1e-2
+        )
+
+    def test_blocks_match_the_unfused_path(self):
+        """The model output does not depend on the fused-kernel path."""
+        from unittest import mock
+
+        import mlx_vlm.models.vggt_omega.layers as layers
+
+        model = self._model()
+        images = self._images()
+        fused = model(images)
+        with (
+            mock.patch.object(layers, "can_prepare_qk", lambda *a: False),
+            mock.patch.object(layers, "can_add_layer_norm", lambda *a: False),
+        ):
+            plain = model(images)
+        for key in ("pose_enc", "depth", "depth_conf"):
+            np.testing.assert_allclose(fused[key], plain[key], rtol=1e-4, atol=1e-4)
+
+    def test_convert_state_dict_and_load(self):
+        """The official layout converts: bias masks folded, conv kernels
+        relaid, mask token dropped, RoPE periods kept in float32; the saved
+        directory loads through ``load_model`` with float32 heads."""
+        from mlx_vlm.models.vggt_omega.convert import convert_state_dict, save_model
+        from mlx_vlm.utils import load_model
+
+        source = self._model()
+        state = self._torch_state_dict(source)
+        converted = convert_state_dict(dict(state), source.config, "bfloat16")
+        params = dict(tree_flatten(converted.parameters()))
+        self.assertNotIn("aggregator.patch_embed.mask_token", params)
+        self.assertFalse(any(k.endswith("bias_mask") for k in params))
+        for k, v in params.items():
+            want = mx.float32 if k.endswith("rope_embed.periods") else mx.bfloat16
+            self.assertEqual(v.dtype, want, k)
+        want = dict(tree_flatten(source.parameters()))
+        agg = "aggregator.frame_blocks.0.attn.qkv.bias"
+        self.assertEqual(mx.abs(params[agg]).max().item(), 0)
+        head = "camera_head.trunk.0.attn.qkv.bias"
+        third = want[head].shape[0] // 3
+        params = {k: v.astype(mx.float32) for k, v in params.items()}
+        np.testing.assert_allclose(params[head][:third], want[head][:third], atol=1e-2)
+        self.assertEqual(mx.abs(params[head][third : 2 * third]).max().item(), 0)
+        for k in (
+            "dense_head.resize_layers.0.weight",
+            "dense_head.scratch.layer1_rn.weight",
+        ):
+            np.testing.assert_allclose(params[k], want[k], atol=1e-2)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            save_model(converted, Path(tmp))
+            loaded = load_model(Path(tmp))
+        self.assertEqual(loaded.camera_head.trunk[0].attn.qkv.weight.dtype, mx.float32)
+        self.assertEqual(loaded.dense_head.proj.weight.dtype, mx.float32)
+        self.assertEqual(
+            loaded.aggregator.frame_blocks[0].attn.qkv.weight.dtype, mx.bfloat16
+        )
+        out = loaded(self._images())
+        self.assertTrue(mx.all(mx.isfinite(out["depth"])).item())
+
+    def test_patch_deconv_matches_conv_transpose(self):
+        from mlx_vlm.models.vggt_omega.heads import PatchDeconv
+
+        for k in (2, 4):
+            layer = PatchDeconv(8, k)
+            layer.bias = mx.arange(8, dtype=mx.float32)
+            x = mx.random.normal((2, 3, 5, 8), key=mx.random.key(k))
+            want = mx.conv_transpose2d(x, layer.weight, stride=k) + layer.bias
+            np.testing.assert_allclose(layer(x), want, atol=1e-5)
+
+    def test_position_embedding_matches_reference_formula(self):
+        """UV-grid sin/cos embedding of the DPT head, against a float64
+        port of the reference ``create_uv_grid`` + ``position_grid_to_embed``."""
+        from mlx_vlm.models.vggt_omega.heads import _position_embedding
+
+        h, w, c, aspect = 3, 5, 16, 688 / 384
+        diagonal = (aspect**2 + 1) ** 0.5
+        span_x, span_y = aspect / diagonal, 1 / diagonal
+        x = np.linspace(-span_x * (w - 1) / w, span_x * (w - 1) / w, w)
+        y = np.linspace(-span_y * (h - 1) / h, span_y * (h - 1) / h, h)
+        uu, vv = np.meshgrid(x, y, indexing="xy")
+
+        def embed(pos):
+            omega = 1.0 / 100 ** (np.arange(c // 4) / (c // 4))
+            angles = np.outer(pos.reshape(-1), omega)
+            return np.concatenate([np.sin(angles), np.cos(angles)], axis=1)
+
+        want = np.concatenate([embed(uu), embed(vv)], axis=1).reshape(h, w, c) * 0.1
+        np.testing.assert_allclose(
+            _position_embedding(h, w, c, aspect), want, atol=1e-6
+        )
+
+    def test_camera_decoding_and_unprojection(self):
+        """Pose encodings decode to the cameras they encode (for non-unit
+        quaternions too), and unprojected depth projects back to its pixels."""
+        from mlx_vlm.models.vggt_omega.geometry import (
+            encoding_to_camera,
+            unproject_depth,
+        )
+
+        H, W = 4, 6
+        quat = np.array([[0.0, 0.0, 0.0, 1.0], [0.1, -0.2, 0.3, 0.9]])
+        quat /= np.linalg.norm(quat, axis=1, keepdims=True)
+        x, y, z, s = quat.T
+        R = np.stack(
+            [
+                [1 - 2 * (y * y + z * z), 2 * (x * y - z * s), 2 * (x * z + y * s)],
+                [2 * (x * y + z * s), 1 - 2 * (x * x + z * z), 2 * (y * z - x * s)],
+                [2 * (x * z - y * s), 2 * (y * z + x * s), 1 - 2 * (x * x + y * y)],
+            ]
+        ).transpose(2, 0, 1)
+        t = np.array([[0.0, 0.0, 0.0], [0.5, -1.0, 2.0]])
+        fov = np.array([[0.8, 1.1], [1.0, 1.3]])
+        encoding = np.concatenate([t, quat * [[1.0], [2.5]], fov], axis=1)
+        extrinsics, intrinsics = encoding_to_camera(
+            mx.array(encoding, mx.float32), (H, W)
+        )
+        np.testing.assert_allclose(extrinsics[:, :, :3], R, atol=1e-5)
+        np.testing.assert_allclose(extrinsics[:, :, 3], t, atol=1e-6)
+        fy, fx = (H / 2) / np.tan(fov[:, 0] / 2), (W / 2) / np.tan(fov[:, 1] / 2)
+        np.testing.assert_allclose(intrinsics[:, 0, 0], fx, rtol=1e-5)
+        np.testing.assert_allclose(intrinsics[:, 1, 1], fy, rtol=1e-5)
+        np.testing.assert_allclose(intrinsics[:, :2, 2], [[W / 2, H / 2]] * 2)
+
+        depth = mx.random.uniform(1, 3, (2, H, W), key=mx.random.key(4))
+        points = np.array(unproject_depth(depth, extrinsics, intrinsics))
+        camera = np.einsum("sij,shwj->shwi", R, points) + t[:, None, None]
+        np.testing.assert_allclose(camera[..., 2], depth, rtol=1e-5)
+        pixels = np.einsum("sij,shwj->shwi", np.array(intrinsics), camera)
+        grid = np.stack(np.meshgrid(np.arange(W), np.arange(H)), axis=-1)
+        np.testing.assert_allclose(
+            pixels[..., :2] / pixels[..., 2:], grid[None].repeat(2, 0), atol=1e-4
+        )
+
+    def test_processor_follows_the_reference_loader(self):
+        """Target sizes, aspect-ratio crops, PIL-equivalent bicubic resizing
+        (within one uint8 level), white alpha and white padding."""
+        from PIL import Image
+
+        from mlx_vlm.models.vggt_omega.processing_vggt_omega import (
+            VGGTOmegaProcessor,
+            crop_to_aspect_ratio,
+            resize_like_pil,
+        )
+
+        balanced, max_size = VGGTOmegaProcessor(), VGGTOmegaProcessor(mode="max_size")
+        self.assertEqual(balanced.target_size(720, 1280), (384, 688))
+        self.assertEqual(balanced.target_size(1280, 720), (688, 384))
+        self.assertEqual(max_size.target_size(720, 1280), (288, 512))
+        self.assertEqual(max_size.target_size(1280, 720), (512, 288))
+        self.assertEqual(
+            crop_to_aspect_ratio(mx.zeros((720, 300, 3))).shape, (600, 300, 3)
+        )
+        self.assertEqual(
+            crop_to_aspect_ratio(mx.zeros((100, 400, 3))).shape, (100, 200, 3)
+        )
+
+        rng = np.random.default_rng(0)
+        image = rng.integers(0, 256, (37, 53, 3), np.uint8)
+        for size in ((16, 32), (64, 80)):
+            want = np.asarray(Image.fromarray(image).resize(size[::-1], Image.BICUBIC))
+            got = np.array(resize_like_pil(mx.array(image), size))
+            self.assertLessEqual(np.abs(got - want).max(), 1.0)
+
+        rgba = np.zeros((32, 48, 4), np.uint8)
+        rgba[..., 3] = 0  # fully transparent -> white
+        wide = rng.integers(0, 256, (32, 64, 3), np.uint8)
+        # pytest.warns, not assertWarns: assertWarns touches every module in
+        # sys.modules, which imports transformers' lazy torch modules.
+        with pytest.warns(UserWarning):  # mixed sizes are padded
+            pixel_values = balanced([Image.fromarray(rgba), wide])["pixel_values"]
+        self.assertEqual(pixel_values.dtype, mx.float32)
+        first = np.array(pixel_values[0])
+        self.assertTrue(np.all(first == 1.0))  # white image, white padding
+
+    def test_predictor_is_lazy_and_writes_point_clouds(self):
+        """``infer`` builds one graph without host syncs; the point cloud
+        keeps confident points and the PLY is binary xyz + rgb."""
+        from mlx_vlm.models.vggt_omega.generate import (
+            VGGTOmegaPredictor,
+            point_cloud,
+            write_ply,
+        )
+        from mlx_vlm.models.vggt_omega.processing_vggt_omega import VGGTOmegaProcessor
+
+        predictor = VGGTOmegaPredictor(
+            self._model(), VGGTOmegaProcessor(image_resolution=48)
+        )
+        frames = [
+            np.random.default_rng(i).integers(0, 256, (30, 45, 3), np.uint8)
+            for i in range(2)
+        ]
+
+        with sync_trap():
+            out = predictor.infer(frames)
+        mx.eval(out)
+        S, H, W = out["depth"].shape
+        self.assertEqual((S, H % 16, W % 16), (2, 0, 0))
+        self.assertEqual(out["world_points"].shape, (S, H, W, 3))
+        self.assertEqual(out["extrinsics"].shape, (S, 3, 4))
+
+        predictions = {
+            "world_points": mx.arange(12, dtype=mx.float32).reshape(1, 2, 2, 3),
+            "images": mx.full((1, 2, 2, 3), 0.5),
+            "depth_conf": mx.array([[[1.0, 2.0], [3.0, 4.0]]]),
+        }
+        points, colors = point_cloud(predictions, conf_percentile=50)
+        self.assertEqual(points.tolist(), [[6, 7, 8], [9, 10, 11]])
+        self.assertEqual(colors.tolist(), [[127] * 3] * 2)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cloud.ply"
+            write_ply(path, points, colors)
+            header, _, payload = path.read_bytes().partition(b"end_header\n")
+        self.assertIn(b"element vertex 2\n", header)
+        self.assertEqual(len(payload), 2 * (3 * 4 + 3))
+        self.assertEqual(np.frombuffer(payload[:12], "<f4").tolist(), [6, 7, 8])
 
 
 def _extraction_model(name):

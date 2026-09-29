@@ -201,6 +201,36 @@
         "slat_steps": 2
       },
       "checks": ["registry_and_config"]
+    },
+    {
+      "id": "vggt_omega",
+      "module": "vggt_omega",
+      "config": {
+        "embed_dim": 128,
+        "num_heads": 2,
+        "mlp_ratio": 2.0,
+        "encoder_depth": 2,
+        "num_storage_tokens": 2,
+        "depth": 4,
+        "num_register_tokens": 3,
+        "register_attention_block_indices": [1],
+        "cached_layer_indices": [0, 1, 2, 3],
+        "enable_alignment": true,
+        "head_num_heads": 2,
+        "head_depth": 1,
+        "dense_features": 16,
+        "dense_out_channels": [8, 16, 32, 32]
+      },
+      "input_shape": [2, 32, 48, 3],
+      "output_shapes": {
+        "pose_enc": [1, 2, 9],
+        "depth": [1, 2, 32, 48, 1],
+        "depth_conf": [1, 2, 32, 48],
+        "camera_and_register_tokens": [1, 2, 4, 256],
+        "text_alignment_embedding": [1, 256],
+        "text_alignment_token": [1, 256]
+      },
+      "checks": ["registry_and_config", "forward", "checkpoint"]
     }
   ],
   "shared_configs": {

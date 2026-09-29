@@ -42,12 +42,24 @@ class RopePositionEmbedding(nn.Module):
     Tables are returned packed for ``_rope_apply``: ``sin`` (N, 2, D/2) as
     ``[-sin, sin]`` and ``cos`` (N, 1, D/2), with ``prefix`` identity rows
     so cls/register tokens are not rotated. Cached per grid.
+
+    ``normalize_coords`` is DINOv3's option: ``"separate"`` divides each
+    axis by its own length, ``"max"`` both axes by the longer one.
     """
 
-    def __init__(self, embed_dim: int, num_heads: int, base: float = 100.0):
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        base: float = 100.0,
+        normalize_coords: str = "separate",
+    ):
         super().__init__()
         assert embed_dim % (4 * num_heads) == 0
+        if normalize_coords not in ("separate", "max"):
+            raise ValueError(f"Unsupported normalize_coords {normalize_coords!r}")
         self.D_head = embed_dim // num_heads
+        self.normalize_coords = normalize_coords
         periods = base ** (
             2 * mx.arange(self.D_head // 4, dtype=mx.float32) / (self.D_head // 2)
         )
@@ -57,9 +69,12 @@ class RopePositionEmbedding(nn.Module):
     def __call__(self, H: int, W: int, prefix: int = 0) -> Tuple[mx.array, mx.array]:
         key = (H, W, prefix)
         if key not in self._tables:
-            # Patch-center coordinates in [-1, +1], normalized per axis.
-            coords_h = mx.arange(0.5, H, dtype=mx.float32) / H
-            coords_w = mx.arange(0.5, W, dtype=mx.float32) / W
+            # Patch-center coordinates within [-1, +1].
+            norm_h, norm_w = H, W
+            if self.normalize_coords == "max":
+                norm_h = norm_w = max(H, W)
+            coords_h = mx.arange(0.5, H, dtype=mx.float32) / norm_h
+            coords_w = mx.arange(0.5, W, dtype=mx.float32) / norm_w
             coords = mx.stack(mx.meshgrid(coords_h, coords_w, indexing="ij"), axis=-1)
             coords = 2.0 * coords.reshape(-1, 2) - 1.0
 
