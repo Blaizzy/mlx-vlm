@@ -3,6 +3,7 @@ from typing import Any, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.layers.distributed import sum_gradients
 
 from ...speculative.cache_state import (
     rollback_speculative_cache as rollback_cache_transaction,
@@ -1022,6 +1023,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.norm = Qwen3_5RMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
 
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
+        self.sharding_group = None
 
     def _causal_conv1d_decode(self, conv_input: mx.array) -> mx.array:
         cached = getattr(self, "_qwen3_5_decode_conv_weight", None)
@@ -1051,6 +1053,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         B, S, _ = inputs.shape
+        if self.sharding_group is not None:
+            inputs = sum_gradients(self.sharding_group)(inputs)
         mixed_qkv = self.in_proj_qkv(inputs)
         z = self.in_proj_z(inputs)
         b, a = self._project_gates(inputs)
@@ -1119,7 +1123,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 _qwen3_5_advance_lengths_info(cache, S)
 
         out = self.norm(out, z)
-        return self.out_proj(out.reshape(B, S, -1))
+        out = self.out_proj(out.reshape(B, S, -1))
+        if self.sharding_group is not None:
+            out = mx.distributed.all_sum(out, group=self.sharding_group)
+        return out
 
 
 class Qwen3_5DecoderLayer(nn.Module):
@@ -1585,6 +1592,10 @@ class LanguageModel(nn.Module):
         attention_mask = kwargs.pop("attention_mask", None)
         capture_layer_ids = kwargs.pop("capture_layer_ids", None)
         speculative_verify = bool(kwargs.pop("speculative_verify", False))
+        if speculative_verify and getattr(self, "_sharding_group", None) is not None:
+            raise NotImplementedError(
+                "Speculative verification is not supported with Qwen MoE tensor parallelism"
+            )
         return_hidden = kwargs.pop("return_hidden", False)
         return_shared_kv = kwargs.pop("return_shared_kv", False)
         skip_logits = kwargs.pop("skip_logits", False)

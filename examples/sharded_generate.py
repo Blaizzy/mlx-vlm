@@ -4,9 +4,9 @@ Run with:
 ```
 mlx.launch \
     --backend jaccl \
-    --env MLX_METAL_FAST_SYNCH=1 \
     --hostfile /path/to/hosts.json \
-    /path/to/sharded_generate.py \
+    -- python /path/to/sharded_generate.py \
+    --backend jaccl \
     --prompt 'Describe this image.' --image /path/to/image.jpg
 ```
 
@@ -50,13 +50,19 @@ if __name__ == "__main__":
         help="Maximum number of tokens to generate",
     )
     parser.add_argument(
+        "--backend",
+        default="any",
+        choices=("any", "jaccl", "ring", "mpi", "nccl"),
+        help="Communication backend; use jaccl for Thunderbolt RDMA.",
+    )
+    parser.add_argument(
         "--pipeline",
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
     )
     args = parser.parse_args()
 
-    group = mx.distributed.init()
+    group = mx.distributed.init(strict=args.backend != "any", backend=args.backend)
     rank = group.rank()
     pipeline_group = group if args.pipeline else None
     tensor_group = group if not args.pipeline else None
