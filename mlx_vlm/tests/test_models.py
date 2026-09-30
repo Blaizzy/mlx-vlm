@@ -2098,3 +2098,94 @@ class TestLayaDecisionModel(unittest.TestCase):
         np.testing.assert_allclose(
             np.asarray(single[0]), np.asarray(batch[0]), atol=2e-5
         )
+
+    def test_activations_match_reference(self):
+        from mlx_vlm.models.laya import Model, ModelConfig
+
+        case = next(case for case in DATA["cases"] if case["id"] == "laya")
+        model = Model(ModelConfig.from_dict(copy.deepcopy(case["config"])))
+        values = [-3.0, -1.0, 0.0, 0.5, 2.0]
+        x = mx.array(values)
+        gelu = mx.array([v * (1 + math.erf(v / math.sqrt(2))) / 2 for v in values])
+        self.assertTrue(
+            mx.array_equal(model.head.layers[0].activation(x), mx.maximum(x, 0))
+        )
+        for activation in (model.scorer.layers[2], model.act_head.layers[1]):
+            self.assertTrue(mx.allclose(activation(x), gelu, atol=1e-7))
+
+    def test_criterion_rendering_matches_reference(self):
+        from mlx_vlm.models.laya.laya import _options
+
+        cases = [
+            (
+                {
+                    "type": "choice",
+                    "criteria": {
+                        "zero": 0,
+                        "false": False,
+                        "empty": "",
+                        "none": None,
+                        "object": {"é": True},
+                        "list": [0, False],
+                    },
+                },
+                [
+                    "zero: 0",
+                    "false: false",
+                    "empty",
+                    "none",
+                    'object: {"é": true}',
+                    "list: [0, false]",
+                ],
+            ),
+            (
+                {"type": "score", "criteria": [{"é": True}, [0, False]]},
+                ['level 0: {"é": true}', "level 1: [0, false]"],
+            ),
+            (
+                {"type": "noul", "criteria": {"false": 0, "true": False}},
+                ["false: 0", "true: false"],
+            ),
+            (
+                {
+                    "type": "noul",
+                    "criteria": {"false": {"é": True}, "true": [0, False]},
+                },
+                ['false: {"é": true}', "true: [0, false]"],
+            ),
+        ]
+        for question, expected in cases:
+            with self.subTest(question=question):
+                self.assertEqual(_options(question)[1], expected)
+
+    def test_calibrated_probabilities_match_reference(self):
+        from mlx_vlm.models.laya.laya import Laya
+
+        for temperature, effective in [
+            (0.1, 0.5),
+            (10, 5),
+            (2, 2),
+            ("nan", 1),
+            ("inf", 1),
+            (None, 1),
+            ("invalid", 1),
+        ]:
+            for bucket in (False, True):
+                with self.subTest(temperature=temperature, bucket=bucket):
+                    settings = {"temperature": [temperature] * 3}
+                    if bucket:
+                        settings.update(
+                            temperature=[1.0] * 3,
+                            temperature_by_options={"choice:2": temperature},
+                        )
+                    model = MagicMock(config=NS(decision_config=settings))
+                    model.return_value = (mx.array([[0.0, 1.0]]), mx.zeros((1, 2)))
+                    adapter = Laya(model, NS(pad_token_id=0))
+                    adapter._sequence = lambda *args: ([1, 2], [0, 1])
+                    result = adapter.predict(
+                        "text", {"route": {"type": "choice", "criteria": ["A", "B"]}}
+                    )
+                    expected = round(1 / (1 + math.exp(-1 / effective)), 4)
+                    self.assertEqual(
+                        result["answers"]["route"]["probabilities"]["B"], expected
+                    )

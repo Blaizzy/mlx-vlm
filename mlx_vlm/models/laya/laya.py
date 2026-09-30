@@ -19,7 +19,7 @@ class DecisionLayer(nn.Module):
         self.norm2 = nn.LayerNorm(width)
         self.linear1 = nn.Linear(width, 4 * width)
         self.linear2 = nn.Linear(4 * width, width)
-        self.activation = nn.GELU(approx="precise")
+        self.activation = nn.ReLU()
 
     def __call__(self, hidden, mask):
         normalized = self.norm1(hidden)
@@ -51,11 +51,11 @@ class Model(nn.Module):
         self.scorer = nn.Sequential(
             nn.LayerNorm(width),
             nn.Linear(width, width),
-            nn.GELU(approx="precise"),
+            nn.GELU(),
             nn.Linear(width, 1),
         )
         self.act_head = nn.Sequential(
-            nn.Linear(width + 4, 256), nn.GELU(approx="precise"), nn.Linear(256, 2)
+            nn.Linear(width + 4, 256), nn.GELU(), nn.Linear(256, 2)
         )
         self.temperature = mx.ones((3,), dtype=mx.float32)
 
@@ -113,6 +113,12 @@ class Model(nn.Module):
         return Laya(self, processor).predict(state, questions, **kwargs)
 
 
+def _render_criterion(value):
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
 def _options(question):
     kind = question["type"]
     criteria = question.get("criteria")
@@ -122,19 +128,33 @@ def _options(question):
         if not isinstance(criteria, dict) or len(criteria) < 2:
             raise ValueError("choice needs at least two options")
         return list(criteria), [
-            key if not value else f"{key}: {value}" for key, value in criteria.items()
+            (
+                key
+                if value is None or value == ""
+                else f"{key}: {_render_criterion(value)}"
+            )
+            for key, value in criteria.items()
         ]
     if kind == "score":
         if not isinstance(criteria, list) or len(criteria) < 2:
             raise ValueError("score needs at least two levels")
         return list(range(len(criteria))), [
-            f"level {i}: {value}" for i, value in enumerate(criteria)
+            f"level {i}: {_render_criterion(value)}" for i, value in enumerate(criteria)
         ]
     if kind == "noul":
         criteria = criteria or {}
         return [False, True], [
-            "false: " + (criteria.get("false") or "no, the statement does not hold"),
-            "true: " + (criteria.get("true") or "yes, the statement holds"),
+            label
+            + ": "
+            + (
+                default
+                if criteria.get(label) is None or criteria.get(label) == ""
+                else _render_criterion(criteria[label])
+            )
+            for label, default in (
+                ("false", "no, the statement does not hold"),
+                ("true", "yes, the statement holds"),
+            )
         ]
     raise ValueError(f"Unsupported question type: {kind!r}")
 
@@ -228,6 +248,13 @@ class Laya:
             )
             temperature = self.config.get("temperature_by_options", {}).get(
                 f"{kind}:{bucket}", self.config["temperature"][QUESTION_TYPES[kind]]
+            )
+            try:
+                temperature = float(temperature)
+            except (TypeError, ValueError):
+                temperature = 1.0
+            temperature = (
+                min(5.0, max(0.5, temperature)) if math.isfinite(temperature) else 1.0
             )
             z = logits[i, :count] / temperature
             probabilities = mx.exp(z - z.max())
