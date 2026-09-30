@@ -1,0 +1,238 @@
+{
+  "cases": [
+    {
+      "id": "dinov2",
+      "module": "dinov2",
+      "config": {
+        "hidden_size": 32,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "patch_size": 16,
+        "image_size": 64,
+        "mlp_ratio": 2.0
+      },
+      "input_shape": [1, 64, 64, 3],
+      "output_shapes": {
+        "last_hidden_state": [1, 17, 32],
+        "pooler_output": [1, 32],
+        "hidden_patch_tokens": [1, 16, 32]
+      },
+      "checks": ["registry_and_config", "forward", "checkpoint"]
+    },
+    {
+      "id": "video_depth_anything",
+      "module": "video_depth_anything",
+      "config": {
+        "encoder": "vits",
+        "embed_dim": 32,
+        "depth": 4,
+        "num_heads": 2,
+        "intermediate_layer_idx": [0, 1, 2, 3],
+        "features": 8,
+        "out_channels": [8, 16, 32, 32],
+        "num_frames": 4,
+        "norm_num_groups": 8
+      },
+      "input_shape": [1, 2, 28, 28, 3],
+      "output_shapes": [1, 2, 28, 28],
+      "checks": ["registry_and_config", "forward", "checkpoint"]
+    },
+    {
+      "id": "sam3_1",
+      "module": "sam3_1",
+      "config": {},
+      "checks": ["registry_and_config"]
+    },
+    {
+      "id": "sam3d_body",
+      "module": "sam3d_body",
+      "config": {},
+      "checks": ["registry_and_config"]
+    },
+    {
+      "id": "sapiens2",
+      "module": "sapiens2",
+      "config": {
+        "architectures": ["Sapiens2Model"],
+        "hidden_size": 64,
+        "num_hidden_layers": 3,
+        "num_attention_heads": 4,
+        "num_first_full_attention_layers": 1,
+        "num_last_full_attention_layers": 1,
+        "intermediate_size": 128,
+        "image_size": [32, 24],
+        "patch_size": 8,
+        "num_register_tokens": 2
+      },
+      "input_shape": [2, 32, 24, 3],
+      "output_shapes": {
+        "last_hidden_state": [2, 15, 64],
+        "pooler_output": [2, 64]
+      },
+      "checks": ["registry_and_config", "forward", "checkpoint"]
+    },
+    {
+      "id": "moge3",
+      "module": "moge3",
+      "config": {
+        "encoder": {
+          "backbone": "dinov2_vits14",
+          "intermediate_layers": [0, 1],
+          "dim_out": 16,
+          "depth": 2,
+          "embed_dim": 32,
+          "num_heads": 4
+        },
+        "neck": {
+          "dim_in": [18, 2, 2],
+          "dim_res_blocks": [16, 8, 4],
+          "dim_out": null,
+          "num_res_blocks": [0, 1, 0],
+          "res_block_in_norm": "none",
+          "res_block_hidden_norm": "none",
+          "resamplers": ["conv_transpose", "bilinear"]
+        },
+        "points_head": {
+          "dim_in": [16, 8, 4],
+          "dim_res_blocks": [16, 8, 4],
+          "dim_out": [null, null, 3],
+          "num_res_blocks": [0, 1, 0],
+          "res_block_in_norm": "none",
+          "res_block_hidden_norm": "none",
+          "resamplers": ["conv_transpose", "bilinear"]
+        },
+        "mask_head": {
+          "dim_in": [16, 8, 4],
+          "dim_res_blocks": [16, 8, 4],
+          "dim_out": [null, null, 1],
+          "num_res_blocks": [0, 1, 0],
+          "res_block_in_norm": "none",
+          "res_block_hidden_norm": "none",
+          "resamplers": ["conv_transpose", "bilinear"]
+        },
+        "normal_head": null,
+        "scale_head": {
+          "dims": [32, 16, 1]
+        },
+        "refiner": {
+          "encoder_channels": 18,
+          "model_channels": [8, 16, 32],
+          "downsample_factors": [2, 2],
+          "encoder_downsample": 4
+        }
+      },
+      "checks": ["registry_and_config"]
+    },
+    {
+      "id": "gliner2_5",
+      "module": "gliner2_5",
+      "config": {
+        "architecture": "boundary",
+        "encoder_config": {
+          "vocab_size": 512,
+          "hidden_size": 128,
+          "num_attention_heads": 4,
+          "num_hidden_layers": 2,
+          "intermediate_size": 256,
+          "position_buckets": 64,
+          "max_relative_positions": 128
+        }
+      },
+      "checks": ["registry_and_config"]
+    },
+    {
+      "id": "openai_privacy_filter",
+      "module": "openai_privacy_filter",
+      "config": {
+        "vocab_size": 32,
+        "hidden_size": 8,
+        "intermediate_size": 8,
+        "num_hidden_layers": 1,
+        "num_local_experts": 4,
+        "num_experts_per_tok": 2,
+        "head_dim": 4,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "sliding_window": 2,
+        "max_position_embeddings": 32,
+        "default_n_ctx": 32,
+        "pad_token_id": 31,
+        "eos_token_id": 31,
+        "num_labels": 5,
+        "id2label": {
+          "0": "O",
+          "1": "B-x",
+          "2": "I-x",
+          "3": "E-x",
+          "4": "S-x"
+        },
+        "attention_chunk_size": 3,
+        "moe_chunk_size": 3
+      },
+      "checks": ["registry_and_config"]
+    },
+    {
+      "id": "sam3d_objects",
+      "module": "sam3d_objects",
+      "config": {
+        "hidden_size": 32,
+        "num_heads": 4,
+        "num_blocks": 1,
+        "cond_channels": 32,
+        "latent_resolution": 2,
+        "resolution": 8,
+        "io_channels": 8,
+        "decoder_channels": 32,
+        "decoder_heads": 4,
+        "decoder_blocks": 2,
+        "window_size": 2,
+        "structure_channels": [32, 16, 8],
+        "structure_res_blocks": 1,
+        "dino_hidden_size": 32,
+        "dino_heads": 4,
+        "dino_layers": 1,
+        "dino_image_size": 28,
+        "image_size": 28,
+        "point_size": 16,
+        "point_patch_size": 4,
+        "point_channels": 32,
+        "point_heads": 4,
+        "ss_steps": 2,
+        "slat_steps": 2
+      },
+      "checks": ["registry_and_config"]
+    }
+  ],
+  "shared_configs": {
+    "bert_token_classifier": {
+      "model_type": "bert",
+      "vocab_size": 64,
+      "hidden_size": 64,
+      "num_hidden_layers": 2,
+      "num_attention_heads": 4,
+      "intermediate_size": 128,
+      "max_position_embeddings": 32,
+      "num_labels": 5,
+      "id2label": {
+        "0": "O",
+        "1": "B-NAME",
+        "2": "I-NAME",
+        "3": "B-PHONE",
+        "4": "I-PHONE"
+      }
+    },
+    "sapiens2_deconv_head": {
+      "upsample_out_channels": [32, 16],
+      "upsample_kernel_sizes": [4, 4],
+      "conv_out_channels": [8],
+      "conv_kernel_sizes": [1]
+    },
+    "sapiens2_pixel_shuffle_head": {
+      "upsample_out_channels": [32, 16, 8],
+      "upsample_kernel_sizes": [3, 3, 3],
+      "conv_out_channels": [8],
+      "conv_kernel_sizes": [3],
+      "use_pixel_shuffle": true
+    }
+  }
+}

@@ -9,6 +9,7 @@ from typing import Dict
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..base import check_array_shape
 from ..dinov2.dinov2 import DINOv2
 from .config import ModelConfig
 from .dpt import DPTHeadTemporal, upsample_bilinear
@@ -47,10 +48,15 @@ class Model(nn.Module):
 
     @staticmethod
     def sanitize(weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
-        """Convert PyTorch checkpoint weights to MLX channel-last layout."""
+        """Convert PyTorch checkpoint weights to MLX channel-last layout.
+
+        ``load_model`` calls this on every checkpoint, including one already in
+        MLX layout, so ``check_array_shape`` gates the transpose to keep it
+        idempotent.
+        """
         sanitized = {}
         for k, v in weights.items():
-            if v.ndim == 4:
+            if v.ndim == 4 and not check_array_shape(v):
                 # resize_layers.0/.1 are ConvTranspose2d; resize_layers.3 is Conv2d
                 if "resize_layers.0" in k or "resize_layers.1" in k:
                     # ConvTranspose2d: (in, out, kh, kw) -> (out, kh, kw, in)
