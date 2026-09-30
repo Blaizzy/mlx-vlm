@@ -1,9 +1,11 @@
 # Decider-2b decisions on MLX
 
+Prepared checkpoint: [nativ-community/decider-2b](https://huggingface.co/nativ-community/decider-2b).
+
 ```python
 from mlx_vlm import load, predict
 
-model, processor = load("path/to/mlx-decider-2b")
+model, processor = load("nativ-community/decider-2b")
 result = predict(model, processor, "Please refund my duplicate charge", {
     "department": {
         "type": "choice",
