@@ -2886,36 +2886,57 @@ def test_restored_tokens_count_successful_restores(
     assert manager.stats_snapshot()["stored_tokens"] == 0
 
 
-def test_a_single_restored_row_keeps_its_own_cache(managers):
-    """One restored row gets the hit's own cache back, the object
-    materialize_single restores on the single-sequence path, not a batch
-    merge of it. Models with a single-row shortcut (qwen3_5) otherwise
-    extract() and re-merge() the full KV on every decode step. Two rows
-    still merge."""
-    manager = managers()
-    tokens = list(range(32))
-    assert manager.store_exact_cache(
-        tokens, [sample("ArraysCache", 32), sample("KVCache", 32)]
-    )
-    runner = coordinate(manager, [ArraysCache(2), KVCache()])
+@parametrize("name", ["qwen3_5", "lfm2", "gemma4", "qwen4_exp"])
+def test_a_restored_row_decodes_the_same_on_its_own_cache_as_merged(
+    prefix_manager, name
+):
+    """A restored single row on its own cache (what a cold row gets) and on the
+    batch merge of it decode the same greedy tokens and logprobs. This shows
+    the change is output-neutral; it does not test which cache the restore
+    site picks (see TestRestoredRowsGetColdCaches in test_generate.py)."""
+    mx.random.seed(23)
+    lm = language_model(name)
+    tokens = [i % 50 + 1 for i in range(71)]
 
-    def hit():
-        return runner.lookup(
-            tokens + [99],
-            extra_hash=0,
-            safe_lookup_min=0,
-            suffix_is_text_only=lambda _: True,
-            prefix_has_media=lambda _: False,
+    def decode(merged):
+        manager = prefix_manager()
+        manager._exact_cache_max = 8
+        seed = lm.make_cache()
+        lm(mx.array([tokens[:64]]), cache=seed)
+        assert manager.store_exact_cache(tokens[:64], seed)
+        restored, count = manager.lookup_exact_cache(tokens)
+        assert count == 64
+        caches = warm_exact([restored], [64])[0] if merged else restored
+        kinds = [type(c) for c in caches]
+        suffix = [tokens[64:]]
+        batch = PromptProcessingBatch(
+            model=lm,
+            uids=[0],
+            input_ids=suffix,
+            max_tokens=[10],
+            inputs_embeds=embeddings(lm, mx.array(suffix)),
+            prompt_kwargs={},
+            warm_cache=caches,
+            prefill_step_size=16,
+            right_pad_per_row=[0],
+            suffix_lens=[len(suffix[0])],
         )
+        while batch.needs_processing():
+            assert batch.prompt_step() > 0
+        generation = batch.generate(
+            lambda lp: mx.argmax(lp, axis=-1), lambda _: False
+        )
+        out = []
+        for _ in range(8):
+            out += [(r.token, r.token_logprob) for r in generation.next()]
+        return out, kinds
 
-    one = hit()
-    caches, prefix = runner.merge_rows([one], [one["prefix_len"]])
-    assert caches is one["warm_cache"] and prefix == one["prefix_len"]
-    assert manager.stats_snapshot()["restored_tokens"] == one["prefix_len"]
-    runner.release_hit(one)
-
-    two = hit()
-    caches, _ = runner.merge_rows([two, None], [two["prefix_len"], 0])
-    assert caches is not two["warm_cache"]
-    assert any(type(c).__name__.startswith("Batch") for c in caches)
-    runner.release_hit(two)
+    plain, plain_kinds = decode(merged=False)
+    merged, merged_kinds = decode(merged=True)
+    assert plain_kinds != merged_kinds
+    assert len(plain) == 8
+    assert [t for t, _ in plain] == [t for t, _ in merged]
+    # A repeated token says little; the sampled logprob at each step does.
+    assert [lp for _, lp in plain] == pytest.approx(
+        [lp for _, lp in merged], abs=1e-4
+    )
