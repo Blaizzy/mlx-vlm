@@ -6,10 +6,12 @@ Native MLX inference for the Fastino GLiNER2.5 boundary-extractor checkpoints:
 - `fastino/gliner2.5-base-v1`
 - `fastino/gliner2.5-multi-v1`
 
+Prepared small checkpoint: [nativ-community/gliner2.5-small-v1](https://huggingface.co/nativ-community/gliner2.5-small-v1).
+
 ```python
 from mlx_vlm import load
 
-model, processor = load("fastino/gliner2.5-small-v1")
+model, processor = load("nativ-community/gliner2.5-small-v1")
 
 entities = model.extract_entities(
     processor,
