@@ -37,11 +37,10 @@ def register_routes(app, deps):
         try:
 
             def work():
-                with runtime.decision_lock:
-                    model, processor, _ = deps.get_cached_model(
-                        model_id, model_kind="decision"
-                    )
-                    return predict(model, processor, body.state, body.questions)
+                model, processor, _ = deps.get_cached_model(
+                    model_id, model_kind="decision"
+                )
+                return predict(model, processor, body.state, body.questions)
 
             result = await asyncio.to_thread(work)
         except Exception as error:

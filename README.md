@@ -534,7 +534,6 @@ curl http://localhost:8080/v1/decisions \
 An explicit `model` in the request selects a checkpoint; otherwise the currently
 loaded decision model is used. Without either, the endpoint returns HTTP 400.
 Decision requests are non-streaming and use the server's API-key authentication.
-Loading, prediction, and unloading coordinate through the decision cache lock.
 
 Both interfaces return the shared `predict()` result and preserve model-specific
 scoring. Decider and Laya support `choice`, `bool`, and `score`; consult each

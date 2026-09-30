@@ -5,7 +5,7 @@ import os
 import secrets
 import sys
 import time
-from contextlib import asynccontextmanager, nullcontext
+from contextlib import asynccontextmanager
 from pathlib import Path
 from threading import Lock
 from types import SimpleNamespace
@@ -580,13 +580,6 @@ def _audio_cache_group(model_kind: str) -> str:
 
 
 def get_cached_model(
-    model_path: str, adapter_path=_INHERIT_ADAPTER, *, model_kind: str = "auto"
-):
-    with runtime.decision_lock if model_kind == "decision" else nullcontext():
-        return _get_cached_model(model_path, adapter_path, model_kind=model_kind)
-
-
-def _get_cached_model(
     model_path: str,
     adapter_path=_INHERIT_ADAPTER,
     *,
@@ -1000,11 +993,6 @@ def _get_cached_model(
 
 # Synchronous unload function for internal use
 def unload_model_sync():
-    with runtime.decision_lock:
-        return _unload_models()
-
-
-def _unload_models():
     unloaded_any = False
     if runtime.audio_queue is not None:
         is_audio_worker = getattr(
@@ -1280,7 +1268,7 @@ async def unload_model_endpoint(request: Request):
         "models": snapshot["loaded_models"],
     }
 
-    if not await asyncio.to_thread(unload_model_sync):
+    if not unload_model_sync():  # Use the synchronous unload function
         return {"status": "no_model_loaded", "message": "No model is currently loaded"}
 
     return {

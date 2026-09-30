@@ -1,5 +1,4 @@
 from dataclasses import dataclass, field
-from threading import RLock
 from typing import Any, Dict, Iterator, Optional
 
 from .runtime_config import RuntimeConfig
@@ -64,7 +63,6 @@ class ModelCacheRegistry:
 @dataclass
 class ServerRuntime:
     model_cache: ModelCacheRegistry = field(default_factory=ModelCacheRegistry)
-    decision_lock: Any = field(default_factory=RLock)
     response_generator: Optional[Any] = None
     audio_queue: Optional[Any] = None
     realtime_engine: Optional[Any] = None
