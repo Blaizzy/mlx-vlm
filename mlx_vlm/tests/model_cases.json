@@ -2,6 +2,63 @@
   "version": 2,
   "cases": [
     {
+      "id": "laya",
+      "module": "laya",
+      "config": {
+        "model_type": "laya",
+        "encoder_config": {
+          "model_type": "modernbert",
+          "vocab_size": 512,
+          "hidden_size": 64,
+          "num_hidden_layers": 2,
+          "intermediate_size": 128,
+          "num_attention_heads": 1,
+          "local_attention": 16,
+          "global_attn_every_n_layers": 2
+        },
+        "head_layers": 1,
+        "tokenizer_subfolder": "tokenizer",
+        "decision_config": {
+          "head_layers": 1,
+          "max_len": 64,
+          "head_max_len": 32,
+          "temperature": [
+            1.0,
+            1.0,
+            1.0
+          ]
+        }
+      },
+      "checks": [
+        "system_one"
+      ],
+      "system_one": {
+        "state": "A B",
+        "questions": {
+          "route": {
+            "type": "choice",
+            "instructions": "Route",
+            "criteria": [
+              "A",
+              "B"
+            ]
+          },
+          "quality": {
+            "type": "score",
+            "instructions": "Rate",
+            "criteria": [
+              "low",
+              "high"
+            ]
+          },
+          "finished": {
+            "type": "bool",
+            "instructions": "Finished"
+          }
+        }
+      }
+    },
+    {
       "id": "lfm2_encoder",
       "module": "lfm2_encoder",
       "config": {
@@ -2778,19 +2835,6 @@
       "num_target_layers": 2,
       "markov_rank": 4,
       "enable_confidence_head": true
-    }
-  },
-  "laya": {
-    "head_layers": 1,
-    "config": {
-      "model_type": "modernbert",
-      "vocab_size": 32,
-      "hidden_size": 64,
-      "num_hidden_layers": 2,
-      "intermediate_size": 128,
-      "num_attention_heads": 1,
-      "local_attention": 16,
-      "global_attn_every_n_layers": 2
     }
   }
 }

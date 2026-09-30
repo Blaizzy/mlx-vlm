@@ -1307,9 +1307,17 @@ def load(
         ValueError: If model class or args class are not found.
     """
     force_download = kwargs.get("force_download", False)
+    subfolder = kwargs.pop("subfolder", None)
+    if subfolder and (Path(subfolder).is_absolute() or ".." in Path(subfolder).parts):
+        raise ValueError("subfolder must be a relative checkpoint directory")
     model_path = get_model_path(
-        path_or_hf_repo, force_download=force_download, revision=revision
+        path_or_hf_repo,
+        force_download=force_download,
+        revision=revision,
+        **({"allow_patterns": [f"{subfolder}/*"]} if subfolder else {}),
     )
+    if subfolder:
+        model_path = model_path / subfolder
     model = load_model(model_path, lazy, strict=strict, **kwargs)
     if adapter_path is not None:
         model = apply_lora_layers(model, adapter_path)
@@ -1401,6 +1409,22 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
             force_download=kwargs.get("force_download", False),
         )
 
+    if (
+        not (model_path / "config.json").is_file()
+        and (model_path / "rl_agent_config.json").is_file()
+    ):
+        with open(model_path / "rl_agent_config.json") as f:
+            settings = json.load(f)
+        with open(model_path / "encoder" / "config.json") as f:
+            encoder_config = json.load(f)
+        return {
+            "model_type": "laya",
+            "encoder_config": encoder_config,
+            "decision_config": settings,
+            "head_layers": settings["head_layers"],
+            "tokenizer_subfolder": "tokenizer",
+        }
+
     try:
         with open(model_path / "config.json", encoding="utf-8") as f:
             config = json.load(f)
@@ -1465,6 +1489,16 @@ def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImagePro
 def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> ProcessorMixin:
+    config = load_config(Path(model_path))
+    if (
+        config.get("tokenizer_subfolder")
+        and (Path(model_path) / config["tokenizer_subfolder"]).is_dir()
+    ):
+        from transformers import AutoTokenizer
+
+        tokenizer_path = Path(model_path) / config.get("tokenizer_subfolder", "")
+        return AutoTokenizer.from_pretrained(tokenizer_path, **kwargs)
+
     processor = AutoProcessor.from_pretrained(model_path, **kwargs)
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)

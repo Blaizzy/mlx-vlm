@@ -1,13 +1,12 @@
 import json
 import math
-from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from transformers import AutoTokenizer
 
-from ..modernbert import ModelConfig
+from ...decision import format_decisions
+from ..modernbert import ModelConfig as EncoderConfig
 from ..modernbert.modernbert import Model as ModernBert
 
 QUESTION_TYPES = {"choice": 0, "score": 1, "noul": 2}
@@ -40,13 +39,16 @@ class DecisionHead(nn.Module):
         return hidden
 
 
-class DecisionModel(nn.Module):
-    def __init__(self, encoder_config, head_layers=2):
+class Model(nn.Module):
+    decision_types = ("choice", "score", "bool")
+
+    def __init__(self, config):
         super().__init__()
-        self.encoder = ModernBert(ModelConfig.from_dict(encoder_config))
-        width = encoder_config["hidden_size"]
+        self.config = config
+        self.encoder = ModernBert(EncoderConfig.from_dict(config.encoder_config))
+        width = config.encoder_config["hidden_size"]
         self.type_emb = nn.Embedding(3, width)
-        self.head = DecisionHead(width, head_layers)
+        self.head = DecisionHead(width, config.head_layers)
         self.scorer = nn.Sequential(
             nn.LayerNorm(width),
             nn.Linear(width, width),
@@ -82,25 +84,36 @@ class DecisionModel(nn.Module):
         act = self.act_head(mx.concatenate((pooled, features), axis=-1))
         return logits, act
 
-
-def _weights(path):
-    weights = mx.load(str(path))
-    result = {}
-    for key, value in weights.items():
-        if ".self_attn.in_proj_" in key:
-            prefix, suffix = key.split(".self_attn.in_proj_")
-            for name, split in zip(
-                ("query_proj", "key_proj", "value_proj"), mx.split(value, 3, axis=0)
+    def sanitize(self, weights):
+        result = {}
+        for key, value in weights.items():
+            if ".self_attn.in_proj_" in key:
+                prefix, suffix = key.split(".self_attn.in_proj_")
+                for name, split in zip(
+                    ("query_proj", "key_proj", "value_proj"), mx.split(value, 3, axis=0)
+                ):
+                    result[f"{prefix}.attention.{name}.{suffix}"] = split
+            elif ".self_attn.out_proj." in key:
+                result[key.replace(".self_attn.out_proj.", ".attention.out_proj.")] = (
+                    value
+                )
+            elif key.startswith(("scorer.", "act_head.")) and not key.startswith(
+                ("scorer.layers.", "act_head.layers.")
             ):
-                result[f"{prefix}.attention.{name}.{suffix}"] = split
-        elif ".self_attn.out_proj." in key:
-            result[key.replace(".self_attn.out_proj.", ".attention.out_proj.")] = value
-        elif key.startswith(("scorer.", "act_head.")):
-            prefix, index, suffix = key.split(".", 2)
-            result[f"{prefix}.layers.{index}.{suffix}"] = value
-        else:
-            result[key] = value
-    return result
+                prefix, index, suffix = key.split(".", 2)
+                result[f"{prefix}.layers.{index}.{suffix}"] = value
+            else:
+                result[key] = value
+        return result
+
+    def predict(self, processor, state, questions, **kwargs):
+        questions = {
+            name: {**spec, "type": "noul" if spec["type"] == "bool" else spec["type"]}
+            for name, spec in questions.items()
+        }
+        return format_decisions(
+            Laya(self, processor).predict(state, questions, **kwargs)
+        )
 
 
 def _options(question):
@@ -130,25 +143,10 @@ def _options(question):
 
 
 class Laya:
-    def __init__(self, path):
-        self.path = Path(path)
-        self.config = json.loads((self.path / "rl_agent_config.json").read_text())
-        encoder_config = json.loads((self.path / "encoder" / "config.json").read_text())
-        rope = encoder_config.get("rope_parameters", {})
-        if isinstance(rope, dict):
-            encoder_config["global_rope_theta"] = rope.get("full_attention", {}).get(
-                "rope_theta", 160000
-            )
-            encoder_config["local_rope_theta"] = rope.get("sliding_attention", {}).get(
-                "rope_theta", 10000
-            )
-        self.tokenizer = AutoTokenizer.from_pretrained(self.path / "tokenizer")
-        self.model = DecisionModel(encoder_config, self.config["head_layers"])
-        self.model.load_weights(
-            list(_weights(self.path / "model.safetensors").items()), strict=True
-        )
-        self.model.eval()
-        mx.eval(self.model.parameters())
+    def __init__(self, model, tokenizer):
+        self.config = model.config.decision_config
+        self.tokenizer = tokenizer
+        self.model = model
 
     def _sequence(self, state, question, option_text):
         tok = self.tokenizer
@@ -280,20 +278,3 @@ class Laya:
             "answers": answers,
             "usage": {"input_tokens": int(attention.sum()), "output_tokens": 0},
         }
-
-
-def load(path_or_repo, *, subfolder=None, revision=None):
-    from ...utils import get_model_path
-
-    prefix = f"{subfolder}/" if subfolder else ""
-    path = get_model_path(
-        path_or_repo,
-        revision=revision,
-        allow_patterns=[
-            f"{prefix}model.safetensors",
-            f"{prefix}rl_agent_config.json",
-            f"{prefix}encoder/*",
-            f"{prefix}tokenizer/*",
-        ],
-    )
-    return Laya(path / subfolder if subfolder else path)

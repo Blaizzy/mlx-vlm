@@ -63,6 +63,66 @@ def capture_positions(
 class ModelChecks:
     """Reusable assertions; each JSON case constructs fresh configs and models."""
 
+    def system_one(self, model, config, *, state, questions):
+        import string
+        import tempfile
+        from dataclasses import asdict
+
+        from tokenizers import Tokenizer, models, pre_tokenizers
+        from transformers import PreTrainedTokenizerFast
+
+        from mlx_vlm import predict
+
+        labels = list(string.ascii_uppercase) + [
+            a + b for a in string.ascii_uppercase for b in string.ascii_uppercase
+        ]
+        tokens = ["[UNK]", "[PAD]", "[CLS]", "[SEP]", "[MASK]", *labels[:255]]
+        backend = Tokenizer(
+            models.WordLevel(dict(zip(tokens, range(len(tokens)))), unk_token="[UNK]")
+        )
+        backend.pre_tokenizer = pre_tokenizers.Whitespace()
+        processor = PreTrainedTokenizerFast(
+            tokenizer_object=backend,
+            unk_token="[UNK]",
+            pad_token="[PAD]",
+            cls_token="[CLS]",
+            sep_token="[SEP]",
+            mask_token="[MASK]",
+        )
+        model.eval()
+        expected = predict(model, processor, state, questions)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config.json").write_text(json.dumps(asdict(config)))
+            processor.save_pretrained(root)
+            mx.save_safetensors(
+                str(root / "model.safetensors"), dict(tree_flatten(model.parameters()))
+            )
+            loaded, tokenizer = load(directory)
+            actual = predict(loaded, tokenizer, state, questions)
+            assert actual["answers"] == expected["answers"]
+            assert actual.get("usage") == expected.get("usage")
+        assert set(expected["answers"]) == set(questions)
+        for name, answer in expected["answers"].items():
+            question = questions[name]
+            kind = question["type"]
+            assert answer["type"] == kind
+            if kind == "choice":
+                assert answer["value"] in question["criteria"]
+            elif kind == "score":
+                assert 0 <= answer["value"] <= len(question["criteria"]) - 1
+            elif kind == "bool":
+                assert isinstance(answer["value"], bool)
+                assert 0 <= answer["probability"] <= 1
+            elif kind == "multi_label":
+                assert set(answer["value"]) <= set(question["criteria"])
+            if "probabilities" in answer:
+                assert sum(answer["probabilities"].values()) == pytest.approx(
+                    1, abs=1e-3
+                )
+        with pytest.raises(ValueError, match="does not support"):
+            predict(model, processor, state, {"invalid": {"type": "unknown"}})
+
     def forward_cache(self, model, vocab_size, *, chunk_sizes=()):
         model.eval()
         mx.eval(model.parameters())
@@ -527,6 +587,8 @@ def check_arguments(kind, case, model, config):
         return (model, config), case["multimodal"]
     if kind == "input_embeddings":
         return (model, name), {}
+    if kind == "system_one":
+        return (model, config), case["system_one"]
     if kind == "audio":
         return (model, config, name), case.get("audio", {})
     if kind in {"request_positions", "chunked_positions"}:
@@ -2076,12 +2138,10 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
 
 class TestLayaDecisionModel(unittest.TestCase):
     def test_padding_does_not_change_option_logits(self):
-        from mlx_vlm.models.laya.laya import DecisionModel
+        from mlx_vlm.models.laya import Model, ModelConfig
 
-        spec = DATA["laya"]
-        model = DecisionModel(
-            copy.deepcopy(spec["config"]), head_layers=spec["head_layers"]
-        )
+        case = next(case for case in DATA["cases"] if case["id"] == "laya")
+        model = Model(ModelConfig.from_dict(copy.deepcopy(case["config"])))
         model.eval()
         single, _ = model(
             mx.array([[1, 2, 3]]),

@@ -1,3 +1,4 @@
-from .laya import Laya, load
+from .config import ModelConfig
+from .laya import Model
 
-__all__ = ["Laya", "load"]
+__all__ = ["Model", "ModelConfig"]
