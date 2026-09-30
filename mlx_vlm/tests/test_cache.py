@@ -2923,9 +2923,7 @@ def test_a_restored_row_decodes_the_same_on_its_own_cache_as_merged(
         )
         while batch.needs_processing():
             assert batch.prompt_step() > 0
-        generation = batch.generate(
-            lambda lp: mx.argmax(lp, axis=-1), lambda _: False
-        )
+        generation = batch.generate(lambda lp: mx.argmax(lp, axis=-1), lambda _: False)
         out = []
         for _ in range(8):
             out += [(r.token, r.token_logprob) for r in generation.next()]
@@ -2937,6 +2935,4 @@ def test_a_restored_row_decodes_the_same_on_its_own_cache_as_merged(
     assert len(plain) == 8
     assert [t for t, _ in plain] == [t for t, _ in merged]
     # A repeated token says little; the sampled logprob at each step does.
-    assert [lp for _, lp in plain] == pytest.approx(
-        [lp for _, lp in merged], abs=1e-4
-    )
+    assert [lp for _, lp in plain] == pytest.approx([lp for _, lp in merged], abs=1e-4)
