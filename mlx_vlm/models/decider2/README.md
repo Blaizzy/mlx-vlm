@@ -57,3 +57,18 @@ Use `--state-file request.txt` for UTF-8 text and `--questions-file questions.js
 for a JSON mapping of named questions. The command prints the same JSON result
 as `predict()`, preserving each model's supported question types and scoring.
 After installation, `mlx_vlm.decide` runs the same command.
+
+## HTTP server
+
+Start the existing server with `python -m mlx_vlm.server`, then send a request:
+
+```sh
+curl http://localhost:8080/v1/decisions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"nativ-community/decider-2b","state":"Please refund my duplicate charge","questions":{"department":{"type":"choice","instructions":"Which team should handle this ticket?","criteria":["billing","technical","sales"]}}}'
+```
+
+`POST /v1/decisions` returns the shared prediction result directly and uses the
+server's existing API-key authentication. Decision models have their own cache
+entry and do not use token-generation workers. Requests are non-streaming and
+preserve each model's supported question types and native scoring.

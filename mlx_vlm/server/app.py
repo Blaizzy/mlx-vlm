@@ -30,6 +30,7 @@ from ..vision_cache import VisionFeatureCache
 from . import request_normalization as _request_normalization
 from .anthropic import register_routes as register_anthropic_routes
 from .audio import register_routes as register_audio_routes
+from .decisions import register_routes as register_decision_routes
 from .embeddings import register_routes as register_embeddings_routes
 from .generation import (
     GenerationArguments,
@@ -100,6 +101,8 @@ def _cache_group_for_cache(cache: dict) -> str:
         return "embedding"
     if model_kind == "reranker":
         return "reranker"
+    if model_kind == "decision":
+        return "decision"
     return "text_generation"
 
 
@@ -584,6 +587,7 @@ def get_cached_model(
     load_as_audio = _audio_model_kind(model_kind)
     load_as_embedding = model_kind == "embedding"
     load_as_reranker = model_kind == "reranker"
+    load_as_decision = model_kind == "decision"
     load_as_image = model_kind == "image_generation" or (
         model_kind == "auto" and is_image_generation_model(model_path)
     )
@@ -599,6 +603,9 @@ def get_cached_model(
     elif load_as_reranker:
         cache_group = "reranker"
         effective_model_kind = "reranker"
+    elif load_as_decision:
+        cache_group = "decision"
+        effective_model_kind = "decision"
     elif load_as_image:
         cache_group = "image_generation"
         effective_model_kind = "image_generation"
@@ -748,6 +755,42 @@ def get_cached_model(
         }
         registry.set(cache_group, cache)
         return model, None, config
+
+    if load_as_decision:
+        from ..utils import load
+
+        if adapter_path is not None:
+            raise HTTPException(
+                status_code=400, detail="Decision adapters are not supported"
+            )
+        try:
+            model, processor = load(model_path)
+            if not getattr(model, "decision_types", ()):
+                raise ValueError("This model does not support decision prediction")
+        except RepositoryNotFoundError as error:
+            raise HTTPException(
+                status_code=404, detail=f"Model not found: {model_path}"
+            ) from error
+        except (FileNotFoundError, ValueError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except Exception as error:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to load decision model: {error}"
+            ) from error
+        config = model.config
+        registry.set(
+            cache_group,
+            {
+                "cache_key": cache_key,
+                "model_path": model_path,
+                "adapter_path": None,
+                "model": model,
+                "processor": processor,
+                "config": config,
+                "model_kind": "decision",
+            },
+        )
+        return model, processor, config
 
     if load_as_embedding:
         if adapter_path is not None:
@@ -1008,6 +1051,7 @@ register_anthropic_routes(inference_router, _protocol_deps)
 register_openai_routes(inference_router, _protocol_deps)
 register_audio_routes(inference_router, _protocol_deps)
 register_realtime_routes(inference_router, _protocol_deps)
+register_decision_routes(inference_router, _protocol_deps)
 register_embeddings_routes(inference_router, _protocol_deps)
 register_reranking_routes(inference_router, _protocol_deps)
 
