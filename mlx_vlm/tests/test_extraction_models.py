@@ -7,12 +7,14 @@ import copy
 import importlib
 import io
 import json
+import math
 import pickle
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -2003,3 +2005,140 @@ def test_video_depth_anything_rejects_unknown_encoder():
 
     with pytest.raises(ValueError):
         ModelConfig(encoder="vitxl")
+
+
+class TestLayaDecisionModel(unittest.TestCase):
+    def test_checkpoint_conversion(self):
+        model = _extraction_model("laya")
+        expected = {
+            key: mx.arange(value.size, dtype=value.dtype).reshape(value.shape)
+            for key, value in tree_flatten(model.parameters())
+        }
+        source = dict(expected)
+        for i in range(model.config.head_layers):
+            prefix = f"head.layers.{i}"
+            for suffix in ("weight", "bias"):
+                parts = []
+                for offset, name in enumerate(("query_proj", "key_proj", "value_proj")):
+                    key = f"{prefix}.attention.{name}.{suffix}"
+                    expected[key] = source.pop(key) + offset * expected[key].size
+                    parts.append(expected[key])
+                source[f"{prefix}.self_attn.in_proj_{suffix}"] = mx.concatenate(parts)
+                source[f"{prefix}.self_attn.out_proj.{suffix}"] = source.pop(
+                    f"{prefix}.attention.out_proj.{suffix}"
+                )
+        for key in list(source):
+            if key.startswith(("scorer.layers.", "act_head.layers.")):
+                source[key.replace(".layers.", ".")] = source.pop(key)
+        converted = model.sanitize(source)
+        _assert_weights_equal(converted, expected)
+        _assert_weights_equal(model.sanitize(dict(converted)), expected)
+        model.load_weights(list(converted.items()), strict=True)
+
+    def test_padding_does_not_change_option_logits(self):
+        model = _extraction_model("laya")
+        single, _ = model(
+            mx.array([[1, 2, 3]]),
+            mx.array([[1, 1, 1]]),
+            mx.array([[1, 2]]),
+            mx.array([[True, True]]),
+            mx.array([0]),
+        )
+        batch, _ = model(
+            mx.array([[1, 2, 3, 0, 0], [1, 4, 5, 6, 7]]),
+            mx.array([[1, 1, 1, 0, 0], [1, 1, 1, 1, 1]]),
+            mx.array([[1, 2], [2, 3]]),
+            mx.array([[True, True], [True, True]]),
+            mx.array([0, 2]),
+        )
+        np.testing.assert_allclose(
+            np.asarray(single[0]), np.asarray(batch[0]), atol=2e-5
+        )
+
+    def test_activations_match_reference(self):
+        model = _extraction_model("laya")
+        values = [-3.0, -1.0, 0.0, 0.5, 2.0]
+        x = mx.array(values)
+        gelu = mx.array([v * (1 + math.erf(v / math.sqrt(2))) / 2 for v in values])
+        self.assertTrue(
+            mx.array_equal(model.head.layers[0].activation(x), mx.maximum(x, 0))
+        )
+        for activation in (model.scorer.layers[2], model.act_head.layers[1]):
+            self.assertTrue(mx.allclose(activation(x), gelu, atol=1e-7))
+
+    def test_criterion_rendering_matches_reference(self):
+        from mlx_vlm.models.laya.laya import _options
+
+        cases = [
+            (
+                {
+                    "type": "choice",
+                    "criteria": {
+                        "zero": 0,
+                        "false": False,
+                        "empty": "",
+                        "none": None,
+                        "object": {"é": True},
+                        "list": [0, False],
+                    },
+                },
+                [
+                    "zero: 0",
+                    "false: false",
+                    "empty",
+                    "none",
+                    'object: {"é": true}',
+                    "list: [0, false]",
+                ],
+            ),
+            (
+                {"type": "score", "criteria": [{"é": True}, [0, False]]},
+                ['level 0: {"é": true}', "level 1: [0, false]"],
+            ),
+            (
+                {"type": "noul", "criteria": {"false": 0, "true": False}},
+                ["false: 0", "true: false"],
+            ),
+            (
+                {
+                    "type": "noul",
+                    "criteria": {"false": {"é": True}, "true": [0, False]},
+                },
+                ['false: {"é": true}', "true: [0, false]"],
+            ),
+        ]
+        for question, expected in cases:
+            with self.subTest(question=question):
+                self.assertEqual(_options(question)[1], expected)
+
+    def test_calibrated_probabilities_match_reference(self):
+        from mlx_vlm.models.laya.laya import Laya
+
+        for temperature, effective in [
+            (0.1, 0.5),
+            (10, 5),
+            (2, 2),
+            ("nan", 1),
+            ("inf", 1),
+            (None, 1),
+            ("invalid", 1),
+        ]:
+            for bucket in (False, True):
+                with self.subTest(temperature=temperature, bucket=bucket):
+                    settings = {"temperature": [temperature] * 3}
+                    if bucket:
+                        settings.update(
+                            temperature=[1.0] * 3,
+                            temperature_by_options={"choice:2": temperature},
+                        )
+                    model = MagicMock(config=SimpleNamespace(decision_config=settings))
+                    model.return_value = (mx.array([[0.0, 1.0]]), mx.zeros((1, 2)))
+                    adapter = Laya(model, SimpleNamespace(pad_token_id=0))
+                    adapter._sequence = lambda *args: ([1, 2], [0, 1])
+                    result = adapter.predict(
+                        "text", {"route": {"type": "choice", "criteria": ["A", "B"]}}
+                    )
+                    expected = round(1 / (1 + math.exp(-1 / effective)), 4)
+                    self.assertEqual(
+                        result["answers"]["route"]["probabilities"]["B"], expected
+                    )
