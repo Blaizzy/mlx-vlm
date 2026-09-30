@@ -60,6 +60,14 @@ def capture_positions(
     return recorder.positions
 
 
+def assert_weights_equal(actual, expected):
+    assert actual.keys() == expected.keys()
+    for key, value in expected.items():
+        assert actual[key].shape == value.shape, key
+        assert actual[key].dtype == value.dtype, key
+        assert mx.array_equal(actual[key], value).item(), key
+
+
 class ModelChecks:
     """Reusable assertions; each JSON case constructs fresh configs and models."""
 
@@ -2075,6 +2083,36 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
 
 
 class TestLayaDecisionModel(unittest.TestCase):
+    def test_checkpoint_conversion(self):
+        from mlx_vlm.models.laya import Model, ModelConfig
+
+        case = next(case for case in DATA["cases"] if case["id"] == "laya")
+        model = Model(ModelConfig.from_dict(copy.deepcopy(case["config"])))
+        expected = {
+            key: mx.arange(value.size, dtype=value.dtype).reshape(value.shape)
+            for key, value in tree_flatten(model.parameters())
+        }
+        source = dict(expected)
+        for i in range(model.config.head_layers):
+            prefix = f"head.layers.{i}"
+            for suffix in ("weight", "bias"):
+                parts = []
+                for offset, name in enumerate(("query_proj", "key_proj", "value_proj")):
+                    key = f"{prefix}.attention.{name}.{suffix}"
+                    expected[key] = source.pop(key) + offset * expected[key].size
+                    parts.append(expected[key])
+                source[f"{prefix}.self_attn.in_proj_{suffix}"] = mx.concatenate(parts)
+                source[f"{prefix}.self_attn.out_proj.{suffix}"] = source.pop(
+                    f"{prefix}.attention.out_proj.{suffix}"
+                )
+        for key in list(source):
+            if key.startswith(("scorer.layers.", "act_head.layers.")):
+                source[key.replace(".layers.", ".")] = source.pop(key)
+        converted = model.sanitize(source)
+        assert_weights_equal(converted, expected)
+        assert_weights_equal(model.sanitize(dict(converted)), expected)
+        model.load_weights(list(converted.items()), strict=True)
+
     def test_padding_does_not_change_option_logits(self):
         from mlx_vlm.models.laya import Model, ModelConfig
 
