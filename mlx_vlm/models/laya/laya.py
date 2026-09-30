@@ -3,7 +3,6 @@ import math
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
 from ..modernbert import ModelConfig as EncoderConfig
 from ..modernbert.modernbert import Model as ModernBert
@@ -218,22 +217,20 @@ class Laya:
             rows.append((key, question, labels, ids, markers))
         length = max(len(row[3]) for row in rows)
         options = max(len(row[4]) for row in rows)
-        ids = np.full((len(rows), length), self.tokenizer.pad_token_id, dtype=np.int32)
-        attention = np.zeros_like(ids)
-        positions = np.zeros((len(rows), options), dtype=np.int32)
-        valid = np.zeros((len(rows), options), dtype=bool)
-        for i, (_, _, _, tokens, markers) in enumerate(rows):
-            ids[i, : len(tokens)] = tokens
-            attention[i, : len(tokens)] = 1
-            positions[i, : len(markers)] = markers
-            valid[i, : len(markers)] = True
-        types = mx.array([QUESTION_TYPES[row[1]["type"]] for row in rows])
+        ids, attention, positions, valid = [], [], [], []
+        for _, _, _, tokens, markers in rows:
+            padding = length - len(tokens)
+            missing = options - len(markers)
+            ids.append(tokens + [self.tokenizer.pad_token_id] * padding)
+            attention.append([1] * len(tokens) + [0] * padding)
+            positions.append(markers + [0] * missing)
+            valid.append([True] * len(markers) + [False] * missing)
         logits, act = self.model(
-            mx.array(ids),
-            mx.array(attention),
-            mx.array(positions),
-            mx.array(valid),
-            types,
+            mx.array(ids, dtype=mx.int32),
+            mx.array(attention, dtype=mx.int32),
+            mx.array(positions, dtype=mx.int32),
+            mx.array(valid, dtype=mx.bool_),
+            mx.array([QUESTION_TYPES[row[1]["type"]] for row in rows]),
         )
         act = mx.softmax(act.astype(mx.float32), -1)
         mx.eval(logits, act)
@@ -298,5 +295,8 @@ class Laya:
         return {
             "model": self.config.get("model_name", "laya"),
             "answers": answers,
-            "usage": {"input_tokens": int(attention.sum()), "output_tokens": 0},
+            "usage": {
+                "input_tokens": sum(len(row[3]) for row in rows),
+                "output_tokens": 0,
+            },
         }
