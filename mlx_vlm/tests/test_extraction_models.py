@@ -1893,6 +1893,68 @@ def _check_conv_checkpoint(model, transpose_convs=()):
 
 
 class ExtractionChecks:
+    def decision_models(self, case):
+        import string
+        from dataclasses import asdict
+
+        from tokenizers import Tokenizer, models, pre_tokenizers
+        from transformers import PreTrainedTokenizerFast
+
+        from mlx_vlm import load, predict
+
+        model = _extraction_model(case["id"])
+        state = case["decision_models"]["state"]
+        questions = case["decision_models"]["questions"]
+
+        labels = list(string.ascii_uppercase) + [
+            a + b for a in string.ascii_uppercase for b in string.ascii_uppercase
+        ]
+        tokens = ["[UNK]", "[PAD]", "[CLS]", "[SEP]", "[MASK]", *labels[:255]]
+        backend = Tokenizer(
+            models.WordLevel(dict(zip(tokens, range(len(tokens)))), unk_token="[UNK]")
+        )
+        backend.pre_tokenizer = pre_tokenizers.Whitespace()
+        processor = PreTrainedTokenizerFast(
+            tokenizer_object=backend,
+            unk_token="[UNK]",
+            pad_token="[PAD]",
+            cls_token="[CLS]",
+            sep_token="[SEP]",
+            mask_token="[MASK]",
+        )
+        expected = predict(model, processor, state, questions)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config.json").write_text(json.dumps(asdict(model.config)))
+            processor.save_pretrained(root)
+            mx.save_safetensors(
+                str(root / "model.safetensors"), dict(tree_flatten(model.parameters()))
+            )
+            loaded, tokenizer = load(directory)
+            actual = predict(loaded, tokenizer, state, questions)
+            assert actual["answers"] == expected["answers"]
+            assert actual.get("usage") == expected.get("usage")
+        assert set(expected["answers"]) == set(questions)
+        for name, answer in expected["answers"].items():
+            question = questions[name]
+            kind = question["type"]
+            assert answer["type"] == kind
+            if kind == "choice":
+                assert answer["value"] in question["criteria"]
+            elif kind == "score":
+                assert 0 <= answer["value"] <= len(question["criteria"]) - 1
+            elif kind == "bool":
+                assert isinstance(answer["value"], bool)
+                assert 0 <= answer["probability"] <= 1
+            elif kind == "multi_label":
+                assert set(answer["value"]) <= set(question["criteria"])
+            if "probabilities" in answer:
+                assert sum(answer["probabilities"].values()) == pytest.approx(
+                    1, abs=1e-3
+                )
+        with pytest.raises(ValueError, match="does not support"):
+            predict(model, processor, state, {"invalid": {"type": "unknown"}})
+
     def registry_and_config(self, case):
         name = case["module"]
         module = importlib.import_module(f"mlx_vlm.models.{name}")
