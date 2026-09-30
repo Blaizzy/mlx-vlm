@@ -36,3 +36,43 @@ rejected instead of silently returning incomplete structured output.
 
 GLiNER2.5 is a bidirectional encoder extractor. Autoregressive speculative
 decoding methods, including MTP and DFlash, do not apply to this architecture.
+
+## Decision classification
+
+Prepare the checkpoint with `model_type: "gliner2_5"`, `architecture: "span"`,
+and the contents of `encoder_config/config.json` embedded as `encoder_config`
+in root `config.json`. Keep the weights and tokenizer files at the root;
+loading uses the standard loader without additional sidecar detection.
+
+`fastino/GLiNER2.5-Decide` is a span-architecture checkpoint. Its classification
+path is supported; its span and counting heads are unused by classification and
+are omitted when loading. Entity extraction from span checkpoints is not yet
+implemented and raises a clear error. Existing boundary models retain entity
+extraction support.
+
+```python
+from mlx_vlm import load, predict
+
+model, processor = load("path/to/prepared-gliner2.5-decide")
+result = predict(model, processor, "Please refund my duplicate charge", {
+    "route": {"type": "choice", "criteria": ["billing", "technical"]},
+    "tags": {
+        "type": "multi_label",
+        "criteria": ["refund", "login", "payment"],
+        "threshold": 0.4,
+    },
+})
+```
+
+The shared decision contract uses `type` and `value` in each answer. Single-label
+choices return softmax `probabilities`; multi-label decisions return independent
+sigmoid `scores`. GLiNER supports `choice` and `multi_label`; use named choice
+labels for Boolean or ordinal classification rather than requesting Laya's or
+Decider's calibrated Boolean/expected-score readout. Optional `instructions`
+become the GLiNER task prompt, and a criteria dictionary supplies label descriptions.
+All tasks in one request share an encoder forward pass. For span checkpoints,
+when no multi-label score meets the threshold, the highest-scoring label is
+returned, matching the reference implementation.
+
+The existing `classify_text(processor, text, tasks)` API remains available.
+`return_scores=True` returns every label's probability or independent score.

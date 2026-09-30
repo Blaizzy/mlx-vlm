@@ -1,4 +1,5 @@
 import bisect
+import json
 import re
 from dataclasses import dataclass
 from typing import Dict, Optional, Sequence, Union
@@ -12,6 +13,7 @@ from .deberta import DebertaModel
 
 SPECIAL_TOKENS = [
     "[SEP_TEXT]",
+    "[SEP_STRUCT]",
     "[P]",
     "[E]",
     "[L]",
@@ -83,7 +85,7 @@ def _resolve_flat_overlaps(spans):
     )
 
 
-class BoundaryExtractor(nn.Module):
+class Extractor(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
@@ -102,7 +104,12 @@ class BoundaryExtractor(nn.Module):
             nn.Dropout(0.0),
             nn.Linear(hidden_size * 2, 1),
         ]
-        self.boundary_head = BoundaryHead(hidden_size, settings)
+        if config.architecture == "boundary":
+            self.boundary_head = BoundaryHead(hidden_size, settings)
+        elif config.architecture != "span":
+            raise ValueError(
+                f"Unsupported GLiNER architecture: {config.architecture!r}"
+            )
 
     def encode(self, input_ids, attention_mask=None):
         return self.encoder(input_ids, attention_mask)
@@ -114,6 +121,8 @@ class BoundaryExtractor(nn.Module):
         return logits.squeeze(-1)
 
     def extract(self, text_states, text_mask, query_states, query_mask):
+        if self.config.architecture != "boundary":
+            raise ValueError("Span checkpoints currently support classification only")
         return self.boundary_head(text_states, text_mask, query_states, query_mask)
 
     def __call__(self, input_ids, attention_mask=None):
@@ -127,10 +136,18 @@ class BoundaryExtractor(nn.Module):
             "record_decoder.",
             "relation_scorer.",
         )
+        if self is not None and self.config.architecture == "span":
+            unsupported += ("span_rep.", "count_embed.", "count_pred.")
         remapped = {}
         for key, value in weights.items():
             if key.startswith(unsupported):
                 continue
+            if (
+                self is not None
+                and self.config.architecture == "span"
+                and key.startswith("classifier.2.")
+            ):
+                key = key.replace("classifier.2.", "classifier.3.", 1)
             key = key.replace("encoder.encoder.layer.", "encoder.encoder.layers.")
             key = key.replace(".attention.self.", ".attention.self_attn.")
             key = key.replace(".LayerNorm.", ".layer_norm.")
@@ -138,7 +155,9 @@ class BoundaryExtractor(nn.Module):
         return remapped
 
 
-class Model(BoundaryExtractor):
+class Model(Extractor):
+    decision_types = ("choice", "multi_label")
+
     def _prepare(
         self, processor, text, schema, max_len=None, word_splitter="whitespace"
     ):
@@ -150,15 +169,22 @@ class Model(BoundaryExtractor):
             raise ValueError("checkpoint tokenizer is missing GLiNER2.5 special tokens")
         if not text.rstrip().endswith((".", "!", "?")):
             text = text + "."
-        max_len = max_len or self.config.max_len
-        combined = list(schema) + ["[SEP_TEXT]"]
-        marker_slots = {1, *range(4, len(schema) - 2, 2)}
+        max_len = max_len or self.config.max_len or processor.model_max_length
+        schemas = schema if schema and isinstance(schema[0], list) else [schema]
+        combined, marker_slots = [], set()
+        for item in schemas:
+            offset = len(combined)
+            marker_slots.update(
+                [offset + 1, *range(offset + 4, offset + len(item) - 2, 2)]
+            )
+            combined.extend([*item, "[SEP_STRUCT]"])
+        combined[-1:] = ["[SEP_TEXT]"]
         subwords = []
         marker_positions = []
         for index, token in enumerate(combined):
             position = len(subwords)
             pieces = processor.tokenize(token)
-            if index < len(schema) and index in marker_slots:
+            if index in marker_slots:
                 marker_positions.append(position)
             subwords.extend(pieces)
         if len(subwords) >= max_len:
@@ -269,17 +295,22 @@ class Model(BoundaryExtractor):
         tasks: Dict[str, Union[Sequence[str], Dict]],
         threshold: float = 0.5,
         *,
+        return_scores: bool = False,
         max_len: Optional[int] = None,
         word_splitter: str = "whitespace",
     ):
-        results = {}
+        results, specs, schemas = {}, [], []
         for task, spec in tasks.items():
             if isinstance(spec, dict):
                 labels = list(spec["labels"])
                 prompt = spec.get("prompt")
                 descriptions = spec.get("label_descriptions")
+                if descriptions is None and isinstance(spec["labels"], dict):
+                    descriptions = spec["labels"]
                 multi_label = spec.get("multi_label", False)
-                task_threshold = spec.get("threshold", threshold)
+                task_threshold = spec.get(
+                    "cls_threshold", spec.get("threshold", threshold)
+                )
             else:
                 labels = list(spec)
                 prompt = None
@@ -289,20 +320,72 @@ class Model(BoundaryExtractor):
             schema = _schema_tokens(
                 task, labels, "[L]", prompt=prompt, descriptions=descriptions
             )
-            prepared = self._prepare(processor, text, schema, max_len, word_splitter)
-            encoded = self.encode(prepared.input_ids)
-            choices = encoded[:, prepared.marker_positions[1:]]
-            probabilities = mx.sigmoid(self.classify(choices).astype(mx.float32))[0]
+            schemas.append(schema)
+            specs.append((task, labels, multi_label, task_threshold))
+        if not specs:
+            return results
+        prepared = self._prepare(processor, text, schemas, max_len, word_splitter)
+        encoded = self.encode(prepared.input_ids)
+        offset = 0
+        for task, labels, multi_label, task_threshold in specs:
+            positions = prepared.marker_positions[offset + 1 : offset + 1 + len(labels)]
+            offset += 1 + len(labels)
+            choices = encoded[:, positions]
+            logits = self.classify(choices).astype(mx.float32)[0]
+            probabilities = mx.sigmoid(logits) if multi_label else mx.softmax(logits)
             scores = probabilities.tolist()[: len(labels)]
-            if multi_label:
+            if return_scores:
+                results[task] = dict(zip(labels, scores))
+            elif multi_label:
                 results[task] = [
                     label
                     for label, score in zip(labels, scores)
                     if score >= task_threshold
                 ]
+                if self.config.architecture == "span" and not results[task]:
+                    results[task] = [
+                        labels[max(range(len(labels)), key=scores.__getitem__)]
+                    ]
             else:
                 results[task] = labels[max(range(len(labels)), key=scores.__getitem__)]
         return results
+
+    def predict(self, processor, state, questions, **kwargs):
+        if not isinstance(state, str):
+            state = json.dumps(state, ensure_ascii=False)
+        tasks = {}
+        for name, spec in questions.items():
+            criteria = spec["criteria"]
+            tasks[name] = {
+                "labels": list(criteria),
+                "prompt": spec.get("instructions"),
+                "multi_label": spec["type"] == "multi_label",
+                "label_descriptions": (
+                    {k: v for k, v in criteria.items() if v is not None}
+                    if isinstance(criteria, dict)
+                    else None
+                ),
+            }
+        scores = self.classify_text(
+            processor, state, tasks, return_scores=True, **kwargs
+        )
+        answers = {}
+        for name, values in scores.items():
+            spec = questions[name]
+            if spec["type"] == "multi_label":
+                threshold = spec.get("threshold", 0.5)
+                value = [label for label, score in values.items() if score >= threshold]
+            else:
+                value = max(values, key=values.get)
+            if (
+                self.config.architecture == "span"
+                and spec["type"] == "multi_label"
+                and not value
+            ):
+                value = [max(values, key=values.get)]
+            score_key = "scores" if spec["type"] == "multi_label" else "probabilities"
+            answers[name] = {"type": spec["type"], "value": value, score_key: values}
+        return {"model": self.config.model_type, "answers": answers}
 
 
 __all__ = ["Model", "ModelConfig"]

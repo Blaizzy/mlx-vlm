@@ -74,7 +74,11 @@ class DisentangledSelfAttention(nn.Module):
         self.key_proj = nn.Linear(config.hidden_size, self.all_head_size)
         self.value_proj = nn.Linear(config.hidden_size, self.all_head_size)
         self.position_buckets = config.position_buckets
-        self.max_relative_positions = config.max_relative_positions
+        self.max_relative_positions = (
+            config.max_relative_positions
+            if config.max_relative_positions > 0
+            else config.max_position_embeddings
+        )
         self.pos_att_type = config.pos_att_type
         self.share_att_key = config.share_att_key
 
@@ -193,7 +197,11 @@ class DebertaEncoder(nn.Module):
         self.rel_embeddings = nn.Embedding(self.num_rel_embeddings, config.hidden_size)
         self.layers = [DebertaLayer(config) for _ in range(config.num_hidden_layers)]
         self.position_buckets = config.position_buckets
-        self.max_relative_positions = config.max_relative_positions
+        self.max_relative_positions = (
+            config.max_relative_positions
+            if config.max_relative_positions > 0
+            else config.max_position_embeddings
+        )
         self.pos_att_type = config.pos_att_type
 
     def __call__(self, states, attention_mask):
