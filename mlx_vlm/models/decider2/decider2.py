@@ -2,10 +2,12 @@ import json
 import math
 import re
 import string
-from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
+
+from ...decision import format_decisions
+from ..qwen3_5_text.qwen3_5_text import Model as QwenModel
 
 
 def _text(value):
@@ -81,8 +83,8 @@ class Decider2:
     def __init__(self, model, tokenizer):
         self.model = model.language_model
         self.tokenizer = tokenizer
-        self.path = Path(model.model_path)
-        self.settings = json.loads((self.path / "decider_config.json").read_text())
+        self.path = getattr(model, "model_path", "decider2")
+        self.settings = model.config.decision_config
         names = list(string.ascii_uppercase) + [
             a + b for a in string.ascii_uppercase for b in string.ascii_uppercase
         ]
@@ -98,9 +100,7 @@ class Decider2:
         self.labels, token_ids = zip(*labels)
         self.label_token_ids = token_ids
         self.label_ids = mx.array(token_ids)
-        self.label_weights = mx.take(
-            self.model.model.embed_tokens.weight, self.label_ids, axis=0
-        )
+        self.label_weights = self.model.model.embed_tokens(self.label_ids)
 
     def _prompt(self, context, question, options, max_state_tokens):
         tok = self.tokenizer
@@ -164,7 +164,7 @@ class Decider2:
             slots.append(len(ids) - 1)
         return ids, slots
 
-    def _score_packed(self, context, rows, max_state_tokens):
+    def _score_packed(self, context, rows, max_state_tokens, temperatures):
         tokens, positions = self._packed_prompt(context, rows, max_state_tokens)
         length = ((len(tokens) + 63) // 64) * 64
         ids = np.full((1, length), self.tokenizer.pad_token_id, dtype=np.int32)
@@ -175,20 +175,15 @@ class Decider2:
         mx.eval(logits)
         results = []
         for i, (_, options) in enumerate(rows):
-            values = (
-                np.asarray(logits[i, : len(options)].astype(mx.float32))
-                / self.settings["temperature"]
-            )
-            probabilities = np.exp(values - values.max())
-            results.append((probabilities / probabilities.sum()).tolist())
+            values = logits[i, : len(options)].astype(mx.float32) / temperatures[i]
+            results.append(mx.softmax(values).tolist())
         return results, len(tokens)
 
-    def _score_rows(self, context, rows, max_state_tokens):
+    def _score_rows(self, context, rows, max_state_tokens, temperatures):
         prompts = [
             self._prompt(context, question, options, max_state_tokens)
             for question, options in rows
         ]
-        temperature = float(self.settings["temperature"])
         results = []
         start = 0
         while start < len(rows):
@@ -217,11 +212,10 @@ class Decider2:
             mx.eval(logits)
             for i, (_, options) in enumerate(rows[start:end]):
                 values = (
-                    np.asarray(logits[i, : len(options)].astype(mx.float32))
-                    / temperature
+                    logits[i, : len(options)].astype(mx.float32)
+                    / temperatures[start + i]
                 )
-                probabilities = np.exp(values - values.max())
-                results.append((probabilities / probabilities.sum()).tolist())
+                results.append(mx.softmax(values).tolist())
             start = end
         common = 0
         while common < min(map(len, prompts)) and all(
@@ -251,7 +245,8 @@ class Decider2:
             else json.dumps(_annotate(state), ensure_ascii=False)
         )
         rendered = {key: _render_question(spec) for key, spec in questions.items()}
-        rows, lookup = [], []
+        rows, lookup, temperatures = [], [], []
+        by_type = self.settings.get("temperature_by_type", {})
         for key, question in rendered.items():
             if isolated and question["type"] == "score" and question["isolated"]:
                 start = len(rows)
@@ -267,10 +262,19 @@ class Decider2:
             else:
                 lookup.append((key, len(rows), 1, False))
                 rows.append((question["instruction"], question["options"]))
+        for key, _, count, is_isolated in lookup:
+            kind = rendered[key]["type"]
+            temperatures.extend(
+                [by_type.get(kind, self.settings["temperature"])] * count
+            )
         if independent:
-            probabilities, tokens = self._score_rows(context, rows, max_state_tokens)
+            probabilities, tokens = self._score_rows(
+                context, rows, max_state_tokens, temperatures
+            )
         else:
-            probabilities, tokens = self._score_packed(context, rows, max_state_tokens)
+            probabilities, tokens = self._score_packed(
+                context, rows, max_state_tokens, temperatures
+            )
         answers = {}
         for key, start, count, is_isolated in lookup:
             question = rendered[key]
@@ -320,3 +324,23 @@ class Decider2:
             "answers": answers,
             "usage": {"input_tokens": tokens, "output_tokens": 0},
         }
+
+
+class Model(QwenModel):
+    decision_types = ("choice", "score", "bool")
+
+    def sanitize(self, weights):
+        weights = {
+            (
+                "model." + key[len("model.language_model.") :]
+                if key.startswith("model.language_model.")
+                else key
+            ): value
+            for key, value in weights.items()
+        }
+        return super().sanitize(weights)
+
+    def predict(self, processor, state, questions, **kwargs):
+        return format_decisions(
+            Decider2(self, processor).predict(state, questions, **kwargs)
+        )

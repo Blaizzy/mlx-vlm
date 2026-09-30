@@ -1,28 +1,39 @@
 # Decider-2b decisions on MLX
 
-Load `nativ-community/decider-2b` with the general loader. It is [`Mapika/decider-2b`](https://huggingface.co/Mapika/decider-2b) v11 with its weights renamed to the standard `model.*` layout, and gives the same outputs. It uses the existing Qwen3.5 text backbone and scores only the allowed option tokens at answer slots.
-
 ```python
-from mlx_vlm import load
-from mlx_vlm.models.decider2 import Decider2
+from mlx_vlm import load, predict
 
 model, processor = load("nativ-community/decider-2b")
-decider = Decider2(model, processor)
-result = decider.predict(
-    {"ticket": "Please refund my duplicate charge"},
-    {
-        "department": {
-            "type": "choice",
-            "instructions": "Which team should handle this ticket?",
-            "criteria": {"billing": None, "technical": None, "sales": None},
-        },
-        "refund": {
-            "type": "noul",
-            "instructions": "Does the customer request a refund?",
-        },
+result = predict(model, processor, "Please refund my duplicate charge", {
+    "department": {
+        "type": "choice",
+        "instructions": "Which team should handle this ticket?",
+        "criteria": ["billing", "technical", "sales"],
     },
-)
-print(result["answers"])
+})
+print(result["answers"]["department"]["value"])
 ```
 
-The default `independent=True` runs each question in its own row and isolates score levels, matching the published inference API. `independent=False` packs questions into one forward pass; later questions can attend to earlier question text and may have different probabilities. Choice supports up to 255 options, score supports 2 to 10 levels, and `noul` reports the probability of yes. This is a non-generative decision API, separate from VLM chat and token generation.
+`load()` reads `decider_config.json` and uses the existing Qwen3.5 text
+backbone and weight loading. The original `Mapika/decider-2b` checkpoint is
+also supported.
+
+The shared `predict(model, processor, state, questions)` API returns named
+answers with `type` and `value`. Decider supports `choice`, `score`, and `bool`;
+`noul` is a Boolean alias. Choice returns a label and score returns an expected
+level index, both with `probabilities`. Boolean answers include the probability
+of true. Confidence, certainty, and isolated-level metrics remain in `metadata`.
+Unsupported question types fail before inference. No answer tokens are generated.
+
+Choice criteria are 2–255 labels or a mapping of labels to descriptions. Score
+criteria are an ordered list of 2–10 level descriptions. Boolean criteria are
+optional descriptions keyed by `false` and `true`.
+
+`independent=True` evaluates questions separately. Score levels are isolated
+according to the checkpoint settings unless overridden with `isolated`.
+`independent=False` packs questions together, allowing later questions to attend
+to earlier ones. Per-type temperatures use checkpoint settings with the global
+temperature as fallback; isolated score rows use the score temperature.
+
+`max_state_tokens` defaults to 32768. Inference performs a full forward pass,
+so long inputs may exceed device memory.

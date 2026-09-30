@@ -1,3 +1,4 @@
-from .decider2 import Decider2
+from .config import ModelConfig
+from .decider2 import Model
 
-__all__ = ["Decider2"]
+__all__ = ["Model", "ModelConfig"]

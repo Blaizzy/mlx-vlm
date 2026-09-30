@@ -1425,6 +1425,11 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
             with open(encoder_config_path, encoding="utf-8") as f:
                 config["encoder_config"] = json.load(f)
 
+    if (model_path / "decider_config.json").is_file():
+        with open(model_path / "decider_config.json", encoding="utf-8") as f:
+            config["decision_config"] = json.load(f)
+        config["model_type"] = "decider2"
+
     return config
 
 
