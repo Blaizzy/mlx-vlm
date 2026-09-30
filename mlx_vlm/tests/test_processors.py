@@ -635,23 +635,23 @@ def test_auto_processor_routes_to_custom_loader(
 
 
 def test_qwen3_5_moe_text_stale_vl_processor_loads_tokenizer(tmp_path):
+    from transformers import Qwen2Tokenizer
+
     importlib.import_module("mlx_vlm.models.qwen3_5_moe_text")
     _write_configs(tmp_path, config={"model_type": "qwen3_5_moe_text"})
-    vocab = {f"t{i}": i for i in range(32)}
-    backend = Tokenizer(WordLevel(vocab, unk_token="t0"))
-    backend.pre_tokenizer = Whitespace()
-    PreTrainedTokenizerFast(
-        tokenizer_object=backend, unk_token="t0", eos_token="t1"
+
+    Qwen2Tokenizer(
+        vocab={"<|endoftext|>": 0, "t": 1, "3": 2, "Ġ": 3, "4": 4}, merges=[]
     ).save_pretrained(tmp_path)
     tokenizer_config = tmp_path / "tokenizer_config.json"
     data = json.loads(tokenizer_config.read_text())
     data["processor_class"] = "Qwen3VLProcessor"
     tokenizer_config.write_text(json.dumps(data))
 
-    processor = load_processor(tmp_path, eos_token_ids=[1])
+    processor = load_processor(tmp_path, eos_token_ids=[0])
 
     assert not hasattr(processor, "image_processor")
-    assert processor.encode("t3 t4", add_special_tokens=False) == [3, 4]
+    assert processor.encode("t3 t4", add_special_tokens=False) == [1, 2, 3, 1, 4]
 
 
 class _ImageStub:
