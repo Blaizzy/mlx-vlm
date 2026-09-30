@@ -2072,3 +2072,29 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
                 )
                 self.assertTrue(bool(mx.all(cache[0].engram[:, 2:5] == -1)))
                 self.assertTrue(bool(mx.allclose(actual, expected, atol=1e-4)))
+
+
+class TestLayaDecisionModel(unittest.TestCase):
+    def test_padding_does_not_change_option_logits(self):
+        from mlx_vlm.models.laya import Model, ModelConfig
+
+        case = next(case for case in DATA["cases"] if case["id"] == "laya")
+        model = Model(ModelConfig.from_dict(copy.deepcopy(case["config"])))
+        model.eval()
+        single, _ = model(
+            mx.array([[1, 2, 3]]),
+            mx.array([[1, 1, 1]]),
+            mx.array([[1, 2]]),
+            mx.array([[True, True]]),
+            mx.array([0]),
+        )
+        batch, _ = model(
+            mx.array([[1, 2, 3, 0, 0], [1, 4, 5, 6, 7]]),
+            mx.array([[1, 1, 1, 0, 0], [1, 1, 1, 1, 1]]),
+            mx.array([[1, 2], [2, 3]]),
+            mx.array([[True, True], [True, True]]),
+            mx.array([0, 2]),
+        )
+        np.testing.assert_allclose(
+            np.asarray(single[0]), np.asarray(batch[0]), atol=2e-5
+        )
