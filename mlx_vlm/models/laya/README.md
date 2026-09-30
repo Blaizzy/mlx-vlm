@@ -9,7 +9,7 @@ Each Laya variant should be prepared as its own checkpoint directory.
 ```python
 from mlx_vlm import load, predict
 
-model, processor = load("path/to/mlx-laya")
+model, processor = load("nativ-community/laya")
 result = predict(model, processor, "Please refund my duplicate charge", {
     "department": {
         "type": "choice",
