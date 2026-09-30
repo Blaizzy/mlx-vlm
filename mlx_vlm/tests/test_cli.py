@@ -584,3 +584,27 @@ def test_decide_registered_as_package_subcommand():
     )
     assert "--questions-file" in result.stdout
     assert "--state-file" in result.stdout
+
+
+@pytest.mark.parametrize("questions", [[], {}, None, "question", {"q": []}])
+@pytest.mark.parametrize("from_file", [False, True])
+def test_decision_cli_rejects_question_structure_before_loading(
+    tmp_path, monkeypatch, capsys, questions, from_file
+):
+    from mlx_vlm import decide
+
+    args = ["--model", "model/path", "--state", "text"]
+    content = json.dumps(questions)
+    if from_file:
+        path = tmp_path / "questions.json"
+        path.write_text(content, encoding="utf-8")
+        args += ["--questions-file", str(path)]
+    else:
+        args += ["--questions", content]
+    load = Mock()
+    monkeypatch.setattr(decide, "load", load)
+    with pytest.raises(SystemExit) as error:
+        decide.main(args)
+    assert error.value.code == 2
+    assert "question" in capsys.readouterr().err.lower()
+    load.assert_not_called()

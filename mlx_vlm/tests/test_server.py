@@ -4490,3 +4490,45 @@ def test_unload_wait_does_not_block_health_endpoint(client, monkeypatch):
         finally:
             release.set()
         assert unloading.result(timeout=5).status_code == 200
+
+
+@pytest.mark.parametrize("threshold", ["bad", None, [], {}, True, -0.1, 1.1])
+def test_decisions_rejects_invalid_threshold_before_prediction(client, threshold):
+    model = NS(decision_types=("multi_label",), predict=MagicMock())
+    with patch.object(server, "get_cached_model", return_value=(model, None, {})):
+        response = client.post(
+            "/v1/decisions",
+            json={
+                "model": "decision",
+                "state": "text",
+                "questions": {
+                    "tags": {
+                        "type": "multi_label",
+                        "criteria": ["refund"],
+                        "threshold": threshold,
+                    }
+                },
+            },
+        )
+    assert response.status_code == 400
+    assert (
+        response.json()["detail"] == "threshold must be a number between zero and one"
+    )
+    model.predict.assert_not_called()
+
+
+@pytest.mark.parametrize("threshold", [0, 0.5, 1])
+def test_decisions_preserves_valid_threshold(client, threshold):
+    model = NS(
+        decision_types=("multi_label",), predict=MagicMock(return_value={"answers": {}})
+    )
+    questions = {
+        "tags": {"type": "multi_label", "criteria": ["refund"], "threshold": threshold}
+    }
+    with patch.object(server, "get_cached_model", return_value=(model, None, {})):
+        response = client.post(
+            "/v1/decisions",
+            json={"model": "decision", "state": "text", "questions": questions},
+        )
+    assert response.status_code == 200
+    model.predict.assert_called_once_with(None, "text", questions)

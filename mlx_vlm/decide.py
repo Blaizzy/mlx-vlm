@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from .decision import predict
+from .decision import _validate_question_structure, predict
 from .utils import load
 
 
@@ -33,7 +33,8 @@ def main(argv=None):
             if args.questions_file is not None
             else args.questions
         )
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        _validate_question_structure(questions)
+    except (OSError, ValueError) as error:
         parser.error(str(error))
     model, processor = load(args.model)
     try:
