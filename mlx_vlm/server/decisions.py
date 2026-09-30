@@ -3,8 +3,7 @@
 import asyncio
 import logging
 import time
-from threading import Lock
-from typing import Any, Dict, Union
+from typing import Any, Dict, Optional, Union
 
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
@@ -13,11 +12,10 @@ from ..decision import predict
 from .runtime import runtime
 
 logger = logging.getLogger(__name__)
-_inference_lock = Lock()
 
 
 class DecisionRequest(BaseModel):
-    model: str = Field(min_length=1)
+    model: Optional[str] = Field(default=None, min_length=1)
     state: Union[str, Dict[str, Any], list]
     questions: Dict[str, Dict[str, Any]] = Field(min_length=1)
 
@@ -25,22 +23,30 @@ class DecisionRequest(BaseModel):
 def register_routes(app, deps):
     @app.post("/v1/decisions")
     async def create_decisions(body: DecisionRequest):
+        model_id = body.model or runtime.model_cache.for_kind("decision").get(
+            "model_path"
+        )
+        if not model_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Specify a model or preload one with --decision-model",
+            )
         endpoint = "/v1/decisions"
         started = time.perf_counter()
-        runtime.metrics.begin_request(endpoint=endpoint, model=body.model, stream=False)
+        runtime.metrics.begin_request(endpoint=endpoint, model=model_id, stream=False)
         try:
 
             def work():
-                with _inference_lock:
+                with runtime.decision_lock:
                     model, processor, _ = deps.get_cached_model(
-                        body.model, model_kind="decision"
+                        model_id, model_kind="decision"
                     )
                     return predict(model, processor, body.state, body.questions)
 
             result = await asyncio.to_thread(work)
         except Exception as error:
             runtime.metrics.record_failure(
-                endpoint=endpoint, model=body.model, stream=False, error=str(error)
+                endpoint=endpoint, model=model_id, stream=False, error=str(error)
             )
             if isinstance(error, HTTPException):
                 raise
@@ -54,7 +60,7 @@ def register_routes(app, deps):
         runtime.metrics.record_success(
             deps.build_metrics_envelope(
                 endpoint=endpoint,
-                model=body.model,
+                model=model_id,
                 stream=False,
                 backend="mlx-decision-native",
                 prompt_tokens=usage.get("input_tokens", 0),

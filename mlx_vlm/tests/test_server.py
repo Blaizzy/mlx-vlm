@@ -2598,6 +2598,7 @@ class TestResponseGenerator:
             ("image-model", "PRELOAD_IMAGE_MODEL", "image-demo"),
             ("tts-model", "PRELOAD_TTS_MODEL", "tts-demo"),
             ("stt-model", "PRELOAD_STT_MODEL", "stt-demo"),
+            ("decision-model", "PRELOAD_DECISION_MODEL", "decision-demo"),
             ("reranker-model", "PRELOAD_RERANKER_MODEL", "reranker-demo"),
             ("thinking-budget", "THINKING_BUDGET", "128"),
             ("thinking-start-token", "THINKING_START_TOKEN", "<|START_THINKING|>"),
@@ -2639,6 +2640,7 @@ class TestResponseGenerator:
             STT_MODEL="audio_stt",
             EMBEDDING_MODEL="embedding",
             RERANKER_MODEL="reranker",
+            DECISION_MODEL="decision",
         )
         for key, kind in kinds.items():
             monkeypatch.setenv("MLX_VLM_PRELOAD_" + key, kind)
@@ -4381,3 +4383,110 @@ def test_decisions_preserves_loader_errors(client, status):
         )
     assert response.status_code == status
     assert response.json()["detail"] == "load failed"
+
+
+@pytest.mark.parametrize("preloaded", [False, True])
+def test_decisions_default_model(client, monkeypatch, preloaded):
+    _reset_runtime(monkeypatch)
+    if preloaded:
+        server.runtime.model_cache.set("decision", {"model_path": "preloaded"})
+    model = NS(
+        decision_types=("bool",), predict=MagicMock(return_value={"answers": {}})
+    )
+    with patch.object(
+        server, "get_cached_model", return_value=(model, None, {})
+    ) as load:
+        response = client.post(
+            "/v1/decisions",
+            json={"state": "text", "questions": {"x": {"type": "bool"}}},
+        )
+    if preloaded:
+        assert response.status_code == 200
+        load.assert_called_once_with("preloaded", model_kind="decision")
+    else:
+        assert response.status_code == 400
+        load.assert_not_called()
+
+
+@pytest.mark.parametrize("operation", ["unload", "replace"])
+@pytest.mark.parametrize("phase", ["load", "predict"])
+def test_decision_prediction_coordinates_cache_lifecycle(
+    client, monkeypatch, operation, phase
+):
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError
+    from threading import Event
+
+    _reset_runtime(monkeypatch)
+    entered, release, attempted = Event(), Event(), Event()
+
+    def predict(processor, state, questions):
+        if phase == "predict":
+            entered.set()
+            assert release.wait(5)
+        return {"answers": {}}
+
+    model = NS(config={}, decision_types=("bool",), predict=predict)
+    replacement = NS(config={}, decision_types=("bool",))
+
+    def load(path):
+        if phase == "load" and path == "first":
+            entered.set()
+            assert release.wait(5)
+        return (model if path == "first" else replacement), None
+
+    def change_cache():
+        attempted.set()
+        if operation == "unload":
+            return server.unload_model_sync()
+        return server.get_cached_model("second", model_kind="decision")
+
+    monkeypatch.setattr("mlx_vlm.utils.load", load)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        request = pool.submit(
+            client.post,
+            "/v1/decisions",
+            json={
+                "model": "first",
+                "state": "text",
+                "questions": {"x": {"type": "bool"}},
+            },
+        )
+        try:
+            assert entered.wait(5)
+            mutation = pool.submit(change_cache)
+            assert attempted.wait(5)
+            with pytest.raises(TimeoutError):
+                mutation.result(timeout=0.1)
+            if phase == "predict":
+                assert server.runtime.model_cache.for_kind("decision")["model"] is model
+            else:
+                assert not server.runtime.model_cache.for_kind("decision")
+        finally:
+            release.set()
+        assert request.result(timeout=5).status_code == 200
+        mutation.result(timeout=5)
+    cache = server.runtime.model_cache.for_kind("decision")
+    assert (not cache) if operation == "unload" else cache["model"] is replacement
+
+
+def test_unload_wait_does_not_block_health_endpoint(client, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    entered, release = Event(), Event()
+
+    def unload():
+        entered.set()
+        assert release.wait(5)
+        return True
+
+    monkeypatch.setattr(server._app_module, "unload_model_sync", unload)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        unloading = pool.submit(client.post, "/unload")
+        try:
+            assert entered.wait(5)
+            health = pool.submit(client.get, "/health")
+            assert health.result(timeout=2).status_code == 200
+        finally:
+            release.set()
+        assert unloading.result(timeout=5).status_code == 200

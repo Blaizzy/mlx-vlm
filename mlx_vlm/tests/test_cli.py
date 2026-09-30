@@ -573,3 +573,14 @@ def test_decision_cli_reports_unsupported_question(capsys, monkeypatch):
         )
     assert error.value.code == 2
     assert "does not support 'score'" in capsys.readouterr().err
+
+
+def test_decide_registered_as_package_subcommand():
+    result = subprocess.run(
+        [sys.executable, "-m", "mlx_vlm", "decide", "--help"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "--questions-file" in result.stdout
+    assert "--state-file" in result.stdout
