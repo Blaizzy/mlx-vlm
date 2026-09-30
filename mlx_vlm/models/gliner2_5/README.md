@@ -39,7 +39,9 @@ decoding methods, including MTP and DFlash, do not apply to this architecture.
 
 ## Decision classification
 
-Prepare the checkpoint with `model_type: "gliner2_5"`, `architecture: "span"`,
+The prepared checkpoint is [nativ-community/GLiNER2.5-Decide](https://huggingface.co/nativ-community/GLiNER2.5-Decide).
+
+For an original checkpoint, prepare it with `model_type: "gliner2_5"`, `architecture: "span"`,
 and the contents of `encoder_config/config.json` embedded as `encoder_config`
 in root `config.json`. Keep the weights and tokenizer files at the root;
 loading uses the standard loader without additional sidecar detection.
@@ -53,7 +55,7 @@ extraction support.
 ```python
 from mlx_vlm import load, predict
 
-model, processor = load("path/to/prepared-gliner2.5-decide")
+model, processor = load("nativ-community/GLiNER2.5-Decide")
 result = predict(model, processor, "Please refund my duplicate charge", {
     "route": {"type": "choice", "criteria": ["billing", "technical"]},
     "tags": {
