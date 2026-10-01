@@ -90,6 +90,7 @@ def main():
         mlx=mx.__version__,
         mlx_vlm=importlib.metadata.version("mlx-vlm"),
         fast_synch=os.environ.get("MLX_METAL_FAST_SYNCH"),
+        generation_stream="default_gpu",
         device=mx.device_info(),
         model=args.model,
         weight_gb=sum(p.nbytes for _, p in tree_flatten(lm.parameters())) / 1e9,
@@ -189,6 +190,8 @@ def main():
             completion_batch_size=batch,
             prefill_step_size=args.prefill_step_size,
             compute_logprobs=False,
+            # Keep embedding preparation and generation on the same GPU stream.
+            stream=mx.default_stream(mx.gpu),
         )
         features = model.get_input_embeddings(mx.array(inputs), None)
         uids = gen.insert(
