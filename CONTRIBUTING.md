@@ -90,7 +90,11 @@ mlx_vlm extract --model <path> --image frame.png --set score_threshold=0.5
 `--set NAME=VALUE` is repeatable and forwards keywords to `extract_task`,
 so a model's own options need no flag of their own. Values are read as
 Python literals, with `true`, `false`, `none` and `null` accepted in any
-case.
+case. `--set-file NAME=PATH` does the same for array inputs that are too
+large to write inline, such as a mask or a point map, reading `.npy`,
+single-array `.npz`, `.json` and images. Images keep the mode they were
+saved in, so a grayscale mask stays two-dimensional and a cutout keeps
+its alpha.
 
 Add `extraction_api` to the model's `checks` with a `task`, an `input_shape`
 and the `outputs` it must name; `kwargs` and `config_overrides` are optional.

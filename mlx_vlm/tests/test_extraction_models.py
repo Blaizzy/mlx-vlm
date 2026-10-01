@@ -2707,3 +2707,101 @@ class TestExtractSettings(unittest.TestCase):
         for pairs in (["noequals"], ["=5"], ["a=1", "a=2"]):
             with self.assertRaises(SystemExit):
                 self._parse(pairs)
+
+
+class TestExtractInputFiles(unittest.TestCase):
+    """`--set-file NAME=PATH` reads array inputs without reshaping them."""
+
+    def _parser(self):
+        import argparse
+
+        return argparse.ArgumentParser()
+
+    def _write(self, root):
+        from PIL import Image
+
+        Image.fromarray((np.random.rand(8, 6, 3) * 255).astype(np.uint8)).save(
+            root / "rgb.png"
+        )
+        Image.fromarray((np.random.rand(8, 6) * 255).astype(np.uint8), mode="L").save(
+            root / "gray.png"
+        )
+        rgba = np.zeros((8, 6, 4), np.uint8)
+        rgba[..., 3] = 255
+        rgba[0:2, 0:2, 3] = 0
+        Image.fromarray(rgba, mode="RGBA").save(root / "cut.png")
+        np.save(root / "pm.npy", np.random.rand(8, 6, 3).astype(np.float32))
+        np.savez(root / "one.npz", only=np.zeros((3, 3)))
+        np.savez(root / "two.npz", a=np.zeros(2), b=np.zeros(2))
+        (root / "box.json").write_text(json.dumps([[0, 0, 10, 10]]))
+        (root / "k.txt").write_text("nope")
+
+    def test_reads_each_supported_type(self):
+        from mlx_vlm.extract import _load_input_file
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write(root)
+            parser = self._parser()
+            self.assertEqual(
+                np.asarray(_load_input_file(root / "rgb.png", parser)).shape, (8, 6, 3)
+            )
+            self.assertEqual(
+                np.asarray(_load_input_file(root / "pm.npy", parser)).shape, (8, 6, 3)
+            )
+            self.assertEqual(
+                np.asarray(_load_input_file(root / "one.npz", parser)).shape, (3, 3)
+            )
+            self.assertEqual(
+                _load_input_file(root / "box.json", parser), [[0, 0, 10, 10]]
+            )
+
+    def test_keeps_the_files_own_image_mode(self):
+        from mlx_vlm.extract import _load_input_file
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write(root)
+            parser = self._parser()
+            # a grayscale mask must stay (H, W); RGBA must keep its alpha, which
+            # is the channel sam3d_objects reads for a cutout.
+            self.assertEqual(
+                np.asarray(_load_input_file(root / "gray.png", parser)).shape, (8, 6)
+            )
+            cutout = np.asarray(_load_input_file(root / "cut.png", parser))
+            self.assertEqual(cutout.shape, (8, 6, 4))
+            self.assertEqual(int((cutout[..., 3] == 0).sum()), 4)
+
+    def test_rejects_unreadable_or_ambiguous_files(self):
+        from mlx_vlm.extract import _parse_input_files
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write(root)
+            for arg in (
+                f"x={root / 'two.npz'}",
+                f"x={root / 'k.txt'}",
+                f"x={root / 'missing.png'}",
+                "noequals",
+                "=x",
+                "x=",
+            ):
+                with self.assertRaises(SystemExit, msg=arg):
+                    _parse_input_files([arg], self._parser())
+
+    def test_multiple_inputs_and_duplicate_rejection(self):
+        from mlx_vlm.extract import _parse_input_files
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write(root)
+            loaded = _parse_input_files(
+                [f"mask={root / 'gray.png'}", f"pointmap={root / 'pm.npy'}"],
+                self._parser(),
+            )
+            self.assertEqual(np.asarray(loaded["mask"]).shape, (8, 6))
+            self.assertEqual(np.asarray(loaded["pointmap"]).shape, (8, 6, 3))
+            with self.assertRaises(SystemExit):
+                _parse_input_files(
+                    [f"a={root / 'gray.png'}", f"a={root / 'pm.npy'}"], self._parser()
+                )
