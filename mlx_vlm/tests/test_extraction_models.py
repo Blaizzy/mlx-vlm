@@ -2915,3 +2915,46 @@ class TestYolo11StandardLoading(unittest.TestCase):
             )
             self.assertEqual(sorted(outputs), ["boxes", "labels", "scores"])
             self.assertEqual(np.asarray(outputs["boxes"]).shape[1], 4)
+
+
+class TestDetectionOutputsAcrossResultTypes(unittest.TestCase):
+    """sam3 keeps its own DetectionResult, so the helper must read both."""
+
+    def test_reads_sam3s_result_shape(self):
+        from mlx_vlm.extraction import detection_outputs
+        from mlx_vlm.models.sam3.generate import DetectionResult as Sam3Result
+
+        # sam3's labels are per-detection prompt strings, not class ids, and it
+        # has no class_names field at all.
+        result = Sam3Result(
+            boxes=np.zeros((2, 4)),
+            masks=np.zeros((2, 3, 3)),
+            scores=np.ones(2),
+            labels=["a person", "a person"],
+            track_ids=np.zeros(2, dtype=np.int64),
+        )
+        named = detection_outputs(result)
+        self.assertEqual(
+            sorted(k for k in named if k != "metadata"),
+            ["boxes", "masks", "scores", "track_ids"],
+        )
+        self.assertEqual(named["metadata"]["label_names"], ["a person", "a person"])
+        for name, value in named.items():
+            if name != "metadata":
+                self.assertIsInstance(value, (mx.array, np.ndarray), name)
+
+    def test_reads_the_shared_result_shape(self):
+        from mlx_vlm.extraction import DetectionResult, detection_outputs
+
+        named = detection_outputs(
+            DetectionResult(
+                boxes=np.zeros((1, 4)),
+                scores=np.ones(1),
+                labels=np.zeros(1, dtype=np.int64),
+                class_names=["cat"],
+            )
+        )
+        self.assertEqual(
+            sorted(k for k in named if k != "metadata"), ["boxes", "labels", "scores"]
+        )
+        self.assertEqual(named["metadata"]["class_names"], ["cat"])

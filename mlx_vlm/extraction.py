@@ -48,17 +48,24 @@ def cxcywh_to_xyxy(boxes: Array) -> Array:
     return stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], axis=-1)
 
 
-def detection_outputs(result: "DetectionResult") -> dict:
-    """Name the populated fields of a detection result for `extract`."""
+def detection_outputs(result) -> dict:
+    """Name the populated fields of a detection result for `extract`.
+
+    sam3 still carries its own DetectionResult, so fields are read
+    defensively until it moves onto the shared one.
+    """
     named = {"boxes": result.boxes, "scores": result.scores}
     for field_name in ("labels", "masks", "track_ids"):
-        value = getattr(result, field_name)
-        if value is not None:
+        value = getattr(result, field_name, None)
+        if value is not None and not isinstance(value, list):
             named[field_name] = value
     extra = {}
-    if result.class_names:
+    if getattr(result, "class_names", None):
         extra["class_names"] = result.class_names
-    if result.label_names is not None:
+    labels = getattr(result, "labels", None)
+    if isinstance(labels, list):
+        extra["label_names"] = labels
+    if getattr(result, "label_names", None) is not None:
         extra["label_names"] = result.label_names
     if extra:
         named[METADATA] = extra
