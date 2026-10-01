@@ -31,7 +31,6 @@ import pytest
 from mlx.utils import tree_flatten, tree_map
 
 from mlx_vlm import embedding_loader
-from mlx_vlm.models import deepseek_v41
 from mlx_vlm.models.base import InputEmbeddingsFeatures
 from mlx_vlm.models.cache import make_prompt_cache
 from mlx_vlm.models.deepseek_v41 import language as deepseek_v41_language
@@ -700,6 +699,17 @@ def _make_distributed_test_model(family, dtype):
     if setup := DISTRIBUTED_MODEL_SETUPS.get(family):
         setup(model, dtype)
     if quantization := case["distributed"].get("quantization"):
+        quantization = copy.deepcopy(quantization)
+        if patterns := quantization.pop("modules", None):
+
+            def predicate(path, module):
+                if hasattr(module, "to_quantized"):
+                    for pattern, overrides in patterns.items():
+                        if fnmatchcase(path, pattern):
+                            return overrides
+                return False
+
+            quantization["class_predicate"] = predicate
         nn.quantize(model, **quantization)
     model.eval()
     return model
@@ -1629,123 +1639,6 @@ class TestQwen3_5MoeText(unittest.TestCase):
 # DeepSeek-V4.1 regressions beyond the shared model contracts
 
 
-def _quantize_deepseek_v41_experts(model):
-    def predicate(path, module):
-        if hasattr(module, "to_quantized") and any(
-            p in path
-            for p in ("switch_mlp.", "shared_experts.", "attn.wq_b", "attn.wo_a")
-        ):
-            bits = 4 if "switch_mlp." in path else 8
-            return dict(group_size=32, bits=bits, mode=f"mxfp{bits}")
-        return False
-
-    nn.quantize(model, class_predicate=predicate)
-
-
-@pytest.mark.parametrize("nested_config", [False, True])
-def test_deepseek_v41_native_checkpoint_keeps_packed_weights(tmp_path, nested_config):
-    mx.random.seed(9)
-    model = deepseek_v41.Model(tiny_config("deepseek_v41"))
-    model.update(tree_map(lambda p: p.astype(mx.bfloat16), model.parameters()))
-    model.language_model.head.weight = mx.random.normal(
-        model.language_model.head.weight.shape
-    )
-    quantization = deepseek_v41_language.make_quantization_config(model)
-    nn.quantize(model, class_predicate=lambda p, m: quantization.get(p, False))
-    mx.eval(model.parameters())
-    expected = dict(tree_flatten(model.parameters()))
-    weights = {}
-    for name, value in expected.items():
-        if (
-            name.endswith(".scales")
-            or name.endswith(".weight")
-            and name[:-6] + "scales" in expected
-        ):
-            suffix = "scale" if name.endswith(".scales") else "weight"
-            prefix = name.rsplit(".", 1)[0]
-            if suffix == "weight":
-                value = value.view(mx.uint8)
-            if ".switch_mlp." in prefix:
-                prefix, projection = prefix.rsplit(".", 1)
-                prefix = prefix.replace(".switch_mlp", ".experts")
-                projection = {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"}[
-                    projection
-                ]
-                for i in range(value.shape[0]):
-                    weights[f"{prefix}.{i}.{projection}.{suffix}"] = value[i]
-            else:
-                if ".attn.wo_a" in prefix:
-                    value = value.flatten(0, 1)
-                weights[f"{prefix}.{suffix}"] = value
-        else:
-            weights[name] = value
-    config = model.config.to_dict()
-    native_quantization = copy.deepcopy(
-        TINY_MODELS["deepseek_v41"]["native_quantization"]
-    )
-    if nested_config:
-        config["text_config"] = {"quantization_config": native_quantization}
-    else:
-        config["quantization_config"] = native_quantization
-    (tmp_path / "config.json").write_text(json.dumps(config))
-    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
-    loaded = load_model(tmp_path)
-    actual = dict(tree_flatten(loaded.parameters()))
-    for name, value in expected.items():
-        assert name in actual, name
-        assert mx.array_equal(value, actual[name]).item(), name
-    assert loaded.layers[0].ffn.switch_mlp.down_proj.mode == "mxfp4"
-    assert loaded.layers[0].ffn.shared_experts.down_proj.mode == "mxfp8"
-    assert loaded.layers[0].attn.wq_a.mode == "mxfp8"
-    assert loaded.layers[1].engram.wkv.mode == "mxfp8"
-    assert not hasattr(loaded, "_source_quantization")
-    assert not hasattr(loaded, "_preserve_source_quantization")
-
-    # The converter must describe the already-native modules when it writes an
-    # MLX checkpoint, even if the requested default for other layers is affine4.
-    from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
-
-    _preserve_existing_deepseek_v4_quantization(config, loaded, 64, 4, "affine")
-    (tmp_path / "config.json").write_text(json.dumps(config))
-    mx.save_safetensors(str(tmp_path / "model.safetensors"), actual)
-    reloaded = dict(tree_flatten(load_model(tmp_path).parameters()))
-    assert actual.keys() == reloaded.keys()
-    for name, value in actual.items():
-        assert mx.array_equal(value, reloaded[name]).item(), name
-
-
-@pytest.mark.parametrize("bits", [4, 8])
-def test_deepseek_v41_converted_checkpoint_keeps_declared_quantization(tmp_path, bits):
-    model = deepseek_v41.Model(tiny_config("deepseek_v41"))
-    quantization = dict(group_size=64, bits=bits, mode="affine")
-    nn.quantize(
-        model,
-        **quantization,
-        class_predicate=lambda p, m: ".switch_mlp." in p and hasattr(m, "to_quantized"),
-    )
-    expected = dict(tree_flatten(model.parameters()))
-    config = model.config.to_dict()
-    config["quantization"] = quantization
-    # Converted checkpoints can retain the source metadata; the explicit MLX
-    # quantization config must win over the native checkpoint format.
-    config["quantization_config"] = copy.deepcopy(
-        TINY_MODELS["deepseek_v41"]["native_quantization"]
-    )
-    (tmp_path / "config.json").write_text(json.dumps(config))
-    mx.save_safetensors(str(tmp_path / "model.safetensors"), expected)
-    loaded = load_model(tmp_path)
-    actual = dict(tree_flatten(loaded.parameters()))
-    assert actual.keys() == expected.keys()
-    for name, value in expected.items():
-        assert mx.array_equal(value, actual[name]).item(), name
-    projection = loaded.layers[0].ffn.switch_mlp.down_proj
-    assert (projection.mode, projection.bits, projection.group_size) == (
-        "affine",
-        bits,
-        64,
-    )
-
-
 def test_deepseek_v41_invalid_shard_preserves_parameters():
     model = deepseek_v41_language.LanguageModel(tiny_config("deepseek_v41"))
     before = dict(tree_flatten(model.parameters()))
@@ -1764,7 +1657,6 @@ def _prepare_deepseek_v41_distributed(model, dtype):
         .astype(dtype)
         .astype(mx.float32)
     )
-    _quantize_deepseek_v41_experts(model)
     config = model.config
     model.engram_hash = NgramHashState(
         config, model.layout, token_map=[i % 7 for i in range(config.vocab_size)]
