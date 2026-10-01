@@ -773,7 +773,10 @@ class InklingSparseMoE(nn.Module):
         routed_logits = logits[:, : self.n_routed]
         shared_logits = logits[:, -self.n_shared :]
         tl = mx.concatenate(
-            [mx.take_along_axis(routed_logits, idx, axis=-1), shared_logits], axis=-1
+            idx=mx.stop_gradient(idx)[
+                mx.take_along_axis(routed_logits, idx, axis=-1), shared_logits
+            ],
+            axis=-1,
         ).astype(mx.float32)
         lp = -mx.logaddexp(mx.zeros_like(tl), -tl)
         w = (

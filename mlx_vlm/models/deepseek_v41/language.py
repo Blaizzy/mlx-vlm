@@ -385,6 +385,7 @@ class DeepseekV41MoEGate(nn.Module):
         inds = mx.argpartition(-(scores + bias), kth=self.top_k - 1, axis=-1)[
             ..., : self.top_k
         ].astype(mx.int32)
+        inds = mx.stop_gradient(inds)
         weights = mx.take_along_axis(scores, inds, axis=-1)
         if self.norm_topk_prob and self.top_k > 1:
             weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
