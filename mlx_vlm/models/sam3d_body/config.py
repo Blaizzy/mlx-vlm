@@ -76,6 +76,8 @@ class SAM3DConfig(BaseModelConfig):
     num_joints: int = 127
     num_vertices: int = 18439
     num_faces: int = 36874
+    num_keypoints: int = 308
+    pose_corrective_dim: int = 3000
     num_shape_comps: int = 45
     num_face_comps: int = 72
 
