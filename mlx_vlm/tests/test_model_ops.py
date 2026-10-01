@@ -15,12 +15,17 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import pytest
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_map
 
 import mlx_vlm.models.rope_utils as rope_utils
 from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
 from mlx_vlm.fp8 import _dequantize_fp8_weight, _quantize_fp8_weight
 from mlx_vlm.models.cache import KVCache
+from mlx_vlm.models.deepseek_v4.language import _sparse_pooled_attention
+from mlx_vlm.models.deepseek_v41 import fakequant as deepseek_v41_fakequant
+from mlx_vlm.models.deepseek_v41.sparse_attention import (
+    sparse_attention as deepseek_v41_sparse_attention,
+)
 from mlx_vlm.models.mla import max_absorbed_queries
 from mlx_vlm.models.paddleocr_vl.config import VisionConfig
 from mlx_vlm.models.paddleocr_vl.vision import Attention, VisionModel
@@ -43,6 +48,7 @@ from mlx_vlm.quantization.one_bit import (
     one_bit_quantized_matmul,
     replace_one_bit_modules,
 )
+from mlx_vlm.tests.test_models import tiny_config
 from mlx_vlm.utils import (
     _transform_modelopt_nvfp4_weights,
     get_model_and_args,
@@ -469,6 +475,240 @@ def two_pass_inputs():
     return inputs(kv_len)
 
 
+# DeepSeek V4.1 sparse attention and expert routing
+
+
+def _deepseek_v41_sparse_inputs(
+    batch=1,
+    heads=4,
+    length=17,
+    dim=512,
+    history=7,
+    topk=31,
+    dtype=mx.bfloat16,
+    window_size=16,
+    pool_length=97,
+):
+    mx.random.seed(71)
+    q = (
+        mx.random.normal((batch, length, heads, dim))
+        .astype(dtype)
+        .transpose(0, 2, 1, 3)
+    )
+    window = mx.random.normal((batch, length + history, dim)).astype(dtype)
+    pool = mx.random.normal((batch, pool_length, dim)).astype(dtype)
+    indices = mx.random.randint(0, pool_length, (batch, length, topk))
+    indices = mx.where(mx.arange(topk) % 5 == 0, -1, indices)
+    positions = mx.arange(length + history)
+    ends = mx.arange(length) + history
+    mask = ((positions <= ends[:, None]) & (positions > ends[:, None] - window_size))[
+        None, None
+    ]
+    sinks = mx.linspace(-4, 6, heads)
+    return q, window, pool, indices, mask, sinks, dim**-0.5, window_size
+
+
+def _deepseek_v41_sparse_reference(args):
+    q, window, pool, indices, mask, sinks, scale, _ = args
+    return _sparse_pooled_attention(
+        q.astype(mx.float32),
+        window[:, None],
+        pool,
+        indices,
+        mask,
+        (indices != -1)[:, None],
+        scale,
+        sinks.astype(mx.float32),
+    ).astype(q.dtype)
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize(
+    "batch,length,heads,dim,topk,history",
+    [
+        (1, 1, 64, 512, 512, 127),
+        (4, 1, 64, 512, 512, 127),
+        (1, 17, 4, 512, 31, 0),
+        (4, 33, 8, 64, 15, 7),
+        (1, 129, 4, 512, 512, 127),
+        (1, 17, 64, 512, 33, 0),
+        (1, 129, 8, 512, 512, 127),
+    ],
+)
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Metal required")
+def test_deepseek_v41_sparse_attention_matches_reference(
+    dtype, batch, length, heads, dim, topk, history
+):
+    args = _deepseek_v41_sparse_inputs(
+        batch, heads, length, dim, history, topk, dtype, 128
+    )
+    actual, expected = deepseek_v41_sparse_attention(
+        *args
+    ), _deepseek_v41_sparse_reference(args)
+    assert actual is not None
+    mx.eval(actual, expected)
+    # FP32 reduction ordering can move the final half-precision rounding by one ULP.
+    tolerance = 0.004 if dtype == mx.bfloat16 else 0.0005
+    assert mx.allclose(actual, expected, atol=tolerance, rtol=tolerance).item()
+
+
+@pytest.mark.parametrize("sink", [-1000.0, 0.0, 1000.0])
+@pytest.mark.parametrize("heads", [2, 8])
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Metal required")
+def test_deepseek_v41_sparse_attention_masked_rows_and_attention_sinks(sink, heads):
+    args = list(_deepseek_v41_sparse_inputs(batch=2, heads=heads, length=3, dim=64))
+    args[3] = mx.full(args[3].shape, -1, mx.int64)
+    args[4] = mx.zeros((2, 1, 3, args[1].shape[1]), mx.bool_)
+    args[5] = mx.full((heads,), sink)
+    out = deepseek_v41_sparse_attention(*args)
+    assert mx.all(mx.isfinite(out)).item()
+    assert mx.all(out == 0).item()
+
+
+@pytest.mark.parametrize("heads", [3, 8])
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Metal required")
+def test_deepseek_v41_sparse_attention_float64_oracle_with_duplicate_indices_and_batch_mask(
+    heads,
+):
+    args = list(
+        _deepseek_v41_sparse_inputs(batch=2, heads=heads, length=3, dim=64, topk=4)
+    )
+    args[3] = mx.broadcast_to(mx.array([3, 3, -1, 5]), (2, 3, 4))
+    args[4] = mx.concatenate([args[4], mx.zeros_like(args[4])], axis=0)
+    q, window, pool, indices, mask, sinks = [
+        np.array(a.astype(mx.float32)) for a in args[:6]
+    ]
+    expected = np.zeros_like(q, dtype=np.float64)
+    for b in range(2):
+        for h in range(heads):
+            for t in range(3):
+                keys = np.concatenate(
+                    [
+                        window[b, mask[b, 0, t].astype(bool)],
+                        pool[b, indices[b, t][indices[b, t] >= 0].astype(int)],
+                    ]
+                )
+                scores = keys.astype(np.float64) @ (
+                    q[b, h, t].astype(np.float64) * args[6]
+                )
+                maximum = max(scores.max(), sinks[h])
+                weights = np.exp(scores - maximum)
+                expected[b, h, t] = (
+                    weights @ keys / (weights.sum() + np.exp(sinks[h] - maximum))
+                )
+    actual = deepseek_v41_sparse_attention(*args)
+    np.testing.assert_allclose(
+        np.array(actual.astype(mx.float32)), expected, atol=0.004, rtol=0.004
+    )
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Metal required")
+def test_deepseek_v41_sparse_attention_empty_pool_and_no_selected_keys():
+    args = list(_deepseek_v41_sparse_inputs(length=3, topk=0))
+    args[2] = args[2][:, :0]
+    actual = deepseek_v41_sparse_attention(*args)
+    q, window, _, _, mask, sinks, scale, _ = args
+    scores = (q.astype(mx.float32) * scale) @ window[:, None].astype(
+        mx.float32
+    ).swapaxes(-1, -2)
+    scores = mx.where(mask, scores, -mx.inf)
+    probabilities = mx.softmax(
+        mx.concatenate(
+            [
+                scores,
+                mx.broadcast_to(sinks[None, :, None, None], (*scores.shape[:-1], 1)),
+            ],
+            -1,
+        ),
+        -1,
+    )
+    expected = probabilities[..., :-1] @ window[:, None].astype(mx.float32)
+    assert mx.allclose(
+        actual.astype(mx.float32), expected, atol=0.004, rtol=0.004
+    ).item()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Metal required")
+def test_deepseek_v41_sparse_attention_unsupported_inputs_return_none():
+    args = list(_deepseek_v41_sparse_inputs())
+    args[0] = args[0].astype(mx.float32)
+    assert deepseek_v41_sparse_attention(*args) is None
+    args = list(_deepseek_v41_sparse_inputs())
+    args[4] = args[4].astype(mx.float32)
+    assert deepseek_v41_sparse_attention(*args) is None
+    args = list(_deepseek_v41_sparse_inputs(dim=48))
+    assert deepseek_v41_sparse_attention(*args) is None
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("batch", [4, 8])
+@pytest.mark.parametrize("masked", [False, True])
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Metal required")
+def test_deepseek_v41_sparse_attention_split_decode_matches_original_reduction_exactly(
+    dtype, batch, masked
+):
+    args = list(_deepseek_v41_sparse_inputs(batch, 8, 1, 512, 127, 512, dtype, 128))
+    # Include repeated keys, invalid routes, batch-specific masks, and sink extremes.
+    args[3] = mx.broadcast_to(mx.array([3, 3, -1, 5] * 128), (batch, 1, 512))
+    args[4] = mx.broadcast_to(args[4], (batch, 1, 1, 128))
+    args[4] = args[4] & (mx.arange(batch)[:, None, None, None] % 2 == 0)
+    args[5] = mx.array([-1000, -10, -1, 0, 1, 10, 100, 1000], mx.float32)
+    if masked:
+        args[3] = mx.full(args[3].shape, -1, mx.int32)
+        args[4] = mx.zeros_like(args[4])
+    actual = deepseek_v41_sparse_attention(*args)
+    # Batch 1 retains the original one-threadgroup decode kernel.
+    expected = mx.concatenate(
+        [
+            deepseek_v41_sparse_attention(
+                *(a[row : row + 1] for a in args[:5]), *args[5:]
+            )
+            for row in range(batch)
+        ],
+        axis=0,
+    )
+    assert mx.array_equal(actual, expected).item()
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+@pytest.mark.parametrize("owned", ["none", "some", "all"])
+def test_deepseek_v41_device_routes_match_compact_owned_routes(dtype, owned):
+    from mlx_vlm.models.deepseek_v41.language import DeepseekV41MoE
+
+    mx.random.seed(43)
+    config = tiny_config("deepseek_v41")
+    model = DeepseekV41MoE(config)
+    model.update(tree_map(lambda p: p.astype(dtype), model.parameters()))
+    model.sharding_group = SimpleNamespace(rank=lambda: 1)
+    count = model.switch_mlp.gate_proj.weight.shape[0]
+    x = mx.random.normal((4, 1, config.hidden_size)).astype(dtype)
+    if owned == "none":
+        indices = mx.zeros((4, 1, 2), mx.int32)
+    elif owned == "all":
+        indices = mx.full((4, 1, 2), count, mx.int32)
+    else:
+        indices = mx.broadcast_to(mx.array([0, count + 1]), (4, 1, 2))
+    scores = mx.random.uniform(shape=indices.shape)
+    expected = []
+    # Independent route-by-route oracle, including duplicate and zero-owned routes.
+    for row in range(4):
+        value = mx.zeros((1, 1, config.hidden_size), mx.float32)
+        for route in range(2):
+            index = indices[row, 0, route].item() - count
+            if 0 <= index < count:
+                y = model.switch_mlp(
+                    x[row : row + 1],
+                    mx.array([[[index]]]),
+                    scores[row : row + 1, :, route : route + 1],
+                )
+                value = value + y[..., 0, :].astype(mx.float32)
+        expected.append(value)
+    with patch.object(mx.distributed, "all_sum", side_effect=lambda data, **_: data):
+        actual = model._distributed_decode_experts(x, indices, scores)
+    expected = mx.concatenate(expected)
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5).item()
+
+
 # Rotary embeddings
 
 # Multimodal position IDs
@@ -798,6 +1038,94 @@ def test_fp8_reconstruction_requantizes_to_native_mxfp8():
     assert actual_weight.shape == (130, 40)
     assert actual_scales.dtype == mx.uint8
     assert actual_scales.shape == (130, 5)
+
+
+# DeepSeek V4.1 activation quantization and native weight packing
+
+
+def _assert_deepseek_v41_fp4_matches_reference(x, kind, block):
+    fn = getattr(deepseek_v41_fakequant, "fake_quant_fp4_" + kind)
+    actual = fn(x, block)
+    with patch.object(deepseek_v41_fakequant, "_fp4_roundtrip_kernel", None):
+        expected = fn(x, block)
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual, expected).item()
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16, mx.float32])
+@pytest.mark.parametrize("kind,block", [("ue8m0", 32), ("e4m3", 16)])
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Metal required")
+def test_deepseek_v41_fp4_random_finite_inputs(dtype, kind, block):
+    mx.random.seed(197)
+    for scale in [0, 1e-38, 1e-5, 0.2, 1, 20, 100, 3000]:
+        x = (mx.random.normal((4, 512)) * scale).astype(dtype)
+        _assert_deepseek_v41_fp4_matches_reference(x, kind, block)
+        _assert_deepseek_v41_fp4_matches_reference(
+            x.reshape(4, 16, 32).transpose(1, 0, 2), kind, block
+        )
+    _assert_deepseek_v41_fp4_matches_reference(mx.zeros((block,), dtype), kind, block)
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16, mx.float32])
+@pytest.mark.parametrize("kind,block", [("ue8m0", 32), ("e4m3", 16)])
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Metal required")
+def test_deepseek_v41_fp4_rounding_boundaries(dtype, kind, block):
+    ties = np.array([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5], np.float32)
+    neighbors = np.concatenate(
+        [np.nextafter(ties, -np.inf), ties, np.nextafter(ties, np.inf)]
+    )
+    rows = []
+    for scale in [2**-9, 0.125, 0.5, 1, 8, 256, 448]:
+        for value in neighbors:
+            # The anchor controls amax while the remaining values cross FP4 ties.
+            row = np.full(block, value * scale, np.float32)
+            row[1::2] *= -1
+            row[0] = 6 * scale
+            rows.append(row)
+    if kind == "e4m3":
+        # Scale halfway points and both neighboring FP32 values.
+        for exponent in range(-9, 9):
+            for mantissa in range(8):
+                tie = np.float32((1 + (mantissa + 0.5) / 8) * 2**exponent)
+                for scale in [
+                    np.nextafter(tie, -np.inf),
+                    tie,
+                    np.nextafter(tie, np.inf),
+                ]:
+                    rows.append(
+                        np.linspace(-6 * scale, 6 * scale, block, dtype=np.float32)
+                    )
+    _assert_deepseek_v41_fp4_matches_reference(
+        mx.array(np.stack(rows)).astype(dtype), kind, block
+    )
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Metal required")
+def test_deepseek_v41_fp4_fallback_and_disabled_quantization():
+    x = mx.arange(128, dtype=mx.float32).reshape(2, 64) / 13
+    for kind in ["ue8m0", "e4m3"]:
+        _assert_deepseek_v41_fp4_matches_reference(x, kind, 64)
+        with patch.object(deepseek_v41_fakequant, "DISABLE", True):
+            assert getattr(deepseek_v41_fakequant, "fake_quant_fp4_" + kind)(x) is x
+    with pytest.raises(ValueError, match="not divisible"):
+        deepseek_v41_fakequant.fake_quant_fp4_e4m3(x[:, :63])
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+def test_deepseek_v41_native_weight_repacking_preserves_bytes_and_block_scales(bits):
+    from mlx_vlm.models.deepseek_v41.deepseek_v41 import _pack_source_weight
+
+    rows, dims = 33, 64
+    weight = mx.arange(rows * dims * bits // 8, dtype=mx.uint8).reshape(rows, -1)
+    scale_rows = rows if bits == 4 else 2
+    scales = mx.arange(scale_rows * 2, dtype=mx.uint8).reshape(scale_rows, 2)
+    packed, expanded, mode = _pack_source_weight(weight, scales)
+    assert packed.dtype == mx.uint32
+    assert packed.shape == (rows, dims * bits // 32)
+    assert mx.array_equal(packed.view(mx.uint8), weight).item()
+    expected = scales if bits == 4 else mx.repeat(scales, 32, axis=0)[:rows]
+    assert mx.array_equal(expanded, expected).item()
+    assert mode == f"mxfp{bits}"
 
 
 # One-bit weights
