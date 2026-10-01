@@ -73,6 +73,15 @@ case configs and `shared_configs`, keeping numerical, checkpoint conversion,
 streaming, and IO assertions in Python. Use nonuniform weights to verify
 conversion values and second-pass stability.
 
+Distributed language-model tests also reuse `shared_configs`. Add a `distributed`
+entry to a shared configuration with `sharded_weights` glob patterns and
+`tolerances` for `float32` and `bfloat16`. An optional `quantization` entry uses
+the usual `nn.quantize` arguments; a `distributed` profile can override model
+dimensions. The shared test runs two and four local ranks with the ring backend,
+checks that the specified weights are partitioned, and compares batch-1 and
+batch-4 prefill and cached decode against an unsharded model and across ranks.
+Keep special model initialization in a setup helper in `test_models.py`.
+
 From the repository root, you can run the tests with:
 
 ```shell

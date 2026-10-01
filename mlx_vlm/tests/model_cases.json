@@ -2448,6 +2448,30 @@
     "max_position_embeddings": 128
   },
   "shared_configs": {
+    "qwen3": {
+      "module": "qwen3",
+      "config_type": "ModelConfig",
+      "config": {
+        "model_type": "qwen3",
+        "hidden_size": 128,
+        "num_hidden_layers": 2,
+        "intermediate_size": 256,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 4,
+        "head_dim": 32,
+        "rms_norm_eps": 1e-06,
+        "rope_theta": 10000,
+        "tie_word_embeddings": false
+      },
+      "distributed": {
+        "quantization": {"group_size": 32, "bits": 4},
+        "sharded_weights": [
+          "model.layers.*.self_attn.*_proj.weight",
+          "model.layers.*.mlp.*_proj.weight"
+        ],
+        "tolerances": {"float32": 0.0002, "bfloat16": 0.03}
+      }
+    },
     "deepseek_v41": {
       "module": "deepseek_v41",
       "config_type": "ModelConfig",
@@ -2494,6 +2518,11 @@
         "engram_head_dim": 64,
         "engram_compressed_vocab_size": 7,
         "image_token_id": 5
+      },
+      "distributed": {
+        "sharded_weights": ["head.weight", "layers.*.ffn.switch_mlp.*.weight"],
+        "tolerances": {"float32": 0.0002, "bfloat16": 0.06},
+        "reshard_error": "already sharded"
       }
     },
     "qwen": {
