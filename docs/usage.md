@@ -144,7 +144,7 @@ Run the opt-in HTTP integration tests on Apple Silicon with model access and
 
 ```bash
 MLX_VLM_COMPACTION_TEST_MODEL=openbmb/MiniCPM5-2B \
-  python -m pytest -q mlx_vlm/tests/test_compaction.py -k real_
+  python -m pytest -q mlx_vlm/tests/test_server.py::TestCompaction -k real_
 ```
 
 These cases exercise SDK compaction/replay, automatic streaming compaction,
