@@ -2204,7 +2204,7 @@ class TestCompaction:
         assert detail in response.json()["detail"]
         compact.assert_awaited_once()
         # Inspect the server-side list, not the client payload copied by HTTP.
-        assert compact.call_args.args[1] == original
+        assert compact.call_args.args[1] == original and not server.response_store
 
     def test_short_history_is_a_noop(self, mocked):
         fake, client = mocked
