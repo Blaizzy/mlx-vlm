@@ -20,7 +20,8 @@ def convert(ckpt_path: str, output_dir: str):
     import mlx.core as mx
     import torch
 
-    from .yolo11 import YOLO11, load_weights
+    from .config import ModelConfig
+    from .yolo11 import Model
 
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     model_pt = ckpt["model"].float()
@@ -61,8 +62,9 @@ def convert(ckpt_path: str, output_dir: str):
     )
 
     # Verify: load into the MLX model and run a forward pass.
-    model = YOLO11(nc=nc)
-    load_weights(model, mx.load(str(weights_path)))
+    model = Model(ModelConfig(nc=nc))
+    model.load_weights(list(model.sanitize(mx.load(str(weights_path))).items()))
+    model.eval()
     x = mx.random.normal((1, 640, 640, 3))
     preds = model(x)
     mx.eval(preds)

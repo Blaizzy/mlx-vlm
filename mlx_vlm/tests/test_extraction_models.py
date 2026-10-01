@@ -2832,8 +2832,33 @@ class TestYolo11StandardLoading(unittest.TestCase):
             out.append(segment)
         return ".".join(out)
 
-    def test_sanitize_places_every_weight_where_load_weights_does(self):
-        from mlx_vlm.models.yolo11 import YOLO11, Model, ModelConfig, load_weights
+    @staticmethod
+    def _reference_load(model, checkpoint):
+        """The walk yolo11 used before it had a sanitize, as an oracle.
+
+        A bare digit is a list index or an nn.Sequential hop depending on the
+        module it indexes, so this resolves the path rather than matching it.
+        """
+
+        def resolve(obj, name):
+            if isinstance(obj, list):
+                return obj[int(name)]
+            children = getattr(obj, "layers", None)
+            if children is not None and name.isdigit():
+                return children[int(name)]
+            return getattr(obj, name)
+
+        last = len(model.layers)
+        for key, value in checkpoint.items():
+            index, _, remainder = key[len("model.") :].partition(".")
+            target = model.detect if int(index) == last else model.layers[int(index)]
+            attrs = remainder.split(".")
+            for attr in attrs[:-1]:
+                target = resolve(target, attr)
+            setattr(target, attrs[-1], value)
+
+    def test_sanitize_places_every_weight_where_the_old_walk_did(self):
+        from mlx_vlm.models.yolo11 import Model, ModelConfig
 
         config = ModelConfig.from_dict(dict(self.CONFIG))
         reference = Model(config)
@@ -2848,8 +2873,9 @@ class TestYolo11StandardLoading(unittest.TestCase):
         }
         self.assertEqual(len(checkpoint), len(canonical))
 
-        legacy = YOLO11(nc=config.nc, ch=tuple(config.ch), reg_max=config.reg_max)
-        load_weights(legacy, checkpoint, prefix="model.")
+        legacy = Model(config)
+        self._reference_load(legacy, checkpoint)
+        legacy.eval()
 
         standard = Model(config)
         standard.load_weights(list(standard.sanitize(dict(checkpoint)).items()))

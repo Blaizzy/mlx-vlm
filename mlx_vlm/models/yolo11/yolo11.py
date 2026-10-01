@@ -467,60 +467,6 @@ def non_max_suppression(
 # ---------------------------------------------------------------------------
 
 
-def load_weights(model, mlx_weights, prefix="model."):
-    """Load an MLX-layout Ultralytics state dict into a YOLO11 model.
-
-    Expects conv weights already transposed to (O, H, W, I); see convert.py.
-    Puts the model in eval mode so BatchNorm uses running statistics.
-    """
-    model.eval()
-    layer_weights = {}
-    for key, val in mlx_weights.items():
-        if not key.startswith(prefix):
-            continue
-        rest = key[len(prefix) :]
-        parts = rest.split(".")
-        layer_idx = int(parts[0])
-        subkey = ".".join(parts[1:])
-        layer_weights.setdefault(layer_idx, {})[subkey] = val
-
-    for layer_idx, weights in layer_weights.items():
-        if layer_idx < len(model.layers):
-            module = model.layers[layer_idx]
-            if module is None:
-                if weights:
-                    raise ValueError(f"unexpected weights for concat layer {layer_idx}")
-                continue
-            _load_into(module, weights)
-        elif layer_idx == len(model.layers):
-            _load_into(model.detect, weights)
-        else:
-            raise ValueError(f"layer index {layer_idx} out of range")
-
-
-def _load_into(module, weights):
-    """Set attributes following dot-separated keys.
-
-    Digit segments index Python lists directly; MLX ``nn.Sequential`` names
-    its children "0", "1", ... so ``getattr`` covers both cases.
-    """
-
-    def resolve(obj, name):
-        if isinstance(obj, list):
-            return obj[int(name)]
-        layers = getattr(obj, "layers", None)  # MLX Sequential
-        if layers is not None and name.isdigit():
-            return layers[int(name)]
-        return getattr(obj, name)
-
-    for key, val in weights.items():
-        attrs = key.split(".")
-        obj = module
-        for attr in attrs[:-1]:
-            obj = resolve(obj, attr)
-        setattr(obj, attrs[-1], val)
-
-
 class Model(YOLO11):
     """YOLO11 behind the repository's standard config and loader."""
 

@@ -6,7 +6,6 @@ from .inference import (
     DEFAULT_MODEL_ID,
     DetectionResult,
     draw_detections,
-    load_detector,
     predict,
     prepare_image,
 )
@@ -24,7 +23,6 @@ from .yolo11 import (
     Model,
     PSABlock,
     box_iou,
-    load_weights,
     non_max_suppression,
     xywh2xyxy,
 )
@@ -47,8 +45,6 @@ __all__ = [
     "YOLO11",
     "box_iou",
     "draw_detections",
-    "load_detector",
-    "load_weights",
     "non_max_suppression",
     "predict",
     "prepare_image",
