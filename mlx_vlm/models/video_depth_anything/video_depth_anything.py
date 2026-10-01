@@ -66,3 +66,11 @@ class Model(nn.Module):
                     v = v.transpose(0, 2, 3, 1)
             sanitized[k] = v
         return sanitized
+
+    extraction_types = ("depth",)
+
+    def extract_task(self, processor, inputs, task="depth", **kwargs):
+        """Predict per-frame depth for (T, H, W, 3) RGB video frames."""
+        from .generate import VideoDepthPredictor
+
+        return {"depth": VideoDepthPredictor(self, processor).infer(inputs, **kwargs)}

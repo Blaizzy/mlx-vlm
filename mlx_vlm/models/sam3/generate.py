@@ -22,6 +22,7 @@ import numpy as np
 from PIL import Image
 
 from ..._stream_cleanup import clear_mlx_streams
+from ...extraction import cxcywh_to_xyxy
 
 
 @dataclass
@@ -820,16 +821,6 @@ def _sigmoid(x: np.ndarray) -> np.ndarray:
     return 1 / (1 + np.exp(-x))
 
 
-def _cxcywh_to_xyxy(boxes: np.ndarray) -> np.ndarray:
-    """Convert (cx, cy, w, h) to (x1, y1, x2, y2)."""
-    cx, cy, w, h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
-    x1 = cx - w / 2
-    y1 = cy - h / 2
-    x2 = cx + w / 2
-    y2 = cy + h / 2
-    return np.stack([x1, y1, x2, y2], axis=1)
-
-
 def _nms(
     boxes: np.ndarray, scores: np.ndarray, iou_threshold: float = 0.5
 ) -> np.ndarray:
@@ -837,7 +828,7 @@ def _nms(
     if len(boxes) == 0:
         return np.array([], dtype=np.int64)
 
-    boxes_xyxy = _cxcywh_to_xyxy(boxes)
+    boxes_xyxy = cxcywh_to_xyxy(boxes)
     x1, y1, x2, y2 = (
         boxes_xyxy[:, 0],
         boxes_xyxy[:, 1],

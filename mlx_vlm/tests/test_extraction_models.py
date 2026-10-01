@@ -1957,6 +1957,37 @@ class ExtractionChecks:
         with pytest.raises(ValueError, match="does not support"):
             predict(model, processor, state, {"invalid": {"type": "unknown"}})
 
+    def extraction_api(self, case):
+        from mlx_vlm.extraction import extract
+
+        spec = case["extraction_api"]
+        config = _extraction_config(case["id"])
+        config.update(spec.get("config_overrides") or {})
+        module = importlib.import_module(f"mlx_vlm.models.{case['module']}")
+        model = module.Model(module.ModelConfig.from_dict(config))
+        model.eval()
+
+        assert spec["task"] in model.extraction_types
+        mx.random.seed(0)
+        inputs = (np.random.default_rng(0).random(spec["input_shape"]) * 255).astype(
+            np.uint8
+        )
+        outputs = extract(model, None, inputs, **(spec.get("kwargs") or {}))
+        assert set(spec["outputs"]) <= set(outputs), sorted(outputs)
+        # Geometry models leave masked-out pixels infinite, so only the valid
+        # region is required to be finite.
+        mask = outputs.get("mask")
+        mask = None if mask is None else np.asarray(mask).astype(bool)
+        for name in spec["outputs"]:
+            value = np.asarray(outputs[name])
+            if mask is not None and value.shape[: mask.ndim] == mask.shape:
+                value = value[mask]
+            assert value.size == 0 or np.all(np.isfinite(value)), name
+        with pytest.raises(ValueError, match="does not support"):
+            extract(model, None, inputs, task="not-a-real-task")
+        with pytest.raises(ValueError, match="requires inputs"):
+            extract(model, None, None)
+
     def registry_and_config(self, case):
         name = case["module"]
         module = importlib.import_module(f"mlx_vlm.models.{name}")
@@ -2142,3 +2173,257 @@ class TestLayaDecisionModel(unittest.TestCase):
                     self.assertEqual(
                         result["answers"]["route"]["probabilities"]["B"], expected
                     )
+
+
+class TestExtractionResults(unittest.TestCase):
+    """The shared detection containers cover every per-model usage pattern."""
+
+    def test_every_import_site_is_the_same_class(self):
+        from mlx_vlm.extraction import DetectionResult, cxcywh_to_xyxy
+        from mlx_vlm.models import yolo11
+        from mlx_vlm.models.rfdetr import generate as rfdetr_generate
+        from mlx_vlm.models.rt_detr_v2 import generate as rt_detr_generate
+        from mlx_vlm.models.sam3 import generate as sam3_generate
+        from mlx_vlm.models.yolo11 import inference as yolo11_inference
+
+        for module in (yolo11, yolo11_inference, rfdetr_generate, rt_detr_generate):
+            self.assertIs(module.DetectionResult, DetectionResult)
+        for module in (rfdetr_generate, sam3_generate):
+            self.assertIs(module.cxcywh_to_xyxy, cxcywh_to_xyxy)
+
+    def test_supports_each_models_fields(self):
+        from mlx_vlm.extraction import DetectionResult
+
+        yolo = DetectionResult(
+            boxes=mx.zeros((2, 4)),
+            scores=mx.zeros((2,)),
+            labels=mx.zeros((2,), dtype=mx.int32),
+            image=object(),
+        )
+        self.assertEqual(len(yolo), 2)
+        self.assertEqual(yolo.class_names, [])
+        self.assertIsNone(yolo.masks)
+
+        rfdetr = DetectionResult(
+            boxes=np.zeros((3, 4)),
+            scores=np.zeros((3,)),
+            labels=np.zeros((3,), dtype=np.int64),
+            class_names=["a", "b"],
+            masks=np.zeros((3, 5, 5)),
+        )
+        self.assertEqual(len(rfdetr), 3)
+        self.assertEqual(rfdetr.masks.shape, (3, 5, 5))
+
+        sam3 = DetectionResult(
+            boxes=np.zeros((1, 4)),
+            masks=np.zeros((1, 5, 5)),
+            scores=np.zeros((1,)),
+            label_names=["person"],
+            track_ids=np.zeros((1,), dtype=np.int64),
+        )
+        self.assertEqual(sam3.label_names, ["person"])
+        self.assertIsNone(sam3.labels)
+
+        self.assertEqual(
+            len(DetectionResult(boxes=np.zeros((0, 4)), scores=np.zeros(0))), 0
+        )
+
+    def test_tracking_result_fields(self):
+        from mlx_vlm.extraction import TrackingResult
+
+        frame = TrackingResult(
+            frame_idx=7, masks=np.zeros((2, 4, 4)), scores=np.ones(2), object_ids=[3, 9]
+        )
+        self.assertEqual(frame.frame_idx, 7)
+        self.assertEqual(frame.object_ids, [3, 9])
+        self.assertIsNone(
+            TrackingResult(
+                frame_idx=0, masks=np.zeros((1, 2, 2)), scores=np.ones(1)
+            ).object_ids
+        )
+
+    def test_cxcywh_to_xyxy_matches_both_array_types(self):
+        from mlx_vlm.extraction import cxcywh_to_xyxy
+
+        boxes = np.array([[10.0, 20.0, 4.0, 6.0]])
+        np.testing.assert_allclose(cxcywh_to_xyxy(boxes), [[8.0, 17.0, 12.0, 23.0]])
+        self.assertEqual(cxcywh_to_xyxy(np.zeros((2, 3, 4))).shape, (2, 3, 4))
+        as_mlx = cxcywh_to_xyxy(mx.array(boxes))
+        self.assertIsInstance(as_mlx, mx.array)
+        np.testing.assert_allclose(np.array(as_mlx), cxcywh_to_xyxy(boxes), atol=1e-6)
+
+
+class TestExtractionAPI(unittest.TestCase):
+    """`extraction.extract` gates on declared tasks before touching the model."""
+
+    class _Depth:
+        extraction_types = ("depth",)
+
+        def extract_task(self, processor, inputs, task=None, **kwargs):
+            return {"depth": inputs, "task": task, "kwargs": kwargs}
+
+    class _Multi:
+        extraction_types = ("depth", "pointmap")
+
+        def extract_task(self, processor, inputs, task=None, **kwargs):
+            return {task: True}
+
+    def test_rejects_models_without_declared_tasks(self):
+        from mlx_vlm.extraction import extract
+
+        with self.assertRaisesRegex(ValueError, "does not support extraction"):
+            extract(object(), None, "x")
+
+    def test_rejects_missing_inputs_and_unsupported_task(self):
+        from mlx_vlm.extraction import extract
+
+        with self.assertRaisesRegex(ValueError, "requires inputs"):
+            extract(self._Depth(), None, None)
+        with self.assertRaisesRegex(ValueError, "does not support 'pointmap'"):
+            extract(self._Depth(), None, "x", task="pointmap")
+
+    def test_requires_an_explicit_task_when_several_are_served(self):
+        from mlx_vlm.extraction import extract
+
+        with self.assertRaisesRegex(ValueError, r"pass task="):
+            extract(self._Multi(), None, "x")
+        self.assertEqual(
+            extract(self._Multi(), None, "x", task="depth"), {"depth": True}
+        )
+
+    def test_rejects_non_mapping_outputs(self):
+        from mlx_vlm.extraction import extract
+
+        class Bad:
+            extraction_types = ("depth",)
+
+            def extract_task(self, processor, inputs, task=None, **kwargs):
+                return np.zeros(3)
+
+        with self.assertRaisesRegex(ValueError, "must return a mapping"):
+            extract(Bad(), None, "x")
+
+    def test_infers_the_single_task_and_forwards_kwargs(self):
+        from mlx_vlm.extraction import extract
+
+        out = extract(self._Depth(), None, "frames", progress=False)
+        self.assertEqual(out["depth"], "frames")
+        self.assertEqual(out["task"], "depth")
+        self.assertEqual(out["kwargs"], {"progress": False})
+
+
+class TestExtractionCLI(unittest.TestCase):
+    """The `extract` subcommand loads a checkpoint, runs a task and reports shapes."""
+
+    @staticmethod
+    def _checkpoint(root, case_id, module_name, overrides=None):
+        config = copy.deepcopy(_extraction_config(case_id))
+        config["model_type"] = module_name
+        config.update(overrides or {})
+        module = importlib.import_module(f"mlx_vlm.models.{module_name}")
+        model = module.Model(module.ModelConfig.from_dict(dict(config)))
+        mx.eval(model.parameters())
+        (root / "config.json").write_text(json.dumps(config))
+        mx.save_safetensors(
+            str(root / "model.safetensors"), dict(tree_flatten(model.parameters()))
+        )
+        return model
+
+    @staticmethod
+    def _png(path, height, width):
+        from PIL import Image
+
+        pixels = (np.random.rand(height, width, 3) * 255).astype(np.uint8)
+        Image.fromarray(pixels).save(path)
+        return path
+
+    def test_is_a_registered_subcommand(self):
+        source = Path(importlib.import_module("mlx_vlm.__main__").__file__).read_text()
+        self.assertIn('"extract"', source)
+
+    def test_runs_a_checkpoint_end_to_end_and_saves_arrays(self):
+        from mlx_vlm import extract as cli
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._checkpoint(root, "sapiens2", "sapiens2")
+            image = self._png(root / "frame.png", 32, 24)
+            output = root / "out.npz"
+            cli.main(
+                ["--model", str(root), "--image", str(image), "--output", str(output)]
+            )
+            saved = np.load(output)
+            self.assertEqual(set(saved.keys()), {"last_hidden_state", "pooler_output"})
+            self.assertEqual(saved["pooler_output"].shape, (1, 64))
+
+    def test_runs_without_an_output_file(self):
+        from mlx_vlm import extract as cli
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._checkpoint(root, "sapiens2", "sapiens2")
+            image = self._png(root / "frame.png", 32, 24)
+            cli.main(["--model", str(root), "--image", str(image)])
+
+    def test_rejects_a_model_without_declared_tasks(self):
+        from mlx_vlm import extract as cli
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image = self._png(root / "frame.png", 8, 8)
+            original = cli.load
+            cli.load = lambda *args, **kwargs: (object(), None)
+            try:
+                with self.assertRaises(SystemExit):
+                    cli.main(["--model", "any", "--image", str(image)])
+            finally:
+                cli.load = original
+
+    def test_rejects_mismatched_image_shapes(self):
+        from mlx_vlm import extract as cli
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._checkpoint(root, "sapiens2", "sapiens2")
+            first = self._png(root / "a.png", 32, 24)
+            second = self._png(root / "b.png", 16, 24)
+            with self.assertRaises(SystemExit):
+                cli.main(
+                    [
+                        "--model",
+                        str(root),
+                        "--image",
+                        str(first),
+                        "--image",
+                        str(second),
+                    ]
+                )
+
+    def test_requires_exactly_one_input_source(self):
+        from mlx_vlm import extract as cli
+
+        with self.assertRaises(SystemExit):
+            cli.main(["--model", "x"])
+        with self.assertRaises(SystemExit):
+            cli.main(["--model", "x", "--image", "a.png", "--video", "v.mp4"])
+
+    def test_stacks_repeated_images_into_frames(self):
+        from mlx_vlm.extract import _stack_images
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            one = self._png(root / "a.png", 8, 6)
+            two = self._png(root / "b.png", 8, 6)
+            self.assertEqual(_stack_images([one]).shape, (8, 6, 3))
+            self.assertEqual(_stack_images([one, two]).shape, (2, 8, 6, 3))
+            with self.assertRaisesRegex(ValueError, "must share a shape"):
+                _stack_images([one, self._png(root / "c.png", 4, 6)])
+
+    def test_manifest_describes_arrays_without_serializing_them(self):
+        from mlx_vlm.extract import _manifest
+
+        manifest = _manifest("depth", {"depth": np.zeros((2, 3), dtype=np.float32)})
+        self.assertEqual(manifest["task"], "depth")
+        self.assertEqual(manifest["outputs"]["depth"]["shape"], [2, 3])
+        self.assertEqual(manifest["outputs"]["depth"]["dtype"], "float32")
+        json.dumps(manifest)

@@ -369,3 +369,11 @@ class Model(nn.Module):
                 for k, v in return_dict.items()
             }
         return return_dict
+
+    extraction_types = ("geometry",)
+
+    def extract_task(self, processor, inputs, task="geometry", **kwargs):
+        """Predict points, depth, normals, mask and intrinsics for an image or batch."""
+        from .generate import MoGe3Predictor
+
+        return MoGe3Predictor(self, processor).infer(inputs, **kwargs)

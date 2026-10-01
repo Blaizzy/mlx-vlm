@@ -165,7 +165,14 @@
       },
       "input_shape": [1, 2, 28, 28, 3],
       "output_shapes": [1, 2, 28, 28],
-      "checks": ["registry_and_config", "forward", "checkpoint"]
+      "extraction_api": {
+        "task": "depth",
+        "input_shape": [8, 28, 28, 3],
+        "outputs": ["depth"],
+        "kwargs": { "progress": false },
+        "config_overrides": { "num_frames": 32 }
+      },
+      "checks": ["registry_and_config", "forward", "checkpoint", "extraction_api"]
     },
     {
       "id": "sam3_1",
@@ -199,7 +206,12 @@
         "last_hidden_state": [2, 15, 64],
         "pooler_output": [2, 64]
       },
-      "checks": ["registry_and_config", "forward", "checkpoint"]
+      "extraction_api": {
+        "task": "backbone",
+        "input_shape": [32, 24, 3],
+        "outputs": ["last_hidden_state", "pooler_output"]
+      },
+      "checks": ["registry_and_config", "forward", "checkpoint", "extraction_api"]
     },
     {
       "id": "moge3",
@@ -251,7 +263,12 @@
           "encoder_downsample": 4
         }
       },
-      "checks": ["registry_and_config"]
+      "extraction_api": {
+        "task": "geometry",
+        "input_shape": [64, 64, 3],
+        "outputs": ["points", "depth", "mask", "intrinsics"]
+      },
+      "checks": ["registry_and_config", "extraction_api"]
     },
     {
       "id": "gliner2_5",

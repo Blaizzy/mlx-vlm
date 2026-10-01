@@ -1,6 +1,5 @@
 import json
 import math
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Union
 
@@ -9,18 +8,11 @@ import numpy as np
 from huggingface_hub import snapshot_download
 from PIL import Image, ImageDraw
 
+from ...extraction import DetectionResult
 from .yolo11 import YOLO11, load_weights, non_max_suppression
 
 DEFAULT_MODEL_ID = "axiom-of-choice/OmniParser-v2-icon-detect"
 ImageInput = Union[str, Path, Image.Image, np.ndarray]
-
-
-@dataclass
-class DetectionResult:
-    boxes: mx.array
-    scores: mx.array
-    labels: mx.array
-    image: Image.Image
 
 
 def load_detector(model_path: Union[str, Path] = DEFAULT_MODEL_ID):
