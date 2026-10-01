@@ -139,19 +139,21 @@ invalidates existing items. OpenAI-issued opaque compaction items are not
 interchangeable with MLX-issued items. `store=False` avoids the Responses registry;
 APC persistence is configured separately.
 
-Run the opt-in HTTP integration test on Apple Silicon with model access and
+Run the opt-in HTTP integration tests on Apple Silicon with model access and
 `pytest`, `httpx`, and `openai` installed:
 
 ```bash
 MLX_VLM_COMPACTION_TEST_MODEL=openbmb/MiniCPM5-2B \
-  python -m pytest -s mlx_vlm/tests/test_compaction_model.py
+  python -m pytest -q mlx_vlm/tests/test_compaction.py -k real_
 ```
 
-The test exercises SDK compaction/replay, automatic streaming compaction,
+These cases exercise SDK compaction/replay, automatic streaming compaction,
 corrections across repeated compaction, cold/warm APC, cache reset, server restart,
-and client-authored summaries through Chat Completions and Messages. It writes
-token counts, timings, and server logs in pytest's temporary directory. Its small
-synthetic recall task is a regression check, not a general summary-quality benchmark.
+and client-authored summaries through Chat Completions and Messages. Each case
+starts a fresh server and keeps its log in pytest's temporary directory. The
+small synthetic recall task is a regression check, not a general summary-quality
+benchmark. Without the model environment variable, only the real-inference cases
+are skipped; the ordinary compaction protocol tests still run.
 
 ## MoE Offloading
 
