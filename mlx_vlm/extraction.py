@@ -9,6 +9,10 @@ import numpy as np
 
 Array = Union[mx.array, np.ndarray]
 
+#: Reserved output name for anything an extraction result carries that is not
+#: an array: class names, a mesh, a pose, a flag.
+METADATA = "metadata"
+
 
 @dataclass
 class DetectionResult:
@@ -51,10 +55,13 @@ def detection_outputs(result: "DetectionResult") -> dict:
         value = getattr(result, field_name)
         if value is not None:
             named[field_name] = value
+    extra = {}
     if result.class_names:
-        named["class_names"] = result.class_names
+        extra["class_names"] = result.class_names
     if result.label_names is not None:
-        named["label_names"] = result.label_names
+        extra["label_names"] = result.label_names
+    if extra:
+        named[METADATA] = extra
     return named
 
 
@@ -82,4 +89,16 @@ def extract(model, processor, inputs, task=None, **kwargs):
     outputs = model.extract_task(processor, inputs, task=task, **kwargs)
     if not isinstance(outputs, Mapping):
         raise ValueError(f"{task!r} extraction must return a mapping of named outputs")
+    for name, value in outputs.items():
+        if name == METADATA:
+            if not isinstance(value, Mapping):
+                raise ValueError(
+                    f"{METADATA!r} must be a mapping, got {type(value).__name__}"
+                )
+            continue
+        if not isinstance(value, (mx.array, np.ndarray)):
+            raise ValueError(
+                f"{task!r} extraction returned {name!r} as {type(value).__name__}; "
+                f"named outputs are arrays, so anything else belongs in {METADATA!r}"
+            )
     return dict(outputs)

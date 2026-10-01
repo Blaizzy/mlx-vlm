@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageOps
 
-from .extraction import extract
+from .extraction import METADATA, extract
 from .utils import load, load_image
 
 
@@ -27,27 +27,6 @@ def _read_video(path, max_frames):
 
     frames = read_video_frames(str(path), max_len=max_frames)
     return frames[0] if isinstance(frames, tuple) else frames
-
-
-def _as_array(value):
-    """Return value as a numpy array, or None if it is not array-shaped."""
-    try:
-        array = np.asarray(value)
-    except Exception:
-        return None
-    return None if array.dtype == object else array
-
-
-def _manifest(task, outputs):
-    """Describe named outputs without materializing them into JSON."""
-    described = {}
-    for name, value in outputs.items():
-        array = _as_array(value)
-        if array is None:
-            described[name] = {"type": type(value).__name__, "array": False}
-        else:
-            described[name] = {"shape": list(array.shape), "dtype": str(array.dtype)}
-    return {"task": task, "outputs": described}
 
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp"}
@@ -114,6 +93,22 @@ def _parse_settings(pairs, parser):
             except (ValueError, SyntaxError):
                 settings[name] = raw
     return settings
+
+
+def _manifest(task, outputs):
+    """Describe named outputs without materializing them into JSON."""
+    described = {
+        name: {
+            "shape": list(np.asarray(value).shape),
+            "dtype": str(np.asarray(value).dtype),
+        }
+        for name, value in outputs.items()
+        if name != METADATA
+    }
+    manifest = {"task": task, "outputs": described}
+    if METADATA in outputs:
+        manifest[METADATA] = sorted(outputs[METADATA])
+    return manifest
 
 
 def main(argv=None):
@@ -193,14 +188,12 @@ def main(argv=None):
 
     task = args.task if args.task is not None else tasks[0]
     if args.output is not None:
-        # Object arrays save but cannot be read back with the default np.load,
-        # so only array-shaped outputs are written.
-        arrays = {k: a for k, v in outputs.items() if (a := _as_array(v)) is not None}
-        skipped = sorted(set(outputs) - set(arrays))
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        np.savez(args.output, **arrays)
-        if skipped:
-            print(f"not array-shaped, omitted from {args.output.name}: {skipped}")
+        np.savez(
+            args.output,
+            **{k: np.asarray(v) for k, v in outputs.items() if k != METADATA},
+        )
+
     print(json.dumps(_manifest(task, outputs), indent=2))
 
 

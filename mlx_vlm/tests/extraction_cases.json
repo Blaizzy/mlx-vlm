@@ -385,7 +385,7 @@
       "extraction_api": {
         "task": "objects",
         "input_shape": [112, 112, 4],
-        "outputs": ["coords", "latents", "pose", "mesh"],
+        "outputs": ["coords", "latents"],
         "kwargs": { "ss_steps": 1, "slat_steps": 1, "formats": ["mesh"], "estimate_depth": false }
       },
       "checks": ["extraction_api"]

@@ -1987,11 +1987,12 @@ class ExtractionChecks:
         mask = None if mask is None else np.asarray(mask).astype(bool)
         for name in spec["outputs"]:
             value = np.asarray(outputs[name])
-            if value.dtype == object or not np.issubdtype(value.dtype, np.number):
-                continue  # structured outputs such as a mesh or a pose dict
             if mask is not None and value.shape[: mask.ndim] == mask.shape:
                 value = value[mask]
             assert value.size == 0 or np.all(np.isfinite(value)), name
+        for name, value in outputs.items():
+            if name != "metadata":
+                assert isinstance(value, (mx.array, np.ndarray)), name
         with pytest.raises(ValueError, match="does not support"):
             extract(model, processor, inputs, task="not-a-real-task")
         with pytest.raises(ValueError, match="requires inputs"):
@@ -2269,13 +2270,16 @@ class TestExtractionAPI(unittest.TestCase):
         extraction_types = ("depth",)
 
         def extract_task(self, processor, inputs, task=None, **kwargs):
-            return {"depth": inputs, "task": task, "kwargs": kwargs}
+            return {
+                "depth": np.zeros(1),
+                "metadata": {"task": task, "kwargs": kwargs},
+            }
 
     class _Multi:
         extraction_types = ("depth", "pointmap")
 
         def extract_task(self, processor, inputs, task=None, **kwargs):
-            return {task: True}
+            return {task: np.zeros(1)}
 
     def test_rejects_models_without_declared_tasks(self):
         from mlx_vlm.extraction import extract
@@ -2297,7 +2301,7 @@ class TestExtractionAPI(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"pass task="):
             extract(self._Multi(), None, "x")
         self.assertEqual(
-            extract(self._Multi(), None, "x", task="depth"), {"depth": True}
+            sorted(extract(self._Multi(), None, "x", task="depth")), ["depth"]
         )
 
     def test_rejects_non_mapping_outputs(self):
@@ -2316,9 +2320,9 @@ class TestExtractionAPI(unittest.TestCase):
         from mlx_vlm.extraction import extract
 
         out = extract(self._Depth(), None, "frames", progress=False)
-        self.assertEqual(out["depth"], "frames")
-        self.assertEqual(out["task"], "depth")
-        self.assertEqual(out["kwargs"], {"progress": False})
+        self.assertEqual(np.asarray(out["depth"]).shape, (1,))
+        self.assertEqual(out["metadata"]["task"], "depth")
+        self.assertEqual(out["metadata"]["kwargs"], {"progress": False})
 
 
 class TestExtractionCLI(unittest.TestCase):
@@ -2478,18 +2482,12 @@ class TestExtractionCoverage(unittest.TestCase):
             track_ids=np.zeros(2, dtype=np.int64),
             label_names=["x", "y"],
         )
+        named = detection_outputs(full)
         self.assertEqual(
-            sorted(detection_outputs(full)),
-            [
-                "boxes",
-                "class_names",
-                "label_names",
-                "labels",
-                "masks",
-                "scores",
-                "track_ids",
-            ],
+            sorted(k for k in named if k != "metadata"),
+            ["boxes", "labels", "masks", "scores", "track_ids"],
         )
+        self.assertEqual(sorted(named["metadata"]), ["class_names", "label_names"])
         sparse = DetectionResult(boxes=np.zeros((1, 4)), scores=np.ones(1))
         self.assertEqual(sorted(detection_outputs(sparse)), ["boxes", "scores"])
 
@@ -2555,22 +2553,23 @@ class TestExtractionCLIOutputs(unittest.TestCase):
     class _Mesh:
         pass
 
-    def test_manifest_marks_non_array_outputs(self):
+    def test_manifest_lists_arrays_and_names_metadata(self):
         from mlx_vlm.extract import _manifest
 
         described = _manifest(
-            "objects", {"depth": np.zeros((2, 2)), "mesh": self._Mesh()}
+            "objects", {"depth": np.zeros((2, 2)), "metadata": {"mesh": self._Mesh()}}
         )
         self.assertEqual(described["outputs"]["depth"]["shape"], [2, 2])
-        self.assertEqual(
-            described["outputs"]["mesh"], {"type": "_Mesh", "array": False}
-        )
+        self.assertEqual(described["metadata"], ["mesh"])
         json.dumps(described)
 
-    def test_npz_omits_object_outputs_and_loads_with_default_numpy(self):
+    def test_npz_holds_the_arrays_and_loads_with_default_numpy(self):
         from mlx_vlm import extract as cli
 
-        outputs = {"depth": np.zeros((2, 2)), "mesh": self._Mesh(), "flag": True}
+        outputs = {
+            "depth": np.zeros((2, 2)),
+            "metadata": {"mesh": self._Mesh(), "flag": True},
+        }
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "nested" / "run.npz"
             original = cli.load
@@ -2591,7 +2590,7 @@ class TestExtractionCLIOutputs(unittest.TestCase):
                 cli.load = original
             self.assertTrue(target.exists(), "parent directory should be created")
             loaded = np.load(target)  # default: allow_pickle=False
-            self.assertEqual(sorted(loaded.keys()), ["depth", "flag"])
+            self.assertEqual(sorted(loaded.keys()), ["depth"])
             self.assertEqual(loaded["depth"].shape, (2, 2))
 
 
@@ -2641,9 +2640,9 @@ class TestExtractionContractGuards(unittest.TestCase):
             extraction_types = ["depth"]
 
             def extract_task(self, processor, inputs, task=None, **kwargs):
-                return {"task": task}
+                return {"depth": np.zeros(1), "metadata": {"task": task}}
 
-        self.assertEqual(extract(Listly(), None, "x"), {"task": "depth"})
+        self.assertEqual(extract(Listly(), None, "x")["metadata"]["task"], "depth")
 
 
 class TestRfdetrTwoStageSelection(unittest.TestCase):
