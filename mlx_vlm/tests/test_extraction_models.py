@@ -2504,13 +2504,6 @@ class TestExtractionCoverage(unittest.TestCase):
             finally:
                 cli.load = original
 
-    def test_server_accepts_an_extraction_preload_flag(self):
-        source = Path(
-            importlib.import_module("mlx_vlm.server.cli").__file__
-        ).read_text()
-        self.assertIn("--extraction-model", source)
-        self.assertIn("MLX_VLM_PRELOAD_EXTRACTION_MODEL", source)
-
 
 class TestExtractionPredictorWiring(unittest.TestCase):
     """Each adapter hands its predictor the collaborator that predictor expects."""
@@ -2604,3 +2597,39 @@ class TestSam3dBodyRayConditioning(unittest.TestCase):
         conv = small.ray_cond_emb.conv
         self.assertEqual(conv.weight.shape[-1], 64 + RAY_ENCODING_CHANNELS)
         self.assertEqual(conv.weight.shape[0], 64)
+
+
+class TestExtractionContractGuards(unittest.TestCase):
+    """A model author's likely slips fail with a message that names the slip."""
+
+    def test_rejects_a_string_declaration(self):
+        from mlx_vlm.extraction import extract
+
+        class Stringly:
+            extraction_types = "depth"  # iterates as characters if unguarded
+
+            def extract_task(self, processor, inputs, task=None, **kwargs):
+                return {"depth": 1}
+
+        with self.assertRaisesRegex(ValueError, "must be a sequence"):
+            extract(Stringly(), None, "x")
+
+    def test_rejects_a_declaration_without_a_hook(self):
+        from mlx_vlm.extraction import extract
+
+        class Declared:
+            extraction_types = ("depth",)
+
+        with self.assertRaisesRegex(ValueError, "implements no extract_task"):
+            extract(Declared(), None, "x")
+
+    def test_accepts_a_list_declaration(self):
+        from mlx_vlm.extraction import extract
+
+        class Listly:
+            extraction_types = ["depth"]
+
+            def extract_task(self, processor, inputs, task=None, **kwargs):
+                return {"task": task}
+
+        self.assertEqual(extract(Listly(), None, "x"), {"task": "depth"})

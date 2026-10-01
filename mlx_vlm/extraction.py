@@ -61,8 +61,14 @@ def detection_outputs(result: "DetectionResult") -> dict:
 def extract(model, processor, inputs, task=None, **kwargs):
     """Predict named structured outputs using a model's native extraction tasks."""
     supported = getattr(model, "extraction_types", ())
+    if isinstance(supported, str):
+        raise ValueError("extraction_types must be a sequence of task names")
     if not supported:
         raise ValueError("This model does not support extraction prediction")
+    if not callable(getattr(model, "extract_task", None)):
+        raise ValueError(
+            "This model declares extraction_types but implements no extract_task"
+        )
     if inputs is None:
         raise ValueError("Extraction requires inputs")
     if task is None:
