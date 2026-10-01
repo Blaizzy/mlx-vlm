@@ -519,3 +519,61 @@ def _load_into(module, weights):
         for attr in attrs[:-1]:
             obj = resolve(obj, attr)
         setattr(obj, attrs[-1], val)
+
+
+class Model(YOLO11):
+    """YOLO11 behind the repository's standard config and loader."""
+
+    extraction_types = ("detection",)
+
+    def __init__(self, config):
+        super().__init__(nc=config.nc, ch=tuple(config.ch), reg_max=config.reg_max)
+        self.config = config
+
+    def sanitize(self, weights):
+        """Rename Ultralytics keys onto this module tree.
+
+        A checkpoint addresses layers as ``model.<index>`` and names
+        ``nn.Sequential`` children with a bare digit, where MLX addresses them
+        as ``layers.<index>``; the digit's meaning depends on the module it
+        indexes, so the path is resolved rather than pattern-matched.
+        """
+        last = len(self.layers)
+        renamed = {}
+        for key, value in weights.items():
+            if not key.startswith("model."):
+                renamed[key] = value
+                continue
+            index, _, remainder = key[len("model.") :].partition(".")
+            position = int(index)
+            if position == last:
+                module, path = self.detect, ["detect"]
+            elif position < last:
+                module, path = self.layers[position], ["layers", index]
+            else:
+                raise ValueError(f"layer index {position} out of range")
+            if module is None:
+                raise ValueError(f"unexpected weights for concat layer {position}")
+            parts = remainder.split(".")
+            for name in parts[:-1]:
+                if isinstance(module, list):
+                    module = module[int(name)]
+                    path.append(name)
+                    continue
+                children = getattr(module, "layers", None)
+                if children is not None and name.isdigit():
+                    module = children[int(name)]
+                    path += ["layers", name]
+                else:
+                    module = getattr(module, name)
+                    path.append(name)
+            path.append(parts[-1])
+            renamed[".".join(path)] = value
+        return renamed
+
+    def extract_task(self, processor, inputs, task="detection", **kwargs):
+        """Detect objects in one image."""
+        from ...extraction import detection_outputs
+        from .inference import predict
+
+        return detection_outputs(predict(self, inputs, **kwargs))

@@ -2442,6 +2442,7 @@ class TestExtractionCoverage(unittest.TestCase):
         "sam3d_body": ("body",),
         "sam3d_objects": ("objects",),
         "video_depth_anything": ("depth",),
+        "yolo11": ("detection",),
     }
 
     def test_declared_models_expose_the_hook(self):
@@ -2806,3 +2807,77 @@ class TestExtractInputFiles(unittest.TestCase):
                 _parse_input_files(
                     [f"a={root / 'gray.png'}", f"a={root / 'pm.npy'}"], self._parser()
                 )
+
+
+class TestYolo11StandardLoading(unittest.TestCase):
+    """yolo11 loads through the shared path with the same weights as before."""
+
+    CONFIG = {"model_type": "yolo11", "nc": 2, "ch": [256, 512, 512], "reg_max": 4}
+
+    @staticmethod
+    def _to_checkpoint_key(key, last):
+        """Canonical key -> Ultralytics key, dropping MLX's Sequential hops."""
+        parts = key.split(".")
+        if parts[0] == "detect":
+            out, rest = [f"model.{last}"], parts[1:]
+        else:
+            out, rest = [f"model.{parts[1]}"], parts[2:]
+        for index, segment in enumerate(rest):
+            if (
+                segment == "layers"
+                and index + 1 < len(rest)
+                and rest[index + 1].isdigit()
+            ):
+                continue
+            out.append(segment)
+        return ".".join(out)
+
+    def test_sanitize_places_every_weight_where_load_weights_does(self):
+        from mlx_vlm.models.yolo11 import YOLO11, Model, ModelConfig, load_weights
+
+        config = ModelConfig.from_dict(dict(self.CONFIG))
+        reference = Model(config)
+        reference.eval()
+        canonical = dict(tree_flatten(reference.parameters()))
+        self.assertGreater(len(canonical), 100)
+
+        last = len(reference.layers)
+        checkpoint = {
+            self._to_checkpoint_key(name, last): mx.random.normal(value.shape)
+            for name, value in canonical.items()
+        }
+        self.assertEqual(len(checkpoint), len(canonical))
+
+        legacy = YOLO11(nc=config.nc, ch=tuple(config.ch), reg_max=config.reg_max)
+        load_weights(legacy, checkpoint, prefix="model.")
+
+        standard = Model(config)
+        standard.load_weights(list(standard.sanitize(dict(checkpoint)).items()))
+        standard.eval()
+
+        expected = dict(tree_flatten(legacy.parameters()))
+        actual = dict(tree_flatten(standard.parameters()))
+        self.assertEqual(set(expected), set(actual))
+        for name, value in expected.items():
+            self.assertTrue(mx.array_equal(value, actual[name]).item(), name)
+
+    def test_loads_from_disk_and_extracts(self):
+        from mlx_vlm.extraction import extract
+        from mlx_vlm.models.yolo11 import Model, ModelConfig
+        from mlx_vlm.utils import load_model
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = Model(ModelConfig.from_dict(dict(self.CONFIG)))
+            mx.eval(model.parameters())
+            (root / "config.json").write_text(json.dumps(self.CONFIG))
+            mx.save_safetensors(
+                str(root / "model.safetensors"), dict(tree_flatten(model.parameters()))
+            )
+            loaded = load_model(root)
+            self.assertEqual(loaded.extraction_types, ("detection",))
+            outputs = extract(
+                loaded, None, (np.random.rand(160, 160, 3) * 255).astype(np.uint8)
+            )
+            self.assertEqual(sorted(outputs), ["boxes", "labels", "scores"])
+            self.assertEqual(np.asarray(outputs["boxes"]).shape[1], 4)
