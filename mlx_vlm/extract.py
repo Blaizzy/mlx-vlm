@@ -1,6 +1,7 @@
 """Run extraction models from the command line."""
 
 import argparse
+import ast
 import json
 from pathlib import Path
 
@@ -48,6 +49,29 @@ def _manifest(task, outputs):
     return {"task": task, "outputs": described}
 
 
+def _parse_settings(pairs, parser):
+    """Turn repeated NAME=VALUE arguments into keyword arguments."""
+    settings = {}
+    for item in pairs or []:
+        name, separator, raw = item.partition("=")
+        name = name.strip()
+        if not separator or not name:
+            parser.error(f"--set expects NAME=VALUE, got {item!r}")
+        if name in settings:
+            parser.error(f"--set {name} was given more than once")
+        lowered = raw.strip().lower()
+        if lowered in ("true", "false"):
+            settings[name] = lowered == "true"
+        elif lowered in ("none", "null"):
+            settings[name] = None
+        else:
+            try:
+                settings[name] = ast.literal_eval(raw)
+            except (ValueError, SyntaxError):
+                settings[name] = raw
+    return settings
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Predict structured outputs with MLX-VLM extraction models"
@@ -66,6 +90,12 @@ def main(argv=None):
     )
     parser.add_argument(
         "--list-tasks", action="store_true", help="Print the model's tasks and exit"
+    )
+    parser.add_argument(
+        "--set",
+        action="append",
+        metavar="NAME=VALUE",
+        help="Extra keyword for the model, repeatable (--set score_threshold=0.5)",
     )
     parser.add_argument(
         "--max-frames", type=int, default=-1, help="Cap frames read from --video"
@@ -95,10 +125,17 @@ def main(argv=None):
         parser.error(str(error))
 
     try:
-        extra = {"text_prompt": args.prompt} if args.prompt is not None else {}
+        extra = _parse_settings(args.set, parser)
+        if args.prompt is not None:
+            extra["text_prompt"] = args.prompt
         outputs = extract(model, processor, inputs, task=args.task, **extra)
     except ValueError as error:
         parser.error(str(error))
+    except TypeError as error:
+        # A mistyped --set name reaches the predictor as an unknown keyword.
+        if "unexpected keyword argument" not in str(error):
+            raise
+        parser.error(f"{error}; this model does not take that --set name")
 
     task = args.task if args.task is not None else tasks[0]
     if args.output is not None:

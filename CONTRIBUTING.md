@@ -84,7 +84,13 @@ command line:
 ```shell
 mlx_vlm extract --model <path> --image frame.png --output out.npz
 mlx_vlm extract --model <path> --list-tasks
+mlx_vlm extract --model <path> --image frame.png --set score_threshold=0.5
 ```
+
+`--set NAME=VALUE` is repeatable and forwards keywords to `extract_task`,
+so a model's own options need no flag of their own. Values are read as
+Python literals, with `true`, `false`, `none` and `null` accepted in any
+case.
 
 Add `extraction_api` to the model's `checks` with a `task`, an `input_shape`
 and the `outputs` it must name; `kwargs` and `config_overrides` are optional.

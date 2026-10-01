@@ -2654,3 +2654,56 @@ class TestRfdetrTwoStageSelection(unittest.TestCase):
         out = model(mx.random.normal((1, 112, 112, 3)))
         self.assertEqual(sorted(out), ["pred_boxes", "pred_logits"])
         self.assertEqual(out["pred_boxes"].shape[1], 16)
+
+
+class TestExtractSettings(unittest.TestCase):
+    """`--set NAME=VALUE` parses literals and rejects malformed input."""
+
+    def _parse(self, pairs):
+        import argparse
+
+        from mlx_vlm.extract import _parse_settings
+
+        parser = argparse.ArgumentParser()
+        return _parse_settings(pairs, parser)
+
+    def test_parses_literals_and_keeps_types(self):
+        cases = {
+            "score_threshold=0.5": ("score_threshold", 0.5),
+            "num_tokens=256": ("num_tokens", 256),
+            "neg=-1.5": ("neg", -1.5),
+            "sci=1e-3": ("sci", 0.001),
+            "bbox=[0, 0, 10, 10]": ("bbox", [0, 0, 10, 10]),
+            "d={'a': 1}": ("d", {"a": 1}),
+        }
+        for raw, (name, want) in cases.items():
+            got = self._parse([raw])[name]
+            self.assertEqual(got, want, raw)
+            self.assertIs(type(got), type(want), raw)
+
+    def test_booleans_and_none_are_not_left_as_strings(self):
+        # "false" as a string is truthy, which would silently invert a flag.
+        for raw, want in (
+            ("progress=false", False),
+            ("progress=False", False),
+            ("flip_test=TRUE", True),
+            ("x=none", None),
+            ("x=null", None),
+        ):
+            name = raw.split("=")[0]
+            self.assertIs(self._parse([raw])[name], want, raw)
+
+    def test_strings_values_with_equals_and_spaces(self):
+        self.assertEqual(self._parse(["prompt=a person"])["prompt"], "a person")
+        self.assertEqual(self._parse(["eq=a=b"])["eq"], "a=b")
+        self.assertEqual(self._parse([" pad =1"])["pad"], 1)
+        self.assertEqual(self._parse(["empty="])["empty"], "")
+
+    def test_empty_and_missing(self):
+        self.assertEqual(self._parse([]), {})
+        self.assertEqual(self._parse(None), {})
+
+    def test_rejects_malformed_and_duplicates(self):
+        for pairs in (["noequals"], ["=5"], ["a=1", "a=2"]):
+            with self.assertRaises(SystemExit):
+                self._parse(pairs)
