@@ -208,7 +208,6 @@ def distributed_worker():
             sharded.shard(group)
         mx.eval(sharded.parameters())
         assert sharded.head.weight.size * 2 == reference.head.weight.size
-        assert all(layer._decode is not None for layer in sharded.layers)
         for layer, original in zip(sharded.layers, reference.layers):
             for projection in ("gate_proj", "up_proj", "down_proj"):
                 assert (

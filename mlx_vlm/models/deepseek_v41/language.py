@@ -21,7 +21,6 @@ from ..switch_layers import SwitchGLU
 from .config import ModelConfig
 from .engram import Engram, EngramLayout, NgramHashState
 from .fakequant import fake_quant_fp4_e4m3, fake_quant_fp4_ue8m0, fake_quant_fp8_ue8m0
-from .masked_experts import masked_experts, supports_masked_experts
 from .sparse_attention import sparse_attention
 
 
@@ -495,11 +494,10 @@ class DeepseekV41MoE(nn.Module):
         self.sharding_group = None
 
     def _distributed_decode_experts(self, x, inds, scores):
-        """Keep small decode dispatch on-device and skip non-local affine routes.
+        """Keep small decode dispatch on-device with zero-weight non-local routes.
 
-        The affine kernel returns zero before loading non-local expert weights.
-        Other formats reuse local expert zero with zero weight. Both paths avoid
-        a route sort, scatter buffer, or variable-sized dispatch with CPU readback.
+        Non-local routes reuse local expert zero with zero weight, avoiding a
+        route sort, scatter buffer, or variable-sized dispatch with CPU readback.
         Weighting still precedes the BF16/FP8 down-projection rounding.
         """
         group = self.sharding_group
@@ -508,12 +506,7 @@ class DeepseekV41MoE(nn.Module):
         local = (inds >= start) & (inds < start + count)
         local_inds = mx.where(local, inds - start, 0)
         local_scores = mx.where(local, scores, 0)
-        if supports_masked_experts(self.switch_mlp, x, local_inds):
-            values = masked_experts(
-                self.switch_mlp, x, local_inds, local_scores, local
-            ).astype(mx.float32)
-        else:
-            values = self.switch_mlp(x, local_inds, local_scores).astype(mx.float32)
+        values = self.switch_mlp(x, local_inds, local_scores).astype(mx.float32)
         routed = mx.where(local[..., None], values, 0).sum(axis=-2)
         return mx.distributed.all_sum(routed, group=group)
 
@@ -954,7 +947,6 @@ class DeepseekV41Block(nn.Module):
     def __init__(self, config: ModelConfig, layer_idx: int, engram_layout=None):
         super().__init__()
         self.layer_idx = layer_idx
-        self._decode = None
         self.hc_mult = config.hc_mult
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
         self.hc_eps = config.hc_eps
@@ -1007,8 +999,6 @@ class DeepseekV41Block(nn.Module):
         image_mask: Optional[mx.array],
         cache: "DeepseekV41Cache",
     ):
-        if self._decode is not None and h.shape[1] == 1:
-            return self._decode(h, pre_mix, image_mask, cache)
         residual = h
         attn_pre, attn_post, attn_comb = self.hc_mixes(
             h, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
@@ -1449,15 +1439,6 @@ class LanguageModel(nn.Module):
             shard_inplace(self.head, lambda p, w: 0, group=group)
             self.head.sharding_group = group
         self._sharding_group = group
-        self.enable_decode_compilation()
-
-    def enable_decode_compilation(self):
-        """Compile fixed-shape decode regions without capturing mutable caches."""
-        from .decode import CompiledDecode
-
-        for layer in self.layers:
-            if layer._decode is None:
-                layer._decode = CompiledDecode(layer)
 
     def _ensure_engram_hash(self):
         """Build the n-gram hash state on first use from the checkpoint directory.
