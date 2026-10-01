@@ -998,7 +998,11 @@ def _checkpoint_loading(config, model_class, weights, *, side_effect=None):
         yield quantize
 
 
-def test_load_model_uses_deepseek_v4_fp8_quantization_config():
+@pytest.mark.parametrize("model_type", ["deepseek_v4", "deepseek_v41"])
+def test_load_model_uses_language_model_fp8_quantization_config(model_type):
+    module = importlib.import_module(f"mlx_vlm.models.{model_type}")
+    case = next(c for c in DATA["cases"] if c["module"] == model_type)
+    language_model = module.Model(build_config(module, case["config"])).language_model
 
     quantization = {
         "group_size": 64,
@@ -1008,17 +1012,15 @@ def test_load_model_uses_deepseek_v4_fp8_quantization_config():
     }
     with (
         patch(
-            "mlx_vlm.models.deepseek_v4.language.make_quantization_config",
+            f"mlx_vlm.models.{model_type}.language.make_quantization_config",
             return_value=quantization,
         ) as make_quantization_config,
         _checkpoint_loading(
             {
-                "model_type": "deepseek_v4",
+                "model_type": model_type,
                 "quantization_config": {"quant_method": "fp8"},
             },
-            lambda config: _CheckpointModel(
-                config, language_model=nn.Linear(2, 2, bias=False)
-            ),
+            lambda config: _CheckpointModel(config, language_model=language_model),
             {},
         ) as quantize,
     ):

@@ -989,9 +989,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         model_config.model_path = str(model_path)
 
     model = model_class.Model(model_config)
-    model._preserve_source_quantization = kwargs.pop(
-        "preserve_source_quantization", False
-    )
 
     quantization_config = config.get("quantization_config", None)
     if quantization_config is None:
@@ -1047,11 +1044,10 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 from .fp8 import transform_fp8_weights
 
                 weights, quantization = transform_fp8_weights(weights, config)
-                # TODO: Refactor DeepSeek-V4 to use the shared FP8 transform.
-                if quantization is None and config.get("model_type") == "deepseek_v4":
-                    from .models.deepseek_v4.language import make_quantization_config
-
-                    quantization = make_quantization_config(model)
+                if quantization is None:
+                    make_config = _language_model_quantization_config(model)
+                    if make_config is not None:
+                        quantization = make_config(model)
             elif (
                 quant_method == "modelopt"
                 and quantization_config.get("quant_algo") == "MXFP8"
@@ -1092,10 +1088,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             weights = sanitize_weights(
                 model_class.AudioModel, weights, model_config.audio_config
             )
-
-    if native_quantization := getattr(model, "_source_quantization", None):
-        config["quantization"] = native_quantization
-        config["quantization_config"] = native_quantization
 
     if (quantization := config.get("quantization", None)) is not None:
         # Handle legacy models which may or may not have vision quantized.
@@ -1339,14 +1331,13 @@ def sharded_load(
     repo,
     tensor_group: Optional[mx.distributed.Group] = None,
     pipeline_group: Optional[mx.distributed.Group] = None,
-    **kwargs,
 ):
     # Get model path with everything but weight safetensors
     model_path = get_model_path(repo)
 
     # Lazy load model to figure out what type of sharding we can do and which
     # weights we need to download.
-    model = load_model(model_path, lazy=True, strict=False, **kwargs)
+    model = load_model(model_path, lazy=True, strict=False)
     config = model.config.to_dict()
 
     has_tensor_parallel = hasattr(model, "shard")

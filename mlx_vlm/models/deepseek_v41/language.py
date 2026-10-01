@@ -15,6 +15,7 @@ from ..deepseek_v4.language import (
     DeepseekV4RoPE,
     _sparse_pooled_attention,
 )
+from ..deepseek_v4.language import make_quantization_config as _v4_quantization_config
 from ..mla import MultiLinear
 from ..switch_layers import SwitchGLU
 from .config import ModelConfig
@@ -22,6 +23,24 @@ from .engram import Engram, EngramLayout, NgramHashState
 from .fakequant import fake_quant_fp4_e4m3, fake_quant_fp4_ue8m0, fake_quant_fp8_ue8m0
 from .masked_experts import masked_experts, supports_masked_experts
 from .sparse_attention import sparse_attention
+
+
+def make_quantization_config(model):
+    """Native V4 expert/attention formats, plus V4.1's FP8 Engram projection."""
+    # The released V4.1 vision tower is BF16, including its attention weights.
+    quantization = {
+        path: params
+        for path, params in _v4_quantization_config(model).items()
+        if not isinstance(params, dict) or path.startswith("language_model.")
+    }
+    for i, layer in enumerate(model.language_model.layers):
+        if layer.engram is not None:
+            quantization[f"language_model.layers.{i}.engram.wkv"] = {
+                "group_size": 32,
+                "bits": 8,
+                "mode": "mxfp8",
+            }
+    return quantization
 
 
 def _index_cos_sin(length: int, rope_dim: int, theta: float, yarn: tuple):

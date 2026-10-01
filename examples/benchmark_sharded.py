@@ -45,7 +45,6 @@ def main():
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 2, 4, 8])
     parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--prefill-step-size", type=int, default=2048)
-    parser.add_argument("--preserve-source-quantization", action="store_true")
     parser.add_argument("--quality-smoke", action="store_true")
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
@@ -77,11 +76,7 @@ def main():
         mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
     mx.set_cache_limit(4 * 1024**3)
     mx.random.seed(0)
-    model, processor = sharded_load(
-        args.model,
-        tensor_group=group,
-        preserve_source_quantization=args.preserve_source_quantization,
-    )
+    model, processor = sharded_load(args.model, tensor_group=group)
     lm = model.language_model
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
     text_config = getattr(model.config, "text_config", model.config)
@@ -105,7 +100,6 @@ def main():
         kv_cache="unquantized",
         sampling="greedy",
         ignore_eos=True,
-        preserve_source_quantization=args.preserve_source_quantization,
     )
 
     if args.quality_smoke:

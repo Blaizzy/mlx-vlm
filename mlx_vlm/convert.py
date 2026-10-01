@@ -11,6 +11,7 @@ from mlx.utils import tree_map_with_path
 from .quant_utils import get_quantization_params
 from .utils import (
     MODEL_CONVERSION_DTYPES,
+    _language_model_quantization_config,
     create_model_card,
     fetch_from_hub,
     get_model_path,
@@ -38,18 +39,19 @@ def _preserve_existing_deepseek_v4_quantization(
     q_bits: Optional[int],
     q_mode: str,
 ):
-    quantization_config = config.get("quantization_config", {})
+    quantization_config = config.get("quantization_config") or (
+        config.get("text_config") or {}
+    ).get("quantization_config", {})
     if (
-        config.get("model_type") != "deepseek_v4"
+        config.get("model_type") not in ("deepseek_v4", "deepseek_v41")
         or "quantization" in config
         or not isinstance(quantization_config, dict)
         or quantization_config.get("quant_method") != "fp8"
     ):
         return
 
-    from .models.deepseek_v4.language import make_quantization_config
-
-    quantization = make_quantization_config(model)
+    make_config = _language_model_quantization_config(model)
+    quantization = make_config(model)
     quantization.update(get_quantization_params(q_group_size, q_bits, q_mode))
     config["quantization"] = quantization
     config["quantization_config"] = quantization

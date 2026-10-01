@@ -1040,9 +1040,10 @@ def test_quantize_module(
         assert config["quantization"] == defaults
 
 
-def test_convert_preserves_existing_deepseek_v4_quantization():
+@pytest.mark.parametrize("model_type", ["deepseek_v4", "deepseek_v41"])
+def test_convert_preserves_existing_deepseek_v4_quantization(model_type):
     config = {
-        "model_type": "deepseek_v4",
+        "model_type": model_type,
         "quantization_config": {"quant_method": "fp8"},
     }
     existing_quantization = {
@@ -1057,8 +1058,8 @@ def test_convert_preserves_existing_deepseek_v4_quantization():
     }
 
     with patch(
-        "mlx_vlm.models.deepseek_v4.language.make_quantization_config",
-        return_value=existing_quantization,
+        "mlx_vlm.convert._language_model_quantization_config",
+        return_value=MagicMock(return_value=existing_quantization),
     ):
         _preserve_existing_deepseek_v4_quantization(
             config, model=MagicMock(), q_group_size=64, q_bits=4, q_mode="affine"

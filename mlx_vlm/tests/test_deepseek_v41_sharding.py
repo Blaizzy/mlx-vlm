@@ -16,8 +16,9 @@ import pytest
 from mlx.utils import tree_flatten, tree_map
 
 from mlx_vlm.models.deepseek_v41 import Model, ModelConfig
+from mlx_vlm.models.deepseek_v41.deepseek_v41 import _pack_source_weight
 from mlx_vlm.models.deepseek_v41.engram import NgramHashState
-from mlx_vlm.models.deepseek_v41.language import LanguageModel
+from mlx_vlm.models.deepseek_v41.language import LanguageModel, make_quantization_config
 from mlx_vlm.tests.test_models import DATA
 from mlx_vlm.utils import load_model
 
@@ -49,14 +50,40 @@ def quantize_experts(model):
     nn.quantize(model, class_predicate=predicate)
 
 
-def test_native_checkpoint_keeps_packed_weights(tmp_path):
+NATIVE_QUANTIZATION = {
+    "quant_method": "fp8",
+    "activation_scheme": "dynamic",
+    "weight_block_size": [32, 32],
+    "scale_fmt": "ue8m0",
+    "expert_dtype": "fp4",
+}
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+def test_native_weight_repacking_preserves_bytes_and_block_scales(bits):
+    rows, dims = 33, 64
+    weight = mx.arange(rows * dims * bits // 8, dtype=mx.uint8).reshape(rows, -1)
+    scale_rows = rows if bits == 4 else 2
+    scales = mx.arange(scale_rows * 2, dtype=mx.uint8).reshape(scale_rows, 2)
+    packed, expanded, mode = _pack_source_weight(weight, scales)
+    assert packed.dtype == mx.uint32
+    assert packed.shape == (rows, dims * bits // 32)
+    assert mx.array_equal(packed.view(mx.uint8), weight).item()
+    expected = scales if bits == 4 else mx.repeat(scales, 32, axis=0)[:rows]
+    assert mx.array_equal(expanded, expected).item()
+    assert mode == f"mxfp{bits}"
+
+
+@pytest.mark.parametrize("nested_config", [False, True])
+def test_native_checkpoint_keeps_packed_weights(tmp_path, nested_config):
     mx.random.seed(9)
     model = Model(small_config())
     model.update(tree_map(lambda p: p.astype(mx.bfloat16), model.parameters()))
     model.language_model.head.weight = mx.random.normal(
         model.language_model.head.weight.shape
     )
-    quantize_experts(model)
+    quantization = make_quantization_config(model)
+    nn.quantize(model, class_predicate=lambda p, m: quantization.get(p, False))
     mx.eval(model.parameters())
     expected = dict(tree_flatten(model.parameters()))
     weights = {}
@@ -84,15 +111,66 @@ def test_native_checkpoint_keeps_packed_weights(tmp_path):
                 weights[f"{prefix}.{suffix}"] = value
         else:
             weights[name] = value
-    (tmp_path / "config.json").write_text(json.dumps(model.config.to_dict()))
+    config = model.config.to_dict()
+    if nested_config:
+        config["text_config"] = {"quantization_config": NATIVE_QUANTIZATION}
+    else:
+        config["quantization_config"] = NATIVE_QUANTIZATION
+    (tmp_path / "config.json").write_text(json.dumps(config))
     mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
-    loaded = load_model(tmp_path, preserve_source_quantization=True)
+    loaded = load_model(tmp_path)
     actual = dict(tree_flatten(loaded.parameters()))
     for name, value in expected.items():
         assert name in actual, name
         assert mx.array_equal(value, actual[name]).item(), name
     assert loaded.layers[0].ffn.switch_mlp.down_proj.mode == "mxfp4"
     assert loaded.layers[0].ffn.shared_experts.down_proj.mode == "mxfp8"
+    assert loaded.layers[0].attn.wq_a.mode == "mxfp8"
+    assert loaded.layers[1].engram.wkv.mode == "mxfp8"
+    assert not hasattr(loaded, "_source_quantization")
+    assert not hasattr(loaded, "_preserve_source_quantization")
+
+    # The converter must describe the already-native modules when it writes an
+    # MLX checkpoint, even if the requested default for other layers is affine4.
+    from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
+
+    _preserve_existing_deepseek_v4_quantization(config, loaded, 64, 4, "affine")
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), actual)
+    reloaded = dict(tree_flatten(load_model(tmp_path).parameters()))
+    assert actual.keys() == reloaded.keys()
+    for name, value in actual.items():
+        assert mx.array_equal(value, reloaded[name]).item(), name
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+def test_converted_checkpoint_keeps_declared_quantization(tmp_path, bits):
+    model = Model(small_config())
+    quantization = dict(group_size=64, bits=bits, mode="affine")
+    nn.quantize(
+        model,
+        **quantization,
+        class_predicate=lambda p, m: ".switch_mlp." in p and hasattr(m, "to_quantized"),
+    )
+    expected = dict(tree_flatten(model.parameters()))
+    config = model.config.to_dict()
+    config["quantization"] = quantization
+    # Converted checkpoints can retain the source metadata; the explicit MLX
+    # quantization config must win over the native checkpoint format.
+    config["quantization_config"] = NATIVE_QUANTIZATION
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), expected)
+    loaded = load_model(tmp_path)
+    actual = dict(tree_flatten(loaded.parameters()))
+    assert actual.keys() == expected.keys()
+    for name, value in expected.items():
+        assert mx.array_equal(value, actual[name]).item(), name
+    projection = loaded.layers[0].ffn.switch_mlp.down_proj
+    assert (projection.mode, projection.bits, projection.group_size) == (
+        "affine",
+        bits,
+        64,
+    )
 
 
 def test_invalid_shard_preserves_parameters():
