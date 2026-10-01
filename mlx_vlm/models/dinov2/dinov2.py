@@ -6,7 +6,6 @@ from typing import Dict, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
 from ..interpolate import resize_bicubic_nhwc, resize_bilinear_nhwc
 
@@ -322,7 +321,7 @@ class Model(DINOv2):
 
     def extract_task(self, processor, inputs, task="backbone", **kwargs):
         """Encode one image into patch tokens and a pooled embedding."""
-        pixels = mx.array(np.asarray(inputs))
+        pixels = mx.array(inputs)
         if pixels.ndim == 3:
             pixels = pixels[None]
         pixels = pixels.astype(mx.float32)
