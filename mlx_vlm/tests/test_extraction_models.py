@@ -2958,3 +2958,50 @@ class TestDetectionOutputsAcrossResultTypes(unittest.TestCase):
             sorted(k for k in named if k != "metadata"), ["boxes", "labels", "scores"]
         )
         self.assertEqual(named["metadata"]["class_names"], ["cat"])
+
+
+class TestSam3dBodyExtraction(unittest.TestCase):
+    """sam3d_body runs once its skeleton is a valid tree.
+
+    Its case carries no config because joint_parents is a checkpoint buffer
+    that defaults to zeros, which makes forward kinematics index an empty
+    list, so the topology is supplied here instead.
+    """
+
+    def test_extracts_body_geometry(self):
+        from mlx_vlm.extraction import extract
+        from mlx_vlm.models.sam3d_body.config import SAM3DConfig
+        from mlx_vlm.models.sam3d_body.model import SAM3DBody
+
+        config = SAM3DConfig(
+            embed_dim=64,
+            depth=1,
+            num_heads=2,
+            head_dim=32,
+            image_size=(64, 48),
+            num_storage_tokens=2,
+            decoder_dim=64,
+            decoder_depth=1,
+            decoder_heads=2,
+            decoder_head_dim=32,
+            decoder_mlp_dim=64,
+            prompt_embed_dim=64,
+        )
+        model = SAM3DBody(config)
+        model.eval()
+        model.head_pose.body_model.joint_parents = mx.array(
+            [-1] + list(range(config.num_joints - 1)), dtype=mx.int32
+        )
+        mx.eval(model.parameters())
+
+        self.assertEqual(model.extraction_types, ("body",))
+        image = (np.random.default_rng(0).random((64, 48, 3)) * 255).astype(np.uint8)
+        outputs = extract(model, None, image)
+        self.assertEqual(
+            sorted(k for k in outputs if k != "metadata"),
+            ["pred_camera", "pred_joint_coords", "pred_keypoints_3d", "pred_vertices"],
+        )
+        for name, value in outputs.items():
+            if name != "metadata":
+                self.assertIsInstance(value, (mx.array, np.ndarray), name)
+        self.assertIn("bbox", outputs["metadata"])

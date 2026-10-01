@@ -389,6 +389,18 @@
         "kwargs": { "ss_steps": 1, "slat_steps": 1, "formats": ["mesh"], "estimate_depth": false }
       },
       "checks": ["extraction_api"]
+    },
+    {
+      "id": "yolo11",
+      "module": "yolo11",
+      "config": { "nc": 2 },
+      "extraction_api": {
+        "task": "detection",
+        "input_shape": [160, 160, 3],
+        "outputs": ["boxes", "scores", "labels"],
+        "processor": "processing_yolo11.YOLO11Processor"
+      },
+      "checks": ["registry_and_config", "extraction_api"]
     }
   ],
   "shared_configs": {

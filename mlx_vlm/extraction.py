@@ -72,6 +72,21 @@ def detection_outputs(result) -> dict:
     return named
 
 
+def split_outputs(result: Mapping) -> dict:
+    """Name the array values and gather everything else under `METADATA`."""
+    arrays, extra = {}, {}
+    for name, value in result.items():
+        if name == METADATA and isinstance(value, Mapping):
+            extra.update(value)
+        elif isinstance(value, (mx.array, np.ndarray)):
+            arrays[name] = value
+        else:
+            extra[name] = value
+    if extra:
+        arrays[METADATA] = extra
+    return arrays
+
+
 def extract(model, processor, inputs, task=None, **kwargs):
     """Predict named structured outputs using a model's native extraction tasks."""
     supported = getattr(model, "extraction_types", ())

@@ -117,12 +117,6 @@ class Model(nn.Module):
         for name in ("mask", "pointmap"):
             if kwargs.get(name) is not None:
                 kwargs[name] = mx.array(kwargs[name])
-        result = Pipeline(self).generate(mx.array(inputs), **kwargs)
-        from ...extraction import METADATA
+        from ...extraction import split_outputs
 
-        arrays, extra = {}, {}
-        for name, value in result.items():
-            (arrays if isinstance(value, mx.array) else extra)[name] = value
-        if extra:
-            arrays[METADATA] = extra
-        return arrays
+        return split_outputs(Pipeline(self).generate(mx.array(inputs), **kwargs))
