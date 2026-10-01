@@ -1629,15 +1629,6 @@ class TestQwen3_5MoeText(unittest.TestCase):
 # DeepSeek-V4.1 regressions beyond the shared model contracts
 
 
-DEEPSEEK_V41_NATIVE_QUANTIZATION = {
-    "quant_method": "fp8",
-    "activation_scheme": "dynamic",
-    "weight_block_size": [32, 32],
-    "scale_fmt": "ue8m0",
-    "expert_dtype": "fp4",
-}
-
-
 def _quantize_deepseek_v41_experts(model):
     def predicate(path, module):
         if hasattr(module, "to_quantized") and any(
@@ -1689,12 +1680,13 @@ def test_deepseek_v41_native_checkpoint_keeps_packed_weights(tmp_path, nested_co
         else:
             weights[name] = value
     config = model.config.to_dict()
+    native_quantization = copy.deepcopy(
+        TINY_MODELS["deepseek_v41"]["native_quantization"]
+    )
     if nested_config:
-        config["text_config"] = {
-            "quantization_config": DEEPSEEK_V41_NATIVE_QUANTIZATION
-        }
+        config["text_config"] = {"quantization_config": native_quantization}
     else:
-        config["quantization_config"] = DEEPSEEK_V41_NATIVE_QUANTIZATION
+        config["quantization_config"] = native_quantization
     (tmp_path / "config.json").write_text(json.dumps(config))
     mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
     loaded = load_model(tmp_path)
@@ -1736,7 +1728,9 @@ def test_deepseek_v41_converted_checkpoint_keeps_declared_quantization(tmp_path,
     config["quantization"] = quantization
     # Converted checkpoints can retain the source metadata; the explicit MLX
     # quantization config must win over the native checkpoint format.
-    config["quantization_config"] = DEEPSEEK_V41_NATIVE_QUANTIZATION
+    config["quantization_config"] = copy.deepcopy(
+        TINY_MODELS["deepseek_v41"]["native_quantization"]
+    )
     (tmp_path / "config.json").write_text(json.dumps(config))
     mx.save_safetensors(str(tmp_path / "model.safetensors"), expected)
     loaded = load_model(tmp_path)

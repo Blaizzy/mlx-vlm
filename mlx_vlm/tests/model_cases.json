@@ -2519,6 +2519,13 @@
         "engram_compressed_vocab_size": 7,
         "image_token_id": 5
       },
+      "native_quantization": {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [32, 32],
+        "scale_fmt": "ue8m0",
+        "expert_dtype": "fp4"
+      },
       "distributed": {
         "sharded_weights": ["head.weight", "layers.*.ffn.switch_mlp.*.weight"],
         "tolerances": {"float32": 0.0002, "bfloat16": 0.06},
