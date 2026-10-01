@@ -980,6 +980,13 @@ def test_mog_head_inference_shapes_and_finite_values():
     assert bool(mx.all(mx.isfinite(logs)))
 
 
+@pytest.mark.parametrize("top_p", [1e-8, 1e-3, 0.7])
+def test_mog_top_p_keeps_most_likely_component(top_p):
+    # 1 - 1e-8 rounds to 1.0 in float32, which used to mask every component.
+    filtered = voicechat_tts._top_p_logits(mx.array([[0.0, 1.0, 3.0, 2.0]]), top_p)
+    assert (filtered > -mx.inf).tolist() == [[False, False, True, top_p == 0.7]]
+
+
 def test_model_creates_session_from_wrapped_tokenizer():
     vocabulary = {"hello": 0}
 
