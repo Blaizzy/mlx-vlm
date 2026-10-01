@@ -2427,3 +2427,84 @@ class TestExtractionCLI(unittest.TestCase):
         self.assertEqual(manifest["outputs"]["depth"]["shape"], [2, 3])
         self.assertEqual(manifest["outputs"]["depth"]["dtype"], "float32")
         json.dumps(manifest)
+
+
+class TestExtractionCoverage(unittest.TestCase):
+    """Every model that declares tasks is reachable through the shared API."""
+
+    DECLARED = {
+        "moge3": ("geometry",),
+        "rfdetr": ("detection",),
+        "rt_detr_v2": ("detection",),
+        "sam3": ("detection",),
+        "sam3d_body": ("body",),
+        "video_depth_anything": ("depth",),
+    }
+
+    def test_declared_models_expose_the_hook(self):
+        for name, tasks in self.DECLARED.items():
+            module = importlib.import_module(f"mlx_vlm.models.{name}")
+            model = module.Model
+            self.assertEqual(model.extraction_types, tasks, name)
+            self.assertTrue(callable(getattr(model, "extract_task", None)), name)
+
+    def test_sapiens2_derives_its_task_from_the_checkpoint(self):
+        from mlx_vlm.models.sapiens2 import Model
+
+        self.assertIsInstance(Model.extraction_types, property)
+
+    def test_detection_outputs_names_only_populated_fields(self):
+        from mlx_vlm.extraction import DetectionResult, detection_outputs
+
+        full = DetectionResult(
+            boxes=np.zeros((2, 4)),
+            scores=np.ones(2),
+            labels=np.zeros(2, dtype=np.int64),
+            class_names=["a", "b"],
+            masks=np.zeros((2, 3, 3)),
+            track_ids=np.zeros(2, dtype=np.int64),
+            label_names=["x", "y"],
+        )
+        self.assertEqual(
+            sorted(detection_outputs(full)),
+            [
+                "boxes",
+                "class_names",
+                "label_names",
+                "labels",
+                "masks",
+                "scores",
+                "track_ids",
+            ],
+        )
+        sparse = DetectionResult(boxes=np.zeros((1, 4)), scores=np.ones(1))
+        self.assertEqual(sorted(detection_outputs(sparse)), ["boxes", "scores"])
+
+    def test_sam3_requires_a_text_prompt(self):
+        from mlx_vlm.extraction import extract
+        from mlx_vlm.models.sam3 import Model
+
+        with self.assertRaisesRegex(ValueError, "requires text_prompt"):
+            extract(Model.__new__(Model), None, np.zeros((4, 4, 3)))
+
+    def test_cli_exposes_prompt_and_list_tasks(self):
+        from mlx_vlm import extract as cli
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original = cli.load
+            cli.load = lambda *a, **k: (
+                SimpleNamespace(extraction_types=("depth", "geometry")),
+                None,
+            )
+            try:
+                cli.main(["--model", "x", "--list-tasks"])  # no input required
+            finally:
+                cli.load = original
+
+    def test_server_accepts_an_extraction_preload_flag(self):
+        source = Path(
+            importlib.import_module("mlx_vlm.server.cli").__file__
+        ).read_text()
+        self.assertIn("--extraction-model", source)
+        self.assertIn("MLX_VLM_PRELOAD_EXTRACTION_MODEL", source)

@@ -73,6 +73,24 @@ case configs and `shared_configs`, keeping numerical, checkpoint conversion,
 streaming, and IO assertions in Python. Use nonuniform weights to verify
 conversion values and second-pass stability.
 
+An extraction model can also expose the shared prediction API. Declare the
+tasks it serves as `extraction_types` on the `Model` class and implement
+`extract_task(self, processor, inputs, task=None, **kwargs)` returning a
+mapping of named outputs, the way `decision_types` and `predict` work for
+decision models. `mlx_vlm.extraction.extract` validates the task against the
+declaration before the model runs, and `mlx_vlm extract` exposes it on the
+command line:
+
+```shell
+mlx_vlm extract --model <path> --image frame.png --output out.npz
+mlx_vlm extract --model <path> --list-tasks
+```
+
+Add `extraction_api` to the model's `checks` with a `task`, an `input_shape`
+and the `outputs` it must name; `kwargs` and `config_overrides` are optional.
+The check runs the model and asserts the declared outputs are present and
+finite, so a new model needs a case entry rather than a test of its own.
+
 From the repository root, you can run the tests with:
 
 ```shell

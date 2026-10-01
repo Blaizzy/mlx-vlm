@@ -41,13 +41,19 @@ def main(argv=None):
         description="Predict structured outputs with MLX-VLM extraction models"
     )
     parser.add_argument("--model", required=True, help="Model path or Hugging Face ID")
-    source = parser.add_mutually_exclusive_group(required=True)
+    source = parser.add_mutually_exclusive_group()
     source.add_argument(
         "--image", type=Path, action="append", help="Image path, repeatable for frames"
     )
     source.add_argument("--video", type=Path, help="Video path (requires cv2)")
     parser.add_argument(
         "--task", default=None, help="Task to request when a model serves several"
+    )
+    parser.add_argument(
+        "--prompt", default=None, help="Text prompt, for models that detect by concept"
+    )
+    parser.add_argument(
+        "--list-tasks", action="store_true", help="Print the model's tasks and exit"
     )
     parser.add_argument(
         "--max-frames", type=int, default=-1, help="Cap frames read from --video"
@@ -57,10 +63,16 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
+    if not args.list_tasks and args.image is None and args.video is None:
+        parser.error("one of --image or --video is required")
+
     model, processor = load(args.model)
     tasks = getattr(model, "extraction_types", ())
     if not tasks:
         parser.error(f"{args.model} does not support extraction prediction")
+    if args.list_tasks:
+        print(json.dumps({"tasks": list(tasks)}, indent=2))
+        return
     try:
         inputs = (
             _read_video(args.video, args.max_frames)
@@ -71,7 +83,8 @@ def main(argv=None):
         parser.error(str(error))
 
     try:
-        outputs = extract(model, processor, inputs, task=args.task)
+        extra = {"text_prompt": args.prompt} if args.prompt is not None else {}
+        outputs = extract(model, processor, inputs, task=args.task, **extra)
     except ValueError as error:
         parser.error(str(error))
 

@@ -44,6 +44,20 @@ def cxcywh_to_xyxy(boxes: Array) -> Array:
     return stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], axis=-1)
 
 
+def detection_outputs(result: "DetectionResult") -> dict:
+    """Name the populated fields of a detection result for `extract`."""
+    named = {"boxes": result.boxes, "scores": result.scores}
+    for field_name in ("labels", "masks", "track_ids"):
+        value = getattr(result, field_name)
+        if value is not None:
+            named[field_name] = value
+    if result.class_names:
+        named["class_names"] = result.class_names
+    if result.label_names is not None:
+        named["label_names"] = result.label_names
+    return named
+
+
 def extract(model, processor, inputs, task=None, **kwargs):
     """Predict named structured outputs using a model's native extraction tasks."""
     supported = getattr(model, "extraction_types", ())
