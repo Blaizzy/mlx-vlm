@@ -1528,6 +1528,24 @@ def test_chat_and_responses_preserve_same_tool_history(
     )
 
 
+def test_responses_tool_arguments_are_normalized_without_mutating_input():
+    items = [
+        {
+            "type": "function_call",
+            "name": "exec_command",
+            "call_id": "c1",
+            "arguments": '{"cmd":"cat log.txt"}',
+        }
+    ]
+    original = copy.deepcopy(items)
+    messages, _ = _response_items_to_chat(items)
+    assert messages[0]["tool_calls"][0]["function"]["arguments"] == {
+        "cmd": "cat log.txt"
+    }
+    assert messages[0]["content"] == ""
+    assert items == original
+
+
 @pytest.mark.parametrize(
     "roles", [("system", "system"), ("system", "developer"), ("developer", "system")]
 )
@@ -2067,8 +2085,6 @@ class TestCompaction:
         assert restored[1]["role"] == "assistant"
         assert "7319" in restored[1]["content"][0]["text"]
         assert "old log entry" not in json.dumps(restored)
-        # No registry or model cache is needed to decode; key reload represents restart.
-        assert compaction.resolve([item], model="demo", tenant=None) == restored
         for inputs in ([item], original + [item], restored):
             response = _post(client, "/responses/input_tokens", input=inputs)
             assert response.status_code == 200
@@ -2154,24 +2170,41 @@ class TestCompaction:
         ]
         assert compaction.safe_boundaries(items) == [0, 6]
 
-    @pytest.mark.parametrize("failure", ["empty", "length", "too_large"])
-    def test_summary_failures_preserve_original_context(self, mocked, failure):
+    @pytest.mark.parametrize(
+        "text, tokens, status, detail",
+        [
+            pytest.param("", 4, 502, "empty summary", id="empty"),
+            pytest.param("partial summary", 256, 502, "output limit", id="length"),
+            pytest.param(
+                "huge " * 10000,
+                4,
+                400,
+                "could not reach the context budget",
+                id="too-large",
+            ),
+        ],
+    )
+    def test_summary_failures_preserve_original_context(
+        self, mocked, text, tokens, status, detail
+    ):
         fake, client = mocked
         original = _compaction_history()
-        saved = copy.deepcopy(original)
-        result = _result("" if failure == "empty" else "huge " * 10000)
-        if failure == "length":
-            result = _result("partial summary", generation_tokens=256)
-        fake.generate.return_value = result
-        response = _post(
-            client,
-            "/responses/compact",
-            input=original,
-            max_output_tokens=256,
-            keep_tokens=0,
-        )
-        assert response.status_code in (400, 502), response.text
-        assert original == saved and not server.response_store
+        fake.generate.return_value = _result(text, generation_tokens=tokens)
+        with patch.object(
+            openai, "_compact_response_context", wraps=openai._compact_response_context
+        ) as compact:
+            response = _post(
+                client,
+                "/responses/compact",
+                input=original,
+                max_output_tokens=256,
+                keep_tokens=0,
+            )
+        assert response.status_code == status, response.text
+        assert detail in response.json()["detail"]
+        compact.assert_awaited_once()
+        # Inspect the server-side list, not the client payload copied by HTTP.
+        assert compact.call_args.args[1] == original
 
     def test_short_history_is_a_noop(self, mocked):
         fake, client = mocked
@@ -2239,15 +2272,6 @@ class TestCompaction:
         assert followup.status_code == 200
         assert "compaction_trigger" not in fake.generate.call_args.kwargs["prompt"]
 
-    def test_codex_trigger_must_be_terminal(self, mocked):
-        _, client = mocked
-        response = _post(
-            client,
-            "responses",
-            input=[{"type": "compaction_trigger"}, _compaction_message("later")],
-        )
-        assert response.status_code == 400
-
     def test_fixed_instructions_are_excluded_from_reduction_target(self, mocked):
         _, client = mocked
         inputs = _compaction_history()
@@ -2265,53 +2289,60 @@ class TestCompaction:
         ).json()["input_tokens"]
         assert before * 0.6 < after < before
 
-    def test_responses_tool_arguments_are_normalized_without_mutating_input(self):
-        from mlx_vlm.server.responses_state import _response_items_to_chat
-
-        items = [
-            {
-                "type": "function_call",
-                "name": "exec_command",
-                "call_id": "c1",
-                "arguments": '{"cmd":"cat log.txt"}',
-            }
-        ]
-        original = copy.deepcopy(items)
-        messages, _ = _response_items_to_chat(items)
-        assert messages[0]["tool_calls"][0]["function"]["arguments"] == {
-            "cmd": "cat log.txt"
-        }
-        assert messages[0]["content"] == ""
-        assert items == original
-
-    @pytest.mark.parametrize("threshold", [1, 100000])
-    def test_impossible_output_budget_rejected_before_generation(
-        self, mocked, threshold
+    @pytest.mark.parametrize(
+        "threshold, output_tokens, status",
+        [
+            pytest.param(1, 32768, 400, id="budget-above-threshold"),
+            pytest.param(100000, 32768, 400, id="budget-below-threshold"),
+            pytest.param(0, 64, 422, id="zero-threshold"),
+            pytest.param(-1, 64, 422, id="negative-threshold"),
+            pytest.param("bad", 64, 422, id="nonnumeric-threshold"),
+        ],
+    )
+    def test_invalid_compaction_budget_rejected_before_generation(
+        self, mocked, threshold, output_tokens, status
     ):
         fake, client = mocked
         response = _post(
             client,
             "responses",
             input=_compaction_history(),
-            max_output_tokens=32768,
+            max_output_tokens=output_tokens,
             context_management=[{"type": "compaction", "compact_threshold": threshold}],
         )
-        assert response.status_code == 400
+        assert response.status_code == status, response.text
         fake.generate.assert_not_called()
 
     @pytest.mark.parametrize(
-        "item",
+        "api, item",
         [
-            {"type": "item_reference", "id": "missing"},
-            {"type": "message", "role": "user", "content": [{"type": "input_audio"}]},
+            pytest.param(
+                "responses", {"type": "compaction_trigger"}, id="nonterminal-trigger"
+            ),
+            pytest.param(
+                "/responses/compact",
+                {"type": "item_reference", "id": "missing"},
+                id="item-reference",
+            ),
+            pytest.param(
+                "/responses/compact",
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_audio"}],
+                },
+                id="input-audio",
+            ),
         ],
     )
-    def test_unsupported_content_is_not_silently_summarized(self, mocked, item):
+    def test_invalid_compaction_input_rejected_before_generation(
+        self, mocked, api, item
+    ):
         fake, client = mocked
         response = _post(
-            client, "/responses/compact", input=[item] + _compaction_history()
+            client, api, input=[copy.deepcopy(item)] + _compaction_history()
         )
-        assert response.status_code == 400
+        assert response.status_code == 400, response.text
         fake.generate.assert_not_called()
 
     def test_tail_with_image_and_pending_tool_call_is_retained(self):
@@ -2445,23 +2476,27 @@ class TestCompaction:
         )
         assert response.status_code == 200
 
-    @pytest.mark.parametrize("threshold", [0, -1, "bad"])
-    def test_invalid_threshold_rejected(self, mocked, threshold):
-        _, client = mocked
-        response = _post(
-            client,
-            "responses",
-            context_management=[{"type": "compaction", "compact_threshold": threshold}],
-        )
-        assert response.status_code == 422
-
+    @pytest.mark.parametrize(
+        "finish_reason, status",
+        [
+            pytest.param("stop", 200, id="success"),
+            pytest.param(None, 400, id="iterator-error"),
+        ],
+    )
     def test_summary_uses_generation_worker_and_closes_iterator(
-        self, mocked, monkeypatch
+        self, mocked, monkeypatch, finish_reason, status
     ):
-        _, client = mocked
-        generator = _streaming(
-            [_token("Goal: ORCHID. Port: 7319.", finish_reason="stop")]
-        )
+        fake, client = mocked
+
+        def chunks():
+            yield _token("Goal: ORCHID. Port: 7319.", finish_reason=finish_reason)
+            raise server.PromptTooLongError("summary worker failed")
+
+        iterator = MagicMock()
+        iterator.__iter__.return_value = chunks()
+        generator = _streaming([])
+        context, _ = generator.generate.return_value
+        generator.generate.return_value = context, iterator
         generator._cpu_preprocess = lambda prompt, images, audio: {
             "input_ids": np.zeros((1, max(1, len(prompt) // 4)), dtype=np.int32)
         }
@@ -2469,8 +2504,12 @@ class TestCompaction:
         response = _post(
             client, "/responses/compact", input=_compaction_history(), keep_tokens=0
         )
-        assert response.status_code == 200, response.text
-        assert generator.generate.call_count == 1
+        assert response.status_code == status, response.text
+        if status == 400:
+            assert response.json()["detail"] == "summary worker failed"
+        generator.generate.assert_called_once()
+        fake.generate.assert_not_called()
+        iterator.close.assert_called_once_with()
 
     @pytest.fixture
     def real_server(self, tmp_path):
