@@ -2433,6 +2433,7 @@ class TestExtractionCoverage(unittest.TestCase):
     """Every model that declares tasks is reachable through the shared API."""
 
     DECLARED = {
+        "dinov2": ("backbone",),
         "moge3": ("geometry",),
         "rfdetr": ("detection",),
         "rt_detr_v2": ("detection",),

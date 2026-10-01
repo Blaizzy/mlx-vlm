@@ -147,7 +147,12 @@
         "pooler_output": [1, 32],
         "hidden_patch_tokens": [1, 16, 32]
       },
-      "checks": ["registry_and_config", "forward", "checkpoint"]
+      "extraction_api": {
+        "task": "backbone",
+        "input_shape": [64, 64, 3],
+        "outputs": ["last_hidden_state", "pooler_output", "hidden_patch_tokens"]
+      },
+      "checks": ["registry_and_config", "forward", "checkpoint", "extraction_api"]
     },
     {
       "id": "video_depth_anything",
