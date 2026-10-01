@@ -2508,3 +2508,36 @@ class TestExtractionCoverage(unittest.TestCase):
         ).read_text()
         self.assertIn("--extraction-model", source)
         self.assertIn("MLX_VLM_PRELOAD_EXTRACTION_MODEL", source)
+
+
+class TestExtractionPredictorWiring(unittest.TestCase):
+    """Each adapter hands its predictor the collaborator that predictor expects."""
+
+    def test_predictor_constructors_accept_what_the_adapters_pass(self):
+        import inspect
+
+        from mlx_vlm.models.rfdetr.generate import RFDETRPredictor
+        from mlx_vlm.models.rt_detr_v2.generate import RTDetrV2Predictor
+        from mlx_vlm.models.sam3.generate import Sam3Predictor
+
+        for predictor in (RFDETRPredictor, RTDetrV2Predictor, Sam3Predictor):
+            second = list(inspect.signature(predictor.__init__).parameters)[2]
+            self.assertEqual(second, "processor", predictor.__name__)
+
+    def test_sam3d_body_predictor_takes_a_config_not_a_processor(self):
+        import inspect
+
+        from mlx_vlm.models.sam3d_body.generate import SAM3DPredictor
+
+        # SAM3DPredictor.predict reads image_size/image_mean/image_std off its
+        # second argument, so the adapter must pass the model config.
+        self.assertEqual(
+            list(inspect.signature(SAM3DPredictor.__init__).parameters)[2], "config"
+        )
+        source = inspect.getsource(
+            importlib.import_module(
+                "mlx_vlm.models.sam3d_body.model"
+            ).SAM3DBody.extract_task
+        )
+        self.assertIn("self.config", source)
+        self.assertNotIn("SAM3DPredictor(self, processor)", source)

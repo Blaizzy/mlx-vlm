@@ -839,7 +839,7 @@ class SAM3DBody(nn.Module):
         """Estimate 3D body pose and shape for one image."""
         from .generate import SAM3DPredictor
 
-        return SAM3DPredictor(self, processor).predict(inputs, **kwargs)
+        return SAM3DPredictor(self, self.config).predict(inputs, **kwargs)
 
 
 # mlx-vlm convention alias
