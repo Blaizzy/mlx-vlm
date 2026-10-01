@@ -70,4 +70,5 @@ def register_routes(app, deps):
                 finish_reason="stop",
             )
         )
+        result["model"] = model_id
         return result

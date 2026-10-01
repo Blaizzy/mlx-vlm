@@ -4300,7 +4300,7 @@ def test_decisions_endpoint_uses_shared_prediction(client, kind):
             json={"model": "decision", "state": "text", "questions": questions},
         )
     assert response.status_code == 200
-    assert response.json() == result
+    assert response.json() == {**result, "model": "decision"}
     load.assert_called_once_with("decision", model_kind="decision")
     model.predict.assert_called_once_with(processor, "text", questions)
 
@@ -4402,6 +4402,7 @@ def test_decisions_default_model(client, monkeypatch, preloaded):
         )
     if preloaded:
         assert response.status_code == 200
+        assert response.json()["model"] == "preloaded"
         load.assert_called_once_with("preloaded", model_kind="decision")
     else:
         assert response.status_code == 400
@@ -4448,3 +4449,22 @@ def test_decisions_preserves_valid_threshold(client, threshold):
         )
     assert response.status_code == 200
     model.predict.assert_called_once_with(None, "text", questions)
+
+
+def test_decisions_generic_prediction_failure_returns_500(client):
+    model = NS(
+        decision_types=("bool",),
+        predict=MagicMock(side_effect=RuntimeError("boom")),
+    )
+    with patch.object(server, "get_cached_model", return_value=(model, None, {})):
+        response = client.post(
+            "/v1/decisions",
+            json={
+                "model": "decision",
+                "state": "text",
+                "questions": {"x": {"type": "bool"}},
+            },
+        )
+    assert response.status_code == 500
+    assert response.json()["detail"] == "Decision prediction failed"
+    model.predict.assert_called_once()
