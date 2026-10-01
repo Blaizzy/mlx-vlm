@@ -1247,6 +1247,7 @@ Structured outputs are not currently supported with speculative decoding.
 - `/models` and `/v1/models` - Discover cached and local models, including their loaded status; accepts repeated `model_dir` query parameters
 - `/chat/completions` and `/v1/chat/completions` - OpenAI-compatible chat-style interaction endpoint with support for images, audio, and text
 - `/responses` and `/v1/responses` - OpenAI-compatible responses endpoint
+- `/responses/compact` and `/v1/responses/compact` - Compact conversation history into replayable state; see [compaction and APC](docs/usage.md#conversation-compaction-and-apc)
 - `/embeddings` and `/v1/embeddings` - OpenAI-compatible embeddings endpoint backed by native MLX embedding models
 - `/v1/rerank` - Rank text or multimodal documents by relevance to a query
 - `/audio/speech` and `/v1/audio/speech` - OpenAI-compatible text-to-speech endpoint backed by `mlx-audio` TTS models

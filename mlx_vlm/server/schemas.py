@@ -336,6 +336,11 @@ class ChatMessage(FlexibleBaseModel):
         return self
 
 
+class CompactionControl(BaseModel):
+    type: Literal["compaction"]
+    compact_threshold: int = Field(..., gt=0)
+
+
 class OpenAIRequest(FlexibleBaseModel):
     """
     OpenAI-compatible request structure.
@@ -426,6 +431,13 @@ class OpenAIRequest(FlexibleBaseModel):
     store: Optional[bool] = Field(
         True, description="Whether to store this response for later retrieval."
     )
+    context_management: Optional[List[CompactionControl]] = Field(None, max_length=1)
+
+
+class CompactRequest(OpenAIRequest):
+    stream: Literal[False] = False
+    max_output_tokens: int = Field(1024, gt=0, le=16384)
+    keep_tokens: Optional[int] = Field(None, ge=0)
 
 
 class PromptTokensDetails(BaseModel):

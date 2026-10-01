@@ -746,11 +746,13 @@ def _append_response_item_to_prompt(
 
     if item_type in ("function_call", "shell_call", "apply_patch_call"):
         chat_messages.append(
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [_response_call_to_chat_tool_call(item)],
-            }
+            _normalize_tool_message(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_response_call_to_chat_tool_call(item)],
+                }
+            )
         )
         return
 
@@ -792,7 +794,16 @@ def _response_chain_items(previous_response_id: Optional[str]) -> List[Dict[str,
                     detail=f"Previous response not found: {current_id}",
                 )
             chain.append(stored)
-            current_id = stored.previous_response_id
+            # A self-contained compaction boundary no longer needs its older
+            # response chain, which may already have been evicted from the store.
+            current_id = (
+                None
+                if any(
+                    item.get("type") == "compaction"
+                    for item in stored.input_items + stored.output_items
+                )
+                else stored.previous_response_id
+            )
 
     items: List[Dict[str, Any]] = []
     for stored in reversed(chain):

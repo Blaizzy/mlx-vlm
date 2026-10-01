@@ -15,6 +15,7 @@ from typing import Any, List, Optional, Tuple
 import mlx.core as mx
 from fastapi import HTTPException, Request
 from fastapi.responses import StreamingResponse
+from pydantic import ValidationError
 
 from ..generate import generate, stream_generate
 from ..generate.edit_image import ImageEditRequest as CoreImageEditRequest
@@ -34,11 +35,13 @@ from ..tools import (
     process_tool_calls,
 )
 from ..utils import prepare_inputs
+from . import compaction
 from .generation import (
     GenerationMetrics,
     PromptTooLongError,
     _build_metrics_envelope,
     _count_prompt_tokens,
+    get_configured_context_limit,
 )
 from .responses_state import (
     ToolCallStreamState,
@@ -67,6 +70,7 @@ from .schemas import (
     ChatResponse,
     ChatStreamChoice,
     ChatStreamChunk,
+    CompactRequest,
     ContentPartOutputText,
     GenerationTimings,
     ImageEditRequest,
@@ -320,6 +324,10 @@ def register_routes(app, deps):
     _make_logprob_content = deps.make_logprob_content
 
     app.post("/responses/input_tokens")(responses_input_tokens_endpoint)
+    app.post("/responses/compact")(responses_compact_endpoint)
+    app.post("/v1/responses/compact", include_in_schema=False)(
+        responses_compact_endpoint
+    )
     app.post("/v1/responses/input_tokens", include_in_schema=False)(
         responses_input_tokens_endpoint
     )
@@ -714,15 +722,26 @@ async def images_edits_endpoint(request: Request):
         raise HTTPException(status_code=500, detail=f"Image edit failed: {e}")
 
 
+def _parse_response_request(body):
+    try:
+        return OpenAIRequest(**body)
+    except ValidationError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
 async def responses_input_tokens_endpoint(request: Request):
     body = await request.json()
-    openai_request = OpenAIRequest(**body)
+    openai_request = _parse_response_request(body)
     try:
         current_input_items = _normalize_response_input(openai_request.input)
         prompt_items = (
             _response_chain_items(openai_request.previous_response_id)
             + current_input_items
         )
+        prompt_items = compaction.resolve(
+            prompt_items, model=openai_request.model, tenant=_read_tenant_id(request)
+        )
+        prompt_items, _ = compaction.split_trigger(prompt_items)
         chat_messages, images = _response_items_to_chat(prompt_items)
         _normalize_instruction_messages(
             chat_messages,
@@ -769,6 +788,288 @@ async def responses_input_tokens_endpoint(request: Request):
         raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+def _compaction_context_limit(config):
+    configured = get_configured_context_limit()
+    text_config = (
+        config.get("text_config")
+        if isinstance(config, dict)
+        else getattr(config, "text_config", None)
+    ) or config
+    model_limit = (
+        text_config.get("max_position_embeddings")
+        if isinstance(text_config, dict)
+        else getattr(text_config, "max_position_embeddings", None)
+    )
+    limits = [
+        int(x)
+        for x in (configured, model_limit)
+        if isinstance(x, (int, float)) and x > 0
+    ]
+    if not limits:
+        raise HTTPException(
+            400, "Compaction requires a model context limit or MAX_KV_SIZE."
+        )
+    return min(limits)
+
+
+async def _compact_response_context(
+    request, items, model, processor, config, tenant, *, automatic=False
+):
+    """Use the ordinary rendering and inference paths, including their APC pool."""
+    compaction.validate_items(items)
+    limit = _compaction_context_limit(config)
+    args = _build_gen_args(request, processor, tenant_id=tenant)
+    tools, _ = _response_tool_registry(request.tools)
+
+    def render(context, generation_args=args):
+        messages, images = _response_items_to_chat(context)
+        _normalize_instruction_messages(messages, request.instructions)
+        options = generation_args.to_template_kwargs()
+        if request.tool_choice is not None:
+            options["tool_choice"] = request.tool_choice
+        prompt = apply_chat_template(
+            processor,
+            config,
+            messages,
+            num_images=len(images),
+            tools=tools or None,
+            **options,
+        )
+        return prompt, images
+
+    async def count_prompt(prompt, images):
+        if runtime.response_generator is not None:
+            raw = await asyncio.to_thread(
+                runtime.response_generator._cpu_preprocess, prompt, images or None, None
+            )
+        else:
+            raw = await asyncio.to_thread(
+                prepare_inputs,
+                processor,
+                images=images or None,
+                prompts=prompt,
+                image_token_index=getattr(config, "image_token_index", None),
+            )
+        return _count_prompt_tokens(raw)
+
+    async def count(context):
+        return await count_prompt(*render(context))
+
+    before = await count(items)
+    if before > limit:
+        raise HTTPException(
+            400, "Compaction input must fit within the model context window."
+        )
+    summary_tokens = (
+        min(1024, max(128, limit // 16)) if automatic else request.max_output_tokens
+    )
+    reserve = request.max_output_tokens if automatic else summary_tokens
+    available = limit - reserve
+    if reserve <= 0 or available <= 0:
+        raise HTTPException(
+            400, "Output reservation leaves no room for compacted context."
+        )
+    if automatic and before < request.context_management[0].compact_threshold:
+        if before > available:
+            raise HTTPException(
+                400,
+                "Input plus output exceeds the context budget; lower compact_threshold.",
+            )
+        return compaction.CompactedContext(items, before, before)
+    summary_request = request.model_copy(
+        update={
+            "max_output_tokens": summary_tokens,
+            "max_tokens": summary_tokens,
+            "temperature": 0.0,
+            "enable_thinking": False,
+            "reasoning": None,
+            "reasoning_effort": None,
+            "thinking_budget": None,
+            "response_format": None,
+            "text": None,
+        }
+    )
+    summary_args = _build_gen_args(summary_request, processor, tenant_id=tenant)
+
+    async def summarize(head):
+        prompt, images = render(
+            head
+            + [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": compaction.SUMMARY_INSTRUCTION,
+                }
+            ],
+            summary_args,
+        )
+        if await count_prompt(prompt, images) + summary_tokens > limit:
+            raise HTTPException(
+                400, "Compaction summary request needs more context headroom."
+            )
+
+        def run():
+            metrics = GenerationMetrics()
+            if runtime.response_generator is not None:
+                context, iterator = runtime.response_generator.generate(
+                    prompt=prompt, images=images or None, args=summary_args
+                )
+                pieces = []
+                finish = None
+                try:
+                    for token in iterator:
+                        pieces.append(token.text)
+                        metrics.record_chunk(token)
+                        if token.finish_reason:
+                            finish = token.finish_reason
+                            break
+                finally:
+                    close = getattr(iterator, "close", None)
+                    if close is not None:
+                        close()
+                text, prompt_tokens, output_tokens = (
+                    "".join(pieces),
+                    context.prompt_tokens,
+                    metrics.generated_tokens,
+                )
+            else:
+                result = generate(
+                    model=model,
+                    processor=processor,
+                    prompt=prompt,
+                    image=images,
+                    vision_cache=runtime.model_cache.get("vision_cache"),
+                    apc_manager=runtime.apc_manager,
+                    **summary_args.to_generate_kwargs(),
+                )
+                metrics.record_result(result)
+                text, prompt_tokens, output_tokens = (
+                    result.text,
+                    result.prompt_tokens,
+                    result.generation_tokens,
+                )
+                finish = getattr(result, "finish_reason", None)
+            if finish == "length" or (
+                finish is None and output_tokens >= summary_tokens
+            ):
+                raise HTTPException(
+                    502,
+                    "Compaction summary hit its output limit; original context preserved.",
+                )
+            _, content, _, _ = _response_output_items_from_text(
+                text,
+                "summary",
+                None,
+                [],
+                {},
+                summary_args.thinking_start_token,
+                summary_args.thinking_end_token,
+                processor=processor,
+            )
+            return content, OpenAIUsage.from_metrics(
+                metrics, prompt_tokens, output_tokens
+            )
+
+        try:
+            return await asyncio.to_thread(run)
+        except PromptTooLongError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    target = available
+    keep = request.keep_tokens if isinstance(request, CompactRequest) else None
+    if keep is None:
+        keep = min(8192, max(256, min(available, int(before * 0.6)) // 2))
+    result = await compaction.compact(
+        items, count=count, summarize=summarize, keep_tokens=keep, target_tokens=target
+    )
+    if result.after_tokens > available:
+        raise HTTPException(
+            400, "Protected conversation exceeds the available context budget."
+        )
+    return result
+
+
+async def responses_compact_endpoint(http_request: Request, request: CompactRequest):
+    tenant = _read_tenant_id(http_request)
+    items = compaction.resolve(
+        _response_chain_items(request.previous_response_id)
+        + _normalize_response_input(request.input),
+        model=request.model,
+        tenant=tenant,
+    )
+    model, processor, config = get_cached_model(
+        request.model, _adapter_path_or_inherit(request)
+    )
+    result = await _compact_response_context(
+        request, items, model, processor, config, tenant
+    )
+    output = (
+        [compaction.seal(result.items, model=request.model, tenant=tenant)]
+        if result.changed
+        else items
+    )
+    return {
+        "id": f"resp_{uuid.uuid4().hex}",
+        "object": "response.compaction",
+        "created_at": int(time.time()),
+        "output": output,
+        "usage": (
+            result.usage or OpenAIUsage(input_tokens=0, output_tokens=0, total_tokens=0)
+        ).model_dump(),
+    }
+
+
+async def _responses_compaction_trigger(request, items, tenant):
+    """Return the single opaque output expected by Codex compaction v2."""
+    model, processor, config = get_cached_model(
+        request.model, _adapter_path_or_inherit(request)
+    )
+    compact_request = CompactRequest(
+        **{
+            **request.model_dump(),
+            "stream": False,
+            "max_output_tokens": 1024,
+        }
+    )
+    result = await _compact_response_context(
+        compact_request, items, model, processor, config, tenant
+    )
+    capsule = compaction.seal(result.items, model=request.model, tenant=tenant)
+    response = OpenAIResponse(
+        id=f"resp_{uuid.uuid4().hex}",
+        created_at=int(time.time()),
+        object="response",
+        status="completed",
+        model=request.model,
+        output=[capsule],
+        output_text="",
+        usage=result.usage
+        or OpenAIUsage(input_tokens=0, output_tokens=0, total_tokens=0),
+        store=request.store,
+        previous_response_id=request.previous_response_id,
+    )
+    _store_response(response, items, [capsule], request.previous_response_id)
+    if not request.stream:
+        return response
+
+    async def events():
+        pending = response.model_copy(update={"status": "in_progress", "output": []})
+        for kind in ("response.created", "response.in_progress"):
+            yield _response_sse_event(
+                kind, {"type": kind, "response": pending.model_dump()}
+            )
+        for kind in ("response.output_item.added", "response.output_item.done"):
+            yield _response_sse_event(
+                kind, {"type": kind, "output_index": 0, "item": capsule}
+            )
+        yield _response_sse_event(
+            "response.completed",
+            {"type": "response.completed", "response": response.model_dump()},
+        )
+
+    return StreamingResponse(events(), media_type="text/event-stream")
 
 
 async def responses_retrieve_endpoint(response_id: str):
@@ -870,7 +1171,7 @@ async def responses_endpoint(request: Request):
 
     request_start = time.perf_counter()
     body = await request.json()
-    openai_request = OpenAIRequest(**body)
+    openai_request = _parse_response_request(body)
 
     try:
         kwargs = {}
@@ -884,6 +1185,36 @@ async def responses_endpoint(request: Request):
             _response_chain_items(openai_request.previous_response_id)
             + current_input_items
         )
+        tenant = _read_tenant_id(request)
+        prompt_items = compaction.resolve(
+            prompt_items, model=openai_request.model, tenant=tenant
+        )
+        prompt_items, triggered = compaction.split_trigger(prompt_items)
+        if triggered:
+            return await _responses_compaction_trigger(
+                openai_request, prompt_items, tenant
+            )
+        compaction_output = []
+        if openai_request.context_management:
+            model, processor, config = get_cached_model(
+                openai_request.model, _adapter_path_or_inherit(openai_request)
+            )
+            compacted = await _compact_response_context(
+                openai_request,
+                prompt_items,
+                model,
+                processor,
+                config,
+                tenant,
+                automatic=True,
+            )
+            if compacted.changed:
+                prompt_items = compacted.items
+                compaction_output = [
+                    compaction.seal(
+                        prompt_items, model=openai_request.model, tenant=tenant
+                    )
+                ]
         chat_messages, images = _response_items_to_chat(prompt_items)
         instructions = _normalize_instruction_messages(
             chat_messages,
@@ -988,6 +1319,20 @@ async def responses_endpoint(request: Request):
                     # Send response.in_progress event  (to match the openai pipeline)
                     yield f"event: response.in_progress\ndata: {ResponseInProgressEvent(type='response.in_progress', response=base_response).model_dump_json()}\n\n"
 
+                    for index, item in enumerate(compaction_output):
+                        for event_type in (
+                            "response.output_item.added",
+                            "response.output_item.done",
+                        ):
+                            yield _response_sse_event(
+                                event_type,
+                                {
+                                    "type": event_type,
+                                    "output_index": index,
+                                    "item": item,
+                                },
+                            )
+
                     # Send response.output_item.added event  (to match the openai pipeline)
                     message_item = MessageItem(
                         id=message_id,
@@ -996,13 +1341,13 @@ async def responses_endpoint(request: Request):
                         role="assistant",
                         content=[],
                     )
-                    yield f"event: response.output_item.added\ndata: {ResponseOutputItemAddedEvent(type='response.output_item.added', output_index=0, item=message_item).model_dump_json()}\n\n"
+                    yield f"event: response.output_item.added\ndata: {ResponseOutputItemAddedEvent(type='response.output_item.added', output_index=len(compaction_output), item=message_item).model_dump_json()}\n\n"
 
                     # Send response.content_part.added event
                     content_part = ContentPartOutputText(
                         type="output_text", text="", annotations=[]
                     )
-                    yield f"event: response.content_part.added\ndata: {ResponseContentPartAddedEvent(type='response.content_part.added', item_id=message_id, output_index=0, content_index=0, part=content_part).model_dump_json()}\n\n"
+                    yield f"event: response.content_part.added\ndata: {ResponseContentPartAddedEvent(type='response.content_part.added', item_id=message_id, output_index=len(compaction_output), content_index=0, part=content_part).model_dump_json()}\n\n"
 
                     # Stream text deltas using ResponseGenerator (continuous batching)
                     full_text = ""
@@ -1071,7 +1416,7 @@ async def responses_endpoint(request: Request):
                                         "type": "response.reasoning_text.delta",
                                         "response_id": response_id,
                                         "item_id": reasoning_item_id,
-                                        "output_index": 0,
+                                        "output_index": len(compaction_output),
                                         "content_index": 0,
                                         "delta": thinking_delta.reasoning,
                                         "timings": {"predicted_per_second": chunk_rate},
@@ -1087,7 +1432,7 @@ async def responses_endpoint(request: Request):
                             }
 
                             if delta:
-                                yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta, timings=StreamingTimings(predicted_per_second=chunk_rate)).model_dump_json()}\n\n"
+                                yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=len(compaction_output), content_index=0, delta=delta, timings=StreamingTimings(predicted_per_second=chunk_rate)).model_dump_json()}\n\n"
                                 await asyncio.sleep(0.01)
 
                             if token.finish_reason:
@@ -1125,7 +1470,7 @@ async def responses_endpoint(request: Request):
                                         "type": "response.reasoning_text.delta",
                                         "response_id": response_id,
                                         "item_id": reasoning_item_id,
-                                        "output_index": 0,
+                                        "output_index": len(compaction_output),
                                         "content_index": 0,
                                         "delta": thinking_delta.reasoning,
                                         "timings": {"predicted_per_second": chunk_rate},
@@ -1141,7 +1486,7 @@ async def responses_endpoint(request: Request):
                             }
 
                             if delta:
-                                yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta, timings=StreamingTimings(predicted_per_second=chunk_rate)).model_dump_json()}\n\n"
+                                yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=len(compaction_output), content_index=0, delta=delta, timings=StreamingTimings(predicted_per_second=chunk_rate)).model_dump_json()}\n\n"
                                 await asyncio.sleep(0.01)
 
                     tail_reasoning, tail = finish_content_streams(
@@ -1155,13 +1500,13 @@ async def responses_endpoint(request: Request):
                                 "type": "response.reasoning_text.delta",
                                 "response_id": response_id,
                                 "item_id": reasoning_item_id,
-                                "output_index": 0,
+                                "output_index": len(compaction_output),
                                 "content_index": 0,
                                 "delta": tail_reasoning,
                             },
                         )
                     if tail:
-                        yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=tail, timings=StreamingTimings(predicted_per_second=metrics.rate)).model_dump_json()}\n\n"
+                        yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=len(compaction_output), content_index=0, delta=tail, timings=StreamingTimings(predicted_per_second=metrics.rate)).model_dump_json()}\n\n"
 
                     output_items, clean_text, _, output_finish_reason = (
                         _response_output_items_from_text(
@@ -1191,20 +1536,20 @@ async def responses_endpoint(request: Request):
                                 "type": "response.reasoning_text.done",
                                 "response_id": response_id,
                                 "item_id": reasoning_item_id,
-                                "output_index": 0,
+                                "output_index": len(compaction_output),
                                 "content_index": 0,
                                 "text": streamed_reasoning,
                             },
                         )
 
                     # Send response.output_text.done event (to match the openai pipeline)
-                    yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=0, content_index=0, text=clean_text, timings=StreamingTimings(predicted_per_second=metrics.rate)).model_dump_json()}\n\n"
+                    yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=len(compaction_output), content_index=0, text=clean_text, timings=StreamingTimings(predicted_per_second=metrics.rate)).model_dump_json()}\n\n"
 
                     # Send response.content_part.done event (to match the openai pipeline)
                     final_content_part = ContentPartOutputText(
                         type="output_text", text=clean_text, annotations=[]
                     )
-                    yield f"event: response.content_part.done\ndata: {ResponseContentPartDoneEvent(type='response.content_part.done', item_id=message_id, output_index=0, content_index=0, part=final_content_part).model_dump_json()}\n\n"
+                    yield f"event: response.content_part.done\ndata: {ResponseContentPartDoneEvent(type='response.content_part.done', item_id=message_id, output_index=len(compaction_output), content_index=0, part=final_content_part).model_dump_json()}\n\n"
 
                     # Send response.output_item.done event (to match the openai pipeline)
                     final_message_item = MessageItem(
@@ -1222,9 +1567,9 @@ async def responses_endpoint(request: Request):
                         if message_output_items
                         else final_message_item.model_dump()
                     )
-                    yield f"event: response.output_item.done\ndata: {ResponseOutputItemDoneEvent(type='response.output_item.done', output_index=0, item=final_message_payload).model_dump_json()}\n\n"
+                    yield f"event: response.output_item.done\ndata: {ResponseOutputItemDoneEvent(type='response.output_item.done', output_index=len(compaction_output), item=final_message_payload).model_dump_json()}\n\n"
 
-                    completed_output = []
+                    completed_output = list(compaction_output)
                     completed_output.extend(reasoning_output_items)
                     if message_output_items:
                         completed_output.extend(message_output_items)
@@ -1438,6 +1783,7 @@ async def responses_endpoint(request: Request):
                 if output_finish_reason == "tool_calls":
                     finish_reason = "tool_calls"
 
+                output_items = compaction_output + output_items
                 response = OpenAIResponse(
                     id=response_id,
                     object="response",
