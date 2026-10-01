@@ -460,6 +460,12 @@ class Transformer(nn.Module):
 
         # Top-K selection by max class score
         max_scores = cls_logits.max(axis=-1)  # (B, HW)
+        if max_scores.shape[-1] < num_queries:
+            raise ValueError(
+                f"Two-stage selection needs at least num_queries ({num_queries}) "
+                f"encoder tokens but the input produced {max_scores.shape[-1]}; "
+                "use a larger image or a smaller num_queries"
+            )
         topk_indices = mx.argpartition(-max_scores, kth=num_queries, axis=-1)[
             :, :num_queries
         ]

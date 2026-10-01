@@ -2633,3 +2633,24 @@ class TestExtractionContractGuards(unittest.TestCase):
                 return {"task": task}
 
         self.assertEqual(extract(Listly(), None, "x"), {"task": "depth"})
+
+
+class TestRfdetrTwoStageSelection(unittest.TestCase):
+    """Two-stage selection names its constraint instead of failing in argpartition."""
+
+    def test_too_few_tokens_reports_the_constraint(self):
+        from mlx_vlm.models.rfdetr import Model, ModelConfig
+
+        model = Model(ModelConfig())
+        model.eval()
+        with self.assertRaisesRegex(ValueError, "encoder tokens"):
+            model(mx.random.normal((1, 224, 224, 3)))
+
+    def test_a_small_configuration_still_forwards(self):
+        from mlx_vlm.models.rfdetr import Model, ModelConfig
+
+        model = Model(ModelConfig(num_queries=16))
+        model.eval()
+        out = model(mx.random.normal((1, 112, 112, 3)))
+        self.assertEqual(sorted(out), ["pred_boxes", "pred_logits"])
+        self.assertEqual(out["pred_boxes"].shape[1], 16)
