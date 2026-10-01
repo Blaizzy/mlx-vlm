@@ -2589,3 +2589,18 @@ class TestExtractionCLIOutputs(unittest.TestCase):
             loaded = np.load(target)  # default: allow_pickle=False
             self.assertEqual(sorted(loaded.keys()), ["depth", "flag"])
             self.assertEqual(loaded["depth"].shape, (2, 2))
+
+
+class TestSam3dBodyRayConditioning(unittest.TestCase):
+    """Ray conditioning width follows embed_dim instead of a fixed 1379."""
+
+    def test_width_is_embed_dim_plus_the_ray_encoding(self):
+        from mlx_vlm.models.sam3d_body.config import SAM3DConfig
+        from mlx_vlm.models.sam3d_body.model import RAY_ENCODING_CHANNELS, SAM3DBody
+
+        self.assertEqual(1280 + RAY_ENCODING_CHANNELS, 1379)  # production, unchanged
+
+        small = SAM3DBody(SAM3DConfig(embed_dim=64, depth=1, num_heads=2, head_dim=32))
+        conv = small.ray_cond_emb.conv
+        self.assertEqual(conv.weight.shape[-1], 64 + RAY_ENCODING_CHANNELS)
+        self.assertEqual(conv.weight.shape[0], 64)

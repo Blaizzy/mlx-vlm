@@ -33,6 +33,9 @@ class CameraHead(nn.Module):
         return pred
 
 
+RAY_ENCODING_CHANNELS = 99
+
+
 class RayConditionEmbedding(nn.Module):
     """Adds camera ray conditioning to image features.
 
@@ -238,7 +241,11 @@ class SAM3DBody(nn.Module):
         )
 
         # Ray conditioning
-        self.ray_cond_emb = RayConditionEmbedding(config.embed_dim, 1379)
+        # Rays are Fourier-encoded to 99 channels and concatenated with the
+        # backbone features, so the 1x1 conv sees embed_dim + 99.
+        self.ray_cond_emb = RayConditionEmbedding(
+            config.embed_dim, config.embed_dim + RAY_ENCODING_CHANNELS
+        )
 
     def compute_ray_map(self, bbox, img_size, cam_int):
         """Compute camera ray map for the cropped image region.
