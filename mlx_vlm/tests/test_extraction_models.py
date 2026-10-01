@@ -1966,13 +1966,20 @@ class ExtractionChecks:
         module = importlib.import_module(f"mlx_vlm.models.{case['module']}")
         model = module.Model(module.ModelConfig.from_dict(config))
         model.eval()
+        processor = None
+        if spec.get("processor"):
+            where, _, name = spec["processor"].rpartition(".")
+            processor = getattr(
+                importlib.import_module(f"mlx_vlm.models.{case['module']}.{where}"),
+                name,
+            )()
 
         assert spec["task"] in model.extraction_types
         mx.random.seed(0)
         inputs = (np.random.default_rng(0).random(spec["input_shape"]) * 255).astype(
             np.uint8
         )
-        outputs = extract(model, None, inputs, **(spec.get("kwargs") or {}))
+        outputs = extract(model, processor, inputs, **(spec.get("kwargs") or {}))
         assert set(spec["outputs"]) <= set(outputs), sorted(outputs)
         # Geometry models leave masked-out pixels infinite, so only the valid
         # region is required to be finite.
@@ -1980,13 +1987,15 @@ class ExtractionChecks:
         mask = None if mask is None else np.asarray(mask).astype(bool)
         for name in spec["outputs"]:
             value = np.asarray(outputs[name])
+            if value.dtype == object or not np.issubdtype(value.dtype, np.number):
+                continue  # structured outputs such as a mesh or a pose dict
             if mask is not None and value.shape[: mask.ndim] == mask.shape:
                 value = value[mask]
             assert value.size == 0 or np.all(np.isfinite(value)), name
         with pytest.raises(ValueError, match="does not support"):
-            extract(model, None, inputs, task="not-a-real-task")
+            extract(model, processor, inputs, task="not-a-real-task")
         with pytest.raises(ValueError, match="requires inputs"):
-            extract(model, None, None)
+            extract(model, processor, None)
 
     def registry_and_config(self, case):
         name = case["module"]

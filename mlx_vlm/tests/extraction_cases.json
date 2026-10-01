@@ -353,6 +353,42 @@
         "slat_steps": 2
       },
       "checks": ["registry_and_config"]
+    },
+    {
+      "id": "rfdetr",
+      "module": "rfdetr",
+      "config": { "num_queries": 16 },
+      "extraction_api": {
+        "task": "detection",
+        "input_shape": [112, 112, 3],
+        "outputs": ["boxes", "scores", "labels"],
+        "processor": "processing_rfdetr.RFDETRProcessor"
+      },
+      "checks": ["registry_and_config", "extraction_api"]
+    },
+    {
+      "id": "rt_detr_v2",
+      "module": "rt_detr_v2",
+      "config": {},
+      "extraction_api": {
+        "task": "detection",
+        "input_shape": [640, 640, 3],
+        "outputs": ["boxes", "scores", "labels"],
+        "processor": "processing_rt_detr_v2.RTDetrV2Processor"
+      },
+      "checks": ["registry_and_config", "extraction_api"]
+    },
+    {
+      "id": "sam3d_objects_api",
+      "module": "sam3d_objects",
+      "config": {},
+      "extraction_api": {
+        "task": "objects",
+        "input_shape": [112, 112, 4],
+        "outputs": ["coords", "latents", "pose", "mesh"],
+        "kwargs": { "ss_steps": 1, "slat_steps": 1, "formats": ["mesh"], "estimate_depth": false }
+      },
+      "checks": ["extraction_api"]
     }
   ],
   "shared_configs": {

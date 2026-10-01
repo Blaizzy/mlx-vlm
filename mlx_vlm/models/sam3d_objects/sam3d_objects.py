@@ -113,4 +113,8 @@ class Model(nn.Module):
         """Reconstruct 3D objects from one image, optionally mask-conditioned."""
         from .pipeline import Pipeline
 
-        return Pipeline(self).generate(inputs, **kwargs)
+        # The pipeline works in MLX throughout, including its dtype checks.
+        for name in ("mask", "pointmap"):
+            if kwargs.get(name) is not None:
+                kwargs[name] = mx.array(kwargs[name])
+        return Pipeline(self).generate(mx.array(inputs), **kwargs)
