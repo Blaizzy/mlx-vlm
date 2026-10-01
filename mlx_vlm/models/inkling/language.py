@@ -770,13 +770,11 @@ class InklingSparseMoE(nn.Module):
         scores = mx.sigmoid(logits.astype(mx.float32))
         sfc = scores[:, : self.n_routed] + self.e_score_correction_bias
         idx = mx.argpartition(-sfc, self.top_k - 1, axis=-1)[:, : self.top_k]
+        idx = mx.stop_gradient(idx)
         routed_logits = logits[:, : self.n_routed]
         shared_logits = logits[:, -self.n_shared :]
         tl = mx.concatenate(
-            idx=mx.stop_gradient(idx)[
-                mx.take_along_axis(routed_logits, idx, axis=-1), shared_logits
-            ],
-            axis=-1,
+            [mx.take_along_axis(routed_logits, idx, axis=-1), shared_logits], axis=-1
         ).astype(mx.float32)
         lp = -mx.logaddexp(mx.zeros_like(tl), -tl)
         w = (
