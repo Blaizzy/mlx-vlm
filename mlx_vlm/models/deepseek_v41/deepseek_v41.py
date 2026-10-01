@@ -2,6 +2,7 @@ from typing import List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_flatten
 
 from ..base import InputEmbeddingsFeatures, LanguageModelOutput
 from .config import ModelConfig
@@ -177,6 +178,8 @@ class Model(nn.Module):
         return []
 
     def sanitize(self, weights):
+        preserve_source = getattr(self, "_preserve_source_quantization", False)
+
         def transform_key(key):
             if key.startswith("language_model."):
                 return key
@@ -202,7 +205,7 @@ class Model(nn.Module):
             packed, scales, mode = _pack_source_weight(
                 weights[weight_key], weights.pop(key)
             )
-            if weight_key.endswith(".engram.embed.weight"):
+            if preserve_source or weight_key.endswith(".engram.embed.weight"):
                 weights[weight_key] = packed
                 weights[key + "s"] = scales
                 continue
@@ -253,8 +256,40 @@ class Model(nn.Module):
             # weights. Convert once, rather than promoting this matrix per token.
             weights[head_w] = weights[head_w].astype(mx.float32)
 
+        if preserve_source:
+            quantization = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+            for path, module in tree_flatten(
+                self.leaf_modules(), is_leaf=lambda m: isinstance(m, nn.Module)
+            ):
+                packed = weights.get(f"{path}.weight")
+                scales = weights.get(f"{path}.scales")
+                if packed is None or scales is None or ".engram.embed" in path:
+                    continue
+                if scales.dtype != mx.uint8 or not hasattr(module, "to_quantized"):
+                    raise ValueError(f"Cannot preserve source quantization for {path}")
+                bits = 32 * packed.shape[-1] // module.weight.shape[-1]
+                if bits not in (4, 8):
+                    raise ValueError(f"Unexpected source precision for {path}: {bits}")
+                quantization[path] = {
+                    "group_size": 32,
+                    "bits": bits,
+                    "mode": f"mxfp{bits}",
+                }
+            self._source_quantization = quantization
+
         self._install_engram_embeddings(weights)
         return weights
+
+    def shard(self, group=None):
+        """Partition routed experts and keep Engram tables on disk."""
+        from .engram import OffloadedEngramEmbedding
+
+        self.language_model.shard(group)
+        for layer in self.layers:
+            if layer.engram is not None and isinstance(
+                layer.engram.embed, OffloadedEngramEmbedding
+            ):
+                layer.engram.embed.hide_parameters()
 
     @property
     def layers(self):

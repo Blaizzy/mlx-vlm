@@ -989,6 +989,9 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         model_config.model_path = str(model_path)
 
     model = model_class.Model(model_config)
+    model._preserve_source_quantization = kwargs.pop(
+        "preserve_source_quantization", False
+    )
 
     quantization_config = config.get("quantization_config", None)
     if quantization_config is None:
@@ -1089,6 +1092,10 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             weights = sanitize_weights(
                 model_class.AudioModel, weights, model_config.audio_config
             )
+
+    if native_quantization := getattr(model, "_source_quantization", None):
+        config["quantization"] = native_quantization
+        config["quantization_config"] = native_quantization
 
     if (quantization := config.get("quantization", None)) is not None:
         # Handle legacy models which may or may not have vision quantized.
@@ -1332,13 +1339,14 @@ def sharded_load(
     repo,
     tensor_group: Optional[mx.distributed.Group] = None,
     pipeline_group: Optional[mx.distributed.Group] = None,
+    **kwargs,
 ):
     # Get model path with everything but weight safetensors
     model_path = get_model_path(repo)
 
     # Lazy load model to figure out what type of sharding we can do and which
     # weights we need to download.
-    model = load_model(model_path, lazy=True, strict=False)
+    model = load_model(model_path, lazy=True, strict=False, **kwargs)
     config = model.config.to_dict()
 
     has_tensor_parallel = hasattr(model, "shard")
