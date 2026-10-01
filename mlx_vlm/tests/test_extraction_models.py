@@ -2437,7 +2437,9 @@ class TestExtractionCoverage(unittest.TestCase):
         "rfdetr": ("detection",),
         "rt_detr_v2": ("detection",),
         "sam3": ("detection",),
+        "sam3_1": ("detection",),
         "sam3d_body": ("body",),
+        "sam3d_objects": ("objects",),
         "video_depth_anything": ("depth",),
     }
 
@@ -2541,3 +2543,49 @@ class TestExtractionPredictorWiring(unittest.TestCase):
         )
         self.assertIn("self.config", source)
         self.assertNotIn("SAM3DPredictor(self, processor)", source)
+
+
+class TestExtractionCLIOutputs(unittest.TestCase):
+    """Non-array outputs must not produce an npz nobody can read back."""
+
+    class _Mesh:
+        pass
+
+    def test_manifest_marks_non_array_outputs(self):
+        from mlx_vlm.extract import _manifest
+
+        described = _manifest(
+            "objects", {"depth": np.zeros((2, 2)), "mesh": self._Mesh()}
+        )
+        self.assertEqual(described["outputs"]["depth"]["shape"], [2, 2])
+        self.assertEqual(
+            described["outputs"]["mesh"], {"type": "_Mesh", "array": False}
+        )
+        json.dumps(described)
+
+    def test_npz_omits_object_outputs_and_loads_with_default_numpy(self):
+        from mlx_vlm import extract as cli
+
+        outputs = {"depth": np.zeros((2, 2)), "mesh": self._Mesh(), "flag": True}
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "nested" / "run.npz"
+            original = cli.load
+            cli.load = lambda *a, **k: (
+                SimpleNamespace(
+                    extraction_types=("objects",),
+                    extract_task=lambda *args, **kwargs: outputs,
+                ),
+                None,
+            )
+            png = Path(directory) / "f.png"
+            from PIL import Image
+
+            Image.fromarray(np.zeros((4, 4, 3), dtype=np.uint8)).save(png)
+            try:
+                cli.main(["--model", "x", "--image", str(png), "--output", str(target)])
+            finally:
+                cli.load = original
+            self.assertTrue(target.exists(), "parent directory should be created")
+            loaded = np.load(target)  # default: allow_pickle=False
+            self.assertEqual(sorted(loaded.keys()), ["depth", "flag"])
+            self.assertEqual(loaded["depth"].shape, (2, 2))
