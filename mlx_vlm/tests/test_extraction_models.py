@@ -2193,13 +2193,11 @@ class TestExtractionResults(unittest.TestCase):
         from mlx_vlm.models import yolo11
         from mlx_vlm.models.rfdetr import generate as rfdetr_generate
         from mlx_vlm.models.rt_detr_v2 import generate as rt_detr_generate
-        from mlx_vlm.models.sam3 import generate as sam3_generate
         from mlx_vlm.models.yolo11 import inference as yolo11_inference
 
         for module in (yolo11, yolo11_inference, rfdetr_generate, rt_detr_generate):
             self.assertIs(module.DetectionResult, DetectionResult)
-        for module in (rfdetr_generate, sam3_generate):
-            self.assertIs(module.cxcywh_to_xyxy, cxcywh_to_xyxy)
+        self.assertIs(rfdetr_generate.cxcywh_to_xyxy, cxcywh_to_xyxy)
 
     def test_supports_each_models_fields(self):
         from mlx_vlm.extraction import DetectionResult

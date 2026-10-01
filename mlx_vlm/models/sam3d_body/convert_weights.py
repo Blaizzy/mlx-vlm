@@ -56,11 +56,6 @@ def transpose_conv2d(weight: np.ndarray) -> np.ndarray:
     return np.transpose(weight, (0, 2, 3, 1))
 
 
-def transpose_conv_transpose2d(weight: np.ndarray) -> np.ndarray:
-    """PyTorch ConvTranspose2d (I,O,H,W) -> MLX (O,H,W,I)."""
-    return np.transpose(weight, (1, 2, 3, 0))
-
-
 # --------------------------------------------------------------------------
 # Backbone QKV splitting
 # --------------------------------------------------------------------------

@@ -81,14 +81,6 @@ CONV_TRANSPOSE_PATTERNS = [
 ]
 
 
-def is_qkv_fused(key):
-    """Check if a key is a fused QKV parameter."""
-    for pat in QKV_FUSED_PATTERNS:
-        if pat.match(key):
-            return True
-    return False
-
-
 def is_conv_transpose(key):
     """Check if a key is a ConvTranspose2d weight."""
     for pat in CONV_TRANSPOSE_PATTERNS:

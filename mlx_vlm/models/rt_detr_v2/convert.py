@@ -87,11 +87,6 @@ def should_drop(key: str) -> bool:
     return any(re.search(p, stripped) for p in DROP_PATTERNS)
 
 
-def is_training_only(key: str) -> bool:
-    stripped = _strip_prefix(key)
-    return any(re.search(p, stripped) for p in TRAINING_ONLY_PATTERNS)
-
-
 def convert(hf_path: str, output: str, dtype: str = "bfloat16") -> Path:
     """Convert a HuggingFace RT-DETRv2 checkpoint to MLX format.
 
