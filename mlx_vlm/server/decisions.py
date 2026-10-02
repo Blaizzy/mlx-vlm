@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 import time
 from typing import Any, Dict, Optional, Union
 
@@ -14,6 +15,16 @@ from .runtime import runtime
 logger = logging.getLogger(__name__)
 
 
+def _default_decision_model() -> Optional[str]:
+    configured = os.environ.get("MLX_VLM_PRELOAD_DECISION_MODEL")
+    if configured:
+        return configured
+    registry = runtime.model_cache
+    if hasattr(registry, "for_kind"):
+        return registry.for_kind("decision").get("model_path")
+    return None
+
+
 class DecisionRequest(BaseModel):
     model: Optional[str] = Field(default=None, min_length=1)
     state: Union[str, Dict[str, Any], list]
@@ -23,9 +34,7 @@ class DecisionRequest(BaseModel):
 def register_routes(app, deps):
     @app.post("/v1/decisions")
     async def create_decisions(body: DecisionRequest):
-        model_id = body.model or runtime.model_cache.for_kind("decision").get(
-            "model_path"
-        )
+        model_id = body.model or _default_decision_model()
         if not model_id:
             raise HTTPException(
                 status_code=400,

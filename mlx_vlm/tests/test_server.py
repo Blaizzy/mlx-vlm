@@ -4388,6 +4388,7 @@ def test_decisions_preserves_loader_errors(client, status):
 @pytest.mark.parametrize("preloaded", [False, True])
 def test_decisions_default_model(client, monkeypatch, preloaded):
     _reset_runtime(monkeypatch)
+    monkeypatch.delenv("MLX_VLM_PRELOAD_DECISION_MODEL", raising=False)
     if preloaded:
         server.runtime.model_cache.set("decision", {"model_path": "preloaded"})
     model = NS(
@@ -4407,6 +4408,24 @@ def test_decisions_default_model(client, monkeypatch, preloaded):
     else:
         assert response.status_code == 400
         load.assert_not_called()
+
+
+def test_decisions_default_model_from_env(client, monkeypatch):
+    _reset_runtime(monkeypatch)
+    monkeypatch.setenv("MLX_VLM_PRELOAD_DECISION_MODEL", "env-decision")
+    model = NS(
+        decision_types=("bool",), predict=MagicMock(return_value={"answers": {}})
+    )
+    with patch.object(
+        server, "get_cached_model", return_value=(model, None, {})
+    ) as load:
+        response = client.post(
+            "/v1/decisions",
+            json={"state": "text", "questions": {"x": {"type": "bool"}}},
+        )
+    assert response.status_code == 200
+    assert response.json()["model"] == "env-decision"
+    load.assert_called_once_with("env-decision", model_kind="decision")
 
 
 @pytest.mark.parametrize("threshold", ["bad", None, [], {}, True, -0.1, 1.1])
