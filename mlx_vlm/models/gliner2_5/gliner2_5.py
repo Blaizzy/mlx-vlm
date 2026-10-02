@@ -136,17 +136,13 @@ class Extractor(nn.Module):
             "record_decoder.",
             "relation_scorer.",
         )
-        if self is not None and self.config.architecture == "span":
+        if self.config.architecture == "span":
             unsupported += ("span_rep.", "count_embed.", "count_pred.")
         remapped = {}
         for key, value in weights.items():
             if key.startswith(unsupported):
                 continue
-            if (
-                self is not None
-                and self.config.architecture == "span"
-                and key.startswith("classifier.2.")
-            ):
+            if self.config.architecture == "span" and key.startswith("classifier.2."):
                 key = key.replace("classifier.2.", "classifier.3.", 1)
             key = key.replace("encoder.encoder.layer.", "encoder.encoder.layers.")
             key = key.replace(".attention.self.", ".attention.self_attn.")

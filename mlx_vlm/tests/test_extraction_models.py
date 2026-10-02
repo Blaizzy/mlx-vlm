@@ -73,7 +73,8 @@ def test_checkpoint_key_sanitization():
         "boundary_head.shared_pool_builder.start_projection.weight": mx.ones((4, 4)),
     }
 
-    sanitized = GlinerModel.sanitize(None, weights)
+    model = GlinerModel(GlinerConfig.from_dict(_extraction_config("gliner2_5")))
+    sanitized = model.sanitize(weights)
 
     assert "encoder.embeddings.layer_norm.weight" in sanitized
     assert "encoder.encoder.layers.0.attention.self_attn.query_proj.weight" in sanitized
