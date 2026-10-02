@@ -2014,3 +2014,46 @@ def test_generate_step_evaluates_cache_periodically(max_tokens, cache_evals):
     assert eval_mock.call_count == 1 + cache_evals
     if cache_evals:
         eval_mock.assert_called_with([cache_state])
+
+
+@pytest.mark.parametrize(
+    "override", ["position_ids", "rope_deltas", "cached_image_features"]
+)
+def test_image_prefix_opaque_overrides_do_not_consult_or_populate_apc(override):
+    processor = SimpleNamespace(
+        tokenizer=SimpleNamespace(stopping_criteria=lambda token: False),
+        detokenizer=SimpleNamespace(
+            last_segment="",
+            reset=lambda: None,
+            add_token=lambda *args, **kwargs: None,
+            finalize=lambda: None,
+        ),
+    )
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="test", eos_token_id=[]),
+        language_model=SimpleNamespace(),
+    )
+    with (
+        patch.object(dispatch_module._apc, "APCCoordinator") as coordinator,
+        patch.object(dispatch_module.cache, "make_prompt_cache", return_value=[]),
+        patch.object(
+            dispatch_module, "wired_limit", return_value=contextlib.nullcontext()
+        ),
+        patch.object(
+            dispatch_module, "generate_step", return_value=iter([(7, mx.zeros((4,)))])
+        ),
+    ):
+        result = list(
+            dispatch_module.stream_generate(
+                model,
+                processor,
+                "",
+                input_ids=mx.array([[1, 2, 3, 4]]),
+                apc_manager=MagicMock(),
+                apc_image_prefix=True,
+                max_tokens=1,
+                **{override: mx.zeros((1, 4))},
+            )
+        )
+    coordinator.assert_not_called()
+    assert all(r.cached_tokens == 0 for r in result)
