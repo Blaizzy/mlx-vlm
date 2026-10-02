@@ -4,7 +4,9 @@ The reference checkpoint is microsoft/OmniParser-v2.0 ``icon_detect/model.pt``
 (Ultralytics YOLO11-family, nc=1). Conversion transposes 4-D conv weights
 from PyTorch (O, I, H, W) to MLX (O, H, W, I) layout.
 
-Requires torch at conversion time only; inference needs no PyTorch.
+Requires torch and ultralytics at conversion time: the checkpoint is a
+pickled Ultralytics model object, so unpickling it needs that package.
+Inference needs neither.
 
 Usage:
     python -m mlx_vlm.models.yolo11.convert \

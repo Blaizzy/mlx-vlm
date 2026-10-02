@@ -2,6 +2,20 @@
 
 Real-time detection transformer ([RF-DETR](https://github.com/roboflow/rf-detr), ICLR 2026) ported to Apple Silicon via MLX. Supports object detection and instance segmentation on COCO 80 classes.
 
+## Prepared checkpoint
+
+[`nativ-community/rfdetr-base-fp32`](https://huggingface.co/nativ-community/rfdetr-base-fp32)
+loads directly, so the conversion below is only needed for the other variants.
+
+```python
+from mlx_vlm import load
+from mlx_vlm.extraction import extract
+
+model, processor = load("nativ-community/rfdetr-base-fp32")
+result = extract(model, processor, "image.jpg")
+print(result["boxes"], result["scores"], result["labels"])
+```
+
 ## Quick Start
 
 ```python

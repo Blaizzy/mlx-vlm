@@ -10,6 +10,7 @@ boxes in original-image pixel coordinates.
 | Model | Component | Size |
 |---|---|---:|
 | [`axiom-of-choice/OmniParser-v2-icon-detect`](https://huggingface.co/axiom-of-choice/OmniParser-v2-icon-detect) | YOLO11 icon detector | 80 MB |
+| [`nativ-community/omniparser-v2-icon-detect-fp32`](https://huggingface.co/nativ-community/omniparser-v2-icon-detect-fp32) | YOLO11 icon detector (fp32) | 80 MB |
 | [`axiom-of-choice/OmniParser-v2-icon-caption-bf16`](https://huggingface.co/axiom-of-choice/OmniParser-v2-icon-caption-bf16) | Florence-2 icon captioner | 517 MB |
 | [`axiom-of-choice/OmniParser-v2-icon-caption-8bit`](https://huggingface.co/axiom-of-choice/OmniParser-v2-icon-caption-8bit) | Florence-2 icon captioner | 356 MB |
 | [`axiom-of-choice/OmniParser-v2-icon-caption-4bit`](https://huggingface.co/axiom-of-choice/OmniParser-v2-icon-caption-4bit) | Florence-2 icon captioner | 271 MB |
