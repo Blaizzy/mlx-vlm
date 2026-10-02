@@ -182,7 +182,7 @@ outputs = extract(model, processor, image)   # {"points": ..., "depth": ..., "ma
 ```
 
 A model declares the tasks it serves as `extraction_types` and implements
-`extract_task`; see CONTRIBUTING.md to add one.
+`extract`; see CONTRIBUTING.md to add one.
 
 #### Thinking Budget
 

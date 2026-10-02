@@ -2267,7 +2267,7 @@ class TestExtractionAPI(unittest.TestCase):
     class _Depth:
         extraction_types = ("depth",)
 
-        def extract_task(self, processor, inputs, task=None, **kwargs):
+        def extract(self, processor, inputs, task=None, **kwargs):
             return {
                 "depth": np.zeros(1),
                 "metadata": {"task": task, "kwargs": kwargs},
@@ -2276,7 +2276,7 @@ class TestExtractionAPI(unittest.TestCase):
     class _Multi:
         extraction_types = ("depth", "pointmap")
 
-        def extract_task(self, processor, inputs, task=None, **kwargs):
+        def extract(self, processor, inputs, task=None, **kwargs):
             return {task: np.zeros(1)}
 
     def test_rejects_models_without_declared_tasks(self):
@@ -2308,7 +2308,7 @@ class TestExtractionAPI(unittest.TestCase):
         class Bad:
             extraction_types = ("depth",)
 
-            def extract_task(self, processor, inputs, task=None, **kwargs):
+            def extract(self, processor, inputs, task=None, **kwargs):
                 return np.zeros(3)
 
         with self.assertRaisesRegex(ValueError, "must return a mapping"):
@@ -2461,7 +2461,7 @@ class TestExtractionCoverage(unittest.TestCase):
             module = importlib.import_module(f"mlx_vlm.models.{name}")
             model = module.Model
             self.assertEqual(model.extraction_types, tasks, name)
-            self.assertTrue(callable(getattr(model, "extract_task", None)), name)
+            self.assertTrue(callable(getattr(model, "extract", None)), name)
 
     def test_sapiens2_derives_its_task_from_the_checkpoint(self):
         from mlx_vlm.models.sapiens2 import Model
@@ -2537,9 +2537,7 @@ class TestExtractionPredictorWiring(unittest.TestCase):
             list(inspect.signature(SAM3DPredictor.__init__).parameters)[2], "config"
         )
         source = inspect.getsource(
-            importlib.import_module(
-                "mlx_vlm.models.sam3d_body.model"
-            ).SAM3DBody.extract_task
+            importlib.import_module("mlx_vlm.models.sam3d_body.model").SAM3DBody.extract
         )
         self.assertIn("self.config", source)
         self.assertNotIn("SAM3DPredictor(self, processor)", source)
@@ -2574,7 +2572,7 @@ class TestExtractionCLIOutputs(unittest.TestCase):
             cli.load = lambda *a, **k: (
                 SimpleNamespace(
                     extraction_types=("objects",),
-                    extract_task=lambda *args, **kwargs: outputs,
+                    extract=lambda *args, **kwargs: outputs,
                 ),
                 None,
             )
@@ -2616,7 +2614,7 @@ class TestExtractionContractGuards(unittest.TestCase):
         class Stringly:
             extraction_types = "depth"  # iterates as characters if unguarded
 
-            def extract_task(self, processor, inputs, task=None, **kwargs):
+            def extract(self, processor, inputs, task=None, **kwargs):
                 return {"depth": 1}
 
         with self.assertRaisesRegex(ValueError, "must be a sequence"):
@@ -2628,7 +2626,7 @@ class TestExtractionContractGuards(unittest.TestCase):
         class Declared:
             extraction_types = ("depth",)
 
-        with self.assertRaisesRegex(ValueError, "implements no extract_task"):
+        with self.assertRaisesRegex(ValueError, "implements no extract"):
             extract(Declared(), None, "x")
 
     def test_accepts_a_list_declaration(self):
@@ -2637,7 +2635,7 @@ class TestExtractionContractGuards(unittest.TestCase):
         class Listly:
             extraction_types = ["depth"]
 
-            def extract_task(self, processor, inputs, task=None, **kwargs):
+            def extract(self, processor, inputs, task=None, **kwargs):
                 return {"depth": np.zeros(1), "metadata": {"task": task}}
 
         self.assertEqual(extract(Listly(), None, "x")["metadata"]["task"], "depth")
@@ -3005,3 +3003,99 @@ class TestSam3dBodyExtraction(unittest.TestCase):
             if name != "metadata":
                 self.assertIsInstance(value, (mx.array, np.ndarray), name)
         self.assertIn("bbox", outputs["metadata"])
+
+
+class TestSam3BoxPrompts(unittest.TestCase):
+    """Box prompts must reach the geometry encoder in both SAM 3 variants."""
+
+    @staticmethod
+    def _detector(pkg, dim=32):
+        cfg = importlib.import_module(f"mlx_vlm.models.{pkg}.config")
+        backbone = cfg.ViTConfig(
+            hidden_size=dim,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            intermediate_size=dim,
+            image_size=112,
+            patch_size=14,
+            window_size=4,
+            global_attn_indexes=[0],
+            pretrain_image_size=112,
+        )
+        detector = cfg.DetectorConfig(
+            vision_config=cfg.VisionEncoderConfig(
+                backbone_config=backbone,
+                fpn_hidden_size=dim,
+                backbone_feature_sizes=[[32, 32], [16, 16], [8, 8]],
+            ),
+            text_config=cfg.TextEncoderConfig(
+                hidden_size=dim,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                intermediate_size=dim,
+                vocab_size=64,
+                projection_dim=dim,
+            ),
+            detr_encoder_config=cfg.DETREncoderConfig(
+                hidden_size=dim,
+                num_layers=1,
+                num_attention_heads=2,
+                intermediate_size=dim,
+            ),
+            detr_decoder_config=cfg.DETRDecoderConfig(
+                hidden_size=dim,
+                num_layers=1,
+                num_attention_heads=2,
+                num_queries=4,
+                intermediate_size=dim,
+            ),
+            geometry_encoder_config=cfg.GeometryEncoderConfig(
+                hidden_size=dim,
+                num_layers=1,
+                num_attention_heads=2,
+                intermediate_size=dim,
+                roi_size=2,
+            ),
+            mask_decoder_config=cfg.DetectorMaskDecoderConfig(
+                hidden_size=dim, num_attention_heads=2
+            ),
+        )
+        module = importlib.import_module(f"mlx_vlm.models.{pkg}.{pkg}")
+        model = module.DetectorModel(cfg.ModelConfig(detector_config=detector))
+        model.eval()
+        return model
+
+    def test_box_prompts_change_detection(self):
+        for pkg in ("sam3", "sam3_1"):
+            with self.subTest(pkg=pkg):
+                mx.random.seed(1234)
+                model = self._detector(pkg)
+                pixel_values = mx.random.normal((1, 112, 112, 3))
+                ids = mx.array([[1, 2, 3, 4]])
+                mask = mx.ones((1, 4), dtype=mx.bool_)
+                plain = model(pixel_values, input_ids=ids, attention_mask=mask)
+                prompted = model(
+                    pixel_values,
+                    input_ids=ids,
+                    attention_mask=mask,
+                    boxes=mx.array([[[0.1, 0.1, 0.5, 0.5]]]),
+                )
+                shift = float(
+                    mx.abs(plain["pred_logits"] - prompted["pred_logits"]).max()
+                )
+                self.assertGreater(shift, 1e-6, f"{pkg} ignored its box prompt")
+
+    def test_empty_boxes_are_a_no_op(self):
+        mx.random.seed(1234)
+        model = self._detector("sam3_1")
+        pixel_values = mx.random.normal((1, 112, 112, 3))
+        ids = mx.array([[1, 2, 3, 4]])
+        mask = mx.ones((1, 4), dtype=mx.bool_)
+        plain = model(pixel_values, input_ids=ids, attention_mask=mask)
+        empty = model(
+            pixel_values,
+            input_ids=ids,
+            attention_mask=mask,
+            boxes=mx.zeros((1, 0, 4)),
+        )
+        self.assertTrue(mx.allclose(plain["pred_logits"], empty["pred_logits"]).item())

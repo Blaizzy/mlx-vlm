@@ -186,7 +186,7 @@ class Model(nn.Module):
 
     extraction_types = ("detection",)
 
-    def extract_task(self, processor, inputs, task="detection", **kwargs):
+    def extract(self, processor, inputs, task=None, **kwargs):
         """Detect objects in one image."""
         from ...extraction import detection_outputs
         from .generate import RTDetrV2Predictor

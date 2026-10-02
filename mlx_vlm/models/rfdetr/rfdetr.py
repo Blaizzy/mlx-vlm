@@ -75,7 +75,6 @@ class Model(nn.Module):
             spatial_shape=(h, w),
             query_feat=self.query_feat.weight,
             refpoint_embed=self.refpoint_embed.weight,
-            bbox_embed=self.bbox_embed,
         )
 
         # 4. Detection heads on final decoder output
@@ -197,7 +196,7 @@ class Model(nn.Module):
 
     extraction_types = ("detection",)
 
-    def extract_task(self, processor, inputs, task="detection", **kwargs):
+    def extract(self, processor, inputs, task=None, **kwargs):
         """Detect objects in one image."""
         from ...extraction import detection_outputs
         from .generate import RFDETRPredictor

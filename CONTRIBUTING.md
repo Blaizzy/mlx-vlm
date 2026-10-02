@@ -75,7 +75,7 @@ conversion values and second-pass stability.
 
 An extraction model can also expose the shared prediction API. Declare the
 tasks it serves as `extraction_types` on the `Model` class and implement
-`extract_task(self, processor, inputs, task=None, **kwargs)` returning a
+`extract(self, processor, inputs, **kwargs)` returning a
 mapping of named outputs, the way `decision_types` and `predict` work for
 decision models. Named outputs are arrays; anything else a result carries,
 such as class names, a mesh or a flag, goes under the reserved `metadata`
@@ -89,7 +89,7 @@ mlx_vlm extract --model <path> --list-tasks
 mlx_vlm extract --model <path> --image frame.png --set score_threshold=0.5
 ```
 
-`--set NAME=VALUE` is repeatable and forwards keywords to `extract_task`,
+`--set NAME=VALUE` is repeatable and forwards keywords to `extract`,
 so a model's own options need no flag of their own. Values are read as
 Python literals, with `true`, `false`, `none` and `null` accepted in any
 case. `--set-file NAME=PATH` does the same for array inputs that are too

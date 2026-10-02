@@ -319,7 +319,7 @@ class Model(DINOv2):
 
     extraction_types = ("backbone",)
 
-    def extract_task(self, processor, inputs, task="backbone", **kwargs):
+    def extract(self, processor, inputs, task=None, **kwargs):
         """Encode one image into patch tokens and a pooled embedding."""
         pixels = mx.array(inputs)
         if pixels.ndim == 3:

@@ -517,7 +517,7 @@ class Model(YOLO11):
             renamed[".".join(path)] = value
         return renamed
 
-    def extract_task(self, processor, inputs, task="detection", **kwargs):
+    def extract(self, processor, inputs, task=None, **kwargs):
         """Detect objects in one image."""
         from ...extraction import detection_outputs
         from .inference import predict

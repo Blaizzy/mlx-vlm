@@ -94,9 +94,9 @@ def extract(model, processor, inputs, task=None, **kwargs):
         raise ValueError("extraction_types must be a sequence of task names")
     if not supported:
         raise ValueError("This model does not support extraction prediction")
-    if not callable(getattr(model, "extract_task", None)):
+    if not callable(getattr(model, "extract", None)):
         raise ValueError(
-            "This model declares extraction_types but implements no extract_task"
+            "This model declares extraction_types but implements no extract"
         )
     if inputs is None:
         raise ValueError("Extraction requires inputs")
@@ -108,7 +108,7 @@ def extract(model, processor, inputs, task=None, **kwargs):
         task = supported[0]
     if task not in supported:
         raise ValueError(f"This model does not support {task!r} extraction")
-    outputs = model.extract_task(processor, inputs, task=task, **kwargs)
+    outputs = model.extract(processor, inputs, task=task, **kwargs)
     if not isinstance(outputs, Mapping):
         raise ValueError(f"{task!r} extraction must return a mapping of named outputs")
     for name, value in outputs.items():

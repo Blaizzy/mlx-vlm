@@ -416,11 +416,9 @@ class MHRBodyModel(nn.Module):
         # ReLU
         sparse_out = nn.relu(sparse_out)
 
-        # Dense layer: (55317, 3000) -> (B, 55317)
-        dense_out = sparse_out @ self.pc_linear_weight.T  # (B, 55317)
+        dense_out = sparse_out @ self.pc_linear_weight.T
 
-        # Reshape to (B, V, 3) where V = 55317 / 3 = 18439
-        corrections = dense_out.reshape(B, -1, 3)  # (B, 18439, 3)
+        corrections = dense_out.reshape(B, -1, 3)
 
         return corrections
 

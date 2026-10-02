@@ -187,14 +187,9 @@ class MHRHead(nn.Module):
         joint_coords = joint_coords / 100.0
 
         # Compute keypoints via mapping
-        # keypoint_mapping: (308, 18566) where 18566 = 18439 verts + 127 joints
-        model_vert_joints = mx.concatenate(
-            [verts, joint_coords], axis=1
-        )  # (B, 18566, 3)
+        model_vert_joints = mx.concatenate([verts, joint_coords], axis=1)
 
-        keypoints = mx.einsum(
-            "kv,bvd->bkd", self.keypoint_mapping, model_vert_joints
-        )  # (B, 308, 3)
+        keypoints = mx.einsum("kv,bvd->bkd", self.keypoint_mapping, model_vert_joints)
         keypoints = keypoints[:, :70]  # Take first 70
 
         # Flip Y, Z for camera coordinate system

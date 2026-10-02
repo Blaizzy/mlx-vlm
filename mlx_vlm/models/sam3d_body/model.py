@@ -842,7 +842,7 @@ class SAM3DBody(nn.Module):
 
     extraction_types = ("body",)
 
-    def extract_task(self, processor, inputs, task="body", **kwargs):
+    def extract(self, processor, inputs, task=None, **kwargs):
         """Estimate 3D body pose and shape for one image."""
         from ...extraction import split_outputs
         from .generate import SAM3DPredictor

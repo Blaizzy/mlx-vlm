@@ -356,7 +356,6 @@ class Decoder(nn.Module):
         memory: mx.array,
         reference_points_unsigmoid: mx.array,
         spatial_shape: Tuple[int, int],
-        bbox_embed: "MLP",
     ) -> Tuple[mx.array, mx.array]:
         """
         Args:
@@ -364,7 +363,6 @@ class Decoder(nn.Module):
             memory: (B, HW, D) encoder features
             reference_points_unsigmoid: (B, Q, 4) initial reference points (pre-sigmoid)
             spatial_shape: (H, W) of feature map
-            bbox_embed: bbox regression head for iterative refinement
         Returns:
             hs: (B, Q, D) final hidden states
             reference_points: (B, Q, 4) refined reference points (sigmoid)
@@ -498,7 +496,6 @@ class Transformer(nn.Module):
         spatial_shape: Tuple[int, int],
         query_feat: mx.array,
         refpoint_embed: mx.array,
-        bbox_embed: "MLP",
     ) -> Tuple[mx.array, mx.array]:
         """
         Args:
@@ -506,7 +503,6 @@ class Transformer(nn.Module):
             spatial_shape: (H, W) of the feature map
             query_feat: (num_queries * group_detr, D) all query features
             refpoint_embed: (num_queries * group_detr, 4) all reference points
-            bbox_embed: bbox regression MLP for iterative refinement
         Returns:
             hs: (B, Q, D) decoder output
             ref_points: (B, Q, 4) refined reference points
@@ -540,8 +536,6 @@ class Transformer(nn.Module):
         tgt = mx.broadcast_to(qf[None, :, :], (B, nq, d))
 
         # Decoder
-        hs, ref_unsig = self.decoder(
-            tgt, memory, combined_refpoints, spatial_shape, bbox_embed
-        )
+        hs, ref_unsig = self.decoder(tgt, memory, combined_refpoints, spatial_shape)
 
         return hs, ref_unsig

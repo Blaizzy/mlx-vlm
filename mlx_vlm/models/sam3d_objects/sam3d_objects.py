@@ -109,7 +109,7 @@ class Model(nn.Module):
 
     extraction_types = ("objects",)
 
-    def extract_task(self, processor, inputs, task="objects", **kwargs):
+    def extract(self, processor, inputs, task=None, **kwargs):
         """Reconstruct 3D objects from one image, optionally mask-conditioned."""
         from .pipeline import Pipeline
 

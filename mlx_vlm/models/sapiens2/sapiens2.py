@@ -176,7 +176,7 @@ class Model(nn.Module):
         """The single dense-prediction task this checkpoint serves."""
         return (self.config.task,)
 
-    def extract_task(self, processor, inputs, task=None, **kwargs):
+    def extract(self, processor, inputs, task=None, **kwargs):
         """Predict this checkpoint's task output for one image."""
         from .generate import Sapiens2Predictor
 

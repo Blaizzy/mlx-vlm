@@ -69,7 +69,7 @@ class Model(nn.Module):
 
     extraction_types = ("depth",)
 
-    def extract_task(self, processor, inputs, task="depth", **kwargs):
+    def extract(self, processor, inputs, task=None, **kwargs):
         """Predict per-frame depth for (T, H, W, 3) RGB video frames."""
         from .generate import VideoDepthPredictor
 

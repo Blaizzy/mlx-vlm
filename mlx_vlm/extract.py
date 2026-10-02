@@ -29,7 +29,12 @@ def _read_video(path, max_frames):
     return frames[0] if isinstance(frames, tuple) else frames
 
 
-IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp"}
+def _image_suffixes():
+    """Every file extension the installed Pillow can open."""
+    Image.init()
+    return {
+        ext for ext, fmt in Image.registered_extensions().items() if fmt in Image.OPEN
+    }
 
 
 def _load_input_file(path, parser):
@@ -50,7 +55,7 @@ def _load_input_file(path, parser):
             return bundle[names[0]]
     if suffix == ".json":
         return json.loads(path.read_text())
-    if suffix in IMAGE_SUFFIXES:
+    if suffix in _image_suffixes():
         # Keep the file's own mode: load_image forces RGB, which turns a
         # grayscale mask into three channels and drops an RGBA cutout's alpha.
         with Image.open(path) as image:
