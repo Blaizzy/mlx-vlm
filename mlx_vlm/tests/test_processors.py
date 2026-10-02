@@ -1285,6 +1285,84 @@ def test_qwen3_vl_video_timestamp_video_prompt_falls_back_to_processor_fps():
     assert "<0.2 seconds>" in rendered and "<1.2 seconds>" in rendered
 
 
+class TestQwen3VLVideoTimestamps:
+    """Qwen3-VL markers follow the frames that were actually sampled."""
+
+    VIDEO_BLOCK = "<|vision_start|><|video_pad|><|vision_end|>"
+
+    @pytest.fixture
+    def p(self):
+        tokens = [
+            "[UNK]",
+            "[PAD]",
+            "<|image_pad|>",
+            "<|video_pad|>",
+            "<|vision_start|>",
+            "<|vision_end|>",
+        ]
+        tokenizer = fast_tokenizer(
+            tokens,
+            tokenizer_class=RecordingTokenizer,
+            split=False,
+            additional_special_tokens=tokens[2:],
+        )
+        return c.qwen3(
+            image_processor=m.qwen3.Qwen3VLImageProcessor(),
+            video_processor=m.qwen3.Qwen3VLVideoProcessor(**PROFILES["qwen_video"]),
+            tokenizer=tokenizer,
+        )
+
+    @staticmethod
+    def markers(p):
+        return re.findall(r"<(\d+\.\d) seconds>", p.tokenizer.last_text[0])
+
+    @staticmethod
+    def frames(count=4):
+        return np.zeros((count, 3, 56, 56), dtype=np.uint8)
+
+    @pytest.mark.parametrize("prepare", [False, True], ids=["direct", "prepare-inputs"])
+    def test_metadata_sets_the_timestamps(self, p, prepare):
+        metadata = dict(total_num_frames=91, fps=30, frames_indices=[0, 30, 60, 90])
+        if prepare:
+            prepare_inputs(
+                p,
+                prompts=self.VIDEO_BLOCK,
+                videos=[self.frames()],
+                video_metadata=[metadata],
+            )
+        else:
+            p(
+                text=[self.VIDEO_BLOCK],
+                videos=[self.frames()],
+                video_metadata=[VideoMetadata(**metadata)],
+            )
+        assert self.markers(p) == ["0.5", "2.5"]
+
+    def test_fps_without_metadata_spaces_frames_evenly(self, p):
+        p(text=[self.VIDEO_BLOCK], videos=[self.frames()], fps=[1.0])
+        assert self.markers(p) == ["0.5", "2.5"]
+
+    def test_clamped_clip_keeps_real_timestamps(self, p, synthetic_video):
+        # 20 s at 30 fps; four frames are far below the default 2 fps.
+        prepare_inputs(
+            p, prompts=self.VIDEO_BLOCK, videos=[synthetic_video], max_frames=4
+        )
+        assert self.markers(p) == ["3.3", "16.6"]
+
+    @pytest.mark.parametrize(
+        "metadata,error",
+        [
+            ([dict(fps=30, frames_indices=[0, 30])] * 2, "one video_metadata"),
+            ([dict(fps=30, frames_indices=[0, 30])], "frame indices must match"),
+            ([dict(fps=0, frames_indices=[0, 1, 2, 3])], "positive and finite"),
+        ],
+        ids=["count", "frames", "fps"],
+    )
+    def test_invalid_metadata(self, p, metadata, error):
+        with pytest.raises(ValueError, match=error):
+            p(text=[self.VIDEO_BLOCK], videos=[self.frames()], video_metadata=metadata)
+
+
 class TestMageVLProcessor:
     """Mage VL image/video processing and processor-to-model compatibility."""
 
