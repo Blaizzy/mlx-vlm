@@ -8,24 +8,9 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ..base import check_array_shape
 from .config import MLPConfig, VisionConfig
 from .sam import SAMEncoder
-
-
-def check_array_shape(arr):
-    shape = arr.shape
-
-    # Check if the shape has 4 dimensions
-    if len(shape) != 4:
-        return False
-
-    out_channels, kH, KW, _ = shape
-
-    # Check if out_channels is the largest, and kH and KW are the same
-    if (out_channels >= kH) and (out_channels >= KW) and (kH == KW):
-        return True
-    else:
-        return False
 
 
 class AttentionPoolLatent(nn.Module):

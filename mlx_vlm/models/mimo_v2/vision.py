@@ -1,6 +1,7 @@
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..rope_utils import rotate_half
 from .config import VisionConfig
 
 
@@ -144,11 +145,6 @@ class PatchMerger(nn.Module):
         for layer in self.mlp:
             x = layer(x)
         return x
-
-
-def rotate_half(x: mx.array) -> mx.array:
-    half = x.shape[-1] // 2
-    return mx.concatenate([-x[..., half:], x[..., :half]], axis=-1)
 
 
 def apply_rotary_pos_emb_vision(q: mx.array, k: mx.array, cos: mx.array, sin: mx.array):
