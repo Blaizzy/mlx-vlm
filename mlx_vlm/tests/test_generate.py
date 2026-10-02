@@ -420,6 +420,86 @@ def _generation_batch(model, inputs=(5, 6), uids=None, **options):
 class TestBatchGenerator:
     """Tests for BatchGenerator class."""
 
+    @pytest.mark.parametrize("phased", [False, True])
+    @pytest.mark.parametrize("budget", [1, 2, 7, None])
+    @pytest.mark.parametrize("capacity", [1, 3])
+    def test_prefill_budget_and_partial_admission(
+        self, mock_processor, budget, capacity, phased
+    ):
+        import mlx.nn as nn
+
+        calls = []
+
+        class Model(nn.Module):
+            def make_cache(self):
+                return [KVCache()]
+
+            def __call__(self, ids, cache=None, inputs_embeds=None, **kwargs):
+                calls.append((inputs_embeds is not None, ids.shape))
+                kv = mx.zeros((ids.shape[0], 1, ids.shape[1], 4))
+                cache[0].update_and_fetch(kv, kv)
+                return SimpleNamespace(
+                    logits=mx.broadcast_to(mx.array([0.0, 10.0, 0.0]), (*ids.shape, 3))
+                )
+
+        gen = BatchGenerator(
+            Model(),
+            mock_processor,
+            completion_batch_size=capacity,
+            prefill_batch_size=8,
+            prefill_step_size=budget,
+            compute_logprobs=False,
+        )
+
+        def step():
+            if not phased:
+                return gen.next()
+            responses = gen.decode_step()
+            return gen.prefill_step(), responses
+
+        def insert(prompts, max_tokens):
+            return gen.insert(
+                prompts,
+                max_tokens=max_tokens,
+                prompt_kwargs=[
+                    {"inputs_embeds": mx.zeros((1, len(ids), 4))} for ids in prompts
+                ],
+            )
+
+        (first,) = insert([[4, 5]], 32)
+        for _ in range(3):
+            step()
+            if len(gen._generation_batch):
+                break
+        assert gen._generation_batch.uids == [first]
+
+        # Requests arriving during decoding can use the remaining slots even
+        # when fewer than prefill_batch_size are available.
+        late = insert([[6] * 7, [7] * 5, [8] * 9], 2)
+        calls.clear()
+        _, responses = step()
+        assert [r.uid for r in responses] == [first]
+        assert calls[0] == (False, (1, 1))
+        if capacity > 1:
+            assert any(is_prompt for is_prompt, _ in calls)
+
+        finished = {r.uid for r in responses if r.finish_reason}
+        for _ in range(120):
+            if not gen.has_work:
+                break
+            _, responses = step()
+            finished.update(r.uid for r in responses if r.finish_reason)
+            assert len(gen._generation_batch) + len(gen._prompt_batch or []) <= capacity
+
+        assert not gen.has_work
+        assert finished == {first, *late}
+        assert gen.stats().prompt_tokens == 23
+        if budget is not None:
+            assert all(b * n <= budget for is_prompt, (b, n) in calls if is_prompt)
+        if capacity > 1 and budget != 1:
+            assert any(is_prompt and b > 1 for is_prompt, (b, _) in calls)
+        gen.close()
+
     def test_insert_with_max_tokens(self, mock_model, mock_processor):
         gen = BatchGenerator(
             model=mock_model.language_model, processor=mock_processor, max_tokens=50
@@ -1342,7 +1422,7 @@ def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
     bg._steps_counter = 0
     bg.completion_batch_size = 4
     bg.prefill_batch_size = 4
-    bg.prefill_step_size = 1
+    bg.prefill_step_size = 4
     bg.kv_bits = None
     bg.kv_group_size = 64
     bg.kv_quant_scheme = "affine"
@@ -1440,11 +1520,12 @@ def test_prompt_processing_batch_slices_native_mrope_position_ids():
     assert step_kwargs["position_ids"].tolist() == position_ids[:, :, :2].tolist()
 
 
-def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
+@pytest.mark.parametrize("budget,chunk_size", [(None, None), (8, 4)])
+def test_mixed_apc_batch_strips_private_kwargs_before_prefill(budget, chunk_size):
     bg = object.__new__(BatchGenerator)
     bg.apc_manager = object()
     bg.model = SimpleNamespace(layers=[object()])
-    bg.prefill_step_size = None
+    bg.prefill_step_size = budget
     bg.kv_bits = None
     bg.kv_group_size = 64
     bg.kv_quant_scheme = "affine"
@@ -1505,6 +1586,7 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
         batch = bg._build_mixed_prompt_batch(sequences)
 
     assert batch is not None
+    assert captured["prefill_step_size"] == chunk_size
     assert "_apc_tenant" not in captured["prompt_kwargs"]
     assert "_apc_image_hash" not in captured["prompt_kwargs"]
     assert "_apc_semantic_hash" not in captured["prompt_kwargs"]
@@ -2014,3 +2096,23 @@ def test_generate_step_evaluates_cache_periodically(max_tokens, cache_evals):
     assert eval_mock.call_count == 1 + cache_evals
     if cache_evals:
         eval_mock.assert_called_with([cache_state])
+
+
+class TestPrefillScheduling:
+    def test_length_buckets_serve_oldest_request_without_starvation(
+        self, mock_processor
+    ):
+        gen = BatchGenerator(FixedLogitModel(), mock_processor)
+        try:
+            first, peer, short = gen.insert([[1] * 8192, [1] * 7800, [1] * 401])
+            selected = gen._take_prefill_sequences(1)
+            assert [s[0] for s in selected] == [first]
+            # New short requests cannot keep the older long peer waiting.
+            gen.insert([[1] * 400] * 8)
+            selected = gen._take_prefill_sequences(8)
+            assert [s[0] for s in selected] == [peer]
+            selected = gen._take_prefill_sequences(2)
+            assert selected[0][0] == short
+            assert all(len(s[1]) <= 512 for s in selected)
+        finally:
+            gen.close()
