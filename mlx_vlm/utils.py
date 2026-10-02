@@ -2063,6 +2063,38 @@ class VideoMetadata:
         return len(self.frames_indices) / max(self.total_num_frames, 1e-6) * self.fps
 
 
+def _read_frames_forward(video_path: str, indices) -> list:
+    """Decode ``indices`` by reading the file forward from the start.
+
+    Used when seeking cannot be trusted. Stops at the first frame that cannot
+    be read, so a truncated file yields only the frames it really holds.
+    """
+    import cv2
+
+    cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
+    frames, pos, last = [], 0, None
+    try:
+        for idx in indices:
+            if idx == last:
+                frames.append(frames[-1])
+                continue
+            if idx < pos:
+                cap.release()
+                cap, pos = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG), 0
+            while pos < idx:
+                if not cap.grab():
+                    return frames
+                pos += 1
+            ret, frame = cap.read()
+            if not ret:
+                return frames
+            pos, last = pos + 1, idx
+            frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    finally:
+        cap.release()
+    return frames
+
+
 def load_video(
     video_path: str,
     sampling: Optional[VideoSampling] = None,
@@ -2149,14 +2181,20 @@ def load_video(
             f"Frame indices must be within a non-empty {total_frames}-frame video."
         )
     frames = []
-    for idx in indices:
+    # Only the FFmpeg backend reports the position it actually decoded; other
+    # backends (e.g. AVFoundation) derive CAP_PROP_POS_FRAMES from the request.
+    check_position = cap.getBackendName() == "FFMPEG"
+    for k, idx in enumerate(indices):
         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ret, frame = cap.read()
-        # Past the last decodable frame (a truncated file, or a header that
-        # overstates the frame count) a seek can return the last decoded frame
-        # again with ret=True. Only the reported position shows the seek never
-        # landed, so stop there as for a failed read.
-        if not ret or int(cap.get(cv2.CAP_PROP_POS_FRAMES)) != idx + 1:
+        if not ret:
+            break
+        if check_position and int(cap.get(cv2.CAP_PROP_POS_FRAMES)) != idx + 1:
+            # The seek did not land, yet read() can still return a frame: the
+            # last decodable one again past the end of a truncated file, or a
+            # neighbour when seeking is off (negative DTS before OpenCV 4.13).
+            # Reading forward from the start tells the two apart.
+            frames.extend(_read_frames_forward(video_path, indices[k:]))
             break
         frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     cap.release()

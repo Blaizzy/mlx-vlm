@@ -2706,49 +2706,94 @@ class TestLoadVideo:
         assert metadata.timestamps[0] == pytest.approx(0.0)
         assert metadata.timestamps[-1] == pytest.approx(20.0, abs=0.05)
 
-    def test_stops_where_seeks_stop_landing(self):
-        # The header counts 30 frames but only 10 decode. As OpenCV does on a
-        # truncated H.264 file, the first missing frame fails, and every later
-        # seek returns the last decoded frame again with ret=True while the
-        # reported position stays one past it.
-        cv2 = pytest.importorskip("cv2")
-        decodable = 10
+    @staticmethod
+    def _capture(cv2, decodable, header_frames, seek):
+        """A cv2.VideoCapture stand-in: ``decodable`` frames read in order, each
+        filled with its own index, and ``seek(target)`` deciding what a read
+        right after a seek returns as ``(ret, frame shown, reported position)``."""
 
         class Capture:
             def __init__(self, path, *args):
-                self.target = self.pos = 0
+                self.pos = self.reported = 0
+                self.target = None
 
             def isOpened(self):
                 return True
 
+            def getBackendName(self):
+                return "FFMPEG"
+
             def get(self, prop):
                 return {
-                    cv2.CAP_PROP_FRAME_COUNT: 30,
+                    cv2.CAP_PROP_FRAME_COUNT: header_frames,
                     cv2.CAP_PROP_FPS: 10.0,
                     cv2.CAP_PROP_FRAME_WIDTH: 8,
                     cv2.CAP_PROP_FRAME_HEIGHT: 8,
-                    cv2.CAP_PROP_POS_FRAMES: self.pos,
+                    cv2.CAP_PROP_POS_FRAMES: self.reported,
                 }[prop]
 
             def set(self, prop, value):
                 self.target = int(value)
 
+            def grab(self):
+                if self.pos >= decodable:
+                    return False
+                self.pos += 1
+                self.reported = self.pos
+                return True
+
             def read(self):
-                if self.target == decodable:
+                if self.target is not None:
+                    target, self.target = self.target, None
+                    ok, shown, self.reported = seek(target)
+                elif self.pos < decodable:
+                    ok, shown = True, self.pos
+                    self.pos += 1
+                    self.reported = self.pos
+                else:
+                    ok = False
+                if not ok:
                     return False, None
-                shown = min(self.target, decodable)
-                self.pos = shown + 1
                 return True, np.full((8, 8, 3), shown, np.uint8)
 
             def release(self):
                 pass
 
-        with patch.object(cv2, "VideoCapture", Capture):
+        return Capture
+
+    def test_truncated_file_stops_at_the_last_decodable_frame(self):
+        # The header counts 30 frames but only 10 decode. As OpenCV does on a
+        # truncated H.264 file, the first missing frame fails, and every later
+        # seek returns a stale frame with ret=True and a position stuck at 11.
+        cv2 = pytest.importorskip("cv2")
+
+        def seek(target):
+            if target < 10:
+                return True, target, target + 1
+            if target == 10:
+                return False, None, 10
+            return True, 10, 11
+
+        with patch.object(cv2, "VideoCapture", self._capture(cv2, 10, 30, seek)):
             frames, metadata = load_video("cut.mp4", nframes=6)
 
         # Sampled indices are 0, 6, 12, 17, 23, 29; only the first two exist.
         assert metadata.frames_indices == [0, 6]
         assert [int(f[0, 0, 0]) for f in frames] == [0, 6]
+
+    def test_inaccurate_seeks_fall_back_to_reading_forward(self):
+        # OpenCV before 4.13 on H.264 with negative DTS: every seek past frame 1
+        # returns frame 1 with position -2, although the file is complete.
+        cv2 = pytest.importorskip("cv2")
+
+        def seek(target):
+            return (True, target, target + 1) if target < 2 else (True, 1, -2)
+
+        with patch.object(cv2, "VideoCapture", self._capture(cv2, 10, 10, seek)):
+            frames, metadata = load_video("negdts.mp4", nframes=10)
+
+        assert metadata.frames_indices == list(range(10))
+        assert [int(f[0, 0, 0]) for f in frames] == list(range(10))
 
     @pytest.mark.skipif(
         shutil.which("ffmpeg") is None,
