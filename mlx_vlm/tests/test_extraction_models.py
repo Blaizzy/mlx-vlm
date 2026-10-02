@@ -2211,6 +2211,22 @@ def test_gliner_decisions_preserve_choice_and_multilabel_scoring():
     assert len(calls) == 1
     assert result["route"]["value"] == "A"
     assert abs(sum(result["route"]["probabilities"].values()) - 1) < 1e-6
-    assert result["tags"]["value"] == ["A"]
     assert abs(result["tags"]["scores"]["A"] - mx.sigmoid(mx.array(2.0)).item()) < 1e-6
     assert "probabilities" not in result["tags"]
+    # The best score is sigmoid(2) = 0.88, so a 0.9 threshold selects nothing.
+    assert result["tags"]["value"] == []
+
+    relaxed = predict(
+        model,
+        None,
+        "example",
+        {
+            "tags": {
+                "type": "multi_label",
+                "criteria": ["A", "B"],
+                "threshold": 0.9,
+                "fallback_to_top": True,
+            }
+        },
+    )["answers"]
+    assert relaxed["tags"]["value"] == ["A"]

@@ -85,6 +85,14 @@ def _resolve_flat_overlaps(spans):
     )
 
 
+def _select_multi_label(scores, threshold, fallback_to_top=False):
+    """Pick labels scoring at or above threshold, else optionally the top one."""
+    chosen = [label for label, score in scores.items() if score >= threshold]
+    if not chosen and fallback_to_top:
+        chosen = [max(scores, key=scores.get)]
+    return chosen
+
+
 class Extractor(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -292,6 +300,7 @@ class Model(Extractor):
         threshold: float = 0.5,
         *,
         return_scores: bool = False,
+        fallback_to_top: bool = False,
         max_len: Optional[int] = None,
         word_splitter: str = "whitespace",
     ):
@@ -333,15 +342,9 @@ class Model(Extractor):
             if return_scores:
                 results[task] = dict(zip(labels, scores))
             elif multi_label:
-                results[task] = [
-                    label
-                    for label, score in zip(labels, scores)
-                    if score >= task_threshold
-                ]
-                if self.config.architecture == "span" and not results[task]:
-                    results[task] = [
-                        labels[max(range(len(labels)), key=scores.__getitem__)]
-                    ]
+                results[task] = _select_multi_label(
+                    dict(zip(labels, scores)), task_threshold, fallback_to_top
+                )
             else:
                 results[task] = labels[max(range(len(labels)), key=scores.__getitem__)]
         return results
@@ -369,16 +372,13 @@ class Model(Extractor):
         for name, values in scores.items():
             spec = questions[name]
             if spec["type"] == "multi_label":
-                threshold = spec.get("threshold", 0.5)
-                value = [label for label, score in values.items() if score >= threshold]
+                value = _select_multi_label(
+                    values,
+                    spec.get("threshold", 0.5),
+                    spec.get("fallback_to_top", False),
+                )
             else:
                 value = max(values, key=values.get)
-            if (
-                self.config.architecture == "span"
-                and spec["type"] == "multi_label"
-                and not value
-            ):
-                value = [max(values, key=values.get)]
             score_key = "scores" if spec["type"] == "multi_label" else "probabilities"
             answers[name] = {"type": spec["type"], "value": value, score_key: values}
         return {"model": self.config.model_type, "answers": answers}
