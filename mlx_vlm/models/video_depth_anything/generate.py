@@ -17,6 +17,8 @@ from typing import List, Optional
 import mlx.core as mx
 import numpy as np
 
+from ..interpolate import resize_bilinear_nhwc
+
 # Inference settings from the reference implementation, do not change
 INFER_LEN = 32
 OVERLAP = 10
@@ -107,10 +109,8 @@ class VideoDepthPredictor:
             depth = self.model(cur_input)  # (1, INFER_LEN, H, W)
 
             # Resize each window back to the original frame resolution
-            from .dpt import upsample_bilinear
-
-            depth = upsample_bilinear(
-                depth[0, :, :, :, None], size=(frame_height, frame_width)
+            depth = resize_bilinear_nhwc(
+                depth[0, :, :, :, None], (frame_height, frame_width), align_corners=True
             )[..., 0]
             depth_list += [np.array(depth[i]) for i in range(depth.shape[0])]
 

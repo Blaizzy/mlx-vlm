@@ -1,81 +1,20 @@
 """DPT head with temporal motion modules for Video Depth Anything."""
 
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..interpolate import bilinear_interpolate
+from ..dpt import Scratch as DPTScratch
+from ..dpt import reassemble_layers
+from ..interpolate import resize_bilinear_nhwc
 from .config import ModelConfig
 from .motion import TemporalModule
 
 
-def upsample_bilinear(x: mx.array, size=None, scale_factor=None) -> mx.array:
-    """Bilinear upsample of a channel-last tensor (N, H, W, C), align_corners=True."""
-    N, H, W, C = x.shape
-    if size is not None:
-        new_h, new_w = size
-    else:
-        new_h, new_w = H * scale_factor, W * scale_factor
-    if (new_h, new_w) == (H, W):
-        return x
-    # bilinear_interpolate works on (H, W, ...); fold N into the channel axis
-    y = x.transpose(1, 2, 0, 3).reshape(H, W, N * C)
-    y = bilinear_interpolate(y, new_h, new_w, align_corners=True)
-    return y.reshape(new_h, new_w, N, C).transpose(2, 0, 1, 3)
-
-
-class ResidualConvUnit(nn.Module):
-    def __init__(self, features: int):
-        super().__init__()
-        self.conv1 = nn.Conv2d(features, features, kernel_size=3, stride=1, padding=1)
-        self.conv2 = nn.Conv2d(features, features, kernel_size=3, stride=1, padding=1)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        out = self.conv1(nn.relu(x))
-        out = self.conv2(nn.relu(out))
-        return out + x
-
-
-class FeatureFusionBlock(nn.Module):
-    def __init__(self, features: int):
-        super().__init__()
-        self.out_conv = nn.Conv2d(
-            features, features, kernel_size=1, stride=1, padding=0
-        )
-        self.resConfUnit1 = ResidualConvUnit(features)
-        self.resConfUnit2 = ResidualConvUnit(features)
-
-    def __call__(
-        self,
-        x: mx.array,
-        res: Optional[mx.array] = None,
-        size: Optional[Tuple[int, int]] = None,
-    ) -> mx.array:
-        output = x
-        if res is not None:
-            output = output + self.resConfUnit1(res)
-        output = self.resConfUnit2(output)
-        if size is None:
-            output = upsample_bilinear(output, scale_factor=2)
-        else:
-            output = upsample_bilinear(output, size=size)
-        return self.out_conv(output)
-
-
-class Scratch(nn.Module):
-    """Container matching the reference checkpoint's ``head.scratch.*`` keys."""
-
+class Scratch(DPTScratch):
     def __init__(self, out_channels: List[int], features: int):
-        super().__init__()
-        for i, c in enumerate(out_channels):
-            setattr(
-                self,
-                f"layer{i + 1}_rn",
-                nn.Conv2d(c, features, kernel_size=3, stride=1, padding=1, bias=False),
-            )
-        for i in range(4):
-            setattr(self, f"refinenet{i + 1}", FeatureFusionBlock(features))
+        super().__init__(out_channels, features)
         self.output_conv1 = nn.Conv2d(
             features, features // 2, kernel_size=3, stride=1, padding=1
         )
@@ -100,18 +39,7 @@ class DPTHeadTemporal(nn.Module):
             nn.Conv2d(in_channels, c, kernel_size=1, stride=1, padding=0)
             for c in out_channels
         ]
-        self.resize_layers = [
-            nn.ConvTranspose2d(
-                out_channels[0], out_channels[0], kernel_size=4, stride=4, padding=0
-            ),
-            nn.ConvTranspose2d(
-                out_channels[1], out_channels[1], kernel_size=2, stride=2, padding=0
-            ),
-            nn.Identity(),
-            nn.Conv2d(
-                out_channels[3], out_channels[3], kernel_size=3, stride=2, padding=1
-            ),
-        ]
+        self.resize_layers = reassemble_layers(out_channels)
         self.scratch = Scratch(out_channels, features)
 
         motion_kwargs = dict(
@@ -174,8 +102,10 @@ class DPTHeadTemporal(nn.Module):
             path_1 = self.scratch.refinenet1(path_2, layer_1_rn)
 
             out = self.scratch.output_conv1(path_1)
-            out = upsample_bilinear(
-                out, size=(patch_h * self.patch_size, patch_w * self.patch_size)
+            out = resize_bilinear_nhwc(
+                out,
+                (patch_h * self.patch_size, patch_w * self.patch_size),
+                align_corners=True,
             )
             # The reference runs the output head in full precision
             out = out.astype(mx.float32)

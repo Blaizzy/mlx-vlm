@@ -11,8 +11,9 @@ import mlx.nn as nn
 
 from ..base import check_array_shape
 from ..dinov2.dinov2 import DINOv2
+from ..interpolate import resize_bilinear_nhwc
 from .config import ModelConfig
-from .dpt import DPTHeadTemporal, upsample_bilinear
+from .dpt import DPTHeadTemporal
 
 
 class Model(nn.Module):
@@ -38,7 +39,7 @@ class Model(nn.Module):
         )
         depth = self.head(features, patch_h, patch_w, T)
         # (B*T, H, W, 1) -> resize to input resolution
-        depth = upsample_bilinear(depth, size=(H, W))
+        depth = resize_bilinear_nhwc(depth, (H, W), align_corners=True)
         depth = nn.relu(depth)
         return depth.reshape(B, T, H, W)
 
