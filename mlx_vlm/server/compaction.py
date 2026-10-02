@@ -98,43 +98,45 @@ def resolve(items: list[dict], *, model: str, tenant: str | None) -> list[dict]:
             raise HTTPException(
                 400, "Invalid compaction state for this server, model, or tenant."
             ) from exc
-        tail = items[index + 1 :]
-
-        # Clients can retain user/instruction messages before the opaque item.
-        # A full transcript containing assistant/tool items or an older capsule
-        # is instead superseded by the latest capsule.
-        prefix = items[:index]
-        if prefix and all(
-            x.get("type") == "message"
-            and x.get("role") in ("user", "system", "developer")
-            and not x.get("tool_calls")
-            for x in prefix
-        ):
-            carried = Counter(_message_key(x) for x in context)
-            retained = []
-            for message in prefix:
-                key = _message_key(message)
-                if carried[key]:
-                    carried[key] -= 1
-                else:
-                    retained.append(message)
-            # Keep leading instructions in place and recent tool exchanges intact.
-            start = next(
-                (i for i, x in enumerate(context) if not _is_instruction(x)),
-                len(context),
-            )
-            context = context[:start] + retained + context[start:]
-
-        # Clients may resend instructions after an opaque boundary. Do not
-        # accumulate identical carried instructions on every compaction cycle.
-        repeated = {_message_key(x) for x in tail if _is_instruction(x)}
-        context = [
-            x
-            for x in context
-            if not _is_instruction(x) or _message_key(x) not in repeated
-        ]
-        return context + tail
+        return _merge_retained_messages(items[:index], context, items[index + 1 :])
     return items
+
+
+def _merge_retained_messages(
+    prefix: list[dict], context: list[dict], tail: list[dict]
+) -> list[dict]:
+    """Merge client-retained messages and continuation with the decoded capsule."""
+    # Clients can retain user/instruction messages before the opaque item.
+    # A full transcript containing assistant/tool items or an older capsule
+    # is instead superseded by the latest capsule.
+    if prefix and all(
+        x.get("type") == "message"
+        and x.get("role") in ("user", "system", "developer")
+        and not x.get("tool_calls")
+        for x in prefix
+    ):
+        carried = Counter(_message_key(x) for x in context)
+        retained = []
+        for message in prefix:
+            key = _message_key(message)
+            if carried[key]:
+                carried[key] -= 1
+            else:
+                retained.append(message)
+        # Keep leading instructions in place and recent tool exchanges intact.
+        start = next(
+            (i for i, x in enumerate(context) if not _is_instruction(x)),
+            len(context),
+        )
+        context = context[:start] + retained + context[start:]
+
+    # Clients may resend instructions after an opaque boundary. Do not
+    # accumulate identical carried instructions on every compaction cycle.
+    repeated = {_message_key(x) for x in tail if _is_instruction(x)}
+    context = [
+        x for x in context if not _is_instruction(x) or _message_key(x) not in repeated
+    ]
+    return context + tail
 
 
 def _message_key(item: dict) -> tuple[str | None, str]:
