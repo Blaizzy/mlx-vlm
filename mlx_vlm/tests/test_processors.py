@@ -7,6 +7,8 @@ import importlib
 import json
 import pkgutil
 import re
+import shutil
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, nullcontext
 from copy import deepcopy
@@ -2703,6 +2705,84 @@ class TestLoadVideo:
         _, metadata = load_video(synthetic_video, fps=1.0)
         assert metadata.timestamps[0] == pytest.approx(0.0)
         assert metadata.timestamps[-1] == pytest.approx(20.0, abs=0.05)
+
+    def test_stops_where_seeks_stop_landing(self):
+        # The header counts 30 frames but only 10 decode. As OpenCV does on a
+        # truncated H.264 file, the first missing frame fails, and every later
+        # seek returns the last decoded frame again with ret=True while the
+        # reported position stays one past it.
+        cv2 = pytest.importorskip("cv2")
+        decodable = 10
+
+        class Capture:
+            def __init__(self, path, *args):
+                self.target = self.pos = 0
+
+            def isOpened(self):
+                return True
+
+            def get(self, prop):
+                return {
+                    cv2.CAP_PROP_FRAME_COUNT: 30,
+                    cv2.CAP_PROP_FPS: 10.0,
+                    cv2.CAP_PROP_FRAME_WIDTH: 8,
+                    cv2.CAP_PROP_FRAME_HEIGHT: 8,
+                    cv2.CAP_PROP_POS_FRAMES: self.pos,
+                }[prop]
+
+            def set(self, prop, value):
+                self.target = int(value)
+
+            def read(self):
+                if self.target == decodable:
+                    return False, None
+                shown = min(self.target, decodable)
+                self.pos = shown + 1
+                return True, np.full((8, 8, 3), shown, np.uint8)
+
+            def release(self):
+                pass
+
+        with patch.object(cv2, "VideoCapture", Capture):
+            frames, metadata = load_video("cut.mp4", nframes=6)
+
+        # Sampled indices are 0, 6, 12, 17, 23, 29; only the first two exist.
+        assert metadata.frames_indices == [0, 6]
+        assert [int(f[0, 0, 0]) for f in frames] == [0, 6]
+
+    @pytest.mark.skipif(
+        shutil.which("ffmpeg") is None,
+        reason="FFmpeg is required to build a truncated H.264 file",
+    )
+    def test_truncated_h264_file_returns_only_decodable_frames(self, tmp_path):
+        cv2 = pytest.importorskip("cv2")
+        full, cut = tmp_path / "full.mp4", tmp_path / "cut.mp4"
+        made = subprocess.run(
+            ["ffmpeg", "-v", "error", "-f", "lavfi", "-i"]
+            + ["testsrc2=size=64x48:rate=30:duration=10", "-c:v", "libx264"]
+            + ["-pix_fmt", "yuv420p", "-movflags", "+faststart", str(full)],
+            capture_output=True,
+        )
+        if made.returncode:
+            pytest.skip("FFmpeg cannot encode H.264 here")
+        data = full.read_bytes()
+        cut.write_bytes(data[: len(data) * 2 // 3])
+
+        cap = cv2.VideoCapture(str(cut))
+        decoded = []
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            decoded.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        cap.release()
+
+        frames, metadata = load_video(str(cut), nframes=20)
+
+        assert 0 < len(frames) < 20
+        assert max(metadata.frames_indices) < len(decoded)
+        for frame, idx in zip(frames, metadata.frames_indices):
+            assert np.array_equal(np.transpose(frame, (1, 2, 0)), decoded[idx])
 
 
 class TestResolveVideoSampling:

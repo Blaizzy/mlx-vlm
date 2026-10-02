@@ -2152,10 +2152,21 @@ def load_video(
     for idx in indices:
         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ret, frame = cap.read()
-        if not ret:
+        # Past the last decodable frame (a truncated file, or a header that
+        # overstates the frame count) a seek can return the last decoded frame
+        # again with ret=True. Only the reported position shows the seek never
+        # landed, so stop there as for a failed read.
+        if not ret or int(cap.get(cv2.CAP_PROP_POS_FRAMES)) != idx + 1:
             break
         frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     cap.release()
+    if frames and len(frames) < len(indices):
+        logger.warning(
+            "video %s: decoded %d of %d sampled frames; the file may be truncated",
+            video_path,
+            len(frames),
+            len(indices),
+        )
     if not frames:
         raise ValueError("No frames read from the video.")
 
