@@ -152,20 +152,20 @@ rather than tokens, so they share one entry point:
 
 ```sh
 # what a checkpoint can predict
-mlx_vlm extract --model mlx-community/moge-3-vitl-mlx-fp32 --list-tasks
+mlx_vlm.extract --model mlx-community/moge-3-vitl-mlx-fp32 --list-tasks
 
 # geometry from one image, arrays written to a .npz
-mlx_vlm extract --model mlx-community/moge-3-vitl-mlx-fp32 --image photo.jpg --output geometry.npz
+mlx_vlm.extract --model mlx-community/moge-3-vitl-mlx-fp32 --image photo.jpg --output geometry.npz
 
 # video depth, from a file or from repeated frames
-mlx_vlm extract --model mlx-community/Video-Depth-Anything-Small-MLX --video clip.mp4
-mlx_vlm extract --model mlx-community/Video-Depth-Anything-Small-MLX --image f0.png --image f1.png
+mlx_vlm.extract --model mlx-community/Video-Depth-Anything-Small-MLX --video clip.mp4
+mlx_vlm.extract --model mlx-community/Video-Depth-Anything-Small-MLX --image f0.png --image f1.png
 
 # detect by concept, and pass a model's own options
-mlx_vlm extract --model <sam3-path> --image street.jpg --prompt "a person" --set score_threshold=0.4
+mlx_vlm.extract --model <sam3-path> --image street.jpg --prompt "a person" --set score_threshold=0.4
 
 # conditioning inputs that are too large to write inline
-mlx_vlm extract --model <sam3d-objects-path> --image mug.png --set-file mask=mug_mask.png
+mlx_vlm.extract --model <sam3d-objects-path> --image mug.png --set-file mask=mug_mask.png
 ```
 
 The command prints a JSON manifest of the named outputs with their shapes

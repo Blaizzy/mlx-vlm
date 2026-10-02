@@ -80,13 +80,13 @@ mapping of named outputs, the way `decision_types` and `predict` work for
 decision models. Named outputs are arrays; anything else a result carries,
 such as class names, a mesh or a flag, goes under the reserved `metadata`
 key, mirroring how decision results keep model-specific metrics there. `mlx_vlm.extraction.extract` validates the task against the
-declaration before the model runs, and `mlx_vlm extract` exposes it on the
+declaration before the model runs, and `mlx_vlm.extract` exposes it on the
 command line:
 
 ```shell
-mlx_vlm extract --model <path> --image frame.png --output out.npz
-mlx_vlm extract --model <path> --list-tasks
-mlx_vlm extract --model <path> --image frame.png --set score_threshold=0.5
+mlx_vlm.extract --model <path> --image frame.png --output out.npz
+mlx_vlm.extract --model <path> --list-tasks
+mlx_vlm.extract --model <path> --image frame.png --set score_threshold=0.5
 ```
 
 `--set NAME=VALUE` is repeatable and forwards keywords to `extract`,

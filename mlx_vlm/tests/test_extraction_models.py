@@ -3099,3 +3099,21 @@ class TestSam3BoxPrompts(unittest.TestCase):
             boxes=mx.zeros((1, 0, 4)),
         )
         self.assertTrue(mx.allclose(plain["pred_logits"], empty["pred_logits"]).item())
+
+
+class TestExtractionEntryPoint(unittest.TestCase):
+    """The documented command has to exist as a console script."""
+
+    def test_extract_is_registered(self):
+        try:
+            import tomllib
+        except ModuleNotFoundError:
+            self.skipTest("tomllib needs Python 3.11")
+        root = Path(__file__).resolve().parents[2] / "pyproject.toml"
+        if not root.exists():
+            self.skipTest("running outside a source checkout")
+        scripts = tomllib.loads(root.read_text())["project"]["scripts"]
+        self.assertEqual(scripts.get("mlx_vlm.extract"), "mlx_vlm.extract:main")
+        from mlx_vlm.extract import main
+
+        self.assertTrue(callable(main))
