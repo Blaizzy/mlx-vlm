@@ -732,10 +732,18 @@ class SAM3DBody(nn.Module):
             "hand_box_embedding.weight": "hand_box_embedding",
         }
         skip_prefixes = ("prompt_encoder.mask_downscaling.",)
+        unused_mhr = (
+            "head_pose.body_model.parameter_limits",
+            "head_pose.body_model.pmi",
+            "head_pose.body_model.texcoord_faces",
+            "head_pose.body_model.texcoords",
+        )
 
         sanitized = {}
         for key, tensor in weights.items():
-            if any(key.startswith(p) for p in hand_prefixes):
+            if any(key == p[:-1] or key.startswith(p) for p in hand_prefixes):
+                continue
+            if key in unused_mhr:
                 continue
             if any(key.startswith(p) for p in skip_prefixes):
                 continue
