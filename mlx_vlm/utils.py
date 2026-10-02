@@ -1419,7 +1419,12 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
     # GLiNER2.5 ships its encoder config in a sidecar directory instead of
     # inline, so fold it in alongside the other config files. Raised outside the
     # block above so the missing file is not reported as a missing config.json.
-    if "BoundaryExtractor" in (config.get("architectures") or ()):
+    # Keyed on the model type as well as the architecture string, because the
+    # span checkpoints declare `gliner2_5` without naming BoundaryExtractor.
+    if (
+        "BoundaryExtractor" in (config.get("architectures") or ())
+        or config.get("model_type") == "gliner2_5"
+    ):
         if "encoder_config" not in config:
             encoder_config_path = model_path / "encoder_config" / "config.json"
             if not encoder_config_path.is_file():

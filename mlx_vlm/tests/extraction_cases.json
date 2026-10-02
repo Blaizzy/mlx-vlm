@@ -1,6 +1,57 @@
 {
   "cases": [
     {
+      "id": "gliner2_5_decide",
+      "module": "gliner2_5",
+      "config": {
+        "architecture": "span",
+        "encoder_config": {
+          "vocab_size": 512,
+          "hidden_size": 8,
+          "num_hidden_layers": 1,
+          "num_attention_heads": 2,
+          "intermediate_size": 16,
+          "position_buckets": 4,
+          "max_relative_positions": -1,
+          "max_position_embeddings": 8
+        }
+      },
+      "checks": [
+        "registry_and_config",
+        "checkpoint",
+        "decision_models"
+      ],
+      "decision_models": {
+        "special_tokens": [
+          "[SEP_TEXT]",
+          "[SEP_STRUCT]",
+          "[P]",
+          "[E]",
+          "[L]",
+          "[C]",
+          "[DESCRIPTION]"
+        ],
+        "state": "A B",
+        "questions": {
+          "route": {
+            "type": "choice",
+            "criteria": [
+              "A",
+              "B"
+            ]
+          },
+          "tags": {
+            "type": "multi_label",
+            "criteria": [
+              "A",
+              "B"
+            ],
+            "threshold": 0.9
+          }
+        }
+      }
+    },
+    {
       "id": "laya",
       "module": "laya",
       "config": {
@@ -268,7 +319,27 @@
           "max_relative_positions": 128
         }
       },
-      "checks": ["registry_and_config"]
+      "checks": ["registry_and_config", "decision_models"],
+      "decision_models": {
+        "special_tokens": [
+          "[SEP_TEXT]",
+          "[SEP_STRUCT]",
+          "[P]",
+          "[E]",
+          "[L]",
+          "[C]",
+          "[DESCRIPTION]"
+        ],
+        "state": "A B",
+        "questions": {
+          "route": { "type": "choice", "criteria": ["A", "B"] },
+          "tags": {
+            "type": "multi_label",
+            "criteria": ["A", "B"],
+            "threshold": 0.5
+          }
+        }
+      }
     },
     {
       "id": "openai_privacy_filter",
