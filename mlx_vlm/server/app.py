@@ -87,23 +87,11 @@ def _require_management_api_key(request: HTTPConnection) -> None:
 
 def _cache_group_for_cache(cache: dict) -> str:
     model_kind = cache.get("model_kind")
-    if model_kind == "image_generation":
-        return "image_generation"
-    if model_kind == "image_edit":
-        return "image_edit"
     if model_kind == "audio_tts":
         return "tts"
     if model_kind == "audio_stt":
         return "stt"
-    if model_kind == "audio":
-        return "audio"
-    if model_kind == "embedding":
-        return "embedding"
-    if model_kind == "reranker":
-        return "reranker"
-    if model_kind == "decision":
-        return "decision"
-    return "text_generation"
+    return model_kind or "text_generation"
 
 
 def _model_info(model_id: str, created: int, *, loaded: bool = False) -> dict:
