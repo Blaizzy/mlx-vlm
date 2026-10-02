@@ -2072,3 +2072,71 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
                 )
                 self.assertTrue(bool(mx.all(cache[0].engram[:, 2:5] == -1)))
                 self.assertTrue(bool(mx.allclose(actual, expected, atol=1e-4)))
+
+
+class TestMoERouterStopGradient:
+    def test_gather_indices_are_stop_gradiented(self):
+        import re
+
+        import mlx_vlm
+
+        offenders = []
+        for path in sorted((Path(mlx_vlm.__file__).parent / "models").rglob("*.py")):
+            src = path.read_text(encoding="utf-8")
+            if "take_along_axis" not in src or "argpartition" not in src:
+                continue
+            from_argsort = set(
+                re.findall(r"(\w+)\s*=\s*[^\n]*arg(?:partition|sort)", src)
+            )
+            for m in re.finditer(r"(\w+)\s*=\s*(\w+)\[", src):
+                if m.group(2) in from_argsort:
+                    from_argsort.add(m.group(1))
+            stopped = set(re.findall(r"(\w+)\s*=\s*mx\.stop_gradient", src))
+            for m in re.finditer(
+                r"take_along_axis\(\s*[^,]+?\s*,\s*(.+?)\s*,\s*axis", src
+            ):
+                idx = m.group(1).strip()
+                if "stop_gradient" in idx:
+                    continue
+                var = re.match(r"[A-Za-z_]\w*", idx)
+                var = var.group(0) if var else ""
+                if var and var not in stopped and var in from_argsort:
+                    offenders.append(
+                        f"{path.parent.name}/{path.name}: take_along_axis(..., {idx})"
+                    )
+        assert (
+            not offenders
+        ), "gather indices need mx.stop_gradient (MLX >= 0.32.1):\n" + "\n".join(
+            offenders
+        )
+
+    @pytest.mark.parametrize(
+        "module,cls,extra",
+        [
+            (
+                "qwen3_5_moe",
+                "Qwen3_5MoeSparseMoeBlock",
+                {"shared_expert_intermediate_size": 8},
+            ),
+            ("qwen3_moe", "Qwen3MoeSparseMoeBlock", {"norm_topk_prob": True}),
+        ],
+    )
+    def test_moe_router_backpropagates_through_dispatch(self, module, cls, extra):
+        import importlib
+        import types
+
+        block_cls = getattr(
+            importlib.import_module(f"mlx_vlm.models.{module}.language"), cls
+        )
+        args = types.SimpleNamespace(
+            hidden_size=16,
+            moe_intermediate_size=8,
+            num_experts=4,
+            num_experts_per_tok=2,
+            **extra,
+        )
+        block = block_cls(args)
+        x = mx.random.normal((1, 3, 16))
+        _, grads = nn.value_and_grad(block, lambda m, inp: m(inp).sum())(block, x)
+        total = sum(float(mx.sum(mx.abs(g))) for _, g in tree_flatten(grads))
+        assert total > 0 and bool(mx.isfinite(mx.array(total)))

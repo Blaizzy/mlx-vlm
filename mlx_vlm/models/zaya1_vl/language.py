@@ -394,6 +394,7 @@ class ZayaRouter(nn.Module):
         biased = expert_prob.astype(mx.float32) + self.balancing_biases
         if self.topk == 1:
             expert_choice = mx.expand_dims(mx.argmax(biased, axis=-1), axis=-1)
+            expert_choice = mx.stop_gradient(expert_choice)
             route_prob = mx.take_along_axis(expert_prob, expert_choice, axis=-1)
         else:
             expert_choice = mx.argpartition(biased, kth=-self.topk, axis=-1)[

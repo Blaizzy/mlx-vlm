@@ -94,6 +94,7 @@ class Router(nn.Module):
         )
         top_k_indices = top_k_indices[..., -self.config.top_k_experts :]
 
+        top_k_indices = mx.stop_gradient(top_k_indices)
         top_k_weights = mx.take_along_axis(expert_scores, top_k_indices, axis=-1)
         top_k_weights = mx.softmax(top_k_weights, axis=-1)
         top_k_weights = top_k_weights * self.per_expert_scale[top_k_indices]

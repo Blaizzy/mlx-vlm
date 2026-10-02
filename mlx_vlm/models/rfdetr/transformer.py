@@ -463,8 +463,10 @@ class Transformer(nn.Module):
         topk_indices = mx.argpartition(-max_scores, kth=num_queries, axis=-1)[
             :, :num_queries
         ]
+        topk_indices = mx.stop_gradient(topk_indices)
         topk_scores = mx.take_along_axis(max_scores, topk_indices, axis=-1)
         sort_idx = mx.argsort(-topk_scores, axis=-1)
+        sort_idx = mx.stop_gradient(sort_idx)
         topk_indices = mx.take_along_axis(topk_indices, sort_idx, axis=-1)
 
         # Gather selected features and boxes

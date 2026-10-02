@@ -68,6 +68,7 @@ def _top_p_logits(logits: mx.array, top_p: float) -> mx.array:
 
     probs = mx.softmax(logits.astype(mx.float32), axis=-1)
     indices = mx.argsort(probs, axis=-1)
+    indices = mx.stop_gradient(indices)
     sorted_probs = mx.take_along_axis(probs, indices, axis=-1)
     # Keep a component while the mass above it is below top_p. Comparing the
     # running sum with 1 - top_p masks everything for tiny top_p, where
