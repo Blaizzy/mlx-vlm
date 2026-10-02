@@ -617,70 +617,8 @@ class SAM3DBody(nn.Module):
                 for key in f.keys():
                     all_tensors[key] = mx.array(f.get_tensor(key))
 
-        # Build weight list for self.load_weights()
-        weights = []
-
-        # Skip keys that belong to hand-specific modules
-        hand_prefixes = (
-            "decoder_hand.",
-            "head_pose_hand.",
-            "head_camera_hand.",
-            "init_pose_hand.",
-            "init_camera_hand.",
-            "init_to_token_mhr_hand.",
-            "prev_to_token_mhr_hand.",
-            "keypoint_embedding_hand.",
-            "keypoint3d_embedding_hand.",
-            "keypoint_posemb_linear_hand.",
-            "keypoint3d_posemb_linear_hand.",
-            "keypoint_feat_linear_hand.",
-            "ray_cond_emb_hand.",
-        )
-
-        # Bare array parameters stored with ".weight" suffix in safetensors
-        # but are plain attributes on the model (not nn.Module submodules)
-        bare_param_keys = {
-            "init_pose.weight": "init_pose",
-            "init_camera.weight": "init_camera",
-            "keypoint_embedding.weight": "keypoint_embedding",
-            "keypoint3d_embedding.weight": "keypoint3d_embedding",
-            "hand_box_embedding.weight": "hand_box_embedding",
-        }
-
-        # mask_downscaling is in the prompt_encoder but not modeled (unused for inference)
-        skip_prefixes = ("prompt_encoder.mask_downscaling.",)
-
-        for key, tensor in all_tensors.items():
-            # Skip hand variants
-            if any(key.startswith(p) for p in hand_prefixes):
-                continue
-
-            # MHR body model weights go through head_pose.load_all_weights
-            if key.startswith("mhr."):
-                continue
-
-            # Skip mask_downscaling (not used in body-only inference)
-            if any(key.startswith(p) for p in skip_prefixes):
-                continue
-
-            # Backbone weights: already prefixed correctly
-            if key.startswith("backbone."):
-                # Skip bias_mask keys (not used in MLX)
-                if "bias_mask" in key:
-                    continue
-                # Skip k_proj.bias (K bias is masked to zero)
-                if "k_proj.bias" in key:
-                    continue
-                weights.append((key, tensor))
-                continue
-
-            # Remap bare param keys
-            if key in bare_param_keys:
-                weights.append((bare_param_keys[key], tensor))
-                continue
-
-            # All other keys map directly
-            weights.append((key, tensor))
+        body = {k: v for k, v in all_tensors.items() if not k.startswith("mhr.")}
+        weights = list(SAM3DBody.sanitize(body).items())
 
         self.load_weights(weights, strict=False)
 

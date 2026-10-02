@@ -1,8 +1,8 @@
 """Convert HuggingFace RT-DETRv2 checkpoints to MLX safetensors format.
 
 The HF `config.json` is consumed as-is; the only transformation is on
-the weights themselves (key renames + Conv2d NCHW->NHWC transpose), then
-optional quantization.
+the weight names, then optional quantization. The NCHW->NHWC conv layout
+change belongs to `Model.sanitize`, which the loader always applies.
 
 Usage:
     python -m mlx_vlm.models.rt_detr_v2.convert \\
@@ -131,16 +131,11 @@ def convert(hf_path: str, output: str, dtype: str = "bfloat16") -> Path:
             continue
         new_k = rename(k)
         arr = mx.array(v.detach().cpu().numpy())
-        if new_k.endswith(".conv.weight") and arr.ndim == 4:
-            arr = arr.transpose(0, 2, 3, 1)
         sanitized[new_k] = arr.astype(mlx_dtype)
     print(f"  renamed {len(sanitized)} tensors, dropped {n_dropped}, cast to {dtype}")
 
     weights_path = out / "model.safetensors"
-    # `metadata={"format": "mlx"}` is what `mlx_vlm.utils.load_model` keys on
-    # to skip `Model.sanitize` — without it the loader would re-run the
-    # rename + NCHW->NHWC transpose pipeline against already-MLX weights.
-    mx.save_safetensors(str(weights_path), sanitized, metadata={"format": "mlx"})
+    mx.save_safetensors(str(weights_path), sanitized)
     print(f"  wrote {weights_path} ({weights_path.stat().st_size / 1e6:.1f} MB)")
 
     # Copy config.json + preprocessor_config.json + any tokenizer files.
@@ -158,10 +153,9 @@ def convert(hf_path: str, output: str, dtype: str = "bfloat16") -> Path:
 def _verify(out: Path) -> None:
     """Smoke-test the converted checkpoint via the framework loader.
 
-    Goes through `mlx_vlm.utils.load_model` (not raw `mx.load`) so the
-    sanitize-metadata path is exercised — a saved file without
-    `metadata['format'] = 'mlx'` would re-trigger `Model.sanitize`
-    and double-transpose conv weights, and this verify catches it.
+    Goes through `mlx_vlm.utils.load_model` rather than raw `mx.load` so the
+    conversion is checked against the same `Model.sanitize` pass that real
+    loads apply, which is what catches a conv weight transposed twice.
     """
     import mlx.core as mx
 
