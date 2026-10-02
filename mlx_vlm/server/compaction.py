@@ -2,7 +2,7 @@
 
 Capsules contain conversation items, never tensors. Replaying one constructs a
 normal prompt, so APC can reuse only an actually matching prefix. The latest
-capsule replaces all preceding conversation items (including older capsules).
+capsule replaces older history, while Codex's retained-message prefix survives.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import json
 import os
 import tempfile
 import uuid
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -98,19 +99,45 @@ def resolve(items: list[dict], *, model: str, tenant: str | None) -> list[dict]:
             ) from exc
         tail = items[index + 1 :]
 
+        # Codex rebuilds its window as retained user/instruction messages followed
+        # by the opaque item. A full transcript (with assistant/tool items or an
+        # older capsule) is instead superseded by the latest capsule.
+        prefix = items[:index]
+        if prefix and all(
+            x.get("type") == "message"
+            and x.get("role") in ("user", "system", "developer")
+            and not x.get("tool_calls")
+            for x in prefix
+        ):
+            carried = Counter(_message_key(x) for x in context)
+            retained = []
+            for message in prefix:
+                key = _message_key(message)
+                if carried[key]:
+                    carried[key] -= 1
+                else:
+                    retained.append(message)
+            # Keep leading instructions in place and recent tool exchanges intact.
+            start = next(
+                (i for i, x in enumerate(context) if not _is_instruction(x)),
+                len(context),
+            )
+            context = context[:start] + retained + context[start:]
+
         # Codex re-sends its developer prefix after each opaque boundary. Do not
         # accumulate identical carried instructions on every compaction cycle.
-        def instruction_key(value):
-            return value.get("role"), json.dumps(value.get("content"), sort_keys=True)
-
-        repeated = {instruction_key(x) for x in tail if _is_instruction(x)}
+        repeated = {_message_key(x) for x in tail if _is_instruction(x)}
         context = [
             x
             for x in context
-            if not _is_instruction(x) or instruction_key(x) not in repeated
+            if not _is_instruction(x) or _message_key(x) not in repeated
         ]
         return context + tail
     return items
+
+
+def _message_key(item: dict) -> tuple[str | None, str]:
+    return item.get("role"), json.dumps(item.get("content"), sort_keys=True)
 
 
 def _is_instruction(item: dict) -> bool:

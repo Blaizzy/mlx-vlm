@@ -2158,6 +2158,85 @@ class TestCompaction:
             assert sum(x.get("content") == prefix["content"] for x in original) == 1
             assert other in original
 
+    def test_codex_retained_messages_survive_capsule_replay(self):
+        instruction = _compaction_message("Keep user constraints.", "developer")
+        requirement = _compaction_message("Project ORCHID. Never edit secrets.env.")
+        correction = _compaction_message("Use port 8421 instead of 7319.")
+        repeated = _compaction_message("Continue")
+        latest = _compaction_message("Read the log")
+        call = {"type": "function_call", "call_id": "c1", "name": "read_file"}
+        output = {"type": "function_call_output", "call_id": "c1", "output": "done"}
+        context = [
+            instruction,
+            _compaction_message("Routine logs inspected.", "assistant"),
+            latest,
+            call,
+            output,
+        ]
+        retained = [requirement, repeated, repeated, correction]
+        expected = context[:1] + retained + context[1:]
+        for cycle in range(3):
+            capsule = compaction.seal(context, model="demo", tenant=None)
+            # Codex may regenerate message IDs when rebuilding the window.
+            inputs = [
+                {**item, "id": f"{cycle}-{index}"}
+                for index, item in enumerate([instruction, *retained, latest])
+            ] + [capsule, _compaction_message("What are the current requirements?")]
+            original = copy.deepcopy(inputs)
+            context = compaction.resolve(inputs, model="demo", tenant=None)
+            assert inputs == original
+            assert [
+                {key: value for key, value in item.items() if key != "id"}
+                for item in context
+            ] == expected + [inputs[-1]]
+            context = context[:-1]
+
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_codex_retained_messages_reach_generation_and_token_count(
+        self, mocked, stream
+    ):
+        fake, client = mocked
+        requirement = _compaction_message("Project ORCHID. Never edit secrets.env.")
+        correction = _compaction_message("Use port 8421 instead of 7319.")
+        context = [_compaction_message("Routine logs inspected.", "assistant")]
+        capsule = compaction.seal(context, model="demo", tenant=None)
+        question = _compaction_message("What are the current requirements?")
+        inputs = [requirement, correction, capsule, question]
+        expected = [requirement, correction, *context, question]
+        counted = _post(client, "/responses/input_tokens", input=inputs)
+        plain = _post(client, "/responses/input_tokens", input=expected)
+        assert counted.status_code == plain.status_code == 200
+        assert counted.json() == plain.json()
+        response = _post(client, "responses", input=inputs, stream=stream)
+        assert response.status_code == 200, response.text
+        rendered = fake.template.call_args.args[2]
+        assert [item["content"] for item in rendered] == [
+            item["content"] for item in expected
+        ]
+
+    def test_codex_retained_messages_count_toward_context_budget(
+        self, mocked, monkeypatch
+    ):
+        fake, client = mocked
+        capsule = compaction.seal(
+            [_compaction_message("Short handoff", "assistant")],
+            model="demo",
+            tenant=None,
+        )
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", 1024)
+        response = _post(
+            client,
+            "responses",
+            input=[_compaction_message("Retained user text. " * 1000), capsule],
+            max_output_tokens=64,
+            context_management=[{"type": "compaction", "compact_threshold": 10000}],
+        )
+        assert response.status_code == 400, response.text
+        assert response.json()["detail"] == (
+            "Compaction input must fit within the model context window."
+        )
+        fake.generate.assert_not_called()
+
     def test_pending_parallel_tools_cannot_be_split(self):
         items = [
             _compaction_message("start"),
