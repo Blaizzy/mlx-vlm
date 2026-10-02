@@ -1748,11 +1748,13 @@ def test_responses_native_tool_calls(client, kind, stream):
 
 @pytest.mark.parametrize("continuous", [False, True])
 @pytest.mark.parametrize(
-    "parts,types",
+    "parts,types,template,finish_reason",
     [
         (
             ["<tool_call>", '{"name":"get_weather","arguments":{}}', "</tool_call>"],
             ["function_call"],
+            "prompt",
+            "stop",
         ),
         (
             [
@@ -1760,6 +1762,8 @@ def test_responses_native_tool_calls(client, kind, stream):
                 '<tool_call>{"name":"get_weather","arguments":{}}</tool_call>',
             ],
             ["message", "function_call"],
+            "prompt",
+            "stop",
         ),
         (
             [
@@ -1769,30 +1773,64 @@ def test_responses_native_tool_calls(client, kind, stream):
                 '<tool_call>{"name":"get_weather","arguments":{}}</tool_call>',
             ],
             ["reasoning", "function_call"],
+            "prompt",
+            "stop",
         ),
-        (["<think>Check first.</think>", "Sunny."], ["reasoning", "message"]),
-        (["Hello", " world."], ["message"]),
-        ([""], []),
-        (["<think>Check first.</think>"], ["reasoning"]),
+        (
+            ["<think>Check first.</think>", "Sunny."],
+            ["reasoning", "message"],
+            "prompt",
+            "stop",
+        ),
+        (["Hello", " world."], ["message"], "prompt", "stop"),
+        ([""], [], "prompt", "stop"),
+        (["<think>Check first.</think>"], ["reasoning"], "prompt", "stop"),
+        ([" ", "\n"], [], "prompt", "stop"),
+        (
+            [" \n", "<think>", "Check first.", "</think>"],
+            ["reasoning"],
+            "prompt",
+            "stop",
+        ),
+        (["<think>", " \n", "</think>"], [], "prompt", "stop"),
+        (["Check first."], ["reasoning"], "prompt<think>", "length"),
+        (
+            [" \n", "Hello ", "\n  ", "world. ", "\n"],
+            ["message"],
+            "prompt",
+            "stop",
+        ),
+        (
+            ["<think> \n", "Check ", "\n  ", "first. \n</think>", " \n"],
+            ["reasoning"],
+            "prompt",
+            "stop",
+        ),
     ],
 )
 def test_responses_stream_items_match_completed_output(
-    client, continuous, parts, types
+    client, continuous, parts, types, template, finish_reason
 ):
     chunks = [
-        _result(text, finish_reason="stop" if i == len(parts) - 1 else None)
+        _result(text, finish_reason=finish_reason if i == len(parts) - 1 else None)
         for i, text in enumerate(parts)
     ]
     tokens = [
-        _token(text, finish_reason="stop" if i == len(parts) - 1 else None)
+        _token(text, finish_reason=finish_reason if i == len(parts) - 1 else None)
         for i, text in enumerate(parts)
     ]
     with _endpoint(
         chunks=chunks,
         generator=_streaming(tokens) if continuous else None,
+        template=template,
         parser=_JSON_TOOLS,
     ):
-        response = _post(client, "responses", stream=True, tools=[_tool()])
+        response = _post(
+            client,
+            "responses",
+            stream=True,
+            tools=[_tool()] if "function_call" in types else [],
+        )
     assert response.status_code == 200, response.text
     events = _data(response)
     final = next(
@@ -1820,6 +1858,40 @@ def test_responses_stream_items_match_completed_output(
         if event["type"] == "response.output_text.delta"
     )
     assert visible == final["output_text"]
+    reasoning = "".join(
+        event["delta"]
+        for event in events
+        if event["type"] == "response.reasoning_text.delta"
+    )
+    assert reasoning == "".join(
+        part["text"]
+        for item in final["output"]
+        if item["type"] == "reasoning"
+        for part in item["summary"]
+    )
+    assert reasoning == "".join(
+        event["text"]
+        for event in events
+        if event["type"] == "response.reasoning_text.done"
+    )
+
+
+@pytest.mark.parametrize("continuous", [False, True])
+def test_responses_truncated_preopened_reasoning(client, continuous):
+    text = "Check first."
+    with _endpoint(
+        template="prompt<think>",
+        result=_result(text, finish_reason="length"),
+        generator=(
+            _streaming([_token(text, finish_reason="length")]) if continuous else None
+        ),
+    ):
+        response = _post(client, "responses").json()
+    assert response["output_text"] == ""
+    assert len(response["output"]) == 1
+    item = response["output"][0]
+    assert item["type"] == "reasoning"
+    assert item["summary"] == [{"type": "summary_text", "text": text}]
 
 
 @pytest.mark.parametrize(

@@ -1281,6 +1281,13 @@ async def responses_endpoint(request: Request):
             **template_kwargs,
         )
 
+        starts_in_thinking = prompt_has_open_thinking(
+            formatted_prompt,
+            gen_args.enable_thinking,
+            gen_args.thinking_start_token,
+            gen_args.thinking_end_token,
+        )
+
         logger.debug(
             "responses request: model=%s images=%d max_tokens=%s temp=%s stream=%s",
             openai_request.model,
@@ -1360,6 +1367,7 @@ async def responses_endpoint(request: Request):
                             )
 
                     output_indices = {}
+                    pending_whitespace = {}
 
                     def start_output_item(item):
                         item_id = item["id"]
@@ -1402,6 +1410,13 @@ async def responses_endpoint(request: Request):
                                 "content": [],
                             }
                             event_type = "response.output_text.delta"
+                        text = pending_whitespace.get(kind, "") + delta
+                        if item["id"] not in output_indices:
+                            text = text.lstrip()
+                        delta = text.rstrip()
+                        pending_whitespace[kind] = text[len(delta) :]
+                        if not delta:
+                            return
                         yield from start_output_item(item)
                         yield _response_sse_event(
                             event_type,
@@ -1436,12 +1451,7 @@ async def responses_endpoint(request: Request):
                     tool_call_state = ToolCallStreamState(tc_start, tc_end)
                     thinking_state = make_response_stream_state(
                         processor,
-                        prompt_has_open_thinking(
-                            formatted_prompt,
-                            gen_args.enable_thinking,
-                            gen_args.thinking_start_token,
-                            gen_args.thinking_end_token,
-                        ),
+                        starts_in_thinking,
                         gen_args.thinking_start_token,
                         gen_args.thinking_end_token,
                     )
@@ -1570,6 +1580,7 @@ async def responses_endpoint(request: Request):
                             gen_args.thinking_end_token,
                             reasoning_item_id,
                             processor=processor,
+                            starts_in_thinking=starts_in_thinking,
                         )
                     )
                     if clean_text and not any(
@@ -1609,7 +1620,7 @@ async def responses_endpoint(request: Request):
                                     "item_id": item["id"],
                                     "output_index": output_index,
                                     "content_index": 0,
-                                    "text": streamed_reasoning,
+                                    "text": streamed_reasoning.strip(),
                                 },
                             )
                         elif item["type"] == "message":
@@ -1807,6 +1818,7 @@ async def responses_endpoint(request: Request):
                         gen_args.thinking_start_token,
                         gen_args.thinking_end_token,
                         processor=processor,
+                        starts_in_thinking=starts_in_thinking,
                     )
                 )
                 if output_finish_reason == "tool_calls":

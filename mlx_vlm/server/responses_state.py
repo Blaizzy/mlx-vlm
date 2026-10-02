@@ -533,11 +533,13 @@ def _response_output_items_from_text(
     thinking_end_token: Optional[str] = None,
     reasoning_item_id: Optional[str] = None,
     processor=None,
+    starts_in_thinking: bool = False,
 ) -> Tuple[List[Dict[str, Any]], str, Optional[str], str]:
     reasoning, content = _split_thinking(
         full_text,
         thinking_start_token,
         thinking_end_token,
+        starts_in_thinking=starts_in_thinking,
         processor=processor,
     )
     reasoning_items = _reasoning_output_items(reasoning, reasoning_item_id)
@@ -551,6 +553,7 @@ def _response_output_items_from_text(
                 tc.remaining_text or "",
                 thinking_start_token,
                 thinking_end_token,
+                starts_in_thinking=starts_in_thinking,
             )
             remaining = strip_protocol_markers(
                 remaining, tool_module, thinking_start_token, thinking_end_token
