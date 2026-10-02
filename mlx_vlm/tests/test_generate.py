@@ -1511,6 +1511,99 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
     assert captured["prompt_kwargs"]["keep_tensor"].shape == (2, 1)
 
 
+class TestRestoredRowsGetColdCaches:
+    """A restored single row is given the caches a cold single row would get
+    (the model's own, as generate() uses), not a batch merge of them."""
+
+    def _restore(
+        self, *, picks, kv_bits=None, drafting=False, make_cache=True, lengths=(8,)
+    ):
+        bg = object.__new__(BatchGenerator)
+        bg.apc_manager = object()
+        bg.model = SimpleNamespace(layers=[object()])
+        if make_cache:
+            bg.model.make_cache = lambda: []
+        bg.prefill_step_size = None
+        bg.kv_bits = kv_bits
+        bg.kv_group_size = 64
+        bg.kv_quant_scheme = "uniform"
+        bg._wire_stack = None
+        if drafting:
+            bg.draft_model, bg.draft_kind = object(), "mtp"
+        bg.apc = MagicMock()
+        bg.apc.materialize_single.return_value = ["plain"]
+        bg.apc.merge_rows.return_value = (["batch"], 4)
+
+        sequences = [
+            (
+                uid,
+                list(range(n)),
+                1,
+                {"inputs_embeds": mx.ones((1, n, 4))},
+                [],
+                None,
+            )
+            for uid, n in enumerate(lengths)
+        ]
+        captured = {}
+
+        def fake_prompt_batch(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(**kwargs)
+
+        with (
+            patch.object(BatchGenerator, "_apc_pick_for", side_effect=picks),
+            patch.object(generate_module, "PromptProcessingBatch", fake_prompt_batch),
+        ):
+            assert bg._build_mixed_prompt_batch(sequences) is not None
+        return bg, captured
+
+    @staticmethod
+    def _checkpoint_pick(n=8):
+        return {
+            "warm_cache": ["warm"],
+            "matched_blocks": [],
+            "prefix_len": 4,
+            "extra_hash": 7,
+            "full_input_ids": list(range(n)),
+        }
+
+    def test_a_lone_checkpoint_hit_gets_its_own_cache(self):
+        bg, captured = self._restore(picks=[self._checkpoint_pick()])
+        assert captured["warm_cache"] == ["plain"]
+        bg.apc.merge_rows.assert_not_called()
+        (hit,), kwargs = bg.apc.materialize_single.call_args
+        assert hit["warm_cache"] == ["warm"]
+        assert kwargs == {"min_capacity_tokens": 9, "kv_quant_config": None}
+
+    @pytest.mark.parametrize(
+        "case",
+        [
+            {"drafting": True},
+            {"kv_bits": 8},
+            {"make_cache": False},
+        ],
+        ids=["drafter", "kv_bits", "no_make_cache"],
+    )
+    def test_the_cases_a_cold_row_batches_keep_the_merge(self, case):
+        bg, captured = self._restore(picks=[self._checkpoint_pick()], **case)
+        assert captured["warm_cache"] == ["batch"]
+        bg.apc.materialize_single.assert_not_called()
+
+    def test_a_block_hit_keeps_the_merge(self):
+        block = {"matched_blocks": [], "prefix_len": 4, "extra_hash": 7}
+        bg, captured = self._restore(picks=[block])
+        assert captured["warm_cache"] == ["batch"]
+        bg.apc.materialize_single.assert_not_called()
+
+    def test_several_rows_keep_the_merge(self):
+        bg, captured = self._restore(
+            picks=[self._checkpoint_pick(), None], lengths=(8, 6)
+        )
+        assert captured["warm_cache"] == ["batch"]
+        bg.apc.materialize_single.assert_not_called()
+
+
 def test_apc_pick_rejects_image_tokens_and_releases_blocks():
     block_size = 4
     image_token_id = 99
