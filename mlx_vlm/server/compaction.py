@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -48,9 +49,24 @@ def _cipher() -> Fernet:
     return Fernet(path.read_bytes().strip())
 
 
-def seal(items: list[dict], *, model: str, tenant: str | None) -> dict:
+@dataclass
+class ResolvedContext:
+    items: list[dict]
+    covered: frozenset[str] = frozenset()
+
+
+def seal(
+    items: list[dict],
+    *,
+    model: str,
+    tenant: str | None,
+    covered: frozenset[str] = frozenset(),
+) -> dict:
+    state = {"version": 1, "model": model, "tenant": tenant, "items": items}
+    if covered:
+        state["covered"] = sorted(covered)
     payload = json.dumps(
-        {"version": 1, "model": model, "tenant": tenant, "items": items},
+        state,
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode()
@@ -62,6 +78,12 @@ def seal(items: list[dict], *, model: str, tenant: str | None) -> dict:
 
 
 def resolve(items: list[dict], *, model: str, tenant: str | None) -> list[dict]:
+    return resolve_context(items, model=model, tenant=tenant).items
+
+
+def resolve_context(
+    items: list[dict], *, model: str, tenant: str | None
+) -> ResolvedContext:
     """Accept either full-history replay or just the latest capsule plus new items."""
     for index in range(len(items) - 1, -1, -1):
         item = items[index]
@@ -77,11 +99,14 @@ def resolve(items: list[dict], *, model: str, tenant: str | None) -> list[dict]:
                 _cipher().decrypt(encrypted[len(CAPSULE_PREFIX) :].encode())
             )
             context = payload["items"]
+            covered = payload.get("covered", [])
             if (
                 payload["version"] != 1
                 or payload["model"] != model
                 or payload["tenant"] != tenant
                 or not isinstance(context, list)
+                or not isinstance(covered, list)
+                or any(not isinstance(x, str) for x in covered)
                 or any(
                     not isinstance(x, dict) or x.get("type") == "compaction"
                     for x in context
@@ -92,12 +117,18 @@ def resolve(items: list[dict], *, model: str, tenant: str | None) -> list[dict]:
             raise HTTPException(
                 400, "Invalid compaction state for this server, model, or tenant."
             ) from exc
-        return _merge_retained_messages(items[:index], context, items[index + 1 :])
-    return items
+        covered = frozenset(covered)
+        return ResolvedContext(
+            _merge_retained_messages(
+                items[:index], context, items[index + 1 :], covered
+            ),
+            covered,
+        )
+    return ResolvedContext(items)
 
 
 def _merge_retained_messages(
-    prefix: list[dict], context: list[dict], tail: list[dict]
+    prefix: list[dict], context: list[dict], tail: list[dict], covered: frozenset[str]
 ) -> list[dict]:
     # A full transcript before the capsule has already been compacted.
     if prefix and all(
@@ -109,6 +140,8 @@ def _merge_retained_messages(
         carried = Counter(_message_key(x) for x in context)
         retained = []
         for message in prefix:
+            if _message_fingerprints(message) & covered:
+                continue
             key = _message_key(message)
             if carried[key]:
                 carried[key] -= 1
@@ -129,7 +162,18 @@ def _merge_retained_messages(
 
 
 def _message_key(item: dict) -> tuple[str | None, str]:
-    return item.get("role"), json.dumps(item.get("content"), sort_keys=True)
+    content = item.get("content")
+    if isinstance(content, str):
+        content = [{"type": "input_text", "text": content}]
+    return item.get("role"), json.dumps(content, sort_keys=True)
+
+
+def _message_fingerprints(item: dict) -> set[str]:
+    keys = {hashlib.sha256(json.dumps(_message_key(item)).encode()).hexdigest()}
+    if item.get("id"):
+        identity = json.dumps((item.get("role"), item["id"]))
+        keys.add("id:" + hashlib.sha256(identity.encode()).hexdigest())
+    return keys
 
 
 def _is_instruction(item: dict) -> bool:
@@ -215,6 +259,7 @@ class CompactedContext:
     after_tokens: int
     usage: Any = None
     changed: bool = False
+    covered: frozenset[str] = frozenset()
 
 
 async def compact(
@@ -224,10 +269,18 @@ async def compact(
     summarize: Callable[[list[dict]], Awaitable[tuple[str, Any]]],
     keep_tokens: int,
     target_tokens: int,
+    retain_tokens: int = 0,
+    covered: frozenset[str] = frozenset(),
 ) -> CompactedContext:
     """Summarize once, preserving instructions and the latest user exchange."""
     before = await count(items)
-    unchanged = CompactedContext(items, before, before)
+    covered = covered | frozenset(
+        key
+        for item in items
+        if item.get("type") == "message" and item.get("role") == "user"
+        for key in _message_fingerprints(item)
+    )
+    unchanged = CompactedContext(items, before, before, covered=covered)
     instructions = [x for x in items if _is_instruction(x)]
     conversation = [x for x in items if not _is_instruction(x)]
     boundaries = safe_boundaries(conversation)
@@ -270,9 +323,25 @@ async def compact(
         + conversation[cut:]
     )
     after = await count(result)
+    base_tokens = after
+    selected = []
+    for message in reversed(conversation[:cut]):
+        if (
+            retain_tokens <= 0
+            or message.get("type") != "message"
+            or message.get("role") != "user"
+            or message.get("tool_calls")
+        ):
+            continue
+        candidate = instructions + [message] + selected + result[len(instructions) :]
+        tokens = await count(candidate)
+        if tokens <= target_tokens and tokens - base_tokens <= retain_tokens:
+            selected.insert(0, message)
+            after = tokens
+    result = instructions + selected + result[len(instructions) :]
     if after >= before or after > target_tokens:
         raise HTTPException(
             400,
             "Compaction could not reach the context budget; original context preserved.",
         )
-    return CompactedContext(result, before, after, usage, True)
+    return CompactedContext(result, before, after, usage, True, covered)

@@ -116,13 +116,27 @@ For native compaction, a single terminal input item
 generating an answer. Both streaming and non-streaming responses contain exactly
 one compaction item, including when the history is too short to shorten. Its
 usage describes the summary pass. Clients can resend a prefix consisting only of
-retained user and system/developer messages before the compaction item. The
-server preserves this prefix, excluding copies already carried in the capsule,
-and includes it in token counts and context-budget checks. A full transcript
-containing assistant/tool items or older capsules is superseded by the latest
+retained user and system/developer messages before the compaction item. User
+messages already covered by that capsule use its selected originals and summary;
+replaying them does not restore discarded logs. New prefix messages are preserved
+and counted against the context budget. Older capsules without coverage metadata
+preserve the prefix, excluding copies already carried in the capsule. A full
+transcript containing assistant/tool items or older capsules is superseded by the latest
 capsule. Identical system/developer messages resent
 after a capsule replace their carried copies, preventing instruction growth
 across repeated compactions.
+
+The server also retains whole older user messages within a budget of 1/16 of the
+effective context limit, capped at 8192 tokens and the available compaction
+budget. It considers newest messages first, skips messages that do not fit, and
+preserves their original order and roles. Oversized pasted content goes through
+the existing summarizer. This is an MLX retention policy for smaller models, not
+the standalone OpenAI API's documented all-user-messages retention behavior.
+Coverage digests remain inside the encrypted item across repeated compactions
+and restarts. They match content when IDs change, or the original message ID when
+the client truncates a retained message. They add payload bytes but no model
+prompt tokens. Messages after the capsule are new input, even when their text
+repeats earlier messages.
 
 The server preserves the latest exchange and never cuts across outstanding tool
 calls. It makes one summary attempt and accepts it only if it fits the available

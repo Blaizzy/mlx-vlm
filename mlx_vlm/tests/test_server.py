@@ -2082,8 +2082,9 @@ class TestCompaction:
         assert "ORCHID" not in item["encrypted_content"]
         restored = compaction.resolve([item], model="demo", tenant=None)
         assert restored[0] == original[0] and restored[-1] == original[-1]
-        assert restored[1]["role"] == "assistant"
-        assert "7319" in restored[1]["content"][0]["text"]
+        assert restored[1] == original[1]
+        assert restored[2]["role"] == "assistant"
+        assert "7319" in restored[2]["content"][0]["text"]
         assert "old log entry" not in json.dumps(restored)
         for inputs in ([item], original + [item], restored):
             response = _post(client, "/responses/input_tokens", input=inputs)
@@ -2248,6 +2249,114 @@ class TestCompaction:
             _compaction_message("next"),
         ]
         assert compaction.safe_boundaries(items) == [0, 6]
+
+    @pytest.mark.parametrize("api", ["standalone", "trigger", "automatic"])
+    @pytest.mark.parametrize("limit", [4096, 16384])
+    def test_bounded_retention_survives_replay_and_recompaction(
+        self, mocked, monkeypatch, api, limit
+    ):
+        fake, client = mocked
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", limit)
+        fake.generate.return_value = _result("Routine work completed.")
+        requirement = _compaction_message("Project ORCHID. Never edit secrets.env.")
+        correction = _compaction_message("Use port 8421 instead of 7319.")
+        question = _compaction_message("What are the current requirements?")
+        retained = [requirement]
+        window = [requirement]
+        for cycle in range(2):
+            log = _compaction_message(
+                f"Log {cycle}: " + "routine evidence " * (limit // 20)
+            )
+            log["id"] = f"log-{cycle}"
+            retained.extend([log, correction, question])
+            window += [log, correction, question]
+            options = dict(input=window, max_output_tokens=128, store=False)
+            if api == "standalone":
+                options["keep_tokens"] = 0
+                response = _post(client, "/responses/compact", **options)
+            else:
+                if api == "trigger":
+                    options["input"] = window + [{"type": "compaction_trigger"}]
+                else:
+                    options["context_management"] = [
+                        {"type": "compaction", "compact_threshold": 1}
+                    ]
+                response = _post(client, "responses", **options)
+            assert response.status_code == 200, response.text
+            capsule = response.json()["output"][0]
+            assert capsule["type"] == "compaction"
+            context = compaction.resolve([capsule], model="demo", tenant=None)
+            assert requirement in context and correction in context
+            assert "routine evidence" not in json.dumps(context)
+            resent = [
+                {
+                    **x,
+                    "id": f"replayed-{cycle}-{i}",
+                    "content": [{"type": "input_text", "text": x["content"]}],
+                }
+                for i, x in enumerate(retained)
+            ]
+            before = _post(client, "/responses/input_tokens", input=window)
+            after = _post(client, "/responses/input_tokens", input=[capsule])
+            replay = _post(client, "/responses/input_tokens", input=resent + [capsule])
+            assert replay.json() == after.json()
+            assert after.json()["input_tokens"] < before.json()["input_tokens"] * 0.6
+            assert (
+                compaction.resolve(resent + [capsule], model="demo", tenant=None)
+                == context
+            )
+            shortened = {**log, "content": "routine evidence [truncated]"}
+            assert (
+                compaction.resolve([shortened, capsule], model="demo", tenant=None)
+                == context
+            )
+            fresh = _compaction_message("A new requirement.")
+            assert compaction.resolve(
+                resent + [fresh, capsule, log], model="demo", tenant=None
+            ) == [fresh, *context, log]
+            fake.generate.reset_mock()
+            unchanged = _post(
+                client,
+                "/responses/compact",
+                input=[capsule],
+                keep_tokens=limit,
+                max_output_tokens=128,
+            )
+            assert unchanged.status_code == 200, unchanged.text
+            fake.generate.assert_not_called()
+            window = resent + unchanged.json()["output"]
+            assert compaction.resolve(window, model="demo", tenant=None) == context
+
+    def test_retention_budget_preserves_whole_messages_in_order(self):
+        messages = [_compaction_message(f"Requirement {i}. " * 10) for i in range(8)]
+        latest = _compaction_message("Continue")
+
+        async def count(items):
+            return len(json.dumps(items))
+
+        async def summarize(items):
+            return "Earlier requirements summarized.", None
+
+        result = asyncio.run(
+            compaction.compact(
+                messages + [latest],
+                count=count,
+                summarize=summarize,
+                keep_tokens=0,
+                target_tokens=1600,
+                retain_tokens=500,
+            )
+        )
+        originals = [x for x in result.items[:-1] if x.get("role") == "user"]
+        assert originals == messages[-2:]
+        base = [x for x in result.items if x not in originals]
+        assert result.after_tokens - asyncio.run(count(base)) <= 500
+        capsule = compaction.seal(
+            result.items, model="demo", tenant=None, covered=result.covered
+        )
+        assert compaction.resolve(
+            messages + [capsule, latest], model="demo", tenant=None
+        ) == result.items + [latest]
 
     @pytest.mark.parametrize(
         "text, tokens, status, detail",

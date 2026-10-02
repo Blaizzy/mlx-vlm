@@ -815,7 +815,15 @@ def _compaction_context_limit(config):
 
 
 async def _compact_response_context(
-    request, items, model, processor, config, tenant, *, automatic=False
+    request,
+    items,
+    model,
+    processor,
+    config,
+    tenant,
+    *,
+    automatic=False,
+    covered=frozenset(),
 ):
     """Use the ordinary rendering and inference paths, including their APC pool."""
     compaction.validate_items(items)
@@ -877,7 +885,7 @@ async def _compact_response_context(
                 400,
                 "Input plus output exceeds the context budget; lower compact_threshold.",
             )
-        return compaction.CompactedContext(items, before, before)
+        return compaction.CompactedContext(items, before, before, covered=covered)
     summary_request = request.model_copy(
         update={
             "max_output_tokens": summary_tokens,
@@ -982,7 +990,13 @@ async def _compact_response_context(
     if keep is None:
         keep = min(8192, max(256, min(available, int(before * 0.6)) // 2))
     result = await compaction.compact(
-        items, count=count, summarize=summarize, keep_tokens=keep, target_tokens=target
+        items,
+        count=count,
+        summarize=summarize,
+        keep_tokens=keep,
+        target_tokens=target,
+        retain_tokens=min(8192, limit // 16),
+        covered=covered,
     )
     if result.after_tokens > available:
         raise HTTPException(
@@ -993,7 +1007,7 @@ async def _compact_response_context(
 
 async def responses_compact_endpoint(http_request: Request, request: CompactRequest):
     tenant = _read_tenant_id(http_request)
-    items = compaction.resolve(
+    context = compaction.resolve_context(
         _response_chain_items(request.previous_response_id)
         + _normalize_response_input(request.input),
         model=request.model,
@@ -1003,12 +1017,22 @@ async def responses_compact_endpoint(http_request: Request, request: CompactRequ
         request.model, _adapter_path_or_inherit(request)
     )
     result = await _compact_response_context(
-        request, items, model, processor, config, tenant
+        request,
+        context.items,
+        model,
+        processor,
+        config,
+        tenant,
+        covered=context.covered,
     )
     output = (
-        [compaction.seal(result.items, model=request.model, tenant=tenant)]
-        if result.changed
-        else items
+        [
+            compaction.seal(
+                result.items, model=request.model, tenant=tenant, covered=result.covered
+            )
+        ]
+        if result.changed or context.covered
+        else context.items
     )
     return {
         "id": f"resp_{uuid.uuid4().hex}",
@@ -1021,7 +1045,7 @@ async def responses_compact_endpoint(http_request: Request, request: CompactRequ
     }
 
 
-async def _responses_compaction_trigger(request, items, tenant):
+async def _responses_compaction_trigger(request, items, tenant, covered=frozenset()):
     """Return the single opaque output expected by Codex compaction v2."""
     model, processor, config = get_cached_model(
         request.model, _adapter_path_or_inherit(request)
@@ -1034,9 +1058,11 @@ async def _responses_compaction_trigger(request, items, tenant):
         }
     )
     result = await _compact_response_context(
-        compact_request, items, model, processor, config, tenant
+        compact_request, items, model, processor, config, tenant, covered=covered
     )
-    capsule = compaction.seal(result.items, model=request.model, tenant=tenant)
+    capsule = compaction.seal(
+        result.items, model=request.model, tenant=tenant, covered=result.covered
+    )
     response = OpenAIResponse(
         id=f"resp_{uuid.uuid4().hex}",
         created_at=int(time.time()),
@@ -1186,13 +1212,13 @@ async def responses_endpoint(request: Request):
             + current_input_items
         )
         tenant = _read_tenant_id(request)
-        prompt_items = compaction.resolve(
+        context = compaction.resolve_context(
             prompt_items, model=openai_request.model, tenant=tenant
         )
-        prompt_items, triggered = compaction.split_trigger(prompt_items)
+        prompt_items, triggered = compaction.split_trigger(context.items)
         if triggered:
             return await _responses_compaction_trigger(
-                openai_request, prompt_items, tenant
+                openai_request, prompt_items, tenant, context.covered
             )
         compaction_output = []
         if openai_request.context_management:
@@ -1207,12 +1233,16 @@ async def responses_endpoint(request: Request):
                 config,
                 tenant,
                 automatic=True,
+                covered=context.covered,
             )
             if compacted.changed:
                 prompt_items = compacted.items
                 compaction_output = [
                     compaction.seal(
-                        prompt_items, model=openai_request.model, tenant=tenant
+                        prompt_items,
+                        model=openai_request.model,
+                        tenant=tenant,
+                        covered=compacted.covered,
                     )
                 ]
         chat_messages, images = _response_items_to_chat(prompt_items)
