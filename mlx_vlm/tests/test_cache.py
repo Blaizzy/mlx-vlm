@@ -2469,6 +2469,26 @@ def test_warm_cache_quantization_policy(scheme, managers):
         assert isinstance(extended[-1], C.BatchKVCache)
 
 
+@parametrize("length, expected", [(16, 0), (32, 16), (33, 32)])
+def test_block_lookup_leaves_a_generation_suffix(managers, length, expected):
+    manager = managers()
+    tokens = list(range(length))
+    manager.release(store_blocks(manager, tokens))
+    hit = P.apc_lookup_plan(
+        manager,
+        tokens,
+        extra_hash=0,
+        apc_mode="block",
+        safe_lookup_min=0,
+        suffix_is_text_only=lambda _: True,
+        prefix_has_media=lambda _: False,
+    )
+    assert (hit["prefix_len"] if hit else 0) == expected
+    if hit:
+        assert hit["full_input_ids"] == tokens
+        manager.release(hit["matched_blocks"])
+
+
 def test_short_and_multimodal_prefixes(managers):
     config = NS(model_type="deepseek_v4", vision_n_layers=32, vocab_size=129280)
     assert P.multimodal_token_ids_from_config(config) == set(range(129280, 129285))
