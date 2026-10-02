@@ -199,22 +199,11 @@ class Model(nn.Module):
             if not key.endswith(".scale"):
                 continue
             weight_key = key[: -len(".scale")] + ".weight"
-            packed, scales, mode = _pack_source_weight(
+            packed, scales, _ = _pack_source_weight(
                 weights[weight_key], weights.pop(key)
             )
-            if weight_key.endswith(".engram.embed.weight"):
-                weights[weight_key] = packed
-                weights[key + "s"] = scales
-                continue
-            # Leave floating-point modules available to the standard converter.
-            weights[weight_key] = mx.dequantize(
-                packed,
-                scales,
-                group_size=32,
-                bits=4 if mode == "mxfp4" else 8,
-                mode=mode,
-                dtype=mx.bfloat16,
-            )
+            weights[weight_key] = packed
+            weights[key + "s"] = scales
 
         from .language import sanitize_moe_weights
 
@@ -255,6 +244,17 @@ class Model(nn.Module):
 
         self._install_engram_embeddings(weights)
         return weights
+
+    def shard(self, group=None):
+        """Partition routed experts and keep Engram tables on disk."""
+        from .engram import OffloadedEngramEmbedding
+
+        self.language_model.shard(group)
+        for layer in self.layers:
+            if layer.engram is not None and isinstance(
+                layer.engram.embed, OffloadedEngramEmbedding
+            ):
+                layer.engram.embed.hide_parameters()
 
     @property
     def layers(self):

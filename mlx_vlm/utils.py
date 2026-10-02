@@ -1044,11 +1044,10 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 from .fp8 import transform_fp8_weights
 
                 weights, quantization = transform_fp8_weights(weights, config)
-                # TODO: Refactor DeepSeek-V4 to use the shared FP8 transform.
-                if quantization is None and config.get("model_type") == "deepseek_v4":
-                    from .models.deepseek_v4.language import make_quantization_config
-
-                    quantization = make_quantization_config(model)
+                if quantization is None:
+                    make_config = _language_model_quantization_config(model)
+                    if make_config is not None:
+                        quantization = make_config(model)
             elif (
                 quant_method == "modelopt"
                 and quantization_config.get("quant_algo") == "MXFP8"

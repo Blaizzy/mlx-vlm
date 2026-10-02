@@ -8,10 +8,16 @@ import inspect
 import json
 import logging
 import math
+import os
+import signal
+import socket
 import struct
+import subprocess
+import sys
 import textwrap
 import unittest
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
+from fnmatch import fnmatchcase
 from operator import attrgetter
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,6 +33,7 @@ from mlx.utils import tree_flatten, tree_map
 from mlx_vlm import embedding_loader
 from mlx_vlm.models.base import InputEmbeddingsFeatures
 from mlx_vlm.models.cache import make_prompt_cache
+from mlx_vlm.models.deepseek_v41 import language as deepseek_v41_language
 from mlx_vlm.models.lfm2_encoder import Model as Lfm2Encoder
 from mlx_vlm.utils import (
     _drop_modules_without_weights,
@@ -680,6 +687,176 @@ def tiny_config(family, profile=None, **overrides):
     return build_config(module, fields | overrides, case["config_type"])
 
 
+# Distributed language-model contracts
+
+
+def _make_distributed_test_model(family, dtype):
+    case = TINY_MODELS[family]
+    config = tiny_config(family, "distributed")
+    module = importlib.import_module("mlx_vlm.models." + case["module"] + ".language")
+    model = module.LanguageModel(config)
+    model.update(tree_map(lambda p: p.astype(dtype), model.parameters()))
+    if setup := DISTRIBUTED_MODEL_SETUPS.get(family):
+        setup(model, dtype)
+    if quantization := case["distributed"].get("quantization"):
+        quantization = copy.deepcopy(quantization)
+        if patterns := quantization.pop("modules", None):
+
+            def predicate(path, module):
+                if hasattr(module, "to_quantized"):
+                    for pattern, overrides in patterns.items():
+                        if fnmatchcase(path, pattern):
+                            return overrides
+                return False
+
+            quantization["class_predicate"] = predicate
+        nn.quantize(model, **quantization)
+    model.eval()
+    return model
+
+
+def _distributed_model_worker(family, dtype_name):
+    group = mx.distributed.init(strict=True, backend="ring")
+    options = TINY_MODELS[family]["distributed"]
+    dtype = getattr(mx, dtype_name)
+    mx.random.seed(19)
+    reference = _make_distributed_test_model(family, dtype)
+    mx.eval(reference.parameters())
+    weights = dict(tree_flatten(reference.parameters()))
+    sharded = _make_distributed_test_model(family, dtype)
+    sharded.load_weights(list(weights.items()), strict=True)
+    sharded.shard(group)
+    if error := options.get("reshard_error"):
+        with pytest.raises(ValueError, match=error):
+            sharded.shard(group)
+    mx.eval(sharded.parameters())
+    local_weights = dict(tree_flatten(sharded.parameters()))
+    for pattern in options["sharded_weights"]:
+        names = [name for name in weights if fnmatchcase(name, pattern)]
+        assert names, f"No weights match {pattern!r}"
+        for name in names:
+            assert local_weights[name].size * group.size() == weights[name].size, name
+
+    records = []
+    # Tensor-sharded BF16 projections round each partial result before the
+    # collective, whereas an unsharded projection rounds once. Model-specific
+    # tolerances account for this; agreement between ranks remains exact.
+    tolerance = options["tolerances"][dtype_name]
+    vocab_size = reference.config.vocab_size
+    for batch in (1, 4):
+        actual_cache = make_prompt_cache(sharded)
+        expected_cache = make_prompt_cache(reference)
+        for step, tokens in enumerate(([1, 7, 9, 3, 11, 15, 2, 6], [13], [17], [19])):
+            ids = mx.array(
+                [[(t + row) % vocab_size for t in tokens] for row in range(batch)]
+            )
+            expected = reference(ids, cache=expected_cache).logits
+            actual = sharded(ids, cache=actual_cache).logits
+            mx.eval(actual, expected)
+            gathered = mx.distributed.all_gather(actual, group=group)
+            mx.eval(gathered)
+            ranks_agree = all(
+                mx.array_equal(
+                    gathered[:batch], gathered[rank * batch : (rank + 1) * batch]
+                ).item()
+                for rank in range(1, group.size())
+            )
+            records.append(
+                dict(
+                    batch=batch,
+                    step=step,
+                    max_error=mx.max(mx.abs(actual - expected)).item(),
+                    ranks_agree=ranks_agree,
+                    passed=mx.allclose(
+                        actual, expected, atol=tolerance, rtol=tolerance
+                    ).item(),
+                )
+            )
+    passed = mx.distributed.all_sum(
+        mx.array(int(all(r["passed"] and r["ranks_agree"] for r in records))),
+        group=group,
+    ).item()
+    print(
+        json.dumps(dict(rank=group.rank(), passed_ranks=passed, checks=records)),
+        flush=True,
+    )
+    assert passed == group.size(), records
+
+
+def _run_distributed_model_test(family, dtype, world_size):
+    repo = Path(__file__).resolve().parents[2]
+    # The ring launcher needs one consecutive port per rank. Probe the entire
+    # range while holding the sockets so a four-rank case cannot reuse a port.
+    for _ in range(100):
+        with ExitStack() as stack:
+            sockets = [stack.enter_context(socket.socket()) for _ in range(world_size)]
+            sockets[0].bind(("127.0.0.1", 0))
+            port = sockets[0].getsockname()[1]
+            if port + world_size > 65536:
+                continue
+            try:
+                for rank, sock in enumerate(sockets[1:], 1):
+                    sock.bind(("127.0.0.1", port + rank))
+            except OSError:
+                continue
+            break
+    else:
+        pytest.fail(f"Could not find {world_size} consecutive ring ports")
+    command = [
+        sys.executable,
+        "-c",
+        "from mlx._distributed_utils.launch import main; main()",
+        "--backend",
+        "ring",
+        "-n",
+        str(world_size),
+        "--starting-port",
+        str(port),
+        "--env",
+        f"PYTHONPATH={repo}",
+        "--",
+        sys.executable,
+        "-c",
+        "import sys; from mlx_vlm.tests.test_models import _distributed_model_worker; "
+        "_distributed_model_worker(*sys.argv[1:])",
+        family,
+        dtype,
+    ]
+    process = subprocess.Popen(
+        command,
+        cwd=repo,
+        env=dict(os.environ, PYTHONPATH=str(repo)),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        output, _ = process.communicate(timeout=120)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        output, _ = process.communicate()
+        pytest.fail(
+            f"Distributed test timed out: {family}/{dtype}/{world_size}\n{output}"
+        )
+    assert process.returncode == 0, output
+    records = [json.loads(line) for line in output.splitlines() if line.startswith("{")]
+    assert len(records) == world_size, output
+    assert {r["rank"] for r in records if r["passed_ranks"] == world_size} == set(
+        range(world_size)
+    ), output
+
+
+@pytest.mark.skipif(not mx.distributed.is_available("ring"), reason="ring required")
+@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+@pytest.mark.parametrize(
+    "family", [name for name, case in TINY_MODELS.items() if "distributed" in case]
+)
+def test_distributed_model(family, dtype, world_size):
+    _run_distributed_model_test(family, dtype, world_size)
+
+
 def test_gemma3_can_preserve_caller_supplied_embedding_scale():
     case = next(case for case in DATA["cases"] if case["module"] == "gemma3")
     module = importlib.import_module(f"mlx_vlm.models.{case['module']}.language")
@@ -998,7 +1175,11 @@ def _checkpoint_loading(config, model_class, weights, *, side_effect=None):
         yield quantize
 
 
-def test_load_model_uses_deepseek_v4_fp8_quantization_config():
+@pytest.mark.parametrize("model_type", ["deepseek_v4", "deepseek_v41"])
+def test_load_model_uses_language_model_fp8_quantization_config(model_type):
+    module = importlib.import_module(f"mlx_vlm.models.{model_type}")
+    case = next(c for c in DATA["cases"] if c["module"] == model_type)
+    language_model = module.Model(build_config(module, case["config"])).language_model
 
     quantization = {
         "group_size": 64,
@@ -1008,17 +1189,15 @@ def test_load_model_uses_deepseek_v4_fp8_quantization_config():
     }
     with (
         patch(
-            "mlx_vlm.models.deepseek_v4.language.make_quantization_config",
+            f"mlx_vlm.models.{model_type}.language.make_quantization_config",
             return_value=quantization,
         ) as make_quantization_config,
         _checkpoint_loading(
             {
-                "model_type": "deepseek_v4",
+                "model_type": model_type,
                 "quantization_config": {"quant_method": "fp8"},
             },
-            lambda config: _CheckpointModel(
-                config, language_model=nn.Linear(2, 2, bias=False)
-            ),
+            lambda config: _CheckpointModel(config, language_model=language_model),
             {},
         ) as quantize,
     ):
@@ -1458,6 +1637,33 @@ class TestQwen3_5MoeText(unittest.TestCase):
 
 
 # DeepSeek-V4.1 regressions beyond the shared model contracts
+
+
+def test_deepseek_v41_invalid_shard_preserves_parameters():
+    model = deepseek_v41_language.LanguageModel(tiny_config("deepseek_v41"))
+    before = dict(tree_flatten(model.parameters()))
+    with pytest.raises(ValueError, match="Expert count"):
+        model.shard(SimpleNamespace(size=lambda: 3, rank=lambda: 0))
+    after = dict(tree_flatten(model.parameters()))
+    assert all(after[k] is v for k, v in before.items())
+
+
+def _prepare_deepseek_v41_distributed(model, dtype):
+    from mlx_vlm.models.deepseek_v41.engram import NgramHashState
+
+    # Keep nonuniform vocabulary weights small and preserve the FP32 head.
+    model.head.weight = (
+        (mx.random.normal(model.head.weight.shape) * 0.05)
+        .astype(dtype)
+        .astype(mx.float32)
+    )
+    config = model.config
+    model.engram_hash = NgramHashState(
+        config, model.layout, token_map=[i % 7 for i in range(config.vocab_size)]
+    )
+
+
+DISTRIBUTED_MODEL_SETUPS = {"deepseek_v41": _prepare_deepseek_v41_distributed}
 
 
 class TestDeepseekV41EndToEnd(unittest.TestCase):

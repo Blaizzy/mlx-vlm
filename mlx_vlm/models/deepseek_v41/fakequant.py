@@ -69,6 +69,66 @@ def _make_fp8_roundtrip_kernel():
 _fp8_roundtrip_kernel = _make_fp8_roundtrip_kernel()
 
 
+def _make_fp4_roundtrip_kernel():
+    if not mx.metal.is_available():
+        return None
+    return mx.fast.metal_kernel(
+        name="deepseek_v41_fp4_roundtrip",
+        input_names=["x"],
+        output_names=["out"],
+        ensure_row_contiguous=True,
+        source=r"""
+ uint i=thread_position_in_grid.x;
+ float value=float(x[i]);
+ float amax=abs(value);
+ for (ushort delta=BLOCK/2; delta>0; delta/=2) amax=max(amax,simd_shuffle_xor(amax,delta));
+ float scale;
+ if (E4M3) {
+   amax=max(amax,6.0f/512.0f);
+   float v=clamp(amax/6.0f,0.0f,448.0f);
+   uint bits=as_type<uint>(v);
+   uint qexp=max(int(bits>>23)-3,118);
+   float step=as_type<float>(qexp<<23);
+   scale=rint(v/step)*step;
+ } else {
+   amax=max(amax,6.0f*0x1p-126f);
+   uint bits=as_type<uint>(amax*(1.0f/6.0f));
+   uint exponent=(bits>>23)+((bits&0x7fffff)!=0);
+   scale=as_type<float>(exponent<<23);
+ }
+ float v=clamp(value/scale,-6.0f,6.0f);
+ float m=abs(v);
+ int idx=int(m>0.25f)+int(m>1.25f)+int(m>2.5f)+int(m>5.0f)
+        +int(m>=0.75f)+int(m>=1.75f)+int(m>=3.5f);
+ constexpr float levels[8]={0.0f,0.5f,1.0f,1.5f,2.0f,3.0f,4.0f,6.0f};
+ out[i]=T(sign(v)*levels[idx]*scale);
+""",
+    )
+
+
+_fp4_roundtrip_kernel = _make_fp4_roundtrip_kernel()
+
+
+def _fused_fp4_roundtrip(x, block, e4m3_scale):
+    if (
+        _fp4_roundtrip_kernel is None
+        or mx.default_device() != mx.gpu
+        or x.dtype not in (mx.bfloat16, mx.float16, mx.float32)
+        or block not in (16, 32)
+        or x.shape[-1] % block
+        or not x.size
+    ):
+        return None
+    return _fp4_roundtrip_kernel(
+        inputs=[x],
+        template=[("T", x.dtype), ("BLOCK", block), ("E4M3", e4m3_scale)],
+        grid=(x.size, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[x.shape],
+        output_dtypes=[x.dtype],
+    )[0]
+
+
 def _log2_ceil_bits(x: mx.array) -> mx.array:
     """ceil(log2(x)) for positive normal fp32 x, via IEEE 754 bits."""
     bits = x.astype(mx.float32).view(mx.uint32)
@@ -139,6 +199,9 @@ def fake_quant_fp4_ue8m0(x: mx.array, block: int = 32) -> mx.array:
     """FP4 round-trip with ue8m0 scales: the indexer q/k path."""
     if DISABLE:
         return x
+    fused = _fused_fp4_roundtrip(x, block, False)
+    if fused is not None:
+        return fused
     dtype = x.dtype
     shape = x.shape
     xb = _blockify(x.astype(mx.float32), block)
@@ -152,6 +215,9 @@ def fake_quant_fp4_e4m3(x: mx.array, block: int = 16) -> mx.array:
     """FP4 round-trip with e4m3 scales: the compressed-KV path."""
     if DISABLE:
         return x
+    fused = _fused_fp4_roundtrip(x, block, True)
+    if fused is not None:
+        return fused
     dtype = x.dtype
     shape = x.shape
     xb = _blockify(x.astype(mx.float32), block)
