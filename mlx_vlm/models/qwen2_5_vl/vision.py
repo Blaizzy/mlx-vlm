@@ -4,6 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ..rope_utils import rotate_half
 from .config import VisionConfig
 
 
@@ -24,13 +25,6 @@ def check_array_shape(arr):
         return True
     else:
         return False
-
-
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return mx.concatenate([-x2, x1], axis=-1)
 
 
 def apply_rotary_pos_emb_vision(tensor, freqs) -> mx.array:

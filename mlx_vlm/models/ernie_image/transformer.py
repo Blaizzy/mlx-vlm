@@ -6,6 +6,7 @@ import mlx.core as mx
 from mlx import nn
 from mlx.core.fast import scaled_dot_product_attention
 
+from ..rope_utils import rotate_half
 from .config import ErnieImageTransformerConfig
 
 
@@ -24,11 +25,6 @@ def timestep_embedding(
     if embedding_dim % 2:
         embedding = mx.pad(embedding, [(0, 0), (0, 1)])
     return embedding
-
-
-def rotate_half(hidden_states: mx.array) -> mx.array:
-    first, second = mx.split(hidden_states, 2, axis=-1)
-    return mx.concatenate([-second, first], axis=-1)
 
 
 def rope_frequencies(
