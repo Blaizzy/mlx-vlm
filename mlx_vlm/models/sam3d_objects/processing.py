@@ -2,6 +2,7 @@
 
 import mlx.core as mx
 
+from ..base import install_auto_processor_patch
 from ..interpolate import resize_bilinear_nhwc, resize_nearest_nhwc
 from .sparse import nonzero
 
@@ -208,3 +209,21 @@ def decode_pose(latents, metadata, downsample_factor=1):
         "translation": translation,
         "scale": scale,
     }
+
+
+class SAM3DObjectsProcessor:
+    """Squares and resizes a masked object crop for the reconstruction pipeline."""
+
+    def __init__(self, size=518):
+        self.size = size
+
+    @classmethod
+    def from_pretrained(cls, path, **kwargs):
+        return cls()
+
+    def __call__(self, image, mask=None, pointmap=None, **kwargs):
+        kwargs.setdefault("size", self.size)
+        return prepare_inputs(image, mask, pointmap, **kwargs)
+
+
+install_auto_processor_patch("sam3d_objects", SAM3DObjectsProcessor)

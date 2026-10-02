@@ -3117,3 +3117,34 @@ class TestExtractionEntryPoint(unittest.TestCase):
         from mlx_vlm.extract import main
 
         self.assertTrue(callable(main))
+
+
+class TestExtractionProcessorResolution(unittest.TestCase):
+    """Every extraction model the CLI can name has to resolve a processor."""
+
+    PROCESSORS = {
+        "moge3": ("moge3", "MogeProcessor"),
+        "rt_detr_v2": ("rt_detr_v2", "RTDetrV2Processor"),
+        "rf-detr": ("rfdetr", "RFDETRProcessor"),
+        "yolo11": ("yolo11", "YOLO11Processor"),
+        "sam3": ("sam3", "Sam3Processor"),
+        "sam3_1": ("sam3_1", "Sam3Processor"),
+        "sapiens2": ("sapiens2", "Sapiens2Processor"),
+        "video_depth_anything": ("video_depth_anything", "VideoDepthProcessor"),
+        "sam3d_body": ("sam3d_body", "SAM3DBodyProcessor"),
+        "sam3d_objects": ("sam3d_objects", "SAM3DObjectsProcessor"),
+    }
+
+    def test_load_processor_resolves_from_the_model_type(self):
+        from mlx_vlm.utils import load_processor
+
+        for model_type, (package, expected) in self.PROCESSORS.items():
+            with self.subTest(model_type=model_type):
+                importlib.import_module(f"mlx_vlm.models.{package}")
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory)
+                    (path / "config.json").write_text(
+                        json.dumps({"model_type": model_type})
+                    )
+                    processor = load_processor(path, True)
+                self.assertEqual(type(processor).__name__, expected)

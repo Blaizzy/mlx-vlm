@@ -6,6 +6,7 @@ Outputs SMPL-compatible body mesh vertices, 3D keypoints, and camera params.
 mlx-vlm compatible: exports Model, ModelConfig, VisionModel, LanguageModel.
 """
 
+from . import processing_sam3d_body  # noqa: F401
 from .config import ModelConfig, SAM3DConfig, TextConfig, VisionConfig
 from .language import LanguageModel
 from .model import Model, SAM3DBody
