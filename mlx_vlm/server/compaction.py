@@ -2,7 +2,8 @@
 
 Capsules contain conversation items, never tensors. Replaying one constructs a
 normal prompt, so APC can reuse only an actually matching prefix. The latest
-capsule replaces older history, while Codex's retained-message prefix survives.
+capsule replaces older history, while the client's retained-message prefix
+survives.
 """
 
 from __future__ import annotations
@@ -99,9 +100,9 @@ def resolve(items: list[dict], *, model: str, tenant: str | None) -> list[dict]:
             ) from exc
         tail = items[index + 1 :]
 
-        # Codex rebuilds its window as retained user/instruction messages followed
-        # by the opaque item. A full transcript (with assistant/tool items or an
-        # older capsule) is instead superseded by the latest capsule.
+        # Clients can retain user/instruction messages before the opaque item.
+        # A full transcript containing assistant/tool items or an older capsule
+        # is instead superseded by the latest capsule.
         prefix = items[:index]
         if prefix and all(
             x.get("type") == "message"
@@ -124,7 +125,7 @@ def resolve(items: list[dict], *, model: str, tenant: str | None) -> list[dict]:
             )
             context = context[:start] + retained + context[start:]
 
-        # Codex re-sends its developer prefix after each opaque boundary. Do not
+        # Clients may resend instructions after an opaque boundary. Do not
         # accumulate identical carried instructions on every compaction cycle.
         repeated = {_message_key(x) for x in tail if _is_instruction(x)}
         context = [
@@ -145,7 +146,7 @@ def _is_instruction(item: dict) -> bool:
 
 
 def split_trigger(items: list[dict]) -> tuple[list[dict], bool]:
-    """Codex's terminal control requests compaction only, without an answer."""
+    """The terminal control requests compaction only, without an answer."""
     positions = [
         i for i, item in enumerate(items) if item.get("type") == "compaction_trigger"
     ]

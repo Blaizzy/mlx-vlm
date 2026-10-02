@@ -2177,7 +2177,7 @@ class TestCompaction:
         expected = context[:1] + retained + context[1:]
         for cycle in range(3):
             capsule = compaction.seal(context, model="demo", tenant=None)
-            # Codex may regenerate message IDs when rebuilding the window.
+            # Clients may regenerate message IDs when rebuilding the window.
             inputs = [
                 {**item, "id": f"{cycle}-{index}"}
                 for index, item in enumerate([instruction, *retained, latest])

@@ -111,18 +111,18 @@ works while that response is stored. `/v1/responses/input_tokens` counts the
 decoded context, not the encrypted payload's string length. Normal response
 usage counts the final inference; explicit compact usage counts the summary pass.
 
-For Codex's native compaction flow, a single terminal input item
+For native compaction, a single terminal input item
 `{"type": "compaction_trigger"}` on `/v1/responses` requests compaction without
 generating an answer. Both streaming and non-streaming responses contain exactly
 one compaction item, including when the history is too short to shorten. Its
-usage describes the summary pass. Codex can resend a prefix consisting only of
+usage describes the summary pass. Clients can resend a prefix consisting only of
 retained user and system/developer messages before the compaction item. The
 server preserves this prefix, excluding copies already carried in the capsule,
 and includes it in token counts and context-budget checks. A full transcript
 containing assistant/tool items or older capsules is superseded by the latest
 capsule. Identical system/developer messages resent
 after a capsule replace their carried copies, preventing instruction growth
-across repeated Codex compactions.
+across repeated compactions.
 
 The server preserves the latest exchange and never cuts across outstanding tool
 calls. It makes one summary attempt and accepts it only if it fits the available
