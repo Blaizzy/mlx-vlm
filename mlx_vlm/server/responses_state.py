@@ -556,6 +556,8 @@ def _response_output_items_from_text(
                 remaining, tool_module, thinking_start_token, thinking_end_token
             )
             return reasoning_items + items, remaining, reasoning, "tool_calls"
+    if not content:
+        return reasoning_items, content, reasoning, "stop"
     item = {
         "id": message_id,
         "type": "message",
@@ -731,7 +733,13 @@ def _append_response_item_to_prompt(
                     part["text"] for part in content_parts if part.get("type") == "text"
                 )
                 message["content"] = text
-                chat_messages.append(_normalize_tool_message(message))
+                if (
+                    role != "assistant"
+                    or text
+                    or reasoning
+                    or message.get("tool_calls")
+                ):
+                    chat_messages.append(_normalize_tool_message(message))
                 chat_messages.append(_response_image_message(len(item_images)))
                 return
             if item_images:
@@ -741,6 +749,10 @@ def _append_response_item_to_prompt(
                     part["text"] for part in content_parts if part.get("type") == "text"
                 )
         message["content"] = content or ""
+        if role == "assistant" and not (
+            content or reasoning or message.get("tool_calls")
+        ):
+            return
         chat_messages.append(_normalize_tool_message(message))
         return
 

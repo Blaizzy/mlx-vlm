@@ -1547,6 +1547,68 @@ def test_responses_tool_arguments_are_normalized_without_mutating_input():
 
 
 @pytest.mark.parametrize(
+    "content", [None, "", [], [{"type": "output_text", "text": ""}]]
+)
+@pytest.mark.parametrize("sealed", [False, True])
+def test_responses_replay_ignores_empty_assistant_turns(
+    client, content, sealed, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("MLX_VLM_COMPACTION_KEY_FILE", str(tmp_path / "key"))
+    history = [
+        _input_message("Read the file."),
+        _msg(content, "assistant", type="message"),
+        *_function_result("File contents", name="read_file"),
+    ]
+    if sealed:
+        history = [compaction.seal(history, model="demo", tenant=None)]
+    with _endpoint() as fake:
+        response = _post(
+            client, "responses", input=[*history, _input_message("Continue.")]
+        )
+    assert response.status_code == 200, response.text
+    messages = fake.template.call_args.args[2]
+    assert [message["role"] for message in messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "user",
+    ]
+    assert messages[1]["tool_calls"][0]["function"]["name"] == "read_file"
+    assert messages[2]["content"] == "File contents"
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"reasoning_content": "Check the file first."},
+        {"reasoning": "Check the file first."},
+        {
+            "tool_calls": [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }
+            ]
+        },
+        {"content": [_input_image("https://example.com/image.png")]},
+    ],
+)
+def test_responses_replay_preserves_assistant_payloads_without_text(extra):
+    item = {"type": "message", "role": "assistant", "content": [], **extra}
+    original = copy.deepcopy(item)
+    messages, images = _response_items_to_chat([item])
+    assert messages
+    if "content" in extra:
+        assert images == ["https://example.com/image.png"]
+    elif "tool_calls" in extra:
+        assert messages[0]["tool_calls"][0]["function"]["name"] == "read_file"
+    else:
+        assert messages[0]["reasoning_content"] == "Check the file first."
+    assert item == original
+
+
+@pytest.mark.parametrize(
     "roles", [("system", "system"), ("system", "developer"), ("developer", "system")]
 )
 def test_chat_and_responses_merge_instruction_messages_identically(client, roles):
@@ -1682,6 +1744,82 @@ def test_responses_native_tool_calls(client, kind, stream):
         )
         assert done["item_id"].startswith("fc_") and done["name"] == name
         assert json.loads(done["arguments"]) == args
+
+
+@pytest.mark.parametrize("continuous", [False, True])
+@pytest.mark.parametrize(
+    "parts,types",
+    [
+        (
+            ["<tool_call>", '{"name":"get_weather","arguments":{}}', "</tool_call>"],
+            ["function_call"],
+        ),
+        (
+            [
+                "Checking. ",
+                '<tool_call>{"name":"get_weather","arguments":{}}</tool_call>',
+            ],
+            ["message", "function_call"],
+        ),
+        (
+            [
+                "<think>",
+                "Check first.",
+                "</think>",
+                '<tool_call>{"name":"get_weather","arguments":{}}</tool_call>',
+            ],
+            ["reasoning", "function_call"],
+        ),
+        (["<think>Check first.</think>", "Sunny."], ["reasoning", "message"]),
+        (["Hello", " world."], ["message"]),
+        ([""], []),
+        (["<think>Check first.</think>"], ["reasoning"]),
+    ],
+)
+def test_responses_stream_items_match_completed_output(
+    client, continuous, parts, types
+):
+    chunks = [
+        _result(text, finish_reason="stop" if i == len(parts) - 1 else None)
+        for i, text in enumerate(parts)
+    ]
+    tokens = [
+        _token(text, finish_reason="stop" if i == len(parts) - 1 else None)
+        for i, text in enumerate(parts)
+    ]
+    with _endpoint(
+        chunks=chunks,
+        generator=_streaming(tokens) if continuous else None,
+        parser=_JSON_TOOLS,
+    ):
+        response = _post(client, "responses", stream=True, tools=[_tool()])
+    assert response.status_code == 200, response.text
+    events = _data(response)
+    final = next(
+        event["response"] for event in events if event["type"] == "response.completed"
+    )
+    assert [item["type"] for item in final["output"]] == types
+    for event_type in ("response.output_item.added", "response.output_item.done"):
+        items = [event for event in events if event["type"] == event_type]
+        assert [event["output_index"] for event in items] == list(range(len(types)))
+        assert [event["item"]["id"] for event in items] == [
+            item["id"] for item in final["output"]
+        ]
+        if event_type.endswith("done"):
+            assert [event["item"] for event in items] == final["output"]
+    added = set()
+    for event in events:
+        if event["type"] == "response.output_item.added":
+            added.add(event["item"]["id"])
+        if "item_id" in event:
+            assert event["item_id"] in added
+            assert final["output"][event["output_index"]]["id"] == event["item_id"]
+    visible = "".join(
+        event["delta"]
+        for event in events
+        if event["type"] == "response.output_text.delta"
+    )
+    assert visible == final["output_text"]
 
 
 @pytest.mark.parametrize(
@@ -2648,6 +2786,47 @@ class TestCompaction:
         )
         assert continued.status_code == 200
         assert "old log entry" not in fake.generate.call_args.kwargs["prompt"]
+
+    def test_auto_compaction_tool_stream_preserves_item_indices(self, mocked):
+        fake, client = mocked
+        text = '<think>Check first.</think><tool_call>{"name":"get_weather","arguments":{}}</tool_call>'
+        fake.stream.side_effect = lambda *args, **kwargs: iter(
+            [_result(text, finish_reason="stop")]
+        )
+        with (
+            patch.object(
+                server, "_infer_tool_parser_from_processor", return_value="demo"
+            ),
+            patch.object(server, "load_tool_module", return_value=_JSON_TOOLS),
+        ):
+            response = _post(
+                client,
+                "responses",
+                input=_compaction_history(),
+                stream=True,
+                tools=[_tool()],
+                max_output_tokens=64,
+                context_management=[{"type": "compaction", "compact_threshold": 1000}],
+            )
+        events = _data(response)
+        final = next(
+            event["response"]
+            for event in events
+            if event["type"] == "response.completed"
+        )
+        assert [item["type"] for item in final["output"]] == [
+            "compaction",
+            "reasoning",
+            "function_call",
+        ]
+        done = [
+            event for event in events if event["type"] == "response.output_item.done"
+        ]
+        assert [event["output_index"] for event in done] == [0, 1, 2]
+        assert [event["item"] for event in done] == final["output"]
+        for event in events:
+            if "item_id" in event:
+                assert final["output"][event["output_index"]]["id"] == event["item_id"]
 
     def test_stored_compaction_survives_parent_eviction(self, mocked):
         _, client = mocked

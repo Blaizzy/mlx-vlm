@@ -80,7 +80,6 @@ from .schemas import (
     ImageGenerationResponse,
     ImageGenerationResponseData,
     InputAudio,
-    MessageItem,
     OpenAIRequest,
     OpenAIResponse,
     OpenAIUsage,
@@ -89,9 +88,6 @@ from .schemas import (
     ResponseContentPartDoneEvent,
     ResponseCreatedEvent,
     ResponseInProgressEvent,
-    ResponseOutputItemAddedEvent,
-    ResponseOutputItemDoneEvent,
-    ResponseOutputTextDeltaEvent,
     ResponseOutputTextDoneEvent,
     StreamingTimings,
     UsageStats,
@@ -1363,21 +1359,66 @@ async def responses_endpoint(request: Request):
                                 },
                             )
 
-                    # Send response.output_item.added event  (to match the openai pipeline)
-                    message_item = MessageItem(
-                        id=message_id,
-                        type="message",
-                        status="in_progress",
-                        role="assistant",
-                        content=[],
-                    )
-                    yield f"event: response.output_item.added\ndata: {ResponseOutputItemAddedEvent(type='response.output_item.added', output_index=len(compaction_output), item=message_item).model_dump_json()}\n\n"
+                    output_indices = {}
 
-                    # Send response.content_part.added event
-                    content_part = ContentPartOutputText(
-                        type="output_text", text="", annotations=[]
-                    )
-                    yield f"event: response.content_part.added\ndata: {ResponseContentPartAddedEvent(type='response.content_part.added', item_id=message_id, output_index=len(compaction_output), content_index=0, part=content_part).model_dump_json()}\n\n"
+                    def start_output_item(item):
+                        item_id = item["id"]
+                        if item_id in output_indices:
+                            return
+                        index = len(compaction_output) + len(output_indices)
+                        output_indices[item_id] = index
+                        pending = {**item, "status": "in_progress"}
+                        if item["type"] == "message":
+                            pending["content"] = []
+                        elif item["type"] == "reasoning":
+                            pending["summary"] = []
+                        yield _response_sse_event(
+                            "response.output_item.added",
+                            {
+                                "type": "response.output_item.added",
+                                "output_index": index,
+                                "item": pending,
+                            },
+                        )
+                        if item["type"] == "message":
+                            part = ContentPartOutputText(
+                                type="output_text", text="", annotations=[]
+                            )
+                            yield f"event: response.content_part.added\ndata: {ResponseContentPartAddedEvent(type='response.content_part.added', item_id=item_id, output_index=index, content_index=0, part=part).model_dump_json()}\n\n"
+
+                    def stream_delta(kind, delta, rate):
+                        if kind == "reasoning":
+                            item = {
+                                "id": reasoning_item_id,
+                                "type": "reasoning",
+                                "summary": [],
+                            }
+                            event_type = "response.reasoning_text.delta"
+                        else:
+                            item = {
+                                "id": message_id,
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [],
+                            }
+                            event_type = "response.output_text.delta"
+                        yield from start_output_item(item)
+                        yield _response_sse_event(
+                            event_type,
+                            {
+                                "type": event_type,
+                                "item_id": item["id"],
+                                "output_index": output_indices[item["id"]],
+                                "content_index": 0,
+                                "delta": delta,
+                                "timings": {"predicted_per_second": rate},
+                                **(
+                                    {"response_id": response_id}
+                                    if kind == "reasoning"
+                                    else {}
+                                ),
+                            },
+                        )
 
                     # Stream text deltas using ResponseGenerator (continuous batching)
                     full_text = ""
@@ -1440,18 +1481,10 @@ async def responses_endpoint(request: Request):
                             )
                             if thinking_delta.reasoning:
                                 streamed_reasoning += thinking_delta.reasoning
-                                yield _response_sse_event(
-                                    "response.reasoning_text.delta",
-                                    {
-                                        "type": "response.reasoning_text.delta",
-                                        "response_id": response_id,
-                                        "item_id": reasoning_item_id,
-                                        "output_index": len(compaction_output),
-                                        "content_index": 0,
-                                        "delta": thinking_delta.reasoning,
-                                        "timings": {"predicted_per_second": chunk_rate},
-                                    },
-                                )
+                                for event in stream_delta(
+                                    "reasoning", thinking_delta.reasoning, chunk_rate
+                                ):
+                                    yield event
                             delta = thinking_delta.content
                             delta = tool_call_state.feed(
                                 delta, last=bool(token.finish_reason)
@@ -1462,7 +1495,8 @@ async def responses_endpoint(request: Request):
                             }
 
                             if delta:
-                                yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=len(compaction_output), content_index=0, delta=delta, timings=StreamingTimings(predicted_per_second=chunk_rate)).model_dump_json()}\n\n"
+                                for event in stream_delta("message", delta, chunk_rate):
+                                    yield event
                                 await asyncio.sleep(0.01)
 
                             if token.finish_reason:
@@ -1494,18 +1528,10 @@ async def responses_endpoint(request: Request):
                             )
                             if thinking_delta.reasoning:
                                 streamed_reasoning += thinking_delta.reasoning
-                                yield _response_sse_event(
-                                    "response.reasoning_text.delta",
-                                    {
-                                        "type": "response.reasoning_text.delta",
-                                        "response_id": response_id,
-                                        "item_id": reasoning_item_id,
-                                        "output_index": len(compaction_output),
-                                        "content_index": 0,
-                                        "delta": thinking_delta.reasoning,
-                                        "timings": {"predicted_per_second": chunk_rate},
-                                    },
-                                )
+                                for event in stream_delta(
+                                    "reasoning", thinking_delta.reasoning, chunk_rate
+                                ):
+                                    yield event
                             delta = thinking_delta.content
                             delta = tool_call_state.feed(delta, last=bool(chunk_finish))
                             if chunk_finish is not None:
@@ -1516,7 +1542,8 @@ async def responses_endpoint(request: Request):
                             }
 
                             if delta:
-                                yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=len(compaction_output), content_index=0, delta=delta, timings=StreamingTimings(predicted_per_second=chunk_rate)).model_dump_json()}\n\n"
+                                for event in stream_delta("message", delta, chunk_rate):
+                                    yield event
                                 await asyncio.sleep(0.01)
 
                     tail_reasoning, tail = finish_content_streams(
@@ -1524,19 +1551,13 @@ async def responses_endpoint(request: Request):
                     )
                     if tail_reasoning:
                         streamed_reasoning += tail_reasoning
-                        yield _response_sse_event(
-                            "response.reasoning_text.delta",
-                            {
-                                "type": "response.reasoning_text.delta",
-                                "response_id": response_id,
-                                "item_id": reasoning_item_id,
-                                "output_index": len(compaction_output),
-                                "content_index": 0,
-                                "delta": tail_reasoning,
-                            },
-                        )
+                        for event in stream_delta(
+                            "reasoning", tail_reasoning, metrics.rate
+                        ):
+                            yield event
                     if tail:
-                        yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=len(compaction_output), content_index=0, delta=tail, timings=StreamingTimings(predicted_per_second=metrics.rate)).model_dump_json()}\n\n"
+                        for event in stream_delta("message", tail, metrics.rate):
+                            yield event
 
                     output_items, clean_text, _, output_finish_reason = (
                         _response_output_items_from_text(
@@ -1551,86 +1572,64 @@ async def responses_endpoint(request: Request):
                             processor=processor,
                         )
                     )
-                    tool_output_items = [
-                        item
-                        for item in output_items
-                        if item.get("type") not in ("message", "reasoning")
-                    ]
-                    reasoning_output_items = [
-                        item for item in output_items if item.get("type") == "reasoning"
-                    ]
-                    if streamed_reasoning:
-                        yield _response_sse_event(
-                            "response.reasoning_text.done",
-                            {
-                                "type": "response.reasoning_text.done",
-                                "response_id": response_id,
-                                "item_id": reasoning_item_id,
-                                "output_index": len(compaction_output),
-                                "content_index": 0,
-                                "text": streamed_reasoning,
-                            },
-                        )
-
-                    # Send response.output_text.done event (to match the openai pipeline)
-                    yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=len(compaction_output), content_index=0, text=clean_text, timings=StreamingTimings(predicted_per_second=metrics.rate)).model_dump_json()}\n\n"
-
-                    # Send response.content_part.done event (to match the openai pipeline)
-                    final_content_part = ContentPartOutputText(
-                        type="output_text", text=clean_text, annotations=[]
-                    )
-                    yield f"event: response.content_part.done\ndata: {ResponseContentPartDoneEvent(type='response.content_part.done', item_id=message_id, output_index=len(compaction_output), content_index=0, part=final_content_part).model_dump_json()}\n\n"
-
-                    # Send response.output_item.done event (to match the openai pipeline)
-                    final_message_item = MessageItem(
-                        id=message_id,
-                        type="message",
-                        status="completed",
-                        role="assistant",
-                        content=[final_content_part] if clean_text else [],
-                    )
-                    message_output_items = [
-                        item for item in output_items if item.get("type") == "message"
-                    ]
-                    final_message_payload = (
-                        message_output_items[0]
-                        if message_output_items
-                        else final_message_item.model_dump()
-                    )
-                    yield f"event: response.output_item.done\ndata: {ResponseOutputItemDoneEvent(type='response.output_item.done', output_index=len(compaction_output), item=final_message_payload).model_dump_json()}\n\n"
-
-                    completed_output = list(compaction_output)
-                    completed_output.extend(reasoning_output_items)
-                    if message_output_items:
-                        completed_output.extend(message_output_items)
-                    elif clean_text:
-                        completed_output.append(final_message_item.model_dump())
-                    tool_start_index = len(completed_output)
-                    completed_output.extend(tool_output_items)
-                    for output_index, tool_item in enumerate(
-                        tool_output_items, start=tool_start_index
+                    if clean_text and not any(
+                        item["type"] == "message" for item in output_items
                     ):
-                        yield _response_sse_event(
-                            "response.output_item.added",
+                        output_items.insert(
+                            sum(item["type"] == "reasoning" for item in output_items),
                             {
-                                "type": "response.output_item.added",
-                                "output_index": output_index,
-                                "item": tool_item,
+                                "id": message_id,
+                                "type": "message",
+                                "status": "completed",
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "output_text",
+                                        "text": clean_text,
+                                        "annotations": [],
+                                    }
+                                ],
                             },
                         )
-                        if tool_item.get("type") == "function_call":
+                    completed_output = list(compaction_output)
+                    for item in sorted(
+                        output_items,
+                        key=lambda item: output_indices.get(item["id"], float("inf")),
+                    ):
+                        for event in start_output_item(item):
+                            yield event
+                        output_index = output_indices[item["id"]]
+                        completed_output.append(item)
+                        if item["type"] == "reasoning" and streamed_reasoning:
+                            yield _response_sse_event(
+                                "response.reasoning_text.done",
+                                {
+                                    "type": "response.reasoning_text.done",
+                                    "response_id": response_id,
+                                    "item_id": item["id"],
+                                    "output_index": output_index,
+                                    "content_index": 0,
+                                    "text": streamed_reasoning,
+                                },
+                            )
+                        elif item["type"] == "message":
+                            yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=output_index, content_index=0, text=clean_text, timings=StreamingTimings(predicted_per_second=metrics.rate)).model_dump_json()}\n\n"
+                            final_content_part = ContentPartOutputText(
+                                type="output_text", text=clean_text, annotations=[]
+                            )
+                            yield f"event: response.content_part.done\ndata: {ResponseContentPartDoneEvent(type='response.content_part.done', item_id=message_id, output_index=output_index, content_index=0, part=final_content_part).model_dump_json()}\n\n"
+                        elif item["type"] == "function_call":
                             yield _response_sse_event(
                                 "response.function_call_arguments.done",
                                 {
                                     "type": "response.function_call_arguments.done",
                                     "response_id": response_id,
-                                    "item_id": tool_item.get("id")
-                                    or tool_item.get("call_id"),
+                                    "item_id": item["id"],
                                     "output_index": output_index,
-                                    "call_id": tool_item.get("call_id"),
-                                    "name": tool_item.get("name"),
-                                    "arguments": tool_item.get("arguments") or "{}",
-                                    "item": tool_item,
+                                    "call_id": item.get("call_id"),
+                                    "name": item.get("name"),
+                                    "arguments": item.get("arguments") or "{}",
+                                    "item": item,
                                 },
                             )
                         yield _response_sse_event(
@@ -1638,7 +1637,7 @@ async def responses_endpoint(request: Request):
                             {
                                 "type": "response.output_item.done",
                                 "output_index": output_index,
-                                "item": tool_item,
+                                "item": item,
                             },
                         )
 
