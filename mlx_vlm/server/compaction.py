@@ -1,10 +1,4 @@
-"""Conversation compaction and stateless replay, independent of model KV caches.
-
-Capsules contain conversation items, never tensors. Replaying one constructs a
-normal prompt, so APC can reuse only an actually matching prefix. The latest
-capsule replaces older history, while the client's retained-message prefix
-survives.
-"""
+"""Conversation compaction and stateless replay."""
 
 from __future__ import annotations
 
@@ -105,10 +99,7 @@ def resolve(items: list[dict], *, model: str, tenant: str | None) -> list[dict]:
 def _merge_retained_messages(
     prefix: list[dict], context: list[dict], tail: list[dict]
 ) -> list[dict]:
-    """Merge client-retained messages and continuation with the decoded capsule."""
-    # Clients can retain user/instruction messages before the opaque item.
-    # A full transcript containing assistant/tool items or an older capsule
-    # is instead superseded by the latest capsule.
+    # A full transcript before the capsule has already been compacted.
     if prefix and all(
         x.get("type") == "message"
         and x.get("role") in ("user", "system", "developer")
@@ -123,15 +114,13 @@ def _merge_retained_messages(
                 carried[key] -= 1
             else:
                 retained.append(message)
-        # Keep leading instructions in place and recent tool exchanges intact.
         start = next(
             (i for i, x in enumerate(context) if not _is_instruction(x)),
             len(context),
         )
         context = context[:start] + retained + context[start:]
 
-    # Clients may resend instructions after an opaque boundary. Do not
-    # accumulate identical carried instructions on every compaction cycle.
+    # Resent instructions replace their carried copies.
     repeated = {_message_key(x) for x in tail if _is_instruction(x)}
     context = [
         x for x in context if not _is_instruction(x) or _message_key(x) not in repeated
@@ -236,11 +225,7 @@ async def compact(
     keep_tokens: int,
     target_tokens: int,
 ) -> CompactedContext:
-    """One bounded summary attempt; commit only a smaller, valid context.
-
-    The latest user exchange always stays verbatim. Instructions are retained with
-    their original roles; generated summaries have assistant authority only.
-    """
+    """Summarize once, preserving instructions and the latest user exchange."""
     before = await count(items)
     unchanged = CompactedContext(items, before, before)
     instructions = [x for x in items if _is_instruction(x)]
@@ -255,14 +240,12 @@ async def compact(
         cut = boundary
     if cut == 0:
         return unchanged
-    # Instructions, tool schemas and the protected tail cannot be summarized.
-    # Apply the reduction goal only to the history that can actually be removed.
+    # Apply the reduction target only to removable history.
     retained = await count(instructions + conversation[cut:])
     target_tokens = min(
         target_tokens, retained + max(1, int((before - retained) * 0.6))
     )
-    # Preserve the original order for the summary request and keep its rendered
-    # prefix reusable. The append is an ordinary user message, not a new system.
+    # Preserve the rendered prefix for APC reuse.
     head_ids = {id(x) for x in conversation[:cut]}
     head = [x for x in items if _is_instruction(x) or id(x) in head_ids]
     summary, usage = await summarize(head)
