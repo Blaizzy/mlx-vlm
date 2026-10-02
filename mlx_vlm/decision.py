@@ -1,6 +1,16 @@
 from collections.abc import Mapping
 
 
+def _validate_question_structure(questions):
+    if not isinstance(questions, Mapping) or not questions:
+        raise ValueError("At least one named question is required")
+    if any(
+        not isinstance(name, str) or not isinstance(question, Mapping)
+        for name, question in questions.items()
+    ):
+        raise ValueError("Questions must map names to question dictionaries")
+
+
 def predict(model, processor, state, questions, **kwargs):
     """Predict named decisions using a model's native scoring and calibration.
 
@@ -12,12 +22,9 @@ def predict(model, processor, state, questions, **kwargs):
     supported = getattr(model, "decision_types", ())
     if not supported:
         raise ValueError("This model does not support decision prediction")
-    if not isinstance(questions, Mapping) or not questions:
-        raise ValueError("At least one named question is required")
+    _validate_question_structure(questions)
     normalized = {}
     for name, question in questions.items():
-        if not isinstance(name, str) or not isinstance(question, Mapping):
-            raise ValueError("Questions must map names to question dictionaries")
         question = dict(question)
         kind = question.get("type", "choice")
         if kind not in supported:
@@ -38,8 +45,14 @@ def predict(model, processor, state, questions, **kwargs):
                 raise ValueError("Decision labels must be unique")
         if kind == "score" and isinstance(criteria, Mapping):
             raise ValueError("score criteria must be an ordered list")
-        if kind == "multi_label" and not 0 <= question.get("threshold", 0.5) <= 1:
-            raise ValueError("threshold must be between zero and one")
+        if kind == "multi_label":
+            threshold = question.get("threshold", 0.5)
+            if (
+                isinstance(threshold, bool)
+                or not isinstance(threshold, (int, float))
+                or not 0 <= threshold <= 1
+            ):
+                raise ValueError("threshold must be a number between zero and one")
         if (
             kind == "bool"
             and criteria is not None

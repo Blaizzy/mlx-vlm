@@ -2598,6 +2598,7 @@ class TestResponseGenerator:
             ("image-model", "PRELOAD_IMAGE_MODEL", "image-demo"),
             ("tts-model", "PRELOAD_TTS_MODEL", "tts-demo"),
             ("stt-model", "PRELOAD_STT_MODEL", "stt-demo"),
+            ("decision-model", "PRELOAD_DECISION_MODEL", "decision-demo"),
             ("reranker-model", "PRELOAD_RERANKER_MODEL", "reranker-demo"),
             ("thinking-budget", "THINKING_BUDGET", "128"),
             ("thinking-start-token", "THINKING_START_TOKEN", "<|START_THINKING|>"),
@@ -2639,6 +2640,7 @@ class TestResponseGenerator:
             STT_MODEL="audio_stt",
             EMBEDDING_MODEL="embedding",
             RERANKER_MODEL="reranker",
+            DECISION_MODEL="decision",
         )
         for key, kind in kinds.items():
             monkeypatch.setenv("MLX_VLM_PRELOAD_" + key, kind)
@@ -4278,3 +4280,210 @@ def test_realtime_websocket_requires_native_pcm_rate(realtime_client):
         event = websocket.receive_json()
         assert event["type"] == "error"
         assert event["error"]["code"] == "inference_error"
+
+
+@pytest.mark.parametrize("kind", ["choice", "score", "bool", "multi_label"])
+def test_decisions_endpoint_uses_shared_prediction(client, kind):
+    criteria = None if kind == "bool" else ["low", "high"]
+    questions = {"result": {"type": kind, "criteria": criteria}}
+    result = {
+        "answers": {"result": {"type": kind, "value": "low"}},
+        "usage": {"input_tokens": 7},
+    }
+    model = NS(decision_types=(kind,), predict=MagicMock(return_value=result))
+    processor = object()
+    with patch.object(
+        server, "get_cached_model", return_value=(model, processor, {})
+    ) as load:
+        response = client.post(
+            "/v1/decisions",
+            json={"model": "decision", "state": "text", "questions": questions},
+        )
+    assert response.status_code == 200
+    assert response.json() == {**result, "model": "decision"}
+    load.assert_called_once_with("decision", model_kind="decision")
+    model.predict.assert_called_once_with(processor, "text", questions)
+
+
+def test_decisions_rejects_unsupported_type(client):
+    model = NS(decision_types=("choice",), predict=MagicMock())
+    with patch.object(server, "get_cached_model", return_value=(model, None, {})):
+        response = client.post(
+            "/v1/decisions",
+            json={
+                "model": "decision",
+                "state": "text",
+                "questions": {"x": {"type": "bool"}},
+            },
+        )
+    assert response.status_code == 400
+    model.predict.assert_not_called()
+
+
+def test_decisions_auth_and_schema_before_loading(client, monkeypatch):
+    monkeypatch.setenv("MLX_VLM_SERVER_API_KEY", "secret-token")
+    with patch.object(server, "get_cached_model") as load:
+        assert client.post("/v1/decisions", json={}).status_code == 401
+        assert (
+            client.post(
+                "/v1/decisions",
+                json={},
+                headers={"Authorization": "Bearer secret-token"},
+            ).status_code
+            == 422
+        )
+    load.assert_not_called()
+
+
+def test_decision_cache_reuses_standard_loader_and_preserves_text(monkeypatch):
+    _reset_runtime(monkeypatch)
+    registry = server.runtime.model_cache
+    text_cache = {"model_path": "text", "model_kind": "text_generation"}
+    registry.set("text_generation", text_cache)
+    model, processor = NS(config={}, decision_types=("choice",)), object()
+    with (
+        patch("mlx_vlm.utils.load", return_value=(model, processor)) as load,
+        patch.object(server._app_module, "ResponseGenerator") as generator,
+    ):
+        for _ in range(2):
+            assert server.get_cached_model("decision", model_kind="decision") == (
+                model,
+                processor,
+                {},
+            )
+    load.assert_called_once_with("decision")
+    generator.assert_not_called()
+    assert registry.for_kind("text_generation") is text_cache
+    assert registry.for_kind("decision")["model"] is model
+
+
+def test_decision_cache_rejects_non_decision_model(monkeypatch):
+    _reset_runtime(monkeypatch)
+    with patch("mlx_vlm.utils.load", return_value=(NS(config={}), None)):
+        with pytest.raises(server.HTTPException) as error:
+            server.get_cached_model("text", model_kind="decision")
+    assert error.value.status_code == 400
+    assert not server.runtime.model_cache.for_kind("decision")
+
+
+@pytest.mark.parametrize("status", [404, 500])
+def test_decisions_preserves_loader_errors(client, status):
+    with patch.object(
+        server,
+        "get_cached_model",
+        side_effect=server.HTTPException(status_code=status, detail="load failed"),
+    ):
+        response = client.post(
+            "/v1/decisions",
+            json={
+                "model": "missing",
+                "state": "text",
+                "questions": {"x": {"type": "bool"}},
+            },
+        )
+    assert response.status_code == status
+    assert response.json()["detail"] == "load failed"
+
+
+@pytest.mark.parametrize("preloaded", [False, True])
+def test_decisions_default_model(client, monkeypatch, preloaded):
+    _reset_runtime(monkeypatch)
+    monkeypatch.delenv("MLX_VLM_PRELOAD_DECISION_MODEL", raising=False)
+    if preloaded:
+        server.runtime.model_cache.set("decision", {"model_path": "preloaded"})
+    model = NS(
+        decision_types=("bool",), predict=MagicMock(return_value={"answers": {}})
+    )
+    with patch.object(
+        server, "get_cached_model", return_value=(model, None, {})
+    ) as load:
+        response = client.post(
+            "/v1/decisions",
+            json={"state": "text", "questions": {"x": {"type": "bool"}}},
+        )
+    if preloaded:
+        assert response.status_code == 200
+        assert response.json()["model"] == "preloaded"
+        load.assert_called_once_with("preloaded", model_kind="decision")
+    else:
+        assert response.status_code == 400
+        load.assert_not_called()
+
+
+def test_decisions_default_model_from_env(client, monkeypatch):
+    _reset_runtime(monkeypatch)
+    monkeypatch.setenv("MLX_VLM_PRELOAD_DECISION_MODEL", "env-decision")
+    model = NS(
+        decision_types=("bool",), predict=MagicMock(return_value={"answers": {}})
+    )
+    with patch.object(
+        server, "get_cached_model", return_value=(model, None, {})
+    ) as load:
+        response = client.post(
+            "/v1/decisions",
+            json={"state": "text", "questions": {"x": {"type": "bool"}}},
+        )
+    assert response.status_code == 200
+    assert response.json()["model"] == "env-decision"
+    load.assert_called_once_with("env-decision", model_kind="decision")
+
+
+@pytest.mark.parametrize("threshold", ["bad", None, [], {}, True, -0.1, 1.1])
+def test_decisions_rejects_invalid_threshold_before_prediction(client, threshold):
+    model = NS(decision_types=("multi_label",), predict=MagicMock())
+    with patch.object(server, "get_cached_model", return_value=(model, None, {})):
+        response = client.post(
+            "/v1/decisions",
+            json={
+                "model": "decision",
+                "state": "text",
+                "questions": {
+                    "tags": {
+                        "type": "multi_label",
+                        "criteria": ["refund"],
+                        "threshold": threshold,
+                    }
+                },
+            },
+        )
+    assert response.status_code == 400
+    assert (
+        response.json()["detail"] == "threshold must be a number between zero and one"
+    )
+    model.predict.assert_not_called()
+
+
+@pytest.mark.parametrize("threshold", [0, 0.5, 1])
+def test_decisions_preserves_valid_threshold(client, threshold):
+    model = NS(
+        decision_types=("multi_label",), predict=MagicMock(return_value={"answers": {}})
+    )
+    questions = {
+        "tags": {"type": "multi_label", "criteria": ["refund"], "threshold": threshold}
+    }
+    with patch.object(server, "get_cached_model", return_value=(model, None, {})):
+        response = client.post(
+            "/v1/decisions",
+            json={"model": "decision", "state": "text", "questions": questions},
+        )
+    assert response.status_code == 200
+    model.predict.assert_called_once_with(None, "text", questions)
+
+
+def test_decisions_generic_prediction_failure_returns_500(client):
+    model = NS(
+        decision_types=("bool",),
+        predict=MagicMock(side_effect=RuntimeError("boom")),
+    )
+    with patch.object(server, "get_cached_model", return_value=(model, None, {})):
+        response = client.post(
+            "/v1/decisions",
+            json={
+                "model": "decision",
+                "state": "text",
+                "questions": {"x": {"type": "bool"}},
+            },
+        )
+    assert response.status_code == 500
+    assert response.json()["detail"] == "Decision prediction failed"
+    model.predict.assert_called_once()
