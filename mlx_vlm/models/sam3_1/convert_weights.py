@@ -55,25 +55,6 @@ def _map_fpn_conv_key(suffix):
 # Key groups that contain fused QKV that need splitting
 # ---------------------------------------------------------------------------
 
-# Patterns where we expect fused QKV (in_proj_weight/bias or qkv.weight/bias)
-QKV_FUSED_PATTERNS = [
-    # ViT attention qkv
-    re.compile(r".*\.attn\.qkv\.(weight|bias)$"),
-    # CLIP text encoder in_proj
-    re.compile(r".*\.attn\.in_proj_(weight|bias)$"),
-    # DETR encoder/decoder self_attn, cross_attn
-    re.compile(r".*\.self_attn\.in_proj_(weight|bias)$"),
-    re.compile(r".*\.cross_attn\.in_proj_(weight|bias)$"),
-    re.compile(r".*\.cross_attn_image\.in_proj_(weight|bias)$"),
-    re.compile(r".*\.ca_text\.in_proj_(weight|bias)$"),
-    # Geometry encoder
-    # Segmentation head cross_attend_prompt
-    re.compile(r".*\.cross_attend_prompt\.in_proj_(weight|bias)$"),
-    # Tracker memory attention
-    re.compile(r".*\.cross_attention\.in_proj_(weight|bias)$"),
-    re.compile(r".*self_attn\.in_proj_(weight|bias)$"),
-]
-
 # Keys that are ConvTranspose2d (need different transpose order)
 CONV_TRANSPOSE_PATTERNS = [
     re.compile(r".*dconv_2x2.*\.(weight|bias)$"),

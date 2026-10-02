@@ -2986,8 +2986,6 @@ class TestSam3dBodyExtraction(unittest.TestCase):
             prompt_embed_dim=64,
             num_vertices=64,
             num_faces=32,
-            num_keypoints=16,
-            pose_corrective_dim=32,
         )
         model = SAM3DBody(config)
         model.eval()

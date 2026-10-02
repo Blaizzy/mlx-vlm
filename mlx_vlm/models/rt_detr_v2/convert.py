@@ -63,13 +63,6 @@ DROP_PATTERNS: List[str] = [
     r"\.num_batches_tracked$",
 ]
 
-# Keys kept in the MLX checkpoint but flagged as training-only — the
-# inference forward path doesn't read them, but trainers (LoRA, full
-# fine-tune) need them.
-TRAINING_ONLY_PATTERNS: List[str] = [
-    r"^denoising_class_embed",
-]
-
 
 def _strip_prefix(key: str) -> str:
     return key[len(_HF_PREFIX) :] if key.startswith(_HF_PREFIX) else key

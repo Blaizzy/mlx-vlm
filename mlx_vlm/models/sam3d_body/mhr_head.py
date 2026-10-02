@@ -61,7 +61,6 @@ class MHRHead(nn.Module):
             num_verts=config.num_vertices,
             num_shape_comps=config.num_shape_comps,
             num_face_comps=config.num_face_comps,
-            pose_corrective_dim=config.pose_corrective_dim,
         )
 
         # Buffers (frozen, loaded from weights)
@@ -73,9 +72,7 @@ class MHRHead(nn.Module):
         self.hand_pose_comps = mx.zeros((54, 54))
         self.hand_joint_idxs_left = mx.zeros((27,), dtype=mx.int32)
         self.hand_joint_idxs_right = mx.zeros((27,), dtype=mx.int32)
-        self.keypoint_mapping = mx.zeros(
-            (config.num_keypoints, config.num_vertices + config.num_joints)
-        )
+        self.keypoint_mapping = mx.zeros((308, config.num_vertices + config.num_joints))
         self.right_wrist_coords = mx.zeros((3,))
         self.root_coords = mx.zeros((3,))
         self.local_to_world_wrist = mx.zeros((3, 3))

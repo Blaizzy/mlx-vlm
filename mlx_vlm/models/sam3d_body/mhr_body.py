@@ -46,12 +46,10 @@ class MHRBodyModel(nn.Module):
         num_verts: int = 18439,
         num_shape_comps: int = 45,
         num_face_comps: int = 72,
-        pose_corrective_dim: int = 3000,
     ):
         super().__init__()
         self.num_joints = num_joints
         self.num_verts = num_verts
-        self.pose_corrective_dim = pose_corrective_dim
 
         # These will be loaded from weights. Declare as frozen arrays.
         # Skeleton
@@ -87,7 +85,7 @@ class MHRBodyModel(nn.Module):
         # Pose correctives (sparse layer + linear)
         self.pc_sparse_indices = mx.zeros((2, 53136), dtype=mx.int32)
         self.pc_sparse_weight = mx.zeros((53136,))
-        self.pc_linear_weight = mx.zeros((num_verts * 3, pose_corrective_dim))
+        self.pc_linear_weight = mx.zeros((num_verts * 3, 3000))
 
     def _apply_parameter_limits(self, model_params: mx.array) -> mx.array:
         """Apply min/max clamping to model parameters.
@@ -408,7 +406,7 @@ class MHRBodyModel(nn.Module):
         weighted = input_vals * weights[None, :]  # (B, K)
 
         # Scatter-add into sparse output
-        out_size = self.pose_corrective_dim
+        out_size = self.pc_linear_weight.shape[1]
         sparse_out_list = []
         for b in range(B):
             col = _scatter_add_1d(weighted[b], out_indices, out_size)
