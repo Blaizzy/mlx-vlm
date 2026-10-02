@@ -2267,6 +2267,7 @@ class TestCompaction:
                 ),
             ) as fake,
             patch.object(openai, "prepare_inputs") as prepare,
+            patch.object(compaction, "prepare_inputs", prepare),
         ):
             fake.template.side_effect = (
                 lambda processor, config, messages, **kw: json.dumps(messages)
@@ -2589,7 +2590,9 @@ class TestCompaction:
         original = _compaction_history()
         fake.generate.return_value = _result(text, generation_tokens=tokens)
         with patch.object(
-            openai, "_compact_response_context", wraps=openai._compact_response_context
+            compaction,
+            "compact_response_context",
+            wraps=compaction.compact_response_context,
         ) as compact:
             response = _post(
                 client,
@@ -2810,9 +2813,9 @@ class TestCompaction:
         ],
     )
     def test_context_limit_respects_model_and_server(self, config, monkeypatch):
-        assert openai._compaction_context_limit(config) == 8192
+        assert compaction._context_limit(config) == 8192
         monkeypatch.setattr(server.runtime.config, "max_kv_size", 4096)
-        assert openai._compaction_context_limit(config) == 4096
+        assert compaction._context_limit(config) == 4096
 
     @pytest.mark.parametrize("stream", [False, True])
     def test_auto_compaction_replay_and_stream_indices(self, mocked, stream):
