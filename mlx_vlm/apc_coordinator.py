@@ -114,7 +114,13 @@ class APCCoordinator:
         self.plan: PrefixCachePlan = build_prefix_cache_plan(model)
 
     def prepare_prefill(
-        self, prompt_lengths, *, prefill_step_size=None, prefix_lengths=None
+        self,
+        prompt_lengths,
+        *,
+        prefill_step_size=None,
+        prefix_lengths=None,
+        evict=True,
+        protected_exact_keys=None,
     ) -> None:
         if self.enabled:
             lengths = (
@@ -123,7 +129,11 @@ class APCCoordinator:
             reserve = self.manager.memory_plan.prepare(
                 lengths, chunk_size=prefill_step_size, prefix_lengths=prefix_lengths
             )
-            self.manager.prepare_prefill(reserve)
+            self.manager.prepare_prefill(
+                reserve,
+                evict=evict,
+                protected_exact_keys=protected_exact_keys,
+            )
 
     def observe_cache(self, prompt_cache, token_count, *, batch_size=1) -> None:
         """Update runtime dimensions independently of snapshot persistence."""
@@ -167,11 +177,33 @@ class APCCoordinator:
         safe_lookup_min: int,
         suffix_is_text_only: Callable[[int], bool],
         prefix_has_media: Callable[[int], bool],
+        protected_exact_keys: Optional[set[int]] = None,
     ) -> Optional[dict]:
         if not self.enabled:
             return None
         from .apc import apc_lookup_plan
 
+        memory = self.manager.memory_plan
+        protected = set(protected_exact_keys or ())
+        if (
+            self.is_checkpoint
+            and len(memory.lengths) == 1
+            and memory.lengths[0] == len(token_ids)
+        ):
+            prefix_len, protected_key = self._exact_prefix_plan(
+                token_ids,
+                extra_hash=extra_hash,
+                safe_lookup_min=safe_lookup_min,
+                suffix_is_text_only=suffix_is_text_only,
+            )
+            if protected_key is not None and prefix_len:
+                protected.add(protected_key)
+            self.prepare_prefill(
+                memory.lengths,
+                prefill_step_size=memory.chunk_size,
+                prefix_lengths=[prefix_len],
+                protected_exact_keys=protected or None,
+            )
         hit = apc_lookup_plan(
             self.manager,
             token_ids,
@@ -180,10 +212,90 @@ class APCCoordinator:
             safe_lookup_min=safe_lookup_min,
             suffix_is_text_only=suffix_is_text_only,
             prefix_has_media=prefix_has_media,
+            protected_exact_keys=protected or None,
         )
         if hit is not None:
             hit["cache_plan"] = self.plan
+        if len(memory.lengths) == 1 and memory.lengths[0] == len(token_ids):
+            self.prepare_prefill(
+                memory.lengths,
+                prefill_step_size=memory.chunk_size,
+                prefix_lengths=[hit["prefix_len"] if hit is not None else 0],
+                protected_exact_keys=(protected or None) if hit is not None else None,
+            )
         return hit
+
+    def _exact_prefix_plan(
+        self,
+        token_ids: Sequence[int],
+        *,
+        extra_hash: int,
+        safe_lookup_min: int,
+        suffix_is_text_only: Callable[[int], bool],
+    ) -> Tuple[int, Optional[int]]:
+        prefix_len, protected_key = self.manager.exact_prefix_plan(
+            token_ids,
+            extra_hash=extra_hash,
+            min_prefix_tokens=safe_lookup_min,
+        )
+        if prefix_len and not suffix_is_text_only(prefix_len):
+            return 0, None
+        return prefix_len, protected_key
+
+    def lookup_many(
+        self, requests: Sequence[Tuple[Sequence[int], dict]]
+    ) -> List[Optional[dict]]:
+        if not self.enabled:
+            return [None] * len(requests)
+        memory = self.manager.memory_plan
+        planned_exact_keys = [None] * len(requests)
+        protected_exact_keys = None
+        if self.is_checkpoint and len(requests) == len(memory.lengths):
+            plans = [
+                self._exact_prefix_plan(
+                    token_ids,
+                    extra_hash=kwargs["extra_hash"],
+                    safe_lookup_min=kwargs["safe_lookup_min"],
+                    suffix_is_text_only=kwargs["suffix_is_text_only"],
+                )
+                for token_ids, kwargs in requests
+            ]
+            planned_exact_keys = [
+                protected_key if prefix_len else None
+                for prefix_len, protected_key in plans
+            ]
+            protected_exact_keys = {
+                key for key in planned_exact_keys if key is not None
+            } or None
+            self.prepare_prefill(
+                memory.lengths,
+                prefill_step_size=memory.chunk_size,
+                prefix_lengths=[prefix_len for prefix_len, _ in plans],
+                protected_exact_keys=protected_exact_keys,
+            )
+        hits = [
+            self.lookup(
+                token_ids,
+                protected_exact_keys=protected_exact_keys,
+                **kwargs,
+            )
+            for token_ids, kwargs in requests
+        ]
+        if len(requests) == len(memory.lengths):
+            protected_exact_keys = {
+                key
+                for key, hit in zip(planned_exact_keys, hits)
+                if key is not None and hit is not None
+            } or None
+            self.prepare_prefill(
+                memory.lengths,
+                prefill_step_size=memory.chunk_size,
+                prefix_lengths=[
+                    hit["prefix_len"] if hit is not None else 0 for hit in hits
+                ],
+                protected_exact_keys=protected_exact_keys,
+            )
+        return hits
 
     def checkpoint_len(
         self, token_ids: Sequence[int], media_token_ids: set[int]
