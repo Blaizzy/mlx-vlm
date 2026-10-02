@@ -1100,6 +1100,65 @@ def test_modelopt_mixed_drops_fp8_kv_cache_scales():
     assert quantization == {"group_size": 16, "bits": 4, "mode": "nvfp4"}
 
 
+def test_convert_output_tokenizer_loads_with_legacy_special_tokens_map(
+    tmp_path, monkeypatch
+):
+    """A transformers 4.x checkpoint ships ``special_tokens_map.json`` with
+    ``AddedToken`` dicts. transformers 5 re-saves ``tokenizer_config.json``
+    without ``added_tokens_decoder``, which makes loading fall back to that
+    legacy file, so the copy taken from the source must not survive.
+    """
+    from tokenizers import AddedToken, Tokenizer, models, pre_tokenizers
+    from transformers import AutoTokenizer
+
+    convert = importlib.import_module("mlx_vlm.convert")
+
+    src = tmp_path / "src"
+    src.mkdir()
+    tokens = {2: "<|image_pad|>", 3: "<decision>"}
+    tokenizer = Tokenizer(models.WordLevel({"[UNK]": 0, "hi": 1}, unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+    tokenizer.add_special_tokens(
+        [AddedToken(t, normalized=False, special=True) for t in tokens.values()]
+    )
+    tokenizer.save(str(src / "tokenizer.json"))
+    flags = {"lstrip": False, "normalized": False, "rstrip": False}
+    added = {i: {"content": t, "single_word": False} | flags for i, t in tokens.items()}
+    # Same layout as a Qwen3.5 fine-tune saved with transformers 4.x.
+    (src / "tokenizer_config.json").write_text(
+        json.dumps(
+            {
+                "tokenizer_class": "PreTrainedTokenizerFast",
+                "unk_token": "[UNK]",
+                "added_tokens_decoder": {
+                    str(i): v | {"special": True} for i, v in added.items()
+                },
+                "additional_special_tokens": ["<decision>"],
+                "extra_special_tokens": {"image_token": "<|image_pad|>"},
+            }
+        )
+    )
+    (src / "special_tokens_map.json").write_text(
+        json.dumps({"unk_token": "[UNK]", "additional_special_tokens": [added[3]]})
+    )
+    (src / "config.json").write_text("{}")
+    expected = AutoTokenizer.from_pretrained(src)("hi <decision>")["input_ids"]
+
+    monkeypatch.setattr(
+        convert,
+        "fetch_from_hub",
+        lambda *args, **kwargs: (
+            nn.Linear(2, 2),
+            {},
+            AutoTokenizer.from_pretrained(src),
+        ),
+    )
+    convert.convert(str(src), str(tmp_path / "out"))
+
+    tokenizer = AutoTokenizer.from_pretrained(tmp_path / "out")
+    assert tokenizer("hi <decision>")["input_ids"] == expected
+
+
 def _hadamard_rotation(width, block):
     h = np.ones((1, 1), dtype=np.float32)
     while len(h) < block:
