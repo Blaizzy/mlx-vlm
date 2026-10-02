@@ -18,16 +18,48 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import logging
 import os
 import re
 import shutil
+import struct
 from collections import OrderedDict
 from typing import Optional, Tuple
 
+import numpy as np
+
+_ST_NP = {
+    "F64": "float64",
+    "F32": "float32",
+    "F16": "float16",
+    "BF16": "uint16",
+    "I64": "int64",
+    "I32": "int32",
+    "I16": "int16",
+    "I8": "int8",
+    "U64": "uint64",
+    "U32": "uint32",
+    "U16": "uint16",
+    "U8": "uint8",
+    "F8_E4M3": "uint8",
+    "F8_E5M2": "uint8",
+    "BOOL": "bool",
+}
+
+
+def _st_header(path: str) -> Tuple[int, dict]:
+    """(data_start, header) for a safetensors file, read without loading data."""
+    with open(path, "rb") as handle:
+        n = struct.unpack("<Q", handle.read(8))[0]
+        header = json.loads(handle.read(n))
+    header.pop("__metadata__", None)
+    return 8 + n, header
+
+
 # stacked: switch_mlp.gate_proj.weight [E,out,in]; per-expert: experts.{j}.gate_proj.weight;
 # stacked-fused: switch_mlp.gate_up_proj.weight [E,2*out,in], gate = first half of axis 1.
-_PROJ = r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight|scales|biases)$"
-_FUSED_PROJ = r"gate_up_proj\.(?P<kind>weight|scales|biases)$"
+_PROJ = r"(?P<proj>gate_proj|up_proj|down_proj)(?:\.(?P<kind>weight|scales|biases))?$"
+_FUSED_PROJ = r"gate_up_proj(?:\.(?P<kind>weight|scales|biases))?$"
 PEREXPERT_RE = re.compile(
     r"^(?:.*\.)?layers\.(?P<layer>\d+)\..*?experts\.(?P<j>\d+)\." + _PROJ
 )
@@ -55,7 +87,7 @@ def plan(tensor_names) -> dict:
             continue
         m = PEREXPERT_RE.match(name)
         if m:
-            key = f"e{int(m['j'])}.{m['proj']}.{m['kind']}"
+            key = f"e{int(m['j'])}.{m['proj']}.{m['kind'] or 'weight'}"
             experts.setdefault(int(m["layer"]), []).append((key, name, None))
             continue
         m = STACKED_FUSED_RE.match(name)
@@ -196,14 +228,14 @@ def _expand_expert_layer(entries, get_value) -> Tuple[dict, int]:
             n_experts = max(n_experts, E)
             mm = STACKED_RE.match(src)
             for j in range(E):
-                layer[f"e{j}.{mm['proj']}.{mm['kind']}"] = arr[j]
+                layer[f"e{j}.{mm['proj']}.{mm['kind'] or 'weight'}"] = arr[j]
         elif mode == "STACK_FUSED":
             # gate = first half of axis 1 (the doubled output dim), up = second.
             E = arr.shape[0]
             half = arr.shape[1] // 2
             n_experts = max(n_experts, E)
             mm = STACKED_FUSED_RE.match(src)
-            kind = mm["kind"]
+            kind = mm["kind"] or "weight"
             gate_half, up_half = arr[:, :half, ...], arr[:, half:, ...]
             for j in range(E):
                 layer[f"e{j}.gate_proj.{kind}"] = gate_half[j]
@@ -425,11 +457,40 @@ def repack(build: str, out: str, resident_shard_gb: float = 5.0) -> None:
     )
 
 
-_PROJ_KEYS = tuple(
-    f"{p}.{k}"
-    for p in ("gate_proj", "up_proj", "down_proj")
-    for k in ("weight", "scales", "biases")
-)
+def resolve_repack(model_path: str, log=None) -> str:
+    """Reuse or build the per-expert offload dir ``<model>-offload`` and return its path; raises if disk can't hold the repack."""
+    if log is None:
+        log = logging.getLogger(__name__).warning
+    model_path = str(model_path).rstrip("/")
+    target = model_path + "-offload"
+    if os.path.exists(os.path.join(target, "offload_index.json")):
+        log(f"[moe-offload] reusing {target} (fast, bounded).")
+        return target
+    _check_disk_headroom(model_path, model_path)
+    log(
+        f"[moe-offload] no repack found -> repacking to {target} "
+        "(one-time; fast + bounded thereafter)."
+    )
+    repack(model_path, target)
+    return target
+
+
+_PROJS = ("gate_proj", "up_proj", "down_proj")
+_PROJ_KEYS = tuple(f"{p}.{k}" for p in _PROJS for k in ("weight", "scales", "biases"))
+
+
+def _pack_trip(get):
+    """(gate, up, down), each ``(weight, scales, biases)`` via ``get(proj, kind)`` (None for an unquantized expert)."""
+    triple = lambda p: (get(p, "weight"), get(p, "scales"), get(p, "biases"))
+    return tuple(triple(p) for p in _PROJS)
+
+
+def _trip_arrays(trip):
+    return [t for grp in trip for t in grp if t is not None]
+
+
+def _trip_nbytes(trip) -> int:
+    return sum(t.nbytes for t in _trip_arrays(trip))
 
 
 def _resident_bytes_on_disk(offload_dir: str) -> int:
@@ -512,13 +573,18 @@ def _estimate_kv_reserve_bytes(model, max_kv_size: Optional[int]) -> int:
 def _default_expert_cache_bytes(
     resident_bytes: int = 0, kv_reserve_bytes: int = 0
 ) -> int:
+    """Auto expert-cache budget, capped at a third of physical RAM so it can't grow into the compute working set and collapse under memory pressure."""
     import mlx.core as mx
 
     try:
-        recommended = mx.device_info()["max_recommended_working_set_size"]
+        info = mx.device_info()
+        recommended = info["max_recommended_working_set_size"]
+        ram = int(info.get("memory_size", 0))
     except Exception:
         return 0
     budget = int(0.8 * recommended) - resident_bytes - kv_reserve_bytes
+    if ram:
+        budget = min(budget, ram // 3)
     return max(0, budget)
 
 
@@ -632,12 +698,7 @@ class ExpertStore:
             self._evict_until_fits(nbytes)
             self._lru[key] = nbytes
             self._resident_bytes += nbytes
-        trip = lambda p: (
-            m[f"e{j}.{p}.weight"],
-            m.get(f"e{j}.{p}.scales"),
-            m.get(f"e{j}.{p}.biases"),
-        )
-        return (trip("gate_proj"), trip("up_proj"), trip("down_proj"))
+        return _pack_trip(lambda p, k: m.get(f"e{j}.{p}.{k}"))
 
     def get_all(self, layer_id: int, needed) -> dict:
         """Bulk variant of ``get()`` for calls that touch most of a layer's
@@ -660,13 +721,12 @@ class ExpertStore:
         out = {}
         for j in needed:
             j = int(j)
-            trip = lambda p: (
-                fresh[f"e{j}.{p}.weight"],
-                fresh.get(f"e{j}.{p}.scales"),
-                fresh.get(f"e{j}.{p}.biases"),
-            )
-            out[j] = (trip("gate_proj"), trip("up_proj"), trip("down_proj"))
+            out[j] = _pack_trip(lambda p, k, j=j: fresh.get(f"e{j}.{p}.{k}"))
         return out
+
+    def get_many(self, layer_id: int, needed) -> dict:
+        """Per-expert get() for each of ``needed`` (overridden with parallel reads by RuntimeExpertStore)."""
+        return {int(j): self.get(layer_id, int(j)) for j in needed}
 
     def stats(self) -> dict:
         """A snapshot of eviction behavior, for a server-side observability
@@ -688,11 +748,259 @@ class ExpertStore:
         }
 
 
+class RuntimeExpertStore(ExpertStore):
+    """No-repack offload: pread routed-expert rows from the stacked checkpoint, converting and byte-budgeted-LRU-caching them; fast-path expert naming only."""
+
+    def __init__(
+        self,
+        model_path: str,
+        expert_cache_bytes: Optional[int] = None,
+        kv_reserve_bytes: int = 0,
+    ):
+        idx_path = os.path.join(model_path, "model.safetensors.index.json")
+        if os.path.exists(idx_path):
+            shard_of = {
+                name: os.path.join(model_path, shard)
+                for name, shard in json.load(open(idx_path))["weight_map"].items()
+            }
+        else:
+            shard_of = {}
+            for f in glob.glob(os.path.join(model_path, "*.safetensors")):
+                if f.endswith("consolidated.safetensors"):
+                    continue
+                for name in _st_header(f)[1]:
+                    shard_of[name] = f
+        if not shard_of:
+            raise ValueError(f"No safetensors found under {model_path}")
+
+        p = plan(list(shard_of))
+        if not p["layers"]:
+            raise ValueError(
+                f"{model_path} needs sanitize() to expose experts; runtime offload "
+                "is fast-path only -- repack() this checkpoint instead."
+            )
+        self._entries = p["experts"]
+        self._shard_of = shard_of
+
+        headers: dict = {}
+        self._shard_fd: dict = {}
+
+        def tensor_info(name):
+            shard = self._shard_of[name]
+            if shard not in headers:
+                headers[shard] = _st_header(shard)
+            if shard not in self._shard_fd:
+                self._shard_fd[shard] = os.open(shard, os.O_RDONLY)
+            data_start, header = headers[shard]
+            meta = header[name]
+            return (
+                self._shard_fd[shard],
+                data_start + meta["data_offsets"][0],
+                tuple(meta["shape"]),
+                _ST_NP[meta["dtype"]],
+                meta["dtype"],
+            )
+
+        self._mm: dict = {}
+        self._layer_reads: dict = {}
+        num_experts = 0
+        for lid, ents in self._entries.items():
+            stacked, perexpert = [], {}
+            for key, name, mode in ents:
+                self._mm[name] = tensor_info(name)
+                shape = self._mm[name][2]
+                if mode == "STACK":
+                    m = STACKED_RE.match(name)
+                    stacked.append((m["proj"], m["kind"] or "weight", "STACK", name))
+                    num_experts = max(num_experts, shape[0])
+                elif mode == "STACK_FUSED":
+                    m = STACKED_FUSED_RE.match(name)
+                    kind = m["kind"] or "weight"
+                    stacked.append(("gate_proj", kind, "FUSED_GATE", name))
+                    stacked.append(("up_proj", kind, "FUSED_UP", name))
+                    num_experts = max(num_experts, shape[0])
+                else:
+                    j, proj, kind = key[1:].split(".")
+                    perexpert[(int(j), proj, kind)] = name
+                    num_experts = max(num_experts, int(j) + 1)
+            self._layer_reads[lid] = (stacked, perexpert)
+
+        self.num_experts = num_experts
+        self._maps = {lid: True for lid in self._entries}
+        self.swapped = 0
+        self._served = 0
+        self._cache: "OrderedDict[Tuple[int, int], tuple]" = OrderedDict()
+        self._cache_bytes = 0
+        self._hits = 0
+        self._misses = 0
+        self._budget = (
+            int(expert_cache_bytes)
+            if expert_cache_bytes is not None
+            else _default_expert_cache_bytes(kv_reserve_bytes=kv_reserve_bytes)
+        )
+
+    def _evict_cache(self, incoming: int) -> None:
+        import mlx.core as mx
+
+        if self._budget <= 0:
+            return
+        evicted = False
+        while self._cache and self._cache_bytes + incoming > self._budget:
+            _, trip = self._cache.popitem(last=False)
+            self._cache_bytes -= _trip_nbytes(trip)
+            evicted = True
+        if evicted:
+            try:
+                mx.clear_cache()
+            except Exception:
+                pass
+
+    def _cache_store(self, key, trip) -> None:
+        nbytes = _trip_nbytes(trip)
+        self._evict_cache(nbytes)
+        self._cache[key] = trip
+        self._cache_bytes += nbytes
+
+    @staticmethod
+    def _to_mx(rows, st_dtype: str):
+        import mlx.core as mx
+
+        arr = mx.array(np.ascontiguousarray(rows))
+        if st_dtype == "BF16":
+            arr = arr.view(mx.bfloat16)
+        return arr
+
+    def experts_present(self, layer_id: int) -> bool:
+        return layer_id in self._entries
+
+    def _pread_array(self, name: str, row: Optional[int] = None):
+        """(numpy, st_dtype) for ``name`` -- one stacked row if ``row`` is set, else the whole tensor."""
+        fd, base, shape, np_dt, st_dt = self._mm[name]
+        item = np.dtype(np_dt).itemsize
+        if row is None:
+            nbytes, off, out_shape = int(np.prod(shape)) * item, base, shape
+        else:
+            stride = int(np.prod(shape[1:])) * item
+            nbytes, off, out_shape = stride, base + row * stride, shape[1:]
+        rows = np.frombuffer(os.pread(fd, nbytes, off), dtype=np_dt).reshape(out_shape)
+        return rows, st_dt
+
+    def _read_raw(self, layer_id: int, j: int) -> Tuple[dict, dict]:
+        """Raw numpy reads for expert ``j``: stacked rows keyed by tensor name, plus whole-tensor per-expert reads keyed by (proj, kind)."""
+        stacked, perexpert = self._layer_reads[layer_id]
+        rows: dict = {}
+        for _, _, _, name in stacked:
+            if name not in rows:
+                rows[name] = self._pread_array(name, j)
+        pe = {
+            (proj, kind): self._pread_array(name)
+            for (jj, proj, kind), name in perexpert.items()
+            if jj == j
+        }
+        return rows, pe
+
+    def _assemble_trip(self, layer_id: int, rows: dict, pe: dict) -> tuple:
+        stacked, _ = self._layer_reads[layer_id]
+        acc: dict = {}
+        for proj, kind, mode, name in stacked:
+            rr, dt = rows[name]
+            if mode != "STACK":
+                half = rr.shape[0] // 2
+                rr = rr[:half] if mode == "FUSED_GATE" else rr[half:]
+            acc[(proj, kind)] = self._to_mx(rr, dt)
+        for (proj, kind), (rr, dt) in pe.items():
+            acc[(proj, kind)] = self._to_mx(rr, dt)
+        return _pack_trip(lambda p, k: acc.get((p, k)))
+
+    def _expert(self, layer_id: int, j: int):
+        self._served += 1
+        rows, pe = self._read_raw(layer_id, j)
+        return self._assemble_trip(layer_id, rows, pe)
+
+    def _take_cached(self, key):
+        cached = self._cache.get(key)
+        if cached is not None:
+            self._cache.move_to_end(key)
+            self._hits += 1
+        return cached
+
+    def get(self, layer_id: int, j: int):
+        key = (int(layer_id), int(j))
+        cached = self._take_cached(key)
+        if cached is not None:
+            return cached
+        self._misses += 1
+        trip = self._expert(*key)
+        if self._budget > 0:
+            import mlx.core as mx
+
+            mx.eval(*_trip_arrays(trip))
+            self._cache_store(key, trip)
+        return trip
+
+    def get_many(self, layer_id: int, needed) -> dict:
+        """Parallel get(): pread the decode step's cache-missed experts on a thread pool (thread-safe on a shared fd), then convert + cache on the calling thread."""
+        import mlx.core as mx
+
+        lid = int(layer_id)
+        out: dict = {}
+        misses = []
+        for j in needed:
+            j = int(j)
+            cached = self._take_cached((lid, j))
+            if cached is not None:
+                out[j] = cached
+            else:
+                self._misses += 1
+                misses.append(j)
+        if not misses:
+            return out
+
+        if len(misses) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=min(8, len(misses))) as ex:
+                raws = list(ex.map(lambda j: (j, self._read_raw(lid, j)), misses))
+        else:
+            raws = [(misses[0], self._read_raw(lid, misses[0]))]
+
+        new = []
+        for j, (rows, pe) in raws:
+            self._served += 1
+            trip = self._assemble_trip(lid, rows, pe)
+            out[j] = trip
+            new.append(((lid, j), trip))
+        if self._budget > 0:
+            mx.eval(*(a for _, trip in new for a in _trip_arrays(trip)))
+            for key, trip in new:
+                self._cache_store(key, trip)
+        return out
+
+    def get_all(self, layer_id: int, needed) -> dict:
+        return {int(j): self._expert(int(layer_id), int(j)) for j in needed}
+
+    def stats(self) -> dict:
+        total = self._hits + self._misses
+        return {
+            "backend": "memmap+cache",
+            "num_experts": self.num_experts,
+            "num_layers": len(self._entries),
+            "experts_served": self._served,
+            "residency": "os_page_cache+lru",
+            "budget_bytes": self._budget,
+            "cache_bytes": self._cache_bytes,
+            "hits": self._hits,
+            "misses": self._misses,
+            "hit_rate": (self._hits / total) if total else None,
+        }
+
+
 def patch_model(
     model,
     offload_dir: str,
     expert_cache_gb: Optional[float] = None,
     max_kv_size: Optional[int] = None,
+    store: Optional["ExpertStore"] = None,
 ) -> "ExpertStore":
     """Swap every switch layer in ``model`` for an offloaded one (see module
     docstring for separate-vs-fused handling). group_size/bits/mode are
@@ -735,7 +1043,8 @@ def patch_model(
         if expert_cache_bytes is not None
         else _estimate_kv_reserve_bytes(model, max_kv_size)
     )
-    store = ExpertStore(offload_dir, expert_cache_bytes, kv_reserve_bytes)
+    if store is None:
+        store = ExpertStore(offload_dir, expert_cache_bytes, kv_reserve_bytes)
     if not store._maps:
         raise ValueError(
             f"No expert files found under {offload_dir}/experts -- this "
