@@ -690,16 +690,116 @@ class TestBatchGenerator:
         gen.insert([[1, 2, 3]])
         assert gen.remove(9999) is False
 
+    @pytest.mark.parametrize("cancelled_row", [0, 1])
+    def test_remove_from_active_prefill(
+        self, mock_model, mock_processor, cancelled_row
+    ):
+        with contextlib.closing(
+            BatchGenerator(
+                mock_model.language_model,
+                mock_processor,
+                prefill_batch_size=2,
+                prefill_step_size=3,
+                max_tokens=2,
+            )
+        ) as gen:
+            prompts = [[1, 2, 3, 4], list(range(1, 14))]
+            uids = gen.insert(
+                prompts,
+                prompt_kwargs=[
+                    {"inputs_embeds": mx.zeros((1, len(ids), 4))} for ids in prompts
+                ],
+            )
+            gen.next()
+            batch = gen._prompt_batch
+            survivor = uids[1 - cancelled_row]
+
+            assert gen.remove(uids[cancelled_row]) is True
+            assert gen._prompt_batch is batch
+            assert batch.uids == [survivor]
+            assert batch._processed_prompt_columns == 3
+            assert batch._input_ids.shape == (1, 10)
+            assert not gen.unprocessed_prompts
+
+            responses = []
+            for _ in range(10):
+                if not gen.has_work:
+                    break
+                progress, tokens = gen.next()
+                assert all(p.uid == survivor for p in progress)
+                responses.extend(tokens)
+            assert not gen.has_work
+            assert responses and all(r.uid == survivor for r in responses)
+
+    def test_remove_all_prefill_rows_releases_apc(self, mock_model, mock_processor):
+        manager = MagicMock()
+        blocks = [object(), object()]
+        with contextlib.closing(
+            BatchGenerator(mock_model.language_model, mock_processor)
+        ) as gen:
+            batch = PromptProcessingBatch(
+                model=mock_model.language_model,
+                uids=[0, 1],
+                input_ids=[[1, 2], [3, 4]],
+                max_tokens=[1, 1],
+                inputs_embeds=mx.zeros((2, 2, 4)),
+                prompt_kwargs={},
+                warm_cache=[],
+                apc_manager=manager,
+                apc_meta=[{"apc_blocks": [block]} for block in blocks],
+            )
+            gen._prompt_batch = batch
+
+            assert gen.remove(0) is True
+            manager.release.assert_called_once_with([blocks[0]])
+            assert gen.remove(1) is True
+            manager.release.assert_called_with([blocks[1]])
+            assert manager.release.call_count == 2
+            assert gen._prompt_batch is None
+            assert not gen.has_work
+
+    def test_remove_right_padded_prefill_preserves_finished_rows(self):
+        class EchoModel:
+            def __call__(self, inputs, **kwargs):
+                return SimpleNamespace(logits=mx.eye(16)[inputs])
+
+        batch = PromptProcessingBatch(
+            model=EchoModel(),
+            uids=[10, 11, 12],
+            input_ids=[[1, 2, 3, 4, 5, 6, 7], [5, 6], [6, 7, 8]],
+            max_tokens=[1, 1, 1],
+            inputs_embeds=mx.zeros((3, 7, 4)),
+            prompt_kwargs={
+                "position_ids": mx.broadcast_to(mx.arange(7)[None, None], (3, 3, 7)),
+                "rope_deltas": mx.array([[10], [11], [12]]),
+            },
+            prefill_step_size=2,
+            warm_cache=[],
+            right_pad_per_row=[0, 5, 4],
+        )
+        batch.prompt_step()
+        batch.remove(10)
+        assert batch._prompt_kwargs["position_ids"].shape == (3, 2, 5)
+        assert batch._prompt_kwargs["rope_deltas"].tolist() == [[11], [12]]
+        while batch.needs_processing():
+            batch.prompt_step()
+        decoded = batch.generate(lambda x: mx.argmax(x, axis=-1), lambda _: False)
+        assert [(r.uid, r.token) for r in decoded.next()] == [(11, 6), (12, 8)]
+
     def test_remove_cancels_image_prefill_and_releases_cache(
         self, mock_model, mock_processor
     ):
         gen = BatchGenerator(
             model=mock_model.language_model, processor=mock_processor, max_tokens=50
         )
-        prompt_batch = SimpleNamespace(
+        prompt_batch = PromptProcessingBatch(
+            model=mock_model.language_model,
             uids=[7],
-            prompt_cache=[MagicMock()],
-            input_ids=mx.array([[1, mock_model.config.image_token_index, 2]]),
+            max_tokens=[50],
+            input_ids=[[1, mock_model.config.image_token_index, 2]],
+            inputs_embeds=mx.zeros((1, 3, 4)),
+            prompt_kwargs={},
+            warm_cache=[BatchKVCache([0])],
         )
         gen._prompt_batch = prompt_batch
 

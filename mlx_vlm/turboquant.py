@@ -6692,7 +6692,7 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
         self.offset = self.offset[batch_indices]
         self.left_padding = self.left_padding[batch_indices]
 
-        min_lp = self.left_padding.min().item()
+        min_lp = min(self.left_padding.min().item(), self._idx)
         if min_lp > 0:
             if self.keys is not None:
                 # Trim leading padding tokens
