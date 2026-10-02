@@ -1956,6 +1956,60 @@ def test_generation_stream_spill(managers, monkeypatch):
     assert manager.disk.num_blocks_indexed == 1 and manager.disk.disk_bytes > 0
 
 
+@parametrize("tier", ["memory", "disk"])
+def test_tensor_limit_replaces_idle_history(managers, monkeypatch, tier):
+    monkeypatch.setenv("APC_MAX_POOL_TENSORS", "8")
+    manager = managers(tier, blocks=8)
+    old_tokens, compacted_tokens = list(range(32)), list(range(100, 132))
+    old = [allocated(32, value) for value in (1, 3)]
+    compacted = [allocated(32, value) for value in (5, 7)]
+    for tokens, caches in ((old_tokens, old), (compacted_tokens, compacted)):
+        stored = manager.store_kv_blocks(
+            tokens, [c.keys for c in caches], [c.values for c in caches]
+        )
+        assert len(stored) == 2
+        manager.release(stored)
+    assert manager.stats.evictions == 2
+    assert len(manager.hash_table) * 4 == manager._max_pool_tensors
+    assert manager.lookup_prefix(old_tokens) == ([], 0)
+    matched, count = manager.lookup_prefix(compacted_tokens + [999])
+    assert count == 32
+    same_cache(P.make_warm_kv_cache(matched), compacted)
+    manager.release(matched)
+    if manager.disk is not None:
+        manager.disk.flush()
+        restored, count = manager.lookup_prefix_disk_cache(old_tokens)
+        assert count == 32
+        same_cache(restored, old)
+        assert manager.stats.disk_write_failures == 0
+        matched, count = manager.lookup_prefix(compacted_tokens + [998])
+        assert count == 32
+        manager.release(matched)
+
+
+@parametrize("leased", [1, 2])
+def test_tensor_limit_preserves_active_blocks(managers, monkeypatch, leased):
+    monkeypatch.setenv("APC_MAX_POOL_TENSORS", "8")
+    manager = managers("disk", blocks=8)
+    old = store_blocks(manager, list(range(32)))
+    active = [(b.block_hash, list(b.keys), list(b.values)) for b in old[:leased]]
+    manager.release(old[leased:])
+    new_tokens = list(range(100, 116))
+    new = store_blocks(manager, new_tokens)
+    assert len(new) == 2 - leased
+    for block, (block_hash, keys, values) in zip(old[:leased], active):
+        assert block.ref_cnt == 1 and block.block_hash == block_hash
+        same_arrays((block.keys, block.values), (keys, values))
+    assert len(manager.hash_table) * 4 == manager._max_pool_tensors
+    manager.release(new)
+    manager.release(old[:leased])
+    manager.disk.flush()
+    restored, count = manager.lookup_prefix_disk_cache(
+        new_tokens, allow_memory_overlap=True
+    )
+    assert count == 16 and len(restored) == 2
+
+
 def test_long_prefix_pressure(memory_manager, monkeypatch):
     manager = memory_manager(budget=2 << 20, disk=True)
     coordinator = coordinate(manager, [C.KVCache()])
@@ -2413,6 +2467,26 @@ def test_warm_cache_quantization_policy(scheme, managers):
         assert extended[1].offset.shape[0] == 2
         assert isinstance(extended[1], C.BatchQuantizedKVCache)
         assert isinstance(extended[-1], C.BatchKVCache)
+
+
+@parametrize("length, expected", [(16, 0), (32, 16), (33, 32)])
+def test_block_lookup_leaves_a_generation_suffix(managers, length, expected):
+    manager = managers()
+    tokens = list(range(length))
+    manager.release(store_blocks(manager, tokens))
+    hit = P.apc_lookup_plan(
+        manager,
+        tokens,
+        extra_hash=0,
+        apc_mode="block",
+        safe_lookup_min=0,
+        suffix_is_text_only=lambda _: True,
+        prefix_has_media=lambda _: False,
+    )
+    assert (hit["prefix_len"] if hit else 0) == expected
+    if hit:
+        assert hit["full_input_ids"] == tokens
+        manager.release(hit["matched_blocks"])
 
 
 def test_short_and_multimodal_prefixes(managers):

@@ -9,11 +9,14 @@ import json
 import logging
 import math
 import os
+import socket
+import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
+from functools import partial
 from itertools import count
 from pathlib import Path
 from queue import Queue
@@ -21,6 +24,7 @@ from threading import Event, Lock, Thread, Timer
 from types import SimpleNamespace as NS
 from unittest.mock import MagicMock, Mock, patch
 
+import httpx
 import mlx.core as mx
 import numpy as np
 import pytest
@@ -50,7 +54,7 @@ from mlx_vlm.models.gpt_oss.processing_gpt_oss import (
 from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.server import GenerationArguments as Args
 from mlx_vlm.server import ResponseGenerator as Generator
-from mlx_vlm.server import realtime
+from mlx_vlm.server import compaction, realtime
 from mlx_vlm.server.model_discovery import discover_models, is_model_directory
 from mlx_vlm.server.responses_state import (
     ToolCallStreamState,
@@ -1525,6 +1529,86 @@ def test_chat_and_responses_preserve_same_tool_history(
     )
 
 
+def test_responses_tool_arguments_are_normalized_without_mutating_input():
+    items = [
+        {
+            "type": "function_call",
+            "name": "exec_command",
+            "call_id": "c1",
+            "arguments": '{"cmd":"cat log.txt"}',
+        }
+    ]
+    original = copy.deepcopy(items)
+    messages, _ = _response_items_to_chat(items)
+    assert messages[0]["tool_calls"][0]["function"]["arguments"] == {
+        "cmd": "cat log.txt"
+    }
+    assert messages[0]["content"] == ""
+    assert items == original
+
+
+@pytest.mark.parametrize(
+    "content", [None, "", [], [{"type": "output_text", "text": ""}]]
+)
+@pytest.mark.parametrize("sealed", [False, True])
+def test_responses_replay_ignores_empty_assistant_turns(
+    client, content, sealed, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("MLX_VLM_COMPACTION_KEY_FILE", str(tmp_path / "key"))
+    history = [
+        _input_message("Read the file."),
+        _msg(content, "assistant", type="message"),
+        *_function_result("File contents", name="read_file"),
+    ]
+    if sealed:
+        history = [_seal_context(history)]
+    with _endpoint() as fake:
+        response = _post(
+            client, "responses", input=[*history, _input_message("Continue.")]
+        )
+    assert response.status_code == 200, response.text
+    messages = fake.template.call_args.args[2]
+    assert [message["role"] for message in messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "user",
+    ]
+    assert messages[1]["tool_calls"][0]["function"]["name"] == "read_file"
+    assert messages[2]["content"] == "File contents"
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"reasoning_content": "Check the file first."},
+        {"reasoning": "Check the file first."},
+        {
+            "tool_calls": [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }
+            ]
+        },
+        {"content": [_input_image("https://example.com/image.png")]},
+    ],
+)
+def test_responses_replay_preserves_assistant_payloads_without_text(extra):
+    item = {"type": "message", "role": "assistant", "content": [], **extra}
+    original = copy.deepcopy(item)
+    messages, images = _response_items_to_chat([item])
+    assert messages
+    if "content" in extra:
+        assert images == ["https://example.com/image.png"]
+    elif "tool_calls" in extra:
+        assert messages[0]["tool_calls"][0]["function"]["name"] == "read_file"
+    else:
+        assert messages[0]["reasoning_content"] == "Check the file first."
+    assert item == original
+
+
 @pytest.mark.parametrize(
     "roles", [("system", "system"), ("system", "developer"), ("developer", "system")]
 )
@@ -1661,6 +1745,132 @@ def test_responses_native_tool_calls(client, kind, stream):
         )
         assert done["item_id"].startswith("fc_") and done["name"] == name
         assert json.loads(done["arguments"]) == args
+
+
+def _completed_response(response):
+    events = _data(response)
+    final = next(e["response"] for e in events if e["type"] == "response.completed")
+    output = final["output"]
+    for kind in ("added", "done"):
+        items = [e for e in events if e["type"] == f"response.output_item.{kind}"]
+        assert [e["output_index"] for e in items] == list(range(len(output)))
+        assert [e["item"]["id"] for e in items] == [item["id"] for item in output]
+        if kind == "done":
+            assert [e["item"] for e in items] == output
+    added = set()
+    for event in events:
+        if event["type"] == "response.output_item.added":
+            added.add(event["item"]["id"])
+        elif event["type"] == "response.output_item.done":
+            assert event["item"]["id"] in added
+        if "item_id" in event:
+            assert event["item_id"] in added
+            assert output[event["output_index"]]["id"] == event["item_id"]
+    reasoning = "".join(
+        part["text"]
+        for item in output
+        if item["type"] == "reasoning"
+        for part in item["summary"]
+    )
+    for kind, expected in (
+        ("output_text", final["output_text"]),
+        ("reasoning_text", reasoning),
+    ):
+        for suffix, field in (("delta", "delta"), ("done", "text")):
+            chunks = [e for e in events if e["type"] == f"response.{kind}.{suffix}"]
+            assert _joined(chunks, field) == expected
+    return final
+
+
+def _response(client, api="responses", *, status=200, **payload):
+    response = _post(client, api, **payload)
+    assert response.status_code == status, response.text
+    return (
+        _completed_response(response)
+        if status == 200 and payload.get("stream")
+        else response.json()
+    )
+
+
+_WEATHER_CALL = '<tool_call>{"name":"get_weather","arguments":{}}</tool_call>'
+
+
+@pytest.mark.parametrize("continuous", [False, True])
+@pytest.mark.parametrize(
+    "parts,types",
+    [
+        (
+            ["<tool_call>", '{"name":"get_weather","arguments":{}}', "</tool_call>"],
+            ["function_call"],
+        ),
+        (["Checking. ", _WEATHER_CALL], ["message", "function_call"]),
+        (
+            ["<think>", "Check first.", "</think>", _WEATHER_CALL],
+            ["reasoning", "function_call"],
+        ),
+        (["<think>Check first.</think>", "Sunny."], ["reasoning", "message"]),
+        (["Hello", " world."], ["message"]),
+        ([""], []),
+        (["<think>Check first.</think>"], ["reasoning"]),
+        ([" ", "\n"], []),
+        ([" \n", "<think>", "Check first.", "</think>"], ["reasoning"]),
+        (["<think>", " \n", "</think>"], []),
+        ([" \n", "Hello ", "\n  ", "world. ", "\n"], ["message"]),
+        (["<think> \n", "Check ", "\n  ", "first. \n</think>", " \n"], ["reasoning"]),
+    ],
+    ids=[
+        "tool",
+        "text-tool",
+        "reasoning-tool",
+        "reasoning-text",
+        "text",
+        "empty",
+        "reasoning",
+        "whitespace",
+        "space-before-reasoning",
+        "empty-reasoning",
+        "text-spacing",
+        "reasoning-spacing",
+    ],
+)
+def test_responses_stream_items_match_completed_output(
+    client, continuous, parts, types
+):
+    chunks = [
+        (_token if continuous else _result)(
+            text, finish_reason="stop" if i == len(parts) - 1 else None
+        )
+        for i, text in enumerate(parts)
+    ]
+    with _endpoint(
+        chunks=chunks,
+        generator=_streaming(chunks) if continuous else None,
+        parser=_JSON_TOOLS,
+    ):
+        final = _response(
+            client, stream=True, tools=[_tool()] if "function_call" in types else []
+        )
+    assert [item["type"] for item in final["output"]] == types
+
+
+@pytest.mark.parametrize("continuous", [False, True])
+@pytest.mark.parametrize("stream", [False, True])
+def test_responses_truncated_preopened_reasoning(client, continuous, stream):
+    text = "Check first."
+    with _endpoint(
+        template="prompt<think>",
+        result=_result(text, finish_reason="length"),
+        chunks=[_result(text, finish_reason="length")],
+        generator=(
+            _streaming([_token(text, finish_reason="length")]) if continuous else None
+        ),
+    ):
+        response = _response(client, stream=stream)
+    assert response["output_text"] == ""
+    assert len(response["output"]) == 1
+    item = response["output"][0]
+    assert item["type"] == "reasoning"
+    assert item["summary"] == [{"type": "summary_text", "text": text}]
 
 
 @pytest.mark.parametrize(
@@ -1953,6 +2163,860 @@ def test_anthropic_count_tokens_applies_tool_choice(client):
     assert [t["function"]["name"] for t in fake.template.call_args.kwargs["tools"]] == [
         "get_time"
     ]
+
+
+def _compaction_message(text, role="user"):
+    return {"type": "message", "role": role, "content": text}
+
+
+def _seal_context(items, **scope):
+    return compaction.seal(items, **{"model": "demo", "tenant": None, **scope})
+
+
+def _resolve_context(items, **scope):
+    return compaction.resolve(items, **{"model": "demo", "tenant": None, **scope})
+
+
+def _compaction_history():
+    return [
+        _compaction_message("Follow the user's constraints.", "system"),
+        _compaction_message(
+            "Project ORCHID. The chosen port is 7319. Never edit secrets.env."
+        ),
+        *_function_result("old log entry\n" * 1500, name="read_file", call_id="c1"),
+        _compaction_message("Read the log. Next: verify configuration.", "assistant"),
+        _compaction_message("What is the port?"),
+    ]
+
+
+def _real_post(client, api="responses", **payload):
+    return _response(
+        client.http,
+        api,
+        model=client.model,
+        temperature=0,
+        enable_thinking=False,
+        **payload,
+    )
+
+
+def _real_answer(client, items):
+    return _real_post(client, input=items, max_output_tokens=96, store=False)
+
+
+def _real_compact(client, items):
+    return client.sdk.responses.compact(
+        model=client.model,
+        input=items,
+        extra_body={
+            "keep_tokens": 256,
+            "max_output_tokens": 768,
+            "temperature": 0,
+            "enable_thinking": False,
+        },
+    )
+
+
+def _assert_recalled(text, port="7319"):
+    assert all(fact in text for fact in ("ORCHID", port, "secrets.env")), text
+
+
+class TestCompaction:
+    """Responses compaction contracts and opt-in real-model integration."""
+
+    @pytest.fixture(autouse=True)
+    def isolated_state(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_COMPACTION_KEY_FILE", str(tmp_path / "key"))
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", None)
+        server.response_store.clear()
+        server.response_store_order.clear()
+
+    @pytest.fixture
+    def mocked(self, client):
+        with (
+            _endpoint(
+                config=NS(model_type="qwen2_vl", max_position_embeddings=32768),
+                result=_result(
+                    "Goal: ORCHID. Port: 7319. Constraint: never edit secrets.env.",
+                    cached_tokens=32,
+                ),
+            ) as fake,
+            patch.object(openai, "prepare_inputs") as prepare,
+            patch.object(compaction, "prepare_inputs", prepare),
+        ):
+            fake.template.side_effect = (
+                lambda processor, config, messages, **kw: json.dumps(messages)
+            )
+            prepare.side_effect = lambda processor, prompts, **kw: {
+                "input_ids": np.zeros((1, max(1, len(prompts) // 4)), dtype=np.int32)
+            }
+            fake.request = partial(_response, client)
+            fake.compact = partial(fake.request, "/responses/compact")
+            fake.count = partial(fake.request, "/responses/input_tokens")
+            yield fake
+
+    @pytest.fixture
+    def requirements(self):
+        return [
+            _compaction_message(text)
+            for text in (
+                "Project ORCHID. Never edit secrets.env.",
+                "Use port 8421 instead of 7319.",
+                "What are the current requirements?",
+            )
+        ]
+
+    @pytest.mark.parametrize("path", ["/responses/compact", "/v1/responses/compact"])
+    def test_compact_round_trip_and_token_count(self, mocked, path):
+        original = _compaction_history()
+        data = mocked.request(
+            path, input=original, keep_tokens=0, max_output_tokens=256
+        )
+        assert data["object"] == "response.compaction"
+        assert data["usage"]["input_tokens_details"]["cached_tokens"] == 32
+        item = data["output"][0]
+        assert item["type"] == "compaction"
+        assert "ORCHID" not in item["encrypted_content"]
+        restored = _resolve_context([item])
+        assert restored[0] == original[0] and restored[-1] == original[-1]
+        assert restored[1] == original[1]
+        assert restored[2]["role"] == "assistant"
+        assert "7319" in restored[2]["content"][0]["text"]
+        assert "old log entry" not in json.dumps(restored)
+        for inputs in ([item], original + [item], restored):
+            response = mocked.count(input=inputs)
+            if inputs == [item]:
+                expected = response
+            assert response == expected
+        mocked.request(
+            input=[item, _compaction_message("Continue")],
+            instructions="New current instructions",
+        )
+        rendered = json.loads(mocked.generate.call_args.kwargs["prompt"])
+        assert "New current instructions" in rendered[0]["content"]
+        assert rendered[-1]["content"] == "Continue"
+
+    @pytest.mark.parametrize("change", ["tenant", "model", "tamper", "foreign"])
+    def test_capsules_reject_invalid_scope_and_payload(self, change):
+        item = _seal_context([_compaction_message("private")], tenant="one")
+        model, tenant = "demo", "one"
+        if change == "tenant":
+            tenant = "two"
+        elif change == "model":
+            model = "other"
+        elif change == "tamper":
+            value = item["encrypted_content"]
+            at = len(compaction.CAPSULE_PREFIX) + 50
+            item["encrypted_content"] = (
+                value[:at] + ("A" if value[at] != "A" else "B") + value[at + 1 :]
+            )
+        else:
+            item["encrypted_content"] = "openai-issued-opaque-state"
+        with pytest.raises(HTTPException) as caught:
+            _resolve_context([item], model=model, tenant=tenant)
+        assert caught.value.status_code == 400
+
+    def test_latest_capsule_replaces_previous_context(self):
+        first = _seal_context([_compaction_message("old")])
+        second = _seal_context([_compaction_message("new")])
+        assert _resolve_context(
+            [first, _compaction_message("between"), second, _compaction_message("last")]
+        ) == [_compaction_message("new"), _compaction_message("last")]
+
+    def test_resent_codex_instructions_do_not_accumulate_in_capsules(self):
+        prefix = _compaction_message("Current permission constraints.", "developer")
+        other = _compaction_message("A separate requirement.", "developer")
+        original = [prefix, other, _compaction_message("handoff", "assistant")]
+        for _ in range(5):
+            capsule = _seal_context(original)
+            original = _resolve_context(
+                [
+                    capsule,
+                    {**prefix, "id": "new-client-id"},
+                    _compaction_message("Continue"),
+                ]
+            )
+            assert sum(x.get("content") == prefix["content"] for x in original) == 1
+            assert other in original
+
+    def test_codex_retained_messages_survive_capsule_replay(self, requirements):
+        instruction = _compaction_message("Keep user constraints.", "developer")
+        requirement, correction, question = requirements
+        repeated = _compaction_message("Continue")
+        latest = _compaction_message("Read the log")
+        call = {"type": "function_call", "call_id": "c1", "name": "read_file"}
+        output = {"type": "function_call_output", "call_id": "c1", "output": "done"}
+        context = [
+            instruction,
+            _compaction_message("Routine logs inspected.", "assistant"),
+            latest,
+            call,
+            output,
+        ]
+        retained = [requirement, repeated, repeated, correction]
+        expected = context[:1] + retained + context[1:]
+        for cycle in range(3):
+            capsule = _seal_context(context)
+            # Clients may regenerate message IDs when rebuilding the window.
+            inputs = [
+                {**item, "id": f"{cycle}-{index}"}
+                for index, item in enumerate([instruction, *retained, latest])
+            ] + [capsule, question]
+            original = copy.deepcopy(inputs)
+            context = _resolve_context(inputs)
+            assert inputs == original
+            assert [
+                {key: value for key, value in item.items() if key != "id"}
+                for item in context
+            ] == expected + [inputs[-1]]
+            context = context[:-1]
+
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_codex_retained_messages_reach_generation_and_token_count(
+        self, mocked, stream, requirements
+    ):
+        requirement, correction, question = requirements
+        context = [_compaction_message("Routine logs inspected.", "assistant")]
+        capsule = _seal_context(context)
+        inputs = [requirement, correction, capsule, question]
+        expected = [requirement, correction, *context, question]
+        counted = mocked.count(input=inputs)
+        plain = mocked.count(input=expected)
+        assert counted == plain
+        mocked.request(input=inputs, stream=stream)
+        rendered = mocked.template.call_args.args[2]
+        assert [item["content"] for item in rendered] == [
+            item["content"] for item in expected
+        ]
+
+    def test_codex_retained_messages_count_toward_context_budget(
+        self, mocked, monkeypatch
+    ):
+        capsule = _seal_context([_compaction_message("Short handoff", "assistant")])
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", 1024)
+        response = mocked.request(
+            input=[_compaction_message("Retained user text. " * 1000), capsule],
+            max_output_tokens=64,
+            context_management=[{"type": "compaction", "compact_threshold": 10000}],
+            status=400,
+        )
+        assert (
+            response["detail"]
+            == "Compaction input must fit within the model context window."
+        )
+        mocked.generate.assert_not_called()
+
+    def test_pending_parallel_tools_cannot_be_split(self):
+        items = [
+            _compaction_message("start"),
+            {"type": "function_call", "call_id": "a"},
+            {"type": "function_call", "call_id": "b"},
+            {"type": "function_call_output", "call_id": "a"},
+            _compaction_message("steering during tools"),
+            {"type": "function_call_output", "call_id": "b"},
+            _compaction_message("next"),
+        ]
+        assert compaction.safe_boundaries(items) == [0, 6]
+
+    @pytest.mark.parametrize("api", ["standalone", "trigger", "automatic"])
+    @pytest.mark.parametrize("limit", [4096, 16384])
+    def test_bounded_retention_survives_replay_and_recompaction(
+        self, mocked, monkeypatch, api, limit, requirements
+    ):
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", limit)
+        mocked.generate.return_value = _result("Routine work completed.")
+        requirement, correction, question = requirements
+        retained = [requirement]
+        window = [requirement]
+        for cycle in range(2):
+            log = _compaction_message(
+                f"Log {cycle}: " + "routine evidence " * (limit // 20)
+            )
+            log["id"] = f"log-{cycle}"
+            retained.extend([log, correction, question])
+            window += [log, correction, question]
+            options = dict(input=window, max_output_tokens=128, store=False)
+            if api == "standalone":
+                options["keep_tokens"] = 0
+                response = mocked.compact(**options)
+            else:
+                if api == "trigger":
+                    options["input"] = window + [{"type": "compaction_trigger"}]
+                else:
+                    options["context_management"] = [
+                        {"type": "compaction", "compact_threshold": 1}
+                    ]
+                response = mocked.request(**options)
+            capsule = response["output"][0]
+            assert capsule["type"] == "compaction"
+            context = _resolve_context([capsule])
+            assert requirement in context and correction in context
+            assert "routine evidence" not in json.dumps(context)
+            resent = [
+                {
+                    **x,
+                    "id": f"replayed-{cycle}-{i}",
+                    "content": [{"type": "input_text", "text": x["content"]}],
+                }
+                for i, x in enumerate(retained)
+            ]
+            before = mocked.count(input=window)
+            after = mocked.count(input=[capsule])
+            replay = mocked.count(input=resent + [capsule])
+            assert replay == after
+            assert after["input_tokens"] < before["input_tokens"] * 0.6
+            assert _resolve_context(resent + [capsule]) == context
+            shortened = {**log, "content": "routine evidence [truncated]"}
+            assert _resolve_context([shortened, capsule]) == context
+            fresh = _compaction_message("A new requirement.")
+            assert _resolve_context(resent + [fresh, capsule, log]) == [
+                fresh,
+                *context,
+                log,
+            ]
+            mocked.generate.reset_mock()
+            unchanged = mocked.compact(
+                input=[capsule],
+                keep_tokens=limit,
+                max_output_tokens=128,
+            )
+            mocked.generate.assert_not_called()
+            window = resent + unchanged["output"]
+            assert _resolve_context(window) == context
+
+    def test_retention_budget_preserves_whole_messages_in_order(self):
+        messages = [_compaction_message(f"Requirement {i}. " * 10) for i in range(8)]
+        latest = _compaction_message("Continue")
+
+        async def count(items):
+            return len(json.dumps(items))
+
+        async def summarize(items):
+            return "Earlier requirements summarized.", None
+
+        result = asyncio.run(
+            compaction.compact(
+                messages + [latest],
+                count=count,
+                summarize=summarize,
+                keep_tokens=0,
+                target_tokens=1600,
+                retain_tokens=500,
+            )
+        )
+        originals = [x for x in result.items[:-1] if x.get("role") == "user"]
+        assert originals == messages[-2:]
+        base = [x for x in result.items if x not in originals]
+        assert result.after_tokens - asyncio.run(count(base)) <= 500
+        capsule = _seal_context(result.items, covered=result.covered)
+        assert _resolve_context(messages + [capsule, latest]) == result.items + [latest]
+
+    @pytest.mark.parametrize(
+        "text, tokens, status, detail",
+        [
+            pytest.param("", 4, 502, "empty summary", id="empty"),
+            pytest.param("partial summary", 256, 502, "output limit", id="length"),
+            pytest.param(
+                "huge " * 10000,
+                4,
+                400,
+                "could not reach the context budget",
+                id="too-large",
+            ),
+        ],
+    )
+    def test_summary_failures_preserve_original_context(
+        self, mocked, text, tokens, status, detail
+    ):
+        original = _compaction_history()
+        mocked.generate.return_value = _result(text, generation_tokens=tokens)
+        with patch.object(
+            compaction,
+            "compact_response_context",
+            wraps=compaction.compact_response_context,
+        ) as compact:
+            response = mocked.compact(
+                input=original,
+                max_output_tokens=256,
+                keep_tokens=0,
+                status=status,
+            )
+        assert detail in response["detail"]
+        compact.assert_awaited_once()
+        assert compact.call_args.args[1] == original and not server.response_store
+
+    def test_short_history_is_a_noop(self, mocked):
+        items = [_compaction_message("hello")]
+        response = mocked.compact(input=items)
+        assert response["output"] == items
+        mocked.generate.assert_not_called()
+
+    def test_summary_budget_overrides_legacy_max_tokens(self, mocked):
+        mocked.compact(
+            input=_compaction_history(),
+            keep_tokens=0,
+            max_output_tokens=256,
+            max_tokens=4096,
+        )
+        assert mocked.generate.call_args.kwargs["max_tokens"] == 256
+
+    def test_auto_below_threshold_only_generates_the_answer(self, mocked):
+        response = mocked.request(
+            input="hello",
+            max_output_tokens=64,
+            context_management=[{"type": "compaction", "compact_threshold": 1000}],
+        )
+        assert all(item["type"] != "compaction" for item in response["output"])
+        assert mocked.generate.call_count == 1
+
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("short", [False, True])
+    def test_codex_compaction_trigger_returns_only_one_capsule(
+        self, mocked, client, stream, short
+    ):
+        items = [_compaction_message("hello")] if short else _compaction_history()
+        response = _post(
+            client,
+            "responses",
+            input=items + [{"type": "compaction_trigger"}],
+            stream=stream,
+        )
+        assert response.status_code == 200, response.text
+        if stream:
+            events = _data(response)
+            data = _completed_response(response)
+            assert not any(x["type"] == "response.output_text.delta" for x in events)
+        else:
+            data = response.json()
+        assert [x["type"] for x in data["output"]] == ["compaction"]
+        assert data["output_text"] == ""
+        assert mocked.generate.call_count == (0 if short else 1)
+        mocked.request(
+            input=data["output"] + [_compaction_message("Continue")],
+        )
+        assert "compaction_trigger" not in mocked.generate.call_args.kwargs["prompt"]
+
+    def test_fixed_instructions_are_excluded_from_reduction_target(self, mocked):
+        inputs = _compaction_history()
+        options = dict(input=inputs, instructions="Static instruction. " * 3000)
+        before = mocked.count(**options)["input_tokens"]
+        response = mocked.compact(keep_tokens=0, **options)
+        after = mocked.count(
+            input=response["output"],
+            instructions=options["instructions"],
+        )["input_tokens"]
+        assert before * 0.6 < after < before
+
+    @pytest.mark.parametrize(
+        "threshold, output_tokens, status",
+        [
+            pytest.param(1, 32768, 400, id="budget-above-threshold"),
+            pytest.param(100000, 32768, 400, id="budget-below-threshold"),
+            pytest.param(0, 64, 422, id="zero-threshold"),
+            pytest.param(-1, 64, 422, id="negative-threshold"),
+            pytest.param("bad", 64, 422, id="nonnumeric-threshold"),
+        ],
+    )
+    def test_invalid_compaction_budget_rejected_before_generation(
+        self, mocked, threshold, output_tokens, status
+    ):
+        mocked.request(
+            input=_compaction_history(),
+            max_output_tokens=output_tokens,
+            context_management=[{"type": "compaction", "compact_threshold": threshold}],
+            status=status,
+        )
+        mocked.generate.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "api, item",
+        [
+            pytest.param(
+                "responses", {"type": "compaction_trigger"}, id="nonterminal-trigger"
+            ),
+            pytest.param(
+                "/responses/compact",
+                {"type": "item_reference", "id": "missing"},
+                id="item-reference",
+            ),
+            pytest.param(
+                "/responses/compact",
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_audio"}],
+                },
+                id="input-audio",
+            ),
+        ],
+    )
+    def test_invalid_compaction_input_rejected_before_generation(
+        self, mocked, api, item
+    ):
+        mocked.request(
+            api, input=[copy.deepcopy(item)] + _compaction_history(), status=400
+        )
+        mocked.generate.assert_not_called()
+
+    def test_tail_with_image_and_pending_tool_call_is_retained(self):
+        instructions = _compaction_message(
+            "Keep the original constraints.", "developer"
+        )
+        tail = [
+            _msg(
+                [
+                    {"type": "input_text", "text": "Inspect this"},
+                    _input_image("data:image/png;base64,example"),
+                ],
+                type="message",
+            ),
+            _function_result("", name="read_file", call_id="pending")[0],
+            _compaction_message("A correction while the tool is running"),
+        ]
+        original = [
+            instructions,
+            _compaction_message("old " * 1000),
+            _compaction_message("done", "assistant"),
+            *tail,
+        ]
+
+        async def count(items):
+            return len(json.dumps(items))
+
+        async def summarize(items):
+            assert items == original[:3]
+            return "Prior work completed.", None
+
+        result = asyncio.run(
+            compaction.compact(
+                original,
+                count=count,
+                summarize=summarize,
+                keep_tokens=0,
+                target_tokens=2000,
+            )
+        )
+        assert result.changed and result.items[0] == instructions
+        assert result.items[-len(tail) :] == tail
+        assert _resolve_context([_seal_context(result.items)]) == result.items
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            NS(text_config=NS(max_position_embeddings=8192)),
+            NS(text_config={"max_position_embeddings": 8192}),
+            {"text_config": {"max_position_embeddings": 8192}},
+        ],
+    )
+    def test_context_limit_respects_model_and_server(self, config, monkeypatch):
+        assert compaction._context_limit(config) == 8192
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", 4096)
+        assert compaction._context_limit(config) == 4096
+
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_auto_compaction_replay_and_stream_indices(self, mocked, stream):
+        final = mocked.request(
+            input=_compaction_history(),
+            max_output_tokens=64,
+            context_management=[{"type": "compaction", "compact_threshold": 1000}],
+            stream=stream,
+        )
+        assert final["output"][0]["type"] == "compaction"
+        resolved = _resolve_context(_compaction_history() + final["output"])
+        assert "old log entry" not in json.dumps(resolved)
+        mocked.request(input="next", previous_response_id=final["id"])
+        assert "old log entry" not in mocked.generate.call_args.kwargs["prompt"]
+
+    def test_auto_compaction_tool_stream_preserves_item_indices(self, mocked):
+        text = "<think>Check first.</think>" + _WEATHER_CALL
+        mocked.stream.side_effect = lambda *a, **kw: iter(
+            [_result(text, finish_reason="stop")]
+        )
+        with (
+            patch.object(
+                server, "_infer_tool_parser_from_processor", return_value="demo"
+            ),
+            patch.object(server, "load_tool_module", return_value=_JSON_TOOLS),
+        ):
+            final = mocked.request(
+                input=_compaction_history(),
+                stream=True,
+                tools=[_tool()],
+                max_output_tokens=64,
+                context_management=[{"type": "compaction", "compact_threshold": 1000}],
+            )
+        assert [item["type"] for item in final["output"]] == [
+            "compaction",
+            "reasoning",
+            "function_call",
+        ]
+
+    def test_stored_compaction_survives_parent_eviction(self, mocked):
+        first = mocked.request(input="original")
+        capsule = _seal_context([_compaction_message("compacted")])
+        second = mocked.request(
+            "responses", input=[capsule], previous_response_id=first["id"]
+        )
+        server.response_store.pop(first["id"])
+        mocked.request("responses", input="next", previous_response_id=second["id"])
+
+    @pytest.mark.parametrize(
+        "finish_reason, status",
+        [
+            pytest.param("stop", 200, id="success"),
+            pytest.param(None, 400, id="iterator-error"),
+        ],
+    )
+    def test_summary_uses_generation_worker_and_closes_iterator(
+        self, mocked, monkeypatch, finish_reason, status
+    ):
+
+        def chunks():
+            yield _token("Goal: ORCHID. Port: 7319.", finish_reason=finish_reason)
+            raise server.PromptTooLongError("summary worker failed")
+
+        iterator = MagicMock()
+        iterator.__iter__.return_value = chunks()
+        generator = _streaming([])
+        context, _ = generator.generate.return_value
+        generator.generate.return_value = (context, iterator)
+        generator._cpu_preprocess = lambda prompt, images, audio: {
+            "input_ids": np.zeros((1, max(1, len(prompt) // 4)), dtype=np.int32)
+        }
+        monkeypatch.setattr(server.runtime, "response_generator", generator)
+        response = mocked.compact(
+            input=_compaction_history(),
+            keep_tokens=0,
+            status=status,
+        )
+        if status == 400:
+            assert response["detail"] == "summary worker failed"
+        generator.generate.assert_called_once()
+        mocked.generate.assert_not_called()
+        iterator.close.assert_called_once_with()
+
+    @pytest.fixture
+    def real_server(self, tmp_path):
+        model = os.environ.get("MLX_VLM_COMPACTION_TEST_MODEL")
+        if not model:
+            pytest.skip("Set MLX_VLM_COMPACTION_TEST_MODEL for real inference")
+        from openai import OpenAI
+
+        @contextmanager
+        def start():
+            with socket.socket() as sock:
+                sock.bind(("127.0.0.1", 0))
+                port = sock.getsockname()[1]
+            env = dict(
+                os.environ,
+                APC_ENABLED="1",
+                APC_DISK_ENABLED="0",
+                APC_NUM_BLOCKS="2048",
+                MLX_VLM_COMPACTION_KEY_FILE=str(tmp_path / "compaction.key"),
+            )
+            env.pop("MLX_VLM_SERVER_API_KEY", None)
+            log_path = tmp_path / "server.log"
+            with log_path.open("a") as log:
+                process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-m",
+                        "mlx_vlm.server",
+                        "--model",
+                        model,
+                        "--host",
+                        "127.0.0.1",
+                        "--port",
+                        str(port),
+                    ],
+                    env=env,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                )
+                try:
+                    url = f"http://127.0.0.1:{port}"
+                    headers = {"X-APC-Tenant": "compaction-test"}
+                    with (
+                        httpx.Client(
+                            base_url=url, timeout=180, headers=headers
+                        ) as client,
+                        OpenAI(
+                            base_url=url + "/v1",
+                            api_key="test",
+                            default_headers=headers,
+                        ) as sdk,
+                    ):
+                        for _ in range(240):
+                            assert process.poll() is None, log_path.read_text()
+                            try:
+                                if client.get("/health", timeout=1).is_success:
+                                    break
+                            except httpx.TransportError:
+                                pass
+                            time.sleep(0.25)
+                        else:
+                            pytest.fail(
+                                f"Model server did not become ready:\n{log_path.read_text()}"
+                            )
+                        yield NS(http=client, sdk=sdk, model=model)
+                finally:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=20)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+
+        return start
+
+    @pytest.fixture
+    def real_client(self, real_server):
+        with real_server() as client:
+            yield client
+
+    @pytest.fixture
+    def real_history(self):
+        items = [
+            _msg(
+                "Follow the user's requirements. Answer factual questions concisely.",
+                "system",
+            ),
+            _msg(
+                "We are working on project ORCHID. The deployment port is 7319. Never edit secrets.env. Remember all three facts."
+            ),
+        ]
+        for index in range(8):
+            items.extend(
+                [
+                    _msg(
+                        f"Inspection {index} finished. "
+                        + "The routine build log contains no new decisions. " * 70,
+                        "assistant",
+                    ),
+                    _msg(
+                        f"Continue inspection {index + 1}, keeping the original requirements."
+                    ),
+                ]
+            )
+        return items + [
+            _msg(
+                "What is the project name, deployment port, and file you must never edit? Give all three."
+            )
+        ]
+
+    def test_real_compaction_replay_and_apc(self, real_client, real_history):
+        client = real_client
+        before = _real_post(client, "/v1/responses/input_tokens", input=real_history)
+        baseline = _real_answer(client, real_history)
+        compacted = _real_compact(client, real_history)
+        output = compacted.model_dump()["output"]
+        assert output[0]["type"] == "compaction"
+        after = _real_post(client, "/v1/responses/input_tokens", input=output)
+        assert after["input_tokens"] < before["input_tokens"] * 0.6
+        cold = _real_answer(client, output)
+        warm = _real_answer(client, output)
+        assert (
+            warm["usage"]["input_tokens_details"]["cached_tokens"]
+            > cold["usage"]["input_tokens_details"]["cached_tokens"]
+        )
+        for response in (baseline, cold, warm):
+            _assert_recalled(response["output_text"])
+        replay = client.sdk.responses.create(
+            model=client.model,
+            input=compacted.output,
+            max_output_tokens=96,
+            temperature=0,
+            store=False,
+            extra_body={"enable_thinking": False},
+        )
+        _assert_recalled(replay.output_text)
+        # Full-history and capsule-only replay must render identical tokenized inputs.
+        assert (
+            _real_post(
+                client, "/v1/responses/input_tokens", input=real_history + output
+            )
+            == after
+        )
+        client.http.post("/v1/cache/reset").raise_for_status()
+        reset = _real_answer(client, output)
+        assert reset["usage"]["input_tokens_details"]["cached_tokens"] == 0
+        _assert_recalled(reset["output_text"])
+
+    def test_real_automatic_compaction_stream(self, real_client, real_history):
+        completed = _real_post(
+            real_client,
+            input=real_history,
+            max_output_tokens=96,
+            store=False,
+            stream=True,
+            context_management=[{"type": "compaction", "compact_threshold": 2000}],
+        )
+        assert completed["output"][0]["type"] == "compaction"
+        _assert_recalled(completed["output_text"])
+
+    def test_real_repeated_compaction_keeps_corrections(
+        self, real_client, real_history
+    ):
+        output = _real_compact(real_client, real_history).model_dump()["output"]
+        corrected = output + [
+            _msg("Confirmed.", "assistant"),
+            _msg(
+                "Correction: deployment port is now 8421. Preserve the other requirements."
+            ),
+            _msg(
+                "Port updated to 8421. " + "Routine verification passed. " * 800,
+                "assistant",
+            ),
+            real_history[-1],
+        ]
+        again = _real_post(
+            real_client,
+            "/v1/responses/compact",
+            input=corrected,
+            keep_tokens=0,
+            max_output_tokens=768,
+        )
+        _assert_recalled(
+            _real_answer(real_client, again["output"])["output_text"], port="8421"
+        )
+
+    @pytest.mark.parametrize("api", ["chat", "messages"])
+    def test_real_client_summary_cache(self, real_client, real_history, api):
+        items = [
+            real_history[0],
+            _msg(
+                "Prior conversation summary: Project ORCHID; deployment port 7319; never edit secrets.env."
+            ),
+            _msg("I will preserve those requirements.", "assistant"),
+            real_history[-1],
+        ]
+        body = {"messages": items, "max_tokens": 96}
+        if api == "messages":
+            body.update(system=items[0]["content"], messages=items[1:])
+        first, warm = [_real_post(real_client, api, **body) for _ in range(2)]
+        if api == "messages":
+            text = "".join(part.get("text", "") for part in warm["content"])
+            counts = [
+                result["usage"].get("cache_read_input_tokens", 0)
+                for result in (first, warm)
+            ]
+        else:
+            text = warm["choices"][0]["message"]["content"]
+            counts = [
+                result["usage"]["prompt_tokens_details"]["cached_tokens"]
+                for result in (first, warm)
+            ]
+        _assert_recalled(text)
+        assert counts[1] > counts[0]
+
+    def test_real_compaction_survives_restart(self, real_server, real_history):
+        with real_server() as client:
+            output = _real_compact(client, real_history).model_dump()["output"]
+        # Restart with the same key, without a response registry or populated APC pool.
+        with real_server() as client:
+            restored = _real_answer(client, output)
+            assert restored["usage"]["input_tokens_details"]["cached_tokens"] == 0
+            _assert_recalled(restored["output_text"])
 
 
 def test_cache_endpoints_report_disabled_stats_and_reset(client, monkeypatch):
