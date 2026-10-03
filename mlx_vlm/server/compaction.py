@@ -279,6 +279,15 @@ def split_trigger(items: list[dict]) -> tuple[list[dict], bool]:
     return items[:-1], True
 
 
+def supports_content(content) -> bool:
+    return not isinstance(content, list) or all(
+        isinstance(part, dict)
+        and part.get("type")
+        in ("input_text", "output_text", "text", "input_image", "image_url")
+        for part in content
+    )
+
+
 def validate_items(items: list[dict]) -> None:
     """Do not summarize content the Responses prompt converter would discard."""
     supported = {
@@ -296,19 +305,8 @@ def validate_items(items: list[dict]) -> None:
         kind = item.get("type")
         if kind not in supported:
             raise HTTPException(400, f"Compaction does not support item type {kind!r}.")
-        content = item.get("content")
-        if kind == "message" and isinstance(content, list):
-            for part in content:
-                if not isinstance(part, dict) or part.get("type") not in (
-                    "input_text",
-                    "output_text",
-                    "text",
-                    "input_image",
-                    "image_url",
-                ):
-                    raise HTTPException(
-                        400, "Unsupported message content for compaction."
-                    )
+        if kind == "message" and not supports_content(item.get("content")):
+            raise HTTPException(400, "Unsupported message content for compaction.")
 
 
 def safe_boundaries(items: list[dict]) -> list[int]:
@@ -420,7 +418,7 @@ async def compact(
     return CompactedContext(result, before, after, usage, True, covered)
 
 
-def _context_limit(config):
+def _context_limit(config, *, required=True):
     configured = get_configured_context_limit()
     text_config = (
         config.get("text_config")
@@ -438,6 +436,8 @@ def _context_limit(config):
         if isinstance(x, (int, float)) and x > 0
     ]
     if not limits:
+        if not required:
+            return None
         raise HTTPException(
             400, "Compaction requires a model context limit or MAX_KV_SIZE."
         )
@@ -533,8 +533,11 @@ async def compact_response_context(
         )
     if (
         automatic
-        and before < request.context_management[0].compact_threshold
         and before <= available
+        and (
+            not request.context_management
+            or before < request.context_management[0].compact_threshold
+        )
     ):
         return CompactedContext(items, before, before, covered=covered)
     summary_request = request.model_copy(

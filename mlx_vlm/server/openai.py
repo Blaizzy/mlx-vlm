@@ -1813,33 +1813,42 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             else _INHERIT_ADAPTER
         )
 
-        if request.context_management:
+        if request.context_management != []:
+            _prepare_chat_tool_choice([], request.tools, request.tool_choice)
             model, processor, config = get_cached_model(request.model, adapter_path)
-            result = await compaction.compact_response_context(
-                request,
-                [
-                    {**message.model_dump(exclude_none=True), "type": "message"}
+            if request.context_management or (
+                compaction._context_limit(config, required=False) is not None
+                and all(
+                    compaction.supports_content(message.content)
                     for message in request.messages
-                ],
-                model,
-                processor,
-                config,
-                _read_tenant_id(http_request),
-                build_gen_args=_build_gen_args,
-                apply_chat_template=apply_chat_template,
-                generate=generate,
-                automatic=True,
-            )
-            request = request.model_copy(
-                update={
-                    "messages": [
-                        ChatMessage.model_validate(
-                            {k: v for k, v in item.items() if k != "type"}
-                        )
-                        for item in result.items
-                    ]
-                }
-            )
+                )
+            ):
+                result = await compaction.compact_response_context(
+                    request,
+                    [
+                        {**message.model_dump(exclude_none=True), "type": "message"}
+                        for message in request.messages
+                    ],
+                    model,
+                    processor,
+                    config,
+                    _read_tenant_id(http_request),
+                    build_gen_args=_build_gen_args,
+                    apply_chat_template=apply_chat_template,
+                    generate=generate,
+                    automatic=True,
+                )
+                if result.changed:
+                    request = request.model_copy(
+                        update={
+                            "messages": [
+                                ChatMessage.model_validate(
+                                    {k: v for k, v in item.items() if k != "type"}
+                                )
+                                for item in result.items
+                            ]
+                        }
+                    )
 
         kwargs = {}
 

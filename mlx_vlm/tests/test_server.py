@@ -2570,7 +2570,7 @@ class TestCompaction:
         assert mocked.generate.call_count == 1
 
     @pytest.mark.parametrize("stream", [False, True])
-    @pytest.mark.parametrize("api", ["responses", "chat"])
+    @pytest.mark.parametrize("api", ["responses", "chat", "chat-default"])
     def test_output_budget_overrides_compaction_threshold(
         self, mocked, client, monkeypatch, api, stream
     ):
@@ -2582,8 +2582,11 @@ class TestCompaction:
             stream=stream,
             context_management=[{"type": "compaction", "compact_threshold": 100000}],
         )
-        if api == "chat":
+        if api.startswith("chat"):
             options.update(messages=items, max_tokens=256)
+            if api == "chat-default":
+                options.pop("context_management")
+            api = "chat"
         else:
             options.update(input=items, max_output_tokens=256)
         response = _post(client, api, **options)
@@ -2617,9 +2620,6 @@ class TestCompaction:
                 messages=[_compaction_message("old evidence " * 180) for _ in range(10)]
                 + [items[-1]],
                 max_tokens=64,
-                context_management=[
-                    {"type": "compaction", "compact_threshold": 100000}
-                ],
             )
         else:
             options.update(
@@ -2747,16 +2747,97 @@ class TestCompaction:
         assert items == original
 
     @pytest.mark.parametrize("options", [{}, {"context_management": []}])
-    def test_chat_compaction_is_disabled_without_request_control(
-        self, mocked, client, options
+    def test_chat_within_budget_does_not_compact(
+        self, mocked, client, monkeypatch, options
     ):
-        response = _post(
-            client,
-            messages=[_compaction_message("hello")],
-            **options,
-        )
+        messages = [_compaction_message("earlier notes " * 120) for _ in range(4)]
+        messages.append(_compaction_message("Continue"))
+        before = mocked.count(input=messages)["input_tokens"]
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", before + 64)
+        response = _post(client, messages=messages, max_tokens=64, **options)
         assert response.status_code == 200
         assert mocked.generate.call_count == 1
+        assert "Conversation handoff" not in mocked.generate.call_args.kwargs["prompt"]
+
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize(
+        "outcome", ["recover", "disabled", "summary-fails", "protected-too-large"]
+    )
+    def test_chat_overflow_preserves_tools_and_only_generates_after_recovery(
+        self, mocked, client, monkeypatch, stream, outcome
+    ):
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", 2048)
+        history = [_msg("Preserve requirements.", "system")]
+        history += [_msg("older evidence " * 150) for _ in range(5)]
+        recent = [
+            _msg("Inspect this file."),
+            _msg(
+                "",
+                "assistant",
+                tool_calls=[
+                    {
+                        "id": "latest",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{}"},
+                    }
+                ],
+            ),
+            _msg(
+                "current evidence " * (600 if outcome == "protected-too-large" else 30),
+                "tool",
+                tool_call_id="latest",
+            ),
+        ]
+        original = copy.deepcopy(history + recent)
+        if outcome == "summary-fails":
+            mocked.generate.return_value = _result("")
+        options = {"context_management": []} if outcome == "disabled" else {}
+        response = _post(
+            client,
+            messages=original,
+            tools=[_tool()],
+            max_tokens=64,
+            stream=stream,
+            **options,
+        )
+        assert original == history + recent
+        if outcome in ("summary-fails", "protected-too-large"):
+            assert response.status_code == (502 if outcome == "summary-fails" else 400)
+            assert response.headers["content-type"] == "application/json"
+            assert mocked.generate.call_count == (
+                1 if outcome == "summary-fails" else 0
+            )
+            mocked.stream.assert_not_called()
+            assert not server.response_store
+            return
+        assert response.status_code == 200, response.text
+        answer = mocked.stream.call_args if stream else mocked.generate.call_args
+        messages = json.loads(answer.kwargs["prompt"])
+        assert messages[0] == original[0]
+        for expected, actual in zip(recent, messages[-3:]):
+            for key in ("role", "content", "tool_call_id"):
+                assert actual.get(key) == expected.get(key)
+        call = messages[-2]["tool_calls"][0]
+        assert call["id"] == messages[-1]["tool_call_id"] == "latest"
+        assert call["function"] == {"name": "get_weather", "arguments": {}}
+        if outcome == "disabled":
+            assert mocked.generate.call_count == (0 if stream else 1)
+            assert len(answer.kwargs["prompt"]) // 4 + 64 > 2048
+        else:
+            summaries = mocked.generate.call_args_list
+            if not stream:
+                summaries = summaries[:-1]
+            assert 1 <= len(summaries) <= compaction.MAX_SUMMARY_PASSES
+            for call in summaries:
+                assert (
+                    json.loads(call.kwargs["prompt"])[-1]["content"]
+                    == compaction.SUMMARY_INSTRUCTION
+                )
+                assert (
+                    len(call.kwargs["prompt"]) // 4 + call.kwargs["max_tokens"] <= 2048
+                )
+            assert len(answer.kwargs["prompt"]) // 4 + 64 <= 2048
+            assert "Conversation handoff" in answer.kwargs["prompt"]
 
     @pytest.mark.parametrize(
         "choice",
@@ -2767,7 +2848,10 @@ class TestCompaction:
             {"type": "function", "function": {"name": "get_weather"}},
         ],
     )
-    def test_chat_compaction_counts_the_generation_prompt(self, mocked, client, choice):
+    @pytest.mark.parametrize("explicit", [False, True])
+    def test_chat_compaction_counts_the_generation_prompt(
+        self, mocked, client, choice, explicit
+    ):
         messages = [
             _msg(
                 [
@@ -2789,7 +2873,15 @@ class TestCompaction:
             messages=messages,
             tools=[_tool()],
             tool_choice=choice,
-            context_management=[{"type": "compaction", "compact_threshold": 100000}],
+            **(
+                {
+                    "context_management": [
+                        {"type": "compaction", "compact_threshold": 100000}
+                    ]
+                }
+                if explicit
+                else {}
+            ),
         )
         assert response.status_code == 200, response.text
         counted, generated = (

@@ -117,12 +117,14 @@ works while that response is stored. `/v1/responses/input_tokens` counts the
 decoded context, not the encrypted payload's string length. Normal response
 usage counts the final inference; explicit compact usage counts the summary pass.
 
-Chat Completions accepts the same `context_management` field as an opt-in MLX
-extension. Compaction is disabled when the field is omitted or empty. This path
-supports text, images, and tool history, and rejects unsupported audio/video
-content. Compaction finishes before the Chat Completions stream opens and leaves
-its response format unchanged. It is request-local: clients that resend their
-full history may need compaction again on later requests. Responses clients can
+Chat Completions automatically compacts supported history when the full input
+plus requested output exceeds the context limit. No threshold setting is needed.
+The optional `context_management` field enables earlier compaction; an empty list
+explicitly disables compaction. Recovery supports text, images, and tool history;
+audio/video requests keep their existing behavior. Compaction finishes before the
+Chat Completions stream opens and leaves its response format unchanged. It is
+request-local: clients that resend their full history may need compaction again
+on later requests. Responses clients can
 reuse the returned compaction item.
 
 Streaming automatic compaction and terminal `compaction_trigger` requests emit
