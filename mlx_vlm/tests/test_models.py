@@ -2140,3 +2140,156 @@ class TestMoERouterStopGradient:
         _, grads = nn.value_and_grad(block, lambda m, inp: m(inp).sum())(block, x)
         total = sum(float(mx.sum(mx.abs(g))) for _, g in tree_flatten(grads))
         assert total > 0 and bool(mx.isfinite(mx.array(total)))
+
+
+class TestKolibri1:
+    @staticmethod
+    def config():
+        from mlx_vlm.models.kolibri1 import ModelConfig
+
+        return ModelConfig(
+            model_type="kolibri1",
+            hidden_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            head_dim=8,
+            vocab_size=128,
+            max_position_embeddings=512,
+            rms_norm_eps=1e-6,
+            num_experts=8,
+            num_experts_per_tok=2,
+            moe_intermediate_size=32,
+            shared_expert_intermediate_size=32,
+            sliding_window=8,
+            layer_types=[
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+            ],
+        )
+
+    def test_forward_and_cache(self):
+        from mlx_vlm.models.kolibri1 import Model
+
+        model = Model(self.config())
+        ModelChecks().forward_cache(model, model.config.vocab_size)
+        cache = model.make_cache()
+        assert [type(item).__name__ for item in cache] == [
+            "RotatingKVCache",
+            "RotatingKVCache",
+            "KVCache",
+            "RotatingKVCache",
+        ]
+
+    def test_router_selects_on_biased_logits_and_weights_unbiased_logits(self):
+        from mlx_vlm.models.kolibri1.language import MoEGate
+
+        config = SimpleNamespace(
+            hidden_size=2,
+            num_experts=4,
+            num_experts_per_tok=2,
+            norm_topk_prob=False,
+        )
+        gate = MoEGate(config)
+        gate.weight = mx.array([[4.0, 0.0], [1.0, 0.0], [-2.0, 0.0], [0.0, 0.0]])
+        gate.e_score_correction_bias = mx.array([-10.0, 0.0, 5.0, 0.0])
+
+        indices, scores = gate(mx.array([[[1.0, 0.0]]]))
+
+        assert indices.tolist() == [[[2, 1]]]
+        expected = mx.sigmoid(mx.array([[[-2.0, 1.0]]]))
+        assert mx.allclose(scores, expected)
+
+    def test_sanitize_and_quantization_boundaries(self):
+        from mlx_vlm.models.kolibri1 import Model
+
+        model = Model(self.config())
+        config = model.config
+        weights = {
+            "model.layers.0.moe.router.expert_bias": mx.zeros((config.num_experts,))
+        }
+        shapes = {
+            "up_proj": (config.moe_intermediate_size, config.hidden_size),
+            "gate_proj": (config.moe_intermediate_size, config.hidden_size),
+            "down_proj": (config.hidden_size, config.moe_intermediate_size),
+        }
+        for expert_idx in range(config.num_experts):
+            for projection, shape in shapes.items():
+                weights[
+                    f"model.layers.0.mlp.experts.{expert_idx}.{projection}.weight"
+                ] = mx.zeros(shape)
+
+        sanitized = model.language_model.sanitize(weights)
+
+        assert "model.layers.0.mlp.gate.e_score_correction_bias" in sanitized
+        assert sanitized["model.layers.0.mlp.switch_mlp.up_proj.weight"].shape == (
+            config.num_experts,
+            config.moe_intermediate_size,
+            config.hidden_size,
+        )
+        predicate = model.quant_predicate
+        assert not predicate("language_model.model.embed_tokens", None)
+        assert not predicate("language_model.lm_head", None)
+        assert not predicate("language_model.model.layers.0.mlp.gate", None)
+        assert predicate("language_model.model.layers.0.mlp.switch_mlp", None)
+
+    def test_model_resolution_and_layer_type_validation(self):
+        from mlx_vlm.models.kolibri1 import Model, ModelConfig
+
+        module, model_type = get_model_and_args({"model_type": "kolibri1"})
+        assert module.Model is Model
+        assert module.ModelConfig is ModelConfig
+        assert model_type == "kolibri1"
+
+        config = self.config()
+        config.layer_types[0] = "attention"
+        with pytest.raises(ValueError, match="Unsupported layer types"):
+            ModelConfig(**vars(config))
+
+    @pytest.mark.parametrize(
+        "mode,group_size",
+        [("affine", 64), ("nvfp4", 16), ("mxfp4", 32)],
+    )
+    def test_quantized_expert_checkpoint_layout(self, mode, group_size):
+        from mlx_vlm.models.kolibri1 import Model
+        from mlx_vlm.models.switch_layers import QuantizedSwitchLinear
+
+        model = Model(self.config())
+        config = model.config
+        source = {
+            "model.layers.0.moe.router.expert_bias": mx.zeros((config.num_experts,))
+        }
+        for expert_idx in range(config.num_experts):
+            quantized = mx.quantize(
+                mx.random.normal((config.moe_intermediate_size, config.hidden_size)),
+                group_size=group_size,
+                bits=4,
+                mode=mode,
+            )
+            prefix = f"model.layers.0.mlp.experts.{expert_idx}.up_proj"
+            source[f"{prefix}.weight"] = quantized[0]
+            source[f"{prefix}.scales"] = quantized[1]
+            if mode == "affine":
+                source[f"{prefix}.biases"] = quantized[2]
+
+        weights = model.sanitize(source)
+        prefix = "language_model.model.layers.0.mlp.switch_mlp.up_proj"
+        nn.quantize(
+            model,
+            group_size=group_size,
+            bits=4,
+            mode=mode,
+            class_predicate=lambda path, _: f"{path}.scales" in weights,
+        )
+        model.load_weights(list(weights.items()), strict=False)
+
+        projection = model.language_model.model.layers[0].mlp.switch_mlp.up_proj
+        assert isinstance(projection, QuantizedSwitchLinear)
+        assert projection.mode == mode
+        assert projection.group_size == group_size
+        assert projection.weight.shape[0] == config.num_experts
+        assert projection.scales.shape[0] == config.num_experts
+        assert (projection.biases is not None) == (mode == "affine")
+        assert mx.isfinite(model(mx.array([[1, 2]])).logits).all().item()
