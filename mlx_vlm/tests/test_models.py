@@ -672,6 +672,37 @@ def test_dense_model(name):
     ModelChecks().forward_cache(model, config["vocab_size"])
 
 
+def test_kolibri1_routes_on_biased_logits_and_weights_by_sigmoid():
+    from mlx_vlm.models.kolibri1.language import Kolibri1MoE
+
+    E, k = 8, 2
+    block = Kolibri1MoE(
+        NS(
+            hidden_size=E,
+            num_experts=E,
+            num_experts_per_tok=k,
+            moe_intermediate_size=4,
+            shared_expert_intermediate_size=4,
+            norm_topk_prob=False,
+        )
+    )
+    # Each expert returns its one-hot row, so the output is the per-expert
+    # routing weight.
+    block.experts = lambda x, inds: mx.eye(E)[inds]
+    block.shared_experts = lambda x: mx.zeros_like(x)
+    block.gate.weight = mx.eye(E)
+    logits = mx.array([[[3.0, 2.0, 1.0, 0.0, -1.0, -2.0, -3.0, -4.0]]])
+    # The bias lifts expert 7 above experts 1..6 for selection only.
+    block.expert_bias = mx.array([0.0] * 7 + [10.0])
+
+    out = block(logits)
+
+    expected = np.zeros(E, dtype=np.float32)
+    for e in (0, 7):
+        expected[e] = 1 / (1 + np.exp(-np.array(logits)[0, 0, e]))
+    np.testing.assert_allclose(np.array(out)[0, 0], expected, rtol=1e-6)
+
+
 def tiny_config(family, profile=None, **overrides):
     """Build a fresh tiny config, optionally selecting a named test profile."""
     case = TINY_MODELS[family]
