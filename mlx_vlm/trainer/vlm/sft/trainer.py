@@ -65,8 +65,6 @@ def _collate_grid_thw(values):
     return mx.concatenate(rows, axis=0)
 
 
-
-
 def _resolve_adapter_file(args: TrainingArgs) -> Path:
     adapter_file = getattr(args, "adapter_file", None)
     if adapter_file:
