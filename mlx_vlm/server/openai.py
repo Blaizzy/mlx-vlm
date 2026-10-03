@@ -24,11 +24,7 @@ from ..generate.edit_image import edit_image
 from ..generate.image import ImageGenerationRequest as CoreImageGenerationRequest
 from ..generate.image import generate_image, parse_size
 from ..generate.video import resolve_video_inputs
-from ..prompt_utils import (
-    apply_chat_template,
-    extract_text_from_content,
-    normalize_image_content,
-)
+from ..prompt_utils import apply_chat_template
 from ..tools import (
     _infer_tool_parser_from_processor,
     _prepare_chat_tool_choice,
@@ -43,7 +39,10 @@ from .generation import (
     _build_metrics_envelope,
     _count_prompt_tokens,
 )
-from .request_normalization import _normalize_instruction_messages
+from .request_normalization import (
+    _chat_message_to_prompt,
+    _normalize_instruction_messages,
+)
 from .responses_state import (
     ToolCallStreamState,
     _normalize_response_input,
@@ -71,6 +70,7 @@ from .schemas import (
     ChatResponse,
     ChatStreamChoice,
     ChatStreamChunk,
+    CompactionControl,
     CompactRequest,
     ContentPartOutputText,
     GenerationTimings,
@@ -807,9 +807,13 @@ async def responses_compact_endpoint(http_request: Request, request: CompactRequ
 def _response_stream_error(exc, response):
     status = exc.status_code if isinstance(exc, HTTPException) else 500
     code = (
-        "rate_limit_exceeded"
-        if status == 429
-        else ("invalid_prompt" if status < 500 else "server_error")
+        "context_length_exceeded"
+        if isinstance(exc, (compaction.ContextBudgetError, PromptTooLongError))
+        else (
+            "rate_limit_exceeded"
+            if status == 429
+            else ("invalid_prompt" if status < 500 else "server_error")
+        )
     )
     return _response_sse_event(
         "response.failed",
@@ -843,6 +847,7 @@ async def _responses_compaction_trigger(request, items, tenant, covered=frozense
         apply_chat_template=apply_chat_template,
         generate=generate,
         covered=covered,
+        allow_oversized=True,
     )
     pending = OpenAIResponse(
         id=f"resp_{uuid.uuid4().hex}",
@@ -1809,6 +1814,48 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             else _INHERIT_ADAPTER
         )
 
+        if (
+            request.context_management is None
+            and runtime.config.chat_compaction_threshold
+        ):
+            request = request.model_copy(
+                update={
+                    "context_management": [
+                        CompactionControl(
+                            type="compaction",
+                            compact_threshold=runtime.config.chat_compaction_threshold,
+                        )
+                    ]
+                }
+            )
+        if request.context_management:
+            model, processor, config = get_cached_model(request.model, adapter_path)
+            result = await compaction.compact_response_context(
+                request,
+                [
+                    {**message.model_dump(exclude_none=True), "type": "message"}
+                    for message in request.messages
+                ],
+                model,
+                processor,
+                config,
+                _read_tenant_id(http_request),
+                build_gen_args=_build_gen_args,
+                apply_chat_template=apply_chat_template,
+                generate=generate,
+                automatic=True,
+            )
+            request = request.model_copy(
+                update={
+                    "messages": [
+                        ChatMessage.model_validate(
+                            {k: v for k, v in item.items() if k != "type"}
+                        )
+                        for item in result.items
+                    ]
+                }
+            )
+
         kwargs = {}
 
         if request.resize_shape is not None:
@@ -1828,11 +1875,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
         videos = []
         processed_messages = []
         for message in request.messages:
-            msg = {"role": message.role}
-
-            if isinstance(message.content, str):
-                msg["content"] = message.content
-            elif isinstance(message.content, list):
+            if isinstance(message.content, list):
                 if message.role == "user":
                     for item in message.content:
                         if not isinstance(item, dict):
@@ -1848,41 +1891,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             video = _extract_video_reference(item)
                             if video:
                                 videos.append(video)
-                msg["content"] = (
-                    normalize_image_content(message.content)
-                    if message.role == "user"
-                    else extract_text_from_content(message.content)
-                )
-            else:
-                msg["content"] = message.content
-
-            # Preserve tool-calling metadata.
-            # Ensure arguments are dicts (not JSON strings) for Jinja templates
-            # that iterate them with |items (e.g. Qwen3.5).
-            if message.tool_calls is not None:
-                normalized_calls = []
-                for tc in message.tool_calls:
-                    tc = dict(tc) if isinstance(tc, dict) else tc
-                    if isinstance(tc, dict) and "function" in tc:
-                        fn = dict(tc["function"])
-                        args = fn.get("arguments", {})
-                        if isinstance(args, str):
-                            try:
-                                fn["arguments"] = json.loads(args)
-                            except (json.JSONDecodeError, TypeError):
-                                fn["arguments"] = {}
-                        tc["function"] = fn
-                    normalized_calls.append(tc)
-                msg["tool_calls"] = normalized_calls
-            if message.tool_call_id is not None:
-                msg["tool_call_id"] = message.tool_call_id
-            if message.name is not None:
-                msg["name"] = message.name
-            if message.reasoning_content is not None:
-                msg["reasoning_content"] = message.reasoning_content
-                msg["reasoning"] = message.reasoning_content
-
-            processed_messages.append(msg)
+            processed_messages.append(
+                _chat_message_to_prompt(message.model_dump(exclude_none=True))
+            )
 
         _normalize_instruction_messages(processed_messages)
         _ensure_effective_input(processed_messages, images=images, audio=audio)

@@ -103,13 +103,35 @@ For automatic compaction, add this field to a Responses request:
 
 The server checks the rendered input token count **before generation**, including
 for streaming requests. This implementation does not compact mid-generation.
-Set the threshold below the context limit, leaving room for the summary prompt
-and its output. When compaction happens, the response output starts with a
+The threshold is overridden when input plus reserved output would exceed the
+context limit. Automatic and terminal-trigger compaction can summarize oversized
+history in up to eight bounded passes, preserving instructions, the latest
+exchange, and tool-call/result groups. Every summary call must fit the model
+window and reduce its input; otherwise the request fails without replacing the
+original context. A single oversized exchange still needs to be reduced by the
+caller. The standalone `/responses/compact` endpoint still requires its input to fit.
+When compaction happens, the response output starts with a
 `type: "compaction"` item. Append the output normally, or keep only the newest
 compaction item and everything after it. `previous_response_id` chaining also
 works while that response is stored. `/v1/responses/input_tokens` counts the
 decoded context, not the encrypted payload's string length. Normal response
 usage counts the final inference; explicit compact usage counts the summary pass.
+
+Chat Completions accepts the same `context_management` field as an opt-in MLX
+extension. To enable it for clients that do not send that field:
+
+```bash
+mlx_vlm.server --model openbmb/MiniCPM5-2B --max-kv-size 10000 \
+  --max-tokens 1024 --chat-compaction-threshold 7000
+```
+
+The default is disabled. `MLX_VLM_CHAT_COMPACTION_THRESHOLD` and the live server
+setting `chat_compaction_threshold` configure the same token threshold; a request
+with `context_management: []` disables it. This path supports text, images, and
+tool history, and rejects unsupported audio/video content. Compaction finishes
+before the Chat Completions stream opens and leaves its response format unchanged.
+It is request-local: clients that resend their full history may need compaction
+again on later requests. Responses clients can reuse the returned compaction item.
 
 Streaming automatic compaction and terminal `compaction_trigger` requests emit
 request-scoped MLX extension events after `response.created` / `response.in_progress`
@@ -133,7 +155,7 @@ Keep the capsule from the accepted final response, not from a progress event.
 
 Once the stream is open, failures are terminal `response.failed` SSE events with
 `response.error.message` and a string `response.error.code` (`invalid_prompt`,
-`rate_limit_exceeded`, or `server_error`). They do not produce a successful final
+`context_length_exceeded`, `rate_limit_exceeded`, or `server_error`). They do not produce a successful final
 response. Clear the indicator on failure or disconnect.
 Disconnecting cancels the queued summary worker. Non-streaming compaction still
 reports failures through HTTP status codes.

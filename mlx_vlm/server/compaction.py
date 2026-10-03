@@ -17,6 +17,7 @@ from typing import Any, Awaitable, Callable
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import HTTPException
 
+from ..tools import _prepare_chat_tool_choice
 from ..utils import prepare_inputs
 from .generation import (
     GenerationMetrics,
@@ -24,14 +25,17 @@ from .generation import (
     _count_prompt_tokens,
     get_configured_context_limit,
 )
-from .request_normalization import _normalize_instruction_messages
+from .request_normalization import (
+    _chat_message_to_prompt,
+    _normalize_instruction_messages,
+)
 from .responses_state import (
     _response_items_to_chat,
     _response_output_items_from_text,
     _response_tool_registry,
 )
 from .runtime import runtime
-from .schemas import CompactRequest, OpenAIUsage
+from .schemas import ChatRequest, CompactRequest, OpenAIUsage
 
 CAPSULE_PREFIX = "mlx-vlm.compaction.v1."
 SUMMARY_INSTRUCTION = """Create a concise handoff of the conversation above for another
@@ -42,6 +46,69 @@ unresolved questions, exact identifiers/file paths, and next steps. Incorporate
 any previous handoff, updating superseded facts. Omit repetitive tool output.
 Use these headings: Goal, Constraints, Progress, Decisions, Next steps, References.
 Return only the handoff, without reasoning or introductory commentary."""
+MAX_SUMMARY_PASSES = 8
+
+
+class ContextBudgetError(HTTPException):
+    def __init__(self, detail):
+        super().__init__(400, detail)
+
+
+def _handoff(summary):
+    return {
+        "type": "message",
+        "role": "assistant",
+        "content": [
+            {"type": "output_text", "text": "Conversation handoff:\n" + summary.strip()}
+        ],
+    }
+
+
+async def _summarize_bounded(items, *, fits, summarize, count):
+    """Fold whole exchanges into a handoff without exceeding any model call's budget."""
+    instructions = [x for x in items if _is_instruction(x)]
+    pending = [x for x in items if not _is_instruction(x)]
+    summary_items = []
+    usage = OpenAIUsage(input_tokens=0, output_tokens=0, total_tokens=0)
+    for _ in range(MAX_SUMMARY_PASSES):
+        prefix = instructions + summary_items
+        boundaries = [x for x in safe_boundaries(pending) if x] + [len(pending)]
+        low, high = 0, len(boundaries)
+        while low < high:
+            middle = (low + high) // 2
+            if await fits(prefix + pending[: boundaries[middle]]):
+                low = middle + 1
+            else:
+                high = middle
+        if low == 0:
+            raise ContextBudgetError(
+                "A conversation exchange cannot fit in a compaction summary request; "
+                "reduce the message or tool result size. Original context preserved."
+            )
+        cut = boundaries[low - 1]
+        chunk = prefix + pending[:cut]
+        summary, step_usage = await summarize(chunk)
+        if not summary.strip():
+            raise HTTPException(
+                502, "Compaction produced an empty summary; original context preserved."
+            )
+        summary_items = [_handoff(summary)]
+        if await count(instructions + summary_items) >= await count(chunk):
+            raise ContextBudgetError(
+                "Compaction did not reduce the history; original context preserved."
+            )
+        usage.input_tokens += step_usage.input_tokens
+        usage.output_tokens += step_usage.output_tokens
+        usage.total_tokens += step_usage.total_tokens
+        usage.input_tokens_details.cached_tokens += (
+            step_usage.input_tokens_details.cached_tokens
+        )
+        pending = pending[cut:]
+        if not pending:
+            return summary, usage
+    raise ContextBudgetError(
+        "Compaction exceeded its summary pass limit; original context preserved."
+    )
 
 
 def _cipher() -> Fernet:
@@ -313,6 +380,10 @@ async def compact(
         return unchanged
     # Apply the reduction target only to removable history.
     retained = await count(instructions + conversation[cut:])
+    if retained >= target_tokens:
+        raise ContextBudgetError(
+            "Protected conversation leaves no room for a summary; original context preserved."
+        )
     target_tokens = min(
         target_tokens, retained + max(1, int((before - retained) * 0.6))
     )
@@ -324,22 +395,7 @@ async def compact(
         raise HTTPException(
             502, "Compaction produced an empty summary; original context preserved."
         )
-    result = (
-        instructions
-        + [
-            {
-                "type": "message",
-                "role": "assistant",
-                "content": [
-                    {
-                        "type": "output_text",
-                        "text": "Conversation handoff:\n" + summary.strip(),
-                    }
-                ],
-            }
-        ]
-        + conversation[cut:]
-    )
+    result = instructions + [_handoff(summary)] + conversation[cut:]
     after = await count(result)
     base_tokens = after
     selected = []
@@ -358,8 +414,7 @@ async def compact(
             after = tokens
     result = instructions + selected + result[len(instructions) :]
     if after >= before or after > target_tokens:
-        raise HTTPException(
-            400,
+        raise ContextBudgetError(
             "Compaction could not reach the context budget; original context preserved.",
         )
     return CompactedContext(result, before, after, usage, True, covered)
@@ -401,6 +456,7 @@ async def compact_response_context(
     apply_chat_template,
     generate,
     automatic=False,
+    allow_oversized=False,
     covered=frozenset(),
     on_start: Callable[[int], None] | None = None,
 ):
@@ -408,20 +464,37 @@ async def compact_response_context(
     validate_items(items)
     limit = _context_limit(config)
     args = build_gen_args(request, processor, tenant_id=tenant)
-    tools, _ = _response_tool_registry(request.tools)
+    tools = (
+        request.tools
+        if isinstance(request, ChatRequest)
+        else _response_tool_registry(request.tools)[0]
+    )
 
     def render(context, generation_args=args):
-        messages, images = _response_items_to_chat(context)
-        _normalize_instruction_messages(messages, request.instructions)
+        if isinstance(request, ChatRequest):
+            messages = [_chat_message_to_prompt(item) for item in context]
+            _, images = _response_items_to_chat(
+                [item for item in context if item.get("role") == "user"]
+            )
+        else:
+            messages, images = _response_items_to_chat(context)
+        _normalize_instruction_messages(
+            messages, None if isinstance(request, ChatRequest) else request.instructions
+        )
         options = generation_args.to_template_kwargs()
-        if request.tool_choice is not None:
-            options["tool_choice"] = request.tool_choice
+        render_tools, tool_choice = tools, request.tool_choice
+        if isinstance(request, ChatRequest):
+            messages, render_tools, tool_choice = _prepare_chat_tool_choice(
+                messages, tools, tool_choice if generation_args is args else "auto"
+            )
+        if tool_choice is not None:
+            options["tool_choice"] = tool_choice
         prompt = apply_chat_template(
             processor,
             config,
             messages,
             num_images=len(images),
-            tools=tools or None,
+            tools=render_tools or None,
             **options,
         )
         return prompt, images
@@ -445,25 +518,24 @@ async def compact_response_context(
         return await count_prompt(*render(context))
 
     before = await count(items)
-    if before > limit:
-        raise HTTPException(
-            400, "Compaction input must fit within the model context window."
+    if before > limit and not (automatic or allow_oversized):
+        raise ContextBudgetError(
+            "Compaction input must fit within the model context window."
         )
     summary_tokens = (
         min(1024, max(128, limit // 16)) if automatic else request.max_output_tokens
     )
-    reserve = request.max_output_tokens if automatic else summary_tokens
+    reserve = args.max_tokens if automatic else summary_tokens
     available = limit - reserve
     if reserve <= 0 or available <= 0:
         raise HTTPException(
             400, "Output reservation leaves no room for compacted context."
         )
-    if automatic and before < request.context_management[0].compact_threshold:
-        if before > available:
-            raise HTTPException(
-                400,
-                "Input plus output exceeds the context budget; lower compact_threshold.",
-            )
+    if (
+        automatic
+        and before < request.context_management[0].compact_threshold
+        and before <= available
+    ):
         return CompactedContext(items, before, before, covered=covered)
     summary_request = request.model_copy(
         update={
@@ -480,8 +552,8 @@ async def compact_response_context(
     )
     summary_args = build_gen_args(summary_request, processor, tenant_id=tenant)
 
-    async def summarize(head):
-        prompt, images = render(
+    def render_summary(head):
+        return render(
             head
             + [
                 {
@@ -492,13 +564,20 @@ async def compact_response_context(
             ],
             summary_args,
         )
+
+    started = False
+
+    async def summarize(head):
+        nonlocal started
+        prompt, images = render_summary(head)
         if await count_prompt(prompt, images) + summary_tokens > limit:
-            raise HTTPException(
-                400, "Compaction summary request needs more context headroom."
+            raise ContextBudgetError(
+                "Compaction summary request needs more context headroom."
             )
 
-        if on_start is not None:
+        if on_start is not None and not started:
             on_start(before)
+        started = True
         cancelled = Event()
         active_iterator = None
 
@@ -576,7 +655,17 @@ async def compact_response_context(
                 active_iterator.close()
             raise
         except PromptTooLongError as exc:
-            raise HTTPException(400, str(exc)) from exc
+            raise ContextBudgetError(str(exc)) from exc
+
+    async def fits(head):
+        return await count_prompt(*render_summary(head)) + summary_tokens <= limit
+
+    async def summarize_history(head):
+        if await fits(head):
+            return await summarize(head)
+        return await _summarize_bounded(
+            head, fits=fits, summarize=summarize, count=count
+        )
 
     target = available
     keep = request.keep_tokens if isinstance(request, CompactRequest) else None
@@ -585,15 +674,15 @@ async def compact_response_context(
     result = await compact(
         items,
         count=count,
-        summarize=summarize,
+        summarize=summarize_history,
         keep_tokens=keep,
         target_tokens=target,
         retain_tokens=min(8192, limit // 16),
         covered=covered,
     )
     if result.after_tokens > available:
-        raise HTTPException(
-            400, "Protected conversation exceeds the available context budget."
+        raise ContextBudgetError(
+            "Protected conversation exceeds the available context budget."
         )
     return result
 

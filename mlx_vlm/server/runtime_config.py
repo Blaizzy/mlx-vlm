@@ -180,6 +180,14 @@ KNOBS: Tuple[
         "Token queue wait timeout in seconds; null disables the timeout.",
     ),
     (
+        "chat_compaction_threshold",
+        "int_or_none",
+        None,
+        (),
+        None,
+        "Opt-in Chat Completions compaction threshold in tokens; null disables it.",
+    ),
+    (
         "spec_draft_model",
         "str_or_none",
         None,
@@ -218,7 +226,11 @@ _KNOB_SPEC: Dict[str, Dict[str, Any]] = {
 
 # Knobs that are naturally live (applied per request) and must never trigger a
 # model reload, so they are excluded from the cache-key fingerprint.
-_LIVE_KNOBS: Tuple[str, ...] = ("max_kv_size", "token_queue_timeout")
+_LIVE_KNOBS: Tuple[str, ...] = (
+    "max_kv_size",
+    "token_queue_timeout",
+    "chat_compaction_threshold",
+)
 
 
 def _env_float(
@@ -312,6 +324,7 @@ class RuntimeConfig:
     apc_checkpoint_guard_tokens: int = 1
     max_kv_size: Optional[int] = None
     token_queue_timeout: Optional[float] = DEFAULT_TOKEN_QUEUE_TIMEOUT
+    chat_compaction_threshold: Optional[int] = None
     spec_draft_model: Optional[str] = None
     spec_draft_kind: Optional[str] = None
     vision_cache_size: int = 20
@@ -369,11 +382,19 @@ class RuntimeConfig:
             ),
             max_kv_size=_env_int("MAX_KV_SIZE", None),
             token_queue_timeout=_env_token_queue_timeout(),
+            chat_compaction_threshold=_env_int(
+                "MLX_VLM_CHAT_COMPACTION_THRESHOLD", None
+            ),
             spec_draft_model=os.environ.get("MLX_VLM_DRAFT_MODEL") or None,
             spec_draft_kind=os.environ.get("MLX_VLM_DRAFT_KIND") or None,
             vision_cache_size=int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20")),
         )
         cfg._env_defaults = {name: getattr(cfg, name) for name in _KNOB_SPEC}
+        if (
+            cfg.chat_compaction_threshold is not None
+            and cfg.chat_compaction_threshold <= 0
+        ):
+            raise ValueError("MLX_VLM_CHAT_COMPACTION_THRESHOLD must be positive")
         return cfg
 
     def schema(self) -> List[Dict[str, Any]]:
@@ -431,6 +452,14 @@ class RuntimeConfig:
                         if name.startswith("apc_")
                         else _coerce(spec["type"], raw, spec.get("allowed"))
                     )
+                    if (
+                        name == "chat_compaction_threshold"
+                        and value is not None
+                        and value <= 0
+                    ):
+                        raise ValueError(
+                            "chat_compaction_threshold must be positive or null"
+                        )
                     if (
                         name == "token_queue_timeout"
                         and value is not None

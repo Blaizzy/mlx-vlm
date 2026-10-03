@@ -2228,6 +2228,7 @@ class TestCompaction:
     def isolated_state(self, tmp_path, monkeypatch):
         monkeypatch.setenv("MLX_VLM_COMPACTION_KEY_FILE", str(tmp_path / "key"))
         monkeypatch.setattr(server.runtime.config, "max_kv_size", None)
+        monkeypatch.setattr(server.runtime.config, "chat_compaction_threshold", None)
         server.response_store.clear()
         server.response_store_order.clear()
 
@@ -2402,7 +2403,7 @@ class TestCompaction:
         )
         assert (
             response["detail"]
-            == "Compaction input must fit within the model context window."
+            == "Protected conversation exceeds the available context budget."
         )
         mocked.generate.assert_not_called()
 
@@ -2568,6 +2569,255 @@ class TestCompaction:
         )
         assert all(item["type"] != "compaction" for item in response["output"])
         assert mocked.generate.call_count == 1
+
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("api", ["responses", "chat"])
+    def test_output_budget_overrides_compaction_threshold(
+        self, mocked, client, monkeypatch, api, stream
+    ):
+        items = [_compaction_message("old evidence " * 150) for _ in range(6)]
+        items.append(_compaction_message("Continue"))
+        before = mocked.count(input=items)["input_tokens"]
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", before + 32)
+        options = dict(
+            stream=stream,
+            context_management=[{"type": "compaction", "compact_threshold": 100000}],
+        )
+        if api == "chat":
+            options.update(messages=items, max_tokens=256)
+        else:
+            options.update(input=items, max_output_tokens=256)
+        response = _post(client, api, **options)
+        assert response.status_code == 200, response.text
+        assert mocked.generate.call_count == (1 if stream else 2)
+        answer_call = mocked.stream.call_args if stream else mocked.generate.call_args
+        assert len(answer_call.kwargs["prompt"]) // 4 + 256 <= before + 32
+        assert "Conversation handoff" in answer_call.kwargs["prompt"]
+
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("mode", ["automatic", "trigger", "chat"])
+    def test_oversized_history_uses_bounded_summary_calls(
+        self, mocked, client, monkeypatch, mode, stream
+    ):
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", 2048)
+        items = [_compaction_message("Keep the constraints.", "system")]
+        for index in range(6):
+            items += [
+                _compaction_message(f"batch-{index} " + "evidence " * 200),
+                *_function_result("done", name="read_file", call_id=f"c{index}"),
+            ]
+        items.append(_compaction_message("Continue"))
+        original = copy.deepcopy(items)
+        options = dict(stream=stream)
+        api = "responses"
+        if mode == "trigger":
+            options.update(input=items + [{"type": "compaction_trigger"}])
+        elif mode == "chat":
+            api = "chat"
+            options.update(
+                messages=[_compaction_message("old evidence " * 180) for _ in range(10)]
+                + [items[-1]],
+                max_tokens=64,
+            )
+            monkeypatch.setattr(
+                server.runtime.config, "chat_compaction_threshold", 100000
+            )
+        else:
+            options.update(
+                input=items,
+                max_output_tokens=64,
+                context_management=[
+                    {"type": "compaction", "compact_threshold": 100000}
+                ],
+            )
+        response = _post(client, api, **options)
+        assert response.status_code == 200, response.text
+        calls = mocked.generate.call_args_list
+        summary_calls = [
+            call
+            for call in calls
+            if json.loads(call.kwargs["prompt"])[-1]["content"]
+            == compaction.SUMMARY_INSTRUCTION
+        ]
+        assert 1 < len(summary_calls) <= compaction.MAX_SUMMARY_PASSES
+        for call in summary_calls:
+            assert len(call.kwargs["prompt"]) // 4 + call.kwargs["max_tokens"] <= 2048
+            messages = json.loads(call.kwargs["prompt"])
+            ids = {tc["id"] for m in messages for tc in m.get("tool_calls", [])}
+            assert ids == {
+                m["tool_call_id"] for m in messages if m.get("role") == "tool"
+            }
+        assert items == original
+        if mode != "chat":
+            final = _completed_response(response) if stream else response.json()
+            assert final["output"][0]["type"] == "compaction"
+            assert mocked.count(input=[final["output"][0]])["input_tokens"] <= 2048 - 64
+            if mode == "trigger":
+                assert final["usage"]["input_tokens"] == 8 * len(summary_calls)
+                assert final["usage"]["output_tokens"] == 4 * len(summary_calls)
+            if stream:
+                kinds = [event["type"] for event in _data(response)]
+                assert (
+                    kinds.count("mlx.compaction.started")
+                    == kinds.count("mlx.compaction.completed")
+                    == 1
+                )
+
+    def test_standalone_compaction_still_requires_input_to_fit(
+        self, mocked, monkeypatch
+    ):
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", 2048)
+        result = mocked.compact(input=_compaction_history(), status=400)
+        assert "input must fit" in result["detail"]
+        mocked.generate.assert_not_called()
+
+    def test_later_summary_failure_never_publishes_partial_compaction(
+        self, mocked, client, monkeypatch
+    ):
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", 2048)
+        mocked.generate.side_effect = [
+            _result("Earlier requirements preserved."),
+            _result(""),
+        ]
+        items = [_compaction_message("old evidence " * 180) for _ in range(10)] + [
+            _compaction_message("Continue")
+        ]
+        original = copy.deepcopy(items)
+        events = _data(
+            _post(
+                client,
+                "responses",
+                input=items,
+                stream=True,
+                max_output_tokens=64,
+                context_management=[{"type": "compaction", "compact_threshold": 1}],
+            )
+        )
+        assert mocked.generate.call_count == 2
+        assert events[-1]["type"] == "response.failed"
+        assert events[-1]["response"]["error"]["code"] == "server_error"
+        assert [event["type"] for event in events].count("mlx.compaction.started") == 1
+        assert not any(
+            event["type"]
+            in (
+                "response.output_item.added",
+                "response.completed",
+                "mlx.compaction.completed",
+            )
+            for event in events
+        )
+        assert not server.response_store and items == original
+
+    @pytest.mark.parametrize(
+        "failure", ["oversized-exchange", "nonreducing-summary", "pass-limit"]
+    )
+    def test_bounded_summary_recovery_stops_without_mutating_input(
+        self, monkeypatch, failure
+    ):
+        items = [_compaction_message("old evidence " * 200) for _ in range(4)]
+        original = copy.deepcopy(items)
+        monkeypatch.setattr(compaction, "MAX_SUMMARY_PASSES", 2)
+
+        async def count(items):
+            return len(json.dumps(items))
+
+        async def fits(items):
+            return (
+                failure != "oversized-exchange"
+                and sum(x.get("role") == "user" for x in items) <= 1
+            )
+
+        summarize = AsyncMock(
+            return_value=(
+                "huge " * 1000 if failure == "nonreducing-summary" else "handoff",
+                server.OpenAIUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+            )
+        )
+        with pytest.raises(compaction.ContextBudgetError):
+            asyncio.run(
+                compaction._summarize_bounded(
+                    items, fits=fits, summarize=summarize, count=count
+                )
+            )
+        assert (
+            summarize.await_count
+            == {"oversized-exchange": 0, "nonreducing-summary": 1, "pass-limit": 2}[
+                failure
+            ]
+        )
+        assert items == original
+
+    @pytest.mark.parametrize("setting", [None, 1])
+    def test_chat_compaction_opt_in_and_explicit_disable(
+        self, mocked, client, monkeypatch, setting
+    ):
+        monkeypatch.setattr(server.runtime.config, "chat_compaction_threshold", setting)
+        response = _post(
+            client,
+            messages=[_compaction_message("hello")],
+            context_management=[] if setting else None,
+        )
+        assert response.status_code == 200
+        assert mocked.generate.call_count == 1
+
+    @pytest.mark.parametrize(
+        "choice",
+        [
+            None,
+            "none",
+            "required",
+            {"type": "function", "function": {"name": "get_weather"}},
+        ],
+    )
+    def test_chat_compaction_counts_the_generation_prompt(self, mocked, client, choice):
+        messages = [
+            _msg(
+                [
+                    {"type": "text", "text": "First."},
+                    {"type": "text", "text": "Second."},
+                ],
+                "developer",
+            ),
+            _msg("", "assistant", reasoning_content="Earlier reasoning."),
+            _msg(
+                [
+                    {"type": "text", "text": "Inspect"},
+                    _input_image("data:image/png;base64,example"),
+                ]
+            ),
+        ]
+        response = _post(
+            client,
+            messages=messages,
+            tools=[_tool()],
+            tool_choice=choice,
+            context_management=[{"type": "compaction", "compact_threshold": 100000}],
+        )
+        assert response.status_code == 200, response.text
+        counted, generated = (
+            mocked.template.call_args_list[0],
+            mocked.template.call_args_list[-1],
+        )
+        assert counted.args == generated.args
+        for field in ("tools", "tool_choice", "num_images"):
+            assert counted.kwargs.get(field) == generated.kwargs.get(field)
+
+    def test_chat_compaction_runtime_setting_is_live_and_validated(self, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_CHAT_COMPACTION_THRESHOLD", "7000")
+        config = RuntimeConfig.from_env()
+        fingerprint = config.fingerprint()
+        assert config.chat_compaction_threshold == 7000
+        for value in (-1, 0):
+            applied, rejected = config.apply_changes(
+                {"chat_compaction_threshold": value}
+            )
+            assert not applied and rejected
+            monkeypatch.setenv("MLX_VLM_CHAT_COMPACTION_THRESHOLD", str(value))
+            with pytest.raises(ValueError, match="must be positive"):
+                RuntimeConfig.from_env()
+        applied, rejected = config.apply_changes({"chat_compaction_threshold": None})
+        assert not rejected and applied == {"chat_compaction_threshold": None}
+        assert config.fingerprint() == fingerprint
 
     @pytest.mark.parametrize("stream", [False, True])
     @pytest.mark.parametrize("short", [False, True])
@@ -2857,7 +3107,7 @@ class TestCompaction:
         assert failed["id"] == events[0]["response"]["id"]
         assert failed["status"] == "failed" and not failed["output"]
         assert failed["error"]["code"] == (
-            "invalid_prompt" if code == 400 else "server_error"
+            "context_length_exceeded" if code == 400 else "server_error"
         )
         assert "Compaction" in failed["error"]["message"]
         assert not server.response_store
@@ -3905,6 +4155,7 @@ class TestResponseGenerator:
             _assert_fields(vars(server._build_gen_args(legacy)), **expected)
 
     def test_server_cli_sets_thinking_defaults(self, monkeypatch):
+        monkeypatch.setattr(server.runtime.config, "chat_compaction_threshold", None)
         flags = [
             ("model", "PRELOAD_MODEL", "demo"),
             ("image-model", "PRELOAD_IMAGE_MODEL", "image-demo"),
@@ -3916,6 +4167,7 @@ class TestResponseGenerator:
             ("thinking-start-token", "THINKING_START_TOKEN", "<|START_THINKING|>"),
             ("thinking-eos-token", "THINKING_END_TOKEN", "<|END_THINKING|>"),
             ("api-key", "SERVER_API_KEY", "admin-token"),
+            ("chat-compaction-threshold", "CHAT_COMPACTION_THRESHOLD", "7000"),
         ]
         expected = {"MLX_VLM_" + env: value for _, env, value in flags}
         expected["MLX_VLM_ENABLE_THINKING"] = "1"
@@ -3943,6 +4195,7 @@ class TestResponseGenerator:
                 os.environ.pop(key, None)
             cli.main()
             _assert_fields(os.environ, **expected)
+            assert server.runtime.config.chat_compaction_threshold == 7000
             assert run.call_args.kwargs["host"] == "127.0.0.1"
 
     def test_lifespan_continues_when_optional_preload_fails(self, monkeypatch):
