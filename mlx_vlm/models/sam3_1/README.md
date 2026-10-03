@@ -4,6 +4,13 @@ MLX port of [Meta's SAM 3.1](https://github.com/facebookresearch/sam3) — exten
 
 > **Note:** SAM 3.1 shares the same detection pipeline as SAM 3 but adds a triple-head FPN, multiplex mask decoder (16 objects simultaneously), and decoupled memory attention for tracking.
 
+> **Tokenizer:** text prompts are tokenized with CLIP, so the checkpoint must ship
+> `tokenizer.json` (or `vocab.json` and `merges.txt`). The processor reads them from
+> the checkpoint and raises if they are missing rather than fetching a vocabulary
+> from elsewhere, which would not be guaranteed to match the converted weights.
+> Some published MLX conversions omit these files; copy them from the source
+> checkpoint alongside the weights.
+
 ## What's New in SAM 3.1
 
 | Component | SAM 3 | SAM 3.1 |

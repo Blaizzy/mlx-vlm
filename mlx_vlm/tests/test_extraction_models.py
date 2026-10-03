@@ -3148,3 +3148,28 @@ class TestExtractionProcessorResolution(unittest.TestCase):
                     )
                     processor = load_processor(path, True)
                 self.assertEqual(type(processor).__name__, expected)
+
+
+class TestSam3TokenizerSource(unittest.TestCase):
+    """SAM 3 takes its CLIP vocabulary from the checkpoint or not at all."""
+
+    def test_missing_tokenizer_is_refused(self):
+        from mlx_vlm.models.sam3.processing_sam3 import Sam3Processor
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / "processor_config.json").write_text(json.dumps({}))
+            processor = Sam3Processor.from_pretrained(str(path))
+            self.assertIsNone(processor.tokenizer)
+            with self.assertRaisesRegex(ValueError, "ships no tokenizer"):
+                processor.preprocess_text("a cat")
+
+    def test_probing_for_a_tokenizer_does_not_raise(self):
+        from mlx_vlm.models.sam3.processing_sam3 import Sam3Processor
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / "processor_config.json").write_text(json.dumps({}))
+            processor = Sam3Processor.from_pretrained(str(path))
+            # load_processor checks hasattr, which only swallows AttributeError.
+            self.assertTrue(hasattr(processor, "tokenizer"))
