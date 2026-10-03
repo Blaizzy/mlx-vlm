@@ -11,6 +11,7 @@ import uuid
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event
 from typing import Any, Awaitable, Callable
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -401,6 +402,7 @@ async def compact_response_context(
     generate,
     automatic=False,
     covered=frozenset(),
+    on_start: Callable[[int], None] | None = None,
 ):
     """Use the ordinary rendering and inference paths, including their APC pool."""
     validate_items(items)
@@ -495,7 +497,13 @@ async def compact_response_context(
                 400, "Compaction summary request needs more context headroom."
             )
 
+        if on_start is not None:
+            on_start(before)
+        cancelled = Event()
+        active_iterator = None
+
         def run():
+            nonlocal active_iterator
             metrics = GenerationMetrics()
             if runtime.response_generator is not None:
                 context, iterator = runtime.response_generator.generate(
@@ -504,6 +512,9 @@ async def compact_response_context(
                 pieces = []
                 finish = None
                 try:
+                    active_iterator = iterator
+                    if cancelled.is_set():
+                        raise asyncio.CancelledError
                     for token in iterator:
                         pieces.append(token.text)
                         metrics.record_chunk(token)
@@ -559,6 +570,11 @@ async def compact_response_context(
 
         try:
             return await asyncio.to_thread(run)
+        except asyncio.CancelledError:
+            cancelled.set()
+            if active_iterator is not None:
+                active_iterator.close()
+            raise
         except PromptTooLongError as exc:
             raise HTTPException(400, str(exc)) from exc
 
@@ -580,3 +596,32 @@ async def compact_response_context(
             400, "Protected conversation exceeds the available context budget."
         )
     return result
+
+
+async def stream_response_context(*args, **kwargs):
+    """Yield request-local progress followed by the validated compacted context."""
+    queue = asyncio.Queue()
+    task = asyncio.create_task(
+        compact_response_context(
+            *args,
+            **kwargs,
+            on_start=lambda before: queue.put_nowait(
+                {"type": "mlx.compaction.started", "input_tokens": before}
+            ),
+        )
+    )
+    task.add_done_callback(lambda _: queue.put_nowait(None))
+    try:
+        while (event := await queue.get()) is not None:
+            yield event
+        result = await task
+        if result.changed:
+            yield {
+                "type": "mlx.compaction.completed",
+                "input_tokens_before": result.before_tokens,
+                "input_tokens_after": result.after_tokens,
+            }
+        yield result
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

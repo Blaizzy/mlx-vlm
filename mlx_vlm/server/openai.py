@@ -7,6 +7,7 @@ import logging
 import random
 import time
 import uuid
+from contextlib import aclosing
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -803,66 +804,99 @@ async def responses_compact_endpoint(http_request: Request, request: CompactRequ
     }
 
 
+def _response_stream_error(exc):
+    return _response_sse_event(
+        "error",
+        {
+            "type": "error",
+            "error": {
+                "message": (
+                    str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
+                ),
+                "code": exc.status_code if isinstance(exc, HTTPException) else 500,
+            },
+        },
+    )
+
+
 async def _responses_compaction_trigger(request, items, tenant, covered=frozenset()):
-    """Return the single opaque output expected by Codex compaction v2."""
+    """Return a single opaque item, with progress while a summary is running."""
     model, processor, config = get_cached_model(
         request.model, _adapter_path_or_inherit(request)
     )
     compact_request = CompactRequest(
-        **{
-            **request.model_dump(),
-            "stream": False,
-            "max_output_tokens": 1024,
-        }
+        **{**request.model_dump(), "stream": False, "max_output_tokens": 1024}
     )
-    result = await compaction.compact_response_context(
-        compact_request,
-        items,
-        model,
-        processor,
-        config,
-        tenant,
+    args = (compact_request, items, model, processor, config, tenant)
+    options = dict(
         build_gen_args=_build_gen_args,
         apply_chat_template=apply_chat_template,
         generate=generate,
         covered=covered,
     )
-    capsule = compaction.seal(
-        result.items, model=request.model, tenant=tenant, covered=result.covered
-    )
-    response = OpenAIResponse(
+    pending = OpenAIResponse(
         id=f"resp_{uuid.uuid4().hex}",
         created_at=int(time.time()),
         object="response",
-        status="completed",
+        status="in_progress",
         model=request.model,
-        output=[capsule],
+        output=[],
         output_text="",
-        usage=result.usage
-        or OpenAIUsage(input_tokens=0, output_tokens=0, total_tokens=0),
+        usage=OpenAIUsage(input_tokens=0, output_tokens=0, total_tokens=0),
         store=request.store,
         previous_response_id=request.previous_response_id,
     )
-    _store_response(response, items, [capsule], request.previous_response_id)
-    if not request.stream:
+
+    def complete(result):
+        capsule = compaction.seal(
+            result.items, model=request.model, tenant=tenant, covered=result.covered
+        )
+        response = pending.model_copy(
+            update={
+                "status": "completed",
+                "output": [capsule],
+                "usage": result.usage or pending.usage,
+            }
+        )
+        _store_response(response, items, [capsule], request.previous_response_id)
         return response
 
-    async def events():
-        pending = response.model_copy(update={"status": "in_progress", "output": []})
-        for kind in ("response.created", "response.in_progress"):
-            yield _response_sse_event(
-                kind, {"type": kind, "response": pending.model_dump()}
-            )
-        for kind in ("response.output_item.added", "response.output_item.done"):
-            yield _response_sse_event(
-                kind, {"type": kind, "output_index": 0, "item": capsule}
-            )
-        yield _response_sse_event(
-            "response.completed",
-            {"type": "response.completed", "response": response.model_dump()},
-        )
+    if not request.stream:
+        return complete(await compaction.compact_response_context(*args, **options))
 
-    return StreamingResponse(events(), media_type="text/event-stream")
+    async def events():
+        try:
+            for kind in ("response.created", "response.in_progress"):
+                yield _response_sse_event(
+                    kind, {"type": kind, "response": pending.model_dump()}
+                )
+            async with aclosing(
+                compaction.stream_response_context(*args, **options)
+            ) as progress:
+                async for update in progress:
+                    if isinstance(update, compaction.CompactedContext):
+                        result = update
+                    else:
+                        yield _response_sse_event(
+                            update["type"], {**update, "response_id": pending.id}
+                        )
+            response = complete(result)
+            for kind in ("response.output_item.added", "response.output_item.done"):
+                yield _response_sse_event(
+                    kind, {"type": kind, "output_index": 0, "item": response.output[0]}
+                )
+            yield _response_sse_event(
+                "response.completed",
+                {"type": "response.completed", "response": response.model_dump()},
+            )
+        except Exception as exc:
+            yield _response_stream_error(exc)
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 async def responses_retrieve_endpoint(response_id: str):
@@ -988,33 +1022,48 @@ async def responses_endpoint(request: Request):
                 openai_request, prompt_items, tenant, context.covered
             )
         compaction_output = []
+        deferred_compaction = bool(
+            openai_request.stream and openai_request.context_management
+        )
+        compaction_args = None
         if openai_request.context_management:
             model, processor, config = get_cached_model(
                 openai_request.model, _adapter_path_or_inherit(openai_request)
             )
-            compacted = await compaction.compact_response_context(
+            compaction_args = (
                 openai_request,
                 prompt_items,
                 model,
                 processor,
                 config,
                 tenant,
-                build_gen_args=_build_gen_args,
-                apply_chat_template=apply_chat_template,
-                generate=generate,
-                automatic=True,
-                covered=context.covered,
             )
-            if compacted.changed:
-                prompt_items = compacted.items
-                compaction_output = [
-                    compaction.seal(
-                        prompt_items,
-                        model=openai_request.model,
-                        tenant=tenant,
-                        covered=compacted.covered,
-                    )
-                ]
+        compaction_options = dict(
+            build_gen_args=_build_gen_args,
+            apply_chat_template=apply_chat_template,
+            generate=generate,
+            automatic=True,
+            covered=context.covered,
+        )
+
+        def apply_compaction(result):
+            if not result.changed:
+                return result.items, []
+            return result.items, [
+                compaction.seal(
+                    result.items,
+                    model=openai_request.model,
+                    tenant=tenant,
+                    covered=result.covered,
+                )
+            ]
+
+        if compaction_args and not deferred_compaction:
+            prompt_items, compaction_output = apply_compaction(
+                await compaction.compact_response_context(
+                    *compaction_args, **compaction_options
+                )
+            )
         chat_messages, images = _response_items_to_chat(prompt_items)
         instructions = _normalize_instruction_messages(
             chat_messages,
@@ -1046,21 +1095,29 @@ async def responses_endpoint(request: Request):
         if openai_request.tool_choice is not None:
             template_kwargs["tool_choice"] = openai_request.tool_choice
 
-        formatted_prompt = apply_chat_template(
-            processor,
-            config,
-            chat_messages,
-            num_images=len(images),
-            tools=chat_tools or None,
-            **template_kwargs,
-        )
+        def render_prompt(items):
+            messages, images = _response_items_to_chat(items)
+            _normalize_instruction_messages(messages, openai_request.instructions)
+            _ensure_effective_input(messages, images=images)
+            prompt = apply_chat_template(
+                processor,
+                config,
+                messages,
+                num_images=len(images),
+                tools=chat_tools or None,
+                **template_kwargs,
+            )
+            thinking = prompt_has_open_thinking(
+                prompt,
+                gen_args.enable_thinking,
+                gen_args.thinking_start_token,
+                gen_args.thinking_end_token,
+            )
+            return prompt, images, thinking
 
-        starts_in_thinking = prompt_has_open_thinking(
-            formatted_prompt,
-            gen_args.enable_thinking,
-            gen_args.thinking_start_token,
-            gen_args.thinking_end_token,
-        )
+        formatted_prompt, starts_in_thinking = None, False
+        if not deferred_compaction:
+            formatted_prompt, images, starts_in_thinking = render_prompt(prompt_items)
 
         logger.debug(
             "responses request: model=%s images=%d max_tokens=%s temp=%s stream=%s",
@@ -1082,16 +1139,18 @@ async def responses_endpoint(request: Request):
                 model=openai_request.model,
                 stream=True,
             )
-            await _preflight_stream_context_budget(
-                endpoint="/responses",
-                model=openai_request.model,
-                prompt=formatted_prompt,
-                images=images if images else None,
-                audio=None,
-                args=gen_args,
-            )
+            if not deferred_compaction:
+                await _preflight_stream_context_budget(
+                    endpoint="/responses",
+                    model=openai_request.model,
+                    prompt=formatted_prompt,
+                    images=images if images else None,
+                    audio=None,
+                    args=gen_args,
+                )
 
             async def stream_generator():
+                nonlocal formatted_prompt, images, starts_in_thinking, compaction_output
                 token_iterator = None
                 token_iter = None  # For ResponseGenerator cleanup
                 metrics_finalized = False
@@ -1125,6 +1184,32 @@ async def responses_endpoint(request: Request):
 
                     # Send response.in_progress event  (to match the openai pipeline)
                     yield f"event: response.in_progress\ndata: {ResponseInProgressEvent(type='response.in_progress', response=base_response).model_dump_json()}\n\n"
+
+                    if deferred_compaction:
+                        async with aclosing(
+                            compaction.stream_response_context(
+                                *compaction_args, **compaction_options
+                            )
+                        ) as progress:
+                            async for update in progress:
+                                if isinstance(update, compaction.CompactedContext):
+                                    items, compaction_output = apply_compaction(update)
+                                    formatted_prompt, images, starts_in_thinking = (
+                                        render_prompt(items)
+                                    )
+                                else:
+                                    yield _response_sse_event(
+                                        update["type"],
+                                        {**update, "response_id": response_id},
+                                    )
+                        await _preflight_stream_context_budget(
+                            endpoint="/responses",
+                            model=openai_request.model,
+                            prompt=formatted_prompt,
+                            images=images or None,
+                            audio=None,
+                            args=gen_args,
+                        )
 
                     for index, item in enumerate(compaction_output):
                         for event_type in (
@@ -1487,8 +1572,7 @@ async def responses_endpoint(request: Request):
                         )
                         metrics_finalized = True
                     logger.exception("Responses stream generation failed: %s", e)
-                    error_data = json.dumps({"error": str(e)})
-                    yield f"data: {error_data}\n\n"
+                    yield _response_stream_error(e)
 
                 finally:
                     if token_iter is not None:
