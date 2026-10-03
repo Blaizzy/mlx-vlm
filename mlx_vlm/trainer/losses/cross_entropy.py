@@ -6,7 +6,6 @@ import mlx.core as mx
 import mlx.nn as nn
 
 
-
 def cross_entropy(
     logits: mx.array,
     targets: mx.array,
@@ -52,8 +51,7 @@ def _transcript_mask(
     """
     if lengths.ndim != 2 or lengths.shape[1] != 2:
         raise ValueError(
-            "Expected lengths with shape [batch_size, 2], "
-            f"but got {lengths.shape}."
+            "Expected lengths with shape [batch_size, 2], " f"but got {lengths.shape}."
         )
 
     if lengths.shape[0] != targets.shape[0]:
@@ -107,8 +105,7 @@ def stt_cross_entropy(
 
     if missing_keys:
         raise KeyError(
-            "Missing required STT batch fields: "
-            + ", ".join(sorted(missing_keys))
+            "Missing required STT batch fields: " + ", ".join(sorted(missing_keys))
         )
 
     token_ids = batch["token_ids"]
@@ -120,9 +117,7 @@ def stt_cross_entropy(
         )
 
     if token_ids.shape[1] < 2:
-        raise ValueError(
-            "STT cross-entropy requires at least two token positions."
-        )
+        raise ValueError("STT cross-entropy requires at least two token positions.")
 
     inputs = token_ids[:, :-1]
     targets = token_ids[:, 1:]
