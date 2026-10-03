@@ -804,16 +804,26 @@ async def responses_compact_endpoint(http_request: Request, request: CompactRequ
     }
 
 
-def _response_stream_error(exc):
+def _response_stream_error(exc, response):
+    status = exc.status_code if isinstance(exc, HTTPException) else 500
+    code = (
+        "rate_limit_exceeded"
+        if status == 429
+        else ("invalid_prompt" if status < 500 else "server_error")
+    )
     return _response_sse_event(
-        "error",
+        "response.failed",
         {
-            "type": "error",
-            "error": {
-                "message": (
-                    str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
-                ),
-                "code": exc.status_code if isinstance(exc, HTTPException) else 500,
+            "type": "response.failed",
+            "response": {
+                **response.model_dump(),
+                "status": "failed",
+                "error": {
+                    "message": (
+                        str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
+                    ),
+                    "code": code,
+                },
             },
         },
     )
@@ -890,7 +900,7 @@ async def _responses_compaction_trigger(request, items, tenant, covered=frozense
                 {"type": "response.completed", "response": response.model_dump()},
             )
         except Exception as exc:
-            yield _response_stream_error(exc)
+            yield _response_stream_error(exc, pending)
 
     return StreamingResponse(
         events(),
@@ -1572,7 +1582,7 @@ async def responses_endpoint(request: Request):
                         )
                         metrics_finalized = True
                     logger.exception("Responses stream generation failed: %s", e)
-                    yield _response_stream_error(e)
+                    yield _response_stream_error(e, base_response)
 
                 finally:
                     if token_iter is not None:

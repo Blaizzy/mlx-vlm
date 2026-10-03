@@ -2851,9 +2851,15 @@ class TestCompaction:
             "response.created",
             "response.in_progress",
             "mlx.compaction.started",
-            "error",
+            "response.failed",
         ]
-        assert events[-1]["error"]["code"] == code
+        failed = events[-1]["response"]
+        assert failed["id"] == events[0]["response"]["id"]
+        assert failed["status"] == "failed" and not failed["output"]
+        assert failed["error"]["code"] == (
+            "invalid_prompt" if code == 400 else "server_error"
+        )
+        assert "Compaction" in failed["error"]["message"]
         assert not server.response_store
         mocked.stream.assert_not_called()
 
@@ -2951,9 +2957,9 @@ class TestCompaction:
         assert [event["type"] for event in events] == [
             "response.created",
             "response.in_progress",
-            "error",
+            "response.failed",
         ]
-        assert events[-1]["error"]["code"] == 400
+        assert events[-1]["response"]["error"]["code"] == "invalid_prompt"
         mocked.generate.assert_not_called()
         mocked.stream.assert_not_called()
 

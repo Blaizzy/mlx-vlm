@@ -131,9 +131,10 @@ rendered conversation before and after compaction, not cache hits or summary usa
 Clients may ignore these additional events; ordinary Responses output is unchanged.
 Keep the capsule from the accepted final response, not from a progress event.
 
-Once the stream is open, failures are terminal `error` SSE events with
-`error.message` and `error.code` (the corresponding HTTP status code); they do not
-produce a successful final response. Clear the indicator on error or disconnect.
+Once the stream is open, failures are terminal `response.failed` SSE events with
+`response.error.message` and a string `response.error.code` (`invalid_prompt`,
+`rate_limit_exceeded`, or `server_error`). They do not produce a successful final
+response. Clear the indicator on failure or disconnect.
 Disconnecting cancels the queued summary worker. Non-streaming compaction still
 reports failures through HTTP status codes.
 
