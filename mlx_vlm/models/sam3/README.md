@@ -4,6 +4,15 @@ MLX port of [Meta's SAM3](https://github.com/facebookresearch/sam3) — an open-
 
 > **Note:** SAM3 is not a generative VLM. It outputs bounding boxes and segmentation masks, not text. It uses a custom inference pipeline (`generate.py`) instead of `mlx_vlm.generate()`.
 
+> **Tokenizer:** text prompts are tokenized with CLIP, so the checkpoint must ship
+> `tokenizer.json` (or `vocab.json` and `merges.txt`). The processor reads them from
+> the checkpoint and raises if they are missing rather than fetching a vocabulary
+> from elsewhere, which would not be guaranteed to match the converted weights.
+> Published MLX conversions of SAM 3 omit these files; copy them from the source
+> checkpoint alongside the weights. For SAM 3.1,
+> [`nativ-community/sam3.1-bf16`](https://huggingface.co/nativ-community/sam3.1-bf16)
+> already includes them.
+
 ## Quick Start
 
 ```python

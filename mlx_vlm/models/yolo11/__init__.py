@@ -1,10 +1,11 @@
 """YOLO11 object detection model for OmniParser's icon_detect module."""
 
+from . import processing_yolo11  # noqa: F401
+from .config import ModelConfig
 from .inference import (
     DEFAULT_MODEL_ID,
     DetectionResult,
     draw_detections,
-    load_detector,
     predict,
     prepare_image,
 )
@@ -19,15 +20,17 @@ from .yolo11 import (
     C3k2,
     Conv,
     Detect,
+    Model,
     PSABlock,
     box_iou,
-    load_weights,
     non_max_suppression,
     xywh2xyxy,
 )
 
 __all__ = [
     "DEFAULT_MODEL_ID",
+    "Model",
+    "ModelConfig",
     "DetectionResult",
     "Attention",
     "Bottleneck",
@@ -42,8 +45,6 @@ __all__ = [
     "YOLO11",
     "box_iou",
     "draw_detections",
-    "load_detector",
-    "load_weights",
     "non_max_suppression",
     "predict",
     "prepare_image",

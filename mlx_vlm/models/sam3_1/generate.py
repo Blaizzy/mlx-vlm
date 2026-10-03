@@ -18,6 +18,7 @@ from ..sam3.generate import (
     Sam3Predictor,
     SimpleTracker,
     _filter_by_regions,
+    _get_backbone_features,
     _resize_masks,
     draw_frame,
     nms,
@@ -150,13 +151,6 @@ def predict_multi(
         scores=np.concatenate(all_scores),
         labels=all_labels,
     )
-
-
-def _get_backbone_features(model, pixel_values: mx.array) -> mx.array:
-    """Run ViT backbone only (no FPN neck)."""
-    features = model.detector_model.vision_encoder.backbone(pixel_values)
-    mx.eval(features)
-    return features
 
 
 def _get_det_features(model, backbone_features: mx.array):

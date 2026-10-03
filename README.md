@@ -7,6 +7,7 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
 - [Installation](#installation)
 - [Usage](#usage)
   - [Command Line Interface (CLI)](#command-line-interface-cli)
+    - [Extraction Models](#extraction-models)
     - [Thinking Budget](#thinking-budget)
   - [Speculative Decoding](#speculative-decoding)
     - [DFlash, DFlash2, and DSpark](#dflash-dflash2-and-dspark)
@@ -143,6 +144,45 @@ mlx_vlm.generate --model mlx-community/gemma-3n-E2B-it-4bit --max-tokens 100 --p
 # Speech generation
 mlx_vlm.generate --model openbmb/MiniCPM-o-4_5 --output-modality audio --prompt "Say hello." --ref-audio /path/to/voice.wav --output speech.wav --max-tokens 256
 ```
+
+#### Extraction Models
+
+Depth, geometry, detection, segmentation and pose models answer in arrays
+rather than tokens, so they share one entry point:
+
+```sh
+# what a checkpoint can predict
+mlx_vlm.extract --model mlx-community/moge-3-vitl-mlx-fp32 --list-tasks
+
+# geometry from one image, arrays written to a .npz
+mlx_vlm.extract --model mlx-community/moge-3-vitl-mlx-fp32 --image photo.jpg --output geometry.npz
+
+# video depth, from a file or from repeated frames
+mlx_vlm.extract --model mlx-community/Video-Depth-Anything-Small-MLX --video clip.mp4
+mlx_vlm.extract --model mlx-community/Video-Depth-Anything-Small-MLX --image f0.png --image f1.png
+
+# detect by concept, and pass a model's own options
+mlx_vlm.extract --model <sam3-path> --image street.jpg --prompt "a person" --set score_threshold=0.4
+
+# conditioning inputs that are too large to write inline
+mlx_vlm.extract --model <sam3d-objects-path> --image mug.png --set-file mask=mug_mask.png
+```
+
+The command prints a JSON manifest of the named outputs with their shapes
+and dtypes, and `--output` writes the array-valued ones to a `.npz`.
+
+From Python:
+
+```python
+from mlx_vlm import load
+from mlx_vlm.extraction import extract
+
+model, processor = load("mlx-community/moge-3-vitl-mlx-fp32")
+outputs = extract(model, processor, image)   # {"points": ..., "depth": ..., "mask": ...}
+```
+
+A model declares the tasks it serves as `extraction_types` and implements
+`extract`; see CONTRIBUTING.md to add one.
 
 #### Thinking Budget
 

@@ -258,6 +258,10 @@ _HF_BLOCK_KEY = re.compile(r"encoder\.layer\.(\d+)\.(.+)")
 _HF_QKV_KEY = re.compile(r"attention\.attention\.(query|key|value)\.(weight|bias)")
 
 
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
 class Model(DINOv2):
     """Standalone DINOv2 image encoder.
 
@@ -312,6 +316,21 @@ class Model(DINOv2):
                 [parts["query"], parts["key"], parts["value"]], axis=0
             )
         return out
+
+    extraction_types = ("backbone",)
+
+    def extract(self, processor, inputs, task=None, **kwargs):
+        """Encode one image into patch tokens and a pooled embedding."""
+        pixels = mx.array(inputs)
+        if pixels.ndim == 3:
+            pixels = pixels[None]
+        pixels = pixels.astype(mx.float32)
+        if pixels.max() > 1.0:
+            pixels = pixels / 255.0
+        size = self.config.image_size
+        pixels = resize_bicubic_nhwc(pixels, (size, size))
+        pixels = (pixels - mx.array(IMAGENET_MEAN)) / mx.array(IMAGENET_STD)
+        return self(pixels, **kwargs)
 
 
 class DINOv2Encoder(nn.Module):
