@@ -82,6 +82,9 @@ class MageFlowPipeline:
             self.model_path,
             max_length=self.runtime_config.max_sequence_length,
         )
+        self.component_quantization: dict[str, dict] = {}
+        if config := getattr(self.text_encoder.model, "quantization_config", None):
+            self.component_quantization["text_encoder"] = dict(config)
         self.tokenizer = self.text_encoder.tokenizer
         self.transformer = None
         self.vae = None
@@ -129,12 +132,24 @@ class MageFlowPipeline:
         formatted = (EDIT_TEMPLATE if edit else GENERATION_TEMPLATE).format(prompt)
         return len(self.tokenizer(formatted, truncation=False)["input_ids"])
 
+    @property
+    def quantization_config(self) -> dict[str, dict] | None:
+        components = dict(self.component_quantization)
+        for name in ("transformer", "vae"):
+            component = getattr(self, name)
+            config = getattr(component, "quantization_config", None)
+            if config:
+                components[name] = dict(config)
+        return components or None
+
     def _ensure_text_encoder(self):
         if self.text_encoder is None:
             self.text_encoder = load_text_encoder(
                 self.model_path,
                 max_length=self.runtime_config.max_sequence_length,
             )
+            if config := getattr(self.text_encoder.model, "quantization_config", None):
+                self.component_quantization["text_encoder"] = dict(config)
         return self.text_encoder
 
     def _evict_text_encoder(self) -> None:
@@ -195,10 +210,14 @@ class MageFlowPipeline:
     def _ensure_components(self, *, require_encoder: bool) -> None:
         if self.transformer is None:
             self.transformer = load_transformer(self.model_path)
+            if config := getattr(self.transformer, "quantization_config", None):
+                self.component_quantization["transformer"] = dict(config)
         if self.vae is None or (
             require_encoder and getattr(self.vae, "dconv_encoder", None) is None
         ):
             self.vae = load_vae(self.model_path, include_encoder=require_encoder)
+            if config := getattr(self.vae, "quantization_config", None):
+                self.component_quantization["vae"] = dict(config)
 
     def _predict(
         self,

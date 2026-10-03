@@ -159,8 +159,9 @@ class Granite(nn.Module):
                 h, cache[0] if cache and cache[0] is not None else cache
             )
 
+        prefill_offset = cache[0].offset if cache and cache[0] is not None else 0
+
         for layer_idx, (layer, c) in enumerate(zip(self.layers, cache)):
-            # Inject deepstack features at target layers
             if (
                 deepstack_visual_embeds is not None
                 and deepstack_target_layers is not None
@@ -168,13 +169,14 @@ class Granite(nn.Module):
             ):
                 for feat_idx, target_layer in enumerate(deepstack_target_layers):
                     if layer_idx == target_layer:
-                        features = deepstack_visual_embeds[feat_idx]
-                        # Add features at image positions
-                        h = mx.where(
-                            visual_pos_masks[..., None],
-                            h + features,
-                            h,
-                        )
+                        seq_len = h.shape[1]
+                        pos_mask = visual_pos_masks[
+                            ..., prefill_offset : prefill_offset + seq_len
+                        ]
+                        features = deepstack_visual_embeds[feat_idx][
+                            prefill_offset : prefill_offset + seq_len
+                        ]
+                        h = mx.where(pos_mask[..., None], h + features, h)
 
             h = layer(h, mask, c)
 

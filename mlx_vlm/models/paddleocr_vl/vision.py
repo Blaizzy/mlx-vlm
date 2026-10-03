@@ -4,6 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..interpolate import bilinear_interpolate
+from ..rope_utils import rotate_half
 from .config import VisionConfig
 
 
@@ -18,13 +19,6 @@ def check_array_shape(arr):
         return True
     else:
         return False
-
-
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return mx.concatenate([-x2, x1], axis=-1)
 
 
 def apply_rotary_pos_emb_vision(tensor, freqs) -> mx.array:
@@ -392,7 +386,7 @@ class VisionModel(nn.Module):
         cu_seqlens = []
         for i in range(grid_thw.shape[0]):
             seq_len = grid_thw[i, 1] * grid_thw[i, 2]
-            cu_seqlens.append(mx.repeat(seq_len, grid_thw[i, 0]))
+            cu_seqlens.append(mx.repeat(seq_len, int(grid_thw[i, 0])))
 
         cu_seqlens = mx.concatenate(cu_seqlens)
         cu_seqlens = mx.cumsum(cu_seqlens.astype(mx.int32), axis=0)

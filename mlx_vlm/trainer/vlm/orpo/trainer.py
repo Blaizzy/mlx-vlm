@@ -11,13 +11,13 @@ from mlx.nn.utils import average_gradients
 from mlx.utils import tree_map
 from tqdm import tqdm
 
-from ..sft.trainer import (
+from ...core import Colors, grad_checkpoint, save_adapter
+from ..cross_entropy.trainer import (
     TrainingArgs,
     _collate_arrays,
     _resolve_adapter_file,
     _squeeze_leading_batch_dim,
 )
-from ...core import Colors, grad_checkpoint, save_adapter
 
 
 @dataclass

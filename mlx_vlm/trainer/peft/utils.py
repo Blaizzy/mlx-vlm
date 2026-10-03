@@ -1,17 +1,9 @@
 import json
 from pathlib import Path
-from typing import Union
 
-import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten
 
-from ..core import (
-    get_module_by_name,
-    print_trainable_parameters,
-    save_adapter,
-    set_module_by_name,
-)
+from ..core import get_module_by_name, print_trainable_parameters, set_module_by_name
 from .lora import LoRaLayer
 
 DEFAULT_LORA_NUM_LAYERS = -1
@@ -230,6 +222,10 @@ def apply_lora_layers(model: nn.Module, adapter_path: str) -> nn.Module:
         config = json.load(f)
         if "rank" not in config and "lora_parameters" not in config:
             raise ValueError("The adapter does not have lora params in the config")
+
+    # Freeze the base before attaching adapters so resuming matches a fresh
+    # start.
+    freeze_model(model)
 
     if "lora_parameters" in config:
         model = _apply_lora_layers(model, config)

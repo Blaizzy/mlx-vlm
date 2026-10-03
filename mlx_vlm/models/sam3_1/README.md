@@ -182,11 +182,44 @@ mlx_vlm/models/sam3_1/
 ├── config.py             # Configs (extends SAM 3 with multiplex_count, 3 scales)
 ├── vision.py             # TriViTDetNeck (imports ViT backbone from sam3)
 ├── sam_components.py     # MultiplexMaskDecoder, DecoupledMemoryAttention, SimpleRoPEAttention
-├── tracker.py            # MultiplexTrackerModel (dual decoder, multiplex embeddings)
+├── multiplex.py          # MultiplexState/Controller (bucket mux/demux) + MultiplexTrackerState
+├── tracker.py            # MultiplexTrackerModel — full video_tracking_multiplex port
 ├── sam3_1.py             # Main Model + sanitize
 ├── processing_sam3_1.py  # Processor (same as SAM 3)
 ├── generate.py           # Inference pipeline (optimized realtime with backbone caching + tracker)
 └── convert_weights.py    # Meta .pt → MLX safetensors converter
+```
+
+## Video Tracking (multiplex)
+
+`tracker.py` ports Meta's `video_tracking_multiplex.py` to MLX (inference):
+
+- **Mask-as-output init** — detection masks on a conditioning frame become the
+  output directly; the interactive decoder only produces object pointers
+- **Memory-conditioned propagation** — the decoupled memory attention reads
+  spatial mask memories, per-frame image features, and object pointer tokens
+  (with temporal pos enc) from up to 7 past frames + 4 conditioning frames
+- **Multiplex batching** — up to 16 objects per bucket share one decoder pass;
+  `MultiplexState` converts between per-object (data) and bucket (mux) space
+- **Interactive refinement** — point/mask prompts on any frame via the
+  interactive SAM head (propagation-and-interaction merge)
+- **Dynamic objects** — `add_new_masks_to_existing_state` /
+  `recondition_masks_in_existing_state` add or re-condition objects mid-video
+
+```python
+from mlx_vlm.utils import load_model, get_model_path
+from mlx_vlm.models.sam3_1.processing_sam3_1 import Sam31Processor
+
+model = load_model(get_model_path("mlx-community/sam3.1-bf16"))
+processor = Sam31Processor.from_pretrained(...)
+
+# Initialize a session from detection masks on frame 0
+state, out = model.track_init(backbone_features, detection_masks)  # (N, H, W)
+
+# Propagate all objects to the next frame
+out = model.track_step(state, backbone_features_t, frame_idx=1)
+masks = out["pred_masks_high_res"]  # (N, 1, 1008, 1008) logits
+scores = out["object_score_logits"]  # (N, 1)
 ```
 
 ### Code Reuse from SAM 3
