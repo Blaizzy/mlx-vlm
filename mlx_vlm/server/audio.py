@@ -24,6 +24,7 @@ from fastapi.responses import (
 )
 from mlx_audio.audio_io import read as audio_read
 from mlx_audio.audio_io import write as audio_write
+from mlx_audio.stt.streaming import supports_realtime_transcription
 from pydantic import Field
 
 from .._stream_cleanup import clear_mlx_streams
@@ -253,6 +254,17 @@ def register_routes(app, deps):
         response_model=None,
         include_in_schema=False,
     )(audio_translations_endpoint)
+    app.get("/models/capabilities")(audio_model_capabilities_endpoint)
+    app.get("/v1/models/capabilities", include_in_schema=False)(
+        audio_model_capabilities_endpoint
+    )
+
+
+def audio_model_capabilities_endpoint(model_name: str):
+    model, _, _ = get_cached_model(model_name, model_kind="audio_stt")
+    return {
+        "realtime_transcription": supports_realtime_transcription(model),
+    }
 
 
 async def audio_speech_endpoint(payload: AudioSpeechRequest, request: Request):

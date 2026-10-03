@@ -5047,6 +5047,25 @@ def _upload(client, endpoint="transcriptions", **options):
     )
 
 
+@pytest.mark.parametrize("supported", [True, False])
+def test_audio_model_realtime_transcription_capability(
+    audio_client, monkeypatch, supported
+):
+    model = NS()
+    if supported:
+        model.create_streaming_session = Mock()
+    loader = Mock(return_value=(model, None, NS(model_type="audio")))
+    monkeypatch.setattr(server, "get_cached_model", loader)
+
+    response = audio_client.get(
+        "/v1/models/capabilities", params={"model_name": "test/model"}
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"realtime_transcription": supported}
+    loader.assert_called_once_with("test/model", model_kind="audio_stt")
+
+
 def test_audio_speech_returns_audio_bytes(audio_client, monkeypatch):
     fake_model, loader = _audio_backend(monkeypatch)
 
