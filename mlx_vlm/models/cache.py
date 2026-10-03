@@ -10,7 +10,7 @@ from mlx.utils import tree_map, tree_reduce
 def should_quantize_kv_layer(layer_idx: int, num_layers: int) -> bool:
     """Whether layer ``layer_idx`` should use a quantized KV cache.
 
-    Live batch generation (``_make_cache``), stream quantize, and APC warm
+    Live batch generation (``make_cache``), stream quantize, and APC warm
     restore must share this policy so continuous-batching ``extend`` always
     joins same-typed peers.
 

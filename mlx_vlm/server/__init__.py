@@ -73,7 +73,6 @@ from .generation import (
     _check_configured_context_budget,
     _count_prompt_tokens,
     _get_draft_block_size_from_env,
-    _make_cache,
     get_configured_context_limit,
     get_kv_group_size,
     get_kv_quant_scheme,
@@ -93,6 +92,7 @@ from .generation import (
     get_token_queue_timeout,
     get_top_logprobs_k,
     load_model_resources,
+    make_cache,
     make_streaming_detokenizer,
 )
 from .openai import (

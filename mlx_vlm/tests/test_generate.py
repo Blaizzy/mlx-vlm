@@ -1534,9 +1534,9 @@ def test_apc_pick_rejects_image_tokens_and_releases_blocks():
 
 class TestBatchTurboQuantizedKVStart:
     def _cache_kinds(self, **kwargs):
-        from mlx_vlm.generate.ar import _make_cache
+        from mlx_vlm.generate.ar import make_cache
 
-        caches = _make_cache(
+        caches = make_cache(
             MockModel(), [0], kv_bits=3.5, kv_quant_scheme="turboquant", **kwargs
         )
         return [type(c).__name__ for c in caches]

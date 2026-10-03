@@ -28,7 +28,7 @@ from ..generate import (  # noqa: F401 - compatibility re-exported by server.__i
     DEFAULT_THINKING_START_TOKEN,
     DEFAULT_TOP_P,
     BatchGenerator,
-    _make_cache,
+    make_cache,
 )
 from ..generate.diffusion import (
     is_diffusion_model,
