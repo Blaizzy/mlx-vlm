@@ -118,6 +118,7 @@ class KlearSparseMoeBlock(nn.Module):
         indices = mx.argpartition(-biased_weights, kth=self.top_k - 1, axis=-1)[
             ..., : self.top_k
         ]
+        indices = mx.stop_gradient(indices)
         scores = mx.take_along_axis(routing_weights, indices, axis=-1)
         if self.norm_topk_prob:
             scores = scores / mx.sum(scores, axis=-1, keepdims=True)

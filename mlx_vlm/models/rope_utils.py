@@ -1,5 +1,6 @@
 import math
 from functools import lru_cache
+from itertools import accumulate
 from typing import List, Optional, Sequence, Union
 
 import mlx.core as mx
@@ -505,7 +506,7 @@ def initialize_rope(
 
 
 def _cumulative_splits(lengths: Sequence[int]):
-    return mx.cumsum(mx.array(lengths, dtype=mx.int32))[:-1]
+    return list(accumulate(lengths))[:-1]
 
 
 def _interleaved_position_selector(mrope_section: Sequence[int], freq_dim: int):

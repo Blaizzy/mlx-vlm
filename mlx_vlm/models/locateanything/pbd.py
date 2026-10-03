@@ -88,6 +88,7 @@ def decode_bbox_avg(
 
     sub = probs[1:5]
     order = mx.argsort(-sub, axis=-1)[:, :keep_k]
+    order = mx.stop_gradient(order)
     pos_ids = mx.take_along_axis(
         mx.broadcast_to(mx.arange(sub.shape[-1])[None], (4, sub.shape[-1])),
         order,

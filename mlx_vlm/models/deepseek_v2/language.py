@@ -246,6 +246,7 @@ class MoEGate(nn.Module):
 
         k = self.top_k
         inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+        inds = mx.stop_gradient(inds)
         scores = mx.take_along_axis(scores, inds, axis=-1)
         scores = scores * self.routed_scaling_factor
 

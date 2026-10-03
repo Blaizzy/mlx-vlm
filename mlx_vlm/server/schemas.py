@@ -14,15 +14,26 @@ from ..generate import (
     DEFAULT_TOP_P,
     normalize_resize_shape,
 )
-from ..generate.image import (
-    DEFAULT_IMAGE_GUIDANCE,
-    DEFAULT_IMAGE_SIZE,
-    DEFAULT_IMAGE_STEPS,
-)
+from ..generate.image import DEFAULT_IMAGE_SIZE
 
 
 def get_server_max_tokens():
     return int(os.environ.get("MLX_VLM_MAX_TOKENS", DEFAULT_MAX_TOKENS))
+
+
+_TOOL_PARSER_DESC = (
+    "Force a specific tool-call parser by name, bypassing chat-template inference."
+)
+
+
+def _check_tool_parser(cls, value: Optional[str]) -> Optional[str]:
+    """Reject an unknown ``tool_parser`` override, naming the known parsers."""
+    from ..tools import SPECS
+
+    if value is not None and value not in {spec.name for spec in SPECS}:
+        known = ", ".join(sorted(spec.name for spec in SPECS))
+        raise ValueError(f"unknown tool_parser {value!r}; known parsers: {known}")
+    return value
 
 
 class FlexibleBaseModel(BaseModel):
@@ -47,18 +58,18 @@ class ImageGenerationRequest(FlexibleBaseModel):
     )
     width: Optional[int] = Field(None, description="Generated image width.")
     height: Optional[int] = Field(None, description="Generated image height.")
-    steps: int = Field(
-        DEFAULT_IMAGE_STEPS,
+    steps: Optional[int] = Field(
+        None,
         ge=1,
-        description="Number of image generation inference steps.",
+        description="Number of image generation inference steps; model default if omitted.",
     )
     seed: Optional[int] = Field(
         None,
         description="Base seed. Multiple outputs use (seed + i) values.",
     )
-    guidance: float = Field(
-        DEFAULT_IMAGE_GUIDANCE,
-        description="Classifier-free guidance scale.",
+    guidance: Optional[float] = Field(
+        None,
+        description="Classifier-free guidance scale; model default if omitted.",
     )
     auto_json_caption: Optional[bool] = Field(
         None,
@@ -121,18 +132,30 @@ class ImageEditRequest(FlexibleBaseModel):
     )
     width: Optional[int] = Field(None, description="Edited image width.")
     height: Optional[int] = Field(None, description="Edited image height.")
-    steps: int = Field(
-        DEFAULT_IMAGE_STEPS,
+    steps: Optional[int] = Field(
+        None,
         ge=1,
-        description="Number of image edit inference steps.",
+        description="Number of image edit inference steps; model default if omitted.",
     )
     seed: Optional[int] = Field(
         None,
         description="Base seed. Multiple outputs use (seed + i) values.",
     )
-    guidance: float = Field(
-        DEFAULT_IMAGE_GUIDANCE,
-        description="Classifier-free guidance scale.",
+    guidance: Optional[float] = Field(
+        None,
+        description="Classifier-free guidance scale; model default if omitted.",
+    )
+    negative_prompt: Optional[str] = Field(
+        None, description="Negative conditioning prompt; model default if omitted."
+    )
+    output_resolution: Optional[int] = Field(
+        None,
+        ge=256,
+        description="Reference image resolution and default output area scale.",
+    )
+    use_kv_cache: Optional[bool] = Field(
+        None,
+        description="Reuse fixed conditioning keys/values when supported by the model.",
     )
     response_format: Literal["b64_json", "path"] = Field(
         "b64_json",
@@ -313,6 +336,11 @@ class ChatMessage(FlexibleBaseModel):
         return self
 
 
+class CompactionControl(BaseModel):
+    type: Literal["compaction"]
+    compact_threshold: int = Field(..., gt=0)
+
+
 class OpenAIRequest(FlexibleBaseModel):
     """
     OpenAI-compatible request structure.
@@ -398,9 +426,18 @@ class OpenAIRequest(FlexibleBaseModel):
         None, description="Responses API tool definitions."
     )
     tool_choice: Optional[Any] = Field(None, description="Tool choice policy.")
+    tool_parser: Optional[str] = Field(None, description=_TOOL_PARSER_DESC)
+    _validate_tool_parser = field_validator("tool_parser")(_check_tool_parser)
     store: Optional[bool] = Field(
         True, description="Whether to store this response for later retrieval."
     )
+    context_management: Optional[List[CompactionControl]] = Field(None, max_length=1)
+
+
+class CompactRequest(OpenAIRequest):
+    stream: Literal[False] = False
+    max_output_tokens: int = Field(1024, gt=0, le=16384)
+    keep_tokens: Optional[int] = Field(None, ge=0)
 
 
 class PromptTokensDetails(BaseModel):
@@ -854,6 +891,8 @@ class ChatRequest(GenerationRequest):
             "Controls tool use: none, auto, required, or a specific function."
         ),
     )
+    tool_parser: Optional[str] = Field(None, description=_TOOL_PARSER_DESC)
+    _validate_tool_parser = field_validator("tool_parser")(_check_tool_parser)
 
 
 class TopLogprob(BaseModel):
@@ -932,6 +971,8 @@ class AnthropicRequest(FlexibleBaseModel):
     stop_sequences: Optional[List[str]] = None
     tools: Optional[List[Any]] = None
     tool_choice: Optional[Any] = None
+    tool_parser: Optional[str] = Field(None, description=_TOOL_PARSER_DESC)
+    _validate_tool_parser = field_validator("tool_parser")(_check_tool_parser)
     metadata: Optional[Any] = None
     thinking: Optional[Any] = None
     output_config: Optional[Any] = None
@@ -1005,6 +1046,9 @@ class ModelInfo(BaseModel):
     id: str
     object: str
     created: int
+    loaded: bool = Field(
+        default=False, description="Whether the model is loaded in this server process."
+    )
 
 
 class ModelsResponse(BaseModel):

@@ -21,6 +21,7 @@ def mlx_topk(a, k, axis=-1):
     """MLX equivalent of torch.topk"""
     partitioned_indices = mx.argpartition(a, kth=-k, axis=axis)
     top_k_indices = partitioned_indices[..., -k:]
+    top_k_indices = mx.stop_gradient(top_k_indices)
     top_k_values = mx.take_along_axis(a, top_k_indices, axis=axis)
     return top_k_values, top_k_indices
 

@@ -4,7 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..attention import VisionAttention as Attention
-from ..kernels import bicubic_interpolate
+from ..interpolate import resize_bilinear_nhwc
 from ..mlp import GELUMLP as MLP
 from .config import VisionConfig
 
@@ -38,16 +38,15 @@ class Encoder(nn.Module):
         output_hidden_states: Optional[bool] = None,
         mask: Optional[mx.array] = None,
     ) -> mx.array:
-        encoder_states = (x,) if output_hidden_states else None
-        h = x
+        encoder_states = (x,) if output_hidden_states else ()
         for l in self.layers:
             x = l(x, mask=mask)
             if output_hidden_states:
                 encoder_states = encoder_states + (x,)
 
-            h = x
-
-        return encoder_states
+        # Callers index ``[-1]`` for the final hidden state, so always return a
+        # non-empty tuple even when the intermediate states were not requested.
+        return encoder_states if output_hidden_states else (x,)
 
 
 class VisionEmbeddings(nn.Module):
@@ -82,20 +81,24 @@ class VisionEmbeddings(nn.Module):
             dtype=source_dtype,
         )
 
-        # (height, width, embed_dim) -> (1, embed_dim, height, width) for interpolation
-        positional_embeddings = positional_embeddings.transpose(2, 0, 1)[None, :]
+        # (height, width, embed_dim) -> (1, height, width, embed_dim) for interpolation.
+        # Siglip2 resizes with bilinear + antialias, so mirror that exactly;
+        # bicubic here would shift every position embedding by several percent.
+        positional_embeddings = positional_embeddings[None].astype(mx.float32)
         for i in range(batch_size):
 
             height, width = spatial_shapes[i].tolist()
 
-            resized_embeddings = bicubic_interpolate(
+            resized_embeddings = resize_bilinear_nhwc(
                 positional_embeddings,
-                size=(height, width),
+                (height, width),
+                align_corners=False,
+                antialias=True,
             )
 
             resized_embeddings = resized_embeddings.reshape(
-                embed_dim, height * width
-            ).transpose(1, 0)
+                height * width, embed_dim
+            ).astype(source_dtype)
 
             resulted_positional_embeddings[i, : height * width] = resized_embeddings
             resulted_positional_embeddings[i, height * width :] = resized_embeddings[0]
@@ -129,18 +132,34 @@ class VisionModel(nn.Module):
 
         self.embeddings = VisionEmbeddings(config)
         self.encoder = Encoder(config)
-        self.post_layernorm = nn.LayerNorm(config.hidden_size)
+        self.post_layernorm = nn.LayerNorm(
+            config.hidden_size, eps=config.layer_norm_eps
+        )
 
     def __call__(
         self,
         x: mx.array,
         output_hidden_states: Optional[bool] = None,
         spatial_shapes: Optional[mx.array] = None,
+        pixel_attention_mask: Optional[mx.array] = None,
     ) -> mx.array:
         x = self.embeddings(x, spatial_shapes=spatial_shapes)
         x = x.astype(self.embeddings.patch_embedding.weight.dtype)
+
+        # Rows past the image's patch count are padding. Siglip2 turns
+        # pixel_attention_mask into a bidirectional attention mask so real
+        # patches never attend to them; without it the padded rows leak into
+        # every valid patch's attention.
+        mask = None
+        if pixel_attention_mask is not None:
+            mask = mx.where(
+                pixel_attention_mask[:, None, None, :].astype(mx.bool_),
+                mx.array(0.0),
+                mx.array(-mx.inf),
+            ).astype(x.dtype)
+
         encoder_outputs = self.encoder(
-            x=x, output_hidden_states=output_hidden_states, mask=None
+            x=x, output_hidden_states=output_hidden_states, mask=mask
         )
         last_hidden_state = self.post_layernorm(encoder_outputs[-1])
         return encoder_outputs, x, last_hidden_state

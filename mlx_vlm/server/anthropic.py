@@ -8,12 +8,17 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..generate import generate, stream_generate
 from ..prompt_utils import apply_chat_template
-from ..tool_parsers import _infer_tool_parser_from_processor, load_tool_module
+from ..tools import (
+    _infer_tool_parser_from_processor,
+    _prepare_chat_tool_choice,
+    load_tool_module,
+    process_tool_calls,
+)
 from ..utils import prepare_inputs
 from .generation import (
     GenerationMetrics,
@@ -22,10 +27,11 @@ from .generation import (
     _count_prompt_tokens,
 )
 from .responses_state import (
+    ToolCallStreamState,
+    finish_content_streams,
     make_response_stream_state,
-    process_tool_calls,
     prompt_has_open_thinking,
-    suppress_tool_call_content,
+    strip_protocol_markers,
 )
 from .runtime import runtime
 from .schemas import AnthropicMessageResponse, AnthropicRequest, AnthropicUsage
@@ -115,13 +121,18 @@ def _normalize_anthropic_system_messages(body: Any) -> Any:
     normalized_messages = []
     system_parts = []
     saw_system_message = False
+    saw_conversation = False
     for message in messages:
         if isinstance(message, dict) and message.get("role") == "system":
             saw_system_message = True
-            text = _anthropic_system_text(message.get("content"))
-            if text:
-                system_parts.append(text)
-            continue
+            if not saw_conversation:
+                text = _anthropic_system_text(message.get("content"))
+                if text:
+                    system_parts.append(text)
+                continue
+            message = {**message, "role": "user"}
+        else:
+            saw_conversation = True
         normalized_messages.append(message)
 
     if not saw_system_message:
@@ -293,29 +304,34 @@ def _anthropic_content_blocks_to_text_and_tools(
     role: str,
     content: Union[str, List[Any]],
     images: List[str],
-) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
+) -> Tuple[
+    Union[str, List[Dict[str, Any]]], List[Dict[str, Any]], List[Dict[str, Any]]
+]:
     if isinstance(content, str):
         return content, [], []
 
-    text_parts: List[str] = []
+    content_parts: List[Dict[str, Any]] = []
+    content_images: List[str] = []
+    tool_images: List[str] = []
     tool_calls: List[Dict[str, Any]] = []
     tool_results: List[Dict[str, Any]] = []
     for raw_item in content or []:
         item = _as_plain_dict(raw_item)
         if not isinstance(item, dict):
             if item is not None:
-                text_parts.append(str(item))
+                content_parts.append({"type": "text", "text": str(item)})
             continue
 
         item_type = item.get("type")
         if item_type == "text":
             text = item.get("text")
             if text:
-                text_parts.append(str(text))
+                content_parts.append({"type": "text", "text": str(text)})
         elif item_type == "image" and role == "user":
             image_ref = _anthropic_image_source_to_ref(item.get("source"))
             if image_ref:
-                images.append(image_ref)
+                content_images.append(image_ref)
+                content_parts.append({"type": "image"})
         elif item_type == "tool_use" and role == "assistant":
             tool_calls.append(_anthropic_tool_use_to_openai(item))
         elif item_type == "tool_result" and role == "user":
@@ -324,7 +340,7 @@ def _anthropic_content_blocks_to_text_and_tools(
                     "role": "tool",
                     "tool_call_id": item.get("tool_use_id"),
                     "content": _anthropic_tool_result_content_to_openai(
-                        item.get("content"), images
+                        item.get("content"), tool_images
                     ),
                     "name": item.get("name"),
                 }
@@ -332,9 +348,18 @@ def _anthropic_content_blocks_to_text_and_tools(
         elif item_type in ("thinking", "redacted_thinking"):
             continue
         elif item.get("text"):
-            text_parts.append(str(item["text"]))
+            content_parts.append({"type": "text", "text": str(item["text"])})
 
-    return "\n".join(text_parts).strip(), tool_calls, tool_results
+    # The caller emits the ordinary message before its tool results; keep the
+    # image payloads in that same order, including interleaved tool_result blocks.
+    images.extend(content_images)
+    images.extend(tool_images)
+    content = (
+        content_parts
+        if content_images
+        else "\n".join(part["text"] for part in content_parts).strip()
+    )
+    return content, tool_calls, tool_results
 
 
 def _anthropic_messages_to_internal(
@@ -350,22 +375,25 @@ def _anthropic_messages_to_internal(
         processed_messages.append({"role": "system", "content": system_text})
 
     for message in request.messages:
-        content_text, tool_calls, tool_results = (
-            _anthropic_content_blocks_to_text_and_tools(
-                message.role, message.content, images
-            )
+        content, tool_calls, tool_results = _anthropic_content_blocks_to_text_and_tools(
+            message.role, message.content, images
         )
-        if content_text or tool_calls or not tool_results:
-            msg: Dict[str, Any] = {"role": message.role, "content": content_text}
+        if content or tool_calls or not tool_results:
+            msg: Dict[str, Any] = {"role": message.role, "content": content}
             if tool_calls:
                 msg["tool_calls"] = tool_calls
-                if not content_text:
-                    msg["content"] = None
+                if not content:
+                    msg["content"] = ""
             processed_messages.append(msg)
         processed_messages.extend(tool_results)
 
     tools = _anthropic_tools_to_openai(request.tools)
     tool_choice = _anthropic_tool_choice_to_openai(request.tool_choice)
+    # Passing tool_choice through as a template kwarg only constrains the models
+    # whose chat template reads it, so enforce it the way /v1/chat/completions does.
+    processed_messages, tools, tool_choice = _prepare_chat_tool_choice(
+        processed_messages, tools, tool_choice
+    )
     return processed_messages, images, tools, tool_choice
 
 
@@ -469,10 +497,15 @@ async def anthropic_messages_endpoint(http_request: Request):
         )
         model, processor, config = get_cached_model(request.model, adapter_path)
 
-        processed_messages, images, tools, tool_choice = (
-            _anthropic_messages_to_internal(request)
+        try:
+            processed_messages, images, tools, tool_choice = (
+                _anthropic_messages_to_internal(request)
+            )
+        except HTTPException as e:
+            return _anthropic_error_response(e.status_code, str(e.detail))
+        tool_parser_type = _infer_tool_parser_from_processor(
+            processor, override=request.tool_parser
         )
-        tool_parser_type = _infer_tool_parser_from_processor(processor)
         tool_module = load_tool_module(tool_parser_type) if tool_parser_type else None
 
         try:
@@ -547,8 +580,11 @@ async def anthropic_messages_endpoint(http_request: Request):
                     gen_args.thinking_start_token,
                     gen_args.thinking_end_token,
                 )
-                in_tool_call = False
-                tc_start = tool_module.tool_call_start if tool_module else None
+                tc_start = (
+                    tool_module.tool_call_start if tool_module and tools else None
+                )
+                tc_end = tool_module.tool_call_end if tool_module and tools else None
+                tool_call_state = ToolCallStreamState(tc_start, tc_end)
                 message_started = False
 
                 def close_open_block():
@@ -674,8 +710,9 @@ async def anthropic_messages_endpoint(http_request: Request):
                         delta_reasoning = thinking_delta.reasoning
                         delta_content = thinking_delta.content
 
-                        in_tool_call, delta_content = suppress_tool_call_content(
-                            full_output, in_tool_call, tc_start, delta_content
+                        delta_content = tool_call_state.feed(
+                            delta_content,
+                            last=bool(getattr(token, "finish_reason", None)),
                         )
 
                         if delta_reasoning is not None and gen_args.enable_thinking:
@@ -726,15 +763,42 @@ async def anthropic_messages_endpoint(http_request: Request):
                             finish_reason = token.finish_reason
                             break
 
+                    tail_reasoning, tail = finish_content_streams(
+                        thinking_state, tool_call_state
+                    )
                     for event in start_message_event():
                         yield event
+                    if tail_reasoning and gen_args.enable_thinking:
+                        yield open_block("thinking")
+                        yield _sse_event(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": block_index,
+                                "delta": {
+                                    "type": "thinking_delta",
+                                    "thinking": tail_reasoning,
+                                },
+                            },
+                        )
+                    if tail:
+                        text_output += tail
+                        yield open_block("text")
+                        yield _sse_event(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": block_index,
+                                "delta": {"type": "text_delta", "text": tail},
+                            },
+                        )
                     yield close_open_block()
 
                     parsed_tool_calls = None
                     if tool_module is not None and tools:
                         tc = process_tool_calls(full_output, tool_module, tools)
-                        if tc["calls"]:
-                            parsed_tool_calls = tc["calls"]
+                        if tc.calls:
+                            parsed_tool_calls = tc.calls
 
                     if parsed_tool_calls:
                         for call in parsed_tool_calls:
@@ -950,13 +1014,19 @@ async def anthropic_messages_endpoint(http_request: Request):
             parsed_tool_calls = None
             if tool_module is not None and tools:
                 tc = process_tool_calls(full_text, tool_module, tools)
-                if tc["calls"]:
-                    parsed_tool_calls = tc["calls"]
+                if tc.calls:
+                    parsed_tool_calls = tc.calls
                     _, content = _split_thinking(
-                        tc["remaining_text"] or "",
+                        tc.remaining_text or "",
                         gen_args.thinking_start_token,
                         gen_args.thinking_end_token,
                         processor=processor,
+                    )
+                    content = strip_protocol_markers(
+                        content,
+                        tool_module,
+                        gen_args.thinking_start_token,
+                        gen_args.thinking_end_token,
                     )
 
             content, stop_sequence = _apply_stop_sequences(
@@ -1059,9 +1129,12 @@ async def anthropic_count_tokens_endpoint(http_request: Request):
         body = _normalize_anthropic_system_messages(await http_request.json())
         request = _anthropic_request_with_derived_fields(AnthropicRequest(**body))
         model, processor, config = get_cached_model(request.model)
-        processed_messages, images, tools, tool_choice = (
-            _anthropic_messages_to_internal(request)
-        )
+        try:
+            processed_messages, images, tools, tool_choice = (
+                _anthropic_messages_to_internal(request)
+            )
+        except HTTPException as e:
+            return _anthropic_error_response(e.status_code, str(e.detail))
         gen_args = _build_gen_args(
             request, processor, tenant_id=_read_tenant_id(http_request)
         )

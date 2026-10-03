@@ -12,6 +12,7 @@ from mlx_vlm.generate.image import (
     ImageGenerationRequest,
     ImageGenerationResult,
 )
+from mlx_vlm.generate.image_defaults import ImageSamplingDefaults, image_metadata_path
 
 from .config import Flux2Variant, get_variant, variant_from_local_path
 from .download import validate_model_layout
@@ -60,6 +61,15 @@ def can_edit(model: str) -> bool:
     return _can_load(model, require_edit=True)
 
 
+def _defaults_variant(model: str, model_path: Path | None):
+    if model_path is not None:
+        return variant_from_local_path(model_path)
+    try:
+        return resolve_variant(model)
+    except ValueError:
+        return variant_from_local_path(image_metadata_path(model))
+
+
 @dataclass(slots=True)
 class Flux2ImageGenerationModel(ImageGenerationModel):
     is_image_generation_model: ClassVar[bool] = True
@@ -67,6 +77,16 @@ class Flux2ImageGenerationModel(ImageGenerationModel):
     pipeline: Flux2Image
     model_id: str
     family: str = "flux2"
+
+    @property
+    def default_sampling(self) -> ImageSamplingDefaults:
+        return ImageSamplingDefaults.from_config(self.pipeline.variant)
+
+    @classmethod
+    def resolve_defaults(
+        cls, model: str, *, model_path: Path | None = None
+    ) -> ImageSamplingDefaults:
+        return ImageSamplingDefaults.from_config(_defaults_variant(model, model_path))
 
     @property
     def variant(self) -> str:
@@ -80,18 +100,22 @@ class Flux2ImageGenerationModel(ImageGenerationModel):
 
     def generate(self, request: ImageGenerationRequest) -> ImageGenerationResult:
         seed = 0 if request.seed is None else request.seed
+        defaults = self.default_sampling
+        steps = request.resolve_steps(defaults.steps)
+        guidance = request.resolve_guidance(defaults.guidance)
         max_sequence_length = request.extra.get("max_sequence_length", None)
         tiled_vae = request.extra.get("tiled_vae", None)
         quantization_config = getattr(self.pipeline, "quantization_config", None)
         array = self.pipeline.generate_array(
             request.prompt,
             seed=seed,
-            steps=request.steps,
+            steps=steps,
             width=request.width,
             height=request.height,
-            guidance=request.guidance,
+            guidance=guidance,
             max_sequence_length=max_sequence_length,
             tiled_vae=tiled_vae,
+            num_images=int(request.extra.get("num_images", 1)),
         )
         metadata = {
             "model_path": str(self.pipeline.model_path),
@@ -105,11 +129,11 @@ class Flux2ImageGenerationModel(ImageGenerationModel):
             seed=seed,
             width=request.width,
             height=request.height,
-            steps=request.steps,
+            steps=steps,
             model=self.model_id,
             family=self.family,
             variant=self.variant,
-            guidance=request.guidance,
+            guidance=guidance,
             prompt_tokens=self.count_prompt_tokens(request.prompt),
             peak_memory=mx.get_peak_memory() / 1e9,
             metadata=metadata,
@@ -161,6 +185,16 @@ class Flux2ImageEditModel(ImageEditModel):
     family: str = "flux2"
 
     @property
+    def default_sampling(self) -> ImageSamplingDefaults:
+        return ImageSamplingDefaults.from_config(self.pipeline.variant)
+
+    @classmethod
+    def resolve_defaults(
+        cls, model: str, *, model_path: Path | None = None
+    ) -> ImageSamplingDefaults:
+        return ImageSamplingDefaults.from_config(_defaults_variant(model, model_path))
+
+    @property
     def variant(self) -> str:
         return self.pipeline.variant.name
 
@@ -172,6 +206,9 @@ class Flux2ImageEditModel(ImageEditModel):
 
     def edit(self, request: ImageEditRequest) -> ImageGenerationResult:
         seed = 0 if request.seed is None else request.seed
+        defaults = self.default_sampling
+        steps = request.resolve_steps(defaults.steps)
+        guidance = request.resolve_guidance(defaults.guidance)
         max_sequence_length = request.extra.get("max_sequence_length", None)
         tiled_vae = request.extra.get("tiled_vae", None)
         quantization_config = getattr(self.pipeline, "quantization_config", None)
@@ -179,10 +216,10 @@ class Flux2ImageEditModel(ImageEditModel):
             request.prompt,
             request.image_paths,
             seed=seed,
-            steps=request.steps,
+            steps=steps,
             width=request.width,
             height=request.height,
-            guidance=request.guidance,
+            guidance=guidance,
             max_sequence_length=max_sequence_length,
             tiled_vae=tiled_vae,
         )
@@ -200,11 +237,11 @@ class Flux2ImageEditModel(ImageEditModel):
             seed=seed,
             width=array.shape[1],
             height=array.shape[0],
-            steps=request.steps,
+            steps=steps,
             model=self.model_id,
             family=self.family,
             variant=self.variant,
-            guidance=request.guidance,
+            guidance=guidance,
             prompt_tokens=self.count_prompt_tokens(request.prompt),
             peak_memory=mx.get_peak_memory() / 1e9,
             metadata=metadata,

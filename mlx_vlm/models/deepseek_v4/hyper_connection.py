@@ -5,6 +5,10 @@ from typing import Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..fast_ops import exact_hc_expand, exact_hc_norm, exact_hc_normalized_norm
+from ..linear import DECODE_BLOCK_SIZE, tiled_linear, tokenwise
+from ..switch_layers import MoE
+
 
 def _make_hc_sinkhorn_collapse_kernel():
     """Fused sinkhorn + collapse: eliminates one dispatch per HC cycle.
@@ -160,6 +164,129 @@ def _make_hc_sinkhorn_collapse_kernel():
 _hc_sinkhorn_collapse_kernel = _make_hc_sinkhorn_collapse_kernel()
 
 
+def _make_hc_sinkhorn_split_kernel():
+    """Sinkhorn without the collapse: returns pre/post/comb.
+
+    Single-pass mHC (DeepSeek-V4.1) hands `pre` to the *next* sublayer rather
+    than collapsing with it here, so `hc_sinkhorn_collapse`'s second phase would
+    be wasted work and its `collapsed` output unused. Phase 1 is identical; one
+    simd group per row is enough because nothing touches the D axis.
+    """
+    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return None
+
+    source = """
+        uint lane = thread_position_in_threadgroup.x;
+        uint row  = threadgroup_position_in_grid.x;
+
+        constexpr int MIX      = (2 + HC) * HC;
+        constexpr int BASE_OFF = 2 * HC;
+        constexpr float EPS = EPS_INT * 1e-9;
+
+        const device float* mix      = (const device float*)mixes + row * MIX;
+        device float*       pre_out  = (device float*)pre + row * HC;
+        device float*       post_out = (device float*)post + row * HC;
+        device float*       comb_out = (device float*)comb + row * HC * HC;
+
+        const float pre_scale  = scale[0];
+        const float post_scale = scale[1];
+        const float comb_scale = scale[2];
+
+        const float active = (lane < (uint)HC) ? 1.0f : 0.0f;
+        const uint  llane  = metal::min(lane, (uint)(HC - 1));
+
+        float pre_z  = mix[llane]      * pre_scale  + base[llane];
+        float post_z = mix[HC + llane] * post_scale + base[HC + llane];
+        float pre_v  = 1.0f / (1.0f + metal::fast::exp(-pre_z)) + EPS;
+        float post_v = 2.0f / (1.0f + metal::fast::exp(-post_z));
+
+        if (lane < (uint)HC) {
+            pre_out[lane]  = pre_v;
+            post_out[lane] = post_v;
+        }
+
+        float4 v = (*(const device float4*)(mix  + BASE_OFF + llane * HC)
+                        * comb_scale
+                  + *(const device float4*)(base + BASE_OFF + llane * HC))
+                 * active;
+
+        float row_max = metal::max(metal::max(v.x, v.y),
+                                   metal::max(v.z, v.w));
+        float4 e = metal::fast::exp(v - row_max) * active;
+        float4 r = e * (1.0f / (e.x + e.y + e.z + e.w + EPS))
+                 + EPS * active;
+
+        float4 col_inv = 1.0f / (float4(
+            simd_sum(r.x), simd_sum(r.y),
+            simd_sum(r.z), simd_sum(r.w)
+        ) + EPS);
+        r *= col_inv;
+
+        for (int iter = 1; iter < ITERS; ++iter) {
+            r *= (1.0f / (r.x + r.y + r.z + r.w + EPS)) * active;
+            col_inv = 1.0f / (float4(
+                simd_sum(r.x), simd_sum(r.y),
+                simd_sum(r.z), simd_sum(r.w)
+            ) + EPS);
+            r *= col_inv;
+        }
+
+        if (lane < (uint)HC) {
+            *(device float4*)(comb_out + lane * HC) = r;
+        }
+    """
+
+    return mx.fast.metal_kernel(
+        name="hc_sinkhorn_split",
+        input_names=["mixes", "scale", "base"],
+        output_names=["pre", "post", "comb"],
+        source=source,
+        ensure_row_contiguous=True,
+    )
+
+
+_hc_sinkhorn_split_kernel = _make_hc_sinkhorn_split_kernel()
+
+
+def hc_split_sinkhorn(mixes, scale, base, hc_mult, sinkhorn_iters, eps):
+    """pre/post/comb for single-pass mHC, fused when the kernel applies.
+
+    The kernel vectorizes comb over float4 and so requires `hc_mult == 4`;
+    everything else falls back to the op path.
+    """
+    eligible = (
+        _hc_sinkhorn_split_kernel is not None
+        and hc_mult == 4
+        and mixes.ndim == 3
+        and mx.default_device() == mx.gpu
+        and mx.metal.is_available()
+    )
+    if not eligible:
+        return _hc_split_sinkhorn_ops(mixes, scale, base, hc_mult, sinkhorn_iters, eps)
+
+    batch, length, _ = mixes.shape
+    return _hc_sinkhorn_split_kernel(
+        inputs=[
+            mixes.astype(mx.float32),
+            scale.astype(mx.float32),
+            base.astype(mx.float32),
+        ],
+        template=[
+            ("HC", hc_mult),
+            ("ITERS", sinkhorn_iters),
+            ("EPS_INT", round(eps / 1e-9)),
+        ],
+        grid=(batch * length * 32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[
+            (batch, length, hc_mult),
+            (batch, length, hc_mult),
+            (batch, length, hc_mult, hc_mult),
+        ],
+        output_dtypes=[mx.float32, mx.float32, mx.float32],
+    )
+
+
 def _hc_kernel(x, y, mixes, scale, base, hc_mult, sinkhorn_iters, eps):
     B, L, H, D = x.shape
 
@@ -229,14 +356,52 @@ class HyperConnection(nn.Module):
         self.base = mx.zeros((mix,), dtype=mx.float32)
         self.scale = mx.ones((3,), dtype=mx.float32)
 
+    def apply_branch(self, x, norm, branch, *args, **kwargs):
+        """Collapse, normalize, evaluate a branch, and expand its residual."""
+        fused = None
+        if 1 < x.shape[1] <= DECODE_BLOCK_SIZE and not self.training:
+            if x.shape[0] == 1:
+                fused = exact_hc_normalized_norm(self, norm, x)
+            if fused is None and _hc_kernel is not None:
+                y = x.astype(mx.float32)
+                z = mx.fast.rms_norm(y.flatten(-2), None, self.norm_eps)
+                mixes = self._mix(z)
+                fused = exact_hc_norm(self, norm, x, mixes)
+        if fused is None:
+            collapsed, post, comb = self(x)
+            collapsed = norm(collapsed)
+        else:
+            collapsed, post, comb = fused
+        if (
+            isinstance(branch, MoE)
+            and 1 < x.shape[1] <= DECODE_BLOCK_SIZE
+            and not self.training
+        ):
+            return branch(collapsed, *args, residual=(x, post, comb), **kwargs)
+        output = branch(collapsed, *args, **kwargs)
+        if isinstance(output, tuple):
+            return (
+                hc_expand(output[0], x, post, comb, use_kernel=not self.training),
+                *output[1:],
+            )
+        return hc_expand(output, x, post, comb, use_kernel=not self.training)
+
+    def _mix(self, z):
+        if z.shape[1] <= DECODE_BLOCK_SIZE:
+            if z.shape[0] == 1 and z.shape[1] > 1 and not self.training:
+                return tokenwise(lambda part: part @ self.fn.T, z)
+            return z @ self.fn.T
+        return tiled_linear(lambda part: part @ self.fn.T, z)
+
     def __call__(self, x: mx.array):
         B, L, H, D = x.shape
         y = x.astype(mx.float32)
         z = mx.fast.rms_norm(y.flatten(-2), None, self.norm_eps)
-        mixes = z @ self.fn.T
+        mixes = self._mix(z)
 
         use_ops = (
-            self.training
+            self.hc_mult != 4
+            or self.training
             or mx.default_device() != mx.gpu
             or not mx.metal.is_available()
         )
@@ -261,7 +426,11 @@ def _hc_expand_op(x, residual, post, comb):
     return y.astype(x.dtype)
 
 
-def hc_expand(x, residual, post, comb):
+def hc_expand(x, residual, post, comb, *, use_kernel=True):
+    if use_kernel and 1 < x.shape[1] <= DECODE_BLOCK_SIZE:
+        output = exact_hc_expand(x, residual, post, comb)
+        if output is not None:
+            return output
     return _hc_expand_op(x, residual, post, comb)
 
 
@@ -278,8 +447,10 @@ class HyperHead(nn.Module):
         self.scale = mx.ones((1,), dtype=mx.float32)
 
     def __call__(self, x: mx.array):
+        if 1 < x.shape[1] <= DECODE_BLOCK_SIZE and not self.training:
+            return tokenwise(self, x)
         y = x.astype(mx.float32)
         z = mx.fast.rms_norm(y.flatten(-2), None, self.norm_eps)
-        mixes = z @ self.fn.T
+        mixes = tiled_linear(lambda x: x @ self.fn.T, z)
         pre = mx.sigmoid(mixes * self.scale + self.base) + self.hc_eps
         return (pre[..., None] * y).sum(axis=2).astype(x.dtype)

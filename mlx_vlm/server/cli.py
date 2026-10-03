@@ -18,6 +18,7 @@ from .generation import (
     get_server_thinking_end_token,
     get_server_thinking_start_token,
 )
+from .model_discovery import MODEL_PATHS_ENV
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
@@ -75,10 +76,25 @@ def main():
         help="Pre-load an embedding model at startup.",
     )
     parser.add_argument(
+        "--decision-model",
+        type=str,
+        default=None,
+        help="Pre-load a decision model at startup.",
+    )
+    parser.add_argument(
         "--reranker-model",
         type=str,
         default=None,
         help="Pre-load a supported reranker model at startup.",
+    )
+    parser.add_argument(
+        "--model-dir",
+        action="append",
+        default=None,
+        help=(
+            "Additional model directory, or parent directory containing model folders. "
+            "Repeat for multiple paths. Overrides MLX_VLM_MODEL_PATHS."
+        ),
     )
     parser.add_argument(
         "--adapter-path",
@@ -209,6 +225,14 @@ def main():
         help="Start index for quantized KV cache.",
     )
     parser.add_argument(
+        "--expert-cache-gb",
+        type=float,
+        default=None,
+        help="For an mlx_vlm.moe_offload checkpoint, bound the resident routed-"
+        "expert set to this many GB (default: 70%% of the GPU's recommended "
+        "working set). Ignored for a normal, non-offloaded checkpoint.",
+    )
+    parser.add_argument(
         "--draft-model",
         type=str,
         default=None,
@@ -288,8 +312,14 @@ def main():
         os.environ["MLX_VLM_PRELOAD_STT_MODEL"] = args.stt_model
     if args.embedding_model:
         os.environ["MLX_VLM_PRELOAD_EMBEDDING_MODEL"] = args.embedding_model
+    if args.decision_model:
+        os.environ["MLX_VLM_PRELOAD_DECISION_MODEL"] = args.decision_model
     if args.reranker_model:
         os.environ["MLX_VLM_PRELOAD_RERANKER_MODEL"] = args.reranker_model
+    if args.model_dir is not None:
+        os.environ[MODEL_PATHS_ENV] = os.pathsep.join(
+            os.path.abspath(os.path.expanduser(path)) for path in args.model_dir
+        )
     os.environ["MLX_VLM_VISION_CACHE_SIZE"] = str(args.vision_cache_size)
     if args.draft_model:
         os.environ["MLX_VLM_DRAFT_MODEL"] = args.draft_model
@@ -325,6 +355,8 @@ def main():
     if args.max_kv_size is not None:
         os.environ["MAX_KV_SIZE"] = str(args.max_kv_size)
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
+    if args.expert_cache_gb is not None:
+        os.environ["EXPERT_CACHE_GB"] = str(args.expert_cache_gb)
     if args.top_logprobs_k is not None:
         os.environ["TOP_LOGPROBS_K"] = str(args.top_logprobs_k)
     if args.api_key:

@@ -5,12 +5,12 @@ image handling is retained here until a second modality uses the same path.
 """
 
 import mlx.core as mx
-import numpy as np
 
 from ...models.base import to_mlx
 from ...prompt_utils import MODEL_CONFIG, apply_chat_template
 
 NATIVE_PREPROCESS_MODELS = set(MODEL_CONFIG.keys())
+
 
 class PreferenceVisionDataset:
     """Dataset for preference-based training (ORPO, DPO).

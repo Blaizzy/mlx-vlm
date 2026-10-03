@@ -107,6 +107,7 @@ class Model(nn.Module):
         model.language_model.*          -> language_model.model.*
         lm_head.*                       -> language_model.lm_head.*
         model.visual.*                  -> vision_tower.*
+        model.*                         -> language_model.model.*
         """
         out = {}
         for k, v in weights.items():
@@ -116,6 +117,8 @@ class Model(nn.Module):
                 k = "vision_tower." + k[len("model.visual.") :]
             elif k.startswith("lm_head."):
                 k = "language_model.lm_head." + k[len("lm_head.") :]
+            elif k.startswith("model."):
+                k = "language_model." + k
             out[k] = v
 
         vision = {

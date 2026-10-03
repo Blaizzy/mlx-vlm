@@ -5,6 +5,7 @@ import mlx.nn as nn
 
 from ..kernels import grid_sample
 from ..mlp import SwiGLUMLP as Glm4vVisionMLP
+from ..rope_utils import rotate_half
 from .config import VisionConfig
 
 
@@ -25,13 +26,6 @@ def check_array_shape(arr):
         return (out_channels >= kH) and (out_channels >= KW) and (kH == KW)
     else:
         return False
-
-
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return mx.concatenate([-x2, x1], axis=-1)
 
 
 def apply_rotary_pos_emb_vision(tensor, freqs) -> mx.array:
@@ -107,10 +101,16 @@ class Glm4vVisionEmbeddings(nn.Module):
 
             # Calculate target dimensions for each patch
             target_h = mx.concatenate(
-                [mx.repeat(image_shapes[i, 1], lengths[i]) for i in range(len(lengths))]
+                [
+                    mx.repeat(image_shapes[i, 1], int(lengths[i]))
+                    for i in range(len(lengths))
+                ]
             ).astype(mx.float32)
             target_w = mx.concatenate(
-                [mx.repeat(image_shapes[i, 2], lengths[i]) for i in range(len(lengths))]
+                [
+                    mx.repeat(image_shapes[i, 2], int(lengths[i]))
+                    for i in range(len(lengths))
+                ]
             ).astype(mx.float32)
 
             # Normalize coordinates to [-1, 1] range for grid_sample

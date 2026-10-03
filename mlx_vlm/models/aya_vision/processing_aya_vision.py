@@ -13,7 +13,15 @@ from transformers.image_utils import ImageInput, make_flat_list_of_images
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
-from ..base import to_mlx
+from ..base import install_auto_processor_patch, to_mlx
+
+_RESPONSE_TOKENS = ("<|START_RESPONSE|>", "<|END_RESPONSE|>")
+
+
+def _strip_response_markers(text: str) -> str:
+    for token in _RESPONSE_TOKENS:
+        text = text.replace(token, "")
+    return text
 
 
 class AyaVisionProcessor(ProcessorMixin):
@@ -148,6 +156,9 @@ class AyaVisionProcessor(ProcessorMixin):
 
         return BatchFeature(data=to_mlx({**text_inputs, **image_inputs}))
 
+    def clean_output(self, text: str) -> str:
+        return _strip_response_markers(text)
+
     def batch_decode(self, *args, **kwargs):
         return self.tokenizer.batch_decode(*args, **kwargs)
 
@@ -162,3 +173,27 @@ class AyaVisionProcessor(ProcessorMixin):
 
 
 __all__ = ["AyaVisionProcessor"]
+
+
+try:
+    from transformers.models.aya_vision.processing_aya_vision import (
+        AyaVisionProcessor as _NativeAyaVisionProcessor,
+    )
+except ImportError:
+    _NativeAyaVisionProcessor = None
+
+if _NativeAyaVisionProcessor is not None:
+
+    class AyaVisionOutputProcessor(_NativeAyaVisionProcessor):
+        """Native processor plus the response-marker cleanup.
+
+        Subclasses the transformers processor rather than registering the
+        mlx-vlm one above, which resolves its image processor through
+        AutoImageProcessor and so cannot be built without torch.
+        """
+
+        def clean_output(self, text: str) -> str:
+            return _strip_response_markers(text)
+
+    __all__.append("AyaVisionOutputProcessor")
+    install_auto_processor_patch("aya_vision", AyaVisionOutputProcessor)

@@ -105,6 +105,7 @@ class MellumSparseMoeBlock(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         gates = mx.softmax(self.gate(x), axis=-1, precise=True)
         indices = mx.argpartition(gates, kth=-self.top_k, axis=-1)[..., -self.top_k :]
+        indices = mx.stop_gradient(indices)
         scores = mx.take_along_axis(gates, indices, axis=-1)
         if self.norm_topk_prob:
             scores /= mx.sum(scores, axis=-1, keepdims=True)
