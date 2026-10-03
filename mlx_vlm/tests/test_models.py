@@ -2234,3 +2234,62 @@ class TestKolibri1:
         assert not predicate("language_model.lm_head", None)
         assert not predicate("language_model.model.layers.0.mlp.gate", None)
         assert predicate("language_model.model.layers.0.mlp.switch_mlp", None)
+
+    def test_model_resolution_and_layer_type_validation(self):
+        from mlx_vlm.models.kolibri1 import Model, ModelConfig
+
+        module, model_type = get_model_and_args({"model_type": "kolibri1"})
+        assert module.Model is Model
+        assert module.ModelConfig is ModelConfig
+        assert model_type == "kolibri1"
+
+        config = self.config()
+        config.layer_types[0] = "attention"
+        with pytest.raises(ValueError, match="Unsupported layer types"):
+            ModelConfig(**vars(config))
+
+    @pytest.mark.parametrize(
+        "mode,group_size",
+        [("affine", 64), ("nvfp4", 16), ("mxfp4", 32)],
+    )
+    def test_quantized_expert_checkpoint_layout(self, mode, group_size):
+        from mlx_vlm.models.kolibri1 import Model
+        from mlx_vlm.models.switch_layers import QuantizedSwitchLinear
+
+        model = Model(self.config())
+        config = model.config
+        source = {
+            "model.layers.0.moe.router.expert_bias": mx.zeros((config.num_experts,))
+        }
+        for expert_idx in range(config.num_experts):
+            quantized = mx.quantize(
+                mx.random.normal((config.moe_intermediate_size, config.hidden_size)),
+                group_size=group_size,
+                bits=4,
+                mode=mode,
+            )
+            prefix = f"model.layers.0.mlp.experts.{expert_idx}.up_proj"
+            source[f"{prefix}.weight"] = quantized[0]
+            source[f"{prefix}.scales"] = quantized[1]
+            if mode == "affine":
+                source[f"{prefix}.biases"] = quantized[2]
+
+        weights = model.sanitize(source)
+        prefix = "language_model.model.layers.0.mlp.switch_mlp.up_proj"
+        nn.quantize(
+            model,
+            group_size=group_size,
+            bits=4,
+            mode=mode,
+            class_predicate=lambda path, _: f"{path}.scales" in weights,
+        )
+        model.load_weights(list(weights.items()), strict=False)
+
+        projection = model.language_model.model.layers[0].mlp.switch_mlp.up_proj
+        assert isinstance(projection, QuantizedSwitchLinear)
+        assert projection.mode == mode
+        assert projection.group_size == group_size
+        assert projection.weight.shape[0] == config.num_experts
+        assert projection.scales.shape[0] == config.num_experts
+        assert (projection.biases is not None) == (mode == "affine")
+        assert mx.isfinite(model(mx.array([[1, 2]])).logits).all().item()

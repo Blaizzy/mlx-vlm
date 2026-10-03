@@ -36,5 +36,11 @@ class ModelConfig(BaseModelConfig):
     def __post_init__(self):
         if len(self.layer_types) != self.num_hidden_layers:
             raise ValueError("layer_types must contain one entry per hidden layer")
+        unsupported = set(self.layer_types) - {
+            "full_attention",
+            "sliding_attention",
+        }
+        if unsupported:
+            raise ValueError(f"Unsupported layer types: {sorted(unsupported)}")
         if self.rope_parameters is not None:
             self.rope_theta = self.rope_parameters.get("rope_theta", self.rope_theta)
