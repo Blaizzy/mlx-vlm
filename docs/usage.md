@@ -111,6 +111,33 @@ works while that response is stored. `/v1/responses/input_tokens` counts the
 decoded context, not the encrypted payload's string length. Normal response
 usage counts the final inference; explicit compact usage counts the summary pass.
 
+Streaming automatic compaction and terminal `compaction_trigger` requests emit
+request-scoped MLX extension events after `response.created` / `response.in_progress`
+and before the compaction output item:
+
+```text
+event: mlx.compaction.started
+data: {"type":"mlx.compaction.started","response_id":"resp_...","input_tokens":5786}
+
+event: mlx.compaction.completed
+data: {"type":"mlx.compaction.completed","response_id":"resp_...","input_tokens_before":5786,"input_tokens_after":854}
+```
+
+Use these events to drive a compacting indicator without a token-count preflight.
+`started` means the server has selected history and checked summary headroom;
+`completed` means the smaller context passed validation. No summary means no
+progress events, even if the threshold was reached. The token counts describe the
+rendered conversation before and after compaction, not cache hits or summary usage.
+Clients may ignore these additional events; ordinary Responses output is unchanged.
+Keep the capsule from the accepted final response, not from a progress event.
+
+Once the stream is open, failures are terminal `response.failed` SSE events with
+`response.error.message` and a string `response.error.code` (`invalid_prompt`,
+`rate_limit_exceeded`, or `server_error`). They do not produce a successful final
+response. Clear the indicator on failure or disconnect.
+Disconnecting cancels the queued summary worker. Non-streaming compaction still
+reports failures through HTTP status codes.
+
 For native compaction, a single terminal input item
 `{"type": "compaction_trigger"}` on `/v1/responses` requests compaction without
 generating an answer. Both streaming and non-streaming responses contain exactly

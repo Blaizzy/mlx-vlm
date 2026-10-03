@@ -22,7 +22,7 @@ from pathlib import Path
 from queue import Queue
 from threading import Event, Lock, Thread, Timer
 from types import SimpleNamespace as NS
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import httpx
 import mlx.core as mx
@@ -2586,6 +2586,8 @@ class TestCompaction:
             events = _data(response)
             data = _completed_response(response)
             assert not any(x["type"] == "response.output_text.delta" for x in events)
+            if short:
+                assert not any(x["type"].startswith("mlx.compaction.") for x in events)
         else:
             data = response.json()
         assert [x["type"] for x in data["output"]] == ["compaction"]
@@ -2750,6 +2752,216 @@ class TestCompaction:
             "reasoning",
             "function_call",
         ]
+
+    @pytest.mark.parametrize("trigger", [False, True])
+    def test_compaction_progress_arrives_before_summary_finishes(self, mocked, trigger):
+        release, running = Event(), Event()
+        summary = mocked.generate.return_value
+
+        def generate(**kwargs):
+            running.set()
+            assert release.wait(
+                5
+            ), "Summary released only after start event is received"
+            return summary
+
+        mocked.generate.side_effect = generate
+        payload = dict(
+            model="demo", input=_compaction_history(), stream=True, max_output_tokens=64
+        )
+        if trigger:
+            payload["input"].append({"type": "compaction_trigger"})
+        else:
+            payload["context_management"] = [
+                {"type": "compaction", "compact_threshold": 1000}
+            ]
+        before = mocked.count(input=_compaction_history())["input_tokens"]
+
+        async def consume():
+            response = await openai.responses_endpoint(
+                NS(json=AsyncMock(return_value=payload), headers={})
+            )
+            events = []
+            try:
+                async for chunk in response.body_iterator:
+                    events.extend(data for _, data in _sse_events(chunk))
+                    if events[-1]["type"] == "mlx.compaction.started":
+                        assert await asyncio.to_thread(running.wait, 2)
+                        assert events[-1]["input_tokens"] == before
+                        assert not release.is_set()
+                        release.set()
+            finally:
+                release.set()
+                await response.body_iterator.aclose()
+            return events
+
+        events = asyncio.run(consume())
+        kinds = [event["type"] for event in events]
+        assert kinds[:3] == [
+            "response.created",
+            "response.in_progress",
+            "mlx.compaction.started",
+        ]
+        assert kinds.index("mlx.compaction.completed") < kinds.index(
+            "response.output_item.added"
+        )
+        final = events[-1]["response"]
+        progress = [
+            event for event in events if event["type"].startswith("mlx.compaction.")
+        ]
+        assert len(progress) == 2 and all(
+            event["response_id"] == final["id"] for event in progress
+        )
+        after = mocked.count(input=[final["output"][0]])["input_tokens"]
+        assert progress[1]["input_tokens_before"] == before
+        assert progress[1]["input_tokens_after"] == after < before
+
+    @pytest.mark.parametrize("threshold", [1, 1000])
+    def test_no_summary_emits_no_progress(self, mocked, client, threshold):
+        response = _post(
+            client,
+            "responses",
+            input="hello",
+            stream=True,
+            context_management=[{"type": "compaction", "compact_threshold": threshold}],
+        )
+        assert not any(e["type"].startswith("mlx.compaction.") for e in _data(response))
+        _completed_response(response)
+        mocked.generate.assert_not_called()
+
+    @pytest.mark.parametrize("trigger", [False, True])
+    @pytest.mark.parametrize(
+        "text, tokens, code",
+        [("", 4, 502), ("partial", 1024, 502), ("huge " * 10000, 4, 400)],
+    )
+    def test_failed_streamed_summary_never_completes(
+        self, mocked, client, trigger, text, tokens, code
+    ):
+        mocked.generate.return_value = _result(text, generation_tokens=tokens)
+        items = _compaction_history()
+        options = {}
+        if trigger:
+            items.append({"type": "compaction_trigger"})
+        else:
+            options["context_management"] = [
+                {"type": "compaction", "compact_threshold": 1000}
+            ]
+        events = _data(_post(client, "responses", input=items, stream=True, **options))
+        assert [event["type"] for event in events] == [
+            "response.created",
+            "response.in_progress",
+            "mlx.compaction.started",
+            "response.failed",
+        ]
+        failed = events[-1]["response"]
+        assert failed["id"] == events[0]["response"]["id"]
+        assert failed["status"] == "failed" and not failed["output"]
+        assert failed["error"]["code"] == (
+            "invalid_prompt" if code == 400 else "server_error"
+        )
+        assert "Compaction" in failed["error"]["message"]
+        assert not server.response_store
+        mocked.stream.assert_not_called()
+
+    @pytest.mark.parametrize("trigger", [False, True])
+    def test_closing_compaction_stream_cancels_summary_worker(
+        self, mocked, monkeypatch, trigger
+    ):
+        queue, running, cancelled = Queue(), Event(), Event()
+
+        def cancel(uid):
+            cancelled.set()
+            queue.put(None)
+
+        iterator = generation._TokenIterator(queue, 1, cancel, 5)
+        worker = _streaming([])
+        worker._cpu_preprocess = lambda prompt, *args: {
+            "input_ids": np.zeros((1, len(prompt) // 4), dtype=np.int32)
+        }
+
+        def generate(**kwargs):
+            running.set()
+            return NS(prompt_tokens=100), iterator
+
+        worker.generate.side_effect = generate
+        monkeypatch.setattr(server.runtime, "response_generator", worker)
+        payload = dict(model="demo", input=_compaction_history(), stream=True)
+        if trigger:
+            payload["input"].append({"type": "compaction_trigger"})
+        else:
+            payload["context_management"] = [
+                {"type": "compaction", "compact_threshold": 1000}
+            ]
+
+        async def disconnect():
+            response = await openai.responses_endpoint(
+                NS(json=AsyncMock(return_value=payload), headers={})
+            )
+            try:
+                async for chunk in response.body_iterator:
+                    event = next(_sse_events(chunk))[1]
+                    if event["type"] == "mlx.compaction.started":
+                        assert await asyncio.to_thread(running.wait, 2)
+                        break
+            finally:
+                await asyncio.wait_for(response.body_iterator.aclose(), 2)
+                assert cancelled.is_set()
+
+        asyncio.run(disconnect())
+        assert not server.response_store
+
+    def test_compaction_progress_is_isolated_between_requests(self, mocked):
+        async def consume(size):
+            items = _compaction_history()
+            items[-1]["content"] += " extra" * size
+            payload = dict(
+                model="demo",
+                input=items,
+                stream=True,
+                context_management=[{"type": "compaction", "compact_threshold": 1000}],
+            )
+            response = await openai.responses_endpoint(
+                NS(json=AsyncMock(return_value=payload), headers={})
+            )
+            return [
+                data
+                async for chunk in response.body_iterator
+                for _, data in _sse_events(chunk)
+            ]
+
+        async def concurrent():
+            return await asyncio.gather(consume(1), consume(100))
+
+        first, second = asyncio.run(concurrent())
+        assert first[-1]["response"]["id"] != second[-1]["response"]["id"]
+        assert first[2]["input_tokens"] < second[2]["input_tokens"]
+        for events in (first, second):
+            response_id = events[-1]["response"]["id"]
+            assert all(
+                e["response_id"] == response_id
+                for e in events
+                if e["type"].startswith("mlx.compaction.")
+            )
+
+    def test_streamed_compaction_budget_error_precedes_start(self, mocked, client):
+        events = _data(
+            _post(
+                client,
+                "responses",
+                input=_compaction_history(),
+                stream=True,
+                max_output_tokens=32768,
+                context_management=[{"type": "compaction", "compact_threshold": 1}],
+            )
+        )
+        assert [event["type"] for event in events] == [
+            "response.created",
+            "response.in_progress",
+            "response.failed",
+        ]
+        assert events[-1]["response"]["error"]["code"] == "invalid_prompt"
+        mocked.generate.assert_not_called()
+        mocked.stream.assert_not_called()
 
     def test_stored_compaction_survives_parent_eviction(self, mocked):
         first = mocked.request(input="original")
@@ -2943,16 +3155,52 @@ class TestCompaction:
         _assert_recalled(reset["output_text"])
 
     def test_real_automatic_compaction_stream(self, real_client, real_history):
-        completed = _real_post(
-            real_client,
+        payload = dict(
+            model=real_client.model,
             input=real_history,
+            temperature=0,
+            enable_thinking=False,
             max_output_tokens=96,
             store=False,
             stream=True,
             context_management=[{"type": "compaction", "compact_threshold": 2000}],
         )
+        started = time.perf_counter()
+        lines, progress = [], []
+        with real_client.http.stream("POST", "/v1/responses", json=payload) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                lines.append(line)
+                if line.startswith("data: "):
+                    event = json.loads(line[6:])
+                    if event.get("type", "").startswith("mlx.compaction."):
+                        progress.append((time.perf_counter() - started, event))
+        completed = _completed_response(
+            httpx.Response(200, text="\n".join(lines) + "\n")
+        )
         assert completed["output"][0]["type"] == "compaction"
         _assert_recalled(completed["output_text"])
+        assert [event["type"] for _, event in progress] == [
+            "mlx.compaction.started",
+            "mlx.compaction.completed",
+        ]
+        assert progress[0][0] < progress[1][0]
+        sdk_payload = {
+            key: value for key, value in payload.items() if key != "enable_thinking"
+        }
+        with real_client.sdk.responses.create(
+            **sdk_payload, extra_body={"enable_thinking": False}
+        ) as stream:
+            sdk_events = list(stream)
+        assert sdk_events[-1].type == "response.completed"
+        assert any(event.type == "mlx.compaction.started" for event in sdk_events)
+        counts = progress[1][1]
+        assert counts["input_tokens_before"] == progress[0][1]["input_tokens"]
+        assert counts["input_tokens_after"] == completed["usage"]["input_tokens"]
+        print(
+            f"Compaction started at {progress[0][0]:.3f}s, completed at {progress[1][0]:.3f}s; "
+            f"{counts['input_tokens_before']} -> {counts['input_tokens_after']} input tokens"
+        )
 
     def test_real_repeated_compaction_keeps_corrections(
         self, real_client, real_history
