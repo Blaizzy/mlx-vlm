@@ -106,7 +106,7 @@ class MoEGate(nn.Module):
         self.e_score_correction_bias = mx.zeros((args.num_experts,))
 
     def __call__(self, x: mx.array):
-        logits = (x @ self.weight.T).astype(mx.float32)
+        logits = x.astype(mx.float32) @ self.weight.astype(mx.float32).T
         selection_logits = logits + self.e_score_correction_bias.astype(mx.float32)
         indices = mx.argpartition(-selection_logits, kth=self.top_k - 1, axis=-1)[
             ..., : self.top_k
