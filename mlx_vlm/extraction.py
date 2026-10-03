@@ -87,6 +87,22 @@ def split_outputs(result: Mapping) -> dict:
     return arrays
 
 
+def describe_outputs(outputs):
+    """Summarise named arrays as shapes and dtypes, listing metadata keys."""
+    described = {
+        name: {
+            "shape": list(np.asarray(value).shape),
+            "dtype": str(np.asarray(value).dtype),
+        }
+        for name, value in outputs.items()
+        if name != METADATA
+    }
+    summary = {"outputs": described}
+    if METADATA in outputs:
+        summary[METADATA] = sorted(outputs[METADATA])
+    return summary
+
+
 def extract(model, processor, inputs, task=None, **kwargs):
     """Predict named structured outputs using a model's native extraction tasks."""
     supported = getattr(model, "extraction_types", ())

@@ -82,6 +82,12 @@ def main():
         help="Pre-load a decision model at startup.",
     )
     parser.add_argument(
+        "--extraction-model",
+        type=str,
+        default=None,
+        help="Pre-load an extraction model at startup.",
+    )
+    parser.add_argument(
         "--reranker-model",
         type=str,
         default=None,
@@ -314,6 +320,8 @@ def main():
         os.environ["MLX_VLM_PRELOAD_EMBEDDING_MODEL"] = args.embedding_model
     if args.decision_model:
         os.environ["MLX_VLM_PRELOAD_DECISION_MODEL"] = args.decision_model
+    if args.extraction_model:
+        os.environ["MLX_VLM_PRELOAD_EXTRACTION_MODEL"] = args.extraction_model
     if args.reranker_model:
         os.environ["MLX_VLM_PRELOAD_RERANKER_MODEL"] = args.reranker_model
     if args.model_dir is not None:

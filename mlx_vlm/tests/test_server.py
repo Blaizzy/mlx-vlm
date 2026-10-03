@@ -5369,6 +5369,102 @@ def test_decisions_endpoint_uses_shared_prediction(client, kind):
     model.predict.assert_called_once_with(processor, "text", questions)
 
 
+def _tiny_png_data_uri():
+    import base64 as _b64
+    from io import BytesIO
+
+    from PIL import Image
+
+    buffer = BytesIO()
+    Image.new("RGB", (8, 8), "white").save(buffer, format="PNG")
+    return "data:image/png;base64," + _b64.b64encode(buffer.getvalue()).decode()
+
+
+def test_extractions_endpoint_returns_arrays_and_manifest(client):
+    import numpy as np
+    from safetensors.numpy import load as load_safetensors
+
+    outputs = {
+        "boxes": np.zeros((2, 4), dtype=np.float32),
+        "scores": np.ones((2,), dtype=np.float32),
+        "metadata": {"class_names": ["cat"]},
+    }
+    model = NS(extraction_types=("detection",), extract=MagicMock(return_value=outputs))
+    with patch.object(
+        server, "get_cached_model", return_value=(model, None, {})
+    ) as load:
+        response = client.post(
+            "/v1/extractions",
+            json={"model": "extractor", "image": _tiny_png_data_uri()},
+        )
+    assert response.status_code == 200
+    body = response.json()
+    load.assert_called_once_with("extractor", model_kind="extraction")
+    assert body["model"] == "extractor"
+    assert body["task"] == "detection"
+    assert body["outputs"] == {
+        "boxes": {"shape": [2, 4], "dtype": "float32"},
+        "scores": {"shape": [2], "dtype": "float32"},
+    }
+    assert body["metadata"] == ["class_names"]
+    decoded = load_safetensors(base64.b64decode(body["arrays_b64"]))
+    assert sorted(decoded) == ["boxes", "scores"]
+    assert decoded["boxes"].shape == (2, 4)
+    assert decoded["scores"].tolist() == [1.0, 1.0]
+
+
+def test_extractions_materializes_mlx_arrays(client):
+    import mlx.core as mx
+    from safetensors.numpy import load as load_safetensors
+
+    # Returning live MLX arrays to the event loop aborts the process, so the
+    # route has to evaluate them on the worker thread. Build them inside the
+    # call so they belong to that thread, as a real model's would.
+    def fake_extract(*args, **kwargs):
+        return {"depth": mx.ones((2, 3), dtype=mx.float32)}
+
+    model = NS(extraction_types=("depth",), extract=fake_extract)
+    with patch.object(server, "get_cached_model", return_value=(model, None, {})):
+        response = client.post(
+            "/v1/extractions",
+            json={"model": "extractor", "image": _tiny_png_data_uri()},
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["outputs"] == {"depth": {"shape": [2, 3], "dtype": "float32"}}
+    decoded = load_safetensors(base64.b64decode(body["arrays_b64"]))
+    assert decoded["depth"].tolist() == [[1.0, 1.0, 1.0], [1.0, 1.0, 1.0]]
+
+
+def test_extractions_requires_an_input(client):
+    model = NS(extraction_types=("detection",), extract=MagicMock())
+    with patch.object(server, "get_cached_model", return_value=(model, None, {})):
+        response = client.post("/v1/extractions", json={"model": "extractor"})
+    assert response.status_code == 400
+    model.extract.assert_not_called()
+
+
+def test_extractions_rejects_an_unsupported_task(client):
+    model = NS(extraction_types=("detection",), extract=MagicMock())
+    with patch.object(server, "get_cached_model", return_value=(model, None, {})):
+        response = client.post(
+            "/v1/extractions",
+            json={
+                "model": "extractor",
+                "image": _tiny_png_data_uri(),
+                "task": "segmentation",
+            },
+        )
+    assert response.status_code == 400
+    model.extract.assert_not_called()
+
+
+def test_extractions_without_a_model_is_refused(client):
+    response = client.post("/v1/extractions", json={"image": _tiny_png_data_uri()})
+    assert response.status_code == 400
+    assert "extraction-model" in response.json()["detail"]
+
+
 def test_decisions_rejects_unsupported_type(client):
     model = NS(decision_types=("choice",), predict=MagicMock())
     with patch.object(server, "get_cached_model", return_value=(model, None, {})):
