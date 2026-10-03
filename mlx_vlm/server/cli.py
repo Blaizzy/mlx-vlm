@@ -19,7 +19,6 @@ from .generation import (
     get_server_thinking_start_token,
 )
 from .model_discovery import MODEL_PATHS_ENV
-from .runtime import runtime
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
@@ -286,13 +285,6 @@ def main():
         ),
     )
     parser.add_argument(
-        "--chat-compaction-threshold",
-        type=int,
-        default=None,
-        help="Opt in to Chat Completions compaction at this input token count. "
-        "Maps to MLX_VLM_CHAT_COMPACTION_THRESHOLD. Disabled by default.",
-    )
-    parser.add_argument(
         "--reload",
         action="store_true",
         default=False,
@@ -306,18 +298,6 @@ def main():
         help="Set the logging level (default: INFO).",
     )
     args = parser.parse_args()
-    if (
-        args.chat_compaction_threshold is not None
-        and args.chat_compaction_threshold <= 0
-    ):
-        parser.error("--chat-compaction-threshold must be positive")
-    if args.chat_compaction_threshold is not None:
-        os.environ["MLX_VLM_CHAT_COMPACTION_THRESHOLD"] = str(
-            args.chat_compaction_threshold
-        )
-        runtime.config.apply_changes(
-            {"chat_compaction_threshold": args.chat_compaction_threshold}
-        )
     if args.trust_remote_code:
         os.environ["MLX_TRUST_REMOTE_CODE"] = "true"
     if args.model:

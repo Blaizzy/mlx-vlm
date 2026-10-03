@@ -70,7 +70,6 @@ from .schemas import (
     ChatResponse,
     ChatStreamChoice,
     ChatStreamChunk,
-    CompactionControl,
     CompactRequest,
     ContentPartOutputText,
     GenerationTimings,
@@ -1814,20 +1813,6 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             else _INHERIT_ADAPTER
         )
 
-        if (
-            request.context_management is None
-            and runtime.config.chat_compaction_threshold
-        ):
-            request = request.model_copy(
-                update={
-                    "context_management": [
-                        CompactionControl(
-                            type="compaction",
-                            compact_threshold=runtime.config.chat_compaction_threshold,
-                        )
-                    ]
-                }
-            )
         if request.context_management:
             model, processor, config = get_cached_model(request.model, adapter_path)
             result = await compaction.compact_response_context(

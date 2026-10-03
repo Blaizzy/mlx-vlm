@@ -2228,7 +2228,6 @@ class TestCompaction:
     def isolated_state(self, tmp_path, monkeypatch):
         monkeypatch.setenv("MLX_VLM_COMPACTION_KEY_FILE", str(tmp_path / "key"))
         monkeypatch.setattr(server.runtime.config, "max_kv_size", None)
-        monkeypatch.setattr(server.runtime.config, "chat_compaction_threshold", None)
         server.response_store.clear()
         server.response_store_order.clear()
 
@@ -2618,9 +2617,9 @@ class TestCompaction:
                 messages=[_compaction_message("old evidence " * 180) for _ in range(10)]
                 + [items[-1]],
                 max_tokens=64,
-            )
-            monkeypatch.setattr(
-                server.runtime.config, "chat_compaction_threshold", 100000
+                context_management=[
+                    {"type": "compaction", "compact_threshold": 100000}
+                ],
             )
         else:
             options.update(
@@ -2747,15 +2746,14 @@ class TestCompaction:
         )
         assert items == original
 
-    @pytest.mark.parametrize("setting", [None, 1])
-    def test_chat_compaction_opt_in_and_explicit_disable(
-        self, mocked, client, monkeypatch, setting
+    @pytest.mark.parametrize("options", [{}, {"context_management": []}])
+    def test_chat_compaction_is_disabled_without_request_control(
+        self, mocked, client, options
     ):
-        monkeypatch.setattr(server.runtime.config, "chat_compaction_threshold", setting)
         response = _post(
             client,
             messages=[_compaction_message("hello")],
-            context_management=[] if setting else None,
+            **options,
         )
         assert response.status_code == 200
         assert mocked.generate.call_count == 1
@@ -2801,23 +2799,6 @@ class TestCompaction:
         assert counted.args == generated.args
         for field in ("tools", "tool_choice", "num_images"):
             assert counted.kwargs.get(field) == generated.kwargs.get(field)
-
-    def test_chat_compaction_runtime_setting_is_live_and_validated(self, monkeypatch):
-        monkeypatch.setenv("MLX_VLM_CHAT_COMPACTION_THRESHOLD", "7000")
-        config = RuntimeConfig.from_env()
-        fingerprint = config.fingerprint()
-        assert config.chat_compaction_threshold == 7000
-        for value in (-1, 0):
-            applied, rejected = config.apply_changes(
-                {"chat_compaction_threshold": value}
-            )
-            assert not applied and rejected
-            monkeypatch.setenv("MLX_VLM_CHAT_COMPACTION_THRESHOLD", str(value))
-            with pytest.raises(ValueError, match="must be positive"):
-                RuntimeConfig.from_env()
-        applied, rejected = config.apply_changes({"chat_compaction_threshold": None})
-        assert not rejected and applied == {"chat_compaction_threshold": None}
-        assert config.fingerprint() == fingerprint
 
     @pytest.mark.parametrize("stream", [False, True])
     @pytest.mark.parametrize("short", [False, True])
@@ -4155,7 +4136,6 @@ class TestResponseGenerator:
             _assert_fields(vars(server._build_gen_args(legacy)), **expected)
 
     def test_server_cli_sets_thinking_defaults(self, monkeypatch):
-        monkeypatch.setattr(server.runtime.config, "chat_compaction_threshold", None)
         flags = [
             ("model", "PRELOAD_MODEL", "demo"),
             ("image-model", "PRELOAD_IMAGE_MODEL", "image-demo"),
@@ -4167,7 +4147,6 @@ class TestResponseGenerator:
             ("thinking-start-token", "THINKING_START_TOKEN", "<|START_THINKING|>"),
             ("thinking-eos-token", "THINKING_END_TOKEN", "<|END_THINKING|>"),
             ("api-key", "SERVER_API_KEY", "admin-token"),
-            ("chat-compaction-threshold", "CHAT_COMPACTION_THRESHOLD", "7000"),
         ]
         expected = {"MLX_VLM_" + env: value for _, env, value in flags}
         expected["MLX_VLM_ENABLE_THINKING"] = "1"
@@ -4195,7 +4174,6 @@ class TestResponseGenerator:
                 os.environ.pop(key, None)
             cli.main()
             _assert_fields(os.environ, **expected)
-            assert server.runtime.config.chat_compaction_threshold == 7000
             assert run.call_args.kwargs["host"] == "127.0.0.1"
 
     def test_lifespan_continues_when_optional_preload_fails(self, monkeypatch):

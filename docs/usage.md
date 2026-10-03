@@ -118,20 +118,12 @@ decoded context, not the encrypted payload's string length. Normal response
 usage counts the final inference; explicit compact usage counts the summary pass.
 
 Chat Completions accepts the same `context_management` field as an opt-in MLX
-extension. To enable it for clients that do not send that field:
-
-```bash
-mlx_vlm.server --model openbmb/MiniCPM5-2B --max-kv-size 10000 \
-  --max-tokens 1024 --chat-compaction-threshold 7000
-```
-
-The default is disabled. `MLX_VLM_CHAT_COMPACTION_THRESHOLD` and the live server
-setting `chat_compaction_threshold` configure the same token threshold; a request
-with `context_management: []` disables it. This path supports text, images, and
-tool history, and rejects unsupported audio/video content. Compaction finishes
-before the Chat Completions stream opens and leaves its response format unchanged.
-It is request-local: clients that resend their full history may need compaction
-again on later requests. Responses clients can reuse the returned compaction item.
+extension. Compaction is disabled when the field is omitted or empty. This path
+supports text, images, and tool history, and rejects unsupported audio/video
+content. Compaction finishes before the Chat Completions stream opens and leaves
+its response format unchanged. It is request-local: clients that resend their
+full history may need compaction again on later requests. Responses clients can
+reuse the returned compaction item.
 
 Streaming automatic compaction and terminal `compaction_trigger` requests emit
 request-scoped MLX extension events after `response.created` / `response.in_progress`
