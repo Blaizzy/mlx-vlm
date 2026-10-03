@@ -1,3 +1,6 @@
+"""Reserved contrastive loss functions shared by embedding modalities."""
+
+
 def infonce_loss():
     return
 

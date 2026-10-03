@@ -1,5 +1,13 @@
+"""Shared trainer primitives that are independent of task and modality.
+
+Keep generic configuration helpers, parameter utilities, and adapter persistence
+here. The optimization lifecycle belongs in ``runner.py`` and distributed
+coordination belongs in ``distributed.py``.
+"""
+
 import json
 import math
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Union
 
@@ -21,6 +29,29 @@ class Colors:
 
 
 not_supported_for_training = {"gemma3n", "qwen3_omni"}
+
+
+@dataclass
+class TrainingArgs:
+    """Configuration shared by all iterative training recipes."""
+
+    batch_size: int = field(default=4, metadata={"help": "Minibatch size."})
+    iters: int = field(default=100, metadata={"help": "Iterations to train for."})
+    val_batches: int = field(default=25, metadata={"help": "Validation batches."})
+    steps_per_report: int = field(default=10, metadata={"help": "Report cadence."})
+    steps_per_eval: int = field(default=200, metadata={"help": "Evaluation cadence."})
+    steps_per_save: int = field(default=100, metadata={"help": "Checkpoint cadence."})
+    max_seq_length: int = field(
+        default=2048, metadata={"help": "Maximum sequence length."}
+    )
+    adapter_file: str = field(default="adapters.safetensors")
+    grad_checkpoint: bool = field(default=False)
+    learning_rate: float = field(default=1e-5)
+    grad_clip: float | None = field(default=1.0)
+    warmup_steps: int = field(default=100)
+    min_learning_rate: float = field(default=1e-6)
+    full_finetune: bool = field(default=False)
+    gradient_accumulation_steps: int = field(default=1)
 
 
 def grad_checkpoint(layer):

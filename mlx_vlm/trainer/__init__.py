@@ -1,11 +1,9 @@
-# Backward-compatible re-exports for the refactored trainer package.
-# New code should import directly from the modality subpackages:
-#   mlx_vlm.trainer.vlm.*     – Vision-Language trainers & datasets
-#   mlx_vlm.trainer.peft.*    – LoRA / DoRA / adapter utilities
-#   mlx_vlm.trainer.core.*    – Generic training infrastructure
-#   mlx_vlm.trainer.stt       – Speech-to-Text (placeholder)
-#   mlx_vlm.trainer.tts       – Text-to-Speech (placeholder)
-#   mlx_vlm.trainer.diffusion – Diffusion models (placeholder)
+"""MLX-VLM training backend.
+
+Shared execution code lives next to this module. Reusable loss math and dataset
+shapes are in ``losses`` and ``datasets``. Modality packages own their training
+algorithms, preprocessing, and recipes.
+"""
 
 from .core import (
     Colors,
@@ -22,8 +20,8 @@ from .peft import (
     DoRAEmbedding,
     DoRALinear,
     LoRAEmbedding,
-    LoRALinear,
     LoRaLayer,
+    LoRALinear,
     LoRASwitchLinear,
     apply_lora_layers,
     find_all_linear_names,
@@ -35,8 +33,10 @@ from .peft import (
     unfreeze_modules,
 )
 from .vlm import (
+    ORPOTrainer,
     ORPOTrainingArgs,
     PreferenceVisionDataset,
+    SFTTrainer,
     TrainingArgs,
     VisionDataset,
     train,

@@ -1,11 +1,18 @@
+"""Next-token dataset preparation with optional image, audio, and video inputs.
+
+This module is intentionally model-aware because it owns processor calls and
+media/token alignment. The public contract lives here because it is task-shaped;
+processors are injected by the modality recipe.
+"""
+
 import json
 import warnings
 
 import mlx.core as mx
 import numpy as np
 
-from ....models.base import to_mlx
-from ....prompt_utils import MODEL_CONFIG, apply_chat_template
+from ...models.base import to_mlx
+from ...prompt_utils import MODEL_CONFIG, apply_chat_template
 
 NATIVE_PREPROCESS_MODELS = set(MODEL_CONFIG.keys())
 
