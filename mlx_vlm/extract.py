@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageOps
 
-from .extraction import METADATA, extract
+from .extraction import METADATA, describe_outputs, extract
 from .utils import load, load_image
 
 
@@ -102,18 +102,7 @@ def _parse_settings(pairs, parser):
 
 def _manifest(task, outputs):
     """Describe named outputs without materializing them into JSON."""
-    described = {
-        name: {
-            "shape": list(np.asarray(value).shape),
-            "dtype": str(np.asarray(value).dtype),
-        }
-        for name, value in outputs.items()
-        if name != METADATA
-    }
-    manifest = {"task": task, "outputs": described}
-    if METADATA in outputs:
-        manifest[METADATA] = sorted(outputs[METADATA])
-    return manifest
+    return {"task": task, **describe_outputs(outputs)}
 
 
 def main(argv=None):
