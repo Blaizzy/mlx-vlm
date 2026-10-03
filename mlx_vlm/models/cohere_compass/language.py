@@ -443,8 +443,6 @@ class TextModel(nn.Module):
 
 
 class LanguageModel(nn.Module):
-    supports_logits_to_keep = True
-
     def __init__(self, config: TextConfig):
         super().__init__()
         self.config = config

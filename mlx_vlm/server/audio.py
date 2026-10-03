@@ -527,11 +527,13 @@ def _run_stt_request(request: AudioInferenceRequest) -> None:
     transcription_request = payload.request
     model, _, _ = get_cached_model(transcription_request.model, model_kind="audio_stt")
 
-    suffix = os.path.splitext(payload.filename or "")[1] or ".wav"
     tmp_path = None
     emitted = False
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        # The audio is already decoded PCM and this file only gives the model a
+        # path to open, so always write WAV. Re-encoding the upload's own
+        # container is lossy at best and impossible for m4a/mp4/aac.
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
             tmp_path = tmp.name
         audio_write(tmp_path, payload.audio, payload.sample_rate)
 
@@ -613,6 +615,36 @@ def _iter_stt_items(result):
 
 
 def _stt_item_to_dict(item) -> Dict[str, Any]:
+    data = _stt_item_base_dict(item)
+    # NeMo-alignment STT models (Parakeet, Canary) report timing as ``sentences``
+    # rather than ``segments``; map it across so it survives the ``segments``-keyed
+    # reassembly in ``_transcription_result_from_chunks``.
+    if isinstance(data, dict) and not data.get("segments") and data.get("sentences"):
+        data["segments"] = _sentences_to_segments(data["sentences"])
+    return data
+
+
+def _sentences_to_segments(sentences: Any) -> List[Dict[str, Any]]:
+    segments: List[Dict[str, Any]] = []
+    for index, sentence in enumerate(sentences):
+        if not isinstance(sentence, dict):
+            continue
+        start, end = sentence.get("start"), sentence.get("end")
+        if start is None or end is None:
+            continue
+        text = sentence.get("text")
+        segments.append(
+            {
+                "id": index,
+                "start": start,
+                "end": end,
+                "text": text.strip() if isinstance(text, str) else text,
+            }
+        )
+    return segments
+
+
+def _stt_item_base_dict(item) -> Dict[str, Any]:
     if isinstance(item, bytes):
         return {"text": item.decode("utf-8", errors="replace")}
     if isinstance(item, str):

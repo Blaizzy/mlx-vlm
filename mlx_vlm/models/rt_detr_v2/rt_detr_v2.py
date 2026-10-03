@@ -112,8 +112,10 @@ class Model(nn.Module):
         K = self.config.num_queries
         scores_max = enc_scores.max(axis=-1)
         topk_idx = mx.argpartition(-scores_max, K - 1, axis=1)[:, :K]
+        topk_idx = mx.stop_gradient(topk_idx)
         topk_scores = mx.take_along_axis(scores_max, topk_idx, axis=1)
         order = mx.argsort(-topk_scores, axis=1)
+        order = mx.stop_gradient(order)
         topk_idx = mx.take_along_axis(topk_idx, order, axis=1)
 
         gather_idx_b = mx.broadcast_to(topk_idx[:, :, None], (topk_idx.shape[0], K, 4))

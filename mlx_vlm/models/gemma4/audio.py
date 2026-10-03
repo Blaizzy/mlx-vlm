@@ -479,13 +479,17 @@ class AudioEncoder(nn.Module):
         chunk_size = self.config.attention_chunk_size
         max_future_horizon = self.config.attention_context_right
         max_past_horizon = max(0, self.config.attention_context_left - 1)
-        upper_diagonal = max_past_horizon + max_future_horizon
         context_size = chunk_size + max_past_horizon + max_future_horizon
 
-        lower_causal = mx.tril(mx.ones((context_size, chunk_size))).T
-        upper_causal = mx.tril(mx.ones((chunk_size, context_size)), k=upper_diagonal)
-        mask = (lower_causal * upper_causal).astype(mx.bool_)
-        return mask
+        # dist is the query-to-key offset (query minus key position); past keys
+        # are strictly within max_past_horizon, future keys strictly within
+        # max_future_horizon.
+        query = mx.arange(chunk_size)[:, None]
+        context = mx.arange(context_size)[None, :]
+        dist = query + max_past_horizon - context
+        past_valid = (dist >= 0) & (dist < max_past_horizon)
+        future_valid = (dist < 0) & (-dist < max_future_horizon)
+        return (past_valid | future_valid).astype(mx.bool_)
 
     def __call__(self, audio_mel: mx.array, audio_mel_mask: mx.array) -> tuple:
         audio_encodings, current_mask = self.subsample_conv_projection(

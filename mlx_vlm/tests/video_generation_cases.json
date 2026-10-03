@@ -1,0 +1,337 @@
+{
+  "configs": {
+    "transformer": {
+      "class": "MiniMaxH3TransformerConfig",
+      "values": {
+        "num_attention_heads": 1,
+        "attention_head_dim": 6,
+        "hidden_size": 8,
+        "num_layers": 1,
+        "num_refiner_layers": 1,
+        "ffn_dim": 10,
+        "in_channels": 1,
+        "audio_in_channels": 2,
+        "patch_size": [1, 1, 1],
+        "text_dim": 5,
+        "freq_dim": 4,
+        "time_embed_hidden_dim": 6,
+        "time_embed_dim": 4,
+        "rope_freq_dim": 1
+      }
+    },
+    "video_vae": {
+      "class": "MiniMaxH3VideoVAEConfig",
+      "values": {
+        "in_channels": 3,
+        "out_channels": 3,
+        "latent_channels": 4,
+        "block_out_channels": [8, 16],
+        "layers_per_block": 1,
+        "spatial_downsample_factors": [2, 2],
+        "temporal_downsample_factors": [2, 2],
+        "norm_num_groups": 8,
+        "decoder_num_layers": 1,
+        "decoder_num_attention_heads": 2,
+        "decoder_attention_head_dim": 8,
+        "decoder_num_register_tokens": 2,
+        "decoder_ffn_mult": 2,
+        "clip_length": 17,
+        "token_drop": 3,
+        "latents_mean": [0.0, 0.0, 0.0, 0.0],
+        "latents_std": [1.0, 1.0, 1.0, 1.0]
+      }
+    },
+    "audio_vae": {
+      "class": "MiniMaxH3AudioVAEConfig",
+      "values": {
+        "encoder_dim": 4,
+        "encoder_rates": [2, 2],
+        "latent_dim": 32,
+        "latent_channels": 8,
+        "num_attention_heads": 2,
+        "decoder_dim": 16,
+        "decoder_rates": [2, 2],
+        "decoder_kernel_sizes": [4, 4],
+        "resblock_kernel_sizes": [3, 7],
+        "resblock_dilation_sizes": [[1, 3], [1, 3]],
+        "sampling_rate": 32000,
+        "latents_mean": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        "latents_std": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+      }
+    },
+    "pipeline_video_vae": {
+      "class": "MiniMaxH3VideoVAEConfig",
+      "values": {
+        "in_channels": 3,
+        "out_channels": 3,
+        "latent_channels": 1,
+        "block_out_channels": [8, 8, 8, 8, 8],
+        "layers_per_block": 1,
+        "spatial_downsample_factors": [2, 2, 2, 2, 2],
+        "temporal_downsample_factors": [2, 2, 1, 1, 1],
+        "norm_num_groups": 8,
+        "decoder_num_layers": 1,
+        "decoder_num_attention_heads": 1,
+        "decoder_attention_head_dim": 8,
+        "decoder_num_register_tokens": 1,
+        "decoder_ffn_mult": 1,
+        "latents_mean": [0.0],
+        "latents_std": [1.0]
+      }
+    },
+    "pipeline_audio_vae": {
+      "class": "MiniMaxH3AudioVAEConfig",
+      "values": {
+        "encoder_dim": 4,
+        "encoder_rates": [2, 2],
+        "latent_dim": 8,
+        "latent_channels": 2,
+        "num_attention_heads": 1,
+        "decoder_dim": 8,
+        "decoder_rates": [2, 2],
+        "decoder_kernel_sizes": [4, 4],
+        "resblock_kernel_sizes": [3],
+        "resblock_dilation_sizes": [[1]],
+        "latents_mean": [0.0, 0.0],
+        "latents_std": [1.0, 1.0]
+      }
+    }
+  },
+  "qwen": {
+    "model_type": "qwen3_vl",
+    "hidden_size": 12,
+    "intermediate_size": 16,
+    "num_attention_heads": 2,
+    "rms_norm_eps": 1e-06,
+    "vocab_size": 32,
+    "num_key_value_heads": 2,
+    "head_dim": 6,
+    "rope_theta": 10000.0,
+    "max_position_embeddings": 32
+  },
+  "references": {
+    "processor_video": [
+      -1.0,
+      -0.9764705896,
+      -0.9529411793,
+      -0.9294117689,
+      -0.9058823586,
+      -0.8823529482,
+      -0.8588235378,
+      -0.8352941275,
+      -0.8117647171,
+      -0.7882353067,
+      -0.7647058964,
+      -0.741176486,
+      -0.7176470757,
+      -0.6941176653,
+      -0.6705882549,
+      -0.6470588446,
+      0.5058823824,
+      0.5294117928,
+      0.5529412031,
+      0.5764706135,
+      0.6000000238,
+      0.6235294342,
+      0.6470588446,
+      0.6705882549
+    ],
+    "processor_image": [
+      -1.0,
+      -0.9764705896,
+      -0.9529411793,
+      -0.9294117689,
+      -0.9058823586,
+      -0.8823529482,
+      -0.8588235378,
+      -0.8352941275
+    ],
+    "conditioner": [
+      [
+        [
+          -0.0008692872,
+          0.0143544516,
+          -0.0518668033,
+          0.0281886049,
+          -0.088826485,
+          0.036101792,
+          0.0340734236,
+          -0.034286052,
+          0.0559054166,
+          -0.0485159159,
+          0.0682821869,
+          0.0416498594
+        ],
+        [
+          -0.0122771589,
+          0.047581926,
+          0.0924062729,
+          0.0631933957,
+          0.1447156221,
+          -0.0848623663,
+          -0.0704205111,
+          0.0460798815,
+          -0.049061358,
+          -0.0370092504,
+          -0.0613816194,
+          -0.0795182437
+        ],
+        [
+          -0.0960728675,
+          -0.0168740973,
+          -0.0908068568,
+          -0.0215693936,
+          -0.1027236059,
+          -0.0146589465,
+          -0.0097286785,
+          -0.0250200611,
+          0.0191809162,
+          -0.0044598971,
+          0.0220890567,
+          -0.0287228636
+        ],
+        [
+          -0.0046169655,
+          0.0754216537,
+          0.0689876825,
+          0.0728251711,
+          0.0522902757,
+          0.0766496062,
+          0.0754699782,
+          -0.0322860964,
+          0.1001782492,
+          0.0107320528,
+          -0.0313899368,
+          -0.0808366984
+        ]
+      ]
+    ],
+    "transformer_audio": [[[0.3702623, 0.048529133], [0.37101823, 0.056271546]]],
+    "transformer_video": [[[0.35690272], [0.35708505], [0.35721874], [0.35731968]]],
+    "video_pixels": [
+      0.0168855451,
+      0.3830011189,
+      -0.3451227248,
+      0.3849773705,
+      0.0160088632,
+      0.382589519,
+      -0.3445619047,
+      0.3845651448
+    ],
+    "video_latents": [
+      -0.0873808935,
+      -0.0868481994,
+      -0.0734840408,
+      -0.0774308816,
+      -0.0855999961,
+      -0.1233575493,
+      -0.0818316489,
+      -0.1153013855
+    ],
+    "audio_waveform": [
+      -0.0065163295,
+      -0.0028203637,
+      0.0028824992,
+      0.0113496268,
+      0.0075704525,
+      0.0072223009,
+      0.0065093203,
+      0.0071694441
+    ],
+    "audio_logs": [
+      -0.0412009582,
+      -0.0375841446,
+      -0.0377684683,
+      -0.0377356336,
+      -0.0374392867,
+      -0.0373374224,
+      -0.0373311266,
+      -0.0381926671
+    ],
+    "audio_mean": [
+      -0.0414157696,
+      -0.0378905796,
+      -0.0380623564,
+      -0.0380322821,
+      -0.0377460718,
+      -0.0376516134,
+      -0.0376482755,
+      -0.0384906232
+    ],
+    "upsampled_frame_indices": [0, 0, 1, 1, 1, 2, 2, 3, 3, 3, 4, 4, 5, 5, 6, 6, 6, 7, 7, 8, 8, 8, 9, 9]
+  },
+  "qwen_model": {
+    "model_type": "qwen3_vl",
+    "image_token_id": 29,
+    "video_token_id": 30,
+    "vision_start_token_id": 28,
+    "vision_end_token_id": 27,
+    "vision_config": {
+      "depth": 1,
+      "hidden_size": 8,
+      "intermediate_size": 16,
+      "out_hidden_size": 12,
+      "num_heads": 2,
+      "patch_size": 2,
+      "spatial_patch_size": 2,
+      "spatial_merge_size": 2,
+      "temporal_patch_size": 2,
+      "num_position_embeddings": 16,
+      "fullatt_block_indexes": [0],
+      "deepstack_visual_indexes": []
+    }
+  },
+  "downloads": [
+    {
+      "id": "t2va",
+      "module": "minimax_h3.download",
+      "config": {"workflow": "t2va", "repo_id": "test-org/minimax-h3", "revision": "test-revision", "max_workers": 2},
+      "repo_id": "test-org/minimax-h3",
+      "validator": "validate_official_layout",
+      "validation_options": {"partition": "fl2va"},
+      "required_patterns": ["transformer/**"],
+      "excluded_patterns": ["transformer_ref/**"],
+      "forwarded": {"revision": "test-revision"}
+    },
+    {
+      "id": "ref2va",
+      "module": "minimax_h3.download",
+      "config": {"workflow": "ref2va", "repo_id": "test-org/minimax-h3", "revision": "test-revision", "max_workers": 2},
+      "repo_id": "test-org/minimax-h3",
+      "validator": "validate_official_layout",
+      "validation_options": {"partition": "ref2va"},
+      "required_patterns": ["transformer_ref/**"],
+      "excluded_patterns": ["transformer/**"],
+      "forwarded": {"revision": "test-revision"}
+    }
+  ],
+  "vae": [
+    {
+      "id": "video",
+      "config": "video_vae",
+      "shape": [1, 3, 22, 8, 8],
+      "modulus": 31,
+      "offset": 15.0,
+      "scale": 0.01,
+      "output_shapes": {"latents": [1, 4, 7, 2, 2], "decoded": [1, 3, 22, 8, 8]},
+      "references": {
+        "latents": {"name": "video_latents", "rtol": 2e-06, "atol": 2e-07},
+        "decoded": {"name": "video_pixels", "rtol": 2e-06, "atol": 2e-07}
+      }
+    },
+    {
+      "id": "audio",
+      "config": "audio_vae",
+      "shape": [2, 1, 33],
+      "modulus": 23,
+      "offset": 11.0,
+      "scale": 0.02,
+      "output_shapes": {"latents": [2, 8, 9], "decoded": [2, 1, 36]},
+      "references": {
+        "latents": {"name": "audio_mean", "rtol": 1e-06, "atol": 3e-08},
+        "logs": {"name": "audio_logs", "rtol": 1e-06, "atol": 3e-08},
+        "decoded": {"name": "audio_waveform", "rtol": 2e-06, "atol": 2e-08}
+      }
+    }
+  ]
+}

@@ -132,10 +132,13 @@ class Flux2Image:
         guidance: float = 1.0,
         max_sequence_length: int | None = None,
         tiled_vae: bool | None = None,
+        num_images: int = 1,
     ) -> mx.array:
         validate_dimensions(width=width, height=height)
         if steps < 1:
             raise ValueError(f"steps must be >= 1, got {steps}")
+        if num_images < 1:
+            raise ValueError(f"num_images must be at least 1, got {num_images}")
         if not prompt:
             raise ValueError("prompt must not be empty")
 
@@ -151,10 +154,25 @@ class Flux2Image:
             )
         self._ensure_transformer_and_vae()
 
+        if num_images > 1:
+            prompt_embeds = mx.broadcast_to(
+                prompt_embeds, (num_images, *prompt_embeds.shape[1:])
+            )
+            text_ids = mx.broadcast_to(text_ids, (num_images, *text_ids.shape[1:]))
+            if negative_prompt_embeds is not None:
+                negative_prompt_embeds = mx.broadcast_to(
+                    negative_prompt_embeds,
+                    (num_images, *negative_prompt_embeds.shape[1:]),
+                )
+                negative_text_ids = mx.broadcast_to(
+                    negative_text_ids, (num_images, *negative_text_ids.shape[1:])
+                )
+
         latents, latent_ids, latent_height, latent_width = prepare_packed_latents(
             seed=seed,
             height=height,
             width=width,
+            batch_size=num_images,
         )
         scheduler = FlowMatchEulerDiscreteScheduler(
             image_seq_len=(height // 16) * (width // 16),
@@ -590,9 +608,9 @@ def _to_image_array(decoded_latents: mx.array) -> mx.array:
     images = mx.clip(decoded_latents / 2 + 0.5, 0, 1)
     images = mx.transpose(images, (0, 2, 3, 1)).astype(mx.float32)
     images = (images * 255).round().astype(mx.uint8)
-    image = images[0]
-    mx.eval(image)
-    return image
+    result = images[0] if images.shape[0] == 1 else images
+    mx.eval(result)
+    return result
 
 
 def _to_pil(image_array: mx.array) -> Image.Image:

@@ -8,6 +8,12 @@ from .ar import (
     batch_generate,
     generate_step,
 )
+from .audio import (
+    AudioGenerationResult,
+    generate_audio,
+    is_audio_generation_model,
+    save_audio,
+)
 from .cli import main, parse_arguments
 from .common import (
     GenerationResult,
@@ -38,6 +44,7 @@ from .image import (
     load_image_generation_model,
     load_image_model,
 )
+from .image_defaults import ImageSamplingDefaults, resolve_image_defaults
 from .types import GenerateKwargs, ProcessorLike
 from .video_generation import (
     VideoGenerationModel,
@@ -55,6 +62,7 @@ from .video_generation import (
 )
 
 __all__ = [
+    "AudioGenerationResult",
     "BatchGenerator",
     "BatchResponse",
     "BatchStats",
@@ -79,7 +87,10 @@ __all__ = [
     "batch_generate",
     "edit_image",
     "generate",
+    "generate_audio",
     "generate_image",
+    "ImageSamplingDefaults",
+    "resolve_image_defaults",
     "generate_step",
     "generate_video",
     "generation_stream",
@@ -88,6 +99,7 @@ __all__ = [
     "image_to_b64_json",
     "image_to_png_bytes",
     "is_image_edit_model",
+    "is_audio_generation_model",
     "is_image_generation_model",
     "is_video_generation_model",
     "load_image_edit_model",
@@ -97,6 +109,7 @@ __all__ = [
     "main",
     "maybe_quantize_kv_cache",
     "parse_arguments",
+    "save_audio",
     "save_video",
     "stream_generate",
     "video_generation_model_class",

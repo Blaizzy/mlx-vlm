@@ -17,6 +17,7 @@ import numpy as np
 from PIL import Image
 
 from ..utils import get_model_path
+from .image_defaults import ImageSamplingDefaults
 
 DEFAULT_IMAGE_SIZE = "512x512"
 DEFAULT_IMAGE_STEPS = 4
@@ -52,19 +53,25 @@ ImageOutputFormat = Literal["b64_json", "path"]
 ImageTask = Literal["generate", "edit"]
 ImageArrayLayout = Literal["HWC"]
 ImageArrayRange = Literal["uint8_0_255"]
-ImageColorSpace = Literal["RGB"]
+ImageColorSpace = Literal["RGB", "RGBA"]
 
 
 @dataclass(slots=True)
 class ImageGenerationRequest:
     prompt: str
     seed: int | None = None
-    steps: int = DEFAULT_IMAGE_STEPS
+    steps: int | None = None
     width: int = 512
     height: int = 512
-    guidance: float = DEFAULT_IMAGE_GUIDANCE
+    guidance: float | None = None
     output_format: Literal["png"] = DEFAULT_IMAGE_FORMAT
     extra: dict[str, Any] = field(default_factory=dict)
+
+    def resolve_steps(self, default: int = DEFAULT_IMAGE_STEPS) -> int:
+        return default if self.steps is None else self.steps
+
+    def resolve_guidance(self, default: float = DEFAULT_IMAGE_GUIDANCE) -> float:
+        return default if self.guidance is None else self.guidance
 
 
 @dataclass(slots=True)
@@ -94,13 +101,21 @@ class ImageGenerationResult:
     def image(self) -> Image.Image:
         return self.to_pil()
 
-    def to_pil(self) -> Image.Image:
-        if self.layout != "HWC" or self.color_space != "RGB":
+    @property
+    def images(self) -> list[Image.Image]:
+        """Every image in the result: one for `[H, W, C]`, N for `[N, H, W, C]`."""
+        if self.layout != "HWC" or self.color_space not in ("RGB", "RGBA"):
             raise ValueError(
                 f"Cannot convert image layout={self.layout!r} "
                 f"color_space={self.color_space!r} to PIL"
             )
-        return Image.fromarray(np.array(self.array))
+        array = np.array(self.array)
+        if array.ndim == 3:
+            array = array[None]
+        return [Image.fromarray(sub) for sub in array]
+
+    def to_pil(self) -> Image.Image:
+        return self.images[0]
 
     def to_png_bytes(self) -> bytes:
         buffer = BytesIO()
@@ -113,9 +128,17 @@ class ImageGenerationResult:
     def save(self, path: str | Path) -> Path:
         output_path = Path(path).expanduser()
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        self.to_pil().save(output_path)
-        self.path = output_path
-        return output_path
+        images = self.images
+        multi = len(images) > 1
+        paths = []
+        for index, image in enumerate(images):
+            target = output_path
+            if multi:
+                target = output_path.with_stem(f"{output_path.stem}_{index}")
+            image.save(target)
+            paths.append(target)
+        self.path = paths[0]
+        return paths[0]
 
 
 class ImageGenerationModel(Protocol):
@@ -123,6 +146,16 @@ class ImageGenerationModel(Protocol):
     model_type: ClassVar[str]
     model_id: str
     family: str
+
+    @property
+    def default_sampling(self) -> ImageSamplingDefaults:
+        raise NotImplementedError("This model does not expose image sampling defaults")
+
+    @classmethod
+    def resolve_defaults(
+        cls, model: str, *, model_path: Path | None = None
+    ) -> ImageSamplingDefaults:
+        raise NotImplementedError("This model does not expose image sampling defaults")
 
     @classmethod
     def supports_model(cls, model: str) -> bool: ...
@@ -158,6 +191,14 @@ def _model_type_from_id(model: str) -> str:
         "klein": "flux2",
         "mage": "mage_flow",
         "mageflow": "mage_flow",
+        "z": "z_image",
+        "zimage": "z_image",
+        "ming": "ming_image",
+        "mingimage": "ming_image",
+        "ernie": "ernie_image",
+        "ideogram": "ideogram4",
+        "qwen": "qwen_image",
+        "qwenimage": "qwen_image",
     }.get(model_type, model_type)
 
 
@@ -179,6 +220,11 @@ def _model_types_from_class_name(class_name: str) -> tuple[str, ...]:
     candidates: list[str] = []
     for end in range(1, len(tokens) + 1):
         _add_model_type(candidates, "_".join(tokens[:end]))
+        if end > 1:
+            # Preserve mixed-case acronyms such as LLaDA in LLaDAImagePipeline.
+            _add_model_type(
+                candidates, "".join(tokens[: end - 1]) + "_" + tokens[end - 1]
+            )
     for token in tokens:
         _add_model_type(candidates, token)
     return tuple(candidates)
@@ -240,6 +286,8 @@ def _image_model_type_from_manifest(metadata: dict[str, Any]) -> str | None:
 def _image_model_type_from_component_indexes(root: Path) -> str | None:
     transformer_index = _load_json_file(
         root / "transformer" / "model.safetensors.index.json"
+    ) or _load_json_file(
+        root / "transformer" / "diffusion_pytorch_model.safetensors.index.json"
     )
     if transformer_index is None:
         return None
@@ -254,6 +302,29 @@ def _image_model_type_from_component_indexes(root: Path) -> str | None:
     }
     if flux2_markers <= keys:
         return "flux2"
+    z_image_markers = {
+        "layers.0.feed_forward.w1.weight",
+        "context_refiner.0.attention.to_q.weight",
+        "noise_refiner.0.adaLN_modulation.0.weight",
+    }
+    if z_image_markers <= keys:
+        if (root / "mllm" / "config.json").exists():
+            return "ming_image"
+        return "z_image"
+    ernie_image_markers = {
+        "adaln_modulation.weight",
+        "final_norm.linear.weight",
+        "layers.0.adaLN_sa_ln.weight",
+    }
+    if ernie_image_markers <= keys:
+        return "ernie_image"
+    qwen_image_markers = {
+        "transformer_blocks.0.img_mlp.gate_layer.weight",
+        "txt_in.text_norm.weight",
+        "txt_in.in_layer.weight",
+    }
+    if qwen_image_markers <= keys:
+        return "qwen_image"
     return None
 
 
@@ -614,8 +685,6 @@ def run_image_generation_cli(args: Any) -> None:
     _validate_image_generation_args(args, task=task)
     seed = args.seed if args.seed is not None else random.randrange(2**32)
     steps = getattr(args, "steps", None)
-    if steps is None:
-        steps = DEFAULT_IMAGE_STEPS
     prompt = _prompt_to_image_text(args.prompt)
     if not prompt:
         raise ValueError(f"--prompt must not be empty for image {task}")

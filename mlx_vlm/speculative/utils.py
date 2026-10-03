@@ -3,7 +3,6 @@ from typing import Any, Callable, Generator, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..models import cache
 from .common import (
     _dflash_block_total,
     _format_speculative_stats,
@@ -18,6 +17,7 @@ from .dflash import (
     _dflash_next_block_size,
     _dflash_rounds,
     _dflash_rounds_batch,
+    _reserve_dflash_target_cache,
 )
 from .eagle3 import _eagle3_capture_layer_ids, _eagle3_rounds, _eagle3_rounds_batch
 from .mtp import (
@@ -40,6 +40,7 @@ __all__ = [
     "_dflash_block_total",
     "_dflash_committed_hidden_segments",
     "_dflash_next_block_size",
+    "_reserve_dflash_target_cache",
     "_dflash_rounds",
     "_dflash_rounds_batch",
     "_effective_mtp_block_size",
@@ -70,6 +71,14 @@ __all__ = [
 
 def format_speculative_stats(draft_model: nn.Module) -> Optional[str]:
     return _format_speculative_stats(draft_model)
+
+
+def _validate_speculative_sampling(draft_model: nn.Module, greedy: bool) -> None:
+    if getattr(draft_model, "requires_greedy_sampling", False) and not greedy:
+        raise ValueError(
+            f"{type(draft_model).__name__} supports greedy speculative decoding "
+            "only; set temperature=0."
+        )
 
 
 def get_speculative_rounds_batch(draft_kind: str):
@@ -106,6 +115,33 @@ def speculative_hidden_state(draft_kind: str, outputs):
     )
 
 
+class SpeculativePrefill:
+    """Retain the target features needed by a drafter across prompt chunks."""
+
+    def __init__(self, draft_kind, drafter):
+        self.kwargs = (
+            speculative_prefill_kwargs(draft_kind, drafter)
+            if drafter is not None and draft_kind in ("dflash", "eagle3")
+            else {}
+        )
+        self.chunks = []
+
+    def append(self, output):
+        if self.kwargs:
+            hidden = output.hidden_states
+            mx.async_eval(hidden)
+            self.chunks.append(hidden)
+
+    def finish(self, output):
+        if self.chunks:
+            self.chunks.append(output.hidden_states)
+            output.hidden_states = [
+                mx.concatenate(parts, axis=1) for parts in zip(*self.chunks)
+            ]
+            self.chunks.clear()
+        return output
+
+
 def make_speculative_prompt_cache(
     lm,
     *,
@@ -114,8 +150,10 @@ def make_speculative_prompt_cache(
     left_padding,
     make_cache: Callable,
 ):
-    if batch_size == 1:
-        return cache.make_prompt_cache(lm)
+    # Every drafter builds its prompt cache through `make_cache`, so the cache
+    # type the server asked for with --kv-bits is what speculation runs on. The
+    # batch caches it returns satisfy the rollback contract speculation needs
+    # (`is_trimmable`/`trim`/`zero_row_tail`).
     return make_cache(lm, left_padding)
 
 
@@ -139,6 +177,7 @@ def run_speculative_server_rounds(
     row_ids: Optional[List[int]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     batch_size = int(first_bonus.shape[0]) if first_bonus.ndim > 0 else 1
+    _validate_speculative_sampling(draft_model, greedy_sampling)
 
     if draft_kind == "eagle3":
         if batch_size == 1:
@@ -184,6 +223,7 @@ def run_speculative_server_rounds(
             prompt_cache,
             hidden,
             shared_kv_states,
+            prompt_tokens=prompt_tokens,
             first_bonus=first_bonus,
             max_tokens=max_tokens,
             sampler=sampler,
@@ -208,6 +248,7 @@ def run_speculative_server_rounds(
                 sampler=sampler,
                 draft_block_size=draft_block_size,
                 token_dtype=token_dtype,
+                greedy_sampling=greedy_sampling,
             ):
                 yield [tok], state
                 if stop_check is not None and stop_check(0, tok):
@@ -225,6 +266,8 @@ def run_speculative_server_rounds(
             draft_block_size=draft_block_size,
             token_dtype=token_dtype,
             stop_check=stop_check,
+            greedy_sampling=greedy_sampling,
+            row_ids=row_ids,
         )
         return
 
@@ -249,6 +292,7 @@ def run_speculative_rounds(
     sampler_is_greedy: bool = False,
 ) -> Generator[Tuple[Any, mx.array], None, None]:
     B = input_ids.shape[0]
+    _validate_speculative_sampling(draft_model, sampler_is_greedy)
 
     if draft_kind == "mtp":
         shared_kv_states = last_outputs.shared_kv_states
@@ -291,6 +335,7 @@ def run_speculative_rounds(
                 prompt_cache,
                 hidden,
                 shared_kv_states,
+                prompt_tokens=input_ids,
                 first_bonus=first_bonus,
                 max_tokens=max_tokens,
                 sampler=sampler,
@@ -367,6 +412,7 @@ def run_speculative_rounds(
             sampler=sampler,
             draft_block_size=draft_block_size,
             token_dtype=input_ids.dtype,
+            greedy_sampling=sampler_is_greedy,
         )
     else:
         mx.eval(first_token)
@@ -382,4 +428,5 @@ def run_speculative_rounds(
             sampler=sampler,
             draft_block_size=draft_block_size,
             token_dtype=input_ids.dtype,
+            greedy_sampling=sampler_is_greedy,
         )

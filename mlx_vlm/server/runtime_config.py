@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import threading
 from dataclasses import dataclass, field
@@ -74,22 +75,93 @@ KNOBS: Tuple[
     ),
     ("apc_enabled", "bool", False, TEXT_KINDS, None, "Prefix caching on/off."),
     (
+        "apc_disk_enabled",
+        "bool",
+        True,
+        TEXT_KINDS,
+        None,
+        "APC disk persistence on/off.",
+    ),
+    (
         "apc_disk_path",
         "str_or_none",
         None,
         TEXT_KINDS,
         None,
-        "APC disk tier directory.",
+        "APC disk directory; null uses the default cache directory, empty disables disk.",
     ),
     ("apc_block_size", "int", 16, TEXT_KINDS, None, "APC block size (tokens)."),
-    ("apc_num_blocks", "int", 2048, TEXT_KINDS, None, "APC block pool capacity."),
+    (
+        "apc_num_blocks",
+        "int",
+        2048,
+        TEXT_KINDS,
+        None,
+        "APC block pool capacity; 0 disables block retention.",
+    ),
     (
         "apc_disk_max_gb",
         "float_or_none",
         None,
         TEXT_KINDS,
         None,
-        "APC disk tier cap (GB).",
+        "APC disk tier cap (GiB); None defaults to 20, 0 is uncapped.",
+    ),
+    (
+        "apc_memory_max_gb",
+        "float_or_none",
+        None,
+        TEXT_KINDS,
+        None,
+        "Resident APC budget (GiB); null = automatic, 0 = disk-only retention.",
+    ),
+    (
+        "apc_memory_reserve_gb",
+        "float_or_none",
+        None,
+        TEXT_KINDS,
+        None,
+        "Additional prefill headroom (GiB); null = automatic, 0 = no fixed reserve.",
+    ),
+    (
+        "apc_disk_queue_max_gb",
+        "float_or_none",
+        1.0,
+        TEXT_KINDS,
+        None,
+        "Queued disk tensor budget (GiB); null = 1 GiB, 0 = synchronous writes.",
+    ),
+    (
+        "apc_disk_shard_max_blocks",
+        "int",
+        256,
+        TEXT_KINDS,
+        None,
+        "Maximum blocks per disk shard.",
+    ),
+    (
+        "apc_checkpoint_entries",
+        "int",
+        2,
+        TEXT_KINDS,
+        None,
+        "Resident checkpoint entries and hybrid capture bound; 0 = disk-only checkpoints.",
+    ),
+    (
+        "apc_checkpoint_interval_tokens",
+        "int",
+        2048,
+        TEXT_KINDS,
+        None,
+        "Intermediate hybrid checkpoint spacing; 0 = final checkpoint only.",
+    ),
+    (
+        "apc_checkpoint_guard_tokens",
+        "int",
+        1,
+        TEXT_KINDS,
+        None,
+        "Tokens retained after the final reusable checkpoint.",
     ),
     (
         "max_kv_size",
@@ -149,12 +221,49 @@ _KNOB_SPEC: Dict[str, Dict[str, Any]] = {
 _LIVE_KNOBS: Tuple[str, ...] = ("max_kv_size", "token_queue_timeout")
 
 
-def _env_float(name: str, default: Optional[float]) -> Optional[float]:
+def _env_float(
+    name: str, default: Optional[float], *, zero_is_none: bool = True
+) -> Optional[float]:
     raw = os.environ.get(name)
     if raw is None or raw == "":
         return default
     value = float(raw)
-    return default if value == 0 else value
+    return default if zero_is_none and value == 0 else value
+
+
+def _coerce_apc(name: str, spec: Dict[str, Any], raw: Any) -> Any:
+    """APC zero/empty values have meaning; reject invalid sizes before reload."""
+    kind = spec["type"]
+    if kind == "bool":
+        return _coerce(kind, raw)
+    if kind == "str_or_none":
+        if raw is not None and not isinstance(raw, str):
+            raise ValueError("expected a string or null")
+        return raw
+    if kind == "float_or_none" and (raw is None or raw == ""):
+        return None
+    if isinstance(raw, bool):
+        raise ValueError("expected a number, got a boolean")
+    value = int(raw) if kind == "int" else float(raw)
+    if kind == "int" and isinstance(raw, float) and raw != value:
+        raise ValueError("expected a whole number")
+    minimum = (
+        1
+        if name
+        in (
+            "apc_block_size",
+            "apc_disk_shard_max_blocks",
+            "apc_checkpoint_guard_tokens",
+        )
+        else 0
+    )
+    if (
+        not math.isfinite(value)
+        or value < minimum
+        or (name.endswith("_gb") and not math.isfinite(value * (1 << 30)))
+    ):
+        raise ValueError(f"expected a finite number >= {minimum}")
+    return value
 
 
 def _env_int(name: str, default: Optional[int]) -> Optional[int]:
@@ -189,10 +298,18 @@ class RuntimeConfig:
     kv_value_scheme: Optional[str] = None
     quantized_kv_start: Optional[int] = None
     apc_enabled: bool = False
+    apc_disk_enabled: bool = True
     apc_disk_path: Optional[str] = None
     apc_block_size: int = 16
     apc_num_blocks: int = 2048
     apc_disk_max_gb: Optional[float] = None
+    apc_memory_max_gb: Optional[float] = None
+    apc_memory_reserve_gb: Optional[float] = None
+    apc_disk_queue_max_gb: Optional[float] = 1.0
+    apc_disk_shard_max_blocks: int = 256
+    apc_checkpoint_entries: int = 2
+    apc_checkpoint_interval_tokens: int = 2048
+    apc_checkpoint_guard_tokens: int = 1
     max_kv_size: Optional[int] = None
     token_queue_timeout: Optional[float] = DEFAULT_TOKEN_QUEUE_TIMEOUT
     spec_draft_model: Optional[str] = None
@@ -219,10 +336,37 @@ class RuntimeConfig:
             quantized_kv_start=_env_int("QUANTIZED_KV_START", None),
             apc_enabled=os.environ.get("APC_ENABLED", "0").lower()
             in ("1", "true", "yes"),
-            apc_disk_path=os.environ.get("APC_DISK_PATH") or None,
+            apc_disk_enabled=os.environ.get("APC_DISK_ENABLED", "1").lower()
+            in ("1", "true", "yes"),
+            apc_disk_path=os.environ.get("APC_DISK_PATH"),
             apc_block_size=int(os.environ.get("APC_BLOCK_SIZE", "16")),
             apc_num_blocks=int(os.environ.get("APC_NUM_BLOCKS", "2048")),
-            apc_disk_max_gb=_env_float("APC_DISK_MAX_GB", None),
+            apc_disk_max_gb=_env_float("APC_DISK_MAX_GB", None, zero_is_none=False),
+            apc_memory_max_gb=_env_float("APC_MEMORY_MAX_GB", None, zero_is_none=False),
+            apc_memory_reserve_gb=_env_float(
+                "APC_MEMORY_RESERVE_GB", None, zero_is_none=False
+            ),
+            apc_disk_queue_max_gb=_env_float(
+                "APC_DISK_QUEUE_MAX_GB", 1.0, zero_is_none=False
+            ),
+            apc_disk_shard_max_blocks=int(
+                os.environ.get("APC_DISK_SHARD_MAX_BLOCKS", "256")
+            ),
+            apc_checkpoint_entries=int(
+                os.environ.get(
+                    "APC_CHECKPOINT_ENTRIES",
+                    os.environ.get("APC_EXACT_CACHE_ENTRIES", "2"),
+                )
+            ),
+            apc_checkpoint_interval_tokens=int(
+                os.environ.get("APC_CHECKPOINT_INTERVAL_TOKENS", "2048")
+            ),
+            apc_checkpoint_guard_tokens=int(
+                os.environ.get(
+                    "APC_CHECKPOINT_GUARD_TOKENS",
+                    os.environ.get("APC_EXACT_PREFIX_GUARD_TOKENS", "1"),
+                )
+            ),
             max_kv_size=_env_int("MAX_KV_SIZE", None),
             token_queue_timeout=_env_token_queue_timeout(),
             spec_draft_model=os.environ.get("MLX_VLM_DRAFT_MODEL") or None,
@@ -249,6 +393,15 @@ class RuntimeConfig:
         with self._lock:
             return {name: getattr(self, name) for name in _KNOB_SPEC}
 
+    def apc_overrides(self) -> Dict[str, Any]:
+        """Snapshot all APC settings for manager creation without changing env."""
+        with self._lock:
+            return {
+                name.removeprefix("apc_"): getattr(self, name)
+                for name in _KNOB_SPEC
+                if name.startswith("apc_")
+            }
+
     def apply_changes(
         self, payload: Dict[str, Any], op: str = "merge"
     ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
@@ -273,14 +426,18 @@ class RuntimeConfig:
                     continue
                 spec = _KNOB_SPEC[name]
                 try:
-                    value = _coerce(spec["type"], raw, spec.get("allowed"))
+                    value = (
+                        _coerce_apc(name, spec, raw)
+                        if name.startswith("apc_")
+                        else _coerce(spec["type"], raw, spec.get("allowed"))
+                    )
                     if (
                         name == "token_queue_timeout"
                         and value is not None
                         and value < 0
                     ):
                         value = None
-                except (TypeError, ValueError) as exc:
+                except (TypeError, ValueError, OverflowError) as exc:
                     rejected.append({"name": name, "reason": str(exc)})
                     continue
                 setattr(self, name, value)
@@ -307,7 +464,7 @@ class RuntimeConfig:
 
     def fingerprint(self, kinds: Optional[Iterable[str]] = None) -> str:
         kind_set = set(kinds) if kinds is not None else None
-        items: List[Tuple[str, str]] = []
+        items: List[Tuple[str, Any]] = []
         with self._lock:
             for name in _KNOB_SPEC:
                 if not self._in_cache_key(name):
@@ -316,7 +473,7 @@ class RuntimeConfig:
                 if kind_set is not None and not (set(spec["reload_kinds"]) & kind_set):
                     continue
                 value = getattr(self, name)
-                items.append((name, "" if value is None else str(value)))
+                items.append((name, value))
         blob = json.dumps(sorted(items), sort_keys=True).encode()
         return hashlib.sha256(blob).hexdigest()
 
