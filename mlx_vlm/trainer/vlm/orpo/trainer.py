@@ -3,6 +3,7 @@
 import time
 from dataclasses import dataclass, field
 from functools import partial
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -11,13 +12,13 @@ from mlx.nn.utils import average_gradients
 from mlx.utils import tree_map
 from tqdm import tqdm
 
-from .sft_trainer import (
+from ...core import Colors, grad_checkpoint, save_adapter
+from ..sft.trainer import (
     TrainingArgs,
     _collate_arrays,
     _resolve_adapter_file,
     _squeeze_leading_batch_dim,
 )
-from .utils import Colors, grad_checkpoint, save_adapter
 
 
 @dataclass
@@ -491,4 +492,29 @@ def train_orpo(
         save_adapter(model, adapter_file)
         print(
             f"{Colors.OKGREEN}Saved final adapter weights to {adapter_file}.{Colors.ENDC}"
+        )
+
+
+@dataclass
+class ORPOTrainer:
+    """Configure and run the functional preference-training recipe."""
+
+    model: nn.Module
+    optimizer: Any
+    train_dataset: Any
+    val_dataset: Any = None
+    args: ORPOTrainingArgs = field(default_factory=ORPOTrainingArgs)
+    train_on_completions: bool = False
+    assistant_id: int = 77091
+
+    def fit(self):
+        """Run training with the configured model, data, and options."""
+        return train_orpo(
+            model=self.model,
+            optimizer=self.optimizer,
+            train_dataset=self.train_dataset,
+            val_dataset=self.val_dataset,
+            args=self.args,
+            train_on_completions=self.train_on_completions,
+            assistant_id=self.assistant_id,
         )

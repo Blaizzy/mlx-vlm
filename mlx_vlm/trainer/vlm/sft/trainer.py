@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -13,7 +14,7 @@ from mlx.nn.utils import average_gradients
 from mlx.utils import tree_map
 from tqdm import tqdm
 
-from .utils import Colors, grad_checkpoint, save_adapter
+from ...core import Colors, TrainingArgs, grad_checkpoint, save_adapter
 
 
 def _squeeze_leading_batch_dim(value):
@@ -62,63 +63,6 @@ def _collate_grid_thw(values):
             )
         rows.append(value)
     return mx.concatenate(rows, axis=0)
-
-
-@dataclass
-class TrainingArgs:
-    batch_size: int = field(default=4, metadata={"help": "Minibatch size."})
-    iters: int = field(default=100, metadata={"help": "Iterations to train for."})
-    val_batches: int = field(
-        default=25,
-        metadata={
-            "help": "Number of validation batches, -1 uses the entire validation set."
-        },
-    )
-    steps_per_report: int = field(
-        default=10,
-        metadata={"help": "Number of training steps between loss reporting."},
-    )
-    steps_per_eval: int = field(
-        default=200, metadata={"help": "Number of training steps between validations."}
-    )
-    steps_per_save: int = field(
-        default=100, metadata={"help": "Save the model every number steps"}
-    )
-    max_seq_length: int = field(
-        default=2048, metadata={"help": "Maximum sequence length."}
-    )
-    adapter_file: str = field(
-        default="adapters.safetensors",
-        metadata={"help": "Save/load path for the trained adapter weights."},
-    )
-    grad_checkpoint: bool = field(
-        default=False,
-        metadata={"help": "Use gradient checkpointing to reduce memory use."},
-    )
-    learning_rate: float = field(
-        default=1e-5,
-        metadata={"help": "Learning rate."},
-    )
-    grad_clip: float = field(
-        default=1.0,
-        metadata={"help": "Gradient clipping value."},
-    )
-    warmup_steps: int = field(
-        default=100,
-        metadata={"help": "Number of warmup steps for learning rate."},
-    )
-    min_learning_rate: float = field(
-        default=1e-6,
-        metadata={"help": "Minimum learning rate after decay."},
-    )
-    full_finetune: bool = field(
-        default=False,
-        metadata={"help": "Fine-tune the full model instead of adapters."},
-    )
-    gradient_accumulation_steps: int = field(
-        default=1,
-        metadata={"help": "Number of steps to accumulate gradients before updating."},
-    )
 
 
 def _resolve_adapter_file(args: TrainingArgs) -> Path:
@@ -656,4 +600,29 @@ def train(
         save_adapter(model, adapter_file)
         print(
             f"{Colors.OKGREEN}Saved final adapter weights to {adapter_file}.{Colors.ENDC}"
+        )
+
+
+@dataclass
+class SFTTrainer:
+    """Configure and run the functional supervised fine-tuning recipe."""
+
+    model: nn.Module
+    optimizer: Any
+    train_dataset: Any
+    val_dataset: Any = None
+    args: TrainingArgs = field(default_factory=TrainingArgs)
+    train_on_completions: bool = False
+    assistant_id: int = 77091
+
+    def fit(self):
+        """Run training with the configured model, data, and options."""
+        return train(
+            model=self.model,
+            optimizer=self.optimizer,
+            train_dataset=self.train_dataset,
+            val_dataset=self.val_dataset,
+            args=self.args,
+            train_on_completions=self.train_on_completions,
+            assistant_id=self.assistant_id,
         )
