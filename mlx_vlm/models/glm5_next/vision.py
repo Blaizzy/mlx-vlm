@@ -3,6 +3,7 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..rope_utils import rotate_half as _rotate_half
 from .config import VisionConfig
 
 
@@ -10,11 +11,6 @@ def _limited_swiglu(gate: mx.array, up: mx.array, limit: float) -> mx.array:
     gate = mx.minimum(gate, limit)
     up = mx.clip(up, -limit, limit)
     return nn.silu(gate) * up
-
-
-def _rotate_half(x: mx.array) -> mx.array:
-    x1, x2 = mx.split(x, 2, axis=-1)
-    return mx.concatenate([-x2, x1], axis=-1)
 
 
 def _apply_rotary(

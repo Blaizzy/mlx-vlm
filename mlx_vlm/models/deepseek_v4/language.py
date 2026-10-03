@@ -159,6 +159,7 @@ def _expert_select(
     inds = mx.argpartition(-biased, kth=top_k - 1, axis=-1)[..., :top_k].astype(
         mx.int32
     )
+    inds = mx.stop_gradient(inds)
     weights = mx.take_along_axis(scores, inds, axis=-1)
     if scoring_func != "softmax" and norm_topk_prob:
         weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
@@ -705,6 +706,7 @@ class Indexer(nn.Module):
         )
         fscore = (fs * self.scale * wq).sum(axis=1)  # (B,1,Kb*b)
         sel = mx.argpartition(-fscore, kth=k - 1, axis=-1)[..., :k]  # (B,1,k)
+        sel = mx.stop_gradient(sel)
         return mx.take_along_axis(pos, sel, axis=-1)
 
     def __call__(

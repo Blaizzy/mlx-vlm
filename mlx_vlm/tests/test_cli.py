@@ -4,6 +4,7 @@ import argparse
 import importlib
 import inspect
 import io
+import json
 import os
 import subprocess
 import sys
@@ -497,3 +498,113 @@ def test_video_generation_cli(tmp_path, capsys, mode, image, last, workflow):
         assert generate.call_args.kwargs["output_path"] == output
         stdout = capsys.readouterr().out
         assert "workflow=ref2va" in stdout and "generation_fps=" in stdout
+
+
+@pytest.mark.parametrize("state_file", [False, True])
+@pytest.mark.parametrize("questions_file", [False, True])
+def test_decision_cli_routes_inputs_and_returns_json(
+    tmp_path, capsys, monkeypatch, state_file, questions_file
+):
+    from mlx_vlm import decide
+
+    state = "Please refund my café purchase."
+    questions = {"route": {"type": "choice", "criteria": ["billing", "support"]}}
+    result = {"answers": {"route": {"type": "choice", "value": "billing"}}}
+    args = ["--model", "model/path"]
+    for name, value, use_file in (
+        ("state", state, state_file),
+        ("questions", json.dumps(questions), questions_file),
+    ):
+        if use_file:
+            path = tmp_path / name
+            path.write_text(value, encoding="utf-8")
+            args.extend([f"--{name}-file", str(path)])
+        else:
+            args.extend([f"--{name}", value])
+    model, processor = object(), object()
+    load = Mock(return_value=(model, processor))
+    predict = Mock(return_value=result)
+    monkeypatch.setattr(decide, "load", load)
+    monkeypatch.setattr(decide, "predict", predict)
+    decide.main(args)
+    load.assert_called_once_with("model/path")
+    predict.assert_called_once_with(model, processor, state, questions)
+    assert json.loads(capsys.readouterr().out) == result
+
+
+@pytest.mark.parametrize("source", ["inline", "invalid_file", "missing_file"])
+def test_decision_cli_rejects_invalid_questions_before_loading(
+    tmp_path, monkeypatch, source
+):
+    from mlx_vlm import decide
+
+    args = ["--model", "model/path", "--state", "text"]
+    if source == "inline":
+        args.extend(["--questions", "{invalid"])
+    else:
+        path = tmp_path / "questions.json"
+        if source == "invalid_file":
+            path.write_text("{invalid")
+        args.extend(["--questions-file", str(path)])
+    load = Mock()
+    monkeypatch.setattr(decide, "load", load)
+    with pytest.raises(SystemExit) as error:
+        decide.main(args)
+    assert error.value.code == 2
+    load.assert_not_called()
+
+
+def test_decision_cli_reports_unsupported_question(capsys, monkeypatch):
+    from mlx_vlm import decide
+
+    monkeypatch.setattr(
+        decide, "load", lambda path: (NS(decision_types=("choice",)), None)
+    )
+    with pytest.raises(SystemExit) as error:
+        decide.main(
+            [
+                "--model",
+                "model/path",
+                "--state",
+                "text",
+                "--questions",
+                '{"q":{"type":"score","criteria":["low","high"]}}',
+            ]
+        )
+    assert error.value.code == 2
+    assert "does not support 'score'" in capsys.readouterr().err
+
+
+def test_decide_registered_as_package_subcommand():
+    result = subprocess.run(
+        [sys.executable, "-m", "mlx_vlm", "decide", "--help"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "--questions-file" in result.stdout
+    assert "--state-file" in result.stdout
+
+
+@pytest.mark.parametrize("questions", [[], {}, None, "question", {"q": []}])
+@pytest.mark.parametrize("from_file", [False, True])
+def test_decision_cli_rejects_question_structure_before_loading(
+    tmp_path, monkeypatch, capsys, questions, from_file
+):
+    from mlx_vlm import decide
+
+    args = ["--model", "model/path", "--state", "text"]
+    content = json.dumps(questions)
+    if from_file:
+        path = tmp_path / "questions.json"
+        path.write_text(content, encoding="utf-8")
+        args += ["--questions-file", str(path)]
+    else:
+        args += ["--questions", content]
+    load = Mock()
+    monkeypatch.setattr(decide, "load", load)
+    with pytest.raises(SystemExit) as error:
+        decide.main(args)
+    assert error.value.code == 2
+    assert "question" in capsys.readouterr().err.lower()
+    load.assert_not_called()

@@ -76,6 +76,12 @@ def main():
         help="Pre-load an embedding model at startup.",
     )
     parser.add_argument(
+        "--decision-model",
+        type=str,
+        default=None,
+        help="Pre-load a decision model at startup.",
+    )
+    parser.add_argument(
         "--reranker-model",
         type=str,
         default=None,
@@ -306,6 +312,8 @@ def main():
         os.environ["MLX_VLM_PRELOAD_STT_MODEL"] = args.stt_model
     if args.embedding_model:
         os.environ["MLX_VLM_PRELOAD_EMBEDDING_MODEL"] = args.embedding_model
+    if args.decision_model:
+        os.environ["MLX_VLM_PRELOAD_DECISION_MODEL"] = args.decision_model
     if args.reranker_model:
         os.environ["MLX_VLM_PRELOAD_RERANKER_MODEL"] = args.reranker_model
     if args.model_dir is not None:
