@@ -1,17 +1,9 @@
 import json
 from pathlib import Path
-from typing import Union
 
-import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten
 
-from ..core import (
-    get_module_by_name,
-    print_trainable_parameters,
-    save_adapter,
-    set_module_by_name,
-)
+from ..core import get_module_by_name, print_trainable_parameters, set_module_by_name
 from .lora import LoRaLayer
 
 DEFAULT_LORA_NUM_LAYERS = -1

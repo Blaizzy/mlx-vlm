@@ -1,3 +1,5 @@
+"""LoRA, DoRA, and adapter utilities shared by every training modality."""
+
 from .adapter_utils import linear_to_lora_layers, load_adapters
 from .dora_layers import DoRAEmbedding, DoRALinear
 from .lora import LoRaLayer, replace_lora_with_linear
