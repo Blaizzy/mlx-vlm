@@ -16,8 +16,10 @@ from .config import ModelConfig
 
 def _topk(x: mx.array, k: int, axis: int = -1) -> Tuple[mx.array, mx.array]:
     indices = mx.argpartition(-x, kth=k - 1, axis=axis)[..., :k]
+    indices = mx.stop_gradient(indices)
     values = mx.take_along_axis(x, indices, axis=axis)
     order = mx.argsort(-values, axis=axis)
+    order = mx.stop_gradient(order)
     return mx.take_along_axis(values, order, axis=axis), mx.take_along_axis(
         indices, order, axis=axis
     )
@@ -309,6 +311,7 @@ class LanguageModel(nn.Module):
         if p is None or p >= 1.0:
             return logits
         sorted_indices = mx.argsort(-logits, axis=-1)
+        sorted_indices = mx.stop_gradient(sorted_indices)
         sorted_logits = mx.take_along_axis(logits, sorted_indices, axis=-1)
         cumulative_probs = mx.cumsum(
             mx.softmax(sorted_logits, axis=-1, precise=True), axis=-1
@@ -318,6 +321,7 @@ class LanguageModel(nn.Module):
             [mx.zeros_like(sorted_mask[..., :1]), sorted_mask[..., :-1]], axis=-1
         )
         inverse_indices = mx.argsort(sorted_indices, axis=-1)
+        inverse_indices = mx.stop_gradient(inverse_indices)
         mask = mx.take_along_axis(sorted_mask, inverse_indices, axis=-1)
         return mx.where(mask, mx.finfo(logits.dtype).min, logits)
 

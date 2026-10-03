@@ -5,25 +5,10 @@ import mlx.nn as nn
 import numpy as np
 
 from ..attention import VisionAttention as Attention
+from ..base import check_array_shape
 from ..interpolate import resize_bilinear
 from ..mlp import GELUMLP as MLP
 from .config import VisionConfig
-
-
-def check_array_shape(arr):
-    shape = arr.shape
-
-    # Check if the shape has 4 dimensions
-    if len(shape) != 4:
-        return False
-
-    out_channels, kH, KW, _ = shape
-
-    # Check if out_channels is the largest, and kH and KW are the same
-    if (out_channels >= kH) and (out_channels >= KW) and (kH == KW):
-        return True
-    else:
-        return False
 
 
 class EncoderLayer(nn.Module):
@@ -165,7 +150,7 @@ class VisionEmbeddings(nn.Module):
 
         for i in range(batch_size):
             # (1, dim, height, width) -> (1, dim, target_height, target_width)
-            height, width = spatial_shapes[i]
+            height, width = spatial_shapes[i].tolist()
             # Then upsample width dimension
             resized_embeddings = resize_bilinear(
                 positional_embeddings,
@@ -209,7 +194,7 @@ class VisionEmbeddings(nn.Module):
             )
 
             # Add positional embeddings to patch embeddings
-            embeddings = patch_embeds + resized_positional_embeddings
+            embeddings = patch_embeddings + resized_positional_embeddings
         return embeddings
 
 

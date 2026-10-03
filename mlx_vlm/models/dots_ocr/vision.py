@@ -3,24 +3,9 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..base import check_array_shape
+from ..rope_utils import rotate_half
 from .config import VisionConfig
-
-
-def check_array_shape(arr):
-    shape = arr.shape
-
-    if len(shape) != 4:
-        return False
-
-    out_channels, k_h, k_w, _ = shape
-    return (out_channels >= k_h) and (out_channels >= k_w) and (k_h == k_w)
-
-
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return mx.concatenate([-x2, x1], axis=-1)
 
 
 def apply_rotary_pos_emb_vision(tensor, freqs) -> mx.array:
@@ -283,7 +268,7 @@ class VisionModel(nn.Module):
         cu_seqlens = []
         for i in range(grid_thw.shape[0]):
             seq_len = grid_thw[i, 1] * grid_thw[i, 2]
-            cu_seqlens.append(mx.repeat(seq_len, grid_thw[i, 0]))
+            cu_seqlens.append(mx.repeat(seq_len, int(grid_thw[i, 0])))
         cu_seqlens = mx.concatenate(cu_seqlens).astype(mx.int32)
         cu_seqlens = mx.cumsum(cu_seqlens, axis=0)
         cu_seqlens = mx.pad(cu_seqlens, (1, 0), constant_values=0)

@@ -443,6 +443,7 @@ class TalkerSparseMoeBlock(nn.Module):
 
         k = self.top_k
         inds = mx.argpartition(routing_weights, kth=-k, axis=-1)[..., -k:]
+        inds = mx.stop_gradient(inds)
         scores = mx.take_along_axis(routing_weights, inds, axis=-1)
 
         if self.norm_topk_prob:

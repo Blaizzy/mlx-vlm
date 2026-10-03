@@ -174,6 +174,7 @@ class AfmoeMoE(nn.Module):
         k = self.num_experts_per_tok
         inds = mx.argpartition(-selection_scores, kth=k - 1, axis=-1)[..., :k]
 
+        inds = mx.stop_gradient(inds)
         selected_scores = mx.take_along_axis(scores, inds, axis=-1)
 
         if self.route_norm and self.num_experts_per_tok > 1:

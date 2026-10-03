@@ -67,8 +67,14 @@ def compute_axial_cis(
     end_x: int,
     end_y: int,
     theta: float = 10000.0,
+    scale: float = 1.0,
 ) -> Tuple[mx.array, mx.array]:
     """Compute 2D axial rotary position embeddings matching HF Sam3ViTRotaryEmbedding.
+
+    ``scale`` multiplies the grid coordinates, as HF does via its ``rotary_scale``.
+    Global-attention blocks span the whole feature map but keep the window-sized
+    coordinate stride, so they pass ``window_size / feat_size``; windowed blocks
+    pass 1.0. Omitting it makes global-block positions advance too fast.
 
     Returns:
         cos: (end_x*end_y, dim) cosine embeddings
@@ -79,8 +85,8 @@ def compute_axial_cis(
 
     # Grid positions (row-major: y changes with row, x changes with column)
     flat_idx = mx.arange(end_x * end_y)
-    x_positions = (flat_idx % end_x).astype(mx.float32)
-    y_positions = (flat_idx // end_x).astype(mx.float32)
+    x_positions = (flat_idx % end_x).astype(mx.float32) * scale
+    y_positions = (flat_idx // end_x).astype(mx.float32) * scale
 
     # Outer products: (N, dim//4) each
     freqs_x = x_positions[:, None] * freqs[None, :]

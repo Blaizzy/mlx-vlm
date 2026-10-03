@@ -1,7 +1,22 @@
-from transformers import AddedToken
+from transformers import AddedToken, AutoConfig, BartConfig
 from transformers.models.florence2.processing_florence2 import Florence2Processor
 
 from ..base import install_auto_processor_patch
+
+
+class Florence2LanguageConfig(BartConfig):
+    """BART text config under Florence-2's legacy ``florence2_language`` type.
+
+    Published Florence-2 checkpoints label their (BART) text config with this
+    remote-code model_type, which the native Florence-2 support in
+    transformers>=5.14 does not register, so loading raises ``KeyError``.
+    Registering it lets the config load through the native, torch-free path.
+    """
+
+    model_type = "florence2_language"
+
+
+AutoConfig.register("florence2_language", Florence2LanguageConfig, exist_ok=True)
 
 _ORIGINAL_INIT = Florence2Processor.__init__
 
@@ -102,9 +117,10 @@ def _from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
     import json
     from pathlib import Path
 
-    from transformers import AutoImageProcessor, AutoTokenizer
+    from transformers import AutoImageProcessor, AutoTokenizer, CLIPImageProcessor
 
     kwargs.pop("use_fast", None)
+    kwargs["trust_remote_code"] = False
     tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path, **kwargs)
 
     proc_cfg_path = Path(pretrained_model_name_or_path) / "processor_config.json"
@@ -130,6 +146,11 @@ def _from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
             pretrained_model_name_or_path,
             **ip_overrides,
             **kwargs,
+        )
+    except ImportError:
+        image_processor = CLIPImageProcessor.from_pretrained(
+            pretrained_model_name_or_path,
+            **ip_overrides,
         )
     return cls(image_processor=image_processor, tokenizer=tokenizer)
 

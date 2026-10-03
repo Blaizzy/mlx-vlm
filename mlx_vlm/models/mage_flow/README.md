@@ -1,7 +1,9 @@
 # Mage-Flow
 
 Mage-Flow is Microsoft's 4B native-resolution image generation and editing
-family. `mlx-vlm` loads the original Hugging Face Diffusers-style checkpoints
+family. The checkpoints are hosted by the
+[`mage-flow-community`](https://huggingface.co/mage-flow-community)
+organization. `mlx-vlm` loads the Hugging Face Diffusers-style checkpoints
 directly and runs the Qwen3-VL conditioner, NR-MMDiT transformer, Mage-VAE, and
 flow-matching sampler with MLX.
 
@@ -9,12 +11,12 @@ flow-matching sampler with MLX.
 
 | Hugging Face model | Alias | Task | Recommended settings |
 |---|---|---|---|
-| `microsoft/Mage-Flow-Base` | `mage-flow-base` | Generation | 30 steps, guidance 5 |
-| `microsoft/Mage-Flow` | `mage-flow` | Generation | 20 steps, guidance 5 |
-| `microsoft/Mage-Flow-Turbo` | `mage-flow-turbo` | Generation | 4 steps, guidance 1 |
-| `microsoft/Mage-Flow-Edit-Base` | `mage-flow-edit-base` | Editing | 30 steps, guidance 5 |
-| `microsoft/Mage-Flow-Edit` | `mage-flow-edit` | Editing | 30 steps, guidance 5 |
-| `microsoft/Mage-Flow-Edit-Turbo` | `mage-flow-edit-turbo` | Editing | 4 steps, guidance 1 |
+| `mage-flow-community/Mage-Flow-Base` | `mage-flow-base` | Generation | 30 steps, guidance 5 |
+| `mage-flow-community/Mage-Flow` | `mage-flow` | Generation | 20 steps, guidance 5 |
+| `mage-flow-community/Mage-Flow-Turbo` | `mage-flow-turbo` | Generation | 4 steps, guidance 1 |
+| `mage-flow-community/Mage-Flow-Edit-Base` | `mage-flow-edit-base` | Editing | 30 steps, guidance 5 |
+| `mage-flow-community/Mage-Flow-Edit` | `mage-flow-edit` | Editing | 30 steps, guidance 5 |
+| `mage-flow-community/Mage-Flow-Edit-Turbo` | `mage-flow-edit-turbo` | Editing | 4 steps, guidance 1 |
 
 All variants support native resolutions from 512 to 2048 pixels per side,
 including aspect ratios up to 4:1. Width and height must be multiples of 16.
@@ -22,6 +24,26 @@ including aspect ratios up to 4:1. Width and height must be multiples of 16.
 The first load downloads the checkpoint's transformer, VAE, text encoder,
 tokenizer, and scheduler metadata. The text encoder is evicted after prompt
 encoding by default to reduce peak resident memory before denoising.
+
+## Quantization
+
+Convert and quantize the diffusion-transformer blocks:
+
+```sh
+python -m mlx_vlm.models.mage_flow.convert \
+  --hf-path mage-flow-community/Mage-Flow-Turbo \
+  --mlx-path ./Mage-Flow-Turbo-MLX-4bit \
+  --quantize \
+  --q-mode affine \
+  --q-bits 4 \
+  --q-group-size 64
+```
+
+The converted directory can be passed to `--model` like the original
+checkpoint. Supported modes are `affine`, `mxfp4`, `nvfp4`, and `mxfp8`.
+The Qwen conditioner, transformer modulation/input/output projections, and VAE
+remain in the selected floating-point dtype because quantizing these
+quality-sensitive components causes severe image degradation.
 
 ## CLI
 
@@ -31,7 +53,7 @@ Generate with the aligned model:
 mlx_vlm.generate \
   --output-modality image \
   --task generate \
-  --model microsoft/Mage-Flow \
+  --model mage-flow-community/Mage-Flow \
   --prompt "A tiny glass greenhouse on a mossy forest floor at sunrise" \
   --size 1024x1024 \
   --steps 20 \
@@ -59,7 +81,7 @@ Edit one image:
 mlx_vlm.generate \
   --output-modality image \
   --task edit \
-  --model microsoft/Mage-Flow-Edit \
+  --model mage-flow-community/Mage-Flow-Edit \
   --image input/dog.jpg \
   --prompt "Replace the background with a field of sunflowers" \
   --size 1024x1024 \
@@ -92,7 +114,7 @@ from mlx_vlm.generate.image import (
     load_image_generation_model,
 )
 
-model = load_image_generation_model("microsoft/Mage-Flow")
+model = load_image_generation_model("mage-flow-community/Mage-Flow")
 result = generate_image(
     model,
     ImageGenerationRequest(
@@ -111,7 +133,10 @@ result.save("outputs/mage-flow.png")
 from mlx_vlm.generate.edit_image import ImageEditRequest
 from mlx_vlm.generate.image import generate_image, load_image_model
 
-model = load_image_model("microsoft/Mage-Flow-Edit-Turbo", task="edit")
+model = load_image_model(
+    "mage-flow-community/Mage-Flow-Edit-Turbo",
+    task="edit",
+)
 result = generate_image(
     model,
     ImageEditRequest(

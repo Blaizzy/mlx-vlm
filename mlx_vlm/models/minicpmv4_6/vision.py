@@ -4,6 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ..base import check_array_shape
 from .config import VisionConfig
 
 
@@ -11,14 +12,6 @@ def _gelu_from_name(name: str):
     if name in {"gelu_pytorch_tanh", "gelu_new", "gelu_fast", "tanh"}:
         return nn.GELU(approx="tanh")
     return nn.GELU(approx="precise")
-
-
-def check_array_shape(arr):
-    shape = arr.shape
-    if len(shape) != 4:
-        return False
-    out_channels, k_h, k_w, _ = shape
-    return (out_channels >= k_h) and (out_channels >= k_w) and (k_h == k_w)
 
 
 class SiglipAttention(nn.Module):

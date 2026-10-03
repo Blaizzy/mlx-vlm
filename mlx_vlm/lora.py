@@ -18,8 +18,14 @@ from .trainer.peft.utils import (
     get_peft_model,
     unfreeze_modules,
 )
-from .trainer.vlm import ORPOTrainingArgs, TrainingArgs, train, train_orpo
-from .trainer.vlm.datasets import PreferenceVisionDataset, VisionDataset
+from .trainer.vlm import (
+    ORPOTrainingArgs,
+    PreferenceVisionDataset,
+    TrainingArgs,
+    VisionDataset,
+    train,
+    train_orpo,
+)
 from .utils import load
 
 logging.basicConfig(level=logging.INFO)

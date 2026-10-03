@@ -306,6 +306,11 @@ class Gemma4VideoProcessor(BaseVideoProcessor):
         self.image_std = image_std or [1.0, 1.0, 1.0]
         self.default_fps = default_fps
 
+    def video_sampling_defaults(self) -> dict:
+        """Cap decoding at the frame count this processor keeps, so the
+        decoder stops reading frames ``_sample_frames`` would discard."""
+        return {"max_frames": self.num_frames}
+
     def _sample_frames(self, video: np.ndarray, num_frames: int) -> np.ndarray:
         """Uniformly sample ``num_frames`` frames from ``video`` (T, C, H, W)."""
         T = video.shape[0]
@@ -435,6 +440,7 @@ class Gemma4VideoProcessor(BaseVideoProcessor):
 class Gemma4Processor(ProcessorMixin):
     """Combined processor for Gemma 4 (image + text + audio + video)."""
 
+    supports_multiple_audio = True
     model_type = "gemma4"
     attributes = ["image_processor", "tokenizer", "video_processor"]
     image_processor_class = "Gemma4ImageProcessor"

@@ -1,3 +1,5 @@
+from dataclasses import replace
+from math import ceil
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -15,6 +17,14 @@ class RingSlidingKVCache(KVCache):
     until a small decode ring is full. Afterwards, new decode keys/values
     overwrite that ring while absolute positions keep increasing.
     """
+
+    def memory_profile(self, token_count):
+        profile = super().memory_profile(token_count)
+        return replace(
+            profile,
+            fixed_bytes=ceil((self.step - 1) * profile.bytes_per_token),
+            step=1,
+        )
 
     def __init__(self, window_size: int):
         super().__init__()

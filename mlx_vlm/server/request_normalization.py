@@ -1,6 +1,6 @@
 """Normalize compatible API requests into server generation arguments."""
 
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 from ..generate import (
     DEFAULT_REPETITION_CONTEXT_SIZE,
@@ -19,6 +19,32 @@ from .generation import (
 from .runtime import runtime
 
 _DISABLED_REASONING_EFFORTS = {"none", "off", "disabled", "false", "0"}
+
+
+def _normalize_instruction_messages(
+    chat_messages: List[dict],
+    instructions: Optional[str] = None,
+) -> Optional[str]:
+    """Combine API instructions into the leading system message for templates."""
+    instruction_parts = [instructions] if instructions else []
+    conversation = []
+
+    for message in chat_messages:
+        if message.get("role") in ("system", "developer"):
+            content = message.get("content")
+            if content:
+                instruction_parts.append(str(content))
+        else:
+            conversation.append(message)
+
+    normalized_instructions = "\n\n".join(instruction_parts) or None
+    if normalized_instructions:
+        conversation.insert(
+            0,
+            {"role": "system", "content": normalized_instructions},
+        )
+    chat_messages[:] = conversation
+    return normalized_instructions
 
 
 def _request_field_is_set(request, field_name: str) -> bool:

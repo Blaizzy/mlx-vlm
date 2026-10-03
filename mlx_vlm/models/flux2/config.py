@@ -13,6 +13,8 @@ class Flux2Variant:
     local_dir_name: str
     transformer_overrides: dict[str, int]
     text_encoder_overrides: dict[str, int]
+    default_steps: int = 4
+    default_guidance: float = 1.0
     supports_generation: bool = True
     supports_edit: bool = False
     uses_reference_kv_cache: bool = False
@@ -85,6 +87,8 @@ VARIANTS: dict[str, Flux2Variant] = {
         ),
         repo_id="black-forest-labs/FLUX.2-klein-base-4B",
         local_dir_name="FLUX.2-klein-base-4B",
+        default_steps=50,
+        default_guidance=4.0,
         transformer_overrides=FLUX2_KLEIN_4B_TRANSFORMER,
         text_encoder_overrides=FLUX2_KLEIN_4B_TEXT_ENCODER,
         supports_edit=True,
@@ -102,6 +106,8 @@ VARIANTS: dict[str, Flux2Variant] = {
         ),
         repo_id="black-forest-labs/FLUX.2-klein-base-9B",
         local_dir_name="FLUX.2-klein-base-9B",
+        default_steps=50,
+        default_guidance=4.0,
         transformer_overrides=FLUX2_KLEIN_9B_TRANSFORMER,
         text_encoder_overrides=FLUX2_KLEIN_9B_TEXT_ENCODER,
         supports_edit=True,
@@ -160,24 +166,30 @@ def variant_from_local_path(model_path: str | Path) -> Flux2Variant:
     if "4b" in name:
         return VARIANTS["flux2-klein-4b"]
 
+    model_index = root / "model_index.json"
+    is_distilled = True
+    if model_index.exists():
+        is_distilled = json.loads(model_index.read_text()).get("is_distilled", True)
+    prefix = "flux2-klein" if is_distilled else "flux2-klein-base"
+
     transformer_config = root / "transformer" / "config.json"
     if transformer_config.exists():
         config = json.loads(transformer_config.read_text())
         num_layers = config.get("num_layers")
         num_attention_heads = config.get("num_attention_heads")
         if num_layers == 8 or num_attention_heads == 32:
-            return VARIANTS["flux2-klein-9b"]
+            return VARIANTS[f"{prefix}-9b"]
         if num_layers == 5 or num_attention_heads == 24:
-            return VARIANTS["flux2-klein-4b"]
+            return VARIANTS[f"{prefix}-4b"]
 
     text_config = root / "text_encoder" / "config.json"
     if text_config.exists():
         config = json.loads(text_config.read_text())
         hidden_size = config.get("hidden_size")
         if hidden_size == 4096:
-            return VARIANTS["flux2-klein-9b"]
+            return VARIANTS[f"{prefix}-9b"]
         if hidden_size == 2560:
-            return VARIANTS["flux2-klein-4b"]
+            return VARIANTS[f"{prefix}-4b"]
 
     raise ValueError(
         f"Could not infer Flux2 variant from local model path: {root}. "

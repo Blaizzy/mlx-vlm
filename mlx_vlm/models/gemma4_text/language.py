@@ -81,6 +81,7 @@ class Router(nn.Module):
         )
         top_k_indices = top_k_indices[..., -self.config.top_k_experts :]
 
+        top_k_indices = mx.stop_gradient(top_k_indices)
         top_k_weights = mx.take_along_axis(expert_scores, top_k_indices, axis=-1)
         top_k_weights = mx.softmax(top_k_weights, axis=-1)
         top_k_weights = top_k_weights * self.per_expert_scale[top_k_indices]
@@ -343,6 +344,9 @@ class Gemma4TextModel(nn.Module):
             DecoderLayer(config, layer_idx=i) for i in range(config.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.first_kv_shared_layer_idx = (
+            config.num_hidden_layers - config.num_kv_shared_layers
+        )
 
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
         if self.hidden_size_per_layer_input:
@@ -446,6 +450,7 @@ class Gemma4TextModel(nn.Module):
         cache=None,
         input_embeddings: Optional[mx.array] = None,
         per_layer_inputs: Optional[mx.array] = None,
+        logits_to_keep: Optional[int] = None,
     ):
         if input_embeddings is None:
             input_embeddings = self.embed_tokens(inputs)
@@ -469,6 +474,8 @@ class Gemma4TextModel(nn.Module):
             cache = cache + [None] * (len(self.layers) - len(cache))
 
         masks = self._make_masks(h, cache)
+        keep = int(logits_to_keep) if logits_to_keep else 0
+        trimmed_prefix = 0
         intermediates = [(None, None)] * len(self.layers)
         for idx, (layer, c, mask, prev_idx, per_layer_input) in enumerate(
             zip(
@@ -479,7 +486,16 @@ class Gemma4TextModel(nn.Module):
                 per_layer_inputs,
             )
         ):
+            if 0 < keep < h.shape[1] and idx == self.first_kv_shared_layer_idx:
+                trimmed_prefix = h.shape[1] - keep
+                h = h[:, -keep:, :]
+            if per_layer_input is not None and per_layer_input.shape[1] != h.shape[1]:
+                per_layer_input = per_layer_input[:, -h.shape[1] :, :]
+            if isinstance(mask, mx.array) and mask.shape[-2] != h.shape[1]:
+                mask = mask[..., -h.shape[1] :, :]
             kvs, offset = intermediates[prev_idx]
+            if trimmed_prefix:
+                offset = offset + trimmed_prefix
 
             h, kvs, offset = layer(
                 h,
@@ -496,8 +512,6 @@ class Gemma4TextModel(nn.Module):
 
 
 class LanguageModel(nn.Module):
-    supports_logits_to_keep = True
-
     def __init__(self, args: ModelConfig):
         super().__init__()
         self.args = args
@@ -523,6 +537,7 @@ class LanguageModel(nn.Module):
             cache=cache,
             input_embeddings=input_embeddings,
             per_layer_inputs=per_layer_inputs,
+            logits_to_keep=logits_to_keep,
         )
         if logits_to_keep:
             out = out[:, -int(logits_to_keep) :, :]

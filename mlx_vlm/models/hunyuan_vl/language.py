@@ -11,6 +11,7 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import KVCache
+from ..rope_utils import rotate_half
 from .config import ModelConfig, TextConfig
 
 
@@ -51,12 +52,6 @@ class HunyuanRotaryEmbedding:
     def __call__(self, x: mx.array, seq_len: int) -> Tuple[mx.array, mx.array]:
         self._update_cache(seq_len, x.dtype)
         return self._cos_cached[:seq_len], self._sin_cached[:seq_len]
-
-
-def rotate_half(x: mx.array) -> mx.array:
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return mx.concatenate([-x2, x1], axis=-1)
 
 
 def apply_rotary_pos_emb_xdrope(

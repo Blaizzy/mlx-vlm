@@ -8,6 +8,7 @@ import mlx.nn as nn
 
 from .utils import (
     _load_safetensors,
+    _quantization_for_module_path,
     apply_generation_config_defaults,
     get_model_and_args,
     load_config,
@@ -105,6 +106,11 @@ def load_encoder_model(
         def quantization_predicate(path, module):
             if not hasattr(module, "to_quantized"):
                 return False
+            per_module_quantization = _quantization_for_module_path(
+                quantization, path, model
+            )
+            if per_module_quantization is not None:
+                return per_module_quantization
             if hasattr(module, "weight") and module.weight.size % 64 != 0:
                 return False
             return f"{path}.scales" in weights
