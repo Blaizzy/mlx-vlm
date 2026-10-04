@@ -135,11 +135,45 @@ def _has_decoder(module):
     return False
 
 
-def _build_multimodal_awq_run(model, processor, config, calibration_data):
-    """Build a calibration forward that routes media+text through the full model.
+def _run_model_inputs(model, inputs):
+    """Run ``model`` on a prepared ``prepare_inputs`` dict, returning its output."""
+    extra = {
+        k: v
+        for k, v in inputs.items()
+        if k not in ("input_ids", "pixel_values", "attention_mask")
+    }
+    return model(
+        inputs.get("input_ids"),
+        pixel_values=inputs.get("pixel_values"),
+        mask=inputs.get("attention_mask"),
+        **extra,
+    )
 
-    Returns ``(run, n_samples)``, or ``(None, 0)`` when the model has no
-    vision/audio modality so the caller falls back to text calibration.
+
+def _cap_image_pixels(image, max_side=1024):
+    """Downscale a calibration image so its longest side is at most ``max_side``.
+
+    Bounds the per-image vision-token count (a full-resolution photo can expand
+    to tens of thousands of tokens, which overflows the distillation backward).
+    """
+    from PIL import Image
+
+    w, h = image.size
+    longest = max(w, h)
+    if longest <= max_side:
+        return image
+    scale = max_side / longest
+    return image.resize(
+        (max(1, round(w * scale)), max(1, round(h * scale))),
+        Image.Resampling.BICUBIC,
+    )
+
+
+def _build_calibration_samples(model, processor, config, calibration_data):
+    """Prepared multimodal (image/audio + text) calibration inputs, or ``[]``.
+
+    Returns an empty list when the model has no vision/audio modality so callers
+    can fall back to text calibration.
     """
     from .prompt_utils import apply_chat_template
     from .quant import (
@@ -156,7 +190,7 @@ def _build_multimodal_awq_run(model, processor, config, calibration_data):
         getattr(model, "audio_tower", None) is not None
     )
     if not has_vision and not has_audio:
-        return None, 0
+        return []
 
     if calibration_data:
         images, audios = load_calibration_media(calibration_data)
@@ -164,28 +198,28 @@ def _build_multimodal_awq_run(model, processor, config, calibration_data):
         images = synthetic_calibration_images(8) if has_vision else []
         audios = synthetic_calibration_audio(8) if has_audio else []
         print(
-            "[INFO] AWQ: using synthetic calibration media; pass "
+            "[INFO] Using synthetic calibration media; pass "
             "--calibration-data for real image/audio samples."
         )
 
-    samples = [(im, None, 1, 0) for im in images]
-    samples += [(None, au, 0, 1) for au in audios]
-    if not samples:
-        return None, 0
+    images = [_cap_image_pixels(im) for im in images]
+
+    media = [(im, None, 1, 0) for im in images]
+    media += [(None, au, 0, 1) for au in audios]
 
     cfg = model.config
-
-    def run():
-        for image, audio, n_img, n_aud in samples:
-            prompt = (
-                "Describe this image in detail."
-                if n_img
-                else "Describe what you hear in this audio."
-            )
-            formatted = apply_chat_template(
-                processor, cfg, prompt, num_images=n_img, num_audios=n_aud
-            )
-            inputs = prepare_inputs(
+    samples = []
+    for image, audio, n_img, n_aud in media:
+        prompt = (
+            "Describe this image in detail."
+            if n_img
+            else "Describe what you hear in this audio."
+        )
+        formatted = apply_chat_template(
+            processor, cfg, prompt, num_images=n_img, num_audios=n_aud
+        )
+        samples.append(
+            prepare_inputs(
                 processor,
                 images=[image] if image is not None else None,
                 audio=[audio] if audio is not None else None,
@@ -194,21 +228,106 @@ def _build_multimodal_awq_run(model, processor, config, calibration_data):
                 add_special_tokens=False,
                 pad_to_uniform_size=False,
             )
-            extra = {
-                k: v
-                for k, v in inputs.items()
-                if k not in ("input_ids", "pixel_values", "attention_mask")
-            }
-            mx.eval(
-                model(
-                    inputs.get("input_ids"),
-                    pixel_values=inputs.get("pixel_values"),
-                    mask=inputs.get("attention_mask"),
-                    **extra,
-                )
-            )
+        )
+    return samples
+
+
+def _build_multimodal_awq_run(model, processor, config, calibration_data):
+    """Build a calibration forward that routes media+text through the full model.
+
+    Returns ``(run, n_samples)``, or ``(None, 0)`` when the model has no
+    vision/audio modality so the caller falls back to text calibration.
+    """
+    samples = _build_calibration_samples(model, processor, config, calibration_data)
+    if not samples:
+        return None, 0
+
+    def run():
+        for inputs in samples:
+            mx.eval(_run_model_inputs(model, inputs))
 
     return run, len(samples)
+
+
+def _build_dwq_calibration(
+    model, processor, config, calibration, calibration_data, freeze_prefix=False
+):
+    """Build ``(inputs, forward)`` for DWQ: calibration samples + a logits forward.
+
+    Uses multimodal samples when requested and available, otherwise falls back
+    to the default text prompts. ``forward`` maps a sample to language-model
+    logits through the model's own path.
+
+    With ``freeze_prefix`` and a multimodal model, the frozen vision/embedding
+    prefix is run once per sample and the fused embeddings are cached (detached),
+    so distillation re-runs only the trainable decoder -- a large speedup when
+    the vision tower is kept full precision, at the cost of not tuning the
+    embedding/vision quantization.
+    """
+    inputs = []
+    if calibration == "multimodal":
+        inputs = _build_calibration_samples(model, processor, config, calibration_data)
+
+    if not inputs:
+        from .quant import DEFAULT_CALIBRATION_TEXT
+
+        tokenizer = getattr(processor, "tokenizer", processor)
+        inputs = [
+            {"input_ids": mx.array([tokenizer.encode(text)])}
+            for text in DEFAULT_CALIBRATION_TEXT
+        ]
+
+    can_cache = (
+        freeze_prefix
+        and inputs
+        and inputs[0].get("pixel_values") is not None
+        and hasattr(model, "get_input_embeddings")
+    )
+    if can_cache:
+        cached = []
+        for mi in inputs:
+            rest = {
+                k: v
+                for k, v in mi.items()
+                if k not in ("input_ids", "pixel_values", "attention_mask")
+                and v is not None
+            }
+            features = model.get_input_embeddings(
+                mi["input_ids"],
+                mi.get("pixel_values"),
+                mask=mi.get("attention_mask"),
+                **rest,
+            )
+            extra = {
+                k: v
+                for k, v in features.to_dict().items()
+                if v is not None and k != "inputs_embeds"
+            }
+            entry = {
+                "input_ids": mi["input_ids"],
+                "attention_mask": mi.get("attention_mask"),
+                "inputs_embeds": mx.stop_gradient(features.inputs_embeds),
+                "_extra": extra,
+            }
+            mx.eval(entry["inputs_embeds"])
+            cached.append(entry)
+
+        def forward(sample):
+            out = model.language_model(
+                sample["input_ids"],
+                mask=sample.get("attention_mask"),
+                inputs_embeds=sample["inputs_embeds"],
+                **sample["_extra"],
+            )
+            return out.logits if hasattr(out, "logits") else out
+
+        return cached, forward
+
+    def forward(sample):
+        out = _run_model_inputs(model, sample)
+        return out.logits if hasattr(out, "logits") else out
+
+    return inputs, forward
 
 
 def _apply_awq_calibration(
@@ -273,6 +392,13 @@ def convert(
     quant_method: str = "rtn",
     calibration: str = "text",
     calibration_data: Optional[str] = None,
+    dwq_steps: int = 200,
+    dwq_lr: float = 1e-6,
+    dwq_val_size: int = 4,
+    dwq_top_k: int = 0,
+    dwq_patience: int = 0,
+    dwq_checkpoint: bool = False,
+    dwq_freeze_prefix: bool = False,
     dtype: Optional[str] = None,
     upload_repo: str = None,
     revision: Optional[str] = None,
@@ -331,7 +457,41 @@ def convert(
             config, target, q_group_size, q_bits, q_mode
         )
 
-        if quant_method == "awq":
+        do_awq = "awq" in quant_method
+        do_dwq = "dwq" in quant_method
+
+        dwq_forward = dwq_train = dwq_val = teacher_train = teacher_val = None
+        if do_dwq:
+            from .quant import capture_teacher
+
+            dwq_inputs, dwq_forward = _build_dwq_calibration(
+                model,
+                processor,
+                config,
+                calibration,
+                calibration_data,
+                freeze_prefix=dwq_freeze_prefix,
+            )
+            if dwq_val_size > 0 and len(dwq_inputs) > dwq_val_size:
+                dwq_train = dwq_inputs[:-dwq_val_size]
+                dwq_val = dwq_inputs[-dwq_val_size:]
+            else:
+                dwq_train, dwq_val = dwq_inputs, []
+            print(
+                f"[INFO] Capturing DWQ teacher ({len(dwq_train)} train, "
+                f"{len(dwq_val)} val samples)"
+            )
+            # Capture the teacher through the same (differentiable) path the
+            # student uses during distillation, so the only difference measured
+            # is quantization error.
+            model.train()
+            try:
+                teacher_train = capture_teacher(dwq_forward, dwq_train, top_k=dwq_top_k)
+                teacher_val = capture_teacher(dwq_forward, dwq_val, top_k=dwq_top_k)
+            finally:
+                model.eval()
+
+        if do_awq:
             print("[INFO] Calibrating (AWQ)")
             _apply_awq_calibration(
                 model,
@@ -354,6 +514,30 @@ def convert(
             mode=q_mode,
             quant_predicate=quant_predicate,
         )
+
+        if do_dwq:
+            from .quant import apply_dwq
+
+            print("[INFO] Distilling (DWQ)")
+            summary = apply_dwq(
+                target,
+                dwq_forward,
+                dwq_train,
+                teacher_train,
+                steps=dwq_steps,
+                lr=dwq_lr,
+                val_inputs=dwq_val,
+                val_teacher=teacher_val,
+                patience=dwq_patience,
+                checkpoint=dwq_checkpoint,
+            )
+            if summary.get("initial_loss") is not None:
+                print(
+                    f"[INFO] DWQ validation CE to teacher: "
+                    f"RTN baseline {summary['initial_loss']:.4f} -> "
+                    f"DWQ {summary['final_loss']:.4f}"
+                )
+            print(f"[INFO] DWQ applied: {summary}")
 
     if dequantize:
         from .quant_utils import dequantize_model
@@ -489,12 +673,12 @@ def configure_parser() -> argparse.ArgumentParser:
         "--quant-method",
         help="Weight quantization method.",
         type=str,
-        choices=["rtn", "awq"],
+        choices=["rtn", "awq", "dwq", "awq+dwq"],
         default="rtn",
     )
     parser.add_argument(
         "--calibration",
-        help="AWQ calibration inputs: text (default) or multimodal (image/audio+text).",
+        help="AWQ/DWQ calibration inputs: text (default) or multimodal (image/audio+text).",
         type=str,
         choices=["text", "multimodal"],
         default="text",
@@ -504,6 +688,46 @@ def configure_parser() -> argparse.ArgumentParser:
         help="Optional directory of real images/audio for --calibration multimodal.",
         type=str,
         default=None,
+    )
+    parser.add_argument(
+        "--dwq-steps",
+        help="Distillation steps for DWQ quantization methods.",
+        type=int,
+        default=200,
+    )
+    parser.add_argument(
+        "--dwq-lr",
+        help="Distillation learning rate for DWQ quantization methods.",
+        type=float,
+        default=1e-6,
+    )
+    parser.add_argument(
+        "--dwq-val-size",
+        help="Held-out calibration samples used to measure DWQ validation loss.",
+        type=int,
+        default=4,
+    )
+    parser.add_argument(
+        "--dwq-top-k",
+        help="Distill against the teacher's top-k logits (0 = full vocabulary).",
+        type=int,
+        default=0,
+    )
+    parser.add_argument(
+        "--dwq-patience",
+        help="Stop DWQ early after this many reports with no val improvement (0 = off).",
+        type=int,
+        default=0,
+    )
+    parser.add_argument(
+        "--dwq-checkpoint",
+        help="Gradient-checkpoint decoder layers during DWQ (less memory, slower).",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--dwq-freeze-prefix",
+        help="Cache the frozen vision/embedding prefix and distill only the decoder.",
+        action="store_true",
     )
     parser.add_argument(
         "--dtype",
