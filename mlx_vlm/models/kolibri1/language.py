@@ -249,13 +249,25 @@ class LanguageModel(nn.Module):
 
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{layer_idx}"
-            source_bias = f"{prefix}.moe.router.expert_bias"
             target_bias = f"{prefix}.mlp.gate.e_score_correction_bias"
-            if source_bias in weights:
-                weights[target_bias] = weights.pop(source_bias)
+            if target_bias not in weights:
+                for source_bias in (
+                    f"{prefix}.moe.router.expert_bias",
+                    f"{prefix}.mlp.expert_bias",
+                ):
+                    if source_bias in weights:
+                        weights[target_bias] = weights.pop(source_bias)
+                        break
 
             for projection in ("up_proj", "down_proj", "gate_proj"):
                 for suffix in ("weight", "scales", "biases"):
+                    target_key = f"{prefix}.mlp.switch_mlp.{projection}.{suffix}"
+                    if target_key in weights:
+                        continue
+                    stacked_key = f"{prefix}.mlp.experts.{projection}.{suffix}"
+                    if stacked_key in weights:
+                        weights[target_key] = weights.pop(stacked_key)
+                        continue
                     first_key = f"{prefix}.mlp.experts.0.{projection}.{suffix}"
                     if first_key not in weights:
                         continue
@@ -265,9 +277,7 @@ class LanguageModel(nn.Module):
                         )
                         for expert_idx in range(self.args.num_experts)
                     ]
-                    weights[f"{prefix}.mlp.switch_mlp.{projection}.{suffix}"] = (
-                        mx.stack(values)
-                    )
+                    weights[target_key] = mx.stack(values)
 
         return weights
 

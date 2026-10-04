@@ -1351,6 +1351,56 @@ def test_moondream3_sanitize_remaps_raw_and_preserves_converted_keys():
     assert Model.sanitize(None, converted).keys() == converted.keys()
 
 
+class TestKolibri1Sanitize(unittest.TestCase):
+    def _model(self):
+        from mlx_vlm.models.kolibri1 import ModelConfig
+        from mlx_vlm.models.kolibri1.language import LanguageModel
+
+        case = next(case for case in DATA["cases"] if case["module"] == "kolibri1")
+        config = copy.deepcopy(case["config"])
+        config["num_hidden_layers"] = 1
+        config["layer_types"] = ["full_attention"]
+        return LanguageModel(ModelConfig.from_dict(config))
+
+    def _checkpoint(self, model, layout):
+        checkpoint = {}
+        for key, value in tree_flatten(model.parameters()):
+            if ".mlp.gate.e_score_correction_bias" in key:
+                if layout == "per_expert":
+                    key = key.replace(
+                        ".mlp.gate.e_score_correction_bias",
+                        ".moe.router.expert_bias",
+                    )
+                elif layout == "stacked":
+                    key = key.replace(
+                        ".mlp.gate.e_score_correction_bias", ".mlp.expert_bias"
+                    )
+            if ".mlp.switch_mlp." in key:
+                prefix, projection = key.split(".mlp.switch_mlp.")
+                if layout == "stacked":
+                    checkpoint[f"{prefix}.mlp.experts.{projection}"] = value
+                    continue
+                if layout == "per_expert":
+                    for expert_idx, expert_value in enumerate(value):
+                        checkpoint[
+                            f"{prefix}.mlp.experts.{expert_idx}.{projection}"
+                        ] = expert_value
+                    continue
+            checkpoint[key] = value
+        return checkpoint
+
+    def test_checkpoint_layouts_sanitize_to_the_model_exactly(self):
+        model = self._model()
+        expected = dict(tree_flatten(model.parameters()))
+        for layout in ("per_expert", "stacked", "canonical"):
+            with self.subTest(layout=layout):
+                sanitized = model.sanitize(self._checkpoint(model, layout))
+                self.assertEqual(sanitized.keys(), expected.keys())
+                for key, value in expected.items():
+                    self.assertTrue(mx.array_equal(sanitized[key], value).item(), key)
+                model.load_weights(list(sanitized.items()), strict=True)
+
+
 class TestQwen3_5MoeText(unittest.TestCase):
     """Decoder-only Qwen3.5 MoE checkpoints (model_type qwen3_5_moe_text)."""
 
