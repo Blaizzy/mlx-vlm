@@ -25,6 +25,8 @@ from mlx_vlm.models.mla import max_absorbed_queries
 from mlx_vlm.models.paddleocr_vl.config import VisionConfig
 from mlx_vlm.models.paddleocr_vl.vision import Attention, VisionModel
 from mlx_vlm.models.qwen3_5 import language as lang
+from mlx_vlm.models.rfdetr.config import DINOv2Config
+from mlx_vlm.models.rfdetr.vision import DINOv2Attention
 from mlx_vlm.models.rope_utils import (
     EagerRoPE,
     MRoPERotaryEmbedding,
@@ -1326,3 +1328,20 @@ def test_rejects_missing_or_invalid_signs(packed_prism_checkpoint, missing):
         weights[key] = mx.zeros_like(weights[key])
     with pytest.raises(ValueError, match="sign"):
         prism.Model(prism.ModelConfig.from_dict(config)).sanitize(weights)
+
+
+@pytest.mark.parametrize("batch,tokens", [(1, 101), (3, 17)])
+def test_rfdetr_backbone_attention_matches_softmax_reference(batch, tokens):
+    attention = DINOv2Attention(DINOv2Config(hidden_size=48, num_attention_heads=3))
+    x = mx.random.normal((batch, tokens, 48), key=mx.random.key(0))
+
+    def heads(t):
+        return t.reshape(batch, tokens, 3, 16).transpose(0, 2, 1, 3)
+
+    q, k, v = (
+        heads(proj(x))
+        for proj in (attention.q_proj, attention.k_proj, attention.v_proj)
+    )
+    scores = mx.softmax((q @ k.transpose(0, 1, 3, 2)) * attention.scale, axis=-1)
+    expected = (scores @ v).transpose(0, 2, 1, 3).reshape(batch, tokens, 48)
+    _assert_allclose(attention(x), attention.o_proj(expected))
