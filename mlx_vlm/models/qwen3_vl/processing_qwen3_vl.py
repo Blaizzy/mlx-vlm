@@ -64,30 +64,53 @@ def _drop_surplus_image_tokens(
     return text
 
 
-def _timestamped_video_placeholder(
+def _video_group_timestamps(
     grid_t: int,
-    frame_seqlen: int,
     temporal_patch_size: int,
     fps: float,
+    metadata=None,
+) -> List[float]:
+    """Seconds of each temporal patch group: the mean of its first and last frame.
+
+    With ``metadata``, a frame's time is its source frame index over the source
+    fps, as in the reference Qwen3-VL processor. Without it, frames are taken
+    as evenly spaced at ``fps``.
+    """
+    if metadata is None:
+        frame_times = [i / fps for i in range(grid_t * temporal_patch_size)]
+    else:
+        if isinstance(metadata, dict):
+            indices, source_fps = metadata["frames_indices"], metadata["fps"]
+        else:
+            indices, source_fps = metadata.frames_indices, metadata.fps
+        if not source_fps or not np.isfinite(source_fps) or source_fps <= 0:
+            raise ValueError("Video metadata fps must be positive and finite.")
+        indices = list(indices)
+        # The video processor repeats the last frame to fill the final group.
+        indices += indices[-1:] * (-len(indices) % temporal_patch_size)
+        if len(indices) != grid_t * temporal_patch_size:
+            raise ValueError("Video frame indices must match the decoded frame count.")
+        frame_times = [i / source_fps for i in indices]
+    return [
+        (frame_times[first] + frame_times[first + temporal_patch_size - 1]) / 2
+        for first in range(0, len(frame_times), temporal_patch_size)
+    ]
+
+
+def _timestamped_video_placeholder(
+    timestamps: List[float],
+    frame_seqlen: int,
     vision_start_token: str,
     vision_end_token: str,
 ) -> str:
-    """Render one ``<t.t seconds>`` marker plus vision block per temporal group.
-
-    The timestamp is the mean of the first and last frame of each group, the
-    convention used by the reference Qwen3-VL processor.
-    """
-    parts = []
-    for group in range(grid_t):
-        first = group * temporal_patch_size
-        seconds = (first + first + temporal_patch_size - 1) / 2 / fps
-        parts.append(
-            f"<{seconds:.1f} seconds>"
-            + vision_start_token
-            + "<|placeholder|>" * frame_seqlen
-            + vision_end_token
-        )
-    return "".join(parts)
+    """Render one ``<t.t seconds>`` marker plus vision block per temporal group."""
+    return "".join(
+        f"<{seconds:.1f} seconds>"
+        + vision_start_token
+        + "<|placeholder|>" * frame_seqlen
+        + vision_end_token
+        for seconds in timestamps
+    )
 
 
 def _flatten_images(images):
@@ -583,13 +606,27 @@ class Qwen3VLVideoProcessor(BaseVideoProcessor):
             return item.ndim in (2, 3)
         return False
 
-    def __call__(self, videos, **kwargs):
+    def __call__(self, videos, video_metadata=None, **kwargs):
         if not isinstance(videos, list) or (videos and self._is_video_frame(videos[0])):
             videos = [videos]
+        if video_metadata is not None and len(video_metadata) != len(videos):
+            raise ValueError("Expected one video_metadata entry per video.")
         all_patches = []
         all_thw = []
-        for v in videos:
+        for index, v in enumerate(videos):
             v = self._prepare_video(v)
+            metadata = video_metadata[index] if video_metadata is not None else None
+            if metadata is not None:
+                indices = (
+                    metadata["frames_indices"]
+                    if isinstance(metadata, dict)
+                    else metadata.frames_indices
+                )
+                # Check before _process_one pads the final temporal group.
+                if len(indices) != len(v):
+                    raise ValueError(
+                        "Video frame indices must match the decoded frame count."
+                    )
             patches, thw = self._process_one(v)
             all_patches.append(patches)
             all_thw.append(thw)
@@ -775,6 +812,8 @@ class Qwen3VLProcessor(ProcessorMixin):
             ]
         ] = None,
         videos=None,
+        fps=None,
+        video_metadata=None,
         **kwargs,
     ) -> BatchFeature:
         image_inputs = {}
@@ -789,7 +828,7 @@ class Qwen3VLProcessor(ProcessorMixin):
 
         if videos is not None:
             _video_proc = self.video_processor or self.image_processor
-            videos_inputs = _video_proc(videos=videos)
+            videos_inputs = _video_proc(videos=videos, video_metadata=video_metadata)
             video_grid_thw = videos_inputs["video_grid_thw"]
         else:
             video_grid_thw = None
@@ -840,8 +879,13 @@ class Qwen3VLProcessor(ProcessorMixin):
         # vision_start/vision_end block per temporal patch group, exactly as the
         # reference processor renders videos. Without the markers the model sees
         # one timeless block of frames and describes motion as a spatial collage.
-        fps_list = kwargs.pop("fps", None)
+        # ``fps`` and ``video_metadata`` are named parameters because
+        # prepare_inputs only forwards the keywords a processor declares.
         if video_grid_thw is not None:
+            if video_metadata is not None and len(video_metadata) != len(
+                video_grid_thw
+            ):
+                raise ValueError("Expected one video_metadata entry per video.")
             _video_proc = self.video_processor or self.image_processor
             merge_length = _video_proc.merge_size**2
             temporal_patch_size = getattr(_video_proc, "temporal_patch_size", 2)
@@ -850,23 +894,22 @@ class Qwen3VLProcessor(ProcessorMixin):
                 while self.video_token in text[i]:
                     grid_t = int(video_grid_thw[index][0])
                     frame_seqlen = int(video_grid_thw[index][1:].prod() // merge_length)
-                    fps = (
-                        fps_list[index]
-                        if isinstance(fps_list, (list, tuple))
-                        else fps_list
-                    )
+                    rate = fps[index] if isinstance(fps, (list, tuple)) else fps
                     # Same fallback idea as the reference processor: use the
                     # configured sampling rate when no per-video fps was given.
-                    fps = fps or getattr(_video_proc, "fps", None) or 2.0
+                    rate = rate or getattr(_video_proc, "fps", None) or 2.0
+                    metadata = (
+                        video_metadata[index] if video_metadata is not None else None
+                    )
                     wrapped = f"{self.vision_start_token}{self.video_token}{self.vision_end_token}"
                     if wrapped in text[i]:
                         text[i] = text[i].replace(
                             wrapped,
                             _timestamped_video_placeholder(
-                                grid_t,
+                                _video_group_timestamps(
+                                    grid_t, temporal_patch_size, float(rate), metadata
+                                ),
                                 frame_seqlen,
-                                temporal_patch_size,
-                                float(fps),
                                 self.vision_start_token,
                                 self.vision_end_token,
                             ),
