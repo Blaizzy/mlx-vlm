@@ -5,7 +5,7 @@ Real-time detection transformer ([RF-DETR](https://github.com/roboflow/rf-detr),
 ## Prepared checkpoint
 
 [`nativ-community/rfdetr-base-fp32`](https://huggingface.co/nativ-community/rfdetr-base-fp32)
-loads directly, so the conversion below is only needed for the other variants.
+
 
 ```python
 from mlx_vlm import load
