@@ -378,7 +378,7 @@
         "kwargs": { "score_threshold": 0.5 },
         "processor": "processing_rt_detr_v2.RTDetrV2Processor"
       },
-      "checks": ["registry_and_config", "extraction_api"]
+      "checks": ["registry_and_config", "checkpoint", "extraction_api"]
     },
     {
       "id": "sam3d_objects_api",
