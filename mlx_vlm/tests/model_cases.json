@@ -843,7 +843,7 @@
           "full_attention"
         ]
       },
-      "checks": ["forward_cache", "input_embeddings", "nvfp4_global_scale"]
+      "checks": ["forward_cache", "input_embeddings"]
     },
     {
       "id": "limite",

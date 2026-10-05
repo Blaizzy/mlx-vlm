@@ -11,92 +11,8 @@ from ..base import (
 from ..cache import KVCache, RotatingKVCache
 from ..mlp import SwiGLUMLP
 from ..rope_utils import initialize_rope
-from ..switch_layers import SwiGLU, SwitchGLU, SwitchLinear
+from ..switch_layers import SwitchGLU
 from .config import ModelConfig
-
-NVFP4_GLOBAL_SCALE = 1.0
-NVFP4_SCALE_DENOMINATOR = 6 * 448
-
-
-class NVFP4Linear(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.group_size = 16
-        self.bits = 4
-        self.mode = "nvfp4"
-
-    def __call__(self, x, indices=None, sorted_indices=False):
-        kwargs = dict(group_size=self.group_size, bits=self.bits, mode=self.mode)
-        if indices is None:
-            x = mx.quantized_matmul(x, self["weight"], self["scales"], **kwargs)
-        else:
-            x = mx.gather_qmm(
-                x,
-                self["weight"],
-                self["scales"],
-                rhs_indices=indices,
-                transpose=True,
-                sorted_indices=sorted_indices,
-                **kwargs,
-            )
-        x = x * (self["global_scale"] / NVFP4_SCALE_DENOMINATOR)
-        if "bias" in self:
-            bias = self["bias"] if indices is None else self["bias"][indices]
-            x = x + (bias if indices is None else mx.expand_dims(bias, -2))
-        return x
-
-    @classmethod
-    def from_linear(cls, linear):
-        layer = cls()
-        layer.global_scale = mx.array(NVFP4_GLOBAL_SCALE, dtype=mx.float32)
-        layer.weight, layer.scales = mx.quantize(
-            linear.weight,
-            group_size=16,
-            bits=4,
-            mode="nvfp4",
-            global_scale=layer.global_scale,
-        )
-        if "bias" in linear:
-            layer.bias = linear.bias
-        layer.freeze()
-        return layer
-
-
-class Linear(nn.Linear):
-    def to_quantized(self, group_size=64, bits=4, mode="affine"):
-        if mode == "nvfp4":
-            return NVFP4Linear.from_linear(self)
-        return super().to_quantized(group_size, bits, mode=mode)
-
-
-class KolibriSwitchLinear(SwitchLinear):
-    def to_quantized(self, group_size=64, bits=4, mode="affine"):
-        if mode == "nvfp4":
-            return NVFP4Linear.from_linear(self)
-        return super().to_quantized(group_size, bits, mode=mode)
-
-
-class KolibriMLP(SwiGLUMLP):
-    def __init__(self, input_dims, hidden_dims):
-        nn.Module.__init__(self)
-        self.gate_proj = Linear(input_dims, hidden_dims, bias=False)
-        self.up_proj = Linear(input_dims, hidden_dims, bias=False)
-        self.down_proj = Linear(hidden_dims, input_dims, bias=False)
-
-
-class KolibriSwitchGLU(SwitchGLU):
-    def __init__(self, input_dims, hidden_dims, num_experts):
-        nn.Module.__init__(self)
-        self.gate_proj = KolibriSwitchLinear(
-            input_dims, hidden_dims, num_experts, bias=False
-        )
-        self.up_proj = KolibriSwitchLinear(
-            input_dims, hidden_dims, num_experts, bias=False
-        )
-        self.down_proj = KolibriSwitchLinear(
-            hidden_dims, input_dims, num_experts, bias=False
-        )
-        self.activation = SwiGLU()
 
 
 class Attention(nn.Module):
@@ -108,22 +24,22 @@ class Attention(nn.Module):
         self.scale = self.head_dim**-0.5
         self.is_sliding = args.layer_types[layer_idx] == "sliding_attention"
 
-        self.q_proj = Linear(
+        self.q_proj = nn.Linear(
             args.hidden_size,
             self.n_heads * self.head_dim,
             bias=args.attention_bias,
         )
-        self.k_proj = Linear(
+        self.k_proj = nn.Linear(
             args.hidden_size,
             self.n_kv_heads * self.head_dim,
             bias=args.attention_bias,
         )
-        self.v_proj = Linear(
+        self.v_proj = nn.Linear(
             args.hidden_size,
             self.n_kv_heads * self.head_dim,
             bias=args.attention_bias,
         )
-        self.o_proj = Linear(
+        self.o_proj = nn.Linear(
             self.n_heads * self.head_dim,
             args.hidden_size,
             bias=args.attention_bias,
@@ -209,12 +125,12 @@ class SparseMoeBlock(nn.Module):
     def __init__(self, args: ModelConfig):
         super().__init__()
         self.gate = MoEGate(args)
-        self.switch_mlp = KolibriSwitchGLU(
+        self.switch_mlp = SwitchGLU(
             args.hidden_size,
             args.moe_intermediate_size,
             args.num_experts,
         )
-        self.shared_experts = KolibriMLP(
+        self.shared_experts = SwiGLUMLP(
             args.hidden_size,
             args.shared_expert_intermediate_size,
         )
@@ -308,7 +224,7 @@ class LanguageModel(nn.Module):
         self.model_type = args.model_type
         self.model = Kolibri1Model(args)
         if not args.tie_word_embeddings:
-            self.lm_head = Linear(args.hidden_size, args.vocab_size, bias=False)
+            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
     def __call__(
         self,
@@ -344,7 +260,7 @@ class LanguageModel(nn.Module):
                         break
 
             for projection in ("up_proj", "down_proj", "gate_proj"):
-                for suffix in ("weight", "scales", "biases", "global_scale"):
+                for suffix in ("weight", "scales", "biases"):
                     target_key = f"{prefix}.mlp.switch_mlp.{projection}.{suffix}"
                     if target_key in weights:
                         continue
