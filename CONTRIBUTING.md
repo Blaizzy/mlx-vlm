@@ -75,7 +75,7 @@ conversion values and second-pass stability.
 
 An extraction model can also expose the shared prediction API. Declare the
 tasks it serves as `extraction_types` on the `Model` class and implement
-`extract(self, processor, inputs, **kwargs)` returning a
+`extract(self, processor, inputs, task=None, **kwargs)` returning a
 mapping of named outputs, the way `decision_types` and `predict` work for
 decision models. Named outputs are arrays; anything else a result carries,
 such as class names, a mesh or a flag, goes under the reserved `metadata`
