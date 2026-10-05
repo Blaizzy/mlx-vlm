@@ -430,6 +430,11 @@ class OffloadedEngramEmbedding(nn.Module):
             if name not in self:
                 setattr(self, name, value)
 
+    def hide_parameters(self):
+        """Exclude the mapped tables from eager distributed weight evaluation."""
+        for name in self._source_embedding.parameters():
+            self.pop(name, None)
+
     def to_quantized(self, group_size=None, bits=None, mode="affine"):
         from ...quant_utils import get_quantization_params
 
