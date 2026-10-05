@@ -65,6 +65,54 @@ def _extraction_config(name):
     return copy.deepcopy(EXTRACTION_CASES[name]["config"])
 
 
+@pytest.mark.parametrize("height,width", [(2, 3), (3, 2), (72, 72)])
+@pytest.mark.parametrize("theta", [10000.0, 100.0])
+def test_sam3_tracker_rope_matches_reference(height, width, theta):
+    from mlx_vlm.models.sam3.position import apply_rotary_enc_1d, init_2d_freqs
+    from mlx_vlm.models.sam3_1.sam_components import SimpleRoPEAttention
+
+    # Meta sam3/sam/rope.py:compute_axial_cis uses row-major coordinates
+    # and assigns the first half of the complex channels to X, then Y.
+    dim = 32
+    positions = np.arange(height * width, dtype=np.float32)
+    frequencies = theta ** (-np.arange(0, dim, 4, dtype=np.float32) / dim)
+    phases = np.concatenate(
+        [
+            np.outer(positions % width, frequencies),
+            np.outer(positions // width, frequencies),
+        ],
+        axis=-1,
+    )
+    reference = np.exp(1j * phases)
+    cos, sin = init_2d_freqs(dim, height, width, theta=theta)
+    np.testing.assert_allclose(np.asarray(cos), reference.real, atol=1e-5)
+    np.testing.assert_allclose(np.asarray(sin), reference.imag, atol=1e-5)
+
+    attention = SimpleRoPEAttention(
+        dim * 2, 2, feat_sizes=(height, width), rope_theta=theta, rope_k_repeat=True
+    )
+    np.testing.assert_allclose(
+        np.asarray(attention._freqs_cos), reference.real, atol=1e-5
+    )
+    np.testing.assert_allclose(
+        np.asarray(attention._freqs_sin), reference.imag, atol=1e-5
+    )
+
+    # Compare pairwise rotation with complex multiplication, including keys
+    # from two memory frames that reuse the same spatial frequencies.
+    rng = np.random.default_rng(42)
+    q = rng.normal(size=(1, height * width, 2, dim)).astype(np.float32)
+    k = rng.normal(size=(1, height * width * 2, 2, dim)).astype(np.float32)
+    rotated = apply_rotary_enc_1d(mx.array(q), mx.array(k), cos, sin, True)
+    for values, actual, repeats in [(q, rotated[0], 1), (k, rotated[1], 2)]:
+        complex_values = values[..., 0::2] + 1j * values[..., 1::2]
+        expected = complex_values * np.tile(reference, (repeats, 1))[None, :, None]
+        expected = np.stack([expected.real, expected.imag], axis=-1).reshape(
+            values.shape
+        )
+        np.testing.assert_allclose(np.asarray(actual), expected, atol=1e-5)
+
+
 def test_checkpoint_key_sanitization():
     weights = {
         "encoder.embeddings.LayerNorm.weight": mx.ones((4,)),
