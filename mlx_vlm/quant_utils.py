@@ -173,19 +173,20 @@ def dequantize_model(model: nn.Module) -> nn.Module:
     """
     from .models.mla import MultiLinear, QuantizedMultiLinear
     from .models.switch_layers import QuantizedSwitchLinear, SwitchLinear
+    from .quantization.nvfp4 import ScaledQuantizedLinear, ScaledQuantizedSwitchLinear
 
     dequantize_layers = []
     for name, module in model.named_modules():
         bias = "bias" in module
-        if isinstance(module, nn.QuantizedLinear):
+        if isinstance(module, (QuantizedSwitchLinear, ScaledQuantizedSwitchLinear)):
+            kwargs = {"bias": bias}
+            cls = SwitchLinear
+        elif isinstance(module, (nn.QuantizedLinear, ScaledQuantizedLinear)):
             cls = nn.Linear
             kwargs = {"bias": bias}
         elif isinstance(module, nn.QuantizedEmbedding):
             kwargs = {}
             cls = nn.Embedding
-        elif isinstance(module, QuantizedSwitchLinear):
-            kwargs = {"bias": bias}
-            cls = SwitchLinear
         elif isinstance(module, QuantizedMultiLinear):
             weight = mx.dequantize(
                 module.weight,
@@ -210,6 +211,8 @@ def dequantize_model(model: nn.Module) -> nn.Module:
             module.bits,
             module.mode,
         )
+        if isinstance(module, ScaledQuantizedLinear):
+            weight = weight * mx.expand_dims(module.weight_scale_2, (-2, -1))
         args = weight.shape[::-1]
         m = cls(*args, **kwargs)
         if bias:

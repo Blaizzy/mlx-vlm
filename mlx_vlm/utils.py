@@ -24,6 +24,11 @@ from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
 
 from .models.base import BaseImageProcessor
+from .quantization.nvfp4 import (
+    ScaledQuantizedLinear,
+    replace_scaled_quantized_linears,
+    set_quantization_fingerprint,
+)
 from .quantization.one_bit import _quantization_for_path, replace_one_bit_modules
 from .tokenizer_utils import load_tokenizer
 from .trainer.utils import apply_lora_layers
@@ -216,10 +221,7 @@ def _transform_modelopt_nvfp4_weights(
         for suffix in ("weight", "input_scale")
     }
     transformed = {}
-    # Each fold below builds a deep lazy graph. A large MoE export has tens of
-    # thousands of quantized tensors, so the unevaluated intermediates blow past
-    # Metal's live-buffer limit before the dict is ever consumed. Flush in
-    # batches to keep the graph shallow; this also frees the intermediates.
+    # Materialize FP8 conversions in batches to bound the lazy graph size.
     pending: List[mx.array] = []
 
     def _flush(force: bool = False) -> None:
@@ -257,12 +259,8 @@ def _transform_modelopt_nvfp4_weights(
                 raise ValueError(f"Invalid ModelOpt NVFP4 scale shape for {prefix}.")
 
             transformed[weight_key] = weight.view(mx.uint32)
-            decoded_scale = _E4M3_DECODE_LUT[scale.astype(mx.uint32)]
-            transformed[f"{prefix}.scales"] = _f32_to_e4m3(
-                decoded_scale * value.astype(mx.float32)
-            )
-            pending.append(transformed[f"{prefix}.scales"])
-            _flush()
+            transformed[f"{prefix}.scales"] = scale
+            transformed[key] = value.astype(mx.float32).reshape(())
         elif key.endswith(scale_suffix) and key[: -len(scale_suffix)] in fp8_prefixes:
             prefix = key[: -len(scale_suffix)]
             weight_key = f"{prefix}.weight"
@@ -644,6 +642,13 @@ def quantize_activations(model: nn.Module) -> nn.Module:
 
     def _maybe_qq(m: nn.Module) -> nn.Module:
         """Convert a QuantizedLinear layer to QQLinear if compatible."""
+        if type(m) is ScaledQuantizedLinear:
+            if "bias" in m:
+                raise ValueError(
+                    "Linear layer with bias does not support activation quantization"
+                )
+            m._quantize_activations = True
+            return m
         if isinstance(m, nn.QuantizedLinear):
             if m.mode not in ACTIVATION_QUANTIZATION_MODES:
                 raise ValueError(
@@ -664,6 +669,8 @@ def quantize_activations(model: nn.Module) -> nn.Module:
 
     leaves = tree_map(_maybe_qq, model.leaf_modules(), is_leaf=nn.Module.is_module)
     model.update_modules(leaves)
+    if getattr(model, "_quantization_fingerprint", None) is not None:
+        set_quantization_fingerprint(model, "nvfp4-global-scale-v1-activations")
 
     return model
 
@@ -1140,6 +1147,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             mode=quantization.get("mode", "affine"),
             class_predicate=get_class_predicate,
         )
+        replace_scaled_quantized_linears(model, weights)
 
     if kwargs.get("quantize_activations", False):
         if quantization is None:

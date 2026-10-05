@@ -208,6 +208,9 @@ def model_key_dependencies(model: Any = None, processor: Any = None) -> Tuple[in
     semantic inputs. Absent or failing hooks contribute nothing.
     """
     deps: List[int] = []
+    fingerprint = _hash_payload(getattr(model, "_quantization_fingerprint", None))
+    if fingerprint is not None:
+        deps.append(fingerprint)
     for obj in (model, processor):
         if obj is None:
             continue

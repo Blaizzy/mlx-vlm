@@ -18,6 +18,7 @@ import pytest
 from mlx.utils import tree_flatten
 
 import mlx_vlm.models.rope_utils as rope_utils
+from mlx_vlm import apc
 from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
 from mlx_vlm.fp8 import _dequantize_fp8_weight, _quantize_fp8_weight
 from mlx_vlm.models.cache import KVCache
@@ -25,6 +26,7 @@ from mlx_vlm.models.mla import max_absorbed_queries
 from mlx_vlm.models.paddleocr_vl.config import VisionConfig
 from mlx_vlm.models.paddleocr_vl.vision import Attention, VisionModel
 from mlx_vlm.models.qwen3_5 import language as lang
+from mlx_vlm.models.qwen3_5_moe import Model as Qwen35MoEModel
 from mlx_vlm.models.rope_utils import (
     EagerRoPE,
     MRoPERotaryEmbedding,
@@ -35,6 +37,13 @@ from mlx_vlm.models.rope_utils import (
     compute_mrope_frequencies,
     initialize_rope,
     mrope_position_selector,
+)
+from mlx_vlm.models.switch_layers import QuantizedSwitchLinear
+from mlx_vlm.quant_utils import dequantize_model
+from mlx_vlm.quantization.nvfp4 import (
+    ScaledQuantizedLinear,
+    ScaledQuantizedSwitchLinear,
+    replace_scaled_quantized_linears,
 )
 from mlx_vlm.quantization.one_bit import (
     OneBitEmbedding,
@@ -904,10 +913,10 @@ def test_transform_modelopt_nvfp4_weights(quant_method, quant_algo):
 
     assert transformed["layer.weight"].dtype == mx.uint32
     assert transformed["layer.weight"].shape == (2, 4)
-    assert transformed["layer.scales"].tolist() == [[48, 56], [64, 72]]
+    assert mx.array_equal(transformed["layer.scales"], weights["layer.weight_scale"])
+    assert transformed["layer.weight_scale_2"].item() == 0.5
     assert mx.array_equal(transformed["layer.bias"], weights["layer.bias"])
     assert "layer.weight_scale" not in transformed
-    assert "layer.weight_scale_2" not in transformed
     assert "layer.input_scale" not in transformed
     assert quantization == {"group_size": 16, "bits": 4, "mode": "nvfp4"}
 
@@ -940,8 +949,164 @@ def test_transform_modelopt_mixed_nvfp4_fp8_weights():
     assert transformed["experts.scales"].dtype == mx.uint8
     assert transformed["attention.weight"].dtype == mx.bfloat16
     assert transformed["attention.weight"].tolist() == [[0.5, 1.0], [0.75, 1.0]]
-    assert not any("weight_scale" in key or "input_scale" in key for key in transformed)
+    assert transformed["experts.weight_scale_2"].item() == 0.5
+    assert not any(
+        key.endswith((".weight_scale", ".input_scale")) for key in transformed
+    )
     assert quantization == {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("shape", [(1, 64), (2, 3, 64)])
+def test_scaled_nvfp4_linear_matches_reference(dtype, bias, shape):
+    model = nn.Module()
+    model.language_model = nn.Module()
+    model.layer = nn.QuantizedLinear(64, 4, bias=bias, mode="nvfp4")
+    global_scale = mx.array(0.00012715657, mx.float32)
+    block_scales = mx.array([[56, 64, 72, 80], [120] * 4] * 2, mx.uint8)
+    weights = {
+        "layer.weight": mx.full((4, 8), 0x77777777, mx.uint32),
+        "layer.scales": block_scales,
+        "layer.weight_scale_2": global_scale,
+    }
+    if bias:
+        weights["layer.bias"] = mx.array([0.25, -0.5, 1.0, -2.0], dtype)
+    replace_scaled_quantized_linears(model, weights)
+    assert apc.semantic_extra_hash(
+        model=model.language_model
+    ) == apc.semantic_extra_hash(model=model)
+    model.load_weights(list(weights.items()))
+    x = mx.linspace(0.1, 1.7, np.prod(shape)).reshape(shape).astype(dtype)
+    decoded_scales = mx.array([[1, 2, 4, 8], [256] * 4] * 2, mx.float32)
+    reference_weight = mx.repeat(decoded_scales, 16, axis=-1) * 6 * global_scale
+    expected = (x.astype(mx.float32) @ reference_weight.T).astype(dtype)
+    if bias:
+        expected += weights["layer.bias"]
+    actual = model.layer(x)
+    mx.eval(actual, expected)
+    assert actual.dtype == dtype
+    assert mx.all(mx.isfinite(actual)).item()
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5).item()
+    assert mx.array_equal(model.layer.scales, block_scales).item()
+    assert not tree_flatten(model.trainable_parameters())
+
+
+@pytest.mark.parametrize("activation_quantization", [False, True])
+def test_modelopt_global_scale_load_and_save(tmp_path, activation_quantization):
+    class Model(nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+            self.layer = nn.Linear(64, 4, bias=False)
+
+    architecture = SimpleNamespace(
+        Model=Model,
+        ModelConfig=SimpleNamespace(
+            from_dict=lambda config: SimpleNamespace(model_type=config["model_type"])
+        ),
+    )
+    weights = {
+        "layer.weight": mx.full((4, 32), 0x22, mx.uint8),
+        "layer.weight_scale": mx.full((4, 4), 120, mx.uint8),
+        "layer.weight_scale_2": mx.array(0.00012715657, mx.float32),
+        "layer.input_scale": mx.array(1.0, mx.float32),
+    }
+    config = {
+        "model_type": "test_modelopt",
+        "quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4"},
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+    with patch("mlx_vlm.utils.get_model_and_args", return_value=(architecture, "test")):
+        model = load_model(tmp_path, quantize_activations=activation_quantization)
+        assert isinstance(model.layer, ScaledQuantizedLinear)
+        assert model.layer._quantize_activations == activation_quantization
+        fingerprint = model._quantization_fingerprint
+        assert fingerprint.endswith("activations") == activation_quantization
+        assert apc.semantic_extra_hash(model=model) != apc.semantic_extra_hash(
+            model=Model(None)
+        )
+        x = mx.full((2, 3, 64), 6.0, mx.bfloat16)
+        expected = mx.full(
+            (2, 3, 4), 6 * 64 * 256 * weights["layer.weight_scale_2"].item()
+        )
+        assert mx.allclose(model.layer(x), expected, atol=0.01, rtol=0.01).item()
+
+        config["quantization"] = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+        config["quantization_config"] = config["quantization"]
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        mx.save_safetensors(
+            str(tmp_path / "model.safetensors"), dict(tree_flatten(model.parameters()))
+        )
+        restored = load_model(tmp_path, quantize_activations=activation_quantization)
+        assert apc.semantic_extra_hash(model=restored) == apc.semantic_extra_hash(
+            model=model
+        )
+        assert mx.array_equal(restored.layer.weight, model.layer.weight).item()
+        assert mx.array_equal(
+            restored.layer.scales, weights["layer.weight_scale"]
+        ).item()
+        assert mx.array_equal(restored.layer(x), model.layer(x)).item()
+        dequantize_model(restored)
+        assert isinstance(restored.layer, nn.Linear)
+        assert mx.allclose(restored.layer(x), expected, atol=0.01, rtol=0.01).item()
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("sorted_indices", [False, True])
+def test_scaled_nvfp4_experts_preserve_individual_scales(dtype, sorted_indices):
+    model = nn.Module()
+    model.layer = QuantizedSwitchLinear(
+        64, 4, 2, bias=False, group_size=16, mode="nvfp4"
+    )
+    scales = mx.array([0.00012715657, 0.000333], mx.float32)
+    weights = {
+        "layer.weight": mx.full((2, 4, 8), 0x22222222, mx.uint32),
+        "layer.scales": mx.full((2, 4, 4), 120, mx.uint8),
+        "layer.weight_scale_2": scales,
+    }
+    replace_scaled_quantized_linears(model, weights)
+    model.load_weights(list(weights.items()))
+    assert isinstance(model.layer, ScaledQuantizedSwitchLinear)
+    indices = mx.array([[0, 0], [1, 1]] if sorted_indices else [[1, 0], [0, 1]])
+    x = mx.ones((2, 1, 1, 64), dtype)
+    expected = mx.broadcast_to(
+        (64 * 256 * scales[indices])[..., None, None], (2, 2, 1, 4)
+    )
+    assert mx.allclose(
+        model.layer(x, indices, sorted_indices=sorted_indices),
+        expected.astype(dtype),
+        atol=1e-5,
+        rtol=1e-5,
+    ).item()
+    dequantize_model(model)
+    assert mx.allclose(model.layer(x, indices), expected, atol=1e-5, rtol=1e-5).item()
+
+
+def test_qwen35_moe_sanitize_stacks_global_scales():
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            text_config=SimpleNamespace(
+                tie_word_embeddings=False, num_hidden_layers=1, num_experts=2
+            )
+        )
+    )
+    weights = {}
+    for expert in range(2):
+        for name in ("up_proj", "down_proj", "gate_proj"):
+            prefix = f"model.language_model.layers.0.mlp.experts.{expert}.{name}"
+            weights[prefix + ".weight"] = mx.zeros((4, 8), mx.uint32)
+            weights[prefix + ".scales"] = mx.full((4, 4), 120, mx.uint8)
+            weights[prefix + ".weight_scale_2"] = mx.array(0.001 * (expert + 1))
+    sanitized = Qwen35MoEModel.sanitize(model, weights)
+    for name in ("up_proj", "down_proj", "gate_proj"):
+        prefix = f"language_model.model.layers.0.mlp.switch_mlp.{name}"
+        assert sanitized[prefix + ".weight"].shape == (2, 4, 8)
+        assert mx.array_equal(
+            sanitized[prefix + ".weight_scale_2"], mx.array([0.001, 0.002])
+        ).item()
+    assert not any(".experts." in key for key in sanitized)
 
 
 @pytest.mark.parametrize(
