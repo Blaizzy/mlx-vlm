@@ -517,9 +517,11 @@ class Model(YOLO11):
             renamed[".".join(path)] = value
         return renamed
 
-    def extract(self, processor, inputs, task=None, **kwargs):
+    def extract(self, processor, inputs, task=None, score_threshold=None, **kwargs):
         """Detect objects in one image."""
         from ...extraction import detection_outputs
         from .inference import predict
 
+        if score_threshold is not None:
+            kwargs["conf_threshold"] = score_threshold
         return detection_outputs(predict(self, inputs, **kwargs))

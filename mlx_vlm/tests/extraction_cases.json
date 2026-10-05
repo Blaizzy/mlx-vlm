@@ -362,6 +362,7 @@
         "task": "detection",
         "input_shape": [112, 112, 3],
         "outputs": ["boxes", "scores", "labels"],
+        "kwargs": { "score_threshold": 0.5 },
         "processor": "processing_rfdetr.RFDETRProcessor"
       },
       "checks": ["registry_and_config", "extraction_api"]
@@ -374,6 +375,7 @@
         "task": "detection",
         "input_shape": [640, 640, 3],
         "outputs": ["boxes", "scores", "labels"],
+        "kwargs": { "score_threshold": 0.5 },
         "processor": "processing_rt_detr_v2.RTDetrV2Processor"
       },
       "checks": ["registry_and_config", "extraction_api"]
@@ -420,6 +422,7 @@
         "task": "detection",
         "input_shape": [160, 160, 3],
         "outputs": ["boxes", "scores", "labels"],
+        "kwargs": { "score_threshold": 0.5 },
         "processor": "processing_yolo11.YOLO11Processor"
       },
       "checks": ["registry_and_config", "extraction_api"]
