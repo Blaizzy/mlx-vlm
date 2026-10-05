@@ -2140,3 +2140,30 @@ class TestMoERouterStopGradient:
         _, grads = nn.value_and_grad(block, lambda m, inp: m(inp).sum())(block, x)
         total = sum(float(mx.sum(mx.abs(g))) for _, g in tree_flatten(grads))
         assert total > 0 and bool(mx.isfinite(mx.array(total)))
+
+
+class TestPhiMoE:
+    def test_sparsemixer(self):
+        from mlx_vlm.models.phimoe.language import sparsemixer
+
+        gates = mx.array([[3.0, 1.0, 0.0, -1.0], [3.0, 2.99, 0.0, -1.0]])
+        inds, scores = sparsemixer(gates, top_k=2, jitter_eps=0.01)
+
+        assert inds.tolist() == [[0, 1], [0, 1]]
+        assert mx.allclose(scores, mx.array([[1.0, 1.0], [0.5025, 1.0]]))
+        mx.eval(
+            mx.grad(lambda g: sparsemixer(g, top_k=2, jitter_eps=0.01)[1].sum())(gates)
+        )
+
+    def test_plain_rope_without_scaling(self):
+        from mlx_vlm.models.phimoe.config import ModelConfig
+        from mlx_vlm.models.phimoe.language import Attention
+
+        config = ModelConfig(
+            hidden_size=16,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            rope_scaling=None,
+        )
+
+        assert isinstance(Attention(config).rope, nn.RoPE)
