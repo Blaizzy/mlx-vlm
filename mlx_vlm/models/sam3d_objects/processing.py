@@ -219,7 +219,12 @@ class SAM3DObjectsProcessor:
 
     @classmethod
     def from_pretrained(cls, path, **kwargs):
-        return cls()
+        import json
+        from pathlib import Path
+
+        config = Path(path) / "config.json"
+        settings = json.loads(config.read_text()) if config.exists() else {}
+        return cls(size=settings.get("image_size", 518))
 
     def __call__(self, image, mask=None, pointmap=None, **kwargs):
         kwargs.setdefault("size", self.size)

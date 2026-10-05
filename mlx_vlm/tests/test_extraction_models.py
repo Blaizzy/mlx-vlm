@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import importlib
 import io
@@ -2512,6 +2513,10 @@ class TestExtractionCoverage(unittest.TestCase):
                 cli.load = original
 
 
+class _Stop(Exception):
+    """Stops a predictor once the adapter has handed it its settings."""
+
+
 class TestExtractionPredictorWiring(unittest.TestCase):
     """Each adapter hands its predictor the collaborator that predictor expects."""
 
@@ -2526,21 +2531,32 @@ class TestExtractionPredictorWiring(unittest.TestCase):
             second = list(inspect.signature(predictor.__init__).parameters)[2]
             self.assertEqual(second, "processor", predictor.__name__)
 
-    def test_sam3d_body_predictor_takes_a_config_not_a_processor(self):
-        import inspect
+    def test_sam3d_body_preprocesses_with_the_processor_then_the_config(self):
+        from mlx_vlm.models.sam3d_body import processing_sam3d_body
+        from mlx_vlm.models.sam3d_body.config import SAM3DConfig
 
-        from mlx_vlm.models.sam3d_body.generate import SAM3DPredictor
+        model = _extraction_model("sam3d_body")
+        processor = processing_sam3d_body.SAM3DBodyProcessor(image_size=(64, 48))
+        image = np.zeros((96, 96, 3), dtype=np.uint8)
 
-        # SAM3DPredictor.predict reads image_size/image_mean/image_std off its
-        # second argument, so the adapter must pass the model config.
-        self.assertEqual(
-            list(inspect.signature(SAM3DPredictor.__init__).parameters)[2], "config"
-        )
-        source = inspect.getsource(
-            importlib.import_module("mlx_vlm.models.sam3d_body.model").SAM3DBody.extract
-        )
-        self.assertIn("self.config", source)
-        self.assertNotIn("SAM3DPredictor(self, processor)", source)
+        seen = []
+        predictor = importlib.import_module("mlx_vlm.models.sam3d_body.generate")
+        original = predictor.SAM3DPredictor.predict
+
+        def record(self, *args, **kwargs):
+            seen.append(self.config.image_size)
+            raise _Stop
+
+        predictor.SAM3DPredictor.predict = record
+        try:
+            for settings in (processor, None):
+                with contextlib.suppress(_Stop):
+                    model.extract(settings, image)
+        finally:
+            predictor.SAM3DPredictor.predict = original
+
+        self.assertEqual(seen[0], (64, 48))
+        self.assertEqual(tuple(seen[1]), tuple(SAM3DConfig().image_size))
 
 
 class TestExtractionCLIOutputs(unittest.TestCase):

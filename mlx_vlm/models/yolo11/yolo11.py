@@ -524,4 +524,6 @@ class Model(YOLO11):
 
         if score_threshold is not None:
             kwargs["conf_threshold"] = score_threshold
+        if processor is not None:
+            kwargs.setdefault("size", processor.size)
         return detection_outputs(predict(self, inputs, **kwargs))

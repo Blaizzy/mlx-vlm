@@ -794,7 +794,7 @@ class SAM3DBody(nn.Module):
         from .generate import SAM3DPredictor
 
         return split_outputs(
-            SAM3DPredictor(self, self.config).predict(inputs, **kwargs)
+            SAM3DPredictor(self, processor or self.config).predict(inputs, **kwargs)
         )
 
 
