@@ -503,6 +503,7 @@ def test_fused_projection_parity(bits, widths, length):
     expected = [
         verifier_linear._target_verify_timewise(linear, inputs) for linear in linears
     ]
+    assert quantized.optimized_affine_linears(linears, inputs) is not None
     actual = verifier_linear._target_verify_linears(linears, inputs)
     equal(actual, expected)
 
