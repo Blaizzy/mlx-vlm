@@ -152,10 +152,10 @@ rather than tokens, so they share one entry point:
 
 ```sh
 # what a checkpoint can predict
-mlx_vlm.extract --model mlx-community/moge-3-vitl-mlx-fp32 --list-tasks
+mlx_vlm.extract --model nativ-community/moge-3-vitl-fp32 --list-tasks
 
 # geometry from one image, arrays written to a .npz
-mlx_vlm.extract --model mlx-community/moge-3-vitl-mlx-fp32 --image photo.jpg --output geometry.npz
+mlx_vlm.extract --model nativ-community/moge-3-vitl-fp32 --image photo.jpg --output geometry.npz
 
 # video depth, from a file or from repeated frames
 mlx_vlm.extract --model mlx-community/Video-Depth-Anything-Small-MLX --video clip.mp4
@@ -177,7 +177,7 @@ From Python:
 from mlx_vlm import load
 from mlx_vlm.extraction import extract
 
-model, processor = load("mlx-community/moge-3-vitl-mlx-fp32")
+model, processor = load("nativ-community/moge-3-vitl-fp32")
 outputs = extract(model, processor, image)   # {"points": ..., "depth": ..., "mask": ...}
 ```
 
