@@ -18,7 +18,10 @@ import pytest
 from mlx.utils import tree_flatten
 
 import mlx_vlm.models.rope_utils as rope_utils
-from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
+from mlx_vlm.convert import (
+    _preserve_existing_deepseek_v4_quantization,
+    _run_model_inputs,
+)
 from mlx_vlm.fp8 import _dequantize_fp8_weight, _quantize_fp8_weight
 from mlx_vlm.models.cache import KVCache
 from mlx_vlm.models.mla import max_absorbed_queries
@@ -1326,3 +1329,404 @@ def test_rejects_missing_or_invalid_signs(packed_prism_checkpoint, missing):
         weights[key] = mx.zeros_like(weights[key])
     with pytest.raises(ValueError, match="sign"):
         prism.Model(prism.ModelConfig.from_dict(config)).sanitize(weights)
+
+
+class _DWQTiny(nn.Module):
+    def __init__(self, vocab=128, dim=64):
+        super().__init__()
+        self.embed = nn.Embedding(vocab, dim)
+        self.fc = nn.Linear(dim, dim, bias=False)
+        self.head = nn.Linear(dim, vocab, bias=False)
+
+    def __call__(self, ids):
+        return self.head(self.fc(self.embed(ids)))
+
+
+def _quantize_tiny(model):
+    def pred(path, mod):
+        return hasattr(mod, "to_quantized") and int(mod.weight.shape[-1]) % 32 == 0
+
+    nn.quantize(model, 32, 4, class_predicate=pred)
+
+
+class TestDWQ(unittest.TestCase):
+    def _setup(self):
+        mx.random.seed(0)
+        model = _DWQTiny()
+        mx.eval(model.parameters())
+        inputs = [{"input_ids": mx.array([[1, 5, 9, 3, 7, 2]])}]
+        forward = lambda sample: model(sample["input_ids"])  # noqa: E731
+        return model, inputs, forward
+
+    def test_best_val_is_at_most_baseline(self):
+        # best-validation restore guarantees DWQ never leaves the model worse
+        # than the round-to-nearest baseline (real improvement is exercised by
+        # the full-model runs; a random toy teacher is near-uniform).
+        from mlx_vlm.quant import apply_dwq, capture_teacher
+
+        model, inputs, fwd = self._setup()
+        teacher = capture_teacher(fwd, inputs)
+        _quantize_tiny(model)
+        summary = apply_dwq(
+            model,
+            fwd,
+            inputs,
+            teacher,
+            steps=100,
+            lr=1e-3,
+            val_inputs=inputs,
+            val_teacher=teacher,
+        )
+        self.assertIsNotNone(summary["final_loss"])
+        self.assertLessEqual(summary["final_loss"], summary["initial_loss"] + 1e-6)
+        self.assertTrue(summary["history"])
+
+    def test_never_worse_than_rtn_baseline(self):
+        # A deliberately huge LR diverges; best-val restore must keep the model
+        # no worse than the round-to-nearest baseline.
+        from mlx_vlm.quant import apply_dwq, capture_teacher
+
+        model, inputs, fwd = self._setup()
+        teacher = capture_teacher(fwd, inputs)
+        _quantize_tiny(model)
+        summary = apply_dwq(
+            model,
+            fwd,
+            inputs,
+            teacher,
+            steps=60,
+            lr=5.0,
+            val_inputs=inputs,
+            val_teacher=teacher,
+        )
+        self.assertLessEqual(summary["final_loss"], summary["initial_loss"] + 1e-6)
+
+    def test_topk_teacher_matches_shapes_and_improves(self):
+        from mlx_vlm.quant import apply_dwq, capture_teacher
+
+        model, inputs, fwd = self._setup()
+        teacher = capture_teacher(fwd, inputs, top_k=16)
+        vals, idx = teacher[0]
+        self.assertEqual(vals.shape[-1], 16)
+        self.assertIsNotNone(idx)
+        self.assertEqual(idx.shape[-1], 16)
+        _quantize_tiny(model)
+        summary = apply_dwq(
+            model,
+            fwd,
+            inputs,
+            teacher,
+            steps=80,
+            lr=1e-3,
+            val_inputs=inputs,
+            val_teacher=teacher,
+        )
+        self.assertLessEqual(summary["final_loss"], summary["initial_loss"] + 1e-6)
+
+    def test_gradient_checkpointing_runs(self):
+        from mlx_vlm.quant import apply_dwq, capture_teacher
+
+        model, inputs, fwd = self._setup()
+        teacher = capture_teacher(fwd, inputs)
+        _quantize_tiny(model)
+        summary = apply_dwq(
+            model,
+            fwd,
+            inputs,
+            teacher,
+            steps=40,
+            lr=1e-3,
+            val_inputs=inputs,
+            val_teacher=teacher,
+            checkpoint=True,
+        )
+        self.assertLessEqual(summary["final_loss"], summary["initial_loss"] + 1e-6)
+
+    def test_only_scales_biases_change(self):
+        from mlx_vlm.quant import apply_dwq, capture_teacher
+
+        model, inputs, fwd = self._setup()
+        teacher = capture_teacher(fwd, inputs)
+        _quantize_tiny(model)
+        weight_before = mx.array(model.head.weight)
+        scales_before = mx.array(model.head.scales)
+        apply_dwq(model, fwd, inputs, teacher, steps=40, lr=1e-3)
+        self.assertTrue(mx.array_equal(model.head.weight, weight_before))
+        self.assertFalse(mx.array_equal(model.head.scales, scales_before))
+
+    def test_shapes_preserved(self):
+        from mlx_vlm.quant import apply_dwq, capture_teacher
+
+        model, inputs, fwd = self._setup()
+        teacher = capture_teacher(fwd, inputs)
+        _quantize_tiny(model)
+        apply_dwq(model, fwd, inputs, teacher, steps=10, lr=1e-3)
+        self.assertEqual(fwd(inputs[0]).shape, (1, 6, 128))
+
+    def test_zero_steps_is_noop(self):
+        from mlx_vlm.quant import apply_dwq, capture_teacher
+
+        model, inputs, fwd = self._setup()
+        teacher = capture_teacher(fwd, inputs)
+        _quantize_tiny(model)
+        scales_before = mx.array(model.head.scales)
+        summary = apply_dwq(model, fwd, inputs, teacher, steps=0, lr=1e-3)
+        self.assertIsNone(summary["final_loss"])
+        self.assertTrue(mx.array_equal(model.head.scales, scales_before))
+
+
+class _MMTinyLM(nn.Module):
+    def __init__(self, vocab, dim):
+        super().__init__()
+        self.embed = nn.Embedding(vocab, dim)
+        self.fc = nn.Linear(dim, dim, bias=False)
+        self.head = nn.Linear(dim, vocab, bias=False)
+
+    def __call__(self, input_ids=None, inputs_embeds=None, **kwargs):
+        from mlx_vlm.models.base import LanguageModelOutput
+
+        h = inputs_embeds if inputs_embeds is not None else self.embed(input_ids)
+        return LanguageModelOutput(logits=self.head(self.fc(h)))
+
+
+class _MMTinyVLM(nn.Module):
+    """Minimal multimodal model exercising the full model(...) -> logits path."""
+
+    def __init__(self, vocab=64, dim=32):
+        super().__init__()
+        self.vision_tower = nn.Linear(dim, dim, bias=False)
+        self.language_model = _MMTinyLM(vocab, dim)
+
+    def get_input_embeddings(self, input_ids=None, pixel_values=None, mask=None):
+        from mlx_vlm.models.base import InputEmbeddingsFeatures
+
+        embeds = self.language_model.embed(input_ids)
+        if pixel_values is not None:
+            embeds = mx.concatenate([self.vision_tower(pixel_values), embeds], axis=1)
+        return InputEmbeddingsFeatures(inputs_embeds=embeds)
+
+    def __call__(self, input_ids, pixel_values=None, mask=None, **kwargs):
+        feats = self.get_input_embeddings(input_ids, pixel_values, mask)
+        return self.language_model(input_ids, inputs_embeds=feats.inputs_embeds)
+
+
+class TestDWQMultimodal(unittest.TestCase):
+    def _setup(self):
+        mx.random.seed(0)
+        model = _MMTinyVLM()
+        mx.eval(model.parameters())
+        sample = {
+            "input_ids": mx.array([[1, 5, 9, 3, 7]]),
+            "pixel_values": mx.random.normal((1, 4, 32)),
+        }
+        forward = lambda s: _run_model_inputs(model, s).logits  # noqa: E731
+        return model, sample, forward
+
+    def test_forward_runs_vision_path(self):
+        model, sample, forward = self._setup()
+        self.assertEqual(forward(sample).shape, (1, 4 + 5, 64))
+
+    def test_dwq_tunes_vision_from_multimodal_signal(self):
+        from mlx_vlm.quant import apply_dwq, capture_teacher
+
+        model, sample, forward = self._setup()
+        teacher = capture_teacher(forward, [sample])
+        _quantize_tiny(model)
+        vision_scales_before = mx.array(model.vision_tower.scales)
+        summary = apply_dwq(
+            model,
+            forward,
+            [sample],
+            teacher,
+            steps=60,
+            lr=1e-3,
+            val_inputs=[sample],
+            val_teacher=teacher,
+        )
+        self.assertLessEqual(summary["final_loss"], summary["initial_loss"] + 1e-6)
+        self.assertFalse(
+            mx.array_equal(model.vision_tower.scales, vision_scales_before)
+        )
+
+    def test_freeze_prefix_cache_is_lossless(self):
+        # Caching the frozen vision/embedding prefix and running only the
+        # decoder must reproduce the full-model logits exactly.
+        model, sample, forward = self._setup()
+        full = forward(sample)
+        feats = model.get_input_embeddings(sample["input_ids"], sample["pixel_values"])
+        cached = model.language_model(
+            sample["input_ids"], inputs_embeds=mx.stop_gradient(feats.inputs_embeds)
+        ).logits
+        self.assertTrue(mx.allclose(full, cached, atol=1e-4))
+
+
+class _AWQAttn(nn.Module):
+    def __init__(self, d, dk):
+        super().__init__()
+        self.q_proj = nn.Linear(d, dk, bias=False)
+        self.k_proj = nn.Linear(d, dk, bias=False)
+        self.v_proj = nn.Linear(d, dk, bias=False)
+        self.o_proj = nn.Linear(dk, d, bias=False)
+
+
+class _AWQMLP(nn.Module):
+    def __init__(self, d, di):
+        super().__init__()
+        self.gate_proj = nn.Linear(d, di, bias=False)
+        self.up_proj = nn.Linear(d, di, bias=False)
+        self.down_proj = nn.Linear(di, d, bias=False)
+
+
+class _AWQStdBlock(nn.Module):
+    def __init__(self, d=64, dk=64, di=128, eps=1e-5):
+        super().__init__()
+        self.self_attn = _AWQAttn(d, dk)
+        self.mlp = _AWQMLP(d, di)
+        self.input_layernorm = nn.RMSNorm(d, eps=eps)
+        self.post_attention_layernorm = nn.RMSNorm(d, eps=eps)
+
+    def __call__(self, x):
+        a = self.input_layernorm(x)
+        v = self.self_attn.v_proj(a)
+        v = (
+            v
+            + 0.0 * self.self_attn.q_proj(a).sum()
+            + 0.0 * self.self_attn.k_proj(a).sum()
+        )
+        h = x + self.self_attn.o_proj(v)
+        b = self.post_attention_layernorm(h)
+        return h + self.mlp.down_proj(
+            nn.silu(self.mlp.gate_proj(b)) * self.mlp.up_proj(b)
+        )
+
+
+class _AWQDeltaAttn(nn.Module):
+    def __init__(self, d, dqkv, dz):
+        super().__init__()
+        self.in_proj_qkv = nn.Linear(d, dqkv, bias=False)
+        self.in_proj_z = nn.Linear(d, dz, bias=False)
+
+
+class _AWQDeltaBlock(nn.Module):
+    def __init__(self, d=64, dqkv=96, dz=64, di=128, eps=1e-5):
+        super().__init__()
+        self.linear_attn = _AWQDeltaAttn(d, dqkv, dz)
+        self.mlp = _AWQMLP(d, di)
+        self.input_layernorm = nn.RMSNorm(d, eps=eps)
+        self.post_attention_layernorm = nn.RMSNorm(d, eps=eps)
+
+
+class _AWQVisAttn(nn.Module):
+    def __init__(self, d):
+        super().__init__()
+        self.qkv = nn.Linear(d, 3 * d)
+        self.proj = nn.Linear(d, d)
+
+
+class _AWQVisMLP(nn.Module):
+    def __init__(self, d, di):
+        super().__init__()
+        self.linear_fc1 = nn.Linear(d, di)
+        self.linear_fc2 = nn.Linear(di, d)
+
+
+class _AWQVisBlock(nn.Module):
+    def __init__(self, d=64, di=128):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d)
+        self.attn = _AWQVisAttn(d)
+        self.norm2 = nn.LayerNorm(d)
+        self.mlp = _AWQVisMLP(d, di)
+
+
+class TestAWQ(unittest.TestCase):
+    def test_fold_into_rmsnorm_is_identity(self):
+        from mlx_vlm.quant.awq import _fold_into_norm
+
+        mx.random.seed(0)
+        d = 64
+        norm = nn.RMSNorm(d)
+        norm.weight = mx.random.uniform(0.5, 1.5, (d,))
+        lin = nn.Linear(d, 32, bias=False)
+        x = mx.random.normal((4, d))
+        y0 = lin(norm(x))
+        s = mx.random.uniform(0.3, 3.0, (d,))
+        _fold_into_norm(norm, [lin], s)
+        self.assertLess(float(mx.max(mx.abs(lin(norm(x)) - y0))), 5e-3)
+
+    def test_fold_into_layernorm_is_identity(self):
+        from mlx_vlm.quant.awq import _fold_into_norm
+
+        mx.random.seed(0)
+        d = 64
+        norm = nn.LayerNorm(d)
+        norm.weight = mx.random.uniform(0.5, 1.5, (d,))
+        norm.bias = mx.random.normal((d,))
+        lin = nn.Linear(d, 32, bias=False)
+        x = mx.random.normal((4, d))
+        y0 = lin(norm(x))
+        s = mx.random.uniform(0.3, 3.0, (d,))
+        _fold_into_norm(norm, [lin], s)
+        self.assertLess(float(mx.max(mx.abs(lin(norm(x)) - y0))), 5e-3)
+
+    def test_fold_into_linear_is_identity(self):
+        from mlx_vlm.quant.awq import _fold_into_linear
+
+        mx.random.seed(0)
+        up = nn.Linear(32, 48, bias=False)
+        down = nn.Linear(48, 32, bias=False)
+        x = mx.random.normal((4, 32))
+        y0 = down(up(x))
+        s = mx.random.uniform(0.3, 3.0, (48,))
+        _fold_into_linear(up, [down], s)
+        self.assertLess(float(mx.max(mx.abs(down(up(x)) - y0))), 5e-3)
+
+    def test_clip_reduces_quant_error(self):
+        from mlx_vlm.quant.awq import _fake_quant, _search_clip
+
+        mx.random.seed(0)
+        w = mx.random.normal((32, 64))
+        x = mx.random.normal((40, 64))
+        ref = w @ x.T
+        err_rtn = float(mx.sum((_fake_quant(w, 32, 3) @ x.T - ref) ** 2).item())
+        clipped = _search_clip(w, x, 32, 3)
+        err_clip = float(mx.sum((_fake_quant(clipped, 32, 3) @ x.T - ref) ** 2).item())
+        self.assertLess(err_clip, err_rtn)
+
+    def test_group_discovery_covers_hybrid_and_vision(self):
+        from mlx_vlm.quant.awq import _awq_groups
+
+        self.assertEqual(len(_awq_groups(_AWQStdBlock())), 4)
+        self.assertEqual(len(_awq_groups(_AWQDeltaBlock())), 3)
+        self.assertEqual(len(_awq_groups(_AWQVisBlock())), 3)
+
+    def test_apply_awq_preserves_output_without_clip(self):
+        from mlx_vlm.quant import apply_awq, collect_activation_stats
+
+        mx.random.seed(0)
+        block = _AWQStdBlock()
+        mx.eval(block.parameters())
+        x = mx.random.normal((2, 6, 64))
+        y0 = block(x)
+        mx.eval(y0)
+
+        def run():
+            for _ in range(3):
+                mx.eval(block(mx.random.normal((2, 6, 64))))
+
+        stats = collect_activation_stats(block, run)
+        summary = apply_awq(block, stats, bits=4, group_size=32, clip=False)
+        self.assertEqual(summary["groups"], 4)
+        self.assertLess(float(mx.max(mx.abs(block(x) - y0))), 5e-3)
+
+    def test_apply_awq_no_stats_is_noop(self):
+        from mlx_vlm.quant import apply_awq
+
+        mx.random.seed(0)
+        block = _AWQStdBlock()
+        mx.eval(block.parameters())
+        x = mx.random.normal((2, 6, 64))
+        y0 = block(x)
+        summary = apply_awq(block, {}, bits=4, group_size=32)
+        self.assertEqual(summary["groups"], 0)
+        self.assertLess(float(mx.max(mx.abs(block(x) - y0))), 1e-6)

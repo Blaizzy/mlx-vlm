@@ -6,9 +6,12 @@ from .calibration import (
     synthetic_calibration_audio,
     synthetic_calibration_images,
 )
+from .dwq import apply_dwq, capture_teacher
 
 __all__ = [
     "apply_awq",
+    "apply_dwq",
+    "capture_teacher",
     "collect_activation_stats",
     "DEFAULT_CALIBRATION_TEXT",
     "synthetic_calibration_images",
