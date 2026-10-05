@@ -12,7 +12,8 @@ from PIL import Image
 
 from ..turboquant import BatchTurboQuantKVCache, TurboQuantKVCache
 from ..turboquant import _state_length as _turboquant_state_length
-from .cache import create_causal_mask
+from .attention import BatchAttentionMask
+from .cache import BatchKVCache, create_causal_mask
 
 
 def load_chat_template(tokenizer, model_path):
@@ -261,9 +262,23 @@ def dequantize_kv_state(cache, keys, values):
 
 
 def create_attention_mask(
-    h, cache=None, window_size: Optional[int] = None, return_array: bool = False
+    h,
+    cache=None,
+    window_size: Optional[int] = None,
+    return_array: bool = False,
+    *,
+    compact: bool = False,
 ):
+    """Opt into compact bounds only when forwarding the mask to shared SDPA."""
     N = h.shape[1]
+    if (
+        compact
+        and type(cache) is BatchKVCache
+        and not return_array
+        and window_size is None
+    ):
+        padding = tuple(int(p) for p in cache.left_padding.tolist())
+        return BatchAttentionMask(N, cache._idx, padding)
     if (
         cache is not None
         and not isinstance(cache, mx.array)
@@ -375,6 +390,11 @@ def scaled_dot_product_attention(
     mask: Optional[mx.array],
     sinks: Optional[mx.array] = None,
 ) -> mx.array:
+    if isinstance(mask, BatchAttentionMask):
+        if type(cache) is not BatchKVCache or sinks is not None:
+            raise ValueError("Compact batch attention requires dense KV without sinks")
+        return mask.apply(queries, keys, values, scale)
+
     if isinstance(cache, (TurboQuantKVCache, BatchTurboQuantKVCache)):
         # The fused kernels have no sink term, and the batch cache only shares
         # them when it holds a single unpadded row. Anything else dequantizes,

@@ -220,6 +220,7 @@ class CohereModel(nn.Module):
                 window_size=(
                     self.window_size if layer.self_attn.use_sliding_window else None
                 ),
+                compact=True,
             )
             h = layer(h, mask, c)
 
