@@ -92,6 +92,57 @@ class ModelChecks:
             mx.linalg.norm(output.text_embeds, axis=-1), mx.array(1.0), atol=1e-5
         )
 
+    def nvfp4_global_scale(self, model):
+        nn.quantize(
+            model,
+            group_size=16,
+            bits=4,
+            mode="nvfp4",
+            class_predicate=lambda path, module: hasattr(module, "to_quantized")
+            and model.quant_predicate(path, module),
+        )
+        dense = model.language_model.model.layers[0].self_attn.q_proj
+        routed = model.language_model.model.layers[0].mlp.switch_mlp.up_proj
+        for layer in (dense, routed):
+            assert layer.mode == "nvfp4"
+            assert "global_scale" in layer
+            assert not mx.any(layer.scales == 0).item()
+
+        x = mx.random.normal((2, dense.weight.shape[-1] * 8))
+        weight = mx.dequantize(
+            dense.weight,
+            dense.scales,
+            group_size=16,
+            bits=4,
+            mode="nvfp4",
+            global_scale=dense.global_scale,
+            dtype=x.dtype,
+        )
+        np.testing.assert_allclose(
+            np.array(dense(x)),
+            np.array(x @ weight.T),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+        x = mx.random.normal((1, 2, 1, 1, routed.weight.shape[-1] * 8))
+        indices = mx.array([[[0, 2], [1, 3]]])
+        weight = mx.dequantize(
+            routed.weight,
+            routed.scales,
+            group_size=16,
+            bits=4,
+            mode="nvfp4",
+            global_scale=routed.global_scale,
+            dtype=x.dtype,
+        )
+        np.testing.assert_allclose(
+            np.array(routed(x, indices)),
+            np.array(mx.gather_mm(x, weight.swapaxes(-1, -2), rhs_indices=indices)),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
     def assert_close(self, actual, expected, *, logits=False):
         assert actual.shape == expected.shape
         assert mx.all(mx.isfinite(actual)).item()
@@ -523,6 +574,8 @@ def check_arguments(kind, case, model, config):
         return (model, text.vocab_size), case.get("forward_cache", {})
     if kind in {"masked_lm", "token_embeddings"}:
         return (model, config), {}
+    if kind == "nvfp4_global_scale":
+        return (model,), {}
     if kind == "multimodal":
         return (model, config), case["multimodal"]
     if kind == "input_embeddings":
