@@ -767,9 +767,13 @@ def _target_verify_qlinear_header(
     constant constexpr int SIMD_SIZE = 32;
     constant constexpr int BITS = __BITS__;
     constant constexpr int GS = __GS__;
-    constant constexpr int PACK_FACTOR = (BITS == 5 ? 8 : 32 / BITS);
-    constant constexpr int BYTES_PER_PACK = (BITS == 5 ? 5 : 32 / 8);
-    constant constexpr int PACKS_PER_THREAD = 2;
+    // get_pack_factor<BITS, 32>, get_bytes_per_pack<BITS, 32> and packs_per_thread
+    // exactly as MLX qmv_fast_impl, so every row matches the M=1 decode kernel.
+    constant constexpr int PACK_FACTOR =
+        (BITS == 3 || BITS == 5) ? 8 : (BITS == 6 ? 4 : 32 / BITS);
+    constant constexpr int BYTES_PER_PACK =
+        ((BITS & (BITS - 1)) == 0) ? 4 : (BITS == 5 ? 5 : 3);
+    constant constexpr int PACKS_PER_THREAD = BITS == 2 ? 1 : 2;
     constant constexpr int VALUES_PER_THREAD = PACK_FACTOR * PACKS_PER_THREAD;
     constant constexpr int BLOCK_SIZE = VALUES_PER_THREAD * SIMD_SIZE;
     constant constexpr int SCALE_STEP_PER_THREAD = GS / VALUES_PER_THREAD;
@@ -780,7 +784,36 @@ def _target_verify_qlinear_header(
     template <typename T>
     inline float load_vector_exact(const device T* x, thread float* x_thread) {
       float sum = 0.0f;
-      if (BITS == 4) {
+      if (BITS == 2) {
+        for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
+          sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+          x_thread[i] = x[i];
+          x_thread[i + 1] = x[i + 1] / 4.0f;
+          x_thread[i + 2] = x[i + 2] / 16.0f;
+          x_thread[i + 3] = x[i + 3] / 64.0f;
+        }
+      } else if (BITS == 3) {
+        for (int i = 0; i < VALUES_PER_THREAD; i += 8) {
+          sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
+              x[i + 6] + x[i + 7];
+          x_thread[i] = x[i];
+          x_thread[i + 1] = x[i + 1] / 8.0f;
+          x_thread[i + 2] = x[i + 2] / 64.0f;
+          x_thread[i + 3] = x[i + 3] / 2.0f;
+          x_thread[i + 4] = x[i + 4] / 16.0f;
+          x_thread[i + 5] = x[i + 5] / 128.0f;
+          x_thread[i + 6] = x[i + 6] / 4.0f;
+          x_thread[i + 7] = x[i + 7] / 32.0f;
+        }
+      } else if (BITS == 6) {
+        for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
+          sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+          x_thread[i] = x[i];
+          x_thread[i + 1] = x[i + 1] / 64.0f;
+          x_thread[i + 2] = x[i + 2] / 16.0f;
+          x_thread[i + 3] = x[i + 3] / 4.0f;
+        }
+      } else if (BITS == 4) {
         for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
           sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
           x_thread[i] = x[i];
@@ -817,7 +850,43 @@ def _target_verify_qlinear_header(
         float bias,
         float sum) {
       float accum = 0.0f;
-      if (BITS == 4) {
+      if (BITS == 2) {
+        for (int i = 0; i < (VALUES_PER_THREAD / 4); i++) {
+          accum +=
+              (x_thread[4 * i] * (w[i] & 0x03) +
+               x_thread[4 * i + 1] * (w[i] & 0x0c) +
+               x_thread[4 * i + 2] * (w[i] & 0x30) +
+               x_thread[4 * i + 3] * (w[i] & 0xc0));
+        }
+      } else if (BITS == 3) {
+        for (int i = 0; i < (VALUES_PER_THREAD / 8); i++) {
+          const thread float* xt = x_thread + 8 * i;
+          const device uint8_t* wb = w + 3 * i;
+
+          accum += (wb[0] & 0x07) * xt[0];
+          accum += (wb[0] & 0x38) * xt[1];
+          accum += (wb[0] & 0xc0) * xt[2];
+          accum += (wb[1] & 0x01) * (xt[2] * 256.0f);
+          accum += (wb[1] & 0x0e) * xt[3];
+          accum += (wb[1] & 0x70) * xt[4];
+          accum += (wb[1] & 0x80) * xt[5];
+          accum += (wb[2] & 0x03) * (xt[5] * 256.0f);
+          accum += (wb[2] & 0x1c) * xt[6];
+          accum += (wb[2] & 0xe0) * xt[7];
+        }
+      } else if (BITS == 6) {
+        for (int i = 0; i < (VALUES_PER_THREAD / 4); i++) {
+          const thread float* xt = x_thread + 4 * i;
+          const device uint8_t* wb = w + 3 * i;
+
+          accum += (wb[0] & 0x3f) * xt[0];
+          accum += (wb[0] & 0xc0) * xt[1];
+          accum += (wb[1] & 0x0f) * (xt[1] * 256.0f);
+          accum += (wb[1] & 0xf0) * xt[2];
+          accum += (wb[2] & 0x03) * (xt[2] * 256.0f);
+          accum += (wb[2] & 0xfc) * xt[3];
+        }
+      } else if (BITS == 4) {
         const device uint16_t* ws = (const device uint16_t*)w;
         for (int i = 0; i < (VALUES_PER_THREAD / 4); i++) {
           uint packed = ws[i];
@@ -1646,7 +1715,7 @@ def supports_optimized_affine_head(linear) -> bool:
     """Return whether the exact affine verifier kernel supports ``linear``."""
     if (
         not isinstance(linear, nn.QuantizedLinear)
-        or linear.bits not in (4, 5, 8)
+        or linear.bits not in AFFINE_BITS
         or linear.mode != "affine"
         or linear.biases is None
         or linear.scales.dtype not in (mx.bfloat16, mx.float16)
@@ -1793,7 +1862,7 @@ def optimized_affine_linears(linears, x: mx.array):
         not 2 <= len(linears) <= 4
         or x.ndim != 3
         or not 1 < x.shape[1] <= 8
-        or bits not in (4, 5, 8)
+        or bits not in AFFINE_BITS
         or not all(
             isinstance(linear, nn.QuantizedLinear)
             and linear.bits == bits
