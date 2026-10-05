@@ -10,7 +10,7 @@ from ..base import (
     create_attention_mask,
     scaled_dot_product_attention,
 )
-from ..cache import BatchKVCache, KVCache, RotatingKVCache
+from ..cache import KVCache, RotatingKVCache
 from ..rope_utils import initialize_rope
 from .config import ModelConfig
 
@@ -146,12 +146,7 @@ class LlamaModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        compact = all(
-            type(c) is BatchKVCache
-            for layer, c in zip(self.layers, cache)
-            if not layer.use_sliding
-        )
-        fa_mask = create_attention_mask(h, cache[self.fa_idx], compact=compact)
+        fa_mask = create_attention_mask(h, cache[self.fa_idx])
         if self.swa_idx is not None:
             swa_mask = create_attention_mask(
                 h, cache[self.swa_idx], window_size=self.sliding_window
