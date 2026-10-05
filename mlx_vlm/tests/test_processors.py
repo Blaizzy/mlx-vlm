@@ -1321,22 +1321,52 @@ class TestQwen3VLVideoTimestamps:
         return np.zeros((count, 3, 56, 56), dtype=np.uint8)
 
     @pytest.mark.parametrize("prepare", [False, True], ids=["direct", "prepare-inputs"])
-    def test_metadata_sets_the_timestamps(self, p, prepare):
-        metadata = dict(total_num_frames=91, fps=30, frames_indices=[0, 30, 60, 90])
+    @pytest.mark.parametrize(
+        "indices,expected",
+        [([0, 30, 60, 90], ["0.5", "2.5"]), ([0, 30, 60], ["0.5", "2.0"])],
+        ids=["even", "odd"],
+    )
+    def test_metadata_sets_the_timestamps(self, p, prepare, indices, expected):
+        metadata = dict(total_num_frames=91, fps=30, frames_indices=indices)
         if prepare:
             prepare_inputs(
                 p,
                 prompts=self.VIDEO_BLOCK,
-                videos=[self.frames()],
+                videos=[self.frames(len(indices))],
                 video_metadata=[metadata],
             )
         else:
             p(
                 text=[self.VIDEO_BLOCK],
-                videos=[self.frames()],
+                videos=[self.frames(len(indices))],
                 video_metadata=[VideoMetadata(**metadata)],
             )
-        assert self.markers(p) == ["0.5", "2.5"]
+        assert self.markers(p) == expected
+
+    @pytest.mark.parametrize("prepare", [False, True], ids=["direct", "prepare-inputs"])
+    @pytest.mark.parametrize(
+        "frame_count,indices",
+        [(4, [0, 30, 60]), (3, [0, 30, 60, 90])],
+        ids=["missing-index", "extra-index"],
+    )
+    def test_metadata_frame_count_is_checked_before_padding(
+        self, p, prepare, frame_count, indices
+    ):
+        metadata = dict(total_num_frames=91, fps=30, frames_indices=indices)
+        with pytest.raises(ValueError, match="frame indices must match"):
+            if prepare:
+                prepare_inputs(
+                    p,
+                    prompts=self.VIDEO_BLOCK,
+                    videos=[self.frames(frame_count)],
+                    video_metadata=[metadata],
+                )
+            else:
+                p(
+                    text=[self.VIDEO_BLOCK],
+                    videos=[self.frames(frame_count)],
+                    video_metadata=[VideoMetadata(**metadata)],
+                )
 
     def test_fps_without_metadata_spaces_frames_evenly(self, p):
         p(text=[self.VIDEO_BLOCK], videos=[self.frames()], fps=[1.0])

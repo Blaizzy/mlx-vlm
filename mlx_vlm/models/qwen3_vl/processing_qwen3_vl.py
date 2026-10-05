@@ -606,13 +606,27 @@ class Qwen3VLVideoProcessor(BaseVideoProcessor):
             return item.ndim in (2, 3)
         return False
 
-    def __call__(self, videos, **kwargs):
+    def __call__(self, videos, video_metadata=None, **kwargs):
         if not isinstance(videos, list) or (videos and self._is_video_frame(videos[0])):
             videos = [videos]
+        if video_metadata is not None and len(video_metadata) != len(videos):
+            raise ValueError("Expected one video_metadata entry per video.")
         all_patches = []
         all_thw = []
-        for v in videos:
+        for index, v in enumerate(videos):
             v = self._prepare_video(v)
+            metadata = video_metadata[index] if video_metadata is not None else None
+            if metadata is not None:
+                indices = (
+                    metadata["frames_indices"]
+                    if isinstance(metadata, dict)
+                    else metadata.frames_indices
+                )
+                # Check before _process_one pads the final temporal group.
+                if len(indices) != len(v):
+                    raise ValueError(
+                        "Video frame indices must match the decoded frame count."
+                    )
             patches, thw = self._process_one(v)
             all_patches.append(patches)
             all_thw.append(thw)
@@ -814,7 +828,7 @@ class Qwen3VLProcessor(ProcessorMixin):
 
         if videos is not None:
             _video_proc = self.video_processor or self.image_processor
-            videos_inputs = _video_proc(videos=videos)
+            videos_inputs = _video_proc(videos=videos, video_metadata=video_metadata)
             video_grid_thw = videos_inputs["video_grid_thw"]
         else:
             video_grid_thw = None
