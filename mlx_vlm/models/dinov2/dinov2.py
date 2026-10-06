@@ -258,6 +258,44 @@ _HF_BLOCK_KEY = re.compile(r"encoder\.layer\.(\d+)\.(.+)")
 _HF_QKV_KEY = re.compile(r"attention\.attention\.(query|key|value)\.(weight|bias)")
 
 
+# Fallbacks for checkpoints that ship no preprocessor_config.json; the
+# facebook/dinov2-* repos declare exactly these values.
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+def _preprocessing(processor, config):
+    """Read DINOv2's documented preprocessing off the checkpoint's processor."""
+    size = getattr(processor, "size", None) or {}
+    crop = getattr(processor, "crop_size", None) or {}
+    return {
+        "shortest_edge": size.get("shortest_edge") or config.image_size,
+        "crop": (
+            crop.get("height") or config.image_size,
+            crop.get("width") or config.image_size,
+        ),
+        "mean": tuple(getattr(processor, "image_mean", None) or IMAGENET_MEAN),
+        "std": tuple(getattr(processor, "image_std", None) or IMAGENET_STD),
+    }
+
+
+def _resize_shortest_edge(pixels, shortest):
+    """Scale so the short side is ``shortest``, keeping the aspect ratio."""
+    height, width = pixels.shape[1:3]
+    scale = shortest / min(height, width)
+    target = (
+        max(shortest, int(round(height * scale))),
+        max(shortest, int(round(width * scale))),
+    )
+    return resize_bicubic_nhwc(pixels, target)
+
+
+def _center_crop(pixels, height, width):
+    top = max((pixels.shape[1] - height) // 2, 0)
+    left = max((pixels.shape[2] - width) // 2, 0)
+    return pixels[:, top : top + height, left : left + width]
+
+
 class Model(DINOv2):
     """Standalone DINOv2 image encoder.
 
@@ -312,6 +350,22 @@ class Model(DINOv2):
                 [parts["query"], parts["key"], parts["value"]], axis=0
             )
         return out
+
+    extraction_types = ("backbone",)
+
+    def extract(self, processor, inputs, task=None, **kwargs):
+        """Encode one image into patch tokens and a pooled embedding."""
+        pixels = mx.array(inputs)
+        if pixels.ndim == 3:
+            pixels = pixels[None]
+        pixels = pixels.astype(mx.float32)
+        if pixels.max() > 1.0:
+            pixels = pixels / 255.0
+        settings = _preprocessing(processor, self.config)
+        pixels = _resize_shortest_edge(pixels, settings["shortest_edge"])
+        pixels = _center_crop(pixels, *settings["crop"])
+        pixels = (pixels - mx.array(settings["mean"])) / mx.array(settings["std"])
+        return self(pixels, **kwargs)
 
 
 class DINOv2Encoder(nn.Module):

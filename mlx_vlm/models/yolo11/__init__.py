@@ -1,5 +1,6 @@
 """YOLO11 object detection model for OmniParser's icon_detect module."""
 
+from . import processing_yolo11  # noqa: F401
 from .config import ModelConfig
 from .inference import (
     DEFAULT_MODEL_ID,

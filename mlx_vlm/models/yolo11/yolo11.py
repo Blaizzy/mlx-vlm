@@ -470,6 +470,8 @@ def non_max_suppression(
 class Model(YOLO11):
     """YOLO11 behind the repository's standard config and loader."""
 
+    extraction_types = ("detection",)
+
     def __init__(self, config):
         super().__init__(nc=config.nc, ch=tuple(config.ch), reg_max=config.reg_max)
         self.config = config
@@ -514,3 +516,12 @@ class Model(YOLO11):
             path.append(parts[-1])
             renamed[".".join(path)] = value
         return renamed
+
+    def extract(self, processor, inputs, task=None, score_threshold=None, **kwargs):
+        """Detect objects in one image."""
+        from ...extraction import detection_outputs
+        from .inference import predict
+
+        if score_threshold is not None:
+            kwargs["conf_threshold"] = score_threshold
+        return detection_outputs(predict(self, inputs, **kwargs))

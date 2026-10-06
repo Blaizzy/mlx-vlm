@@ -15,12 +15,31 @@ MLX port of [Meta's SAM 3D Body](https://github.com/facebookresearch/sam-3d-body
 
 The model takes a cropped person image (512×384), encodes it through a DINOv3-H+ ViT (32 layers, 1280d), decodes pose/shape tokens with a 6-layer transformer decoder, then runs the MHR body model (forward kinematics → blend shapes → pose correctives → linear blend skinning) to produce the final mesh.
 
+## Prepared checkpoint
+
+[`nativ-community/sam-3d-body-dinov3-mlx`](https://huggingface.co/nativ-community/sam-3d-body-dinov3-mlx)
+loads directly, converted from `facebook/sam-3d-body-dinov3` with
+`python -m mlx_vlm.models.sam3d_body.convert_weights`.
+
+```sh
+mlx_vlm.extract --model nativ-community/sam-3d-body-dinov3-mlx --image person.jpg --output body.npz
+```
+
+```python
+from mlx_vlm import load
+from mlx_vlm.extraction import extract
+
+model, processor = load("nativ-community/sam-3d-body-dinov3-mlx")
+result = extract(model, processor, image)
+# result["pred_vertices"], result["pred_keypoints_3d"], result["pred_camera"]
+```
+
 ## Quick Start
 
 ```python
 from mlx_vlm.models.sam3d_body.generate import SAM3DPredictor
 
-predictor = SAM3DPredictor.from_pretrained("/path/to/sam3d-mlx-weights")
+predictor = SAM3DPredictor.from_pretrained("nativ-community/sam-3d-body-dinov3-mlx")
 ```
 
 ## Single-Image Inference

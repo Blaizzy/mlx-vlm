@@ -795,6 +795,17 @@ class SAM3DBody(nn.Module):
 
         return result
 
+    extraction_types = ("body",)
+
+    def extract(self, processor, inputs, task=None, **kwargs):
+        """Estimate 3D body pose and shape for one image."""
+        from ...extraction import split_outputs
+        from .generate import SAM3DPredictor
+
+        return split_outputs(
+            SAM3DPredictor(self, self.config).predict(inputs, **kwargs)
+        )
+
 
 # mlx-vlm convention alias
 Model = SAM3DBody
