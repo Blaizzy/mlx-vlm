@@ -5,6 +5,7 @@ import mlx.nn as nn
 import numpy as np
 
 from ..base import InputEmbeddingsFeatures
+from ..switch_layers import EXPERT_WEIGHT_SUFFIXES, expand_expert_scales
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
@@ -60,7 +61,16 @@ def _sanitize_moe_weights(weights: dict, args):
     for layer_idx in range(args.num_hidden_layers):
         prefix = f"language_model.model.layers.{layer_idx}.block_sparse_moe"
 
-        for suffix in ("weight", "scales", "biases", "bias"):
+        if pack_shared:
+            expand_expert_scales(
+                weights,
+                [
+                    k.removesuffix(".weight")
+                    for k in weights
+                    if k.startswith(prefix + ".") and k.endswith(".weight")
+                ],
+            )
+        for suffix in (*EXPERT_WEIGHT_SUFFIXES, "bias"):
             if pack_shared:
                 gate_keys = expert_keys(prefix, "w1", suffix)
                 up_keys = expert_keys(prefix, "w3", suffix)

@@ -11,7 +11,7 @@ from ..base import (
 from ..cache import KVCache
 from ..mlp import SwiGLUMLP
 from ..rope_utils import initialize_rope
-from ..switch_layers import SwitchGLU
+from ..switch_layers import EXPERT_WEIGHT_SUFFIXES, SwitchGLU
 from .config import ModelConfig
 
 
@@ -242,7 +242,7 @@ class LanguageModel(nn.Module):
             prefix = f"model.layers.{l}"
             if l >= self.args.first_k_dense_replace:
                 for m in ("gate_proj", "down_proj", "up_proj"):
-                    for k in ("weight", "scales", "biases"):
+                    for k in EXPERT_WEIGHT_SUFFIXES:
                         if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
                             to_join = [
                                 weights.pop(f"{prefix}.mlp.experts.{e}.{m}.{k}")

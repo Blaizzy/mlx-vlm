@@ -11,7 +11,7 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import ArraysCache, KVCache
-from ..switch_layers import SwitchGLU
+from ..switch_layers import EXPERT_WEIGHT_SUFFIXES, SwitchGLU
 from .config import ModelConfig
 
 
@@ -323,7 +323,7 @@ class LanguageModel(nn.Module):
                 continue
 
             for proj in ["gate_proj", "down_proj", "up_proj"]:
-                for name in ["weight", "bias", "scales", "biases"]:
+                for name in (*EXPERT_WEIGHT_SUFFIXES, "bias"):
                     expert_tensors = [
                         weights.pop(f"{base}.experts.{e}.{proj}.{name}")
                         for e in range(len(weights))

@@ -10,7 +10,7 @@ from ..base import (
 )
 from ..cache import KVCache, RotatingKVCache
 from ..rope_utils import initialize_rope
-from ..switch_layers import SwitchGLU
+from ..switch_layers import EXPERT_WEIGHT_SUFFIXES, SwitchGLU
 from .config import ModelConfig
 
 
@@ -220,15 +220,18 @@ class LanguageModel(nn.Module):
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{layer_idx}"
             for name in ("up_proj", "down_proj", "gate_proj"):
-                key = f"{prefix}.mlp.experts.0.{name}.weight"
-                if key in weights:
-                    stacked = [
-                        weights.pop(f"{prefix}.mlp.experts.{expert_idx}.{name}.weight")
-                        for expert_idx in range(self.args.num_experts)
-                    ]
-                    weights[f"{prefix}.mlp.switch_mlp.{name}.weight"] = mx.stack(
-                        stacked
-                    )
+                for suffix in EXPERT_WEIGHT_SUFFIXES:
+                    key = f"{prefix}.mlp.experts.0.{name}.{suffix}"
+                    if key in weights:
+                        stacked = [
+                            weights.pop(
+                                f"{prefix}.mlp.experts.{expert_idx}.{name}.{suffix}"
+                            )
+                            for expert_idx in range(self.args.num_experts)
+                        ]
+                        weights[f"{prefix}.mlp.switch_mlp.{name}.{suffix}"] = mx.stack(
+                            stacked
+                        )
         return weights
 
     @property

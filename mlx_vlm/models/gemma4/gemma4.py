@@ -4,6 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import InputEmbeddingsFeatures
+from ..switch_layers import move_expert_projection, split_expert_projection
 from .audio import AudioEncoder
 from .config import ModelConfig
 from .language import LanguageModel, RMSNormNoScale
@@ -223,6 +224,21 @@ class Model(nn.Module):
         return logits
 
     def sanitize(self, weights):
+        weights = dict(weights)
+        prefixes = {
+            k.split(".experts.")[0] + ".experts"
+            for k in weights
+            if ".experts.gate_up_proj" in k or ".experts.down_proj" in k
+        }
+        for prefix in prefixes:
+            split_expert_projection(
+                weights,
+                f"{prefix}.gate_up_proj",
+                [f"{prefix}.switch_glu.gate_proj", f"{prefix}.switch_glu.up_proj"],
+            )
+            move_expert_projection(
+                weights, f"{prefix}.down_proj", f"{prefix}.switch_glu.down_proj"
+            )
         use_clipped = getattr(self.config.vision_config, "use_clipped_linears", False)
         sanitized = {}
         for k, v in weights.items():
@@ -271,30 +287,6 @@ class Model(nn.Module):
             if "depthwise_conv1d.weight" in new_key and v.ndim == 3:
                 if v.shape[-1] != 1:
                     v = v.transpose(0, 2, 1)
-
-            # MoE: experts.down_proj -> experts.switch_glu.down_proj.weight
-            # experts.gate_up_proj -> split into switch_glu.gate_proj + switch_glu.up_proj
-            if new_key.endswith(".experts.down_proj"):
-                new_key = new_key.replace(
-                    ".experts.down_proj", ".experts.switch_glu.down_proj.weight"
-                )
-            if new_key.endswith(".experts.gate_up_proj"):
-                gate_key = new_key.replace(
-                    ".experts.gate_up_proj",
-                    ".experts.switch_glu.gate_proj.weight",
-                )
-                up_key = new_key.replace(
-                    ".experts.gate_up_proj",
-                    ".experts.switch_glu.up_proj.weight",
-                )
-
-                v = v.swapaxes(-1, -2)
-                mid_dim = v.shape[-1] // 2
-                gate_value = v[..., :mid_dim].swapaxes(-1, -2)
-                up_value = v[..., mid_dim:].swapaxes(-1, -2)
-                sanitized[gate_key] = gate_value
-                sanitized[up_key] = up_value
-                continue
 
             sanitized[new_key] = v
         return sanitized

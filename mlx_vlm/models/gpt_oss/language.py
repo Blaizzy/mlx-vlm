@@ -13,7 +13,7 @@ from ..base import (
 )
 from ..cache import KVCache, RotatingKVCache
 from ..rope_utils import initialize_rope
-from ..switch_layers import SwitchGLU
+from ..switch_layers import SwitchGLU, split_expert_projection
 from .config import ModelConfig
 
 
@@ -224,6 +224,15 @@ class LanguageModel(nn.Module):
         )
 
     def sanitize(self, weights):
+        for key in list(weights):
+            if key.endswith(".gate_up_proj.weight"):
+                prefix = key.removesuffix(".gate_up_proj.weight")
+                split_expert_projection(
+                    weights,
+                    f"{prefix}.gate_up_proj",
+                    [f"{prefix}.gate_proj", f"{prefix}.up_proj"],
+                    interleaved=True,
+                )
         if any("gate_proj.weight" in k for k in weights.keys()):
             return weights
 

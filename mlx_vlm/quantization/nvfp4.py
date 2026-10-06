@@ -88,7 +88,9 @@ class ScaledQuantizedSwitchLinear(ScaledQuantizedLinear):
             mode=self.mode,
             sorted_indices=sorted_indices,
         )
-        scale = self.global_scale.reshape(self.num_experts, -1)[indices][..., None, :]
+        scale = self.global_scale
+        if scale.size != 1:
+            scale = scale.reshape(self.num_experts, -1)[indices][..., None, :]
         output = self.apply_scale(output, scale).astype(x.dtype)
         if "bias" in self:
             output = output + self.bias[indices][..., None, :]

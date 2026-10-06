@@ -197,20 +197,20 @@ def _transform_modelopt_nvfp4_weights(
             if (
                 weight.dtype != mx.uint8
                 or scale.dtype != mx.uint8
-                or weight.ndim != 2
-                or scale.ndim != 2
-                or value.size != 1
+                or weight.ndim not in (2, 3)
+                or scale.ndim != weight.ndim
+                or value.size not in (1, weight.shape[0] if weight.ndim == 3 else 1)
             ):
                 raise ValueError(f"Invalid ModelOpt NVFP4 tensors for {prefix}.")
             if (
-                weight.shape[0] != scale.shape[0]
-                or weight.shape[1] != 8 * scale.shape[1]
+                weight.shape[:-1] != scale.shape[:-1]
+                or weight.shape[-1] != 8 * scale.shape[-1]
             ):
                 raise ValueError(f"Invalid ModelOpt NVFP4 scale shape for {prefix}.")
 
             transformed[weight_key] = weight.view(mx.uint32)
             transformed[f"{prefix}.scales"] = scale
-            transformed[key] = value.astype(mx.float32).reshape(())
+            transformed[key] = value.astype(mx.float32).squeeze()
         elif key.endswith(scale_suffix) and key[: -len(scale_suffix)] in fp8_prefixes:
             prefix = key[: -len(scale_suffix)]
             weight_key = f"{prefix}.weight"
@@ -258,7 +258,7 @@ def _transform_compressed_tensors_nvfp4_weights(
 
             new_weights[f"{prefix}.weight"] = packed.view(mx.uint32)
             new_weights[f"{prefix}.scales"] = scale
-            new_weights[f"{prefix}.weight_global_scale"] = global_scale.reshape(())
+            new_weights[f"{prefix}.weight_global_scale"] = global_scale.squeeze()
         elif key.endswith((".weight_scale",) + _COMPRESSED_TENSORS_DROP_SUFFIXES):
             continue
         else:
@@ -470,7 +470,7 @@ def _transform_compressed_tensors_mixed_weights(
                 global_scale = weights[global_key].astype(mx.float32)
                 new_weights[f"{prefix}.weight"] = value.view(mx.uint32)
                 new_weights[f"{prefix}.scales"] = scale
-                new_weights[global_key] = global_scale.reshape(())
+                new_weights[global_key] = global_scale.squeeze()
                 native_quant["nvfp4"] = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
             else:  # INT4 symmetric pack-quantized
                 new_weights[f"{prefix}.weight"] = value.view(mx.uint32)

@@ -13,7 +13,7 @@ from ..base import (
 from ..cache import ArraysCache, KVCache
 from ..gated_delta import gated_delta_update
 from ..mla import MultiLinear, latent_length, max_absorbed_queries
-from ..switch_layers import SwitchGLU
+from ..switch_layers import EXPERT_WEIGHT_SUFFIXES, SwitchGLU
 from .config import ModelConfig
 
 
@@ -488,22 +488,24 @@ class LanguageModel(nn.Module):
                     ("w2", "down_proj"),
                     ("w3", "up_proj"),
                 ]:
-                    key = f"{src_prefix}.experts.0.{src}.weight"
-                    if key in weights:
-                        stacked = [
-                            weights.pop(f"{src_prefix}.experts.{i}.{src}.weight")
-                            for i in range(self.args.num_experts)
-                        ]
-                        weights[f"{dst_prefix}.switch_mlp.{dst}.weight"] = mx.stack(
-                            stacked
-                        )
+                    for suffix in EXPERT_WEIGHT_SUFFIXES:
+                        key = f"{src_prefix}.experts.0.{src}.{suffix}"
+                        if key in weights:
+                            stacked = [
+                                weights.pop(f"{src_prefix}.experts.{i}.{src}.{suffix}")
+                                for i in range(self.args.num_experts)
+                            ]
+                            weights[f"{dst_prefix}.switch_mlp.{dst}.{suffix}"] = (
+                                mx.stack(stacked)
+                            )
 
                 for name in ("gate_proj", "up_proj", "down_proj"):
-                    src_key = f"{src_prefix}.shared_experts.{name}.weight"
-                    if src_key in weights:
-                        weights[f"{dst_prefix}.shared_experts.{name}.weight"] = (
-                            weights.pop(src_key)
-                        )
+                    for suffix in EXPERT_WEIGHT_SUFFIXES:
+                        src_key = f"{src_prefix}.shared_experts.{name}.{suffix}"
+                        if src_key in weights:
+                            weights[f"{dst_prefix}.shared_experts.{name}.{suffix}"] = (
+                                weights.pop(src_key)
+                            )
 
                 gate_key = f"{src_prefix}.gate.weight"
                 if gate_key in weights:

@@ -12,7 +12,7 @@ from ..base import (
 )
 from ..cache import ArraysCache, KVCache
 from ..ssm import ssm_update
-from ..switch_layers import SwitchMLP
+from ..switch_layers import EXPERT_WEIGHT_SUFFIXES, SwitchMLP
 from .config import ModelConfig
 from .speculative_verifier import NemotronHExactSpeculativeVerifier
 
@@ -524,7 +524,7 @@ class Model(nn.Module):
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"backbone.layers.{layer_idx}.mixer"
             for m, n in [("down_proj", "fc2"), ("up_proj", "fc1")]:
-                for suffix in ("weight", "scales", "biases"):
+                for suffix in EXPERT_WEIGHT_SUFFIXES:
                     first_key = f"{prefix}.experts.0.{m}.{suffix}"
                     if first_key not in weights:
                         continue

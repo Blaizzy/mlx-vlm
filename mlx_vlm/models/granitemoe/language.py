@@ -9,7 +9,7 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..rope_utils import initialize_rope
-from ..switch_layers import SwitchGLU
+from ..switch_layers import SwitchGLU, move_expert_projection, split_expert_projection
 from .config import ModelConfig
 
 
@@ -186,14 +186,13 @@ class LanguageModel(nn.Module):
             return weights
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}.block_sparse_moe"
-            key = f"{prefix}.input_linear.weight"
-            value = weights.pop(key)
-            gate_proj, up_proj = mx.split(value, 2, axis=1)
-            weights[key.replace("input_linear", "switch_mlp.gate_proj")] = gate_proj
-            weights[key.replace("input_linear", "switch_mlp.up_proj")] = up_proj
-            key = f"{prefix}.output_linear.weight"
-            weights[key.replace("output_linear", "switch_mlp.down_proj")] = weights.pop(
-                key
+            split_expert_projection(
+                weights,
+                f"{prefix}.input_linear",
+                [f"{prefix}.switch_mlp.gate_proj", f"{prefix}.switch_mlp.up_proj"],
+            )
+            move_expert_projection(
+                weights, f"{prefix}.output_linear", f"{prefix}.switch_mlp.down_proj"
             )
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)

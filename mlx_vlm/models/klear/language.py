@@ -10,7 +10,7 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import KVCache
-from ..switch_layers import SwitchGLU
+from ..switch_layers import EXPERT_WEIGHT_SUFFIXES, SwitchGLU
 from .config import ModelConfig
 
 
@@ -213,11 +213,14 @@ class LanguageModel(nn.Module):
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{layer_idx}.mlp.experts"
             for name in ("gate_proj", "up_proj", "down_proj"):
-                stacked = [
-                    weights.pop(f"{prefix}.{expert_idx}.{name}.weight")
-                    for expert_idx in range(self.args.num_experts)
-                ]
-                weights[f"{prefix}.{name}.weight"] = mx.stack(stacked)
+                for suffix in EXPERT_WEIGHT_SUFFIXES:
+                    if f"{prefix}.0.{name}.{suffix}" not in weights:
+                        continue
+                    stacked = [
+                        weights.pop(f"{prefix}.{expert_idx}.{name}.{suffix}")
+                        for expert_idx in range(self.args.num_experts)
+                    ]
+                    weights[f"{prefix}.{name}.{suffix}"] = mx.stack(stacked)
         return weights
 
     @property

@@ -14,7 +14,7 @@ from ..base import (
 from ..cache import ArraysCache, CacheList, KVCache
 from ..mla import MultiLinear, latent_length, max_absorbed_queries
 from ..rope_utils import initialize_rope
-from ..switch_layers import SwitchGLU
+from ..switch_layers import EXPERT_WEIGHT_SUFFIXES, SwitchGLU
 from .config import ModelConfig
 from .indexer_kernel import indexer_dense_scores, indexer_dense_scores_available
 
@@ -600,7 +600,7 @@ class LanguageModel(nn.Module):
         for l in range(self.args.num_layers):
             prefix = f"model.layers.{l}"
             for _, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
-                for k in ["weight", "scales", "biases"]:
+                for k in EXPERT_WEIGHT_SUFFIXES:
                     if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
                         to_join = [
                             weights.pop(f"{prefix}.mlp.experts.{e}.{m}.{k}")

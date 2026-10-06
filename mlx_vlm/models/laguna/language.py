@@ -11,7 +11,14 @@ from ..base import (
 from ..cache import KVCache, RotatingKVCache
 from ..mlp import SwiGLUMLP as MLP
 from ..rope_utils import initialize_rope
-from ..switch_layers import SwiGLU, SwitchLinear, _gather_sort, _scatter_unsort
+from ..switch_layers import (
+    EXPERT_WEIGHT_SUFFIXES,
+    SwiGLU,
+    SwitchLinear,
+    _gather_sort,
+    _scatter_unsort,
+    expand_expert_scales,
+)
 from .config import ModelConfig
 
 
@@ -401,31 +408,18 @@ class LanguageModel(nn.Module):
         return weights
 
     def _stack_experts(self, weights):
-        # Fused gate/up rows can have different per-expert global factors.
-        for key in list(weights):
-            if not key.endswith((".weight_scale_2", ".weight_global_scale")):
-                continue
-            prefix = key.rsplit(".", 1)[0]
-            if not prefix.endswith((".gate_proj", ".up_proj")) or not any(
-                part in prefix for part in (".experts.", ".switch_mlp.")
-            ):
-                continue
-            shape = weights[f"{prefix}.weight"].shape[:-1]
-            scale = weights[key]
-            if scale.size == 1:
-                scale = scale.reshape(())
-            elif scale.ndim == len(shape) - 1:
-                scale = scale[..., None]
-            weights[key] = mx.broadcast_to(scale, shape)
+        expand_expert_scales(
+            weights,
+            [
+                key.removesuffix(".weight")
+                for key in weights
+                if key.endswith((".gate_proj.weight", ".up_proj.weight"))
+                and any(part in key for part in (".experts.", ".switch_mlp."))
+            ],
+        )
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{layer_idx}.mlp"
-            for suffix in [
-                "weight",
-                "scales",
-                "biases",
-                "weight_scale_2",
-                "weight_global_scale",
-            ]:
+            for suffix in EXPERT_WEIGHT_SUFFIXES:
                 gate_key = f"{prefix}.experts.0.gate_proj.{suffix}"
                 up_key = f"{prefix}.experts.0.up_proj.{suffix}"
                 if gate_key in weights and up_key in weights:
@@ -460,13 +454,7 @@ class LanguageModel(nn.Module):
     def _fuse_split_switch_gate_up(self, weights):
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{layer_idx}.mlp.switch_mlp"
-            for suffix in [
-                "weight",
-                "scales",
-                "biases",
-                "weight_scale_2",
-                "weight_global_scale",
-            ]:
+            for suffix in EXPERT_WEIGHT_SUFFIXES:
                 gate_key = f"{prefix}.gate_proj.{suffix}"
                 up_key = f"{prefix}.up_proj.{suffix}"
                 fused_key = f"{prefix}.gate_up_proj.{suffix}"

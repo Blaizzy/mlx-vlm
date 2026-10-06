@@ -13,7 +13,7 @@ from mlx_vlm.sample_utils import top_p_sampling
 
 from ..base import create_attention_mask, scaled_dot_product_attention
 from ..cache import KVCache
-from ..switch_layers import SwitchGLU
+from ..switch_layers import EXPERT_WEIGHT_SUFFIXES, SwitchGLU
 from .language import Attention, Qwen3OmniMoeThinkerTextRotaryEmbedding
 
 
@@ -861,14 +861,15 @@ class Talker(nn.Module):
         for l in range(self.config.text_config.num_hidden_layers):
             prefix = f"talker.model.layers.{l}.mlp"
             for n in ["gate_proj", "down_proj", "up_proj"]:
-                experts_weights = []
-                for e in range(self.config.text_config.num_experts):
-                    key = f"{prefix}.experts.{e}.{n}.weight"
-                    if key in weights:
-                        experts_weights.append(weights.pop(key))
+                for suffix in EXPERT_WEIGHT_SUFFIXES:
+                    experts_weights = []
+                    for e in range(self.config.text_config.num_experts):
+                        key = f"{prefix}.experts.{e}.{n}.{suffix}"
+                        if key in weights:
+                            experts_weights.append(weights.pop(key))
 
-                if experts_weights:
-                    weights[f"{prefix}.switch_mlp.{n}.weight"] = mx.stack(
-                        experts_weights, axis=0
-                    )
+                    if experts_weights:
+                        weights[f"{prefix}.switch_mlp.{n}.{suffix}"] = mx.stack(
+                            experts_weights, axis=0
+                        )
         return weights

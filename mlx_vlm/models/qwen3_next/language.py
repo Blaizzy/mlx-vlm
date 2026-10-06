@@ -17,7 +17,7 @@ from ..cache import ArraysCache, KVCache
 from ..gated_delta import gated_delta_update
 from ..mlp import SwiGLUMLP as Qwen3NextMLP
 from ..rope_utils import initialize_rope
-from ..switch_layers import SwitchGLU
+from ..switch_layers import EXPERT_WEIGHT_SUFFIXES, SwitchGLU
 from .config import ModelConfig
 
 
@@ -419,11 +419,14 @@ class LanguageModel(nn.Module):
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}.mlp"
             for n in ["up_proj", "down_proj", "gate_proj"]:
-                to_join = [
-                    weights.pop(f"{prefix}.experts.{e}.{n}.weight")
-                    for e in range(self.args.num_experts)
-                ]
-                weights[f"{prefix}.switch_mlp.{n}.weight"] = mx.stack(to_join)
+                for suffix in EXPERT_WEIGHT_SUFFIXES:
+                    if f"{prefix}.experts.0.{n}.{suffix}" not in weights:
+                        continue
+                    to_join = [
+                        weights.pop(f"{prefix}.experts.{e}.{n}.{suffix}")
+                        for e in range(self.args.num_experts)
+                    ]
+                    weights[f"{prefix}.switch_mlp.{n}.{suffix}"] = mx.stack(to_join)
 
         norm_keys = (
             ".input_layernorm.weight",

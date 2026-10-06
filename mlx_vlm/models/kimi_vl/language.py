@@ -11,7 +11,7 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..mlp import DeepseekMLP as DeepseekV3MLP
-from ..switch_layers import SwitchGLU
+from ..switch_layers import EXPERT_WEIGHT_SUFFIXES, SwitchGLU
 from .config import TextConfig
 
 
@@ -420,7 +420,7 @@ class LanguageModel(nn.Module):
         for l in range(self.config.num_hidden_layers):
             prefix = f"language_model.model.layers.{l}"
             for m in [("gate_proj"), ("down_proj"), ("up_proj")]:
-                for k in ["weight", "scales", "biases"]:
+                for k in EXPERT_WEIGHT_SUFFIXES:
                     if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
                         to_join = [
                             weights.pop(f"{prefix}.mlp.experts.{e}.{m}.{k}")

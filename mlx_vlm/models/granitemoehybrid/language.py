@@ -13,7 +13,7 @@ from ..base import (
 from ..cache import ArraysCache, KVCache
 from ..rope_utils import initialize_rope
 from ..ssm import ssm_update
-from ..switch_layers import SwitchGLU
+from ..switch_layers import SwitchGLU, move_expert_projection, split_expert_projection
 from .config import ModelConfig
 
 
@@ -461,16 +461,13 @@ class LanguageModel(nn.Module):
             for layer_index in range(self.args.num_hidden_layers):
                 prefix = f"model.layers.{layer_index}.block_sparse_moe"
 
-                input_weight = weights.pop(f"{prefix}.input_linear.weight")
-                _, expert_hidden, _ = input_weight.shape
-                weights[f"{prefix}.switch_mlp.gate_proj.weight"] = input_weight[
-                    :, : expert_hidden // 2, :
-                ]
-                weights[f"{prefix}.switch_mlp.up_proj.weight"] = input_weight[
-                    :, expert_hidden // 2 :, :
-                ]
-                weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
-                    f"{prefix}.output_linear.weight"
+                split_expert_projection(
+                    weights,
+                    f"{prefix}.input_linear",
+                    [f"{prefix}.switch_mlp.gate_proj", f"{prefix}.switch_mlp.up_proj"],
+                )
+                move_expert_projection(
+                    weights, f"{prefix}.output_linear", f"{prefix}.switch_mlp.down_proj"
                 )
 
         elif (

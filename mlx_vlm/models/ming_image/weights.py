@@ -8,6 +8,8 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 
+from ...quantization.nvfp4 import replace_scaled_quantized_linears
+from ..switch_layers import EXPERT_WEIGHT_SUFFIXES
 from .config import MingImageConfig
 from .text_encoder import MingImageTextEncoder
 from .transformer import MingImageTransformer, sanitize_transformer_weights
@@ -54,6 +56,7 @@ def _apply(
             mode=quant.get("mode", "affine"),
             class_predicate=lambda path, _module: path in quantized,
         )
+    replace_scaled_quantized_linears(model, dict(weights))
     model.load_weights(weights, strict=True)
     model.eval()
     return model
@@ -85,16 +88,17 @@ def load_vae(model_path: str | Path, config: MingImageConfig | None = None):
 
 def _stack_experts(weights: dict[str, mx.array], prefix: str, num_experts: int) -> None:
     for proj in ("gate_proj", "up_proj", "down_proj"):
-        first = f"{prefix}.experts.0.{proj}.weight"
-        if first not in weights:
-            continue
-        stacked = mx.stack(
-            [
-                weights.pop(f"{prefix}.experts.{e}.{proj}.weight")
-                for e in range(num_experts)
-            ]
-        )
-        weights[f"{prefix}.switch_mlp.{proj}.weight"] = stacked
+        for suffix in EXPERT_WEIGHT_SUFFIXES:
+            first = f"{prefix}.experts.0.{proj}.{suffix}"
+            if first not in weights:
+                continue
+            stacked = mx.stack(
+                [
+                    weights.pop(f"{prefix}.experts.{e}.{proj}.{suffix}")
+                    for e in range(num_experts)
+                ]
+            )
+            weights[f"{prefix}.switch_mlp.{proj}.{suffix}"] = stacked
 
 
 def _sanitize_mllm(
