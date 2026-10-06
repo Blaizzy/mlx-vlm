@@ -938,7 +938,7 @@ class LanguageModel(nn.Module):
                         )
                         weights[f"{dst_prefix}.switch_mlp.{dst}.scales"] = scales
                     else:
-                        for suffix in ("weight", "scales", "biases", "weight_scale_2"):
+                        for suffix in ("weight", "scales", "biases"):
                             if f"{src_prefix}.experts.0.{src}.{suffix}" in weights:
                                 weights[f"{dst_prefix}.switch_mlp.{dst}.{suffix}"] = (
                                     mx.stack(
@@ -963,7 +963,7 @@ class LanguageModel(nn.Module):
                     "switch_mlp.up_proj",
                     "switch_mlp.down_proj",
                 ):
-                    for suffix in ("weight", "scales", "biases", "weight_scale_2"):
+                    for suffix in ("weight", "scales", "biases"):
                         src_key = f"{src_prefix}.{name}.{suffix}"
                         if src_key in weights:
                             weights[f"{dst_prefix}.{name}.{suffix}"] = weights.pop(

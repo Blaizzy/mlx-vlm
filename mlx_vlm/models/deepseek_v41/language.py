@@ -319,7 +319,7 @@ def sanitize_moe_weights(weights: dict, ffn_prefix: str, n_routed: int) -> dict:
     weights = remapped
     prefix = f"{ffn_prefix}.experts"
     for dst in ("gate_proj", "down_proj", "up_proj"):
-        for suffix in ("weight", "scales", "biases", "weight_scale_2"):
+        for suffix in ("weight", "scales", "biases"):
             stacked_key = f"{prefix}.{dst}.{suffix}"
             if stacked_key in weights:
                 weights[f"{ffn_prefix}.switch_mlp.{dst}.{suffix}"] = weights.pop(
@@ -330,7 +330,7 @@ def sanitize_moe_weights(weights: dict, ffn_prefix: str, n_routed: int) -> dict:
         ("w2", "down_proj"),
         ("w3", "up_proj"),
     ):
-        for suffix in ("weight", "scales", "biases", "weight_scale_2"):
+        for suffix in ("weight", "scales", "biases"):
             key0 = f"{prefix}.0.{src}.{suffix}"
             if key0 not in weights:
                 continue
