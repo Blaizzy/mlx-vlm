@@ -2142,3 +2142,239 @@ class TestLayaDecisionModel(unittest.TestCase):
                     self.assertEqual(
                         result["answers"]["route"]["probabilities"]["B"], expected
                     )
+
+
+class TestSam3dBodyRayConditioning(unittest.TestCase):
+    """Ray conditioning width follows embed_dim instead of a fixed 1379."""
+
+    def test_width_is_embed_dim_plus_the_ray_encoding(self):
+        from mlx_vlm.models.sam3d_body.config import SAM3DConfig
+        from mlx_vlm.models.sam3d_body.model import RAY_ENCODING_CHANNELS, SAM3DBody
+
+        self.assertEqual(1280 + RAY_ENCODING_CHANNELS, 1379)  # production, unchanged
+
+        small = SAM3DBody(SAM3DConfig(embed_dim=64, depth=1, num_heads=2, head_dim=32))
+        conv = small.ray_cond_emb.conv
+        self.assertEqual(conv.weight.shape[-1], 64 + RAY_ENCODING_CHANNELS)
+        self.assertEqual(conv.weight.shape[0], 64)
+
+
+class TestRfdetrTwoStageSelection(unittest.TestCase):
+    """Two-stage selection names its constraint instead of failing in argpartition."""
+
+    def test_too_few_tokens_reports_the_constraint(self):
+        from mlx_vlm.models.rfdetr import Model, ModelConfig
+
+        model = Model(ModelConfig())
+        model.eval()
+        with self.assertRaisesRegex(ValueError, "encoder tokens"):
+            model(mx.random.normal((1, 224, 224, 3)))
+
+    def test_a_small_configuration_still_forwards(self):
+        from mlx_vlm.models.rfdetr import Model, ModelConfig
+
+        model = Model(ModelConfig(num_queries=16))
+        model.eval()
+        out = model(mx.random.normal((1, 112, 112, 3)))
+        self.assertEqual(sorted(out), ["pred_boxes", "pred_logits"])
+        self.assertEqual(out["pred_boxes"].shape[1], 16)
+
+
+class TestYolo11StandardLoading(unittest.TestCase):
+    """yolo11 loads through the shared path with the same weights as before."""
+
+    CONFIG = {"model_type": "yolo11", "nc": 2, "ch": [256, 512, 512], "reg_max": 4}
+
+    @staticmethod
+    def _to_checkpoint_key(key, last):
+        """Canonical key -> Ultralytics key, dropping MLX's Sequential hops."""
+        parts = key.split(".")
+        if parts[0] == "detect":
+            out, rest = [f"model.{last}"], parts[1:]
+        else:
+            out, rest = [f"model.{parts[1]}"], parts[2:]
+        for index, segment in enumerate(rest):
+            if (
+                segment == "layers"
+                and index + 1 < len(rest)
+                and rest[index + 1].isdigit()
+            ):
+                continue
+            out.append(segment)
+        return ".".join(out)
+
+    @staticmethod
+    def _reference_load(model, checkpoint):
+        """The walk yolo11 used before it had a sanitize, as an oracle.
+
+        A bare digit is a list index or an nn.Sequential hop depending on the
+        module it indexes, so this resolves the path rather than matching it.
+        """
+
+        def resolve(obj, name):
+            if isinstance(obj, list):
+                return obj[int(name)]
+            children = getattr(obj, "layers", None)
+            if children is not None and name.isdigit():
+                return children[int(name)]
+            return getattr(obj, name)
+
+        last = len(model.layers)
+        for key, value in checkpoint.items():
+            index, _, remainder = key[len("model.") :].partition(".")
+            target = model.detect if int(index) == last else model.layers[int(index)]
+            attrs = remainder.split(".")
+            for attr in attrs[:-1]:
+                target = resolve(target, attr)
+            setattr(target, attrs[-1], value)
+
+    def test_sanitize_places_every_weight_where_the_old_walk_did(self):
+        from mlx_vlm.models.yolo11 import Model, ModelConfig
+
+        config = ModelConfig.from_dict(dict(self.CONFIG))
+        reference = Model(config)
+        reference.eval()
+        canonical = dict(tree_flatten(reference.parameters()))
+        self.assertGreater(len(canonical), 100)
+
+        last = len(reference.layers)
+        checkpoint = {
+            self._to_checkpoint_key(name, last): mx.random.normal(value.shape)
+            for name, value in canonical.items()
+        }
+        self.assertEqual(len(checkpoint), len(canonical))
+
+        legacy = Model(config)
+        self._reference_load(legacy, checkpoint)
+        legacy.eval()
+
+        standard = Model(config)
+        standard.load_weights(list(standard.sanitize(dict(checkpoint)).items()))
+        standard.eval()
+
+        expected = dict(tree_flatten(legacy.parameters()))
+        actual = dict(tree_flatten(standard.parameters()))
+        self.assertEqual(set(expected), set(actual))
+        for name, value in expected.items():
+            self.assertTrue(mx.array_equal(value, actual[name]).item(), name)
+
+
+class TestSam3BoxPrompts(unittest.TestCase):
+    """Box prompts must reach the geometry encoder in both SAM 3 variants."""
+
+    @staticmethod
+    def _detector(pkg, dim=32):
+        cfg = importlib.import_module(f"mlx_vlm.models.{pkg}.config")
+        backbone = cfg.ViTConfig(
+            hidden_size=dim,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            intermediate_size=dim,
+            image_size=112,
+            patch_size=14,
+            window_size=4,
+            global_attn_indexes=[0],
+            pretrain_image_size=112,
+        )
+        detector = cfg.DetectorConfig(
+            vision_config=cfg.VisionEncoderConfig(
+                backbone_config=backbone,
+                fpn_hidden_size=dim,
+                backbone_feature_sizes=[[32, 32], [16, 16], [8, 8]],
+            ),
+            text_config=cfg.TextEncoderConfig(
+                hidden_size=dim,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                intermediate_size=dim,
+                vocab_size=64,
+                projection_dim=dim,
+            ),
+            detr_encoder_config=cfg.DETREncoderConfig(
+                hidden_size=dim,
+                num_layers=1,
+                num_attention_heads=2,
+                intermediate_size=dim,
+            ),
+            detr_decoder_config=cfg.DETRDecoderConfig(
+                hidden_size=dim,
+                num_layers=1,
+                num_attention_heads=2,
+                num_queries=4,
+                intermediate_size=dim,
+            ),
+            geometry_encoder_config=cfg.GeometryEncoderConfig(
+                hidden_size=dim,
+                num_layers=1,
+                num_attention_heads=2,
+                intermediate_size=dim,
+                roi_size=2,
+            ),
+            mask_decoder_config=cfg.DetectorMaskDecoderConfig(
+                hidden_size=dim, num_attention_heads=2
+            ),
+        )
+        module = importlib.import_module(f"mlx_vlm.models.{pkg}.{pkg}")
+        model = module.DetectorModel(cfg.ModelConfig(detector_config=detector))
+        model.eval()
+        return model
+
+    def test_box_prompts_change_detection(self):
+        for pkg in ("sam3", "sam3_1"):
+            with self.subTest(pkg=pkg):
+                mx.random.seed(1234)
+                model = self._detector(pkg)
+                pixel_values = mx.random.normal((1, 112, 112, 3))
+                ids = mx.array([[1, 2, 3, 4]])
+                mask = mx.ones((1, 4), dtype=mx.bool_)
+                plain = model(pixel_values, input_ids=ids, attention_mask=mask)
+                prompted = model(
+                    pixel_values,
+                    input_ids=ids,
+                    attention_mask=mask,
+                    boxes=mx.array([[[0.1, 0.1, 0.5, 0.5]]]),
+                )
+                shift = float(
+                    mx.abs(plain["pred_logits"] - prompted["pred_logits"]).max()
+                )
+                self.assertGreater(shift, 1e-6, f"{pkg} ignored its box prompt")
+
+    def test_empty_boxes_are_a_no_op(self):
+        mx.random.seed(1234)
+        model = self._detector("sam3_1")
+        pixel_values = mx.random.normal((1, 112, 112, 3))
+        ids = mx.array([[1, 2, 3, 4]])
+        mask = mx.ones((1, 4), dtype=mx.bool_)
+        plain = model(pixel_values, input_ids=ids, attention_mask=mask)
+        empty = model(
+            pixel_values,
+            input_ids=ids,
+            attention_mask=mask,
+            boxes=mx.zeros((1, 0, 4)),
+        )
+        self.assertTrue(mx.allclose(plain["pred_logits"], empty["pred_logits"]).item())
+
+
+class TestSam3TokenizerSource(unittest.TestCase):
+    """SAM 3 takes its CLIP vocabulary from the checkpoint or not at all."""
+
+    def test_missing_tokenizer_is_refused(self):
+        from mlx_vlm.models.sam3.processing_sam3 import Sam3Processor
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / "processor_config.json").write_text(json.dumps({}))
+            processor = Sam3Processor.from_pretrained(str(path))
+            self.assertIsNone(processor.tokenizer)
+            with self.assertRaisesRegex(ValueError, "ships no tokenizer"):
+                processor.preprocess_text("a cat")
+
+    def test_probing_for_a_tokenizer_does_not_raise(self):
+        from mlx_vlm.models.sam3.processing_sam3 import Sam3Processor
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / "processor_config.json").write_text(json.dumps({}))
+            processor = Sam3Processor.from_pretrained(str(path))
+            # load_processor checks hasattr, which only swallows AttributeError.
+            self.assertTrue(hasattr(processor, "tokenizer"))

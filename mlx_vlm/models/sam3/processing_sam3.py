@@ -24,6 +24,7 @@ class Sam3Processor:
         self.image_std = np.array(image_std, dtype=np.float32)
         self.max_text_length = max_text_length
         self._tokenizer = None
+        self._source = None
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs):
@@ -57,11 +58,43 @@ class Sam3Processor:
         image_mean = tuple(img_proc.get("image_mean", [0.5, 0.5, 0.5]))
         image_std = tuple(img_proc.get("image_std", [0.5, 0.5, 0.5]))
 
-        return cls(
+        processor = cls(
             image_size=image_size,
             image_mean=image_mean,
             image_std=image_std,
         )
+        processor._tokenizer = cls._load_tokenizer(pretrained_model_name_or_path)
+        processor._source = str(pretrained_model_name_or_path)
+        return processor
+
+    @staticmethod
+    def _load_tokenizer(pretrained_model_name_or_path):
+        """Load the CLIP tokenizer shipped with a checkpoint, or None."""
+        from pathlib import Path
+
+        source = str(pretrained_model_name_or_path)
+        directory = Path(source)
+        if directory.is_dir():
+            names = {entry.name for entry in directory.iterdir()}
+        else:
+            try:
+                from huggingface_hub import list_repo_files
+
+                names = set(list_repo_files(source))
+            except Exception:
+                return None
+
+        # Asked for a repo without these, transformers returns a tokenizer with
+        # a two-entry vocabulary rather than raising, so check before loading.
+        if "tokenizer.json" not in names and not {"vocab.json", "merges.txt"} <= names:
+            return None
+
+        from transformers import CLIPTokenizer
+
+        try:
+            return CLIPTokenizer.from_pretrained(source)
+        except Exception:
+            return None
 
     def save_pretrained(self, save_directory: str, **kwargs):
         """Save processor config and tokenizer to directory."""
@@ -89,27 +122,13 @@ class Sam3Processor:
         with open(save_dir / "processor_config.json", "w") as f:
             json.dump(proc_config, f, indent=2)
 
-        # Copy tokenizer files if available
+        # Keep the tokenizer with the weights so the saved copy stays loadable
         if self._tokenizer is not None:
             self._tokenizer.save_pretrained(str(save_dir))
-        else:
-            # Save tokenizer from the CLIP model
-            try:
-                tok = self.tokenizer  # triggers lazy load
-                tok.save_pretrained(str(save_dir))
-            except Exception:
-                pass
 
     @property
     def tokenizer(self):
-        """Lazy-load CLIP tokenizer."""
-        if self._tokenizer is None:
-            from transformers import CLIPTokenizer
-
-            # SAM3 uses CLIP tokenizer
-            self._tokenizer = CLIPTokenizer.from_pretrained(
-                "openai/clip-vit-base-patch32"
-            )
+        """The CLIP tokenizer that shipped with the checkpoint, if any."""
         return self._tokenizer
 
     def preprocess_image(
@@ -162,6 +181,14 @@ class Sam3Processor:
         if isinstance(text, str):
             text = [text]
 
+        if self._tokenizer is None:
+            raise ValueError(
+                f"{self._source or 'This checkpoint'} ships no tokenizer. SAM 3 "
+                "prompts its text encoder with CLIP tokens, so the vocabulary has "
+                "to match the converted weights: add tokenizer.json (or vocab.json "
+                "and merges.txt) from the source checkpoint, or set "
+                "processor._tokenizer yourself."
+            )
         encoded = self.tokenizer(
             text,
             padding="max_length",

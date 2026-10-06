@@ -4,6 +4,14 @@ MLX port of [Meta's SAM 3.1](https://github.com/facebookresearch/sam3) — exten
 
 > **Note:** SAM 3.1 shares the same detection pipeline as SAM 3 but adds a triple-head FPN, multiplex mask decoder (16 objects simultaneously), and decoupled memory attention for tracking.
 
+> **Tokenizer:** text prompts are tokenized with CLIP, so the checkpoint must ship
+> `tokenizer.json` (or `vocab.json` and `merges.txt`). The processor reads them from
+> the checkpoint and raises if they are missing rather than fetching a vocabulary
+> from elsewhere, which would not be guaranteed to match the converted weights.
+> `mlx-community/sam3.1-bf16` omits them, so use
+> [`nativ-community/sam3.1-bf16`](https://huggingface.co/nativ-community/sam3.1-bf16),
+> which is the same weights with the tokenizer included.
+
 ## What's New in SAM 3.1
 
 | Component | SAM 3 | SAM 3.1 |
@@ -22,7 +30,7 @@ from mlx_vlm.utils import load_model, get_model_path
 from mlx_vlm.models.sam3.generate import Sam3Predictor
 from mlx_vlm.models.sam3_1.processing_sam3_1 import Sam31Processor
 
-model_path = get_model_path("mlx-community/sam3.1-bf16")
+model_path = get_model_path("nativ-community/sam3.1-bf16")
 model = load_model(model_path)
 processor = Sam31Processor.from_pretrained(str(model_path))
 predictor = Sam3Predictor(model, processor, score_threshold=0.3)
@@ -210,7 +218,7 @@ mlx_vlm/models/sam3_1/
 from mlx_vlm.utils import load_model, get_model_path
 from mlx_vlm.models.sam3_1.processing_sam3_1 import Sam31Processor
 
-model = load_model(get_model_path("mlx-community/sam3.1-bf16"))
+model = load_model(get_model_path("nativ-community/sam3.1-bf16"))
 processor = Sam31Processor.from_pretrained(...)
 
 # Initialize a session from detection masks on frame 0
