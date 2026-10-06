@@ -18,7 +18,6 @@ import pytest
 from mlx.utils import tree_flatten
 
 import mlx_vlm.models.rope_utils as rope_utils
-from mlx_vlm import apc
 from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
 from mlx_vlm.fp8 import _dequantize_fp8_weight, _quantize_fp8_weight
 from mlx_vlm.models.cache import KVCache
@@ -961,7 +960,6 @@ def test_transform_modelopt_mixed_nvfp4_fp8_weights():
 @pytest.mark.parametrize("shape", [(1, 64), (2, 3, 64)])
 def test_scaled_nvfp4_linear_matches_reference(dtype, bias, shape):
     model = nn.Module()
-    model.language_model = nn.Module()
     model.layer = nn.QuantizedLinear(64, 4, bias=bias, mode="nvfp4")
     global_scale = mx.array(0.00012715657, mx.float32)
     block_scales = mx.array([[56, 64, 72, 80], [120] * 4] * 2, mx.uint8)
@@ -973,9 +971,6 @@ def test_scaled_nvfp4_linear_matches_reference(dtype, bias, shape):
     if bias:
         weights["layer.bias"] = mx.array([0.25, -0.5, 1.0, -2.0], dtype)
     replace_scaled_quantized_linears(model, weights)
-    assert apc.semantic_extra_hash(
-        model=model.language_model
-    ) == apc.semantic_extra_hash(model=model)
     model.load_weights(list(weights.items()))
     x = mx.linspace(0.1, 1.7, np.prod(shape)).reshape(shape).astype(dtype)
     decoded_scales = mx.array([[1, 2, 4, 8], [256] * 4] * 2, mx.float32)
@@ -1022,11 +1017,6 @@ def test_modelopt_global_scale_load_and_save(tmp_path, activation_quantization):
         model = load_model(tmp_path, quantize_activations=activation_quantization)
         assert isinstance(model.layer, ScaledQuantizedLinear)
         assert model.layer._quantize_activations == activation_quantization
-        fingerprint = model._quantization_fingerprint
-        assert fingerprint.endswith("activations") == activation_quantization
-        assert apc.semantic_extra_hash(model=model) != apc.semantic_extra_hash(
-            model=Model(None)
-        )
         x = mx.full((2, 3, 64), 6.0, mx.bfloat16)
         expected = mx.full(
             (2, 3, 4), 6 * 64 * 256 * weights["layer.weight_scale_2"].item()
@@ -1040,9 +1030,6 @@ def test_modelopt_global_scale_load_and_save(tmp_path, activation_quantization):
             str(tmp_path / "model.safetensors"), dict(tree_flatten(model.parameters()))
         )
         restored = load_model(tmp_path, quantize_activations=activation_quantization)
-        assert apc.semantic_extra_hash(model=restored) == apc.semantic_extra_hash(
-            model=model
-        )
         assert mx.array_equal(restored.layer.weight, model.layer.weight).item()
         assert mx.array_equal(
             restored.layer.scales, weights["layer.weight_scale"]

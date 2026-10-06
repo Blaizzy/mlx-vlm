@@ -24,11 +24,7 @@ from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
 
 from .models.base import BaseImageProcessor
-from .quantization.nvfp4 import (
-    ScaledQuantizedLinear,
-    replace_scaled_quantized_linears,
-    set_quantization_fingerprint,
-)
+from .quantization.nvfp4 import replace_scaled_quantized_linears
 from .quantization.one_bit import _quantization_for_path, replace_one_bit_modules
 from .tokenizer_utils import load_tokenizer
 from .trainer.utils import apply_lora_layers
@@ -642,13 +638,6 @@ def quantize_activations(model: nn.Module) -> nn.Module:
 
     def _maybe_qq(m: nn.Module) -> nn.Module:
         """Convert a QuantizedLinear layer to QQLinear if compatible."""
-        if type(m) is ScaledQuantizedLinear:
-            if "bias" in m:
-                raise ValueError(
-                    "Linear layer with bias does not support activation quantization"
-                )
-            m._quantize_activations = True
-            return m
         if isinstance(m, nn.QuantizedLinear):
             if m.mode not in ACTIVATION_QUANTIZATION_MODES:
                 raise ValueError(
@@ -669,8 +658,6 @@ def quantize_activations(model: nn.Module) -> nn.Module:
 
     leaves = tree_map(_maybe_qq, model.leaf_modules(), is_leaf=nn.Module.is_module)
     model.update_modules(leaves)
-    if getattr(model, "_quantization_fingerprint", None) is not None:
-        set_quantization_fingerprint(model, "nvfp4-global-scale-v1-activations")
 
     return model
 
@@ -1147,7 +1134,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             mode=quantization.get("mode", "affine"),
             class_predicate=get_class_predicate,
         )
-        replace_scaled_quantized_linears(model, weights)
 
     if kwargs.get("quantize_activations", False):
         if quantization is None:
@@ -1156,6 +1142,8 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 "Please use a quantized model with mode 'nvfp4' or 'mxfp8'."
             )
         model = quantize_activations(model)
+
+    replace_scaled_quantized_linears(model, weights)
 
     if is_offload_dir:
         # strict=False above must not swallow a genuinely malformed offload

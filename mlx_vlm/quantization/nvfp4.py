@@ -12,12 +12,12 @@ class ScaledQuantizedLinear(nn.Module):
         super().__init__()
         self.weight = linear.weight
         self.scales = linear.scales
-        self.biases = linear.biases
+        self.biases = linear.get("biases")
         self.group_size = linear.group_size
         self.bits = linear.bits
         self.mode = linear.mode
         self.weight_scale_2 = global_scale
-        self._quantize_activations = False
+        self._quantize_activations = isinstance(linear, nn.QQLinear)
         if "bias" in linear:
             self.bias = linear.bias
         self.freeze()
@@ -83,26 +83,18 @@ class ScaledQuantizedSwitchLinear(ScaledQuantizedLinear):
         return output
 
 
-def set_quantization_fingerprint(model: nn.Module, fingerprint: str) -> None:
-    model._quantization_fingerprint = fingerprint
-    language_model = getattr(model, "language_model", None)
-    if language_model is not None:
-        language_model._quantization_fingerprint = fingerprint
-
-
 def replace_scaled_quantized_linears(model: nn.Module, weights: dict) -> None:
-    replaced = False
-
     def replace(path, module):
-        nonlocal replaced
         scale = weights.get(f"{path}.weight_scale_2")
         if scale is None:
             return module
-        if not isinstance(module, (nn.QuantizedLinear, QuantizedSwitchLinear)) or (
-            module.mode != "nvfp4"
+        if (
+            not isinstance(
+                module, (nn.QuantizedLinear, nn.QQLinear, QuantizedSwitchLinear)
+            )
+            or module.mode != "nvfp4"
         ):
             raise ValueError(f"NVFP4 global scale requires a quantized linear: {path}")
-        replaced = True
         if isinstance(module, QuantizedSwitchLinear):
             return ScaledQuantizedSwitchLinear(module, scale)
         return ScaledQuantizedLinear(module, scale)
@@ -110,5 +102,3 @@ def replace_scaled_quantized_linears(model: nn.Module, weights: dict) -> None:
     model.update_modules(
         tree_map_with_path(replace, model.leaf_modules(), is_leaf=nn.Module.is_module)
     )
-    if replaced:
-        set_quantization_fingerprint(model, "nvfp4-global-scale-v1")
