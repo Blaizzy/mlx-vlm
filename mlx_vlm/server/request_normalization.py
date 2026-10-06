@@ -1,12 +1,14 @@
 """Normalize compatible API requests into server generation arguments."""
 
-from typing import Optional, Tuple, Union
+import json
+from typing import List, Optional, Tuple, Union
 
 from ..generate import (
     DEFAULT_REPETITION_CONTEXT_SIZE,
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
 )
+from ..prompt_utils import extract_text_from_content, normalize_image_content
 from ..structured import build_json_schema_logits_processor
 from .generation import (
     GenerationArguments,
@@ -19,6 +21,70 @@ from .generation import (
 from .runtime import runtime
 
 _DISABLED_REASONING_EFFORTS = {"none", "off", "disabled", "false", "0"}
+
+
+def _chat_message_to_prompt(message):
+    content = message.get("content")
+    if isinstance(content, list):
+        content = (
+            normalize_image_content(content)
+            if message["role"] == "user"
+            else extract_text_from_content(content)
+        )
+    msg = {"role": message["role"], "content": content}
+    # Preserve tool-calling metadata.
+    # Ensure arguments are dicts (not JSON strings) for Jinja templates
+    # that iterate them with |items (e.g. Qwen3.5).
+    if message.get("tool_calls") is not None:
+        normalized_calls = []
+        for tc in message.get("tool_calls"):
+            tc = dict(tc) if isinstance(tc, dict) else tc
+            if isinstance(tc, dict) and "function" in tc:
+                fn = dict(tc["function"])
+                args = fn.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        fn["arguments"] = json.loads(args)
+                    except (json.JSONDecodeError, TypeError):
+                        fn["arguments"] = {}
+                tc["function"] = fn
+            normalized_calls.append(tc)
+        msg["tool_calls"] = normalized_calls
+    if message.get("tool_call_id") is not None:
+        msg["tool_call_id"] = message.get("tool_call_id")
+    if message.get("name") is not None:
+        msg["name"] = message.get("name")
+    if message.get("reasoning_content") is not None:
+        msg["reasoning_content"] = message.get("reasoning_content")
+        msg["reasoning"] = message.get("reasoning_content")
+
+    return msg
+
+
+def _normalize_instruction_messages(
+    chat_messages: List[dict],
+    instructions: Optional[str] = None,
+) -> Optional[str]:
+    """Combine API instructions into the leading system message for templates."""
+    instruction_parts = [instructions] if instructions else []
+    conversation = []
+
+    for message in chat_messages:
+        if message.get("role") in ("system", "developer"):
+            content = message.get("content")
+            if content:
+                instruction_parts.append(str(content))
+        else:
+            conversation.append(message)
+
+    normalized_instructions = "\n\n".join(instruction_parts) or None
+    if normalized_instructions:
+        conversation.insert(
+            0,
+            {"role": "system", "content": normalized_instructions},
+        )
+    chat_messages[:] = conversation
+    return normalized_instructions
 
 
 def _request_field_is_set(request, field_name: str) -> bool:

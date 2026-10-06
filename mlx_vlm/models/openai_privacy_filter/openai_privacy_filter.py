@@ -271,8 +271,10 @@ class MLP(nn.Module):
         indices = mx.argpartition(-logits, kth=self.top_k - 1, axis=-1)[
             ..., : self.top_k
         ]
+        indices = mx.stop_gradient(indices)
         top_logits = mx.take_along_axis(logits, indices, axis=-1)
         order = mx.argsort(-top_logits, axis=-1)
+        order = mx.stop_gradient(order)
         indices = mx.take_along_axis(indices, order, axis=-1)
         top_logits = mx.take_along_axis(top_logits, order, axis=-1)
         weights = mx.softmax(top_logits, axis=-1, precise=True) / self.top_k

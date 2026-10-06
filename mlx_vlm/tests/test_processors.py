@@ -635,23 +635,23 @@ def test_auto_processor_routes_to_custom_loader(
 
 
 def test_qwen3_5_moe_text_stale_vl_processor_loads_tokenizer(tmp_path):
+    from transformers import Qwen2Tokenizer
+
     importlib.import_module("mlx_vlm.models.qwen3_5_moe_text")
     _write_configs(tmp_path, config={"model_type": "qwen3_5_moe_text"})
-    vocab = {f"t{i}": i for i in range(32)}
-    backend = Tokenizer(WordLevel(vocab, unk_token="t0"))
-    backend.pre_tokenizer = Whitespace()
-    PreTrainedTokenizerFast(
-        tokenizer_object=backend, unk_token="t0", eos_token="t1"
+
+    Qwen2Tokenizer(
+        vocab={"<|endoftext|>": 0, "t": 1, "3": 2, "Ġ": 3, "4": 4}, merges=[]
     ).save_pretrained(tmp_path)
     tokenizer_config = tmp_path / "tokenizer_config.json"
     data = json.loads(tokenizer_config.read_text())
     data["processor_class"] = "Qwen3VLProcessor"
     tokenizer_config.write_text(json.dumps(data))
 
-    processor = load_processor(tmp_path, eos_token_ids=[1])
+    processor = load_processor(tmp_path, eos_token_ids=[0])
 
     assert not hasattr(processor, "image_processor")
-    assert processor.encode("t3 t4", add_special_tokens=False) == [3, 4]
+    assert processor.encode("t3 t4", add_special_tokens=False) == [1, 2, 3, 1, 4]
 
 
 class _ImageStub:
@@ -1285,6 +1285,114 @@ def test_qwen3_vl_video_timestamp_video_prompt_falls_back_to_processor_fps():
     assert "<0.2 seconds>" in rendered and "<1.2 seconds>" in rendered
 
 
+class TestQwen3VLVideoTimestamps:
+    """Qwen3-VL markers follow the frames that were actually sampled."""
+
+    VIDEO_BLOCK = "<|vision_start|><|video_pad|><|vision_end|>"
+
+    @pytest.fixture
+    def p(self):
+        tokens = [
+            "[UNK]",
+            "[PAD]",
+            "<|image_pad|>",
+            "<|video_pad|>",
+            "<|vision_start|>",
+            "<|vision_end|>",
+        ]
+        tokenizer = fast_tokenizer(
+            tokens,
+            tokenizer_class=RecordingTokenizer,
+            split=False,
+            additional_special_tokens=tokens[2:],
+        )
+        return c.qwen3(
+            image_processor=m.qwen3.Qwen3VLImageProcessor(),
+            video_processor=m.qwen3.Qwen3VLVideoProcessor(**PROFILES["qwen_video"]),
+            tokenizer=tokenizer,
+        )
+
+    @staticmethod
+    def markers(p):
+        return re.findall(r"<(\d+\.\d) seconds>", p.tokenizer.last_text[0])
+
+    @staticmethod
+    def frames(count=4):
+        return np.zeros((count, 3, 56, 56), dtype=np.uint8)
+
+    @pytest.mark.parametrize("prepare", [False, True], ids=["direct", "prepare-inputs"])
+    @pytest.mark.parametrize(
+        "indices,expected",
+        [([0, 30, 60, 90], ["0.5", "2.5"]), ([0, 30, 60], ["0.5", "2.0"])],
+        ids=["even", "odd"],
+    )
+    def test_metadata_sets_the_timestamps(self, p, prepare, indices, expected):
+        metadata = dict(total_num_frames=91, fps=30, frames_indices=indices)
+        if prepare:
+            prepare_inputs(
+                p,
+                prompts=self.VIDEO_BLOCK,
+                videos=[self.frames(len(indices))],
+                video_metadata=[metadata],
+            )
+        else:
+            p(
+                text=[self.VIDEO_BLOCK],
+                videos=[self.frames(len(indices))],
+                video_metadata=[VideoMetadata(**metadata)],
+            )
+        assert self.markers(p) == expected
+
+    @pytest.mark.parametrize("prepare", [False, True], ids=["direct", "prepare-inputs"])
+    @pytest.mark.parametrize(
+        "frame_count,indices",
+        [(4, [0, 30, 60]), (3, [0, 30, 60, 90])],
+        ids=["missing-index", "extra-index"],
+    )
+    def test_metadata_frame_count_is_checked_before_padding(
+        self, p, prepare, frame_count, indices
+    ):
+        metadata = dict(total_num_frames=91, fps=30, frames_indices=indices)
+        with pytest.raises(ValueError, match="frame indices must match"):
+            if prepare:
+                prepare_inputs(
+                    p,
+                    prompts=self.VIDEO_BLOCK,
+                    videos=[self.frames(frame_count)],
+                    video_metadata=[metadata],
+                )
+            else:
+                p(
+                    text=[self.VIDEO_BLOCK],
+                    videos=[self.frames(frame_count)],
+                    video_metadata=[VideoMetadata(**metadata)],
+                )
+
+    def test_fps_without_metadata_spaces_frames_evenly(self, p):
+        p(text=[self.VIDEO_BLOCK], videos=[self.frames()], fps=[1.0])
+        assert self.markers(p) == ["0.5", "2.5"]
+
+    def test_clamped_clip_keeps_real_timestamps(self, p, synthetic_video):
+        # 20 s at 30 fps; four frames are far below the default 2 fps.
+        prepare_inputs(
+            p, prompts=self.VIDEO_BLOCK, videos=[synthetic_video], max_frames=4
+        )
+        assert self.markers(p) == ["3.3", "16.6"]
+
+    @pytest.mark.parametrize(
+        "metadata,error",
+        [
+            ([dict(fps=30, frames_indices=[0, 30])] * 2, "one video_metadata"),
+            ([dict(fps=30, frames_indices=[0, 30])], "frame indices must match"),
+            ([dict(fps=0, frames_indices=[0, 1, 2, 3])], "positive and finite"),
+        ],
+        ids=["count", "frames", "fps"],
+    )
+    def test_invalid_metadata(self, p, metadata, error):
+        with pytest.raises(ValueError, match=error):
+            p(text=[self.VIDEO_BLOCK], videos=[self.frames()], video_metadata=metadata)
+
+
 class TestMageVLProcessor:
     """Mage VL image/video processing and processor-to-model compatibility."""
 
@@ -1602,6 +1710,7 @@ def test_extract_text_from_content(content, expected):
     [
         ("nemotron_h_nano_omni", "image-audio"),
         ("nemotronh_nano_omni_reasoning_v3", "image-audio"),
+        ("qwen3_omni_moe", "qwen-image-audio"),
         ("gemma4_unified", "video-audio"),
         ("prism_hadamard_qwen35", "image-video"),
         ("step3p7", "patch"),
@@ -1619,6 +1728,7 @@ def test_prompt_media_format(family, kind):
     text_part = dict(type="text", text=text, content=text)
     expected = {
         "image-audio": [dict(type="image"), text_part, dict(type="audio")],
+        "qwen-image-audio": [dict(type="audio"), dict(type="image"), text_part],
         "video-audio": [
             dict(type="video", video="clip.mp4", max_pixels=224 * 224, fps=1),
             dict(type="audio"),
@@ -1912,6 +2022,18 @@ def test_apply_chat_template_preserves_explicit_thinking_enabled():
 
     assert processor.kwargs["enable_thinking"] is True
     assert result.endswith("<think>\n")
+
+
+def test_qwen3_omni_enables_thinking_by_default():
+    processor = MagicMock(chat_template="{{ messages }}")
+    processor.apply_chat_template.return_value = "prompt"
+
+    result = apply_chat_template(
+        processor, {"model_type": "qwen3_omni_moe"}, "Describe this image."
+    )
+
+    assert result == "prompt"
+    assert processor.apply_chat_template.call_args.kwargs["enable_thinking"] is True
 
 
 def test_apply_chat_template_maps_enable_thinking_for_thinking_mode_templates():

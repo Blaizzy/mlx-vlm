@@ -106,6 +106,9 @@ def convert_qwen4_exp_fp8_weights(weights: dict[str, mx.array]):
     ple_scale_keys = [key for key in converted if key.endswith(_PLE_SCALE_SUFFIX)]
     for scale_key in ple_scale_keys:
         prefix = scale_key[: -len("weight_scale")]
+        if any(key.startswith(prefix + "shards.") for key in converted):
+            converted.pop(scale_key)
+            continue
         scale = converted.pop(scale_key)
         shard_keys = sorted(
             (key for key in converted if key.startswith(prefix + "shard_")),

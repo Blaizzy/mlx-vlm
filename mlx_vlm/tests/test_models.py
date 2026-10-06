@@ -1177,6 +1177,47 @@ def test_missing_model_file_raises_clearly(tmp_path):
         load_model(tmp_path)
 
 
+def test_qwen3_omni_audio_batch_matches_repeated_input():
+    from mlx_vlm.models.qwen3_omni_moe.audio import AudioModel
+    from mlx_vlm.models.qwen3_omni_moe.config import AudioConfig
+
+    config = AudioConfig(
+        d_model=8,
+        encoder_layers=1,
+        encoder_attention_heads=2,
+        encoder_ffn_dim=16,
+        num_mel_bins=8,
+        output_dim=8,
+        downsample_hidden_size=4,
+        conv_chunksize=4,
+        max_source_positions=64,
+    )
+    model = AudioModel(config)
+    sample = mx.random.normal((8, 170))
+    output = model(mx.concatenate([sample, sample], axis=1), mx.array([170, 170]))
+
+    assert output.shape == (44, 8)
+    assert mx.allclose(output[:22], output[22:])
+
+
+def test_qwen3_omni_rope_delta_ignores_batch_padding():
+    from mlx_vlm.models.qwen3_omni_moe.language import LanguageModel
+
+    model = LanguageModel.__new__(LanguageModel)
+    model.config = SimpleNamespace(
+        vision_config=SimpleNamespace(spatial_merge_size=2),
+        image_token_id=10,
+        video_token_id=11,
+        vision_start_token_id=12,
+    )
+    input_ids = mx.array([[0, 0, 1, 2], [1, 2, 3, 4]])
+    attention_mask = mx.array([[0, 0, 1, 1], [1, 1, 1, 1]])
+
+    _, rope_deltas = model.get_rope_index(input_ids, attention_mask=attention_mask)
+
+    assert rope_deltas.tolist() == [[0], [0]]
+
+
 # Patch embedding layouts
 
 
@@ -1319,6 +1360,56 @@ def test_moondream3_sanitize_remaps_raw_and_preserves_converted_keys():
     converted["text.lm_head.weight"] = mx.zeros((1,))
     converted["vision.proj_mlp.fc1.weight"] = mx.zeros((1,))
     assert Model.sanitize(None, converted).keys() == converted.keys()
+
+
+class TestKolibri1Sanitize(unittest.TestCase):
+    def _model(self):
+        from mlx_vlm.models.kolibri1 import ModelConfig
+        from mlx_vlm.models.kolibri1.language import LanguageModel
+
+        case = next(case for case in DATA["cases"] if case["module"] == "kolibri1")
+        config = copy.deepcopy(case["config"])
+        config["num_hidden_layers"] = 1
+        config["layer_types"] = ["full_attention"]
+        return LanguageModel(ModelConfig.from_dict(config))
+
+    def _checkpoint(self, model, layout):
+        checkpoint = {}
+        for key, value in tree_flatten(model.parameters()):
+            if ".mlp.gate.e_score_correction_bias" in key:
+                if layout == "per_expert":
+                    key = key.replace(
+                        ".mlp.gate.e_score_correction_bias",
+                        ".moe.router.expert_bias",
+                    )
+                elif layout == "stacked":
+                    key = key.replace(
+                        ".mlp.gate.e_score_correction_bias", ".mlp.expert_bias"
+                    )
+            if ".mlp.switch_mlp." in key:
+                prefix, projection = key.split(".mlp.switch_mlp.")
+                if layout == "stacked":
+                    checkpoint[f"{prefix}.mlp.experts.{projection}"] = value
+                    continue
+                if layout == "per_expert":
+                    for expert_idx, expert_value in enumerate(value):
+                        checkpoint[
+                            f"{prefix}.mlp.experts.{expert_idx}.{projection}"
+                        ] = expert_value
+                    continue
+            checkpoint[key] = value
+        return checkpoint
+
+    def test_checkpoint_layouts_sanitize_to_the_model_exactly(self):
+        model = self._model()
+        expected = dict(tree_flatten(model.parameters()))
+        for layout in ("per_expert", "stacked", "canonical"):
+            with self.subTest(layout=layout):
+                sanitized = model.sanitize(self._checkpoint(model, layout))
+                self.assertEqual(sanitized.keys(), expected.keys())
+                for key, value in expected.items():
+                    self.assertTrue(mx.array_equal(sanitized[key], value).item(), key)
+                model.load_weights(list(sanitized.items()), strict=True)
 
 
 class TestQwen3_5MoeText(unittest.TestCase):
@@ -2042,3 +2133,98 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
                 )
                 self.assertTrue(bool(mx.all(cache[0].engram[:, 2:5] == -1)))
                 self.assertTrue(bool(mx.allclose(actual, expected, atol=1e-4)))
+
+
+class TestMoERouterStopGradient:
+    def test_gather_indices_are_stop_gradiented(self):
+        import re
+
+        import mlx_vlm
+
+        offenders = []
+        for path in sorted((Path(mlx_vlm.__file__).parent / "models").rglob("*.py")):
+            src = path.read_text(encoding="utf-8")
+            if "take_along_axis" not in src or "argpartition" not in src:
+                continue
+            from_argsort = set(
+                re.findall(r"(\w+)\s*=\s*[^\n]*arg(?:partition|sort)", src)
+            )
+            for m in re.finditer(r"(\w+)\s*=\s*(\w+)\[", src):
+                if m.group(2) in from_argsort:
+                    from_argsort.add(m.group(1))
+            stopped = set(re.findall(r"(\w+)\s*=\s*mx\.stop_gradient", src))
+            for m in re.finditer(
+                r"take_along_axis\(\s*[^,]+?\s*,\s*(.+?)\s*,\s*axis", src
+            ):
+                idx = m.group(1).strip()
+                if "stop_gradient" in idx:
+                    continue
+                var = re.match(r"[A-Za-z_]\w*", idx)
+                var = var.group(0) if var else ""
+                if var and var not in stopped and var in from_argsort:
+                    offenders.append(
+                        f"{path.parent.name}/{path.name}: take_along_axis(..., {idx})"
+                    )
+        assert (
+            not offenders
+        ), "gather indices need mx.stop_gradient (MLX >= 0.32.1):\n" + "\n".join(
+            offenders
+        )
+
+    @pytest.mark.parametrize(
+        "module,cls,extra",
+        [
+            (
+                "qwen3_5_moe",
+                "Qwen3_5MoeSparseMoeBlock",
+                {"shared_expert_intermediate_size": 8},
+            ),
+            ("qwen3_moe", "Qwen3MoeSparseMoeBlock", {"norm_topk_prob": True}),
+        ],
+    )
+    def test_moe_router_backpropagates_through_dispatch(self, module, cls, extra):
+        import importlib
+        import types
+
+        block_cls = getattr(
+            importlib.import_module(f"mlx_vlm.models.{module}.language"), cls
+        )
+        args = types.SimpleNamespace(
+            hidden_size=16,
+            moe_intermediate_size=8,
+            num_experts=4,
+            num_experts_per_tok=2,
+            **extra,
+        )
+        block = block_cls(args)
+        x = mx.random.normal((1, 3, 16))
+        _, grads = nn.value_and_grad(block, lambda m, inp: m(inp).sum())(block, x)
+        total = sum(float(mx.sum(mx.abs(g))) for _, g in tree_flatten(grads))
+        assert total > 0 and bool(mx.isfinite(mx.array(total)))
+
+
+class TestPhiMoE:
+    def test_sparsemixer(self):
+        from mlx_vlm.models.phimoe.language import sparsemixer
+
+        gates = mx.array([[3.0, 1.0, 0.0, -1.0], [3.0, 2.99, 0.0, -1.0]])
+        inds, scores = sparsemixer(gates, top_k=2, jitter_eps=0.01)
+
+        assert inds.tolist() == [[0, 1], [0, 1]]
+        assert mx.allclose(scores, mx.array([[1.0, 1.0], [0.5025, 1.0]]))
+        mx.eval(
+            mx.grad(lambda g: sparsemixer(g, top_k=2, jitter_eps=0.01)[1].sum())(gates)
+        )
+
+    def test_plain_rope_without_scaling(self):
+        from mlx_vlm.models.phimoe.config import ModelConfig
+        from mlx_vlm.models.phimoe.language import Attention
+
+        config = ModelConfig(
+            hidden_size=16,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            rope_scaling=None,
+        )
+
+        assert isinstance(Attention(config).rope, nn.RoPE)

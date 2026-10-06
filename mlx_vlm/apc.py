@@ -3123,8 +3123,8 @@ class APCManager:
         # Apple Metal has a per-process resource-count ceiling separate from
         # byte memory. Qwen3-VL-4B stores 72 MLX tensors per APCBlock, so a
         # very large pool can hit the ceiling before unified memory is scarce.
-        # Keep disk persistence going, but stop adding memory-pool blocks near
-        # the resource limit. Set to 0 to disable.
+        # Reclaim idle memory blocks at the resource limit; the disk tier
+        # retains their write-through copies. Set to 0 to disable the limit.
         self._max_pool_tensors = max(
             0, int(os.environ.get("APC_MAX_POOL_TENSORS", "450000"))
         )
@@ -3204,8 +3204,10 @@ class APCManager:
         b.prev = b.next = None
 
     # ---------- Block lifecycle ----------
-    def _evict_lru(self) -> Optional[APCBlock]:
+    def _evict_lru(self, *, cached_only: bool = False) -> Optional[APCBlock]:
         b = self._free_head
+        while cached_only and b is not None and b.block_hash is None:
+            b = b.next
         if b is None:
             return None
         self._free_remove(b)
@@ -3216,6 +3218,20 @@ class APCManager:
         b.token_ids = ()
         b.release_components()
         return b
+
+    def _make_tensor_room(self, per_block_tensors: int) -> bool:
+        """Reclaim idle blocks without removing disk copies; caller holds lock."""
+        if self._max_pool_tensors <= 0 or per_block_tensors <= 0:
+            return True
+        if per_block_tensors > self._max_pool_tensors:
+            return False
+        while (len(self.hash_table) + 1) * per_block_tensors > self._max_pool_tensors:
+            block = self._evict_lru(cached_only=True)
+            if block is None:
+                return False
+            self._free_push(block)
+            self.stats.memory_evictions += 1
+        return True
 
     def _acquire_existing(self, b: APCBlock) -> APCBlock:
         if b.ref_cnt == 0:
@@ -3630,11 +3646,11 @@ class APCManager:
                     for t in token_ids[i * self.block_size : (i + 1) * self.block_size]
                 )
                 h = _hash_tokens(parent, chunk, extra_hash)
-                # If the prefix is already in memory, the normal memory path is
-                # better and preserves the expected ref-count lifecycle.
+                # Prefer memory only when the leading block is resident.
                 b_mem = self.hash_table.get(h)
                 if (
-                    not allow_memory_overlap
+                    i == 0
+                    and not allow_memory_overlap
                     and b_mem is not None
                     and b_mem.token_ids == chunk
                 ):
@@ -3841,12 +3857,7 @@ class APCManager:
                 if memory_slots <= 0:
                     parent = h
                     continue
-                if (
-                    self._max_pool_tensors > 0
-                    and per_block_tensors > 0
-                    and (len(self.hash_table) + 1) * per_block_tensors
-                    > self._max_pool_tensors
-                ):
+                if not self._make_tensor_room(per_block_tensors):
                     logger.debug(
                         "APC pool tensor limit reached; skipping memory store "
                         "at block %d/%d",
@@ -4656,7 +4667,7 @@ def apc_lookup_plan(
             }
         return None
 
-    matched, prefix_len = manager.lookup_prefix(ids_list, extra_hash=extra_hash)
+    matched, prefix_len = manager.lookup_prefix(ids_list[:-1], extra_hash=extra_hash)
     if prefix_len > 0 and prefix_has_media(prefix_len):
         manager.release(matched)
         matched = []

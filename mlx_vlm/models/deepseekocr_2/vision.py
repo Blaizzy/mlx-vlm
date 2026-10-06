@@ -3,23 +3,9 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..base import check_array_shape
+from ..rope_utils import rotate_half
 from .config import Qwen2EncoderConfig, VisionConfig
-
-
-def check_array_shape(arr):
-    shape = arr.shape
-
-    # Check if the shape has 4 dimensions
-    if len(shape) != 4:
-        return False
-
-    out_channels, kH, KW, _ = shape
-
-    # Check if out_channels is the largest, and kH and KW are the same
-    if (out_channels >= kH) and (out_channels >= KW) and (kH == KW):
-        return True
-    else:
-        return False
 
 
 class Qwen2RMSNorm(nn.Module):
@@ -71,13 +57,6 @@ class Qwen2RotaryEmbedding(nn.Module):
         cos = mx.cos(emb)
         sin = mx.sin(emb)
         return cos.astype(x.dtype), sin.astype(x.dtype)
-
-
-def rotate_half(x: mx.array) -> mx.array:
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return mx.concatenate([-x2, x1], axis=-1)
 
 
 def apply_rotary_pos_emb(

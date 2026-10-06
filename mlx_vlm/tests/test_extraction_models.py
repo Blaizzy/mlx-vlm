@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import importlib
 import io
 import json
+import math
 import pickle
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -50,6 +54,15 @@ from mlx_vlm.token_classification import (
     load_token_classifier,
 )
 from mlx_vlm.utils import get_model_and_args, load_config
+
+EXTRACTION_DATA = json.loads(
+    Path(__file__).with_name("extraction_cases.json").read_text()
+)
+EXTRACTION_CASES = {case["id"]: case for case in EXTRACTION_DATA["cases"]}
+
+
+def _extraction_config(name):
+    return copy.deepcopy(EXTRACTION_CASES[name]["config"])
 
 
 def test_checkpoint_key_sanitization():
@@ -212,21 +225,9 @@ def test_quantized_encoder_still_runs():
     embedding LayerNorm reject the shape, so every quantized model fails at
     inference even though conversion reports success.
     """
-    config = GlinerConfig.from_dict(
-        {
-            "model_type": "extractor",
-            "architecture": "boundary",
-            "encoder_config": {
-                "vocab_size": 512,
-                "hidden_size": 128,
-                "num_attention_heads": 4,
-                "num_hidden_layers": 2,
-                "intermediate_size": 256,
-                "position_buckets": 64,
-                "max_relative_positions": 128,
-            },
-        }
-    )
+    values = _extraction_config("gliner2_5")
+    values["model_type"] = "extractor"
+    config = GlinerConfig.from_dict(values)
     model = GlinerModel(config)
     model.eval()
     ids = mx.zeros((1, 16), dtype=mx.int32)
@@ -289,30 +290,8 @@ def test_boundary_architecture_selects_the_gliner_module():
     assert model_type == "gliner2_5"
 
 
-LABELS = {0: "O", 1: "B-x", 2: "I-x", 3: "E-x", 4: "S-x"}
-
-
 def _privacy_config(**overrides):
-    values = {
-        "vocab_size": 32,
-        "hidden_size": 8,
-        "intermediate_size": 8,
-        "num_hidden_layers": 1,
-        "num_local_experts": 4,
-        "num_experts_per_tok": 2,
-        "head_dim": 4,
-        "num_attention_heads": 2,
-        "num_key_value_heads": 1,
-        "sliding_window": 2,
-        "max_position_embeddings": 32,
-        "default_n_ctx": 32,
-        "pad_token_id": 31,
-        "eos_token_id": 31,
-        "num_labels": 5,
-        "id2label": LABELS,
-        "attention_chunk_size": 3,
-        "moe_chunk_size": 3,
-    }
+    values = _extraction_config("openai_privacy_filter")
     values.update(overrides)
     return PrivacyConfig(**values)
 
@@ -437,17 +416,7 @@ BIO_LABELS = {0: "O", 1: "B-NAME", 2: "I-NAME", 3: "B-PHONE", 4: "I-PHONE"}
 
 
 def _bert_token_config(**overrides):
-    values = {
-        "model_type": "bert",
-        "vocab_size": 64,
-        "hidden_size": 64,
-        "num_hidden_layers": 2,
-        "num_attention_heads": 4,
-        "intermediate_size": 128,
-        "max_position_embeddings": 32,
-        "num_labels": len(BIO_LABELS),
-        "id2label": BIO_LABELS,
-    }
+    values = copy.deepcopy(EXTRACTION_DATA["shared_configs"]["bert_token_classifier"])
     values.update(overrides)
     return values
 
@@ -505,7 +474,6 @@ def _write_bert_token_checkpoint(root):
     mx.save_safetensors(
         str(root / "model.safetensors"), dict(tree_flatten(model.parameters()))
     )
-    config["id2label"] = {str(k): v for k, v in BIO_LABELS.items()}
     config["quantization"] = {
         "group_size": 32,
         "bits": 4,
@@ -700,43 +668,28 @@ class TestSapiens2(unittest.TestCase):
             "pointmap": "Sapiens2ForPointmapEstimation",
             "matting": "Sapiens2ForImageMatting",
         }
-        args = dict(
-            architectures=[archs[task]],
-            hidden_size=64,
-            num_hidden_layers=3,
-            num_attention_heads=4,
-            num_first_full_attention_layers=1,
-            num_last_full_attention_layers=1,
-            intermediate_size=128,
-            image_size=[32, 24],
-            patch_size=8,
-            num_register_tokens=2,
-        )
+        args = _extraction_config("sapiens2")
+        args["architectures"] = [archs[task]]
         args.update(overrides)
         return ModelConfig(**args)
 
     def _deconv_head(self, **kw):
         from mlx_vlm.models.sapiens2.config import HeadConfig
 
-        return HeadConfig(
-            upsample_out_channels=[32, 16],
-            upsample_kernel_sizes=[4, 4],
-            conv_out_channels=[8],
-            conv_kernel_sizes=[1],
-            **kw,
+        values = copy.deepcopy(
+            EXTRACTION_DATA["shared_configs"]["sapiens2_deconv_head"]
         )
+        values.update(kw)
+        return HeadConfig(**values)
 
     def _pixel_shuffle_head(self, **kw):
         from mlx_vlm.models.sapiens2.config import HeadConfig
 
-        return HeadConfig(
-            upsample_out_channels=[32, 16, 8],
-            upsample_kernel_sizes=[3, 3, 3],
-            conv_out_channels=[8],
-            conv_kernel_sizes=[3],
-            use_pixel_shuffle=True,
-            **kw,
+        values = copy.deepcopy(
+            EXTRACTION_DATA["shared_configs"]["sapiens2_pixel_shuffle_head"]
         )
+        values.update(kw)
+        return HeadConfig(**values)
 
     def _predictor(self, task, head_config, num_labels, **overrides):
         from mlx_vlm.models.sapiens2.generate import Sapiens2Predictor
@@ -750,19 +703,6 @@ class TestSapiens2(unittest.TestCase):
     @staticmethod
     def _image(h=40, w=30):
         return np.random.default_rng(0).integers(0, 255, (h, w, 3), np.uint8)
-
-    def test_registry_exposes_model(self):
-        """The package resolves through the shared loader like other models."""
-        import dataclasses
-
-        from mlx_vlm.utils import get_model_and_args
-
-        model_module, model_type = get_model_and_args({"model_type": "sapiens2"})
-        self.assertEqual(model_type, "sapiens2")
-        config = model_module.ModelConfig.from_dict(
-            dataclasses.asdict(self._tiny_config())
-        )
-        self.assertIsInstance(model_module.Model(config), model_module.Model)
 
     def test_config_from_hf_dict(self):
         """from_dict parses an official-style config.json (nested head_config,
@@ -798,16 +738,6 @@ class TestSapiens2(unittest.TestCase):
         self.assertEqual(config.kv_heads_per_layer, [4, 2, 4])
         explicit = self._tiny_config(num_key_value_heads_per_layer=[4, 4, 4])
         self.assertEqual(explicit.kv_heads_per_layer, [4, 4, 4])
-
-    def test_backbone_shapes(self):
-        """Tokens include 1 cls + R register + H*W/patch^2 patch tokens."""
-        from mlx_vlm.models.sapiens2.sapiens2 import Model
-
-        model = Model(self._tiny_config())
-        out = model(mx.random.normal((2, 32, 24, 3)))
-        # grid 4x3 = 12 patches + 3 prefix tokens
-        self.assertEqual(out["last_hidden_state"].shape, (2, 15, 64))
-        self.assertEqual(out["pooler_output"].shape, (2, 64))
 
     def test_deconv_head_shapes(self):
         """Seg/pose heads upsample x2 per deconv block."""
@@ -903,30 +833,17 @@ class TestSapiens2(unittest.TestCase):
         self.assertTrue(expected.issubset(keys))
 
     def test_sanitize_relays_conv_weights(self):
-        """sanitize converts torch conv layouts and prefixes bare backbone keys."""
         from mlx_vlm.models.sapiens2.sapiens2 import Model
 
-        config = self._tiny_config(
-            "seg", head_config=self._deconv_head(), num_labels=29
+        model = Model(
+            self._tiny_config("seg", head_config=self._deconv_head(), num_labels=29)
         )
-        model = Model(config)
-        params = dict(tree_flatten(model.parameters()))
-
-        weights = {}
-        for k, v in params.items():
-            if k.endswith("projection.weight"):
-                weights[k] = mx.zeros((v.shape[0], v.shape[3], 8, 8))  # torch Conv2d
-            elif "deconv_layers" in k:
-                weights[k] = mx.zeros((v.shape[3], v.shape[0], 4, 4))  # torch ConvT
-            else:
-                weights[k] = v
-        sanitized = model.sanitize(weights)
-        for k, v in sanitized.items():
-            self.assertEqual(v.shape, params[k].shape, f"{k} not relayed out correctly")
-
-        # bare (pretrain-style) keys get the backbone. prefix
-        bare = model.sanitize({"patch_embed.projection.bias": mx.zeros((64,))})
-        self.assertIn("backbone.patch_embed.projection.bias", bare)
+        _check_conv_checkpoint(model, ("decode_head.deconv_layers",))
+        value = mx.arange(64, dtype=mx.float32)
+        _assert_weights_equal(
+            model.sanitize({"patch_embed.projection.bias": value}),
+            {"backbone.patch_embed.projection.bias": value},
+        )
 
     def test_pixel_shuffle_matches_torch_layout(self):
         """Channel-last PixelShuffle equals torch's channel-last view."""
@@ -990,13 +907,14 @@ class TestSapiens2(unittest.TestCase):
                 "backbone.blocks.1.attn.wqkv.bias",
             },
         )
-        w = np.array(out["backbone.blocks.1.attn.wqkv.weight"])
-        self.assertEqual(w.shape, (d + 2 * kv, 64))
-        self.assertTrue((w[:d] == 1).all() and (w[d : d + kv] == 2).all())
-        self.assertTrue((w[d + kv :] == 3).all())
-        # already-merged keys pass through
-        again = model.sanitize(out)
-        self.assertEqual(set(again), set(out))
+        expected = {
+            f"backbone.blocks.1.attn.wqkv.{kind}": mx.concatenate(
+                [parts[part][index] for part in ("q", "k", "v")]
+            )
+            for index, kind in enumerate(("weight", "bias"))
+        }
+        _assert_weights_equal(out, expected)
+        _assert_weights_equal(model.sanitize(dict(out)), out)
 
     def test_sanitize_unifies_mixed_dtypes(self):
         """A bf16 checkpoint with float32 norms/biases loads as all-bf16."""
@@ -1008,7 +926,10 @@ class TestSapiens2(unittest.TestCase):
             keep = k.endswith((".bias", "ln1.weight", "ln2.weight"))
             weights[k] = v.astype(mx.float32 if keep else mx.bfloat16)
         out = model.sanitize(weights)
-        self.assertTrue(all(v.dtype == mx.bfloat16 for v in out.values()))
+        _assert_weights_equal(
+            out, {k: v.astype(mx.bfloat16) for k, v in weights.items()}
+        )
+        _assert_weights_equal(model.sanitize(dict(out)), out)
         # single-dtype checkpoints are left alone
         out32 = model.sanitize(dict(tree_flatten(model.parameters())))
         self.assertTrue(all(v.dtype == mx.float32 for v in out32.values()))
@@ -1133,7 +1054,8 @@ class TestSapiens2(unittest.TestCase):
                 dr[border:-border, border:-border] = hm[k]
                 dr = cv2.GaussianBlur(dr, (kernel, kernel), 0)
                 blurred[k] = dr[border:-border, border:-border]
-                blurred[k] *= origin_max / blurred[k].max()
+                if origin_max > 0:
+                    blurred[k] *= origin_max / blurred[k].max()
             np.log(np.clip(blurred, 1e-3, 50.0), blurred)
             pad = np.pad(blurred, ((0, 0), (1, 1), (1, 1)), mode="edge")
             out = locs.copy()
@@ -1339,83 +1261,18 @@ class TestSAM3DObjects(unittest.TestCase):
     def _config(self, **overrides):
         from mlx_vlm.models.sam3d_objects import ModelConfig
 
-        args = dict(
-            hidden_size=32,
-            num_heads=4,
-            num_blocks=1,
-            cond_channels=32,
-            latent_resolution=2,
-            resolution=8,
-            io_channels=8,
-            decoder_channels=32,
-            decoder_heads=4,
-            decoder_blocks=2,
-            window_size=2,
-            structure_channels=[32, 16, 8],
-            structure_res_blocks=1,
-            dino_hidden_size=32,
-            dino_heads=4,
-            dino_layers=1,
-            dino_image_size=28,
-            image_size=28,
-            point_size=16,
-            point_patch_size=4,
-            point_channels=32,
-            point_heads=4,
-            ss_steps=2,
-            slat_steps=2,
-        )
+        args = _extraction_config("sam3d_objects")
         args.update(overrides)
         return ModelConfig(**args)
 
     @staticmethod
     def _depth_config():
         """A tiny MoGe-3 configuration in the bundle's ``config.json`` form."""
-        import dataclasses
+        from dataclasses import asdict
 
-        from mlx_vlm.models.moge3.config import (
-            ConvStackConfig,
-            EncoderConfig,
-            ModelConfig,
-            RefinerConfig,
-            ScaleHeadConfig,
-        )
+        from mlx_vlm.models.moge3.config import ModelConfig
 
-        dims = [16, 8, 4]
-
-        def stack(dim_in, dim_out=None):
-            return ConvStackConfig(
-                dim_in=dim_in,
-                dim_res_blocks=list(dims),
-                dim_out=dim_out,
-                num_res_blocks=[0, 1, 0],
-                res_block_in_norm="none",
-                res_block_hidden_norm="none",
-                resamplers=["conv_transpose", "bilinear"],
-            )
-
-        config = ModelConfig(
-            encoder=EncoderConfig(
-                backbone="dinov2_vits14",
-                intermediate_layers=[0, 1],
-                dim_out=16,
-                depth=2,
-                embed_dim=32,
-                num_heads=4,
-            ),
-            neck=stack([18, 2, 2]),
-            points_head=stack(list(dims), [None, None, 3]),
-            mask_head=stack(list(dims), [None, None, 1]),
-            normal_head=None,
-            scale_head=ScaleHeadConfig(dims=[32, 16, 1]),
-            refiner=RefinerConfig(
-                encoder_channels=18,
-                model_channels=[8, 16, 32],
-                downsample_factors=[2, 2],
-                encoder_downsample=4,
-            ),
-        )
-        return dataclasses.asdict(config)
+        return asdict(ModelConfig.from_dict(_extraction_config("moge3")))
 
     @staticmethod
     def _cutout(height=48, width=64):
@@ -2002,3 +1859,286 @@ class TestSAM3DObjects(unittest.TestCase):
                     "f 1 2 3",
                 ],
             )
+
+
+def _extraction_model(name):
+    module = importlib.import_module(
+        f"mlx_vlm.models.{EXTRACTION_CASES[name]['module']}"
+    )
+    model = module.Model(module.ModelConfig.from_dict(_extraction_config(name)))
+    model.eval()
+    return model
+
+
+def _assert_weights_equal(actual, expected):
+    assert actual.keys() == expected.keys()
+    for key, value in expected.items():
+        assert actual[key].shape == value.shape, key
+        assert actual[key].dtype == value.dtype, key
+        assert mx.array_equal(actual[key], value).item(), key
+
+
+def _check_conv_checkpoint(model, transpose_convs=()):
+    expected = dict(tree_flatten(model.parameters()))
+    source = {}
+    for key, value in expected.items():
+        if value.ndim == 4:
+            value = mx.arange(value.size, dtype=value.dtype).reshape(value.shape)
+            expected[key] = value
+            axes = (3, 0, 1, 2) if key.startswith(transpose_convs) else (0, 3, 1, 2)
+            source[key] = value.transpose(*axes)
+        else:
+            source[key] = value
+    converted = model.sanitize(source)
+    _assert_weights_equal(converted, expected)
+    _assert_weights_equal(model.sanitize(dict(converted)), converted)
+
+
+class ExtractionChecks:
+    def decision_models(self, case):
+        import string
+        from dataclasses import asdict
+
+        from tokenizers import Tokenizer, models, pre_tokenizers
+        from transformers import PreTrainedTokenizerFast
+
+        from mlx_vlm import load, predict
+
+        model = _extraction_model(case["id"])
+        state = case["decision_models"]["state"]
+        questions = case["decision_models"]["questions"]
+
+        labels = list(string.ascii_uppercase) + [
+            a + b for a in string.ascii_uppercase for b in string.ascii_uppercase
+        ]
+        tokens = ["[UNK]", "[PAD]", "[CLS]", "[SEP]", "[MASK]", *labels[:255]]
+        backend = Tokenizer(
+            models.WordLevel(dict(zip(tokens, range(len(tokens)))), unk_token="[UNK]")
+        )
+        backend.pre_tokenizer = pre_tokenizers.Whitespace()
+        processor = PreTrainedTokenizerFast(
+            tokenizer_object=backend,
+            unk_token="[UNK]",
+            pad_token="[PAD]",
+            cls_token="[CLS]",
+            sep_token="[SEP]",
+            mask_token="[MASK]",
+        )
+        expected = predict(model, processor, state, questions)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config.json").write_text(json.dumps(asdict(model.config)))
+            processor.save_pretrained(root)
+            mx.save_safetensors(
+                str(root / "model.safetensors"), dict(tree_flatten(model.parameters()))
+            )
+            loaded, tokenizer = load(directory)
+            actual = predict(loaded, tokenizer, state, questions)
+            assert actual["answers"] == expected["answers"]
+            assert actual.get("usage") == expected.get("usage")
+        assert set(expected["answers"]) == set(questions)
+        for name, answer in expected["answers"].items():
+            question = questions[name]
+            kind = question["type"]
+            assert answer["type"] == kind
+            if kind == "choice":
+                assert answer["value"] in question["criteria"]
+            elif kind == "score":
+                assert 0 <= answer["value"] <= len(question["criteria"]) - 1
+            elif kind == "bool":
+                assert isinstance(answer["value"], bool)
+                assert 0 <= answer["probability"] <= 1
+            elif kind == "multi_label":
+                assert set(answer["value"]) <= set(question["criteria"])
+            if "probabilities" in answer:
+                assert sum(answer["probabilities"].values()) == pytest.approx(
+                    1, abs=1e-3
+                )
+        with pytest.raises(ValueError, match="does not support"):
+            predict(model, processor, state, {"invalid": {"type": "unknown"}})
+
+    def registry_and_config(self, case):
+        name = case["module"]
+        module = importlib.import_module(f"mlx_vlm.models.{name}")
+        resolved, model_type = get_model_and_args({"model_type": name})
+        assert resolved is module and model_type == name
+        config = module.ModelConfig.from_dict(copy.deepcopy(case["config"]))
+        assert isinstance(config, module.ModelConfig)
+
+    def forward(self, case):
+        name = case["id"]
+        mx.random.seed(0)
+        output = _extraction_model(name)(mx.random.normal(case["input_shape"]))
+        expected = case["output_shapes"]
+        if not isinstance(expected, dict):
+            output, expected = {"output": output}, {"output": expected}
+        for key, shape in expected.items():
+            assert output[key].shape == tuple(shape)
+            assert output[key].dtype == mx.float32
+            assert mx.all(mx.isfinite(output[key])).item()
+
+    def checkpoint(self, case):
+        name = case["id"]
+        model = _extraction_model(name)
+        weights = dict(tree_flatten(model.parameters()))
+        _assert_weights_equal(model.sanitize(dict(weights)), weights)
+        once = model.sanitize(dict(weights))
+        _assert_weights_equal(model.sanitize(dict(once)), once)
+
+
+@pytest.mark.parametrize("case", EXTRACTION_DATA["cases"], ids=lambda case: case["id"])
+def test_extraction_contract(case):
+    checks = ExtractionChecks()
+    for kind in case["checks"]:
+        getattr(checks, kind)(case)
+
+
+def test_video_depth_anything_conv_checkpoint():
+    _check_conv_checkpoint(
+        _extraction_model("video_depth_anything"),
+        ("head.resize_layers.0", "head.resize_layers.1"),
+    )
+
+
+def test_video_depth_anything_rejects_unknown_encoder():
+    from mlx_vlm.models.video_depth_anything import ModelConfig
+
+    with pytest.raises(ValueError):
+        ModelConfig(encoder="vitxl")
+
+
+class TestLayaDecisionModel(unittest.TestCase):
+    def test_checkpoint_conversion(self):
+        model = _extraction_model("laya")
+        expected = {
+            key: mx.arange(value.size, dtype=value.dtype).reshape(value.shape)
+            for key, value in tree_flatten(model.parameters())
+        }
+        source = dict(expected)
+        for i in range(model.config.head_layers):
+            prefix = f"head.layers.{i}"
+            for suffix in ("weight", "bias"):
+                parts = []
+                for offset, name in enumerate(("query_proj", "key_proj", "value_proj")):
+                    key = f"{prefix}.attention.{name}.{suffix}"
+                    expected[key] = source.pop(key) + offset * expected[key].size
+                    parts.append(expected[key])
+                source[f"{prefix}.self_attn.in_proj_{suffix}"] = mx.concatenate(parts)
+                source[f"{prefix}.self_attn.out_proj.{suffix}"] = source.pop(
+                    f"{prefix}.attention.out_proj.{suffix}"
+                )
+        for key in list(source):
+            if key.startswith(("scorer.layers.", "act_head.layers.")):
+                source[key.replace(".layers.", ".")] = source.pop(key)
+        converted = model.sanitize(source)
+        _assert_weights_equal(converted, expected)
+        _assert_weights_equal(model.sanitize(dict(converted)), expected)
+        model.load_weights(list(converted.items()), strict=True)
+
+    def test_padding_does_not_change_option_logits(self):
+        model = _extraction_model("laya")
+        single, _ = model(
+            mx.array([[1, 2, 3]]),
+            mx.array([[1, 1, 1]]),
+            mx.array([[1, 2]]),
+            mx.array([[True, True]]),
+            mx.array([0]),
+        )
+        batch, _ = model(
+            mx.array([[1, 2, 3, 0, 0], [1, 4, 5, 6, 7]]),
+            mx.array([[1, 1, 1, 0, 0], [1, 1, 1, 1, 1]]),
+            mx.array([[1, 2], [2, 3]]),
+            mx.array([[True, True], [True, True]]),
+            mx.array([0, 2]),
+        )
+        np.testing.assert_allclose(
+            np.asarray(single[0]), np.asarray(batch[0]), atol=2e-5
+        )
+
+    def test_activations_match_reference(self):
+        model = _extraction_model("laya")
+        values = [-3.0, -1.0, 0.0, 0.5, 2.0]
+        x = mx.array(values)
+        gelu = mx.array([v * (1 + math.erf(v / math.sqrt(2))) / 2 for v in values])
+        self.assertTrue(
+            mx.array_equal(model.head.layers[0].activation(x), mx.maximum(x, 0))
+        )
+        for activation in (model.scorer.layers[2], model.act_head.layers[1]):
+            self.assertTrue(mx.allclose(activation(x), gelu, atol=1e-7))
+
+    def test_criterion_rendering_matches_reference(self):
+        from mlx_vlm.models.laya.laya import _options
+
+        cases = [
+            (
+                {
+                    "type": "choice",
+                    "criteria": {
+                        "zero": 0,
+                        "false": False,
+                        "empty": "",
+                        "none": None,
+                        "object": {"é": True},
+                        "list": [0, False],
+                    },
+                },
+                [
+                    "zero: 0",
+                    "false: false",
+                    "empty",
+                    "none",
+                    'object: {"é": true}',
+                    "list: [0, false]",
+                ],
+            ),
+            (
+                {"type": "score", "criteria": [{"é": True}, [0, False]]},
+                ['level 0: {"é": true}', "level 1: [0, false]"],
+            ),
+            (
+                {"type": "noul", "criteria": {"false": 0, "true": False}},
+                ["false: 0", "true: false"],
+            ),
+            (
+                {
+                    "type": "noul",
+                    "criteria": {"false": {"é": True}, "true": [0, False]},
+                },
+                ['false: {"é": true}', "true: [0, false]"],
+            ),
+        ]
+        for question, expected in cases:
+            with self.subTest(question=question):
+                self.assertEqual(_options(question)[1], expected)
+
+    def test_calibrated_probabilities_match_reference(self):
+        from mlx_vlm.models.laya.laya import Laya
+
+        for temperature, effective in [
+            (0.1, 0.5),
+            (10, 5),
+            (2, 2),
+            ("nan", 1),
+            ("inf", 1),
+            (None, 1),
+            ("invalid", 1),
+        ]:
+            for bucket in (False, True):
+                with self.subTest(temperature=temperature, bucket=bucket):
+                    settings = {"temperature": [temperature] * 3}
+                    if bucket:
+                        settings.update(
+                            temperature=[1.0] * 3,
+                            temperature_by_options={"choice:2": temperature},
+                        )
+                    model = MagicMock(config=SimpleNamespace(decision_config=settings))
+                    model.return_value = (mx.array([[0.0, 1.0]]), mx.zeros((1, 2)))
+                    adapter = Laya(model, SimpleNamespace(pad_token_id=0))
+                    adapter._sequence = lambda *args: ([1, 2], [0, 1])
+                    result = adapter.predict(
+                        "text", {"route": {"type": "choice", "criteria": ["A", "B"]}}
+                    )
+                    expected = round(1 / (1 + math.exp(-1 / effective)), 4)
+                    self.assertEqual(
+                        result["answers"]["route"]["probabilities"]["B"], expected
+                    )

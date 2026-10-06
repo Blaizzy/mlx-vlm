@@ -1129,3 +1129,29 @@ def test_diffusion_gemma_load_config_preserves_generation_config(tmp_path):
     assert loaded["model_type"] == "diffusion_gemma"
     assert loaded["generation_config"] == generation_config
     assert ModelConfig.from_dict(loaded).generation_config == generation_config
+
+
+@pytest.mark.parametrize("family", ["llada2_moe", "nemotron_labs_diffusion"])
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+def test_diffusion_top_p_sums_probability_mass_in_float32(family, dtype):
+    import importlib
+
+    language = importlib.import_module(f"mlx_vlm.models.{family}.language")
+    top_p_logits = language.LanguageModel._top_p_logits
+
+    # One likely token and 4095 unlikely ones. A float16 or bfloat16 running
+    # sum stops growing long before it reaches top_p, which kept every token.
+    vocab_size, top_logit, top_p = 4096, 8.0, 0.9
+    logits = mx.zeros((1, vocab_size)).at[0, 0].add(top_logit).astype(dtype)
+    top_prob = math.exp(top_logit) / (math.exp(top_logit) + vocab_size - 1)
+    small_prob = (1.0 - top_prob) / (vocab_size - 1)
+    expected = 1 + math.floor((top_p - top_prob) / small_prob) + 1
+
+    filtered = top_p_logits(logits, top_p)
+    kept = filtered > mx.finfo(dtype).min
+    assert filtered.dtype == dtype
+    assert kept.sum().item() == expected
+    assert kept[0, 0].item()
+
+    tiny = top_p_logits(logits, 1e-8) > mx.finfo(dtype).min
+    assert tiny.tolist()[0] == [True] + [False] * (vocab_size - 1)

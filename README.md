@@ -509,6 +509,37 @@ output = generate(model, processor, formatted_prompt, image, audio=audio, verbos
 print(output)
 ```
 
+
+### Decision models
+
+Run shared typed decision prediction from the CLI:
+
+```sh
+python -m mlx_vlm decide --model nativ-community/decider-2b \
+  --state "Please refund my duplicate charge" \
+  --questions '{"department":{"type":"choice","instructions":"Which team should handle this ticket?","criteria":["billing","technical","sales"]}}'
+```
+
+Use `--state-file request.txt` for UTF-8 text and `--questions-file questions.json`
+for named questions. `mlx_vlm.decide` runs the same command.
+
+Preload a decision model in the existing server:
+
+```sh
+python -m mlx_vlm server --decision-model nativ-community/decider-2b
+curl http://localhost:8080/v1/decisions \
+  -H 'Content-Type: application/json' \
+  -d '{"state":"Please refund my duplicate charge","questions":{"department":{"type":"choice","instructions":"Which team should handle this ticket?","criteria":["billing","technical","sales"]}}}'
+```
+
+An explicit `model` in the request selects a checkpoint; otherwise the currently
+loaded decision model is used. Without either, the endpoint returns HTTP 400.
+Decision requests are non-streaming and use the server's API-key authentication.
+
+Both interfaces return the shared `predict()` result and preserve model-specific
+scoring. Decider and Laya support `choice`, `bool`, and `score`; consult each
+model's README for criteria and calibration details.
+
 ### Server (FastAPI)
 
 Start the server:
@@ -554,6 +585,7 @@ mlx_vlm.server --model-dir /Volumes/Models --model-dir ~/my-custom-model
 - `--tts-model`: Preload a text-to-speech model at server startup
 - `--stt-model`: Preload a speech-to-text model at server startup
 - `--embedding-model`: Preload an embedding model at server startup
+- `--decision-model`: Preload a decision model at server startup
 - `--reranker-model`: Preload a supported reranker model at server startup
 - `--model-dir`: Additional model folder or parent containing model folders to include in discovery; repeat for multiple paths. Overrides `MLX_VLM_MODEL_PATHS` (paths separated by `os.pathsep`, `:` on macOS/Linux)
 - `--adapter-path`: Path for adapter weights to use with the preloaded model
@@ -1248,7 +1280,9 @@ Structured outputs are not currently supported with speculative decoding.
 - `/models` and `/v1/models` - Discover cached and local models, including their loaded status; accepts repeated `model_dir` query parameters
 - `/chat/completions` and `/v1/chat/completions` - OpenAI-compatible chat-style interaction endpoint with support for images, audio, and text
 - `/responses` and `/v1/responses` - OpenAI-compatible responses endpoint
+- `/responses/compact` and `/v1/responses/compact` - Compact conversation history into replayable state; see [compaction and APC](docs/usage.md#conversation-compaction-and-apc)
 - `/embeddings` and `/v1/embeddings` - OpenAI-compatible embeddings endpoint backed by native MLX embedding models
+- `/v1/decisions` - Predict named typed decisions using the shared decision API
 - `/v1/rerank` - Rank text or multimodal documents by relevance to a query
 - `/audio/speech` and `/v1/audio/speech` - OpenAI-compatible text-to-speech endpoint backed by `mlx-audio` TTS models
 - `/audio/transcriptions` and `/v1/audio/transcriptions` - OpenAI-compatible speech-to-text endpoint backed by `mlx-audio` STT models

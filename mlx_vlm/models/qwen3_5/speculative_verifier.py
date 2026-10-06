@@ -195,6 +195,7 @@ class Qwen3_5BatchInvariantForward:
             )
             top_k = feed_forward.top_k
             indices = mx.argpartition(gates, kth=-top_k, axis=-1)[..., -top_k:]
+            indices = mx.stop_gradient(indices)
             scores = mx.take_along_axis(gates, indices, axis=-1)
             scores = scores / scores.sum(axis=-1, keepdims=True)
 
