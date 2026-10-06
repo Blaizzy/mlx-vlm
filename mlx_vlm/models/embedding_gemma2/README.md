@@ -147,8 +147,8 @@ bidirectional attention, the inclusive local-window boundary, explicit positions
 padding, media placement, disabled towers, and checkpoint sanitization/reloading:
 
 ```sh
-python -m pytest -q mlx_vlm/tests/test_embedding_gemma2.py \
-  mlx_vlm/tests/test_models.py mlx_vlm/tests/test_processors.py -k embedding_gemma2
+python -m pytest -q mlx_vlm/tests/test_models.py \
+  mlx_vlm/tests/test_processors.py -k embedding_gemma2
 ```
 
 Processor validation covers 49 cases across text, images, audio, video, mixed

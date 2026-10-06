@@ -5,6 +5,9 @@
       "id": "embedding_gemma2",
       "module": "embedding_gemma2",
       "config": {
+        "image_token_id": 60,
+        "audio_token_id": 61,
+        "video_token_id": 62,
         "text_config": {
           "vocab_size": 64,
           "hidden_size": 16,
