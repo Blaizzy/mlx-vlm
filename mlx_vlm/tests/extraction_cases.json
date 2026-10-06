@@ -415,6 +415,36 @@
       "checks": ["extraction_api"]
     },
     {
+      "id": "sam3d_body_api",
+      "module": "sam3d_body",
+      "config": {
+        "embed_dim": 64,
+        "depth": 2,
+        "num_heads": 4,
+        "head_dim": 16,
+        "patch_size": 16,
+        "image_size": [64, 48],
+        "decoder_dim": 64,
+        "decoder_depth": 1,
+        "decoder_heads": 2,
+        "decoder_head_dim": 32,
+        "decoder_mlp_dim": 64,
+        "prompt_embed_dim": 64,
+        "num_vertices": 64,
+        "num_faces": 32,
+        "num_shape_comps": 4,
+        "num_face_comps": 8,
+        "pose_output_dim": 414
+      },
+      "extraction_api": {
+        "task": "body",
+        "input_shape": [96, 96, 3],
+        "outputs": ["pred_vertices", "pred_keypoints_3d", "pred_camera"],
+        "index_weights": { "head_pose.body_model.joint_parents": -1 }
+      },
+      "checks": ["extraction_api"]
+    },
+    {
       "id": "yolo11",
       "module": "yolo11",
       "config": { "nc": 2 },

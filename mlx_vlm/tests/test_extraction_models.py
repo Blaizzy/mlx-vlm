@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import functools
 import importlib
 import io
 import json
@@ -1968,6 +1969,19 @@ class ExtractionChecks:
         module = importlib.import_module(f"mlx_vlm.models.{case['module']}")
         model = module.Model(module.ModelConfig.from_dict(config))
         model.eval()
+        # Index buffers carry structure, not numbers, so a zeroed one is not a
+        # valid skeleton; a case seeds them with a run from the given start.
+        for path, start in (spec.get("index_weights") or {}).items():
+            *owners, leaf = path.split(".")
+            owner = functools.reduce(getattr, owners, model)
+            buffer = getattr(owner, leaf)
+            setattr(
+                owner,
+                leaf,
+                mx.arange(start, start + buffer.size, dtype=buffer.dtype).reshape(
+                    buffer.shape
+                ),
+            )
         processor = None
         if spec.get("processor"):
             where, _, name = spec["processor"].rpartition(".")
@@ -2445,9 +2459,9 @@ class TestExtractionCLI(unittest.TestCase):
 class TestExtractionCoverage(unittest.TestCase):
     """Every model that declares tasks is reachable through the shared API."""
 
-    # sam3 and sam3_1 tokenize their prompt with CLIP and sam3d_body runs its
-    # predictor over a real crop, so none of the three fits a random-weight case.
-    UNCASED = {"sam3", "sam3_1", "sam3d_body"}
+    # sam3 and sam3_1 tokenize their prompt with CLIP, which a random-weight
+    # case has no vocabulary for.
+    UNCASED = {"sam3", "sam3_1"}
 
     @staticmethod
     def _declared():
@@ -2550,12 +2564,14 @@ class TestExtractionPredictorWiring(unittest.TestCase):
             second = list(inspect.signature(predictor.__init__).parameters)[2]
             self.assertEqual(second, "processor", predictor.__name__)
 
-    def test_sam3d_body_preprocesses_with_the_processor_then_the_config(self):
+    def test_sam3d_body_preprocesses_at_the_size_the_ray_grid_assumes(self):
         from mlx_vlm.models.sam3d_body import processing_sam3d_body
-        from mlx_vlm.models.sam3d_body.config import SAM3DConfig
 
-        model = _extraction_model("sam3d_body")
-        processor = processing_sam3d_body.SAM3DBodyProcessor(image_size=(64, 48))
+        # apply_ray_conditioning reshapes the ray map to the patch grid implied
+        # by config.image_size, so preprocessing cannot follow a processor that
+        # disagrees with the checkpoint.
+        model = _extraction_model("sam3d_body_api")
+        processor = processing_sam3d_body.SAM3DBodyProcessor(image_size=(512, 384))
         image = np.zeros((96, 96, 3), dtype=np.uint8)
 
         seen = []
@@ -2563,7 +2579,7 @@ class TestExtractionPredictorWiring(unittest.TestCase):
         original = predictor.SAM3DPredictor.predict
 
         def record(self, *args, **kwargs):
-            seen.append(self.config.image_size)
+            seen.append(tuple(self.config.image_size))
             raise _Stop
 
         predictor.SAM3DPredictor.predict = record
@@ -2574,8 +2590,7 @@ class TestExtractionPredictorWiring(unittest.TestCase):
         finally:
             predictor.SAM3DPredictor.predict = original
 
-        self.assertEqual(seen[0], (64, 48))
-        self.assertEqual(tuple(seen[1]), tuple(SAM3DConfig().image_size))
+        self.assertEqual(seen, [(64, 48), (64, 48)])
 
 
 class TestExtractionCLIOutputs(unittest.TestCase):
