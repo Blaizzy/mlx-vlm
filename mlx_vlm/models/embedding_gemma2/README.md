@@ -18,15 +18,11 @@ and audio components.
 
 ```python
 import mlx.core as mx
-from transformers import AutoTokenizer
 
-from mlx_vlm.embedding_loader import load_embedding_model
-from mlx_vlm.utils import get_model_path
+from mlx_vlm import load
 
-path = get_model_path("google/embeddinggemma-2")
-model = load_embedding_model(path)
-tokenizer = AutoTokenizer.from_pretrained(path)
-inputs = tokenizer(
+model, processor = load("google/embeddinggemma-2")
+inputs = processor.tokenizer(
     [
         "task: search result | query: Which planet is known as the Red Planet?",
         "title: none | text: Venus is often called Earth's twin because of its similar size and proximity.",
@@ -87,8 +83,10 @@ Mismatched expanded media-token and feature counts raise an error.
 ## Selective tower loading and conversion
 
 ```python
-from mlx_vlm.utils import load_config
+from mlx_vlm.embedding_loader import load_embedding_model
+from mlx_vlm.utils import get_model_path, load_config
 
+path = get_model_path("google/embeddinggemma-2")
 config = load_config(path)
 config["audio_config"] = None
 config["vision_config"] = None  # Omit this assignment to retain images/video.
