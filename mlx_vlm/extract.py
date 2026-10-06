@@ -3,6 +3,7 @@
 import argparse
 import ast
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -116,6 +117,22 @@ def _manifest(task, outputs):
     return manifest
 
 
+def _usage_hint(error, sources, images):
+    """Explain a TypeError the model raised in terms of the flags behind it."""
+    named = re.search(r"unexpected keyword argument '([^']+)'", str(error))
+    if named:
+        name = named.group(1)
+        flag = sources.get(name, "--set")
+        if flag == "--prompt":
+            return f"{error}; this model does not take --prompt"
+        return f"{error}; {flag} {name!r} is not a keyword this model takes"
+    if images and len(images) > 1:
+        return f"{error}; {len(images)} images were given and this model reads one"
+    if sources:
+        return f"{error}; check the values given for {', '.join(sorted(sources))}"
+    return str(error)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Predict structured outputs with MLX-VLM extraction models"
@@ -123,7 +140,10 @@ def main(argv=None):
     parser.add_argument("--model", required=True, help="Model path or Hugging Face ID")
     source = parser.add_mutually_exclusive_group()
     source.add_argument(
-        "--image", type=Path, action="append", help="Image path, repeatable for frames"
+        "--image",
+        type=Path,
+        action="append",
+        help="Image path, repeatable for models that read a sequence of frames",
     )
     source.add_argument("--video", type=Path, help="Video path (requires cv2)")
     parser.add_argument(
@@ -176,20 +196,22 @@ def main(argv=None):
 
     try:
         extra = _parse_settings(args.set, parser)
+        sources = dict.fromkeys(extra, "--set")
         for name, value in _parse_input_files(args.set_file, parser).items():
             if name in extra:
                 parser.error(f"{name} given by both --set and --set-file")
             extra[name] = value
+            sources[name] = "--set-file"
         if args.prompt is not None:
             extra["text_prompt"] = args.prompt
+            sources["text_prompt"] = "--prompt"
         outputs = extract(model, processor, inputs, task=args.task, **extra)
     except ValueError as error:
         parser.error(str(error))
     except TypeError as error:
-        # A mistyped --set name reaches the predictor as an unknown keyword.
-        if "unexpected keyword argument" not in str(error):
-            raise
-        parser.error(f"{error}; this model does not take that --set name")
+        # Whatever the model rejects arrives here: an unknown keyword, an input
+        # of the wrong rank, a --set value of the wrong type.
+        parser.error(_usage_hint(error, sources, args.image))
 
     task = args.task if args.task is not None else tasks[0]
     if args.output is not None:
