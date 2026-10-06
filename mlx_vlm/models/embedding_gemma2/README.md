@@ -1,47 +1,195 @@
 # EmbeddingGemma 2
 
-Multimodal embeddings for text, images, audio, video, and composed inputs on
-Apple Silicon. Outputs are normalized 768-dimensional vectors, with Matryoshka
-support for 128, 256, and 512 dimensions.
+Native MLX embeddings for `nativ-community/embeddinggemma-2`: text, images, audio,
+video, and combinations of these modalities in a shared 768-dimensional space.
+The bidirectional encoder uses alternating local/full attention, projection-only
+per-layer inputs, and the Gemma 4 vision and audio towers.
 
-See the [examples notebook](../../../examples/embedding_gemma2.ipynb) for
-retrieval, batching, all four modalities, mixed inputs, and conversion.
+The model returns projected token representations in `last_hidden_state` and
+mask-aware mean-pooled, L2-normalized float32 vectors in `text_embeds`. Prompts
+and media tokens participate in pooling; padding does not.
 
-## Quick start
+For runnable examples covering retrieval, Matryoshka dimensions, all four
+modalities, and mixed batches, see the
+[EmbeddingGemma 2 notebook](../../../examples/embedding_gemma2.ipynb).
 
-Requires MLX >= 0.32.3 and Transformers >= 5.14.0. The local processor does not
-require Torch, TorchVision, TorchAudio, TorchCodec, or PyAV.
+## Setup
+
+The local processor works with Transformers >= 5.14.0. Images and video frames
+use NumPy/Pillow preprocessing; audio uses the NumPy Gemma 4 feature extractor.
+Media files use MLX-VLM's existing audio loader and OpenCV's bundled video
+libraries. On Apple Silicon with a compatible FFmpeg 7 bundle, video decoding
+uses packet timestamps for sampling and a Metal kernel for YUV-to-RGB conversion.
+Library versions are checked before native structures are accessed. Other
+builds and unsupported formats use the existing OpenCV decoder, with a warning
+that colors and frame timing may differ from the reference. Torch, TorchVision,
+TorchAudio, TorchCodec, and PyAV are not required; no dependencies are added.
+
+## Text retrieval and Matryoshka embeddings
 
 ```python
 import mlx.core as mx
+
 from mlx_vlm import load
 
 model, processor = load("nativ-community/embeddinggemma-2")
 inputs = processor.tokenizer(
     [
         "task: search result | query: Which planet is known as the Red Planet?",
-        "title: none | text: Venus is often called Earth's twin.",
-        "title: none | text: Mars is known as the Red Planet.",
+        "title: none | text: Venus is often called Earth's twin because of its similar size and proximity.",
+        "title: none | text: Mars, known for its reddish appearance, is often referred to as the Red Planet.",
     ],
     padding=True,
     return_tensors="np",
 )
 embeddings = model(**{key: mx.array(value) for key, value in inputs.items()}).text_embeds
-print(embeddings[:1] @ embeddings[1:].T)  # Cosine similarities
+print(embeddings[:1] @ embeddings[1:].T)
 
-# Optional: truncate and renormalize. Use the same dimension for all inputs.
+# Use the same dimension for queries and documents: 128, 256, 512, or 768.
 embeddings = embeddings[:, :256]
 embeddings /= mx.linalg.norm(embeddings, axis=-1, keepdims=True)
 ```
 
-For media, use `processor(...)` or `processor.apply_chat_template(...)` with
-`return_tensors="mlx"`, then call `model(**inputs).text_embeds`.
+Task prompts are optional. The checkpoint's `config_sentence_transformers.json`
+contains the prompt catalog. For native MLX calls, prepend the chosen prompt to
+plain text or supply it as a system message to the processor. Sentence
+Transformers itself runs the reference PyTorch model.
 
-## Notes
+## Multimodal inputs
 
-- Video uses Metal color conversion with compatible OpenCV-bundled FFmpeg 7
-  libraries. Unsupported builds and formats fall back to OpenCV; numerical
-  agreement with the reference can differ.
-- Conversion preserves the tokenizer, chat template, and processor settings.
-  Reload converted directories with the same `load` API.
-- BF16 and 8-bit passed numerical accuracy checks; standard 4-bit did not.
+`mlx_vlm.load` selects the local `EmbeddingGemma2Processor`. It expands media
+placeholders, computes patch positions and audio features, and samples video
+frames. Use `return_tensors="mlx"` to receive model-ready MLX arrays:
+
+```python
+from mlx_vlm import load
+
+model, processor = load("nativ-community/embeddinggemma-2")
+conversations = [
+    [
+        {"role": "system", "content": "title: none | text: "},
+        {"role": "user", "content": [
+            {"type": "text", "text": "A photo of a cat"},
+            {"type": "image", "url": "cat.jpg"},
+        ]},
+    ],
+    [{"role": "user", "content": [{"type": "audio", "url": "speech.wav"}]}],
+    [{"role": "user", "content": [{"type": "video", "url": "sample_video.mp4"}]}],
+]
+inputs = processor.apply_chat_template(
+    conversations, tokenize=True, return_dict=True, return_tensors="mlx"
+)
+embeddings = model(**inputs).text_embeds
+print(embeddings.shape)  # (3, 768)
+```
+
+The processor preserves content order and supports manual `<|image|>`,
+`<|audio|>`, and `<|video|>` placeholders for interleaving. Direct `processor(...)`
+calls support media-only and nested per-sample inputs. Pass `max_soft_tokens`
+(70, 140, 280, 560, or 1120) to control visual budgets; video also accepts `fps`,
+`max_frames`, `overflow_strategy`, and `add_timestamps`, as described in the
+[upstream documentation](https://huggingface.co/google/embeddinggemma-2/blob/main/embedding_gemma2_documentation.md).
+Mismatched expanded media-token and feature counts raise an error.
+
+## Selective tower loading and conversion
+
+```python
+from mlx_vlm.embedding_loader import load_embedding_model
+from mlx_vlm.utils import get_model_path, load_config
+
+path = get_model_path("nativ-community/embeddinggemma-2")
+config = load_config(path)
+config["audio_config"] = None
+config["vision_config"] = None  # Omit this assignment to retain images/video.
+text_model = load_embedding_model(path, config=config)
+```
+
+Unused tower weights are discarded during loading. The complete checkpoint can
+also be converted and reloaded with the standard CLI:
+
+```sh
+mlx_vlm.convert --hf-path nativ-community/embeddinggemma-2 \
+  --mlx-path embeddinggemma2-mlx --dtype bfloat16
+```
+
+Both `load_embedding_model` and `mlx_vlm.load` accept the converted directory.
+Conversion saves the tokenizer, chat template, image/audio/video settings, and
+processor configuration. `mlx_vlm.load` restores the local processor from these
+files, including when loading offline.
+
+## Performance and quantization
+
+BF16 and affine 4/6/8-bit were measured on Apple M5 Max. BF16 is fastest for text,
+image, and audio in these tests. 8-bit reduces full-model weight storage by
+17.1% with minimum embedding cosine 0.99966 against the float32 reference;
+plain 4-bit falls to 0.96716 and fails the documented accuracy limits.
+
+## Reference validation
+
+Validation uses checkpoint revision `fc77679a26fcb86250765859d04ce2fcc6cb0b2c`,
+extras revision `f6c512df20896fd06f85d39db10c45a0a9849ef8`, and the supplied
+Transformers 5.18.0.dev0 reference on CPU. The reference always runs in float32;
+MLX runs on an Apple M5 Max with float32 or BF16 weights/activations.
+
+With reference-preprocessed inputs, all **20 Python examples pass in both
+precisions**, with **32 paired forward comparisons per precision**. This covers
+both Sentence Transformers and AutoModel
+examples: retrieval, prompts, Matryoshka, single/composed modalities, ordering,
+manual interleaving, heterogeneous batches, selective towers, image budgets,
+video sampling/timestamps, and direct/nested processor calls. Processor-only
+examples are additionally forwarded through both models. All 128/256/512 prefixes
+are compared after renormalization on every forward pass.
+
+| MLX precision vs float32 reference | Max embedding absolute error | Min embedding cosine | Max token relative L2 error |
+| --- | ---: | ---: | ---: |
+| Float32 | 5.79e-07 | 0.99999999999 | 3.58e-05 |
+| BF16 | 0.00271 | 0.99979058879 | 0.167 |
+
+Unnormalized token states are more sensitive to BF16 rounding than the normalized
+sentence embeddings. Float32 comparisons disable MLX's default TF32 matmul on M5
+(`MLX_ENABLE_TF32=0`); the library does not change users' precision settings.
+BF16 conversion/reload produces bit-identical embeddings for text, image, audio,
+and video. A heterogeneous BF16 batch versus individual encoding has minimum
+cosine similarity 0.99997.
+
+Acceptance thresholds are cosine >=
+0.999999 / 0.999 and embedding max error <= 1e-5 / 0.01 for float32 / BF16,
+respectively; token relative L2 bounds are 1e-4 / 0.2. Unit regressions cover
+bidirectional attention, the inclusive local-window boundary, explicit positions,
+padding, media placement, disabled towers, and checkpoint sanitization/reloading:
+
+```sh
+python -m pytest -q mlx_vlm/tests/test_models.py \
+  mlx_vlm/tests/test_processors.py -k embedding_gemma2
+```
+
+Processor validation covers 49 cases across text, images, audio, video, mixed
+and nested batches, visual budgets, frame sampling, timestamps, and invalid
+inputs, with Torch packages absent and stock Transformers 5.14.0. Token IDs,
+masks, patch positions, frame counts, and tested audio features match the source
+exactly. Saving and reloading preserves processor outputs and settings.
+Full BF16 and 8-bit conversions preserve these settings and outputs across all
+modalities; BF16 embeddings are bit-identical before and after conversion.
+
+With the Metal video path, all **37 valid preprocessing comparisons pass**
+using the same BF16 model: minimum cosine **0.999886** and maximum embedding
+absolute error **0.001902**. These comparisons isolate preprocessing differences
+from model arithmetic.
+
+A separate 17-clip corpus covers H.264, MPEG-4, MJPEG, VP9, 10-bit HEVC, ProRes
+4:2:2, portrait/4K footage, full/limited range, and variable frame rate. All
+**51 cases** (three sampling policies per clip) pass against the float32
+Transformers reference at dimensions 128, 256, 512, and 768, with minimum cosine
+**0.999531** and maximum embedding absolute error **0.005486**. Frame indices,
+token IDs, masks, positions, and frame counts match in every case. Decoded RGB
+is byte-identical in 48 cases; the three HEVC cases have small color differences
+and still pass the embedding thresholds.
+
+These results use the normal loaded and saved/reloaded processor with OpenCV
+5.0.0.93's FFmpeg 7 libraries, MLX 0.32.3, and stock Transformers 5.14.0 on
+Apple M5 Max, with Torch packages and PyAV imports blocked. The frozen reference
+uses Transformers 5.18.0.dev0, TorchCodec 0.16.0, and FFmpeg 8.1.2. They are
+numerical parity checks on this corpus, not retrieval-quality measurements or
+a guarantee of parity on every decoder build. The Metal path handles supported
+planar 8/10-bit YUV with even frame dimensions; display transforms, interlacing,
+HDR, other layouts, URLs, and incompatible library builds fall back to OpenCV.
