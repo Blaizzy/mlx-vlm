@@ -14,27 +14,13 @@ stringified integer ids.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Union
 
 import mlx.core as mx
 import numpy as np
 
+from ...extraction import DetectionResult
 from .processing_rt_detr_v2 import ImageInput, RTDetrV2Processor
-
-
-@dataclass
-class DetectionResult:
-    """Per-image detection output.
-
-    Mirrors `mlx_vlm.models.rfdetr.generate.DetectionResult`.
-    """
-
-    boxes: np.ndarray  # (N, 4) xyxy pixel coordinates in the original image
-    scores: np.ndarray  # (N,) confidence scores in [0, 1]
-    labels: np.ndarray  # (N,) integer class ids
-    class_names: List[str] = field(default_factory=list)
-
 
 LabelMap = Union[Sequence[str], Dict[int, str], Dict[str, str]]
 

@@ -11,6 +11,7 @@ if __name__ == "__main__":
         "generate_video",
         "generate_audio",
         "convert",
+        "extract",
         "decide",
         "chat",
         "chat_ui",
