@@ -701,7 +701,7 @@ class LanguageModel(nn.Module):
 
             # Stack text experts (0 to num_text_experts-1) into switch_mlp
             for m in ["gate_proj", "down_proj", "up_proj"]:
-                for k in ["weight", "scales", "biases", "weight_scale_2"]:
+                for k in ["weight", "scales", "biases"]:
                     if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
                         to_join = [
                             weights.pop(f"{prefix}.mlp.experts.{e}.{m}.{k}")
@@ -712,7 +712,7 @@ class LanguageModel(nn.Module):
             # Stack multimodal experts (num_text_experts to num_text_experts+num_mm_experts-1) into switch_mlp_1
             if num_mm_experts > 0:
                 for m in ["gate_proj", "down_proj", "up_proj"]:
-                    for k in ["weight", "scales", "biases", "weight_scale_2"]:
+                    for k in ["weight", "scales", "biases"]:
                         first_mm_expert = num_text_experts
                         if f"{prefix}.mlp.experts.{first_mm_expert}.{m}.{k}" in weights:
                             to_join = [

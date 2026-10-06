@@ -304,7 +304,7 @@ class LanguageModel(nn.Module):
 
             if l >= self.args.first_k_dense_replace:
                 for m in ["gate_proj", "down_proj", "up_proj"]:
-                    for k in ["weight", "scales", "biases", "weight_scale_2"]:
+                    for k in ["weight", "scales", "biases"]:
                         if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
                             to_join = [
                                 weights.pop(f"{prefix}.mlp.experts.{e}.{m}.{k}")

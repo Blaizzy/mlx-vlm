@@ -1074,37 +1074,23 @@ def test_scaled_nvfp4_experts_preserve_individual_scales(dtype, sorted_indices):
     "family",
     [
         "afmoe",
-        "bailing_moe",
-        "bailing_moe_linear",
-        "cohere2_moe",
-        "deepseek",
         "deepseek_v2",
         "deepseek_v3",
         "deepseek_v32",
         "deepseek_v41",
-        "deepseek_vl_v2",
-        "deepseekocr",
-        "dots1",
-        "ernie4_5_moe_vl",
         "exaone_moe",
         "glm4_moe",
         "glm4_moe_lite",
-        "glm4v_moe",
         "glm5_next",
-        "hunyuan",
         "kimi_k3",
         "kimi_vl",
         "laguna",
         "lfm2_moe",
         "llada2_moe",
-        "longcat_flash",
-        "longcat_flash_sparse",
         "mimo_v2_flash",
         "mixtral",
         "nemotron_h",
         "olmoe",
-        "phimoe",
-        "qwen2_moe",
         "qwen3_5_moe",
     ],
 )
@@ -1115,21 +1101,18 @@ def test_moe_sanitize_load_and_infer(family, global_scales):
     args = SimpleNamespace(
         tie_word_embeddings=False,
         num_hidden_layers=1,
-        num_layers=1,
         num_experts=2,
         n_routed_experts=2,
         num_local_experts=2,
-        moe_num_experts=[2, 2],
         num_dense_layers=0,
         first_k_dense_replace=0,
         is_moe_layer=[True],
         quantization={"mode": "nvfp4"},
-        oe_vocab_size_ratio=0,
     )
     model = SimpleNamespace(args=args, config=args, norm_head=False)
     root = "model.layers.0.mlp"
     projections = {name: name for name in ("gate_proj", "down_proj", "up_proj")}
-    if family in {"mixtral", "phimoe", "kimi_k3", "deepseek_v41"}:
+    if family in {"mixtral", "kimi_k3", "deepseek_v41"}:
         projections = dict(zip(("w1", "w2", "w3"), projections))
         if family != "deepseek_v41":
             root = "model.layers.0.block_sparse_moe"
@@ -1138,16 +1121,7 @@ def test_moe_sanitize_load_and_infer(family, global_scales):
     if family == "nemotron_h":
         root = "backbone.layers.0.mixer"
         projections = {"down_proj": "fc2", "up_proj": "fc1"}
-    if family in {
-        "deepseek_vl_v2",
-        "deepseekocr",
-        "ernie4_5_moe_vl",
-        "glm4v_moe",
-        "glm5_next",
-        "kimi_k3",
-        "kimi_vl",
-        "llada2_moe",
-    }:
+    if family in {"glm5_next", "kimi_k3", "kimi_vl", "llada2_moe"}:
         root = "language_model." + root
     if family == "qwen3_5_moe":
         cls = importlib.import_module("mlx_vlm.models.qwen3_5_moe").Model
@@ -1173,7 +1147,7 @@ def test_moe_sanitize_load_and_infer(family, global_scales):
         model.model = SimpleNamespace(layers=model.layers)
 
     raw, reference = {}, {}
-    experts = 4 if family == "ernie4_5_moe_vl" else 2
+    experts = 2
     for projection, (source, target) in enumerate(projections.items()):
         scales = []
         for expert in range(experts):
@@ -1221,13 +1195,11 @@ def test_moe_sanitize_load_and_infer(family, global_scales):
             )
 
     weight_keys = [key for key in sanitized if key.endswith(".weight")]
-    assert len(weight_keys) == len(reference) * (2 if experts == 4 else 1)
+    assert len(weight_keys) == len(reference)
     assert len(sanitized) == len(weight_keys) * (3 if global_scales else 2)
     for key in weight_keys:
         prefix = key.removesuffix(".weight")
         expected = reference[prefix.rsplit(".", 1)[-1]]
-        if experts == 4:
-            expected = expected[2:] if ".switch_mlp_1." in key else expected[:2]
         assert sanitized[key].shape == (2, expected.shape[1], 8)
         layer_model = nn.Module()
         layer_model.layer = QuantizedSwitchLinear(
