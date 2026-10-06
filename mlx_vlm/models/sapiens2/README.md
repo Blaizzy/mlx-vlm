@@ -13,10 +13,16 @@ The official Hugging Face repos load directly — `config.json`
 | Task | Output | HF repos |
 |------|--------|----------|
 | Pose (308 keypoints) | heatmaps → keypoints | `mlx-community/sapiens2-pose-{0.4b,0.8b,1b,5b}-bf16` |
-| Segmentation (29 parts) | per-pixel class logits | `mlx-community/sapiens2-seg-{0.4b,0.8b,1b,5b}-bf16` |
+| Segmentation (29 parts) | per-pixel class logits | `mlx-community/sapiens2-seg-{0.8b,1b,5b}-bf16` |
 | Surface normals | per-pixel normals | `mlx-community/sapiens2-normal-{0.4b,0.8b,1b,5b}-bf16` |
 | Pointmaps | per-pixel XYZ + scale | `mlx-community/sapiens2-pointmap-{0.4b,0.8b,1b,5b}-bf16` |
 | Matting | alpha + foreground | `mlx-community/sapiens2-matting-1b-bf16` |
+
+`mlx-community/sapiens2-seg-0.4b-bf16` ships a `config.json` with no
+architecture fields, so a loader falls back to the 1B geometry against a
+24-block checkpoint. Use
+[`nativ-community/sapiens2-seg-0.4b-bf16`](https://huggingface.co/nativ-community/sapiens2-seg-0.4b-bf16),
+which is the same weights with a config that describes them.
 
 ## Usage
 
