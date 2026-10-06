@@ -2007,6 +2007,49 @@ def test_video_depth_anything_rejects_unknown_encoder():
         ModelConfig(encoder="vitxl")
 
 
+def test_rfdetr_checkpoint_conversion():
+    from mlx_vlm.models.rfdetr import Model, ModelConfig
+
+    model = Model(ModelConfig(segmentation=True))
+    mx.random.seed(0)
+    expected = {
+        key: mx.random.normal(value.shape)
+        for key, value in tree_flatten(model.parameters())
+    }
+    renames = [
+        ("backbone.embeddings.", "backbone.0.encoder.encoder.embeddings."),
+        ("backbone.encoder.layers.", "backbone.0.encoder.encoder.encoder.layer."),
+        ("backbone.layernorm.", "backbone.0.encoder.encoder.layernorm."),
+        ("projector.", "backbone.0.projector."),
+        (".attention.q_proj.", ".attention.attention.query."),
+        (".attention.k_proj.", ".attention.attention.key."),
+        (".attention.v_proj.", ".attention.attention.value."),
+        (".attention.o_proj.", ".attention.output.dense."),
+        (".layer_scale1", ".layer_scale1.lambda1"),
+        (".layer_scale2", ".layer_scale2.lambda1"),
+    ]
+    source = {}
+    for key, value in expected.items():
+        for mlx_name, torch_name in renames:
+            key = key.replace(mlx_name, torch_name)
+        if value.ndim == 4:
+            value = value.transpose(0, 3, 1, 2)
+        source[f"model.{key}"] = value
+    for i in range(model.config.dec_layers):
+        prefix = f"model.transformer.decoder.layers.{i}.self_attn."
+        for suffix in ("weight", "bias"):
+            source[f"{prefix}in_proj_{suffix}"] = mx.concatenate(
+                [source.pop(f"{prefix}{name}_proj.{suffix}") for name in "qkv"]
+            )
+    mask_token = "model.backbone.0.encoder.encoder.embeddings.mask_token"
+    source[mask_token] = mx.zeros((1, 384))
+
+    converted = model.sanitize(source)
+    _assert_weights_equal(converted, expected)
+    _assert_weights_equal(model.sanitize(dict(converted)), expected)
+    model.load_weights(list(converted.items()), strict=True)
+
+
 class TestLayaDecisionModel(unittest.TestCase):
     def test_checkpoint_conversion(self):
         model = _extraction_model("laya")
