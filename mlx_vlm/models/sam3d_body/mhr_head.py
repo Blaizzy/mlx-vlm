@@ -15,6 +15,23 @@ from .mhr_utils import (
 )
 from .transformer import DecoderFFN
 
+# A pose vector is global rotation, continuous body pose, shape, scale PCA,
+# hand and face, in that order. Only the shape and face widths are
+# configurable; the rest are fixed by the MHR skeleton.
+GLOBAL_ROT_DIM = 6
+BODY_POSE_CONT_DIM = 260
+SCALE_PCA_DIM = 28
+HAND_PARAM_DIM = 108
+
+
+def pose_segments(config):
+    """Where each segment of a pose vector starts, and its total width."""
+    shape = GLOBAL_ROT_DIM + BODY_POSE_CONT_DIM
+    scale = shape + config.num_shape_comps
+    hand = scale + SCALE_PCA_DIM
+    face = hand + HAND_PARAM_DIM
+    return shape, scale, hand, face, face + config.num_face_comps
+
 
 class MHRHead(nn.Module):
     """MHR pose prediction head.
@@ -48,7 +65,13 @@ class MHRHead(nn.Module):
             config = SAM3DConfig()
 
         self.config = config
-        output_dim = config.pose_output_dim  # 519
+        self._segments = pose_segments(config)
+        output_dim = self._segments[-1]
+        if output_dim != config.pose_output_dim:
+            raise ValueError(
+                f"pose_output_dim is {config.pose_output_dim} but the segment "
+                f"widths sum to {output_dim}"
+            )
 
         # Proj FFN: same nested list pattern as decoder FFN
         self.proj = DecoderFFN(input_dim, input_dim)
@@ -66,7 +89,7 @@ class MHRHead(nn.Module):
         # Buffers (frozen, loaded from weights)
         self.joint_rotation = mx.zeros((config.num_joints, 3, 3))
         self.scale_mean = mx.zeros((68,))
-        self.scale_comps = mx.zeros((28, 68))
+        self.scale_comps = mx.zeros((SCALE_PCA_DIM, 68))
         self.faces = mx.zeros((config.num_faces, 3), dtype=mx.int32)
         self.hand_pose_mean = mx.zeros((54,))
         self.hand_pose_comps = mx.zeros((54, 54))
@@ -132,12 +155,13 @@ class MHRHead(nn.Module):
             pred = pred + init_estimate
 
         # Split predictions
-        global_rot_6d = pred[:, :6]
-        pred_pose_cont = pred[:, 6:266]  # 260D continuous body pose
-        pred_shape = pred[:, 266:311]  # 45D shape params
-        pred_scale = pred[:, 311:339]  # 28D scale PCA coefficients
-        pred_hand = pred[:, 339:447]  # 108D hand params
-        pred_face = pred[:, 447:519] * 0  # 72D face, zeroed
+        shape_at, scale_at, hand_at, face_at, end = self._segments
+        global_rot_6d = pred[:, :GLOBAL_ROT_DIM]
+        pred_pose_cont = pred[:, GLOBAL_ROT_DIM:shape_at]
+        pred_shape = pred[:, shape_at:scale_at]
+        pred_scale = pred[:, scale_at:hand_at]
+        pred_hand = pred[:, hand_at:face_at]
+        pred_face = pred[:, face_at:end] * 0  # face is zeroed
 
         # Global rotation: 6D -> rotmat -> euler
         global_rot_rotmat = rot6d_to_rotmat(global_rot_6d)  # (B, 3, 3)
