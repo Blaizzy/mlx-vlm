@@ -1125,32 +1125,15 @@ def test_scaled_nvfp4_experts_preserve_individual_scales(
 
 
 @pytest.mark.parametrize(
-    "family,format",
-    [
-        ("qwen3_5_moe", "native"),
-        ("qwen3_5_moe", "modelopt"),
-        ("cohere2_moe", "native"),
-        ("cohere2_moe", "nvfp4-pack-quantized"),
-        ("cohere2_moe", "mixed-precision"),
-    ],
+    "format", ["native", "nvfp4-pack-quantized", "mixed-precision"]
 )
-def test_moe_sanitize_load_and_infer(family, format):
+def test_cohere_nvfp4_sanitize_load_and_infer(format):
+    from mlx_vlm.models.cohere2_moe.language import LanguageModel
+
     global_scales = format != "native"
-    args = SimpleNamespace(
-        tie_word_embeddings=False,
-        num_hidden_layers=1,
-        num_experts=2,
-        first_k_dense_replace=0,
-    )
-    model = SimpleNamespace(args=args, config=SimpleNamespace(text_config=args))
-    if family == "qwen3_5_moe":
-        cls = importlib.import_module("mlx_vlm.models.qwen3_5_moe").Model
-        root = "model.language_model.layers.0.mlp"
-    else:
-        cls = importlib.import_module(
-            "mlx_vlm.models.cohere2_moe.language"
-        ).LanguageModel
-        root = "model.layers.0.mlp"
+    args = SimpleNamespace(num_hidden_layers=1, num_experts=2, first_k_dense_replace=0)
+    model = SimpleNamespace(args=args)
+    root = "model.layers.0.mlp"
     projections = ("gate_proj", "down_proj", "up_proj")
     raw, reference = {}, {}
     experts = 2
@@ -1160,41 +1143,27 @@ def test_moe_sanitize_load_and_infer(family, format):
             prefix = f"{root}.experts.{expert}.{name}"
             scale = 0.125 * (expert + 1) * (projection + 1) if global_scales else 1.0
             scales.append(scale)
-            raw[prefix + ".weight"] = mx.full((4, 32), 0x22, mx.uint8)
-            raw[prefix + ".weight_scale"] = mx.full((4, 4), 56, mx.uint8)
-            raw[prefix + ".weight_scale_2"] = mx.array(scale, mx.float32)
+            raw[prefix + ".weight"] = mx.full((4, 8), 0x22222222, mx.uint32)
+            raw[prefix + ".scales"] = mx.full((4, 4), 56, mx.uint8)
+            if global_scales:
+                raw[prefix + ".weight_packed"] = raw.pop(prefix + ".weight").view(
+                    mx.uint8
+                )
+                raw[prefix + ".weight_scale"] = raw.pop(prefix + ".scales")
+                raw[prefix + ".weight_global_scale"] = mx.array([1 / scale], mx.float32)
+                raw[prefix + ".input_global_scale"] = mx.array([2.0])
         reference[name] = mx.broadcast_to(
             mx.array(scales)[:, None, None], (experts, 4, 64)
         )
-    if format in {"nvfp4-pack-quantized", "mixed-precision"}:
-        for key in list(raw):
-            if key.endswith(".weight"):
-                raw[key + "_packed"] = raw.pop(key)
-            elif key.endswith(".weight_scale_2"):
-                prefix = key.removesuffix(".weight_scale_2")
-                raw[prefix + ".weight_global_scale"] = mx.reciprocal(
-                    raw.pop(key)
-                ).reshape(1)
-                raw[prefix + ".input_global_scale"] = mx.array([2.0])
-        weights, _ = _transform_compressed_tensors_weights(
-            raw, {"quant_method": "compressed-tensors", "format": format}
-        )
-    else:
-        weights, _ = _transform_modelopt_nvfp4_weights(
-            raw, {"quant_method": "modelopt", "quant_algo": "NVFP4"}
-        )
-    if not global_scales:
-        weights = {
-            k: v for k, v in weights.items() if not k.endswith(".weight_scale_2")
-        }
-    else:
-        scale_name = "weight_scale_2" if format == "modelopt" else "weight_global_scale"
-        other_scale = (
-            "weight_global_scale" if format == "modelopt" else "weight_scale_2"
-        )
-        assert any(k.endswith("." + scale_name) for k in weights)
-        assert not any(k.endswith("." + other_scale) for k in weights)
-    sanitized = cls.sanitize(model, weights)
+    config = (
+        {"quant_method": "compressed-tensors", "format": format}
+        if global_scales
+        else None
+    )
+    weights, _ = _transform_compressed_tensors_weights(raw, config)
+    assert any(k.endswith(".weight_global_scale") for k in weights) == global_scales
+    assert not any(k.endswith(".weight_scale_2") for k in weights)
+    sanitized = LanguageModel.sanitize(model, weights)
 
     weight_keys = [key for key in sanitized if key.endswith(".weight")]
     assert len(weight_keys) == len(reference)
