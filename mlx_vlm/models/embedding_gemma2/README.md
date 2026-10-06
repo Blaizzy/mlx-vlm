@@ -12,11 +12,7 @@ and media tokens participate in pooling; padding does not.
 ## Setup
 
 The local processor works with Transformers >= 5.14.0 and uses its Gemma 4 image
-and audio components. Image/video preprocessing requires `torch` and
-`torchvision`; media decoding also uses `librosa`, `soundfile`, and `torchcodec`,
-with a compatible FFmpeg installation. On macOS with Homebrew FFmpeg 8, set
-`DYLD_LIBRARY_PATH="$(brew --prefix ffmpeg@8)/lib"` when launching Python if
-TorchCodec cannot locate the FFmpeg libraries.
+and audio components.
 
 ## Text retrieval and Matryoshka embeddings
 
