@@ -10,6 +10,7 @@ import io
 import json
 import math
 import pickle
+import pkgutil
 import tempfile
 import threading
 import unittest
@@ -2444,25 +2445,43 @@ class TestExtractionCLI(unittest.TestCase):
 class TestExtractionCoverage(unittest.TestCase):
     """Every model that declares tasks is reachable through the shared API."""
 
-    DECLARED = {
-        "dinov2": ("backbone",),
-        "moge3": ("geometry",),
-        "rfdetr": ("detection",),
-        "rt_detr_v2": ("detection",),
-        "sam3": ("detection",),
-        "sam3_1": ("detection",),
-        "sam3d_body": ("body",),
-        "sam3d_objects": ("objects",),
-        "video_depth_anything": ("depth",),
-        "yolo11": ("detection",),
-    }
+    # sam3 and sam3_1 tokenize their prompt with CLIP and sam3d_body runs its
+    # predictor over a real crop, so none of the three fits a random-weight case.
+    UNCASED = {"sam3", "sam3_1", "sam3d_body"}
+
+    @staticmethod
+    def _declared():
+        from mlx_vlm import models
+
+        found = {}
+        for info in pkgutil.iter_modules(models.__path__):
+            if not info.ispkg or info.name.startswith("_"):
+                continue
+            try:
+                module = importlib.import_module(f"mlx_vlm.models.{info.name}")
+            except ModuleNotFoundError:
+                continue
+            tasks = getattr(getattr(module, "Model", None), "extraction_types", None)
+            if tasks:
+                found[info.name] = tasks
+        return found
 
     def test_declared_models_expose_the_hook(self):
-        for name, tasks in self.DECLARED.items():
-            module = importlib.import_module(f"mlx_vlm.models.{name}")
-            model = module.Model
-            self.assertEqual(model.extraction_types, tasks, name)
+        declared = self._declared()
+        self.assertGreaterEqual(len(declared), 11)
+        for name, tasks in declared.items():
+            model = importlib.import_module(f"mlx_vlm.models.{name}").Model
             self.assertTrue(callable(getattr(model, "extract", None)), name)
+            if not isinstance(tasks, property):
+                self.assertIsInstance(tasks, tuple, name)
+
+    def test_every_declared_model_has_a_case(self):
+        cased = {
+            case["module"]
+            for case in EXTRACTION_DATA["cases"]
+            if "extraction_api" in case
+        }
+        self.assertEqual(set(self._declared()) - cased, self.UNCASED)
 
     def test_sapiens2_derives_its_task_from_the_checkpoint(self):
         from mlx_vlm.models.sapiens2 import Model
