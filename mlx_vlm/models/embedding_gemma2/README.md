@@ -1,6 +1,6 @@
 # EmbeddingGemma 2
 
-Native MLX embeddings for `gg-hf-em/embeddinggemma-2`: text, images, audio,
+Native MLX embeddings for `google/embeddinggemma-2`: text, images, audio,
 video, and combinations of these modalities in a shared 768-dimensional space.
 The bidirectional encoder uses alternating local/full attention, projection-only
 per-layer inputs, and the Gemma 4 vision and audio towers.
@@ -11,19 +11,7 @@ and media tokens participate in pooling; padding does not.
 
 ## Setup
 
-The checkpoint's processor requires the Transformers build supplied in the
-[EmbeddingGemma 2 EAP extras dataset](https://huggingface.co/datasets/gg-hf-em/embeddinggemma-2-eap-extras).
-Install that wheel in your MLX-VLM environment:
-
-```sh
-hf download gg-hf-em/embeddinggemma-2-eap-extras \
-  transformers-5.18.0.dev0-py3-none-any.whl --repo-type dataset \
-  --revision f6c512df20896fd06f85d39db10c45a0a9849ef8 \
-  --local-dir embeddinggemma2-extras
-python -m pip install embeddinggemma2-extras/transformers-5.18.0.dev0-py3-none-any.whl
-```
-
-Audio/video preprocessing also needs the upstream optional dependencies, including
+Audio/video preprocessing needs the upstream optional dependencies, including
 `torchaudio`, `librosa`, `soundfile`, and `torchcodec`, with a compatible FFmpeg
 installation. On macOS with Homebrew FFmpeg 8, set
 `DYLD_LIBRARY_PATH="$(brew --prefix ffmpeg@8)/lib"` when launching Python if
@@ -38,7 +26,7 @@ from transformers import AutoTokenizer
 from mlx_vlm.embedding_loader import load_embedding_model
 from mlx_vlm.utils import get_model_path
 
-path = get_model_path("gg-hf-em/embeddinggemma-2")
+path = get_model_path("google/embeddinggemma-2")
 model = load_embedding_model(path)
 tokenizer = AutoTokenizer.from_pretrained(path)
 inputs = tokenizer(
@@ -72,7 +60,7 @@ and audio features, and sample video frames. Convert its NumPy tensors to MLX:
 import mlx.core as mx
 from mlx_vlm import load
 
-model, processor = load("gg-hf-em/embeddinggemma-2")
+model, processor = load("google/embeddinggemma-2")
 conversations = [
     [
         {"role": "system", "content": "title: none | text: "},
@@ -96,7 +84,7 @@ The processor preserves content order and supports manual `<|image|>`,
 calls support media-only and nested per-sample inputs. Pass `max_soft_tokens`
 (70, 140, 280, 560, or 1120) to control visual budgets; video also accepts `fps`,
 `max_frames`, `overflow_strategy`, and `add_timestamps`, as described in the
-[upstream documentation](https://huggingface.co/gg-hf-em/embeddinggemma-2/blob/main/embedding_gemma2_documentation.md).
+[upstream documentation](https://huggingface.co/google/embeddinggemma-2/blob/main/embedding_gemma2_documentation.md).
 Mismatched expanded media-token and feature counts raise an error.
 
 ## Selective tower loading and conversion
@@ -114,7 +102,7 @@ Unused tower weights are discarded during loading. The complete checkpoint can
 also be converted and reloaded with the standard CLI:
 
 ```sh
-mlx_vlm.convert --hf-path gg-hf-em/embeddinggemma-2 \
+mlx_vlm.convert --hf-path google/embeddinggemma-2 \
   --mlx-path embeddinggemma2-mlx --dtype bfloat16
 ```
 
