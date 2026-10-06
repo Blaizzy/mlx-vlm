@@ -122,53 +122,7 @@ def _e4m3_decode_table() -> mx.array:
     return mx.array(table, dtype=mx.float32)
 
 
-# Built once; reused by every NVFP4 fold.
 _E4M3_DECODE_LUT = _e4m3_decode_table()
-
-
-def _f32_to_e4m3(x: mx.array) -> mx.array:
-    """Encode non-negative ``float32`` values to ``E4M3FN`` bytes.
-
-    Pure-MLX bit manipulation (MLX exposes no float8 dtype). Saturates to 448
-    on overflow and flushes to the subnormal grid / zero on underflow. Inputs
-    are assumed ``>= 0`` (NVFP4 group scales are magnitudes), so the sign bit is
-    always 0.
-    """
-    x = mx.maximum(x.astype(mx.float32), 0.0)
-    bits = x.view(mx.uint32)
-    fexp = (bits >> 23) & 0xFF  # fp32 exponent, bias 127
-    fman = bits & 0x7FFFFF  # fp32 mantissa, 23 bits
-
-    # Normal path: target E4M3 biased exponent e = (fexp - 127) + 7.
-    exponent = fexp.astype(mx.int32) - 120
-    drop = 20  # 23 -> 3 mantissa bits
-    round_bit = (fman >> (drop - 1)) & 1
-    sticky = (fman & ((1 << (drop - 1)) - 1)) != 0
-    mantissa = fman >> drop
-    roundup = round_bit & (sticky.astype(mx.uint32) | (mantissa & 1))
-    mantissa = mantissa + roundup
-    carry = mantissa >> 3  # mantissa overflowed past 7 -> bump exponent
-    mantissa = mantissa & 0x7
-    exponent = exponent + carry.astype(mx.int32)
-
-    # Saturate: e > 15, or the NaN slot (e == 15, mant == 7), clamps to 448.
-    over = (exponent > 15) | ((exponent == 15) & (mantissa == 7))
-    exponent = mx.where(over, mx.array(15, mx.int32), exponent)
-    mantissa = mx.where(over, mx.array(6, mx.uint32), mantissa)
-    normal_byte = (exponent.astype(mx.uint32) << 3) | mantissa
-    normal_valid = exponent >= 1
-
-    # Subnormal path: value = m * 2^-9, so m = round(x * 512) (RNE).
-    # m == 8 lands exactly on the smallest normal (0x08 = e1 m0 = 2^-6).
-    sub = x * 512.0
-    sub_floor = mx.floor(sub)
-    frac = sub - sub_floor
-    sub_floor_u32 = sub_floor.astype(mx.uint32)
-    up = (frac > 0.5) | ((frac == 0.5) & ((sub_floor_u32 & 1) == 1))
-    sub_byte = sub_floor_u32 + up.astype(mx.uint32)
-
-    byte = mx.where(normal_valid, normal_byte, sub_byte)
-    return byte.astype(mx.uint8)
 
 
 def _transform_modelopt_nvfp4_weights(
