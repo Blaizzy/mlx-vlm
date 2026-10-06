@@ -40,6 +40,8 @@ STACKED_FUSED_RE = re.compile(
     + _FUSED_PROJ
 )
 
+_WEIGHT_INDEX = "model.safetensors.index.json"
+
 
 def plan(tensor_names) -> dict:
     """Pure partition of names -> resident vs per-layer routed experts.
@@ -226,7 +228,7 @@ def repack(build: str, out: str, resident_shard_gb: float = 5.0) -> None:
     os.makedirs(os.path.join(out, "experts"), exist_ok=True)
     _check_disk_headroom(build, out)
 
-    idx_path = os.path.join(build, "model.safetensors.index.json")
+    idx_path = os.path.join(build, _WEIGHT_INDEX)
     if os.path.exists(idx_path):
         wmap = json.load(open(idx_path))["weight_map"]
     else:
@@ -248,7 +250,7 @@ def repack(build: str, out: str, resident_shard_gb: float = 5.0) -> None:
         except Exception:
             pass
 
-    buf, buf_bytes, ri, res_index = {}, 0, 0, {}
+    buf, buf_bytes, ri, res_index, res_bytes = {}, 0, 0, {}, 0
 
     def flush_resident():
         nonlocal buf, buf_bytes, ri
@@ -264,9 +266,10 @@ def repack(build: str, out: str, resident_shard_gb: float = 5.0) -> None:
         clear()
 
     def add_resident(name, value):
-        nonlocal buf_bytes
+        nonlocal buf_bytes, res_bytes
         buf[name] = value
         buf_bytes += value.nbytes
+        res_bytes += value.nbytes
         if buf_bytes >= resident_shard_gb * 1e9:
             flush_resident()
 
@@ -409,6 +412,7 @@ def repack(build: str, out: str, resident_shard_gb: float = 5.0) -> None:
             os.path.isfile(src)
             and not fn.startswith("model-")
             and not fn.endswith(".safetensors")
+            and fn != _WEIGHT_INDEX
         ):
             shutil.copy2(src, os.path.join(out, fn))
         elif os.path.isdir(src) and not fn.startswith(".") and fn != "experts":
@@ -418,6 +422,14 @@ def repack(build: str, out: str, resident_shard_gb: float = 5.0) -> None:
                 dirs_exist_ok=True,
                 ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
             )
+    json.dump(
+        {
+            "metadata": {"total_size": res_bytes},
+            "weight_map": {k: res_index[k] for k in sorted(res_index)},
+        },
+        open(os.path.join(out, _WEIGHT_INDEX), "w"),
+        indent=2,
+    )
     json.dump(
         {"layers": sorted(written_layers), "num_experts": n_experts},
         open(os.path.join(out, "offload_index.json"), "w"),

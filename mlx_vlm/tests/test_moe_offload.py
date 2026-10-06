@@ -303,3 +303,59 @@ def test_repack_sanitizes_raw_mixtral_style_expert_naming(tmp_path):
     offloaded = load_model(offload_raw)
     assert getattr(offloaded, "moe_offload_store", None) is not None
     _assert_offload_parity(resident, offloaded(prompt).logits)
+
+
+def test_repack_rewrites_stale_source_weight_index(tmp_path):
+    config = _deepseek_config()
+    model = deepseek_v3.Model(config)
+    mx.eval(model.parameters())
+    nn.quantize(
+        model,
+        group_size=32,
+        bits=4,
+        class_predicate=lambda path, module: "switch_mlp" in path
+        and hasattr(module, "to_quantized"),
+    )
+    mx.eval(model.parameters())
+    build, offload = tmp_path / "build", tmp_path / "offload"
+    save_weights(str(build), model)
+    config_dict = dataclasses.asdict(config)
+    config_dict["quantization"] = dict(group_size=32, bits=4, mode="affine")
+    (build / "config.json").write_text(json.dumps(config_dict))
+
+    index_path = build / "model.safetensors.index.json"
+    index = json.loads(index_path.read_text())
+    weights = {
+        k: mx.array(v) for k, v in mx.load(str(build / "model.safetensors")).items()
+    }
+    mx.eval(list(weights.values()))
+    sidecar_key = "language_model.model.embed_tokens.weight"
+    assert sidecar_key in weights
+    (build / "sidecar").mkdir()
+    mx.save_safetensors(
+        str(build / "sidecar" / "extra.safetensors"),
+        {sidecar_key: weights[sidecar_key]},
+    )
+    mx.save_safetensors(
+        str(build / "model.safetensors"),
+        {k: v for k, v in weights.items() if k != sidecar_key},
+    )
+    index["weight_map"][sidecar_key] = "sidecar/extra.safetensors"
+    index_path.write_text(json.dumps(index))
+
+    repack(str(build), str(offload))
+    assert (offload / "sidecar" / "extra.safetensors").exists()
+    rewritten = json.loads((offload / "model.safetensors.index.json").read_text())
+    shards = set(rewritten["weight_map"].values())
+    assert shards and all(s.startswith("resident-") for s in shards)
+    assert sidecar_key in rewritten["weight_map"]
+    assert not any(
+        "switch_mlp.gate_proj.weight" in k for k in rewritten["weight_map"]
+    ), "routed experts must not be named in the resident index"
+
+    prompt = mx.array([[1, 2, 3, 4, 5, 6]])
+    resident = load_model(build)(prompt).logits
+    mx.eval(resident)
+    offloaded = load_model(offload)
+    assert getattr(offloaded, "moe_offload_store", None) is not None
+    _assert_offload_parity(resident, offloaded(prompt).logits)
