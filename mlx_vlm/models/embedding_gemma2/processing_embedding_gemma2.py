@@ -15,10 +15,11 @@
 
 """EmbeddingGemma 2 preprocessing, adapted from the reference Transformers processor.
 
-Uses the public Gemma 4 image/audio components and the local video processor.
+Uses NumPy/Pillow vision preprocessing and the NumPy Gemma 4 audio extractor.
 """
 
 import copy
+from pathlib import Path
 
 import numpy as np
 from transformers.audio_utils import AudioInput, is_valid_audio
@@ -35,6 +36,7 @@ from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 from transformers.video_utils import VideoInput, is_valid_video, make_batched_videos
 
 from ..base import install_auto_processor_patch, to_mlx
+from ..gemma4.processing_gemma4 import get_aspect_ratio_preserving_size
 
 
 class EmbeddingGemma2ImageKwargs(ImagesKwargs, total=False):
@@ -60,6 +62,74 @@ class EmbeddingGemma2ProcessorKwargs(ProcessingKwargs, total=False):
 
 class EmbeddingGemma2Processor(ProcessorMixin):
     valid_processor_kwargs = EmbeddingGemma2ProcessorKwargs
+
+    def check_argument_for_proper_class(self, argument_name, argument):
+        # Transformers exposes a dummy BaseVideoProcessor without TorchVision.
+        if argument_name == "video_processor":
+            from .video_processing_embedding_gemma2 import EmbeddingGemma2VideoProcessor
+
+            if isinstance(argument, EmbeddingGemma2VideoProcessor):
+                return type(argument)
+        return super().check_argument_for_proper_class(argument_name, argument)
+
+    def _load_audio(self, audio, sampling_rate):
+        from mlx_vlm.utils import load_audio
+
+        if isinstance(audio, (str, Path)):
+            return load_audio(audio, sr=sampling_rate)
+        if isinstance(audio, (list, tuple)) and not is_valid_audio(audio):
+            return [self._load_audio(item, sampling_rate) for item in audio]
+        return audio
+
+    def apply_chat_template(self, conversation, chat_template=None, **kwargs):
+        # Resolve file audio before ProcessorMixin can select a Torch backend.
+        audio_from_video = kwargs.pop("load_audio_from_video", False)
+        if kwargs.get("tokenize", False):
+            conversation = copy.deepcopy(conversation)
+            processor_kwargs = kwargs.get("processor_kwargs") or {}
+            audio_kwargs = processor_kwargs.get(
+                "audio_kwargs", kwargs.get("audio_kwargs", {})
+            )
+            sampling_rate = kwargs.get(
+                "sampling_rate",
+                processor_kwargs.get(
+                    "sampling_rate",
+                    audio_kwargs.get(
+                        "sampling_rate", self.feature_extractor.sampling_rate
+                    ),
+                ),
+            )
+            conversations = (
+                [conversation] if isinstance(conversation[0], dict) else conversation
+            )
+            for messages in conversations:
+                for message in messages:
+                    content = message.get("content", []) or []
+                    for item in list(content):
+                        if isinstance(item, dict) and item.get("type") == "audio":
+                            for key in ("audio", "url", "path"):
+                                if key in item:
+                                    item[key] = self._load_audio(
+                                        item[key], sampling_rate
+                                    )
+                        elif (
+                            audio_from_video
+                            and isinstance(item, dict)
+                            and item.get("type") == "video"
+                        ):
+                            for key in ("video", "url", "path"):
+                                if key in item:
+                                    content.append(
+                                        {
+                                            "type": "audio",
+                                            "audio": self._load_audio(
+                                                item[key], sampling_rate
+                                            ),
+                                        }
+                                    )
+        return super().apply_chat_template(
+            conversation, chat_template=chat_template, **kwargs
+        )
 
     def __init__(
         self,
@@ -148,6 +218,17 @@ class EmbeddingGemma2Processor(ProcessorMixin):
         # Transformers 5.14 does not flatten nested per-sample audio yet.
         if nested_audio:
             audio = [item for sample in audio for item in sample]
+        if audio is not None:
+            audio_kwargs = kwargs.get("audio_kwargs") or {}
+            audio = self._load_audio(
+                audio,
+                kwargs.get(
+                    "sampling_rate",
+                    audio_kwargs.get(
+                        "sampling_rate", self.feature_extractor.sampling_rate
+                    ),
+                ),
+            )
         images, text, videos, audio = super().prepare_inputs_layout(
             images=images, text=text, videos=videos, audio=audio, **kwargs
         )
@@ -302,10 +383,6 @@ class EmbeddingGemma2Processor(ProcessorMixin):
     def _get_num_multimodal_tokens(
         self, image_sizes=None, audio_lengths=None, **kwargs
     ):
-        from transformers.models.gemma4.image_processing_gemma4 import (
-            get_aspect_ratio_preserving_size,
-        )
-
         images_kwargs = dict(
             EmbeddingGemma2ProcessorKwargs._defaults.get("images_kwargs", {})
         )
@@ -437,10 +514,8 @@ class EmbeddingGemma2Processor(ProcessorMixin):
         from transformers.models.gemma4.feature_extraction_gemma4 import (
             Gemma4AudioFeatureExtractor,
         )
-        from transformers.models.gemma4.image_processing_gemma4 import (
-            Gemma4ImageProcessor,
-        )
 
+        from .image_processing_embedding_gemma2 import EmbeddingGemma2ImageProcessor
         from .video_processing_embedding_gemma2 import EmbeddingGemma2VideoProcessor
 
         config = processor_dict or {}
@@ -452,7 +527,7 @@ class EmbeddingGemma2Processor(ProcessorMixin):
                 audio_config[name + "_ms"] = audio_config[name] * 1000 / sampling_rate
         return [
             Gemma4AudioFeatureExtractor(**audio_config),
-            Gemma4ImageProcessor(**config.get("image_processor", {})),
+            EmbeddingGemma2ImageProcessor(**config.get("image_processor", {})),
             AutoTokenizer.from_pretrained(pretrained_model_name_or_path, **kwargs),
             EmbeddingGemma2VideoProcessor(**config.get("video_processor", {})),
         ]

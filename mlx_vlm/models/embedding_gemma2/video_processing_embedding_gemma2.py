@@ -15,24 +15,32 @@
 
 """EmbeddingGemma 2 video sampling and variable-length frame batching."""
 
+import copy
+from functools import partial
+
 import numpy as np
-import torch
-from torchvision.transforms.v2 import functional as tvF
 from transformers.feature_extraction_utils import BatchFeature
-from transformers.models.gemma4.video_processing_gemma4 import (
-    Gemma4VideoProcessor,
-    Gemma4VideoProcessorKwargs,
-    convert_video_to_patches,
-    pad_to_max_patches,
+from transformers.image_utils import ChannelDimension, infer_channel_dimension_format
+from transformers.processing_utils import VideosKwargs
+from transformers.utils import logging
+from transformers.video_utils import (
+    VideoMetadata,
+    convert_to_rgb,
+    is_valid_video,
+    make_batched_metadata,
+    make_batched_videos,
 )
-from transformers.utils import TensorType, logging
-from transformers.video_utils import VideoMetadata
+
+from ..gemma4.processing_gemma4 import Gemma4VideoProcessor
+from .image_processing_embedding_gemma2 import EmbeddingGemma2ImageProcessor
 
 logger = logging.get_logger(__name__)
-_SUPPORTED_SOFT_TOKENS = (70, 140, 280, 560, 1120)
 
 
-class EmbeddingGemma2VideoProcessorKwargs(Gemma4VideoProcessorKwargs, total=False):
+class EmbeddingGemma2VideoProcessorKwargs(VideosKwargs, total=False):
+    patch_size: int
+    max_soft_tokens: int
+    pooling_kernel_size: int
     add_timestamps: bool
     max_frames: int | None
     overflow_strategy: str | None
@@ -45,81 +53,124 @@ class EmbeddingGemma2VideoProcessor(Gemma4VideoProcessor):
         "video_position_ids",
         "num_frames_per_video",
     ]
-    num_frames = None
-    fps = 1
-    max_frames = 32
-    overflow_strategy = "uniform"
-    add_timestamps = False
 
-    def _preprocess(
+    def __init__(
         self,
-        videos: list["torch.Tensor"],
-        do_convert_rgb: bool,
-        do_resize: bool,
-        resample: "tvF.InterpolationMode | int | None",
-        do_rescale: bool,
-        rescale_factor: float,
-        do_normalize: bool,
-        image_mean: float | list[float] | None,
-        image_std: float | list[float] | None,
-        return_tensors: str | TensorType | None,
-        patch_size: int | None = None,
-        max_soft_tokens: int | None = None,
-        pooling_kernel_size: int | None = None,
+        fps=1,
+        max_frames=32,
+        overflow_strategy="uniform",
+        add_timestamps=False,
+        do_sample_frames=True,
+        num_frames=None,
         **kwargs,
-    ) -> BatchFeature:
-        if max_soft_tokens not in _SUPPORTED_SOFT_TOKENS:
-            raise ValueError(
-                f"`max_soft_tokens` must be one of {_SUPPORTED_SOFT_TOKENS}, got {max_soft_tokens}."
+    ):
+        kwargs.setdefault("do_normalize", True)
+        super().__init__(num_frames=num_frames, **kwargs)
+        self.fps = fps
+        self.max_frames = max_frames
+        self.overflow_strategy = overflow_strategy
+        self.add_timestamps = add_timestamps
+        self.do_sample_frames = do_sample_frames
+        self.do_convert_rgb = kwargs.get("do_convert_rgb", True)
+        self.resample = kwargs.get("resample", 3)
+        self.return_metadata = kwargs.get("return_metadata", False)
+
+    def video_sampling_defaults(self):
+        return {"fps": self.fps, "max_frames": self.max_frames}
+
+    def __call__(self, videos, **kwargs):
+        return self.preprocess(videos, **kwargs)
+
+    def preprocess(
+        self,
+        videos,
+        video_metadata=None,
+        return_metadata=None,
+        return_tensors=None,
+        **kwargs,
+    ):
+        videos = make_batched_videos(videos)
+        metadata = copy.deepcopy(make_batched_metadata(videos, video_metadata))
+        options = {
+            name: getattr(self, name)
+            for name in (
+                "fps",
+                "max_frames",
+                "overflow_strategy",
+                "num_frames",
             )
-        max_patches = max_soft_tokens * pooling_kernel_size**2
-        pixel_values = []
-        position_ids = []
-        num_soft_tokens_per_video = []
-        num_frames_per_video = []
-        for video in videos:
-            if do_convert_rgb:
-                video = self.convert_to_rgb(video)
-            if do_resize:
-                video = self.aspect_ratio_preserving_resize(
-                    video=video,
-                    patch_size=patch_size,
-                    max_patches=max_patches,
-                    pooling_kernel_size=pooling_kernel_size,
-                    resample=resample,
-                )
-            video = self.rescale_and_normalize(
-                video, do_rescale, rescale_factor, do_normalize, image_mean, image_std
-            )
-            num_frames = video.shape[0]
-            patch_height = video.shape[-2] // patch_size
-            patch_width = video.shape[-1] // patch_size
-            patches = convert_video_to_patches(video, patch_size)
-            num_soft_tokens_per_video.append(patches.shape[1] // pooling_kernel_size**2)
-            num_frames_per_video.append(num_frames)
-            device = video.device
-            patch_grid = torch.meshgrid(
-                torch.arange(patch_width, device=device),
-                torch.arange(patch_height, device=device),
-                indexing="xy",
-            )
-            stacked_grid = torch.stack(patch_grid, dim=-1)
-            real_positions = stacked_grid.reshape(patches.shape[1], 2)
-            real_positions = real_positions[None, ...].repeat(num_frames, 1, 1)
-            patches, positions = pad_to_max_patches(
-                patches, real_positions, max_patches
-            )
-            pixel_values.append(patches)
-            position_ids.append(positions)
-        pixel_values = torch.cat(pixel_values, dim=0)
-        position_ids = torch.cat(position_ids, dim=0)
-        data = {
-            "pixel_values_videos": pixel_values,
-            "video_position_ids": position_ids,
-            "num_frames_per_video": num_frames_per_video,
-            "num_soft_tokens_per_video": num_soft_tokens_per_video,
         }
-        return BatchFeature(data=data, tensor_type=return_tensors)
+        options.update({name: kwargs[name] for name in options if name in kwargs})
+        do_sample = kwargs.get("do_sample_frames", self.do_sample_frames)
+        sampler = partial(self.sample_frames, **options) if do_sample else None
+        image_processor = EmbeddingGemma2ImageProcessor(**self.__dict__)
+        pixels, positions, counts, frame_counts = [], [], [], []
+        for index, video in enumerate(videos):
+            if is_valid_video(video):
+                video = np.asarray(video)
+                if sampler is not None:
+                    indices = sampler(metadata=metadata[index])
+                    metadata[index].frames_indices = indices
+                    video = video[indices]
+            elif isinstance(video, list):
+                if do_sample:
+                    raise ValueError(
+                        "Sampling frames from a list of images is not supported! Set `do_sample_frames=False`."
+                    )
+                video = image_processor.fetch_images(video)
+            else:
+                video, metadata[index] = self._decode_video(video, sampler)
+            video = np.asarray(video)
+            layout = kwargs.get("input_data_format") or infer_channel_dimension_format(
+                video, num_channels=(1, 3, 4)
+            )
+            if kwargs.get("do_convert_rgb", self.do_convert_rgb):
+                video = convert_to_rgb(video, input_data_format=layout)
+                layout = ChannelDimension.FIRST
+            image_kwargs = kwargs | {"input_data_format": layout}
+            inputs = image_processor(list(video), return_tensors="np", **image_kwargs)
+            pixels.append(inputs["pixel_values"])
+            positions.append(inputs["image_position_ids"])
+            counts.append(int(inputs["num_soft_tokens_per_image"][0]))
+            frame_counts.append(len(video))
+        result = BatchFeature(
+            {
+                "pixel_values_videos": np.concatenate(pixels),
+                "video_position_ids": np.concatenate(positions),
+                "num_frames_per_video": frame_counts,
+                "num_soft_tokens_per_video": counts,
+            },
+            tensor_type=return_tensors,
+        )
+        include_metadata = (
+            self.return_metadata if return_metadata is None else return_metadata
+        )
+        if include_metadata:
+            result["video_metadata"] = metadata
+        return result
+
+    @staticmethod
+    def _decode_video(path, sampler):
+        from mlx_vlm.utils import load_video
+
+        def sample(metadata, **kwargs):
+            return (
+                sampler(metadata=metadata)
+                if sampler is not None
+                else np.arange(metadata.total_num_frames)
+            )
+
+        video, info = load_video(str(path), frame_sampler=sample)
+        metadata = VideoMetadata(
+            total_num_frames=info.total_num_frames,
+            fps=info.fps,
+            duration=info.duration,
+            frames_indices=info.frames_indices,
+            width=info.width,
+            height=info.height,
+            video_backend="opencv",
+        )
+        return video.transpose(0, 2, 3, 1), metadata
 
     def sample_frames(
         self,

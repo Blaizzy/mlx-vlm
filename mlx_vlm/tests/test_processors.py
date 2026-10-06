@@ -7,6 +7,9 @@ import importlib
 import json
 import pkgutil
 import re
+import subprocess
+import sys
+import textwrap
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, nullcontext
 from copy import deepcopy
@@ -2878,13 +2881,14 @@ class TestVideoMetadataForwarding:
 
 @pytest.fixture
 def embedding_gemma2_processor():
-    pytest.importorskip("torchvision")
     from transformers.models.gemma4.feature_extraction_gemma4 import (
         Gemma4AudioFeatureExtractor,
     )
-    from transformers.models.gemma4.image_processing_gemma4 import Gemma4ImageProcessor
 
     from mlx_vlm.models.embedding_gemma2 import EmbeddingGemma2Processor
+    from mlx_vlm.models.embedding_gemma2.image_processing_embedding_gemma2 import (
+        EmbeddingGemma2ImageProcessor,
+    )
     from mlx_vlm.models.embedding_gemma2.video_processing_embedding_gemma2 import (
         EmbeddingGemma2VideoProcessor,
     )
@@ -2910,7 +2914,7 @@ def embedding_gemma2_processor():
         feature_extractor=Gemma4AudioFeatureExtractor(
             feature_size=32, frame_length_ms=24, hop_length_ms=8, preemphasis=0.5
         ),
-        image_processor=Gemma4ImageProcessor(
+        image_processor=EmbeddingGemma2ImageProcessor(
             patch_size=4, pooling_kernel_size=2, max_soft_tokens=70
         ),
         video_processor=EmbeddingGemma2VideoProcessor(
@@ -2936,6 +2940,127 @@ def _embedding_gemma2_media():
         rng.normal(0, 0.1, 3200).astype(np.float32),
         rng.integers(0, 256, (2, 24, 32, 3), dtype=np.uint8),
     )
+
+
+def test_embedding_gemma2_without_torch(
+    tmp_path, embedding_gemma2_processor, synthetic_video
+):
+    """Guard file decoding, chat templates, and offline reload against Torch imports."""
+    import wave
+
+    embedding_gemma2_processor.save_pretrained(tmp_path)
+    _write_configs(tmp_path, config={"model_type": "embedding_gemma2"})
+    image, audio, _ = _embedding_gemma2_media()
+    image.save(tmp_path / "image.png")
+    with wave.open(str(tmp_path / "audio.wav"), "wb") as output:
+        output.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+        output.writeframes((audio * 32767).astype("<i2").tobytes())
+    script = textwrap.dedent("""
+        import importlib.util
+        import sys
+        from pathlib import Path
+
+        blocked = {"torch", "torchvision", "torchaudio", "torchcodec", "av"}
+        original_find_spec = importlib.util.find_spec
+        def find_spec(name, *args, **kwargs):
+            return None if name.split(".")[0] in blocked else original_find_spec(name, *args, **kwargs)
+        importlib.util.find_spec = find_spec
+        class RejectTorch:
+            def find_spec(self, fullname, path=None, target=None):
+                assert fullname.split(".")[0] not in blocked, fullname
+        sys.meta_path.insert(0, RejectTorch())
+
+        import mlx.core as mx
+        import numpy as np
+        from mlx_vlm.models.embedding_gemma2 import EmbeddingGemma2Processor
+
+        folder = Path(sys.argv[1])
+        processor = EmbeddingGemma2Processor.from_pretrained(folder, local_files_only=True)
+        conversation = [{"role": "user", "content": [
+            {"type": "text", "text": "hello"},
+            {"type": "image", "url": str(folder / "image.png")},
+            {"type": "audio", "url": str(folder / "audio.wav")},
+            {"type": "video", "url": sys.argv[2]},
+        ]}]
+        expected = processor.apply_chat_template(
+            conversation, tokenize=True, return_dict=True, return_tensors="np"
+        )
+        assert {"input_ids", "pixel_values", "input_features", "pixel_values_videos"} <= set(expected)
+        processor._get_num_multimodal_tokens(image_sizes=[(24, 32)], audio_lengths=[3200])
+        processor.save_pretrained(folder / "resaved")
+        reloaded = type(processor).from_pretrained(folder / "resaved", local_files_only=True)
+        assert processor.to_dict() == reloaded.to_dict()
+        actual = reloaded.apply_chat_template(
+            conversation, tokenize=True, return_dict=True, return_tensors="mlx"
+        )
+        for key in expected:
+            assert isinstance(actual[key], mx.array), key
+            np.testing.assert_array_equal(np.asarray(actual[key]), expected[key])
+        assert not any(name.split(".")[0] in blocked for name in sys.modules)
+    """)
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path), synthetic_video],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("floating", [False, True], ids=["uint8", "float32"])
+def test_embedding_gemma2_image_options(embedding_gemma2_processor, floating):
+    processor = embedding_gemma2_processor.image_processor
+    image = np.arange(16 * 24 * 3, dtype=np.uint8).reshape(16, 24, 3)
+    if floating:
+        image = image.astype(np.float32) / 255
+    config = processor.to_dict()
+    output = processor(
+        [image],
+        do_resize=False,
+        do_rescale=False,
+        do_normalize=False,
+        return_tensors="np",
+    )
+    expected = image.reshape(4, 4, 6, 4, 3).transpose(0, 2, 1, 3, 4).reshape(24, 48)
+    equal(output["pixel_values"][0, :24], expected)
+    equal(output["pixel_values"][0, 24:], 0)
+    equal(output["image_position_ids"][0, :6], [[x, 0] for x in range(6)])
+    assert output["num_soft_tokens_per_image"][0] == 6
+    assert processor.to_dict() == config
+    assert np.isfinite(
+        processor([image], do_rescale=not floating)["pixel_values"]
+    ).all()
+
+
+def test_embedding_gemma2_chat_audio_from_video(
+    embedding_gemma2_processor, synthetic_video, monkeypatch
+):
+    processor = embedding_gemma2_processor
+    assert "<|audio|>" in processor.apply_chat_template(
+        _message({"type": "audio", "url": "unopened.wav"})
+    )
+    _, audio, _ = _embedding_gemma2_media()
+    requested = []
+
+    def load_audio(value, sampling_rate):
+        if isinstance(value, str) and value == synthetic_video:
+            requested.append((value, sampling_rate))
+            return audio
+        return value
+
+    monkeypatch.setattr(processor, "_load_audio", load_audio)
+    conversation = _message({"type": "video", "url": synthetic_video})
+    before = deepcopy(conversation)
+    result = processor.apply_chat_template(
+        conversation,
+        load_audio_from_video=True,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="np",
+    )
+    assert requested == [(synthetic_video, 16000)]
+    assert {"input_features", "pixel_values_videos"} <= set(result)
+    assert conversation == before
 
 
 @pytest.mark.parametrize(

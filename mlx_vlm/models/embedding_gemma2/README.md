@@ -11,8 +11,10 @@ and media tokens participate in pooling; padding does not.
 
 ## Setup
 
-The local processor works with Transformers >= 5.14.0 and uses its Gemma 4 image
-and audio components.
+The local processor works with Transformers >= 5.14.0. Images and video frames
+use NumPy/Pillow preprocessing; audio uses the NumPy Gemma 4 feature extractor.
+Media files use MLX-VLM's existing audio loader and OpenCV video decoder.
+Torch, TorchVision, TorchAudio, and TorchCodec are not required.
 
 ## Text retrieval and Matryoshka embeddings
 
@@ -120,8 +122,9 @@ extras revision `f6c512df20896fd06f85d39db10c45a0a9849ef8`, and the supplied
 Transformers 5.18.0.dev0 reference on CPU. The reference always runs in float32;
 MLX runs on an Apple M5 Max with float32 or BF16 weights/activations.
 
-All **20 Python examples pass in both precisions**, with **32 paired forward
-comparisons per precision**. This covers both Sentence Transformers and AutoModel
+With reference-preprocessed inputs, all **20 Python examples pass in both
+precisions**, with **32 paired forward comparisons per precision**. This covers
+both Sentence Transformers and AutoModel
 examples: retrieval, prompts, Matryoshka, single/composed modalities, ordering,
 manual interleaving, heterogeneous batches, selective towers, image budgets,
 video sampling/timestamps, and direct/nested processor calls. Processor-only
@@ -153,7 +156,16 @@ python -m pytest -q mlx_vlm/tests/test_models.py \
 
 Processor validation covers 49 cases across text, images, audio, video, mixed
 and nested batches, visual budgets, frame sampling, timestamps, and invalid
-inputs. All numeric outputs match the reference exactly, both before and after
-processor save/reload, including with stock Transformers 5.14.0. Full BF16 and
-8-bit conversions preserve processor outputs and settings; BF16 embeddings are
-bit-identical before and after conversion across all modalities and mixed batches.
+inputs, with Torch packages absent and stock Transformers 5.14.0. Token IDs,
+masks, patch positions, frame counts, and tested audio features match the source
+exactly. Saving and reloading preserves processor outputs and settings.
+Full BF16 and 8-bit conversions preserve these settings and outputs across all
+modalities; BF16 embeddings are bit-identical before and after conversion.
+
+Pillow resizing and OpenCV decoding are not pixel-identical to the source's
+TorchVision/TorchCodec pipeline. On 37 valid cases using the same BF16 model,
+source versus local preprocessing has minimum embedding cosine 0.998779 and
+maximum embedding absolute error 0.00614. The video-file case with timestamps
+misses the 0.999 cosine threshold; the other 36 pass. Excluding file decoding,
+minimum cosine is 0.999886. These preprocessing comparisons are separate from
+the model-only numerical checks above.
