@@ -33,6 +33,39 @@ def pose_segments(config):
     return shape, scale, hand, face, face + config.num_face_comps
 
 
+MHR_KEY_MAP = {
+    "character.skeleton.joint_translation_offsets": "joint_translation_offsets",
+    "character.skeleton.joint_prerotations": "joint_prerotations",
+    "character.skeleton.joint_parents": "joint_parents",
+    "character.skeleton.pmi": None,  # skip — not used at inference
+    "character.mesh.rest_vertices": None,  # skip — skinning uses blend_shape result
+    "character.mesh.faces": None,  # skip
+    "character.mesh.texcoords": None,  # skip
+    "character.mesh.texcoord_faces": None,  # skip
+    "character.parameter_transform.parameter_transform": "parameter_transform",
+    "character.parameter_transform.pose_parameters": "pose_parameters",
+    "character.parameter_transform.rigid_parameters": "rigid_parameters",
+    "character.parameter_transform.scaling_parameters": "scaling_parameters",
+    "character.parameter_limits.minmax_min": "minmax_min",
+    "character.parameter_limits.minmax_max": "minmax_max",
+    "character.parameter_limits.minmax_weight": "minmax_weight",
+    "character.parameter_limits.minmax_parameter_index": "minmax_parameter_index",
+    "character.parameter_limits.ellipsoid_ellipsoid": None,
+    "character.parameter_limits.ellipsoid_ellipsoid_inv": None,
+    "character.parameter_limits.ellipsoid_offset": None,
+    "character.blend_shape.base_shape": "base_shape",
+    "character.blend_shape.shape_vectors": "shape_vectors",
+    "character.linear_blend_skinning.inverse_bind_pose": "inverse_bind_pose",
+    "character.linear_blend_skinning.skin_indices_flattened": "skin_indices",
+    "character.linear_blend_skinning.skin_weights_flattened": "skin_weights",
+    "character.linear_blend_skinning.vert_indices_flattened": "vert_indices",
+    "face_expressions.shape_vectors": "face_shape_vectors",
+    "pose_correctives.pose_dirs_predictor.0.sparse_indices": "pc_sparse_indices",
+    "pose_correctives.pose_dirs_predictor.0.sparse_weight": "pc_sparse_weight",
+    "pose_correctives.pose_dirs_predictor.2.weight": "pc_linear_weight",
+}
+
+
 class MHRHead(nn.Module):
     """MHR pose prediction head.
 
@@ -237,37 +270,6 @@ class MHRHead(nn.Module):
         from safetensors import safe_open
 
         # Key mapping: safetensors prefix -> (model prefix, attr remap)
-        MHR_KEY_MAP = {
-            "character.skeleton.joint_translation_offsets": "joint_translation_offsets",
-            "character.skeleton.joint_prerotations": "joint_prerotations",
-            "character.skeleton.joint_parents": "joint_parents",
-            "character.skeleton.pmi": None,  # skip — not used at inference
-            "character.mesh.rest_vertices": None,  # skip — skinning uses blend_shape result
-            "character.mesh.faces": None,  # skip
-            "character.mesh.texcoords": None,  # skip
-            "character.mesh.texcoord_faces": None,  # skip
-            "character.parameter_transform.parameter_transform": "parameter_transform",
-            "character.parameter_transform.pose_parameters": "pose_parameters",
-            "character.parameter_transform.rigid_parameters": "rigid_parameters",
-            "character.parameter_transform.scaling_parameters": "scaling_parameters",
-            "character.parameter_limits.minmax_min": "minmax_min",
-            "character.parameter_limits.minmax_max": "minmax_max",
-            "character.parameter_limits.minmax_weight": "minmax_weight",
-            "character.parameter_limits.minmax_parameter_index": "minmax_parameter_index",
-            "character.parameter_limits.ellipsoid_ellipsoid": None,
-            "character.parameter_limits.ellipsoid_ellipsoid_inv": None,
-            "character.parameter_limits.ellipsoid_offset": None,
-            "character.blend_shape.base_shape": "base_shape",
-            "character.blend_shape.shape_vectors": "shape_vectors",
-            "character.linear_blend_skinning.inverse_bind_pose": "inverse_bind_pose",
-            "character.linear_blend_skinning.skin_indices_flattened": "skin_indices",
-            "character.linear_blend_skinning.skin_weights_flattened": "skin_weights",
-            "character.linear_blend_skinning.vert_indices_flattened": "vert_indices",
-            "face_expressions.shape_vectors": "face_shape_vectors",
-            "pose_correctives.pose_dirs_predictor.0.sparse_indices": "pc_sparse_indices",
-            "pose_correctives.pose_dirs_predictor.0.sparse_weight": "pc_sparse_weight",
-            "pose_correctives.pose_dirs_predictor.2.weight": "pc_linear_weight",
-        }
 
         weights = []
         with safe_open(safetensors_path, framework="numpy") as f:

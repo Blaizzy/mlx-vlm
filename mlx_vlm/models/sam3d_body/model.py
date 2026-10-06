@@ -677,8 +677,17 @@ class SAM3DBody(nn.Module):
             "head_pose.body_model.texcoords",
         )
 
+        from .mhr_head import MHR_KEY_MAP
+
         sanitized = {}
         for key, tensor in weights.items():
+            if key.startswith("mhr."):
+                mapped = MHR_KEY_MAP.get(key[len("mhr.") :], False)
+                if mapped is False:
+                    raise ValueError(f"unknown MHR weight {key!r}")
+                if mapped is not None:
+                    sanitized[f"head_pose.body_model.{mapped}"] = tensor
+                continue
             if any(key == p[:-1] or key.startswith(p) for p in hand_prefixes):
                 continue
             if key in unused_mhr:
