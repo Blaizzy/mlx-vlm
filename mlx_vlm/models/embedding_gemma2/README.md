@@ -1,6 +1,6 @@
 # EmbeddingGemma 2
 
-Native MLX embeddings for `google/embeddinggemma-2`: text, images, audio,
+Native MLX embeddings for `nativ-community/embeddinggemma-2`: text, images, audio,
 video, and combinations of these modalities in a shared 768-dimensional space.
 The bidirectional encoder uses alternating local/full attention, projection-only
 per-layer inputs, and the Gemma 4 vision and audio towers.
@@ -21,7 +21,7 @@ import mlx.core as mx
 
 from mlx_vlm import load
 
-model, processor = load("google/embeddinggemma-2")
+model, processor = load("nativ-community/embeddinggemma-2")
 inputs = processor.tokenizer(
     [
         "task: search result | query: Which planet is known as the Red Planet?",
@@ -53,7 +53,7 @@ frames. Use `return_tensors="mlx"` to receive model-ready MLX arrays:
 ```python
 from mlx_vlm import load
 
-model, processor = load("google/embeddinggemma-2")
+model, processor = load("nativ-community/embeddinggemma-2")
 conversations = [
     [
         {"role": "system", "content": "title: none | text: "},
@@ -86,7 +86,7 @@ Mismatched expanded media-token and feature counts raise an error.
 from mlx_vlm.embedding_loader import load_embedding_model
 from mlx_vlm.utils import get_model_path, load_config
 
-path = get_model_path("google/embeddinggemma-2")
+path = get_model_path("nativ-community/embeddinggemma-2")
 config = load_config(path)
 config["audio_config"] = None
 config["vision_config"] = None  # Omit this assignment to retain images/video.
@@ -97,7 +97,7 @@ Unused tower weights are discarded during loading. The complete checkpoint can
 also be converted and reloaded with the standard CLI:
 
 ```sh
-mlx_vlm.convert --hf-path google/embeddinggemma-2 \
+mlx_vlm.convert --hf-path nativ-community/embeddinggemma-2 \
   --mlx-path embeddinggemma2-mlx --dtype bfloat16
 ```
 
