@@ -9,6 +9,10 @@ The model returns projected token representations in `last_hidden_state` and
 mask-aware mean-pooled, L2-normalized float32 vectors in `text_embeds`. Prompts
 and media tokens participate in pooling; padding does not.
 
+For runnable examples covering retrieval, Matryoshka dimensions, all four
+modalities, and mixed batches, see the
+[EmbeddingGemma 2 notebook](../../../examples/embedding_gemma2.ipynb).
+
 ## Setup
 
 The local processor works with Transformers >= 5.14.0. Images and video frames
