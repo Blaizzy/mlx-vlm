@@ -286,26 +286,11 @@ def _transform_compressed_tensors_nvfp4_weights(
     weights: Dict[str, mx.array],
     quantization_config: Dict[str, Any],
 ) -> Dict[str, mx.array]:
-    """Fold compressed-tensors NVFP4 weights into MLX-native ``nvfp4`` weights.
+    """Preserve packed FP4 weights, FP8 block scales and the global factor.
 
-    A ``nvfp4-pack-quantized`` checkpoint stores, per quantized Linear:
-
-    - ``<p>.weight_packed``       ``uint8``  ``[out, in // 2]``
-      (2x E2M1 per byte)
-    - ``<p>.weight_scale``        ``uint8``  ``[out, in // 16]``
-      (E4M3 per group of 16, loaded by ``mx.load`` as raw bytes -- the same
-      byte layout MLX uses for nvfp4 scales)
-    - ``<p>.weight_global_scale`` ``float32`` ``[1]`` (per-tensor; the real
-      weight is ``fp4 * weight_scale / weight_global_scale``)
-
-    MLX ``nvfp4`` ``QuantizedLinear`` expects ``<p>.weight`` (``uint32``) plus
-    ``<p>.scales`` (``uint8`` E4M3) and is single-level: the per-tensor global
-    scale is not representable (and is rejected on the Metal backend). Both
-    decodes are linear in the FP4 codes, so the global scale can be folded
-    directly into the per-group E4M3 scales:
-    ``scale_mlx = E4M3(weight_scale / global_scale)``. We keep the original
-    packed E2M1 codes bit-exact, avoiding the weight dequantize/re-quantize
-    round-trip entirely.
+    Compressed-tensors reconstructs weights as ``fp4 * scale / global_scale``.
+    Normalize the reciprocal to the shared FP32 ``weight_scale_2`` parameter
+    instead of rounding the effective block scales back to FP8.
     """
     packed_suffix = ".weight_packed"
 
@@ -317,18 +302,12 @@ def _transform_compressed_tensors_nvfp4_weights(
             scale = weights[f"{prefix}.weight_scale"]
             global_scale = weights[f"{prefix}.weight_global_scale"].astype(mx.float32)
 
-            # weight_packed is uint8 [out, in//2]; reinterpret as uint32
-            # [out, in//8] to match MLX's nvfp4 layout (bit-identical).
             new_weights[f"{prefix}.weight"] = packed.view(mx.uint32)
-
-            # Fold the per-tensor global scale into the per-group E4M3 scales:
-            # decode E4M3 -> divide by global scale -> re-encode E4M3.
-            # The FP4 codes are untouched; only the much smaller scale tensor
-            # is re-rounded once.
-            decoded = _E4M3_DECODE_LUT[scale.astype(mx.uint32)]
-            new_weights[f"{prefix}.scales"] = _f32_to_e4m3(decoded / global_scale)
-        elif key.endswith(".weight_scale") or key.endswith(".weight_global_scale"):
-            # Consumed alongside their ``.weight_packed``.
+            new_weights[f"{prefix}.scales"] = scale
+            new_weights[f"{prefix}.weight_scale_2"] = mx.reciprocal(
+                global_scale
+            ).reshape(())
+        elif key.endswith((".weight_scale",) + _COMPRESSED_TENSORS_DROP_SUFFIXES):
             continue
         else:
             new_weights[key] = weights[key]
@@ -387,7 +366,7 @@ def _transform_compressed_tensors_int4_weights(
 # ``model.load_weights(strict=True)`` as unexpected keys and abort startup.
 _COMPRESSED_TENSORS_DROP_SUFFIXES = (
     ".weight_shape",
-    ".weight_global_scale",  # folded into ``.scales`` alongside ``.weight_packed``
+    ".weight_global_scale",  # normalized to the FP32 ``.weight_scale_2`` factor
     ".weight_zero_point",
     ".input_global_scale",
     ".input_scale",
@@ -487,7 +466,7 @@ def _transform_compressed_tensors_mixed_weights(
     assignment produced:
 
     - ``.weight_packed`` + ``.weight_global_scale`` -> NVFP4
-      (folded to MLX-native ``nvfp4``, as ``_transform_..._nvfp4_weights`` does)
+      (keeps block scales and the reciprocal global factor separate)
     - ``.weight_packed`` alone -> INT4 ``pack-quantized`` (folded to ``affine``)
     - ``.weight_scale`` without ``.weight_packed`` -> channel-wise fp8
       ``float-quantized`` (dequantized to a dense weight)
@@ -538,8 +517,10 @@ def _transform_compressed_tensors_mixed_weights(
             if global_key in weights:  # NVFP4
                 global_scale = weights[global_key].astype(mx.float32)
                 new_weights[f"{prefix}.weight"] = value.view(mx.uint32)
-                decoded = _E4M3_DECODE_LUT[scale.astype(mx.uint32)]
-                new_weights[f"{prefix}.scales"] = _f32_to_e4m3(decoded / global_scale)
+                new_weights[f"{prefix}.scales"] = scale
+                new_weights[f"{prefix}.weight_scale_2"] = mx.reciprocal(
+                    global_scale
+                ).reshape(())
                 native_quant["nvfp4"] = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
             else:  # INT4 symmetric pack-quantized
                 new_weights[f"{prefix}.weight"] = value.view(mx.uint32)

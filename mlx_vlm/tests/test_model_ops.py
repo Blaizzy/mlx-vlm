@@ -51,6 +51,7 @@ from mlx_vlm.quantization.one_bit import (
     replace_one_bit_modules,
 )
 from mlx_vlm.utils import (
+    _transform_compressed_tensors_weights,
     _transform_modelopt_nvfp4_weights,
     get_model_and_args,
     load_model,
@@ -987,7 +988,10 @@ def test_scaled_nvfp4_linear_matches_reference(dtype, bias, shape):
 
 
 @pytest.mark.parametrize("activation_quantization", [False, True])
-def test_modelopt_global_scale_load_and_save(tmp_path, activation_quantization):
+@pytest.mark.parametrize(
+    "format", ["modelopt", "nvfp4-pack-quantized", "mixed-precision"]
+)
+def test_nvfp4_global_scale_load_and_save(tmp_path, activation_quantization, format):
     class Model(nn.Module):
         def __init__(self, config):
             super().__init__()
@@ -1010,6 +1014,17 @@ def test_modelopt_global_scale_load_and_save(tmp_path, activation_quantization):
         "model_type": "test_modelopt",
         "quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4"},
     }
+    if format != "modelopt":
+        weights["layer.weight_packed"] = weights.pop("layer.weight")
+        weights["layer.weight_global_scale"] = mx.array([14400], mx.bfloat16)
+        weights["layer.input_global_scale"] = weights.pop("layer.input_scale")
+        weights["layer.weight_shape"] = mx.array([4, 64])
+        weights.pop("layer.weight_scale_2")
+        config["quantization_config"] = {
+            "quant_method": "compressed-tensors",
+            "format": format,
+        }
+    factor = weights.get("layer.weight_scale_2", mx.array(1 / 14400, mx.float32))
     (tmp_path / "config.json").write_text(json.dumps(config))
     mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
     with patch("mlx_vlm.utils.get_model_and_args", return_value=(architecture, "test")):
@@ -1017,9 +1032,8 @@ def test_modelopt_global_scale_load_and_save(tmp_path, activation_quantization):
         assert isinstance(model.layer, ScaledQuantizedLinear)
         assert model.layer._quantize_activations == activation_quantization
         x = mx.full((2, 3, 64), 6.0, mx.bfloat16)
-        expected = mx.full(
-            (2, 3, 4), 6 * 64 * 256 * weights["layer.weight_scale_2"].item()
-        )
+        expected = mx.full((2, 3, 4), 6 * 64 * 256 * factor.item())
+        assert model.layer.weight_scale_2.dtype == mx.float32
         assert mx.allclose(model.layer(x), expected, atol=0.01, rtol=0.01).item()
 
         config["quantization"] = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
@@ -1074,13 +1088,18 @@ def test_scaled_nvfp4_experts_preserve_individual_scales(dtype, sorted_indices):
     "family",
     [
         "afmoe",
+        "bailing_moe",
+        "cohere2_moe",
+        "deepseek",
         "deepseek_v2",
         "deepseek_v3",
         "deepseek_v32",
         "deepseek_v41",
+        "deepseek_vl_v2",
         "exaone_moe",
         "glm4_moe",
         "glm4_moe_lite",
+        "glm4v_moe",
         "glm5_next",
         "kimi_k3",
         "kimi_vl",
@@ -1094,8 +1113,11 @@ def test_scaled_nvfp4_experts_preserve_individual_scales(dtype, sorted_indices):
         "qwen3_5_moe",
     ],
 )
-@pytest.mark.parametrize("global_scales", [False, True])
-def test_moe_sanitize_load_and_infer(family, global_scales):
+@pytest.mark.parametrize(
+    "format", ["native", "modelopt", "nvfp4-pack-quantized", "mixed-precision"]
+)
+def test_moe_sanitize_load_and_infer(family, format):
+    global_scales = format != "native"
     module = importlib.import_module(f"mlx_vlm.models.{family}.language")
     cls = module.LanguageModel
     args = SimpleNamespace(
@@ -1121,7 +1143,14 @@ def test_moe_sanitize_load_and_infer(family, global_scales):
     if family == "nemotron_h":
         root = "backbone.layers.0.mixer"
         projections = {"down_proj": "fc2", "up_proj": "fc1"}
-    if family in {"glm5_next", "kimi_k3", "kimi_vl", "llada2_moe"}:
+    if family in {
+        "deepseek_vl_v2",
+        "glm4v_moe",
+        "glm5_next",
+        "kimi_k3",
+        "kimi_vl",
+        "llada2_moe",
+    }:
         root = "language_model." + root
     if family == "qwen3_5_moe":
         cls = importlib.import_module("mlx_vlm.models.qwen3_5_moe").Model
@@ -1160,9 +1189,23 @@ def test_moe_sanitize_load_and_infer(family, global_scales):
         reference[target] = mx.broadcast_to(
             mx.array(scales)[:, None, None], (experts, 4, 64)
         )
-    weights, _ = _transform_modelopt_nvfp4_weights(
-        raw, {"quant_method": "modelopt", "quant_algo": "NVFP4"}
-    )
+    if format in {"nvfp4-pack-quantized", "mixed-precision"}:
+        for key in list(raw):
+            if key.endswith(".weight"):
+                raw[key + "_packed"] = raw.pop(key)
+            elif key.endswith(".weight_scale_2"):
+                prefix = key.removesuffix(".weight_scale_2")
+                raw[prefix + ".weight_global_scale"] = mx.reciprocal(
+                    raw.pop(key)
+                ).reshape(1)
+                raw[prefix + ".input_global_scale"] = mx.array([2.0])
+        weights, _ = _transform_compressed_tensors_weights(
+            raw, {"quant_method": "compressed-tensors", "format": format}
+        )
+    else:
+        weights, _ = _transform_modelopt_nvfp4_weights(
+            raw, {"quant_method": "modelopt", "quant_algo": "NVFP4"}
+        )
     if not global_scales:
         weights = {
             k: v for k, v in weights.items() if not k.endswith(".weight_scale_2")
