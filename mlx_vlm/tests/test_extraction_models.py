@@ -64,6 +64,41 @@ EXTRACTION_DATA = json.loads(
 EXTRACTION_CASES = {case["id"]: case for case in EXTRACTION_DATA["cases"]}
 
 
+def _config_value(config, name, default=None):
+    """Find a named field anywhere in a nested case config."""
+    stack = [config]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            if name in current:
+                return current[name]
+            stack.extend(current.values())
+    return default
+
+
+def _clip_tokenizer(vocab_size):
+    """A CLIP tokenizer with no vocabulary to download.
+
+    Prompts encode to unknown tokens, which is all a contract test needs, but
+    every id stays inside the model's embedding table.
+    """
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import CLIPTokenizerFast
+
+    vocab = {f"t{index}</w>": index for index in range(vocab_size - 2)}
+    vocab["<|startoftext|>"] = vocab_size - 2
+    vocab["<|endoftext|>"] = vocab_size - 1
+    backend = Tokenizer(models.BPE(vocab=vocab, merges=[], unk_token="<|endoftext|>"))
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    return CLIPTokenizerFast(
+        tokenizer_object=backend,
+        bos_token="<|startoftext|>",
+        eos_token="<|endoftext|>",
+        unk_token="<|endoftext|>",
+        pad_token="<|endoftext|>",
+    )
+
+
 def _extraction_config(name):
     return copy.deepcopy(EXTRACTION_CASES[name]["config"])
 
@@ -1988,7 +2023,11 @@ class ExtractionChecks:
             processor = getattr(
                 importlib.import_module(f"mlx_vlm.models.{case['module']}.{where}"),
                 name,
-            )()
+            )(**(spec.get("processor_kwargs") or {}))
+        if spec.get("tokenizer") == "clip":
+            processor._tokenizer = _clip_tokenizer(
+                _config_value(config, "vocab_size", 64)
+            )
 
         assert spec["task"] in model.extraction_types
         mx.random.seed(0)
@@ -2459,10 +2498,6 @@ class TestExtractionCLI(unittest.TestCase):
 class TestExtractionCoverage(unittest.TestCase):
     """Every model that declares tasks is reachable through the shared API."""
 
-    # sam3 and sam3_1 tokenize their prompt with CLIP, which a random-weight
-    # case has no vocabulary for.
-    UNCASED = {"sam3", "sam3_1"}
-
     @staticmethod
     def _declared():
         from mlx_vlm import models
@@ -2495,7 +2530,7 @@ class TestExtractionCoverage(unittest.TestCase):
             for case in EXTRACTION_DATA["cases"]
             if "extraction_api" in case
         }
-        self.assertEqual(set(self._declared()) - cased, self.UNCASED)
+        self.assertEqual(sorted(set(self._declared()) - cased), [])
 
     def test_sapiens2_derives_its_task_from_the_checkpoint(self):
         from mlx_vlm.models.sapiens2 import Model

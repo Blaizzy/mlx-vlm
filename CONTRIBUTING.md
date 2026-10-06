@@ -101,9 +101,14 @@ mode they were saved in, so a grayscale mask stays two-dimensional and a
 cutout keeps its alpha.
 
 Add `extraction_api` to the model's `checks` with a `task`, an `input_shape`
-and the `outputs` it must name; `kwargs` and `config_overrides` are optional.
-The check runs the model and asserts the declared outputs are present and
-finite, so a new model needs a case entry rather than a test of its own.
+and the `outputs` it must name. `kwargs`, `config_overrides`, `processor`
+and `processor_kwargs` are optional, as are `index_weights`, which seeds a
+parameter that holds indices rather than numbers with a run from a given
+start, and `tokenizer`, which hands the processor a vocabulary built in the
+test rather than downloaded. The check runs the model and asserts the
+declared outputs are present and finite, so a new model needs a case entry
+rather than a test of its own, and a model that declares `extraction_types`
+without one fails the coverage test.
 
 From the repository root, you can run the tests with:
 
