@@ -122,13 +122,10 @@ Both `load_embedding_model` and `mlx_vlm.load` accept the converted directory.
 
 ## Performance and quantization
 
-See [measured latency, memory, and quantization accuracy](BENCHMARKS.md) for
-BF16 and affine 4/6/8-bit results on Apple M5 Max. BF16 is fastest for text,
+BF16 and affine 4/6/8-bit were measured on Apple M5 Max. BF16 is fastest for text,
 image, and audio in these tests. 8-bit reduces full-model weight storage by
 17.1% with minimum embedding cosine 0.99966 against the float32 reference;
 plain 4-bit falls to 0.96716 and fails the documented accuracy limits.
-[Batch scaling measurements](BATCHED_BENCHMARKS.md) cover batches 1–32 for
-128/512-token text, images, audio, and video.
 
 ## Reference validation
 
@@ -157,17 +154,7 @@ BF16 conversion/reload produces bit-identical embeddings for text, image, audio,
 and video. A heterogeneous BF16 batch versus individual encoding has minimum
 cosine similarity 0.99997.
 
-Reproduce the full documentation comparison (the script downloads the pinned
-checkpoint and sample assets, verifies the documentation hash, and writes JSON):
-
-```sh
-python -m pip install 'sentence-transformers>=6.1' torch torchaudio torchcodec librosa soundfile
-python examples/validate_embedding_gemma2.py --dtype float32 --output-dir validation
-python examples/validate_embedding_gemma2.py --dtype bfloat16 --output-dir validation
-```
-
-The runner only adapts model/media locations and reference execution device/dtype;
-it executes the original example logic. Acceptance thresholds are cosine >=
+Acceptance thresholds are cosine >=
 0.999999 / 0.999 and embedding max error <= 1e-5 / 0.01 for float32 / BF16,
 respectively; token relative L2 bounds are 1e-4 / 0.2. Unit regressions cover
 bidirectional attention, the inclusive local-window boundary, explicit positions,
