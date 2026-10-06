@@ -755,6 +755,7 @@ def patch_model(
         )
     swapped = [0]
     missing_layers = []
+    undeclared_gating = []
 
     def visit(module, path=""):
         for name, child in list(module.items()):
@@ -779,6 +780,8 @@ def patch_model(
                         # intentional skip. Left un-swapped, it would silently
                         # run on random-init weights with no error anywhere.
                         missing_layers.append((lid, cp))
+                    elif lid is not None and getattr(child, "activation", None) is None:
+                        undeclared_gating.append((cp, type(child).__name__))
                     elif lid is not None:
                         if is_separate:
                             gate_quant = resolve_quant(f"{cp}.gate_proj")
@@ -832,6 +835,17 @@ def patch_model(
             f"match this model's routed experts: {detail}. This looks like a "
             "partial or corrupted repack() output -- re-run repack() rather than "
             "silently running those layers on random-init weights."
+        )
+    if undeclared_gating:
+        detail = ", ".join(f"{cp} ({cls})" for cp, cls in sorted(undeclared_gating))
+        raise ValueError(
+            f"Expert offload needs each switch layer's activation, and "
+            f"{len(undeclared_gating)} expose none: {detail}. An offloaded layer "
+            "calls `activation(x_up, x_gate)` to reproduce the resident layer's "
+            "gating exactly; reconstructing it here would silently compute the "
+            "wrong function for anything that isn't SiLU-gated. Set "
+            "`self.activation` on the switch layer and call it from `__call__` "
+            "so both paths share one definition."
         )
     if swapped[0] == 0:
         raise ValueError(

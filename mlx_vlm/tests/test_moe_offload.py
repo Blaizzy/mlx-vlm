@@ -10,8 +10,23 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-from mlx_vlm.models import deepseek_v3, laguna, minimax
+from mlx_vlm.models import deepseek_v3, diffusion_gemma, laguna, minimax
+from mlx_vlm.models.diffusion_gemma.language import DecoderLayer as DiffusionGemmaLayer
+from mlx_vlm.models.diffusion_gemma.language import Experts as DiffusionGemmaExperts
+from mlx_vlm.models.hy_v4.fused_switch_glu import FusedSwitchGLU
+from mlx_vlm.models.inkling.language import InklingSwitchGLU
 from mlx_vlm.models.laguna.language import LagunaPackedSwitchGLU
+from mlx_vlm.models.minimax_m3_vl.language import (
+    MiniMaxPackedSwitchGLU,
+    MiniMaxSwiGLUOAI,
+)
+from mlx_vlm.models.openai_privacy_filter.config import (
+    ModelConfig as PrivacyFilterConfig,
+)
+from mlx_vlm.models.openai_privacy_filter.openai_privacy_filter import (
+    Experts as PrivacyFilterExperts,
+)
+from mlx_vlm.models.switch_layers import SwitchGLU
 from mlx_vlm.moe_offload import ExpertStore, patch_model, plan, repack
 from mlx_vlm.utils import load_model, save_weights
 
@@ -49,7 +64,7 @@ def _deepseek_config():
     )
 
 
-def _build_and_repack(root, model=None, config=None):
+def _build_and_repack(root, model=None, config=None, quant_paths=("switch_mlp",)):
     if model is None:
         config = _deepseek_config()
         model = deepseek_v3.Model(config)
@@ -58,7 +73,7 @@ def _build_and_repack(root, model=None, config=None):
         model,
         group_size=32,
         bits=4,
-        class_predicate=lambda path, module: "switch_mlp" in path
+        class_predicate=lambda path, module: any(q in path for q in quant_paths)
         and hasattr(module, "to_quantized"),
     )
     mx.eval(model.parameters())
@@ -359,3 +374,117 @@ def test_repack_rewrites_stale_source_weight_index(tmp_path):
     offloaded = load_model(offload)
     assert getattr(offloaded, "moe_offload_store", None) is not None
     _assert_offload_parity(resident, offloaded(prompt).logits)
+
+
+_H, _I, _E, _K = 32, 64, 4, 2
+
+# Every switch layer patch_model can swap, so a differently shaped one cannot
+# reach the swap without a parity test. Keyed by what builds it.
+_SWAPPABLE_BLOCKS = {
+    "switch_glu": lambda: SwitchGLU(_H, _I, _E),
+    "inkling": lambda: InklingSwitchGLU(_H, _I, _E),
+    "hy_v4": lambda: FusedSwitchGLU(_H, _I, _E),
+    "laguna": lambda: LagunaPackedSwitchGLU(_H, _I, _E),
+    "minimax_m3_vl": lambda: MiniMaxPackedSwitchGLU(_H, _I, _E, MiniMaxSwiGLUOAI()),
+    "diffusion_gemma": lambda: DiffusionGemmaExperts(
+        diffusion_gemma.TextConfig(
+            hidden_size=_H,
+            moe_intermediate_size=_I,
+            num_experts=_E,
+            top_k_experts=_K,
+        )
+    ),
+    "openai_privacy_filter": lambda: PrivacyFilterExperts(
+        PrivacyFilterConfig(
+            hidden_size=_H,
+            intermediate_size=_I,
+            num_local_experts=_E,
+            num_experts_per_tok=_K,
+        )
+    ),
+}
+
+
+def _wrap_block(block):
+    """A model exposing ``block`` at ``model.layers.0.experts``."""
+
+    class Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.experts = block
+
+    class InnerModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = [Layer()]
+
+    class BlockModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = {"model_type": "switch_block_probe"}
+            self.model_type = "switch_block_probe"
+            self.model = InnerModel()
+
+    return BlockModel()
+
+
+@pytest.mark.parametrize("family", sorted(_SWAPPABLE_BLOCKS))
+def test_every_swappable_block_matches_resident(tmp_path, family):
+    model = _wrap_block(_SWAPPABLE_BLOCKS[family]())
+    _, offload = _build_and_repack(
+        tmp_path, model, model.config, quant_paths=("experts",)
+    )
+    x = mx.random.normal((5, _H)).astype(mx.bfloat16)
+    indices = mx.random.randint(0, _E, (5, _K)).astype(mx.uint32)
+    mx.eval(x, indices)
+    resident = model.model.layers[0].experts(x, indices)
+    mx.eval(resident)
+
+    store = patch_model(model, str(offload))
+    assert store.swapped == 1
+    _assert_offload_parity(resident, model.model.layers[0].experts(x, indices))
+
+
+def test_patch_model_refuses_a_layer_that_declares_no_gating(tmp_path):
+    model = _wrap_block(SwitchGLU(_H, _I, _E))
+    _, offload = _build_and_repack(
+        tmp_path, model, model.config, quant_paths=("experts",)
+    )
+    del model.model.layers[0].experts.activation
+    with pytest.raises(ValueError, match="(?i)activation"):
+        patch_model(model, str(offload))
+
+
+def test_diffusion_gemma_layer_applies_router_weights():
+    """The block returns [..., K, D]; its caller must still weight and sum."""
+    config = diffusion_gemma.TextConfig(
+        hidden_size=_H,
+        moe_intermediate_size=_I,
+        num_experts=_E,
+        top_k_experts=_K,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=16,
+        global_head_dim=16,
+        intermediate_size=_I,
+        vocab_size=128,
+    )
+    layer = DiffusionGemmaLayer(config, 0)
+    mx.eval(layer.parameters())
+    x = mx.random.normal((1, 4, _H))
+    mx.eval(x)
+
+    indices = mx.zeros((4, _K), dtype=mx.uint32)
+    base = mx.full((4, _K), 0.25)
+
+    def run(weights):
+        layer.router = lambda _flat: (indices, weights)
+        out = layer(x)
+        mx.eval(out)
+        return out
+
+    once, twice = run(base), run(base * 2.0)
+    # Doubling the router weights must change the layer's output; if the
+    # combine were dropped, the expert branch would ignore them entirely.
+    assert float(mx.abs(once - twice).max()) > 1e-4
