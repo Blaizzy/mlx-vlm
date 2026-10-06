@@ -2264,3 +2264,100 @@ class TestLayaDecisionModel(unittest.TestCase):
                     self.assertEqual(
                         result["answers"]["route"]["probabilities"]["B"], expected
                     )
+
+
+def _bilinear_zeros(value, x, y):
+    """grid_sample(align_corners=False, padding_mode="zeros") at one [0, 1] point."""
+    H, W, _ = value.shape
+    ix, iy = x * W - 0.5, y * H - 0.5
+    x0, y0 = math.floor(ix), math.floor(iy)
+    out = np.zeros(value.shape[-1], dtype=np.float64)
+    for yy, wy in ((y0, y0 + 1 - iy), (y0 + 1, iy - y0)):
+        for xx, wx in ((x0, x0 + 1 - ix), (x0 + 1, ix - x0)):
+            if 0 <= yy < H and 0 <= xx < W:
+                out += wy * wx * value[yy, xx]
+    return out
+
+
+def test_rfdetr_deformable_attention_samples_every_level():
+    """Deformable cross-attention must sample each level from its own map.
+
+    Two levels with different shapes; checked against an explicit per-point
+    bilinear reference of the multi-scale deformable attention core.
+    """
+    from mlx_vlm.models.rfdetr.transformer import MSDeformableAttention
+
+    B, Q, D, heads, levels, points = 2, 5, 16, 4, 2, 3
+    shapes = [(6, 8), (3, 4)]
+    mx.random.seed(0)
+    attn = MSDeformableAttention(D, heads, levels, points)
+    query = mx.random.normal((B, Q, D))
+    ref = mx.concatenate(
+        [mx.random.uniform(0.2, 0.8, (B, Q, 1, 2)), mx.full((B, Q, 1, 2), 0.3)],
+        axis=-1,
+    )
+    value = mx.random.normal((B, sum(h * w for h, w in shapes), D))
+    out = np.array(attn(query, ref, value, shapes))
+
+    hd = D // heads
+    v = np.array(attn.value_proj(value), dtype=np.float64)
+    off = np.array(attn.sampling_offsets(query)).reshape(B, Q, heads, levels, points, 2)
+    w = np.array(
+        mx.softmax(
+            attn.attention_weights(query).reshape(B, Q, heads, levels * points), -1
+        )
+    ).reshape(B, Q, heads, levels, points)
+    r = np.array(ref)
+    expected = np.zeros((B, Q, D))
+    for b in range(B):
+        start = 0
+        for lvl, (H, W) in enumerate(shapes):
+            v_l = v[b, start : start + H * W].reshape(H, W, heads, hd)
+            start += H * W
+            for q in range(Q):
+                for h in range(heads):
+                    for p in range(points):
+                        loc = (
+                            r[b, q, 0, :2]
+                            + off[b, q, h, lvl, p] / points * r[b, q, 0, 2:] * 0.5
+                        )
+                        expected[b, q, h * hd : (h + 1) * hd] += w[
+                            b, q, h, lvl, p
+                        ] * _bilinear_zeros(v_l[:, :, h], *loc)
+    expected = np.array(attn.output_proj(mx.array(expected, dtype=mx.float32)))
+    np.testing.assert_allclose(out, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_rfdetr_multiscale_projector_levels():
+    """P3/P5 projector stages resample each backbone feature (2x up, 2x down)
+    and keep the checkpoint's stages / stages_sampling key layout."""
+    model = _extraction_model("rfdetr_multiscale")
+    B, h, w, C = 2, 8, 8, 384
+    features = [mx.random.normal((B, h, w, C)) for _ in range(4)]
+    levels = model.projector(features)
+    assert [x.shape for x in levels] == [(B, 2 * h, 2 * w, 64), (B, h // 2, w // 2, 64)]
+
+    params = dict(tree_flatten(model.projector.parameters()))
+    assert params["stages_sampling.0.3.0.weight"].shape == (C // 2, 2, 2, C)
+    assert params["stages_sampling.1.3.0.conv.weight"].shape == (C, 3, 3, C)
+    assert params["stages.0.0.cv1.conv.weight"].shape == (64, 1, 1, 4 * C // 2)
+    assert params["stages.1.0.cv1.conv.weight"].shape == (64, 1, 1, 4 * C)
+    assert params["stages.1.0.m.0.cv1.conv.weight"].shape == (32, 3, 3, 32)
+
+
+def test_rfdetr_sanitize_converts_projector_conv_transpose():
+    model = _extraction_model("rfdetr_multiscale")
+    expected = {
+        k: mx.arange(v.size, dtype=v.dtype).reshape(v.shape)
+        for k, v in tree_flatten(model.parameters())
+        if k.startswith("projector.stages_sampling.0.")
+    }
+    assert len(expected) == 8  # weight + bias per backbone feature
+    # PyTorch ConvTranspose2d layout: (in, out, kH, kW)
+    source = {
+        f"model.backbone.0.{k}": (v.transpose(3, 0, 1, 2) if v.ndim == 4 else v)
+        for k, v in expected.items()
+    }
+    converted = model.sanitize(source)
+    _assert_weights_equal(converted, expected)
+    _assert_weights_equal(model.sanitize(dict(converted)), expected)

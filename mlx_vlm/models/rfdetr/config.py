@@ -31,6 +31,8 @@ class ProjectorConfig(BaseModelConfig):
     hidden_dim: int = 256
     num_bottlenecks: int = 3
     bottleneck_channels: int = 128
+    # One output level per factor: 2.0 = P3, 1.0 = P4, 0.5 = P5
+    scale_factors: List[float] = field(default_factory=lambda: [1.0])
 
 
 @dataclass
@@ -139,9 +141,15 @@ class ModelConfig(BaseModelConfig):
 
         # Build projector config (always derived; underscore avoids framework loader match)
         n_features = len(self.out_feature_indexes)
-        in_channels = encoder_params["hidden_size"] * n_features
-        self._projector_config = ProjectorConfig(hidden_dim=self.hidden_dim)
-        self._projector_config.in_channels = in_channels
+        level2scale = {"P3": 2.0, "P4": 1.0, "P5": 0.5}
+        self._projector_config = ProjectorConfig(
+            hidden_dim=self.hidden_dim,
+            bottleneck_channels=self.hidden_dim // 2,
+            scale_factors=[level2scale[lvl] for lvl in self.projector_scale],
+        )
+        self._projector_config.in_channels = [
+            encoder_params["hidden_size"]
+        ] * n_features
 
         if self.transformer_config is None:
             self.transformer_config = TransformerConfig(
@@ -150,6 +158,7 @@ class ModelConfig(BaseModelConfig):
                 sa_nheads=self.sa_nheads,
                 ca_nheads=self.ca_nheads,
                 dec_n_points=self.dec_n_points,
+                n_levels=len(self.projector_scale),
                 num_queries=self.num_queries,
                 group_detr=self.group_detr,
                 num_classes=self.num_classes + 1,  # +1 for background
