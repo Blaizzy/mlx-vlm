@@ -62,13 +62,7 @@ class Model(Qwen3_5Model):
                     )
             elif f"{prefix}.experts.0.up_proj.weight" in weights:
                 for name in ["up_proj", "down_proj", "gate_proj"]:
-                    for suffix in [
-                        "weight",
-                        "scales",
-                        "biases",
-                        "weight_scale_2",
-                        "weight_global_scale",
-                    ]:
+                    for suffix in ["weight", "scales", "biases", "weight_scale_2"]:
                         first_key = f"{prefix}.experts.0.{name}.{suffix}"
                         if first_key not in weights:
                             continue

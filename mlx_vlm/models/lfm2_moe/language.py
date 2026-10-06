@@ -30,13 +30,7 @@ class LanguageModel(Lfm2LanguageModel):
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{layer_idx}.feed_forward"
             for proj in ["gate_proj", "down_proj", "up_proj"]:
-                for suffix in [
-                    "weight",
-                    "scales",
-                    "biases",
-                    "weight_scale_2",
-                    "weight_global_scale",
-                ]:
+                for suffix in ["weight", "scales", "biases", "weight_scale_2"]:
                     first_key = f"{prefix}.experts.0.{proj}.{suffix}"
                     if first_key not in weights:
                         continue

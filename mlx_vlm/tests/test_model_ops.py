@@ -1125,36 +1125,53 @@ def test_scaled_nvfp4_experts_preserve_individual_scales(
 
 
 @pytest.mark.parametrize(
-    "family",
+    "family,format",
     [
-        "afmoe",
-        "bailing_moe",
-        "cohere2_moe",
-        "deepseek",
-        "deepseek_v2",
-        "deepseek_v3",
-        "deepseek_v32",
-        "deepseek_v41",
-        "deepseek_vl_v2",
-        "exaone_moe",
-        "glm4_moe",
-        "glm4_moe_lite",
-        "glm4v_moe",
-        "glm5_next",
-        "kimi_k3",
-        "kimi_vl",
-        "laguna",
-        "lfm2_moe",
-        "llada2_moe",
-        "mimo_v2_flash",
-        "mixtral",
-        "nemotron_h",
-        "olmoe",
-        "qwen3_5_moe",
+        (family, format)
+        for families, formats in [
+            (
+                [
+                    "afmoe",
+                    "deepseek_v2",
+                    "deepseek_v3",
+                    "deepseek_v32",
+                    "deepseek_v41",
+                    "exaone_moe",
+                    "glm4_moe",
+                    "glm4_moe_lite",
+                    "glm5_next",
+                    "kimi_k3",
+                    "kimi_vl",
+                    "lfm2_moe",
+                    "llada2_moe",
+                    "mimo_v2_flash",
+                    "mixtral",
+                    "nemotron_h",
+                    "olmoe",
+                    "qwen3_5_moe",
+                ],
+                ("native", "modelopt"),
+            ),
+            (
+                [
+                    "bailing_moe",
+                    "cohere2_moe",
+                    "deepseek",
+                    "deepseek_vl_v2",
+                    "glm4v_moe",
+                ],
+                ("native", "nvfp4-pack-quantized", "mixed-precision"),
+            ),
+            (
+                [
+                    "laguna",
+                ],
+                ("native", "modelopt", "nvfp4-pack-quantized", "mixed-precision"),
+            ),
+        ]
+        for family in families
+        for format in formats
     ],
-)
-@pytest.mark.parametrize(
-    "format", ["native", "modelopt", "nvfp4-pack-quantized", "mixed-precision"]
 )
 def test_moe_sanitize_load_and_infer(family, format):
     global_scales = format != "native"

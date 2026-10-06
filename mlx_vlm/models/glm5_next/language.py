@@ -1031,13 +1031,7 @@ class LanguageModel(nn.Module):
 
             if isinstance(layer.mlp, Glm5NextMoE):
                 for name in ("gate_proj", "up_proj", "down_proj"):
-                    for suffix in (
-                        "weight",
-                        "scales",
-                        "biases",
-                        "weight_scale_2",
-                        "weight_global_scale",
-                    ):
+                    for suffix in ("weight", "scales", "biases", "weight_scale_2"):
                         key0 = f"{prefix}.mlp.experts.0.{name}.{suffix}"
                         if key0 in weights:
                             values = [
