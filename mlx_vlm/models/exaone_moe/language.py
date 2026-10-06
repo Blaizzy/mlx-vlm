@@ -292,7 +292,7 @@ class LanguageModel(nn.Module):
                 )
 
             for m in ["gate_proj", "down_proj", "up_proj"]:
-                for k in ["weight", "scales", "biases"]:
+                for k in ["weight", "scales", "biases", "weight_scale_2"]:
                     first_key = f"{prefix}.mlp.experts.0.{m}.{k}"
                     last_key = (
                         f"{prefix}.mlp.experts.{self.args.num_experts - 1}.{m}.{k}"

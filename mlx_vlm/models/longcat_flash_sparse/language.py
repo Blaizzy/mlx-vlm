@@ -600,7 +600,7 @@ class LanguageModel(nn.Module):
         for l in range(self.args.num_layers):
             prefix = f"model.layers.{l}"
             for _, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
-                for k in ["weight", "scales", "biases"]:
+                for k in ["weight", "scales", "biases", "weight_scale_2"]:
                     if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
                         to_join = [
                             weights.pop(f"{prefix}.mlp.experts.{e}.{m}.{k}")

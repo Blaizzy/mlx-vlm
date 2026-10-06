@@ -212,7 +212,10 @@ def dequantize_model(model: nn.Module) -> nn.Module:
             module.mode,
         )
         if isinstance(module, ScaledQuantizedLinear):
-            weight = weight * mx.expand_dims(module.weight_scale_2, (-2, -1))
+            scale = module.weight_scale_2
+            weight = weight * scale.reshape(
+                scale.shape + (1,) * (weight.ndim - scale.ndim)
+            )
         args = weight.shape[::-1]
         m = cls(*args, **kwargs)
         if bias:
