@@ -8,7 +8,7 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten
 
 from .backbone import Sapiens2Backbone
-from .config import ModelConfig
+from .config import ARCHITECTURE_TASKS, ModelConfig
 from .heads import DeconvHead, PixelShuffleHead
 
 # q/k/v projection keys of the checkpoint, merged into ``wqkv`` on load.
@@ -33,6 +33,12 @@ class Model(nn.Module):
         self.backbone = Sapiens2Backbone(config)
 
         self.decode_head = None
+        if self.task == "backbone" and config.head_config is not None:
+            raise ValueError(
+                "config.json carries a head_config but its architectures do not "
+                "name a task, so the head would be dropped and its weights left "
+                f"unloaded; set architectures to one of {sorted(ARCHITECTURE_TASKS)}"
+            )
         if self.task != "backbone":
             if config.head_config is None:
                 raise ValueError(
