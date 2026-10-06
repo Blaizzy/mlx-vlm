@@ -1143,6 +1143,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             )
         model = quantize_activations(model)
 
+    # TODO (Prince): Move NVFP4 extra scale handling to MLX core.
     replace_scaled_quantized_linears(model, weights)
 
     if is_offload_dir:
