@@ -13,8 +13,13 @@ and media tokens participate in pooling; padding does not.
 
 The local processor works with Transformers >= 5.14.0. Images and video frames
 use NumPy/Pillow preprocessing; audio uses the NumPy Gemma 4 feature extractor.
-Media files use MLX-VLM's existing audio loader and OpenCV video decoder.
-Torch, TorchVision, TorchAudio, and TorchCodec are not required.
+Media files use MLX-VLM's existing audio loader and OpenCV's bundled video
+libraries. On Apple Silicon with a compatible FFmpeg 7 bundle, video decoding
+uses packet timestamps for sampling and a Metal kernel for YUV-to-RGB conversion.
+Library versions are checked before native structures are accessed. Other
+builds and unsupported formats use the existing OpenCV decoder, with a warning
+that colors and frame timing may differ from the reference. Torch, TorchVision,
+TorchAudio, TorchCodec, and PyAV are not required; no dependencies are added.
 
 ## Text retrieval and Matryoshka embeddings
 
@@ -162,10 +167,25 @@ exactly. Saving and reloading preserves processor outputs and settings.
 Full BF16 and 8-bit conversions preserve these settings and outputs across all
 modalities; BF16 embeddings are bit-identical before and after conversion.
 
-Pillow resizing and OpenCV decoding are not pixel-identical to the source's
-TorchVision/TorchCodec pipeline. On 37 valid cases using the same BF16 model,
-source versus local preprocessing has minimum embedding cosine 0.998779 and
-maximum embedding absolute error 0.00614. The video-file case with timestamps
-misses the 0.999 cosine threshold; the other 36 pass. Excluding file decoding,
-minimum cosine is 0.999886. These preprocessing comparisons are separate from
-the model-only numerical checks above.
+With the Metal video path, all **37 valid preprocessing comparisons pass**
+using the same BF16 model: minimum cosine **0.999886** and maximum embedding
+absolute error **0.001902**. These comparisons isolate preprocessing differences
+from model arithmetic.
+
+A separate 17-clip corpus covers H.264, MPEG-4, MJPEG, VP9, 10-bit HEVC, ProRes
+4:2:2, portrait/4K footage, full/limited range, and variable frame rate. All
+**51 cases** (three sampling policies per clip) pass against the float32
+Transformers reference at dimensions 128, 256, 512, and 768, with minimum cosine
+**0.999531** and maximum embedding absolute error **0.005486**. Frame indices,
+token IDs, masks, positions, and frame counts match in every case. Decoded RGB
+is byte-identical in 48 cases; the three HEVC cases have small color differences
+and still pass the embedding thresholds.
+
+These results use the normal loaded and saved/reloaded processor with OpenCV
+5.0.0.93's FFmpeg 7 libraries, MLX 0.32.3, and stock Transformers 5.14.0 on
+Apple M5 Max, with Torch packages and PyAV imports blocked. The frozen reference
+uses Transformers 5.18.0.dev0, TorchCodec 0.16.0, and FFmpeg 8.1.2. They are
+numerical parity checks on this corpus, not retrieval-quality measurements or
+a guarantee of parity on every decoder build. The Metal path handles supported
+planar 8/10-bit YUV with even frame dimensions; display transforms, interlacing,
+HDR, other layouts, URLs, and incompatible library builds fall back to OpenCV.

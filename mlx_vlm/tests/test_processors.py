@@ -3166,7 +3166,7 @@ def test_embedding_gemma2_missing_media_is_rejected(
 
 @pytest.mark.parametrize("quantize", [False, True])
 def test_embedding_gemma2_conversion_saves_processor(
-    tmp_path, embedding_gemma2_processor, quantize
+    tmp_path, embedding_gemma2_processor, quantize, synthetic_video
 ):
     from dataclasses import asdict
 
@@ -3213,10 +3213,226 @@ def test_embedding_gemma2_conversion_saves_processor(
     actual = loaded_processor(**inputs)
     for key, expected in p(**inputs).items():
         equal(actual[key], expected)
+    file_inputs = dict(
+        videos=[synthetic_video], add_timestamps=True, return_tensors="np"
+    )
+    file_actual = loaded_processor(**file_inputs)
+    for key, expected in p(**file_inputs).items():
+        equal(file_actual[key], expected)
     text = loaded_processor(text="hello", return_tensors="mlx")
     output = loaded_model(**text).text_embeds
     assert output.shape == (1, 24)
     assert mx.all(mx.isfinite(output)).item()
+
+
+@pytest.fixture
+def embedding_gemma2_decoder():
+    from mlx_vlm.models.embedding_gemma2 import _video_decoder as decoder
+
+    try:
+        decoder._load_ffmpeg()
+    except decoder.VideoDecodeUnavailable as exc:
+        pytest.skip(str(exc))
+    return decoder
+
+
+@pytest.mark.parametrize("library", ["avformat", "avcodec", "avutil"])
+def test_embedding_gemma2_rejects_unknown_ffmpeg_abi(tmp_path, monkeypatch, library):
+    from mlx_vlm.models.embedding_gemma2 import _video_decoder as decoder
+
+    libraries = {}
+    for stem, major in (("avformat", 61), ("avcodec", 61), ("avutil", 59)):
+        path = tmp_path / f"lib{stem}.dylib"
+        path.touch()
+        lib = Mock()
+        getattr(lib, stem + "_version").return_value = (major + (stem == library)) << 16
+        libraries[str(path)] = lib
+    monkeypatch.setattr(decoder.C, "CDLL", lambda path: libraries[path])
+    with patch.object(decoder._FFmpeg, "bind") as bind:
+        with pytest.raises(decoder.VideoDecodeUnavailable, match="Unsupported .* ABI"):
+            decoder._FFmpeg(tmp_path)
+        bind.assert_not_called()  # Reject before any native decoder operation.
+
+
+@pytest.mark.parametrize("reason", ["libraries", "metal", "platform"])
+def test_embedding_gemma2_missing_native_backend(tmp_path, monkeypatch, reason):
+    import cv2
+
+    from mlx_vlm.models.embedding_gemma2 import _video_decoder as decoder
+
+    monkeypatch.setattr(decoder.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(decoder.platform, "machine", lambda: "arm64")
+    monkeypatch.setattr(mx.metal, "is_available", lambda: reason != "metal")
+    monkeypatch.setattr(cv2, "__file__", str(tmp_path / "cv2" / "__init__.py"))
+    if reason == "platform":
+        monkeypatch.setattr(decoder.platform, "machine", lambda: "x86_64")
+    # Bypass the cache so a previously loaded bundle cannot hide missing support.
+    with pytest.raises(decoder.VideoDecodeUnavailable):
+        decoder._load_ffmpeg.__wrapped__()
+
+
+@pytest.mark.parametrize("failure", ["environment", "format", "kernel"])
+def test_embedding_gemma2_video_fallback(
+    embedding_gemma2_processor, synthetic_video, monkeypatch, failure
+):
+    from mlx_vlm.models.embedding_gemma2 import _video_decoder as decoder
+    from mlx_vlm.models.embedding_gemma2 import _video_kernel as kernel
+
+    def unavailable(*args, **kwargs):
+        raise decoder.VideoDecodeUnavailable("Unsupported test backend")
+
+    if failure == "environment":
+        monkeypatch.setattr(decoder, "_load_ffmpeg", unavailable)
+    else:
+        try:
+            decoder._load_ffmpeg()
+        except decoder.VideoDecodeUnavailable as exc:
+            pytest.skip(str(exc))
+        if failure == "format":
+            original = decoder.Decoder.copy_frame
+            calls = 0
+
+            def copy_frame(self, frame):
+                nonlocal calls
+                calls += 1
+                if calls > 1:
+                    unavailable()
+                return original(self, frame)
+
+            monkeypatch.setattr(decoder.Decoder, "copy_frame", copy_frame)
+        else:
+
+            def kernel_error(*args):
+                raise RuntimeError("Metal compiler failure")
+
+            monkeypatch.setattr(kernel, "yuv_to_rgb", kernel_error)
+    sampler = lambda metadata, **kw: np.array([0, 59, 599])
+    expected, info = load_video(synthetic_video, frame_sampler=sampler)
+    actual, metadata = embedding_gemma2_processor.video_processor._decode_video(
+        synthetic_video, sampler
+    )
+    equal(actual, expected.transpose(0, 2, 3, 1))
+    equal(metadata.frames_indices, info.frames_indices)
+    assert metadata.video_backend == "opencv"
+    assert metadata.fps == info.fps
+
+
+def test_embedding_gemma2_native_seek_and_cleanup(
+    embedding_gemma2_decoder, synthetic_video
+):
+    module = embedding_gemma2_decoder
+    with module.Decoder(synthetic_video) as decoder:
+        last, _ = decoder.get(599)
+        first, _ = decoder.get(0)
+        repeated, _ = decoder.get(599)
+        for actual, expected in zip(repeated, last):
+            equal(actual, expected)
+        assert not np.array_equal(first[0], last[0])
+        assert decoder.metadata == dict(total_num_frames=600, fps=30, duration=20)
+    decoder.close()  # Closing twice is harmless, including after partial failure.
+    assert not any(
+        (decoder.context, decoder.codec_context, decoder.frame, decoder.packet)
+    )
+    failed = module.Decoder.__new__(module.Decoder)
+    with patch.object(module._load_ffmpeg(), "avcodec_open2", return_value=-22):
+        with pytest.raises(module.VideoDecodeUnavailable):
+            failed.__init__(synthetic_video)
+    assert not any((failed.context, failed.codec_context, failed.frame, failed.packet))
+
+
+@pytest.mark.parametrize("indices", [[], [-1], [600]])
+def test_embedding_gemma2_native_invalid_sampling(
+    embedding_gemma2_decoder, synthetic_video, indices
+):
+    with pytest.raises(ValueError, match="Frame indices"):
+        embedding_gemma2_decoder.decode_video(synthetic_video, lambda metadata: indices)
+
+
+@pytest.mark.parametrize("layout", ["rgb", "hdr", "interlaced", "stride", "odd"])
+def test_embedding_gemma2_native_unsupported_frame(
+    embedding_gemma2_decoder, synthetic_video, layout
+):
+    module = embedding_gemma2_decoder
+    with module.Decoder(synthetic_video) as decoder:
+        frame = module.Frame(width=16, height=8)
+        frame.format = decoder.api.av_get_pix_fmt(
+            b"rgb24" if layout == "rgb" else b"yuv420p"
+        )
+        frame.color_trc = 16 if layout == "hdr" else 2
+        frame.flags = 8 if layout == "interlaced" else 0
+        if layout == "odd":
+            frame.width = 17
+        with pytest.raises(module.VideoDecodeUnavailable):
+            decoder.copy_frame(frame)
+
+
+@pytest.mark.parametrize("mov", [False, True])
+def test_embedding_gemma2_variable_packet_timing(mov):
+    from mlx_vlm.models.embedding_gemma2 import _video_decoder as module
+
+    decoder = module.Decoder.__new__(module.Decoder)
+    storage = module.Packet()
+    decoder.packet = module.C.pointer(storage)
+    decoder.context = None
+    decoder.index = 0
+    decoder.time_base = (1, 10)
+    decoder.is_mov = mov
+    # Decode order differs from presentation order, as in a video with B-frames.
+    packets = iter([(0, 2, -2), (9, 2, 0), (2, 2, 3), (5, 2, 7)])
+
+    def read_packet(context, packet):
+        try:
+            storage.pts, storage.duration, storage.dts = next(packets)
+        except StopIteration:
+            return module.EOF
+        return 0
+
+    decoder.api = SimpleNamespace(
+        av_read_frame=read_packet,
+        av_packet_unref=lambda p: None,
+        check=lambda result: result,
+    )
+    timeline = decoder.scan()
+    assert [p[0] for p in timeline] == [0, 2, 5, 9]
+    assert [p[1] for p in timeline] == ([2, 4, 2, 3] if mov else [2, 2, 2, 2])
+    assert decoder.metadata["duration"] == pytest.approx(1.2 if mov else 1.1)
+
+
+@pytest.mark.parametrize(
+    "fmt,depth,chroma_y,width,expected",
+    [
+        ("yuv420p", 8, 1, 32, [254, 0, 0]),
+        ("yuv420p", 8, 1, 18, [252, 0, 0]),
+        ("yuvj420p", 8, 1, 32, [238, 14, 14]),
+        ("yuvj420p", 8, 1, 18, [238, 15, 14]),
+        ("yuv420p10le", 10, 1, 32, [252, 0, 0]),
+        ("yuv422p10le", 10, 0, 18, [252, 0, 0]),
+    ],
+)
+def test_embedding_gemma2_metal_color_rounding(fmt, depth, chroma_y, width, expected):
+    """Golden RGB from FFmpeg 8.1.2, rawvideo -> rgb24 with sws_flags=0."""
+    if not mx.metal.is_available():
+        pytest.skip("Metal is unavailable")
+    from mlx_vlm.models.embedding_gemma2._video_kernel import yuv_to_rgb
+
+    dtype = np.uint8 if depth == 8 else np.uint16
+    planes = [np.full((6, width), 81 << (depth - 8), dtype)] + [
+        np.full((6 >> chroma_y, width // 2), value << (depth - 8), dtype)
+        for value in (90, 240)
+    ]
+    actual = np.asarray(
+        yuv_to_rgb(
+            planes,
+            dict(
+                colorspace=2,
+                format=fmt,
+                depth=depth,
+                log2_chroma_w=1,
+                log2_chroma_h=chroma_y,
+            ),
+        )
+    )
+    equal(actual, np.broadcast_to(np.array(expected, dtype=np.uint8), (6, width, 3)))
 
 
 @pytest.mark.parametrize("modality", ["image", "audio"])

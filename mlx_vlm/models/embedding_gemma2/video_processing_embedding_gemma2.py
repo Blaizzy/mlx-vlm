@@ -151,6 +151,16 @@ class EmbeddingGemma2VideoProcessor(Gemma4VideoProcessor):
 
     @staticmethod
     def _decode_video(path, sampler):
+        from ._video_decoder import VideoDecodeUnavailable, decode_video
+
+        try:
+            return decode_video(path, sampler)
+        except VideoDecodeUnavailable as exc:
+            logger.warning_once(
+                f"Using OpenCV video decoding: {exc}. Colors and frame timing may "
+                "differ from the reference decoder."
+            )
+
         from mlx_vlm.utils import load_video
 
         def sample(metadata, **kwargs):
