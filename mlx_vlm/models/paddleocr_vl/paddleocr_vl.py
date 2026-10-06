@@ -33,8 +33,13 @@ class Model(nn.Module):
         if pixel_values is None:
             self.language_model._position_ids = None
             self.language_model._rope_deltas = None
+            position_ids, rope_deltas = self.language_model.get_rope_index(
+                input_ids, None, None, mask
+            )
             return InputEmbeddingsFeatures(
-                inputs_embeds=self.language_model.model.embed_tokens(input_ids)
+                inputs_embeds=self.language_model.model.embed_tokens(input_ids),
+                position_ids=position_ids,
+                rope_deltas=rope_deltas,
             )
 
         dtype = self.visual.embeddings.patch_embedding.weight.dtype
@@ -60,6 +65,7 @@ class Model(nn.Module):
             input_ids,
         )
 
+        position_ids, rope_deltas = None, None
         if image_grid_thw is not None or video_grid_thw is not None:
             position_ids, rope_deltas = self.language_model.get_rope_index(
                 input_ids, image_grid_thw, video_grid_thw, mask
@@ -67,7 +73,11 @@ class Model(nn.Module):
             self.language_model._position_ids = position_ids
             self.language_model._rope_deltas = rope_deltas
 
-        return InputEmbeddingsFeatures(inputs_embeds=final_inputs_embeds)
+        return InputEmbeddingsFeatures(
+            inputs_embeds=final_inputs_embeds,
+            position_ids=position_ids,
+            rope_deltas=rope_deltas,
+        )
 
     @staticmethod
     def merge_input_ids_with_image_features(

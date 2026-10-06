@@ -1207,6 +1207,44 @@ def test_qwen3_omni_rope_delta_ignores_batch_padding():
     assert rope_deltas.tolist() == [[0], [0]]
 
 
+def test_paddleocr_vl_input_embeddings_return_request_positions():
+    case = next(
+        case
+        for case in DATA["cases"]
+        if case["id"] == "TestGetInputEmbeddings.paddleocr_vl_input_embeddings"
+    )
+    module = importlib.import_module("mlx_vlm.models.paddleocr_vl")
+    config = build_config(module, case["config"])
+    model = module.Model(config)
+    vision = config.vision_config
+    merge = vision.spatial_merge_size
+    grid = mx.array([[1, 2 * merge, 2 * merge]], dtype=mx.int32)
+    input_ids = mx.array([[1, 2] + [config.image_token_id] * 4 + [3]], dtype=mx.int32)
+    pixel_values = mx.zeros(
+        (
+            1,
+            4 * merge * merge,
+            vision.num_channels,
+            vision.patch_size,
+            vision.patch_size,
+        )
+    )
+
+    result = model.get_input_embeddings(
+        input_ids=input_ids,
+        pixel_values=pixel_values,
+        image_grid_thw=grid,
+        cached_image_features=mx.zeros((4, config.text_config.hidden_size)),
+    )
+    positions, deltas = model.language_model.get_rope_index(input_ids, grid)
+    assert mx.array_equal(result.position_ids, positions).item()
+    assert mx.array_equal(result.rope_deltas, deltas).item()
+
+    text = model.get_input_embeddings(input_ids=mx.array([[1, 2, 3]], mx.int32))
+    assert text.position_ids.tolist() == [[[0, 1, 2]]] * 3
+    assert text.rope_deltas.tolist() == [[0]]
+
+
 # Patch embedding layouts
 
 
