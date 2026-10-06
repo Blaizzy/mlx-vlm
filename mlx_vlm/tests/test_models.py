@@ -12,6 +12,7 @@ import struct
 import textwrap
 import unittest
 from contextlib import contextmanager
+from dataclasses import asdict
 from operator import attrgetter
 from pathlib import Path
 from types import SimpleNamespace
@@ -91,6 +92,17 @@ class ModelChecks:
         assert mx.allclose(
             mx.linalg.norm(output.text_embeds, axis=-1), mx.array(1.0), atol=1e-5
         )
+
+    def sentence_embeddings(self, model, config):
+        mask = mx.array([[1, 1, 1, 0]])
+        output = model(mx.array([[1, 2, 3, 0]]), attention_mask=mask)
+        changed_padding = model(mx.array([[1, 2, 3, 9]]), attention_mask=mask)
+        width = config.text_config.embedding_dim
+        assert output.last_hidden_state.shape == (1, 4, width)
+        assert output.text_embeds.shape == (1, width)
+        assert output.text_embeds.dtype == mx.float32
+        self.assert_close(output.text_embeds, changed_padding.text_embeds)
+        self.assert_close(mx.linalg.norm(output.text_embeds, axis=-1), mx.ones((1,)))
 
     def assert_close(self, actual, expected, *, logits=False):
         assert actual.shape == expected.shape
@@ -521,7 +533,7 @@ def check_arguments(kind, case, model, config):
     )
     if kind == "forward_cache":
         return (model, text.vocab_size), case.get("forward_cache", {})
-    if kind in {"masked_lm", "token_embeddings"}:
+    if kind in {"masked_lm", "token_embeddings", "sentence_embeddings"}:
         return (model, config), {}
     if kind == "multimodal":
         return (model, config), case["multimodal"]
@@ -662,6 +674,180 @@ def test_lfm2_colbert_sanitize_and_loader(tmp_path, monkeypatch):
     embedding_loader.load_embedding_model(tmp_path)
     assert captured["model_remapping"]["lfm2"] == "lfm2_colbert"
     assert captured["config_overrides"]["embedding_dim"] == 128
+
+
+@pytest.fixture
+def embedding_gemma2_case():
+    case = next(c for c in DATA["cases"] if c["module"] == "embedding_gemma2")
+    module = importlib.import_module("mlx_vlm.models." + case["module"])
+    return module, build_config(module, case["config"])
+
+
+@pytest.mark.parametrize("left_padding", [False, True])
+def test_embedding_gemma2_padded_batch_matches_individual(
+    embedding_gemma2_case, left_padding
+):
+    module, config = embedding_gemma2_case
+    mx.random.seed(42)
+    model = module.Model(config)
+    ids = [1, 2, 3]
+    solo = model(mx.array([ids])).text_embeds
+    padded = [0, 0, *ids] if left_padding else [*ids, 0, 0]
+    valid = [0, 0, 1, 1, 1] if left_padding else [1, 1, 1, 0, 0]
+    output = model(
+        mx.array([padded, [4, 5, 6, 7, 8]]),
+        attention_mask=mx.array([valid, [1, 1, 1, 1, 1]]),
+    )
+    np.testing.assert_allclose(output.text_embeds[:1], solo, atol=1e-5, rtol=1e-5)
+
+
+def test_embedding_gemma2_attention_is_bidirectional(embedding_gemma2_case):
+    module, config = embedding_gemma2_case
+    model = module.Model(config)
+    first = model(mx.array([[1, 2, 3]])).last_hidden_state
+    second = model(mx.array([[1, 2, 4]])).last_hidden_state
+    assert not mx.allclose(first[:, 0], second[:, 0])
+
+
+def test_embedding_gemma2_sliding_attention_includes_window_boundary(
+    embedding_gemma2_case,
+):
+    module, config = embedding_gemma2_case
+    mx.random.seed(42)
+    model = module.Model(config)
+    # Isolate the first (sliding) layer so the full layer cannot mix distant tokens.
+    model.language_model.layers = model.language_model.layers[:1]
+    baseline = model(mx.array([[1, 2, 3, 4, 5]])).last_hidden_state[:, 0]
+    boundary = model(mx.array([[1, 2, 3, 6, 5]])).last_hidden_state[:, 0]
+    outside = model(mx.array([[1, 2, 3, 4, 6]])).last_hidden_state[:, 0]
+    assert not mx.allclose(baseline, boundary)
+    np.testing.assert_allclose(baseline, outside, atol=1e-6)
+
+
+def test_embedding_gemma2_explicit_position_ids(embedding_gemma2_case):
+    module, config = embedding_gemma2_case
+    mx.random.seed(42)
+    model = module.Model(config)
+    ids = mx.array([[1, 2, 3]])
+    default = model(ids).last_hidden_state
+    explicit = model(ids, position_ids=mx.array([[0, 1, 2]])).last_hidden_state
+    spaced = model(ids, position_ids=mx.array([[0, 2, 4]])).last_hidden_state
+    np.testing.assert_array_equal(default, explicit)
+    assert not mx.allclose(default, spaced)
+
+
+def test_embedding_gemma2_full_attention_config_defaults_and_index_normalization(
+    embedding_gemma2_case,
+):
+    module, config = embedding_gemma2_case
+    defaults = module.TextConfig(
+        num_hidden_layers=7,
+        vocab_size=64,
+        hidden_size=16,
+        intermediate_size=32,
+        hidden_size_per_layer_input=8,
+    )
+    model = module.Model(module.ModelConfig(text_config=defaults))
+    assert defaults.layer_types[-1] == "full_attention"
+    assert model.layers[5].self_attn.head_dim == 512
+    assert model.layers[5].self_attn.num_kv_heads == 1
+    config.text_config.per_layer_config = {1: {"head_dim": 16}}
+    config.text_config.__post_init__()
+    assert module.Model(config).layers[1].self_attn.head_dim == 16
+
+
+def test_embedding_gemma2_media_scatter_preserves_batch_order_and_validates_counts(
+    embedding_gemma2_case,
+):
+    module, _ = embedding_gemma2_case
+    ids = mx.array([[1, 60, 60], [60, 2, 0]])
+    embeddings = mx.zeros((2, 3, 4))
+    features = mx.arange(12).reshape(3, 4)
+    output = module.Model._scatter(embeddings, ids, 60, features)
+    np.testing.assert_array_equal(output[0, 1:], features[:2])
+    np.testing.assert_array_equal(output[1, 0], features[2])
+    np.testing.assert_array_equal(output[1, 1:], mx.zeros((2, 4)))
+    with pytest.raises(ValueError, match="token count"):
+        module.Model._scatter(embeddings, ids, 60, features[:2])
+
+
+@pytest.mark.parametrize("modality", ["image", "video", "audio"])
+def test_embedding_gemma2_disabled_towers_reject_media(embedding_gemma2_case, modality):
+    module, config = embedding_gemma2_case
+    model = module.Model(config)
+    with pytest.raises(ValueError, match="require.*config"):
+        getattr(model, f"get_{modality}_features")(mx.zeros((1, 2, 3)), None)
+
+
+def test_embedding_gemma2_sanitize_and_converted_checkpoint_roundtrip(
+    embedding_gemma2_case, tmp_path
+):
+    module, config = embedding_gemma2_case
+
+    config.audio_config = module.AudioConfig(
+        hidden_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        subsampling_conv_channels=(4, 2),
+        output_proj_dims=8,
+    )
+    model = module.Model(config)
+    weights = dict(tree_flatten(model.parameters()))
+    original = {}
+    for key, value in weights.items():
+        if key.endswith("conv.weight"):
+            value = value.transpose(0, 3, 1, 2)
+        elif key.endswith("depthwise_conv1d.weight"):
+            value = value.transpose(0, 2, 1)
+        original["model." + key] = value
+    sanitized = model.sanitize(original)
+    twice = model.sanitize(sanitized)
+    assert weights.keys() == sanitized.keys() == twice.keys()
+    for key in weights:
+        np.testing.assert_array_equal(sanitized[key], weights[key])
+        np.testing.assert_array_equal(twice[key], weights[key])
+
+    (tmp_path / "config.json").write_text(json.dumps(asdict(config)))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), sanitized)
+    loaded = embedding_loader.load_embedding_model(tmp_path)
+    ids = mx.array([[1, 2, 3]])
+    np.testing.assert_allclose(
+        loaded(ids).text_embeds, model(ids).text_embeds, atol=1e-6
+    )
+
+    config.audio_config = None
+    reduced = embedding_loader.load_embedding_model(tmp_path, config=asdict(config))
+    assert reduced.audio_tower is None
+    np.testing.assert_allclose(
+        reduced(ids).text_embeds, model(ids).text_embeds, atol=1e-6
+    )
+
+
+@pytest.mark.parametrize("bits", [4, 6, 8])
+def test_embedding_gemma2_quantized_checkpoint_roundtrip(
+    embedding_gemma2_case, tmp_path, bits
+):
+    from mlx_vlm.quant_utils import quantize_model
+
+    module, config = embedding_gemma2_case
+    config.text_config.hidden_size = 64
+    config.text_config.intermediate_size = 128
+    config.text_config.hidden_size_per_layer_input = 64
+    config.text_config.head_dim = 32
+    config.text_config.per_layer_config = {"01": {"head_dim": 64}}
+    model, saved_config = quantize_model(module.Model(config), asdict(config), 64, bits)
+    assert model.language_model.embed_tokens.bits == bits
+    (tmp_path / "config.json").write_text(json.dumps(saved_config))
+    mx.save_safetensors(
+        str(tmp_path / "model.safetensors"), dict(tree_flatten(model.parameters()))
+    )
+    reloaded = embedding_loader.load_embedding_model(tmp_path)
+    ids = mx.array([[1, 2, 3], [4, 5, 6]])
+    expected = model(ids).text_embeds
+    actual = reloaded(ids).text_embeds
+    assert reloaded.language_model.embed_tokens.bits == bits
+    np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_allclose(mx.linalg.norm(actual, axis=-1), 1, atol=1e-6)
 
 
 @pytest.mark.parametrize("name", DATA["dense"])
