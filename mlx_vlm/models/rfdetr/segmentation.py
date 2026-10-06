@@ -5,6 +5,8 @@ from typing import Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..interpolate import resize_bilinear_nhwc
+
 
 class DepthwiseConvBlock(nn.Module):
     """ConvNeXt-style depthwise convolution block."""
@@ -90,7 +92,9 @@ class SegmentationHead(nn.Module):
         # Downsample spatial features
         target_h = image_size[0] // self.downsample_ratio
         target_w = image_size[1] // self.downsample_ratio
-        sf = _interpolate_spatial(spatial_features, target_h, target_w)
+        sf = resize_bilinear_nhwc(
+            spatial_features, (target_h, target_w), align_corners=True
+        )
 
         # Process through DepthwiseConvBlocks
         for block in self.blocks:
@@ -111,44 +115,3 @@ class SegmentationHead(nn.Module):
         mask_logits = mask_logits + self.bias
 
         return mask_logits
-
-
-def _interpolate_spatial(x: mx.array, target_h: int, target_w: int) -> mx.array:
-    """Bilinear interpolation for spatial feature downsampling.
-
-    Args:
-        x: (B, H, W, C) channel-last input
-        target_h, target_w: target spatial dimensions
-    Returns:
-        (B, target_h, target_w, C)
-    """
-    B, H, W, C = x.shape
-    if H == target_h and W == target_w:
-        return x
-
-    # Simple bilinear interpolation via grid sampling
-    y_coords = mx.linspace(0, H - 1, target_h)
-    x_coords = mx.linspace(0, W - 1, target_w)
-
-    yy = mx.broadcast_to(y_coords[:, None], (target_h, target_w))
-    xx = mx.broadcast_to(x_coords[None, :], (target_h, target_w))
-
-    y0 = mx.clip(mx.floor(yy).astype(mx.int32), 0, H - 1)
-    y1 = mx.clip(y0 + 1, 0, H - 1)
-    x0 = mx.clip(mx.floor(xx).astype(mx.int32), 0, W - 1)
-    x1 = mx.clip(x0 + 1, 0, W - 1)
-
-    fy = (yy - y0.astype(yy.dtype))[..., None]
-    fx = (xx - x0.astype(xx.dtype))[..., None]
-
-    val_00 = x[:, y0, x0, :]
-    val_01 = x[:, y0, x1, :]
-    val_10 = x[:, y1, x0, :]
-    val_11 = x[:, y1, x1, :]
-
-    return (
-        val_00 * (1 - fy) * (1 - fx)
-        + val_01 * (1 - fy) * fx
-        + val_10 * fy * (1 - fx)
-        + val_11 * fy * fx
-    )
