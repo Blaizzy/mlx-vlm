@@ -73,4 +73,6 @@ class Model(nn.Module):
         """Predict per-frame depth for (T, H, W, 3) RGB video frames."""
         from .generate import VideoDepthPredictor
 
+        if getattr(inputs, "ndim", 0) == 3:
+            inputs = inputs[None]
         return {"depth": VideoDepthPredictor(self, processor).infer(inputs, **kwargs)}

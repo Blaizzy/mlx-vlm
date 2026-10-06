@@ -8,10 +8,11 @@ MLX port of [Meta's SAM3](https://github.com/facebookresearch/sam3) — an open-
 > `tokenizer.json` (or `vocab.json` and `merges.txt`). The processor reads them from
 > the checkpoint and raises if they are missing rather than fetching a vocabulary
 > from elsewhere, which would not be guaranteed to match the converted weights.
-> Published MLX conversions of SAM 3 omit these files; copy them from the source
-> checkpoint alongside the weights. For SAM 3.1,
-> [`nativ-community/sam3.1-bf16`](https://huggingface.co/nativ-community/sam3.1-bf16)
-> already includes them.
+> The `mlx-community/sam3-{bf16,8bit,4bit}` conversions ship them and need no
+> licence acceptance, unlike `facebook/sam3`. `mlx-community/sam3-image` carries
+> neither a tokenizer nor a `config.json` and does not load. For SAM 3.1 use
+> [`nativ-community/sam3.1-bf16`](https://huggingface.co/nativ-community/sam3.1-bf16),
+> since `mlx-community/sam3.1-bf16` omits the tokenizer.
 
 ## Quick Start
 
@@ -22,7 +23,7 @@ from mlx_vlm.models.sam3.generate import Sam3Predictor
 from mlx_vlm.models.sam3.processing_sam3 import Sam3Processor
 
 # Load model (downloads ~3.4 GB on first run)
-model_path = get_model_path("facebook/sam3")
+model_path = get_model_path("mlx-community/sam3-bf16")
 model = load_model(model_path)
 processor = Sam3Processor.from_pretrained(str(model_path))
 
@@ -223,7 +224,7 @@ The background image is auto-resized to match the camera resolution. The segment
 | `--show-boxes` | off | Overlay bounding boxes and labels |
 | `--bg-image` | | Background image for camera bg swap (realtime only) |
 | `--output` | auto-named | Output file path (track only) |
-| `--model` | `facebook/sam3` | Model path or HF repo |
+| `--model` | `mlx-community/sam3-bf16` | Model path or HF repo |
 | `--threshold` | 0.3 / 0.15 | Score threshold (image / video default) |
 | `--nms-thresh` | `0.5` | NMS IoU threshold |
 | `--every` | `2` | Detect every N frames (track only) |

@@ -994,7 +994,7 @@ def track_video(
     video_path: str,
     prompts: List[str],
     output: Optional[str] = None,
-    model_path: str = "facebook/sam3",
+    model_path: str = "mlx-community/sam3-bf16",
     threshold: float = 0.15,
     nms_thresh: float = 0.5,
     every: int = 2,
@@ -1133,7 +1133,7 @@ def track_video(
 def track_video_realtime(
     video_path: str,
     prompts: List[str],
-    model_path: str = "facebook/sam3",
+    model_path: str = "mlx-community/sam3-bf16",
     threshold: float = 0.15,
     nms_thresh: float = 0.5,
     boxes: Optional[str] = None,
@@ -1526,7 +1526,7 @@ def run_image(
     prompts: List[str],
     task: str = "segment",
     output: Optional[str] = None,
-    model_path: str = "facebook/sam3",
+    model_path: str = "mlx-community/sam3-bf16",
     threshold: float = 0.3,
     nms_thresh: float = 0.5,
     boxes: Optional[str] = None,
@@ -1654,7 +1654,7 @@ def main():
         "--output", default=None, help="Output path (default: auto-named)"
     )
     parser.add_argument(
-        "--model", default="facebook/sam3", help="Model path or HF repo"
+        "--model", default="mlx-community/sam3-bf16", help="Model path or HF repo"
     )
     parser.add_argument(
         "--threshold",
