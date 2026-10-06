@@ -118,8 +118,9 @@ def _manifest(task, outputs):
 
 
 def _usage_hint(error, sources, images):
-    """Explain a TypeError the model raised in terms of the flags behind it."""
-    named = re.search(r"unexpected keyword argument '([^']+)'", str(error))
+    """Explain a failure the model raised in terms of the flags behind it."""
+    error = str(error).strip()
+    named = re.search(r"unexpected keyword argument '([^']+)'", error)
     if named:
         name = named.group(1)
         flag = sources.get(name, "--set")
@@ -212,6 +213,12 @@ def main(argv=None):
         # Whatever the model rejects arrives here: an unknown keyword, an input
         # of the wrong rank, a --set value of the wrong type.
         parser.error(_usage_hint(error, sources, args.image))
+    except Exception as error:
+        # A model that reads one image can fail far from the CLI, inside a
+        # resize or a decode, where the exception says nothing about the input.
+        if args.image and len(args.image) > 1:
+            parser.error(_usage_hint(error, sources, args.image))
+        raise
 
     task = args.task if args.task is not None else tasks[0]
     if args.output is not None:
