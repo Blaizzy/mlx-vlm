@@ -710,7 +710,13 @@ class LanguageModel(nn.Module):
                 continue
             prefix = f"language_model.model.layers.{layer_idx}.mlp"
             for module in ("gate_proj", "down_proj", "up_proj"):
-                for suffix in ("weight", "scales", "biases", "weight_scale_2"):
+                for suffix in (
+                    "weight",
+                    "scales",
+                    "biases",
+                    "weight_scale_2",
+                    "weight_global_scale",
+                ):
                     first_key = f"{prefix}.experts.0.{module}.{suffix}"
                     if first_key not in weights:
                         continue

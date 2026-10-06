@@ -524,7 +524,13 @@ class Model(nn.Module):
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"backbone.layers.{layer_idx}.mixer"
             for m, n in [("down_proj", "fc2"), ("up_proj", "fc1")]:
-                for suffix in ("weight", "scales", "biases", "weight_scale_2"):
+                for suffix in (
+                    "weight",
+                    "scales",
+                    "biases",
+                    "weight_scale_2",
+                    "weight_global_scale",
+                ):
                     first_key = f"{prefix}.experts.0.{m}.{suffix}"
                     if first_key not in weights:
                         continue

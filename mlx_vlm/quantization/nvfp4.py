@@ -8,7 +8,7 @@ from ..models.switch_layers import QuantizedSwitchLinear
 
 
 class ScaledQuantizedLinear(nn.Module):
-    def __init__(self, linear: nn.Module, global_scale: mx.array):
+    def __init__(self, linear: nn.Module, global_scale: mx.array, scale_name: str):
         super().__init__()
         self.weight = linear.weight
         self.scales = linear.scales
@@ -16,11 +16,21 @@ class ScaledQuantizedLinear(nn.Module):
         self.group_size = linear.group_size
         self.bits = linear.bits
         self.mode = linear.mode
-        self.weight_scale_2 = global_scale
+        self[scale_name] = global_scale
+        self._scale_name = scale_name
         self._quantize_activations = isinstance(linear, nn.QQLinear)
         if "bias" in linear:
             self.bias = linear.bias
         self.freeze()
+
+    @property
+    def global_scale(self):
+        return self[self._scale_name]
+
+    def apply_scale(self, output, scale):
+        if self._scale_name == "weight_global_scale":
+            return output / scale
+        return output * scale
 
     def __call__(self, x):
         dtype = x.dtype
@@ -45,7 +55,9 @@ class ScaledQuantizedLinear(nn.Module):
                 mode=self.mode,
                 transpose=True,
             )
-        output = (output.astype(mx.float32) * self.weight_scale_2).astype(dtype)
+        output = self.apply_scale(output.astype(mx.float32), self.global_scale).astype(
+            dtype
+        )
         if "bias" in self:
             output = output + self.bias
         return output
@@ -76,8 +88,8 @@ class ScaledQuantizedSwitchLinear(ScaledQuantizedLinear):
             mode=self.mode,
             sorted_indices=sorted_indices,
         )
-        scale = self.weight_scale_2.reshape(self.num_experts, -1)[indices][..., None, :]
-        output = (output * scale).astype(x.dtype)
+        scale = self.global_scale.reshape(self.num_experts, -1)[indices][..., None, :]
+        output = self.apply_scale(output, scale).astype(x.dtype)
         if "bias" in self:
             output = output + self.bias[indices][..., None, :]
         return output
@@ -85,9 +97,17 @@ class ScaledQuantizedSwitchLinear(ScaledQuantizedLinear):
 
 def replace_scaled_quantized_linears(model: nn.Module, weights: dict) -> None:
     def replace(path, module):
-        scale = weights.get(f"{path}.weight_scale_2")
-        if scale is None:
+        scale_names = [
+            name
+            for name in ("weight_scale_2", "weight_global_scale")
+            if f"{path}.{name}" in weights
+        ]
+        if not scale_names:
             return module
+        if len(scale_names) != 1:
+            raise ValueError(f"Conflicting NVFP4 global scales: {path}")
+        scale_name = scale_names[0]
+        scale = weights[f"{path}.{scale_name}"]
         if (
             not isinstance(
                 module, (nn.QuantizedLinear, nn.QQLinear, QuantizedSwitchLinear)
@@ -96,8 +116,8 @@ def replace_scaled_quantized_linears(model: nn.Module, weights: dict) -> None:
         ):
             raise ValueError(f"NVFP4 global scale requires a quantized linear: {path}")
         if isinstance(module, QuantizedSwitchLinear):
-            return ScaledQuantizedSwitchLinear(module, scale)
-        return ScaledQuantizedLinear(module, scale)
+            return ScaledQuantizedSwitchLinear(module, scale, scale_name)
+        return ScaledQuantizedLinear(module, scale, scale_name)
 
     model.update_modules(
         tree_map_with_path(replace, model.leaf_modules(), is_leaf=nn.Module.is_module)

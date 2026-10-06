@@ -490,16 +490,22 @@ class LanguageModel(nn.Module):
 
     def _stack_experts(self, weights):
         for key in list(weights):
-            if key.endswith(".weight_scale_2") and (
+            if key.endswith((".weight_scale_2", ".weight_global_scale")) and (
                 ".experts." in key or ".switch_mlp." in key
             ):
-                shape = weights[key.replace(".weight_scale_2", ".weight")].shape[:-1]
+                shape = weights[key.rsplit(".", 1)[0] + ".weight"].shape[:-1]
                 scale = weights[key]
                 if scale.ndim < len(shape):
                     weights[key] = mx.broadcast_to(scale[..., None], shape)
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{layer_idx}.mlp"
-            for suffix in ["weight", "scales", "biases", "weight_scale_2"]:
+            for suffix in [
+                "weight",
+                "scales",
+                "biases",
+                "weight_scale_2",
+                "weight_global_scale",
+            ]:
                 gate_key = f"{prefix}.experts.0.gate_proj.{suffix}"
                 up_key = f"{prefix}.experts.0.up_proj.{suffix}"
                 if gate_key in weights and up_key in weights:
@@ -534,7 +540,13 @@ class LanguageModel(nn.Module):
     def _fuse_split_switch_gate_up(self, weights):
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{layer_idx}.mlp.switch_mlp"
-            for suffix in ["weight", "scales", "biases", "weight_scale_2"]:
+            for suffix in [
+                "weight",
+                "scales",
+                "biases",
+                "weight_scale_2",
+                "weight_global_scale",
+            ]:
                 gate_key = f"{prefix}.gate_proj.{suffix}"
                 up_key = f"{prefix}.up_proj.{suffix}"
                 fused_key = f"{prefix}.gate_up_proj.{suffix}"

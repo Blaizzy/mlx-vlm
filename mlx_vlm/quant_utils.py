@@ -212,9 +212,9 @@ def dequantize_model(model: nn.Module) -> nn.Module:
             module.mode,
         )
         if isinstance(module, ScaledQuantizedLinear):
-            scale = module.weight_scale_2
-            weight = weight * scale.reshape(
-                scale.shape + (1,) * (weight.ndim - scale.ndim)
+            scale = module.global_scale
+            weight = module.apply_scale(
+                weight, scale.reshape(scale.shape + (1,) * (weight.ndim - scale.ndim))
             )
         args = weight.shape[::-1]
         m = cls(*args, **kwargs)

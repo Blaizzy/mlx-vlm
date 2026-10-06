@@ -958,15 +958,18 @@ def test_transform_modelopt_mixed_nvfp4_fp8_weights():
 @pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
 @pytest.mark.parametrize("bias", [False, True])
 @pytest.mark.parametrize("shape", [(1, 64), (2, 3, 64)])
-def test_scaled_nvfp4_linear_matches_reference(dtype, bias, shape):
+@pytest.mark.parametrize("scale_name", ["weight_scale_2", "weight_global_scale"])
+def test_scaled_nvfp4_linear_matches_reference(dtype, bias, shape, scale_name):
     model = nn.Module()
     model.layer = nn.QuantizedLinear(64, 4, bias=bias, mode="nvfp4")
-    global_scale = mx.array(0.00012715657, mx.float32)
+    global_scale = mx.array(
+        14400 if scale_name == "weight_global_scale" else 0.00012715657, mx.float32
+    )
     block_scales = mx.array([[56, 64, 72, 80], [120] * 4] * 2, mx.uint8)
     weights = {
         "layer.weight": mx.full((4, 8), 0x77777777, mx.uint32),
         "layer.scales": block_scales,
-        "layer.weight_scale_2": global_scale,
+        f"layer.{scale_name}": global_scale,
     }
     if bias:
         weights["layer.bias"] = mx.array([0.25, -0.5, 1.0, -2.0], dtype)
@@ -974,7 +977,11 @@ def test_scaled_nvfp4_linear_matches_reference(dtype, bias, shape):
     model.load_weights(list(weights.items()))
     x = mx.linspace(0.1, 1.7, np.prod(shape)).reshape(shape).astype(dtype)
     decoded_scales = mx.array([[1, 2, 4, 8], [256] * 4] * 2, mx.float32)
-    reference_weight = mx.repeat(decoded_scales, 16, axis=-1) * 6 * global_scale
+    reference_weight = mx.repeat(decoded_scales, 16, axis=-1) * 6
+    if scale_name == "weight_global_scale":
+        reference_weight /= global_scale
+    else:
+        reference_weight *= global_scale
     expected = (x.astype(mx.float32) @ reference_weight.T).astype(dtype)
     if bias:
         expected += weights["layer.bias"]
@@ -985,6 +992,19 @@ def test_scaled_nvfp4_linear_matches_reference(dtype, bias, shape):
     assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5).item()
     assert mx.array_equal(model.layer.scales, block_scales).item()
     assert not tree_flatten(model.trainable_parameters())
+
+
+def test_scaled_nvfp4_rejects_conflicting_scale_conventions():
+    model = nn.Module()
+    model.layer = nn.QuantizedLinear(64, 4, bias=False, mode="nvfp4")
+    with pytest.raises(ValueError, match="Conflicting NVFP4 global scales: layer"):
+        replace_scaled_quantized_linears(
+            model,
+            {
+                "layer.weight_scale_2": mx.array(0.5),
+                "layer.weight_global_scale": mx.array(2.0),
+            },
+        )
 
 
 @pytest.mark.parametrize("activation_quantization", [False, True])
@@ -1024,7 +1044,10 @@ def test_nvfp4_global_scale_load_and_save(tmp_path, activation_quantization, for
             "quant_method": "compressed-tensors",
             "format": format,
         }
-    factor = weights.get("layer.weight_scale_2", mx.array(1 / 14400, mx.float32))
+    scale_name = "weight_scale_2" if format == "modelopt" else "weight_global_scale"
+    other_scale = "weight_global_scale" if format == "modelopt" else "weight_scale_2"
+    source_scale = weights[f"layer.{scale_name}"].astype(mx.float32).reshape(())
+    factor = source_scale if format == "modelopt" else 1 / source_scale
     (tmp_path / "config.json").write_text(json.dumps(config))
     mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
     with patch("mlx_vlm.utils.get_model_and_args", return_value=(architecture, "test")):
@@ -1033,7 +1056,9 @@ def test_nvfp4_global_scale_load_and_save(tmp_path, activation_quantization, for
         assert model.layer._quantize_activations == activation_quantization
         x = mx.full((2, 3, 64), 6.0, mx.bfloat16)
         expected = mx.full((2, 3, 4), 6 * 64 * 256 * factor.item())
-        assert model.layer.weight_scale_2.dtype == mx.float32
+        assert other_scale not in model.layer
+        assert model.layer[scale_name].dtype == mx.float32
+        assert mx.array_equal(model.layer[scale_name], source_scale).item()
         assert mx.allclose(model.layer(x), expected, atol=0.01, rtol=0.01).item()
 
         config["quantization"] = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
@@ -1043,6 +1068,8 @@ def test_nvfp4_global_scale_load_and_save(tmp_path, activation_quantization, for
             str(tmp_path / "model.safetensors"), dict(tree_flatten(model.parameters()))
         )
         restored = load_model(tmp_path, quantize_activations=activation_quantization)
+        assert other_scale not in restored.layer
+        assert mx.array_equal(restored.layer[scale_name], source_scale).item()
         assert mx.array_equal(restored.layer.weight, model.layer.weight).item()
         assert mx.array_equal(
             restored.layer.scales, weights["layer.weight_scale"]
@@ -1055,25 +1082,38 @@ def test_nvfp4_global_scale_load_and_save(tmp_path, activation_quantization, for
 
 @pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
 @pytest.mark.parametrize("sorted_indices", [False, True])
-def test_scaled_nvfp4_experts_preserve_individual_scales(dtype, sorted_indices):
+@pytest.mark.parametrize("scale_name", ["weight_scale_2", "weight_global_scale"])
+def test_scaled_nvfp4_experts_preserve_individual_scales(
+    dtype, sorted_indices, scale_name
+):
     model = nn.Module()
     model.layer = QuantizedSwitchLinear(
         64, 4, 2, bias=False, group_size=16, mode="nvfp4"
     )
-    scales = mx.array([0.00012715657, 0.000333], mx.float32)
+    scales = mx.array(
+        (
+            [14400, 9600]
+            if scale_name == "weight_global_scale"
+            else [0.00012715657, 0.000333]
+        ),
+        mx.float32,
+    )
     weights = {
         "layer.weight": mx.full((2, 4, 8), 0x22222222, mx.uint32),
         "layer.scales": mx.full((2, 4, 4), 120, mx.uint8),
-        "layer.weight_scale_2": scales,
+        f"layer.{scale_name}": scales,
     }
     replace_scaled_quantized_linears(model, weights)
     model.load_weights(list(weights.items()))
     assert isinstance(model.layer, ScaledQuantizedSwitchLinear)
     indices = mx.array([[0, 0], [1, 1]] if sorted_indices else [[1, 0], [0, 1]])
     x = mx.ones((2, 1, 1, 64), dtype)
-    expected = mx.broadcast_to(
-        (64 * 256 * scales[indices])[..., None, None], (2, 2, 1, 4)
+    expected = (
+        64 * 256 / scales[indices]
+        if scale_name == "weight_global_scale"
+        else 64 * 256 * scales[indices]
     )
+    expected = mx.broadcast_to(expected[..., None, None], (2, 2, 1, 4))
     assert mx.allclose(
         model.layer(x, indices, sorted_indices=sorted_indices),
         expected.astype(dtype),
@@ -1210,6 +1250,13 @@ def test_moe_sanitize_load_and_infer(family, format):
         weights = {
             k: v for k, v in weights.items() if not k.endswith(".weight_scale_2")
         }
+    else:
+        scale_name = "weight_scale_2" if format == "modelopt" else "weight_global_scale"
+        other_scale = (
+            "weight_global_scale" if format == "modelopt" else "weight_scale_2"
+        )
+        assert any(k.endswith("." + scale_name) for k in weights)
+        assert not any(k.endswith("." + other_scale) for k in weights)
     if family == "laguna":
         stacked = {
             key.replace(".experts.0.", ".switch_mlp."): mx.stack(

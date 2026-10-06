@@ -289,8 +289,8 @@ def _transform_compressed_tensors_nvfp4_weights(
     """Preserve packed FP4 weights, FP8 block scales and the global factor.
 
     Compressed-tensors reconstructs weights as ``fp4 * scale / global_scale``.
-    Normalize the reciprocal to the shared FP32 ``weight_scale_2`` parameter
-    instead of rounding the effective block scales back to FP8.
+    Keep ``weight_global_scale`` in FP32 instead of rounding the effective
+    block scales back to FP8.
     """
     packed_suffix = ".weight_packed"
 
@@ -304,9 +304,7 @@ def _transform_compressed_tensors_nvfp4_weights(
 
             new_weights[f"{prefix}.weight"] = packed.view(mx.uint32)
             new_weights[f"{prefix}.scales"] = scale
-            new_weights[f"{prefix}.weight_scale_2"] = mx.reciprocal(
-                global_scale
-            ).reshape(())
+            new_weights[f"{prefix}.weight_global_scale"] = global_scale.reshape(())
         elif key.endswith((".weight_scale",) + _COMPRESSED_TENSORS_DROP_SUFFIXES):
             continue
         else:
@@ -366,7 +364,7 @@ def _transform_compressed_tensors_int4_weights(
 # ``model.load_weights(strict=True)`` as unexpected keys and abort startup.
 _COMPRESSED_TENSORS_DROP_SUFFIXES = (
     ".weight_shape",
-    ".weight_global_scale",  # normalized to the FP32 ``.weight_scale_2`` factor
+    ".weight_global_scale",  # emitted with its packed NVFP4 weight
     ".weight_zero_point",
     ".input_global_scale",
     ".input_scale",
@@ -466,7 +464,7 @@ def _transform_compressed_tensors_mixed_weights(
     assignment produced:
 
     - ``.weight_packed`` + ``.weight_global_scale`` -> NVFP4
-      (keeps block scales and the reciprocal global factor separate)
+      (keeps block scales and the global divisor separate)
     - ``.weight_packed`` alone -> INT4 ``pack-quantized`` (folded to ``affine``)
     - ``.weight_scale`` without ``.weight_packed`` -> channel-wise fp8
       ``float-quantized`` (dequantized to a dense weight)
@@ -518,9 +516,7 @@ def _transform_compressed_tensors_mixed_weights(
                 global_scale = weights[global_key].astype(mx.float32)
                 new_weights[f"{prefix}.weight"] = value.view(mx.uint32)
                 new_weights[f"{prefix}.scales"] = scale
-                new_weights[f"{prefix}.weight_scale_2"] = mx.reciprocal(
-                    global_scale
-                ).reshape(())
+                new_weights[global_key] = global_scale.reshape(())
                 native_quant["nvfp4"] = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
             else:  # INT4 symmetric pack-quantized
                 new_weights[f"{prefix}.weight"] = value.view(mx.uint32)
