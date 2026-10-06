@@ -2752,3 +2752,235 @@ class TestVideoMetadataForwarding:
             prepare_inputs(processor, videos=["clip.mp4"], prompts="Describe this.")
         assert "video_metadata" not in processor.kwargs
         assert processor.fps == [metadata.sampled_fps]
+
+
+@pytest.fixture
+def embedding_gemma2_processor():
+    pytest.importorskip("torchvision")
+    from transformers.models.gemma4.feature_extraction_gemma4 import (
+        Gemma4AudioFeatureExtractor,
+    )
+    from transformers.models.gemma4.image_processing_gemma4 import Gemma4ImageProcessor
+
+    from mlx_vlm.models.embedding_gemma2 import EmbeddingGemma2Processor
+    from mlx_vlm.models.embedding_gemma2.video_processing_embedding_gemma2 import (
+        EmbeddingGemma2VideoProcessor,
+    )
+
+    tokens = dict(
+        image_token="<|image|>",
+        boi_token="<|image>",
+        eoi_token="<image|>",
+        audio_token="<|audio|>",
+        boa_token="<|audio>",
+        eoa_token="<audio|>",
+        video_token="<|video|>",
+    )
+    tokenizer = fast_tokenizer(extra_special_tokens=tokens)
+    template = (
+        "{% for msg in messages %}{% for item in msg['content'] %}"
+        "{% if item['type'] == 'text' %}{{ item['text'] }}"
+        "{% else %}{{ '<|' + item['type'] + '|>' }}{% endif %}"
+        "{% endfor %}{% endfor %}"
+    )
+    return EmbeddingGemma2Processor(
+        tokenizer=tokenizer,
+        feature_extractor=Gemma4AudioFeatureExtractor(
+            feature_size=32, frame_length_ms=24, hop_length_ms=8, preemphasis=0.5
+        ),
+        image_processor=Gemma4ImageProcessor(
+            patch_size=4, pooling_kernel_size=2, max_soft_tokens=70
+        ),
+        video_processor=EmbeddingGemma2VideoProcessor(
+            patch_size=4,
+            pooling_kernel_size=2,
+            max_soft_tokens=70,
+            fps=2,
+            max_frames=3,
+            overflow_strategy="truncate",
+            add_timestamps=False,
+        ),
+        chat_template=template,
+        image_seq_length=70,
+        audio_seq_length=96,
+        audio_ms_per_token=32,
+    )
+
+
+def _embedding_gemma2_media():
+    rng = np.random.default_rng(42)
+    return (
+        Image.fromarray(rng.integers(0, 256, (24, 32, 3), dtype=np.uint8)),
+        rng.normal(0, 0.1, 3200).astype(np.float32),
+        rng.integers(0, 256, (2, 24, 32, 3), dtype=np.uint8),
+    )
+
+
+@pytest.mark.parametrize(
+    "modality", ["text", "image", "audio", "video", "mixed", "nested"]
+)
+def test_embedding_gemma2_processor_round_trip(
+    tmp_path, embedding_gemma2_processor, modality
+):
+    p = embedding_gemma2_processor
+    image, audio, video = _embedding_gemma2_media()
+    inputs = {
+        "text": dict(text=["hello", "hello hello"]),
+        "image": dict(images=[image]),
+        "audio": dict(audio=[audio]),
+        "video": dict(videos=[video]),
+        "mixed": dict(images=[[image]], audio=[[audio]], videos=[[video]]),
+        "nested": dict(
+            images=[[image, image], [image]], audio=[[audio], [audio, audio]]
+        ),
+    }[modality]
+    expected = p(**inputs, return_tensors="np")
+    p.save_pretrained(tmp_path)
+    _write_configs(tmp_path, config={"model_type": "embedding_gemma2"})
+    loaded = load_processor(tmp_path, add_detokenizer=False, local_files_only=True)
+    assert type(loaded) is type(p)
+    assert loaded.to_dict() == p.to_dict()
+    assert loaded.chat_template == p.chat_template
+    for backend in ("np", "mlx"):
+        actual = loaded(**inputs, return_tensors=backend)
+        assert set(actual) == set(expected)
+        for key in expected:
+            equal(np.asarray(actual[key]), expected[key])
+            if backend == "mlx":
+                assert isinstance(actual[key], mx.array)
+
+
+@pytest.mark.parametrize(
+    "fps,strategy,expected",
+    [
+        (2, "uniform", [0, 4, 8]),
+        (2, "truncate", [0, 2, 4]),
+        (None, "uniform", [0, 5, 10]),
+        (None, "truncate", [0, 1, 2]),
+    ],
+)
+def test_embedding_gemma2_video_sampling(
+    embedding_gemma2_processor, fps, strategy, expected
+):
+    from transformers.video_utils import VideoMetadata as HFVideoMetadata
+
+    metadata = HFVideoMetadata(total_num_frames=11, fps=4, duration=2.75)
+    actual = embedding_gemma2_processor.video_processor.sample_frames(
+        metadata, fps=fps, max_frames=3, overflow_strategy=strategy
+    )
+    equal(actual, expected)
+
+
+def test_embedding_gemma2_mixed_chat_and_metadata(embedding_gemma2_processor):
+    from transformers.video_utils import VideoMetadata as HFVideoMetadata
+
+    p = embedding_gemma2_processor
+    image, audio, video = _embedding_gemma2_media()
+    conversation = _message(
+        {"type": "audio", "audio": audio},
+        {"type": "text", "text": " hello "},
+        {"type": "image", "image": image},
+        {"type": "video", "video": video},
+    )
+    templated = p.apply_chat_template(
+        conversation, tokenize=True, return_dict=True, return_tensors="mlx", fps=None
+    )
+    direct = p(
+        text="<|audio|> hello <|image|><|video|>",
+        images=[[image]],
+        audio=[audio],
+        videos=[video],
+        return_tensors="mlx",
+        fps=None,
+    )
+    for key in direct:
+        equal(np.asarray(templated[key]), np.asarray(direct[key]))
+    metadata = HFVideoMetadata(total_num_frames=2, fps=2, duration=1)
+    result = p(
+        videos=[video],
+        video_metadata=[metadata],
+        add_timestamps=True,
+        return_metadata=True,
+        return_text_replacement_offsets=True,
+        return_tensors="mlx",
+    )
+    assert isinstance(result["input_ids"], mx.array)
+    equal(result["video_metadata"][0].frames_indices, [0, 1])
+    assert result["text_replacement_offsets"][0][0]["type"] == "video"
+
+
+@pytest.mark.parametrize("modality", ["image", "audio", "video"])
+def test_embedding_gemma2_missing_media_is_rejected(
+    embedding_gemma2_processor, modality
+):
+    with pytest.raises(ValueError, match="no .* passed"):
+        embedding_gemma2_processor(text=f"<|{modality}|>", return_tensors="mlx")
+
+
+@pytest.mark.parametrize("quantize", [False, True])
+def test_embedding_gemma2_conversion_saves_processor(
+    tmp_path, embedding_gemma2_processor, quantize
+):
+    from dataclasses import asdict
+
+    from mlx.utils import tree_flatten
+
+    from mlx_vlm import convert, load
+    from mlx_vlm.models import embedding_gemma2
+    from mlx_vlm.tests.test_models import DATA as MODEL_DATA
+    from mlx_vlm.tests.test_models import build_config
+
+    case = next(c for c in MODEL_DATA["cases"] if c["module"] == "embedding_gemma2")
+    config = build_config(embedding_gemma2, case["config"])
+    config.text_config.hidden_size = 32
+    config.text_config.intermediate_size = 64
+    config.text_config.hidden_size_per_layer_input = 32
+    config.text_config.head_dim = 16
+    config.text_config.per_layer_config = {"01": {"head_dim": 32}}
+    model = embedding_gemma2.Model(config)
+    source, destination = tmp_path / "source", tmp_path / "converted"
+    source.mkdir()
+    _write_configs(source, config=asdict(model.config))
+    mx.save_safetensors(
+        str(source / "model.safetensors"), dict(tree_flatten(model.parameters()))
+    )
+    p = embedding_gemma2_processor
+    p.save_pretrained(source)
+    convert(
+        str(source),
+        str(destination),
+        dtype="bfloat16",
+        quantize=quantize,
+        q_bits=8,
+        q_group_size=32,
+    )
+    loaded_model, loaded_processor = load(destination, local_files_only=True)
+    assert type(loaded_processor) is type(p)
+    assert loaded_processor.to_dict() == p.to_dict()
+    assert loaded_processor.chat_template == p.chat_template
+    loaded_processor.save_pretrained(tmp_path / "resaved")
+    image, audio, video = _embedding_gemma2_media()
+    inputs = dict(
+        images=[[image]], audio=[[audio]], videos=[[video]], return_tensors="np"
+    )
+    actual = loaded_processor(**inputs)
+    for key, expected in p(**inputs).items():
+        equal(actual[key], expected)
+    text = loaded_processor(text="hello", return_tensors="mlx")
+    output = loaded_model(**text).text_embeds
+    assert output.shape == (1, 24)
+    assert mx.all(mx.isfinite(output)).item()
+
+
+@pytest.mark.parametrize("modality", ["image", "audio"])
+def test_embedding_gemma2_prepare_inputs_routes_media(
+    embedding_gemma2_processor, modality
+):
+    p = embedding_gemma2_processor
+    image, audio, _ = _embedding_gemma2_media()
+    media = {"images": [image]} if modality == "image" else {"audio": [audio]}
+    prompt = f"<|{modality}|> hello"
+    expected = p(text=[prompt], **media, return_tensors="mlx")
+    actual = prepare_inputs(p, prompts=[prompt], **media, return_tensors="mlx")
+    for key in expected:
+        equal(np.asarray(actual[key]), np.asarray(expected[key]))

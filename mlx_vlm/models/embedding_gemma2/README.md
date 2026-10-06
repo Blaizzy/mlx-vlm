@@ -11,9 +11,10 @@ and media tokens participate in pooling; padding does not.
 
 ## Setup
 
-Audio/video preprocessing needs the upstream optional dependencies, including
-`torchaudio`, `librosa`, `soundfile`, and `torchcodec`, with a compatible FFmpeg
-installation. On macOS with Homebrew FFmpeg 8, set
+The local processor works with Transformers >= 5.14.0 and uses its Gemma 4 image
+and audio components. Image/video preprocessing requires `torch` and
+`torchvision`; media decoding also uses `librosa`, `soundfile`, and `torchcodec`,
+with a compatible FFmpeg installation. On macOS with Homebrew FFmpeg 8, set
 `DYLD_LIBRARY_PATH="$(brew --prefix ffmpeg@8)/lib"` when launching Python if
 TorchCodec cannot locate the FFmpeg libraries.
 
@@ -53,11 +54,11 @@ Transformers itself runs the reference PyTorch model.
 
 ## Multimodal inputs
 
-Use the upstream processor to expand media placeholders, compute patch positions
-and audio features, and sample video frames. Convert its NumPy tensors to MLX:
+`mlx_vlm.load` selects the local `EmbeddingGemma2Processor`. It expands media
+placeholders, computes patch positions and audio features, and samples video
+frames. Use `return_tensors="mlx"` to receive model-ready MLX arrays:
 
 ```python
-import mlx.core as mx
 from mlx_vlm import load
 
 model, processor = load("google/embeddinggemma-2")
@@ -73,9 +74,9 @@ conversations = [
     [{"role": "user", "content": [{"type": "video", "url": "sample_video.mp4"}]}],
 ]
 inputs = processor.apply_chat_template(
-    conversations, tokenize=True, return_dict=True, return_tensors="np"
+    conversations, tokenize=True, return_dict=True, return_tensors="mlx"
 )
-embeddings = model(**{key: mx.array(value) for key, value in inputs.items()}).text_embeds
+embeddings = model(**inputs).text_embeds
 print(embeddings.shape)  # (3, 768)
 ```
 
@@ -107,6 +108,9 @@ mlx_vlm.convert --hf-path google/embeddinggemma-2 \
 ```
 
 Both `load_embedding_model` and `mlx_vlm.load` accept the converted directory.
+Conversion saves the tokenizer, chat template, image/audio/video settings, and
+processor configuration. `mlx_vlm.load` restores the local processor from these
+files, including when loading offline.
 
 ## Performance and quantization
 
@@ -150,5 +154,12 @@ padding, media placement, disabled towers, and checkpoint sanitization/reloading
 
 ```sh
 python -m pytest -q mlx_vlm/tests/test_embedding_gemma2.py \
-  mlx_vlm/tests/test_models.py -k embedding_gemma2
+  mlx_vlm/tests/test_models.py mlx_vlm/tests/test_processors.py -k embedding_gemma2
 ```
+
+Processor validation covers 49 cases across text, images, audio, video, mixed
+and nested batches, visual budgets, frame sampling, timestamps, and invalid
+inputs. All numeric outputs match the reference exactly, both before and after
+processor save/reload, including with stock Transformers 5.14.0. Full BF16 and
+8-bit conversions preserve processor outputs and settings; BF16 embeddings are
+bit-identical before and after conversion across all modalities and mixed batches.
