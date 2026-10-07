@@ -431,6 +431,34 @@ def _tiny_vision_model():
     )
 
 
+def test_rfdetr_small_variant_matches_checkpoint_layout():
+    from mlx_vlm.models.rfdetr import Model, ModelConfig
+    from mlx_vlm.models.rfdetr.convert import MODEL_VARIANTS
+
+    # Roboflow RFDETRSmallConfig: 512px, patch 16, 32x32 position grid, 2 windows
+    config = ModelConfig.from_dict(copy.deepcopy(MODEL_VARIANTS["small"]["config"]))
+    model = Model(config)
+    backbone = model.backbone
+
+    # Shapes of the rf-detr-small.pth backbone tensors
+    assert backbone.embeddings.position_embeddings.shape == (1, 1 + 32 * 32, 384)
+    assert backbone.embeddings.patch_embeddings.projection.weight.shape == (
+        384,
+        16,
+        16,
+        3,
+    )
+    assert backbone.num_windows == backbone.embeddings.num_windows == 2
+    # Stages 3, 6, 9, 12 are the outputs of blocks 2, 5, 8, 11; blocks 3, 6, 9
+    # use global attention and the rest are windowed.
+    assert backbone.config.out_feature_indexes == [2, 5, 8, 11]
+    assert sorted(backbone.window_block_indexes) == [0, 1, 2, 4, 5, 7, 8, 10, 11]
+
+    res = config.resolution
+    features = backbone(mx.zeros((1, res, res, 3)))
+    assert [f.shape for f in features] == [(1, 32, 32, 384)] * 4
+
+
 def test_paddle_attention_uses_no_mask_for_single_segment():
     attention = Attention(dim=8, num_heads=2)
     hidden_states = mx.random.uniform(shape=(4, 8))
