@@ -2123,6 +2123,7 @@ def _weather_tools(**fields):
 WEATHER_TOOLS = _weather_tools(city="string", days="integer")
 # Literal wire examples are independent of the parser's marker constants.
 WIRE_CALLS = {
+    "apertus": '<|tools_prefix|>[{"get_weather": {"city": "Paris", "days": 3}}]',
     "atem": 'to=self<|message|><atem:function_calls><atem:invoke name="get_weather">'
     '<atem:parameter name="city">Paris</atem:parameter>'
     '<atem:parameter name="days">3</atem:parameter></atem:invoke></atem:function_calls>',
@@ -2239,6 +2240,8 @@ def test_parser_selection(name):
 @pytest.mark.parametrize(
     "name,text,error",
     [
+        ("apertus", "not a tool call", None),
+        ("apertus", '[{"get_weather": {}, "get_time": {}}]', None),
         ("atem", "not a tool call", "No ATEM function invocation"),
         ("minicpm5", '<function name="lookup"><param name="value">unfinished', None),
         ("minicpm5", '<function name=""></function>', None),

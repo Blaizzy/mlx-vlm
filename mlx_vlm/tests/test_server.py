@@ -5386,6 +5386,7 @@ _CALL = '<tool_call>{"name": "get_weather", "arguments": {}}</tool_call>'
         ("minicpm5", '<function name="get_time"></function>Use <function as a prefix.'),
         ("mistral", 'Before [TOOL_CALLS]foo[ARGS]{"a": 1}\nAfter'),
         ("mistral", "[TOOL_CALLS]foo[ARGS]{}\n[TOOL_CALLS]bar[ARGS]{}"),
+        ("apertus", 'Reading. <|tools_prefix|>[{"read": {"path": "a"}}, {"ls": {}}]'),
     ],
 )
 def test_tool_stream_matches_non_streamed_content(parser, text):
