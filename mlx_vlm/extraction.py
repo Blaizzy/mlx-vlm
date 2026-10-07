@@ -87,6 +87,23 @@ def split_outputs(result: Mapping) -> dict:
     return arrays
 
 
+def describe_outputs(outputs):
+    """Summarise named arrays as shapes and dtypes, listing metadata keys."""
+    described = {
+        # MLX spells its dtypes "mlx.core.float32"; callers want "float32".
+        name: {
+            "shape": list(value.shape),
+            "dtype": str(value.dtype).rsplit(".", 1)[-1],
+        }
+        for name, value in outputs.items()
+        if name != METADATA
+    }
+    summary = {"outputs": described}
+    if METADATA in outputs:
+        summary[METADATA] = sorted(outputs[METADATA])
+    return summary
+
+
 def extract(model, processor, inputs, task=None, **kwargs):
     """Predict named structured outputs using a model's native extraction tasks."""
     supported = getattr(model, "extraction_types", ())

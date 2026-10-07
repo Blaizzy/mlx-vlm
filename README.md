@@ -579,6 +579,31 @@ Both interfaces return the shared `predict()` result and preserve model-specific
 scoring. Decider and Laya support `choice`, `bool`, and `score`; consult each
 model's README for criteria and calibration details.
 
+Extraction models are served the same way, at `/v1/extractions`:
+
+```sh
+python -m mlx_vlm server --extraction-model nativ-community/rfdetr-base-fp32
+curl http://localhost:8080/v1/extractions \
+  -H 'Content-Type: application/json' \
+  -d '{"image":"https://example.com/street.jpg","settings":{"conf_threshold":0.3}}'
+```
+
+`image` takes a URL, a path or a data URI, and repeats as a list for models that
+read frames; `video` takes a path instead. `task` selects among a model's
+`extraction_types`, `prompt` supplies a text prompt, and `settings` forwards
+keywords to the model.
+
+Because extraction returns arrays rather than text, the response pairs a manifest
+with the data: `outputs` gives each array's shape and dtype, `metadata` lists any
+non-array keys, and `arrays_b64` carries the arrays as base64 safetensors.
+
+```python
+import base64
+from safetensors.numpy import load
+
+arrays = load(base64.b64decode(response["arrays_b64"]))
+```
+
 ### Server (FastAPI)
 
 Start the server:
@@ -1322,6 +1347,7 @@ Structured outputs are not currently supported with speculative decoding.
 - `/responses/compact` and `/v1/responses/compact` - Compact conversation history into replayable state; see [compaction and APC](docs/usage.md#conversation-compaction-and-apc)
 - `/embeddings` and `/v1/embeddings` - OpenAI-compatible embeddings endpoint backed by native MLX embedding models
 - `/v1/decisions` - Predict named typed decisions using the shared decision API
+- `/v1/extractions` - Predict named arrays using the shared extraction API
 - `/v1/rerank` - Rank text or multimodal documents by relevance to a query
 - `/audio/speech` and `/v1/audio/speech` - OpenAI-compatible text-to-speech endpoint backed by `mlx-audio` TTS models
 - `/audio/transcriptions` and `/v1/audio/transcriptions` - OpenAI-compatible speech-to-text endpoint backed by `mlx-audio` STT models
