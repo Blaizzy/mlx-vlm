@@ -9,6 +9,7 @@ from .muse_glimmer_assistant import MuseGlimmerAssistantDraftModel
 from .qwen3_dflash import DFlashDraftModel
 
 KNOWN_DRAFTER_KINDS = {"dflash", "mtp", "eagle3"}
+_BUNDLED_QWEN_MTP_TYPES = {"qwen3_5", "qwen3_5_moe"}
 
 # Drafter HF ``model_type`` → required round-loop kind. Anything not listed
 # here falls back to ``DEFAULT_DRAFTER_KIND`` when the caller didn't pass one.
@@ -139,6 +140,8 @@ def _expected_drafter_kind(model_type: Any, config: Any = None) -> Optional[str]
     """Round-loop kind a drafter requires, or ``None`` when it can't be inferred:
     an explicit ``model_type`` mapping first, then an ``mtp`` model_type name,
     then a config that declares next-token-prediction layers."""
+    if model_type in _BUNDLED_QWEN_MTP_TYPES:
+        return "mtp"
     expected = DRAFTER_KIND_BY_MODEL_TYPE.get(model_type)
     if expected is not None:
         return expected
@@ -199,6 +202,9 @@ def load_drafter(
     drafter's HF ``model_type`` (see :func:`resolve_drafter_kind`). Callers
     should use ``resolved_kind`` for downstream dispatch instead of trusting
     their original ``kind`` arg.
+
+    Qwen3.5/3.6/3.8 base checkpoints can be passed directly: their bundled MTP
+    tensors are loaded in memory without extracting a separate checkpoint.
     """
     if kind is not None and kind not in KNOWN_DRAFTER_KINDS:
         raise ValueError(
@@ -208,6 +214,10 @@ def load_drafter(
 
     path = get_model_path(path_or_repo)
     resolved = resolve_drafter_kind(path, kind)
+    if _peek_drafter_model_type(path) in _BUNDLED_QWEN_MTP_TYPES:
+        from .qwen3_5_mtp.split import Qwen3_5MTPSplitter
+
+        return Qwen3_5MTPSplitter().load(path, **kwargs), resolved
     return load_model(path, **kwargs), resolved
 
 

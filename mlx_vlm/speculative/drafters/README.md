@@ -4,6 +4,11 @@ Some base checkpoints ship native **multi-token-prediction (MTP)** tensors. This
 package extracts them into a standalone MLX *drafter* for speculative decoding,
 through one shared framework (`mtp_split.py`) with a small per-family subclass.
 
+Qwen3.5/3.6/3.8 checkpoints can also be loaded directly: pass the original
+checkpoint as `--draft-model` in the CLI or server. Bundled MTP weights are
+loaded in memory without writing a separate checkpoint; the draft kind is
+auto-detected. See the [Qwen MTP examples](qwen3_5_mtp/README.md).
+
 ## Extract a drafter
 
 Standalone — auto-detects the family from the source config:

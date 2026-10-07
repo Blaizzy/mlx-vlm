@@ -1,4 +1,4 @@
-"""Central framework for extracting native MTP tensors into a standalone drafter.
+"""Prepare native MTP tensors for in-memory loading or standalone extraction.
 
 One ``MTPSplitter`` base owns the shared mechanics (shard discovery, selective
 load, config assembly, tokenizer copy). A family customizes by subclassing and
@@ -202,22 +202,14 @@ class MTPSplitter:
         self.postprocess(tensors, text_config)
         return tensors
 
-    def split(
+    def prepare(
         self,
-        source: str,
-        output: str,
+        source_path: Path,
         *,
-        revision: Optional[str] = None,
         block_size: Optional[int] = None,
-        force_download: bool = False,
         **quant_opts,
-    ) -> Path:
-        source_path = get_model_path(
-            source, revision=revision, force_download=force_download
-        )
-        output_path = Path(output)
-        output_path.mkdir(parents=True, exist_ok=True)
-
+    ) -> Tuple[dict, Dict[str, mx.array]]:
+        """Prepare a drafter config and weights in memory without writing files."""
         with open(source_path / "config.json") as f:
             source_config = json.load(f)
         text_config = self.read_text_config(source_config)
@@ -253,13 +245,6 @@ class MTPSplitter:
             weights, source_config, text_config, quant_opts
         )
 
-        mx.eval(list(weights.values()))
-        mx.save_safetensors(
-            str(output_path / "model.safetensors"),
-            weights,
-            metadata={"format": "mlx"},
-        )
-
         depth = self.depth(text_config)
         draft_config = {
             "model_type": self.output_model_type,
@@ -273,6 +258,33 @@ class MTPSplitter:
         if quantization is not None:
             draft_config["quantization"] = quantization
             draft_config["quantization_config"] = quantization
+
+        return draft_config, weights
+
+    def split(
+        self,
+        source: str,
+        output: str,
+        *,
+        revision: Optional[str] = None,
+        block_size: Optional[int] = None,
+        force_download: bool = False,
+        **quant_opts,
+    ) -> Path:
+        source_path = get_model_path(
+            source, revision=revision, force_download=force_download
+        )
+        draft_config, weights = self.prepare(
+            source_path, block_size=block_size, **quant_opts
+        )
+        output_path = Path(output)
+        output_path.mkdir(parents=True, exist_ok=True)
+        mx.eval(list(weights.values()))
+        mx.save_safetensors(
+            str(output_path / "model.safetensors"),
+            weights,
+            metadata={"format": "mlx"},
+        )
 
         with open(output_path / "config.json", "w") as f:
             json.dump(dict(sorted(draft_config.items())), f, indent=2)
