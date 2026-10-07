@@ -1,5 +1,6 @@
 import argparse
 import glob
+import json
 import shutil
 from pathlib import Path
 from typing import Callable, Optional, Union
@@ -263,6 +264,28 @@ def _apply_awq_calibration(
     print(f"[INFO] AWQ scaling applied: {summary}")
 
 
+def _drop_stale_special_tokens_map(model_path: Path, mlx_path: Path) -> None:
+    """Remove the source's special_tokens_map.json once the tokenizer is re-saved.
+
+    transformers 5 saves fast tokenizers without ``added_tokens_decoder`` in
+    tokenizer_config.json and without special_tokens_map.json, since
+    tokenizer.json already holds the added tokens. Loading a tokenizer_config.json
+    that lacks ``added_tokens_decoder`` falls back to merging special_tokens_map.json,
+    so the copy taken from the source (which the source never read) gets applied,
+    and ``AddedToken`` dicts in it fail with
+    "Input must be a List[Union[str, AddedToken]]".
+    """
+
+    def has_added_tokens_decoder(path: Path) -> bool:
+        config = path / "tokenizer_config.json"
+        return config.exists() and "added_tokens_decoder" in json.loads(
+            config.read_text(encoding="utf-8")
+        )
+
+    if has_added_tokens_decoder(model_path) and not has_added_tokens_decoder(mlx_path):
+        (mlx_path / "special_tokens_map.json").unlink(missing_ok=True)
+
+
 def convert(
     hf_path: str,
     mlx_path: str = "mlx_model",
@@ -390,6 +413,7 @@ def convert(
     # files verbatim, which is what save_pretrained would have produced anyway.
     if hasattr(processor, "save_pretrained"):
         processor.save_pretrained(mlx_path)
+        _drop_stale_special_tokens_map(model_path, mlx_path)
     else:
         # NOTE: no local `import shutil` here — convert.py already imports it at module scope,
         # and a function-local import would make the name local for the WHOLE function, unbinding
