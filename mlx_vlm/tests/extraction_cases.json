@@ -350,6 +350,94 @@
       }
     },
     {
+      "id": "gev",
+      "module": "gev",
+      "config": {
+        "model_type": "gev",
+        "text_config": {
+          "hidden_size": 32,
+          "num_hidden_layers": 1,
+          "intermediate_size": 64,
+          "num_attention_heads": 2,
+          "num_key_value_heads": 1,
+          "head_dim": 8,
+          "global_head_dim": 8,
+          "vocab_size": 512,
+          "vocab_size_per_layer_input": 512,
+          "hidden_size_per_layer_input": 0,
+          "num_kv_shared_layers": 0
+        },
+        "vision_config": {
+          "hidden_size": 16,
+          "intermediate_size": 32,
+          "num_hidden_layers": 1,
+          "num_attention_heads": 2,
+          "num_key_value_heads": 2,
+          "head_dim": 8,
+          "global_head_dim": 8,
+          "position_embedding_size": 16
+        },
+        "decision_config": {
+          "ranges": {
+            "noul": [
+              0,
+              2
+            ],
+            "score": [
+              2,
+              8
+            ],
+            "choice": [
+              8,
+              24
+            ]
+          },
+          "softcap": 30.0,
+          "temperature_by_type": {
+            "noul": 1.0,
+            "choice": 1.0,
+            "score": 1.0
+          },
+          "lora_alpha": 64,
+          "lora_r": 32
+        }
+      },
+      "checks": [
+        "registry_and_config",
+        "checkpoint",
+        "decision_models"
+      ],
+      "decision_models": {
+        "state": "A B",
+        "questions": {
+          "route": {
+            "type": "choice",
+            "instructions": "Route",
+            "criteria": [
+              "A",
+              "B"
+            ]
+          },
+          "quality": {
+            "type": "score",
+            "instructions": "Rate",
+            "criteria": [
+              "0",
+              "1",
+              "2",
+              "3",
+              "4",
+              "5"
+            ]
+          },
+          "finished": {
+            "type": "bool",
+            "instructions": "Finished"
+          }
+        }
+      }
+    },
+    {
       "id": "dinov2",
       "module": "dinov2",
       "config": {
