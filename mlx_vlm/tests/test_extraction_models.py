@@ -1993,6 +1993,37 @@ def test_extraction_contract(case):
         getattr(checks, kind)(case)
 
 
+@pytest.mark.parametrize(
+    "stages, taps, global_layers",
+    [
+        ([2, 5, 8, 11], [1, 4, 7, 10], [2, 5, 8, 11]),  # base
+        ([3, 6, 9, 12], [2, 5, 8, 11], [3, 6, 9]),  # small, seg
+    ],
+)
+def test_rfdetr_backbone_stage_indexes(stages, taps, global_layers):
+    from mlx_vlm.models.rfdetr import ModelConfig
+    from mlx_vlm.models.rfdetr.vision import DINOv2Backbone
+
+    def layers(config):
+        backbone = DINOv2Backbone(config.backbone_config)
+        windowed = backbone.window_block_indexes
+        return backbone.config.out_feature_indexes, [
+            i for i in range(12) if i not in windowed
+        ]
+
+    # Stage i is the output of block i - 1; the raw stage numbers are the
+    # global attention blocks (rfdetr compute_window_block_indexes).
+    config = ModelConfig(out_feature_indexes=stages)
+    assert layers(config) == (taps, global_layers)
+
+    # A saved config must reload to the same layers, with or without the
+    # derived sub-configs.
+    saved = json.loads(json.dumps(config.to_dict(), default=lambda c: c.to_dict()))
+    assert layers(ModelConfig.from_dict(saved)) == (taps, global_layers)
+    del saved["backbone_config"]
+    assert layers(ModelConfig.from_dict(saved)) == (taps, global_layers)
+
+
 def test_video_depth_anything_conv_checkpoint():
     _check_conv_checkpoint(
         _extraction_model("video_depth_anything"),
