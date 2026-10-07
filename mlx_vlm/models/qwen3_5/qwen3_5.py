@@ -98,14 +98,31 @@ class Model(Qwen3VLModel):
                 mx.eval(hidden_states)
                 vision_cache.put(kwargs["_image_key"], hidden_states)
 
-        # Insert special image tokens in the input_ids
-        inputs_embeds, _ = self.merge_input_ids_with_image_features(
-            hidden_states,
-            inputs_embeds,
-            input_ids,
-            self.config.image_token_index,
-            self.config.video_token_index,
-        )
+        pixel_values_videos = kwargs.get("pixel_values_videos", None)
+        if image_grid_thw is not None and pixel_values_videos is not None:
+            video_states, _ = self.vision_tower(
+                pixel_values_videos.astype(dtype), video_grid_thw
+            )
+            for token, states in (
+                (self.config.image_token_index, hidden_states),
+                (self.config.video_token_index, video_states),
+            ):
+                inputs_embeds = masked_scatter(
+                    inputs_embeds,
+                    mx.broadcast_to(
+                        (input_ids == token)[..., None], inputs_embeds.shape
+                    ),
+                    states,
+                )
+        else:
+            # Insert special image tokens in the input_ids
+            inputs_embeds, _ = self.merge_input_ids_with_image_features(
+                hidden_states,
+                inputs_embeds,
+                input_ids,
+                self.config.image_token_index,
+                self.config.video_token_index,
+            )
 
         position_ids, rope_deltas = self.language_model.get_rope_index(
             input_ids, image_grid_thw, video_grid_thw, mask

@@ -308,16 +308,38 @@ class Clef:
         )
         media = {}
         images, videos = list(images or []), list(videos or [])
+        media_kwargs = dict(media_kwargs or {})
+        if videos and "video_metadata" not in media_kwargs:
+            video_processor = self.processor.video_processor
+            fps = media_kwargs.pop("fps", None)
+            num_frames = media_kwargs.pop("num_frames", None)
+            metadata = []
+            for index, frames in enumerate(videos):
+                total = len(frames)
+                count = num_frames
+                if count is None:
+                    count = int(total / 24 * (fps or video_processor.fps))
+                    count = min(
+                        max(count, video_processor.min_frames),
+                        video_processor.max_frames,
+                        total,
+                    )
+                indices = np.linspace(0, total - 1, count).round().astype(int)
+                videos[index] = [frames[i] for i in indices]
+                metadata.append({"frames_indices": indices.tolist(), "fps": 24})
+            media_kwargs["video_metadata"] = metadata
         if images or videos:
             encoded = self.processor(
                 text=[
                     "<|vision_start|><|image_pad|><|vision_end|>" * len(images)
-                    + "<|vision_start|><|video_pad|><|vision_end|>" * len(videos)
+                    # transformers 5 keeps the outer vision tokens around timestamped frames
+                    + "<|vision_start|><|vision_start|><|video_pad|><|vision_end|><|vision_end|>"
+                    * len(videos)
                     + "\n"
                 ],
                 images=images or None,
                 videos=videos or None,
-                **(media_kwargs or {}),
+                **media_kwargs,
             )
             prefix += np.asarray(encoded["input_ids"])[0].tolist()
             media = {
