@@ -65,6 +65,54 @@ def _extraction_config(name):
     return copy.deepcopy(EXTRACTION_CASES[name]["config"])
 
 
+@pytest.mark.parametrize("height,width", [(2, 3), (3, 2), (72, 72)])
+@pytest.mark.parametrize("theta", [10000.0, 100.0])
+def test_sam3_tracker_rope_matches_reference(height, width, theta):
+    from mlx_vlm.models.sam3.position import apply_rotary_enc_1d, init_2d_freqs
+    from mlx_vlm.models.sam3_1.sam_components import SimpleRoPEAttention
+
+    # Meta sam3/sam/rope.py:compute_axial_cis uses row-major coordinates
+    # and assigns the first half of the complex channels to X, then Y.
+    dim = 32
+    positions = np.arange(height * width, dtype=np.float32)
+    frequencies = theta ** (-np.arange(0, dim, 4, dtype=np.float32) / dim)
+    phases = np.concatenate(
+        [
+            np.outer(positions % width, frequencies),
+            np.outer(positions // width, frequencies),
+        ],
+        axis=-1,
+    )
+    reference = np.exp(1j * phases)
+    cos, sin = init_2d_freqs(dim, height, width, theta=theta)
+    np.testing.assert_allclose(np.asarray(cos), reference.real, atol=1e-5)
+    np.testing.assert_allclose(np.asarray(sin), reference.imag, atol=1e-5)
+
+    attention = SimpleRoPEAttention(
+        dim * 2, 2, feat_sizes=(height, width), rope_theta=theta, rope_k_repeat=True
+    )
+    np.testing.assert_allclose(
+        np.asarray(attention._freqs_cos), reference.real, atol=1e-5
+    )
+    np.testing.assert_allclose(
+        np.asarray(attention._freqs_sin), reference.imag, atol=1e-5
+    )
+
+    # Compare pairwise rotation with complex multiplication, including keys
+    # from two memory frames that reuse the same spatial frequencies.
+    rng = np.random.default_rng(42)
+    q = rng.normal(size=(1, height * width, 2, dim)).astype(np.float32)
+    k = rng.normal(size=(1, height * width * 2, 2, dim)).astype(np.float32)
+    rotated = apply_rotary_enc_1d(mx.array(q), mx.array(k), cos, sin, True)
+    for values, actual, repeats in [(q, rotated[0], 1), (k, rotated[1], 2)]:
+        complex_values = values[..., 0::2] + 1j * values[..., 1::2]
+        expected = complex_values * np.tile(reference, (repeats, 1))[None, :, None]
+        expected = np.stack([expected.real, expected.imag], axis=-1).reshape(
+            values.shape
+        )
+        np.testing.assert_allclose(np.asarray(actual), expected, atol=1e-5)
+
+
 def test_checkpoint_key_sanitization():
     weights = {
         "encoder.embeddings.LayerNorm.weight": mx.ones((4,)),
@@ -1993,6 +2041,37 @@ def test_extraction_contract(case):
         getattr(checks, kind)(case)
 
 
+@pytest.mark.parametrize(
+    "stages, taps, global_layers",
+    [
+        ([2, 5, 8, 11], [1, 4, 7, 10], [2, 5, 8, 11]),  # base
+        ([3, 6, 9, 12], [2, 5, 8, 11], [3, 6, 9]),  # small, seg
+    ],
+)
+def test_rfdetr_backbone_stage_indexes(stages, taps, global_layers):
+    from mlx_vlm.models.rfdetr import ModelConfig
+    from mlx_vlm.models.rfdetr.vision import DINOv2Backbone
+
+    def layers(config):
+        backbone = DINOv2Backbone(config.backbone_config)
+        windowed = backbone.window_block_indexes
+        return backbone.config.out_feature_indexes, [
+            i for i in range(12) if i not in windowed
+        ]
+
+    # Stage i is the output of block i - 1; the raw stage numbers are the
+    # global attention blocks (rfdetr compute_window_block_indexes).
+    config = ModelConfig(out_feature_indexes=stages)
+    assert layers(config) == (taps, global_layers)
+
+    # A saved config must reload to the same layers, with or without the
+    # derived sub-configs.
+    saved = json.loads(json.dumps(config.to_dict(), default=lambda c: c.to_dict()))
+    assert layers(ModelConfig.from_dict(saved)) == (taps, global_layers)
+    del saved["backbone_config"]
+    assert layers(ModelConfig.from_dict(saved)) == (taps, global_layers)
+
+
 def test_video_depth_anything_conv_checkpoint():
     _check_conv_checkpoint(
         _extraction_model("video_depth_anything"),
@@ -2032,6 +2111,49 @@ def test_video_depth_anything_rejects_unknown_encoder():
 
     with pytest.raises(ValueError):
         ModelConfig(encoder="vitxl")
+
+
+def test_rfdetr_checkpoint_conversion():
+    from mlx_vlm.models.rfdetr import Model, ModelConfig
+
+    model = Model(ModelConfig(segmentation=True))
+    mx.random.seed(0)
+    expected = {
+        key: mx.random.normal(value.shape)
+        for key, value in tree_flatten(model.parameters())
+    }
+    renames = [
+        ("backbone.embeddings.", "backbone.0.encoder.encoder.embeddings."),
+        ("backbone.encoder.layers.", "backbone.0.encoder.encoder.encoder.layer."),
+        ("backbone.layernorm.", "backbone.0.encoder.encoder.layernorm."),
+        ("projector.", "backbone.0.projector."),
+        (".attention.q_proj.", ".attention.attention.query."),
+        (".attention.k_proj.", ".attention.attention.key."),
+        (".attention.v_proj.", ".attention.attention.value."),
+        (".attention.o_proj.", ".attention.output.dense."),
+        (".layer_scale1", ".layer_scale1.lambda1"),
+        (".layer_scale2", ".layer_scale2.lambda1"),
+    ]
+    source = {}
+    for key, value in expected.items():
+        for mlx_name, torch_name in renames:
+            key = key.replace(mlx_name, torch_name)
+        if value.ndim == 4:
+            value = value.transpose(0, 3, 1, 2)
+        source[f"model.{key}"] = value
+    for i in range(model.config.dec_layers):
+        prefix = f"model.transformer.decoder.layers.{i}.self_attn."
+        for suffix in ("weight", "bias"):
+            source[f"{prefix}in_proj_{suffix}"] = mx.concatenate(
+                [source.pop(f"{prefix}{name}_proj.{suffix}") for name in "qkv"]
+            )
+    mask_token = "model.backbone.0.encoder.encoder.embeddings.mask_token"
+    source[mask_token] = mx.zeros((1, 384))
+
+    converted = model.sanitize(source)
+    _assert_weights_equal(converted, expected)
+    _assert_weights_equal(model.sanitize(dict(converted)), expected)
+    model.load_weights(list(converted.items()), strict=True)
 
 
 class TestLayaDecisionModel(unittest.TestCase):

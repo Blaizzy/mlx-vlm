@@ -21,6 +21,7 @@ import mlx_vlm.models.rope_utils as rope_utils
 from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
 from mlx_vlm.fp8 import _dequantize_fp8_weight, _quantize_fp8_weight
 from mlx_vlm.models.cache import KVCache
+from mlx_vlm.models.kernels import grid_sample
 from mlx_vlm.models.mla import max_absorbed_queries
 from mlx_vlm.models.paddleocr_vl.config import VisionConfig
 from mlx_vlm.models.paddleocr_vl.vision import Attention, VisionModel
@@ -430,6 +431,34 @@ def _tiny_vision_model():
     )
 
 
+def test_rfdetr_small_variant_matches_checkpoint_layout():
+    from mlx_vlm.models.rfdetr import Model, ModelConfig
+    from mlx_vlm.models.rfdetr.convert import MODEL_VARIANTS
+
+    # Roboflow RFDETRSmallConfig: 512px, patch 16, 32x32 position grid, 2 windows
+    config = ModelConfig.from_dict(copy.deepcopy(MODEL_VARIANTS["small"]["config"]))
+    model = Model(config)
+    backbone = model.backbone
+
+    # Shapes of the rf-detr-small.pth backbone tensors
+    assert backbone.embeddings.position_embeddings.shape == (1, 1 + 32 * 32, 384)
+    assert backbone.embeddings.patch_embeddings.projection.weight.shape == (
+        384,
+        16,
+        16,
+        3,
+    )
+    assert backbone.num_windows == backbone.embeddings.num_windows == 2
+    # Stages 3, 6, 9, 12 are the outputs of blocks 2, 5, 8, 11; blocks 3, 6, 9
+    # use global attention and the rest are windowed.
+    assert backbone.config.out_feature_indexes == [2, 5, 8, 11]
+    assert sorted(backbone.window_block_indexes) == [0, 1, 2, 4, 5, 7, 8, 10, 11]
+
+    res = config.resolution
+    features = backbone(mx.zeros((1, res, res, 3)))
+    assert [f.shape for f in features] == [(1, 32, 32, 384)] * 4
+
+
 def test_paddle_attention_uses_no_mask_for_single_segment():
     attention = Attention(dim=8, num_heads=2)
     hidden_states = mx.random.uniform(shape=(4, 8))
@@ -469,6 +498,26 @@ def two_pass_inputs():
     if kv_len is None:
         pytest.skip("no KV length on this GPU selects the two-pass plan")
     return inputs(kv_len)
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("grid_dtype", [None, mx.float32])
+def test_grid_sample_half_precision_matches_float32(dtype, grid_dtype):
+    if not mx.metal.is_available():
+        pytest.skip("Metal kernels are unavailable on this host")
+
+    mx.random.seed(0)
+    x = mx.random.normal((2, 12, 10, 8)).astype(dtype)
+    grid = mx.random.uniform(-1.1, 1.1, (2, 7, 5, 2)).astype(grid_dtype or dtype)
+    expected = grid_sample(x.astype(mx.float32), grid.astype(mx.float32))
+    actual = grid_sample(x, grid)
+    mx.eval(actual)  # surface kernel build errors here rather than in np.array
+    assert actual.dtype == dtype
+    # Only the final rounding to `dtype` should separate the two.
+    rtol = 2**-8 if dtype == mx.bfloat16 else 2**-10
+    np.testing.assert_allclose(
+        np.array(actual.astype(mx.float32)), np.array(expected), rtol=rtol, atol=1e-6
+    )
 
 
 # Rotary embeddings
