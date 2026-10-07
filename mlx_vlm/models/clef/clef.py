@@ -241,7 +241,7 @@ class Model(Qwen3_5Model):
         return Clef(self, processor).predict(state, questions, **kwargs)
 
 
-def _render(value):
+def _render_criterion(value):
     if isinstance(value, str):
         return value
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
@@ -294,7 +294,9 @@ class Clef:
                 "INSTRUCTION: "
             )
             start = len(schema)
-            schema += tokens(_render(question.get("instructions") or str(name)))
+            schema += tokens(
+                _render_criterion(question.get("instructions") or str(name))
+            )
             question_span = (start, len(schema))
             schema += tokens("\nALLOWED OPTIONS:\n")
             spans, labels = [], []
@@ -304,7 +306,7 @@ class Clef:
                 semantics = {"option_id": option}
                 if description is not None:
                     semantics["description"] = description
-                schema += tokens(_render(semantics))
+                schema += tokens(_render_criterion(semantics))
                 spans.append((start, len(schema)))
                 labels.append(option)
                 schema += tokens("\n")
@@ -366,7 +368,7 @@ class Clef:
                 )
                 if encoded.get(key) is not None
             }
-        state_ids = tokens(_render(state))[:max_state_tokens]
+        state_ids = tokens(_render_criterion(state))[:max_state_tokens]
         fixed = len(prefix) + len(schema) + len(suffix)
         if fixed > max_length:
             raise ValueError(
