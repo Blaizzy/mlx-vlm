@@ -183,16 +183,16 @@ KNOBS: Tuple[
         "spec_draft_model",
         "str_or_none",
         None,
-        TEXT_KINDS,
+        (),
         None,
-        "Speculative drafting model path.",
+        "Speculative drafter path; null disables drafting. Swapped between batches.",
     ),
     (
         "spec_draft_kind",
         "str_or_none",
         None,
-        TEXT_KINDS,
-        None,
+        (),
+        ("dflash", "eagle3", "mtp"),
         "Speculative draft kind (auto if unset).",
     ),
     (
@@ -218,7 +218,12 @@ _KNOB_SPEC: Dict[str, Dict[str, Any]] = {
 
 # Knobs that are naturally live (applied per request) and must never trigger a
 # model reload, so they are excluded from the cache-key fingerprint.
-_LIVE_KNOBS: Tuple[str, ...] = ("max_kv_size", "token_queue_timeout")
+_LIVE_KNOBS: Tuple[str, ...] = (
+    "max_kv_size",
+    "token_queue_timeout",
+    "spec_draft_model",
+    "spec_draft_kind",
+)
 
 
 def _env_float(
@@ -393,6 +398,11 @@ class RuntimeConfig:
         with self._lock:
             return {name: getattr(self, name) for name in _KNOB_SPEC}
 
+    def drafter_settings(self) -> Tuple[Optional[str], Optional[str]]:
+        """Read the drafter path and kind as one settings snapshot."""
+        with self._lock:
+            return self.spec_draft_model, self.spec_draft_kind
+
     def apc_overrides(self) -> Dict[str, Any]:
         """Snapshot all APC settings for manager creation without changing env."""
         with self._lock:
@@ -420,6 +430,7 @@ class RuntimeConfig:
         applied: Dict[str, Any] = {}
         rejected: List[Dict[str, Any]] = []
         with self._lock:
+            previous_drafter = self.spec_draft_model
             for name, raw in payload.items():
                 if name not in _KNOB_SPEC:
                     rejected.append({"name": name, "reason": "unknown knob"})
@@ -442,6 +453,13 @@ class RuntimeConfig:
                     continue
                 setattr(self, name, value)
                 applied[name] = value
+            if (
+                "spec_draft_model" in applied
+                and self.spec_draft_model != previous_drafter
+                and "spec_draft_kind" not in payload
+            ):
+                self.spec_draft_kind = None
+                applied["spec_draft_kind"] = None
         return applied, rejected
 
     def _in_cache_key(self, name: str) -> bool:

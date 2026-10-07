@@ -626,6 +626,11 @@ def get_cached_model(
         if cache_group == "text_generation":
             runtime.response_generator = cached_cache.get("response_generator")
             runtime.apc_manager = cached_cache.get("apc_manager")
+            # The next generate() applies this on its caller thread so waiting
+            # for an active batch never blocks the HTTP event loop.
+            runtime.response_generator.draft_settings = (
+                runtime.config.drafter_settings()
+            )
         logger.debug("Using cached model: %s (adapter=%s)", model_path, adapter_path)
         return (
             cached_cache["model"],
@@ -943,8 +948,7 @@ def get_cached_model(
         quantized_kv_start=quantized_kv_start,
         top_logprobs_k=get_top_logprobs_k(),
         apc_manager=runtime.apc_manager,
-        draft_model_path=cfg.spec_draft_model,
-        draft_kind=cfg.spec_draft_kind,
+        draft_settings=cfg.drafter_settings(),
     )
     try:
         model, processor, config = response_generator.wait_until_ready()
