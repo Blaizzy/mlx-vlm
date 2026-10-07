@@ -6,6 +6,7 @@ import mlx.nn as nn
 import numpy as np
 
 from ..qwen3_5 import Model as Qwen3_5Model
+from ..qwen3_vl.qwen3_vl import masked_scatter
 
 QUESTION_TYPES = {"noul": 0, "choice": 1, "score": 2}
 
@@ -150,11 +151,24 @@ class Model(Qwen3_5Model):
         self.head = JointSchemaHead(**config.head_config)
 
     def __call__(self, input_ids, question_spans, option_spans, qtype, **media):
-        features = self.get_input_embeddings(input_ids, **media)
+        embeds = self.language_model.model.embed_tokens(input_ids)
+        dtype = self.vision_tower.patch_embed.proj.weight.dtype
+        for pixels, grid, token in (
+            ("pixel_values", "image_grid_thw", self.config.image_token_index),
+            ("pixel_values_videos", "video_grid_thw", self.config.video_token_index),
+        ):
+            if media.get(pixels) is not None:
+                states, _ = self.vision_tower(media[pixels].astype(dtype), media[grid])
+                embeds = masked_scatter(
+                    embeds,
+                    mx.broadcast_to((input_ids == token)[..., None], embeds.shape),
+                    states,
+                )
+        position_ids, _ = self.language_model.get_rope_index(
+            input_ids, media.get("image_grid_thw"), media.get("video_grid_thw")
+        )
         hidden = self.language_model.model(
-            input_ids,
-            inputs_embeds=features.inputs_embeds,
-            position_ids=features.position_ids,
+            input_ids, inputs_embeds=embeds, position_ids=position_ids
         )
         hidden = self.head.hidden_norm(hidden[0])
         flat = np.asarray(input_ids[0])
