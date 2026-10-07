@@ -45,6 +45,27 @@ qwen_omni = _model_module("qwen3_omni_moe")
 omni_language = _model_module("qwen3_omni_moe.language")
 
 
+def test_mimo_v2_encodes_batched_audio_samples_independently():
+    module = _model_module("mimo_v2")
+    cases = json.loads(Path(__file__).with_name("model_cases.json").read_text())
+    case = next(c for c in cases["cases"] if c["module"] == "mimo_v2")
+    model = module.Model(module.ModelConfig.from_dict(case["config"]))
+    first = mx.array([[1, 2], [3, 4], [5, 6], [7, 8]])
+    second = mx.array([[8, 7], [6, 5], [4, 3], [2, 1]])
+    expected = mx.concatenate(
+        [model.encode_audio(first), model.encode_audio(second)], axis=0
+    )
+    ids = mx.array([[model.config.audio_token_id] * expected.shape[0]])
+
+    result = model.get_input_embeddings(
+        ids,
+        audio_codes=mx.concatenate([first, second], axis=0),
+        audio_code_lengths=[first.shape[0], second.shape[0]],
+    ).inputs_embeds
+
+    assert mx.allclose(result[0], expected)
+
+
 # Audio model components
 
 
@@ -60,6 +81,46 @@ def _small_config(factory, **overrides):
             | overrides
         )
     )
+
+
+def test_gemma4_audio_causal_mask_matches_transformers_predicate():
+    """Matches transformers' sliding_window_mask_function: a key is valid iff
+    0 <= (q_idx - kv_idx) < attention_context_left - 1, or
+    (kv_idx - q_idx) < attention_context_right."""
+    from mlx_vlm.models.gemma4.audio import AudioEncoder
+    from mlx_vlm.models.gemma4.config import AudioConfig
+
+    for chunk_size, context_left, context_right in [
+        (12, 13, 0),  # the shipped checkpoint's own config
+        (12, 1, 0),
+        (8, 6, 4),
+        (4, 2, 2),
+        (6, 4, 1),
+        (5, 1, 5),
+        (10, 10, 3),
+    ]:
+        max_past = max(0, context_left - 1)
+        max_future = context_right
+        context_size = chunk_size + max_past + max_future
+        encoder = SimpleNamespace(
+            config=AudioConfig(
+                attention_chunk_size=chunk_size,
+                attention_context_left=context_left,
+                attention_context_right=context_right,
+            )
+        )
+
+        mask = AudioEncoder._build_causal_valid_mask(encoder)
+
+        expected = [
+            [
+                (0 <= (q + max_past - c) < max_past)
+                or ((q + max_past - c) < 0 and -(q + max_past - c) < max_future)
+                for c in range(context_size)
+            ]
+            for q in range(chunk_size)
+        ]
+        assert mask.tolist() == expected, (chunk_size, context_left, context_right)
 
 
 class TestMiniCPMOTTS(unittest.TestCase):
@@ -917,6 +978,13 @@ def test_mog_head_inference_shapes_and_finite_values():
     assert logs.shape == (1, 1, 1)
     assert bool(mx.all(mx.isfinite(mean)))
     assert bool(mx.all(mx.isfinite(logs)))
+
+
+@pytest.mark.parametrize("top_p", [1e-8, 1e-3, 0.7])
+def test_mog_top_p_keeps_most_likely_component(top_p):
+    # 1 - 1e-8 rounds to 1.0 in float32, which used to mask every component.
+    filtered = voicechat_tts._top_p_logits(mx.array([[0.0, 1.0, 3.0, 2.0]]), top_p)
+    assert (filtered > -mx.inf).tolist() == [[False, False, True, top_p == 0.7]]
 
 
 def test_model_creates_session_from_wrapped_tokenizer():

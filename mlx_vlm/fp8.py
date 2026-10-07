@@ -21,6 +21,7 @@ def make_quantization_config(config: dict) -> dict | None:
         and quantization.get("quant_method") == "fp8"
         and quantization.get("fmt", "e4m3") == "e4m3"
         and quantization.get("weight_block_size") == [128, 128]
+        and quantization.get("store_dtype", "fp8") == "fp8"
     )
     return dict(MLX_MXFP8_QUANTIZATION) if is_supported else None
 

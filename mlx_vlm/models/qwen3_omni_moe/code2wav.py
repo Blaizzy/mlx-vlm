@@ -9,6 +9,7 @@ from mlx.utils import tree_flatten
 from mlx_vlm.models.qwen3_omni_moe.config import Code2WavConfig
 
 from ..base import scaled_dot_product_attention
+from ..rope_utils import rotate_half
 
 
 class SnakeBeta(nn.Module):
@@ -177,12 +178,6 @@ class Code2WavDecoderBlock(nn.Module):
         for block in self.block:
             hidden = block(hidden)
         return hidden
-
-
-def rotate_half(x):
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return mx.concatenate([-x2, x1], axis=-1)
 
 
 def apply_rotary_pos_emb(q, k, cos, sin):

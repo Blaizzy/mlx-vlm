@@ -20,6 +20,7 @@ AudioInput = Union[str, np.ndarray, List[str], List[np.ndarray]]
 
 
 class NemotronHNanoOmniProcessor(ProcessorMixin):
+    supports_multiple_audio = True
     attributes = ["image_processor", "tokenizer"]
     image_processor_class = "AutoImageProcessor"
     video_processor_class = "AutoVideoProcessor"

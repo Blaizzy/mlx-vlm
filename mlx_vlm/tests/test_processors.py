@@ -7,6 +7,9 @@ import importlib
 import json
 import pkgutil
 import re
+import subprocess
+import sys
+import textwrap
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, nullcontext
 from copy import deepcopy
@@ -628,12 +631,30 @@ def test_auto_processor_routes_to_custom_loader(
         assert (
             AutoProcessor.from_pretrained(tmp_path, trust_remote_code=False) is sentinel
         )
-    loader.assert_called_once_with(tmp_path, trust_remote_code=False)
-    if model_type in ("hunyuan_vl", "qwen4_exp"):
-        assert isinstance(AutoProcessor.from_pretrained(tmp_path), cls)
-    else:
-        with pytest.raises(ValueError, match="Unrecognized processing class"):
-            AutoProcessor.from_pretrained(tmp_path)
+        loader.assert_called_once_with(tmp_path, trust_remote_code=False)
+        loader.reset_mock()
+        assert AutoProcessor.from_pretrained(tmp_path) is sentinel
+        loader.assert_called_once_with(tmp_path, trust_remote_code=True)
+
+
+def test_qwen3_5_moe_text_stale_vl_processor_loads_tokenizer(tmp_path):
+    from transformers import Qwen2Tokenizer
+
+    importlib.import_module("mlx_vlm.models.qwen3_5_moe_text")
+    _write_configs(tmp_path, config={"model_type": "qwen3_5_moe_text"})
+
+    Qwen2Tokenizer(
+        vocab={"<|endoftext|>": 0, "t": 1, "3": 2, "Ġ": 3, "4": 4}, merges=[]
+    ).save_pretrained(tmp_path)
+    tokenizer_config = tmp_path / "tokenizer_config.json"
+    data = json.loads(tokenizer_config.read_text())
+    data["processor_class"] = "Qwen3VLProcessor"
+    tokenizer_config.write_text(json.dumps(data))
+
+    processor = load_processor(tmp_path, eos_token_ids=[0])
+
+    assert not hasattr(processor, "image_processor")
+    assert processor.encode("t3 t4", add_special_tokens=False) == [1, 2, 3, 1, 4]
 
 
 class _ImageStub:
@@ -736,6 +757,22 @@ def test_processor_mlx_outputs(name, with_image):
     _assert_all_mx(result, *(["pixel_values"] if with_image else []))
     if name == "mllama" and with_image:
         assert "cross_attention_mask" in result
+
+
+def test_gemma3n_batches_images_and_audio():
+    processor = _make_processor("gemma3n")
+    processor.feature_extractor = Mock(return_value={"input_features": [[0.0]] * 2})
+    images = [_make_image(), _make_image()]
+
+    result = processor(
+        text=["<image><audio>one", "<image><audio>two"],
+        images=images,
+        audio=[[0.0], [0.0]],
+        padding=True,
+    )
+
+    assert result["input_ids"].shape[0] == 2
+    assert processor.tokenizer.last_kwargs["padding"] is True
 
 
 def test_unlimited_ocr_default_chat_template_omits_trailing_space():
@@ -1251,6 +1288,114 @@ def test_qwen3_vl_video_timestamp_video_prompt_falls_back_to_processor_fps():
     assert "<0.2 seconds>" in rendered and "<1.2 seconds>" in rendered
 
 
+class TestQwen3VLVideoTimestamps:
+    """Qwen3-VL markers follow the frames that were actually sampled."""
+
+    VIDEO_BLOCK = "<|vision_start|><|video_pad|><|vision_end|>"
+
+    @pytest.fixture
+    def p(self):
+        tokens = [
+            "[UNK]",
+            "[PAD]",
+            "<|image_pad|>",
+            "<|video_pad|>",
+            "<|vision_start|>",
+            "<|vision_end|>",
+        ]
+        tokenizer = fast_tokenizer(
+            tokens,
+            tokenizer_class=RecordingTokenizer,
+            split=False,
+            additional_special_tokens=tokens[2:],
+        )
+        return c.qwen3(
+            image_processor=m.qwen3.Qwen3VLImageProcessor(),
+            video_processor=m.qwen3.Qwen3VLVideoProcessor(**PROFILES["qwen_video"]),
+            tokenizer=tokenizer,
+        )
+
+    @staticmethod
+    def markers(p):
+        return re.findall(r"<(\d+\.\d) seconds>", p.tokenizer.last_text[0])
+
+    @staticmethod
+    def frames(count=4):
+        return np.zeros((count, 3, 56, 56), dtype=np.uint8)
+
+    @pytest.mark.parametrize("prepare", [False, True], ids=["direct", "prepare-inputs"])
+    @pytest.mark.parametrize(
+        "indices,expected",
+        [([0, 30, 60, 90], ["0.5", "2.5"]), ([0, 30, 60], ["0.5", "2.0"])],
+        ids=["even", "odd"],
+    )
+    def test_metadata_sets_the_timestamps(self, p, prepare, indices, expected):
+        metadata = dict(total_num_frames=91, fps=30, frames_indices=indices)
+        if prepare:
+            prepare_inputs(
+                p,
+                prompts=self.VIDEO_BLOCK,
+                videos=[self.frames(len(indices))],
+                video_metadata=[metadata],
+            )
+        else:
+            p(
+                text=[self.VIDEO_BLOCK],
+                videos=[self.frames(len(indices))],
+                video_metadata=[VideoMetadata(**metadata)],
+            )
+        assert self.markers(p) == expected
+
+    @pytest.mark.parametrize("prepare", [False, True], ids=["direct", "prepare-inputs"])
+    @pytest.mark.parametrize(
+        "frame_count,indices",
+        [(4, [0, 30, 60]), (3, [0, 30, 60, 90])],
+        ids=["missing-index", "extra-index"],
+    )
+    def test_metadata_frame_count_is_checked_before_padding(
+        self, p, prepare, frame_count, indices
+    ):
+        metadata = dict(total_num_frames=91, fps=30, frames_indices=indices)
+        with pytest.raises(ValueError, match="frame indices must match"):
+            if prepare:
+                prepare_inputs(
+                    p,
+                    prompts=self.VIDEO_BLOCK,
+                    videos=[self.frames(frame_count)],
+                    video_metadata=[metadata],
+                )
+            else:
+                p(
+                    text=[self.VIDEO_BLOCK],
+                    videos=[self.frames(frame_count)],
+                    video_metadata=[VideoMetadata(**metadata)],
+                )
+
+    def test_fps_without_metadata_spaces_frames_evenly(self, p):
+        p(text=[self.VIDEO_BLOCK], videos=[self.frames()], fps=[1.0])
+        assert self.markers(p) == ["0.5", "2.5"]
+
+    def test_clamped_clip_keeps_real_timestamps(self, p, synthetic_video):
+        # 20 s at 30 fps; four frames are far below the default 2 fps.
+        prepare_inputs(
+            p, prompts=self.VIDEO_BLOCK, videos=[synthetic_video], max_frames=4
+        )
+        assert self.markers(p) == ["3.3", "16.6"]
+
+    @pytest.mark.parametrize(
+        "metadata,error",
+        [
+            ([dict(fps=30, frames_indices=[0, 30])] * 2, "one video_metadata"),
+            ([dict(fps=30, frames_indices=[0, 30])], "frame indices must match"),
+            ([dict(fps=0, frames_indices=[0, 1, 2, 3])], "positive and finite"),
+        ],
+        ids=["count", "frames", "fps"],
+    )
+    def test_invalid_metadata(self, p, metadata, error):
+        with pytest.raises(ValueError, match=error):
+            p(text=[self.VIDEO_BLOCK], videos=[self.frames()], video_metadata=metadata)
+
+
 class TestMageVLProcessor:
     """Mage VL image/video processing and processor-to-model compatibility."""
 
@@ -1568,6 +1713,7 @@ def test_extract_text_from_content(content, expected):
     [
         ("nemotron_h_nano_omni", "image-audio"),
         ("nemotronh_nano_omni_reasoning_v3", "image-audio"),
+        ("qwen3_omni_moe", "qwen-image-audio"),
         ("gemma4_unified", "video-audio"),
         ("prism_hadamard_qwen35", "image-video"),
         ("step3p7", "patch"),
@@ -1585,6 +1731,7 @@ def test_prompt_media_format(family, kind):
     text_part = dict(type="text", text=text, content=text)
     expected = {
         "image-audio": [dict(type="image"), text_part, dict(type="audio")],
+        "qwen-image-audio": [dict(type="audio"), dict(type="image"), text_part],
         "video-audio": [
             dict(type="video", video="clip.mp4", max_pixels=224 * 224, fps=1),
             dict(type="audio"),
@@ -1648,6 +1795,156 @@ class TestApplyChatTemplateIntegration:
     These tests verify the actual bug fix works end-to-end, not just the helper.
     Uses return_messages=True to inspect intermediate messages without mocking.
     """
+
+    @pytest.mark.parametrize(
+        "family,markers",
+        [
+            ("deepseek_v4", ("<image>", "<image>")),
+            ("qwen3_vl", ("<image>", "<image>")),
+            ("ernie4_5_moe_vl", ("<image>", "<image>")),
+            ("internvl_chat", ("<image>", "<image>")),
+            ("gemma4", ("<image>", "<image>")),
+            ("step3p7", ("<im_patch>", "<im_patch>")),
+            ("gemma3", ("<start_of_image>", "<start_of_image>")),
+            ("phi4mm", ("<|image_1|>", "<|image_2|>")),
+        ],
+    )
+    @pytest.mark.parametrize("representation", ["dict", "list", "pydantic"])
+    def test_interleaved_images_reach_renderer(self, family, markers, representation):
+        from pydantic import BaseModel
+
+        class Message(BaseModel):
+            role: str
+            content: list
+
+        message = dict(
+            role="user",
+            content=[
+                dict(type="input_text", text="before "),
+                dict(
+                    type="image_url", image_url=dict(url="data:image/png;base64,FIRST")
+                ),
+                dict(type="text", text=" between "),
+                dict(type="input_image", image_url="data:image/png;base64,SECOND"),
+                dict(type="text", text=" after"),
+            ],
+        )
+        original = deepcopy(message)
+        prompt = (
+            message
+            if representation == "dict"
+            else [Message(**message)] if representation == "pydantic" else [message]
+        )
+        normalized = apply_chat_template(
+            None, dict(model_type=family), prompt, num_images=2, return_messages=True
+        )
+        assert "base64" not in str(normalized)
+        rendered = get_chat_template(None, normalized, add_generation_prompt=True)
+        assert rendered == f"before {markers[0]} between {markers[1]} after"
+        assert message == original
+
+    def test_explicit_images_without_side_channel_count(self):
+        message = dict(
+            role="user", content=[dict(type="text", text="before "), dict(type="image")]
+        )
+        rendered = apply_chat_template(None, dict(model_type="qwen3_vl"), [message])
+        assert rendered == "before <image>"
+
+    @pytest.mark.parametrize(
+        "family,separator", [("deepseek", ""), ("deepseek41", "\n\n")]
+    )
+    def test_deepseek_processor_preserves_inline_image_position(
+        self, family, separator
+    ):
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]")),
+            unk_token="[UNK]",
+        )
+        processor = getattr(c, family)(tokenizer)
+        message = dict(
+            role="user",
+            content=[
+                dict(type="text", text="before"),
+                dict(type="image_url", image_url=dict(url="x")),
+                dict(type="text", text="after"),
+            ],
+        )
+        model_type = "deepseek_v4" if family == "deepseek" else "deepseek_v41"
+        rendered = apply_chat_template(
+            processor, dict(model_type=model_type), message, num_images=1
+        )
+        assert f"before{separator}<｜deepseek_image｜>{separator}after" in rendered
+
+    @pytest.mark.parametrize(
+        "family,expected",
+        [
+            ("qwen3_vl", "<image> before <image> after"),
+            ("qwen2_vl", "before <image> after<image>"),
+            ("phi4mm", "<|image_1|>before <|image_2|> after"),
+        ],
+    )
+    def test_extra_side_channel_images_keep_default_placement(self, family, expected):
+        message = dict(
+            role="user",
+            content=[
+                dict(type="text", text="before "),
+                dict(type="image"),
+                dict(type="text", text=" after"),
+            ],
+        )
+        assert (
+            apply_chat_template(None, dict(model_type=family), message, num_images=2)
+            == expected
+        )
+
+    def test_interleaved_images_keep_side_channel_audio_and_video(self):
+        message = dict(
+            role="user",
+            content=[
+                dict(type="text", text="before"),
+                dict(type="image"),
+                dict(type="text", text="after"),
+            ],
+        )
+        result = apply_chat_template(
+            None,
+            dict(model_type="qwen3_vl"),
+            message,
+            num_images=1,
+            num_audios=1,
+            video="clip.mp4",
+            return_messages=True,
+        )
+        parts = result[0]["content"]
+        assert [part["type"] for part in parts] == [
+            "video",
+            "audio",
+            "text",
+            "image",
+            "text",
+        ]
+        assert parts[2]["text"] == "before" and parts[4]["text"] == "after"
+
+    def test_explicit_images_do_not_bypass_single_image_limit(self):
+        message = dict(role="user", content=[dict(type="image"), dict(type="image")])
+        with pytest.raises(ValueError, match="multi-image"):
+            apply_chat_template(None, dict(model_type="mllama"), message)
+
+    def test_tool_image_does_not_add_another_image_to_user_turn(self):
+        messages = [
+            dict(role="user", content="Inspect the result."),
+            dict(role="tool", tool_call_id="image", content=[dict(type="image")]),
+            dict(role="user", content="What changed?"),
+        ]
+        rendered = apply_chat_template(
+            None, dict(model_type="qwen3_vl"), messages, num_images=1
+        )
+        assert rendered.count("<image>") == 1
+        assert (
+            rendered.index("Tool:")
+            < rendered.index("<image>")
+            < rendered.index("What changed?")
+        )
 
     def test_image_stays_on_its_original_user_turn(self):
         messages = [
@@ -1728,6 +2025,18 @@ def test_apply_chat_template_preserves_explicit_thinking_enabled():
 
     assert processor.kwargs["enable_thinking"] is True
     assert result.endswith("<think>\n")
+
+
+def test_qwen3_omni_enables_thinking_by_default():
+    processor = MagicMock(chat_template="{{ messages }}")
+    processor.apply_chat_template.return_value = "prompt"
+
+    result = apply_chat_template(
+        processor, {"model_type": "qwen3_omni_moe"}, "Describe this image."
+    )
+
+    assert result == "prompt"
+    assert processor.apply_chat_template.call_args.kwargs["enable_thinking"] is True
 
 
 def test_apply_chat_template_maps_enable_thinking_for_thinking_mode_templates():
@@ -1839,6 +2148,8 @@ WIRE_CALLS = {
     "]<]minimax[>[<city>Paris]<]minimax[>[</city>]<]minimax[>[<days>3"
     "]<]minimax[>[</days>]<]minimax[>[</invoke>]<]minimax[>[</tool_call>",
     "mistral": '[TOOL_CALLS]get_weather[ARGS]{"city": "Paris", "days": 3}',
+    "harmony": "<|channel|>commentary to=functions.get_weather <|constrain|>json"
+    '<|message|>{"city": "Paris", "days": 3}<|call|>',
     "pythonic": '<|tool_call_start|>[get_weather(city="Paris", days=3)]<|tool_call_end|>',
     "qwen3_coder": "<tool_call>\n<function=get_weather><parameter=city>Paris</parameter>"
     "<parameter=days>3</parameter></function></tool_call>",
@@ -2006,6 +2317,93 @@ def test_invalid_calls(name, text, error):
             _call("get_weather", zip="10001", days=3),
             _weather_tools(zip="string", days="integer"),
         ),
+        (
+            "qwen3_coder",
+            dict,
+            '<function=configure>\n<parameter=options>\n{"depth": 2}\n</parameter>\n'
+            "<parameter=ids>\n[1, 2]\n</parameter>\n"
+            "<parameter=tag>\n123\n</parameter>\n</function>",
+            _call("configure", options={"depth": 2}, ids=[1, 2], tag="123"),
+            [
+                dict(
+                    type="function",
+                    function=dict(
+                        name="configure",
+                        parameters=dict(
+                            type="object",
+                            properties=dict(
+                                options=dict(description="untyped"),
+                                ids=dict(description="untyped"),
+                                tag=dict(description="untyped"),
+                            ),
+                        ),
+                    ),
+                )
+            ],
+        ),
+        (
+            "qwen3_coder",
+            dict,
+            "<function=write>\n<parameter=content>\nfirst\n"
+            "<parameter=name>\nlast\n</parameter>\n</function>",
+            _call("write", content="first\n<parameter=name>\nlast"),
+            None,
+        ),
+        (
+            "qwen3_coder",
+            dict,
+            "<function=write>\n<parameter=path>\na.txt\n</parameter>\n"
+            "<parameter=content>\nhello\n</function>",
+            _call("write", path="a.txt", content="hello"),
+            None,
+        ),
+        (
+            "qwen3_coder",
+            dict,
+            "<function=write>\n<parameter=path>\na.txt\n</parameter>\n"
+            "<parameter=content\n</function>",
+            _call("write", path="a.txt"),
+            None,
+        ),
+        (
+            "qwen3_coder",
+            dict,
+            "<function=get_weather>\n<parameter=zip>\n10001\n</parameter>\n"
+            "<parameter=days>\nthree\n</function>",
+            _call("get_weather", zip="10001"),
+            _weather_tools(zip="string", days="integer"),
+        ),
+        (
+            "qwen3_coder",
+            dict,
+            "<function=write><parameter=content><parameter=</parameter></function>",
+            _call("write", content="<parameter="),
+            None,
+        ),
+        (
+            "qwen3_coder",
+            dict,
+            "<function=write><parameter=content>"
+            "Use <parameter=name> in the template.</parameter></function>",
+            _call("write", content="Use <parameter=name> in the template."),
+            None,
+        ),
+        (
+            "qwen3_coder",
+            dict,
+            '<function=configure><parameter=options>{"depth": 2}</parameter>'
+            "</function>",
+            _call("configure", options={"depth": 2}),
+            [
+                dict(
+                    type="function",
+                    function=dict(
+                        name="configure",
+                        parameters=dict(type="object", properties=dict(options={})),
+                    ),
+                )
+            ],
+        ),
     ],
     ids=[
         "gemma-nested",
@@ -2015,6 +2413,14 @@ def test_invalid_calls(name, text, error):
         "cohere-object",
         "cohere-array-escape",
         "glm-newline",
+        "qwen-untyped",
+        "qwen-line-start-parameter-tag",
+        "qwen-unclosed-last",
+        "qwen-truncated-parameter-tag",
+        "qwen-unclosed-last-invalid",
+        "qwen-literal-parameter-prefix",
+        "qwen-literal-parameter-tag",
+        "qwen-empty-property-schema",
     ],
 )
 def test_parser_syntax(parser, argument_type, text, expected, tools):
@@ -2024,6 +2430,23 @@ def test_parser_syntax(parser, argument_type, text, expected, tools):
     expected_calls = expected if isinstance(expected, list) else [expected]
     assert all(isinstance(call["arguments"], argument_type) for call in calls)
     assert [dict(call, arguments=_arguments(call)) for call in calls] == expected_calls
+
+
+@pytest.mark.parametrize("name", PARSER_NAMES)
+def test_parser_accepts_boolean_property_schemas(name):
+    # ``true`` is a valid JSON Schema for a property that admits any value.
+    tools = [
+        dict(
+            type="function",
+            function=dict(
+                name="get_weather",
+                parameters=dict(type="object", properties=dict(city=True, days=True)),
+            ),
+        )
+    ]
+    result = process_tool_calls(WIRE_CALLS[name], load_tool_module(name), tools)
+    assert [call["function"]["name"] for call in result.calls] == ["get_weather"]
+    assert json.loads(result.calls[0]["function"]["arguments"])["city"] == "Paris"
 
 
 @pytest.mark.parametrize(
@@ -2073,6 +2496,30 @@ def test_minicpm5_cdata_and_argument_types():
         "get_time",
     ]
     assert json.loads(result.calls[1]["function"]["arguments"]) == {}
+
+
+HARMONY_ANALYSIS_THEN_CALL = (
+    "<|channel|>analysis<|message|>The user wants the weather. Call get_weather."
+    "<|end|><|start|>assistant<|channel|>commentary to=functions.get_weather "
+    '<|constrain|>json<|message|>{"city": "Paris", "days": 3}<|call|>'
+)
+
+
+def test_harmony_extracts_commentary_tool_call_past_analysis():
+    result = process_tool_calls(
+        HARMONY_ANALYSIS_THEN_CALL, load_tool_module("harmony"), WEATHER_TOOLS
+    )
+    assert len(result.calls) == 1
+    assert result.calls[0]["function"]["name"] == "get_weather"
+    assert json.loads(result.calls[0]["function"]["arguments"]) == WEATHER_ARGS
+    assert "to=functions" not in result.remaining_text
+
+
+def test_harmony_ignores_plain_commentary_preamble():
+    preamble = "<|channel|>commentary<|message|>Let me look that up.<|end|>"
+    result = process_tool_calls(preamble, load_tool_module("harmony"), None)
+    assert result.calls == []
+    assert result.remaining_text == preamble
 
 
 # Loading and utility contracts
@@ -2269,6 +2716,75 @@ class TestEstimateNumImageTokens:
             estimate_num_image_tokens(SimpleNamespace(), 480, 640)
 
 
+class TestMiMoV2Processor:
+    def test_processor_attributes(self):
+        from mlx_vlm.models.mimo_v2.processing import MiMoV2Processor
+
+        assert MiMoV2Processor.get_attributes() == [
+            "image_processor",
+            "tokenizer",
+            "video_processor",
+        ]
+
+    def test_audio_codes_expand_placeholders_by_grouped_length(self):
+        from mlx_vlm.models.mimo_v2.processing import MiMoV2Processor
+        from mlx_vlm.models.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor
+
+        processor = object.__new__(MiMoV2Processor)
+        processor.audio_token = "<|audio_pad|>"
+        processor._audio_tokenizer = SimpleNamespace(
+            encode=lambda *args, **kwargs: mx.zeros((20, 5), dtype=mx.int32)
+        )
+        captured = {}
+
+        def process(*args, **kwargs):
+            captured.update(kwargs)
+            return {}
+
+        with patch.object(Qwen2_5_VLProcessor, "__call__", side_effect=process):
+            result = processor(
+                text=["before<|audio_pad|>after"],
+                audio=np.zeros(1600, dtype=np.float32),
+            )
+
+        assert captured["text"] == ["before<|audio_pad|><|audio_pad|>after"]
+        assert result["audio_codes"].shape == (5, 20)
+        assert result["audio_code_lengths"] == [5]
+
+    def test_audio_codes_preserve_batch_boundaries(self):
+        from mlx_vlm.models.mimo_v2.processing import MiMoV2Processor
+        from mlx_vlm.models.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor
+
+        processor = object.__new__(MiMoV2Processor)
+        processor.audio_token = "<|audio_pad|>"
+
+        def encode(item, **kwargs):
+            length = 5 if item == "first" else 3
+            offset = 0 if item == "first" else 100
+            return mx.arange(20 * length).reshape(20, length) + offset
+
+        processor._audio_tokenizer = SimpleNamespace(encode=encode)
+        captured = {}
+
+        def process(*args, **kwargs):
+            captured.update(kwargs)
+            return {}
+
+        with patch.object(Qwen2_5_VLProcessor, "__call__", side_effect=process):
+            result = processor(
+                text=["a<|audio_pad|>", "b<|audio_pad|>"],
+                audio=["first", "second"],
+            )
+
+        assert captured["text"] == [
+            "a<|audio_pad|><|audio_pad|>",
+            "b<|audio_pad|>",
+        ]
+        assert result["audio_codes"].shape == (8, 20)
+        assert result["audio_code_lengths"] == [5, 3]
+        assert result["audio_codes"][5, 0].item() == 100
+
+
 @pytest.fixture(scope="module")
 def synthetic_video(tmp_path_factory):
     """A deterministic 600-frame 64x64 clip at 30 fps, i.e. 20 seconds."""
@@ -2308,6 +2824,43 @@ class TestResolveVideoSampling:
 
 
 class TestVideoMetadataForwarding:
+    def test_each_video_uses_its_own_sampling_rate(self):
+        class Processor:
+            tokenizer = SimpleNamespace(pad_token="<pad>")
+
+            def __call__(self, text, images=None, videos=None, fps=None, **kwargs):
+                self.fps = fps
+                self.kwargs = kwargs
+                return {
+                    "input_ids": np.array([[1], [2]]),
+                    "attention_mask": np.array([[1], [1]]),
+                }
+
+        processor = Processor()
+        video = np.zeros((2, 3, 8, 8), dtype=np.uint8)
+        samplings = []
+
+        def load(path, sampling, frame_sampler=None):
+            samplings.append(sampling)
+            return video, VideoMetadata(
+                total_num_frames=30,
+                fps=30,
+                frames_indices=[0, 29],
+            )
+
+        with patch("mlx_vlm.utils.load_video", side_effect=load):
+            prepare_inputs(
+                processor,
+                videos=["first.mp4", "second.mp4"],
+                prompts=["first", "second"],
+                fps=[1, 2],
+                nframes=2,
+            )
+
+        assert [sampling.fps for sampling in samplings] == [1, 2]
+        assert [sampling.nframes for sampling in samplings] == [2, 2]
+        assert "nframes" not in processor.kwargs
+
     def test_metadata_is_only_forwarded_to_declaring_processors(self):
         class Processor:
             tokenizer = SimpleNamespace(pad_token="<pad>")
@@ -2324,3 +2877,573 @@ class TestVideoMetadataForwarding:
             prepare_inputs(processor, videos=["clip.mp4"], prompts="Describe this.")
         assert "video_metadata" not in processor.kwargs
         assert processor.fps == [metadata.sampled_fps]
+
+
+@pytest.fixture
+def embedding_gemma2_processor():
+    from transformers.models.gemma4.feature_extraction_gemma4 import (
+        Gemma4AudioFeatureExtractor,
+    )
+
+    from mlx_vlm.models.embedding_gemma2 import EmbeddingGemma2Processor
+    from mlx_vlm.models.embedding_gemma2.image_processing_embedding_gemma2 import (
+        EmbeddingGemma2ImageProcessor,
+    )
+    from mlx_vlm.models.embedding_gemma2.video_processing_embedding_gemma2 import (
+        EmbeddingGemma2VideoProcessor,
+    )
+
+    tokens = dict(
+        image_token="<|image|>",
+        boi_token="<|image>",
+        eoi_token="<image|>",
+        audio_token="<|audio|>",
+        boa_token="<|audio>",
+        eoa_token="<audio|>",
+        video_token="<|video|>",
+    )
+    tokenizer = fast_tokenizer(extra_special_tokens=tokens)
+    template = (
+        "{% for msg in messages %}{% for item in msg['content'] %}"
+        "{% if item['type'] == 'text' %}{{ item['text'] }}"
+        "{% else %}{{ '<|' + item['type'] + '|>' }}{% endif %}"
+        "{% endfor %}{% endfor %}"
+    )
+    return EmbeddingGemma2Processor(
+        tokenizer=tokenizer,
+        feature_extractor=Gemma4AudioFeatureExtractor(
+            feature_size=32, frame_length_ms=24, hop_length_ms=8, preemphasis=0.5
+        ),
+        image_processor=EmbeddingGemma2ImageProcessor(
+            patch_size=4, pooling_kernel_size=2, max_soft_tokens=70
+        ),
+        video_processor=EmbeddingGemma2VideoProcessor(
+            patch_size=4,
+            pooling_kernel_size=2,
+            max_soft_tokens=70,
+            fps=2,
+            max_frames=3,
+            overflow_strategy="truncate",
+            add_timestamps=False,
+        ),
+        chat_template=template,
+        image_seq_length=70,
+        audio_seq_length=96,
+        audio_ms_per_token=32,
+    )
+
+
+def _embedding_gemma2_media():
+    rng = np.random.default_rng(42)
+    return (
+        Image.fromarray(rng.integers(0, 256, (24, 32, 3), dtype=np.uint8)),
+        rng.normal(0, 0.1, 3200).astype(np.float32),
+        rng.integers(0, 256, (2, 24, 32, 3), dtype=np.uint8),
+    )
+
+
+def test_embedding_gemma2_without_torch(
+    tmp_path, embedding_gemma2_processor, synthetic_video
+):
+    """Guard file decoding, chat templates, and offline reload against Torch imports."""
+    import wave
+
+    embedding_gemma2_processor.save_pretrained(tmp_path)
+    _write_configs(tmp_path, config={"model_type": "embedding_gemma2"})
+    image, audio, _ = _embedding_gemma2_media()
+    image.save(tmp_path / "image.png")
+    with wave.open(str(tmp_path / "audio.wav"), "wb") as output:
+        output.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+        output.writeframes((audio * 32767).astype("<i2").tobytes())
+    script = textwrap.dedent("""
+        import importlib.util
+        import sys
+        from pathlib import Path
+
+        blocked = {"torch", "torchvision", "torchaudio", "torchcodec", "av"}
+        original_find_spec = importlib.util.find_spec
+        def find_spec(name, *args, **kwargs):
+            return None if name.split(".")[0] in blocked else original_find_spec(name, *args, **kwargs)
+        importlib.util.find_spec = find_spec
+        class RejectTorch:
+            def find_spec(self, fullname, path=None, target=None):
+                assert fullname.split(".")[0] not in blocked, fullname
+        sys.meta_path.insert(0, RejectTorch())
+
+        import mlx.core as mx
+        import numpy as np
+        from mlx_vlm.models.embedding_gemma2 import EmbeddingGemma2Processor
+
+        folder = Path(sys.argv[1])
+        processor = EmbeddingGemma2Processor.from_pretrained(folder, local_files_only=True)
+        conversation = [{"role": "user", "content": [
+            {"type": "text", "text": "hello"},
+            {"type": "image", "url": str(folder / "image.png")},
+            {"type": "audio", "url": str(folder / "audio.wav")},
+            {"type": "video", "url": sys.argv[2]},
+        ]}]
+        expected = processor.apply_chat_template(
+            conversation, tokenize=True, return_dict=True, return_tensors="np"
+        )
+        assert {"input_ids", "pixel_values", "input_features", "pixel_values_videos"} <= set(expected)
+        processor._get_num_multimodal_tokens(image_sizes=[(24, 32)], audio_lengths=[3200])
+        processor.save_pretrained(folder / "resaved")
+        reloaded = type(processor).from_pretrained(folder / "resaved", local_files_only=True)
+        assert processor.to_dict() == reloaded.to_dict()
+        actual = reloaded.apply_chat_template(
+            conversation, tokenize=True, return_dict=True, return_tensors="mlx"
+        )
+        for key in expected:
+            assert isinstance(actual[key], mx.array), key
+            np.testing.assert_array_equal(np.asarray(actual[key]), expected[key])
+        assert not any(name.split(".")[0] in blocked for name in sys.modules)
+    """)
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path), synthetic_video],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("floating", [False, True], ids=["uint8", "float32"])
+def test_embedding_gemma2_image_options(embedding_gemma2_processor, floating):
+    processor = embedding_gemma2_processor.image_processor
+    image = np.arange(16 * 24 * 3, dtype=np.uint8).reshape(16, 24, 3)
+    if floating:
+        image = image.astype(np.float32) / 255
+    config = processor.to_dict()
+    output = processor(
+        [image],
+        do_resize=False,
+        do_rescale=False,
+        do_normalize=False,
+        return_tensors="np",
+    )
+    expected = image.reshape(4, 4, 6, 4, 3).transpose(0, 2, 1, 3, 4).reshape(24, 48)
+    equal(output["pixel_values"][0, :24], expected)
+    equal(output["pixel_values"][0, 24:], 0)
+    equal(output["image_position_ids"][0, :6], [[x, 0] for x in range(6)])
+    assert output["num_soft_tokens_per_image"][0] == 6
+    assert processor.to_dict() == config
+    assert np.isfinite(
+        processor([image], do_rescale=not floating)["pixel_values"]
+    ).all()
+
+
+def test_embedding_gemma2_chat_audio_from_video(
+    embedding_gemma2_processor, synthetic_video, monkeypatch
+):
+    processor = embedding_gemma2_processor
+    assert "<|audio|>" in processor.apply_chat_template(
+        _message({"type": "audio", "url": "unopened.wav"})
+    )
+    _, audio, _ = _embedding_gemma2_media()
+    requested = []
+
+    def load_audio(value, sampling_rate):
+        if isinstance(value, str) and value == synthetic_video:
+            requested.append((value, sampling_rate))
+            return audio
+        return value
+
+    monkeypatch.setattr(processor, "_load_audio", load_audio)
+    conversation = _message({"type": "video", "url": synthetic_video})
+    before = deepcopy(conversation)
+    result = processor.apply_chat_template(
+        conversation,
+        load_audio_from_video=True,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="np",
+    )
+    assert requested == [(synthetic_video, 16000)]
+    assert {"input_features", "pixel_values_videos"} <= set(result)
+    assert conversation == before
+
+
+@pytest.mark.parametrize(
+    "modality", ["text", "image", "audio", "video", "mixed", "nested"]
+)
+def test_embedding_gemma2_processor_round_trip(
+    tmp_path, embedding_gemma2_processor, modality
+):
+    p = embedding_gemma2_processor
+    image, audio, video = _embedding_gemma2_media()
+    inputs = {
+        "text": dict(text=["hello", "hello hello"]),
+        "image": dict(images=[image]),
+        "audio": dict(audio=[audio]),
+        "video": dict(videos=[video]),
+        "mixed": dict(images=[[image]], audio=[[audio]], videos=[[video]]),
+        "nested": dict(
+            images=[[image, image], [image]], audio=[[audio], [audio, audio]]
+        ),
+    }[modality]
+    expected = p(**inputs, return_tensors="np")
+    p.save_pretrained(tmp_path)
+    _write_configs(tmp_path, config={"model_type": "embedding_gemma2"})
+    loaded = load_processor(tmp_path, add_detokenizer=False, local_files_only=True)
+    assert type(loaded) is type(p)
+    assert loaded.to_dict() == p.to_dict()
+    assert loaded.chat_template == p.chat_template
+    for backend in ("np", "mlx"):
+        actual = loaded(**inputs, return_tensors=backend)
+        assert set(actual) == set(expected)
+        for key in expected:
+            equal(np.asarray(actual[key]), expected[key])
+            if backend == "mlx":
+                assert isinstance(actual[key], mx.array)
+
+
+@pytest.mark.parametrize(
+    "fps,strategy,expected",
+    [
+        (2, "uniform", [0, 4, 8]),
+        (2, "truncate", [0, 2, 4]),
+        (None, "uniform", [0, 5, 10]),
+        (None, "truncate", [0, 1, 2]),
+    ],
+)
+def test_embedding_gemma2_video_sampling(
+    embedding_gemma2_processor, fps, strategy, expected
+):
+    from transformers.video_utils import VideoMetadata as HFVideoMetadata
+
+    metadata = HFVideoMetadata(total_num_frames=11, fps=4, duration=2.75)
+    actual = embedding_gemma2_processor.video_processor.sample_frames(
+        metadata, fps=fps, max_frames=3, overflow_strategy=strategy
+    )
+    equal(actual, expected)
+
+
+def test_embedding_gemma2_mixed_chat_and_metadata(embedding_gemma2_processor):
+    from transformers.video_utils import VideoMetadata as HFVideoMetadata
+
+    p = embedding_gemma2_processor
+    image, audio, video = _embedding_gemma2_media()
+    conversation = _message(
+        {"type": "audio", "audio": audio},
+        {"type": "text", "text": " hello "},
+        {"type": "image", "image": image},
+        {"type": "video", "video": video},
+    )
+    templated = p.apply_chat_template(
+        conversation, tokenize=True, return_dict=True, return_tensors="mlx", fps=None
+    )
+    direct = p(
+        text="<|audio|> hello <|image|><|video|>",
+        images=[[image]],
+        audio=[audio],
+        videos=[video],
+        return_tensors="mlx",
+        fps=None,
+    )
+    for key in direct:
+        equal(np.asarray(templated[key]), np.asarray(direct[key]))
+    metadata = HFVideoMetadata(total_num_frames=2, fps=2, duration=1)
+    result = p(
+        videos=[video],
+        video_metadata=[metadata],
+        add_timestamps=True,
+        return_metadata=True,
+        return_text_replacement_offsets=True,
+        return_tensors="mlx",
+    )
+    assert isinstance(result["input_ids"], mx.array)
+    equal(result["video_metadata"][0].frames_indices, [0, 1])
+    assert result["text_replacement_offsets"][0][0]["type"] == "video"
+
+
+@pytest.mark.parametrize("modality", ["image", "audio", "video"])
+def test_embedding_gemma2_missing_media_is_rejected(
+    embedding_gemma2_processor, modality
+):
+    with pytest.raises(ValueError, match="no .* passed"):
+        embedding_gemma2_processor(text=f"<|{modality}|>", return_tensors="mlx")
+
+
+@pytest.mark.parametrize("quantize", [False, True])
+def test_embedding_gemma2_conversion_saves_processor(
+    tmp_path, embedding_gemma2_processor, quantize, synthetic_video
+):
+    from dataclasses import asdict
+
+    from mlx.utils import tree_flatten
+
+    from mlx_vlm import convert, load
+    from mlx_vlm.models import embedding_gemma2
+    from mlx_vlm.tests.test_models import DATA as MODEL_DATA
+    from mlx_vlm.tests.test_models import build_config
+
+    case = next(c for c in MODEL_DATA["cases"] if c["module"] == "embedding_gemma2")
+    config = build_config(embedding_gemma2, case["config"])
+    config.text_config.hidden_size = 32
+    config.text_config.intermediate_size = 64
+    config.text_config.hidden_size_per_layer_input = 32
+    config.text_config.head_dim = 16
+    config.text_config.per_layer_config = {"01": {"head_dim": 32}}
+    model = embedding_gemma2.Model(config)
+    source, destination = tmp_path / "source", tmp_path / "converted"
+    source.mkdir()
+    _write_configs(source, config=asdict(model.config))
+    mx.save_safetensors(
+        str(source / "model.safetensors"), dict(tree_flatten(model.parameters()))
+    )
+    p = embedding_gemma2_processor
+    p.save_pretrained(source)
+    convert(
+        str(source),
+        str(destination),
+        dtype="bfloat16",
+        quantize=quantize,
+        q_bits=8,
+        q_group_size=32,
+    )
+    loaded_model, loaded_processor = load(destination, local_files_only=True)
+    assert type(loaded_processor) is type(p)
+    assert loaded_processor.to_dict() == p.to_dict()
+    assert loaded_processor.chat_template == p.chat_template
+    loaded_processor.save_pretrained(tmp_path / "resaved")
+    image, audio, video = _embedding_gemma2_media()
+    inputs = dict(
+        images=[[image]], audio=[[audio]], videos=[[video]], return_tensors="np"
+    )
+    actual = loaded_processor(**inputs)
+    for key, expected in p(**inputs).items():
+        equal(actual[key], expected)
+    file_inputs = dict(
+        videos=[synthetic_video], add_timestamps=True, return_tensors="np"
+    )
+    file_actual = loaded_processor(**file_inputs)
+    for key, expected in p(**file_inputs).items():
+        equal(file_actual[key], expected)
+    text = loaded_processor(text="hello", return_tensors="mlx")
+    output = loaded_model(**text).text_embeds
+    assert output.shape == (1, 24)
+    assert mx.all(mx.isfinite(output)).item()
+
+
+@pytest.fixture
+def embedding_gemma2_decoder():
+    from mlx_vlm.models.embedding_gemma2 import _video_decoder as decoder
+
+    try:
+        decoder._load_ffmpeg()
+    except decoder.VideoDecodeUnavailable as exc:
+        pytest.skip(str(exc))
+    return decoder
+
+
+@pytest.mark.parametrize("library", ["avformat", "avcodec", "avutil"])
+def test_embedding_gemma2_rejects_unknown_ffmpeg_abi(tmp_path, monkeypatch, library):
+    from mlx_vlm.models.embedding_gemma2 import _video_decoder as decoder
+
+    libraries = {}
+    for stem, major in (("avformat", 61), ("avcodec", 61), ("avutil", 59)):
+        path = tmp_path / f"lib{stem}.dylib"
+        path.touch()
+        lib = Mock()
+        getattr(lib, stem + "_version").return_value = (major + (stem == library)) << 16
+        libraries[str(path)] = lib
+    monkeypatch.setattr(decoder.C, "CDLL", lambda path: libraries[path])
+    with patch.object(decoder._FFmpeg, "bind") as bind:
+        with pytest.raises(decoder.VideoDecodeUnavailable, match="Unsupported .* ABI"):
+            decoder._FFmpeg(tmp_path)
+        bind.assert_not_called()  # Reject before any native decoder operation.
+
+
+@pytest.mark.parametrize("reason", ["libraries", "metal", "platform"])
+def test_embedding_gemma2_missing_native_backend(tmp_path, monkeypatch, reason):
+    import cv2
+
+    from mlx_vlm.models.embedding_gemma2 import _video_decoder as decoder
+
+    monkeypatch.setattr(decoder.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(decoder.platform, "machine", lambda: "arm64")
+    monkeypatch.setattr(mx.metal, "is_available", lambda: reason != "metal")
+    monkeypatch.setattr(cv2, "__file__", str(tmp_path / "cv2" / "__init__.py"))
+    if reason == "platform":
+        monkeypatch.setattr(decoder.platform, "machine", lambda: "x86_64")
+    # Bypass the cache so a previously loaded bundle cannot hide missing support.
+    with pytest.raises(decoder.VideoDecodeUnavailable):
+        decoder._load_ffmpeg.__wrapped__()
+
+
+@pytest.mark.parametrize("failure", ["environment", "format", "kernel"])
+def test_embedding_gemma2_video_fallback(
+    embedding_gemma2_processor, synthetic_video, monkeypatch, failure
+):
+    from mlx_vlm.models.embedding_gemma2 import _video_decoder as decoder
+    from mlx_vlm.models.embedding_gemma2 import _video_kernel as kernel
+
+    def unavailable(*args, **kwargs):
+        raise decoder.VideoDecodeUnavailable("Unsupported test backend")
+
+    if failure == "environment":
+        monkeypatch.setattr(decoder, "_load_ffmpeg", unavailable)
+    else:
+        try:
+            decoder._load_ffmpeg()
+        except decoder.VideoDecodeUnavailable as exc:
+            pytest.skip(str(exc))
+        if failure == "format":
+            original = decoder.Decoder.copy_frame
+            calls = 0
+
+            def copy_frame(self, frame):
+                nonlocal calls
+                calls += 1
+                if calls > 1:
+                    unavailable()
+                return original(self, frame)
+
+            monkeypatch.setattr(decoder.Decoder, "copy_frame", copy_frame)
+        else:
+
+            def kernel_error(*args):
+                raise RuntimeError("Metal compiler failure")
+
+            monkeypatch.setattr(kernel, "yuv_to_rgb", kernel_error)
+    sampler = lambda metadata, **kw: np.array([0, 59, 599])
+    expected, info = load_video(synthetic_video, frame_sampler=sampler)
+    actual, metadata = embedding_gemma2_processor.video_processor._decode_video(
+        synthetic_video, sampler
+    )
+    equal(actual, expected.transpose(0, 2, 3, 1))
+    equal(metadata.frames_indices, info.frames_indices)
+    assert metadata.video_backend == "opencv"
+    assert metadata.fps == info.fps
+
+
+def test_embedding_gemma2_native_seek_and_cleanup(
+    embedding_gemma2_decoder, synthetic_video
+):
+    module = embedding_gemma2_decoder
+    with module.Decoder(synthetic_video) as decoder:
+        last, _ = decoder.get(599)
+        first, _ = decoder.get(0)
+        repeated, _ = decoder.get(599)
+        for actual, expected in zip(repeated, last):
+            equal(actual, expected)
+        assert not np.array_equal(first[0], last[0])
+        assert decoder.metadata == dict(total_num_frames=600, fps=30, duration=20)
+    decoder.close()  # Closing twice is harmless, including after partial failure.
+    assert not any(
+        (decoder.context, decoder.codec_context, decoder.frame, decoder.packet)
+    )
+    failed = module.Decoder.__new__(module.Decoder)
+    with patch.object(module._load_ffmpeg(), "avcodec_open2", return_value=-22):
+        with pytest.raises(module.VideoDecodeUnavailable):
+            failed.__init__(synthetic_video)
+    assert not any((failed.context, failed.codec_context, failed.frame, failed.packet))
+
+
+@pytest.mark.parametrize("indices", [[], [-1], [600]])
+def test_embedding_gemma2_native_invalid_sampling(
+    embedding_gemma2_decoder, synthetic_video, indices
+):
+    with pytest.raises(ValueError, match="Frame indices"):
+        embedding_gemma2_decoder.decode_video(synthetic_video, lambda metadata: indices)
+
+
+@pytest.mark.parametrize("layout", ["rgb", "hdr", "interlaced", "stride", "odd"])
+def test_embedding_gemma2_native_unsupported_frame(
+    embedding_gemma2_decoder, synthetic_video, layout
+):
+    module = embedding_gemma2_decoder
+    with module.Decoder(synthetic_video) as decoder:
+        frame = module.Frame(width=16, height=8)
+        frame.format = decoder.api.av_get_pix_fmt(
+            b"rgb24" if layout == "rgb" else b"yuv420p"
+        )
+        frame.color_trc = 16 if layout == "hdr" else 2
+        frame.flags = 8 if layout == "interlaced" else 0
+        if layout == "odd":
+            frame.width = 17
+        with pytest.raises(module.VideoDecodeUnavailable):
+            decoder.copy_frame(frame)
+
+
+@pytest.mark.parametrize("mov", [False, True])
+def test_embedding_gemma2_variable_packet_timing(mov):
+    from mlx_vlm.models.embedding_gemma2 import _video_decoder as module
+
+    decoder = module.Decoder.__new__(module.Decoder)
+    storage = module.Packet()
+    decoder.packet = module.C.pointer(storage)
+    decoder.context = None
+    decoder.index = 0
+    decoder.time_base = (1, 10)
+    decoder.is_mov = mov
+    # Decode order differs from presentation order, as in a video with B-frames.
+    packets = iter([(0, 2, -2), (9, 2, 0), (2, 2, 3), (5, 2, 7)])
+
+    def read_packet(context, packet):
+        try:
+            storage.pts, storage.duration, storage.dts = next(packets)
+        except StopIteration:
+            return module.EOF
+        return 0
+
+    decoder.api = SimpleNamespace(
+        av_read_frame=read_packet,
+        av_packet_unref=lambda p: None,
+        check=lambda result: result,
+    )
+    timeline = decoder.scan()
+    assert [p[0] for p in timeline] == [0, 2, 5, 9]
+    assert [p[1] for p in timeline] == ([2, 4, 2, 3] if mov else [2, 2, 2, 2])
+    assert decoder.metadata["duration"] == pytest.approx(1.2 if mov else 1.1)
+
+
+@pytest.mark.parametrize(
+    "fmt,depth,chroma_y,width,expected",
+    [
+        ("yuv420p", 8, 1, 32, [254, 0, 0]),
+        ("yuv420p", 8, 1, 18, [252, 0, 0]),
+        ("yuvj420p", 8, 1, 32, [238, 14, 14]),
+        ("yuvj420p", 8, 1, 18, [238, 15, 14]),
+        ("yuv420p10le", 10, 1, 32, [252, 0, 0]),
+        ("yuv422p10le", 10, 0, 18, [252, 0, 0]),
+    ],
+)
+def test_embedding_gemma2_metal_color_rounding(fmt, depth, chroma_y, width, expected):
+    """Golden RGB from FFmpeg 8.1.2, rawvideo -> rgb24 with sws_flags=0."""
+    if not mx.metal.is_available():
+        pytest.skip("Metal is unavailable")
+    from mlx_vlm.models.embedding_gemma2._video_kernel import yuv_to_rgb
+
+    dtype = np.uint8 if depth == 8 else np.uint16
+    planes = [np.full((6, width), 81 << (depth - 8), dtype)] + [
+        np.full((6 >> chroma_y, width // 2), value << (depth - 8), dtype)
+        for value in (90, 240)
+    ]
+    actual = np.asarray(
+        yuv_to_rgb(
+            planes,
+            dict(
+                colorspace=2,
+                format=fmt,
+                depth=depth,
+                log2_chroma_w=1,
+                log2_chroma_h=chroma_y,
+            ),
+        )
+    )
+    equal(actual, np.broadcast_to(np.array(expected, dtype=np.uint8), (6, width, 3)))
+
+
+@pytest.mark.parametrize("modality", ["image", "audio"])
+def test_embedding_gemma2_prepare_inputs_routes_media(
+    embedding_gemma2_processor, modality
+):
+    p = embedding_gemma2_processor
+    image, audio, _ = _embedding_gemma2_media()
+    media = {"images": [image]} if modality == "image" else {"audio": [audio]}
+    prompt = f"<|{modality}|> hello"
+    expected = p(text=[prompt], **media, return_tensors="mlx")
+    actual = prepare_inputs(p, prompts=[prompt], **media, return_tensors="mlx")
+    for key in expected:
+        equal(np.asarray(actual[key]), np.asarray(expected[key]))

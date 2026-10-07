@@ -35,7 +35,7 @@ def _get_string_arg_names(tool_name: str, tools: list[Any] | None) -> set[str]:
         return {
             name
             for name, schema in properties.items()
-            if schema.get("type") == "string"
+            if isinstance(schema, dict) and schema.get("type") == "string"
         }
     return set()
 

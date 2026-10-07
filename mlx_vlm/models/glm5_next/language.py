@@ -78,6 +78,7 @@ def _expert_select(
     indices = mx.argpartition(-choice_scores, kth=top_k - 1, axis=-1)[
         ..., :top_k
     ].astype(mx.int32)
+    indices = mx.stop_gradient(indices)
     weights = mx.take_along_axis(scores, indices, axis=-1)
     if top_k > 1 and norm_topk_prob:
         weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
@@ -285,6 +286,7 @@ def _exact_pool_select(
                 ..., :select_k
             ].astype(mx.int32)
         selected_chunks.append(selected)
+        selected = mx.stop_gradient(selected)
         valid_chunks.append(mx.take_along_axis(candidates, selected, axis=-1))
 
     if len(selected_chunks) == 1:
@@ -472,6 +474,7 @@ class Glm5NextIndexer(nn.Module):
             selection_order = mx.argsort(
                 mx.where(selected_valid, selected, pool_count), axis=-1
             )
+            selection_order = mx.stop_gradient(selection_order)
             selected = mx.take_along_axis(selected, selection_order, axis=-1)
             selected_valid = mx.take_along_axis(
                 selected_valid, selection_order, axis=-1

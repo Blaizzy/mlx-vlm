@@ -1,10 +1,20 @@
-"""Text and vision extraction, privacy tagging, checkpoints, and quantized inference."""
+"""Text, vision and 3D extraction, privacy tagging, checkpoints, and quantized inference."""
 
 from __future__ import annotations
 
+import asyncio
+import copy
+import importlib
+import io
 import json
+import math
+import pickle
+import tempfile
+import threading
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -12,13 +22,8 @@ import numpy as np
 import pytest
 from mlx.utils import tree_flatten
 
-from mlx_vlm.gliner import (
-    GLiNER2,
-    _CharSplitter,
-    _resolve_flat_overlaps,
-    _schema_tokens,
-    _WhitespaceSplitter,
-)
+from mlx_vlm.models.bert import ModelConfig as BertConfig
+from mlx_vlm.models.bert import TokenClassificationModel as BertTokenClassifier
 from mlx_vlm.models.gliner2_5 import Model as GlinerModel
 from mlx_vlm.models.gliner2_5 import ModelConfig as GlinerConfig
 from mlx_vlm.models.gliner2_5.boundary import (
@@ -27,10 +32,85 @@ from mlx_vlm.models.gliner2_5.boundary import (
     PooledCandidates,
     SharedPoolScorer,
 )
+from mlx_vlm.models.gliner2_5.gliner2_5 import (
+    _resolve_flat_overlaps,
+    _schema_tokens,
+    _split_words,
+)
 from mlx_vlm.models.openai_privacy_filter import Model as PrivacyModel
 from mlx_vlm.models.openai_privacy_filter import ModelConfig as PrivacyConfig
-from mlx_vlm.privacy_filter import PrivacyFilter
+from mlx_vlm.privacy_filter import (
+    VITERBI_BIAS_KEYS,
+    PrivacyFilter,
+    ViterbiDecoder,
+    _load_transition_biases,
+    load_privacy_filter,
+)
+from mlx_vlm.token_classification import (
+    TokenClassifier,
+    build_label_info,
+    decode_spans,
+    load_token_classification_model,
+    load_token_classifier,
+)
 from mlx_vlm.utils import get_model_and_args, load_config
+
+EXTRACTION_DATA = json.loads(
+    Path(__file__).with_name("extraction_cases.json").read_text()
+)
+EXTRACTION_CASES = {case["id"]: case for case in EXTRACTION_DATA["cases"]}
+
+
+def _extraction_config(name):
+    return copy.deepcopy(EXTRACTION_CASES[name]["config"])
+
+
+@pytest.mark.parametrize("height,width", [(2, 3), (3, 2), (72, 72)])
+@pytest.mark.parametrize("theta", [10000.0, 100.0])
+def test_sam3_tracker_rope_matches_reference(height, width, theta):
+    from mlx_vlm.models.sam3.position import apply_rotary_enc_1d, init_2d_freqs
+    from mlx_vlm.models.sam3_1.sam_components import SimpleRoPEAttention
+
+    # Meta sam3/sam/rope.py:compute_axial_cis uses row-major coordinates
+    # and assigns the first half of the complex channels to X, then Y.
+    dim = 32
+    positions = np.arange(height * width, dtype=np.float32)
+    frequencies = theta ** (-np.arange(0, dim, 4, dtype=np.float32) / dim)
+    phases = np.concatenate(
+        [
+            np.outer(positions % width, frequencies),
+            np.outer(positions // width, frequencies),
+        ],
+        axis=-1,
+    )
+    reference = np.exp(1j * phases)
+    cos, sin = init_2d_freqs(dim, height, width, theta=theta)
+    np.testing.assert_allclose(np.asarray(cos), reference.real, atol=1e-5)
+    np.testing.assert_allclose(np.asarray(sin), reference.imag, atol=1e-5)
+
+    attention = SimpleRoPEAttention(
+        dim * 2, 2, feat_sizes=(height, width), rope_theta=theta, rope_k_repeat=True
+    )
+    np.testing.assert_allclose(
+        np.asarray(attention._freqs_cos), reference.real, atol=1e-5
+    )
+    np.testing.assert_allclose(
+        np.asarray(attention._freqs_sin), reference.imag, atol=1e-5
+    )
+
+    # Compare pairwise rotation with complex multiplication, including keys
+    # from two memory frames that reuse the same spatial frequencies.
+    rng = np.random.default_rng(42)
+    q = rng.normal(size=(1, height * width, 2, dim)).astype(np.float32)
+    k = rng.normal(size=(1, height * width * 2, 2, dim)).astype(np.float32)
+    rotated = apply_rotary_enc_1d(mx.array(q), mx.array(k), cos, sin, True)
+    for values, actual, repeats in [(q, rotated[0], 1), (k, rotated[1], 2)]:
+        complex_values = values[..., 0::2] + 1j * values[..., 1::2]
+        expected = complex_values * np.tile(reference, (repeats, 1))[None, :, None]
+        expected = np.stack([expected.real, expected.imag], axis=-1).reshape(
+            values.shape
+        )
+        np.testing.assert_allclose(np.asarray(actual), expected, atol=1e-5)
 
 
 def test_checkpoint_key_sanitization():
@@ -52,8 +132,8 @@ def test_checkpoint_key_sanitization():
 def test_word_splitters_preserve_offsets():
     text = "Email Me@Example.com 北京"
 
-    whitespace = _WhitespaceSplitter()(text)
-    characters = _CharSplitter()(text)
+    whitespace = _split_words(text, "whitespace")
+    characters = _split_words(text, "char")
 
     assert whitespace[1] == ("me@example.com", 6, 20)
     assert characters[-2:] == [("北", 21, 22), ("京", 22, 23)]
@@ -178,9 +258,10 @@ def test_flat_overlap_resolution_keeps_disjoint_spans():
     [(0, {"word_splitter": "bpe"}, "word_splitter"), (4, {}, "special tokens")],
 )
 def test_gliner2_rejects_incompatible_tokenization(added, kwargs, error):
+    model = SimpleNamespace(config=SimpleNamespace(max_len=32))
     tokenizer = SimpleNamespace(add_special_tokens=lambda _: added)
     with pytest.raises(ValueError, match=error):
-        GLiNER2(object(), tokenizer, **kwargs)
+        GlinerModel._prepare(model, tokenizer, "text", (), **kwargs)
 
 
 def test_quantized_encoder_still_runs():
@@ -192,21 +273,9 @@ def test_quantized_encoder_still_runs():
     embedding LayerNorm reject the shape, so every quantized model fails at
     inference even though conversion reports success.
     """
-    config = GlinerConfig.from_dict(
-        {
-            "model_type": "extractor",
-            "architecture": "boundary",
-            "encoder_config": {
-                "vocab_size": 512,
-                "hidden_size": 128,
-                "num_attention_heads": 4,
-                "num_hidden_layers": 2,
-                "intermediate_size": 256,
-                "position_buckets": 64,
-                "max_relative_positions": 128,
-            },
-        }
-    )
+    values = _extraction_config("gliner2_5")
+    values["model_type"] = "extractor"
+    config = GlinerConfig.from_dict(values)
     model = GlinerModel(config)
     model.eval()
     ids = mx.zeros((1, 16), dtype=mx.int32)
@@ -269,30 +338,8 @@ def test_boundary_architecture_selects_the_gliner_module():
     assert model_type == "gliner2_5"
 
 
-LABELS = {0: "O", 1: "B-x", 2: "I-x", 3: "E-x", 4: "S-x"}
-
-
 def _privacy_config(**overrides):
-    values = {
-        "vocab_size": 32,
-        "hidden_size": 8,
-        "intermediate_size": 8,
-        "num_hidden_layers": 1,
-        "num_local_experts": 4,
-        "num_experts_per_tok": 2,
-        "head_dim": 4,
-        "num_attention_heads": 2,
-        "num_key_value_heads": 1,
-        "sliding_window": 2,
-        "max_position_embeddings": 32,
-        "default_n_ctx": 32,
-        "pad_token_id": 31,
-        "eos_token_id": 31,
-        "num_labels": 5,
-        "id2label": LABELS,
-        "attention_chunk_size": 3,
-        "moe_chunk_size": 3,
-    }
+    values = _extraction_config("openai_privacy_filter")
     values.update(overrides)
     return PrivacyConfig(**values)
 
@@ -413,6 +460,250 @@ def test_high_level_api_returns_offsets_and_redacted_text():
     assert result.to_dict()["spans"][0]["text"] == "Alice"
 
 
+BIO_LABELS = {0: "O", 1: "B-NAME", 2: "I-NAME", 3: "B-PHONE", 4: "I-PHONE"}
+
+
+def _bert_token_config(**overrides):
+    values = copy.deepcopy(EXTRACTION_DATA["shared_configs"]["bert_token_classifier"])
+    values.update(overrides)
+    return values
+
+
+def test_bert_token_classifier_scores_every_token():
+    model = BertTokenClassifier(BertConfig.from_dict(_bert_token_config()))
+    ids = mx.array([[2, 5, 6, 7, 3], [2, 8, 3, 0, 0]], dtype=mx.int32)
+    mask = mx.array([[1, 1, 1, 1, 1], [1, 1, 1, 0, 0]], dtype=mx.int32)
+    logits = model(ids, attention_mask=mask).logits
+    mx.eval(logits)
+    assert logits.shape == (2, 5, len(BIO_LABELS))
+    assert mx.all(mx.isfinite(logits)).item()
+
+    weights = model.sanitize(
+        {
+            "bert.embeddings.word_embeddings.weight": mx.zeros((64, 64)),
+            "bert.pooler.dense.weight": mx.zeros((64, 64)),
+            "cls.predictions.bias": mx.zeros((64,)),
+            "classifier.weight": mx.zeros((5, 64)),
+        }
+    )
+    assert sorted(weights) == [
+        "classifier.weight",
+        "embeddings.word_embeddings.weight",
+    ]
+
+
+BERT_EMBEDDING_PATHS = (
+    "embeddings.word_embeddings",
+    "embeddings.position_embeddings",
+    "embeddings.token_type_embeddings",
+)
+BERT_VOCAB = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]", "call", "at", "mc"]
+BERT_VOCAB += ["##kay", "ada", "-", ",", "617", "555"]
+
+
+def _write_bert_token_checkpoint(root):
+    """Save a mixed-bit (8-bit embeddings, 4-bit linears) BERT token classifier."""
+    from transformers import BertTokenizerFast
+
+    config = _bert_token_config(architectures=["BertForTokenClassification"])
+    model = BertTokenClassifier(BertConfig.from_dict(config))
+    nn.quantize(
+        model,
+        class_predicate=lambda path, module: (
+            {"group_size": 32, "bits": 8}
+            if path in BERT_EMBEDDING_PATHS
+            else (
+                {"group_size": 32, "bits": 4}
+                if isinstance(module, nn.Linear)
+                else False
+            )
+        ),
+    )
+    mx.save_safetensors(
+        str(root / "model.safetensors"), dict(tree_flatten(model.parameters()))
+    )
+    config["quantization"] = {
+        "group_size": 32,
+        "bits": 4,
+        **{path: {"group_size": 32, "bits": 8} for path in BERT_EMBEDDING_PATHS},
+    }
+    (root / "config.json").write_text(json.dumps(config))
+    (root / "vocab.txt").write_text("\n".join(BERT_VOCAB) + "\n")
+    BertTokenizerFast(vocab_file=str(root / "vocab.txt")).save_pretrained(root)
+    return model
+
+
+def test_mixed_bit_token_classifier_checkpoint_loads(tmp_path):
+    """Per-module quantization overrides must reach the encoder loader.
+
+    Embeddings stored at 8 bits next to 4-bit linears used to be re-quantized
+    with the global 4-bit setting and fail with a packed-shape mismatch.
+    """
+    model = _write_bert_token_checkpoint(tmp_path)
+
+    loaded = load_token_classification_model(tmp_path)
+
+    assert loaded.embeddings.word_embeddings.bits == 8
+    assert loaded.encoder.layer[0].attention.self.query.bits == 4
+    ids = mx.array([[2, 5, 6, 7, 3]], dtype=mx.int32)
+    expected = model(ids).logits
+    actual = loaded(ids).logits
+    assert mx.array_equal(actual, expected).item()
+
+
+def test_privacy_filter_loader_runs_bio_token_classifiers(tmp_path):
+    """``load_privacy_filter`` routes BERT checkpoints to the shared pipeline."""
+    _write_bert_token_checkpoint(tmp_path)
+    text = "call Ada at 617-555, McKay"
+
+    direct = load_token_classifier(tmp_path)
+    routed = load_privacy_filter(str(tmp_path))
+
+    assert type(routed) is TokenClassifier
+    assert (direct.prefix_ids, direct.suffix_ids) == ([2], [3])
+    assert routed(text).to_dict() == direct(text).to_dict()
+    with pytest.raises(ValueError, match="Viterbi"):
+        load_privacy_filter(str(tmp_path), operating_point="high_recall")
+
+
+def test_bio_labels_are_shared_but_viterbi_requires_bioes():
+    info = build_label_info(list(BIO_LABELS.values()))
+    assert info.span_names == ("O", "NAME", "PHONE")
+    assert info.states_by_span["NAME"] == {"B": 1, "I": 2}
+    with pytest.raises(ValueError, match="missing"):
+        ViterbiDecoder(list(BIO_LABELS.values()))
+    with pytest.raises(ValueError, match="expected BIO or BIOES"):
+        build_label_info(["O", "NAME"])
+
+
+def test_token_spans_group_subwords_and_touching_words():
+    """A word is tagged if any piece is: ``Mc`` is ``O`` but ``##Kay`` is a name."""
+    text = "call Mary Ann Smith at 617-555 now, McKay"
+    tokens = [
+        ((0, 4), 0, "O"),
+        ((5, 7), 1, "B-NAME"),
+        ((7, 9), 1, "B-NAME"),
+        ((10, 13), 2, "B-NAME"),
+        ((14, 19), 3, "I-NAME"),
+        ((20, 22), 4, "O"),
+        ((23, 26), 5, "B-PHONE"),
+        ((26, 27), 6, "B-PHONE"),
+        ((27, 30), 7, "I-PHONE"),
+        ((31, 34), 8, "O"),
+        ((34, 35), 9, "O"),
+        ((36, 38), 10, "O"),
+        ((38, 41), 10, "B-NAME"),
+    ]
+    offsets, word_ids, tags = zip(*tokens)
+    label_ids = {label: index for index, label in BIO_LABELS.items()}
+    path = [label_ids[tag] for tag in tags]
+    info = build_label_info(list(BIO_LABELS.values()))
+
+    spans = decode_spans(text, path, offsets, info, word_ids=word_ids)
+    token_level = decode_spans(text, path, offsets, info)
+
+    assert [(span.label, span.text) for span in spans] == [
+        ("NAME", "Mary"),
+        ("NAME", "Ann Smith"),
+        ("PHONE", "617-555"),
+        ("NAME", "McKay"),
+    ]
+    assert [span.text for span in token_level] == [
+        "Ma",
+        "ry",
+        "Ann Smith",
+        "617",
+        "-555",
+        "Kay",
+    ]
+
+
+class _Encoding(dict):
+    def __init__(self, word_ids, **kwargs):
+        super().__init__(**kwargs)
+        self._word_ids = word_ids
+
+    def word_ids(self):
+        return self._word_ids
+
+
+class _WordTokenizer:
+    """One token per whitespace word; capitalized words get id 3."""
+
+    cls_token_id = 101
+    sep_token_id = 102
+
+    def __call__(self, text, **kwargs):
+        words, offsets, start = text.split(), [], 0
+        for word in words:
+            start = text.index(word, start)
+            offsets.append((start, start + len(word)))
+            start += len(word)
+        return _Encoding(
+            list(range(len(words))),
+            input_ids=[3 if word[0].isupper() else 0 for word in words],
+            offset_mapping=offsets,
+        )
+
+
+class _CapitalizedNameModel:
+    def __init__(self):
+        self.config = SimpleNamespace(
+            id2label=BIO_LABELS, num_labels=len(BIO_LABELS), max_position_embeddings=4
+        )
+        self.windows = []
+
+    def eval(self):
+        return self
+
+    def __call__(self, input_ids, attention_mask=None):
+        ids = input_ids[0].tolist()
+        self.windows.append(ids)
+        logits = mx.full((1, len(ids), len(BIO_LABELS)), -10.0)
+        for position, token in enumerate(ids):
+            logits[0, position, 1 if token == 3 else 0] = 10.0
+        return SimpleNamespace(logits=logits)
+
+
+def test_token_classifier_windows_long_inputs_and_redacts():
+    model = _CapitalizedNameModel()
+    classifier = TokenClassifier(model, _WordTokenizer())
+
+    result = classifier("ask Ada and Grace or Linus today")
+
+    assert (classifier.context_size, classifier.window) == (4, 2)
+    assert [len(window) for window in model.windows] == [4, 4, 4, 3]
+    assert all(w[0] == 101 and w[-1] == 102 for w in model.windows)
+    assert [span.text for span in result.spans] == ["Ada", "Grace", "Linus"]
+    assert result.redacted_text == "ask <NAME> and <NAME> or <NAME> today"
+    assert classifier("ask Ada", keep_labels=("NAME",)).redacted_text == "ask Ada"
+    with pytest.raises(ValueError, match="decode must be 'argmax'"):
+        classifier("ask Ada", decode="viterbi")
+
+
+def test_viterbi_calibration_operating_points(tmp_path):
+    assert _load_transition_biases(tmp_path, "default") == dict.fromkeys(
+        VITERBI_BIAS_KEYS, 0.0
+    )
+    biases = {key: float(index) for index, key in enumerate(VITERBI_BIAS_KEYS)}
+    calibration = {"operating_points": {"high_recall": {"biases": biases}}}
+    (tmp_path / "viterbi_calibration.json").write_text(json.dumps(calibration))
+
+    assert _load_transition_biases(tmp_path, "high_recall") == biases
+    with pytest.raises(ValueError, match="operating point"):
+        _load_transition_biases(tmp_path, "default")
+
+
+def test_privacy_filter_keeps_labels_and_rejects_unknown_decode():
+    detector = PrivacyFilter(_PrivacyModel(), _PrivacyTokenizer())
+
+    kept = detector("Alice emailed bob@example.com", keep_labels=("private_email",))
+
+    assert kept.redacted_text == "<PRIVATE_PERSON> emailed bob@example.com"
+    with pytest.raises(ValueError, match="decode must be 'viterbi' or 'argmax'"):
+        detector("Alice emailed bob@example.com", decode="beam")
+
+
 class TestSapiens2(unittest.TestCase):
     def _tiny_config(self, task="backbone", **overrides):
         from mlx_vlm.models.sapiens2.config import ModelConfig
@@ -425,43 +716,28 @@ class TestSapiens2(unittest.TestCase):
             "pointmap": "Sapiens2ForPointmapEstimation",
             "matting": "Sapiens2ForImageMatting",
         }
-        args = dict(
-            architectures=[archs[task]],
-            hidden_size=64,
-            num_hidden_layers=3,
-            num_attention_heads=4,
-            num_first_full_attention_layers=1,
-            num_last_full_attention_layers=1,
-            intermediate_size=128,
-            image_size=[32, 24],
-            patch_size=8,
-            num_register_tokens=2,
-        )
+        args = _extraction_config("sapiens2")
+        args["architectures"] = [archs[task]]
         args.update(overrides)
         return ModelConfig(**args)
 
     def _deconv_head(self, **kw):
         from mlx_vlm.models.sapiens2.config import HeadConfig
 
-        return HeadConfig(
-            upsample_out_channels=[32, 16],
-            upsample_kernel_sizes=[4, 4],
-            conv_out_channels=[8],
-            conv_kernel_sizes=[1],
-            **kw,
+        values = copy.deepcopy(
+            EXTRACTION_DATA["shared_configs"]["sapiens2_deconv_head"]
         )
+        values.update(kw)
+        return HeadConfig(**values)
 
     def _pixel_shuffle_head(self, **kw):
         from mlx_vlm.models.sapiens2.config import HeadConfig
 
-        return HeadConfig(
-            upsample_out_channels=[32, 16, 8],
-            upsample_kernel_sizes=[3, 3, 3],
-            conv_out_channels=[8],
-            conv_kernel_sizes=[3],
-            use_pixel_shuffle=True,
-            **kw,
+        values = copy.deepcopy(
+            EXTRACTION_DATA["shared_configs"]["sapiens2_pixel_shuffle_head"]
         )
+        values.update(kw)
+        return HeadConfig(**values)
 
     def _predictor(self, task, head_config, num_labels, **overrides):
         from mlx_vlm.models.sapiens2.generate import Sapiens2Predictor
@@ -475,19 +751,6 @@ class TestSapiens2(unittest.TestCase):
     @staticmethod
     def _image(h=40, w=30):
         return np.random.default_rng(0).integers(0, 255, (h, w, 3), np.uint8)
-
-    def test_registry_exposes_model(self):
-        """The package resolves through the shared loader like other models."""
-        import dataclasses
-
-        from mlx_vlm.utils import get_model_and_args
-
-        model_module, model_type = get_model_and_args({"model_type": "sapiens2"})
-        self.assertEqual(model_type, "sapiens2")
-        config = model_module.ModelConfig.from_dict(
-            dataclasses.asdict(self._tiny_config())
-        )
-        self.assertIsInstance(model_module.Model(config), model_module.Model)
 
     def test_config_from_hf_dict(self):
         """from_dict parses an official-style config.json (nested head_config,
@@ -523,16 +786,6 @@ class TestSapiens2(unittest.TestCase):
         self.assertEqual(config.kv_heads_per_layer, [4, 2, 4])
         explicit = self._tiny_config(num_key_value_heads_per_layer=[4, 4, 4])
         self.assertEqual(explicit.kv_heads_per_layer, [4, 4, 4])
-
-    def test_backbone_shapes(self):
-        """Tokens include 1 cls + R register + H*W/patch^2 patch tokens."""
-        from mlx_vlm.models.sapiens2.sapiens2 import Model
-
-        model = Model(self._tiny_config())
-        out = model(mx.random.normal((2, 32, 24, 3)))
-        # grid 4x3 = 12 patches + 3 prefix tokens
-        self.assertEqual(out["last_hidden_state"].shape, (2, 15, 64))
-        self.assertEqual(out["pooler_output"].shape, (2, 64))
 
     def test_deconv_head_shapes(self):
         """Seg/pose heads upsample x2 per deconv block."""
@@ -628,30 +881,17 @@ class TestSapiens2(unittest.TestCase):
         self.assertTrue(expected.issubset(keys))
 
     def test_sanitize_relays_conv_weights(self):
-        """sanitize converts torch conv layouts and prefixes bare backbone keys."""
         from mlx_vlm.models.sapiens2.sapiens2 import Model
 
-        config = self._tiny_config(
-            "seg", head_config=self._deconv_head(), num_labels=29
+        model = Model(
+            self._tiny_config("seg", head_config=self._deconv_head(), num_labels=29)
         )
-        model = Model(config)
-        params = dict(tree_flatten(model.parameters()))
-
-        weights = {}
-        for k, v in params.items():
-            if k.endswith("projection.weight"):
-                weights[k] = mx.zeros((v.shape[0], v.shape[3], 8, 8))  # torch Conv2d
-            elif "deconv_layers" in k:
-                weights[k] = mx.zeros((v.shape[3], v.shape[0], 4, 4))  # torch ConvT
-            else:
-                weights[k] = v
-        sanitized = model.sanitize(weights)
-        for k, v in sanitized.items():
-            self.assertEqual(v.shape, params[k].shape, f"{k} not relayed out correctly")
-
-        # bare (pretrain-style) keys get the backbone. prefix
-        bare = model.sanitize({"patch_embed.projection.bias": mx.zeros((64,))})
-        self.assertIn("backbone.patch_embed.projection.bias", bare)
+        _check_conv_checkpoint(model, ("decode_head.deconv_layers",))
+        value = mx.arange(64, dtype=mx.float32)
+        _assert_weights_equal(
+            model.sanitize({"patch_embed.projection.bias": value}),
+            {"backbone.patch_embed.projection.bias": value},
+        )
 
     def test_pixel_shuffle_matches_torch_layout(self):
         """Channel-last PixelShuffle equals torch's channel-last view."""
@@ -715,13 +955,14 @@ class TestSapiens2(unittest.TestCase):
                 "backbone.blocks.1.attn.wqkv.bias",
             },
         )
-        w = np.array(out["backbone.blocks.1.attn.wqkv.weight"])
-        self.assertEqual(w.shape, (d + 2 * kv, 64))
-        self.assertTrue((w[:d] == 1).all() and (w[d : d + kv] == 2).all())
-        self.assertTrue((w[d + kv :] == 3).all())
-        # already-merged keys pass through
-        again = model.sanitize(out)
-        self.assertEqual(set(again), set(out))
+        expected = {
+            f"backbone.blocks.1.attn.wqkv.{kind}": mx.concatenate(
+                [parts[part][index] for part in ("q", "k", "v")]
+            )
+            for index, kind in enumerate(("weight", "bias"))
+        }
+        _assert_weights_equal(out, expected)
+        _assert_weights_equal(model.sanitize(dict(out)), out)
 
     def test_sanitize_unifies_mixed_dtypes(self):
         """A bf16 checkpoint with float32 norms/biases loads as all-bf16."""
@@ -733,7 +974,10 @@ class TestSapiens2(unittest.TestCase):
             keep = k.endswith((".bias", "ln1.weight", "ln2.weight"))
             weights[k] = v.astype(mx.float32 if keep else mx.bfloat16)
         out = model.sanitize(weights)
-        self.assertTrue(all(v.dtype == mx.bfloat16 for v in out.values()))
+        _assert_weights_equal(
+            out, {k: v.astype(mx.bfloat16) for k, v in weights.items()}
+        )
+        _assert_weights_equal(model.sanitize(dict(out)), out)
         # single-dtype checkpoints are left alone
         out32 = model.sanitize(dict(tree_flatten(model.parameters())))
         self.assertTrue(all(v.dtype == mx.float32 for v in out32.values()))
@@ -858,7 +1102,8 @@ class TestSapiens2(unittest.TestCase):
                 dr[border:-border, border:-border] = hm[k]
                 dr = cv2.GaussianBlur(dr, (kernel, kernel), 0)
                 blurred[k] = dr[border:-border, border:-border]
-                blurred[k] *= origin_max / blurred[k].max()
+                if origin_max > 0:
+                    blurred[k] *= origin_max / blurred[k].max()
             np.log(np.clip(blurred, 1e-3, 50.0), blurred)
             pad = np.pad(blurred, ((0, 0), (1, 1), (1, 1)), mode="edge")
             out = locs.copy()
@@ -1047,3 +1292,975 @@ class TestSapiens2(unittest.TestCase):
             outs = list(seg.stream(path))
             self.assertEqual(len(outs), 3)
             self.assertEqual(outs[0]["segmentation"].shape, (24, 32))
+
+
+class TestSAM3DObjects(unittest.TestCase):
+    """Image-plus-mask to 3D: bundle loading, the sparse flow kernels, sampling,
+    mesh extraction and the streaming pipeline, on a tiny random model."""
+
+    def setUp(self):
+        self._device = mx.default_device()
+        # Reference comparisons run in FP32, independent of Metal kernel precision.
+        mx.set_default_device(mx.cpu)
+
+    def tearDown(self):
+        mx.set_default_device(self._device)
+
+    def _config(self, **overrides):
+        from mlx_vlm.models.sam3d_objects import ModelConfig
+
+        args = _extraction_config("sam3d_objects")
+        args.update(overrides)
+        return ModelConfig(**args)
+
+    @staticmethod
+    def _depth_config():
+        """A tiny MoGe-3 configuration in the bundle's ``config.json`` form."""
+        from dataclasses import asdict
+
+        from mlx_vlm.models.moge3.config import ModelConfig
+
+        return asdict(ModelConfig.from_dict(_extraction_config("moge3")))
+
+    @staticmethod
+    def _cutout(height=48, width=64):
+        """An RGBA object cutout whose alpha channel is the mask."""
+        rgba = np.random.default_rng(0).integers(0, 255, (height, width, 4), np.uint8)
+        rgba[..., 3] = 0
+        rgba[10:40, 20:50, 3] = 255
+        return mx.array(rgba)
+
+    @staticmethod
+    def _bundle(root, config, weights):
+        """Write a converted bundle: config, one shard and its index."""
+        root = Path(root)
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "config.json").write_text(json.dumps(config.to_dict()))
+        mx.save_safetensors(str(root / "model.safetensors"), weights)
+        index = {
+            "metadata": {"total_size": 0},
+            "weight_map": {k: "model.safetensors" for k in weights},
+        }
+        (root / "model.safetensors.index.json").write_text(json.dumps(index))
+        return root
+
+    def test_config_routes_and_round_trips(self):
+        """The shared loader resolves the package; ``depth_model`` is None, a
+        MoGe-3 configuration (``{}`` selects the released ViT-L one) that
+        survives ``to_dict``/``from_dict``, or a rejected MoGe-v1 flag."""
+        from mlx_vlm.models import sam3d_objects
+        from mlx_vlm.models.sam3d_objects import ModelConfig
+        from mlx_vlm.utils import get_model_and_args
+
+        module, model_type = get_model_and_args({"model_type": "sam3d_objects"})
+        self.assertIs(module, sam3d_objects)
+        self.assertEqual(model_type, "sam3d_objects")
+        self.assertIsNone(ModelConfig().depth_model)
+        released = ModelConfig(depth_model={}).depth_model
+        self.assertEqual(released.encoder.backbone, "dinov2_vitl14")
+        self.assertEqual(released.encoder.embed_dim, 1024)
+        # Bundles converted with the retired MoGe-v1 model declared it as true.
+        with self.assertRaisesRegex(ValueError, "MoGe-v1"):
+            ModelConfig.from_dict({"depth_model": True})
+        config = self._config(depth_model=self._depth_config())
+        self.assertEqual(ModelConfig.from_dict(config.to_dict()), config)
+
+    def test_bundle_loads_frozen_strict_and_in_bf16(self):
+        """A converted bundle loads through ``from_pretrained`` and the shared
+        ``load_model`` with its bf16 weights intact; the model is inference-only
+        and a shard missing a tensor is rejected rather than left random."""
+        from mlx_vlm.models.sam3d_objects import Model
+        from mlx_vlm.utils import load_model
+
+        model = Model(self._config())
+        self.assertEqual(tree_flatten(model.trainable_parameters()), [])
+        with self.assertRaisesRegex(ValueError, "inference-only"):
+            model.train()
+        weights = {
+            k: v.astype(mx.bfloat16) for k, v in tree_flatten(model.parameters())
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._bundle(directory, model.config, weights)
+            for loaded in (Model.from_pretrained(root), load_model(root)):
+                self.assertEqual(tree_flatten(loaded.trainable_parameters()), [])
+                for name, value in tree_flatten(loaded.parameters()):
+                    self.assertEqual(value.dtype, mx.bfloat16)
+                    self.assertTrue(mx.array_equal(value, weights[name]).item(), name)
+            weights.pop(next(iter(weights)))
+            mx.save_safetensors(str(root / "model.safetensors"), weights)
+            with self.assertRaises(ValueError):
+                Model.from_pretrained(root)
+
+    def test_add_depth_extends_a_bundle_with_moge3_weights(self):
+        """``convert.add_depth`` records the MoGe-3 configuration and adds a
+        ``moge.safetensors`` shard (torch ConvTranspose layout relaid, cast to
+        the requested dtype) that loads back exactly; legacy MoGe-v1 bundles are
+        rejected at load time."""
+        from mlx_vlm.models.sam3d_objects import Model
+        from mlx_vlm.models.sam3d_objects.convert import add_depth
+
+        depth_config = self._depth_config()
+        depth = Model(self._config(depth_model=depth_config)).depth_model
+        depth_weights = dict(tree_flatten(depth.parameters()))
+        base = Model(self._config())
+        base_weights = dict(tree_flatten(base.parameters()))
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._bundle(Path(directory) / "bundle", base.config, base_weights)
+            source = Path(directory) / "moge3"
+            source.mkdir()
+            (source / "config.json").write_text(json.dumps(depth_config))
+            torch_layout = {
+                k: v.transpose(3, 0, 1, 2) if k.endswith("resamplers.0.0.weight") else v
+                for k, v in depth_weights.items()
+            }
+            mx.save_safetensors(str(source / "model.safetensors"), torch_layout)
+            add_depth(source, root, dtype="bfloat16")
+            config = json.loads((root / "config.json").read_text())
+            self.assertEqual(config["depth_model"], depth_config)
+            index = json.loads((root / "model.safetensors.index.json").read_text())
+            self.assertEqual(
+                index["weight_map"]["depth_model.neck.resamplers.0.0.weight"],
+                "moge.safetensors",
+            )
+            loaded = Model.from_pretrained(root)
+            for name, value in tree_flatten(loaded.depth_model.parameters()):
+                self.assertEqual(value.dtype, mx.bfloat16)
+                expected = depth_weights[name].astype(mx.bfloat16)
+                self.assertTrue(mx.array_equal(value, expected).item(), name)
+            for name, value in tree_flatten(loaded.parameters()):
+                if not name.startswith("depth_model."):
+                    self.assertTrue(mx.array_equal(value, base_weights[name]).item())
+            config["depth_model"] = True
+            (root / "config.json").write_text(json.dumps(config))
+            with self.assertRaisesRegex(ValueError, "MoGe-v1"):
+                Model.from_pretrained(root)
+
+    def test_prepare_inputs_accepts_documented_image_and_mask_forms(self):
+        """Masks may be boolean, 0/1 or 0/255 arrays or the alpha channel, and
+        uint8 or [0, 1] floating pixels agree; crop and full views come out
+        square at the model size; a point map is normalized by the masked
+        (lower) median, which is kept for pose decoding."""
+        from mlx_vlm.models.sam3d_objects.processing import prepare_inputs
+
+        image = self._cutout()
+        reference, metadata = prepare_inputs(image, None, size=28)
+        self.assertEqual(
+            {k: v.shape for k, v in reference.items() if v is not None},
+            {
+                "image": (1, 28, 28, 3),
+                "rgb_image": (1, 28, 28, 3),
+                "mask": (1, 28, 28, 1),
+                "rgb_image_mask": (1, 28, 28, 1),
+            },
+        )
+        self.assertFalse(metadata["pointmap_conditioned"])
+        alpha = image[..., 3]
+        pixels = image[..., :3].astype(mx.float32) / 255
+        masks = (alpha > 0, (alpha > 0).astype(mx.uint8), alpha, alpha / 255)
+        for mask in masks:
+            inputs, _ = prepare_inputs(pixels, mask, size=28)
+            for key, value in reference.items():
+                same = value is None or mx.array_equal(inputs[key], value).item()
+                self.assertTrue(same, key)
+        thin = mx.zeros(alpha.shape, mx.bool_)
+        thin[20, 20:40] = True
+        for bad_image, bad_mask in (
+            (image[..., :3], None),  # no mask and no alpha channel
+            (image[..., :3].astype(mx.float32), alpha),  # floating pixels above 1
+            (image, thin),  # foreground spanning a single row
+        ):
+            with self.assertRaises(ValueError):
+                prepare_inputs(bad_image, bad_mask, size=28)
+        xs, ys = mx.meshgrid(mx.arange(64.0), mx.arange(48.0), indexing="xy")
+        pointmap = mx.stack([xs, ys, mx.full(xs.shape, 5.0)], axis=-1)
+        inputs, metadata = prepare_inputs(image, None, pointmap, size=28)
+        self.assertTrue(metadata["pointmap_conditioned"])
+        self.assertEqual(metadata["pointmap_shift"].tolist(), [34.0, 24.0, 5.0])
+        self.assertGreater(metadata["pointmap_scale"][0].item(), 0)
+        self.assertEqual(inputs["pointmap"].shape, (1, 28, 28, 3))
+        self.assertEqual(inputs["rgb_pointmap"].shape, (1, 28, 28, 3))
+
+    def test_estimate_pointmap_uses_sam_camera_convention(self):
+        """The depth adapter is the shared MoGe-3 model: its point map (recovered
+        shift, no forced projection) mirrored from OpenCV to SAM's PyTorch3D
+        camera (+X left, +Y up), NaN where MoGe masks it out."""
+        from mlx_vlm.models.moge3.moge3 import Model as MoGe3
+        from mlx_vlm.models.sam3d_objects import Model
+        from mlx_vlm.models.sam3d_objects.depth import estimate_pointmap
+
+        depth = Model(self._config(depth_model=self._depth_config())).depth_model
+        self.assertIsInstance(depth, MoGe3)
+        image = self._cutout()
+        pointmap = estimate_pointmap(depth, image, num_tokens=12)
+        reference = depth.infer(
+            image[..., :3].astype(mx.float32) / 255,
+            num_tokens=12,
+            force_projection=False,
+            apply_mask=False,
+        )
+        flipped = reference["points"] * mx.array([-1.0, -1.0, 1.0])
+        expected = mx.where(reference["mask"][..., None], flipped, float("nan"))
+        self.assertEqual(pointmap.shape, (48, 64, 3))
+        self.assertTrue(mx.allclose(pointmap, expected, equal_nan=True).item())
+
+    def test_stream_events_and_outputs(self):
+        """``stream`` yields the staged event protocol the CLI relays and an
+        evaluated result: sparse coords with latents, a unit-quaternion pose,
+        and the requested Gaussian and mesh decodes. A bundled depth model
+        conditions on an estimated point map unless ``estimate_depth`` is off."""
+        from mlx_vlm.models.sam3d_objects import Model
+        from mlx_vlm.models.sam3d_objects.pipeline import Pipeline, Request
+
+        # Fixed random weights keep the run reproducible; every probed seed
+        # produced occupied voxels, so the structure decoder never comes up empty.
+        mx.random.seed(0)
+        config = self._config(depth_model=self._depth_config(), depth_num_tokens=12)
+        pipeline = Pipeline(Model(config))
+        image = self._cutout()
+        request = Request(image, formats=("gaussian", "gaussian_4", "mesh"))
+        events = list(pipeline.stream(request))
+        self.assertEqual(
+            [event.stage for event in events],
+            ["depth", "conditioning", "structure", "structure", "occupancy"]
+            + ["latent", "latent", "gaussian", "gaussian_4", "mesh", "complete"],
+        )
+        self.assertEqual(events[0].data["pointmap"].shape, (48, 64, 3))
+        result = events[-1].data
+        self.assertTrue(result["pointmap_conditioned"])
+        count = result["coords"].shape[0]
+        self.assertGreater(count, 0)
+        self.assertEqual(result["latents"].shape, (count, config.latent_channels))
+        voxels = result["coords"][:, 1:]
+        self.assertTrue(mx.all((voxels >= 0) & (voxels < config.resolution)).item())
+        pose = result["pose"]
+        self.assertAlmostEqual(mx.linalg.norm(pose["rotation"]).item(), 1.0, places=5)
+        rotation = pose["rotation_matrix"]
+        self.assertTrue(mx.allclose(rotation.T @ rotation, mx.eye(3), atol=1e-5).item())
+        self.assertEqual((pose["translation"].shape, pose["scale"].shape), ((3,), (3,)))
+        for kind, per_voxel in (("gaussian", 32), ("gaussian_4", 4)):
+            rows = count * per_voxel
+            self.assertEqual(
+                {key: value.shape for key, value in result[kind].items()},
+                {
+                    "positions": (rows, 3),
+                    "sh_dc": (rows, 3),
+                    "scales": (rows, 3),
+                    "rotations": (rows, 4),
+                    "opacities": (rows, 1),
+                },
+            )
+        mesh = result["mesh"]
+        vertices = mesh["vertices"].shape[0]
+        self.assertGreater(vertices, 0)
+        self.assertEqual(mesh["vertex_colors"].shape, (vertices, 6))
+        self.assertEqual((mesh["faces"].dtype, mesh["faces"].shape[1]), (mx.int32, 3))
+        self.assertTrue(mx.all(mesh["faces"] < vertices).item())
+        # Without depth estimation the conditioner uses its trained point-map dropout.
+        result = pipeline.generate(image, estimate_depth=False, formats=("mesh",))
+        self.assertFalse(result["pointmap_conditioned"])
+        self.assertEqual(
+            set(result), {"coords", "latents", "pose", "pointmap_conditioned", "mesh"}
+        )
+
+    def test_sparse_conv_and_pool_match_dense_references(self):
+        """Sparse convolution equals the dense ``conv3d`` gathered at the active
+        voxels, ``from_parents`` equals convolving the rows expanded from the
+        parent grid, and pooling averages each 2x2x2 block the way torch's
+        scatter mean does (its initial zero counts)."""
+        from mlx_vlm.models.sam3d_objects.sparse import Grid, SparseConv, pool
+
+        coords = mx.array([[0, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 1], [0, 2, 2, 2]])
+        x = mx.arange(8, dtype=mx.float32).reshape(4, 2) / 8
+        conv = SparseConv(2, 3)
+        dense = mx.zeros((1, 3, 3, 3, 2))
+        dense[coords[:, 0], coords[:, 1], coords[:, 2], coords[:, 3]] = x
+        expected = conv.conv(dense)[
+            coords[:, 0], coords[:, 1], coords[:, 2], coords[:, 3]
+        ]
+        self.assertTrue(
+            mx.allclose(conv(x, Grid(coords, 3)), expected, atol=1e-6).item()
+        )
+
+        coords = mx.array(
+            [
+                [0, i, j, k]
+                for i in range(4)
+                for j in range(4)
+                for k in range(4)
+                if (i + j + k) % 5
+            ]
+        )
+        grid = Grid(coords, 4)
+        child, parent = grid.downsample()
+        x = mx.random.normal((child.coords.shape[0], 6))
+        for kernel in (3, 1):
+            conv = SparseConv(6, 5, kernel=kernel)
+            want = conv(x[parent], grid)
+            got = conv.from_parents(x, parent, grid)
+            self.assertTrue(mx.allclose(got, want, atol=1e-5).item())
+
+        cube = mx.array(
+            [[0, i, j, k] for i in range(2) for j in range(2) for k in range(2)]
+        )
+        values, child, parent = pool(mx.full((8, 1), 7.0), Grid(cube, 2))
+        self.assertEqual((child.coords.shape, parent.tolist()), ((1, 4), [0] * 8))
+        self.assertAlmostEqual(values.item(), 8 * 7 / 9, places=5)
+
+    def test_window_attention_matches_masked_dense_attention(self):
+        """Shifted window attention over sparse voxels equals dense attention
+        masked to voxels sharing a window."""
+        from mlx_vlm.models.sam3d_objects.layers import attend
+        from mlx_vlm.models.sam3d_objects.sparse import Grid, window_attention
+
+        coords = mx.array([[0, i, j, 0] for i in range(4) for j in range(3)])
+        qkv = mx.random.normal((len(coords), 3, 2, 4))
+        grid = Grid(coords, 4)
+        for shift in (0, 1):
+            windows = (coords[:, 1:] + shift) // 2
+            mask = mx.all(windows[:, None] == windows[None, :], axis=-1)[None, None]
+            expected = attend(*(qkv[None, :, i] for i in range(3)), mask=mask)[0]
+            actual = window_attention(qkv, grid, 2, shift)
+            self.assertTrue(mx.allclose(actual, expected, atol=1e-5).item())
+
+    def test_prepared_and_guided_conditions_match_plain_calls(self):
+        """Per-request condition projection (``prepare_condition``; None is the
+        classifier-free zero condition) and the batched ``guided`` pass give the
+        same velocities as plain calls of both flows on raw tokens."""
+        from mlx_vlm.models.sam3d_objects import Model
+        from mlx_vlm.models.sam3d_objects.flow import LATENTS
+        from mlx_vlm.models.sam3d_objects.sparse import Grid
+
+        config = self._config()
+        model = Model(config)
+        tokens = mx.random.normal((1, 5, config.cond_channels))
+        raw = (tokens, mx.zeros_like(tokens))
+        time = mx.array([250.0])
+        state = {
+            n: mx.random.normal(
+                (1, config.latent_resolution**3 if n == "shape" else 1, c)
+            )
+            for n, c in LATENTS.items()
+        }
+        structure = model.ss_generator
+        prepared = [structure.prepare_condition(t) for t in (tokens, None)]
+        plain = [structure(state, time, t, mx.zeros(1)) for t in raw]
+        guided = structure.guided(state, time, *prepared, mx.zeros(1))
+        for condition, batched, want in zip(prepared, guided, plain):
+            single = structure(state, time, condition, mx.zeros(1))
+            for name in want:
+                for got in (single[name], batched[name]):
+                    self.assertTrue(
+                        mx.allclose(got, want[name], atol=1e-5).item(), name
+                    )
+
+        coords = mx.array(
+            [[0, i, j, k] for i in range(4) for j in range(4) for k in range(2)]
+        )
+        grid = Grid(coords, 8)
+        latent = mx.random.normal((coords.shape[0], config.latent_channels))
+        sparse = model.slat_generator
+        prepared = [sparse.prepare_condition(t) for t in (tokens, None)]
+        plain = [sparse(latent, grid, time, t) for t in raw]
+        guided = sparse.guided(latent, grid, time, *prepared)
+        for condition, batched, want in zip(prepared, guided, plain):
+            for got in (sparse(latent, grid, time, condition), batched):
+                self.assertTrue(mx.allclose(got, want, atol=1e-5).item())
+
+    def test_share_backbones_requires_identical_dino_weights(self):
+        """Distinct backbones stay separate; once the condition encoders hold
+        identical DINO weights they share one module and one per-request
+        feature cache without changing their embeddings."""
+        from mlx_vlm.models.sam3d_objects import Model
+
+        model = Model(self._config())
+        self.assertFalse(model.share_backbones())
+        embedders = (model.ss_condition_embedder, model.slat_condition_embedder)
+        first = embedders[0].module_list[0].backbone
+        for embedder in embedders:
+            for wrapper in embedder.module_list[:2]:
+                wrapper.backbone.update(first.parameters())
+        inputs = {
+            "image": mx.random.uniform(shape=(1, 28, 28, 3)),
+            "rgb_image": mx.random.uniform(shape=(1, 28, 28, 3)),
+            "mask": mx.random.uniform(shape=(1, 28, 28, 1)),
+            "rgb_image_mask": mx.random.uniform(shape=(1, 28, 28, 1)),
+            "pointmap": None,
+            "rgb_pointmap": None,
+        }
+        want = [embedder(inputs) for embedder in embedders]
+        self.assertTrue(model.share_backbones())
+        self.assertTrue(model.shared_backbone)
+        self.assertIs(embedders[1].module_list[1].backbone, first)
+        cache = {}
+        got = [embedder(inputs, cache=cache) for embedder in embedders]
+        self.assertEqual(set(cache), {"image", "rgb_image", "mask", "rgb_image_mask"})
+        for a, b in zip(got, want):
+            self.assertTrue(mx.allclose(a, b, atol=1e-6).item())
+
+    def test_dino_wrapper_matches_shared_backbone(self):
+        """The conditioner's DINO is the shared DINOv2 (ImageNet-normalized, cls
+        plus patch tokens without registers) with SAM's LayerNorm; features are
+        cached per request key, and the pre-norm variant keeps every token."""
+        from mlx_vlm.models.dinov2.dinov2 import Block
+        from mlx_vlm.models.sam3d_objects.layers import LayerNorm
+        from mlx_vlm.models.sam3d_objects.vision import Dino
+
+        config = self._config()
+        dino = Dino(config)
+        self.assertIsInstance(dino.backbone.blocks[0], Block)
+        self.assertIsInstance(dino.backbone.norm, LayerNorm)
+        image = mx.random.uniform(shape=(2, 28, 28, 3))
+        x = (image - mx.array([0.485, 0.456, 0.406])) / mx.array([0.229, 0.224, 0.225])
+        features = dino.backbone.forward_features(x)
+        expected = mx.concatenate(
+            [features["x_norm_clstoken"][:, None], features["x_norm_patchtokens"]],
+            axis=1,
+        )
+        self.assertEqual(expected.shape, (2, 5, 32))
+        self.assertTrue(mx.allclose(dino(image), expected, atol=1e-5).item())
+        cache = {}
+        first = dino(image, cache=cache, key="image")
+        self.assertEqual(list(cache), ["image"])
+        self.assertTrue(mx.array_equal(dino(None, cache=cache, key="image"), first))
+        prenorm = Dino(config, prenorm=True)
+        prenorm.update(dino.parameters())
+        self.assertEqual(prenorm(image).shape, (2, 9, 32))
+
+    def test_sampler_schedule_and_guidance(self):
+        """``schedule`` warps ``steps + 1`` times by the rescale factor and only
+        accepts positive integer step counts; ``sample`` takes Euler steps with
+        the ``(1 + s) * cond - s * uncond`` velocity while ``t <= 0.5`` and the
+        plain conditional velocity afterwards."""
+        from mlx_vlm.models.sam3d_objects.pipeline import sample, schedule
+
+        self.assertEqual(schedule(2, 3), [0, 0.25, 1])
+        for bad in (0, -1, 1.5, True):
+            with self.assertRaises(ValueError):
+                schedule(bad, 1)
+        seen = []
+
+        def flow(x, grid, time, condition):
+            seen.append(float(time.item()))
+            return mx.ones_like(x) * condition
+
+        outputs = list(sample(flow, mx.zeros((1, 1)), 4, 1, 2, mx.array(1.0)))
+        self.assertEqual(seen, [0, 0, 250, 250, 500, 500, 750])
+        self.assertAlmostEqual(outputs[-1][1].item(), 2.5)
+
+    def test_mesh_extraction_closes_a_sphere_and_skips_empty_surfaces(self):
+        """FlexiCubes extraction of a sphere SDF is a closed manifold (every
+        edge in exactly two non-degenerate faces); an all-outside field gives
+        no faces."""
+        from mlx_vlm.models.sam3d_objects.mesh import CORNERS, extract_mesh
+        from mlx_vlm.models.sam3d_objects.sparse import Grid
+
+        r = 6
+        coords = mx.array(
+            [[0, i, j, k] for i in range(r) for j in range(r) for k in range(r)]
+        )
+        corners = (coords[:, None, 1:] + mx.array(CORNERS)[None]) / r - 0.5
+        sdf = mx.sqrt(mx.sum(corners * corners, axis=-1)) - 0.3
+        features = mx.concatenate(
+            [sdf + 1 / r, mx.zeros((coords.shape[0], 93))], axis=-1
+        )
+        mesh = extract_mesh(features, Grid(coords, r))
+        self.assertGreater(mesh["vertices"].shape[0], 0)
+        edges = {}
+        for a, b, c in mesh["faces"].tolist():
+            self.assertEqual(len({a, b, c}), 3)
+            for pair in ((a, b), (b, c), (c, a)):
+                key = tuple(sorted(pair))
+                edges[key] = edges.get(key, 0) + 1
+        self.assertEqual(set(edges.values()), {2})
+        empty = extract_mesh(mx.ones_like(features), Grid(coords, r))
+        self.assertEqual(empty["faces"].shape, (0, 3))
+
+    def test_astream_pulls_lazily_and_releases_the_worker(self):
+        """Async iteration takes one request at a time from an async source,
+        rejects a concurrent stream, and releases the pipeline after ``aclose``
+        or task cancellation, so the same pipeline serves later requests."""
+        from mlx_vlm.models.sam3d_objects import Model
+        from mlx_vlm.models.sam3d_objects.pipeline import Event, Pipeline
+
+        started, release = threading.Event(), threading.Event()
+        release.set()
+
+        class FakePipeline(Pipeline):
+            def _run(self, request, cancel):
+                started.set()
+                release.wait(timeout=3)
+                for i in range(3):
+                    if cancel.is_set():
+                        return
+                    yield Event(str(request), "step", i, 3, {})
+
+        pipeline = FakePipeline(Model(self._config()))
+
+        async def run():
+            consumed = []
+
+            async def source():
+                for i in range(5):
+                    consumed.append(i)
+                    yield i
+
+            stream = pipeline.astream(source())
+            self.assertEqual((await anext(stream)).request_id, "0")
+            self.assertEqual(consumed, [0])
+            with self.assertRaises(RuntimeError):
+                next(pipeline.stream(None))
+            await stream.aclose()
+            events = [event async for event in pipeline.astream([7, 8])]
+            self.assertEqual([e.request_id for e in events], ["7"] * 3 + ["8"] * 3)
+            started.clear()
+            release.clear()
+            task = asyncio.create_task(anext(pipeline.astream([None])))
+            await asyncio.to_thread(started.wait)
+            task.cancel()
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            events = [event async for event in pipeline.astream([9])]
+            self.assertEqual([e.request_id for e in events], ["9"] * 3)
+
+        asyncio.run(run())
+
+    def test_checkpoint_unpickler_rejects_executable_globals(self):
+        """Torch checkpoints go through a restricted unpickler that only
+        resolves tensor storage classes, so a crafted pickle cannot import
+        ``os.system``."""
+        from mlx_vlm.models.sam3d_objects.checkpoint import TensorUnpickler
+
+        with self.assertRaises(pickle.UnpicklingError):
+            TensorUnpickler(io.BytesIO(b"cos\nsystem\n.")).load()
+
+    def test_cli_readers_and_writers(self):
+        """``read_image`` keeps alpha, ``read_mask`` reads alpha or gray as
+        booleans, ``write_gaussians`` emits the 17-field splat PLY (zero
+        normals, logit opacity, log scales) and ``write_obj`` colored vertices
+        with 1-based faces."""
+        from PIL import Image
+
+        from mlx_vlm.models.sam3d_objects.generate import (
+            read_image,
+            read_mask,
+            write_gaussians,
+            write_obj,
+        )
+
+        rgba = np.array([[[10, 20, 30, 0], [40, 50, 60, 255]]], np.uint8)
+        gaussian = {
+            "positions": mx.array([[0.0, 1.0, 2.0]]),
+            "sh_dc": mx.array([[0.1, 0.2, 0.3]]),
+            "scales": mx.array([[1.0, 2.0, 4.0]]),
+            "rotations": mx.array([[1.0, 0.0, 0.0, 0.0]]),
+            "opacities": mx.array([[0.5]]),
+        }
+        mesh = {
+            "vertices": mx.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+            "faces": mx.array([[0, 1, 2]], mx.int32),
+            "vertex_colors": mx.full((3, 6), 0.5),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            Image.fromarray(rgba, "RGBA").save(root / "cutout.png")
+            Image.fromarray(rgba[..., 3], "L").save(root / "mask.png")
+            Image.fromarray(rgba[..., :3], "RGB").save(root / "photo.jpg")
+            image = read_image(root / "cutout.png")
+            self.assertEqual((image.dtype, image.tolist()), (mx.uint8, rgba.tolist()))
+            self.assertEqual(read_image(root / "photo.jpg").shape, (1, 2, 3))
+            for name in ("cutout.png", "mask.png"):
+                self.assertEqual(read_mask(root / name).tolist(), [[False, True]])
+            write_gaussians(root / "object.ply", gaussian)
+            header, _, payload = (
+                (root / "object.ply").read_bytes().partition(b"end_header\n")
+            )
+            self.assertIn(b"element vertex 1\n", header)
+            self.assertEqual(header.count(b"property float "), 17)
+            expected = [
+                0,
+                1,
+                2,
+                0,
+                0,
+                0,
+                0.1,
+                0.2,
+                0.3,
+                0,
+                *np.log([1, 2, 4]),
+                1,
+                0,
+                0,
+                0,
+            ]
+            np.testing.assert_allclose(
+                np.frombuffer(payload, "<f4"), expected, atol=1e-6
+            )
+            write_obj(root / "object.obj", mesh)
+            self.assertEqual(
+                (root / "object.obj").read_text().splitlines(),
+                [
+                    "v 0 0 0 0.5 0.5 0.5",
+                    "v 1 0 0 0.5 0.5 0.5",
+                    "v 0 1 0 0.5 0.5 0.5",
+                    "f 1 2 3",
+                ],
+            )
+
+
+def _extraction_model(name):
+    module = importlib.import_module(
+        f"mlx_vlm.models.{EXTRACTION_CASES[name]['module']}"
+    )
+    model = module.Model(module.ModelConfig.from_dict(_extraction_config(name)))
+    model.eval()
+    return model
+
+
+def _assert_weights_equal(actual, expected):
+    assert actual.keys() == expected.keys()
+    for key, value in expected.items():
+        assert actual[key].shape == value.shape, key
+        assert actual[key].dtype == value.dtype, key
+        assert mx.array_equal(actual[key], value).item(), key
+
+
+def _check_conv_checkpoint(model, transpose_convs=()):
+    expected = dict(tree_flatten(model.parameters()))
+    source = {}
+    for key, value in expected.items():
+        if value.ndim == 4:
+            value = mx.arange(value.size, dtype=value.dtype).reshape(value.shape)
+            expected[key] = value
+            axes = (3, 0, 1, 2) if key.startswith(transpose_convs) else (0, 3, 1, 2)
+            source[key] = value.transpose(*axes)
+        else:
+            source[key] = value
+    converted = model.sanitize(source)
+    _assert_weights_equal(converted, expected)
+    _assert_weights_equal(model.sanitize(dict(converted)), converted)
+
+
+class ExtractionChecks:
+    def decision_models(self, case):
+        import string
+        from dataclasses import asdict
+
+        from tokenizers import Tokenizer, models, pre_tokenizers
+        from transformers import PreTrainedTokenizerFast
+
+        from mlx_vlm import load, predict
+
+        model = _extraction_model(case["id"])
+        state = case["decision_models"]["state"]
+        questions = case["decision_models"]["questions"]
+
+        labels = list(string.ascii_uppercase) + [
+            a + b for a in string.ascii_uppercase for b in string.ascii_uppercase
+        ]
+        tokens = ["[UNK]", "[PAD]", "[CLS]", "[SEP]", "[MASK]", *labels[:255]]
+        backend = Tokenizer(
+            models.WordLevel(dict(zip(tokens, range(len(tokens)))), unk_token="[UNK]")
+        )
+        backend.pre_tokenizer = pre_tokenizers.Whitespace()
+        processor = PreTrainedTokenizerFast(
+            tokenizer_object=backend,
+            unk_token="[UNK]",
+            pad_token="[PAD]",
+            cls_token="[CLS]",
+            sep_token="[SEP]",
+            mask_token="[MASK]",
+        )
+        expected = predict(model, processor, state, questions)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config.json").write_text(json.dumps(asdict(model.config)))
+            processor.save_pretrained(root)
+            mx.save_safetensors(
+                str(root / "model.safetensors"), dict(tree_flatten(model.parameters()))
+            )
+            loaded, tokenizer = load(directory)
+            actual = predict(loaded, tokenizer, state, questions)
+            assert actual["answers"] == expected["answers"]
+            assert actual.get("usage") == expected.get("usage")
+        assert set(expected["answers"]) == set(questions)
+        for name, answer in expected["answers"].items():
+            question = questions[name]
+            kind = question["type"]
+            assert answer["type"] == kind
+            if kind == "choice":
+                assert answer["value"] in question["criteria"]
+            elif kind == "score":
+                assert 0 <= answer["value"] <= len(question["criteria"]) - 1
+            elif kind == "bool":
+                assert isinstance(answer["value"], bool)
+                assert 0 <= answer["probability"] <= 1
+            elif kind == "multi_label":
+                assert set(answer["value"]) <= set(question["criteria"])
+            if "probabilities" in answer:
+                assert sum(answer["probabilities"].values()) == pytest.approx(
+                    1, abs=1e-3
+                )
+        with pytest.raises(ValueError, match="does not support"):
+            predict(model, processor, state, {"invalid": {"type": "unknown"}})
+
+    def registry_and_config(self, case):
+        name = case["module"]
+        module = importlib.import_module(f"mlx_vlm.models.{name}")
+        resolved, model_type = get_model_and_args({"model_type": name})
+        assert resolved is module and model_type == name
+        config = module.ModelConfig.from_dict(copy.deepcopy(case["config"]))
+        assert isinstance(config, module.ModelConfig)
+
+    def forward(self, case):
+        name = case["id"]
+        mx.random.seed(0)
+        output = _extraction_model(name)(mx.random.normal(case["input_shape"]))
+        expected = case["output_shapes"]
+        if not isinstance(expected, dict):
+            output, expected = {"output": output}, {"output": expected}
+        for key, shape in expected.items():
+            assert output[key].shape == tuple(shape)
+            assert output[key].dtype == mx.float32
+            assert mx.all(mx.isfinite(output[key])).item()
+
+    def checkpoint(self, case):
+        name = case["id"]
+        model = _extraction_model(name)
+        weights = dict(tree_flatten(model.parameters()))
+        _assert_weights_equal(model.sanitize(dict(weights)), weights)
+        once = model.sanitize(dict(weights))
+        _assert_weights_equal(model.sanitize(dict(once)), once)
+
+
+@pytest.mark.parametrize("case", EXTRACTION_DATA["cases"], ids=lambda case: case["id"])
+def test_extraction_contract(case):
+    checks = ExtractionChecks()
+    for kind in case["checks"]:
+        getattr(checks, kind)(case)
+
+
+@pytest.mark.parametrize(
+    "stages, taps, global_layers",
+    [
+        ([2, 5, 8, 11], [1, 4, 7, 10], [2, 5, 8, 11]),  # base
+        ([3, 6, 9, 12], [2, 5, 8, 11], [3, 6, 9]),  # small, seg
+    ],
+)
+def test_rfdetr_backbone_stage_indexes(stages, taps, global_layers):
+    from mlx_vlm.models.rfdetr import ModelConfig
+    from mlx_vlm.models.rfdetr.vision import DINOv2Backbone
+
+    def layers(config):
+        backbone = DINOv2Backbone(config.backbone_config)
+        windowed = backbone.window_block_indexes
+        return backbone.config.out_feature_indexes, [
+            i for i in range(12) if i not in windowed
+        ]
+
+    # Stage i is the output of block i - 1; the raw stage numbers are the
+    # global attention blocks (rfdetr compute_window_block_indexes).
+    config = ModelConfig(out_feature_indexes=stages)
+    assert layers(config) == (taps, global_layers)
+
+    # A saved config must reload to the same layers, with or without the
+    # derived sub-configs.
+    saved = json.loads(json.dumps(config.to_dict(), default=lambda c: c.to_dict()))
+    assert layers(ModelConfig.from_dict(saved)) == (taps, global_layers)
+    del saved["backbone_config"]
+    assert layers(ModelConfig.from_dict(saved)) == (taps, global_layers)
+
+
+def test_video_depth_anything_conv_checkpoint():
+    _check_conv_checkpoint(
+        _extraction_model("video_depth_anything"),
+        ("head.resize_layers.0", "head.resize_layers.1"),
+    )
+
+
+def test_video_depth_anything_rejects_unknown_encoder():
+    from mlx_vlm.models.video_depth_anything import ModelConfig
+
+    with pytest.raises(ValueError):
+        ModelConfig(encoder="vitxl")
+
+
+def test_rfdetr_checkpoint_conversion():
+    from mlx_vlm.models.rfdetr import Model, ModelConfig
+
+    model = Model(ModelConfig(segmentation=True))
+    mx.random.seed(0)
+    expected = {
+        key: mx.random.normal(value.shape)
+        for key, value in tree_flatten(model.parameters())
+    }
+    renames = [
+        ("backbone.embeddings.", "backbone.0.encoder.encoder.embeddings."),
+        ("backbone.encoder.layers.", "backbone.0.encoder.encoder.encoder.layer."),
+        ("backbone.layernorm.", "backbone.0.encoder.encoder.layernorm."),
+        ("projector.", "backbone.0.projector."),
+        (".attention.q_proj.", ".attention.attention.query."),
+        (".attention.k_proj.", ".attention.attention.key."),
+        (".attention.v_proj.", ".attention.attention.value."),
+        (".attention.o_proj.", ".attention.output.dense."),
+        (".layer_scale1", ".layer_scale1.lambda1"),
+        (".layer_scale2", ".layer_scale2.lambda1"),
+    ]
+    source = {}
+    for key, value in expected.items():
+        for mlx_name, torch_name in renames:
+            key = key.replace(mlx_name, torch_name)
+        if value.ndim == 4:
+            value = value.transpose(0, 3, 1, 2)
+        source[f"model.{key}"] = value
+    for i in range(model.config.dec_layers):
+        prefix = f"model.transformer.decoder.layers.{i}.self_attn."
+        for suffix in ("weight", "bias"):
+            source[f"{prefix}in_proj_{suffix}"] = mx.concatenate(
+                [source.pop(f"{prefix}{name}_proj.{suffix}") for name in "qkv"]
+            )
+    mask_token = "model.backbone.0.encoder.encoder.embeddings.mask_token"
+    source[mask_token] = mx.zeros((1, 384))
+
+    converted = model.sanitize(source)
+    _assert_weights_equal(converted, expected)
+    _assert_weights_equal(model.sanitize(dict(converted)), expected)
+    model.load_weights(list(converted.items()), strict=True)
+
+
+class TestLayaDecisionModel(unittest.TestCase):
+    def test_checkpoint_conversion(self):
+        model = _extraction_model("laya")
+        expected = {
+            key: mx.arange(value.size, dtype=value.dtype).reshape(value.shape)
+            for key, value in tree_flatten(model.parameters())
+        }
+        source = dict(expected)
+        for i in range(model.config.head_layers):
+            prefix = f"head.layers.{i}"
+            for suffix in ("weight", "bias"):
+                parts = []
+                for offset, name in enumerate(("query_proj", "key_proj", "value_proj")):
+                    key = f"{prefix}.attention.{name}.{suffix}"
+                    expected[key] = source.pop(key) + offset * expected[key].size
+                    parts.append(expected[key])
+                source[f"{prefix}.self_attn.in_proj_{suffix}"] = mx.concatenate(parts)
+                source[f"{prefix}.self_attn.out_proj.{suffix}"] = source.pop(
+                    f"{prefix}.attention.out_proj.{suffix}"
+                )
+        for key in list(source):
+            if key.startswith(("scorer.layers.", "act_head.layers.")):
+                source[key.replace(".layers.", ".")] = source.pop(key)
+        converted = model.sanitize(source)
+        _assert_weights_equal(converted, expected)
+        _assert_weights_equal(model.sanitize(dict(converted)), expected)
+        model.load_weights(list(converted.items()), strict=True)
+
+    def test_padding_does_not_change_option_logits(self):
+        model = _extraction_model("laya")
+        single, _ = model(
+            mx.array([[1, 2, 3]]),
+            mx.array([[1, 1, 1]]),
+            mx.array([[1, 2]]),
+            mx.array([[True, True]]),
+            mx.array([0]),
+        )
+        batch, _ = model(
+            mx.array([[1, 2, 3, 0, 0], [1, 4, 5, 6, 7]]),
+            mx.array([[1, 1, 1, 0, 0], [1, 1, 1, 1, 1]]),
+            mx.array([[1, 2], [2, 3]]),
+            mx.array([[True, True], [True, True]]),
+            mx.array([0, 2]),
+        )
+        np.testing.assert_allclose(
+            np.asarray(single[0]), np.asarray(batch[0]), atol=2e-5
+        )
+
+    def test_activations_match_reference(self):
+        model = _extraction_model("laya")
+        values = [-3.0, -1.0, 0.0, 0.5, 2.0]
+        x = mx.array(values)
+        gelu = mx.array([v * (1 + math.erf(v / math.sqrt(2))) / 2 for v in values])
+        self.assertTrue(
+            mx.array_equal(model.head.layers[0].activation(x), mx.maximum(x, 0))
+        )
+        for activation in (model.scorer.layers[2], model.act_head.layers[1]):
+            self.assertTrue(mx.allclose(activation(x), gelu, atol=1e-7))
+
+    def test_criterion_rendering_matches_reference(self):
+        from mlx_vlm.models.laya.laya import _options
+
+        cases = [
+            (
+                {
+                    "type": "choice",
+                    "criteria": {
+                        "zero": 0,
+                        "false": False,
+                        "empty": "",
+                        "none": None,
+                        "object": {"é": True},
+                        "list": [0, False],
+                    },
+                },
+                [
+                    "zero: 0",
+                    "false: false",
+                    "empty",
+                    "none",
+                    'object: {"é": true}',
+                    "list: [0, false]",
+                ],
+            ),
+            (
+                {"type": "score", "criteria": [{"é": True}, [0, False]]},
+                ['level 0: {"é": true}', "level 1: [0, false]"],
+            ),
+            (
+                {"type": "noul", "criteria": {"false": 0, "true": False}},
+                ["false: 0", "true: false"],
+            ),
+            (
+                {
+                    "type": "noul",
+                    "criteria": {"false": {"é": True}, "true": [0, False]},
+                },
+                ['false: {"é": true}', "true: [0, false]"],
+            ),
+        ]
+        for question, expected in cases:
+            with self.subTest(question=question):
+                self.assertEqual(_options(question)[1], expected)
+
+    def test_calibrated_probabilities_match_reference(self):
+        from mlx_vlm.models.laya.laya import Laya
+
+        for temperature, effective in [
+            (0.1, 0.5),
+            (10, 5),
+            (2, 2),
+            ("nan", 1),
+            ("inf", 1),
+            (None, 1),
+            ("invalid", 1),
+        ]:
+            for bucket in (False, True):
+                with self.subTest(temperature=temperature, bucket=bucket):
+                    settings = {"temperature": [temperature] * 3}
+                    if bucket:
+                        settings.update(
+                            temperature=[1.0] * 3,
+                            temperature_by_options={"choice:2": temperature},
+                        )
+                    model = MagicMock(config=SimpleNamespace(decision_config=settings))
+                    model.return_value = (mx.array([[0.0, 1.0]]), mx.zeros((1, 2)))
+                    adapter = Laya(model, SimpleNamespace(pad_token_id=0))
+                    adapter._sequence = lambda *args: ([1, 2], [0, 1])
+                    result = adapter.predict(
+                        "text", {"route": {"type": "choice", "criteria": ["A", "B"]}}
+                    )
+                    expected = round(1 / (1 + math.exp(-1 / effective)), 4)
+                    self.assertEqual(
+                        result["answers"]["route"]["probabilities"]["B"], expected
+                    )

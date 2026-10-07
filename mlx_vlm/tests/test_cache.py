@@ -58,6 +58,7 @@ from mlx_vlm.models.cache import (
     RotatingKVCache,
     create_causal_mask,
 )
+from mlx_vlm.models.deepseek_v41.language import DeepseekV41Cache
 from mlx_vlm.models.hy_v4.cache import HyV4KVCache
 from mlx_vlm.models.minimax_m3_vl.language import (
     MiniMaxM3BatchKVCache,
@@ -158,6 +159,163 @@ def test_arrays_cache_advance_matches_decremented_values():
 
     cache.finalize()
     assert cache.left_padding is None and cache.lengths is None
+
+
+@pytest.mark.parametrize("right_pad", [False, True])
+@pytest.mark.parametrize("chunks", [((0, 9),), ((0, 2), (2, 5), (5, 8), (8, 9))])
+def test_deepseek_v41_batch_cache_matches_independent_requests(right_pad, chunks):
+    from mlx_vlm.models import deepseek_v41
+    from mlx_vlm.models.deepseek_v41.engram import NgramHashState
+    from mlx_vlm.models.deepseek_v41.language import LanguageModel
+
+    mx.random.seed(0)
+    case = next(case for case in DATA["cases"] if case["module"] == "deepseek_v41")
+    config = build_config(deepseek_v41, case["config"])
+    model = LanguageModel(config)
+    model.engram_hash = NgramHashState(
+        config, model.layout, token_map=[i % 7 for i in range(config.vocab_size)]
+    )
+    model.head.weight = mx.random.normal(model.head.weight.shape) * 0.05
+    prompts = [[3, 7, 5, 5, 11, 15, 19, 23, 27], [9, 5, 13]]
+
+    def assert_logits(actual, expected):
+        mx.eval(actual, expected)
+        assert mx.allclose(actual, expected, atol=1e-4).item()
+
+    references = [model.make_cache() for _ in prompts]
+    padding = [0, 6]
+    cache = _make_cache(model, [0, 0] if right_pad else padding)
+    if right_pad:
+        cache[0].prepare(lengths=[9, 3], right_padding=padding)
+    ids = mx.array(
+        [
+            prompt + [0] * pad if right_pad else [0] * pad + prompt
+            for prompt, pad in zip(prompts, padding)
+        ]
+    )
+    # One row is entirely padding in two of these chunks.
+    for start, stop in chunks:
+        actual = model(ids[:, start:stop], cache=cache).logits
+        mx.eval(actual, cache[0].state)
+        for index, (prompt, reference) in enumerate(zip(prompts, references)):
+            first = 0 if right_pad else padding[index]
+            begin, end = max(start, first), min(stop, first + len(prompt))
+            if begin < end:
+                expected = model(
+                    ids[index : index + 1, begin:end], cache=reference
+                ).logits
+                full = model(mx.array([prompt[: end - first]])).logits
+                assert_logits(expected, full[:, -(end - begin) :])
+                assert_logits(
+                    actual[index : index + 1, begin - start : end - start],
+                    expected,
+                )
+    if right_pad:
+        cache[0].finalize()
+    assert cache[0].offset.tolist() == [9, 3]
+
+    # Exercise different compression phases, then admit a new request.
+    histories = [list(prompt) for prompt in prompts]
+    for step in range(6):
+        if step == 2:
+            joined = model.make_cache()
+            mx.eval(model(mx.array([[17, 5, 21, 25]]), cache=joined).logits)
+            cache = _extend_cache(cache, joined)
+            references.append([joined[0].extract(0)])
+            histories.append([17, 5, 21, 25])
+        if step == 4:
+            cache[0].filter(mx.array([2, 0]))
+            references = [references[2], references[0]]
+            histories = [histories[2], histories[0]]
+        tokens = mx.array([[31 + index + step] for index in range(len(references))])
+        actual = model(tokens, cache=cache).logits
+        expected = mx.concatenate(
+            [
+                model(tokens[index : index + 1], cache=reference).logits
+                for index, reference in enumerate(references)
+            ]
+        )
+        assert_logits(actual, expected)
+        for index, reference in enumerate(references):
+            histories[index].append(31 + index + step)
+            full = model(mx.array([histories[index]])).logits[:, -1:]
+            assert_logits(actual[index : index + 1], full)
+            row = cache[0].extract(index)
+            assert row.offset == reference[0].offset
+            for ring in row.window:
+                assert ring.shape == (1, config.sliding_window, config.head_dim)
+            fixed = C.cache_nbytes([row.window, row.kv_state, row.score_state])
+            reserve = sum(
+                (row.step - 1) * array.nbytes // array.shape[1]
+                for array in row.compress + row.keys
+                if array is not None and array.shape[1]
+            )
+            assert row.memory_profile(row.offset).fixed_bytes == fixed + reserve
+            assert mx.array_equal(row.engram, reference[0].engram).item()
+
+    # Merging already-populated scalar caches is the server join path.
+    merged = _extend_cache(references[0], references[1])
+    tokens = mx.array([[41], [43]])
+    assert_logits(
+        model(tokens, cache=merged).logits,
+        model(tokens, cache=cache).logits,
+    )
+    restored = [
+        DeepseekV41Cache.from_state(row.state, row.meta_state)
+        for row in (cache[0].extract(0), cache[0].extract(1))
+    ]
+    cache = [DeepseekV41Cache.merge(restored, [row.offset for row in restored])]
+    assert not cache[0].is_trimmable()
+    assert all(not row.is_trimmable() for row in restored)
+    # Restored compressor state must continue from each request's exact prefix.
+    assert_logits(
+        model(tokens, cache=cache).logits,
+        model(tokens, cache=merged).logits,
+    )
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+def test_deepseek_v41_cache_append_preserves_prefix_and_snapshots(dtype):
+    cache = DeepseekV41Cache(2)
+    expected = mx.zeros((2, 0, 4), dtype=dtype)
+    snapshots = []
+    for length in (255, 1, 1, 259):
+        start = expected.shape[1]
+        values = mx.arange(2 * length * 4).reshape(2, length, 4).astype(dtype)
+        expected = mx.concatenate([expected, values], axis=1)
+        cache.compress_kv = cache.append_compressed(1, values)
+        cache.index_k = cache.append_index_keys(1, values[..., :2])
+        cache.offset += length
+        mx.eval(cache.state)
+
+        assert mx.array_equal(cache.compress_kv, expected).item()
+        assert mx.array_equal(cache.index_k, expected[..., :2]).item()
+        assert cache.compress[1].shape[1] == start + length
+        assert cache._compress_buffers[1].shape[1] % cache.step == 0
+        assert cache._compress_buffers[1].shape[1] - expected.shape[1] < cache.step
+        profile = cache.memory_profile(cache.offset)
+        allocated = cache._compress_buffers[1].nbytes + cache._key_buffers[1].nbytes
+        assert profile.source_bytes == allocated
+        assert profile.footprint(cache.offset) >= allocated
+
+        snapshots.append(
+            (
+                DeepseekV41Cache.from_state(cache.state, cache.meta_state),
+                mx.array(expected),
+            )
+        )
+
+    for snapshot, reference in snapshots:
+        assert snapshot.offset == reference.shape[1]
+        assert mx.array_equal(snapshot.compress[1], reference).item()
+        assert mx.array_equal(snapshot.keys[1], reference[..., :2]).item()
+    for restored, reference in (*snapshots, (cache.extract(1), expected[1:])):
+        values = mx.full((reference.shape[0], 2, 4), -1, dtype=dtype)
+        actual = restored.append_compressed(1, values)
+        assert mx.array_equal(
+            actual, mx.concatenate([reference, values], axis=1)
+        ).item()
+        assert restored.state[restored.n_layers + 1].shape == actual.shape
 
 
 @pytest.mark.parametrize("family", ["shared", "qwen"])
@@ -360,6 +518,43 @@ def test_empty_batch_kv_cache_ignores_unapplied_right_padding():
     assert cache.offset.tolist() == [0, 0]
     assert cache.left_padding.tolist() == [0, 0]
     assert cache._right_padding is None
+
+
+@pytest.mark.parametrize(
+    "factory", [BatchKVCache, BatchQuantizedKVCache, BatchQSAKVCache]
+)
+@pytest.mark.parametrize("trigger", ["prepare", "prefill", "ragged_commit"])
+def test_qwen3_5_padding_mask_follows_in_place_updates(factory, trigger):
+    from mlx_vlm.models.qwen3_5 import language as qwen3_5
+    from mlx_vlm.speculative.cache_state import start_speculative_cache
+
+    def kv(steps):
+        return mx.ones((2, 1, steps, 64))
+
+    cache = factory([0, 0])
+    decode = mx.zeros((2, 1, 16))
+    if trigger == "prefill":
+        cache.prepare(right_padding=[0, 3], lengths=[5, 2])
+        cache.update_and_fetch(kv(4), kv(4))
+    elif trigger == "ragged_commit":
+        cache.update_and_fetch(kv(6), kv(6))
+
+    assert qwen3_5._create_qwen3_5_attention_mask(decode, cache) is None
+    if trigger == "prepare":
+        cache.prepare(left_padding=[0, 3])
+    elif trigger == "prefill":
+        cache.update_and_fetch(kv(1), kv(1))
+        cache.finalize()
+    else:
+        # QSA exposes the padding of its inner KV cache.
+        transaction = start_speculative_cache([getattr(cache, "kv_cache", cache)], 4)
+        cache.update_and_fetch(kv(4), kv(4))
+        transaction.commit([4, 1])
+
+    assert cache.left_padding.tolist() == [0, 3]
+    assert qwen3_5._create_qwen3_5_attention_mask(decode, cache) == "left_padded_decode"
+    assert cache._qwen3_5_decode_left_padding == [0, 3]
+    assert qwen3_5._qwen3_5_left_padding_info(cache) == ((0, 3), 3)
 
 
 @pytest.mark.parametrize("window", [4, 8, 16])
@@ -624,6 +819,24 @@ def test_finalize_noop_without_prepare():
     before = cache.left_padding.tolist()
     cache.finalize()
     assert cache.left_padding.tolist() == before
+
+
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6, 8])
+def test_empty_quantized_cache_matches_quantize_layout(bits, head_dim, batched):
+    if batched:
+        cache = BatchQuantizedKVCache([0, 0], group_size=64, bits=bits)
+    else:
+        cache = C.QuantizedKVCache(group_size=64, bits=bits)
+    # The first update allocates the buffers, the second grows them.
+    for steps in (3, 300):
+        new = mx.random.normal((2 if batched else 1, 2, steps, head_dim))
+        keys, _ = cache.update_and_fetch(new, new)
+    expected = mx.quantize(new, group_size=64, bits=bits)
+    assert [k.shape[-1] for k in keys] == [e.shape[-1] for e in expected]
+    stored = mx.dequantize(*(k[..., 3:, :] for k in keys), group_size=64, bits=bits)
+    assert mx.array_equal(stored, mx.dequantize(*expected, group_size=64, bits=bits))
 
 
 GROUP = 64
@@ -1022,6 +1235,38 @@ def test_disk_block_lifecycle(managers, monkeypatch):
     assert warm is not None and 0 < count < 48
 
 
+@parametrize("evicted", [1, 2])
+def test_disk_prefix_with_evicted_leading_blocks(managers, evicted):
+    manager = managers("disk", blocks=3)
+    tokens = list(range(48))
+    source = [filled(C.KVCache(), 48, heads=1, dim=4)]
+    stored = manager.store_kv_blocks(
+        tokens, [source[0].keys], [source[0].values], extra_hash=17
+    )
+    hashes = [block.block_hash for block in stored]
+    manager.release(stored)
+    manager.release(store_blocks(manager, list(range(100, 100 + 16 * evicted))))
+    manager.disk.flush()
+    assert all(h not in manager.hash_table for h in hashes[:evicted])
+    assert all(h in manager.hash_table for h in hashes[evicted:])
+    assert manager.lookup_prefix(tokens, extra_hash=17) == ([], 0)
+    residents = {h: b.ref_cnt for h, b in manager.hash_table.items()}
+
+    hit = P.apc_lookup_plan(
+        manager,
+        tokens + [999],
+        extra_hash=17,
+        apc_mode="block",
+        safe_lookup_min=0,
+        suffix_is_text_only=lambda _: True,
+        prefix_has_media=lambda _: False,
+    )
+    assert hit is not None and hit["prefix_len"] == 48
+    assert hit["matched_blocks"] == []
+    same_cache(hit["warm_cache"], source)
+    assert {h: b.ref_cnt for h, b in manager.hash_table.items()} == residents
+
+
 def test_disk_policy_and_metadata(managers, monkeypatch):
     monkeypatch.setenv("APC_DISK_SHARD_MAX_BLOCKS", "3")
     manager = managers("disk")
@@ -1315,6 +1560,7 @@ def sample(name, length=0):
             sample("KVCache", length), sample("ArraysCache", length)
         ),
         "ChunkedKVCache": lambda: C.ChunkedKVCache(8),
+        "DeepseekV41Cache": lambda: DeepseekV41Cache(1),
         "PoolingCache": lambda: C.PoolingCache(2),
         "RingSlidingKVCache": lambda: RingSlidingKVCache(max(16, length)),
         "RotatingKVCache": lambda: C.RotatingKVCache(max(16, length * 2)),
@@ -1330,6 +1576,14 @@ def sample(name, length=0):
         cache.pooled = mx.ones((1, length // 2, 4))
         cache.buf_kv, cache.buf_gate = mx.ones((1, 2, 4)), mx.ones((1, 2, 1))
         cache.remainder = 1
+    elif name == "DeepseekV41Cache":
+        cache.offset = length
+        cache.window[0] = mx.ones((1, length, 4))
+        cache.compress[0] = mx.ones((1, length // 2, 4)) * 2
+        cache.keys[0] = mx.ones((1, length // 2, 4)) * 3
+        cache.kv_state[0] = mx.ones((1, 2, 4)) * 4
+        cache.score_state[0] = mx.ones((1, 2, 4)) * 5
+        cache.engram = mx.zeros((1, length), dtype=mx.int64)
     elif name == "Z1TCache":
         cache.offset = length
         cache.cum_eKV, cache.cum_eK = mx.ones((1, 4)), mx.ones((1, 4)) * 2
@@ -1732,6 +1986,60 @@ def test_generation_stream_spill(managers, monkeypatch):
     assert manager.store_kv_blocks(list(range(16)), keys, values) == []
     manager.disk.flush()
     assert manager.disk.num_blocks_indexed == 1 and manager.disk.disk_bytes > 0
+
+
+@parametrize("tier", ["memory", "disk"])
+def test_tensor_limit_replaces_idle_history(managers, monkeypatch, tier):
+    monkeypatch.setenv("APC_MAX_POOL_TENSORS", "8")
+    manager = managers(tier, blocks=8)
+    old_tokens, compacted_tokens = list(range(32)), list(range(100, 132))
+    old = [allocated(32, value) for value in (1, 3)]
+    compacted = [allocated(32, value) for value in (5, 7)]
+    for tokens, caches in ((old_tokens, old), (compacted_tokens, compacted)):
+        stored = manager.store_kv_blocks(
+            tokens, [c.keys for c in caches], [c.values for c in caches]
+        )
+        assert len(stored) == 2
+        manager.release(stored)
+    assert manager.stats.evictions == 2
+    assert len(manager.hash_table) * 4 == manager._max_pool_tensors
+    assert manager.lookup_prefix(old_tokens) == ([], 0)
+    matched, count = manager.lookup_prefix(compacted_tokens + [999])
+    assert count == 32
+    same_cache(P.make_warm_kv_cache(matched), compacted)
+    manager.release(matched)
+    if manager.disk is not None:
+        manager.disk.flush()
+        restored, count = manager.lookup_prefix_disk_cache(old_tokens)
+        assert count == 32
+        same_cache(restored, old)
+        assert manager.stats.disk_write_failures == 0
+        matched, count = manager.lookup_prefix(compacted_tokens + [998])
+        assert count == 32
+        manager.release(matched)
+
+
+@parametrize("leased", [1, 2])
+def test_tensor_limit_preserves_active_blocks(managers, monkeypatch, leased):
+    monkeypatch.setenv("APC_MAX_POOL_TENSORS", "8")
+    manager = managers("disk", blocks=8)
+    old = store_blocks(manager, list(range(32)))
+    active = [(b.block_hash, list(b.keys), list(b.values)) for b in old[:leased]]
+    manager.release(old[leased:])
+    new_tokens = list(range(100, 116))
+    new = store_blocks(manager, new_tokens)
+    assert len(new) == 2 - leased
+    for block, (block_hash, keys, values) in zip(old[:leased], active):
+        assert block.ref_cnt == 1 and block.block_hash == block_hash
+        same_arrays((block.keys, block.values), (keys, values))
+    assert len(manager.hash_table) * 4 == manager._max_pool_tensors
+    manager.release(new)
+    manager.release(old[:leased])
+    manager.disk.flush()
+    restored, count = manager.lookup_prefix_disk_cache(
+        new_tokens, allow_memory_overlap=True
+    )
+    assert count == 16 and len(restored) == 2
 
 
 def test_long_prefix_pressure(memory_manager, monkeypatch):
@@ -2191,6 +2499,26 @@ def test_warm_cache_quantization_policy(scheme, managers):
         assert extended[1].offset.shape[0] == 2
         assert isinstance(extended[1], C.BatchQuantizedKVCache)
         assert isinstance(extended[-1], C.BatchKVCache)
+
+
+@parametrize("length, expected", [(16, 0), (32, 16), (33, 32)])
+def test_block_lookup_leaves_a_generation_suffix(managers, length, expected):
+    manager = managers()
+    tokens = list(range(length))
+    manager.release(store_blocks(manager, tokens))
+    hit = P.apc_lookup_plan(
+        manager,
+        tokens,
+        extra_hash=0,
+        apc_mode="block",
+        safe_lookup_min=0,
+        suffix_is_text_only=lambda _: True,
+        prefix_has_media=lambda _: False,
+    )
+    assert (hit["prefix_len"] if hit else 0) == expected
+    if hit:
+        assert hit["full_input_ids"] == tokens
+        manager.release(hit["matched_blocks"])
 
 
 def test_short_and_multimodal_prefixes(managers):

@@ -159,6 +159,7 @@ def _expert_select(
     inds = mx.argpartition(-biased, kth=top_k - 1, axis=-1)[..., :top_k].astype(
         mx.int32
     )
+    inds = mx.stop_gradient(inds)
     weights = mx.take_along_axis(scores, inds, axis=-1)
     if scoring_func != "softmax" and norm_topk_prob:
         weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
@@ -422,6 +423,18 @@ def _split_softmax(log_normalizer, logits_a, logits_b, sinks=None):
     return weights_a, weights_b
 
 
+def _gather_pooled(pooled: mx.array, topk: mx.array) -> mx.array:
+    B, n_pooled, D = pooled.shape
+    L, k = topk.shape[1:]
+    if B == 1:
+        return mx.take(pooled, topk.reshape(-1), axis=1).reshape(B, L, k, D)
+    rows = mx.where(topk < 0, topk + n_pooled, topk)
+    rows = rows + (mx.arange(B, dtype=topk.dtype) * n_pooled)[:, None, None]
+    return mx.take(pooled.reshape(B * n_pooled, D), rows.reshape(-1), axis=0).reshape(
+        B, L, k, D
+    )
+
+
 def _sparse_pooled_attention(
     q: mx.array,
     local_kv: mx.array,
@@ -432,20 +445,13 @@ def _sparse_pooled_attention(
     scale: float,
     sinks: Optional[mx.array],
 ) -> mx.array:
-    B, H, L, D = q.shape
-    idx = topk[:, None, :, :, None]
-    pooled = mx.take_along_axis(
-        mx.broadcast_to(pooled[:, None, None], (B, 1, L, pooled.shape[1], D)),
-        mx.broadcast_to(idx, idx.shape[:-1] + (D,)),
-        axis=3,
-    )
+    pooled_sq = _gather_pooled(pooled, topk)
 
     q_scaled = q * scale
     local_scores = q_scaled @ local_kv.swapaxes(-1, -2)
     local_scores = _apply_score_mask(local_scores, local_mask)
     normalizer = mx.logsumexp(local_scores, -1, keepdims=True)
 
-    pooled_sq = pooled.squeeze(1)
     q_bl = q_scaled.transpose(0, 2, 1, 3)
     pooled_scores = q_bl @ pooled_sq.swapaxes(-1, -2)
     pooled_scores = pooled_scores.transpose(0, 2, 1, 3)
@@ -700,6 +706,7 @@ class Indexer(nn.Module):
         )
         fscore = (fs * self.scale * wq).sum(axis=1)  # (B,1,Kb*b)
         sel = mx.argpartition(-fscore, kth=k - 1, axis=-1)[..., :k]  # (B,1,k)
+        sel = mx.stop_gradient(sel)
         return mx.take_along_axis(pos, sel, axis=-1)
 
     def __call__(

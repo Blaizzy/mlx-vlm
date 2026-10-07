@@ -145,6 +145,18 @@ class ImageEditRequest(FlexibleBaseModel):
         None,
         description="Classifier-free guidance scale; model default if omitted.",
     )
+    negative_prompt: Optional[str] = Field(
+        None, description="Negative conditioning prompt; model default if omitted."
+    )
+    output_resolution: Optional[int] = Field(
+        None,
+        ge=256,
+        description="Reference image resolution and default output area scale.",
+    )
+    use_kv_cache: Optional[bool] = Field(
+        None,
+        description="Reuse fixed conditioning keys/values when supported by the model.",
+    )
     response_format: Literal["b64_json", "path"] = Field(
         "b64_json",
         description="Return base64 PNG data or write files and return local paths.",
@@ -324,6 +336,11 @@ class ChatMessage(FlexibleBaseModel):
         return self
 
 
+class CompactionControl(BaseModel):
+    type: Literal["compaction"]
+    compact_threshold: int = Field(..., gt=0)
+
+
 class OpenAIRequest(FlexibleBaseModel):
     """
     OpenAI-compatible request structure.
@@ -414,6 +431,13 @@ class OpenAIRequest(FlexibleBaseModel):
     store: Optional[bool] = Field(
         True, description="Whether to store this response for later retrieval."
     )
+    context_management: Optional[List[CompactionControl]] = Field(None, max_length=1)
+
+
+class CompactRequest(OpenAIRequest):
+    stream: Literal[False] = False
+    max_output_tokens: int = Field(1024, gt=0, le=16384)
+    keep_tokens: Optional[int] = Field(None, ge=0)
 
 
 class PromptTokensDetails(BaseModel):
@@ -859,6 +883,7 @@ class StreamOptions(BaseModel):
 
 class ChatRequest(GenerationRequest):
     messages: List[ChatMessage]
+    context_management: Optional[List[CompactionControl]] = Field(None, max_length=1)
     stream_options: Optional[StreamOptions] = None
     tools: Optional[List[Any]] = Field(None, description="Tools the model may call.")
     tool_choice: Optional[Any] = Field(

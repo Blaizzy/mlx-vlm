@@ -35,7 +35,12 @@ print(result.redacted_text)
 
 The result contains character offsets, typed labels, source text for each
 span, and redacted text. Pass `replacement="[REDACTED]"` to use a single
-replacement string instead of typed placeholders such as `<PRIVATE_EMAIL>`.
+replacement string instead of typed placeholders such as `<PRIVATE_EMAIL>`, and
+`keep_labels=("private_url",)` to report spans without redacting them.
+
+Windowing, span decoding and redaction are shared with
+`mlx_vlm.token_classification`, so this loader also runs BIO token classifiers
+such as Rampart (see the [BERT docs](../bert/README.md)).
 
 Use independent per-token decoding only when explicitly needed:
 

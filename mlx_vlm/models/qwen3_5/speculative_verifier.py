@@ -195,6 +195,7 @@ class Qwen3_5BatchInvariantForward:
             )
             top_k = feed_forward.top_k
             indices = mx.argpartition(gates, kth=-top_k, axis=-1)[..., -top_k:]
+            indices = mx.stop_gradient(indices)
             scores = mx.take_along_axis(gates, indices, axis=-1)
             scores = scores / scores.sum(axis=-1, keepdims=True)
 
@@ -285,7 +286,6 @@ class Qwen3_5BatchInvariantForward:
         if cache is not None:
             if hasattr(cache, "advance"):
                 cache.advance(length)
-                helpers._qwen3_5_advance_left_padding_info(cache, length)
                 helpers._qwen3_5_advance_lengths_info(cache, length)
 
         output = layer.norm(output, z)

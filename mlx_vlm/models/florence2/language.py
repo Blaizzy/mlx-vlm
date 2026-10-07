@@ -1,5 +1,5 @@
 import math
-from typing import Optional, Tuple
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -9,7 +9,7 @@ from ..base import (
     create_attention_mask,
     scaled_dot_product_attention,
 )
-from ..cache import SimpleKVCache
+from ..cache import CacheList, SimpleKVCache
 from .config import TextConfig
 
 
@@ -176,7 +176,7 @@ class Florence2DecoderLayer(nn.Module):
         encoder_hidden_states,
         attention_mask=None,
         encoder_attention_mask=None,
-        cache: Optional[Tuple[SimpleKVCache, SimpleKVCache]] = None,
+        cache: Optional[CacheList] = None,
     ):
         residual = hidden_states
 
@@ -390,7 +390,9 @@ class Florence2LanguageModel(nn.Module):
             inputs_embeds = inputs_embeds * self.embed_scale
 
         if cache is None:
-            cache = [(SimpleKVCache(), SimpleKVCache())] * len(self.decoder.layers)
+            cache = [
+                CacheList(SimpleKVCache(), SimpleKVCache()) for _ in self.decoder.layers
+            ]
 
         if encoder_outputs is None:
             encoder_outputs = self.encoder(
@@ -486,4 +488,4 @@ class LanguageModel(nn.Module):
         return self.config.decoder_attention_heads
 
     def make_cache(self):
-        return [(SimpleKVCache(), SimpleKVCache()) for n in self.layers]
+        return [CacheList(SimpleKVCache(), SimpleKVCache()) for _ in self.layers]

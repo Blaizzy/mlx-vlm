@@ -51,6 +51,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | LocateAnything | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/locateanything/README.md) |
 | Moondream2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/moondream2/README.md) |
 | Moondream3 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/moondream3/README.md) |
+| EmbeddingGemma 2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/embedding_gemma2/README.md) |
 | Gemma 4 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/gemma4/README.md) |
 | MiniMax M3 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minimax_m3_vl/README.md) |
 | Falcon-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/falcon_ocr/README.md) |
@@ -60,6 +61,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | Granite 4.0 Vision | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite4_vision/README.md) |
 | MiniCPM-V 4.6 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minicpmv4_6/README.md) |
 | GLiNER2.5 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/gliner2_5/README.md) |
+| BERT | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/bert/README.md) |
 | LLaVA-OneVision | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/llava_onevision/README.md) |
 | K2-Horizon | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/k2_horizon/README.md) |
 | Z1T-0 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/z1t/README.md) |
@@ -380,6 +382,33 @@ tool-call parsing, MSA index caches, and MXFP8 config loading. See
 [`mlx_vlm/models/minimax_m3_vl/README.md`](mlx_vlm/models/minimax_m3_vl/README.md)
 for model-specific conversion and runtime notes.
 
+#### Reading the server's draft counters
+
+With a drafter loaded, `mlx_vlm.server` adds four fields to a response's
+`timings`, named after llama.cpp's:
+
+| Field | Meaning |
+|---|---|
+| `draft_kind` | The drafter family that ran |
+| `draft_rounds` | Verification rounds: target forward passes after the prefill |
+| `draft_n` | Tokens proposed, `--draft-block-size` minus one per round (the block includes the anchor token) |
+| `draft_n_accepted` | Proposed tokens the target's greedy choice matched |
+
+`draft_n_accepted` is a measure of the drafter, not of the output. A round
+is recorded when the target verifies it, before the stop token or `max_tokens`
+cuts the reply, so matches past the end of the reply are counted and the field
+can exceed `predicted_n`. `predicted_n - draft_n_accepted` is therefore not
+the number of target forward passes. Use `draft_rounds`:
+
+```text
+accept_length = (predicted_n - 1) / draft_rounds
+```
+
+The first token comes from the prefill, before any draft exists, so it is
+left out of the numerator. The three counters are differences of a tally kept
+on the drafter, so they belong to one request only when one request is in
+flight; with concurrent requests they are shared across the batch.
+
 ### Chat UI with Gradio
 
 The Gradio chat UI requires the optional `ui` extra, which the base `mlx-vlm`
@@ -480,6 +509,37 @@ output = generate(model, processor, formatted_prompt, image, audio=audio, verbos
 print(output)
 ```
 
+
+### Decision models
+
+Run shared typed decision prediction from the CLI:
+
+```sh
+python -m mlx_vlm decide --model nativ-community/decider-2b \
+  --state "Please refund my duplicate charge" \
+  --questions '{"department":{"type":"choice","instructions":"Which team should handle this ticket?","criteria":["billing","technical","sales"]}}'
+```
+
+Use `--state-file request.txt` for UTF-8 text and `--questions-file questions.json`
+for named questions. `mlx_vlm.decide` runs the same command.
+
+Preload a decision model in the existing server:
+
+```sh
+python -m mlx_vlm server --decision-model nativ-community/decider-2b
+curl http://localhost:8080/v1/decisions \
+  -H 'Content-Type: application/json' \
+  -d '{"state":"Please refund my duplicate charge","questions":{"department":{"type":"choice","instructions":"Which team should handle this ticket?","criteria":["billing","technical","sales"]}}}'
+```
+
+An explicit `model` in the request selects a checkpoint; otherwise the currently
+loaded decision model is used. Without either, the endpoint returns HTTP 400.
+Decision requests are non-streaming and use the server's API-key authentication.
+
+Both interfaces return the shared `predict()` result and preserve model-specific
+scoring. Decider and Laya support `choice`, `bool`, and `score`; consult each
+model's README for criteria and calibration details.
+
 ### Server (FastAPI)
 
 Start the server:
@@ -525,6 +585,7 @@ mlx_vlm.server --model-dir /Volumes/Models --model-dir ~/my-custom-model
 - `--tts-model`: Preload a text-to-speech model at server startup
 - `--stt-model`: Preload a speech-to-text model at server startup
 - `--embedding-model`: Preload an embedding model at server startup
+- `--decision-model`: Preload a decision model at server startup
 - `--reranker-model`: Preload a supported reranker model at server startup
 - `--model-dir`: Additional model folder or parent containing model folders to include in discovery; repeat for multiple paths. Overrides `MLX_VLM_MODEL_PATHS` (paths separated by `os.pathsep`, `:` on macOS/Linux)
 - `--adapter-path`: Path for adapter weights to use with the preloaded model
@@ -1219,7 +1280,9 @@ Structured outputs are not currently supported with speculative decoding.
 - `/models` and `/v1/models` - Discover cached and local models, including their loaded status; accepts repeated `model_dir` query parameters
 - `/chat/completions` and `/v1/chat/completions` - OpenAI-compatible chat-style interaction endpoint with support for images, audio, and text
 - `/responses` and `/v1/responses` - OpenAI-compatible responses endpoint
+- `/responses/compact` and `/v1/responses/compact` - Compact conversation history into replayable state; see [compaction and APC](docs/usage.md#conversation-compaction-and-apc)
 - `/embeddings` and `/v1/embeddings` - OpenAI-compatible embeddings endpoint backed by native MLX embedding models
+- `/v1/decisions` - Predict named typed decisions using the shared decision API
 - `/v1/rerank` - Rank text or multimodal documents by relevance to a query
 - `/audio/speech` and `/v1/audio/speech` - OpenAI-compatible text-to-speech endpoint backed by `mlx-audio` TTS models
 - `/audio/transcriptions` and `/v1/audio/transcriptions` - OpenAI-compatible speech-to-text endpoint backed by `mlx-audio` STT models
@@ -1281,7 +1344,7 @@ curl -X POST "http://localhost:8080/v1/embeddings" \
   }'
 ```
 
-Preload a default with `--embedding-model <repo-or-path>`. Supported architectures: BERT, XLM-RoBERTa, ModernBERT, Qwen3-Embedding, EmbeddingGemma (gemma3), LFM2, SigLIP (text), Qwen3-VL-Embedding, and Llama-Nemotron-VL, plus LLM2Vec bidirectional Llama. ColBERT-style multi-vector models (ColIdefics3, ColQwen2.5) are also available for late-interaction use.
+Preload a default with `--embedding-model <repo-or-path>`. Supported architectures: BERT, XLM-RoBERTa, ModernBERT, Qwen3-Embedding, EmbeddingGemma (gemma3), LFM2, SigLIP (text), Qwen3-VL-Embedding, and Llama-Nemotron-VL, plus LLM2Vec bidirectional Llama. ColBERT-style multi-vector models (ColIdefics3, ColQwen2.5, LFM2-ColBERT) are also available for late-interaction use.
 
 ##### Reranking
 

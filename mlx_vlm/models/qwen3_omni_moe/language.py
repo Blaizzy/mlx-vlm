@@ -164,6 +164,7 @@ class Qwen3OmniMoeThinkerTextSparseMoeBlock(nn.Module):
 
         k = self.top_k
         inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+        inds = mx.stop_gradient(inds)
         scores = mx.take_along_axis(gates, inds, axis=-1)
         if self.norm_topk_prob:
             scores /= mx.sum(scores, axis=-1, keepdims=True)
@@ -493,7 +494,11 @@ class LanguageModel(nn.Module):
                 position_ids = mx.broadcast_to(
                     position_ids[None, :, :], (3, *position_ids.shape)
                 )
-                mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
+                mrope_position_deltas = (
+                    max_position_ids
+                    + 1
+                    - mx.sum(attention_mask, axis=-1, keepdims=True)
+                )
             else:
                 position_ids = mx.arange(input_ids.shape[1]).reshape(1, -1)
                 position_ids = mx.broadcast_to(

@@ -12,6 +12,7 @@ from mlx_vlm.generate.image import (
     ImageGenerationRequest,
     ImageGenerationResult,
 )
+from mlx_vlm.generate.image_defaults import ImageSamplingDefaults, image_metadata_path
 
 from .config import MageFlowVariant, get_variant, variant_from_local_path
 from .download import validate_model_layout
@@ -58,6 +59,15 @@ def _can_load(model: str, *, task: str) -> bool:
         return False
 
 
+def _defaults_variant(model: str, model_path: Path | None):
+    if model_path is not None:
+        return variant_from_local_path(model_path)
+    try:
+        return resolve_variant(model)
+    except ValueError:
+        return variant_from_local_path(image_metadata_path(model))
+
+
 @dataclass(slots=True)
 class MageFlowImageGenerationModel(ImageGenerationModel):
     is_image_generation_model: ClassVar[bool] = True
@@ -67,13 +77,27 @@ class MageFlowImageGenerationModel(ImageGenerationModel):
     family: str = "mage_flow"
 
     @property
+    def default_sampling(self) -> ImageSamplingDefaults:
+        return ImageSamplingDefaults.from_config(self.pipeline.variant)
+
+    @classmethod
+    def resolve_defaults(
+        cls, model: str, *, model_path: Path | None = None
+    ) -> ImageSamplingDefaults:
+        variant = _defaults_variant(model, model_path)
+        if variant.task != "generate":
+            raise ValueError(f"{model} does not support image generate")
+        return ImageSamplingDefaults.from_config(variant)
+
+    @property
     def variant(self) -> str:
         return self.pipeline.variant.name
 
     def generate(self, request: ImageGenerationRequest) -> ImageGenerationResult:
         seed = 0 if request.seed is None else request.seed
-        steps = request.resolve_steps()
-        guidance = request.resolve_guidance()
+        defaults = self.default_sampling
+        steps = request.resolve_steps(defaults.steps)
+        guidance = request.resolve_guidance(defaults.guidance)
         array = self.pipeline.generate_array(
             request.prompt,
             seed=seed,
@@ -149,13 +173,27 @@ class MageFlowImageEditModel(ImageEditModel):
     family: str = "mage_flow"
 
     @property
+    def default_sampling(self) -> ImageSamplingDefaults:
+        return ImageSamplingDefaults.from_config(self.pipeline.variant)
+
+    @classmethod
+    def resolve_defaults(
+        cls, model: str, *, model_path: Path | None = None
+    ) -> ImageSamplingDefaults:
+        variant = _defaults_variant(model, model_path)
+        if variant.task != "edit":
+            raise ValueError(f"{model} does not support image edit")
+        return ImageSamplingDefaults.from_config(variant)
+
+    @property
     def variant(self) -> str:
         return self.pipeline.variant.name
 
     def edit(self, request: ImageEditRequest) -> ImageGenerationResult:
         seed = 0 if request.seed is None else request.seed
-        steps = request.resolve_steps(self.pipeline.variant.default_steps)
-        guidance = request.resolve_guidance(self.pipeline.variant.default_guidance)
+        defaults = self.default_sampling
+        steps = request.resolve_steps(defaults.steps)
+        guidance = request.resolve_guidance(defaults.guidance)
         array = self.pipeline.edit_array(
             request.prompt,
             request.image_paths,

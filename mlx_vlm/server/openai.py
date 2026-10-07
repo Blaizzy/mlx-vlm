@@ -5,9 +5,9 @@ import gc
 import json
 import logging
 import random
-import re
 import time
 import uuid
+from contextlib import aclosing
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -16,6 +16,7 @@ from typing import Any, List, Optional, Tuple
 import mlx.core as mx
 from fastapi import HTTPException, Request
 from fastapi.responses import StreamingResponse
+from pydantic import ValidationError
 
 from ..generate import generate, stream_generate
 from ..generate.edit_image import ImageEditRequest as CoreImageEditRequest
@@ -23,7 +24,7 @@ from ..generate.edit_image import edit_image
 from ..generate.image import ImageGenerationRequest as CoreImageGenerationRequest
 from ..generate.image import generate_image, parse_size
 from ..generate.video import resolve_video_inputs
-from ..prompt_utils import apply_chat_template, extract_text_from_content
+from ..prompt_utils import apply_chat_template
 from ..tools import (
     _infer_tool_parser_from_processor,
     _prepare_chat_tool_choice,
@@ -31,11 +32,16 @@ from ..tools import (
     process_tool_calls,
 )
 from ..utils import prepare_inputs
+from . import compaction
 from .generation import (
     GenerationMetrics,
     PromptTooLongError,
     _build_metrics_envelope,
     _count_prompt_tokens,
+)
+from .request_normalization import (
+    _chat_message_to_prompt,
+    _normalize_instruction_messages,
 )
 from .responses_state import (
     ToolCallStreamState,
@@ -48,10 +54,12 @@ from .responses_state import (
 from .responses_state import _sse_event as _response_sse_event
 from .responses_state import (
     _store_response,
+    finish_content_streams,
     make_response_stream_state,
     prompt_has_open_thinking,
     response_store,
     response_store_lock,
+    strip_protocol_markers,
 )
 from .runtime import runtime
 from .schemas import (
@@ -62,6 +70,7 @@ from .schemas import (
     ChatResponse,
     ChatStreamChoice,
     ChatStreamChunk,
+    CompactRequest,
     ContentPartOutputText,
     GenerationTimings,
     ImageEditRequest,
@@ -71,7 +80,6 @@ from .schemas import (
     ImageGenerationResponse,
     ImageGenerationResponseData,
     InputAudio,
-    MessageItem,
     OpenAIRequest,
     OpenAIResponse,
     OpenAIUsage,
@@ -80,9 +88,6 @@ from .schemas import (
     ResponseContentPartDoneEvent,
     ResponseCreatedEvent,
     ResponseInProgressEvent,
-    ResponseOutputItemAddedEvent,
-    ResponseOutputItemDoneEvent,
-    ResponseOutputTextDeltaEvent,
     ResponseOutputTextDoneEvent,
     StreamingTimings,
     UsageStats,
@@ -183,31 +188,6 @@ def _adapter_path_or_inherit(request):
         if "adapter_path" in request.model_fields_set
         else _INHERIT_ADAPTER
     )
-
-
-def _normalize_response_instruction_messages(
-    chat_messages: List[dict],
-    instructions: Optional[str],
-) -> Optional[str]:
-    instruction_parts = [instructions] if instructions else []
-    conversation = []
-
-    for message in chat_messages:
-        if message.get("role") in ("system", "developer"):
-            content = message.get("content")
-            if content:
-                instruction_parts.append(str(content))
-        else:
-            conversation.append(message)
-
-    normalized_instructions = "\n\n".join(instruction_parts) or None
-    if normalized_instructions:
-        conversation.insert(
-            0,
-            {"role": "system", "content": normalized_instructions},
-        )
-    chat_messages[:] = conversation
-    return normalized_instructions
 
 
 def _decode_input_audio_data(input_audio: InputAudio):
@@ -314,6 +294,10 @@ def register_routes(app, deps):
     _make_logprob_content = deps.make_logprob_content
 
     app.post("/responses/input_tokens")(responses_input_tokens_endpoint)
+    app.post("/responses/compact")(responses_compact_endpoint)
+    app.post("/v1/responses/compact", include_in_schema=False)(
+        responses_compact_endpoint
+    )
     app.post("/v1/responses/input_tokens", include_in_schema=False)(
         responses_input_tokens_endpoint
     )
@@ -630,6 +614,15 @@ async def images_edits_endpoint(request: Request):
                         height=height,
                         guidance=image_request.guidance,
                         output_format=image_request.output_format,
+                        extra={
+                            key: value
+                            for key in (
+                                "negative_prompt",
+                                "output_resolution",
+                                "use_kv_cache",
+                            )
+                            if (value := getattr(image_request, key)) is not None
+                        },
                     )
                     result = edit_image(
                         model,
@@ -699,17 +692,28 @@ async def images_edits_endpoint(request: Request):
         raise HTTPException(status_code=500, detail=f"Image edit failed: {e}")
 
 
+def _parse_response_request(body):
+    try:
+        return OpenAIRequest(**body)
+    except ValidationError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
 async def responses_input_tokens_endpoint(request: Request):
     body = await request.json()
-    openai_request = OpenAIRequest(**body)
+    openai_request = _parse_response_request(body)
     try:
         current_input_items = _normalize_response_input(openai_request.input)
         prompt_items = (
             _response_chain_items(openai_request.previous_response_id)
             + current_input_items
         )
+        prompt_items = compaction.resolve(
+            prompt_items, model=openai_request.model, tenant=_read_tenant_id(request)
+        )
+        prompt_items, _ = compaction.split_trigger(prompt_items)
         chat_messages, images = _response_items_to_chat(prompt_items)
-        _normalize_response_instruction_messages(
+        _normalize_instruction_messages(
             chat_messages,
             openai_request.instructions,
         )
@@ -754,6 +758,159 @@ async def responses_input_tokens_endpoint(request: Request):
         raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+async def responses_compact_endpoint(http_request: Request, request: CompactRequest):
+    tenant = _read_tenant_id(http_request)
+    context = compaction.resolve_context(
+        _response_chain_items(request.previous_response_id)
+        + _normalize_response_input(request.input),
+        model=request.model,
+        tenant=tenant,
+    )
+    model, processor, config = get_cached_model(
+        request.model, _adapter_path_or_inherit(request)
+    )
+    result = await compaction.compact_response_context(
+        request,
+        context.items,
+        model,
+        processor,
+        config,
+        tenant,
+        build_gen_args=_build_gen_args,
+        apply_chat_template=apply_chat_template,
+        generate=generate,
+        covered=context.covered,
+    )
+    output = (
+        [
+            compaction.seal(
+                result.items, model=request.model, tenant=tenant, covered=result.covered
+            )
+        ]
+        if result.changed or context.covered
+        else context.items
+    )
+    return {
+        "id": f"resp_{uuid.uuid4().hex}",
+        "object": "response.compaction",
+        "created_at": int(time.time()),
+        "output": output,
+        "usage": (
+            result.usage or OpenAIUsage(input_tokens=0, output_tokens=0, total_tokens=0)
+        ).model_dump(),
+    }
+
+
+def _response_stream_error(exc, response):
+    status = exc.status_code if isinstance(exc, HTTPException) else 500
+    code = (
+        "context_length_exceeded"
+        if isinstance(exc, (compaction.ContextBudgetError, PromptTooLongError))
+        else (
+            "rate_limit_exceeded"
+            if status == 429
+            else ("invalid_prompt" if status < 500 else "server_error")
+        )
+    )
+    return _response_sse_event(
+        "response.failed",
+        {
+            "type": "response.failed",
+            "response": {
+                **response.model_dump(),
+                "status": "failed",
+                "error": {
+                    "message": (
+                        str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
+                    ),
+                    "code": code,
+                },
+            },
+        },
+    )
+
+
+async def _responses_compaction_trigger(request, items, tenant, covered=frozenset()):
+    """Return a single opaque item, with progress while a summary is running."""
+    model, processor, config = get_cached_model(
+        request.model, _adapter_path_or_inherit(request)
+    )
+    compact_request = CompactRequest(
+        **{**request.model_dump(), "stream": False, "max_output_tokens": 1024}
+    )
+    args = (compact_request, items, model, processor, config, tenant)
+    options = dict(
+        build_gen_args=_build_gen_args,
+        apply_chat_template=apply_chat_template,
+        generate=generate,
+        covered=covered,
+        allow_oversized=True,
+    )
+    pending = OpenAIResponse(
+        id=f"resp_{uuid.uuid4().hex}",
+        created_at=int(time.time()),
+        object="response",
+        status="in_progress",
+        model=request.model,
+        output=[],
+        output_text="",
+        usage=OpenAIUsage(input_tokens=0, output_tokens=0, total_tokens=0),
+        store=request.store,
+        previous_response_id=request.previous_response_id,
+    )
+
+    def complete(result):
+        capsule = compaction.seal(
+            result.items, model=request.model, tenant=tenant, covered=result.covered
+        )
+        response = pending.model_copy(
+            update={
+                "status": "completed",
+                "output": [capsule],
+                "usage": result.usage or pending.usage,
+            }
+        )
+        _store_response(response, items, [capsule], request.previous_response_id)
+        return response
+
+    if not request.stream:
+        return complete(await compaction.compact_response_context(*args, **options))
+
+    async def events():
+        try:
+            for kind in ("response.created", "response.in_progress"):
+                yield _response_sse_event(
+                    kind, {"type": kind, "response": pending.model_dump()}
+                )
+            async with aclosing(
+                compaction.stream_response_context(*args, **options)
+            ) as progress:
+                async for update in progress:
+                    if isinstance(update, compaction.CompactedContext):
+                        result = update
+                    else:
+                        yield _response_sse_event(
+                            update["type"], {**update, "response_id": pending.id}
+                        )
+            response = complete(result)
+            for kind in ("response.output_item.added", "response.output_item.done"):
+                yield _response_sse_event(
+                    kind, {"type": kind, "output_index": 0, "item": response.output[0]}
+                )
+            yield _response_sse_event(
+                "response.completed",
+                {"type": "response.completed", "response": response.model_dump()},
+            )
+        except Exception as exc:
+            yield _response_stream_error(exc, pending)
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 async def responses_retrieve_endpoint(response_id: str):
@@ -855,7 +1012,7 @@ async def responses_endpoint(request: Request):
 
     request_start = time.perf_counter()
     body = await request.json()
-    openai_request = OpenAIRequest(**body)
+    openai_request = _parse_response_request(body)
 
     try:
         kwargs = {}
@@ -869,8 +1026,60 @@ async def responses_endpoint(request: Request):
             _response_chain_items(openai_request.previous_response_id)
             + current_input_items
         )
+        tenant = _read_tenant_id(request)
+        context = compaction.resolve_context(
+            prompt_items, model=openai_request.model, tenant=tenant
+        )
+        prompt_items, triggered = compaction.split_trigger(context.items)
+        if triggered:
+            return await _responses_compaction_trigger(
+                openai_request, prompt_items, tenant, context.covered
+            )
+        compaction_output = []
+        deferred_compaction = bool(
+            openai_request.stream and openai_request.context_management
+        )
+        compaction_args = None
+        if openai_request.context_management:
+            model, processor, config = get_cached_model(
+                openai_request.model, _adapter_path_or_inherit(openai_request)
+            )
+            compaction_args = (
+                openai_request,
+                prompt_items,
+                model,
+                processor,
+                config,
+                tenant,
+            )
+        compaction_options = dict(
+            build_gen_args=_build_gen_args,
+            apply_chat_template=apply_chat_template,
+            generate=generate,
+            automatic=True,
+            covered=context.covered,
+        )
+
+        def apply_compaction(result):
+            if not result.changed:
+                return result.items, []
+            return result.items, [
+                compaction.seal(
+                    result.items,
+                    model=openai_request.model,
+                    tenant=tenant,
+                    covered=result.covered,
+                )
+            ]
+
+        if compaction_args and not deferred_compaction:
+            prompt_items, compaction_output = apply_compaction(
+                await compaction.compact_response_context(
+                    *compaction_args, **compaction_options
+                )
+            )
         chat_messages, images = _response_items_to_chat(prompt_items)
-        instructions = _normalize_response_instruction_messages(
+        instructions = _normalize_instruction_messages(
             chat_messages,
             openai_request.instructions,
         )
@@ -900,14 +1109,29 @@ async def responses_endpoint(request: Request):
         if openai_request.tool_choice is not None:
             template_kwargs["tool_choice"] = openai_request.tool_choice
 
-        formatted_prompt = apply_chat_template(
-            processor,
-            config,
-            chat_messages,
-            num_images=len(images),
-            tools=chat_tools or None,
-            **template_kwargs,
-        )
+        def render_prompt(items):
+            messages, images = _response_items_to_chat(items)
+            _normalize_instruction_messages(messages, openai_request.instructions)
+            _ensure_effective_input(messages, images=images)
+            prompt = apply_chat_template(
+                processor,
+                config,
+                messages,
+                num_images=len(images),
+                tools=chat_tools or None,
+                **template_kwargs,
+            )
+            thinking = prompt_has_open_thinking(
+                prompt,
+                gen_args.enable_thinking,
+                gen_args.thinking_start_token,
+                gen_args.thinking_end_token,
+            )
+            return prompt, images, thinking
+
+        formatted_prompt, starts_in_thinking = None, False
+        if not deferred_compaction:
+            formatted_prompt, images, starts_in_thinking = render_prompt(prompt_items)
 
         logger.debug(
             "responses request: model=%s images=%d max_tokens=%s temp=%s stream=%s",
@@ -929,16 +1153,18 @@ async def responses_endpoint(request: Request):
                 model=openai_request.model,
                 stream=True,
             )
-            await _preflight_stream_context_budget(
-                endpoint="/responses",
-                model=openai_request.model,
-                prompt=formatted_prompt,
-                images=images if images else None,
-                audio=None,
-                args=gen_args,
-            )
+            if not deferred_compaction:
+                await _preflight_stream_context_budget(
+                    endpoint="/responses",
+                    model=openai_request.model,
+                    prompt=formatted_prompt,
+                    images=images if images else None,
+                    audio=None,
+                    args=gen_args,
+                )
 
             async def stream_generator():
+                nonlocal formatted_prompt, images, starts_in_thinking, compaction_output
                 token_iterator = None
                 token_iter = None  # For ResponseGenerator cleanup
                 metrics_finalized = False
@@ -973,21 +1199,114 @@ async def responses_endpoint(request: Request):
                     # Send response.in_progress event  (to match the openai pipeline)
                     yield f"event: response.in_progress\ndata: {ResponseInProgressEvent(type='response.in_progress', response=base_response).model_dump_json()}\n\n"
 
-                    # Send response.output_item.added event  (to match the openai pipeline)
-                    message_item = MessageItem(
-                        id=message_id,
-                        type="message",
-                        status="in_progress",
-                        role="assistant",
-                        content=[],
-                    )
-                    yield f"event: response.output_item.added\ndata: {ResponseOutputItemAddedEvent(type='response.output_item.added', output_index=0, item=message_item).model_dump_json()}\n\n"
+                    if deferred_compaction:
+                        async with aclosing(
+                            compaction.stream_response_context(
+                                *compaction_args, **compaction_options
+                            )
+                        ) as progress:
+                            async for update in progress:
+                                if isinstance(update, compaction.CompactedContext):
+                                    items, compaction_output = apply_compaction(update)
+                                    formatted_prompt, images, starts_in_thinking = (
+                                        render_prompt(items)
+                                    )
+                                else:
+                                    yield _response_sse_event(
+                                        update["type"],
+                                        {**update, "response_id": response_id},
+                                    )
+                        await _preflight_stream_context_budget(
+                            endpoint="/responses",
+                            model=openai_request.model,
+                            prompt=formatted_prompt,
+                            images=images or None,
+                            audio=None,
+                            args=gen_args,
+                        )
 
-                    # Send response.content_part.added event
-                    content_part = ContentPartOutputText(
-                        type="output_text", text="", annotations=[]
-                    )
-                    yield f"event: response.content_part.added\ndata: {ResponseContentPartAddedEvent(type='response.content_part.added', item_id=message_id, output_index=0, content_index=0, part=content_part).model_dump_json()}\n\n"
+                    for index, item in enumerate(compaction_output):
+                        for event_type in (
+                            "response.output_item.added",
+                            "response.output_item.done",
+                        ):
+                            yield _response_sse_event(
+                                event_type,
+                                {
+                                    "type": event_type,
+                                    "output_index": index,
+                                    "item": item,
+                                },
+                            )
+
+                    output_indices = {}
+                    pending_whitespace = {}
+
+                    def start_output_item(item):
+                        item_id = item["id"]
+                        if item_id in output_indices:
+                            return
+                        index = len(compaction_output) + len(output_indices)
+                        output_indices[item_id] = index
+                        pending = {**item, "status": "in_progress"}
+                        if item["type"] == "message":
+                            pending["content"] = []
+                        elif item["type"] == "reasoning":
+                            pending["summary"] = []
+                        yield _response_sse_event(
+                            "response.output_item.added",
+                            {
+                                "type": "response.output_item.added",
+                                "output_index": index,
+                                "item": pending,
+                            },
+                        )
+                        if item["type"] == "message":
+                            part = ContentPartOutputText(
+                                type="output_text", text="", annotations=[]
+                            )
+                            yield f"event: response.content_part.added\ndata: {ResponseContentPartAddedEvent(type='response.content_part.added', item_id=item_id, output_index=index, content_index=0, part=part).model_dump_json()}\n\n"
+
+                    def stream_delta(kind, delta, rate):
+                        if kind == "reasoning":
+                            item = {
+                                "id": reasoning_item_id,
+                                "type": "reasoning",
+                                "summary": [],
+                            }
+                            event_type = "response.reasoning_text.delta"
+                        else:
+                            item = {
+                                "id": message_id,
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [],
+                            }
+                            event_type = "response.output_text.delta"
+                        text = pending_whitespace.get(kind, "") + delta
+                        if item["id"] not in output_indices:
+                            text = text.lstrip()
+                        delta = text.rstrip()
+                        pending_whitespace[kind] = text[len(delta) :]
+                        if not delta:
+                            return
+                        yield from start_output_item(item)
+                        yield _response_sse_event(
+                            event_type,
+                            {
+                                "type": event_type,
+                                "item_id": item["id"],
+                                "output_index": output_indices[item["id"]],
+                                "content_index": 0,
+                                "delta": delta,
+                                "timings": {"predicted_per_second": rate},
+                                **(
+                                    {"response_id": response_id}
+                                    if kind == "reasoning"
+                                    else {}
+                                ),
+                            },
+                        )
 
                     # Stream text deltas using ResponseGenerator (continuous batching)
                     full_text = ""
@@ -1005,12 +1324,7 @@ async def responses_endpoint(request: Request):
                     tool_call_state = ToolCallStreamState(tc_start, tc_end)
                     thinking_state = make_response_stream_state(
                         processor,
-                        prompt_has_open_thinking(
-                            formatted_prompt,
-                            gen_args.enable_thinking,
-                            gen_args.thinking_start_token,
-                            gen_args.thinking_end_token,
-                        ),
+                        starts_in_thinking,
                         gen_args.thinking_start_token,
                         gen_args.thinking_end_token,
                     )
@@ -1050,18 +1364,10 @@ async def responses_endpoint(request: Request):
                             )
                             if thinking_delta.reasoning:
                                 streamed_reasoning += thinking_delta.reasoning
-                                yield _response_sse_event(
-                                    "response.reasoning_text.delta",
-                                    {
-                                        "type": "response.reasoning_text.delta",
-                                        "response_id": response_id,
-                                        "item_id": reasoning_item_id,
-                                        "output_index": 0,
-                                        "content_index": 0,
-                                        "delta": thinking_delta.reasoning,
-                                        "timings": {"predicted_per_second": chunk_rate},
-                                    },
-                                )
+                                for event in stream_delta(
+                                    "reasoning", thinking_delta.reasoning, chunk_rate
+                                ):
+                                    yield event
                             delta = thinking_delta.content
                             delta = tool_call_state.feed(
                                 delta, last=bool(token.finish_reason)
@@ -1072,7 +1378,8 @@ async def responses_endpoint(request: Request):
                             }
 
                             if delta:
-                                yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta, timings=StreamingTimings(predicted_per_second=chunk_rate)).model_dump_json()}\n\n"
+                                for event in stream_delta("message", delta, chunk_rate):
+                                    yield event
                                 await asyncio.sleep(0.01)
 
                             if token.finish_reason:
@@ -1104,18 +1411,10 @@ async def responses_endpoint(request: Request):
                             )
                             if thinking_delta.reasoning:
                                 streamed_reasoning += thinking_delta.reasoning
-                                yield _response_sse_event(
-                                    "response.reasoning_text.delta",
-                                    {
-                                        "type": "response.reasoning_text.delta",
-                                        "response_id": response_id,
-                                        "item_id": reasoning_item_id,
-                                        "output_index": 0,
-                                        "content_index": 0,
-                                        "delta": thinking_delta.reasoning,
-                                        "timings": {"predicted_per_second": chunk_rate},
-                                    },
-                                )
+                                for event in stream_delta(
+                                    "reasoning", thinking_delta.reasoning, chunk_rate
+                                ):
+                                    yield event
                             delta = thinking_delta.content
                             delta = tool_call_state.feed(delta, last=bool(chunk_finish))
                             if chunk_finish is not None:
@@ -1126,8 +1425,22 @@ async def responses_endpoint(request: Request):
                             }
 
                             if delta:
-                                yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta, timings=StreamingTimings(predicted_per_second=chunk_rate)).model_dump_json()}\n\n"
+                                for event in stream_delta("message", delta, chunk_rate):
+                                    yield event
                                 await asyncio.sleep(0.01)
+
+                    tail_reasoning, tail = finish_content_streams(
+                        thinking_state, tool_call_state
+                    )
+                    if tail_reasoning:
+                        streamed_reasoning += tail_reasoning
+                        for event in stream_delta(
+                            "reasoning", tail_reasoning, metrics.rate
+                        ):
+                            yield event
+                    if tail:
+                        for event in stream_delta("message", tail, metrics.rate):
+                            yield event
 
                     output_items, clean_text, _, output_finish_reason = (
                         _response_output_items_from_text(
@@ -1140,88 +1453,67 @@ async def responses_endpoint(request: Request):
                             gen_args.thinking_end_token,
                             reasoning_item_id,
                             processor=processor,
+                            starts_in_thinking=starts_in_thinking,
                         )
                     )
-                    tool_output_items = [
-                        item
-                        for item in output_items
-                        if item.get("type") not in ("message", "reasoning")
-                    ]
-                    reasoning_output_items = [
-                        item for item in output_items if item.get("type") == "reasoning"
-                    ]
-                    if streamed_reasoning:
-                        yield _response_sse_event(
-                            "response.reasoning_text.done",
-                            {
-                                "type": "response.reasoning_text.done",
-                                "response_id": response_id,
-                                "item_id": reasoning_item_id,
-                                "output_index": 0,
-                                "content_index": 0,
-                                "text": streamed_reasoning,
-                            },
-                        )
-
-                    # Send response.output_text.done event (to match the openai pipeline)
-                    yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=0, content_index=0, text=clean_text, timings=StreamingTimings(predicted_per_second=metrics.rate)).model_dump_json()}\n\n"
-
-                    # Send response.content_part.done event (to match the openai pipeline)
-                    final_content_part = ContentPartOutputText(
-                        type="output_text", text=clean_text, annotations=[]
-                    )
-                    yield f"event: response.content_part.done\ndata: {ResponseContentPartDoneEvent(type='response.content_part.done', item_id=message_id, output_index=0, content_index=0, part=final_content_part).model_dump_json()}\n\n"
-
-                    # Send response.output_item.done event (to match the openai pipeline)
-                    final_message_item = MessageItem(
-                        id=message_id,
-                        type="message",
-                        status="completed",
-                        role="assistant",
-                        content=[final_content_part] if clean_text else [],
-                    )
-                    message_output_items = [
-                        item for item in output_items if item.get("type") == "message"
-                    ]
-                    final_message_payload = (
-                        message_output_items[0]
-                        if message_output_items
-                        else final_message_item.model_dump()
-                    )
-                    yield f"event: response.output_item.done\ndata: {ResponseOutputItemDoneEvent(type='response.output_item.done', output_index=0, item=final_message_payload).model_dump_json()}\n\n"
-
-                    completed_output = []
-                    completed_output.extend(reasoning_output_items)
-                    if message_output_items:
-                        completed_output.extend(message_output_items)
-                    elif clean_text:
-                        completed_output.append(final_message_item.model_dump())
-                    tool_start_index = len(completed_output)
-                    completed_output.extend(tool_output_items)
-                    for output_index, tool_item in enumerate(
-                        tool_output_items, start=tool_start_index
+                    if clean_text and not any(
+                        item["type"] == "message" for item in output_items
                     ):
-                        yield _response_sse_event(
-                            "response.output_item.added",
+                        output_items.insert(
+                            sum(item["type"] == "reasoning" for item in output_items),
                             {
-                                "type": "response.output_item.added",
-                                "output_index": output_index,
-                                "item": tool_item,
+                                "id": message_id,
+                                "type": "message",
+                                "status": "completed",
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "output_text",
+                                        "text": clean_text,
+                                        "annotations": [],
+                                    }
+                                ],
                             },
                         )
-                        if tool_item.get("type") == "function_call":
+                    completed_output = list(compaction_output)
+                    for item in sorted(
+                        output_items,
+                        key=lambda item: output_indices.get(item["id"], float("inf")),
+                    ):
+                        for event in start_output_item(item):
+                            yield event
+                        output_index = output_indices[item["id"]]
+                        completed_output.append(item)
+                        if item["type"] == "reasoning" and streamed_reasoning:
+                            yield _response_sse_event(
+                                "response.reasoning_text.done",
+                                {
+                                    "type": "response.reasoning_text.done",
+                                    "response_id": response_id,
+                                    "item_id": item["id"],
+                                    "output_index": output_index,
+                                    "content_index": 0,
+                                    "text": streamed_reasoning.strip(),
+                                },
+                            )
+                        elif item["type"] == "message":
+                            yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=output_index, content_index=0, text=clean_text, timings=StreamingTimings(predicted_per_second=metrics.rate)).model_dump_json()}\n\n"
+                            final_content_part = ContentPartOutputText(
+                                type="output_text", text=clean_text, annotations=[]
+                            )
+                            yield f"event: response.content_part.done\ndata: {ResponseContentPartDoneEvent(type='response.content_part.done', item_id=message_id, output_index=output_index, content_index=0, part=final_content_part).model_dump_json()}\n\n"
+                        elif item["type"] == "function_call":
                             yield _response_sse_event(
                                 "response.function_call_arguments.done",
                                 {
                                     "type": "response.function_call_arguments.done",
                                     "response_id": response_id,
-                                    "item_id": tool_item.get("id")
-                                    or tool_item.get("call_id"),
+                                    "item_id": item["id"],
                                     "output_index": output_index,
-                                    "call_id": tool_item.get("call_id"),
-                                    "name": tool_item.get("name"),
-                                    "arguments": tool_item.get("arguments") or "{}",
-                                    "item": tool_item,
+                                    "call_id": item.get("call_id"),
+                                    "name": item.get("name"),
+                                    "arguments": item.get("arguments") or "{}",
+                                    "item": item,
                                 },
                             )
                         yield _response_sse_event(
@@ -1229,7 +1521,7 @@ async def responses_endpoint(request: Request):
                             {
                                 "type": "response.output_item.done",
                                 "output_index": output_index,
-                                "item": tool_item,
+                                "item": item,
                             },
                         )
 
@@ -1294,8 +1586,7 @@ async def responses_endpoint(request: Request):
                         )
                         metrics_finalized = True
                     logger.exception("Responses stream generation failed: %s", e)
-                    error_data = json.dumps({"error": str(e)})
-                    yield f"data: {error_data}\n\n"
+                    yield _response_stream_error(e, base_response)
 
                 finally:
                     if token_iter is not None:
@@ -1399,11 +1690,13 @@ async def responses_endpoint(request: Request):
                         gen_args.thinking_start_token,
                         gen_args.thinking_end_token,
                         processor=processor,
+                        starts_in_thinking=starts_in_thinking,
                     )
                 )
                 if output_finish_reason == "tool_calls":
                     finish_reason = "tool_calls"
 
+                output_items = compaction_output + output_items
                 response = OpenAIResponse(
                     id=response_id,
                     object="response",
@@ -1520,6 +1813,43 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             else _INHERIT_ADAPTER
         )
 
+        if request.context_management != []:
+            _prepare_chat_tool_choice([], request.tools, request.tool_choice)
+            model, processor, config = get_cached_model(request.model, adapter_path)
+            if request.context_management or (
+                compaction._context_limit(config, required=False) is not None
+                and all(
+                    compaction.supports_content(message.content)
+                    for message in request.messages
+                )
+            ):
+                result = await compaction.compact_response_context(
+                    request,
+                    [
+                        {**message.model_dump(exclude_none=True), "type": "message"}
+                        for message in request.messages
+                    ],
+                    model,
+                    processor,
+                    config,
+                    _read_tenant_id(http_request),
+                    build_gen_args=_build_gen_args,
+                    apply_chat_template=apply_chat_template,
+                    generate=generate,
+                    automatic=True,
+                )
+                if result.changed:
+                    request = request.model_copy(
+                        update={
+                            "messages": [
+                                ChatMessage.model_validate(
+                                    {k: v for k, v in item.items() if k != "type"}
+                                )
+                                for item in result.items
+                            ]
+                        }
+                    )
+
         kwargs = {}
 
         if request.resize_shape is not None:
@@ -1539,11 +1869,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
         videos = []
         processed_messages = []
         for message in request.messages:
-            msg = {"role": message.role}
-
-            if isinstance(message.content, str):
-                msg["content"] = message.content
-            elif isinstance(message.content, list):
+            if isinstance(message.content, list):
                 if message.role == "user":
                     for item in message.content:
                         if not isinstance(item, dict):
@@ -1559,38 +1885,11 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             video = _extract_video_reference(item)
                             if video:
                                 videos.append(video)
-                msg["content"] = extract_text_from_content(message.content)
-            else:
-                msg["content"] = message.content
+            processed_messages.append(
+                _chat_message_to_prompt(message.model_dump(exclude_none=True))
+            )
 
-            # Preserve tool-calling metadata.
-            # Ensure arguments are dicts (not JSON strings) for Jinja templates
-            # that iterate them with |items (e.g. Qwen3.5).
-            if message.tool_calls is not None:
-                normalized_calls = []
-                for tc in message.tool_calls:
-                    tc = dict(tc) if isinstance(tc, dict) else tc
-                    if isinstance(tc, dict) and "function" in tc:
-                        fn = dict(tc["function"])
-                        args = fn.get("arguments", {})
-                        if isinstance(args, str):
-                            try:
-                                fn["arguments"] = json.loads(args)
-                            except (json.JSONDecodeError, TypeError):
-                                fn["arguments"] = {}
-                        tc["function"] = fn
-                    normalized_calls.append(tc)
-                msg["tool_calls"] = normalized_calls
-            if message.tool_call_id is not None:
-                msg["tool_call_id"] = message.tool_call_id
-            if message.name is not None:
-                msg["name"] = message.name
-            if message.reasoning_content is not None:
-                msg["reasoning_content"] = message.reasoning_content
-                msg["reasoning"] = message.reasoning_content
-
-            processed_messages.append(msg)
-
+        _normalize_instruction_messages(processed_messages)
         _ensure_effective_input(processed_messages, images=images, audio=audio)
 
         processed_messages, tools, tool_choice = _prepare_chat_tool_choice(
@@ -1802,6 +2101,29 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 finish_reason = token.finish_reason
                                 break
 
+                        tail_reasoning, tail = finish_content_streams(
+                            thinking_state, tool_call_state
+                        )
+                        if tail or tail_reasoning:
+                            chunk_data = ChatStreamChunk(
+                                id=request_id,
+                                created=int(time.time()),
+                                model=request.model,
+                                choices=[
+                                    ChatStreamChoice(
+                                        delta=ChatMessage(
+                                            role="assistant",
+                                            content=tail,
+                                            reasoning=tail_reasoning,
+                                        )
+                                    )
+                                ],
+                                timings=StreamingTimings(
+                                    predicted_per_second=metrics.rate
+                                ),
+                            )
+                            yield f"data: {chunk_data.model_dump_json()}\n\n"
+
                         # Parse tool calls from full output and emit final chunk
                         terminal_emitted = False
                         if tool_module is not None:
@@ -1875,6 +2197,10 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
                         )
+                        tool_call_state = ToolCallStreamState(
+                            tool_module.tool_call_start if tool_module else None,
+                            tool_module.tool_call_end if tool_module else None,
+                        )
                         for chunk in token_iterator:
                             if chunk is None or not hasattr(chunk, "text"):
                                 continue
@@ -1890,12 +2216,15 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             thinking_delta = thinking_state.feed(
                                 chunk.text, last=bool(chunk_finish)
                             )
-                            if thinking_delta.content or thinking_delta.reasoning:
+                            delta_content = tool_call_state.feed(
+                                thinking_delta.content, last=bool(chunk_finish)
+                            )
+                            if delta_content or thinking_delta.reasoning:
                                 choices = [
                                     ChatStreamChoice(
                                         delta=ChatMessage(
                                             role="assistant",
-                                            content=thinking_delta.content,
+                                            content=delta_content,
                                             reasoning=thinking_delta.reasoning,
                                         )
                                     )
@@ -1913,13 +2242,62 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 yield f"data: {chunk_data.model_dump_json()}\n\n"
                                 await asyncio.sleep(0.01)
 
-                        finish_reason = finish_reason or "stop"
-                        chunk_data = _final_chat_chunk(
-                            request_id,
-                            request.model,
-                            finish_reason,
-                            metrics.rate,
+                        tail_reasoning, tail = finish_content_streams(
+                            thinking_state, tool_call_state
                         )
+                        if tail or tail_reasoning:
+                            chunk_data = ChatStreamChunk(
+                                id=request_id,
+                                created=int(time.time()),
+                                model=request.model,
+                                choices=[
+                                    ChatStreamChoice(
+                                        delta=ChatMessage(
+                                            role="assistant",
+                                            content=tail,
+                                            reasoning=tail_reasoning,
+                                        )
+                                    )
+                                ],
+                                timings=StreamingTimings(
+                                    predicted_per_second=metrics.rate
+                                ),
+                            )
+                            yield f"data: {chunk_data.model_dump_json()}\n\n"
+
+                        tc = (
+                            process_tool_calls(output_text, tool_module, tools)
+                            if tool_module is not None
+                            else None
+                        )
+                        if tc is not None and tc.calls:
+                            tool_calls_made = True
+                            finish_reason = "tool_calls"
+                            chunk_data = ChatStreamChunk(
+                                id=request_id,
+                                created=int(time.time()),
+                                model=request.model,
+                                choices=[
+                                    ChatStreamChoice(
+                                        finish_reason="tool_calls",
+                                        delta=ChatMessage(
+                                            role="assistant",
+                                            tool_calls=tc.calls,
+                                        ),
+                                    )
+                                ],
+                                timings=StreamingTimings(
+                                    predicted_per_second=metrics.rate
+                                ),
+                            )
+                        else:
+                            finish_reason = finish_reason or "stop"
+                            chunk_data = _final_chat_chunk(
+                                request_id,
+                                request.model,
+                                finish_reason,
+                                metrics.rate,
+                            )
                         yield f"data: {chunk_data.model_dump_json()}\n\n"
                         if emit_usage:
                             chunk_data = _chat_usage_chunk(
@@ -2147,12 +2525,15 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
                         )
-                        if clean_remaining:
-                            # Strip model control tokens
-                            clean_remaining = re.sub(
-                                r"<\|[^>]+\|>|<[^>]+>", "", clean_remaining
-                            ).strip()
-                        content = clean_remaining or None
+                        content = (
+                            strip_protocol_markers(
+                                clean_remaining,
+                                tool_module,
+                                gen_args.thinking_start_token,
+                                gen_args.thinking_end_token,
+                            )
+                            or None
+                        )
 
                 response_logprobs = None
                 if request.logprobs and collected_logprobs:

@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from threading import Lock
 from types import SimpleNamespace
-from typing import Annotated, List, Optional, Tuple
+from typing import Annotated, List, Literal, Optional, Tuple
 
 import mlx.core as mx
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
@@ -21,6 +21,7 @@ from starlette.requests import HTTPConnection
 from .. import apc as _apc
 from ..generate.edit_image import load_image_edit_model
 from ..generate.image import is_image_generation_model, load_image_generation_model
+from ..generate.image_defaults import ImageSamplingDefaults, resolve_image_defaults
 from ..reranker import RerankerKind, reranker_kind
 from ..structured import build_json_schema_logits_processor
 from ..tools import _infer_tool_parser_from_processor
@@ -29,6 +30,7 @@ from ..vision_cache import VisionFeatureCache
 from . import request_normalization as _request_normalization
 from .anthropic import register_routes as register_anthropic_routes
 from .audio import register_routes as register_audio_routes
+from .decisions import register_routes as register_decision_routes
 from .embeddings import register_routes as register_embeddings_routes
 from .generation import (
     GenerationArguments,
@@ -85,21 +87,11 @@ def _require_management_api_key(request: HTTPConnection) -> None:
 
 def _cache_group_for_cache(cache: dict) -> str:
     model_kind = cache.get("model_kind")
-    if model_kind == "image_generation":
-        return "image_generation"
-    if model_kind == "image_edit":
-        return "image_edit"
     if model_kind == "audio_tts":
         return "tts"
     if model_kind == "audio_stt":
         return "stt"
-    if model_kind == "audio":
-        return "audio"
-    if model_kind == "embedding":
-        return "embedding"
-    if model_kind == "reranker":
-        return "reranker"
-    return "text_generation"
+    return model_kind or "text_generation"
 
 
 def _model_info(model_id: str, created: int, *, loaded: bool = False) -> dict:
@@ -367,9 +359,43 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+def _reject_native_chat_model_for_audio(model_path: str) -> None:
+    """Reject chat/multimodal checkpoints pointed at the ``/v1/audio/*`` endpoints.
+
+    ``mlx_audio``'s loader autodetects an audio category partly from repo-name tokens
+    (its tts/stt models are named after backbones like ``qwen3``/``llama``/``glm``), so a
+    chat/omni model such as Qwen3-Omni is misrouted into a flat audio config and dies with
+    an opaque ``TypeError`` that surfaces as a 500. Gate on the config ``model_type`` instead:
+    if it resolves to one of mlx-vlm's own model families and ``mlx_audio`` does not recognize
+    the type as a genuine audio model, raise ``ValueError`` so the caller maps it to a 400.
+    """
+    from mlx_audio.utils import get_model_category
+
+    from ..utils import get_model_and_args, get_model_path, load_config
+
+    config = load_config(get_model_path(model_path, allow_patterns=["*.json"]))
+
+    raw_type = (config.get("model_type") or "").lower()
+    if raw_type and get_model_category(raw_type, [raw_type]):
+        return
+
+    try:
+        _, model_type = get_model_and_args(config)
+    except Exception:
+        return
+
+    raise ValueError(
+        f"{model_path!r} is a chat/multimodal model that mlx-vlm serves natively "
+        f"(model_type={model_type!r}); the /v1/audio/* endpoints only support dedicated "
+        "speech-to-text/text-to-speech checkpoints. To use audio with this model, send "
+        "POST /v1/chat/completions with an 'input_audio' content part."
+    )
+
+
 def load_audio_model(model_path: str):
     from mlx_audio.utils import load_model
 
+    _reject_native_chat_model_for_audio(model_path)
     return load_model(model_path)
 
 
@@ -416,6 +442,12 @@ async def lifespan(app):
             None,
             "reranker",
             "reranker model",
+        ),
+        (
+            os.environ.pop("MLX_VLM_PRELOAD_DECISION_MODEL", None),
+            None,
+            "decision",
+            "decision model",
         ),
     )
     runtime.preload_failures.clear()
@@ -549,6 +581,7 @@ def get_cached_model(
     load_as_audio = _audio_model_kind(model_kind)
     load_as_embedding = model_kind == "embedding"
     load_as_reranker = model_kind == "reranker"
+    load_as_decision = model_kind == "decision"
     load_as_image = model_kind == "image_generation" or (
         model_kind == "auto" and is_image_generation_model(model_path)
     )
@@ -564,6 +597,9 @@ def get_cached_model(
     elif load_as_reranker:
         cache_group = "reranker"
         effective_model_kind = "reranker"
+    elif load_as_decision:
+        cache_group = "decision"
+        effective_model_kind = "decision"
     elif load_as_image:
         cache_group = "image_generation"
         effective_model_kind = "image_generation"
@@ -713,6 +749,42 @@ def get_cached_model(
         }
         registry.set(cache_group, cache)
         return model, None, config
+
+    if load_as_decision:
+        from ..utils import load
+
+        if adapter_path is not None:
+            raise HTTPException(
+                status_code=400, detail="Decision adapters are not supported"
+            )
+        try:
+            model, processor = load(model_path)
+            if not getattr(model, "decision_types", ()):
+                raise ValueError("This model does not support decision prediction")
+        except RepositoryNotFoundError as error:
+            raise HTTPException(
+                status_code=404, detail=f"Model not found: {model_path}"
+            ) from error
+        except (FileNotFoundError, ValueError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except Exception as error:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to load decision model: {error}"
+            ) from error
+        config = model.config
+        registry.set(
+            cache_group,
+            {
+                "cache_key": cache_key,
+                "model_path": model_path,
+                "adapter_path": None,
+                "model": model,
+                "processor": processor,
+                "config": config,
+                "model_kind": "decision",
+            },
+        )
+        return model, processor, config
 
     if load_as_embedding:
         if adapter_path is not None:
@@ -973,6 +1045,7 @@ register_anthropic_routes(inference_router, _protocol_deps)
 register_openai_routes(inference_router, _protocol_deps)
 register_audio_routes(inference_router, _protocol_deps)
 register_realtime_routes(inference_router, _protocol_deps)
+register_decision_routes(inference_router, _protocol_deps)
 register_embeddings_routes(inference_router, _protocol_deps)
 register_reranking_routes(inference_router, _protocol_deps)
 
@@ -1025,6 +1098,23 @@ def models_endpoint(
         "object": "list",
         "data": sorted(models.values(), key=lambda model: model["id"].lower()),
     }
+
+
+@inference_router.get("/images/defaults", response_model=ImageSamplingDefaults)
+@inference_router.get(
+    "/v1/images/defaults", response_model=ImageSamplingDefaults, include_in_schema=False
+)
+def image_defaults_endpoint(
+    model: Annotated[str, Query(min_length=1)],
+    task: Literal["generate", "edit"] = "generate",
+):
+    """Resolve sampling defaults using metadata only, without loading weights."""
+    try:
+        return resolve_image_defaults(model, task=task)
+    except NotImplementedError as error:
+        raise HTTPException(status_code=501, detail=str(error)) from error
+    except (ValueError, FileNotFoundError) as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
 
 
 app.include_router(inference_router)

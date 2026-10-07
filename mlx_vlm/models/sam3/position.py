@@ -205,7 +205,7 @@ def init_2d_freqs(
     freqs_y = mx.outer(grid_y, freqs)  # (H*W, half//2)
     freqs_x = mx.outer(grid_x, freqs)  # (H*W, half//2)
 
-    # Interleave y and x frequencies
-    freqs_all = mx.concatenate([freqs_y, freqs_x], axis=-1)  # (H*W, half)
+    # Match Meta's compute_axial_cis: x frequencies precede y frequencies.
+    freqs_all = mx.concatenate([freqs_x, freqs_y], axis=-1)  # (H*W, half)
 
     return mx.cos(freqs_all), mx.sin(freqs_all)
