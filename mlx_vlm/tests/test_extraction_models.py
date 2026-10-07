@@ -20,8 +20,9 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import pytest
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_map
 
+from mlx_vlm.decision import predict
 from mlx_vlm.models.bert import ModelConfig as BertConfig
 from mlx_vlm.models.bert import TokenClassificationModel as BertTokenClassifier
 from mlx_vlm.models.gliner2_5 import Model as GlinerModel
@@ -53,7 +54,7 @@ from mlx_vlm.token_classification import (
     load_token_classification_model,
     load_token_classifier,
 )
-from mlx_vlm.utils import get_model_and_args, load_config
+from mlx_vlm.utils import get_model_and_args, load, load_config
 
 EXTRACTION_DATA = json.loads(
     Path(__file__).with_name("extraction_cases.json").read_text()
@@ -2142,3 +2143,499 @@ class TestLayaDecisionModel(unittest.TestCase):
                     self.assertEqual(
                         result["answers"]["route"]["probabilities"]["B"], expected
                     )
+
+
+JEV_PROJECTIONS = {
+    "linear_attn": ("in_proj_qkv", "in_proj_z", "out_proj"),
+    "self_attn": ("q_proj", "k_proj", "v_proj", "o_proj"),
+    "mlp": ("gate_proj", "up_proj", "down_proj"),
+}
+
+
+def _jev_tokenizer(labels):
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
+    words = ["[UNK]", "[PAD]", "[", "]", ":", ")", "x", "y", "kind", "state"]
+    words += ["question", "options", "decision", "noul", "choice", "score"]
+    words += ["false", "true", *map(str, range(6)), *labels]
+    vocab = dict(zip(words, range(len(words))))
+    special = ["<|image_pad|>", "<|video_pad|>", "<|vision_start|>", "<|vision_end|>"]
+    vocab.update(zip(special, range(300, 304)))
+    backend = Tokenizer(models.WordLevel(vocab, unk_token="[UNK]"))
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    return PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        unk_token="[UNK]",
+        pad_token="[PAD]",
+        additional_special_tokens=special,
+    )
+
+
+def _jev_template(kind, state, question, lines):
+    """The prompt from the JEV model card, built independently of the implementation."""
+    return (
+        f"[kind] {kind}\n[state] {state}\n[question] {question}\n[options]\n"
+        + "\n".join(lines)
+        + "\n[decision]:"
+    )
+
+
+def _jev_adapter(model, folder, rank, used, verbalizers):
+    """Write a PEFT adapter in JEV's adapter_vllm layout with zero rank padding."""
+    mx.random.seed(3)
+    text = model.config.text_config
+    tensors = {}
+    for index, layer in enumerate(model.language_model.model.layers):
+        for block, names in JEV_PROJECTIONS.items():
+            parent = getattr(layer, block, None)
+            for name in names if parent is not None else ():
+                output_dims, input_dims = parent[name].linear.weight.shape
+                a = mx.random.normal((rank, input_dims)) * 0.2
+                b = mx.random.normal((output_dims, rank)) * 0.2
+                mask = (mx.arange(rank) < used).astype(a.dtype)
+                key = f"base_model.model.model.language_model.layers.{index}.{block}.{name}"
+                tensors[f"{key}.lora_A.weight"] = a * mask[:, None]
+                tensors[f"{key}.lora_B.weight"] = b * mask[None]
+    rows = mx.zeros((text.vocab_size,)).at[mx.array(verbalizers)].add(1.0)
+    tensors["base_model.model.lm_head.lora_A.weight"] = mx.random.normal(
+        (rank, text.hidden_size)
+    )
+    tensors["base_model.model.lm_head.lora_B.weight"] = (
+        mx.random.normal((text.vocab_size, rank)) * rows[:, None]
+    )
+    folder.mkdir(parents=True)
+    mx.save_safetensors(str(folder / "adapter_model.safetensors"), tensors)
+    targets = sorted({n for names in JEV_PROJECTIONS.values() for n in names})
+    (folder / "adapter_config.json").write_text(
+        json.dumps({"r": rank, "lora_alpha": 2 * rank, "target_modules": targets})
+    )
+    return tensors
+
+
+class TestJevDecisionModel(unittest.TestCase):
+    def setUp(self):
+        self.labels = _extraction_config("jev")["decision_config"]["choice_labels"]
+
+    def _model(self, seed=0):
+        mx.random.seed(seed)
+        model = _extraction_model("jev")
+        model.update(
+            tree_map(
+                lambda value: mx.random.normal(value.shape) * 0.1,
+                model.parameters(),
+            )
+        )
+        return model
+
+    def test_base_checkpoint_keys_map_to_the_adapter_projections(self):
+        model = self._model()
+        expected = {
+            key: mx.arange(value.size, dtype=value.dtype).reshape(value.shape)
+            for key, value in tree_flatten(model.parameters())
+        }
+        source = {
+            key.replace(".linear.", "."): value for key, value in expected.items()
+        }
+        converted = model.sanitize(source)
+        _assert_weights_equal(converted, expected)
+        _assert_weights_equal(model.sanitize(dict(converted)), expected)
+        model.load_weights(list(converted.items()), strict=True)
+
+    def test_quantized_base_keeps_adapter_and_head_in_full_precision(self):
+        model = self._model()
+        weights = dict(tree_flatten(model.parameters()))
+        nn.quantize(
+            model,
+            group_size=32,
+            bits=4,
+            class_predicate=lambda path, module: hasattr(module, "to_quantized")
+            and path.startswith("language_model.model.layers")
+            and module.weight.shape[-1] % 32 == 0,
+        )
+        projection = model.language_model.model.layers[1].mlp.down_proj
+        self.assertIsInstance(projection.linear, nn.QuantizedLinear)
+        self.assertEqual(
+            projection.lora_a.shape,
+            weights["language_model.model.layers.1.mlp.down_proj.lora_a"].shape,
+        )
+        self.assertEqual(model.decision_head.weight.dtype, mx.float32)
+        self.assertEqual(
+            model.quantization_path_aliases(
+                "language_model.model.layers.1.self_attn.q_proj.linear"
+            ),
+            (
+                "language_model.model.layers.1.self_attn.q_proj",
+                "model.layers.1.self_attn.q_proj",
+            ),
+        )
+        self.assertFalse(model.cast_predicate("decision_head.weight"))
+        self.assertFalse(
+            model.cast_predicate("language_model.model.layers.0.linear_attn.A_log")
+        )
+
+    def test_system_one_switches_the_adapter_on_only_for_decisions(self):
+        from mlx_vlm.models.jev.jev import SystemOneLinear
+
+        model = self._model()
+        projection = model.language_model.model.layers[0].mlp.down_proj
+        self.assertIsInstance(projection, SystemOneLinear)
+        x = mx.random.normal((1, 3, projection.lora_a.shape[0]))
+        base = projection.linear(x)
+        self.assertTrue(mx.array_equal(projection(x), base))
+        with model.system_one():
+            expected = base + projection.scale * (
+                (x @ projection.lora_a) @ projection.lora_b
+            )
+            self.assertTrue(mx.allclose(projection(x), expected, atol=1e-5))
+        self.assertTrue(mx.array_equal(projection(x), base))
+        with self.assertRaises(ValueError):
+            with model.system_one():
+                raise ValueError("decision failed")
+        self.assertFalse(projection.enabled)
+
+    def test_prompt_matches_the_published_template(self):
+        from mlx_vlm.models.jev.jev import Jev
+
+        model = self._model()
+        jev = Jev(model, _jev_tokenizer(self.labels))
+        questions = {
+            "team": {
+                "type": "choice",
+                "instructions": "Which team?",
+                "criteria": {"billing": "charges and refunds", "shipping": None},
+            },
+            "refund": {"type": "bool", "instructions": "Refund?"},
+            "urgency": {
+                "type": "score",
+                "instructions": "Rate urgency on a 0-5 scale.",
+                "criteria": list("abcdef"),
+            },
+        }
+        state = {"ticket": "charged twice"}
+        rendered = [jev._question(spec) for spec in questions.values()]
+        text = json.dumps(state)
+        self.assertEqual(
+            [q["head"] + text + q["tail"] for q in rendered],
+            [
+                _jev_template(
+                    "choice",
+                    text,
+                    "Which team?",
+                    ["A) billing: charges and refunds", "B) shipping"],
+                ),
+                _jev_template("noul", text, "Refund?", ["false", "true"]),
+                _jev_template(
+                    "score",
+                    text,
+                    "Rate urgency on a 0-5 scale.",
+                    list("012345"),
+                ),
+            ],
+        )
+        self.assertEqual(jev._state(state), ([text], []))
+        self.assertEqual(
+            jev._state(["a", {"image": "x.png"}, {"k": 1}]),
+            (["a", None, '{"k": 1}'], ["x.png"]),
+        )
+
+    def test_choices_beyond_the_trained_slots_use_wide_label_rows(self):
+        from mlx_vlm.models.jev.jev import _rows
+
+        slots = {"noul": (0, 2), "score": (2, 8), "choice": (8, 24)}
+        self.assertEqual(_rows("noul", 2, slots), [0, 1])
+        self.assertEqual(_rows("score", 6, slots), list(range(2, 8)))
+        self.assertEqual(_rows("choice", 3, slots), [8, 9, 10])
+        self.assertEqual(_rows("choice", 19, slots), list(range(8, 27)))
+
+        model = self._model()
+        options = [f"option {i}" for i in range(len(self.labels))]
+        result = predict(
+            model,
+            _jev_tokenizer(self.labels),
+            "text",
+            {"pick": {"type": "choice", "instructions": "Pick", "criteria": options}},
+        )
+        answer = result["answers"]["pick"]
+        self.assertEqual(answer["metadata"]["adaptation"], "wide-labels")
+        self.assertAlmostEqual(sum(answer["probabilities"].values()), 1, places=3)
+        with self.assertRaises(ValueError):
+            predict(
+                model,
+                _jev_tokenizer(self.labels),
+                "text",
+                {
+                    "pick": {
+                        "type": "choice",
+                        "instructions": "Pick",
+                        "criteria": options + ["one more"],
+                    }
+                },
+            )
+
+    def test_rejects_questions_outside_the_trained_protocol(self):
+        model = self._model()
+        tokenizer = _jev_tokenizer(self.labels)
+        for question in (
+            {"type": "bool", "instructions": "Ok?", "criteria": {"true": "yes"}},
+            {"type": "score", "instructions": "Rate", "criteria": ["low", "high"]},
+            {"type": "choice", "instructions": "Pick", "criteria": ["a\nb", "c"]},
+            {"type": "choice", "instructions": "", "criteria": ["a", "b"]},
+            {"type": "noul", "instructions": "Ok?", "criteria": ["no", "yes"]},
+        ):
+            with self.subTest(question=question):
+                with self.assertRaises(ValueError):
+                    predict(model, tokenizer, "text", {"q": question})
+
+    def test_direct_model_calls_validate_questions(self):
+        from mlx_vlm.models.jev.jev import Jev
+
+        jev = Jev(self._model(), _jev_tokenizer(self.labels))
+        for question in (
+            {"type": "choice", "instructions": "Pick", "criteria": ["a"]},
+            {"type": "choice", "instructions": "Pick", "criteria": ["a", "a"]},
+            {"type": "choice", "instructions": "Pick"},
+            {
+                "type": "score",
+                "instructions": "Rate",
+                "criteria": dict.fromkeys("abcdef"),
+            },
+            {"type": "multi_label", "instructions": "Tags", "criteria": ["a", "b"]},
+        ):
+            with self.subTest(question=question):
+                with self.assertRaises(ValueError):
+                    jev._question(question)
+
+    def test_long_states_are_rejected_before_the_forward_pass(self):
+        model = self._model()
+        tokenizer = _jev_tokenizer(self.labels)
+        questions = {"ok": {"type": "bool", "instructions": "Ok?"}}
+        with self.assertRaises(ValueError):
+            predict(model, tokenizer, "x y " * 10, questions, max_state_tokens=8)
+        result = predict(
+            model, tokenizer, "x y " * 10, questions, max_state_tokens=None
+        )
+        self.assertIn("ok", result["answers"])
+
+    def test_decisions_hold_the_model_lock(self):
+        from unittest.mock import patch
+
+        from mlx_vlm.models.jev import jev as module
+
+        model = self._model()
+        seen = []
+        original = module.Jev.predict
+
+        def spy(jev, *args, **kwargs):
+            seen.append(model._decision_lock.locked())
+            return original(jev, *args, **kwargs)
+
+        with patch.object(module.Jev, "predict", spy):
+            predict(
+                model,
+                _jev_tokenizer(self.labels),
+                "x y",
+                {"ok": {"type": "bool", "instructions": "Ok?"}},
+            )
+        self.assertEqual(seen, [True])
+        self.assertFalse(model._decision_lock.locked())
+
+    def test_adapter_conversion_rejects_unknown_lora_tensors(self):
+        from mlx_vlm.models.jev.convert import adapter_lora
+
+        key = "base_model.model.model.language_model.layers.0.mlp.down_proj"
+        a, b = mx.ones((4, 3)), mx.ones((5, 4))
+        weights = {f"{key}.lora_A.weight": a, f"{key}.lora_B.weight": b}
+        lora, rank, scale = adapter_lora(weights, 8, 4)
+        self.assertEqual((rank, scale), (4, 2.0))
+        self.assertEqual(
+            lora["language_model.model.layers.0.mlp.down_proj.lora_a"].shape, (3, 4)
+        )
+        self.assertEqual(adapter_lora(weights, 8, 4, rslora=True)[2], 4.0)
+        adapter_lora({**weights, "base_model.model.lm_head.lora_A.weight": a}, 8, 4)
+        for extra in (
+            "base_model.model.model.mtp.layers.0.mlp.down_proj.lora_A.weight",
+            "base_model.model.model.visual.blocks.0.attn.qkv.lora_A.weight",
+        ):
+            with self.subTest(extra=extra):
+                with self.assertRaises(ValueError):
+                    adapter_lora({**weights, extra: a}, 8, 4)
+
+    def test_answers_do_not_depend_on_other_questions(self):
+        from mlx_vlm.models.jev.jev import Jev
+
+        model = self._model()
+        tokenizer = _jev_tokenizer(self.labels)
+        questions = {
+            "short": {"type": "bool", "instructions": "Ok?"},
+            "long": {
+                "type": "choice",
+                "instructions": "Which of these options fits the state best?",
+                "criteria": ["A", "B", "C", "D"],
+            },
+        }
+        with model.system_one():
+            _, together, _ = Jev(model, tokenizer).probabilities("x y", questions)
+            alone = [
+                Jev(model, tokenizer).probabilities("x y", {name: spec})[1][0]
+                for name, spec in questions.items()
+            ]
+        self.assertEqual(together, alone)
+
+    def test_image_states_expand_placeholders_and_reuse_features(self):
+        from PIL import Image
+
+        from mlx_vlm.models.jev.jev import Jev
+        from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLImageProcessor
+
+        model = self._model()
+        vision = model.config.vision_config
+        processor = SimpleNamespace(
+            tokenizer=_jev_tokenizer(self.labels),
+            image_processor=Qwen3VLImageProcessor(
+                patch_size=vision.patch_size,
+                merge_size=vision.spatial_merge_size,
+                temporal_patch_size=vision.temporal_patch_size,
+            ),
+        )
+        image = Image.new("RGB", (56, 56), (200, 30, 30))
+        state = ["look: ", {"image": image}, " and ", {"image": image}]
+        jev = Jev(model, processor)
+        pieces, images = jev._state(state)
+        encoded = jev._encode_images(images)
+        prompt = jev._image_prompt(
+            pieces, encoded, jev._question({"type": "bool", "instructions": "Red?"})
+        )
+        self.assertEqual(prompt.count(300), sum(encoded["counts"]))
+        self.assertEqual(prompt.count(302), 2)
+        with model.system_one():
+            _, probabilities, _ = jev.probabilities(
+                state,
+                {
+                    "red": {"type": "bool", "instructions": "Red?"},
+                    "count": {
+                        "type": "choice",
+                        "instructions": "How many?",
+                        "criteria": ["one", "two"],
+                    },
+                },
+            )
+        for p in probabilities:
+            self.assertAlmostEqual(sum(p), 1, places=5)
+
+    def test_converted_adapter_matches_the_published_client_side_math(self):
+        from mlx_vlm.models.jev.convert import adapter_lora, convert
+        from mlx_vlm.models.qwen3_5 import Model as Qwen35
+        from mlx_vlm.models.qwen3_5 import ModelConfig as Qwen35Config
+
+        tokenizer = _jev_tokenizer(self.labels)
+        words = ["false", "true", *map(str, range(6)), *self.labels[:16]]
+        verbalizers = tokenizer.convert_tokens_to_ids(words)
+        values = _extraction_config("jev")
+        values.pop("decision_config")
+        values["model_type"] = "qwen3_5"
+        mx.random.seed(1)
+        base = Qwen35(Qwen35Config.from_dict(values))
+        base.update(
+            tree_map(lambda v: mx.random.normal(v.shape) * 0.1, base.parameters())
+        )
+        model = self._model()
+        temperatures = {"noul": 1.1, "choice": 0.9, "score": 1.05}
+        bias = [0.01 * (i - 12) for i in range(24)]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base_dir, adapter_dir, out = root / "base", root / "jev", root / "out"
+            base_dir.mkdir()
+            mx.save_safetensors(
+                str(base_dir / "model.safetensors"),
+                dict(tree_flatten(base.parameters())),
+            )
+            (base_dir / "config.json").write_text(json.dumps(values))
+            tokenizer.save_pretrained(base_dir)
+            peft = _jev_adapter(model, adapter_dir / "adapter_vllm", 4, 2, verbalizers)
+            (adapter_dir / "calibration.json").write_text(
+                json.dumps({"per_kind": temperatures})
+            )
+            ranges = {"noul": [0, 2], "score": [2, 8], "choice": [8, 24]}
+            (adapter_dir / "adapter_vllm" / "decision_head.json").write_text(
+                json.dumps(
+                    {
+                        "bias": bias,
+                        "verbalizer_ids": verbalizers,
+                        "slots": {"ranges": ranges, "template_version": "bare-v1"},
+                    }
+                )
+            )
+            lora, rank, scale = adapter_lora(peft, 8, 4)
+            self.assertEqual((rank, scale), (2, 2.0))
+            convert(str(base_dir), str(adapter_dir), str(out))
+            loaded, _ = load(str(out))
+            config = json.loads((out / "config.json").read_text())
+            self.assertEqual(config["model_type"], "jev")
+            self.assertEqual(config["decision_config"]["adapter"]["rank"], 2)
+
+            questions = {
+                "team": {
+                    "type": "choice",
+                    "instructions": "x",
+                    "criteria": ["a", "b", "c"],
+                },
+                "ok": {"type": "bool", "instructions": "y"},
+                "level": {
+                    "type": "score",
+                    "instructions": "x y",
+                    "criteria": list("abcdef"),
+                },
+            }
+            result = predict(loaded, tokenizer, "x y x", questions)
+            from mlx_vlm.models.jev.jev import Jev
+
+            with loaded.system_one():
+                _, actual, _ = Jev(loaded, tokenizer).probabilities("x y x", questions)
+
+        # Reference: PEFT LoRA folded into the base weights, lm_head LoRA logits,
+        # log-softmax over the vocabulary, + bias, / temperature, softmax.
+        weights = dict(tree_flatten(base.parameters()))
+        for key, value in peft.items():
+            if key.endswith("lora_A.weight") and "lm_head" not in key:
+                name = key.replace(
+                    "base_model.model.model.language_model.", "language_model.model."
+                ).replace(".lora_A.weight", ".weight")
+                b = peft[key.replace("lora_A", "lora_B")]
+                weights[name] = weights[name] + 2.0 * (b @ value)
+        base.load_weights(list(weights.items()))
+        lm_head = weights["language_model.lm_head.weight"] + 2.0 * (
+            peft["base_model.model.lm_head.lora_B.weight"]
+            @ peft["base_model.model.lm_head.lora_A.weight"]
+        )
+        lines = {
+            "team": ["A) a", "B) b", "C) c"],
+            "ok": ["false", "true"],
+            "level": list("012345"),
+        }
+        kinds = {"team": "choice", "ok": "noul", "level": "score"}
+        for (name, kind), probabilities in zip(kinds.items(), actual):
+            ids = tokenizer.encode(
+                _jev_template(
+                    kind, "x y x", questions[name]["instructions"], lines[name]
+                ),
+                add_special_tokens=False,
+            )
+            hidden = base.language_model(mx.array([ids]), return_hidden=True)
+            logits = hidden.hidden_states[-1][0, -1] @ lm_head.T
+            logprobs = logits - mx.logsumexp(logits)
+            start = ranges[kind][0]
+            count = len(lines[name])
+            z = [
+                (logprobs[verbalizers[start + i]].item() + bias[start + i])
+                / temperatures[kind]
+                for i in range(count)
+            ]
+            expected = np.exp(np.array(z) - max(z))
+            np.testing.assert_allclose(
+                probabilities, expected / expected.sum(), atol=1e-4
+            )
+        self.assertEqual(
+            result["answers"]["team"]["probabilities"],
+            {k: round(v, 4) for k, v in zip("abc", actual[0])},
+        )

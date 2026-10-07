@@ -537,8 +537,9 @@ loaded decision model is used. Without either, the endpoint returns HTTP 400.
 Decision requests are non-streaming and use the server's API-key authentication.
 
 Both interfaces return the shared `predict()` result and preserve model-specific
-scoring. Decider and Laya support `choice`, `bool`, and `score`; consult each
-model's README for criteria and calibration details.
+scoring. Decider, Laya, and JEV support `choice`, `bool`, and `score`; JEV
+also accepts images in the state through `predict()`. Consult each model's
+README for criteria and calibration details.
 
 ### Server (FastAPI)
 

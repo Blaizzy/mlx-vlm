@@ -1716,6 +1716,7 @@ def test_extract_text_from_content(content, expected):
         ("qwen3_omni_moe", "qwen-image-audio"),
         ("gemma4_unified", "video-audio"),
         ("prism_hadamard_qwen35", "image-video"),
+        ("jev", "image-video"),
         ("step3p7", "patch"),
     ],
 )
