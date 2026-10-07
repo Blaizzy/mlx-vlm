@@ -21,6 +21,7 @@ import mlx_vlm.models.rope_utils as rope_utils
 from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
 from mlx_vlm.fp8 import _dequantize_fp8_weight, _quantize_fp8_weight
 from mlx_vlm.models.cache import KVCache
+from mlx_vlm.models.kernels import grid_sample
 from mlx_vlm.models.mla import max_absorbed_queries
 from mlx_vlm.models.paddleocr_vl.config import VisionConfig
 from mlx_vlm.models.paddleocr_vl.vision import Attention, VisionModel
@@ -469,6 +470,26 @@ def two_pass_inputs():
     if kv_len is None:
         pytest.skip("no KV length on this GPU selects the two-pass plan")
     return inputs(kv_len)
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("grid_dtype", [None, mx.float32])
+def test_grid_sample_half_precision_matches_float32(dtype, grid_dtype):
+    if not mx.metal.is_available():
+        pytest.skip("Metal kernels are unavailable on this host")
+
+    mx.random.seed(0)
+    x = mx.random.normal((2, 12, 10, 8)).astype(dtype)
+    grid = mx.random.uniform(-1.1, 1.1, (2, 7, 5, 2)).astype(grid_dtype or dtype)
+    expected = grid_sample(x.astype(mx.float32), grid.astype(mx.float32))
+    actual = grid_sample(x, grid)
+    mx.eval(actual)  # surface kernel build errors here rather than in np.array
+    assert actual.dtype == dtype
+    # Only the final rounding to `dtype` should separate the two.
+    rtol = 2**-8 if dtype == mx.bfloat16 else 2**-10
+    np.testing.assert_allclose(
+        np.array(actual.astype(mx.float32)), np.array(expected), rtol=rtol, atol=1e-6
+    )
 
 
 # Rotary embeddings

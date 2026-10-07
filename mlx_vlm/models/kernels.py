@@ -506,8 +506,8 @@ def grid_sample(x, grid):
         int b_stride = H * h_stride;
 
         uint grid_idx = elem / C * 2;
-        float ix = ((grid[grid_idx] + 1) * W - 1) / 2;
-        float iy = ((grid[grid_idx + 1] + 1) * H - 1) / 2;
+        float ix = ((static_cast<float>(grid[grid_idx]) + 1) * W - 1) / 2;
+        float iy = ((static_cast<float>(grid[grid_idx + 1]) + 1) * H - 1) / 2;
 
         int ix_nw = floor(ix);
         int iy_nw = floor(iy);
@@ -521,10 +521,10 @@ def grid_sample(x, grid):
         int ix_se = ix_nw + 1;
         int iy_se = iy_nw + 1;
 
-        T nw = (ix_se - ix)    * (iy_se - iy);
-        T ne = (ix    - ix_sw) * (iy_sw - iy);
-        T sw = (ix_ne - ix)    * (iy    - iy_ne);
-        T se = (ix    - ix_nw) * (iy    - iy_nw);
+        float nw = (ix_se - ix)    * (iy_se - iy);
+        float ne = (ix    - ix_sw) * (iy_sw - iy);
+        float sw = (ix_ne - ix)    * (iy    - iy_ne);
+        float se = (ix    - ix_nw) * (iy    - iy_nw);
 
         int batch_idx = elem / C / gH / gW * b_stride;
         int channel_idx = elem % C;
@@ -540,7 +540,7 @@ def grid_sample(x, grid):
         I_sw = iy_sw >= 0 && iy_sw <= H - 1 && ix_sw >= 0 && ix_sw <= W - 1 ? I_sw : 0;
         I_se = iy_se >= 0 && iy_se <= H - 1 && ix_se >= 0 && ix_se <= W - 1 ? I_se : 0;
 
-        out[elem] = nw * I_nw + ne * I_ne + sw * I_sw + se * I_se;
+        out[elem] = static_cast<T>(nw * I_nw + ne * I_ne + sw * I_sw + se * I_se);
     """
 
     kernel = mx.fast.metal_kernel(
