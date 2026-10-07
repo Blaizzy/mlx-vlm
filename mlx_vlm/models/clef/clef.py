@@ -7,40 +7,7 @@ import numpy as np
 
 from ..qwen3_5 import Model as Qwen3_5Model
 
-SYSTEM_PROMPT = (
-    "Read the complete state and schema. Decide every field jointly. Each answer "
-    "must be exactly one of that field's allowed options."
-)
-IMAGE_PLACEHOLDER = "<|vision_start|><|image_pad|><|vision_end|>"
-VIDEO_PLACEHOLDER = "<|vision_start|><|video_pad|><|vision_end|>"
-MEDIA_KEYS = ("pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw")
 QUESTION_TYPES = {"noul": 0, "choice": 1, "score": 2}
-BACKBONE_PREFIXES = ("model.", "lm_head", "mtp.", "language_model.", "vision_tower.")
-
-
-def _render(value):
-    if isinstance(value, str):
-        return value
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-
-
-def _options(kind, criteria):
-    if kind == "noul":
-        defaults = {
-            "true": "The proposition is true or the answer is yes.",
-            "false": "The proposition is false or the answer is no.",
-        }
-        defaults.update(criteria or {})
-        return [(key, defaults[key]) for key in ("true", "false")]
-    if kind == "choice":
-        if isinstance(criteria, list):
-            criteria = dict.fromkeys(criteria)
-        return sorted((str(key), value) for key, value in criteria.items())
-    return [(str(index), value) for index, value in enumerate(criteria)]
-
-
-def _normalize(x, eps=1e-12):
-    return x / mx.maximum(mx.linalg.norm(x, axis=-1, keepdims=True), eps)
 
 
 def _span_means(spans, length):
@@ -151,9 +118,15 @@ class JointSchemaHead(nn.Module):
             fields = layer(fields, memory)
         fields = self.field_norm(fields[0])[owner]
 
-        anchor = _normalize(questions + global_vector)[owner]
+        anchor = questions + global_vector
+        anchor = anchor / mx.maximum(
+            mx.linalg.norm(anchor, axis=-1, keepdims=True), 1e-12
+        )
+        lexical = lexical / mx.maximum(
+            mx.linalg.norm(lexical, axis=-1, keepdims=True), 1e-12
+        )
         prior_scale = mx.exp(mx.minimum(self.prior_logit_scale, math.log(100.0)))
-        prior = prior_scale * mx.sum(_normalize(lexical) * anchor, axis=-1)
+        prior = prior_scale * mx.sum(lexical * anchor[owner], axis=-1)
         options = self.option_norm(routed)
         cosine = mx.sum(fields * options, axis=-1) / mx.maximum(
             mx.linalg.norm(fields, axis=-1) * mx.linalg.norm(options, axis=-1), 1e-8
@@ -169,22 +142,6 @@ class JointSchemaHead(nn.Module):
         return prior + mx.sigmoid(self.residual_gate) * joint
 
 
-def _sanitize_head(weights):
-    result = {}
-    for key, value in weights.items():
-        if key.endswith(("in_proj_weight", "in_proj_bias")):
-            prefix, suffix = key.rsplit(".in_proj_", 1)
-            for name, part in zip(
-                ("query_proj", "key_proj", "value_proj"), mx.split(value, 3, axis=0)
-            ):
-                result[f"{prefix}.{name}.{suffix}"] = part
-            continue
-        for layer in ("feedforward", "residual_scorer"):
-            key = key.replace(f"{layer}.3.", f"{layer}.1.")
-        result[key] = value
-    return result
-
-
 class Model(Qwen3_5Model):
     decision_types = ("choice", "score", "bool", "noul")
 
@@ -192,16 +149,64 @@ class Model(Qwen3_5Model):
         super().__init__(config)
         self.head = JointSchemaHead(**config.head_config)
 
+    def __call__(self, input_ids, question_spans, option_spans, qtype, **media):
+        features = self.get_input_embeddings(input_ids, **media)
+        hidden = self.language_model.model(
+            input_ids,
+            inputs_embeds=features.inputs_embeds,
+            position_ids=features.position_ids,
+        )
+        hidden = self.head.hidden_norm(hidden[0])
+        flat = np.asarray(input_ids[0])
+        lexical_ids = np.concatenate([flat[s:e] for s, e in option_spans])
+        lexical_spans = np.cumsum([0, *(e - s for s, e in option_spans)])
+        lm_head, ids = self.language_model.lm_head, mx.array(lexical_ids)
+        embeddings = lm_head.weight[ids]
+        if "scales" in lm_head:
+            biases = lm_head.get("biases")
+            embeddings = mx.dequantize(
+                embeddings,
+                lm_head.scales[ids],
+                None if biases is None else biases[ids],
+                group_size=lm_head.group_size,
+                bits=lm_head.bits,
+                mode=lm_head.mode,
+            )
+        lexical = (
+            _span_means(
+                list(zip(lexical_spans[:-1], lexical_spans[1:])), len(lexical_ids)
+            )
+            @ embeddings
+        )
+        return self.head(
+            hidden,
+            [span for span, _ in question_spans],
+            option_spans,
+            lexical.astype(hidden.dtype),
+            qtype,
+            [count for _, count in question_spans],
+        )
+
     def sanitize(self, weights):
-        backbone = {k: v for k, v in weights.items() if k.startswith(BACKBONE_PREFIXES)}
-        head = {
-            k.removeprefix("head."): v
-            for k, v in weights.items()
-            if not k.startswith(BACKBONE_PREFIXES)
-        }
-        weights = super().sanitize(backbone)
-        weights.update({f"head.{k}": v for k, v in _sanitize_head(head).items()})
-        return weights
+        backbone, head = {}, {}
+        for key, value in weights.items():
+            if key.startswith(
+                ("model.", "lm_head", "language_model.", "vision_tower.")
+            ):
+                backbone[key] = value
+                continue
+            key = "head." + key.removeprefix("head.")
+            if key.endswith(("in_proj_weight", "in_proj_bias")):
+                prefix, suffix = key.rsplit(".in_proj_", 1)
+                for name, part in zip(
+                    ("query_proj", "key_proj", "value_proj"), mx.split(value, 3, axis=0)
+                ):
+                    head[f"{prefix}.{name}.{suffix}"] = part
+                continue
+            for layer in ("feedforward", "residual_scorer"):
+                key = key.replace(f"{layer}.3.", f"{layer}.1.")
+            head[key] = value
+        return {**super().sanitize(backbone), **head}
 
     @property
     def quant_predicate(self):
@@ -214,25 +219,50 @@ class Model(Qwen3_5Model):
 
         return predicate
 
-    def _output_rows(self, ids):
-        layer = getattr(self.language_model, "lm_head", None)
-        if layer is None:
-            layer = self.language_model.model.embed_tokens
-        if "scales" not in layer:
-            return layer.weight[ids]
-        biases = layer.get("biases")
-        return mx.dequantize(
-            layer.weight[ids],
-            layer.scales[ids],
-            None if biases is None else biases[ids],
-            group_size=layer.group_size,
-            bits=layer.bits,
-            mode=layer.mode,
-        )
+    def predict(self, processor, state, questions, **kwargs):
+        questions = {
+            name: {**spec, "type": "noul" if spec["type"] == "bool" else spec["type"]}
+            for name, spec in questions.items()
+        }
+        return Clef(self, processor).predict(state, questions, **kwargs)
 
-    def encode(
+
+def _render(value):
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _options(question):
+    kind = question["type"]
+    criteria = question.get("criteria")
+    if kind == "noul":
+        defaults = {
+            "true": "The proposition is true or the answer is yes.",
+            "false": "The proposition is false or the answer is no.",
+        }
+        defaults.update(criteria or {})
+        return [(key, defaults[key]) for key in ("true", "false")]
+    if kind == "choice":
+        if isinstance(criteria, list):
+            criteria = dict.fromkeys(criteria)
+        return sorted((str(key), value) for key, value in criteria.items())
+    if kind == "score":
+        return [(str(index), value) for index, value in enumerate(criteria)]
+    raise ValueError(f"Unsupported question type: {kind!r}")
+
+
+class Clef:
+    def __init__(self, model, processor):
+        self.model = model
+        self.processor = processor
+        self.tokenizer = getattr(processor, "tokenizer", processor)
+
+    def _tokens(self, text):
+        return self.tokenizer(text, add_special_tokens=False)["input_ids"]
+
+    def _sequence(
         self,
-        processor,
         state,
         questions,
         images=None,
@@ -241,27 +271,20 @@ class Model(Qwen3_5Model):
         max_length=16384,
         max_state_tokens=None,
     ):
-        tokenizer = getattr(processor, "tokenizer", processor)
-
-        def tokens(text):
-            return tokenizer(text, add_special_tokens=False)["input_ids"]
-
+        tokens = self._tokens
         schema = tokens("\n\nSCHEMA FIELDS:\n")
         rows = []
         for index, (name, question) in enumerate(questions.items()):
-            kind = "noul" if question["type"] == "bool" else question["type"]
             schema += tokens(
-                f"\nFIELD {index + 1}\nID: {name}\nTYPE: {kind}\nINSTRUCTION: "
+                f"\nFIELD {index + 1}\nID: {name}\nTYPE: {question['type']}\n"
+                "INSTRUCTION: "
             )
             start = len(schema)
-            instructions = question.get("instructions")
-            schema += tokens(_render(instructions or str(name)))
+            schema += tokens(_render(question.get("instructions") or str(name)))
             question_span = (start, len(schema))
             schema += tokens("\nALLOWED OPTIONS:\n")
-            spans, ids = [], []
-            for number, (option, description) in enumerate(
-                _options(kind, question.get("criteria")), 1
-            ):
+            spans, labels = [], []
+            for number, (option, description) in enumerate(_options(question), 1):
                 schema += tokens(f"OPTION {number}: ")
                 start = len(schema)
                 semantics = {"option_id": option}
@@ -269,13 +292,15 @@ class Model(Qwen3_5Model):
                     semantics["description"] = description
                 schema += tokens(_render(semantics))
                 spans.append((start, len(schema)))
-                ids.append(option)
+                labels.append(option)
                 schema += tokens("\n")
             schema += tokens("END FIELD\n")
-            rows.append((name, kind, question_span, spans, ids))
+            rows.append((name, question, question_span, spans, labels))
 
         prefix = tokens(
-            f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\nSTATE:\n"
+            "<|im_start|>system\nRead the complete state and schema. Decide every "
+            "field jointly. Each answer must be exactly one of that field's allowed "
+            "options.<|im_end|>\n<|im_start|>user\nSTATE:\n"
         )
         suffix = tokens(
             "\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
@@ -284,10 +309,10 @@ class Model(Qwen3_5Model):
         media = {}
         images, videos = list(images or []), list(videos or [])
         if images or videos:
-            encoded = processor(
+            encoded = self.processor(
                 text=[
-                    IMAGE_PLACEHOLDER * len(images)
-                    + VIDEO_PLACEHOLDER * len(videos)
+                    "<|vision_start|><|image_pad|><|vision_end|>" * len(images)
+                    + "<|vision_start|><|video_pad|><|vision_end|>" * len(videos)
                     + "\n"
                 ],
                 images=images or None,
@@ -297,7 +322,12 @@ class Model(Qwen3_5Model):
             prefix += np.asarray(encoded["input_ids"])[0].tolist()
             media = {
                 key: mx.array(np.asarray(encoded[key]))
-                for key in MEDIA_KEYS
+                for key in (
+                    "pixel_values",
+                    "image_grid_thw",
+                    "pixel_values_videos",
+                    "video_grid_thw",
+                )
                 if encoded.get(key) is not None
             }
         state_ids = tokens(_render(state))[:max_state_tokens]
@@ -311,50 +341,32 @@ class Model(Qwen3_5Model):
         rows = [
             (
                 name,
-                kind,
-                (q[0] + offset, q[1] + offset),
+                question,
+                (span[0] + offset, span[1] + offset),
                 [(s + offset, e + offset) for s, e in spans],
-                ids,
+                labels,
             )
-            for name, kind, q, spans, ids in rows
+            for name, question, span, spans, labels in rows
         ]
         return prefix + state_ids + schema + suffix, rows, media
 
-    def decide(self, input_ids, rows, media=None):
-        input_ids = mx.array([input_ids])
-        features = self.get_input_embeddings(input_ids, **(media or {}))
-        hidden = self.language_model.model(
-            input_ids,
-            inputs_embeds=features.inputs_embeds,
-            position_ids=features.position_ids,
+    def predict(self, state, questions, **kwargs):
+        ids, rows, media = self._sequence(state, questions, **kwargs)
+        logits = self.model(
+            mx.array([ids]),
+            [(row[2], len(row[3])) for row in rows],
+            [span for row in rows for span in row[3]],
+            mx.array([QUESTION_TYPES[row[1]["type"]] for row in rows]),
+            **media,
         )
-        hidden = self.head.hidden_norm(hidden[0])
-        option_spans = [span for row in rows for span in row[3]]
-        flat = np.asarray(input_ids[0])
-        lexical_ids = np.concatenate([flat[s:e] for s, e in option_spans])
-        lexical_spans = np.cumsum([0, *(e - s for s, e in option_spans)])
-        lexical = _span_means(
-            list(zip(lexical_spans[:-1], lexical_spans[1:])), len(lexical_ids)
-        ) @ self._output_rows(mx.array(lexical_ids))
-        logits = self.head(
-            hidden,
-            [row[2] for row in rows],
-            option_spans,
-            lexical.astype(hidden.dtype),
-            mx.array([QUESTION_TYPES[row[1]] for row in rows]),
-            [len(row[3]) for row in rows],
-        )
-        bounds = np.cumsum([0, *(len(row[3]) for row in rows)]).tolist()
-        return [logits[s:e] for s, e in zip(bounds[:-1], bounds[1:])]
-
-    def predict(self, processor, state, questions, **kwargs):
-        input_ids, rows, media = self.encode(processor, state, questions, **kwargs)
-        logits = self.decide(input_ids, rows, media)
         mx.eval(logits)
         answers = {}
-        for (name, kind, _, _, ids), values in zip(rows, logits):
-            p = dict(zip(ids, mx.softmax(values.astype(mx.float32)).tolist()))
-            question = questions[name]
+        start = 0
+        for name, question, _, spans, labels in rows:
+            values = logits[start : start + len(spans)].astype(mx.float32)
+            start += len(spans)
+            p = dict(zip(labels, mx.softmax(values).tolist()))
+            kind = question["type"]
             if kind == "noul":
                 probability = round(p["true"], 4)
                 answers[name] = {
@@ -369,7 +381,7 @@ class Model(Qwen3_5Model):
                 else [str(i) for i in range(len(question["criteria"]))]
             )
             best = max(labels, key=p.__getitem__)
-            answer = {
+            answers[name] = {
                 "type": kind,
                 "value": (
                     best
@@ -380,10 +392,11 @@ class Model(Qwen3_5Model):
                 "metadata": {"confidence": round(p[best], 4)},
             }
             if kind == "score":
-                answer["metadata"]["legend"] = dict(zip(labels, question["criteria"]))
-            answers[name] = answer
+                answers[name]["metadata"]["legend"] = dict(
+                    zip(labels, question["criteria"])
+                )
         return {
-            "model": str(getattr(self.config, "model_path", None) or "clef"),
+            "model": "clef",
             "answers": answers,
-            "usage": {"input_tokens": len(input_ids), "output_tokens": 0},
+            "usage": {"input_tokens": len(ids), "output_tokens": 0},
         }
