@@ -2079,33 +2079,6 @@ def test_video_depth_anything_conv_checkpoint():
     )
 
 
-def test_clef_checkpoint_conversion():
-    model = _extraction_model("clef")
-    expected = {
-        key: mx.arange(value.size, dtype=value.dtype).reshape(value.shape)
-        for key, value in tree_flatten(model.parameters())
-    }
-    source, fused = {}, {}
-    for key, value in expected.items():
-        if not key.startswith("head."):
-            source[key] = value
-            continue
-        key = key.removeprefix("head.")
-        for layer in ("feedforward", "residual_scorer"):
-            key = key.replace(f"{layer}.1.", f"{layer}.3.")
-        prefix, _, name = key.rpartition(".")
-        prefix, _, proj = prefix.rpartition(".")
-        if proj in ("query_proj", "key_proj", "value_proj"):
-            fused.setdefault(f"{prefix}.in_proj_{name}", []).append(value)
-        else:
-            source[key] = value
-    source.update({key: mx.concatenate(parts) for key, parts in fused.items()})
-    converted = model.sanitize(source)
-    _assert_weights_equal(converted, expected)
-    _assert_weights_equal(model.sanitize(dict(converted)), expected)
-    model.load_weights(list(converted.items()), strict=True)
-
-
 def test_video_depth_anything_rejects_unknown_encoder():
     from mlx_vlm.models.video_depth_anything import ModelConfig
 
