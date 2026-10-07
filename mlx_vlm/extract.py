@@ -104,9 +104,10 @@ def _parse_settings(pairs, parser):
 def _manifest(task, outputs):
     """Describe named outputs without materializing them into JSON."""
     described = {
+        # MLX spells its dtypes "mlx.core.float32"; the manifest wants "float32".
         name: {
-            "shape": list(np.asarray(value).shape),
-            "dtype": str(np.asarray(value).dtype),
+            "shape": list(value.shape),
+            "dtype": str(value.dtype).rsplit(".", 1)[-1],
         }
         for name, value in outputs.items()
         if name != METADATA
