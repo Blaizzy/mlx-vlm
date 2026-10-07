@@ -11,7 +11,7 @@ from ..base import (
 )
 from ..cache import ArraysCache, CacheList, KVCache
 from ..rope_utils import initialize_rope
-from ..switch_layers import EXPERT_WEIGHT_SUFFIXES, SwitchLinear
+from ..switch_layers import SwitchLinear
 from .config import ModelConfig, TextConfig
 
 
@@ -700,16 +700,15 @@ class LanguageModel(nn.Module):
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"language_model.model.layers.{layer_idx}.mlp.zaya_block.experts"
             for name in ("linear_fc1", "linear_fc2"):
-                for suffix in EXPERT_WEIGHT_SUFFIXES:
-                    stacked = []
-                    for expert_idx in range(self.args.num_experts):
-                        key = f"{prefix}.local_experts.{expert_idx}.{name}.{suffix}"
-                        if key in sanitized_weights:
-                            stacked.append(sanitized_weights.pop(key))
-                    if stacked:
-                        sanitized_weights[f"{prefix}.{name}.{suffix}"] = mx.stack(
-                            stacked, axis=0
-                        )
+                stacked = []
+                for expert_idx in range(self.args.num_experts):
+                    key = f"{prefix}.local_experts.{expert_idx}.{name}.weight"
+                    if key in sanitized_weights:
+                        stacked.append(sanitized_weights.pop(key))
+                if stacked:
+                    sanitized_weights[f"{prefix}.{name}.weight"] = mx.stack(
+                        stacked, axis=0
+                    )
 
             if self.args.vision_lora:
                 for lora_name in ("lora_fc1", "lora_fc2"):

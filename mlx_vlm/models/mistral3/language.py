@@ -12,7 +12,11 @@ from ..cache import KVCache, RotatingKVCache
 from ..mistral4.language import Mistral4Model, _get_llama_4_attn_scale
 from ..pixtral.language import Mistral
 from ..rope_utils import initialize_rope
-from ..switch_layers import move_expert_projection, split_expert_projection
+from ..switch_layers import (
+    move_expert_projection,
+    split_expert_projection,
+    stack_expert_projection,
+)
 from .config import TextConfig
 
 
@@ -252,6 +256,14 @@ class LanguageModel(nn.Module):
             for l in range(self.config.num_hidden_layers):
                 prefix = f"language_model.model.layers.{l}.mlp"
 
+                for name in ("gate_proj", "up_proj", "down_proj"):
+                    stack_expert_projection(
+                        weights,
+                        f"{prefix}.experts",
+                        name,
+                        f"{prefix}.switch_mlp.{name}",
+                        self.config.n_routed_experts,
+                    )
                 split_expert_projection(
                     weights,
                     f"{prefix}.experts.gate_up_proj",

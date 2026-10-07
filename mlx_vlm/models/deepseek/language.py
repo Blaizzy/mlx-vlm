@@ -9,7 +9,7 @@ from ..base import (
     create_attention_mask,
     scaled_dot_product_attention,
 )
-from ..switch_layers import EXPERT_WEIGHT_SUFFIXES, SwitchGLU
+from ..switch_layers import SwitchGLU
 from .config import ModelConfig
 
 
@@ -228,7 +228,7 @@ class LanguageModel(nn.Module):
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
             for m in ["gate_proj", "down_proj", "up_proj"]:
-                for k in EXPERT_WEIGHT_SUFFIXES:
+                for k in ("weight", "scales", "biases", "weight_global_scale"):
                     if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
                         to_join = [
                             weights.pop(f"{prefix}.mlp.experts.{e}.{m}.{k}")

@@ -8,7 +8,7 @@ from ..base import (
     create_attention_mask,
     scaled_dot_product_attention,
 )
-from ..switch_layers import EXPERT_WEIGHT_SUFFIXES, SwitchMLP
+from ..switch_layers import SwitchMLP
 from .config import ModelConfig
 
 
@@ -165,7 +165,7 @@ class LanguageModel(nn.Module):
         for l in range(self.args.num_layers):
             prefix = f"transformer.h.{l}"
             for n in ["fc1", "fc2"]:
-                for k in (*EXPERT_WEIGHT_SUFFIXES, "bias"):
+                for k in ["weight", "scales", "biases", "bias"]:
                     if f"{prefix}.moe.mlp.0.{n}.{k}" in weights:
                         to_join = [
                             weights.pop(f"{prefix}.moe.mlp.{e}.{n}.{k}")

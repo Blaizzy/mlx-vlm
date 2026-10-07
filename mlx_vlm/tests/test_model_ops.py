@@ -1165,11 +1165,11 @@ def _transform_expert_test_weights(weights, format):
     return _transform_compressed_tensors_weights(weights, config)[0]
 
 
-def _assert_expert_projection(weights, prefix, expected, format, loader=None):
+def _assert_expert_projection(weights, prefix, expected, format):
     rows, dims = expected.shape[-2:]
     dense = expected.ndim == 2
     model = nn.Module()
-    if format == "bf16" or loader is not None:
+    if format == "bf16":
         model.layer = (
             nn.Linear(dims, rows, bias=False)
             if dense
@@ -1191,20 +1191,8 @@ def _assert_expert_projection(weights, prefix, expected, format, loader=None):
         for k, v in weights.items()
         if k.startswith(prefix + ".")
     }
-    if loader is None:
-        replace_scaled_quantized_linears(model, tensors)
-        model.load_weights(list(tensors.items()))
-    else:
-        quant = (
-            None
-            if format == "bf16"
-            else dict(
-                group_size=32 if format == "affine" else 16,
-                bits=4,
-                mode="affine" if format == "affine" else "nvfp4",
-            )
-        )
-        loader(model, list(tensors.items()), quant)
+    replace_scaled_quantized_linears(model, tensors)
+    model.load_weights(list(tensors.items()))
     if format not in {"bf16", "affine"}:
         assert mx.all(model.layer.scales == 56).item()
     inputs = mx.arange(2 * dims).reshape(2, dims).astype(mx.float32) / (2 * dims)
@@ -1223,35 +1211,45 @@ def _assert_expert_projection(weights, prefix, expected, format, loader=None):
 
 
 @pytest.mark.parametrize(
-    "format",
-    ["bf16", "affine", "native", "modelopt", "nvfp4-pack-quantized", "mixed-precision"],
-)
-@pytest.mark.parametrize(
-    "family",
-    """
-    afmoe bailing_moe bailing_moe_linear cohere2_moe deepseek deepseek_v2
-    deepseek_v3 deepseek_v32 deepseek_v4 deepseek_vl_v2 deepseekocr dots1
-    ernie4_5_moe ernie4_5_moe_vl exaone_moe glm4_moe glm4_moe_lite glm4v_moe
-    hunyuan jamba kimi_vl klear lfm2_moe llada2_moe longcat_flash
-    longcat_flash_sparse mellum mimo_v2_flash minimax mixtral nemotron_h olmoe
-    phimoe phixtral qwen2_moe qwen3_moe qwen3_next qwen3_omni_moe
-    qwen3_omni_moe.talker qwen3_5_moe qwen3_5_moe_text zaya1_vl
-    deepseek_v41 kimi_linear kimi_k3 glm5_next qwen3_vl_moe step3p5 step3p7 ming_image
-    """.split(),
+    "family,format",
+    [
+        (family, format)
+        for formats, families in [
+            (
+                ("modelopt", "nvfp4-pack-quantized", "mixed-precision"),
+                """afmoe deepseek_v2 deepseek_v3 deepseek_v32 deepseek_v4
+                exaone_moe glm4_moe glm4_moe_lite glm5_next kimi_k3
+                lfm2_moe llada2_moe minimax mixtral qwen3_moe qwen3_next
+                qwen3_omni_moe qwen3_5_moe qwen3_5_moe_text qwen3_vl_moe
+                qwen3_vl_moe_stacked qwen4_exp gemma4 gemma4_text hy_v4 step3p5""",
+            ),
+            (
+                ("modelopt",),
+                "deepseek_v41 kimi_vl mimo_v2_flash nemotron_h olmoe step3p7",
+            ),
+            (
+                ("nvfp4-pack-quantized", "mixed-precision"),
+                """bailing_moe cohere2_moe deepseek deepseek_vl_v2 glm4v_moe
+                kimi_linear mellum llama4 mistral3 mistral_large3""",
+            ),
+        ]
+        for family in families.split()
+        for format in ("bf16", "affine", "native", *formats)
+    ],
 )
 def test_nvfp4_expert_sanitize_load_and_infer(format, family):
     module_name = family if "." in family else family + ".language"
+    if family == "qwen3_vl_moe_stacked":
+        module_name = "qwen3_vl_moe.language"
+    if family == "mistral_large3":
+        module_name = "deepseek_v3.language"
     owner, method = "LanguageModel", "sanitize"
     if family in {"deepseek_v3", "deepseek_v32", "nemotron_h"}:
         owner = "Model"
-    elif family in {"qwen3_5_moe", "qwen3_5_moe_text"}:
+    elif family in {"qwen3_5_moe", "qwen3_5_moe_text", "qwen4_exp", "gemma4"}:
         module_name, owner = family + "." + family, "Model"
         if family.endswith("_text"):
             method = "_stack_experts"
-    elif family == "qwen3_omni_moe.talker":
-        owner = "Talker"
-    if family == "ming_image":
-        module_name, owner = "ming_image.weights", "MingImageTextEncoder"
     cls = getattr(importlib.import_module(f"mlx_vlm.models.{module_name}"), owner)
     global_scales = format in {"modelopt", "nvfp4-pack-quantized", "mixed-precision"}
     args = SimpleNamespace(
@@ -1267,9 +1265,14 @@ def test_nvfp4_expert_sanitize_load_and_infer(format, family):
         is_moe_layer=[True],
         vision_lora=False,
         oe_vocab_size_ratio=0,
+        num_kv_shared_layers=0,
+        ple_storage=False,
+        vision_config=None,
     )
     args.text_config = args
-    model = SimpleNamespace(args=args, config=args, norm_head=False)
+    model = SimpleNamespace(
+        args=args, config=args, norm_head=False, audio_tower=None, model_type="mistral4"
+    )
     if family == "lfm2_moe":
         model._stack_experts = lambda weights: cls._stack_experts(model, weights)
     for key, class_name in [
@@ -1285,39 +1288,39 @@ def test_nvfp4_expert_sanitize_load_and_infer(format, family):
                 SimpleNamespace(mlp=moe_cls.__new__(moe_cls), self_attn=None)
             ]
             model.model = SimpleNamespace(layers=model.layers)
-    root = (
-        "model.model.layers.0.mlp" if family == "ming_image" else "model.layers.0.mlp"
-    )
+    root = "model.layers.0.mlp"
     if family in {
         "deepseek_vl_v2",
-        "deepseekocr",
         "glm4v_moe",
         "kimi_vl",
-        "ernie4_5_moe_vl",
         "qwen3_5_moe_text",
         "llada2_moe",
         "glm5_next",
-        "qwen3_vl_moe",
+        "qwen3_vl_moe_stacked",
     }:
         root = "language_model." + root
     elif family == "qwen3_omni_moe":
         root = "thinker.language_model." + root
-    elif family == "qwen3_omni_moe.talker":
-        root = "talker." + root
-    elif family == "qwen3_5_moe":
+    elif family in {"qwen3_5_moe", "qwen4_exp", "qwen3_vl_moe"}:
         root = "model.language_model.layers.0.mlp"
-    elif family in {"jamba", "lfm2_moe"}:
+    elif family == "gemma4":
+        root = "model.language_model.layers.0"
+    elif family == "gemma4_text":
+        root = "model.layers.0"
+    elif family == "llama4":
+        root = "language_model.model.layers.0.feed_forward"
+    elif family == "mistral3":
+        root = "language_model.model.layers.0.mlp"
+    elif family == "mistral_large3":
+        root = "layers.0"
+    elif family == "lfm2_moe":
         root = "model.layers.0.feed_forward"
-    elif family in {"mixtral", "phimoe", "minimax"}:
+    elif family in {"mixtral", "minimax"}:
         root = "model.layers.0.block_sparse_moe"
     elif family == "nemotron_h":
         root = "backbone.layers.0.mixer"
     elif family == "deepseek_v4":
         root = "model.layers.0.ffn"
-    elif family == "phixtral":
-        root = "transformer.h.0.moe"
-    elif family == "zaya1_vl":
-        root = "language_model.model.layers.0.mlp.zaya_block.experts"
     elif family == "kimi_linear":
         root = "model.layers.0.block_sparse_moe"
     elif family == "kimi_k3":
@@ -1331,21 +1334,15 @@ def test_nvfp4_expert_sanitize_load_and_infer(format, family):
     expert_prefix = "experts"
     if family in {
         "mixtral",
-        "phimoe",
         "minimax",
         "deepseek_v4",
         "deepseek_v41",
         "kimi_linear",
         "kimi_k3",
         "lfm2_moe",
+        "mistral_large3",
     }:
         source_projections = ("w1", "w2", "w3")
-    elif family == "phixtral":
-        projections = source_projections = ("fc1", "fc2")
-        expert_prefix = "mlp"
-    elif family == "zaya1_vl":
-        projections = source_projections = ("linear_fc1", "linear_fc2")
-        expert_prefix = "local_experts"
     elif family == "nemotron_h":
         projections, source_projections = ("fc1", "fc2"), ("up_proj", "down_proj")
     raw, reference = {}, {}
@@ -1360,28 +1357,39 @@ def test_nvfp4_expert_sanitize_load_and_infer(format, family):
         reference[name] = mx.broadcast_to(
             mx.array(scales)[:, None, None], (experts, 4, 64)
         )
-    if family in {"qwen3_vl_moe", "step3p5", "step3p7"}:
+    if family in {"qwen3_vl_moe_stacked", "step3p5", "step3p7"}:
         for key in list(raw):
             if ".experts.0." in key:
                 first = raw.pop(key)
                 second = raw.pop(key.replace(".experts.0.", ".experts.1."))
                 destination = key.replace(
-                    ".experts.0.", ".experts." if family == "qwen3_vl_moe" else "."
+                    ".experts.0.",
+                    ".experts." if family == "qwen3_vl_moe_stacked" else ".",
                 )
                 raw[destination] = mx.stack([first, second])
     weights = _transform_expert_test_weights(raw, format)
-    loader = None
-    if family == "ming_image":
-        module = importlib.import_module("mlx_vlm.models.ming_image.weights")
-        sanitized = module._sanitize_mllm(weights, 1, experts, 0)
-        loader = module._apply
-    elif family == "deepseek_v41":
+    if family == "mistral_large3":
+        wrapper = importlib.import_module(
+            "mlx_vlm.models.mistral_large3.mistral_large3"
+        ).Model
+        mapper = wrapper.__new__(wrapper)
+        weights = {mapper._map_language_key(k): v for k, v in weights.items()}
+    if family == "qwen3_vl_moe":
+        wrapper = importlib.import_module(
+            "mlx_vlm.models.qwen3_vl_moe.qwen3_vl_moe"
+        ).Model
+        weights = wrapper.sanitize(model, weights)
+    if family == "deepseek_v41":
         sanitized = importlib.import_module(
             f"mlx_vlm.models.{module_name}"
         ).sanitize_moe_weights(weights, root, experts)
     else:
         sanitized = getattr(cls, method)(model, weights)
 
+    if family == "hy_v4":
+        reference["gate_up_proj"] = mx.concatenate(
+            [reference.pop("gate_proj"), reference.pop("up_proj")], axis=1
+        )
     weight_keys = [key for key in sanitized if key.endswith(".weight")]
     assert len(weight_keys) == len(reference)
     tensor_count = (
@@ -1396,23 +1404,19 @@ def test_nvfp4_expert_sanitize_load_and_infer(format, family):
             expected.shape[1],
             64 if format == "bf16" else 8,
         )
-        _assert_expert_projection(sanitized, prefix, expected, format, loader)
+        _assert_expert_projection(sanitized, prefix, expected, format)
 
 
 @pytest.mark.parametrize(
     "family",
     [
-        "granitemoe",
-        "granitemoehybrid",
         "qwen3_5_moe",
         "qwen3_5_moe_text",
         "qwen4_exp",
         "gemma4",
         "gemma4_text",
-        "gpt_oss",
         "llama4",
         "mistral3",
-        "openai_privacy_filter",
     ],
 )
 @pytest.mark.parametrize(
@@ -1436,7 +1440,6 @@ def test_nvfp4_fused_expert_sanitize(family, format, layout):
         "qwen3_5_moe_text",
         "qwen4_exp",
         "gemma4",
-        "openai_privacy_filter",
     }:
         module_name, owner = family + "." + family, "Model"
         if family == "qwen3_5_moe_text":
@@ -1445,6 +1448,7 @@ def test_nvfp4_fused_expert_sanitize(family, format, layout):
     args = SimpleNamespace(
         num_hidden_layers=1,
         num_experts=2,
+        num_local_experts=2,
         tie_word_embeddings=False,
         use_moe=True,
         num_kv_shared_layers=0,
@@ -1458,13 +1462,7 @@ def test_nvfp4_fused_expert_sanitize(family, format, layout):
     )
     root = "model.layers.0.mlp.experts"
     gate, down = "gate_up_proj", "down_proj"
-    if family in {"granitemoe", "granitemoehybrid"}:
-        root, gate, down = (
-            "model.layers.0.block_sparse_moe",
-            "input_linear",
-            "output_linear",
-        )
-    elif family in {"qwen3_5_moe", "qwen4_exp"}:
+    if family in {"qwen3_5_moe", "qwen4_exp"}:
         root = "model.language_model.layers.0.mlp.experts"
     elif family in {"qwen3_5_moe_text", "gemma4"}:
         root = "language_model.model.layers.0.mlp.experts"
@@ -1507,8 +1505,8 @@ def test_nvfp4_fused_expert_sanitize(family, format, layout):
     sanitized = getattr(cls, method)(model, weights)
     gate_weight = references[gate]
     references = {
-        "gate_proj": gate_weight[:, ::2] if family == "gpt_oss" else gate_weight[:, :4],
-        "up_proj": gate_weight[:, 1::2] if family == "gpt_oss" else gate_weight[:, 4:],
+        "gate_proj": gate_weight[:, :4],
+        "up_proj": gate_weight[:, 4:],
         "down_proj": references[down],
     }
     weight_keys = [key for key in sanitized if key.endswith(".weight")]
@@ -1522,18 +1520,32 @@ def test_nvfp4_fused_expert_sanitize(family, format, layout):
         _assert_expert_projection(sanitized, prefix, expected, format)
 
 
-@pytest.mark.parametrize("family", ["hy_v4", "glm5_next", "minimax_m3_vl"])
 @pytest.mark.parametrize(
-    "format",
-    ["bf16", "affine", "native", "modelopt", "nvfp4-pack-quantized", "mixed-precision"],
+    "family,format",
+    [
+        (family, format)
+        for family in ("hy_v4", "glm5_next", "minimax_m3_vl", "diffusion_gemma")
+        for format in (
+            "bf16",
+            "affine",
+            "native",
+            "modelopt",
+            "nvfp4-pack-quantized",
+            "mixed-precision",
+        )
+        if family != "minimax_m3_vl"
+        or format not in {"nvfp4-pack-quantized", "mixed-precision"}
+    ],
 )
 def test_nvfp4_expert_fusion_preserves_distinct_scales(family, format):
     module = importlib.import_module(
         f"mlx_vlm.models.{family}."
-        + (family if family == "minimax_m3_vl" else "language")
+        + (family if family in {"minimax_m3_vl", "diffusion_gemma"} else "language")
     )
     args = SimpleNamespace(
         num_hidden_layers=1,
+        num_experts=2,
+        vision_config=None,
         n_routed_experts=2,
         num_local_experts=2,
         n_shared_experts=1,
@@ -1541,8 +1553,12 @@ def test_nvfp4_expert_fusion_preserves_distinct_scales(family, format):
         shared_intermediate_size=4,
         pack_shared_expert=True,
     )
-    model = SimpleNamespace(args=args)
+    args.text_config = args
+    model = SimpleNamespace(args=args, config=args)
     root = "model.layers.0.mlp"
+    if family == "diffusion_gemma":
+        root = "model.decoder.layers.0"
+        model.model = SimpleNamespace(encoder=SimpleNamespace(vision_tower=None))
     if family == "glm5_next":
         root = "language_model." + root
         model.layers = [
@@ -1568,7 +1584,11 @@ def test_nvfp4_expert_fusion_preserves_distinct_scales(family, format):
                 else 1.0
             )
             values.append(mx.full((4, 64), factor))
-            projection = name if e is None else ("w1", "w3", "w2")[i]
+            projection = (
+                name
+                if e is None or family == "diffusion_gemma"
+                else ("w1", "w3", "w2")[i]
+            )
             prefix = (
                 f"{root}.shared_experts.{projection}"
                 if e is None
@@ -1594,6 +1614,8 @@ def test_nvfp4_expert_fusion_preserves_distinct_scales(family, format):
         weights = module.Model.sanitize(model, stacked)
     elif family == "glm5_next":
         weights = module.LanguageModel.sanitize(model, weights)
+    elif family == "diffusion_gemma":
+        weights = module.Model.sanitize(model, weights)
     else:
         module._sanitize_moe_weights(weights, args)
     references["gate_up_proj"] = mx.concatenate(

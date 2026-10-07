@@ -15,7 +15,7 @@ from ..deepseek_v4.language import (
     _sparse_pooled_attention,
 )
 from ..mla import MultiLinear
-from ..switch_layers import EXPERT_WEIGHT_SUFFIXES, SwitchGLU
+from ..switch_layers import SwitchGLU
 from .config import ModelConfig
 from .engram import Engram, EngramLayout, NgramHashState
 from .fakequant import fake_quant_fp4_e4m3, fake_quant_fp4_ue8m0, fake_quant_fp8_ue8m0
@@ -319,7 +319,7 @@ def sanitize_moe_weights(weights: dict, ffn_prefix: str, n_routed: int) -> dict:
     weights = remapped
     prefix = f"{ffn_prefix}.experts"
     for dst in ("gate_proj", "down_proj", "up_proj"):
-        for suffix in EXPERT_WEIGHT_SUFFIXES:
+        for suffix in ("weight", "scales", "biases", "weight_scale_2"):
             stacked_key = f"{prefix}.{dst}.{suffix}"
             if stacked_key in weights:
                 weights[f"{ffn_prefix}.switch_mlp.{dst}.{suffix}"] = weights.pop(
@@ -330,7 +330,7 @@ def sanitize_moe_weights(weights: dict, ffn_prefix: str, n_routed: int) -> dict:
         ("w2", "down_proj"),
         ("w3", "up_proj"),
     ):
-        for suffix in EXPERT_WEIGHT_SUFFIXES:
+        for suffix in ("weight", "scales", "biases", "weight_scale_2"):
             key0 = f"{prefix}.0.{src}.{suffix}"
             if key0 not in weights:
                 continue

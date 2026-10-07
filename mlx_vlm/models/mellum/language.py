@@ -10,7 +10,7 @@ from ..base import (
 )
 from ..cache import KVCache, RotatingKVCache
 from ..rope_utils import initialize_rope
-from ..switch_layers import EXPERT_WEIGHT_SUFFIXES, SwitchGLU
+from ..switch_layers import SwitchGLU
 from .config import ModelConfig
 
 
@@ -220,7 +220,7 @@ class LanguageModel(nn.Module):
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{layer_idx}"
             for name in ("up_proj", "down_proj", "gate_proj"):
-                for suffix in EXPERT_WEIGHT_SUFFIXES:
+                for suffix in ("weight", "scales", "biases", "weight_global_scale"):
                     key = f"{prefix}.mlp.experts.0.{name}.{suffix}"
                     if key in weights:
                         stacked = [

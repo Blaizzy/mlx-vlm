@@ -11,7 +11,12 @@ from ..base import (
 )
 from ..cache import KVCache, RotatingKVCache
 from ..rope_utils import initialize_rope
-from ..switch_layers import SwitchGLU, move_expert_projection, split_expert_projection
+from ..switch_layers import (
+    SwitchGLU,
+    move_expert_projection,
+    split_expert_projection,
+    stack_expert_projection,
+)
 from .config import ModelConfig
 
 
@@ -554,9 +559,19 @@ class LanguageModel(nn.Module):
         prefixes = {
             k.split(".experts.")[0] + ".experts"
             for k in weights
-            if ".experts.gate_up_proj" in k or ".experts.down_proj" in k
+            if ".experts.gate_up_proj" in k
+            or ".experts.down_proj" in k
+            or ".experts.0." in k
         }
         for prefix in prefixes:
+            for name in ("gate_proj", "up_proj", "down_proj"):
+                stack_expert_projection(
+                    weights,
+                    prefix,
+                    name,
+                    f"{prefix}.switch_glu.{name}",
+                    self.args.num_experts,
+                )
             split_expert_projection(
                 weights,
                 f"{prefix}.gate_up_proj",

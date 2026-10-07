@@ -37,7 +37,18 @@ def expand_expert_scales(weights, prefixes):
                 )
 
 
-def split_expert_projection(weights, source, targets, *, interleaved=False):
+def stack_expert_projection(weights, source, projection, target, num_experts):
+    for suffix in (*EXPERT_WEIGHT_SUFFIXES, "bias"):
+        if f"{source}.0.{projection}.{suffix}" in weights:
+            weights[f"{target}.{suffix}"] = mx.stack(
+                [
+                    weights.pop(f"{source}.{i}.{projection}.{suffix}")
+                    for i in range(num_experts)
+                ]
+            )
+
+
+def split_expert_projection(weights, source, targets):
     """Split fused output rows, including each row's quantization parameters."""
     weight_key = f"{source}.weight"
     if source in weights:
@@ -58,13 +69,7 @@ def split_expert_projection(weights, source, targets, *, interleaved=False):
         if suffix in GLOBAL_SCALE_SUFFIXES:
             value = expert_scale_rows(value, shape)
         axis = -1 if suffix in (*GLOBAL_SCALE_SUFFIXES, "bias") else -2
-        if interleaved:
-            parts = [
-                mx.take(value, mx.arange(i, value.shape[axis], 2), axis=axis)
-                for i in range(2)
-            ]
-        else:
-            parts = mx.split(value, len(targets), axis=axis)
+        parts = mx.split(value, len(targets), axis=axis)
         for target, part in zip(targets, parts):
             weights[f"{target}.{suffix}"] = mx.contiguous(part)
 

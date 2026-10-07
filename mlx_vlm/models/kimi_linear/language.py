@@ -13,7 +13,7 @@ from ..base import (
 from ..cache import ArraysCache, KVCache
 from ..gated_delta import gated_delta_update
 from ..mla import MultiLinear, latent_length, max_absorbed_queries
-from ..switch_layers import EXPERT_WEIGHT_SUFFIXES, SwitchGLU
+from ..switch_layers import SwitchGLU
 from .config import ModelConfig
 
 
@@ -488,7 +488,7 @@ class LanguageModel(nn.Module):
                     ("w2", "down_proj"),
                     ("w3", "up_proj"),
                 ]:
-                    for suffix in EXPERT_WEIGHT_SUFFIXES:
+                    for suffix in ("weight", "scales", "biases", "weight_global_scale"):
                         key = f"{src_prefix}.experts.0.{src}.{suffix}"
                         if key in weights:
                             stacked = [
@@ -500,7 +500,7 @@ class LanguageModel(nn.Module):
                             )
 
                 for name in ("gate_proj", "up_proj", "down_proj"):
-                    for suffix in EXPERT_WEIGHT_SUFFIXES:
+                    for suffix in ("weight", "scales", "biases", "weight_global_scale"):
                         src_key = f"{src_prefix}.shared_experts.{name}.{suffix}"
                         if src_key in weights:
                             weights[f"{dst_prefix}.shared_experts.{name}.{suffix}"] = (

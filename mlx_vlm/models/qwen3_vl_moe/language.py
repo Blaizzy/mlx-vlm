@@ -14,7 +14,7 @@ from ..cache import KVCache
 from ..mlp import SwiGLUMLP as Qwen3VLMoEMLP
 from ..rope_utils import MRoPERotaryEmbedding
 from ..rope_utils import apply_multimodal_rotary_pos_emb as _apply_mrope
-from ..switch_layers import SwitchGLU, move_expert_projection
+from ..switch_layers import SwitchGLU, move_expert_projection, stack_expert_projection
 from .config import ModelConfig, TextConfig
 
 
@@ -689,6 +689,13 @@ class LanguageModel(nn.Module):
         for l in range(self.args.num_hidden_layers):
             prefix = f"language_model.model.layers.{l}.mlp"
             for name in ("up_proj", "down_proj", "gate_proj"):
+                stack_expert_projection(
+                    weights,
+                    f"{prefix}.experts",
+                    name,
+                    f"{prefix}.switch_mlp.{name}",
+                    self.args.num_experts,
+                )
                 move_expert_projection(
                     weights, f"{prefix}.experts.{name}", f"{prefix}.switch_mlp.{name}"
                 )

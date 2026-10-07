@@ -4,7 +4,11 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import InputEmbeddingsFeatures
-from ..switch_layers import move_expert_projection, split_expert_projection
+from ..switch_layers import (
+    move_expert_projection,
+    split_expert_projection,
+    stack_expert_projection,
+)
 from .audio import AudioEncoder
 from .config import ModelConfig
 from .language import LanguageModel, RMSNormNoScale
@@ -228,9 +232,19 @@ class Model(nn.Module):
         prefixes = {
             k.split(".experts.")[0] + ".experts"
             for k in weights
-            if ".experts.gate_up_proj" in k or ".experts.down_proj" in k
+            if ".experts.gate_up_proj" in k
+            or ".experts.down_proj" in k
+            or ".experts.0." in k
         }
         for prefix in prefixes:
+            for name in ("gate_proj", "up_proj", "down_proj"):
+                stack_expert_projection(
+                    weights,
+                    prefix,
+                    name,
+                    f"{prefix}.switch_glu.{name}",
+                    self.config.text_config.num_experts,
+                )
             split_expert_projection(
                 weights,
                 f"{prefix}.gate_up_proj",

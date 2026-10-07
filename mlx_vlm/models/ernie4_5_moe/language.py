@@ -11,7 +11,7 @@ from ..base import (
 from ..cache import KVCache
 from ..mlp import SwiGLUMLP
 from ..rope_utils import initialize_rope
-from ..switch_layers import EXPERT_WEIGHT_SUFFIXES, SwitchGLU
+from ..switch_layers import SwitchGLU
 from .config import ModelConfig
 
 
@@ -232,15 +232,12 @@ class LanguageModel(nn.Module):
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
             for m in ["gate_proj", "down_proj", "up_proj"]:
-                for suffix in EXPERT_WEIGHT_SUFFIXES:
-                    if f"{prefix}.mlp.experts.0.{m}.{suffix}" in weights:
-                        to_join = [
-                            weights.pop(f"{prefix}.mlp.experts.{e}.{m}.{suffix}")
-                            for e in range(self.args.moe_num_experts)
-                        ]
-                        weights[f"{prefix}.mlp.switch_mlp.{m}.{suffix}"] = mx.stack(
-                            to_join
-                        )
+                if f"{prefix}.mlp.experts.0.{m}.weight" in weights:
+                    to_join = [
+                        weights.pop(f"{prefix}.mlp.experts.{e}.{m}.weight")
+                        for e in range(self.args.moe_num_experts)
+                    ]
+                    weights[f"{prefix}.mlp.switch_mlp.{m}.weight"] = mx.stack(to_join)
 
         return weights
 

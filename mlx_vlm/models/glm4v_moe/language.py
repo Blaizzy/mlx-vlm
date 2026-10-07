@@ -11,7 +11,7 @@ from ..base import (
 )
 from ..mlp import DeepseekMLP as Glm4vMoeMLP
 from ..rope_utils import apply_multimodal_rotary_pos_emb as _apply_mrope
-from ..switch_layers import EXPERT_WEIGHT_SUFFIXES, SwitchGLU
+from ..switch_layers import SwitchGLU
 from .config import ModelConfig, TextConfig
 
 
@@ -632,7 +632,7 @@ class LanguageModel(nn.Module):
         for l in range(self.args.num_hidden_layers):
             prefix = f"language_model.model.layers.{l}"
             for n, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
-                for k in EXPERT_WEIGHT_SUFFIXES:
+                for k in ("weight", "scales", "biases", "weight_global_scale"):
                     if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
                         to_join = [
                             weights.pop(f"{prefix}.mlp.experts.{e}.{m}.{k}")

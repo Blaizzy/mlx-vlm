@@ -9,7 +9,7 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..rope_utils import SuScaledRoPE
-from ..switch_layers import EXPERT_WEIGHT_SUFFIXES, SwitchGLU
+from ..switch_layers import SwitchGLU
 from .config import ModelConfig
 
 
@@ -193,7 +193,7 @@ class LanguageModel(nn.Module):
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
             for n, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
-                for k in EXPERT_WEIGHT_SUFFIXES:
+                for k in ["weight", "scales", "biases"]:
                     if f"{prefix}.block_sparse_moe.experts.0.{n}.{k}" in weights:
                         to_join = [
                             weights.pop(
