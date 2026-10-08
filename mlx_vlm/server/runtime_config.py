@@ -180,7 +180,7 @@ KNOBS: Tuple[
         "Token queue wait timeout in seconds; null disables the timeout.",
     ),
     (
-        "spec_draft_model",
+        "draft_model",
         "str_or_none",
         None,
         TEXT_KINDS,
@@ -188,7 +188,7 @@ KNOBS: Tuple[
         "Speculative drafting model path.",
     ),
     (
-        "spec_draft_kind",
+        "draft_kind",
         "str_or_none",
         None,
         TEXT_KINDS,
@@ -312,8 +312,8 @@ class RuntimeConfig:
     apc_checkpoint_guard_tokens: int = 1
     max_kv_size: Optional[int] = None
     token_queue_timeout: Optional[float] = DEFAULT_TOKEN_QUEUE_TIMEOUT
-    spec_draft_model: Optional[str] = None
-    spec_draft_kind: Optional[str] = None
+    draft_model: Optional[str] = None
+    draft_kind: Optional[str] = None
     vision_cache_size: int = 20
 
     _lock: threading.Lock = field(
@@ -369,8 +369,8 @@ class RuntimeConfig:
             ),
             max_kv_size=_env_int("MAX_KV_SIZE", None),
             token_queue_timeout=_env_token_queue_timeout(),
-            spec_draft_model=os.environ.get("MLX_VLM_DRAFT_MODEL") or None,
-            spec_draft_kind=os.environ.get("MLX_VLM_DRAFT_KIND") or None,
+            draft_model=os.environ.get("MLX_VLM_DRAFT_MODEL") or None,
+            draft_kind=os.environ.get("MLX_VLM_DRAFT_KIND") or None,
             vision_cache_size=int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20")),
         )
         cfg._env_defaults = {name: getattr(cfg, name) for name in _KNOB_SPEC}

@@ -943,8 +943,8 @@ def get_cached_model(
         quantized_kv_start=quantized_kv_start,
         top_logprobs_k=get_top_logprobs_k(),
         apc_manager=runtime.apc_manager,
-        draft_model_path=cfg.spec_draft_model,
-        draft_kind=cfg.spec_draft_kind,
+        draft_model_path=cfg.draft_model,
+        draft_kind=cfg.draft_kind,
     )
     try:
         model, processor, config = response_generator.wait_until_ready()
