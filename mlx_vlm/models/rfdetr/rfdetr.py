@@ -76,7 +76,6 @@ class Model(nn.Module):
             spatial_shape=(h, w),
             query_feat=self.query_feat.weight,
             refpoint_embed=self.refpoint_embed.weight,
-            bbox_embed=self.bbox_embed,
         )
 
         # 4. Detection heads on final decoder output

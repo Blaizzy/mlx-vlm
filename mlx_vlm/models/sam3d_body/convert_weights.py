@@ -28,16 +28,6 @@ from .config import SAM3DConfig
 # Max shard size in bytes (5 GB)
 MAX_SHARD_SIZE = 5 * 1024**3
 
-# bfloat16 -> float16 for safetensors (safetensors doesn't support bfloat16 natively)
-DTYPE_MAP = {
-    torch.bfloat16: np.float16,
-    torch.float32: np.float32,
-    torch.float16: np.float16,
-    torch.int32: np.int32,
-    torch.int64: np.int32,  # downcast int64 to int32
-    torch.bool: np.bool_,
-}
-
 
 def to_numpy(tensor: torch.Tensor) -> np.ndarray:
     """Convert a PyTorch tensor to numpy with appropriate dtype."""
@@ -54,11 +44,6 @@ def to_numpy(tensor: torch.Tensor) -> np.ndarray:
 def transpose_conv2d(weight: np.ndarray) -> np.ndarray:
     """PyTorch Conv2d (O,I,H,W) -> MLX (O,H,W,I)."""
     return np.transpose(weight, (0, 2, 3, 1))
-
-
-def transpose_conv_transpose2d(weight: np.ndarray) -> np.ndarray:
-    """PyTorch ConvTranspose2d (I,O,H,W) -> MLX (O,H,W,I)."""
-    return np.transpose(weight, (1, 2, 3, 0))
 
 
 # --------------------------------------------------------------------------

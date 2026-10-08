@@ -150,7 +150,10 @@ class Model(nn.Module):
           1. Name rewrite via the `convert.rename` pipeline (strips the
              `model.` prefix, then applies submodule-specific rules).
           2. Conv2d weight layout transpose: PyTorch (out, in, kH, kW) →
-             MLX NHWC (out, kH, kW, in).
+             MLX NHWC (out, kH, kW, in). Only keys the rename moved are
+             transposed; an MLX key is a fixed point of `rename`, and the
+             stem conv is (32, 3, 3, 3), so the layouts are told apart by
+             name rather than by shape.
           3. Drop list: keys in `DROP_PATTERNS` are excluded. Currently
              this is just `*.num_batches_tracked` — MLX `nn.BatchNorm`
              has no slot for that counter and trainers re-initialise it
@@ -161,7 +164,7 @@ class Model(nn.Module):
             if _should_drop(k):
                 continue
             new_k = _rename(k)
-            if new_k.endswith(".conv.weight") and v.ndim == 4:
+            if new_k != k and new_k.endswith(".conv.weight") and v.ndim == 4:
                 v = v.transpose(0, 2, 3, 1)
             out[new_k] = v
         return out

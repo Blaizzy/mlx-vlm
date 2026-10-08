@@ -14,7 +14,7 @@ import mlx.nn as nn
 from .config import ModelConfig
 from .decoder import DETRDecoder
 from .encoder import DETREncoder
-from .geometry import GeometryEncoder
+from .geometry import GeometryEncoder, apply_box_prompts
 from .position import PositionEmbeddingSine
 from .segmentation import DotProductScoring, MaskDecoder
 from .text_encoder import TextEncoder
@@ -124,31 +124,15 @@ class DetectorModel(nn.Module):
         prompt = inputs_embeds
         prompt_mask = attention_mask
 
-        if boxes is not None and boxes.shape[1] > 0:
-            n_boxes = boxes.shape[1]
-            box_labels = mx.ones((boxes.shape[0], n_boxes), dtype=mx.int32)
-            box_mask = mx.ones((boxes.shape[0], n_boxes), dtype=mx.bool_)
-            geom_feats, geom_mask = self.geometry_encoder(
-                boxes, box_labels, box_mask, encoder_feat, encoder_pos
-            )
-
-            if prompt.shape[0] == 1 and geom_feats.shape[0] > 1:
-                prompt = mx.broadcast_to(
-                    prompt, (geom_feats.shape[0],) + prompt.shape[1:]
-                )
-            prompt = mx.concatenate([prompt, geom_feats], axis=1)
-
-            if prompt_mask is None:
-                prompt_mask = mx.ones(
-                    (prompt.shape[0], inputs_embeds.shape[1]), dtype=geom_mask.dtype
-                )
-            elif prompt_mask.shape[0] == 1 and geom_mask.shape[0] > 1:
-                prompt_mask = mx.broadcast_to(
-                    prompt_mask, (geom_mask.shape[0], prompt_mask.shape[1])
-                )
-            prompt_mask = mx.concatenate(
-                [prompt_mask.astype(geom_mask.dtype), geom_mask], axis=1
-            )
+        prompt, prompt_mask = apply_box_prompts(
+            self.geometry_encoder,
+            boxes,
+            prompt,
+            prompt_mask,
+            inputs_embeds,
+            encoder_feat,
+            encoder_pos,
+        )
 
         encoded = self.detr_encoder(src, pos_flat, prompt, prompt_mask)
 

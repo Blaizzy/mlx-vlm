@@ -820,58 +820,6 @@ def _sigmoid(x: np.ndarray) -> np.ndarray:
     return 1 / (1 + np.exp(-x))
 
 
-def _cxcywh_to_xyxy(boxes: np.ndarray) -> np.ndarray:
-    """Convert (cx, cy, w, h) to (x1, y1, x2, y2)."""
-    cx, cy, w, h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
-    x1 = cx - w / 2
-    y1 = cy - h / 2
-    x2 = cx + w / 2
-    y2 = cy + h / 2
-    return np.stack([x1, y1, x2, y2], axis=1)
-
-
-def _nms(
-    boxes: np.ndarray, scores: np.ndarray, iou_threshold: float = 0.5
-) -> np.ndarray:
-    """Non-maximum suppression."""
-    if len(boxes) == 0:
-        return np.array([], dtype=np.int64)
-
-    boxes_xyxy = _cxcywh_to_xyxy(boxes)
-    x1, y1, x2, y2 = (
-        boxes_xyxy[:, 0],
-        boxes_xyxy[:, 1],
-        boxes_xyxy[:, 2],
-        boxes_xyxy[:, 3],
-    )
-    areas = (x2 - x1) * (y2 - y1)
-
-    order = scores.argsort()[::-1]
-    keep = []
-
-    while len(order) > 0:
-        i = order[0]
-        keep.append(i)
-
-        if len(order) == 1:
-            break
-
-        xx1 = np.maximum(x1[i], x1[order[1:]])
-        yy1 = np.maximum(y1[i], y1[order[1:]])
-        xx2 = np.minimum(x2[i], x2[order[1:]])
-        yy2 = np.minimum(y2[i], y2[order[1:]])
-
-        w = np.maximum(0, xx2 - xx1)
-        h = np.maximum(0, yy2 - yy1)
-        inter = w * h
-
-        iou = inter / (areas[i] + areas[order[1:]] - inter)
-        remaining = np.where(iou <= iou_threshold)[0]
-        order = order[remaining + 1]
-
-    return np.array(keep, dtype=np.int64)
-
-
 def _box_iou(box1: np.ndarray, box2: np.ndarray) -> float:
     """IoU between two xyxy boxes."""
     x1 = max(box1[0], box2[0])
@@ -1046,7 +994,7 @@ def track_video(
     video_path: str,
     prompts: List[str],
     output: Optional[str] = None,
-    model_path: str = "facebook/sam3",
+    model_path: str = "mlx-community/sam3-bf16",
     threshold: float = 0.15,
     nms_thresh: float = 0.5,
     every: int = 2,
@@ -1185,7 +1133,7 @@ def track_video(
 def track_video_realtime(
     video_path: str,
     prompts: List[str],
-    model_path: str = "facebook/sam3",
+    model_path: str = "mlx-community/sam3-bf16",
     threshold: float = 0.15,
     nms_thresh: float = 0.5,
     boxes: Optional[str] = None,
@@ -1578,7 +1526,7 @@ def run_image(
     prompts: List[str],
     task: str = "segment",
     output: Optional[str] = None,
-    model_path: str = "facebook/sam3",
+    model_path: str = "mlx-community/sam3-bf16",
     threshold: float = 0.3,
     nms_thresh: float = 0.5,
     boxes: Optional[str] = None,
@@ -1706,7 +1654,7 @@ def main():
         "--output", default=None, help="Output path (default: auto-named)"
     )
     parser.add_argument(
-        "--model", default="facebook/sam3", help="Model path or HF repo"
+        "--model", default="mlx-community/sam3-bf16", help="Model path or HF repo"
     )
     parser.add_argument(
         "--threshold",

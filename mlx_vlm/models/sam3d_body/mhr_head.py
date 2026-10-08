@@ -15,6 +15,56 @@ from .mhr_utils import (
 )
 from .transformer import DecoderFFN
 
+# A pose vector is global rotation, continuous body pose, shape, scale PCA,
+# hand and face, in that order. Only the shape and face widths are
+# configurable; the rest are fixed by the MHR skeleton.
+GLOBAL_ROT_DIM = 6
+BODY_POSE_CONT_DIM = 260
+SCALE_PCA_DIM = 28
+HAND_PARAM_DIM = 108
+
+
+def pose_segments(config):
+    """Where each segment of a pose vector starts, and its total width."""
+    shape = GLOBAL_ROT_DIM + BODY_POSE_CONT_DIM
+    scale = shape + config.num_shape_comps
+    hand = scale + SCALE_PCA_DIM
+    face = hand + HAND_PARAM_DIM
+    return shape, scale, hand, face, face + config.num_face_comps
+
+
+MHR_KEY_MAP = {
+    "character.skeleton.joint_translation_offsets": "joint_translation_offsets",
+    "character.skeleton.joint_prerotations": "joint_prerotations",
+    "character.skeleton.joint_parents": "joint_parents",
+    "character.skeleton.pmi": None,  # skip — not used at inference
+    "character.mesh.rest_vertices": None,  # skip — skinning uses blend_shape result
+    "character.mesh.faces": None,  # skip
+    "character.mesh.texcoords": None,  # skip
+    "character.mesh.texcoord_faces": None,  # skip
+    "character.parameter_transform.parameter_transform": "parameter_transform",
+    "character.parameter_transform.pose_parameters": "pose_parameters",
+    "character.parameter_transform.rigid_parameters": "rigid_parameters",
+    "character.parameter_transform.scaling_parameters": "scaling_parameters",
+    "character.parameter_limits.minmax_min": "minmax_min",
+    "character.parameter_limits.minmax_max": "minmax_max",
+    "character.parameter_limits.minmax_weight": "minmax_weight",
+    "character.parameter_limits.minmax_parameter_index": "minmax_parameter_index",
+    "character.parameter_limits.ellipsoid_ellipsoid": None,
+    "character.parameter_limits.ellipsoid_ellipsoid_inv": None,
+    "character.parameter_limits.ellipsoid_offset": None,
+    "character.blend_shape.base_shape": "base_shape",
+    "character.blend_shape.shape_vectors": "shape_vectors",
+    "character.linear_blend_skinning.inverse_bind_pose": "inverse_bind_pose",
+    "character.linear_blend_skinning.skin_indices_flattened": "skin_indices",
+    "character.linear_blend_skinning.skin_weights_flattened": "skin_weights",
+    "character.linear_blend_skinning.vert_indices_flattened": "vert_indices",
+    "face_expressions.shape_vectors": "face_shape_vectors",
+    "pose_correctives.pose_dirs_predictor.0.sparse_indices": "pc_sparse_indices",
+    "pose_correctives.pose_dirs_predictor.0.sparse_weight": "pc_sparse_weight",
+    "pose_correctives.pose_dirs_predictor.2.weight": "pc_linear_weight",
+}
+
 
 class MHRHead(nn.Module):
     """MHR pose prediction head.
@@ -48,7 +98,13 @@ class MHRHead(nn.Module):
             config = SAM3DConfig()
 
         self.config = config
-        output_dim = config.pose_output_dim  # 519
+        self._segments = pose_segments(config)
+        output_dim = self._segments[-1]
+        if output_dim != config.pose_output_dim:
+            raise ValueError(
+                f"pose_output_dim is {config.pose_output_dim} but the segment "
+                f"widths sum to {output_dim}"
+            )
 
         # Proj FFN: same nested list pattern as decoder FFN
         self.proj = DecoderFFN(input_dim, input_dim)
@@ -59,18 +115,20 @@ class MHRHead(nn.Module):
         self.body_model = MHRBodyModel(
             num_joints=config.num_joints,
             num_verts=config.num_vertices,
+            num_shape_comps=config.num_shape_comps,
+            num_face_comps=config.num_face_comps,
         )
 
         # Buffers (frozen, loaded from weights)
         self.joint_rotation = mx.zeros((config.num_joints, 3, 3))
         self.scale_mean = mx.zeros((68,))
-        self.scale_comps = mx.zeros((28, 68))
+        self.scale_comps = mx.zeros((SCALE_PCA_DIM, 68))
         self.faces = mx.zeros((config.num_faces, 3), dtype=mx.int32)
         self.hand_pose_mean = mx.zeros((54,))
         self.hand_pose_comps = mx.zeros((54, 54))
         self.hand_joint_idxs_left = mx.zeros((27,), dtype=mx.int32)
         self.hand_joint_idxs_right = mx.zeros((27,), dtype=mx.int32)
-        self.keypoint_mapping = mx.zeros((308, 18566))
+        self.keypoint_mapping = mx.zeros((308, config.num_vertices + config.num_joints))
         self.right_wrist_coords = mx.zeros((3,))
         self.root_coords = mx.zeros((3,))
         self.local_to_world_wrist = mx.zeros((3, 3))
@@ -130,12 +188,13 @@ class MHRHead(nn.Module):
             pred = pred + init_estimate
 
         # Split predictions
-        global_rot_6d = pred[:, :6]
-        pred_pose_cont = pred[:, 6:266]  # 260D continuous body pose
-        pred_shape = pred[:, 266:311]  # 45D shape params
-        pred_scale = pred[:, 311:339]  # 28D scale PCA coefficients
-        pred_hand = pred[:, 339:447]  # 108D hand params
-        pred_face = pred[:, 447:519] * 0  # 72D face, zeroed
+        shape_at, scale_at, hand_at, face_at, end = self._segments
+        global_rot_6d = pred[:, :GLOBAL_ROT_DIM]
+        pred_pose_cont = pred[:, GLOBAL_ROT_DIM:shape_at]
+        pred_shape = pred[:, shape_at:scale_at]
+        pred_scale = pred[:, scale_at:hand_at]
+        pred_hand = pred[:, hand_at:face_at]
+        pred_face = pred[:, face_at:end] * 0  # face is zeroed
 
         # Global rotation: 6D -> rotmat -> euler
         global_rot_rotmat = rot6d_to_rotmat(global_rot_6d)  # (B, 3, 3)
@@ -185,14 +244,9 @@ class MHRHead(nn.Module):
         joint_coords = joint_coords / 100.0
 
         # Compute keypoints via mapping
-        # keypoint_mapping: (308, 18566) where 18566 = 18439 verts + 127 joints
-        model_vert_joints = mx.concatenate(
-            [verts, joint_coords], axis=1
-        )  # (B, 18566, 3)
+        model_vert_joints = mx.concatenate([verts, joint_coords], axis=1)
 
-        keypoints = mx.einsum(
-            "kv,bvd->bkd", self.keypoint_mapping, model_vert_joints
-        )  # (B, 308, 3)
+        keypoints = mx.einsum("kv,bvd->bkd", self.keypoint_mapping, model_vert_joints)
         keypoints = keypoints[:, :70]  # Take first 70
 
         # Flip Y, Z for camera coordinate system
@@ -216,37 +270,6 @@ class MHRHead(nn.Module):
         from safetensors import safe_open
 
         # Key mapping: safetensors prefix -> (model prefix, attr remap)
-        MHR_KEY_MAP = {
-            "character.skeleton.joint_translation_offsets": "joint_translation_offsets",
-            "character.skeleton.joint_prerotations": "joint_prerotations",
-            "character.skeleton.joint_parents": "joint_parents",
-            "character.skeleton.pmi": None,  # skip — not used at inference
-            "character.mesh.rest_vertices": None,  # skip — skinning uses blend_shape result
-            "character.mesh.faces": None,  # skip
-            "character.mesh.texcoords": None,  # skip
-            "character.mesh.texcoord_faces": None,  # skip
-            "character.parameter_transform.parameter_transform": "parameter_transform",
-            "character.parameter_transform.pose_parameters": "pose_parameters",
-            "character.parameter_transform.rigid_parameters": "rigid_parameters",
-            "character.parameter_transform.scaling_parameters": "scaling_parameters",
-            "character.parameter_limits.minmax_min": "minmax_min",
-            "character.parameter_limits.minmax_max": "minmax_max",
-            "character.parameter_limits.minmax_weight": "minmax_weight",
-            "character.parameter_limits.minmax_parameter_index": "minmax_parameter_index",
-            "character.parameter_limits.ellipsoid_ellipsoid": None,
-            "character.parameter_limits.ellipsoid_ellipsoid_inv": None,
-            "character.parameter_limits.ellipsoid_offset": None,
-            "character.blend_shape.base_shape": "base_shape",
-            "character.blend_shape.shape_vectors": "shape_vectors",
-            "character.linear_blend_skinning.inverse_bind_pose": "inverse_bind_pose",
-            "character.linear_blend_skinning.skin_indices_flattened": "skin_indices",
-            "character.linear_blend_skinning.skin_weights_flattened": "skin_weights",
-            "character.linear_blend_skinning.vert_indices_flattened": "vert_indices",
-            "face_expressions.shape_vectors": "face_shape_vectors",
-            "pose_correctives.pose_dirs_predictor.0.sparse_indices": "pc_sparse_indices",
-            "pose_correctives.pose_dirs_predictor.0.sparse_weight": "pc_sparse_weight",
-            "pose_correctives.pose_dirs_predictor.2.weight": "pc_linear_weight",
-        }
 
         weights = []
         with safe_open(safetensors_path, framework="numpy") as f:

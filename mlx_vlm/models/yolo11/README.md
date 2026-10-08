@@ -10,6 +10,7 @@ boxes in original-image pixel coordinates.
 | Model | Component | Size |
 |---|---|---:|
 | [`axiom-of-choice/OmniParser-v2-icon-detect`](https://huggingface.co/axiom-of-choice/OmniParser-v2-icon-detect) | YOLO11 icon detector | 80 MB |
+| [`nativ-community/omniparser-v2-icon-detect-fp32`](https://huggingface.co/nativ-community/omniparser-v2-icon-detect-fp32) | YOLO11 icon detector (fp32) | 80 MB |
 | [`axiom-of-choice/OmniParser-v2-icon-caption-bf16`](https://huggingface.co/axiom-of-choice/OmniParser-v2-icon-caption-bf16) | Florence-2 icon captioner | 517 MB |
 | [`axiom-of-choice/OmniParser-v2-icon-caption-8bit`](https://huggingface.co/axiom-of-choice/OmniParser-v2-icon-caption-8bit) | Florence-2 icon captioner | 356 MB |
 | [`axiom-of-choice/OmniParser-v2-icon-caption-4bit`](https://huggingface.co/axiom-of-choice/OmniParser-v2-icon-caption-4bit) | Florence-2 icon captioner | 271 MB |
@@ -23,9 +24,10 @@ pip install -U mlx-vlm
 ## Python
 
 ```python
-from mlx_vlm.models.yolo11 import draw_detections, load_detector, predict
+from mlx_vlm import load
+from mlx_vlm.models.yolo11 import draw_detections, predict
 
-model = load_detector("axiom-of-choice/OmniParser-v2-icon-detect")
+model, _ = load("axiom-of-choice/OmniParser-v2-icon-detect")
 result = predict(model, "screenshot.png", size=1280)
 
 for box, score in zip(result.boxes.tolist(), result.scores.tolist()):
@@ -73,7 +75,7 @@ python -m mlx_vlm.models.yolo11.convert \
 ```
 
 The output directory contains `config.json` and `model.safetensors` and can be
-passed directly to `load_detector`.
+passed directly to `load`.
 
 ## Architecture
 
