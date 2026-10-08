@@ -73,6 +73,8 @@ def _state(state, image_token):
         else:
             text += _render_criterion(part)
             continue
+        if image_token is None:
+            raise ValueError("This model does not accept images")
         text += image_token
         images.append(image)
     return text, images
