@@ -1,5 +1,6 @@
 """SAM 3D Objects inference on Apple Silicon with MLX."""
 
+from . import processing  # noqa: F401
 from .config import ModelConfig, SAM3DObjectsConfig, TextConfig, VisionConfig
 from .sam3d_objects import Model
 

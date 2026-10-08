@@ -11,8 +11,8 @@ Unlike standard VLMs, this model outputs dense geometry instead of text.
 
 | HF repo (MLX) | Source checkpoint | Backbone |
 | --- | --- | --- |
-| `mlx-community/moge-3-vitl-mlx-fp32` | `Ruicheng/moge-3-vitl` | DINOv2 ViT-L/14 |
 | `mlx-community/moge-3-vitg-mlx-fp32` | `Ruicheng/moge-3-vitg` | DINOv2 ViT-g/14 |
+| `nativ-community/moge-3-vitl-fp32` | `Ruicheng/moge-3-vitl` | DINOv2 ViT-L/14 |
 
 The MLX repos are produced from the official `model.pt` checkpoints with
 `python -m mlx_vlm.models.moge3.convert`.
@@ -23,7 +23,7 @@ The MLX repos are produced from the official `model.pt` checkpoints with
 from mlx_vlm import load
 from mlx_vlm.models.moge3.generate import MoGe3Predictor, read_image
 
-model, processor = load("mlx-community/moge-3-vitl-mlx-fp32")
+model, processor = load("nativ-community/moge-3-vitl-fp32")
 predictor = MoGe3Predictor(model, processor)
 
 output = predictor.infer(read_image("image.jpg"), resolution_level=9)

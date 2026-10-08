@@ -188,3 +188,15 @@ class Model(nn.Module):
             if any(d % 64 != 0 for d in shape):
                 return False
         return isinstance(module, nn.Linear)
+
+    extraction_types = ("detection",)
+
+    def extract(self, processor, inputs, task=None, score_threshold=None, **kwargs):
+        """Detect objects in one image."""
+        from ...extraction import detection_outputs
+        from .generate import RTDetrV2Predictor
+
+        if score_threshold is not None:
+            kwargs["threshold"] = score_threshold
+        predictor = RTDetrV2Predictor(self, processor, **kwargs)
+        return detection_outputs(predictor.predict(inputs))

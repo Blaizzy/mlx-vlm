@@ -452,3 +452,15 @@ class Model(nn.Module):
             sanitized[key] = value
 
         return sanitized
+
+    extraction_types = ("detection",)
+
+    def extract(self, processor, inputs, task=None, text_prompt=None, **kwargs):
+        """Detect and segment the prompted concept in one image."""
+        from ...extraction import detection_outputs
+        from .generate import Sam3Predictor
+
+        if not text_prompt:
+            raise ValueError("sam3 detection requires text_prompt=")
+        predictor = Sam3Predictor(self, processor)
+        return detection_outputs(predictor.predict(inputs, text_prompt, **kwargs))

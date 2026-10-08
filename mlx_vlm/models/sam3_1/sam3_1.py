@@ -404,3 +404,15 @@ class Model(nn.Module):
             if any(d % 64 != 0 for d in shape):
                 return False
         return True
+
+    extraction_types = ("detection",)
+
+    def extract(self, processor, inputs, task=None, text_prompt=None, **kwargs):
+        """Detect and segment the prompted concept in one image."""
+        from ...extraction import detection_outputs
+        from ..sam3.generate import Sam3Predictor
+
+        if not text_prompt:
+            raise ValueError("sam3_1 detection requires text_prompt=")
+        predictor = Sam3Predictor(self, processor)
+        return detection_outputs(predictor.predict(inputs, text_prompt, **kwargs))

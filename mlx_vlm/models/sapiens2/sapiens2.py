@@ -176,3 +176,14 @@ class Model(nn.Module):
                 for k, v in sanitized.items()
             }
         return sanitized
+
+    @property
+    def extraction_types(self):
+        """The single dense-prediction task this checkpoint serves."""
+        return (self.config.task,)
+
+    def extract(self, processor, inputs, task=None, **kwargs):
+        """Predict this checkpoint's task output for one image."""
+        from .generate import Sapiens2Predictor
+
+        return Sapiens2Predictor(self, processor).infer(inputs, **kwargs)
