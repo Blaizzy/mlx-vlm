@@ -703,7 +703,7 @@ def _generator(**overrides):
         dict.fromkeys(
             (
                 "adapter_path model processor config vision_cache draft_model draft_kind "
-                "draft_model_path draft_kind_override kv_bits apc_manager apc_mode tokenizer _load_error"
+                "kv_bits apc_manager apc_mode tokenizer _load_error"
             ).split()
         )
     )
@@ -721,7 +721,6 @@ def _generator(**overrides):
         _cancel_lock=Lock(),
         _drafter_update_lock=Lock(),
         _draft_selection=(None, None),
-        _pending_drafter_update=None,
         draft_settings=None,
     )
     gen.__dict__.update(overrides)
@@ -759,6 +758,7 @@ def test_server_serves_ar_requests_after_drafter_mismatch(monkeypatch):
     gen, _ = _worker_setup(monkeypatch, initialize=False)
     monkeypatch.setenv("MLX_VLM_DRAFT_MODEL", "assistant")
     monkeypatch.setenv("MLX_VLM_DRAFT_KIND", "mtp")
+    gen._draft_selection = ("assistant", "mtp")
     monkeypatch.setattr(
         generation,
         "load_model_resources",
@@ -5002,20 +5002,41 @@ def test_drafter_settings_keep_cached_target(settings_client):
         assert generators[0].draft_settings == expected
 
 
-def test_explicit_disabled_drafter_does_not_restore_startup_env(monkeypatch):
+@pytest.mark.parametrize(
+    "options,expected",
+    [
+        ({}, ("startup-drafter", "mtp")),
+        (
+            {"draft_model_path": "explicit", "draft_kind": "eagle3"},
+            ("explicit", "eagle3"),
+        ),
+        ({"draft_settings": (None, None)}, (None, None)),
+    ],
+)
+def test_initial_drafter_settings_override_startup_env(monkeypatch, options, expected):
     monkeypatch.setenv("MLX_VLM_DRAFT_MODEL", "startup-drafter")
     monkeypatch.setenv("MLX_VLM_DRAFT_KIND", "mtp")
-    gen = _generator(draft_settings=(None, None))
     resources = NS(), NS(tokenizer=NS()), NS(eos_token_id=[])
     monkeypatch.setattr(generation, "load_model_resources", lambda *a: resources)
-    loader = Mock(side_effect=AssertionError("disabled means no drafter"))
+    drafter = NS()
+    loader = Mock(return_value=(drafter, expected[1]))
     monkeypatch.setattr("mlx_vlm.speculative.drafters.load_drafter", loader)
-    gen._initialize_model()
-    assert gen.draft_model is None and gen._draft_selection == (None, None)
-    loader.assert_not_called()
+    gen = Generator("demo", **options)
+    try:
+        gen.wait_until_ready(timeout=2)
+        assert gen._draft_selection == expected
+        if expected[0] is None:
+            assert gen.draft_model is None
+            loader.assert_not_called()
+        else:
+            assert gen.draft_model is drafter
+            loader.assert_called_once_with(expected[0], kind=expected[1])
+    finally:
+        gen.stop_and_join(timeout=2)
 
 
-def test_worker_can_enable_replace_and_disable_only_drafter(monkeypatch):
+@pytest.mark.parametrize("via_settings", [False, True])
+def test_worker_can_enable_replace_and_disable_only_drafter(monkeypatch, via_settings):
     gen, batches = _worker_setup(monkeypatch, idle=True)
     gen._preprocess_request = lambda *a: {"input_ids": mx.array([[1]]), "request_id": 1}
     initialized = Mock(wraps=gen._initialize_model)
@@ -5037,7 +5058,10 @@ def test_worker_can_enable_replace_and_disable_only_drafter(monkeypatch):
         gen.wait_until_ready(timeout=1)
         model, processor, tokenizer = gen.model, gen.processor, gen.tokenizer
         for path in ("qwen3_5_mtp", "eagle3", None, "qwen3_5_mtp"):
-            gen.draft_settings = (path, None)
+            if via_settings:
+                gen.draft_settings = (path, None)
+            else:
+                gen.replace_drafter(path)
             _, tokens = gen.generate("Hello", args=Args(max_tokens=1))
             assert len(list(tokens)) == 1
             previous_loads = len(loads)
@@ -5069,6 +5093,34 @@ def test_worker_revalidates_requests_preprocessed_before_drafter_swap(
         assert isinstance(invalid.get(timeout=1), ValueError)
         _drain(valid)
         assert len(batches) == 1
+
+
+def test_worker_drains_queued_requests_and_swaps_during_shutdown(monkeypatch):
+    gen, batches = _worker_setup(monkeypatch, idle=True)
+    drafter = NS()
+    loader = Mock(return_value=(drafter, "mtp"))
+    monkeypatch.setattr("mlx_vlm.speculative.drafters.load_drafter", loader)
+    before = _enqueue(gen, max_tokens=1)
+    enable = generation._DrafterUpdate("mtp", None)
+    gen.requests.put(enable)
+    during = _enqueue(gen, max_tokens=1)
+    disable = generation._DrafterUpdate(None, None)
+    gen.requests.put(disable)
+    after = _enqueue(gen, max_tokens=1)
+    gen._stop = True
+    gen.requests.put(None)
+
+    with _running(gen) as worker:
+        for queue in (before, during, after):
+            assert len(_drain(queue)[1]) == 1
+        assert enable.result.get(timeout=1) is None
+        assert disable.result.get(timeout=1) is None
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+
+    assert [batch.kwargs["draft_model"] for batch in batches] == [None, drafter, None]
+    assert all(batch.closed for batch in batches)
+    loader.assert_called_once_with("mtp", kind=None)
 
 
 def test_drafter_swap_does_not_reuse_request_ids(monkeypatch):
