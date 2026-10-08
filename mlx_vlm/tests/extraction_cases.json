@@ -411,6 +411,33 @@
         "slat_steps": 2
       },
       "checks": ["registry_and_config"]
+    },
+    {
+      "id": "rfdetr_multiscale",
+      "module": "rfdetr",
+      "config": {
+        "model_type": "rf-detr",
+        "encoder": "dinov2_windowed_small",
+        "hidden_dim": 64,
+        "resolution": 112,
+        "dec_layers": 1,
+        "num_queries": 10,
+        "num_classes": 3,
+        "patch_size": 14,
+        "num_windows": 2,
+        "group_detr": 1,
+        "sa_nheads": 2,
+        "ca_nheads": 4,
+        "dec_n_points": 2,
+        "out_feature_indexes": [2, 5, 8, 11],
+        "projector_scale": ["P3", "P5"]
+      },
+      "input_shape": [2, 112, 112, 3],
+      "output_shapes": {
+        "pred_logits": [2, 10, 4],
+        "pred_boxes": [2, 10, 4]
+      },
+      "checks": ["registry_and_config", "forward"]
     }
   ],
   "shared_configs": {

@@ -65,15 +65,20 @@ class Model(nn.Module):
         # 1. Backbone: extract multi-scale features
         features = self.backbone(pixel_values)
 
-        # 2. Projector: merge features into single scale
-        memory = self.projector(features)  # (B, h, w, D)
-        h, w = memory.shape[1], memory.shape[2]
-        memory_flat = memory.reshape(B, h * w, -1)  # (B, HW, D)
+        # 2. Projector: merge features into one map per level
+        levels = self.projector(features)  # [(B, h, w, D)]
+        spatial_shapes = [(m.shape[1], m.shape[2]) for m in levels]
+        memory_flat = [m.reshape(B, m.shape[1] * m.shape[2], -1) for m in levels]
+        memory_flat = (
+            mx.concatenate(memory_flat, axis=1)
+            if len(memory_flat) > 1
+            else memory_flat[0]
+        )  # (B, sum(HW), D)
 
         # 3. Transformer: two-stage selection + decoder
         hs, ref_points = self.transformer(
             memory_flat,
-            spatial_shape=(h, w),
+            spatial_shapes=spatial_shapes,
             query_feat=self.query_feat.weight,
             refpoint_embed=self.refpoint_embed.weight,
             bbox_embed=self.bbox_embed,
@@ -99,7 +104,7 @@ class Model(nn.Module):
 
         # Optional segmentation
         if self.segmentation_head is not None:
-            pred_masks = self.segmentation_head(memory, hs, (H, W))
+            pred_masks = self.segmentation_head(levels[0], hs, (H, W))
             result["pred_masks"] = pred_masks
 
         return result
@@ -161,6 +166,18 @@ class Model(nn.Module):
                 sanitized[base + "q_proj.bias"] = v[:d]
                 sanitized[base + "k_proj.bias"] = v[d : 2 * d]
                 sanitized[base + "v_proj.bias"] = v[2 * d :]
+                continue
+
+            # 7b. Projector P3 ConvTranspose2d (kernel 2): PyTorch (in, out, 2, 2)
+            # -> MLX (out, 2, 2, in); weights already in MLX layout are left as-is
+            if (
+                "projector.stages_sampling." in new_k
+                and "conv" not in new_k
+                and v.ndim == 4
+                and v.shape[2:] == (2, 2)
+                and v.shape[1:3] != (2, 2)
+            ):
+                sanitized[new_k] = v.transpose(1, 2, 3, 0)
                 continue
 
             # 8. Conv2d weight transposition: PyTorch (out, in, kH, kW) -> MLX (out, kH, kW, in)

@@ -1,7 +1,7 @@
 """RF-DETR Transformer: Two-stage encoder + Decoder with deformable attention."""
 
 import math
-from typing import Tuple
+from typing import List, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -115,21 +115,20 @@ class MSDeformableAttention(nn.Module):
         query: mx.array,
         reference_points: mx.array,
         value: mx.array,
-        spatial_shape: Tuple[int, int],
+        spatial_shapes: List[Tuple[int, int]],
     ) -> mx.array:
         """
         Args:
             query: (B, Q, D) query features
-            reference_points: (B, Q, n_levels, 2) or (B, Q, n_levels, 4)
+            reference_points: (B, Q, n_levels or 1, 2) or (B, Q, n_levels or 1, 4)
                 For 2D: [cx, cy] in [0, 1] normalized coords
                 For 4D: [cx, cy, w, h] (can be in logit space for bbox_reparam)
-            value: (B, HW, D) flattened spatial features
-            spatial_shape: (H, W) of the feature map
+            value: (B, sum(H*W), D) flattened spatial features, levels concatenated
+            spatial_shapes: [(H, W)] of each feature level
         Returns:
             (B, Q, D)
         """
         B, Q, _ = query.shape
-        H, W = spatial_shape
 
         # Project values
         value = self.value_proj(value)  # (B, HW, D)
@@ -153,15 +152,17 @@ class MSDeformableAttention(nn.Module):
         )
 
         # Compute sampling locations based on reference point dimensionality
+        # (n_levels, 1, 2) per-level [W, H], broadcast over points
+        offset_normalizer = mx.array(
+            [[[W, H]] for H, W in spatial_shapes], dtype=mx.float32
+        )
         if reference_points.ndim == 3:
             # (B, Q, 2) -> add n_levels and n_heads dims
             ref = reference_points[:, :, None, None, None, :]  # (B, Q, 1, 1, 1, 2)
-            offset_normalizer = mx.array([W, H], dtype=mx.float32)
             sampling_locations = ref + offsets / offset_normalizer
         elif reference_points.shape[-1] == 2:
             # (B, Q, n_levels, 2)
             ref = reference_points[:, :, None, :, None, :]  # (B, Q, 1, n_levels, 1, 2)
-            offset_normalizer = mx.array([W, H], dtype=mx.float32)
             sampling_locations = ref + offsets / offset_normalizer
         elif reference_points.shape[-1] == 4:
             # 4D: offsets scaled by reference box size (PyTorch DETR formula)
@@ -177,32 +178,40 @@ class MSDeformableAttention(nn.Module):
                 f"reference_points last dim must be 2 or 4, got {reference_points.shape[-1]}"
             )
 
-        # Reshape value for grid sampling: (B, HW, D) -> (B*n_heads, H, W, head_dim)
-        value_spatial = value.reshape(B, H, W, self.n_heads, self.head_dim)
-        value_spatial = value_spatial.transpose(
-            0, 3, 1, 2, 4
-        )  # (B, n_heads, H, W, head_dim)
-        value_spatial = value_spatial.reshape(B * self.n_heads, H, W, self.head_dim)
-
-        # For n_levels=1, squeeze level dim
-        samp_loc = sampling_locations[:, :, :, 0, :, :]  # (B, Q, n_heads, n_points, 2)
-
         # Convert to grid_sample format: [-1, 1] from [0, 1]
-        grid_coords = samp_loc * 2 - 1  # (B, Q, n_heads, n_points, 2)
+        grid_coords = sampling_locations * 2 - 1  # (B, Q, n_heads, L, n_points, 2)
 
-        # Reshape for grid_sample: (B*n_heads, Q, n_points, 2)
-        grid_coords = grid_coords.transpose(0, 2, 1, 3, 4).reshape(
-            B * self.n_heads, Q, self.n_points, 2
-        )
+        sampled = []
+        start = 0
+        for lvl, (H, W) in enumerate(spatial_shapes):
+            # Level value for grid sampling: (B, HW, D) -> (B*n_heads, H, W, head_dim)
+            value_spatial = value[:, start : start + H * W]
+            start += H * W
+            value_spatial = value_spatial.reshape(B, H, W, self.n_heads, self.head_dim)
+            value_spatial = value_spatial.transpose(
+                0, 3, 1, 2, 4
+            )  # (B, n_heads, H, W, head_dim)
+            value_spatial = value_spatial.reshape(B * self.n_heads, H, W, self.head_dim)
 
-        # Grid sample: (B*n_heads, Q, n_points, head_dim)
-        sampled = grid_sample(value_spatial, grid_coords)
+            # Reshape for grid_sample: (B*n_heads, Q, n_points, 2)
+            grid_l = (
+                grid_coords[:, :, :, lvl]
+                .transpose(0, 2, 1, 3, 4)
+                .reshape(B * self.n_heads, Q, self.n_points, 2)
+            )
+
+            # Grid sample: (B*n_heads, Q, n_points, head_dim)
+            sampled.append(grid_sample(value_spatial, grid_l))
+        # (B*n_heads, Q, n_levels * n_points, head_dim)
+        sampled = mx.concatenate(sampled, axis=2) if len(sampled) > 1 else sampled[0]
 
         # Apply attention weights
-        sampled = sampled.reshape(B, self.n_heads, Q, self.n_points, self.head_dim)
-        weights = attn_weights[:, :, :, 0, :].transpose(0, 2, 1, 3)[..., None]
+        n_samples = self.n_levels * self.n_points
+        sampled = sampled.reshape(B, self.n_heads, Q, n_samples, self.head_dim)
+        weights = attn_weights.reshape(B, Q, self.n_heads, n_samples)
+        weights = weights.transpose(0, 2, 1, 3)[..., None]
 
-        # Weighted sum over points
+        # Weighted sum over levels and points
         output = (sampled * weights).sum(axis=3)  # (B, n_heads, Q, head_dim)
         output = output.transpose(0, 2, 1, 3).reshape(B, Q, self.d_model)
 
@@ -303,15 +312,15 @@ class DecoderLayer(nn.Module):
         tgt: mx.array,
         memory: mx.array,
         reference_points: mx.array,
-        spatial_shape: Tuple[int, int],
+        spatial_shapes: List[Tuple[int, int]],
         query_pos: mx.array = None,
     ) -> mx.array:
         """
         Args:
             tgt: (B, Q, D) query features
-            memory: (B, HW, D) encoder features
-            reference_points: (B, Q, n_levels, 4) reference boxes for deformable attn
-            spatial_shape: (H, W)
+            memory: (B, sum(HW), D) encoder features
+            reference_points: (B, Q, 1, 4) reference boxes for deformable attn
+            spatial_shapes: [(H, W)] per feature level
             query_pos: (B, Q, D) position embedding
         """
         # Self-attention (query_pos added to q,k only)
@@ -321,7 +330,7 @@ class DecoderLayer(nn.Module):
         # Deformable cross-attention (query_pos added to query)
         cross_query = tgt + query_pos if query_pos is not None else tgt
         tgt = tgt + self.cross_attn(
-            cross_query, reference_points, memory, spatial_shape
+            cross_query, reference_points, memory, spatial_shapes
         )
         tgt = self.norm2(tgt)
 
@@ -355,15 +364,15 @@ class Decoder(nn.Module):
         tgt: mx.array,
         memory: mx.array,
         reference_points_unsigmoid: mx.array,
-        spatial_shape: Tuple[int, int],
+        spatial_shapes: List[Tuple[int, int]],
         bbox_embed: "MLP",
     ) -> Tuple[mx.array, mx.array]:
         """
         Args:
             tgt: (B, Q, D) query features
-            memory: (B, HW, D) encoder features
+            memory: (B, sum(HW), D) encoder features
             reference_points_unsigmoid: (B, Q, 4) initial reference points (pre-sigmoid)
-            spatial_shape: (H, W) of feature map
+            spatial_shapes: [(H, W)] per feature level
             bbox_embed: bbox regression head for iterative refinement
         Returns:
             hs: (B, Q, D) final hidden states
@@ -380,12 +389,12 @@ class Decoder(nn.Module):
 
         for layer_idx, layer in enumerate(self.layers):
             # Pass 4D reference points for deformable cross-attention
-            # Shape: (B, Q, n_levels=1, 4) in [0,1] coordinate space
+            # Shape: (B, Q, 1, 4) in [0,1] coordinate space, shared by all levels
             refpoints_input = ref_coords[:, :, None, :]  # (B, Q, 1, 4)
 
             # Decoder layer
             output = layer(
-                output, memory, refpoints_input, spatial_shape, query_pos=query_pos
+                output, memory, refpoints_input, spatial_shapes, query_pos=query_pos
             )
 
         output = self.norm(output)
@@ -417,14 +426,14 @@ class Transformer(nn.Module):
     def two_stage_select(
         self,
         memory: mx.array,
-        spatial_shape: Tuple[int, int],
+        spatial_shapes: List[Tuple[int, int]],
         group_idx: int = 0,
     ) -> Tuple[mx.array, mx.array]:
         """Select top-K queries from encoder memory (two-stage mechanism).
 
         Args:
-            memory: (B, HW, D) encoder features (projected features)
-            spatial_shape: (H, W) feature map dimensions
+            memory: (B, sum(HW), D) encoder features (projected features)
+            spatial_shapes: [(H, W)] per feature level
             group_idx: which group to use (0 for inference)
         Returns:
             refpoint_embed_ts: (B, num_queries, 4) selected reference points
@@ -432,12 +441,25 @@ class Transformer(nn.Module):
         """
         B = memory.shape[0]
         num_queries = self.config.num_queries
-        H, W = spatial_shape
 
-        # Generate grid proposals (in actual coordinate space, not logit)
-        grid_proposals = _gen_encoder_output_proposals(
-            H, W
-        )  # (HW, 4) cx,cy,w,h in [0,1]
+        # Generate grid proposals (in actual coordinate space, not logit);
+        # box size doubles per level
+        grid_proposals = [
+            _gen_encoder_output_proposals(H, W, scale=0.05 * 2.0**lvl)
+            for lvl, (H, W) in enumerate(spatial_shapes)
+        ]
+        grid_proposals = (
+            mx.concatenate(grid_proposals, axis=0)
+            if len(grid_proposals) > 1
+            else grid_proposals[0]
+        )  # (sum(HW), 4) cx,cy,w,h in [0,1]
+
+        # Proposals too close to the border are zeroed, as is their memory
+        valid = ((grid_proposals > 0.01) & (grid_proposals < 0.99)).all(
+            axis=-1, keepdims=True
+        )
+        grid_proposals = mx.where(valid, grid_proposals, 0.0)
+        memory = mx.where(valid[None], memory, 0.0)
 
         # Project encoder features
         output = self.enc_output[group_idx](memory)
@@ -491,15 +513,15 @@ class Transformer(nn.Module):
     def __call__(
         self,
         memory: mx.array,
-        spatial_shape: Tuple[int, int],
+        spatial_shapes: List[Tuple[int, int]],
         query_feat: mx.array,
         refpoint_embed: mx.array,
         bbox_embed: "MLP",
     ) -> Tuple[mx.array, mx.array]:
         """
         Args:
-            memory: (B, HW, D) projected spatial features
-            spatial_shape: (H, W) of the feature map
+            memory: (B, sum(HW), D) projected spatial features, levels concatenated
+            spatial_shapes: [(H, W)] of each feature level
             query_feat: (num_queries * group_detr, D) all query features
             refpoint_embed: (num_queries * group_detr, 4) all reference points
             bbox_embed: bbox regression MLP for iterative refinement
@@ -517,7 +539,7 @@ class Transformer(nn.Module):
 
         # Two-stage query selection
         refpoint_embed_ts, memory_ts = self.two_stage_select(
-            memory, spatial_shape, group_idx=0
+            memory, spatial_shapes, group_idx=0
         )
 
         # Combine learnable refpoint_embed with two-stage proposals
@@ -537,7 +559,7 @@ class Transformer(nn.Module):
 
         # Decoder
         hs, ref_unsig = self.decoder(
-            tgt, memory, combined_refpoints, spatial_shape, bbox_embed
+            tgt, memory, combined_refpoints, spatial_shapes, bbox_embed
         )
 
         return hs, ref_unsig

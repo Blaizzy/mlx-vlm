@@ -327,8 +327,10 @@ class ConvBN(nn.Module):
         kernel_size: int = 1,
         stride: int = 1,
         padding: int = 0,
+        activation=nn.silu,
     ):
         super().__init__()
+        self.activation = activation
         self.conv = nn.Conv2d(
             in_channels,
             out_channels,
@@ -342,7 +344,7 @@ class ConvBN(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         x = self.conv(x)
         x = self.bn(x)
-        return nn.silu(x)
+        return self.activation(x)
 
 
 class Bottleneck(nn.Module):
@@ -395,33 +397,54 @@ class C2f(nn.Module):
 
 
 class MultiScaleProjector(nn.Module):
-    """Projects concatenated multi-scale backbone features through C2f block."""
+    """Builds one feature level per scale factor: resample each backbone feature
+    (2.0 = ConvTranspose up, 1.0 = identity, 0.5 = stride-2 conv down), concat,
+    then C2f + LayerNorm."""
 
     def __init__(self, config: ProjectorConfig):
         super().__init__()
-        c2f = C2f(
-            in_channels=config.in_channels,
-            out_channels=config.hidden_dim,
-            num_bottlenecks=config.num_bottlenecks,
-            bottleneck_channels=config.bottleneck_channels,
-        )
-        final_norm = nn.LayerNorm(config.hidden_dim)
-        self.stages = [[c2f, final_norm]]
+        self.stages_sampling = []
+        self.stages = []
+        for scale in config.scale_factors:
+            sampling = []
+            for c in config.in_channels:
+                if scale == 2.0:
+                    sampling.append([nn.ConvTranspose2d(c, c // 2, 2, stride=2)])
+                elif scale == 1.0:
+                    sampling.append([])
+                elif scale == 0.5:
+                    sampling.append(
+                        [ConvBN(c, c, 3, stride=2, padding=1, activation=nn.relu)]
+                    )
+                else:
+                    raise ValueError(f"Unsupported projector scale factor: {scale}")
+            self.stages_sampling.append(sampling)
+            c2f = C2f(
+                in_channels=sum(int(c // max(1, scale)) for c in config.in_channels),
+                out_channels=config.hidden_dim,
+                num_bottlenecks=config.num_bottlenecks,
+                bottleneck_channels=config.bottleneck_channels,
+            )
+            self.stages.append([c2f, nn.LayerNorm(config.hidden_dim)])
 
-    def __call__(self, features: List[mx.array]) -> mx.array:
+    def __call__(self, features: List[mx.array]) -> List[mx.array]:
         """
         Args:
             features: list of (B, h, w, D) feature maps from backbone
         Returns:
-            (B, h, w, hidden_dim) projected features
+            list of (B, h_l, w_l, hidden_dim) projected features, one per level
         """
-        # Concatenate all features along channel dimension
-        x = mx.concatenate(features, axis=-1)  # (B, h, w, sum(D))
-        # Process through C2f + final LayerNorm
-        c2f, final_norm = self.stages[0]
-        x = c2f(x)
-        x = final_norm(x)
-        return x
+        outputs = []
+        for sampling, (c2f, final_norm) in zip(self.stages_sampling, self.stages):
+            resampled = []
+            for layers, x in zip(sampling, features):
+                for layer in layers:
+                    x = layer(x)
+                resampled.append(x)
+            # Concatenate along channel dimension, then C2f + final LayerNorm
+            x = mx.concatenate(resampled, axis=-1)
+            outputs.append(final_norm(c2f(x)))
+        return outputs
 
 
 # ─── VisionModel wrapper for framework ───

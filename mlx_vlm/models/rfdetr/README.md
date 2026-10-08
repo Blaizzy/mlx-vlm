@@ -46,7 +46,7 @@ Each output directory contains `config.json`, `preprocessor_config.json`, and `m
 |---------|------|-----------|--------|----------|
 | `base` | Detection | 560 | ~32M | ~33ms |
 | `small` | Detection | 512 | ~32M | - |
-| `large` | Detection | 704 | ~128M | - |
+| `large` | Detection | 560 | ~136M | - |
 | `seg-small` | Detection + Segmentation | 384 | ~34M | ~88ms |
 | `seg-large` | Detection + Segmentation | 480 | ~130M | - |
 
@@ -79,8 +79,8 @@ predictor = RFDETRPredictor(
 ## Architecture
 
 ```
-Image (HxW) --> DINOv2-small (windowed attention, 12 layers)
-            --> MultiScaleProjector (C2f block, P4)
+Image (HxW) --> DINOv2-small/base (windowed attention, 12 layers)
+            --> MultiScaleProjector (C2f block, P4; P3 + P5 for large)
             --> Two-Stage Encoder (top-K query selection)
             --> Decoder (3-4 layers, deformable cross-attention)
             --> Detection Head (class + bbox)
