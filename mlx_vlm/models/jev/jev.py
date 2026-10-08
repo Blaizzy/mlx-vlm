@@ -57,6 +57,8 @@ def _render_criterion(value):
 
 
 def _state(state, image_token):
+    if state is None:
+        return "", []
     if not isinstance(state, list):
         return _render_criterion(state), []
     text, images = "", []
@@ -85,17 +87,17 @@ def _options(question):
     criteria = question.get("criteria")
     if kind == "noul":
         if criteria:
-            raise ValueError("GEV bool questions take no criteria")
+            raise ValueError("bool questions take no criteria")
         return ["false", "true"], ["false", "true"]
     if kind == "score":
         if len(criteria) != 6:
-            raise ValueError("GEV score questions need six levels, 0 to 5")
+            raise ValueError("score questions need six levels, 0 to 5")
         return [str(i) for i in range(6)], [str(i) for i in range(6)]
     if kind == "choice":
         if isinstance(criteria, list):
             criteria = dict.fromkeys(criteria)
         if len(criteria) > 256:
-            raise ValueError("GEV choice questions take at most 256 options")
+            raise ValueError("choice questions take at most 256 options")
         return list(criteria), [
             key if value in (None, "") else f"{key}: {_render_criterion(value)}"
             for key, value in criteria.items()
