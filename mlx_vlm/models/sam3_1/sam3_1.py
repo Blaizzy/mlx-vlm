@@ -12,6 +12,7 @@ import mlx.nn as nn
 from ..sam3.decoder import DETRDecoder
 from ..sam3.encoder import DETREncoder
 from ..sam3.geometry import GeometryEncoder as _GeometryEncoder
+from ..sam3.geometry import apply_box_prompts
 from ..sam3.position import PositionEmbeddingSine
 from ..sam3.segmentation import DotProductScoring, MaskDecoder
 from ..sam3.text_encoder import TextEncoder
@@ -97,6 +98,16 @@ class DetectorModel(nn.Module):
 
         prompt = inputs_embeds
         prompt_mask = attention_mask
+
+        prompt, prompt_mask = apply_box_prompts(
+            self.geometry_encoder,
+            boxes,
+            prompt,
+            prompt_mask,
+            inputs_embeds,
+            encoder_feat,
+            encoder_pos,
+        )
 
         # DETR encoder
         encoded = self.detr_encoder(src, pos_flat, prompt, prompt_mask)
@@ -393,3 +404,15 @@ class Model(nn.Module):
             if any(d % 64 != 0 for d in shape):
                 return False
         return True
+
+    extraction_types = ("detection",)
+
+    def extract(self, processor, inputs, task=None, text_prompt=None, **kwargs):
+        """Detect and segment the prompted concept in one image."""
+        from ...extraction import detection_outputs
+        from ..sam3.generate import Sam3Predictor
+
+        if not text_prompt:
+            raise ValueError("sam3_1 detection requires text_prompt=")
+        predictor = Sam3Predictor(self, processor)
+        return detection_outputs(predictor.predict(inputs, text_prompt, **kwargs))

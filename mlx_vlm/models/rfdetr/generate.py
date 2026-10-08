@@ -1,40 +1,13 @@
 """RF-DETR inference pipeline."""
 
-from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import numpy as np
 from PIL import Image
 
+from ...extraction import DetectionResult, cxcywh_to_xyxy
 from .processing_rfdetr import COCO_CLASSES, RFDETRProcessor
-
-
-@dataclass
-class DetectionResult:
-    """Detection output container."""
-
-    boxes: np.ndarray  # (N, 4) xyxy format in pixel coordinates
-    scores: np.ndarray  # (N,) confidence scores
-    labels: np.ndarray  # (N,) integer class indices
-    class_names: List[str] = field(default_factory=list)
-    masks: Optional[np.ndarray] = None  # (N, H, W) binary masks if segmentation enabled
-
-
-def box_cxcywh_to_xyxy(boxes: np.ndarray) -> np.ndarray:
-    """Convert center-format boxes to corner-format.
-
-    Args:
-        boxes: (..., 4) in [cx, cy, w, h] format
-    Returns:
-        (..., 4) in [x1, y1, x2, y2] format
-    """
-    cx, cy, w, h = boxes[..., 0], boxes[..., 1], boxes[..., 2], boxes[..., 3]
-    x1 = cx - w / 2
-    y1 = cy - h / 2
-    x2 = cx + w / 2
-    y2 = cy + h / 2
-    return np.stack([x1, y1, x2, y2], axis=-1)
 
 
 def postprocess(
@@ -88,7 +61,7 @@ def postprocess(
     final_query_idx = topk_idx[keep]
 
     # Convert boxes: cxcywh -> xyxy
-    boxes = box_cxcywh_to_xyxy(boxes)
+    boxes = cxcywh_to_xyxy(boxes)
 
     # Scale to original image size
     orig_h, orig_w = original_size

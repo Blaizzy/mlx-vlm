@@ -1,44 +1,16 @@
-import json
 import math
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Union
 
 import mlx.core as mx
 import numpy as np
-from huggingface_hub import snapshot_download
 from PIL import Image, ImageDraw
 
-from .yolo11 import YOLO11, load_weights, non_max_suppression
+from ...extraction import DetectionResult
+from .yolo11 import non_max_suppression
 
 DEFAULT_MODEL_ID = "axiom-of-choice/OmniParser-v2-icon-detect"
 ImageInput = Union[str, Path, Image.Image, np.ndarray]
-
-
-@dataclass
-class DetectionResult:
-    boxes: mx.array
-    scores: mx.array
-    labels: mx.array
-    image: Image.Image
-
-
-def load_detector(model_path: Union[str, Path] = DEFAULT_MODEL_ID):
-    """Load a converted OmniParser YOLO11 detector from disk or Hugging Face."""
-    path = Path(model_path)
-    if not path.exists():
-        path = Path(snapshot_download(str(model_path)))
-    if path.is_file():
-        path = path.parent
-    with open(path / "config.json") as f:
-        config = json.load(f)
-    model = YOLO11(
-        nc=int(config["nc"]),
-        ch=tuple(config.get("ch", (256, 512, 512))),
-        reg_max=int(config.get("reg_max", 16)),
-    )
-    load_weights(model, mx.load(str(path / "model.safetensors")))
-    return model
 
 
 def prepare_image(image: ImageInput, size=None, stride=32):

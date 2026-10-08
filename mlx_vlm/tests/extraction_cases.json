@@ -227,7 +227,12 @@
         "pooler_output": [1, 32],
         "hidden_patch_tokens": [1, 16, 32]
       },
-      "checks": ["registry_and_config", "forward", "checkpoint"]
+      "extraction_api": {
+        "task": "backbone",
+        "input_shape": [64, 64, 3],
+        "outputs": ["last_hidden_state", "pooler_output", "hidden_patch_tokens"]
+      },
+      "checks": ["registry_and_config", "forward", "checkpoint", "extraction_api"]
     },
     {
       "id": "video_depth_anything",
@@ -245,7 +250,14 @@
       },
       "input_shape": [1, 2, 28, 28, 3],
       "output_shapes": [1, 2, 28, 28],
-      "checks": ["registry_and_config", "forward", "checkpoint"]
+      "extraction_api": {
+        "task": "depth",
+        "input_shape": [8, 28, 28, 3],
+        "outputs": ["depth"],
+        "kwargs": { "progress": false },
+        "config_overrides": { "num_frames": 32 }
+      },
+      "checks": ["registry_and_config", "forward", "checkpoint", "extraction_api"]
     },
     {
       "id": "sam3_1",
@@ -279,7 +291,12 @@
         "last_hidden_state": [2, 15, 64],
         "pooler_output": [2, 64]
       },
-      "checks": ["registry_and_config", "forward", "checkpoint"]
+      "extraction_api": {
+        "task": "backbone",
+        "input_shape": [32, 24, 3],
+        "outputs": ["last_hidden_state", "pooler_output"]
+      },
+      "checks": ["registry_and_config", "forward", "checkpoint", "extraction_api"]
     },
     {
       "id": "moge3",
@@ -331,7 +348,12 @@
           "encoder_downsample": 4
         }
       },
-      "checks": ["registry_and_config"]
+      "extraction_api": {
+        "task": "geometry",
+        "input_shape": [64, 64, 3],
+        "outputs": ["points", "depth", "mask", "intrinsics"]
+      },
+      "checks": ["registry_and_config", "extraction_api"]
     },
     {
       "id": "gliner2_5",
@@ -411,6 +433,235 @@
         "slat_steps": 2
       },
       "checks": ["registry_and_config"]
+    },
+    {
+      "id": "rfdetr",
+      "module": "rfdetr",
+      "config": { "num_queries": 16 },
+      "extraction_api": {
+        "task": "detection",
+        "input_shape": [112, 112, 3],
+        "outputs": ["boxes", "scores", "labels"],
+        "kwargs": { "score_threshold": 0.5 },
+        "processor": "processing_rfdetr.RFDETRProcessor"
+      },
+      "checks": ["registry_and_config", "extraction_api"]
+    },
+    {
+      "id": "rt_detr_v2",
+      "module": "rt_detr_v2",
+      "config": {},
+      "extraction_api": {
+        "task": "detection",
+        "input_shape": [640, 640, 3],
+        "outputs": ["boxes", "scores", "labels"],
+        "kwargs": { "score_threshold": 0.5 },
+        "processor": "processing_rt_detr_v2.RTDetrV2Processor"
+      },
+      "checks": ["registry_and_config", "checkpoint", "extraction_api"]
+    },
+    {
+      "id": "sam3d_objects_api",
+      "module": "sam3d_objects",
+      "config": {
+        "hidden_size": 64,
+        "num_heads": 4,
+        "num_blocks": 2,
+        "cond_channels": 64,
+        "latent_resolution": 2,
+        "resolution": 8,
+        "io_channels": 16,
+        "decoder_channels": 64,
+        "decoder_heads": 4,
+        "decoder_blocks": 2,
+        "window_size": 4,
+        "structure_channels": [32, 16, 8],
+        "structure_res_blocks": 1,
+        "dino_hidden_size": 64,
+        "dino_heads": 4,
+        "dino_layers": 2,
+        "dino_image_size": 56,
+        "image_size": 56,
+        "point_size": 32,
+        "point_channels": 64,
+        "point_heads": 4
+      },
+      "extraction_api": {
+        "task": "objects",
+        "input_shape": [112, 112, 4],
+        "outputs": ["coords", "latents"],
+        "kwargs": { "ss_steps": 1, "slat_steps": 1, "formats": ["mesh"], "estimate_depth": false }
+      },
+      "checks": ["extraction_api"]
+    },
+    {
+      "id": "sam3_api",
+      "module": "sam3",
+      "config": {
+        "detector_config": {
+      "vision_config": {
+          "backbone_config": {
+            "hidden_size": 32,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "intermediate_size": 64,
+            "image_size": 112,
+            "patch_size": 14,
+            "window_size": 4,
+            "global_attn_indexes": [1],
+            "pretrain_image_size": 112
+          },
+          "fpn_hidden_size": 32,
+          "backbone_feature_sizes": [[32, 32], [16, 16], [8, 8]]
+        },
+        "text_config": {
+          "hidden_size": 32,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 2,
+          "intermediate_size": 64,
+          "vocab_size": 64,
+          "max_position_embeddings": 32,
+          "projection_dim": 32,
+          "bos_token_id": 62,
+          "eos_token_id": 63
+        },
+        "detr_encoder_config": {
+          "hidden_size": 32,
+          "num_layers": 1,
+          "num_attention_heads": 2,
+          "intermediate_size": 64
+        },
+        "detr_decoder_config": {
+          "hidden_size": 32,
+          "num_layers": 1,
+          "num_attention_heads": 2,
+          "num_queries": 8,
+          "intermediate_size": 64
+        },
+        "geometry_encoder_config": {
+          "hidden_size": 32,
+          "num_attention_heads": 2,
+          "intermediate_size": 64
+        },
+        "mask_decoder_config": { "hidden_size": 32, "num_attention_heads": 2 }
+        }
+      },
+      "extraction_api": {
+        "task": "detection",
+        "input_shape": [112, 112, 3],
+        "outputs": ["boxes", "scores"],
+        "kwargs": { "text_prompt": "a person" },
+        "processor": "processing_sam3.Sam3Processor",
+        "processor_kwargs": { "image_size": 112 },
+        "tokenizer": "clip"
+      },
+      "checks": ["extraction_api"]
+    },
+    {
+      "id": "sam3_1_api",
+      "module": "sam3_1",
+      "config": {
+        "detector_config": {
+      "vision_config": {
+          "backbone_config": {
+            "hidden_size": 32,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "intermediate_size": 64,
+            "image_size": 112,
+            "patch_size": 14,
+            "window_size": 4,
+            "global_attn_indexes": [1],
+            "pretrain_image_size": 112
+          },
+          "fpn_hidden_size": 32,
+          "backbone_feature_sizes": [[32, 32], [16, 16], [8, 8]]
+        },
+        "text_config": {
+          "hidden_size": 32,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 2,
+          "intermediate_size": 64,
+          "vocab_size": 64,
+          "max_position_embeddings": 32,
+          "projection_dim": 32,
+          "bos_token_id": 62,
+          "eos_token_id": 63
+        },
+        "detr_encoder_config": {
+          "hidden_size": 32,
+          "num_layers": 1,
+          "num_attention_heads": 2,
+          "intermediate_size": 64
+        },
+        "detr_decoder_config": {
+          "hidden_size": 32,
+          "num_layers": 1,
+          "num_attention_heads": 2,
+          "num_queries": 8,
+          "intermediate_size": 64
+        },
+        "geometry_encoder_config": {
+          "hidden_size": 32,
+          "num_attention_heads": 2,
+          "intermediate_size": 64
+        },
+        "mask_decoder_config": { "hidden_size": 32, "num_attention_heads": 2 }
+        }
+      },
+      "extraction_api": {
+        "task": "detection",
+        "input_shape": [112, 112, 3],
+        "outputs": ["boxes", "scores"],
+        "kwargs": { "text_prompt": "a person" },
+        "processor": "processing_sam3_1.Sam31Processor",
+        "processor_kwargs": { "image_size": 112 },
+        "tokenizer": "clip"
+      },
+      "checks": ["extraction_api"]
+    },
+    {
+      "id": "sam3d_body_api",
+      "module": "sam3d_body",
+      "config": {
+        "embed_dim": 64,
+        "depth": 2,
+        "num_heads": 4,
+        "head_dim": 16,
+        "patch_size": 16,
+        "image_size": [64, 48],
+        "decoder_dim": 64,
+        "decoder_depth": 1,
+        "decoder_heads": 2,
+        "decoder_head_dim": 32,
+        "decoder_mlp_dim": 64,
+        "prompt_embed_dim": 64,
+        "num_vertices": 64,
+        "num_faces": 32,
+        "num_shape_comps": 4,
+        "num_face_comps": 8,
+        "pose_output_dim": 414
+      },
+      "extraction_api": {
+        "task": "body",
+        "input_shape": [96, 96, 3],
+        "outputs": ["pred_vertices", "pred_keypoints_3d", "pred_camera"],
+        "index_weights": { "head_pose.body_model.joint_parents": -1 }
+      },
+      "checks": ["extraction_api"]
+    },
+    {
+      "id": "yolo11",
+      "module": "yolo11",
+      "config": { "nc": 2 },
+      "extraction_api": {
+        "task": "detection",
+        "input_shape": [160, 160, 3],
+        "outputs": ["boxes", "scores", "labels"],
+        "kwargs": { "score_threshold": 0.5 },
+        "processor": "processing_yolo11.YOLO11Processor"
+      },
+      "checks": ["registry_and_config", "extraction_api"]
     }
   ],
   "shared_configs": {

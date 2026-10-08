@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
+import functools
 import importlib
 import io
 import json
 import math
 import pickle
+import pkgutil
 import tempfile
 import threading
 import unittest
@@ -59,6 +62,41 @@ EXTRACTION_DATA = json.loads(
     Path(__file__).with_name("extraction_cases.json").read_text()
 )
 EXTRACTION_CASES = {case["id"]: case for case in EXTRACTION_DATA["cases"]}
+
+
+def _config_value(config, name, default=None):
+    """Find a named field anywhere in a nested case config."""
+    stack = [config]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            if name in current:
+                return current[name]
+            stack.extend(current.values())
+    return default
+
+
+def _clip_tokenizer(vocab_size):
+    """A CLIP tokenizer with no vocabulary to download.
+
+    Prompts encode to unknown tokens, which is all a contract test needs, but
+    every id stays inside the model's embedding table.
+    """
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import CLIPTokenizerFast
+
+    vocab = {f"t{index}</w>": index for index in range(vocab_size - 2)}
+    vocab["<|startoftext|>"] = vocab_size - 2
+    vocab["<|endoftext|>"] = vocab_size - 1
+    backend = Tokenizer(models.BPE(vocab=vocab, merges=[], unk_token="<|endoftext|>"))
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    return CLIPTokenizerFast(
+        tokenizer_object=backend,
+        bos_token="<|startoftext|>",
+        eos_token="<|endoftext|>",
+        unk_token="<|endoftext|>",
+        pad_token="<|endoftext|>",
+    )
 
 
 def _extraction_config(name):
@@ -2005,6 +2043,64 @@ class ExtractionChecks:
         with pytest.raises(ValueError, match="does not support"):
             predict(model, processor, state, {"invalid": {"type": "unknown"}})
 
+    def extraction_api(self, case):
+        from mlx_vlm.extraction import extract
+
+        spec = case["extraction_api"]
+        config = _extraction_config(case["id"])
+        config.update(spec.get("config_overrides") or {})
+        module = importlib.import_module(f"mlx_vlm.models.{case['module']}")
+        model = module.Model(module.ModelConfig.from_dict(config))
+        model.eval()
+        # Index buffers carry structure, not numbers, so a zeroed one is not a
+        # valid skeleton; a case seeds them with a run from the given start.
+        for path, start in (spec.get("index_weights") or {}).items():
+            *owners, leaf = path.split(".")
+            owner = functools.reduce(getattr, owners, model)
+            buffer = getattr(owner, leaf)
+            setattr(
+                owner,
+                leaf,
+                mx.arange(start, start + buffer.size, dtype=buffer.dtype).reshape(
+                    buffer.shape
+                ),
+            )
+        processor = None
+        if spec.get("processor"):
+            where, _, name = spec["processor"].rpartition(".")
+            processor = getattr(
+                importlib.import_module(f"mlx_vlm.models.{case['module']}.{where}"),
+                name,
+            )(**(spec.get("processor_kwargs") or {}))
+        if spec.get("tokenizer") == "clip":
+            processor._tokenizer = _clip_tokenizer(
+                _config_value(config, "vocab_size", 64)
+            )
+
+        assert spec["task"] in model.extraction_types
+        mx.random.seed(0)
+        inputs = (np.random.default_rng(0).random(spec["input_shape"]) * 255).astype(
+            np.uint8
+        )
+        outputs = extract(model, processor, inputs, **(spec.get("kwargs") or {}))
+        assert set(spec["outputs"]) <= set(outputs), sorted(outputs)
+        # Geometry models leave masked-out pixels infinite, so only the valid
+        # region is required to be finite.
+        mask = outputs.get("mask")
+        mask = None if mask is None else np.asarray(mask).astype(bool)
+        for name in spec["outputs"]:
+            value = np.asarray(outputs[name])
+            if mask is not None and value.shape[: mask.ndim] == mask.shape:
+                value = value[mask]
+            assert value.size == 0 or np.all(np.isfinite(value)), name
+        for name, value in outputs.items():
+            if name != "metadata":
+                assert isinstance(value, (mx.array, np.ndarray)), name
+        with pytest.raises(ValueError, match="does not support"):
+            extract(model, processor, inputs, task="not-a-real-task")
+        with pytest.raises(ValueError, match="requires inputs"):
+            extract(model, processor, None)
+
     def registry_and_config(self, case):
         name = case["module"]
         module = importlib.import_module(f"mlx_vlm.models.{name}")
@@ -2264,3 +2360,1023 @@ class TestLayaDecisionModel(unittest.TestCase):
                     self.assertEqual(
                         result["answers"]["route"]["probabilities"]["B"], expected
                     )
+
+
+class TestExtractionResults(unittest.TestCase):
+    """The shared detection containers cover every per-model usage pattern."""
+
+    def test_every_import_site_is_the_same_class(self):
+        from mlx_vlm.extraction import DetectionResult, cxcywh_to_xyxy
+        from mlx_vlm.models import yolo11
+        from mlx_vlm.models.rfdetr import generate as rfdetr_generate
+        from mlx_vlm.models.rt_detr_v2 import generate as rt_detr_generate
+        from mlx_vlm.models.yolo11 import inference as yolo11_inference
+
+        for module in (yolo11, yolo11_inference, rfdetr_generate, rt_detr_generate):
+            self.assertIs(module.DetectionResult, DetectionResult)
+        self.assertIs(rfdetr_generate.cxcywh_to_xyxy, cxcywh_to_xyxy)
+
+    def test_supports_each_models_fields(self):
+        from mlx_vlm.extraction import DetectionResult
+
+        yolo = DetectionResult(
+            boxes=mx.zeros((2, 4)),
+            scores=mx.zeros((2,)),
+            labels=mx.zeros((2,), dtype=mx.int32),
+            image=object(),
+        )
+        self.assertEqual(len(yolo), 2)
+        self.assertEqual(yolo.class_names, [])
+        self.assertIsNone(yolo.masks)
+
+        rfdetr = DetectionResult(
+            boxes=np.zeros((3, 4)),
+            scores=np.zeros((3,)),
+            labels=np.zeros((3,), dtype=np.int64),
+            class_names=["a", "b"],
+            masks=np.zeros((3, 5, 5)),
+        )
+        self.assertEqual(len(rfdetr), 3)
+        self.assertEqual(rfdetr.masks.shape, (3, 5, 5))
+
+        sam3 = DetectionResult(
+            boxes=np.zeros((1, 4)),
+            masks=np.zeros((1, 5, 5)),
+            scores=np.zeros((1,)),
+            label_names=["person"],
+            track_ids=np.zeros((1,), dtype=np.int64),
+        )
+        self.assertEqual(sam3.label_names, ["person"])
+        self.assertIsNone(sam3.labels)
+
+        self.assertEqual(
+            len(DetectionResult(boxes=np.zeros((0, 4)), scores=np.zeros(0))), 0
+        )
+
+    def test_tracking_result_fields(self):
+        from mlx_vlm.extraction import TrackingResult
+
+        frame = TrackingResult(
+            frame_idx=7, masks=np.zeros((2, 4, 4)), scores=np.ones(2), object_ids=[3, 9]
+        )
+        self.assertEqual(frame.frame_idx, 7)
+        self.assertEqual(frame.object_ids, [3, 9])
+        self.assertIsNone(
+            TrackingResult(
+                frame_idx=0, masks=np.zeros((1, 2, 2)), scores=np.ones(1)
+            ).object_ids
+        )
+
+    def test_cxcywh_to_xyxy_matches_both_array_types(self):
+        from mlx_vlm.extraction import cxcywh_to_xyxy
+
+        boxes = np.array([[10.0, 20.0, 4.0, 6.0]])
+        np.testing.assert_allclose(cxcywh_to_xyxy(boxes), [[8.0, 17.0, 12.0, 23.0]])
+        self.assertEqual(cxcywh_to_xyxy(np.zeros((2, 3, 4))).shape, (2, 3, 4))
+        as_mlx = cxcywh_to_xyxy(mx.array(boxes))
+        self.assertIsInstance(as_mlx, mx.array)
+        np.testing.assert_allclose(np.array(as_mlx), cxcywh_to_xyxy(boxes), atol=1e-6)
+
+
+class TestExtractionAPI(unittest.TestCase):
+    """`extraction.extract` gates on declared tasks before touching the model."""
+
+    class _Depth:
+        extraction_types = ("depth",)
+
+        def extract(self, processor, inputs, task=None, **kwargs):
+            return {
+                "depth": np.zeros(1),
+                "metadata": {"task": task, "kwargs": kwargs},
+            }
+
+    class _Multi:
+        extraction_types = ("depth", "pointmap")
+
+        def extract(self, processor, inputs, task=None, **kwargs):
+            return {task: np.zeros(1)}
+
+    def test_rejects_models_without_declared_tasks(self):
+        from mlx_vlm.extraction import extract
+
+        with self.assertRaisesRegex(ValueError, "does not support extraction"):
+            extract(object(), None, "x")
+
+    def test_rejects_missing_inputs_and_unsupported_task(self):
+        from mlx_vlm.extraction import extract
+
+        with self.assertRaisesRegex(ValueError, "requires inputs"):
+            extract(self._Depth(), None, None)
+        with self.assertRaisesRegex(ValueError, "does not support 'pointmap'"):
+            extract(self._Depth(), None, "x", task="pointmap")
+
+    def test_requires_an_explicit_task_when_several_are_served(self):
+        from mlx_vlm.extraction import extract
+
+        with self.assertRaisesRegex(ValueError, r"pass task="):
+            extract(self._Multi(), None, "x")
+        self.assertEqual(
+            sorted(extract(self._Multi(), None, "x", task="depth")), ["depth"]
+        )
+
+    def test_rejects_non_mapping_outputs(self):
+        from mlx_vlm.extraction import extract
+
+        class Bad:
+            extraction_types = ("depth",)
+
+            def extract(self, processor, inputs, task=None, **kwargs):
+                return np.zeros(3)
+
+        with self.assertRaisesRegex(ValueError, "must return a mapping"):
+            extract(Bad(), None, "x")
+
+    def test_infers_the_single_task_and_forwards_kwargs(self):
+        from mlx_vlm.extraction import extract
+
+        out = extract(self._Depth(), None, "frames", progress=False)
+        self.assertEqual(np.asarray(out["depth"]).shape, (1,))
+        self.assertEqual(out["metadata"]["task"], "depth")
+        self.assertEqual(out["metadata"]["kwargs"], {"progress": False})
+
+
+class TestExtractionCLI(unittest.TestCase):
+    """The `extract` subcommand loads a checkpoint, runs a task and reports shapes."""
+
+    @staticmethod
+    def _checkpoint(root, case_id, module_name, overrides=None):
+        config = copy.deepcopy(_extraction_config(case_id))
+        config["model_type"] = module_name
+        config.update(overrides or {})
+        module = importlib.import_module(f"mlx_vlm.models.{module_name}")
+        model = module.Model(module.ModelConfig.from_dict(dict(config)))
+        mx.eval(model.parameters())
+        (root / "config.json").write_text(json.dumps(config))
+        mx.save_safetensors(
+            str(root / "model.safetensors"), dict(tree_flatten(model.parameters()))
+        )
+        return model
+
+    @staticmethod
+    def _png(path, height, width):
+        from PIL import Image
+
+        pixels = (np.random.rand(height, width, 3) * 255).astype(np.uint8)
+        Image.fromarray(pixels).save(path)
+        return path
+
+    def test_is_a_registered_subcommand(self):
+        source = Path(importlib.import_module("mlx_vlm.__main__").__file__).read_text()
+        self.assertIn('"extract"', source)
+
+    def test_runs_a_checkpoint_end_to_end_and_saves_arrays(self):
+        from mlx_vlm import extract as cli
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._checkpoint(root, "sapiens2", "sapiens2")
+            image = self._png(root / "frame.png", 32, 24)
+            output = root / "out.npz"
+            cli.main(
+                ["--model", str(root), "--image", str(image), "--output", str(output)]
+            )
+            saved = np.load(output)
+            self.assertEqual(set(saved.keys()), {"last_hidden_state", "pooler_output"})
+            self.assertEqual(saved["pooler_output"].shape, (1, 64))
+
+    def test_runs_without_an_output_file(self):
+        from mlx_vlm import extract as cli
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._checkpoint(root, "sapiens2", "sapiens2")
+            image = self._png(root / "frame.png", 32, 24)
+            cli.main(["--model", str(root), "--image", str(image)])
+
+    def test_rejects_a_model_without_declared_tasks(self):
+        from mlx_vlm import extract as cli
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image = self._png(root / "frame.png", 8, 8)
+            original = cli.load
+            cli.load = lambda *args, **kwargs: (object(), None)
+            try:
+                with self.assertRaises(SystemExit):
+                    cli.main(["--model", "any", "--image", str(image)])
+            finally:
+                cli.load = original
+
+    def test_rejects_mismatched_image_shapes(self):
+        from mlx_vlm import extract as cli
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._checkpoint(root, "sapiens2", "sapiens2")
+            first = self._png(root / "a.png", 32, 24)
+            second = self._png(root / "b.png", 16, 24)
+            with self.assertRaises(SystemExit):
+                cli.main(
+                    [
+                        "--model",
+                        str(root),
+                        "--image",
+                        str(first),
+                        "--image",
+                        str(second),
+                    ]
+                )
+
+    def test_requires_exactly_one_input_source(self):
+        from mlx_vlm import extract as cli
+
+        with self.assertRaises(SystemExit):
+            cli.main(["--model", "x"])
+        with self.assertRaises(SystemExit):
+            cli.main(["--model", "x", "--image", "a.png", "--video", "v.mp4"])
+
+    def test_stacks_repeated_images_into_frames(self):
+        from mlx_vlm.extract import _stack_images
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            one = self._png(root / "a.png", 8, 6)
+            two = self._png(root / "b.png", 8, 6)
+            self.assertEqual(_stack_images([one]).shape, (8, 6, 3))
+            self.assertEqual(_stack_images([one, two]).shape, (2, 8, 6, 3))
+            with self.assertRaisesRegex(ValueError, "must share a shape"):
+                _stack_images([one, self._png(root / "c.png", 4, 6)])
+
+    def test_manifest_describes_arrays_without_serializing_them(self):
+        from mlx_vlm.extract import _manifest
+
+        manifest = _manifest("depth", {"depth": np.zeros((2, 3), dtype=np.float32)})
+        self.assertEqual(manifest["task"], "depth")
+        self.assertEqual(manifest["outputs"]["depth"]["shape"], [2, 3])
+        self.assertEqual(manifest["outputs"]["depth"]["dtype"], "float32")
+        json.dumps(manifest)
+
+
+class TestExtractionCoverage(unittest.TestCase):
+    """Every model that declares tasks is reachable through the shared API."""
+
+    @staticmethod
+    def _declared():
+        from mlx_vlm import models
+
+        found = {}
+        for info in pkgutil.iter_modules(models.__path__):
+            if not info.ispkg or info.name.startswith("_"):
+                continue
+            try:
+                module = importlib.import_module(f"mlx_vlm.models.{info.name}")
+            except ModuleNotFoundError:
+                continue
+            tasks = getattr(getattr(module, "Model", None), "extraction_types", None)
+            if tasks:
+                found[info.name] = tasks
+        return found
+
+    def test_declared_models_expose_the_hook(self):
+        declared = self._declared()
+        self.assertGreaterEqual(len(declared), 11)
+        for name, tasks in declared.items():
+            model = importlib.import_module(f"mlx_vlm.models.{name}").Model
+            self.assertTrue(callable(getattr(model, "extract", None)), name)
+            if not isinstance(tasks, property):
+                self.assertIsInstance(tasks, tuple, name)
+
+    def test_every_declared_model_has_a_case(self):
+        cased = {
+            case["module"]
+            for case in EXTRACTION_DATA["cases"]
+            if "extraction_api" in case
+        }
+        self.assertEqual(sorted(set(self._declared()) - cased), [])
+
+    def test_sapiens2_derives_its_task_from_the_checkpoint(self):
+        from mlx_vlm.models.sapiens2 import Model
+
+        self.assertIsInstance(Model.extraction_types, property)
+
+    def test_detection_outputs_names_only_populated_fields(self):
+        from mlx_vlm.extraction import DetectionResult, detection_outputs
+
+        full = DetectionResult(
+            boxes=np.zeros((2, 4)),
+            scores=np.ones(2),
+            labels=np.zeros(2, dtype=np.int64),
+            class_names=["a", "b"],
+            masks=np.zeros((2, 3, 3)),
+            track_ids=np.zeros(2, dtype=np.int64),
+            label_names=["x", "y"],
+        )
+        named = detection_outputs(full)
+        self.assertEqual(
+            sorted(k for k in named if k != "metadata"),
+            ["boxes", "labels", "masks", "scores", "track_ids"],
+        )
+        self.assertEqual(sorted(named["metadata"]), ["class_names", "label_names"])
+        sparse = DetectionResult(boxes=np.zeros((1, 4)), scores=np.ones(1))
+        self.assertEqual(sorted(detection_outputs(sparse)), ["boxes", "scores"])
+
+    def test_sam3_requires_a_text_prompt(self):
+        from mlx_vlm.extraction import extract
+        from mlx_vlm.models.sam3 import Model
+
+        with self.assertRaisesRegex(ValueError, "requires text_prompt"):
+            extract(Model.__new__(Model), None, np.zeros((4, 4, 3)))
+
+    def test_cli_exposes_prompt_and_list_tasks(self):
+        from mlx_vlm import extract as cli
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original = cli.load
+            cli.load = lambda *a, **k: (
+                SimpleNamespace(extraction_types=("depth", "geometry")),
+                None,
+            )
+            try:
+                cli.main(["--model", "x", "--list-tasks"])  # no input required
+            finally:
+                cli.load = original
+
+
+class _Stop(Exception):
+    """Stops a predictor once the adapter has handed it its settings."""
+
+
+class TestExtractionPredictorWiring(unittest.TestCase):
+    """Each adapter hands its predictor the collaborator that predictor expects."""
+
+    def test_predictor_constructors_accept_what_the_adapters_pass(self):
+        import inspect
+
+        from mlx_vlm.models.rfdetr.generate import RFDETRPredictor
+        from mlx_vlm.models.rt_detr_v2.generate import RTDetrV2Predictor
+        from mlx_vlm.models.sam3.generate import Sam3Predictor
+
+        for predictor in (RFDETRPredictor, RTDetrV2Predictor, Sam3Predictor):
+            second = list(inspect.signature(predictor.__init__).parameters)[2]
+            self.assertEqual(second, "processor", predictor.__name__)
+
+    def test_sam3d_body_preprocesses_at_the_size_the_ray_grid_assumes(self):
+        from mlx_vlm.models.sam3d_body import processing_sam3d_body
+
+        # apply_ray_conditioning reshapes the ray map to the patch grid implied
+        # by config.image_size, so preprocessing cannot follow a processor that
+        # disagrees with the checkpoint.
+        model = _extraction_model("sam3d_body_api")
+        processor = processing_sam3d_body.SAM3DBodyProcessor(image_size=(512, 384))
+        image = np.zeros((96, 96, 3), dtype=np.uint8)
+
+        seen = []
+        predictor = importlib.import_module("mlx_vlm.models.sam3d_body.generate")
+        original = predictor.SAM3DPredictor.predict
+
+        def record(self, *args, **kwargs):
+            seen.append(tuple(self.config.image_size))
+            raise _Stop
+
+        predictor.SAM3DPredictor.predict = record
+        try:
+            for settings in (processor, None):
+                with contextlib.suppress(_Stop):
+                    model.extract(settings, image)
+        finally:
+            predictor.SAM3DPredictor.predict = original
+
+        self.assertEqual(seen, [(64, 48), (64, 48)])
+
+
+class TestExtractionCLIOutputs(unittest.TestCase):
+    """Non-array outputs must not produce an npz nobody can read back."""
+
+    class _Mesh:
+        pass
+
+    def test_manifest_lists_arrays_and_names_metadata(self):
+        from mlx_vlm.extract import _manifest
+
+        described = _manifest(
+            "objects", {"depth": np.zeros((2, 2)), "metadata": {"mesh": self._Mesh()}}
+        )
+        self.assertEqual(described["outputs"]["depth"]["shape"], [2, 2])
+        self.assertEqual(described["metadata"], ["mesh"])
+        json.dumps(described)
+
+    def test_npz_holds_the_arrays_and_loads_with_default_numpy(self):
+        from mlx_vlm import extract as cli
+
+        outputs = {
+            "depth": np.zeros((2, 2)),
+            "metadata": {"mesh": self._Mesh(), "flag": True},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "nested" / "run.npz"
+            original = cli.load
+            cli.load = lambda *a, **k: (
+                SimpleNamespace(
+                    extraction_types=("objects",),
+                    extract=lambda *args, **kwargs: outputs,
+                ),
+                None,
+            )
+            png = Path(directory) / "f.png"
+            from PIL import Image
+
+            Image.fromarray(np.zeros((4, 4, 3), dtype=np.uint8)).save(png)
+            try:
+                cli.main(["--model", "x", "--image", str(png), "--output", str(target)])
+            finally:
+                cli.load = original
+            self.assertTrue(target.exists(), "parent directory should be created")
+            loaded = np.load(target)  # default: allow_pickle=False
+            self.assertEqual(sorted(loaded.keys()), ["depth"])
+            self.assertEqual(loaded["depth"].shape, (2, 2))
+
+
+class TestSam3dBodyRayConditioning(unittest.TestCase):
+    """Ray conditioning width follows embed_dim instead of a fixed 1379."""
+
+    def test_width_is_embed_dim_plus_the_ray_encoding(self):
+        from mlx_vlm.models.sam3d_body.config import SAM3DConfig
+        from mlx_vlm.models.sam3d_body.model import RAY_ENCODING_CHANNELS, SAM3DBody
+
+        self.assertEqual(1280 + RAY_ENCODING_CHANNELS, 1379)  # production, unchanged
+
+        small = SAM3DBody(SAM3DConfig(embed_dim=64, depth=1, num_heads=2, head_dim=32))
+        conv = small.ray_cond_emb.conv
+        self.assertEqual(conv.weight.shape[-1], 64 + RAY_ENCODING_CHANNELS)
+        self.assertEqual(conv.weight.shape[0], 64)
+
+
+class TestExtractionContractGuards(unittest.TestCase):
+    """A model author's likely slips fail with a message that names the slip."""
+
+    def test_rejects_a_string_declaration(self):
+        from mlx_vlm.extraction import extract
+
+        class Stringly:
+            extraction_types = "depth"  # iterates as characters if unguarded
+
+            def extract(self, processor, inputs, task=None, **kwargs):
+                return {"depth": 1}
+
+        with self.assertRaisesRegex(ValueError, "must be a sequence"):
+            extract(Stringly(), None, "x")
+
+    def test_rejects_a_declaration_without_a_hook(self):
+        from mlx_vlm.extraction import extract
+
+        class Declared:
+            extraction_types = ("depth",)
+
+        with self.assertRaisesRegex(ValueError, "implements no extract"):
+            extract(Declared(), None, "x")
+
+    def test_accepts_a_list_declaration(self):
+        from mlx_vlm.extraction import extract
+
+        class Listly:
+            extraction_types = ["depth"]
+
+            def extract(self, processor, inputs, task=None, **kwargs):
+                return {"depth": np.zeros(1), "metadata": {"task": task}}
+
+        self.assertEqual(extract(Listly(), None, "x")["metadata"]["task"], "depth")
+
+
+class TestRfdetrTwoStageSelection(unittest.TestCase):
+    """Two-stage selection names its constraint instead of failing in argpartition."""
+
+    def test_too_few_tokens_reports_the_constraint(self):
+        from mlx_vlm.models.rfdetr import Model, ModelConfig
+
+        model = Model(ModelConfig())
+        model.eval()
+        with self.assertRaisesRegex(ValueError, "encoder tokens"):
+            model(mx.random.normal((1, 224, 224, 3)))
+
+    def test_a_small_configuration_still_forwards(self):
+        from mlx_vlm.models.rfdetr import Model, ModelConfig
+
+        model = Model(ModelConfig(num_queries=16))
+        model.eval()
+        out = model(mx.random.normal((1, 112, 112, 3)))
+        self.assertEqual(sorted(out), ["pred_boxes", "pred_logits"])
+        self.assertEqual(out["pred_boxes"].shape[1], 16)
+
+
+class TestExtractSettings(unittest.TestCase):
+    """`--set NAME=VALUE` parses literals and rejects malformed input."""
+
+    def _parse(self, pairs):
+        import argparse
+
+        from mlx_vlm.extract import _parse_settings
+
+        parser = argparse.ArgumentParser()
+        return _parse_settings(pairs, parser)
+
+    def test_parses_literals_and_keeps_types(self):
+        cases = {
+            "score_threshold=0.5": ("score_threshold", 0.5),
+            "num_tokens=256": ("num_tokens", 256),
+            "neg=-1.5": ("neg", -1.5),
+            "sci=1e-3": ("sci", 0.001),
+            "bbox=[0, 0, 10, 10]": ("bbox", [0, 0, 10, 10]),
+            "d={'a': 1}": ("d", {"a": 1}),
+        }
+        for raw, (name, want) in cases.items():
+            got = self._parse([raw])[name]
+            self.assertEqual(got, want, raw)
+            self.assertIs(type(got), type(want), raw)
+
+    def test_booleans_and_none_are_not_left_as_strings(self):
+        # "false" as a string is truthy, which would silently invert a flag.
+        for raw, want in (
+            ("progress=false", False),
+            ("progress=False", False),
+            ("flip_test=TRUE", True),
+            ("x=none", None),
+            ("x=null", None),
+        ):
+            name = raw.split("=")[0]
+            self.assertIs(self._parse([raw])[name], want, raw)
+
+    def test_strings_values_with_equals_and_spaces(self):
+        self.assertEqual(self._parse(["prompt=a person"])["prompt"], "a person")
+        self.assertEqual(self._parse(["eq=a=b"])["eq"], "a=b")
+        self.assertEqual(self._parse([" pad =1"])["pad"], 1)
+        self.assertEqual(self._parse(["empty="])["empty"], "")
+
+    def test_empty_and_missing(self):
+        self.assertEqual(self._parse([]), {})
+        self.assertEqual(self._parse(None), {})
+
+    def test_rejects_malformed_and_duplicates(self):
+        for pairs in (["noequals"], ["=5"], ["a=1", "a=2"]):
+            with self.assertRaises(SystemExit):
+                self._parse(pairs)
+
+
+class TestExtractInputFiles(unittest.TestCase):
+    """`--set-file NAME=PATH` reads array inputs without reshaping them."""
+
+    def _parser(self):
+        import argparse
+
+        return argparse.ArgumentParser()
+
+    def _write(self, root):
+        from PIL import Image
+
+        Image.fromarray((np.random.rand(8, 6, 3) * 255).astype(np.uint8)).save(
+            root / "rgb.png"
+        )
+        Image.fromarray((np.random.rand(8, 6) * 255).astype(np.uint8), mode="L").save(
+            root / "gray.png"
+        )
+        rgba = np.zeros((8, 6, 4), np.uint8)
+        rgba[..., 3] = 255
+        rgba[0:2, 0:2, 3] = 0
+        Image.fromarray(rgba, mode="RGBA").save(root / "cut.png")
+        np.save(root / "pm.npy", np.random.rand(8, 6, 3).astype(np.float32))
+        np.savez(root / "one.npz", only=np.zeros((3, 3)))
+        np.savez(root / "two.npz", a=np.zeros(2), b=np.zeros(2))
+        (root / "box.json").write_text(json.dumps([[0, 0, 10, 10]]))
+        (root / "k.txt").write_text("nope")
+
+    def test_reads_each_supported_type(self):
+        from mlx_vlm.extract import _load_input_file
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write(root)
+            parser = self._parser()
+            self.assertEqual(
+                np.asarray(_load_input_file(root / "rgb.png", parser)).shape, (8, 6, 3)
+            )
+            self.assertEqual(
+                np.asarray(_load_input_file(root / "pm.npy", parser)).shape, (8, 6, 3)
+            )
+            self.assertEqual(
+                np.asarray(_load_input_file(root / "one.npz", parser)).shape, (3, 3)
+            )
+            self.assertEqual(
+                _load_input_file(root / "box.json", parser), [[0, 0, 10, 10]]
+            )
+
+    def test_keeps_the_files_own_image_mode(self):
+        from mlx_vlm.extract import _load_input_file
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write(root)
+            parser = self._parser()
+            # a grayscale mask must stay (H, W); RGBA must keep its alpha, which
+            # is the channel sam3d_objects reads for a cutout.
+            self.assertEqual(
+                np.asarray(_load_input_file(root / "gray.png", parser)).shape, (8, 6)
+            )
+            cutout = np.asarray(_load_input_file(root / "cut.png", parser))
+            self.assertEqual(cutout.shape, (8, 6, 4))
+            self.assertEqual(int((cutout[..., 3] == 0).sum()), 4)
+
+    def test_rejects_unreadable_or_ambiguous_files(self):
+        from mlx_vlm.extract import _parse_input_files
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write(root)
+            for arg in (
+                f"x={root / 'two.npz'}",
+                f"x={root / 'k.txt'}",
+                f"x={root / 'missing.png'}",
+                "noequals",
+                "=x",
+                "x=",
+            ):
+                with self.assertRaises(SystemExit, msg=arg):
+                    _parse_input_files([arg], self._parser())
+
+    def test_multiple_inputs_and_duplicate_rejection(self):
+        from mlx_vlm.extract import _parse_input_files
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write(root)
+            loaded = _parse_input_files(
+                [f"mask={root / 'gray.png'}", f"pointmap={root / 'pm.npy'}"],
+                self._parser(),
+            )
+            self.assertEqual(np.asarray(loaded["mask"]).shape, (8, 6))
+            self.assertEqual(np.asarray(loaded["pointmap"]).shape, (8, 6, 3))
+            with self.assertRaises(SystemExit):
+                _parse_input_files(
+                    [f"a={root / 'gray.png'}", f"a={root / 'pm.npy'}"], self._parser()
+                )
+
+
+class TestYolo11StandardLoading(unittest.TestCase):
+    """yolo11 loads through the shared path with the same weights as before."""
+
+    CONFIG = {"model_type": "yolo11", "nc": 2, "ch": [256, 512, 512], "reg_max": 4}
+
+    @staticmethod
+    def _to_checkpoint_key(key, last):
+        """Canonical key -> Ultralytics key, dropping MLX's Sequential hops."""
+        parts = key.split(".")
+        if parts[0] == "detect":
+            out, rest = [f"model.{last}"], parts[1:]
+        else:
+            out, rest = [f"model.{parts[1]}"], parts[2:]
+        for index, segment in enumerate(rest):
+            if (
+                segment == "layers"
+                and index + 1 < len(rest)
+                and rest[index + 1].isdigit()
+            ):
+                continue
+            out.append(segment)
+        return ".".join(out)
+
+    @staticmethod
+    def _reference_load(model, checkpoint):
+        """The walk yolo11 used before it had a sanitize, as an oracle.
+
+        A bare digit is a list index or an nn.Sequential hop depending on the
+        module it indexes, so this resolves the path rather than matching it.
+        """
+
+        def resolve(obj, name):
+            if isinstance(obj, list):
+                return obj[int(name)]
+            children = getattr(obj, "layers", None)
+            if children is not None and name.isdigit():
+                return children[int(name)]
+            return getattr(obj, name)
+
+        last = len(model.layers)
+        for key, value in checkpoint.items():
+            index, _, remainder = key[len("model.") :].partition(".")
+            target = model.detect if int(index) == last else model.layers[int(index)]
+            attrs = remainder.split(".")
+            for attr in attrs[:-1]:
+                target = resolve(target, attr)
+            setattr(target, attrs[-1], value)
+
+    def test_sanitize_places_every_weight_where_the_old_walk_did(self):
+        from mlx_vlm.models.yolo11 import Model, ModelConfig
+
+        config = ModelConfig.from_dict(dict(self.CONFIG))
+        reference = Model(config)
+        reference.eval()
+        canonical = dict(tree_flatten(reference.parameters()))
+        self.assertGreater(len(canonical), 100)
+
+        last = len(reference.layers)
+        checkpoint = {
+            self._to_checkpoint_key(name, last): mx.random.normal(value.shape)
+            for name, value in canonical.items()
+        }
+        self.assertEqual(len(checkpoint), len(canonical))
+
+        legacy = Model(config)
+        self._reference_load(legacy, checkpoint)
+        legacy.eval()
+
+        standard = Model(config)
+        standard.load_weights(list(standard.sanitize(dict(checkpoint)).items()))
+        standard.eval()
+
+        expected = dict(tree_flatten(legacy.parameters()))
+        actual = dict(tree_flatten(standard.parameters()))
+        self.assertEqual(set(expected), set(actual))
+        for name, value in expected.items():
+            self.assertTrue(mx.array_equal(value, actual[name]).item(), name)
+
+    def test_loads_from_disk_and_extracts(self):
+        from mlx_vlm.extraction import extract
+        from mlx_vlm.models.yolo11 import Model, ModelConfig
+        from mlx_vlm.utils import load_model
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = Model(ModelConfig.from_dict(dict(self.CONFIG)))
+            mx.eval(model.parameters())
+            (root / "config.json").write_text(json.dumps(self.CONFIG))
+            mx.save_safetensors(
+                str(root / "model.safetensors"), dict(tree_flatten(model.parameters()))
+            )
+            loaded = load_model(root)
+            self.assertEqual(loaded.extraction_types, ("detection",))
+            outputs = extract(
+                loaded, None, (np.random.rand(160, 160, 3) * 255).astype(np.uint8)
+            )
+            self.assertEqual(sorted(outputs), ["boxes", "labels", "scores"])
+            self.assertEqual(np.asarray(outputs["boxes"]).shape[1], 4)
+
+
+class TestDetectionOutputsAcrossResultTypes(unittest.TestCase):
+    """sam3 keeps its own DetectionResult, so the helper must read both."""
+
+    def test_reads_sam3s_result_shape(self):
+        from mlx_vlm.extraction import detection_outputs
+        from mlx_vlm.models.sam3.generate import DetectionResult as Sam3Result
+
+        # sam3's labels are per-detection prompt strings, not class ids, and it
+        # has no class_names field at all.
+        result = Sam3Result(
+            boxes=np.zeros((2, 4)),
+            masks=np.zeros((2, 3, 3)),
+            scores=np.ones(2),
+            labels=["a person", "a person"],
+            track_ids=np.zeros(2, dtype=np.int64),
+        )
+        named = detection_outputs(result)
+        self.assertEqual(
+            sorted(k for k in named if k != "metadata"),
+            ["boxes", "masks", "scores", "track_ids"],
+        )
+        self.assertEqual(named["metadata"]["label_names"], ["a person", "a person"])
+        for name, value in named.items():
+            if name != "metadata":
+                self.assertIsInstance(value, (mx.array, np.ndarray), name)
+
+    def test_reads_the_shared_result_shape(self):
+        from mlx_vlm.extraction import DetectionResult, detection_outputs
+
+        named = detection_outputs(
+            DetectionResult(
+                boxes=np.zeros((1, 4)),
+                scores=np.ones(1),
+                labels=np.zeros(1, dtype=np.int64),
+                class_names=["cat"],
+            )
+        )
+        self.assertEqual(
+            sorted(k for k in named if k != "metadata"), ["boxes", "labels", "scores"]
+        )
+        self.assertEqual(named["metadata"]["class_names"], ["cat"])
+
+
+class TestSam3dBodyExtraction(unittest.TestCase):
+    """sam3d_body runs once its skeleton is a valid tree.
+
+    Its case carries no config because joint_parents is a checkpoint buffer
+    that defaults to zeros, which makes forward kinematics index an empty
+    list, so the topology is supplied here instead.
+    """
+
+    def test_extracts_body_geometry(self):
+        from mlx_vlm.extraction import extract
+        from mlx_vlm.models.sam3d_body.config import SAM3DConfig
+        from mlx_vlm.models.sam3d_body.model import SAM3DBody
+
+        config = SAM3DConfig(
+            embed_dim=64,
+            depth=1,
+            num_heads=2,
+            head_dim=32,
+            image_size=(64, 48),
+            num_storage_tokens=2,
+            decoder_dim=64,
+            decoder_depth=1,
+            decoder_heads=2,
+            decoder_head_dim=32,
+            decoder_mlp_dim=64,
+            prompt_embed_dim=64,
+            num_vertices=64,
+            num_faces=32,
+        )
+        model = SAM3DBody(config)
+        model.eval()
+        model.head_pose.body_model.joint_parents = mx.array(
+            [-1] + list(range(config.num_joints - 1)), dtype=mx.int32
+        )
+        mx.eval(model.parameters())
+
+        self.assertEqual(model.extraction_types, ("body",))
+        image = (np.random.default_rng(0).random((64, 48, 3)) * 255).astype(np.uint8)
+        outputs = extract(model, None, image)
+        self.assertEqual(
+            sorted(k for k in outputs if k != "metadata"),
+            ["pred_camera", "pred_joint_coords", "pred_keypoints_3d", "pred_vertices"],
+        )
+        for name, value in outputs.items():
+            if name != "metadata":
+                self.assertIsInstance(value, (mx.array, np.ndarray), name)
+        self.assertIn("bbox", outputs["metadata"])
+
+
+class TestSam3BoxPrompts(unittest.TestCase):
+    """Box prompts must reach the geometry encoder in both SAM 3 variants."""
+
+    @staticmethod
+    def _detector(pkg, dim=32):
+        cfg = importlib.import_module(f"mlx_vlm.models.{pkg}.config")
+        backbone = cfg.ViTConfig(
+            hidden_size=dim,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            intermediate_size=dim,
+            image_size=112,
+            patch_size=14,
+            window_size=4,
+            global_attn_indexes=[0],
+            pretrain_image_size=112,
+        )
+        detector = cfg.DetectorConfig(
+            vision_config=cfg.VisionEncoderConfig(
+                backbone_config=backbone,
+                fpn_hidden_size=dim,
+                backbone_feature_sizes=[[32, 32], [16, 16], [8, 8]],
+            ),
+            text_config=cfg.TextEncoderConfig(
+                hidden_size=dim,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                intermediate_size=dim,
+                vocab_size=64,
+                projection_dim=dim,
+            ),
+            detr_encoder_config=cfg.DETREncoderConfig(
+                hidden_size=dim,
+                num_layers=1,
+                num_attention_heads=2,
+                intermediate_size=dim,
+            ),
+            detr_decoder_config=cfg.DETRDecoderConfig(
+                hidden_size=dim,
+                num_layers=1,
+                num_attention_heads=2,
+                num_queries=4,
+                intermediate_size=dim,
+            ),
+            geometry_encoder_config=cfg.GeometryEncoderConfig(
+                hidden_size=dim,
+                num_layers=1,
+                num_attention_heads=2,
+                intermediate_size=dim,
+                roi_size=2,
+            ),
+            mask_decoder_config=cfg.DetectorMaskDecoderConfig(
+                hidden_size=dim, num_attention_heads=2
+            ),
+        )
+        module = importlib.import_module(f"mlx_vlm.models.{pkg}.{pkg}")
+        model = module.DetectorModel(cfg.ModelConfig(detector_config=detector))
+        model.eval()
+        return model
+
+    def test_box_prompts_change_detection(self):
+        for pkg in ("sam3", "sam3_1"):
+            with self.subTest(pkg=pkg):
+                mx.random.seed(1234)
+                model = self._detector(pkg)
+                pixel_values = mx.random.normal((1, 112, 112, 3))
+                ids = mx.array([[1, 2, 3, 4]])
+                mask = mx.ones((1, 4), dtype=mx.bool_)
+                plain = model(pixel_values, input_ids=ids, attention_mask=mask)
+                prompted = model(
+                    pixel_values,
+                    input_ids=ids,
+                    attention_mask=mask,
+                    boxes=mx.array([[[0.1, 0.1, 0.5, 0.5]]]),
+                )
+                shift = float(
+                    mx.abs(plain["pred_logits"] - prompted["pred_logits"]).max()
+                )
+                self.assertGreater(shift, 1e-6, f"{pkg} ignored its box prompt")
+
+    def test_empty_boxes_are_a_no_op(self):
+        mx.random.seed(1234)
+        model = self._detector("sam3_1")
+        pixel_values = mx.random.normal((1, 112, 112, 3))
+        ids = mx.array([[1, 2, 3, 4]])
+        mask = mx.ones((1, 4), dtype=mx.bool_)
+        plain = model(pixel_values, input_ids=ids, attention_mask=mask)
+        empty = model(
+            pixel_values,
+            input_ids=ids,
+            attention_mask=mask,
+            boxes=mx.zeros((1, 0, 4)),
+        )
+        self.assertTrue(mx.allclose(plain["pred_logits"], empty["pred_logits"]).item())
+
+
+class TestExtractionEntryPoint(unittest.TestCase):
+    """The documented command has to exist as a console script."""
+
+    def test_extract_is_registered(self):
+        try:
+            import tomllib
+        except ModuleNotFoundError:
+            self.skipTest("tomllib needs Python 3.11")
+        root = Path(__file__).resolve().parents[2] / "pyproject.toml"
+        if not root.exists():
+            self.skipTest("running outside a source checkout")
+        scripts = tomllib.loads(root.read_text())["project"]["scripts"]
+        self.assertEqual(scripts.get("mlx_vlm.extract"), "mlx_vlm.extract:main")
+        from mlx_vlm.extract import main
+
+        self.assertTrue(callable(main))
+
+
+class TestExtractionProcessorResolution(unittest.TestCase):
+    """Every extraction model the CLI can name has to resolve a processor."""
+
+    PROCESSORS = {
+        "moge3": ("moge3", "MogeProcessor"),
+        "rt_detr_v2": ("rt_detr_v2", "RTDetrV2Processor"),
+        "rf-detr": ("rfdetr", "RFDETRProcessor"),
+        "yolo11": ("yolo11", "YOLO11Processor"),
+        "sam3": ("sam3", "Sam3Processor"),
+        "sam3_1": ("sam3_1", "Sam3Processor"),
+        "sapiens2": ("sapiens2", "Sapiens2Processor"),
+        "video_depth_anything": ("video_depth_anything", "VideoDepthProcessor"),
+        "sam3d_body": ("sam3d_body", "SAM3DBodyProcessor"),
+        "sam3d_objects": ("sam3d_objects", "SAM3DObjectsProcessor"),
+    }
+
+    def test_load_processor_resolves_from_the_model_type(self):
+        from mlx_vlm.utils import load_processor
+
+        for model_type, (package, expected) in self.PROCESSORS.items():
+            with self.subTest(model_type=model_type):
+                importlib.import_module(f"mlx_vlm.models.{package}")
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory)
+                    (path / "config.json").write_text(
+                        json.dumps({"model_type": model_type})
+                    )
+                    processor = load_processor(path, True)
+                self.assertEqual(type(processor).__name__, expected)
+
+
+class TestSam3TokenizerSource(unittest.TestCase):
+    """SAM 3 takes its CLIP vocabulary from the checkpoint or not at all."""
+
+    def test_missing_tokenizer_is_refused(self):
+        from mlx_vlm.models.sam3.processing_sam3 import Sam3Processor
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / "processor_config.json").write_text(json.dumps({}))
+            processor = Sam3Processor.from_pretrained(str(path))
+            self.assertIsNone(processor.tokenizer)
+            with self.assertRaisesRegex(ValueError, "ships no tokenizer"):
+                processor.preprocess_text("a cat")
+
+    def test_probing_for_a_tokenizer_does_not_raise(self):
+        from mlx_vlm.models.sam3.processing_sam3 import Sam3Processor
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / "processor_config.json").write_text(json.dumps({}))
+            processor = Sam3Processor.from_pretrained(str(path))
+            # load_processor checks hasattr, which only swallows AttributeError.
+            self.assertTrue(hasattr(processor, "tokenizer"))

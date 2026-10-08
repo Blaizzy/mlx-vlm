@@ -106,3 +106,17 @@ class Model(nn.Module):
         from .pipeline import Pipeline
 
         return Pipeline(self).generate(*args, **kwargs)
+
+    extraction_types = ("objects",)
+
+    def extract(self, processor, inputs, task=None, **kwargs):
+        """Reconstruct 3D objects from one image, optionally mask-conditioned."""
+        from .pipeline import Pipeline
+
+        # The pipeline works in MLX throughout, including its dtype checks.
+        for name in ("mask", "pointmap"):
+            if kwargs.get(name) is not None:
+                kwargs[name] = mx.array(kwargs[name])
+        from ...extraction import split_outputs
+
+        return split_outputs(Pipeline(self).generate(mx.array(inputs), **kwargs))

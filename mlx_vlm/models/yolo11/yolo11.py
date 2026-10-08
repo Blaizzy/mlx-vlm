@@ -467,55 +467,61 @@ def non_max_suppression(
 # ---------------------------------------------------------------------------
 
 
-def load_weights(model, mlx_weights, prefix="model."):
-    """Load an MLX-layout Ultralytics state dict into a YOLO11 model.
+class Model(YOLO11):
+    """YOLO11 behind the repository's standard config and loader."""
 
-    Expects conv weights already transposed to (O, H, W, I); see convert.py.
-    Puts the model in eval mode so BatchNorm uses running statistics.
-    """
-    model.eval()
-    layer_weights = {}
-    for key, val in mlx_weights.items():
-        if not key.startswith(prefix):
-            continue
-        rest = key[len(prefix) :]
-        parts = rest.split(".")
-        layer_idx = int(parts[0])
-        subkey = ".".join(parts[1:])
-        layer_weights.setdefault(layer_idx, {})[subkey] = val
+    extraction_types = ("detection",)
 
-    for layer_idx, weights in layer_weights.items():
-        if layer_idx < len(model.layers):
-            module = model.layers[layer_idx]
-            if module is None:
-                if weights:
-                    raise ValueError(f"unexpected weights for concat layer {layer_idx}")
+    def __init__(self, config):
+        super().__init__(nc=config.nc, ch=tuple(config.ch), reg_max=config.reg_max)
+        self.config = config
+
+    def sanitize(self, weights):
+        """Rename Ultralytics keys onto this module tree.
+
+        A checkpoint addresses layers as ``model.<index>`` and names
+        ``nn.Sequential`` children with a bare digit, where MLX addresses them
+        as ``layers.<index>``; the digit's meaning depends on the module it
+        indexes, so the path is resolved rather than pattern-matched.
+        """
+        last = len(self.layers)
+        renamed = {}
+        for key, value in weights.items():
+            if not key.startswith("model."):
+                renamed[key] = value
                 continue
-            _load_into(module, weights)
-        elif layer_idx == len(model.layers):
-            _load_into(model.detect, weights)
-        else:
-            raise ValueError(f"layer index {layer_idx} out of range")
+            index, _, remainder = key[len("model.") :].partition(".")
+            position = int(index)
+            if position == last:
+                module, path = self.detect, ["detect"]
+            elif position < last:
+                module, path = self.layers[position], ["layers", index]
+            else:
+                raise ValueError(f"layer index {position} out of range")
+            if module is None:
+                raise ValueError(f"unexpected weights for concat layer {position}")
+            parts = remainder.split(".")
+            for name in parts[:-1]:
+                if isinstance(module, list):
+                    module = module[int(name)]
+                    path.append(name)
+                    continue
+                children = getattr(module, "layers", None)
+                if children is not None and name.isdigit():
+                    module = children[int(name)]
+                    path += ["layers", name]
+                else:
+                    module = getattr(module, name)
+                    path.append(name)
+            path.append(parts[-1])
+            renamed[".".join(path)] = value
+        return renamed
 
+    def extract(self, processor, inputs, task=None, score_threshold=None, **kwargs):
+        """Detect objects in one image."""
+        from ...extraction import detection_outputs
+        from .inference import predict
 
-def _load_into(module, weights):
-    """Set attributes following dot-separated keys.
-
-    Digit segments index Python lists directly; MLX ``nn.Sequential`` names
-    its children "0", "1", ... so ``getattr`` covers both cases.
-    """
-
-    def resolve(obj, name):
-        if isinstance(obj, list):
-            return obj[int(name)]
-        layers = getattr(obj, "layers", None)  # MLX Sequential
-        if layers is not None and name.isdigit():
-            return layers[int(name)]
-        return getattr(obj, name)
-
-    for key, val in weights.items():
-        attrs = key.split(".")
-        obj = module
-        for attr in attrs[:-1]:
-            obj = resolve(obj, attr)
-        setattr(obj, attrs[-1], val)
+        if score_threshold is not None:
+            kwargs["conf_threshold"] = score_threshold
+        return detection_outputs(predict(self, inputs, **kwargs))

@@ -73,6 +73,43 @@ case configs and `shared_configs`, keeping numerical, checkpoint conversion,
 streaming, and IO assertions in Python. Use nonuniform weights to verify
 conversion values and second-pass stability.
 
+An extraction model can also expose the shared prediction API. Declare the
+tasks it serves as `extraction_types` on the `Model` class and implement
+`extract(self, processor, inputs, task=None, **kwargs)` returning a
+mapping of named outputs, the way `decision_types` and `predict` work for
+decision models. Named outputs are arrays; anything else a result carries,
+such as class names, a mesh or a flag, goes under the reserved `metadata`
+key, mirroring how decision results keep model-specific metrics there. `mlx_vlm.extraction.extract` validates the task against the
+declaration before the model runs, and `mlx_vlm.extract` exposes it on the
+command line:
+
+```shell
+mlx_vlm.extract --model <path> --image frame.png --output out.npz
+mlx_vlm.extract --model <path> --list-tasks
+mlx_vlm.extract --model <path> --image frame.png --set score_threshold=0.5
+```
+
+`--set NAME=VALUE` is repeatable and forwards keywords to `extract`, so a
+model's own options need no flag of their own. A model keeps the option
+names its own predictor uses, except that every detection model also
+accepts `score_threshold`, so one `--set` works across the family. Values
+are read as Python literals, with `true`, `false`, `none` and `null`
+accepted in any case. `--set-file NAME=PATH` does the same for array
+inputs that are too large to write inline, such as a mask or a point map,
+reading `.npy`, single-array `.npz`, `.json` and images. Images keep the
+mode they were saved in, so a grayscale mask stays two-dimensional and a
+cutout keeps its alpha.
+
+Add `extraction_api` to the model's `checks` with a `task`, an `input_shape`
+and the `outputs` it must name. `kwargs`, `config_overrides`, `processor`
+and `processor_kwargs` are optional, as are `index_weights`, which seeds a
+parameter that holds indices rather than numbers with a run from a given
+start, and `tokenizer`, which hands the processor a vocabulary built in the
+test rather than downloaded. The check runs the model and asserts the
+declared outputs are present and finite, so a new model needs a case entry
+rather than a test of its own, and a model that declares `extraction_types`
+without one fails the coverage test.
+
 From the repository root, you can run the tests with:
 
 ```shell
