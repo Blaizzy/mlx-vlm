@@ -2500,3 +2500,529 @@ class TestSam3TokenizerSource(unittest.TestCase):
             processor = Sam3Processor.from_pretrained(str(path))
             # load_processor checks hasattr, which only swallows AttributeError.
             self.assertTrue(hasattr(processor, "tokenizer"))
+
+
+class TestExtractionResults(unittest.TestCase):
+    """The shared detection containers cover every per-model usage pattern."""
+
+    def test_every_import_site_is_the_same_class(self):
+        from mlx_vlm.extraction import DetectionResult, cxcywh_to_xyxy
+        from mlx_vlm.models import yolo11
+        from mlx_vlm.models.rfdetr import generate as rfdetr_generate
+        from mlx_vlm.models.rt_detr_v2 import generate as rt_detr_generate
+        from mlx_vlm.models.yolo11 import inference as yolo11_inference
+
+        for module in (yolo11, yolo11_inference, rfdetr_generate, rt_detr_generate):
+            self.assertIs(module.DetectionResult, DetectionResult)
+        self.assertIs(rfdetr_generate.cxcywh_to_xyxy, cxcywh_to_xyxy)
+
+    def test_supports_each_models_fields(self):
+        from mlx_vlm.extraction import DetectionResult
+
+        yolo = DetectionResult(
+            boxes=mx.zeros((2, 4)),
+            scores=mx.zeros((2,)),
+            labels=mx.zeros((2,), dtype=mx.int32),
+            image=object(),
+        )
+        self.assertEqual(len(yolo), 2)
+        self.assertEqual(yolo.class_names, [])
+        self.assertIsNone(yolo.masks)
+
+        rfdetr = DetectionResult(
+            boxes=np.zeros((3, 4)),
+            scores=np.zeros((3,)),
+            labels=np.zeros((3,), dtype=np.int64),
+            class_names=["a", "b"],
+            masks=np.zeros((3, 5, 5)),
+        )
+        self.assertEqual(len(rfdetr), 3)
+        self.assertEqual(rfdetr.masks.shape, (3, 5, 5))
+
+        sam3 = DetectionResult(
+            boxes=np.zeros((1, 4)),
+            masks=np.zeros((1, 5, 5)),
+            scores=np.zeros((1,)),
+            label_names=["person"],
+            track_ids=np.zeros((1,), dtype=np.int64),
+        )
+        self.assertEqual(sam3.label_names, ["person"])
+        self.assertIsNone(sam3.labels)
+
+        self.assertEqual(
+            len(DetectionResult(boxes=np.zeros((0, 4)), scores=np.zeros(0))), 0
+        )
+
+    def test_tracking_result_fields(self):
+        from mlx_vlm.extraction import TrackingResult
+
+        frame = TrackingResult(
+            frame_idx=7, masks=np.zeros((2, 4, 4)), scores=np.ones(2), object_ids=[3, 9]
+        )
+        self.assertEqual(frame.frame_idx, 7)
+        self.assertEqual(frame.object_ids, [3, 9])
+        self.assertIsNone(
+            TrackingResult(
+                frame_idx=0, masks=np.zeros((1, 2, 2)), scores=np.ones(1)
+            ).object_ids
+        )
+
+    def test_cxcywh_to_xyxy_matches_both_array_types(self):
+        from mlx_vlm.extraction import cxcywh_to_xyxy
+
+        boxes = np.array([[10.0, 20.0, 4.0, 6.0]])
+        np.testing.assert_allclose(cxcywh_to_xyxy(boxes), [[8.0, 17.0, 12.0, 23.0]])
+        self.assertEqual(cxcywh_to_xyxy(np.zeros((2, 3, 4))).shape, (2, 3, 4))
+        as_mlx = cxcywh_to_xyxy(mx.array(boxes))
+        self.assertIsInstance(as_mlx, mx.array)
+        np.testing.assert_allclose(np.array(as_mlx), cxcywh_to_xyxy(boxes), atol=1e-6)
+
+
+class TestExtractionAPI(unittest.TestCase):
+    """`extraction.extract` gates on declared tasks before touching the model."""
+
+    class _Depth:
+        extraction_types = ("depth",)
+
+        def extract(self, processor, inputs, task=None, **kwargs):
+            return {
+                "depth": np.zeros(1),
+                "metadata": {"task": task, "kwargs": kwargs},
+            }
+
+    class _Multi:
+        extraction_types = ("depth", "pointmap")
+
+        def extract(self, processor, inputs, task=None, **kwargs):
+            return {task: np.zeros(1)}
+
+    def test_rejects_models_without_declared_tasks(self):
+        from mlx_vlm.extraction import extract
+
+        with self.assertRaisesRegex(ValueError, "does not support extraction"):
+            extract(object(), None, "x")
+
+    def test_rejects_missing_inputs_and_unsupported_task(self):
+        from mlx_vlm.extraction import extract
+
+        with self.assertRaisesRegex(ValueError, "requires inputs"):
+            extract(self._Depth(), None, None)
+        with self.assertRaisesRegex(ValueError, "does not support 'pointmap'"):
+            extract(self._Depth(), None, "x", task="pointmap")
+
+    def test_requires_an_explicit_task_when_several_are_served(self):
+        from mlx_vlm.extraction import extract
+
+        with self.assertRaisesRegex(ValueError, r"pass task="):
+            extract(self._Multi(), None, "x")
+        self.assertEqual(
+            sorted(extract(self._Multi(), None, "x", task="depth")), ["depth"]
+        )
+
+    def test_rejects_non_mapping_outputs(self):
+        from mlx_vlm.extraction import extract
+
+        class Bad:
+            extraction_types = ("depth",)
+
+            def extract(self, processor, inputs, task=None, **kwargs):
+                return np.zeros(3)
+
+        with self.assertRaisesRegex(ValueError, "must return a mapping"):
+            extract(Bad(), None, "x")
+
+    def test_infers_the_single_task_and_forwards_kwargs(self):
+        from mlx_vlm.extraction import extract
+
+        out = extract(self._Depth(), None, "frames", progress=False)
+        self.assertEqual(np.asarray(out["depth"]).shape, (1,))
+        self.assertEqual(out["metadata"]["task"], "depth")
+        self.assertEqual(out["metadata"]["kwargs"], {"progress": False})
+
+
+class TestExtractionCLI(unittest.TestCase):
+    """The `extract` subcommand loads a checkpoint, runs a task and reports shapes."""
+
+    @staticmethod
+    def _checkpoint(root, case_id, module_name, overrides=None):
+        config = copy.deepcopy(_extraction_config(case_id))
+        config["model_type"] = module_name
+        config.update(overrides or {})
+        module = importlib.import_module(f"mlx_vlm.models.{module_name}")
+        model = module.Model(module.ModelConfig.from_dict(dict(config)))
+        mx.eval(model.parameters())
+        (root / "config.json").write_text(json.dumps(config))
+        mx.save_safetensors(
+            str(root / "model.safetensors"), dict(tree_flatten(model.parameters()))
+        )
+        return model
+
+    @staticmethod
+    def _png(path, height, width):
+        from PIL import Image
+
+        pixels = (np.random.rand(height, width, 3) * 255).astype(np.uint8)
+        Image.fromarray(pixels).save(path)
+        return path
+
+    def test_is_a_registered_subcommand(self):
+        source = Path(importlib.import_module("mlx_vlm.__main__").__file__).read_text()
+        self.assertIn('"extract"', source)
+
+    def test_rejects_a_model_without_declared_tasks(self):
+        from mlx_vlm import extract as cli
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image = self._png(root / "frame.png", 8, 8)
+            original = cli.load
+            cli.load = lambda *args, **kwargs: (object(), None)
+            try:
+                with self.assertRaises(SystemExit):
+                    cli.main(["--model", "any", "--image", str(image)])
+            finally:
+                cli.load = original
+
+    def test_rejects_mismatched_image_shapes(self):
+        from mlx_vlm import extract as cli
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._checkpoint(root, "sapiens2", "sapiens2")
+            first = self._png(root / "a.png", 32, 24)
+            second = self._png(root / "b.png", 16, 24)
+            with self.assertRaises(SystemExit):
+                cli.main(
+                    [
+                        "--model",
+                        str(root),
+                        "--image",
+                        str(first),
+                        "--image",
+                        str(second),
+                    ]
+                )
+
+    def test_requires_exactly_one_input_source(self):
+        from mlx_vlm import extract as cli
+
+        with self.assertRaises(SystemExit):
+            cli.main(["--model", "x"])
+        with self.assertRaises(SystemExit):
+            cli.main(["--model", "x", "--image", "a.png", "--video", "v.mp4"])
+
+    def test_stacks_repeated_images_into_frames(self):
+        from mlx_vlm.extract import _stack_images
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            one = self._png(root / "a.png", 8, 6)
+            two = self._png(root / "b.png", 8, 6)
+            self.assertEqual(_stack_images([one]).shape, (8, 6, 3))
+            self.assertEqual(_stack_images([one, two]).shape, (2, 8, 6, 3))
+            with self.assertRaisesRegex(ValueError, "must share a shape"):
+                _stack_images([one, self._png(root / "c.png", 4, 6)])
+
+    def test_manifest_describes_arrays_without_serializing_them(self):
+        from mlx_vlm.extract import _manifest
+
+        manifest = _manifest("depth", {"depth": np.zeros((2, 3), dtype=np.float32)})
+        self.assertEqual(manifest["task"], "depth")
+        self.assertEqual(manifest["outputs"]["depth"]["shape"], [2, 3])
+        self.assertEqual(manifest["outputs"]["depth"]["dtype"], "float32")
+        json.dumps(manifest)
+
+
+class TestExtractionCLIOutputs(unittest.TestCase):
+    """Non-array outputs must not produce an npz nobody can read back."""
+
+    class _Mesh:
+        pass
+
+    def test_manifest_lists_arrays_and_names_metadata(self):
+        from mlx_vlm.extract import _manifest
+
+        described = _manifest(
+            "objects", {"depth": np.zeros((2, 2)), "metadata": {"mesh": self._Mesh()}}
+        )
+        self.assertEqual(described["outputs"]["depth"]["shape"], [2, 2])
+        self.assertEqual(described["metadata"], ["mesh"])
+        json.dumps(described)
+
+    def test_npz_holds_the_arrays_and_loads_with_default_numpy(self):
+        from mlx_vlm import extract as cli
+
+        outputs = {
+            "depth": np.zeros((2, 2)),
+            "metadata": {"mesh": self._Mesh(), "flag": True},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "nested" / "run.npz"
+            original = cli.load
+            cli.load = lambda *a, **k: (
+                SimpleNamespace(
+                    extraction_types=("objects",),
+                    extract=lambda *args, **kwargs: outputs,
+                ),
+                None,
+            )
+            png = Path(directory) / "f.png"
+            from PIL import Image
+
+            Image.fromarray(np.zeros((4, 4, 3), dtype=np.uint8)).save(png)
+            try:
+                cli.main(["--model", "x", "--image", str(png), "--output", str(target)])
+            finally:
+                cli.load = original
+            self.assertTrue(target.exists(), "parent directory should be created")
+            loaded = np.load(target)  # default: allow_pickle=False
+            self.assertEqual(sorted(loaded.keys()), ["depth"])
+            self.assertEqual(loaded["depth"].shape, (2, 2))
+
+
+class TestExtractionContractGuards(unittest.TestCase):
+    """A model author's likely slips fail with a message that names the slip."""
+
+    def test_rejects_a_string_declaration(self):
+        from mlx_vlm.extraction import extract
+
+        class Stringly:
+            extraction_types = "depth"  # iterates as characters if unguarded
+
+            def extract(self, processor, inputs, task=None, **kwargs):
+                return {"depth": 1}
+
+        with self.assertRaisesRegex(ValueError, "must be a sequence"):
+            extract(Stringly(), None, "x")
+
+    def test_rejects_a_declaration_without_a_hook(self):
+        from mlx_vlm.extraction import extract
+
+        class Declared:
+            extraction_types = ("depth",)
+
+        with self.assertRaisesRegex(ValueError, "implements no extract"):
+            extract(Declared(), None, "x")
+
+    def test_accepts_a_list_declaration(self):
+        from mlx_vlm.extraction import extract
+
+        class Listly:
+            extraction_types = ["depth"]
+
+            def extract(self, processor, inputs, task=None, **kwargs):
+                return {"depth": np.zeros(1), "metadata": {"task": task}}
+
+        self.assertEqual(extract(Listly(), None, "x")["metadata"]["task"], "depth")
+
+
+class TestExtractSettings(unittest.TestCase):
+    """`--set NAME=VALUE` parses literals and rejects malformed input."""
+
+    def _parse(self, pairs):
+        import argparse
+
+        from mlx_vlm.extract import _parse_settings
+
+        parser = argparse.ArgumentParser()
+        return _parse_settings(pairs, parser)
+
+    def test_parses_literals_and_keeps_types(self):
+        cases = {
+            "score_threshold=0.5": ("score_threshold", 0.5),
+            "num_tokens=256": ("num_tokens", 256),
+            "neg=-1.5": ("neg", -1.5),
+            "sci=1e-3": ("sci", 0.001),
+            "bbox=[0, 0, 10, 10]": ("bbox", [0, 0, 10, 10]),
+            "d={'a': 1}": ("d", {"a": 1}),
+        }
+        for raw, (name, want) in cases.items():
+            got = self._parse([raw])[name]
+            self.assertEqual(got, want, raw)
+            self.assertIs(type(got), type(want), raw)
+
+    def test_booleans_and_none_are_not_left_as_strings(self):
+        # "false" as a string is truthy, which would silently invert a flag.
+        for raw, want in (
+            ("progress=false", False),
+            ("progress=False", False),
+            ("flip_test=TRUE", True),
+            ("x=none", None),
+            ("x=null", None),
+        ):
+            name = raw.split("=")[0]
+            self.assertIs(self._parse([raw])[name], want, raw)
+
+    def test_strings_values_with_equals_and_spaces(self):
+        self.assertEqual(self._parse(["prompt=a person"])["prompt"], "a person")
+        self.assertEqual(self._parse(["eq=a=b"])["eq"], "a=b")
+        self.assertEqual(self._parse([" pad =1"])["pad"], 1)
+        self.assertEqual(self._parse(["empty="])["empty"], "")
+
+    def test_empty_and_missing(self):
+        self.assertEqual(self._parse([]), {})
+        self.assertEqual(self._parse(None), {})
+
+    def test_rejects_malformed_and_duplicates(self):
+        for pairs in (["noequals"], ["=5"], ["a=1", "a=2"]):
+            with self.assertRaises(SystemExit):
+                self._parse(pairs)
+
+
+class TestExtractInputFiles(unittest.TestCase):
+    """`--set-file NAME=PATH` reads array inputs without reshaping them."""
+
+    def _parser(self):
+        import argparse
+
+        return argparse.ArgumentParser()
+
+    def _write(self, root):
+        from PIL import Image
+
+        Image.fromarray((np.random.rand(8, 6, 3) * 255).astype(np.uint8)).save(
+            root / "rgb.png"
+        )
+        Image.fromarray((np.random.rand(8, 6) * 255).astype(np.uint8), mode="L").save(
+            root / "gray.png"
+        )
+        rgba = np.zeros((8, 6, 4), np.uint8)
+        rgba[..., 3] = 255
+        rgba[0:2, 0:2, 3] = 0
+        Image.fromarray(rgba, mode="RGBA").save(root / "cut.png")
+        np.save(root / "pm.npy", np.random.rand(8, 6, 3).astype(np.float32))
+        np.savez(root / "one.npz", only=np.zeros((3, 3)))
+        np.savez(root / "two.npz", a=np.zeros(2), b=np.zeros(2))
+        (root / "box.json").write_text(json.dumps([[0, 0, 10, 10]]))
+        (root / "k.txt").write_text("nope")
+
+    def test_reads_each_supported_type(self):
+        from mlx_vlm.extract import _load_input_file
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write(root)
+            parser = self._parser()
+            self.assertEqual(
+                np.asarray(_load_input_file(root / "rgb.png", parser)).shape, (8, 6, 3)
+            )
+            self.assertEqual(
+                np.asarray(_load_input_file(root / "pm.npy", parser)).shape, (8, 6, 3)
+            )
+            self.assertEqual(
+                np.asarray(_load_input_file(root / "one.npz", parser)).shape, (3, 3)
+            )
+            self.assertEqual(
+                _load_input_file(root / "box.json", parser), [[0, 0, 10, 10]]
+            )
+
+    def test_keeps_the_files_own_image_mode(self):
+        from mlx_vlm.extract import _load_input_file
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write(root)
+            parser = self._parser()
+            # a grayscale mask must stay (H, W); RGBA must keep its alpha, which
+            # is the channel sam3d_objects reads for a cutout.
+            self.assertEqual(
+                np.asarray(_load_input_file(root / "gray.png", parser)).shape, (8, 6)
+            )
+            cutout = np.asarray(_load_input_file(root / "cut.png", parser))
+            self.assertEqual(cutout.shape, (8, 6, 4))
+            self.assertEqual(int((cutout[..., 3] == 0).sum()), 4)
+
+    def test_rejects_unreadable_or_ambiguous_files(self):
+        from mlx_vlm.extract import _parse_input_files
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write(root)
+            for arg in (
+                f"x={root / 'two.npz'}",
+                f"x={root / 'k.txt'}",
+                f"x={root / 'missing.png'}",
+                "noequals",
+                "=x",
+                "x=",
+            ):
+                with self.assertRaises(SystemExit, msg=arg):
+                    _parse_input_files([arg], self._parser())
+
+    def test_multiple_inputs_and_duplicate_rejection(self):
+        from mlx_vlm.extract import _parse_input_files
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write(root)
+            loaded = _parse_input_files(
+                [f"mask={root / 'gray.png'}", f"pointmap={root / 'pm.npy'}"],
+                self._parser(),
+            )
+            self.assertEqual(np.asarray(loaded["mask"]).shape, (8, 6))
+            self.assertEqual(np.asarray(loaded["pointmap"]).shape, (8, 6, 3))
+            with self.assertRaises(SystemExit):
+                _parse_input_files(
+                    [f"a={root / 'gray.png'}", f"a={root / 'pm.npy'}"], self._parser()
+                )
+
+
+class TestDetectionOutputsAcrossResultTypes(unittest.TestCase):
+    """sam3 keeps its own DetectionResult, so the helper must read both."""
+
+    def test_reads_sam3s_result_shape(self):
+        from mlx_vlm.extraction import detection_outputs
+        from mlx_vlm.models.sam3.generate import DetectionResult as Sam3Result
+
+        # sam3's labels are per-detection prompt strings, not class ids, and it
+        # has no class_names field at all.
+        result = Sam3Result(
+            boxes=np.zeros((2, 4)),
+            masks=np.zeros((2, 3, 3)),
+            scores=np.ones(2),
+            labels=["a person", "a person"],
+            track_ids=np.zeros(2, dtype=np.int64),
+        )
+        named = detection_outputs(result)
+        self.assertEqual(
+            sorted(k for k in named if k != "metadata"),
+            ["boxes", "masks", "scores", "track_ids"],
+        )
+        self.assertEqual(named["metadata"]["label_names"], ["a person", "a person"])
+        for name, value in named.items():
+            if name != "metadata":
+                self.assertIsInstance(value, (mx.array, np.ndarray), name)
+
+    def test_reads_the_shared_result_shape(self):
+        from mlx_vlm.extraction import DetectionResult, detection_outputs
+
+        named = detection_outputs(
+            DetectionResult(
+                boxes=np.zeros((1, 4)),
+                scores=np.ones(1),
+                labels=np.zeros(1, dtype=np.int64),
+                class_names=["cat"],
+            )
+        )
+        self.assertEqual(
+            sorted(k for k in named if k != "metadata"), ["boxes", "labels", "scores"]
+        )
+        self.assertEqual(named["metadata"]["class_names"], ["cat"])
+
+
+class TestExtractionEntryPoint(unittest.TestCase):
+    """The documented command has to exist as a console script."""
+
+    def test_extract_is_registered(self):
+        try:
+            import tomllib
+        except ModuleNotFoundError:
+            self.skipTest("tomllib needs Python 3.11")
+        root = Path(__file__).resolve().parents[2] / "pyproject.toml"
+        if not root.exists():
+            self.skipTest("running outside a source checkout")
+        scripts = tomllib.loads(root.read_text())["project"]["scripts"]
+        self.assertEqual(scripts.get("mlx_vlm.extract"), "mlx_vlm.extract:main")
+        from mlx_vlm.extract import main
+
+        self.assertTrue(callable(main))

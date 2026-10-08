@@ -1,5 +1,4 @@
 import math
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Union
 
@@ -7,18 +6,11 @@ import mlx.core as mx
 import numpy as np
 from PIL import Image, ImageDraw
 
+from ...extraction import DetectionResult
 from .yolo11 import non_max_suppression
 
 DEFAULT_MODEL_ID = "axiom-of-choice/OmniParser-v2-icon-detect"
 ImageInput = Union[str, Path, Image.Image, np.ndarray]
-
-
-@dataclass
-class DetectionResult:
-    boxes: mx.array
-    scores: mx.array
-    labels: mx.array
-    image: Image.Image
 
 
 def prepare_image(image: ImageInput, size=None, stride=32):
