@@ -1677,22 +1677,35 @@ class ResponseGenerator:
         can finish these requests before applying it and reading more work.
         """
         pending = []
-        timeout = 0 if active else idle_timeout
-        while capacity is None or len(pending) < capacity:
-            try:
-                item = self.requests.get(timeout=timeout)
-            except QueueEmpty:
-                break
-            timeout = 0  # Only the first read may wait; drain peers immediately.
+        if capacity is not None and capacity <= 0:
+            return pending, False, None
+
+        try:
+            item = (
+                self.requests.get_nowait()
+                if active
+                else self.requests.get(timeout=idle_timeout)
+            )
+        except QueueEmpty:
+            return pending, False, None
+
+        while True:
             if item is None:
                 if self._stop and not pending:
                     return pending, True, None
-                continue
-            if isinstance(item, _DrafterUpdate):
+            elif isinstance(item, _DrafterUpdate):
                 return pending, False, item
-            pending.append(item)
-            if len(pending) == 1 and coalesce_s > 0:
-                time.sleep(coalesce_s)
+            else:
+                pending.append(item)
+                if len(pending) == 1 and coalesce_s > 0:
+                    time.sleep(coalesce_s)
+
+            if capacity is not None and len(pending) >= capacity:
+                break
+            try:
+                item = self.requests.get_nowait()
+            except QueueEmpty:
+                break
 
         return pending, False, None
 
