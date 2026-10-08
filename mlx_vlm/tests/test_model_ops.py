@@ -492,6 +492,44 @@ def test_paddle_batch_matches_packed_fallback(second_grid, fast_path):
     _assert_allclose(output, expected)
 
 
+@pytest.mark.parametrize(
+    "batch,size,image_size",
+    [
+        (1, (32, 32), (384, 384)),
+        (2, (5, 7), (47, 50)),
+        (1, (9, 6), (17, 22)),
+        (2, (3, 4), (7, 30)),
+    ],
+)
+def test_rfdetr_segmentation_upsample_matches_gather_reference(batch, size, image_size):
+    from mlx_vlm.models.rfdetr.segmentation import SegmentationHead
+
+    head = SegmentationHead(in_dim=16, num_blocks=1)
+    features = mx.random.normal((batch, *size, 16), key=mx.random.key(0))
+    queries = mx.random.normal((batch, 3, 16), key=mx.random.key(1))
+    out_h, out_w = image_size[0] // 4, image_size[1] // 4
+
+    # align_corners=True bilinear from four corner gathers
+    def taps(n_in, n_out):
+        pos = mx.linspace(0, n_in - 1, n_out)
+        lo = mx.minimum(mx.floor(pos).astype(mx.int32), n_in - 1)
+        return lo, mx.minimum(lo + 1, n_in - 1), pos - lo
+
+    y0, y1, fy = taps(size[0], out_h)
+    x0, x1, fx = taps(size[1], out_w)
+    fy, fx = fy[:, None, None], fx[None, :, None]
+    top, bottom = (
+        r[:, :, x0] * (1 - fx) + r[:, :, x1] * fx
+        for r in (features[:, y0], features[:, y1])
+    )
+    upsampled = top * (1 - fy) + bottom * fy
+
+    # Already at the target size, so the head skips its own resize
+    expected = head(upsampled, queries, (out_h * 4, out_w * 4))
+    # Sample positions can differ by one float32 ulp from the reference's
+    _assert_allclose(head(features, queries, image_size), expected, atol=1e-4)
+
+
 @pytest.fixture
 def two_pass_inputs():
     kv_len = two_pass_kv_len()

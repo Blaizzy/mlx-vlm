@@ -15,7 +15,7 @@ python -m mlx_vlm convert --help
 python -m mlx_vlm generate --help
 ```
 
-- `mlx_vlm.decide` – predict typed decisions from text and named questions.
+- `mlx_vlm.decide` – predict typed decisions from text, images, or audio and named questions.
 - `mlx_vlm.convert` – convert Hugging Face models to MLX format.
 - `mlx_vlm.generate` – run inference on images, audio, or video.
 - `mlx_vlm.chat_ui` – start an interactive Gradio UI.

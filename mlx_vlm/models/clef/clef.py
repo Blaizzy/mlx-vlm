@@ -145,6 +145,7 @@ class JointSchemaHead(nn.Module):
 
 class Model(Qwen3_5Model):
     decision_types = ("choice", "score", "bool", "noul")
+    decision_media = ("images", "videos")
 
     def __init__(self, config):
         super().__init__(config)
