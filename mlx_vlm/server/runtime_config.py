@@ -180,7 +180,7 @@ KNOBS: Tuple[
         "Token queue wait timeout in seconds; null disables the timeout.",
     ),
     (
-        "spec_draft_model",
+        "draft_model",
         "str_or_none",
         None,
         (),
@@ -221,7 +221,7 @@ _KNOB_SPEC: Dict[str, Dict[str, Any]] = {
 _LIVE_KNOBS: Tuple[str, ...] = (
     "max_kv_size",
     "token_queue_timeout",
-    "spec_draft_model",
+    "draft_model",
     "spec_draft_kind",
 )
 
@@ -317,7 +317,7 @@ class RuntimeConfig:
     apc_checkpoint_guard_tokens: int = 1
     max_kv_size: Optional[int] = None
     token_queue_timeout: Optional[float] = DEFAULT_TOKEN_QUEUE_TIMEOUT
-    spec_draft_model: Optional[str] = None
+    draft_model: Optional[str] = None
     spec_draft_kind: Optional[str] = None
     vision_cache_size: int = 20
 
@@ -374,7 +374,7 @@ class RuntimeConfig:
             ),
             max_kv_size=_env_int("MAX_KV_SIZE", None),
             token_queue_timeout=_env_token_queue_timeout(),
-            spec_draft_model=os.environ.get("MLX_VLM_DRAFT_MODEL") or None,
+            draft_model=os.environ.get("MLX_VLM_DRAFT_MODEL") or None,
             spec_draft_kind=os.environ.get("MLX_VLM_DRAFT_KIND") or None,
             vision_cache_size=int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20")),
         )
@@ -401,7 +401,7 @@ class RuntimeConfig:
     def drafter_settings(self) -> Tuple[Optional[str], Optional[str]]:
         """Read the drafter path and kind as one settings snapshot."""
         with self._lock:
-            return self.spec_draft_model, self.spec_draft_kind
+            return self.draft_model, self.spec_draft_kind
 
     def apc_overrides(self) -> Dict[str, Any]:
         """Snapshot all APC settings for manager creation without changing env."""
@@ -430,7 +430,7 @@ class RuntimeConfig:
         applied: Dict[str, Any] = {}
         rejected: List[Dict[str, Any]] = []
         with self._lock:
-            previous_drafter = self.spec_draft_model
+            previous_drafter = self.draft_model
             for name, raw in payload.items():
                 if name not in _KNOB_SPEC:
                     rejected.append({"name": name, "reason": "unknown knob"})
@@ -454,8 +454,8 @@ class RuntimeConfig:
                 setattr(self, name, value)
                 applied[name] = value
             if (
-                "spec_draft_model" in applied
-                and self.spec_draft_model != previous_drafter
+                "draft_model" in applied
+                and self.draft_model != previous_drafter
                 and "spec_draft_kind" not in payload
             ):
                 self.spec_draft_kind = None

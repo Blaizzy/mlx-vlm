@@ -443,7 +443,7 @@ Changes take effect on the next request. KV and APC settings reload text models,
 and `vision_cache_size` reloads image models. `max_kv_size` and
 `token_queue_timeout` apply to new requests without a reload.
 
-Changing `spec_draft_model` or `spec_draft_kind` replaces only the drafter after
+Changing `draft_model` or `spec_draft_kind` replaces only the drafter after
 earlier queued generations finish, keeping the target model loaded. A different
 drafter path resets the kind to auto-detection unless a kind is supplied in the
 same update. Set the path to `null` to disable speculative decoding:
@@ -452,11 +452,11 @@ same update. Set the path to `null` to disable speculative decoding:
 # Enable bundled MTP, or replace the current drafter.
 curl -X PATCH http://127.0.0.1:8080/v1/settings \
   -H 'Content-Type: application/json' \
-  -d '{"spec_draft_model": "nvidia/Qwen3.8-27B-NVFP4"}'
+  -d '{"draft_model": "nvidia/Qwen3.8-27B-NVFP4"}'
 
 curl -X PATCH http://127.0.0.1:8080/v1/settings \
   -H 'Content-Type: application/json' \
-  -d '{"spec_draft_model": null}'
+  -d '{"draft_model": null}'
 ```
 
 The new drafter is validated before replacing the old one. If loading fails,

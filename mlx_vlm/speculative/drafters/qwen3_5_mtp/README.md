@@ -34,7 +34,7 @@ On a running server, enable bundled MTP through the settings endpoint:
 ```bash
 curl -X PATCH http://localhost:8080/v1/settings \
   -H 'Content-Type: application/json' \
-  -d '{"spec_draft_model":"nvidia/Qwen3.8-27B-NVFP4","spec_draft_kind":"mtp"}'
+  -d '{"draft_model":"nvidia/Qwen3.8-27B-NVFP4","spec_draft_kind":"mtp"}'
 
 curl http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
@@ -53,12 +53,12 @@ path resets `spec_draft_kind` to auto-detection unless you explicitly provide it
 ```bash
 curl -X PATCH http://localhost:8080/v1/settings \
   -H 'Content-Type: application/json' \
-  -d '{"spec_draft_model":"/path/to/compatible-drafter"}'
+  -d '{"draft_model":"/path/to/compatible-drafter"}'
 
 # Disable drafting while keeping the target loaded.
 curl -X PATCH http://localhost:8080/v1/settings \
   -H 'Content-Type: application/json' \
-  -d '{"spec_draft_model":null}'
+  -d '{"draft_model":null}'
 ```
 
 A failed replacement returns a generation error and preserves the old drafter;

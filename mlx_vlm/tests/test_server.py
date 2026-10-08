@@ -4579,16 +4579,16 @@ class TestRuntimeConfig:
         assert cfg.fingerprint() == before
 
     def test_drafter_path_change_resets_kind_and_preserves_target_fingerprint(self):
-        cfg = RuntimeConfig(spec_draft_model="old", spec_draft_kind="mtp")
+        cfg = RuntimeConfig(draft_model="old", spec_draft_kind="mtp")
         before = cfg.fingerprint()
-        applied, rejected = cfg.apply_changes({"spec_draft_model": "new"})
-        assert applied == {"spec_draft_model": "new", "spec_draft_kind": None}
+        applied, rejected = cfg.apply_changes({"draft_model": "new"})
+        assert applied == {"draft_model": "new", "spec_draft_kind": None}
         assert rejected == []
         assert cfg.drafter_settings() == ("new", None)
         assert cfg.fingerprint() == before and cfg.reload_kinds(applied) == set()
-        cfg.apply_changes({"spec_draft_model": "old", "spec_draft_kind": "mtp"})
+        cfg.apply_changes({"draft_model": "old", "spec_draft_kind": "mtp"})
         assert cfg.drafter_settings() == ("old", "mtp")
-        cfg.apply_changes({"spec_draft_model": "old"})
+        cfg.apply_changes({"draft_model": "old"})
         assert cfg.drafter_settings() == ("old", "mtp")
         applied, rejected = cfg.apply_changes({"spec_draft_kind": "invalid"})
         assert applied == {} and rejected[0]["name"] == "spec_draft_kind"
@@ -4989,9 +4989,9 @@ def test_drafter_settings_keep_cached_target(settings_client):
     resources = server.get_cached_model("demo")
     before = client.get("/v1/settings").json()["fingerprint"]
     for payload, expected in [
-        ({"spec_draft_model": "mtp", "spec_draft_kind": "mtp"}, ("mtp", "mtp")),
-        ({"spec_draft_model": "dflash"}, ("dflash", None)),
-        ({"spec_draft_model": None}, (None, None)),
+        ({"draft_model": "mtp", "spec_draft_kind": "mtp"}, ("mtp", "mtp")),
+        ({"draft_model": "dflash"}, ("dflash", None)),
+        ({"draft_model": None}, (None, None)),
     ]:
         response = client.patch("/v1/settings", json=payload)
         assert response.status_code == 200
