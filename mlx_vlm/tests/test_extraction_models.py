@@ -704,6 +704,23 @@ def test_privacy_filter_keeps_labels_and_rejects_unknown_decode():
         detector("Alice emailed bob@example.com", decode="beam")
 
 
+def _sync_trap():
+    """Context that fails on any host <-> device synchronization."""
+    from contextlib import ExitStack
+    from unittest import mock
+
+    def boom(*args, **kwargs):
+        raise AssertionError("host sync during graph construction")
+
+    stack = ExitStack()
+    for name in ("eval", "async_eval", "synchronize"):
+        stack.enter_context(mock.patch.object(mx, name, boom))
+    for name in ("tolist", "item", "__bool__", "__float__", "__int__"):
+        if hasattr(mx.array, name):
+            stack.enter_context(mock.patch.object(mx.array, name, boom))
+    return stack
+
+
 class TestSapiens2(unittest.TestCase):
     def _tiny_config(self, task="backbone", **overrides):
         from mlx_vlm.models.sapiens2.config import ModelConfig
@@ -1200,22 +1217,6 @@ class TestSapiens2(unittest.TestCase):
         self.assertEqual((got.shape, got.dtype), ((40, 30, 3), mx.uint8))
         self.assertIs(to_array(got), got)
 
-    def _sync_trap(self):
-        """Context that fails on any host <-> device synchronization."""
-        from contextlib import ExitStack
-        from unittest import mock
-
-        def boom(*args, **kwargs):
-            raise AssertionError("host sync during graph construction")
-
-        stack = ExitStack()
-        for name in ("eval", "async_eval", "synchronize"):
-            stack.enter_context(mock.patch.object(mx, name, boom))
-        for name in ("tolist", "item", "__bool__", "__float__", "__int__"):
-            if hasattr(mx.array, name):
-                stack.enter_context(mock.patch.object(mx.array, name, boom))
-        return stack
-
     def test_infer_builds_graphs_without_host_sync(self):
         """Every task's ``infer`` only builds a graph: no eval, item or
         tolist on the way, including the first call (weight relayouts,
@@ -1230,7 +1231,7 @@ class TestSapiens2(unittest.TestCase):
         ]
         for task, head, labels, kw in cases:
             predictor = self._predictor(task, head, labels, **kw)
-            with self._sync_trap():
+            with _sync_trap():
                 first = predictor.infer(image)
                 second = predictor.infer(mx.array(image))
             mx.eval(first, second)  # and the graphs are valid
@@ -2263,4 +2264,521 @@ class TestLayaDecisionModel(unittest.TestCase):
                     expected = round(1 / (1 + math.exp(-1 / effective)), 4)
                     self.assertEqual(
                         result["answers"]["route"]["probabilities"]["B"], expected
+                    )
+
+
+class TestMapAnything(unittest.TestCase):
+    """Multi-view metric reconstruction: config parsing, checkpoint conversion,
+    the geometry helpers, every input modality through ``infer`` (lazily) and
+    the preprocessing, on a tiny random model."""
+
+    SIZE = (28, 42)
+
+    @staticmethod
+    def _official_config(**overrides):
+        """A tiny model in the official ``config.json`` form (no model_type)."""
+        config = _extraction_config("mapanything")
+        config.update(overrides)
+        return config
+
+    def _model(self, **overrides):
+        from mlx_vlm.models.mapanything import Model, ModelConfig
+
+        mx.random.seed(0)
+        model = Model(ModelConfig.from_dict(self._official_config(**overrides)))
+        mx.eval(model.parameters())
+        return model
+
+    def _views(self, num=3, geometry=True):
+        """Normalized images with every optional input form across views."""
+        images, rng = np.random.default_rng(0), np.random.default_rng(1)
+        h, w = self.SIZE
+        K = np.array(
+            [[40.0, 0, w / 2 - 0.3], [0, 42.0, h / 2 + 0.2], [0, 0, 1]], np.float32
+        )
+        views = []
+        for i in range(num):
+            view = {
+                "img": images.standard_normal((1, h, w, 3)).astype(np.float32),
+                "data_norm_type": ["dinov2"],
+            }
+            if geometry and i % 3 == 0:
+                pose = np.eye(4, dtype=np.float32)
+                pose[:3, 3] = [0.1 * i, 0.0, 0.2]
+                view.update(
+                    intrinsics=K[None],
+                    depth_z=rng.uniform(1, 5, (1, h, w)).astype(np.float32),
+                    camera_poses=pose[None],
+                )
+            elif geometry and i % 3 == 1:
+                quats = np.array([[0.0, 0.0, 0.0998, 0.995]], np.float32)
+                view.update(
+                    intrinsics=K[None],
+                    camera_poses=(quats, np.array([[0.5, 0.1, 0.0]], np.float32)),
+                    is_metric_scale=False,
+                )
+            elif geometry:
+                from mlx_vlm.models.mapanything.geometry import rays_from_intrinsics
+
+                rays = rays_from_intrinsics(mx.array(K), h, w)
+                view.update(
+                    ray_directions=np.array(rays)[None],
+                    depth_z=rng.uniform(1, 5, (1, h, w, 1)).astype(np.float32),
+                )
+            views.append(view)
+        return views
+
+    def test_official_configs(self):
+        from mlx_vlm.models.mapanything import ModelConfig
+
+        default = ModelConfig()
+        self.assertEqual(
+            (default.encoder_config.size, default.encoder_config.depth),
+            ("giant", 24),
+        )
+        self.assertEqual(default.info_sharing_config.indices, [7, 11])
+        self.assertEqual(default.dpt_input_dims, [1536] * 4)
+        v1 = self._official_config(
+            encoder_config={"encoder_str": "dinov2", "size": "large"},
+            info_sharing_config={
+                "model_type": "alternating_attention",
+                "model_return_type": "intermediate_features",
+                "module_args": {"depth": 24, "indices": [11, 17]},
+            },
+            info_sharing_mlp_layer_str="mlp",
+            use_register_tokens_from_encoder=False,
+        )
+        config = ModelConfig.from_dict(v1)
+        self.assertEqual(
+            (config.encoder_config.depth, config.encoder_config.norm_returned_features),
+            (24, True),
+        )
+        self.assertEqual(
+            (config.info_sharing_config.dim, config.info_sharing_config.layer_scale),
+            (768, False),
+        )
+        self.assertEqual(config.dpt_input_dims, [1024, 768, 768, 768])
+        for bad in (
+            {"pred_head_config": {"type": "linear"}},
+            {"pred_head_config": {"adaptor_type": "pointmap"}},
+            {"info_sharing_config": {"model_type": "cross_attention"}},
+        ):
+            with self.assertRaises(ValueError):
+                ModelConfig.from_dict(self._official_config(**bad))
+
+    def test_converter_maps_official_layout(self):
+        """Official (PyTorch) names and layouts -> MLX, including a round trip
+        of every parameter of the model."""
+        from mlx_vlm.models.mapanything import ModelConfig
+        from mlx_vlm.models.mapanything.convert import to_mlx_layout
+
+        model = self._model()
+        config = ModelConfig.from_dict(self._official_config())
+        params = dict(tree_flatten(model.parameters()))
+        layers = len(config.geometric_input_config.global_intermediate_dims) + 1
+
+        def official(key, value):
+            if key.startswith("encoder."):
+                key = "encoder.model." + key[len("encoder.") :]
+            for name in ("depth_scale", "cam_rot", "cam_trans", "cam_trans_scale"):
+                prefix = f"{name}_encoder.layers."
+                if key.startswith(prefix):
+                    index, rest = key[len(prefix) :].split(".", 1)
+                    k = int(index)
+                    path = (
+                        "0." * (layers - 1) + "0"
+                        if k == 0
+                        else "0." * (layers - 1 - k) + "1"
+                    )
+                    key = f"{name}_encoder.encoder.{path}.{rest}"
+            for old, new in (
+                ("dense_head.projects.{}.", "dense_head.0.input_process.{}.0.0."),
+                ("dense_head.resize_layers.{}.", "dense_head.0.input_process.{}.0.1."),
+                ("dense_head.scratch.layer{}_rn.", "dense_head.0.input_process.{}.1."),
+            ):
+                for i in range(4):
+                    src = old.format(i + 1 if "_rn" in old else i)
+                    if key.startswith(src):
+                        key = new.format(i) + key[len(src) :]
+            if key.startswith("dense_head.scratch."):
+                key = "dense_head.0." + key[len("dense_head.") :]
+            elif key.startswith(("dense_head.conv1", "dense_head.conv2")):
+                key = "dense_head.1." + key[len("dense_head.") :]
+            if key.startswith("scale_head.mlp."):
+                _, _, index, rest = key.split(".", 3)
+                key = f"scale_head.mlp.{index}.0.{rest}"
+            if (
+                "input_process.0.0.1.weight" in key
+                or "input_process.1.0.1.weight" in key
+            ):
+                value = value.transpose(3, 0, 1, 2)
+            elif value.ndim == 4:
+                value = value.transpose(0, 3, 1, 2)
+            elif (
+                key.startswith("pose_head.")
+                and key.endswith("weight")
+                and (".proj." in key or ".res_conv" in key)
+            ):
+                value = value[..., None, None]
+            return key, value
+
+        checkpoint = dict(official(k, v) for k, v in params.items())
+        self.assertIn("cam_rot_encoder.encoder.0.0.0.weight", checkpoint)
+        self.assertIn("dense_head.0.input_process.2.1.weight", checkpoint)
+        self.assertIn("scale_head.mlp.1.0.weight", checkpoint)
+        converted = to_mlx_layout(checkpoint, config, "float16")
+        self.assertEqual(set(converted), set(params))
+        for key, value in params.items():
+            np.testing.assert_array_equal(
+                np.array(converted[key].astype(mx.float32)),
+                np.array(value.astype(converted[key].dtype).astype(mx.float32)),
+                err_msg=key,
+            )
+        self.assertEqual(converted["encoder.blocks.1.mlp.fc1.bias"].dtype, mx.float16)
+        self.assertEqual(
+            converted["info_sharing.self_attention_blocks.1.mlp.w12.bias"].dtype,
+            mx.float16,
+        )
+        self.assertEqual(converted["info_sharing.proj_embed.weight"].dtype, mx.float16)
+        for key in (
+            "encoder.patch_embed.proj.weight",
+            "encoder.blocks.0.ls1.gamma",
+            "pose_head.proj.weight",
+        ):
+            self.assertEqual(converted[key].dtype, mx.float32, key)
+        model.load_weights(list(model.sanitize(converted).items()))
+
+    def test_sanitize_keeps_heads_and_norms_in_float32(self):
+        model = self._model()
+        params = dict(tree_flatten(model.parameters()))
+        weights = {k: v.astype(mx.bfloat16) for k, v in params.items()}
+        out = model.sanitize(weights)
+        self.assertEqual(out["encoder.blocks.0.attn.qkv.weight"].dtype, mx.bfloat16)
+        for key in (
+            "encoder.blocks.0.norm1.weight",
+            "encoder.blocks.0.ls2.gamma",
+            "info_sharing.view_pos_table",
+            "scale_token",
+            "dense_head.conv1.weight",
+            "ray_dirs_encoder.conv_in.weight",
+        ):
+            self.assertEqual(out[key].dtype, mx.float32, key)
+        _assert_weights_equal(model.sanitize(dict(out)), out)
+
+    def test_forward_outputs(self):
+        model = self._model()
+        views = self._views()
+        outputs = model.infer(views)
+        h, w = self.SIZE
+        shapes = {
+            "pts3d": (1, h, w, 3),
+            "pts3d_cam": (1, h, w, 3),
+            "ray_directions": (1, h, w, 3),
+            "depth_along_ray": (1, h, w, 1),
+            "depth_z": (1, h, w, 1),
+            "cam_trans": (1, 3),
+            "cam_quats": (1, 4),
+            "camera_poses": (1, 4, 4),
+            "intrinsics": (1, 3, 3),
+            "metric_scaling_factor": (1, 1),
+            "conf": (1, h, w),
+            "non_ambiguous_mask": (1, h, w),
+            "non_ambiguous_mask_logits": (1, h, w),
+            "mask": (1, h, w, 1),
+            "img_no_norm": (1, h, w, 3),
+        }
+        self.assertEqual(len(outputs), len(views))
+        for out in outputs:
+            self.assertEqual({k: tuple(v.shape) for k, v in out.items()}, shapes)
+            rays = np.array(out["ray_directions"])
+            np.testing.assert_allclose(np.linalg.norm(rays, axis=-1), 1, atol=1e-5)
+            pose = np.array(out["camera_poses"])[0]
+            np.testing.assert_allclose(
+                pose[:3, :3] @ pose[:3, :3].T, np.eye(3), atol=1e-5
+            )
+            self.assertTrue(np.all(np.array(out["conf"]) >= 1))
+            mask = np.array(out["mask"])
+            self.assertTrue(np.all(np.array(out["pts3d"])[~mask[..., 0]] == 0))
+
+    def test_ignore_flags_equal_omitting_inputs(self):
+        """Every modality reaches the network, and ``ignore_*`` is the same as
+        not providing that input."""
+        model = self._model()
+        full, bare = self._views(), self._views(geometry=False)
+
+        def depth(views, **kw):
+            return [
+                np.array(o["depth_along_ray"])
+                for o in model.infer(views, apply_mask=False, **kw)
+            ]
+
+        with_inputs = depth(full)
+        without = depth(bare)
+        ignored = depth(
+            full,
+            ignore_calibration_inputs=True,
+            ignore_depth_inputs=True,
+            ignore_pose_inputs=True,
+        )
+        for a, b, c in zip(with_inputs, without, ignored):
+            np.testing.assert_array_equal(b, c)
+            self.assertGreater(np.abs(a - b).max(), 1e-6)
+        for flag in ("ignore_depth_scale_inputs", "ignore_pose_scale_inputs"):
+            changed = depth(full, **{flag: True})
+            self.assertGreater(
+                max(np.abs(a - b).max() for a, b in zip(changed, with_inputs)), 0
+            )
+
+    def test_view_validation(self):
+        model = self._model()
+        img = np.zeros((1, *self.SIZE, 3), np.float32)
+        base = {"img": img, "data_norm_type": ["dinov2"]}
+        cases = [
+            [{**base, "extra": 1}],
+            [{"img": img}],
+            [
+                {
+                    **base,
+                    "intrinsics": np.eye(3),
+                    "ray_directions": np.zeros((*self.SIZE, 3)),
+                }
+            ],
+            [{**base, "depth_z": np.ones(self.SIZE)}],
+            [base, {**base, "camera_poses": np.eye(4)[None]}],
+            [{**base, "data_norm_type": ["identity"]}],
+        ]
+        for views in cases:
+            with self.assertRaises(ValueError):
+                model.infer(views)
+
+    def test_dense_head_chunking_is_exact(self):
+        model = self._model()
+        views = self._views(geometry=False)
+        whole = model.infer(views, memory_efficient_inference=False)
+        chunked = model.infer(views, minibatch_size=1)
+        for a, b in zip(whole, chunked):
+            np.testing.assert_allclose(
+                np.array(a["depth_along_ray"]),
+                np.array(b["depth_along_ray"]),
+                rtol=1e-6,
+            )
+
+    def test_infer_builds_graphs_without_host_sync(self):
+        """Preprocessing, the network and every post-processing option only
+        build a graph, for images and all geometric input forms."""
+        from mlx_vlm.models.mapanything.processing_mapanything import (
+            MapAnythingProcessor,
+        )
+
+        model = self._model()
+        processor = MapAnythingProcessor(resize_mode="fixed_size", size=(42, 28))
+        rng = np.random.default_rng(1)
+        raw = [
+            {
+                "img": rng.integers(0, 255, (60, 80, 3), np.uint8),
+                "intrinsics": np.array(
+                    [[70.0, 0, 40], [0, 70.0, 30], [0, 0, 1]], np.float32
+                ),
+                "depth_z": rng.uniform(1, 3, (60, 80)).astype(np.float32),
+                "camera_poses": np.eye(4, dtype=np.float32),
+            },
+            {"img": mx.array(rng.random((50, 70, 3)).astype(np.float32))},
+            {
+                "img": rng.integers(0, 255, (60, 80, 3), np.uint8),
+                "camera_poses": (np.array([0, 0, 0, 1.0]), np.zeros(3)),
+            },
+        ]
+        with _sync_trap():
+            views = processor.preprocess(raw)
+            first = model.infer(
+                views,
+                apply_confidence_mask=True,
+                use_multiview_confidence=True,
+            )
+            second = model.infer(views, mask_edges=False)
+        mx.eval(first, second)
+        self.assertEqual(first[0]["pts3d"].shape, (1, 28, 42, 3))
+
+    def test_geometry_round_trips(self):
+        from mlx_vlm.models.mapanything import geometry as G
+
+        rng = np.random.default_rng(0)
+        quats = rng.standard_normal((5, 4)).astype(np.float32)
+        quats /= np.linalg.norm(quats, axis=-1, keepdims=True)
+        quats *= np.sign(quats[:, 3:])
+        rot = G.quaternion_to_rotation_matrix(mx.array(quats))
+        np.testing.assert_allclose(
+            np.array(G.rotation_matrix_to_quaternion(rot)), quats, atol=1e-5
+        )
+        trans = mx.array(rng.standard_normal((5, 3)).astype(np.float32))
+        q, t = G.relative_pose(mx.array(quats), trans, mx.array(quats), trans)
+        self.assertEqual(np.abs(np.array(t)).max(), 0.0)
+        np.testing.assert_allclose(np.array(q), [[0, 0, 0, 1]] * 5, atol=1e-6)
+        pose = G.pose_matrix(mx.array(quats), trans)
+        np.testing.assert_allclose(
+            np.array(G.pose_inverse(pose) @ pose),
+            np.broadcast_to(np.eye(4), (5, 4, 4)),
+            atol=1e-5,
+        )
+        K = mx.array([[[300.0, 0, 161.5], [0, 310.0, 118.2], [0, 0, 1]]])
+        for h, w in ((240, 320), (1100, 1000)):
+            rays = G.rays_from_intrinsics(K, h, w)
+            np.testing.assert_allclose(
+                np.array(G.intrinsics_from_rays(rays)), np.array(K), rtol=1e-3
+            )
+        depth = mx.array(rng.uniform(1, 4, (1, 24, 32)).astype(np.float32))
+        rays = G.rays_from_intrinsics(K, 24, 32)
+        points = G.depth_to_camera_points(depth, K)
+        np.testing.assert_allclose(
+            np.array(G.depth_z_to_depth_along_ray(depth, rays))[..., 0],
+            np.linalg.norm(np.array(points), axis=-1),
+            rtol=1e-5,
+        )
+
+    def test_layers_match_torch_layouts(self):
+        from mlx_vlm.models.dpt import PatchUpsample
+        from mlx_vlm.models.mapanything.encoders import pixel_unshuffle
+
+        rng = np.random.default_rng(0)
+        x = rng.standard_normal((2, 6, 9, 2)).astype(np.float32)
+        ours = np.array(pixel_unshuffle(mx.array(x), 3))
+        want = np.zeros((2, 2, 3, 18), np.float32)
+        for c in range(2):
+            for i in range(3):
+                for j in range(3):
+                    want[..., c * 9 + i * 3 + j] = x[:, i::3, j::3, c]
+        np.testing.assert_array_equal(ours, want)
+
+        up = PatchUpsample(4, 2)
+        up.weight = mx.array(rng.standard_normal((4, 2, 2, 4)).astype(np.float32))
+        up.bias = mx.array(rng.standard_normal(4).astype(np.float32))
+        conv = nn.ConvTranspose2d(4, 4, 2, stride=2)
+        conv.weight, conv.bias = up.weight, up.bias
+        y = mx.array(rng.standard_normal((1, 3, 5, 4)).astype(np.float32))
+        np.testing.assert_allclose(np.array(up(y)), np.array(conv(y)), atol=1e-5)
+
+    def test_processor_matches_reference_rules(self):
+        from PIL import Image
+
+        from mlx_vlm.models.mapanything.processing_mapanything import (
+            MapAnythingProcessor,
+            resize_like_pil,
+        )
+
+        self.assertEqual(MapAnythingProcessor().target_size(1280 / 720), (518, 294))
+        self.assertEqual(
+            MapAnythingProcessor(resolution_set=512).target_size(0.7), (336, 512)
+        )
+        self.assertEqual(
+            MapAnythingProcessor(resize_mode="longest_side", size=518).target_size(
+                4 / 3
+            ),
+            (518, 392),
+        )
+        self.assertEqual(
+            MapAnythingProcessor(resize_mode="fixed_size", size=(300, 200)).target_size(
+                1
+            ),
+            (294, 196),
+        )
+        rng = np.random.default_rng(0)
+        image = rng.integers(0, 256, (90, 160, 3), np.uint8)
+        for size in ((47, 83), (120, 213)):
+            ours = np.array(resize_like_pil(mx.array(image), size, shrink=size[0] < 90))
+            want = np.asarray(
+                Image.fromarray(image).resize(
+                    size[::-1], Image.LANCZOS if size[0] < 90 else Image.BICUBIC
+                )
+            )
+            self.assertLessEqual(np.abs(ours - want).max(), 2)
+
+        processor = MapAnythingProcessor(resize_mode="fixed_size", size=(70, 42))
+        K = mx.array([[50.0, 0, 40.0], [0, 50.0, 30.0], [0, 0, 1]])
+        depth = mx.array(np.arange(60 * 81, dtype=np.float32).reshape(60, 81))
+        img = mx.array(rng.integers(0, 256, (60, 81, 3), np.uint8))
+        _, cropped, K2 = processor.crop_resize(img, (70, 42), depth, K)
+        scale = max(70 / 81, 42 / 60) + 1e-8
+        new_w, new_h = int(81 * scale), int(60 * scale)
+        left, top = round((new_w - 70) / 2), round((new_h - 42) / 2)
+        cx = (40 + 0.5) * scale - 0.5 * (81 * scale - new_w) - 0.5 - left
+        np.testing.assert_allclose(np.array(K2)[0], [50 * scale, 0, cx], rtol=1e-6)
+        rows = [min(int(i * (1 / (new_h / 60))), 59) for i in range(new_h)][
+            top : top + 42
+        ]
+        cols = [min(int(j * (1 / (new_w / 81))), 80) for j in range(new_w)][
+            left : left + 70
+        ]
+        np.testing.assert_array_equal(
+            np.array(cropped), np.array(depth)[np.ix_(rows, cols)]
+        )
+
+    def test_multiview_confidence_and_edges(self):
+        from mlx_vlm.models.mapanything.confidence import multiview_depth_confidence
+        from mlx_vlm.models.mapanything.geometry import depth_edge
+
+        h, w = 24, 32
+        K = mx.array([[[30.0, 0, 16], [0, 30.0, 12], [0, 0, 1]]])
+        pose = mx.eye(4)[None]
+        ramp = mx.broadcast_to(mx.linspace(1.0, 5.0, w), (1, h, w))[..., None]
+        mask = mx.ones((1, h, w), dtype=mx.bool_)
+        agree = multiview_depth_confidence(
+            [ramp, ramp], [K, K], [pose, pose], [mask, mask]
+        )
+        self.assertEqual(float(agree[0].min()), 1.0)
+        flipped = ramp[:, :, ::-1]
+        disagree = multiview_depth_confidence(
+            [ramp, flipped], [K, K], [pose, pose], [mask, mask]
+        )
+        self.assertLess(float(disagree[0].mean()), 0.2)
+        single = multiview_depth_confidence([ramp], [K], [pose], [mask])
+        self.assertEqual(float(single[0].min()), 1.0)
+
+        step = mx.concatenate(
+            [mx.full((1, h, w // 2), 2.0), mx.full((1, h, w // 2), 4.0)], axis=2
+        )
+        edges = np.array(depth_edge(step, 0.03, mask))
+        self.assertTrue(edges[:, :, w // 2 - 1 : w // 2 + 1].all())
+        self.assertFalse(edges[:, :, : w // 2 - 2].any())
+
+    def test_batched_views_match_single_scenes(self):
+        """A batch of scenes gives each scene's own result (geometric inputs
+        and the scale normalizations stay per sample)."""
+        model = self._model()
+        first, second = self._views(), self._views()
+        for view in second:
+            view["img"] = view["img"][..., ::-1].copy()
+            if "camera_poses" in view and not isinstance(view["camera_poses"], tuple):
+                view["camera_poses"] = view["camera_poses"].copy()
+                view["camera_poses"][:, :3, 3] *= 3
+        batched = []
+        for a, b in zip(first, second):
+            view = {
+                "img": np.concatenate([a["img"], b["img"]]),
+                "data_norm_type": ["dinov2"],
+            }
+            for key in ("intrinsics", "ray_directions", "depth_z"):
+                if key in a:
+                    view[key] = np.concatenate([a[key], b[key]])
+            if "camera_poses" in a:
+                pa, pb = a["camera_poses"], b["camera_poses"]
+                view["camera_poses"] = (
+                    tuple(np.concatenate([x, y]) for x, y in zip(pa, pb))
+                    if isinstance(pa, tuple)
+                    else np.concatenate([pa, pb])
+                )
+            if "is_metric_scale" in a:
+                view["is_metric_scale"] = np.array(
+                    [a["is_metric_scale"], b["is_metric_scale"]]
+                )
+            batched.append(view)
+        together = model.infer(batched)
+        for index, views in enumerate((first, second)):
+            alone = model.infer(views)
+            for key in ("pts3d", "conf", "cam_trans", "metric_scaling_factor"):
+                for t, s in zip(together, alone):
+                    np.testing.assert_allclose(
+                        np.array(t[key][index]),
+                        np.array(s[key][0]),
+                        rtol=2e-4,
+                        atol=2e-5,
                     )

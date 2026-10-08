@@ -411,6 +411,68 @@
         "slat_steps": 2
       },
       "checks": ["registry_and_config"]
+    },
+    {
+      "id": "mapanything",
+      "module": "mapanything",
+      "config": {
+        "name": "mapanything",
+        "encoder_config": {
+          "encoder_str": "dinov2",
+          "size": "small",
+          "keep_first_n_layers": 2,
+          "norm_returned_features": false,
+          "data_norm_type": "dinov2"
+        },
+        "info_sharing_config": {
+          "model_type": "alternating_attention",
+          "model_return_type": "intermediate_features",
+          "custom_positional_encoding": null,
+          "module_args": {
+            "depth": 4,
+            "dim": 64,
+            "num_heads": 4,
+            "indices": [1, 2],
+            "init_values": 1e-5
+          }
+        },
+        "pred_head_config": {
+          "type": "dpt+pose",
+          "adaptor_type": "raydirs+depth+pose+confidence+mask",
+          "feature_head": {"feature_dim": 16, "layer_dims": [8, 8, 16, 16]},
+          "regressor_head": {"output_dim": 6},
+          "pose_head": {"num_resconv_block": 2, "rot_representation_dim": 4},
+          "scale_head": {"output_dim": 1},
+          "dpt_adaptor": {
+            "name": "raydirs+depth+pose+confidence+mask",
+            "confidence_type": "exp",
+            "confidence_vmin": 1,
+            "depth_mode": "exp",
+            "depth_vmin": 0,
+            "ray_directions_mode": "linear",
+            "ray_directions_normalize_to_unit_sphere": true,
+            "ray_directions_normalize_to_unit_image_plane": false,
+            "ray_directions_clamp_min_of_z_dir": false
+          },
+          "pose_adaptor": {
+            "cam_trans_mode": "linear",
+            "quaternions_mode": "linear",
+            "quaternions_normalize": true
+          },
+          "scale_adaptor": {"mode": "exp", "vmin": 1e-8}
+        },
+        "geometric_input_config": {
+          "ray_dirs_encoder_config": {
+            "apply_pe": false,
+            "intermediate_dims": [16, 24, 32]
+          },
+          "depth_encoder_config": {"apply_pe": false},
+          "scale_encoder_config": {"intermediate_dims": [8, 16]}
+        },
+        "use_register_tokens_from_encoder": true,
+        "info_sharing_mlp_layer_str": "swiglufused"
+      },
+      "checks": ["registry_and_config", "checkpoint"]
     }
   ],
   "shared_configs": {
