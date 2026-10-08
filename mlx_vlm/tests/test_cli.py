@@ -584,6 +584,10 @@ def test_decision_cli_reports_unsupported_question(capsys, monkeypatch):
             ["--image", "cat.jpg", "--image", "https://example.com/dog.png"],
         ),
         ({"audio": "meow.flac"}, ["--audio", "meow.flac"]),
+        (
+            {"images": ["cat.jpg"], "audio": "meow.flac"},
+            ["--image", "cat.jpg", "--audio", "meow.flac"],
+        ),
     ],
 )
 def test_decision_cli_passes_media(monkeypatch, state, media, flags):
@@ -601,23 +605,15 @@ def test_decision_cli_passes_media(monkeypatch, state, media, flags):
     predict.assert_called_once_with(model, processor, state, questions, **media)
 
 
-@pytest.mark.parametrize(
-    "flags, message",
-    [
-        ([], "--state --state-file --image --audio is required"),
-        (["--image", "a.png", "--audio", "b.wav"], "not allowed with argument"),
-    ],
-)
-def test_decision_cli_rejects_missing_or_mixed_media(
-    monkeypatch, capsys, flags, message
-):
+def test_decision_cli_requires_state_or_media(monkeypatch, capsys):
     from mlx_vlm import decide
 
     load = Mock()
     monkeypatch.setattr(decide, "load", load)
     with pytest.raises(SystemExit) as error:
-        decide.main(["--model", "d1", "--questions", '{"q":{"type":"bool"}}', *flags])
+        decide.main(["--model", "d1", "--questions", '{"q":{"type":"bool"}}'])
     assert error.value.code == 2
+    message = "--state --state-file --image --audio is required"
     assert message in capsys.readouterr().err
     load.assert_not_called()
 

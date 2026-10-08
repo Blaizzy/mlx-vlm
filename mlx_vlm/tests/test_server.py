@@ -22,7 +22,7 @@ from pathlib import Path
 from queue import Queue
 from threading import Event, Lock, Thread, Timer
 from types import SimpleNamespace as NS
-from unittest.mock import AsyncMock, MagicMock, Mock, create_autospec, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import httpx
 import mlx.core as mx
@@ -6129,12 +6129,10 @@ def test_decisions_pass_images_and_allow_null_state(client, state):
     images = ["data:image/png;base64,iVBORw0KGgo=", "https://example.com/cat.jpg"]
     questions = {"cat": {"type": "bool"}}
     result = {"answers": {"cat": {"type": "bool", "value": True}}, "usage": {}}
-
-    def predict(processor, state, questions, images=None):
-        pass
-
     model = NS(
-        decision_types=("bool",), predict=create_autospec(predict, return_value=result)
+        decision_types=("bool",),
+        decision_media=("images",),
+        predict=MagicMock(return_value=result),
     )
     processor = object()
     with patch.object(server, "get_cached_model", return_value=(model, processor, {})):
@@ -6166,10 +6164,7 @@ def test_decisions_require_state_without_media(client, body):
     "media, kind", [({"images": ["cat.png"]}, "image"), ({"audio": "a.wav"}, "audio")]
 )
 def test_decisions_reject_media_for_text_only_models(client, media, kind):
-    def predict(processor, state, questions, **kwargs):
-        pass
-
-    model = NS(decision_types=("bool",), predict=create_autospec(predict))
+    model = NS(decision_types=("bool",), predict=MagicMock())
     with patch.object(server, "get_cached_model", return_value=(model, None, {})):
         response = client.post(
             "/v1/decisions",
@@ -6197,12 +6192,10 @@ def test_decisions_reject_media_for_text_only_models(client, media, kind):
 def test_decisions_pass_audio_and_allow_null_state(client, audio, expected):
     questions = {"speech": {"type": "bool"}}
     result = {"answers": {"speech": {"type": "bool", "value": True}}, "usage": {}}
-
-    def predict(processor, state, questions, images=None, audio=None):
-        pass
-
     model = NS(
-        decision_types=("bool",), predict=create_autospec(predict, return_value=result)
+        decision_types=("bool",),
+        decision_media=("audio",),
+        predict=MagicMock(return_value=result),
     )
     with patch.object(server, "get_cached_model", return_value=(model, None, {})):
         response = client.post(
@@ -6217,17 +6210,26 @@ def test_decisions_pass_audio_and_allow_null_state(client, audio, expected):
     assert (sent if isinstance(sent, str) else sent.read()) == expected
 
 
-def test_decisions_reject_images_with_audio(client):
-    with patch.object(server, "get_cached_model") as load:
+def test_decisions_leave_mixed_media_to_the_model(client):
+    questions = {"x": {"type": "bool"}}
+    error = ValueError("a request carries images or audio, not both")
+    model = NS(
+        decision_types=("bool",),
+        decision_media=("images", "audio"),
+        predict=MagicMock(side_effect=error),
+    )
+    with patch.object(server, "get_cached_model", return_value=(model, None, {})):
         response = client.post(
             "/v1/decisions",
             json={
-                "model": "d1",
-                "questions": {"x": {"type": "bool"}},
+                "model": "d1-omni",
+                "questions": questions,
                 "images": ["cat.png"],
                 "audio": "meow.wav",
             },
         )
     assert response.status_code == 400
-    assert response.json()["detail"] == "Send images or audio, not both"
-    load.assert_not_called()
+    assert response.json()["detail"] == str(error)
+    model.predict.assert_called_once_with(
+        None, None, questions, images=["cat.png"], audio="meow.wav"
+    )

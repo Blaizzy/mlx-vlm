@@ -43,10 +43,6 @@ class DecisionRequest(BaseModel):
 def register_routes(app, deps):
     @app.post("/v1/decisions")
     async def create_decisions(body: DecisionRequest):
-        if body.images and body.audio:
-            raise HTTPException(
-                status_code=400, detail="Send images or audio, not both"
-            )
         model_id = body.model or _default_decision_model()
         if not model_id:
             raise HTTPException(

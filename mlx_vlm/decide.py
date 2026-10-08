@@ -14,15 +14,14 @@ def main(argv=None):
     state = parser.add_mutually_exclusive_group()
     state.add_argument("--state", help="Text to evaluate")
     state.add_argument("--state-file", type=Path, help="UTF-8 text file to evaluate")
-    media = parser.add_mutually_exclusive_group()
-    media.add_argument(
+    parser.add_argument(
         "--image",
         action="append",
         dest="images",
         metavar="PATH_OR_URL",
         help="Image to evaluate; repeat for several (state is optional with images)",
     )
-    media.add_argument(
+    parser.add_argument(
         "--audio",
         metavar="PATH_OR_URL",
         help="Audio clip to evaluate (state is optional with audio)",

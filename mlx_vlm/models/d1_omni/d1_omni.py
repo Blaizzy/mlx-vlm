@@ -48,6 +48,7 @@ def _answer(question, probs):
 
 class Model(nn.Module):
     decision_types = ("choice", "score", "bool", "noul")
+    decision_media = ("images", "audio")
 
     def __init__(self, config: ModelConfig):
         super().__init__()

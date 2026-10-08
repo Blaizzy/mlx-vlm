@@ -60,6 +60,7 @@ def _answer(question, p):
 
 class Model(Lfm2VlModel):
     decision_types = ("choice", "score", "bool", "noul")
+    decision_media = ("images",)
 
     def predict(self, processor, state, questions, images=None, token_budget=65536):
         """Typed decisions read off the next-token logits at the answer slot."""

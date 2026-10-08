@@ -1,7 +1,6 @@
-import inspect
 from collections.abc import Mapping
 
-_MEDIA = {"images": "image", "audio": "audio"}
+_MEDIA = {"images": "image", "videos": "video", "audio": "audio"}
 
 
 def _validate_question_structure(questions):
@@ -21,14 +20,16 @@ def predict(model, processor, state, questions, **kwargs):
     ``score``, ``bool``, and ``multi_label``; support is model-specific.
     Probabilities and independent scores remain distinct, and model-specific
     metrics stay in ``metadata``. ``state`` may be ``None`` when media such as
-    ``images=[...]`` carry the whole state; media go to models that accept them.
+    ``images=[...]`` carry the whole state; a model reads the media named in
+    its ``decision_media``.
     """
     supported = getattr(model, "decision_types", ())
     if not supported:
         raise ValueError("This model does not support decision prediction")
     kwargs = {k: v for k, v in kwargs.items() if k not in _MEDIA or v is not None}
+    media = getattr(model, "decision_media", ())
     for name, kind in _MEDIA.items():
-        if name in kwargs and name not in inspect.signature(model.predict).parameters:
+        if name in kwargs and name not in media:
             raise ValueError(f"This model does not support {kind} input")
     _validate_question_structure(questions)
     normalized = {}
