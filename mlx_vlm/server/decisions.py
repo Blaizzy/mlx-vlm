@@ -4,12 +4,13 @@ import asyncio
 import logging
 import os
 import time
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from fastapi import HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from ..decision import predict
+from .openai import _decode_input_audio_data
 from .runtime import runtime
 
 logger = logging.getLogger(__name__)
@@ -27,13 +28,25 @@ def _default_decision_model() -> Optional[str]:
 
 class DecisionRequest(BaseModel):
     model: Optional[str] = Field(default=None, min_length=1)
-    state: Union[str, Dict[str, Any], list]
+    state: Union[str, Dict[str, Any], list, None] = None
     questions: Dict[str, Dict[str, Any]] = Field(min_length=1)
+    images: Optional[List[str]] = None
+    audio: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _state_or_media(self):
+        if self.state is None and not (self.images or self.audio):
+            raise ValueError("state is required unless images or audio are given")
+        return self
 
 
 def register_routes(app, deps):
     @app.post("/v1/decisions")
     async def create_decisions(body: DecisionRequest):
+        if body.images and body.audio:
+            raise HTTPException(
+                status_code=400, detail="Send images or audio, not both"
+            )
         model_id = body.model or _default_decision_model()
         if not model_id:
             raise HTTPException(
@@ -49,7 +62,10 @@ def register_routes(app, deps):
                 model, processor, _ = deps.get_cached_model(
                     model_id, model_kind="decision"
                 )
-                return predict(model, processor, body.state, body.questions)
+                media = {"images": body.images} if body.images else {}
+                if body.audio:
+                    media["audio"] = _decode_input_audio_data({"data": body.audio})
+                return predict(model, processor, body.state, body.questions, **media)
 
             result = await asyncio.to_thread(work)
         except Exception as error:

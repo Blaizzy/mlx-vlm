@@ -22,7 +22,7 @@ from pathlib import Path
 from queue import Queue
 from threading import Event, Lock, Thread, Timer
 from types import SimpleNamespace as NS
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, create_autospec, patch
 
 import httpx
 import mlx.core as mx
@@ -6122,3 +6122,112 @@ def test_decisions_generic_prediction_failure_returns_500(client):
     assert response.status_code == 500
     assert response.json()["detail"] == "Decision prediction failed"
     model.predict.assert_called_once()
+
+
+@pytest.mark.parametrize("state", [{"state": None}, {}, {"state": "text"}])
+def test_decisions_pass_images_and_allow_null_state(client, state):
+    images = ["data:image/png;base64,iVBORw0KGgo=", "https://example.com/cat.jpg"]
+    questions = {"cat": {"type": "bool"}}
+    result = {"answers": {"cat": {"type": "bool", "value": True}}, "usage": {}}
+
+    def predict(processor, state, questions, images=None):
+        pass
+
+    model = NS(
+        decision_types=("bool",), predict=create_autospec(predict, return_value=result)
+    )
+    processor = object()
+    with patch.object(server, "get_cached_model", return_value=(model, processor, {})):
+        response = client.post(
+            "/v1/decisions",
+            json={"model": "d1", "questions": questions, "images": images, **state},
+        )
+    assert response.status_code == 200
+    assert response.json() == {**result, "model": "d1"}
+    model.predict.assert_called_once_with(
+        processor, state.get("state"), questions, images=images
+    )
+
+
+@pytest.mark.parametrize(
+    "body", [{"state": None}, {}, {"state": None, "images": [], "audio": ""}]
+)
+def test_decisions_require_state_without_media(client, body):
+    with patch.object(server, "get_cached_model") as load:
+        response = client.post(
+            "/v1/decisions",
+            json={"model": "d1", "questions": {"x": {"type": "bool"}}, **body},
+        )
+    assert response.status_code == 422
+    load.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "media, kind", [({"images": ["cat.png"]}, "image"), ({"audio": "a.wav"}, "audio")]
+)
+def test_decisions_reject_media_for_text_only_models(client, media, kind):
+    def predict(processor, state, questions, **kwargs):
+        pass
+
+    model = NS(decision_types=("bool",), predict=create_autospec(predict))
+    with patch.object(server, "get_cached_model", return_value=(model, None, {})):
+        response = client.post(
+            "/v1/decisions",
+            json={
+                "model": "decider",
+                "state": "text",
+                "questions": {"x": {"type": "bool"}},
+                **media,
+            },
+        )
+    assert response.status_code == 400
+    assert response.json()["detail"] == f"This model does not support {kind} input"
+    model.predict.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "audio, expected",
+    [
+        ("https://example.com/clip.flac", "https://example.com/clip.flac"),
+        ("clips/meow.wav", "clips/meow.wav"),
+        ("data:audio/wav;base64," + base64.b64encode(b"RIFF").decode(), b"RIFF"),
+        (base64.b64encode(b"fLaC").decode(), b"fLaC"),
+    ],
+)
+def test_decisions_pass_audio_and_allow_null_state(client, audio, expected):
+    questions = {"speech": {"type": "bool"}}
+    result = {"answers": {"speech": {"type": "bool", "value": True}}, "usage": {}}
+
+    def predict(processor, state, questions, images=None, audio=None):
+        pass
+
+    model = NS(
+        decision_types=("bool",), predict=create_autospec(predict, return_value=result)
+    )
+    with patch.object(server, "get_cached_model", return_value=(model, None, {})):
+        response = client.post(
+            "/v1/decisions",
+            json={"model": "d1", "state": None, "questions": questions, "audio": audio},
+        )
+    assert response.status_code == 200
+    assert response.json() == {**result, "model": "d1"}
+    args, kwargs = model.predict.call_args
+    assert args == (None, None, questions) and set(kwargs) == {"audio"}
+    sent = kwargs["audio"]
+    assert (sent if isinstance(sent, str) else sent.read()) == expected
+
+
+def test_decisions_reject_images_with_audio(client):
+    with patch.object(server, "get_cached_model") as load:
+        response = client.post(
+            "/v1/decisions",
+            json={
+                "model": "d1",
+                "questions": {"x": {"type": "bool"}},
+                "images": ["cat.png"],
+                "audio": "meow.wav",
+            },
+        )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Send images or audio, not both"
+    load.assert_not_called()

@@ -1,4 +1,7 @@
+import inspect
 from collections.abc import Mapping
+
+_MEDIA = {"images": "image", "audio": "audio"}
 
 
 def _validate_question_structure(questions):
@@ -17,11 +20,16 @@ def predict(model, processor, state, questions, **kwargs):
     Questions contain a type, instructions, and criteria. Types are ``choice``,
     ``score``, ``bool``, and ``multi_label``; support is model-specific.
     Probabilities and independent scores remain distinct, and model-specific
-    metrics stay in ``metadata``.
+    metrics stay in ``metadata``. ``state`` may be ``None`` when media such as
+    ``images=[...]`` carry the whole state; media go to models that accept them.
     """
     supported = getattr(model, "decision_types", ())
     if not supported:
         raise ValueError("This model does not support decision prediction")
+    kwargs = {k: v for k, v in kwargs.items() if k not in _MEDIA or v is not None}
+    for name, kind in _MEDIA.items():
+        if name in kwargs and name not in inspect.signature(model.predict).parameters:
+            raise ValueError(f"This model does not support {kind} input")
     _validate_question_structure(questions)
     normalized = {}
     for name, question in questions.items():
@@ -54,7 +62,7 @@ def predict(model, processor, state, questions, **kwargs):
             ):
                 raise ValueError("threshold must be a number between zero and one")
         if (
-            kind == "bool"
+            kind in ("bool", "noul")
             and criteria is not None
             and not isinstance(criteria, Mapping)
         ):
