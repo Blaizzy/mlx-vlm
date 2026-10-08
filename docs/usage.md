@@ -439,30 +439,10 @@ curl -X PATCH http://127.0.0.1:8080/v1/settings \
   -d '{"op": "replace", "values": {"apc_enabled": true}}'
 ```
 
-Changes take effect on the next request. KV and APC settings reload text models,
-and `vision_cache_size` reloads image models. `max_kv_size` and
+Changes take effect on the next request. Most settings reload the affected
+model first — KV, APC, and speculative-decoding settings reload text models,
+`vision_cache_size` reloads image models — while `max_kv_size` and
 `token_queue_timeout` apply to new requests without a reload.
-
-Changing `draft_model` or `spec_draft_kind` replaces only the drafter after
-earlier queued generations finish, keeping the target model loaded. A different
-drafter path resets the kind to auto-detection unless a kind is supplied in the
-same update. Set the path to `null` to disable speculative decoding:
-
-```bash
-# Enable bundled MTP, or replace the current drafter.
-curl -X PATCH http://127.0.0.1:8080/v1/settings \
-  -H 'Content-Type: application/json' \
-  -d '{"draft_model": "nvidia/Qwen3.8-27B-NVFP4"}'
-
-curl -X PATCH http://127.0.0.1:8080/v1/settings \
-  -H 'Content-Type: application/json' \
-  -d '{"draft_model": null}'
-```
-
-The new drafter is validated before replacing the old one. If loading fails,
-generation returns an error and the old drafter stays loaded; restore its
-settings or select a valid replacement to resume. Both drafters can briefly
-occupy memory during the swap.
 
 The response reports which settings were applied and which were rejected;
 unknown names and invalid values are rejected and never applied.

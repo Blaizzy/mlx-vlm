@@ -34,37 +34,18 @@ On a running server, enable bundled MTP through the settings endpoint:
 ```bash
 curl -X PATCH http://localhost:8080/v1/settings \
   -H 'Content-Type: application/json' \
-  -d '{"draft_model":"nvidia/Qwen3.8-27B-NVFP4","spec_draft_kind":"mtp"}'
+  -d '{"spec_draft_model":"nvidia/Qwen3.8-27B-NVFP4","spec_draft_kind":"mtp"}'
 
 curl http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"nvidia/Qwen3.8-27B-NVFP4","messages":[{"role":"user","content":"Hello"}],"max_tokens":64}'
 ```
 
-These server-wide settings take effect on the next generation request. The
-server finishes earlier queued requests, then loads and validates the replacement
-drafter on its GPU worker. The target model, processor, vision cache, and APC
-manager stay loaded. Both `/v1/chat/completions` and `/v1/responses` use the
-configured drafter.
-
-To replace MTP with another compatible drafter, change only its path. A different
-path resets `spec_draft_kind` to auto-detection unless you explicitly provide it:
-
-```bash
-curl -X PATCH http://localhost:8080/v1/settings \
-  -H 'Content-Type: application/json' \
-  -d '{"draft_model":"/path/to/compatible-drafter"}'
-
-# Disable drafting while keeping the target loaded.
-curl -X PATCH http://localhost:8080/v1/settings \
-  -H 'Content-Type: application/json' \
-  -d '{"draft_model":null}'
-```
-
-A failed replacement returns a generation error and preserves the old drafter;
-restore its settings or choose another valid drafter before retrying. During a
-swap, both old and replacement drafter weights can briefly occupy memory. If the
-server requires an API key, include its bearer authorization header.
+These are server-wide settings, not per-request generation fields. The text
+model reloads with its drafter on the next generation request; a server restart
+is unnecessary. Both `/v1/chat/completions` and `/v1/responses` use the configured
+drafter. If the server requires an API key, include its bearer authorization
+header on these requests.
 
 Optionally, split those weights into a standalone drafter folder with:
 

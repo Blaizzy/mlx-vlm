@@ -752,15 +752,6 @@ class QueuedGenerationRequest:
 
 
 @dataclass
-class _DrafterUpdate:
-    """A queue barrier: replace the drafter after earlier requests finish."""
-
-    path: Optional[str]
-    kind: Optional[str]
-    result: Queue = field(default_factory=Queue)
-
-
-@dataclass
 class GenerationMetrics:
     """Runtime metrics collected while consuming generation output."""
 
@@ -1003,7 +994,6 @@ class ResponseGenerator:
         draft_model_path: Optional[str] = None,
         draft_kind: Optional[str] = None,
         prefill_step_size: Optional[int] = None,
-        draft_settings: Optional[Tuple[Optional[str], Optional[str]]] = None,
     ):
         self.model_path = model_path
         self.adapter_path = adapter_path
@@ -1012,20 +1002,9 @@ class ResponseGenerator:
         self.config = None
         self.stop_tokens = set()
         self.vision_cache = vision_cache
+        self.draft_model_path = draft_model_path
+        self.draft_kind_override = draft_kind
         self.draft_model = None
-        self.draft_kind = None
-        # Server settings can request a new selection; the worker owns the
-        # active selection and publishes it only after a successful load.
-        self.draft_settings = draft_settings
-        self._draft_selection = (
-            draft_settings
-            if draft_settings is not None
-            else (
-                draft_model_path or os.environ.get("MLX_VLM_DRAFT_MODEL"),
-                draft_kind or os.environ.get("MLX_VLM_DRAFT_KIND"),
-            )
-        )
-        self._drafter_update_lock = Lock()
         self.kv_bits = kv_bits
         self.kv_key_bits = kv_key_bits
         self.kv_value_bits = kv_value_bits
@@ -1078,71 +1057,6 @@ class ResponseGenerator:
             raise self._load_error
         return self.model, self.processor, self.config
 
-    def replace_drafter(self, path: Optional[str], kind: Optional[str] = None):
-        """Wait for a worker-owned swap without unloading the target model.
-
-        Calls are serialized and queued behind already admitted work. A failed
-        load or validation leaves the previous drafter usable.
-        """
-        self.wait_until_ready()
-        with self._drafter_update_lock:
-            if self._draft_selection == (path, kind):
-                return
-            if self._stop or not self._thread.is_alive():
-                raise RuntimeError("Cannot replace the drafter of a stopped worker.")
-            if is_diffusion_model(self.model):
-                raise ValueError(
-                    "Speculative drafters are not supported for diffusion models."
-                )
-            update = _DrafterUpdate(path, kind)
-            self.requests.put(update)
-            while True:
-                try:
-                    result = update.result.get(timeout=0.1)
-                    break
-                except QueueEmpty:
-                    if not self._thread.is_alive():
-                        raise RuntimeError(
-                            "Generation worker stopped during drafter replacement."
-                        )
-            if isinstance(result, Exception):
-                raise result
-
-    @staticmethod
-    def _load_drafter_for_target(model, path, kind, *, allow_incompatible=False):
-        if path is None:
-            return None, None
-        from ..speculative.drafters import load_drafter, validate_drafter_compatibility
-
-        logger.info("Loading speculative drafter (%s): %s", kind or "auto", path)
-        draft_model, resolved_kind = load_drafter(path, kind=kind)
-        try:
-            validate_drafter_compatibility(model, draft_model, resolved_kind)
-        except ValueError as exc:
-            if not allow_incompatible:
-                raise
-            logger.warning(
-                "Speculative drafter is incompatible with the target model; "
-                "falling back to autoregressive generation: %s",
-                exc,
-            )
-            return None, None
-        logger.info("Drafter ready; speculative decoding enabled (%s).", resolved_kind)
-        return draft_model, resolved_kind
-
-    def _apply_drafter_update(self, update: _DrafterUpdate):
-        """GPU worker only, with no active batch. Publish only after validation."""
-        draft_model, draft_kind = self._load_drafter_for_target(
-            self.model, update.path, update.kind
-        )
-        mx.clear_cache()
-        self.draft_model, self.draft_kind = draft_model, draft_kind
-        self._draft_selection = (update.path, update.kind)
-        logger.info(
-            "Drafter replaced; target model remains loaded (%s).",
-            draft_kind or "disabled",
-        )
-
     def _cancel(self, uid):
         with self._cancel_lock:
             self._cancelled.add(uid)
@@ -1165,10 +1079,44 @@ class ResponseGenerator:
         )
         stop_tokens.update(getattr(processor, "additional_eos_token_ids", ()))
 
-        selection = self._draft_selection
-        draft_model, draft_kind = self._load_drafter_for_target(
-            model, *selection, allow_incompatible=True
+        draft_model = None
+        draft_kind = self.draft_kind_override or os.environ.get("MLX_VLM_DRAFT_KIND")
+        draft_model_path = self.draft_model_path or os.environ.get(
+            "MLX_VLM_DRAFT_MODEL"
         )
+        if draft_model_path:
+            from ..speculative.drafters import (
+                load_drafter,
+                validate_drafter_compatibility,
+            )
+
+            logger.info(
+                "Loading speculative drafter (%s): %s",
+                draft_kind or "auto",
+                draft_model_path,
+            )
+            draft_model, resolved_kind = load_drafter(draft_model_path, kind=draft_kind)
+            if draft_kind is None:
+                logger.info("Auto-detected speculative draft kind: %s", resolved_kind)
+            elif resolved_kind != draft_kind:
+                logger.warning(
+                    "Drafter requires draft kind %s; using it instead of %s.",
+                    resolved_kind,
+                    draft_kind,
+                )
+            draft_kind = resolved_kind
+            try:
+                validate_drafter_compatibility(model, draft_model, draft_kind)
+            except ValueError as e:
+                logger.warning(
+                    "Speculative drafter is incompatible with the target model; "
+                    "falling back to autoregressive generation: %s",
+                    e,
+                )
+                draft_model = None
+                draft_kind = None
+            else:
+                logger.info("Drafter ready; speculative decoding enabled.")
 
         self.model = model
         self.processor = processor
@@ -1184,16 +1132,6 @@ class ResponseGenerator:
             language_model = getattr(model, "language_model", model)
             self.apc_mode = _apc.model_apc_mode(language_model)
 
-    def _validate_speculative_args(self, args):
-        if self.draft_model is not None and args.logits_processors is not None:
-            raise ValueError(
-                "Structured response_format is not supported with speculative decoding."
-            )
-        if self.draft_model is not None and args.thinking_budget is not None:
-            raise ValueError(
-                "thinking_budget is not supported with speculative decoding in the server."
-            )
-
     def generate(
         self,
         prompt: str,
@@ -1203,10 +1141,15 @@ class ResponseGenerator:
         videos: Optional[List] = None,
     ) -> Tuple[GenerationContext, "_TokenIterator"]:
         self.wait_until_ready()
-        if self.draft_settings is not None:
-            self.replace_drafter(*self.draft_settings)
         args = args or GenerationArguments(max_tokens=get_server_max_tokens())
-        self._validate_speculative_args(args)
+        if self.draft_model is not None and args.logits_processors is not None:
+            raise ValueError(
+                "Structured response_format is not supported with speculative decoding."
+            )
+        if self.draft_model is not None and args.thinking_budget is not None:
+            raise ValueError(
+                "thinking_budget is not supported with speculative decoding in the server."
+            )
         rqueue: Queue = Queue()
         request_started_at = time.perf_counter()
 
@@ -1666,48 +1609,46 @@ class ResponseGenerator:
         capacity: Optional[int] = None,
         idle_timeout: float = 0.1,
         coalesce_s: float = 0.0,
-    ) -> Tuple[List[QueuedGenerationRequest], bool, Optional[_DrafterUpdate]]:
+    ):
         """Collect the first queued request, then drain immediately available peers.
 
         When ``capacity`` is set, admit at most ``capacity`` new requests and leave
         the rest queued (backpressure), so the running batch never exceeds
         ``--max-num-seqs`` concurrent sequences.
-
-        A drafter update ends collection. Return it separately so the worker
-        can finish these requests before applying it and reading more work.
         """
         pending = []
-        if capacity is not None and capacity <= 0:
-            return pending, False, None
+        should_stop = False
 
-        try:
-            item = (
-                self.requests.get_nowait()
-                if active
-                else self.requests.get(timeout=idle_timeout)
-            )
-        except QueueEmpty:
-            return pending, False, None
-
-        while True:
+        def append_item(item):
+            nonlocal should_stop
             if item is None:
                 if self._stop and not pending:
-                    return pending, True, None
-            elif isinstance(item, _DrafterUpdate):
-                return pending, False, item
-            else:
-                pending.append(item)
-                if len(pending) == 1 and coalesce_s > 0:
-                    time.sleep(coalesce_s)
+                    should_stop = True
+                return
+            pending.append(item)
 
-            if capacity is not None and len(pending) >= capacity:
-                break
+        def _has_room():
+            return capacity is None or len(pending) < capacity
+
+        try:
+            if active:
+                if _has_room():
+                    append_item(self.requests.get_nowait())
+            else:
+                append_item(self.requests.get(timeout=idle_timeout))
+        except QueueEmpty:
+            pass
+
+        if pending and coalesce_s > 0:
+            time.sleep(coalesce_s)
+
+        while not should_stop and _has_room():
             try:
-                item = self.requests.get_nowait()
+                append_item(self.requests.get_nowait())
             except QueueEmpty:
                 break
 
-        return pending, False, None
+        return pending, should_stop
 
     def _run(self):
         try:
@@ -1744,18 +1685,11 @@ class ResponseGenerator:
         generation_stream = mx.default_stream(mx.default_device())
 
         batch_gen = None
-        pending_update: Optional[_DrafterUpdate] = None
-        next_uid = 0
         # uid -> {rqueue, tokens, gen_kwargs}
         active: dict = {}
         max_num_seqs = get_max_num_seqs()
 
-        while not (
-            self._stop
-            and not active
-            and self.requests.empty()
-            and pending_update is None
-        ):
+        while not (self._stop and not active and self.requests.empty()):
             new_items = []
             try:
                 # Poll the request queue — non-blocking when generating, short
@@ -1769,33 +1703,13 @@ class ResponseGenerator:
                 capacity = (
                     None if max_num_seqs is None else max(0, max_num_seqs - len(active))
                 )
-                if pending_update is None:
-                    new_items, should_stop, pending_update = (
-                        self._collect_pending_requests(
-                            active=active_batch,
-                            capacity=capacity,
-                            coalesce_s=coalesce_s,
-                        )
-                    )
-                    if should_stop and not active:
-                        break
-
-                if pending_update is not None and not active and not new_items:
-                    try:
-                        if batch_gen is not None:
-                            batch_gen.close()
-                        self._apply_drafter_update(pending_update)
-                    except Exception as exc:
-                        logger.exception(
-                            "Drafter replacement failed; retaining the previous drafter."
-                        )
-                        pending_update.result.put(exc)
-                    else:
-                        pending_update.result.put(None)
-                    finally:
-                        batch_gen = None
-                        pending_update = None
-                    continue
+                new_items, should_stop = self._collect_pending_requests(
+                    active=active_batch,
+                    capacity=capacity,
+                    coalesce_s=coalesce_s,
+                )
+                if should_stop and not active:
+                    break
 
                 # Drop abandoned requests before doing more work.
                 cancelled = self._drain_cancellations()
@@ -1825,12 +1739,6 @@ class ResponseGenerator:
                     prompt_tokens = request.prompt_tokens
                     args = request.args
                     images = request.images
-                    try:
-                        # A request may have been preprocessed before a swap.
-                        self._validate_speculative_args(args)
-                    except ValueError as exc:
-                        rqueue.put(exc)
-                        continue
                     log_state = self._log_prefill_started(
                         request, backend="continuous_batching"
                     )
@@ -1858,9 +1766,6 @@ class ResponseGenerator:
                             greedy_sampling=args.temperature == 0,
                             prefill_step_size=self._effective_prefill_step_size(),
                         )
-                        # Batch instances restart their UID counter. Keep IDs
-                        # unique across swaps so late cancellations stay safe.
-                        batch_gen.uid_count = next_uid
 
                     # Vision encoder runs on the GPU thread; text tokenization
                     # already happened on the caller thread.
@@ -1904,7 +1809,6 @@ class ResponseGenerator:
                             ],
                             thinking_budget_criteria=[thinking_budget_criteria],
                         )
-                        next_uid = uid + 1
                     except Exception as e:
                         rqueue.put(e)
                         continue
@@ -1961,7 +1865,7 @@ class ResponseGenerator:
         cancelled: set = set()
         while not self._stop:
             try:
-                new_items, should_stop, _ = self._collect_pending_requests(active=False)
+                new_items, should_stop = self._collect_pending_requests(active=False)
                 if should_stop:
                     break
                 cancelled |= self._drain_cancellations()

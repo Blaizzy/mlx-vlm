@@ -180,19 +180,19 @@ KNOBS: Tuple[
         "Token queue wait timeout in seconds; null disables the timeout.",
     ),
     (
-        "draft_model",
+        "spec_draft_model",
         "str_or_none",
         None,
-        (),
+        TEXT_KINDS,
         None,
-        "Speculative drafter path; null disables drafting. Swapped between batches.",
+        "Speculative drafting model path.",
     ),
     (
         "spec_draft_kind",
         "str_or_none",
         None,
-        (),
-        ("dflash", "eagle3", "mtp"),
+        TEXT_KINDS,
+        None,
         "Speculative draft kind (auto if unset).",
     ),
     (
@@ -218,12 +218,7 @@ _KNOB_SPEC: Dict[str, Dict[str, Any]] = {
 
 # Knobs that are naturally live (applied per request) and must never trigger a
 # model reload, so they are excluded from the cache-key fingerprint.
-_LIVE_KNOBS: Tuple[str, ...] = (
-    "max_kv_size",
-    "token_queue_timeout",
-    "draft_model",
-    "spec_draft_kind",
-)
+_LIVE_KNOBS: Tuple[str, ...] = ("max_kv_size", "token_queue_timeout")
 
 
 def _env_float(
@@ -317,7 +312,7 @@ class RuntimeConfig:
     apc_checkpoint_guard_tokens: int = 1
     max_kv_size: Optional[int] = None
     token_queue_timeout: Optional[float] = DEFAULT_TOKEN_QUEUE_TIMEOUT
-    draft_model: Optional[str] = None
+    spec_draft_model: Optional[str] = None
     spec_draft_kind: Optional[str] = None
     vision_cache_size: int = 20
 
@@ -374,7 +369,7 @@ class RuntimeConfig:
             ),
             max_kv_size=_env_int("MAX_KV_SIZE", None),
             token_queue_timeout=_env_token_queue_timeout(),
-            draft_model=os.environ.get("MLX_VLM_DRAFT_MODEL") or None,
+            spec_draft_model=os.environ.get("MLX_VLM_DRAFT_MODEL") or None,
             spec_draft_kind=os.environ.get("MLX_VLM_DRAFT_KIND") or None,
             vision_cache_size=int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20")),
         )
@@ -397,11 +392,6 @@ class RuntimeConfig:
     def current(self) -> Dict[str, Any]:
         with self._lock:
             return {name: getattr(self, name) for name in _KNOB_SPEC}
-
-    def drafter_settings(self) -> Tuple[Optional[str], Optional[str]]:
-        """Read the drafter path and kind as one settings snapshot."""
-        with self._lock:
-            return self.draft_model, self.spec_draft_kind
 
     def apc_overrides(self) -> Dict[str, Any]:
         """Snapshot all APC settings for manager creation without changing env."""
@@ -430,7 +420,6 @@ class RuntimeConfig:
         applied: Dict[str, Any] = {}
         rejected: List[Dict[str, Any]] = []
         with self._lock:
-            previous_drafter = self.draft_model
             for name, raw in payload.items():
                 if name not in _KNOB_SPEC:
                     rejected.append({"name": name, "reason": "unknown knob"})
@@ -453,13 +442,6 @@ class RuntimeConfig:
                     continue
                 setattr(self, name, value)
                 applied[name] = value
-            if (
-                "draft_model" in applied
-                and self.draft_model != previous_drafter
-                and "spec_draft_kind" not in payload
-            ):
-                self.spec_draft_kind = None
-                applied["spec_draft_kind"] = None
         return applied, rejected
 
     def _in_cache_key(self, name: str) -> bool:

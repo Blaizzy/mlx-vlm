@@ -9,6 +9,7 @@ from .muse_glimmer_assistant import MuseGlimmerAssistantDraftModel
 from .qwen3_dflash import DFlashDraftModel
 
 KNOWN_DRAFTER_KINDS = {"dflash", "mtp", "eagle3"}
+_BUNDLED_QWEN_MTP_TYPES = {"qwen3_5", "qwen3_5_moe"}
 
 # Drafter HF ``model_type`` → required round-loop kind. Anything not listed
 # here falls back to ``DEFAULT_DRAFTER_KIND`` when the caller didn't pass one.
@@ -25,8 +26,6 @@ DRAFTER_KIND_BY_MODEL_TYPE = {
     "glm_moe_dsa_mtp": "mtp",
     "hy_v4_mtp": "mtp",
     "inkling_mtp": "mtp",
-    "qwen3_5": "mtp",
-    "qwen3_5_moe": "mtp",
     "qwen3_5_mtp": "mtp",
     "qwen4_exp_mtp": "mtp",
     "laguna": "dflash",
@@ -120,6 +119,11 @@ def _read_drafter_config(model_path) -> dict:
         return {}
 
 
+def _peek_drafter_model_type(model_path) -> Optional[str]:
+    config = _read_drafter_config(model_path)
+    return config.get("model_type") or config.get("speculators_model_type")
+
+
 def _declares_mtp_layers(config: Any) -> bool:
     """True when the config declares next-token-prediction layers, the marker of
     a native checkpoint that carries an embedded ``mtp.*`` head."""
@@ -136,6 +140,8 @@ def _expected_drafter_kind(model_type: Any, config: Any = None) -> Optional[str]
     """Round-loop kind a drafter requires, or ``None`` when it can't be inferred:
     an explicit ``model_type`` mapping first, then an ``mtp`` model_type name,
     then a config that declares next-token-prediction layers."""
+    if model_type in _BUNDLED_QWEN_MTP_TYPES:
+        return "mtp"
     expected = DRAFTER_KIND_BY_MODEL_TYPE.get(model_type)
     if expected is not None:
         return expected
@@ -146,9 +152,7 @@ def _expected_drafter_kind(model_type: Any, config: Any = None) -> Optional[str]
     return None
 
 
-def resolve_drafter_kind(
-    model_path, kind: Optional[str] = None, *, config: Optional[dict] = None
-) -> str:
+def resolve_drafter_kind(model_path, kind: Optional[str] = None) -> str:
     """Reconcile the caller's ``kind`` with the drafter's actual model type.
 
     When ``kind`` is None, auto-detect from the drafter's HF ``model_type`` or,
@@ -161,8 +165,7 @@ def resolve_drafter_kind(
     but forgets ``--draft-kind mtp``: rather than crashing deep inside
     ``draft_block`` with an opaque error, we pick the right kind for them.
     """
-    if config is None:
-        config = _read_drafter_config(model_path)
+    config = _read_drafter_config(model_path)
     model_type = config.get("model_type") or config.get("speculators_model_type")
     expected = _expected_drafter_kind(model_type, config)
 
@@ -210,9 +213,8 @@ def load_drafter(
     from ...utils import get_model_path, load_model
 
     path = get_model_path(path_or_repo)
-    config = _read_drafter_config(path)
-    resolved = resolve_drafter_kind(path, kind, config=config)
-    if config.get("model_type") in ("qwen3_5", "qwen3_5_moe"):
+    resolved = resolve_drafter_kind(path, kind)
+    if _peek_drafter_model_type(path) in _BUNDLED_QWEN_MTP_TYPES:
         from .qwen3_5_mtp.split import Qwen3_5MTPSplitter
 
         return Qwen3_5MTPSplitter().load(path, **kwargs), resolved

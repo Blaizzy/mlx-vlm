@@ -20,7 +20,7 @@ from functools import partial
 from itertools import count
 from pathlib import Path
 from queue import Queue
-from threading import Event, Lock, Thread, Timer, current_thread
+from threading import Event, Lock, Thread, Timer
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -703,7 +703,7 @@ def _generator(**overrides):
         dict.fromkeys(
             (
                 "adapter_path model processor config vision_cache draft_model draft_kind "
-                "kv_bits apc_manager apc_mode tokenizer _load_error"
+                "draft_model_path draft_kind_override kv_bits apc_manager apc_mode tokenizer _load_error"
             ).split()
         )
     )
@@ -719,9 +719,6 @@ def _generator(**overrides):
         _ready=Event(),
         _cancelled=set(),
         _cancel_lock=Lock(),
-        _drafter_update_lock=Lock(),
-        _draft_selection=(None, None),
-        draft_settings=None,
     )
     gen.__dict__.update(overrides)
     return gen
@@ -758,7 +755,6 @@ def test_server_serves_ar_requests_after_drafter_mismatch(monkeypatch):
     gen, _ = _worker_setup(monkeypatch, initialize=False)
     monkeypatch.setenv("MLX_VLM_DRAFT_MODEL", "assistant")
     monkeypatch.setenv("MLX_VLM_DRAFT_KIND", "mtp")
-    gen._draft_selection = ("assistant", "mtp")
     monkeypatch.setattr(
         generation,
         "load_model_resources",
@@ -3730,7 +3726,6 @@ def _enqueue(gen, request_id=1, **kwargs):
 @contextmanager
 def _running(gen):
     worker = Thread(target=gen._run, daemon=True)
-    gen._thread = worker
     worker.start()
     try:
         yield worker
@@ -4578,21 +4573,6 @@ class TestRuntimeConfig:
         assert cfg.reload_kinds(applied) == set()
         assert cfg.fingerprint() == before
 
-    def test_drafter_path_change_resets_kind_and_preserves_target_fingerprint(self):
-        cfg = RuntimeConfig(draft_model="old", spec_draft_kind="mtp")
-        before = cfg.fingerprint()
-        applied, rejected = cfg.apply_changes({"draft_model": "new"})
-        assert applied == {"draft_model": "new", "spec_draft_kind": None}
-        assert rejected == []
-        assert cfg.drafter_settings() == ("new", None)
-        assert cfg.fingerprint() == before and cfg.reload_kinds(applied) == set()
-        cfg.apply_changes({"draft_model": "old", "spec_draft_kind": "mtp"})
-        assert cfg.drafter_settings() == ("old", "mtp")
-        cfg.apply_changes({"draft_model": "old"})
-        assert cfg.drafter_settings() == ("old", "mtp")
-        applied, rejected = cfg.apply_changes({"spec_draft_kind": "invalid"})
-        assert applied == {} and rejected[0]["name"] == "spec_draft_kind"
-
     @pytest.mark.parametrize(
         "payload",
         [[1, 2, 3], {"op": "bogus", "values": {}}, {"op": "replace", "values": "x"}],
@@ -4963,7 +4943,6 @@ def settings_client(monkeypatch, tmp_path):
             self.processor = NS()
             self.config = NS(model_type="test")
             self.apc_manager = kwargs["apc_manager"]
-            self.draft_settings = kwargs["draft_settings"]
             self.stopped = False
             generators.append(self)
 
@@ -4982,246 +4961,6 @@ def settings_client(monkeypatch, tmp_path):
         if not generator.stopped:
             generator.stop_and_join()
     client.close()
-
-
-def test_drafter_settings_keep_cached_target(settings_client):
-    client, generators = settings_client
-    resources = server.get_cached_model("demo")
-    before = client.get("/v1/settings").json()["fingerprint"]
-    for payload, expected in [
-        ({"draft_model": "mtp", "spec_draft_kind": "mtp"}, ("mtp", "mtp")),
-        ({"draft_model": "dflash"}, ("dflash", None)),
-        ({"draft_model": None}, (None, None)),
-    ]:
-        response = client.patch("/v1/settings", json=payload)
-        assert response.status_code == 200
-        assert response.json()["reload_kinds"] == []
-        assert response.json()["fingerprint"] == before
-        assert server.get_cached_model("demo") == resources
-        assert len(generators) == 1 and not generators[0].stopped
-        assert generators[0].draft_settings == expected
-
-
-@pytest.mark.parametrize(
-    "options,expected",
-    [
-        ({}, ("startup-drafter", "mtp")),
-        (
-            {"draft_model_path": "explicit", "draft_kind": "eagle3"},
-            ("explicit", "eagle3"),
-        ),
-        ({"draft_settings": (None, None)}, (None, None)),
-    ],
-)
-def test_initial_drafter_settings_override_startup_env(monkeypatch, options, expected):
-    monkeypatch.setenv("MLX_VLM_DRAFT_MODEL", "startup-drafter")
-    monkeypatch.setenv("MLX_VLM_DRAFT_KIND", "mtp")
-    resources = NS(), NS(tokenizer=NS()), NS(eos_token_id=[])
-    monkeypatch.setattr(generation, "load_model_resources", lambda *a: resources)
-    drafter = NS()
-    loader = Mock(return_value=(drafter, expected[1]))
-    monkeypatch.setattr("mlx_vlm.speculative.drafters.load_drafter", loader)
-    gen = Generator("demo", **options)
-    try:
-        gen.wait_until_ready(timeout=2)
-        assert gen._draft_selection == expected
-        if expected[0] is None:
-            assert gen.draft_model is None
-            loader.assert_not_called()
-        else:
-            assert gen.draft_model is drafter
-            loader.assert_called_once_with(expected[0], kind=expected[1])
-    finally:
-        gen.stop_and_join(timeout=2)
-
-
-@pytest.mark.parametrize("via_settings", [False, True])
-def test_worker_can_enable_replace_and_disable_only_drafter(monkeypatch, via_settings):
-    gen, batches = _worker_setup(monkeypatch, idle=True)
-    gen._preprocess_request = lambda *a: {"input_ids": mx.array([[1]]), "request_id": 1}
-    initialized = Mock(wraps=gen._initialize_model)
-    gen._initialize_model = initialized
-    drafts = {
-        name: NS(config=NS(model_type=name), accept_lens=[], draft_lens=[])
-        for name in ("qwen3_5_mtp", "eagle3")
-    }
-    loads = []
-
-    def load_drafter(path, kind=None):
-        loads.append((path, current_thread()))
-        return drafts[path], "mtp" if path == "qwen3_5_mtp" else "eagle3"
-
-    monkeypatch.setattr("mlx_vlm.speculative.drafters.load_drafter", load_drafter)
-    gen.vision_cache = object()
-    vision_cache = gen.vision_cache
-    with _running(gen) as worker:
-        gen.wait_until_ready(timeout=1)
-        model, processor, tokenizer = gen.model, gen.processor, gen.tokenizer
-        for path in ("qwen3_5_mtp", "eagle3", None, "qwen3_5_mtp"):
-            if via_settings:
-                gen.draft_settings = (path, None)
-            else:
-                gen.replace_drafter(path)
-            _, tokens = gen.generate("Hello", args=Args(max_tokens=1))
-            assert len(list(tokens)) == 1
-            previous_loads = len(loads)
-            gen.replace_drafter(path)  # identical selection is a no-op
-            assert len(loads) == previous_loads
-            assert batches[-1].kwargs["draft_model"] is drafts.get(path)
-            assert gen.model is model and gen.processor is processor
-            assert gen.tokenizer is tokenizer and gen.vision_cache is vision_cache
-        assert initialized.call_count == 1
-        assert len(loads) == 3 and all(thread is worker for _, thread in loads)
-        assert all(batch.closed for batch in batches[:-1])
-
-
-@pytest.mark.parametrize("args", [{"thinking_budget": 1}, {"logits_processors": []}])
-def test_worker_revalidates_requests_preprocessed_before_drafter_swap(
-    monkeypatch, args
-):
-    gen, batches = _worker_setup(monkeypatch, idle=True)
-    monkeypatch.setattr(
-        "mlx_vlm.speculative.drafters.load_drafter",
-        lambda *a, **kw: (NS(), "mtp"),
-    )
-    update = generation._DrafterUpdate("mtp", None)
-    gen.requests.put(update)
-    invalid = _enqueue(gen, **args)
-    valid = _enqueue(gen, max_tokens=1)
-    with _running(gen):
-        assert update.result.get(timeout=1) is None
-        assert isinstance(invalid.get(timeout=1), ValueError)
-        _drain(valid)
-        assert len(batches) == 1
-
-
-def test_worker_drains_queued_requests_and_swaps_during_shutdown(monkeypatch):
-    gen, batches = _worker_setup(monkeypatch, idle=True)
-    drafter = NS()
-    loader = Mock(return_value=(drafter, "mtp"))
-    monkeypatch.setattr("mlx_vlm.speculative.drafters.load_drafter", loader)
-    before = _enqueue(gen, max_tokens=1)
-    enable = generation._DrafterUpdate("mtp", None)
-    gen.requests.put(enable)
-    during = _enqueue(gen, max_tokens=1)
-    disable = generation._DrafterUpdate(None, None)
-    gen.requests.put(disable)
-    after = _enqueue(gen, max_tokens=1)
-    gen._stop = True
-    gen.requests.put(None)
-
-    with _running(gen) as worker:
-        for queue in (before, during, after):
-            assert len(_drain(queue)[1]) == 1
-        assert enable.result.get(timeout=1) is None
-        assert disable.result.get(timeout=1) is None
-        worker.join(timeout=2)
-        assert not worker.is_alive()
-
-    assert [batch.kwargs["draft_model"] for batch in batches] == [None, drafter, None]
-    assert all(batch.closed for batch in batches)
-    loader.assert_called_once_with("mtp", kind=None)
-
-
-def test_drafter_swap_does_not_reuse_request_ids(monkeypatch):
-    gen, batches = _worker_setup(monkeypatch, idle=True)
-    original_insert = _Batch.insert
-
-    def insert(batch, *args, **kwargs):
-        # Match the real BatchGenerator's per-instance UID counter.
-        batch.uids = iter([batch.uid_count])
-        batch.uid_count += 1
-        return original_insert(batch, *args, **kwargs)
-
-    monkeypatch.setattr(_Batch, "insert", insert)
-    monkeypatch.setattr(
-        "mlx_vlm.speculative.drafters.load_drafter",
-        lambda *a, **kw: (NS(), "mtp"),
-    )
-    with _running(gen):
-        first, _ = _drain(_enqueue(gen, max_tokens=1))
-        gen.replace_drafter("mtp")
-        second, _ = _drain(_enqueue(gen, max_tokens=1))
-        assert first.uid != second.uid
-
-
-@pytest.mark.parametrize("failure", [None, "load", "incompatible"])
-def test_drafter_swap_drains_active_batch_and_preserves_old_on_failure(
-    monkeypatch, failure
-):
-    gen, batches = _worker_setup(monkeypatch, steps=3, draft_kind="mtp", idle=True)
-    old_started, release_old, update_queued = Event(), Event(), Event()
-    sequence, errors = [], []
-    original_step, original_put = gen._step, gen.requests.put
-    candidate = NS(
-        config=NS(model_type="eagle3"),
-        validate_target_compatibility=Mock(
-            side_effect=(
-                ValueError("incompatible replacement")
-                if failure == "incompatible"
-                else None
-            )
-        ),
-    )
-
-    def step(batch, active):
-        if not old_started.is_set():
-            old_started.set()
-            assert release_old.wait(5)
-        original_step(batch, active)
-        if not active:
-            sequence.append("batch_finished")
-
-    def put(item):
-        original_put(item)
-        if isinstance(item, generation._DrafterUpdate):
-            update_queued.set()
-
-    def load_drafter(*args, **kwargs):
-        sequence.append("load")
-        assert batches[0].closed and not batches[0].active
-        if failure == "load":
-            raise RuntimeError("replacement failed to load")
-        return candidate, "eagle3"
-
-    def replace():
-        try:
-            gen.replace_drafter("replacement", "eagle3")
-        except Exception as exc:
-            errors.append(exc)
-
-    gen._step = step
-    gen.requests.put = put
-    monkeypatch.setattr("mlx_vlm.speculative.drafters.load_drafter", load_drafter)
-    first = _enqueue(gen, max_tokens=3)
-    with _running(gen):
-        assert old_started.wait(2)
-        old_drafter, target = gen.draft_model, gen.model
-        updater = Thread(target=replace)
-        updater.start()
-        try:
-            assert update_queued.wait(2)
-            second = _enqueue(gen, request_id=2, max_tokens=3)
-            release_old.set()
-            _, first_tokens = _drain(first)
-            updater.join(2)
-            assert not updater.is_alive()
-            _, second_tokens = _drain(second)
-        finally:
-            release_old.set()
-            updater.join(2)
-        assert sequence == ["batch_finished", "load", "batch_finished"]
-        assert len(first_tokens) == len(second_tokens) == 3
-        assert gen.model is target
-        assert batches[0].kwargs["draft_model"] is old_drafter
-        assert batches[1].kwargs["draft_model"] is (
-            old_drafter if failure else candidate
-        )
-        assert len(errors) == int(failure is not None)
-        if failure:
-            assert gen._draft_selection != ("replacement", "eagle3")
-        else:
-            assert gen._draft_selection == ("replacement", "eagle3")
 
 
 def test_apc_patch_reaches_next_model_request(settings_client, tmp_path):
