@@ -1150,6 +1150,23 @@ class ResponseGenerator:
             raise ValueError(
                 "thinking_budget is not supported with speculative decoding in the server."
             )
+        if self.draft_model is not None:
+            # Speculative rounds verify with argmax and never apply logits
+            # processors, so these would otherwise be silently ignored.
+            unsupported = [
+                name
+                for name, value, neutral in (
+                    ("repetition_penalty", args.repetition_penalty, 1.0),
+                    ("presence_penalty", args.presence_penalty, 0.0),
+                    ("frequency_penalty", args.frequency_penalty, 0.0),
+                    ("logit_bias", args.logit_bias, None),
+                )
+                if value not in (None, neutral) and value != {}
+            ]
+            if unsupported:
+                raise ValueError(
+                    f"{', '.join(unsupported)} not supported with speculative decoding in the server."
+                )
         rqueue: Queue = Queue()
         request_started_at = time.perf_counter()
 

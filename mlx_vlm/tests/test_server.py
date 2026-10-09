@@ -774,6 +774,41 @@ def test_server_serves_ar_requests_after_drafter_mismatch(monkeypatch):
     assert gen.draft_model is gen.draft_kind is None
 
 
+@pytest.mark.parametrize(
+    "kwargs, rejected",
+    [
+        ({"presence_penalty": 1.5}, "presence_penalty"),
+        ({"repetition_penalty": 1.2}, "repetition_penalty"),
+        ({"frequency_penalty": 0.5}, "frequency_penalty"),
+        ({"logit_bias": {1: 2.0}}, "logit_bias"),
+        (
+            {"presence_penalty": 1.0, "frequency_penalty": 1.0},
+            "presence_penalty, frequency_penalty",
+        ),
+    ],
+)
+def test_speculative_server_rejects_ignored_sampling_params(kwargs, rejected):
+    gen = _generator(draft_model=object())
+    gen._ready.set()
+    with pytest.raises(ValueError, match=f"{rejected} not supported"):
+        gen.generate("prompt", args=Args(max_tokens=1, **kwargs))
+
+
+def test_speculative_server_accepts_neutral_sampling_params():
+    gen = _generator(draft_model=object())
+    gen._ready.set()
+    gen._preprocess_request = MagicMock(side_effect=RuntimeError("past validation"))
+    args = Args(
+        max_tokens=1,
+        repetition_penalty=1.0,
+        presence_penalty=0.0,
+        frequency_penalty=0.0,
+        logit_bias={},
+    )
+    with pytest.raises(RuntimeError, match="past validation"):
+        gen.generate("prompt", args=args)
+
+
 def test_ar_thread_exception_reaches_pending_client_queue(monkeypatch):
     gen, _ = _worker_setup(monkeypatch, idle=True)
     error = RuntimeError("vision embedding failed")
