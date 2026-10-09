@@ -76,6 +76,7 @@ conversion values and second-pass stability.
 From the repository root, you can run the tests with:
 
 ```shell
+python -m pip install -e '.[test]'
 python -m pytest -q mlx_vlm/tests
 ```
 
