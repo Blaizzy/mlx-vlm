@@ -217,14 +217,20 @@ def _resize_video_frames(video: np.ndarray, target_h: int, target_w: int) -> np.
     T, C, H, W = video.shape
     if target_h == H and target_w == W:
         return video
+    # PIL resizes uint8, so float frames (already rescaled to [0, 1]) go
+    # through uint8 and are scaled back afterwards.
+    is_float = np.issubdtype(video.dtype, np.floating)
     out = np.empty((T, C, target_h, target_w), dtype=video.dtype)
     for i, frame in enumerate(video):
         arr = np.transpose(frame, (1, 2, 0))
-        if arr.dtype in (np.float32, np.float64):
+        if is_float:
             arr = (arr * 255).clip(0, 255).astype(np.uint8)
         pil = Image.fromarray(arr)
         pil = pil.resize((target_w, target_h), resample=Image.BICUBIC)
-        out[i] = np.transpose(np.array(pil), (2, 0, 1))
+        resized = np.array(pil)
+        if is_float:
+            resized = resized / 255.0
+        out[i] = np.transpose(resized, (2, 0, 1))
     return out
 
 
@@ -255,23 +261,22 @@ def _smart_resize_image(
 
 
 def _to_numpy_image(img) -> np.ndarray:
-    """Coerce a PIL.Image / path / numpy to a ``(C, H, W)`` uint8 array."""
+    """Coerce a PIL.Image / path / numpy (CHW, HWC or HW) to a ``(C, H, W)`` array."""
     from PIL import Image
 
     if isinstance(img, str):
         img = Image.open(img)
     if hasattr(img, "convert"):
         img = img.convert("RGB")
-        arr = np.array(img)  # (H, W, C)
-    elif isinstance(img, np.ndarray):
-        arr = img
-    else:
-        arr = np.asarray(img)
+        return np.transpose(np.array(img), (2, 0, 1))  # HWC -> CHW
+    arr = np.asarray(img)
     if arr.ndim == 2:
-        arr = np.stack([arr] * 3, axis=-1)
-    if arr.shape[-1] in (1, 3, 4) and arr.ndim == 3:
+        arr = arr[None]
+    elif arr.shape[-1] in (1, 3, 4) and arr.shape[0] not in (1, 3, 4):
         arr = np.transpose(arr, (2, 0, 1))  # HWC -> CHW
-    if arr.shape[0] == 4:
+    if arr.shape[0] == 1:
+        arr = np.repeat(arr, 3, axis=0)
+    elif arr.shape[0] == 4:
         arr = arr[:3]
     return arr
 
@@ -404,14 +409,7 @@ class Qwen3VLImageProcessor(ImageProcessingMixin):
 
     def __call__(self, images, **kwargs):
         images = _flatten_images(images)
-        imgs = [
-            (
-                img
-                if (isinstance(img, np.ndarray) and img.ndim == 3)
-                else _to_numpy_image(img)
-            )
-            for img in images
-        ]
+        imgs = [_to_numpy_image(img) for img in images]
         all_patches = []
         all_thw = []
         image_kwargs = {
