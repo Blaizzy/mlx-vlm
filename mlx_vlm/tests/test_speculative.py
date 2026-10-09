@@ -438,6 +438,27 @@ def test_quantized_linear_and_argmax(mode, bits, size, batch):
     equal(quantized.decode_quantized_argmax(linear, inputs, token_mask=mask), allowed)
 
 
+@parametrize("bits", [4])
+@parametrize("size", [32, 64, 128])
+@parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_optimized_affine_rows_t9_t16_match_decode(bits, size, dtype):
+    # verify-t16: T=9..16 must be bit-identical via the extended streamed kernel.
+    # Only 4-bit affine is handled by the streamed path; other bits fall to the
+    # existing per-token singletons path (which is also exact).
+    mx.random.seed(701 + bits + size)
+    dense = nn.Linear(1024, 48, bias=False)
+    dense.weight = dense.weight.astype(dtype)
+    linear = nn.QuantizedLinear.from_linear(dense, bits=bits, group_size=size)
+    assert quantized.supports_optimized_affine_head(linear)
+    for length in range(9, 17):
+        inputs = mx.random.normal((2, length, 1024)).astype(dtype)
+        expected = verifier_linear._target_verify_singletons(linear, inputs)
+        actual = quantized.optimized_affine_linear(linear, inputs)
+        assert actual is not None, f"kernel returned None at T={length}"
+        equal(actual, expected)
+        equal(quantized.optimized_affine_argmax(linear, inputs), greedy(expected))
+
+
 @parametrize("mode,bits,size", formats((32, 64, 128)))
 @parametrize("batch", [1, 4, 8, 64, 127])
 def test_quantized_moe_hyperconnection(mode, bits, size, batch, monkeypatch):
@@ -484,6 +505,63 @@ def test_fused_projection_parity(bits, widths, length):
         verifier_linear._target_verify_timewise(linear, inputs) for linear in linears
     ]
     actual = verifier_linear._target_verify_linears(linears, inputs)
+    equal(actual, expected)
+
+
+def test_affine_verify_path_bounds_streamed_kernel():
+    # The streamed kernel holds result[VERIFY_T] per thread, so it must stay bounded.
+    path = quantized._affine_verify_path
+    assert path(4, 5) == (False, False)
+    assert path(4, 6) == (True, False)
+    assert path(4, quantized.STREAMED_VERIFY_MAX_T) == (True, False)
+    assert path(4, quantized.STREAMED_VERIFY_MAX_T + 1) == (False, True)
+    assert path(4, 2048) == (False, True)
+    assert path(3, 12) == (False, False)
+
+
+@parametrize("size", [32, 64])
+@parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_optimized_affine_rows_beyond_streamed_bound_match_decode(size, dtype):
+    # T > STREAMED_VERIFY_MAX_T falls back to the token-tiled kernel and stays exact.
+    mx.random.seed(911 + size)
+    dense = nn.Linear(1024, 48, bias=False)
+    dense.weight = dense.weight.astype(dtype)
+    linear = nn.QuantizedLinear.from_linear(dense, bits=4, group_size=size)
+    for length in (17, 18, 24, 33):
+        inputs = mx.random.normal((2, length, 1024)).astype(dtype)
+        expected = verifier_linear._target_verify_singletons(linear, inputs)
+        equal(quantized.optimized_affine_linear(linear, inputs), expected)
+        equal(quantized.optimized_affine_argmax(linear, inputs), greedy(expected))
+
+
+def test_fused_projections_decline_beyond_streamed_bound():
+    linears = [
+        bf16_parameters(nn.QuantizedLinear(512, w, bias=False, group_size=64, bits=4))
+        for w in (16, 24)
+    ]
+    inputs = mx.random.normal((1, quantized.STREAMED_VERIFY_MAX_T + 1, 512)).astype(
+        mx.bfloat16
+    )
+    assert quantized.optimized_affine_linears(linears, inputs) is None
+
+
+@parametrize("widths", [(16, 24), (16, 24, 32), (8, 16, 24, 32)])
+@parametrize("length", [9, 10, 12, 14, 16])
+def test_fused_projection_parity_t9_t16(widths, length):
+    # verify-t16: fused linears gate now covers T=9..16 for 4-bit affine.
+    mx.random.seed(52 + len(widths) + length)
+    linears = [
+        bf16_parameters(
+            nn.QuantizedLinear(512, width, bias=False, group_size=64, bits=4)
+        )
+        for width in widths
+    ]
+    inputs = mx.random.normal((1, length, 512)).astype(mx.bfloat16)
+    expected = [
+        verifier_linear._target_verify_timewise(linear, inputs) for linear in linears
+    ]
+    actual = quantized.optimized_affine_linears(linears, inputs)
+    assert actual is not None, f"fused linears returned None at T={length}"
     equal(actual, expected)
 
 
