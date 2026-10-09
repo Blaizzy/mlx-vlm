@@ -492,6 +492,20 @@ def test_paddle_batch_matches_packed_fallback(second_grid, fast_path):
     _assert_allclose(output, expected)
 
 
+def test_paddle_accepts_packed_patches_of_mixed_sizes():
+    # The trainer concatenates differently sized images to (total, C, H, W).
+    model = _tiny_vision_model()
+    first = mx.random.uniform(shape=(4, 3, 2, 2))
+    second = mx.random.uniform(shape=(6, 3, 2, 2))
+    grid = mx.array([[1, 2, 2], [1, 2, 3]], dtype=mx.int32)
+    output = model(mx.concatenate([first, second]), grid)
+    expected = mx.concatenate(
+        [model(first[None], grid[:1]), model(second[None], grid[1:])]
+    )
+    assert output.shape == (10, 1024)
+    _assert_allclose(output, expected)
+
+
 @pytest.mark.parametrize(
     "batch,size,image_size",
     [
