@@ -39,6 +39,13 @@ from mlx_vlm.models.rope_utils import (
     initialize_rope,
     mrope_position_selector,
 )
+from mlx_vlm.models.switch_layers import QuantizedSwitchLinear, SwitchLinear
+from mlx_vlm.quant_utils import dequantize_model
+from mlx_vlm.quantization.nvfp4 import (
+    ScaledQuantizedLinear,
+    ScaledQuantizedSwitchLinear,
+    replace_scaled_quantized_linears,
+)
 from mlx_vlm.quantization.one_bit import (
     OneBitEmbedding,
     OneBitLinear,
@@ -47,6 +54,7 @@ from mlx_vlm.quantization.one_bit import (
     replace_one_bit_modules,
 )
 from mlx_vlm.utils import (
+    _transform_compressed_tensors_weights,
     _transform_modelopt_nvfp4_weights,
     get_model_and_args,
     load_model,
@@ -993,10 +1001,10 @@ def test_transform_modelopt_nvfp4_weights(quant_method, quant_algo):
 
     assert transformed["layer.weight"].dtype == mx.uint32
     assert transformed["layer.weight"].shape == (2, 4)
-    assert transformed["layer.scales"].tolist() == [[48, 56], [64, 72]]
+    assert mx.array_equal(transformed["layer.scales"], weights["layer.weight_scale"])
+    assert transformed["layer.weight_scale_2"].item() == 0.5
     assert mx.array_equal(transformed["layer.bias"], weights["layer.bias"])
     assert "layer.weight_scale" not in transformed
-    assert "layer.weight_scale_2" not in transformed
     assert "layer.input_scale" not in transformed
     assert quantization == {"group_size": 16, "bits": 4, "mode": "nvfp4"}
 
@@ -1029,8 +1037,814 @@ def test_transform_modelopt_mixed_nvfp4_fp8_weights():
     assert transformed["experts.scales"].dtype == mx.uint8
     assert transformed["attention.weight"].dtype == mx.bfloat16
     assert transformed["attention.weight"].tolist() == [[0.5, 1.0], [0.75, 1.0]]
-    assert not any("weight_scale" in key or "input_scale" in key for key in transformed)
+    assert transformed["experts.weight_scale_2"].item() == 0.5
+    assert not any(
+        key.endswith((".weight_scale", ".input_scale")) for key in transformed
+    )
     assert quantization == {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("shape", [(1, 64), (2, 3, 64)])
+@pytest.mark.parametrize("scale_name", ["weight_scale_2", "weight_global_scale"])
+def test_scaled_nvfp4_linear_matches_reference(dtype, bias, shape, scale_name):
+    model = nn.Module()
+    model.layer = nn.QuantizedLinear(64, 4, bias=bias, mode="nvfp4")
+    global_scale = mx.array(
+        14400 if scale_name == "weight_global_scale" else 0.00012715657, mx.float32
+    )
+    block_scales = mx.array([[56, 64, 72, 80], [120] * 4] * 2, mx.uint8)
+    weights = {
+        "layer.weight": mx.full((4, 8), 0x77777777, mx.uint32),
+        "layer.scales": block_scales,
+        f"layer.{scale_name}": global_scale,
+    }
+    if bias:
+        weights["layer.bias"] = mx.array([0.25, -0.5, 1.0, -2.0], dtype)
+    replace_scaled_quantized_linears(model, weights)
+    model.load_weights(list(weights.items()))
+    x = mx.linspace(0.1, 1.7, np.prod(shape)).reshape(shape).astype(dtype)
+    decoded_scales = mx.array([[1, 2, 4, 8], [256] * 4] * 2, mx.float32)
+    reference_weight = mx.repeat(decoded_scales, 16, axis=-1) * 6
+    if scale_name == "weight_global_scale":
+        reference_weight /= global_scale
+    else:
+        reference_weight *= global_scale
+    expected = (x.astype(mx.float32) @ reference_weight.T).astype(dtype)
+    if bias:
+        expected += weights["layer.bias"]
+    actual = model.layer(x)
+    mx.eval(actual, expected)
+    assert actual.dtype == dtype
+    assert mx.all(mx.isfinite(actual)).item()
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5).item()
+    assert mx.array_equal(model.layer.scales, block_scales).item()
+    assert not tree_flatten(model.trainable_parameters())
+
+
+def test_scaled_nvfp4_rejects_conflicting_scale_conventions():
+    model = nn.Module()
+    model.layer = nn.QuantizedLinear(64, 4, bias=False, mode="nvfp4")
+    with pytest.raises(ValueError, match="Conflicting NVFP4 global scales: layer"):
+        replace_scaled_quantized_linears(
+            model,
+            {
+                "layer.weight_scale_2": mx.array(0.5),
+                "layer.weight_global_scale": mx.array(2.0),
+            },
+        )
+
+
+@pytest.mark.parametrize("activation_quantization", [False, True])
+@pytest.mark.parametrize(
+    "format", ["modelopt", "nvfp4-pack-quantized", "mixed-precision"]
+)
+def test_nvfp4_global_scale_load_and_save(tmp_path, activation_quantization, format):
+    class Model(nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+            self.layer = nn.Linear(64, 4, bias=False)
+
+    architecture = SimpleNamespace(
+        Model=Model,
+        ModelConfig=SimpleNamespace(
+            from_dict=lambda config: SimpleNamespace(model_type=config["model_type"])
+        ),
+    )
+    weights = {
+        "layer.weight": mx.full((4, 32), 0x22, mx.uint8),
+        "layer.weight_scale": mx.full((4, 4), 120, mx.uint8),
+        "layer.weight_scale_2": mx.array(0.00012715657, mx.float32),
+        "layer.input_scale": mx.array(1.0, mx.float32),
+    }
+    config = {
+        "model_type": "test_modelopt",
+        "quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4"},
+    }
+    if format != "modelopt":
+        weights["layer.weight_packed"] = weights.pop("layer.weight")
+        weights["layer.weight_global_scale"] = mx.array([14400], mx.bfloat16)
+        weights["layer.input_global_scale"] = weights.pop("layer.input_scale")
+        weights["layer.weight_shape"] = mx.array([4, 64])
+        weights.pop("layer.weight_scale_2")
+        config["quantization_config"] = {
+            "quant_method": "compressed-tensors",
+            "format": format,
+        }
+    scale_name = "weight_scale_2" if format == "modelopt" else "weight_global_scale"
+    other_scale = "weight_global_scale" if format == "modelopt" else "weight_scale_2"
+    source_scale = weights[f"layer.{scale_name}"].astype(mx.float32).reshape(())
+    factor = source_scale if format == "modelopt" else 1 / source_scale
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+    with patch("mlx_vlm.utils.get_model_and_args", return_value=(architecture, "test")):
+        model = load_model(tmp_path, quantize_activations=activation_quantization)
+        assert isinstance(model.layer, ScaledQuantizedLinear)
+        assert model.layer._quantize_activations == activation_quantization
+        x = mx.full((2, 3, 64), 6.0, mx.bfloat16)
+        expected = mx.full((2, 3, 4), 6 * 64 * 256 * factor.item())
+        assert other_scale not in model.layer
+        assert model.layer[scale_name].dtype == mx.float32
+        assert mx.array_equal(model.layer[scale_name], source_scale).item()
+        assert mx.allclose(model.layer(x), expected, atol=0.01, rtol=0.01).item()
+
+        config["quantization"] = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+        config["quantization_config"] = config["quantization"]
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        mx.save_safetensors(
+            str(tmp_path / "model.safetensors"), dict(tree_flatten(model.parameters()))
+        )
+        restored = load_model(tmp_path, quantize_activations=activation_quantization)
+        assert other_scale not in restored.layer
+        assert mx.array_equal(restored.layer[scale_name], source_scale).item()
+        assert mx.array_equal(restored.layer.weight, model.layer.weight).item()
+        assert mx.array_equal(
+            restored.layer.scales, weights["layer.weight_scale"]
+        ).item()
+        assert mx.array_equal(restored.layer(x), model.layer(x)).item()
+        dequantize_model(restored)
+        assert isinstance(restored.layer, nn.Linear)
+        assert mx.allclose(restored.layer(x), expected, atol=0.01, rtol=0.01).item()
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("sorted_indices", [False, True])
+@pytest.mark.parametrize("scale_name", ["weight_scale_2", "weight_global_scale"])
+def test_scaled_nvfp4_experts_preserve_individual_scales(
+    dtype, sorted_indices, scale_name
+):
+    model = nn.Module()
+    model.layer = QuantizedSwitchLinear(
+        64, 4, 2, bias=False, group_size=16, mode="nvfp4"
+    )
+    scales = mx.array(
+        (
+            [14400, 9600]
+            if scale_name == "weight_global_scale"
+            else [0.00012715657, 0.000333]
+        ),
+        mx.float32,
+    )
+    weights = {
+        "layer.weight": mx.full((2, 4, 8), 0x22222222, mx.uint32),
+        "layer.scales": mx.full((2, 4, 4), 120, mx.uint8),
+        f"layer.{scale_name}": scales,
+    }
+    replace_scaled_quantized_linears(model, weights)
+    model.load_weights(list(weights.items()))
+    assert isinstance(model.layer, ScaledQuantizedSwitchLinear)
+    indices = mx.array([[0, 0], [1, 1]] if sorted_indices else [[1, 0], [0, 1]])
+    x = mx.ones((2, 1, 1, 64), dtype)
+    expected = (
+        64 * 256 / scales[indices]
+        if scale_name == "weight_global_scale"
+        else 64 * 256 * scales[indices]
+    )
+    expected = mx.broadcast_to(expected[..., None, None], (2, 2, 1, 4))
+    assert mx.allclose(
+        model.layer(x, indices, sorted_indices=sorted_indices),
+        expected.astype(dtype),
+        atol=1e-5,
+        rtol=1e-5,
+    ).item()
+    dequantize_model(model)
+    assert mx.allclose(model.layer(x, indices), expected, atol=1e-5, rtol=1e-5).item()
+
+
+def _expert_test_weights(prefix, format, shape, scale):
+    if format == "bf16":
+        return {prefix + ".weight": mx.ones(shape, mx.bfloat16)}
+    packed = mx.full((*shape[:-1], shape[-1] // 8), 0x22222222, mx.uint32)
+    block = mx.full((*shape[:-1], shape[-1] // 16), 56, mx.uint8)
+    weights = {prefix + ".weight": packed, prefix + ".scales": block}
+    if format == "affine":
+        weights[prefix + ".scales"] = mx.ones((*shape[:-1], shape[-1] // 32))
+        weights[prefix + ".biases"] = -weights[prefix + ".scales"]
+    elif format in {
+        "modelopt",
+        "nvfp4-pack-quantized",
+        "mixed-precision",
+        "native-global",
+    }:
+        scale = mx.array(scale, mx.float32)
+        scale_name = "weight_scale_2" if format == "modelopt" else "weight_global_scale"
+        weights[prefix + "." + scale_name] = (
+            scale if format == "modelopt" else 1 / scale
+        )
+        if format != "native-global":
+            weights[
+                prefix + (".weight" if format == "modelopt" else ".weight_packed")
+            ] = weights.pop(prefix + ".weight").view(mx.uint8)
+            weights[prefix + ".weight_scale"] = weights.pop(prefix + ".scales")
+    return weights
+
+
+def _transform_expert_test_weights(weights, format):
+    if format == "modelopt":
+        return _transform_modelopt_nvfp4_weights(
+            weights, {"quant_method": "modelopt", "quant_algo": "NVFP4"}
+        )[0]
+    config = (
+        {"quant_method": "compressed-tensors", "format": format}
+        if format in {"nvfp4-pack-quantized", "mixed-precision"}
+        else None
+    )
+    return _transform_compressed_tensors_weights(weights, config)[0]
+
+
+def _assert_expert_projection(weights, prefix, expected, format):
+    rows, dims = expected.shape[-2:]
+    dense = expected.ndim == 2
+    model = nn.Module()
+    if format == "bf16":
+        model.layer = (
+            nn.Linear(dims, rows, bias=False)
+            if dense
+            else SwitchLinear(dims, rows, expected.shape[0], bias=False)
+        )
+    else:
+        options = dict(
+            bias=False,
+            group_size=32 if format == "affine" else 16,
+            mode="affine" if format == "affine" else "nvfp4",
+        )
+        model.layer = (
+            nn.QuantizedLinear(dims, rows, **options)
+            if dense
+            else QuantizedSwitchLinear(dims, rows, expected.shape[0], **options)
+        )
+    tensors = {
+        "layer" + k[len(prefix) :]: v
+        for k, v in weights.items()
+        if k.startswith(prefix + ".")
+    }
+    replace_scaled_quantized_linears(model, tensors)
+    model.load_weights(list(tensors.items()))
+    if format not in {"bf16", "affine"}:
+        assert mx.all(model.layer.scales == 56).item()
+    inputs = mx.arange(2 * dims).reshape(2, dims).astype(mx.float32) / (2 * dims)
+    if dense:
+        actual, reference = model.layer(inputs), inputs @ expected.T
+    else:
+        indices = mx.stack(
+            [mx.arange(expected.shape[0])[::-1], mx.arange(expected.shape[0])]
+        )
+        inputs = inputs[:, None, None]
+        actual = model.layer(inputs, indices)
+        reference = mx.gather_mm(inputs, expected.swapaxes(-1, -2), rhs_indices=indices)
+    assert mx.allclose(actual, reference, atol=1e-5).item(), prefix
+    dequantize_model(model)
+    assert mx.allclose(model.layer.weight, expected, atol=1e-6).item(), prefix
+
+
+@pytest.mark.parametrize(
+    "family,format",
+    [
+        (family, format)
+        for formats, families in [
+            (
+                ("modelopt", "nvfp4-pack-quantized", "mixed-precision"),
+                """afmoe deepseek_v2 deepseek_v3 deepseek_v32 deepseek_v4
+                exaone_moe glm4_moe glm4_moe_lite glm5_next kimi_k3
+                lfm2_moe llada2_moe minimax mixtral qwen3_moe qwen3_next
+                qwen3_omni_moe qwen3_5_moe qwen3_5_moe_text qwen3_vl_moe
+                qwen3_vl_moe_stacked qwen4_exp gemma4 gemma4_text hy_v4 step3p5""",
+            ),
+            (
+                ("modelopt",),
+                "deepseek_v41 kimi_vl mimo_v2_flash nemotron_h olmoe step3p7",
+            ),
+            (
+                ("nvfp4-pack-quantized", "mixed-precision"),
+                """bailing_moe cohere2_moe deepseek deepseek_vl_v2 glm4v_moe
+                kimi_linear mellum llama4 mistral3 mistral_large3""",
+            ),
+        ]
+        for family in families.split()
+        for format in ("bf16", "affine", "native", *formats)
+    ],
+)
+def test_nvfp4_expert_sanitize_load_and_infer(format, family):
+    module_name = family if "." in family else family + ".language"
+    if family == "qwen3_vl_moe_stacked":
+        module_name = "qwen3_vl_moe.language"
+    if family == "mistral_large3":
+        module_name = "deepseek_v3.language"
+    owner, method = "LanguageModel", "sanitize"
+    if family in {"deepseek_v3", "deepseek_v32", "nemotron_h"}:
+        owner = "Model"
+    elif family in {"qwen3_5_moe", "qwen3_5_moe_text", "qwen4_exp", "gemma4"}:
+        module_name, owner = family + "." + family, "Model"
+        if family.endswith("_text"):
+            method = "_stack_experts"
+    cls = getattr(importlib.import_module(f"mlx_vlm.models.{module_name}"), owner)
+    global_scales = format in {"modelopt", "nvfp4-pack-quantized", "mixed-precision"}
+    args = SimpleNamespace(
+        num_hidden_layers=1,
+        num_layers=1,
+        num_experts=2,
+        n_routed_experts=2,
+        num_local_experts=2,
+        moe_num_experts=2,
+        first_k_dense_replace=0,
+        num_dense_layers=0,
+        tie_word_embeddings=False,
+        is_moe_layer=[True],
+        vision_lora=False,
+        oe_vocab_size_ratio=0,
+        num_kv_shared_layers=0,
+        ple_storage=False,
+        vision_config=None,
+    )
+    args.text_config = args
+    model = SimpleNamespace(
+        args=args, config=args, norm_head=False, audio_tower=None, model_type="mistral4"
+    )
+    if family == "lfm2_moe":
+        model._stack_experts = lambda weights: cls._stack_experts(model, weights)
+    for key, class_name in [
+        ("kimi_linear", "KimiSparseMoE"),
+        ("kimi_k3", "KimiK3SparseMoE"),
+        ("glm5_next", "Glm5NextMoE"),
+    ]:
+        if family == key:
+            moe_cls = getattr(
+                importlib.import_module(f"mlx_vlm.models.{module_name}"), class_name
+            )
+            model.layers = [
+                SimpleNamespace(mlp=moe_cls.__new__(moe_cls), self_attn=None)
+            ]
+            model.model = SimpleNamespace(layers=model.layers)
+    root = "model.layers.0.mlp"
+    if family in {
+        "deepseek_vl_v2",
+        "glm4v_moe",
+        "kimi_vl",
+        "qwen3_5_moe_text",
+        "llada2_moe",
+        "glm5_next",
+        "qwen3_vl_moe_stacked",
+    }:
+        root = "language_model." + root
+    elif family == "qwen3_omni_moe":
+        root = "thinker.language_model." + root
+    elif family in {"qwen3_5_moe", "qwen4_exp", "qwen3_vl_moe"}:
+        root = "model.language_model.layers.0.mlp"
+    elif family == "gemma4":
+        root = "model.language_model.layers.0"
+    elif family == "gemma4_text":
+        root = "model.layers.0"
+    elif family == "llama4":
+        root = "language_model.model.layers.0.feed_forward"
+    elif family == "mistral3":
+        root = "language_model.model.layers.0.mlp"
+    elif family == "mistral_large3":
+        root = "layers.0"
+    elif family == "lfm2_moe":
+        root = "model.layers.0.feed_forward"
+    elif family in {"mixtral", "minimax"}:
+        root = "model.layers.0.block_sparse_moe"
+    elif family == "nemotron_h":
+        root = "backbone.layers.0.mixer"
+    elif family == "deepseek_v4":
+        root = "model.layers.0.ffn"
+    elif family == "kimi_linear":
+        root = "model.layers.0.block_sparse_moe"
+    elif family == "kimi_k3":
+        root = "language_model.model.layers.0.block_sparse_moe"
+    elif family == "deepseek_v41":
+        root = "model.layers.0.ffn"
+    elif family in {"step3p5", "step3p7"}:
+        root = "model.layers.0.moe"
+    projections = ("gate_proj", "down_proj", "up_proj")
+    source_projections = projections
+    expert_prefix = "experts"
+    if family in {
+        "mixtral",
+        "minimax",
+        "deepseek_v4",
+        "deepseek_v41",
+        "kimi_linear",
+        "kimi_k3",
+        "lfm2_moe",
+        "mistral_large3",
+    }:
+        source_projections = ("w1", "w2", "w3")
+    elif family == "nemotron_h":
+        projections, source_projections = ("fc1", "fc2"), ("up_proj", "down_proj")
+    raw, reference = {}, {}
+    experts = 2
+    for projection, name in enumerate(projections):
+        scales = []
+        for expert in range(experts):
+            prefix = f"{root}.{expert_prefix}.{expert}.{source_projections[projection]}"
+            scale = 0.137 * (expert + 1) * (projection + 1) if global_scales else 1.0
+            scales.append(scale)
+            raw.update(_expert_test_weights(prefix, format, (4, 64), scale))
+        reference[name] = mx.broadcast_to(
+            mx.array(scales)[:, None, None], (experts, 4, 64)
+        )
+    if family in {"qwen3_vl_moe_stacked", "step3p5", "step3p7"}:
+        for key in list(raw):
+            if ".experts.0." in key:
+                first = raw.pop(key)
+                second = raw.pop(key.replace(".experts.0.", ".experts.1."))
+                destination = key.replace(
+                    ".experts.0.",
+                    ".experts." if family == "qwen3_vl_moe_stacked" else ".",
+                )
+                raw[destination] = mx.stack([first, second])
+    weights = _transform_expert_test_weights(raw, format)
+    if family == "mistral_large3":
+        wrapper = importlib.import_module(
+            "mlx_vlm.models.mistral_large3.mistral_large3"
+        ).Model
+        mapper = wrapper.__new__(wrapper)
+        weights = {mapper._map_language_key(k): v for k, v in weights.items()}
+    if family == "qwen3_vl_moe":
+        wrapper = importlib.import_module(
+            "mlx_vlm.models.qwen3_vl_moe.qwen3_vl_moe"
+        ).Model
+        weights = wrapper.sanitize(model, weights)
+    if family == "deepseek_v41":
+        sanitized = importlib.import_module(
+            f"mlx_vlm.models.{module_name}"
+        ).sanitize_moe_weights(weights, root, experts)
+    else:
+        sanitized = getattr(cls, method)(model, weights)
+
+    if family == "hy_v4":
+        reference["gate_up_proj"] = mx.concatenate(
+            [reference.pop("gate_proj"), reference.pop("up_proj")], axis=1
+        )
+    weight_keys = [key for key in sanitized if key.endswith(".weight")]
+    assert len(weight_keys) == len(reference)
+    tensor_count = (
+        1 if format == "bf16" else 3 if global_scales or format == "affine" else 2
+    )
+    assert len(sanitized) == len(weight_keys) * tensor_count
+    for key in weight_keys:
+        prefix = key.removesuffix(".weight")
+        expected = reference[prefix.rsplit(".", 1)[-1]]
+        assert sanitized[key].shape == (
+            2,
+            expected.shape[1],
+            64 if format == "bf16" else 8,
+        )
+        _assert_expert_projection(sanitized, prefix, expected, format)
+
+
+@pytest.mark.parametrize(
+    "family",
+    [
+        "qwen3_5_moe",
+        "qwen3_5_moe_text",
+        "qwen4_exp",
+        "gemma4",
+        "gemma4_text",
+        "llama4",
+        "mistral3",
+    ],
+)
+@pytest.mark.parametrize(
+    "format,layout",
+    [
+        ("bf16", "scalar"),
+        ("affine", "scalar"),
+        ("native", "scalar"),
+        ("modelopt", "scalar"),
+        ("modelopt", "expert"),
+        ("nvfp4-pack-quantized", "scalar"),
+        ("nvfp4-pack-quantized", "expert"),
+        ("mixed-precision", "expert"),
+        ("native-global", "row"),
+    ],
+)
+def test_nvfp4_fused_expert_sanitize(family, format, layout):
+    module_name, owner, method = family + ".language", "LanguageModel", "sanitize"
+    if family in {
+        "qwen3_5_moe",
+        "qwen3_5_moe_text",
+        "qwen4_exp",
+        "gemma4",
+    }:
+        module_name, owner = family + "." + family, "Model"
+        if family == "qwen3_5_moe_text":
+            method = "_stack_experts"
+    cls = getattr(importlib.import_module(f"mlx_vlm.models.{module_name}"), owner)
+    args = SimpleNamespace(
+        num_hidden_layers=1,
+        num_experts=2,
+        num_local_experts=2,
+        tie_word_embeddings=False,
+        use_moe=True,
+        num_kv_shared_layers=0,
+        ple_storage=False,
+        vision_config=None,
+        n_routed_experts=2,
+    )
+    args.text_config = args
+    model = SimpleNamespace(
+        args=args, config=args, audio_tower=None, model_type="mistral4"
+    )
+    root = "model.layers.0.mlp.experts"
+    gate, down = "gate_up_proj", "down_proj"
+    if family in {"qwen3_5_moe", "qwen4_exp"}:
+        root = "model.language_model.layers.0.mlp.experts"
+    elif family in {"qwen3_5_moe_text", "gemma4"}:
+        root = "language_model.model.layers.0.mlp.experts"
+    elif family == "llama4":
+        root = "language_model.model.layers.0.feed_forward.experts"
+    elif family == "mistral3":
+        root = "language_model.model.layers.0.mlp.experts"
+    has_global = format in {
+        "modelopt",
+        "nvfp4-pack-quantized",
+        "mixed-precision",
+        "native-global",
+    }
+    raw, references = {}, {}
+    for name, rows in [(gate, 8), (down, 4)]:
+        prefix = f"{root}.{name}"
+        factor = (
+            mx.array(0.137)
+            if layout == "scalar"
+            else (
+                mx.array([0.137, 0.319])
+                if layout == "expert"
+                else mx.arange(2 * rows).reshape(2, rows) * 0.07 + 0.137
+            )
+        )
+        factors = (
+            mx.full((2, rows), factor.item())
+            if layout == "scalar"
+            else (
+                mx.broadcast_to(factor[:, None], (2, rows))
+                if layout == "expert"
+                else factor
+            )
+        )
+        references[name] = mx.broadcast_to(
+            (factors if has_global else mx.ones((2, rows)))[..., None], (2, rows, 64)
+        )
+        raw.update(_expert_test_weights(prefix, format, (2, rows, 64), factor))
+    weights = _transform_expert_test_weights(raw, format)
+    sanitized = getattr(cls, method)(model, weights)
+    gate_weight = references[gate]
+    references = {
+        "gate_proj": gate_weight[:, :4],
+        "up_proj": gate_weight[:, 4:],
+        "down_proj": references[down],
+    }
+    weight_keys = [key for key in sanitized if key.endswith(".weight")]
+    assert len(weight_keys) == 3
+    assert len(sanitized) == 3 * (
+        1 if format == "bf16" else 3 if format == "affine" or has_global else 2
+    )
+    for key in weight_keys:
+        prefix = key.removesuffix(".weight")
+        expected = references[prefix.rsplit(".", 1)[-1]]
+        _assert_expert_projection(sanitized, prefix, expected, format)
+
+
+@pytest.mark.parametrize(
+    "family,format",
+    [
+        (family, format)
+        for family in ("hy_v4", "glm5_next", "minimax_m3_vl", "diffusion_gemma")
+        for format in (
+            "bf16",
+            "affine",
+            "native",
+            "modelopt",
+            "nvfp4-pack-quantized",
+            "mixed-precision",
+        )
+        if family != "minimax_m3_vl"
+        or format not in {"nvfp4-pack-quantized", "mixed-precision"}
+    ],
+)
+def test_nvfp4_expert_fusion_preserves_distinct_scales(family, format):
+    module = importlib.import_module(
+        f"mlx_vlm.models.{family}."
+        + (family if family in {"minimax_m3_vl", "diffusion_gemma"} else "language")
+    )
+    args = SimpleNamespace(
+        num_hidden_layers=1,
+        num_experts=2,
+        vision_config=None,
+        n_routed_experts=2,
+        num_local_experts=2,
+        n_shared_experts=1,
+        intermediate_size=4,
+        shared_intermediate_size=4,
+        pack_shared_expert=True,
+    )
+    args.text_config = args
+    model = SimpleNamespace(args=args, config=args)
+    root = "model.layers.0.mlp"
+    if family == "diffusion_gemma":
+        root = "model.decoder.layers.0"
+        model.model = SimpleNamespace(encoder=SimpleNamespace(vision_tower=None))
+    if family == "glm5_next":
+        root = "language_model." + root
+        model.layers = [
+            SimpleNamespace(
+                mlp=module.Glm5NextMoE.__new__(module.Glm5NextMoE), self_attn=None
+            )
+        ]
+    elif family == "minimax_m3_vl":
+        root = "language_model.model.layers.0.block_sparse_moe"
+    raw, references = {}, {}
+    has_global = format in {"modelopt", "nvfp4-pack-quantized", "mixed-precision"}
+    for i, name in enumerate(("gate_proj", "up_proj", "down_proj")):
+        targets = (
+            [None]
+            if family == "glm5_next"
+            else [0, 1, None] if family == "minimax_m3_vl" else [0, 1]
+        )
+        values = []
+        for e in targets:
+            factor = (
+                0.137 + 0.211 * i + 0.319 * (2 if e is None else e)
+                if has_global
+                else 1.0
+            )
+            values.append(mx.full((4, 64), factor))
+            projection = (
+                name
+                if e is None or family == "diffusion_gemma"
+                else ("w1", "w3", "w2")[i]
+            )
+            prefix = (
+                f"{root}.shared_experts.{projection}"
+                if e is None
+                else f"{root}.experts.{e}.{projection}"
+            )
+            raw.update(_expert_test_weights(prefix, format, (4, 64), factor))
+        references[name] = values[0] if family == "glm5_next" else mx.stack(values)
+    weights = _transform_expert_test_weights(raw, format)
+    if family == "hy_v4":
+        stacked = {}
+        for key in list(weights):
+            if ".experts.0." in key:
+                first = weights.pop(key)
+                second = weights.pop(key.replace(".experts.0.", ".experts.1."))
+                key = key.replace(".experts.0.", ".switch_mlp.")
+                for source, target in [
+                    ("w1", "gate_proj"),
+                    ("w3", "up_proj"),
+                    ("w2", "down_proj"),
+                ]:
+                    key = key.replace("." + source + ".", "." + target + ".")
+                stacked[key] = mx.stack([first, second])
+        weights = module.Model.sanitize(model, stacked)
+    elif family == "glm5_next":
+        weights = module.LanguageModel.sanitize(model, weights)
+    elif family == "diffusion_gemma":
+        weights = module.Model.sanitize(model, weights)
+    else:
+        module._sanitize_moe_weights(weights, args)
+    references["gate_up_proj"] = mx.concatenate(
+        [references.pop("gate_proj"), references.pop("up_proj")], axis=-2
+    )
+    weight_keys = [k for k in weights if k.endswith(".weight")]
+    assert len(weight_keys) == 2
+    for key in weight_keys:
+        prefix = key.removesuffix(".weight")
+        expected = references[prefix.rsplit(".", 1)[-1]]
+        _assert_expert_projection(weights, prefix, expected, format)
+
+
+@pytest.mark.parametrize("format", ["native", "modelopt", "nvfp4-pack-quantized"])
+@pytest.mark.parametrize("split_fused", [False, True])
+def test_laguna_nvfp4_load_fused_scales_and_reload(tmp_path, format, split_fused):
+    from mlx_vlm.models import laguna
+
+    config = laguna.ModelConfig(
+        model_type="laguna",
+        vocab_size=64,
+        hidden_size=64,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        max_position_embeddings=128,
+        num_experts=2,
+        num_experts_per_tok=2,
+        moe_intermediate_size=64,
+        shared_expert_intermediate_size=64,
+    )
+    mx.random.seed(42)
+    model = laguna.Model(config)
+    nn.quantize(
+        model,
+        group_size=16,
+        bits=4,
+        mode="nvfp4",
+        class_predicate=lambda p, m: hasattr(m, "to_quantized")
+        and ".mlp." in p
+        and ".gate." not in p,
+    )
+    weights = dict(tree_flatten(model.parameters()))
+    raw = {k: v for k, v in weights.items() if not k.endswith(".scales")}
+    reference = dict(raw)
+    scale_name = "weight_scale_2" if format == "modelopt" else "weight_global_scale"
+
+    def export_projection(prefix, packed, scales, factor):
+        if format == "native":
+            raw[prefix + ".weight"] = packed
+            raw[prefix + ".scales"] = scales
+            return mx.dequantize(packed, scales, group_size=16, bits=4, mode="nvfp4")
+        weight_suffix = ".weight" if format == "modelopt" else ".weight_packed"
+        raw[prefix + weight_suffix] = packed.view(mx.uint8)
+        raw[prefix + ".weight_scale"] = scales
+        scale = mx.array(factor if format == "modelopt" else 1 / factor, mx.float32)
+        raw[prefix + "." + scale_name] = scale
+        decoded = mx.dequantize(packed, scales, group_size=16, bits=4, mode="nvfp4")
+        return decoded * scale if format == "modelopt" else decoded / scale
+
+    for key, scales in weights.items():
+        if not key.endswith(".scales"):
+            continue
+        prefix = key.removesuffix(".scales")
+        packed = raw.pop(prefix + ".weight")
+        if packed.ndim == 2:
+            reference[prefix + ".weight"] = export_projection(
+                prefix, packed, scales, 0.137
+            )
+            continue
+        root, projection = prefix.split(".switch_mlp.")
+        projections = (
+            ("gate_proj", "up_proj") if projection == "gate_up_proj" else (projection,)
+        )
+        experts = []
+        for e in range(2):
+            parts = []
+            for i, name in enumerate(projections):
+                rows = slice(i * 64, (i + 1) * 64)
+                parts.append(
+                    export_projection(
+                        f"{root}.experts.{e}.{name}",
+                        packed[e, rows],
+                        scales[e, rows],
+                        0.137 + 0.113 * e + 0.217 * i,
+                    )
+                )
+            experts.append(mx.concatenate(parts, axis=0))
+        reference[prefix + ".weight"] = mx.stack(experts)
+
+    reference_model = laguna.Model(config)
+    reference_model.load_weights(list(reference.items()))
+    saved_config = asdict(config)
+    quantization = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+    if format == "native":
+        saved_config["quantization"] = quantization
+    else:
+        saved_config.pop("quantization")
+        saved_config["quantization_config"] = (
+            {"quant_method": "modelopt", "quant_algo": "NVFP4"}
+            if format == "modelopt"
+            else {"quant_method": "compressed-tensors", "format": format}
+        )
+    (tmp_path / "config.json").write_text(json.dumps(saved_config))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), raw)
+    loaded = load_model(tmp_path)
+    tokens = mx.array([[1, 2, 3, 4]])
+    expected = reference_model(tokens).logits
+    actual = loaded(tokens).logits
+    assert mx.allclose(actual, expected, atol=2e-5, rtol=2e-4).item()
+    fused = loaded.language_model.model.layers[1].mlp.switch_mlp.gate_up_proj
+    if format != "native":
+        assert fused[scale_name].shape == (2, 128)
+        assert not mx.array_equal(
+            fused[scale_name][:, :64], fused[scale_name][:, 64:]
+        ).item()
+    assert mx.array_equal(
+        fused.scales,
+        weights["language_model.model.layers.1.mlp.switch_mlp.gate_up_proj.scales"],
+    ).item()
+    saved_config["quantization"] = saved_config["quantization_config"] = quantization
+    (tmp_path / "config.json").write_text(json.dumps(saved_config))
+    saved_weights = dict(tree_flatten(loaded.parameters()))
+    if split_fused:
+        for key in list(saved_weights):
+            if ".gate_up_proj." not in key:
+                continue
+            value = saved_weights.pop(key)
+            for i, name in enumerate(("gate_proj", "up_proj")):
+                part = value[:, i * 64 : (i + 1) * 64]
+                if key.endswith(scale_name):
+                    part = part[:, 0]
+                saved_weights[key.replace("gate_up_proj", name)] = part
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), saved_weights)
+    restored = load_model(tmp_path)
+    assert mx.array_equal(restored(tokens).logits, actual).item()
+    dequantize_model(restored)
+    assert mx.allclose(restored(tokens).logits, expected, atol=2e-5, rtol=2e-4).item()
 
 
 @pytest.mark.parametrize(

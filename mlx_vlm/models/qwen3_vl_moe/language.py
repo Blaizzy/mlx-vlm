@@ -14,7 +14,7 @@ from ..cache import KVCache
 from ..mlp import SwiGLUMLP as Qwen3VLMoEMLP
 from ..rope_utils import MRoPERotaryEmbedding
 from ..rope_utils import apply_multimodal_rotary_pos_emb as _apply_mrope
-from ..switch_layers import SwitchGLU
+from ..switch_layers import SwitchGLU, move_expert_projection, stack_expert_projection
 from .config import ModelConfig, TextConfig
 
 
@@ -688,11 +688,17 @@ class LanguageModel(nn.Module):
     def sanitize(self, weights):
         for l in range(self.args.num_hidden_layers):
             prefix = f"language_model.model.layers.{l}.mlp"
-            # Only sanitize MoE layer weights
-            if f"{prefix}.experts.up_proj" in weights:
-                for n in ["up_proj", "down_proj", "gate_proj"]:
-                    to_join = weights.pop(f"{prefix}.experts.{n}")
-                    weights[f"{prefix}.switch_mlp.{n}.weight"] = to_join
+            for name in ("up_proj", "down_proj", "gate_proj"):
+                stack_expert_projection(
+                    weights,
+                    f"{prefix}.experts",
+                    name,
+                    f"{prefix}.switch_mlp.{name}",
+                    self.args.num_experts,
+                )
+                move_expert_projection(
+                    weights, f"{prefix}.experts.{name}", f"{prefix}.switch_mlp.{name}"
+                )
         return weights
 
     @property

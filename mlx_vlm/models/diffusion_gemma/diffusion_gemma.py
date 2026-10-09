@@ -2,6 +2,11 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import InputEmbeddingsFeatures, LanguageModelOutput
+from ..switch_layers import (
+    EXPERT_WEIGHT_SUFFIXES,
+    expand_expert_scales,
+    stack_expert_projection,
+)
 from .config import ModelConfig
 from .language import DiffusionGemma4Backbone, make_compiled_softcap
 from .visualizer import make_unmasking_visualizer
@@ -346,6 +351,25 @@ class Model(nn.Module):
         )
 
     def sanitize(self, weights):
+        weights = dict(weights)
+        for layer in range(self.config.text_config.num_hidden_layers):
+            prefix = f"model.decoder.layers.{layer}.experts"
+            for name in ("gate_proj", "up_proj", "down_proj"):
+                stack_expert_projection(
+                    weights,
+                    prefix,
+                    name,
+                    f"{prefix}.{name}",
+                    self.config.text_config.num_experts,
+                )
+            expand_expert_scales(weights, [f"{prefix}.gate_proj", f"{prefix}.up_proj"])
+            for suffix in EXPERT_WEIGHT_SUFFIXES:
+                gate = f"{prefix}.gate_proj.{suffix}"
+                up = f"{prefix}.up_proj.{suffix}"
+                if gate in weights and up in weights:
+                    weights[f"{prefix}.gate_up_proj.{suffix}"] = mx.concatenate(
+                        [weights.pop(gate), weights.pop(up)], axis=1
+                    )
         has_vision_tower = self.model.encoder.vision_tower is not None
         use_clipped = (
             getattr(self.config.vision_config, "use_clipped_linears", False)

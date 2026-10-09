@@ -165,7 +165,7 @@ class Model(nn.Module):
             if "model" in key:
                 if "model.language_model" in key:
                     key = key.replace("model.language_model", "language_model.model")
-                    if "gate_up_proj" in key:
+                    if key.endswith(".experts.gate_up_proj"):
                         gate_key = key.replace("gate_up_proj", "gate_proj")
                         up_key = key.replace("gate_up_proj", "up_proj")
 
@@ -178,7 +178,7 @@ class Model(nn.Module):
                         )
 
                         continue
-                    if "down_proj" in key:
+                    if key.endswith(".experts.down_proj"):
                         sanitized_weights[key] = value.transpose(0, 2, 1)
                         continue
 

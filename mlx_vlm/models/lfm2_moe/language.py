@@ -1,6 +1,7 @@
 import mlx.core as mx
 
 from ..lfm2.language import LanguageModel as Lfm2LanguageModel
+from ..switch_layers import EXPERT_WEIGHT_SUFFIXES
 
 
 class LanguageModel(Lfm2LanguageModel):
@@ -14,9 +15,9 @@ class LanguageModel(Lfm2LanguageModel):
                 param = param.transpose(0, 2, 1)
 
             replacements = {
-                "w1.weight": "gate_proj.weight",
-                "w2.weight": "down_proj.weight",
-                "w3.weight": "up_proj.weight",
+                ".w1.": ".gate_proj.",
+                ".w2.": ".down_proj.",
+                ".w3.": ".up_proj.",
             }
             for old, new in replacements.items():
                 if old in name:
@@ -30,7 +31,7 @@ class LanguageModel(Lfm2LanguageModel):
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{layer_idx}.feed_forward"
             for proj in ["gate_proj", "down_proj", "up_proj"]:
-                for suffix in ["weight", "scales", "biases"]:
+                for suffix in EXPERT_WEIGHT_SUFFIXES:
                     first_key = f"{prefix}.experts.0.{proj}.{suffix}"
                     if first_key not in weights:
                         continue

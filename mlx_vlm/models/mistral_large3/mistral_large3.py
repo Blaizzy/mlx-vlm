@@ -95,6 +95,7 @@ class Model(nn.Module):
         # affine `scales`/`biases` (a re-quantized checkpoint) pass through unchanged.
         for suffix, mapped in (
             (".weight_scale", ".weight_scale_inv"),
+            (".weight_global_scale", ".weight_global_scale"),
             (".scales", ".scales"),
             (".biases", ".biases"),
             (".weight", ".weight"),

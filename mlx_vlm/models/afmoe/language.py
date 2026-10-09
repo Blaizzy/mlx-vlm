@@ -12,7 +12,7 @@ from ..base import (
 from ..cache import KVCache, RotatingKVCache
 from ..mlp import SwiGLUMLP
 from ..rope_utils import initialize_rope
-from ..switch_layers import SwitchGLU
+from ..switch_layers import EXPERT_WEIGHT_SUFFIXES, SwitchGLU
 from .config import ModelConfig
 
 
@@ -316,7 +316,7 @@ class LanguageModel(nn.Module):
                 continue
             prefix = f"model.layers.{l}"
             for n in ["up_proj", "down_proj", "gate_proj"]:
-                for k in ["weight", "scales", "biases"]:
+                for k in EXPERT_WEIGHT_SUFFIXES:
                     if f"{prefix}.mlp.experts.0.{n}.{k}" in weights:
                         to_join = [
                             weights.pop(f"{prefix}.mlp.experts.{e}.{n}.{k}")

@@ -24,6 +24,7 @@ from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
 
 from .models.base import BaseImageProcessor
+from .quantization.nvfp4 import replace_scaled_quantized_linears
 from .quantization.one_bit import _quantization_for_path, replace_one_bit_modules
 from .tokenizer_utils import load_tokenizer
 from .trainer.utils import apply_lora_layers
@@ -121,53 +122,7 @@ def _e4m3_decode_table() -> mx.array:
     return mx.array(table, dtype=mx.float32)
 
 
-# Built once; reused by every NVFP4 fold.
 _E4M3_DECODE_LUT = _e4m3_decode_table()
-
-
-def _f32_to_e4m3(x: mx.array) -> mx.array:
-    """Encode non-negative ``float32`` values to ``E4M3FN`` bytes.
-
-    Pure-MLX bit manipulation (MLX exposes no float8 dtype). Saturates to 448
-    on overflow and flushes to the subnormal grid / zero on underflow. Inputs
-    are assumed ``>= 0`` (NVFP4 group scales are magnitudes), so the sign bit is
-    always 0.
-    """
-    x = mx.maximum(x.astype(mx.float32), 0.0)
-    bits = x.view(mx.uint32)
-    fexp = (bits >> 23) & 0xFF  # fp32 exponent, bias 127
-    fman = bits & 0x7FFFFF  # fp32 mantissa, 23 bits
-
-    # Normal path: target E4M3 biased exponent e = (fexp - 127) + 7.
-    exponent = fexp.astype(mx.int32) - 120
-    drop = 20  # 23 -> 3 mantissa bits
-    round_bit = (fman >> (drop - 1)) & 1
-    sticky = (fman & ((1 << (drop - 1)) - 1)) != 0
-    mantissa = fman >> drop
-    roundup = round_bit & (sticky.astype(mx.uint32) | (mantissa & 1))
-    mantissa = mantissa + roundup
-    carry = mantissa >> 3  # mantissa overflowed past 7 -> bump exponent
-    mantissa = mantissa & 0x7
-    exponent = exponent + carry.astype(mx.int32)
-
-    # Saturate: e > 15, or the NaN slot (e == 15, mant == 7), clamps to 448.
-    over = (exponent > 15) | ((exponent == 15) & (mantissa == 7))
-    exponent = mx.where(over, mx.array(15, mx.int32), exponent)
-    mantissa = mx.where(over, mx.array(6, mx.uint32), mantissa)
-    normal_byte = (exponent.astype(mx.uint32) << 3) | mantissa
-    normal_valid = exponent >= 1
-
-    # Subnormal path: value = m * 2^-9, so m = round(x * 512) (RNE).
-    # m == 8 lands exactly on the smallest normal (0x08 = e1 m0 = 2^-6).
-    sub = x * 512.0
-    sub_floor = mx.floor(sub)
-    frac = sub - sub_floor
-    sub_floor_u32 = sub_floor.astype(mx.uint32)
-    up = (frac > 0.5) | ((frac == 0.5) & ((sub_floor_u32 & 1) == 1))
-    sub_byte = sub_floor_u32 + up.astype(mx.uint32)
-
-    byte = mx.where(normal_valid, normal_byte, sub_byte)
-    return byte.astype(mx.uint8)
 
 
 def _transform_modelopt_nvfp4_weights(
@@ -216,10 +171,7 @@ def _transform_modelopt_nvfp4_weights(
         for suffix in ("weight", "input_scale")
     }
     transformed = {}
-    # Each fold below builds a deep lazy graph. A large MoE export has tens of
-    # thousands of quantized tensors, so the unevaluated intermediates blow past
-    # Metal's live-buffer limit before the dict is ever consumed. Flush in
-    # batches to keep the graph shallow; this also frees the intermediates.
+    # Materialize FP8 conversions in batches to bound the lazy graph size.
     pending: List[mx.array] = []
 
     def _flush(force: bool = False) -> None:
@@ -245,24 +197,20 @@ def _transform_modelopt_nvfp4_weights(
             if (
                 weight.dtype != mx.uint8
                 or scale.dtype != mx.uint8
-                or weight.ndim != 2
-                or scale.ndim != 2
-                or value.size != 1
+                or weight.ndim not in (2, 3)
+                or scale.ndim != weight.ndim
+                or value.size not in (1, weight.shape[0] if weight.ndim == 3 else 1)
             ):
                 raise ValueError(f"Invalid ModelOpt NVFP4 tensors for {prefix}.")
             if (
-                weight.shape[0] != scale.shape[0]
-                or weight.shape[1] != 8 * scale.shape[1]
+                weight.shape[:-1] != scale.shape[:-1]
+                or weight.shape[-1] != 8 * scale.shape[-1]
             ):
                 raise ValueError(f"Invalid ModelOpt NVFP4 scale shape for {prefix}.")
 
             transformed[weight_key] = weight.view(mx.uint32)
-            decoded_scale = _E4M3_DECODE_LUT[scale.astype(mx.uint32)]
-            transformed[f"{prefix}.scales"] = _f32_to_e4m3(
-                decoded_scale * value.astype(mx.float32)
-            )
-            pending.append(transformed[f"{prefix}.scales"])
-            _flush()
+            transformed[f"{prefix}.scales"] = scale
+            transformed[key] = value.astype(mx.float32).squeeze()
         elif key.endswith(scale_suffix) and key[: -len(scale_suffix)] in fp8_prefixes:
             prefix = key[: -len(scale_suffix)]
             weight_key = f"{prefix}.weight"
@@ -292,26 +240,11 @@ def _transform_compressed_tensors_nvfp4_weights(
     weights: Dict[str, mx.array],
     quantization_config: Dict[str, Any],
 ) -> Dict[str, mx.array]:
-    """Fold compressed-tensors NVFP4 weights into MLX-native ``nvfp4`` weights.
+    """Preserve packed FP4 weights, FP8 block scales and the global factor.
 
-    A ``nvfp4-pack-quantized`` checkpoint stores, per quantized Linear:
-
-    - ``<p>.weight_packed``       ``uint8``  ``[out, in // 2]``
-      (2x E2M1 per byte)
-    - ``<p>.weight_scale``        ``uint8``  ``[out, in // 16]``
-      (E4M3 per group of 16, loaded by ``mx.load`` as raw bytes -- the same
-      byte layout MLX uses for nvfp4 scales)
-    - ``<p>.weight_global_scale`` ``float32`` ``[1]`` (per-tensor; the real
-      weight is ``fp4 * weight_scale / weight_global_scale``)
-
-    MLX ``nvfp4`` ``QuantizedLinear`` expects ``<p>.weight`` (``uint32``) plus
-    ``<p>.scales`` (``uint8`` E4M3) and is single-level: the per-tensor global
-    scale is not representable (and is rejected on the Metal backend). Both
-    decodes are linear in the FP4 codes, so the global scale can be folded
-    directly into the per-group E4M3 scales:
-    ``scale_mlx = E4M3(weight_scale / global_scale)``. We keep the original
-    packed E2M1 codes bit-exact, avoiding the weight dequantize/re-quantize
-    round-trip entirely.
+    Compressed-tensors reconstructs weights as ``fp4 * scale / global_scale``.
+    Keep ``weight_global_scale`` in FP32 instead of rounding the effective
+    block scales back to FP8.
     """
     packed_suffix = ".weight_packed"
 
@@ -323,18 +256,10 @@ def _transform_compressed_tensors_nvfp4_weights(
             scale = weights[f"{prefix}.weight_scale"]
             global_scale = weights[f"{prefix}.weight_global_scale"].astype(mx.float32)
 
-            # weight_packed is uint8 [out, in//2]; reinterpret as uint32
-            # [out, in//8] to match MLX's nvfp4 layout (bit-identical).
             new_weights[f"{prefix}.weight"] = packed.view(mx.uint32)
-
-            # Fold the per-tensor global scale into the per-group E4M3 scales:
-            # decode E4M3 -> divide by global scale -> re-encode E4M3.
-            # The FP4 codes are untouched; only the much smaller scale tensor
-            # is re-rounded once.
-            decoded = _E4M3_DECODE_LUT[scale.astype(mx.uint32)]
-            new_weights[f"{prefix}.scales"] = _f32_to_e4m3(decoded / global_scale)
-        elif key.endswith(".weight_scale") or key.endswith(".weight_global_scale"):
-            # Consumed alongside their ``.weight_packed``.
+            new_weights[f"{prefix}.scales"] = scale
+            new_weights[f"{prefix}.weight_global_scale"] = global_scale.squeeze()
+        elif key.endswith((".weight_scale",) + _COMPRESSED_TENSORS_DROP_SUFFIXES):
             continue
         else:
             new_weights[key] = weights[key]
@@ -393,7 +318,7 @@ def _transform_compressed_tensors_int4_weights(
 # ``model.load_weights(strict=True)`` as unexpected keys and abort startup.
 _COMPRESSED_TENSORS_DROP_SUFFIXES = (
     ".weight_shape",
-    ".weight_global_scale",  # folded into ``.scales`` alongside ``.weight_packed``
+    ".weight_global_scale",  # emitted with its packed NVFP4 weight
     ".weight_zero_point",
     ".input_global_scale",
     ".input_scale",
@@ -493,7 +418,7 @@ def _transform_compressed_tensors_mixed_weights(
     assignment produced:
 
     - ``.weight_packed`` + ``.weight_global_scale`` -> NVFP4
-      (folded to MLX-native ``nvfp4``, as ``_transform_..._nvfp4_weights`` does)
+      (keeps block scales and the global divisor separate)
     - ``.weight_packed`` alone -> INT4 ``pack-quantized`` (folded to ``affine``)
     - ``.weight_scale`` without ``.weight_packed`` -> channel-wise fp8
       ``float-quantized`` (dequantized to a dense weight)
@@ -544,8 +469,8 @@ def _transform_compressed_tensors_mixed_weights(
             if global_key in weights:  # NVFP4
                 global_scale = weights[global_key].astype(mx.float32)
                 new_weights[f"{prefix}.weight"] = value.view(mx.uint32)
-                decoded = _E4M3_DECODE_LUT[scale.astype(mx.uint32)]
-                new_weights[f"{prefix}.scales"] = _f32_to_e4m3(decoded / global_scale)
+                new_weights[f"{prefix}.scales"] = scale
+                new_weights[global_key] = global_scale.squeeze()
                 native_quant["nvfp4"] = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
             else:  # INT4 symmetric pack-quantized
                 new_weights[f"{prefix}.weight"] = value.view(mx.uint32)
@@ -1153,6 +1078,9 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 "Please use a quantized model with mode 'nvfp4' or 'mxfp8'."
             )
         model = quantize_activations(model)
+
+    # TODO (Prince): Move NVFP4 extra scale handling to MLX core.
+    replace_scaled_quantized_linears(model, weights)
 
     if is_offload_dir:
         # strict=False above must not swallow a genuinely malformed offload

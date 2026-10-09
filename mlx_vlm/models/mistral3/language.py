@@ -12,6 +12,11 @@ from ..cache import KVCache, RotatingKVCache
 from ..mistral4.language import Mistral4Model, _get_llama_4_attn_scale
 from ..pixtral.language import Mistral
 from ..rope_utils import initialize_rope
+from ..switch_layers import (
+    move_expert_projection,
+    split_expert_projection,
+    stack_expert_projection,
+)
 from .config import TextConfig
 
 
@@ -251,22 +256,24 @@ class LanguageModel(nn.Module):
             for l in range(self.config.num_hidden_layers):
                 prefix = f"language_model.model.layers.{l}.mlp"
 
-                # Split fused gate_up_proj: (n_experts, 2*intermediate, hidden)
-                # -> gate_proj: (n_experts, intermediate, hidden)
-                # -> up_proj: (n_experts, intermediate, hidden)
-                fused_key = f"{prefix}.experts.gate_up_proj"
-                if fused_key in weights:
-                    gate_up = weights.pop(fused_key)
-                    gate_proj, up_proj = mx.split(gate_up, 2, axis=1)
-                    weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_proj
-                    weights[f"{prefix}.switch_mlp.up_proj.weight"] = up_proj
-
-                # Rename down_proj: (n_experts, hidden, intermediate)
-                down_key = f"{prefix}.experts.down_proj"
-                if down_key in weights:
-                    weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
-                        down_key
+                for name in ("gate_proj", "up_proj", "down_proj"):
+                    stack_expert_projection(
+                        weights,
+                        f"{prefix}.experts",
+                        name,
+                        f"{prefix}.switch_mlp.{name}",
+                        self.config.n_routed_experts,
                     )
+                split_expert_projection(
+                    weights,
+                    f"{prefix}.experts.gate_up_proj",
+                    [f"{prefix}.switch_mlp.gate_proj", f"{prefix}.switch_mlp.up_proj"],
+                )
+                move_expert_projection(
+                    weights,
+                    f"{prefix}.experts.down_proj",
+                    f"{prefix}.switch_mlp.down_proj",
+                )
 
         return weights
 
