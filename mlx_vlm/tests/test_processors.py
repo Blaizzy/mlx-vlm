@@ -1925,6 +1925,19 @@ class TestApplyChatTemplateIntegration:
         ]
         assert parts[2]["text"] == "before" and parts[4]["text"] == "after"
 
+    def test_num_videos_warns_and_video_adds_placeholder(self):
+        config = dict(model_type="qwen2_5_vl")
+        with pytest.warns(UserWarning, match="video="):
+            result = apply_chat_template(
+                None, config, "Describe this.", num_videos=1, return_messages=True
+            )
+        assert "video" not in str(result)
+
+        result = apply_chat_template(
+            None, config, "Describe this.", video="clip.mp4", return_messages=True
+        )
+        assert [part["type"] for part in result[0]["content"]] == ["video", "text"]
+
     def test_explicit_images_do_not_bypass_single_image_limit(self):
         message = dict(role="user", content=[dict(type="image"), dict(type="image")])
         with pytest.raises(ValueError, match="multi-image"):

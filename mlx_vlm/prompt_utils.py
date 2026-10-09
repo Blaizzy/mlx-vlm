@@ -1,5 +1,6 @@
 import inspect
 import json
+import warnings
 from enum import Enum
 from functools import partial
 from typing import Any, Dict, List, Union
@@ -963,11 +964,24 @@ def apply_chat_template(
         return_messages: Whether to return messages list instead of template
         num_images: Number of images in the input
         num_audios: Number of audio files in the input
-        **kwargs: Additional arguments for message formatting
+        **kwargs: Additional arguments for message formatting, including:
+            video: Video path or list of paths. Adds one video placeholder per
+                video for models with native video support. There is no
+                ``num_videos`` argument; pass the paths here instead.
+            fps: Frames per second to sample, a scalar or one value per video
+                (default 1).
+            max_pixels: Maximum pixels per video frame (default 224 * 224).
 
     Returns:
         Formatted messages or chat template
     """
+    if "num_videos" in kwargs:
+        warnings.warn(
+            "apply_chat_template does not use num_videos; pass video=<path or "
+            "list of paths> to add video placeholders.",
+            stacklevel=2,
+        )
+
     config = config if isinstance(config, dict) else config.__dict__
     model_type = config["model_type"]
 
