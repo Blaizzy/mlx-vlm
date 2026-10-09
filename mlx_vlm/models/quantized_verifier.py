@@ -1675,6 +1675,19 @@ def _can_optimized_affine_linear(linear, x: mx.array) -> bool:
     return x.shape[-1] == K
 
 
+# The 4-bit streamed kernels keep one accumulator per verified token in registers
+# (``result[VERIFY_T]``), so they are bounded; longer 4-bit inputs use token tiling.
+STREAMED_VERIFY_MIN_T = 6
+STREAMED_VERIFY_MAX_T = 16
+
+
+def _affine_verify_path(bits: int, T: int) -> tuple[bool, bool]:
+    """Return ``(streamed, token_tiled)`` for an affine verify of ``T`` tokens."""
+    streamed = bits == 4 and STREAMED_VERIFY_MIN_T <= T <= STREAMED_VERIFY_MAX_T
+    token_tiled = bits == 4 and T > STREAMED_VERIFY_MAX_T
+    return streamed, token_tiled
+
+
 def optimized_affine_linear(linear, x: mx.array) -> Optional[mx.array]:
     if not _can_optimized_affine_linear(linear, x):
         return None
@@ -1683,15 +1696,14 @@ def optimized_affine_linear(linear, x: mx.array) -> Optional[mx.array]:
     N = linear.weight.shape[0]
 
     x = mx.contiguous(x)
-    # The streamed kernel does one weight pass for all T tokens (single z-slice per
-    # batch element). For 4-bit affine it is exact for any T >= 6; extended from
-    # <= 8 to <= 16 (verify-t16 branch). token_tiled (grid.z=(T+1)//2*B) is no
-    # longer needed for 4-bit because streamed handles T=6..16 in a single pass.
-    streamed = linear.bits == 4 and T >= 6
+    streamed, token_tiled = _affine_verify_path(linear.bits, T)
     results_per_simdgroup = 1 if streamed else 4
-    kernel_factory = (
-        _target_verify_qmv_streamed_kernel if streamed else _target_verify_qmv_kernel
-    )
+    if streamed:
+        kernel_factory = _target_verify_qmv_streamed_kernel
+    elif token_tiled:
+        kernel_factory = _target_verify_qmv_token_tiled_kernel
+    else:
+        kernel_factory = _target_verify_qmv_kernel
     kernel_args = (linear.bits, linear.group_size, x.dtype, T, K, N)
     kernel = kernel_factory(*kernel_args)
     rows_per_threadgroup = 2 * results_per_simdgroup
@@ -1706,7 +1718,7 @@ def optimized_affine_linear(linear, x: mx.array) -> Optional[mx.array]:
         grid=(
             32,
             2 * (N // rows_per_threadgroup),
-            B,
+            B * ((T + 1) // 2) if token_tiled else B,
         ),
         threadgroup=(32, 2, 1),
         output_shapes=[(B, T, N)],
@@ -1725,8 +1737,7 @@ def optimized_affine_argmax(
 
     B, T, K = x.shape
     N = linear.weight.shape[0]
-    # streamed now handles 4-bit T = 6..16 in a single weight pass (verify-t16).
-    streamed = linear.bits == 4 and T >= 6
+    streamed, token_tiled = _affine_verify_path(linear.bits, T)
     results_per_simdgroup = 1 if streamed else 4
     rows_per_threadgroup = 2 * results_per_simdgroup
     num_tiles = N // rows_per_threadgroup
@@ -1737,6 +1748,12 @@ def optimized_affine_argmax(
             _target_verify_masked_qargmax_streamed_kernel
             if token_mask is not None
             else _target_verify_qargmax_streamed_kernel
+        )
+    elif token_tiled:
+        kernel_factory = (
+            _target_verify_masked_qargmax_token_tiled_kernel
+            if token_mask is not None
+            else _target_verify_qargmax_token_tiled_kernel
         )
     else:
         kernel_factory = (
@@ -1771,7 +1788,7 @@ def optimized_affine_argmax(
         grid=(
             32,
             2 * num_tiles,
-            B,
+            B * ((T + 1) // 2) if token_tiled else B,
         ),
         threadgroup=(32, 2, 1),
         output_shapes=[(B, T, num_tiles), (B, T, num_tiles)],
@@ -1786,7 +1803,7 @@ def optimized_affine_linears(linears, x: mx.array):
     if (
         not 2 <= len(linears) <= 4
         or x.ndim != 3
-        or not 1 < x.shape[1] <= 16
+        or not 1 < x.shape[1] <= STREAMED_VERIFY_MAX_T
         or bits not in (4, 5, 8)
         or not all(
             isinstance(linear, nn.QuantizedLinear)
@@ -1804,7 +1821,7 @@ def optimized_affine_linears(linears, x: mx.array):
     n_sizes = tuple(int(linear.weight.shape[0]) for linear in linears)
     total_n = sum(n_sizes)
     x = mx.contiguous(x)
-    streamed = bits == 4 and T >= 6
+    streamed = bits == 4 and T >= STREAMED_VERIFY_MIN_T
     kernel_factory = (
         _target_verify_fused_qmv_streamed_kernel
         if streamed
