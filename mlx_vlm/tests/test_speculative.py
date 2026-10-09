@@ -438,6 +438,26 @@ def test_quantized_linear_and_argmax(mode, bits, size, batch):
     equal(quantized.decode_quantized_argmax(linear, inputs, token_mask=mask), allowed)
 
 
+@parametrize("bits", [2, 3, 4, 5, 6, 8])
+@parametrize("size", [32, 64, 128])
+@parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_optimized_affine_rows_match_decode(bits, size, dtype):
+    # Every verify row must be bit-identical to the M=1 decode matmul on that row,
+    # and the optimized kernel (not the per-token fallback) must be selected.
+    mx.random.seed(700 + bits + size)
+    dense = nn.Linear(1024, 48, bias=False)
+    dense.weight = dense.weight.astype(dtype)
+    linear = nn.QuantizedLinear.from_linear(dense, bits=bits, group_size=size)
+    assert quantized.supports_optimized_affine_head(linear)
+    for length in (1, 2, 3, 4, 6, 8):
+        inputs = mx.random.normal((2, length, 1024)).astype(dtype)
+        expected = verifier_linear._target_verify_singletons(linear, inputs)
+        actual = quantized.optimized_affine_linear(linear, inputs)
+        assert actual is not None
+        equal(actual, expected)
+        equal(quantized.optimized_affine_argmax(linear, inputs), greedy(expected))
+
+
 @parametrize("mode,bits,size", formats((32, 64, 128)))
 @parametrize("batch", [1, 4, 8, 64, 127])
 def test_quantized_moe_hyperconnection(mode, bits, size, batch, monkeypatch):
@@ -468,7 +488,7 @@ def test_quantized_moe_hyperconnection(mode, bits, size, batch, monkeypatch):
     equal(actual, expected)
 
 
-@parametrize("bits", [4, 5, 8])
+@parametrize("bits", [2, 3, 4, 5, 6, 8])
 @parametrize("widths", [(16, 24), (16, 24, 32), (8, 16, 24, 32)])
 @parametrize("length", [2, 3, 6, 8])
 def test_fused_projection_parity(bits, widths, length):
@@ -483,6 +503,7 @@ def test_fused_projection_parity(bits, widths, length):
     expected = [
         verifier_linear._target_verify_timewise(linear, inputs) for linear in linears
     ]
+    assert quantized.optimized_affine_linears(linears, inputs) is not None
     actual = verifier_linear._target_verify_linears(linears, inputs)
     equal(actual, expected)
 
