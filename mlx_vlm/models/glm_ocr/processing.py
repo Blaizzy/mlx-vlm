@@ -192,8 +192,7 @@ class Glm46VImageProcessor(ImageProcessingMixin):
         all_patches = []
         all_thw = []
         for image in images:
-            if not (isinstance(image, np.ndarray) and image.ndim == 3):
-                image = _to_numpy_image(image)
+            image = _to_numpy_image(image)
             patches, thw = self._process_one(image)
             all_patches.append(patches)
             all_thw.append(thw)

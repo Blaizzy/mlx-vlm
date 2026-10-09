@@ -2680,6 +2680,64 @@ class TestProcessImage:
         assert img.size == original.size
 
 
+class TestQwen3VLImageInputs:
+    @staticmethod
+    def _rgb(height, width):
+        rng = np.random.default_rng(0)
+        return rng.integers(0, 256, (height, width, 3), dtype=np.uint8)
+
+    @pytest.mark.parametrize(
+        "layout",
+        [
+            lambda hwc: hwc,
+            lambda hwc: hwc.transpose(2, 0, 1),
+            lambda hwc: np.concatenate([hwc, np.full_like(hwc[..., :1], 255)], -1),
+        ],
+        ids=["hwc", "chw", "hwc_rgba"],
+    )
+    def test_numpy_layouts_match_pil(self, layout):
+        from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLImageProcessor
+
+        processor = Qwen3VLImageProcessor()
+        hwc = self._rgb(224, 336)
+        expected = processor([Image.fromarray(hwc)])
+        actual = processor([layout(hwc)])
+        np.testing.assert_array_equal(
+            actual["image_grid_thw"], expected["image_grid_thw"]
+        )
+        np.testing.assert_array_equal(actual["pixel_values"], expected["pixel_values"])
+
+    @pytest.mark.parametrize(
+        "gray", [lambda g: g, lambda g: g[None]], ids=["hw", "1hw"]
+    )
+    def test_grayscale_numpy_matches_pil(self, gray):
+        from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLImageProcessor
+
+        processor = Qwen3VLImageProcessor()
+        g = self._rgb(64, 64)[..., 0]
+        expected = processor([Image.fromarray(g)])["pixel_values"]
+        np.testing.assert_array_equal(processor([gray(g)])["pixel_values"], expected)
+
+    def test_float_image_matches_uint8_when_resized(self):
+        from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLImageProcessor
+
+        processor = Qwen3VLImageProcessor()
+        chw = self._rgb(230, 340).transpose(2, 0, 1)
+        expected = processor([chw])["pixel_values"]
+        actual = processor([chw.astype(np.float32) / 255])["pixel_values"]
+        np.testing.assert_allclose(actual, expected, atol=1e-5)
+
+    def test_float_video_matches_uint8_when_resized(self):
+        from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLVideoProcessor
+
+        processor = Qwen3VLVideoProcessor(patch_size=16)
+        rng = np.random.default_rng(0)
+        video = rng.integers(0, 256, (4, 3, 70, 70), dtype=np.uint8)
+        expected = processor(video)["pixel_values_videos"]
+        actual = processor(video.astype(np.float32) / 255)["pixel_values_videos"]
+        np.testing.assert_allclose(actual, expected, atol=1e-5)
+
+
 class TestEstimateNumImageTokens:
     def _processor(self):
         from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLImageProcessor
