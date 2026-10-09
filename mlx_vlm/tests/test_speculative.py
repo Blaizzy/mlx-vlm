@@ -288,6 +288,28 @@ def test_generation_and_request_reset(family, temperature, seed):
         drafter.draft_lens.append(999)
 
 
+def test_dflash2_greedy_generation_uses_selector(monkeypatch):
+    mx.random.seed(37)
+    target, drafter = dflash_target("dflash2"), dflash_drafter("dflash2")
+    mx.eval(target.language_model.parameters(), drafter.parameters())
+    validate_drafter_compatibility(target, drafter, "dflash")
+    drafter.bind(target)
+    assert callable(drafter.argmax_from_hidden)
+    expected = generated(target)
+    selector_class = type(drafter.candidate_selector)
+    original_select = selector_class.select
+    calls = []
+
+    def counting_select(self, *args, **kwargs):
+        calls.append(self)
+        return original_select(self, *args, **kwargs)
+
+    monkeypatch.setattr(selector_class, "select", counting_select)
+    assert generated(target, drafter) == expected
+    assert calls
+    assert all(selector is drafter.candidate_selector for selector in calls)
+
+
 @parametrize(
     "family,failure",
     [("qwen", False), ("glm", False), ("deepseek", False), ("glm", True)],
