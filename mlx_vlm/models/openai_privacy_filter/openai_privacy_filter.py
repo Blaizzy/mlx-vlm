@@ -200,9 +200,17 @@ def _swiglu(gate: mx.array, up: mx.array) -> mx.array:
     return (up + 1.0) * gate * mx.sigmoid(1.702 * gate)
 
 
+class ClippedSwiGLU(nn.Module):
+    """``_swiglu`` under the shared ``activation(x_up, x_gate)`` convention."""
+
+    def __call__(self, x, gate):
+        return _swiglu(gate, x)
+
+
 class Experts(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
+        self.activation = ClippedSwiGLU()
         # Keep the projections split to match existing mlx-community
         # checkpoints. The Hugging Face checkpoint's fused gate/up tensors are
         # split by Model.sanitize before loading.
@@ -243,7 +251,7 @@ class Experts(nn.Module):
         )
         up = self.up_proj(x, sorted_indices, sorted_indices=do_sort).astype(mx.float32)
         output = self.down_proj(
-            _swiglu(gate, up),
+            self.activation(up, gate),
             sorted_indices,
             sorted_indices=do_sort,
         ).astype(mx.float32)
