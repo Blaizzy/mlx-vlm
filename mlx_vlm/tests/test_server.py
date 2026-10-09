@@ -1968,6 +1968,19 @@ def test_v1_stream_endpoints_reject_over_context_before_sse(
         generator.generate.assert_not_called()
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_chat_completions_honours_max_completion_tokens(client, stream):
+    generator = _streaming([_token("ok", finish_reason="stop")])
+    with _endpoint(generator=generator if stream else None) as endpoint:
+        response = _post(client, stream=stream, max_completion_tokens=5)
+    assert response.status_code == 200
+    if stream:
+        max_tokens = generator.generate.call_args.kwargs["args"].max_tokens
+    else:
+        max_tokens = endpoint.generate.call_args.kwargs["max_tokens"]
+    assert max_tokens == 5
+
+
 @pytest.mark.parametrize("encoding", ["base64", "data-uri", "path"])
 def test_chat_completions_decodes_input_audio_base64(client, encoding):
     raw = b"RIFF$\x00\x00\x00WAVEfmt "
@@ -4212,8 +4225,17 @@ class TestResponseGenerator:
             ),
             ({}, "1", dict(enable_thinking=True)),
             ({}, "0", dict(enable_thinking=False)),
+            (dict(max_completion_tokens=5), "0", dict(max_tokens=5)),
+            (dict(max_tokens=256, max_completion_tokens=5), "0", dict(max_tokens=5)),
         ],
-        ids=["explicit", "effort", "default-on", "default-off"],
+        ids=[
+            "explicit",
+            "effort",
+            "default-on",
+            "default-off",
+            "max-completion-tokens",
+            "max-completion-tokens-wins",
+        ],
     )
     def test_build_generation_arguments(self, monkeypatch, options, env, expected):
         monkeypatch.setenv("MLX_VLM_ENABLE_THINKING", env)
