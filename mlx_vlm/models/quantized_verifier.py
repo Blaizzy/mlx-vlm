@@ -1683,15 +1683,15 @@ def optimized_affine_linear(linear, x: mx.array) -> Optional[mx.array]:
     N = linear.weight.shape[0]
 
     x = mx.contiguous(x)
-    streamed = linear.bits == 4 and 6 <= T <= 8
-    token_tiled = linear.bits == 4 and T >= 6 and not streamed
+    # The streamed kernel does one weight pass for all T tokens (single z-slice per
+    # batch element). For 4-bit affine it is exact for any T >= 6; extended from
+    # <= 8 to <= 16 (verify-t16 branch). token_tiled (grid.z=(T+1)//2*B) is no
+    # longer needed for 4-bit because streamed handles T=6..16 in a single pass.
+    streamed = linear.bits == 4 and T >= 6
     results_per_simdgroup = 1 if streamed else 4
-    if streamed:
-        kernel_factory = _target_verify_qmv_streamed_kernel
-    elif token_tiled:
-        kernel_factory = _target_verify_qmv_token_tiled_kernel
-    else:
-        kernel_factory = _target_verify_qmv_kernel
+    kernel_factory = (
+        _target_verify_qmv_streamed_kernel if streamed else _target_verify_qmv_kernel
+    )
     kernel_args = (linear.bits, linear.group_size, x.dtype, T, K, N)
     kernel = kernel_factory(*kernel_args)
     rows_per_threadgroup = 2 * results_per_simdgroup
@@ -1706,7 +1706,7 @@ def optimized_affine_linear(linear, x: mx.array) -> Optional[mx.array]:
         grid=(
             32,
             2 * (N // rows_per_threadgroup),
-            B * ((T + 1) // 2) if token_tiled else B,
+            B,
         ),
         threadgroup=(32, 2, 1),
         output_shapes=[(B, T, N)],
@@ -1725,8 +1725,8 @@ def optimized_affine_argmax(
 
     B, T, K = x.shape
     N = linear.weight.shape[0]
-    streamed = linear.bits == 4 and 6 <= T <= 8
-    token_tiled = linear.bits == 4 and T >= 6 and not streamed
+    # streamed now handles 4-bit T = 6..16 in a single weight pass (verify-t16).
+    streamed = linear.bits == 4 and T >= 6
     results_per_simdgroup = 1 if streamed else 4
     rows_per_threadgroup = 2 * results_per_simdgroup
     num_tiles = N // rows_per_threadgroup
@@ -1737,12 +1737,6 @@ def optimized_affine_argmax(
             _target_verify_masked_qargmax_streamed_kernel
             if token_mask is not None
             else _target_verify_qargmax_streamed_kernel
-        )
-    elif token_tiled:
-        kernel_factory = (
-            _target_verify_masked_qargmax_token_tiled_kernel
-            if token_mask is not None
-            else _target_verify_qargmax_token_tiled_kernel
         )
     else:
         kernel_factory = (
@@ -1777,7 +1771,7 @@ def optimized_affine_argmax(
         grid=(
             32,
             2 * num_tiles,
-            B * ((T + 1) // 2) if token_tiled else B,
+            B,
         ),
         threadgroup=(32, 2, 1),
         output_shapes=[(B, T, num_tiles), (B, T, num_tiles)],
@@ -1792,7 +1786,7 @@ def optimized_affine_linears(linears, x: mx.array):
     if (
         not 2 <= len(linears) <= 4
         or x.ndim != 3
-        or not 1 < x.shape[1] <= 8
+        or not 1 < x.shape[1] <= 16
         or bits not in (4, 5, 8)
         or not all(
             isinstance(linear, nn.QuantizedLinear)
