@@ -12,7 +12,14 @@ import pytest
 
 from mlx_vlm.models import deepseek_v3, laguna, minimax
 from mlx_vlm.models.laguna.language import LagunaPackedSwitchGLU
-from mlx_vlm.moe_offload import ExpertStore, patch_model, plan, repack
+from mlx_vlm.moe_offload import (
+    ExpertStore,
+    _expand_expert_layer,
+    patch_model,
+    plan,
+    repack,
+    resolve_repack,
+)
 from mlx_vlm.utils import load_model, save_weights
 
 
@@ -49,7 +56,7 @@ def _deepseek_config():
     )
 
 
-def _build_and_repack(root, model=None, config=None):
+def _build(root, model=None, config=None):
     if model is None:
         config = _deepseek_config()
         model = deepseek_v3.Model(config)
@@ -64,9 +71,15 @@ def _build_and_repack(root, model=None, config=None):
     mx.eval(model.parameters())
     config = dict(config) if isinstance(config, dict) else dataclasses.asdict(config)
     config["quantization"] = dict(group_size=32, bits=4, mode="affine")
-    build, offload = root / "build", root / "offload"
+    build = root / "build"
     save_weights(str(build), model)
     (build / "config.json").write_text(json.dumps(config))
+    return build
+
+
+def _build_and_repack(root, model=None, config=None):
+    build = _build(root, model, config)
+    offload = root / "offload"
     repack(str(build), str(offload))
     return build, offload
 
@@ -303,3 +316,110 @@ def test_repack_sanitizes_raw_mixtral_style_expert_naming(tmp_path):
     offloaded = load_model(offload_raw)
     assert getattr(offloaded, "moe_offload_store", None) is not None
     _assert_offload_parity(resident, offloaded(prompt).logits)
+
+
+def test_resolve_repack_reuses_existing_dir(tmp_path):
+    build = _build(tmp_path)
+    target = str(build) + "-offload"
+    repack(str(build), target)
+    with patch("mlx_vlm.moe_offload.repack") as repack_spy:
+        serve = resolve_repack(str(build))
+    assert serve == target
+    repack_spy.assert_not_called()
+
+
+def test_resolve_repack_builds_when_missing(tmp_path):
+    build = _build(tmp_path)
+    serve = resolve_repack(str(build))
+    assert serve == str(build) + "-offload"
+    assert (tmp_path / "build-offload" / "offload_index.json").exists()
+
+
+def test_resolve_repack_raises_without_disk(tmp_path):
+    build = _build(tmp_path)
+    fake_usage = shutil.disk_usage(tmp_path)._replace(free=0)
+    with patch("mlx_vlm.moe_offload.shutil.disk_usage", return_value=fake_usage):
+        with pytest.raises(ValueError):
+            resolve_repack(str(build))
+    assert not (tmp_path / "build-offload").exists()
+
+
+def test_load_model_moe_offload_repack_with_parity(tmp_path):
+    build = _build(tmp_path)
+    prompt = mx.array([[1, 2, 3, 4, 5, 6]])
+    resident = load_model(build)(prompt).logits
+    mx.eval(resident)
+    model = load_model(build, moe_offload="repack")
+    store = getattr(model, "moe_offload_store", None)
+    assert store is not None
+    assert (tmp_path / "build-offload" / "offload_index.json").exists()
+    _assert_offload_parity(resident, model(prompt).logits)
+
+
+def test_load_model_moe_offload_mmap_with_parity(tmp_path):
+    build = _build(tmp_path)
+    prompt = mx.array([[1, 2, 3, 4, 5, 6]])
+    resident = load_model(build)(prompt).logits
+    mx.eval(resident)
+    model = load_model(build, moe_offload="mmap")
+    store = getattr(model, "moe_offload_store", None)
+    assert store is not None
+    assert store.stats()["backend"] == "memmap+cache"
+    assert not (tmp_path / "build-offload").exists()
+    _assert_offload_parity(resident, model(prompt).logits)
+
+
+def test_load_model_moe_offload_rejects_bad_mode(tmp_path):
+    build = _build(tmp_path)
+    with pytest.raises(ValueError, match="repack.*mmap|mmap.*repack"):
+        load_model(build, moe_offload=True)
+
+
+def test_default_expert_cache_budget_caps_at_third_of_ram():
+    import mlx.core as mx
+
+    from mlx_vlm.moe_offload import _default_expert_cache_bytes
+
+    ram = int(mx.device_info().get("memory_size", 0))
+    if not ram:
+        pytest.skip("device_info has no memory_size")
+    assert _default_expert_cache_bytes() <= ram // 3
+
+
+def test_plan_recognizes_bare_fused_and_glm_layouts():
+    # Qwen3.5/3.6-MoE: bare bf16 fused experts (no .weight suffix).
+    qwen = [
+        "model.language_model.layers.5.mlp.experts.gate_up_proj",
+        "model.language_model.layers.5.mlp.experts.down_proj",
+        "model.language_model.layers.5.mlp.shared_expert.gate_proj.weight",
+    ]
+    # GLM-4.6 (glm4_moe): standard separate stacked switch_mlp, quantized.
+    glm = [
+        "model.layers.3.mlp.switch_mlp.gate_proj.weight",
+        "model.layers.3.mlp.switch_mlp.up_proj.weight",
+        "model.layers.3.mlp.switch_mlp.down_proj.weight",
+    ]
+    p = plan(qwen + glm)
+    assert p["layers"] == [3, 5]
+    assert "shared_expert.gate_proj.weight" in " ".join(p["resident"])
+    assert sorted(m for _, _, m in p["experts"][5]) == ["STACK", "STACK_FUSED"]
+    assert sorted(m for _, _, m in p["experts"][3]) == ["STACK", "STACK", "STACK"]
+
+
+def test_expand_unstacks_bare_fused_bf16_experts():
+    E, mid, hidden, out = 4, 6, 8, 8
+    prefix = "model.language_model.layers.0.mlp"
+    gate_up = mx.random.normal((E, 2 * mid, hidden))
+    down = mx.random.normal((E, out, mid))
+    mx.eval(gate_up, down)
+    src = {
+        f"{prefix}.experts.gate_up_proj": gate_up,
+        f"{prefix}.experts.down_proj": down,
+    }
+    p = plan(list(src))
+    layer, n_experts = _expand_expert_layer(p["experts"][0], lambda name: src[name])
+    assert n_experts == E
+    for j in range(E):
+        assert mx.array_equal(layer[f"e{j}.gate_proj.weight"], gate_up[j, :mid])
+        assert mx.array_equal(layer[f"e{j}.up_proj.weight"], gate_up[j, mid:])
+        assert mx.array_equal(layer[f"e{j}.down_proj.weight"], down[j])

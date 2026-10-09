@@ -551,6 +551,17 @@ def parse_arguments():
         "Only supported for models quantized with 'nvfp4' or 'mxfp8' modes.",
     )
     parser.add_argument(
+        "--moe-offload",
+        choices=["repack", "mmap"],
+        default=None,
+        help="Serve MoE routed experts from disk to bound memory for models "
+        "that don't fit in RAM (no default -- choose explicitly). 'repack' "
+        "reorganizes the checkpoint once into a sibling '<model>-offload' dir "
+        "(faster when RAM can cache most experts). 'mmap' pages experts "
+        "straight from the original checkpoint (lighter, no extra disk, better "
+        "under tight memory). Both are slower than a resident load.",
+    )
+    parser.add_argument(
         "--expert-cache-gb",
         type=float,
         default=None,
@@ -1361,6 +1372,7 @@ def main():
         revision=args.revision,
         trust_remote_code=args.trust_remote_code,
         quantize_activations=args.quantize_activations,
+        moe_offload=args.moe_offload,
         expert_cache_gb=args.expert_cache_gb,
         max_kv_size=args.max_kv_size,
     )
