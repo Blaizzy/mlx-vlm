@@ -2143,6 +2143,48 @@ def test_anthropic_stream_without_tools_keeps_literal_call_markup(client):
     assert _joined(_deltas(streamed, "messages"), "text") == expected
 
 
+def _anthropic_stream_stop(response):
+    (delta,) = [e["delta"] for e in _data(response) if e.get("type") == "message_delta"]
+    return delta["stop_reason"], delta["stop_sequence"]
+
+
+@pytest.mark.parametrize(
+    "chunks,unread",
+    [
+        (["Hello STOP secret tail"], 0),
+        (["Hello ", "STOP", " secret", " tail"], 2),
+        (["Hello ST", "OP secret", " tail"], 1),
+    ],
+    ids=["one-chunk", "whole-match", "split-match"],
+)
+def test_anthropic_stream_cuts_text_at_stop_sequence(client, chunks, unread):
+    with _endpoint(result=_result("".join(chunks))):
+        ordinary = _post(client, "messages", stop_sequences=["STOP"])
+    tokens = [_token(text) for text in chunks[:-1]]
+    tokens.append(_token(chunks[-1], finish_reason="stop"))
+    remaining = iter(tokens)
+    streamed = _stream_response(
+        client,
+        remaining,
+        "messages",
+        stop_sequences=["NEVER", "STOP"],
+    )
+
+    assert ordinary.json()["content"] == [dict(type="text", text="Hello ")]
+    assert _joined(_deltas(streamed, "messages"), "text") == "Hello "
+    assert _anthropic_stream_stop(streamed) == ("stop_sequence", "STOP")
+    # Generation stops at the match instead of running to the end.
+    assert len(list(remaining)) == unread
+
+
+def test_anthropic_stream_releases_unmatched_stop_prefix(client):
+    tokens = [_token("Hello ST"), _token("AR done", finish_reason="stop")]
+    streamed = _stream_response(client, tokens, "messages", stop_sequences=["STOP"])
+
+    assert _joined(_deltas(streamed, "messages"), "text") == "Hello STAR done"
+    assert _anthropic_stream_stop(streamed) == ("end_turn", None)
+
+
 ANTHROPIC_TOOLS = [_tool(name, "messages") for name in ("get_time", "get_weather")]
 
 

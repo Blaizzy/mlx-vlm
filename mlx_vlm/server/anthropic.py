@@ -458,6 +458,43 @@ def _apply_stop_sequences(
     return text[:best_index], best_sequence
 
 
+class StopSequenceStreamState:
+    """Cut streamed text at the first stop sequence, independent of chunking.
+
+    Text that could still be the start of a stop sequence is held back until
+    it completes or stops matching, so nothing past a match is ever emitted.
+    """
+
+    def __init__(self, stop_sequences: Optional[List[str]]):
+        self.stop_sequences = [s for s in stop_sequences or [] if s]
+        self.pending = ""
+        self.matched: Optional[str] = None
+
+    def feed(self, text: Optional[str], last: bool = False) -> Optional[str]:
+        if self.matched is not None:
+            return None
+        if not self.stop_sequences:
+            return text or None
+        self.pending += text or ""
+        emit, self.matched = _apply_stop_sequences(self.pending, self.stop_sequences)
+        if self.matched is not None:
+            self.pending = ""
+            return emit or None
+        hold = 0 if last else self._partial_match_length(self.pending)
+        emit = self.pending[: len(self.pending) - hold]
+        self.pending = self.pending[len(emit) :]
+        return emit or None
+
+    def _partial_match_length(self, text: str) -> int:
+        hold = 0
+        for sequence in self.stop_sequences:
+            for length in range(min(len(sequence) - 1, len(text)), hold, -1):
+                if text.endswith(sequence[:length]):
+                    hold = length
+                    break
+        return hold
+
+
 def _anthropic_content_from_generation(
     reasoning: Optional[str],
     content: str,
@@ -585,6 +622,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                 )
                 tc_end = tool_module.tool_call_end if tool_module and tools else None
                 tool_call_state = ToolCallStreamState(tc_start, tc_end)
+                stop_state = StopSequenceStreamState(request.stop_sequences)
                 message_started = False
 
                 def close_open_block():
@@ -714,6 +752,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                             delta_content,
                             last=bool(getattr(token, "finish_reason", None)),
                         )
+                        delta_content = stop_state.feed(delta_content)
 
                         if delta_reasoning is not None and gen_args.enable_thinking:
                             yield open_block("thinking")
@@ -759,6 +798,8 @@ async def anthropic_messages_endpoint(http_request: Request):
                                 },
                             )
 
+                        if stop_state.matched is not None:
+                            break
                         if getattr(token, "finish_reason", None):
                             finish_reason = token.finish_reason
                             break
@@ -766,6 +807,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                     tail_reasoning, tail = finish_content_streams(
                         thinking_state, tool_call_state
                     )
+                    tail = stop_state.feed(tail, last=True)
                     for event in start_message_event():
                         yield event
                     if tail_reasoning and gen_args.enable_thinking:
@@ -840,11 +882,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                             )
                             block_index += 1
 
-                    stop_sequence = None
-                    if not parsed_tool_calls:
-                        _, stop_sequence = _apply_stop_sequences(
-                            text_output, request.stop_sequences
-                        )
+                    stop_sequence = None if parsed_tool_calls else stop_state.matched
 
                     anth_stop_reason = _anthropic_stop_reason(
                         finish_reason,
