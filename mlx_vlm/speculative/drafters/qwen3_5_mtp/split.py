@@ -4,11 +4,9 @@ from pathlib import Path
 from typing import Dict, Optional
 
 import mlx.core as mx
-import mlx.nn as nn
 
 from ....fp8 import make_quantization_config
 from ..mtp_split import MTPSplitter
-from .config import Qwen3_5MTPConfig
 from .qwen3_5_mtp import Qwen3_5MTPDraftModel
 
 # top-level ``mtp.*`` norms that follow the zero-centered (weight + 1.0) RMSNorm
@@ -32,43 +30,6 @@ class Qwen3_5MTPSplitter(MTPSplitter):
     block_size_extra = 2
     supports_mlx_source = True
 
-    def load(self, source_path: Path, lazy: bool = False, **kwargs):
-        """Load bundled Qwen MTP tensors without creating a standalone checkpoint."""
-        config, weights = self.prepare(source_path)
-        model = Qwen3_5MTPDraftModel(Qwen3_5MTPConfig.from_dict(config))
-        quantization = config.get("quantization")
-        if quantization is not None:
-
-            def quant_predicate(path, module):
-                if (
-                    not hasattr(module, "to_quantized")
-                    or f"{path}.scales" not in weights
-                ):
-                    return False
-                return quantization.get(f"mtp.{path}", quantization.get(path, True))
-
-            nn.quantize(
-                model,
-                group_size=quantization["group_size"],
-                bits=quantization["bits"],
-                mode=quantization.get("mode", "affine"),
-                class_predicate=quant_predicate,
-            )
-        if kwargs.get("quantize_activations", False):
-            from ....utils import quantize_activations
-
-            if quantization is None:
-                raise ValueError(
-                    "Activation quantization requires quantized MTP weights."
-                )
-            model = quantize_activations(model)
-        model.load_weights(list(weights.items()), strict=kwargs.get("strict", True))
-        if not lazy:
-            mx.eval(model.parameters())
-        model.model_path = source_path
-        model.eval()
-        return model
-
     def select_keys(self, key: str, text_config: dict) -> bool:
         return key.startswith("mtp.")
 
@@ -88,6 +49,15 @@ class Qwen3_5MTPSplitter(MTPSplitter):
             quantization = source_config.get("quantization")
         if quantization is None:
             quantization = make_quantization_config(source_config)
+        if quantization is not None:
+            quantization = {
+                **quantization,
+                **{
+                    key.removeprefix("mtp."): value
+                    for key, value in quantization.items()
+                    if key.startswith("mtp.")
+                },
+            }
         return quantization
 
 
@@ -152,6 +122,15 @@ class Qwen3NextMTPSplitter(MTPSplitter):
             quantization = source_config.get("quantization")
         if quantization is None:
             quantization = make_quantization_config(source_config)
+        if quantization is not None:
+            quantization = {
+                **quantization,
+                **{
+                    key.removeprefix("mtp."): value
+                    for key, value in quantization.items()
+                    if key.startswith("mtp.")
+                },
+            }
         return quantization
 
 

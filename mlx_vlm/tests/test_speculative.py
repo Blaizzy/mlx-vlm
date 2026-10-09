@@ -784,6 +784,48 @@ def test_bundled_qwen_mtp_kind_and_standalone_loading(tmp_path):
         equal(value, expected[key])
 
 
+@parametrize("family", ["glm", "deepseek"])
+def test_load_registered_native_drafter(tmp_path, monkeypatch, family):
+    model_type = TINY_MODELS[family]["module"]
+    text = tiny_config(family).to_dict()
+    arch = module(f"speculative.drafters.{model_type}_mtp")
+    reference = arch.Model(arch.ModelConfig.from_dict({"text_config": text}))
+    reference.set_dtype(mx.bfloat16)
+    weights = {}
+    for key, value in tree_flatten(reference.parameters()):
+        if family == "glm":
+            key = key.removeprefix("mtp_block.")
+            key = key.replace("shared_head_norm.", "shared_head.norm.")
+            key = f"model.language_model.layers.{text['num_hidden_layers']}.{key}"
+        else:
+            key = "mtp.0." + key.removeprefix("decoder.")
+            for component in ("attn", "ffn"):
+                key = key.replace(f"{component}_hc.", f"hc_{component}_")
+        weights[key] = value
+    config = dict(model_type=model_type, text_config=text)
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(tmp_path / "mtp.safetensors"), weights)
+    weight_map = dict.fromkeys(weights, "mtp.safetensors")
+    weight_map["model.unused.weight"] = "unavailable-base.safetensors"
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map})
+    )
+    before = {p.name: p.stat().st_mtime_ns for p in tmp_path.iterdir()}
+    monkeypatch.setattr(
+        "mlx_vlm.utils.load_model",
+        Mock(side_effect=AssertionError("must not load the target as a drafter")),
+    )
+
+    draft, kind = load_drafter(str(tmp_path), kind="dflash")
+    assert kind == "mtp" and isinstance(draft, arch.Model)
+    assert {p.name: p.stat().st_mtime_ns for p in tmp_path.iterdir()} == before
+    expected = dict(tree_flatten(reference.parameters()))
+    actual = dict(tree_flatten(draft.parameters()))
+    assert actual.keys() == expected.keys()
+    for key, value in actual.items():
+        equal(value, expected[key])
+
+
 def test_deepseek_dspark_split_load_and_draft(tmp_path):
     arch = module("speculative.drafters.deepseek_v4_dspark")
     text = tiny_config("deepseek")
@@ -842,6 +884,14 @@ def test_deepseek_dspark_split_load_and_draft(tmp_path):
     weights = fresh.sanitize(weights)
     fresh.load_weights(list(weights.items()), strict=True)
     assert not any("confidence_head" in key or "bias_vl" in key for key in weights)
+    bundled, kind = load_drafter(str(tmp_path))
+    assert kind == "dflash" and isinstance(bundled, arch.Model)
+    assert bundled.config.n_mtp_layers == 3
+    expected = dict(tree_flatten(fresh.parameters()))
+    actual = dict(tree_flatten(bundled.parameters()))
+    assert actual.keys() == expected.keys()
+    for key, value in actual.items():
+        equal(value, expected[key])
     target = NS(
         embed_tokens=nn.Embedding(32, 16), lm_head=nn.Linear(16, 32, bias=False)
     )
