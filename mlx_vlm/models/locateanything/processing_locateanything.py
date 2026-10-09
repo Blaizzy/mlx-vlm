@@ -12,6 +12,7 @@ from transformers.image_utils import ImageInput
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
+from ..chat_template import render_chat_template
 from .image_processing_locateanything import LocateAnythingImageProcessor
 
 
@@ -174,12 +175,8 @@ class LocateAnythingProcessor(ProcessorMixin):
                 "or ensure the tokenizer has a chat_template attribute."
             )
 
-        try:
-            from jinja2 import Template
-        except ImportError:
-            raise ImportError("jinja2 is required for apply_chat_template")
-
-        rendered = Template(chat_template).render(
+        rendered = render_chat_template(
+            chat_template,
             messages=conversation,
             add_generation_prompt=add_generation_prompt,
             **kwargs,

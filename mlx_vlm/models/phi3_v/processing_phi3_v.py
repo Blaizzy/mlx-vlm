@@ -26,6 +26,8 @@ from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 from transformers.utils import TensorType
 
+from ..chat_template import render_chat_template
+
 
 def _validate_images_text_input_order(images, text):
     """
@@ -562,13 +564,8 @@ class Phi3VProcessor(ProcessorMixin):
                 "or ensure the tokenizer has a chat_template attribute."
             )
 
-        try:
-            from jinja2 import Template
-        except ImportError:
-            raise ImportError("jinja2 is required for apply_chat_template")
-
-        template = Template(chat_template)
-        rendered = template.render(
+        rendered = render_chat_template(
+            chat_template,
             messages=conversation,
             add_generation_prompt=add_generation_prompt,
             **kwargs,
