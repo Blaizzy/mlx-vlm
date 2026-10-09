@@ -208,7 +208,9 @@ def _build_gen_args(
 ) -> GenerationArguments:
     """Build generation arguments from a compatible API request."""
     config = getattr(processor, "config", None) if processor is not None else None
-    max_tokens = getattr(request, "max_tokens", None)
+    max_tokens = getattr(request, "max_completion_tokens", None)
+    if max_tokens is None:
+        max_tokens = getattr(request, "max_tokens", None)
     if max_tokens is None:
         max_tokens = getattr(request, "max_output_tokens", None)
     if max_tokens is None:

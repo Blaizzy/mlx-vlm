@@ -883,6 +883,13 @@ class StreamOptions(BaseModel):
 
 class ChatRequest(GenerationRequest):
     messages: List[ChatMessage]
+    max_completion_tokens: Optional[int] = Field(
+        None,
+        description=(
+            "Maximum number of tokens to generate; OpenAI's replacement for "
+            "max_tokens, which it takes precedence over."
+        ),
+    )
     context_management: Optional[List[CompactionControl]] = Field(None, max_length=1)
     stream_options: Optional[StreamOptions] = None
     tools: Optional[List[Any]] = Field(None, description="Tools the model may call.")
