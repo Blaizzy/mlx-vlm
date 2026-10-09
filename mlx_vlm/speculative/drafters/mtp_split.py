@@ -1,4 +1,4 @@
-"""Central framework for extracting native MTP tensors into a standalone drafter.
+"""Prepare native MTP tensors for in-memory loading or standalone extraction.
 
 One ``MTPSplitter`` base owns the shared mechanics (shard discovery, selective
 load, config assembly, tokenizer copy). A family customizes by subclassing and
@@ -17,11 +17,12 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import mlx.core as mx
+import mlx.nn as nn
 from safetensors import safe_open
 
 from ...fp8 import transform_fp8_weights
 from ...quant_utils import get_quantization_params
-from ...utils import get_model_path
+from ...utils import get_model_and_args, get_model_path
 
 
 def _safetensor_files(model_path: Path) -> List[Path]:
@@ -202,22 +203,14 @@ class MTPSplitter:
         self.postprocess(tensors, text_config)
         return tensors
 
-    def split(
+    def prepare(
         self,
-        source: str,
-        output: str,
+        source_path: Path,
         *,
-        revision: Optional[str] = None,
         block_size: Optional[int] = None,
-        force_download: bool = False,
         **quant_opts,
-    ) -> Path:
-        source_path = get_model_path(
-            source, revision=revision, force_download=force_download
-        )
-        output_path = Path(output)
-        output_path.mkdir(parents=True, exist_ok=True)
-
+    ) -> Tuple[dict, Dict[str, mx.array]]:
+        """Prepare a drafter config and weights in memory without writing files."""
         with open(source_path / "config.json") as f:
             source_config = json.load(f)
         text_config = self.read_text_config(source_config)
@@ -253,13 +246,6 @@ class MTPSplitter:
             weights, source_config, text_config, quant_opts
         )
 
-        mx.eval(list(weights.values()))
-        mx.save_safetensors(
-            str(output_path / "model.safetensors"),
-            weights,
-            metadata={"format": "mlx"},
-        )
-
         depth = self.depth(text_config)
         draft_config = {
             "model_type": self.output_model_type,
@@ -273,6 +259,71 @@ class MTPSplitter:
         if quantization is not None:
             draft_config["quantization"] = quantization
             draft_config["quantization_config"] = quantization
+
+        return draft_config, weights
+
+    def load(self, source_path: Path, lazy: bool = False, **kwargs):
+        """Load prepared drafter tensors without writing a standalone checkpoint."""
+        config, weights = self.prepare(source_path)
+        arch, _ = get_model_and_args(config)
+        model = arch.Model(arch.ModelConfig.from_dict(config))
+        quantization = config.get("quantization")
+        if quantization is not None:
+
+            def quant_predicate(path, module):
+                if (
+                    not hasattr(module, "to_quantized")
+                    or f"{path}.scales" not in weights
+                ):
+                    return False
+                return quantization.get(path, True)
+
+            nn.quantize(
+                model,
+                group_size=quantization["group_size"],
+                bits=quantization["bits"],
+                mode=quantization.get("mode", "affine"),
+                class_predicate=quant_predicate,
+            )
+        if kwargs.get("quantize_activations", False):
+            from ...utils import quantize_activations
+
+            if quantization is None:
+                raise ValueError(
+                    "Activation quantization requires quantized drafter weights."
+                )
+            model = quantize_activations(model)
+        model.load_weights(list(weights.items()), strict=kwargs.get("strict", True))
+        if not lazy:
+            mx.eval(model.parameters())
+        model.model_path = source_path
+        model.eval()
+        return model
+
+    def split(
+        self,
+        source: str,
+        output: str,
+        *,
+        revision: Optional[str] = None,
+        block_size: Optional[int] = None,
+        force_download: bool = False,
+        **quant_opts,
+    ) -> Path:
+        source_path = get_model_path(
+            source, revision=revision, force_download=force_download
+        )
+        draft_config, weights = self.prepare(
+            source_path, block_size=block_size, **quant_opts
+        )
+        output_path = Path(output)
+        output_path.mkdir(parents=True, exist_ok=True)
+        mx.eval(list(weights.values()))
+        mx.save_safetensors(
+            str(output_path / "model.safetensors"),
+            weights,
+            metadata={"format": "mlx"},
+        )
 
         with open(output_path / "config.json", "w") as f:
             json.dump(dict(sorted(draft_config.items())), f, indent=2)
@@ -302,10 +353,21 @@ MTP_SPLITTERS: Dict[str, str] = {
 }
 
 
-def get_mtp_splitter(base_model_type: str) -> Optional[MTPSplitter]:
+def get_mtp_splitter(
+    base_model_type: str, *, source_config: Optional[dict] = None
+) -> Optional[MTPSplitter]:
     target = MTP_SPLITTERS.get(base_model_type)
     if target is None:
         return None
+    if source_config is not None:
+        text_config = source_config.get("text_config") or source_config
+        if base_model_type == "deepseek_v4" and (
+            text_config.get("dspark_target_layer_ids")
+            or source_config.get("dspark_target_layer_ids")
+        ):
+            from .deepseek_v4_dspark.split import DeepseekV4DsparkSplitter
+
+            return DeepseekV4DsparkSplitter()
     module_path, class_name = target.split(":")
     cls = getattr(importlib.import_module(module_path), class_name)
     return cls()
@@ -324,21 +386,6 @@ def detect_mtp_splitter(model_path: Path) -> Optional[MTPSplitter]:
     with open(config_path) as f:
         source_config = json.load(f)
     text_config = source_config.get("text_config") or source_config
-    model_types = {
-        text_config.get("model_type"),
-        source_config.get("model_type"),
-    }
-    if "deepseek_v4" in model_types and (
-        text_config.get("dspark_target_layer_ids")
-        or source_config.get("dspark_target_layer_ids")
-    ):
-        from .deepseek_v4_dspark.split import DeepseekV4DsparkSplitter
-
-        splitter = DeepseekV4DsparkSplitter()
-        tc = splitter.read_text_config(source_config)
-        for _ in splitter.iter_selected(model_path, tc):
-            return splitter
-
     # Some checkpoints name the inner text stack separately from the
     # architecture (Apodex 1.1 uses text_config "qwen3_5_moe_text" under a
     # root "qwen3_5_moe"), so fall back to the root type before giving up.
@@ -349,7 +396,7 @@ def detect_mtp_splitter(model_path: Path) -> Optional[MTPSplitter]:
     ):
         if not base_model_type:
             continue
-        splitter = get_mtp_splitter(base_model_type)
+        splitter = get_mtp_splitter(base_model_type, source_config=source_config)
         if splitter is not None:
             break
     if splitter is None:

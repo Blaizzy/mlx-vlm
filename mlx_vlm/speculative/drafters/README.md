@@ -4,6 +4,14 @@ Some base checkpoints ship native **multi-token-prediction (MTP)** tensors. This
 package extracts them into a standalone MLX *drafter* for speculative decoding,
 through one shared framework (`mtp_split.py`) with a small per-family subclass.
 
+Registered native checkpoints with a drafter runtime can also be loaded
+directly: pass the original checkpoint as `--draft-model` in the CLI or server.
+The existing `MTP_SPLITTERS` registry selects the family, and the shared
+`MTPSplitter.load()` prepares and loads its weights in memory without writing
+a separate checkpoint. The draft kind is inferred from the splitter's output
+model type, including native DSpark heads. See the
+[Qwen MTP examples](qwen3_5_mtp/README.md).
+
 ## Extract a drafter
 
 Standalone — auto-detects the family from the source config:
@@ -46,7 +54,8 @@ Detection is **tensor-presence based** — a config flag alone is not trusted
 1. Subclass `MTPSplitter` and override only what differs — `select_keys`,
    `rename` / `run_sanitize`, `postprocess`, `quantization_from_source`, `depth`,
    `extra_config`. The shared base handles shard discovery, loading, config
-   assembly, tokenizer copy, and on-request affine quantization.
+   assembly, in-memory model loading, tokenizer copy, and on-request affine
+   quantization.
 2. Register it by base `model_type` in `MTP_SPLITTERS`.
 
 To *run* the drafter you also need a draft-model class. Reuse an existing one

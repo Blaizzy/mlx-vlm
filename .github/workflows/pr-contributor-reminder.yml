@@ -321,8 +321,7 @@ jobs:
             Review the failing output. To reproduce the test suite locally, run:
 
             \`\`\`shell
-            python -m pip install pytest
-            python -m pip install -e .
+            python -m pip install -e '.[test]'
             cd mlx_vlm
             pytest -s ./tests
             \`\`\`

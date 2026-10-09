@@ -49,6 +49,15 @@ class Qwen3_5MTPSplitter(MTPSplitter):
             quantization = source_config.get("quantization")
         if quantization is None:
             quantization = make_quantization_config(source_config)
+        if quantization is not None:
+            quantization = {
+                **quantization,
+                **{
+                    key.removeprefix("mtp."): value
+                    for key, value in quantization.items()
+                    if key.startswith("mtp.")
+                },
+            }
         return quantization
 
 
@@ -113,6 +122,15 @@ class Qwen3NextMTPSplitter(MTPSplitter):
             quantization = source_config.get("quantization")
         if quantization is None:
             quantization = make_quantization_config(source_config)
+        if quantization is not None:
+            quantization = {
+                **quantization,
+                **{
+                    key.removeprefix("mtp."): value
+                    for key, value in quantization.items()
+                    if key.startswith("mtp.")
+                },
+            }
         return quantization
 
 

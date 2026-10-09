@@ -27,6 +27,7 @@ from mlx_vlm.models.switch_layers import QuantizedSwitchLinear, SwitchGLU
 from mlx_vlm.speculative import common, mtp
 from mlx_vlm.speculative.cache_state import start_speculative_cache
 from mlx_vlm.speculative.drafters import (
+    load_drafter,
     resolve_drafter_kind,
     validate_drafter_compatibility,
 )
@@ -659,6 +660,172 @@ def split_checkpoint(
     return config, weights, output
 
 
+@parametrize("family", ["qwen3_5", "qwen3_5_moe"])
+@parametrize("layout", ["hf", "mlx", "affine", "fp8"])
+@parametrize("indexed", [False, True])
+def test_load_bundled_qwen_mtp(tmp_path, monkeypatch, family, layout, indexed):
+    arch = module("speculative.drafters.qwen3_5_mtp")
+    text = tiny_config(
+        "qwen", hidden_size=128, intermediate_size=128, head_dim=16
+    ).to_dict()
+    text.update(model_type=family + "_text", mtp_num_hidden_layers=1)
+    if family.endswith("moe"):
+        text.update(
+            num_experts=2,
+            num_experts_per_tok=1,
+            shared_expert_intermediate_size=128,
+            moe_intermediate_size=128,
+        )
+    reference = arch.Model(arch.ModelConfig.from_dict({"text_config": text}))
+    reference.set_dtype(mx.bfloat16)
+    config = dict(model_type=family, text_config=text)
+    mlx_layout = layout in ("mlx", "affine")
+    if layout == "affine":
+        quant = dict(group_size=32, bits=4, mode="affine")
+        fc_quant = dict(group_size=32, bits=8, mode="affine")
+        nn.quantize(
+            reference,
+            **quant,
+            class_predicate=lambda path, layer: (
+                fc_quant if path == "fc" else hasattr(layer, "to_quantized")
+            ),
+        )
+        config["quantization"] = {**quant, "fc": quant, "mtp.fc": fc_quant}
+    weights = {
+        "mtp." + key: value if mlx_layout or value.ndim != 1 else value - 1
+        for key, value in tree_flatten(reference.parameters())
+    }
+    if family.endswith("moe") and not mlx_layout:
+        prefix = "mtp.layers.0.mlp."
+        weights[prefix + "experts.gate_up_proj"] = mx.concatenate(
+            [
+                weights.pop(prefix + f"switch_mlp.{p}.weight")
+                for p in ("gate_proj", "up_proj")
+            ],
+            axis=-2,
+        )
+        weights[prefix + "experts.down_proj"] = weights.pop(
+            prefix + "switch_mlp.down_proj.weight"
+        )
+    if layout == "fp8":
+        config["quantization_config"] = dict(
+            quant_method="fp8", fmt="e4m3", weight_block_size=[128, 128]
+        )
+        weights["mtp.fc.weight"] = mx.to_fp8(weights["mtp.fc.weight"])
+        weights["mtp.fc.weight_scale_inv"] = mx.ones((1, 2), dtype=mx.bfloat16)
+        reference.fc.weight = mx.from_fp8(weights["mtp.fc.weight"], dtype=mx.bfloat16)
+        reference.fc = nn.QuantizedLinear.from_linear(
+            reference.fc, group_size=32, bits=8, mode="mxfp8"
+        )
+    elif layout == "hf":
+        # The target's quantization must not quantize its bundled BF16 head.
+        config["quantization_config"] = dict(
+            quant_method="compressed-tensors", format="nvfp4-pack-quantized"
+        )
+    weights["model.unused.weight"] = mx.ones((2, 2))
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(
+        str(tmp_path / "model.safetensors"),
+        weights,
+        metadata={"format": "mlx" if mlx_layout else "pt"},
+    )
+    if indexed:
+        weight_map = dict.fromkeys(weights, "model.safetensors")
+        # A base-only shard must not be opened by the drafter loader.
+        weight_map["model.unused.weight"] = "unavailable-base.safetensors"
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": weight_map})
+        )
+    before = {p.name: p.stat().st_mtime_ns for p in tmp_path.iterdir()}
+    monkeypatch.setattr(
+        "mlx_vlm.utils.load_model",
+        Mock(side_effect=AssertionError("must not load the target as a drafter")),
+    )
+    draft, kind = load_drafter(str(tmp_path), lazy=indexed)
+    assert kind == "mtp" and draft.config.model_type == "qwen3_5_mtp"
+    assert draft.config.block_size == 3 and len(draft.layers) == 1
+    assert {p.name: p.stat().st_mtime_ns for p in tmp_path.iterdir()} == before
+    inputs = mx.random.normal((1, 2, 128)).astype(mx.bfloat16)
+    positions = mx.array([[0, 1]])
+    actual = draft._forward_hidden(inputs, inputs, draft.make_cache(), positions)
+    expected = reference._forward_hidden(
+        inputs, inputs, reference.make_cache(), positions
+    )
+    equal(actual, expected)
+    assert mx.isfinite(actual).all().item()
+
+
+@parametrize("partial", [False, True])
+def test_load_bundled_qwen_mtp_rejects_missing_weights(tmp_path, partial):
+    config = dict(model_type="qwen3_5", text_config=tiny_config("qwen").to_dict())
+    config["text_config"]["mtp_num_hidden_layers"] = 1
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    weights = {"mtp.fc.weight" if partial else "model.unused": mx.ones((16, 32))}
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+    with pytest.raises(ValueError, match="Missing|missing|No MTP tensors"):
+        load_drafter(str(tmp_path), kind="mtp")
+
+
+def test_bundled_qwen_mtp_kind_and_standalone_loading(tmp_path):
+    arch = module("speculative.drafters.qwen3_5_mtp")
+    text = tiny_config("qwen").to_dict()
+    config = dict(model_type="qwen3_5", text_config=text)
+    reference = arch.Model(arch.ModelConfig.from_dict(config))
+    weights = {
+        "mtp." + k: v if v.ndim != 1 else v - 1
+        for k, v in tree_flatten(reference.parameters())
+    }
+    _, _, output = split_checkpoint(tmp_path, config, weights)
+    assert resolve_drafter_kind(tmp_path, "dflash") == "mtp"
+    standalone, kind = load_drafter(str(output))
+    assert kind == "mtp"
+    expected = dict(tree_flatten(reference.parameters()))
+    for key, value in tree_flatten(standalone.parameters()):
+        equal(value, expected[key])
+
+
+@parametrize("family", ["glm", "deepseek"])
+def test_load_registered_native_drafter(tmp_path, monkeypatch, family):
+    model_type = TINY_MODELS[family]["module"]
+    text = tiny_config(family).to_dict()
+    arch = module(f"speculative.drafters.{model_type}_mtp")
+    reference = arch.Model(arch.ModelConfig.from_dict({"text_config": text}))
+    reference.set_dtype(mx.bfloat16)
+    weights = {}
+    for key, value in tree_flatten(reference.parameters()):
+        if family == "glm":
+            key = key.removeprefix("mtp_block.")
+            key = key.replace("shared_head_norm.", "shared_head.norm.")
+            key = f"model.language_model.layers.{text['num_hidden_layers']}.{key}"
+        else:
+            key = "mtp.0." + key.removeprefix("decoder.")
+            for component in ("attn", "ffn"):
+                key = key.replace(f"{component}_hc.", f"hc_{component}_")
+        weights[key] = value
+    config = dict(model_type=model_type, text_config=text)
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(tmp_path / "mtp.safetensors"), weights)
+    weight_map = dict.fromkeys(weights, "mtp.safetensors")
+    weight_map["model.unused.weight"] = "unavailable-base.safetensors"
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map})
+    )
+    before = {p.name: p.stat().st_mtime_ns for p in tmp_path.iterdir()}
+    monkeypatch.setattr(
+        "mlx_vlm.utils.load_model",
+        Mock(side_effect=AssertionError("must not load the target as a drafter")),
+    )
+
+    draft, kind = load_drafter(str(tmp_path), kind="dflash")
+    assert kind == "mtp" and isinstance(draft, arch.Model)
+    assert {p.name: p.stat().st_mtime_ns for p in tmp_path.iterdir()} == before
+    expected = dict(tree_flatten(reference.parameters()))
+    actual = dict(tree_flatten(draft.parameters()))
+    assert actual.keys() == expected.keys()
+    for key, value in actual.items():
+        equal(value, expected[key])
+
+
 def test_deepseek_dspark_split_load_and_draft(tmp_path):
     arch = module("speculative.drafters.deepseek_v4_dspark")
     text = tiny_config("deepseek")
@@ -717,6 +884,14 @@ def test_deepseek_dspark_split_load_and_draft(tmp_path):
     weights = fresh.sanitize(weights)
     fresh.load_weights(list(weights.items()), strict=True)
     assert not any("confidence_head" in key or "bias_vl" in key for key in weights)
+    bundled, kind = load_drafter(str(tmp_path))
+    assert kind == "dflash" and isinstance(bundled, arch.Model)
+    assert bundled.config.n_mtp_layers == 3
+    expected = dict(tree_flatten(fresh.parameters()))
+    actual = dict(tree_flatten(bundled.parameters()))
+    assert actual.keys() == expected.keys()
+    for key, value in actual.items():
+        equal(value, expected[key])
     target = NS(
         embed_tokens=nn.Embedding(32, 16), lm_head=nn.Linear(16, 32, bias=False)
     )
