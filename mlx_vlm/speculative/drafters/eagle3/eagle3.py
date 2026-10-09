@@ -152,6 +152,14 @@ class DecoderLayer(nn.Module):
         return hidden + self.mlp(self.post_attention_layernorm(hidden))
 
 
+def _embedding_shape(embed):
+    # QuantizedEmbedding packs its weight, so compare the logical shape.
+    if hasattr(embed, "num_embeddings") and hasattr(embed, "dims"):
+        return (embed.num_embeddings, embed.dims)
+    weight = getattr(embed, "weight", None)
+    return None if weight is None else tuple(weight.shape)
+
+
 class Eagle3DraftModel(nn.Module):
     supports_greedy_draft_argmax = True
     prefer_requested_block_size = True
@@ -223,13 +231,18 @@ class Eagle3DraftModel(nn.Module):
         ):
             inner = target_model.language_model.model
 
-        if inner is not None:
-            target_embed = inner.embed_tokens
-            weight = getattr(target_embed, "weight", None)
-            if weight is not None and tuple(weight.shape) == tuple(
-                self.embed_tokens.weight.shape
-            ):
-                self.embed_tokens = target_embed
+        if self.embed_tokens is None:
+            # The checkpoint has no embedding (e.g. SGLang drafters), so the
+            # target's must be shared.
+            if inner is None:
+                raise AttributeError(
+                    f"Cannot find embed_tokens in {type(target_model).__name__}"
+                )
+            self.embed_tokens = inner.embed_tokens
+        elif inner is not None and _embedding_shape(
+            inner.embed_tokens
+        ) == _embedding_shape(self.embed_tokens):
+            self.embed_tokens = inner.embed_tokens
         return self
 
     def make_cache(self, left_padding: Optional[List[int]] = None) -> List[KVCache]:

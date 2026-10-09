@@ -757,6 +757,42 @@ def test_eagle3_draft_replay(accepted):
     ]
 
 
+def eagle3_drafter(hidden_size=16):
+    arch = module("speculative.drafters.eagle3")
+    cfg = arch.ModelConfig(
+        transformer_layer_config=values(
+            intermediate_size=32, head_dim=8, hidden_size=hidden_size
+        ),
+        **DATA["eagle3"],
+    )
+    return arch.Model(cfg)
+
+
+def test_eagle3_bind_without_embed_tokens():
+    # SGLang EAGLE-3 drafters ship no embedding; load_model sets it to None.
+    drafter = eagle3_drafter()
+    drafter.embed_tokens = None
+    target_embed = nn.Embedding(32, 16)
+    drafter.bind(NS(model=NS(embed_tokens=target_embed)))
+    assert drafter.embed_tokens is target_embed
+
+    drafter.embed_tokens = None
+    with pytest.raises(AttributeError, match="embed_tokens"):
+        drafter.bind(NS())
+
+
+def test_eagle3_bind_quantized_target_embedding():
+    drafter = eagle3_drafter(hidden_size=64)
+    target_embed = nn.QuantizedEmbedding(32, 64)
+    drafter.bind(NS(embed_tokens=target_embed))
+    assert drafter.embed_tokens is target_embed
+
+    # A target embedding with a different vocab is not shared.
+    own_embed = drafter.embed_tokens = nn.Embedding(32, 64)
+    drafter.bind(NS(embed_tokens=nn.QuantizedEmbedding(48, 64)))
+    assert drafter.embed_tokens is own_embed
+
+
 @parametrize("offsets,length", [([128], 8), ([10], 6), ([5, 8], 8), ([128, 10], 8)])
 @parametrize("query_len", [1, 3])
 def test_drafter_masks(offsets, length, query_len):
