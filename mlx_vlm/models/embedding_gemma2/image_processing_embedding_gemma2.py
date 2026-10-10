@@ -65,14 +65,23 @@ class EmbeddingGemma2ImageProcessor(Gemma4ImageProcessor):
         max_patches = processor.max_soft_tokens * processor.pooling_kernel_size**2
         pixels, positions, counts = [], [], []
         for image in make_flat_list_of_images(images):
+            # PIL stores pixels height-major, so its layout is known before
+            # conversion. Inferring it from shape mistakes a 3-pixel-tall RGB
+            # image, (3, W, 3), for channels-first and cannot handle a
+            # 1-pixel-tall one at all.
+            is_pil = isinstance(image, Image.Image)
             if processor.do_convert_rgb:
                 image = _convert_to_rgb(image)
             image = to_numpy_array(image)
             if image.ndim == 2:
                 image = image[None]
                 layout = ChannelDimension.FIRST
+            elif input_data_format is not None:
+                layout = input_data_format
+            elif is_pil:
+                layout = ChannelDimension.LAST
             else:
-                layout = input_data_format or infer_channel_dimension_format(image)
+                layout = infer_channel_dimension_format(image)
             image = _to_channel_first(image, layout)
             if processor.do_resize:
                 height, width = image.shape[-2:]
