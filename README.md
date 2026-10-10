@@ -1659,7 +1659,29 @@ With more coming soon.
 mlx_vlm.generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 100 --prompt "Describe this video" --video path/to/video.mp4 --fps 1.0
 ```
 
-These examples demonstrate how to use multiple images with MLX-VLM for more complex visual reasoning tasks.
+#### Python
+
+Pass the video to `apply_chat_template` with `video=` (and optionally `fps=`) so the prompt gets a video placeholder, then pass the same path to `generate`. There is no `num_videos` argument.
+
+```python
+from mlx_vlm import load, generate
+from mlx_vlm.prompt_utils import apply_chat_template
+from mlx_vlm.utils import load_config
+
+model_path = "mlx-community/Qwen2-VL-2B-Instruct-4bit"
+model, processor = load(model_path)
+config = load_config(model_path)
+
+video = "path/to/video.mp4"
+formatted_prompt = apply_chat_template(
+    processor, config, "Describe this video.", video=video, fps=1.0
+)
+
+output = generate(
+    model, processor, formatted_prompt, video=video, fps=1.0, max_tokens=100
+)
+print(output)
+```
 
 ## Vision Feature Caching
 
