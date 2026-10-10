@@ -744,10 +744,8 @@ def test_decision_cli_request_streams(
     )
 
 
-def test_decision_legacy_cli_and_comparison_gate(
-    decision_cli_responses, tmp_path, capsys
-):
-    from mlx_vlm.decision import main
+def test_decision_cli_comparison_gate(decision_cli_responses, tmp_path, capsys):
+    from mlx_vlm.decide import main
 
     questions = tmp_path / "questions.json"
     questions.write_text(json.dumps({"q": {"type": "noul"}}))
@@ -755,6 +753,8 @@ def test_decision_legacy_cli_and_comparison_gate(
     with pytest.raises(SystemExit) as error:
         main(
             [
+                "--format",
+                "systemone",
                 "--model",
                 "candidate",
                 "--state",

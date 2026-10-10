@@ -101,13 +101,6 @@ def context_limit(config, requested=None):
     return limit
 
 
-def main(argv=None):
-    """Compatibility entry point for the original System One CLI."""
-    from .decide import main as decide
-
-    return decide(argv, default_format="systemone")
-
-
 def systemone(model, processor, request, max_length=None, *, engine=None):
     """Compatibility helper using the same model capabilities as native serving."""
     from .decision_scheduler import make_decision_engine
@@ -143,7 +136,3 @@ def comparison_report(*args, **kwargs):
     from .decide import comparison_report as compare
 
     return compare(*args, **kwargs)
-
-
-if __name__ == "__main__":
-    main()

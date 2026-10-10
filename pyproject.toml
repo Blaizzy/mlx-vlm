@@ -29,7 +29,6 @@ Issues = "https://github.com/Blaizzy/mlx-vlm/issues"
 
 [project.scripts]
 "mlx_vlm.decide" = "mlx_vlm.decide:main"
-"mlx_vlm.decision" = "mlx_vlm.decision:main"
 "mlx_vlm.chat_ui" = "mlx_vlm.chat_ui:main"
 "mlx_vlm.chat" = "mlx_vlm.chat:main"
 "mlx_vlm.convert" = "mlx_vlm.convert:main"

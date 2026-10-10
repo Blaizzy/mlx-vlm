@@ -98,9 +98,8 @@ Image and video-frame references must be HTTP(S) URLs or image data URLs.
 }
 ```
 
-Use `mlx_vlm.decide --format systemone` for this schema. The previous
-`mlx_vlm.decision` executable, `python -m mlx_vlm decision`, and Python
-`mlx_vlm.decision.systemone(...)` helper remain compatibility entry points.
+Use `mlx_vlm.decide --format systemone` for this schema. Python callers can use
+the `mlx_vlm.decision.systemone(...)` helper.
 The adapter uses unrounded distributions when the backend exposes them;
 otherwise it uses the model's native probabilities. Native `/v1/decisions`
 answers and model-specific calibration remain unchanged.

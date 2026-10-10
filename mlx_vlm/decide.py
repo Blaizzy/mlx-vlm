@@ -153,14 +153,14 @@ def _validated_body(raw, args):
     return body
 
 
-def main(argv=None, *, default_format="native"):
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--model", help="Model path or Hugging Face ID; overrides request files"
     )
     state = parser.add_mutually_exclusive_group()
     state.add_argument(
-        "--state", help="Text to evaluate (legacy format also accepts @JSONFILE)"
+        "--state", help="Text to evaluate (System One format also accepts @JSONFILE)"
     )
     state.add_argument("--state-file", type=Path)
     questions = parser.add_mutually_exclusive_group()
@@ -174,9 +174,7 @@ def main(argv=None, *, default_format="native"):
     )
     parser.add_argument("--request", help="JSON/JSONL file; - reads stdin")
     parser.add_argument("--jsonl", action="store_true")
-    parser.add_argument(
-        "--format", choices=["native", "systemone"], default=default_format
-    )
+    parser.add_argument("--format", choices=["native", "systemone"], default="native")
     parser.add_argument("--max-length", type=int)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--prefill-step-size", type=int, default=512)
