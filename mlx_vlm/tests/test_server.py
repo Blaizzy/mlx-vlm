@@ -5675,8 +5675,26 @@ def test_audio_speech_stream_bad_model_returns_error_before_headers(
         ),
         ("transcriptions", {"response_format": "text"}, "Plain text transcript.", {}),
         ("translations", {}, "Translated transcript.", {"task": "translate"}),
+        (
+            "transcriptions",
+            {"hotwords": ["MLX", "Apple Silicon"]},
+            "MLX transcription.",
+            {"hotwords": ["MLX", "Apple Silicon"]},
+        ),
+        (
+            "transcriptions",
+            {"hotwords[]": ["MLX", "Apple Silicon"], "context": "Product names"},
+            "MLX transcription.",
+            {"hotwords": ["MLX", "Apple Silicon"], "context": "Product names"},
+        ),
     ],
-    ids=["transcription-json", "transcription-text", "translation"],
+    ids=[
+        "transcription-json",
+        "transcription-text",
+        "translation",
+        "repeated-hotwords",
+        "hotwords-alias-with-context",
+    ],
 )
 def test_audio_transcription_request(
     audio_client, monkeypatch, endpoint, options, text, forwarded
@@ -5696,6 +5714,23 @@ def test_audio_transcription_request(
         assert response.json() == {"text": text}
     assert {key: fake.calls[0][key] for key in forwarded} == forwarded
     loader.assert_called_once_with("fake-stt", model_kind="audio_stt")
+
+
+def test_stt_forwards_context_and_hotwords_when_backend_accepts_both():
+    def generate(path, *, hotwords=None, context=None):
+        pass
+
+    kwargs = server_audio._build_stt_generate_kwargs(
+        NS(generate=generate),
+        server_audio.AudioTranscriptionRequest(
+            model="fake-stt",
+            context="Product names",
+            hotwords=["Nativ"],
+        ),
+        translate=False,
+    )
+
+    _assert_fields(kwargs, context="Product names", hotwords=["Nativ"])
 
 
 @pytest.mark.usefixtures("reset_audio_runtime")
