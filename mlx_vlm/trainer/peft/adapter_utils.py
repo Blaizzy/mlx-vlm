@@ -1,12 +1,9 @@
-import json
-import types
-from pathlib import Path
 from typing import Dict
 
 import mlx.nn as nn
 from mlx.utils import tree_unflatten
 
-from ..models.switch_layers import QuantizedSwitchLinear, SwitchLinear
+from ...models.switch_layers import QuantizedSwitchLinear, SwitchLinear
 from .dora_layers import DoRAEmbedding, DoRALinear
 from .lora_layers import LoRAEmbedding, LoRALinear, LoRASwitchLinear
 
@@ -97,18 +94,6 @@ def load_adapters(model: nn.Module, adapter_path: str) -> nn.Module:
     Returns:
         nn.Module: The updated model with LoRA layers applied.
     """
-    adapter_path = Path(adapter_path)
-    if not adapter_path.exists():
-        raise FileNotFoundError(f"The adapter path does not exist: {adapter_path}")
-    with open(adapter_path / "adapter_config.json", "r") as fid:
-        config = types.SimpleNamespace(**json.load(fid))
-    fine_tune_type = getattr(config, "fine_tune_type", "lora")
-    if fine_tune_type != "full":
-        linear_to_lora_layers(
-            model,
-            config.num_layers,
-            config.lora_parameters,
-            use_dora=(fine_tune_type == "dora"),
-        )
-    model.load_weights(str(adapter_path / "adapters.safetensors"), strict=False)
-    return model
+    from .utils import load_adapters as restore_adapters
+
+    return restore_adapters(model, adapter_path)

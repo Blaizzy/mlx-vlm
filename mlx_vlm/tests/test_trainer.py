@@ -13,19 +13,19 @@ import mlx.nn as nn
 import pytest
 
 from mlx_vlm.tests.test_models import tiny_config
-from mlx_vlm.trainer.datasets import VisionDataset
-from mlx_vlm.trainer.lora import LoRaLayer
-from mlx_vlm.trainer.lora_layers import LoRALinear
-from mlx_vlm.trainer.sft_trainer import (
+from mlx_vlm.trainer.datasets.next_token import VisionDataset
+from mlx_vlm.trainer.peft.lora import LoRaLayer
+from mlx_vlm.trainer.peft.lora_layers import LoRALinear
+from mlx_vlm.trainer.peft.utils import (
+    apply_lora_layers,
+    find_all_linear_names,
+    get_peft_model,
+)
+from mlx_vlm.trainer.vlm.sft.trainer import (
     TrainingArgs,
     iterate_batches,
     train,
     vision_language_loss_fn,
-)
-from mlx_vlm.trainer.utils import (
-    apply_lora_layers,
-    find_all_linear_names,
-    get_peft_model,
 )
 from mlx_vlm.utils import load
 
@@ -40,7 +40,9 @@ def dataset_setup(monkeypatch):
         "messages": [{"role": "user", "content": "Hello"}],
     }
     template, prepare = Mock(return_value=""), Mock()
-    monkeypatch.setattr("mlx_vlm.trainer.datasets.apply_chat_template", template)
+    monkeypatch.setattr(
+        "mlx_vlm.trainer.datasets.next_token.apply_chat_template", template
+    )
     monkeypatch.setattr("mlx_vlm.utils.prepare_inputs", prepare)
     config, processor = {
         "model_type": "test_model",
@@ -183,9 +185,10 @@ def test_training_updates_and_saves(monkeypatch, missing_adapter):
         labels=mx.array([[0, 1, 2]] * 4),
     )
     save, optimizer = Mock(), MagicMock(learning_rate=1e-4)
-    monkeypatch.setattr("mlx_vlm.trainer.sft_trainer.mx.save_safetensors", save)
+    monkeypatch.setattr("mlx_vlm.trainer.vlm.sft.trainer.mx.save_safetensors", save)
     monkeypatch.setattr(
-        "mlx_vlm.trainer.sft_trainer.iterate_batches", Mock(return_value=iter([batch]))
+        "mlx_vlm.trainer.vlm.sft.trainer.iterate_batches",
+        Mock(return_value=iter([batch])),
     )
     options = dict(steps_per_save=1, adapter_file=None) if missing_adapter else {}
     result = train(
@@ -243,8 +246,8 @@ def adapter_model(**layers):
 
 def test_get_peft_model(monkeypatch):
     freeze, report = Mock(), Mock()
-    monkeypatch.setattr("mlx_vlm.trainer.utils.freeze_model", freeze)
-    monkeypatch.setattr("mlx_vlm.trainer.utils.print_trainable_parameters", report)
+    monkeypatch.setattr("mlx_vlm.trainer.peft.utils.freeze_model", freeze)
+    monkeypatch.setattr("mlx_vlm.trainer.peft.utils.print_trainable_parameters", report)
     model = adapter_model(
         layer1=nn.Linear(256, 512), layer2=nn.QuantizedLinear(256, 512, 8)
     )
@@ -304,7 +307,7 @@ def test_apply_lora_layers(tmp_path, monkeypatch, legacy):
     if legacy:
         model.language_model.named_modules.return_value = []
         peft = Mock(return_value=model)
-        monkeypatch.setattr("mlx_vlm.trainer.utils.get_peft_model", peft)
+        monkeypatch.setattr("mlx_vlm.trainer.peft.utils.get_peft_model", peft)
     assert apply_lora_layers(model, str(tmp_path)) is model
     model.load_weights.assert_called_once_with(str(weights), strict=False)
     if legacy:
@@ -446,3 +449,27 @@ def test_load_delegates_adapter_loading_to_trainer_entrypoint():
     adapted_model.eval.assert_called_once()
     assert result_model is adapted_model
     assert result_processor is processor
+
+
+def test_trainer_public_exports():
+    from mlx_vlm import trainer
+    from mlx_vlm.trainer import vlm
+    from mlx_vlm.trainer.datasets.preference import PreferenceVisionDataset
+    from mlx_vlm.trainer.vlm.orpo.trainer import ORPOTrainingArgs, train_orpo
+
+    assert trainer.VisionDataset is vlm.VisionDataset is VisionDataset
+    assert (
+        trainer.PreferenceVisionDataset
+        is vlm.PreferenceVisionDataset
+        is PreferenceVisionDataset
+    )
+    assert trainer.TrainingArgs is vlm.TrainingArgs is TrainingArgs
+    from mlx_vlm.trainer.vlm.orpo.config import (
+        ORPOTrainingArgs as NotebookORPOTrainingArgs,
+    )
+
+    assert trainer.ORPOTrainingArgs is vlm.ORPOTrainingArgs is NotebookORPOTrainingArgs
+    assert vlm.LegacyORPOTrainingArgs is ORPOTrainingArgs
+    assert trainer.train is vlm.train is train
+    assert trainer.train_orpo is vlm.train_orpo is train_orpo
+    assert trainer.get_peft_model is get_peft_model
