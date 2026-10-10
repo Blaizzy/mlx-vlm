@@ -279,6 +279,7 @@ def convert(
     dequantize: bool = False,
     trust_remote_code: bool = True,
     quant_predicate: Optional[str] = None,
+    decision_quantization: Optional[str] = None,
     mtp: bool = False,
     mtp_output: Optional[str] = None,
 ):
@@ -287,6 +288,16 @@ def convert(
     model, config, processor = fetch_from_hub(
         model_path, lazy=True, trust_remote_code=trust_remote_code
     )
+
+    if decision_quantization is not None:
+        if decision_quantization not in ("preserve-output", "backbone"):
+            raise ValueError("Unknown decision quantization policy")
+        if not hasattr(model.config, "decision_quantization"):
+            raise ValueError(
+                "This model does not support decision quantization policies"
+            )
+        model.config.decision_quantization = decision_quantization
+        config["decision_quantization"] = decision_quantization
 
     model_quant_predicate = getattr(model, "quant_predicate", None)
 
@@ -302,7 +313,17 @@ def convert(
     if isinstance(quant_predicate, str):
         quant_predicate = mixed_quant_predicate_builder(quant_predicate, target)
 
-    quant_predicate = quant_predicate or base_quant_predicate
+    if quant_predicate is None:
+        quant_predicate = base_quant_predicate
+    elif model_quant_predicate is not None:
+        selected_predicate = quant_predicate
+
+        def quant_predicate(path, module):
+            # A custom recipe may change precision, but cannot quantize a
+            # parameter the model explicitly excludes (e.g. a decision head).
+            if model_quant_predicate(path, module) is False:
+                return False
+            return selected_predicate(path, module)
 
     if dtype is None:
         dtype = config.get("torch_dtype", None)
@@ -511,6 +532,11 @@ def configure_parser() -> argparse.ArgumentParser:
         type=str,
         choices=MODEL_CONVERSION_DTYPES,
         default=None,
+    )
+    parser.add_argument(
+        "--decision-quantization",
+        choices=["preserve-output", "backbone"],
+        help="Decision models: preserve the lexical output embeddings, or quantize the backbone and keep only the head floating point.",
     )
     parser.add_argument(
         "--quant-predicate",

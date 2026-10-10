@@ -2030,3 +2030,198 @@ def test_generate_step_evaluates_cache_periodically(max_tokens, cache_evals):
     assert eval_mock.call_count == 1 + cache_evals
     if cache_evals:
         eval_mock.assert_called_with([cache_state])
+
+
+# Incremental decision engines are optional model capabilities.
+@pytest.mark.parametrize(
+    "cache_bytes,chunk", [(0, 10000), (0, 31), (1024**2, 31), (1024**2, 10000)]
+)
+def test_decision_prefill_and_prefix_contract(incremental_decision, cache_bytes, chunk):
+    from mlx_vlm import predict
+    from mlx_vlm.decision_scheduler import make_decision_engine
+    from mlx_vlm.tests.test_extraction_models import _assert_decision_answers
+
+    _, (model, processor, body) = incremental_decision
+    expected = predict(model, processor, body["state"], body["questions"])
+    engine = make_decision_engine(
+        model, processor, prefill_step_size=chunk, cache_bytes=cache_bytes
+    )
+    states = [
+        engine.prepare(body),
+        engine.prepare({**body, "state": body["state"][::-1]}),
+    ]
+    while not states[0].done:
+        before = states[0].offset
+        engine.step(states)
+        assert 0 < states[0].offset - before <= chunk
+    _assert_decision_answers(
+        engine.finish(states[0])["response"]["answers"], expected["answers"]
+    )
+    assert bool(engine.prefix_cache.entries) == bool(cache_bytes)
+    cached = engine.prepare(body)
+    assert cached.cached_tokens == (cached.record.prefix_length if cache_bytes else 0)
+    while not cached.done:
+        engine.step([cached])
+    _assert_decision_answers(
+        engine.finish(cached)["response"]["answers"], expected["answers"]
+    )
+    if chunk >= len(cached.record.input_ids):
+        assert engine.batch_steps == (3 if cache_bytes else 2)
+
+
+def test_decision_prefix_isolation_eviction_and_clear(incremental_decision):
+    from mlx_vlm import predict
+    from mlx_vlm.decision_scheduler import make_decision_engine
+    from mlx_vlm.tests.test_extraction_models import _assert_decision_answers
+
+    _, (model, processor, body) = incremental_decision
+    engine = make_decision_engine(model, processor, prefill_step_size=31)
+    first = engine.decide(body, namespace="a")
+    before = engine.prefill_tokens
+    second = {**body, "questions": {"different": {"type": "bool"}}}
+    record = engine.prepare(second, namespace="a").record
+    output = engine.decide(second, namespace="a")
+    expected = predict(model, processor, second["state"], second["questions"])
+    _assert_decision_answers(output["response"]["answers"], expected["answers"])
+    assert (
+        engine.prefill_tokens - before == len(record.input_ids) - record.prefix_length
+    )
+    _assert_decision_answers(
+        engine.decide(body, namespace="a")["response"], first["response"]
+    )
+    assert engine.prepare(body, namespace="b").cached_tokens == 0
+    engine.prefix_cache.max_bytes = engine.prefix_cache.nbytes
+    engine.decide({**body, "state": body["state"][::-1]}, namespace="a")
+    assert len(engine.prefix_cache.entries) == 1
+    assert engine.prepare(body, namespace="a").cached_tokens == 0
+    engine.prefix_cache.clear()
+    assert not engine.prefix_cache.entries and engine.prefix_cache.nbytes == 0
+
+
+def test_decision_cancellation_boundaries_and_live_batch_row(incremental_decision):
+    from threading import Event
+
+    from mlx_vlm.decision import DecisionCancelled
+    from mlx_vlm.decision_scheduler import make_decision_engine
+
+    _, (model, processor, body) = incremental_decision
+    engine = make_decision_engine(model, processor, prefill_step_size=31)
+    event = Event()
+    event.set()
+    with pytest.raises(DecisionCancelled):
+        engine.prepare(body, cancelled=event)
+    event.clear()
+    state = engine.prepare(body, cancelled=event)
+    event.set()
+    with pytest.raises(DecisionCancelled):
+        engine.step([state])
+    assert state.offset == engine.prefill_tokens == 0
+    live = engine.prepare(body)
+    engine.step([state, live])
+    while not live.done:
+        engine.step([live])
+    assert engine.finish(live)["response"]["answers"]
+    live.cancelled.set()
+    with pytest.raises(DecisionCancelled):
+        engine.finish(live)
+
+
+def test_decision_overflow_and_context_configuration(incremental_decision):
+    from mlx_vlm import predict
+    from mlx_vlm.decision import context_limit
+    from mlx_vlm.decision_scheduler import make_decision_engine
+
+    _, (model, processor, body) = incremental_decision
+    limit = context_limit(model.config)
+    engine = make_decision_engine(model, processor)
+    too_long = {**body, "state": " A" * limit}
+    for call in (
+        lambda: engine.prepare(too_long),
+        lambda: predict(model, processor, too_long["state"], body["questions"]),
+    ):
+        with pytest.raises(ValueError, match="maximum"):
+            call()
+    for value in (0, -1, model.config.text_config.max_position_embeddings + 1):
+        with pytest.raises(ValueError):
+            make_decision_engine(model, processor, max_length=value)
+
+
+def test_decision_mixed_media_cache_contract(incremental_decision):
+    from threading import Event
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from PIL import Image
+
+    from mlx_vlm import predict
+    from mlx_vlm.decision import DecisionCancelled
+    from mlx_vlm.decision_scheduler import make_decision_engine
+    from mlx_vlm.tests.test_extraction_models import (
+        _assert_decision_answers,
+        _decision_fixture,
+    )
+
+    case, _ = incremental_decision
+    spec = case["decision_engine"]["media"]
+    model, tokenizer, body = _decision_fixture(case, spec["config_overrides"])
+
+    class Processor:
+        video_processor = SimpleNamespace(fps=1, min_frames=1, max_frames=64)
+
+        def __call__(self, **kwargs):
+            # Deterministic fixture tensors, with changed images reflected in the cache key.
+            output = {
+                key: np.full(
+                    shape, np.asarray(kwargs["images"][0]).mean(), dtype=np.float32
+                )
+                for key, shape in spec["shapes"].items()
+            }
+            output.update(
+                {key: np.array(value) for key, value in spec["values"].items()}
+            )
+            output["input_ids"] = np.array([spec["token_ids"]])
+            return output
+
+    processor = Processor()
+    processor.tokenizer = tokenizer
+    frame = Image.new("RGB", (28, 28), "red")
+    body = {**body, "images": [frame], "videos": [[frame]]}
+    engine = make_decision_engine(model, processor, prefill_step_size=3)
+    expected = predict(
+        model,
+        processor,
+        body["state"],
+        body["questions"],
+        images=body["images"],
+        videos=body["videos"],
+    )
+    _assert_decision_answers(
+        engine.decide(body)["response"]["answers"], expected["answers"]
+    )
+    with patch.object(
+        type(model),
+        "get_input_embeddings",
+        side_effect=AssertionError("vision preprocessing reran"),
+    ):
+        _assert_decision_answers(
+            engine.decide(body)["response"]["answers"], expected["answers"]
+        )
+    changed = {**body, "images": [Image.new("RGB", (28, 28), "white")]}
+    assert engine.prepare(changed).cached_tokens == 0
+
+    cancelled = Event()
+
+    def download(value):
+        cancelled.set()
+        return frame
+
+    with patch("mlx_vlm.utils.load_image", side_effect=download) as load_image:
+        with pytest.raises(DecisionCancelled):
+            engine.prepare(
+                {
+                    **body,
+                    "images": ["https://example.com/one", "https://example.com/two"],
+                },
+                cancelled=cancelled,
+            )
+    assert load_image.call_count == 1

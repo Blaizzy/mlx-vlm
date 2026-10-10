@@ -1909,11 +1909,22 @@ class TestSAM3DObjects(unittest.TestCase):
             )
 
 
-def _extraction_model(name):
+def _merge_decision_config(values, overrides):
+    values = copy.deepcopy(values)
+    for key, value in overrides.items():
+        values[key] = (
+            _merge_decision_config(values.get(key, {}), value)
+            if isinstance(value, dict)
+            else value
+        )
+    return values
+
+
+def _extraction_model(name, config_overrides=None):
     module = importlib.import_module(
         f"mlx_vlm.models.{EXTRACTION_CASES[name]['module']}"
     )
-    raw = _extraction_config(name)
+    raw = _merge_decision_config(_extraction_config(name), config_overrides or {})
     config = update_module_configs(
         module.ModelConfig.from_dict(raw), module, raw, ["text", "vision", "audio"]
     )
@@ -3003,3 +3014,196 @@ class TestD1OmniDecisionModel(unittest.TestCase):
             predict(model, tok, None, questions, images=[image], audio=clip)
         with self.assertRaisesRegex(ValueError, "mono"):
             predict(model, tok, None, questions, audio=np.zeros((2, 8000), np.int16))
+
+
+def _decision_fixture(case, config_overrides=None):
+    settings = case["decision_models"]
+    model = _extraction_model(case["id"], config_overrides)
+    mx.eval(model.parameters())
+    processor = _decision_tokenizer(
+        settings.get("tokens", ()), **settings.get("special_tokens", {})
+    )
+    body = {
+        "model": case["id"],
+        "state": settings["state"],
+        "questions": settings["questions"],
+    }
+    return model, processor, body
+
+
+def _assert_decision_answers(actual, expected):
+    if isinstance(expected, dict):
+        assert actual.keys() == expected.keys()
+        for key in expected:
+            _assert_decision_answers(actual[key], expected[key])
+    elif isinstance(expected, list):
+        assert len(actual) == len(expected)
+        for a, b in zip(actual, expected):
+            _assert_decision_answers(a, b)
+    elif isinstance(expected, float):
+        assert actual == pytest.approx(expected, abs=3e-4, rel=3e-4)
+    else:
+        assert actual == expected
+
+
+@pytest.mark.parametrize(
+    "case",
+    [case for case in EXTRACTION_DATA["cases"] if "decision_models" in case["checks"]],
+    ids=lambda case: case["id"],
+)
+def test_decision_scheduler_preserves_native_prediction(case):
+    from mlx_vlm import predict
+    from mlx_vlm.decision_scheduler import DecisionScheduler
+
+    model, processor, body = _decision_fixture(case)
+    expected = predict(model, processor, body["state"], body["questions"])
+    scheduler = DecisionScheduler(lambda name: (model, processor, model.config))
+    try:
+        jobs = [scheduler.submit(body) for _ in range(2)]
+        for job in jobs:
+            actual = job.future.result(timeout=10)["response"]
+            _assert_decision_answers(actual["answers"], expected["answers"])
+            assert actual.get("usage") == expected.get("usage")
+    finally:
+        scheduler.stop_and_join()
+    assert not scheduler.worker.is_alive()
+    assert scheduler.engine is None
+
+
+@pytest.mark.parametrize(
+    "case",
+    [case for case in EXTRACTION_DATA["cases"] if "decision_checkpoint" in case],
+    ids=lambda case: case["id"],
+)
+@pytest.mark.parametrize("indexed", [False, True])
+def test_decision_auxiliary_checkpoint(case, indexed, tmp_path):
+    from dataclasses import asdict
+
+    from mlx_vlm import predict
+    from mlx_vlm.utils import load_model
+
+    model, processor, body = _decision_fixture(case)
+    spec = case["decision_checkpoint"]
+    config = asdict(model.config)
+    head_config = config.pop(spec["config_key"])
+    config["model_type"] = spec["backbone_type"]
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    (tmp_path / spec["config_file"]).write_text(json.dumps(head_config))
+    weights = dict(tree_flatten(model.parameters()))
+    backbone = {k: v for k, v in weights.items() if not k.startswith(spec["prefix"])}
+    head = {
+        k.removeprefix(spec["prefix"]): v
+        for k, v in weights.items()
+        if k.startswith(spec["prefix"])
+    }
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), backbone)
+    mx.save_safetensors(str(tmp_path / spec["weights_file"]), head)
+    if indexed:
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": dict.fromkeys(backbone, "model.safetensors")})
+        )
+    loaded = load_model(tmp_path)
+    expected = predict(model, processor, body["state"], body["questions"])
+    actual = predict(loaded, processor, body["state"], body["questions"])
+    _assert_decision_answers(actual, expected)
+    (tmp_path / spec["weights_file"]).unlink()
+    with pytest.raises(FileNotFoundError, match="Missing decision head"):
+        load_model(tmp_path)
+
+
+DECISION_QUANTIZATION_CASES = [
+    (case, variant)
+    for case in EXTRACTION_DATA["cases"]
+    for variant in case.get("decision_quantization", {}).get("variants", [])
+]
+
+
+@pytest.mark.parametrize(
+    "recipe",
+    [None, "mixed_4_8", lambda path, module: True],
+    ids=["default", "mixed", "custom"],
+)
+@pytest.mark.parametrize(
+    "case,variant",
+    DECISION_QUANTIZATION_CASES,
+    ids=[
+        case["id"] + "-" + variant["id"]
+        for case, variant in DECISION_QUANTIZATION_CASES
+    ],
+)
+def test_decision_quantization_roundtrip(case, variant, recipe, monkeypatch, tmp_path):
+    from dataclasses import asdict
+    from operator import attrgetter
+    from types import SimpleNamespace
+
+    from mlx_vlm import predict
+    from mlx_vlm.utils import load_model
+
+    conversion = importlib.import_module("mlx_vlm.convert")
+    spec = case["decision_quantization"]
+    model, processor, body = _decision_fixture(
+        case,
+        _merge_decision_config(
+            spec["config_overrides"], variant.get("config_overrides", {})
+        ),
+    )
+    protected = {
+        name: np.array(value)
+        for name, value in tree_flatten(model.parameters())
+        if any(
+            name == path or name.startswith(path + ".")
+            for path in variant["protected_paths"]
+        )
+    }
+    assert protected
+    source, destination = tmp_path / "source", tmp_path / "converted"
+    source.mkdir()
+    monkeypatch.setattr(conversion, "get_model_path", lambda *a, **k: source)
+    monkeypatch.setattr(
+        conversion,
+        "fetch_from_hub",
+        lambda *a, **k: (
+            model,
+            {k: v for k, v in asdict(model.config).items() if v is not None},
+            SimpleNamespace(save_pretrained=lambda p: None),
+        ),
+    )
+    monkeypatch.setattr(conversion, "create_model_card", lambda *a, **k: None)
+    conversion.convert(
+        str(source),
+        str(destination),
+        quantize=True,
+        q_group_size=spec["group_size"],
+        q_bits=spec["bits"],
+        quant_predicate=recipe,
+        **variant["convert_options"],
+    )
+    loaded = load_model(destination)
+    weights = dict(tree_flatten(loaded.parameters()))
+    for name, expected in protected.items():
+        np.testing.assert_array_equal(np.array(weights[name]), expected)
+    modules = dict(loaded.named_modules())
+    for path in spec["quantized_paths"]:
+        assert isinstance(modules[path], (nn.QuantizedLinear, nn.QuantizedEmbedding))
+    for name, expected in variant["convert_options"].items():
+        assert getattr(loaded.config, name) == expected
+    layer = modules[variant["row_layer"]]
+    assert hasattr(layer, "scales") == variant["quantized_rows"]
+    ids = mx.array([1, 5, 5, 10])
+    expected = (
+        mx.dequantize(
+            layer.weight,
+            layer.scales,
+            layer.biases,
+            group_size=layer.group_size,
+            bits=layer.bits,
+            mode=layer.mode,
+        )
+        if hasattr(layer, "scales")
+        else layer.weight
+    )
+    np.testing.assert_allclose(
+        np.array(attrgetter(spec["row_reader"])(loaded)(ids)), np.array(expected[ids])
+    )
+    result = predict(loaded, processor, body["state"], body["questions"])
+    assert set(result["answers"]) == set(body["questions"])

@@ -6233,3 +6233,262 @@ def test_decisions_leave_mixed_media_to_the_model(client):
     model.predict.assert_called_once_with(
         None, None, questions, images=["cat.png"], audio="meow.wav"
     )
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        {"type": "bogus"},
+        {"type": "choice", "criteria": {}},
+        {"type": "choice", "criteria": ["a", "b"]},
+        {"type": "score", "criteria": []},
+        {"type": "score", "criteria": [None]},
+        {"type": "noul", "temperature": 1},
+    ],
+)
+def test_systemone_rejects_invalid_questions(client, question):
+    with patch.object(server, "get_cached_model") as load:
+        response = client.post(
+            "/v1/systemone",
+            json={"model": "decision", "state": "A", "questions": {"q": question}},
+        )
+    assert response.status_code == 422
+    load.assert_not_called()
+
+
+@pytest.mark.parametrize("surface", ["http", "dict", "schema"])
+def test_systemone_adapts_shared_predictions_and_confidence(client, surface):
+    from mlx_vlm.decision import systemone
+    from mlx_vlm.systemone import SystemOneRequest
+
+    questions = {
+        "outage": {"type": "noul"},
+        "team": {"type": "choice", "criteria": {"billing": None, "technical": "Bugs"}},
+        "urgency": {"type": "score", "criteria": ["Low", "Medium", "High"]},
+        "only_choice": {"type": "choice", "criteria": {"one": None}},
+        "only_level": {"type": "score", "criteria": ["Low"]},
+    }
+    native = {
+        "answers": {
+            "outage": {"type": "bool", "value": True, "probability": 0.8},
+            "team": {
+                "type": "choice",
+                "value": "technical",
+                "probabilities": {"billing": 0.25, "technical": 0.75},
+            },
+            "urgency": {
+                "type": "score",
+                "value": 1.6,
+                "probabilities": {"0": 0.1, "1": 0.2, "2": 0.7},
+            },
+        },
+        "usage": {"input_tokens": 12},
+    }
+    model = NS(
+        decision_types=("bool", "choice", "score"), predict=Mock(return_value=native)
+    )
+    native["answers"]["only_choice"] = {"probabilities": {"one": 1.0}}
+    native["answers"]["only_level"] = {"probabilities": {"0": 1.0}}
+    body = {"model": "decision", "state": "A", "questions": questions}
+    if surface == "http":
+        with patch.object(server, "get_cached_model", return_value=(model, None, {})):
+            response = client.post("/v1/systemone", json=body)
+        assert response.status_code == 200, response.text
+        assert response.headers["x-typesafe-request-id"]
+        assert response.headers["x-clef-cached-tokens"] == "0"
+        result = response.json()
+    else:
+        request = SystemOneRequest.model_validate(body) if surface == "schema" else body
+        result = systemone(model, None, request)
+    answers = result["answers"]
+    assert answers["outage"] == {"type": "noul", "noul": 0.8}
+    assert answers["team"]["confidence"] == 0.5
+    assert (
+        answers["urgency"]["score"] == 1.6 and answers["urgency"]["confidence"] == 0.4
+    )
+    assert answers["only_choice"]["confidence"] == 1.0
+    assert answers["only_level"]["score"] == 0.0
+    assert answers["only_level"]["confidence"] == 1.0
+    assert model.predict.call_args.args[2]["outage"]["type"] == "bool"
+
+
+@pytest.mark.parametrize(
+    "endpoint,kind", [("/v1/decisions", "bool"), ("/v1/systemone", "noul")]
+)
+def test_decision_backpressure_is_shared(client, monkeypatch, endpoint, kind):
+    import mlx_vlm.server.decisions as decisions
+    from mlx_vlm.decision_scheduler import DecisionQueueFull
+
+    scheduler = NS(submit=Mock(side_effect=DecisionQueueFull("full")))
+    monkeypatch.setattr(decisions, "get_scheduler", lambda deps: scheduler)
+    result = client.post(
+        endpoint,
+        json={"model": "test", "state": "A", "questions": {"q": {"type": kind}}},
+    )
+    assert result.status_code == 429
+
+
+def test_decision_scheduler_admission_switching_and_recovery(incremental_decision):
+    from mlx_vlm.decision import context_limit
+    from mlx_vlm.decision_scheduler import DecisionScheduler, make_decision_engine
+
+    _, (model, processor, body) = incremental_decision
+    engine_type = type(make_decision_engine(model, processor))
+    original = engine_type.step
+    reached, resume = Event(), Event()
+    loaded, sizes = [], []
+
+    def step(engine, states):
+        sizes.append(len(states))
+        if len(sizes) == 1:
+            reached.set()
+            assert resume.wait(5)
+        return original(engine, states)
+
+    def load(name):
+        loaded.append(name)
+        return model, processor, model.config
+
+    with patch.object(engine_type, "step", step):
+        scheduler = DecisionScheduler(load, prefill_step_size=31, batch_size=3)
+        try:
+            first = scheduler.submit(body)
+            assert reached.wait(5), (
+                first.future.exception(timeout=0)
+                if first.future.done()
+                else "Worker did not reach prefill"
+            )
+            jobs = [
+                first,
+                scheduler.submit(body),
+                scheduler.submit(body),
+                scheduler.submit({**body, "model": "other"}),
+            ]
+            resume.set()
+            assert all(
+                job.future.result(timeout=10)["response"]["answers"] for job in jobs
+            )
+            assert any(size > 1 for size in sizes)
+            assert loaded == [body["model"], "other"]
+            bad = scheduler.submit(
+                {**body, "model": "other", "state": " A" * context_limit(model.config)}
+            )
+            good = scheduler.submit({**body, "model": "other"})
+            with pytest.raises(ValueError, match="maximum"):
+                bad.future.result(timeout=5)
+            assert good.future.result(timeout=5)["response"]["answers"]
+        finally:
+            resume.set()
+            scheduler.stop_and_join()
+    assert not scheduler.worker.is_alive() and scheduler.engine is None
+
+
+def test_decision_scheduler_overload_cancellation_and_shutdown(incremental_decision):
+    from mlx_vlm.decision import DecisionCancelled
+    from mlx_vlm.decision_scheduler import DecisionQueueFull, DecisionScheduler
+
+    _, (model, processor, body) = incremental_decision
+    reached, resume = Event(), Event()
+
+    def load(name):
+        reached.set()
+        assert resume.wait(5)
+        return model, processor, model.config
+
+    scheduler = DecisionScheduler(load, max_pending=1, batch_size=1)
+    try:
+        first = scheduler.submit(body)
+        assert reached.wait(5)
+        queued = scheduler.submit(body)
+        with pytest.raises(DecisionQueueFull):
+            scheduler.submit(body)
+        first.cancel()
+        queued.cancel()
+    finally:
+        resume.set()
+        scheduler.stop_and_join()
+    assert first.future.done() and queued.future.done()
+    with pytest.raises(DecisionCancelled):
+        scheduler.submit(body)
+
+
+@pytest.mark.parametrize("wire_format", ["native", "systemone"])
+def test_decision_disconnect_cancels_shared_job(monkeypatch, wire_format):
+    from fastapi import FastAPI, Response
+
+    import mlx_vlm.server.decisions as decisions
+    from mlx_vlm.decision_scheduler import DecisionJob
+    from mlx_vlm.systemone import SystemOneRequest
+
+    body = {
+        "model": "test",
+        "state": "A",
+        "questions": {"q": {"type": "noul" if wire_format == "systemone" else "bool"}},
+    }
+    job = DecisionJob(body)
+    monkeypatch.setattr(
+        decisions, "get_scheduler", lambda deps: NS(submit=lambda *a, **k: job)
+    )
+    app = FastAPI()
+    decisions.register_routes(app, NS(read_tenant_id=lambda request: "tenant"))
+    endpoint = app.routes[-1 if wire_format == "systemone" else -2].endpoint
+    schema = (
+        SystemOneRequest if wire_format == "systemone" else decisions.DecisionRequest
+    )
+
+    async def disconnected():
+        return True
+
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(
+            endpoint(
+                schema.model_validate(body),
+                NS(is_disconnected=disconnected),
+                Response(),
+            )
+        )
+    assert error.value.status_code == 499
+    assert job.cancelled.is_set() and job.future.cancelled()
+
+
+def test_decision_fallback_failure_does_not_poison_batch():
+    from mlx_vlm.decision_scheduler import DecisionScheduler
+
+    def predict(processor, state, questions):
+        if state == "bad":
+            raise ValueError("invalid input")
+        return {"answers": {"q": {"type": "bool", "value": True, "probability": 0.8}}}
+
+    model = NS(decision_types=("bool",), predict=predict)
+    scheduler = DecisionScheduler(lambda name: (model, None, {}), batch_wait_ms=20)
+    body = {"model": "test", "state": "bad", "questions": {"q": {"type": "bool"}}}
+    try:
+        bad, good = scheduler.submit(body), scheduler.submit({**body, "state": "good"})
+        with pytest.raises(ValueError, match="invalid input"):
+            bad.future.result(timeout=5)
+        assert good.future.result(timeout=5)["response"]["answers"]["q"]["value"]
+    finally:
+        scheduler.stop_and_join()
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_decision_cli_preserves_environment_unless_overridden(monkeypatch, explicit):
+    limits = {
+        "batch-size": 2,
+        "prefill-step-size": 64,
+        "prefix-cache-mb": 0,
+        "max-pending": 8,
+        "max-length": 1024,
+    }
+    arguments = ["mlx_vlm.server"]
+    expected = {}
+    for flag, value in limits.items():
+        key = "MLX_VLM_DECISION_" + flag.replace("-", "_").upper()
+        monkeypatch.setenv(key, "123")
+        expected[key] = str(value) if explicit else "123"
+        if explicit:
+            arguments.extend(["--decision-" + flag, str(value)])
+    monkeypatch.setattr(sys, "argv", arguments)
+    with patch.dict(os.environ), patch.object(cli.uvicorn, "run"):
+        cli.main()
+        _assert_fields(os.environ, **expected)

@@ -1037,8 +1037,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
     def _normalize_qk(self, q: mx.array, k: mx.array):
         inv_scale = k.shape[-1] ** -0.5
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        # rms_norm averages squared magnitudes; the reference L2 norm sums them.
+        norm_eps = 1e-6 / k.shape[-1]
+        q = (inv_scale**2) * mx.fast.rms_norm(q, None, norm_eps)
+        k = inv_scale * mx.fast.rms_norm(k, None, norm_eps)
         return q, k
 
     def _project_gates(self, inputs: mx.array):
@@ -1185,6 +1187,7 @@ class Qwen3_5Model(nn.Module):
         position_ids: Optional[mx.array] = None,
         capture_layer_ids: Optional[List[int]] = None,
         hidden_sink: Optional[list] = None,
+        checkpoint=None,
     ):
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
@@ -1215,6 +1218,7 @@ class Qwen3_5Model(nn.Module):
                 inputs_embeds=h,
                 cache=row_cache,
                 position_ids=position_ids,
+                checkpoint=checkpoint,
             )
             for i, cache_entry in enumerate(row_cache):
                 if cache[i] is None or cache_entry is None:
@@ -1281,6 +1285,7 @@ class Qwen3_5Model(nn.Module):
                         inputs_embeds=row_embeds,
                         cache=current_cache,
                         position_ids=row_position_ids,
+                        checkpoint=checkpoint,
                     )
                     if pad > 0:
                         row_out = _pad_row_time(row_out, pad, h.shape[1])
@@ -1330,6 +1335,10 @@ class Qwen3_5Model(nn.Module):
             )
             if hidden_sink is not None and i in capture_set:
                 hidden_sink.append(h)
+            if checkpoint is not None and (
+                (i + 1) % 4 == 0 or i + 1 == len(self.layers)
+            ):
+                checkpoint(h)
 
         return self.norm(h)
 

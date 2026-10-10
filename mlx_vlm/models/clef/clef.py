@@ -1,14 +1,13 @@
-import json
 import math
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ...decision import context_limit
+from ..base import InputEmbeddingsFeatures
 from ..qwen3_5 import Model as Qwen3_5Model
-from ..qwen3_vl.qwen3_vl import masked_scatter
-
-QUESTION_TYPES = {"noul": 0, "choice": 1, "score": 2}
+from .processing_clef import encode_record
 
 
 def _span_means(spans, length):
@@ -81,9 +80,20 @@ class JointSchemaHead(nn.Module):
         self.joint_logit_scale = mx.zeros(())
         self.residual_gate = mx.zeros(())
 
-    def __call__(self, hidden, question_spans, option_spans, lexical, types, counts):
+    def __call__(
+        self,
+        hidden,
+        question_spans,
+        option_spans,
+        lexical,
+        types,
+        counts,
+        checkpoint=None,
+    ):
         length = hidden.shape[0]
         memory = self.memory_projection(hidden)[None]
+        if checkpoint is not None:
+            checkpoint(memory)
         global_vector = hidden[-1]
         questions = (_span_means(question_spans, length) @ hidden).astype(hidden.dtype)
         contexts = (_span_means(option_spans, length) @ hidden).astype(hidden.dtype)
@@ -96,6 +106,8 @@ class JointSchemaHead(nn.Module):
         )[None]
         for layer in self.evidence_layers:
             routed = layer(routed, memory)
+            if checkpoint is not None:
+                checkpoint(routed)
         routed = routed[0]
 
         base = self.question_projection(questions)
@@ -117,6 +129,8 @@ class JointSchemaHead(nn.Module):
         )[None]
         for layer in self.layers:
             fields = layer(fields, memory)
+            if checkpoint is not None:
+                checkpoint(fields)
         fields = self.field_norm(fields[0])[owner]
 
         anchor = questions + global_vector
@@ -151,42 +165,71 @@ class Model(Qwen3_5Model):
         super().__init__(config)
         self.head = JointSchemaHead(**config.head_config)
 
-    def __call__(self, input_ids, question_spans, option_spans, qtype, **media):
+    def get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
+        """Scatter each modality separately, while sharing multimodal positions."""
         embeds = self.language_model.model.embed_tokens(input_ids)
-        dtype = self.vision_tower.patch_embed.proj.weight.dtype
         for pixels, grid, token in (
-            ("pixel_values", "image_grid_thw", self.config.image_token_index),
-            ("pixel_values_videos", "video_grid_thw", self.config.video_token_index),
+            (pixel_values, kwargs.get("image_grid_thw"), self.config.image_token_index),
+            (
+                kwargs.get("pixel_values_videos"),
+                kwargs.get("video_grid_thw"),
+                self.config.video_token_index,
+            ),
         ):
-            if media.get(pixels) is not None:
-                states, _ = self.vision_tower(media[pixels].astype(dtype), media[grid])
-                embeds = masked_scatter(
-                    embeds,
-                    mx.broadcast_to((input_ids == token)[..., None], embeds.shape),
-                    states,
+            if pixels is not None:
+                dtype = self.vision_tower.patch_embed.proj.weight.dtype
+                features, _ = self.vision_tower(pixels.astype(dtype), grid)
+                embeds, _ = self.merge_input_ids_with_image_features(
+                    features, embeds, input_ids, token, token
                 )
-        position_ids, _ = self.language_model.get_rope_index(
-            input_ids, media.get("image_grid_thw"), media.get("video_grid_thw")
+        positions, deltas = self.language_model.get_rope_index(
+            input_ids,
+            kwargs.get("image_grid_thw"),
+            kwargs.get("video_grid_thw"),
+            kwargs.get("mask"),
         )
+        return InputEmbeddingsFeatures(
+            inputs_embeds=embeds, position_ids=positions, rope_deltas=deltas
+        )
+
+    def _output_embeddings(self, ids):
+        layer = (
+            self.language_model.model.embed_tokens
+            if self.config.text_config.tie_word_embeddings
+            else self.language_model.lm_head
+        )
+        if hasattr(layer, "scales"):
+            # Gather first: never dequantize the full vocabulary matrix.
+            biases = getattr(layer, "biases", None)
+            return mx.dequantize(
+                layer.weight[ids],
+                layer.scales[ids],
+                biases[ids] if biases is not None else None,
+                group_size=layer.group_size,
+                bits=layer.bits,
+                mode=layer.mode,
+            )
+        return layer.weight[ids]
+
+    def __call__(self, input_ids, question_spans, option_spans, qtype, **media):
+        features = self.get_input_embeddings(input_ids, **media)
         hidden = self.language_model.model(
-            input_ids, inputs_embeds=embeds, position_ids=position_ids
+            input_ids,
+            inputs_embeds=features.inputs_embeds,
+            position_ids=features.position_ids,
         )
+        return self._score_hidden(
+            hidden, input_ids, question_spans, option_spans, qtype
+        )
+
+    def _score_hidden(
+        self, hidden, input_ids, question_spans, option_spans, qtype, checkpoint=None
+    ):
         hidden = self.head.hidden_norm(hidden[0])
         flat = np.asarray(input_ids[0])
         lexical_ids = np.concatenate([flat[s:e] for s, e in option_spans])
         lexical_spans = np.cumsum([0, *(e - s for s, e in option_spans)])
-        lm_head, ids = self.language_model.lm_head, mx.array(lexical_ids)
-        embeddings = lm_head.weight[ids]
-        if "scales" in lm_head:
-            biases = lm_head.get("biases")
-            embeddings = mx.dequantize(
-                embeddings,
-                lm_head.scales[ids],
-                None if biases is None else biases[ids],
-                group_size=lm_head.group_size,
-                bits=lm_head.bits,
-                mode=lm_head.mode,
-            )
+        embeddings = self._output_embeddings(mx.array(lexical_ids))
         lexical = (
             _span_means(
                 list(zip(lexical_spans[:-1], lexical_spans[1:])), len(lexical_ids)
@@ -200,7 +243,46 @@ class Model(Qwen3_5Model):
             lexical.astype(hidden.dtype),
             qtype,
             [count for _, count in question_spans],
+            checkpoint=checkpoint,
         )
+
+    def score_record(self, hidden, input_ids, record, checkpoint=None):
+        counts = [len(q.option_spans) for q in record.questions]
+        logits = self._score_hidden(
+            hidden,
+            input_ids,
+            [(q.question_span, count) for q, count in zip(record.questions, counts)],
+            [span for q in record.questions for span in q.option_spans],
+            mx.array([q.question_type for q in record.questions]),
+            checkpoint=checkpoint,
+        )
+        return mx.split(logits, np.cumsum(counts[:-1]).tolist())
+
+    def decide(self, record):
+        ids = mx.array(record.input_ids)[None]
+        media = {
+            k: mx.array(v)
+            for k, v in (record.media or {}).items()
+            if k
+            in (
+                "pixel_values",
+                "pixel_values_videos",
+                "image_grid_thw",
+                "video_grid_thw",
+            )
+        }
+        features = self.get_input_embeddings(ids, **media)
+        hidden = self.language_model.model(
+            ids,
+            inputs_embeds=features.inputs_embeds,
+            position_ids=features.position_ids,
+        )
+        return self.score_record(hidden, ids, record)
+
+    def make_decision_engine(self, processor, **settings):
+        from .inference import DecisionEngine
+
+        return DecisionEngine(self, processor, **settings)
 
     def sanitize(self, weights):
         backbone, head = {}, {}
@@ -211,6 +293,9 @@ class Model(Qwen3_5Model):
                 backbone[key] = value
                 continue
             key = "head." + key.removeprefix("head.")
+            key = key.replace(".feedforward.layers.", ".feedforward.").replace(
+                "head.residual_scorer.layers.", "head.residual_scorer."
+            )
             if key.endswith(("in_proj_weight", "in_proj_bias")):
                 prefix, suffix = key.rsplit(".in_proj_", 1)
                 for name, part in zip(
@@ -226,11 +311,21 @@ class Model(Qwen3_5Model):
     @property
     def quant_predicate(self):
         base = super().quant_predicate
+        lexical_layer = (
+            "language_model.model.embed_tokens"
+            if self.config.text_config.tie_word_embeddings
+            else "language_model.lm_head"
+        )
 
         def predicate(path, module):
             if path.startswith("head."):
                 return False
-            return True if base is None else base(path, module)
+            if (
+                self.config.decision_quantization == "preserve-output"
+                and path == lexical_layer
+            ):
+                return False
+            return base(path, module) if base else True
 
         return predicate
 
@@ -242,200 +337,71 @@ class Model(Qwen3_5Model):
         return Clef(self, processor).predict(state, questions, **kwargs)
 
 
-def _render_criterion(value):
-    if isinstance(value, str):
-        return value
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-
-
-def _options(question):
-    kind = question["type"]
-    criteria = question.get("criteria")
-    if kind == "noul":
-        defaults = {
-            "true": "The proposition is true or the answer is yes.",
-            "false": "The proposition is false or the answer is no.",
+def format_result(record, questions, logits):
+    probabilities = [
+        mx.softmax(value.astype(mx.float32), precise=True) for value in logits
+    ]
+    mx.eval(probabilities)
+    raw = {
+        question.question_id: dict(zip(question.option_ids, p.tolist()))
+        for question, p in zip(record.questions, probabilities)
+    }
+    if not all(math.isfinite(p) for values in raw.values() for p in values.values()):
+        raise RuntimeError("Decision model produced non-finite probabilities")
+    answers = {}
+    for name, question in questions.items():
+        p = raw[name]
+        kind = question["type"]
+        if kind in ("bool", "noul"):
+            probability = round(p["true"], 4)
+            answers[name] = {
+                "type": "bool",
+                "value": probability >= 0.5,
+                "probability": probability,
+            }
+            continue
+        labels = (
+            list(question["criteria"])
+            if kind == "choice"
+            else [str(i) for i in range(len(question["criteria"]))]
+        )
+        best = max(labels, key=p.__getitem__)
+        answers[name] = {
+            "type": kind,
+            "value": (
+                best
+                if kind == "choice"
+                else round(sum(i * p[label] for i, label in enumerate(labels)), 4)
+            ),
+            "probabilities": {label: round(p[label], 4) for label in labels},
+            "metadata": {"confidence": round(p[best], 4)},
         }
-        defaults.update(criteria or {})
-        return [(key, defaults[key]) for key in ("true", "false")]
-    if kind == "choice":
-        if isinstance(criteria, list):
-            criteria = dict.fromkeys(criteria)
-        return sorted((str(key), value) for key, value in criteria.items())
-    if kind == "score":
-        return [(str(index), value) for index, value in enumerate(criteria)]
-    raise ValueError(f"Unsupported question type: {kind!r}")
+        if kind == "score":
+            answers[name]["metadata"]["legend"] = dict(
+                zip(labels, question["criteria"])
+            )
+    return {
+        "response": {
+            "model": "clef",
+            "answers": answers,
+            "usage": {"input_tokens": len(record.input_ids), "output_tokens": 0},
+        },
+        "probabilities": raw,
+    }
 
 
 class Clef:
     def __init__(self, model, processor):
-        self.model = model
-        self.processor = processor
-        self.tokenizer = getattr(processor, "tokenizer", processor)
+        self.model, self.processor = model, processor
 
-    def _tokens(self, text):
-        return self.tokenizer(text, add_special_tokens=False)["input_ids"]
-
-    def _sequence(
-        self,
-        state,
-        questions,
-        images=None,
-        videos=None,
-        media_kwargs=None,
-        max_length=16384,
-        max_state_tokens=None,
+    def predict(
+        self, state, questions, max_length=None, max_state_tokens=None, **media
     ):
-        tokens = self._tokens
-        schema = tokens("\n\nSCHEMA FIELDS:\n")
-        rows = []
-        for index, (name, question) in enumerate(questions.items()):
-            schema += tokens(
-                f"\nFIELD {index + 1}\nID: {name}\nTYPE: {question['type']}\n"
-                "INSTRUCTION: "
-            )
-            start = len(schema)
-            schema += tokens(
-                _render_criterion(question.get("instructions") or str(name))
-            )
-            question_span = (start, len(schema))
-            schema += tokens("\nALLOWED OPTIONS:\n")
-            spans, labels = [], []
-            for number, (option, description) in enumerate(_options(question), 1):
-                schema += tokens(f"OPTION {number}: ")
-                start = len(schema)
-                semantics = {"option_id": option}
-                if description is not None:
-                    semantics["description"] = description
-                schema += tokens(_render_criterion(semantics))
-                spans.append((start, len(schema)))
-                labels.append(option)
-                schema += tokens("\n")
-            schema += tokens("END FIELD\n")
-            rows.append((name, question, question_span, spans, labels))
-
-        prefix = tokens(
-            "<|im_start|>system\nRead the complete state and schema. Decide every "
-            "field jointly. Each answer must be exactly one of that field's allowed "
-            "options.<|im_end|>\n<|im_start|>user\nSTATE:\n"
+        record = encode_record(
+            getattr(self.processor, "tokenizer", self.processor),
+            {"state": state, "questions": questions, **media},
+            max_length=context_limit(self.model.config, max_length),
+            max_state_tokens=max_state_tokens,
+            processor=self.processor,
         )
-        suffix = tokens(
-            "\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
-            "JOINT SCHEMA DECISIONS:"
-        )
-        media = {}
-        images, videos = list(images or []), list(videos or [])
-        media_kwargs = dict(media_kwargs or {})
-        if videos and "video_metadata" not in media_kwargs:
-            video_processor = self.processor.video_processor
-            fps = media_kwargs.pop("fps", None)
-            num_frames = media_kwargs.pop("num_frames", None)
-            metadata = []
-            for index, frames in enumerate(videos):
-                total = len(frames)
-                count = num_frames
-                if count is None:
-                    count = int(total / 24 * (fps or video_processor.fps))
-                    count = min(
-                        max(count, video_processor.min_frames),
-                        video_processor.max_frames,
-                        total,
-                    )
-                indices = np.linspace(0, total - 1, count).round().astype(int)
-                videos[index] = [frames[i] for i in indices]
-                metadata.append({"frames_indices": indices.tolist(), "fps": 24})
-            media_kwargs["video_metadata"] = metadata
-        if images or videos:
-            encoded = self.processor(
-                text=[
-                    "<|vision_start|><|image_pad|><|vision_end|>" * len(images)
-                    # transformers 5 keeps the outer vision tokens around timestamped frames
-                    + "<|vision_start|><|vision_start|><|video_pad|><|vision_end|><|vision_end|>"
-                    * len(videos)
-                    + "\n"
-                ],
-                images=images or None,
-                videos=videos or None,
-                **media_kwargs,
-            )
-            prefix += np.asarray(encoded["input_ids"])[0].tolist()
-            media = {
-                key: mx.array(np.asarray(encoded[key]))
-                for key in (
-                    "pixel_values",
-                    "image_grid_thw",
-                    "pixel_values_videos",
-                    "video_grid_thw",
-                )
-                if encoded.get(key) is not None
-            }
-        state_ids = tokens(_render_criterion(state))[:max_state_tokens]
-        fixed = len(prefix) + len(schema) + len(suffix)
-        if fixed > max_length:
-            raise ValueError(
-                f"schema requires {fixed} tokens before state; maximum is {max_length}"
-            )
-        state_ids = state_ids[: max_length - fixed]
-        offset = len(prefix) + len(state_ids)
-        rows = [
-            (
-                name,
-                question,
-                (span[0] + offset, span[1] + offset),
-                [(s + offset, e + offset) for s, e in spans],
-                labels,
-            )
-            for name, question, span, spans, labels in rows
-        ]
-        return prefix + state_ids + schema + suffix, rows, media
-
-    def predict(self, state, questions, **kwargs):
-        ids, rows, media = self._sequence(state, questions, **kwargs)
-        logits = self.model(
-            mx.array([ids]),
-            [(row[2], len(row[3])) for row in rows],
-            [span for row in rows for span in row[3]],
-            mx.array([QUESTION_TYPES[row[1]["type"]] for row in rows]),
-            **media,
-        )
-        mx.eval(logits)
-        answers = {}
-        start = 0
-        for name, question, _, spans, labels in rows:
-            values = logits[start : start + len(spans)].astype(mx.float32)
-            start += len(spans)
-            p = dict(zip(labels, mx.softmax(values).tolist()))
-            kind = question["type"]
-            if kind == "noul":
-                probability = round(p["true"], 4)
-                answers[name] = {
-                    "type": "bool",
-                    "value": probability >= 0.5,
-                    "probability": probability,
-                }
-                continue
-            labels = (
-                list(question["criteria"])
-                if kind == "choice"
-                else [str(i) for i in range(len(question["criteria"]))]
-            )
-            best = max(labels, key=p.__getitem__)
-            answers[name] = {
-                "type": kind,
-                "value": (
-                    best
-                    if kind == "choice"
-                    else round(sum(i * p[label] for i, label in enumerate(labels)), 4)
-                ),
-                "probabilities": {label: round(p[label], 4) for label in labels},
-                "metadata": {"confidence": round(p[best], 4)},
-            }
-            if kind == "score":
-                answers[name]["metadata"]["legend"] = dict(
-                    zip(labels, question["criteria"])
-                )
-        return {
-            "model": "clef",
-            "answers": answers,
-            "usage": {"input_tokens": len(ids), "output_tokens": 0},
-        }
+        return format_result(record, questions, self.model.decide(record))["response"]

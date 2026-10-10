@@ -23,6 +23,12 @@ def predict(model, processor, state, questions, **kwargs):
     ``images=[...]`` carry the whole state; a model reads the media named in
     its ``decision_media``.
     """
+    normalized, kwargs = normalize_questions(model, questions, **kwargs)
+    return model.predict(processor, state, normalized, **kwargs)
+
+
+def normalize_questions(model, questions, *, allow_single_criterion=False, **kwargs):
+    """Validate capabilities independently of eager or scheduled execution."""
     supported = getattr(model, "decision_types", ())
     if not supported:
         raise ValueError("This model does not support decision prediction")
@@ -40,7 +46,7 @@ def predict(model, processor, state, questions, **kwargs):
             raise ValueError(f"This model does not support {kind!r} decisions")
         criteria = question.get("criteria")
         if kind in ("choice", "multi_label", "score"):
-            minimum = 1 if kind == "multi_label" else 2
+            minimum = 1 if kind == "multi_label" or allow_single_criterion else 2
             if (
                 not isinstance(criteria, (list, tuple, Mapping))
                 or len(criteria) < minimum
@@ -74,4 +80,59 @@ def predict(model, processor, state, questions, **kwargs):
             question["criteria"] = list(criteria)
         question["type"] = kind
         normalized[name] = question
-    return model.predict(processor, state, normalized, **kwargs)
+    return normalized, kwargs
+
+
+class DecisionCancelled(Exception):
+    pass
+
+
+def check_cancelled(event):
+    if event.is_set():
+        raise DecisionCancelled("Decision cancelled")
+
+
+def context_limit(config, requested=None):
+    text = getattr(config, "text_config", config)
+    native = getattr(text, "max_position_embeddings", 65536)
+    limit = min(65536, native) if requested is None else requested
+    if not 0 < limit <= native:
+        raise ValueError(f"Decision context limit must be between 1 and {native}")
+    return limit
+
+
+def systemone(model, processor, request, max_length=None, *, engine=None):
+    """Compatibility helper using the same model capabilities as native serving."""
+    from .decision_scheduler import make_decision_engine
+    from .systemone import SystemOneRequest, format_response, native_request
+
+    request = SystemOneRequest.model_validate(request).model_dump(exclude_none=True)
+    body = native_request(request)
+    questions, media = normalize_questions(
+        model,
+        body["questions"],
+        allow_single_criterion=True,
+        **{
+            key: value
+            for key, value in body.items()
+            if key not in ("model", "state", "questions")
+        },
+    )
+    body = {**body, "questions": questions, **media}
+    backend = engine or make_decision_engine(
+        model,
+        processor,
+        max_length=max_length,
+        prefill_step_size=context_limit(getattr(model, "config", None), max_length),
+        cache_bytes=0,
+    )
+    state = backend.prepare(body)
+    while not state.done:
+        backend.step([state])
+    return format_response(request, backend.finish(state))
+
+
+def comparison_report(*args, **kwargs):
+    from .decide import comparison_report as compare
+
+    return compare(*args, **kwargs)

@@ -969,7 +969,24 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 
     weights = {}
     for wf in weight_files:
+        if (
+            config.get("model_type") == "clef"
+            and Path(wf).name == "joint_head.safetensors"
+        ):
+            continue
         weights.update(_load_safetensors(wf))
+    if config.get("model_type") == "clef" and not any(
+        k.startswith("head.") for k in weights
+    ):
+        head_path = model_path / "joint_head.safetensors"
+        if not head_path.exists():
+            raise FileNotFoundError(f"Missing decision head: {head_path}")
+        weights.update(
+            {
+                "head." + key.removeprefix("head."): value
+                for key, value in _load_safetensors(str(head_path)).items()
+            }
+        )
 
     model_class, _ = get_model_and_args(config=config, model_path=model_path)
 
@@ -1409,6 +1426,19 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
     try:
         with open(model_path / "config.json", encoding="utf-8") as f:
             config = json.load(f)
+
+        head_config = model_path / "joint_head_config.json"
+        if config.get("model_type") in ("qwen3_5", "clef") and (
+            head_config.exists() or config.get("joint_head_config")
+        ):
+            config["model_type"] = "clef"
+            legacy = config.pop("joint_head_config", None)
+            if "head_config" not in config:
+                config["head_config"] = (
+                    legacy
+                    if legacy is not None
+                    else json.loads(head_config.read_text())
+                )
 
         generation_config_file = model_path / "generation_config.json"
         if generation_config_file.exists():

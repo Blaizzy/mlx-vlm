@@ -556,6 +556,8 @@ scoring. Decider, Laya, [d1-3B](mlx_vlm/models/d1/README.md), and
 [d1-omni-600M](mlx_vlm/models/d1_omni/README.md) support `choice`, `bool`, and
 `score`; the two LiquidAI d1 models also read images, and d1-omni reads speech.
 Consult each model's README for criteria and calibration details.
+For JSONL batches, checkpoint comparisons, prefix caching, and the TypeSafe
+`/v1/systemone` adapter, see [decision serving and evaluation](docs/decisions.md).
 
 ### Server (FastAPI)
 

@@ -175,6 +175,12 @@ def _server_runtime_snapshot() -> dict:
         "continuous_batching_enabled": runtime.response_generator is not None,
         "request_queue_depth": queue_depth,
         "audio_queue_depth": audio_queue_depth,
+        "decision_queue_depth": (
+            runtime.decision_queue.qsize() if runtime.decision_queue else 0
+        ),
+        "decision_active_requests": (
+            runtime.decision_queue.active_count if runtime.decision_queue else 0
+        ),
         "preload_failures": dict(runtime.preload_failures),
         "apc": (
             {"enabled": False}
@@ -479,6 +485,9 @@ async def lifespan(app):
     try:
         yield
     finally:
+        if runtime.decision_queue is not None:
+            await asyncio.to_thread(runtime.decision_queue.stop_and_join)
+            runtime.decision_queue = None
         if runtime.audio_queue is not None:
             runtime.audio_queue.stop_and_join()
             runtime.audio_queue = None
@@ -512,6 +521,13 @@ _INHERIT_ADAPTER = object()
 
 
 def _unload_model_cache_group(cache_group: str) -> bool:
+    if (
+        cache_group == "decision"
+        and runtime.decision_queue is not None
+        and not runtime.decision_queue.is_worker_thread()
+    ):
+        runtime.decision_queue.stop_and_join()
+        runtime.decision_queue = None
     registry = _model_cache_registry()
     cache = registry.for_kind(cache_group)
     if not cache:
@@ -982,6 +998,13 @@ def get_cached_model(
 # Synchronous unload function for internal use
 def unload_model_sync():
     unloaded_any = False
+    if (
+        runtime.decision_queue is not None
+        and not runtime.decision_queue.is_worker_thread()
+    ):
+        runtime.decision_queue.stop_and_join()
+        runtime.decision_queue = None
+        unloaded_any = True
     if runtime.audio_queue is not None:
         is_audio_worker = getattr(
             runtime.audio_queue, "is_worker_thread", lambda: False
