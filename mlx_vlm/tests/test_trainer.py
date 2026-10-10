@@ -464,7 +464,12 @@ def test_trainer_public_exports():
         is PreferenceVisionDataset
     )
     assert trainer.TrainingArgs is vlm.TrainingArgs is TrainingArgs
-    assert trainer.ORPOTrainingArgs is vlm.ORPOTrainingArgs is ORPOTrainingArgs
+    from mlx_vlm.trainer.vlm.orpo.config import (
+        ORPOTrainingArgs as NotebookORPOTrainingArgs,
+    )
+
+    assert trainer.ORPOTrainingArgs is vlm.ORPOTrainingArgs is NotebookORPOTrainingArgs
+    assert vlm.LegacyORPOTrainingArgs is ORPOTrainingArgs
     assert trainer.train is vlm.train is train
     assert trainer.train_orpo is vlm.train_orpo is train_orpo
     assert trainer.get_peft_model is get_peft_model

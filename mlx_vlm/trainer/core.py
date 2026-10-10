@@ -1,8 +1,7 @@
 """Shared trainer primitives that are independent of task and modality.
 
-Keep generic configuration helpers, parameter utilities, and adapter persistence
-here. The optimization lifecycle belongs in ``runner.py`` and distributed
-coordination belongs in ``distributed.py``.
+These primitives preserve the functional SFT/ORPO recipes. The notebook API's
+configuration, model preparation, and optimization lifecycle live in ``common``.
 """
 
 import json

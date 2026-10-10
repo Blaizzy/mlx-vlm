@@ -35,6 +35,7 @@ Issues = "https://github.com/Blaizzy/mlx-vlm/issues"
 "mlx_vlm.generate" = "mlx_vlm.generate:main"
 "mlx_vlm.moe_offload" = "mlx_vlm.moe_offload:main"
 "mlx_vlm.server" = "mlx_vlm.server:main"
+"mlx_vlm.train" = "mlx_vlm.train:main"
 
 [tool.setuptools.packages.find]
 include = ["mlx_vlm*"]
@@ -52,5 +53,5 @@ test = ["pytest", "httpx2>=2.0.0,<3", "starlette>=1.2.1"]
 ui = ["gradio>=5.19.0"]
 cuda = ["mlx-cuda"]
 cpu = ["mlx-cpu"]
-train = ["datasets>=2.19.1"]
+train = ["datasets>=2.19.1", "PyYAML>=6.0"]
 realtime = ["sounddevice>=0.5.0"]
