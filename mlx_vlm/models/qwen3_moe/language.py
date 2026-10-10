@@ -9,6 +9,7 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..mlp import SwiGLUMLP as MLP
+from ..rope_utils import initialize_rope
 from ..switch_layers import SwitchGLU
 from .config import ModelConfig
 
@@ -35,10 +36,12 @@ class Attention(nn.Module):
         self.q_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
         self.k_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
 
-        self.rope = nn.RoPE(
-            head_dim,
-            traditional=False,
+        self.rope = initialize_rope(
+            dims=head_dim,
             base=args.rope_theta,
+            traditional=False,
+            scaling_config=args.rope_scaling,
+            max_position_embeddings=args.max_position_embeddings,
         )
 
     def __call__(
@@ -96,6 +99,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         k = self.top_k
         inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+        inds = mx.stop_gradient(inds)
         scores = mx.take_along_axis(gates, inds, axis=-1)
         if self.norm_topk_prob:
             scores /= mx.sum(scores, axis=-1, keepdims=True)

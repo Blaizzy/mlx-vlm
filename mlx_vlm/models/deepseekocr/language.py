@@ -319,6 +319,7 @@ class MoEGate(nn.Module):
             flat_scores = scores
             k = self.top_k
             inds = mx.argpartition(flat_scores, kth=-k, axis=-1)[..., -k:]
+            inds = mx.stop_gradient(inds)
             scores_selected = mx.take_along_axis(flat_scores, inds, axis=-1)
 
         elif self.topk_method == "noaux_tc":
@@ -468,7 +469,8 @@ class DeepseekV2Model(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        mask = create_attention_mask(h, cache[0])
+        if mask is None:
+            mask = create_attention_mask(h, cache[0])
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)

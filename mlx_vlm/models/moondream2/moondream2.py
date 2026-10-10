@@ -4,6 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import InputEmbeddingsFeatures
+from . import processing_moondream2  # noqa: F401
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
@@ -73,7 +74,9 @@ class Model(nn.Module):
 
         prefix_len = 1 + num_vision_tokens
         seq_len = final_embeds.shape[1]
-        attention_mask_4d = self._create_prefix_attention_mask(seq_len, prefix_len)
+        attention_mask_4d = self._create_prefix_attention_mask(
+            seq_len, prefix_len, dtype
+        )
 
         return InputEmbeddingsFeatures(
             inputs_embeds=final_embeds,
@@ -81,9 +84,9 @@ class Model(nn.Module):
         )
 
     def _create_prefix_attention_mask(
-        self, seq_len: int, prefix_len: int
+        self, seq_len: int, prefix_len: int, dtype: mx.Dtype = mx.float32
     ) -> Optional[mx.array]:
-        causal = mx.triu(mx.full((seq_len, seq_len), -mx.inf), k=1)
+        causal = mx.triu(mx.full((seq_len, seq_len), -mx.inf, dtype=dtype), k=1)
         causal[:prefix_len, :prefix_len] = 0.0
         return causal.reshape(1, 1, seq_len, seq_len)
 
@@ -91,48 +94,23 @@ class Model(nn.Module):
         sanitized = {}
 
         for k, v in weights.items():
-            new_key = k
-
-            if "position_ids" in new_key:
+            if "position_ids" in k or k.startswith("model.region."):
                 continue
 
-            if new_key.startswith("region_model."):
-                continue
-
-            if new_key.startswith("vision_encoder.encoder.model.visual."):
-                new_key = (
-                    "vision.encoder."
-                    + new_key[len("vision_encoder.encoder.model.visual.") :]
-                )
-                new_key = new_key.replace("patch_embed.linear.", "patch_emb.")
-                new_key = new_key.replace("pos_embed", "pos_emb")
-                new_key = new_key.replace(".norm1.", ".ln1.")
-                new_key = new_key.replace(".norm2.", ".ln2.")
-                new_key = new_key.replace("norm.", "post_ln.")
-
-            elif new_key.startswith("vision_encoder.projection.mlp."):
-                new_key = (
-                    "vision.proj_mlp."
-                    + new_key[len("vision_encoder.projection.mlp.") :]
-                )
-
-            elif new_key == "text_model.transformer.embd.wte.weight":
+            if k == "model.text.wte":
                 new_key = "text.model.embed_tokens.weight"
-
-            elif new_key.startswith("text_model.transformer.h."):
-                new_key = (
-                    "text.model.layers." + new_key[len("text_model.transformer.h.") :]
-                )
-                new_key = new_key.replace(".mixer.Wqkv.", ".attn.qkv.")
-                new_key = new_key.replace(".mixer.out_proj.", ".attn.proj.")
-
-            elif new_key.startswith("text_model.lm_head.ln."):
-                new_key = (
-                    "text.model.post_ln." + new_key[len("text_model.lm_head.ln.") :]
-                )
-
-            elif new_key.startswith("text_model.lm_head.linear."):
-                new_key = "text.lm_head." + new_key[len("text_model.lm_head.linear.") :]
+            elif k.startswith("model.text.blocks."):
+                new_key = "text.model.layers." + k[len("model.text.blocks.") :]
+            elif k.startswith("model.text.post_ln."):
+                new_key = "text.model.post_ln." + k[len("model.text.post_ln.") :]
+            elif k.startswith("model.text.lm_head."):
+                new_key = "text.lm_head." + k[len("model.text.lm_head.") :]
+            elif k.startswith("model.vision.proj_mlp."):
+                new_key = "vision.proj_mlp." + k[len("model.vision.proj_mlp.") :]
+            elif k.startswith("model.vision."):
+                new_key = "vision.encoder." + k[len("model.vision.") :]
+            else:
+                new_key = k
 
             sanitized[new_key] = v
 

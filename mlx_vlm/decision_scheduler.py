@@ -5,14 +5,77 @@ from collections import deque
 from concurrent.futures import Future, InvalidStateError
 from dataclasses import dataclass, field
 from threading import BoundedSemaphore, Event, Thread, current_thread
+from types import SimpleNamespace
 
-from .decision import decision_probabilities, format_response, prepare_request
-from .models.clef.inference import (
-    DecisionCancelled,
-    DecisionEngine,
-    check_cancelled,
-    context_limit,
-)
+from ._stream_cleanup import clear_mlx_streams
+from .decision import DecisionCancelled, check_cancelled, normalize_questions
+
+
+class PredictionEngine:
+    """Fallback for models that expose predict but no incremental engine.
+
+    Cancellation is checked around each model call; a running call cannot be
+    interrupted unless the model supplies an incremental decision engine.
+    """
+
+    def __init__(self, model, processor, *, max_length=None, **kwargs):
+        self.model, self.processor, self.max_length = model, processor, max_length
+
+    def prepare(self, request, *, namespace=None, cancelled=None):
+        cancelled = cancelled if cancelled is not None else Event()
+        check_cancelled(cancelled)
+        return SimpleNamespace(
+            request=request,
+            cancelled=cancelled,
+            offset=0,
+            done=False,
+            cached_tokens=0,
+            result=None,
+            error=None,
+        )
+
+    def step(self, states):
+        for state in states:
+            if state.cancelled.is_set():
+                continue
+            body = state.request
+            kwargs = {
+                k: v
+                for k, v in body.items()
+                if k not in ("model", "state", "questions")
+            }
+            if self.max_length is not None:
+                kwargs["max_length"] = self.max_length
+            try:
+                state.result = self.model.predict(
+                    self.processor, body.get("state"), body["questions"], **kwargs
+                )
+            except Exception as error:
+                state.error = error
+            state.done = True
+            state.offset = 1
+
+    def finish(self, state):
+        check_cancelled(state.cancelled)
+        if not state.done:
+            raise ValueError("Cannot finish an incomplete decision")
+        if state.error is not None:
+            raise state.error
+        return {"response": state.result, "probabilities": None, "cached_tokens": 0}
+
+
+def make_decision_engine(model, processor, **settings):
+    """Select a model-owned incremental backend or ordinary prediction.
+
+    Backends implement prepare(request, namespace, cancelled), step(states), and
+    finish(state). States expose offset/done for admission between bounded steps;
+    finish returns a native response, optional unrounded probabilities by question
+    and label, and cached_tokens. This scheduler never accesses model internals.
+    """
+    factory = getattr(model, "make_decision_engine", None)
+    if factory is not None:
+        return factory(processor, **settings)
+    return PredictionEngine(model, processor, **settings)
 
 
 class DecisionQueueFull(Exception):
@@ -23,6 +86,7 @@ class DecisionQueueFull(Exception):
 class DecisionJob:
     request: dict
     namespace: object = None
+    allow_single_criterion: bool = False
     future: Future = field(default_factory=Future)
     cancelled: Event = field(default_factory=Event)
 
@@ -72,15 +136,15 @@ class DecisionScheduler:
         self.stopping = Event()
         self.engine = None
         self.active_count = self.pending_count = 0
-        self.worker = Thread(target=self._run, name="clef-inference", daemon=True)
+        self.worker = Thread(target=self._run, name="decision-inference", daemon=True)
         self.worker.start()
 
-    def submit(self, request, *, namespace=None):
+    def submit(self, request, *, namespace=None, allow_single_criterion=False):
         if self.stopping.is_set():
             raise DecisionCancelled("Decision scheduler stopped")
         if not self.slots.acquire(blocking=False):
             raise DecisionQueueFull("Decision request queue is full")
-        job = DecisionJob(request, namespace)
+        job = DecisionJob(request, namespace, allow_single_criterion)
         job.future.add_done_callback(lambda future: self.slots.release())
         try:
             self.queue.put_nowait(job)
@@ -146,8 +210,10 @@ class DecisionScheduler:
                         current_model = None
                         try:
                             model, processor, config = self.loader(name)
-                            self.engine = DecisionEngine(
+                            self.engine = make_decision_engine(
                                 model,
+                                processor,
+                                max_length=self.max_length,
                                 prefill_step_size=self.prefill_step_size,
                                 cache_bytes=self.cache_bytes,
                             )
@@ -169,21 +235,29 @@ class DecisionScheduler:
                         continue
                     try:
                         check_cancelled(self.stopping)
-                        limit = context_limit(config, self.max_length)
-                        body, encoded = prepare_request(
-                            processor,
-                            job.request,
-                            limit,
-                            lambda: check_cancelled(job.cancelled),
+                        body = dict(job.request)
+                        questions, media = normalize_questions(
+                            self.engine.model,
+                            body["questions"],
+                            allow_single_criterion=job.allow_single_criterion,
+                            **{
+                                k: v
+                                for k, v in body.items()
+                                if k not in ("model", "state", "questions")
+                            },
                         )
+                        body = {
+                            "model": body["model"],
+                            "state": body.get("state"),
+                            "questions": questions,
+                            **media,
+                        }
                         state = self.engine.prepare(
-                            encoded, namespace=job.namespace, cancelled=job.cancelled
+                            body, namespace=job.namespace, cancelled=job.cancelled
                         )
                         active.append((job, body, state))
                     except Exception as exc:
                         _complete(job, error=exc)
-                    finally:
-                        encoded = None
                 self._active_jobs = tuple(item[0] for item in active)
                 self.active_count, self.pending_count = len(active), len(pending)
                 if not active:
@@ -206,19 +280,9 @@ class DecisionScheduler:
                         active.append((job, body, state))
                         continue
                     try:
-                        probabilities = decision_probabilities(
-                            self.engine.finish(state)
-                        )
-                        _complete(
-                            job,
-                            result={
-                                "response": format_response(
-                                    body, state.record, probabilities
-                                ),
-                                "probabilities": probabilities,
-                                "cached_tokens": state.cached_tokens,
-                            },
-                        )
+                        output = self.engine.finish(state)
+                        output["response"]["model"] = body["model"]
+                        _complete(job, result=output)
                     except Exception as exc:
                         _complete(job, error=exc)
                 # Do not retain the last completed request's full hidden/KV
@@ -240,4 +304,5 @@ class DecisionScheduler:
                     break
             self._active_jobs = ()
             self.engine = None
+            clear_mlx_streams()
             self.active_count = self.pending_count = 0

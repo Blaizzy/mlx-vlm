@@ -10,6 +10,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException
 
+from ..prompt_utils import _normalize_tool_message
+from ..tools import process_tool_calls
+
 logger = logging.getLogger("mlx_vlm.server")
 
 RESPONSE_STORE_LIMIT = int(os.environ.get("MLX_VLM_RESPONSE_STORE_LIMIT", "1024"))
@@ -59,6 +62,9 @@ class ThinkingStreamState:
         self.close_markers = tuple(marker for _, marker in self.open_close_markers)
         self.in_thinking = bool(enable_thinking)
         self.thinking_done = False
+        # Newlines right after the close marker are dropped, even when they
+        # arrive in later chunks than the marker itself.
+        self.strip_leading_newlines = False
         self.buffer = ""
 
     def feed(self, text: str, last: bool = False) -> ThinkingStreamDelta:
@@ -83,13 +89,19 @@ class ThinkingStreamState:
                 if before:
                     reasoning.append(before)
 
-                self.buffer = self.buffer[idx + len(marker) :].lstrip("\n")
+                self.buffer = self.buffer[idx + len(marker) :]
                 self.in_thinking = False
                 self.thinking_done = True
+                self.strip_leading_newlines = True
                 thinking_closed = True
                 continue
 
             if self.thinking_done:
+                if self.strip_leading_newlines:
+                    self.buffer = self.buffer.lstrip("\n")
+                    if not self.buffer:
+                        break
+                    self.strip_leading_newlines = False
                 emit, self.buffer = self._split_partial(self.buffer, _CONTENT_MARKERS)
                 emit = _strip_content_markers(emit)
                 if emit:
@@ -264,74 +276,164 @@ response_store_order: deque = deque()
 response_store_lock = Lock()
 
 
-def suppress_tool_call_content(
-    full_output: str,
-    in_tool_call: bool,
-    tc_start: Optional[str],
-    delta_content: Optional[str],
-) -> Tuple[bool, Optional[str]]:
-    """Suppress tool-call markup from streamed delta.content."""
-    if not tc_start:
-        return in_tool_call, delta_content
-    if not in_tool_call:
-        if tc_start in full_output:
-            return True, None
+class ToolCallStreamState:
+    """Remove tool-call spans from streamed content, independent of chunking.
 
-        if any(full_output.endswith(tc_start[:j]) for j in range(2, len(tc_start))):
-            return False, None
-    else:
-        return True, None
-    return in_tool_call, delta_content
+    Streamed content matches what the non-streamed response returns:
+    ``process_tool_calls`` removes closed calls, and the content is stripped.
+    Marker fragments are buffered until they either complete or stop matching.
+    Text outside calls is emitted exactly once; a closed call is discarded. A
+    parser with no end marker ends a call at the next newline, as the extractor
+    does. A call still open when generation ends is not a call to the
+    extractor, so its text is emitted then. Whitespace leading the content is
+    dropped, and trailing whitespace is held until more text follows.
+    """
+
+    def __init__(
+        self,
+        tc_start: Optional[str],
+        tc_end: Optional[str],
+    ):
+        self.tc_start = tc_start or ""
+        self.tc_end = tc_end or ""
+        self.in_tool_call = False
+        self.buffer = ""
+        self.call_text = ""
+        self.pending_space = ""
+        self.shown_text = False
+        self.closed_call = False
+        self.finished = False
+
+    def feed(self, text: Optional[str], last: bool = False) -> Optional[str]:
+        if not self.tc_start:
+            self.finished = self.finished or last
+            return text
+
+        self.buffer += text or ""
+        visible = []
+
+        while self.buffer:
+            if self.in_tool_call:
+                marker = self.tc_end or "\n"
+            else:
+                marker = self.tc_start
+
+            marker_at = self.buffer.find(marker)
+            if marker_at >= 0:
+                if self.in_tool_call:
+                    # process_tool_calls replaces each call with a space.
+                    self.call_text = ""
+                    self.pending_space += " "
+                    self.closed_call = True
+                else:
+                    self._show(self.buffer[:marker_at], visible)
+                    self.call_text = marker
+                self.buffer = self.buffer[marker_at + len(marker) :]
+                self.in_tool_call = not self.in_tool_call
+                continue
+
+            stable, self.buffer = self._split_partial_marker(self.buffer, marker)
+            if self.in_tool_call:
+                if self.tc_end:
+                    # Kept only to be emitted if the call never closes; with no
+                    # end marker the extractor always ends it, so keep nothing.
+                    self.call_text += stable
+            else:
+                self._show(stable, visible)
+            break
+
+        if last:
+            if self.in_tool_call:
+                if self.tc_end:
+                    # No end marker arrived, so the extractor finds no call and
+                    # keeps this text as content. Beside a parsed call the
+                    # non-streamed response strips its marker.
+                    text = self.call_text + self.buffer
+                    if self.closed_call and _is_whole_tag(self.tc_start):
+                        text = text.removeprefix(self.tc_start)
+                    self._show(text, visible)
+            elif self.buffer:
+                # An unfinished start-marker prefix is ordinary content when
+                # generation ends before the marker can complete.
+                self._show(self.buffer, visible)
+            self.buffer = ""
+            self.call_text = ""
+            self.pending_space = ""
+            self.finished = True
+
+        return "".join(visible) or None
+
+    def finish(self) -> Optional[str]:
+        """Flush held text when the stream ended without a finish token."""
+        if self.finished:
+            return None
+        return self.feed(None, last=True)
+
+    def _show(self, text: str, visible: list) -> None:
+        text = self.pending_space + text
+        if not self.shown_text:
+            text = text.lstrip()
+        body = text.rstrip()
+        self.pending_space = text[len(body) :]
+        if body:
+            self.shown_text = True
+            visible.append(body)
+
+    @staticmethod
+    def _split_partial_marker(text: str, marker: str) -> Tuple[str, str]:
+        max_length = min(len(text), len(marker) - 1)
+        for length in range(max_length, 0, -1):
+            if text.endswith(marker[:length]):
+                return text[:-length], text[-length:]
+        return text, ""
 
 
-def process_tool_calls(model_output: str, tool_module, tools):
-    """Parse tool calls from model output using the appropriate tool parser."""
-    called_tools = []
-    remaining = model_output
+def _is_whole_tag(marker: str) -> bool:
+    """Whether ``marker`` is a complete tag, never a prefix of ordinary text.
 
-    if tool_module.tool_call_start in model_output:
-        if tool_module.tool_call_end == "":
-            pattern = re.compile(
-                f"{re.escape(tool_module.tool_call_start)}.*?(?:\n|$)", re.DOTALL
-            )
-        else:
-            pattern = re.compile(
-                f"{re.escape(tool_module.tool_call_start)}.*?{re.escape(tool_module.tool_call_end)}",
-                re.DOTALL,
-            )
+    MiniCPM5 starts a call with the bare prefix ``<function``, which prose can
+    contain; only markers such as ``<tool_call>`` or ``[TOOL_CALLS]`` are safe
+    to remove on sight.
+    """
+    return bool(re.fullmatch(r"<[^<>]+>|\[[^\[\]]+\]", marker))
 
-        matches = re.findall(pattern, model_output)
-        if matches:
-            remaining = re.sub(pattern, " ", model_output).strip()
-            for match in matches:
-                call = (
-                    match.strip()
-                    .removeprefix(tool_module.tool_call_start)
-                    .removesuffix(tool_module.tool_call_end)
-                )
-                try:
-                    parsed = tool_module.parse_tool_call(call, tools)
-                    parsed_calls = parsed if isinstance(parsed, list) else [parsed]
-                    for tool_call in parsed_calls:
-                        args = tool_call["arguments"]
-                        called_tools.append(
-                            {
-                                "type": "function",
-                                "index": len(called_tools),
-                                "id": str(uuid.uuid4()),
-                                "function": {
-                                    "name": tool_call["name"].strip(),
-                                    "arguments": (
-                                        args
-                                        if isinstance(args, str)
-                                        else json.dumps(args, ensure_ascii=False)
-                                    ),
-                                },
-                            },
-                        )
-                except Exception:
-                    logger.warning("Invalid tool call: %s", call)
-    return dict(calls=called_tools, remaining_text=remaining)
+
+def strip_protocol_markers(
+    text: str,
+    tool_module: Any,
+    thinking_start_token: Optional[str] = None,
+    thinking_end_token: Optional[str] = None,
+) -> str:
+    """Remove protocol residue left beside a parsed tool call.
+
+    Drops ``<|...|>`` control tokens (a model can run past its end token), the
+    parser's own call markers, and thinking markers, when they are whole tags.
+    Other ``<...>`` text, such as ``<b>``, is content the model wrote and is
+    kept.
+    """
+    text = re.sub(r"<\|[^>]+\|>", "", text)
+    markers = [tool_module.tool_call_start, tool_module.tool_call_end]
+    for pair in ThinkingStreamState._build_open_close_markers(
+        thinking_start_token, thinking_end_token
+    ):
+        markers.extend(pair)
+    for marker in sorted(filter(_is_whole_tag, markers), key=len, reverse=True):
+        text = text.replace(marker, "")
+    return text.strip()
+
+
+def finish_content_streams(thinking_state, tool_call_state):
+    """``(reasoning, content)`` still held when a stream ends.
+
+    Callers finalize both states on a token with a finish reason; a token
+    iterator can also just stop. The states are fed the same ``last`` flag, so
+    once the tool-call state is finished both are, and nothing is fed again (a
+    tokenizer response parser refuses a second finalization).
+    """
+    if tool_call_state.finished:
+        return None, None
+    delta = thinking_state.feed("", last=True)
+    return delta.reasoning, tool_call_state.feed(delta.content, last=True)
 
 
 def _as_plain_dict(value):
@@ -357,7 +459,7 @@ def _sse_event(event_type: str, payload: Dict[str, Any]) -> str:
 def _clean_reasoning(reasoning: str, start_marker: str) -> str:
     reasoning = reasoning.replace(start_marker, "")
     if start_marker == "<|channel>thought":
-        reasoning = reasoning.lstrip("thought")
+        reasoning = reasoning.removeprefix("thought")
     return reasoning.strip()
 
 
@@ -431,27 +533,34 @@ def _response_output_items_from_text(
     thinking_end_token: Optional[str] = None,
     reasoning_item_id: Optional[str] = None,
     processor=None,
+    starts_in_thinking: bool = False,
 ) -> Tuple[List[Dict[str, Any]], str, Optional[str], str]:
     reasoning, content = _split_thinking(
         full_text,
         thinking_start_token,
         thinking_end_token,
+        starts_in_thinking=starts_in_thinking,
         processor=processor,
     )
     reasoning_items = _reasoning_output_items(reasoning, reasoning_item_id)
     if tool_module is not None and chat_tools:
         tc = process_tool_calls(full_text, tool_module, chat_tools)
-        if tc["calls"]:
+        if tc.calls:
             items = [
-                _tool_call_to_response_item(call, tool_registry) for call in tc["calls"]
+                _tool_call_to_response_item(call, tool_registry) for call in tc.calls
             ]
             _, remaining = _split_thinking(
-                tc.get("remaining_text") or "",
+                tc.remaining_text or "",
                 thinking_start_token,
                 thinking_end_token,
+                starts_in_thinking=starts_in_thinking,
             )
-            remaining = re.sub(r"<\|[^>]+\|>|<[^>]+>", "", remaining).strip()
+            remaining = strip_protocol_markers(
+                remaining, tool_module, thinking_start_token, thinking_end_token
+            )
             return reasoning_items + items, remaining, reasoning, "tool_calls"
+    if not content:
+        return reasoning_items, content, reasoning, "stop"
     item = {
         "id": message_id,
         "type": "message",
@@ -593,6 +702,16 @@ def _append_response_item_to_prompt(
     item_type = item.get("type")
     if item_type == "message":
         role = item.get("role") or "user"
+        message = {"role": role}
+        for field in ("tool_calls", "tool_call_id", "name"):
+            if item.get(field) is not None:
+                message[field] = item[field]
+        reasoning = item.get("reasoning_content")
+        if reasoning is None:
+            reasoning = item.get("reasoning")
+        if reasoning is not None:
+            message["reasoning_content"] = reasoning
+            message["reasoning"] = reasoning
         content = item.get("content")
         if isinstance(content, list):
             content_parts = []
@@ -616,7 +735,14 @@ def _append_response_item_to_prompt(
                 text = "\n".join(
                     part["text"] for part in content_parts if part.get("type") == "text"
                 )
-                chat_messages.append({"role": role, "content": text})
+                message["content"] = text
+                if (
+                    role != "assistant"
+                    or text
+                    or reasoning
+                    or message.get("tool_calls")
+                ):
+                    chat_messages.append(_normalize_tool_message(message))
                 chat_messages.append(_response_image_message(len(item_images)))
                 return
             if item_images:
@@ -625,16 +751,23 @@ def _append_response_item_to_prompt(
                 content = "\n".join(
                     part["text"] for part in content_parts if part.get("type") == "text"
                 )
-        chat_messages.append({"role": role, "content": content or ""})
+        message["content"] = content or ""
+        if role == "assistant" and not (
+            content or reasoning or message.get("tool_calls")
+        ):
+            return
+        chat_messages.append(_normalize_tool_message(message))
         return
 
     if item_type in ("function_call", "shell_call", "apply_patch_call"):
         chat_messages.append(
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [_response_call_to_chat_tool_call(item)],
-            }
+            _normalize_tool_message(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_response_call_to_chat_tool_call(item)],
+                }
+            )
         )
         return
 
@@ -676,7 +809,16 @@ def _response_chain_items(previous_response_id: Optional[str]) -> List[Dict[str,
                     detail=f"Previous response not found: {current_id}",
                 )
             chain.append(stored)
-            current_id = stored.previous_response_id
+            # A self-contained compaction boundary no longer needs its older
+            # response chain, which may already have been evicted from the store.
+            current_id = (
+                None
+                if any(
+                    item.get("type") == "compaction"
+                    for item in stored.input_items + stored.output_items
+                )
+                else stored.previous_response_id
+            )
 
     items: List[Dict[str, Any]] = []
     for stored in reversed(chain):

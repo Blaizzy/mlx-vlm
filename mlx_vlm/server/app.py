@@ -6,21 +6,25 @@ import secrets
 import sys
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from threading import Lock
 from types import SimpleNamespace
-from typing import List, Optional, Tuple
+from typing import Annotated, List, Literal, Optional, Tuple
 
 import mlx.core as mx
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from huggingface_hub import scan_cache_dir
 from huggingface_hub.errors import CacheNotFound, RepositoryNotFoundError
+from starlette.requests import HTTPConnection
 
 from .. import apc as _apc
 from ..generate.edit_image import load_image_edit_model
 from ..generate.image import is_image_generation_model, load_image_generation_model
+from ..generate.image_defaults import ImageSamplingDefaults, resolve_image_defaults
+from ..reranker import RerankerKind, reranker_kind
 from ..structured import build_json_schema_logits_processor
-from ..tool_parsers import _infer_tool_parser_from_processor
+from ..tools import _infer_tool_parser_from_processor
 from ..version import __version__
 from ..vision_cache import VisionFeatureCache
 from . import request_normalization as _request_normalization
@@ -43,7 +47,11 @@ from .generation import (
     get_quantized_kv_start,
     get_top_logprobs_k,
 )
+from .model_discovery import MODEL_PATHS_ENV, discover_models
 from .openai import register_routes as register_openai_routes
+from .realtime import register_routes as register_realtime_routes
+from .reranking import ensure_chat_template as ensure_reranker_chat_template
+from .reranking import register_routes as register_reranking_routes
 from .responses_state import _split_thinking as _split_thinking_text
 from .runtime import ModelCacheRegistry, runtime
 from .schemas import ChatLogprobContent, ModelsResponse, TopLogprob
@@ -62,7 +70,7 @@ def _server_api_key() -> Optional[str]:
     return key if key else None
 
 
-def _require_management_api_key(request: Request) -> None:
+def _require_management_api_key(request: HTTPConnection) -> None:
     api_key = _server_api_key()
     if api_key is None:
         return
@@ -79,21 +87,32 @@ def _require_management_api_key(request: Request) -> None:
 
 def _cache_group_for_cache(cache: dict) -> str:
     model_kind = cache.get("model_kind")
-    if model_kind == "image_generation":
-        return "image_generation"
-    if model_kind == "image_edit":
-        return "image_edit"
     if model_kind == "audio_tts":
         return "tts"
     if model_kind == "audio_stt":
         return "stt"
-    if model_kind == "audio":
-        return "audio"
-    if model_kind == "embedding":
-        return "embedding"
-    if model_kind == "decision":
-        return "decision"
-    return "text_generation"
+    return model_kind or "text_generation"
+
+
+def _model_info(model_id: str, created: int, *, loaded: bool = False) -> dict:
+    model_id = str(model_id)
+    return {
+        "id": model_id,
+        "object": "model",
+        "created": created,
+        "loaded": loaded,
+    }
+
+
+def _served_model_entries() -> list[dict]:
+    created = int(time.time())
+    models = {}
+    for _, cache in _model_cache_registry().items():
+        model_id = cache.get("model_path")
+        if not model_id:
+            continue
+        models[model_id] = _model_info(model_id, created, loaded=True)
+    return list(models.values())
 
 
 def _model_cache_registry() -> ModelCacheRegistry:
@@ -186,12 +205,15 @@ def _build_gen_args(
 def _read_tenant_id(http_request) -> Optional[str]:
     """Pull a per-tenant APC salt from the request headers.
 
-    Honoured headers (in order): ``X-APC-Tenant``, ``X-Tenant-Id``.
+    Honoured headers (in order): ``X-APC-Tenant``, ``X-Tenant-Id``. Falls back to
+    ``APC_DEFAULT_TENANT`` so a single-tenant deployment shares one cache without
+    every client sending a header.
     """
+    default = os.environ.get("APC_DEFAULT_TENANT") or None
     if http_request is None or not hasattr(http_request, "headers"):
-        return None
+        return default
     h = http_request.headers
-    return h.get("x-apc-tenant") or h.get("x-tenant-id") or None
+    return h.get("x-apc-tenant") or h.get("x-tenant-id") or default
 
 
 async def _preflight_stream_context_budget(
@@ -343,9 +365,43 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+def _reject_native_chat_model_for_audio(model_path: str) -> None:
+    """Reject chat/multimodal checkpoints pointed at the ``/v1/audio/*`` endpoints.
+
+    ``mlx_audio``'s loader autodetects an audio category partly from repo-name tokens
+    (its tts/stt models are named after backbones like ``qwen3``/``llama``/``glm``), so a
+    chat/omni model such as Qwen3-Omni is misrouted into a flat audio config and dies with
+    an opaque ``TypeError`` that surfaces as a 500. Gate on the config ``model_type`` instead:
+    if it resolves to one of mlx-vlm's own model families and ``mlx_audio`` does not recognize
+    the type as a genuine audio model, raise ``ValueError`` so the caller maps it to a 400.
+    """
+    from mlx_audio.utils import get_model_category
+
+    from ..utils import get_model_and_args, get_model_path, load_config
+
+    config = load_config(get_model_path(model_path, allow_patterns=["*.json"]))
+
+    raw_type = (config.get("model_type") or "").lower()
+    if raw_type and get_model_category(raw_type, [raw_type]):
+        return
+
+    try:
+        _, model_type = get_model_and_args(config)
+    except Exception:
+        return
+
+    raise ValueError(
+        f"{model_path!r} is a chat/multimodal model that mlx-vlm serves natively "
+        f"(model_type={model_type!r}); the /v1/audio/* endpoints only support dedicated "
+        "speech-to-text/text-to-speech checkpoints. To use audio with this model, send "
+        "POST /v1/chat/completions with an 'input_audio' content part."
+    )
+
+
 def load_audio_model(model_path: str):
     from mlx_audio.utils import load_model
 
+    _reject_native_chat_model_for_audio(model_path)
     return load_model(model_path)
 
 
@@ -363,12 +419,6 @@ async def lifespan(app):
         logger.info("Language model ready, continuous batching enabled.")
 
     preload_models = (
-        (
-            os.environ.pop("MLX_VLM_PRELOAD_DECISION_MODEL", None),
-            None,
-            "decision",
-            "decision model",
-        ),
         (
             os.environ.pop("MLX_VLM_PRELOAD_IMAGE_MODEL", None),
             None,
@@ -392,6 +442,18 @@ async def lifespan(app):
             None,
             "embedding",
             "embedding model",
+        ),
+        (
+            os.environ.pop("MLX_VLM_PRELOAD_RERANKER_MODEL", None),
+            None,
+            "reranker",
+            "reranker model",
+        ),
+        (
+            os.environ.pop("MLX_VLM_PRELOAD_DECISION_MODEL", None),
+            None,
+            "decision",
+            "decision model",
         ),
     )
     runtime.preload_failures.clear()
@@ -429,6 +491,9 @@ async def lifespan(app):
         if runtime.audio_queue is not None:
             runtime.audio_queue.stop_and_join()
             runtime.audio_queue = None
+        if runtime.realtime_engine is not None:
+            runtime.realtime_engine.stop_and_join()
+            runtime.realtime_engine = None
 
 
 app = FastAPI(
@@ -456,6 +521,13 @@ _INHERIT_ADAPTER = object()
 
 
 def _unload_model_cache_group(cache_group: str) -> bool:
+    if (
+        cache_group == "decision"
+        and runtime.decision_queue is not None
+        and not runtime.decision_queue.is_worker_thread()
+    ):
+        runtime.decision_queue.stop_and_join()
+        runtime.decision_queue = None
     registry = _model_cache_registry()
     cache = registry.for_kind(cache_group)
     if not cache:
@@ -468,6 +540,13 @@ def _unload_model_cache_group(cache_group: str) -> bool:
         cache.get("adapter_path"),
     )
 
+    apc_manager = cache.get("apc_manager")
+    if apc_manager is not None:
+        # APC entries own model-specific KV state. Invalidate them before the
+        # generation worker starts releasing the model so no stale entry can
+        # be observed during a concurrent unload/reload transition.
+        apc_manager.clear()
+
     response_generator = cache.get("response_generator")
     if response_generator is not None:
         logger.info("Stopping response generator.")
@@ -475,8 +554,10 @@ def _unload_model_cache_group(cache_group: str) -> bool:
         if runtime.response_generator is response_generator:
             runtime.response_generator = None
 
-    apc_manager = cache.get("apc_manager")
     if apc_manager is not None:
+        # A worker that was already draining may have completed an APC store
+        # after the first reset. Clear once more before publishing the cache
+        # group as unloaded.
         apc_manager.clear()
         if runtime.apc_manager is apc_manager:
             runtime.apc_manager = None
@@ -515,14 +596,12 @@ def get_cached_model(
     load_as_edit = model_kind == "image_edit"
     load_as_audio = _audio_model_kind(model_kind)
     load_as_embedding = model_kind == "embedding"
+    load_as_reranker = model_kind == "reranker"
     load_as_decision = model_kind == "decision"
     load_as_image = model_kind == "image_generation" or (
         model_kind == "auto" and is_image_generation_model(model_path)
     )
-    if load_as_decision:
-        cache_group = "decision"
-        effective_model_kind = "decision"
-    elif load_as_edit:
+    if load_as_edit:
         cache_group = "image_edit"
         effective_model_kind = "image_edit"
     elif load_as_audio:
@@ -531,6 +610,12 @@ def get_cached_model(
     elif load_as_embedding:
         cache_group = "embedding"
         effective_model_kind = "embedding"
+    elif load_as_reranker:
+        cache_group = "reranker"
+        effective_model_kind = "reranker"
+    elif load_as_decision:
+        cache_group = "decision"
+        effective_model_kind = "decision"
     elif load_as_image:
         cache_group = "image_generation"
         effective_model_kind = "image_generation"
@@ -544,7 +629,12 @@ def get_cached_model(
         cached = cached_cache.get("cache_key")
         adapter_path = cached[1] if cached and cached[0] == model_path else None
 
-    cache_key = (model_path, adapter_path, effective_model_kind)
+    cache_key = (
+        model_path,
+        adapter_path,
+        effective_model_kind,
+        runtime.config.fingerprint(kinds={effective_model_kind}),
+    )
     cached_cache = registry.for_kind(cache_group)
 
     # Return from cache if already loaded and matches the requested paths
@@ -677,39 +767,40 @@ def get_cached_model(
         return model, None, config
 
     if load_as_decision:
+        from ..utils import load
+
         if adapter_path is not None:
             raise HTTPException(
-                status_code=400,
-                detail="Adapters are not supported for decision models.",
+                status_code=400, detail="Decision adapters are not supported"
             )
-        from ..utils import get_model_path, load_config, load_model, load_processor
-
         try:
-            model_dir = get_model_path(model_path)
-            decision_config = load_config(model_dir)
-            if decision_config.get("model_type") != "clef":
-                raise ValueError(
-                    "Native decisions require a Clef checkpoint with its joint schema head"
-                )
-            model = load_model(model_dir)
-            processor = load_processor(model_dir, add_detokenizer=False)
-        except RepositoryNotFoundError as exc:
+            model, processor = load(model_path)
+            if not getattr(model, "decision_types", ()):
+                raise ValueError("This model does not support decision prediction")
+        except RepositoryNotFoundError as error:
             raise HTTPException(
                 status_code=404, detail=f"Model not found: {model_path}"
-            ) from exc
-        except (ValueError, FileNotFoundError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        cache = {
-            "cache_key": cache_key,
-            "model_path": model_path,
-            "adapter_path": None,
-            "model": model,
-            "processor": processor,
-            "config": model.config,
-            "model_kind": "decision",
-        }
-        registry.set(cache_group, cache)
-        return model, processor, model.config
+            ) from error
+        except (FileNotFoundError, ValueError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except Exception as error:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to load decision model: {error}"
+            ) from error
+        config = model.config
+        registry.set(
+            cache_group,
+            {
+                "cache_key": cache_key,
+                "model_path": model_path,
+                "adapter_path": None,
+                "model": model,
+                "processor": processor,
+                "config": config,
+                "model_kind": "decision",
+            },
+        )
+        return model, processor, config
 
     if load_as_embedding:
         if adapter_path is not None:
@@ -759,16 +850,86 @@ def get_cached_model(
         registry.set(cache_group, cache)
         return model, processor, config
 
-    vision_cache_size = int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20"))
+    if load_as_reranker:
+        if adapter_path is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Adapters are not supported for reranker models.",
+            )
+        logger.info("Loading reranker model: %s", model_path)
+        from ..reranker_loader import load_reranker
+
+        try:
+            model, processor = load_reranker(model_path)
+        except RepositoryNotFoundError as e:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"Model not found: {model_path!r} is not a known "
+                    "Hugging Face repo or local path"
+                ),
+            ) from e
+        except (FileNotFoundError, ValueError) as e:
+            raise HTTPException(
+                status_code=400, detail=f"Unsupported reranker model: {e}"
+            ) from e
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to load reranker model: {e}"
+            ) from e
+        config = model.config
+        try:
+            kind = reranker_kind(config)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=400,
+                detail=str(e),
+            ) from e
+        if kind != RerankerKind.SEQUENCE_CLASSIFIER:
+            try:
+                ensure_reranker_chat_template(processor, model_path)
+            except ValueError as e:
+                raise HTTPException(
+                    status_code=400, detail=f"Unsupported reranker model: {e}"
+                ) from e
+        cache = {
+            "cache_key": cache_key,
+            "model_path": model_path,
+            "adapter_path": None,
+            "model": model,
+            "processor": processor,
+            "config": config,
+            "model_kind": "reranker",
+        }
+        registry.set(cache_group, cache)
+        return model, processor, config
+
+    cfg = runtime.config
+    vision_cache_size = cfg.vision_cache_size
     vision_cache = VisionFeatureCache(max_size=vision_cache_size)
 
-    # KV cache quantization (uniform or TurboQuant)
-    kv_bits = get_quantized_kv_bits(model_path)
-    kv_key_bits, kv_value_bits = get_quantized_kv_split_bits()
-    kv_key_scheme, kv_value_scheme = get_kv_split_schemes()
-    kv_group_size = get_kv_group_size()
-    quantized_kv_start = get_quantized_kv_start()
-    kv_quant_scheme = get_kv_quant_scheme()
+    kv_bits = cfg.kv_bits if cfg.kv_bits is not None else get_quantized_kv_bits()
+    default_key_bits, default_value_bits = get_quantized_kv_split_bits()
+    kv_key_bits = cfg.kv_key_bits if cfg.kv_key_bits is not None else default_key_bits
+    kv_value_bits = (
+        cfg.kv_value_bits if cfg.kv_value_bits is not None else default_value_bits
+    )
+    default_key_scheme, default_value_scheme = get_kv_split_schemes()
+    kv_key_scheme = (
+        cfg.kv_key_scheme if cfg.kv_key_scheme is not None else default_key_scheme
+    )
+    kv_value_scheme = (
+        cfg.kv_value_scheme if cfg.kv_value_scheme is not None else default_value_scheme
+    )
+    kv_group_size = (
+        cfg.kv_group_size if cfg.kv_group_size is not None else get_kv_group_size()
+    )
+    quantized_kv_start = (
+        cfg.quantized_kv_start
+        if cfg.quantized_kv_start is not None
+        else get_quantized_kv_start()
+    )
+    kv_quant_scheme = cfg.kv_quant_scheme or get_kv_quant_scheme()
 
     runtime.apc_manager = _apc.from_env(
         model_namespace=_apc.apc_disk_namespace(
@@ -780,7 +941,8 @@ def get_cached_model(
             kv_group_size=kv_group_size,
             kv_quant_scheme=kv_quant_scheme,
             quantized_kv_start=quantized_kv_start,
-        )
+        ),
+        overrides=cfg.apc_overrides(),
     )
 
     response_generator = ResponseGenerator(
@@ -797,6 +959,8 @@ def get_cached_model(
         quantized_kv_start=quantized_kv_start,
         top_logprobs_k=get_top_logprobs_k(),
         apc_manager=runtime.apc_manager,
+        draft_model_path=cfg.spec_draft_model,
+        draft_kind=cfg.spec_draft_kind,
     )
     try:
         model, processor, config = response_generator.wait_until_ready()
@@ -850,6 +1014,15 @@ def unload_model_sync():
             runtime.audio_queue.stop_and_join()
             runtime.audio_queue = None
             unloaded_any = True
+    if runtime.realtime_engine is not None:
+        is_realtime_worker = getattr(
+            runtime.realtime_engine, "is_worker_thread", lambda: False
+        )
+        if not is_realtime_worker():
+            logger.info("Stopping realtime VoiceChat engine.")
+            runtime.realtime_engine.stop_and_join()
+            runtime.realtime_engine = None
+            unloaded_any = True
 
     registry = _model_cache_registry()
     for cache_group, _ in list(registry.items()):
@@ -894,8 +1067,10 @@ _protocol_deps = SimpleNamespace(
 register_anthropic_routes(inference_router, _protocol_deps)
 register_openai_routes(inference_router, _protocol_deps)
 register_audio_routes(inference_router, _protocol_deps)
-register_embeddings_routes(inference_router, _protocol_deps)
+register_realtime_routes(inference_router, _protocol_deps)
 register_decision_routes(inference_router, _protocol_deps)
+register_embeddings_routes(inference_router, _protocol_deps)
+register_reranking_routes(inference_router, _protocol_deps)
 
 
 @inference_router.get("/models", response_model=ModelsResponse)
@@ -904,55 +1079,65 @@ register_decision_routes(inference_router, _protocol_deps)
     response_model=ModelsResponse,
     include_in_schema=False,
 )
-def models_endpoint():
+def models_endpoint(
+    model_dir: Annotated[
+        Optional[List[str]],
+        Query(
+            description=(
+                "Additional model folder or parent containing model folders on the "
+                "server filesystem. Repeat for multiple paths. Applies only to this "
+                "request, in addition to the cache and configured model directories."
+            )
+        ),
+    ] = None,
+):
     """
-    Return list of locally downloaded MLX models.
+    Return cached and loaded models, indicating which are loaded in this process.
+
+    Inspect the shared cache, configured directories, and request-specific paths.
     """
+    models = {model["id"]: model for model in _served_model_entries()}
 
-    required_files = {"config.json", "tokenizer_config.json"}
-
-    def probably_mlx_lm(repo):
-        if repo.repo_type != "model":
-            return False
-        if "main" not in repo.refs:
-            return False
-        file_names = {f.file_path.name for f in repo.refs["main"].files}
-        has_weights = "model.safetensors.index.json" in file_names or any(
-            file_name.endswith(".safetensors") for file_name in file_names
-        )
-        return required_files.issubset(file_names) and has_weights
-
-    # Scan the cache directory for downloaded mlx models when it exists.
     try:
         hf_cache_info = _server_package_attr("scan_cache_dir", scan_cache_dir)()
-        downloaded_models = [
-            repo for repo in hf_cache_info.repos if probably_mlx_lm(repo)
-        ]
     except CacheNotFound:
-        downloaded_models = []
+        hf_cache_info = SimpleNamespace(repos=[])
 
-    # Create a list of available models
-    models = [
-        {"id": repo.repo_id, "object": "model", "created": int(repo.last_modified)}
-        for repo in downloaded_models
-    ]
-    loaded_models = {
-        cache.get("model_path")
-        for cache in _model_cache_registry().values()
-        if cache.get("model_path")
+    loaded_paths = set()
+    for model_id in models:
+        path = Path(model_id).expanduser()
+        try:
+            if path.is_dir():
+                loaded_paths.add(path.resolve())
+        except (OSError, RuntimeError):
+            continue
+    paths = [p for p in os.environ.get(MODEL_PATHS_ENV, "").split(os.pathsep) if p]
+    paths.extend(p for p in model_dir or [] if p)
+    for model in discover_models(hf_cache_info, paths):
+        if model["id"] not in models and model["path"] not in loaded_paths:
+            models[model["id"]] = _model_info(model["id"], model["created"])
+
+    return {
+        "object": "list",
+        "data": sorted(models.values(), key=lambda model: model["id"].lower()),
     }
-    loaded_model = _model_cache_registry().get("model_path")
-    if loaded_model:
-        loaded_models.add(loaded_model)
-    for loaded in sorted(loaded_models):
-        if all(model["id"] != loaded for model in models):
-            models.append(
-                {"id": loaded, "object": "model", "created": int(time.time())}
-            )
 
-    response = {"object": "list", "data": models}
 
-    return response
+@inference_router.get("/images/defaults", response_model=ImageSamplingDefaults)
+@inference_router.get(
+    "/v1/images/defaults", response_model=ImageSamplingDefaults, include_in_schema=False
+)
+def image_defaults_endpoint(
+    model: Annotated[str, Query(min_length=1)],
+    task: Literal["generate", "edit"] = "generate",
+):
+    """Resolve sampling defaults using metadata only, without loading weights."""
+    try:
+        return resolve_image_defaults(model, task=task)
+    except NotImplementedError as error:
+        raise HTTPException(status_code=501, detail=str(error)) from error
+    except (ValueError, FileNotFoundError) as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
 
 
 app.include_router(inference_router)
@@ -1018,6 +1203,67 @@ async def apc_cache_reset(request: Request):
         return {"enabled": False}
     runtime.apc_manager.clear()
     return {"enabled": True, "status": "cleared"}
+
+
+@app.get("/v1/moe-offload/stats")
+@app.get("/moe-offload/stats", include_in_schema=False)
+async def moe_offload_stats(request: Request):
+    """Report the loaded model's expert-offload eviction state (or
+    ``enabled=false`` for a normal, non-offloaded checkpoint)."""
+    _require_management_api_key(request)
+    model = getattr(runtime.response_generator, "model", None)
+    store = getattr(model, "moe_offload_store", None)
+    if store is None:
+        return {"enabled": False}
+    snap = store.stats()
+    snap["enabled"] = True
+    return snap
+
+
+def _settings_operation(payload: dict):
+    if "op" in payload or "values" in payload:
+        op = payload.get("op", "merge")
+        if op not in ("merge", "replace"):
+            raise HTTPException(status_code=400, detail=f"unsupported op {op!r}")
+        values = payload.get("values")
+        if not isinstance(values, dict):
+            raise HTTPException(status_code=400, detail="values must be a JSON object")
+        return op, values
+    return "merge", payload
+
+
+@app.get("/v1/settings")
+@app.get("/settings", include_in_schema=False)
+async def get_runtime_settings(request: Request):
+    _require_management_api_key(request)
+    cfg = runtime.config
+    return {
+        "schema": cfg.schema(),
+        "current": cfg.current(),
+        "fingerprint": cfg.fingerprint(),
+    }
+
+
+@app.patch("/v1/settings")
+@app.patch("/settings", include_in_schema=False)
+async def update_runtime_settings(request: Request):
+    _require_management_api_key(request)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="body must be a JSON object")
+    op, values = _settings_operation(payload)
+    before = runtime.config.current()
+    applied, rejected = runtime.config.apply_changes(values, op=op)
+    current = runtime.config.current()
+    changed = {name: value for name, value in current.items() if before[name] != value}
+    return {
+        "op": op,
+        "applied": applied,
+        "rejected": rejected,
+        "reload_kinds": sorted(runtime.config.reload_kinds(changed)),
+        "fingerprint": runtime.config.fingerprint(),
+        "current": current,
+    }
 
 
 @app.post("/unload")

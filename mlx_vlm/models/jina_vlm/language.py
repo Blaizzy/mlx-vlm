@@ -268,7 +268,8 @@ class LanguageModel(nn.Module):
             cache = [None] * len(self.layers)
 
         # Create causal attention mask
-        mask = create_attention_mask(x, cache)
+        if mask is None:
+            mask = create_attention_mask(x, cache)
 
         for i, layer in enumerate(self.layers):
             x = layer(x, mask=mask, cache=cache[i])

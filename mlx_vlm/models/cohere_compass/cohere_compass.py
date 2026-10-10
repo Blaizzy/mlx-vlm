@@ -7,7 +7,7 @@ import numpy as np
 from ..base import InputEmbeddingsFeatures
 from . import processing_cohere_compass  # noqa: F401
 from .config import ModelConfig
-from .language import LanguageModel
+from .language import DeepstackVisualFeatures, LanguageModel
 from .processing_cohere_compass import CohereCompassImageProcessor
 from .vision import VisionModel
 
@@ -70,6 +70,11 @@ class Model(nn.Module):
             )
         inputs_embeds = masked_scatter(inputs_embeds, image_mask, image_features)
         visual_pos_masks = image_mask[..., 0]
+        if deepstack_visual_embeds is not None:
+            deepstack_visual_embeds = DeepstackVisualFeatures(
+                embeddings=deepstack_visual_embeds,
+                position_mask=visual_pos_masks,
+            )
 
         position_ids, rope_deltas = self.language_model.get_rope_index(
             input_ids,

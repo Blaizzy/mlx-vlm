@@ -9,6 +9,7 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import KVCache
+from ..rope_utils import initialize_rope
 from .config import ModelConfig, TextConfig
 
 
@@ -70,7 +71,13 @@ class Molmo2Attention(nn.Module):
             bias=False,
         )
 
-        self.rotary_emb = nn.RoPE(self.head_dim, base=config.rope_theta)
+        self.rotary_emb = initialize_rope(
+            dims=self.head_dim,
+            base=config.rope_theta,
+            traditional=False,
+            scaling_config=config.rope_scaling,
+            max_position_embeddings=config.max_position_embeddings,
+        )
 
     def __call__(
         self,

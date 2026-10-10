@@ -9,11 +9,14 @@ if __name__ == "__main__":
         "generate",
         "generate_image",
         "generate_video",
+        "generate_audio",
         "convert",
+        "decide",
+        "decision",
         "chat",
         "chat_ui",
         "server",
-        "decision",
+        "moe_offload",
     }
 
     if len(sys.argv) < 2:
@@ -21,7 +24,7 @@ if __name__ == "__main__":
     subcommand = sys.argv.pop(1)
     if subcommand not in subcommands:
         raise ValueError(f"CLI requires a subcommand in {subcommands}")
-    if subcommand in {"generate_image", "generate_video"}:
+    if subcommand in {"generate_image", "generate_video", "generate_audio"}:
         output_modality = subcommand.removeprefix("generate_")
         sys.argv[1:1] = ["--output-modality", output_modality]
         subcommand = "generate"

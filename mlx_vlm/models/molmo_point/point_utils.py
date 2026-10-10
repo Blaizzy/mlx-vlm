@@ -79,7 +79,7 @@ def draw_points_on_image(
     points: List[Tuple[int, int, float, float]],
     output_path: Optional[str] = None,
     point_radius: int = 8,
-    point_color: str = "red",
+    point_color: Optional[str] = None,
     label: bool = True,
 ) -> Image.Image:
     """Draw point predictions on an image.
@@ -89,7 +89,9 @@ def draw_points_on_image(
         points: List of (object_id, image_num, x, y) tuples
         output_path: Optional path to save the annotated image
         point_radius: Radius of the point marker
-        point_color: Color of the point marker
+        point_color: Color of the point marker. When ``None`` (the default),
+            each object id is drawn in its own color so objects stay
+            distinguishable.
         label: Whether to draw object ID labels
 
     Returns:
@@ -101,7 +103,7 @@ def draw_points_on_image(
     colors = ["red", "blue", "green", "yellow", "purple", "orange", "cyan", "magenta"]
 
     for obj_id, img_num, x, y in points:
-        color = colors[obj_id % len(colors)]
+        color = point_color or colors[obj_id % len(colors)]
         r = point_radius
 
         # Draw filled circle

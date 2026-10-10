@@ -146,13 +146,18 @@ class Model(nn.Module):
             # last_hidden_state is consumed
             if ".vision_encoder.model.head." in k:
                 continue
+            # Converted checkpoints may already use mlx-vlm's
+            # language_model prefix. Tied models do not instantiate lm_head,
+            # so drop both the original and already-prefixed forms.
+            if self.config.text_config.tie_word_embeddings and k.startswith(
+                ("lm_head.", "language_model.lm_head.")
+            ):
+                continue
             # Checkpoint stores the language model at the top level; nest it
             # under language_model to follow the mlx-vlm layout
             if k.startswith("model."):
                 k = "language_model." + k
             elif k.startswith("lm_head."):
-                if self.config.text_config.tie_word_embeddings:
-                    continue
                 k = "language_model." + k
             # MLX cannot register leading-underscore parameters
             if k.endswith("._bias"):

@@ -15,6 +15,17 @@ from ..deepseekocr.processing_deepseekocr import (
 
 
 class UnlimitedOCRProcessor(DeepseekOCRProcessor):
+    @property
+    def default_chat_template(self):
+        return (
+            "{% for message in messages %}"
+            "{% if message['role'] == 'user' %}"
+            "{% elif message['role'] == 'assistant' %}{% endif %}"
+            "{{message['content']}}{% if not loop.last %} {% endif %}"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}{% endif %}"
+        )
+
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         kwargs.pop("trust_remote_code", None)

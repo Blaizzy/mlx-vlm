@@ -51,6 +51,18 @@ class ModelConfig(BaseModelConfig):
     eos_token_id: Optional[Union[int, List[int]]] = None
     pad_token_id: Optional[int] = None
     topk_method: str = "noaux_tc"
+    # Vision is opt-in so configs for the existing text-only checkpoints keep
+    # constructing the language-only model.
+    vision_n_layers: int = 0
+    vision_dim: int = 1024
+    vision_n_heads: int = 16
+    vision_inter_dim: int = 2816
+    vision_patch_size: int = 14
+    vision_rope_theta: float = 10000.0
+    vision_downsample_ratio: int = 3
+    vision_max_n_token: int = 384
+    vision_min_pixels: int = 147456
+    vision_max_wh_ratio: int = 8
 
     def __post_init__(self):
         if not self.compress_ratios:

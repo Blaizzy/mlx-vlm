@@ -9,6 +9,7 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import KVCache
+from ..rope_utils import initialize_rope
 from .config import TextConfig
 
 
@@ -115,11 +116,12 @@ class MllamaTextSelfAttention(nn.Module):
             self.num_heads * self.head_dim, self.hidden_size, bias=False
         )
 
-        self.rope = nn.RoPE(
-            self.head_dim,
-            traditional=config.rope_traditional,
+        self.rope = initialize_rope(
+            dims=self.head_dim,
             base=config.rope_theta,
-            scale=1,
+            traditional=config.rope_traditional,
+            scaling_config=config.rope_scaling,
+            max_position_embeddings=config.max_position_embeddings,
         )
 
     def __call__(
@@ -310,6 +312,39 @@ class MllamaTextModel(nn.Module):
 
         if cache is None:
             cache = [None] * len(self.layers)
+
+        if (
+            cross_attention_mask is not None
+            or full_text_row_masked_out_mask is not None
+        ):
+            # Full-prompt masks need the current chunk's text rows. Cross-attention
+            # caches do not track text positions; use a self-attention cache.
+            offset = 0
+            for idx, c in enumerate(cache):
+                if c is not None and idx not in self.config.cross_attention_layers:
+                    offset = c.offset
+                    if isinstance(offset, mx.array):
+                        # Batched masks include padding, so use the shared column
+                        # count rather than per-row (unpadded) token offsets.
+                        offset = (
+                            c._idx if hasattr(c, "_idx") else int(offset.max().item())
+                        )
+                    break
+
+            if (
+                cross_attention_mask is not None
+                and cross_attention_mask.shape[2] > seq_length
+            ):
+                cross_attention_mask = cross_attention_mask[
+                    :, :, offset : offset + seq_length
+                ]
+            if (
+                full_text_row_masked_out_mask is not None
+                and full_text_row_masked_out_mask.shape[2] > seq_length
+            ):
+                full_text_row_masked_out_mask = full_text_row_masked_out_mask[
+                    :, :, offset : offset + seq_length
+                ]
 
         if mask is None:
             mask = create_attention_mask(hidden_states, cache)

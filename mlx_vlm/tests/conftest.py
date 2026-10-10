@@ -10,35 +10,28 @@ import pytest
 os.environ["MLX_ENABLE_TF32"] = "0"
 
 
+def pytest_sessionfinish(session, exitstatus):
+    """Release thread-local MLX resources before Python finalization."""
+    del session, exitstatus
+
+    import mlx.core as mx
+
+    clear_streams = getattr(mx, "clear_streams", None)
+    if clear_streams is not None:
+        clear_streams()
+
+
 @pytest.fixture(
     params=[
         case
         for case in json.loads(
-            Path(__file__).with_name("model_cases.json").read_text()
+            Path(__file__).with_name("extraction_cases.json").read_text()
         )["cases"]
-        if "decision" in case["checks"]
+        if "decision_engine" in case
     ],
     ids=lambda case: case["id"],
 )
-def decision_case(request):
-    import copy
+def incremental_decision(request):
+    from mlx_vlm.tests.test_extraction_models import _decision_fixture
 
-    return copy.deepcopy(request.param)
-
-
-@pytest.fixture
-def decision_model(decision_case):
-    from mlx_vlm.tests.test_models import _model_for_case
-
-    return _model_for_case(decision_case)
-
-
-@pytest.fixture
-def decision_processor(decision_case):
-    from types import SimpleNamespace
-
-    from mlx_vlm.tests.test_processors import _DecisionTokenizer
-
-    return SimpleNamespace(
-        tokenizer=_DecisionTokenizer(decision_case["decision"]["tokenizer_vocab_size"])
-    )
+    return request.param, _decision_fixture(request.param)

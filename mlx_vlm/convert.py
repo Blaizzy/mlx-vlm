@@ -8,6 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_map_with_path
 
+from .quant_utils import get_quantization_params
 from .utils import (
     MODEL_CONVERSION_DTYPES,
     create_model_card,
@@ -30,23 +31,6 @@ QUANT_RECIPES = [
 ]
 
 
-def _quantization_params(
-    q_group_size: Optional[int], q_bits: Optional[int], q_mode: str
-):
-    mode_defaults = {
-        "affine": (64, 4),
-        "mxfp4": (32, 4),
-        "nvfp4": (16, 4),
-        "mxfp8": (32, 8),
-    }
-    group_size, bits = mode_defaults[q_mode]
-    return {
-        "group_size": q_group_size or group_size,
-        "bits": q_bits or bits,
-        "mode": q_mode,
-    }
-
-
 def _preserve_existing_deepseek_v4_quantization(
     config: dict,
     model: nn.Module,
@@ -66,7 +50,7 @@ def _preserve_existing_deepseek_v4_quantization(
     from .models.deepseek_v4.language import make_quantization_config
 
     quantization = make_quantization_config(model)
-    quantization.update(_quantization_params(q_group_size, q_bits, q_mode))
+    quantization.update(get_quantization_params(q_group_size, q_bits, q_mode))
     config["quantization"] = quantization
     config["quantization_config"] = quantization
 
@@ -295,16 +279,23 @@ def convert(
     dequantize: bool = False,
     trust_remote_code: bool = True,
     quant_predicate: Optional[str] = None,
-    decision_quantization: str = "preserve-output",
+    decision_quantization: Optional[str] = None,
+    mtp: bool = False,
+    mtp_output: Optional[str] = None,
 ):
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
     model, config, processor = fetch_from_hub(
         model_path, lazy=True, trust_remote_code=trust_remote_code
     )
-    if config.get("model_type") == "clef":
+
+    if decision_quantization is not None:
         if decision_quantization not in ("preserve-output", "backbone"):
             raise ValueError("Unknown decision quantization policy")
+        if not hasattr(model.config, "decision_quantization"):
+            raise ValueError(
+                "This model does not support decision quantization policies"
+            )
         model.config.decision_quantization = decision_quantization
         config["decision_quantization"] = decision_quantization
 
@@ -317,29 +308,20 @@ def convert(
             return model_quant_predicate(path, module)
         return True
 
-    # TODO: Remove once all LM models are migrated
-    # Text-only models wrap the real mlx-lm model under `language_model._model`.
-    # nn.Module.parameters() can't reach that underscore child, so dtype-cast,
-    # quantization, and save_weights must operate on the inner model -- the same
-    # one load_model quantizes (see utils.load_model). Otherwise convert writes
-    # an empty safetensors and mixed-bit per-layer keys don't match on reload.
-    target = (
-        model.language_model._model
-        if getattr(model, "_is_text_model", False)
-        else model
-    )
+    target = model
 
     if isinstance(quant_predicate, str):
         quant_predicate = mixed_quant_predicate_builder(quant_predicate, target)
 
-    quant_predicate = quant_predicate or base_quant_predicate
-    if config.get("model_type") == "clef":
-        # Mixed recipes/custom predicates must also respect protected decision
-        # weights. The lexical prior reads output-embedding rows directly.
+    if quant_predicate is None:
+        quant_predicate = base_quant_predicate
+    elif model_quant_predicate is not None:
         selected_predicate = quant_predicate
 
         def quant_predicate(path, module):
-            if not model_quant_predicate(path, module):
+            # A custom recipe may change precision, but cannot quantize a
+            # parameter the model explicitly excludes (e.g. a decision head).
+            if model_quant_predicate(path, module) is False:
                 return False
             return selected_predicate(path, module)
 
@@ -443,6 +425,33 @@ def convert(
 
     save_config(config, config_path=mlx_path / "config.json")
 
+    if mtp:
+        try:
+            from .speculative.drafters.mtp_split import detect_mtp_splitter
+
+            splitter = detect_mtp_splitter(model_path)
+            if splitter is None:
+                print(
+                    "[INFO] --mtp: no native MTP tensors / registered splitter for "
+                    "this model; skipping drafter"
+                )
+            else:
+                drafter_path = mtp_output or f"{mlx_path}-mtp"
+                print(f"[INFO] Extracting MTP drafter -> {drafter_path}")
+                splitter.split(
+                    str(model_path),
+                    str(drafter_path),
+                    q_bits=q_bits if quantize else None,
+                    q_group_size=q_group_size,
+                )
+        except Exception as exc:
+            # the base conversion already succeeded; a drafter failure must not
+            # take the whole convert down with it
+            print(
+                f"[WARNING] --mtp: failed to extract MTP drafter "
+                f"({type(exc).__name__}: {exc}); base conversion is unaffected"
+            )
+
     hf_repo = None if Path(hf_path).exists() else hf_path
     create_model_card(mlx_path, hf_repo)
 
@@ -491,12 +500,6 @@ def configure_parser() -> argparse.ArgumentParser:
         default=None,
     )
     parser.add_argument(
-        "--decision-quantization",
-        choices=["preserve-output", "backbone"],
-        default="preserve-output",
-        help="Clef: keep head and lexical output embeddings floating point (default), or only the head to save more memory.",
-    )
-    parser.add_argument(
         "--q-mode",
         help="The quantization mode.",
         type=str,
@@ -531,6 +534,11 @@ def configure_parser() -> argparse.ArgumentParser:
         default=None,
     )
     parser.add_argument(
+        "--decision-quantization",
+        choices=["preserve-output", "backbone"],
+        help="Decision models: preserve the lexical output embeddings, or quantize the backbone and keep only the head floating point.",
+    )
+    parser.add_argument(
         "--quant-predicate",
         help=f"Mixed-bit quantization recipe.",
         choices=QUANT_RECIPES,
@@ -555,6 +563,18 @@ def configure_parser() -> argparse.ArgumentParser:
         help="Trust remote code.",
         action="store_true",
         default=False,
+    )
+    parser.add_argument(
+        "--mtp",
+        help="Also extract the model's native MTP tensors into a standalone drafter.",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--mtp-output",
+        help="Output path for the MTP drafter (default: <mlx-path>-mtp).",
+        type=str,
+        default=None,
     )
     return parser
 

@@ -3,6 +3,7 @@
 """Clef's trained record format, with explicit overflow errors."""
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from typing import Any
@@ -12,7 +13,9 @@ SYSTEM_PROMPT = (
     "must be exactly one of that field's allowed options."
 )
 IMAGE_PLACEHOLDER = "<|vision_start|><|image_pad|><|vision_end|>"
-VIDEO_PLACEHOLDER = "<|vision_start|><|video_pad|><|vision_end|>"
+VIDEO_PLACEHOLDER = (
+    "<|vision_start|><|vision_start|><|video_pad|><|vision_end|><|vision_end|>"
+)
 MEDIA_BATCH_KEYS = (
     "pixel_values",
     "image_grid_thw",
@@ -20,7 +23,7 @@ MEDIA_BATCH_KEYS = (
     "video_grid_thw",
 )
 MEDIA_TOKEN_KEYS = ("mm_token_type_ids",)
-QUESTION_TYPES = {"noul": 0, "choice": 1, "score": 2}
+QUESTION_TYPES = {"bool": 0, "noul": 0, "choice": 1, "score": 2}
 
 
 def render(value: Any) -> str:
@@ -36,7 +39,7 @@ def render(value: Any) -> str:
 
 def question_options(question: dict[str, Any]) -> list[tuple[str, Any]]:
     question_type = str(question["type"])
-    if question_type == "noul":
+    if question_type in ("noul", "bool"):
         criteria = {
             "true": "The proposition is true or the answer is yes.",
             "false": "The proposition is false or the answer is no.",
@@ -44,7 +47,10 @@ def question_options(question: dict[str, Any]) -> list[tuple[str, Any]]:
         criteria.update(question.get("criteria") or {})
         return [(key, criteria[key]) for key in ("true", "false")]
     if question_type == "choice":
-        return sorted((str(key), value) for key, value in question["criteria"].items())
+        criteria = question["criteria"]
+        if isinstance(criteria, (list, tuple)):
+            criteria = dict.fromkeys(criteria)
+        return sorted((str(key), value) for key, value in criteria.items())
     return [(str(index), value) for index, value in enumerate(question["criteria"])]
 
 
@@ -69,11 +75,12 @@ class EncodedRecord:
 
 
 def _tokens(tokenizer: Any, text: str) -> list[int]:
-    return tokenizer(text, add_special_tokens=False).input_ids
+    result = tokenizer(text, add_special_tokens=False)
+    return result["input_ids"] if isinstance(result, Mapping) else result.input_ids
 
 
 def _encode_media(
-    processor: Any, record: dict[str, Any]
+    processor: Any, record: dict[str, Any], checkpoint
 ) -> tuple[list[int], dict[str, Any] | None]:
     images = list(record.get("images") or [])
     videos = list(record.get("videos") or [])
@@ -81,13 +88,44 @@ def _encode_media(
         return [], None
     if processor is None:
         raise ValueError("records with images or videos require a processor")
+    import numpy as np
+
+    from ...utils import load_image
+
+    def image(value):
+        checkpoint()
+        return load_image(value) if isinstance(value, str) else value
+
+    images = [image(value) for value in images]
+    videos = [[image(frame) for frame in frames] for frames in videos]
+    checkpoint()
+    media_kwargs = dict(record.get("media_kwargs") or {})
+    if videos and "video_metadata" not in media_kwargs:
+        video_processor = processor.video_processor
+        fps = media_kwargs.pop("fps", None)
+        num_frames = media_kwargs.pop("num_frames", None)
+        metadata = []
+        for index, frames in enumerate(videos):
+            total = len(frames)
+            count = num_frames
+            if count is None:
+                count = int(total / 24 * (fps or video_processor.fps))
+                count = min(
+                    max(count, video_processor.min_frames),
+                    video_processor.max_frames,
+                    total,
+                )
+            indices = np.linspace(0, total - 1, count).round().astype(int)
+            videos[index] = [frames[i] for i in indices]
+            metadata.append({"frames_indices": indices.tolist(), "fps": 24})
+        media_kwargs["video_metadata"] = metadata
     text = IMAGE_PLACEHOLDER * len(images) + VIDEO_PLACEHOLDER * len(videos) + "\n"
     encoded = processor(
         text=[text],
         images=images or None,
         videos=videos or None,
         return_tensors="np",
-        **(record.get("media_kwargs") or {}),
+        **media_kwargs,
     )
     media = {key: encoded[key] for key in MEDIA_BATCH_KEYS if key in encoded}
     for key in MEDIA_TOKEN_KEYS:
@@ -102,7 +140,18 @@ def encode_record(
     max_length: int = 65536,
     max_state_tokens: int | None = None,
     processor: Any | None = None,
+    checkpoint=lambda: None,
 ) -> EncodedRecord:
+    record = {
+        **record,
+        "questions": {
+            name: {
+                **question,
+                "type": "noul" if question["type"] == "bool" else question["type"],
+            }
+            for name, question in record["questions"].items()
+        },
+    }
     schema_ids = _tokens(tokenizer, "\n\nSCHEMA FIELDS:\n")
     questions: list[EncodedQuestion] = []
     for question_index, (question_id, question) in enumerate(
@@ -157,7 +206,8 @@ def encode_record(
         tokenizer,
         "\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:",
     )
-    media_ids, media = _encode_media(processor, record)
+    media_ids, media = _encode_media(processor, record, checkpoint)
+    checkpoint()
     if media is not None:
         media["token_offset"] = len(prefix_ids)
         prefix_ids = prefix_ids + media_ids

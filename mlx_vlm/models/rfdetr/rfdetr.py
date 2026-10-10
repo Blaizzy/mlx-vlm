@@ -5,6 +5,7 @@ from typing import Dict
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..base import check_array_shape
 from .config import ModelConfig
 from .segmentation import SegmentationHead
 from .transformer import MLP, Transformer, inverse_sigmoid
@@ -163,12 +164,12 @@ class Model(nn.Module):
                 continue
 
             # 8. Conv2d weight transposition: PyTorch (out, in, kH, kW) -> MLX (out, kH, kW, in)
-            if v.ndim == 4 and (
-                "conv" in new_k.lower() or "spatial_features_proj" in new_k
-            ):
-                v = v.transpose(0, 2, 3, 1)
-            elif v.ndim == 4 and "patch_embeddings.projection" in new_k:
-                v = v.transpose(0, 2, 3, 1)
+            # Skip weights already in MLX layout so a second pass is a no-op.
+            if v.ndim == 4 and not check_array_shape(v):
+                if "conv" in new_k.lower() or "spatial_features_proj" in new_k:
+                    v = v.transpose(0, 2, 3, 1)
+                elif "patch_embeddings.projection" in new_k:
+                    v = v.transpose(0, 2, 3, 1)
 
             sanitized[new_k] = v
 

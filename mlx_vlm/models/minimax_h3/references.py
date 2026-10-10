@@ -195,7 +195,7 @@ def _video_positions(
     frame_time = _temporal_position_grid(num_latent_frames, rotary_time)
     return mx.concatenate(
         [
-            mx.repeat(frame_time, frame_grid.shape[0]).reshape(-1, 1),
+            mx.repeat(frame_time, int(frame_grid.shape[0])).reshape(-1, 1),
             mx.tile(frame_grid, (num_latent_frames, 1)),
         ],
         axis=-1,

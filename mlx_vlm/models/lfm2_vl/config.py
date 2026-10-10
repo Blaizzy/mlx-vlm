@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..base import BaseModelConfig
 
@@ -38,8 +38,20 @@ class TextConfig(BaseModelConfig):
     layer_types: List[str] = None
     num_heads: int = 16
     full_attn_idxs: List[int] = None
+    rope_parameters: Optional[Dict[str, Any]] = None
+    tie_word_embeddings: Optional[bool] = True
 
     def __post_init__(self):
+
+        # Every LFM2-VL checkpoint ties the embeddings; the flag is either
+        # absent or explicitly true, and a serialized ``null`` means the same.
+        if self.tie_word_embeddings is None:
+            self.tie_word_embeddings = True
+
+        # LFM2.5-VL text configs carry rope settings under ``rope_parameters``
+        # and drop the top-level ``rope_theta``.
+        if self.rope_parameters is not None and "rope_theta" in self.rope_parameters:
+            self.rope_theta = self.rope_parameters["rope_theta"]
 
         # LFM2.5-VL checkpoints expose the MLP width as ``intermediate_size``
         # and omit the legacy ``block_ff_dim`` field.

@@ -157,6 +157,13 @@ class Model(Qwen3VLModel):
 
             if "conv1d.weight" in key and value.shape[-1] != 1:
                 value = value.moveaxis(2, 1)
+            # Qwen3.8 ships the Conv3d patch embed in PyTorch NCDHW order,
+            # while MLX convolutions expect NDHWC. Guard on the trailing axis
+            # so re-sanitizing already-converted weights is a no-op.
+            if key.endswith("patch_embed.proj.weight") and value.ndim == 5:
+                in_ch = self.config.vision_config.in_channels
+                if value.shape[-1] != in_ch and value.shape[1] == in_ch:
+                    value = value.transpose(0, 2, 3, 4, 1)
             if any(key.endswith(sfx) for sfx in NORM_WEIGHT_SUFFIXES):
                 if value.ndim == 1 and should_offset_norm_weight(
                     original_key, shift_norm_weights

@@ -18,6 +18,7 @@ from .image import (
     _normalize_model_type,
     _resolve_image_model_path,
 )
+from .image_defaults import ImageSamplingDefaults
 
 
 @dataclass(slots=True)
@@ -25,10 +26,10 @@ class ImageEditRequest:
     prompt: str
     image_paths: tuple[str | Path, ...]
     seed: int | None = None
-    steps: int = DEFAULT_IMAGE_STEPS
+    steps: int | None = None
     width: int | None = None
     height: int | None = None
-    guidance: float = DEFAULT_IMAGE_GUIDANCE
+    guidance: float | None = None
     output_format: Literal["png"] = DEFAULT_IMAGE_FORMAT
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -38,12 +39,28 @@ class ImageEditRequest:
         else:
             self.image_paths = tuple(self.image_paths)
 
+    def resolve_steps(self, default: int = DEFAULT_IMAGE_STEPS) -> int:
+        return default if self.steps is None else self.steps
+
+    def resolve_guidance(self, default: float = DEFAULT_IMAGE_GUIDANCE) -> float:
+        return default if self.guidance is None else self.guidance
+
 
 class ImageEditModel(Protocol):
     is_image_edit_model: ClassVar[bool]
     model_type: ClassVar[str]
     model_id: str
     family: str
+
+    @property
+    def default_sampling(self) -> ImageSamplingDefaults:
+        raise NotImplementedError("This model does not expose image sampling defaults")
+
+    @classmethod
+    def resolve_defaults(
+        cls, model: str, *, model_path: Path | None = None
+    ) -> ImageSamplingDefaults:
+        raise NotImplementedError("This model does not expose image sampling defaults")
 
     @classmethod
     def supports_model(cls, model: str) -> bool: ...

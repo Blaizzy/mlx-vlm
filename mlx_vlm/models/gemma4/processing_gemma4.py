@@ -101,6 +101,33 @@ def _pad_video_patches(patches: np.ndarray, positions: np.ndarray, target_length
     return patches, positions
 
 
+def get_aspect_ratio_preserving_size(
+    height, width, patch_size, max_patches, pooling_kernel_size
+):
+    """Compute patch-budget dimensions shared by Gemma 4 processors."""
+    target_px = max_patches * (patch_size**2)
+    factor = math.sqrt(target_px / (height * width))
+    side_mult = pooling_kernel_size * patch_size
+
+    target_height = int(math.floor(factor * height / side_mult)) * side_mult
+    target_width = int(math.floor(factor * width / side_mult)) * side_mult
+
+    if target_height == 0 and target_width == 0:
+        raise ValueError("Attempting to resize to a 0 x 0 image.")
+
+    max_side_length = (max_patches // pooling_kernel_size**2) * side_mult
+    if target_height == 0:
+        target_height = side_mult
+        target_width = min(int(math.floor(width / height)) * side_mult, max_side_length)
+    elif target_width == 0:
+        target_width = side_mult
+        target_height = min(
+            int(math.floor(height / width)) * side_mult, max_side_length
+        )
+
+    return target_height, target_width
+
+
 class Gemma4ImageProcessor(HFBaseImageProcessor):
     """Image processor for Gemma 4.
 
@@ -154,27 +181,9 @@ class Gemma4ImageProcessor(HFBaseImageProcessor):
         else:
             height, width = image.shape[0], image.shape[1]
 
-        target_px = max_patches * (patch_size**2)
-        factor = math.sqrt(target_px / (height * width))
-        side_mult = pooling_kernel_size * patch_size
-
-        target_height = int(math.floor(factor * height / side_mult)) * side_mult
-        target_width = int(math.floor(factor * width / side_mult)) * side_mult
-
-        if target_height == 0 and target_width == 0:
-            raise ValueError("Attempting to resize to a 0 x 0 image.")
-
-        max_side_length = (max_patches // pooling_kernel_size**2) * side_mult
-        if target_height == 0:
-            target_height = side_mult
-            target_width = min(
-                int(math.floor(width / height)) * side_mult, max_side_length
-            )
-        elif target_width == 0:
-            target_width = side_mult
-            target_height = min(
-                int(math.floor(height / width)) * side_mult, max_side_length
-            )
+        target_height, target_width = get_aspect_ratio_preserving_size(
+            height, width, patch_size, max_patches, pooling_kernel_size
+        )
 
         if target_height == height and target_width == width:
             return image
@@ -306,6 +315,11 @@ class Gemma4VideoProcessor(BaseVideoProcessor):
         self.image_std = image_std or [1.0, 1.0, 1.0]
         self.default_fps = default_fps
 
+    def video_sampling_defaults(self) -> dict:
+        """Cap decoding at the frame count this processor keeps, so the
+        decoder stops reading frames ``_sample_frames`` would discard."""
+        return {"max_frames": self.num_frames}
+
     def _sample_frames(self, video: np.ndarray, num_frames: int) -> np.ndarray:
         """Uniformly sample ``num_frames`` frames from ``video`` (T, C, H, W)."""
         T = video.shape[0]
@@ -435,6 +449,7 @@ class Gemma4VideoProcessor(BaseVideoProcessor):
 class Gemma4Processor(ProcessorMixin):
     """Combined processor for Gemma 4 (image + text + audio + video)."""
 
+    supports_multiple_audio = True
     model_type = "gemma4"
     attributes = ["image_processor", "tokenizer", "video_processor"]
     image_processor_class = "Gemma4ImageProcessor"

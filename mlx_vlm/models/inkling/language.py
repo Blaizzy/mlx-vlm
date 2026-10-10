@@ -162,6 +162,7 @@ def banded_additive_mask(
         and shape_ref.shape[2] == S
         and q_offset == S - LQ
         and mx.default_device() == mx.gpu
+        and mx.metal.is_available()
     ):
         mask = _mask_v2_kernel(
             inputs=[rel, proj, shape_ref],
@@ -176,7 +177,7 @@ def banded_additive_mask(
             output_shapes=[(B, H, LQ, S)],
             output_dtypes=[dtype],
         )[0]
-    elif mx.default_device() == mx.gpu:
+    elif mx.default_device() == mx.gpu and mx.metal.is_available():
         mask = _mask_kernel(
             inputs=[rel, proj],
             template=[
@@ -323,6 +324,7 @@ class InklingShortConvolution(nn.Module):
             and K == 4
             and x.shape[1] <= 8
             and mx.default_device() == mx.gpu
+            and mx.metal.is_available()
         ):
             B, L, C = x.shape
             state = cache[self.conv_idx]
@@ -747,7 +749,7 @@ class InklingSparseMoE(nn.Module):
             self._wscale = mx.array(
                 [self.route_scale], dtype=mx.float32
             ) * self.global_scale.astype(mx.float32)
-        if mx.default_device() == mx.gpu:
+        if mx.default_device() == mx.gpu and mx.metal.is_available():
             return _route_kernel(
                 inputs=[logits, self.e_score_correction_bias, self._wscale],
                 template=[
@@ -770,6 +772,7 @@ class InklingSparseMoE(nn.Module):
         scores = mx.sigmoid(logits.astype(mx.float32))
         sfc = scores[:, : self.n_routed] + self.e_score_correction_bias
         idx = mx.argpartition(-sfc, self.top_k - 1, axis=-1)[:, : self.top_k]
+        idx = mx.stop_gradient(idx)
         routed_logits = logits[:, : self.n_routed]
         shared_logits = logits[:, -self.n_shared :]
         tl = mx.concatenate(
@@ -803,6 +806,7 @@ class InklingSparseMoE(nn.Module):
             _DOWN_COMBINE
             and xf.shape[0] <= 8
             and mx.default_device() == mx.gpu
+            and mx.metal.is_available()
             and getattr(dp, "bits", None) == 4
             and getattr(dp, "group_size", None) == 64
             and getattr(dp, "mode", "affine") == "affine"

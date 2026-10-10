@@ -31,13 +31,53 @@ To determine the model layer names, we suggest either:
 - Look at the names of the weights by inspecting `model.safetensors.index.json`
   in the Hugging Face repo.
 
-Additionally, add a test for the new model type to the [model
-tests](https://github.com/Blaizzy/mlx-vlm/tree/main/src/tests/test_models.py).
+If the model needs a `sanitize()` to convert weights from the PyTorch layout,
+note that `load_model` calls it on **every** checkpoint, including ones already
+converted to MLX layout. `sanitize()` must therefore be idempotent: running it
+on its own output has to be a no-op.
 
-From the `src/` directory, you can run the tests with:
+For conv weight transposes, `check_array_shape` is the established guard. It
+does not cover the other conversions a `sanitize()` may perform, and each needs
+its own "has this already been done?" check:
+
+| conversion | detect it by |
+|---|---|
+| conv transpose | target layout (`check_array_shape`, or compare against `self.<conv>.weight.shape`) |
+| norm-weight shift (`v + 1.0`) | a marker that only an unconverted checkpoint carries; `v.ndim == 1` is **not** one, since it holds before and after |
+| expert / qkv / gate_up splits and merges | absence of the source key |
+| quantization-scale rewrites | the scale dtype or grouping already being the MLX one |
+| MTP or draft shard filtering | presence of the shard keys |
+
+Prefer an explicit check over relying on an earlier step in the same
+`sanitize()` to have consumed its input key. That works, but it makes
+idempotency a side effect of unrelated code, and reordering silently breaks it.
+
+Getting this wrong fails in two ways. A shape-changing conversion applied twice
+dies loudly at weight-load; a value-changing one (a norm shift, a scale rewrite)
+loads fine and generates garbage.
+
+Register a small configuration in the case file for the model's task:
+
+| Task | Case file | Tests |
+|---|---|---|
+| Text generation | [model_cases.json](mlx_vlm/tests/model_cases.json) | [test_models.py](mlx_vlm/tests/test_models.py) |
+| Image generation | [image_generation_cases.json](mlx_vlm/tests/image_generation_cases.json) | [test_image_generation_models.py](mlx_vlm/tests/test_image_generation_models.py) |
+| Depth, geometry, masks, spans, or decisions | [extraction_cases.json](mlx_vlm/tests/extraction_cases.json) | [test_extraction_models.py](mlx_vlm/tests/test_extraction_models.py) |
+
+Extraction cases use `id`, `module`, `config`, and `checks`, like text-model
+cases. Shared checks cover `registry_and_config`, `forward`, and `checkpoint`;
+forward checks use `input_shape` and `output_shapes`. Decision models select
+`decision_models` with their `state` and typed `questions` to check standard
+loading and prediction. Specialized tests reuse
+case configs and `shared_configs`, keeping numerical, checkpoint conversion,
+streaming, and IO assertions in Python. Use nonuniform weights to verify
+conversion values and second-pass stability.
+
+From the repository root, install the test dependencies and run the tests with:
 
 ```shell
-python -m unittest discover tests/
+python -m pip install -e ".[test]"
+python -m pytest -q mlx_vlm/tests
 ```
 
 ## Pull Requests

@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, Optional
 
+from .runtime_config import RuntimeConfig
+
 
 class ModelCacheRegistry:
     def __init__(self, default_kind: str = "text_generation"):
@@ -64,9 +66,11 @@ class ServerRuntime:
     response_generator: Optional[Any] = None
     audio_queue: Optional[Any] = None
     decision_queue: Optional[Any] = None
+    realtime_engine: Optional[Any] = None
     apc_manager: Optional[Any] = None
     metrics: Optional[Any] = None
     preload_failures: Dict[str, Dict[str, str]] = field(default_factory=dict)
+    config: RuntimeConfig = field(default_factory=RuntimeConfig.from_env)
 
 
 runtime = ServerRuntime()

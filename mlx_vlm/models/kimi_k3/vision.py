@@ -3,14 +3,8 @@ from typing import List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..base import check_array_shape
 from .config import VisionConfig
-
-
-def check_array_shape(arr):
-    if arr.ndim != 4:
-        return False
-    out_channels, kH, kW, _ = arr.shape
-    return (out_channels >= kH) and (out_channels >= kW) and (kH == kW)
 
 
 def _interp_indices(in_size: int, out_size: int):

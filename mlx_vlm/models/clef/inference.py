@@ -13,24 +13,10 @@ from threading import Event
 import mlx.core as mx
 import numpy as np
 
+from ...decision import DecisionCancelled, check_cancelled, context_limit
 from ..cache import ArraysCache, KVCache
-
-
-class DecisionCancelled(Exception):
-    pass
-
-
-def check_cancelled(event):
-    if event.is_set():
-        raise DecisionCancelled("Decision cancelled")
-
-
-def context_limit(config, requested=None):
-    native = config.text_config.max_position_embeddings
-    limit = min(65536, native) if requested is None else requested
-    if not 0 < limit <= native:
-        raise ValueError(f"Decision context limit must be between 1 and {native}")
-    return limit
+from .clef import format_result
+from .processing_clef import encode_record
 
 
 def _clone_cache(caches):
@@ -104,6 +90,7 @@ def _prefix_key(record, namespace):
 @dataclass
 class DecisionState:
     record: object
+    request: dict
     ids: mx.array
     embeds: mx.array
     positions: mx.array
@@ -121,17 +108,33 @@ class DecisionState:
 
 
 class DecisionEngine:
-    def __init__(self, model, *, prefill_step_size=512, cache_bytes=256 * 1024**2):
+    def __init__(
+        self,
+        model,
+        processor,
+        *,
+        max_length=None,
+        prefill_step_size=512,
+        cache_bytes=256 * 1024**2,
+    ):
         if prefill_step_size < 1:
             raise ValueError("Prefill step size must be positive")
-        self.model = model
+        self.model, self.processor = model, processor
+        self.max_length = context_limit(model.config, max_length)
         self.prefill_step_size = prefill_step_size
         self.prefix_cache = PrefixCache(cache_bytes)
         self.batch_steps = self.prefill_tokens = 0
 
-    def prepare(self, record, *, namespace=None, cancelled=None):
+    def prepare(self, request, *, namespace=None, cancelled=None):
         cancelled = cancelled if cancelled is not None else Event()
         check_cancelled(cancelled)
+        record = encode_record(
+            getattr(self.processor, "tokenizer", self.processor),
+            request,
+            max_length=self.max_length,
+            processor=self.processor,
+            checkpoint=lambda: check_cancelled(cancelled),
+        )
         ids = mx.array(record.input_ids)[None]
         key = (
             _prefix_key(record, namespace)
@@ -172,6 +175,7 @@ class DecisionEngine:
         check_cancelled(cancelled)
         return DecisionState(
             record,
+            request,
             ids,
             embeds,
             positions,
@@ -270,15 +274,16 @@ class DecisionEngine:
             mx.eval(value)
             check_cancelled(state.cancelled)
 
-        logits = self.model.head(
+        logits = self.model.score_record(
             mx.concatenate(state.hidden, axis=1),
             state.ids,
             state.record,
-            self.model._output_embeddings,
             checkpoint=checkpoint,
         )
         checkpoint(logits)
-        return logits
+        output = format_result(state.record, state.request["questions"], logits)
+        output["cached_tokens"] = state.cached_tokens
+        return output
 
     def decide(self, record, **kwargs):
         state = self.prepare(record, **kwargs)

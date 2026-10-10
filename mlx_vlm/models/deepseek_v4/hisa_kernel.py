@@ -77,4 +77,5 @@ def hisa_select(
 
     sel = mx.argpartition(-fscore, kth=k - 1, axis=-1)[..., :k]  # (B,L,k)
     pos = (top_blk[..., None] * b + mx.arange(b)).reshape(B, L, C)
+    sel = mx.stop_gradient(sel)
     return mx.take_along_axis(pos, sel, axis=-1)  # (B,L,k)
