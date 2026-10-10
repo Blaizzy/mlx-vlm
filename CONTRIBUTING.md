@@ -73,9 +73,10 @@ case configs and `shared_configs`, keeping numerical, checkpoint conversion,
 streaming, and IO assertions in Python. Use nonuniform weights to verify
 conversion values and second-pass stability.
 
-From the repository root, you can run the tests with:
+From the repository root, install the test dependencies and run the tests with:
 
 ```shell
+python -m pip install -e ".[test]"
 python -m pytest -q mlx_vlm/tests
 ```
 

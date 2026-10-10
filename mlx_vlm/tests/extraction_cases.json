@@ -131,6 +131,237 @@
       }
     },
     {
+      "id": "clef",
+      "module": "clef",
+      "config": {
+        "model_type": "clef",
+        "text_config": {
+          "model_type": "qwen3_5",
+          "hidden_size": 16,
+          "intermediate_size": 32,
+          "linear_num_value_heads": 2,
+          "linear_num_key_heads": 2,
+          "linear_key_head_dim": 32,
+          "linear_value_head_dim": 8,
+          "linear_conv_kernel_dim": 3,
+          "num_hidden_layers": 2,
+          "full_attention_interval": 2,
+          "num_attention_heads": 2,
+          "rms_norm_eps": 1e-05,
+          "vocab_size": 512,
+          "num_key_value_heads": 2,
+          "max_position_embeddings": 128,
+          "head_dim": 8,
+          "rope_parameters": {
+            "type": "default",
+            "mrope_section": [
+              1,
+              0,
+              0
+            ],
+            "rope_theta": 10000,
+            "partial_rotary_factor": 0.25
+          }
+        },
+        "vision_config": {
+          "depth": 1,
+          "hidden_size": 16,
+          "intermediate_size": 32,
+          "out_hidden_size": 16,
+          "num_heads": 2
+        },
+        "head_config": {
+          "hidden_size": 16,
+          "width": 16,
+          "routing_layers": 1,
+          "layers": 1,
+          "heads": 2,
+          "feedforward": 32
+        }
+      },
+      "checks": [
+        "registry_and_config",
+        "checkpoint",
+        "decision_models"
+      ],
+      "decision_models": {
+        "state": "A B",
+        "questions": {
+          "route": {
+            "type": "choice",
+            "instructions": "Route",
+            "criteria": [
+              "A",
+              "B"
+            ]
+          },
+          "quality": {
+            "type": "score",
+            "instructions": "Rate",
+            "criteria": [
+              "low",
+              "high"
+            ]
+          },
+          "finished": {
+            "type": "bool",
+            "instructions": "Finished"
+          }
+        }
+      }
+    },
+    {
+      "id": "d1",
+      "module": "d1",
+      "config": {
+        "model_type": "d1",
+        "text_config": {
+          "vocab_size": 320,
+          "hidden_size": 16,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 2,
+          "num_key_value_heads": 1,
+          "intermediate_size": 32,
+          "block_dim": 16,
+          "block_multiple_of": 8,
+          "block_auto_adjust_ff_dim": false,
+          "layer_types": ["conv", "full_attention"],
+          "max_position_embeddings": 4096
+        },
+        "vision_config": {
+          "hidden_size": 16,
+          "intermediate_size": 32,
+          "num_hidden_layers": 1,
+          "num_attention_heads": 2,
+          "num_patches": 16
+        },
+        "projector_hidden_size": 16
+      },
+      "checks": [
+        "registry_and_config",
+        "checkpoint",
+        "decision_models"
+      ],
+      "decision_models": {
+        "state": "A B",
+        "questions": {
+          "route": {
+            "type": "choice",
+            "instructions": "Route",
+            "criteria": {
+              "A": "first",
+              "B": null
+            }
+          },
+          "quality": {
+            "type": "score",
+            "instructions": "Rate",
+            "criteria": [
+              "low",
+              "mid",
+              "high"
+            ]
+          },
+          "finished": {
+            "type": "bool",
+            "instructions": "Finished",
+            "criteria": {
+              "false": "open",
+              "true": "done"
+            }
+          }
+        },
+        "tokens": ["yes", "Yes", "YES", "no", "No", "NO", "0", "1", "2"],
+        "special_tokens": {
+          "bos_token": "<|startoftext|>",
+          "additional_special_tokens": ["<|im_start|>", "<|im_end|>"]
+        }
+      }
+    },
+    {
+      "id": "d1_omni",
+      "module": "d1_omni",
+      "config": {
+        "model_type": "d1_omni",
+        "text_config": {
+          "vocab_size": 320,
+          "hidden_size": 64,
+          "intermediate_size": 96,
+          "num_hidden_layers": 3,
+          "num_attention_heads": 4,
+          "num_key_value_heads": 2,
+          "layer_types": ["conv", "full_attention", "conv"],
+          "block_multiple_of": 32
+        },
+        "vision_config": {
+          "model_type": "siglip2_vision_model",
+          "hidden_size": 32,
+          "intermediate_size": 64,
+          "num_hidden_layers": 1,
+          "num_attention_heads": 2,
+          "num_patches": 16
+        },
+        "audio_config": {
+          "feat_in": 16,
+          "n_layers": 1,
+          "d_model": 16,
+          "subsampling_conv_channels": 4,
+          "ff_expansion_factor": 2,
+          "n_heads": 2,
+          "conv_kernel_size": 3,
+          "residual_width": 8
+        },
+        "projector_hidden_size": 48,
+        "head_layers": 2,
+        "temperatures": {
+          "choice:2": 1.5,
+          "score": 2.0
+        }
+      },
+      "checks": [
+        "registry_and_config",
+        "checkpoint",
+        "decision_models"
+      ],
+      "decision_models": {
+        "state": "A B",
+        "questions": {
+          "route": {
+            "type": "choice",
+            "instructions": "Route",
+            "criteria": [
+              "A",
+              "B"
+            ]
+          },
+          "quality": {
+            "type": "score",
+            "instructions": "Rate",
+            "criteria": [
+              "low",
+              "mid",
+              "high"
+            ]
+          },
+          "finished": {
+            "type": "bool",
+            "instructions": "Finished"
+          }
+        },
+        "special_tokens": {
+          "bos_token": "<|startoftext|>",
+          "additional_special_tokens": [
+            "<|mask|>",
+            "<|reserved_7|>",
+            "<|reserved_8|>",
+            "<|reserved_9|>",
+            "<|reserved_10|>",
+            "<|reserved_11|>"
+          ]
+        }
+      }
+    },
+    {
       "id": "dinov2",
       "module": "dinov2",
       "config": {

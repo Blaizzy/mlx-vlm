@@ -2,6 +2,30 @@
   "version": 2,
   "cases": [
     {
+      "id": "embedding_gemma2",
+      "module": "embedding_gemma2",
+      "config": {
+        "image_token_id": 60,
+        "audio_token_id": 61,
+        "video_token_id": 62,
+        "text_config": {
+          "vocab_size": 64,
+          "hidden_size": 16,
+          "intermediate_size": 32,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 2,
+          "num_key_value_heads": 1,
+          "head_dim": 8,
+          "hidden_size_per_layer_input": 8,
+          "embedding_dim": 24,
+          "sliding_window": 3,
+          "layer_types": ["sliding_attention", "full_attention"],
+          "per_layer_config": {"01": {"head_dim": 16}}
+        }
+      },
+      "checks": ["sentence_embeddings"]
+    },
+    {
       "id": "lfm2_encoder",
       "module": "lfm2_encoder",
       "config": {
@@ -816,6 +840,34 @@
         }
       },
       "checks": ["language"]
+    },
+    {
+      "id": "kolibri1",
+      "module": "kolibri1",
+      "config": {
+        "model_type": "kolibri1",
+        "hidden_size": 16,
+        "num_hidden_layers": 5,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 8,
+        "vocab_size": 32,
+        "max_position_embeddings": 128,
+        "rms_norm_eps": 1e-06,
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 16,
+        "shared_expert_intermediate_size": 32,
+        "sliding_window": 4,
+        "layer_types": [
+          "sliding_attention",
+          "sliding_attention",
+          "sliding_attention",
+          "sliding_attention",
+          "full_attention"
+        ]
+      },
+      "checks": ["forward_cache", "input_embeddings"]
     },
     {
       "id": "limite",
@@ -2162,6 +2214,30 @@
       "attention_bias": false,
       "head_dim": 16,
       "tie_word_embeddings": false
+    },
+    "xing4_0": {
+      "model_type": "xing4_0",
+      "hidden_size": 64,
+      "intermediate_size": 128,
+      "moe_intermediate_size": 32,
+      "num_hidden_layers": 3,
+      "first_k_dense_replace": 1,
+      "num_attention_heads": 4,
+      "num_key_value_heads": 4,
+      "n_routed_experts": 4,
+      "n_shared_experts": 1,
+      "num_experts_per_tok": 2,
+      "routed_scaling_factor": 2.0,
+      "kv_lora_rank": 16,
+      "q_lora_rank": 32,
+      "qk_rope_head_dim": 8,
+      "qk_nope_head_dim": 16,
+      "v_head_dim": 16,
+      "vocab_size": 128,
+      "max_position_embeddings": 512,
+      "rms_norm_eps": 1e-06,
+      "hc_mult": 4,
+      "hc_sinkhorn_iters": 20
     },
     "nemotron_nas": {
       "model_type": "nemotron-nas",

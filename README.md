@@ -51,6 +51,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | LocateAnything | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/locateanything/README.md) |
 | Moondream2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/moondream2/README.md) |
 | Moondream3 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/moondream3/README.md) |
+| EmbeddingGemma 2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/embedding_gemma2/README.md) |
 | Gemma 4 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/gemma4/README.md) |
 | MiniMax M3 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minimax_m3_vl/README.md) |
 | Falcon-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/falcon_ocr/README.md) |
@@ -522,6 +523,19 @@ python -m mlx_vlm decide --model nativ-community/decider-2b \
 Use `--state-file request.txt` for UTF-8 text and `--questions-file questions.json`
 for named questions. `mlx_vlm.decide` runs the same command.
 
+Models that read images take a repeatable `--image`, and models that read
+speech take one `--audio` (each a path or URL). The state is optional when
+media are given:
+
+```sh
+python -m mlx_vlm decide --model LiquidAI/d1-omni-600M \
+  --image http://images.cocodataset.org/val2017/000000039769.jpg \
+  --questions '{"cats":{"type":"choice","instructions":"How many cats are there?","criteria":["one","two","more"]}}'
+python -m mlx_vlm decide --model LiquidAI/d1-omni-600M \
+  --audio https://huggingface.co/datasets/Narsil/asr_dummy/resolve/main/1.flac \
+  --questions '{"speaking":{"type":"bool","instructions":"Is anyone speaking in this clip?"}}'
+```
+
 Preload a decision model in the existing server:
 
 ```sh
@@ -533,11 +547,15 @@ curl http://localhost:8080/v1/decisions \
 
 An explicit `model` in the request selects a checkpoint; otherwise the currently
 loaded decision model is used. Without either, the endpoint returns HTTP 400.
-Decision requests are non-streaming and use the server's API-key authentication.
+Requests may add `"images"`, a list of URLs, paths, or data URIs, or `"audio"`,
+one URL, path, or base64 data URI; `state` may then be `null`. Decision requests
+are non-streaming and use the server's API-key authentication.
 
 Both interfaces return the shared `predict()` result and preserve model-specific
-scoring. Decider and Laya support `choice`, `bool`, and `score`; consult each
-model's README for criteria and calibration details.
+scoring. Decider, Laya, [d1-3B](mlx_vlm/models/d1/README.md), and
+[d1-omni-600M](mlx_vlm/models/d1_omni/README.md) support `choice`, `bool`, and
+`score`; the two LiquidAI d1 models also read images, and d1-omni reads speech.
+Consult each model's README for criteria and calibration details.
 
 ### Server (FastAPI)
 

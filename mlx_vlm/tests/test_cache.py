@@ -1235,6 +1235,38 @@ def test_disk_block_lifecycle(managers, monkeypatch):
     assert warm is not None and 0 < count < 48
 
 
+@parametrize("evicted", [1, 2])
+def test_disk_prefix_with_evicted_leading_blocks(managers, evicted):
+    manager = managers("disk", blocks=3)
+    tokens = list(range(48))
+    source = [filled(C.KVCache(), 48, heads=1, dim=4)]
+    stored = manager.store_kv_blocks(
+        tokens, [source[0].keys], [source[0].values], extra_hash=17
+    )
+    hashes = [block.block_hash for block in stored]
+    manager.release(stored)
+    manager.release(store_blocks(manager, list(range(100, 100 + 16 * evicted))))
+    manager.disk.flush()
+    assert all(h not in manager.hash_table for h in hashes[:evicted])
+    assert all(h in manager.hash_table for h in hashes[evicted:])
+    assert manager.lookup_prefix(tokens, extra_hash=17) == ([], 0)
+    residents = {h: b.ref_cnt for h, b in manager.hash_table.items()}
+
+    hit = P.apc_lookup_plan(
+        manager,
+        tokens + [999],
+        extra_hash=17,
+        apc_mode="block",
+        safe_lookup_min=0,
+        suffix_is_text_only=lambda _: True,
+        prefix_has_media=lambda _: False,
+    )
+    assert hit is not None and hit["prefix_len"] == 48
+    assert hit["matched_blocks"] == []
+    same_cache(hit["warm_cache"], source)
+    assert {h: b.ref_cnt for h, b in manager.hash_table.items()} == residents
+
+
 def test_disk_policy_and_metadata(managers, monkeypatch):
     monkeypatch.setenv("APC_DISK_SHARD_MAX_BLOCKS", "3")
     manager = managers("disk")

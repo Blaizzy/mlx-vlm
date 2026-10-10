@@ -329,9 +329,12 @@ def apply_typical_p(logprobs: mx.array, typical_p: float) -> mx.array:
 
 @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
 def _typical_p(logprobs: mx.array, typical_p: float) -> mx.array:
-    p = mx.exp(logprobs)
-    ent = -mx.sum(p * logprobs, axis=-1, keepdims=True)
-    shifted = mx.abs(-logprobs - ent)
+    # Sum in float32: a float16/bfloat16 running sum stops growing once the
+    # remaining probabilities are below its precision.
+    f = logprobs.astype(mx.float32)
+    p = mx.exp(f)
+    ent = -mx.sum(p * f, axis=-1, keepdims=True)
+    shifted = mx.abs(-f - ent)
     sorted_indices = mx.argsort(shifted, axis=-1)
     sorted_probs = mx.take_along_axis(p, sorted_indices, axis=-1)
     cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
