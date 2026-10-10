@@ -72,8 +72,12 @@ def test_notebook_cells_train_evaluate_and_reload(notebook, train_type, tmp_path
                         PILImage.new("RGB", (32, 16), "white") for _ in range(10)
                     ],
                     "prompt": [f"Describe image {index}." for index in range(10)],
-                    "chosen": [f"A detailed description {index}." for index in range(10)],
-                    "rejected": [f"An unclear description {index}." for index in range(10)],
+                    "chosen": [
+                        f"A detailed description {index}." for index in range(10)
+                    ],
+                    "rejected": [
+                        f"An unclear description {index}." for index in range(10)
+                    ],
                 },
                 features=Features(
                     {
