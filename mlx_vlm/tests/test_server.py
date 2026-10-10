@@ -24,7 +24,7 @@ from threading import Event, Lock, Thread, Timer
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
-import httpx
+import httpx2
 import mlx.core as mx
 import numpy as np
 import pytest
@@ -3372,7 +3372,7 @@ class TestCompaction:
                     url = f"http://127.0.0.1:{port}"
                     headers = {"X-APC-Tenant": "compaction-test"}
                     with (
-                        httpx.Client(
+                        httpx2.Client(
                             base_url=url, timeout=180, headers=headers
                         ) as client,
                         OpenAI(
@@ -3386,7 +3386,7 @@ class TestCompaction:
                             try:
                                 if client.get("/health", timeout=1).is_success:
                                     break
-                            except httpx.TransportError:
+                            except httpx2.TransportError:
                                 pass
                             time.sleep(0.25)
                         else:
@@ -3499,7 +3499,7 @@ class TestCompaction:
                     if event.get("type", "").startswith("mlx.compaction."):
                         progress.append((time.perf_counter() - started, event))
         completed = _completed_response(
-            httpx.Response(200, text="\n".join(lines) + "\n")
+            httpx2.Response(200, text="\n".join(lines) + "\n")
         )
         assert completed["output"][0]["type"] == "compaction"
         _assert_recalled(completed["output_text"])
