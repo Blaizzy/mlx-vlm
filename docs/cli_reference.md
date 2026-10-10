@@ -27,5 +27,5 @@ Each command accepts `--help` for full usage information.
 Decision CLI and HTTP examples, including `--decision-model` preloading, are in
 the [decision models guide](https://github.com/Blaizzy/mlx-vlm#decision-models).
 
-Batch input, comparison reports, scheduling options, and TypeSafe compatibility
-are described in [decision serving and evaluation](decisions.md).
+Batch input, comparison reports, and scheduling options are described in
+[decision serving and evaluation](decisions.md).

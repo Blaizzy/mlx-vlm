@@ -699,10 +699,9 @@ def decision_cli_responses(monkeypatch):
     return calls
 
 
-@pytest.mark.parametrize("wire_format", ["native", "systemone"])
 @pytest.mark.parametrize("kind", ["file", "stdin", "jsonl"])
 def test_decision_cli_request_streams(
-    decision_cli_responses, monkeypatch, tmp_path, capsys, wire_format, kind
+    decision_cli_responses, monkeypatch, tmp_path, capsys, kind
 ):
     import io
 
@@ -711,7 +710,7 @@ def test_decision_cli_request_streams(
     body = {
         "model": "test",
         "state": "A",
-        "questions": {"q": {"type": "noul" if wire_format == "systemone" else "bool"}},
+        "questions": {"q": {"type": "bool"}},
     }
     content = (
         "\n".join(json.dumps({**body, "state": str(i)}) for i in range(5))
@@ -721,7 +720,7 @@ def test_decision_cli_request_streams(
     path = tmp_path / "requests.json"
     path.write_text(content)
     monkeypatch.setattr(sys, "stdin", io.StringIO(content))
-    args = ["--format", wire_format, "--request", str(path) if kind == "file" else "-"]
+    args = ["--request", str(path) if kind == "file" else "-"]
     if kind == "jsonl":
         args += ["--jsonl", "--batch-size", "2"]
     decide.main(args)
@@ -737,24 +736,18 @@ def test_decision_cli_request_streams(
         [str(i) for i in range(5)] if kind == "jsonl" else ["A"]
     )
     answer = outputs[0]["answers"]["q"]
-    assert answer == (
-        {"type": "noul", "noul": 0.8}
-        if wire_format == "systemone"
-        else {"type": "bool", "value": True, "probability": 0.8}
-    )
+    assert answer == {"type": "bool", "value": True, "probability": 0.8}
 
 
 def test_decision_cli_comparison_gate(decision_cli_responses, tmp_path, capsys):
     from mlx_vlm.decide import main
 
     questions = tmp_path / "questions.json"
-    questions.write_text(json.dumps({"q": {"type": "noul"}}))
+    questions.write_text(json.dumps({"q": {"type": "bool"}}))
     report = tmp_path / "drift.json"
     with pytest.raises(SystemExit) as error:
         main(
             [
-                "--format",
-                "systemone",
                 "--model",
                 "candidate",
                 "--state",
@@ -769,8 +762,9 @@ def test_decision_cli_comparison_gate(decision_cli_responses, tmp_path, capsys):
         )
     assert error.value.code == 1
     assert json.loads(capsys.readouterr().out)["answers"]["q"] == {
-        "type": "noul",
-        "noul": 0.8,
+        "type": "bool",
+        "value": True,
+        "probability": 0.8,
     }
     result = json.loads(report.read_text())
     assert not result["passed"] and result["argmax_flips"] == 1

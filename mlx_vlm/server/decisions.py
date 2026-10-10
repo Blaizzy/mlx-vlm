@@ -6,17 +6,11 @@ import os
 import time
 from typing import Any, Dict, List, Optional, Union
 
-from fastapi import HTTPException, Request, Response
+from fastapi import HTTPException, Request
 from pydantic import BaseModel, Field, model_validator
 
 from ..decision import DecisionCancelled
 from ..decision_scheduler import DecisionQueueFull, DecisionScheduler
-from ..systemone import (
-    SystemOneRequest,
-    SystemOneResponse,
-    format_response,
-    native_request,
-)
 from .generation import get_configured_context_limit
 from .openai import _decode_input_audio_data
 from .runtime import runtime
@@ -70,8 +64,8 @@ def get_scheduler(deps):
     return runtime.decision_queue
 
 
-async def _execute(body, request, response, deps, *, systemone=False):
-    endpoint = "/v1/systemone" if systemone else "/v1/decisions"
+async def _execute(body, request, deps):
+    endpoint = "/v1/decisions"
     model_id = body.get("model") or _default_decision_model()
     if not model_id:
         raise HTTPException(
@@ -83,13 +77,11 @@ async def _execute(body, request, response, deps, *, systemone=False):
     runtime.metrics.begin_request(endpoint=endpoint, model=model_id, stream=False)
     job = future = None
     try:
-        native = native_request(body) if systemone else dict(body)
-        if native.get("audio"):
-            native["audio"] = _decode_input_audio_data({"data": native["audio"]})
+        if body.get("audio"):
+            body["audio"] = _decode_input_audio_data({"data": body["audio"]})
         job = get_scheduler(deps).submit(
-            native,
+            body,
             namespace=deps.read_tenant_id(request),
-            allow_single_criterion=systemone,
         )
         future = asyncio.wrap_future(job.future)
         while not future.done():
@@ -98,7 +90,7 @@ async def _execute(body, request, response, deps, *, systemone=False):
                 job.cancel()
                 raise HTTPException(status_code=499, detail="Client disconnected")
         output = await future
-        result = format_response(body, output) if systemone else output["response"]
+        result = output["response"]
     except asyncio.CancelledError:
         if job is not None:
             job.cancel()
@@ -117,9 +109,7 @@ async def _execute(body, request, response, deps, *, systemone=False):
         if isinstance(error, DecisionCancelled):
             raise HTTPException(status_code=503, detail=str(error)) from error
         if isinstance(error, ValueError):
-            raise HTTPException(
-                status_code=422 if systemone else 400, detail=str(error)
-            ) from error
+            raise HTTPException(status_code=400, detail=str(error)) from error
         logger.exception("Decision request failed")
         raise HTTPException(
             status_code=500, detail="Decision prediction failed"
@@ -145,27 +135,10 @@ async def _execute(body, request, response, deps, *, systemone=False):
         )
     )
     result["model"] = model_id
-    if systemone:
-        from uuid import uuid4
-
-        response.headers["x-typesafe-request-id"] = uuid4().hex
-        response.headers["x-clef-cached-tokens"] = str(output["cached_tokens"])
     return result
 
 
 def register_routes(app, deps):
     @app.post("/v1/decisions")
-    async def create_decisions(
-        body: DecisionRequest, request: Request, response: Response
-    ):
-        return await _execute(
-            body.model_dump(exclude_none=True), request, response, deps
-        )
-
-    @app.post("/v1/systemone", response_model=SystemOneResponse)
-    async def create_systemone(
-        body: SystemOneRequest, request: Request, response: Response
-    ):
-        return await _execute(
-            body.model_dump(exclude_none=True), request, response, deps, systemone=True
-        )
+    async def create_decisions(body: DecisionRequest, request: Request):
+        return await _execute(body.model_dump(exclude_none=True), request, deps)

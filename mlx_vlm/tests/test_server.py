@@ -6235,95 +6235,15 @@ def test_decisions_leave_mixed_media_to_the_model(client):
     )
 
 
-@pytest.mark.parametrize(
-    "question",
-    [
-        {"type": "bogus"},
-        {"type": "choice", "criteria": {}},
-        {"type": "choice", "criteria": ["a", "b"]},
-        {"type": "score", "criteria": []},
-        {"type": "score", "criteria": [None]},
-        {"type": "noul", "temperature": 1},
-    ],
-)
-def test_systemone_rejects_invalid_questions(client, question):
-    with patch.object(server, "get_cached_model") as load:
-        response = client.post(
-            "/v1/systemone",
-            json={"model": "decision", "state": "A", "questions": {"q": question}},
-        )
-    assert response.status_code == 422
-    load.assert_not_called()
-
-
-@pytest.mark.parametrize("surface", ["http", "dict", "schema"])
-def test_systemone_adapts_shared_predictions_and_confidence(client, surface):
-    from mlx_vlm.decision import systemone
-    from mlx_vlm.systemone import SystemOneRequest
-
-    questions = {
-        "outage": {"type": "noul"},
-        "team": {"type": "choice", "criteria": {"billing": None, "technical": "Bugs"}},
-        "urgency": {"type": "score", "criteria": ["Low", "Medium", "High"]},
-        "only_choice": {"type": "choice", "criteria": {"one": None}},
-        "only_level": {"type": "score", "criteria": ["Low"]},
-    }
-    native = {
-        "answers": {
-            "outage": {"type": "bool", "value": True, "probability": 0.8},
-            "team": {
-                "type": "choice",
-                "value": "technical",
-                "probabilities": {"billing": 0.25, "technical": 0.75},
-            },
-            "urgency": {
-                "type": "score",
-                "value": 1.6,
-                "probabilities": {"0": 0.1, "1": 0.2, "2": 0.7},
-            },
-        },
-        "usage": {"input_tokens": 12},
-    }
-    model = NS(
-        decision_types=("bool", "choice", "score"), predict=Mock(return_value=native)
-    )
-    native["answers"]["only_choice"] = {"probabilities": {"one": 1.0}}
-    native["answers"]["only_level"] = {"probabilities": {"0": 1.0}}
-    body = {"model": "decision", "state": "A", "questions": questions}
-    if surface == "http":
-        with patch.object(server, "get_cached_model", return_value=(model, None, {})):
-            response = client.post("/v1/systemone", json=body)
-        assert response.status_code == 200, response.text
-        assert response.headers["x-typesafe-request-id"]
-        assert response.headers["x-clef-cached-tokens"] == "0"
-        result = response.json()
-    else:
-        request = SystemOneRequest.model_validate(body) if surface == "schema" else body
-        result = systemone(model, None, request)
-    answers = result["answers"]
-    assert answers["outage"] == {"type": "noul", "noul": 0.8}
-    assert answers["team"]["confidence"] == 0.5
-    assert (
-        answers["urgency"]["score"] == 1.6 and answers["urgency"]["confidence"] == 0.4
-    )
-    assert answers["only_choice"]["confidence"] == 1.0
-    assert answers["only_level"]["score"] == 0.0
-    assert answers["only_level"]["confidence"] == 1.0
-    assert model.predict.call_args.args[2]["outage"]["type"] == "bool"
-
-
-@pytest.mark.parametrize(
-    "endpoint,kind", [("/v1/decisions", "bool"), ("/v1/systemone", "noul")]
-)
-def test_decision_backpressure_is_shared(client, monkeypatch, endpoint, kind):
+def test_decision_backpressure(client, monkeypatch):
     import mlx_vlm.server.decisions as decisions
     from mlx_vlm.decision_scheduler import DecisionQueueFull
 
     scheduler = NS(submit=Mock(side_effect=DecisionQueueFull("full")))
     monkeypatch.setattr(decisions, "get_scheduler", lambda deps: scheduler)
     result = client.post(
-        endpoint,
-        json={"model": "test", "state": "A", "questions": {"q": {"type": kind}}},
+        "/v1/decisions",
+        json={"model": "test", "state": "A", "questions": {"q": {"type": "bool"}}},
     )
     assert result.status_code == 429
 
@@ -6412,18 +6332,16 @@ def test_decision_scheduler_overload_cancellation_and_shutdown(incremental_decis
         scheduler.submit(body)
 
 
-@pytest.mark.parametrize("wire_format", ["native", "systemone"])
-def test_decision_disconnect_cancels_shared_job(monkeypatch, wire_format):
-    from fastapi import FastAPI, Response
+def test_decision_disconnect_cancels_shared_job(monkeypatch):
+    from fastapi import FastAPI
 
     import mlx_vlm.server.decisions as decisions
     from mlx_vlm.decision_scheduler import DecisionJob
-    from mlx_vlm.systemone import SystemOneRequest
 
     body = {
         "model": "test",
         "state": "A",
-        "questions": {"q": {"type": "noul" if wire_format == "systemone" else "bool"}},
+        "questions": {"q": {"type": "bool"}},
     }
     job = DecisionJob(body)
     monkeypatch.setattr(
@@ -6431,9 +6349,8 @@ def test_decision_disconnect_cancels_shared_job(monkeypatch, wire_format):
     )
     app = FastAPI()
     decisions.register_routes(app, NS(read_tenant_id=lambda request: "tenant"))
-    endpoint = app.routes[-1 if wire_format == "systemone" else -2].endpoint
-    schema = (
-        SystemOneRequest if wire_format == "systemone" else decisions.DecisionRequest
+    endpoint = next(
+        route.endpoint for route in app.routes if route.path == "/v1/decisions"
     )
 
     async def disconnected():
@@ -6442,9 +6359,8 @@ def test_decision_disconnect_cancels_shared_job(monkeypatch, wire_format):
     with pytest.raises(HTTPException) as error:
         asyncio.run(
             endpoint(
-                schema.model_validate(body),
+                decisions.DecisionRequest.model_validate(body),
                 NS(is_disconnected=disconnected),
-                Response(),
             )
         )
     assert error.value.status_code == 499
