@@ -21,10 +21,13 @@ import mlx_vlm.models.rope_utils as rope_utils
 from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
 from mlx_vlm.fp8 import _dequantize_fp8_weight, _quantize_fp8_weight
 from mlx_vlm.models.cache import KVCache
+from mlx_vlm.models.kernels import grid_sample
 from mlx_vlm.models.mla import max_absorbed_queries
 from mlx_vlm.models.paddleocr_vl.config import VisionConfig
 from mlx_vlm.models.paddleocr_vl.vision import Attention, VisionModel
 from mlx_vlm.models.qwen3_5 import language as lang
+from mlx_vlm.models.rfdetr.config import DINOv2Config
+from mlx_vlm.models.rfdetr.vision import DINOv2Attention
 from mlx_vlm.models.rope_utils import (
     EagerRoPE,
     MRoPERotaryEmbedding,
@@ -428,6 +431,34 @@ def _tiny_vision_model():
     )
 
 
+def test_rfdetr_small_variant_matches_checkpoint_layout():
+    from mlx_vlm.models.rfdetr import Model, ModelConfig
+    from mlx_vlm.models.rfdetr.convert import MODEL_VARIANTS
+
+    # Roboflow RFDETRSmallConfig: 512px, patch 16, 32x32 position grid, 2 windows
+    config = ModelConfig.from_dict(copy.deepcopy(MODEL_VARIANTS["small"]["config"]))
+    model = Model(config)
+    backbone = model.backbone
+
+    # Shapes of the rf-detr-small.pth backbone tensors
+    assert backbone.embeddings.position_embeddings.shape == (1, 1 + 32 * 32, 384)
+    assert backbone.embeddings.patch_embeddings.projection.weight.shape == (
+        384,
+        16,
+        16,
+        3,
+    )
+    assert backbone.num_windows == backbone.embeddings.num_windows == 2
+    # Stages 3, 6, 9, 12 are the outputs of blocks 2, 5, 8, 11; blocks 3, 6, 9
+    # use global attention and the rest are windowed.
+    assert backbone.config.out_feature_indexes == [2, 5, 8, 11]
+    assert sorted(backbone.window_block_indexes) == [0, 1, 2, 4, 5, 7, 8, 10, 11]
+
+    res = config.resolution
+    features = backbone(mx.zeros((1, res, res, 3)))
+    assert [f.shape for f in features] == [(1, 32, 32, 384)] * 4
+
+
 def test_paddle_attention_uses_no_mask_for_single_segment():
     attention = Attention(dim=8, num_heads=2)
     hidden_states = mx.random.uniform(shape=(4, 8))
@@ -461,12 +492,70 @@ def test_paddle_batch_matches_packed_fallback(second_grid, fast_path):
     _assert_allclose(output, expected)
 
 
+@pytest.mark.parametrize(
+    "batch,size,image_size",
+    [
+        (1, (32, 32), (384, 384)),
+        (2, (5, 7), (47, 50)),
+        (1, (9, 6), (17, 22)),
+        (2, (3, 4), (7, 30)),
+    ],
+)
+def test_rfdetr_segmentation_upsample_matches_gather_reference(batch, size, image_size):
+    from mlx_vlm.models.rfdetr.segmentation import SegmentationHead
+
+    head = SegmentationHead(in_dim=16, num_blocks=1)
+    features = mx.random.normal((batch, *size, 16), key=mx.random.key(0))
+    queries = mx.random.normal((batch, 3, 16), key=mx.random.key(1))
+    out_h, out_w = image_size[0] // 4, image_size[1] // 4
+
+    # align_corners=True bilinear from four corner gathers
+    def taps(n_in, n_out):
+        pos = mx.linspace(0, n_in - 1, n_out)
+        lo = mx.minimum(mx.floor(pos).astype(mx.int32), n_in - 1)
+        return lo, mx.minimum(lo + 1, n_in - 1), pos - lo
+
+    y0, y1, fy = taps(size[0], out_h)
+    x0, x1, fx = taps(size[1], out_w)
+    fy, fx = fy[:, None, None], fx[None, :, None]
+    top, bottom = (
+        r[:, :, x0] * (1 - fx) + r[:, :, x1] * fx
+        for r in (features[:, y0], features[:, y1])
+    )
+    upsampled = top * (1 - fy) + bottom * fy
+
+    # Already at the target size, so the head skips its own resize
+    expected = head(upsampled, queries, (out_h * 4, out_w * 4))
+    # Sample positions can differ by one float32 ulp from the reference's
+    _assert_allclose(head(features, queries, image_size), expected, atol=1e-4)
+
+
 @pytest.fixture
 def two_pass_inputs():
     kv_len = two_pass_kv_len()
     if kv_len is None:
         pytest.skip("no KV length on this GPU selects the two-pass plan")
     return inputs(kv_len)
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("grid_dtype", [None, mx.float32])
+def test_grid_sample_half_precision_matches_float32(dtype, grid_dtype):
+    if not mx.metal.is_available():
+        pytest.skip("Metal kernels are unavailable on this host")
+
+    mx.random.seed(0)
+    x = mx.random.normal((2, 12, 10, 8)).astype(dtype)
+    grid = mx.random.uniform(-1.1, 1.1, (2, 7, 5, 2)).astype(grid_dtype or dtype)
+    expected = grid_sample(x.astype(mx.float32), grid.astype(mx.float32))
+    actual = grid_sample(x, grid)
+    mx.eval(actual)  # surface kernel build errors here rather than in np.array
+    assert actual.dtype == dtype
+    # Only the final rounding to `dtype` should separate the two.
+    rtol = 2**-8 if dtype == mx.bfloat16 else 2**-10
+    np.testing.assert_allclose(
+        np.array(actual.astype(mx.float32)), np.array(expected), rtol=rtol, atol=1e-6
+    )
 
 
 # Rotary embeddings
@@ -1326,3 +1415,20 @@ def test_rejects_missing_or_invalid_signs(packed_prism_checkpoint, missing):
         weights[key] = mx.zeros_like(weights[key])
     with pytest.raises(ValueError, match="sign"):
         prism.Model(prism.ModelConfig.from_dict(config)).sanitize(weights)
+
+
+@pytest.mark.parametrize("batch,tokens", [(1, 101), (3, 17)])
+def test_rfdetr_backbone_attention_matches_softmax_reference(batch, tokens):
+    attention = DINOv2Attention(DINOv2Config(hidden_size=48, num_attention_heads=3))
+    x = mx.random.normal((batch, tokens, 48), key=mx.random.key(0))
+
+    def heads(t):
+        return t.reshape(batch, tokens, 3, 16).transpose(0, 2, 1, 3)
+
+    q, k, v = (
+        heads(proj(x))
+        for proj in (attention.q_proj, attention.k_proj, attention.v_proj)
+    )
+    scores = mx.softmax((q @ k.transpose(0, 1, 3, 2)) * attention.scale, axis=-1)
+    expected = (scores @ v).transpose(0, 2, 1, 3).reshape(batch, tokens, 48)
+    _assert_allclose(attention(x), attention.o_proj(expected))

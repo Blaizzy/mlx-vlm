@@ -103,13 +103,56 @@ For automatic compaction, add this field to a Responses request:
 
 The server checks the rendered input token count **before generation**, including
 for streaming requests. This implementation does not compact mid-generation.
-Set the threshold below the context limit, leaving room for the summary prompt
-and its output. When compaction happens, the response output starts with a
+The threshold is overridden when input plus reserved output would exceed the
+context limit. Automatic and terminal-trigger compaction can summarize oversized
+history in up to eight bounded passes, preserving instructions, the latest
+exchange, and tool-call/result groups. Every summary call must fit the model
+window and reduce its input; otherwise the request fails without replacing the
+original context. A single oversized exchange still needs to be reduced by the
+caller. The standalone `/responses/compact` endpoint still requires its input to fit.
+When compaction happens, the response output starts with a
 `type: "compaction"` item. Append the output normally, or keep only the newest
 compaction item and everything after it. `previous_response_id` chaining also
 works while that response is stored. `/v1/responses/input_tokens` counts the
 decoded context, not the encrypted payload's string length. Normal response
 usage counts the final inference; explicit compact usage counts the summary pass.
+
+Chat Completions automatically compacts supported history when the full input
+plus requested output exceeds the context limit. No threshold setting is needed.
+The optional `context_management` field enables earlier compaction; an empty list
+explicitly disables compaction. Recovery supports text, images, and tool history;
+audio/video requests keep their existing behavior. Compaction finishes before the
+Chat Completions stream opens and leaves its response format unchanged. It is
+request-local: clients that resend their full history may need compaction again
+on later requests. Responses clients can
+reuse the returned compaction item.
+
+Streaming automatic compaction and terminal `compaction_trigger` requests emit
+request-scoped MLX extension events after `response.created` / `response.in_progress`
+and before the compaction output item:
+
+```text
+event: mlx.compaction.started
+data: {"type":"mlx.compaction.started","response_id":"resp_...","input_tokens":5786}
+
+event: mlx.compaction.completed
+data: {"type":"mlx.compaction.completed","response_id":"resp_...","input_tokens_before":5786,"input_tokens_after":854}
+```
+
+Use these events to drive a compacting indicator without a token-count preflight.
+`started` means the server has selected history and checked summary headroom;
+`completed` means the smaller context passed validation. No summary means no
+progress events, even if the threshold was reached. The token counts describe the
+rendered conversation before and after compaction, not cache hits or summary usage.
+Clients may ignore these additional events; ordinary Responses output is unchanged.
+Keep the capsule from the accepted final response, not from a progress event.
+
+Once the stream is open, failures are terminal `response.failed` SSE events with
+`response.error.message` and a string `response.error.code` (`invalid_prompt`,
+`context_length_exceeded`, `rate_limit_exceeded`, or `server_error`). They do not produce a successful final
+response. Clear the indicator on failure or disconnect.
+Disconnecting cancels the queued summary worker. Non-streaming compaction still
+reports failures through HTTP status codes.
 
 For native compaction, a single terminal input item
 `{"type": "compaction_trigger"}` on `/v1/responses` requests compaction without
@@ -159,9 +202,10 @@ interchangeable with MLX-issued items. `store=False` avoids the Responses regist
 APC persistence is configured separately.
 
 Run the opt-in HTTP integration tests on Apple Silicon with model access and
-`pytest`, `httpx`, and `openai` installed:
+the test extra (including `httpx2`) plus `openai` installed:
 
 ```bash
+python -m pip install -e ".[test]" openai
 MLX_VLM_COMPACTION_TEST_MODEL=openbmb/MiniCPM5-2B \
   python -m pytest -q mlx_vlm/tests/test_server.py::TestCompaction -k real_
 ```

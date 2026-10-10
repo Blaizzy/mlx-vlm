@@ -883,6 +883,7 @@ class StreamOptions(BaseModel):
 
 class ChatRequest(GenerationRequest):
     messages: List[ChatMessage]
+    context_management: Optional[List[CompactionControl]] = Field(None, max_length=1)
     stream_options: Optional[StreamOptions] = None
     tools: Optional[List[Any]] = Field(None, description="Tools the model may call.")
     tool_choice: Optional[Any] = Field(

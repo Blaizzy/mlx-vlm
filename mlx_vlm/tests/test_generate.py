@@ -1778,6 +1778,22 @@ def test_sampling_filter_matches_numpy(name, values, reference, tolerance):
         assert (output != -mx.inf).tolist() == [True, False, False, False, False]
 
 
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("typical_p", [0.2, 0.5, 0.9])
+def test_typical_p_low_precision_logprobs_match_float32(dtype, typical_p):
+    # A float16/bfloat16 running sum of many small probabilities stops growing
+    # below typical_p, which kept every token.
+    vocab_size = 32768
+    logits = mx.random.normal((1, vocab_size), key=mx.random.key(0)) * 2.0
+    logprobs = (logits - mx.logsumexp(logits, axis=-1, keepdims=True)).astype(dtype)
+    expected = sampling.apply_typical_p(logprobs.astype(mx.float32), typical_p)
+    actual = sampling.apply_typical_p(logprobs, typical_p)
+    assert actual.dtype == dtype
+    kept = actual > -mx.inf
+    assert kept.sum().item() < vocab_size
+    assert mx.array_equal(kept, expected > -mx.inf).item()
+
+
 @pytest.mark.parametrize(
     "shape,dtype,top_p",
     [

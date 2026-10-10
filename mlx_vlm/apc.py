@@ -3646,11 +3646,11 @@ class APCManager:
                     for t in token_ids[i * self.block_size : (i + 1) * self.block_size]
                 )
                 h = _hash_tokens(parent, chunk, extra_hash)
-                # If the prefix is already in memory, the normal memory path is
-                # better and preserves the expected ref-count lifecycle.
+                # Prefer memory only when the leading block is resident.
                 b_mem = self.hash_table.get(h)
                 if (
-                    not allow_memory_overlap
+                    i == 0
+                    and not allow_memory_overlap
                     and b_mem is not None
                     and b_mem.token_ids == chunk
                 ):
