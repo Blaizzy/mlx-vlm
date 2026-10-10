@@ -65,6 +65,31 @@ def test_notebook_cells_train_evaluate_and_reload(notebook, train_type, tmp_path
     ]
 
     def load_dataset_fixture(dataset_id, *, revision=None, split=None):
+        if dataset_id == "mlx-community/Josiefied-Qwen3-dpo-v1-flat":
+            preference_rows = Dataset.from_dict(
+                {
+                    "image": [
+                        PILImage.new("RGB", (32, 16), "white") for _ in range(10)
+                    ],
+                    "prompt": [f"Describe image {index}." for index in range(10)],
+                    "chosen": [f"A detailed description {index}." for index in range(10)],
+                    "rejected": [f"An unclear description {index}." for index in range(10)],
+                },
+                features=Features(
+                    {
+                        "image": Image(),
+                        "prompt": Value("string"),
+                        "chosen": Value("string"),
+                        "rejected": Value("string"),
+                    }
+                ),
+            )
+            return DatasetDict(
+                {
+                    "train": preference_rows,
+                    "validation": preference_rows.select([0, 1]),
+                }
+            )
         if dataset_id == "mlx-community/JOSIE-v2-Instruct-5K":
             assert split == "train"
             return Dataset.from_dict(
