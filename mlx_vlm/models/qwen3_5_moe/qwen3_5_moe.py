@@ -22,6 +22,9 @@ class Model(Qwen3_5Model):
         self.vision_tower = VisionModel(config.vision_config)
         self.language_model = LanguageModel(config.text_config, config)
 
+    def shard(self, group=None):
+        self.language_model.shard(group)
+
     def sanitize(self, weights):
         # The MTP draft shard is separate from the base model. Its presence
         # must not select the base model's RMSNorm loading convention.

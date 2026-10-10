@@ -469,4 +469,15 @@ mlx.launch \
     --image mx-vlm/examples/images/scene_1.jpg
 ```
 
+Qwen3.5/3.6 MoE models also support tensor parallelism, including their linear attention and shared experts. For example, with two hosts:
+
+```bash
+mlx.launch --backend jaccl --hostfile hosts.json -- \
+    python examples/sharded_generate.py --backend jaccl \
+    --model mlx-community/Qwen3.6-35B-A3B-4bit \
+    --prompt "What is 17 times 19?" --max-tokens 128
+```
+
+Pass the backend to both the launcher and the example so RDMA initialization failures are reported. Qwen MoE tensor parallelism currently supports ordinary generation; speculative verification is not supported.
+
 We recommend you use the JACCL protocol over Thunderbolt. For more information, please refer to [the MLX distributed communication guide](https://ml-explore.github.io/mlx/build/html/usage/distributed.html).
