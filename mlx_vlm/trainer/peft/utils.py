@@ -1,10 +1,27 @@
-import json
+"""Create, load, and save adapters for composite language/audio/vision models."""
+
 from pathlib import Path
+from typing import Union
 
 import mlx.nn as nn
 
-from ..core import get_module_by_name, print_trainable_parameters, set_module_by_name
+from mlx_vlm.trainer.common.model import (
+    _dequantize_model,
+    _read_checkpoint,
+    _record_adapter_config,
+    _restore_quantization,
+)
+from mlx_vlm.trainer.common.utils import (
+    get_module_by_name,
+    print_trainable_parameters,
+    save_trainable_weights,
+    set_module_by_name,
+)
+
+from .adapter_utils import linear_to_lora_layers
+from .dora_layers import DoRALinear
 from .lora import LoRaLayer
+from .lora_layers import LoRALinear
 
 DEFAULT_LORA_NUM_LAYERS = -1
 
@@ -13,23 +30,15 @@ def _lora_scale(alpha: float, rank: int) -> float:
     return alpha / rank
 
 
-def _linear_layer_key(model_key: str, language_key: str) -> str:
-    return f"{model_key}.{language_key}" if language_key else model_key
-
-
 def _to_lora(layer, lora_parameters, use_dora=False):
     if isinstance(layer, (nn.Linear, nn.QuantizedLinear)):
         if use_dora:
-            from .dora_layers import DoRALinear
-
             return DoRALinear.from_base(
                 layer,
                 r=lora_parameters["rank"],
                 scale=lora_parameters["scale"],
                 dropout=lora_parameters["dropout"],
             )
-
-        from .lora_layers import LoRALinear
 
         return LoRALinear.from_base(
             layer,
@@ -41,19 +50,58 @@ def _to_lora(layer, lora_parameters, use_dora=False):
     raise ValueError(f"Can't convert layer of type {type(layer).__name__} to LoRA")
 
 
-def _apply_language_lora_layers(model, linear_layers, lora_parameters):
-    targets = set(linear_layers)
-    keys = []
-    for name, module in model.language_model.named_modules():
-        if isinstance(module, (nn.Linear, nn.QuantizedLinear)):
-            if name.split(".")[-1] in targets:
-                set_module_by_name(
-                    model.language_model,
-                    name,
-                    _to_lora(module, lora_parameters),
+def _adapter_target(model):
+    """Return the transformer module that owns the target layers."""
+    language_model = getattr(model, "language_model", None)
+    if language_model is not None:
+        return language_model
+    inner_model = getattr(model, "model", None)
+    if inner_model is not None and hasattr(inner_model, "layers"):
+        return inner_model
+    return model
+
+
+def _resolve_lora_targets(model, linear_layers):
+    target = _adapter_target(model)
+    prefix = next(
+        (name for name, module in model.named_modules() if module is target), ""
+    )
+    modules = {
+        name: module
+        for name, module in model.named_modules()
+        if isinstance(module, (nn.Linear, nn.QuantizedLinear))
+    }
+    candidates = [
+        name for name in modules if not prefix or name.startswith(prefix + ".")
+    ]
+    if linear_layers is None:
+        suffixes = set(find_all_linear_names(target))
+        keys = [name for name in candidates if name.split(".")[-1] in suffixes]
+    else:
+        if isinstance(linear_layers, str):
+            raise ValueError(
+                "Pass layer names as a list, such as ['q_proj', 'v_proj']."
+            )
+        keys = []
+        for name in linear_layers:
+            if name in modules:
+                matches = [name]
+            elif "." in name:
+                matches = [key for key in (name, f"{prefix}.{name}") if key in modules]
+            else:
+                matches = [key for key in candidates if key.split(".")[-1] == name]
+            if not matches:
+                raise ValueError(
+                    f"No matching Linear targets for {name}. "
+                    f"Available layer names: {sorted(modules)}."
                 )
-                keys.append(_linear_layer_key("language_model", name))
-    return keys
+            keys.extend(matches)
+    if not keys:
+        raise ValueError(
+            f"No matching Linear targets. Available layer names: {sorted(modules)}. "
+            "Load a fresh base model and choose names from this list."
+        )
+    return list(dict.fromkeys(keys))
 
 
 def _apply_lora_layers(model, config):
@@ -65,10 +113,8 @@ def _apply_lora_layers(model, config):
         return model
 
     if "keys" not in lora_parameters:
-        from .adapter_utils import linear_to_lora_layers
-
         linear_to_lora_layers(
-            model,
+            _adapter_target(model),
             config.get("num_layers", DEFAULT_LORA_NUM_LAYERS),
             lora_parameters,
             use_dora=use_dora,
@@ -76,18 +122,21 @@ def _apply_lora_layers(model, config):
         return model
 
     for name in lora_parameters["keys"]:
-        module = get_module_by_name(model, name)
+        target = model
+        try:
+            module = get_module_by_name(target, name)
+        except (AttributeError, IndexError, KeyError):
+            target = _adapter_target(model)
+            module = get_module_by_name(target, name)
         set_module_by_name(
-            model,
-            name,
-            _to_lora(module, lora_parameters, use_dora=use_dora),
+            target, name, _to_lora(module, lora_parameters, use_dora=use_dora)
         )
     return model
 
 
-def _lora_config(rank, alpha, dropout):
+def _lora_config(rank, alpha, dropout, *, use_dora=False):
     return {
-        "fine_tune_type": "lora",
+        "fine_tune_type": "dora" if use_dora else "lora",
         "num_layers": DEFAULT_LORA_NUM_LAYERS,
         "lora_parameters": {
             "rank": rank,
@@ -111,39 +160,100 @@ def _apply_legacy_lora_layers(model, config):
 
 def get_peft_model(
     model,
-    linear_layers,
+    linear_layers=None,
     rank=10,
     alpha=0.1,
     dropout=0.1,
     freeze=True,
     verbose=True,
     legacy=False,
+    use_dora=False,
 ):
+    """Attach LoRA/DoRA adapters, discovering transformer targets by default.
+
+    Args:
+        model: A loaded MLX model.
+        linear_layers: Linear suffixes or qualified names, or None to discover
+            transformer targets automatically (excluding the language head).
+        rank: Adapter rank.
+        alpha: Adapter scaling numerator; the update scale is alpha / rank.
+        dropout: Dropout probability for adapter inputs.
+        freeze: Freeze the entire base model before attaching trainable adapters.
+        verbose: Print the trainable parameter count.
+        legacy: Use the legacy adapter format.
+        use_dora: Use DoRA instead of LoRA.
+
+    Returns:
+        The same model with adapters attached and checkpoint metadata recorded.
+    """
+    keys = _resolve_lora_targets(model, linear_layers)
+    if rank <= 0:
+        raise ValueError("LoRA rank must be positive.")
+    if not 0 <= dropout < 1:
+        raise ValueError(
+            "LoRA dropout must be between 0 (inclusive) and 1 (exclusive)."
+        )
     if freeze:
         freeze_model(model)
-
+        model.freeze()
     if legacy:
-        for name, module in model.language_model.named_modules():
-            if isinstance(module, nn.Linear) or isinstance(module, nn.QuantizedLinear):
-                if name.split(".")[-1] in linear_layers:
-                    lora_layer = LoRaLayer(module, rank, alpha, dropout)
-                    set_module_by_name(model.language_model, name, lora_layer)
-
-        model.config.lora = {}
-        model.config.lora["rank"] = rank
-        model.config.lora["alpha"] = alpha
-        model.config.lora["dropout"] = dropout
+        for name in keys:
+            module = get_module_by_name(model, name)
+            set_module_by_name(model, name, LoRaLayer(module, rank, alpha, dropout))
+        config = {"rank": rank, "alpha": alpha, "dropout": dropout}
     else:
-        config = _lora_config(rank, alpha, dropout)
-        config["lora_parameters"]["keys"] = _apply_language_lora_layers(
-            model, linear_layers, config["lora_parameters"]
-        )
-        model.config.lora = config
-
+        config = _lora_config(rank, alpha, dropout, use_dora=use_dora)
+        config["lora_parameters"]["keys"] = keys
+        _apply_lora_layers(model, config)
+    _record_adapter_config(model, config)
     if verbose:
-        print_trainable_parameters(model.language_model)
-
+        print_trainable_parameters(model)
     return model
+
+
+def apply_lora_layers(model: nn.Module, adapter_path: Union[str, Path]) -> nn.Module:
+    """Restore adapter settings, base quantization, and weights onto a fresh base.
+
+    Pass the saved weights file with adapter_config.json beside it, or a folder
+    containing adapters.safetensors or weights.safetensors. The base stays frozen
+    and the restored adapters remain trainable.
+    """
+    weights_path, config = _read_checkpoint(adapter_path)
+    if config.get("fine_tune_type") == "full":
+        _dequantize_model(model)
+        model.load_weights(str(weights_path), strict=True)
+        _record_adapter_config(model, config)
+        return model
+    if "rank" not in config and "lora_parameters" not in config:
+        raise ValueError("The adapter does not have lora params in the config")
+    _restore_quantization(model, config.get("base_quantization", {}))
+    model.freeze()
+    if "lora_parameters" in config:
+        _apply_lora_layers(model, config)
+    else:
+        _apply_legacy_lora_layers(model, config)
+    model.load_weights(str(weights_path), strict=False)
+    _record_adapter_config(model, config)
+    return model
+
+
+def load_adapters(model: nn.Module, adapter_path: Union[str, Path]) -> nn.Module:
+    """Restore adapters from a saved weights file or adapter directory.
+
+    Load the original base model first. The saved metadata restores the target
+    layers, rank, scale, and dropout, so no manual LoRA setup is needed.
+    """
+    return apply_lora_layers(model, adapter_path)
+
+
+def dequantize(model: nn.Module) -> nn.Module:
+    """Replace quantized linear and embedding modules with float modules."""
+    return _dequantize_model(model)
+
+
+def save_adapter(model: nn.Module, adapter_file: Union[str, Path]):
+    """Save adapter weights and config."""
+    save_trainable_weights(model, adapter_file)
 
 
 def freeze_model(model):
@@ -200,40 +310,6 @@ def find_all_linear_names(model):
     if "lm_head" in lora_module_names:  # needed for 16-bit
         lora_module_names.remove("lm_head")
     return list(lora_module_names)
-
-
-def apply_lora_layers(model: nn.Module, adapter_path: str) -> nn.Module:
-    """
-    Apply LoRA layers to the model.
-
-    Args:
-        model (nn.Module): The neural network model.
-        adapter_path (str): Path to the adapter configuration file.
-
-    Returns:
-        nn.Module: The updated model with LoRA layers applied.
-    """
-    adapter_path = Path(adapter_path)
-
-    if not adapter_path.exists():
-        raise FileNotFoundError(f"The adapter path does not exist: {adapter_path}")
-
-    with open(adapter_path / "adapter_config.json", "r") as f:
-        config = json.load(f)
-        if "rank" not in config and "lora_parameters" not in config:
-            raise ValueError("The adapter does not have lora params in the config")
-
-    # Freeze the base before attaching adapters so resuming matches a fresh
-    # start.
-    freeze_model(model)
-
-    if "lora_parameters" in config:
-        model = _apply_lora_layers(model, config)
-    else:
-        model = _apply_legacy_lora_layers(model, config)
-
-    model.load_weights(str(adapter_path / "adapters.safetensors"), strict=False)
-    return model
 
 
 def unfreeze_modules(model: nn.Module, module_names):

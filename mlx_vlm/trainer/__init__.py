@@ -1,10 +1,16 @@
 """MLX-VLM training backend.
 
-Shared execution code lives next to this module. Reusable loss math and dataset
-shapes are in ``losses`` and ``datasets``. Modality packages own their training
-algorithms, preprocessing, and recipes.
+The notebook ``Trainer`` API and CLI share the engine in ``common``. Reusable
+loss math and raw dataset loading live in ``losses`` and ``datasets``. The
+``vlm`` package owns preprocessing and objectives. Existing functional recipes
+remain available through ``train``/``train_orpo`` and their object facades.
 """
 
+from .api import Trainer
+from .common.callbacks import TrainingCallback, WandBCallback
+from .common.config import CoreTrainingArgs
+from .common.model import prepare_model_for_training
+from .common.task import TrainingTask
 from .core import (
     Colors,
     count_parameters,
@@ -34,7 +40,6 @@ from .peft import (
 )
 from .vlm import (
     ORPOTrainer,
-    ORPOTrainingArgs,
     PreferenceVisionDataset,
     SFTTrainer,
     TrainingArgs,
@@ -42,3 +47,6 @@ from .vlm import (
     train,
     train_orpo,
 )
+from .vlm.config import VLMTrainingArgs
+from .vlm.dpo.config import DPOTrainingArgs
+from .vlm.orpo.config import ORPOTrainingArgs
