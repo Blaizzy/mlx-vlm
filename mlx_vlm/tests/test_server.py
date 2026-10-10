@@ -1749,7 +1749,11 @@ def test_responses_native_tool_calls(client, kind, stream):
 
 def _completed_response(response):
     events = _data(response)
-    final = next(e["response"] for e in events if e["type"] == "response.completed")
+    final = next(
+        e["response"]
+        for e in events
+        if e["type"] in ("response.completed", "response.incomplete")
+    )
     output = final["output"]
     for kind in ("added", "done"):
         items = [e for e in events if e["type"] == f"response.output_item.{kind}"]
@@ -1866,6 +1870,8 @@ def test_responses_truncated_preopened_reasoning(client, continuous, stream):
         ),
     ):
         response = _response(client, stream=stream)
+    assert response["status"] == "incomplete"
+    assert response["incomplete_details"] == {"reason": "max_output_tokens"}
     assert response["output_text"] == ""
     assert len(response["output"]) == 1
     item = response["output"][0]
@@ -2570,8 +2576,93 @@ class TestCompaction:
         assert mocked.generate.call_count == 1
 
     @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("api", ["responses", "chat"])
+    @pytest.mark.parametrize("limit", [2048, 4096, 8192, 128000])
+    @pytest.mark.parametrize("output", [64, 128000, 256000])
+    def test_max_output_is_a_ceiling_for_short_prompts(
+        self, mocked, client, monkeypatch, api, stream, limit, output
+    ):
+        mocked.config.max_position_embeddings = 128000
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", limit)
+        options = dict(
+            stream=stream,
+            context_management=[
+                {"type": "compaction", "compact_threshold": limit * 3 // 4}
+            ],
+        )
+        if api == "chat":
+            options.update(
+                messages=[_msg("Are you ready to help me with some coding?")],
+                max_tokens=output,
+            )
+        else:
+            options.update(
+                input="Are you ready to help me with some coding?",
+                max_output_tokens=output,
+            )
+        original = copy.deepcopy(options)
+        response = _post(client, api, **options)
+        assert response.status_code == 200, response.text
+        assert options == original
+        assert mocked.generate.call_count == (0 if stream else 1)
+        answer = mocked.stream.call_args if stream else mocked.generate.call_args
+        prompt_tokens = len(answer.kwargs["prompt"]) // 4
+        assert answer.kwargs["max_tokens"] == min(output, limit - prompt_tokens)
+        assert "Conversation handoff" not in answer.kwargs["prompt"]
+
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("api", ["responses", "chat"])
+    @pytest.mark.parametrize("offset", [-1, 0, 1])
+    def test_actual_input_triggers_compaction_and_output_uses_compacted_size(
+        self, mocked, client, monkeypatch, api, stream, offset
+    ):
+        items = [_compaction_message("older evidence " * 150) for _ in range(5)]
+        items.append(_compaction_message("Continue"))
+        before = mocked.count(input=items)["input_tokens"]
+        limit = before * 2
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", limit)
+        options = dict(
+            stream=stream,
+            context_management=[
+                {"type": "compaction", "compact_threshold": before + offset}
+            ],
+        )
+        if api == "chat":
+            options.update(messages=items, max_tokens=limit)
+        else:
+            options.update(input=items, max_output_tokens=limit)
+        response = _post(client, api, **options)
+        assert response.status_code == 200, response.text
+        should_compact = offset <= 0
+        assert mocked.generate.call_count == int(should_compact) + int(not stream)
+        answer = mocked.stream.call_args if stream else mocked.generate.call_args
+        after = len(answer.kwargs["prompt"]) // 4
+        assert answer.kwargs["max_tokens"] == limit - after
+        assert ("Conversation handoff" in answer.kwargs["prompt"]) == should_compact
+        if should_compact:
+            assert after < before
+
+    @pytest.mark.parametrize("api", ["responses", "chat"])
+    def test_required_input_must_leave_room_for_generation(
+        self, mocked, api, monkeypatch
+    ):
+        items = [_compaction_message("protected input " * 500)]
+        before = mocked.count(input=items)["input_tokens"]
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", before)
+        options = dict(
+            context_management=[{"type": "compaction", "compact_threshold": 1}]
+        )
+        if api == "chat":
+            options.update(messages=items, max_tokens=before)
+        else:
+            options.update(input=items, max_output_tokens=before)
+        response = mocked.request(api, status=400, **options)
+        assert "Protected conversation" in response["detail"]
+        mocked.generate.assert_not_called()
+
+    @pytest.mark.parametrize("stream", [False, True])
     @pytest.mark.parametrize("api", ["responses", "chat", "chat-default"])
-    def test_output_budget_overrides_compaction_threshold(
+    def test_unused_output_does_not_override_compaction_threshold(
         self, mocked, client, monkeypatch, api, stream
     ):
         items = [_compaction_message("old evidence " * 150) for _ in range(6)]
@@ -2591,10 +2682,11 @@ class TestCompaction:
             options.update(input=items, max_output_tokens=256)
         response = _post(client, api, **options)
         assert response.status_code == 200, response.text
-        assert mocked.generate.call_count == (1 if stream else 2)
+        assert mocked.generate.call_count == (0 if stream else 1)
         answer_call = mocked.stream.call_args if stream else mocked.generate.call_args
-        assert len(answer_call.kwargs["prompt"]) // 4 + 256 <= before + 32
-        assert "Conversation handoff" in answer_call.kwargs["prompt"]
+        assert answer_call.kwargs["max_tokens"] == 32
+        assert len(answer_call.kwargs["prompt"]) // 4 + 32 == before + 32
+        assert "Conversation handoff" not in answer_call.kwargs["prompt"]
 
     @pytest.mark.parametrize("stream", [False, True])
     @pytest.mark.parametrize("mode", ["automatic", "trigger", "chat"])
@@ -2935,8 +3027,8 @@ class TestCompaction:
     @pytest.mark.parametrize(
         "threshold, output_tokens, status",
         [
-            pytest.param(1, 32768, 400, id="budget-above-threshold"),
-            pytest.param(100000, 32768, 400, id="budget-below-threshold"),
+            pytest.param(1, 0, 400, id="zero-output"),
+            pytest.param(100000, -1, 400, id="negative-output"),
             pytest.param(0, 64, 422, id="zero-threshold"),
             pytest.param(-1, 64, 422, id="negative-threshold"),
             pytest.param("bad", 64, 422, id="nonnumeric-threshold"),
@@ -3273,7 +3365,7 @@ class TestCompaction:
                 "responses",
                 input=_compaction_history(),
                 stream=True,
-                max_output_tokens=32768,
+                max_output_tokens=0,
                 context_management=[{"type": "compaction", "compact_threshold": 1}],
             )
         )
