@@ -5,7 +5,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 from PIL import Image
+
+from mlx_vlm.decision import SystemOneRequest, encode_record
 
 # ── Shared mocks ──────────────────────────────────────────────────────────────
 
@@ -3351,3 +3354,74 @@ class TestTrustRemoteCodePassthrough(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# Decision request encoding and media validation.
+
+
+class _DecisionTokenizer:
+    def __init__(self, vocab_size=128):
+        self.vocab_size = vocab_size
+
+    def __call__(self, text, **kwargs):
+        return SimpleNamespace(
+            input_ids=[ord(char) % (self.vocab_size - 1) for char in text]
+        )
+
+
+def _decision_request():
+    return {
+        "model": "decision-test",
+        "state": "The server is down",
+        "questions": {
+            "outage": {"type": "noul"},
+            "team": {
+                "type": "choice",
+                "criteria": {"technical": "Bugs", "billing": None},
+            },
+            "urgency": {"type": "score", "criteria": ["Low", "Medium", "High"]},
+        },
+    }
+
+
+def test_decision_encoding_order_and_overflow():
+    encoded = encode_record(_DecisionTokenizer(), _decision_request())
+    assert encoded.questions[0].option_ids == ("true", "false")
+    assert encoded.questions[1].option_ids == ("billing", "technical")
+    assert encoded.questions[2].option_ids == ("0", "1", "2")
+    with pytest.raises(ValueError, match="maximum"):
+        encode_record(
+            _DecisionTokenizer(),
+            _decision_request(),
+            max_length=len(encoded.input_ids) - 1,
+        )
+
+
+def test_decision_media_validation_and_decoding():
+    import base64
+    import io
+
+    from PIL import Image
+
+    from mlx_vlm.decision import _decode_media
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (32, 32), "red").save(buffer, format="PNG")
+    url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+    media = _decode_media({"images": [url]})
+    assert media["images"][0].getpixel((0, 0)) == (255, 0, 0)
+    video = _decode_media({"videos": [[url, url]]})
+    assert video["videos"][0].shape == (2, 32, 32, 3)
+    with pytest.raises(ValueError, match="HTTP"):
+        _decode_media({"images": ["/etc/passwd"]})
+    mixed = SystemOneRequest.model_validate(
+        {**_decision_request(), "images": [url], "videos": [[url]]}
+    )
+    assert mixed.images and mixed.videos
+
+
+def test_decision_empty_question_instruction_rejected():
+    with pytest.raises(ValueError, match="nonempty"):
+        encode_record(
+            _DecisionTokenizer(), {"state": "", "questions": {"": {"type": "noul"}}}
+        )

@@ -75,6 +75,26 @@ def main():
         help="Pre-load an embedding model at startup.",
     )
     parser.add_argument(
+        "--decision-model",
+        type=str,
+        default=None,
+        help="Pre-load a Clef decision model for /v1/systemone.",
+    )
+    parser.add_argument(
+        "--decision-max-length",
+        type=int,
+        help="Complete decision input limit (default: up to 65536)",
+    )
+    parser.add_argument("--decision-batch-size", type=int, default=4)
+    parser.add_argument("--decision-prefill-step-size", type=int, default=512)
+    parser.add_argument(
+        "--decision-prefix-cache-mb",
+        type=int,
+        default=256,
+        help="0 disables decision prefix reuse",
+    )
+    parser.add_argument("--decision-max-pending", type=int, default=64)
+    parser.add_argument(
         "--adapter-path",
         type=str,
         default=None,
@@ -268,6 +288,24 @@ def main():
         help="Set the logging level (default: INFO).",
     )
     args = parser.parse_args()
+    if (
+        args.decision_batch_size < 1
+        or args.decision_prefill_step_size < 1
+        or args.decision_max_pending < 1
+        or args.decision_prefix_cache_mb < 0
+        or (args.decision_max_length is not None and args.decision_max_length < 1)
+    ):
+        parser.error("Decision limits must be positive; prefix cache may be zero")
+    for key in (
+        "max_length",
+        "batch_size",
+        "prefill_step_size",
+        "prefix_cache_mb",
+        "max_pending",
+    ):
+        value = getattr(args, "decision_" + key)
+        if value is not None:
+            os.environ["MLX_VLM_DECISION_" + key.upper()] = str(value)
     if args.trust_remote_code:
         os.environ["MLX_TRUST_REMOTE_CODE"] = "true"
     if args.model:
@@ -282,6 +320,8 @@ def main():
         os.environ["MLX_VLM_PRELOAD_STT_MODEL"] = args.stt_model
     if args.embedding_model:
         os.environ["MLX_VLM_PRELOAD_EMBEDDING_MODEL"] = args.embedding_model
+    if args.decision_model:
+        os.environ["MLX_VLM_PRELOAD_DECISION_MODEL"] = args.decision_model
     os.environ["MLX_VLM_VISION_CACHE_SIZE"] = str(args.vision_cache_size)
     if args.draft_model:
         os.environ["MLX_VLM_DRAFT_MODEL"] = args.draft_model

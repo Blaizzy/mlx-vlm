@@ -430,6 +430,10 @@ print(output)
 
 ### Server (FastAPI)
 
+Clef and Clef-Flash use the native decision endpoint `/v1/systemone` and
+`--decision-model`. See the [Clef guide and API comparison](mlx_vlm/models/clef/README.md)
+for TypeSafe Jev compatibility, conversion, and limitations.
+
 Start the server:
 ```sh
 mlx_vlm.server --port 8080
@@ -1064,6 +1068,7 @@ Structured outputs are not currently supported with speculative decoding.
 - `/chat/completions` and `/v1/chat/completions` - OpenAI-compatible chat-style interaction endpoint with support for images, audio, and text
 - `/responses` and `/v1/responses` - OpenAI-compatible responses endpoint
 - `/embeddings` and `/v1/embeddings` - OpenAI-compatible embeddings endpoint backed by native MLX embedding models
+- `/v1/systemone` - TypeSafe-compatible typed decisions using Clef's native joint schema head
 - `/audio/speech` and `/v1/audio/speech` - OpenAI-compatible text-to-speech endpoint backed by `mlx-audio` TTS models
 - `/audio/transcriptions` and `/v1/audio/transcriptions` - OpenAI-compatible speech-to-text endpoint backed by `mlx-audio` STT models
 - `/audio/translations` and `/v1/audio/translations` - OpenAI-compatible audio translation endpoint for STT models that expose a translation task

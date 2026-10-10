@@ -1,6 +1,15 @@
 import argparse
 import ast
+import io
+import json
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from mlx_vlm.decision import comparison_report, encode_record, format_response
+from mlx_vlm.decision import main as decision_main
+from mlx_vlm.tests.test_processors import _decision_request, _DecisionTokenizer
 
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
 
@@ -133,3 +142,137 @@ def test_generate_one_shot_applies_system_prompt():
         and _assigns_prompt(node)
         for node in ast.walk(main)
     ), "one-shot generate must prepend args.system to the prompt"
+
+
+# Decision CLI: parsing, output streams, and comparison reports.
+
+
+@pytest.fixture
+def decision_cli_stub(monkeypatch):
+    from mlx_vlm.decision_scheduler import DecisionJob
+
+    calls = []
+
+    def load_model(path):
+        print("loader diagnostic")
+        return SimpleNamespace(config=SimpleNamespace())
+
+    class Scheduler:
+        def __init__(self, loader, **kwargs):
+            self.loader = loader
+            self.loaded = set()
+
+        def submit(self, body):
+            calls.append(body)
+            if body["model"] not in self.loaded:
+                self.loader(body["model"])
+                self.loaded.add(body["model"])
+            record = encode_record(_DecisionTokenizer(), body)
+            probs = [[0.8, 0.2], [0.25, 0.75], [0.1, 0.2, 0.7]]
+            if body["model"] == "reference":
+                probs = [p[::-1] for p in probs]
+            job = DecisionJob(body)
+            job.future.set_result(
+                {
+                    "response": format_response(body, record, probs),
+                    "probabilities": probs,
+                }
+            )
+            return job
+
+        def stop_and_join(self):
+            pass
+
+    monkeypatch.setattr("mlx_vlm.utils.get_model_path", lambda name: name)
+    monkeypatch.setattr("mlx_vlm.utils.load_model", load_model)
+    monkeypatch.setattr(
+        "mlx_vlm.utils.load_processor",
+        lambda *a, **k: SimpleNamespace(tokenizer=_DecisionTokenizer()),
+    )
+    monkeypatch.setattr("mlx_vlm.decision_scheduler.DecisionScheduler", Scheduler)
+    return calls
+
+
+@pytest.mark.parametrize("kind", ["file", "stdin", "inline", "jsonl"])
+def test_decision_cli_input_modes_and_json_only_stdout(
+    decision_cli_stub, monkeypatch, tmp_path, capsys, kind
+):
+    body = _decision_request()
+    path = tmp_path / "requests.json"
+    if kind == "file":
+        path.write_text(json.dumps(body))
+        argv = ["--request", str(path)]
+    elif kind == "stdin":
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(body)))
+        argv = ["--request", "-"]
+    elif kind == "inline":
+        questions = tmp_path / "questions.json"
+        questions.write_text(json.dumps(body["questions"]))
+        argv = [
+            "--model",
+            body["model"],
+            "--state",
+            body["state"],
+            "--questions",
+            "@" + str(questions),
+        ]
+    else:
+        monkeypatch.setattr(
+            "sys.stdin",
+            io.StringIO(
+                "\n".join(json.dumps({**body, "state": str(i)}) for i in range(5))
+            ),
+        )
+        argv = ["--request", "-", "--jsonl", "--batch-size", "2"]
+    decision_main(argv)
+    captured = capsys.readouterr()
+    assert "loader diagnostic" in captured.err
+    outputs = (
+        [json.loads(line) for line in captured.out.splitlines()]
+        if kind == "jsonl"
+        else [json.loads(captured.out)]
+    )
+    assert len(outputs) == len(decision_cli_stub) == (5 if kind == "jsonl" else 1)
+    assert all(output["model"] == body["model"] for output in outputs)
+    assert [call["state"] for call in decision_cli_stub] == (
+        [str(i) for i in range(5)] if kind == "jsonl" else [body["state"]]
+    )
+
+
+def test_decision_comparison_uses_unrounded_probabilities_and_gates_changes():
+    report = comparison_report([[[0.50001, 0.49999]]], [[[0.49999, 0.50001]]])
+    assert report["argmax_flips"] == 1
+    assert 0 < report["max_probability_drift"] < 0.0001
+    assert not report["passed"]
+    assert comparison_report([[[0.5, 0.5]]], [[[0.5, 0.5]]])["passed"]
+    assert not comparison_report(
+        [[[0.7, 0.3]]], [[[0.6, 0.4]]], max_probability_drift=0.05
+    )["passed"]
+
+
+def test_decision_cli_comparison_report_and_exit_code(
+    decision_cli_stub, monkeypatch, tmp_path
+):
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(_decision_request())))
+    report = tmp_path / "drift.json"
+    with pytest.raises(SystemExit) as exc:
+        decision_main(
+            [
+                "--request",
+                "-",
+                "--compare-model",
+                "reference",
+                "--report",
+                str(report),
+                "--max-probability-drift",
+                "0",
+            ]
+        )
+    assert exc.value.code == 1
+    result = json.loads(report.read_text())
+    assert not result["passed"]
+    assert result["argmax_flips"] == 3
+    assert [body["model"] for body in decision_cli_stub] == [
+        "decision-test",
+        "reference",
+    ]

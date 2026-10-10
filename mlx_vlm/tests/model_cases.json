@@ -1,0 +1,188 @@
+{
+  "version": 2,
+  "cases": [
+    {
+      "id": "clef",
+      "module": "clef",
+      "config": {
+        "model_type": "clef",
+        "text_config": {
+          "model_type": "qwen3_5",
+          "hidden_size": 64,
+          "intermediate_size": 128,
+          "linear_num_value_heads": 2,
+          "linear_num_key_heads": 2,
+          "linear_key_head_dim": 32,
+          "linear_value_head_dim": 32,
+          "linear_conv_kernel_dim": 4,
+          "num_hidden_layers": 4,
+          "num_attention_heads": 2,
+          "rms_norm_eps": 1e-06,
+          "vocab_size": 128,
+          "num_key_value_heads": 2,
+          "max_position_embeddings": 2048,
+          "head_dim": 32,
+          "rope_parameters": {
+            "type": "default",
+            "mrope_section": [
+              1,
+              1,
+              2
+            ],
+            "rope_theta": 100000,
+            "partial_rotary_factor": 0.25
+          }
+        },
+        "vision_config": {
+          "depth": 1,
+          "hidden_size": 16,
+          "intermediate_size": 32,
+          "out_hidden_size": 64,
+          "num_heads": 2
+        },
+        "joint_head_config": {
+          "hidden_size": 64,
+          "width": 16,
+          "routing_layers": 1,
+          "layers": 1,
+          "heads": 2,
+          "feedforward": 32
+        }
+      },
+      "checks": [
+        "decision"
+      ],
+      "decision": {
+        "tokenizer_vocab_size": 128
+      },
+      "parameter_initializers": {
+        "*.A_log": 0
+      },
+      "quantization": {
+        "group_size": 32,
+        "bits": 4,
+        "quantized_paths": [
+          "language_model.model.layers.3.self_attn.q_proj"
+        ],
+        "row_reader": "_output_embeddings",
+        "variants": [
+          {
+            "id": "preserve-output",
+            "convert_options": {
+              "decision_quantization": "preserve-output"
+            },
+            "protected_paths": [
+              "head",
+              "language_model.lm_head"
+            ],
+            "row_layer": "language_model.lm_head",
+            "quantized_rows": false
+          },
+          {
+            "id": "backbone",
+            "convert_options": {
+              "decision_quantization": "backbone"
+            },
+            "protected_paths": [
+              "head"
+            ],
+            "row_layer": "language_model.lm_head",
+            "quantized_rows": true
+          },
+          {
+            "id": "tied-output",
+            "config_overrides": {
+              "text_config": {
+                "tie_word_embeddings": true
+              }
+            },
+            "convert_options": {
+              "decision_quantization": "preserve-output"
+            },
+            "protected_paths": [
+              "head",
+              "language_model.model.embed_tokens"
+            ],
+            "row_layer": "language_model.model.embed_tokens",
+            "quantized_rows": false
+          }
+        ]
+      },
+      "decision_media": {
+        "config_overrides": {
+          "image_token_id": 120,
+          "image_token_index": 120,
+          "video_token_id": 121,
+          "video_token_index": 121,
+          "vision_start_token_id": 122
+        },
+        "input_ids": [
+          1,
+          122,
+          120,
+          123,
+          2,
+          122,
+          121,
+          123,
+          3,
+          4,
+          5,
+          6
+        ],
+        "questions": [
+          {
+            "question_id": "q",
+            "kind": 0,
+            "question_span": [
+              8,
+              9
+            ],
+            "option_spans": [
+              [
+                9,
+                10
+              ],
+              [
+                10,
+                11
+              ]
+            ],
+            "option_ids": [
+              "true",
+              "false"
+            ]
+          }
+        ],
+        "prefix_length": 8,
+        "media_shapes": {
+          "pixel_values": [
+            4,
+            1176
+          ],
+          "pixel_values_videos": [
+            4,
+            1176
+          ]
+        },
+        "media_values": {
+          "image_grid_thw": [
+            [
+              1,
+              2,
+              2
+            ]
+          ],
+          "video_grid_thw": [
+            [
+              1,
+              2,
+              2
+            ]
+          ]
+        },
+        "changed_media": "pixel_values"
+      }
+    }
+  ]
+}

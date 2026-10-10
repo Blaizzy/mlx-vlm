@@ -5,13 +5,22 @@ import logging
 import sys
 import typing
 from argparse import Namespace
+from dataclasses import replace
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
+import numpy as np
 import pytest
 
 from mlx_vlm import apc as apc_module
+from mlx_vlm.decision import encode_record, prepare_request
+from mlx_vlm.decision_scheduler import (
+    DecisionCancelled,
+    DecisionEngine,
+    context_limit,
+)
 from mlx_vlm.generate import (
     BatchGenerationResult,
     BatchGenerator,
@@ -33,6 +42,7 @@ from mlx_vlm.models.cache import (
     KVCache,
     RotatingKVCache,
 )
+from mlx_vlm.tests.test_processors import _decision_request, _DecisionTokenizer
 from mlx_vlm.utils import ThinkingBudgetCriteria
 
 generate_module = sys.modules["mlx_vlm.generate"]
@@ -2953,3 +2963,210 @@ class TestBatchTurboQuantizedKVStart:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# Decision inference: chunking, prefix reuse, media, and cancellation.
+
+
+def _assert_decision_logits(actual, expected):
+    assert len(actual) == len(expected)
+    for a, b in zip(actual, expected):
+        np.testing.assert_allclose(np.array(a), np.array(b), atol=3e-5, rtol=3e-5)
+
+
+def test_decision_chunked_batch_and_cache_match_full_prefill(
+    decision_model, decision_processor
+):
+    model = decision_model
+    records = [
+        encode_record(
+            decision_processor.tokenizer, {**_decision_request(), "state": text}
+        )
+        for text in ("aaa", "bbb")
+    ]
+    engine = DecisionEngine(model, prefill_step_size=64)
+    states = [engine.prepare(r) for r in records]
+    while not states[0].done:
+        engine.step(states)
+    for state, record in zip(states, records):
+        _assert_decision_logits(engine.finish(state), model.decide(record))
+        _assert_decision_logits(engine.decide(record), model.decide(record))
+    assert engine.prefix_cache.hits == 2
+    assert engine.prefix_cache.nbytes <= engine.prefix_cache.max_bytes
+
+
+def test_decision_prefix_reuse_new_questions_isolated_from_mutations_and_tenants(
+    decision_model,
+    decision_processor,
+):
+    model = decision_model
+    first = encode_record(decision_processor.tokenizer, _decision_request())
+    second = encode_record(
+        decision_processor.tokenizer,
+        {**_decision_request(), "questions": {"different": {"type": "noul"}}},
+    )
+    engine = DecisionEngine(model, prefill_step_size=97)
+    engine.decide(first, namespace="a")
+    before = engine.prefill_tokens
+    _assert_decision_logits(engine.decide(second, namespace="a"), model.decide(second))
+    assert (
+        engine.prefill_tokens - before == len(second.input_ids) - second.prefix_length
+    )
+    # Scoring and writing suffix caches must never corrupt the saved prefix.
+    _assert_decision_logits(engine.decide(first, namespace="a"), model.decide(first))
+    state = engine.prepare(first, namespace="b")
+    assert state.cached_tokens == 0
+    assert engine.prefix_cache.hits == 2
+
+
+def test_decision_prefix_cache_eviction_and_clear(decision_model, decision_processor):
+    model = decision_model
+    first = encode_record(decision_processor.tokenizer, _decision_request())
+    second = encode_record(
+        decision_processor.tokenizer,
+        {**_decision_request(), "state": "X" * len(_decision_request()["state"])},
+    )
+    engine = DecisionEngine(model)
+    engine.decide(first)
+    size = engine.prefix_cache.nbytes
+    assert size > 0
+    engine.prefix_cache.max_bytes = size
+    engine.decide(second)
+    assert len(engine.prefix_cache.entries) == 1
+    assert engine.prepare(first).cached_tokens == 0
+    engine.prefix_cache.clear()
+    assert engine.prefix_cache.nbytes == 0
+    assert not engine.prefix_cache.entries
+
+
+@pytest.mark.parametrize("cache_bytes,expected_steps", [(0, 1), (1024**2, 2)])
+def test_decision_short_request_only_splits_to_store_a_prefix(
+    decision_model, decision_processor, cache_bytes, expected_steps
+):
+    model = decision_model
+    record = encode_record(decision_processor.tokenizer, _decision_request())
+    engine = DecisionEngine(
+        model, prefill_step_size=len(record.input_ids), cache_bytes=cache_bytes
+    )
+    _assert_decision_logits(engine.decide(record), model.decide(record))
+    assert engine.batch_steps == expected_steps
+    assert bool(engine.prefix_cache.entries) == bool(cache_bytes)
+    state = engine.prepare(record)
+    assert state.cached_tokens == (record.prefix_length if cache_bytes else 0)
+
+
+def test_decision_disabled_prefix_cache_still_bounds_prefill_chunks(
+    decision_model, decision_processor
+):
+    model = decision_model
+    record = encode_record(decision_processor.tokenizer, _decision_request())
+    engine = DecisionEngine(model, prefill_step_size=71, cache_bytes=0)
+    state = engine.prepare(record)
+    while not state.done:
+        before = state.offset
+        engine.step([state])
+        assert 0 < state.offset - before <= 71
+    _assert_decision_logits(engine.finish(state), model.decide(record))
+    assert engine.batch_steps == (len(record.input_ids) + 70) // 71
+
+
+def test_decision_context_over_16k_and_backbone_boundary():
+    config = SimpleNamespace(
+        text_config=SimpleNamespace(max_position_embeddings=262144)
+    )
+    assert context_limit(config) == 65536
+    assert context_limit(config, 100000) == 100000
+    for value in (0, -1, 262145):
+        with pytest.raises(ValueError):
+            context_limit(config, value)
+    body, encoded = prepare_request(
+        SimpleNamespace(tokenizer=_DecisionTokenizer()),
+        {**_decision_request(), "state": "x" * 17000},
+    )
+    assert len(encoded.input_ids) > 16384
+    with pytest.raises(ValueError, match="maximum"):
+        prepare_request(SimpleNamespace(tokenizer=_DecisionTokenizer()), body, 16384)
+
+
+def test_decision_mixed_media_cache_parity(decision_case, decision_processor):
+    from mlx_vlm.tests.test_models import _model_for_case
+
+    spec = decision_case.get("decision_media")
+    if spec is None:
+        pytest.skip("Model case does not define mixed-media inputs")
+    model = _model_for_case(decision_case, spec.get("config_overrides"))
+    record = encode_record(decision_processor.tokenizer, _decision_request())
+    media = {
+        key: mx.random.normal(tuple(shape))
+        for key, shape in spec["media_shapes"].items()
+    }
+    media.update({key: mx.array(value) for key, value in spec["media_values"].items()})
+    questions = []
+    for item in spec["questions"]:
+        questions.append(
+            type(record.questions[0])(
+                item["question_id"],
+                item["kind"],
+                tuple(item["question_span"]),
+                tuple(tuple(span) for span in item["option_spans"]),
+                tuple(item["option_ids"]),
+            )
+        )
+    record = replace(
+        record,
+        input_ids=tuple(spec["input_ids"]),
+        questions=tuple(questions),
+        prefix_length=spec["prefix_length"],
+        media=media,
+    )
+    engine = DecisionEngine(model, prefill_step_size=3)
+    expected = model.decide(record)
+    _assert_decision_logits(engine.decide(record), expected)
+    with patch.object(
+        type(model),
+        "get_input_embeddings",
+        side_effect=AssertionError("media preprocessing reran"),
+    ):
+        _assert_decision_logits(engine.decide(record), expected)
+    key = spec["changed_media"]
+    changed = replace(record, media={**media, key: media[key] + 1})
+    assert engine.prepare(changed).cached_tokens == 0
+
+
+def test_decision_cancellation_at_execution_boundaries(
+    decision_model, decision_processor
+):
+    record = encode_record(decision_processor.tokenizer, _decision_request())
+    engine = DecisionEngine(decision_model, prefill_step_size=64)
+    event = Event()
+    event.set()
+    with pytest.raises(DecisionCancelled):
+        engine.prepare(record, cancelled=event)
+    event.clear()
+    state = engine.prepare(record, cancelled=event)
+    event.set()
+    with pytest.raises(DecisionCancelled):
+        engine.step([state])
+    assert state.offset == 0
+    assert engine.prefill_tokens == 0
+    event.clear()
+    state = engine.prepare(record, cancelled=event)
+    while not state.done:
+        engine.step([state])
+    event.set()
+    with pytest.raises(DecisionCancelled):
+        engine.finish(state)
+
+
+def test_decision_cancelled_batch_row_does_not_cancel_live_row(
+    decision_model, decision_processor
+):
+    model = decision_model
+    record = encode_record(decision_processor.tokenizer, _decision_request())
+    engine = DecisionEngine(model)
+    states = [engine.prepare(record), engine.prepare(record)]
+    states[0].cancelled.set()
+    engine.step(states)
+    while not states[1].done:
+        engine.step([states[1]])
+    _assert_decision_logits(engine.finish(states[1]), model.decide(record))

@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import importlib
 import json
 import logging
 import os
@@ -17,6 +18,7 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
+from pydantic import ValidationError
 from transformers.utils.chat_parsing import ResponseParser, parse_response
 
 import mlx_vlm.server as server
@@ -26,9 +28,18 @@ import mlx_vlm.server.openai as server_openai
 import mlx_vlm.speculative.utils as speculative_utils
 from mlx_vlm import apc as apc_module
 from mlx_vlm.apc import hash_image_payload
+from mlx_vlm.decision import SystemOneRequest, systemone_answer
+from mlx_vlm.decision_scheduler import (
+    DecisionCancelled,
+    DecisionEngine,
+    DecisionQueueFull,
+    DecisionScheduler,
+    context_limit,
+)
 from mlx_vlm.generate import GenerationResult
 from mlx_vlm.generate.image import ImageGenerationResult
 from mlx_vlm.prompt_utils import apply_chat_template
+from mlx_vlm.tests.test_processors import _decision_request, _DecisionTokenizer
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
 
 _MUSE_RESPONSE_TEMPLATE = {
@@ -7155,3 +7166,222 @@ class TestCountThinkingTagTokens:
 
     def test_no_tags(self):
         assert server._count_thinking_tag_tokens("plain text") == 0
+
+
+# Decision protocol and scheduling contracts.
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        {"type": "bogus"},
+        {"type": "choice", "criteria": {}},
+        {"type": "choice", "criteria": ["a", "b"]},
+        {"type": "score", "criteria": []},
+        {"type": "score", "criteria": [None]},
+        {"type": "noul", "criteria": {"yes": "yes"}},
+        {"type": "noul", "temperature": 1},
+    ],
+)
+def test_decision_invalid_questions(question):
+    with pytest.raises(ValidationError):
+        SystemOneRequest.model_validate(
+            {**_decision_request(), "questions": {"x": question}}
+        )
+
+
+def test_decision_typed_answers_follow_typesafe_confidence():
+    q = _decision_request()["questions"]
+    assert systemone_answer(q["outage"], {"true": 0.8, "false": 0.2}) == {
+        "type": "noul",
+        "noul": 0.8,
+    }
+    assert (
+        systemone_answer(q["team"], {"billing": 0.25, "technical": 0.75})["confidence"]
+        == 0.5
+    )
+    score = systemone_answer(q["urgency"], {"0": 0.1, "1": 0.2, "2": 0.7})
+    assert score["score"] == 1.6
+    assert score["confidence"] == 0.4
+    assert score["legend"] == {"0": "Low", "1": "Medium", "2": "High"}
+    assert (
+        systemone_answer(q["urgency"], {"0": 0.5, "1": 0, "2": 0.5})["confidence"] == 0
+    )
+
+
+def test_decision_endpoint_auth_validation_and_response(monkeypatch):
+    from unittest.mock import Mock
+
+    from mlx_vlm.decision import encode_record, format_response
+    from mlx_vlm.decision_scheduler import DecisionJob
+
+    body = _decision_request()
+    record = encode_record(_DecisionTokenizer(), body)
+    job = DecisionJob(body)
+    job.future.set_result(
+        {
+            "response": format_response(
+                body, record, [[0.5, 0.5], [0.25, 0.75], [0.1, 0.2, 0.7]]
+            ),
+            "cached_tokens": 0,
+        }
+    )
+    scheduler = SimpleNamespace(submit=Mock(return_value=job))
+    monkeypatch.setattr(
+        "mlx_vlm.server.decisions.get_scheduler", lambda deps: scheduler
+    )
+    monkeypatch.setenv("MLX_VLM_SERVER_API_KEY", "test-key")
+    client = TestClient(server.app)
+    assert client.post("/v1/systemone", json=body).status_code == 401
+    headers = {"Authorization": "Bearer test-key"}
+    assert (
+        client.post(
+            "/v1/systemone", json={**body, "stream": True}, headers=headers
+        ).status_code
+        == 422
+    )
+    scheduler.submit.assert_not_called()
+    response = client.post("/v1/systemone", json=body, headers=headers)
+    assert response.status_code == 200, response.text
+    assert response.headers["x-typesafe-request-id"]
+    assert response.json()["answers"]["outage"] == {"type": "noul", "noul": 0.5}
+    assert response.json()["model"] == body["model"]
+    scheduler.submit.assert_called_once()
+
+
+def test_decision_scheduler_admits_new_requests_and_switches_models(
+    decision_model, decision_processor
+):
+    model = decision_model
+    loaded, batch_sizes = [], []
+    reached, resume = Event(), Event()
+    original = DecisionEngine.step
+
+    def step(engine, states):
+        batch_sizes.append(len(states))
+        if len(batch_sizes) == 1:
+            reached.set()
+            assert resume.wait(5)
+        return original(engine, states)
+
+    def load(name):
+        loaded.append(name)
+        return model, decision_processor, model.config
+
+    with patch.object(DecisionEngine, "step", step):
+        scheduler = DecisionScheduler(load, prefill_step_size=64, batch_size=3)
+        try:
+            first = scheduler.submit(_decision_request())
+            assert reached.wait(5)
+            second, third = scheduler.submit(_decision_request()), scheduler.submit(
+                _decision_request()
+            )
+            other = scheduler.submit({**_decision_request(), "model": "other"})
+            resume.set()
+            results = [
+                job.future.result(timeout=10) for job in (first, second, third, other)
+            ]
+            assert any(size > 1 for size in batch_sizes)
+            assert loaded == ["decision-test", "other"]
+            assert (
+                results[0]["response"]["answers"] == results[1]["response"]["answers"]
+            )
+        finally:
+            resume.set()
+            scheduler.stop_and_join()
+    assert not scheduler.worker.is_alive()
+    assert scheduler.engine is None
+
+
+def test_decision_scheduler_overload_cancellation_and_shutdown(
+    decision_model, decision_processor
+):
+    model = decision_model
+    reached, resume = Event(), Event()
+
+    def load(name):
+        reached.set()
+        assert resume.wait(5)
+        return model, decision_processor, model.config
+
+    scheduler = DecisionScheduler(load, max_pending=1, batch_size=1)
+    try:
+        first = scheduler.submit(_decision_request())
+        assert reached.wait(5)
+        queued = scheduler.submit(_decision_request())
+        with pytest.raises(DecisionQueueFull):
+            scheduler.submit(_decision_request())
+        first.cancel()
+        queued.cancel()
+        resume.set()
+    finally:
+        resume.set()
+        scheduler.stop_and_join()
+    assert first.future.done() and queued.future.done()
+    with pytest.raises(DecisionCancelled):
+        scheduler.submit(_decision_request())
+
+
+def test_decision_scheduler_invalid_request_does_not_poison_next_request(
+    decision_model,
+    decision_processor,
+):
+    model = decision_model
+    scheduler = DecisionScheduler(
+        lambda name: (
+            model,
+            decision_processor,
+            model.config,
+        )
+    )
+    try:
+        bad = scheduler.submit(
+            {**_decision_request(), "state": "x" * context_limit(model.config)}
+        )
+        good = scheduler.submit(_decision_request())
+        with pytest.raises(ValueError, match="maximum"):
+            bad.future.result(timeout=5)
+        assert good.future.result(timeout=5)["response"]["answers"]
+    finally:
+        scheduler.stop_and_join()
+
+
+def test_decision_http_disconnect_cancels_worker_and_overload_returns_429(monkeypatch):
+    from fastapi import FastAPI, HTTPException, Response
+
+    from mlx_vlm.decision import SystemOneRequest
+    from mlx_vlm.decision_scheduler import DecisionJob
+
+    importlib.import_module("mlx_vlm.server.app")  # Initializes runtime metrics.
+    from mlx_vlm.server.decisions import register_routes
+
+    job = DecisionJob(_decision_request())
+    fake = SimpleNamespace(submit=lambda *a, **k: job)
+    monkeypatch.setattr("mlx_vlm.server.decisions.get_scheduler", lambda deps: fake)
+    api = FastAPI()
+    register_routes(api, SimpleNamespace(read_tenant_id=lambda req: "tenant"))
+    endpoint = api.routes[-1].endpoint
+
+    async def disconnected():
+        return True
+
+    async def call():
+        return await endpoint(
+            SystemOneRequest.model_validate(_decision_request()),
+            Response(),
+            SimpleNamespace(is_disconnected=disconnected),
+        )
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(call())
+    assert exc.value.status_code == 499
+    assert job.cancelled.is_set()
+    assert job.future.cancelled()
+
+    def overloaded(*args, **kwargs):
+        raise DecisionQueueFull("full")
+
+    fake.submit = overloaded
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(call())
+    assert exc.value.status_code == 429

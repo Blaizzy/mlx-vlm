@@ -675,7 +675,26 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 
     weights = {}
     for wf in weight_files:
+        if (
+            config.get("model_type") == "clef"
+            and Path(wf).name == "joint_head.safetensors"
+        ):
+            continue
         weights.update(_load_safetensors(wf))
+
+    # Clef releases keep the trained decision head outside the backbone index.
+    if config.get("model_type") == "clef" and not any(
+        key.startswith("head.") for key in weights
+    ):
+        head_path = model_path / "joint_head.safetensors"
+        if not head_path.exists():
+            raise FileNotFoundError(f"Missing Clef decision head: {head_path}")
+        weights.update(
+            {
+                f"head.{key}": value
+                for key, value in _load_safetensors(str(head_path)).items()
+            }
+        )
 
     model_class, _ = get_model_and_args(config=config)
 
@@ -1057,6 +1076,16 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
     try:
         with open(model_path / "config.json", encoding="utf-8") as f:
             config = json.load(f)
+
+        # The original Clef config identifies only its Qwen3.5 backbone.
+        head_config_file = model_path / "joint_head_config.json"
+        if config.get("model_type") in ("qwen3_5", "clef") and (
+            head_config_file.exists() or config.get("joint_head_config")
+        ):
+            config["model_type"] = "clef"
+            if "joint_head_config" not in config:
+                with open(head_config_file, encoding="utf-8") as f:
+                    config["joint_head_config"] = json.load(f)
 
         generation_config_file = model_path / "generation_config.json"
         if generation_config_file.exists():

@@ -295,12 +295,18 @@ def convert(
     dequantize: bool = False,
     trust_remote_code: bool = True,
     quant_predicate: Optional[str] = None,
+    decision_quantization: str = "preserve-output",
 ):
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
     model, config, processor = fetch_from_hub(
         model_path, lazy=True, trust_remote_code=trust_remote_code
     )
+    if config.get("model_type") == "clef":
+        if decision_quantization not in ("preserve-output", "backbone"):
+            raise ValueError("Unknown decision quantization policy")
+        model.config.decision_quantization = decision_quantization
+        config["decision_quantization"] = decision_quantization
 
     model_quant_predicate = getattr(model, "quant_predicate", None)
 
@@ -327,6 +333,15 @@ def convert(
         quant_predicate = mixed_quant_predicate_builder(quant_predicate, target)
 
     quant_predicate = quant_predicate or base_quant_predicate
+    if config.get("model_type") == "clef":
+        # Mixed recipes/custom predicates must also respect protected decision
+        # weights. The lexical prior reads output-embedding rows directly.
+        selected_predicate = quant_predicate
+
+        def quant_predicate(path, module):
+            if not model_quant_predicate(path, module):
+                return False
+            return selected_predicate(path, module)
 
     if dtype is None:
         dtype = config.get("torch_dtype", None)
@@ -474,6 +489,12 @@ def configure_parser() -> argparse.ArgumentParser:
         help="Bits per weight for quantization.",
         type=int,
         default=None,
+    )
+    parser.add_argument(
+        "--decision-quantization",
+        choices=["preserve-output", "backbone"],
+        default="preserve-output",
+        help="Clef: keep head and lexical output embeddings floating point (default), or only the head to save more memory.",
     )
     parser.add_argument(
         "--q-mode",

@@ -26,6 +26,7 @@ from ..vision_cache import VisionFeatureCache
 from . import request_normalization as _request_normalization
 from .anthropic import register_routes as register_anthropic_routes
 from .audio import register_routes as register_audio_routes
+from .decisions import register_routes as register_decision_routes
 from .embeddings import register_routes as register_embeddings_routes
 from .generation import (
     GenerationArguments,
@@ -90,6 +91,8 @@ def _cache_group_for_cache(cache: dict) -> str:
         return "audio"
     if model_kind == "embedding":
         return "embedding"
+    if model_kind == "decision":
+        return "decision"
     return "text_generation"
 
 
@@ -153,6 +156,12 @@ def _server_runtime_snapshot() -> dict:
         "continuous_batching_enabled": runtime.response_generator is not None,
         "request_queue_depth": queue_depth,
         "audio_queue_depth": audio_queue_depth,
+        "decision_queue_depth": (
+            runtime.decision_queue.qsize() if runtime.decision_queue else 0
+        ),
+        "decision_active_requests": (
+            runtime.decision_queue.active_count if runtime.decision_queue else 0
+        ),
         "preload_failures": dict(runtime.preload_failures),
         "apc": (
             {"enabled": False}
@@ -355,6 +364,12 @@ async def lifespan(app):
 
     preload_models = (
         (
+            os.environ.pop("MLX_VLM_PRELOAD_DECISION_MODEL", None),
+            None,
+            "decision",
+            "decision model",
+        ),
+        (
             os.environ.pop("MLX_VLM_PRELOAD_IMAGE_MODEL", None),
             None,
             "image_generation",
@@ -408,6 +423,9 @@ async def lifespan(app):
     try:
         yield
     finally:
+        if runtime.decision_queue is not None:
+            await asyncio.to_thread(runtime.decision_queue.stop_and_join)
+            runtime.decision_queue = None
         if runtime.audio_queue is not None:
             runtime.audio_queue.stop_and_join()
             runtime.audio_queue = None
@@ -497,10 +515,14 @@ def get_cached_model(
     load_as_edit = model_kind == "image_edit"
     load_as_audio = _audio_model_kind(model_kind)
     load_as_embedding = model_kind == "embedding"
+    load_as_decision = model_kind == "decision"
     load_as_image = model_kind == "image_generation" or (
         model_kind == "auto" and is_image_generation_model(model_path)
     )
-    if load_as_edit:
+    if load_as_decision:
+        cache_group = "decision"
+        effective_model_kind = "decision"
+    elif load_as_edit:
         cache_group = "image_edit"
         effective_model_kind = "image_edit"
     elif load_as_audio:
@@ -654,6 +676,41 @@ def get_cached_model(
         registry.set(cache_group, cache)
         return model, None, config
 
+    if load_as_decision:
+        if adapter_path is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Adapters are not supported for decision models.",
+            )
+        from ..utils import get_model_path, load_config, load_model, load_processor
+
+        try:
+            model_dir = get_model_path(model_path)
+            decision_config = load_config(model_dir)
+            if decision_config.get("model_type") != "clef":
+                raise ValueError(
+                    "Native decisions require a Clef checkpoint with its joint schema head"
+                )
+            model = load_model(model_dir)
+            processor = load_processor(model_dir, add_detokenizer=False)
+        except RepositoryNotFoundError as exc:
+            raise HTTPException(
+                status_code=404, detail=f"Model not found: {model_path}"
+            ) from exc
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        cache = {
+            "cache_key": cache_key,
+            "model_path": model_path,
+            "adapter_path": None,
+            "model": model,
+            "processor": processor,
+            "config": model.config,
+            "model_kind": "decision",
+        }
+        registry.set(cache_group, cache)
+        return model, processor, model.config
+
     if load_as_embedding:
         if adapter_path is not None:
             raise HTTPException(
@@ -777,6 +834,13 @@ def get_cached_model(
 # Synchronous unload function for internal use
 def unload_model_sync():
     unloaded_any = False
+    if (
+        runtime.decision_queue is not None
+        and not runtime.decision_queue.is_worker_thread()
+    ):
+        runtime.decision_queue.stop_and_join()
+        runtime.decision_queue = None
+        unloaded_any = True
     if runtime.audio_queue is not None:
         is_audio_worker = getattr(
             runtime.audio_queue, "is_worker_thread", lambda: False
@@ -831,6 +895,7 @@ register_anthropic_routes(inference_router, _protocol_deps)
 register_openai_routes(inference_router, _protocol_deps)
 register_audio_routes(inference_router, _protocol_deps)
 register_embeddings_routes(inference_router, _protocol_deps)
+register_decision_routes(inference_router, _protocol_deps)
 
 
 @inference_router.get("/models", response_model=ModelsResponse)

@@ -1,13 +1,24 @@
+import copy
+import fnmatch
 import importlib
 import inspect
+import json
 import threading
 import unittest
+from dataclasses import asdict
+from operator import attrgetter
+from pathlib import Path
 from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+import pytest
 from mlx.utils import tree_flatten, tree_map
+
+from mlx_vlm.decision import encode_record, systemone
+from mlx_vlm.tests.test_processors import _decision_request, _DecisionTokenizer
+from mlx_vlm.utils import load_model
 
 
 class TestModels(unittest.TestCase):
@@ -12865,3 +12876,197 @@ class TestCohereCompass(unittest.TestCase):
         processor(text=["short", "longer"], padding=True)
 
         self.assertEqual(processor.tokenizer.last_kwargs["padding_side"], "left")
+
+
+# Shared model contracts: adding a model requires a JSON case, not new tests.
+
+CONFIG_TYPES = {"text_config": "TextConfig", "vision_config": "VisionConfig"}
+DATA = json.loads(
+    Path(__file__).with_name("model_cases.json").read_text(encoding="utf-8")
+)
+if DATA["version"] != 2:
+    raise ValueError(f"Unsupported model_cases.json version: {DATA['version']}")
+DECISION_CASES = [case for case in DATA["cases"] if "decision" in case["checks"]]
+QUANTIZATION_CASES = [
+    (case, variant)
+    for case in DECISION_CASES
+    for variant in case.get("quantization", {}).get("variants", [])
+]
+
+
+def build_config(module, values, config_type="ModelConfig"):
+    """Construct the model family's config classes from ordinary nested data."""
+    fields = copy.deepcopy(values)
+    for name, value in fields.items():
+        if name in CONFIG_TYPES and isinstance(value, dict):
+            fields[name] = build_config(module, value, CONFIG_TYPES[name])
+    return attrgetter(config_type)(module)(**fields)
+
+
+def _merge_config(values, overrides):
+    fields = copy.deepcopy(values)
+    for key, value in overrides.items():
+        fields[key] = (
+            _merge_config(fields.get(key, {}), value)
+            if isinstance(value, dict)
+            else value
+        )
+    return fields
+
+
+def _model_for_case(case, overrides=None):
+    module = importlib.import_module("mlx_vlm.models." + case["module"])
+    config = build_config(module, _merge_config(case["config"], overrides or {}))
+    mx.random.seed(14)
+    model = module.Model(config)
+    initializers = case.get("parameter_initializers", {})
+    weights = [
+        (name, mx.full_like(value, fill))
+        for name, value in tree_flatten(model.parameters())
+        for pattern, fill in initializers.items()
+        if fnmatch.fnmatchcase(name, pattern)
+    ]
+    if weights:
+        model.load_weights(weights, strict=False)
+    model.eval()
+    mx.eval(model.parameters())
+    return model
+
+
+class ModelChecks:
+    """Reusable assertions; each JSON case constructs fresh configs and models."""
+
+    def decision(self, model, tokenizer_vocab_size=128):
+        record = encode_record(
+            _DecisionTokenizer(tokenizer_vocab_size), _decision_request()
+        )
+        logits = model.decide(record)
+        assert len(logits) == len(record.questions)
+        for output, question in zip(logits, record.questions):
+            assert output.shape == (len(question.option_ids),)
+            assert mx.all(mx.isfinite(output)).item()
+
+
+def check_arguments(kind, case, model, config):
+    if kind == "decision":
+        return (model,), case["decision"]
+    raise ValueError(f"Unknown model check: {kind}")
+
+
+@pytest.mark.parametrize("case", DATA["cases"], ids=lambda case: case["id"])
+def test_model_contract(case):
+    model = _model_for_case(case)
+    checks = ModelChecks()
+    for kind in case["checks"]:
+        args, kwargs = check_arguments(kind, case, model, model.config)
+        getattr(checks, kind)(*args, **kwargs)
+
+
+def test_decision_checkpoint_roundtrip(decision_model, decision_processor, tmp_path):
+    model = decision_model
+    mx.save_safetensors(
+        str(tmp_path / "model.safetensors"), dict(tree_flatten(model.parameters()))
+    )
+    (tmp_path / "config.json").write_text(json.dumps(asdict(model.config)))
+    loaded = load_model(tmp_path)
+    record = encode_record(decision_processor.tokenizer, _decision_request())
+    actual, expected = loaded.decide(record), model.decide(record)
+    assert len(actual) == len(expected)
+    for a, b in zip(actual, expected):
+        np.testing.assert_allclose(np.array(a), np.array(b), rtol=1e-5, atol=1e-5)
+    with pytest.raises(ValueError, match="decision model"):
+        loaded(mx.array([[1, 2]]))
+
+
+@pytest.mark.parametrize(
+    "recipe",
+    [None, "mixed_4_8", lambda path, module: True],
+    ids=["default", "mixed", "custom"],
+)
+@pytest.mark.parametrize(
+    "case,variant",
+    QUANTIZATION_CASES,
+    ids=[case["id"] + "-" + variant["id"] for case, variant in QUANTIZATION_CASES],
+)
+def test_decision_quantization_roundtrip(case, variant, recipe, monkeypatch, tmp_path):
+    conversion = importlib.import_module("mlx_vlm.convert")
+    model = _model_for_case(case, variant.get("config_overrides"))
+    spec = case["quantization"]
+    protected = {
+        name: np.array(value)
+        for name, value in tree_flatten(model.parameters())
+        if any(
+            name == path or name.startswith(path + ".")
+            for path in variant["protected_paths"]
+        )
+    }
+    assert protected
+    source, destination = tmp_path / "source", tmp_path / "converted"
+    source.mkdir()
+    monkeypatch.setattr(conversion, "get_model_path", lambda *a, **k: source)
+    monkeypatch.setattr(
+        conversion,
+        "fetch_from_hub",
+        lambda *a, **k: (
+            model,
+            {k: v for k, v in asdict(model.config).items() if v is not None},
+            SimpleNamespace(save_pretrained=lambda p: None),
+        ),
+    )
+    monkeypatch.setattr(conversion, "create_model_card", lambda *a, **k: None)
+    conversion.convert(
+        str(source),
+        str(destination),
+        quantize=True,
+        q_group_size=spec["group_size"],
+        q_bits=spec["bits"],
+        quant_predicate=recipe,
+        **variant["convert_options"],
+    )
+    loaded = load_model(destination)
+    weights = dict(tree_flatten(loaded.parameters()))
+    for name, expected in protected.items():
+        np.testing.assert_array_equal(np.array(weights[name]), expected)
+    modules = dict(loaded.named_modules())
+    for path in spec["quantized_paths"]:
+        assert isinstance(modules[path], (nn.QuantizedLinear, nn.QuantizedEmbedding))
+    for name, expected in variant["convert_options"].items():
+        assert getattr(loaded.config, name) == expected
+    layer = modules[variant["row_layer"]]
+    assert hasattr(layer, "scales") == variant["quantized_rows"]
+    ids = mx.array([1, 5, 5, 10])
+    expected = (
+        mx.dequantize(
+            layer.weight,
+            layer.scales,
+            layer.biases,
+            group_size=layer.group_size,
+            bits=layer.bits,
+            mode=layer.mode,
+        )
+        if hasattr(layer, "scales")
+        else layer.weight
+    )
+    np.testing.assert_allclose(
+        np.array(attrgetter(spec["row_reader"])(loaded)(ids)), np.array(expected[ids])
+    )
+    ModelChecks().decision(loaded, **case["decision"])
+
+
+def test_decision_single_forward_and_nonfinite():
+    from unittest.mock import Mock
+
+    model = Mock()
+    model.decide.return_value = [
+        mx.array([2.0, 0.0]),
+        mx.array([0.0, 2.0]),
+        mx.array([0.0, 1.0, 2.0]),
+    ]
+    processor = SimpleNamespace(tokenizer=_DecisionTokenizer())
+    result = systemone(model, processor, _decision_request())
+    assert model.decide.call_count == 1
+    assert result["answers"]["team"]["choice"] == "technical"
+    assert result["usage"]["output_tokens"] == 0
+    model.decide.return_value[0] = mx.array([float("nan"), 0.0])
+    with pytest.raises(RuntimeError, match="non-finite"):
+        systemone(model, processor, _decision_request())
