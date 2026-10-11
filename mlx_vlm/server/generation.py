@@ -1774,6 +1774,7 @@ class ResponseGenerator:
                         coordinator.prepare_prefill(
                             prompt_tokens,
                             prefill_step_size=self._effective_prefill_step_size(),
+                            evict=False,
                         )
                     input_ids, gen_kwargs = self._gpu_embed(
                         raw_inputs,

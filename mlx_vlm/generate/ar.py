@@ -2639,7 +2639,27 @@ class BatchGenerator:
         if self.apc_manager is None:
             return None
 
-        picks: List[Optional[dict]] = [self._apc_pick_for(s) for s in sequences]
+        coordinator = getattr(self, "apc", None)
+        if coordinator is None:
+            picks = [self._apc_pick_for(s) for s in sequences]
+        else:
+            requests = [
+                (
+                    ids_list,
+                    {
+                        "extra_hash": self._apc_extra_hash(prompt_kwargs or {}),
+                        "safe_lookup_min": self._apc_safe_prefix_lookup_min(ids_list),
+                        "suffix_is_text_only": lambda pl, ids=ids_list: (
+                            self._apc_suffix_is_text_only(ids, pl)
+                        ),
+                        "prefix_has_media": lambda pl, ids=ids_list: (
+                            self._apc_prefix_has_media_tokens(ids, pl)
+                        ),
+                    },
+                )
+                for _, ids_list, _, prompt_kwargs, _, _ in sequences
+            ]
+            picks = coordinator.lookup_many(requests)
         any_warm = any(p is not None for p in picks)
         if not any_warm:
             return None  # caller falls back to cold-only path
@@ -3052,6 +3072,7 @@ class BatchGenerator:
                 coordinator.prepare_prefill(
                     [len(s[1]) for s in sequences],
                     prefill_step_size=self.prefill_step_size,
+                    evict=False,
                 )
             if logger.isEnabledFor(logging.DEBUG) and os.environ.get("APC_DEBUG"):
                 logger.warning(
