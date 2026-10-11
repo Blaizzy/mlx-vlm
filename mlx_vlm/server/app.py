@@ -288,6 +288,7 @@ def _split_thinking(
     thinking_end_token: Optional[str] = None,
     starts_in_thinking: bool = False,
     processor=None,
+    prompt_prefix: str = "",
 ) -> Tuple[Optional[str], str]:
     """Split thinking tags from content. Returns (reasoning, content)."""
     return _split_thinking_text(
@@ -296,6 +297,7 @@ def _split_thinking(
         thinking_end_token,
         starts_in_thinking,
         processor=processor,
+        prompt_prefix=prompt_prefix,
     )
 
 

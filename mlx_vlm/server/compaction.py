@@ -645,6 +645,7 @@ async def compact_response_context(
                 summary_args.thinking_start_token,
                 summary_args.thinking_end_token,
                 processor=processor,
+                prompt_prefix=prompt,
             )
             return content, OpenAIUsage.from_metrics(
                 metrics, prompt_tokens, output_tokens

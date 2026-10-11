@@ -2074,6 +2074,78 @@ def test_response_template_tool_calls(client, api):
     assert "to=self" not in response.text and "<atem:" not in response.text
 
 
+@pytest.mark.parametrize("continuous", [False, True])
+@pytest.mark.parametrize("stream", [False, True])
+def test_responses_preopened_template_content(client, continuous, stream):
+    text = "ROGUE 42<|eot|>"
+    prefix = "<|start|>assistant to=user<|message|>"
+    config = NS(model_type="muse_glimmer")
+    with _endpoint(
+        config=config,
+        processor=NS(config=config, tokenizer=_MuseResponseTemplateTokenizer()),
+        template=prefix,
+        result=_result(text),
+        chunks=[_result(text, finish_reason="stop")],
+        generator=(
+            _streaming([_token(text, finish_reason="stop")]) if continuous else None
+        ),
+    ):
+        body = _response(client, stream=stream)
+    assert body["output_text"] == "ROGUE 42"
+    assert body["output"][0]["type"] == "message"
+    assert body["output"][0]["content"][0]["text"] == "ROGUE 42"
+
+
+@pytest.mark.parametrize("api", ["responses", "chat", "messages"])
+@pytest.mark.parametrize("continuous", [False, True])
+@pytest.mark.parametrize("channel", ["user", "self"])
+def test_preopened_template_content_survives_tool_extraction(
+    client, api, continuous, channel
+):
+    call = _MUSE_CALL.split("<atem:function_calls>", 1)[1]
+    text = (
+        "Visible before. <atem:function_calls>" + call + " Visible after.<|eot|>"
+        if channel == "user"
+        else "Private reasoning.<|eom|><|start|>assistant to=get_weather<|message|>"
+        "<atem:function_calls>" + call
+    )
+    prefix = f"<|start|>assistant to={channel}<|message|>"
+    config = NS(model_type="muse_glimmer")
+    with _endpoint(
+        config=config,
+        processor=NS(config=config, tokenizer=_MuseResponseTemplateTokenizer()),
+        template=prefix,
+        result=_result(text),
+        generator=(
+            _streaming([_token(text, finish_reason="stop")]) if continuous else None
+        ),
+        parser=load_tool_module("atem"),
+    ):
+        response = _post(client, api, tools=[_tool(api=api)], stream=False)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    if api == "responses":
+        content = body["output_text"]
+        tool = next(item for item in body["output"] if item["type"] == "function_call")
+        name, arguments = tool["name"], json.loads(tool["arguments"])
+    elif api == "chat":
+        message = body["choices"][0]["message"]
+        content = message["content"]
+        tool = message["tool_calls"][0]["function"]
+        name, arguments = tool["name"], json.loads(tool["arguments"])
+    else:
+        content = "".join(
+            item["text"] for item in body["content"] if item["type"] == "text"
+        )
+        tool = next(item for item in body["content"] if item["type"] == "tool_use")
+        name, arguments = tool["name"], tool["input"]
+    assert (content or "") == (
+        "Visible before.   Visible after." if channel == "user" else ""
+    )
+    assert name == "get_weather" and arguments == {"city": "Warsaw"}
+    assert "<|eot|>" not in response.text and "<atem:" not in response.text
+
+
 def test_chat_completions_endpoint_falls_back_from_video_to_images(client):
     from mlx_vlm.generate import video
 
@@ -2295,6 +2367,44 @@ class TestCompaction:
         rendered = json.loads(mocked.generate.call_args.kwargs["prompt"])
         assert "New current instructions" in rendered[0]["content"]
         assert rendered[-1]["content"] == "Continue"
+
+    @pytest.mark.parametrize("continuous", [False, True])
+    def test_summary_preserves_preopened_template_content(self, mocked, continuous):
+        summary = "Goal: ORCHID. Port: 7319. Constraint: never edit secrets.env."
+        text = summary + "<|eot|>"
+        prefix = "<|start|>assistant to=user<|message|>"
+        model, _, config = mocked.cache.return_value
+        config.model_type = "muse_glimmer"
+        mocked.cache.return_value = (
+            model,
+            NS(config=config, tokenizer=_MuseResponseTemplateTokenizer()),
+            config,
+        )
+        mocked.template.side_effect = (
+            lambda processor, config, messages, **kw: json.dumps(messages) + prefix
+        )
+        mocked.generate.return_value = _result(text, finish_reason="stop")
+        worker = (
+            _streaming([_token(text, finish_reason="stop")]) if continuous else None
+        )
+        if worker is not None:
+            worker._cpu_preprocess = lambda prompt, images, audio: {
+                "input_ids": np.zeros((1, max(1, len(prompt) // 4)), dtype=np.int32)
+            }
+        with patch.object(server.runtime, "response_generator", worker):
+            response = mocked.compact(
+                input=_compaction_history(), keep_tokens=0, max_output_tokens=256
+            )
+        restored = _resolve_context([response["output"][0]])
+        summary_text = restored[2]["content"][0]["text"]
+        assert summary_text == "Conversation handoff:\n" + summary
+        assert "<|eot|>" not in json.dumps(restored)
+        actual_prompt = (
+            worker.generate.call_args.kwargs["prompt"]
+            if continuous
+            else mocked.generate.call_args.kwargs["prompt"]
+        )
+        assert actual_prompt.endswith(prefix)
 
     @pytest.mark.parametrize("change", ["tenant", "model", "tamper", "foreign"])
     def test_capsules_reject_invalid_scope_and_payload(self, change):
