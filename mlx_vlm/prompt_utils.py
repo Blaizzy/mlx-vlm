@@ -105,6 +105,7 @@ MODEL_CONFIG = {
     "phi4-siglip": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "hunyuan_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "youtu_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "youtu_vita": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "inkling": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "inkling_mm_model": MessageFormat.LIST_WITH_IMAGE_FIRST,
     # Prompt-only models
@@ -345,6 +346,7 @@ class MessageFormatter:
             "minimax_m3_vl",
             "llava_onevision",
             "glm5_next",
+            "youtu_vita",
         ] and kwargs.get("video"):
             return self._format_video_message(
                 prompt,
