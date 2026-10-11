@@ -37,7 +37,8 @@ jobs:
           fi
 
       - name: Install package and dependencies
-        run: python -m pip install -e '.[test]'
+        run: |
+          python -m pip install -e ".[test]"
 
       - name: Run Python tests
         run: |

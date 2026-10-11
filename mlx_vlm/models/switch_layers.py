@@ -289,12 +289,14 @@ class OffloadedSwitchGLU(nn.Module):
     ``gate_scale``/``out_scale`` are Inkling's resident NVFP4 correction
     vectors; ``gate_bias``/``up_bias``/``down_bias`` are ``SwitchLinear``'s
     optional per-expert additive bias (e.g. gpt-oss). ``activation`` is the
-    original ``SwitchGLU``'s activation object, called exactly as
+    replaced layer's activation object, called exactly as
     ``activation(x_up, x_gate)`` rather than reimplemented inline -- an inline
     ``silu(gate) * x`` measurably diverged from a real checkpoint's compiled
-    activation on real data. ``gate_quant``/``up_quant``/``down_quant`` are
-    each a ``(group_size, bits, mode)`` triple, resolved per projection since
-    a layer can have different bits per projection (mixed-precision converts).
+    activation on real data, and silently so for a layer whose gating is not
+    SiLU-based at all, so it is required rather than defaulted.
+    ``gate_quant``/``up_quant``/``down_quant`` are each a
+    ``(group_size, bits, mode)`` triple, resolved per projection since a layer
+    can have different bits per projection (mixed-precision converts).
     """
 
     def __init__(
@@ -304,7 +306,7 @@ class OffloadedSwitchGLU(nn.Module):
         gate_quant: Tuple[int, int, str],
         up_quant: Tuple[int, int, str],
         down_quant: Tuple[int, int, str],
-        activation: Any = None,
+        activation: Any,
         gate_scale: Optional[mx.array] = None,
         out_scale: Optional[mx.array] = None,
         gate_bias: Optional[mx.array] = None,
@@ -374,11 +376,7 @@ class OffloadedSwitchGLU(nn.Module):
             x_up = self._proj(xr, uw, usc, ub, self.up_quant)
             if self.up_bias is not None:
                 x_up = x_up + self.up_bias[j].astype(x_up.dtype)
-            h = (
-                self.activation(x_up, x_gate)
-                if self.activation is not None
-                else (nn.silu(x_gate) * x_up)
-            )
+            h = self.activation(x_up, x_gate)
             d = self._proj(h, dw, dsc, db, self.down_quant)
             if self.down_bias is not None:
                 d = d + self.down_bias[j].astype(d.dtype)

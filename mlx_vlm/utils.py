@@ -765,6 +765,11 @@ def get_model_and_args(config: dict, model_path: Optional[Path] = None):
         model_type = "dflash2"
     elif "Gemma4DSparkModel" in architectures:
         model_type = "gemma4_dspark"
+    elif model_type == "lfm2_vl" and str(
+        (config.get("auto_map") or {}).get("AutoModel", "")
+    ).endswith("D1Model"):
+        # LiquidAI d1 checkpoints are LFM2-VL weights with a decision readout.
+        model_type = "d1"
     elif dflash_config is not None:
         is_dspark = (
             dflash_config.get("projector_type") == "dspark"

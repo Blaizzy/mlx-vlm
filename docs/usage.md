@@ -202,9 +202,10 @@ interchangeable with MLX-issued items. `store=False` avoids the Responses regist
 APC persistence is configured separately.
 
 Run the opt-in HTTP integration tests on Apple Silicon with model access and
-`pytest`, `httpx`, and `openai` installed:
+the test extra (including `httpx2`) plus `openai` installed:
 
 ```bash
+python -m pip install -e ".[test]" openai
 MLX_VLM_COMPACTION_TEST_MODEL=openbmb/MiniCPM5-2B \
   python -m pytest -q mlx_vlm/tests/test_server.py::TestCompaction -k real_
 ```

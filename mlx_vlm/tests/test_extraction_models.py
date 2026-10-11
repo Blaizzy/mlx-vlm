@@ -53,7 +53,7 @@ from mlx_vlm.token_classification import (
     load_token_classification_model,
     load_token_classifier,
 )
-from mlx_vlm.utils import get_model_and_args, load_config
+from mlx_vlm.utils import get_model_and_args, load_config, update_module_configs
 
 EXTRACTION_DATA = json.loads(
     Path(__file__).with_name("extraction_cases.json").read_text()
@@ -63,6 +63,54 @@ EXTRACTION_CASES = {case["id"]: case for case in EXTRACTION_DATA["cases"]}
 
 def _extraction_config(name):
     return copy.deepcopy(EXTRACTION_CASES[name]["config"])
+
+
+@pytest.mark.parametrize("height,width", [(2, 3), (3, 2), (72, 72)])
+@pytest.mark.parametrize("theta", [10000.0, 100.0])
+def test_sam3_tracker_rope_matches_reference(height, width, theta):
+    from mlx_vlm.models.sam3.position import apply_rotary_enc_1d, init_2d_freqs
+    from mlx_vlm.models.sam3_1.sam_components import SimpleRoPEAttention
+
+    # Meta sam3/sam/rope.py:compute_axial_cis uses row-major coordinates
+    # and assigns the first half of the complex channels to X, then Y.
+    dim = 32
+    positions = np.arange(height * width, dtype=np.float32)
+    frequencies = theta ** (-np.arange(0, dim, 4, dtype=np.float32) / dim)
+    phases = np.concatenate(
+        [
+            np.outer(positions % width, frequencies),
+            np.outer(positions // width, frequencies),
+        ],
+        axis=-1,
+    )
+    reference = np.exp(1j * phases)
+    cos, sin = init_2d_freqs(dim, height, width, theta=theta)
+    np.testing.assert_allclose(np.asarray(cos), reference.real, atol=1e-5)
+    np.testing.assert_allclose(np.asarray(sin), reference.imag, atol=1e-5)
+
+    attention = SimpleRoPEAttention(
+        dim * 2, 2, feat_sizes=(height, width), rope_theta=theta, rope_k_repeat=True
+    )
+    np.testing.assert_allclose(
+        np.asarray(attention._freqs_cos), reference.real, atol=1e-5
+    )
+    np.testing.assert_allclose(
+        np.asarray(attention._freqs_sin), reference.imag, atol=1e-5
+    )
+
+    # Compare pairwise rotation with complex multiplication, including keys
+    # from two memory frames that reuse the same spatial frequencies.
+    rng = np.random.default_rng(42)
+    q = rng.normal(size=(1, height * width, 2, dim)).astype(np.float32)
+    k = rng.normal(size=(1, height * width * 2, 2, dim)).astype(np.float32)
+    rotated = apply_rotary_enc_1d(mx.array(q), mx.array(k), cos, sin, True)
+    for values, actual, repeats in [(q, rotated[0], 1), (k, rotated[1], 2)]:
+        complex_values = values[..., 0::2] + 1j * values[..., 1::2]
+        expected = complex_values * np.tile(reference, (repeats, 1))[None, :, None]
+        expected = np.stack([expected.real, expected.imag], axis=-1).reshape(
+            values.shape
+        )
+        np.testing.assert_allclose(np.asarray(actual), expected, atol=1e-5)
 
 
 def test_checkpoint_key_sanitization():
@@ -1865,7 +1913,11 @@ def _extraction_model(name):
     module = importlib.import_module(
         f"mlx_vlm.models.{EXTRACTION_CASES[name]['module']}"
     )
-    model = module.Model(module.ModelConfig.from_dict(_extraction_config(name)))
+    raw = _extraction_config(name)
+    config = update_module_configs(
+        module.ModelConfig.from_dict(raw), module, raw, ["text", "vision", "audio"]
+    )
+    model = module.Model(config)
     model.eval()
     return model
 
@@ -1894,37 +1946,50 @@ def _check_conv_checkpoint(model, transpose_convs=()):
     _assert_weights_equal(model.sanitize(dict(converted)), converted)
 
 
+def _decision_tokenizer(tokens=(), **special_tokens):
+    """A word-level tokenizer over option labels plus `tokens`; `special_tokens`
+    (e.g. `bos_token`, `additional_special_tokens`) are added as special tokens."""
+    import string
+
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
+    labels = list(string.ascii_uppercase) + [
+        a + b for a in string.ascii_uppercase for b in string.ascii_uppercase
+    ]
+    vocab = ["[UNK]", "[PAD]", "[CLS]", "[SEP]", "[MASK]", *labels[:255], *tokens]
+    backend = Tokenizer(
+        models.WordLevel(dict(zip(vocab, range(len(vocab)))), unk_token="[UNK]")
+    )
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    return PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        unk_token="[UNK]",
+        pad_token="[PAD]",
+        cls_token="[CLS]",
+        sep_token="[SEP]",
+        mask_token="[MASK]",
+        **special_tokens,
+    )
+
+
 class ExtractionChecks:
     def decision_models(self, case):
-        import string
         from dataclasses import asdict
-
-        from tokenizers import Tokenizer, models, pre_tokenizers
-        from transformers import PreTrainedTokenizerFast
 
         from mlx_vlm import load, predict
 
         model = _extraction_model(case["id"])
-        state = case["decision_models"]["state"]
-        questions = case["decision_models"]["questions"]
-
-        labels = list(string.ascii_uppercase) + [
-            a + b for a in string.ascii_uppercase for b in string.ascii_uppercase
-        ]
-        tokens = ["[UNK]", "[PAD]", "[CLS]", "[SEP]", "[MASK]", *labels[:255]]
-        backend = Tokenizer(
-            models.WordLevel(dict(zip(tokens, range(len(tokens)))), unk_token="[UNK]")
-        )
-        backend.pre_tokenizer = pre_tokenizers.Whitespace()
-        processor = PreTrainedTokenizerFast(
-            tokenizer_object=backend,
-            unk_token="[UNK]",
-            pad_token="[PAD]",
-            cls_token="[CLS]",
-            sep_token="[SEP]",
-            mask_token="[MASK]",
+        settings = case["decision_models"]
+        state = settings["state"]
+        questions = settings["questions"]
+        processor = _decision_tokenizer(
+            settings.get("tokens", ()), **settings.get("special_tokens", {})
         )
         expected = predict(model, processor, state, questions)
+        # Absent media are not forwarded, whichever media the model reads.
+        absent = predict(model, processor, state, questions, images=None, audio=None)
+        assert absent == expected
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "config.json").write_text(json.dumps(asdict(model.config)))
@@ -1993,6 +2058,37 @@ def test_extraction_contract(case):
         getattr(checks, kind)(case)
 
 
+@pytest.mark.parametrize(
+    "stages, taps, global_layers",
+    [
+        ([2, 5, 8, 11], [1, 4, 7, 10], [2, 5, 8, 11]),  # base
+        ([3, 6, 9, 12], [2, 5, 8, 11], [3, 6, 9]),  # small, seg
+    ],
+)
+def test_rfdetr_backbone_stage_indexes(stages, taps, global_layers):
+    from mlx_vlm.models.rfdetr import ModelConfig
+    from mlx_vlm.models.rfdetr.vision import DINOv2Backbone
+
+    def layers(config):
+        backbone = DINOv2Backbone(config.backbone_config)
+        windowed = backbone.window_block_indexes
+        return backbone.config.out_feature_indexes, [
+            i for i in range(12) if i not in windowed
+        ]
+
+    # Stage i is the output of block i - 1; the raw stage numbers are the
+    # global attention blocks (rfdetr compute_window_block_indexes).
+    config = ModelConfig(out_feature_indexes=stages)
+    assert layers(config) == (taps, global_layers)
+
+    # A saved config must reload to the same layers, with or without the
+    # derived sub-configs.
+    saved = json.loads(json.dumps(config.to_dict(), default=lambda c: c.to_dict()))
+    assert layers(ModelConfig.from_dict(saved)) == (taps, global_layers)
+    del saved["backbone_config"]
+    assert layers(ModelConfig.from_dict(saved)) == (taps, global_layers)
+
+
 def test_video_depth_anything_conv_checkpoint():
     _check_conv_checkpoint(
         _extraction_model("video_depth_anything"),
@@ -2005,6 +2101,49 @@ def test_video_depth_anything_rejects_unknown_encoder():
 
     with pytest.raises(ValueError):
         ModelConfig(encoder="vitxl")
+
+
+def test_rfdetr_checkpoint_conversion():
+    from mlx_vlm.models.rfdetr import Model, ModelConfig
+
+    model = Model(ModelConfig(segmentation=True))
+    mx.random.seed(0)
+    expected = {
+        key: mx.random.normal(value.shape)
+        for key, value in tree_flatten(model.parameters())
+    }
+    renames = [
+        ("backbone.embeddings.", "backbone.0.encoder.encoder.embeddings."),
+        ("backbone.encoder.layers.", "backbone.0.encoder.encoder.encoder.layer."),
+        ("backbone.layernorm.", "backbone.0.encoder.encoder.layernorm."),
+        ("projector.", "backbone.0.projector."),
+        (".attention.q_proj.", ".attention.attention.query."),
+        (".attention.k_proj.", ".attention.attention.key."),
+        (".attention.v_proj.", ".attention.attention.value."),
+        (".attention.o_proj.", ".attention.output.dense."),
+        (".layer_scale1", ".layer_scale1.lambda1"),
+        (".layer_scale2", ".layer_scale2.lambda1"),
+    ]
+    source = {}
+    for key, value in expected.items():
+        for mlx_name, torch_name in renames:
+            key = key.replace(mlx_name, torch_name)
+        if value.ndim == 4:
+            value = value.transpose(0, 3, 1, 2)
+        source[f"model.{key}"] = value
+    for i in range(model.config.dec_layers):
+        prefix = f"model.transformer.decoder.layers.{i}.self_attn."
+        for suffix in ("weight", "bias"):
+            source[f"{prefix}in_proj_{suffix}"] = mx.concatenate(
+                [source.pop(f"{prefix}{name}_proj.{suffix}") for name in "qkv"]
+            )
+    mask_token = "model.backbone.0.encoder.encoder.embeddings.mask_token"
+    source[mask_token] = mx.zeros((1, 384))
+
+    converted = model.sanitize(source)
+    _assert_weights_equal(converted, expected)
+    _assert_weights_equal(model.sanitize(dict(converted)), expected)
+    model.load_weights(list(converted.items()), strict=True)
 
 
 class TestLayaDecisionModel(unittest.TestCase):
@@ -2142,3 +2281,725 @@ class TestLayaDecisionModel(unittest.TestCase):
                     self.assertEqual(
                         result["answers"]["route"]["probabilities"]["B"], expected
                     )
+
+
+_D1_QUESTIONS = {
+    "route": {"type": "choice", "instructions": "Route", "criteria": ["A", "B"]},
+    "quality": {
+        "type": "score",
+        "instructions": "Rate",
+        "criteria": ["low", "mid", "high"],
+    },
+    "finished": {"type": "bool", "instructions": "Finished"},
+}
+_D1_TEMPLATE = (
+    "{{ bos_token }}{% for m in messages %}<|im_start|>{{ m['role'] }}\n"
+    "{% for c in m['content'] %}{% if c['type'] == 'image' %}<image>"
+    "{% else %}{{ c['text'] }}{% endif %}{% endfor %}<|im_end|>\n{% endfor %}"
+)
+
+
+class _VocabTokenizer:
+    """One token per vocabulary entry, one token per character otherwise."""
+
+    def __init__(self, vocab):
+        self.ids = {token: i for i, token in enumerate(vocab)}
+
+    def encode(self, text, add_special_tokens=False):
+        if text in self.ids:
+            return [self.ids[text]]
+        return [1000 + ord(c) for c in text]
+
+
+def _d1_tokenizer():
+    return _decision_tokenizer(
+        ["yes", "no", "0", "1", "2", "Route", "Rate", "Finished"],
+        bos_token="<|startoftext|>",
+        additional_special_tokens=[
+            "<|im_start|>",
+            "<|im_end|>",
+            "<image>",
+            "<|image_start|>",
+            "<|image_end|>",
+        ],
+    )
+
+
+class TestD1DecisionModel(unittest.TestCase):
+    def test_prompt_matches_reference(self):
+        from mlx_vlm.models.d1.prompt import as_question, prefix_text, suffix_text
+
+        tok = _VocabTokenizer(["A", "B"])
+        head, tail = "<|im_start|>user\n", "<|im_end|>\n<|im_start|>assistant\n"
+        self.assertEqual(
+            prefix_text("Refund me", "<s>"), f"<s>{head}Refund me\n\n\nQUESTION:\n"
+        )
+        self.assertEqual(
+            prefix_text({"order": [1, "café"]}),
+            f'{head}{{\n  "order": [\n    1,\n    "café"\n  ]\n}}\n\n\nQUESTION:\n',
+        )
+        self.assertEqual(
+            prefix_text(None, "<s>", "<image><image>"), f"<s>{head}<image><image>"
+        )
+        cases = [
+            (
+                {"criteria": {"billing": "Charges", "tech_support": None}},
+                "Options:\nA Charges\nB tech support\n\n"
+                "Reply with the option code only.",
+            ),
+            (
+                {"criteria": ["x", "y"]},
+                "Options:\nx x\ny y\n\nReply with the option code only.",
+            ),
+            (
+                {"type": "bool", "criteria": {"false": "keep", "true": "refund"}},
+                "Yes: refund\nNo: keep\n\nReply with yes or no only.",
+            ),
+            ({"type": "bool"}, "\nReply with yes or no only."),
+            (
+                {"type": "score", "criteria": ["low", "high"]},
+                "0 low\n1 high\n\nReply with a single digit 0-1 only.",
+            ),
+        ]
+        for question, body in cases:
+            with self.subTest(question=question):
+                question = as_question({"instructions": "Q?", **question})
+                separator = "\n" if question["type"] == "noul" else "\n\n"
+                self.assertEqual(
+                    suffix_text(tok, question), f"Q?{separator}{body}{tail}"
+                )
+
+    def test_option_codes_and_aliases(self):
+        from mlx_vlm.models.d1.prompt import aliases, option_codes
+
+        self.assertEqual(option_codes(["x", " Y "]), ["x", "Y"])
+        self.assertEqual(option_codes(["red", "green"]), ["A", "B"])
+        self.assertEqual(option_codes(list(map(str, range(27))))[::26], ["00", "26"])
+        letters = [chr(c) for c in range(ord("A"), ord("Z") + 1)]
+        tok = _VocabTokenizer(letters + [f"{i:02d}" for i in range(1, 27)])
+        codes = aliases(tok, [f"label {i}" for i in range(27)])
+        # "00" is two tokens here, so it takes the first free code of the pool.
+        self.assertEqual(codes[:3], [("A", 0), ("01", 26), ("02", 27)])
+
+    def test_readout_max_pools_each_option(self):
+        from mlx_vlm.models.d1.d1 import _answer
+        from mlx_vlm.models.d1.prompt import readout, readout_ids
+
+        tok = _VocabTokenizer(["A", "B", " A", "yes", "Yes", "no", "0", "1", "2"])
+        choice = {"type": "choice", "criteria": {"red": None, "blue": None}}
+        noul = {"type": "noul", "criteria": None}
+        score = {"type": "score", "criteria": ["a", "b", "c"]}
+        self.assertEqual(readout_ids(tok, choice), [[0, 2], [1]])
+        self.assertEqual(readout_ids(tok, noul), [[3, 4], [5]])
+        self.assertEqual(readout_ids(tok, score), [[6], [7], [8]])
+        expected = [1 / (1 + math.exp(-1)), 1 / (1 + math.exp(1))]
+        np.testing.assert_allclose(
+            readout(tok, choice, {0: -3.0, 2: -1.0, 1: -2.0}), expected
+        )
+        np.testing.assert_allclose(
+            readout(tok, noul, {3: -4.0, 4: -0.5, 5: -1.5}), expected
+        )
+        self.assertEqual(
+            _answer(noul, [0.25, 0.75]),
+            {"type": "bool", "value": False, "probability": 0.25},
+        )
+        self.assertEqual(_answer(score, [0.2, 0.3, 0.5])["value"], 1.3)
+
+    def test_malformed_questions_are_value_errors(self):
+        from mlx_vlm import predict
+        from mlx_vlm.models.d1.prompt import aliases, as_question
+
+        model, tok = _extraction_model("d1"), _d1_tokenizer()
+        for question, message in [
+            ({"type": "bool"}, "instructions"),
+            ({"type": "noul", "instructions": "Q", "criteria": ["a", "b"]}, "criteria"),
+            (
+                {"type": "score", "instructions": "Q", "criteria": list("abcdefghijk")},
+                "2 to 10",
+            ),
+        ]:
+            with self.subTest(question=question):
+                with self.assertRaisesRegex(ValueError, message):
+                    predict(model, tok, "A B", {"q": question})
+        with self.assertRaisesRegex(ValueError, "noul criteria"):
+            as_question({"type": "noul", "instructions": "Q", "criteria": "yes"})
+        with self.assertRaisesRegex(ValueError, "two options"):
+            as_question({"instructions": "Q", "criteria": "ab"})
+        # One-character codes are the only single tokens here: 52 of them.
+        with self.assertRaisesRegex(ValueError, "alias"):
+            aliases(_VocabTokenizer([]), [f"label {i}" for i in range(53)])
+
+    def test_cap_pixels(self):
+        from PIL import Image
+
+        from mlx_vlm.models.d1.prompt import cap_pixels
+
+        small = cap_pixels(Image.new("RGBA", (100, 50)))
+        self.assertEqual((small.mode, small.size), ("RGB", (100, 50)))
+        self.assertEqual(cap_pixels(Image.new("RGB", (2048, 1024))).size, (1448, 724))
+
+    def test_questions_continue_the_shared_state(self):
+        from mlx_vlm.models.d1.prompt import as_question, prefix_text, suffix_text
+
+        model, tok = _extraction_model("d1"), _d1_tokenizer()
+        questions = [as_question(q) for q in _D1_QUESTIONS.values()]
+        state = {"ticket": "A B"}
+
+        def encode(text):
+            return tok.encode(text, add_special_tokens=False)
+
+        prefix = prefix_text(state, "<|startoftext|>")
+        trunk, branches, vision = model.decision_inputs(tok, state, questions)
+        self.assertEqual(trunk, encode(prefix))
+        self.assertEqual(branches, [encode(suffix_text(tok, q)) for q in questions])
+        self.assertEqual(vision, {})
+        together, read = model.probabilities(tok, state, questions)
+        self.assertEqual(read, len(trunk) + sum(map(len, branches)))
+        chunked, _ = model.probabilities(tok, state, questions, token_budget=1)
+        np.testing.assert_allclose(sum(chunked, []), sum(together, []), atol=1e-5)
+        for question, probabilities in zip(questions, together):
+            alone, read = model.probabilities(tok, state, [question])
+            self.assertEqual(read, len(encode(prefix + suffix_text(tok, question))))
+            np.testing.assert_allclose(alone[0], probabilities, atol=1e-5)
+
+    def test_image_decisions_use_the_processor(self):
+        from PIL import Image
+        from transformers import Lfm2VlProcessor
+
+        from mlx_vlm import predict
+        from mlx_vlm.models.d1.prompt import as_question
+        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import Lfm2VlNumpyImageProcessor
+
+        tok = _d1_tokenizer()
+        processor = Lfm2VlProcessor(
+            image_processor=Lfm2VlNumpyImageProcessor(),
+            tokenizer=tok,
+            chat_template=_D1_TEMPLATE,
+        )
+        model = _extraction_model("d1")
+        model.config.image_token_index = tok.convert_tokens_to_ids("<image>")
+        questions = [as_question(q) for q in _D1_QUESTIONS.values()]
+        pixels = np.random.default_rng(0).integers(0, 256, (48, 64, 3), np.uint8)
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "photo.png")
+            Image.fromarray(pixels).save(path)
+            images = [Image.fromarray(pixels), path]
+            result = predict(model, processor, None, _D1_QUESTIONS, images=images)
+            trunk, branches, vision = model.decision_inputs(
+                processor, None, questions, images
+            )
+            together, _ = model.probabilities(processor, None, questions, images)
+            alone = [
+                model.probabilities(processor, None, [q], images)[0][0]
+                for q in questions
+            ]
+        self.assertEqual(
+            [answer["type"] for answer in result["answers"].values()],
+            ["choice", "score", "bool"],
+        )
+        self.assertEqual(
+            result["usage"]["input_tokens"], len(trunk) + sum(map(len, branches))
+        )
+        bos, start, image_start = tok.convert_tokens_to_ids(
+            ["<|startoftext|>", "<|im_start|>", "<|image_start|>"]
+        )
+        self.assertEqual((trunk[:2], trunk.count(image_start)), ([bos, start], 2))
+        mask = np.asarray(vision["pixel_attention_mask"])
+        self.assertEqual(vision["pixel_values"].shape[:2], (2, mask.sum(1).max()))
+        np.testing.assert_allclose(sum(alone, []), sum(together, []), atol=1e-5)
+        with self.assertRaisesRegex(ValueError, "processor"):
+            model.predict(tok, None, _D1_QUESTIONS, images=Image.fromarray(pixels))
+
+    def test_lfm2_vl_checkpoint_with_d1_auto_map_loads_as_d1(self):
+        from dataclasses import asdict
+
+        from mlx_vlm import load, predict
+        from mlx_vlm.models import d1, lfm2_vl
+
+        auto_map = {"AutoModel": "modeling_d1.D1Model"}
+        self.assertEqual(
+            get_model_and_args({"model_type": "lfm2_vl", "auto_map": auto_map}),
+            (d1, "d1"),
+        )
+        for other in (None, {"AutoModel": "modeling_lfm2_vl.Lfm2VlModel"}):
+            self.assertEqual(
+                get_model_and_args({"model_type": "lfm2_vl", "auto_map": other}),
+                (lfm2_vl, "lfm2_vl"),
+            )
+        model, tok = _extraction_model("d1"), _d1_tokenizer()
+        questions = {"route": _D1_QUESTIONS["route"]}
+        expected = predict(model, tok, "A B", questions)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = {**asdict(model.config), "model_type": "lfm2_vl"}
+            (root / "config.json").write_text(
+                json.dumps({**config, "auto_map": auto_map})
+            )
+            tok.save_pretrained(root)
+            weights = {}
+            for key, value in tree_flatten(model.parameters()):
+                if key.startswith("language_model.model."):  # the HF layout
+                    key = key.replace("language_model.model.", "model.language_model.")
+                    if key.endswith(".conv.conv.weight"):
+                        value = value.transpose(0, 2, 1)
+                weights[key] = value
+            mx.save_safetensors(str(root / "model.safetensors"), weights)
+            loaded, processor = load(directory)
+            actual = predict(loaded, processor, "A B", questions)
+        self.assertIsInstance(loaded, d1.Model)
+        self.assertEqual(loaded.config.model_type, "lfm2_vl")
+        self.assertEqual(actual["answers"], expected["answers"])
+        self.assertEqual(actual["usage"], expected["usage"])
+
+
+def _chars(text):
+    return [100 + ord(c) for c in text]
+
+
+class _CharTokenizer:
+    """d1-omni's delimiters as fixed ids and one token per character."""
+
+    bos_token_id = 1
+    special = {f"<|reserved_{i}|>": i for i in range(7, 12)} | {"<|mask|>": 16}
+
+    def convert_tokens_to_ids(self, token):
+        return self.special[token]
+
+    def __call__(self, text, add_special_tokens=False):
+        return {"input_ids": _chars(text)}
+
+
+def _random_d1_omni():
+    model = _extraction_model("d1_omni")
+    mx.random.seed(0)
+    weights = {
+        k: mx.random.normal(v.shape) * 0.5 for k, v in tree_flatten(model.parameters())
+    }
+    # Batch-norm variances stay positive.
+    weights.update({k: v.abs() + 0.5 for k, v in weights.items() if "running_var" in k})
+    model.load_weights(list(weights.items()))
+    return model
+
+
+def _flat(results):
+    return [p for probs, _ in results for row in probs for p in row]
+
+
+class TestD1OmniDecisionModel(unittest.TestCase):
+    def test_encode_matches_reference(self):
+        from mlx_vlm.models.d1_omni.prompt import encode
+
+        tok, t = _CharTokenizer(), _chars
+        choice = ("choice", "Pick", {"a": None, "b": "bee"})
+        ids, markers = encode(tok, "xy", choice, 16384)
+        self.assertEqual(
+            ids,
+            [1, 7, *t("xy"), 8, *t("Pick"), 9, 16, *t(" a"), 10]
+            + [9, 16, *t(" b: bee"), 10, 11],
+        )
+        self.assertEqual(markers, [10, 15])
+        # Three options leave 64 - 55 - 2 = 7 tokens of state.
+        score = ("score", "Rate", ["low", "mid", "high"])
+        ids, markers = encode(tok, "abcdefghijklmnop", score, 64)
+        self.assertEqual(
+            (ids[:9], len(ids), markers), ([1, 7, *t("abcdefg")], 64, [15, 31, 47])
+        )
+        # Instructions keep max(16, budget) = 96 tokens, each option 45.
+        long = ("choice", "Q" * 200, {"a": "x" * 100, "b": None})
+        ids, markers = encode(tok, "s", long, 16384)
+        self.assertEqual((len(ids), markers), (153, [100, 148]))
+        self.assertEqual(ids[3:101], [8, *t("Q" * 95), 9, 16])
+        self.assertEqual(ids[101:147], [*t(" a: " + "x" * 41), 10])
+        # Caller text cannot forge a delimiter or marker.
+        escaped = ("noul", "<|mask|>?", {"true": "<|reserved_9|>"})
+        ids, _ = encode(tok, "<|im_end|>", escaped, 16384)
+        self.assertEqual(
+            [i for i in ids if i < 100], [1, 7, 8, 9, 16, 10, 9, 16, 10, 11]
+        )
+        self.assertEqual(
+            "".join(chr(i - 100) for i in ids if i >= 100),
+            "<¦im_end¦><¦mask¦>? false: no, the statement does not hold"
+            " true: <¦reserved_9¦>",
+        )
+        with self.assertRaisesRegex(ValueError, "do not fit"):
+            encode(tok, "", ("noul", "q", None), 20)
+
+    def test_option_texts_and_temperature_buckets(self):
+        from mlx_vlm.models.d1_omni.prompt import (
+            as_question,
+            escape,
+            render_options,
+            temperature_key,
+        )
+
+        self.assertEqual(
+            escape("<|mask|> <|reserved_7|> <|not one|> <||>"),
+            "<¦mask¦> <¦reserved_7¦> <|not one|> <||>",
+        )
+        noul = as_question({"type": "bool", "instructions": "Q"})
+        self.assertEqual(noul, ("noul", "Q", None))
+        cases = [
+            (
+                noul,
+                None,
+                [
+                    "false: no, the statement does not hold",
+                    "true: yes, the statement holds",
+                ],
+            ),
+            (noul, {"false": "no", "true": "yes"}, ["false: no", "true: yes"]),
+            (("noul", "", {"yes": "Y", "no": "N"}), None, ["false: N", "true: Y"]),
+            (
+                ("noul", "", {"true": 0, "false": ""}),
+                {"false": "no", "true": "yes"},
+                ["false: no, the statement does not hold", "true: 0"],
+            ),
+            (
+                (
+                    "choice",
+                    "",
+                    {"zero": 0, "none": None, "empty": "", "o": {"é": True}},
+                ),
+                None,
+                ["zero: 0", "none", "empty", 'o: {"é": true}'],
+            ),
+            (
+                ("score", "", ["low", [0, False]]),
+                None,
+                ["level 0: low", "level 1: [0, false]"],
+            ),
+        ]
+        for question, default, expected in cases:
+            with self.subTest(question=question):
+                self.assertEqual(render_options(question, default), expected)
+        # After an audio prefix: numbered choices and bare yes/no nouls.
+        spoken = [
+            (cases[1][0], ["false: no", "true: yes"]),
+            (
+                ("choice", "", {"a": None, "b": "", "c": "sea", "d": [1]}),
+                [
+                    "option_000: a",
+                    "option_001: b",
+                    "option_002: sea",
+                    "option_003: [1]",
+                ],
+            ),
+            (cases[-1][0], ["level 0: low", "level 1: [0, false]"]),
+        ]
+        for question, expected in spoken:
+            with self.subTest(question=question, audio=True):
+                self.assertEqual(render_options(question, audio=True), expected)
+        choice = as_question(
+            {"type": "choice", "instructions": 1, "criteria": list("abc")}
+        )
+        self.assertEqual(choice, ("choice", "1", dict.fromkeys("abc")))
+        for question, key in [
+            (noul, "noul:2"),
+            (choice, "choice:3-5"),
+            (("score", "", list("abcdef")), "score:6-10"),
+            (("choice", "", dict.fromkeys("abcdefghijkl")), "choice:11+"),
+        ]:
+            self.assertEqual(temperature_key(question), key)
+        with self.assertRaisesRegex(ValueError, "2 to 10"):
+            as_question(
+                {"type": "score", "instructions": "", "criteria": list("abcdefghijk")}
+            )
+
+    def test_image_layout_matches_reference(self):
+        from PIL import Image
+
+        from mlx_vlm.models.d1_omni.vision import layout, preprocess
+
+        cases = [
+            ((640, 480), (1, 1), (416, 576), False),
+            ((64, 48), (1, 1), (224, 320), False),
+            ((300, 1400), (1, 1), (1088, 224), False),
+            ((1, 1), (1, 1), (256, 256), False),
+            ((2000, 1200), (3, 2), (384, 640), True),
+            ((3000, 260), (10, 1), (128, 1728), True),
+            ((1000, 1000), (2, 2), (512, 512), True),
+            # A ratio tie picks the larger grid once the image fills half of it.
+            ((1100, 1100), (3, 3), (512, 512), True),
+        ]
+        for (width, height), grid, thumbnail, tiled in cases:
+            with self.subTest(size=(width, height)):
+                self.assertEqual(
+                    layout(width, height),
+                    {"grid": grid, "thumbnail": thumbnail, "tiled": tiled},
+                )
+        with self.assertRaises(ValueError):
+            layout(0, 10)
+        inputs = preprocess(Image.new("RGB", (64, 48), (255, 0, 127)))
+        self.assertEqual(inputs["pixel_values"].shape, (1, 1024, 768))
+        self.assertEqual(inputs["spatial_shapes"].tolist(), [[14, 20]])
+        self.assertEqual(int(inputs["pixel_attention_mask"].sum()), 280)
+        np.testing.assert_allclose(
+            inputs["pixel_values"][0, 0, :6], [1, -1, -0.5 / 127.5] * 2, atol=1e-6
+        )
+        self.assertFalse(inputs["pixel_values"][0, 280:].any())
+
+    def test_sanitize_converts_reference_checkpoint(self):
+        from mlx_vlm.models.d1_omni.audio import RENAMES
+
+        model = _extraction_model("d1_omni")
+        expected, start = {}, 0
+        for key, value in tree_flatten(model.parameters()):
+            expected[key] = mx.arange(start, start + value.size, dtype=value.dtype)
+            expected[key] = expected[key].reshape(value.shape)
+            start += value.size
+        source = {}
+        for key, value in expected.items():
+            if key.startswith("audio."):
+                for old, new in RENAMES:
+                    key = key.replace(new, old)
+                axes = {4: (0, 3, 1, 2), 3: (0, 2, 1)}.get(value.ndim)
+                source[key] = value if axes is None else value.transpose(*axes)
+                continue
+            if key.endswith(".conv.conv.weight"):
+                value = value.transpose(0, 2, 1)
+            key = key.replace("vision.tower.", "vision.tower.vision_model.")
+            key = key.replace("head.scorer.layers.", "head.scorer.")
+            source[key.replace(".attention.out_proj.", ".self_attn.out_proj.")] = value
+        for i in range(model.config.head_layers):
+            prefix = f"head.head.layers.{i}"
+            for suffix in ("weight", "bias"):
+                parts = [
+                    source.pop(f"{prefix}.attention.{name}_proj.{suffix}")
+                    for name in ("query", "key", "value")
+                ]
+                source[f"{prefix}.self_attn.in_proj_{suffix}"] = mx.concatenate(parts)
+        for key in (
+            "audio.encoder.pre_encode.conv.3.weight",
+            "audio.encoder.pre_encode.out.weight",
+            "audio.encoder.layers.0.self_attn.linear_pos.weight",
+            "audio.encoder.layers.0.self_attn.pos_bias_u",
+            "audio.encoder.layers.0.conv.depthwise_conv.weight",
+            "audio.encoder.layers.0.conv.batch_norm.running_var",
+            "audio.residual.down.weight",
+        ):
+            self.assertIn(key, source)
+        dropped = {
+            "audio.encoder.layers.0.conv.batch_norm.num_batches_tracked": mx.array(3),
+            "vision.tower.vision_model.embeddings.position_ids": mx.arange(16),
+        }
+        source.update(dropped)
+        converted = model.sanitize(source)
+        _assert_weights_equal(converted, expected)
+        _assert_weights_equal(model.sanitize(dict(converted)), expected)
+        model.load_weights(list(converted.items()), strict=True)
+
+    def test_image_decisions_batching_and_usage(self):
+        from PIL import Image
+
+        from mlx_vlm import predict
+        from mlx_vlm.models.d1_omni.prompt import as_question, encode
+
+        model, tok = _random_d1_omni(), _CharTokenizer()
+        pixels = np.random.default_rng(0).integers(0, 256, (48, 64, 3), np.uint8)
+        image = Image.fromarray(pixels)
+        q1 = {"type": "bool", "instructions": "Is it short?"}
+        q2 = {"type": "choice", "instructions": "Pick one", "criteria": ["a", "b", "c"]}
+        q3 = {
+            "type": "score",
+            "instructions": "Rate",
+            "criteria": ["low", "mid", "high"],
+        }
+        requests = [
+            ("x" * 300, [q1, q2]),
+            ("hi", [q3]),
+            (None, [q1, q2], [image]),
+            ({"k": [1, 2]}, [q2], image),
+        ]
+
+        batched = model.probabilities(tok, requests)
+        alone = [model.probabilities(tok, [request])[0] for request in requests]
+        np.testing.assert_allclose(_flat(batched), _flat(alone), atol=1e-5)
+        rows = model.probabilities(tok, requests, token_budget=1)
+        np.testing.assert_allclose(_flat(batched), _flat(rows), atol=1e-5)
+        # Every question reads the 7 x 10 image prefix; image nouls say yes/no.
+        yes_no = {"false": "no", "true": "yes"}
+        texts = [encode(tok, "", as_question(q), 896, yes_no)[0] for q in (q1, q2)]
+        self.assertEqual(batched[2][1], 2 * 70 + sum(map(len, texts)))
+        # Calibration applies to text rows only.
+        model.config.temperatures = {}
+        uncalibrated = model.probabilities(tok, requests[1:3])
+        self.assertFalse(np.allclose(uncalibrated[0][0], batched[1][0], atol=1e-3))
+        np.testing.assert_allclose(
+            _flat(uncalibrated[1:]), _flat(batched[2:3]), atol=1e-5
+        )
+
+        result = predict(model, tok, None, {"a": q1, "b": q2, "c": q3}, images=[image])
+        answers = result["answers"]
+        alone = predict(
+            model, tok, None, {"a": q1, "b": q2}, images=[image], token_budget=1
+        )["answers"]
+        self.assertAlmostEqual(
+            alone["a"]["probability"], answers["a"]["probability"], places=3
+        )
+        self.assertEqual(
+            [a["type"] for a in answers.values()], ["bool", "choice", "score"]
+        )
+        [(same, _)] = model.probabilities(tok, [(None, [q1, q2, q3], [image])])
+        self.assertEqual(answers["a"]["probability"], round(same[0][1], 4))
+        self.assertEqual(set(answers["b"]["probabilities"]), {"a", "b", "c"})
+        self.assertEqual(
+            answers["c"]["metadata"]["legend"], {"0": "low", "1": "mid", "2": "high"}
+        )
+
+    def test_media_prefix_reads_only_media(self):
+        # Prefix queries never see text keys and the centred convolution never lets
+        # the last prefix position read the first text one, so the media prefix is
+        # encoded the same whatever text follows it.
+        trunk = _random_d1_omni().encoder
+        media = mx.random.normal((5, 64), key=mx.random.key(1))
+
+        def run(ids):
+            h = mx.concatenate([media, trunk.embed_tokens(mx.array(ids))])[None]
+            return np.array(trunk(h, mx.ones(h.shape[:2], dtype=mx.bool_), [5])[0])
+
+        first, second = run([1, 2, 3, 4]), run([9, 8, 7, 6])
+        np.testing.assert_array_equal(first[:5], second[:5])
+        self.assertFalse(np.allclose(first[5:], second[5:]))
+
+    def test_short_conv_taps_left_centre_right(self):
+        trunk = _random_d1_omni().encoder
+        conv = next(layer.conv for layer in trunk.layers if hasattr(layer, "conv"))
+        conv.conv.weight = mx.broadcast_to(
+            mx.array([1.0, 10.0, 100.0])[None, :, None], conv.conv.weight.shape
+        )
+        x = np.random.default_rng(0).normal(size=(1, 6, 64)).astype(np.float32)
+        keep = np.array([[1, 1, 0, 1, 1, 1]], np.float32)  # a 3-position prefix
+        y = conv(mx.array(x), mx.ones((1, 6)), mx.array(keep))
+        b, c, u = np.split(x @ np.array(conv.in_proj.weight).T, 3, axis=-1)
+        z = np.pad(b * u, [(0, 0), (1, 1), (0, 0)])
+        z = z[:, :-2] + 10 * z[:, 1:-1] + 100 * keep[..., None] * z[:, 2:]
+        expected = (c * z) @ np.array(conv.out_proj.weight).T
+        np.testing.assert_allclose(
+            np.array(y), expected, rtol=0, atol=1e-5 * np.abs(expected).max()
+        )
+
+    def test_exif_orientation_applies_to_files_only(self):
+        from PIL import Image, ImageOps
+
+        from mlx_vlm import predict
+
+        model, tok = _random_d1_omni(), _CharTokenizer()
+        pixels = np.random.default_rng(0).integers(0, 256, (48, 96, 3), np.uint8)
+        questions = {"q": {"type": "bool", "instructions": "Upright?"}}
+
+        def answer(image):
+            return predict(model, tok, None, questions, images=[image])["answers"]
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "photo.jpg"
+            exif = Image.Exif()
+            exif[0x0112] = 6  # Orientation: rotate 90 degrees to display
+            Image.fromarray(pixels).save(path, exif=exif)
+            photo = Image.open(path)
+            photo.load()
+            stored = Image.fromarray(np.asarray(photo))
+            turned = ImageOps.exif_transpose(photo)
+            # A PIL image is read as given, as in the reference; a file is turned.
+            self.assertEqual(answer(photo), answer(stored))
+            self.assertEqual(answer(str(path)), answer(turned))
+            self.assertNotEqual(answer(stored), answer(turned))
+
+    def test_audio_waveform_inputs(self):
+        from mlx_vlm.models.d1_omni.audio import waveform
+
+        pcm = np.array([-32768, -1, 0, 1, 32767], np.int16)
+        samples = pcm.astype(np.float32) / 32768
+        for audio in (pcm, mx.array(pcm), samples, samples.tolist(), mx.array(samples)):
+            with self.subTest(audio=type(audio)):
+                x = waveform(audio)
+                self.assertEqual((x.dtype, x.shape), (mx.float32, (8000,)))
+                np.testing.assert_array_equal(np.array(x[:5]), samples)
+                self.assertFalse(np.array(x[5:]).any())
+        self.assertEqual(waveform(np.ones(31 * 16000, np.float32)).shape, (480000,))
+        # The reference pads even an empty clip with silence.
+        self.assertEqual(waveform(np.zeros(0, np.int16)).shape, (8000,))
+        with self.assertRaisesRegex(ValueError, "mono"):
+            waveform(np.zeros((8000, 2), np.int16))
+
+    def test_audio_decisions_batching_and_usage(self):
+        import wave
+
+        from PIL import Image
+
+        from mlx_vlm import predict
+        from mlx_vlm.models.d1_omni.prompt import as_question, encode
+
+        model, tok = _random_d1_omni(), _CharTokenizer()
+        rng = np.random.default_rng(0)
+        clip = (rng.normal(0, 0.1, 12000) * 32768).astype(np.int16)
+        image = Image.fromarray(rng.integers(0, 256, (48, 64, 3), np.uint8))
+        q1 = {"type": "bool", "instructions": "Loud?", "criteria": {"true": "very"}}
+        q2 = {"type": "choice", "instructions": "Pick one", "criteria": ["a", "b", "c"]}
+        q3 = {"type": "score", "instructions": "Rate", "criteria": ["low", "high"]}
+        requests = [
+            ("x" * 300, [q1, q2]),
+            (None, [q1, q2, q3], None, clip),
+            ({"k": [1, 2]}, [q2], None, clip[:9000].astype(np.float32) / 32768),
+            (None, [q3], [image]),
+            ("hi", [q3], None, None),
+        ]
+        batched = model.probabilities(tok, requests)
+        alone = [model.probabilities(tok, [request])[0] for request in requests]
+        np.testing.assert_allclose(_flat(batched), _flat(alone), atol=1e-5)
+        rows = model.probabilities(tok, requests, token_budget=1)
+        np.testing.assert_allclose(_flat(batched), _flat(rows), atol=1e-5)
+        # A missing state reads as {}, options are written as the audio questions
+        # were trained, and every question reads the 10-frame audio prefix.
+        texts = [
+            encode(tok, {}, as_question(q), 15360, audio=True)[0] for q in (q1, q2, q3)
+        ]
+        self.assertEqual(model.audio(clip).shape, (1, 10, 64))
+        self.assertEqual(batched[1][1], 3 * 10 + sum(map(len, texts)))
+        explicit = model.probabilities(tok, [({}, [q1, q2, q3], None, clip)])
+        np.testing.assert_allclose(_flat(explicit), _flat(alone[1:2]), atol=1e-6)
+        # Audio answers are not calibrated.
+        model.config.temperatures = {}
+        uncalibrated = model.probabilities(tok, requests[1:3])
+        np.testing.assert_allclose(_flat(uncalibrated), _flat(batched[1:3]), atol=1e-5)
+
+        questions = {"a": q1, "b": q2, "c": q3}
+        result = predict(model, tok, None, questions, audio=clip)
+        answers = result["answers"]
+        self.assertEqual(
+            [a["type"] for a in answers.values()], ["bool", "choice", "score"]
+        )
+        self.assertEqual(answers["a"]["probability"], round(alone[1][0][0][1], 4))
+        self.assertEqual(set(answers["b"]["probabilities"]), {"a", "b", "c"})
+        self.assertEqual(result["usage"]["input_tokens"], batched[1][1])
+        # int16 PCM is scaled by 1/32768; float samples and 16 kHz files agree.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "clip.wav"
+            with wave.open(str(path), "wb") as f:
+                f.setnchannels(1), f.setsampwidth(2), f.setframerate(16000)
+                f.writeframes(clip.tobytes())
+            floats = clip.astype(np.float32) / 32768
+            for audio in (floats, mx.array(clip), str(path), path):
+                with self.subTest(audio=type(audio)):
+                    self.assertEqual(
+                        predict(model, tok, None, questions, audio=audio), result
+                    )
+            with open(path, "rb") as f:
+                self.assertEqual(predict(model, tok, None, questions, audio=f), result)
+            # Files that fail to decode, or decode to nothing, are caller errors.
+            empty, garbage = path.with_name("empty.wav"), path.with_name("bad.wav")
+            with wave.open(str(empty), "wb") as f:
+                f.setnchannels(1), f.setsampwidth(2), f.setframerate(16000)
+            garbage.write_bytes(b"not audio" * 10)
+            for audio, message in (
+                (path.with_name("no.wav"), "Failed to load audio"),
+                (garbage, "Failed to load audio"),
+                (io.BytesIO(b"not audio"), "Failed to load audio"),
+                (empty, "no samples"),
+            ):
+                with self.subTest(audio=audio):
+                    with self.assertRaisesRegex(ValueError, message):
+                        predict(model, tok, None, questions, audio=audio)
+        with self.assertRaisesRegex(ValueError, "images or audio, not both"):
+            predict(model, tok, None, questions, images=[image], audio=clip)
+        with self.assertRaisesRegex(ValueError, "mono"):
+            predict(model, tok, None, questions, audio=np.zeros((2, 8000), np.int16))
