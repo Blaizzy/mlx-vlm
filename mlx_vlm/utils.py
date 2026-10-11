@@ -2426,7 +2426,9 @@ def prepare_inputs(
             if feature_extractor is not None
             else 16000
         )
-        audio = [load_audio(audio_file, sr=sr) for audio_file in audio]
+        # a processor may bring its own loader (e.g. to match its reference resampler)
+        audio_loader = getattr(processor, "load_audio", None) or load_audio
+        audio = [audio_loader(audio_file, sr=sr) for audio_file in audio]
 
     video_fps = None
     supplied_video_metadata = kwargs.pop("video_metadata", None)
@@ -2458,7 +2460,16 @@ def prepare_inputs(
             if isinstance(fps_values, (list, tuple)):
                 video_sampling_overrides["fps"] = fps_values[video_index]
             sampling = resolve_video_sampling(processor, video_sampling_overrides)
-            if isinstance(v, (str, bytes, Path)):
+            if isinstance(v, (str, Path)) and getattr(
+                processor, "decodes_video_files", False
+            ):
+                # the processor samples + decodes the file itself (e.g. it also needs
+                # the audio track), so hand it the path untouched
+                arr = str(v)
+                metadata = VideoMetadata(
+                    total_num_frames=0, fps=sampling.fps or 1.0, frames_indices=[]
+                )
+            elif isinstance(v, (str, bytes, Path)):
                 arr, metadata = load_video(
                     str(v), sampling, frame_sampler=frame_sampler
                 )
