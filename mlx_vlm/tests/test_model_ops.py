@@ -1432,3 +1432,52 @@ def test_rfdetr_backbone_attention_matches_softmax_reference(batch, tokens):
     scores = mx.softmax((q @ k.transpose(0, 1, 3, 2)) * attention.scale, axis=-1)
     expected = (scores @ v).transpose(0, 2, 1, 3).reshape(batch, tokens, 48)
     _assert_allclose(attention(x), attention.o_proj(expected))
+
+
+def test_convert_mixed_recipe_honors_model_quant_predicate(tmp_path):
+    """Mixed recipes must keep the model's own quantization exclusions."""
+    from mlx_vlm.convert import convert
+
+    class Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.down_proj = nn.Linear(64, 64, bias=False)
+
+    class TinyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.language_model = nn.Module()
+            self.language_model.layers = [Block(), Block()]
+            self.encoder = nn.Module()
+            self.encoder.layers = [Block()]
+
+        @property
+        def layers(self):
+            return self.language_model.layers
+
+        @property
+        def quant_predicate(self):
+            return lambda path, _: not path.startswith("encoder.")
+
+    source = tmp_path / "source"
+    source.mkdir()
+    model = TinyModel()
+    with (
+        patch("mlx_vlm.convert.get_model_path", return_value=source),
+        patch(
+            "mlx_vlm.convert.fetch_from_hub",
+            return_value=(model, {"model_type": "tiny"}, MagicMock()),
+        ),
+    ):
+        convert(
+            str(source),
+            mlx_path=str(tmp_path / "out"),
+            quantize=True,
+            q_group_size=64,
+            quant_predicate="mixed_4_8",
+            dtype="float32",
+        )
+
+    assert hasattr(model.language_model.layers[0].down_proj, "scales")
+    assert hasattr(model.language_model.layers[1].down_proj, "scales")
+    assert not hasattr(model.encoder.layers[0].down_proj, "scales")
