@@ -40,7 +40,6 @@ def _quantization_from_weights(weights: Dict[str, mx.array]) -> Optional[dict]:
 class DeepseekV4MTPSplitter(MTPSplitter):
     output_model_type = "deepseek_v4_mtp"
     draft_model_cls = DeepseekV4MTPDraftModel
-    require_text_config = False
     tie_word_embeddings_default = False
     depth_field = "num_nextn_predict_layers"
     block_size_extra = 1

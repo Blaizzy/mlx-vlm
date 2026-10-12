@@ -67,7 +67,6 @@ class Qwen3NextMTPSplitter(MTPSplitter):
     # experts (not Qwen3.5's fused ``gate_up_proj``), so expert stacking is bespoke.
     output_model_type = "qwen3_5_mtp"
     draft_model_cls = None
-    require_text_config = False
     tie_word_embeddings_default = True
     depth_field = "mtp_num_hidden_layers"
     block_size_extra = 2

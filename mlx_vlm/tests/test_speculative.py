@@ -667,7 +667,10 @@ def split_checkpoint(
 @parametrize("family", ["qwen3_5", "qwen3_5_moe", "qwen3_next"])
 @parametrize("layout", ["hf", "mlx", "affine", "fp8"])
 @parametrize("indexed", [False, True])
-def test_load_bundled_qwen_mtp(tmp_path, monkeypatch, family, layout, indexed):
+@parametrize("config_location", ["text", "root"])
+def test_load_bundled_qwen_mtp(
+    tmp_path, monkeypatch, family, layout, indexed, config_location
+):
     arch = module("speculative.drafters.qwen3_5_mtp")
     text = tiny_config(
         "qwen", hidden_size=128, intermediate_size=128, head_dim=16
@@ -700,6 +703,12 @@ def test_load_bundled_qwen_mtp(tmp_path, monkeypatch, family, layout, indexed):
             next_arch.Qwen3NextDecoderLayer(next_arch.ModelConfig.from_dict(config), 0)
         ]
         reference.set_dtype(mx.bfloat16)
+    text_config = config.get("text_config") or config
+    config = (
+        dict(text_config, model_type=family)
+        if config_location == "root"
+        else dict(model_type=family, text_config=text_config)
+    )
     mlx_layout = layout in ("mlx", "affine")
     if layout == "affine":
         quant = dict(group_size=32, bits=4, mode="affine")
@@ -941,7 +950,7 @@ def test_load_registered_native_drafter(
                 value = value.transpose(0, 2, 1)
         weights[key] = value
     config = dict(model_type=model_type, text_config=text)
-    if config_location == "root" and family != "inkling":
+    if config_location == "root":
         config = dict(text, model_type=model_type)
     elif config_location == "text":
         config["model_type"] = "multimodal_wrapper"

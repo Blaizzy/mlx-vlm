@@ -11,7 +11,6 @@ from .qwen4_exp_mtp import Qwen4ExpMTPDraftModel
 class Qwen4ExpMTPSplitter(MTPSplitter):
     output_model_type = "qwen4_exp_mtp"
     draft_model_cls = Qwen4ExpMTPDraftModel
-    require_text_config = False
     tie_word_embeddings_default = False
     depth_field = "mtp_num_hidden_layers"
     block_size_extra = 1

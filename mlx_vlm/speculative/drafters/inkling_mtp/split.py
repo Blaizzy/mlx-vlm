@@ -19,9 +19,7 @@ class InklingMTPSplitter(MTPSplitter):
     supports_mlx_source = True
 
     def read_text_config(self, source_config: dict) -> dict:
-        text_config = dict(source_config.get("text_config") or {})
-        if not text_config:
-            raise ValueError("source config does not contain a text_config.")
+        text_config = super().read_text_config(source_config)
         mtp_config = source_config.get("mtp_config") or {}
         text_config.setdefault(
             "num_mtp_layers",

@@ -49,9 +49,6 @@ class MTPSplitter:
     # --- declarative per-family config (override in subclass) ---
     output_model_type: str = ""
     draft_model_cls = None  # class with a ``sanitize(self, weights)`` staticlike method
-    require_text_config: bool = (
-        True  # True: use text_config only; False: fall back to root
-    )
     tie_word_embeddings_default: bool = False
     depth_field: str = "num_nextn_predict_layers"
     block_size_extra: int = 1  # block_size default = depth + block_size_extra
@@ -68,13 +65,7 @@ class MTPSplitter:
         return cls()
 
     def read_text_config(self, source_config: dict) -> dict:
-        text_config = dict(
-            source_config.get("text_config")
-            or ({} if self.require_text_config else source_config)
-        )
-        if self.require_text_config and not text_config:
-            raise ValueError("source config does not contain a text_config.")
-        return text_config
+        return dict(source_config.get("text_config") or source_config)
 
     def select_keys(self, key: str, text_config: dict) -> bool:
         raise NotImplementedError
