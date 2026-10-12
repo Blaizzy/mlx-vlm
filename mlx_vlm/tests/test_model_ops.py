@@ -41,6 +41,10 @@ from mlx_vlm.models.rope_utils import (
 )
 from mlx_vlm.models.switch_layers import QuantizedSwitchLinear, SwitchLinear
 from mlx_vlm.quant_utils import dequantize_model
+from mlx_vlm.quantization.checkpoint import (
+    _transform_compressed_tensors_weights,
+    _transform_modelopt_nvfp4_weights,
+)
 from mlx_vlm.quantization.nvfp4 import (
     ScaledQuantizedLinear,
     ScaledQuantizedSwitchLinear,
@@ -53,12 +57,7 @@ from mlx_vlm.quantization.one_bit import (
     one_bit_quantized_matmul,
     replace_one_bit_modules,
 )
-from mlx_vlm.utils import (
-    _transform_compressed_tensors_weights,
-    _transform_modelopt_nvfp4_weights,
-    get_model_and_args,
-    load_model,
-)
+from mlx_vlm.utils import get_model_and_args, load_model
 
 prism = importlib.import_module("mlx_vlm.models.prism_hadamard_qwen35")
 prism_ops = importlib.import_module(
