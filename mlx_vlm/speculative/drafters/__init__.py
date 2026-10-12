@@ -146,7 +146,7 @@ def _expected_drafter_kind(model_type: Any, config: Any = None) -> Optional[str]
 
 
 def resolve_drafter_kind(
-    model_path, kind: Optional[str] = None, *, config: Optional[dict] = None
+    model_path, kind: Optional[str] = None, *, config: Any = None
 ) -> str:
     """Reconcile the caller's ``kind`` with the drafter's actual model type.
 
@@ -159,13 +159,18 @@ def resolve_drafter_kind(
     user points ``--draft-model`` at e.g. a ``gemma4_assistant`` checkpoint
     but forgets ``--draft-kind mtp``: rather than crashing deep inside
     ``draft_block`` with an opaque error, we pick the right kind for them.
+
+    Pass a loaded drafter's ``config`` to resolve its kind without rereading or
+    resolving the source checkpoint.
     """
     if config is None:
         config = _read_drafter_config(model_path)
-    model_type = config.get("model_type") or config.get("speculators_model_type")
-    splitter = get_mtp_splitter(model_type, source_config=config)
-    if splitter is not None:
-        model_type = splitter.output_model_type
+        splitter = get_mtp_splitter(source_config=config)
+        if splitter is not None:
+            config = {**config, "model_type": splitter.output_model_type}
+    model_type = _cfg_get(config, "model_type") or _cfg_get(
+        config, "speculators_model_type"
+    )
     expected = _expected_drafter_kind(model_type, config)
 
     if kind is None:
@@ -213,12 +218,12 @@ def load_drafter(
 
     path = get_model_path(path_or_repo)
     config = _read_drafter_config(path)
-    resolved = resolve_drafter_kind(path, kind, config=config)
-    model_type = config.get("model_type") or config.get("speculators_model_type")
-    splitter = get_mtp_splitter(model_type, source_config=config)
+    splitter = get_mtp_splitter(source_config=config)
     if splitter is not None:
-        return splitter.load(path, **kwargs), resolved
-    return load_model(path, **kwargs), resolved
+        model = splitter.load(path, source_config=config, **kwargs)
+    else:
+        model = load_model(path, **kwargs)
+    return model, resolve_drafter_kind(path, kind, config=model.config)
 
 
 __all__ = [

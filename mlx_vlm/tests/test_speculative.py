@@ -234,7 +234,11 @@ class TransactionDrafter:
 
 
 def equal(actual, expected, **tolerance):
-    if isinstance(actual, (list, tuple)):
+    if isinstance(actual, dict):
+        assert actual.keys() == expected.keys()
+        for key in actual:
+            equal(actual[key], expected[key], **tolerance)
+    elif isinstance(actual, (list, tuple)):
         assert len(actual) == len(expected)
         for a, b in zip(actual, expected):
             equal(a, b, **tolerance)
@@ -737,11 +741,12 @@ def test_load_bundled_qwen_mtp(tmp_path, monkeypatch, family, layout, indexed):
             json.dumps({"weight_map": weight_map})
         )
     before = {p.name: p.stat().st_mtime_ns for p in tmp_path.iterdir()}
-    monkeypatch.setattr(
-        "mlx_vlm.utils.load_model",
-        Mock(side_effect=AssertionError("must not load the target as a drafter")),
-    )
-    draft, kind = load_drafter(str(tmp_path), lazy=indexed)
+    with monkeypatch.context() as patcher:
+        patcher.setattr(
+            "mlx_vlm.utils.load_model",
+            Mock(side_effect=AssertionError("must not load the target as a drafter")),
+        )
+        draft, kind = load_drafter(str(tmp_path), lazy=indexed)
     assert kind == "mtp" and draft.config.model_type == "qwen3_5_mtp"
     assert draft.config.block_size == 3 and len(draft.layers) == 1
     assert {p.name: p.stat().st_mtime_ns for p in tmp_path.iterdir()} == before
@@ -754,13 +759,44 @@ def test_load_bundled_qwen_mtp(tmp_path, monkeypatch, family, layout, indexed):
     equal(actual, expected)
     assert mx.isfinite(actual).all().item()
 
+    output = split_mtp(str(tmp_path), str(tmp_path / "draft"))
+    standalone, standalone_kind = load_drafter(str(output))
+    assert standalone_kind == kind
+    equal(
+        dict(tree_flatten(draft.parameters())),
+        dict(tree_flatten(standalone.parameters())),
+    )
 
-@parametrize("partial", [False, True])
-def test_load_bundled_qwen_mtp_rejects_missing_weights(tmp_path, partial):
+    if layout in ("hf", "fp8"):
+        if layout == "hf":
+            with pytest.raises(ValueError, match="Activation quantization requires"):
+                load_drafter(str(tmp_path), quantize_activations=True)
+        else:
+            activated, _ = load_drafter(str(tmp_path), quantize_activations=True)
+            standalone_activated, _ = load_drafter(
+                str(output), quantize_activations=True
+            )
+            assert isinstance(activated.fc, nn.QQLinear)
+            fc_inputs = mx.concatenate([inputs, inputs], axis=-1)
+            equal(activated.fc(fc_inputs), standalone_activated.fc(fc_inputs))
+
+
+@parametrize("missing", ["all", "most", "norm"])
+def test_load_bundled_qwen_mtp_rejects_missing_weights(tmp_path, missing):
     config = dict(model_type="qwen3_5", text_config=tiny_config("qwen").to_dict())
     config["text_config"]["mtp_num_hidden_layers"] = 1
     (tmp_path / "config.json").write_text(json.dumps(config))
-    weights = {"mtp.fc.weight" if partial else "model.unused": mx.ones((16, 32))}
+    if missing == "norm":
+        arch = module("speculative.drafters.qwen3_5_mtp")
+        model = arch.Model(arch.ModelConfig.from_dict(config))
+        weights = {
+            "mtp." + key: value for key, value in tree_flatten(model.parameters())
+        }
+        del weights["mtp.norm.weight"]
+    else:
+        weights = {
+            "mtp.fc.weight" if missing == "most" else "model.unused": mx.ones((16, 32))
+        }
     mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
     with pytest.raises(ValueError, match="Missing|missing|No MTP tensors"):
         load_drafter(str(tmp_path), kind="mtp")
@@ -785,7 +821,8 @@ def test_bundled_qwen_mtp_kind_and_standalone_loading(tmp_path):
 
 
 @parametrize("family", ["glm", "deepseek"])
-def test_load_registered_native_drafter(tmp_path, monkeypatch, family):
+@parametrize("config_location", ["root", "text", "root-fallback"])
+def test_load_registered_native_drafter(tmp_path, monkeypatch, family, config_location):
     model_type = TINY_MODELS[family]["module"]
     text = tiny_config(family).to_dict()
     arch = module(f"speculative.drafters.{model_type}_mtp")
@@ -803,6 +840,11 @@ def test_load_registered_native_drafter(tmp_path, monkeypatch, family):
                 key = key.replace(f"{component}_hc.", f"hc_{component}_")
         weights[key] = value
     config = dict(model_type=model_type, text_config=text)
+    if config_location == "text":
+        config["model_type"] = "multimodal_wrapper"
+        text["model_type"] = model_type
+    elif config_location == "root-fallback":
+        text["model_type"] = "unregistered_text_type"
     (tmp_path / "config.json").write_text(json.dumps(config))
     mx.save_safetensors(str(tmp_path / "mtp.safetensors"), weights)
     weight_map = dict.fromkeys(weights, "mtp.safetensors")
@@ -824,6 +866,10 @@ def test_load_registered_native_drafter(tmp_path, monkeypatch, family):
     assert actual.keys() == expected.keys()
     for key, value in actual.items():
         equal(value, expected[key])
+
+    from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter
+
+    assert detect_mtp_splitter(tmp_path).output_model_type == draft.config.model_type
 
 
 def test_deepseek_dspark_split_load_and_draft(tmp_path):
@@ -892,6 +938,9 @@ def test_deepseek_dspark_split_load_and_draft(tmp_path):
     assert actual.keys() == expected.keys()
     for key, value in actual.items():
         equal(value, expected[key])
+    standalone, standalone_kind = load_drafter(str(output), kind="mtp")
+    assert standalone_kind == "dflash"
+    equal(dict(tree_flatten(standalone.parameters())), expected)
     target = NS(
         embed_tokens=nn.Embedding(32, 16), lm_head=nn.Linear(16, 32, bias=False)
     )

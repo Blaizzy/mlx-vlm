@@ -911,15 +911,6 @@ def load_model(
         FileNotFoundError: If the weight files (.safetensors) are not found.
         ValueError: If the model class or args class are not found or cannot be instantiated.
     """
-    strict = kwargs.pop("strict", True)
-    # An expert-offload dir (mlx_vlm.moe_offload) is missing routed-expert
-    # keys by design; defer eval until patch_model swaps those modules, or
-    # their random-init resident weights get eagerly materialized -- the OOM
-    # this feature exists to avoid.
-    is_offload_dir = (model_path / "offload_index.json").exists()
-    if is_offload_dir:
-        strict = False
-        requested_lazy, lazy = lazy, True
     config = load_config(model_path, **kwargs)
 
     index_file = model_path / "model.safetensors.index.json"
@@ -1095,6 +1086,37 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 model_class.AudioModel, weights, model_config.audio_config
             )
 
+    return load_model_weights(
+        model,
+        config,
+        weights,
+        model_path,
+        lazy=lazy,
+        declared_keys=declared_keys,
+        is_offload_dir=(model_path / "offload_index.json").exists(),
+        **kwargs,
+    )
+
+
+def load_model_weights(
+    model: nn.Module,
+    config: dict,
+    weights: dict,
+    model_path: Path,
+    *,
+    lazy: bool = False,
+    strict: bool = True,
+    declared_keys: Optional[set] = None,
+    is_offload_dir: bool = False,
+    **kwargs,
+) -> nn.Module:
+    """Install prepared weights, applying module quantization but no sanitization.
+
+    Pass declared_keys for full checkpoints that may omit multimodal modules.
+    Prepared drafters retain every module so strict loading detects missing weights.
+    """
+    if is_offload_dir:
+        strict = False
     if (quantization := config.get("quantization", None)) is not None:
         # Handle legacy models which may or may not have vision quantized.
         # text-only quants of unified VLM families set vision_config to null,
@@ -1178,7 +1200,8 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 "repack() output?): " + ", ".join(sorted(unexpected_missing)[:10])
             )
 
-    _drop_modules_without_weights(model, weights, declared_keys)
+    if declared_keys is not None:
+        _drop_modules_without_weights(model, weights, declared_keys)
 
     model.load_weights(list(weights.items()), strict=strict)
 
@@ -1191,7 +1214,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             expert_cache_gb=kwargs.get("expert_cache_gb"),
             max_kv_size=kwargs.get("max_kv_size"),
         )
-        lazy = requested_lazy
 
     if not lazy:
         mx.eval(model.parameters())

@@ -54,6 +54,20 @@ class DeepseekV4MTPSplitter(MTPSplitter):
         "chat_template.jinja",
     )
 
+    @classmethod
+    def from_config(cls, source_config: dict):
+        from ..deepseek_v4_dspark.split import DeepseekV4DsparkSplitter
+
+        text_config = source_config.get("text_config") or source_config
+        if (
+            source_config.get("model_type")
+            == DeepseekV4DsparkSplitter.output_model_type
+            or text_config.get("dspark_target_layer_ids")
+            or source_config.get("dspark_target_layer_ids")
+        ):
+            return DeepseekV4DsparkSplitter()
+        return cls()
+
     def select_keys(self, key: str, text_config: dict) -> bool:
         return key.startswith("mtp.")
 

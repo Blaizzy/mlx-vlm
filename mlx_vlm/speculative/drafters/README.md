@@ -6,10 +6,12 @@ through one shared framework (`mtp_split.py`) with a small per-family subclass.
 
 Registered native checkpoints with a drafter runtime can also be loaded
 directly: pass the original checkpoint as `--draft-model` in the CLI or server.
-The existing `MTP_SPLITTERS` registry selects the family, and the shared
-`MTPSplitter.load()` prepares and loads its weights in memory without writing
-a separate checkpoint. The draft kind is inferred from the splitter's output
-model type, including native DSpark heads. See the
+The existing `MTP_SPLITTERS` registry resolves the family once from the root or
+text config. `MTPSplitter.prepare()` selects and converts its tensors in memory;
+the same `load_model_weights()` used by the normal model loader applies module
+quantization and installs the prepared weights without sanitizing them again.
+The draft kind is inferred from the loaded drafter config, including native
+DSpark heads. No separate checkpoint is written. See the
 [Qwen MTP examples](qwen3_5_mtp/README.md).
 
 ## Extract a drafter
@@ -57,6 +59,9 @@ Detection is **tensor-presence based** — a config flag alone is not trusted
    assembly, in-memory model loading, tokenizer copy, and on-request affine
    quantization.
 2. Register it by base `model_type` in `MTP_SPLITTERS`.
+
+Families with multiple native drafter architectures can override `from_config`
+to choose their splitter. Loading and extraction use the same resolver.
 
 To *run* the drafter you also need a draft-model class. Reuse an existing one
 when the architecture matches (e.g. Qwen3-Next reuses `qwen3_5_mtp`); otherwise
