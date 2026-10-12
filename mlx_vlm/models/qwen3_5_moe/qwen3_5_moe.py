@@ -8,6 +8,11 @@ from ..qwen3_5.qwen3_5 import (
     should_offset_norm_weight,
     should_shift_norm_weights,
 )
+from ..switch_layers import (
+    EXPERT_WEIGHT_SUFFIXES,
+    move_expert_projection,
+    split_expert_projection,
+)
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
@@ -34,35 +39,24 @@ class Model(Qwen3_5Model):
         for layer_idx in range(self.config.text_config.num_hidden_layers):
             prefix = f"model.language_model.layers.{layer_idx}.mlp"
             gate_up_key = f"{prefix}.experts.gate_up_proj"
-            if gate_up_key in weights:
-                # process gate_up_proj [num_experts, 2 * intermediate_size, hidden_size]
-                gate_up_weight = weights.pop(gate_up_key)
-                mid = gate_up_weight.shape[-2] // 2
-                weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_up_weight[
-                    ..., :mid, :
-                ]
-                weights[f"{prefix}.switch_mlp.up_proj.weight"] = gate_up_weight[
-                    ..., mid:, :
-                ]
-                gate_up_scales_key = f"{gate_up_key}_scales"
-                if gate_up_scales_key in weights:
-                    gate_up_scales = weights.pop(gate_up_scales_key)
-                    weights[f"{prefix}.switch_mlp.gate_proj.scales"] = gate_up_scales[
-                        ..., :mid, :
-                    ]
-                    weights[f"{prefix}.switch_mlp.up_proj.scales"] = gate_up_scales[
-                        ..., mid:, :
-                    ]
-                # down_proj
-                down_key = f"{prefix}.experts.down_proj"
-                weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(down_key)
-                if f"{down_key}_scales" in weights:
-                    weights[f"{prefix}.switch_mlp.down_proj.scales"] = weights.pop(
-                        f"{down_key}_scales"
-                    )
+            if gate_up_key in weights or f"{gate_up_key}.weight" in weights:
+                for name in ("gate_up_proj", "down_proj"):
+                    key = f"{prefix}.experts.{name}"
+                    if f"{key}_scales" in weights:
+                        weights[f"{key}.scales"] = weights.pop(f"{key}_scales")
+                split_expert_projection(
+                    weights,
+                    gate_up_key,
+                    [f"{prefix}.switch_mlp.gate_proj", f"{prefix}.switch_mlp.up_proj"],
+                )
+                move_expert_projection(
+                    weights,
+                    f"{prefix}.experts.down_proj",
+                    f"{prefix}.switch_mlp.down_proj",
+                )
             elif f"{prefix}.experts.0.up_proj.weight" in weights:
                 for name in ["up_proj", "down_proj", "gate_proj"]:
-                    for suffix in ["weight", "scales", "biases"]:
+                    for suffix in EXPERT_WEIGHT_SUFFIXES:
                         first_key = f"{prefix}.experts.0.{name}.{suffix}"
                         if first_key not in weights:
                             continue

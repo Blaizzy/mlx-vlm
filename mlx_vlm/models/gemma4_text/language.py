@@ -11,7 +11,12 @@ from ..base import (
 )
 from ..cache import KVCache, RotatingKVCache
 from ..rope_utils import initialize_rope
-from ..switch_layers import SwitchGLU
+from ..switch_layers import (
+    SwitchGLU,
+    move_expert_projection,
+    split_expert_projection,
+    stack_expert_projection,
+)
 from .config import ModelConfig
 
 
@@ -550,6 +555,31 @@ class LanguageModel(nn.Module):
         return LanguageModelOutput(logits=out)
 
     def sanitize(self, weights):
+        weights = dict(weights)
+        prefixes = {
+            k.split(".experts.")[0] + ".experts"
+            for k in weights
+            if ".experts.gate_up_proj" in k
+            or ".experts.down_proj" in k
+            or ".experts.0." in k
+        }
+        for prefix in prefixes:
+            for name in ("gate_proj", "up_proj", "down_proj"):
+                stack_expert_projection(
+                    weights,
+                    prefix,
+                    name,
+                    f"{prefix}.switch_glu.{name}",
+                    self.args.num_experts,
+                )
+            split_expert_projection(
+                weights,
+                f"{prefix}.gate_up_proj",
+                [f"{prefix}.switch_glu.gate_proj", f"{prefix}.switch_glu.up_proj"],
+            )
+            move_expert_projection(
+                weights, f"{prefix}.down_proj", f"{prefix}.switch_glu.down_proj"
+            )
         sanitized = {}
         first_kv_shared = self.args.num_hidden_layers - self.args.num_kv_shared_layers
         for k, v in weights.items():
@@ -575,18 +605,6 @@ class LanguageModel(nn.Module):
                         continue
                 except (IndexError, ValueError):
                     pass
-
-            if k.endswith(".experts.gate_up_proj"):
-                base = k.removesuffix(".gate_up_proj")
-                gate, up = map(mx.contiguous, mx.split(v, 2, axis=-2))
-                sanitized[f"{base}.switch_glu.gate_proj.weight"] = gate
-                sanitized[f"{base}.switch_glu.up_proj.weight"] = up
-                continue
-
-            if k.endswith(".experts.down_proj"):
-                base = k.removesuffix(".down_proj")
-                sanitized[f"{base}.switch_glu.down_proj.weight"] = v
-                continue
 
             sanitized[k] = v
 

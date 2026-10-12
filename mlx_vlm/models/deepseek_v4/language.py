@@ -16,7 +16,7 @@ from ..cache import CacheList, PoolingCache, RotatingKVCache
 from ..linear import DECODE_BLOCK_SIZE, linear, tokenwise
 from ..mla import MultiLinear
 from ..pipeline import PipelineMixin
-from ..switch_layers import MoE, SwitchGLU
+from ..switch_layers import EXPERT_WEIGHT_SUFFIXES, MoE, SwitchGLU
 from .config import ModelConfig
 from .hisa_kernel import hisa_select
 from .hyper_connection import HyperConnection, HyperHead
@@ -1387,7 +1387,7 @@ class LanguageModel(nn.Module):
                 ("w2", "down_proj"),
                 ("w3", "up_proj"),
             ):
-                for suffix in ("weight", "scales"):
+                for suffix in EXPERT_WEIGHT_SUFFIXES:
                     key0 = f"{prefix}.0.{src}.{suffix}"
                     if key0 in weights:
                         stacked = [
