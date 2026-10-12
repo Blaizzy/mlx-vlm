@@ -56,7 +56,9 @@ turned upright by their EXIF orientation, PIL images are read as given. Each is
 first downscaled to at most 1024 × 1024 pixels in area, then tiled by the
 LFM2-VL processor. One question runs as a single pass. Several questions read the
 state and its images once: the shared prefix fills a cache that each question
-continues as its own row. `token_budget` (default 65536) bounds the padded
+continues as its own row. A prompt or shared prefix over 2048 tokens is read in
+chunks of 2048 tokens, or of `token_budget` if that is smaller, which bounds the
+memory a long state takes. `token_budget` (default 65536) bounds the padded
 tokens per batch of questions, prefix included. `usage.input_tokens` counts the
 prefix once plus each question's tokens.
 

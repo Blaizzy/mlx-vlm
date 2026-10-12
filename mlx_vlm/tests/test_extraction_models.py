@@ -15,7 +15,7 @@ import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -2462,6 +2462,53 @@ class TestD1DecisionModel(unittest.TestCase):
             alone, read = model.probabilities(tok, state, [question])
             self.assertEqual(read, len(encode(prefix + suffix_text(tok, question))))
             np.testing.assert_allclose(alone[0], probabilities, atol=1e-5)
+
+    def test_long_trunks_are_prefilled_in_chunks(self):
+        from mlx_vlm.models.d1 import d1
+
+        model = _extraction_model("d1")
+        lm = model.language_model.model
+        forward, widths = type(lm).__call__, []
+
+        def spy(self, inputs, *args, **kwargs):
+            widths.append(inputs.shape[1])
+            return forward(self, inputs, *args, **kwargs)
+
+        rng = np.random.default_rng(0)
+        trunk = rng.integers(0, 320, 2500).tolist()
+        branches = [[1, 2, 3], [4, 5, 6]]
+        with patch.object(type(lm), "__call__", spy):
+            # Trunk widths, then one width per branch batch.
+            for length, questions, budget, expected in [
+                (2500, branches, 65536, [2048, 452, 3]),
+                (2500, [], 65536, [2048, 452]),
+                (2500, branches, 1000, [1000, 1000, 500, 3, 3]),
+                (300, branches, 65536, [300, 3]),
+                (300, [], 65536, [300]),
+            ]:
+                with self.subTest(length=length, questions=questions, budget=budget):
+                    ids = trunk[:length]
+                    widths.clear()
+                    chunked = model.answer_logprobs(ids, questions, None, budget)
+                    self.assertEqual(widths, expected)
+                    with patch.object(d1, "PREFILL_STEP", len(ids)):
+                        whole = model.answer_logprobs(ids, questions)
+                    np.testing.assert_allclose(chunked, whole, atol=1e-5)
+        for budget in (0, -1, None):
+            with self.assertRaisesRegex(ValueError, "token_budget must be at least 1"):
+                model.answer_logprobs(trunk[:300], [], None, budget)
+        # Each chunk is evaluated before the next, so a long trunk peaks far below
+        # one pass.
+        ids, peaks = rng.integers(0, 320, 16384).tolist(), []
+        for step in (d1.PREFILL_STEP, len(ids)):
+            with patch.object(d1, "PREFILL_STEP", step):
+                mx.synchronize()
+                mx.clear_cache()
+                mx.reset_peak_memory()
+                start = mx.get_active_memory()
+                model.answer_logprobs(ids, branches)
+                peaks.append(mx.get_peak_memory() - start)
+        self.assertLess(peaks[0], peaks[1] / 2)
 
     def test_image_decisions_use_the_processor(self):
         from PIL import Image
