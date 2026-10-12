@@ -47,7 +47,8 @@
         "slice_end_id": 53,
         "newline_id": 54
       },
-      "checks": ["language", "vision", "input_embeddings"],
+      "checks": ["forward_cache", "language", "vision", "input_embeddings"],
+      "forward_cache": {"chunk_sizes": [1, 3]},
       "vision": {
         "feature_layer": null
       }
@@ -103,7 +104,8 @@
         "slice_end_id": 53,
         "newline_id": 54
       },
-      "checks": ["language", "vision", "input_embeddings"],
+      "checks": ["forward_cache", "language", "vision", "input_embeddings"],
+      "forward_cache": {"chunk_sizes": [1, 3]},
       "vision": {
         "feature_layer": null
       }

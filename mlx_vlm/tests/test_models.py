@@ -860,68 +860,29 @@ def minicpmv47_case(request):
     return module, build_config(module, case["config"])
 
 
-def test_minicpmv47_text_cache_and_new_request(minicpmv47_case):
-    module, config = minicpmv47_case
-
-    model = module.Model(config)
-    ids = mx.array([[1, 2, 3, 4]])
-    expected = model(ids).logits
-    cache = model.language_model.make_cache()
-    model(ids[:, :3], cache=cache)
-    actual = model(ids[:, 3:], cache=cache).logits
-    assert mx.allclose(actual, expected[:, 3:], atol=1e-5)
-    assert model(mx.array([[5, 6]])).logits.shape == (1, 2, 64)
-
-
 @pytest.mark.parametrize("mode,count", [("16x", 4), ("4x", 16)])
 def test_minicpmv47_vision_and_chunked_prefill(minicpmv47_case, mode, count):
     module, config = minicpmv47_case
 
     model = module.Model(config)
     ids = mx.array([[1, 50] + [48] * count + [51, 2]])
-    features = model.get_input_embeddings(
-        ids,
-        [[mx.random.normal((3, 2, 128))]],
-        tgt_sizes=[np.array([[8, 8]])],
-        downsample_mode=mode,
-    )
+    media = {
+        "pixel_values": [[mx.random.normal((3, 2, 128))]],
+        "tgt_sizes": [np.array([[8, 8]])],
+        "downsample_mode": mode,
+    }
+    features = model.get_input_embeddings(ids, **media)
     assert features.inputs_embeds.shape == (*ids.shape, 16)
     assert features.position_ids.shape == (3, 1, ids.shape[-1])
     assert features.rope_deltas.item() < 0
-    full = model.language_model(ids, **features.to_dict()).logits
+    ModelChecks().prefill_parity(model, ids, media, chunk_sizes=(3,))
+
+    # The outer model must preserve the canvas delta when decoding without images.
     cache = model.language_model.make_cache()
-    parts = []
-    for start in range(0, ids.shape[-1], 3):
-        stop = start + 3
-        parts.append(
-            model.language_model(
-                ids[:, start:stop],
-                inputs_embeds=features.inputs_embeds[:, start:stop],
-                position_ids=features.position_ids[:, :, start:stop],
-                rope_deltas=features.rope_deltas,
-                cache=cache,
-            ).logits
-        )
-    assert mx.allclose(mx.concatenate(parts, axis=1), full, atol=2e-5)
+    model(ids, cache=cache, **media)
     next_logits = model(mx.array([[3]]), cache=cache).logits
     extended = mx.concatenate([ids, mx.array([[3]])], axis=1)
-    positions = mx.concatenate(
-        [
-            features.position_ids,
-            mx.full((3, 1, 1), int(features.position_ids.max()) + 1),
-        ],
-        axis=-1,
-    )
-    embeds = mx.concatenate(
-        [
-            features.inputs_embeds,
-            model.language_model.model.embed_tokens(mx.array([[3]])),
-        ],
-        axis=1,
-    )
-    expected = model.language_model(
-        extended, inputs_embeds=embeds, position_ids=positions
-    ).logits[:, -1:]
+    expected = model(extended, **media).logits[:, -1:]
     assert mx.allclose(next_logits, expected, atol=2e-5)
 
 
@@ -975,6 +936,7 @@ def test_minicpmv47_slices_share_the_thumbnail_canvas(minicpmv47_case):
     np.testing.assert_array_equal(positions[:, 0], expected)
 
 
+@pytest.mark.parametrize("minicpmv47_case", ["minicpmv4_7"], indirect=True)
 def test_minicpmv47_sanitize_is_idempotent(minicpmv47_case):
     module, config = minicpmv47_case
 
