@@ -1,7 +1,9 @@
 # MiniCPM-V 4.7
 
-MLX support for `MiniCPM-V-4.7-1B`. The model combines a SigLIP
-vision tower with a Qwen3.5 hybrid language model. Canvas M-RoPE preserves
+MLX support for `MiniCPM-V-4.7-1B` and `MiniCPM-V-4.7-35B-A3B`. The models combine
+a SigLIP vision tower with a Qwen3.5 hybrid language model. The 1B model uses a
+dense decoder; the 35B-A3B model uses 256 experts with 8 selected per token,
+plus a shared expert. Canvas M-RoPE preserves
 spatial relationships between thumbnails and detail crops, and the order of
 video frames.
 
@@ -12,8 +14,8 @@ chat template, including thinking and Qwen3-Coder tool-call formatting.
 
 ## Local checkpoints
 
-Extract the supplied archive before loading it. The source checkpoint
-can be loaded directly.
+Extract the supplied archive before loading it. Both source checkpoints
+can be loaded directly; substitute `35B-A3B` for `1B` in the paths below.
 
 ```bash
 tar -xf ~/Downloads/MiniCPM-V-4.7-1B.tar -C ~/Downloads
@@ -33,6 +35,29 @@ mlx_vlm.convert \
   --mlx-path ~/Downloads/MiniCPM-V-4.7-1B-mlx-bf16 \
   --dtype bfloat16
 ```
+
+The 35B-A3B BF16 checkpoint needs about 71 GB of memory for short multimodal
+requests. To create a smaller local copy:
+
+```bash
+tar -xf ~/Downloads/MiniCPM-V-4.7-35B-A3B.tar -C ~/Downloads
+
+mlx_vlm.convert \
+  --hf-path ~/Downloads/MiniCPM-V-4.7-35B-A3B \
+  --mlx-path ~/Downloads/MiniCPM-V-4.7-35B-A3B-mlx-4bit \
+  -q --q-bits 4 --q-group-size 64 --dtype bfloat16
+
+mlx_vlm.generate \
+  --model ~/Downloads/MiniCPM-V-4.7-35B-A3B-mlx-4bit \
+  --image path/to/image.jpg \
+  --prompt "Describe this image." \
+  --max-tokens 200 --temperature 0
+```
+
+The default quantization policy keeps the vision modules, embeddings, output
+head, and linear attention at full precision, and uses 8-bit expert routers.
+The resulting 4-bit checkpoint is about 23.5 GB; memory usage also depends on
+image resolution and context length.
 
 ## Video and finer image detail
 

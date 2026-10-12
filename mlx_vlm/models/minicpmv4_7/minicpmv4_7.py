@@ -7,8 +7,9 @@ from ..minicpmv4_6.minicpmv4_6 import Merger
 from ..minicpmv4_6.minicpmv4_6 import Model as MiniCPMVModel
 from ..minicpmv4_6.minicpmv4_6 import VitMerger
 from ..minicpmv4_6.vision import VisionModel
+from ..qwen3_5_moe.qwen3_5_moe import Model as Qwen35MoEModel
 from .config import ModelConfig
-from .language import LanguageModel
+from .language import LanguageModel, MoELanguageModel
 from .rope import CanvasRoPE
 
 
@@ -17,7 +18,12 @@ class Model(MiniCPMVModel):
         nn.Module.__init__(self)
         self.config = config
         self.vision_tower = VisionModel(config.vision_config)
-        self.language_model = LanguageModel(config.text_config, config)
+        language_cls = (
+            MoELanguageModel
+            if config.text_config.model_type == "qwen3_5_moe_text"
+            else LanguageModel
+        )
+        self.language_model = language_cls(config.text_config, config)
         self.vit_merger = VitMerger(
             config.vision_config.hidden_size,
             config.vision_config.window_intermediate_size,
@@ -31,6 +37,18 @@ class Model(MiniCPMVModel):
             config.merge_kernel_size,
         )
         self.vit_merger.act = nn.GELU(approx="tanh")
+
+    def sanitize(self, weights):
+        if self.config.text_config.model_type == "qwen3_5_moe_text":
+            # Split fused experts; copy array handles before in-place norm updates.
+            weights = Qwen35MoEModel.sanitize(
+                self, {key: mx.array(value) for key, value in weights.items()}
+            )
+        return super().sanitize(weights)
+
+    @property
+    def cast_predicate(self):
+        return self.language_model.cast_predicate
 
     def get_input_embeddings(self, input_ids, pixel_values=None, **kwargs):
         mode = kwargs.get("downsample_mode", self.config.downsample_mode)

@@ -2592,3 +2592,87 @@ class TestMiniCPMV47:
             2,
             3,
         )
+
+
+class TestMiniCPMV47MoE(TestMiniCPMV47):
+    @staticmethod
+    def config():
+        from mlx_vlm.models.minicpmv4_7 import ModelConfig
+
+        params = asdict(TestMiniCPMV47.config())
+        text = params["text_config"]
+        text.pop("intermediate_size")
+        text.update(
+            model_type="qwen3_5_moe_text",
+            num_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=8,
+            shared_expert_intermediate_size=16,
+        )
+        return ModelConfig.from_dict(params)
+
+    def test_native_expert_checkpoint_and_reload(self, tmp_path):
+        from mlx_vlm.models.minicpmv4_7 import Model
+        from mlx_vlm.models.qwen3_5.qwen3_5 import NORM_WEIGHT_SUFFIXES
+        from mlx_vlm.models.qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
+
+        model = Model(self.config())
+        assert isinstance(model.layers[0].mlp, Qwen3_5MoeSparseMoeBlock)
+        expected = dict(tree_flatten(model.parameters()))
+        raw = {}
+        for key, value in expected.items():
+            if ".switch_mlp." in key:
+                continue
+            if key.startswith("language_model.model."):
+                key = key.replace("language_model.model.", "model.language_model.", 1)
+                if key.endswith(NORM_WEIGHT_SUFFIXES):
+                    value = value - 1
+                if "conv1d.weight" in key:
+                    value = value.swapaxes(1, 2)
+            elif key.startswith("language_model.lm_head."):
+                key = key.replace("language_model.", "", 1)
+            else:
+                key = "model." + key.replace(
+                    "vit_merger.", "vision_tower.vit_merger.", 1
+                )
+                if key.endswith("patch_embedding.weight"):
+                    value = value.transpose(0, 3, 1, 2)
+            raw[key] = value
+        for index, layer in enumerate(model.layers):
+            prefix = f"model.language_model.layers.{index}.mlp.experts"
+            experts = layer.mlp.switch_mlp
+            raw[f"{prefix}.gate_up_proj"] = mx.concatenate(
+                [experts.gate_proj.weight, experts.up_proj.weight], axis=-2
+            )
+            raw[f"{prefix}.down_proj"] = experts.down_proj.weight
+
+        sanitized = model.sanitize(raw)
+        assert sanitized.keys() == expected.keys()
+        for key, value in expected.items():
+            assert mx.array_equal(sanitized[key], value), key
+        reloaded = model.sanitize(sanitized)
+        for key, value in sanitized.items():
+            assert mx.array_equal(reloaded[key], value), key
+        model.load_weights(list(reloaded.items()), strict=True)
+        mx.eval(model(mx.array([[1, 2, 3]])).logits)
+        (tmp_path / "config.json").write_text(json.dumps(asdict(model.config)))
+        for weights in (raw, sanitized):
+            mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+            loaded = load_model(tmp_path)
+            assert isinstance(loaded.layers[0].mlp, Qwen3_5MoeSparseMoeBlock)
+            for key, value in tree_flatten(loaded.parameters()):
+                assert mx.array_equal(value, expected[key]), key
+
+    def test_router_quantization_and_state_dtype(self):
+        from mlx_vlm.models.minicpmv4_7 import Model
+
+        model = Model(self.config())
+        prefix = "language_model.model.layers.0"
+        assert model.quant_predicate(f"{prefix}.mlp.gate", None) == {
+            "group_size": 64,
+            "bits": 8,
+        }
+        assert model.quant_predicate(f"{prefix}.mlp.switch_mlp.up_proj", None)
+        assert not model.quant_predicate(f"{prefix}.linear_attn.in_proj_qkv", None)
+        assert not model.cast_predicate(f"{prefix}.linear_attn.A_log")
+        assert model.cast_predicate(f"{prefix}.mlp.switch_mlp.up_proj.weight")
