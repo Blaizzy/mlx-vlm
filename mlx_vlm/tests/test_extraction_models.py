@@ -2510,6 +2510,32 @@ class TestD1DecisionModel(unittest.TestCase):
                 peaks.append(mx.get_peak_memory() - start)
         self.assertLess(peaks[0], peaks[1] / 2)
 
+    def test_questions_are_batched_by_length(self):
+        from mlx_vlm.models.d1 import d1
+        from mlx_vlm.models.d1.prompt import as_question
+
+        # Longest first, each batch in request order; a new batch starts when a
+        # branch is under half the longest, or the budget is full.
+        lengths = [20, 981, 20, 97, 25, 50]
+        self.assertEqual(d1._chunks(lengths, 200, 65536), [[1], [3, 5], [0, 2, 4]])
+        self.assertEqual(d1._chunks([10] * 5, 10, 60), [[0, 1, 2], [3, 4]])
+        model, tok = _extraction_model("d1"), _d1_tokenizer()
+        choice = {
+            "type": "choice",
+            "instructions": "Route",
+            "criteria": {f"t{i}": "a long topic description" for i in range(20)},
+        }
+        questions = [as_question(q) for q in _D1_QUESTIONS.values()]
+        questions.insert(1, as_question(choice))
+        grouped, _ = model.probabilities(tok, "A B", questions)
+        one_batch = lambda lengths, trunk, budget: [list(range(len(lengths)))]
+        with patch.object(d1, "_chunks", one_batch):
+            padded, _ = model.probabilities(tok, "A B", questions)
+        np.testing.assert_allclose(sum(grouped, []), sum(padded, []), atol=1e-5)
+        for question, probabilities in zip(questions, grouped):
+            alone, _ = model.probabilities(tok, "A B", [question])
+            np.testing.assert_allclose(alone[0], probabilities, atol=1e-5)
+
     def test_image_decisions_use_the_processor(self):
         from PIL import Image
         from transformers import Lfm2VlProcessor
@@ -2915,6 +2941,49 @@ class TestD1OmniDecisionModel(unittest.TestCase):
             for method in (module.Model.predict, module.Model.probabilities):
                 parameter = inspect.signature(method).parameters["token_budget"]
                 self.assertEqual(parameter.default, budget)
+
+    def test_rows_are_batched_by_length(self):
+        from PIL import Image
+
+        from mlx_vlm.models.d1_omni import d1_omni
+
+        rows = [(None, [0] * n) for n in (40, 900, 45, 300, 160, 100)]
+        batches = lambda budget: list(d1_omni._batches(rows, range(6), budget))
+        self.assertEqual(batches(16384), [[1], [3, 4], [5], [2, 0]])
+        self.assertEqual(batches(320), [[1], [3], [4, 5], [2, 0]])
+        # After a shared prefix, only the text lengths count against padding.
+        media = mx.zeros((1000, 8))
+        rows = [(media, [0] * n) for n in (40, 900, 45)]
+        self.assertEqual(list(d1_omni._batches(rows, range(3), 16384)), [[1, 2, 0]])
+        shared = d1_omni._batches(rows, range(3), 16384, shared=True)
+        self.assertEqual(list(shared), [[1], [2, 0]])
+
+        model, tok = _random_d1_omni(), _CharTokenizer()
+        image = Image.fromarray(
+            np.random.default_rng(0).integers(0, 256, (48, 64, 3), np.uint8)
+        )
+        choice = {
+            "type": "choice",
+            "instructions": "Pick one",
+            "criteria": {f"t{i}": "a long topic description" for i in range(20)},
+        }
+        questions = [
+            {"type": "bool", "instructions": "Short?"},
+            choice,
+            {"type": "score", "instructions": "Rate", "criteria": ["low", "high"]},
+            {"type": "bool", "instructions": "Is it?"},
+        ]
+        requests = [("x" * 50, questions), (None, questions, [image])]
+        grouped = model.probabilities(tok, requests)
+        one_batch = lambda rows, indices, budget, shared=False: [sorted(indices)]
+        with patch.object(d1_omni, "_batches", one_batch):
+            padded = model.probabilities(tok, requests)
+        np.testing.assert_allclose(_flat(grouped), _flat(padded), atol=1e-5)
+        for request, (probabilities, _) in zip(requests, grouped):
+            for question, expected in zip(questions, probabilities):
+                alone = (request[0], [question], *request[2:])
+                [(actual, _)] = model.probabilities(tok, [alone])
+                np.testing.assert_allclose(actual[0], expected, atol=1e-5)
 
     def test_media_prefix_reads_only_media(self):
         # Prefix queries never see text keys and the centred convolution never lets

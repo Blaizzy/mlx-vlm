@@ -78,10 +78,12 @@ options, and Boolean criteria are ignored. The trunk runs a request's media
 prefix once and every question's text row reads it from there, which matches
 running the prefix in each row, as the reference does, to float32 rounding.
 `usage.input_tokens` still counts the prefix once per question. The
-questions of a request run in length-sorted batches; `token_budget` (default
-16384) bounds the padded positions per batch, media prefix included. Peak
-memory grows with the budget: in float32, a full batch takes about 5.8 GB above
-the weights at 65536 and about 2.2 GB at 16384, which is no slower.
+questions of a request run in batches of similar length, longest first: a batch
+takes no row under half the length of its longest (of its text, after a shared
+prefix), so one long question does not pad many short ones. `token_budget`
+(default 16384) bounds the padded positions per batch, media prefix included.
+Peak memory grows with the budget: in float32, a full batch takes about 5.8 GB
+above the weights at 65536 and about 2.2 GB at 16384, which is no slower.
 
 The checkpoint is float32 and runs in float32 by default, matching the PyTorch
 reference to about 1e-5 in probability on text, images, and speech. For images

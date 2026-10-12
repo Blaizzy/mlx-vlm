@@ -27,14 +27,20 @@ def _tile(cache, count):
 
 
 def _chunks(lengths, trunk, budget):
-    """Consecutive branch batches of at most `budget` padded tokens, trunk included."""
-    out, longest = [[]], 0
-    for i, n in enumerate(lengths):
-        if out[-1] and (len(out[-1]) + 1) * (trunk + max(longest, n)) > budget:
-            out.append([])
-            longest = 0
-        out[-1].append(i)
-        longest = max(longest, n)
+    """Branch batches, longest first, each in request order: at most `budget` padded
+    tokens, trunk included, and no branch padded past twice its length."""
+    order = sorted(range(len(lengths)), key=lambda i: -lengths[i])
+    out = []
+    while order:
+        longest, size = lengths[order[0]], 1
+        while (
+            size < len(order)
+            and (size + 1) * (trunk + longest) <= budget
+            and 2 * lengths[order[size]] >= longest
+        ):
+            size += 1
+        out.append(sorted(order[:size]))
+        order = order[size:]
     return out
 
 
@@ -147,14 +153,15 @@ class Model(Lfm2VlModel):
         if not branches:
             return list(self._logz(hidden[:, -1]))
         mx.eval([c.state for c in cache])
-        out = []
+        out = [None] * len(branches)
         for chunk in _chunks(list(map(len, branches)), len(trunk), token_budget):
             rows = [branches[j] for j in chunk]
             width = max(map(len, rows))
             padded = mx.array([row + [0] * (width - len(row)) for row in rows])
             hidden = model(padded, cache=_tile(cache, len(rows)))
             last = mx.array([len(row) - 1 for row in rows])
-            out += list(self._logz(hidden[mx.arange(len(rows)), last]))
+            for j, z in zip(chunk, self._logz(hidden[mx.arange(len(rows)), last])):
+                out[j] = z
         return out
 
     def probabilities(

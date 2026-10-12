@@ -16,13 +16,19 @@ def _length(row):
     return (0 if row[0] is None else row[0].shape[0]) + len(row[1])
 
 
-def _batches(rows, indices, budget):
-    """``indices`` of ``rows`` in batches, longest first, of at most ``budget``
-    padded positions."""
+def _batches(rows, indices, budget, shared=False):
+    """``indices`` of ``rows`` in batches, longest first: at most ``budget`` padded
+    positions, media prefix included, and no row padded past twice its length (its
+    text length after a ``shared`` prefix, as only the text runs)."""
     order = sorted(indices, key=lambda i: _length(rows[i]), reverse=True)
+    width = (lambda i: len(rows[i][1])) if shared else (lambda i: _length(rows[i]))
     while order:
         longest, size = _length(rows[order[0]]), 1
-        while size < len(order) and (size + 1) * longest <= budget:
+        while (
+            size < len(order)
+            and (size + 1) * longest <= budget
+            and 2 * width(order[size]) >= width(order[0])
+        ):
             size += 1
         yield order[:size]
         order = order[size:]
@@ -200,7 +206,7 @@ class Model(nn.Module):
             if media is not None:
                 shared = self.encoder.prefix_state(media.astype(dtype))
                 mx.eval(shared[1])  # finish the prefix before the text takes memory
-            for batch in _batches(rows, group, token_budget):
+            for batch in _batches(rows, group, token_budget, shared is not None):
                 for i, probs in zip(
                     batch, self._forward([rows[i] for i in batch], shared)
                 ):

@@ -58,9 +58,11 @@ LFM2-VL processor. One question runs as a single pass. Several questions read th
 state and its images once: the shared prefix fills a cache that each question
 continues as its own row. A prompt or shared prefix over 2048 tokens is read in
 chunks of 2048 tokens, or of `token_budget` if that is smaller, which bounds the
-memory a long state takes. `token_budget` (default 65536) bounds the padded
-tokens per batch of questions, prefix included. `usage.input_tokens` counts the
-prefix once plus each question's tokens.
+memory a long state takes. Questions run in batches of similar length, longest
+first: a batch takes no question under half the length of its longest, so one
+long question does not pad many short ones. `token_budget` (default 65536)
+bounds the padded tokens per batch of questions, prefix included.
+`usage.input_tokens` counts the prefix once plus each question's tokens.
 
 The checkpoint runs in bfloat16, which moves probabilities by up to a few
 hundredths, as in the PyTorch reference. In float32
