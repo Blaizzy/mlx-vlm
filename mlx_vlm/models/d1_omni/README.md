@@ -48,10 +48,10 @@ base64 data URI) the same way.
 d1-omni supports `choice`, `score`, and `bool`; `noul` is an alias for `bool`.
 A `choice` takes `{label: description}` or a list of labels, a `score` an
 ordered list of 2 to 10 levels, and a `bool` optional `{"false": ..., "true":
-...}` descriptions. Choice and score answers include `probabilities` and
-`metadata.confidence`; scores also carry the level `legend`. Boolean answers
-include `probability`, the probability of true, and use 0.5 to select their
-value.
+...}` descriptions (or `no` and `yes`; other keys raise `ValueError`). Choice
+and score answers include `probabilities` and `metadata.confidence`; scores
+also carry the level `legend`. Boolean answers include `probability`, the
+probability of true, and use 0.5 to select their value.
 
 A state is a string, any JSON value, or `None` when images or audio are the
 whole state. `images` is one image or a list of PIL images, paths, or URLs,

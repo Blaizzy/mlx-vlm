@@ -2430,6 +2430,24 @@ class TestD1DecisionModel(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "alias"):
             aliases(_VocabTokenizer([]), [f"label {i}" for i in range(53)])
 
+    def test_bool_criteria_take_only_true_and_false(self):
+        from mlx_vlm import predict
+        from mlx_vlm.models.d1.prompt import as_question, suffix_text
+
+        model, tok = _extraction_model("d1"), _d1_tokenizer()
+        for criteria in (
+            {"yes": "refund", "no": "keep"},
+            {True: "refund", False: "keep"},
+            {"true": "refund", "maybe": "keep"},
+        ):
+            question = {"type": "bool", "instructions": "Q", "criteria": criteria}
+            with self.subTest(criteria=criteria):
+                with self.assertRaisesRegex(ValueError, 'describe "true" and "false"'):
+                    predict(model, tok, "A B", {"q": question})
+        # A missing side still reads None, as in the reference.
+        partial = {"type": "bool", "instructions": "Q", "criteria": {"true": "refund"}}
+        self.assertIn("Yes: refund\nNo: None", suffix_text(tok, as_question(partial)))
+
     def test_cap_pixels(self):
         from PIL import Image
 
@@ -2838,6 +2856,29 @@ class TestD1OmniDecisionModel(unittest.TestCase):
             as_question(
                 {"type": "score", "instructions": "", "criteria": list("abcdefghijk")}
             )
+
+    def test_bool_criteria_take_true_and_false_or_yes_and_no(self):
+        from mlx_vlm import predict
+        from mlx_vlm.models.d1_omni.prompt import as_question
+
+        model, tok = _random_d1_omni(), _CharTokenizer()
+        for criteria in (
+            {True: "refund", False: "keep"},
+            {"True": "refund", "False": "keep"},
+            {"true": "refund", "yes": "refund"},
+            {"no": "keep", "maybe": "refund"},
+        ):
+            question = {"type": "bool", "instructions": "Q", "criteria": criteria}
+            with self.subTest(criteria=criteria):
+                with self.assertRaisesRegex(ValueError, 'describe "true" and "false"'):
+                    predict(model, tok, "A B", {"q": question})
+        for criteria in (
+            {"true": "a", "false": "b"},
+            {"yes": "a", "no": "b"},
+            {"no": "b"},
+        ):
+            question = {"type": "bool", "instructions": "Q", "criteria": criteria}
+            self.assertEqual(as_question(question), ("noul", "Q", criteria))
 
     def test_image_layout_matches_reference(self):
         from PIL import Image

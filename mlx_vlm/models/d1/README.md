@@ -48,8 +48,9 @@ without calibration.
 d1 supports `choice`, `score`, and `bool`; `noul` is a Boolean alias. Choice
 criteria map labels to descriptions or list labels; score criteria are an
 ordered list of 2 to 10 levels; Boolean criteria optionally describe `true` and
-`false`. Choice returns a label, score its expected level, and Boolean the
-probability of `true`; `confidence` and the score `legend` are in `metadata`.
+`false`, and other keys raise `ValueError`. Choice returns a label, score its
+expected level, and Boolean the probability of `true`; `confidence` and the
+score `legend` are in `metadata`.
 
 `images` is one image or a list of PIL images, paths, or URLs; files are
 turned upright by their EXIF orientation, PIL images are read as given. Each is
