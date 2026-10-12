@@ -10,7 +10,7 @@ from ..gated_delta import gated_delta_update
 from ..linear import DECODE_BLOCK_SIZE, linear, tiled_linear
 from ..mla import MultiLinear
 from ..sparse_attention import indexed_sparse_attention
-from ..switch_layers import MoE, SwitchGLU
+from ..switch_layers import EXPERT_WEIGHT_SUFFIXES, MoE, SwitchGLU, expand_expert_scales
 from .config import TextConfig
 
 
@@ -990,7 +990,11 @@ class LanguageModel(nn.Module):
             elif isinstance(layer.mlp, Glm5NextMoE):
                 mlp_prefixes.append(f"{prefix}.mlp.shared_experts")
             for mlp_prefix in mlp_prefixes:
-                for suffix in ("weight", "scales", "biases"):
+                expand_expert_scales(
+                    weights,
+                    [f"{mlp_prefix}.{name}" for name in ("gate_proj", "up_proj")],
+                )
+                for suffix in EXPERT_WEIGHT_SUFFIXES:
                     source_keys = [
                         f"{mlp_prefix}.{projection}.{suffix}"
                         for projection in ("gate_proj", "up_proj")
@@ -1031,7 +1035,7 @@ class LanguageModel(nn.Module):
 
             if isinstance(layer.mlp, Glm5NextMoE):
                 for name in ("gate_proj", "up_proj", "down_proj"):
-                    for suffix in ("weight", "scales", "biases"):
+                    for suffix in EXPERT_WEIGHT_SUFFIXES:
                         key0 = f"{prefix}.mlp.experts.0.{name}.{suffix}"
                         if key0 in weights:
                             values = [
