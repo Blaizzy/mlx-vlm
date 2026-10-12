@@ -48,7 +48,7 @@ source (which still carries `mtp.*`).
 | `hy_v4` | `hy_v4_mtp` | Yes |
 | `glm5_next`, `glm5_next_text` | `glm5_next_mtp` | Yes |
 | `glm_moe_dsa` | `glm_moe_dsa_mtp` | Yes |
-| `inkling_mm_model` | `inkling_mtp` | Yes |
+| `inkling`, `inkling_mm_model` | `inkling_mtp` | Yes |
 | `glm4_moe_lite` | `glm4_moe_lite_mtp` | Extraction only; no drafter runtime |
 
 Detection is **tensor-presence based** — a config flag alone is not trusted

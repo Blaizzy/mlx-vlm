@@ -729,28 +729,11 @@ def _language_model_quantization_config(model):
     return getattr(module, "make_quantization_config", None)
 
 
-def get_model_and_args(config: dict, model_path: Optional[Path] = None):
-    """Resolve a model package and its normalized model type.
-
-    If the config declares ``model_file`` and ``model_path`` is provided, the
-    model module is imported from that file inside the checkpoint (the same
-    mechanism mlx_lm supports) instead of the built-in registry.
-    """
-    if model_path is not None and (model_file := config.get("model_file")):
-        model_file_path = Path(model_path) / model_file
-        if not model_file_path.is_file():
-            raise FileNotFoundError(
-                f"config.json declares model_file={model_file!r} but "
-                f"{model_file_path} does not exist"
-            )
-        spec = importlib.util.spec_from_file_location("custom_model", model_file_path)
-        arch = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(arch)
-        return arch, "custom"
-
+def get_model_type(config: dict) -> Optional[str]:
+    """Normalize the architecture declared by a checkpoint without importing it."""
     raw_model_type = config.get("model_type") or config.get("speculators_model_type")
     if raw_model_type is None:
-        raise KeyError("model_type")
+        return None
     model_type = raw_model_type.lower()
 
     model_type = MODEL_REMAPPING.get(model_type, model_type)
@@ -777,6 +760,32 @@ def get_model_and_args(config: dict, model_path: Optional[Path] = None):
             > 0
         )
         model_type = "dspark" if is_dspark else f"{model_type}_dflash"
+
+    return model_type
+
+
+def get_model_and_args(config: dict, model_path: Optional[Path] = None):
+    """Resolve a model package and its normalized model type.
+
+    If the config declares ``model_file`` and ``model_path`` is provided, the
+    model module is imported from that file inside the checkpoint (the same
+    mechanism mlx_lm supports) instead of the built-in registry.
+    """
+    if model_path is not None and (model_file := config.get("model_file")):
+        model_file_path = Path(model_path) / model_file
+        if not model_file_path.is_file():
+            raise FileNotFoundError(
+                f"config.json declares model_file={model_file!r} but "
+                f"{model_file_path} does not exist"
+            )
+        spec = importlib.util.spec_from_file_location("custom_model", model_file_path)
+        arch = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(arch)
+        return arch, "custom"
+
+    model_type = get_model_type(config)
+    if model_type is None:
+        raise KeyError("model_type")
 
     last_err: Optional[ImportError] = None
     for pkg in ("mlx_vlm.models", "mlx_vlm.speculative.drafters"):

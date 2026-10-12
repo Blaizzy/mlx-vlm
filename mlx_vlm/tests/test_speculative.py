@@ -638,6 +638,32 @@ def test_checkpoint_routing_and_validation(tmp_path, family):
         validate_drafter_compatibility(target, drafter, "dflash")
 
 
+@parametrize("family", ["dflash2", "dspark-qwen"])
+@parametrize("nested", [False, True])
+def test_standalone_drafter_with_mtp_backbone(tmp_path, family, nested):
+    from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter
+
+    config = dflash_config(family)
+    config["model_type"] = "qwen3_5"
+    if nested:
+        config["text_config"] = tiny_config("qwen").to_dict()
+        config["text_config"]["model_type"] = "qwen3_5"
+    model_type = "dflash2" if family == "dflash2" else "dspark"
+    arch = module(f"speculative.drafters.{model_type}")
+    reference = arch.Model(arch.ModelConfig.from_dict(config))
+    expected = dict(tree_flatten(reference.parameters()))
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(
+        str(tmp_path / "model.safetensors"), expected, metadata={"format": "mlx"}
+    )
+
+    draft, kind = load_drafter(str(tmp_path))
+    assert isinstance(draft, arch.Model)
+    assert kind == resolve_drafter_kind(tmp_path) == "dflash"
+    assert detect_mtp_splitter(tmp_path) is None
+    equal(dict(tree_flatten(draft.parameters())), expected)
+
+
 def split_checkpoint(
     path, config, weights, *, separate=False, indexed=False, **options
 ):
@@ -876,6 +902,7 @@ def test_bundled_qwen_mtp_kind_and_standalone_loading(tmp_path):
         ("glm_moe_dsa", "glm_moe_dsa"),
         ("qwen4_exp", "qwen4_exp"),
         ("qwen4_exp", "qwen4_exp_text"),
+        ("inkling", "inkling"),
         ("inkling", "inkling_mm_model"),
     ],
 )

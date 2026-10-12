@@ -21,7 +21,12 @@ from safetensors import safe_open
 
 from ...fp8 import transform_fp8_weights
 from ...quant_utils import get_quantization_params
-from ...utils import get_model_and_args, get_model_path, load_model_weights
+from ...utils import (
+    get_model_and_args,
+    get_model_path,
+    get_model_type,
+    load_model_weights,
+)
 
 
 def _safetensor_files(model_path: Path) -> List[Path]:
@@ -318,6 +323,7 @@ MTP_SPLITTERS: Dict[str, str] = {
     "glm5_next": "mlx_vlm.speculative.drafters.glm5_next_mtp.split:Glm5NextMTPSplitter",
     "glm5_next_text": "mlx_vlm.speculative.drafters.glm5_next_mtp.split:Glm5NextMTPSplitter",
     "glm_moe_dsa": "mlx_vlm.speculative.drafters.glm_moe_dsa_mtp.split:GlmMoeDsaMTPSplitter",
+    "inkling": "mlx_vlm.speculative.drafters.inkling_mtp.split:InklingMTPSplitter",
     "inkling_mm_model": "mlx_vlm.speculative.drafters.inkling_mtp.split:InklingMTPSplitter",
 }
 
@@ -328,10 +334,21 @@ def get_mtp_splitter(
     """Resolve a bundled family from its text/root config or an explicit type."""
     source_config = source_config or {}
     text_config = source_config.get("text_config") or source_config
+    # Keep root architecture metadata when resolving an inner backbone type.
+    # A standalone drafter can declare the same backbone as a bundled MTP model.
     model_types = (
         (base_model_type,)
         if base_model_type is not None
-        else (text_config.get("model_type"), source_config.get("model_type"))
+        else (
+            get_model_type(
+                {
+                    **source_config,
+                    "model_type": text_config.get("model_type")
+                    or source_config.get("model_type"),
+                }
+            ),
+            get_model_type(source_config),
+        )
     )
     for model_type in model_types:
         target = MTP_SPLITTERS.get(model_type)
