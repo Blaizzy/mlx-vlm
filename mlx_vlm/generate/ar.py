@@ -871,6 +871,22 @@ def _extend_cache(cache_a, cache_b):
     return extended
 
 
+def _plain_single_row_cache(model, *, rows, right_padded, kv_bits, drafting) -> bool:
+    """Whether a lone row runs on the model's own caches, as generate() does.
+
+    Batch caches are for rows that share a step, for drafting (rollback runs
+    through the batch-cache contract) and for quantized KV. A cold prompt and
+    a restored one ask this same question, so they get the same caches.
+    """
+    return (
+        rows == 1
+        and not right_padded
+        and kv_bits is None
+        and not drafting
+        and hasattr(model, "make_cache")
+    )
+
+
 def _make_cache(
     model,
     left_padding,
@@ -1849,11 +1865,12 @@ class PromptProcessingBatch:
                     prefill_length=max_length,
                 ),
             )
-        elif (
-            len(input_ids) == 1
-            and right_pad_per_row is None
-            and kv_bits is None
-            and hasattr(model, "make_cache")
+        elif _plain_single_row_cache(
+            model,
+            rows=len(input_ids),
+            right_padded=right_pad_per_row is not None,
+            kv_bits=kv_bits,
+            drafting=draft_model is not None and draft_kind is not None,
         ):
             self.prompt_cache = cache.make_prompt_cache(model)
         else:
@@ -2726,11 +2743,33 @@ class BatchGenerator:
         _quant_cfg = _quant_policy.to_config() if _quant_policy is not None else None
         coordinator = getattr(self, "apc", None)
         if coordinator is not None:
-            warm_cache, _ = coordinator.merge_rows(
-                picks,
-                prefix_lens,
-                kv_quant_config=_quant_cfg,
-            )
+            lone = picks[0] if len(picks) == 1 else None
+            if (
+                lone is not None
+                and lone.get("warm_cache") is not None
+                and _plain_single_row_cache(
+                    self.model,
+                    rows=1,
+                    right_padded=any(right_pad_per_row),
+                    kv_bits=self.kv_bits,
+                    drafting=(
+                        getattr(self, "draft_model", None) is not None
+                        and getattr(self, "draft_kind", None) is not None
+                    ),
+                )
+            ):
+                # A restored row gets the caches a cold row would get.
+                warm_cache = coordinator.materialize_single(
+                    lone,
+                    min_capacity_tokens=len(full_ids[0]) + 1,
+                    kv_quant_config=None,
+                )
+            else:
+                warm_cache, _ = coordinator.merge_rows(
+                    picks,
+                    prefix_lens,
+                    kv_quant_config=_quant_cfg,
+                )
         elif apc_mode == "exact":
             row_caches = [
                 p["warm_cache"] if p is not None else self.model.make_cache()
