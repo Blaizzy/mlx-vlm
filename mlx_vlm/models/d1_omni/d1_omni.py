@@ -109,7 +109,7 @@ class Model(nn.Module):
         return predicate
 
     def predict(
-        self, processor, state, questions, images=None, audio=None, token_budget=65536
+        self, processor, state, questions, images=None, audio=None, token_budget=16384
     ):
         tokenizer = getattr(processor, "tokenizer", processor)
         parsed = {name: as_question(spec) for name, spec in questions.items()}
@@ -122,7 +122,7 @@ class Model(nn.Module):
             "usage": {"input_tokens": read, "output_tokens": 0},
         }
 
-    def probabilities(self, tokenizer, requests, token_budget=65536):
+    def probabilities(self, tokenizer, requests, token_budget=16384):
         """``(state, questions[, images[, audio]])`` requests -> per request, each
         question's distribution over its options in option order (``[false, true]``
         for a noul) and the positions the trunk read. ``audio`` is one clip: 16 kHz
@@ -168,7 +168,7 @@ class Model(nn.Module):
             results = results[len(request) :]
         return out
 
-    def _run(self, rows, token_budget=65536):
+    def _run(self, rows, token_budget=16384):
         """Rows (prefix, ids, markers, question, calibrate) -> probabilities, batched
         longest first under a token budget."""
         results = [None] * len(rows)

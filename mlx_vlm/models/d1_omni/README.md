@@ -77,7 +77,9 @@ training, a missing state reads as `{}`, choices are written as numbered
 options, and Boolean criteria are ignored. `usage.input_tokens` counts every
 position the trunk reads, so each question counts the media prefix again. The
 questions of a request run in length-sorted batches; `token_budget` (default
-65536) bounds the padded positions per batch, media prefix included.
+16384) bounds the padded positions per batch, media prefix included. Peak
+memory grows with the budget: in float32, a full batch takes about 5.8 GB above
+the weights at 65536 and about 2.2 GB at 16384, which is no slower.
 
 The checkpoint is float32 and runs in float32 by default, matching the PyTorch
 reference to about 1e-5 in probability on text, images, and speech. For images

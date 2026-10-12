@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import importlib
+import inspect
 import io
 import json
 import math
@@ -2845,6 +2846,28 @@ class TestD1OmniDecisionModel(unittest.TestCase):
         self.assertEqual(
             answers["c"]["metadata"]["legend"], {"0": "low", "1": "mid", "2": "high"}
         )
+
+    def test_default_token_budget_bounds_batches(self):
+        from mlx_vlm.models.d1 import d1
+        from mlx_vlm.models.d1_omni import d1_omni
+
+        model, tok = _random_d1_omni(), _CharTokenizer()
+        batches = []
+
+        def forward(rows, *args):
+            batches.append(len(rows))
+            return [[0.5, 0.5]] * len(rows)
+
+        model._forward = forward
+        question = {"type": "bool", "instructions": "Q"}
+        model.probabilities(tok, [("x" * 3000, [question] * 6)])
+        # Rows of about 3,100 positions: 5 fit in 16384 (all 6 fit in 65536).
+        self.assertEqual(batches, [5, 1])
+        # d1-3B keeps 65536: a smaller budget is slower there and saves no memory.
+        for module, budget in ((d1_omni, 16384), (d1, 65536)):
+            for method in (module.Model.predict, module.Model.probabilities):
+                parameter = inspect.signature(method).parameters["token_budget"]
+                self.assertEqual(parameter.default, budget)
 
     def test_media_prefix_reads_only_media(self):
         # Prefix queries never see text keys and the centred convolution never lets
