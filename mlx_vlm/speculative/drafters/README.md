@@ -4,6 +4,16 @@ Some base checkpoints ship native **multi-token-prediction (MTP)** tensors. This
 package extracts them into a standalone MLX *drafter* for speculative decoding,
 through one shared framework (`mtp_split.py`) with a small per-family subclass.
 
+Registered native checkpoints with a drafter runtime can also be loaded
+directly: pass the original checkpoint as `--draft-model` in the CLI or server.
+The existing `MTP_SPLITTERS` registry resolves the family once from the root or
+text config. `MTPSplitter.prepare()` selects and converts its tensors in memory;
+the same `load_model_weights()` used by the normal model loader applies module
+quantization and installs the prepared weights without sanitizing them again.
+The draft kind is inferred from the loaded drafter config, including native
+DSpark heads. No separate checkpoint is written. See the
+[Qwen MTP examples](qwen3_5_mtp/README.md).
+
 ## Extract a drafter
 
 Standalone — auto-detects the family from the source config:
@@ -29,14 +39,17 @@ source (which still carries `mtp.*`).
 
 ## Supported base model types
 
-| base `model_type` | drafter `model_type` |
-|---|---|
-| `qwen3_5`, `qwen3_5_moe` | `qwen3_5_mtp` |
-| `qwen3_next` | `qwen3_5_mtp` (reuses the runtime) |
-| `qwen4_exp` | `qwen4_exp_mtp` |
-| `deepseek_v4` | `deepseek_v4_mtp` |
-| `glm4_moe_lite` | `glm4_moe_lite_mtp` |
-| `inkling_mm_model` | `inkling_mtp` |
+| base `model_type` | drafter `model_type` | Bundled loading |
+|---|---|---|
+| `qwen3_5`, `qwen3_5_moe` | `qwen3_5_mtp` | Yes |
+| `qwen3_next` | `qwen3_5_mtp` (reuses the runtime) | Yes |
+| `qwen4_exp`, `qwen4_exp_text` | `qwen4_exp_mtp` | Yes |
+| `deepseek_v4` | `deepseek_v4_mtp` or `deepseek_v4_dspark` | Yes |
+| `hy_v4` | `hy_v4_mtp` | Yes |
+| `glm5_next`, `glm5_next_text` | `glm5_next_mtp` | Yes |
+| `glm_moe_dsa` | `glm_moe_dsa_mtp` | Yes |
+| `inkling`, `inkling_mm_model` | `inkling_mtp` | Yes |
+| `glm4_moe_lite` | `glm4_moe_lite_mtp` | Extraction only; no drafter runtime |
 
 Detection is **tensor-presence based** — a config flag alone is not trusted
 (some models declare MTP but ship no tensors; others ship tensors with no flag).
@@ -46,8 +59,12 @@ Detection is **tensor-presence based** — a config flag alone is not trusted
 1. Subclass `MTPSplitter` and override only what differs — `select_keys`,
    `rename` / `run_sanitize`, `postprocess`, `quantization_from_source`, `depth`,
    `extra_config`. The shared base handles shard discovery, loading, config
-   assembly, tokenizer copy, and on-request affine quantization.
+   assembly, in-memory model loading, tokenizer copy, and on-request affine
+   quantization.
 2. Register it by base `model_type` in `MTP_SPLITTERS`.
+
+Families with multiple native drafter architectures can override `from_config`
+to choose their splitter. Loading and extraction use the same resolver.
 
 To *run* the drafter you also need a draft-model class. Reuse an existing one
 when the architecture matches (e.g. Qwen3-Next reuses `qwen3_5_mtp`); otherwise
