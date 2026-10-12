@@ -14,6 +14,7 @@ from .glm5_next_mtp import Glm5NextMTPDraftModel
 class Glm5NextMTPSplitter(MTPSplitter):
     output_model_type = "glm5_next_mtp"
     draft_model_cls = Glm5NextMTPDraftModel
+    require_text_config = False
     tie_word_embeddings_default = False
     depth_field = "num_nextn_predict_layers"
     block_size_extra = 1

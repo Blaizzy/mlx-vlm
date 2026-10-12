@@ -67,10 +67,26 @@ class Qwen3NextMTPSplitter(MTPSplitter):
     # experts (not Qwen3.5's fused ``gate_up_proj``), so expert stacking is bespoke.
     output_model_type = "qwen3_5_mtp"
     draft_model_cls = None
+    require_text_config = False
     tie_word_embeddings_default = True
     depth_field = "mtp_num_hidden_layers"
     block_size_extra = 2
     supports_mlx_source = True
+
+    def read_text_config(self, source_config: dict) -> dict:
+        text_config = super().read_text_config(source_config)
+        if "rope_parameters" not in text_config:
+            rotary_dim = int(
+                text_config["head_dim"] * text_config["partial_rotary_factor"]
+            )
+            text_config["rope_parameters"] = {
+                "type": "default",
+                "rope_theta": text_config["rope_theta"],
+                "partial_rotary_factor": text_config["partial_rotary_factor"],
+                "mrope_section": [rotary_dim // 2, 0, 0],
+            }
+        text_config.setdefault("norm_topk_prob", False)
+        return text_config
 
     def select_keys(self, key: str, text_config: dict) -> bool:
         return key.startswith("mtp.")

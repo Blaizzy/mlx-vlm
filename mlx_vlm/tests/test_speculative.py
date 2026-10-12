@@ -664,7 +664,7 @@ def split_checkpoint(
     return config, weights, output
 
 
-@parametrize("family", ["qwen3_5", "qwen3_5_moe"])
+@parametrize("family", ["qwen3_5", "qwen3_5_moe", "qwen3_next"])
 @parametrize("layout", ["hf", "mlx", "affine", "fp8"])
 @parametrize("indexed", [False, True])
 def test_load_bundled_qwen_mtp(tmp_path, monkeypatch, family, layout, indexed):
@@ -673,7 +673,7 @@ def test_load_bundled_qwen_mtp(tmp_path, monkeypatch, family, layout, indexed):
         "qwen", hidden_size=128, intermediate_size=128, head_dim=16
     ).to_dict()
     text.update(model_type=family + "_text", mtp_num_hidden_layers=1)
-    if family.endswith("moe"):
+    if family != "qwen3_5":
         text.update(
             num_experts=2,
             num_experts_per_tok=1,
@@ -683,6 +683,23 @@ def test_load_bundled_qwen_mtp(tmp_path, monkeypatch, family, layout, indexed):
     reference = arch.Model(arch.ModelConfig.from_dict({"text_config": text}))
     reference.set_dtype(mx.bfloat16)
     config = dict(model_type=family, text_config=text)
+    if family == "qwen3_next":
+        config = dict(text, model_type=family)
+        rope = config.pop("rope_parameters")
+        config.update(
+            rope_theta=rope["rope_theta"],
+            partial_rotary_factor=rope["partial_rotary_factor"],
+            decoder_sparse_step=1,
+            mlp_only_layers=[],
+            full_attention_interval=1,
+        )
+        if indexed:
+            config["norm_topk_prob"] = True
+        next_arch = module("models.qwen3_next.language")
+        reference.layers = [
+            next_arch.Qwen3NextDecoderLayer(next_arch.ModelConfig.from_dict(config), 0)
+        ]
+        reference.set_dtype(mx.bfloat16)
     mlx_layout = layout in ("mlx", "affine")
     if layout == "affine":
         quant = dict(group_size=32, bits=4, mode="affine")
@@ -699,7 +716,12 @@ def test_load_bundled_qwen_mtp(tmp_path, monkeypatch, family, layout, indexed):
         "mtp." + key: value if mlx_layout or value.ndim != 1 else value - 1
         for key, value in tree_flatten(reference.parameters())
     }
-    if family.endswith("moe") and not mlx_layout:
+    if family == "qwen3_next" and not mlx_layout:
+        for key in list(weights):
+            if ".switch_mlp." in key:
+                for expert, value in enumerate(weights.pop(key)):
+                    weights[key.replace(".switch_mlp.", f".experts.{expert}.")] = value
+    elif family.endswith("moe") and not mlx_layout:
         prefix = "mtp.layers.0.mlp."
         weights[prefix + "experts.gate_up_proj"] = mx.concatenate(
             [
@@ -753,10 +775,25 @@ def test_load_bundled_qwen_mtp(tmp_path, monkeypatch, family, layout, indexed):
     inputs = mx.random.normal((1, 2, 128)).astype(mx.bfloat16)
     positions = mx.array([[0, 1]])
     actual = draft._forward_hidden(inputs, inputs, draft.make_cache(), positions)
-    expected = reference._forward_hidden(
-        inputs, inputs, reference.make_cache(), positions
-    )
-    equal(actual, expected)
+    if family == "qwen3_next":
+        hidden = reference.fc(
+            mx.concatenate(
+                [
+                    reference.pre_fc_norm_embedding(inputs),
+                    reference.pre_fc_norm_hidden(inputs),
+                ],
+                axis=-1,
+            )
+        )
+        expected = reference.norm(
+            reference.layers[0](hidden, mask="causal", cache=KVCache())
+        )
+        equal(actual, expected, atol=1e-3, rtol=1e-3)
+    else:
+        expected = reference._forward_hidden(
+            inputs, inputs, reference.make_cache(), positions
+        )
+        equal(actual, expected)
     assert mx.isfinite(actual).all().item()
 
     output = split_mtp(str(tmp_path), str(tmp_path / "draft"))
@@ -820,12 +857,38 @@ def test_bundled_qwen_mtp_kind_and_standalone_loading(tmp_path):
         equal(value, expected[key])
 
 
-@parametrize("family", ["glm", "deepseek"])
+@parametrize(
+    "family, model_type",
+    [
+        ("glm", "glm5_next"),
+        ("glm", "glm5_next_text"),
+        ("deepseek", "deepseek_v4"),
+        ("hy_v4", "hy_v4"),
+        ("glm_moe_dsa", "glm_moe_dsa"),
+        ("qwen4_exp", "qwen4_exp"),
+        ("qwen4_exp", "qwen4_exp_text"),
+        ("inkling", "inkling_mm_model"),
+    ],
+)
 @parametrize("config_location", ["root", "text", "root-fallback"])
-def test_load_registered_native_drafter(tmp_path, monkeypatch, family, config_location):
-    model_type = TINY_MODELS[family]["module"]
-    text = tiny_config(family).to_dict()
-    arch = module(f"speculative.drafters.{model_type}_mtp")
+def test_load_registered_native_drafter(
+    tmp_path, monkeypatch, family, model_type, config_location
+):
+    if family in TINY_MODELS:
+        text = tiny_config(family).to_dict()
+        runtime = TINY_MODELS[family]["module"]
+    elif family in ("hy_v4", "glm_moe_dsa"):
+        text = values("mla_mtp", model_type=family)
+        runtime = family
+    else:
+        case = next(
+            c
+            for c in module("tests.test_models").DATA["cases"]
+            if c["module"] == family
+        )
+        text = deepcopy(case["config"]["text_config"])
+        runtime = family
+    arch = module(f"speculative.drafters.{runtime}_mtp")
     reference = arch.Model(arch.ModelConfig.from_dict({"text_config": text}))
     reference.set_dtype(mx.bfloat16)
     weights = {}
@@ -834,13 +897,53 @@ def test_load_registered_native_drafter(tmp_path, monkeypatch, family, config_lo
             key = key.removeprefix("mtp_block.")
             key = key.replace("shared_head_norm.", "shared_head.norm.")
             key = f"model.language_model.layers.{text['num_hidden_layers']}.{key}"
-        else:
+        elif family == "deepseek":
             key = "mtp.0." + key.removeprefix("decoder.")
             for component in ("attn", "ffn"):
                 key = key.replace(f"{component}_hc.", f"hc_{component}_")
+        elif family == "hy_v4":
+            key = key.removeprefix("decoder.")
+            if key == "norm.weight":
+                key = "final_layernorm.weight"
+            key = "model.mtp_layers.0." + key
+        elif family == "glm_moe_dsa":
+            key = key.removeprefix("mtp.").replace(
+                "shared_head_norm.", "shared_head.norm."
+            )
+            key = f"model.layers.{text['num_hidden_layers']}.{key}"
+            if ".switch_mlp." in key:
+                for expert, tensor in enumerate(value):
+                    weights[key.replace(".switch_mlp.", f".experts.{expert}.")] = tensor
+                continue
+        elif family == "qwen4_exp":
+            key = "language_model.mtp." + key
+        elif family == "inkling":
+            if key == "norm.weight":
+                weights["model.llm.norm.weight"] = value
+                continue
+            key = "model.mtp." + key.replace("blocks.", "layers.")
+            if ".qkvr_proj.weight" in key:
+                sizes = reference.blocks[0].transformer_block.self_attn.qkvr_dims
+                for name, tensor in zip(
+                    ("wq_du", "wk_dv", "wv_dv", "wr_du"),
+                    mx.split(value, np.cumsum(sizes[:-1]).tolist()),
+                ):
+                    weights[key.replace("self_attn.qkvr_proj", f"attn.{name}")] = tensor
+                continue
+            key = key.replace("self_attn.o_proj", "attn.wo_ud")
+            key = key.replace("self_attn.rel_proj", "attn.rel_logits_proj.weight")
+            key = key.replace("self_attn.", "attn.")
+            key = key.replace("input_layernorm", "attn_norm").replace(
+                "post_attention_layernorm", "mlp_norm"
+            )
+            if ".conv.weight" in key:
+                key = key.replace(".conv.weight", ".weight")
+                value = value.transpose(0, 2, 1)
         weights[key] = value
     config = dict(model_type=model_type, text_config=text)
-    if config_location == "text":
+    if config_location == "root" and family != "inkling":
+        config = dict(text, model_type=model_type)
+    elif config_location == "text":
         config["model_type"] = "multimodal_wrapper"
         text["model_type"] = model_type
     elif config_location == "root-fallback":
@@ -853,12 +956,12 @@ def test_load_registered_native_drafter(tmp_path, monkeypatch, family, config_lo
         json.dumps({"weight_map": weight_map})
     )
     before = {p.name: p.stat().st_mtime_ns for p in tmp_path.iterdir()}
-    monkeypatch.setattr(
-        "mlx_vlm.utils.load_model",
-        Mock(side_effect=AssertionError("must not load the target as a drafter")),
-    )
-
-    draft, kind = load_drafter(str(tmp_path), kind="dflash")
+    with monkeypatch.context() as patcher:
+        patcher.setattr(
+            "mlx_vlm.utils.load_model",
+            Mock(side_effect=AssertionError("must not load the target as a drafter")),
+        )
+        draft, kind = load_drafter(str(tmp_path), kind="dflash")
     assert kind == "mtp" and isinstance(draft, arch.Model)
     assert {p.name: p.stat().st_mtime_ns for p in tmp_path.iterdir()} == before
     expected = dict(tree_flatten(reference.parameters()))
@@ -870,6 +973,10 @@ def test_load_registered_native_drafter(tmp_path, monkeypatch, family, config_lo
     from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter
 
     assert detect_mtp_splitter(tmp_path).output_model_type == draft.config.model_type
+    output = split_mtp(str(tmp_path), str(tmp_path / "draft"))
+    standalone, standalone_kind = load_drafter(str(output))
+    assert standalone_kind == kind
+    equal(actual, dict(tree_flatten(standalone.parameters())))
 
 
 def test_deepseek_dspark_split_load_and_draft(tmp_path):
