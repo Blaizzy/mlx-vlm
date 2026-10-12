@@ -989,15 +989,27 @@ def test_replace_one_bit_checkpoint_modules_only():
 
 
 @pytest.mark.parametrize(
-    ("quant_method", "quant_algo"),
-    [("modelopt", "NVFP4"), ("modelopt", "W4A16_NVFP4"), ("modelopt_mixed", "NVFP4")],
+    "config",
+    [
+        {"quant_method": method, "quant_algo": algo}
+        for method, algo in [
+            ("modelopt", "NVFP4"),
+            ("modelopt", "W4A16_NVFP4"),
+            ("modelopt_mixed", "NVFP4"),
+        ]
+    ]
+    + [
+        {
+            "quant_method": "fp8",
+            "quant_algo": "MIXED_PRECISION",
+            "moe_quant_algo": "NVFP4",
+        }
+    ],
 )
-def test_transform_modelopt_nvfp4_weights(quant_method, quant_algo):
+def test_transform_modelopt_nvfp4_weights(config):
     weights = _nvfp4_weights() | {"layer.bias": mx.ones((2,))}
 
-    transformed, quantization = _transform_modelopt_nvfp4_weights(
-        weights, {"quant_method": quant_method, "quant_algo": quant_algo}
-    )
+    transformed, quantization = _transform_modelopt_nvfp4_weights(weights, config)
 
     assert transformed["layer.weight"].dtype == mx.uint32
     assert transformed["layer.weight"].shape == (2, 4)
@@ -1007,6 +1019,117 @@ def test_transform_modelopt_nvfp4_weights(quant_method, quant_algo):
     assert "layer.weight_scale" not in transformed
     assert "layer.input_scale" not in transformed
     assert quantization == {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+
+
+@pytest.mark.parametrize("moe_quant_algo", [None, "MXFP4"])
+def test_transform_modelopt_leaves_other_fp8_exports_unchanged(moe_quant_algo):
+    weights = _nvfp4_weights()
+    transformed, quantization = _transform_modelopt_nvfp4_weights(
+        weights,
+        {
+            "quant_method": "fp8",
+            "quant_algo": "MIXED_PRECISION",
+            "moe_quant_algo": moe_quant_algo,
+        },
+    )
+    assert transformed is weights
+    assert quantization is None
+
+
+@pytest.mark.parametrize("family", ["deepseek_v4", "deepseek_v41"])
+def test_deepseek_mixed_fp8_nvfp4_strict_load(tmp_path, family):
+    module = importlib.import_module(f"mlx_vlm.models.{family}")
+    config = module.ModelConfig.from_dict(
+        dict(
+            model_type=family,
+            vocab_size=128,
+            hidden_size=128,
+            moe_intermediate_size=128,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            n_routed_experts=2,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            q_lora_rank=128,
+            qk_rope_head_dim=32,
+            head_dim=128,
+            o_groups=2,
+            o_lora_rank=64,
+            compress_ratios=[0],
+            num_hash_layers=0,
+            engram_layer_ids=[],
+            kv_source_layer_ids=[],
+            index_source_layer_ids=[],
+            vision_num_layers=0,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+        )
+    )
+    mx.random.seed(42)
+    reference = module.Model(config)
+    expected_weights = dict(tree_flatten(reference.parameters()))
+    raw = {}
+    for key, value in list(expected_weights.items()):
+        source_key = (
+            key.removeprefix("language_model.") if family == "deepseek_v4" else key
+        )
+        if ".switch_mlp." in key:
+            root, projection = key.removesuffix(".weight").split(".switch_mlp.")
+            root = root.removeprefix("language_model.").removeprefix("model.")
+            name = {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"}[projection]
+            decoded = []
+            for e in range(2):
+                factor = mx.array(0.137 + e * 0.211, mx.float32)
+                packed, scales = mx.quantize(value[e] / factor, mode="nvfp4")
+                prefix = f"{root}.experts.{e}.{name}"
+                raw[prefix + ".weight"] = packed.view(mx.uint8)
+                raw[prefix + ".weight_scale"] = scales
+                raw[prefix + ".weight_scale_2"] = factor
+                decoded.append(mx.dequantize(packed, scales, mode="nvfp4") * factor)
+            expected_weights[key] = mx.stack(decoded)
+        elif key.endswith(".weight") and (
+            ".attn.w" in key or ".ffn.shared_experts." in key
+        ):
+            shape = value.shape
+            encoded = mx.to_fp8(value.reshape(-1, shape[-1]))
+            prefix = source_key.removesuffix(".weight")
+            raw[prefix + ".weight"] = encoded
+            block = 128 if family == "deepseek_v4" else 32
+            raw[prefix + ".scale"] = mx.full(
+                (encoded.shape[0] // block, encoded.shape[1] // block), 127, mx.uint8
+            )
+            expected_weights[key] = mx.from_fp8(encoded, dtype=mx.bfloat16).reshape(
+                shape
+            )
+        else:
+            raw[source_key] = value
+
+    saved_config = asdict(config)
+    saved_config["quantization_config"] = {
+        "quant_method": "fp8",
+        "quant_algo": "MIXED_PRECISION",
+        "moe_quant_algo": "NVFP4",
+        "weight_block_size": [128, 128] if family == "deepseek_v4" else [32, 32],
+        "scale_fmt": "ue8m0",
+    }
+    (tmp_path / "config.json").write_text(json.dumps(saved_config))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), raw)
+    loaded = load_model(tmp_path, strict=True, lazy=False)
+    expert = loaded.layers[0].ffn.switch_mlp.gate_proj
+    assert isinstance(expert, ScaledQuantizedSwitchLinear)
+    assert expert.mode == "nvfp4"
+    assert expert.group_size == 16
+    assert mx.allclose(expert.global_scale, mx.array([0.137, 0.348])).item()
+    if family == "deepseek_v4":
+        assert loaded.layers[0].attn.wq_a.mode == "mxfp8"
+        assert loaded.layers[0].ffn.shared_experts.gate_proj.mode == "mxfp8"
+    reference.load_weights(list(expected_weights.items()))
+    tokens = mx.array([[0, 42, 1]])
+    expected = reference(tokens).logits
+    actual = loaded(tokens).logits
+    assert mx.all(mx.isfinite(actual)).item()
+    assert mx.allclose(actual, expected, atol=2e-5, rtol=2e-4).item()
 
 
 def _nvfp4_weights():

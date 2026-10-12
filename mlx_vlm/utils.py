@@ -138,10 +138,14 @@ def _transform_modelopt_nvfp4_weights(
     """
     if quantization_config is None:
         return weights, None
-    if quantization_config.get("quant_method") not in {
-        "modelopt",
-        "modelopt_mixed",
-    } or quantization_config.get("quant_algo") not in {
+    quant_method = quantization_config.get("quant_method")
+    is_modelopt = quant_method in {"modelopt", "modelopt_mixed"}
+    is_fp8_with_nvfp4_experts = (
+        quant_method == "fp8" and quantization_config.get("moe_quant_algo") == "NVFP4"
+    )
+    if not (is_modelopt or is_fp8_with_nvfp4_experts) or quantization_config.get(
+        "quant_algo"
+    ) not in {
         "NVFP4",
         "W4A16_NVFP4",
         "MIXED_PRECISION",
@@ -937,7 +941,9 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         )
     if transformed_quantization is not None:
         config["quantization"] = transformed_quantization
-        config["quantization_config"] = transformed_quantization
+        # Mixed FP8 exports still need their non-expert weight conversion.
+        if quantization_config.get("quant_method") != "fp8":
+            config["quantization_config"] = transformed_quantization
 
     if not has_quantization:
         quantization_config = config.get("quantization_config", None)
@@ -1019,6 +1025,18 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             weights = sanitize_weights(
                 model_class.AudioModel, weights, model_config.audio_config
             )
+
+    if (
+        transformed_quantization is not None
+        and quantization_config.get("quant_method") == "fp8"
+    ):
+        quantization = dict(config["quantization"])
+        for key in weights:
+            if key.endswith(".weight_scale_2"):
+                quantization[key.removesuffix(".weight_scale_2")] = dict(
+                    transformed_quantization
+                )
+        config["quantization"] = config["quantization_config"] = quantization
 
     if (quantization := config.get("quantization", None)) is not None:
         # Handle legacy models which may or may not have vision quantized.
