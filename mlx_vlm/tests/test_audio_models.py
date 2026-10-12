@@ -1528,6 +1528,39 @@ def test_load_audio_downmixes_stereo_before_resampling(monkeypatch):
     np.testing.assert_allclose(audio, expected, rtol=1e-5, atol=1e-6)
 
 
+@pytest.mark.parametrize("rate", [8000, 16000, 44100, 48000])
+def test_load_audio_max_seconds_cuts_before_resampling(monkeypatch, tmp_path, rate):
+    import mlx_audio.utils
+    from mlx_audio.utils import resample_audio
+
+    rng = np.random.default_rng(0)
+    pcm = (rng.standard_normal((7 * rate + 123, 2)) * 8000).astype(np.int16)
+    path = tmp_path / "clip.wav"
+    with wave.open(str(path), "wb") as f:
+        f.setnchannels(2)
+        f.setsampwidth(2)
+        f.setframerate(rate)
+        f.writeframes(pcm.tobytes())
+    full = load_audio(str(path), sr=16000)
+    lengths = []
+
+    def resample(audio, orig_sample_rate, sample_rate):
+        lengths.append(len(audio))
+        return resample_audio(audio, orig_sample_rate, sample_rate)
+
+    monkeypatch.setattr(mlx_audio.utils, "resample_audio", resample)
+    for seconds in (2, 2.5, 30):
+        cut = load_audio(str(path), sr=16000, max_seconds=seconds)
+        np.testing.assert_array_equal(cut, full[: int(seconds * 16000)])
+    # Each file is cut 1 s past max_seconds before it is resampled.
+    expected = [] if rate == 16000 else [3 * rate, int(3.5 * rate), len(pcm)]
+    assert lengths == expected
+    stereo = np.stack([full, full], axis=1)
+    np.testing.assert_array_equal(
+        load_audio(stereo, 16000, max_seconds=1), full[:16000]
+    )
+
+
 def _host(a):
     return np.array(a.astype(mx.float32))
 

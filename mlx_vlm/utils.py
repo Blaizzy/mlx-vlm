@@ -1476,13 +1476,17 @@ def load_audio(
     file,
     sr: int,
     timeout: int = 10,
+    max_seconds: Optional[float] = None,
 ):
     """
     Helper function to load audio from either a URL, file path, or numpy array.
+    ``max_seconds`` keeps only the start of the clip; a file is cut before it is
+    downmixed and resampled, with the same samples as cutting it afterwards.
     """
     if isinstance(file, np.ndarray):
         audio = file.astype(np.float32, copy=False)
-        return audio.mean(axis=1) if audio.ndim > 1 else audio
+        audio = audio.mean(axis=1) if audio.ndim > 1 else audio
+        return audio if max_seconds is None else audio[: int(max_seconds * sr)]
 
     from mlx_audio.audio_io import read as read_audio
     from mlx_audio.utils import resample_audio
@@ -1501,15 +1505,20 @@ def load_audio(
     else:
         audio, sample_rate = read_audio(file, dtype="float32")
 
+    audio = np.asarray(audio, dtype=np.float32)
+    if max_seconds is not None:
+        # The resampling filter spans 64 zero crossings of the lower rate per side
+        # (4 ms at 16 kHz), so 1 s past the cut keeps a full decode's samples.
+        audio = audio[: math.ceil((max_seconds + 1) * sample_rate)]
     # Downmix before resampling: read_audio returns (samples, channels), and
     # resample_audio works on the last axis, so resampling stereo first would
     # resample the channel axis and leave the samples at the source rate.
-    audio = np.asarray(audio, dtype=np.float32)
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
     if sample_rate != sr:
         audio = resample_audio(audio, sample_rate, sr)
-    return np.asarray(audio, dtype=np.float32)
+    audio = np.asarray(audio, dtype=np.float32)
+    return audio if max_seconds is None else audio[: int(max_seconds * sr)]
 
 
 @dataclass(frozen=True)
