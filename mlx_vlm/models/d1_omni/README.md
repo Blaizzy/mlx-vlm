@@ -74,8 +74,10 @@ and 16384 minus the prefix in every case. The instructions keep up to B =
 max(96, min(24 × options + 32, cap / 2)) tokens, the options share another B,
 and the state is cut on the right to the room that is left. After audio, as in
 training, a missing state reads as `{}`, choices are written as numbered
-options, and Boolean criteria are ignored. `usage.input_tokens` counts every
-position the trunk reads, so each question counts the media prefix again. The
+options, and Boolean criteria are ignored. The trunk runs a request's media
+prefix once and every question's text row reads it from there, which matches
+running the prefix in each row, as the reference does, to float32 rounding.
+`usage.input_tokens` still counts the prefix once per question. The
 questions of a request run in length-sorted batches; `token_budget` (default
 16384) bounds the padded positions per batch, media prefix included. Peak
 memory grows with the budget: in float32, a full batch takes about 5.8 GB above

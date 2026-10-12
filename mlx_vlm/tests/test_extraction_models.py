@@ -2884,6 +2884,59 @@ class TestD1OmniDecisionModel(unittest.TestCase):
         np.testing.assert_array_equal(first[:5], second[:5])
         self.assertFalse(np.allclose(first[5:], second[5:]))
 
+    def test_shared_media_prefix_matches_per_row_prefix(self):
+        from PIL import Image
+
+        model, tok = _random_d1_omni(), _CharTokenizer()
+        trunk = model.encoder
+        # Text rows after one shared prefix read what [prefix; text] rows read.
+        P, lengths = 5, [7, 3, 5]
+        media = mx.random.normal((P, 64), key=mx.random.key(1))
+        h = mx.random.normal((3, max(lengths), 64), key=mx.random.key(2))
+        pad = mx.arange(max(lengths))[None] < mx.array(lengths)[:, None]
+        rows = mx.concatenate([mx.broadcast_to(media, (3, P, 64)), h], axis=1)
+        rows_pad = mx.concatenate([mx.ones((3, P), mx.bool_), pad], axis=1)
+        expected = np.array(trunk(rows, rows_pad, [P] * 3)[:, P:])
+        actual = np.array(trunk.after(h, pad, trunk.prefix_state(media)))
+        for row, n in enumerate(lengths):
+            np.testing.assert_allclose(actual[row, :n], expected[row, :n], atol=1e-5)
+
+        calls = []
+        prefix_state = trunk.prefix_state
+        trunk.prefix_state = lambda media: calls.append(media) or prefix_state(media)
+        rng = np.random.default_rng(0)
+        image = Image.fromarray(rng.integers(0, 256, (48, 64, 3), np.uint8))
+        clip = (rng.normal(0, 0.1, 12000) * 32768).astype(np.int16)
+        questions = [
+            {"type": "bool", "instructions": "Short?"},
+            {"type": "choice", "instructions": "Pick one", "criteria": ["a", "bb"]},
+            {"type": "score", "instructions": "Rate it", "criteria": list("abcd")},
+        ]
+        for kind, media in (("image", ([image],)), ("audio", (None, clip))):
+            with self.subTest(media=kind):
+                calls.clear()
+                [shared] = model.probabilities(tok, [(None, questions, *media)])
+                self.assertEqual(len(calls), 1)
+                # One question per request runs its prefix in the row.
+                alone = model.probabilities(
+                    tok, [(None, [q], *media) for q in questions]
+                )
+                self.assertEqual(len(calls), 1)
+                np.testing.assert_allclose(_flat([shared]), _flat(alone), atol=1e-5)
+                self.assertEqual(shared[1], sum(read for _, read in alone))
+        # Every request that has several questions on media runs its prefix once.
+        calls.clear()
+        model.probabilities(
+            tok,
+            [
+                (None, questions[:2], [image]),
+                ("hi", questions),
+                (None, questions[1:], None, clip),
+                (None, questions[:1], [image]),
+            ],
+        )
+        self.assertEqual(len(calls), 2)
+
     def test_short_conv_taps_left_centre_right(self):
         trunk = _random_d1_omni().encoder
         conv = next(layer.conv for layer in trunk.layers if hasattr(layer, "conv"))
