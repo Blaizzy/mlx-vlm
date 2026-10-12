@@ -1506,6 +1506,9 @@ def load_audio(
         audio, sample_rate = read_audio(file, dtype="float32")
 
     audio = np.asarray(audio, dtype=np.float32)
+    if audio.size == 0:
+        source = file if isinstance(file, str) else "the audio data"
+        raise ValueError(f"Decoding {source} returned no samples")
     if max_seconds is not None:
         # The resampling filter spans 64 zero crossings of the lower rate per side
         # (4 ms at 16 kHz), so 1 s past the cut keeps a full decode's samples.
