@@ -2643,6 +2643,66 @@ class _CharTokenizer:
         return {"input_ids": _chars(text)}
 
 
+# torchvision 0.29.1 ``resize(uint8, BILINEAR, antialias=True)`` of
+# ``_resize_input(h, w)`` to (height, width), as hex bytes in (H, W, C) order.
+_TORCHVISION_RESIZE = {
+    ((13, 17), (5, 7)): (
+        "5e7b986b819e7b7f8a758e76949c6b9d826e70718c6e8b8e64819e7693af6e8595817486"
+        "5b4c6587607d627f7a7b897f8185a27c7f768f7c5a6668768a728f7d9a7770839b7a8a97"
+        "7f9a8281986b898b758d7e68617e7d64778a945a4985835b86a39892afad939667"
+    ),
+    ((5, 7), (8, 11)): (
+        "001d3a2c49666a87a4a8c5e288a5c223405d617e9b9e7693dc102d8e3754466380173451"
+        "49668386a3c085a2bf7895b263809d627f9c7f7693c6607d805c793f5c793855726c89a6"
+        "a0bdda5a77946683a0aecbe8607d9a567390a8c5e2708daa3653705976934d6a8745627f"
+        "718eab7b98b56986a3375471425f7ca1bedb7592af44617e7b98b553708d2b486564819e"
+        "617e9b314e6b3d5a77607d9aa0bdda7a97b4526f8c9cb9d67d9ab753708d324f6c183552"
+        "04213e7491aeafcce9a5c2df7f9cb9607d9abdda67a7c4928aa7c47996b36683a0526f8c"
+        "89a6c39fbcd98ba8c57996b36d8aa7d4f10ec4e172b1ceebb4d1eea8c5e292afcc95b2cf"
+        "8ca9c67693b07592af7794b1"
+    ),
+    ((6, 40), (9, 7)): (
+        "70728f72747481787a85817c8789808d8d8f728f7272829a82916d7c86736b77837c8b86"
+        "8f9b708f826f6f8ca08da46d7f8e725e6d8a6d878b8f9d59a873705a77937e7d89a07687"
+        "946c89636f878a707a9a6980597693717c99906b88926b8876708d90738a89737d67849c"
+        "6683a073607a8b75888a7e99877a8c82786b94b1b55f7c99604e5aaf9f8c8599ac4e5e79"
+        "97623f6f8c9a81848f665867b39d897c899e6c5e7b7f67623e5b78a48e8670667cad8f84"
+        "74728b98648160728f"
+    ),
+    ((3, 130), (3, 12)): (
+        "75707f7e7d7b8a8983798379817e79838786777b85807d7c8b85847d747e81807a8e8984"
+        "83a08469867778927799796f7889688c6b676f879d7e9b7b6683929e8d6f8d7a88918662"
+        "6b73909f6d8a78698698627f95787a8f84758b706e839f697f86767996627390816b8891"
+    ),
+    ((2, 1000), (2, 7)): (
+        "7f7f7f7f7f80807f7f7f8080807f7f7f808080808080847d827e7d7f7e7f7d7f807e8081"
+        "7f81827f837e"
+    ),
+}
+
+
+def _resize_input(height, width):
+    i, j, c = np.meshgrid(*map(np.arange, (height, width, 3)), indexing="ij")
+    return ((i * 53 + j * 97 + c * 29 + (i * j) % 7 * 31) % 256).astype(np.uint8)
+
+
+def _numpy_resize(x, height, width):
+    """The int64 numpy resize d1-omni used before its int32 MLX version."""
+    from mlx_vlm.models.d1_omni.vision import _taps
+
+    for axis, n in ((1, width), (0, height)):
+        if x.shape[axis] == n:
+            continue
+        index, weights, bits = _taps(x.shape[axis], n)
+        shape = (1, -1, 1) if axis == 1 else (-1, 1, 1)
+        acc = np.int64(1 << (bits - 1))
+        for k in range(index.shape[1]):
+            src = np.take(x, index[:, k], axis=axis).astype(np.int64)
+            acc = acc + src * weights[:, k].reshape(shape)
+        x = np.clip(acc >> bits, 0, 255).astype(np.uint8)
+    return x
+
+
 def _random_d1_omni():
     model = _extraction_model("d1_omni")
     mx.random.seed(0)
@@ -2811,6 +2871,28 @@ class TestD1OmniDecisionModel(unittest.TestCase):
             inputs["pixel_values"][0, 0, :6], [1, -1, -0.5 / 127.5] * 2, atol=1e-6
         )
         self.assertFalse(inputs["pixel_values"][0, 280:].any())
+
+    def test_image_resize_matches_torchvision(self):
+        from mlx_vlm.models.d1_omni.vision import TILE, layout, resize
+
+        for ((h, w), (height, width)), expected in _TORCHVISION_RESIZE.items():
+            with self.subTest(size=(h, w), to=(height, width)):
+                actual = resize(_resize_input(h, w), height, width)
+                self.assertEqual(actual.shape, (height, width, 3))
+                self.assertEqual(actual.tobytes().hex(), expected)
+        # The same bytes as the int64 numpy resize, at the sizes images take.
+        rng = np.random.default_rng(0)
+        for h, w in [(1, 1), (17, 9), (480, 640), (1200, 2000), (4097, 3)]:
+            x = rng.integers(0, 256, (h, w, 3), np.uint8)
+            plan = layout(w, h)
+            sizes = [plan["thumbnail"]]
+            if plan["tiled"]:
+                sizes.append((plan["grid"][1] * TILE, plan["grid"][0] * TILE))
+            for size in sizes:
+                with self.subTest(size=(h, w), to=size):
+                    np.testing.assert_array_equal(
+                        resize(x, *size), _numpy_resize(x, *size)
+                    )
 
     def test_sanitize_converts_reference_checkpoint(self):
         from mlx_vlm.models.d1_omni.audio import RENAMES
