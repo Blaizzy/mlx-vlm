@@ -575,6 +575,49 @@ def test_decision_cli_reports_unsupported_question(capsys, monkeypatch):
     assert "does not support 'score'" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("state", [None, "Is this a cat?"])
+@pytest.mark.parametrize(
+    "media, flags",
+    [
+        (
+            {"images": ["cat.jpg", "https://example.com/dog.png"]},
+            ["--image", "cat.jpg", "--image", "https://example.com/dog.png"],
+        ),
+        ({"audio": "meow.flac"}, ["--audio", "meow.flac"]),
+        (
+            {"images": ["cat.jpg"], "audio": "meow.flac"},
+            ["--image", "cat.jpg", "--audio", "meow.flac"],
+        ),
+    ],
+)
+def test_decision_cli_passes_media(monkeypatch, state, media, flags):
+    from mlx_vlm import decide
+
+    questions = {"cat": {"type": "bool"}}
+    args = ["--model", "d1", "--questions", json.dumps(questions), *flags]
+    if state is not None:
+        args += ["--state", state]
+    model, processor = object(), object()
+    predict = Mock(return_value={"answers": {}})
+    monkeypatch.setattr(decide, "load", Mock(return_value=(model, processor)))
+    monkeypatch.setattr(decide, "predict", predict)
+    decide.main(args)
+    predict.assert_called_once_with(model, processor, state, questions, **media)
+
+
+def test_decision_cli_requires_state_or_media(monkeypatch, capsys):
+    from mlx_vlm import decide
+
+    load = Mock()
+    monkeypatch.setattr(decide, "load", load)
+    with pytest.raises(SystemExit) as error:
+        decide.main(["--model", "d1", "--questions", '{"q":{"type":"bool"}}'])
+    assert error.value.code == 2
+    message = "--state --state-file --image --audio is required"
+    assert message in capsys.readouterr().err
+    load.assert_not_called()
+
+
 def test_decide_registered_as_package_subcommand():
     result = subprocess.run(
         [sys.executable, "-m", "mlx_vlm", "decide", "--help"],

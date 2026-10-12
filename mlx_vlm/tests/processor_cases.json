@@ -109,6 +109,7 @@
     "ernie4_5_moe_vl": {"class": "Ernie4_5_VLProcessor"}
   },
   "routes": [
+    ["embedding_gemma2", "embedding_gemma2.processing_embedding_gemma2", "EmbeddingGemma2Processor"],
     ["internvl_chat", "internvl_chat", "InternVLChatProcessor"],
     ["molmo", "molmo.processing_molmo", "MolmoProcessor"],
     ["kimi_vl", "kimi_vl.processing_kimi_vl", "KimiVLProcessor"],

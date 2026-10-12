@@ -101,6 +101,7 @@ class Experts(nn.Module):
         super().__init__()
 
         self.hidden_dims = config.moe_intermediate_size
+        self.activation = GeGLU()
         self.gate_up_proj = SwitchLinear(
             input_dims=config.hidden_size,
             output_dims=2 * config.moe_intermediate_size,
@@ -114,7 +115,7 @@ class Experts(nn.Module):
             bias=False,
         )
 
-    def __call__(self, x, top_k_indices, top_k_weights):
+    def __call__(self, x, top_k_indices):
         x = mx.expand_dims(x, (-2, -3))
         do_sort = top_k_indices.size >= 64
         indices = top_k_indices
@@ -127,13 +128,12 @@ class Experts(nn.Module):
         gate_up = self.gate_up_proj(x, indices, sorted_indices=do_sort)
         gate = gate_up[..., : self.hidden_dims]
         up = gate_up[..., self.hidden_dims :]
-        y = self.down_proj(geglu(gate, up), indices, sorted_indices=do_sort)
+        y = self.down_proj(self.activation(up, gate), indices, sorted_indices=do_sort)
 
         if do_sort:
             y = _scatter_unsort(y, inv_order, top_k_indices.shape)
 
-        y = y.squeeze(-2)
-        return (y * top_k_weights[..., None]).sum(axis=-2)
+        return y.squeeze(-2)
 
 
 class Attention(nn.Module):
@@ -311,7 +311,8 @@ class DecoderLayer(nn.Module):
         flat = residual.reshape(-1, residual.shape[-1])
         top_k_indices, top_k_weights = self.router(flat)
         h2 = self.pre_feedforward_layernorm_2(flat)
-        h2 = self.experts(h2, top_k_indices, top_k_weights)
+        h2 = self.experts(h2, top_k_indices)
+        h2 = (h2 * top_k_weights[..., None]).sum(axis=-2)
         h2 = h2.reshape(residual.shape)
         h2 = self.post_feedforward_layernorm_2(h2)
 
