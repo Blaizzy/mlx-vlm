@@ -333,6 +333,10 @@ def get_mtp_splitter(
 ) -> Optional[MTPSplitter]:
     """Resolve a bundled family from its text/root config or an explicit type."""
     source_config = source_config or {}
+    # Checkpoint-local model code takes precedence over built-in architectures.
+    if source_config.get("model_file"):
+        return None
+    root_model_type = get_model_type(source_config)
     text_config = source_config.get("text_config") or source_config
     # Keep root architecture metadata when resolving an inner backbone type.
     # A standalone drafter can declare the same backbone as a bundled MTP model.
@@ -347,7 +351,7 @@ def get_mtp_splitter(
                     or source_config.get("model_type"),
                 }
             ),
-            get_model_type(source_config),
+            root_model_type,
         )
     )
     for model_type in model_types:
@@ -358,7 +362,7 @@ def get_mtp_splitter(
         cls = getattr(importlib.import_module(module_path), class_name)
         splitter = cls.from_config(source_config)
         # Extracted drafters retain the base text_config but need no splitting.
-        if source_config.get("model_type") == splitter.output_model_type:
+        if root_model_type == splitter.output_model_type:
             return None
         return splitter
     return None

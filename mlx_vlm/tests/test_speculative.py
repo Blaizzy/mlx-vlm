@@ -664,6 +664,40 @@ def test_standalone_drafter_with_mtp_backbone(tmp_path, family, nested):
     equal(dict(tree_flatten(draft.parameters())), expected)
 
 
+def test_custom_drafter_with_mtp_backbone(tmp_path):
+    from mlx_vlm.speculative.drafters.mtp_split import get_mtp_splitter
+
+    config = values(
+        model_type="qwen3_5",
+        model_file="model.py",
+        head_dim=8,
+        mask_token_id=31,
+        target_layer_ids=[0],
+        block_size=3,
+    )
+    arch = module("speculative.drafters.qwen3_dflash")
+    reference = arch.Model(arch.ModelConfig.from_dict(config))
+    expected = dict(tree_flatten(reference.parameters()))
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    model_file = tmp_path / "model.py"
+    model_file.write_text(
+        "from mlx_vlm.speculative.drafters.qwen3_dflash import Model, ModelConfig\n"
+    )
+    mx.save_safetensors(
+        str(tmp_path / "model.safetensors"), expected, metadata={"format": "mlx"}
+    )
+
+    draft, kind = load_drafter(str(tmp_path))
+    assert isinstance(draft, arch.Model)
+    assert kind == resolve_drafter_kind(tmp_path) == "dflash"
+    assert get_mtp_splitter(source_config=config) is None
+    equal(dict(tree_flatten(draft.parameters())), expected)
+
+    model_file.unlink()
+    with pytest.raises(FileNotFoundError, match="model_file"):
+        load_drafter(str(tmp_path))
+
+
 def split_checkpoint(
     path, config, weights, *, separate=False, indexed=False, **options
 ):
@@ -874,9 +908,14 @@ def test_load_bundled_qwen_mtp_rejects_missing_weights(tmp_path, missing):
         load_drafter(str(tmp_path), kind="mtp")
 
 
-def test_bundled_qwen_mtp_kind_and_standalone_loading(tmp_path):
+@parametrize("type_key", ["model_type", "speculators_model_type"])
+@parametrize("model_type", ["qwen3_5_mtp", "QWEN3_5_MTP"])
+def test_bundled_qwen_mtp_kind_and_standalone_loading(tmp_path, type_key, model_type):
+    from mlx_vlm.speculative.drafters.mtp_split import get_mtp_splitter
+
     arch = module("speculative.drafters.qwen3_5_mtp")
     text = tiny_config("qwen").to_dict()
+    text["model_type"] = "qwen3_5"
     config = dict(model_type="qwen3_5", text_config=text)
     reference = arch.Model(arch.ModelConfig.from_dict(config))
     weights = {
@@ -885,11 +924,18 @@ def test_bundled_qwen_mtp_kind_and_standalone_loading(tmp_path):
     }
     _, _, output = split_checkpoint(tmp_path, config, weights)
     assert resolve_drafter_kind(tmp_path, "dflash") == "mtp"
+    standalone_config_path = output / "config.json"
+    standalone_config = json.loads(standalone_config_path.read_text())
+    standalone_config.pop("model_type")
+    standalone_config[type_key] = model_type
+    standalone_config_path.write_text(json.dumps(standalone_config))
+
     standalone, kind = load_drafter(str(output))
-    assert kind == "mtp"
+    assert isinstance(standalone, arch.Model)
+    assert kind == resolve_drafter_kind(output) == "mtp"
+    assert get_mtp_splitter(source_config=standalone_config) is None
     expected = dict(tree_flatten(reference.parameters()))
-    for key, value in tree_flatten(standalone.parameters()):
-        equal(value, expected[key])
+    equal(dict(tree_flatten(standalone.parameters())), expected)
 
 
 @parametrize(
