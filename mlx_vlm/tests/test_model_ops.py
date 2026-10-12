@@ -1129,6 +1129,36 @@ def test_quantize_module(
         assert config["quantization"] == defaults
 
 
+def test_mixed_recipe_finds_lfm2_down_projection():
+    from mlx_vlm.convert import mixed_quant_predicate_builder
+
+    def block():
+        b = nn.Module()
+        b.self_attn = nn.Module()
+        b.self_attn.v_proj = nn.Linear(64, 64)
+        b.feed_forward = nn.Module()
+        b.feed_forward.w1 = nn.Linear(64, 64)
+        b.feed_forward.w2 = nn.Linear(64, 64)
+        return b
+
+    model = nn.Module()
+    model.layers = [block() for _ in range(8)]
+    predicate = mixed_quant_predicate_builder("mixed_4_6", model)
+    modules = dict(model.named_modules())
+    bits = {
+        path: predicate(path, modules[path])["bits"]
+        for path in modules
+        if isinstance(modules[path], nn.Linear)
+    }
+    # Q4_K_M layout: v_proj and the down projection get more bits in these layers.
+    more = {0, 3, 6, 7}
+    for i in range(8):
+        high = 6 if i in more else 4
+        assert bits[f"layers.{i}.feed_forward.w2"] == high
+        assert bits[f"layers.{i}.self_attn.v_proj"] == high
+        assert bits[f"layers.{i}.feed_forward.w1"] == 4
+
+
 def test_convert_preserves_existing_deepseek_v4_quantization():
     config = {
         "model_type": "deepseek_v4",
