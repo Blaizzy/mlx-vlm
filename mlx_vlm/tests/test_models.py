@@ -2403,3 +2403,192 @@ class TestPhiMoE:
         )
 
         assert isinstance(Attention(config).rope, nn.RoPE)
+
+
+class TestMiniCPMV47:
+    @staticmethod
+    def config():
+        from mlx_vlm.models.minicpmv4_7 import ModelConfig
+
+        return ModelConfig.from_dict(
+            {
+                "model_type": "minicpmv4_7",
+                "text_config": {
+                    "model_type": "qwen3_5_text",
+                    "hidden_size": 16,
+                    "intermediate_size": 32,
+                    "num_hidden_layers": 2,
+                    "full_attention_interval": 2,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 2,
+                    "head_dim": 8,
+                    "linear_num_value_heads": 2,
+                    "linear_num_key_heads": 2,
+                    "linear_key_head_dim": 32,
+                    "linear_value_head_dim": 8,
+                    "linear_conv_kernel_dim": 3,
+                    "rms_norm_eps": 1e-5,
+                    "vocab_size": 64,
+                    "rope_parameters": {
+                        "rope_type": "default",
+                        "mrope_section": [1, 0, 0],
+                        "partial_rotary_factor": 0.25,
+                    },
+                },
+                "vision_config": {
+                    "model_type": "minicpmv4_7_vision",
+                    "hidden_size": 16,
+                    "intermediate_size": 32,
+                    "num_hidden_layers": 2,
+                    "num_attention_heads": 2,
+                    "image_size": 8,
+                    "patch_size": 2,
+                },
+                "patch_size": 2,
+                "insert_layer_id": 0,
+                "image_token_id": 48,
+                "video_token_id": 49,
+                "image_start_id": 50,
+                "image_end_id": 51,
+                "slice_start_id": 52,
+                "slice_end_id": 53,
+                "newline_id": 54,
+            }
+        )
+
+    def test_text_cache_and_new_request(self):
+        from mlx_vlm.models.minicpmv4_7 import Model
+
+        model = Model(self.config())
+        ids = mx.array([[1, 2, 3, 4]])
+        expected = model(ids).logits
+        cache = model.language_model.make_cache()
+        model(ids[:, :3], cache=cache)
+        actual = model(ids[:, 3:], cache=cache).logits
+        assert mx.allclose(actual, expected[:, 3:], atol=1e-5)
+        assert model(mx.array([[5, 6]])).logits.shape == (1, 2, 64)
+
+    @pytest.mark.parametrize("mode,count", [("16x", 4), ("4x", 16)])
+    def test_vision_and_chunked_prefill(self, mode, count):
+        from mlx_vlm.models.minicpmv4_7 import Model
+
+        model = Model(self.config())
+        ids = mx.array([[1, 50] + [48] * count + [51, 2]])
+        features = model.get_input_embeddings(
+            ids,
+            [[mx.random.normal((3, 2, 128))]],
+            tgt_sizes=[np.array([[8, 8]])],
+            downsample_mode=mode,
+        )
+        assert features.inputs_embeds.shape == (*ids.shape, 16)
+        assert features.position_ids.shape == (3, 1, ids.shape[-1])
+        assert features.rope_deltas.item() < 0
+        full = model.language_model(ids, **features.to_dict()).logits
+        cache = model.language_model.make_cache()
+        parts = []
+        for start in range(0, ids.shape[-1], 3):
+            stop = start + 3
+            parts.append(
+                model.language_model(
+                    ids[:, start:stop],
+                    inputs_embeds=features.inputs_embeds[:, start:stop],
+                    position_ids=features.position_ids[:, :, start:stop],
+                    rope_deltas=features.rope_deltas,
+                    cache=cache,
+                ).logits
+            )
+        assert mx.allclose(mx.concatenate(parts, axis=1), full, atol=2e-5)
+        next_logits = model(mx.array([[3]]), cache=cache).logits
+        extended = mx.concatenate([ids, mx.array([[3]])], axis=1)
+        positions = mx.concatenate(
+            [
+                features.position_ids,
+                mx.full((3, 1, 1), int(features.position_ids.max()) + 1),
+            ],
+            axis=-1,
+        )
+        embeds = mx.concatenate(
+            [
+                features.inputs_embeds,
+                model.language_model.model.embed_tokens(mx.array([[3]])),
+            ],
+            axis=1,
+        )
+        expected = model.language_model(
+            extended, inputs_embeds=embeds, position_ids=positions
+        ).logits[:, -1:]
+        assert mx.allclose(next_logits, expected, atol=2e-5)
+
+    def test_canvas_and_padding(self):
+        from mlx_vlm.models.minicpmv4_7.rope import CanvasRoPE
+
+        rope = CanvasRoPE(self.config())
+        ids = np.array([[0, 0, 1, 50, 48, 48, 48, 48, 51, 2]])
+        positions, deltas = rope.get_rope_index(
+            ids,
+            (ids == 48).astype(np.int32),
+            np.array([[8, 8]]),
+            attention_mask=ids != 0,
+        )
+        expected = [
+            [0, 0, 0, 1, 1, 1, 1, 1, 1, 4],
+            [0, 0, 0, 0, 1, 1, 2, 2, 3, 4],
+            [0, 0, 0, 0, 1, 2, 1, 2, 3, 4],
+        ]
+        np.testing.assert_array_equal(positions[:, 0], expected)
+        assert deltas.item() == -3
+
+    def test_grid_validation(self):
+        from mlx_vlm.models.minicpmv4_7 import Model
+
+        model = Model(self.config())
+        ids = mx.array([[50, 48, 51]])
+        with pytest.raises(ValueError, match="crop grids"):
+            model.get_input_embeddings(ids)
+        with pytest.raises(ValueError, match="token count"):
+            model.get_input_embeddings(ids, tgt_sizes=[[[8, 8]]])
+        with pytest.raises(ValueError, match="crop grids"):
+            model.language_model.get_rope_index(ids)
+
+    def test_slices_share_the_thumbnail_canvas(self):
+        from mlx_vlm.models.minicpmv4_7.rope import CanvasRoPE
+
+        ids = np.array([[1, 50, 48, 51, 52, 48, 53, 52, 48, 53, 2]])
+        positions, _ = CanvasRoPE(self.config()).get_rope_index(
+            ids, (ids == 48).astype(np.int32), np.array([[4, 4]] * 3)
+        )
+        expected = [
+            [0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 4],
+            [0, 0, 1, 2, 1, 1, 1, 1, 1, 1, 4],
+            [0, 0, 1, 3, 1, 1, 1, 2, 2, 2, 4],
+        ]
+        np.testing.assert_array_equal(positions[:, 0], expected)
+
+    def test_sanitize_is_idempotent(self):
+        from mlx_vlm.models.minicpmv4_7 import Model
+
+        model = Model(self.config())
+        weights = {
+            "model.language_model.layers.0.input_layernorm.weight": mx.zeros((16,)),
+            "model.language_model.layers.0.linear_attn.conv1d.weight": mx.ones(
+                (80, 1, 3)
+            ),
+            "model.vision_tower.embeddings.patch_embedding.weight": mx.zeros(
+                (16, 3, 2, 2)
+            ),
+        }
+        first = model.sanitize(weights)
+        second = model.sanitize(first)
+        assert first.keys() == second.keys()
+        for key in first:
+            assert mx.array_equal(first[key], second[key])
+        assert mx.array_equal(
+            first["language_model.model.layers.0.input_layernorm.weight"],
+            mx.ones((16,)),
+        )
+        assert first["vision_tower.embeddings.patch_embedding.weight"].shape == (
+            16,
+            2,
+            2,
+            3,
+        )
