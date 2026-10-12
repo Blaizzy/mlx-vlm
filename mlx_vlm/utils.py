@@ -192,28 +192,11 @@ def _language_model_quantization_config(model):
     return getattr(module, "make_quantization_config", None)
 
 
-def get_model_and_args(config: dict, model_path: Optional[Path] = None):
-    """Resolve a model package and its normalized model type.
-
-    If the config declares ``model_file`` and ``model_path`` is provided, the
-    model module is imported from that file inside the checkpoint (the same
-    mechanism mlx_lm supports) instead of the built-in registry.
-    """
-    if model_path is not None and (model_file := config.get("model_file")):
-        model_file_path = Path(model_path) / model_file
-        if not model_file_path.is_file():
-            raise FileNotFoundError(
-                f"config.json declares model_file={model_file!r} but "
-                f"{model_file_path} does not exist"
-            )
-        spec = importlib.util.spec_from_file_location("custom_model", model_file_path)
-        arch = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(arch)
-        return arch, "custom"
-
+def get_model_type(config: dict) -> Optional[str]:
+    """Normalize the architecture declared by a checkpoint without importing it."""
     raw_model_type = config.get("model_type") or config.get("speculators_model_type")
     if raw_model_type is None:
-        raise KeyError("model_type")
+        return None
     model_type = raw_model_type.lower()
 
     model_type = MODEL_REMAPPING.get(model_type, model_type)
@@ -240,6 +223,32 @@ def get_model_and_args(config: dict, model_path: Optional[Path] = None):
             > 0
         )
         model_type = "dspark" if is_dspark else f"{model_type}_dflash"
+
+    return model_type
+
+
+def get_model_and_args(config: dict, model_path: Optional[Path] = None):
+    """Resolve a model package and its normalized model type.
+
+    If the config declares ``model_file`` and ``model_path`` is provided, the
+    model module is imported from that file inside the checkpoint (the same
+    mechanism mlx_lm supports) instead of the built-in registry.
+    """
+    if model_path is not None and (model_file := config.get("model_file")):
+        model_file_path = Path(model_path) / model_file
+        if not model_file_path.is_file():
+            raise FileNotFoundError(
+                f"config.json declares model_file={model_file!r} but "
+                f"{model_file_path} does not exist"
+            )
+        spec = importlib.util.spec_from_file_location("custom_model", model_file_path)
+        arch = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(arch)
+        return arch, "custom"
+
+    model_type = get_model_type(config)
+    if model_type is None:
+        raise KeyError("model_type")
 
     last_err: Optional[ImportError] = None
     for pkg in ("mlx_vlm.models", "mlx_vlm.speculative.drafters"):
@@ -374,15 +383,6 @@ def load_model(
         FileNotFoundError: If the weight files (.safetensors) are not found.
         ValueError: If the model class or args class are not found or cannot be instantiated.
     """
-    strict = kwargs.pop("strict", True)
-    # An expert-offload dir (mlx_vlm.moe_offload) is missing routed-expert
-    # keys by design; defer eval until patch_model swaps those modules, or
-    # their random-init resident weights get eagerly materialized -- the OOM
-    # this feature exists to avoid.
-    is_offload_dir = (model_path / "offload_index.json").exists()
-    if is_offload_dir:
-        strict = False
-        requested_lazy, lazy = lazy, True
     config = load_config(model_path, **kwargs)
 
     index_file = model_path / "model.safetensors.index.json"
@@ -566,6 +566,37 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             )
         )
 
+    return load_model_weights(
+        model,
+        config,
+        weights,
+        model_path,
+        lazy=lazy,
+        declared_keys=declared_keys,
+        is_offload_dir=(model_path / "offload_index.json").exists(),
+        **kwargs,
+    )
+
+
+def load_model_weights(
+    model: nn.Module,
+    config: dict,
+    weights: dict,
+    model_path: Path,
+    *,
+    lazy: bool = False,
+    strict: bool = True,
+    declared_keys: Optional[set] = None,
+    is_offload_dir: bool = False,
+    **kwargs,
+) -> nn.Module:
+    """Install prepared weights, applying module quantization but no sanitization.
+
+    Pass declared_keys for full checkpoints that may omit multimodal modules.
+    Prepared drafters retain every module so strict loading detects missing weights.
+    """
+    if is_offload_dir:
+        strict = False
     if (quantization := config.get("quantization", None)) is not None:
         # Handle legacy models which may or may not have vision quantized.
         # text-only quants of unified VLM families set vision_config to null,
@@ -652,7 +683,8 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 "repack() output?): " + ", ".join(sorted(unexpected_missing)[:10])
             )
 
-    _drop_modules_without_weights(model, weights, declared_keys)
+    if declared_keys is not None:
+        _drop_modules_without_weights(model, weights, declared_keys)
 
     model.load_weights(list(weights.items()), strict=strict)
 
@@ -665,7 +697,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             expert_cache_gb=kwargs.get("expert_cache_gb"),
             max_kv_size=kwargs.get("max_kv_size"),
         )
-        lazy = requested_lazy
 
     if not lazy:
         mx.eval(model.parameters())
