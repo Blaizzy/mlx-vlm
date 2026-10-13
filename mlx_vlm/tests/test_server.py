@@ -2406,17 +2406,122 @@ class TestCompaction:
         )
         mocked.generate.assert_not_called()
 
-    def test_pending_parallel_tools_cannot_be_split(self):
+    @pytest.fixture(params=["chat", "function", "shell", "apply_patch", "tool_result"])
+    def tool_group(self, request):
+        def make(ids, output="recent evidence"):
+            if request.param == "chat":
+                calls = [
+                    dict(
+                        type="message",
+                        role="assistant",
+                        content="",
+                        tool_calls=[
+                            dict(
+                                id=id,
+                                type="function",
+                                function=dict(name="inspect", arguments="{}"),
+                            )
+                            for id in ids
+                        ],
+                    )
+                ]
+                results = [
+                    dict(type="message", role="tool", tool_call_id=id, content=output)
+                    for id in ids
+                ]
+            else:
+                kind = "function" if request.param == "tool_result" else request.param
+                calls = [
+                    dict(
+                        type=f"{kind}_call", call_id=id, name="inspect", arguments="{}"
+                    )
+                    for id in ids
+                ]
+                results = [
+                    dict(
+                        type=(
+                            "tool_result"
+                            if request.param == "tool_result"
+                            else f"{kind}_call_output"
+                        ),
+                        call_id=id,
+                        output=output,
+                    )
+                    for id in ids
+                ]
+            return calls, results
+
+        return make
+
+    def test_pending_parallel_tools_cannot_be_split(self, tool_group):
+        calls, results = tool_group(["a", "b"])
         items = [
             _compaction_message("start"),
-            {"type": "function_call", "call_id": "a"},
-            {"type": "function_call", "call_id": "b"},
-            {"type": "function_call_output", "call_id": "a"},
+            *calls,
+            results[0],
             _compaction_message("steering during tools"),
-            {"type": "function_call_output", "call_id": "b"},
+            results[1],
             _compaction_message("next"),
         ]
-        assert compaction.safe_boundaries(items) == [0, 6]
+        for keep_last_group in (False, True):
+            assert compaction.safe_boundaries(
+                items, keep_last_group=keep_last_group
+            ) == [0, len(items) - 1]
+
+    @pytest.mark.parametrize("pending", [False, True])
+    @pytest.mark.parametrize("retain_tokens", [0, 500])
+    def test_single_turn_tool_compaction_preserves_protected_context(
+        self, tool_group, pending, retain_tokens
+    ):
+        instruction = _compaction_message("Keep the constraints.", "system")
+        request = _compaction_message("Inspect the project; never edit secrets.env.")
+        calls, results = tool_group(["old"], "old evidence " * 1000)
+        head = [instruction, request, *calls, *results]
+        calls, results = tool_group(["recent"])
+        tail = [
+            *calls,
+            *results,
+            _compaction_message("Checking the evidence.", "assistant"),
+        ]
+        if pending:
+            calls, results = tool_group(["a", "b"])
+            tail += [*calls, results[0]]
+        items = head + tail
+        original = copy.deepcopy(items)
+        summarize = AsyncMock(return_value=("Earlier evidence reviewed.", None))
+
+        async def count(items):
+            return len(json.dumps(items))
+
+        compact = partial(
+            compaction.compact,
+            count=count,
+            summarize=summarize,
+            keep_tokens=0,
+            retain_tokens=retain_tokens,
+        )
+        with pytest.raises(
+            compaction.ContextBudgetError, match="no room for a summary"
+        ):
+            asyncio.run(
+                compact(
+                    items,
+                    target_tokens=asyncio.run(count([instruction, request] + tail)),
+                )
+            )
+        summarize.assert_not_called()
+        result = asyncio.run(compact(items, target_tokens=3000))
+        summarize.assert_awaited_once_with(head)
+        assert result.changed and result.after_tokens < 3000
+        assert result.items[:2] == [instruction, request]
+        assert result.items[3:] == tail
+        assert result.items.count(request) == 1 and items == original
+        capsule = _seal_context(result.items, covered=result.covered)
+        assert _resolve_context([request, capsule]) == result.items
+        summarize.reset_mock()
+        unchanged = asyncio.run(compact(result.items, target_tokens=3000))
+        assert not unchanged.changed
+        summarize.assert_not_called()
 
     @pytest.mark.parametrize("api", ["standalone", "trigger", "automatic"])
     @pytest.mark.parametrize("limit", [4096, 16384])
@@ -2596,19 +2701,27 @@ class TestCompaction:
         assert len(answer_call.kwargs["prompt"]) // 4 + 256 <= before + 32
         assert "Conversation handoff" in answer_call.kwargs["prompt"]
 
+    @pytest.mark.parametrize("single_turn", [False, True])
     @pytest.mark.parametrize("stream", [False, True])
     @pytest.mark.parametrize("mode", ["automatic", "trigger", "chat"])
     def test_oversized_history_uses_bounded_summary_calls(
-        self, mocked, client, monkeypatch, mode, stream
+        self, mocked, client, monkeypatch, mode, stream, single_turn
     ):
         monkeypatch.setattr(server.runtime.config, "max_kv_size", 2048)
         items = [_compaction_message("Keep the constraints.", "system")]
+        if single_turn:
+            items.append(_compaction_message("Inspect all six batches."))
         for index in range(6):
-            items += [
-                _compaction_message(f"batch-{index} " + "evidence " * 200),
-                *_function_result("done", name="read_file", call_id=f"c{index}"),
-            ]
-        items.append(_compaction_message("Continue"))
+            evidence = f"batch-{index} " + "evidence " * 200
+            if not single_turn:
+                items.append(_compaction_message(evidence))
+            items += _function_result(
+                evidence if single_turn else "done",
+                name="read_file",
+                call_id=f"c{index}",
+            )
+        if not single_turn:
+            items.append(_compaction_message("Continue"))
         original = copy.deepcopy(items)
         options = dict(stream=stream)
         api = "responses"
@@ -2617,8 +2730,7 @@ class TestCompaction:
         elif mode == "chat":
             api = "chat"
             options.update(
-                messages=[_compaction_message("old evidence " * 180) for _ in range(10)]
-                + [items[-1]],
+                messages=_response_items_to_chat(items)[0],
                 max_tokens=64,
             )
         else:

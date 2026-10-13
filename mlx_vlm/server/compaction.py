@@ -309,14 +309,15 @@ def validate_items(items: list[dict]) -> None:
             raise HTTPException(400, "Unsupported message content for compaction.")
 
 
-def safe_boundaries(items: list[dict]) -> list[int]:
-    """User boundaries with no outstanding tool calls, including parallel calls."""
+def safe_boundaries(items: list[dict], *, keep_last_group: bool = False) -> list[int]:
+    """Split at user turns or completed tool groups, never inside parallel calls."""
     pending: set[str] = set()
-    boundaries = []
+    user_boundaries = set()
+    tool_boundaries = []
     for index, item in enumerate(items):
         kind = item.get("type")
         if item.get("role") == "user" and not pending:
-            boundaries.append(index)
+            user_boundaries.add(index)
         if kind in ("function_call", "shell_call", "apply_patch_call"):
             pending.add(item.get("call_id") or item.get("id") or "missing-call-id")
         for call in item.get("tool_calls") or []:
@@ -331,8 +332,14 @@ def safe_boundaries(items: list[dict]) -> list[int]:
             )
             or item.get("role") == "tool"
         ):
-            pending.discard(item.get("call_id") or item.get("tool_call_id"))
-    return boundaries
+            call_id = item.get("call_id") or item.get("tool_call_id")
+            if call_id in pending:
+                pending.remove(call_id)
+                if not pending:
+                    tool_boundaries.append(index + 1)
+    if keep_last_group:
+        tool_boundaries = tool_boundaries[:-1]
+    return sorted(user_boundaries | {x for x in tool_boundaries if x < len(items)})
 
 
 @dataclass
@@ -355,7 +362,7 @@ async def compact(
     retain_tokens: int = 0,
     covered: frozenset[str] = frozenset(),
 ) -> CompactedContext:
-    """Summarize once, preserving instructions and the latest user exchange."""
+    """Preserve instructions, the latest user request, and recent tool evidence."""
     before = await count(items)
     covered = covered | frozenset(
         key
@@ -366,18 +373,40 @@ async def compact(
     unchanged = CompactedContext(items, before, before, covered=covered)
     instructions = [x for x in items if _is_instruction(x)]
     conversation = [x for x in items if not _is_instruction(x)]
-    boundaries = safe_boundaries(conversation)
+    boundaries = safe_boundaries(conversation, keep_last_group=True)
     if not boundaries:
         return unchanged
+    latest_user = next(
+        (
+            i
+            for i in reversed(range(len(conversation)))
+            if conversation[i].get("role") == "user"
+        ),
+        None,
+    )
+
+    def protected_user(boundary):
+        return (
+            [conversation[latest_user]]
+            if latest_user is not None and latest_user < boundary
+            else []
+        )
+
     cut = boundaries[-1]
     for boundary in reversed(boundaries[:-1]):
-        if await count(instructions + conversation[boundary:]) > keep_tokens:
+        if (
+            await count(
+                instructions + protected_user(boundary) + conversation[boundary:]
+            )
+            > keep_tokens
+        ):
             break
         cut = boundary
     if cut == 0:
         return unchanged
     # Apply the reduction target only to removable history.
-    retained = await count(instructions + conversation[cut:])
+    protected = protected_user(cut)
+    retained = await count(instructions + protected + conversation[cut:])
     if retained >= target_tokens:
         raise ContextBudgetError(
             "Protected conversation leaves no room for a summary; original context preserved."
@@ -393,7 +422,7 @@ async def compact(
         raise HTTPException(
             502, "Compaction produced an empty summary; original context preserved."
         )
-    result = instructions + [_handoff(summary)] + conversation[cut:]
+    result = instructions + protected + [_handoff(summary)] + conversation[cut:]
     after = await count(result)
     base_tokens = after
     selected = []
@@ -403,6 +432,7 @@ async def compact(
             or message.get("type") != "message"
             or message.get("role") != "user"
             or message.get("tool_calls")
+            or any(message is item for item in protected)
         ):
             continue
         candidate = instructions + [message] + selected + result[len(instructions) :]
