@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import tempfile
 import uuid
 from collections import Counter
@@ -30,6 +31,7 @@ from .request_normalization import (
     _normalize_instruction_messages,
 )
 from .responses_state import (
+    ThinkingStreamState,
     _response_items_to_chat,
     _response_output_items_from_text,
     _response_tool_registry,
@@ -344,6 +346,7 @@ class CompactedContext:
     changed: bool = False
     covered: frozenset[str] = frozenset()
     max_output_tokens: int | None = None
+    continuation: str = ""
 
 
 async def compact(
@@ -445,6 +448,62 @@ def _context_limit(config, *, required=True):
     return min(limits)
 
 
+def automatic_threshold(request, limit):
+    """Default to 75% of actual context; explicit thresholds take precedence."""
+    controls = request.context_management
+    threshold = controls[0].compact_threshold if controls else None
+    return min(limit - 1, threshold or max(1, limit * 3 // 4))
+
+
+def continuation_tail(text, processor, args, tool_start=None, tool_end=None):
+    """Keep recent text and protocol delimiters; never split an open tool call."""
+    tokenizer = getattr(processor, "tokenizer", processor)
+    markers = getattr(tokenizer, "all_special_tokens", [])
+    markers = list(markers) if isinstance(markers, (list, tuple)) else []
+    markers += [
+        marker
+        for pair in ThinkingStreamState._DEFAULT_OPEN_CLOSE_MARKERS
+        for marker in pair
+    ]
+    markers += [
+        args.thinking_start_token,
+        args.thinking_end_token,
+        tool_start,
+        tool_end,
+    ]
+    markers = sorted(
+        {x for x in markers if isinstance(x, str) and x}, key=len, reverse=True
+    )
+    # A character suffix avoids re-decoding a token slice into broken Unicode.
+    cut = max(0, len(text) - 512)
+    if tool_start:
+        start = text.rfind(tool_start)
+        end = text.rfind(tool_end or "\n")
+        if start >= 0 and end < start:
+            cut = min(cut, start)
+    if markers:
+        patterns = [re.escape(x) for x in markers]
+        template = getattr(tokenizer, "response_template", None)
+        if isinstance(template, dict):
+            # Some templates encode the channel in ordinary header text, such
+            # as `to=self<|message|>`. Keep the entire header when trimming.
+            patterns = [
+                field["open_pattern"]
+                for field in template.get("fields", {}).values()
+                if isinstance(field, dict)
+                and isinstance(field.get("open_pattern"), str)
+            ] + patterns
+        pattern = re.compile("|".join(f"(?:{x})" for x in patterns))
+        matches = list(pattern.finditer(text))
+        for match in matches:
+            if match.start() < cut < match.end():
+                cut = match.start()
+        prefix = "".join(match.group() for match in matches if match.end() <= cut)
+    else:
+        prefix = ""
+    return prefix + text[cut:]
+
+
 async def compact_response_context(
     request,
     items,
@@ -460,6 +519,8 @@ async def compact_response_context(
     allow_oversized=False,
     covered=frozenset(),
     on_start: Callable[[int], None] | None = None,
+    continuation: str = "",
+    retained_continuation: str = "",
 ):
     """Use the ordinary rendering and inference paths, including their APC pool."""
     validate_items(items)
@@ -516,7 +577,8 @@ async def compact_response_context(
         return _count_prompt_tokens(raw)
 
     async def count(context):
-        return await count_prompt(*render(context))
+        prompt, images = render(context)
+        return await count_prompt(prompt + continuation, images)
 
     before = await count(items)
     if before > limit and not (automatic or allow_oversized):
@@ -535,11 +597,9 @@ async def compact_response_context(
         )
     if (
         automatic
+        and not continuation
         and before <= available
-        and (
-            not request.context_management
-            or before < request.context_management[0].compact_threshold
-        )
+        and (before < automatic_threshold(request, limit))
     ):
         return CompactedContext(
             items,
@@ -547,6 +607,7 @@ async def compact_response_context(
             before,
             covered=covered,
             max_output_tokens=min(args.max_tokens, limit - before),
+            continuation=continuation,
         )
     summary_request = request.model_copy(
         update={
@@ -682,15 +743,56 @@ async def compact_response_context(
     keep = request.keep_tokens if isinstance(request, CompactRequest) else None
     if keep is None:
         keep = min(8192, max(256, min(available, int(before * 0.6)) // 2))
-    result = await compact(
-        items,
-        count=count,
-        summarize=summarize_history,
-        keep_tokens=keep,
-        target_tokens=target,
-        retain_tokens=min(8192, limit // 16),
-        covered=covered,
-    )
+    if continuation:
+        # Free enough space to resume below the threshold, not just below the
+        # physical context limit. The partial assistant message stays open.
+        target = automatic_threshold(request, limit) - 1
+    if not continuation:
+        result = await compact(
+            items,
+            count=count,
+            summarize=summarize_history,
+            keep_tokens=keep,
+            target_tokens=target,
+            retain_tokens=min(8192, limit // 16),
+            covered=covered,
+        )
+    else:
+        # A long answer can fill a window on its own. Summarize its earlier
+        # output as well, while keeping the latest user exchange and an exact
+        # continuation suffix (including any unfinished tool arguments).
+        conversation = [x for x in items if not _is_instruction(x)]
+        boundaries = safe_boundaries(conversation)
+        cut = boundaries[-1] if boundaries else 0
+        protected = [x for x in items if _is_instruction(x)] + conversation[cut:]
+        partial = {
+            "type": "message",
+            "role": "assistant",
+            "content": "Response already emitted (continue it without repeating):\n"
+            + continuation,
+        }
+        summary, usage = await summarize_history(items + [partial])
+        continuation = retained_continuation
+        instructions = [x for x in protected if _is_instruction(x)]
+        candidate = (
+            instructions
+            + [_handoff(summary)]
+            + [x for x in protected if not _is_instruction(x)]
+        )
+        after = await count(candidate)
+        if after >= before or after > target:
+            raise ContextBudgetError(
+                "Compaction cannot free space below the threshold while preserving "
+                "the current message and unfinished tool call."
+            )
+        covered = covered | frozenset(
+            key
+            for item in items
+            if item.get("role") == "user"
+            for key in _message_fingerprints(item)
+        )
+        result = CompactedContext(candidate, before, after, usage, True, covered)
+    result.continuation = continuation
     if result.after_tokens > available:
         raise ContextBudgetError(
             "Protected conversation exceeds the available context budget."

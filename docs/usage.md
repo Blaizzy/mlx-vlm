@@ -101,57 +101,52 @@ For automatic compaction, add this field to a Responses request:
 {"context_management": [{"type": "compaction", "compact_threshold": 24000}]}
 ```
 
-The server checks the rendered input token count **before generation**, including
-for streaming requests. This implementation does not compact mid-generation.
-Only actual input usage triggers compaction; unused `max_output_tokens` (or
-Chat Completions `max_tokens`) does not reserve context or lower the threshold.
-After compaction, generation is capped at the smaller of the requested output
-limit and the remaining context capacity. A short prompt can therefore use a
-Max output setting equal to or larger than the context window. Generation stops
-with a length finish reason if it fills the remaining window; the next request
-can compact that history. Input that leaves no room for generation even after
-compaction is still rejected. Automatic and terminal-trigger compaction can summarize oversized
-history in up to eight bounded passes, preserving instructions, the latest
-exchange, and tool-call/result groups. Every summary call must fit the model
-window and reduce its input; otherwise the request fails without replacing the
-original context. A single oversized exchange still needs to be reduced by the
-caller. The standalone `/responses/compact` endpoint still requires its input to fit.
-When compaction happens, the response output starts with a
-`type: "compaction"` item. Append the output normally, or keep only the newest
-compaction item and everything after it. `previous_response_id` chaining also
-works while that response is stored. `/v1/responses/input_tokens` counts the
-decoded context, not the encrypted payload's string length. Normal response
-usage counts the final inference; explicit compact usage counts the summary pass.
+The default threshold is **75% of the effective context window** when
+`compact_threshold` is omitted. Explicit thresholds take precedence. The server
+counts rendered input, including tools and media, and pauses generation when
+input plus newly generated tokens reaches the threshold. It summarizes the
+conversation and the response produced so far, rebuilds a smaller context, and
+continues the same response. Recent output and protocol delimiters are retained
+to continue the unfinished assistant message; an open tool call is never split.
 
-Chat Completions automatically compacts supported history when the actual input
-leaves no room for generation within the context limit. No threshold setting is needed.
-The optional `context_management` field enables earlier compaction; an empty list
-explicitly disables compaction. Recovery supports text, images, and tool history;
-audio/video requests keep their existing behavior. Compaction finishes before the
-Chat Completions stream opens and leaves its response format unchanged. It is
-request-local: clients that resend their full history may need compaction again
-on later requests. Responses clients can
-reuse the returned compaction item.
+`max_output_tokens` (or Chat Completions `max_tokens`) is one output ceiling for
+the whole response, including reasoning. It does not reserve unused input space,
+and it is not reset after compaction. A response can span multiple context
+windows. Hitting the output ceiling produces `status: "incomplete"`,
+`incomplete_details.reason: "max_output_tokens"`, and `response.incomplete` in a
+Responses stream; Chat Completions uses `finish_reason: "length"`.
 
-Streaming automatic compaction and terminal `compaction_trigger` requests emit
-request-scoped MLX extension events after `response.created` / `response.in_progress`
-and before the compaction output item:
+Instructions and the latest user exchange remain protected. If compaction cannot
+free space while preserving them and any unfinished tool arguments, the request
+fails instead of silently dropping content or repeatedly retrying. Automatic and
+terminal-trigger compaction can summarize oversized history in up to eight
+bounded passes. Every summary call must fit the model window and reduce its
+input. The standalone `/responses/compact` endpoint requires its input to fit.
 
-```text
-event: mlx.compaction.started
-data: {"type":"mlx.compaction.started","response_id":"resp_...","input_tokens":5786}
+Compaction items appear in the output where compaction occurred. A stream can
+contain text, a compaction item, and more text under the same response ID.
+Append all output normally, or keep the newest compaction item and everything
+after it. `previous_response_id` chaining also works while the response is
+stored. `/v1/responses/input_tokens` counts decoded context rather than the
+opaque payload. Normal response usage sums answer-generation passes; internal
+summary passes have separate budgets and do not spend the answer's output cap.
+Explicit compact usage reports the summary passes.
 
-event: mlx.compaction.completed
-data: {"type":"mlx.compaction.completed","response_id":"resp_...","input_tokens_before":5786,"input_tokens_after":854}
-```
+Chat Completions defaults to the same 75% threshold for supported text, image,
+and tool history. Its `context_management` field is an MLX extension; an empty
+list disables compaction. Audio/video requests keep their existing behavior.
+Chat Completions keeps its normal response format. It is request-local, so
+clients resending full history may compact again. Responses clients can reuse
+the encrypted compaction item instead.
 
-Use these events to drive a compacting indicator without a token-count preflight.
-`started` means the server has selected history and checked summary headroom;
-`completed` means the smaller context passed validation. No summary means no
-progress events, even if the threshold was reached. The token counts describe the
-rendered conversation before and after compaction, not cache hits or summary usage.
-Clients may ignore these additional events; ordinary Responses output is unchanged.
-Keep the capsule from the accepted final response, not from a progress event.
+Responses streams use standard `response.output_item.added` and
+`response.output_item.done` events for compaction. The added item has an empty
+`encrypted_content` while the summary runs; the done item carries the validated
+state. Use this lifecycle for a compacting indicator. All events have consecutive,
+response-local `sequence_number` values, including failures. Text events include
+`logprobs`, and response usage includes input/output token details. A failed
+summary never emits a completed compaction item. Keep compaction state from the
+accepted final response.
 
 Once the stream is open, failures are terminal `response.failed` SSE events with
 `response.error.message` and a string `response.error.code` (`invalid_prompt`,

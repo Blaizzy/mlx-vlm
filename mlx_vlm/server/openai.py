@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import binascii
+import copy
 import gc
 import json
 import logging
@@ -33,6 +34,7 @@ from ..tools import (
 )
 from ..utils import prepare_inputs
 from . import compaction
+from .compacting_generation import CompactingGeneration
 from .generation import (
     GenerationMetrics,
     PromptTooLongError,
@@ -50,6 +52,7 @@ from .responses_state import (
     _response_items_to_chat,
     _response_output_items_from_text,
     _response_tool_registry,
+    _sequence_response_events,
 )
 from .responses_state import _sse_event as _response_sse_event
 from .responses_state import (
@@ -802,6 +805,40 @@ async def responses_compact_endpoint(http_request: Request, request: CompactRequ
     }
 
 
+def _response_request_metadata(request):
+    tools = []
+    for tool in request.tools or []:
+        tool = tool.model_dump() if hasattr(tool, "model_dump") else dict(tool)
+        if tool.get("type") == "function":
+            tool = {
+                "type": "function",
+                **tool.get("function", {k: v for k, v in tool.items() if k != "type"}),
+            }
+            tool.setdefault("strict", None)
+        tools.append(tool)
+    choice = request.tool_choice or "auto"
+    if isinstance(choice, dict) and isinstance(choice.get("function"), dict):
+        choice = {"type": "function", "name": choice["function"]["name"]}
+    return {
+        "tools": tools,
+        "tool_choice": choice,
+        "parallel_tool_calls": getattr(request, "parallel_tool_calls", True),
+    }
+
+
+def _response_usage(metrics, input_tokens, output_tokens, processor, reasoning):
+    tokenizer = getattr(processor, "tokenizer", processor)
+    encode = getattr(tokenizer, "encode", None)
+    reasoning_tokens = 0
+    if reasoning and callable(encode):
+        reasoning_tokens = min(
+            output_tokens, len(encode(reasoning, add_special_tokens=False))
+        )
+    return OpenAIUsage.from_metrics(
+        metrics, input_tokens, output_tokens, reasoning_tokens=reasoning_tokens
+    )
+
+
 def _response_stream_error(exc, response):
     status = exc.status_code if isinstance(exc, HTTPException) else 500
     code = (
@@ -848,6 +885,7 @@ async def _responses_compaction_trigger(request, items, tenant, covered=frozense
         allow_oversized=True,
     )
     pending = OpenAIResponse(
+        **_response_request_metadata(request),
         id=f"resp_{uuid.uuid4().hex}",
         created_at=int(time.time()),
         object="response",
@@ -878,6 +916,7 @@ async def _responses_compaction_trigger(request, items, tenant, covered=frozense
         return complete(await compaction.compact_response_context(*args, **options))
 
     async def events():
+        item_id = None
         try:
             for kind in ("response.created", "response.in_progress"):
                 yield _response_sse_event(
@@ -889,15 +928,43 @@ async def _responses_compaction_trigger(request, items, tenant, covered=frozense
                 async for update in progress:
                     if isinstance(update, compaction.CompactedContext):
                         result = update
-                    else:
+                    elif update["type"] == "mlx.compaction.started":
+                        item_id = f"cmp_{uuid.uuid4().hex}"
                         yield _response_sse_event(
-                            update["type"], {**update, "response_id": pending.id}
+                            "response.output_item.added",
+                            {
+                                "type": "response.output_item.added",
+                                "output_index": 0,
+                                "item": {
+                                    "type": "compaction",
+                                    "id": item_id,
+                                    "encrypted_content": "",
+                                },
+                            },
                         )
             response = complete(result)
-            for kind in ("response.output_item.added", "response.output_item.done"):
-                yield _response_sse_event(
-                    kind, {"type": kind, "output_index": 0, "item": response.output[0]}
+            if item_id:
+                response.output[0]["id"] = item_id
+                _store_response(
+                    response, items, response.output, request.previous_response_id
                 )
+            else:
+                yield _response_sse_event(
+                    "response.output_item.added",
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": response.output[0],
+                    },
+                )
+            yield _response_sse_event(
+                "response.output_item.done",
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": response.output[0],
+                },
+            )
             yield _response_sse_event(
                 "response.completed",
                 {"type": "response.completed", "response": response.model_dump()},
@@ -906,7 +973,7 @@ async def _responses_compaction_trigger(request, items, tenant, covered=frozense
             yield _response_stream_error(exc, pending)
 
     return StreamingResponse(
-        events(),
+        _sequence_response_events(events()),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -952,6 +1019,365 @@ async def responses_input_items_endpoint(response_id: str):
         "last_id": data[-1].get("id") if data else None,
         "has_more": False,
     }
+
+
+async def _compacting_responses(request, items, current_input, tenant, covered):
+    """Share one generation/compaction loop between streamed and JSON responses."""
+    model, processor, config = get_cached_model(
+        request.model, _adapter_path_or_inherit(request)
+    )
+    args = _build_gen_args(request, processor, tenant_id=tenant)
+    chat_tools, registry = _response_tool_registry(request.tools)
+    parser_type = _infer_tool_parser_from_processor(
+        processor, override=request.tool_parser
+    )
+    tool_module = load_tool_module(parser_type) if parser_type and chat_tools else None
+    if tool_module:
+        args.skip_special_tokens = False
+    options = args.to_template_kwargs()
+    if request.tool_choice is not None:
+        options["tool_choice"] = request.tool_choice
+
+    def render(context):
+        messages, images = _response_items_to_chat(context)
+        _normalize_instruction_messages(messages, request.instructions)
+        _ensure_effective_input(messages, images=images)
+        return (
+            apply_chat_template(
+                processor,
+                config,
+                messages,
+                num_images=len(images),
+                tools=chat_tools or None,
+                **options,
+            ),
+            images,
+        )
+
+    prompt, _ = render(items)
+    starts_thinking = prompt_has_open_thinking(
+        prompt,
+        args.enable_thinking,
+        args.thinking_start_token,
+        args.thinking_end_token,
+    )
+    session = CompactingGeneration(
+        request,
+        items,
+        model,
+        processor,
+        config,
+        tenant,
+        args,
+        render=render,
+        build_gen_args=_build_gen_args,
+        apply_chat_template=apply_chat_template,
+        generate=generate,
+        stream_generate=stream_generate,
+        prepare_inputs=prepare_inputs,
+        covered=covered,
+        tool_module=tool_module,
+    )
+    pending = OpenAIResponse(
+        **_response_request_metadata(request),
+        id=f"resp_{uuid.uuid4().hex}",
+        object="response",
+        created_at=int(time.time()),
+        status="in_progress",
+        model=request.model,
+        instructions=request.instructions,
+        max_output_tokens=request.max_output_tokens,
+        output=[],
+        output_text="",
+        temperature=request.temperature,
+        top_p=request.top_p,
+        previous_response_id=request.previous_response_id,
+        store=request.store,
+        usage=None,
+    )
+    output = []
+    active = {}
+    pending_whitespace = {}
+    shown = set()
+    thinking = make_response_stream_state(
+        processor,
+        starts_thinking,
+        args.thinking_start_token,
+        args.thinking_end_token,
+    )
+    tools_state = ToolCallStreamState(
+        getattr(tool_module, "tool_call_start", None),
+        getattr(tool_module, "tool_call_end", None),
+    )
+
+    def emit(kind, **payload):
+        return _response_sse_event(kind, {"type": kind, **payload})
+
+    def delta(kind, text):
+        if not text:
+            return
+        text = pending_whitespace.get(kind, "") + text
+        if kind not in shown:
+            text = text.lstrip()
+        body = text.rstrip()
+        pending_whitespace[kind] = text[len(body) :]
+        if not body:
+            return
+        shown.add(kind)
+        text = body
+        if kind not in active:
+            index = len(output)
+            item = {
+                "id": f"{'msg' if kind == 'message' else 'rs'}_{uuid.uuid4().hex}",
+                "type": kind,
+                "status": "in_progress",
+                "content": [],
+            }
+            if kind == "message":
+                item["role"] = "assistant"
+                part = {
+                    "type": "output_text",
+                    "text": "",
+                    "annotations": [],
+                    "logprobs": [],
+                }
+            else:
+                item["summary"] = []
+                part = {"type": "reasoning_text", "text": ""}
+            output.append(item)
+            active[kind] = index
+            yield emit(
+                "response.output_item.added",
+                output_index=index,
+                item=copy.deepcopy(item),
+            )
+            item["content"].append(part)
+            if kind == "message":
+                yield emit(
+                    "response.content_part.added",
+                    item_id=item["id"],
+                    output_index=index,
+                    content_index=0,
+                    part=copy.deepcopy(part),
+                )
+        index = active[kind]
+        item = output[index]
+        item["content"][0]["text"] += text
+        event_kind = "output_text" if kind == "message" else "reasoning_text"
+        yield emit(
+            f"response.{event_kind}.delta",
+            item_id=item["id"],
+            output_index=index,
+            content_index=0,
+            delta=text,
+            **({"logprobs": []} if kind == "message" else {}),
+        )
+
+    def close_items(incomplete=False):
+        for kind, index in sorted(active.items(), key=lambda pair: pair[1]):
+            item = output[index]
+            item["status"] = "incomplete" if incomplete else "completed"
+            part = item["content"][0]
+            event_kind = "output_text" if kind == "message" else "reasoning_text"
+            yield emit(
+                f"response.{event_kind}.done",
+                item_id=item["id"],
+                output_index=index,
+                content_index=0,
+                text=part["text"],
+                **({"logprobs": []} if kind == "message" else {}),
+            )
+            if kind == "message":
+                yield emit(
+                    "response.content_part.done",
+                    item_id=item["id"],
+                    output_index=index,
+                    content_index=0,
+                    part=part,
+                )
+            yield emit("response.output_item.done", output_index=index, item=item)
+        active.clear()
+
+    async def events():
+        started = time.perf_counter()
+        finalized = False
+        runtime.metrics.begin_request(
+            endpoint="/responses", model=request.model, stream=request.stream
+        )
+        try:
+            yield emit("response.created", response=pending.model_dump())
+            yield emit("response.in_progress", response=pending.model_dump())
+            async with aclosing(session.tokens()) as tokens:
+                async for token in tokens:
+                    if isinstance(token, dict):
+                        if token["kind"] == "compaction_start":
+                            for event in close_items():
+                                yield event
+                            output.append(token["item"])
+                            yield emit(
+                                "response.output_item.added",
+                                output_index=len(output) - 1,
+                                item=token["item"],
+                            )
+                        else:
+                            item = token["item"]
+                            index = next(
+                                (
+                                    i
+                                    for i, x in enumerate(output)
+                                    if x["id"] == item["id"]
+                                ),
+                                None,
+                            )
+                            if index is None:
+                                index = len(output)
+                                output.append(item)
+                                yield emit(
+                                    "response.output_item.added",
+                                    output_index=index,
+                                    item=item,
+                                )
+                            output[index] = item
+                            yield emit(
+                                "response.output_item.done",
+                                output_index=index,
+                                item=item,
+                            )
+                        continue
+                    parts = thinking.feed(token.text, last=bool(token.finish_reason))
+                    for event in delta("reasoning", parts.reasoning):
+                        yield event
+                    content = tools_state.feed(
+                        parts.content, last=bool(token.finish_reason)
+                    )
+                    for event in delta("message", content):
+                        yield event
+            reasoning, content = finish_content_streams(thinking, tools_state)
+            for kind, text in (("reasoning", reasoning), ("message", content)):
+                for event in delta(kind, text):
+                    yield event
+            for event in close_items(session.finish_reason == "length"):
+                yield event
+            parsed, _, _, _ = _response_output_items_from_text(
+                session.full_text,
+                "unused",
+                tool_module,
+                chat_tools,
+                registry,
+                args.thinking_start_token,
+                args.thinking_end_token,
+                processor=processor,
+                starts_in_thinking=starts_thinking,
+            )
+            for item in parsed:
+                if item["type"] in ("message", "reasoning"):
+                    continue
+                index = len(output)
+                output.append(item)
+                yield emit(
+                    "response.output_item.added",
+                    output_index=index,
+                    item={**item, "status": "in_progress", "arguments": ""},
+                )
+                if item["type"] == "function_call":
+                    yield emit(
+                        "response.function_call_arguments.delta",
+                        item_id=item["id"],
+                        output_index=index,
+                        delta=item.get("arguments", ""),
+                    )
+                    yield emit(
+                        "response.function_call_arguments.done",
+                        item_id=item["id"],
+                        output_index=index,
+                        arguments=item.get("arguments", ""),
+                    )
+                yield emit("response.output_item.done", output_index=index, item=item)
+            text = "".join(
+                part["text"]
+                for item in output
+                if item["type"] == "message"
+                for part in item["content"]
+            )
+            response = pending.model_copy(
+                update={
+                    "status": (
+                        "incomplete"
+                        if session.finish_reason == "length"
+                        else "completed"
+                    ),
+                    "incomplete_details": (
+                        {"reason": "max_output_tokens"}
+                        if session.finish_reason == "length"
+                        else None
+                    ),
+                    "output": output,
+                    "output_text": text,
+                    "usage": _response_usage(
+                        session.metrics,
+                        session.input_tokens,
+                        session.output_tokens,
+                        processor,
+                        "".join(
+                            part["text"]
+                            for item in output
+                            if item["type"] == "reasoning"
+                            for part in item["content"]
+                        ),
+                    ),
+                }
+            )
+            _store_response(
+                response, current_input, output, request.previous_response_id
+            )
+            runtime.metrics.record_success(
+                _build_metrics_envelope(
+                    endpoint="/responses",
+                    model=request.model,
+                    stream=request.stream,
+                    backend=(
+                        "continuous_batching"
+                        if runtime.response_generator
+                        else "generate"
+                    ),
+                    prompt_tokens=session.input_tokens,
+                    completion_tokens=session.output_tokens,
+                    generated_tokens=session.output_tokens,
+                    request_elapsed_s=time.perf_counter() - started,
+                    request_started_s=started,
+                    token_times=session.metrics.token_times,
+                    prompt_tps=session.metrics.prompt_tps,
+                    generation_tps=session.metrics.generation_tps,
+                    peak_memory_gb=session.metrics.peak_memory,
+                    finish_reason=session.finish_reason,
+                )
+            )
+            finalized = True
+            yield emit(f"response.{response.status}", response=response.model_dump())
+        except Exception as exc:
+            if not request.stream:
+                raise
+            yield _response_stream_error(exc, pending)
+        finally:
+            if not finalized:
+                runtime.metrics.record_failure(
+                    endpoint="/responses",
+                    model=request.model,
+                    stream=request.stream,
+                    error="generation_failed_or_cancelled",
+                )
+
+    if request.stream:
+        return StreamingResponse(
+            _sequence_response_events(events()),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+    async with aclosing(events()) as stream:
+        async for event in stream:
+            payload = json.loads(event.split("data: ", 1)[1])
+            if payload["type"] in ("response.completed", "response.incomplete"):
+                return OpenAIResponse.model_validate(payload["response"])
 
 
 async def responses_endpoint(request: Request):
@@ -1034,52 +1460,13 @@ async def responses_endpoint(request: Request):
             return await _responses_compaction_trigger(
                 openai_request, prompt_items, tenant, context.covered
             )
-        compaction_output = []
-        deferred_compaction = bool(
-            openai_request.stream and openai_request.context_management
-        )
-        compaction_args = None
         if openai_request.context_management:
-            model, processor, config = get_cached_model(
-                openai_request.model, _adapter_path_or_inherit(openai_request)
-            )
-            compaction_args = (
+            return await _compacting_responses(
                 openai_request,
                 prompt_items,
-                model,
-                processor,
-                config,
+                current_input_items,
                 tenant,
-            )
-        compaction_options = dict(
-            build_gen_args=_build_gen_args,
-            apply_chat_template=apply_chat_template,
-            generate=generate,
-            automatic=True,
-            covered=context.covered,
-        )
-
-        output_limit = None
-
-        def apply_compaction(result):
-            nonlocal output_limit
-            output_limit = result.max_output_tokens
-            if not result.changed:
-                return result.items, []
-            return result.items, [
-                compaction.seal(
-                    result.items,
-                    model=openai_request.model,
-                    tenant=tenant,
-                    covered=result.covered,
-                )
-            ]
-
-        if compaction_args and not deferred_compaction:
-            prompt_items, compaction_output = apply_compaction(
-                await compaction.compact_response_context(
-                    *compaction_args, **compaction_options
-                )
+                context.covered,
             )
         chat_messages, images = _response_items_to_chat(prompt_items)
         instructions = _normalize_instruction_messages(
@@ -1107,8 +1494,6 @@ async def responses_endpoint(request: Request):
             raise HTTPException(status_code=400, detail=str(e))
         if chat_tools and tool_module is not None:
             gen_args.skip_special_tokens = False
-        if output_limit is not None:
-            gen_args.max_tokens = output_limit
 
         template_kwargs = gen_args.to_template_kwargs()
         if openai_request.tool_choice is not None:
@@ -1134,9 +1519,7 @@ async def responses_endpoint(request: Request):
             )
             return prompt, images, thinking
 
-        formatted_prompt, starts_in_thinking = None, False
-        if not deferred_compaction:
-            formatted_prompt, images, starts_in_thinking = render_prompt(prompt_items)
+        formatted_prompt, images, starts_in_thinking = render_prompt(prompt_items)
 
         logger.debug(
             "responses request: model=%s images=%d max_tokens=%s temp=%s stream=%s",
@@ -1158,18 +1541,16 @@ async def responses_endpoint(request: Request):
                 model=openai_request.model,
                 stream=True,
             )
-            if not deferred_compaction:
-                await _preflight_stream_context_budget(
-                    endpoint="/responses",
-                    model=openai_request.model,
-                    prompt=formatted_prompt,
-                    images=images if images else None,
-                    audio=None,
-                    args=gen_args,
-                )
+            await _preflight_stream_context_budget(
+                endpoint="/responses",
+                model=openai_request.model,
+                prompt=formatted_prompt,
+                images=images if images else None,
+                audio=None,
+                args=gen_args,
+            )
 
             async def stream_generator():
-                nonlocal formatted_prompt, images, starts_in_thinking, compaction_output
                 token_iterator = None
                 token_iter = None  # For ResponseGenerator cleanup
                 metrics_finalized = False
@@ -1178,6 +1559,7 @@ async def responses_endpoint(request: Request):
                 try:
                     # Create base response object (to match the openai pipeline)
                     base_response = OpenAIResponse(
+                        **_response_request_metadata(openai_request),
                         id=response_id,
                         object="response",
                         created_at=int(generated_at),
@@ -1204,47 +1586,6 @@ async def responses_endpoint(request: Request):
                     # Send response.in_progress event  (to match the openai pipeline)
                     yield f"event: response.in_progress\ndata: {ResponseInProgressEvent(type='response.in_progress', response=base_response).model_dump_json()}\n\n"
 
-                    if deferred_compaction:
-                        async with aclosing(
-                            compaction.stream_response_context(
-                                *compaction_args, **compaction_options
-                            )
-                        ) as progress:
-                            async for update in progress:
-                                if isinstance(update, compaction.CompactedContext):
-                                    items, compaction_output = apply_compaction(update)
-                                    gen_args.max_tokens = output_limit
-                                    formatted_prompt, images, starts_in_thinking = (
-                                        render_prompt(items)
-                                    )
-                                else:
-                                    yield _response_sse_event(
-                                        update["type"],
-                                        {**update, "response_id": response_id},
-                                    )
-                        await _preflight_stream_context_budget(
-                            endpoint="/responses",
-                            model=openai_request.model,
-                            prompt=formatted_prompt,
-                            images=images or None,
-                            audio=None,
-                            args=gen_args,
-                        )
-
-                    for index, item in enumerate(compaction_output):
-                        for event_type in (
-                            "response.output_item.added",
-                            "response.output_item.done",
-                        ):
-                            yield _response_sse_event(
-                                event_type,
-                                {
-                                    "type": event_type,
-                                    "output_index": index,
-                                    "item": item,
-                                },
-                            )
-
                     output_indices = {}
                     pending_whitespace = {}
 
@@ -1252,7 +1593,7 @@ async def responses_endpoint(request: Request):
                         item_id = item["id"]
                         if item_id in output_indices:
                             return
-                        index = len(compaction_output) + len(output_indices)
+                        index = len(output_indices)
                         output_indices[item_id] = index
                         pending = {**item, "status": "in_progress"}
                         if item["type"] == "message":
@@ -1481,7 +1822,7 @@ async def responses_endpoint(request: Request):
                                 ],
                             },
                         )
-                    completed_output = list(compaction_output)
+                    completed_output = []
                     for item in sorted(
                         output_items,
                         key=lambda item: output_indices.get(item["id"], float("inf")),
@@ -1579,10 +1920,12 @@ async def responses_endpoint(request: Request):
                             ),
                             "output": completed_output,
                             "output_text": clean_text,
-                            "usage": OpenAIUsage.from_metrics(
+                            "usage": _response_usage(
                                 metrics,
                                 usage_stats["input_tokens"],
                                 usage_stats["output_tokens"],
+                                processor,
+                                streamed_reasoning,
                             ),
                         }
                     )
@@ -1629,7 +1972,7 @@ async def responses_endpoint(request: Request):
                     logger.debug("Responses stream closed.")
 
             return StreamingResponse(
-                stream_generator(),
+                _sequence_response_events(stream_generator()),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -1721,8 +2064,8 @@ async def responses_endpoint(request: Request):
                 if finish_reason != "length" and output_finish_reason == "tool_calls":
                     finish_reason = "tool_calls"
 
-                output_items = compaction_output + output_items
                 response = OpenAIResponse(
+                    **_response_request_metadata(openai_request),
                     id=response_id,
                     object="response",
                     created_at=int(generated_at),
@@ -1741,8 +2084,8 @@ async def responses_endpoint(request: Request):
                     top_p=openai_request.top_p,
                     previous_response_id=openai_request.previous_response_id,
                     store=openai_request.store,
-                    usage=OpenAIUsage.from_metrics(
-                        metrics, prompt_tokens, output_tokens
+                    usage=_response_usage(
+                        metrics, prompt_tokens, output_tokens, processor, reasoning
                     ),
                 )
                 _store_response(
@@ -1827,6 +2170,252 @@ async def responses_endpoint(request: Request):
         )
 
 
+async def _compacting_chat(request, http_request, model, processor, config):
+    tenant = _read_tenant_id(http_request)
+    args = _build_gen_args(request, processor, tenant_id=tenant)
+    parser_type = _infer_tool_parser_from_processor(
+        processor, override=request.tool_parser
+    )
+    tool_module = (
+        load_tool_module(parser_type) if parser_type and request.tools else None
+    )
+    if tool_module:
+        args.skip_special_tokens = False
+    items = [
+        {**message.model_dump(exclude_none=True), "type": "message"}
+        for message in request.messages
+    ]
+
+    def render(context):
+        messages = [_chat_message_to_prompt(item) for item in context]
+        _, images = _response_items_to_chat(
+            [item for item in context if item.get("role") == "user"]
+        )
+        _normalize_instruction_messages(messages)
+        _ensure_effective_input(messages, images=images)
+        messages, tools, choice = _prepare_chat_tool_choice(
+            messages, request.tools, request.tool_choice
+        )
+        options = args.to_template_kwargs()
+        if choice is not None:
+            options["tool_choice"] = choice
+        return (
+            apply_chat_template(
+                processor,
+                config,
+                messages,
+                num_images=len(images),
+                tools=tools,
+                **options,
+            ),
+            images,
+        )
+
+    initial_prompt, _ = render(items)
+    thinking = make_response_stream_state(
+        processor,
+        prompt_has_open_thinking(
+            initial_prompt,
+            args.enable_thinking,
+            args.thinking_start_token,
+            args.thinking_end_token,
+        ),
+        args.thinking_start_token,
+        args.thinking_end_token,
+    )
+    tool_state = ToolCallStreamState(
+        getattr(tool_module, "tool_call_start", None),
+        getattr(tool_module, "tool_call_end", None),
+    )
+    generate_kwargs = {}
+    if request.resize_shape is not None:
+        if len(request.resize_shape) not in (1, 2):
+            raise HTTPException(
+                400, "resize_shape must contain exactly two integers (height, width)"
+            )
+        generate_kwargs["resize_shape"] = tuple(request.resize_shape) * (
+            2 if len(request.resize_shape) == 1 else 1
+        )
+    session = CompactingGeneration(
+        request,
+        items,
+        model,
+        processor,
+        config,
+        tenant,
+        args,
+        render=render,
+        build_gen_args=_build_gen_args,
+        apply_chat_template=apply_chat_template,
+        generate=generate,
+        stream_generate=stream_generate,
+        prepare_inputs=prepare_inputs,
+        tool_module=tool_module,
+        generate_kwargs=generate_kwargs,
+    )
+    async for _ in session.compact():
+        pass
+    request_id = f"chatcmpl-{uuid.uuid4().hex}"
+    created = int(time.time())
+    text, reasoning, logprobs = [], [], []
+
+    def chunk(delta, finish=None, logprobs=None):
+        return ChatStreamChunk(
+            id=request_id,
+            created=created,
+            model=request.model,
+            choices=[
+                ChatStreamChoice(delta=delta, finish_reason=finish, logprobs=logprobs)
+            ],
+        )
+
+    async def events():
+        started, finalized = time.perf_counter(), False
+        runtime.metrics.begin_request(
+            endpoint="/chat/completions", model=request.model, stream=request.stream
+        )
+        try:
+            async with aclosing(session.tokens()) as tokens:
+                async for token in tokens:
+                    if isinstance(token, dict):
+                        continue
+                    parts = thinking.feed(token.text, last=bool(token.finish_reason))
+                    content = tool_state.feed(
+                        parts.content, last=bool(token.finish_reason)
+                    )
+                    text.append(content or "")
+                    reasoning.append(parts.reasoning or "")
+                    token_logprobs = None
+                    if (
+                        request.logprobs
+                        and runtime.response_generator
+                        and token.finish_reason != "stop"
+                    ):
+                        entry = _make_logprob_content(
+                            runtime.response_generator.tokenizer,
+                            token.token,
+                            token.logprobs,
+                            top_logprobs=getattr(token, "top_logprobs", None),
+                            top_k=int(request.top_logprobs or 0),
+                        )
+                        logprobs.append(entry)
+                        token_logprobs = ChatLogprobs(content=[entry])
+                    if content or parts.reasoning or token_logprobs:
+                        yield chunk(
+                            ChatMessage(
+                                role="assistant",
+                                content=content,
+                                reasoning=parts.reasoning,
+                            ),
+                            logprobs=token_logprobs,
+                        )
+            tail_reasoning, tail = finish_content_streams(thinking, tool_state)
+            text.append(tail or "")
+            reasoning.append(tail_reasoning or "")
+            if tail or tail_reasoning:
+                yield chunk(
+                    ChatMessage(
+                        role="assistant", content=tail, reasoning=tail_reasoning
+                    )
+                )
+            calls = (
+                process_tool_calls(session.full_text, tool_module, request.tools)
+                if tool_module
+                else None
+            )
+            finish = session.finish_reason or "stop"
+            if calls and calls.calls:
+                finish = "length" if finish == "length" else "tool_calls"
+                yield chunk(
+                    ChatMessage(role="assistant", tool_calls=calls.calls), finish
+                )
+            else:
+                yield _final_chat_chunk(
+                    request_id, request.model, finish, session.metrics.rate
+                )
+            session.finish_reason = finish
+            session.tool_calls = calls.calls if calls else None
+            runtime.metrics.record_success(
+                _build_metrics_envelope(
+                    endpoint="/chat/completions",
+                    model=request.model,
+                    stream=request.stream,
+                    backend=(
+                        "continuous_batching"
+                        if runtime.response_generator
+                        else "generate"
+                    ),
+                    prompt_tokens=session.input_tokens,
+                    completion_tokens=session.output_tokens,
+                    generated_tokens=session.output_tokens,
+                    request_elapsed_s=time.perf_counter() - started,
+                    request_started_s=started,
+                    token_times=session.metrics.token_times,
+                    prompt_tps=session.metrics.prompt_tps,
+                    generation_tps=session.metrics.generation_tps,
+                    peak_memory_gb=session.metrics.peak_memory,
+                    finish_reason=finish,
+                )
+            )
+            finalized = True
+        finally:
+            if not finalized:
+                runtime.metrics.record_failure(
+                    endpoint="/chat/completions",
+                    model=request.model,
+                    stream=request.stream,
+                    error="generation_failed_or_cancelled",
+                )
+
+    if request.stream:
+
+        async def stream():
+            try:
+                async with aclosing(events()) as updates:
+                    async for item in updates:
+                        yield f"data: {item.model_dump_json()}\n\n"
+                if request.stream_options and request.stream_options.include_usage:
+                    usage = _chat_usage_chunk(
+                        request_id,
+                        request.model,
+                        session.metrics,
+                        session.input_tokens,
+                        session.output_tokens,
+                    )
+                    yield f"data: {usage.model_dump_json()}\n\n"
+                yield "data: [DONE]\n\n"
+            except Exception as exc:
+                yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+
+        return StreamingResponse(stream(), media_type="text/event-stream")
+    async with aclosing(events()) as updates:
+        async for _ in updates:
+            pass
+    return ChatResponse(
+        id=request_id,
+        created=created,
+        model=request.model,
+        choices=[
+            ChatChoice(
+                index=0,
+                message=ChatMessage(
+                    role="assistant",
+                    content="".join(text).strip(),
+                    reasoning="".join(reasoning).strip() or None,
+                    tool_calls=session.tool_calls,
+                ),
+                finish_reason=session.finish_reason,
+                logprobs=ChatLogprobs(content=logprobs) if logprobs else None,
+            )
+        ],
+        usage=UsageStats(
+            prompt_tokens=session.input_tokens,
+            completion_tokens=session.output_tokens,
+            total_tokens=session.input_tokens + session.output_tokens,
+        ),
+    )
+
+
 async def chat_completions_endpoint(request: ChatRequest, http_request: Request):
     """
     Generate text based on a prompt and optional images.
@@ -1843,7 +2432,6 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             else _INHERIT_ADAPTER
         )
 
-        compacted_context = None
         if request.context_management != []:
             _prepare_chat_tool_choice([], request.tools, request.tool_choice)
             model, processor, config = get_cached_model(request.model, adapter_path)
@@ -1854,33 +2442,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     for message in request.messages
                 )
             ):
-                result = await compaction.compact_response_context(
-                    request,
-                    [
-                        {**message.model_dump(exclude_none=True), "type": "message"}
-                        for message in request.messages
-                    ],
-                    model,
-                    processor,
-                    config,
-                    _read_tenant_id(http_request),
-                    build_gen_args=_build_gen_args,
-                    apply_chat_template=apply_chat_template,
-                    generate=generate,
-                    automatic=True,
+                return await _compacting_chat(
+                    request, http_request, model, processor, config
                 )
-                compacted_context = result
-                if result.changed:
-                    request = request.model_copy(
-                        update={
-                            "messages": [
-                                ChatMessage.model_validate(
-                                    {k: v for k, v in item.items() if k != "type"}
-                                )
-                                for item in result.items
-                            ]
-                        }
-                    )
 
         kwargs = {}
 
@@ -1965,8 +2529,6 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             raise HTTPException(status_code=400, detail=str(e))
         if tools and tool_module is not None:
             gen_args.skip_special_tokens = False
-        if compacted_context is not None:
-            gen_args.max_tokens = compacted_context.max_output_tokens
 
         template_kwargs = gen_args.to_template_kwargs()
         if tool_choice is not None:
