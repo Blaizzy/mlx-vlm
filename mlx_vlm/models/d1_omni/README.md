@@ -87,10 +87,11 @@ Peak memory grows with the budget: in float32, a full batch takes about 5.8 GB
 above the weights at 65536 and about 2.2 GB at 16384, which is no slower.
 
 The checkpoint is float32 and runs in float32 by default, matching the PyTorch
-reference to about 1e-5 in probability on text, images, and speech. For images
-this holds against torchvision's native uint8 resize, which the reference uses on
-Apple Silicon from torchvision 0.27 and on x86 with AVX2; on older or GPU setups
-it resizes in float and its own answers move by up to about 0.08.
+reference to about 1e-5 in probability on text, 5e-5 on images, and 1e-3 on
+speech. For images this holds against torchvision's native uint8 resize, which
+the reference uses on Apple Silicon from torchvision 0.27 and on x86 with AVX2;
+on older or GPU setups it resizes in float and its own answers move by up to
+about 0.08.
 `--dtype float16` conversions keep the answers apart from near ties.
 Four-bit quantization changes a noticeable share of answers, so prefer 8-bit
 (`-q --q-bits 8`) or float16; the vision tower and the decision scorer stay
@@ -98,4 +99,7 @@ unquantized. The audio encoder is quantized with the trunk: keeping it in full
 precision measured no gain at 4 or 8 bits, where the trunk dominates the drift,
 and adds about 300 MB. Digital silence (all-zero samples) is numerically
 ill-conditioned in the log-mel front end; the reference itself answers it
-differently on CPU and GPU.
+differently on CPU and GPU. So is speech with almost nothing above 4 kHz, such
+as audio recorded at 8 kHz: on 200 MINDS-14 clips read from their 8 kHz files,
+MLX and the CPU reference differ by up to 0.35 and in 6 top answers, and the
+reference's own CPU and GPU runs by up to 0.52 and in 4.

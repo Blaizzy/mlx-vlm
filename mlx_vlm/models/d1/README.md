@@ -71,5 +71,5 @@ hundredths, as in the PyTorch reference. In float32
 with images, the MLX image processor's resize differs slightly from
 torchvision's, which moves probabilities by up to about 5e-3 on yes/no questions
 and 1.6e-2 on questions with many options (POPE images, same top option).
-4-bit conversions shift probabilities further, by up to about 0.2 in parity
+4-bit conversions shift probabilities further, by up to about 0.32 in parity
 checks.
