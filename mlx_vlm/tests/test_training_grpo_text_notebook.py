@@ -6,6 +6,7 @@ import json
 import re
 from dataclasses import replace
 from decimal import Decimal, InvalidOperation
+from importlib import import_module
 from pathlib import Path
 from unittest.mock import patch
 
@@ -135,7 +136,9 @@ def test_text_grpo_notebook_trains_evaluates_saves_and_reloads(
             "mlx_vlm.trainer.vlm.sft.dataset._load_vlm_helpers",
             return_value=({}, template, prepare, None),
         ),
-        patch("mlx_vlm.generate.generate_step", side_effect=generate),
+        patch.object(
+            import_module("mlx_vlm.generate"), "generate_step", side_effect=generate
+        ),
     ):
         for i, cell in enumerate(notebook_cells()):
             if cell["cell_type"] != "code":

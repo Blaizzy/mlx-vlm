@@ -3,6 +3,7 @@
 import ast
 import json
 from dataclasses import replace
+from importlib import import_module
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -165,7 +166,9 @@ def test_rollouts_keep_exact_ids_eos_media_and_restore_mode(tmp_path, vision):
     args, model = settings(tmp_path), TinyVLM()
     model.train()
     generate, calls = sampled_stream()
-    with patch("mlx_vlm.generate.generate_step", side_effect=generate):
+    with patch.object(
+        import_module("mlx_vlm.generate"), "generate_step", side_effect=generate
+    ):
         completions, texts, indices = generate_grpo(
             model, Tokenizer(), [row(vision)], args
         )
@@ -175,7 +178,11 @@ def test_rollouts_keep_exact_ids_eos_media_and_restore_mode(tmp_path, vision):
     assert all((pixels is not None) == vision for _, pixels, _ in calls)
     if vision:
         assert all("image_grid_thw" in kw for _, _, kw in calls)
-    with patch("mlx_vlm.generate.generate_step", side_effect=RuntimeError("failure")):
+    with patch.object(
+        import_module("mlx_vlm.generate"),
+        "generate_step",
+        side_effect=RuntimeError("failure"),
+    ):
         with pytest.raises(RuntimeError):
             generate_grpo(model, Tokenizer(), [row(vision)], args)
     assert model.training
@@ -232,7 +239,9 @@ def test_trainer_updates_saves_and_evaluates(tmp_path, compiled, vision):
     model = TinyVLM()
     before = mx.array(model.projection.weight)
     generate, _ = sampled_stream()
-    with patch("mlx_vlm.generate.generate_step", side_effect=generate):
+    with patch.object(
+        import_module("mlx_vlm.generate"), "generate_step", side_effect=generate
+    ):
         trainer = Trainer(
             model,
             settings(tmp_path, compile=compiled),
@@ -265,7 +274,9 @@ def test_kl_reference_frozen_and_beta_zero_skips_it(tmp_path):
             prepared=True,
         )
     generate, _ = sampled_stream()
-    with patch("mlx_vlm.generate.generate_step", side_effect=generate):
+    with patch.object(
+        import_module("mlx_vlm.generate"), "generate_step", side_effect=generate
+    ):
         trainer = Trainer(
             model,
             settings(tmp_path, beta=0.1),
@@ -386,7 +397,9 @@ def test_grpo_cli_custom_rewards(tmp_path):
             "mlx_vlm.trainer.vlm.sft.dataset._load_vlm_helpers",
             return_value=helper_fixtures(),
         ),
-        patch("mlx_vlm.generate.generate_step", side_effect=generate),
+        patch.object(
+            import_module("mlx_vlm.generate"), "generate_step", side_effect=generate
+        ),
     ):
         metrics = run(args, config)
     assert metrics["train_reward_mean"] == 0.5
@@ -417,7 +430,9 @@ def test_notebook_runs_training_evaluation_and_saving(tmp_path):
             "mlx_vlm.trainer.vlm.sft.dataset._load_vlm_helpers",
             return_value=helper_fixtures(),
         ),
-        patch("mlx_vlm.generate.generate_step", side_effect=generate),
+        patch.object(
+            import_module("mlx_vlm.generate"), "generate_step", side_effect=generate
+        ),
     ):
         for i, cell in enumerate(document["cells"]):
             if cell["cell_type"] != "code":
@@ -599,7 +614,9 @@ def test_sampling_suppresses_only_in_vocabulary_media_slots(tmp_path):
     model.config.video_token_index = -200
     model.config.video_token_id = 999
     generate, calls = sampled_stream()
-    with patch("mlx_vlm.generate.generate_step", side_effect=generate):
+    with patch.object(
+        import_module("mlx_vlm.generate"), "generate_step", side_effect=generate
+    ):
         generate_grpo(model, Tokenizer(), [row(True)], settings(tmp_path))
     assert all(kw["logit_bias"] == {7: -float("inf")} for _, _, kw in calls)
 
