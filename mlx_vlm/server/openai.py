@@ -31,6 +31,7 @@ from ..tools import (
     load_tool_module,
     process_tool_calls,
 )
+from ..tools.streaming import ToolCallDeltaState
 from ..utils import prepare_inputs
 from . import compaction
 from .generation import (
@@ -44,6 +45,7 @@ from .request_normalization import (
     _normalize_instruction_messages,
 )
 from .responses_state import (
+    ThinkingStreamState,
     ToolCallStreamState,
     _normalize_response_input,
     _response_chain_items,
@@ -1241,6 +1243,13 @@ async def responses_endpoint(request: Request):
 
                     output_indices = {}
                     pending_whitespace = {}
+                    tool_delta_state = ToolCallDeltaState(tool_module, chat_tools)
+                    tool_thinking_state = ThinkingStreamState(
+                        starts_in_thinking,
+                        gen_args.thinking_start_token,
+                        gen_args.thinking_end_token,
+                    )
+                    function_item_ids = {}
 
                     def start_output_item(item):
                         item_id = item["id"]
@@ -1253,6 +1262,8 @@ async def responses_endpoint(request: Request):
                             pending["content"] = []
                         elif item["type"] == "reasoning":
                             pending["summary"] = []
+                        elif item["type"] == "function_call":
+                            pending["arguments"] = ""
                         yield _response_sse_event(
                             "response.output_item.added",
                             {
@@ -1307,6 +1318,39 @@ async def responses_endpoint(request: Request):
                                 ),
                             },
                         )
+
+                    def stream_tool_deltas(text):
+                        for delta in tool_delta_state.feed(text):
+                            call = tool_delta_state.calls[delta["index"]]
+                            function = call["function"]
+                            if (
+                                tool_registry.get(function["name"], "function")
+                                != "function"
+                            ):
+                                continue
+                            item_id = function_item_ids.setdefault(
+                                call["id"], f"fc_{uuid.uuid4().hex}"
+                            )
+                            yield from start_output_item(
+                                {
+                                    "id": item_id,
+                                    "type": "function_call",
+                                    "call_id": call["id"],
+                                    "name": function["name"],
+                                    "arguments": "",
+                                }
+                            )
+                            arguments = delta["function"].get("arguments", "")
+                            if arguments:
+                                yield _response_sse_event(
+                                    "response.function_call_arguments.delta",
+                                    {
+                                        "type": "response.function_call_arguments.delta",
+                                        "item_id": item_id,
+                                        "output_index": output_indices[item_id],
+                                        "delta": arguments,
+                                    },
+                                )
 
                     # Stream text deltas using ResponseGenerator (continuous batching)
                     full_text = ""
@@ -1368,6 +1412,12 @@ async def responses_endpoint(request: Request):
                                     "reasoning", thinking_delta.reasoning, chunk_rate
                                 ):
                                     yield event
+                            for event in stream_tool_deltas(
+                                tool_thinking_state.feed(
+                                    raw_delta, last=bool(token.finish_reason)
+                                ).content
+                            ):
+                                yield event
                             delta = thinking_delta.content
                             delta = tool_call_state.feed(
                                 delta, last=bool(token.finish_reason)
@@ -1415,6 +1465,12 @@ async def responses_endpoint(request: Request):
                                     "reasoning", thinking_delta.reasoning, chunk_rate
                                 ):
                                     yield event
+                            for event in stream_tool_deltas(
+                                tool_thinking_state.feed(
+                                    raw_delta, last=bool(chunk_finish)
+                                ).content
+                            ):
+                                yield event
                             delta = thinking_delta.content
                             delta = tool_call_state.feed(delta, last=bool(chunk_finish))
                             if chunk_finish is not None:
@@ -1454,8 +1510,12 @@ async def responses_endpoint(request: Request):
                             reasoning_item_id,
                             processor=processor,
                             starts_in_thinking=starts_in_thinking,
+                            tool_delta_state=tool_delta_state,
                         )
                     )
+                    for item in output_items:
+                        if item.get("call_id") in function_item_ids:
+                            item["id"] = function_item_ids[item["call_id"]]
                     if clean_text and not any(
                         item["type"] == "message" for item in output_items
                     ):
@@ -1993,6 +2053,19 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     output_text = ""
                     stream_prompt_tokens = 0
                     tool_calls_made = False
+                    tool_delta_state = ToolCallDeltaState(tool_module, tools)
+                    # Response templates consume structured tool regions. Split
+                    # reasoning separately so the tool parser still sees their markup.
+                    tool_thinking_state = ThinkingStreamState(
+                        prompt_has_open_thinking(
+                            formatted_prompt,
+                            gen_args.enable_thinking,
+                            gen_args.thinking_start_token,
+                            gen_args.thinking_end_token,
+                        ),
+                        gen_args.thinking_start_token,
+                        gen_args.thinking_end_token,
+                    )
 
                     # Use ResponseGenerator if available, otherwise fall back to stream_generate
                     if runtime.response_generator is not None:
@@ -2047,6 +2120,11 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             )
                             delta_reasoning = thinking_delta.reasoning
                             delta_content = thinking_delta.content
+                            tool_deltas = tool_delta_state.feed(
+                                tool_thinking_state.feed(
+                                    token.text, last=bool(token.finish_reason)
+                                ).content
+                            )
 
                             # Suppress tool-call markup from content
                             delta_content = tool_call_state.feed(
@@ -2072,6 +2150,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             has_payload = (
                                 bool(delta_content)
                                 or bool(delta_reasoning)
+                                or bool(tool_deltas)
                                 or chunk_logprobs is not None
                             )
                             if has_payload:
@@ -2081,6 +2160,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                             role="assistant",
                                             content=delta_content,
                                             reasoning=delta_reasoning,
+                                            tool_calls=tool_deltas or None,
                                         ),
                                         logprobs=chunk_logprobs,
                                     )
@@ -2128,6 +2208,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         terminal_emitted = False
                         if tool_module is not None:
                             tc = process_tool_calls(full_output, tool_module, tools)
+                            remaining_calls = tool_delta_state.finish(tc.calls)
                             if tc.calls:
                                 tool_calls_made = True
                                 finish_reason = "tool_calls"
@@ -2137,7 +2218,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                         finish_reason="tool_calls",
                                         delta=ChatMessage(
                                             role="assistant",
-                                            tool_calls=tc.calls,
+                                            tool_calls=remaining_calls or None,
                                         ),
                                     )
                                 ]
@@ -2216,16 +2297,22 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             thinking_delta = thinking_state.feed(
                                 chunk.text, last=bool(chunk_finish)
                             )
+                            tool_deltas = tool_delta_state.feed(
+                                tool_thinking_state.feed(
+                                    chunk.text, last=bool(chunk_finish)
+                                ).content
+                            )
                             delta_content = tool_call_state.feed(
                                 thinking_delta.content, last=bool(chunk_finish)
                             )
-                            if delta_content or thinking_delta.reasoning:
+                            if delta_content or thinking_delta.reasoning or tool_deltas:
                                 choices = [
                                     ChatStreamChoice(
                                         delta=ChatMessage(
                                             role="assistant",
                                             content=delta_content,
                                             reasoning=thinking_delta.reasoning,
+                                            tool_calls=tool_deltas or None,
                                         )
                                     )
                                 ]
@@ -2270,6 +2357,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             if tool_module is not None
                             else None
                         )
+                        remaining_calls = tool_delta_state.finish(
+                            tc.calls if tc else []
+                        )
                         if tc is not None and tc.calls:
                             tool_calls_made = True
                             finish_reason = "tool_calls"
@@ -2282,7 +2372,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                         finish_reason="tool_calls",
                                         delta=ChatMessage(
                                             role="assistant",
-                                            tool_calls=tc.calls,
+                                            tool_calls=remaining_calls or None,
                                         ),
                                     )
                                 ],
