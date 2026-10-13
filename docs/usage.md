@@ -35,6 +35,18 @@ output = generate(model, processor, formatted_prompt, image, verbose=False)
 print(output)
 ```
 
+## Streaming tool calls
+
+With `stream: true`, Chat Completions sends argument fragments in
+`choices[0].delta.tool_calls`; Responses sends
+`response.function_call_arguments.delta` events. Accumulate fragments by call
+index (Chat Completions) or item ID (Responses). Execute a tool only after the
+stream completes successfully and its arguments are complete.
+
+Incremental arguments are supported for JSON, Cohere, Qwen Coder XML, and Gemma
+tool formats. Other parsers retain their completed-call behavior. XML values
+that require type conversion are buffered until the parameter closes.
+
 ## Conversation compaction and APC
 
 Compaction replaces older conversation turns with a model-generated handoff and

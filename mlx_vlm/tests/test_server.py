@@ -6359,3 +6359,109 @@ def test_decisions_leave_mixed_media_to_the_model(client):
     model.predict.assert_called_once_with(
         None, None, questions, images=["cat.png"], audio="meow.wav"
     )
+
+
+@pytest.mark.parametrize("api", ["chat", "responses"])
+@pytest.mark.parametrize("batching", [False, True])
+@pytest.mark.parametrize("truncated", [False, True])
+@pytest.mark.parametrize("response_template", [False, True])
+def test_tool_arguments_stream_incrementally(
+    client, api, batching, truncated, response_template
+):
+    chunks = [
+        '<tool_call>{"name":"get_weather","arguments":{"city":"',
+        "War",
+        "saw",
+        '"}}</tool_call>',
+    ]
+    if truncated:
+        chunks = chunks[:-1]
+    tokens = [
+        _token(text, finish_reason="stop" if i == len(chunks) - 1 else None)
+        for i, text in enumerate(chunks)
+    ]
+    template = {
+        "defaults": {"role": "assistant"},
+        "fields": {
+            "content": {"content": "text"},
+            "tool_calls": {
+                "open": "<tool_call>",
+                "close": "</tool_call>",
+                "content": "json",
+                "repeats": True,
+            },
+        },
+    }
+    processor = (
+        NS(
+            response_template=template,
+            get_response_parser=lambda prefix: ResponseParser(template, prefix=prefix),
+            parse_response=lambda text, prefix: parse_response(
+                text, template, prefix=prefix
+            ),
+        )
+        if response_template
+        else None
+    )
+    with _endpoint(
+        generator=_streaming(tokens) if batching else None,
+        chunks=[
+            _result(token.text, finish_reason=token.finish_reason) for token in tokens
+        ],
+        parser=load_tool_module("json_tools"),
+        processor=processor,
+    ):
+        response = _post(client, api, stream=True, tools=[_tool()])
+    events = _data(response)
+    if api == "responses":
+        deltas = [
+            event
+            for event in events
+            if event.get("type") == "response.function_call_arguments.delta"
+        ]
+        assert len(deltas) >= 3
+        assert deltas[0]["delta"] == '{"city":"'
+        added = next(
+            event
+            for event in events
+            if event.get("type") == "response.output_item.added"
+        )
+        assert added["item"]["arguments"] == ""
+        assert all(
+            event["item_id"] == added["item"]["id"]
+            and event["output_index"] == added["output_index"]
+            for event in deltas
+        )
+        completed = [
+            event for event in events if event.get("type") == "response.completed"
+        ]
+        if truncated:
+            assert not completed and any(
+                event.get("type") in ("error", "response.failed") for event in events
+            )
+        else:
+            final = completed[0]["response"]["output"][0]
+            assert final["arguments"] == _joined(deltas, "delta") == '{"city":"Warsaw"}'
+            assert final["id"] == added["item"]["id"]
+            assert final["call_id"] == added["item"]["call_id"]
+    else:
+        choices = [event["choices"][0] for event in events if event.get("choices")]
+        calls = [
+            call
+            for choice in choices
+            for call in choice["delta"].get("tool_calls") or []
+        ]
+        assert len(calls) >= 3
+        assert calls[0]["function"]["name"] == "get_weather"
+        assert calls[0]["function"]["arguments"] == '{"city":"'
+        finishes = [
+            choice["finish_reason"] for choice in choices if choice.get("finish_reason")
+        ]
+        if truncated:
+            assert not finishes and any("error" in event for event in events)
+        else:
+            assert finishes == ["tool_calls"]
+            assert (
+                "".join(call["function"].get("arguments", "") for call in calls)
+                == '{"city":"Warsaw"}'
+            )
