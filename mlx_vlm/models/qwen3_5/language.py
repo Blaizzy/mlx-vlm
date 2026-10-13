@@ -274,12 +274,18 @@ _QWEN3_5_RAGGED_SDPA_ONE_PASS_SOURCE = r"""
 
     const device T* qptr =
         queries + int(q_batch_head_idx) * D_SIZE + int(simd_lid) * qk_per_thread;
-    const device T* kptr =
-        keys + (batch_idx * NUM_KV_HEADS + kv_head_idx) * K_SIZE * D_SIZE +
-        (pad + int(simd_gid)) * D_SIZE + int(simd_lid) * qk_per_thread;
-    const device T* vptr =
-        values + (batch_idx * NUM_KV_HEADS + kv_head_idx) * K_SIZE * V_SIZE +
-        (pad + int(simd_gid)) * V_SIZE + int(simd_lid) * v_per_thread;
+    // K/V may be strided views (e.g. a KV cache buffer sliced along the
+    // sequence axis), so address them through their real strides.
+    const int64_t k_row = keys_strides[2];
+    const int64_t v_row = values_strides[2];
+    const int64_t k_elem = keys_strides[3];
+    const int64_t v_elem = values_strides[3];
+    const device T* kptr = keys + batch_idx * keys_strides[0] +
+        kv_head_idx * keys_strides[1] + (pad + int(simd_gid)) * k_row +
+        int(simd_lid) * qk_per_thread * k_elem;
+    const device T* vptr = values + batch_idx * values_strides[0] +
+        kv_head_idx * values_strides[1] + (pad + int(simd_gid)) * v_row +
+        int(simd_lid) * v_per_thread * v_elem;
     device T* optr =
         out + int(q_batch_head_idx) * V_SIZE + int(simd_gid) * v_per_thread;
 
@@ -294,30 +300,61 @@ _QWEN3_5_RAGGED_SDPA_ONE_PASS_SOURCE = r"""
     U max_score = -3.4028234663852886e38f;
     U sum_exp_score = 0;
 
-    for (int i = int(simd_gid); i < N; i += BN) {
-        for (int j = 0; j < qk_per_thread; j++) {
-            k[j] = kptr[j];
+    // Uniform branch: rows contiguous along D (the KV cache case) keep the
+    // unit-stride inner loads; any other layout takes the strided loads.
+    // Both loops do the same arithmetic in the same order.
+    if (k_elem == 1 && v_elem == 1) {
+        for (int i = int(simd_gid); i < N; i += BN) {
+            for (int j = 0; j < qk_per_thread; j++) {
+                k[j] = kptr[j];
+            }
+
+            U score = 0;
+            for (int j = 0; j < qk_per_thread; j++) {
+                score += q[j] * k[j];
+            }
+            score = simd_sum(score);
+
+            U new_max = max(max_score, score);
+            U factor = fast::exp(max_score - new_max);
+            U exp_score = fast::exp(score - new_max);
+
+            max_score = new_max;
+            sum_exp_score = sum_exp_score * factor + exp_score;
+
+            for (int j = 0; j < v_per_thread; j++) {
+                o[j] = o[j] * factor + exp_score * vptr[j];
+            }
+
+            kptr += BN * k_row;
+            vptr += BN * v_row;
         }
+    } else {
+        for (int i = int(simd_gid); i < N; i += BN) {
+            for (int j = 0; j < qk_per_thread; j++) {
+                k[j] = kptr[j * k_elem];
+            }
 
-        U score = 0;
-        for (int j = 0; j < qk_per_thread; j++) {
-            score += q[j] * k[j];
+            U score = 0;
+            for (int j = 0; j < qk_per_thread; j++) {
+                score += q[j] * k[j];
+            }
+            score = simd_sum(score);
+
+            U new_max = max(max_score, score);
+            U factor = fast::exp(max_score - new_max);
+            U exp_score = fast::exp(score - new_max);
+
+            max_score = new_max;
+            sum_exp_score = sum_exp_score * factor + exp_score;
+
+            for (int j = 0; j < v_per_thread; j++) {
+                o[j] = o[j] * factor + exp_score * vptr[j * v_elem];
+            }
+
+            kptr += BN * k_row;
+            vptr += BN * v_row;
         }
-        score = simd_sum(score);
-
-        U new_max = max(max_score, score);
-        U factor = fast::exp(max_score - new_max);
-        U exp_score = fast::exp(score - new_max);
-
-        max_score = new_max;
-        sum_exp_score = sum_exp_score * factor + exp_score;
-
-        for (int j = 0; j < v_per_thread; j++) {
-            o[j] = o[j] * factor + exp_score * vptr[j];
-        }
-
-        kptr += BN * D_SIZE;
-        vptr += BN * V_SIZE;
     }
 
     if (simd_lid == 0) {
@@ -370,14 +407,17 @@ _QWEN3_5_RAGGED_SDPA_TWO_PASS_1_SOURCE = r"""
 
     const device T* qptr =
         queries + q_batch_head_idx * D_SIZE + int(simd_lid) * qk_per_thread;
-    const device T* kptr =
-        keys + (int(batch_idx) * NUM_KV_HEADS + int(kv_head_idx)) *
-                   K_SIZE * D_SIZE +
-        (pad + int(block_idx)) * D_SIZE + int(simd_lid) * qk_per_thread;
-    const device T* vptr =
-        values + (int(batch_idx) * NUM_KV_HEADS + int(kv_head_idx)) *
-                     K_SIZE * V_SIZE +
-        (pad + int(block_idx)) * V_SIZE + int(simd_lid) * v_per_thread;
+    // See the one-pass kernel: K/V are addressed through their real strides.
+    const int64_t k_row = keys_strides[2];
+    const int64_t v_row = values_strides[2];
+    const int64_t k_elem = keys_strides[3];
+    const int64_t v_elem = values_strides[3];
+    const device T* kptr = keys + int(batch_idx) * keys_strides[0] +
+        int(kv_head_idx) * keys_strides[1] + (pad + int(block_idx)) * k_row +
+        int(simd_lid) * qk_per_thread * k_elem;
+    const device T* vptr = values + int(batch_idx) * values_strides[0] +
+        int(kv_head_idx) * values_strides[1] + (pad + int(block_idx)) * v_row +
+        int(simd_lid) * v_per_thread * v_elem;
     device T* optr =
         partials + q_batch_head_idx * BLOCKS * V_SIZE +
         int(block_idx) * V_SIZE + int(simd_lid) * v_per_thread;
@@ -394,26 +434,50 @@ _QWEN3_5_RAGGED_SDPA_TWO_PASS_1_SOURCE = r"""
     U max_score = -3.4028234663852886e38f;
     U sum_exp_score = 0;
 
-    for (int i = int(block_idx); i < N; i += BLOCKS) {
-        U score = 0;
-        for (int j = 0; j < qk_per_thread; j++) {
-            score += q[j] * kptr[j];
+    if (k_elem == 1 && v_elem == 1) {
+        for (int i = int(block_idx); i < N; i += BLOCKS) {
+            U score = 0;
+            for (int j = 0; j < qk_per_thread; j++) {
+                score += q[j] * kptr[j];
+            }
+            score = simd_sum(score);
+
+            U new_max = max(max_score, score);
+            U factor = fast::exp(max_score - new_max);
+            U exp_score = fast::exp(score - new_max);
+
+            max_score = new_max;
+            sum_exp_score = sum_exp_score * factor + exp_score;
+
+            for (int j = 0; j < v_per_thread; j++) {
+                o[j] = o[j] * factor + exp_score * vptr[j];
+            }
+
+            kptr += BLOCKS * k_row;
+            vptr += BLOCKS * v_row;
         }
-        score = simd_sum(score);
+    } else {
+        for (int i = int(block_idx); i < N; i += BLOCKS) {
+            U score = 0;
+            for (int j = 0; j < qk_per_thread; j++) {
+                score += q[j] * kptr[j * k_elem];
+            }
+            score = simd_sum(score);
 
-        U new_max = max(max_score, score);
-        U factor = fast::exp(max_score - new_max);
-        U exp_score = fast::exp(score - new_max);
+            U new_max = max(max_score, score);
+            U factor = fast::exp(max_score - new_max);
+            U exp_score = fast::exp(score - new_max);
 
-        max_score = new_max;
-        sum_exp_score = sum_exp_score * factor + exp_score;
+            max_score = new_max;
+            sum_exp_score = sum_exp_score * factor + exp_score;
 
-        for (int j = 0; j < v_per_thread; j++) {
-            o[j] = o[j] * factor + exp_score * vptr[j];
+            for (int j = 0; j < v_per_thread; j++) {
+                o[j] = o[j] * factor + exp_score * vptr[j * v_elem];
+            }
+
+            kptr += BLOCKS * k_row;
+            vptr += BLOCKS * v_row;
         }
-
-        kptr += BLOCKS * D_SIZE;
-        vptr += BLOCKS * V_SIZE;
     }
 
     if (simd_lid == 0) {
@@ -541,6 +605,7 @@ def _qwen3_5_ragged_sdpa_one_pass_kernel(dtype, d_size, v_size):
         output_names=["out"],
         header="#include <metal_simdgroup>\nusing namespace metal;\n",
         source=_QWEN3_5_RAGGED_SDPA_ONE_PASS_SOURCE,
+        ensure_row_contiguous=False,
     )
 
 
@@ -555,6 +620,7 @@ def _qwen3_5_ragged_sdpa_two_pass_1_kernel(dtype, d_size, v_size, blocks):
         output_names=["partials", "sums", "maxs"],
         header="#include <metal_simdgroup>\nusing namespace metal;\n",
         source=_QWEN3_5_RAGGED_SDPA_TWO_PASS_1_SOURCE,
+        ensure_row_contiguous=False,
     )
 
 
@@ -674,9 +740,10 @@ def _qwen3_5_ragged_decode_attention(
         return None
     mode, blocks = plans[0]
 
+    # Only the queries need copying. The kernels read K/V through their strides,
+    # so a KV cache returned as a slice of a larger buffer (as BatchKVCache does)
+    # is not copied in full on every decode step.
     queries = mx.contiguous(queries)
-    keys = mx.contiguous(keys)
-    values = mx.contiguous(values)
     pads_array = _qwen3_5_cached_i32_array(pads)
     scale_array, k_size_array = _qwen3_5_cached_sdpa_scalars(float(scale), int(k_size))
     template = [
