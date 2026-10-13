@@ -510,6 +510,9 @@ TINY_MODELS = DATA["shared_configs"]
 def build_config(module, values, config_type="ModelConfig"):
     """Construct the model family's config classes from ordinary nested data."""
     fields = copy.deepcopy(values)
+    if module.__name__ == "mlx_vlm.models.minicpmv4_7" and config_type == "ModelConfig":
+        # Preserve the checkpoint loader's dense/MoE text-config dispatch.
+        return module.ModelConfig.from_dict(fields)
     for name, value in fields.items():
         if name in CONFIG_TYPES and isinstance(value, dict):
             fields[name] = build_config(module, value, CONFIG_TYPES[name])
@@ -848,6 +851,184 @@ def test_embedding_gemma2_quantized_checkpoint_roundtrip(
     assert reloaded.language_model.embed_tokens.bits == bits
     np.testing.assert_array_equal(actual, expected)
     np.testing.assert_allclose(mx.linalg.norm(actual, axis=-1), 1, atol=1e-6)
+
+
+@pytest.fixture(params=[c["id"] for c in DATA["cases"] if c["module"] == "minicpmv4_7"])
+def minicpmv47_case(request):
+    case = next(c for c in DATA["cases"] if c["id"] == request.param)
+    module = importlib.import_module("mlx_vlm.models." + case["module"])
+    return module, build_config(module, case["config"])
+
+
+@pytest.mark.parametrize("mode,count", [("16x", 4), ("4x", 16)])
+def test_minicpmv47_vision_and_chunked_prefill(minicpmv47_case, mode, count):
+    module, config = minicpmv47_case
+
+    model = module.Model(config)
+    ids = mx.array([[1, 50] + [48] * count + [51, 2]])
+    media = {
+        "pixel_values": [[mx.random.normal((3, 2, 128))]],
+        "tgt_sizes": [np.array([[8, 8]])],
+        "downsample_mode": mode,
+    }
+    features = model.get_input_embeddings(ids, **media)
+    assert features.inputs_embeds.shape == (*ids.shape, 16)
+    assert features.position_ids.shape == (3, 1, ids.shape[-1])
+    assert features.rope_deltas.item() < 0
+    ModelChecks().prefill_parity(model, ids, media, chunk_sizes=(3,))
+
+    # The outer model must preserve the canvas delta when decoding without images.
+    cache = model.language_model.make_cache()
+    model(ids, cache=cache, **media)
+    next_logits = model(mx.array([[3]]), cache=cache).logits
+    extended = mx.concatenate([ids, mx.array([[3]])], axis=1)
+    expected = model(extended, **media).logits[:, -1:]
+    assert mx.allclose(next_logits, expected, atol=2e-5)
+
+
+def test_minicpmv47_canvas_and_padding(minicpmv47_case):
+    module, config = minicpmv47_case
+    rope_module = importlib.import_module(module.__name__ + ".rope")
+
+    rope = rope_module.CanvasRoPE(config)
+    ids = np.array([[0, 0, 1, 50, 48, 48, 48, 48, 51, 2]])
+    positions, deltas = rope.get_rope_index(
+        ids,
+        (ids == 48).astype(np.int32),
+        np.array([[8, 8]]),
+        attention_mask=ids != 0,
+    )
+    expected = [
+        [0, 0, 0, 1, 1, 1, 1, 1, 1, 4],
+        [0, 0, 0, 0, 1, 1, 2, 2, 3, 4],
+        [0, 0, 0, 0, 1, 2, 1, 2, 3, 4],
+    ]
+    np.testing.assert_array_equal(positions[:, 0], expected)
+    assert deltas.item() == -3
+
+
+def test_minicpmv47_grid_validation(minicpmv47_case):
+    module, config = minicpmv47_case
+
+    model = module.Model(config)
+    ids = mx.array([[50, 48, 51]])
+    with pytest.raises(ValueError, match="crop grids"):
+        model.get_input_embeddings(ids)
+    with pytest.raises(ValueError, match="token count"):
+        model.get_input_embeddings(ids, tgt_sizes=[[[8, 8]]])
+    with pytest.raises(ValueError, match="crop grids"):
+        model.language_model.get_rope_index(ids)
+
+
+def test_minicpmv47_slices_share_the_thumbnail_canvas(minicpmv47_case):
+    module, config = minicpmv47_case
+    rope_module = importlib.import_module(module.__name__ + ".rope")
+
+    ids = np.array([[1, 50, 48, 51, 52, 48, 53, 52, 48, 53, 2]])
+    positions, _ = rope_module.CanvasRoPE(config).get_rope_index(
+        ids, (ids == 48).astype(np.int32), np.array([[4, 4]] * 3)
+    )
+    expected = [
+        [0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 4],
+        [0, 0, 1, 2, 1, 1, 1, 1, 1, 1, 4],
+        [0, 0, 1, 3, 1, 1, 1, 2, 2, 2, 4],
+    ]
+    np.testing.assert_array_equal(positions[:, 0], expected)
+
+
+@pytest.mark.parametrize("minicpmv47_case", ["minicpmv4_7"], indirect=True)
+def test_minicpmv47_sanitize_is_idempotent(minicpmv47_case):
+    module, config = minicpmv47_case
+
+    model = module.Model(config)
+    weights = {
+        "model.language_model.layers.0.input_layernorm.weight": mx.zeros((16,)),
+        "model.language_model.layers.0.linear_attn.conv1d.weight": mx.ones((80, 1, 3)),
+        "model.vision_tower.embeddings.patch_embedding.weight": mx.zeros((16, 3, 2, 2)),
+    }
+    first = model.sanitize(weights)
+    second = model.sanitize(first)
+    assert first.keys() == second.keys()
+    for key in first:
+        assert mx.array_equal(first[key], second[key])
+    assert mx.array_equal(
+        first["language_model.model.layers.0.input_layernorm.weight"],
+        mx.ones((16,)),
+    )
+    assert first["vision_tower.embeddings.patch_embedding.weight"].shape == (
+        16,
+        2,
+        2,
+        3,
+    )
+
+
+@pytest.mark.parametrize("minicpmv47_case", ["minicpmv4_7_moe"], indirect=True)
+def test_minicpmv47_native_expert_checkpoint_and_reload(minicpmv47_case, tmp_path):
+    module, config = minicpmv47_case
+    qwen = importlib.import_module("mlx_vlm.models.qwen3_5.qwen3_5")
+    moe = importlib.import_module("mlx_vlm.models.qwen3_5_moe.language")
+
+    model = module.Model(config)
+    assert isinstance(model.layers[0].mlp, moe.Qwen3_5MoeSparseMoeBlock)
+    expected = dict(tree_flatten(model.parameters()))
+    raw = {}
+    for key, value in expected.items():
+        if ".switch_mlp." in key:
+            continue
+        if key.startswith("language_model.model."):
+            key = key.replace("language_model.model.", "model.language_model.", 1)
+            if key.endswith(qwen.NORM_WEIGHT_SUFFIXES):
+                value = value - 1
+            if "conv1d.weight" in key:
+                value = value.swapaxes(1, 2)
+        elif key.startswith("language_model.lm_head."):
+            key = key.replace("language_model.", "", 1)
+        else:
+            key = "model." + key.replace("vit_merger.", "vision_tower.vit_merger.", 1)
+            if key.endswith("patch_embedding.weight"):
+                value = value.transpose(0, 3, 1, 2)
+        raw[key] = value
+    for index, layer in enumerate(model.layers):
+        prefix = f"model.language_model.layers.{index}.mlp.experts"
+        experts = layer.mlp.switch_mlp
+        raw[f"{prefix}.gate_up_proj"] = mx.concatenate(
+            [experts.gate_proj.weight, experts.up_proj.weight], axis=-2
+        )
+        raw[f"{prefix}.down_proj"] = experts.down_proj.weight
+
+    sanitized = model.sanitize(raw)
+    assert sanitized.keys() == expected.keys()
+    for key, value in expected.items():
+        assert mx.array_equal(sanitized[key], value), key
+    reloaded = model.sanitize(sanitized)
+    for key, value in sanitized.items():
+        assert mx.array_equal(reloaded[key], value), key
+    model.load_weights(list(reloaded.items()), strict=True)
+    mx.eval(model(mx.array([[1, 2, 3]])).logits)
+    (tmp_path / "config.json").write_text(json.dumps(asdict(model.config)))
+    for weights in (raw, sanitized):
+        mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+        loaded = load_model(tmp_path)
+        assert isinstance(loaded.layers[0].mlp, moe.Qwen3_5MoeSparseMoeBlock)
+        for key, value in tree_flatten(loaded.parameters()):
+            assert mx.array_equal(value, expected[key]), key
+
+
+@pytest.mark.parametrize("minicpmv47_case", ["minicpmv4_7_moe"], indirect=True)
+def test_minicpmv47_router_quantization_and_state_dtype(minicpmv47_case):
+    module, config = minicpmv47_case
+
+    model = module.Model(config)
+    prefix = "language_model.model.layers.0"
+    assert model.quant_predicate(f"{prefix}.mlp.gate", None) == {
+        "group_size": 64,
+        "bits": 8,
+    }
+    assert model.quant_predicate(f"{prefix}.mlp.switch_mlp.up_proj", None)
+    assert not model.quant_predicate(f"{prefix}.linear_attn.in_proj_qkv", None)
+    assert not model.cast_predicate(f"{prefix}.linear_attn.A_log")
+    assert model.cast_predicate(f"{prefix}.mlp.switch_mlp.up_proj.weight")
 
 
 @pytest.mark.parametrize("name", DATA["dense"])
