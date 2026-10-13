@@ -59,6 +59,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | PP-DocLayoutV3 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/pp_doclayout_v3/README.md) |
 | Granite Vision 3.2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite_vision/README.md) |
 | Granite 4.0 Vision | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite4_vision/README.md) |
+| MiniCPM-V 4.7 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minicpmv4_7/README.md) |
 | MiniCPM-V 4.6 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minicpmv4_6/README.md) |
 | GLiNER2.5 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/gliner2_5/README.md) |
 | BERT | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/bert/README.md) |
@@ -1824,13 +1825,29 @@ See [docs/usage.md](https://github.com/Blaizzy/mlx-vlm/blob/main/docs/usage.md#d
 
 # Fine-tuning
 
-MLX-VLM supports fine-tuning models with LoRA and QLoRA. Fine-tuning (and the
+MLX-VLM supports VLM SFT, ORPO, and DPO with LoRA, QLoRA, DoRA, or full
+fine-tuning. Fine-tuning (and the
 eval scripts) need the training extra, which is not installed by default:
 
 ```bash
 pip install "mlx-vlm[train]"
 ```
 
-## LoRA & QLoRA
+Train from the CLI with `python -m mlx_vlm.train`:
 
-To learn more about LoRA, please refer to the [LoRA.md](./mlx_vlm/LORA.MD) file.
+```bash
+python -m mlx_vlm.train \
+  --model mlx-community/Qwen2.5-VL-3B-Instruct-4bit \
+  --data data --train-on-completions \
+  --batch-size 1 --gradient-accumulation-steps 4 \
+  --iters 100 --adapter-file adapters/sft/weights.safetensors
+```
+
+For Python and notebooks, import `Trainer`, `VLMTrainingArgs`, and
+`prepare_model_for_training` from `mlx_vlm.trainer`. The CLI and notebook API
+share model preparation and the training engine.
+
+Start with the [SFT notebook](examples/training/sft_text_only.ipynb), or explore the
+[ORPO, DPO, and custom-loss examples](examples/training/README.md). See the
+[training guide](docs/training.md) for dataset formats, configuration, saving,
+resuming, and the existing functional trainer APIs.

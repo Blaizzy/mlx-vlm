@@ -66,6 +66,40 @@ from mlx_vlm.tests.test_processors import MINICPM_MULTICALL
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
 from mlx_vlm.tools import load_tool_module, process_tool_calls
 
+
+def test_cancellation_is_acknowledged_only_after_removal():
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen._cancelled = {7}
+    gen._cancel_lock = Lock()
+    rqueue = Queue()
+    active = {7: {"rqueue": rqueue}}
+    batch_gen = NS(remove=MagicMock(side_effect=[False, True]))
+
+    gen._apply_cancellations(batch_gen, active)
+    assert 7 in active
+    assert rqueue.empty()
+    assert gen._cancelled == {7}
+
+    gen._apply_cancellations(batch_gen, active)
+    assert active == {}
+    assert rqueue.get_nowait() is None
+    assert rqueue.empty()
+    assert gen._cancelled == set()
+    assert batch_gen.remove.call_count == 2
+
+
+def test_cancellation_of_finished_request_is_ignored():
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen._cancelled = {7}
+    gen._cancel_lock = Lock()
+    batch_gen = NS(remove=MagicMock())
+
+    gen._apply_cancellations(batch_gen, {})
+
+    batch_gen.remove.assert_not_called()
+    assert gen._cancelled == set()
+
+
 _MUSE_RESPONSE_TEMPLATE = {
     "defaults": {"role": "assistant"},
     "fields": {
@@ -1749,7 +1783,11 @@ def test_responses_native_tool_calls(client, kind, stream):
 
 def _completed_response(response):
     events = _data(response)
-    final = next(e["response"] for e in events if e["type"] == "response.completed")
+    final = next(
+        e["response"]
+        for e in events
+        if e["type"] in ("response.completed", "response.incomplete")
+    )
     output = final["output"]
     for kind in ("added", "done"):
         items = [e for e in events if e["type"] == f"response.output_item.{kind}"]
@@ -1866,6 +1904,8 @@ def test_responses_truncated_preopened_reasoning(client, continuous, stream):
         ),
     ):
         response = _response(client, stream=stream)
+    assert response["status"] == "incomplete"
+    assert response["incomplete_details"] == {"reason": "max_output_tokens"}
     assert response["output_text"] == ""
     assert len(response["output"]) == 1
     item = response["output"][0]
@@ -2675,8 +2715,93 @@ class TestCompaction:
         assert mocked.generate.call_count == 1
 
     @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("api", ["responses", "chat"])
+    @pytest.mark.parametrize("limit", [2048, 4096, 8192, 128000])
+    @pytest.mark.parametrize("output", [64, 128000, 256000])
+    def test_max_output_is_a_ceiling_for_short_prompts(
+        self, mocked, client, monkeypatch, api, stream, limit, output
+    ):
+        mocked.config.max_position_embeddings = 128000
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", limit)
+        options = dict(
+            stream=stream,
+            context_management=[
+                {"type": "compaction", "compact_threshold": limit * 3 // 4}
+            ],
+        )
+        if api == "chat":
+            options.update(
+                messages=[_msg("Are you ready to help me with some coding?")],
+                max_tokens=output,
+            )
+        else:
+            options.update(
+                input="Are you ready to help me with some coding?",
+                max_output_tokens=output,
+            )
+        original = copy.deepcopy(options)
+        response = _post(client, api, **options)
+        assert response.status_code == 200, response.text
+        assert options == original
+        assert mocked.generate.call_count == (0 if stream else 1)
+        answer = mocked.stream.call_args if stream else mocked.generate.call_args
+        prompt_tokens = len(answer.kwargs["prompt"]) // 4
+        assert answer.kwargs["max_tokens"] == min(output, limit - prompt_tokens)
+        assert "Conversation handoff" not in answer.kwargs["prompt"]
+
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("api", ["responses", "chat"])
+    @pytest.mark.parametrize("offset", [-1, 0, 1])
+    def test_actual_input_triggers_compaction_and_output_uses_compacted_size(
+        self, mocked, client, monkeypatch, api, stream, offset
+    ):
+        items = [_compaction_message("older evidence " * 150) for _ in range(5)]
+        items.append(_compaction_message("Continue"))
+        before = mocked.count(input=items)["input_tokens"]
+        limit = before * 2
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", limit)
+        options = dict(
+            stream=stream,
+            context_management=[
+                {"type": "compaction", "compact_threshold": before + offset}
+            ],
+        )
+        if api == "chat":
+            options.update(messages=items, max_tokens=limit)
+        else:
+            options.update(input=items, max_output_tokens=limit)
+        response = _post(client, api, **options)
+        assert response.status_code == 200, response.text
+        should_compact = offset <= 0
+        assert mocked.generate.call_count == int(should_compact) + int(not stream)
+        answer = mocked.stream.call_args if stream else mocked.generate.call_args
+        after = len(answer.kwargs["prompt"]) // 4
+        assert answer.kwargs["max_tokens"] == limit - after
+        assert ("Conversation handoff" in answer.kwargs["prompt"]) == should_compact
+        if should_compact:
+            assert after < before
+
+    @pytest.mark.parametrize("api", ["responses", "chat"])
+    def test_required_input_must_leave_room_for_generation(
+        self, mocked, api, monkeypatch
+    ):
+        items = [_compaction_message("protected input " * 500)]
+        before = mocked.count(input=items)["input_tokens"]
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", before)
+        options = dict(
+            context_management=[{"type": "compaction", "compact_threshold": 1}]
+        )
+        if api == "chat":
+            options.update(messages=items, max_tokens=before)
+        else:
+            options.update(input=items, max_output_tokens=before)
+        response = mocked.request(api, status=400, **options)
+        assert "Protected conversation" in response["detail"]
+        mocked.generate.assert_not_called()
+
+    @pytest.mark.parametrize("stream", [False, True])
     @pytest.mark.parametrize("api", ["responses", "chat", "chat-default"])
-    def test_output_budget_overrides_compaction_threshold(
+    def test_unused_output_does_not_override_compaction_threshold(
         self, mocked, client, monkeypatch, api, stream
     ):
         items = [_compaction_message("old evidence " * 150) for _ in range(6)]
@@ -2696,10 +2821,11 @@ class TestCompaction:
             options.update(input=items, max_output_tokens=256)
         response = _post(client, api, **options)
         assert response.status_code == 200, response.text
-        assert mocked.generate.call_count == (1 if stream else 2)
+        assert mocked.generate.call_count == (0 if stream else 1)
         answer_call = mocked.stream.call_args if stream else mocked.generate.call_args
-        assert len(answer_call.kwargs["prompt"]) // 4 + 256 <= before + 32
-        assert "Conversation handoff" in answer_call.kwargs["prompt"]
+        assert answer_call.kwargs["max_tokens"] == 32
+        assert len(answer_call.kwargs["prompt"]) // 4 + 32 == before + 32
+        assert "Conversation handoff" not in answer_call.kwargs["prompt"]
 
     @pytest.mark.parametrize("single_turn", [False, True])
     @pytest.mark.parametrize("stream", [False, True])
@@ -3047,8 +3173,8 @@ class TestCompaction:
     @pytest.mark.parametrize(
         "threshold, output_tokens, status",
         [
-            pytest.param(1, 32768, 400, id="budget-above-threshold"),
-            pytest.param(100000, 32768, 400, id="budget-below-threshold"),
+            pytest.param(1, 0, 400, id="zero-output"),
+            pytest.param(100000, -1, 400, id="negative-output"),
             pytest.param(0, 64, 422, id="zero-threshold"),
             pytest.param(-1, 64, 422, id="negative-threshold"),
             pytest.param("bad", 64, 422, id="nonnumeric-threshold"),
@@ -3385,7 +3511,7 @@ class TestCompaction:
                 "responses",
                 input=_compaction_history(),
                 stream=True,
-                max_output_tokens=32768,
+                max_output_tokens=0,
                 context_management=[{"type": "compaction", "compact_threshold": 1}],
             )
         )
@@ -6345,3 +6471,109 @@ def test_decisions_leave_mixed_media_to_the_model(client):
     model.predict.assert_called_once_with(
         None, None, questions, images=["cat.png"], audio="meow.wav"
     )
+
+
+@pytest.mark.parametrize("api", ["chat", "responses"])
+@pytest.mark.parametrize("batching", [False, True])
+@pytest.mark.parametrize("truncated", [False, True])
+@pytest.mark.parametrize("response_template", [False, True])
+def test_tool_arguments_stream_incrementally(
+    client, api, batching, truncated, response_template
+):
+    chunks = [
+        '<tool_call>{"name":"get_weather","arguments":{"city":"',
+        "War",
+        "saw",
+        '"}}</tool_call>',
+    ]
+    if truncated:
+        chunks = chunks[:-1]
+    tokens = [
+        _token(text, finish_reason="stop" if i == len(chunks) - 1 else None)
+        for i, text in enumerate(chunks)
+    ]
+    template = {
+        "defaults": {"role": "assistant"},
+        "fields": {
+            "content": {"content": "text"},
+            "tool_calls": {
+                "open": "<tool_call>",
+                "close": "</tool_call>",
+                "content": "json",
+                "repeats": True,
+            },
+        },
+    }
+    processor = (
+        NS(
+            response_template=template,
+            get_response_parser=lambda prefix: ResponseParser(template, prefix=prefix),
+            parse_response=lambda text, prefix: parse_response(
+                text, template, prefix=prefix
+            ),
+        )
+        if response_template
+        else None
+    )
+    with _endpoint(
+        generator=_streaming(tokens) if batching else None,
+        chunks=[
+            _result(token.text, finish_reason=token.finish_reason) for token in tokens
+        ],
+        parser=load_tool_module("json_tools"),
+        processor=processor,
+    ):
+        response = _post(client, api, stream=True, tools=[_tool()])
+    events = _data(response)
+    if api == "responses":
+        deltas = [
+            event
+            for event in events
+            if event.get("type") == "response.function_call_arguments.delta"
+        ]
+        assert len(deltas) >= 3
+        assert deltas[0]["delta"] == '{"city":"'
+        added = next(
+            event
+            for event in events
+            if event.get("type") == "response.output_item.added"
+        )
+        assert added["item"]["arguments"] == ""
+        assert all(
+            event["item_id"] == added["item"]["id"]
+            and event["output_index"] == added["output_index"]
+            for event in deltas
+        )
+        completed = [
+            event for event in events if event.get("type") == "response.completed"
+        ]
+        if truncated:
+            assert not completed and any(
+                event.get("type") in ("error", "response.failed") for event in events
+            )
+        else:
+            final = completed[0]["response"]["output"][0]
+            assert final["arguments"] == _joined(deltas, "delta") == '{"city":"Warsaw"}'
+            assert final["id"] == added["item"]["id"]
+            assert final["call_id"] == added["item"]["call_id"]
+    else:
+        choices = [event["choices"][0] for event in events if event.get("choices")]
+        calls = [
+            call
+            for choice in choices
+            for call in choice["delta"].get("tool_calls") or []
+        ]
+        assert len(calls) >= 3
+        assert calls[0]["function"]["name"] == "get_weather"
+        assert calls[0]["function"]["arguments"] == '{"city":"'
+        finishes = [
+            choice["finish_reason"] for choice in choices if choice.get("finish_reason")
+        ]
+        if truncated:
+            assert not finishes and any("error" in event for event in events)
+        else:
+            assert finishes == ["tool_calls"]
+            assert (
+                "".join(call["function"].get("arguments", "") for call in calls)
+                == '{"city":"Warsaw"}'
+            )

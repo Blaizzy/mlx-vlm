@@ -350,6 +350,7 @@ class CompactedContext:
     usage: Any = None
     changed: bool = False
     covered: frozenset[str] = frozenset()
+    max_output_tokens: int | None = None
 
 
 async def compact(
@@ -555,9 +556,10 @@ async def compact_response_context(
     summary_tokens = (
         min(1024, max(128, limit // 16)) if automatic else request.max_output_tokens
     )
-    reserve = args.max_tokens if automatic else summary_tokens
-    available = limit - reserve
-    if reserve <= 0 or available <= 0:
+    # Max output is a ceiling, not occupied context. Automatic compaction
+    # follows actual input usage; generation gets the remaining space below.
+    available = limit - (1 if automatic else summary_tokens)
+    if (args.max_tokens if automatic else summary_tokens) <= 0 or available <= 0:
         raise HTTPException(
             400, "Output reservation leaves no room for compacted context."
         )
@@ -569,7 +571,13 @@ async def compact_response_context(
             or before < request.context_management[0].compact_threshold
         )
     ):
-        return CompactedContext(items, before, before, covered=covered)
+        return CompactedContext(
+            items,
+            before,
+            before,
+            covered=covered,
+            max_output_tokens=min(args.max_tokens, limit - before),
+        )
     summary_request = request.model_copy(
         update={
             "max_output_tokens": summary_tokens,
@@ -717,6 +725,8 @@ async def compact_response_context(
         raise ContextBudgetError(
             "Protected conversation exceeds the available context budget."
         )
+    if automatic:
+        result.max_output_tokens = min(args.max_tokens, limit - result.after_tokens)
     return result
 
 

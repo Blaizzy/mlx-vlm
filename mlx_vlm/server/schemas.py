@@ -562,6 +562,7 @@ class OpenAIResponse(BaseModel):
     status: Literal["completed", "failed", "in_progress", "incomplete"] = Field(
         ..., description="The status of the response generation"
     )
+    incomplete_details: Optional[dict[str, str]] = None
     error: Optional[OpenAIErrorObject] = Field(
         None,
         description="An error object returned when the model fails to generate a Response",

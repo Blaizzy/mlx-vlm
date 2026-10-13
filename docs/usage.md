@@ -35,6 +35,18 @@ output = generate(model, processor, formatted_prompt, image, verbose=False)
 print(output)
 ```
 
+## Streaming tool calls
+
+With `stream: true`, Chat Completions sends argument fragments in
+`choices[0].delta.tool_calls`; Responses sends
+`response.function_call_arguments.delta` events. Accumulate fragments by call
+index (Chat Completions) or item ID (Responses). Execute a tool only after the
+stream completes successfully and its arguments are complete.
+
+Incremental arguments are supported for JSON, Cohere, Qwen Coder XML, and Gemma
+tool formats. Other parsers retain their completed-call behavior. XML values
+that require type conversion are buffered until the parameter closes.
+
 ## Conversation compaction and APC
 
 Compaction replaces older conversation turns with a model-generated handoff and
@@ -103,13 +115,19 @@ For automatic compaction, add this field to a Responses request:
 
 The server checks the rendered input token count **before generation**, including
 for streaming requests. This implementation does not compact mid-generation.
-The threshold is overridden when input plus reserved output would exceed the
-context limit. Automatic and terminal-trigger compaction can summarize oversized
-history in up to eight bounded passes, preserving instructions and splitting
-only between user turns or completed tool-call/result groups. Every summary call
-must fit the model window and reduce its input; otherwise the request fails
-without replacing the original context. A single oversized message or indivisible
-tool group still needs to be reduced by the caller. The standalone
+Only actual input usage triggers compaction; unused `max_output_tokens` (or
+Chat Completions `max_tokens`) does not reserve context or lower the threshold.
+After compaction, generation is capped at the smaller of the requested output
+limit and the remaining context capacity. A short prompt can therefore use a
+Max output setting equal to or larger than the context window. Generation stops
+with a length finish reason if it fills the remaining window; the next request
+can compact that history. Input that leaves no room for generation even after
+compaction is still rejected. Automatic and terminal-trigger compaction can
+summarize oversized history in up to eight bounded passes, preserving instructions
+and splitting only between user turns or completed tool-call/result groups. Every
+summary call must fit the model window and reduce its input; otherwise the request
+fails without replacing the original context. A single oversized message or
+indivisible tool group still needs to be reduced by the caller. The standalone
 `/responses/compact` endpoint still requires its input to fit.
 When compaction happens, the response output starts with a
 `type: "compaction"` item. Append the output normally, or keep only the newest
@@ -118,8 +136,8 @@ works while that response is stored. `/v1/responses/input_tokens` counts the
 decoded context, not the encrypted payload's string length. Normal response
 usage counts the final inference; explicit compact usage counts the summary pass.
 
-Chat Completions automatically compacts supported history when the full input
-plus requested output exceeds the context limit. No threshold setting is needed.
+Chat Completions automatically compacts supported history when the actual input
+leaves no room for generation within the context limit. No threshold setting is needed.
 The optional `context_management` field enables earlier compaction; an empty list
 explicitly disables compaction. Recovery supports text, images, and tool history;
 audio/video requests keep their existing behavior. Compaction finishes before the
