@@ -236,11 +236,14 @@ def make_response_stream_state(
     enable_thinking: bool = False,
     thinking_start_token: Optional[str] = None,
     thinking_end_token: Optional[str] = None,
+    prompt_prefix: str = "",
 ):
     tokenizer = _response_template_tokenizer(processor)
     if tokenizer is not None and hasattr(tokenizer, "get_response_parser"):
         try:
-            return ResponseTemplateStreamState(tokenizer.get_response_parser(prefix=""))
+            return ResponseTemplateStreamState(
+                tokenizer.get_response_parser(prefix=prompt_prefix)
+            )
         except (AttributeError, TypeError, ValueError):
             logger.debug(
                 "Falling back from tokenizer response-template parser", exc_info=True
@@ -469,6 +472,7 @@ def _split_thinking(
     thinking_end_token: Optional[str] = None,
     starts_in_thinking: bool = False,
     processor=None,
+    prompt_prefix: str = "",
 ) -> Tuple[Optional[str], str]:
     if not text:
         return None, text
@@ -476,7 +480,7 @@ def _split_thinking(
     tokenizer = _response_template_tokenizer(processor)
     if tokenizer is not None and hasattr(tokenizer, "parse_response"):
         try:
-            parsed = tokenizer.parse_response(text, prefix="")
+            parsed = tokenizer.parse_response(text, prefix=prompt_prefix)
             if isinstance(parsed, dict) and (
                 "content" in parsed
                 or "reasoning" in parsed
@@ -534,6 +538,7 @@ def _response_output_items_from_text(
     reasoning_item_id: Optional[str] = None,
     processor=None,
     starts_in_thinking: bool = False,
+    prompt_prefix: str = "",
 ) -> Tuple[List[Dict[str, Any]], str, Optional[str], str]:
     reasoning, content = _split_thinking(
         full_text,
@@ -541,6 +546,7 @@ def _response_output_items_from_text(
         thinking_end_token,
         starts_in_thinking=starts_in_thinking,
         processor=processor,
+        prompt_prefix=prompt_prefix,
     )
     reasoning_items = _reasoning_output_items(reasoning, reasoning_item_id)
     if tool_module is not None and chat_tools:
@@ -554,6 +560,8 @@ def _response_output_items_from_text(
                 thinking_start_token,
                 thinking_end_token,
                 starts_in_thinking=starts_in_thinking,
+                processor=processor,
+                prompt_prefix=prompt_prefix,
             )
             remaining = strip_protocol_markers(
                 remaining, tool_module, thinking_start_token, thinking_end_token

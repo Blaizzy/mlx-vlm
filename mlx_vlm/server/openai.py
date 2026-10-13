@@ -1327,6 +1327,7 @@ async def responses_endpoint(request: Request):
                         starts_in_thinking,
                         gen_args.thinking_start_token,
                         gen_args.thinking_end_token,
+                        prompt_prefix=formatted_prompt,
                     )
                     reasoning_item_id = f"rs_{uuid.uuid4().hex}"
                     streamed_reasoning = ""
@@ -1454,6 +1455,7 @@ async def responses_endpoint(request: Request):
                             reasoning_item_id,
                             processor=processor,
                             starts_in_thinking=starts_in_thinking,
+                            prompt_prefix=formatted_prompt,
                         )
                     )
                     if clean_text and not any(
@@ -1691,6 +1693,7 @@ async def responses_endpoint(request: Request):
                         gen_args.thinking_end_token,
                         processor=processor,
                         starts_in_thinking=starts_in_thinking,
+                        prompt_prefix=formatted_prompt,
                     )
                 )
                 if output_finish_reason == "tool_calls":
@@ -2020,6 +2023,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             ),
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
+                            prompt_prefix=formatted_prompt,
                         )
                         full_output = ""  # raw output for tool call parsing
                         # Track tool-call state to suppress markup from content
@@ -2196,6 +2200,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             ),
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
+                            prompt_prefix=formatted_prompt,
                         )
                         tool_call_state = ToolCallStreamState(
                             tool_module.tool_call_start if tool_module else None,
@@ -2496,6 +2501,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         gen_args.thinking_end_token,
                     ),
                     processor=processor,
+                    prompt_prefix=formatted_prompt,
                 )
 
                 # Count raw generated tokens minus thinking tag tokens
@@ -2524,6 +2530,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             tc.remaining_text or "",
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
+                            processor=processor,
+                            prompt_prefix=formatted_prompt,
                         )
                         content = (
                             strip_protocol_markers(
