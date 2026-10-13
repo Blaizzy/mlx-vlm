@@ -1,4 +1,4 @@
-"""Central framework for extracting native MTP tensors into a standalone drafter.
+"""Prepare native MTP tensors for in-memory loading or standalone extraction.
 
 One ``MTPSplitter`` base owns the shared mechanics (shard discovery, selective
 load, config assembly, tokenizer copy). A family customizes by subclassing and
@@ -21,7 +21,12 @@ from safetensors import safe_open
 
 from ...fp8 import transform_fp8_weights
 from ...quant_utils import get_quantization_params
-from ...utils import get_model_path
+from ...utils import (
+    get_model_and_args,
+    get_model_path,
+    get_model_type,
+    load_model_weights,
+)
 
 
 def _safetensor_files(model_path: Path) -> List[Path]:
@@ -49,9 +54,6 @@ class MTPSplitter:
     # --- declarative per-family config (override in subclass) ---
     output_model_type: str = ""
     draft_model_cls = None  # class with a ``sanitize(self, weights)`` staticlike method
-    require_text_config: bool = (
-        True  # True: use text_config only; False: fall back to root
-    )
     tie_word_embeddings_default: bool = False
     depth_field: str = "num_nextn_predict_layers"
     block_size_extra: int = 1  # block_size default = depth + block_size_extra
@@ -63,14 +65,12 @@ class MTPSplitter:
     )
 
     # --- hooks (override the small differences) ---
+    @classmethod
+    def from_config(cls, source_config: dict):
+        return cls()
+
     def read_text_config(self, source_config: dict) -> dict:
-        text_config = dict(
-            source_config.get("text_config")
-            or ({} if self.require_text_config else source_config)
-        )
-        if self.require_text_config and not text_config:
-            raise ValueError("source config does not contain a text_config.")
-        return text_config
+        return dict(source_config.get("text_config") or source_config)
 
     def select_keys(self, key: str, text_config: dict) -> bool:
         raise NotImplementedError
@@ -202,24 +202,18 @@ class MTPSplitter:
         self.postprocess(tensors, text_config)
         return tensors
 
-    def split(
+    def prepare(
         self,
-        source: str,
-        output: str,
+        source_path: Path,
         *,
-        revision: Optional[str] = None,
+        source_config: Optional[dict] = None,
         block_size: Optional[int] = None,
-        force_download: bool = False,
         **quant_opts,
-    ) -> Path:
-        source_path = get_model_path(
-            source, revision=revision, force_download=force_download
-        )
-        output_path = Path(output)
-        output_path.mkdir(parents=True, exist_ok=True)
-
-        with open(source_path / "config.json") as f:
-            source_config = json.load(f)
+    ) -> Tuple[dict, Dict[str, mx.array]]:
+        """Prepare a drafter config and weights in memory without writing files."""
+        if source_config is None:
+            with open(source_path / "config.json") as f:
+                source_config = json.load(f)
         text_config = self.read_text_config(source_config)
 
         selected: Dict[str, mx.array] = {}
@@ -253,13 +247,6 @@ class MTPSplitter:
             weights, source_config, text_config, quant_opts
         )
 
-        mx.eval(list(weights.values()))
-        mx.save_safetensors(
-            str(output_path / "model.safetensors"),
-            weights,
-            metadata={"format": "mlx"},
-        )
-
         depth = self.depth(text_config)
         draft_config = {
             "model_type": self.output_model_type,
@@ -273,6 +260,44 @@ class MTPSplitter:
         if quantization is not None:
             draft_config["quantization"] = quantization
             draft_config["quantization_config"] = quantization
+
+        return draft_config, weights
+
+    def load(
+        self, source_path: Path, lazy: bool = False, *, source_config=None, **kwargs
+    ):
+        """Load prepared drafter tensors without writing a standalone checkpoint."""
+        config, weights = self.prepare(source_path, source_config=source_config)
+        arch, _ = get_model_and_args(config)
+        model = arch.Model(arch.ModelConfig.from_dict(config))
+        return load_model_weights(
+            model, config, weights, source_path, lazy=lazy, **kwargs
+        )
+
+    def split(
+        self,
+        source: str,
+        output: str,
+        *,
+        revision: Optional[str] = None,
+        block_size: Optional[int] = None,
+        force_download: bool = False,
+        **quant_opts,
+    ) -> Path:
+        source_path = get_model_path(
+            source, revision=revision, force_download=force_download
+        )
+        draft_config, weights = self.prepare(
+            source_path, block_size=block_size, **quant_opts
+        )
+        output_path = Path(output)
+        output_path.mkdir(parents=True, exist_ok=True)
+        mx.eval(list(weights.values()))
+        mx.save_safetensors(
+            str(output_path / "model.safetensors"),
+            weights,
+            metadata={"format": "mlx"},
+        )
 
         with open(output_path / "config.json", "w") as f:
             json.dump(dict(sorted(draft_config.items())), f, indent=2)
@@ -298,17 +323,49 @@ MTP_SPLITTERS: Dict[str, str] = {
     "glm5_next": "mlx_vlm.speculative.drafters.glm5_next_mtp.split:Glm5NextMTPSplitter",
     "glm5_next_text": "mlx_vlm.speculative.drafters.glm5_next_mtp.split:Glm5NextMTPSplitter",
     "glm_moe_dsa": "mlx_vlm.speculative.drafters.glm_moe_dsa_mtp.split:GlmMoeDsaMTPSplitter",
+    "inkling": "mlx_vlm.speculative.drafters.inkling_mtp.split:InklingMTPSplitter",
     "inkling_mm_model": "mlx_vlm.speculative.drafters.inkling_mtp.split:InklingMTPSplitter",
 }
 
 
-def get_mtp_splitter(base_model_type: str) -> Optional[MTPSplitter]:
-    target = MTP_SPLITTERS.get(base_model_type)
-    if target is None:
+def get_mtp_splitter(
+    base_model_type: Optional[str] = None, *, source_config: Optional[dict] = None
+) -> Optional[MTPSplitter]:
+    """Resolve a bundled family from its text/root config or an explicit type."""
+    source_config = source_config or {}
+    # Checkpoint-local model code takes precedence over built-in architectures.
+    if source_config.get("model_file"):
         return None
-    module_path, class_name = target.split(":")
-    cls = getattr(importlib.import_module(module_path), class_name)
-    return cls()
+    root_model_type = get_model_type(source_config)
+    text_config = source_config.get("text_config") or source_config
+    # Keep root architecture metadata when resolving an inner backbone type.
+    # A standalone drafter can declare the same backbone as a bundled MTP model.
+    model_types = (
+        (base_model_type,)
+        if base_model_type is not None
+        else (
+            get_model_type(
+                {
+                    **source_config,
+                    "model_type": text_config.get("model_type")
+                    or source_config.get("model_type"),
+                }
+            ),
+            root_model_type,
+        )
+    )
+    for model_type in model_types:
+        target = MTP_SPLITTERS.get(model_type)
+        if target is None:
+            continue
+        module_path, class_name = target.split(":")
+        cls = getattr(importlib.import_module(module_path), class_name)
+        splitter = cls.from_config(source_config)
+        # Extracted drafters retain the base text_config but need no splitting.
+        if root_model_type == splitter.output_model_type:
+            return None
+        return splitter
+    return None
 
 
 def detect_mtp_splitter(model_path: Path) -> Optional[MTPSplitter]:
@@ -323,35 +380,7 @@ def detect_mtp_splitter(model_path: Path) -> Optional[MTPSplitter]:
         return None
     with open(config_path) as f:
         source_config = json.load(f)
-    text_config = source_config.get("text_config") or source_config
-    model_types = {
-        text_config.get("model_type"),
-        source_config.get("model_type"),
-    }
-    if "deepseek_v4" in model_types and (
-        text_config.get("dspark_target_layer_ids")
-        or source_config.get("dspark_target_layer_ids")
-    ):
-        from .deepseek_v4_dspark.split import DeepseekV4DsparkSplitter
-
-        splitter = DeepseekV4DsparkSplitter()
-        tc = splitter.read_text_config(source_config)
-        for _ in splitter.iter_selected(model_path, tc):
-            return splitter
-
-    # Some checkpoints name the inner text stack separately from the
-    # architecture (Apodex 1.1 uses text_config "qwen3_5_moe_text" under a
-    # root "qwen3_5_moe"), so fall back to the root type before giving up.
-    splitter = None
-    for base_model_type in (
-        text_config.get("model_type"),
-        source_config.get("model_type"),
-    ):
-        if not base_model_type:
-            continue
-        splitter = get_mtp_splitter(base_model_type)
-        if splitter is not None:
-            break
+    splitter = get_mtp_splitter(source_config=source_config)
     if splitter is None:
         return None
     tc = splitter.read_text_config(source_config)

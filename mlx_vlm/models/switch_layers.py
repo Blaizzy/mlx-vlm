@@ -8,6 +8,80 @@ import numpy as np
 from .activations import swiglu
 from .linear import DECODE_BLOCK_SIZE
 
+GLOBAL_SCALE_SUFFIXES = ("weight_scale_2", "weight_global_scale")
+EXPERT_WEIGHT_SUFFIXES = (
+    "weight",
+    "scales",
+    "biases",
+    *GLOBAL_SCALE_SUFFIXES,
+)
+
+
+def expert_scale_rows(scale, shape):
+    """Broadcast a tensor or per-expert factor over its output rows."""
+    if scale.size == 1:
+        scale = scale.reshape(())
+    else:
+        scale = scale.reshape(*shape[:-1], -1)
+    return mx.broadcast_to(scale, shape)
+
+
+def expand_expert_scales(weights, prefixes):
+    """Keep independent global factors when concatenating output rows."""
+    for prefix in prefixes:
+        for suffix in GLOBAL_SCALE_SUFFIXES:
+            key = f"{prefix}.{suffix}"
+            if key in weights:
+                weights[key] = expert_scale_rows(
+                    weights[key], weights[f"{prefix}.weight"].shape[:-1]
+                )
+
+
+def stack_expert_projection(weights, source, projection, target, num_experts):
+    for suffix in (*EXPERT_WEIGHT_SUFFIXES, "bias"):
+        if f"{source}.0.{projection}.{suffix}" in weights:
+            weights[f"{target}.{suffix}"] = mx.stack(
+                [
+                    weights.pop(f"{source}.{i}.{projection}.{suffix}")
+                    for i in range(num_experts)
+                ]
+            )
+
+
+def split_expert_projection(weights, source, targets):
+    """Split fused output rows, including each row's quantization parameters."""
+    weight_key = f"{source}.weight"
+    if source in weights:
+        weights[weight_key] = weights.pop(source)
+    if weight_key not in weights:
+        return
+    if weights[weight_key].ndim != 3:
+        raise ValueError(
+            f"{source} has shape {weights[weight_key].shape}; expected "
+            "[num_experts, output_rows, input_columns]"
+        )
+    shape = weights[weight_key].shape[:-1]
+    for suffix in (*EXPERT_WEIGHT_SUFFIXES, "bias"):
+        key = f"{source}.{suffix}"
+        if key not in weights:
+            continue
+        value = weights.pop(key)
+        if suffix in GLOBAL_SCALE_SUFFIXES:
+            value = expert_scale_rows(value, shape)
+        axis = -1 if suffix in (*GLOBAL_SCALE_SUFFIXES, "bias") else -2
+        parts = mx.split(value, len(targets), axis=axis)
+        for target, part in zip(targets, parts):
+            weights[f"{target}.{suffix}"] = mx.contiguous(part)
+
+
+def move_expert_projection(weights, source, target):
+    for suffix in (*EXPERT_WEIGHT_SUFFIXES, "bias"):
+        key = (
+            source if suffix == "weight" and source in weights else f"{source}.{suffix}"
+        )
+        if key in weights:
+            weights[f"{target}.{suffix}"] = weights.pop(key)
+
 
 def _gather_sort(x, indices):
     *_, M = indices.shape
@@ -289,12 +363,14 @@ class OffloadedSwitchGLU(nn.Module):
     ``gate_scale``/``out_scale`` are Inkling's resident NVFP4 correction
     vectors; ``gate_bias``/``up_bias``/``down_bias`` are ``SwitchLinear``'s
     optional per-expert additive bias (e.g. gpt-oss). ``activation`` is the
-    original ``SwitchGLU``'s activation object, called exactly as
+    replaced layer's activation object, called exactly as
     ``activation(x_up, x_gate)`` rather than reimplemented inline -- an inline
     ``silu(gate) * x`` measurably diverged from a real checkpoint's compiled
-    activation on real data. ``gate_quant``/``up_quant``/``down_quant`` are
-    each a ``(group_size, bits, mode)`` triple, resolved per projection since
-    a layer can have different bits per projection (mixed-precision converts).
+    activation on real data, and silently so for a layer whose gating is not
+    SiLU-based at all, so it is required rather than defaulted.
+    ``gate_quant``/``up_quant``/``down_quant`` are each a
+    ``(group_size, bits, mode)`` triple, resolved per projection since a layer
+    can have different bits per projection (mixed-precision converts).
     """
 
     def __init__(
@@ -304,7 +380,7 @@ class OffloadedSwitchGLU(nn.Module):
         gate_quant: Tuple[int, int, str],
         up_quant: Tuple[int, int, str],
         down_quant: Tuple[int, int, str],
-        activation: Any = None,
+        activation: Any,
         gate_scale: Optional[mx.array] = None,
         out_scale: Optional[mx.array] = None,
         gate_bias: Optional[mx.array] = None,
@@ -374,11 +450,7 @@ class OffloadedSwitchGLU(nn.Module):
             x_up = self._proj(xr, uw, usc, ub, self.up_quant)
             if self.up_bias is not None:
                 x_up = x_up + self.up_bias[j].astype(x_up.dtype)
-            h = (
-                self.activation(x_up, x_gate)
-                if self.activation is not None
-                else (nn.silu(x_gate) * x_up)
-            )
+            h = self.activation(x_up, x_gate)
             d = self._proj(h, dw, dsc, db, self.down_quant)
             if self.down_bias is not None:
                 d = d + self.down_bias[j].astype(d.dtype)
