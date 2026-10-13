@@ -266,7 +266,10 @@ class Model(nn.Module):
         return target_states.at[indices_mx].add(features - current)
 
     def get_vision_embedding(self, pixel_values, tgt_sizes, downsample_mode=None):
-        dtype = self.language_model.model.embed_tokens.weight.dtype
+        # Quantized embedding weights store packed integers, not activations.
+        dtype = self.language_model.model.embed_tokens(
+            mx.array([[0]], dtype=mx.int32)
+        ).dtype
 
         if pixel_values is None:
             return []
