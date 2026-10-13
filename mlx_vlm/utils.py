@@ -31,7 +31,7 @@ from .quantization.checkpoint import (
 from .quantization.nvfp4 import replace_scaled_quantized_linears
 from .quantization.one_bit import _quantization_for_path, replace_one_bit_modules
 from .tokenizer_utils import load_tokenizer
-from .trainer.utils import apply_lora_layers
+from .trainer.peft.utils import apply_lora_layers
 
 logger = logging.getLogger(__name__)
 
