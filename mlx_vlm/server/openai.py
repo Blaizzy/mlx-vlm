@@ -83,7 +83,6 @@ from .schemas import (
     OpenAIRequest,
     OpenAIResponse,
     OpenAIUsage,
-    ResponseCompletedEvent,
     ResponseContentPartAddedEvent,
     ResponseContentPartDoneEvent,
     ResponseCreatedEvent,
@@ -1060,7 +1059,11 @@ async def responses_endpoint(request: Request):
             covered=context.covered,
         )
 
+        output_limit = None
+
         def apply_compaction(result):
+            nonlocal output_limit
+            output_limit = result.max_output_tokens
             if not result.changed:
                 return result.items, []
             return result.items, [
@@ -1104,6 +1107,8 @@ async def responses_endpoint(request: Request):
             raise HTTPException(status_code=400, detail=str(e))
         if chat_tools and tool_module is not None:
             gen_args.skip_special_tokens = False
+        if output_limit is not None:
+            gen_args.max_tokens = output_limit
 
         template_kwargs = gen_args.to_template_kwargs()
         if openai_request.tool_choice is not None:
@@ -1208,6 +1213,7 @@ async def responses_endpoint(request: Request):
                             async for update in progress:
                                 if isinstance(update, compaction.CompactedContext):
                                     items, compaction_output = apply_compaction(update)
+                                    gen_args.max_tokens = output_limit
                                     formatted_prompt, images, starts_in_thinking = (
                                         render_prompt(items)
                                     )
@@ -1525,11 +1531,14 @@ async def responses_endpoint(request: Request):
                             },
                         )
 
-                    # Send response.completed event (to match the openai pipeline)
                     finish_reason = (
-                        "tool_calls"
-                        if output_finish_reason == "tool_calls"
-                        else finish_reason or "stop"
+                        "length"
+                        if finish_reason == "length"
+                        else (
+                            "tool_calls"
+                            if output_finish_reason == "tool_calls"
+                            else finish_reason or "stop"
+                        )
                     )
                     envelope = _build_metrics_envelope(
                         endpoint="/responses",
@@ -1558,7 +1567,16 @@ async def responses_endpoint(request: Request):
                     metrics_finalized = True
                     completed_response = base_response.model_copy(
                         update={
-                            "status": "completed",
+                            "status": (
+                                "incomplete"
+                                if finish_reason == "length"
+                                else "completed"
+                            ),
+                            "incomplete_details": (
+                                {"reason": "max_output_tokens"}
+                                if finish_reason == "length"
+                                else None
+                            ),
                             "output": completed_output,
                             "output_text": clean_text,
                             "usage": OpenAIUsage.from_metrics(
@@ -1574,7 +1592,14 @@ async def responses_endpoint(request: Request):
                         completed_output,
                         openai_request.previous_response_id,
                     )
-                    yield f"event: response.completed\ndata: {ResponseCompletedEvent(type='response.completed', response=completed_response).model_dump_json()}\n\n"
+                    terminal_event = f"response.{completed_response.status}"
+                    yield _response_sse_event(
+                        terminal_event,
+                        {
+                            "type": terminal_event,
+                            "response": completed_response.model_dump(),
+                        },
+                    )
 
                 except Exception as e:
                     if not metrics_finalized:
@@ -1693,7 +1718,7 @@ async def responses_endpoint(request: Request):
                         starts_in_thinking=starts_in_thinking,
                     )
                 )
-                if output_finish_reason == "tool_calls":
+                if finish_reason != "length" and output_finish_reason == "tool_calls":
                     finish_reason = "tool_calls"
 
                 output_items = compaction_output + output_items
@@ -1701,7 +1726,12 @@ async def responses_endpoint(request: Request):
                     id=response_id,
                     object="response",
                     created_at=int(generated_at),
-                    status="completed",
+                    status="incomplete" if finish_reason == "length" else "completed",
+                    incomplete_details=(
+                        {"reason": "max_output_tokens"}
+                        if finish_reason == "length"
+                        else None
+                    ),
                     instructions=instructions,
                     max_output_tokens=openai_request.max_output_tokens,
                     model=openai_request.model,
@@ -1813,6 +1843,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             else _INHERIT_ADAPTER
         )
 
+        compacted_context = None
         if request.context_management != []:
             _prepare_chat_tool_choice([], request.tools, request.tool_choice)
             model, processor, config = get_cached_model(request.model, adapter_path)
@@ -1838,6 +1869,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     generate=generate,
                     automatic=True,
                 )
+                compacted_context = result
                 if result.changed:
                     request = request.model_copy(
                         update={
@@ -1933,6 +1965,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             raise HTTPException(status_code=400, detail=str(e))
         if tools and tool_module is not None:
             gen_args.skip_special_tokens = False
+        if compacted_context is not None:
+            gen_args.max_tokens = compacted_context.max_output_tokens
 
         template_kwargs = gen_args.to_template_kwargs()
         if tool_choice is not None:
