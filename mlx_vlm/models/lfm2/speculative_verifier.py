@@ -98,19 +98,7 @@ class Lfm2ExactSpeculativeVerifier:
             value = self._linear(feed_forward.up_proj, x)
             return self._linear(feed_forward.down_proj, swiglu(gate, value))
         if isinstance(feed_forward, Lfm2MoeSparseMoeBlock):
-            gates = mx.softmax(
-                self._linear(feed_forward.gate, x).astype(mx.float32),
-                axis=-1,
-            )
-            if feed_forward.use_expert_bias:
-                gates += feed_forward.expert_bias
-            indices = mx.argpartition(gates, kth=-feed_forward.top_k, axis=-1)[
-                ..., -feed_forward.top_k :
-            ]
-            indices = mx.stop_gradient(indices)
-            scores = mx.take_along_axis(gates, indices, axis=-1)
-            if feed_forward.norm_topk_prob:
-                scores /= mx.sum(scores, axis=-1, keepdims=True) + 1e-20
+            indices, scores = feed_forward._route(self._linear(feed_forward.gate, x))
             switch_mlp = feed_forward.switch_mlp
             expert_up = self._switch_linear(switch_mlp.up_proj, x, indices)
             expert_gate = self._switch_linear(switch_mlp.gate_proj, x, indices)

@@ -17,6 +17,56 @@ from .speculative_verifier import Lfm2ExactSpeculativeVerifier
 
 _EXACT_SPECULATIVE_VERIFIER = Lfm2ExactSpeculativeVerifier()
 
+_SHORT_CONV_STEP_SOURCE = """
+    const uint c = thread_position_in_grid.x;
+    const uint b = thread_position_in_grid.y;
+    if (c >= D) return;
+
+    const uint base = b * bcx_strides[0];
+    const uint stride = bcx_strides[2];
+    // Match the materialized B * x before storing or convolving it.
+    const T bx = static_cast<T>(
+        static_cast<float>(bcx[base + c * stride]) *
+        static_cast<float>(bcx[base + (2 * D + c) * stride]));
+    const uint sbase = b * state_strides[0] + c * state_strides[2];
+    const uint wbase = c * weight_strides[0];
+    float acc = 0.0f;
+    for (uint j = 0; j < K - 1; ++j) {
+        acc = metal::fma(
+            static_cast<float>(state[sbase + j * state_strides[1]]),
+            static_cast<float>(weight[wbase + j * weight_strides[1]]),
+            acc);
+    }
+    acc = metal::fma(static_cast<float>(bx),
+        static_cast<float>(weight[wbase + (K - 1) * weight_strides[1]]), acc);
+    // Conv1d rounds its output before the optional bias and output gate.
+    T conv = static_cast<T>(acc);
+    if (HAS_BIAS) {
+        conv = static_cast<T>(static_cast<float>(conv) +
+            static_cast<float>(bias[c * bias_strides[0]]));
+    }
+    y[b * D + c] = static_cast<T>(static_cast<float>(conv) *
+        static_cast<float>(bcx[base + (D + c) * stride]));
+
+    const uint dst = b * (K - 1) * D + c;
+    for (uint j = 0; j < K - 2; ++j) {
+        new_state[dst + j * D] = state[sbase + (j + 1) * state_strides[1]];
+    }
+    new_state[dst + (K - 2) * D] = bx;
+"""
+
+_short_conv_step_kernel = (
+    mx.fast.metal_kernel(
+        name="lfm2_short_conv_step",
+        input_names=["bcx", "state", "weight", "bias"],
+        output_names=["y", "new_state"],
+        source=_SHORT_CONV_STEP_SOURCE,
+        ensure_row_contiguous=False,
+    )
+    if mx.metal.is_available()
+    else None
+)
+
 
 class Attention(nn.Module):
     def __init__(self, args):
@@ -109,8 +159,47 @@ class ShortConv(nn.Module):
         cache: Optional[Any] = None,
         gdn_sink: list | None = None,
     ):
-        projected = self.in_proj(x)
-        return self.out_proj(self._convolve_projected(projected, mask, cache, gdn_sink))
+        BCx = self.in_proj(x)
+        # Fuse the single-token depthwise convolution, gates, and cache shift.
+        # Keep the differentiable, masked, and multi-token paths on standard ops.
+        if (
+            _short_conv_step_kernel is not None
+            and not self.training
+            and gdn_sink is None
+            and x.shape[1] == 1
+            and cache is not None
+            and cache[0] is not None
+            and cache[0].shape == (x.shape[0], self.L_cache - 1, x.shape[2])
+            and mask is None
+            and cache.lengths is None
+            and 2 <= self.L_cache <= 8
+            and BCx.dtype in (mx.float32, mx.float16, mx.bfloat16)
+            and BCx.dtype == cache[0].dtype == self.conv.weight.dtype
+            and (not self.bias or self.conv.bias.dtype == BCx.dtype)
+            and mx.default_device() == mx.gpu
+        ):
+            batch, _, dim = x.shape
+            y, cache[0] = _short_conv_step_kernel(
+                inputs=[
+                    BCx,
+                    cache[0],
+                    self.conv.weight,
+                    self.conv.bias if self.bias else self.conv.weight,
+                ],
+                template=[
+                    ("T", BCx.dtype),
+                    ("D", dim),
+                    ("K", self.L_cache),
+                    ("HAS_BIAS", self.bias),
+                ],
+                grid=(dim, batch, 1),
+                threadgroup=(min(256, dim), 1, 1),
+                output_shapes=[(batch, 1, dim), cache[0].shape],
+                output_dtypes=[BCx.dtype, BCx.dtype],
+            )
+            cache.advance(1)
+            return self.out_proj(y)
+        return self.out_proj(self._convolve_projected(BCx, mask, cache, gdn_sink))
 
     def _convolve_projected(self, BCx, mask, cache, gdn_sink):
         B, C, x = mx.split(BCx, 3, axis=-1)
@@ -211,28 +300,30 @@ class Lfm2MoeSparseMoeBlock(nn.Module):
         self.top_k = args.num_experts_per_tok
         self.norm_topk_prob = args.norm_topk_prob
         self.use_expert_bias = args.use_expert_bias
+        self.routed_scaling_factor = args.routed_scaling_factor
 
         self.gate = nn.Linear(dim, num_experts, bias=False)
         self.switch_mlp = SwitchGLU(dim, intermediate_size, num_experts)
         if self.use_expert_bias:
             self.expert_bias = mx.zeros((self.num_experts,))
 
-    def __call__(self, x: mx.array):
-        gates = self.gate(x).astype(mx.float32)
-        gates = mx.softmax(gates, axis=-1)
-
-        if self.use_expert_bias:
-            gates += self.expert_bias
+    def _route(self, logits: mx.array):
+        gates = mx.sigmoid(logits)
+        # The load-balancing bias selects experts but does not weight their output.
+        routing_scores = gates + self.expert_bias if self.use_expert_bias else gates
 
         k = self.top_k
-        inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+        inds = mx.argpartition(routing_scores, kth=-k, axis=-1)[..., -k:]
 
         inds = mx.stop_gradient(inds)
         scores = mx.take_along_axis(gates, inds, axis=-1)
         if self.norm_topk_prob:
-            scores /= mx.sum(scores, axis=-1, keepdims=True) + 1e-20
-        scores = scores.astype(x.dtype)
+            scores /= mx.sum(scores, axis=-1, keepdims=True) + 1e-6
+        return inds, scores * self.routed_scaling_factor
 
+    def __call__(self, x: mx.array):
+        inds, scores = self._route(self.gate(x))
+        scores = scores.astype(x.dtype)
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
 
@@ -340,6 +431,8 @@ class Lfm2Model(nn.Module):
 
 
 class LanguageModel(nn.Module):
+    supports_logits_to_keep = True
+
     def __init__(self, args: ModelConfig):
         super().__init__()
         self.args = args
@@ -355,6 +448,7 @@ class LanguageModel(nn.Module):
         cache=None,
         input_embeddings: Optional[mx.array] = None,
         inputs_embeds: Optional[mx.array] = None,
+        logits_to_keep: int = 0,
         **kwargs,
     ) -> LanguageModelOutput:
         if inputs is None:
@@ -384,6 +478,8 @@ class LanguageModel(nn.Module):
             capture_layer_ids=capture_layer_ids,
             hidden_sink=hidden_sink,
         )
+        if logits_to_keep:
+            out = out[:, -logits_to_keep:, :]
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
