@@ -626,6 +626,96 @@ def test_model_contract(case):
         getattr(checks, kind)(*args, **kwargs)
 
 
+@pytest.fixture
+def lfm2_moe_case():
+    case = next(c for c in DATA["cases"] if c["module"] == "lfm2_moe")
+    module = importlib.import_module("mlx_vlm.models." + case["module"])
+    return module, build_config(module, case["config"])
+
+
+@pytest.mark.parametrize("use_bias", [False, True])
+@pytest.mark.parametrize("normalize", [False, True])
+def test_lfm2_moe_router_matches_explicit_expert_sum(
+    lfm2_moe_case, use_bias, normalize
+):
+    from mlx_vlm.models.lfm2.language import Lfm2MoeSparseMoeBlock
+    from mlx_vlm.models.lfm2.speculative_verifier import Lfm2ExactSpeculativeVerifier
+
+    mx.random.seed(7)
+    _, config = lfm2_moe_case
+    config.use_expert_bias = use_bias
+    config.norm_topk_prob = normalize
+    config.routed_scaling_factor = 1.7
+    block = Lfm2MoeSparseMoeBlock(config)
+    if use_bias:
+        block.expert_bias = mx.array([0.7, -0.4, 0.2, -0.1])
+    x = mx.random.normal((2, 3, config.hidden_size))
+    actual = np.array(block(x))
+    values = np.array(x)
+    logits = values @ np.array(block.gate.weight).T
+    probabilities = 1 / (1 + np.exp(-logits))
+    selection = probabilities + (np.array(block.expert_bias) if use_bias else 0)
+    indices = np.argsort(selection, axis=-1)[..., -config.num_experts_per_tok :]
+    scores = np.take_along_axis(probabilities, indices, axis=-1)
+    if normalize:
+        scores /= scores.sum(axis=-1, keepdims=True) + 1e-6
+    scores *= config.routed_scaling_factor
+    weights = block.switch_mlp
+    gate, up, down = (
+        np.array(getattr(weights, name).weight)
+        for name in ("gate_proj", "up_proj", "down_proj")
+    )
+    expected = np.zeros_like(values)
+    for batch in range(values.shape[0]):
+        for token in range(values.shape[1]):
+            for slot, expert in enumerate(indices[batch, token]):
+                v = values[batch, token]
+                g = gate[expert] @ v
+                result = down[expert] @ ((g / (1 + np.exp(-g))) * (up[expert] @ v))
+                expected[batch, token] += scores[batch, token, slot] * result
+    np.testing.assert_allclose(actual, expected, atol=2e-6, rtol=2e-5)
+    verified = Lfm2ExactSpeculativeVerifier()._feed_forward(block, x)
+    np.testing.assert_allclose(np.array(verified), expected, atol=2e-6, rtol=2e-5)
+
+
+@pytest.mark.parametrize("batch_size", [1, 4, 16])
+def test_lfm2_moe_chunked_prefill_and_decode(lfm2_moe_case, batch_size):
+    module, config = lfm2_moe_case
+    mx.random.seed(13)
+    model = module.Model(config)
+    model.eval()
+    tokens = mx.random.randint(0, config.vocab_size, (batch_size, 13))
+    ModelChecks().prefill_parity(model, tokens, {}, (1, 4, 5))
+    full = model(tokens).logits
+    last = model(tokens, logits_to_keep=1).logits
+    np.testing.assert_allclose(np.array(last), np.array(full[:, -1:]), atol=1e-5)
+
+
+def test_lfm2_moe_transformers_numerical_parity(lfm2_moe_case):
+    torch = pytest.importorskip("torch")
+    from transformers import Lfm2MoeConfig, Lfm2MoeForCausalLM
+
+    torch.manual_seed(42)
+    module, config = lfm2_moe_case
+    config.routed_scaling_factor = 1.3
+    reference = Lfm2MoeForCausalLM(Lfm2MoeConfig(**asdict(config))).eval()
+    # Nonzero balancing biases catch the old use of biased output weights.
+    with torch.no_grad():
+        for layer in reference.model.layers[1:]:
+            layer.feed_forward.expert_bias.copy_(torch.tensor([0.4, -0.3, 0.2, -0.1]))
+    model = module.Model(config)
+    weights = {
+        k: mx.array(v.detach().numpy()) for k, v in reference.state_dict().items()
+    }
+    model.load_weights(list(model.sanitize(weights).items()), strict=True)
+    model.eval()
+    tokens = torch.tensor([[1, 7, 11, 2, 3, 9], [4, 5, 13, 6, 2, 1]])
+    with torch.no_grad():
+        expected = reference(tokens, use_cache=False).logits.numpy()
+    actual = np.array(model(mx.array(tokens.numpy())).logits)
+    np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=1e-4)
+
+
 def test_lfm2_encoder_sanitize_and_dispatch():
     case = next(case for case in DATA["cases"] if case["module"] == "lfm2_encoder")
     module = importlib.import_module("mlx_vlm.models.lfm2_encoder")
