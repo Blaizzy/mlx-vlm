@@ -11,7 +11,14 @@ from ..base import (
 from ..cache import KVCache, RotatingKVCache
 from ..mlp import SwiGLUMLP as MLP
 from ..rope_utils import initialize_rope
-from ..switch_layers import SwiGLU, SwitchLinear, _gather_sort, _scatter_unsort
+from ..switch_layers import (
+    EXPERT_WEIGHT_SUFFIXES,
+    SwiGLU,
+    SwitchLinear,
+    _gather_sort,
+    _scatter_unsort,
+    expand_expert_scales,
+)
 from .config import ModelConfig
 
 
@@ -346,8 +353,6 @@ class LanguageModel(nn.Module):
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
 
-        weights = self._stack_compressed_nvfp4_experts(weights)
-        weights = self._fold_compressed_nvfp4_shared_experts(weights)
         weights = self._unpack_compressed_tensors(weights)
         weights = self._remap_router_weights(weights)
         weights = self._stack_experts(weights)
@@ -388,92 +393,6 @@ class LanguageModel(nn.Module):
                 new_weights[k] = v
         return new_weights
 
-    def _stack_compressed_nvfp4_experts(self, weights):
-        quantization = self.args.quantization or {}
-        if quantization.get("mode") != "nvfp4":
-            return weights
-        if not any(
-            ".mlp.experts." in key and key.endswith(".weight_packed") for key in weights
-        ):
-            return weights
-
-        from ...utils import _E4M3_DECODE_LUT, _f32_to_e4m3
-
-        def pop_projection(prefix, proj):
-            packed = []
-            scales = []
-            global_scales = []
-            for expert_idx in range(self.args.num_experts):
-                expert_prefix = f"{prefix}.experts.{expert_idx}.{proj}"
-                packed.append(weights.pop(f"{expert_prefix}.weight_packed"))
-                scales.append(weights.pop(f"{expert_prefix}.weight_scale"))
-                global_scales.append(
-                    weights.pop(f"{expert_prefix}.weight_global_scale").astype(
-                        mx.float32
-                    )
-                )
-                weights.pop(f"{expert_prefix}.input_global_scale", None)
-
-            stacked_scales = mx.stack(scales)
-            global_scale = mx.stack(global_scales).reshape(self.args.num_experts, 1, 1)
-            decoded = _E4M3_DECODE_LUT[stacked_scales.astype(mx.uint32)]
-            return mx.stack([p.view(mx.uint32) for p in packed]), decoded / global_scale
-
-        for layer_idx in range(self.args.num_hidden_layers):
-            prefix = f"model.layers.{layer_idx}.mlp"
-            if f"{prefix}.experts.0.gate_proj.weight_packed" in weights:
-                gate_weight, gate_scales = pop_projection(prefix, "gate_proj")
-                up_weight, up_scales = pop_projection(prefix, "up_proj")
-                weights[f"{prefix}.switch_mlp.gate_up_proj.weight"] = mx.concatenate(
-                    [gate_weight, up_weight], axis=1
-                )
-                weights[f"{prefix}.switch_mlp.gate_up_proj.scales"] = _f32_to_e4m3(
-                    mx.concatenate([gate_scales, up_scales], axis=1)
-                )
-
-            if f"{prefix}.experts.0.down_proj.weight_packed" in weights:
-                down_weight, down_scales = pop_projection(prefix, "down_proj")
-                weights[f"{prefix}.switch_mlp.down_proj.weight"] = down_weight
-                weights[f"{prefix}.switch_mlp.down_proj.scales"] = _f32_to_e4m3(
-                    down_scales
-                )
-
-        return weights
-
-    def _fold_compressed_nvfp4_shared_experts(self, weights):
-        quantization = self.args.quantization or {}
-        if quantization.get("mode") != "nvfp4":
-            return weights
-        if not any(
-            ".mlp.shared_expert." in key and key.endswith(".weight_packed")
-            for key in weights
-        ):
-            return weights
-
-        from ...utils import _E4M3_DECODE_LUT, _f32_to_e4m3
-
-        packed_suffix = ".weight_packed"
-        for key in list(weights.keys()):
-            if ".mlp.shared_expert." not in key or not key.endswith(packed_suffix):
-                continue
-
-            prefix = key[: -len(packed_suffix)]
-            scale_key = f"{prefix}.weight_scale"
-            global_scale_key = f"{prefix}.weight_global_scale"
-            if scale_key not in weights or global_scale_key not in weights:
-                continue
-
-            packed = weights.pop(key)
-            scale = weights.pop(scale_key)
-            global_scale = weights.pop(global_scale_key).astype(mx.float32)
-            weights.pop(f"{prefix}.input_global_scale", None)
-
-            weights[f"{prefix}.weight"] = packed.view(mx.uint32)
-            decoded = _E4M3_DECODE_LUT[scale.astype(mx.uint32)]
-            weights[f"{prefix}.scales"] = _f32_to_e4m3(decoded / global_scale)
-
-        return weights
-
     def _remap_router_weights(self, weights):
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{layer_idx}.mlp"
@@ -489,9 +408,18 @@ class LanguageModel(nn.Module):
         return weights
 
     def _stack_experts(self, weights):
+        expand_expert_scales(
+            weights,
+            [
+                key.removesuffix(".weight")
+                for key in weights
+                if key.endswith((".gate_proj.weight", ".up_proj.weight"))
+                and any(part in key for part in (".experts.", ".switch_mlp."))
+            ],
+        )
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{layer_idx}.mlp"
-            for suffix in ["weight", "scales", "biases"]:
+            for suffix in EXPERT_WEIGHT_SUFFIXES:
                 gate_key = f"{prefix}.experts.0.gate_proj.{suffix}"
                 up_key = f"{prefix}.experts.0.up_proj.{suffix}"
                 if gate_key in weights and up_key in weights:
@@ -526,7 +454,7 @@ class LanguageModel(nn.Module):
     def _fuse_split_switch_gate_up(self, weights):
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{layer_idx}.mlp.switch_mlp"
-            for suffix in ["weight", "scales", "biases"]:
+            for suffix in EXPERT_WEIGHT_SUFFIXES:
                 gate_key = f"{prefix}.gate_proj.{suffix}"
                 up_key = f"{prefix}.up_proj.{suffix}"
                 fused_key = f"{prefix}.gate_up_proj.{suffix}"

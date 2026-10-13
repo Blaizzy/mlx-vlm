@@ -1999,6 +1999,70 @@ def test_apply_chat_template_uses_generic_text_model_fallback():
     assert result == "templated"
 
 
+@pytest.mark.parametrize("model_type", ["llama", "qwen3_5"])
+@pytest.mark.parametrize(
+    "template",
+    [
+        "{{ tools | tojson }}",
+        "{% for tool in tools %}{% for key, value in tool.items() %}"
+        "{{ key }}={{ value | tojson }};{% endfor %}{% endfor %}",
+    ],
+)
+def test_tool_schema_key_order_does_not_change_prompt(model_type, template):
+    parameters = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "enum": ["src", "tests"]},
+            "options": {
+                "type": "object",
+                "properties": {"recursive": {"type": "boolean"}},
+            },
+        },
+        "required": ["path", "options"],
+    }
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": name, "parameters": parameters},
+        }
+        for name in ["search_files", "read_file"]
+    ]
+
+    def reverse_keys(value):
+        if isinstance(value, dict):
+            return {key: reverse_keys(value[key]) for key in reversed(value)}
+        if isinstance(value, list):
+            return [reverse_keys(item) for item in value]
+        return value
+
+    tokenizer = fast_tokenizer(chat_template=template)
+
+    def render(value):
+        return apply_chat_template(
+            tokenizer, {"model_type": model_type}, "Find files.", tools=value
+        )
+
+    reordered = reverse_keys(tools)
+    original_json = json.dumps(reordered)
+    prompt = render(tools)
+    assert render(reordered) == prompt
+    assert json.dumps(reordered) == original_json
+    assert render(list(reversed(tools))) != prompt
+
+    changed = deepcopy(tools)
+    changed[0]["function"]["parameters"]["properties"]["path"]["type"] = "integer"
+    assert render(changed) != prompt
+    if template == "{{ tools | tojson }}":
+        assert json.loads(prompt) == tools
+
+
+@pytest.mark.parametrize("tools", [None, [], (lambda: None,)])
+def test_template_preserves_empty_and_callable_tools(tools):
+    processor = MagicMock(chat_template="{{ tools }}")
+    get_chat_template(processor, [{"role": "user", "content": "Hi"}], True, tools=tools)
+    assert processor.apply_chat_template.call_args.kwargs["tools"] == tools
+
+
 def test_apply_chat_template_preserves_explicit_thinking_enabled():
     class ThinkingProcessor:
         chat_template = "{{ messages }}"
@@ -3447,3 +3511,92 @@ def test_embedding_gemma2_prepare_inputs_routes_media(
     actual = prepare_inputs(p, prompts=[prompt], **media, return_tensors="mlx")
     for key in expected:
         equal(np.asarray(actual[key]), np.asarray(expected[key]))
+
+
+class TestMiniCPMV47Processor:
+    @staticmethod
+    def processor():
+        from mlx_vlm.models.minicpmv4_7.processing_minicpmv4_7 import (
+            MiniCPMV4_7Processor,
+            MiniCPMVImageProcessor,
+            MiniCPMVVideoProcessor,
+        )
+
+        options = dict(PROFILES["minicpm_image"])
+        return MiniCPMV4_7Processor(
+            tokenizer=ProcessorTokenizer(**PROFILES["minicpm_tokenizer"]),
+            image_processor=MiniCPMVImageProcessor(**options),
+            video_processor=MiniCPMVVideoProcessor(**options),
+        )
+
+    @pytest.mark.parametrize("mode,count", [("16x", 1), ("4x", 4)])
+    def test_mixed_media_and_mode(self, mode, count):
+        processor = self.processor()
+        processor.image_processor.use_image_id = True
+        inputs = processor(
+            text="<|video_pad|> then <|image_pad|>",
+            images=[Image.new("RGB", (56, 56), "red")],
+            videos=[np.zeros((2, 3, 56, 56), dtype=np.uint8)],
+            downsample_mode=mode,
+        )
+        assert inputs["downsample_mode"] == mode
+        assert np.count_nonzero(inputs["mm_token_type_ids"] == 2) == 2 * count
+        assert np.count_nonzero(inputs["mm_token_type_ids"] == 1) == count
+        assert len(inputs["pixel_values"][0]) == 3
+        assert inputs["input_ids"][0, 0] == processor.tokenizer.im_start_id
+        assert (
+            np.count_nonzero(inputs["input_ids"] == processor.tokenizer.im_id_start_id)
+            == 1
+        )
+        assert processor.image_processor.downsample_mode == "16x"
+        np.testing.assert_array_equal(inputs["pixel_values"][0][0], -1)
+        assert np.any(inputs["pixel_values"][0][-1] == 1)
+
+    def test_placeholder_validation_and_thinking(self):
+        processor = self.processor()
+        with pytest.raises(ValueError, match="placeholders"):
+            processor(text="Describe", images=[Image.new("RGB", (56, 56))])
+        with pytest.raises(ValueError, match="placeholders"):
+            processor(text="<|image_pad|>")
+        prompt = "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        assert processor._strip_think_prefix(prompt) == prompt
+        processor.tokenizer.apply_chat_template = Mock(return_value=prompt)
+        assert processor.apply_chat_template([], enable_thinking=False) == prompt
+        processor.tokenizer.apply_chat_template.assert_called_once_with(
+            [], enable_thinking=False
+        )
+
+    def test_save_load_roundtrip(self, tmp_path):
+        from mlx_vlm.models.minicpmv4_7 import MiniCPMV4_7Processor
+
+        processor = self.processor()
+        tokens = processor.tokenizer.special_tokens
+        backend = Tokenizer(
+            WordLevel(
+                vocab={token: i for i, token in enumerate(tokens)}, unk_token="<unk>"
+            )
+        )
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=backend,
+            unk_token="<unk>",
+            eos_token="</image>",
+            pad_token="<unk>",
+            additional_special_tokens=list(tokens),
+        )
+        tokenizer.chat_template = (
+            "{% for message in messages %}{{ message.content }}{% endfor %}"
+        )
+        processor.tokenizer = tokenizer
+        processor.video_processor.max_num_frames = 7
+        processor.image_processor.downsample_mode = "4x"
+        processor.save_pretrained(tmp_path)
+        (tmp_path / "config.json").write_text(
+            json.dumps({"model_type": "minicpmv4_7", "downsample_mode": "16x"})
+        )
+        loaded = AutoProcessor.from_pretrained(tmp_path)
+        assert isinstance(loaded, MiniCPMV4_7Processor)
+        assert loaded.image_processor.downsample_mode == "4x"
+        assert loaded.video_processor.max_num_frames == 7
+        assert loaded.tokenizer.chat_template == tokenizer.chat_template
+        result = loaded(text="<|image_pad|>", images=[Image.new("RGB", (56, 56))])
+        assert np.count_nonzero(result["mm_token_type_ids"] == 1) == 4

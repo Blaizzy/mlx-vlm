@@ -5,7 +5,7 @@ import math
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..models.switch_layers import QuantizedSwitchLinear, SwitchLinear
+from ...models.switch_layers import QuantizedSwitchLinear, SwitchLinear
 
 
 class LoRALinear(nn.Module):

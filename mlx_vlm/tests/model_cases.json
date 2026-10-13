@@ -2,6 +2,115 @@
   "version": 2,
   "cases": [
     {
+      "id": "minicpmv4_7",
+      "module": "minicpmv4_7",
+      "config": {
+        "model_type": "minicpmv4_7",
+        "text_config": {
+          "model_type": "qwen3_5_text",
+          "hidden_size": 16,
+          "intermediate_size": 32,
+          "num_hidden_layers": 2,
+          "full_attention_interval": 2,
+          "num_attention_heads": 2,
+          "num_key_value_heads": 2,
+          "head_dim": 8,
+          "linear_num_value_heads": 2,
+          "linear_num_key_heads": 2,
+          "linear_key_head_dim": 32,
+          "linear_value_head_dim": 8,
+          "linear_conv_kernel_dim": 3,
+          "rms_norm_eps": 1e-05,
+          "vocab_size": 64,
+          "rope_parameters": {
+            "rope_type": "default",
+            "mrope_section": [1, 0, 0],
+            "partial_rotary_factor": 0.25
+          }
+        },
+        "vision_config": {
+          "model_type": "minicpmv4_7_vision",
+          "hidden_size": 16,
+          "intermediate_size": 32,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 2,
+          "image_size": 8,
+          "patch_size": 2
+        },
+        "patch_size": 2,
+        "insert_layer_id": 0,
+        "image_token_id": 48,
+        "video_token_id": 49,
+        "image_start_id": 50,
+        "image_end_id": 51,
+        "slice_start_id": 52,
+        "slice_end_id": 53,
+        "newline_id": 54
+      },
+      "checks": ["forward_cache", "language", "vision", "input_embeddings"],
+      "forward_cache": {"chunk_sizes": [1, 3]},
+      "vision": {
+        "feature_layer": null
+      }
+    },
+    {
+      "id": "minicpmv4_7_moe",
+      "module": "minicpmv4_7",
+      "config": {
+        "model_type": "minicpmv4_7",
+        "text_config": {
+          "model_type": "qwen3_5_moe_text",
+          "hidden_size": 16,
+          "num_hidden_layers": 2,
+          "full_attention_interval": 2,
+          "num_attention_heads": 2,
+          "num_key_value_heads": 2,
+          "head_dim": 8,
+          "linear_num_value_heads": 2,
+          "linear_num_key_heads": 2,
+          "linear_key_head_dim": 32,
+          "linear_value_head_dim": 8,
+          "linear_conv_kernel_dim": 3,
+          "rms_norm_eps": 1e-05,
+          "vocab_size": 64,
+          "rope_parameters": {
+            "mrope_section": [1, 0, 0],
+            "partial_rotary_factor": 0.25,
+            "type": "default",
+            "rope_theta": 10000000.0
+          },
+          "num_experts": 4,
+          "num_experts_per_tok": 2,
+          "moe_intermediate_size": 8,
+          "shared_expert_intermediate_size": 16,
+          "max_position_embeddings": 262144
+        },
+        "vision_config": {
+          "model_type": "minicpmv4_7_vision",
+          "hidden_size": 16,
+          "intermediate_size": 32,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 2,
+          "image_size": 8,
+          "patch_size": 2
+        },
+        "patch_size": 2,
+        "insert_layer_id": 0,
+        "image_token_id": 48,
+        "video_token_id": 49,
+        "image_start_id": 50,
+        "image_end_id": 51,
+        "slice_start_id": 52,
+        "slice_end_id": 53,
+        "newline_id": 54
+      },
+      "checks": ["forward_cache", "language", "vision", "input_embeddings"],
+      "forward_cache": {"chunk_sizes": [1, 3]},
+      "vision": {
+        "feature_layer": null
+      }
+    },
+    {
       "id": "embedding_gemma2",
       "module": "embedding_gemma2",
       "config": {
@@ -2618,6 +2727,37 @@
     }
   },
   "speculative": {
+    "mla_mtp": {
+      "num_hidden_layers": 2,
+      "intermediate_size": 32,
+      "moe_intermediate_size": 16,
+      "n_shared_experts": 1,
+      "n_routed_experts": 4,
+      "routed_scaling_factor": 2.5,
+      "kv_lora_rank": 16,
+      "q_lora_rank": 16,
+      "qk_rope_head_dim": 8,
+      "qk_nope_head_dim": 8,
+      "v_head_dim": 8,
+      "index_head_dim": 8,
+      "index_n_heads": 2,
+      "index_topk": 4,
+      "topk_method": "noaux_tc",
+      "scoring_func": "sigmoid",
+      "norm_topk_prob": true,
+      "n_group": 2,
+      "topk_group": 1,
+      "num_experts_per_tok": 2,
+      "moe_layer_freq": 1,
+      "first_k_dense_replace": 1,
+      "rms_norm_eps": 1e-05,
+      "rope_parameters": {
+        "rope_theta": 10000
+      },
+      "attention_bias": false,
+      "num_nextn_predict_layers": 1,
+      "hc_mult": 2
+    },
     "lfm2": {
       "model_type": "lfm2",
       "hidden_size": 8,
