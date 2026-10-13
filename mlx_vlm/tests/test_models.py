@@ -2593,13 +2593,13 @@ class TestMiniCPMQuantizedEmbeddingDtype(unittest.TestCase):
 
         for cls in (MiniCPM46, MiniCPM47):
             for dtype in (mx.float32, mx.bfloat16):
-                for quantized in (False, True):
-                    with self.subTest(model=cls, dtype=dtype, quantized=quantized):
+                for bits in (None, 4, 8):
+                    with self.subTest(model=cls, dtype=dtype, bits=bits):
                         embedding = nn.Embedding(16, 64)
                         embedding.weight = embedding.weight.astype(dtype)
-                        if quantized:
+                        if bits is not None:
                             embedding = nn.QuantizedEmbedding.from_embedding(
-                                embedding, group_size=32, bits=4
+                                embedding, group_size=64 if bits == 8 else 32, bits=bits
                             )
                             self.assertEqual(embedding.weight.dtype, mx.uint32)
                         observed = []
