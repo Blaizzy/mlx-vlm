@@ -919,6 +919,8 @@ class ArraysCache(_BaseCache):
         record = self._speculation["records"].get(index)
         if record is None:
             return 0
+        if record[0] == "replay":
+            return record[1]
         if record[0] == "window":
             return record[1].shape[1] - record[2]
         return 1 if record[1] is None else record[1].shape[1] + 1
@@ -1056,6 +1058,29 @@ class ArraysCache(_BaseCache):
             source = mx.concatenate([previous[1], source[:, width:]], axis=1)
         transaction["records"][index] = ("window", source, width)
 
+    def record_speculative_replay(self, index, length, final_state, replay):
+        """Retain a whole-block state and rebuild a rejected suffix's prefix.
+
+        ``replay(lengths)`` must return the state after each row's accepted
+        prefix, starting from the state before this block. It is called only
+        for partial acceptance; full acceptance and abort require no replay.
+        """
+        transaction = self._speculation
+        if transaction is None:
+            return
+        if int(length) != self.history_capacity or int(index) in transaction["records"]:
+            raise ValueError(
+                "Replayed state must cover one complete speculative block."
+            )
+        if not callable(replay):
+            raise TypeError("State replay must be callable.")
+        transaction["records"][int(index)] = (
+            "replay",
+            int(length),
+            final_state,
+            replay,
+        )
+
     @staticmethod
     def _select_speculative_states(record, initial, lengths, total):
         _, intermediate, final = record
@@ -1157,7 +1182,14 @@ class ArraysCache(_BaseCache):
 
         initial_state = transaction["initial_state"]
         for index, record in transaction["records"].items():
-            if record[0] == "states":
+            if record[0] == "replay":
+                if all(keep == 0 for keep in lengths):
+                    self.cache[index] = initial_state[index]
+                elif all(keep == total for keep in lengths):
+                    self.cache[index] = record[2]
+                else:
+                    self.cache[index] = record[3](lengths)
+            elif record[0] == "states":
                 self.cache[index] = self._select_speculative_states(
                     record,
                     initial_state[index],
