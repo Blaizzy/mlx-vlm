@@ -4,7 +4,6 @@ import os
 import re
 import uuid
 from collections import deque
-from contextlib import aclosing
 from dataclasses import dataclass
 from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
@@ -455,27 +454,6 @@ def _jsonable(value: Any) -> Any:
 
 def _sse_event(event_type: str, payload: Dict[str, Any]) -> str:
     return f"event: {event_type}\ndata: {json.dumps(payload, default=_jsonable)}\n\n"
-
-
-async def _sequence_response_events(events):
-    """Assign response-local sequence numbers to every SSE event, including errors."""
-    sequence_number = 0
-    async with aclosing(events) as stream:
-        async for event in stream:
-            fields = dict(
-                line.split(": ", 1)
-                for line in event.strip().splitlines()
-                if ": " in line
-            )
-            payload = json.loads(fields["data"])
-            payload["sequence_number"] = sequence_number
-            if payload["type"] in (
-                "response.output_text.delta",
-                "response.output_text.done",
-            ):
-                payload.setdefault("logprobs", [])
-            yield _sse_event(fields.get("event", payload["type"]), payload)
-            sequence_number += 1
 
 
 def _clean_reasoning(reasoning: str, start_marker: str) -> str:
