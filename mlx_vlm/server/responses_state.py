@@ -534,6 +534,7 @@ def _response_output_items_from_text(
     reasoning_item_id: Optional[str] = None,
     processor=None,
     starts_in_thinking: bool = False,
+    tool_delta_state=None,
 ) -> Tuple[List[Dict[str, Any]], str, Optional[str], str]:
     reasoning, content = _split_thinking(
         full_text,
@@ -545,6 +546,8 @@ def _response_output_items_from_text(
     reasoning_items = _reasoning_output_items(reasoning, reasoning_item_id)
     if tool_module is not None and chat_tools:
         tc = process_tool_calls(full_text, tool_module, chat_tools)
+        if tool_delta_state is not None:
+            tool_delta_state.finish(tc.calls)
         if tc.calls:
             items = [
                 _tool_call_to_response_item(call, tool_registry) for call in tc.calls
