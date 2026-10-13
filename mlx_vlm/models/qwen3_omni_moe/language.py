@@ -47,7 +47,6 @@ class Qwen3OmniMoeThinkerTextRotaryEmbedding(MRoPERotaryEmbedding):
             rope_scaling=rope_scaling,
             style="interleaved",
         )
-        self.attention_scaling = 1.0
 
 
 def apply_multimodal_rotary_pos_emb(q, k, cos, sin, unqueeze_dim=1):
