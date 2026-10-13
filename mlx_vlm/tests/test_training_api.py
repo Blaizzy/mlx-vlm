@@ -98,9 +98,7 @@ class EngineTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires optimizer"):
             trainer.train()
         self.assertIsNone(trainer.optimizer)
-        self.assertTrue(
-            mx.isfinite(mx.array(trainer.evaluate()["val_loss"])).item()
-        )
+        self.assertTrue(mx.isfinite(mx.array(trainer.evaluate()["val_loss"])).item())
 
     def test_custom_task_partial_update_final_save_and_evaluation_mode(self):
         for compiled in (False, True):
