@@ -709,6 +709,14 @@ def get_message_json(
     )
 
 
+def _sort_tool_schema_keys(value):
+    if isinstance(value, dict):
+        return {key: _sort_tool_schema_keys(value[key]) for key in sorted(value)}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_sort_tool_schema_keys(item) for item in value)
+    return value
+
+
 def get_chat_template(
     processor,
     messages: List[Dict[str, Any]],
@@ -918,6 +926,9 @@ def get_chat_template(
             return _messages_to_plain_prompt()
 
         template_kwargs = dict(kwargs)
+        if "tools" in template_kwargs:
+            # Equivalent schemas must render the same token prefix for APC.
+            template_kwargs["tools"] = _sort_tool_schema_keys(template_kwargs["tools"])
         if "enable_thinking" not in template_kwargs and _supports_template_kw(
             template_processor, "enable_thinking"
         ):

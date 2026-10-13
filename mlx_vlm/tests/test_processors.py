@@ -1999,6 +1999,70 @@ def test_apply_chat_template_uses_generic_text_model_fallback():
     assert result == "templated"
 
 
+@pytest.mark.parametrize("model_type", ["llama", "qwen3_5"])
+@pytest.mark.parametrize(
+    "template",
+    [
+        "{{ tools | tojson }}",
+        "{% for tool in tools %}{% for key, value in tool.items() %}"
+        "{{ key }}={{ value | tojson }};{% endfor %}{% endfor %}",
+    ],
+)
+def test_tool_schema_key_order_does_not_change_prompt(model_type, template):
+    parameters = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "enum": ["src", "tests"]},
+            "options": {
+                "type": "object",
+                "properties": {"recursive": {"type": "boolean"}},
+            },
+        },
+        "required": ["path", "options"],
+    }
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": name, "parameters": parameters},
+        }
+        for name in ["search_files", "read_file"]
+    ]
+
+    def reverse_keys(value):
+        if isinstance(value, dict):
+            return {key: reverse_keys(value[key]) for key in reversed(value)}
+        if isinstance(value, list):
+            return [reverse_keys(item) for item in value]
+        return value
+
+    tokenizer = fast_tokenizer(chat_template=template)
+
+    def render(value):
+        return apply_chat_template(
+            tokenizer, {"model_type": model_type}, "Find files.", tools=value
+        )
+
+    reordered = reverse_keys(tools)
+    original_json = json.dumps(reordered)
+    prompt = render(tools)
+    assert render(reordered) == prompt
+    assert json.dumps(reordered) == original_json
+    assert render(list(reversed(tools))) != prompt
+
+    changed = deepcopy(tools)
+    changed[0]["function"]["parameters"]["properties"]["path"]["type"] = "integer"
+    assert render(changed) != prompt
+    if template == "{{ tools | tojson }}":
+        assert json.loads(prompt) == tools
+
+
+@pytest.mark.parametrize("tools", [None, [], (lambda: None,)])
+def test_template_preserves_empty_and_callable_tools(tools):
+    processor = MagicMock(chat_template="{{ tools }}")
+    get_chat_template(processor, [{"role": "user", "content": "Hi"}], True, tools=tools)
+    assert processor.apply_chat_template.call_args.kwargs["tools"] == tools
+
+
 def test_apply_chat_template_preserves_explicit_thinking_enabled():
     class ThinkingProcessor:
         chat_template = "{{ messages }}"

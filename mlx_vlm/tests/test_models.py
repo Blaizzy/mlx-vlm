@@ -2533,7 +2533,7 @@ class TestMoERouterStopGradient:
             (
                 "qwen3_5_moe",
                 "Qwen3_5MoeSparseMoeBlock",
-                {"shared_expert_intermediate_size": 8},
+                {"shared_expert_intermediate_size": 8, "norm_topk_prob": True},
             ),
             ("qwen3_moe", "Qwen3MoeSparseMoeBlock", {"norm_topk_prob": True}),
         ],
