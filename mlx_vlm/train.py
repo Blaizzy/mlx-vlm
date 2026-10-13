@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import asdict, fields
@@ -9,10 +10,6 @@ from pathlib import Path
 from typing import get_args
 
 from .trainer.api import Trainer, task_spec
-
-
-def _optional_int(value):
-    return None if value.lower() == "none" else int(value)
 
 
 def _read_config(path):
@@ -36,7 +33,10 @@ def build_parser(task="vlm", algorithm=None):
     parser = argparse.ArgumentParser(description=f"MLX {task}/{algorithm} training")
     parser.add_argument("--task", choices=("vlm",), default=task)
     parser.add_argument(
-        "--algorithm", "--train-mode", choices=("sft", "orpo", "dpo"), default=algorithm
+        "--algorithm",
+        "--train-mode",
+        choices=("sft", "orpo", "dpo", "grpo"),
+        default=algorithm,
     )
     parser.add_argument("-c", "--config")
     parser.add_argument("--model", "--model-path", help="Model path or Hub identifier.")
@@ -55,6 +55,11 @@ def build_parser(task="vlm", algorithm=None):
         "--epochs", type=int, help="Complete batch passes; overrides default iters."
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--optimizer", choices=("adam", "adamw", "sgd", "muon"), default="adamw"
+    )
+    parser.add_argument("--learning-rate", type=float, default=1e-5)
+    parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument(
         "--train-type", choices=("lora", "dora", "full"), default="lora"
     )
@@ -92,8 +97,21 @@ def build_parser(task="vlm", algorithm=None):
         "--output-path", help="Output file or folder; alias for --adapter-file."
     )
     parser.add_argument(
-        "--reference-model", help="Separate DPO reference; defaults to --model."
+        "--reference-model", help="Frozen DPO/GRPO reference; defaults to --model."
     )
+    if algorithm == "grpo":
+        parser.add_argument(
+            "--reward-functions",
+            default="accuracy_reward",
+            help="Comma-separated batched reward callback names.",
+        )
+        parser.add_argument(
+            "--reward-functions-file",
+            help="Python file defining custom reward callbacks.",
+        )
+        parser.add_argument(
+            "--reward-weights", type=json.loads, help="JSON array of reward weights."
+        )
     parser.add_argument("--wandb", help="Optional W&B project.")
     parser.add_argument(
         "--dataset-config",
@@ -107,7 +125,13 @@ def build_parser(task="vlm", algorithm=None):
             kwargs["action"] = argparse.BooleanOptionalAction
         else:
             types = get_args(item.type)
-            kwargs["type"] = _optional_int if type(None) in types else item.type
+            if type(None) in types:
+                converter = next(t for t in types if t is not type(None))
+                kwargs["type"] = lambda value, converter=converter: (
+                    None if value.lower() == "none" else converter(value)
+                )
+            else:
+                kwargs["type"] = item.type
         parser.add_argument("--" + item.name.replace("_", "-"), **kwargs)
     return parser
 
@@ -144,8 +168,19 @@ def parse_args(argv=None, *, task="vlm"):
         )
     if not isinstance(args.dataset_config, dict):
         parser.error("--dataset-config must be a JSON object.")
-    if args.reference_model and args.algorithm != "dpo":
-        parser.error("--reference-model is only used by DPO.")
+    if args.reference_model and args.algorithm not in {"dpo", "grpo"}:
+        parser.error("--reference-model is only used by DPO or GRPO.")
+    if args.optimizer not in {"adam", "adamw", "sgd", "muon"}:
+        parser.error("optimizer must be adam, adamw, sgd, or muon.")
+    if (
+        not math.isfinite(args.learning_rate)
+        or args.learning_rate <= 0
+        or not math.isfinite(args.weight_decay)
+        or args.weight_decay < 0
+    ):
+        parser.error(
+            "learning_rate must be positive and weight_decay nonnegative and finite."
+        )
     _, (_, config_type) = task_spec(args.task, args.algorithm)
     settings = {item.name: getattr(args, item.name) for item in fields(config_type)}
     if args.epochs is not None:
@@ -212,13 +247,14 @@ def _load_dataset(args):
 def run(args, settings, training_callback=None):
     """Load resources and call the same Trainer used in notebooks."""
     import mlx.core as mx
+    import mlx.optimizers as optim
 
     from mlx_vlm.trainer.common.callbacks import WandBCallback
 
     mx.random.seed(args.seed)
     model, processor = _load_model(args.task, args.model)
     reference = None
-    if args.algorithm == "dpo":
+    if args.algorithm == "dpo" or (args.algorithm == "grpo" and settings.beta):
         reference, _ = _load_model(args.task, args.reference_model or args.model)
     raw = _load_dataset(args)
     if isinstance(raw, Mapping):
@@ -231,9 +267,41 @@ def run(args, settings, training_callback=None):
     if len(train_rows) == 0:
         raise ValueError(f"Dataset has no non-empty {args.train_split!r} split.")
     model = _configure_model(model, args)
+    reward_options = {}
+    if args.algorithm == "grpo":
+        from .trainer.vlm.grpo import rewards
+
+        if args.reward_functions_file:
+            import importlib.util
+
+            spec = importlib.util.spec_from_file_location(
+                "vlm_custom_rewards", args.reward_functions_file
+            )
+            rewards = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(rewards)
+        reward_options = {
+            "reward_funcs": [
+                getattr(rewards, name.strip())
+                for name in args.reward_functions.split(",")
+            ],
+            "reward_weights": args.reward_weights,
+        }
+    optimizer_type = {
+        "adam": optim.Adam,
+        "adamw": optim.AdamW,
+        "sgd": optim.SGD,
+        "muon": optim.Muon,
+    }[args.optimizer]
+    optimizer_options = (
+        {"weight_decay": args.weight_decay}
+        if args.optimizer in {"adamw", "muon"}
+        else {}
+    )
+    optimizer = optimizer_type(learning_rate=args.learning_rate, **optimizer_options)
     trainer = Trainer(
         model,
         settings,
+        optimizer=optimizer,
         task=args.task,
         algorithm=args.algorithm,
         train_dataset=train_rows,
@@ -243,9 +311,13 @@ def run(args, settings, training_callback=None):
         dataset_config=args.dataset_config,
         seed=args.seed,
         training_callback=training_callback,
+        **reward_options,
     )
     if args.epochs is not None:
         signature = getattr(trainer.train_dataset, "media_signature", None)
+        if args.algorithm == "grpo":
+            # GRPO scores rows independently and accepts mixed text/image batches.
+            signature = None
         counts = Counter(
             signature(i) if signature else () for i in range(len(train_rows))
         )

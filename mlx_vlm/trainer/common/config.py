@@ -1,4 +1,4 @@
-"""Training schedule and optimizer settings shared by all modalities."""
+"""Training loop settings shared by all modalities."""
 
 from dataclasses import dataclass, field
 
@@ -33,9 +33,6 @@ class CoreTrainingArgs:
         default=False,
         metadata={"help": "Checkpoint model layers to reduce memory use."},
     )
-    learning_rate: float = 1e-5
-    weight_decay: float = 0.0
-    optimizer: str = "adamw"
     compile: bool = False
     clear_cache_threshold: int = 0
     cache_size: int | None = 32
@@ -56,12 +53,6 @@ class CoreTrainingArgs:
             raise ValueError("steps_per_eval must be at least 1 or None.")
         if self.val_batches != -1 and self.val_batches < 1:
             raise ValueError("val_batches must be at least 1 or -1.")
-        if self.learning_rate <= 0 or self.weight_decay < 0:
-            raise ValueError(
-                "learning_rate must be positive and weight_decay nonnegative."
-            )
-        if self.optimizer not in {"adam", "adamw", "sgd", "muon"}:
-            raise ValueError("optimizer must be adam, adamw, sgd, or muon.")
         if self.clear_cache_threshold < 0:
             raise ValueError("clear_cache_threshold must be nonnegative (bytes).")
         if self.cache_size is not None and self.cache_size < 0:
