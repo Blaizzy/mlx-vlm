@@ -35,15 +35,18 @@ def small_row_attention(
         )
 
     chunk = 4 if rows > 5 else rows
+    if exact and queries.shape[1] == 16 and keys.shape[1] == 2:
+        # Five queries with eight heads per KV head change native reductions.
+        chunk = min(chunk, 4)
     if exact and not (
         _supports_invariant_grouping()
         and mx.default_device() == mx.gpu
         and queries.shape[0] == 1
         and (
             queries.shape[1] == 6 * keys.shape[1]
-            # MiniCPM 1B is separately qualified only below this boundary.
+            # MiniCPM layouts are separately qualified only below this boundary.
             # Longer contexts use singleton attention; widening this changes bits.
-            or queries.shape[1] == 8
+            or queries.shape[1] in (8, 16)
             and keys.shape[1] == 2
             and keys.shape[2] < 16384
             and rows <= 8

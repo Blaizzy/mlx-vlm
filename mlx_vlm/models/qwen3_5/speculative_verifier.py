@@ -208,7 +208,8 @@ class Qwen3_5BatchInvariantForward:
             indices = mx.argpartition(gates, kth=-top_k, axis=-1)[..., -top_k:]
             indices = mx.stop_gradient(indices)
             scores = mx.take_along_axis(gates, indices, axis=-1)
-            scores = scores / scores.sum(axis=-1, keepdims=True)
+            if feed_forward.norm_topk_prob:
+                scores = scores / scores.sum(axis=-1, keepdims=True)
 
             shared_output = self._feed_forward(feed_forward.shared_expert, x)
             shared_output = (
@@ -543,12 +544,14 @@ class Qwen3_5SpeculativeVerifier(Qwen3_5BatchInvariantForward):
 
     @staticmethod
     def supports_model(language_model):
+        from ..qwen3_5_moe.language import Qwen3_5MoeModel
         from .language import Qwen3_5Model
 
         model = language_model.model
-        if type(model) is not Qwen3_5Model:
+        if type(model) not in (Qwen3_5Model, Qwen3_5MoeModel):
             return False
-        projection = getattr(model.layers[0].mlp, "gate_proj", None)
+        mlp = model.layers[0].mlp
+        projection = getattr(getattr(mlp, "shared_expert", mlp), "gate_proj", None)
         return (
             not language_model.training
             and getattr(model.embed_tokens, "scales", model.embed_tokens.weight).dtype

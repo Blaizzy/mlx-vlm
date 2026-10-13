@@ -14,10 +14,12 @@ from mlx_vlm.models.base import InputEmbeddingsFeatures
 from mlx_vlm.models.cache import ArraysCache
 from mlx_vlm.models.qwen3_5 import gated_delta as gd
 from mlx_vlm.models.qwen3_5.speculative_verifier import (
+    Qwen3_5BatchInvariantForward,
     Qwen3_5SpeculativeVerifier,
     replay_recurrent_state,
 )
 from mlx_vlm.models.small_row_attention import small_row_attention
+from mlx_vlm.models.switch_layers import SwitchLinear
 from mlx_vlm.speculative.cache_state import start_speculative_cache
 from mlx_vlm.tests.test_speculative import dflash_config, generated
 from mlx_vlm.tests.test_speculative import language as make_language
@@ -26,8 +28,22 @@ from mlx_vlm.utils import get_model_and_args
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="Metal required")
 
 
-def language(*args, **kwargs):
-    model, config = make_language(*args, **kwargs)
+def language(family, **kwargs):
+    model, config = make_language("qwen" if family == "qwen_moe" else family, **kwargs)
+    if family == "qwen_moe":
+        from mlx_vlm.models.qwen3_5_moe.config import TextConfig
+        from mlx_vlm.models.qwen3_5_moe.language import LanguageModel
+
+        config = TextConfig.from_dict(
+            vars(config)
+            | dict(
+                num_experts=16,
+                num_experts_per_tok=8,
+                moe_intermediate_size=256,
+                shared_expert_intermediate_size=256,
+            )
+        )
+        model = LanguageModel(config, model.config)
     model.use_simd_verifier = True
     return model, config
 
@@ -42,6 +58,19 @@ def test_simd_verifier_requires_explicit_opt_in(monkeypatch):
     assert model._get_speculative_verifier().uses_simd
     model.use_simd_verifier = False
     assert not model._get_speculative_verifier().uses_simd
+
+
+@pytest.mark.parametrize("normalize", [False, True])
+def test_moe_verifier_respects_router_normalization(normalize):
+    model, _ = language("qwen_moe", hidden_size=128, intermediate_size=256)
+    mlp = model.model.layers[0].mlp
+    mlp.norm_topk_prob = normalize
+    mlp.eval()
+    x = mx.random.normal((1, 5, 128))
+    actual = Qwen3_5BatchInvariantForward()._feed_forward(mlp, x)
+    np.testing.assert_allclose(
+        np.asarray(actual), np.asarray(mlp(x)), rtol=1e-4, atol=1e-6
+    )
 
 
 def require_matrix():
@@ -303,10 +332,11 @@ def test_simd_model_commit_matches_explicit_state_history(accepted, monkeypatch)
         (4, mx.bfloat16, False, False),
     ],
 )
-def test_opt_in_verifier_selection(bits, dtype, device, expected, monkeypatch):
+@pytest.mark.parametrize("family", ["qwen", "qwen_moe"])
+def test_opt_in_verifier_selection(bits, dtype, device, expected, monkeypatch, family):
     from mlx_vlm.models.qwen3_5 import speculative_verifier as verifier
 
-    model, _ = language("qwen", hidden_size=128, intermediate_size=256)
+    model, _ = language(family, hidden_size=128, intermediate_size=256)
     model.set_dtype(dtype)
     model.eval()
     if bits is not None:
@@ -400,13 +430,14 @@ def test_exact_attention_handles_other_dispatches(kind):
 )
 @pytest.mark.parametrize("batch", [1, 2])
 @pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("family", ["qwen", "qwen_moe"])
 def test_simd_verification_and_rollback_match_own_serial(
-    prefix_length, rows, accepted, batch, quantized
+    prefix_length, rows, accepted, batch, quantized, family
 ):
     require_matrix()
     mx.random.seed(913)
     model, _ = language(
-        "qwen",
+        family,
         hidden_size=512,
         intermediate_size=1024,
         num_hidden_layers=4,
@@ -426,7 +457,11 @@ def test_simd_verification_and_rollback_match_own_serial(
             model,
             group_size=64,
             bits=4,
-            class_predicate=lambda _, m: isinstance(m, nn.Linear),
+            class_predicate=lambda name, m: (
+                {"bits": 8, "group_size": 64}
+                if name.endswith(("mlp.gate", "mlp.shared_expert_gate"))
+                else isinstance(m, (nn.Linear, SwitchLinear))
+            ),
         )
     cache = model.make_cache()
     prefix = (mx.arange(prefix_length)[None] + mx.arange(batch)[:, None]) % 24
@@ -637,13 +672,14 @@ def test_dense_adapter_preserves_shared_parameters_and_fallback(monkeypatch):
 
 
 @pytest.mark.parametrize("length", [31, 1023, 1024, 1025, 16383, 16384, 16385])
-@pytest.mark.parametrize("rows", [2, 5, 8])
+@pytest.mark.parametrize("rows", [2, 3, 4, 5, 6, 7, 8])
 @pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("heads", [8, 16])
 def test_minicpm_attention_qualification_and_long_context_fallback(
-    length, rows, causal
+    length, rows, causal, heads
 ):
     mx.random.seed(length + rows)
-    q = mx.random.normal((1, 8, rows, 256)).astype(mx.bfloat16)
+    q = mx.random.normal((1, heads, rows, 256)).astype(mx.bfloat16)
     k = mx.random.normal((1, 2, length, 256)).astype(mx.bfloat16)
     v = mx.random.normal(k.shape).astype(mx.bfloat16)
     output = small_row_attention(

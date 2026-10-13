@@ -14,12 +14,16 @@ from mlx_vlm.utils import load
 p = argparse.ArgumentParser()
 p.add_argument("--model", required=True)
 p.add_argument("--output", type=Path, default=Path("minicpm-verifier-checks.json"))
+p.add_argument("--capture-layers", type=int, nargs="+")
+p.add_argument(
+    "--long-context", action="store_true", help="Also check the 64K boundary"
+)
 a = p.parse_args()
 model, _ = load(a.model)
 lm = model.language_model
 install_padded_head(lm)
 results = []
-for prefix_length, rows, accepted in [
+cases = [
     (32, 1, 0),
     (32, 5, 3),
     (32, 8, 8),
@@ -29,14 +33,21 @@ for prefix_length, rows, accepted in [
     (2048, 6, 2),
     (16376, 8, 3),
     (16378, 8, 3),
-]:
+]
+if a.long_context:
+    cases.extend([(65528, 8, 3), (65530, 8, 3)])
+for prefix_length, rows, accepted in cases:
     cache = lm.make_cache()
     prefix = (mx.arange(prefix_length)[None] % 100) + 100
-    mx.eval(lm(prefix, cache=cache).logits)
+    lm(prefix, cache=cache, skip_logits=True)
+    mx.eval([layer.state for layer in cache])
     reference = deepcopy(cache)
     retained = deepcopy(cache)
     ids = (mx.arange(rows)[None] * 2 + 1) + 200
-    options = dict(return_hidden=True, capture_layer_ids=[3, 7, 11, 15, 19])
+    options = dict(
+        return_hidden=True,
+        capture_layer_ids=a.capture_layers or list(range(3, len(lm.model.layers), 4)),
+    )
     grouped = lm(ids, cache=cache, speculative_verify=True, **options)
     mx.eval(grouped.logits)
     steps = []

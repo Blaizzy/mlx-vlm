@@ -13,7 +13,7 @@ def install_padded_head(lm):
     from mlx_vlm.models.simd_mma import simd_mmas, supports_simd_linear
 
     if not Qwen3_5SpeculativeVerifier.supports_model(lm):
-        raise ValueError("The SIMD verifier requires a supported GPU and dense model")
+        raise ValueError("The SIMD verifier requires a supported GPU and model")
     head = lm.lm_head
     if (
         type(head) is not nn.Linear
@@ -22,8 +22,10 @@ def install_padded_head(lm):
     ):
         raise ValueError("Experiment only covers an unquantized BF16 head without bias")
     vocab, width = head.weight.shape
-    padded = nn.Linear(width, (vocab + 15) // 16 * 16, bias=False)
-    padded.weight = mx.pad(head.weight, [(0, (-vocab) % 16), (0, 0)])
+    padded = head
+    if vocab % 16:
+        padded = nn.Linear(width, (vocab + 15) // 16 * 16, bias=False)
+        padded.weight = mx.pad(head.weight, [(0, (-vocab) % 16), (0, 0)])
     mx.eval(padded.parameters())
     assert supports_simd_linear(padded)
 
