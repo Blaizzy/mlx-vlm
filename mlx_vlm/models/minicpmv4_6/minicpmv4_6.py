@@ -358,7 +358,9 @@ class Model(nn.Module):
         if cached is not None:
             vision_hidden_states = cached
         elif pixel_values is not None:
-            vision_hidden_states = self.get_vision_embedding(pixel_values, tgt_sizes)
+            vision_hidden_states = self.get_vision_embedding(
+                pixel_values, tgt_sizes, downsample_mode=kwargs.get("downsample_mode")
+            )
         else:
             vision_hidden_states = None
 
