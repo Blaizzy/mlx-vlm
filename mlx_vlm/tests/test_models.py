@@ -181,7 +181,6 @@ class ModelChecks:
         vision, vc = core.vision_tower, config.vision_config
         layers, width = len(vc.deepstack_visual_indexes), vc.out_hidden_size
         assert layers > 0, "The multimodal case must enable DeepStack layers"
-        patch_width = vc.in_channels * vc.temporal_patch_size * vc.patch_size**2
         tokens = {"image": config.image_token_id, "video": config.video_token_id}
         grids = {"image": image_grid, "video": video_grid}
         model.eval()
@@ -189,28 +188,15 @@ class ModelChecks:
             model.update(tree_map(lambda p: p.astype(dtype), model.parameters()))
             for layout in (tuple(layout) for layout in layouts):
                 for batch in batch_sizes:
-                    rows, media, encoded = [], {}, {}
-                    for row in range(batch):
-                        order = layout if row == 0 else layout[::-1]
-                        ids = [1, 2]
-                        for kind in order:
-                            count = math.prod(grids[kind]) // vc.spatial_merge_size**2
-                            ids += [config.vision_start_token_id] + [
-                                tokens[kind]
-                            ] * count
-                            ids += [config.vision_end_token_id]
-                        rows.append(ids + [3, 4, 5])
-                    ids = mx.array(rows, mx.int32)
+                    ids, media = qwen_multimodal_inputs(
+                        config, grids, layout, batch, dtype
+                    )
+                    encoded = {}
                     for kind in layout:
-                        pixels = mx.random.normal(
-                            (batch * math.prod(grids[kind]), patch_width)
-                        ).astype(dtype)
-                        grid = mx.array([grids[kind]] * batch)
-                        media[
+                        key = (
                             "pixel_values" if kind == "image" else "pixel_values_videos"
-                        ] = pixels
-                        media[kind + "_grid_thw"] = grid
-                        encoded[kind] = vision(pixels, grid)
+                        )
+                        encoded[kind] = vision(media[key], media[kind + "_grid_thw"])
                     features = model.get_input_embeddings(ids, **media)
                     assert isinstance(features, InputEmbeddingsFeatures)
                     mask = (ids == tokens["image"]) | (ids == tokens["video"])
@@ -423,25 +409,18 @@ class ModelChecks:
         if model_type == "llama4_vision_model":
             width = kwargs.pop("projector_output_dim", width)
         batch = kwargs.pop("batch_size", 1)
-        flat = (
-            "qwen2_5_vl qwen3_5 qwen3_5_moe qwen4_exp "
-            "glm4v_moe glm4v hunyuan_vl siglip2_vision_model mimovl"
-        ).split()
-        shape = (
-            image_size
-            if len(image_size) > 2 or model_type in flat
-            else (
-                (batch, channels, *image_size)
-                if channel_first
-                else (batch, *image_size, channels)
-            )
-        )
         parameters = inspect.signature(model.__call__).parameters
         for dtype in (mx.float32, mx.float16):
             model.update(tree_map(lambda p: p.astype(dtype), model.parameters()))
             if model_type is not None:
                 assert model.model_type == model_type
-            inputs = mx.random.uniform(shape=shape)
+            inputs = vision_inputs(
+                image_size,
+                channels,
+                model_type,
+                channel_first=channel_first,
+                batch=batch,
+            )
             if "image_masks" in parameters:
                 inputs = inputs.transpose(0, 3, 1, 2)
                 kwargs["image_masks"] = mx.ones((batch, channels, image_size[0]))
@@ -705,47 +684,79 @@ def test_model_contract(case):
         getattr(checks, kind)(*args, **kwargs)
 
 
-def quantized_vision_inputs(name, config):
+def vision_inputs(
+    image_size, channels=3, model_type=None, *, channel_first=False, batch=1
+):
+    """Build synthetic pixels using the vision contract's shape conventions."""
+    flat = (
+        "qwen2_5_vl qwen3_5 qwen3_5_moe qwen4_exp "
+        "glm4v_moe glm4v hunyuan_vl siglip2_vision_model mimovl"
+    ).split()
+    shape = (
+        image_size
+        if len(image_size) > 2 or model_type in flat
+        else (
+            (batch, channels, *image_size)
+            if channel_first
+            else (batch, *image_size, channels)
+        )
+    )
+    return mx.random.uniform(shape=shape)
+
+
+def qwen_multimodal_inputs(config, grids, layout=("image",), batch=1, dtype=mx.float32):
+    """Image/video inputs shared by fusion, prefill and quantized embedding checks."""
+    vc = config.vision_config
+    temporal = getattr(vc, "temporal_patch_size", getattr(vc, "patch_temporal", 1))
+    merge = getattr(vc, "spatial_merge_size", getattr(vc, "merge_size", 2))
+    patch_width = getattr(vc, "in_channels", 3) * temporal * vc.patch_size**2
+    rows, media = [], {}
+    for row in range(batch):
+        ids = [1, 2]
+        for kind in layout if row == 0 else layout[::-1]:
+            token = getattr(
+                config, kind + "_token_id", getattr(config, kind + "_token_index", 128)
+            )
+            count = math.prod(grids[kind]) // merge**2
+            ids += [getattr(config, "vision_start_token_id", 130)] + [token] * count
+            ids += [getattr(config, "vision_end_token_id", 131)]
+        rows.append(ids + [3, 4, 5])
+    for kind in layout:
+        media["pixel_values" if kind == "image" else "pixel_values_videos"] = (
+            mx.random.normal((batch * math.prod(grids[kind]), patch_width)).astype(
+                dtype
+            )
+        )
+        media[kind + "_grid_thw"] = mx.array([grids[kind]] * batch)
+    return mx.array(rows, mx.int32), media
+
+
+def minicpm_inputs(config, mode="16x"):
+    count = 64 // (16 if mode == "16x" else 4)
+    ids = (
+        [1, getattr(config, "image_start_id", 130)]
+        + [getattr(config, "image_token_id", 128)] * count
+        + [getattr(config, "image_end_id", 131), 2]
+    )
+    return mx.array([ids]), {
+        "pixel_values": [[mx.random.normal((3, 2, 128))]],
+        "tgt_sizes": [np.array([[8, 8]])],
+        "downsample_mode": mode,
+    }
+
+
+def multimodal_image_inputs(name, config):
+    """Add each family's placeholder tokens and metadata to synthetic pixels."""
     core = getattr(config, "thinker_config", config)
-    vc = getattr(core, "vision_config", None)
-    if name in ("deepseek_v4", "deepseek_v41"):
-        implementation = importlib.import_module("mlx_vlm.models." + name + "." + name)
-        pixels = mx.random.normal((16, 3, 2, 2))
-        image = implementation.IMAGE
-        if name == "deepseek_v4":
-            media = dict(
-                pixel_values=pixels,
-                image_grid_hw=mx.array([[4, 4]]),
-                image_permutations=mx.arange(4),
-                image_sample_indices=mx.array([0]),
-                image_offsets=mx.array([1]),
-                image_types=mx.array([image] * 4),
-                image_type_offsets=mx.array([0, 4]),
-            )
-            ids = mx.array([[1] + [config.vocab_size + image] * 4 + [2]])
-        else:
-            media = dict(
-                pixel_values=[
-                    [
-                        SimpleNamespace(
-                            start=1,
-                            patches=pixels,
-                            n_vit_h=4,
-                            n_vit_w=4,
-                            types=[image] * 4,
-                        )
-                    ]
-                ]
-            )
-            ids = mx.array([[1, 2, 3, 4, 5, 6]])
+    if name.startswith("minicpm"):
+        ids, media = minicpm_inputs(core)
+        media["image_bound"] = [mx.array([[2, ids.shape[-1] - 2]])]
         return ids, media
     token = getattr(
         core,
         "img_id",
         getattr(core, "image_token_id", getattr(core, "image_token_index", 128)),
     )
-    ids = [1] + [token] * 16 + [2]
-    media = {"pixel_values": mx.random.normal((1, 3, 8, 8))}
     if name in (
         "clef",
         "prism_hadamard_qwen35",
@@ -774,33 +785,46 @@ def quantized_vision_inputs(name, config):
         "muse_glimmer",
         "ernie4_5_moe_vl",
     ):
-        temporal = getattr(vc, "temporal_patch_size", getattr(vc, "patch_temporal", 1))
-        media = {
-            "pixel_values": mx.random.normal((16, 3 * temporal * vc.patch_size**2)),
-            "image_grid_thw": mx.array([[1, 4, 4]]),
-        }
-        ids = (
-            [1, getattr(core, "vision_start_token_id", 130)]
-            + [token]
-            * (
-                16
-                // getattr(vc, "spatial_merge_size", getattr(vc, "merge_size", 2)) ** 2
+        ids, media = qwen_multimodal_inputs(core, {"image": (1, 4, 4)})
+        if name == "hunyuan_vl":
+            ids = mx.array([[1] + [token] * 8 + [2]])
+        if name == "youtu_vl":
+            media["spatial_shapes"] = mx.array([[4, 4]])
+        return ids, media
+    if name in ("deepseek_v4", "deepseek_v41"):
+        implementation = importlib.import_module("mlx_vlm.models." + name + "." + name)
+        pixels = vision_inputs((16, 3, 2, 2))
+        image = implementation.IMAGE
+        if name == "deepseek_v4":
+            media = dict(
+                pixel_values=pixels,
+                image_grid_hw=mx.array([[4, 4]]),
+                image_permutations=mx.arange(4),
+                image_sample_indices=mx.array([0]),
+                image_offsets=mx.array([1]),
+                image_types=mx.array([image] * 4),
+                image_type_offsets=mx.array([0, 4]),
             )
-            + [getattr(core, "vision_end_token_id", 131), 2]
-        )
-    elif name.startswith("minicpm"):
-        media = {
-            "pixel_values": [[mx.random.normal((3, 2, 128))]],
-            "tgt_sizes": [np.array([[8, 8]])],
-            "downsample_mode": "16x",
-        }
-        ids = (
-            [1, getattr(core, "image_start_id", 130)]
-            + [token] * 4
-            + [getattr(core, "image_end_id", 131), 2]
-        )
-        media["image_bound"] = [mx.array([[2, 6]])]
-    elif name in (
+            ids = mx.array([[1] + [config.vocab_size + image] * 4 + [2]])
+        else:
+            media = dict(
+                pixel_values=[
+                    [
+                        SimpleNamespace(
+                            start=1,
+                            patches=pixels,
+                            n_vit_h=4,
+                            n_vit_w=4,
+                            types=[image] * 4,
+                        )
+                    ]
+                ]
+            )
+            ids = mx.array([[1, 2, 3, 4, 5, 6]])
+        return ids, media
+    shape, count, media = (8, 8), 16, {}
+    channel_first = True
+    if name in (
         "llava_bunny",
         "llava_next",
         "llava_onevision",
@@ -809,128 +833,96 @@ def quantized_vision_inputs(name, config):
         "mistral_large3",
         "florence2",
     ):
-        ids = [1, token, 2]
-        if name in ("llava_next", "llava_onevision"):
-            media["pixel_values"] = media["pixel_values"][None]
+        count = 17 if name == "llava_onevision" else 1
         media["image_sizes"] = [(8, 8)]
-        if name == "llava_bunny":
-            media["pixel_values"] = mx.random.normal((1, 3, 54, 54))
+        if name in ("llava_next", "llava_onevision"):
+            shape = (1, 1, 3, 8, 8)
+        elif name == "llava_bunny":
+            shape = (54, 54)
     elif name in ("deepseekocr", "deepseekocr_2", "unlimited_ocr"):
-        count = 3 if name != "deepseekocr_2" else 2
-        ids = [1] + [token] * count + [2]
+        count = 2 if name == "deepseekocr_2" else 3
         media = {
             "pixel_values": [
                 mx.zeros((0, 3, 64, 64)),
-                mx.random.normal((1, 3, 64, 64)),
+                vision_inputs((64, 64), channel_first=True),
             ],
             "images_spatial_crop": mx.array([[1, 1]]),
             "images_seq_mask": mx.array([[False] + [True] * count + [False]]),
         }
     elif name == "phi3_v":
-        ids = [1] + [-1] * 313 + [2]
-        media = {
-            "pixel_values": mx.random.normal((1, 2, 3, 336, 336)),
-            "image_sizes": mx.array([[336, 336]]),
-        }
+        shape, count, token = (1, 2, 3, 336, 336), 313, -1
+        media["image_sizes"] = mx.array([[336, 336]])
     elif name == "jina_vlm":
+        shape = (1, 16, 12)
         media = {
-            "pixel_values": mx.random.normal((1, 16, 12)),
             "image_input_idx": mx.array([[1, 2, 3, 4]]),
             "image_masks": mx.ones((1, 16)),
         }
     elif name in ("kimi_k25", "kimi_k3", "kimi_vl", "locateanything"):
-        media = {
-            "pixel_values": mx.random.normal((16, 3, 2, 2)),
-            "image_grid_hws": mx.array([[4, 4]]),
-        }
-        ids = [1] + [token] * 4 + [2]
+        shape, count = (16, 3, 2, 2), 4
+        media["image_grid_hws"] = mx.array([[4, 4]])
     elif name == "mllama":
+        shape = (1, 1, 1, 3, 8, 8)
         media = {
-            "pixel_values": mx.random.normal((1, 1, 1, 3, 8, 8)),
             "aspect_ratio_ids": mx.array([[1]]),
             "aspect_ratio_mask": mx.ones((1, 1, 1)),
         }
     elif name == "deepseek_vl_v2":
+        shape, count = (1, 2, 3, 8, 8), 13
         media = {
-            "pixel_values": mx.random.normal((1, 2, 3, 8, 8)),
             "images_spatial_crop": mx.array([[[1, 1]]]),
-            "images_seq_mask": mx.array([[False] + [True] * 13 + [False]]),
+            "images_seq_mask": mx.array([[False] + [True] * count + [False]]),
         }
-        ids = [1] + [token] * 13 + [2]
     elif name == "inkling":
-        media = {"pixel_values": mx.random.normal((2, 2, 2, 2, 3))}
-        ids = [1, token, token, 2]
+        shape, count = (2, 2, 2, 2, 3), 2
     elif name in ("falcon_ocr", "falcon_perception", "moondream2", "moondream3", "got"):
-        media["pixel_values"] = media["pixel_values"].transpose(0, 2, 3, 1)
-    elif name == "minimax_m3_vl":
-        media = {
-            "pixel_values": mx.random.normal((1, 16, 12)),
-            "image_grid_thw": mx.array([[1, 4, 4]]),
-        }
-    elif name == "paddleocr_vl":
-        media = {
-            "pixel_values": mx.random.normal((1, 16, 3, 2, 2)),
-            "image_grid_thw": mx.array([[1, 4, 4]]),
-        }
-        ids = [1, token, 2]
+        channel_first = False
+        if name == "got":
+            count = 1
+    elif name in ("minimax_m3_vl", "paddleocr_vl"):
+        shape = (1, 16, 12) if name == "minimax_m3_vl" else (1, 16, 3, 2, 2)
+        count = 16 if name == "minimax_m3_vl" else 1
+        media["image_grid_thw"] = mx.array([[1, 4, 4]])
     elif name in ("lfm2_vl", "phi4_siglip", "phi4mm", "d1"):
+        shape, count = (1, 16, 12), 4
         media = {
-            "pixel_values": mx.random.normal((1, 16, 12)),
             "spatial_shapes": mx.array([[4, 4]]),
             "pixel_attention_mask": mx.ones((1, 16), mx.bool_),
         }
-        ids = [1] + [token] * 4 + [2]
         if name in ("phi4_siglip", "phi4mm"):
-            ids = [1, -200 if name == "phi4_siglip" else token, 2]
-    elif name == "aya_vision":
-        ids = [1] + [token] * 4 + [2]
+            count = 1
+            token = -200 if name == "phi4_siglip" else token
+    elif name in ("aya_vision", "llama4", "nemotron_h_nano_omni", "diffusion_gemma"):
+        count = 4
     elif name in ("internvl", "internvl_chat", "llmjpvl"):
-        ids = [1] + [token] * int(16 * core.downsample_ratio**2) + [2]
+        count = int(16 * core.downsample_ratio**2)
     elif name in ("idefics2", "idefics3", "smolvlm", "colidefics3"):
-        media["pixel_values"] = media["pixel_values"][None]
+        shape = (1, 1, 3, 8, 8)
         media["pixel_attention_mask"] = mx.ones((1, 1, 8, 8), dtype=mx.bool_)
-        ids = (
-            [1]
-            + [token]
-            * (
-                core.perceiver_config.resampler_n_latents
-                if name == "idefics2"
-                else 16 // core.scale_factor**2
-            )
-            + [2]
+        count = (
+            core.perceiver_config.resampler_n_latents
+            if name == "idefics2"
+            else 16 // core.scale_factor**2
         )
-    if name in ("llama4", "nemotron_h_nano_omni"):
-        ids = [1] + [token] * 4 + [2]
-    if name in ("step3p7", "got"):
-        ids = [1, token, 2]
-    if name == "hunyuan_vl":
-        ids = [1] + [token] * 8 + [2]
-    if name == "youtu_vl":
-        media["spatial_shapes"] = mx.array([[4, 4]])
-    if name in ("granite4_vision", "granite_vision"):
-        media["pixel_values"] = media["pixel_values"][None]
+    elif name in ("step3p7", "multi_modality"):
+        count = 1
+    elif name in ("granite4_vision", "granite_vision"):
+        shape = (1, 1, 3, 8, 8)
         media["image_sizes"] = [(8, 8)]
-    if name in ("gemma4", "gemma4_unified"):
-        media = {
-            "pixel_values": mx.random.normal((1, 16, 12)),
-            "image_position_ids": mx.array(
-                [[[h, w] for h in range(4) for w in range(4)]]
-            ),
-        }
-    if name == "gemma4":
-        ids = [1] + [token] * 4 + [2]
-    if name == "multi_modality":
-        ids = [1, token, 2]
-    if name == "gemma3n":
-        media["pixel_values"] = mx.random.normal((1, 3, 256, 256))
-        ids = [1] + [token] * 256 + [2]
-    if name == "diffusion_gemma":
-        ids = [1] + [token] * 4 + [2]
-    if name == "llava_onevision":
-        ids = [1] + [token] * 17 + [2]
+    elif name in ("gemma4", "gemma4_unified"):
+        shape = (1, 16, 12)
+        count = 4 if name == "gemma4" else 16
+        media["image_position_ids"] = mx.array(
+            [[[h, w] for h in range(4) for w in range(4)]]
+        )
+    elif name == "gemma3n":
+        shape, count = (256, 256), 256
+    ids = mx.array([[1] + [token] * count + [2]])
+    if "pixel_values" not in media:
+        media["pixel_values"] = vision_inputs(shape, channel_first=channel_first)
     if name in ("paligemma", "gemma3"):
-        media["mask"] = mx.ones((1, len(ids)), mx.int32)
-    return mx.array([ids]), media
+        media["mask"] = mx.ones(ids.shape, mx.int32)
+    return ids, media
 
 
 def quantized_vision_config(name, case):
@@ -1062,7 +1054,7 @@ def test_quantized_vision_embeddings(case_name):
     module, config = quantized_vision_config(name, case)
     model = quantized_vision_model(name, module, config)
     model.eval()
-    ids, media = quantized_vision_inputs(name, config)
+    ids, media = multimodal_image_inputs(name, config)
     ModelChecks().quantized_vision(model, ids, media)
 
 
@@ -1305,12 +1297,8 @@ def test_minicpmv47_vision_and_chunked_prefill(minicpmv47_case, mode, count):
     module, config = minicpmv47_case
 
     model = module.Model(config)
-    ids = mx.array([[1, 50] + [48] * count + [51, 2]])
-    media = {
-        "pixel_values": [[mx.random.normal((3, 2, 128))]],
-        "tgt_sizes": [np.array([[8, 8]])],
-        "downsample_mode": mode,
-    }
+    ids, media = minicpm_inputs(config, mode)
+    assert ids.shape[-1] == count + 4
     features = model.get_input_embeddings(ids, **media)
     assert features.inputs_embeds.shape == (*ids.shape, 16)
     assert features.position_ids.shape == (3, 1, ids.shape[-1])
