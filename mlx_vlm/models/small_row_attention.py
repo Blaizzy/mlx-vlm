@@ -1,4 +1,4 @@
-"""Group short query blocks for the native Metal attention kernels."""
+"""Group qualified query blocks with singleton-equivalent attention reductions."""
 
 from functools import lru_cache
 from importlib.metadata import version
@@ -15,30 +15,18 @@ def _supports_invariant_grouping():
     )
 
 
-def small_row_attention(
-    queries, keys, values, *, scale, mask=None, sinks=None, exact=False
-):
+def small_row_attention(queries, keys, values, *, scale, mask=None, sinks=None):
     rows = queries.shape[2]
-    if (
-        rows < 2
-        or not exact
-        and rows > 8
-        or keys.shape[2] < rows
-        or not exact
-        and (
-            sinks is not None
-            or not (mask is None or isinstance(mask, str) and mask == "causal")
-        )
-    ):
+    if rows < 2 or keys.shape[2] < rows:
         return mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=scale, mask=mask, sinks=sinks
         )
 
     chunk = 4 if rows > 5 else rows
-    if exact and queries.shape[1] == 16 and keys.shape[1] == 2:
+    if queries.shape[1] == 16 and keys.shape[1] == 2:
         # Five queries with eight heads per KV head change native reductions.
         chunk = min(chunk, 4)
-    if exact and not (
+    if not (
         _supports_invariant_grouping()
         and mx.default_device() == mx.gpu
         and queries.shape[0] == 1
@@ -58,12 +46,12 @@ def small_row_attention(
     ):
         chunk = 1
     prefix = keys.shape[2] - rows
+    causal = isinstance(mask, str) and mask == "causal"
     outputs = []
     start = 0
     while start < rows:
         stop = min(start + chunk, rows)
-        causal = isinstance(mask, str) and mask == "causal"
-        if exact and causal:
+        if causal:
             # Keep every query in a group on the same native reduction plan
             # as its standalone call. Context length changes that plan here.
             for boundary in (1024, 16384, 65536):

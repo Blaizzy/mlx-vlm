@@ -179,7 +179,7 @@ def test_matrix_against_independent_unpacked_reference(batch, rows, width, group
     mx.random.seed(width + rows)
     layer = linear(width, group_size=group, bias=True)
     x = mx.random.normal((batch, rows * 2, width)).astype(mx.bfloat16)[:, ::2]
-    actual = mma.affine_mma(layer, x)
+    actual = mma.simd_mmas((layer,), x)[0]
     codes = (
         (np.asarray(layer.weight)[..., None] >> (4 * np.arange(8, dtype=np.uint32)))
         & 15
@@ -201,9 +201,9 @@ def test_fused_matrix_preserves_projection_boundaries(outputs):
     require_matrix()
     x = mx.random.normal((2, 5, 512)).astype(mx.bfloat16)
     layers = tuple(linear(512, n, bias=True) for n in outputs)
-    fused = mma.affine_mmas(layers, x)
+    fused = mma.simd_mmas(layers, x)
     for layer, actual in zip(layers, fused):
-        assert mx.array_equal(actual, mma.affine_mma(layer, x)).item()
+        assert mx.array_equal(actual, mma.simd_mmas((layer,), x)[0]).item()
 
 
 @pytest.mark.parametrize(
@@ -218,28 +218,12 @@ def test_fused_matrix_preserves_projection_boundaries(outputs):
 def test_matrix_unsupported_shapes_use_fallback(rows, dtype, bits, output):
     layer = linear(512, output, bits=bits)
     x = mx.ones((1, rows, 512), dtype)
-    assert mma.affine_mma(layer, x) is None
+    assert mma.simd_mmas((layer,), x) is None
 
 
 def test_matrix_disabled_device_fallback(monkeypatch):
     monkeypatch.setattr(mma, "supports_simd_mma", lambda: False)
-    assert mma.affine_mma(linear(512), mx.ones((1, 8, 512), mx.bfloat16)) is None
-
-
-def test_adapter_preserves_parameters_and_shared_module():
-    require_matrix()
-    shared = linear(512)
-    model = nn.Sequential(shared)
-    before = dict(tree_flatten(model.parameters()))
-    mma.enable_simd_linears(model)
-    assert type(shared) is nn.QuantizedLinear
-    assert isinstance(model.layers[0], mma.SIMDQuantizedLinear)
-    after = dict(tree_flatten(model.parameters()))
-    assert before.keys() == after.keys()
-    assert all(before[key] is after[key] for key in before)
-    adapted = model.layers[0]
-    mma.enable_simd_linears(model)
-    assert model.layers[0] is adapted
+    assert mma.simd_mmas((linear(512),), mx.ones((1, 8, 512), mx.bfloat16)) is None
 
 
 @pytest.mark.parametrize(
@@ -271,15 +255,6 @@ def test_attention_against_float32_reference(rows, length, causal):
         assert mx.array_equal(
             mx.array(a[:, :, :-1]), b[:, :, :-1].astype(mx.float32)
         ).item()
-
-
-def test_attention_array_mask_fallback():
-    q = mx.random.normal((1, 2, 8, 32)).astype(mx.bfloat16)
-    k = mx.random.normal((1, 1, 64, 32)).astype(mx.bfloat16)
-    mask = mx.arange(64) < 35
-    actual = small_row_attention(q, k, k, scale=0.125, mask=mask)
-    expected = mx.fast.scaled_dot_product_attention(q, k, k, scale=0.125, mask=mask)
-    assert mx.array_equal(actual, expected).item()
 
 
 @pytest.mark.parametrize("lengths", [(0, 0), (3, 3), (8, 8), (0, 8), (3, 7)])
@@ -435,16 +410,16 @@ def test_opt_in_verifier_selection(bits, dtype, device, expected, monkeypatch, f
     assert not model._get_speculative_verifier().uses_simd
 
 
-@pytest.mark.parametrize("rows", [2, 3, 4, 5, 6, 7, 8])
+@pytest.mark.parametrize("rows", [2, 3, 4, 5, 6, 7, 8, 9, 16])
 @pytest.mark.parametrize("width,group", [(512, 32), (5120, 64), (17408, 128)])
 def test_matrix_rows_match_singletons_in_every_column(rows, width, group):
     require_matrix()
     mx.random.seed(7 + width + rows)
     projection = linear(width, group_size=group, bias=True)
     hidden = mx.random.normal((2, rows * 2, width)).astype(mx.bfloat16)[:, ::2]
-    grouped = mma.affine_mma(projection, hidden)
+    grouped = mma.simd_mmas((projection,), hidden, chunked=True)[0]
     expected = mx.concatenate(
-        [mma.affine_mma(projection, hidden[:, i : i + 1]) for i in range(rows)], 1
+        [mma.simd_mmas((projection,), hidden[:, i : i + 1])[0] for i in range(rows)], 1
     )
     assert mx.array_equal(grouped, expected).item()
 
@@ -459,7 +434,7 @@ def test_causal_attention_crosses_dispatch_boundaries_exactly(length, rows):
     q = mx.random.normal((1, rows, 6, 256)).astype(mx.bfloat16).transpose(0, 2, 1, 3)
     k = mx.random.normal((1, 1, length + 3, 256)).astype(mx.bfloat16)[:, :, :length]
     v = mx.random.normal(k.shape).astype(mx.bfloat16)
-    output = small_row_attention(q, k, v, scale=1 / 16, mask="causal", exact=True)
+    output = small_row_attention(q, k, v, scale=1 / 16, mask="causal")
     expected = mx.concatenate(
         [
             mx.fast.scaled_dot_product_attention(
@@ -475,8 +450,8 @@ def test_causal_attention_crosses_dispatch_boundaries_exactly(length, rows):
     assert mx.array_equal(output, expected).item()
 
 
-@pytest.mark.parametrize("kind", ["mask", "sinks", "ordinary"])
-def test_exact_attention_handles_other_dispatches(kind):
+@pytest.mark.parametrize("kind", ["mask", "vector_mask", "sinks", "ordinary"])
+def test_attention_handles_other_dispatches(kind):
     q = mx.random.normal((2, 4, 8, 64)).astype(mx.bfloat16)
     k = mx.random.normal((2, 2, 1040, 64)).astype(mx.bfloat16)
     v = mx.random.normal(k.shape).astype(mx.bfloat16)
@@ -485,10 +460,10 @@ def test_exact_attention_handles_other_dispatches(kind):
         if kind == "mask"
         else None
     )
+    if kind == "vector_mask":
+        mask = mx.arange(1040) < 1035
     sinks = mx.zeros((4,), dtype=mx.bfloat16) if kind == "sinks" else None
-    result = small_row_attention(
-        q, k, v, scale=1 / 8, mask=mask, sinks=sinks, exact=True
-    )
+    result = small_row_attention(q, k, v, scale=1 / 8, mask=mask, sinks=sinks)
     expected = mx.concatenate(
         [
             mx.fast.scaled_dot_product_attention(
@@ -496,7 +471,7 @@ def test_exact_attention_handles_other_dispatches(kind):
                 k,
                 v,
                 scale=1 / 8,
-                mask=mask[i : i + 1] if mask is not None else None,
+                mask=mask[i : i + 1] if kind == "mask" else mask,
                 sinks=sinks,
             )
             for i in range(8)
@@ -705,11 +680,11 @@ def test_dense_matrix_accuracy_fusion_and_row_invariance(batch, rows, width, siz
         error = np.linalg.norm(float_array(output) - float_array(reference))
         assert error / max(np.linalg.norm(float_array(reference)), 1e-12) < 0.003
         single = mx.concatenate(
-            [mma.dense_mmas((layer,), x[:, i : i + 1])[0] for i in range(rows)], axis=1
+            [mma.simd_mmas((layer,), x[:, i : i + 1])[0] for i in range(rows)], axis=1
         )
         assert mx.array_equal(output, single).item()
         assert mx.array_equal(
-            output, mma.dense_mmas((layer,), x, chunked=True)[0]
+            output, mma.simd_mmas((layer,), x, chunked=True)[0]
         ).item()
 
 
@@ -733,25 +708,8 @@ def test_dense_matrix_preserves_bfloat16_exponent_range():
     layer = nn.Linear(128, 16, bias=False)
     layer.weight = mx.full((16, 128), 2.0**80, mx.bfloat16)
     x = mx.full((2, 5, 128), 2.0**-80, mx.bfloat16)
-    output = mma.dense_mmas((layer,), x)[0]
+    output = mma.simd_mmas((layer,), x)[0]
     assert mx.array_equal(output, mx.full((2, 5, 16), 128, mx.bfloat16)).item()
-
-
-def test_dense_adapter_preserves_shared_parameters_and_fallback(monkeypatch):
-    require_matrix()
-    original = nn.Linear(128, 48, bias=True)
-    original.set_dtype(mx.bfloat16)
-    model = nn.Sequential(original)
-    before = dict(tree_flatten(model.parameters()))
-    mma.enable_simd_linears(model)
-    assert type(original) is nn.Linear
-    assert isinstance(model.layers[0], mma.SIMDLinear)
-    after = dict(tree_flatten(model.parameters()))
-    assert before.keys() == after.keys()
-    assert all(before[key] is after[key] for key in before)
-    x = mx.ones((1, 2, 128), mx.bfloat16)
-    monkeypatch.setattr(mma, "supports_simd_mma", lambda: False)
-    assert mx.array_equal(model.layers[0](x), original(x)).item()
 
 
 @pytest.mark.parametrize("length", [31, 1023, 1024, 1025, 16383, 16384, 16385])
@@ -766,7 +724,7 @@ def test_minicpm_attention_qualification_and_long_context_fallback(
     k = mx.random.normal((1, 2, length, 256)).astype(mx.bfloat16)
     v = mx.random.normal(k.shape).astype(mx.bfloat16)
     output = small_row_attention(
-        q, k, v, scale=1 / 16, mask="causal" if causal else None, exact=True
+        q, k, v, scale=1 / 16, mask="causal" if causal else None
     )
     expected = mx.concatenate(
         [

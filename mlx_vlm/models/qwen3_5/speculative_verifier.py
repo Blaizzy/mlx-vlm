@@ -634,7 +634,7 @@ class Qwen3_5SpeculativeVerifier(Qwen3_5BatchInvariantForward):
         ):
             return None
         return small_row_attention(
-            queries, keys, values, scale=attention.scale, mask=mask, exact=True
+            queries, keys, values, scale=attention.scale, mask=mask
         )
 
     @staticmethod

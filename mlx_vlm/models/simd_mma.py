@@ -5,12 +5,10 @@ row and a block use the same eight-column tile and reduction order. Its
 arithmetic differs from the default verifier.
 """
 
-from copy import copy
 from functools import lru_cache
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_unflatten
 
 _PREPARE_SOURCE = r"""
 
@@ -200,32 +198,9 @@ def supports_affine_linear(linear):
     )
 
 
-def affine_mmas(linears, x, *, chunked=False):
-    """Return fused projections, or None when the regular path should be used."""
-    if (
-        not 1 <= len(linears) <= 4
-        or x.ndim != 3
-        or x.shape[1] < 1
-        or (x.shape[1] > 8 and not chunked)
-        or x.dtype != mx.bfloat16
-        or x.shape[-1] < 128
-        or not all(
-            supports_affine_linear(linear) and linear.weight.shape[1] * 8 == x.shape[-1]
-            for linear in linears
-        )
-        or any(linear.group_size != linears[0].group_size for linear in linears)
-        or not supports_simd_mma()
-    ):
-        return None
-    if x.shape[1] > 8:
-        chunks = [
-            affine_mmas(linears, x[:, start : start + 8])
-            for start in range(0, x.shape[1], 8)
-        ]
-        return tuple(mx.concatenate(values, axis=1) for values in zip(*chunks))
+def _affine_mmas(linears, x, sizes):
     batch, rows, width = x.shape
     group_size = linears[0].group_size
-    sizes = tuple(linear.weight.shape[0] for linear in linears)
     # Each SIMD group computes a different reduction interval. Keep partial
     # sums in threadgroup memory and write the rounded result only once.
     split = 16 if width > 8192 else 8
@@ -242,7 +217,7 @@ def affine_mmas(linears, x, *, chunked=False):
     inputs = [packed, sums]
     for linear in linears:
         inputs.extend([linear.weight, linear.scales, linear.biases])
-    output = _matrix_kernel(sizes)(
+    return _matrix_kernel(sizes)(
         inputs=inputs,
         template=[
             ("T", x.dtype),
@@ -259,28 +234,6 @@ def affine_mmas(linears, x, *, chunked=False):
         output_shapes=[(batch, rows, sum(sizes))],
         output_dtypes=[x.dtype],
     )[0]
-    cuts, offset = [], 0
-    for size in sizes[:-1]:
-        offset += size
-        cuts.append(offset)
-    outputs = mx.split(output, cuts, axis=-1) if cuts else (output,)
-    return tuple(
-        value + linear["bias"] if "bias" in linear else value
-        for linear, value in zip(linears, outputs)
-    )
-
-
-def affine_mma(linear, x):
-    outputs = affine_mmas((linear,), x)
-    return None if outputs is None else outputs[0]
-
-
-class SIMDQuantizedLinear(nn.QuantizedLinear):
-    """Runtime adapter preserving parameter names and the original fallback."""
-
-    def __call__(self, x):
-        output = affine_mma(self, x)
-        return super().__call__(x) if output is None else output
 
 
 _DENSE_PREPARE_SOURCE = r"""
@@ -392,29 +345,8 @@ def supports_simd_linear(linear):
     return supports_affine_linear(linear) or supports_dense_linear(linear)
 
 
-def dense_mmas(linears, x, *, chunked=False):
-    """BF16 projections with identical arithmetic for serial and block decoding."""
-    if (
-        not 1 <= len(linears) <= 4
-        or x.ndim != 3
-        or x.shape[1] < 1
-        or (x.shape[1] > 8 and not chunked)
-        or x.dtype != mx.bfloat16
-        or not all(
-            supports_dense_linear(linear) and linear.weight.shape[1] == x.shape[-1]
-            for linear in linears
-        )
-        or not supports_simd_mma()
-    ):
-        return None
-    if x.shape[1] > 8:
-        chunks = [
-            dense_mmas(linears, x[:, start : start + 8])
-            for start in range(0, x.shape[1], 8)
-        ]
-        return tuple(mx.concatenate(values, axis=1) for values in zip(*chunks))
+def _dense_mmas(linears, x, sizes):
     batch, rows, width = x.shape
-    sizes = tuple(linear.weight.shape[0] for linear in linears)
     # Partitioning depends on K, never on the number of verification tokens.
     split = 16 if width > 8192 else 8
     while width % (8 * split):
@@ -427,7 +359,7 @@ def dense_mmas(linears, x, *, chunked=False):
         output_shapes=[(batch, width // 8, 32, 2)],
         output_dtypes=[mx.float32],
     )[0]
-    output = _dense_matrix_kernel(sizes)(
+    return _dense_matrix_kernel(sizes)(
         inputs=[packed] + [linear.weight for linear in linears],
         template=[
             ("T", x.dtype),
@@ -442,6 +374,40 @@ def dense_mmas(linears, x, *, chunked=False):
         output_shapes=[(batch, rows, sum(sizes))],
         output_dtypes=[x.dtype],
     )[0]
+
+
+def simd_mmas(linears, x, *, chunked=False):
+    """Dispatch supported affine or dense weights without changing their format."""
+    if (
+        not 1 <= len(linears) <= 4
+        or x.ndim != 3
+        or x.shape[1] < 1
+        or (x.shape[1] > 8 and not chunked)
+        or x.dtype != mx.bfloat16
+    ):
+        return None
+    affine = isinstance(linears[0], nn.QuantizedLinear)
+    supports = supports_affine_linear if affine else supports_dense_linear
+    packing = 8 if affine else 1
+    if (
+        not all(
+            supports(linear) and linear.weight.shape[1] * packing == x.shape[-1]
+            for linear in linears
+        )
+        or affine
+        and any(linear.group_size != linears[0].group_size for linear in linears)
+        or not supports_simd_mma()
+    ):
+        return None
+    if x.shape[1] > 8:
+        chunks = [
+            simd_mmas(linears, x[:, start : start + 8])
+            for start in range(0, x.shape[1], 8)
+        ]
+        return tuple(mx.concatenate(values, axis=1) for values in zip(*chunks))
+    sizes = tuple(linear.weight.shape[0] for linear in linears)
+    project = _affine_mmas if affine else _dense_mmas
+    output = project(linears, x, sizes)
     cuts, offset = [], 0
     for size in sizes[:-1]:
         offset += size
@@ -451,42 +417,3 @@ def dense_mmas(linears, x, *, chunked=False):
         value + linear.bias if "bias" in linear else value
         for linear, value in zip(linears, outputs)
     )
-
-
-def simd_mmas(linears, x, *, chunked=False):
-    """Dispatch supported affine or dense weights without changing their format."""
-    if not linears:
-        return None
-    project = affine_mmas if isinstance(linears[0], nn.QuantizedLinear) else dense_mmas
-    return project(linears, x, chunked=chunked)
-
-
-class SIMDLinear(nn.Linear):
-    """Dense projection adapter preserving the original module's parameters."""
-
-    def __call__(self, x):
-        outputs = dense_mmas((self,), x)
-        return super().__call__(x) if outputs is None else outputs[0]
-
-
-def is_simd_linear(linear):
-    return isinstance(linear, (SIMDLinear, SIMDQuantizedLinear))
-
-
-def enable_simd_linears(model):
-    """Adapt compatible owned projections while preserving shared parameters."""
-    if not supports_simd_mma():
-        return model
-    replacements = []
-    for name, module in model.named_modules():
-        if supports_simd_linear(module) and not is_simd_linear(module):
-            replacement = copy(module)
-            replacement.__class__ = (
-                SIMDQuantizedLinear
-                if isinstance(module, nn.QuantizedLinear)
-                else SIMDLinear
-            )
-            replacements.append((name, replacement))
-    if replacements:
-        model.update_modules(tree_unflatten(replacements))
-    return model
