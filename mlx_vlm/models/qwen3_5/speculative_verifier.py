@@ -560,20 +560,57 @@ class Qwen3_5SpeculativeVerifier(Qwen3_5BatchInvariantForward):
             and supports_simd_mma()
         )
 
+    @staticmethod
+    def _prepare_linear(linear):
+        if not (
+            type(linear) is nn.Linear
+            and "bias" not in linear
+            and linear.weight.dtype == mx.bfloat16
+            and linear.weight.ndim == 2
+            and linear.weight.shape[0] % 16
+            and linear.weight.shape[1] >= 128
+            and linear.weight.shape[1] % 8 == 0
+        ):
+            return linear
+        cached = getattr(linear, "_simd_padded_weight", None)
+        if cached is None or cached[0] is not linear.weight:
+            # No random initialization: preparation must not advance sampling RNG.
+            padded = nn.Linear.__new__(nn.Linear)
+            nn.Module.__init__(padded)
+            padded.weight = mx.pad(
+                linear.weight, [(0, (-linear.weight.shape[0]) % 16), (0, 0)]
+            )
+            # Projection-owned derived weights stay outside checkpoint parameters.
+            cached = (linear.weight, padded)
+            linear._simd_padded_weight = cached
+        return cached[1]
+
+    def _simd_linears(self, linears, x):
+        if x.ndim != 3 or x.dtype != mx.bfloat16 or not supports_simd_mma():
+            return None
+        prepared = tuple(self._prepare_linear(linear) for linear in linears)
+        output = simd_mmas(prepared, x, chunked=True)
+        if output is None:
+            return None
+        return tuple(
+            value if prepared_linear is linear else value[..., : linear.weight.shape[0]]
+            for linear, prepared_linear, value in zip(linears, prepared, output)
+        )
+
     def _linear(self, linear, x):
-        output = simd_mmas((linear,), x, chunked=True)
+        output = self._simd_linears((linear,), x)
         return super()._linear(linear, x) if output is None else output[0]
 
     def _linears(self, linears, x):
-        output = simd_mmas(linears, x, chunked=True)
+        output = self._simd_linears(linears, x)
         return super()._linears(linears, x) if output is None else output
 
     def quantized_linear(self, linear, x):
-        output = simd_mmas((linear,), x, chunked=True)
+        output = self._simd_linears((linear,), x)
         return super().quantized_linear(linear, x) if output is None else output[0]
 
     def quantized_argmax(self, linear, x, token_mask=None):
-        output = simd_mmas((linear,), x, chunked=True)
+        output = self._simd_linears((linear,), x)
         if output is None:
             return super().quantized_argmax(linear, x, token_mask)
         logits = output[0]

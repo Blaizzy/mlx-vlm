@@ -14,13 +14,10 @@ from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
-from adapter import install_padded_head
 from mlx.utils import tree_flatten
 
 from mlx_vlm import stream_generate
-from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
-from mlx_vlm.speculative.drafters.dspark.config import DSparkConfig
-from mlx_vlm.speculative.drafters.dspark.dspark import DSparkDraftModel
+from mlx_vlm.speculative.drafters import load_drafter
 from mlx_vlm.utils import load
 
 CASES = {
@@ -56,44 +53,20 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
     model, processor = load(args.model)
     lm = model.language_model
-    if args.mode == "simd":
-        install_padded_head(lm)
-    else:
-        standard = Qwen3_5BatchInvariantForward()
-        type(lm)._get_speculative_verifier = lambda self: standard
+    lm.use_simd_verifier = args.mode == "simd"
+    if lm.use_simd_verifier and not lm._get_speculative_verifier().uses_simd:
+        raise ValueError("The SIMD verifier requires a supported GPU and model")
 
     before = dict(tree_flatten(lm.parameters()))
-    checkpoint = Path(args.draft)
-    config = json.loads((checkpoint / "config.json").read_text())
-    # Older local DSpark exports used a flat projector field.
-    if "dflash_config" not in config and config.get("projector_type") == "dspark":
-        config["dflash_config"] = {"projector_type": "dspark"}
-    draft = DSparkDraftModel(DSparkConfig.from_dict(config))
-    weights = {}
-    for shard in sorted(checkpoint.glob("*.safetensors")):
-        weights.update(mx.load(str(shard)))
-    draft.load_weights(list(draft.sanitize(weights).items()))
-    del weights
+    draft, draft_kind = load_drafter(args.draft)
     if args.draft_bits:
         # Quantize owned weights before binding shared target modules.
         nn.quantize(draft, group_size=64, bits=args.draft_bits)
     mx.eval(draft.parameters())
-    draft.bind(model)
-    proposal_head = None
     if args.draft_head_bits:
-        proposal_head = nn.QuantizedLinear.from_linear(
-            lm.lm_head, group_size=64, bits=args.draft_head_bits
-        )
-        mx.eval(proposal_head.parameters())
-        original_bind = draft.bind
-
-        def bind_with_proposal_head(target):
-            result = original_bind(target)
-            draft.lm_head = proposal_head
-            return result
-
-        draft.bind = bind_with_proposal_head
-        draft.bind(model)
+        draft.config.proposal_head_bits = args.draft_head_bits
+    draft.bind(model)
+    proposal_head = draft.lm_head if draft.config.proposal_head_bits else None
     after = dict(tree_flatten(lm.parameters()))
     assert before.keys() == after.keys() and all(before[k] is after[k] for k in before)
     metadata = dict(
@@ -165,7 +138,7 @@ def main():
                 options = (
                     {}
                     if policy == "serial"
-                    else dict(draft_model=draft, draft_kind="dflash")
+                    else dict(draft_model=draft, draft_kind=draft_kind)
                 )
                 for output in stream_generate(
                     model,

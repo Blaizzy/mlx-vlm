@@ -1,4 +1,4 @@
-# MiniCPM 1B and 35B-A3B / DSpark SIMD prototype
+# MiniCPM 1B and 35B-A3B / DSpark SIMD verification
 
 This example compares ordinary token-by-token decoding with DSpark using the
 same MiniCPM-V 4.7 target and SIMD arithmetic. It quantizes only the
@@ -10,11 +10,51 @@ and experts, 8-bit routers, and BF16 embeddings and vocabulary head.
 The verifier is opt-in. Ordinary model loading keeps the existing forward path.
 For supported Qwen3.5 dense and MoE language models,
 `language_model.use_simd_verifier = True` selects SIMD verification and singleton
-decoding together. Keep this setting fixed throughout a request. The example additionally installs a
-process-local adapter that pads the 1B model's 248,094-row vocabulary head by
-two rows and removes those rows before sampling. This keeps an extra approximately
-0.51 GB BF16 weight copy outside the checkpoint parameters.
-The 35B-A3B head already has 248,144 aligned rows and reuses its existing weights.
+decoding together. Keep this setting fixed while requests or prompt caches are
+in use. Hardware, dtype and shape checks retain the ordinary fallback.
+
+The verifier prepares unaligned BF16 projections internally. The 1B vocabulary
+head needs two extra rows; its approximately 0.51 GB padded copy is cached on
+that projection, outside checkpoint parameters, and rebuilt when the weight
+array is replaced. Padded logits are removed before sampling. The already
+aligned 35B-A3B head reuses its weights. The shared verifier holds no model
+weights. KV/recurrent rollback continues through the existing cache transaction
+and deferred-replay APIs.
+
+DSpark owns its optional quantized proposal head. Binding and resetting reuse
+that head for unchanged target weights and quantization settings, and rebuild
+it when the target weights or bias change. Rebinding also refreshes shared
+embeddings while preserving embeddings owned by the drafter checkpoint.
+Preparing either derived head leaves the sampling RNG untouched.
+
+## Existing loader, CLI and server paths
+
+Normal loaders can enable SIMD from the target checkpoint's `text_config`:
+
+```json
+{"use_simd_verifier": true}
+```
+
+The DSpark checkpoint can configure its separate proposal head through these
+fields in `dflash_config` (or at the top level):
+
+```json
+{"proposal_head_bits": 4, "proposal_head_group_size": 64}
+```
+
+`proposal_head_bits` defaults to `null`; supported values are 4 and 8. This
+option requires an untied, unquantized `nn.Linear` target head. It creates a
+separate quantized copy without changing the target. Draft backbone/Markov
+weights use the checkpoint's usual quantization configuration.
+
+The existing `--model` / `--draft-model` CLI and server options consume those
+checkpoints through the shared loaders. No head adapter or binding patch is
+needed. Python callers can set `language_model.use_simd_verifier` and
+`draft.config.proposal_head_bits` before starting generation. Legacy MiniCPM
+drafters with a flat `projector_type: "dspark"` now use the same loader path.
+To reproduce fixed widths, set `block_size_policy: "fixed"` and
+`runtime_block_size` in the drafter configuration; width four suits the measured
+prose/image fixtures and six suits code.
 
 ## Reproduce
 
@@ -59,56 +99,57 @@ normal decoding. End-of-request round accounting excludes un-emitted terminal
 EOS and trailing proposals. The `serial` row is the token reference for each
 fixture, and differing outputs fail the run.
 
-## 1B measured results
+## Measured results
 
-M3 Ultra, BF16 target, 4-bit drafter and draft head, median of three runs with
-1,024 output tokens. Both columns use the same SIMD target arithmetic.
+M3 Ultra, MLX/Metal 0.32.3, TF32 off, batch one, greedy, median of three
+runs with 1,024 emitted tokens. Both columns use the same SIMD target
+arithmetic. Drafters and separate proposal heads use affine 4-bit weights,
+group size 64. The target precision is described above.
 
-| Fixture | Without DSpark | With DSpark | With DSpark, decode only |
-|---|---:|---:|---:|
-| Prose | 231.6 tok/s | 280.4 tok/s | 282.4 tok/s |
-| Code | 231.8 tok/s | 399.3 tok/s | 403.0 tok/s |
-| Image-conditioned | 223.9 tok/s | 265.5 tok/s | 277.4 tok/s |
+| Model | Fixture | Without DSpark | With DSpark | With DSpark, decode only |
+|---|---|---:|---:|---:|
+| 1B | Prose | 227.1 tok/s | 276.8 tok/s | 278.8 tok/s |
+| 1B | Code | 227.6 tok/s | 395.7 tok/s | 399.3 tok/s |
+| 1B | Image-conditioned | 219.4 tok/s | 261.0 tok/s | 272.7 tok/s |
+| 35B-A3B | Prose | 79.5 tok/s | 113.8 tok/s | 115.0 tok/s |
+| 35B-A3B | Code | 79.7 tok/s | 156.5 tok/s | 158.4 tok/s |
+| 35B-A3B | Image-conditioned | 78.1 tok/s | 106.1 tok/s | 109.3 tok/s |
 
-The longer code completion emits 1,980 tokens at 402.5 tok/s
-end-to-end (404.6 tok/s decode-only). These are fixture results,
-not a general 400 tok/s guarantee. Prose/image use width four and code uses six.
+Full-request rates include prefill, image processing and host work. Prose/image
+use width four and code uses six. The initial MoE width sweep covered 3/4/6/8;
+these fresh runs cover serial/4/6 for both models. These fixture results do not
+establish a general 400 tok/s guarantee. Throughput remains close to the
+pre-refactor measurements; this change moves ownership into the shared library.
 
-Original 1B qualification (`c53bfece`): 678 verifier/speculative tests passed
-on the qualified GPU. All 33 generation runs (39,528 tokens) match both serial decoding and the prior
-prototype; all nine full-checkpoint logit/hidden/cache checks pass.
-That M5 Max fallback run passed 116 tests and skipped 78 hardware-specific cases.
+The longer code measurements in [results.json](results.json) and
+[moe_results.json](moe_results.json) predate the ownership refactor and have not
+been repeated here. With a 4,096-token budget, the 1B fixture stopped naturally
+at 1,980 tokens and reached 402.5 tok/s end-to-end. The MoE fixture emitted all
+4,096 tokens at 79.2 tok/s without DSpark and 169.1 tok/s with DSpark
+(169.8 tok/s decode-only).
 
-## 35B-A3B measured results
+## Current validation
 
-M3 Ultra, mixed-precision target described above, 4-bit drafter and draft head,
-median of three runs with 1,024 output tokens. Both columns use the same SIMD
-target arithmetic. The initial width sweep covered 3, 4, 6 and 8; fresh runs
-with the final source confirmed width four for prose/image and six for code.
+- M3 Ultra: **887 passed** across the verifier and speculative suites.
+- M5 Max fallback: **784 passed, 103 hardware-specific skips** in the same suites.
+- CLI/server speculative, cancellation and cache tests: **12 passed**.
+- MiniCPM model contract tests: **15 passed**.
+- All **54 benchmark runs / 55,296 emitted tokens** match serial decoding and
+  the pre-refactor implementation exactly. Target parameters remain unchanged.
+- All nine 1B and eleven MoE full-checkpoint checks match singleton logits,
+  hidden states, accepted KV/recurrent prefixes and next logits after rollback,
+  with zero maximum logit error. MoE checks include both sides of the 64K boundary.
+- Actual CLI and server entrypoints load the configured 1B target and DSpark
+  checkpoint through shared loaders. The CLI succeeds, and two consecutive
+  server requests produce identical messages. This smoke test uses a BF16 draft
+  backbone and 4-bit proposal head.
 
-| Fixture | Without DSpark | With DSpark | With DSpark, decode only |
-|---|---:|---:|---:|
-| Prose | 79.4 tok/s | 113.6 tok/s | 114.8 tok/s |
-| Code | 79.6 tok/s | 156.5 tok/s | 158.3 tok/s |
-| Image-conditioned | 78.2 tok/s | 106.2 tok/s | 109.4 tok/s |
-
-The selected policies improve full-request throughput by 1.43x, 1.97x and 1.36x,
-respectively. The MoE checkpoint does not reach the 1B model's 400 tok/s result.
-The result file includes prefill rates, individual repeats, complete-round
-rates and output-token hashes. Exploratory measurements affected by a shared
-GPU pause are excluded from these timing results.
-
-The longer code run emits all 4,096 tokens at
-79.2 tok/s without DSpark and 169.1 tok/s with DSpark
-(169.8 tok/s decode-only), a 2.14x full-request gain.
-All **33 final generation runs / 52,224 tokens** match serial decoding exactly.
-
-Current validation: **863 verifier/speculative tests pass** on M3 Ultra.
-The M5 Max fallback run passes **277 tests with 102 hardware-specific skips**.
-All 11 full-checkpoint MoE cases match singleton logits, hidden states,
-accepted KV/recurrent prefixes and the next logits after rollback, including
-both sides of the 64K boundary. The original 1B checkpoint also passes its nine
-regression cases. Hardware eligibility remains restricted to M3 Ultra.
+The lifecycle tests cover proposal-head reuse across reset, invalidation after
+weight/bias changes and disabling quantization, target rebinding, shared versus owned embeddings,
+and preservation of the sampling RNG. Verifier tests cover projection-owned
+padding, removal of padded vocabulary logits before masked argmax, and fallback.
+The existing cache transaction and deferred-replay tests remain the rollback
+contract; this change adds no second cache mechanism.
 
 ## Correctness and limits
 
@@ -153,12 +194,14 @@ qualification and is excluded.
 The 35B layout groups at most four queries: grouping five changes native
 attention reductions even below the context boundary.
 
-This is a benchmark prototype, not a general CLI/server integration. The head
-adapter is process-local. It is intended for one target model in the benchmark
-process. Fixed widths were selected from measured fixtures, not a universal
-policy. Routed experts keep the existing gather path; the routed MMA prototype
+Verifier preparation and proposal-head ownership are library behavior shared
+by the Python, CLI and server paths. The example only configures those paths
+and instruments benchmark rounds. Fixed widths were selected from measured
+fixtures, not a universal policy. Routed experts keep the existing gather path; the routed MMA prototype
 did not establish an end-to-end gain. Fused Markov, draft-fusion and
 width-controller experiments without an end-to-end gain are also excluded.
 
-See [results.json](results.json) for the original 1B results and
-[moe_results.json](moe_results.json) for the MoE measurements and current validation.
+See [integration_results.json](integration_results.json) for current measurements,
+individual repeats, prefill/decode/round rates, token hashes and validation.
+[results.json](results.json) and [moe_results.json](moe_results.json) preserve the
+earlier 1B and MoE measurements.

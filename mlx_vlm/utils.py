@@ -216,6 +216,8 @@ def get_model_type(config: dict) -> Optional[str]:
     ).endswith("D1Model"):
         # LiquidAI d1 checkpoints are LFM2-VL weights with a decision readout.
         model_type = "d1"
+    elif config.get("projector_type") == "dspark":
+        model_type = "dspark"
     elif dflash_config is not None:
         is_dspark = (
             dflash_config.get("projector_type") == "dspark"

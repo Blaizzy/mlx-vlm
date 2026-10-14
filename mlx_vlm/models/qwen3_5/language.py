@@ -1345,6 +1345,7 @@ class LanguageModel(nn.Module):
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         super().__init__()
         self.args = args
+        self.use_simd_verifier = getattr(args, "use_simd_verifier", False)
         self.config = config
         self.model_type = args.model_type
         self.model = Qwen3_5Model(args)

@@ -1,4 +1,4 @@
-"""Full-checkpoint logit/hidden/cache qualification for the MiniCPM adapter."""
+"""Full-checkpoint logit/hidden/cache qualification for the MiniCPM verifier."""
 
 import argparse
 import json
@@ -6,7 +6,6 @@ from copy import deepcopy
 from pathlib import Path
 
 import mlx.core as mx
-from adapter import install_padded_head
 
 from mlx_vlm.models.cache import ArraysCache
 from mlx_vlm.utils import load
@@ -21,7 +20,9 @@ p.add_argument(
 a = p.parse_args()
 model, _ = load(a.model)
 lm = model.language_model
-install_padded_head(lm)
+lm.use_simd_verifier = True
+if not lm._get_speculative_verifier().uses_simd:
+    raise ValueError("The SIMD verifier requires a supported GPU and model")
 results = []
 cases = [
     (32, 1, 0),

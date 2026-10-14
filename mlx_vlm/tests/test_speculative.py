@@ -72,9 +72,9 @@ def language(family, *, inference=False, **overrides):
     return module(f"models.{name}.language").LanguageModel(config), config
 
 
-def dflash_target(family):
+def dflash_target(family, **overrides):
     if family in ("dflash2", "dspark-qwen"):
-        model, _ = language("qwen")
+        model, _ = language("qwen", **overrides)
         model.set_dtype(mx.bfloat16)
 
         def embeddings(input_ids, pixel_values=None, mask=None, **kwargs):
@@ -114,8 +114,9 @@ def dflash_config(family):
     return config
 
 
-def dflash_drafter(family):
+def dflash_drafter(family, **overrides):
     config = dflash_config(family)
+    config.update(overrides)
     arch, name = get_model_and_args(config)
     expected = (
         "dflash2"
@@ -274,12 +275,28 @@ def generated(target, drafter=None, *, seed=41, temperature=0):
 
 
 @parametrize(
-    "family", ["dflash2", "glimmer", "dspark-lfm2", "dspark-lfm2-moe", "dspark-qwen"]
+    "family,head_bits",
+    [
+        ("dflash2", None),
+        ("glimmer", None),
+        ("dspark-lfm2", None),
+        ("dspark-lfm2-moe", None),
+        ("dspark-qwen", None),
+        ("dspark-qwen", 4),
+        ("dspark-qwen", 8),
+    ],
 )
 @parametrize("temperature,seed", [(0, 41), (0.5, 41), (1.0, 41), (0.7, None)])
-def test_generation_and_request_reset(family, temperature, seed):
+def test_generation_and_request_reset(family, head_bits, temperature, seed):
     mx.random.seed(37)
-    target, drafter = dflash_target(family), dflash_drafter(family)
+    dimensions = {"hidden_size": 32} if head_bits else {}
+    target = dflash_target(
+        family, **(dimensions | {"tie_word_embeddings": False} if head_bits else {})
+    )
+    drafter = dflash_drafter(family, **dimensions)
+    if head_bits:
+        drafter.config.proposal_head_bits = head_bits
+        drafter.config.proposal_head_group_size = 32
     mx.eval(target.language_model.parameters(), drafter.parameters())
     validate_drafter_compatibility(target, drafter, "dflash")
     expected = generated(target, temperature=temperature, seed=seed)
@@ -291,6 +308,66 @@ def test_generation_and_request_reset(family, temperature, seed):
         assert 999 not in drafter.accept_lens + drafter.draft_lens
         drafter.accept_lens.append(999)
         drafter.draft_lens.append(999)
+
+
+@parametrize("bits", [None, 4, 8])
+@parametrize("owned_embeddings", [False, True])
+def test_dspark_proposal_head_binding_lifetime(bits, owned_embeddings):
+    target = dflash_target("dspark-qwen", tie_word_embeddings=False, hidden_size=32)
+    drafter = dflash_drafter("dspark-qwen", hidden_size=32)
+    drafter.config.proposal_head_bits = bits
+    drafter.config.proposal_head_group_size = 32
+    if owned_embeddings:
+        drafter.embed_tokens = nn.Embedding(
+            drafter.config.vocab_size, drafter.config.hidden_size
+        )
+    embeddings = drafter.embed_tokens
+    before = dict(tree_flatten(target.language_model.parameters()))
+    mx.random.seed(71)
+    expected_rng = mx.random.uniform(shape=(4,))
+    mx.random.seed(71)
+    drafter.bind(target)
+    equal(mx.random.uniform(shape=(4,)), expected_rng)
+    head = drafter.lm_head
+    drafter.reset(target)
+    assert drafter.lm_head is head
+    after = dict(tree_flatten(target.language_model.parameters()))
+    assert before.keys() == after.keys()
+    assert all(before[key] is after[key] for key in before)
+    if bits:
+        assert isinstance(head, nn.QuantizedLinear)
+        expected = mx.quantize(
+            target.language_model.lm_head.weight, group_size=32, bits=bits
+        )
+        equal((head.weight, head.scales, head.biases), expected)
+        target.language_model.lm_head.weight = mx.zeros_like(
+            target.language_model.lm_head.weight
+        )
+        drafter.reset(target)
+        assert drafter.lm_head is not head
+        equal(
+            drafter.lm_head(mx.ones((1, 1, drafter.config.hidden_size), mx.bfloat16)),
+            mx.zeros((1, 1, drafter.config.vocab_size)),
+        )
+        previous = drafter.lm_head
+        target.language_model.lm_head.bias = mx.ones(
+            (drafter.config.vocab_size,), mx.bfloat16
+        )
+        drafter.reset(target)
+        assert drafter.lm_head is not previous
+        equal(drafter.lm_head.bias, target.language_model.lm_head.bias)
+    else:
+        assert head is target.language_model.lm_head
+    other = dflash_target("dspark-qwen", tie_word_embeddings=False, hidden_size=32)
+    drafter.reset(other)
+    assert drafter.lm_head is not head
+    assert drafter.embed_tokens is (
+        embeddings if owned_embeddings else other.language_model.model.embed_tokens
+    )
+    drafter.config.proposal_head_bits = None
+    drafter.reset(other)
+    assert drafter.lm_head is other.language_model.lm_head
+    assert drafter._proposal_head_cache is None
 
 
 @parametrize(
@@ -638,12 +715,20 @@ def test_checkpoint_routing_and_validation(tmp_path, family):
         validate_drafter_compatibility(target, drafter, "dflash")
 
 
-@parametrize("family", ["dflash2", "dspark-qwen"])
+@parametrize(
+    "family,legacy", [("dflash2", False), ("dspark-qwen", False), ("dspark-qwen", True)]
+)
 @parametrize("nested", [False, True])
-def test_standalone_drafter_with_mtp_backbone(tmp_path, family, nested):
+def test_standalone_drafter_with_mtp_backbone(tmp_path, family, legacy, nested):
     from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter
 
     config = dflash_config(family)
+    if family == "dspark-qwen":
+        config["dflash_config"]["proposal_head_bits"] = 4
+        config["dflash_config"]["proposal_head_group_size"] = 32
+    if legacy:
+        config.update(config.pop("dflash_config"))
+        config["projector_type"] = "dspark"
     config["model_type"] = "qwen3_5"
     if nested:
         config["text_config"] = tiny_config("qwen").to_dict()
@@ -661,6 +746,9 @@ def test_standalone_drafter_with_mtp_backbone(tmp_path, family, nested):
     assert isinstance(draft, arch.Model)
     assert kind == resolve_drafter_kind(tmp_path) == "dflash"
     assert detect_mtp_splitter(tmp_path) is None
+    if family == "dspark-qwen":
+        assert draft.config.proposal_head_bits == 4
+        assert draft.config.proposal_head_group_size == 32
     equal(dict(tree_flatten(draft.parameters())), expected)
 
 

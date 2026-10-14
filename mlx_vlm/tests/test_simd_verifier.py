@@ -60,6 +60,88 @@ def test_simd_verifier_requires_explicit_opt_in(monkeypatch):
     assert not model._get_speculative_verifier().uses_simd
 
 
+@pytest.mark.parametrize("name", ["minicpmv4_7", "minicpmv4_7_moe"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_minicpm_verifier_selection_from_checkpoint_config(name, enabled, monkeypatch):
+    from mlx_vlm.tests.test_models import DATA, build_config
+
+    config = deepcopy(
+        next(case["config"] for case in DATA["cases"] if case["id"] == name)
+    )
+    config["text_config"]["use_simd_verifier"] = enabled
+    arch, _ = get_model_and_args(config)
+    model = arch.Model(build_config(arch, config)).language_model
+    monkeypatch.setattr(
+        Qwen3_5SpeculativeVerifier, "supports_model", lambda self, model: True
+    )
+    assert model.use_simd_verifier is enabled
+    assert model._get_speculative_verifier().uses_simd is enabled
+
+
+@pytest.mark.parametrize("rows", [17, 32])
+def test_simd_projection_preparation_owns_derived_weights(rows):
+    head = nn.Linear(128, rows, bias=False)
+    head.set_dtype(mx.bfloat16)
+    before = dict(tree_flatten(head.parameters()))
+    prepare = Qwen3_5SpeculativeVerifier._prepare_linear
+    mx.random.seed(97)
+    expected_rng = mx.random.uniform(shape=(4,))
+    mx.random.seed(97)
+    prepared = prepare(head)
+    assert mx.array_equal(mx.random.uniform(shape=(4,)), expected_rng).item()
+    assert prepare(head) is prepared
+    after = dict(tree_flatten(head.parameters()))
+    assert before.keys() == after.keys()
+    assert all(before[key] is after[key] for key in before)
+    if rows % 16 == 0:
+        assert prepared is head
+        return
+    assert prepared.weight.shape == (32, 128)
+    assert mx.array_equal(prepared.weight[:rows], head.weight).item()
+    other = nn.Linear(128, rows, bias=False)
+    other.set_dtype(mx.bfloat16)
+    assert prepare(other) is not prepared
+    head.weight = mx.full(head.weight.shape, 2, mx.bfloat16)
+    refreshed = prepare(head)
+    assert refreshed is not prepared
+    assert mx.array_equal(refreshed.weight[:rows], head.weight).item()
+
+
+def test_simd_unaligned_head_logits_and_masked_argmax():
+    require_matrix()
+    head = nn.Linear(128, 17, bias=False)
+    head.weight = -mx.ones((17, 128), mx.bfloat16)
+    x = mx.ones((1, 5, 128), mx.bfloat16)
+    verifier = Qwen3_5SpeculativeVerifier()
+    block = verifier.quantized_linear(head, x)
+    serial = mx.concatenate(
+        [verifier._linear(head, x[:, i : i + 1]) for i in range(5)], 1
+    )
+    assert block.shape == (1, 5, 17)
+    assert mx.array_equal(block, serial).item()
+    # Zero-filled padding must never become a candidate above negative logits.
+    assert mx.array_equal(
+        verifier.quantized_argmax(head, x), mx.zeros((1, 5), mx.uint32)
+    ).item()
+    mask = mx.full((5, 1), 1 << 16, mx.int32)
+    assert mx.array_equal(
+        verifier.quantized_argmax(head, x, mask), mx.full((1, 5), 16)
+    ).item()
+
+
+def test_simd_padding_is_not_prepared_on_fallback(monkeypatch):
+    from mlx_vlm.models.qwen3_5 import speculative_verifier as verifier
+
+    head = nn.Linear(128, 17, bias=False)
+    head.set_dtype(mx.bfloat16)
+    monkeypatch.setattr(verifier, "supports_simd_mma", lambda: False)
+    x = mx.ones((1, 1, 128), mx.bfloat16)
+    assert mx.array_equal(
+        verifier.Qwen3_5SpeculativeVerifier()._linear(head, x), head(x)
+    ).item()
+    assert not hasattr(head, "_simd_padded_weight")
+
+
 @pytest.mark.parametrize("normalize", [False, True])
 def test_moe_verifier_respects_router_normalization(normalize):
     model, _ = language("qwen_moe", hidden_size=128, intermediate_size=256)
@@ -441,6 +523,7 @@ def test_simd_verification_and_rollback_match_own_serial(
         hidden_size=512,
         intermediate_size=1024,
         num_hidden_layers=4,
+        vocab_size=33,
         num_attention_heads=4,
         num_key_value_heads=2,
         head_dim=64,
