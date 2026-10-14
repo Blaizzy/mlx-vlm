@@ -48,6 +48,10 @@ class Model(nn.Module):
     def get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
         return Mistral3VLM.get_input_embeddings(self, input_ids, pixel_values, **kwargs)
 
+    merge_input_ids_with_image_features = staticmethod(
+        Mistral3VLM.merge_input_ids_with_image_features
+    )
+
     def __call__(
         self,
         input_ids: mx.array,
