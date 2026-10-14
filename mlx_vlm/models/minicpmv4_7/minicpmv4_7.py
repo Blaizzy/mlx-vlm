@@ -100,17 +100,15 @@ class Model(MiniCPMVModel):
             downsample_mode=mode,
             attention_mask=kwargs.get("attention_mask", kwargs.get("mask")),
         )
-        cached = kwargs.get("cached_image_features")
-        if cached is None and pixel_values is not None:
-            cached = self.get_vision_embedding(
-                pixel_values, targets, downsample_mode=mode
-            )
-        if np.any(modalities) and cached is None:
+        if (
+            np.any(modalities)
+            and pixel_values is None
+            and kwargs.get("cached_image_features") is None
+        ):
             raise ValueError("Visual placeholders require image or video features.")
-        kwargs["cached_image_features"] = cached
         kwargs["image_bound"] = bounds
         embeddings = super().get_input_embeddings(
-            input_ids, pixel_values=None, **kwargs
+            input_ids, pixel_values=pixel_values, **kwargs
         )
         # The language cache counts padded tokens, so subtract the padded width.
         deltas = positions.max(axis=(0, 2))[:, None] + 1 - ids.shape[1]
