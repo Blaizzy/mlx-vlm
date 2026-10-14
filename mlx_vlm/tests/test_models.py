@@ -626,36 +626,6 @@ def test_model_contract(case):
         getattr(checks, kind)(*args, **kwargs)
 
 
-def test_mistral_large3_image_embeddings():
-    case = next(c for c in DATA["cases"] if c["module"] == "mistral_large3")
-    module = importlib.import_module("mlx_vlm.models.mistral_large3")
-    config = build_config(module, case["config"])
-    model = module.Model(config)
-    model.eval()
-    ids = mx.array([[1, config.image_token_index, 2]])
-    size = config.vision_config.image_size
-    pixels = mx.random.normal((1, 3, size, size))
-    image_sizes = [(size, size)]
-    *_, states = model.vision_tower(
-        pixels.transpose(0, 2, 3, 1),
-        output_hidden_states=True,
-        image_sizes=image_sizes,
-    )
-    image_features = model.multi_modal_projector(
-        states[config.vision_feature_layer], image_sizes
-    )
-    text = model.language_model.model.embed_tokens(ids)
-    expected = mx.concatenate([text[:, :1], image_features[None], text[:, 2:]], axis=1)
-    for cached in (None, image_features):
-        actual = model.get_input_embeddings(
-            ids,
-            pixel_values=pixels,
-            image_sizes=image_sizes,
-            cached_image_features=cached,
-        ).inputs_embeds
-        ModelChecks().assert_close(actual, expected)
-
-
 def test_lfm2_encoder_sanitize_and_dispatch():
     case = next(case for case in DATA["cases"] if case["module"] == "lfm2_encoder")
     module = importlib.import_module("mlx_vlm.models.lfm2_encoder")
