@@ -1028,24 +1028,7 @@ def quantized_vision_model(name, module, config):
 
 # Molmo, Molmo2 and MolmoPoint store raw embedding arrays and do not implement
 # token-embedding quantization. Jina's case uses its supported standard embedding.
-@pytest.mark.parametrize(
-    "case_name",
-    [
-        (
-            pytest.param(
-                name,
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=AttributeError,
-                    reason="Mistral Large 3 lacks merge_input_ids_with_image_features even without quantization",
-                ),
-            )
-            if name == "mistral_large3"
-            else name
-        )
-        for name in DATA["quantized_vision"]["cases"]
-    ],
-)
+@pytest.mark.parametrize("case_name", DATA["quantized_vision"]["cases"])
 def test_quantized_vision_embeddings(case_name):
     """Packed token weights must not change image integration or its compute dtype."""
     case = DATA["quantized_vision"]["cases"][case_name]
