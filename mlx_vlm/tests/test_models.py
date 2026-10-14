@@ -593,7 +593,7 @@ TINY_MODELS = DATA["shared_configs"]
 def build_config(
     module, values, config_type="ModelConfig", *, defaults=None, overrides=None
 ):
-    """Construct fresh configs, optionally applying shared dimensions and a case profile."""
+    """Construct fresh configs, retaining case values over shared defaults."""
     defaults, overrides = defaults or {}, overrides or {}
     values = values or {}
     fields = copy.deepcopy(values)
@@ -601,6 +601,7 @@ def build_config(
         module.__name__ == "mlx_vlm.models.minicpmv4_7"
         and config_type == "ModelConfig"
         and not defaults
+        and not overrides
     ):
         # Preserve the checkpoint loader's dense/MoE text-config dispatch.
         return module.ModelConfig.from_dict(fields)
@@ -611,13 +612,11 @@ def build_config(
         and overrides.get("model_type", fields.get("model_type")) == "qwen3_5_moe_text"
     ):
         cls = module.config.MoETextConfig
-    fields.update(
-        {
-            k: copy.deepcopy(v)
-            for k, v in defaults.get(config_type, {}).items()
-            if k in inspect.signature(cls).parameters
-        }
-    )
+    fields = {
+        k: copy.deepcopy(v)
+        for k, v in defaults.get(config_type, {}).items()
+        if k in inspect.signature(cls).parameters
+    } | fields
     fields.update(copy.deepcopy(overrides))
     for name, value in fields.items():
         if name in CONFIG_TYPES and isinstance(value, dict):
@@ -809,12 +808,8 @@ def test_model_contract(case, profile, monkeypatch):
     config = build_config(
         module,
         case["config"],
-        defaults=(
-            DATA["image_defaults"]
-            if image is not None and module_name != "deepseek_v4"
-            else None
-        ),
-        overrides=variant.get("config", {}) if profile else case["config"],
+        defaults=DATA["image_defaults"] if "image" in case else None,
+        overrides=variant.get("config", {}),
     )
     # Only these encoders hardcode large constructors. Keep their real layers at small depth.
     if image is not None and case["module"] in (
