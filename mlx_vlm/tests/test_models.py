@@ -668,6 +668,9 @@ def check_arguments(kind, case, model, config):
                 ),
             ),
         )
+        if name == "deepseek_v4":
+            implementation = importlib.import_module(model.__module__)
+            token = config.vocab_size + implementation.IMAGE
         row = (
             image.get("prefix", [1])
             + [token] * image.get("image_tokens", 16)
@@ -806,7 +809,11 @@ def test_model_contract(case, profile, monkeypatch):
     config = build_config(
         module,
         case["config"],
-        defaults=DATA["image_defaults"] if image is not None else None,
+        defaults=(
+            DATA["image_defaults"]
+            if image is not None and module_name != "deepseek_v4"
+            else None
+        ),
         overrides=variant.get("config", {}) if profile else case["config"],
     )
     # Only these encoders hardcode large constructors. Keep their real layers at small depth.
