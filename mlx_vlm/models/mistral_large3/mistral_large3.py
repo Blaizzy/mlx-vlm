@@ -35,18 +35,16 @@ _ATTN_RENAMES = {
 }
 
 
-class Model(nn.Module):
+class Model(Mistral3VLM):
     def __init__(self, config: ModelConfig):
-        super().__init__()
+        # Mistral3VLM's constructor builds a different language model.
+        nn.Module.__init__(self)
         self.config = config
         self.model_type = config.model_type
         self.vision_tower = VisionModel(config.vision_config)
         self.multi_modal_projector = Mistral3MultiModalProjector(config)
         self.language_model = LanguageModel(config.text_config)
         self.vision_feature_layer = config.vision_feature_layer
-
-    def get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
-        return Mistral3VLM.get_input_embeddings(self, input_ids, pixel_values, **kwargs)
 
     def __call__(
         self,
@@ -56,13 +54,7 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ):
-        return Mistral3VLM.__call__(
-            self, input_ids, pixel_values, mask, cache, **kwargs
-        )
-
-    @property
-    def layers(self):
-        return self.language_model.model.layers
+        return super().__call__(input_ids, pixel_values, mask, cache, **kwargs)
 
     @staticmethod
     def _map_language_base(base: str) -> str:
