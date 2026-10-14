@@ -59,7 +59,11 @@ SPECS: Tuple[ParserSpec, ...] = (
     ),
     ParserSpec(
         "qwen3_coder",
-        (("<tool_call>\\n<function=",), ("<tool_call>\n<function=",)),
+        (
+            ("<tool_call>\\n<function=",),
+            ("<tool_call>\n<function=",),
+            ("<tool_call><function=",),
+        ),
     ),
     ParserSpec("kimi_k2", (("<|tool_calls_section_begin|>",),)),
     ParserSpec("mistral", (("[TOOL_CALLS]",),)),

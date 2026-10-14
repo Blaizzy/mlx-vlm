@@ -2300,6 +2300,13 @@ def test_parser_selection(name):
     assert _infer_tool_parser("anything", override=name) == name
 
 
+def test_qwen3_coder_selection_without_newline():
+    # MiMo-V2.6 renders the call with no newline after <tool_call>; the
+    # template also matches the generic JSON markers, which must not win.
+    template = "{{- '<tool_call><function=' ~ tool_call.name ~ '>' -}}"
+    assert _infer_tool_parser(template) == "qwen3_coder"
+
+
 @pytest.mark.parametrize(
     "name,text,error",
     [
