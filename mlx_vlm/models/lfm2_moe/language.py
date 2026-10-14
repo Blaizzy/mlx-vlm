@@ -30,6 +30,15 @@ class LanguageModel(Lfm2LanguageModel):
     def _stack_experts(self, weights):
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{layer_idx}.feed_forward"
+            # Transformers can save either individual experts or packed tensors.
+            gate_up_key = f"{prefix}.experts.gate_up_proj"
+            if gate_up_key in weights:
+                gate, up = mx.split(weights.pop(gate_up_key), 2, axis=-2)
+                weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate
+                weights[f"{prefix}.switch_mlp.up_proj.weight"] = up
+                weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
+                    f"{prefix}.experts.down_proj"
+                )
             for proj in ["gate_proj", "down_proj", "up_proj"]:
                 for suffix in EXPERT_WEIGHT_SUFFIXES:
                     first_key = f"{prefix}.experts.0.{proj}.{suffix}"
