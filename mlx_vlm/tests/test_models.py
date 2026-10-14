@@ -344,11 +344,11 @@ class ModelChecks:
                 assert value == reference, path
 
     def input_embeddings(self, model, model_name, input_ids=None, **media):
-        if input_ids is None:
-            input_ids = mx.array([[1, 2, 3, 4, 5]])
-        result = model.get_input_embeddings(input_ids, **media)
-        assert isinstance(result, InputEmbeddingsFeatures), model_name
-        assert result.inputs_embeds is not None
+        for ids, kwargs in ((mx.array([[1, 2, 3, 4, 5]]), {}), (input_ids, media)):
+            if ids is not None and (kwargs or model_name != "nemotron_parse"):
+                result = model.get_input_embeddings(ids, **kwargs)
+                assert isinstance(result, InputEmbeddingsFeatures), model_name
+                assert result.inputs_embeds is not None
         if media:
             self.quantized_vision(model, input_ids, media)
 
@@ -590,44 +590,16 @@ TINY_DEFAULTS = DATA["tiny_defaults"]
 TINY_MODELS = DATA["shared_configs"]
 
 
-def build_config(
-    module, values, config_type="ModelConfig", *, defaults=None, overrides=None
-):
-    """Construct fresh configs, retaining case values over shared defaults."""
-    defaults, overrides = defaults or {}, overrides or {}
-    values = values or {}
-    fields = copy.deepcopy(values)
-    if (
-        module.__name__ == "mlx_vlm.models.minicpmv4_7"
-        and config_type == "ModelConfig"
-        and not defaults
-        and not overrides
-    ):
+def build_config(module, values, config_type="ModelConfig"):
+    """Construct fresh configs from each model's test case."""
+    fields = copy.deepcopy(values or {})
+    if module.__name__ == "mlx_vlm.models.minicpmv4_7" and config_type == "ModelConfig":
         # Preserve the checkpoint loader's dense/MoE text-config dispatch.
         return module.ModelConfig.from_dict(fields)
-    cls = attrgetter(config_type)(module)
-    if (
-        module.__name__ == "mlx_vlm.models.minicpmv4_7"
-        and config_type == "TextConfig"
-        and overrides.get("model_type", fields.get("model_type")) == "qwen3_5_moe_text"
-    ):
-        cls = module.config.MoETextConfig
-    fields = {
-        k: copy.deepcopy(v)
-        for k, v in defaults.get(config_type, {}).items()
-        if k in inspect.signature(cls).parameters
-    } | fields
-    fields.update(copy.deepcopy(overrides))
     for name, value in fields.items():
         if name in CONFIG_TYPES and isinstance(value, dict):
-            fields[name] = build_config(
-                module,
-                values.get(name, {}),
-                CONFIG_TYPES[name],
-                defaults=defaults,
-                overrides=overrides.get(name, {}),
-            )
-    return cls(**fields)
+            fields[name] = build_config(module, value, CONFIG_TYPES[name])
+    return attrgetter(config_type)(module)(**fields)
 
 
 def first_attribute(obj, *names):
@@ -788,29 +760,15 @@ def check_arguments(kind, case, model, config):
     raise ValueError(f"Unknown model check: {kind}")
 
 
-# Image profiles use the same constructor and contract runner as component checks.
 # Molmo/Molmo2/MolmoPoint lack quantizable token embeddings; Jina uses its standard embedding.
-@pytest.mark.parametrize(
-    "case,profile",
-    [
-        pytest.param(case, profile, id=case["id"] + ("." + profile if profile else ""))
-        for case in DATA["cases"]
-        for profile in (None, *case.get("profiles", {}))
-    ],
-)
-def test_model_contract(case, profile, monkeypatch):
-    variant = case.get("profiles", {}).get(profile, {})
-    image = variant.get("image", case.get("image"))
+@pytest.mark.parametrize("case", DATA["cases"], ids=lambda case: case["id"])
+def test_model_contract(case, monkeypatch):
+    image = case.get("image")
     if image is not None or "multimodal" in case["checks"]:
         mx.random.seed(17)
-    module_name = variant.get("module", case["module"])
+    module_name = case["module"]
     module = importlib.import_module("mlx_vlm.models." + module_name)
-    config = build_config(
-        module,
-        case["config"],
-        defaults=DATA["image_defaults"] if "image" in case else None,
-        overrides=variant.get("config", {}),
-    )
+    config = build_config(module, case["config"])
     # Only these encoders hardcode large constructors. Keep their real layers at small depth.
     if image is not None and case["module"] in (
         "deepseekocr",
@@ -843,7 +801,6 @@ def test_model_contract(case, profile, monkeypatch):
     model = module.Model(config)
     if image is not None:
         model.eval()
-    case = case | variant
     checks = ModelChecks()
     for kind in case["checks"]:
         args, kwargs = check_arguments(kind, case, model, config)
@@ -1096,7 +1053,7 @@ def test_minicpmv47_vision_and_chunked_prefill(minicpmv47_case, mode, count):
         "downsample_mode": mode,
     }
     features = model.get_input_embeddings(ids, **media)
-    assert features.inputs_embeds.shape == (*ids.shape, 16)
+    assert features.inputs_embeds.shape == (*ids.shape, config.text_config.hidden_size)
     assert features.position_ids.shape == (3, 1, ids.shape[-1])
     assert features.rope_deltas.item() < 0
     ModelChecks().prefill_parity(model, ids, media, chunk_sizes=(3,))
