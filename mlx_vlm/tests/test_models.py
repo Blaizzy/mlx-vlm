@@ -181,6 +181,7 @@ class ModelChecks:
         vision, vc = core.vision_tower, config.vision_config
         layers, width = len(vc.deepstack_visual_indexes), vc.out_hidden_size
         assert layers > 0, "The multimodal case must enable DeepStack layers"
+        patch_width = vc.in_channels * vc.temporal_patch_size * vc.patch_size**2
         tokens = {"image": config.image_token_id, "video": config.video_token_id}
         grids = {"image": image_grid, "video": video_grid}
         model.eval()
@@ -188,15 +189,28 @@ class ModelChecks:
             model.update(tree_map(lambda p: p.astype(dtype), model.parameters()))
             for layout in (tuple(layout) for layout in layouts):
                 for batch in batch_sizes:
-                    ids, media = qwen_multimodal_inputs(
-                        config, grids, layout, batch, dtype
-                    )
-                    encoded = {}
+                    rows, media, encoded = [], {}, {}
+                    for row in range(batch):
+                        order = layout if row == 0 else layout[::-1]
+                        ids = [1, 2]
+                        for kind in order:
+                            count = math.prod(grids[kind]) // vc.spatial_merge_size**2
+                            ids += [config.vision_start_token_id] + [
+                                tokens[kind]
+                            ] * count
+                            ids += [config.vision_end_token_id]
+                        rows.append(ids + [3, 4, 5])
+                    ids = mx.array(rows, mx.int32)
                     for kind in layout:
-                        key = (
+                        pixels = mx.random.normal(
+                            (batch * math.prod(grids[kind]), patch_width)
+                        ).astype(dtype)
+                        grid = mx.array([grids[kind]] * batch)
+                        media[
                             "pixel_values" if kind == "image" else "pixel_values_videos"
-                        )
-                        encoded[kind] = vision(media[key], media[kind + "_grid_thw"])
+                        ] = pixels
+                        media[kind + "_grid_thw"] = grid
+                        encoded[kind] = vision(pixels, grid)
                     features = model.get_input_embeddings(ids, **media)
                     assert isinstance(features, InputEmbeddingsFeatures)
                     mask = (ids == tokens["image"]) | (ids == tokens["video"])
@@ -329,10 +343,14 @@ class ModelChecks:
             else:
                 assert value == reference, path
 
-    def input_embeddings(self, model, model_name):
-        result = model.get_input_embeddings(input_ids=mx.array([[1, 2, 3, 4, 5]]))
+    def input_embeddings(self, model, model_name, input_ids=None, **media):
+        if input_ids is None:
+            input_ids = mx.array([[1, 2, 3, 4, 5]])
+        result = model.get_input_embeddings(input_ids, **media)
         assert isinstance(result, InputEmbeddingsFeatures), model_name
         assert result.inputs_embeds is not None
+        if media:
+            self.quantized_vision(model, input_ids, media)
 
     def request_positions(self, model):
         language = model.language_model
@@ -409,18 +427,25 @@ class ModelChecks:
         if model_type == "llama4_vision_model":
             width = kwargs.pop("projector_output_dim", width)
         batch = kwargs.pop("batch_size", 1)
+        flat = (
+            "qwen2_5_vl qwen3_5 qwen3_5_moe qwen4_exp "
+            "glm4v_moe glm4v hunyuan_vl siglip2_vision_model mimovl"
+        ).split()
+        shape = (
+            image_size
+            if len(image_size) > 2 or model_type in flat
+            else (
+                (batch, channels, *image_size)
+                if channel_first
+                else (batch, *image_size, channels)
+            )
+        )
         parameters = inspect.signature(model.__call__).parameters
         for dtype in (mx.float32, mx.float16):
             model.update(tree_map(lambda p: p.astype(dtype), model.parameters()))
             if model_type is not None:
                 assert model.model_type == model_type
-            inputs = vision_inputs(
-                image_size,
-                channels,
-                model_type,
-                channel_first=channel_first,
-                batch=batch,
-            )
+            inputs = mx.random.uniform(shape=shape)
             if "image_masks" in parameters:
                 inputs = inputs.transpose(0, 3, 1, 2)
                 kwargs["image_masks"] = mx.ones((batch, channels, image_size[0]))
@@ -565,16 +590,45 @@ TINY_DEFAULTS = DATA["tiny_defaults"]
 TINY_MODELS = DATA["shared_configs"]
 
 
-def build_config(module, values, config_type="ModelConfig"):
-    """Construct the model family's config classes from ordinary nested data."""
+def build_config(
+    module, values, config_type="ModelConfig", *, defaults=None, overrides=None
+):
+    """Construct fresh configs, optionally applying shared dimensions and a case profile."""
+    defaults, overrides = defaults or {}, overrides or {}
+    values = values or {}
     fields = copy.deepcopy(values)
-    if module.__name__ == "mlx_vlm.models.minicpmv4_7" and config_type == "ModelConfig":
+    if (
+        module.__name__ == "mlx_vlm.models.minicpmv4_7"
+        and config_type == "ModelConfig"
+        and not defaults
+    ):
         # Preserve the checkpoint loader's dense/MoE text-config dispatch.
         return module.ModelConfig.from_dict(fields)
+    cls = attrgetter(config_type)(module)
+    if (
+        module.__name__ == "mlx_vlm.models.minicpmv4_7"
+        and config_type == "TextConfig"
+        and overrides.get("model_type", fields.get("model_type")) == "qwen3_5_moe_text"
+    ):
+        cls = module.config.MoETextConfig
+    fields.update(
+        {
+            k: copy.deepcopy(v)
+            for k, v in defaults.get(config_type, {}).items()
+            if k in inspect.signature(cls).parameters
+        }
+    )
+    fields.update(copy.deepcopy(overrides))
     for name, value in fields.items():
         if name in CONFIG_TYPES and isinstance(value, dict):
-            fields[name] = build_config(module, value, CONFIG_TYPES[name])
-    return attrgetter(config_type)(module)(**fields)
+            fields[name] = build_config(
+                module,
+                values.get(name, {}),
+                CONFIG_TYPES[name],
+                defaults=defaults,
+                overrides=overrides.get(name, {}),
+            )
+    return cls(**fields)
 
 
 def first_attribute(obj, *names):
@@ -599,7 +653,68 @@ def check_arguments(kind, case, model, config):
     if kind == "multimodal":
         return (model, config), case["multimodal"]
     if kind == "input_embeddings":
-        return (model, name), {}
+        if "image" not in case:
+            return (model, name), {}
+        image = case["image"]
+        token = image.get(
+            "image_token",
+            getattr(
+                core_config,
+                "img_id",
+                getattr(
+                    core_config,
+                    "image_token_id",
+                    getattr(core_config, "image_token_index", 128),
+                ),
+            ),
+        )
+        row = (
+            image.get("prefix", [1])
+            + [token] * image.get("image_tokens", 16)
+            + image.get("suffix", [2])
+        )
+        ids = mx.array(image.get("input_ids", [row]))
+        pixels = mx.random.uniform(shape=tuple(image.get("input_shape", (1, 3, 8, 8))))
+        media = {key: mx.array(value) for key, value in image.get("kwargs", {}).items()}
+        if "image_sizes" in media and name != "phi3_v":
+            media["image_sizes"] = image["kwargs"]["image_sizes"]
+        if "pixel_mask_shape" in image:
+            media["pixel_attention_mask"] = mx.ones(image["pixel_mask_shape"], mx.bool_)
+        if name.startswith("minicpm"):
+            pixels = [[pixels]]
+            media.update(
+                tgt_sizes=[np.array([[8, 8]])],
+                downsample_mode="16x",
+                image_bound=[mx.array([[2, ids.shape[-1] - 2]])],
+            )
+        elif name in ("deepseekocr", "deepseekocr_2", "unlimited_ocr"):
+            pixels = [mx.zeros((0, *pixels.shape[1:])), pixels]
+        elif name == "deepseek_v41":
+            implementation = importlib.import_module(
+                "mlx_vlm.models.deepseek_v41.deepseek_v41"
+            )
+            pixels = [
+                [
+                    NS(
+                        start=1,
+                        patches=pixels,
+                        n_vit_h=4,
+                        n_vit_w=4,
+                        types=[implementation.IMAGE] * 4,
+                    )
+                ]
+            ]
+        if name in ("deepseekocr", "deepseekocr_2", "unlimited_ocr", "deepseek_vl_v2"):
+            media["images_seq_mask"] = ids == token
+        if name == "jina_vlm":
+            media["image_masks"] = mx.ones(pixels.shape[:2])
+        if name in ("gemma4", "gemma4_unified"):
+            media["image_position_ids"] = mx.array(
+                [[[h, w] for h in range(4) for w in range(4)]]
+            )
+        if name in ("paligemma", "gemma3"):
+            media["mask"] = mx.ones(ids.shape, mx.int32)
+        return (model, name), dict(input_ids=ids, pixel_values=pixels, **media)
     if kind == "audio":
         return (model, config, name), case.get("audio", {})
     if kind in {"request_positions", "chunked_positions"}:
@@ -671,342 +786,40 @@ def check_arguments(kind, case, model, config):
     raise ValueError(f"Unknown model check: {kind}")
 
 
-@pytest.mark.parametrize("case", DATA["cases"], ids=lambda case: case["id"])
-def test_model_contract(case):
-    if "multimodal" in case["checks"]:
+# Image profiles use the same constructor and contract runner as component checks.
+# Molmo/Molmo2/MolmoPoint lack quantizable token embeddings; Jina uses its standard embedding.
+@pytest.mark.parametrize(
+    "case,profile",
+    [
+        pytest.param(case, profile, id=case["id"] + ("." + profile if profile else ""))
+        for case in DATA["cases"]
+        for profile in (None, *case.get("profiles", {}))
+    ],
+)
+def test_model_contract(case, profile, monkeypatch):
+    variant = case.get("profiles", {}).get(profile, {})
+    image = variant.get("image", case.get("image"))
+    if image is not None or "multimodal" in case["checks"]:
         mx.random.seed(17)
-    module = importlib.import_module("mlx_vlm.models." + case["module"])
-    config = build_config(module, case["config"])
-    model = module.Model(config)
-    checks = ModelChecks()
-    for kind in case["checks"]:
-        args, kwargs = check_arguments(kind, case, model, config)
-        getattr(checks, kind)(*args, **kwargs)
-
-
-def vision_inputs(
-    image_size, channels=3, model_type=None, *, channel_first=False, batch=1
-):
-    """Build synthetic pixels using the vision contract's shape conventions."""
-    flat = (
-        "qwen2_5_vl qwen3_5 qwen3_5_moe qwen4_exp "
-        "glm4v_moe glm4v hunyuan_vl siglip2_vision_model mimovl"
-    ).split()
-    shape = (
-        image_size
-        if len(image_size) > 2 or model_type in flat
-        else (
-            (batch, channels, *image_size)
-            if channel_first
-            else (batch, *image_size, channels)
-        )
+    module_name = variant.get("module", case["module"])
+    module = importlib.import_module("mlx_vlm.models." + module_name)
+    config = build_config(
+        module,
+        case["config"],
+        defaults=DATA["image_defaults"] if image is not None else None,
+        overrides=variant.get("config", {}) if profile else case["config"],
     )
-    return mx.random.uniform(shape=shape)
-
-
-def qwen_multimodal_inputs(config, grids, layout=("image",), batch=1, dtype=mx.float32):
-    """Image/video inputs shared by fusion, prefill and quantized embedding checks."""
-    vc = config.vision_config
-    temporal = getattr(vc, "temporal_patch_size", getattr(vc, "patch_temporal", 1))
-    merge = getattr(vc, "spatial_merge_size", getattr(vc, "merge_size", 2))
-    patch_width = getattr(vc, "in_channels", 3) * temporal * vc.patch_size**2
-    rows, media = [], {}
-    for row in range(batch):
-        ids = [1, 2]
-        for kind in layout if row == 0 else layout[::-1]:
-            token = getattr(
-                config, kind + "_token_id", getattr(config, kind + "_token_index", 128)
-            )
-            count = math.prod(grids[kind]) // merge**2
-            ids += [getattr(config, "vision_start_token_id", 130)] + [token] * count
-            ids += [getattr(config, "vision_end_token_id", 131)]
-        rows.append(ids + [3, 4, 5])
-    for kind in layout:
-        media["pixel_values" if kind == "image" else "pixel_values_videos"] = (
-            mx.random.normal((batch * math.prod(grids[kind]), patch_width)).astype(
-                dtype
-            )
-        )
-        media[kind + "_grid_thw"] = mx.array([grids[kind]] * batch)
-    return mx.array(rows, mx.int32), media
-
-
-def minicpm_inputs(config, mode="16x"):
-    count = 64 // (16 if mode == "16x" else 4)
-    ids = (
-        [1, getattr(config, "image_start_id", 130)]
-        + [getattr(config, "image_token_id", 128)] * count
-        + [getattr(config, "image_end_id", 131), 2]
-    )
-    return mx.array([ids]), {
-        "pixel_values": [[mx.random.normal((3, 2, 128))]],
-        "tgt_sizes": [np.array([[8, 8]])],
-        "downsample_mode": mode,
-    }
-
-
-def multimodal_image_inputs(name, config):
-    """Add each family's placeholder tokens and metadata to synthetic pixels."""
-    core = getattr(config, "thinker_config", config)
-    if name.startswith("minicpm"):
-        ids, media = minicpm_inputs(core)
-        media["image_bound"] = [mx.array([[2, ids.shape[-1] - 2]])]
-        return ids, media
-    token = getattr(
-        core,
-        "img_id",
-        getattr(core, "image_token_id", getattr(core, "image_token_index", 128)),
-    )
-    if name in (
-        "clef",
-        "prism_hadamard_qwen35",
-        "qwen2_vl",
-        "qwen2_5_vl",
-        "qwen3_vl",
-        "qwen3_vl_moe",
-        "qwen3_5",
-        "qwen3_5_moe",
-        "qwen3_omni_moe",
-        "qwen4_exp",
-        "indic_ocr",
-        "glm4v",
-        "glm4v_moe",
-        "mimo_v2",
-        "hunyuan_vl",
-        "dots_ocr",
-        "glm_ocr",
-        "glm5_next",
-        "youtu_vl",
-        "zaya1_vl",
-        "qwen3_vl_embedding",
-        "colqwen2_5",
-        "cohere_compass",
-        "mage_vl",
-        "muse_glimmer",
-        "ernie4_5_moe_vl",
+    # Only these encoders hardcode large constructors. Keep their real layers at small depth.
+    if image is not None and case["module"] in (
+        "deepseekocr",
+        "deepseekocr_2",
+        "unlimited_ocr",
     ):
-        ids, media = qwen_multimodal_inputs(core, {"image": (1, 4, 4)})
-        if name == "hunyuan_vl":
-            ids = mx.array([[1] + [token] * 8 + [2]])
-        if name == "youtu_vl":
-            media["spatial_shapes"] = mx.array([[4, 4]])
-        return ids, media
-    if name in ("deepseek_v4", "deepseek_v41"):
-        implementation = importlib.import_module("mlx_vlm.models." + name + "." + name)
-        pixels = vision_inputs((16, 3, 2, 2))
-        image = implementation.IMAGE
-        if name == "deepseek_v4":
-            media = dict(
-                pixel_values=pixels,
-                image_grid_hw=mx.array([[4, 4]]),
-                image_permutations=mx.arange(4),
-                image_sample_indices=mx.array([0]),
-                image_offsets=mx.array([1]),
-                image_types=mx.array([image] * 4),
-                image_type_offsets=mx.array([0, 4]),
-            )
-            ids = mx.array([[1] + [config.vocab_size + image] * 4 + [2]])
-        else:
-            media = dict(
-                pixel_values=[
-                    [
-                        SimpleNamespace(
-                            start=1,
-                            patches=pixels,
-                            n_vit_h=4,
-                            n_vit_w=4,
-                            types=[image] * 4,
-                        )
-                    ]
-                ]
-            )
-            ids = mx.array([[1, 2, 3, 4, 5, 6]])
-        return ids, media
-    shape, count, media = (8, 8), 16, {}
-    channel_first = True
-    if name in (
-        "llava_bunny",
-        "llava_next",
-        "llava_onevision",
-        "fastvlm",
-        "mistral3",
-        "mistral_large3",
-        "florence2",
-    ):
-        count = 17 if name == "llava_onevision" else 1
-        media["image_sizes"] = [(8, 8)]
-        if name in ("llava_next", "llava_onevision"):
-            shape = (1, 1, 3, 8, 8)
-        elif name == "llava_bunny":
-            shape = (54, 54)
-    elif name in ("deepseekocr", "deepseekocr_2", "unlimited_ocr"):
-        count = 2 if name == "deepseekocr_2" else 3
-        media = {
-            "pixel_values": [
-                mx.zeros((0, 3, 64, 64)),
-                vision_inputs((64, 64), channel_first=True),
-            ],
-            "images_spatial_crop": mx.array([[1, 1]]),
-            "images_seq_mask": mx.array([[False] + [True] * count + [False]]),
-        }
-    elif name == "phi3_v":
-        shape, count, token = (1, 2, 3, 336, 336), 313, -1
-        media["image_sizes"] = mx.array([[336, 336]])
-    elif name == "jina_vlm":
-        shape = (1, 16, 12)
-        media = {
-            "image_input_idx": mx.array([[1, 2, 3, 4]]),
-            "image_masks": mx.ones((1, 16)),
-        }
-    elif name in ("kimi_k25", "kimi_k3", "kimi_vl", "locateanything"):
-        shape, count = (16, 3, 2, 2), 4
-        media["image_grid_hws"] = mx.array([[4, 4]])
-    elif name == "mllama":
-        shape = (1, 1, 1, 3, 8, 8)
-        media = {
-            "aspect_ratio_ids": mx.array([[1]]),
-            "aspect_ratio_mask": mx.ones((1, 1, 1)),
-        }
-    elif name == "deepseek_vl_v2":
-        shape, count = (1, 2, 3, 8, 8), 13
-        media = {
-            "images_spatial_crop": mx.array([[[1, 1]]]),
-            "images_seq_mask": mx.array([[False] + [True] * count + [False]]),
-        }
-    elif name == "inkling":
-        shape, count = (2, 2, 2, 2, 3), 2
-    elif name in ("falcon_ocr", "falcon_perception", "moondream2", "moondream3", "got"):
-        channel_first = False
-        if name == "got":
-            count = 1
-    elif name in ("minimax_m3_vl", "paddleocr_vl"):
-        shape = (1, 16, 12) if name == "minimax_m3_vl" else (1, 16, 3, 2, 2)
-        count = 16 if name == "minimax_m3_vl" else 1
-        media["image_grid_thw"] = mx.array([[1, 4, 4]])
-    elif name in ("lfm2_vl", "phi4_siglip", "phi4mm", "d1"):
-        shape, count = (1, 16, 12), 4
-        media = {
-            "spatial_shapes": mx.array([[4, 4]]),
-            "pixel_attention_mask": mx.ones((1, 16), mx.bool_),
-        }
-        if name in ("phi4_siglip", "phi4mm"):
-            count = 1
-            token = -200 if name == "phi4_siglip" else token
-    elif name in ("aya_vision", "llama4", "nemotron_h_nano_omni", "diffusion_gemma"):
-        count = 4
-    elif name in ("internvl", "internvl_chat", "llmjpvl"):
-        count = int(16 * core.downsample_ratio**2)
-    elif name in ("idefics2", "idefics3", "smolvlm", "colidefics3"):
-        shape = (1, 1, 3, 8, 8)
-        media["pixel_attention_mask"] = mx.ones((1, 1, 8, 8), dtype=mx.bool_)
-        count = (
-            core.perceiver_config.resampler_n_latents
-            if name == "idefics2"
-            else 16 // core.scale_factor**2
-        )
-    elif name in ("step3p7", "multi_modality"):
-        count = 1
-    elif name in ("granite4_vision", "granite_vision"):
-        shape = (1, 1, 3, 8, 8)
-        media["image_sizes"] = [(8, 8)]
-    elif name in ("gemma4", "gemma4_unified"):
-        shape = (1, 16, 12)
-        count = 4 if name == "gemma4" else 16
-        media["image_position_ids"] = mx.array(
-            [[[h, w] for h in range(4) for w in range(4)]]
-        )
-    elif name == "gemma3n":
-        shape, count = (256, 256), 256
-    ids = mx.array([[1] + [token] * count + [2]])
-    if "pixel_values" not in media:
-        media["pixel_values"] = vision_inputs(shape, channel_first=channel_first)
-    if name in ("paligemma", "gemma3"):
-        media["mask"] = mx.ones(ids.shape, mx.int32)
-    return ids, media
-
-
-def quantized_vision_config(name, case):
-    """Reuse model cases, shrinking only dimensions needed for real image inference."""
-    module = importlib.import_module("mlx_vlm.models." + name)
-    defaults = DATA["quantized_vision"]
-    overrides = case.get("config", {})
-
-    def make(cls, values):
-        fields = inspect.signature(cls).parameters
-        if (
-            "model_type" in fields
-            and fields["model_type"].default is inspect.Parameter.empty
-        ):
-            values = {"model_type": name, **values}
-        return cls(**{k: v for k, v in values.items() if k in fields})
-
-    def update(config, values):
-        for key, value in values.items():
-            if not hasattr(config, key) or isinstance(
-                getattr(type(config), key, None), property
-            ):
-                continue
-            current = getattr(config, key)
-            if key == "deepstack_visual_indexes" and not current:
-                continue
-            if isinstance(value, dict) and hasattr(current, "__dataclass_fields__"):
-                update(current, value)
-            elif not (isinstance(current, (list, tuple)) and isinstance(value, int)):
-                setattr(config, key, copy.deepcopy(value))
-
-    if "base" in case:
-        base = next(c for c in DATA["cases"] if c["id"] == case["base"])
-        config = build_config(
-            module,
-            {
-                **base["config"],
-                **{k: v for k, v in overrides.items() if k not in CONFIG_TYPES},
-            },
-        )
-    else:
-        values = {**defaults["model_config"], **overrides}
-        for role in ("text", "vision", "projector", "perceiver"):
-            key = role + "_config"
-            cls = getattr(module, role.title() + "Config", None)
-            if (
-                cls is not None
-                and key in inspect.signature(module.ModelConfig).parameters
-            ):
-                values[key] = make(
-                    cls, {**defaults.get(key, {}), **overrides.get(key, {})}
-                )
-        config = make(module.ModelConfig, values)
-    core = getattr(config, "thinker_config", config)
-    update(getattr(core, "text_config", core), defaults["text_config"])
-    update(core, defaults["model_config"])
-    if hasattr(core, "vision_config"):
-        update(core.vision_config, defaults["vision_config"])
-    if getattr(core, "audio_config", None) is not None:
-        update(core.audio_config, {"text_hidden_size": 32, "output_dim": 32})
-    if getattr(core, "perceiver_config", None) is not None:
-        update(
-            core.perceiver_config,
-            {
-                "resampler_depth": 1,
-                "resampler_head_dim": 8,
-                "resampler_n_heads": 4,
-                "resampler_n_latents": 4,
-                "num_key_value_heads": 2,
-            },
-        )
-    update(core, overrides)
-    return module, config
-
-
-def quantized_vision_model(name, module, config):
-    # These encoders hardcode large constructors; retain real layers at small depth.
-    if name in ("deepseekocr", "deepseekocr_2", "unlimited_ocr"):
-        owner = (
+        implementation = importlib.import_module(
             "mlx_vlm.models.deepseekocr.deepseekocr"
-            if name == "unlimited_ocr"
+            if case["module"] == "unlimited_ocr"
             else module.Model.__module__
         )
-        implementation = importlib.import_module(owner)
         sam = implementation.SAMViTConfig(
             image_size=64,
             width=32,
@@ -1015,30 +828,24 @@ def quantized_vision_model(name, module, config):
             window_size=4,
             global_attn_indexes=[0],
         )
-        with patch.object(implementation, "SAMViTConfig", return_value=sam):
-            return module.Model(config)
-    if name == "phi3_v":
+        monkeypatch.setattr(implementation, "SAMViTConfig", lambda: sam)
+    if image is not None and case["module"] == "phi3_v":
         vision = importlib.import_module("mlx_vlm.models.phi3_v.vision").VisionModel
         clip = copy.copy(vision.CLIP_VIT_LARGE_PATCH14_336_CONFIG)
         clip.num_hidden_layers, clip.intermediate_size = 2, 64
-        with patch.object(vision, "CLIP_VIT_LARGE_PATCH14_336_CONFIG", clip):
-            return module.Model(config)
-    return module.Model(config)
-
-
-# Molmo, Molmo2 and MolmoPoint store raw embedding arrays and do not implement
-# token-embedding quantization. Jina's case uses its supported standard embedding.
-@pytest.mark.parametrize("case_name", DATA["quantized_vision"]["cases"])
-def test_quantized_vision_embeddings(case_name):
-    """Packed token weights must not change image integration or its compute dtype."""
-    case = DATA["quantized_vision"]["cases"][case_name]
-    name = case.get("module", case_name)
-    mx.random.seed(17)
-    module, config = quantized_vision_config(name, case)
-    model = quantized_vision_model(name, module, config)
-    model.eval()
-    ids, media = multimodal_image_inputs(name, config)
-    ModelChecks().quantized_vision(model, ids, media)
+        monkeypatch.setattr(vision, "CLIP_VIT_LARGE_PATCH14_336_CONFIG", clip)
+    if image is not None and module_name == "fastvlm":
+        config.vision_config.layers = [1] * 5
+        config.vision_config.embed_dims = [32] * 5
+        config.vision_config.pos_embs_shapes = [None] * 5
+    model = module.Model(config)
+    if image is not None:
+        model.eval()
+    case = case | variant
+    checks = ModelChecks()
+    for kind in case["checks"]:
+        args, kwargs = check_arguments(kind, case, model, config)
+        getattr(checks, kind)(*args, **kwargs)
 
 
 def test_lfm2_encoder_sanitize_and_dispatch():
@@ -1280,8 +1087,12 @@ def test_minicpmv47_vision_and_chunked_prefill(minicpmv47_case, mode, count):
     module, config = minicpmv47_case
 
     model = module.Model(config)
-    ids, media = minicpm_inputs(config, mode)
-    assert ids.shape[-1] == count + 4
+    ids = mx.array([[1, 50] + [48] * count + [51, 2]])
+    media = {
+        "pixel_values": [[mx.random.normal((3, 2, 128))]],
+        "tgt_sizes": [np.array([[8, 8]])],
+        "downsample_mode": mode,
+    }
     features = model.get_input_embeddings(ids, **media)
     assert features.inputs_embeds.shape == (*ids.shape, 16)
     assert features.position_ids.shape == (3, 1, ids.shape[-1])
