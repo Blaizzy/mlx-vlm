@@ -262,6 +262,29 @@ class ModelChecks:
                             mx.zeros_like(features.inputs_embeds), mask, value
                         )
                         self.assert_close(injected, expected[:, :, layer])
+                    with patch.object(
+                        model.language_model.model,
+                        "embed_tokens",
+                        nn.QuantizedEmbedding.from_embedding(
+                            model.language_model.model.embed_tokens,
+                            group_size=32,
+                            bits=4,
+                        ),
+                    ):
+                        quantized = model.get_input_embeddings(ids, **media)
+                    assert quantized.inputs_embeds.dtype == features.inputs_embeds.dtype
+                    assert mx.array_equal(quantized.visual_pos_masks, mask).item()
+                    self.assert_close(
+                        mx.where(mask[..., None], quantized.inputs_embeds, 0),
+                        mx.where(mask[..., None], features.inputs_embeds, 0),
+                    )
+                    for actual, reference in zip(
+                        quantized.deepstack_visual_embeds,
+                        features.deepstack_visual_embeds,
+                        strict=True,
+                    ):
+                        assert actual.dtype == reference.dtype
+                        self.assert_close(actual, reference)
                     self.prefill_parity(model, ids, media, chunk_sizes)
 
     def input_embeddings(self, model, model_name):

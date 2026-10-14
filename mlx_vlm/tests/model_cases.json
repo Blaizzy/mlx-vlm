@@ -1510,7 +1510,7 @@
       "config": {
         "text_config": {
           "model_type": "qwen3_vl_text",
-          "hidden_size": 16,
+          "hidden_size": 32,
           "num_hidden_layers": 2,
           "intermediate_size": 32,
           "num_attention_heads": 2,
@@ -1529,7 +1529,7 @@
           "depth": 2,
           "hidden_size": 16,
           "num_heads": 2,
-          "out_hidden_size": 16,
+          "out_hidden_size": 32,
           "num_position_embeddings": 16,
           "deepstack_visual_indexes": [0, 1],
           "intermediate_size": 32,
@@ -1843,7 +1843,7 @@
         "text_config": {
           "model_type": "qwen3_vl_moe",
           "num_hidden_layers": 1,
-          "hidden_size": 16,
+          "hidden_size": 32,
           "intermediate_size": 32,
           "num_attention_heads": 2,
           "num_experts": 2,
@@ -1863,7 +1863,7 @@
           "depth": 1,
           "hidden_size": 16,
           "intermediate_size": 32,
-          "out_hidden_size": 16,
+          "out_hidden_size": 32,
           "num_heads": 2,
           "num_position_embeddings": 16,
           "deepstack_visual_indexes": [0],
@@ -1943,7 +1943,7 @@
         "thinker_config": {
           "text_config": {
             "num_hidden_layers": 2,
-            "hidden_size": 16,
+            "hidden_size": 32,
             "intermediate_size": 32,
             "num_attention_heads": 2,
             "num_experts": 2,
@@ -1962,7 +1962,7 @@
             "depth": 2,
             "hidden_size": 16,
             "intermediate_size": 32,
-            "out_hidden_size": 16,
+            "out_hidden_size": 32,
             "num_heads": 2,
             "image_size": 8,
             "patch_size": 2,
@@ -1977,7 +1977,7 @@
             "encoder_attention_heads": 2,
             "encoder_ffn_dim": 32,
             "num_hidden_layers": 1,
-            "output_dim": 16
+            "output_dim": 32
           },
           "image_token_id": 31,
           "video_token_id": 30,
@@ -2011,7 +2011,7 @@
             "num_key_value_heads": 2,
             "head_dim": 8
           },
-          "thinker_hidden_size": 16
+          "thinker_hidden_size": 32
         },
         "code2wav_config": {},
         "enable_audio_output": false
