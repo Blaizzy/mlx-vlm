@@ -488,3 +488,74 @@ def test_diffusion_gemma_layer_applies_router_weights():
     # Doubling the router weights must change the layer's output; if the
     # combine were dropped, the expert branch would ignore them entirely.
     assert float(mx.abs(once - twice).max()) > 1e-4
+
+
+def test_expert_store_reuses_lazy_handles_and_drops_evicted_handles(tmp_path):
+    _, offload = _build_and_repack(tmp_path)
+    store = ExpertStore(str(offload), expert_cache_bytes=1)
+    store.get(1, 0)
+    store.get(1, 1)
+    store.get(1, 2)
+    with patch.object(mx, "load", wraps=mx.load) as load:
+        first = store.get(1, 0)
+        mx.eval(first)
+        store.get(1, 1)
+        assert load.call_count == 1
+        assert store.stats()["reloads"] == 1
+        assert "e0.gate_proj.weight" not in store._maps[1]
+        assert "e0.gate_proj.weight" not in store._fresh[1]
+        again = store.get(1, 0)
+        mx.eval(again)
+        assert load.call_count == 2
+        for got, want in zip(again, first):
+            for g, w in zip(got, want):
+                if g is not None:
+                    assert mx.array_equal(g, w)
+
+
+def _expert_bytes(store, layer_id, j):
+    return sum(
+        a.nbytes for proj in store.get(layer_id, j) for a in proj if a is not None
+    )
+
+
+@pytest.mark.parametrize("fraction, expected", [("0", 65), ("1", 21)])
+def test_expert_store_clears_allocator_by_evicted_bytes(
+    tmp_path, monkeypatch, fraction, expected
+):
+    _, offload = _build_and_repack(tmp_path)
+    expert = _expert_bytes(ExpertStore(str(offload), expert_cache_bytes=1), 1, 0)
+    # The budget holds three experts, so fraction 1 clears after every third
+    # eviction and fraction 0 clears on every evicting miss.
+    monkeypatch.setenv("MLX_VLM_OFFLOAD_CLEAR_CACHE_FRACTION", fraction)
+    store = ExpertStore(str(offload), expert_cache_bytes=3 * expert)
+    with patch.object(mx, "clear_cache") as clear:
+        for i in range(68):
+            store.get(1, i % 4)
+        assert store.stats()["evictions"] == 65
+        assert clear.call_count == expected
+
+
+def test_expert_store_counts_every_expert_evicted_by_one_miss(tmp_path, monkeypatch):
+    _, offload = _build_and_repack(tmp_path)
+    expert = _expert_bytes(ExpertStore(str(offload), expert_cache_bytes=1), 1, 0)
+    monkeypatch.setenv("MLX_VLM_OFFLOAD_CLEAR_CACHE_FRACTION", "0.5")
+    store = ExpertStore(str(offload), expert_cache_bytes=4 * expert)
+    for j in range(3):
+        store.get(1, j)
+    with patch.object(mx, "clear_cache") as clear:
+        # One incoming block needing the whole budget evicts all three
+        # residents in a single call: 3 experts >= 2 experts' worth, so clear.
+        store._evict_until_fits(4 * expert)
+        assert store.stats()["evictions"] == 3
+        assert clear.call_count == 1
+        assert store._evicted_since_clear == 0
+
+
+def test_expert_store_default_clear_threshold_is_a_budget_fraction(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("MLX_VLM_OFFLOAD_CLEAR_CACHE_FRACTION", raising=False)
+    _, offload = _build_and_repack(tmp_path)
+    store = ExpertStore(str(offload), expert_cache_bytes=64_000)
+    assert store._clear_after_bytes == 1_000

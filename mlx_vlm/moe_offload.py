@@ -592,6 +592,20 @@ class ExpertStore:
         self._hits = 0
         self._misses = 0
         self._evictions = 0
+        self._fresh: dict = {}  # {layer_id: lazy handle dict from the last mx.load}
+        self._reloads = 0
+        # Evicted experts' buffers sit in MLX's allocator cache until
+        # mx.clear_cache(). Clearing on every evicting miss is a per-miss
+        # cost, so clear once the bytes evicted since the last clear reach a
+        # fraction of the budget (default 1/64). Counting bytes rather than
+        # evictions keeps that bound the same for large experts and for
+        # misses that evict several experts at once. 0 clears on every
+        # evicting miss.
+        fraction = float(
+            os.environ.get("MLX_VLM_OFFLOAD_CLEAR_CACHE_FRACTION", "0.015625")
+        )
+        self._clear_after_bytes = max(0, int(self._budget * fraction))
+        self._evicted_since_clear = 0
 
     def experts_present(self, layer_id: int) -> bool:
         return layer_id in self._maps
@@ -601,7 +615,17 @@ class ExpertStore:
 
         if f"e{j}.gate_proj.weight" in m:
             return
-        fresh = mx.load(self._paths[layer_id])
+        # ``mx.load`` is lazy but re-parses the whole layer header (thousands
+        # of tensors) every call: ~1.65 ms on an M6 for a 256-expert layer,
+        # which was the dominant per-miss cost (not the SSD read). Keep the
+        # lazy handle dict around and reload only when a needed handle has
+        # been dropped by eviction (handles are removed from this cache too,
+        # so an evicted expert's buffer really is freed).
+        fresh = self._fresh.get(layer_id)
+        if fresh is None or f"e{j}.gate_proj.weight" not in fresh:
+            fresh = mx.load(self._paths[layer_id])
+            self._fresh[layer_id] = fresh
+            self._reloads += 1
         for k in _PROJ_KEYS:
             name = f"e{j}.{k}"
             if name in fresh:
@@ -616,12 +640,17 @@ class ExpertStore:
         while self._lru and self._resident_bytes + incoming_bytes > self._budget:
             (lid, j), nbytes = self._lru.popitem(last=False)
             m = self._maps[lid]
+            fresh = self._fresh.get(lid)
             for k in _PROJ_KEYS:
                 m.pop(f"e{j}.{k}", None)
+                if fresh is not None:
+                    fresh.pop(f"e{j}.{k}", None)
             self._resident_bytes -= nbytes
+            self._evicted_since_clear += nbytes
             self._evictions += 1
             evicted = True
-        if evicted:
+        if evicted and self._evicted_since_clear >= self._clear_after_bytes:
+            self._evicted_since_clear = 0
             try:
                 mx.clear_cache()
             except Exception:
@@ -697,6 +726,7 @@ class ExpertStore:
             "misses": self._misses,
             "evictions": self._evictions,
             "hit_rate": (self._hits / total) if total else None,
+            "reloads": self._reloads,
         }
 
 
