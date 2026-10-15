@@ -587,7 +587,10 @@ class MessageFormatter:
         """Format with numbered image/audio tokens.
 
         Order follows Phi-4 convention: <|image_N|> before <|audio_N|>.
+        ``image_offset`` is the number of images in earlier messages, so the
+        numbering runs across the whole conversation.
         """
+        offset = kwargs.get("image_offset", 0)
         explicit_images = _content_media_count(
             prompt, ("image", "image_url", "input_image")
         )
@@ -595,7 +598,7 @@ class MessageFormatter:
         parts, explicit_images = self._content_parts(
             prompt,
             str,
-            lambda i: f"<|image_{missing+i+1}|>",
+            lambda i: f"<|image_{offset+missing+i+1}|>",
             role == "user" and not skip_image_token,
         )
         content = "".join(parts)
@@ -607,7 +610,7 @@ class MessageFormatter:
                 prefix_parts.append(
                     "".join(
                         [
-                            f"<|image_{i+1}|>"
+                            f"<|image_{offset+i+1}|>"
                             for i in range(num_images - explicit_images)
                         ]
                     )
@@ -1084,6 +1087,7 @@ def apply_chat_template(
                         skip_audio_token=audio_counts[i] == 0,
                         num_images=image_counts[i],
                         num_audios=audio_counts[i],
+                        image_offset=sum(image_counts[:i]),
                         **kwargs,
                     )
                 )
@@ -1108,6 +1112,7 @@ def apply_chat_template(
                             or role in ["system", "assistant"],
                             num_images=image_counts[i],
                             num_audios=audio_counts[i],
+                            image_offset=sum(image_counts[:i]),
                             **kwargs,
                         )
                     )

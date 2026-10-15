@@ -1925,6 +1925,32 @@ class TestApplyChatTemplateIntegration:
         ]
         assert parts[2]["text"] == "before" and parts[4]["text"] == "after"
 
+    @pytest.mark.parametrize("family", ["phi3_v", "phi4mm"])
+    @pytest.mark.parametrize("explicit_last", [True, False])
+    def test_numbered_images_continue_across_turns(self, family, explicit_last):
+        last = (
+            [dict(type="image"), dict(type="text", text="And this one?")]
+            if explicit_last
+            else "And this one?"
+        )
+        messages = [
+            dict(
+                role="user", content=[dict(type="image"), dict(type="text", text="A?")]
+            ),
+            dict(role="assistant", content="A cat."),
+            dict(role="user", content=last),
+        ]
+        rendered = apply_chat_template(
+            None, dict(model_type=family), messages, num_images=2
+        )
+        assert rendered.count("<|image_1|>") == 1
+        assert rendered.count("<|image_2|>") == 1
+        assert (
+            rendered.index("<|image_1|>")
+            < rendered.index("A cat.")
+            < rendered.index("<|image_2|>")
+        )
+
     def test_explicit_images_do_not_bypass_single_image_limit(self):
         message = dict(role="user", content=[dict(type="image"), dict(type="image")])
         with pytest.raises(ValueError, match="multi-image"):
