@@ -675,13 +675,20 @@ def test_model_contract(case):
         getattr(checks, kind)(*args, **kwargs)
 
 
-def test_nemotron_puzzle_layer_configs():
-    config = model_case("nemotron_bolt")["config"]
+@pytest.fixture
+def nemotron_case(request):
+    case = model_case(getattr(request, "param", "nemotron_super_vl"))
+    module = importlib.import_module("mlx_vlm.models." + case["module"])
+    return module, case["config"]
+
+
+@pytest.mark.parametrize("nemotron_case", ["nemotron_bolt"], indirect=True)
+def test_nemotron_puzzle_layer_configs(nemotron_case):
+    arch, config = nemotron_case
     # The block list takes precedence, as in NVIDIA's Puzzle config.
     config["llm_config"]["layers_block_type"] = ["attention"]
     _, family = get_model_and_args({"model_type": "nemotron_h_puzzle"})
     assert family == "nemotron_h"
-    arch = importlib.import_module("mlx_vlm.models.nemotron_h_nano_omni")
     model = arch.Model(build_config(arch, config))
     assert [layer.block_type for layer in model.language_model.layers] == [
         "M",
@@ -699,25 +706,27 @@ def test_nemotron_puzzle_layer_configs():
 
 
 @pytest.mark.parametrize("vision_norm,mtp_depth", [(True, 0), (False, 1), (None, 1)])
-def test_nemotron_explicit_vision_norm_overrides_mtp(vision_norm, mtp_depth):
-    nemotron_config = model_case("nemotron_super_vl")["config"]
-    arch = importlib.import_module("mlx_vlm.models.nemotron_h_nano_omni")
-    nemotron_config["vision_final_layernorm"] = vision_norm
-    nemotron_config["llm_config"]["num_nextn_predict_layers"] = mtp_depth
-    model = arch.Model(arch.ModelConfig.from_dict(nemotron_config))
+def test_nemotron_explicit_vision_norm_overrides_mtp(
+    nemotron_case, vision_norm, mtp_depth
+):
+    arch, config = nemotron_case
+    config["vision_final_layernorm"] = vision_norm
+    config["llm_config"]["num_nextn_predict_layers"] = mtp_depth
+    model = arch.Model(build_config(arch, config))
     expected = vision_norm if vision_norm is not None else mtp_depth > 0
     assert isinstance(model.vision_final_layernorm, nn.LayerNorm) == expected
     assert model.config.to_dict().get("vision_final_layernorm") == vision_norm
 
 
-@pytest.mark.parametrize("case_name", ["nemotron_super_vl", "nemotron_bolt"])
+@pytest.mark.parametrize(
+    "nemotron_case", ["nemotron_super_vl", "nemotron_bolt"], indirect=True
+)
 @pytest.mark.parametrize("text_key", ["llm_config", "text_config"])
-def test_nemotron_checkpoint_loading(tmp_path, case_name, text_key):
-    case = model_case(case_name)
-    config = case["config"]
+def test_nemotron_checkpoint_loading(tmp_path, nemotron_case, text_key):
+    arch, config = nemotron_case
     config[text_key] = config.pop("llm_config")
-    arch, family = get_model_and_args(config)
-    assert family == case["module"]
+    _, family = get_model_and_args(config)
+    assert family == arch.__name__.rsplit(".", 1)[-1]
     model = arch.Model(build_config(arch, config))
     expected = dict(tree_flatten(model.parameters()))
     weights = {}
@@ -756,10 +765,11 @@ def test_nemotron_checkpoint_loading(tmp_path, case_name, text_key):
         (1.0, [True, True, False, False, False, False]),
     ],
 )
-def test_nemotron_video_retention_order_and_first_tubelet(rate, expected):
-    vision = importlib.import_module(
-        "mlx_vlm.models.nemotron_h_nano_omni.nemotron_h_nano_omni"
-    )
+def test_nemotron_video_retention_order_and_first_tubelet(
+    nemotron_case, rate, expected
+):
+    arch, _ = nemotron_case
+    vision = inspect.getmodule(arch.Model)
     # The second token changes most in frame 2; equal scores preserve order.
     features = mx.array(
         [[[1.0, 0.0], [1.0, 0.0]], [[1.0, 0.0], [-1.0, 0.0]], [[1.0, 0.0], [-1.0, 0.0]]]
@@ -771,28 +781,22 @@ def test_nemotron_video_retention_order_and_first_tubelet(rate, expected):
     ]
 
 
-def test_nemotron_vision_normalization_and_video_pruning():
-    nemotron_config = model_case("nemotron_super_vl")["config"]
-    vision = importlib.import_module(
-        "mlx_vlm.models.nemotron_h_nano_omni.nemotron_h_nano_omni"
-    )
-    arch = importlib.import_module("mlx_vlm.models.nemotron_h_nano_omni")
-    model = arch.Model(arch.ModelConfig.from_dict(nemotron_config))
+def test_nemotron_vision_normalization_and_video_pruning(nemotron_case):
+    arch, config = nemotron_case
+    vision = inspect.getmodule(arch.Model)
+    model = arch.Model(build_config(arch, config))
     features = mx.random.normal((1, 4, 16))
     # The projector must normalize BEFORE spatially merging the four patches.
     expected = model.mlp1(model.vision_final_layernorm(features).reshape(1, 1, 64))
     np.testing.assert_allclose(
-        np.array(model._project_vision_features(features, 2, 2)),
-        np.array(expected),
-        rtol=1e-5,
-        atol=1e-5,
+        model._project_vision_features(features, 2, 2), expected, rtol=1e-5, atol=1e-5
     )
     # Five rectangular frames pad to three tubelets, two tokens per tubelet.
     pixels = mx.random.normal((5, 3, 32, 64))
     ids = mx.array([[1, 18, 18, 2, 18, 18, 3, 18, 18, 4]])
     full = model.extract_video_feature(pixels)
     assert full.shape == (3, 2, 32)
-    keep = np.flatnonzero(np.array(vision.compute_retention_mask(full, 0.7)))
+    keep = np.flatnonzero(vision.compute_retention_mask(full, 0.7))
     actual = model.get_input_embeddings(ids, pixel_values_videos=pixels).inputs_embeds
     assert actual.shape == (1, 6, 32)
     unpruned = model.get_input_embeddings(
@@ -804,13 +808,9 @@ def test_nemotron_vision_normalization_and_video_pruning():
         model.get_input_embeddings(
             ids, pixel_values_videos=pixels, video_pruning_rate=-1
         )
-    np.testing.assert_allclose(
-        np.array(actual[0, 1:3]), np.array(full.reshape(-1, 32)[mx.array(keep)])
-    )
+    np.testing.assert_allclose(actual[0, 1:3], full.reshape(-1, 32)[mx.array(keep)])
     expected_text = model.language_model.get_input_embeddings(mx.array([[1, 2, 3, 4]]))
-    np.testing.assert_allclose(
-        np.array(actual[:, [0, 3, 4, 5]]), np.array(expected_text)
-    )
+    np.testing.assert_allclose(actual[:, [0, 3, 4, 5]], expected_text)
     images = [mx.zeros((3, 32, 32)), mx.zeros((3, 32, 64))]
     assert model.get_input_embeddings(
         mx.array([[1, 18, 18, 18, 2]]), images
