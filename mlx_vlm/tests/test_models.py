@@ -678,7 +678,10 @@ def check_arguments(kind, case, model, config):
                     )
                 ]
             ]
-        if name in ("deepseekocr", "deepseekocr_2", "unlimited_ocr", "deepseek_vl_v2"):
+        if (
+            "images_seq_mask"
+            in inspect.signature(model.get_input_embeddings).parameters
+        ):
             media["images_seq_mask"] = ids == token
         if name == "jina_vlm":
             media["image_masks"] = mx.ones(pixels.shape[:2])
