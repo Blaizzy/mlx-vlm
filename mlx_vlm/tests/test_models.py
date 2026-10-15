@@ -296,10 +296,6 @@ class ModelChecks:
             quantized.weight, quantized.scales, quantized.biases, group_size=32, bits=4
         )
         core = getattr(model, "thinker", model)
-        if type(model).__module__.split(".")[-2] == "diffusion_gemma":
-            core = model.model.encoder
-        if type(model).__module__.split(".")[-2] in ("falcon_ocr", "falcon_perception"):
-            core = model.language_model.model
         vision = first_attribute(
             core,
             "vision_tower",
@@ -309,6 +305,8 @@ class ModelChecks:
             "vision_backbone",
             "visual",
             "img_projector",
+            "model.encoder.vision_tower",
+            "language_model.model.img_projector",
         )
         vision = getattr(vision, "embeddings", vision)
         # Delegate to the real encoder and ensure both runs actually process pixels.
@@ -603,8 +601,10 @@ def build_config(module, values, config_type="ModelConfig"):
 
 def first_attribute(obj, *names):
     for name in names:
-        if hasattr(obj, name):
-            return getattr(obj, name)
+        try:
+            return attrgetter(name)(obj)
+        except AttributeError:
+            continue
     raise AttributeError(f"{type(obj).__name__} has none of {names}")
 
 
