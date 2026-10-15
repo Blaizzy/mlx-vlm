@@ -490,6 +490,7 @@ CONFIG_TYPES = {
     "projector_config": "ProjectorConfig",
     "perceiver_config": "PerceiverConfig",
     "audio_config": "AudioConfig",
+    "omni_config": "OmniConfig",
     "thinker_config": "ThinkerConfig",
     "talker_config": "TalkerConfig",
     "code_predictor_config": "CodePredictorConfig",

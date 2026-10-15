@@ -1378,6 +1378,55 @@ def test_prepare_inputs_preserves_audio_for_capable_processors(
         np.testing.assert_array_equal(audios[1], np.zeros(16))
 
 
+def test_prepare_inputs_uses_processor_audio_loader(monkeypatch):
+    from mlx_vlm import utils
+
+    loaded = []
+
+    def processor_loader(path, sr=16000):
+        loaded.append((path, sr))
+        return np.full(16, 3.0)
+
+    processor = SimpleNamespace(load_audio=processor_loader)
+    process = Mock(return_value={"input_ids": mx.array([[1]])})
+    monkeypatch.setattr(
+        utils, "load_audio", Mock(side_effect=AssertionError("generic loader used"))
+    )
+    monkeypatch.setattr(utils, "process_inputs_with_fallback", process)
+    utils.prepare_inputs(processor, prompts="prompt", audio=["voice.wav"])
+    assert loaded == [("voice.wav", 16000)]
+    np.testing.assert_array_equal(
+        process.call_args.kwargs["audio"][0], np.full(16, 3.0)
+    )
+
+
+def test_prepare_inputs_passes_video_paths_to_decoding_processors(monkeypatch):
+    from mlx_vlm import utils
+
+    process = Mock(return_value={"input_ids": mx.array([[1]])})
+    load_video = Mock(side_effect=AssertionError("utils must not decode the file"))
+    monkeypatch.setattr(utils, "load_video", load_video)
+    monkeypatch.setattr(utils, "process_inputs_with_fallback", process)
+    processor = SimpleNamespace(decodes_video_files=True)
+    utils.prepare_inputs(processor, prompts="prompt", videos=["clip.mp4"])
+    assert process.call_args.kwargs["videos"] == ["clip.mp4"]
+
+    # processors without the flag keep the existing behaviour: frames are decoded here
+    frames = np.zeros((2, 8, 8, 3), np.uint8)
+    metadata = SimpleNamespace(
+        sampled_fps=1.0,
+        frames_indices=[0, 1],
+        total_num_frames=2,
+        fps=1.0,
+        duration=2.0,
+    )
+    load_video = Mock(return_value=(frames, metadata))
+    monkeypatch.setattr(utils, "load_video", load_video)
+    utils.prepare_inputs(SimpleNamespace(), prompts="prompt", videos=["clip.mp4"])
+    load_video.assert_called_once()
+    assert process.call_args.kwargs["videos"][0] is frames
+
+
 @pytest.mark.parametrize("tokens", [[], [7], [7, 8], [7, 2], [2]])
 def test_final_token_ids_preserve_eos_without_duplicate_flush(monkeypatch, tokens):
     model, processor = MockModel(), MockProcessor()

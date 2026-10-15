@@ -304,7 +304,15 @@ def convert(
     target = model
 
     if isinstance(quant_predicate, str):
-        quant_predicate = mixed_quant_predicate_builder(quant_predicate, target)
+        mixed_predicate = mixed_quant_predicate_builder(quant_predicate, target)
+
+        def quant_predicate(path, module):
+            # the model's own exclusions (e.g. youtu_vita omni encoder) also apply to mixed recipes
+            if model_quant_predicate is not None and not model_quant_predicate(
+                path, module
+            ):
+                return False
+            return mixed_predicate(path, module)
 
     quant_predicate = quant_predicate or base_quant_predicate
 
