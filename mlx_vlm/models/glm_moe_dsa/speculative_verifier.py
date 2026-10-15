@@ -9,10 +9,11 @@ from ..exact_speculative_verify import (
     exact_speculative_verify_dense_available,
     exact_speculative_verify_weight,
 )
+from ..qmv_compat import QMV_SUM_DEFINE
 
 
 def _quantized_head_header(bits: int, group_size: int) -> str:
-    return r"""
+    return QMV_SUM_DEFINE + r"""
     using namespace metal;
 
     constant constexpr int BITS = __BITS__;
@@ -32,7 +33,8 @@ def _quantized_head_header(bits: int, group_size: int) -> str:
       float sum = 0.0f;
       if (BITS == 4) {
         for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
-          sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+          sum += MLX_VLM_QMV_SUM(x[i]) + MLX_VLM_QMV_SUM(x[i + 1]) +
+              MLX_VLM_QMV_SUM(x[i + 2]) + MLX_VLM_QMV_SUM(x[i + 3]);
           x_thread[i] = x[i];
           x_thread[i + 1] = x[i + 1];
           x_thread[i + 2] = x[i + 2];
@@ -40,8 +42,10 @@ def _quantized_head_header(bits: int, group_size: int) -> str:
         }
       } else if (BITS == 5) {
         for (int i = 0; i < VALUES_PER_THREAD; i += 8) {
-          sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
-              x[i + 6] + x[i + 7];
+          sum += MLX_VLM_QMV_SUM(x[i]) + MLX_VLM_QMV_SUM(x[i + 1]) +
+              MLX_VLM_QMV_SUM(x[i + 2]) + MLX_VLM_QMV_SUM(x[i + 3]) +
+              MLX_VLM_QMV_SUM(x[i + 4]) + MLX_VLM_QMV_SUM(x[i + 5]) +
+              MLX_VLM_QMV_SUM(x[i + 6]) + MLX_VLM_QMV_SUM(x[i + 7]);
           x_thread[i] = x[i];
           x_thread[i + 1] = x[i + 1] / 32.0f;
           x_thread[i + 2] = x[i + 2] / 4.0f;

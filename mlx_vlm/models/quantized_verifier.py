@@ -6,6 +6,7 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from .qmv_compat import QMV_SUM_DEFINE
 from .switch_layers import QuantizedSwitchLinear
 
 AFFINE_BITS = frozenset((2, 3, 4, 5, 6, 8))
@@ -15,7 +16,7 @@ FIXED_FORMATS = {
     "nvfp4": (4, 16),
 }
 
-_QUANTIZED_MOE_HC_HEADER = r"""
+_QUANTIZED_MOE_HC_HEADER = QMV_SUM_DEFINE + r"""
 #include <metal_simdgroup>
 #include <metal_simdgroup_matrix>
 #include <metal_stdlib>
@@ -42,8 +43,10 @@ inline float load_quantized_vector(
   float sum = 0.0f;
   if constexpr (BITS == 3 || BITS == 5) {
     for (int i = 0; i < VALUES_PER_THREAD; i += 8) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
-          x[i + 6] + x[i + 7];
+      sum += MLX_VLM_QMV_SUM(x[i]) + MLX_VLM_QMV_SUM(x[i + 1]) +
+          MLX_VLM_QMV_SUM(x[i + 2]) + MLX_VLM_QMV_SUM(x[i + 3]) +
+          MLX_VLM_QMV_SUM(x[i + 4]) + MLX_VLM_QMV_SUM(x[i + 5]) +
+          MLX_VLM_QMV_SUM(x[i + 6]) + MLX_VLM_QMV_SUM(x[i + 7]);
     }
   } else if constexpr (BITS == 8) {
     for (int i = 0; i < VALUES_PER_THREAD; ++i) {
@@ -51,7 +54,8 @@ inline float load_quantized_vector(
     }
   } else {
     for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+      sum += MLX_VLM_QMV_SUM(x[i]) + MLX_VLM_QMV_SUM(x[i + 1]) +
+          MLX_VLM_QMV_SUM(x[i + 2]) + MLX_VLM_QMV_SUM(x[i + 3]);
     }
   }
   for (int i = 0; i < VALUES_PER_THREAD; ++i) {
@@ -760,7 +764,7 @@ def _stable_nvfp4_argmax(
 def _target_verify_qlinear_header(
     bits: int, group_size: int, results_per_simdgroup: int = 4
 ) -> str:
-    return (
+    return QMV_SUM_DEFINE + (
         r"""
     using namespace metal;
 
@@ -782,7 +786,8 @@ def _target_verify_qlinear_header(
       float sum = 0.0f;
       if (BITS == 4) {
         for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
-          sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+          sum += MLX_VLM_QMV_SUM(x[i]) + MLX_VLM_QMV_SUM(x[i + 1]) +
+              MLX_VLM_QMV_SUM(x[i + 2]) + MLX_VLM_QMV_SUM(x[i + 3]);
           x_thread[i] = x[i];
           x_thread[i + 1] = x[i + 1];
           x_thread[i + 2] = x[i + 2];
@@ -790,8 +795,10 @@ def _target_verify_qlinear_header(
         }
       } else if (BITS == 5) {
         for (int i = 0; i < VALUES_PER_THREAD; i += 8) {
-          sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
-              x[i + 6] + x[i + 7];
+          sum += MLX_VLM_QMV_SUM(x[i]) + MLX_VLM_QMV_SUM(x[i + 1]) +
+              MLX_VLM_QMV_SUM(x[i + 2]) + MLX_VLM_QMV_SUM(x[i + 3]) +
+              MLX_VLM_QMV_SUM(x[i + 4]) + MLX_VLM_QMV_SUM(x[i + 5]) +
+              MLX_VLM_QMV_SUM(x[i + 6]) + MLX_VLM_QMV_SUM(x[i + 7]);
           x_thread[i] = x[i];
           x_thread[i + 1] = x[i + 1] / 32.0f;
           x_thread[i + 2] = x[i + 2] / 4.0f;

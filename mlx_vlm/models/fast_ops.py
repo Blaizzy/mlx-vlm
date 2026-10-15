@@ -5,7 +5,9 @@ from typing import Optional
 
 import mlx.core as mx
 
-_COMMON_HEADER = r"""
+from .qmv_compat import QMV_SUM_DEFINE
+
+_COMMON_HEADER = QMV_SUM_DEFINE + r"""
 #include <metal_simdgroup>
 #include <metal_simdgroup_matrix>
 #include <metal_stdlib>
@@ -415,8 +417,10 @@ inline float load_affine5_vector_exact(
     thread float* x_thread) {
   float sum = 0.0f;
   for (int i = 0; i < VALUES_PER_THREAD; i += 8) {
-    sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
-        x[i + 6] + x[i + 7];
+    sum += MLX_VLM_QMV_SUM(x[i]) + MLX_VLM_QMV_SUM(x[i + 1]) +
+        MLX_VLM_QMV_SUM(x[i + 2]) + MLX_VLM_QMV_SUM(x[i + 3]) +
+        MLX_VLM_QMV_SUM(x[i + 4]) + MLX_VLM_QMV_SUM(x[i + 5]) +
+        MLX_VLM_QMV_SUM(x[i + 6]) + MLX_VLM_QMV_SUM(x[i + 7]);
     x_thread[i] = x[i];
     x_thread[i + 1] = x[i + 1] / 32.0f;
     x_thread[i + 2] = x[i + 2] / 4.0f;
@@ -477,7 +481,8 @@ inline float load_affine4_vector_exact(
     thread float* x_thread) {
   float sum = 0.0f;
   for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
-    sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+    sum += MLX_VLM_QMV_SUM(x[i]) + MLX_VLM_QMV_SUM(x[i + 1]) +
+        MLX_VLM_QMV_SUM(x[i + 2]) + MLX_VLM_QMV_SUM(x[i + 3]);
     x_thread[i] = x[i];
     x_thread[i + 1] = x[i + 1] / 16.0f;
     x_thread[i + 2] = x[i + 2] / 256.0f;
