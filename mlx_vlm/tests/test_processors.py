@@ -1673,7 +1673,7 @@ def test_checkpoint_loading(tmp_path, name):
         ) == [3]
 
 
-def test_nemotron_processor_image_video_and_metadata(tmp_path):
+def test_nemotron_processor_modalities_and_metadata(tmp_path):
     metadata = deepcopy(DATA["checkpoints"]["nemotron"])
     config = metadata["config"]
     config["model_type"] = "nemotron_h_omni"
@@ -1731,6 +1731,14 @@ def test_nemotron_processor_image_video_and_metadata(tmp_path):
     assert processor.image_processor._is_video_mode is False
     with pytest.raises(ValueError, match="one video"):
         prepare_inputs(processor, prompts="<video><video>", videos=[frames, frames])
+
+    waveform = np.linspace(-1, 1, 1600, dtype=np.float32)
+    keyword = processor(text="<so_embedding>", audio=waveform)
+    positional = processor(None, "<so_embedding>", None, waveform)
+    for inputs in (keyword, positional):
+        assert len(inputs["sound_clips"]) == 1
+        np.testing.assert_array_equal(inputs["sound_clips"][0], waveform)
+    np.testing.assert_array_equal(positional["input_ids"], keyword["input_ids"])
 
 
 # Prompt construction

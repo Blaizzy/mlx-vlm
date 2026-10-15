@@ -196,8 +196,8 @@ class NemotronHNanoOmniProcessor(ProcessorMixin):
             ]
         ] = None,
         videos=None,
-        video_metadata=None,
         audio: Optional[AudioInput] = None,
+        video_metadata=None,
         **kwargs,
     ) -> BatchFeature:
         if text is None and images is None and videos is None and audio is None:
