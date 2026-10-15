@@ -275,6 +275,39 @@ class ResponseVideoParam(TypedDict, total=False):
 
 ResizeShapeInput: TypeAlias = Union[Tuple[int], Tuple[int, int]]
 
+
+class ImageProcessingRequest(FlexibleBaseModel):
+    min_pixels: Optional[int] = Field(
+        None,
+        gt=0,
+        description="Minimum image pixel area for supported processors. Overrides the server default.",
+    )
+    max_pixels: Optional[int] = Field(
+        None,
+        gt=0,
+        description="Maximum image pixel area for supported processors. Overrides the server default.",
+    )
+    resize_shape: Optional[ResizeShapeInput] = Field(
+        None,
+        description="Resize images before processing. Provide one integer for square or two dimensions.",
+    )
+
+    @field_validator("resize_shape", mode="before")
+    @classmethod
+    def normalize_resize_shape_field(cls, value):
+        return normalize_resize_shape(value)
+
+    @model_validator(mode="after")
+    def validate_pixel_limits(self):
+        if (
+            self.min_pixels is not None
+            and self.max_pixels is not None
+            and self.min_pixels > self.max_pixels
+        ):
+            raise ValueError("min_pixels must not exceed max_pixels")
+        return self
+
+
 ResponseInputContentParam: TypeAlias = Union[
     ResponseInputTextParam,
     ResponseInputImageParam,
@@ -341,7 +374,7 @@ class CompactionControl(BaseModel):
     compact_threshold: int = Field(..., gt=0)
 
 
-class OpenAIRequest(FlexibleBaseModel):
+class OpenAIRequest(ImageProcessingRequest):
     """
     OpenAI-compatible request structure.
     Using this structure : https://github.com/openai/openai-python/blob/main/src/openai/resources/responses/responses.py
@@ -701,7 +734,7 @@ StreamEvent = Union[
 # Models for /chat/completion endpoint
 
 
-class VLMRequest(FlexibleBaseModel):
+class VLMRequest(ImageProcessingRequest):
     model: str = Field(
         ...,
         description="The path to the local model directory or Hugging Face repo.",
@@ -828,18 +861,9 @@ class VLMRequest(FlexibleBaseModel):
             "the TOP_LOGPROBS_K env var; values above the cap are clamped."
         ),
     )
-    resize_shape: Optional[ResizeShapeInput] = Field(
-        None,
-        description="Resize shape for the image. Provide one integer for square or two for (height, width).",
-    )
     response_format: Optional[Any] = Field(
         None, description="OpenAI-compatible response_format for structured outputs."
     )
-
-    @field_validator("resize_shape", mode="before")
-    @classmethod
-    def normalize_resize_shape_field(cls, value):
-        return normalize_resize_shape(value)
 
 
 class GenerationRequest(VLMRequest):
@@ -956,7 +980,7 @@ class AnthropicMessageParam(FlexibleBaseModel):
     content: Union[str, List[Any]]
 
 
-class AnthropicRequest(FlexibleBaseModel):
+class AnthropicRequest(ImageProcessingRequest):
     model: str = Field(..., description="The model to use for generation.")
     messages: List[AnthropicMessageParam]
     max_tokens: int = Field(

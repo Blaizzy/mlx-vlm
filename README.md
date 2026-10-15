@@ -624,9 +624,50 @@ mlx_vlm.server --model-dir /Volumes/Models --model-dir ~/my-custom-model
 - `--kv-group-size`: Group size for uniform KV cache quantization (default: `64`)
 - `--max-kv-size`: Maximum KV cache size in tokens
 - `--vision-cache-size`: Max number of cached vision features (default: `20`)
+- `--min-pixels` / `--max-pixels`: Default minimum/maximum input image pixel area for processors that support these options (also `MLX_VLM_MIN_PIXELS` / `MLX_VLM_MAX_PIXELS`). Unset values use the model's preprocessing defaults.
 - `--log-progress-interval`: Decoded tokens between progress log messages; `0` disables periodic decode progress (default: `10`)
 - `--api-key`: Bearer token required for inference, model discovery, and management endpoints
 - `--log-level`: Logging level — `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (default: `INFO`)
+
+For higher-resolution image input, including OCR with Bonsai 2, set pixel-area
+defaults at startup:
+
+```sh
+mlx_vlm.server --model prism-ml/Ternary-Bonsai-2-2B-mlx-2bit \
+  --min-pixels 1048576 --max-pixels 4194304
+```
+
+Chat Completions, Responses, and Messages requests can override these defaults
+with top-level `min_pixels` and `max_pixels` fields (use `extra_body` with an
+OpenAI client). For example, `"min_pixels": 1048576` requests at least 1024 × 1024
+pixels of area, preserving aspect ratio and rounding to the processor's patch
+size. On Bonsai 2 this corresponds to approximately 1024 image tokens. Higher
+resolution uses more context, memory, and processing time. Both limits must be
+positive and the effective minimum must not exceed the maximum. Omitted or null
+request values inherit the server defaults.
+
+Change these defaults on a running server without restarting or reloading the
+model:
+
+```sh
+curl -X PATCH http://localhost:8080/v1/settings \
+  -H 'Content-Type: application/json' \
+  -d '{"min_pixels": 1048576, "max_pixels": 4194304}'
+```
+
+Use `GET /v1/settings` to inspect the current values. New requests inherit the
+updated limits; requests already queued for generation keep their resolved
+options, and per-request overrides still take precedence. The pair is updated
+atomically; invalid limits appear in `rejected` and leave both limits unchanged.
+Set either setting to `null` to use that limit from the model's preprocessing
+configuration. Updates last until the server restarts; the
+`{"op": "replace", "values": {}}` form resets **all** runtime settings to their
+startup defaults, including CLI pixel limits. Include
+`Authorization: Bearer <key>` when the server has an API key configured.
+
+The existing `resize_shape` request field also applies before image processing
+in the batching server. Processor pixel limits still apply afterward. Token
+counting and streaming context checks use the same options as generation.
 
 At `INFO`, the server logs request start/completion, chunked-prefill progress,
 time to first token, periodic decode throughput, and the final token counts. Set

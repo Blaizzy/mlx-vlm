@@ -24,6 +24,7 @@ from ..utils import (
     prepare_inputs,
     should_add_special_tokens,
 )
+from ..vision_cache import processed_image_key
 from .audio import generate_audio
 from .common import (
     DEFAULT_DIFFUSION_MAX_DENOISING_STEPS,
@@ -875,18 +876,19 @@ def stream_generate(
 
     # Vision feature caching: reuse cached image features across turns
     if vision_cache is not None and image is not None and pixel_values is not None:
-        cached = vision_cache.get(image)
+        image_key = processed_image_key(pixel_values, kwargs.get("image_grid_thw"))
+        cached = vision_cache.get(image_key)
         if cached is not None:
             kwargs["cached_image_features"] = cached
         elif hasattr(model, "encode_images"):
             features = model.encode_images(pixel_values, **kwargs)
             mx.eval(*features)
-            vision_cache.put(image, features)
+            vision_cache.put(image_key, features)
             kwargs["cached_image_features"] = features
         elif hasattr(model, "encode_image"):
             features = model.encode_image(pixel_values)
             mx.eval(features)
-            vision_cache.put(image, features)
+            vision_cache.put(image_key, features)
             kwargs["cached_image_features"] = features
 
     # Prompt cache reuse: skip common prefix from previous turn

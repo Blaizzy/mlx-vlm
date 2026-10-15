@@ -81,7 +81,7 @@ from mlx_vlm.turboquant import (
     _TurboQuantProdCodec,
     resolve_kv_bits,
 )
-from mlx_vlm.vision_cache import VisionFeatureCache
+from mlx_vlm.vision_cache import VisionFeatureCache, processed_image_key
 
 # Cache lifecycle
 
@@ -964,6 +964,21 @@ def test_prepare_left_padding_on_empty_only():
 
 
 class TestVisionFeatureCache:
+    def test_processed_key_preserves_patch_geometry(self):
+        pixels = mx.zeros((16, 3))
+        square = processed_image_key(pixels, mx.array([[1, 4, 4]]))
+        wide = processed_image_key(pixels, mx.array([[1, 2, 8]]))
+        assert square != wide
+        assert square == processed_image_key(mx.zeros((16, 3)), mx.array([[1, 4, 4]]))
+
+    def test_processed_key_handles_ragged_image_batches(self):
+        images = [mx.zeros((4, 3)), mx.ones((16, 3))]
+        key = processed_image_key(images)
+        assert key == processed_image_key([mx.zeros((4, 3)), mx.ones((16, 3))])
+        assert key != processed_image_key(list(reversed(images)))
+        assert key != processed_image_key([mx.ones((4, 3)), images[1]])
+        assert key != processed_image_key([images[0], mx.ones((32, 3))])
+
     def test_lru_eviction(self):
         cache = VisionFeatureCache(max_size=2)
         cache.put("a.jpg", mx.ones((1, 10, 64)))

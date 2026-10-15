@@ -533,7 +533,11 @@ async def compact_response_context(
     async def count_prompt(prompt, images):
         if runtime.response_generator is not None:
             raw = await asyncio.to_thread(
-                runtime.response_generator._cpu_preprocess, prompt, images or None, None
+                runtime.response_generator._cpu_preprocess,
+                prompt,
+                images or None,
+                None,
+                **args.preprocessing_kwargs(),
             )
         else:
             raw = await asyncio.to_thread(
@@ -542,6 +546,7 @@ async def compact_response_context(
                 images=images or None,
                 prompts=prompt,
                 image_token_index=getattr(config, "image_token_index", None),
+                **args.preprocessing_kwargs(),
             )
         return _count_prompt_tokens(raw)
 

@@ -11,7 +11,23 @@ from typing import Any, Optional, Sequence, Union
 
 import mlx.core as mx
 
+from .apc import hash_image_payload
+
 VisionFeatures = Union[mx.array, Sequence[mx.array]]
+
+
+def processed_image_key(pixel_values, image_grid_thw=None) -> str:
+    """Separate features of the same source processed at different resolutions."""
+
+    def pixel_key(value):
+        # Some processors return differently sized tensors for each image.
+        if isinstance(value, (list, tuple)):
+            return "[" + ",".join(pixel_key(item) for item in value) + "]"
+        return str(hash_image_payload(pixel_values=value))
+
+    pixels = pixel_key(pixel_values)
+    grid = hash_image_payload(pixel_values=image_grid_thw)
+    return f"processed:{pixels}:{grid}"
 
 
 class VisionFeatureCache:

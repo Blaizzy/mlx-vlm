@@ -1767,6 +1767,13 @@ def process_inputs(
         if param in kwargs.keys():
             args[param] = kwargs.get(param, None)
 
+    # Qwen-style processors route image sizing through **kwargs. Forward only
+    # these preprocessing options, not arbitrary decoder/sampler arguments.
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        for key in ("min_pixels", "max_pixels", "resized_height", "resized_width"):
+            if kwargs.get(key) is not None:
+                args[key] = kwargs[key]
+
     # Add audio if provided and supported
     if audio is not None and len(audio) > 0:
         if "audio" in parameters:

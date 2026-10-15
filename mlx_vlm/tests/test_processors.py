@@ -2683,6 +2683,37 @@ def test_prepare_inputs_preserves_mlx_attention_mask_for_thread_handoff():
     assert consumed == [[[1, 1]]]
 
 
+@pytest.mark.parametrize("name", ["qwen3_vl", "qwen2_5_vl"])
+def test_prepare_inputs_image_limits_are_per_request(name):
+    processor = _make_processor(name)
+    processor.image_processor = m.qwen3.Qwen3VLImageProcessor(
+        min_pixels=1024, max_pixels=1048576, patch_size=16, merge_size=2
+    )
+    processor.tokenizer.special_tokens = {processor.image_token: 100}
+    for options, expected_tokens in [
+        ({}, 4),
+        (dict(min_pixels=16384), 16),
+        (dict(max_pixels=1024), 1),
+        ({}, 4),
+    ]:
+        inputs = prepare_inputs(
+            processor,
+            prompts=processor.image_token,
+            images=[Image.new("RGB", (64, 64))],
+            temperature=0.7,
+            max_tokens=8,
+            **options,
+        )
+        assert inputs["input_ids"].shape[-1] == expected_tokens
+        assert int(inputs["image_grid_thw"][0].prod()) // 4 == expected_tokens
+        assert not (
+            {"min_pixels", "max_pixels", "temperature", "max_tokens"}
+            & processor.tokenizer.last_kwargs.keys()
+        )
+    assert processor.image_processor.min_pixels == 1024
+    assert processor.image_processor.max_pixels == 1048576
+
+
 def _make_test_image_bytes():
     """Create a small valid PNG in memory."""
     from PIL import Image as PILImage
