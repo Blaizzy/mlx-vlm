@@ -37,9 +37,10 @@ class TextConfig(BaseModelConfig):
     attention_bias: bool = False
     scoring_func: str = "softmax"
     attn_type: str = "DeepseekV2Attention"
+    use_mla: Optional[bool] = None
 
     def __post_init__(self):
-        if self.qk_nope_head_dim == 0:
+        if not (self.use_mla if self.use_mla is not None else self.qk_nope_head_dim):
             self.attn_type = "LlamaAttention"
 
         if self.num_key_value_heads is None:
