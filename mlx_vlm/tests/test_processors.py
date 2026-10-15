@@ -1674,11 +1674,9 @@ def test_checkpoint_loading(tmp_path, name):
 
 
 def test_nemotron_processor_image_video_and_metadata(tmp_path):
-    from mlx_vlm.tests.test_models import model_case
-
-    config = model_case("nemotron_super_vl")["config"]
     metadata = deepcopy(DATA["checkpoints"]["nemotron"])
-    metadata["config"] = config
+    config = metadata["config"]
+    config["model_type"] = "nemotron_h_omni"
     metadata["processor_config"][
         "processor_class"
     ] = "NemotronH_Omni_Reasoning_V3Processor"
