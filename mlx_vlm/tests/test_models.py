@@ -507,11 +507,20 @@ TINY_DEFAULTS = DATA["tiny_defaults"]
 TINY_MODELS = DATA["shared_configs"]
 
 
+def model_case(name):
+    """Return fresh case data for shared model and checkpoint tests."""
+    return copy.deepcopy(next(case for case in DATA["cases"] if case["id"] == name))
+
+
 def build_config(module, values, config_type="ModelConfig"):
     """Construct the model family's config classes from ordinary nested data."""
     fields = copy.deepcopy(values)
-    if module.__name__ == "mlx_vlm.models.minicpmv4_7" and config_type == "ModelConfig":
-        # Preserve the checkpoint loader's dense/MoE text-config dispatch.
+    if (
+        module.__name__
+        in ("mlx_vlm.models.minicpmv4_7", "mlx_vlm.models.nemotron_h_nano_omni")
+        and config_type == "ModelConfig"
+    ):
+        # Preserve checkpoint aliases and per-layer text-config dispatch.
         return module.ModelConfig.from_dict(fields)
     for name, value in fields.items():
         if name in CONFIG_TYPES and isinstance(value, dict):
@@ -624,6 +633,264 @@ def test_model_contract(case):
     for kind in case["checks"]:
         args, kwargs = check_arguments(kind, case, model, config)
         getattr(checks, kind)(*args, **kwargs)
+
+
+@pytest.fixture
+def nemotron_config():
+    return model_case("nemotron_super_vl")["config"]
+
+
+@pytest.fixture
+def nemotron_bolt_config():
+    return model_case("nemotron_bolt")["config"]
+
+
+def test_nemotron_puzzle_layer_configs(nemotron_bolt_config):
+    text_module = importlib.import_module("mlx_vlm.models.nemotron_h.config")
+
+    raw = nemotron_bolt_config["llm_config"]
+    original = json.dumps(raw)
+    # The block list takes precedence, as in NVIDIA's Puzzle config.
+    parsed = text_module.ModelConfig.from_dict(
+        {**raw, "layers_block_type": ["attention"]}
+    )
+    assert parsed.hybrid_override_pattern == ["M", "E", "*", "E"]
+    assert parsed.num_hidden_layers == 4
+    assert parsed.n_routed_experts is None
+    assert parsed.for_layer(1).n_routed_experts == 2
+    assert parsed.for_layer(3).n_routed_experts == 3
+    assert parsed.for_layer(1).moe_intermediate_size == 32
+    assert parsed.for_layer(3).moe_intermediate_size == 64
+    assert parsed.for_layer(3).num_experts_per_tok == 2
+    assert json.dumps(raw) == original
+    _, family = get_model_and_args({"model_type": "nemotron_h_puzzle"})
+    assert family == "nemotron_h"
+
+
+@pytest.mark.parametrize("vision_norm,mtp_depth", [(True, 0), (False, 1)])
+def test_nemotron_explicit_vision_norm_overrides_mtp(
+    nemotron_config, vision_norm, mtp_depth
+):
+    arch = importlib.import_module("mlx_vlm.models.nemotron_h_nano_omni")
+    nemotron_config["vision_final_layernorm"] = vision_norm
+    nemotron_config["llm_config"]["num_nextn_predict_layers"] = mtp_depth
+    model = arch.Model(arch.ModelConfig.from_dict(nemotron_config))
+    assert isinstance(model.vision_final_layernorm, nn.LayerNorm) == vision_norm
+    assert model.config.to_dict()["vision_final_layernorm"] == vision_norm
+
+
+@pytest.mark.parametrize("name", ["nemotron_super_vl", "nemotron_bolt"])
+def test_nemotron_checkpoint_conversion_and_multimodal_forward(tmp_path, name):
+    from mlx_vlm.quant_utils import quantize_model
+    from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter
+    from mlx_vlm.utils import save_weights
+
+    case = model_case(name)
+    config = case["config"]
+    arch = importlib.import_module("mlx_vlm.models." + case["module"])
+    mixed = name == "nemotron_super_vl"
+    mx.random.seed(7 if mixed else 123)
+    reference = arch.Model(build_config(arch, config))
+    reference.eval()
+    dense = dict(tree_flatten(reference.parameters()))
+    source = {}
+    for key, weight in dense.items():
+        if ".switch_mlp." in key:
+            prefix, projection = key.split(".switch_mlp.")
+            projection = projection.replace("fc1", "up_proj").replace(
+                "fc2", "down_proj"
+            )
+            decoded = []
+            for expert, value in enumerate(weight):
+                path = f"{prefix}.experts.{expert}.{projection}"
+                if mixed:
+                    scale = 0.137 * (expert + 1)
+                    packed, scales = mx.quantize(
+                        value / scale, group_size=16, bits=4, mode="nvfp4"
+                    )
+                    source[path] = packed.view(mx.uint8)
+                    source[path.removesuffix("weight") + "weight_scale"] = scales
+                    source[path.removesuffix("weight") + "weight_scale_2"] = mx.array(
+                        scale
+                    )
+                    source[path.removesuffix("weight") + "input_scale"] = mx.array(1.0)
+                    value = (
+                        mx.dequantize(
+                            packed, scales, group_size=16, bits=4, mode="nvfp4"
+                        )
+                        * scale
+                    )
+                else:
+                    source[path] = value
+                decoded.append(value)
+            dense[key] = mx.stack(decoded)
+            continue
+        if mixed and key == "language_model.lm_head.weight":
+            # E4M3 bytes 56 and 64 represent 1 and 2, respectively.
+            values = mx.arange(weight.size).reshape(weight.shape) % 2
+            source[key] = (56 + 8 * values).astype(mx.uint8)
+            source[key.removesuffix("weight") + "weight_scale"] = mx.array(0.5)
+            source[key.removesuffix("weight") + "input_scale"] = mx.array(1.0)
+            dense[key] = (0.5 + 0.5 * values).astype(mx.bfloat16)
+            continue
+        if "conv1d.weight" in key:
+            weight = weight.moveaxis(1, 2)
+        key = key.replace("mlp1.layers.", "mlp1.")
+        if key.startswith("vision_final_layernorm."):
+            key = "vision_projector." + key
+        source[key] = weight
+    if mixed:
+        source["language_model.mtp.unused.weight"] = mx.ones((2, 2))
+        source["vision_model.summary_idxs"] = mx.array([0, 1])
+        config["quantization_config"] = {
+            "quant_method": "modelopt_mixed",
+            "quant_algo": "MIXED_PRECISION",
+        }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), source)
+    reference.load_weights(list(dense.items()))
+    loaded = load_model(tmp_path)
+    if not mixed:
+        assert detect_mtp_splitter(tmp_path) is None
+        for idx, experts, width, topk in [(1, 2, 32, 1), (3, 3, 64, 2)]:
+            moe = loaded.language_model.layers[idx].mixer
+            assert moe.switch_mlp.fc1.weight.shape == (experts, width, 32)
+            assert moe.switch_mlp.fc2.weight.shape == (experts, 32, width)
+            assert moe.gate.weight.shape == (experts, 32)
+            assert moe.gate.top_k == topk
+    ids = mx.array([[1, 18, 4 if mixed else 3]])
+    pixels = mx.random.normal((1, 3, 32, 32))
+    actual, expected = loaded(ids, pixels).logits, reference(ids, pixels).logits
+    tolerance = 1e-3 if mixed else 1e-5
+    np.testing.assert_allclose(
+        actual, expected, atol=tolerance, rtol=1e-3 if mixed else 1e-7
+    )
+    features = loaded.get_input_embeddings(ids, pixels).inputs_embeds
+    cache = loaded.language_model.make_cache()
+    reference_cache = reference.language_model.make_cache()
+    for i in range(ids.shape[1]):
+        inputs = ids[:, i : i + 1]
+        embeds = features[:, i : i + 1]
+        step = loaded.language_model(inputs, inputs_embeds=embeds, cache=cache).logits
+        expected_step = (
+            actual[:, i : i + 1]
+            if mixed
+            else reference.language_model(
+                inputs, inputs_embeds=embeds, cache=reference_cache
+            ).logits
+        )
+        np.testing.assert_allclose(
+            step,
+            expected_step,
+            atol=2e-3 if mixed else 1e-5,
+            rtol=2e-3 if mixed else 1e-7,
+        )
+    if mixed:
+        return
+    video_ids = mx.array([[1, 18, 18, 3]])
+    video = mx.random.normal((4, 3, 32, 32))
+    np.testing.assert_allclose(
+        loaded(video_ids, pixel_values_videos=video).logits,
+        reference(video_ids, pixel_values_videos=video).logits,
+        atol=1e-5,
+    )
+    quantized, quant_config = quantize_model(
+        loaded,
+        config,
+        32,
+        4,
+        quant_predicate=lambda path, module: path.startswith("language_model."),
+    )
+    output = tmp_path / "4bit"
+    save_weights(output, quantized)
+    (output / "config.json").write_text(json.dumps(quant_config))
+    reloaded = load_model(output)
+    assert reloaded.language_model.layers[3].mixer.config.n_routed_experts == 3
+    np.testing.assert_array_equal(
+        reloaded(ids, pixels).logits, quantized(ids, pixels).logits
+    )
+
+
+@pytest.mark.parametrize("text_key", ["llm_config", "text_config"])
+def test_nemotron_released_config(nemotron_config, text_key):
+    arch = importlib.import_module("mlx_vlm.models.nemotron_h_nano_omni")
+    nemotron_config[text_key] = nemotron_config.pop("llm_config")
+    module, family = get_model_and_args(nemotron_config)
+    parsed = module.ModelConfig.from_dict(nemotron_config)
+    assert family == "nemotron_h_nano_omni"
+    assert parsed.text_config.num_hidden_layers == 3
+    assert parsed.text_config.hybrid_override_pattern == ["M", "E", "*"]
+    assert parsed.text_config.time_step_limit == (0, float("inf"))
+    assert "num_hidden_layers" not in nemotron_config[text_key]
+    assert isinstance(arch.Model(parsed).vision_final_layernorm, nn.LayerNorm)
+
+
+@pytest.mark.parametrize(
+    "rate,expected",
+    [
+        (0.0, [True] * 6),
+        (0.5, [True, True, False, True, False, False]),
+        (1.0, [True, True, False, False, False, False]),
+    ],
+)
+def test_nemotron_video_retention_order_and_first_tubelet(rate, expected):
+    vision = importlib.import_module(
+        "mlx_vlm.models.nemotron_h_nano_omni.nemotron_h_nano_omni"
+    )
+    # The second token changes most in frame 2; equal scores preserve order.
+    features = mx.array(
+        [[[1.0, 0.0], [1.0, 0.0]], [[1.0, 0.0], [-1.0, 0.0]], [[1.0, 0.0], [-1.0, 0.0]]]
+    )
+    assert vision.compute_retention_mask(features, rate).tolist() == expected
+    assert vision.compute_retention_mask(mx.zeros((1, 2, 4)), rate).tolist() == [
+        True,
+        True,
+    ]
+
+
+def test_nemotron_vision_normalization_and_video_pruning(nemotron_config):
+    vision = importlib.import_module(
+        "mlx_vlm.models.nemotron_h_nano_omni.nemotron_h_nano_omni"
+    )
+    arch = importlib.import_module("mlx_vlm.models.nemotron_h_nano_omni")
+    model = arch.Model(arch.ModelConfig.from_dict(nemotron_config))
+    features = mx.random.normal((1, 4, 16))
+    # The projector must normalize BEFORE spatially merging the four patches.
+    expected = model.mlp1(model.vision_final_layernorm(features).reshape(1, 1, 64))
+    np.testing.assert_allclose(
+        np.array(model._project_vision_features(features, 2, 2)),
+        np.array(expected),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    # Five rectangular frames pad to three tubelets, two tokens per tubelet.
+    pixels = mx.random.normal((5, 3, 32, 64))
+    ids = mx.array([[1, 18, 18, 2, 18, 18, 3, 18, 18, 4]])
+    full = model.extract_video_feature(pixels)
+    assert full.shape == (3, 2, 32)
+    keep = np.flatnonzero(np.array(vision.compute_retention_mask(full, 0.7)))
+    actual = model.get_input_embeddings(ids, pixel_values_videos=pixels).inputs_embeds
+    assert actual.shape == (1, 6, 32)
+    unpruned = model.get_input_embeddings(
+        ids, pixel_values_videos=pixels, video_pruning_rate=0
+    ).inputs_embeds
+    assert unpruned.shape == (1, 10, 32)
+    assert model.video_pruning_rate == 0.7
+    with pytest.raises(ValueError, match="video_pruning_rate"):
+        model.get_input_embeddings(
+            ids, pixel_values_videos=pixels, video_pruning_rate=-1
+        )
+    np.testing.assert_allclose(
+        np.array(actual[0, 1:3]), np.array(full.reshape(-1, 32)[mx.array(keep)])
+    )
+    expected_text = model.language_model.get_input_embeddings(mx.array([[1, 2, 3, 4]]))
+    np.testing.assert_allclose(
+        np.array(actual[:, [0, 3, 4, 5]]), np.array(expected_text)
+    )
+    images = [mx.zeros((3, 32, 32)), mx.zeros((3, 32, 64))]
+    assert model.get_input_embeddings(
+        mx.array([[1, 18, 18, 18, 2]]), images
+    ).inputs_embeds.shape == (1, 5, 32)
 
 
 def test_lfm2_encoder_sanitize_and_dispatch():
