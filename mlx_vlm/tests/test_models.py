@@ -310,8 +310,7 @@ class ModelChecks:
             "visual",
             "img_projector",
         )
-        if type(model).__module__.split(".")[-2] in ("minicpmv4_6", "minicpmv4_7"):
-            vision = vision.embeddings
+        vision = getattr(vision, "embeddings", vision)
         # Delegate to the real encoder and ensure both runs actually process pixels.
         with patch.object(
             type(vision), "__call__", autospec=True, side_effect=type(vision).__call__
