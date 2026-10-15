@@ -68,6 +68,7 @@ MODEL_CONFIG = {
     "internvl": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "llmjpvl": MessageFormat.IMAGE_TOKEN,
     "nemotron_h_nano_omni": MessageFormat.LIST_WITH_IMAGE_TYPE,
+    "nemotron_h_omni": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "nemotronh_nano_omni_reasoning_v3": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "kimi_vl": MessageFormat.LIST_WITH_IMAGE,
     "kimi_k25": MessageFormat.LIST_WITH_IMAGE,
@@ -347,6 +348,9 @@ class MessageFormatter:
             "minimax_m3_vl",
             "llava_onevision",
             "glm5_next",
+            "nemotron_h_omni",
+            "nemotron_h_nano_omni",
+            "nemotronh_nano_omni_reasoning_v3",
         ] and kwargs.get("video"):
             return self._format_video_message(
                 prompt,

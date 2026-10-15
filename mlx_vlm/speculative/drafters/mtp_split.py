@@ -21,6 +21,7 @@ from safetensors import safe_open
 
 from ...fp8 import transform_fp8_weights
 from ...quant_utils import get_quantization_params
+from ...quantization.checkpoint import transform_quantized_weights
 from ...utils import (
     get_model_and_args,
     get_model_path,
@@ -225,6 +226,18 @@ class MTPSplitter:
         if not selected:
             raise ValueError(f"No MTP tensors found in {source_path}.")
 
+        source_quantization = source_config.get(
+            "quantization_config"
+        ) or text_config.get("quantization_config")
+        selected, native_quantization = transform_quantized_weights(
+            selected, source_quantization
+        )
+        if native_quantization is not None:
+            source_config = dict(source_config)
+            source_config["quantization"] = native_quantization
+            if source_quantization.get("quant_method") != "fp8":
+                source_config["quantization_config"] = native_quantization
+
         q_bits = quant_opts.get("q_bits")
         q_mode = quant_opts.get("q_mode")
         quantize = q_bits is not None or q_mode is not None
@@ -312,6 +325,8 @@ class MTPSplitter:
 
 # base model_type -> "module_path:ClassName" (lazy so importing this module is cheap)
 MTP_SPLITTERS: Dict[str, str] = {
+    "nemotron_h": "mlx_vlm.speculative.drafters.nemotron_h_mtp.split:NemotronHMTPSplitter",
+    "nemotron_h_nano_omni": "mlx_vlm.speculative.drafters.nemotron_h_mtp.split:NemotronHMTPSplitter",
     "qwen3_5": "mlx_vlm.speculative.drafters.qwen3_5_mtp.split:Qwen3_5MTPSplitter",
     "qwen3_5_moe": "mlx_vlm.speculative.drafters.qwen3_5_mtp.split:Qwen3_5MTPSplitter",
     "qwen3_next": "mlx_vlm.speculative.drafters.qwen3_5_mtp.split:Qwen3NextMTPSplitter",

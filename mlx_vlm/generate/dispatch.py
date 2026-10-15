@@ -584,7 +584,7 @@ def parse_arguments():
         "--draft-model",
         type=str,
         default=None,
-        help="Speculative drafter path or HF id. Qwen3.5/3.6/3.8 checkpoints "
+        help="Speculative drafter path or HF id. Qwen3.5/3.6/3.8 and Nemotron checkpoints "
         "with bundled MTP weights can use the same path as --model.",
     )
     parser.add_argument(

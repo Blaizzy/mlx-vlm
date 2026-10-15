@@ -426,6 +426,9 @@ def generate_step(
         )
 
         inputs_embeds = embedding_output.inputs_embeds
+        if getattr(embedding_output, "input_ids", None) is not None:
+            input_ids = embedding_output.input_ids
+        speculative_prompt_ids = input_ids
 
         kwargs.update(
             {
@@ -519,7 +522,7 @@ def generate_step(
             model,
             draft_model,
             prompt_cache,
-            input_ids,
+            speculative_prompt_ids if draft_kind == "mtp" else input_ids,
             y,
             logprobs,
             last_outputs,

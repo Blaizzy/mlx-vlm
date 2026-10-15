@@ -86,6 +86,8 @@ class InputEmbeddingsFeatures:
     position_ids: Optional[mx.array] = None
     pos_hw: Optional[mx.array] = None
     rope_deltas: Optional[mx.array] = None
+    # Models that prune prompt embeddings must keep token IDs aligned for MTP.
+    input_ids: Optional[mx.array] = None
 
     def to_dict(self):
         return {

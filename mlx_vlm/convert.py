@@ -377,7 +377,9 @@ def convert(
             # Skip the index file - save_weights() already generated the correct one
             if Path(file).name == "model.safetensors.index.json":
                 continue
-            shutil.copy(file, mlx_path)
+            # Hub cache files can be read-only. Keep output metadata writable
+            # for processor.save_pretrained() and save_config() below.
+            shutil.copyfile(file, mlx_path / Path(file).name)
 
     # Copy folders from the model path to the MLX path
     for item in model_path.iterdir():

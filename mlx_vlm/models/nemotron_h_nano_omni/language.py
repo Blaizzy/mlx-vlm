@@ -1,37 +1,13 @@
 from typing import Any, Optional
 
 import mlx.core as mx
-import mlx.nn as nn
 
 from ..base import LanguageModelOutput, create_attention_mask, create_ssm_mask
-from ..cache import ArraysCache, KVCache
-from ..nemotron_h.config import ModelConfig as ModelArgs
+from ..nemotron_h.language import LanguageModel as NemotronHLanguageModel
 from ..nemotron_h.language import Model as NemotronHForCausalLM
-from ..nemotron_h.language import NemotronHModel
 
 
-class LanguageModel(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-        self.args = args
-        self.config = args
-        self.model_type = args.model_type
-        self.backbone = NemotronHModel(args)
-        self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
-
-    @property
-    def layers(self):
-        return self.backbone.layers
-
-    def make_cache(self):
-        caches = []
-        for layer in self.layers:
-            if layer.block_type == "M":
-                caches.append(ArraysCache(size=2))
-            elif layer.block_type == "*":
-                caches.append(KVCache())
-        return caches
-
+class LanguageModel(NemotronHLanguageModel):
     def get_input_embeddings(self, input_ids: mx.array) -> mx.array:
         return self.backbone.embeddings(input_ids)
 
@@ -44,6 +20,10 @@ class LanguageModel(nn.Module):
         output_hidden_states: bool = False,
         **kwargs,
     ):
+        if not output_hidden_states:
+            return super().__call__(
+                inputs, inputs_embeds=inputs_embeds, cache=cache, **kwargs
+            )
         if inputs_embeds is None:
             if inputs is None:
                 raise ValueError("Either inputs or inputs_embeds must be provided.")
