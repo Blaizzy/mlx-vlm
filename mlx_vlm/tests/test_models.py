@@ -612,11 +612,10 @@ def first_attribute(obj, *names):
 def check_arguments(kind, case, model, config):
     """Keep shared component selection and dimension wiring in Python."""
     name = case["module"]
-    # Phi3-V keeps language dimensions on the outer config.
     core_config = getattr(config, "thinker_config", config)
-    text = (
-        config if name == "phi3_v" else getattr(core_config, "text_config", core_config)
-    )
+    text = getattr(core_config, "text_config", core_config)
+    if not hasattr(text, "vocab_size"):
+        text = core_config
     if kind == "forward_cache":
         return (model, text.vocab_size), case.get("forward_cache", {})
     if kind in {"masked_lm", "token_embeddings", "sentence_embeddings"}:
@@ -626,6 +625,7 @@ def check_arguments(kind, case, model, config):
     if kind == "input_embeddings":
         if "image" not in case:
             return (model, name), {}
+        parameters = inspect.signature(model.get_input_embeddings).parameters
         image = case["image"]
         token = image.get(
             "image_token",
@@ -678,18 +678,15 @@ def check_arguments(kind, case, model, config):
                     )
                 ]
             ]
-        if (
-            "images_seq_mask"
-            in inspect.signature(model.get_input_embeddings).parameters
-        ):
+        if "images_seq_mask" in parameters:
             media["images_seq_mask"] = ids == token
         if name == "jina_vlm":
             media["image_masks"] = mx.ones(pixels.shape[:2])
-        if name in ("gemma4", "gemma4_unified"):
+        if "image_position_ids" in parameters:
             media["image_position_ids"] = mx.array(
                 [[[h, w] for h in range(4) for w in range(4)]]
             )
-        if name in ("paligemma", "gemma3"):
+        if "mask" in parameters:
             media["mask"] = mx.ones(ids.shape, mx.int32)
         return (model, name), dict(input_ids=ids, pixel_values=pixels, **media)
     if kind == "audio":
@@ -709,7 +706,7 @@ def check_arguments(kind, case, model, config):
         projector = attrgetter(case.get("projector_path", "multi_modal_projector"))(
             model
         )
-        if name in ("deepseek_v4", "deepseek_v41"):
+        if "n_h" in inspect.signature(projector.__call__).parameters:
             return (
                 projector,
                 first_attribute(config, "vision_dim", "vision_hidden_size"),
@@ -722,7 +719,7 @@ def check_arguments(kind, case, model, config):
     if kind == "vision":
         vision = attrgetter(case.get("vision_path", "vision_tower"))(model)
         options = case.get("vision", {})
-        if name in ("deepseek_v4", "deepseek_v41"):
+        if "n_h" in inspect.signature(vision.__call__).parameters:
             return (
                 vision,
                 None,
@@ -739,11 +736,8 @@ def check_arguments(kind, case, model, config):
         if image_size is None:
             image_size = (vc.image_size, vc.image_size)
         width = first_attribute(
-            vc, "out_hidden_size", "hidden_size", "d_model", "width", "text_hidden_size"
+            vc, "out_hidden_size", "d_model", "hidden_size", "width", "text_hidden_size"
         )
-        # Molmo's hidden_size describes its projector; use d_model for vision.
-        if name == "molmo":
-            width = vc.d_model
         channels = first_attribute(vc, "num_channels", "in_channels")
         kwargs = {}
         if "feature_layer" in options:
