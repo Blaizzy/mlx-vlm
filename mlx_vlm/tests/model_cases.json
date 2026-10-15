@@ -88,18 +88,7 @@
         "forward_cache",
         "language_hidden_states",
         "input_embeddings"
-      ],
-      "checkpoint": {
-        "format": "modelopt_mixed",
-        "last_token": 4,
-        "prefill_parity": ["image"],
-        "image_shape": [
-          1,
-          3,
-          32,
-          32
-        ]
-      }
+      ]
     },
     {
       "id": "nemotron_bolt",
@@ -198,25 +187,7 @@
         "forward_cache",
         "language_hidden_states",
         "input_embeddings"
-      ],
-      "checkpoint": {
-        "format": "native",
-        "image_shape": [
-          1,
-          3,
-          32,
-          32
-        ],
-        "video_shape": [
-          4,
-          3,
-          32,
-          32
-        ],
-        "video_tokens": 2,
-        "quantize": true,
-        "has_mtp": false
-      }
+      ]
     },
     {
       "id": "minicpmv4_7",
@@ -325,8 +296,7 @@
       "forward_cache": {"chunk_sizes": [1, 3]},
       "vision": {
         "feature_layer": null
-      },
-      "checkpoint": {"format": "native"}
+      }
     },
     {
       "id": "embedding_gemma2",

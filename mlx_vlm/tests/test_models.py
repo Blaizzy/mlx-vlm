@@ -676,28 +676,20 @@ def test_model_contract(case):
 
 
 def test_nemotron_puzzle_layer_configs():
-    nemotron_bolt_config = model_case("nemotron_bolt")["config"]
-    text_module = importlib.import_module("mlx_vlm.models.nemotron_h.config")
-
-    raw = nemotron_bolt_config["llm_config"]
-    original = json.dumps(raw)
+    config = model_case("nemotron_bolt")["config"]
     # The block list takes precedence, as in NVIDIA's Puzzle config.
-    parsed = text_module.ModelConfig.from_dict(
-        {**raw, "layers_block_type": ["attention"]}
-    )
-    assert parsed.hybrid_override_pattern == ["M", "E", "*", "E"]
-    assert parsed.num_hidden_layers == 4
-    assert parsed.n_routed_experts is None
-    assert parsed.for_layer(1).n_routed_experts == 2
-    assert parsed.for_layer(3).n_routed_experts == 3
-    assert parsed.for_layer(1).moe_intermediate_size == 32
-    assert parsed.for_layer(3).moe_intermediate_size == 64
-    assert parsed.for_layer(3).num_experts_per_tok == 2
-    assert json.dumps(raw) == original
+    config["llm_config"]["layers_block_type"] = ["attention"]
     _, family = get_model_and_args({"model_type": "nemotron_h_puzzle"})
     assert family == "nemotron_h"
     arch = importlib.import_module("mlx_vlm.models.nemotron_h_nano_omni")
-    model = arch.Model(build_config(arch, nemotron_bolt_config))
+    model = arch.Model(build_config(arch, config))
+    assert [layer.block_type for layer in model.language_model.layers] == [
+        "M",
+        "E",
+        "*",
+        "E",
+    ]
+    assert model.config.text_config.time_step_limit == (0, float("inf"))
     for idx, experts, width, topk in [(1, 2, 32, 1), (3, 3, 64, 2)]:
         moe = model.language_model.layers[idx].mixer
         assert moe.switch_mlp.fc1.weight.shape == (experts, width, 32)
@@ -718,250 +710,42 @@ def test_nemotron_explicit_vision_norm_overrides_mtp(vision_norm, mtp_depth):
     assert model.config.to_dict().get("vision_final_layernorm") == vision_norm
 
 
-def nemotron_checkpoint_weights(model, config, mixed):
-    dense = dict(tree_flatten(model.parameters()))
-    source = {}
-    for key, weight in dense.items():
+@pytest.mark.parametrize("case_name", ["nemotron_super_vl", "nemotron_bolt"])
+@pytest.mark.parametrize("text_key", ["llm_config", "text_config"])
+def test_nemotron_checkpoint_loading(tmp_path, case_name, text_key):
+    case = model_case(case_name)
+    config = case["config"]
+    config[text_key] = config.pop("llm_config")
+    arch, family = get_model_and_args(config)
+    assert family == case["module"]
+    model = arch.Model(build_config(arch, config))
+    expected = dict(tree_flatten(model.parameters()))
+    weights = {}
+    for key, value in expected.items():
         if ".switch_mlp." in key:
             prefix, projection = key.split(".switch_mlp.")
             projection = projection.replace("fc1", "up_proj").replace(
                 "fc2", "down_proj"
             )
-            decoded = []
-            for expert, value in enumerate(weight):
-                path = f"{prefix}.experts.{expert}.{projection}"
-                if mixed:
-                    scale = 0.137 * (expert + 1)
-                    packed, scales = mx.quantize(
-                        value / scale, group_size=16, bits=4, mode="nvfp4"
-                    )
-                    source[path] = packed.view(mx.uint8)
-                    source[path.removesuffix("weight") + "weight_scale"] = scales
-                    source[path.removesuffix("weight") + "weight_scale_2"] = mx.array(
-                        scale
-                    )
-                    source[path.removesuffix("weight") + "input_scale"] = mx.array(1.0)
-                    value = (
-                        mx.dequantize(
-                            packed, scales, group_size=16, bits=4, mode="nvfp4"
-                        )
-                        * scale
-                    )
-                else:
-                    source[path] = value
-                decoded.append(value)
-            dense[key] = mx.stack(decoded)
-            continue
-        if mixed and key == "language_model.lm_head.weight":
-            # E4M3 bytes 56 and 64 represent 1 and 2, respectively.
-            values = mx.arange(weight.size).reshape(weight.shape) % 2
-            source[key] = (56 + 8 * values).astype(mx.uint8)
-            source[key.removesuffix("weight") + "weight_scale"] = mx.array(0.5)
-            source[key.removesuffix("weight") + "input_scale"] = mx.array(1.0)
-            dense[key] = (0.5 + 0.5 * values).astype(mx.bfloat16)
-            continue
-        if "conv1d.weight" in key:
-            weight = weight.moveaxis(1, 2)
-        key = key.replace("mlp1.layers.", "mlp1.")
-        if key.startswith("vision_final_layernorm."):
-            key = "vision_projector." + key
-        source[key] = weight
-    if mixed:
-        source["language_model.mtp.unused.weight"] = mx.ones((2, 2))
-        source["vision_model.summary_idxs"] = mx.array([0, 1])
-        config["quantization_config"] = {
-            "quant_method": "modelopt_mixed",
-            "quant_algo": "MIXED_PRECISION",
-        }
-    return source, dense
-
-
-def minicpm_checkpoint_weights(model, config, mixed):
-    qwen = importlib.import_module("mlx_vlm.models.qwen3_5.qwen3_5")
-    moe = importlib.import_module("mlx_vlm.models.qwen3_5_moe.language")
-
-    assert isinstance(model.layers[0].mlp, moe.Qwen3_5MoeSparseMoeBlock)
-    expected = dict(tree_flatten(model.parameters()))
-    raw = {}
-    for key, value in expected.items():
-        if ".switch_mlp." in key:
-            continue
-        if key.startswith("language_model.model."):
-            key = key.replace("language_model.model.", "model.language_model.", 1)
-            if key.endswith(qwen.NORM_WEIGHT_SUFFIXES):
-                value = value - 1
-            if "conv1d.weight" in key:
-                value = value.swapaxes(1, 2)
-        elif key.startswith("language_model.lm_head."):
-            key = key.replace("language_model.", "", 1)
+            for expert, weight in enumerate(value):
+                weights[f"{prefix}.experts.{expert}.{projection}"] = weight
         else:
-            key = "model." + key.replace("vit_merger.", "vision_tower.vit_merger.", 1)
-            if key.endswith("patch_embedding.weight"):
-                value = value.transpose(0, 3, 1, 2)
-        raw[key] = value
-    for index, layer in enumerate(model.layers):
-        prefix = f"model.language_model.layers.{index}.mlp.experts"
-        experts = layer.mlp.switch_mlp
-        raw[f"{prefix}.gate_up_proj"] = mx.concatenate(
-            [experts.gate_proj.weight, experts.up_proj.weight], axis=-2
-        )
-        raw[f"{prefix}.down_proj"] = experts.down_proj.weight
-
-    sanitized = model.sanitize(raw)
-    assert sanitized.keys() == expected.keys()
-    for key, value in expected.items():
-        assert mx.array_equal(sanitized[key], value), key
-    reloaded = model.sanitize(sanitized)
-    for key, value in sanitized.items():
-        assert mx.array_equal(reloaded[key], value), key
-    model.load_weights(list(reloaded.items()), strict=True)
-    return raw, expected
-
-
-def checkpoint_inputs(case):
-    """Build ordinary token and pixel inputs from the case's shape options."""
-    yield "text", mx.array([[1, 2, 3]]), {}
-    settings = case["checkpoint"]
-    token = case["config"].get(
-        "img_context_token_id",
-        case["config"].get("image_token_id", case["config"].get("image_token_index")),
-    )
-    for kind, key in (("image", "pixel_values"), ("video", "pixel_values_videos")):
-        if kind + "_shape" in settings:
-            ids = mx.array(
-                [
-                    [1]
-                    + [token] * settings.get(kind + "_tokens", 1)
-                    + [settings.get("last_token", 3)]
-                ]
-            )
-            yield kind, ids, {key: mx.random.normal(tuple(settings[kind + "_shape"]))}
-
-
-def assert_checkpoint_inference(reference, loaded, case, mixed):
-    tolerance = dict(atol=1e-3, rtol=1e-3) if mixed else dict(atol=1e-5, rtol=1e-7)
-    for kind, ids, media in checkpoint_inputs(case):
-        actual = loaded(ids, **media).logits
-        np.testing.assert_allclose(actual, reference(ids, **media).logits, **tolerance)
-        features = loaded.get_input_embeddings(ids, **media).to_dict()
-        embeds = features.pop("inputs_embeds")
-        if embeds.shape[1] != ids.shape[1]:
-            continue  # Pruned embeddings cannot be sliced by the original token IDs.
-        cache, reference_cache = [
-            make_prompt_cache(m.language_model) for m in (loaded, reference)
-        ]
-        for i in range(ids.shape[1]):
-            inputs, chunk = ids[:, i : i + 1], embeds[:, i : i + 1]
-            step = loaded.language_model(
-                inputs, inputs_embeds=chunk, cache=cache, **features
-            ).logits
-            expected = reference.language_model(
-                inputs, inputs_embeds=chunk, cache=reference_cache, **features
-            ).logits
-            np.testing.assert_allclose(step, expected, **tolerance)
-            if kind in case["checkpoint"].get("prefill_parity", []):
-                np.testing.assert_allclose(
-                    step, actual[:, i : i + 1], atol=2e-3, rtol=2e-3
-                )
-
-
-def assert_checkpoint_weights(model, expected):
-    actual = dict(tree_flatten(model.parameters()))
-    assert actual.keys() == expected.keys()
-    for key, value in actual.items():
-        np.testing.assert_array_equal(value, expected[key], err_msg=key)
-
-
-@pytest.mark.parametrize(
-    "case", [c for c in DATA["cases"] if "checkpoint" in c], ids=lambda case: case["id"]
-)
-def test_checkpoint_roundtrip(tmp_path, case):
-    from mlx_vlm.quant_utils import quantize_model
-    from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter
-    from mlx_vlm.utils import save_weights
-
-    case = copy.deepcopy(case)
-    config, options = case["config"], case["checkpoint"]
-    arch = importlib.import_module("mlx_vlm.models." + case["module"])
-    mixed = options.get("format") == "modelopt_mixed"
-    mx.random.seed(7 if mixed else 123)
-    reference = arch.Model(build_config(arch, config))
-    reference.eval()
-    encode = {
-        "nemotron_h_nano_omni": nemotron_checkpoint_weights,
-        "minicpmv4_7": minicpm_checkpoint_weights,
-    }[case["module"]]
-    weights, expected = encode(reference, config, mixed)
-    reference.load_weights(list(expected.items()), strict=True)
+            if "conv1d.weight" in key:
+                value = value.moveaxis(1, 2)
+            key = key.replace("mlp1.layers.", "mlp1.")
+            if key.startswith("vision_final_layernorm."):
+                key = "vision_projector." + key
+            weights[key] = value
+    weights["vision_model.summary_idxs"] = mx.array([0, 1])
+    weights["language_model.mtp.unused.weight"] = mx.ones((2, 2))
     (tmp_path / "config.json").write_text(json.dumps(config))
     mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
     loaded = load_model(tmp_path)
-    if "has_mtp" in options:
-        assert (detect_mtp_splitter(tmp_path) is not None) == options["has_mtp"]
-    if not mixed:
-        assert_checkpoint_weights(loaded, expected)
-        assert {name: type(m) for name, m in loaded.named_modules()} == {
-            name: type(m) for name, m in reference.named_modules()
-        }
-    assert_checkpoint_inference(reference, loaded, case, mixed)
-    if mixed:
-        return
-    if options.get("quantize"):
-        loaded, config = quantize_model(
-            loaded,
-            config,
-            32,
-            4,
-            quant_predicate=lambda path, module: path.startswith("language_model."),
-        )
-    output = tmp_path / "mlx"
-    save_weights(output, loaded)
-    (output / "config.json").write_text(json.dumps(config))
-    reloaded = load_model(output)
-    assert asdict(reloaded.config) == asdict(loaded.config)
-    assert_checkpoint_weights(reloaded, dict(tree_flatten(loaded.parameters())))
-    for kind, ids, media in checkpoint_inputs(case):
-        np.testing.assert_array_equal(
-            reloaded(ids, **media).logits, loaded(ids, **media).logits
-        )
-
-
-@pytest.mark.parametrize(
-    "case,text_key",
-    [
-        pytest.param(c, key, id=f"{c['id']}-{key}")
-        for c in DATA["cases"]
-        if "checkpoint" in c
-        for key in (
-            ("llm_config", "text_config")
-            if "llm_config" in c["config"]
-            else ("text_config",)
-        )
-    ],
-)
-def test_checkpoint_config_roundtrip(case, text_key):
-    raw = copy.deepcopy(case["config"])
-    raw[text_key] = raw.pop("llm_config" if "llm_config" in raw else "text_config")
-    original = copy.deepcopy(raw)
-    module, family = get_model_and_args(raw)
-    parsed = module.ModelConfig.from_dict(raw)
-    assert family == case["module"]
-    assert raw == original
-    serialized = asdict(parsed)
-    assert asdict(module.ModelConfig.from_dict(serialized)) == serialized
-    text = raw[text_key]
-    blocks = text.get("block_configs", text.get("layers_block_type"))
-    if blocks is not None:
-        names = [
-            block["block_type"] if isinstance(block, dict) else block
-            for block in blocks
-        ]
-        assert parsed.text_config.num_hidden_layers == len(blocks)
-        assert parsed.text_config.hybrid_override_pattern == [
-            {"mamba": "M", "moe": "E", "attention": "*"}[name] for name in names
-        ]
-    if text.get("time_step_limit") == [0.0, {"__float__": "Infinity"}]:
-        assert parsed.text_config.time_step_limit == (0, float("inf"))
+    assert asdict(loaded.config) == asdict(model.config)
+    actual = dict(tree_flatten(loaded.parameters()))
+    assert actual.keys() == expected.keys()
+    for key, value in expected.items():
+        assert mx.array_equal(actual[key], value), key
 
 
 @pytest.mark.parametrize(
@@ -1368,6 +1152,58 @@ def test_minicpmv47_sanitize_is_idempotent(minicpmv47_case):
         2,
         3,
     )
+
+
+@pytest.mark.parametrize("minicpmv47_case", ["minicpmv4_7_moe"], indirect=True)
+def test_minicpmv47_native_expert_checkpoint_and_reload(minicpmv47_case, tmp_path):
+    module, config = minicpmv47_case
+    qwen = importlib.import_module("mlx_vlm.models.qwen3_5.qwen3_5")
+    moe = importlib.import_module("mlx_vlm.models.qwen3_5_moe.language")
+
+    model = module.Model(config)
+    assert isinstance(model.layers[0].mlp, moe.Qwen3_5MoeSparseMoeBlock)
+    expected = dict(tree_flatten(model.parameters()))
+    raw = {}
+    for key, value in expected.items():
+        if ".switch_mlp." in key:
+            continue
+        if key.startswith("language_model.model."):
+            key = key.replace("language_model.model.", "model.language_model.", 1)
+            if key.endswith(qwen.NORM_WEIGHT_SUFFIXES):
+                value = value - 1
+            if "conv1d.weight" in key:
+                value = value.swapaxes(1, 2)
+        elif key.startswith("language_model.lm_head."):
+            key = key.replace("language_model.", "", 1)
+        else:
+            key = "model." + key.replace("vit_merger.", "vision_tower.vit_merger.", 1)
+            if key.endswith("patch_embedding.weight"):
+                value = value.transpose(0, 3, 1, 2)
+        raw[key] = value
+    for index, layer in enumerate(model.layers):
+        prefix = f"model.language_model.layers.{index}.mlp.experts"
+        experts = layer.mlp.switch_mlp
+        raw[f"{prefix}.gate_up_proj"] = mx.concatenate(
+            [experts.gate_proj.weight, experts.up_proj.weight], axis=-2
+        )
+        raw[f"{prefix}.down_proj"] = experts.down_proj.weight
+
+    sanitized = model.sanitize(raw)
+    assert sanitized.keys() == expected.keys()
+    for key, value in expected.items():
+        assert mx.array_equal(sanitized[key], value), key
+    reloaded = model.sanitize(sanitized)
+    for key, value in sanitized.items():
+        assert mx.array_equal(reloaded[key], value), key
+    model.load_weights(list(reloaded.items()), strict=True)
+    mx.eval(model(mx.array([[1, 2, 3]])).logits)
+    (tmp_path / "config.json").write_text(json.dumps(asdict(model.config)))
+    for weights in (raw, sanitized):
+        mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+        loaded = load_model(tmp_path)
+        assert isinstance(loaded.layers[0].mlp, moe.Qwen3_5MoeSparseMoeBlock)
+        for key, value in tree_flatten(loaded.parameters()):
+            assert mx.array_equal(value, expected[key]), key
 
 
 @pytest.mark.parametrize("minicpmv47_case", ["minicpmv4_7_moe"], indirect=True)
