@@ -121,14 +121,7 @@ class SpeculativePrefill:
     def __init__(self, draft_kind, drafter):
         self.kwargs = (
             speculative_prefill_kwargs(draft_kind, drafter)
-            if drafter is not None
-            and (
-                draft_kind in ("dflash", "eagle3")
-                or (
-                    draft_kind == "mtp"
-                    and getattr(drafter, "supports_chunked_prefill", False)
-                )
-            )
+            if drafter is not None and draft_kind in ("dflash", "eagle3")
             else {}
         )
         self.chunks = []

@@ -19,8 +19,6 @@ class NemotronHMTPDraftModel(AutoregressiveMTPDraftModel):
     layers. Reusing that module recursively permits multiple draft tokens.
     """
 
-    supports_chunked_prefill = True
-
     def __init__(self, config: NemotronHMTPConfig):
         super().__init__(config)
         text = config.text_config
@@ -48,6 +46,24 @@ class NemotronHMTPDraftModel(AutoregressiveMTPDraftModel):
 
     def make_cache(self):
         return [KVCache() for layer in self.layers if layer.block_type == "*"]
+
+    def prefill_from_target_hidden(
+        self,
+        input_ids,
+        hidden,
+        bonus_token,
+        sampler,
+        token_dtype=mx.int32,
+        greedy=False,
+    ):
+        if input_ids.shape[1] != hidden.shape[1]:
+            raise ValueError(
+                "Nemotron MTP requires one hidden state per prompt token. "
+                "For video requests, set video_pruning_rate=0."
+            )
+        return super().prefill_from_target_hidden(
+            input_ids, hidden, bonus_token, sampler, token_dtype, greedy
+        )
 
     def _forward_hidden(self, token_embed, hidden, tokens, cache, **kwargs):
         del tokens, kwargs

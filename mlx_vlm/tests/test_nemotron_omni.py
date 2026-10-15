@@ -417,8 +417,9 @@ def test_mtp_generation_matches_autoregressive(
     elif media == "video":
         ids = mx.array([[1, 18, 18, 18, 3]])
         kwargs["pixel_values_videos"] = mx.random.normal((6, 3, 32, 32))
+        kwargs["video_pruning_rate"] = 0
         embeds = model.get_input_embeddings(ids, **kwargs)
-        assert embeds.input_ids.tolist() == [[1, 18, 3]]
+        assert embeds.inputs_embeds.shape[1] == ids.shape[1]
     common = dict(
         max_tokens=12, temperature=temperature, seed=19, prefill_step_size=2, **kwargs
     )
@@ -441,9 +442,31 @@ def test_mtp_generation_matches_autoregressive(
         a < d for a, d in zip(draft.accept_lens, draft.draft_lens)
     )
     prompt_ids, prompt_hidden = prefill.call_args.args[:2]
-    expected_ids = embeds.input_ids if media == "video" else ids
-    assert prompt_ids.tolist() == expected_ids.tolist()
-    assert prompt_hidden.shape[1] == expected_ids.shape[1]
+    assert prompt_ids.tolist() == ids.tolist()
+    assert prompt_hidden.shape[1] == ids.shape[1]
+
+
+def test_mtp_rejects_pruned_video(config):
+    from mlx_vlm.generate.ar import generate_step
+    from mlx_vlm.speculative.drafters.nemotron_h_mtp import Model as DraftModel
+    from mlx_vlm.speculative.drafters.nemotron_h_mtp import ModelConfig as DraftConfig
+
+    model = Model(ModelConfig.from_dict(config))
+    draft = DraftModel(DraftConfig(text_config=config["llm_config"]))
+    with pytest.raises(ValueError, match="video_pruning_rate=0"):
+        list(
+            generate_step(
+                mx.array([[1, 18, 18, 18, 3]]),
+                model,
+                None,
+                None,
+                pixel_values_videos=mx.zeros((6, 3, 32, 32)),
+                draft_model=draft,
+                draft_kind="mtp",
+                max_tokens=3,
+                temperature=0,
+            )
+        )
 
 
 @pytest.mark.parametrize("accepted", [0, 1, 3])

@@ -351,9 +351,8 @@ class Model(nn.Module):
             keep[positions] = np.array(video_mask)
             indices = mx.array(np.flatnonzero(keep))
             inputs_embeds = inputs_embeds[:, indices]
-            input_ids = input_ids[:, indices]
 
-        return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds, input_ids=input_ids)
+        return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
 
     def __call__(
         self,
@@ -367,7 +366,7 @@ class Model(nn.Module):
             input_ids, pixel_values, mask=mask, **kwargs
         )
         return self.language_model(
-            embedding_output.input_ids,
+            input_ids,
             inputs_embeds=embedding_output.inputs_embeds,
             cache=cache,
             **kwargs,

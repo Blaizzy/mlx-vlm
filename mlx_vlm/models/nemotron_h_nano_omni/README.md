@@ -74,6 +74,8 @@ mlx_vlm.generate \
   --max-tokens 256
 ```
 
+MTP processes the complete prompt in one prefill pass. For video MTP, add `--gen-kwargs '{"video_pruning_rate": 0}'` (or `video_pruning_rate=0` in Python) so prompt tokens remain aligned with the target hidden states. Pruned video requests support ordinary generation only.
+
 The MTP kind is detected automatically. Only the MTP shard is read for the drafter; it shares the target's token embeddings and output head. NVFP4 expert weights retain their individual global scales. A block size of 3 drafts two tokens; larger values recursively reuse the same native prediction module. The target verifies every draft, and rejected tokens roll back both attention and Mamba state.
 
 To save the drafter separately:
