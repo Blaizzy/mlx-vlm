@@ -442,14 +442,6 @@ class NemotronHExactSpeculativeVerifier(Qwen3_5ExactSpeculativeVerifier):
         return self._linear(mixer.out_proj, output)
 
     def _mlp(self, mlp, hidden):
-        # Preserve singleton rounding through the shared experts' ReLU2 and
-        # dense/ModelOpt projections. Small BF16 differences compound across
-        # the Super model's many MoE layers and can change greedy tokens.
-        if hidden.ndim == 3 and hidden.shape[1] > 1:
-            return mx.concatenate(
-                [mlp(hidden[:, i : i + 1]) for i in range(hidden.shape[1])],
-                axis=1,
-            )
         return self._linear(mlp.down_proj, nn.relu2(self._linear(mlp.up_proj, hidden)))
 
     def _switch_mlp(self, switch_mlp, hidden, indices):

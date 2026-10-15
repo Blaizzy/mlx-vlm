@@ -24,6 +24,7 @@ from mlx_vlm.models.base import InputEmbeddingsFeatures, LanguageModelOutput
 from mlx_vlm.models.cache import ArraysCache, BatchKVCache, KVCache
 from mlx_vlm.models.linear import native_batch_linear
 from mlx_vlm.models.switch_layers import QuantizedSwitchLinear, SwitchGLU
+from mlx_vlm.quantization.nvfp4 import ScaledQuantizedLinear
 from mlx_vlm.speculative import common, mtp
 from mlx_vlm.speculative.cache_state import start_speculative_cache
 from mlx_vlm.speculative.drafters import (
@@ -1073,6 +1074,27 @@ def nemotron_target_and_drafter():
     )
 
 
+@parametrize("case_name", ["nemotron_super_vl", "nemotron_bolt"])
+def test_hidden_state_output_preserves_speculative_flags(case_name):
+    case = model_case(case_name)
+    arch = module("models." + case["module"])
+    model = arch.Model(build_config(arch, case["config"])).language_model
+    ids = mx.array([[1, 2, 3]])
+    output = model(
+        ids,
+        cache=model.make_cache(),
+        output_hidden_states=True,
+        speculative_verify=True,
+        skip_logits=True,
+        return_shared_kv=True,
+    )
+    assert output.logits is None
+    assert output.shared_kv_states == {}
+    assert output.gdn_states
+    assert len(output.hidden_states) == len(model.layers) + 1
+    equal(output.hidden_states[0], model.get_input_embeddings(ids))
+
+
 @parametrize("quantized", [False, True])
 def test_nemotron_native_mtp_load_split_and_forward(tmp_path, quantized):
     mx.random.seed(42)
@@ -1806,6 +1828,32 @@ def test_wide_quantized_verifier(batch, length, bits):
         verifier_linear._target_verify_quantized_argmax(linear, inputs),
         greedy(expected),
     )
+
+
+@parametrize("batch,length", [(1, 1), (1, 3), (2, 3)])
+@parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+def test_scaled_quantized_verifier(batch, length, dtype):
+    mx.random.seed(43)
+    linears = [
+        ScaledQuantizedLinear(
+            nn.QuantizedLinear.from_linear(
+                nn.Linear(512, 128, bias=bias), group_size=16, bits=4, mode="nvfp4"
+            ),
+            mx.array(0.37),
+            scale_name,
+        )
+        for bias, scale_name in [
+            (False, "weight_scale_2"),
+            (True, "weight_global_scale"),
+        ]
+    ]
+    inputs = mx.random.normal((batch, length, 512)).astype(dtype)
+    expected = [
+        verifier_linear._target_verify_singletons(linear, inputs) for linear in linears
+    ]
+    for linear, reference in zip(linears, expected):
+        equal(verifier_linear._target_verify_linear(linear, inputs), reference)
+    equal(verifier_linear._target_verify_linears(linears, inputs), expected)
 
 
 def test_glm_mtp_native_weight_fusion():

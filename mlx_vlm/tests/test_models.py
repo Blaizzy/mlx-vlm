@@ -11,7 +11,7 @@ import math
 import struct
 import textwrap
 import unittest
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict
 from operator import attrgetter
 from pathlib import Path
@@ -314,6 +314,44 @@ class ModelChecks:
             ).logits
             assert logits.shape == (1, 1, config.vocab_size) and logits.dtype == dtype
 
+    def language_hidden_states(self, model):
+        ids = mx.array([[1, 2, 3]])
+        embeds = model.get_input_embeddings(ids)
+        captured = []
+
+        def record_input(forward):
+            def call(layer, hidden, *args, **kwargs):
+                captured.append(hidden)
+                return forward(layer, hidden, *args, **kwargs)
+
+            return call
+
+        reference_cache = model.make_cache()
+        with ExitStack() as stack:
+            for layer_type in {type(layer) for layer in model.layers}:
+                stack.enter_context(
+                    patch.object(
+                        layer_type, "__call__", record_input(layer_type.__call__)
+                    )
+                )
+            reference = model(ids, cache=reference_cache)
+        assert reference.hidden_states is None
+        next_ids = mx.array([[4]])
+        next_logits = model(next_ids, cache=reference_cache).logits
+        for inputs in (
+            {"inputs": ids},
+            {"input_ids": ids},
+            {"inputs_embeds": embeds},
+        ):
+            cache = model.make_cache()
+            output = model(**inputs, cache=cache, output_hidden_states=True)
+            assert len(output.hidden_states) == len(model.layers) + 1
+            for actual, expected in zip(output.hidden_states[:-1], captured):
+                self.assert_close(actual, expected)
+            self.assert_close(output.logits, reference.logits)
+            self.assert_close(model.lm_head(output.hidden_states[-1]), output.logits)
+            self.assert_close(model(next_ids, cache=cache).logits, next_logits)
+
     def projector(
         self, model, input_width, output_width, *, grid_hw=None, downsample_ratio=1
     ):
@@ -555,6 +593,8 @@ def check_arguments(kind, case, model, config):
         return (model, config, name), case.get("audio", {})
     if kind in {"request_positions", "chunked_positions"}:
         return (model,), {}
+    if kind == "language_hidden_states":
+        return (model.language_model,), {}
     if kind in {"language", "mrope_cache_index", "mrope_deltas"}:
         if kind == "language":
             options = (
