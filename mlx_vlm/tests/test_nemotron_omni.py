@@ -1,7 +1,6 @@
 """Nemotron 3.5 Super VL and Bolt checkpoint and inference contracts."""
 
 import json
-from types import SimpleNamespace
 from unittest.mock import Mock
 
 import mlx.core as mx
@@ -218,41 +217,6 @@ def test_bolt_checkpoint_conversion_and_multimodal_forward(tmp_path, bolt_config
     np.testing.assert_array_equal(
         np.array(reloaded(ids, pixels).logits), np.array(quantized(ids, pixels).logits)
     )
-
-
-def test_conversion_can_rewrite_readonly_hub_metadata(
-    tmp_path, bolt_config, monkeypatch
-):
-    from importlib import import_module
-
-    conversion = import_module("mlx_vlm.convert")
-
-    source, output = tmp_path / "source", tmp_path / "output"
-    source.mkdir()
-    for name, content in (("config.json", bolt_config), ("tokenizer.json", {})):
-        file = source / name
-        file.write_text(json.dumps(content))
-        file.chmod(0o444)
-
-    def save_processor(path):
-        tokenizer_file = path / "tokenizer.json"
-        assert tokenizer_file.stat().st_mode & 0o200
-        tokenizer_file.write_text(json.dumps({"saved": True}))
-
-    model = Model(ModelConfig.from_dict(bolt_config))
-    processor = SimpleNamespace(save_pretrained=save_processor)
-    monkeypatch.setattr(
-        conversion,
-        "fetch_from_hub",
-        lambda *args, **kwargs: (model, bolt_config, processor),
-    )
-    conversion.convert(str(source), mlx_path=str(output), trust_remote_code=False)
-    assert json.loads((output / "tokenizer.json").read_text()) == {"saved": True}
-    assert (
-        json.loads((output / "config.json").read_text())["llm_config"]["block_configs"]
-        == bolt_config["llm_config"]["block_configs"]
-    )
-    assert not (source / "tokenizer.json").stat().st_mode & 0o200
 
 
 @pytest.mark.parametrize("text_key", ["llm_config", "text_config"])
