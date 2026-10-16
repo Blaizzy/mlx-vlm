@@ -266,7 +266,7 @@ class Model(nn.Module):
         return target_states.at[indices_mx].add(features - current)
 
     def get_vision_embedding(self, pixel_values, tgt_sizes, downsample_mode=None):
-        dtype = self.language_model.model.embed_tokens.weight.dtype
+        dtype = self.vision_tower.embeddings.patch_embedding.weight.dtype
 
         if pixel_values is None:
             return []
@@ -358,7 +358,9 @@ class Model(nn.Module):
         if cached is not None:
             vision_hidden_states = cached
         elif pixel_values is not None:
-            vision_hidden_states = self.get_vision_embedding(pixel_values, tgt_sizes)
+            vision_hidden_states = self.get_vision_embedding(
+                pixel_values, tgt_sizes, downsample_mode=kwargs.get("downsample_mode")
+            )
         else:
             vision_hidden_states = None
 

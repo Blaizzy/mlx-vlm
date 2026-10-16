@@ -607,6 +607,51 @@ class TestBatchGenerator:
             (200, 11),
         ]
 
+    def test_speculative_generation_batch_releases_cache_when_finished(
+        self, monkeypatch
+    ):
+        closed = []
+
+        def fake_rounds(*args, **kwargs):
+            del args, kwargs
+            try:
+                yield [1], {"round_pos": 0, "round_len": 1}
+                yield [2], {"round_pos": 0, "round_len": 1}
+            finally:
+                closed.append(True)
+
+        monkeypatch.setattr(ar_module, "run_speculative_server_rounds", fake_rounds)
+
+        cache = [SimpleNamespace(state=mx.zeros((4,)))]
+        batch = SpeculativeGenerationBatch(
+            model=SimpleNamespace(),
+            draft_model=SimpleNamespace(),
+            draft_kind="mtp",
+            uids=[100],
+            first_tokens=mx.array([0], dtype=mx.int32),
+            prompt_cache=cache,
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            stop_criteria=lambda token: token == 1,
+            max_tokens=[10],
+            hidden=mx.zeros((1, 1, 1)),
+            shared_kv_states={"k": mx.zeros((1,))},
+            prompt_tokens=mx.array([[0]], dtype=mx.int32),
+        )
+
+        batch.next()
+        assert batch.prompt_cache is cache
+
+        responses = batch.next()
+        assert [(r.uid, r.token, r.finish_reason) for r in responses] == [
+            (100, 1, "stop")
+        ]
+        assert len(batch) == 0
+        assert batch.prompt_cache == []
+        assert batch.hidden is None
+        assert batch.shared_kv_states is None
+        assert closed == [True]
+        assert batch.next() == []
+
     def test_generation_batch_extend_expands_compact_processor_state(self):
         sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
         stop_criteria = lambda token: False
@@ -1229,6 +1274,50 @@ def test_stream_generate_stores_checkpoint_only_before_decode(reused_prefix):
     ]
     assert all(call.args[1] == prompt_cache for call in calls)
     assert all(call.kwargs == {"extra_hash": 0} for call in calls)
+
+
+@pytest.mark.parametrize(
+    "geometry",
+    ["image_grid_thw", "image_grid_hw", "image_permutations", "image_position_ids"],
+)
+def test_stream_generate_cache_preserves_image_metadata(geometry, monkeypatch):
+    from mlx_vlm.vision_cache import VisionFeatureCache
+
+    vision_cache = VisionFeatureCache()
+    encode = MagicMock(side_effect=lambda pixels, **kwargs: [kwargs[geometry]])
+    model = SimpleNamespace(config=MockConfig(), encode_images=encode)
+    processor = SimpleNamespace(stopping_criteria=lambda token: False)
+    monkeypatch.setattr(
+        dispatch_module, "wired_limit", lambda *args: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        dispatch_module,
+        "make_streaming_detokenizer",
+        lambda _: MagicMock(last_segment=""),
+    )
+
+    def decode(*args, **kwargs):
+        assert mx.array_equal(kwargs["cached_image_features"][0], kwargs[geometry])
+        yield 7, mx.zeros((4,))
+
+    monkeypatch.setattr(dispatch_module, "generate_step", decode)
+    for layout in (0, 1, 0):
+        list(
+            dispatch_module.stream_generate(
+                model,
+                processor,
+                prompt="",
+                image="same.png",
+                input_ids=mx.array([[1, 2]]),
+                pixel_values=mx.zeros((16, 3)),
+                mask=None,
+                prompt_cache=[],
+                vision_cache=vision_cache,
+                max_tokens=1,
+                **{geometry: mx.array([layout])},
+            )
+        )
+    assert encode.call_count == len(vision_cache) == 2
 
 
 @pytest.mark.parametrize("value", [224, "22", [1.5], [True], [1, 2, 3]])
