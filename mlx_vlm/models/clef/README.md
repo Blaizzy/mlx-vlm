@@ -36,10 +36,8 @@ the probability of true. `images` and `videos` may be passed to `predict`.
 
 See [shared decision serving](../../../docs/decisions.md) for scheduling,
 state-prefix caching, cancellation, JSONL evaluation, and the TypeSafe adapter.
-The shared `predict()`, CLI, and `/v1/decisions` default to System One answers:
+The shared `predict()`, CLI, and `/v1/decisions` return System One answers:
 `choice`, `score`, or `noul`, with top-level confidence and score legend.
-Use `format="native"` in Python, `--format native` in the CLI, or
-`"format": "native"` over HTTP for native answers and model-specific metadata.
 
 ## Quantization
 

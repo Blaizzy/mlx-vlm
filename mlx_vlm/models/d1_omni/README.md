@@ -48,12 +48,10 @@ base64 data URI) the same way.
 d1-omni supports `choice`, `score`, and `bool`; `noul` is an alias for `bool`.
 A `choice` takes `{label: description}` or a list of labels, a `score` an
 ordered list of 2 to 10 levels, and a `bool` optional `{"false": ..., "true":
-...}` descriptions. The shared Python API, CLI, and `/v1/decisions` default to
+...}` descriptions. The shared Python API, CLI, and `/v1/decisions` return
 System One answers: `choice`, `score`, and `noul`. Choice and score answers
 include `probabilities` and top-level System One `confidence`; scores also carry
 the level `legend`. Boolean answers put the probability of true in `noul`.
-Use Python `format="native"`, CLI `--format native`, or HTTP `"format": "native"`
-for native answers and model-specific metadata.
 
 A state is a string, any JSON value, or `None` when images or audio are the
 whole state. `images` is one image or a list of PIL images, paths, or URLs,

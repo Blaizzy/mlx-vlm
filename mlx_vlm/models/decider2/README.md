@@ -26,13 +26,10 @@ Weights use the existing Qwen3.5 text backbone and sanitization. No special
 loader or runtime sidecar detection is required.
 
 The shared `predict(model, processor, state, questions)` API, CLI, and
-`/v1/decisions` default to System One answers. Decider supports `choice`, `score`,
+`/v1/decisions` return System One answers. Decider supports `choice`, `score`,
 and `bool`; `noul` is a Boolean alias. Answers put the selected label in `choice`,
 the expected level index in `score`, and the probability of true in `noul`.
 Choice and score answers include `probabilities` and shared System One confidence.
-Use `format="native"` in Python, `--format native` in the CLI, or
-`"format": "native"` over HTTP for model-specific confidence, certainty, and
-isolated-level metrics in `metadata`.
 Unsupported question types fail before inference. No answer tokens are generated.
 
 Choice criteria are 2–255 labels or a mapping of labels to descriptions. Score

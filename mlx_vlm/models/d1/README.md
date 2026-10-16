@@ -49,11 +49,9 @@ d1 supports `choice`, `score`, and `bool`; `noul` is a Boolean alias. Choice
 criteria map labels to descriptions or list labels; score criteria are an
 ordered list of 2 to 10 levels; Boolean criteria optionally describe `true` and
 `false`. Choice returns a label, score its expected level, and Boolean the
-probability of `true`. The shared Python API, CLI, and `/v1/decisions` default
-to System One answers with `choice`, `score`, or `noul` fields and top-level
-System One `confidence` and score `legend`. Native answers and metadata remain
-available through Python `format="native"`, CLI `--format native`, or HTTP
-`"format": "native"`.
+probability of `true`. The shared Python API, CLI, and `/v1/decisions` return
+System One answers with `choice`, `score`, or `noul` fields and top-level
+System One `confidence` and score `legend`.
 
 `images` is one image or a list of PIL images, paths, or URLs; files are
 turned upright by their EXIF orientation, PIL images are read as given. Each is

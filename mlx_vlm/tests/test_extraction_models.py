@@ -3050,26 +3050,19 @@ def _assert_decision_answers(actual, expected):
     [case for case in EXTRACTION_DATA["cases"] if "decision_models" in case["checks"]],
     ids=lambda case: case["id"],
 )
-@pytest.mark.parametrize("wire_format", ["systemone", "native"])
-def test_decision_scheduler_preserves_prediction(case, wire_format):
+def test_decision_scheduler_preserves_prediction(case):
     from mlx_vlm import predict
     from mlx_vlm.decision_scheduler import DecisionScheduler
     from mlx_vlm.systemone import format_response
 
     model, processor, body = _decision_fixture(case)
-    expected = predict(
-        model, processor, body["state"], body["questions"], format=wire_format
-    )
+    expected = predict(model, processor, body["state"], body["questions"])
     scheduler = DecisionScheduler(lambda name: (model, processor, model.config))
     try:
-        jobs = [scheduler.submit(body, response_format=wire_format) for _ in range(2)]
+        jobs = [scheduler.submit(body) for _ in range(2)]
         for job in jobs:
             output = job.future.result(timeout=10)
-            actual = (
-                format_response(body, output)
-                if wire_format == "systemone"
-                else output["response"]
-            )
+            actual = format_response(body, output)
             _assert_decision_answers(actual["answers"], expected["answers"])
             assert actual.get("usage") == expected.get("usage")
     finally:

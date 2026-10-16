@@ -92,16 +92,11 @@ class SystemOneResponse(BaseModel):
     usage: DecisionUsage
 
 
-def validate_response_format(format, questions):
-    if format not in ("systemone", "native"):
-        raise ValueError("Decision format must be 'systemone' or 'native'")
-    if format == "systemone":
-        for question in questions.values():
-            kind = question.get("type", "choice")
-            if kind not in ("bool", "noul", "choice", "score"):
-                raise ValueError(
-                    f"System One output does not support {kind!r}; use format='native'"
-                )
+def validate_questions(questions):
+    for question in questions.values():
+        kind = question.get("type", "choice")
+        if kind not in ("bool", "noul", "choice", "score"):
+            raise ValueError(f"System One does not support {kind!r} decisions")
 
 
 def systemone_answer(question, probabilities):
@@ -155,7 +150,7 @@ def native_request(request):
 
 
 def format_response(request, output):
-    validate_response_format("systemone", request["questions"])
+    validate_questions(request["questions"])
     answers = {}
     raw = output.get("probabilities")
     native = output["response"]

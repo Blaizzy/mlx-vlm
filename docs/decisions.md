@@ -1,7 +1,7 @@
 # Decision serving and batch evaluation
 
 `mlx_vlm.predict(model, processor, state, questions)`, `mlx_vlm.decide`, and
-`/v1/decisions` use the same model backends and default to System One answers:
+`/v1/decisions` use the same model backends and return System One answers:
 `noul`, `choice`, and `score`, with top-level `confidence` and score `legend`.
 Model calibration is applied before formatting; the shared formatter applies
 the System One confidence formulas. Supported question types and media are declared by the model.
@@ -14,15 +14,14 @@ print(result["answers"]["team"]["choice"])
 
 Questions accept both `bool` and `noul`, and choice criteria may be a list of
 labels or a mapping to descriptions. Boolean answers always use
-`{"type": "noul", "noul": 0.8}` in the default format. Choice and score answers
+`{"type": "noul", "noul": 0.8}`. Choice and score answers
 include probabilities rounded to four decimals; output-token usage is zero.
 
-For model-specific metadata or independent `multi_label` scores, opt into native
-output with `predict(..., format="native")`, CLI `--format native`, or
-`"format": "native"` in a `/v1/decisions` request. System One has no multi-label
-answer type, so that combination is rejected before inference rather than
-converting independent scores into a probability distribution. Low-level
-`model.predict()` and decision engine results retain the native backend contract.
+There is one public response schema and no format selector. System One has no
+`multi_label` answer type, so those requests are rejected before inference.
+Express independent labels as separate Boolean questions. Model implementations
+retain their internal scoring results; the shared formatter produces the public
+System One response.
 
 ## CLI
 
@@ -101,7 +100,7 @@ and active request count.
 ## TypeSafe System One compatibility
 
 `/v1/systemone` retains strict TypeSafe request validation and returns the same
-System One answers as `predict()`, `decide`, and `/v1/decisions` by default.
+System One answers as `predict()`, `decide`, and `/v1/decisions`.
 It retains `noul`, `choice`, and `score`, their confidence formulas, four-decimal
 output rounding, zero output-token usage, and the `x-typesafe-request-id` and
 `x-clef-cached-tokens` headers. `model` and `state` are required in this format.
@@ -128,10 +127,9 @@ python -m mlx_vlm.decide --request request.json
 ```
 
 `mlx_vlm.decide --request request.json` and `python -m mlx_vlm decide
---request request.json` return this format by default. `--format systemone`
-selects it explicitly; `--format native` selects native answers. The Python
+--request request.json` return the same System One answers. The Python
 `mlx_vlm.decision.systemone(...)` helper accepts a strict System One request.
 
 The adapter uses unrounded distributions when the backend exposes them;
-otherwise it uses the model's native probabilities. Native output remains
-available explicitly, with model-specific metadata and calibration preserved.
+otherwise it uses the model's native probabilities. Model calibration is applied
+before the shared confidence calculation and output rounding.

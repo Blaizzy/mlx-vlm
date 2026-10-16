@@ -9,7 +9,7 @@ from pathlib import Path
 
 from .decision import _validate_question_structure, predict
 from .decision_scheduler import DecisionScheduler
-from .systemone import format_response, validate_response_format
+from .systemone import format_response, validate_questions
 from .utils import load
 
 
@@ -118,7 +118,7 @@ def _requests(args, parser):
     state = (
         args.state_file.read_text(encoding="utf-8") if args.state_file else args.state
     )
-    if args.format == "systemone" and isinstance(state, str) and state.startswith("@"):
+    if isinstance(state, str) and state.startswith("@"):
         state = _json_argument(state)
     questions = (
         json.loads(args.questions_file.read_text(encoding="utf-8"))
@@ -139,10 +139,15 @@ def _validated_body(raw, args):
     if not isinstance(raw, dict):
         raise ValueError("Each request must be a JSON object")
     body = dict(raw)
+    unknown = body.keys() - {"model", "state", "questions", "images", "videos", "audio"}
+    if unknown:
+        raise ValueError(
+            f"Unknown decision request fields: {', '.join(sorted(unknown))}"
+        )
     if args.model:
         body["model"] = args.model
     _validate_question_structure(body.get("questions"))
-    validate_response_format(args.format, body["questions"])
+    validate_questions(body["questions"])
     if not isinstance(body.get("model"), str) or not body["model"]:
         raise ValueError("Specify a model for each request or with --model")
     if body.get("state") is None and not any(
@@ -159,7 +164,7 @@ def main(argv=None):
     )
     state = parser.add_mutually_exclusive_group()
     state.add_argument(
-        "--state", help="Text to evaluate (System One format also accepts @JSONFILE)"
+        "--state", help="Text to evaluate; @JSONFILE reads a structured state"
     )
     state.add_argument("--state-file", type=Path)
     questions = parser.add_mutually_exclusive_group()
@@ -173,12 +178,6 @@ def main(argv=None):
     )
     parser.add_argument("--request", help="JSON/JSONL file; - reads stdin")
     parser.add_argument("--jsonl", action="store_true")
-    parser.add_argument(
-        "--format",
-        choices=["native", "systemone"],
-        default="systemone",
-        help="Response format (default: systemone)",
-    )
     parser.add_argument("--max-length", type=int)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--prefill-step-size", type=int, default=512)
@@ -224,7 +223,6 @@ def main(argv=None):
                     processor,
                     body.get("state"),
                     body["questions"],
-                    format=args.format,
                     **{
                         k: v
                         for k, v in body.items()
@@ -251,23 +249,12 @@ def main(argv=None):
             max_pending=max(64, args.batch_size * 2),
         )
 
-    def submit(queue, body):
-        return queue.submit(
-            body,
-            allow_single_criterion=args.format == "systemone",
-            response_format=args.format,
-        )
-
     candidates, inputs, pending = [], [], deque()
     queue = scheduler()
 
     def emit(body, job):
         output = job.future.result()
-        result = (
-            format_response(body, output)
-            if args.format == "systemone"
-            else output["response"]
-        )
+        result = format_response(body, output)
         print(
             json.dumps(result, indent=None if args.jsonl else 2, ensure_ascii=False),
             file=output_stream,
@@ -280,7 +267,7 @@ def main(argv=None):
         for body in requests:
             if args.compare_model:
                 inputs.append(body)
-            pending.append((body, submit(queue, body)))
+            pending.append((body, queue.submit(body)))
             if len(pending) >= args.batch_size * 2:
                 emit(*pending.popleft())
         while pending:
@@ -295,7 +282,7 @@ def main(argv=None):
         queue, reference = scheduler(), []
         try:
             for body in inputs:
-                job = submit(queue, {**body, "model": args.compare_model})
+                job = queue.submit({**body, "model": args.compare_model})
                 reference.append(job.future.result()["probabilities"])
             report = comparison_report(
                 reference,

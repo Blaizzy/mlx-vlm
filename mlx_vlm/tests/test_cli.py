@@ -502,17 +502,15 @@ def test_video_generation_cli(tmp_path, capsys, mode, image, last, workflow):
 
 @pytest.mark.parametrize("state_file", [False, True])
 @pytest.mark.parametrize("questions_file", [False, True])
-@pytest.mark.parametrize("wire_format", ["systemone", "native"])
 def test_decision_cli_routes_inputs_and_returns_json(
-    tmp_path, capsys, monkeypatch, state_file, questions_file, wire_format
+    tmp_path, capsys, monkeypatch, state_file, questions_file
 ):
     from mlx_vlm import decide
 
     state = "Please refund my café purchase."
     questions = {"route": {"type": "choice", "criteria": ["billing", "support"]}}
-    field = "choice" if wire_format == "systemone" else "value"
-    result = {"answers": {"route": {"type": "choice", field: "billing"}}}
-    args = ["--format", wire_format, "--model", "model/path"]
+    result = {"answers": {"route": {"type": "choice", "choice": "billing"}}}
+    args = ["--model", "model/path"]
     for name, value, use_file in (
         ("state", state, state_file),
         ("questions", json.dumps(questions), questions_file),
@@ -530,9 +528,7 @@ def test_decision_cli_routes_inputs_and_returns_json(
     monkeypatch.setattr(decide, "predict", predict)
     decide.main(args)
     load.assert_called_once_with("model/path")
-    predict.assert_called_once_with(
-        model, processor, state, questions, format=wire_format
-    )
+    predict.assert_called_once_with(model, processor, state, questions)
     assert json.loads(capsys.readouterr().out) == result
 
 
@@ -542,7 +538,7 @@ def test_decision_cli_rejects_invalid_questions_before_loading(
 ):
     from mlx_vlm import decide
 
-    args = ["--format", "native", "--model", "model/path", "--state", "text"]
+    args = ["--model", "model/path", "--state", "text"]
     if source == "inline":
         args.extend(["--questions", "{invalid"])
     else:
@@ -567,8 +563,6 @@ def test_decision_cli_reports_unsupported_question(capsys, monkeypatch):
     with pytest.raises(SystemExit) as error:
         decide.main(
             [
-                "--format",
-                "native",
                 "--model",
                 "model/path",
                 "--state",
@@ -614,9 +608,7 @@ def test_decision_cli_passes_media(monkeypatch, state, media, flags):
     monkeypatch.setattr(decide, "load", Mock(return_value=(model, processor)))
     monkeypatch.setattr(decide, "predict", predict)
     decide.main(args)
-    predict.assert_called_once_with(
-        model, processor, state, questions, format="systemone", **media
-    )
+    predict.assert_called_once_with(model, processor, state, questions, **media)
 
 
 def test_decision_cli_requires_state_or_media(monkeypatch, capsys):
@@ -627,8 +619,6 @@ def test_decision_cli_requires_state_or_media(monkeypatch, capsys):
     with pytest.raises(SystemExit) as error:
         decide.main(
             [
-                "--format",
-                "native",
                 "--model",
                 "d1",
                 "--questions",
@@ -659,7 +649,7 @@ def test_decision_cli_rejects_question_structure_before_loading(
 ):
     from mlx_vlm import decide
 
-    args = ["--format", "native", "--model", "model/path", "--state", "text"]
+    args = ["--model", "model/path", "--state", "text"]
     content = json.dumps(questions)
     if from_file:
         path = tmp_path / "questions.json"
@@ -722,10 +712,9 @@ def decision_cli_responses(monkeypatch):
     return calls
 
 
-@pytest.mark.parametrize("wire_format", [None, "native"])
 @pytest.mark.parametrize("kind", ["file", "stdin", "jsonl"])
 def test_decision_cli_request_streams(
-    decision_cli_responses, monkeypatch, tmp_path, capsys, wire_format, kind
+    decision_cli_responses, monkeypatch, tmp_path, capsys, kind
 ):
     import io
 
@@ -734,7 +723,7 @@ def test_decision_cli_request_streams(
     body = {
         "model": "test",
         "state": "A",
-        "questions": {"q": {"type": "bool" if wire_format == "native" else "noul"}},
+        "questions": {"q": {"type": "noul"}},
     }
     content = (
         "\n".join(json.dumps({**body, "state": str(i)}) for i in range(5))
@@ -745,8 +734,6 @@ def test_decision_cli_request_streams(
     path.write_text(content)
     monkeypatch.setattr(sys, "stdin", io.StringIO(content))
     args = ["--request", str(path) if kind == "file" else "-"]
-    if wire_format is not None:
-        args += ["--format", wire_format]
     if kind == "jsonl":
         args += ["--jsonl", "--batch-size", "2"]
     decide.main(args)
@@ -762,11 +749,7 @@ def test_decision_cli_request_streams(
         [str(i) for i in range(5)] if kind == "jsonl" else ["A"]
     )
     answer = outputs[0]["answers"]["q"]
-    assert answer == (
-        {"type": "noul", "noul": 0.8}
-        if wire_format is None
-        else {"type": "bool", "value": True, "probability": 0.8}
-    )
+    assert answer == {"type": "noul", "noul": 0.8}
 
 
 def test_decision_cli_comparison_gate(decision_cli_responses, tmp_path, capsys):

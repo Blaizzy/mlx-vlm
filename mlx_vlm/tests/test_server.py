@@ -6410,34 +6410,6 @@ def test_realtime_websocket_requires_native_pcm_rate(realtime_client):
         assert event["error"]["code"] == "inference_error"
 
 
-@pytest.mark.parametrize("kind", ["choice", "score", "bool", "multi_label"])
-def test_decisions_endpoint_preserves_explicit_native_output(client, kind):
-    criteria = None if kind == "bool" else ["low", "high"]
-    questions = {"result": {"type": kind, "criteria": criteria}}
-    result = {
-        "answers": {"result": {"type": kind, "value": "low"}},
-        "usage": {"input_tokens": 7},
-    }
-    model = NS(decision_types=(kind,), predict=MagicMock(return_value=result))
-    processor = object()
-    with patch.object(
-        server, "get_cached_model", return_value=(model, processor, {})
-    ) as load:
-        response = client.post(
-            "/v1/decisions",
-            json={
-                "model": "decision",
-                "state": "text",
-                "questions": questions,
-                "format": "native",
-            },
-        )
-    assert response.status_code == 200
-    assert response.json() == {**result, "model": "decision"}
-    load.assert_called_once_with("decision", model_kind="decision")
-    model.predict.assert_called_once_with(processor, "text", questions)
-
-
 def test_decisions_rejects_unsupported_type(client):
     model = NS(decision_types=("choice",), predict=MagicMock())
     with patch.object(server, "get_cached_model", return_value=(model, None, {})):
@@ -6569,53 +6541,6 @@ def test_decisions_default_model_from_env(client, monkeypatch):
     assert response.status_code == 200
     assert response.json()["model"] == "env-decision"
     load.assert_called_once_with("env-decision", model_kind="decision")
-
-
-@pytest.mark.parametrize("threshold", ["bad", None, [], {}, True, -0.1, 1.1])
-def test_decisions_rejects_invalid_threshold_before_prediction(client, threshold):
-    model = NS(decision_types=("multi_label",), predict=MagicMock())
-    with patch.object(server, "get_cached_model", return_value=(model, None, {})):
-        response = client.post(
-            "/v1/decisions",
-            json={
-                "model": "decision",
-                "state": "text",
-                "questions": {
-                    "tags": {
-                        "type": "multi_label",
-                        "criteria": ["refund"],
-                        "threshold": threshold,
-                    }
-                },
-            },
-        )
-    assert response.status_code == 400
-    assert (
-        response.json()["detail"] == "threshold must be a number between zero and one"
-    )
-    model.predict.assert_not_called()
-
-
-@pytest.mark.parametrize("threshold", [0, 0.5, 1])
-def test_decisions_preserves_valid_threshold(client, threshold):
-    model = NS(
-        decision_types=("multi_label",), predict=MagicMock(return_value={"answers": {}})
-    )
-    questions = {
-        "tags": {"type": "multi_label", "criteria": ["refund"], "threshold": threshold}
-    }
-    with patch.object(server, "get_cached_model", return_value=(model, None, {})):
-        response = client.post(
-            "/v1/decisions",
-            json={
-                "model": "decision",
-                "state": "text",
-                "questions": questions,
-                "format": "native",
-            },
-        )
-    assert response.status_code == 200
-    model.predict.assert_called_once_with(None, "text", questions)
 
 
 def test_decisions_generic_prediction_failure_returns_500(client):
@@ -6896,38 +6821,24 @@ def test_systemone_adapts_shared_predictions_and_confidence(
 
 
 @pytest.mark.parametrize("surface", ["predict", "http", "cli"])
-def test_decision_multilabel_requires_native_output(client, surface, tmp_path, capsys):
+def test_decision_multilabel_rejected_before_inference(
+    client, surface, tmp_path, capsys
+):
     from mlx_vlm import decide, predict
 
     questions = {"tags": {"type": "multi_label", "criteria": ["a", "b"]}}
-    native = {
-        "answers": {
-            "tags": {
-                "type": "multi_label",
-                "value": ["a", "b"],
-                "scores": {"a": 0.8, "b": 0.9},
-            }
-        },
-        "model": "decision",
-    }
-    model = NS(
-        decision_types=("multi_label",), config=NS(), predict=Mock(return_value=native)
-    )
+    model = NS(decision_types=("multi_label",), predict=Mock(), config=NS())
     body = {"model": "decision", "state": "A", "questions": questions}
     if surface == "predict":
-        with pytest.raises(ValueError, match="use format='native'"):
+        with pytest.raises(ValueError, match="does not support 'multi_label'"):
             predict(model, None, "A", questions)
         model.predict.assert_not_called()
-        result = predict(model, None, "A", questions, format="native")
     elif surface == "http":
         with patch.object(server, "get_cached_model", return_value=(model, None, {})):
             response = client.post("/v1/decisions", json=body)
             assert response.status_code == 400
-            assert "use format='native'" in response.json()["detail"]
+            assert "does not support 'multi_label'" in response.json()["detail"]
             model.predict.assert_not_called()
-            response = client.post("/v1/decisions", json={**body, "format": "native"})
-        assert response.status_code == 200
-        result = response.json()
     else:
         path = tmp_path / "request.json"
         path.write_text(json.dumps(body))
@@ -6935,12 +6846,8 @@ def test_decision_multilabel_requires_native_output(client, surface, tmp_path, c
             with pytest.raises(SystemExit) as error:
                 decide.main(["--request", str(path)])
             assert error.value.code == 2
-            assert "use format='native'" in capsys.readouterr().err
+            assert "does not support 'multi_label'" in capsys.readouterr().err
             model.predict.assert_not_called()
-            decide.main(["--request", str(path), "--format", "native"])
-        result = json.loads(capsys.readouterr().out)
-    assert result == native
-    model.predict.assert_called_once_with(None, "A", questions)
 
 
 @pytest.mark.parametrize(

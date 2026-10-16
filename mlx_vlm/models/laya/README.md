@@ -28,16 +28,13 @@ Laya supports `choice`, `score`, and `bool` decisions; `noul` is an alias for
 `bool`. A `score` question takes an ordered list of criteria. All questions in
 one request are batched. The decision path does not generate tokens.
 
-The shared `predict()` API, CLI, and `/v1/decisions` default to System One
+The shared `predict()` API, CLI, and `/v1/decisions` return System One
 answers: `choice`, `score`, and `noul`. Choice and score answers include
 calibrated `probabilities` and the shared System One `confidence`; Boolean
 answers put the probability of true in `noul`. Tokenization, heads, and
-calibration remain in the Laya implementation. Use `format="native"` in Python,
-`--format native` in the CLI, or `"format": "native"` over HTTP for Laya's
-entropy confidence and action probability in `metadata`.
+calibration remain in the Laya implementation.
 
 The shared `predict` function rejects unsupported decision types before
-inference. Models supporting multi-label classification require native output
-for independent `scores`, which need not sum to one. Inspect `model.decision_types` for the
-supported types. Loading uses the standard `lazy`, `strict`, and `revision`
+inference. Use separate Boolean questions for independent labels. Inspect
+`model.decision_types` for the supported types. Loading uses the standard `lazy`, `strict`, and `revision`
 options and supports converted checkpoints through the same path.

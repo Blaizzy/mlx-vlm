@@ -515,7 +515,7 @@ print(output)
 ### Decision models
 
 Run shared typed decision prediction from the CLI. `predict()`, `decide`, and
-`/v1/decisions` default to System One answers: `noul`, `choice`, and `score`, with
+`/v1/decisions` return System One answers: `noul`, `choice`, and `score`, with
 shared confidence formulas. Boolean questions accept either `bool` or `noul`.
 
 ```sh
@@ -555,9 +555,8 @@ Requests may add `"images"`, a list of URLs, paths, or data URIs, or `"audio"`,
 one URL, path, or base64 data URI; `state` may then be `null`. Decision requests
 are non-streaming and use the server's API-key authentication.
 
-All three interfaces use the same response formatter. Use Python
-`format="native"`, CLI `--format native`, or HTTP `"format": "native"` for
-model-specific metadata and multi-label scores. Decider, Laya, [d1-3B](mlx_vlm/models/d1/README.md), and
+All three interfaces use the same response schema without a format selector.
+Decider, Laya, [d1-3B](mlx_vlm/models/d1/README.md), and
 [d1-omni-600M](mlx_vlm/models/d1_omni/README.md) support `choice`, `bool`, and
 `score`; the two LiquidAI d1 models also read images, and d1-omni reads speech.
 Consult each model's README for criteria and calibration details.

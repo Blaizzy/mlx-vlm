@@ -2226,14 +2226,11 @@ def test_generate_step_evaluates_cache_periodically(max_tokens, cache_evals):
     "cache_bytes,chunk", [(0, 10000), (0, 31), (1024**2, 31), (1024**2, 10000)]
 )
 def test_decision_prefill_and_prefix_contract(incremental_decision, cache_bytes, chunk):
-    from mlx_vlm import predict
     from mlx_vlm.decision_scheduler import make_decision_engine
     from mlx_vlm.tests.test_extraction_models import _assert_decision_answers
 
     _, (model, processor, body) = incremental_decision
-    expected = predict(
-        model, processor, body["state"], body["questions"], format="native"
-    )
+    expected = model.predict(processor, body["state"], body["questions"])
     engine = make_decision_engine(
         model, processor, prefill_step_size=chunk, cache_bytes=cache_bytes
     )
@@ -2261,7 +2258,6 @@ def test_decision_prefill_and_prefix_contract(incremental_decision, cache_bytes,
 
 
 def test_decision_prefix_isolation_eviction_and_clear(incremental_decision):
-    from mlx_vlm import predict
     from mlx_vlm.decision_scheduler import make_decision_engine
     from mlx_vlm.tests.test_extraction_models import _assert_decision_answers
 
@@ -2272,9 +2268,7 @@ def test_decision_prefix_isolation_eviction_and_clear(incremental_decision):
     second = {**body, "questions": {"different": {"type": "bool"}}}
     record = engine.prepare(second, namespace="a").record
     output = engine.decide(second, namespace="a")
-    expected = predict(
-        model, processor, second["state"], second["questions"], format="native"
-    )
+    expected = model.predict(processor, second["state"], second["questions"])
     _assert_decision_answers(output["response"]["answers"], expected["answers"])
     assert (
         engine.prefill_tokens - before == len(record.input_ids) - record.prefix_length
@@ -2348,7 +2342,6 @@ def test_decision_mixed_media_cache_contract(incremental_decision):
 
     from PIL import Image
 
-    from mlx_vlm import predict
     from mlx_vlm.decision import DecisionCancelled
     from mlx_vlm.decision_scheduler import make_decision_engine
     from mlx_vlm.tests.test_extraction_models import (
@@ -2382,14 +2375,12 @@ def test_decision_mixed_media_cache_contract(incremental_decision):
     frame = Image.new("RGB", (28, 28), "red")
     body = {**body, "images": [frame], "videos": [[frame]]}
     engine = make_decision_engine(model, processor, prefill_step_size=3)
-    expected = predict(
-        model,
+    expected = model.predict(
         processor,
         body["state"],
         body["questions"],
         images=body["images"],
         videos=body["videos"],
-        format="native",
     )
     _assert_decision_answers(
         engine.decide(body)["response"]["answers"], expected["answers"]

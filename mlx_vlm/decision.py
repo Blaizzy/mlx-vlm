@@ -13,40 +13,30 @@ def _validate_question_structure(questions):
         raise ValueError("Questions must map names to question dictionaries")
 
 
-def predict(model, processor, state, questions, *, format="systemone", **kwargs):
-    """Predict named decisions with System One answers by default.
+def predict(model, processor, state, questions, **kwargs):
+    """Predict named decisions with System One answers.
 
     Questions contain a type, instructions, and criteria. Types are ``choice``,
     ``score``, and ``bool`` (or ``noul``); support is model-specific. Answers use
     ``choice``, ``score``, and ``noul`` fields and System One confidence formulas.
-    Use ``format="native"`` for model-specific metadata and ``multi_label``
-    scores. Model calibration is applied before either response is formatted.
+    Model calibration is applied before the response is formatted.
     ``state`` may be ``None`` when supported media carry the whole state.
     """
     from .systemone import format_response
 
-    normalized, kwargs = normalize_questions(
-        model,
-        questions,
-        response_format=format,
-        allow_single_criterion=format == "systemone",
-        **kwargs,
-    )
-    if format == "native":
-        return model.predict(processor, state, normalized, **kwargs)
+    if "format" in kwargs:
+        raise TypeError(
+            "predict() does not accept 'format'; decisions return System One answers"
+        )
+    normalized, kwargs = normalize_questions(model, questions, **kwargs)
     body = {"state": state, "questions": normalized, **kwargs}
     return format_response(body, _predict_output(model, processor, body))
 
 
-def normalize_questions(
-    model,
-    questions,
-    *,
-    allow_single_criterion=False,
-    response_format="native",
-    **kwargs,
-):
+def normalize_questions(model, questions, **kwargs):
     """Validate capabilities independently of eager or scheduled execution."""
+    from .systemone import validate_questions
+
     supported = getattr(model, "decision_types", ())
     if not supported:
         raise ValueError("This model does not support decision prediction")
@@ -56,6 +46,7 @@ def normalize_questions(
         if name in kwargs and name not in media:
             raise ValueError(f"This model does not support {kind} input")
     _validate_question_structure(questions)
+    validate_questions(questions)
     normalized = {}
     for name, question in questions.items():
         question = dict(question)
@@ -65,13 +56,9 @@ def normalize_questions(
         if kind not in supported:
             raise ValueError(f"This model does not support {kind!r} decisions")
         criteria = question.get("criteria")
-        if kind in ("choice", "multi_label", "score"):
-            minimum = 1 if kind == "multi_label" or allow_single_criterion else 2
-            if (
-                not isinstance(criteria, (list, tuple, Mapping))
-                or len(criteria) < minimum
-            ):
-                raise ValueError(f"{kind} needs at least {minimum} criteria")
+        if kind in ("choice", "score"):
+            if not isinstance(criteria, (list, tuple, Mapping)) or not criteria:
+                raise ValueError(f"{kind} needs at least one criterion")
             if kind != "score" and any(
                 not isinstance(label, str) or not label for label in criteria
             ):
@@ -80,14 +67,6 @@ def normalize_questions(
                 raise ValueError("Decision labels must be unique")
         if kind == "score" and isinstance(criteria, Mapping):
             raise ValueError("score criteria must be an ordered list")
-        if kind == "multi_label":
-            threshold = question.get("threshold", 0.5)
-            if (
-                isinstance(threshold, bool)
-                or not isinstance(threshold, (int, float))
-                or not 0 <= threshold <= 1
-            ):
-                raise ValueError("threshold must be a number between zero and one")
         if (
             kind in ("bool", "noul")
             and criteria is not None
@@ -100,9 +79,6 @@ def normalize_questions(
             question["criteria"] = list(criteria)
         question["type"] = kind
         normalized[name] = question
-    from .systemone import validate_response_format
-
-    validate_response_format(response_format, normalized)
     return normalized, kwargs
 
 
@@ -162,8 +138,6 @@ def systemone(model, processor, request, max_length=None, *, engine=None):
     questions, media = normalize_questions(
         model,
         body["questions"],
-        allow_single_criterion=True,
-        response_format="systemone",
         **{
             key: value
             for key, value in body.items()
