@@ -17,6 +17,7 @@ from tqdm import tqdm
 
 from .. import apc as _apc
 from ..kv_quant import from_legacy as kv_quant_from_legacy
+from ..models import batch_invariant as _batch_invariant
 from ..models import cache
 from ..prompt_utils import apply_chat_template
 from ..sample_utils import (
@@ -2480,6 +2481,23 @@ class PromptProcessingBatch:
         return rope_deltas
 
 
+def _supports_batch_invariant(model) -> bool:
+    """Whether ``model`` routes its projections through batch_invariant.linear."""
+    if getattr(model, "supports_batch_invariant", False):
+        return True
+    _warn_batch_invariant_unsupported(type(model).__name__)
+    return False
+
+
+@functools.lru_cache(maxsize=None)
+def _warn_batch_invariant_unsupported(name: str) -> None:
+    logger.warning(
+        "batch_invariant=True is ignored for %s: the model does not implement "
+        "batch-invariant projections.",
+        name,
+    )
+
+
 class BatchGenerator:
     """
     Continuous batching with separate prompt processing and generation phases.
@@ -2487,6 +2505,12 @@ class BatchGenerator:
     next() returns (prompt_responses, generation_responses) where:
     - prompt_responses contains completed prompt-batch timing stats
     - generation_responses is a list of GenerationBatch.Response objects
+
+    batch_invariant=True makes each row's output independent of how many
+    other rows share the batch, so greedy rows match batch-size-1 output bit
+    for bit. It costs batched decode and prefill speed and only takes effect
+    for models that set ``supports_batch_invariant`` (dense Qwen3.5 today);
+    other models log a warning once and run unchanged.
     """
 
     def __init__(
@@ -2520,9 +2544,13 @@ class BatchGenerator:
         draft_kind: Optional[str] = None,
         draft_block_size: Optional[int] = None,
         greedy_sampling: bool = False,
+        batch_invariant: bool = False,
     ):
         self.model = model
         self.max_tokens = max_tokens
+        self.batch_invariant = bool(batch_invariant) and _supports_batch_invariant(
+            model
+        )
         self.processor = processor
         self.kv_bits = kv_bits
         self.kv_key_bits = kv_key_bits
@@ -3234,6 +3262,9 @@ class BatchGenerator:
 
     def next(self, **kwargs):
         with mx.stream(self._stream):
+            if self.batch_invariant:
+                with _batch_invariant.batch_invariant():
+                    return self._next(**kwargs)
             return self._next(**kwargs)
 
 
@@ -3277,7 +3308,9 @@ def batch_generate(
           batch processing.
        track_image_sizes (bool): If ``True``, track and return original image sizes.
        kwargs: The remaining options get passed to :obj:`BatchGenerator`.
-          See :obj:`BatchGenerator` for more details.
+          See :obj:`BatchGenerator` for more details. For example,
+          ``batch_invariant=True`` makes each greedy row match generating that
+          prompt alone, at some speed cost.
 
     Returns:
         BatchResponse with generated texts, statistics, and optionally image_sizes.

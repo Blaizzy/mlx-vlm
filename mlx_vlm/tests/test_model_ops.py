@@ -2464,3 +2464,64 @@ def test_rfdetr_backbone_attention_matches_softmax_reference(batch, tokens):
     scores = mx.softmax((q @ k.transpose(0, 1, 3, 2)) * attention.scale, axis=-1)
     expected = (scores @ v).transpose(0, 2, 1, 3).reshape(batch, tokens, 48)
     _assert_allclose(attention(x), attention.o_proj(expected))
+
+
+def _batch_invariant_probe(B, L):
+    mx.random.seed(0)
+    linear = nn.QuantizedLinear(1024, 512, bias=False, group_size=64, bits=4)
+    linear.scales = linear.scales.astype(mx.bfloat16)
+    linear.biases = linear.biases.astype(mx.bfloat16)
+    x = (mx.random.normal((B, L, 1024)) * 0.5).astype(mx.bfloat16)
+    return linear, x
+
+
+@pytest.mark.parametrize("L", [1, 3])
+@pytest.mark.parametrize("B", [2, 4, 8])
+def test_batch_invariant_linear_matches_single_row(B, L):
+    """Rows of a batched quantized projection must equal the B=1 result (#2518)."""
+    from mlx_vlm.models import batch_invariant
+
+    linear, x = _batch_invariant_probe(B, L)
+    with batch_invariant.batch_invariant():
+        out = batch_invariant.linear(linear, x)
+    expected = mx.concatenate([linear(x[i : i + 1]) for i in range(B)], axis=0)
+    mx.eval(out, expected)
+    assert out.shape == expected.shape
+    assert mx.array_equal(out, expected).item()
+
+
+@pytest.mark.parametrize("B", [1, 4])
+def test_batch_invariant_linear_off_is_plain_call(B):
+    """With the switch off (the default) the helper is exactly ``layer(x)``."""
+    from mlx_vlm.models import batch_invariant
+
+    linear, x = _batch_invariant_probe(B, 1)
+    assert not batch_invariant.is_enabled()
+    calls = []
+
+    def layer(inputs):
+        calls.append(inputs)
+        return linear(inputs)
+
+    out = batch_invariant.linear(layer, x)
+    assert len(calls) == 1 and calls[0] is x
+    assert mx.array_equal(out, linear(x)).item()
+
+
+def test_batch_invariant_switch_is_scoped():
+    from mlx_vlm.models import batch_invariant
+
+    assert not batch_invariant.is_enabled()
+    with batch_invariant.batch_invariant():
+        assert batch_invariant.is_enabled()
+        with batch_invariant.batch_invariant(False):
+            assert not batch_invariant.is_enabled()
+        assert batch_invariant.is_enabled()
+    assert not batch_invariant.is_enabled()
+
+
+def test_qwen3_5_projections_route_through_batch_invariant_linear():
+    from mlx_vlm.models import batch_invariant
+
+    assert lang._batch_invariant_linear is batch_invariant.linear
+    assert lang.LanguageModel.supports_batch_invariant

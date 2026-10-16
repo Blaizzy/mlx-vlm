@@ -79,6 +79,16 @@ def get_prefill_step_size():
     return int(os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE))
 
 
+def get_batch_invariant() -> bool:
+    """Whether continuous batching runs batch-invariant (MLX_VLM_BATCH_INVARIANT)."""
+    return os.environ.get("MLX_VLM_BATCH_INVARIANT", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def get_max_num_seqs():
     """Max sequences allowed in the running batch at once (None = unbounded)."""
     raw = os.environ.get("MLX_VLM_MAX_NUM_SEQS", "")
@@ -1811,6 +1821,7 @@ class ResponseGenerator:
                             draft_block_size=_get_draft_block_size_from_env(),
                             greedy_sampling=args.temperature == 0,
                             prefill_step_size=self._effective_prefill_step_size(),
+                            batch_invariant=get_batch_invariant(),
                         )
 
                     # Vision encoder runs on the GPU thread; text tokenization
