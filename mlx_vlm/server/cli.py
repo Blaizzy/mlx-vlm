@@ -283,6 +283,17 @@ def main():
         ),
     )
     parser.add_argument(
+        "--batch-invariant",
+        action="store_true",
+        help=(
+            "Make continuous-batching output independent of how many requests "
+            "share the batch: a temperature-0 request returns the same tokens "
+            "as when it runs alone. Slower batched decode and prefill; dense "
+            "Qwen3.5 models only (ignored with a warning elsewhere). Maps to "
+            "MLX_VLM_BATCH_INVARIANT."
+        ),
+    )
+    parser.add_argument(
         "--top-logprobs-k",
         type=int,
         default=None,
@@ -354,6 +365,8 @@ def main():
         os.environ["MLX_VLM_DRAFT_BLOCK_SIZE"] = str(args.draft_block_size)
     if args.max_num_seqs is not None:
         os.environ["MLX_VLM_MAX_NUM_SEQS"] = str(args.max_num_seqs)
+    if args.batch_invariant:
+        os.environ["MLX_VLM_BATCH_INVARIANT"] = "1"
     if args.prefill_step_size:
         os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
     os.environ["MLX_VLM_LOG_PROGRESS_INTERVAL"] = str(args.log_progress_interval)

@@ -110,6 +110,9 @@ class Qwen3_5MoeModel(Qwen3_5Model):
 
 
 class LanguageModel(Qwen3_5LanguageModel):
+    # The routed experts (SwitchGLU / gather_qmm) and the router are not
+    # batch-invariant, so BatchGenerator(batch_invariant=True) is a no-op here.
+    supports_batch_invariant = False
 
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         nn.Module.__init__(self)

@@ -2219,3 +2219,113 @@ def test_generate_step_evaluates_cache_periodically(max_tokens, cache_evals):
     assert eval_mock.call_count == 1 + cache_evals
     if cache_evals:
         eval_mock.assert_called_with([cache_state])
+
+
+def _tiny_quantized_qwen3_5():
+    import mlx.nn as nn
+
+    from mlx_vlm.models.qwen3_5.config import TextConfig
+    from mlx_vlm.models.qwen3_5_text.language import LanguageModel
+
+    mx.random.seed(0)
+    args = TextConfig(
+        model_type="qwen3_5_text",
+        hidden_size=512,
+        intermediate_size=1024,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=64,
+        linear_value_head_dim=64,
+        linear_conv_kernel_dim=4,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        rms_norm_eps=1e-6,
+        vocab_size=512,
+        num_key_value_heads=1,
+        max_position_embeddings=256,
+        full_attention_interval=2,
+        head_dim=128,
+        tie_word_embeddings=False,
+    )
+    model = LanguageModel(args)
+    nn.quantize(
+        model,
+        group_size=64,
+        bits=4,
+        class_predicate=lambda _, m: isinstance(m, nn.Linear),
+    )
+    model.set_dtype(mx.bfloat16)
+    mx.eval(model.parameters())
+    return model
+
+
+def _greedy_rows(model, processor, prompts, batch_invariant):
+    model._position_ids = None
+    model._rope_deltas = None
+    gen = BatchGenerator(
+        model,
+        processor,
+        max_tokens=12,
+        completion_batch_size=len(prompts),
+        prefill_batch_size=len(prompts),
+        compute_logprobs=True,
+        greedy_sampling=True,
+        batch_invariant=batch_invariant,
+    )
+    try:
+        embeds = [
+            {"inputs_embeds": model.model.embed_tokens(mx.array([p]))} for p in prompts
+        ]
+        uids = gen.insert(
+            [list(p) for p in prompts], max_tokens=12, prompt_kwargs=embeds
+        )
+        out = {uid: [] for uid in uids}
+        while gen.has_work:
+            _, responses = gen.next()
+            for r in responses:
+                out[r.uid].append((int(r.token), float(r.token_logprob)))
+        return [out[uid] for uid in uids]
+    finally:
+        gen.close()
+
+
+def test_batch_generator_batch_invariant_rows_match_single_row(mock_processor):
+    """batch_invariant=True: every row equals running that prompt alone (#2518)."""
+    from mlx_vlm.models import batch_invariant
+
+    model = _tiny_quantized_qwen3_5()
+    seen = []
+    original = batch_invariant.linear
+
+    def spy(layer, x):
+        seen.append(batch_invariant.is_enabled())
+        return original(layer, x)
+
+    prompts = [[5, 9, 17, 33, 2 + i] for i in range(4)]
+    with patch.object(
+        importlib.import_module("mlx_vlm.models.qwen3_5.language"),
+        "_batch_invariant_linear",
+        spy,
+    ):
+        single = [_greedy_rows(model, mock_processor, [p], True)[0] for p in prompts]
+        batched = _greedy_rows(model, mock_processor, prompts, True)
+        assert seen and all(seen)
+        seen.clear()
+        plain = _greedy_rows(model, mock_processor, prompts, False)
+        assert seen and not any(seen)
+    # Tokens and their bf16 log-probabilities match the B=1 runs bit for bit.
+    assert batched == single
+    assert not batch_invariant.is_enabled()
+    assert len(plain) == len(prompts)
+
+
+def test_batch_generator_batch_invariant_ignored_for_unsupported_model(
+    mock_model, mock_processor
+):
+    gen = BatchGenerator(
+        mock_model.language_model, mock_processor, batch_invariant=True
+    )
+    try:
+        assert gen.batch_invariant is False
+    finally:
+        gen.close()
