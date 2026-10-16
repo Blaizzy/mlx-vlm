@@ -86,6 +86,7 @@ class DecisionQueueFull(Exception):
 class DecisionJob:
     request: dict
     namespace: object = None
+    allow_single_criterion: bool = False
     future: Future = field(default_factory=Future)
     cancelled: Event = field(default_factory=Event)
 
@@ -138,12 +139,12 @@ class DecisionScheduler:
         self.worker = Thread(target=self._run, name="decision-inference", daemon=True)
         self.worker.start()
 
-    def submit(self, request, *, namespace=None):
+    def submit(self, request, *, namespace=None, allow_single_criterion=False):
         if self.stopping.is_set():
             raise DecisionCancelled("Decision scheduler stopped")
         if not self.slots.acquire(blocking=False):
             raise DecisionQueueFull("Decision request queue is full")
-        job = DecisionJob(request, namespace)
+        job = DecisionJob(request, namespace, allow_single_criterion)
         job.future.add_done_callback(lambda future: self.slots.release())
         try:
             self.queue.put_nowait(job)
@@ -238,6 +239,7 @@ class DecisionScheduler:
                         questions, media = normalize_questions(
                             self.engine.model,
                             body["questions"],
+                            allow_single_criterion=job.allow_single_criterion,
                             **{
                                 k: v
                                 for k, v in body.items()

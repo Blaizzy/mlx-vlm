@@ -40,7 +40,7 @@ check, not evidence that a model is calibrated or equally accurate.
 
 ## Shared scheduling
 
-The `/v1/decisions` endpoint uses a bounded scheduler and the standard model loader:
+Both HTTP endpoints use one bounded scheduler and the standard model loader:
 
 ```sh
 python -m mlx_vlm server --decision-model Cloudflare/clef-flash \
@@ -78,25 +78,29 @@ A full queue returns HTTP 429. Disconnects cancel queued jobs and signal active
 jobs. Shutdown drains the worker. Runtime metrics include decision queue depth
 and active request count.
 
-## HTTP requests
+## TypeSafe System One compatibility
 
-Send the same request schema to `/v1/decisions` or supply it to
-`mlx_vlm.decide --request request.json`:
+`/v1/systemone` adapts shared native predictions to the TypeSafe wire format.
+It retains `noul`, `choice`, and `score`, their confidence formulas, four-decimal
+output rounding, zero output-token usage, and the `x-typesafe-request-id` and
+`x-clef-cached-tokens` headers. `model` and `state` are required in this format.
+Image and video-frame references must be HTTP(S) URLs or image data URLs.
 
 ```json
 {
   "model": "Cloudflare/clef-flash",
   "state": "The checkout service is down",
   "questions": {
-    "outage": {"type": "bool"},
+    "outage": {"type": "noul"},
     "team": {"type": "choice", "criteria": {"technical": "Bugs", "billing": null}},
     "urgency": {"type": "score", "criteria": ["Low", "Medium", "High"]}
   }
 }
 ```
 
-Python callers use `mlx_vlm.predict(model, processor, state, questions)`.
-All interfaces preserve the model's native answers and calibration. HTTP
-requests can omit `model` when a decision model is preloaded; `--model` supplies
-or overrides it for CLI requests. Media can replace `state` when supported by
-the model.
+Use `mlx_vlm.decide --format systemone` for this schema. The previous
+`mlx_vlm.decision` executable, `python -m mlx_vlm decision`, and Python
+`mlx_vlm.decision.systemone(...)` helper remain compatibility entry points.
+The adapter uses unrounded distributions when the backend exposes them;
+otherwise it uses the model's native probabilities. Native `/v1/decisions`
+answers and model-specific calibration remain unchanged.

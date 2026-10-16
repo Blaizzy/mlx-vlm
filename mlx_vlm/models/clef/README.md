@@ -35,7 +35,7 @@ generated. Choice and score answers include `probabilities`, Boolean answers
 the probability of true. `images` and `videos` may be passed to `predict`.
 
 See [shared decision serving](../../../docs/decisions.md) for scheduling,
-state-prefix caching, cancellation, and JSONL evaluation.
+state-prefix caching, cancellation, JSONL evaluation, and the TypeSafe adapter.
 The model retains its native `predict()` and `/v1/decisions` answer schema.
 
 ## Quantization

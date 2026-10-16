@@ -12,6 +12,7 @@ if __name__ == "__main__":
         "generate_audio",
         "convert",
         "decide",
+        "decision",
         "chat",
         "chat_ui",
         "server",

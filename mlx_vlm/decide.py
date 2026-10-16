@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .decision import _validate_question_structure, predict
 from .decision_scheduler import DecisionScheduler
+from .systemone import SystemOneRequest, format_response, native_request
 from .utils import load
 
 
@@ -117,6 +118,8 @@ def _requests(args, parser):
     state = (
         args.state_file.read_text(encoding="utf-8") if args.state_file else args.state
     )
+    if args.format == "systemone" and isinstance(state, str) and state.startswith("@"):
+        state = _json_argument(state)
     questions = (
         json.loads(args.questions_file.read_text(encoding="utf-8"))
         if args.questions_file
@@ -138,6 +141,8 @@ def _validated_body(raw, args):
     body = dict(raw)
     if args.model:
         body["model"] = args.model
+    if args.format == "systemone":
+        return SystemOneRequest.model_validate(body).model_dump(exclude_none=True)
     _validate_question_structure(body.get("questions"))
     if not isinstance(body.get("model"), str) or not body["model"]:
         raise ValueError("Specify a model for each request or with --model")
@@ -148,13 +153,15 @@ def _validated_body(raw, args):
     return body
 
 
-def main(argv=None):
+def main(argv=None, *, default_format="native"):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--model", help="Model path or Hugging Face ID; overrides request files"
     )
     state = parser.add_mutually_exclusive_group()
-    state.add_argument("--state", help="Text to evaluate")
+    state.add_argument(
+        "--state", help="Text to evaluate (legacy format also accepts @JSONFILE)"
+    )
     state.add_argument("--state-file", type=Path)
     questions = parser.add_mutually_exclusive_group()
     questions.add_argument("--questions", type=_json_argument)
@@ -167,6 +174,9 @@ def main(argv=None):
     )
     parser.add_argument("--request", help="JSON/JSONL file; - reads stdin")
     parser.add_argument("--jsonl", action="store_true")
+    parser.add_argument(
+        "--format", choices=["native", "systemone"], default=default_format
+    )
     parser.add_argument("--max-length", type=int)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--prefill-step-size", type=int, default=512)
@@ -195,7 +205,8 @@ def main(argv=None):
     requests = (_validated_body(raw, args) for raw in _requests(args, parser))
     # Retain the simple native CLI's standard load()/predict() contract.
     simple = (
-        args.request is None
+        args.format == "native"
+        and args.request is None
         and not args.compare_model
         and args.max_length is None
         and args.batch_size == 4
@@ -238,12 +249,20 @@ def main(argv=None):
             max_pending=max(64, args.batch_size * 2),
         )
 
+    def submit(queue, body):
+        native = native_request(body) if args.format == "systemone" else body
+        return queue.submit(native, allow_single_criterion=args.format == "systemone")
+
     candidates, inputs, pending = [], [], deque()
     queue = scheduler()
 
-    def emit(job):
+    def emit(body, job):
         output = job.future.result()
-        result = output["response"]
+        result = (
+            format_response(body, output)
+            if args.format == "systemone"
+            else output["response"]
+        )
         print(
             json.dumps(result, indent=None if args.jsonl else 2, ensure_ascii=False),
             file=output_stream,
@@ -256,11 +275,11 @@ def main(argv=None):
         for body in requests:
             if args.compare_model:
                 inputs.append(body)
-            pending.append(queue.submit(body))
+            pending.append((body, submit(queue, body)))
             if len(pending) >= args.batch_size * 2:
-                emit(pending.popleft())
+                emit(*pending.popleft())
         while pending:
-            emit(pending.popleft())
+            emit(*pending.popleft())
     except (OSError, ValueError, KeyboardInterrupt) as error:
         parser.exit(130 if isinstance(error, KeyboardInterrupt) else 2, f"{error}\n")
     finally:
@@ -271,7 +290,7 @@ def main(argv=None):
         queue, reference = scheduler(), []
         try:
             for body in inputs:
-                job = queue.submit({**body, "model": args.compare_model})
+                job = submit(queue, {**body, "model": args.compare_model})
                 reference.append(job.future.result()["probabilities"])
             report = comparison_report(
                 reference,
