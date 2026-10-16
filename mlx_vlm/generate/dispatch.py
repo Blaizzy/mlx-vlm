@@ -876,7 +876,7 @@ def stream_generate(
 
     # Vision feature caching: reuse cached image features across turns
     if vision_cache is not None and image is not None and pixel_values is not None:
-        image_key = processed_image_key(pixel_values, kwargs.get("image_grid_thw"))
+        image_key = processed_image_key(pixel_values, **kwargs)
         cached = vision_cache.get(image_key)
         if cached is not None:
             kwargs["cached_image_features"] = cached

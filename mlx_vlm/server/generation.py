@@ -1645,9 +1645,7 @@ class ResponseGenerator:
             and images is not None
         ):
             data_kwargs["vision_cache"] = self.vision_cache
-            data_kwargs["_image_key"] = processed_image_key(
-                pixel_values, data_kwargs.get("image_grid_thw")
-            )
+            data_kwargs["_image_key"] = processed_image_key(pixel_values, **data_kwargs)
 
         # Always call get_input_embeddings — BatchGenerator requires inputs_embeds
         embed = self.model.get_input_embeddings(

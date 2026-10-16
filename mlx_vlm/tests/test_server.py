@@ -449,7 +449,17 @@ class TestImageProcessingOptions:
         assert response.json()["input_tokens"] == 1024
         _assert_fields(prepare.call_args.kwargs, **options)
 
-    def test_worker_cache_separates_processed_resolutions(self):
+    @pytest.mark.parametrize(
+        "geometry",
+        [
+            "pixel_values",
+            "image_grid_thw",
+            "image_position_ids",
+            "image_grid_hw",
+            "image_permutations",
+        ],
+    )
+    def test_worker_cache_separates_processed_resolutions(self, geometry):
         from mlx_vlm.vision_cache import VisionFeatureCache
 
         cache = VisionFeatureCache()
@@ -457,18 +467,28 @@ class TestImageProcessingOptions:
 
         def embed(ids, pixels, **kwargs):
             key = kwargs["_image_key"]
+            marker = (
+                pixels.shape[0]
+                if geometry == "pixel_values"
+                else kwargs[geometry].item()
+            )
             features = cache.get(key)
             if features is None:
-                features = mx.zeros((pixels.shape[0], 4))
+                features = mx.full((pixels.shape[0], 4), marker)
                 cache.put(key, features)
                 encoded.append(key)
             assert features.shape[0] == pixels.shape[0]
+            assert features[0, 0].item() == marker
             return NS(to_dict=lambda: {"inputs_embeds": features})
 
         gen = _generator(model=NS(get_input_embeddings=embed), vision_cache=cache)
         for size in (256, 1024, 256):
+            inputs = dict(input_ids=mx.array([[1]]), pixel_values=mx.zeros((256, 3)))
+            inputs[geometry] = (
+                mx.zeros((size, 3)) if geometry == "pixel_values" else mx.array([size])
+            )
             gen._gpu_embed(
-                dict(input_ids=mx.array([[1]]), pixel_values=mx.zeros((size, 3))),
+                inputs,
                 images=["same.png"],
             )
         assert len(encoded) == len(cache) == 2
