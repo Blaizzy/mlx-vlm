@@ -45,9 +45,7 @@ _PRE_NORM = """
 def _source(pre_norm: bool) -> str:
     pw = ", pw[R]" if pre_norm else ""
     load_pw = "pw[i] = pre_w[d];" if pre_norm else ""
-    source = (
-        _HEAD
-        + f"""
+    source = _HEAD + f"""
     float v[R], st[R], al[R], be[R]{pw};
     for (int i = 0; i < R; i++) {{
         int d = t + i * TG;
@@ -85,16 +83,13 @@ def _source(pre_norm: bool) -> str:
         sum_sq += s * s;
     }}
 """
-    )
     if pre_norm:
         source += _PRE_NORM
     return source
 
 
 # Only the pre-norm, with the same sums as in norm_add_norm.
-_PRE_NORM_ONLY = (
-    _HEAD
-    + """
+_PRE_NORM_ONLY = _HEAD + """
     float v[R], pw[R];
     float sum_sq = 0.0f;
     for (int i = 0; i < R; i++) {
@@ -107,9 +102,7 @@ _PRE_NORM_ONLY = (
         sum_sq += v[i] * v[i];
     }
     float rstd;
-"""
-    + _PRE_NORM
-)
+""" + _PRE_NORM
 
 
 _NORM_ADD_INPUTS = ["branch", "stream", "alpha", "beta", "post_w", "post_eps"]

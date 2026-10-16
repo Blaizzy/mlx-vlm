@@ -88,9 +88,11 @@ def make_checkpoints(tmp_path, *, indexed_target=True, native_keys=False):
             (
                 "model.language_model." + key[len("language_model.model.") :]
                 if key.startswith("language_model.model.")
-                else key[len("language_model.") :]
-                if key.startswith("language_model.lm_head.")
-                else "model." + key
+                else (
+                    key[len("language_model.") :]
+                    if key.startswith("language_model.lm_head.")
+                    else "model." + key
+                )
             ): value
             for key, value in weights.items()
         }

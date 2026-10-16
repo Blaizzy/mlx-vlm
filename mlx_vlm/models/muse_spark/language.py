@@ -462,9 +462,11 @@ class LanguageModel(nn.Module):
 
     def make_cache(self):
         return [
-            RotatingKVCache(max_size=self.args.sliding_window)
-            if layer.use_sliding
-            else KVCache()
+            (
+                RotatingKVCache(max_size=self.args.sliding_window)
+                if layer.use_sliding
+                else KVCache()
+            )
             for layer in self.layers
         ]
 
@@ -472,9 +474,9 @@ class LanguageModel(nn.Module):
         group = group or mx.distributed.init()
         N = group.size()
         n_kv_heads = self.args.num_key_value_heads
-        assert n_kv_heads % N == 0, (
-            f"group size {N} must divide num_key_value_heads {n_kv_heads}"
-        )
+        assert (
+            n_kv_heads % N == 0
+        ), f"group size {N} must divide num_key_value_heads {n_kv_heads}"
         vocab = self.args.vocab_size
         assert vocab % N == 0, f"group size {N} must divide vocab_size {vocab}"
         self.lm_head = shard_linear(self.lm_head, "all-to-sharded", group=group)
