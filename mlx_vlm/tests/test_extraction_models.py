@@ -113,6 +113,26 @@ def test_sam3_tracker_rope_matches_reference(height, width, theta):
         np.testing.assert_allclose(np.asarray(actual), expected, atol=1e-5)
 
 
+def test_sam3_pixel_decoder_group_norm_matches_reference():
+    from mlx_vlm.models.sam3.segmentation import PixelDecoder
+
+    # Meta sam3/model/maskformer_segmentation.py:PixelDecoder uses
+    # torch.nn.GroupNorm(8, 256), which normalizes contiguous channel groups.
+    groups, dims = 8, 256
+    norm = PixelDecoder(dims).norms[0]
+    rng = np.random.default_rng(0)
+    scale = rng.uniform(0.2, 3.0, dims)
+    shift = rng.uniform(-2.0, 2.0, dims)
+    x = (rng.standard_normal((2, 12, 12, dims)) * scale + shift).astype(np.float32)
+
+    grouped = x.reshape(2, 12, 12, groups, dims // groups)
+    mean = grouped.mean(axis=(1, 2, 4), keepdims=True)
+    var = grouped.var(axis=(1, 2, 4), keepdims=True)
+    expected = ((grouped - mean) / np.sqrt(var + norm.eps)).reshape(x.shape)
+
+    np.testing.assert_allclose(np.asarray(norm(mx.array(x))), expected, atol=1e-4)
+
+
 def test_checkpoint_key_sanitization():
     weights = {
         "encoder.embeddings.LayerNorm.weight": mx.ones((4,)),
