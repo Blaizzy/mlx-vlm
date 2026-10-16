@@ -128,6 +128,7 @@ def test_text_grpo_notebook_trains_evaluates_saves_and_reloads(
     with (
         patch("mlx_vlm.convert") as conversion,
         patch("mlx_vlm.load", side_effect=load),
+        patch("mlx_vlm.trainer.WandBCallback") as wandb_callback,
         patch(
             "datasets.load_dataset",
             return_value=DatasetDict(train=train, valid=valid, test=test),
@@ -180,6 +181,9 @@ def test_text_grpo_notebook_trains_evaluates_saves_and_reloads(
                 )
 
     conversion.assert_not_called()
+    wandb_callback.assert_called_once()
+    wandb_callback.return_value.finish.assert_called_once_with()
+    assert wandb_callback.call_args.kwargs["project_name"] == "mlx-vlm-grpo-text"
     data_loading.assert_called_once_with("mlx-community/simple-grpo")
     assert namespace["MODEL_ID"] == "mlx-community/Qwen3.5-2B-4bit"
     assert namespace["train_rows"]["question"] == train["prompt"]
