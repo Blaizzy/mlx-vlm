@@ -199,6 +199,7 @@ def _model_type_from_id(model: str) -> str:
         "zimage": "z_image",
         "ming": "ming_image",
         "mingimage": "ming_image",
+        "moss": "moss_image",
         "ernie": "ernie_image",
         "ideogram": "ideogram4",
         "qwen": "qwen_image",

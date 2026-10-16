@@ -1104,8 +1104,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
     def _normalize_qk(self, q: mx.array, k: mx.array):
         inv_scale = k.shape[-1] ** -0.5
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        # Upstream L2 normalization adds epsilon to the sum of squares;
+        # RMSNorm adds it to the mean, so divide epsilon by the head width.
+        eps = 1e-6 / k.shape[-1]
+        q = (inv_scale**2) * mx.fast.rms_norm(q, None, eps)
+        k = inv_scale * mx.fast.rms_norm(k, None, eps)
         return q, k
 
     def _project_gates(self, inputs: mx.array):
