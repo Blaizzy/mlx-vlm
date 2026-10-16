@@ -1775,18 +1775,13 @@ QWEN_SANITIZED_KEY = "vision_tower.patch_embed.proj.weight"
 
 
 def _qwen_patch_model(
-    in_channels=3,
-    temporal_patch_size=2,
-    patch_size=4,
-    hidden_size=8,
-    attention_head_dim=16,
+    in_channels=3, temporal_patch_size=2, patch_size=4, hidden_size=8
 ):
     qwen = importlib.import_module("mlx_vlm.models.qwen3_5")
-    text_hidden_size = 2 * attention_head_dim
     text_config = qwen.TextConfig(
         model_type="qwen3_5_text",
-        hidden_size=text_hidden_size,
-        intermediate_size=2 * text_hidden_size,
+        hidden_size=32,
+        intermediate_size=64,
         linear_num_value_heads=4,
         linear_num_key_heads=2,
         linear_key_head_dim=8,
@@ -1799,14 +1794,14 @@ def _qwen_patch_model(
         num_key_value_heads=1,
         max_position_embeddings=128,
         full_attention_interval=2,
-        head_dim=attention_head_dim,
+        head_dim=16,
     )
     vision_config = qwen.VisionConfig(
         model_type="qwen3_5",
         depth=1,
         hidden_size=hidden_size,
         intermediate_size=16,
-        out_hidden_size=text_hidden_size,
+        out_hidden_size=32,
         num_heads=1,
         in_channels=in_channels,
         patch_size=patch_size,
