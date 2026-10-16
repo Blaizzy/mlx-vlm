@@ -468,7 +468,9 @@ def test_qwen35_chunked_projection_matches_dense_scores_and_gradients(vision, ti
     from mlx_vlm.trainer.vlm.grpo.trainer import _cache_frozen_vision
     from mlx_vlm.trainer.vlm.sft.runtime import forward_vlm_logits
 
-    model, _ = _qwen_patch_model()
+    # MLX's fused SDPA VJP needs a supported head dimension and more than
+    # eight query positions; keep this gradient-parity fixture on that path.
+    model, _ = _qwen_patch_model(attention_head_dim=128)
     model.config.image_token_index = model.config.image_token_id = 7
     model.config.video_token_index = model.config.video_token_id = 8
     model.config.vision_start_token_id = 5
@@ -476,7 +478,7 @@ def test_qwen35_chunked_projection_matches_dense_scores_and_gradients(vision, ti
     model.config.text_config.tie_word_embeddings = tied
     nn.quantize(model.language_model, group_size=32, bits=4)
     model = prepare_model_for_training(model, lora_rank=2, lora_alpha=4, verbose=False)
-    ids = [1, 5, 7, 7, 7, 7, 6, 3, 2] if vision else [1, 4, 3, 2]
+    ids = [1, 5, 7, 7, 7, 7, 6, 4, 3, 2] if vision else [1, 4, 4, 4, 4, 4, 4, 4, 3, 2]
     batch = {
         "input_ids": mx.array([ids]),
         "attention_mask": mx.ones((1, len(ids)), dtype=mx.int32),
