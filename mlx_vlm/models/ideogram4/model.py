@@ -11,6 +11,7 @@ from mlx_vlm.generate.image import (
     ImageGenerationRequest,
     ImageGenerationResult,
 )
+from mlx_vlm.generate.image_defaults import ImageSamplingDefaults, image_metadata_path
 
 from .config import (
     IDEOGRAM_4_FP8_REPO_ID,
@@ -20,6 +21,7 @@ from .config import (
 )
 from .download import validate_model_layout
 from .pipeline import Ideogram4ImagePipeline
+from .scheduler import get_preset
 
 
 def resolve_variant(model: str | Ideogram4Variant | None) -> Ideogram4Variant:
@@ -48,6 +50,15 @@ def can_load(model: str) -> bool:
         return False
 
 
+def _defaults_variant(model: str, model_path: Path | None):
+    if model_path is not None:
+        return variant_from_local_path(model_path)
+    try:
+        return resolve_variant(model)
+    except ValueError:
+        return variant_from_local_path(image_metadata_path(model))
+
+
 @dataclass(slots=True)
 class Ideogram4ImageGenerationModel(ImageGenerationModel):
     is_image_generation_model: ClassVar[bool] = True
@@ -57,20 +68,41 @@ class Ideogram4ImageGenerationModel(ImageGenerationModel):
     family: str = "ideogram4"
 
     @property
+    def default_sampling(self) -> ImageSamplingDefaults:
+        return self._preset_defaults(self.pipeline.variant.default_sampler_preset)
+
+    @classmethod
+    def resolve_defaults(
+        cls, model: str, *, model_path: Path | None = None
+    ) -> ImageSamplingDefaults:
+        variant = _defaults_variant(model, model_path)
+        return cls._preset_defaults(variant.default_sampler_preset)
+
+    @staticmethod
+    def _preset_defaults(name: str | None) -> ImageSamplingDefaults:
+        preset = get_preset(name)
+        return ImageSamplingDefaults(preset.num_steps, preset.guidance_schedule[-1])
+
+    @property
     def variant(self) -> str:
         return self.pipeline.variant.name
 
     def generate(self, request: ImageGenerationRequest) -> ImageGenerationResult:
         seed = 0 if request.seed is None else request.seed
-        steps = request.resolve_steps()
-        guidance = request.resolve_guidance()
+        defaults = self._preset_defaults(
+            request.extra.get(
+                "sampler_preset", self.pipeline.variant.default_sampler_preset
+            )
+        )
+        steps = request.resolve_steps(defaults.steps)
+        guidance = request.resolve_guidance(defaults.guidance)
         array, metadata = self.pipeline.generate_array(
             request.prompt,
             seed=seed,
             steps=steps,
             width=request.width,
             height=request.height,
-            guidance=guidance,
+            guidance=request.guidance,
             **request.extra,
         )
         return ImageGenerationResult(

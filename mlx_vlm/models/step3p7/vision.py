@@ -3,13 +3,8 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..rope_utils import rotate_half_even_odd
 from .config import VisionConfig
-
-
-def _rotate_half(x: mx.array) -> mx.array:
-    x = x.reshape(*x.shape[:-1], -1, 2)
-    x1, x2 = x[..., 0], x[..., 1]
-    return mx.stack([-x2, x1], axis=-1).reshape(*x.shape[:-2], -1)
 
 
 def _quick_gelu(x: mx.array) -> mx.array:
@@ -45,7 +40,9 @@ class EncoderRope2D(nn.Module):
         freqs = freqs[None, None, :, :]
         cos = mx.repeat(mx.cos(freqs), 2, axis=-1)
         sin = mx.repeat(mx.sin(freqs), 2, axis=-1)
-        return (q * cos) + (_rotate_half(q) * sin), (k * cos) + (_rotate_half(k) * sin)
+        return (q * cos) + (rotate_half_even_odd(q) * sin), (k * cos) + (
+            rotate_half_even_odd(k) * sin
+        )
 
 
 class EncoderMLP(nn.Module):

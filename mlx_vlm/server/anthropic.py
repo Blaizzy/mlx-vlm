@@ -13,7 +13,12 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..generate import generate, stream_generate
 from ..prompt_utils import apply_chat_template
-from ..tool_parsers import _infer_tool_parser_from_processor, load_tool_module
+from ..tools import (
+    _infer_tool_parser_from_processor,
+    _prepare_chat_tool_choice,
+    load_tool_module,
+    process_tool_calls,
+)
 from ..utils import prepare_inputs
 from .generation import (
     GenerationMetrics,
@@ -21,12 +26,12 @@ from .generation import (
     _build_metrics_envelope,
     _count_prompt_tokens,
 )
-from .openai import _prepare_chat_tool_choice
 from .responses_state import (
     ToolCallStreamState,
+    finish_content_streams,
     make_response_stream_state,
-    process_tool_calls,
     prompt_has_open_thinking,
+    strip_protocol_markers,
 )
 from .runtime import runtime
 from .schemas import AnthropicMessageResponse, AnthropicRequest, AnthropicUsage
@@ -299,29 +304,34 @@ def _anthropic_content_blocks_to_text_and_tools(
     role: str,
     content: Union[str, List[Any]],
     images: List[str],
-) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
+) -> Tuple[
+    Union[str, List[Dict[str, Any]]], List[Dict[str, Any]], List[Dict[str, Any]]
+]:
     if isinstance(content, str):
         return content, [], []
 
-    text_parts: List[str] = []
+    content_parts: List[Dict[str, Any]] = []
+    content_images: List[str] = []
+    tool_images: List[str] = []
     tool_calls: List[Dict[str, Any]] = []
     tool_results: List[Dict[str, Any]] = []
     for raw_item in content or []:
         item = _as_plain_dict(raw_item)
         if not isinstance(item, dict):
             if item is not None:
-                text_parts.append(str(item))
+                content_parts.append({"type": "text", "text": str(item)})
             continue
 
         item_type = item.get("type")
         if item_type == "text":
             text = item.get("text")
             if text:
-                text_parts.append(str(text))
+                content_parts.append({"type": "text", "text": str(text)})
         elif item_type == "image" and role == "user":
             image_ref = _anthropic_image_source_to_ref(item.get("source"))
             if image_ref:
-                images.append(image_ref)
+                content_images.append(image_ref)
+                content_parts.append({"type": "image"})
         elif item_type == "tool_use" and role == "assistant":
             tool_calls.append(_anthropic_tool_use_to_openai(item))
         elif item_type == "tool_result" and role == "user":
@@ -330,7 +340,7 @@ def _anthropic_content_blocks_to_text_and_tools(
                     "role": "tool",
                     "tool_call_id": item.get("tool_use_id"),
                     "content": _anthropic_tool_result_content_to_openai(
-                        item.get("content"), images
+                        item.get("content"), tool_images
                     ),
                     "name": item.get("name"),
                 }
@@ -338,9 +348,18 @@ def _anthropic_content_blocks_to_text_and_tools(
         elif item_type in ("thinking", "redacted_thinking"):
             continue
         elif item.get("text"):
-            text_parts.append(str(item["text"]))
+            content_parts.append({"type": "text", "text": str(item["text"])})
 
-    return "\n".join(text_parts).strip(), tool_calls, tool_results
+    # The caller emits the ordinary message before its tool results; keep the
+    # image payloads in that same order, including interleaved tool_result blocks.
+    images.extend(content_images)
+    images.extend(tool_images)
+    content = (
+        content_parts
+        if content_images
+        else "\n".join(part["text"] for part in content_parts).strip()
+    )
+    return content, tool_calls, tool_results
 
 
 def _anthropic_messages_to_internal(
@@ -356,17 +375,15 @@ def _anthropic_messages_to_internal(
         processed_messages.append({"role": "system", "content": system_text})
 
     for message in request.messages:
-        content_text, tool_calls, tool_results = (
-            _anthropic_content_blocks_to_text_and_tools(
-                message.role, message.content, images
-            )
+        content, tool_calls, tool_results = _anthropic_content_blocks_to_text_and_tools(
+            message.role, message.content, images
         )
-        if content_text or tool_calls or not tool_results:
-            msg: Dict[str, Any] = {"role": message.role, "content": content_text}
+        if content or tool_calls or not tool_results:
+            msg: Dict[str, Any] = {"role": message.role, "content": content}
             if tool_calls:
                 msg["tool_calls"] = tool_calls
-                if not content_text:
-                    msg["content"] = None
+                if not content:
+                    msg["content"] = ""
             processed_messages.append(msg)
         processed_messages.extend(tool_results)
 
@@ -486,7 +503,9 @@ async def anthropic_messages_endpoint(http_request: Request):
             )
         except HTTPException as e:
             return _anthropic_error_response(e.status_code, str(e.detail))
-        tool_parser_type = _infer_tool_parser_from_processor(processor)
+        tool_parser_type = _infer_tool_parser_from_processor(
+            processor, override=request.tool_parser
+        )
         tool_module = load_tool_module(tool_parser_type) if tool_parser_type else None
 
         try:
@@ -561,8 +580,10 @@ async def anthropic_messages_endpoint(http_request: Request):
                     gen_args.thinking_start_token,
                     gen_args.thinking_end_token,
                 )
-                tc_start = tool_module.tool_call_start if tool_module else None
-                tc_end = tool_module.tool_call_end if tool_module else None
+                tc_start = (
+                    tool_module.tool_call_start if tool_module and tools else None
+                )
+                tc_end = tool_module.tool_call_end if tool_module and tools else None
                 tool_call_state = ToolCallStreamState(tc_start, tc_end)
                 message_started = False
 
@@ -742,15 +763,42 @@ async def anthropic_messages_endpoint(http_request: Request):
                             finish_reason = token.finish_reason
                             break
 
+                    tail_reasoning, tail = finish_content_streams(
+                        thinking_state, tool_call_state
+                    )
                     for event in start_message_event():
                         yield event
+                    if tail_reasoning and gen_args.enable_thinking:
+                        yield open_block("thinking")
+                        yield _sse_event(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": block_index,
+                                "delta": {
+                                    "type": "thinking_delta",
+                                    "thinking": tail_reasoning,
+                                },
+                            },
+                        )
+                    if tail:
+                        text_output += tail
+                        yield open_block("text")
+                        yield _sse_event(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": block_index,
+                                "delta": {"type": "text_delta", "text": tail},
+                            },
+                        )
                     yield close_open_block()
 
                     parsed_tool_calls = None
                     if tool_module is not None and tools:
                         tc = process_tool_calls(full_output, tool_module, tools)
-                        if tc["calls"]:
-                            parsed_tool_calls = tc["calls"]
+                        if tc.calls:
+                            parsed_tool_calls = tc.calls
 
                     if parsed_tool_calls:
                         for call in parsed_tool_calls:
@@ -966,13 +1014,19 @@ async def anthropic_messages_endpoint(http_request: Request):
             parsed_tool_calls = None
             if tool_module is not None and tools:
                 tc = process_tool_calls(full_text, tool_module, tools)
-                if tc["calls"]:
-                    parsed_tool_calls = tc["calls"]
+                if tc.calls:
+                    parsed_tool_calls = tc.calls
                     _, content = _split_thinking(
-                        tc["remaining_text"] or "",
+                        tc.remaining_text or "",
                         gen_args.thinking_start_token,
                         gen_args.thinking_end_token,
                         processor=processor,
+                    )
+                    content = strip_protocol_markers(
+                        content,
+                        tool_module,
+                        gen_args.thinking_start_token,
+                        gen_args.thinking_end_token,
                     )
 
             content, stop_sequence = _apply_stop_sequences(
@@ -1101,6 +1155,7 @@ async def anthropic_count_tokens_endpoint(http_request: Request):
                 formatted_prompt,
                 images if images else None,
                 None,
+                **gen_args.preprocessing_kwargs(),
             )
         else:
             image_token_index = getattr(config, "image_token_index", None)
@@ -1109,6 +1164,7 @@ async def anthropic_count_tokens_endpoint(http_request: Request):
                 images=images if images else None,
                 prompts=formatted_prompt,
                 image_token_index=image_token_index,
+                **gen_args.preprocessing_kwargs(),
             )
         return {"input_tokens": _count_prompt_tokens(raw_inputs)}
     except Exception as e:

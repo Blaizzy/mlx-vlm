@@ -1,5 +1,5 @@
 import math
-from typing import Optional, Tuple
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -9,7 +9,7 @@ from ..base import (
     create_attention_mask,
     scaled_dot_product_attention,
 )
-from ..cache import SimpleKVCache
+from ..cache import CacheList, SimpleKVCache
 from .config import TextConfig
 
 
@@ -134,7 +134,7 @@ class NemotronParseDecoderLayer(nn.Module):
         encoder_hidden_states,
         attention_mask=None,
         encoder_attention_mask=None,
-        cache: Optional[Tuple[SimpleKVCache, SimpleKVCache]] = None,
+        cache: Optional[CacheList] = None,
     ):
         # mBART decoder layers are pre-norm: normalize, then attention, then residual.
         residual = hidden_states
@@ -257,7 +257,9 @@ class NemotronParseLanguageModel(nn.Module):
         if cache is None:
             # A comprehension, not list multiplication: each layer must own a
             # distinct (self-attn, cross-attn) cache pair.
-            cache = [(SimpleKVCache(), SimpleKVCache()) for _ in self.decoder.layers]
+            cache = [
+                CacheList(SimpleKVCache(), SimpleKVCache()) for _ in self.decoder.layers
+            ]
 
         # Prefer the tokenized prompt as the decoder seed when the caller
         # provided one (the HF reference routes the prompt into
@@ -370,4 +372,4 @@ class LanguageModel(nn.Module):
         return self.config.decoder_attention_heads
 
     def make_cache(self):
-        return [(SimpleKVCache(), SimpleKVCache()) for n in self.layers]
+        return [CacheList(SimpleKVCache(), SimpleKVCache()) for _ in self.layers]

@@ -144,8 +144,9 @@ class ZImagePipeline:
         z = (z / self.config.vae.scaling_factor) + self.config.vae.shift_factor
         decoded = self.vae.decode(z)
         mx.eval(decoded)
-        image = mx.clip(decoded[0] / 2.0 + 0.5, 0.0, 1.0)
-        return mx.round(image * 255.0).astype(mx.uint8)
+        images = mx.clip(decoded / 2.0 + 0.5, 0.0, 1.0)
+        images = mx.round(images * 255.0).astype(mx.uint8)
+        return images[0] if images.shape[0] == 1 else images
 
     def generate_array(
         self,
@@ -158,6 +159,7 @@ class ZImagePipeline:
         guidance: float = 0.0,
         negative_prompt: str | None = None,
         cfg_truncation: float = 1.0,
+        num_images: int = 1,
     ) -> mx.array:
         for name, value in (("width", width), ("height", height)):
             if value < 16 or value % 16:
@@ -170,6 +172,8 @@ class ZImagePipeline:
             raise ValueError(
                 f"Z-Image cfg_truncation must be in [0, 1], got {cfg_truncation}"
             )
+        if num_images < 1:
+            raise ValueError(f"Z-Image num_images must be at least 1, got {num_images}")
 
         cap_feats, negative_cap_feats = self._encode_conditioning(
             prompt,
@@ -182,7 +186,7 @@ class ZImagePipeline:
         latent_h = 2 * (height // (vae_scale * 2))
         latent_w = 2 * (width // (vae_scale * 2))
         latents = mx.random.normal(
-            (1, 16, 1, latent_h, latent_w),
+            (num_images, 16, 1, latent_h, latent_w),
             key=mx.random.key(seed),
             dtype=mx.float32,
         )

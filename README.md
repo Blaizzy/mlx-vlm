@@ -51,16 +51,24 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | LocateAnything | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/locateanything/README.md) |
 | Moondream2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/moondream2/README.md) |
 | Moondream3 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/moondream3/README.md) |
+| EmbeddingGemma 2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/embedding_gemma2/README.md) |
 | Gemma 4 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/gemma4/README.md) |
 | MiniMax M3 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minimax_m3_vl/README.md) |
 | Falcon-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/falcon_ocr/README.md) |
+| IndicOCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/indic_ocr/README.md) |
+| PP-DocLayoutV3 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/pp_doclayout_v3/README.md) |
 | Granite Vision 3.2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite_vision/README.md) |
 | Granite 4.0 Vision | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite4_vision/README.md) |
+| MiniCPM-V 4.7 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minicpmv4_7/README.md) |
 | MiniCPM-V 4.6 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minicpmv4_6/README.md) |
 | GLiNER2.5 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/gliner2_5/README.md) |
+| BERT | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/bert/README.md) |
 | LLaVA-OneVision | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/llava_onevision/README.md) |
 | K2-Horizon | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/k2_horizon/README.md) |
 | Z1T-0 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/z1t/README.md) |
+| Spark-X2.5 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/spark2_5/README.md) |
+| Ternary Bonsai 2 | [Docs](mlx_vlm/models/prism_hadamard_qwen35/README.md) |
+| Nemotron 3.5 Super VL / Bolt / Nano Omni | [Docs](mlx_vlm/models/nemotron_h_nano_omni/README.md) |
 
 ## Installation
 
@@ -92,7 +100,7 @@ This repo ships an agent-skills bundle under `skills/` for common MLX-VLM workfl
 | `add-new-model` | Port a new architecture into `mlx_vlm/models` — config, weight-name mapping, reuse a similar model, add a test class. |
 | `benchmarking` | Produce credible, reproducible perf numbers and fork-vs-main A/B tables for PRs. |
 | `contributing` | Shape a change to pass review — code/config/test placement, pre-commit hooks, and PR expectations. |
-| `hf-cache-models` | List MLX-VLM-supported (and, with `--check-arch`, loadable) models in the local Hugging Face cache. |
+| `hf-cache-models` | List cached, custom, and loaded models through the server's model discovery endpoint. |
 | `reproducible-github-issues` | Turn CLI or server failures into concise, reproducible GitHub issues. |
 
 Validate the bundle at any time:
@@ -129,11 +137,14 @@ mlx_vlm.generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 10
 # Image generation
 mlx_vlm.generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 100 --temperature 0.0 --image http://images.cocodataset.org/val2017/000000039769.jpg
 
-# Audio generation (New)
+# Audio understanding
 mlx_vlm.generate --model mlx-community/gemma-3n-E2B-it-4bit --max-tokens 100 --prompt "Describe what you hear" --audio /path/to/audio.wav
 
-# Multi-modal generation (Image + Audio)
+# Multi-modal understanding (Image + Audio)
 mlx_vlm.generate --model mlx-community/gemma-3n-E2B-it-4bit --max-tokens 100 --prompt "Describe what you see and hear" --image /path/to/image.jpg --audio /path/to/audio.wav
+
+# Speech generation
+mlx_vlm.generate --model openbmb/MiniCPM-o-4_5 --output-modality audio --prompt "Say hello." --ref-audio /path/to/voice.wav --output speech.wav --max-tokens 256
 ```
 
 #### Thinking Budget
@@ -373,6 +384,33 @@ tool-call parsing, MSA index caches, and MXFP8 config loading. See
 [`mlx_vlm/models/minimax_m3_vl/README.md`](mlx_vlm/models/minimax_m3_vl/README.md)
 for model-specific conversion and runtime notes.
 
+#### Reading the server's draft counters
+
+With a drafter loaded, `mlx_vlm.server` adds four fields to a response's
+`timings`, named after llama.cpp's:
+
+| Field | Meaning |
+|---|---|
+| `draft_kind` | The drafter family that ran |
+| `draft_rounds` | Verification rounds: target forward passes after the prefill |
+| `draft_n` | Tokens proposed, `--draft-block-size` minus one per round (the block includes the anchor token) |
+| `draft_n_accepted` | Proposed tokens the target's greedy choice matched |
+
+`draft_n_accepted` is a measure of the drafter, not of the output. A round
+is recorded when the target verifies it, before the stop token or `max_tokens`
+cuts the reply, so matches past the end of the reply are counted and the field
+can exceed `predicted_n`. `predicted_n - draft_n_accepted` is therefore not
+the number of target forward passes. Use `draft_rounds`:
+
+```text
+accept_length = (predicted_n - 1) / draft_rounds
+```
+
+The first token comes from the prefill, before any draft exists, so it is
+left out of the numerator. The three counters are differences of a tally kept
+on the drafter, so they belong to one request only when one request is in
+flight; with concurrent requests they are shared across the batch.
+
 ### Chat UI with Gradio
 
 The Gradio chat UI requires the optional `ui` extra, which the base `mlx-vlm`
@@ -473,6 +511,54 @@ output = generate(model, processor, formatted_prompt, image, audio=audio, verbos
 print(output)
 ```
 
+
+### Decision models
+
+Run shared typed decision prediction from the CLI:
+
+```sh
+python -m mlx_vlm decide --model nativ-community/decider-2b \
+  --state "Please refund my duplicate charge" \
+  --questions '{"department":{"type":"choice","instructions":"Which team should handle this ticket?","criteria":["billing","technical","sales"]}}'
+```
+
+Use `--state-file request.txt` for UTF-8 text and `--questions-file questions.json`
+for named questions. `mlx_vlm.decide` runs the same command.
+
+Models that read images take a repeatable `--image`, and models that read
+speech take one `--audio` (each a path or URL). The state is optional when
+media are given:
+
+```sh
+python -m mlx_vlm decide --model LiquidAI/d1-omni-600M \
+  --image http://images.cocodataset.org/val2017/000000039769.jpg \
+  --questions '{"cats":{"type":"choice","instructions":"How many cats are there?","criteria":["one","two","more"]}}'
+python -m mlx_vlm decide --model LiquidAI/d1-omni-600M \
+  --audio https://huggingface.co/datasets/Narsil/asr_dummy/resolve/main/1.flac \
+  --questions '{"speaking":{"type":"bool","instructions":"Is anyone speaking in this clip?"}}'
+```
+
+Preload a decision model in the existing server:
+
+```sh
+python -m mlx_vlm server --decision-model nativ-community/decider-2b
+curl http://localhost:8080/v1/decisions \
+  -H 'Content-Type: application/json' \
+  -d '{"state":"Please refund my duplicate charge","questions":{"department":{"type":"choice","instructions":"Which team should handle this ticket?","criteria":["billing","technical","sales"]}}}'
+```
+
+An explicit `model` in the request selects a checkpoint; otherwise the currently
+loaded decision model is used. Without either, the endpoint returns HTTP 400.
+Requests may add `"images"`, a list of URLs, paths, or data URIs, or `"audio"`,
+one URL, path, or base64 data URI; `state` may then be `null`. Decision requests
+are non-streaming and use the server's API-key authentication.
+
+Both interfaces return the shared `predict()` result and preserve model-specific
+scoring. Decider, Laya, [d1-3B](mlx_vlm/models/d1/README.md), and
+[d1-omni-600M](mlx_vlm/models/d1_omni/README.md) support `choice`, `bool`, and
+`score`; the two LiquidAI d1 models also read images, and d1-omni reads speech.
+Consult each model's README for criteria and calibration details.
+
 ### Server (FastAPI)
 
 Start the server:
@@ -507,8 +593,8 @@ mlx_vlm.server --model Qwen/Qwen3.5-4B \
 # Require bearer authentication for API endpoints
 mlx_vlm.server --api-key <secret-token>
 
-# Opt into shared Hugging Face cache model discovery
-mlx_vlm.server --model-discovery hf-cache
+# Include local models outside the Hugging Face cache
+mlx_vlm.server --model-dir /Volumes/Models --model-dir ~/my-custom-model
 ```
 
 #### Server Options
@@ -518,8 +604,9 @@ mlx_vlm.server --model-discovery hf-cache
 - `--tts-model`: Preload a text-to-speech model at server startup
 - `--stt-model`: Preload a speech-to-text model at server startup
 - `--embedding-model`: Preload an embedding model at server startup
+- `--decision-model`: Preload a decision model at server startup
 - `--reranker-model`: Preload a supported reranker model at server startup
-- `--model-discovery`: Models exposed by `/v1/models`; `served` lists only models loaded by this process (default), while `hf-cache` also scans the shared Hugging Face cache
+- `--model-dir`: Additional model folder or parent containing model folders to include in discovery; repeat for multiple paths. Overrides `MLX_VLM_MODEL_PATHS` (paths separated by `os.pathsep`, `:` on macOS/Linux)
 - `--adapter-path`: Path for adapter weights to use with the preloaded model
 - `--draft-model`: Speculative drafter path or HF id (e.g. `z-lab/Qwen3.8-27B-DFlash2`, `z-lab/Qwen3.5-4B-DFlash`, `RedHatAI/gemma-4-31B-it-speculator.eagle3`, `google/gemma-4-31B-it-assistant`, `Inferact/MiniMax-M3-EAGLE3`) — enables speculative decoding for ~2× or higher throughput
 - `--draft-kind`: Drafter family — `dflash` (default), `eagle3`, or `mtp` (native/assistant MTP)
@@ -538,9 +625,50 @@ mlx_vlm.server --model-discovery hf-cache
 - `--kv-group-size`: Group size for uniform KV cache quantization (default: `64`)
 - `--max-kv-size`: Maximum KV cache size in tokens
 - `--vision-cache-size`: Max number of cached vision features (default: `20`)
+- `--min-pixels` / `--max-pixels`: Default minimum/maximum input image pixel area for processors that support these options (also `MLX_VLM_MIN_PIXELS` / `MLX_VLM_MAX_PIXELS`). Unset values use the model's preprocessing defaults.
 - `--log-progress-interval`: Decoded tokens between progress log messages; `0` disables periodic decode progress (default: `10`)
 - `--api-key`: Bearer token required for inference, model discovery, and management endpoints
 - `--log-level`: Logging level — `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (default: `INFO`)
+
+For higher-resolution image input, including OCR with Bonsai 2, set pixel-area
+defaults at startup:
+
+```sh
+mlx_vlm.server --model prism-ml/Ternary-Bonsai-2-2B-mlx-2bit \
+  --min-pixels 1048576 --max-pixels 4194304
+```
+
+Chat Completions, Responses, and Messages requests can override these defaults
+with top-level `min_pixels` and `max_pixels` fields (use `extra_body` with an
+OpenAI client). For example, `"min_pixels": 1048576` requests at least 1024 × 1024
+pixels of area, preserving aspect ratio and rounding to the processor's patch
+size. On Bonsai 2 this corresponds to approximately 1024 image tokens. Higher
+resolution uses more context, memory, and processing time. Both limits must be
+positive and the effective minimum must not exceed the maximum. Omitted or null
+request values inherit the server defaults.
+
+Change these defaults on a running server without restarting or reloading the
+model:
+
+```sh
+curl -X PATCH http://localhost:8080/v1/settings \
+  -H 'Content-Type: application/json' \
+  -d '{"min_pixels": 1048576, "max_pixels": 4194304}'
+```
+
+Use `GET /v1/settings` to inspect the current values. New requests inherit the
+updated limits; requests already queued for generation keep their resolved
+options, and per-request overrides still take precedence. The pair is updated
+atomically; invalid limits appear in `rejected` and leave both limits unchanged.
+Set either setting to `null` to use that limit from the model's preprocessing
+configuration. Updates last until the server restarts; the
+`{"op": "replace", "values": {}}` form resets **all** runtime settings to their
+startup defaults, including CLI pixel limits. Include
+`Authorization: Bearer <key>` when the server has an API key configured.
+
+The existing `resize_shape` request field also applies before image processing
+in the batching server. Processor pixel limits still apply afterward. Token
+counting and streaming context checks use the same options as generation.
 
 At `INFO`, the server logs request start/completion, chunked-prefill progress,
 time to first token, periodic decode throughput, and the final token counts. Set
@@ -875,7 +1003,9 @@ APC_NUM_BLOCKS=4096 \
 mlx_vlm.server --model Qwen/Qwen3-VL-4B-Instruct --kv-bits 8 --port 8080
 ```
 
-Enable the persistent disk tier:
+APC persists caches to disk by default when enabled, under
+`$MLX_VLM_CACHE_HOME/apc` (or `~/.cache/mlx-vlm/apc`), with a 20 GiB cap per
+model namespace. Customize the location and cap:
 
 ```sh
 APC_ENABLED=1 \
@@ -911,6 +1041,52 @@ curl http://localhost:8080/v1/cache/stats
 curl -X POST http://localhost:8080/v1/cache/reset
 ```
 
+`restored_tokens` counts prefix tokens successfully materialized for generation
+across block and exact caches, in memory or on disk. A lookup alone does not
+increase it, nor does a failed batch restore. A successful restore remains counted
+if the request later fails or is cancelled.
+The previous `served_tokens` block-storage count is now `stored_tokens`;
+`token_hit_rate` retains its existing calculation,
+`matched_tokens / (matched_tokens + stored_tokens)`.
+
+Configure APC on a running server with `PATCH /v1/settings`. Use
+`GET /v1/settings` to discover supported settings and read their current values:
+
+```sh
+curl http://localhost:8080/v1/settings
+
+curl -X PATCH http://localhost:8080/v1/settings \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "apc_enabled": true,
+    "apc_disk_enabled": true,
+    "apc_memory_max_gb": 2,
+    "apc_disk_max_gb": 20,
+    "apc_checkpoint_interval_tokens": 1024
+  }'
+```
+
+The endpoint also accepts `apc_memory_reserve_gb`, `apc_disk_queue_max_gb`,
+`apc_disk_path`, `apc_disk_shard_max_blocks`, `apc_block_size`, `apc_num_blocks`,
+`apc_checkpoint_entries`, and `apc_checkpoint_guard_tokens`. When
+`MLX_VLM_SERVER_API_KEY` is configured, include `Authorization: Bearer <key>`.
+
+Settings apply on the next text-generation request through the existing model
+reload path; the server process stays running. Reloading clears resident caches
+and retires the previous disk writer after its generation worker finishes.
+Existing disk files remain available. Updating APC options while APC is disabled
+stages them for the next enable. The response reports `applied`, `rejected`,
+`reload_kinds`, and the resulting settings; invalid sizes are rejected without
+changing those values. Unchanged settings do not trigger a reload.
+
+Use `null` for automatic memory budgets or the default disk path/cap. Zero has
+specific meanings: `apc_memory_max_gb: 0` retains caches only on disk,
+`apc_disk_max_gb: 0` removes the disk cap, and `apc_disk_queue_max_gb: 0` writes
+synchronously. An empty `apc_disk_path` or `apc_disk_enabled: false` disables
+persistence. PATCH merges with current settings; the optional
+`{"op": "replace", "values": {...}}` form first restores startup environment
+defaults. `/v1/cache/stats` shows the active manager after the next request.
+
 Common APC environment variables:
 
 | Variable | Default | Description |
@@ -918,10 +1094,16 @@ Common APC environment variables:
 | `APC_ENABLED` | `0` | Set to `1` to enable APC |
 | `APC_NUM_BLOCKS` | `2048` | Number of in-memory APC blocks |
 | `APC_BLOCK_SIZE` | `16` | Tokens per APC block |
-| `APC_CHECKPOINT_ENTRIES` | `2` | In-memory checkpoint entries for hybrid/stateful cache layouts |
+| `APC_CHECKPOINT_ENTRIES` | `2` | In-memory checkpoint entries; also bounds snapshots captured per hybrid prompt (disk-only mode captures two) |
 | `APC_CHECKPOINT_GUARD_TOKENS` | `1` | Tokens retained after a reusable hybrid checkpoint boundary; the default preserves the normal final-token prefill boundary |
-| `APC_DISK_PATH` | unset | Directory for persistent disk shards |
-| `APC_DISK_MAX_GB` | `0` | Disk cap in GB; `0` means uncapped |
+| `APC_CHECKPOINT_INTERVAL_TOKENS` | `2048` | Spacing of intermediate hybrid checkpoints, rounded up to a multiple of `APC_BLOCK_SIZE`; `0` keeps only the final checkpoint |
+| `APC_MEMORY_MAX_GB` | auto | Resident block and checkpoint budget in GiB: 10% of Metal's recommended working set, capped at 8 GiB; `0` retains caches only on disk |
+| `APC_MEMORY_RESERVE_GB` | auto | Additional memory headroom in GiB: 10% of Metal's recommended working set, at least 1 GiB |
+| `APC_DISK_ENABLED` | `1` | Set to `0` to disable disk persistence |
+| `MLX_VLM_CACHE_HOME` | `~/.cache/mlx-vlm` | Base cache directory; APC uses its `apc` subdirectory unless `APC_DISK_PATH` is set |
+| `APC_DISK_PATH` | cache directory above | Directory for persistent disk shards; an empty value disables persistence |
+| `APC_DISK_MAX_GB` | `20` | Disk cap per model namespace in GiB; `0` means uncapped |
+| `APC_DISK_QUEUE_MAX_GB` | `1` | Maximum tensor bytes held by queued disk writes in GiB; larger writes run synchronously; `0` makes all writes synchronous |
 | `APC_DISK_SHARD_MAX_BLOCKS` | `256` | Max blocks per disk segment shard |
 | `APC_MAX_POOL_TENSORS` | `450000` | Stops adding memory blocks before the Metal resource limit; disk writes continue |
 | `APC_LAYER_MAJOR_MEMORY_MIN_TOKENS` | `50000` | Store long warm-memory prefixes as compact layer-major snapshots instead of per-block tensors |
@@ -930,6 +1112,44 @@ Common APC environment variables:
 
 Custom cache layouts can opt in without APC model-name checks by implementing `prefix_cache_snapshot()` and `prefix_cache_restore(snapshot)`. In-tree dense, sliding-window, recurrent, composite, VLM, and Omni cache layouts are detected automatically. APC works with `--kv-bits` (including TurboQuant): the live KV cache stays quantized; pageable APC K/V blocks are stored as dequantized float K/V, so block-pool size does not shrink with quant.
 When APC is enabled on the server, a non-fatal layout self-check runs at model load.
+
+Requests with a shared document and different questions can reuse their common
+prefix. Dense K/V caches, including compact layer-major memory snapshots, match
+complete blocks before the first differing token. Hybrid, recurrent and sliding
+window caches must restore a state captured before that divergence: their final
+state cannot be rolled back by slicing K/V tensors.
+
+Hybrid prefill now captures intermediate checkpoints as well as the final guard
+checkpoint, in streaming, continuous batching and DiffusionGemma generation.
+With the defaults, each prompt stores its latest 2,048-token boundary before the
+final checkpoint and the final checkpoint itself. For example, a 30,000-token
+document followed by 20 instruction tokens can reuse 28,672 tokens when the
+instructions change. The same checkpoints persist across server restarts when
+the disk tier is enabled.
+
+Captures are bounded by `APC_CHECKPOINT_ENTRIES` to avoid copying the growing
+hybrid cache at every prefill chunk. More entries retain more earlier boundaries;
+a smaller interval gives finer reuse near the end. Reuse still requires a
+retained boundary before the divergence. Short prompts below the interval,
+divergence before the earliest retained checkpoint, and evicted checkpoints can
+miss. Media checkpoints include all media tokens so the remaining suffix is text.
+Changing checkpoint boundaries can change floating-point execution shapes, as
+with other chunked or cached prefill paths.
+
+The resident byte budget includes exact snapshots as well as pageable blocks.
+Before embeddings and prefill, APC drains pending disk writes and evicts idle
+checkpoints and blocks in LRU order within each tier. Admission uses current
+Metal allocations, available system RAM, and the incoming prompt's estimated
+cache growth, based on observed bytes per token. Leased blocks remain valid for
+active requests. Snapshots that exceed the budget are written directly to disk
+without making another resident copy, and disk restores stay out of the memory
+LRU when promotion would exceed the budget. Disk pressure may therefore trade
+latency for lower memory use.
+
+These controls limit APC's memory overhead; model weights and an individual
+request must still fit in memory. Tune the reserve for models with larger
+prefill or vision temporaries. `/v1/cache/stats` reports resident bytes,
+the memory budget, prefill reserve, memory evictions, and pending disk bytes.
 
 #### KV Cache Quantization
 
@@ -1117,10 +1337,12 @@ Structured outputs are not currently supported with speculative decoding.
 
 #### Available Endpoints
 
-- `/models` and `/v1/models` - List models intentionally served by this process
+- `/models` and `/v1/models` - Discover cached and local models, including their loaded status; accepts repeated `model_dir` query parameters
 - `/chat/completions` and `/v1/chat/completions` - OpenAI-compatible chat-style interaction endpoint with support for images, audio, and text
 - `/responses` and `/v1/responses` - OpenAI-compatible responses endpoint
+- `/responses/compact` and `/v1/responses/compact` - Compact conversation history into replayable state; see [compaction and APC](docs/usage.md#conversation-compaction-and-apc)
 - `/embeddings` and `/v1/embeddings` - OpenAI-compatible embeddings endpoint backed by native MLX embedding models
+- `/v1/decisions` - Predict named typed decisions using the shared decision API
 - `/v1/rerank` - Rank text or multimodal documents by relevance to a query
 - `/audio/speech` and `/v1/audio/speech` - OpenAI-compatible text-to-speech endpoint backed by `mlx-audio` TTS models
 - `/audio/transcriptions` and `/v1/audio/transcriptions` - OpenAI-compatible speech-to-text endpoint backed by `mlx-audio` STT models
@@ -1138,10 +1360,38 @@ Structured outputs are not currently supported with speculative decoding.
 curl "http://localhost:8080/models"
 ```
 
-By default, model discovery is isolated from the shared Hugging Face cache so
-models downloaded by other applications are not advertised by this server.
-Use `--model-discovery hf-cache` (or
-`MLX_VLM_MODEL_DISCOVERY=hf-cache`) to enable cache-wide model discovery.
+`/models` and `/v1/models` list loaded models and local model candidates from the
+Hugging Face cache and any configured or request-specific model directories. Each entry includes
+`loaded: true` when the model is currently loaded in this server process, or
+`loaded: false` when it is discovered but not loaded. Discovery does not load
+models or guarantee that every discovered architecture is supported.
+
+Discovery reads model metadata (`config.json`, or `model_index.json` for image
+pipelines) and checks for nonempty safetensors files. Sharded checkpoints must
+have every shard referenced by their weight index. Tokenizer metadata is not
+required, and checkpoint Python code is never executed by discovery.
+
+All cached revisions are considered, preferring `main`. If only another revision
+is usable, the entry's ID is its absolute snapshot path so selecting it uses that
+local revision. Custom models also use absolute paths. Symlink aliases and
+loaded local models are deduplicated by their resolved directory.
+
+Each `--model-dir` can be a model folder or a parent whose immediate children
+are model folders; it does not recursively scan arbitrary directories. Missing
+paths and invalid model folders are skipped. Hugging Face's `HF_HUB_CACHE` and
+`HF_HOME` settings select a custom Hugging Face cache directory as usual.
+
+You can also pass directories directly to either models endpoint:
+
+```sh
+curl --get "http://localhost:8080/v1/models" \
+  --data-urlencode "model_dir=/Volumes/Models" \
+  --data-urlencode "model_dir=/Users/me/my custom model"
+```
+
+These paths refer to the server's filesystem. They supplement the cache and
+configured directories for this request only; they do not change server settings.
+Use repeated `model_dir` parameters for multiple paths. Empty values are ignored.
 
 ##### Embeddings
 
@@ -1154,7 +1404,7 @@ curl -X POST "http://localhost:8080/v1/embeddings" \
   }'
 ```
 
-Preload a default with `--embedding-model <repo-or-path>`. Supported architectures: BERT, XLM-RoBERTa, ModernBERT, Qwen3-Embedding, EmbeddingGemma (gemma3), LFM2, SigLIP (text), Qwen3-VL-Embedding, and Llama-Nemotron-VL, plus LLM2Vec bidirectional Llama. ColBERT-style multi-vector models (ColIdefics3, ColQwen2.5) are also available for late-interaction use.
+Preload a default with `--embedding-model <repo-or-path>`. Supported architectures: BERT, XLM-RoBERTa, ModernBERT, Qwen3-Embedding, EmbeddingGemma (gemma3), LFM2, SigLIP (text), Qwen3-VL-Embedding, and Llama-Nemotron-VL, plus LLM2Vec bidirectional Llama. ColBERT-style multi-vector models (ColIdefics3, ColQwen2.5, LFM2-ColBERT) are also available for late-interaction use.
 
 ##### Reranking
 
@@ -1441,6 +1691,7 @@ The following models support video chat:
 4. LLaVA
 5. MiniMax M3
 6. LLaVA-OneVision
+7. Mage-VL
 
 With more coming soon.
 
@@ -1616,13 +1867,29 @@ See [docs/usage.md](https://github.com/Blaizzy/mlx-vlm/blob/main/docs/usage.md#d
 
 # Fine-tuning
 
-MLX-VLM supports fine-tuning models with LoRA and QLoRA. Fine-tuning (and the
+MLX-VLM supports VLM SFT, ORPO, and DPO with LoRA, QLoRA, DoRA, or full
+fine-tuning. Fine-tuning (and the
 eval scripts) need the training extra, which is not installed by default:
 
 ```bash
 pip install "mlx-vlm[train]"
 ```
 
-## LoRA & QLoRA
+Train from the CLI with `python -m mlx_vlm.train`:
 
-To learn more about LoRA, please refer to the [LoRA.md](./mlx_vlm/LORA.MD) file.
+```bash
+python -m mlx_vlm.train \
+  --model mlx-community/Qwen2.5-VL-3B-Instruct-4bit \
+  --data data --train-on-completions \
+  --batch-size 1 --gradient-accumulation-steps 4 \
+  --iters 100 --adapter-file adapters/sft/weights.safetensors
+```
+
+For Python and notebooks, import `Trainer`, `VLMTrainingArgs`, and
+`prepare_model_for_training` from `mlx_vlm.trainer`. The CLI and notebook API
+share model preparation and the training engine.
+
+Start with the [SFT notebook](examples/training/sft_text_only.ipynb), or explore the
+[ORPO, DPO, and custom-loss examples](examples/training/README.md). See the
+[training guide](docs/training.md) for dataset formats, configuration, saving,
+resuming, and the existing functional trainer APIs.

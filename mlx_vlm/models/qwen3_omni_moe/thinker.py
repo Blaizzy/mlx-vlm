@@ -8,7 +8,7 @@ from mlx_vlm.models.qwen3_omni_moe.audio import AudioModel
 
 from ..base import InputEmbeddingsFeatures
 from .config import ThinkerConfig
-from .language import LanguageModel
+from .language import LanguageModel, expand_deepstack_visual_embeds
 from .vision import VisionModel
 
 
@@ -237,38 +237,27 @@ class Thinker(nn.Module):
                 video_mask_flat = mx.reshape(
                     video_mask[..., 0] if video_mask.ndim == 3 else video_mask, (-1,)
                 )
-                visual_indices_flat = mx.where(visual_mask_flat)[0]
-                image_mask_on_visual = mx.take(
-                    image_mask_flat, visual_indices_flat, axis=0
+                # Locate each modality within the combined visual token sequence.
+                visual_indices = np.where(np.array(visual_mask_flat))[0]
+                image_joint = mx.array(
+                    np.where(np.array(image_mask_flat)[visual_indices])[0], mx.uint32
                 )
-                video_mask_on_visual = mx.take(
-                    video_mask_flat, visual_indices_flat, axis=0
+                video_joint = mx.array(
+                    np.where(np.array(video_mask_flat)[visual_indices])[0], mx.uint32
                 )
-                image_indices = mx.where(image_mask_on_visual)[0]
-                video_indices = mx.where(video_mask_on_visual)[0]
 
                 visual_embeds_multiscale_joint = []
                 for img_embed, vid_embed in zip(
                     visual_embeds_multiscale, video_embeds_multiscale
                 ):
                     embed_joint = mx.zeros(
-                        (len(visual_indices_flat), img_embed.shape[-1]),
+                        (len(visual_indices), img_embed.shape[-1]),
                         dtype=img_embed.dtype,
                     )
-                    if len(image_indices) > 0:
-                        embed_joint = mx.scatter(
-                            embed_joint,
-                            image_indices,
-                            mx.take(img_embed, image_indices, axis=0),
-                            axis=0,
-                        )
-                    if len(video_indices) > 0:
-                        embed_joint = mx.scatter(
-                            embed_joint,
-                            video_indices,
-                            mx.take(vid_embed, video_indices, axis=0),
-                            axis=0,
-                        )
+                    if image_joint.size > 0:
+                        embed_joint[image_joint] = img_embed
+                    if video_joint.size > 0:
+                        embed_joint[video_joint] = vid_embed
                     visual_embeds_multiscale_joint.append(embed_joint)
                 visual_embeds_multiscale = tuple(visual_embeds_multiscale_joint)
 
@@ -278,6 +267,24 @@ class Thinker(nn.Module):
         )
         if image_grid_thw is None and video_grid_thw is None and position_ids.ndim == 3:
             position_ids = position_ids[0]
+
+        # Align residuals with token positions for batching and prefill slicing.
+        # Text-only requests use zeros with the same layer and hidden dimensions.
+        if visual_embeds_multiscale:
+            visual_embeds_multiscale = expand_deepstack_visual_embeds(
+                visual_pos_masks, visual_embeds_multiscale, inputs_embeds.dtype
+            )
+        elif self.vision_tower.deepstack_merger_list:
+            visual_embeds_multiscale = mx.broadcast_to(
+                mx.zeros((), dtype=inputs_embeds.dtype),
+                (
+                    *inputs_embeds.shape[:2],
+                    len(self.vision_tower.deepstack_merger_list),
+                    inputs_embeds.shape[-1],
+                ),
+            )
+        else:
+            visual_embeds_multiscale = None
 
         return InputEmbeddingsFeatures(
             inputs_embeds=inputs_embeds,

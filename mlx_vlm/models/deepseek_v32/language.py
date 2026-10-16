@@ -14,7 +14,7 @@ from ..cache import CacheList, KVCache
 from ..mla import MultiLinear, latent_length, max_absorbed_queries
 from ..mlp import DeepseekMLP as DeepseekV32MLP
 from ..rope_utils import initialize_rope
-from ..switch_layers import SwitchGLU
+from ..switch_layers import EXPERT_WEIGHT_SUFFIXES, SwitchGLU
 from .config import ModelConfig
 
 
@@ -256,6 +256,7 @@ def group_expert_select(
 
     k = top_k
     inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+    inds = mx.stop_gradient(inds)
     scores = mx.take_along_axis(orig_scores, inds, axis=-1)
     if top_k > 1 and norm_topk_prob:
         denominator = scores.sum(axis=-1, keepdims=True)
@@ -477,7 +478,7 @@ class Model(nn.Module):
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
             for n, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
-                for k in ["weight", "scales", "biases"]:
+                for k in EXPERT_WEIGHT_SUFFIXES:
                     if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
                         to_join = [
                             weights.pop(f"{prefix}.mlp.experts.{e}.{m}.{k}")

@@ -1,4 +1,6 @@
+from dataclasses import replace
 from functools import lru_cache, partial
+from math import ceil
 from typing import Any, List, Optional
 
 import mlx.core as mx
@@ -98,6 +100,7 @@ def _minimax_moe_select(
 
     biased_scores = scores + correction_bias
     inds = mx.argpartition(-biased_scores, kth=k - 1, axis=-1)[..., :k]
+    inds = mx.stop_gradient(inds)
     weights = mx.take_along_axis(scores, inds, axis=-1)
     weights = weights / (mx.sum(weights, axis=-1, keepdims=True) + 1e-20)
     return inds, weights * routed_scaling_factor
@@ -177,6 +180,7 @@ def _build_sparse_causal_mask_compiled(
     topk_idx = mx.argpartition(-selected_scores, kth=sparse_topk_blocks - 1, axis=-1)[
         ..., :sparse_topk_blocks
     ]
+    topk_idx = mx.stop_gradient(topk_idx)
     topk_valid = mx.take_along_axis(valid_blocks, topk_idx, axis=-1)
 
     block_selected = mx.any(topk_idx[..., None] == blocks, axis=-2)
@@ -261,6 +265,7 @@ def _select_sparse_block_indices_compiled(
     invalid = mx.full(topk_idx.shape, num_blocks, dtype=topk_idx.dtype)
     block_indices = mx.where(topk_valid, topk_idx, invalid)
     order = mx.argsort(block_indices, axis=-1)
+    order = mx.stop_gradient(order)
     block_indices = mx.take_along_axis(block_indices, order, axis=-1)
     return mx.where(block_indices == num_blocks, mx.array(-1), block_indices)
 
@@ -550,7 +555,22 @@ class MiniMaxRMSNorm(nn.Module):
         return mx.fast.rms_norm(x, weight, self.eps)
 
 
+def _minimax_memory_profile(c, token_count):
+    profile = c.kv_cache.memory_profile(token_count)
+    capacity = 0 if c.index_keys is None else c.index_keys.shape[2]
+    index_bytes = c.index_keys.nbytes / capacity if capacity else 0
+    per_token = profile.bytes_per_token + index_bytes
+    return replace(
+        profile,
+        source_bytes=c.nbytes,
+        fixed_bytes=ceil((c.step - 1) * per_token),
+        bytes_per_token=per_token,
+        step=1,
+    )
+
+
 class MiniMaxM3KVCache:
+    memory_profile = _minimax_memory_profile
     step = KVCache.step
 
     def __init__(self):
@@ -678,6 +698,7 @@ class MiniMaxM3KVCache:
 
 
 class MiniMaxM3BatchKVCache:
+    memory_profile = _minimax_memory_profile
     step = BatchKVCache.step
 
     def __init__(self, left_padding):
@@ -761,13 +782,14 @@ class MiniMaxM3BatchKVCache:
         return self.kv_cache.make_mask(*args, **kwargs)
 
     def filter(self, batch_indices):
-        min_left_pad = self.left_padding[batch_indices].min().item()
+        previous_length = self.kv_cache._idx
         self.kv_cache.filter(batch_indices)
+        trimmed = previous_length - self.kv_cache._idx
         if self.index_keys is not None:
             self.index_keys = self.index_keys[batch_indices]
-            if min_left_pad > 0:
-                self.index_keys = self.index_keys[..., min_left_pad:, :]
-                self.index_offset -= min_left_pad
+            if trimmed > 0:
+                self.index_keys = self.index_keys[..., trimmed:, :]
+                self.index_offset -= trimmed
 
     def extend(self, other):
         if not isinstance(other, MiniMaxM3BatchKVCache):

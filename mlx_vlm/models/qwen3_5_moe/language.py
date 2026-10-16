@@ -21,6 +21,7 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
 
         self.num_experts = num_experts = args.num_experts
         self.top_k = args.num_experts_per_tok
+        self.norm_topk_prob = args.norm_topk_prob
 
         self.gate = nn.Linear(dim, num_experts, bias=False)
         self.switch_mlp = SwitchGLU(dim, intermediate_size, num_experts)
@@ -28,20 +29,25 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         self.shared_expert = Qwen3_5MoeMLP(dim, shared_expert_intermediate_size)
         self.shared_expert_gate = nn.Linear(dim, 1, bias=False)
 
+    def _shared_expert_scale(self, x: mx.array) -> mx.array:
+        return mx.sigmoid(self.shared_expert_gate(x))
+
     def __call__(self, x: mx.array) -> mx.array:
         gates = self.gate(x)
         gates = mx.softmax(gates, axis=-1, precise=True)
 
         k = self.top_k
         inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+        inds = mx.stop_gradient(inds)
         scores = mx.take_along_axis(gates, inds, axis=-1)
-        scores = scores / scores.sum(axis=-1, keepdims=True)
+        if self.norm_topk_prob:
+            scores = scores / scores.sum(axis=-1, keepdims=True)
 
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
 
         shared_y = self.shared_expert(x)
-        shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
+        shared_y = self._shared_expert_scale(x) * shared_y
 
         return y + shared_y
 

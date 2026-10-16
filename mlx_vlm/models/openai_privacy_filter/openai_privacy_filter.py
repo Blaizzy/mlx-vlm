@@ -1,17 +1,12 @@
 import math
-from dataclasses import dataclass
 from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..base import TokenClassifierOutput
 from ..switch_layers import SwitchLinear, _gather_sort, _scatter_unsort
 from .config import ModelConfig
-
-
-@dataclass
-class TokenClassifierOutput:
-    logits: mx.array
 
 
 class RMSNorm(nn.Module):
@@ -205,9 +200,17 @@ def _swiglu(gate: mx.array, up: mx.array) -> mx.array:
     return (up + 1.0) * gate * mx.sigmoid(1.702 * gate)
 
 
+class ClippedSwiGLU(nn.Module):
+    """``_swiglu`` under the shared ``activation(x_up, x_gate)`` convention."""
+
+    def __call__(self, x, gate):
+        return _swiglu(gate, x)
+
+
 class Experts(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
+        self.activation = ClippedSwiGLU()
         # Keep the projections split to match existing mlx-community
         # checkpoints. The Hugging Face checkpoint's fused gate/up tensors are
         # split by Model.sanitize before loading.
@@ -248,7 +251,7 @@ class Experts(nn.Module):
         )
         up = self.up_proj(x, sorted_indices, sorted_indices=do_sort).astype(mx.float32)
         output = self.down_proj(
-            _swiglu(gate, up),
+            self.activation(up, gate),
             sorted_indices,
             sorted_indices=do_sort,
         ).astype(mx.float32)
@@ -276,8 +279,10 @@ class MLP(nn.Module):
         indices = mx.argpartition(-logits, kth=self.top_k - 1, axis=-1)[
             ..., : self.top_k
         ]
+        indices = mx.stop_gradient(indices)
         top_logits = mx.take_along_axis(logits, indices, axis=-1)
         order = mx.argsort(-top_logits, axis=-1)
+        order = mx.stop_gradient(order)
         indices = mx.take_along_axis(indices, order, axis=-1)
         top_logits = mx.take_along_axis(top_logits, order, axis=-1)
         weights = mx.softmax(top_logits, axis=-1, precise=True) / self.top_k

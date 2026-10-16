@@ -41,3 +41,4 @@ behavior (used by the MoGe-3 and Video Depth Anything backbones below).
 | --- | --- |
 | `video_depth_anything` | ViT-S/14, ViT-B/14, ViT-L/14 |
 | `moge3` | ViT-L/14, ViT-g/14 |
+| `sam3d_objects` | ViT-L/14 with registers (conditioners)|

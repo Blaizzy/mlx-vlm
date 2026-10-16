@@ -4,6 +4,8 @@ from typing import Optional, Tuple
 
 import mlx.core as mx
 
+from ..interpolate import nearest_indices
+
 
 def _view_plane_axes(
     width: int, height: int, aspect_ratio: float = None
@@ -96,11 +98,6 @@ def _solve_focal_shift(
     return shift.reshape(-1), f
 
 
-def _nearest_indices(in_size: int, out_size: int) -> mx.array:
-    """Torch ``F.interpolate(mode='nearest')`` source indices."""
-    return mx.floor(mx.arange(out_size) * (in_size / out_size)).astype(mx.int32)
-
-
 def recover_focal_shift(
     points: mx.array,
     mask: Optional[mx.array] = None,
@@ -118,8 +115,8 @@ def recover_focal_shift(
 
     # The solver only needs a 64x64 grid, so build the UV map at that size
     # directly instead of subsampling a full-resolution grid.
-    ii = _nearest_indices(height, downsample_size[0])
-    jj = _nearest_indices(width, downsample_size[1])
+    ii = nearest_indices(height, downsample_size[0])
+    jj = nearest_indices(width, downsample_size[1])
     points = points.reshape(-1, height, width, 3)[:, ii][:, :, jj]
     batch = points.shape[0]
     n = downsample_size[0] * downsample_size[1]

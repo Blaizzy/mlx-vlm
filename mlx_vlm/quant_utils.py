@@ -171,20 +171,36 @@ def dequantize_model(model: nn.Module) -> nn.Module:
     Returns:
         nn.Module: The model with dequantized layers.
     """
+    from .models.mla import MultiLinear, QuantizedMultiLinear
     from .models.switch_layers import QuantizedSwitchLinear, SwitchLinear
+    from .quantization.nvfp4 import ScaledQuantizedLinear, ScaledQuantizedSwitchLinear
 
     dequantize_layers = []
     for name, module in model.named_modules():
         bias = "bias" in module
-        if isinstance(module, nn.QuantizedLinear):
+        if isinstance(module, (QuantizedSwitchLinear, ScaledQuantizedSwitchLinear)):
+            kwargs = {"bias": bias}
+            cls = SwitchLinear
+        elif isinstance(module, (nn.QuantizedLinear, ScaledQuantizedLinear)):
             cls = nn.Linear
             kwargs = {"bias": bias}
         elif isinstance(module, nn.QuantizedEmbedding):
             kwargs = {}
             cls = nn.Embedding
-        elif isinstance(module, QuantizedSwitchLinear):
-            kwargs = {"bias": bias}
-            cls = SwitchLinear
+        elif isinstance(module, QuantizedMultiLinear):
+            weight = mx.dequantize(
+                module.weight,
+                module.scales,
+                module.biases,
+                module.group_size,
+                module.bits,
+                module.mode,
+            )
+            num_heads, output_dims, input_dims = weight.shape
+            m = MultiLinear(input_dims, output_dims, num_heads)
+            m.weight = weight
+            dequantize_layers.append((name, m))
+            continue
         else:
             continue
         weight = mx.dequantize(
@@ -195,6 +211,11 @@ def dequantize_model(model: nn.Module) -> nn.Module:
             module.bits,
             module.mode,
         )
+        if isinstance(module, ScaledQuantizedLinear):
+            scale = module.global_scale
+            weight = module.apply_scale(
+                weight, scale.reshape(scale.shape + (1,) * (weight.ndim - scale.ndim))
+            )
         args = weight.shape[::-1]
         m = cls(*args, **kwargs)
         if bias:

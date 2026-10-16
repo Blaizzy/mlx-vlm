@@ -6,13 +6,17 @@ os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 
 from ._stream_cleanup import clear_mlx_streams
 from .convert import convert
+from .decision import predict
 from .generate import (
+    AudioGenerationResult,
     BatchResponse,
     BatchStats,
     GenerationResult,
     PromptCacheState,
     batch_generate,
     generate,
+    generate_audio,
+    save_audio,
     stream_generate,
 )
 from .prompt_utils import apply_chat_template, get_message_json

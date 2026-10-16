@@ -328,7 +328,7 @@ class ZImageTransformer(nn.Module):
                     cap_tokens[:, :cap_len],
                     mx.broadcast_to(
                         self.cap_pad_token,
-                        (B, cap_padding, self.config.hidden_size),
+                        (cap_tokens.shape[0], cap_padding, self.config.hidden_size),
                     ),
                 ],
                 axis=1,
@@ -353,6 +353,8 @@ class ZImageTransformer(nn.Module):
             cap_tokens = block(cap_tokens, cap_cos, cap_sin)
 
         # Unified
+        if cap_tokens.shape[0] != B:
+            cap_tokens = mx.broadcast_to(cap_tokens, (B, *cap_tokens.shape[1:]))
         unified = mx.concatenate([img_tokens, cap_tokens], axis=1)
         unified_cos = mx.concatenate([img_cos, cap_cos], axis=1)
         unified_sin = mx.concatenate([img_sin, cap_sin], axis=1)

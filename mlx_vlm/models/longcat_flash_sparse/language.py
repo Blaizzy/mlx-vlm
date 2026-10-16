@@ -321,6 +321,7 @@ class LongcatFlashMLA(nn.Module):
                     axis=2,
                 )
                 if mask is not None:
+                    topk_indices = mx.stop_gradient(topk_indices)
                     mask = mx.take_along_axis(mask, topk_indices, axis=-1)
             else:
                 shape = list(topk_indices.shape)

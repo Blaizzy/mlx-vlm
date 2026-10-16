@@ -18,6 +18,7 @@ from .image import (
     _normalize_model_type,
     _resolve_image_model_path,
 )
+from .image_defaults import ImageSamplingDefaults
 
 
 @dataclass(slots=True)
@@ -50,6 +51,16 @@ class ImageEditModel(Protocol):
     model_type: ClassVar[str]
     model_id: str
     family: str
+
+    @property
+    def default_sampling(self) -> ImageSamplingDefaults:
+        raise NotImplementedError("This model does not expose image sampling defaults")
+
+    @classmethod
+    def resolve_defaults(
+        cls, model: str, *, model_path: Path | None = None
+    ) -> ImageSamplingDefaults:
+        raise NotImplementedError("This model does not expose image sampling defaults")
 
     @classmethod
     def supports_model(cls, model: str) -> bool: ...

@@ -21,6 +21,21 @@ def get_server_max_tokens():
     return int(os.environ.get("MLX_VLM_MAX_TOKENS", DEFAULT_MAX_TOKENS))
 
 
+_TOOL_PARSER_DESC = (
+    "Force a specific tool-call parser by name, bypassing chat-template inference."
+)
+
+
+def _check_tool_parser(cls, value: Optional[str]) -> Optional[str]:
+    """Reject an unknown ``tool_parser`` override, naming the known parsers."""
+    from ..tools import SPECS
+
+    if value is not None and value not in {spec.name for spec in SPECS}:
+        known = ", ".join(sorted(spec.name for spec in SPECS))
+        raise ValueError(f"unknown tool_parser {value!r}; known parsers: {known}")
+    return value
+
+
 class FlexibleBaseModel(BaseModel):
     """Base model that ignores/accepts any unknown OpenAI SDK fields."""
 
@@ -129,6 +144,18 @@ class ImageEditRequest(FlexibleBaseModel):
     guidance: Optional[float] = Field(
         None,
         description="Classifier-free guidance scale; model default if omitted.",
+    )
+    negative_prompt: Optional[str] = Field(
+        None, description="Negative conditioning prompt; model default if omitted."
+    )
+    output_resolution: Optional[int] = Field(
+        None,
+        ge=256,
+        description="Reference image resolution and default output area scale.",
+    )
+    use_kv_cache: Optional[bool] = Field(
+        None,
+        description="Reuse fixed conditioning keys/values when supported by the model.",
     )
     response_format: Literal["b64_json", "path"] = Field(
         "b64_json",
@@ -248,6 +275,39 @@ class ResponseVideoParam(TypedDict, total=False):
 
 ResizeShapeInput: TypeAlias = Union[Tuple[int], Tuple[int, int]]
 
+
+class ImageProcessingRequest(FlexibleBaseModel):
+    min_pixels: Optional[int] = Field(
+        None,
+        gt=0,
+        description="Minimum image pixel area for supported processors. Overrides the server default.",
+    )
+    max_pixels: Optional[int] = Field(
+        None,
+        gt=0,
+        description="Maximum image pixel area for supported processors. Overrides the server default.",
+    )
+    resize_shape: Optional[ResizeShapeInput] = Field(
+        None,
+        description="Resize images before processing. Provide one integer for square or two dimensions.",
+    )
+
+    @field_validator("resize_shape", mode="before")
+    @classmethod
+    def normalize_resize_shape_field(cls, value):
+        return normalize_resize_shape(value)
+
+    @model_validator(mode="after")
+    def validate_pixel_limits(self):
+        if (
+            self.min_pixels is not None
+            and self.max_pixels is not None
+            and self.min_pixels > self.max_pixels
+        ):
+            raise ValueError("min_pixels must not exceed max_pixels")
+        return self
+
+
 ResponseInputContentParam: TypeAlias = Union[
     ResponseInputTextParam,
     ResponseInputImageParam,
@@ -309,7 +369,12 @@ class ChatMessage(FlexibleBaseModel):
         return self
 
 
-class OpenAIRequest(FlexibleBaseModel):
+class CompactionControl(BaseModel):
+    type: Literal["compaction"]
+    compact_threshold: int = Field(..., gt=0)
+
+
+class OpenAIRequest(ImageProcessingRequest):
     """
     OpenAI-compatible request structure.
     Using this structure : https://github.com/openai/openai-python/blob/main/src/openai/resources/responses/responses.py
@@ -394,9 +459,18 @@ class OpenAIRequest(FlexibleBaseModel):
         None, description="Responses API tool definitions."
     )
     tool_choice: Optional[Any] = Field(None, description="Tool choice policy.")
+    tool_parser: Optional[str] = Field(None, description=_TOOL_PARSER_DESC)
+    _validate_tool_parser = field_validator("tool_parser")(_check_tool_parser)
     store: Optional[bool] = Field(
         True, description="Whether to store this response for later retrieval."
     )
+    context_management: Optional[List[CompactionControl]] = Field(None, max_length=1)
+
+
+class CompactRequest(OpenAIRequest):
+    stream: Literal[False] = False
+    max_output_tokens: int = Field(1024, gt=0, le=16384)
+    keep_tokens: Optional[int] = Field(None, ge=0)
 
 
 class PromptTokensDetails(BaseModel):
@@ -521,6 +595,7 @@ class OpenAIResponse(BaseModel):
     status: Literal["completed", "failed", "in_progress", "incomplete"] = Field(
         ..., description="The status of the response generation"
     )
+    incomplete_details: Optional[dict[str, str]] = None
     error: Optional[OpenAIErrorObject] = Field(
         None,
         description="An error object returned when the model fails to generate a Response",
@@ -659,7 +734,7 @@ StreamEvent = Union[
 # Models for /chat/completion endpoint
 
 
-class VLMRequest(FlexibleBaseModel):
+class VLMRequest(ImageProcessingRequest):
     model: str = Field(
         ...,
         description="The path to the local model directory or Hugging Face repo.",
@@ -786,18 +861,9 @@ class VLMRequest(FlexibleBaseModel):
             "the TOP_LOGPROBS_K env var; values above the cap are clamped."
         ),
     )
-    resize_shape: Optional[ResizeShapeInput] = Field(
-        None,
-        description="Resize shape for the image. Provide one integer for square or two for (height, width).",
-    )
     response_format: Optional[Any] = Field(
         None, description="OpenAI-compatible response_format for structured outputs."
     )
-
-    @field_validator("resize_shape", mode="before")
-    @classmethod
-    def normalize_resize_shape_field(cls, value):
-        return normalize_resize_shape(value)
 
 
 class GenerationRequest(VLMRequest):
@@ -842,6 +908,7 @@ class StreamOptions(BaseModel):
 
 class ChatRequest(GenerationRequest):
     messages: List[ChatMessage]
+    context_management: Optional[List[CompactionControl]] = Field(None, max_length=1)
     stream_options: Optional[StreamOptions] = None
     tools: Optional[List[Any]] = Field(None, description="Tools the model may call.")
     tool_choice: Optional[Any] = Field(
@@ -850,6 +917,8 @@ class ChatRequest(GenerationRequest):
             "Controls tool use: none, auto, required, or a specific function."
         ),
     )
+    tool_parser: Optional[str] = Field(None, description=_TOOL_PARSER_DESC)
+    _validate_tool_parser = field_validator("tool_parser")(_check_tool_parser)
 
 
 class TopLogprob(BaseModel):
@@ -911,7 +980,7 @@ class AnthropicMessageParam(FlexibleBaseModel):
     content: Union[str, List[Any]]
 
 
-class AnthropicRequest(FlexibleBaseModel):
+class AnthropicRequest(ImageProcessingRequest):
     model: str = Field(..., description="The model to use for generation.")
     messages: List[AnthropicMessageParam]
     max_tokens: int = Field(
@@ -928,6 +997,8 @@ class AnthropicRequest(FlexibleBaseModel):
     stop_sequences: Optional[List[str]] = None
     tools: Optional[List[Any]] = None
     tool_choice: Optional[Any] = None
+    tool_parser: Optional[str] = Field(None, description=_TOOL_PARSER_DESC)
+    _validate_tool_parser = field_validator("tool_parser")(_check_tool_parser)
     metadata: Optional[Any] = None
     thinking: Optional[Any] = None
     output_config: Optional[Any] = None
@@ -1001,6 +1072,9 @@ class ModelInfo(BaseModel):
     id: str
     object: str
     created: int
+    loaded: bool = Field(
+        default=False, description="Whether the model is loaded in this server process."
+    )
 
 
 class ModelsResponse(BaseModel):

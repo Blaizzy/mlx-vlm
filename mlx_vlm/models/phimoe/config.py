@@ -20,3 +20,4 @@ class ModelConfig(BaseModelConfig):
     num_local_experts: int = 16
     num_experts_per_tok: int = 2
     rope_theta: float = 10000.0
+    router_jitter_noise: float = 0.01
