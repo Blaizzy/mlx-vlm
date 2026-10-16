@@ -426,6 +426,14 @@ def convert(
                     str(drafter_path),
                     q_bits=q_bits if quantize else None,
                     q_group_size=q_group_size,
+                    # `split` takes **quant_opts, so an omitted q_mode is not a
+                    # TypeError: the drafter silently falls back to affine while the
+                    # main model gets the requested mode. Both options stay gated on
+                    # `quantize`, because the splitter infers "quantize the drafter"
+                    # from either one being non-None -- forwarding this function's
+                    # "affine" default unconditionally would quantize the drafter of
+                    # an unquantized main model.
+                    q_mode=q_mode if quantize else None,
                 )
         except Exception as exc:
             # the base conversion already succeeded; a drafter failure must not

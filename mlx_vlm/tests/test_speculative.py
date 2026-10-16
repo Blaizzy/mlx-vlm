@@ -624,6 +624,73 @@ def test_split_and_requantize_checkpoint(tmp_path, family, quant):
     assert (key + ".biases" in written) == (quant == "affine")
 
 
+@parametrize("quantize", [True, False])
+def test_convert_forwards_quantization_mode_to_mtp_drafter(
+    tmp_path, monkeypatch, quantize
+):
+    """`convert --mtp --q-mode M` must build the drafter in mode M, not affine.
+
+    `MTPSplitter.split` takes `**quant_opts`, so an omitted `q_mode` is not a
+    `TypeError`: it arrives as a missing key, reaches `q_mode or "affine"`, and the
+    drafter comes out affine while the main model is in the requested mode. Nothing
+    downstream rejects the pair, so only the call site can be asserted --
+    `test_split_and_requantize_checkpoint` covers the splitter honouring the mode it
+    is given. The `quantize=False` case is the other half: the splitter reads
+    "quantize the drafter" off either option being non-None, so forwarding
+    `convert`'s own `"affine"` default unconditionally would quantize the drafter of
+    an unquantized main model.
+    """
+    from mlx_vlm.speculative.drafters import mtp_split as splitters
+
+    # the module, not the `convert` function that `mlx_vlm/__init__.py` re-exports
+    conversion = module("convert")
+
+    recorded = []
+
+    class Recorder:
+        def split(self, source, output, **quant_opts):
+            recorded.append(quant_opts)
+            Path(output).mkdir(parents=True, exist_ok=True)
+            return Path(output)
+
+    class Tiny(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(64, 64, bias=False)
+
+    source = tmp_path / "source"
+    source.mkdir()
+    config = dict(model_type="tiny")
+    (source / "config.json").write_text(json.dumps(config))
+    model = Tiny()
+
+    monkeypatch.setattr(conversion, "get_model_path", lambda *a, **k: source)
+    monkeypatch.setattr(
+        conversion,
+        "fetch_from_hub",
+        lambda *a, **k: (model, deepcopy(config), NS(save_pretrained=lambda _: None)),
+    )
+    monkeypatch.setattr(conversion, "create_model_card", lambda *a, **k: None)
+    monkeypatch.setattr(splitters, "detect_mtp_splitter", lambda _: Recorder())
+
+    conversion.convert(
+        str(source),
+        str(tmp_path / "converted"),
+        quantize=quantize,
+        q_bits=4,
+        q_group_size=32,
+        q_mode="mxfp4",
+        mtp=True,
+    )
+
+    # an empty list means the drafter step never reached `split`; `convert` swallows
+    # every exception from that block, so the recording is the only witness
+    assert len(recorded) == 1
+    assert {k: recorded[0].get(k) for k in ("q_bits", "q_mode")} == (
+        dict(q_bits=4, q_mode="mxfp4") if quantize else dict(q_bits=None, q_mode=None)
+    )
+
+
 @parametrize("family", ["dflash2", "glimmer", "dspark-lfm2", "dspark-qwen"])
 def test_checkpoint_routing_and_validation(tmp_path, family):
     settings = dflash_config(family)
