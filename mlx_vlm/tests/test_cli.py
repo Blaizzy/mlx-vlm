@@ -365,7 +365,10 @@ def test_image_cli_request_and_output(tmp_path, task):
     edit = task == "edit"
     output = tmp_path / "image.png"
     extras = (
-        {}
+        {
+            "gen_kwargs": {"upsample_prompt": False},
+            "prompt_expansion_model": "local-pup",
+        }
         if edit
         else dict(
             gen_kwargs={"sampler_preset": "V4_TURBO_12"},
@@ -400,6 +403,10 @@ def test_image_cli_request_and_output(tmp_path, task):
         assert request.prompt == "add sunglasses"
         assert request.image_paths == ("reference.png",)
         assert (request.width, request.height) == (256, 512)
+        assert request.extra == {
+            "upsample_prompt": False,
+            "prompt_expansion_model": "local-pup",
+        }
     else:
         assert request.extra == dict(
             sampler_preset="V4_TURBO_12", prompt_expansion_model="tiny-text-model"

@@ -201,8 +201,8 @@ def parse_arguments():
         type=str,
         default=None,
         help=(
-            "Text model path or Hugging Face repo used to expand plain image "
-            "prompts into Ideogram 4 JSON captions."
+            "Prompt expansion model path or Hugging Face repo. Overrides the "
+            "Flux3 upsampler, or enables Ideogram 4 JSON caption expansion."
         ),
     )
     parser.add_argument(

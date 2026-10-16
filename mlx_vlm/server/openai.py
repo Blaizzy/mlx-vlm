@@ -482,6 +482,9 @@ async def images_generations_endpoint(request: Request):
                         extra["prompt_expansion_model"] = (
                             image_request.prompt_expansion_model
                         )
+                    for key in ("upsample_prompt", "boxes"):
+                        if (value := getattr(image_request, key)) is not None:
+                            extra[key] = value
                     core_request = CoreImageGenerationRequest(
                         prompt=image_request.prompt,
                         seed=seed,
@@ -621,6 +624,9 @@ async def images_edits_endpoint(request: Request):
                                 "negative_prompt",
                                 "output_resolution",
                                 "use_kv_cache",
+                                "prompt_expansion_model",
+                                "upsample_prompt",
+                                "boxes",
                             )
                             if (value := getattr(image_request, key)) is not None
                         },
@@ -641,6 +647,7 @@ async def images_edits_endpoint(request: Request):
                 height=result.height,
                 seed=result.seed,
                 path=str(result.path) if result.path is not None else None,
+                revised_prompt=result.metadata.get("revised_prompt"),
             )
             if image_request.response_format == "b64_json":
                 item.b64_json = result.to_b64_json()
