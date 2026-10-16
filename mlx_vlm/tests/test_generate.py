@@ -607,6 +607,51 @@ class TestBatchGenerator:
             (200, 11),
         ]
 
+    def test_speculative_generation_batch_releases_cache_when_finished(
+        self, monkeypatch
+    ):
+        closed = []
+
+        def fake_rounds(*args, **kwargs):
+            del args, kwargs
+            try:
+                yield [1], {"round_pos": 0, "round_len": 1}
+                yield [2], {"round_pos": 0, "round_len": 1}
+            finally:
+                closed.append(True)
+
+        monkeypatch.setattr(ar_module, "run_speculative_server_rounds", fake_rounds)
+
+        cache = [SimpleNamespace(state=mx.zeros((4,)))]
+        batch = SpeculativeGenerationBatch(
+            model=SimpleNamespace(),
+            draft_model=SimpleNamespace(),
+            draft_kind="mtp",
+            uids=[100],
+            first_tokens=mx.array([0], dtype=mx.int32),
+            prompt_cache=cache,
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            stop_criteria=lambda token: token == 1,
+            max_tokens=[10],
+            hidden=mx.zeros((1, 1, 1)),
+            shared_kv_states={"k": mx.zeros((1,))},
+            prompt_tokens=mx.array([[0]], dtype=mx.int32),
+        )
+
+        batch.next()
+        assert batch.prompt_cache is cache
+
+        responses = batch.next()
+        assert [(r.uid, r.token, r.finish_reason) for r in responses] == [
+            (100, 1, "stop")
+        ]
+        assert len(batch) == 0
+        assert batch.prompt_cache == []
+        assert batch.hidden is None
+        assert batch.shared_kv_states is None
+        assert closed == [True]
+        assert batch.next() == []
+
     def test_generation_batch_extend_expands_compact_processor_state(self):
         sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
         stop_criteria = lambda token: False
