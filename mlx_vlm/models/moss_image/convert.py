@@ -17,12 +17,17 @@ from .config import detect_moss_image_layout
 from .weights import load_text_encoder, load_transformer, load_vae, read_config
 
 
-def model_card(source_id):
+def model_card(source_id=None):
+    source_metadata = f"base_model: {source_id}\n" if source_id is not None else ""
+    source_description = (
+        f"Converted from [{source_id}](https://huggingface.co/{source_id})."
+        if source_id is not None
+        else "Converted from a local MOSS-Image checkpoint."
+    )
     return f"""---
 library_name: mlx-vlm
 license: apache-2.0
-base_model: {source_id}
-pipeline_tag: text-to-image
+{source_metadata}pipeline_tag: text-to-image
 tags:
 - mlx
 - moss-image
@@ -30,7 +35,7 @@ tags:
 
 # MOSS-Image for MLX
 
-Converted from [{source_id}](https://huggingface.co/{source_id}).
+{source_description}
 Requires mlx-vlm with MOSS-Image support. Inference runs in MLX without PyTorch
 or Diffusers. This checkpoint supports text-to-image generation.
 
@@ -55,9 +60,7 @@ The text encoder is released before loading the diffusion transformer.
 """
 
 
-def convert_moss_image(
-    model_path, output_path, *, dtype=None, source_id="OpenMOSS-Team/MOSS-Image-SFT"
-):
+def convert_moss_image(model_path, output_path, *, dtype=None, source_id=None):
     source, destination = Path(model_path).expanduser(), Path(output_path).expanduser()
     if not detect_moss_image_layout(source):
         raise ValueError(f"Not a MOSS-Image checkpoint: {source}")
@@ -71,6 +74,10 @@ def convert_moss_image(
         raise ValueError(f"Unsupported MOSS-Image dtype: {dtype}")
     destination.mkdir(parents=True, exist_ok=True)
     index = read_config(source / "model_index.json")
+    if source_id is None:
+        source_id = index.get("source_model")
+    if source_id is not None:
+        index["source_model"] = source_id
     index["mlx_vlm_format"] = "moss_image"
     (destination / "model_index.json").write_text(json.dumps(index, indent=2) + "\n")
     for name in ("tokenizer", "scheduler"):
@@ -135,6 +142,10 @@ def main():
     parser.add_argument("--hf-path", required=True)
     parser.add_argument("--mlx-path", required=True)
     parser.add_argument("--revision")
+    parser.add_argument(
+        "--source-id",
+        help="Original Hugging Face model ID for a local checkpoint's model card.",
+    )
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"))
     args = parser.parse_args()
     source = get_model_path(
@@ -147,9 +158,8 @@ def main():
         args.mlx_path,
         dtype=args.dtype,
         source_id=(
-            args.hf_path
-            if not Path(args.hf_path).exists()
-            else "OpenMOSS-Team/MOSS-Image-SFT"
+            args.source_id
+            or (args.hf_path if not Path(args.hf_path).exists() else None)
         ),
     )
 

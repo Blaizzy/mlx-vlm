@@ -1,12 +1,18 @@
 # MOSS-Image
 
-MLX text-to-image inference for [OpenMOSS-Team/MOSS-Image-SFT](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT).
+MLX text-to-image inference for both MOSS-Image checkpoints:
+
+| Model | Description |
+| --- | --- |
+| [OpenMOSS-Team/MOSS-Image-Base](https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base) | Base text-to-image model |
+| [OpenMOSS-Team/MOSS-Image-SFT](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT) | Supervised fine-tuned checkpoint |
+
 Load the original Hugging Face checkpoint directly. The implementation uses the
 MOSS diffusion transformer, Qwen3.5's final text hidden states, and FLUX.2 VAE.
 Runtime inference requires no PyTorch or Diffusers.
 
 ```sh
-mlx_vlm.generate --output-modality image --model OpenMOSS-Team/MOSS-Image-SFT \
+mlx_vlm.generate --output-modality image --model OpenMOSS-Team/MOSS-Image-Base \
   --prompt "A red ceramic teapot on a wooden table, soft morning light" \
   --size 1024x1024 --seed 42 --output moss.png
 ```
@@ -26,8 +32,9 @@ result.save("moss.png")
 ```
 
 Defaults are 50 sampling steps, guidance 3.0, scheduler shift 5.0, and an empty
-negative prompt. Set dimensions explicitly; both must be positive multiples of
-16. The generic image API defaults to 512×512, while upstream recommends 1024×1024.
+negative prompt for both Base and SFT. Set dimensions explicitly; both must be
+positive multiples of 16. The generic image API defaults to 512×512, while
+upstream recommends 1024×1024.
 The text encoder is released before loading the diffusion transformer by default.
 The original weights occupy approximately 27 GB on disk.
 

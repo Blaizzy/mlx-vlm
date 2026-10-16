@@ -22,7 +22,7 @@ from mlx_vlm.generate.image import (
 )
 from mlx_vlm.models.flux2.vae import Flux2VAE
 from mlx_vlm.models.moss_image.config import MOSSImageTransformerConfig
-from mlx_vlm.models.moss_image.convert import convert_moss_image
+from mlx_vlm.models.moss_image.convert import convert_moss_image, model_card
 from mlx_vlm.models.moss_image.model import MOSSImageGenerationModel
 from mlx_vlm.models.moss_image.pipeline import MOSSImagePipeline
 from mlx_vlm.models.moss_image.scheduler import MOSSImageScheduler
@@ -64,7 +64,12 @@ def test_metadata_discovery_and_loading(tmp_path, monkeypatch):
     assert image_generation_model_class(str(tmp_path)) is MOSSImageGenerationModel
     assert is_image_generation_model(str(tmp_path))
     assert not MOSSImageGenerationModel.supports_model("org/unrelated")
-    for model in (str(tmp_path), "OpenMOSS-Team/MOSS-Image-SFT", "moss-image"):
+    for model in (
+        str(tmp_path),
+        "OpenMOSS-Team/MOSS-Image-Base",
+        "OpenMOSS-Team/MOSS-Image-SFT",
+        "moss-image",
+    ):
         assert image_generation_model_class(model) is MOSSImageGenerationModel
         assert resolve_image_defaults(model) == ImageSamplingDefaults(50, 3.0)
     module = importlib.import_module("mlx_vlm.models.moss_image.model")
@@ -73,6 +78,38 @@ def test_metadata_discovery_and_loading(tmp_path, monkeypatch):
     loaded = load_image_generation_model(str(tmp_path))
     assert loaded.pipeline is pipeline.return_value
     pipeline.assert_called_once_with(tmp_path, evict_text_encoder=True)
+
+
+@pytest.mark.parametrize("variant", ["Base", "SFT"])
+def test_hub_checkpoint_loading(variant, tmp_path, monkeypatch):
+    image_module = importlib.import_module("mlx_vlm.generate.image")
+    model_module = importlib.import_module("mlx_vlm.models.moss_image.model")
+    download = Mock(return_value=tmp_path)
+    monkeypatch.setattr(image_module, "get_model_path", download)
+    pipeline = Mock()
+    monkeypatch.setattr(model_module, "MOSSImagePipeline", pipeline)
+    model_id = f"OpenMOSS-Team/MOSS-Image-{variant}"
+    loaded = load_image_generation_model(model_id, revision="pinned-revision")
+    assert loaded.model_id == model_id
+    assert loaded.default_sampling == ImageSamplingDefaults(50, 3.0)
+    assert is_image_generation_model(model_id)
+    pipeline.assert_called_once_with(tmp_path, evict_text_encoder=True)
+    assert download.call_args.args == (model_id,)
+    assert download.call_args.kwargs["revision"] == "pinned-revision"
+
+
+@pytest.mark.parametrize(
+    "source_id", [None, "OpenMOSS-Team/MOSS-Image-Base", "OpenMOSS-Team/MOSS-Image-SFT"]
+)
+def test_model_card_preserves_checkpoint_identity(source_id):
+    card = model_card(source_id)
+    if source_id is None:
+        assert "base_model:" not in card
+        assert "MOSS-Image-SFT" not in card
+        assert "local MOSS-Image checkpoint" in card
+    else:
+        assert f"base_model: {source_id}\n" in card
+        assert f"https://huggingface.co/{source_id}" in card
 
 
 def test_wrapper_defaults_and_generation_options():
@@ -256,7 +293,10 @@ def test_qwen_gdn_normalization_uses_l2_epsilon():
 
 
 @pytest.mark.parametrize("dtype", [None, "bfloat16"])
-def test_original_to_mlx_checkpoint_round_trip(tmp_path, dtype):
+@pytest.mark.parametrize(
+    "source_id", [None, "OpenMOSS-Team/MOSS-Image-Base", "OpenMOSS-Team/MOSS-Image-SFT"]
+)
+def test_original_to_mlx_checkpoint_round_trip(tmp_path, dtype, source_id):
     source, output = tmp_path / "source", tmp_path / "mlx"
     source.mkdir()
     (source / "model_index.json").write_text(
@@ -306,7 +346,18 @@ def test_original_to_mlx_checkpoint_round_trip(tmp_path, dtype):
                     value = value.transpose(0, 3, 1, 2)
             weights[key] = value
         mx.save_safetensors(str(directory / "model.safetensors"), weights)
-    assert convert_moss_image(source, output, dtype=dtype) == output
+    options = {} if source_id is None else {"source_id": source_id}
+    assert convert_moss_image(source, output, dtype=dtype, **options) == output
+    assert (
+        json.loads((output / "model_index.json").read_text()).get("source_model")
+        == source_id
+    )
+    card = (output / "README.md").read_text()
+    if source_id is None:
+        assert "base_model:" not in card
+        assert "MOSS-Image-SFT" not in card
+    else:
+        assert f"base_model: {source_id}\n" in card
     for name, loader in (
         ("text_encoder", load_text_encoder),
         ("transformer", load_transformer),
@@ -338,6 +389,9 @@ def test_original_to_mlx_checkpoint_round_trip(tmp_path, dtype):
     )
     assert (output / "LICENSE").read_text() == "upstream license"
     assert "generate_image" in (output / "README.md").read_text()
+    reconverted = tmp_path / "reconverted"
+    convert_moss_image(output, reconverted)
+    assert (reconverted / "README.md").read_text() == card
     with pytest.raises(FileExistsError):
         convert_moss_image(source, output)
 
