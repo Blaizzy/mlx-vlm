@@ -415,6 +415,72 @@ def test_launchable_pipelines_are_untouched(kv_len):
     assert lang._QWEN3_5_SDPA_LAUNCHABLE, "the dispatch should record what it probed"
 
 
+def strided_kv_views(batch, kv_len, layout):
+    """bf16 K/V of shape (batch, KV_HEADS, kv_len, HEAD_DIM) in a given layout."""
+
+    def normal(shape):
+        return mx.random.normal(shape).astype(mx.bfloat16)
+
+    n, h, d = kv_len, KV_HEADS, HEAD_DIM
+    if layout == "contiguous":
+        keys, values = normal((batch, h, n, d)), normal((batch, h, n, d))
+    elif layout == "cache_slice":
+        # BatchKVCache returns a slice of a larger buffer along the sequence axis.
+        keys = normal((batch, h, n + 13, d))[:, :, :n]
+        values = normal((batch, h, n + 13, d))[:, :, :n]
+    elif layout == "transposed":
+        # Contiguous along the head dim, but the row stride is not HEAD_DIM.
+        keys = normal((batch, n, h, d)).transpose(0, 2, 1, 3)
+        values = normal((batch, n, h, d)).transpose(0, 2, 1, 3)
+    else:
+        # "head_dim_strided": not contiguous along the head dim either.
+        keys = normal((batch, h, d, n)).swapaxes(2, 3)
+        values = normal((batch, h, d, n)).swapaxes(2, 3)
+    return keys, values
+
+
+@_RAGGED_SDPA_ONLY
+@pytest.mark.usefixtures("clear_launchability_cache")
+@pytest.mark.parametrize("pads", [[0, 1], [0, 1, 2, 1]])
+@pytest.mark.parametrize("plan", ["one_pass", "two_pass"])
+@pytest.mark.parametrize(
+    "layout", ["contiguous", "cache_slice", "transposed", "head_dim_strided"]
+)
+def test_ragged_decode_strided_kv_matches_contiguous(pads, plan, layout):
+    if plan == "one_pass":
+        kv_len = 64
+    else:
+        kv_len = next(
+            (
+                n
+                for n in (2048, 8192)
+                if lang._qwen3_5_sdpa_vector_plan(n - max(pads), Q_HEADS, KV_HEADS)[0]
+                == "two_pass"
+            ),
+            None,
+        )
+        if kv_len is None:
+            pytest.skip("no small KV length on this GPU selects the two-pass plan")
+    assert {
+        lang._qwen3_5_sdpa_vector_plan(kv_len - pad, Q_HEADS, KV_HEADS)[0]
+        for pad in pads
+    } == {plan}
+    mx.random.seed(0)
+    queries = mx.random.normal((len(pads), Q_HEADS, 1, HEAD_DIM)).astype(mx.bfloat16)
+    keys, values = strided_kv_views(len(pads), kv_len, layout)
+
+    out = lang._qwen3_5_ragged_decode_attention(queries, keys, values, pads, SCALE)
+    expected = lang._qwen3_5_ragged_decode_attention(
+        queries, mx.contiguous(keys), mx.contiguous(values), pads, SCALE
+    )
+
+    if out is None or expected is None:
+        pytest.skip("this GPU declines the fast path for this shape")
+    # Strided K/V are read in place instead of copied; the kernel must produce
+    # exactly what it produces for a row-contiguous copy of the same values.
+    assert mx.array_equal(out, expected).item()
+
+
 def _assert_allclose(actual, expected, atol=1e-5, rtol=1e-5):
     mx.eval(actual, expected)
     np.testing.assert_allclose(

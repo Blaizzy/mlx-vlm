@@ -45,6 +45,7 @@ from ..speculative.utils import speculative_stats_since, speculative_stats_snaps
 from ..structured import ThinkingAwareLogitsProcessor
 from ..tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
 from ..utils import ThinkingBudgetCriteria, load, prepare_inputs, resolve_eos_token_ids
+from ..vision_cache import processed_image_key
 from .runtime import runtime
 
 logger = logging.getLogger("mlx_vlm.server")
@@ -92,6 +93,16 @@ def get_max_num_seqs():
 
 def get_server_max_tokens():
     return int(os.environ.get("MLX_VLM_MAX_TOKENS", DEFAULT_MAX_TOKENS))
+
+
+def get_server_min_pixels():
+    value = os.environ.get("MLX_VLM_MIN_PIXELS")
+    return int(value) if value else None
+
+
+def get_server_max_pixels():
+    value = os.environ.get("MLX_VLM_MAX_PIXELS")
+    return int(value) if value else None
 
 
 def get_token_queue_timeout():
@@ -639,9 +650,30 @@ class GenerationArguments:
     # cached blocks from one tenant can't be reused (or detected via timing)
     # by another. None = no salt = single-tenant behaviour.
     tenant_id: Optional[str] = None
+    min_pixels: Optional[int] = None
+    max_pixels: Optional[int] = None
+    resize_shape: Optional[Tuple[int, int]] = None
 
     def __post_init__(self):
         self.temperature = clamp_temperature(self.temperature)
+        for name in ("min_pixels", "max_pixels"):
+            value = getattr(self, name)
+            if value is not None and value <= 0:
+                raise ValueError(f"{name} must be positive")
+        if (
+            self.min_pixels is not None
+            and self.max_pixels is not None
+            and self.min_pixels > self.max_pixels
+        ):
+            raise ValueError("min_pixels must not exceed max_pixels")
+
+    def preprocessing_kwargs(self) -> dict:
+        """Per-request image options; never mutate the shared processor."""
+        return {
+            key: getattr(self, key)
+            for key in ("min_pixels", "max_pixels", "resize_shape")
+            if getattr(self, key) is not None
+        }
 
     def diffusion_kwargs(self) -> dict:
         """Diffusion-only generation kwargs explicitly supplied by a request."""
@@ -706,6 +738,7 @@ class GenerationArguments:
         if self.tenant_id is not None:
             kw["apc_tenant"] = self.tenant_id
         kw.update(self.diffusion_kwargs())
+        kw.update(self.preprocessing_kwargs())
         return kw
 
     def to_template_kwargs(self) -> dict:
@@ -1176,7 +1209,9 @@ class ResponseGenerator:
         # races request threads through the mutable fast-tokenizer backend.
         tokenizer_lock = getattr(self, "_tokenizer_lock", None)
         with tokenizer_lock if tokenizer_lock is not None else nullcontext():
-            raw_inputs = self._preprocess_request(prompt, images, audio, videos)
+            raw_inputs = self._preprocess_request(
+                prompt, images, audio, videos, **args.preprocessing_kwargs()
+            )
             thinking_budget_criteria = self._make_thinking_budget_criteria(
                 args, raw_inputs.get("input_ids")
             )
@@ -1237,7 +1272,9 @@ class ResponseGenerator:
             rqueue, ctx.uid, self._cancel, get_token_queue_timeout()
         )
 
-    def _cpu_preprocess(self, prompt, images=None, audio=None, videos=None) -> dict:
+    def _cpu_preprocess(
+        self, prompt, images=None, audio=None, videos=None, **preprocessing_kwargs
+    ) -> dict:
         """CPU-only: tokenize text, load/resize images. Thread-safe."""
         add_special_tokens = (
             getattr(self.processor, "chat_template", None) is None
@@ -1254,12 +1291,17 @@ class ResponseGenerator:
             prompts=prompt,
             image_token_index=image_token_index,
             add_special_tokens=add_special_tokens,
+            **preprocessing_kwargs,
         )
 
-    def _preprocess_request(self, prompt, images=None, audio=None, videos=None) -> dict:
+    def _preprocess_request(
+        self, prompt, images=None, audio=None, videos=None, **preprocessing_kwargs
+    ) -> dict:
         if videos is None:
-            return self._cpu_preprocess(prompt, images, audio)
-        return self._cpu_preprocess(prompt, images, audio, videos)
+            return self._cpu_preprocess(prompt, images, audio, **preprocessing_kwargs)
+        return self._cpu_preprocess(
+            prompt, images, audio, videos, **preprocessing_kwargs
+        )
 
     # -- internals --
 
@@ -1603,7 +1645,7 @@ class ResponseGenerator:
             and images is not None
         ):
             data_kwargs["vision_cache"] = self.vision_cache
-            data_kwargs["_image_key"] = images
+            data_kwargs["_image_key"] = processed_image_key(pixel_values, **data_kwargs)
 
         # Always call get_input_embeddings — BatchGenerator requires inputs_embeds
         embed = self.model.get_input_embeddings(
@@ -2099,7 +2141,9 @@ class ResponseGenerator:
             return
         self.wait_until_ready()
         args = args or GenerationArguments(max_tokens=get_server_max_tokens())
-        raw_inputs = self._preprocess_request(prompt, images, audio, videos)
+        raw_inputs = self._preprocess_request(
+            prompt, images, audio, videos, **args.preprocessing_kwargs()
+        )
         _check_configured_context_budget(
             _count_prompt_tokens(raw_inputs), args.max_tokens
         )
