@@ -17,13 +17,16 @@ from mlx_vlm.train import _configure_model
 from mlx_vlm.trainer import (
     CoreTrainingArgs,
     DPOTrainingArgs,
+    GRPOTrainingArgs,
     ORPOTrainingArgs,
     Trainer,
     TrainingCallback,
     TrainingTask,
     VLMTrainingArgs,
 )
+from mlx_vlm.trainer.core import TrainingArgs as LegacyTrainingArgs
 from mlx_vlm.trainer.datasets.loading import CacheDataset
+from mlx_vlm.trainer.vlm.orpo.trainer import ORPOTrainingArgs as LegacyORPOTrainingArgs
 
 
 class TinyLM(nn.Module):
@@ -57,6 +60,46 @@ def example(ids=(1, 3, 2)):
 
 
 class EngineTest(unittest.TestCase):
+    def test_training_arguments_reject_optimizer_settings(self):
+        for cls in (
+            CoreTrainingArgs,
+            VLMTrainingArgs,
+            DPOTrainingArgs,
+            ORPOTrainingArgs,
+            GRPOTrainingArgs,
+            LegacyTrainingArgs,
+            LegacyORPOTrainingArgs,
+        ):
+            for name, value in (
+                ("optimizer", "adamw"),
+                ("learning_rate", 1e-5),
+                ("weight_decay", 0.01),
+                ("warmup_steps", 100),
+                ("min_learning_rate", 1e-6),
+            ):
+                with self.subTest(cls=cls.__name__, setting=name):
+                    self.assertFalse(hasattr(cls(), name))
+                    with self.assertRaises(TypeError):
+                        cls(**{name: value})
+
+    def test_training_requires_optimizer_but_evaluation_does_not(self):
+        model = nn.Linear(1, 1, bias=False)
+        task = TrainingTask(
+            lambda m, x: (m(x).sum(), mx.array(1)),
+            lambda rows, **kwargs: iter(rows),
+        )
+        trainer = Trainer(
+            model,
+            CoreTrainingArgs(val_batches=-1),
+            task=task,
+            train_dataset=[mx.ones((1, 1))],
+            eval_dataset=[mx.ones((1, 1))],
+        )
+        with self.assertRaisesRegex(ValueError, "requires optimizer"):
+            trainer.train()
+        self.assertIsNone(trainer.optimizer)
+        self.assertTrue(mx.isfinite(mx.array(trainer.evaluate()["val_loss"])).item())
+
     def test_custom_task_partial_update_final_save_and_evaluation_mode(self):
         for compiled in (False, True):
             with (
@@ -142,6 +185,7 @@ class EngineTest(unittest.TestCase):
                     trainer = Trainer(
                         model,
                         args,
+                        optimizer=optim.AdamW(learning_rate=1e-5, weight_decay=0.0),
                         task="vlm",
                         algorithm=mode,
                         train_dataset=rows,
@@ -245,6 +289,7 @@ class DataAndCLITest(unittest.TestCase):
                     trainer = Trainer(
                         TinyLM(),
                         cls(cache_size=1, train_on_completions=True),
+                        optimizer=optim.AdamW(learning_rate=1e-5, weight_decay=0.0),
                         processing_class=processor,
                         train_dataset=rows,
                         task="vlm",

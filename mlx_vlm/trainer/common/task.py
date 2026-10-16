@@ -17,6 +17,10 @@ class TrainingTask:
     are summed; other scalar metrics use weighted means. Metric dictionaries
     must have the same keys across distributed ranks for each batch.
     Auxiliary models belong in ``state`` when compilation is enabled.
+    ``value_and_grad_factory(model, compile)`` optionally builds an objective's
+    gradient function, returning ``((loss, metrics), gradients)``. It owns its
+    compilation and synchronization boundaries; the engine still accumulates
+    and applies gradients and handles the full training lifecycle.
     """
 
     loss: Callable
@@ -27,6 +31,8 @@ class TrainingTask:
     loss_args: Callable | None = None
     unit: str = "examples"
     state: list[Any] = field(default_factory=list)
+    # Online objectives can synchronize bounded gradient chunks before updating.
+    value_and_grad_factory: Callable | None = None
 
     def objective(self, model, batch):
         extra = self.loss_args(batch) if self.loss_args is not None else ()

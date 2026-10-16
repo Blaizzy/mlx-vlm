@@ -45,10 +45,7 @@ class TrainingArgs:
     )
     adapter_file: str = field(default="adapters.safetensors")
     grad_checkpoint: bool = field(default=False)
-    learning_rate: float = field(default=1e-5)
     grad_clip: float | None = field(default=1.0)
-    warmup_steps: int = field(default=100)
-    min_learning_rate: float = field(default=1e-6)
     full_finetune: bool = field(default=False)
     gradient_accumulation_steps: int = field(default=1)
 
