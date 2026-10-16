@@ -3,11 +3,12 @@ import threading
 import time
 from types import SimpleNamespace
 
-import mlx_vlm.server as server
 import pytest
 from fastapi.testclient import TestClient
+
+import mlx_vlm.server as server
 from mlx_vlm.server import audio
-from mlx_vlm.tests.test_server_audio import reset_audio_runtime
+from mlx_vlm.tests.test_server import reset_audio_runtime as reset_audio_runtime
 
 
 class Session:

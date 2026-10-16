@@ -7,8 +7,9 @@ the WebSocket handshake.
 
 This requires a model implementing the live-input `create_streaming_session`
 contract (`feed`, `step`, `close`, `done`, `input_sample_rate`). Nemotron support
-is proposed in https://github.com/Blaizzy/mlx-audio/pull/945; an unmodified
-mlx-audio release without that contract is not supported. Other model factories
+was merged in https://github.com/Blaizzy/mlx-audio/pull/945 and is available in
+mlx-audio 0.5.9, used for the validation below. Releases without that contract
+are not supported. Other model factories
 with the same name but a different contract are rejected.
 
 After `session.created`, send JSON events:
@@ -47,17 +48,26 @@ all run on the audio worker thread.
 
 ## Validation
 
-Run `pytest mlx_vlm/tests/test_server_audio.py
-mlx_vlm/tests/test_server_stt_realtime.py mlx_vlm/tests/test_server_realtime.py`
-on an MLX-capable host. The realtime STT tests use an in-memory fake model and
-cover partial-before-commit, finalization, malformed input, authentication,
-contention, disconnect, post-commit rejection, cold-step backpressure and
-shutdown with pending requests. They do not download model weights.
+Run `python -m pytest -q mlx_vlm/tests/test_server.py
+mlx_vlm/tests/test_server_stt_realtime.py` on an MLX-capable host. The realtime
+STT tests use an in-memory fake model and cover partial-before-commit,
+finalization, malformed input, authentication, contention, disconnect,
+post-commit rejection, cold-step backpressure and shutdown with pending requests.
+They do not download model weights.
 
-A separate local socket proof through Nativ's unmodified Python overlay used
-the candidate mlx-audio implementation and Nemotron 3.5 0.6B checkpoint
-`e550040c0478027ed679b2b6b0d055502c103663`, with synthetic Portuguese and English
-speech sent as 20 ms chunks. Both produced partials before commit. One run per
-language measured first partial at 5.285 s / 2.214 s and commit-to-final at
-0.260 s / 0.645 s respectively. These are functional observations, not latency
-percentiles or a packaged Nativ app certification.
+On 16 October 2026, the candidate on upstream `6d2f226` passed 672 tests, with
+six skips, using MLX 0.32.4 and mlx-audio 0.5.9.
+
+A separate socket proof through Nativ's Python overlay at upstream
+`a3888494f2d51bbff3b13730d1c5fcce1d59b849` used this candidate, released
+mlx-audio 0.5.9 and Nemotron 3.5 0.6B checkpoint
+`e550040c0478027ed679b2b6b0d055502c103663`. Synthetic English and Portuguese
+speech was sent as paced 20 ms chunks. Both produced partials before commit.
+
+| Fixture | Audio duration | First partial | Commit to final |
+| --- | ---: | ---: | ---: |
+| English | 10.074 s | 3.427 s | 0.605 s |
+| Portuguese | 13.150 s | 2.052 s | 0.187 s |
+
+These are single-run functional observations, not latency percentiles,
+transcription-accuracy certification or a packaged Nativ app certification.
