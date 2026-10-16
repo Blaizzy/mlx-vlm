@@ -32,7 +32,7 @@ from mlx_vlm.utils import load_model, save_weights
 
 
 @pytest.fixture(params=[None, mx.cpu], ids=["default", "cpu"])
-def nvfp4_device(request):
+def offload_device(request):
     with mx.stream(request.param or mx.default_device()):
         yield
 
@@ -42,7 +42,7 @@ def nvfp4_device(request):
 @pytest.mark.parametrize("scalar", [False, True])
 @pytest.mark.parametrize("decode", [False, True])
 def test_native_nvfp4_global_scales_survive_repack(
-    tmp_path, fused, scale_name, scalar, decode, nvfp4_device
+    tmp_path, fused, scale_name, scalar, decode, offload_device
 ):
     from mlx.utils import tree_flatten
 
@@ -512,6 +512,64 @@ def test_every_swappable_block_matches_resident(tmp_path, family, tokens):
     store = patch_model(model, str(offload))
     assert store.swapped == 1
     _assert_offload_parity(resident, model.model.layers[0].experts(x, indices))
+
+
+@pytest.mark.parametrize("shape", [(1, 1), (2, 9)])
+def test_nontrivial_expert_scales_preserve_bfloat16(tmp_path, shape, offload_device):
+    mx.random.seed(53)
+    block = InklingSwitchGLU(64, 128, 16, bias=True)
+    for projection in (block.gate_proj, block.up_proj, block.down_proj):
+        projection.bias = mx.random.normal(projection.bias.shape) * 0.1
+    block.set_dtype(mx.bfloat16)
+    block.gate_scale = mx.linspace(0.17, 1.7, 16)
+    block.out_scale = mx.linspace(0.23, 1.2, 16)
+    model = _wrap_block(block)
+    _, offload = _build_and_repack(
+        tmp_path, model, model.config, quant_paths=("experts",)
+    )
+    x = mx.random.normal((*shape, 64)).astype(mx.bfloat16)
+    # Repeated routes, multiple batch axes, and more than eight unique experts.
+    base = mx.arange(shape[0] * shape[1]).reshape(*shape, 1)
+    indices = ((base + mx.array([0, 0, 5, 11])) % 16).astype(mx.uint32)
+    resident = block(x, indices)
+    mx.eval(resident)
+    patch_model(model, str(offload), expert_cache_gb=1e-9)
+    for _ in range(2):
+        _assert_offload_parity(resident, model.model.layers[0].experts(x, indices))
+
+
+@pytest.mark.parametrize("tokens", [1, 9])
+def test_dense_bfloat16_experts_still_run_on_cpu(tmp_path, tokens):
+    with mx.stream(mx.cpu):
+        mx.random.seed(53)
+        block = SwitchGLU(64, 128, 16)
+        block.set_dtype(mx.bfloat16)
+        model = _wrap_block(block)
+        x = mx.random.normal((tokens, 64)).astype(mx.bfloat16)
+        indices = (mx.arange(tokens * 2).reshape(tokens, 2) % 16).astype(mx.uint32)
+        # CPU gather_mm cannot evaluate BF16. Use the original dense matmuls
+        # as the reference, which supported CPU offloading before batching.
+        expected = []
+        for token, experts in enumerate(indices.tolist()):
+            routed = []
+            for expert in experts:
+                gate = x[token : token + 1] @ block.gate_proj.weight[expert].T
+                up = x[token : token + 1] @ block.up_proj.weight[expert].T
+                routed.append(
+                    block.activation(up, gate) @ block.down_proj.weight[expert].T
+                )
+            expected.append(mx.concatenate(routed))
+        expected = mx.stack(expected)
+        mx.eval(expected)
+        build, offload = tmp_path / "build", tmp_path / "offload"
+        save_weights(str(build), model)
+        (build / "config.json").write_text(json.dumps(model.config))
+        repack(str(build), str(offload))
+        patch_model(model, str(offload), expert_cache_gb=1e-9)
+        for _ in range(2):
+            actual = model.model.layers[0].experts(x, indices)
+            assert actual.dtype == mx.bfloat16
+            _assert_offload_parity(expected, actual)
 
 
 def test_patch_model_refuses_a_layer_that_declares_no_gating(tmp_path):
