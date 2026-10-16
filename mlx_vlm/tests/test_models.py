@@ -1835,6 +1835,102 @@ def test_patch_embed_is_transposed_from_ncdhw_to_ndhwc():
     assert sanitized[QWEN_SANITIZED_KEY].shape == expected
 
 
+def _qwen_mixed_media_request(model, order):
+    """Token ids and vision inputs for a prompt with one image and one video."""
+    config = model.config
+    config.image_token_id = config.image_token_index = 60
+    config.video_token_id = config.video_token_index = 61
+    config.vision_start_token_id = 62
+    vc = config.vision_config
+    width = vc.in_channels * vc.temporal_patch_size * vc.patch_size**2
+    grids = {"image": (1, 2, 2), "video": (2, 2, 2)}
+    tokens = {"image": 60, "video": 61}
+    ids = [1, 2]
+    for kind in order:
+        ids += [62] + [tokens[kind]] * math.prod(grids[kind]) + [63]
+    ids = mx.array([ids + [3]], mx.int32)
+    inputs = {
+        "pixel_values": mx.random.normal((math.prod(grids["image"]), width)),
+        "image_grid_thw": mx.array([grids["image"]]),
+        "pixel_values_videos": mx.random.normal((math.prod(grids["video"]), width)),
+        "video_grid_thw": mx.array([grids["video"]]),
+    }
+    return ids, inputs, tokens
+
+
+def _with_features(model, ids, features_by_token):
+    embeds = model.language_model.model.embed_tokens(ids)
+    flat = embeds.reshape(-1, embeds.shape[-1])
+    for token, features in features_by_token.items():
+        positions = [i for i, t in enumerate(ids.flatten().tolist()) if t == token]
+        flat[mx.array(positions, mx.uint32)] = features
+    return flat.reshape(embeds.shape)
+
+
+@pytest.mark.parametrize("order", [("image", "video"), ("video", "image")])
+def test_qwen3_5_embeds_images_and_videos_in_one_request(order):
+    """Images and videos in one prompt each fill their own placeholder tokens."""
+    model, _ = _qwen_patch_model()
+    model.eval()
+    ids, inputs, tokens = _qwen_mixed_media_request(model, order)
+    image, _ = model.vision_tower(inputs["pixel_values"], inputs["image_grid_thw"])
+    video, _ = model.vision_tower(
+        inputs["pixel_values_videos"], inputs["video_grid_thw"]
+    )
+
+    features = model.get_input_embeddings(ids, **inputs)
+
+    expected = _with_features(
+        model, ids, {tokens["image"]: image, tokens["video"]: video}
+    )
+    np.testing.assert_allclose(features.inputs_embeds, expected, rtol=1e-5, atol=1e-5)
+    position_ids, _ = model.language_model.get_rope_index(
+        ids, inputs["image_grid_thw"], inputs["video_grid_thw"]
+    )
+    assert mx.array_equal(features.position_ids, position_ids).item()
+
+
+def test_qwen3_5_mixed_media_cached_features_and_vision_cache():
+    """Cached features cover all placeholders; the vision cache holds the images."""
+    model, _ = _qwen_patch_model()
+    model.eval()
+    ids, inputs, tokens = _qwen_mixed_media_request(model, ("video", "image"))
+    width = model.config.vision_config.out_hidden_size
+    image, _ = model.vision_tower(inputs["pixel_values"], inputs["image_grid_thw"])
+    video, _ = model.vision_tower(
+        inputs["pixel_values_videos"], inputs["video_grid_thw"]
+    )
+
+    # Precomputed features for every image and video placeholder, in token order.
+    cached = mx.random.normal((12, width))
+    features = model.get_input_embeddings(ids, cached_image_features=cached, **inputs)
+    expected = model.language_model.model.embed_tokens(ids)
+    flat = expected.reshape(-1, width)
+    positions = [
+        i for i, t in enumerate(ids.flatten().tolist()) if t in tokens.values()
+    ]
+    flat[mx.array(positions, mx.uint32)] = cached
+    np.testing.assert_allclose(
+        features.inputs_embeds, flat.reshape(expected.shape), rtol=1e-5, atol=1e-5
+    )
+
+    # The vision cache key covers the images only: it stores and serves them,
+    # while the video is encoded on every call.
+    store = {}
+    cache = SimpleNamespace(get=store.get, put=store.__setitem__)
+    for _ in range(2):
+        features = model.get_input_embeddings(
+            ids, vision_cache=cache, _image_key="images", **inputs
+        )
+        expected = _with_features(
+            model, ids, {tokens["image"]: image, tokens["video"]: video}
+        )
+        np.testing.assert_allclose(
+            features.inputs_embeds, expected, rtol=1e-5, atol=1e-5
+        )
+    assert list(store) == ["images"] and store["images"].shape == image.shape
+
+
 def test_glm_quantized_head_sanitization_loads_strictly():
     module = importlib.import_module("mlx_vlm.models.glm5_next")
     model = module.Model(
