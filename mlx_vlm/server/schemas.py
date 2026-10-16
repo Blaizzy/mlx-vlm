@@ -78,9 +78,16 @@ class ImageGenerationRequest(FlexibleBaseModel):
     prompt_expansion_model: Optional[str] = Field(
         None,
         description=(
-            "Text model path or Hugging Face repo used to expand plain "
-            "Ideogram 4 prompts into structured JSON captions."
+            "Model path or Hugging Face repo for prompt expansion. Flux3 uses "
+            "its default upsampler when omitted; Ideogram 4 expansion is optional."
         ),
+    )
+    upsample_prompt: bool | None = Field(
+        None, description="For Flux3, expand prompts automatically; enabled by default."
+    )
+    boxes: list[dict[str, Any]] | None = Field(
+        None,
+        description="For Flux3, normalized layout boxes passed to the prompt upsampler.",
     )
     response_format: Literal["b64_json", "path"] = Field(
         "b64_json",
@@ -156,6 +163,18 @@ class ImageEditRequest(FlexibleBaseModel):
     use_kv_cache: Optional[bool] = Field(
         None,
         description="Reuse fixed conditioning keys/values when supported by the model.",
+    )
+    prompt_expansion_model: str | None = Field(
+        None,
+        description="For Flux3, override the default prompt upsampler with a model path or Hub ID.",
+    )
+    upsample_prompt: bool | None = Field(
+        None,
+        description="For Flux3, expand the instruction using reference images; enabled by default.",
+    )
+    boxes: list[dict[str, Any]] | None = Field(
+        None,
+        description="For Flux3, normalized layout/edit boxes passed to the prompt upsampler.",
     )
     response_format: Literal["b64_json", "path"] = Field(
         "b64_json",

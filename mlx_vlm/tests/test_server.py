@@ -1432,6 +1432,36 @@ def test_image_editing_forwards_model_options(client, monkeypatch, options):
     assert request.steps == 30
 
 
+@pytest.mark.parametrize("method", ["generations", "edits"])
+def test_flux3_prompt_upsampling_options_and_revised_prompt(
+    client, monkeypatch, method
+):
+    options = {
+        "upsample_prompt": False,
+        "prompt_expansion_model": "local-flux3-pup",
+        "boxes": [{"id": "pot", "bbox": [0.1, 0.2, 0.8, 0.9]}],
+    }
+    result = _fake_image_result(seed=7)
+    result.metadata["revised_prompt"] = "A detailed scene caption."
+    generate = Mock(return_value=result)
+    edit = method == "edits"
+    monkeypatch.setattr(openai, "edit_image" if edit else "generate_image", generate)
+    with _endpoint(model_type="flux3"):
+        response = client.post(
+            f"/v1/images/{method}",
+            json={
+                "model": "flux3-klein",
+                "prompt": "a teapot",
+                "seed": 7,
+                **({"image": "reference.png"} if edit else {}),
+                **options,
+            },
+        )
+    assert response.status_code == 200
+    assert generate.call_args.args[1].extra == options
+    assert response.json()["data"][0]["revised_prompt"] == "A detailed scene caption."
+
+
 @pytest.mark.parametrize("api", ["/responses", "/chat/completions"])
 def test_responses_endpoint_forwards_new_sampling_args(client, api):
     options = dict(
