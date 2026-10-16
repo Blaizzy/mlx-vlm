@@ -1673,6 +1673,74 @@ def test_checkpoint_loading(tmp_path, name):
         ) == [3]
 
 
+def test_nemotron_processor_modalities_and_metadata(tmp_path):
+    metadata = deepcopy(DATA["checkpoints"]["nemotron"])
+    config = metadata["config"]
+    config["model_type"] = "nemotron_h_omni"
+    metadata["processor_config"][
+        "processor_class"
+    ] = "NemotronH_Omni_Reasoning_V3Processor"
+    metadata["preprocessor_config"].update(
+        norm_mean=[0.5] * 3,
+        norm_std=[0.5] * 3,
+        min_num_patches=4,
+        max_num_patches=16,
+        video_target_num_patches=8,
+    )
+    _write_configs(tmp_path, **metadata)
+    vocab = {str(i): i for i in range(21)}
+    for index, token in [
+        (0, "[UNK]"),
+        (5, "seconds"),
+        (18, "<image>"),
+        (19, "<img>"),
+        (20, "</img>"),
+    ]:
+        del vocab[str(index)]
+        vocab[token] = index
+    backend = Tokenizer(WordLevel(vocab, unk_token="[UNK]"))
+    backend.pre_tokenizer = Whitespace()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        unk_token="[UNK]",
+        eos_token="[UNK]",
+        pad_token="[UNK]",
+        additional_special_tokens=["<image>", "<img>", "</img>"],
+    )
+    tokenizer.save_pretrained(tmp_path)
+    processor = load_processor(tmp_path, add_detokenizer=False, trust_remote_code=False)
+    assert processor_handles_video(processor)
+    messages = apply_chat_template(
+        processor, config, "Describe.", num_images=1, return_messages=True
+    )
+    assert messages[0]["content"][0] == {"type": "image"}
+    messages = apply_chat_template(
+        processor, config, "Describe.", video="clip.mp4", return_messages=True
+    )
+    assert messages[0]["content"][0]["type"] == "video"
+    image = Image.new("RGB", (32, 32), "red")
+    inputs = prepare_inputs(processor, prompts="<image>Describe.", images=[image])
+    assert int(mx.sum(inputs["input_ids"] == 18)) == int(inputs["num_tokens"].sum())
+    frames = np.zeros((5, 3, 32, 64), dtype=np.uint8)
+    inputs = prepare_inputs(processor, prompts="<video>Describe.", videos=[frames])
+    assert inputs["pixel_values_videos"].shape[0] == 5
+    assert int(mx.sum(inputs["input_ids"] == 18)) == 3 * int(inputs["num_tokens"][0])
+    assert (
+        int(mx.sum(inputs["input_ids"] == 5)) == 5
+    )  # Per-frame timestamps survived the loader.
+    assert processor.image_processor._is_video_mode is False
+    with pytest.raises(ValueError, match="one video"):
+        prepare_inputs(processor, prompts="<video><video>", videos=[frames, frames])
+
+    waveform = np.linspace(-1, 1, 1600, dtype=np.float32)
+    keyword = processor(text="<so_embedding>", audio=waveform)
+    positional = processor(None, "<so_embedding>", None, waveform)
+    for inputs in (keyword, positional):
+        assert len(inputs["sound_clips"]) == 1
+        np.testing.assert_array_equal(inputs["sound_clips"][0], waveform)
+    np.testing.assert_array_equal(positional["input_ids"], keyword["input_ids"])
+
+
 # Prompt construction
 
 
@@ -1997,6 +2065,70 @@ def test_apply_chat_template_uses_generic_text_model_fallback():
     result = apply_chat_template(TextProcessor(), {"model_type": "llama"}, "Hello")
 
     assert result == "templated"
+
+
+@pytest.mark.parametrize("model_type", ["llama", "qwen3_5"])
+@pytest.mark.parametrize(
+    "template",
+    [
+        "{{ tools | tojson }}",
+        "{% for tool in tools %}{% for key, value in tool.items() %}"
+        "{{ key }}={{ value | tojson }};{% endfor %}{% endfor %}",
+    ],
+)
+def test_tool_schema_key_order_does_not_change_prompt(model_type, template):
+    parameters = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "enum": ["src", "tests"]},
+            "options": {
+                "type": "object",
+                "properties": {"recursive": {"type": "boolean"}},
+            },
+        },
+        "required": ["path", "options"],
+    }
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": name, "parameters": parameters},
+        }
+        for name in ["search_files", "read_file"]
+    ]
+
+    def reverse_keys(value):
+        if isinstance(value, dict):
+            return {key: reverse_keys(value[key]) for key in reversed(value)}
+        if isinstance(value, list):
+            return [reverse_keys(item) for item in value]
+        return value
+
+    tokenizer = fast_tokenizer(chat_template=template)
+
+    def render(value):
+        return apply_chat_template(
+            tokenizer, {"model_type": model_type}, "Find files.", tools=value
+        )
+
+    reordered = reverse_keys(tools)
+    original_json = json.dumps(reordered)
+    prompt = render(tools)
+    assert render(reordered) == prompt
+    assert json.dumps(reordered) == original_json
+    assert render(list(reversed(tools))) != prompt
+
+    changed = deepcopy(tools)
+    changed[0]["function"]["parameters"]["properties"]["path"]["type"] = "integer"
+    assert render(changed) != prompt
+    if template == "{{ tools | tojson }}":
+        assert json.loads(prompt) == tools
+
+
+@pytest.mark.parametrize("tools", [None, [], (lambda: None,)])
+def test_template_preserves_empty_and_callable_tools(tools):
+    processor = MagicMock(chat_template="{{ tools }}")
+    get_chat_template(processor, [{"role": "user", "content": "Hi"}], True, tools=tools)
+    assert processor.apply_chat_template.call_args.kwargs["tools"] == tools
 
 
 def test_apply_chat_template_preserves_explicit_thinking_enabled():
@@ -2617,6 +2749,37 @@ def test_prepare_inputs_preserves_mlx_attention_mask_for_thread_handoff():
 
     assert inputs["attention_mask"] is attention_mask
     assert consumed == [[[1, 1]]]
+
+
+@pytest.mark.parametrize("name", ["qwen3_vl", "qwen2_5_vl"])
+def test_prepare_inputs_image_limits_are_per_request(name):
+    processor = _make_processor(name)
+    processor.image_processor = m.qwen3.Qwen3VLImageProcessor(
+        min_pixels=1024, max_pixels=1048576, patch_size=16, merge_size=2
+    )
+    processor.tokenizer.special_tokens = {processor.image_token: 100}
+    for options, expected_tokens in [
+        ({}, 4),
+        (dict(min_pixels=16384), 16),
+        (dict(max_pixels=1024), 1),
+        ({}, 4),
+    ]:
+        inputs = prepare_inputs(
+            processor,
+            prompts=processor.image_token,
+            images=[Image.new("RGB", (64, 64))],
+            temperature=0.7,
+            max_tokens=8,
+            **options,
+        )
+        assert inputs["input_ids"].shape[-1] == expected_tokens
+        assert int(inputs["image_grid_thw"][0].prod()) // 4 == expected_tokens
+        assert not (
+            {"min_pixels", "max_pixels", "temperature", "max_tokens"}
+            & processor.tokenizer.last_kwargs.keys()
+        )
+    assert processor.image_processor.min_pixels == 1024
+    assert processor.image_processor.max_pixels == 1048576
 
 
 def _make_test_image_bytes():
@@ -3447,3 +3610,92 @@ def test_embedding_gemma2_prepare_inputs_routes_media(
     actual = prepare_inputs(p, prompts=[prompt], **media, return_tensors="mlx")
     for key in expected:
         equal(np.asarray(actual[key]), np.asarray(expected[key]))
+
+
+class TestMiniCPMV47Processor:
+    @staticmethod
+    def processor():
+        from mlx_vlm.models.minicpmv4_7.processing_minicpmv4_7 import (
+            MiniCPMV4_7Processor,
+            MiniCPMVImageProcessor,
+            MiniCPMVVideoProcessor,
+        )
+
+        options = dict(PROFILES["minicpm_image"])
+        return MiniCPMV4_7Processor(
+            tokenizer=ProcessorTokenizer(**PROFILES["minicpm_tokenizer"]),
+            image_processor=MiniCPMVImageProcessor(**options),
+            video_processor=MiniCPMVVideoProcessor(**options),
+        )
+
+    @pytest.mark.parametrize("mode,count", [("16x", 1), ("4x", 4)])
+    def test_mixed_media_and_mode(self, mode, count):
+        processor = self.processor()
+        processor.image_processor.use_image_id = True
+        inputs = processor(
+            text="<|video_pad|> then <|image_pad|>",
+            images=[Image.new("RGB", (56, 56), "red")],
+            videos=[np.zeros((2, 3, 56, 56), dtype=np.uint8)],
+            downsample_mode=mode,
+        )
+        assert inputs["downsample_mode"] == mode
+        assert np.count_nonzero(inputs["mm_token_type_ids"] == 2) == 2 * count
+        assert np.count_nonzero(inputs["mm_token_type_ids"] == 1) == count
+        assert len(inputs["pixel_values"][0]) == 3
+        assert inputs["input_ids"][0, 0] == processor.tokenizer.im_start_id
+        assert (
+            np.count_nonzero(inputs["input_ids"] == processor.tokenizer.im_id_start_id)
+            == 1
+        )
+        assert processor.image_processor.downsample_mode == "16x"
+        np.testing.assert_array_equal(inputs["pixel_values"][0][0], -1)
+        assert np.any(inputs["pixel_values"][0][-1] == 1)
+
+    def test_placeholder_validation_and_thinking(self):
+        processor = self.processor()
+        with pytest.raises(ValueError, match="placeholders"):
+            processor(text="Describe", images=[Image.new("RGB", (56, 56))])
+        with pytest.raises(ValueError, match="placeholders"):
+            processor(text="<|image_pad|>")
+        prompt = "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        assert processor._strip_think_prefix(prompt) == prompt
+        processor.tokenizer.apply_chat_template = Mock(return_value=prompt)
+        assert processor.apply_chat_template([], enable_thinking=False) == prompt
+        processor.tokenizer.apply_chat_template.assert_called_once_with(
+            [], enable_thinking=False
+        )
+
+    def test_save_load_roundtrip(self, tmp_path):
+        from mlx_vlm.models.minicpmv4_7 import MiniCPMV4_7Processor
+
+        processor = self.processor()
+        tokens = processor.tokenizer.special_tokens
+        backend = Tokenizer(
+            WordLevel(
+                vocab={token: i for i, token in enumerate(tokens)}, unk_token="<unk>"
+            )
+        )
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=backend,
+            unk_token="<unk>",
+            eos_token="</image>",
+            pad_token="<unk>",
+            additional_special_tokens=list(tokens),
+        )
+        tokenizer.chat_template = (
+            "{% for message in messages %}{{ message.content }}{% endfor %}"
+        )
+        processor.tokenizer = tokenizer
+        processor.video_processor.max_num_frames = 7
+        processor.image_processor.downsample_mode = "4x"
+        processor.save_pretrained(tmp_path)
+        (tmp_path / "config.json").write_text(
+            json.dumps({"model_type": "minicpmv4_7", "downsample_mode": "16x"})
+        )
+        loaded = AutoProcessor.from_pretrained(tmp_path)
+        assert isinstance(loaded, MiniCPMV4_7Processor)
+        assert loaded.image_processor.downsample_mode == "4x"
+        assert loaded.video_processor.max_num_frames == 7
+        assert loaded.tokenizer.chat_template == tokenizer.chat_template
+        result = loaded(text="<|image_pad|>", images=[Image.new("RGB", (56, 56))])
+        assert np.count_nonzero(result["mm_token_type_ids"] == 1) == 4

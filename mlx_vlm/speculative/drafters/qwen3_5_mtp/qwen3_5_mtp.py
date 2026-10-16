@@ -8,6 +8,7 @@ import mlx.nn as nn
 from ....models.base import create_attention_mask
 from ....models.cache import BatchKVCache, KVCache
 from ....models.qwen3_5.language import Qwen3_5DecoderLayer
+from ....models.qwen3_5_moe.config import TextConfig as MoeTextConfig
 from ....models.qwen3_5_moe.language import Qwen3_5MoeDecoderLayer
 from ...common import _prepare_ragged_mtp_replay
 from .config import Qwen3_5MTPConfig
@@ -40,7 +41,7 @@ class Qwen3_5MTPDraftModel(nn.Module):
         self.pre_fc_norm_hidden = nn.RMSNorm(hidden_size, eps=text_config.rms_norm_eps)
         layer_cls = (
             Qwen3_5MoeDecoderLayer
-            if "moe" in getattr(text_config, "model_type", "")
+            if isinstance(text_config, MoeTextConfig)
             else Qwen3_5DecoderLayer
         )
         self.layers = [

@@ -510,7 +510,7 @@ def test_decision_cli_routes_inputs_and_returns_json(
     state = "Please refund my café purchase."
     questions = {"route": {"type": "choice", "criteria": ["billing", "support"]}}
     result = {"answers": {"route": {"type": "choice", "value": "billing"}}}
-    args = ["--model", "model/path"]
+    args = ["--format", "native", "--model", "model/path"]
     for name, value, use_file in (
         ("state", state, state_file),
         ("questions", json.dumps(questions), questions_file),
@@ -538,7 +538,7 @@ def test_decision_cli_rejects_invalid_questions_before_loading(
 ):
     from mlx_vlm import decide
 
-    args = ["--model", "model/path", "--state", "text"]
+    args = ["--format", "native", "--model", "model/path", "--state", "text"]
     if source == "inline":
         args.extend(["--questions", "{invalid"])
     else:
@@ -563,6 +563,8 @@ def test_decision_cli_reports_unsupported_question(capsys, monkeypatch):
     with pytest.raises(SystemExit) as error:
         decide.main(
             [
+                "--format",
+                "native",
                 "--model",
                 "model/path",
                 "--state",
@@ -594,7 +596,15 @@ def test_decision_cli_passes_media(monkeypatch, state, media, flags):
     from mlx_vlm import decide
 
     questions = {"cat": {"type": "bool"}}
-    args = ["--model", "d1", "--questions", json.dumps(questions), *flags]
+    args = [
+        "--format",
+        "native",
+        "--model",
+        "d1",
+        "--questions",
+        json.dumps(questions),
+        *flags,
+    ]
     if state is not None:
         args += ["--state", state]
     model, processor = object(), object()
@@ -611,7 +621,16 @@ def test_decision_cli_requires_state_or_media(monkeypatch, capsys):
     load = Mock()
     monkeypatch.setattr(decide, "load", load)
     with pytest.raises(SystemExit) as error:
-        decide.main(["--model", "d1", "--questions", '{"q":{"type":"bool"}}'])
+        decide.main(
+            [
+                "--format",
+                "native",
+                "--model",
+                "d1",
+                "--questions",
+                '{"q":{"type":"bool"}}',
+            ]
+        )
     assert error.value.code == 2
     message = "--state --state-file --image --audio is required"
     assert message in capsys.readouterr().err
@@ -636,7 +655,7 @@ def test_decision_cli_rejects_question_structure_before_loading(
 ):
     from mlx_vlm import decide
 
-    args = ["--model", "model/path", "--state", "text"]
+    args = ["--format", "native", "--model", "model/path", "--state", "text"]
     content = json.dumps(questions)
     if from_file:
         path = tmp_path / "questions.json"
@@ -699,7 +718,7 @@ def decision_cli_responses(monkeypatch):
     return calls
 
 
-@pytest.mark.parametrize("wire_format", ["native", "systemone"])
+@pytest.mark.parametrize("wire_format", [None, "native"])
 @pytest.mark.parametrize("kind", ["file", "stdin", "jsonl"])
 def test_decision_cli_request_streams(
     decision_cli_responses, monkeypatch, tmp_path, capsys, wire_format, kind
@@ -711,7 +730,7 @@ def test_decision_cli_request_streams(
     body = {
         "model": "test",
         "state": "A",
-        "questions": {"q": {"type": "noul" if wire_format == "systemone" else "bool"}},
+        "questions": {"q": {"type": "bool" if wire_format == "native" else "noul"}},
     }
     content = (
         "\n".join(json.dumps({**body, "state": str(i)}) for i in range(5))
@@ -721,7 +740,9 @@ def test_decision_cli_request_streams(
     path = tmp_path / "requests.json"
     path.write_text(content)
     monkeypatch.setattr(sys, "stdin", io.StringIO(content))
-    args = ["--format", wire_format, "--request", str(path) if kind == "file" else "-"]
+    args = ["--request", str(path) if kind == "file" else "-"]
+    if wire_format is not None:
+        args += ["--format", wire_format]
     if kind == "jsonl":
         args += ["--jsonl", "--batch-size", "2"]
     decide.main(args)
@@ -739,15 +760,13 @@ def test_decision_cli_request_streams(
     answer = outputs[0]["answers"]["q"]
     assert answer == (
         {"type": "noul", "noul": 0.8}
-        if wire_format == "systemone"
+        if wire_format is None
         else {"type": "bool", "value": True, "probability": 0.8}
     )
 
 
-def test_decision_legacy_cli_and_comparison_gate(
-    decision_cli_responses, tmp_path, capsys
-):
-    from mlx_vlm.decision import main
+def test_decision_cli_comparison_gate(decision_cli_responses, tmp_path, capsys):
+    from mlx_vlm.decide import main
 
     questions = tmp_path / "questions.json"
     questions.write_text(json.dumps({"q": {"type": "noul"}}))

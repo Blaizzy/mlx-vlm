@@ -35,6 +35,18 @@ output = generate(model, processor, formatted_prompt, image, verbose=False)
 print(output)
 ```
 
+## Streaming tool calls
+
+With `stream: true`, Chat Completions sends argument fragments in
+`choices[0].delta.tool_calls`; Responses sends
+`response.function_call_arguments.delta` events. Accumulate fragments by call
+index (Chat Completions) or item ID (Responses). Execute a tool only after the
+stream completes successfully and its arguments are complete.
+
+Incremental arguments are supported for JSON, Cohere, Qwen Coder XML, and Gemma
+tool formats. Other parsers retain their completed-call behavior. XML values
+that require type conversion are buffered until the parameter closes.
+
 ## Conversation compaction and APC
 
 Compaction replaces older conversation turns with a model-generated handoff and
@@ -90,9 +102,9 @@ response = client.responses.create(
 `/responses/compact` is also available without the `/v1` prefix. It is a
 non-streaming endpoint. Optional MLX extensions, passed with SDK `extra_body`,
 are `max_output_tokens` (summary budget; default 1024, maximum 16384) and
-`keep_tokens` (recent-context target; the latest complete user exchange always
-stays). Resend the same `instructions` and `tools` on compaction and continuation
-requests if they were used to render the original prompt. Generated handoffs
+`keep_tokens` (recent-context target; the latest user request and protected tool
+groups always stay). Resend the same `instructions` and `tools` on compaction and
+continuation requests if they were used to render the original prompt. Generated handoffs
 have assistant authority; system/developer messages keep their original roles.
 
 For automatic compaction, add this field to a Responses request:
@@ -103,13 +115,20 @@ For automatic compaction, add this field to a Responses request:
 
 The server checks the rendered input token count **before generation**, including
 for streaming requests. This implementation does not compact mid-generation.
-The threshold is overridden when input plus reserved output would exceed the
-context limit. Automatic and terminal-trigger compaction can summarize oversized
-history in up to eight bounded passes, preserving instructions, the latest
-exchange, and tool-call/result groups. Every summary call must fit the model
-window and reduce its input; otherwise the request fails without replacing the
-original context. A single oversized exchange still needs to be reduced by the
-caller. The standalone `/responses/compact` endpoint still requires its input to fit.
+Only actual input usage triggers compaction; unused `max_output_tokens` (or
+Chat Completions `max_tokens`) does not reserve context or lower the threshold.
+After compaction, generation is capped at the smaller of the requested output
+limit and the remaining context capacity. A short prompt can therefore use a
+Max output setting equal to or larger than the context window. Generation stops
+with a length finish reason if it fills the remaining window; the next request
+can compact that history. Input that leaves no room for generation even after
+compaction is still rejected. Automatic and terminal-trigger compaction can
+summarize oversized history in up to eight bounded passes, preserving instructions
+and splitting only between user turns or completed tool-call/result groups. Every
+summary call must fit the model window and reduce its input; otherwise the request
+fails without replacing the original context. A single oversized message or
+indivisible tool group still needs to be reduced by the caller. The standalone
+`/responses/compact` endpoint still requires its input to fit.
 When compaction happens, the response output starts with a
 `type: "compaction"` item. Append the output normally, or keep only the newest
 compaction item and everything after it. `previous_response_id` chaining also
@@ -117,8 +136,8 @@ works while that response is stored. `/v1/responses/input_tokens` counts the
 decoded context, not the encrypted payload's string length. Normal response
 usage counts the final inference; explicit compact usage counts the summary pass.
 
-Chat Completions automatically compacts supported history when the full input
-plus requested output exceeds the context limit. No threshold setting is needed.
+Chat Completions automatically compacts supported history when the actual input
+leaves no room for generation within the context limit. No threshold setting is needed.
 The optional `context_management` field enables earlier compaction; an empty list
 explicitly disables compaction. Recovery supports text, images, and tool history;
 audio/video requests keep their existing behavior. Compaction finishes before the
@@ -181,15 +200,19 @@ the client truncates a retained message. They add payload bytes but no model
 prompt tokens. Messages after the capsule are new input, even when their text
 repeats earlier messages.
 
-The server preserves the latest exchange and never cuts across outstanding tool
-calls. It makes one summary attempt and accepts it only if it fits the available
-budget and reduces removable history to at most 60% of its original token count.
+Within a tool loop, the server preserves the latest user request verbatim, the
+latest completed tool group, and every outstanding call with its received results.
+Older completed groups can be summarized without waiting for another user message.
+Parallel calls stay together until all their results arrive. The server accepts a
+summary only if it fits the available budget and reduces removable history to at
+most 60% of its original token count.
 Fixed instructions, tool schemas, and the protected tail are excluded from this
 reduction target. Empty or truncated summaries and insufficient context headroom return an error without
 replacing conversation state. A short conversation with nothing to summarize is
-returned unchanged. One oversized user/tool exchange cannot be shortened by this
-policy. Separate reasoning side-channel items follow the normal Responses
-renderer; this is a textual handoff, not a compressed hidden model state.
+returned unchanged. A protected message or tool group that exceeds the budget
+still needs to be reduced by the caller. Separate reasoning side-channel items
+follow the normal Responses renderer; this is a textual handoff, not a compressed
+hidden model state.
 
 Compaction items contain authenticated encrypted conversation state, not KV
 tensors. They remain usable after cache eviction or server restart with the same

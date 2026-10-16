@@ -40,7 +40,7 @@ speech = predict(model, processor, None, {
 }, audio="https://huggingface.co/datasets/Narsil/asr_dummy/resolve/main/1.flac")
 ```
 
-From the command line, `python -m mlx_vlm decide --model LiquidAI/d1-omni-600M`
+From the command line, `python -m mlx_vlm decide --format native --model LiquidAI/d1-omni-600M`
 takes `--state` and/or either one or more `--image` options or one `--audio`;
 the server's `/v1/decisions` takes `"images"` or `"audio"` (a URL, path, or
 base64 data URI) the same way.

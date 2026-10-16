@@ -1,14 +1,17 @@
 # Decision serving and batch evaluation
 
 `mlx_vlm.predict(model, processor, state, questions)`, `mlx_vlm.decide`, and
-`/v1/decisions` share question validation and preserve each model's native scoring.
-Supported question types and media are declared by the model. Clef, Decider,
-Laya, and the LiquidAI d1 models use this interface.
+`/v1/decisions` use the same model backends. The Python API and `/v1/decisions`
+preserve each model's native scoring and answer format. The CLI defaults to the
+original TypeSafe System One format; `--format native` selects native requests
+and answers. Supported question types and media are declared by the model.
+Clef, Decider, Laya, and the LiquidAI d1 models use this interface.
 
 ## CLI
 
-Existing `--state`, `--state-file`, `--questions`, `--questions-file`, `--image`,
-and `--audio` inputs continue to work. Requests can also be supplied as JSON:
+Use `--state`, `--state-file`, `--questions`, `--questions-file`, or `--image`
+for individual inputs. Native format also supports `--audio`. Requests can be
+supplied as JSON using the [System One schema below](#typesafe-system-one-compatibility):
 
 ```sh
 python -m mlx_vlm decide --request request.json
@@ -16,9 +19,9 @@ cat request.json | python -m mlx_vlm decide --request -
 cat requests.jsonl | python -m mlx_vlm decide --request - --jsonl --batch-size 4
 ```
 
-Each request contains `model`, `state`, and `questions`; media may replace the
-state for models that support it. `--model` overrides the checkpoint in request
-files. JSONL output preserves input order. Loader diagnostics go to stderr, so
+Each request contains `model`, `state`, and `questions`. With `--format native`,
+media may replace the state for models that support it. `--model` overrides the
+checkpoint in request files. JSONL output preserves input order. Loader diagnostics go to stderr, so
 stdout remains JSON. Models that read videos accept repeatable `--video` values,
 each containing a JSON array of frame URLs. `--images` accepts multiple image
 references as an alternative to repeatable `--image`.
@@ -98,9 +101,17 @@ Image and video-frame references must be HTTP(S) URLs or image data URLs.
 }
 ```
 
-Use `mlx_vlm.decide --format systemone` for this schema. The previous
-`mlx_vlm.decision` executable, `python -m mlx_vlm decision`, and Python
-`mlx_vlm.decision.systemone(...)` helper remain compatibility entry points.
+Save this as `request.json` and run:
+
+```sh
+python -m mlx_vlm.decide --request request.json
+```
+
+`mlx_vlm.decide --request request.json` and `python -m mlx_vlm decide
+--request request.json` use this format by default. `--format systemone` selects
+it explicitly; `--format native` selects the shared native request and response
+schema. The Python `mlx_vlm.decision.systemone(...)` helper also exposes the adapter.
+
 The adapter uses unrounded distributions when the backend exposes them;
 otherwise it uses the model's native probabilities. Native `/v1/decisions`
 answers and model-specific calibration remain unchanged.

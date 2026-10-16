@@ -75,7 +75,11 @@ def mixed_quant_predicate_builder(
 
     low_bits, high_bits = recipe_config[recipe]
 
-    down_keys = [k for k, _ in model.named_modules() if "down_proj" in k]
+    # LFM2 names its feed-forward down projection `feed_forward.w2`.
+    def is_down_proj(path):
+        return "down_proj" in path or "feed_forward.w2" in path
+
+    down_keys = [k for k, _ in model.named_modules() if is_down_proj(k)]
     if len(down_keys) == 0:
         raise ValueError("Model does not have expected keys for mixed quant.")
 
@@ -115,7 +119,7 @@ def mixed_quant_predicate_builder(
             or (index - num_layers // 8) % 3 == 2
         )
 
-        if use_more_bits and ("v_proj" in path or "down_proj" in path):
+        if use_more_bits and ("v_proj" in path or is_down_proj(path)):
             return {"group_size": group_size, "bits": high_bits}
 
         if "lm_head" in path or "embed_tokens" in path:

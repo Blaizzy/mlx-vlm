@@ -24,6 +24,7 @@ from ..utils import (
     prepare_inputs,
     should_add_special_tokens,
 )
+from ..vision_cache import processed_image_key
 from .audio import generate_audio
 from .common import (
     DEFAULT_DIFFUSION_MAX_DENOISING_STEPS,
@@ -584,7 +585,8 @@ def parse_arguments():
         "--draft-model",
         type=str,
         default=None,
-        help="Speculative drafter path or HF id (e.g. z-lab/Qwen3.5-4B-DFlash).",
+        help="Speculative drafter path or HF id. Qwen3.5/3.6/3.8 and Nemotron checkpoints "
+        "with bundled MTP weights can use the same path as --model.",
     )
     parser.add_argument(
         "--draft-kind",
@@ -593,7 +595,7 @@ def parse_arguments():
         choices=["dflash", "eagle3", "mtp"],
         help="Drafter family. Supported: 'dflash' (Qwen3.5 DFlash), "
         "'eagle3' (Speculators/SGLang EAGLE-3), "
-        "'mtp' (Gemma 4 Multi-Token Prediction / Assistant model). "
+        "'mtp' (native Multi-Token Prediction / Assistant model). "
         "Default: auto-detected from the drafter's HF model_type.",
     )
     parser.add_argument(
@@ -874,18 +876,19 @@ def stream_generate(
 
     # Vision feature caching: reuse cached image features across turns
     if vision_cache is not None and image is not None and pixel_values is not None:
-        cached = vision_cache.get(image)
+        image_key = processed_image_key(pixel_values, **kwargs)
+        cached = vision_cache.get(image_key)
         if cached is not None:
             kwargs["cached_image_features"] = cached
         elif hasattr(model, "encode_images"):
             features = model.encode_images(pixel_values, **kwargs)
             mx.eval(*features)
-            vision_cache.put(image, features)
+            vision_cache.put(image_key, features)
             kwargs["cached_image_features"] = features
         elif hasattr(model, "encode_image"):
             features = model.encode_image(pixel_values)
             mx.eval(features)
-            vision_cache.put(image, features)
+            vision_cache.put(image_key, features)
             kwargs["cached_image_features"] = features
 
     # Prompt cache reuse: skip common prefix from previous turn

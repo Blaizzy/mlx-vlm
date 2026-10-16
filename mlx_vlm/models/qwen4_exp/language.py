@@ -357,8 +357,9 @@ class BatchQSAKVCache:
         return self.kv_cache.make_mask(*args, **kwargs)
 
     def filter(self, batch_indices):
-        min_left = int(self.left_padding[batch_indices].min().item())
+        previous_length = self.kv_cache._idx
         self.kv_cache.filter(batch_indices)
+        trimmed = previous_length - self.kv_cache._idx
         self.clear_index_blocks()
         if self.index_keys is None:
             return
@@ -367,10 +368,10 @@ class BatchQSAKVCache:
             self.index_position_ids = self.index_position_ids[:, batch_indices]
         else:
             self.index_position_ids = self.index_position_ids[batch_indices]
-        if min_left > 0:
-            self.index_keys = self.index_keys[:, min_left:]
-            self.index_position_ids = self.index_position_ids[..., min_left:]
-            self.index_offset -= min_left
+        if trimmed > 0:
+            self.index_keys = self.index_keys[:, trimmed:]
+            self.index_position_ids = self.index_position_ids[..., trimmed:]
+            self.index_offset -= trimmed
 
     @staticmethod
     def _promote_positions(positions, sample_positions):

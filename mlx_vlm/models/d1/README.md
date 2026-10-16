@@ -27,7 +27,7 @@ photo = predict(model, processor, None, {
 }, images=["http://images.cocodataset.org/val2017/000000039769.jpg"])
 ```
 
-From the command line, `python -m mlx_vlm decide --model LiquidAI/d1-3B` takes
+From the command line, `python -m mlx_vlm decide --format native --model LiquidAI/d1-3B` takes
 `--state` and/or one or more `--image` options; the server's `/v1/decisions`
 takes `"images"` the same way.
 
