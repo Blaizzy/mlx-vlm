@@ -28,8 +28,8 @@ budget uses the GPU's recommended working set minus resident weights and a
 reserve. On the tested 128 GB Mac, `--expert-cache-gb 60` keeps short text/image
 runs around 94 GB of peak MLX memory; a larger KV cache needs additional headroom.
 
-A local run on a 128 GB Apple M5 Max produced the same complete outputs and
-stopped normally before and after the offloader optimization:
+A local run on a 128 GB Apple M5 Max with MLX 0.32.3 produced the same complete
+outputs and stopped normally before and after the offloader optimization:
 
 | Input | Final answer | Original decode tokens/s (24 GB cache) | Optimized decode tokens/s (60 GB cache) | Response seconds, before → after |
 | --- | --- | --- | --- | --- |
