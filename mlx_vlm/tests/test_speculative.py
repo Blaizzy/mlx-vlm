@@ -494,6 +494,55 @@ def test_fused_projection_parity(bits, widths, length):
     equal(actual, expected)
 
 
+@parametrize("bits", [4, 5])
+@parametrize("dtype", [mx.bfloat16, mx.float16])
+@parametrize("projection", ["gate_up", "down"])
+def test_affine_switch_projection_parity(bits, dtype, projection):
+    mx.random.seed(2527)
+    linears = [QuantizedSwitchLinear(512, 32, 4, False, 64, bits) for _ in range(2)]
+    for linear in linears:
+        linear.scales = linear.scales.astype(dtype)
+        linear.biases = linear.biases.astype(dtype)
+    indices = mx.arange(6, dtype=mx.int32).reshape(1, 3, 2) % 4
+    if projection == "gate_up":
+        inputs = mx.random.normal((1, 3, 512)).astype(dtype)
+        expected = [
+            quantized.exact_quantized_switch_linear(linear, inputs, indices)
+            for linear in linears
+        ]
+        actual = fast_ops.exact_affine_switch_gate_up(
+            NS(up_proj=linears[0], gate_proj=linears[1]), inputs, indices
+        )
+    else:
+        inputs = mx.random.normal((1, 3, 2, 512)).astype(dtype)
+        weights = mx.softmax(mx.random.normal((1, 3, 2)), axis=-1)
+        shared = mx.random.normal((1, 3, 32)).astype(dtype)
+        routed = quantized.exact_quantized_selected_linear(linears[0], inputs, indices)
+        expected = SwitchGLU._combine(routed, weights, shared)
+        actual = fast_ops.exact_affine_moe_down(
+            linears[0], inputs, indices, weights, shared
+        )
+    assert actual is not None
+    equal(actual, expected)
+
+
+@parametrize("bits", [4, 5, 8])
+@parametrize("dtype", [mx.bfloat16, mx.float16])
+@parametrize("batch", [1, 2])
+def test_glm_quantized_head_parity(bits, dtype, batch):
+    mx.random.seed(2527)
+    head = nn.QuantizedLinear(512, 32, bias=False, group_size=64, bits=bits)
+    head.scales = head.scales.astype(dtype)
+    head.biases = head.biases.astype(dtype)
+    inputs = mx.random.normal((batch, 3, 512)).astype(dtype)
+    expected = verifier_linear._target_verify_singletons(head, inputs)
+    actual = module("models.glm_moe_dsa.speculative_verifier")._quantized_head_logits(
+        head, inputs
+    )
+    assert actual is not None
+    equal(actual, expected)
+
+
 @parametrize("kind", ["mtp", "dflash", "eagle3"])
 @parametrize("batch", [1, 2])
 @parametrize("token,failure", [(4, False), (7, False), (4, True)])
