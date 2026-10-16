@@ -19,7 +19,7 @@ result = predict(model, processor, "I was charged twice, please refund one.", {
         "criteria": ["Can wait", "Today", "Blocking the customer now"],
     },
 })
-print(result["answers"]["team"]["value"])
+print(result["answers"]["team"]["choice"])
 
 photo = predict(model, processor, None, {
     "cats": {"type": "choice", "instructions": "How many cats are there?",
@@ -27,7 +27,7 @@ photo = predict(model, processor, None, {
 }, images=["http://images.cocodataset.org/val2017/000000039769.jpg"])
 ```
 
-From the command line, `python -m mlx_vlm decide --format native --model LiquidAI/d1-3B` takes
+From the command line, `python -m mlx_vlm decide --model LiquidAI/d1-3B` takes
 `--state` and/or one or more `--image` options; the server's `/v1/decisions`
 takes `"images"` the same way.
 
@@ -49,7 +49,11 @@ d1 supports `choice`, `score`, and `bool`; `noul` is a Boolean alias. Choice
 criteria map labels to descriptions or list labels; score criteria are an
 ordered list of 2 to 10 levels; Boolean criteria optionally describe `true` and
 `false`. Choice returns a label, score its expected level, and Boolean the
-probability of `true`; `confidence` and the score `legend` are in `metadata`.
+probability of `true`. The shared Python API, CLI, and `/v1/decisions` default
+to System One answers with `choice`, `score`, or `noul` fields and top-level
+System One `confidence` and score `legend`. Native answers and metadata remain
+available through Python `format="native"`, CLI `--format native`, or HTTP
+`"format": "native"`.
 
 `images` is one image or a list of PIL images, paths, or URLs; files are
 turned upright by their EXIF orientation, PIL images are read as given. Each is

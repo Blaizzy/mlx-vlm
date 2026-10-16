@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from fastapi import HTTPException, Request, Response
 from pydantic import BaseModel, Field, model_validator
@@ -35,6 +35,10 @@ def _default_decision_model() -> Optional[str]:
 
 
 class DecisionRequest(BaseModel):
+    format: Literal["systemone", "native"] = Field(
+        default="systemone",
+        description="Response format; native retains model-specific metadata and multi-label scores",
+    )
     model: Optional[str] = Field(default=None, min_length=1)
     state: Union[str, Dict[str, Any], list, None] = None
     questions: Dict[str, Dict[str, Any]] = Field(min_length=1)
@@ -72,6 +76,7 @@ def get_scheduler(deps):
 
 async def _execute(body, request, response, deps, *, systemone=False):
     endpoint = "/v1/systemone" if systemone else "/v1/decisions"
+    response_format = "systemone" if systemone else body.pop("format", "systemone")
     model_id = body.get("model") or _default_decision_model()
     if not model_id:
         raise HTTPException(
@@ -89,7 +94,8 @@ async def _execute(body, request, response, deps, *, systemone=False):
         job = get_scheduler(deps).submit(
             native,
             namespace=deps.read_tenant_id(request),
-            allow_single_criterion=systemone,
+            allow_single_criterion=response_format == "systemone",
+            response_format=response_format,
         )
         future = asyncio.wrap_future(job.future)
         while not future.done():
@@ -98,7 +104,11 @@ async def _execute(body, request, response, deps, *, systemone=False):
                 job.cancel()
                 raise HTTPException(status_code=499, detail="Client disconnected")
         output = await future
-        result = format_response(body, output) if systemone else output["response"]
+        result = (
+            format_response(body, output)
+            if response_format == "systemone"
+            else output["response"]
+        )
     except asyncio.CancelledError:
         if job is not None:
             job.cancel()
@@ -145,7 +155,7 @@ async def _execute(body, request, response, deps, *, systemone=False):
         )
     )
     result["model"] = model_id
-    if systemone:
+    if response_format == "systemone":
         from uuid import uuid4
 
         response.headers["x-typesafe-request-id"] = uuid4().hex

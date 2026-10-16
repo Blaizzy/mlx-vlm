@@ -2231,7 +2231,9 @@ def test_decision_prefill_and_prefix_contract(incremental_decision, cache_bytes,
     from mlx_vlm.tests.test_extraction_models import _assert_decision_answers
 
     _, (model, processor, body) = incremental_decision
-    expected = predict(model, processor, body["state"], body["questions"])
+    expected = predict(
+        model, processor, body["state"], body["questions"], format="native"
+    )
     engine = make_decision_engine(
         model, processor, prefill_step_size=chunk, cache_bytes=cache_bytes
     )
@@ -2270,7 +2272,9 @@ def test_decision_prefix_isolation_eviction_and_clear(incremental_decision):
     second = {**body, "questions": {"different": {"type": "bool"}}}
     record = engine.prepare(second, namespace="a").record
     output = engine.decide(second, namespace="a")
-    expected = predict(model, processor, second["state"], second["questions"])
+    expected = predict(
+        model, processor, second["state"], second["questions"], format="native"
+    )
     _assert_decision_answers(output["response"]["answers"], expected["answers"])
     assert (
         engine.prefill_tokens - before == len(record.input_ids) - record.prefix_length
@@ -2333,6 +2337,8 @@ def test_decision_overflow_and_context_configuration(incremental_decision):
     for value in (0, -1, model.config.text_config.max_position_embeddings + 1):
         with pytest.raises(ValueError):
             make_decision_engine(model, processor, max_length=value)
+    with pytest.raises(ValueError, match="State exceeds"):
+        predict(model, processor, "A B", body["questions"], max_state_tokens=1)
 
 
 def test_decision_mixed_media_cache_contract(incremental_decision):
@@ -2383,6 +2389,7 @@ def test_decision_mixed_media_cache_contract(incremental_decision):
         body["questions"],
         images=body["images"],
         videos=body["videos"],
+        format="native",
     )
     _assert_decision_answers(
         engine.decide(body)["response"]["answers"], expected["answers"]

@@ -28,7 +28,7 @@ result = predict(model, processor, "I was charged twice, please refund one.", {
         "criteria": ["Can wait", "Today", "Blocking the customer now"],
     },
 })
-print(result["answers"]["team"]["value"])
+print(result["answers"]["team"]["choice"])
 
 photo = predict(model, processor, None, {
     "cats": {"type": "choice", "instructions": "How many cats are there?",
@@ -40,7 +40,7 @@ speech = predict(model, processor, None, {
 }, audio="https://huggingface.co/datasets/Narsil/asr_dummy/resolve/main/1.flac")
 ```
 
-From the command line, `python -m mlx_vlm decide --format native --model LiquidAI/d1-omni-600M`
+From the command line, `python -m mlx_vlm decide --model LiquidAI/d1-omni-600M`
 takes `--state` and/or either one or more `--image` options or one `--audio`;
 the server's `/v1/decisions` takes `"images"` or `"audio"` (a URL, path, or
 base64 data URI) the same way.
@@ -48,10 +48,12 @@ base64 data URI) the same way.
 d1-omni supports `choice`, `score`, and `bool`; `noul` is an alias for `bool`.
 A `choice` takes `{label: description}` or a list of labels, a `score` an
 ordered list of 2 to 10 levels, and a `bool` optional `{"false": ..., "true":
-...}` descriptions. Choice and score answers include `probabilities` and
-`metadata.confidence`; scores also carry the level `legend`. Boolean answers
-include `probability`, the probability of true, and use 0.5 to select their
-value.
+...}` descriptions. The shared Python API, CLI, and `/v1/decisions` default to
+System One answers: `choice`, `score`, and `noul`. Choice and score answers
+include `probabilities` and top-level System One `confidence`; scores also carry
+the level `legend`. Boolean answers put the probability of true in `noul`.
+Use Python `format="native"`, CLI `--format native`, or HTTP `"format": "native"`
+for native answers and model-specific metadata.
 
 A state is a string, any JSON value, or `None` when images or audio are the
 whole state. `images` is one image or a list of PIL images, paths, or URLs,

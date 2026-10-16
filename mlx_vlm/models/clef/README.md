@@ -19,7 +19,7 @@ result = predict(model, processor, "Please refund my duplicate charge", {
         "criteria": ["billing", "technical", "sales"],
     },
 })
-print(result["answers"]["department"]["value"])
+print(result["answers"]["department"]["choice"])
 ```
 
 Standard loading accepts prepared `model_type: "clef"` checkpoints with
@@ -36,7 +36,10 @@ the probability of true. `images` and `videos` may be passed to `predict`.
 
 See [shared decision serving](../../../docs/decisions.md) for scheduling,
 state-prefix caching, cancellation, JSONL evaluation, and the TypeSafe adapter.
-The model retains its native `predict()` and `/v1/decisions` answer schema.
+The shared `predict()`, CLI, and `/v1/decisions` default to System One answers:
+`choice`, `score`, or `noul`, with top-level confidence and score legend.
+Use `format="native"` in Python, `--format native` in the CLI, or
+`"format": "native"` over HTTP for native answers and model-specific metadata.
 
 ## Quantization
 

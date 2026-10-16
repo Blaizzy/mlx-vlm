@@ -9,7 +9,7 @@ from pathlib import Path
 
 from .decision import _validate_question_structure, predict
 from .decision_scheduler import DecisionScheduler
-from .systemone import SystemOneRequest, format_response, native_request
+from .systemone import format_response, validate_response_format
 from .utils import load
 
 
@@ -141,9 +141,8 @@ def _validated_body(raw, args):
     body = dict(raw)
     if args.model:
         body["model"] = args.model
-    if args.format == "systemone":
-        return SystemOneRequest.model_validate(body).model_dump(exclude_none=True)
     _validate_question_structure(body.get("questions"))
+    validate_response_format(args.format, body["questions"])
     if not isinstance(body.get("model"), str) or not body["model"]:
         raise ValueError("Specify a model for each request or with --model")
     if body.get("state") is None and not any(
@@ -178,7 +177,7 @@ def main(argv=None):
         "--format",
         choices=["native", "systemone"],
         default="systemone",
-        help="Request and response format (default: systemone)",
+        help="Response format (default: systemone)",
     )
     parser.add_argument("--max-length", type=int)
     parser.add_argument("--batch-size", type=int, default=4)
@@ -206,10 +205,9 @@ def main(argv=None):
         parser.error("--report requires --compare-model")
     output_stream = sys.stdout
     requests = (_validated_body(raw, args) for raw in _requests(args, parser))
-    # Retain the simple native CLI's standard load()/predict() contract.
+    # Direct requests share the public Python API and its response formatter.
     simple = (
-        args.format == "native"
-        and args.request is None
+        args.request is None
         and not args.compare_model
         and args.max_length is None
         and args.batch_size == 4
@@ -226,6 +224,7 @@ def main(argv=None):
                     processor,
                     body.get("state"),
                     body["questions"],
+                    format=args.format,
                     **{
                         k: v
                         for k, v in body.items()
@@ -253,8 +252,11 @@ def main(argv=None):
         )
 
     def submit(queue, body):
-        native = native_request(body) if args.format == "systemone" else body
-        return queue.submit(native, allow_single_criterion=args.format == "systemone")
+        return queue.submit(
+            body,
+            allow_single_criterion=args.format == "systemone",
+            response_format=args.format,
+        )
 
     candidates, inputs, pending = [], [], deque()
     queue = scheduler()

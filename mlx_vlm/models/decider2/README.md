@@ -13,7 +13,7 @@ result = predict(model, processor, "Please refund my duplicate charge", {
         "criteria": ["billing", "technical", "sales"],
     },
 })
-print(result["answers"]["department"]["value"])
+print(result["answers"]["department"]["choice"])
 ```
 
 Use a checkpoint with `model_type: "decider2"` in its root `config.json`,
@@ -25,11 +25,14 @@ Mapika checkpoint or an older conversion labeled `qwen3_5_text`.
 Weights use the existing Qwen3.5 text backbone and sanitization. No special
 loader or runtime sidecar detection is required.
 
-The shared `predict(model, processor, state, questions)` API returns named
-answers with `type` and `value`. Decider supports `choice`, `score`, and `bool`;
-`noul` is a Boolean alias. Choice returns a label and score returns an expected
-level index, both with `probabilities`. Boolean answers include the probability
-of true. Confidence, certainty, and isolated-level metrics remain in `metadata`.
+The shared `predict(model, processor, state, questions)` API, CLI, and
+`/v1/decisions` default to System One answers. Decider supports `choice`, `score`,
+and `bool`; `noul` is a Boolean alias. Answers put the selected label in `choice`,
+the expected level index in `score`, and the probability of true in `noul`.
+Choice and score answers include `probabilities` and shared System One confidence.
+Use `format="native"` in Python, `--format native` in the CLI, or
+`"format": "native"` over HTTP for model-specific confidence, certainty, and
+isolated-level metrics in `metadata`.
 Unsupported question types fail before inference. No answer tokens are generated.
 
 Choice criteria are 2–255 labels or a mapping of labels to descriptions. Score

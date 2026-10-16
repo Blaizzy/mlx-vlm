@@ -6411,7 +6411,7 @@ def test_realtime_websocket_requires_native_pcm_rate(realtime_client):
 
 
 @pytest.mark.parametrize("kind", ["choice", "score", "bool", "multi_label"])
-def test_decisions_endpoint_uses_shared_prediction(client, kind):
+def test_decisions_endpoint_preserves_explicit_native_output(client, kind):
     criteria = None if kind == "bool" else ["low", "high"]
     questions = {"result": {"type": kind, "criteria": criteria}}
     result = {
@@ -6425,7 +6425,12 @@ def test_decisions_endpoint_uses_shared_prediction(client, kind):
     ) as load:
         response = client.post(
             "/v1/decisions",
-            json={"model": "decision", "state": "text", "questions": questions},
+            json={
+                "model": "decision",
+                "state": "text",
+                "questions": questions,
+                "format": "native",
+            },
         )
     assert response.status_code == 200
     assert response.json() == {**result, "model": "decision"}
@@ -6520,7 +6525,12 @@ def test_decisions_default_model(client, monkeypatch, preloaded):
     if preloaded:
         server.runtime.model_cache.set("decision", {"model_path": "preloaded"})
     model = NS(
-        decision_types=("bool",), predict=MagicMock(return_value={"answers": {}})
+        decision_types=("bool",),
+        predict=MagicMock(
+            return_value={
+                "answers": {"x": {"type": "bool", "value": True, "probability": 0.8}}
+            }
+        ),
     )
     with patch.object(
         server, "get_cached_model", return_value=(model, None, {})
@@ -6542,7 +6552,12 @@ def test_decisions_default_model_from_env(client, monkeypatch):
     _reset_runtime(monkeypatch)
     monkeypatch.setenv("MLX_VLM_PRELOAD_DECISION_MODEL", "env-decision")
     model = NS(
-        decision_types=("bool",), predict=MagicMock(return_value={"answers": {}})
+        decision_types=("bool",),
+        predict=MagicMock(
+            return_value={
+                "answers": {"x": {"type": "bool", "value": True, "probability": 0.8}}
+            }
+        ),
     )
     with patch.object(
         server, "get_cached_model", return_value=(model, None, {})
@@ -6592,7 +6607,12 @@ def test_decisions_preserves_valid_threshold(client, threshold):
     with patch.object(server, "get_cached_model", return_value=(model, None, {})):
         response = client.post(
             "/v1/decisions",
-            json={"model": "decision", "state": "text", "questions": questions},
+            json={
+                "model": "decision",
+                "state": "text",
+                "questions": questions,
+                "format": "native",
+            },
         )
     assert response.status_code == 200
     model.predict.assert_called_once_with(None, "text", questions)
@@ -6621,7 +6641,10 @@ def test_decisions_generic_prediction_failure_returns_500(client):
 def test_decisions_pass_images_and_allow_null_state(client, state):
     images = ["data:image/png;base64,iVBORw0KGgo=", "https://example.com/cat.jpg"]
     questions = {"cat": {"type": "bool"}}
-    result = {"answers": {"cat": {"type": "bool", "value": True}}, "usage": {}}
+    result = {
+        "answers": {"cat": {"type": "bool", "value": True, "probability": 0.8}},
+        "usage": {},
+    }
     model = NS(
         decision_types=("bool",),
         decision_media=("images",),
@@ -6634,7 +6657,11 @@ def test_decisions_pass_images_and_allow_null_state(client, state):
             json={"model": "d1", "questions": questions, "images": images, **state},
         )
     assert response.status_code == 200
-    assert response.json() == {**result, "model": "d1"}
+    assert response.json() == {
+        "model": "d1",
+        "answers": {"cat": {"type": "noul", "noul": 0.8}},
+        "usage": {"input_tokens": 0, "output_tokens": 0},
+    }
     model.predict.assert_called_once_with(
         processor, state.get("state"), questions, images=images
     )
@@ -6684,7 +6711,10 @@ def test_decisions_reject_media_for_text_only_models(client, media, kind):
 )
 def test_decisions_pass_audio_and_allow_null_state(client, audio, expected):
     questions = {"speech": {"type": "bool"}}
-    result = {"answers": {"speech": {"type": "bool", "value": True}}, "usage": {}}
+    result = {
+        "answers": {"speech": {"type": "bool", "value": True, "probability": 0.8}},
+        "usage": {},
+    }
     model = NS(
         decision_types=("bool",),
         decision_media=("audio",),
@@ -6696,7 +6726,11 @@ def test_decisions_pass_audio_and_allow_null_state(client, audio, expected):
             json={"model": "d1", "state": None, "questions": questions, "audio": audio},
         )
     assert response.status_code == 200
-    assert response.json() == {**result, "model": "d1"}
+    assert response.json() == {
+        "model": "d1",
+        "answers": {"speech": {"type": "noul", "noul": 0.8}},
+        "usage": {"input_tokens": 0, "output_tokens": 0},
+    }
     args, kwargs = model.predict.call_args
     assert args == (None, None, questions) and set(kwargs) == {"audio"}
     sent = kwargs["audio"]
@@ -6749,8 +6783,14 @@ def test_systemone_rejects_invalid_questions(client, question):
     load.assert_not_called()
 
 
-@pytest.mark.parametrize("surface", ["http", "dict", "schema"])
-def test_systemone_adapts_shared_predictions_and_confidence(client, surface):
+@pytest.mark.parametrize(
+    "surface", ["/v1/systemone", "/v1/decisions", "predict", "cli", "dict", "schema"]
+)
+@pytest.mark.parametrize("raw", [False, True])
+def test_systemone_adapts_shared_predictions_and_confidence(
+    client, surface, tmp_path, capsys, raw
+):
+    from mlx_vlm import decide, predict
     from mlx_vlm.decision import systemone
     from mlx_vlm.systemone import SystemOneRequest
 
@@ -6762,6 +6802,7 @@ def test_systemone_adapts_shared_predictions_and_confidence(client, surface):
         "only_level": {"type": "score", "criteria": ["Low"]},
     }
     native = {
+        "model": "decision",
         "answers": {
             "outage": {"type": "bool", "value": True, "probability": 0.8},
             "team": {
@@ -6778,31 +6819,128 @@ def test_systemone_adapts_shared_predictions_and_confidence(client, surface):
         "usage": {"input_tokens": 12},
     }
     model = NS(
-        decision_types=("bool", "choice", "score"), predict=Mock(return_value=native)
+        decision_types=("bool", "choice", "score"),
+        predict=Mock(return_value=native),
+        config=NS(),
     )
     native["answers"]["only_choice"] = {"probabilities": {"one": 1.0}}
     native["answers"]["only_level"] = {"probabilities": {"0": 1.0}}
+    prepared = []
+    if raw:
+
+        class Engine:
+            def __init__(self):
+                self.model = model
+
+            def prepare(self, body, **kwargs):
+                prepared.append(body)
+                return NS(offset=0, done=False)
+
+            def step(self, states):
+                for state in states:
+                    state.offset, state.done = 1, True
+
+            def finish(self, state):
+                return {
+                    "response": native,
+                    "cached_tokens": 0,
+                    "probabilities": {
+                        "outage": {"true": 0.8, "false": 0.2},
+                        # Rounded probabilities would give confidence 0.5.
+                        "team": {"billing": 0.24996, "technical": 0.75004},
+                        "urgency": {"0": 0.1, "1": 0.2, "2": 0.7},
+                        "only_choice": {"one": 1.0},
+                        "only_level": {"0": 1.0},
+                    },
+                }
+
+        model.make_decision_engine = lambda *a, **kw: Engine()
+    if surface in ("/v1/decisions", "predict", "cli"):
+        questions["outage"]["type"] = "bool"
+        questions["team"]["criteria"] = list(questions["team"]["criteria"])
     body = {"model": "decision", "state": "A", "questions": questions}
-    if surface == "http":
+    if surface.startswith("/v1/"):
         with patch.object(server, "get_cached_model", return_value=(model, None, {})):
-            response = client.post("/v1/systemone", json=body)
+            response = client.post(surface, json=body)
         assert response.status_code == 200, response.text
         assert response.headers["x-typesafe-request-id"]
         assert response.headers["x-clef-cached-tokens"] == "0"
         result = response.json()
+    elif surface == "predict":
+        result = predict(model, None, body["state"], questions)
+    elif surface == "cli":
+        path = tmp_path / "request.json"
+        path.write_text(json.dumps(body))
+        with patch.object(decide, "load", return_value=(model, None)):
+            decide.main(["--request", str(path)])
+        result = json.loads(capsys.readouterr().out)
     else:
         request = SystemOneRequest.model_validate(body) if surface == "schema" else body
         result = systemone(model, None, request)
     answers = result["answers"]
+    assert result["model"] == "decision"
+    assert result["usage"] == {"input_tokens": 12, "output_tokens": 0}
     assert answers["outage"] == {"type": "noul", "noul": 0.8}
-    assert answers["team"]["confidence"] == 0.5
+    assert answers["team"]["confidence"] == (0.5001 if raw else 0.5)
     assert (
         answers["urgency"]["score"] == 1.6 and answers["urgency"]["confidence"] == 0.4
     )
     assert answers["only_choice"]["confidence"] == 1.0
     assert answers["only_level"]["score"] == 0.0
     assert answers["only_level"]["confidence"] == 1.0
-    assert model.predict.call_args.args[2]["outage"]["type"] == "bool"
+    if raw:
+        model.predict.assert_not_called()
+        assert prepared[0]["questions"]["outage"]["type"] == "bool"
+    else:
+        assert model.predict.call_args.args[2]["outage"]["type"] == "bool"
+
+
+@pytest.mark.parametrize("surface", ["predict", "http", "cli"])
+def test_decision_multilabel_requires_native_output(client, surface, tmp_path, capsys):
+    from mlx_vlm import decide, predict
+
+    questions = {"tags": {"type": "multi_label", "criteria": ["a", "b"]}}
+    native = {
+        "answers": {
+            "tags": {
+                "type": "multi_label",
+                "value": ["a", "b"],
+                "scores": {"a": 0.8, "b": 0.9},
+            }
+        },
+        "model": "decision",
+    }
+    model = NS(
+        decision_types=("multi_label",), config=NS(), predict=Mock(return_value=native)
+    )
+    body = {"model": "decision", "state": "A", "questions": questions}
+    if surface == "predict":
+        with pytest.raises(ValueError, match="use format='native'"):
+            predict(model, None, "A", questions)
+        model.predict.assert_not_called()
+        result = predict(model, None, "A", questions, format="native")
+    elif surface == "http":
+        with patch.object(server, "get_cached_model", return_value=(model, None, {})):
+            response = client.post("/v1/decisions", json=body)
+            assert response.status_code == 400
+            assert "use format='native'" in response.json()["detail"]
+            model.predict.assert_not_called()
+            response = client.post("/v1/decisions", json={**body, "format": "native"})
+        assert response.status_code == 200
+        result = response.json()
+    else:
+        path = tmp_path / "request.json"
+        path.write_text(json.dumps(body))
+        with patch.object(decide, "load", return_value=(model, None)):
+            with pytest.raises(SystemExit) as error:
+                decide.main(["--request", str(path)])
+            assert error.value.code == 2
+            assert "use format='native'" in capsys.readouterr().err
+            model.predict.assert_not_called()
+            decide.main(["--request", str(path), "--format", "native"])
+        result = json.loads(capsys.readouterr().out)
+    assert result == native
+    model.predict.assert_called_once_with(None, "A", questions)
 
 
 @pytest.mark.parametrize(

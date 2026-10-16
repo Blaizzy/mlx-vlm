@@ -13,21 +13,39 @@ def _validate_question_structure(questions):
         raise ValueError("Questions must map names to question dictionaries")
 
 
-def predict(model, processor, state, questions, **kwargs):
-    """Predict named decisions using a model's native scoring and calibration.
+def predict(model, processor, state, questions, *, format="systemone", **kwargs):
+    """Predict named decisions with System One answers by default.
 
     Questions contain a type, instructions, and criteria. Types are ``choice``,
-    ``score``, ``bool``, and ``multi_label``; support is model-specific.
-    Probabilities and independent scores remain distinct, and model-specific
-    metrics stay in ``metadata``. ``state`` may be ``None`` when media such as
-    ``images=[...]`` carry the whole state; a model reads the media named in
-    its ``decision_media``.
+    ``score``, and ``bool`` (or ``noul``); support is model-specific. Answers use
+    ``choice``, ``score``, and ``noul`` fields and System One confidence formulas.
+    Use ``format="native"`` for model-specific metadata and ``multi_label``
+    scores. Model calibration is applied before either response is formatted.
+    ``state`` may be ``None`` when supported media carry the whole state.
     """
-    normalized, kwargs = normalize_questions(model, questions, **kwargs)
-    return model.predict(processor, state, normalized, **kwargs)
+    from .systemone import format_response
+
+    normalized, kwargs = normalize_questions(
+        model,
+        questions,
+        response_format=format,
+        allow_single_criterion=format == "systemone",
+        **kwargs,
+    )
+    if format == "native":
+        return model.predict(processor, state, normalized, **kwargs)
+    body = {"state": state, "questions": normalized, **kwargs}
+    return format_response(body, _predict_output(model, processor, body))
 
 
-def normalize_questions(model, questions, *, allow_single_criterion=False, **kwargs):
+def normalize_questions(
+    model,
+    questions,
+    *,
+    allow_single_criterion=False,
+    response_format="native",
+    **kwargs,
+):
     """Validate capabilities independently of eager or scheduled execution."""
     supported = getattr(model, "decision_types", ())
     if not supported:
@@ -42,6 +60,8 @@ def normalize_questions(model, questions, *, allow_single_criterion=False, **kwa
     for name, question in questions.items():
         question = dict(question)
         kind = question.get("type", "choice")
+        if kind == "noul" and "bool" in supported:
+            kind = "bool"
         if kind not in supported:
             raise ValueError(f"This model does not support {kind!r} decisions")
         criteria = question.get("criteria")
@@ -80,6 +100,9 @@ def normalize_questions(model, questions, *, allow_single_criterion=False, **kwa
             question["criteria"] = list(criteria)
         question["type"] = kind
         normalized[name] = question
+    from .systemone import validate_response_format
+
+    validate_response_format(response_format, normalized)
     return normalized, kwargs
 
 
@@ -101,24 +124,22 @@ def context_limit(config, requested=None):
     return limit
 
 
-def systemone(model, processor, request, max_length=None, *, engine=None):
-    """Compatibility helper using the same model capabilities as native serving."""
+def _predict_output(model, processor, body, *, engine=None):
+    """Retain raw probabilities from incremental backends before formatting."""
     from .decision_scheduler import make_decision_engine
-    from .systemone import SystemOneRequest, format_response, native_request
 
-    request = SystemOneRequest.model_validate(request).model_dump(exclude_none=True)
-    body = native_request(request)
-    questions, media = normalize_questions(
-        model,
-        body["questions"],
-        allow_single_criterion=True,
-        **{
-            key: value
-            for key, value in body.items()
-            if key not in ("model", "state", "questions")
-        },
-    )
-    body = {**body, "questions": questions, **media}
+    kwargs = {
+        key: value
+        for key, value in body.items()
+        if key not in ("model", "state", "questions")
+    }
+    if engine is None and getattr(model, "make_decision_engine", None) is None:
+        return {
+            "response": model.predict(
+                processor, body.get("state"), body["questions"], **kwargs
+            )
+        }
+    max_length = kwargs.get("max_length")
     backend = engine or make_decision_engine(
         model,
         processor,
@@ -129,7 +150,32 @@ def systemone(model, processor, request, max_length=None, *, engine=None):
     state = backend.prepare(body)
     while not state.done:
         backend.step([state])
-    return format_response(request, backend.finish(state))
+    return backend.finish(state)
+
+
+def systemone(model, processor, request, max_length=None, *, engine=None):
+    """Accept a strict System One request using the shared prediction formatter."""
+    from .systemone import SystemOneRequest, format_response, native_request
+
+    request = SystemOneRequest.model_validate(request).model_dump(exclude_none=True)
+    body = native_request(request)
+    questions, media = normalize_questions(
+        model,
+        body["questions"],
+        allow_single_criterion=True,
+        response_format="systemone",
+        **{
+            key: value
+            for key, value in body.items()
+            if key not in ("model", "state", "questions")
+        },
+    )
+    body = {**body, "questions": questions, **media}
+    if max_length is not None:
+        body["max_length"] = max_length
+    return format_response(
+        request, _predict_output(model, processor, body, engine=engine)
+    )
 
 
 def comparison_report(*args, **kwargs):

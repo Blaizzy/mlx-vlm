@@ -2016,16 +2016,19 @@ class ExtractionChecks:
         for name, answer in expected["answers"].items():
             question = questions[name]
             kind = question["type"]
-            assert answer["type"] == kind
+            assert answer["type"] == ("noul" if kind in ("bool", "noul") else kind)
             if kind == "choice":
-                assert answer["value"] in question["criteria"]
+                assert answer["choice"] in question["criteria"]
             elif kind == "score":
-                assert 0 <= answer["value"] <= len(question["criteria"]) - 1
-            elif kind == "bool":
-                assert isinstance(answer["value"], bool)
-                assert 0 <= answer["probability"] <= 1
-            elif kind == "multi_label":
-                assert set(answer["value"]) <= set(question["criteria"])
+                assert 0 <= answer["score"] <= len(question["criteria"]) - 1
+                assert answer["legend"] == {
+                    str(i): value for i, value in enumerate(question["criteria"])
+                }
+            elif kind in ("bool", "noul"):
+                assert 0 <= answer["noul"] <= 1
+            if kind in ("choice", "score"):
+                assert 0 <= answer["confidence"] <= 1
+            assert "metadata" not in answer and "value" not in answer
             if "probabilities" in answer:
                 assert sum(answer["probabilities"].values()) == pytest.approx(
                     1, abs=1e-3
@@ -2506,7 +2509,7 @@ class TestD1DecisionModel(unittest.TestCase):
             ]
         self.assertEqual(
             [answer["type"] for answer in result["answers"].values()],
-            ["choice", "score", "bool"],
+            ["choice", "score", "noul"],
         )
         self.assertEqual(
             result["usage"]["input_tokens"], len(trunk) + sum(map(len, branches))
@@ -2844,18 +2847,14 @@ class TestD1OmniDecisionModel(unittest.TestCase):
         alone = predict(
             model, tok, None, {"a": q1, "b": q2}, images=[image], token_budget=1
         )["answers"]
-        self.assertAlmostEqual(
-            alone["a"]["probability"], answers["a"]["probability"], places=3
-        )
+        self.assertAlmostEqual(alone["a"]["noul"], answers["a"]["noul"], places=3)
         self.assertEqual(
-            [a["type"] for a in answers.values()], ["bool", "choice", "score"]
+            [a["type"] for a in answers.values()], ["noul", "choice", "score"]
         )
         [(same, _)] = model.probabilities(tok, [(None, [q1, q2, q3], [image])])
-        self.assertEqual(answers["a"]["probability"], round(same[0][1], 4))
+        self.assertEqual(answers["a"]["noul"], round(same[0][1], 4))
         self.assertEqual(set(answers["b"]["probabilities"]), {"a", "b", "c"})
-        self.assertEqual(
-            answers["c"]["metadata"]["legend"], {"0": "low", "1": "mid", "2": "high"}
-        )
+        self.assertEqual(answers["c"]["legend"], {"0": "low", "1": "mid", "2": "high"})
 
     def test_media_prefix_reads_only_media(self):
         # Prefix queries never see text keys and the centred convolution never lets
@@ -2977,9 +2976,9 @@ class TestD1OmniDecisionModel(unittest.TestCase):
         result = predict(model, tok, None, questions, audio=clip)
         answers = result["answers"]
         self.assertEqual(
-            [a["type"] for a in answers.values()], ["bool", "choice", "score"]
+            [a["type"] for a in answers.values()], ["noul", "choice", "score"]
         )
-        self.assertEqual(answers["a"]["probability"], round(alone[1][0][0][1], 4))
+        self.assertEqual(answers["a"]["noul"], round(alone[1][0][0][1], 4))
         self.assertEqual(set(answers["b"]["probabilities"]), {"a", "b", "c"})
         self.assertEqual(result["usage"]["input_tokens"], batched[1][1])
         # int16 PCM is scaled by 1/32768; float samples and 16 kHz files agree.
@@ -3051,17 +3050,26 @@ def _assert_decision_answers(actual, expected):
     [case for case in EXTRACTION_DATA["cases"] if "decision_models" in case["checks"]],
     ids=lambda case: case["id"],
 )
-def test_decision_scheduler_preserves_native_prediction(case):
+@pytest.mark.parametrize("wire_format", ["systemone", "native"])
+def test_decision_scheduler_preserves_prediction(case, wire_format):
     from mlx_vlm import predict
     from mlx_vlm.decision_scheduler import DecisionScheduler
+    from mlx_vlm.systemone import format_response
 
     model, processor, body = _decision_fixture(case)
-    expected = predict(model, processor, body["state"], body["questions"])
+    expected = predict(
+        model, processor, body["state"], body["questions"], format=wire_format
+    )
     scheduler = DecisionScheduler(lambda name: (model, processor, model.config))
     try:
-        jobs = [scheduler.submit(body) for _ in range(2)]
+        jobs = [scheduler.submit(body, response_format=wire_format) for _ in range(2)]
         for job in jobs:
-            actual = job.future.result(timeout=10)["response"]
+            output = job.future.result(timeout=10)
+            actual = (
+                format_response(body, output)
+                if wire_format == "systemone"
+                else output["response"]
+            )
             _assert_decision_answers(actual["answers"], expected["answers"])
             assert actual.get("usage") == expected.get("usage")
     finally:

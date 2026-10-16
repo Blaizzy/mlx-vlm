@@ -1,4 +1,4 @@
-"""TypeSafe System One compatibility over native typed decision results."""
+"""Shared System One response formatting and strict compatibility schemas."""
 
 import json
 from typing import Annotated, Dict, List, Literal, Union
@@ -92,11 +92,24 @@ class SystemOneResponse(BaseModel):
     usage: DecisionUsage
 
 
+def validate_response_format(format, questions):
+    if format not in ("systemone", "native"):
+        raise ValueError("Decision format must be 'systemone' or 'native'")
+    if format == "systemone":
+        for question in questions.values():
+            kind = question.get("type", "choice")
+            if kind not in ("bool", "noul", "choice", "score"):
+                raise ValueError(
+                    f"System One output does not support {kind!r}; use format='native'"
+                )
+
+
 def systemone_answer(question, probabilities):
     """TypeSafe adapter confidence statistics, computed before output rounding."""
-    if question["type"] == "noul":
+    kind = question.get("type", "choice")
+    if kind in ("bool", "noul"):
         return {"type": "noul", "noul": round(probabilities["true"], 4)}
-    if question["type"] == "choice":
+    if kind == "choice":
         options = list(question["criteria"])
         choice = max(options, key=probabilities.__getitem__)
         n = len(options)
@@ -142,6 +155,7 @@ def native_request(request):
 
 
 def format_response(request, output):
+    validate_response_format("systemone", request["questions"])
     answers = {}
     raw = output.get("probabilities")
     native = output["response"]
@@ -149,14 +163,14 @@ def format_response(request, output):
         answer = native["answers"][name]
         if raw is not None:
             probabilities = raw[name]
-        elif question["type"] == "noul":
+        elif question.get("type") in ("bool", "noul"):
             p = answer["probability"]
             probabilities = {"true": p, "false": 1 - p}
         else:
             probabilities = answer["probabilities"]
         answers[name] = systemone_answer(question, probabilities)
     return {
-        "model": request["model"],
+        "model": request.get("model", native.get("model", "")),
         "answers": answers,
         "usage": {
             "input_tokens": native.get("usage", {}).get("input_tokens", 0),

@@ -15,7 +15,7 @@ python -m mlx_vlm convert --help
 python -m mlx_vlm generate --help
 ```
 
-- `mlx_vlm.decide` – predict named decisions using the original System One JSON format; `--format native` supports native questions and answers, including audio for capable models.
+- `mlx_vlm.decide` – predict named decisions from text and model-supported media, returning System One answers by default; `--format native` preserves model-specific metadata and multi-label scores.
 - `mlx_vlm.convert` – convert Hugging Face models to MLX format.
 - `mlx_vlm.generate` – run inference on images, audio, or video.
 - `mlx_vlm.chat_ui` – start an interactive Gradio UI.

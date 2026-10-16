@@ -502,15 +502,17 @@ def test_video_generation_cli(tmp_path, capsys, mode, image, last, workflow):
 
 @pytest.mark.parametrize("state_file", [False, True])
 @pytest.mark.parametrize("questions_file", [False, True])
+@pytest.mark.parametrize("wire_format", ["systemone", "native"])
 def test_decision_cli_routes_inputs_and_returns_json(
-    tmp_path, capsys, monkeypatch, state_file, questions_file
+    tmp_path, capsys, monkeypatch, state_file, questions_file, wire_format
 ):
     from mlx_vlm import decide
 
     state = "Please refund my café purchase."
     questions = {"route": {"type": "choice", "criteria": ["billing", "support"]}}
-    result = {"answers": {"route": {"type": "choice", "value": "billing"}}}
-    args = ["--format", "native", "--model", "model/path"]
+    field = "choice" if wire_format == "systemone" else "value"
+    result = {"answers": {"route": {"type": "choice", field: "billing"}}}
+    args = ["--format", wire_format, "--model", "model/path"]
     for name, value, use_file in (
         ("state", state, state_file),
         ("questions", json.dumps(questions), questions_file),
@@ -528,7 +530,9 @@ def test_decision_cli_routes_inputs_and_returns_json(
     monkeypatch.setattr(decide, "predict", predict)
     decide.main(args)
     load.assert_called_once_with("model/path")
-    predict.assert_called_once_with(model, processor, state, questions)
+    predict.assert_called_once_with(
+        model, processor, state, questions, format=wire_format
+    )
     assert json.loads(capsys.readouterr().out) == result
 
 
@@ -597,8 +601,6 @@ def test_decision_cli_passes_media(monkeypatch, state, media, flags):
 
     questions = {"cat": {"type": "bool"}}
     args = [
-        "--format",
-        "native",
         "--model",
         "d1",
         "--questions",
@@ -612,7 +614,9 @@ def test_decision_cli_passes_media(monkeypatch, state, media, flags):
     monkeypatch.setattr(decide, "load", Mock(return_value=(model, processor)))
     monkeypatch.setattr(decide, "predict", predict)
     decide.main(args)
-    predict.assert_called_once_with(model, processor, state, questions, **media)
+    predict.assert_called_once_with(
+        model, processor, state, questions, format="systemone", **media
+    )
 
 
 def test_decision_cli_requires_state_or_media(monkeypatch, capsys):

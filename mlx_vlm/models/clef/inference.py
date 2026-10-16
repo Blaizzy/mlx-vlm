@@ -132,6 +132,7 @@ class DecisionEngine:
             getattr(self.processor, "tokenizer", self.processor),
             request,
             max_length=self.max_length,
+            max_state_tokens=request.get("max_state_tokens"),
             processor=self.processor,
             checkpoint=lambda: check_cancelled(cancelled),
         )
