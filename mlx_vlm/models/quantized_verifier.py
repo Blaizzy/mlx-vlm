@@ -1730,12 +1730,22 @@ def supports_optimized_affine_head(linear) -> bool:
     return K % 512 == 0 and N % 8 == 0
 
 
+# Widths whose verify blocks only have the generic kernel, which keeps one result
+# per verified token in registers (4-bit switches to the streamed/token-tiled
+# kernels for longer blocks). Past a few tokens it is slower than the singleton
+# gather_qmm fallback, which is also exact, so these widths use it only for
+# short blocks (MTP-sized verifies).
+_GENERIC_VERIFY_BITS = frozenset((2, 3, 6))
+GENERIC_VERIFY_MAX_T = 4
+
+
 def _can_optimized_affine_linear(linear, x: mx.array) -> bool:
     """Check the exact affine kernel for a runtime-sized batch."""
     if (
         not supports_optimized_affine_head(linear)
         or x.ndim != 3
         or x.shape[1] < 1
+        or (linear.bits in _GENERIC_VERIFY_BITS and x.shape[1] > GENERIC_VERIFY_MAX_T)
         or x.dtype != linear.scales.dtype
         or not mx.metal.is_available()
         or mx.default_device() != mx.gpu

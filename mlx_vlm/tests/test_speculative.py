@@ -450,7 +450,9 @@ def test_quantized_linear_and_argmax(mode, bits, size, batch):
 @parametrize("dtype", [mx.bfloat16, mx.float16])
 def test_optimized_affine_rows_match_decode(bits, size, dtype):
     # Every verify row must be bit-identical to the M=1 decode matmul on that row,
-    # and the optimized kernel (not the per-token fallback) must be selected.
+    # and the optimized kernel (not the per-token fallback) must be selected,
+    # except for the generic-only widths past GENERIC_VERIFY_MAX_T, which take
+    # the singleton fallback and must still be exact.
     mx.random.seed(700 + bits + size)
     dense = nn.Linear(1024, 48, bias=False)
     dense.weight = dense.weight.astype(dtype)
@@ -460,6 +462,15 @@ def test_optimized_affine_rows_match_decode(bits, size, dtype):
         inputs = mx.random.normal((2, length, 1024)).astype(dtype)
         expected = verifier_linear._target_verify_singletons(linear, inputs)
         actual = quantized.optimized_affine_linear(linear, inputs)
+        if bits in (2, 3, 6) and length > quantized.GENERIC_VERIFY_MAX_T:
+            assert actual is None
+            assert quantized.optimized_affine_argmax(linear, inputs) is None
+            equal(verifier_linear._target_verify_linear(linear, inputs), expected)
+            equal(
+                verifier_linear._target_verify_quantized_argmax(linear, inputs),
+                greedy(expected),
+            )
+            continue
         assert actual is not None
         equal(actual, expected)
         equal(quantized.optimized_affine_argmax(linear, inputs), greedy(expected))
@@ -510,7 +521,11 @@ def test_fused_projection_parity(bits, widths, length):
     expected = [
         verifier_linear._target_verify_timewise(linear, inputs) for linear in linears
     ]
-    assert quantized.optimized_affine_linears(linears, inputs) is not None
+    fused = quantized.optimized_affine_linears(linears, inputs)
+    if bits in (2, 3, 6) and length > quantized.GENERIC_VERIFY_MAX_T:
+        assert fused is None
+    else:
+        assert fused is not None
     actual = verifier_linear._target_verify_linears(linears, inputs)
     equal(actual, expected)
 
