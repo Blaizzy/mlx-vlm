@@ -1574,6 +1574,21 @@ class SpeculativeGenerationBatch:
         self.uids = [
             uid for uid, done in zip(self._all_uids, self._finished) if not done
         ]
+        if not self.uids:
+            self._release()
+
+    def _release(self):
+        # A finished batch stays installed as the generator's batch until the
+        # next request's prefill completes; holding its prompt cache that long
+        # keeps a dead copy of the whole context resident during that prefill.
+        if self._rounds_iter is not None:
+            self._rounds_iter.close()
+            self._rounds_iter = None
+        self.prompt_cache = []
+        self.hidden = None
+        self.shared_kv_states = None
+        self.prompt_tokens = None
+        mx.clear_cache()
 
     def extend(self, other: "SpeculativeGenerationBatch"):
         if len(self) == 0:
