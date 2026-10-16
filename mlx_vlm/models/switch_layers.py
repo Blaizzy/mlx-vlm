@@ -410,9 +410,14 @@ class OffloadedSwitchGLU(nn.Module):
             scales = [self.store.global_scale(self.layer_id, j, name) for j in experts]
             has_global_scale = any(s is not None for s, _ in scales)
             if tensors[0][1] is None:
+                dtype = mx.result_type(value.dtype, weight.dtype)
+                # CPU gather_mm only supports FP32, unlike ordinary matmul.
+                compute_dtype = mx.float32 if mx.default_device() == mx.cpu else dtype
                 output = mx.gather_mm(
-                    value, weight.swapaxes(-1, -2), rhs_indices=local_indices
-                )
+                    value.astype(compute_dtype),
+                    weight.astype(compute_dtype).swapaxes(-1, -2),
+                    rhs_indices=local_indices,
+                ).astype(dtype)
             else:
                 group_size, bits, mode = quant
                 fused_scale = (
@@ -480,11 +485,11 @@ class OffloadedSwitchGLU(nn.Module):
 
         gate = project(x, 0, self.gate_quant)
         if self.gate_scale is not None:
-            gate *= self.gate_scale[routed_experts][:, None, None]
+            gate *= self.gate_scale[routed_experts][:, None, None].astype(gate.dtype)
         up = project(x, 1, self.up_quant)
         output = project(self.activation(up, gate), 2, self.down_quant)
         if self.out_scale is not None:
-            output *= self.out_scale[routed_experts][:, None, None]
+            output *= self.out_scale[routed_experts][:, None, None].astype(output.dtype)
         return output.squeeze(-2).astype(x.dtype)
 
     def __call__(self, x, indices) -> mx.array:
