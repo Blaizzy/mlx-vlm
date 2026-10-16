@@ -26,6 +26,7 @@
     "mllama": ["mllama", "MllamaProcessor"],
     "molmo_point": ["molmo_point", "MolmoPointProcessor"],
     "muse_glimmer": ["muse_glimmer", "MuseGlimmerProcessor"],
+    "muse_spark": ["muse_spark", "MuseSparkProcessor"],
     "paddleocr_vl": ["paddleocr_vl", "PaddleOCRVLProcessor"],
     "pixtral_ip": ["pixtral.image_processing_pixtral", null],
     "omni": ["qwen3_omni_moe", "Qwen3OmniMoeProcessor"],
@@ -128,7 +129,8 @@
     ["aya_output", "<|START_RESPONSE|>", "<|END_RESPONSE|>"],
     ["diffusion", "", ""],
     ["muse_glimmer", "to=user<|message|>", "<|return|>"],
-    ["muse_glimmer", "", ""]
+    ["muse_glimmer", "", ""],
+    ["muse_spark", "to=user<|message|>", "<|return|>"]
   ],
   "checkpoints": {
     "glm_ocr": {
@@ -193,6 +195,12 @@
     "muse_glimmer": {
       "config": {
         "model_type": "muse_glimmer",
+        "text_config": {"vocab_size": 1234, "eos_token_id": 99}
+      }
+    },
+    "muse_spark": {
+      "config": {
+        "model_type": "muse_spark",
         "text_config": {"vocab_size": 1234, "eos_token_id": 99}
       }
     },
@@ -265,6 +273,13 @@
     },
     "muse_glimmer": {
       "config.model_type": "muse_glimmer",
+      "config.vocab_size": 1234,
+      "config.eos_token_id": 99,
+      "config.thinking_start_token": "to=self<|message|>",
+      "config.thinking_end_token": "<|eom|>"
+    },
+    "muse_spark": {
+      "config.model_type": "muse_spark",
       "config.vocab_size": 1234,
       "config.eos_token_id": 99,
       "config.thinking_start_token": "to=self<|message|>",

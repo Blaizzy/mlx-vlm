@@ -1959,6 +1959,159 @@ class TestKolibri1Sanitize(unittest.TestCase):
                 model.load_weights(list(sanitized.items()), strict=True)
 
 
+class TestMuseSpark(unittest.TestCase):
+    def _model(self):
+        from mlx_vlm.models import muse_spark
+
+        config = muse_spark.ModelConfig.from_dict(model_case("muse_spark")["config"])
+        model = muse_spark.Model(config)
+        # Values that survive 1 + w in FP32, as mlx-lm stores the norm gains.
+        model.update(tree_map(lambda p: mx.round(p * 256) / 256, model.parameters()))
+        return muse_spark, model
+
+    @staticmethod
+    def _interleave_rope_rows(w, head_dim):
+        # mlx-lm's RoPE row order for q and k.
+        shape = w.shape
+        w = w.reshape(-1, 2, head_dim // 2, *shape[1:])
+        return mx.swapaxes(w, 1, 2).reshape(shape)
+
+    def _checkpoint(self, muse_spark, model, layout):
+        text = model.config.text_config
+        gates = {}
+        for idx, layer in enumerate(model.language_model.layers):
+            for name in ("attn", "ffn"):
+                gate = mx.random.normal((text.hidden_size,), key=mx.random.key(idx))
+                alpha, beta = muse_spark.language.residual_gate_coefficients(
+                    gate, text.residual_gate_temperature
+                )
+                setattr(layer, f"add_{name}_alpha", alpha)
+                setattr(layer, f"add_{name}_beta", beta)
+                gates[f"layers.{idx}.add_{name}"] = gate
+
+        checkpoint = {}
+        for key, value in tree_flatten(model.parameters()):
+            if key.startswith("language_model.model."):
+                key = key.replace("language_model.model.", "model.language_model.")
+            elif key.startswith("language_model."):
+                key = key[len("language_model.") :]
+            else:
+                key = "model." + key
+            checkpoint[key] = value
+
+        params = dict(checkpoint)
+        for key in params:
+            if key.endswith("mlp.experts.gate_proj.weight") and layout == "hf":
+                prefix = key[: -len("gate_proj.weight")]
+                checkpoint[prefix + "gate_up_proj"] = mx.concatenate(
+                    [checkpoint.pop(key), checkpoint.pop(prefix + "up_proj.weight")],
+                    axis=1,
+                )
+                checkpoint[prefix + "down_proj"] = checkpoint.pop(
+                    prefix + "down_proj.weight"
+                )
+            elif "_alpha" in key or "_beta" in key:
+                if layout == "hf":
+                    checkpoint.pop(key)
+                    layer = key.split("model.language_model.")[1].rsplit("_", 1)[0]
+                    name = "attention" if layer.endswith("attn") else "feedforward"
+                    gate_key = (
+                        key.rsplit(".", 1)[0] + f".post_{name}_residual_gate.gate"
+                    )
+                    checkpoint[gate_key] = gates[layer]
+            elif layout == "mlx_lm" and key.endswith(
+                (
+                    "input_layernorm.weight",
+                    "pre_feedforward_layernorm.weight",
+                    "post_feedforward_layernorm.weight",
+                    "pre_expert_norm.weight",
+                    "post_expert_norm.weight",
+                )
+            ):
+                checkpoint[key] = 1 + checkpoint[key]
+            elif layout == "mlx_lm" and key.endswith("self_attn.q_proj.weight"):
+                attn = key[: -len("q_proj.weight")]
+                q, k, v, g = (
+                    checkpoint.pop(f"{attn}{name}.weight")
+                    for name in ("q_proj", "k_proj", "v_proj", "gate_proj")
+                )
+                q = self._interleave_rope_rows(q, text.head_dim)
+                k = self._interleave_rope_rows(k, text.head_dim)
+                checkpoint[f"{attn}qkvg_proj.weight"] = mx.concatenate([q, k, v, g])
+            elif layout == "mlx_lm" and key.endswith(".attn.q_proj.weight"):
+                attn = key[: -len("q_proj.weight")]
+                vision = model.config.vision_config
+                head_dim = vision.hidden_size // vision.num_attention_heads
+                for param in ("weight", "bias"):
+                    q, k, v = (
+                        checkpoint.pop(f"{attn}{name}_proj.{param}") for name in "qkv"
+                    )
+                    q = self._interleave_rope_rows(q, head_dim)
+                    k = self._interleave_rope_rows(k, head_dim)
+                    checkpoint[f"{attn}qkv_proj.{param}"] = mx.concatenate([q, k, v])
+        return checkpoint
+
+    def test_checkpoint_layouts_sanitize_to_the_model_exactly(self):
+        for layout in ("hf", "mlx_lm"):
+            with self.subTest(layout=layout):
+                muse_spark, model = self._model()
+                checkpoint = self._checkpoint(muse_spark, model, layout)
+                expected = dict(tree_flatten(model.parameters()))
+                sanitized = model.sanitize(checkpoint)
+                self.assertEqual(sanitized.keys(), expected.keys())
+                for key, value in expected.items():
+                    self.assertTrue(mx.allclose(sanitized[key], value).item(), key)
+                model.load_weights(list(sanitized.items()), strict=True)
+
+    def test_square_vision_grid_matches_muse_glimmer(self):
+        from mlx_vlm.models.muse_glimmer.vision import PatchEmbedder
+
+        _, model = self._model()
+        embedder = model.vision_tower.patch_embedder
+        for grid in ([[1, 2, 2]], [[2, 4, 4], [1, 6, 6]]):
+            self.assertTrue(
+                mx.array_equal(
+                    embedder._position_embeddings(grid),
+                    PatchEmbedder._position_embeddings(embedder, grid),
+                ).item()
+            )
+
+    def test_matches_transformers(self):
+        torch = pytest.importorskip("torch")
+        transformers = pytest.importorskip("transformers")
+        if not hasattr(transformers, "MuseSparkForConditionalGeneration"):
+            pytest.skip("transformers has no Muse Spark")
+
+        muse_spark, _ = self._model()
+        values = model_case("muse_spark")["config"]
+        values["audio_config"] = {"hidden_sizes": [8] * 4, "out_hidden_size": 16}
+        hf_config = transformers.MuseSparkConfig(**values)
+        hf_config._attn_implementation = "eager"
+        torch.manual_seed(0)
+        hf = transformers.MuseSparkForConditionalGeneration(hf_config).eval()
+        with torch.no_grad():
+            for name, param in hf.named_parameters():
+                param.normal_(0, 0.3 if param.ndim == 1 else 0.1)
+        weights = {k: mx.array(v.float().numpy()) for k, v in hf.state_dict().items()}
+        model = muse_spark.Model(muse_spark.ModelConfig.from_dict(values))
+        model.load_weights(list(model.sanitize(weights).items()), strict=True)
+
+        # A non-square image larger than the 2 x 2 position table.
+        grid = np.array([[1, 4, 6]])
+        pixels = np.random.default_rng(0).standard_normal((24, 24), dtype=np.float32)
+        ids = np.array([[1, 2] + [30] * 6 + [3, 4, 5, 6, 7]])
+        with torch.no_grad():
+            expected = hf(
+                input_ids=torch.tensor(ids),
+                pixel_values=torch.tensor(pixels),
+                image_grid_thw=torch.tensor(grid),
+            ).logits.numpy()
+        actual = model(
+            mx.array(ids), pixel_values=mx.array(pixels), image_grid_thw=mx.array(grid)
+        ).logits
+        np.testing.assert_allclose(np.array(actual), expected, atol=1e-4, rtol=1e-4)
+
+
 class TestQwen3_5MoeText(unittest.TestCase):
     """Decoder-only Qwen3.5 MoE checkpoints (model_type qwen3_5_moe_text)."""
 
