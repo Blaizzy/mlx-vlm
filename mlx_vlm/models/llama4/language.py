@@ -11,7 +11,7 @@ from ..base import (
 )
 from ..cache import ChunkedKVCache, KVCache
 from ..rope_utils import initialize_rope
-from ..switch_layers import SwitchGLU
+from ..switch_layers import SwitchGLU, split_expert_projection, stack_expert_projection
 from .config import TextConfig
 
 
@@ -305,9 +305,25 @@ class LanguageModel(nn.Module):
         return LanguageModelOutput(logits=out)
 
     def sanitize(self, weights):
+        for key in list(weights):
+            if key.endswith(".gate_up_proj.weight"):
+                prefix = key.removesuffix(".gate_up_proj.weight")
+                split_expert_projection(
+                    weights,
+                    f"{prefix}.gate_up_proj",
+                    [f"{prefix}.gate_proj", f"{prefix}.up_proj"],
+                )
         # Rename expert weights for SwitchGLU
         for l in range(self.config.num_hidden_layers):
             prefix = f"language_model.model.layers.{l}.feed_forward.experts"
+            for name in ("gate_proj", "up_proj", "down_proj"):
+                stack_expert_projection(
+                    weights,
+                    prefix,
+                    name,
+                    f"{prefix}.{name}",
+                    self.config.num_local_experts,
+                )
             if f"{prefix}.gate_up_proj" in weights:
                 v = weights.pop(f"{prefix}.gate_up_proj")
                 gate_k = f"{prefix}.gate_proj.weight"

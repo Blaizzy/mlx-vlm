@@ -59,6 +59,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | PP-DocLayoutV3 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/pp_doclayout_v3/README.md) |
 | Granite Vision 3.2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite_vision/README.md) |
 | Granite 4.0 Vision | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite4_vision/README.md) |
+| MiniCPM-V 4.7 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minicpmv4_7/README.md) |
 | MiniCPM-V 4.6 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minicpmv4_6/README.md) |
 | GLiNER2.5 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/gliner2_5/README.md) |
 | BERT | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/bert/README.md) |
@@ -67,6 +68,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | Z1T-0 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/z1t/README.md) |
 | Spark-X2.5 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/spark2_5/README.md) |
 | Ternary Bonsai 2 | [Docs](mlx_vlm/models/prism_hadamard_qwen35/README.md) |
+| Nemotron 3.5 Super VL / Bolt / Nano Omni | [Docs](mlx_vlm/models/nemotron_h_nano_omni/README.md) |
 
 ## Installation
 
@@ -623,9 +625,50 @@ mlx_vlm.server --model-dir /Volumes/Models --model-dir ~/my-custom-model
 - `--kv-group-size`: Group size for uniform KV cache quantization (default: `64`)
 - `--max-kv-size`: Maximum KV cache size in tokens
 - `--vision-cache-size`: Max number of cached vision features (default: `20`)
+- `--min-pixels` / `--max-pixels`: Default minimum/maximum input image pixel area for processors that support these options (also `MLX_VLM_MIN_PIXELS` / `MLX_VLM_MAX_PIXELS`). Unset values use the model's preprocessing defaults.
 - `--log-progress-interval`: Decoded tokens between progress log messages; `0` disables periodic decode progress (default: `10`)
 - `--api-key`: Bearer token required for inference, model discovery, and management endpoints
 - `--log-level`: Logging level — `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (default: `INFO`)
+
+For higher-resolution image input, including OCR with Bonsai 2, set pixel-area
+defaults at startup:
+
+```sh
+mlx_vlm.server --model prism-ml/Ternary-Bonsai-2-2B-mlx-2bit \
+  --min-pixels 1048576 --max-pixels 4194304
+```
+
+Chat Completions, Responses, and Messages requests can override these defaults
+with top-level `min_pixels` and `max_pixels` fields (use `extra_body` with an
+OpenAI client). For example, `"min_pixels": 1048576` requests at least 1024 × 1024
+pixels of area, preserving aspect ratio and rounding to the processor's patch
+size. On Bonsai 2 this corresponds to approximately 1024 image tokens. Higher
+resolution uses more context, memory, and processing time. Both limits must be
+positive and the effective minimum must not exceed the maximum. Omitted or null
+request values inherit the server defaults.
+
+Change these defaults on a running server without restarting or reloading the
+model:
+
+```sh
+curl -X PATCH http://localhost:8080/v1/settings \
+  -H 'Content-Type: application/json' \
+  -d '{"min_pixels": 1048576, "max_pixels": 4194304}'
+```
+
+Use `GET /v1/settings` to inspect the current values. New requests inherit the
+updated limits; requests already queued for generation keep their resolved
+options, and per-request overrides still take precedence. The pair is updated
+atomically; invalid limits appear in `rejected` and leave both limits unchanged.
+Set either setting to `null` to use that limit from the model's preprocessing
+configuration. Updates last until the server restarts; the
+`{"op": "replace", "values": {}}` form resets **all** runtime settings to their
+startup defaults, including CLI pixel limits. Include
+`Authorization: Bearer <key>` when the server has an API key configured.
+
+The existing `resize_shape` request field also applies before image processing
+in the batching server. Processor pixel limits still apply afterward. Token
+counting and streaming context checks use the same options as generation.
 
 At `INFO`, the server logs request start/completion, chunked-prefill progress,
 time to first token, periodic decode throughput, and the final token counts. Set
@@ -1824,13 +1867,29 @@ See [docs/usage.md](https://github.com/Blaizzy/mlx-vlm/blob/main/docs/usage.md#d
 
 # Fine-tuning
 
-MLX-VLM supports fine-tuning models with LoRA and QLoRA. Fine-tuning (and the
+MLX-VLM supports VLM SFT, ORPO, and DPO with LoRA, QLoRA, DoRA, or full
+fine-tuning. Fine-tuning (and the
 eval scripts) need the training extra, which is not installed by default:
 
 ```bash
 pip install "mlx-vlm[train]"
 ```
 
-## LoRA & QLoRA
+Train from the CLI with `python -m mlx_vlm.train`:
 
-To learn more about LoRA, please refer to the [LoRA.md](./mlx_vlm/LORA.MD) file.
+```bash
+python -m mlx_vlm.train \
+  --model mlx-community/Qwen2.5-VL-3B-Instruct-4bit \
+  --data data --train-on-completions \
+  --batch-size 1 --gradient-accumulation-steps 4 \
+  --iters 100 --adapter-file adapters/sft/weights.safetensors
+```
+
+For Python and notebooks, import `Trainer`, `VLMTrainingArgs`, and
+`prepare_model_for_training` from `mlx_vlm.trainer`. The CLI and notebook API
+share model preparation and the training engine.
+
+Start with the [SFT notebook](examples/training/sft_text_only.ipynb), or explore the
+[ORPO, DPO, and custom-loss examples](examples/training/README.md). See the
+[training guide](docs/training.md) for dataset formats, configuration, saving,
+resuming, and the existing functional trainer APIs.

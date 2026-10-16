@@ -10,7 +10,6 @@ from ..mtp_split import MTPSplitter
 
 class GlmMoeDsaMTPSplitter(MTPSplitter):
     output_model_type = "glm_moe_dsa_mtp"
-    require_text_config = False
     tie_word_embeddings_default = False
     depth_field = "num_nextn_predict_layers"
     block_size_extra = 1

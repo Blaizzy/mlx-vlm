@@ -180,7 +180,7 @@ KNOBS: Tuple[
         "Token queue wait timeout in seconds; null disables the timeout.",
     ),
     (
-        "spec_draft_model",
+        "draft_model",
         "str_or_none",
         None,
         TEXT_KINDS,
@@ -188,7 +188,7 @@ KNOBS: Tuple[
         "Speculative drafting model path.",
     ),
     (
-        "spec_draft_kind",
+        "draft_kind",
         "str_or_none",
         None,
         TEXT_KINDS,
@@ -202,6 +202,22 @@ KNOBS: Tuple[
         VISION_KINDS,
         None,
         "Vision feature cache capacity.",
+    ),
+    (
+        "min_pixels",
+        "int_or_none",
+        None,
+        (),
+        None,
+        "Live minimum input image pixel area; null uses the model default.",
+    ),
+    (
+        "max_pixels",
+        "int_or_none",
+        None,
+        (),
+        None,
+        "Live maximum input image pixel area; null uses the model default.",
     ),
 )
 
@@ -218,7 +234,12 @@ _KNOB_SPEC: Dict[str, Dict[str, Any]] = {
 
 # Knobs that are naturally live (applied per request) and must never trigger a
 # model reload, so they are excluded from the cache-key fingerprint.
-_LIVE_KNOBS: Tuple[str, ...] = ("max_kv_size", "token_queue_timeout")
+_IMAGE_PIXEL_LIMITS: Tuple[str, ...] = ("min_pixels", "max_pixels")
+_LIVE_KNOBS: Tuple[str, ...] = (
+    "max_kv_size",
+    "token_queue_timeout",
+    *_IMAGE_PIXEL_LIMITS,
+)
 
 
 def _env_float(
@@ -312,9 +333,11 @@ class RuntimeConfig:
     apc_checkpoint_guard_tokens: int = 1
     max_kv_size: Optional[int] = None
     token_queue_timeout: Optional[float] = DEFAULT_TOKEN_QUEUE_TIMEOUT
-    spec_draft_model: Optional[str] = None
-    spec_draft_kind: Optional[str] = None
+    draft_model: Optional[str] = None
+    draft_kind: Optional[str] = None
     vision_cache_size: int = 20
+    min_pixels: Optional[int] = None
+    max_pixels: Optional[int] = None
 
     _lock: threading.Lock = field(
         default_factory=threading.Lock, repr=False, compare=False
@@ -369,9 +392,11 @@ class RuntimeConfig:
             ),
             max_kv_size=_env_int("MAX_KV_SIZE", None),
             token_queue_timeout=_env_token_queue_timeout(),
-            spec_draft_model=os.environ.get("MLX_VLM_DRAFT_MODEL") or None,
-            spec_draft_kind=os.environ.get("MLX_VLM_DRAFT_KIND") or None,
+            draft_model=os.environ.get("MLX_VLM_DRAFT_MODEL") or None,
+            draft_kind=os.environ.get("MLX_VLM_DRAFT_KIND") or None,
             vision_cache_size=int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20")),
+            min_pixels=_env_int("MLX_VLM_MIN_PIXELS", None),
+            max_pixels=_env_int("MLX_VLM_MAX_PIXELS", None),
         )
         cfg._env_defaults = {name: getattr(cfg, name) for name in _KNOB_SPEC}
         return cfg
@@ -402,24 +427,32 @@ class RuntimeConfig:
                 if name.startswith("apc_")
             }
 
+    def image_pixel_limits(self) -> Dict[str, Optional[int]]:
+        """Snapshot both limits together for one generation request."""
+        with self._lock:
+            return {name: getattr(self, name) for name in _IMAGE_PIXEL_LIMITS}
+
     def apply_changes(
         self, payload: Dict[str, Any], op: str = "merge"
     ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-        if op == "replace":
-            with self._lock:
-                for name in _KNOB_SPEC:
-                    restored = self._env_defaults.get(name, _KNOB_SPEC[name]["default"])
-                    setattr(self, name, restored)
-        return self._apply_validated(payload)
+        return self._apply_validated(payload, op=op)
 
     def _apply_validated(
-        self, payload: Dict[str, Any]
+        self, payload: Dict[str, Any], op: str = "merge"
     ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
         if not isinstance(payload, dict):
             raise TypeError("settings payload must be a JSON object")
         applied: Dict[str, Any] = {}
         rejected: List[Dict[str, Any]] = []
         with self._lock:
+            candidate = {
+                name: (
+                    self._env_defaults.get(name, spec["default"])
+                    if op == "replace"
+                    else getattr(self, name)
+                )
+                for name, spec in _KNOB_SPEC.items()
+            }
             for name, raw in payload.items():
                 if name not in _KNOB_SPEC:
                     rejected.append({"name": name, "reason": "unknown knob"})
@@ -431,6 +464,13 @@ class RuntimeConfig:
                         if name.startswith("apc_")
                         else _coerce(spec["type"], raw, spec.get("allowed"))
                     )
+                    if name in _IMAGE_PIXEL_LIMITS and value is not None:
+                        if (
+                            isinstance(raw, bool)
+                            or (isinstance(raw, float) and raw != value)
+                            or value <= 0
+                        ):
+                            raise ValueError("expected a positive whole number or null")
                     if (
                         name == "token_queue_timeout"
                         and value is not None
@@ -440,8 +480,28 @@ class RuntimeConfig:
                 except (TypeError, ValueError, OverflowError) as exc:
                     rejected.append({"name": name, "reason": str(exc)})
                     continue
-                setattr(self, name, value)
+                candidate[name] = value
                 applied[name] = value
+
+            # A malformed or inverted pair must not apply either limit. Check
+            # against the merged candidate so raising/lowering both is atomic.
+            minimum, maximum = (candidate[name] for name in _IMAGE_PIXEL_LIMITS)
+            invalid_pair = (
+                minimum is not None and maximum is not None and minimum > maximum
+            )
+            if invalid_pair or any(r["name"] in _IMAGE_PIXEL_LIMITS for r in rejected):
+                reason = (
+                    "min_pixels must not exceed max_pixels"
+                    if invalid_pair
+                    else "image pixel limits contain an invalid value"
+                )
+                for name in _IMAGE_PIXEL_LIMITS:
+                    candidate[name] = getattr(self, name)
+                    if name in applied:
+                        del applied[name]
+                        rejected.append({"name": name, "reason": reason})
+            for name, value in candidate.items():
+                setattr(self, name, value)
         return applied, rejected
 
     def _in_cache_key(self, name: str) -> bool:

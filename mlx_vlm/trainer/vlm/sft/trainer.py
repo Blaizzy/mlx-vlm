@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -13,7 +14,15 @@ from mlx.nn.utils import average_gradients
 from mlx.utils import tree_map
 from tqdm import tqdm
 
-from .utils import Colors, grad_checkpoint, save_adapter
+from ...common.metrics import (
+    MetricAccumulator,
+    format_metric_report,
+    normalize_loss_output,
+    report_loss_metrics,
+)
+from ...core import Colors, TrainingArgs, grad_checkpoint, save_adapter
+from ...losses.cross_entropy import cross_entropy
+from .runtime import vlm_batch_metrics, vlm_vision_mask
 
 
 def _squeeze_leading_batch_dim(value):
@@ -62,63 +71,6 @@ def _collate_grid_thw(values):
             )
         rows.append(value)
     return mx.concatenate(rows, axis=0)
-
-
-@dataclass
-class TrainingArgs:
-    batch_size: int = field(default=4, metadata={"help": "Minibatch size."})
-    iters: int = field(default=100, metadata={"help": "Iterations to train for."})
-    val_batches: int = field(
-        default=25,
-        metadata={
-            "help": "Number of validation batches, -1 uses the entire validation set."
-        },
-    )
-    steps_per_report: int = field(
-        default=10,
-        metadata={"help": "Number of training steps between loss reporting."},
-    )
-    steps_per_eval: int = field(
-        default=200, metadata={"help": "Number of training steps between validations."}
-    )
-    steps_per_save: int = field(
-        default=100, metadata={"help": "Save the model every number steps"}
-    )
-    max_seq_length: int = field(
-        default=2048, metadata={"help": "Maximum sequence length."}
-    )
-    adapter_file: str = field(
-        default="adapters.safetensors",
-        metadata={"help": "Save/load path for the trained adapter weights."},
-    )
-    grad_checkpoint: bool = field(
-        default=False,
-        metadata={"help": "Use gradient checkpointing to reduce memory use."},
-    )
-    learning_rate: float = field(
-        default=1e-5,
-        metadata={"help": "Learning rate."},
-    )
-    grad_clip: float = field(
-        default=1.0,
-        metadata={"help": "Gradient clipping value."},
-    )
-    warmup_steps: int = field(
-        default=100,
-        metadata={"help": "Number of warmup steps for learning rate."},
-    )
-    min_learning_rate: float = field(
-        default=1e-6,
-        metadata={"help": "Minimum learning rate after decay."},
-    )
-    full_finetune: bool = field(
-        default=False,
-        metadata={"help": "Fine-tune the full model instead of adapters."},
-    )
-    gradient_accumulation_steps: int = field(
-        default=1,
-        metadata={"help": "Number of steps to accumulate gradients before updating."},
-    )
 
 
 def _resolve_adapter_file(args: TrainingArgs) -> Path:
@@ -214,8 +166,10 @@ def vision_language_loss_fn(
             )
             loss_mask = loss_mask * completion_mask[:, 1:]
 
-    ce = nn.losses.cross_entropy(logits, labels)
-    return (ce * loss_mask).sum() / mx.maximum(loss_mask.sum(), 1)
+    loss, metrics = cross_entropy(
+        logits, labels, loss_mask, vision_mask=vlm_vision_mask(model, batch)
+    )
+    return loss, {**metrics, **vlm_batch_metrics(batch)}
 
 
 def _dataset_image_token_id(dataset):
@@ -398,13 +352,13 @@ def evaluate(
     loss_fn=vision_language_loss_fn,
     train_on_completions=False,
     assistant_id=77091,
+    return_metrics=False,
 ):
     """
     Evaluate the model on validation dataset.
     """
     model.eval()
-    all_losses = mx.array(0.0)
-    ntokens = mx.array(0)
+    accumulator = MetricAccumulator()
 
     loss_fn_partial = partial(
         loss_fn, train_on_completions=train_on_completions, assistant_id=assistant_id
@@ -427,32 +381,16 @@ def evaluate(
             else len(dataset) // batch_size
         ),
     ):
-        # Calculate number of tokens for averaging
-        if "attention_mask" in batch:
-            lengths = batch["attention_mask"].sum(axis=1)
-        else:
-            lengths = mx.full(
-                (batch["input_ids"].shape[0],), batch["input_ids"].shape[1]
-            )
+        loss, metrics = normalize_loss_output(loss_fn_partial(model, batch))
+        accumulator.add(loss, metrics)
+        mx.eval(accumulator.state())
 
-        ntoks = lengths.sum()
-        losses = loss_fn_partial(model, batch)
-
-        all_losses += losses * ntoks
-        ntokens += ntoks
-        mx.eval(all_losses, ntokens)
-
-    # Reduce across ranks entirely on the CPU stream. The ring all-reduce
-    # blocks on the network, and any Metal command buffer left in flight during
-    # that wait (here the trailing divide) trips Metal's ~5s command-buffer
-    # watchdog under a slow peer. See issue #2179.
-    with mx.stream(mx.cpu):
-        all_losses = mx.distributed.all_sum(all_losses, stream=mx.cpu)
-        ntokens = mx.distributed.all_sum(ntokens, stream=mx.cpu)
-        avg_loss = all_losses / mx.maximum(ntokens, 1)
-
+    values = accumulator.compute()
+    if values["weight"] <= 0:
+        raise ValueError("Evaluation produced no supervised tokens or examples.")
+    info = report_loss_metrics(values, "val")
     mx.clear_cache()
-    return avg_loss.item()
+    return info if return_metrics else info["val_loss"]
 
 
 def train(
@@ -508,16 +446,8 @@ def train(
     state = [model.state, optimizer.state, mx.random.state]
 
     def step(batch, prev_grad, do_update):
-        # Calculate number of tokens for metrics
-        if "attention_mask" in batch:
-            lengths = batch["attention_mask"].sum(axis=1)
-        else:
-            lengths = mx.full(
-                (batch["input_ids"].shape[0],), batch["input_ids"].shape[1]
-            )
-
-        toks = lengths.sum()
-        lvalue, grad = loss_value_and_grad(model, batch)
+        output, grad = loss_value_and_grad(model, batch)
+        lvalue, metrics = normalize_loss_output(output)
 
         # Gradient clipping
         if args.grad_clip is not None:
@@ -541,15 +471,14 @@ def train(
             optimizer.update(model, grad)
             grad = None
 
-        return lvalue, toks, grad
+        return lvalue, metrics, grad
 
     # Create value and grad function
     loss_value_and_grad = nn.value_and_grad(model, loss_fn_partial)
 
     # Training metrics
     model.train()
-    losses = 0
-    n_tokens = 0
+    accumulator = MetricAccumulator()
     steps = 0
     trained_tokens = 0
     train_time = 0
@@ -572,7 +501,7 @@ def train(
             it == 1 or it % args.steps_per_eval == 0 or it == args.iters
         ):
             tic_val = time.perf_counter()
-            val_loss = evaluate(
+            val_info = evaluate(
                 model=model,
                 dataset=val_dataset,
                 batch_size=args.batch_size,
@@ -581,64 +510,56 @@ def train(
                 loss_fn=loss_fn_partial,
                 train_on_completions=train_on_completions,
                 assistant_id=assistant_id,
+                return_metrics=True,
             )
             model.train()
             val_time = time.perf_counter() - tic_val
 
             if rank == 0:
-                print(
-                    f"{Colors.OKCYAN}Iter {it}: "
-                    f"Val loss {val_loss:.3f}, "
-                    f"Val took {val_time:.3f}s{Colors.ENDC}",
-                    flush=True,
-                )
+                val_info.update(iteration=it, val_time=val_time)
+                print(format_metric_report(val_info, "Validation"), flush=True)
 
             tic = time.perf_counter()
 
         # Training step
-        lvalue, toks, grad_accum = step(
+        lvalue, metrics, grad_accum = step(
             batch,
             grad_accum,
             it % grad_accum_steps == 0,
         )
         mx.clear_cache()
-        losses += lvalue
-        n_tokens += toks
+        accumulator.add(lvalue, metrics)
         steps += 1
-        mx.eval(state, losses, n_tokens, grad_accum)
+        mx.eval(state, accumulator.state(), grad_accum)
         train_time += time.perf_counter() - tic
 
         # Report training metrics
         if it % args.steps_per_report == 0 or it == args.iters:
-            train_loss = mx.distributed.all_sum(losses, stream=mx.cpu).item()
-            train_loss /= steps * world_size
-            n_tokens_total = mx.distributed.all_sum(n_tokens, stream=mx.cpu).item()
+            values = accumulator.compute()
+            n_tokens_total = values.get("num_tokens", values["weight"])
             learning_rate = (
                 optimizer.learning_rate.item()
                 if hasattr(optimizer.learning_rate, "item")
                 else args.learning_rate
             )
-            it_sec = args.steps_per_report / train_time
-            tokens_sec = float(n_tokens_total) / train_time
             trained_tokens += n_tokens_total
-            peak_mem = mx.get_peak_memory() / 1e9
-
+            info = {
+                "iteration": it,
+                **report_loss_metrics(values, "train"),
+                "learning_rate": learning_rate,
+                "iterations_per_second": steps / max(train_time, 1e-8),
+                "tokens_per_second": n_tokens_total / max(train_time, 1e-8),
+                "trained_tokens": trained_tokens,
+                "peak_memory": mx.get_peak_memory() / 1e9,
+            }
+            if "num_processed_tokens" in values:
+                info["processed_tokens_per_second"] = values[
+                    "num_processed_tokens"
+                ] / max(train_time, 1e-8)
             if rank == 0:
-                print(
-                    f"Iter {it}: Train loss {Colors.OKGREEN}{train_loss:.8f}{Colors.ENDC}, "
-                    f"Learning Rate {learning_rate:.3e}, "
-                    f"It/sec {it_sec:.3f}, "
-                    f"Tokens/sec {tokens_sec:.3f}, "
-                    f"Trained Tokens {trained_tokens}, "
-                    f"Peak mem {peak_mem:.3f} GB",
-                    flush=True,
-                )
-
-            # Reset metrics
-            losses = 0
-            n_tokens = 0
-            steps = 0
-            train_time = 0
+                print(format_metric_report(info, "Training"), flush=True)
+            accumulator = MetricAccumulator()
+            steps, train_time = 0, 0
 
         # Save checkpoint
         if it % args.steps_per_save == 0 and rank == 0:
@@ -656,4 +577,29 @@ def train(
         save_adapter(model, adapter_file)
         print(
             f"{Colors.OKGREEN}Saved final adapter weights to {adapter_file}.{Colors.ENDC}"
+        )
+
+
+@dataclass
+class SFTTrainer:
+    """Configure and run the functional supervised fine-tuning recipe."""
+
+    model: nn.Module
+    optimizer: Any
+    train_dataset: Any
+    val_dataset: Any = None
+    args: TrainingArgs = field(default_factory=TrainingArgs)
+    train_on_completions: bool = False
+    assistant_id: int = 77091
+
+    def fit(self):
+        """Run training with the configured model, data, and options."""
+        return train(
+            model=self.model,
+            optimizer=self.optimizer,
+            train_dataset=self.train_dataset,
+            val_dataset=self.val_dataset,
+            args=self.args,
+            train_on_completions=self.train_on_completions,
+            assistant_id=self.assistant_id,
         )

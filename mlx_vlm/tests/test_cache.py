@@ -81,7 +81,7 @@ from mlx_vlm.turboquant import (
     _TurboQuantProdCodec,
     resolve_kv_bits,
 )
-from mlx_vlm.vision_cache import VisionFeatureCache
+from mlx_vlm.vision_cache import VisionFeatureCache, processed_image_key
 
 # Cache lifecycle
 
@@ -125,6 +125,44 @@ def test_kv_cache_extracts_one_active_row(factory):
     assert extracted.values.shape == (1, 2, 3, 4)
     assert mx.array_equal(extracted.keys, keys[1:2]).item()
     assert mx.array_equal(extracted.values, values[1:2]).item()
+
+
+@pytest.mark.parametrize("processed", [0, 3, 12])
+@pytest.mark.parametrize("kind", ["dense", "uniform"])
+def test_batch_filter_only_trims_processed_padding(processed, kind):
+    cache = batch_cache(kind, [9, 0])
+    if processed:
+        keys = mx.ones((2, 1, processed, 32))
+        cache.update_and_fetch(keys, keys)
+    cache.filter(mx.array([0]))
+
+    assert cache._idx == max(0, processed - 9)
+    assert cache.left_padding.tolist() == [max(0, 9 - processed)]
+    assert cache.offset.tolist() == [processed - 9]
+
+
+def test_minimax_m3_batch_filter_preserves_unprocessed_padding():
+    cache = MiniMaxM3BatchKVCache([9, 0])
+    keys = mx.ones((2, 1, 3, 4))
+    cache.update_and_fetch(keys, keys)
+    cache.update_index_and_fetch(keys)
+    cache.filter(mx.array([0]))
+
+    assert cache._idx == cache.index_offset == 0
+    assert cache.state[1].shape[2] == 0
+    assert cache.left_padding.tolist() == [6]
+
+
+def test_qsa_batch_filter_preserves_unprocessed_padding():
+    cache = BatchQSAKVCache([9, 0])
+    keys = mx.ones((2, 1, 3, 4))
+    cache.update_and_fetch(keys, keys)
+    cache.update_indexer(keys[:, 0], mx.broadcast_to(mx.arange(3)[None], (2, 3)))
+    cache.filter(mx.array([0]))
+
+    assert cache._idx == cache.index_offset == 0
+    assert cache.index_keys.shape[1] == 0
+    assert cache.left_padding.tolist() == [6]
 
 
 def test_cache_list_can_extract_an_already_extracted_kv_cache():
@@ -926,6 +964,44 @@ def test_prepare_left_padding_on_empty_only():
 
 
 class TestVisionFeatureCache:
+    def test_processed_key_preserves_gemma_patch_positions(self):
+        from PIL import Image
+
+        from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
+            Gemma4UnifiedImageProcessor,
+        )
+
+        processor = Gemma4UnifiedImageProcessor(
+            do_resize=False, max_soft_tokens=8, patch_size=16, pooling_kernel_size=2
+        )
+        square, _ = processor.preprocess(Image.new("RGB", (64, 64)))
+        wide, _ = processor.preprocess(Image.new("RGB", (128, 32)))
+        assert mx.array_equal(
+            mx.array(square["pixel_values"]), mx.array(wide["pixel_values"])
+        )
+        assert not mx.array_equal(
+            mx.array(square["image_position_ids"]), mx.array(wide["image_position_ids"])
+        )
+        assert processed_image_key(**square) != processed_image_key(**wide)
+        assert processed_image_key(**square) == processed_image_key(
+            **square, input_ids=mx.array([[1, 2]]), temperature=0.5, max_tokens=16
+        )
+
+    def test_processed_key_preserves_patch_geometry(self):
+        pixels = mx.zeros((16, 3))
+        square = processed_image_key(pixels, mx.array([[1, 4, 4]]))
+        wide = processed_image_key(pixels, mx.array([[1, 2, 8]]))
+        assert square != wide
+        assert square == processed_image_key(mx.zeros((16, 3)), mx.array([[1, 4, 4]]))
+
+    def test_processed_key_handles_ragged_image_batches(self):
+        images = [mx.zeros((4, 3)), mx.ones((16, 3))]
+        key = processed_image_key(images)
+        assert key == processed_image_key([mx.zeros((4, 3)), mx.ones((16, 3))])
+        assert key != processed_image_key(list(reversed(images)))
+        assert key != processed_image_key([mx.ones((4, 3)), images[1]])
+        assert key != processed_image_key([images[0], mx.ones((32, 3))])
+
     def test_lru_eviction(self):
         cache = VisionFeatureCache(max_size=2)
         cache.put("a.jpg", mx.ones((1, 10, 64)))
@@ -2588,16 +2664,18 @@ def test_turboquant_skips_non_kv_cache_entries():
     assert isinstance(prompt_cache[1], TurboQuantKVCache)
 
 
-def test_batch_turboquant_filter_supports_uniform_single_item_offsets():
+@pytest.mark.parametrize("padding", [0, 9])
+def test_batch_turboquant_filter_supports_uniform_single_item_offsets(padding):
     keys = mx.ones((1, 2, 3, 8), dtype=mx.float16)
     values = mx.ones((1, 2, 3, 8), dtype=mx.float16)
-    cache = BatchTurboQuantKVCache([0], bits=3.5)
+    cache = BatchTurboQuantKVCache([padding], bits=3.5)
 
     cache.update_and_fetch(keys, values)
     cache.filter(mx.array([0]))
 
-    assert cache.offset.tolist() == [3]
-    assert cache.left_padding.tolist() == [0]
+    assert cache.offset.tolist() == [3 - padding]
+    assert cache.left_padding.tolist() == [max(0, padding - 3)]
+    assert cache._idx == max(0, 3 - padding)
 
 
 def test_batch_turboquant_cache_supports_uniform_right_trim():

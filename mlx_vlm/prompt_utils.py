@@ -56,6 +56,7 @@ MODEL_CONFIG = {
     "qwen3_omni_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "minicpmo": MessageFormat.IMAGE_TOKEN,
     "minicpmv4_6": MessageFormat.IMAGE_TOKEN_WRAPPED,
+    "minicpmv4_7": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "mistral3": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm4v": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm4v_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
@@ -67,6 +68,7 @@ MODEL_CONFIG = {
     "internvl": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "llmjpvl": MessageFormat.IMAGE_TOKEN,
     "nemotron_h_nano_omni": MessageFormat.LIST_WITH_IMAGE_TYPE,
+    "nemotron_h_omni": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "nemotronh_nano_omni_reasoning_v3": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "kimi_vl": MessageFormat.LIST_WITH_IMAGE,
     "kimi_k25": MessageFormat.LIST_WITH_IMAGE,
@@ -342,9 +344,13 @@ class MessageFormatter:
             "gemma4_unified",
             "diffusion_gemma",
             "minicpmv4_6",
+            "minicpmv4_7",
             "minimax_m3_vl",
             "llava_onevision",
             "glm5_next",
+            "nemotron_h_omni",
+            "nemotron_h_nano_omni",
+            "nemotronh_nano_omni_reasoning_v3",
         ] and kwargs.get("video"):
             return self._format_video_message(
                 prompt,
@@ -707,6 +713,14 @@ def get_message_json(
     )
 
 
+def _sort_tool_schema_keys(value):
+    if isinstance(value, dict):
+        return {key: _sort_tool_schema_keys(value[key]) for key in sorted(value)}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_sort_tool_schema_keys(item) for item in value)
+    return value
+
+
 def get_chat_template(
     processor,
     messages: List[Dict[str, Any]],
@@ -916,6 +930,9 @@ def get_chat_template(
             return _messages_to_plain_prompt()
 
         template_kwargs = dict(kwargs)
+        if "tools" in template_kwargs:
+            # Equivalent schemas must render the same token prefix for APC.
+            template_kwargs["tools"] = _sort_tool_schema_keys(template_kwargs["tools"])
         if "enable_thinking" not in template_kwargs and _supports_template_kw(
             template_processor, "enable_thinking"
         ):
