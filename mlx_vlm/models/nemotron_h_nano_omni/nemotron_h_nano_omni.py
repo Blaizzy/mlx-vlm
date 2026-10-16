@@ -53,6 +53,30 @@ def masked_scatter(
     return final_flat.reshape(final_shape)
 
 
+def compute_retention_mask(video_embeds: mx.array, pruning_rate: float) -> mx.array:
+    """Keep the first tubelet and the least similar tokens in later tubelets.
+
+    Features have shape (tubelets, spatial tokens, hidden size), so rectangular
+    frames work without reconstructing a square spatial grid.
+    """
+    if not 0.0 <= pruning_rate <= 1.0:
+        raise ValueError("video_pruning_rate must be between 0 and 1.")
+    frames, tokens, _ = video_embeds.shape
+    normalized = video_embeds / mx.maximum(
+        mx.linalg.norm(video_embeds, axis=-1, keepdims=True), 1e-8
+    )
+    similarity = mx.sum(normalized[1:] * normalized[:-1], axis=-1)
+    scores = mx.concatenate(
+        [mx.full((1, tokens), 255, similarity.dtype), 1 - similarity]
+    )
+    keep = max(tokens, int(frames * tokens * (1 - pruning_rate)))
+    # argsort is stable: ties retain the reference's chronological token order.
+    indices = mx.argsort(-scores.reshape(-1))[:keep]
+    mask = mx.zeros((frames * tokens,), dtype=mx.bool_)
+    mask[indices] = True
+    return mask
+
+
 class Model(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -61,6 +85,16 @@ class Model(nn.Module):
         self.language_model = LanguageModel(config.text_config)
         self.vision_model = VisionModel(config.vision_config)
         self.mlp1 = VisionProjection(config)
+        use_vision_final_layernorm = config.vision_final_layernorm
+        if use_vision_final_layernorm is None:
+            use_vision_final_layernorm = config.text_config.num_nextn_predict_layers > 0
+        self.vision_final_layernorm = (
+            nn.LayerNorm(
+                config.vit_hidden_size, eps=config.vision_config.layer_norm_eps
+            )
+            if use_vision_final_layernorm
+            else None
+        )
 
         self.img_context_token_id = config.img_context_token_id
         self.video_context_token_id = config.video_context_token_id
@@ -183,7 +217,18 @@ class Model(nn.Module):
             pixel_values = mx.array(pixel_values)
         if pixel_values.ndim == 3:
             pixel_values = pixel_values[None, ...]
-        return pixel_values
+        return pixel_values.astype(self.mlp1.layers[0].weight.dtype)
+
+    def _project_vision_features(self, vit_embeds, height, width):
+        if self.vision_final_layernorm is not None:
+            vit_embeds = self.vision_final_layernorm(vit_embeds)
+        vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], height, width, -1)
+        vit_embeds = self.pixel_shuffle(
+            vit_embeds, scale_factor=self.config.downsample_ratio
+        )
+        return self.mlp1(
+            vit_embeds.reshape(vit_embeds.shape[0], -1, vit_embeds.shape[-1])
+        )
 
     def _extract_feature_single(self, pixel_values):
         pixel_values = self._ensure_4d_pixels(pixel_values)
@@ -192,17 +237,18 @@ class Model(nn.Module):
         _, _, height, width = pixel_values.shape
         patch_h = height // patch_size
         patch_w = width // patch_size
-        vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], patch_h, patch_w, -1)
-        vit_embeds = self.pixel_shuffle(
-            vit_embeds, scale_factor=self.config.downsample_ratio
-        )
-        vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], -1, vit_embeds.shape[-1])
-        return self.mlp1(vit_embeds)
+        return self._project_vision_features(vit_embeds, patch_h, patch_w)
 
     def extract_feature(self, pixel_values):
         if isinstance(pixel_values, (list, tuple)):
             return mx.concatenate(
-                [self._extract_feature_single(pv) for pv in pixel_values], axis=0
+                [
+                    self._extract_feature_single(pv).reshape(
+                        -1, self.config.text_config.hidden_size
+                    )
+                    for pv in pixel_values
+                ],
+                axis=0,
             )
         return self._extract_feature_single(pixel_values)
 
@@ -232,12 +278,7 @@ class Model(nn.Module):
         patch_size = self.vision_model.radio_model.model.patch_generator.patch_size
         patch_h = height // patch_size
         patch_w = width // patch_size
-        vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], patch_h, patch_w, -1)
-        vit_embeds = self.pixel_shuffle(
-            vit_embeds, scale_factor=self.config.downsample_ratio
-        )
-        vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], -1, vit_embeds.shape[-1])
-        return self.mlp1(vit_embeds)
+        return self._project_vision_features(vit_embeds, patch_h, patch_w)
 
     def get_input_embeddings(
         self,
@@ -260,9 +301,11 @@ class Model(nn.Module):
 
         pixel_values_videos = kwargs.get("pixel_values_videos", None)
         if pixel_values_videos is not None:
-            if self.video_pruning_rate > 0:
-                raise NotImplementedError(
-                    "Efficient video sampling is not implemented for Nemotron Omni yet."
+            if input_ids.shape[0] != 1:
+                raise ValueError("Nemotron video inputs require batch size 1.")
+            if pixel_values is not None:
+                raise ValueError(
+                    "Use separate requests for Nemotron image and video inputs."
                 )
             video_features = self.extract_video_feature(pixel_values_videos)
             inputs_embeds = self._merge_features(
@@ -296,6 +339,19 @@ class Model(nn.Module):
                 "Sound",
             )
 
+        pruning_rate = kwargs.get("video_pruning_rate", self.video_pruning_rate)
+        if pixel_values_videos is not None and not 0 <= pruning_rate <= 1:
+            raise ValueError("video_pruning_rate must be between 0 and 1.")
+        if pixel_values_videos is not None and pruning_rate > 0:
+            video_mask = compute_retention_mask(video_features, pruning_rate)
+            positions = np.flatnonzero(
+                np.array(input_ids[0] == self.img_context_token_id)
+            )
+            keep = np.ones(input_ids.shape[1], dtype=bool)
+            keep[positions] = np.array(video_mask)
+            indices = mx.array(np.flatnonzero(keep))
+            inputs_embeds = inputs_embeds[:, indices]
+
         return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
 
     def __call__(
@@ -319,6 +375,13 @@ class Model(nn.Module):
     def sanitize(self, weights):
         sanitized = {}
         for key, value in sanitize_audio_weights(weights).items():
+            if key in (
+                "vision_model.summary_idxs",
+                "vision_model.radio_model.summary_idxs",
+            ):
+                continue
+            if key.startswith("vision_projector.vision_final_layernorm."):
+                key = key.removeprefix("vision_projector.")
             if key.startswith("mlp1."):
                 key = key.replace("mlp1.0.", "mlp1.layers.0.")
                 key = key.replace("mlp1.1.", "mlp1.layers.1.")

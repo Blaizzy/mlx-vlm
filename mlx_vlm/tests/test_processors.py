@@ -1673,6 +1673,74 @@ def test_checkpoint_loading(tmp_path, name):
         ) == [3]
 
 
+def test_nemotron_processor_modalities_and_metadata(tmp_path):
+    metadata = deepcopy(DATA["checkpoints"]["nemotron"])
+    config = metadata["config"]
+    config["model_type"] = "nemotron_h_omni"
+    metadata["processor_config"][
+        "processor_class"
+    ] = "NemotronH_Omni_Reasoning_V3Processor"
+    metadata["preprocessor_config"].update(
+        norm_mean=[0.5] * 3,
+        norm_std=[0.5] * 3,
+        min_num_patches=4,
+        max_num_patches=16,
+        video_target_num_patches=8,
+    )
+    _write_configs(tmp_path, **metadata)
+    vocab = {str(i): i for i in range(21)}
+    for index, token in [
+        (0, "[UNK]"),
+        (5, "seconds"),
+        (18, "<image>"),
+        (19, "<img>"),
+        (20, "</img>"),
+    ]:
+        del vocab[str(index)]
+        vocab[token] = index
+    backend = Tokenizer(WordLevel(vocab, unk_token="[UNK]"))
+    backend.pre_tokenizer = Whitespace()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        unk_token="[UNK]",
+        eos_token="[UNK]",
+        pad_token="[UNK]",
+        additional_special_tokens=["<image>", "<img>", "</img>"],
+    )
+    tokenizer.save_pretrained(tmp_path)
+    processor = load_processor(tmp_path, add_detokenizer=False, trust_remote_code=False)
+    assert processor_handles_video(processor)
+    messages = apply_chat_template(
+        processor, config, "Describe.", num_images=1, return_messages=True
+    )
+    assert messages[0]["content"][0] == {"type": "image"}
+    messages = apply_chat_template(
+        processor, config, "Describe.", video="clip.mp4", return_messages=True
+    )
+    assert messages[0]["content"][0]["type"] == "video"
+    image = Image.new("RGB", (32, 32), "red")
+    inputs = prepare_inputs(processor, prompts="<image>Describe.", images=[image])
+    assert int(mx.sum(inputs["input_ids"] == 18)) == int(inputs["num_tokens"].sum())
+    frames = np.zeros((5, 3, 32, 64), dtype=np.uint8)
+    inputs = prepare_inputs(processor, prompts="<video>Describe.", videos=[frames])
+    assert inputs["pixel_values_videos"].shape[0] == 5
+    assert int(mx.sum(inputs["input_ids"] == 18)) == 3 * int(inputs["num_tokens"][0])
+    assert (
+        int(mx.sum(inputs["input_ids"] == 5)) == 5
+    )  # Per-frame timestamps survived the loader.
+    assert processor.image_processor._is_video_mode is False
+    with pytest.raises(ValueError, match="one video"):
+        prepare_inputs(processor, prompts="<video><video>", videos=[frames, frames])
+
+    waveform = np.linspace(-1, 1, 1600, dtype=np.float32)
+    keyword = processor(text="<so_embedding>", audio=waveform)
+    positional = processor(None, "<so_embedding>", None, waveform)
+    for inputs in (keyword, positional):
+        assert len(inputs["sound_clips"]) == 1
+        np.testing.assert_array_equal(inputs["sound_clips"][0], waveform)
+    np.testing.assert_array_equal(positional["input_ids"], keyword["input_ids"])
+
+
 # Prompt construction
 
 
