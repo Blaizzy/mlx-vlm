@@ -91,6 +91,7 @@ MODEL_CONFIG = {
     "molmo2": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "molmo_point": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "step3p7": MessageFormat.IMAGE_PATCH_TOKEN,
+    "step5_vl": MessageFormat.IMAGE_PATCH_TOKEN,
     "minimax_m3_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "muse_glimmer": MessageFormat.LIST_WITH_IMAGE_FIRST,
     # Token-based models
