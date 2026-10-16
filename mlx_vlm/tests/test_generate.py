@@ -1231,6 +1231,50 @@ def test_stream_generate_stores_checkpoint_only_before_decode(reused_prefix):
     assert all(call.kwargs == {"extra_hash": 0} for call in calls)
 
 
+@pytest.mark.parametrize(
+    "geometry",
+    ["image_grid_thw", "image_grid_hw", "image_permutations", "image_position_ids"],
+)
+def test_stream_generate_cache_preserves_image_metadata(geometry, monkeypatch):
+    from mlx_vlm.vision_cache import VisionFeatureCache
+
+    vision_cache = VisionFeatureCache()
+    encode = MagicMock(side_effect=lambda pixels, **kwargs: [kwargs[geometry]])
+    model = SimpleNamespace(config=MockConfig(), encode_images=encode)
+    processor = SimpleNamespace(stopping_criteria=lambda token: False)
+    monkeypatch.setattr(
+        dispatch_module, "wired_limit", lambda *args: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        dispatch_module,
+        "make_streaming_detokenizer",
+        lambda _: MagicMock(last_segment=""),
+    )
+
+    def decode(*args, **kwargs):
+        assert mx.array_equal(kwargs["cached_image_features"][0], kwargs[geometry])
+        yield 7, mx.zeros((4,))
+
+    monkeypatch.setattr(dispatch_module, "generate_step", decode)
+    for layout in (0, 1, 0):
+        list(
+            dispatch_module.stream_generate(
+                model,
+                processor,
+                prompt="",
+                image="same.png",
+                input_ids=mx.array([[1, 2]]),
+                pixel_values=mx.zeros((16, 3)),
+                mask=None,
+                prompt_cache=[],
+                vision_cache=vision_cache,
+                max_tokens=1,
+                **{geometry: mx.array([layout])},
+            )
+        )
+    assert encode.call_count == len(vision_cache) == 2
+
+
 @pytest.mark.parametrize("value", [224, "22", [1.5], [True], [1, 2, 3]])
 def test_normalize_resize_shape_rejects_invalid_values(value):
     with pytest.raises(ValueError, match="resize_shape must contain 1 or 2 integers"):

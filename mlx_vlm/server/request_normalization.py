@@ -238,8 +238,16 @@ def _build_gen_args(
     default_top_k = _model_config_field_or_default(processor, "top_k", 0)
     if _model_config_field_or_default(processor, "do_sample", None) is False:
         default_temperature = 0.0
+    image_defaults = runtime.config.image_pixel_limits()
     args = GenerationArguments(
         max_tokens=max_tokens,
+        min_pixels=_request_field_or_default(
+            request, "min_pixels", image_defaults["min_pixels"]
+        ),
+        max_pixels=_request_field_or_default(
+            request, "max_pixels", image_defaults["max_pixels"]
+        ),
+        resize_shape=getattr(request, "resize_shape", None),
         temperature=_request_field_or_default(
             request, "temperature", default_temperature
         ),
