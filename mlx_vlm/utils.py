@@ -40,6 +40,7 @@ ACTIVATION_QUANTIZATION_MODES = {"nvfp4", "mxfp8"}
 
 # Constants
 MODEL_REMAPPING = {
+    "nemotron_h_puzzle": "nemotron_h",
     "moondream1": "moondream2",
     "llava_qwen2": "fastvlm",  # Apple's FastVLM, note it's different to the one below
     "llava-qwen2": "llava_bunny",
@@ -57,6 +58,7 @@ MODEL_REMAPPING = {
     "dinov2_with_registers": "dinov2",
     "falcon-perception": "falcon_perception",
     "nemotronh_nano_omni_reasoning_v3": "nemotron_h_nano_omni",
+    "nemotron_h_omni": "nemotron_h_nano_omni",
     "cohere2moe": "cohere2_moe",
     "unlimited-ocr": "unlimited_ocr",
     "mistral": "llama",

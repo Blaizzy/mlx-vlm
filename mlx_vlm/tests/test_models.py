@@ -11,7 +11,7 @@ import math
 import struct
 import textwrap
 import unittest
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict
 from operator import attrgetter
 from pathlib import Path
@@ -314,6 +314,44 @@ class ModelChecks:
             ).logits
             assert logits.shape == (1, 1, config.vocab_size) and logits.dtype == dtype
 
+    def language_hidden_states(self, model):
+        ids = mx.array([[1, 2, 3]])
+        embeds = model.get_input_embeddings(ids)
+        captured = []
+
+        def record_input(forward):
+            def call(layer, hidden, *args, **kwargs):
+                captured.append(hidden)
+                return forward(layer, hidden, *args, **kwargs)
+
+            return call
+
+        reference_cache = model.make_cache()
+        with ExitStack() as stack:
+            for layer_type in {type(layer) for layer in model.layers}:
+                stack.enter_context(
+                    patch.object(
+                        layer_type, "__call__", record_input(layer_type.__call__)
+                    )
+                )
+            reference = model(ids, cache=reference_cache)
+        assert reference.hidden_states is None
+        next_ids = mx.array([[4]])
+        next_logits = model(next_ids, cache=reference_cache).logits
+        for inputs in (
+            {"inputs": ids},
+            {"input_ids": ids},
+            {"inputs_embeds": embeds},
+        ):
+            cache = model.make_cache()
+            output = model(**inputs, cache=cache, output_hidden_states=True)
+            assert len(output.hidden_states) == len(model.layers) + 1
+            for actual, expected in zip(output.hidden_states[:-1], captured):
+                self.assert_close(actual, expected)
+            self.assert_close(output.logits, reference.logits)
+            self.assert_close(model.lm_head(output.hidden_states[-1]), output.logits)
+            self.assert_close(model(next_ids, cache=cache).logits, next_logits)
+
     def projector(
         self, model, input_width, output_width, *, grid_hw=None, downsample_ratio=1
     ):
@@ -507,11 +545,20 @@ TINY_DEFAULTS = DATA["tiny_defaults"]
 TINY_MODELS = DATA["shared_configs"]
 
 
+def model_case(name):
+    """Return fresh case data for shared model and checkpoint tests."""
+    return copy.deepcopy(next(case for case in DATA["cases"] if case["id"] == name))
+
+
 def build_config(module, values, config_type="ModelConfig"):
     """Construct the model family's config classes from ordinary nested data."""
     fields = copy.deepcopy(values)
-    if module.__name__ == "mlx_vlm.models.minicpmv4_7" and config_type == "ModelConfig":
-        # Preserve the checkpoint loader's dense/MoE text-config dispatch.
+    if (
+        module.__name__
+        in ("mlx_vlm.models.minicpmv4_7", "mlx_vlm.models.nemotron_h_nano_omni")
+        and config_type == "ModelConfig"
+    ):
+        # Preserve checkpoint aliases and per-layer text-config dispatch.
         return module.ModelConfig.from_dict(fields)
     for name, value in fields.items():
         if name in CONFIG_TYPES and isinstance(value, dict):
@@ -546,6 +593,8 @@ def check_arguments(kind, case, model, config):
         return (model, config, name), case.get("audio", {})
     if kind in {"request_positions", "chunked_positions"}:
         return (model,), {}
+    if kind == "language_hidden_states":
+        return (model.language_model,), {}
     if kind in {"language", "mrope_cache_index", "mrope_deltas"}:
         if kind == "language":
             options = (
@@ -624,6 +673,148 @@ def test_model_contract(case):
     for kind in case["checks"]:
         args, kwargs = check_arguments(kind, case, model, config)
         getattr(checks, kind)(*args, **kwargs)
+
+
+@pytest.fixture
+def nemotron_case(request):
+    case = model_case(getattr(request, "param", "nemotron_super_vl"))
+    module = importlib.import_module("mlx_vlm.models." + case["module"])
+    return module, case["config"]
+
+
+@pytest.mark.parametrize("nemotron_case", ["nemotron_bolt"], indirect=True)
+def test_nemotron_puzzle_layer_configs(nemotron_case):
+    arch, config = nemotron_case
+    # The block list takes precedence, as in NVIDIA's Puzzle config.
+    config["llm_config"]["layers_block_type"] = ["attention"]
+    _, family = get_model_and_args({"model_type": "nemotron_h_puzzle"})
+    assert family == "nemotron_h"
+    model = arch.Model(build_config(arch, config))
+    assert [layer.block_type for layer in model.language_model.layers] == [
+        "M",
+        "E",
+        "*",
+        "E",
+    ]
+    assert model.config.text_config.time_step_limit == (0, float("inf"))
+    for idx, experts, width, topk in [(1, 2, 32, 1), (3, 3, 64, 2)]:
+        moe = model.language_model.layers[idx].mixer
+        assert moe.switch_mlp.fc1.weight.shape == (experts, width, 32)
+        assert moe.switch_mlp.fc2.weight.shape == (experts, 32, width)
+        assert moe.gate.weight.shape == (experts, 32)
+        assert moe.gate.top_k == topk
+
+
+@pytest.mark.parametrize("vision_norm,mtp_depth", [(True, 0), (False, 1), (None, 1)])
+def test_nemotron_explicit_vision_norm_overrides_mtp(
+    nemotron_case, vision_norm, mtp_depth
+):
+    arch, config = nemotron_case
+    config["vision_final_layernorm"] = vision_norm
+    config["llm_config"]["num_nextn_predict_layers"] = mtp_depth
+    model = arch.Model(build_config(arch, config))
+    expected = vision_norm if vision_norm is not None else mtp_depth > 0
+    assert isinstance(model.vision_final_layernorm, nn.LayerNorm) == expected
+    assert model.config.to_dict().get("vision_final_layernorm") == vision_norm
+
+
+@pytest.mark.parametrize(
+    "nemotron_case", ["nemotron_super_vl", "nemotron_bolt"], indirect=True
+)
+@pytest.mark.parametrize("text_key", ["llm_config", "text_config"])
+def test_nemotron_checkpoint_loading(tmp_path, nemotron_case, text_key):
+    arch, config = nemotron_case
+    config[text_key] = config.pop("llm_config")
+    _, family = get_model_and_args(config)
+    assert family == arch.__name__.rsplit(".", 1)[-1]
+    model = arch.Model(build_config(arch, config))
+    expected = dict(tree_flatten(model.parameters()))
+    weights = {}
+    for key, value in expected.items():
+        if ".switch_mlp." in key:
+            prefix, projection = key.split(".switch_mlp.")
+            projection = projection.replace("fc1", "up_proj").replace(
+                "fc2", "down_proj"
+            )
+            for expert, weight in enumerate(value):
+                weights[f"{prefix}.experts.{expert}.{projection}"] = weight
+        else:
+            if "conv1d.weight" in key:
+                value = value.moveaxis(1, 2)
+            key = key.replace("mlp1.layers.", "mlp1.")
+            if key.startswith("vision_final_layernorm."):
+                key = "vision_projector." + key
+            weights[key] = value
+    weights["vision_model.summary_idxs"] = mx.array([0, 1])
+    weights["language_model.mtp.unused.weight"] = mx.ones((2, 2))
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+    loaded = load_model(tmp_path)
+    assert asdict(loaded.config) == asdict(model.config)
+    actual = dict(tree_flatten(loaded.parameters()))
+    assert actual.keys() == expected.keys()
+    for key, value in expected.items():
+        assert mx.array_equal(actual[key], value), key
+
+
+@pytest.mark.parametrize(
+    "rate,expected",
+    [
+        (0.0, [True] * 6),
+        (0.5, [True, True, False, True, False, False]),
+        (1.0, [True, True, False, False, False, False]),
+    ],
+)
+def test_nemotron_video_retention_order_and_first_tubelet(
+    nemotron_case, rate, expected
+):
+    arch, _ = nemotron_case
+    vision = inspect.getmodule(arch.Model)
+    # The second token changes most in frame 2; equal scores preserve order.
+    features = mx.array(
+        [[[1.0, 0.0], [1.0, 0.0]], [[1.0, 0.0], [-1.0, 0.0]], [[1.0, 0.0], [-1.0, 0.0]]]
+    )
+    assert vision.compute_retention_mask(features, rate).tolist() == expected
+    assert vision.compute_retention_mask(mx.zeros((1, 2, 4)), rate).tolist() == [
+        True,
+        True,
+    ]
+
+
+def test_nemotron_vision_normalization_and_video_pruning(nemotron_case):
+    arch, config = nemotron_case
+    vision = inspect.getmodule(arch.Model)
+    model = arch.Model(build_config(arch, config))
+    features = mx.random.normal((1, 4, 16))
+    # The projector must normalize BEFORE spatially merging the four patches.
+    expected = model.mlp1(model.vision_final_layernorm(features).reshape(1, 1, 64))
+    np.testing.assert_allclose(
+        model._project_vision_features(features, 2, 2), expected, rtol=1e-5, atol=1e-5
+    )
+    # Five rectangular frames pad to three tubelets, two tokens per tubelet.
+    pixels = mx.random.normal((5, 3, 32, 64))
+    ids = mx.array([[1, 18, 18, 2, 18, 18, 3, 18, 18, 4]])
+    full = model.extract_video_feature(pixels)
+    assert full.shape == (3, 2, 32)
+    keep = np.flatnonzero(vision.compute_retention_mask(full, 0.7))
+    actual = model.get_input_embeddings(ids, pixel_values_videos=pixels).inputs_embeds
+    assert actual.shape == (1, 6, 32)
+    unpruned = model.get_input_embeddings(
+        ids, pixel_values_videos=pixels, video_pruning_rate=0
+    ).inputs_embeds
+    assert unpruned.shape == (1, 10, 32)
+    assert model.video_pruning_rate == 0.7
+    with pytest.raises(ValueError, match="video_pruning_rate"):
+        model.get_input_embeddings(
+            ids, pixel_values_videos=pixels, video_pruning_rate=-1
+        )
+    np.testing.assert_allclose(actual[0, 1:3], full.reshape(-1, 32)[mx.array(keep)])
+    expected_text = model.language_model.get_input_embeddings(mx.array([[1, 2, 3, 4]]))
+    np.testing.assert_allclose(actual[:, [0, 3, 4, 5]], expected_text)
+    images = [mx.zeros((3, 32, 32)), mx.zeros((3, 32, 64))]
+    assert model.get_input_embeddings(
+        mx.array([[1, 18, 18, 18, 2]]), images
+    ).inputs_embeds.shape == (1, 5, 32)
 
 
 def test_lfm2_encoder_sanitize_and_dispatch():
@@ -2346,6 +2537,9 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
 
         case = next(case for case in DATA["cases"] if case["module"] == "deepseek_v41")
         config = build_config(deepseek_v41, case["config"])
+        # MLX's sorted affine GEMM can read past a partial 64-element K tile.
+        # Use aligned projections while retaining decode and sorted dispatch.
+        config.hidden_size = config.moe_intermediate_size = 64
 
         def project(layer, x, expert=None):
             # Use MLX's native MXFP8 codec as an independent rounding oracle.
