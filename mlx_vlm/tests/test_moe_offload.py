@@ -31,6 +31,54 @@ from mlx_vlm.moe_offload import ExpertStore, patch_model, plan, repack
 from mlx_vlm.utils import load_model, save_weights
 
 
+@pytest.fixture(params=[None, mx.cpu], ids=["default", "cpu"])
+def nvfp4_device(request):
+    with mx.stream(request.param or mx.default_device()):
+        yield
+
+
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("scale_name", ["weight_scale_2", "weight_global_scale"])
+@pytest.mark.parametrize("scalar", [False, True])
+@pytest.mark.parametrize("decode", [False, True])
+def test_native_nvfp4_global_scales_survive_repack(
+    tmp_path, fused, scale_name, scalar, decode, nvfp4_device
+):
+    from mlx.utils import tree_flatten
+
+    from mlx_vlm.quantization.nvfp4 import replace_scaled_quantized_linears
+
+    model = nn.Module()
+    model.model = nn.Module()
+    layer = nn.Module()
+    layer.switch_mlp = (LagunaPackedSwitchGLU if fused else SwitchGLU)(64, 64, 4)
+    model.model.layers = [layer]
+    nn.quantize(model, mode="nvfp4", group_size=16, bits=4)
+    scales = {}
+    for path, value in tree_flatten(model.parameters()):
+        if path.endswith(".weight"):
+            scale = mx.array(0.137) if scalar else mx.array([0.137, 0.348, 0.779, 0.29])
+            scales[path.removesuffix("weight") + scale_name] = scale
+    replace_scaled_quantized_linears(model, scales)
+    x = mx.random.normal((1, 3, 64)).astype(mx.bfloat16)
+    indices = mx.array([[[0, 1], [2, 3], [0, 3]]])
+    if decode:
+        x, indices = x[:, :1], indices[:, :1]
+    expected = layer.switch_mlp(x, indices)
+    mx.eval(expected)
+    build, out = tmp_path / "build", tmp_path / "out"
+    save_weights(str(build), model)
+    (build / "config.json").write_text(
+        json.dumps({"quantization": {"group_size": 16, "bits": 4, "mode": "nvfp4"}})
+    )
+    repack(str(build), str(out))
+    patch_model(model, str(out), expert_cache_gb=0.00001)
+    actual = layer.switch_mlp(x, indices)
+    _assert_offload_parity(expected, actual)
+    # The same experts must still produce the same result after eviction/reload.
+    _assert_offload_parity(expected, layer.switch_mlp(x, indices))
+
+
 def _deepseek_config():
     return deepseek_v3.ModelConfig(
         model_type="deepseek_v3",
@@ -202,6 +250,26 @@ def test_expert_store_get_is_thread_safe(tmp_path):
                     assert (g is None) == (w is None)
                     if g is not None:
                         assert mx.array_equal(g, w)
+
+
+def test_selected_experts_reload_once_and_survive_tiny_cache(tmp_path):
+    _, offload = _build_and_repack(tmp_path)
+    store = ExpertStore(str(offload), expert_cache_bytes=1)
+    first = store.get_many(1, [0, 2, 0])
+    mx.eval(first)
+    assert store.stats()["resident_bytes"] <= 1
+    # Both experts were evicted. Reloading them must parse the layer only once,
+    # and eviction must not invalidate tensors returned to the current graph.
+    with patch("mlx.core.load", wraps=mx.load) as load:
+        second = store.get_many(1, [0, 2])
+        assert load.call_count == 1
+    for j in first:
+        for got, want in zip(second[j], first[j]):
+            for g, w in zip(got, want):
+                if w is not None:
+                    assert mx.array_equal(g, w).item()
+    assert store.stats()["metadata_reloads"] == 1
+    assert store.stats()["resident_bytes"] <= 1
 
 
 def test_fused_switch_layer_offloads_correctly(tmp_path):
@@ -429,13 +497,14 @@ def _wrap_block(block):
 
 
 @pytest.mark.parametrize("family", sorted(_SWAPPABLE_BLOCKS))
-def test_every_swappable_block_matches_resident(tmp_path, family):
+@pytest.mark.parametrize("tokens", [1, 5])
+def test_every_swappable_block_matches_resident(tmp_path, family, tokens):
     model = _wrap_block(_SWAPPABLE_BLOCKS[family]())
     _, offload = _build_and_repack(
         tmp_path, model, model.config, quant_paths=("experts",)
     )
-    x = mx.random.normal((5, _H)).astype(mx.bfloat16)
-    indices = mx.random.randint(0, _E, (5, _K)).astype(mx.uint32)
+    x = mx.random.normal((tokens, _H)).astype(mx.bfloat16)
+    indices = mx.random.randint(0, _E, (tokens, _K)).astype(mx.uint32)
     mx.eval(x, indices)
     resident = model.model.layers[0].experts(x, indices)
     mx.eval(resident)
