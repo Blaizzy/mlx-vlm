@@ -46,13 +46,11 @@ from .common import (
     DEFAULT_PREFILL_STEP_SIZE,
     DEFAULT_QUANTIZED_KV_START,
     DEFAULT_REPETITION_CONTEXT_SIZE,
-    DEFAULT_TEMPERATURE,
-    DEFAULT_TOP_K,
-    DEFAULT_TOP_P,
     _chunked_prefill_enabled,
     _default_prefill_step_size_for_offload,
     generation_stream,
     maybe_quantize_kv_cache,
+    resolve_sampling_defaults,
     wired_limit,
 )
 from .types import GenerateKwargs, ProcessorLike, Unpack
@@ -174,16 +172,16 @@ def generate_step(
     mask,
     *,
     max_tokens: int = DEFAULT_MAX_TOKENS,
-    temperature: float = DEFAULT_TEMPERATURE,
+    temperature: Optional[float] = None,
     repetition_penalty: Optional[float] = None,
     repetition_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE,
     presence_penalty: Optional[float] = None,
     presence_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE,
     frequency_penalty: Optional[float] = None,
     frequency_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE,
-    top_p: float = DEFAULT_TOP_P,
+    top_p: Optional[float] = None,
     min_p: float = DEFAULT_MIN_P,
-    top_k: int = DEFAULT_TOP_K,
+    top_k: Optional[int] = None,
     top_n_sigma: float = DEFAULT_TOP_N_SIGMA,
     p_less: bool = False,
     typical_p: float = 1.0,
@@ -220,7 +218,10 @@ def generate_step(
         pixel_values: The pixel values for vision models (optional).
         mask: The attention mask (optional).
         max_tokens (int): Maximum number of tokens to generate.
-        temperature (float): The temperature for sampling, if 0 the argmax is used.
+        temperature (float, optional): The temperature for sampling; 0 uses argmax.
+          Unset sampling options use the checkpoint's generation_config.json,
+          falling back to temperature=0.0, top_p=1.0, top_k=0. A checkpoint with
+          do_sample=False defaults to greedy unless temperature is explicit.
         repetition_penalty (float, optional): The penalty factor for repeating
           tokens.
         repetition_context_size (int, optional): The number of tokens to
@@ -280,6 +281,12 @@ def generate_step(
         kv_value_scheme=kv_value_scheme,
     )
 
+    temperature, top_p, top_k = resolve_sampling_defaults(
+        getattr(model, "config", None),
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+    )
     temperature = clamp_temperature(temperature)
     sampler_is_greedy = sampler is None and temperature == 0
     if sampler is None:
