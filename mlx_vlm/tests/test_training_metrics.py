@@ -142,6 +142,7 @@ def test_vision_counts_flow_through_train_validation_and_callbacks(compiled, tmp
             val_batches=-1,
             adapter_file=str(tmp_path / "weights.safetensors"),
         ),
+        optimizer=optim.AdamW(learning_rate=1e-5, weight_decay=0.0),
         train_dataset=[row],
         eval_dataset=[row],
         prepared=True,

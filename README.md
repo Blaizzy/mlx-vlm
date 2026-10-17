@@ -1860,7 +1860,7 @@ See [docs/usage.md](https://github.com/Blaizzy/mlx-vlm/blob/main/docs/usage.md#d
 
 # Fine-tuning
 
-MLX-VLM supports VLM SFT, ORPO, and DPO with LoRA, QLoRA, DoRA, or full
+MLX-VLM supports VLM SFT, ORPO, DPO, and GRPO with LoRA, QLoRA, DoRA, or full
 fine-tuning. Fine-tuning (and the
 eval scripts) need the training extra, which is not installed by default:
 
@@ -1883,6 +1883,6 @@ For Python and notebooks, import `Trainer`, `VLMTrainingArgs`, and
 share model preparation and the training engine.
 
 Start with the [SFT notebook](examples/training/sft_text_only.ipynb), or explore the
-[ORPO, DPO, and custom-loss examples](examples/training/README.md). See the
+[ORPO, DPO, vision GRPO, and custom-loss examples](examples/training/README.md). See the
 [training guide](docs/training.md) for dataset formats, configuration, saving,
 resuming, and the existing functional trainer APIs.

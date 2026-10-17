@@ -49,4 +49,5 @@ from .vlm import (
 )
 from .vlm.config import VLMTrainingArgs
 from .vlm.dpo.config import DPOTrainingArgs
+from .vlm.grpo import GRPOTrainingArgs, GRPOVisionDataset
 from .vlm.orpo.config import ORPOTrainingArgs

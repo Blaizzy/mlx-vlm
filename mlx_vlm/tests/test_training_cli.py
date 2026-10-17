@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import mlx.core as mx
 import mlx.nn as nn
+import mlx.optimizers as optim
 import numpy as np
 import pytest
 
@@ -47,6 +48,29 @@ def test_config_cli_precedence_and_algorithm_selection(tmp_path):
     assert settings.beta == 0.4
 
 
+@pytest.mark.parametrize("algorithm", ["sft", "dpo", "orpo", "grpo"])
+def test_optimizer_cli_settings_are_separate_from_training_arguments(
+    algorithm, tmp_path
+):
+    config = tmp_path / "optimizer.json"
+    config.write_text(
+        json.dumps(
+            {
+                "model": "unused",
+                "algorithm": algorithm,
+                "optimizer": "sgd",
+                "learning_rate": 0.02,
+                "weight_decay": 0.03,
+            }
+        )
+    )
+    args, settings = parse_args(["-c", str(config), "--learning-rate", "0.01"])
+    assert args.optimizer == "sgd"
+    assert args.learning_rate == 0.01 and args.weight_decay == 0.03
+    for name in ("optimizer", "learning_rate", "weight_decay"):
+        assert not hasattr(settings, name)
+
+
 @pytest.mark.parametrize(
     "flags",
     [
@@ -56,6 +80,9 @@ def test_config_cli_precedence_and_algorithm_selection(tmp_path):
         ["--dataset-config", "[]"],
         ["--reference-model", "unused"],
         ["--batch-size", "0"],
+        ["--optimizer", "invalid"],
+        ["--learning-rate", "0"],
+        ["--weight-decay", "-1"],
     ],
 )
 def test_invalid_cli_options_fail_before_loading(flags):
@@ -155,6 +182,7 @@ def test_cli_raw_rows_prepare_quantize_train_evaluate_and_save(tmp_path):
         return {"input_ids": np.array([ids])}
 
     def build_trainer(prepared, *positional, **kwargs):
+        assert isinstance(kwargs["optimizer"], optim.AdamW)
         assert isinstance(prepared.projection, DoRALinear)
         assert isinstance(prepared.projection.linear, nn.QuantizedLinear)
         return Trainer(prepared, *positional, **kwargs)

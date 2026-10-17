@@ -540,7 +540,7 @@ def train(
             learning_rate = (
                 optimizer.learning_rate.item()
                 if hasattr(optimizer.learning_rate, "item")
-                else args.learning_rate
+                else optimizer.learning_rate
             )
             trained_tokens += n_tokens_total
             info = {

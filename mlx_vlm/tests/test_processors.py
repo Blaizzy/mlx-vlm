@@ -830,6 +830,18 @@ class TestGemma4UnifiedProcessor:
             [x, y] for y in range(2) for x in range(2)
         ]
 
+    @pytest.mark.parametrize("height", [1, 3], ids=["1px-tall", "3px-tall"])
+    def test_short_pil_images_stay_channels_last(self, height):
+        pixels = np.arange(height * 4 * 3, dtype=np.uint8).reshape(height, 4, 3)
+        p = m.g4.Gemma4ImageProcessor(do_resize=False, do_rescale=False)
+        data, _ = p(Image.fromarray(pixels))
+        equal(data["pixel_values"][0], pixels.transpose(2, 0, 1))
+
+        p = _gemma_image()
+        p.do_resize = True
+        data, _ = p(Image.new("RGB", (900, height)))
+        assert data["image_position_ids"][0].max(axis=0).tolist() == [3, 0]
+
     def test_video_padding_and_positions(self):
         video = np.zeros((2, 3, 4, 8), np.uint8)
         p = _gemma_image(m.g4.Gemma4VideoProcessor, max_soft_tokens=70)
@@ -3193,6 +3205,99 @@ def test_embedding_gemma2_image_options(embedding_gemma2_processor, floating):
     assert np.isfinite(
         processor([image], do_rescale=not floating)["pixel_values"]
     ).all()
+
+
+@pytest.mark.parametrize("height", [1, 3], ids=["1px-tall", "3px-tall"])
+def test_embedding_gemma2_short_pil_images_stay_channels_last(height):
+    # A 3-pixel-tall RGB PIL image becomes (3, W, 3) after conversion, which
+    # shape-based channel inference reads as channels-first; a 1-pixel-tall
+    # one becomes (1, W, 3) and loses two of its three channels. PIL pixels
+    # are always HWC, so the layout must not be guessed for PIL inputs.
+    from mlx_vlm.models.embedding_gemma2.image_processing_embedding_gemma2 import (
+        EmbeddingGemma2ImageProcessor,
+    )
+
+    processor = EmbeddingGemma2ImageProcessor(
+        patch_size=16, pooling_kernel_size=4, max_soft_tokens=280
+    )
+    output = processor.preprocess(
+        [Image.new("RGB", (900, height))], return_tensors="np"
+    )
+
+    # Every patch keeps all 3 channels: 16 * 16 * 3, not 16 * 16 * 1.
+    assert output["pixel_values"].shape[-1] == 768
+    # A landscape image spans the x axis, not y (position ids are [x, y]).
+    equal(output["image_position_ids"][0].max(axis=0).tolist(), [1119, 3])
+
+    portrait = processor.preprocess(
+        [Image.new("RGB", (height, 900))], return_tensors="np"
+    )
+    equal(portrait["image_position_ids"][0].max(axis=0).tolist(), [3, 1119])
+
+
+def test_embedding_gemma2_pil_frames_stay_channels_last():
+    # The video processor stacks PIL frames into (T, H, W, C) before
+    # inferring the layout, so a 3-frame batch of short frames is mistaken
+    # for channels-first and reaches the vision tower transposed.
+    from transformers.image_utils import ChannelDimension
+
+    from mlx_vlm.models.embedding_gemma2.image_processing_embedding_gemma2 import (
+        EmbeddingGemma2ImageProcessor,
+    )
+    from mlx_vlm.models.embedding_gemma2.video_processing_embedding_gemma2 import (
+        EmbeddingGemma2VideoProcessor,
+    )
+
+    image_processor = EmbeddingGemma2ImageProcessor(
+        patch_size=16, pooling_kernel_size=4, max_soft_tokens=280
+    )
+    video_processor = EmbeddingGemma2VideoProcessor(
+        patch_size=16, pooling_kernel_size=4, max_soft_tokens=280
+    )
+
+    height = 3
+    content = np.zeros((height, 900, 3), np.uint8)
+    content[:, :450, 0] = 255
+    content[height // 2 :, :, 1] = 255
+    frames = [Image.fromarray(content) for _ in range(3)]
+
+    video = video_processor.preprocess(
+        [frames], return_tensors="np", do_sample_frames=False
+    )
+    reference = image_processor.preprocess(
+        frames,
+        return_tensors="np",
+        input_data_format=ChannelDimension.LAST,
+    )
+    equal(video["pixel_values_videos"], reference["pixel_values"])
+    equal(video["video_position_ids"], reference["image_position_ids"])
+
+    # Unambiguous numpy frame stacks (height not in (1, 3, 4)) infer HWC and
+    # match the PIL result.
+    tall = [Image.fromarray(np.zeros((40, 900, 3), np.uint8)) for _ in range(3)]
+    raw_video = video_processor.preprocess(
+        [np.stack([np.asarray(frame) for frame in tall])],
+        return_tensors="np",
+        do_sample_frames=False,
+    )
+    pil_video = video_processor.preprocess(
+        [tall], return_tensors="np", do_sample_frames=False
+    )
+    equal(raw_video["pixel_values_videos"], pil_video["pixel_values_videos"])
+
+    # An ambiguous *array* stack is still resolved by shape inference: raw
+    # arrays carry no layout guarantee, so their behaviour is unchanged.
+    ambiguous = np.zeros((3, 3, 900, 3), np.uint8)
+    forced_first = video_processor.preprocess(
+        [ambiguous],
+        return_tensors="np",
+        do_sample_frames=False,
+        input_data_format=ChannelDimension.FIRST,
+    )
+    inferred = video_processor.preprocess(
+        [ambiguous], return_tensors="np", do_sample_frames=False
+    )
+    equal(inferred["pixel_values_videos"], forced_first["pixel_values_videos"])
 
 
 def test_embedding_gemma2_chat_audio_from_video(

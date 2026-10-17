@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
+import mlx.optimizers as optim
 from mlx.utils import tree_flatten
 
 from mlx_vlm.trainer import (
@@ -92,10 +93,10 @@ class ModelPreparationTest(unittest.TestCase):
                     model,
                     CoreTrainingArgs(
                         iters=1,
-                        learning_rate=0.01,
                         compile=False,
                         adapter_file=str(Path(folder) / "weights.safetensors"),
                     ),
+                    optimizer=optim.AdamW(learning_rate=0.01, weight_decay=0.0),
                     task=task,
                     train_dataset=[mx.array([[1, 2, 3]])],
                 )
