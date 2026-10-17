@@ -197,7 +197,7 @@ Speed up generation by drafting several candidate tokens with a small "drafter" 
 | `--draft-kind` | Drafter family — `dflash` (default), `eagle3`, or `mtp` (native/assistant MTP) |
 | `--draft-block-size` | Override the drafter's configured block size |
 
-See [docs/usage.md](docs/usage.md) for Python API examples including batch generation.
+See [docs/usage.md](docs/usage.md) for Python API examples, including a [standalone batch generation recipe](docs/usage.md#batch-generation).
 
 #### DFlash, DFlash2, and DSpark
 

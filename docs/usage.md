@@ -35,6 +35,50 @@ output = generate(model, processor, formatted_prompt, image, verbose=False)
 print(output)
 ```
 
+## Batch generation
+
+Use `batch_generate` for a standalone Python batch. Pass one image for each
+prompt, in the same order. It returns a `BatchResponse`: `texts` contains the
+responses in input order, and `stats` contains aggregate token counts, timing
+and memory statistics.
+
+Pass **raw prompts** to this API. It applies the processor's chat template
+internally, so do not call `apply_chat_template` first as in the single-request
+example above.
+
+Run this example from the repository root to use the sample images, or replace
+the paths with your own local images. It uses a small, pinned checkpoint and
+resizes the images to keep the example bounded:
+
+```python
+from PIL import Image
+
+from mlx_vlm import load
+from mlx_vlm.generate import batch_generate
+
+model, processor = load(
+    "mlx-community/SmolVLM-256M-Instruct-4bit",
+    revision="69cb5195f414ceb6398c5581254673d2c6c8d0d8",
+)
+image_paths = ["examples/images/cats.jpg", "examples/images/desktop_setup.png"]
+images = [Image.open(path).convert("RGB").resize((256, 256)) for path in image_paths]
+prompts = [
+    "Name the animal shown in this image. Answer in two words.",
+    "Name the main electronic device in this image. Answer in two words.",
+]
+
+response = batch_generate(
+    model, processor, images=images, prompts=prompts, max_tokens=8
+)
+for prompt, text in zip(prompts, response.texts):
+    print(f"{prompt}: {text}")
+print(response.stats)
+```
+
+Increase `max_tokens` for longer answers. This batches the inputs to one function
+call; the server's [continuous batching](https://github.com/Blaizzy/mlx-vlm#continuous-batching)
+handles requests arriving over time.
+
 ## Streaming tool calls
 
 With `stream: true`, Chat Completions sends argument fragments in
