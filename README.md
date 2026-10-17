@@ -514,50 +514,43 @@ print(output)
 
 ### Decision models
 
-Run shared typed decision prediction from the CLI:
+`predict()`, `decide`, and `/v1/decisions` use the OpenAI Decisions schema:
+`input`, an ordered `questions` array, and an ordered `answers` array. Questions
+use `predicate`, `choice`, or `score`; no format selector is needed.
 
 ```sh
 python -m mlx_vlm decide --model nativ-community/decider-2b \
-  --state "Please refund my duplicate charge" \
-  --questions '{"department":{"type":"choice","instructions":"Which team should handle this ticket?","criteria":["billing","technical","sales"]}}'
+  --input "Please refund my duplicate charge" \
+  --questions '[{"name":"department","type":"choice","instructions":"Which team should handle this ticket?","choices":[{"value":"billing"},{"value":"technical"},{"value":"sales"}]}]'
 ```
 
-Use `--state-file request.txt` for UTF-8 text and `--questions-file questions.json`
-for named questions. `mlx_vlm.decide` runs the same command.
-
-Models that read images take a repeatable `--image`, and models that read
-speech take one `--audio` (each a path or URL). The state is optional when
-media are given:
+Use `--input-file request.txt` for UTF-8 text, `--questions-file questions.json`
+for questions, or `--request request.json` for the complete request. The old
+`--state`/`--state-file` flags remain aliases for text input; JSON uses `input`.
+Models that read images take repeatable `--image` options; models that read
+speech take `--audio`. Input text is optional when media are supplied.
 
 ```sh
-python -m mlx_vlm decide --model LiquidAI/d1-omni-600M \
-  --image http://images.cocodataset.org/val2017/000000039769.jpg \
-  --questions '{"cats":{"type":"choice","instructions":"How many cats are there?","criteria":["one","two","more"]}}'
 python -m mlx_vlm decide --model LiquidAI/d1-omni-600M \
   --audio https://huggingface.co/datasets/Narsil/asr_dummy/resolve/main/1.flac \
-  --questions '{"speaking":{"type":"bool","instructions":"Is anyone speaking in this clip?"}}'
-```
+  --questions '[{"name":"speaking","type":"predicate","instructions":"Is anyone speaking in this clip?"}]'
 
-Preload a decision model in the existing server:
-
-```sh
 python -m mlx_vlm server --decision-model nativ-community/decider-2b
 curl http://localhost:8080/v1/decisions \
   -H 'Content-Type: application/json' \
-  -d '{"state":"Please refund my duplicate charge","questions":{"department":{"type":"choice","instructions":"Which team should handle this ticket?","criteria":["billing","technical","sales"]}}}'
+  -d '{"input":"Please refund my duplicate charge","questions":[{"name":"refund","type":"predicate","instructions":"Does the customer request a refund?"}]}'
 ```
 
-An explicit `model` in the request selects a checkpoint; otherwise the currently
-loaded decision model is used. Without either, the endpoint returns HTTP 400.
-Requests may add `"images"`, a list of URLs, paths, or data URIs, or `"audio"`,
-one URL, path, or base64 data URI; `state` may then be `null`. Decision requests
-are non-streaming and use the server's API-key authentication.
+An explicit `model` selects a checkpoint; otherwise the preloaded decision
+model is used. Requests are non-streaming and use the server's API-key
+authentication. Standard image parts are supported in `input`; top-level
+`images`, `videos`, and `audio` are local extensions for supported models.
 
-Both interfaces return the shared `predict()` result and preserve model-specific
-scoring. Decider, Laya, [d1-3B](mlx_vlm/models/d1/README.md), and
-[d1-omni-600M](mlx_vlm/models/d1_omni/README.md) support `choice`, `bool`, and
-`score`; the two LiquidAI d1 models also read images, and d1-omni reads speech.
-Consult each model's README for criteria and calibration details.
+Clef, Decider, Laya, [d1-3B](mlx_vlm/models/d1/README.md), and
+[d1-omni-600M](mlx_vlm/models/d1_omni/README.md) share this interface. For the
+schema, compatibility limits, JSONL batches, checkpoint comparisons, caching,
+and the retained TypeSafe `/v1/systemone` adapter, see
+[decision serving and evaluation](docs/decisions.md).
 
 ### Server (FastAPI)
 

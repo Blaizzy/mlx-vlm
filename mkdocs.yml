@@ -84,6 +84,7 @@ nav:
     - Home: index.md
     - Installation: installation.md
     - CLI Reference: cli_reference.md
+    - Decision Serving: decisions.md
     - Examples: examples.md
     - Speculative Decoding: speculative-decoding.md
     - Contributing: contributing.md
