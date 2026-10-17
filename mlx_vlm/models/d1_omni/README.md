@@ -11,50 +11,93 @@ loads directly; no remote code is needed.
 from mlx_vlm import load, predict
 
 model, processor = load("LiquidAI/d1-omni-600M")
-result = predict(model, processor, "I was charged twice, please refund one.", {
-    "refund": {"type": "bool", "instructions": "Is the customer asking for a refund?"},
-    "team": {
+result = predict(model, processor, "I was charged twice, please refund one.", [
+    {
+        "name": "refund",
+        "type": "predicate",
+        "instructions": "Is the customer asking for a refund?"
+    },
+    {
+        "name": "team",
         "type": "choice",
         "instructions": "Which team should handle this?",
-        "criteria": {
-            "billing": "Charges, refunds, invoices",
-            "technical": "App or site faults",
-            "fraud": "Suspected unauthorised use",
-        },
+        "choices": [
+            {
+                "value": "billing",
+                "description": "Charges, refunds, invoices"
+            },
+            {
+                "value": "technical",
+                "description": "App or site faults"
+            },
+            {
+                "value": "fraud",
+                "description": "Suspected unauthorised use"
+            }
+        ]
     },
-    "urgency": {
+    {
+        "name": "urgency",
         "type": "score",
         "instructions": "How urgent is this?",
-        "criteria": ["Can wait", "Today", "Blocking the customer now"],
-    },
-})
-print(result["answers"]["team"]["choice"])
+        "levels": [
+            {
+                "label": "Can wait"
+            },
+            {
+                "label": "Today"
+            },
+            {
+                "label": "Blocking the customer now"
+            }
+        ]
+    }
+])
+print(result["answers"][1]["choice"])
 
-photo = predict(model, processor, None, {
-    "cats": {"type": "choice", "instructions": "How many cats are there?",
-             "criteria": ["one", "two", "more"]},
-}, images=["cats.jpg"])
+photo = predict(model, processor, None, [
+    {
+        "name": "cats",
+        "type": "choice",
+        "instructions": "How many cats are there?",
+        "choices": [
+            {
+                "value": "one"
+            },
+            {
+                "value": "two"
+            },
+            {
+                "value": "more"
+            }
+        ]
+    }
+], images=["cats.jpg"])
 
-speech = predict(model, processor, None, {
-    "speaking": {"type": "bool", "instructions": "Is anyone speaking in this clip?"},
-}, audio="https://huggingface.co/datasets/Narsil/asr_dummy/resolve/main/1.flac")
+speech = predict(model, processor, None, [
+    {
+        "name": "speaking",
+        "type": "predicate",
+        "instructions": "Is anyone speaking in this clip?"
+    }
+], audio="https://huggingface.co/datasets/Narsil/asr_dummy/resolve/main/1.flac")
 ```
 
 From the command line, `python -m mlx_vlm decide --model LiquidAI/d1-omni-600M`
-takes `--state` and/or either one or more `--image` options or one `--audio`;
+takes `--input` and/or either one or more `--image` options or one `--audio`;
 the server's `/v1/decisions` takes `"images"` or `"audio"` (a URL, path, or
 base64 data URI) the same way.
 
-d1-omni supports `choice`, `score`, and `bool`; `noul` is an alias for `bool`.
-A `choice` takes `{label: description}` or a list of labels, a `score` an
-ordered list of 2 to 10 levels, and a `bool` optional `{"false": ..., "true":
-...}` descriptions. The shared Python API, CLI, and `/v1/decisions` return
-System One answers: `choice`, `score`, and `noul`. Choice and score answers
-include `probabilities` and top-level System One `confidence`; scores also carry
-the level `legend`. Boolean answers put the probability of true in `noul`.
+The shared Python API, CLI, and `/v1/decisions` use the
+[OpenAI Decisions schema](../../../docs/decisions.md): ordered `predicate`,
+`choice`, and `score` questions and answers. Choice values have optional
+descriptions; score levels have labels and optional descriptions. Boolean
+answers carry `probability`, and choice/score answers contain probability arrays
+and the local confidence statistic.
 
-A state is a string, any JSON value, or `None` when images or audio are the
-whole state. `images` is one image or a list of PIL images, paths, or URLs,
+Public input is text or an ordered conversation, or `None` when media carry the
+whole input. The native model interface retains JSON state and `bool`/`noul`
+questions with criteria. `images` is one image or a list of PIL images, paths, or URLs,
 read in order; files are turned upright by their EXIF orientation, PIL images
 are read as given, and large images are tiled into up to ten 512 px tiles plus
 a thumbnail. `audio` is one clip: 16 kHz mono samples (a NumPy array, list, or

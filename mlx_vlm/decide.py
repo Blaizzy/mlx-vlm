@@ -7,9 +7,14 @@ import sys
 from collections import deque
 from pathlib import Path
 
-from .decision import _validate_question_structure, predict
+from .decision import predict
+from .decision_protocol import (
+    DecisionRequest,
+    cache_namespace,
+    format_response,
+    native_request,
+)
 from .decision_scheduler import DecisionScheduler
-from .systemone import format_response, validate_questions
 from .utils import load
 
 
@@ -71,8 +76,8 @@ def _requests(args, parser):
             any(
                 value is not None
                 for value in (
-                    args.state,
-                    args.state_file,
+                    args.input,
+                    args.input_file,
                     args.questions,
                     args.questions_file,
                 )
@@ -81,7 +86,7 @@ def _requests(args, parser):
             or args.audio
             or args.video
         ):
-            parser.error("Use --request or inline state/questions/media")
+            parser.error("Use --request or inline input/questions/media")
         stream = (
             sys.stdin if args.request == "-" else open(args.request, encoding="utf-8")
         )
@@ -108,15 +113,15 @@ def _requests(args, parser):
     if args.questions is None and args.questions_file is None:
         parser.error("--questions or --questions-file is required")
     if (
-        args.state is None
-        and args.state_file is None
+        args.input is None
+        and args.input_file is None
         and not (args.images or args.audio or args.video)
     ):
         parser.error(
-            "one of the arguments --state --state-file --image --audio is required (or --video)"
+            "one of the arguments --input --input-file --image --audio is required (or --video)"
         )
     state = (
-        args.state_file.read_text(encoding="utf-8") if args.state_file else args.state
+        args.input_file.read_text(encoding="utf-8") if args.input_file else args.input
     )
     if isinstance(state, str) and state.startswith("@"):
         state = _json_argument(state)
@@ -125,7 +130,7 @@ def _requests(args, parser):
         if args.questions_file
         else args.questions
     )
-    body = {"model": args.model, "state": state, "questions": questions}
+    body = {"model": args.model, "input": state, "questions": questions}
     if args.images:
         body["images"] = args.images
     if args.audio:
@@ -139,21 +144,11 @@ def _validated_body(raw, args):
     if not isinstance(raw, dict):
         raise ValueError("Each request must be a JSON object")
     body = dict(raw)
-    unknown = body.keys() - {"model", "state", "questions", "images", "videos", "audio"}
-    if unknown:
-        raise ValueError(
-            f"Unknown decision request fields: {', '.join(sorted(unknown))}"
-        )
     if args.model:
         body["model"] = args.model
-    _validate_question_structure(body.get("questions"))
-    validate_questions(body["questions"])
-    if not isinstance(body.get("model"), str) or not body["model"]:
+    body = DecisionRequest.model_validate(body).model_dump(exclude_none=True)
+    if not body.get("model"):
         raise ValueError("Specify a model for each request or with --model")
-    if body.get("state") is None and not any(
-        body.get(name) for name in ("images", "audio", "videos")
-    ):
-        raise ValueError("state is required unless media are given")
     return body
 
 
@@ -164,9 +159,12 @@ def main(argv=None):
     )
     state = parser.add_mutually_exclusive_group()
     state.add_argument(
-        "--state", help="Text to evaluate; @JSONFILE reads a structured state"
+        "--input",
+        "--state",
+        dest="input",
+        help="Text to evaluate; @JSONFILE reads an input array",
     )
-    state.add_argument("--state-file", type=Path)
+    state.add_argument("--input-file", "--state-file", dest="input_file", type=Path)
     questions = parser.add_mutually_exclusive_group()
     questions.add_argument("--questions", type=_json_argument)
     questions.add_argument("--questions-file", type=Path)
@@ -221,12 +219,12 @@ def main(argv=None):
                 result = predict(
                     model,
                     processor,
-                    body.get("state"),
+                    body.get("input"),
                     body["questions"],
                     **{
                         k: v
                         for k, v in body.items()
-                        if k not in ("model", "state", "questions")
+                        if k not in ("model", "input", "questions")
                     },
                 )
             print(json.dumps(result, ensure_ascii=False, indent=2), file=output_stream)
@@ -267,7 +265,12 @@ def main(argv=None):
         for body in requests:
             if args.compare_model:
                 inputs.append(body)
-            pending.append((body, queue.submit(body)))
+            pending.append(
+                (
+                    body,
+                    queue.submit(native_request(body), namespace=cache_namespace(body)),
+                )
+            )
             if len(pending) >= args.batch_size * 2:
                 emit(*pending.popleft())
         while pending:
@@ -282,7 +285,10 @@ def main(argv=None):
         queue, reference = scheduler(), []
         try:
             for body in inputs:
-                job = queue.submit({**body, "model": args.compare_model})
+                job = queue.submit(
+                    native_request({**body, "model": args.compare_model}),
+                    namespace=cache_namespace(body),
+                )
                 reference.append(job.future.result()["probabilities"])
             report = comparison_report(
                 reference,

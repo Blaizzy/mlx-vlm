@@ -6417,8 +6417,8 @@ def test_decisions_rejects_unsupported_type(client):
             "/v1/decisions",
             json={
                 "model": "decision",
-                "state": "text",
-                "questions": {"x": {"type": "bool"}},
+                "input": "text",
+                "questions": [{"name": "x", "type": "predicate", "instructions": "Q"}],
             },
         )
     assert response.status_code == 400
@@ -6482,8 +6482,8 @@ def test_decisions_preserves_loader_errors(client, status):
             "/v1/decisions",
             json={
                 "model": "missing",
-                "state": "text",
-                "questions": {"x": {"type": "bool"}},
+                "input": "text",
+                "questions": [{"name": "x", "type": "predicate", "instructions": "Q"}],
             },
         )
     assert response.status_code == status
@@ -6500,7 +6500,7 @@ def test_decisions_default_model(client, monkeypatch, preloaded):
         decision_types=("bool",),
         predict=MagicMock(
             return_value={
-                "answers": {"x": {"type": "bool", "value": True, "probability": 0.8}}
+                "answers": {"0": {"type": "bool", "value": True, "probability": 0.8}}
             }
         ),
     )
@@ -6509,7 +6509,10 @@ def test_decisions_default_model(client, monkeypatch, preloaded):
     ) as load:
         response = client.post(
             "/v1/decisions",
-            json={"state": "text", "questions": {"x": {"type": "bool"}}},
+            json={
+                "input": "text",
+                "questions": [{"name": "x", "type": "predicate", "instructions": "Q"}],
+            },
         )
     if preloaded:
         assert response.status_code == 200
@@ -6527,7 +6530,7 @@ def test_decisions_default_model_from_env(client, monkeypatch):
         decision_types=("bool",),
         predict=MagicMock(
             return_value={
-                "answers": {"x": {"type": "bool", "value": True, "probability": 0.8}}
+                "answers": {"0": {"type": "bool", "value": True, "probability": 0.8}}
             }
         ),
     )
@@ -6536,7 +6539,10 @@ def test_decisions_default_model_from_env(client, monkeypatch):
     ) as load:
         response = client.post(
             "/v1/decisions",
-            json={"state": "text", "questions": {"x": {"type": "bool"}}},
+            json={
+                "input": "text",
+                "questions": [{"name": "x", "type": "predicate", "instructions": "Q"}],
+            },
         )
     assert response.status_code == 200
     assert response.json()["model"] == "env-decision"
@@ -6553,8 +6559,8 @@ def test_decisions_generic_prediction_failure_returns_500(client):
             "/v1/decisions",
             json={
                 "model": "decision",
-                "state": "text",
-                "questions": {"x": {"type": "bool"}},
+                "input": "text",
+                "questions": [{"name": "x", "type": "predicate", "instructions": "Q"}],
             },
         )
     assert response.status_code == 500
@@ -6562,12 +6568,12 @@ def test_decisions_generic_prediction_failure_returns_500(client):
     model.predict.assert_called_once()
 
 
-@pytest.mark.parametrize("state", [{"state": None}, {}, {"state": "text"}])
+@pytest.mark.parametrize("state", [{"input": None}, {}, {"input": "text"}])
 def test_decisions_pass_images_and_allow_null_state(client, state):
     images = ["data:image/png;base64,iVBORw0KGgo=", "https://example.com/cat.jpg"]
-    questions = {"cat": {"type": "bool"}}
+    questions = [{"name": "cat", "type": "predicate", "instructions": "Q"}]
     result = {
-        "answers": {"cat": {"type": "bool", "value": True, "probability": 0.8}},
+        "answers": {"0": {"type": "bool", "value": True, "probability": 0.8}},
         "usage": {},
     }
     model = NS(
@@ -6584,22 +6590,35 @@ def test_decisions_pass_images_and_allow_null_state(client, state):
     assert response.status_code == 200
     assert response.json() == {
         "model": "d1",
-        "answers": {"cat": {"type": "noul", "noul": 0.8}},
-        "usage": {"input_tokens": 0, "output_tokens": 0},
+        "answers": [{"type": "predicate", "name": "cat", "probability": 0.8}],
+        "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 0},
+        },
     }
     model.predict.assert_called_once_with(
-        processor, state.get("state"), questions, images=images
+        processor,
+        state.get("input"),
+        {"0": {"type": "bool", "instructions": "Q"}},
+        images=images,
     )
 
 
 @pytest.mark.parametrize(
-    "body", [{"state": None}, {}, {"state": None, "images": [], "audio": ""}]
+    "body", [{"input": None}, {}, {"input": None, "images": [], "audio": ""}]
 )
 def test_decisions_require_state_without_media(client, body):
     with patch.object(server, "get_cached_model") as load:
         response = client.post(
             "/v1/decisions",
-            json={"model": "d1", "questions": {"x": {"type": "bool"}}, **body},
+            json={
+                "model": "d1",
+                "questions": [{"name": "x", "type": "predicate", "instructions": "Q"}],
+                **body,
+            },
         )
     assert response.status_code == 422
     load.assert_not_called()
@@ -6615,8 +6634,8 @@ def test_decisions_reject_media_for_text_only_models(client, media, kind):
             "/v1/decisions",
             json={
                 "model": "decider",
-                "state": "text",
-                "questions": {"x": {"type": "bool"}},
+                "input": "text",
+                "questions": [{"name": "x", "type": "predicate", "instructions": "Q"}],
                 **media,
             },
         )
@@ -6635,9 +6654,9 @@ def test_decisions_reject_media_for_text_only_models(client, media, kind):
     ],
 )
 def test_decisions_pass_audio_and_allow_null_state(client, audio, expected):
-    questions = {"speech": {"type": "bool"}}
+    questions = [{"name": "speech", "type": "predicate", "instructions": "Q"}]
     result = {
-        "answers": {"speech": {"type": "bool", "value": True, "probability": 0.8}},
+        "answers": {"0": {"type": "bool", "value": True, "probability": 0.8}},
         "usage": {},
     }
     model = NS(
@@ -6648,22 +6667,30 @@ def test_decisions_pass_audio_and_allow_null_state(client, audio, expected):
     with patch.object(server, "get_cached_model", return_value=(model, None, {})):
         response = client.post(
             "/v1/decisions",
-            json={"model": "d1", "state": None, "questions": questions, "audio": audio},
+            json={"model": "d1", "input": None, "questions": questions, "audio": audio},
         )
     assert response.status_code == 200
     assert response.json() == {
         "model": "d1",
-        "answers": {"speech": {"type": "noul", "noul": 0.8}},
-        "usage": {"input_tokens": 0, "output_tokens": 0},
+        "answers": [{"type": "predicate", "name": "speech", "probability": 0.8}],
+        "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 0},
+        },
     }
     args, kwargs = model.predict.call_args
-    assert args == (None, None, questions) and set(kwargs) == {"audio"}
+    assert args == (None, None, {"0": {"type": "bool", "instructions": "Q"}}) and set(
+        kwargs
+    ) == {"audio"}
     sent = kwargs["audio"]
     assert (sent if isinstance(sent, str) else sent.read()) == expected
 
 
 def test_decisions_leave_mixed_media_to_the_model(client):
-    questions = {"x": {"type": "bool"}}
+    questions = [{"name": "x", "type": "predicate", "instructions": "Q"}]
     error = ValueError("a request carries images or audio, not both")
     model = NS(
         decision_types=("bool",),
@@ -6683,7 +6710,11 @@ def test_decisions_leave_mixed_media_to_the_model(client):
     assert response.status_code == 400
     assert response.json()["detail"] == str(error)
     model.predict.assert_called_once_with(
-        None, None, questions, images=["cat.png"], audio="meow.wav"
+        None,
+        None,
+        {"0": {"type": "bool", "instructions": "Q"}},
+        images=["cat.png"],
+        audio="meow.wav",
     )
 
 
@@ -6708,14 +6739,11 @@ def test_systemone_rejects_invalid_questions(client, question):
     load.assert_not_called()
 
 
-@pytest.mark.parametrize(
-    "surface", ["/v1/systemone", "/v1/decisions", "predict", "cli", "dict", "schema"]
-)
+@pytest.mark.parametrize("surface", ["/v1/systemone", "dict", "schema"])
 @pytest.mark.parametrize("raw", [False, True])
 def test_systemone_adapts_shared_predictions_and_confidence(
     client, surface, tmp_path, capsys, raw
 ):
-    from mlx_vlm import decide, predict
     from mlx_vlm.decision import systemone
     from mlx_vlm.systemone import SystemOneRequest
 
@@ -6780,9 +6808,6 @@ def test_systemone_adapts_shared_predictions_and_confidence(
                 }
 
         model.make_decision_engine = lambda *a, **kw: Engine()
-    if surface in ("/v1/decisions", "predict", "cli"):
-        questions["outage"]["type"] = "bool"
-        questions["team"]["criteria"] = list(questions["team"]["criteria"])
     body = {"model": "decision", "state": "A", "questions": questions}
     if surface.startswith("/v1/"):
         with patch.object(server, "get_cached_model", return_value=(model, None, {})):
@@ -6791,14 +6816,6 @@ def test_systemone_adapts_shared_predictions_and_confidence(
         assert response.headers["x-typesafe-request-id"]
         assert response.headers["x-clef-cached-tokens"] == "0"
         result = response.json()
-    elif surface == "predict":
-        result = predict(model, None, body["state"], questions)
-    elif surface == "cli":
-        path = tmp_path / "request.json"
-        path.write_text(json.dumps(body))
-        with patch.object(decide, "load", return_value=(model, None)):
-            decide.main(["--request", str(path)])
-        result = json.loads(capsys.readouterr().out)
     else:
         request = SystemOneRequest.model_validate(body) if surface == "schema" else body
         result = systemone(model, None, request)
@@ -6826,18 +6843,18 @@ def test_decision_multilabel_rejected_before_inference(
 ):
     from mlx_vlm import decide, predict
 
-    questions = {"tags": {"type": "multi_label", "criteria": ["a", "b"]}}
+    questions = [{"name": "tags", "type": "multi_label", "instructions": "Tag"}]
     model = NS(decision_types=("multi_label",), predict=Mock(), config=NS())
-    body = {"model": "decision", "state": "A", "questions": questions}
+    body = {"model": "decision", "input": "A", "questions": questions}
     if surface == "predict":
-        with pytest.raises(ValueError, match="does not support 'multi_label'"):
+        with pytest.raises(ValueError, match="multi_label"):
             predict(model, None, "A", questions)
         model.predict.assert_not_called()
     elif surface == "http":
         with patch.object(server, "get_cached_model", return_value=(model, None, {})):
             response = client.post("/v1/decisions", json=body)
-            assert response.status_code == 400
-            assert "does not support 'multi_label'" in response.json()["detail"]
+            assert response.status_code == 422
+            assert "multi_label" in response.text
             model.predict.assert_not_called()
     else:
         path = tmp_path / "request.json"
@@ -6846,12 +6863,342 @@ def test_decision_multilabel_rejected_before_inference(
             with pytest.raises(SystemExit) as error:
                 decide.main(["--request", str(path)])
             assert error.value.code == 2
-            assert "does not support 'multi_label'" in capsys.readouterr().err
+            assert "multi_label" in capsys.readouterr().err
             model.predict.assert_not_called()
 
 
+@pytest.mark.parametrize("surface", ["predict", "http", "cli"])
+@pytest.mark.parametrize("raw", [False, True])
+def test_decisions_openai_contract(client, tmp_path, capsys, surface, raw):
+    from mlx_vlm import decide, predict
+
+    questions = [
+        {"type": "predicate", "instructions": "Outage?"},
+        {
+            "type": "choice",
+            "name": "result",
+            "instructions": "Pick",
+            "choices": [
+                {"value": True, "description": "Boolean"},
+                {"value": "true", "description": "Text"},
+            ],
+        },
+        {
+            "type": "score",
+            "name": "result",
+            "instructions": "Rate",
+            "levels": [
+                {"label": "Low"},
+                {"label": "Medium"},
+                {"label": "High", "description": "Blocking"},
+            ],
+        },
+        {"type": "predicate", "name": "blocked", "instructions": "Restricted?"},
+    ]
+    response = {
+        "model": "decision",
+        "answers": {
+            "0": {"probability": 0.8},
+            "1": {"probabilities": {"true": 0.75, '"true"': 0.25}},
+            "2": {"probabilities": {"0": 0.1, "1": 0.2, "2": 0.7}},
+            "3": {"type": "refusal"},
+        },
+        "usage": {"input_tokens": 12},
+    }
+    prepared = []
+    model = NS(
+        decision_types=("bool", "choice", "score"),
+        config=NS(),
+        predict=Mock(return_value=response),
+    )
+    if raw:
+
+        class Engine:
+            def __init__(self):
+                self.model = model
+
+            def prepare(self, body, **kwargs):
+                prepared.append(body)
+                return NS(done=False, offset=0)
+
+            def step(self, states):
+                for state in states:
+                    state.done, state.offset = True, 1
+
+            def finish(self, state):
+                return {
+                    "response": response,
+                    "probabilities": {
+                        "0": {"true": 0.8, "false": 0.2},
+                        "1": {"true": 0.75004, '"true"': 0.24996},
+                        "2": {"0": 0.1, "1": 0.2, "2": 0.7},
+                    },
+                    "cached_tokens": 0,
+                }
+
+        model.make_decision_engine = lambda *a, **k: Engine()
+    body = {"model": "decision", "input": "A", "questions": questions}
+    if surface == "http":
+        with patch.object(server, "get_cached_model", return_value=(model, None, {})):
+            result = client.post("/v1/decisions", json=body)
+        assert result.status_code == 200, result.text
+        assert result.headers["x-request-id"]
+        result = result.json()
+    elif surface == "cli":
+        path = tmp_path / "request.json"
+        path.write_text(json.dumps(body))
+        with patch.object(decide, "load", return_value=(model, None)):
+            decide.main(["--request", str(path)])
+        result = json.loads(capsys.readouterr().out)
+    else:
+        result = predict(model, None, body["input"], questions)
+    assert result == {
+        "model": "decision",
+        "answers": [
+            {"type": "predicate", "name": None, "probability": 0.8},
+            {
+                "type": "choice",
+                "name": "result",
+                "choice": True,
+                "confidence": 0.5001 if raw else 0.5,
+                "probabilities": [
+                    {"value": True, "probability": 0.75},
+                    {"value": "true", "probability": 0.25},
+                ],
+            },
+            {
+                "type": "score",
+                "name": "result",
+                "score": 1.6,
+                "confidence": 0.4,
+                "probabilities": [
+                    {"value": 0, "label": "Low", "probability": 0.1},
+                    {"value": 1, "label": "Medium", "probability": 0.2},
+                    {"value": 2, "label": "High", "probability": 0.7},
+                ],
+            },
+            {"type": "refusal", "name": "blocked"},
+        ],
+        "usage": {
+            "input_tokens": 12,
+            "output_tokens": 0,
+            "total_tokens": 12,
+            "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 0},
+        },
+    }
+    native = prepared[0] if raw else {"questions": model.predict.call_args.args[2]}
+    assert native["questions"]["1"]["criteria"] == {"true": "Boolean", '"true"': "Text"}
+    assert native["questions"]["2"]["criteria"] == ["Low", "Medium", "High: Blocking"]
+
+
 @pytest.mark.parametrize(
-    "endpoint,kind", [("/v1/decisions", "bool"), ("/v1/systemone", "noul")]
+    "invalid",
+    [
+        {"questions": {"q": {"type": "bool"}}},
+        {"questions": [{"type": "predicate"}]},
+        {"questions": [{"type": "predicate", "instructions": "Q", "name": None}]},
+        {
+            "questions": [
+                {"type": "choice", "instructions": "Q", "choices": [{"value": "a"}]}
+            ]
+        },
+        {
+            "questions": [
+                {
+                    "type": "choice",
+                    "instructions": "Q",
+                    "choices": [{"value": "a"}, {"value": "a"}],
+                }
+            ]
+        },
+        {
+            "questions": [
+                {
+                    "type": "choice",
+                    "instructions": "Q",
+                    "choices": [{"value": 1}, {"value": 2}],
+                }
+            ]
+        },
+        {
+            "questions": [
+                {"type": "score", "instructions": "Q", "levels": [{"label": "one"}]}
+            ]
+        },
+        {
+            "input": [
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "input_image",
+                            "image_url": "https://example.com/a.png",
+                        }
+                    ],
+                }
+            ]
+        },
+        {
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "missing",
+                    "output": "result",
+                }
+            ]
+        },
+        {
+            "input": [
+                {"role": "user", "content": [{"type": "input_file", "file_id": "abc"}]}
+            ]
+        },
+        {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "A",
+                            "prompt_cache_breakpoint": {"mode": "explicit"},
+                        }
+                    ],
+                }
+            ]
+        },
+        {"prompt_cache_options": {"mode": "explicit"}},
+        {"prompt_cache_options": {"ttl": "30m"}},
+        {"format": "systemone"},
+    ],
+)
+def test_decisions_invalid_schema_before_loading(client, invalid):
+    body = {
+        "model": "decision",
+        "input": "A",
+        "questions": [{"type": "predicate", "instructions": "Q"}],
+        **invalid,
+    }
+    with patch.object(server, "get_cached_model") as load:
+        response = client.post("/v1/decisions", json=body)
+    assert response.status_code == 422
+    load.assert_not_called()
+
+
+def test_decision_python_preserves_media_objects_and_backend_options():
+    from mlx_vlm import predict
+
+    image = Image.new("RGB", (8, 8))
+    audio = np.zeros(8000, dtype=np.float32)
+    model = NS(
+        decision_types=("bool",),
+        decision_media=("images", "audio"),
+        predict=Mock(return_value={"answers": {"0": {"probability": 0.8}}}),
+    )
+    result = predict(
+        model,
+        None,
+        None,
+        [{"type": "predicate", "instructions": "Q"}],
+        images=image,
+        audio=audio,
+        token_budget=32,
+    )
+    assert model.predict.call_args.kwargs["images"] is image
+    assert model.predict.call_args.kwargs["audio"] is audio
+    assert model.predict.call_args.kwargs["token_budget"] == 32
+    assert result["answers"] == [
+        {"type": "predicate", "name": None, "probability": 0.8}
+    ]
+
+
+def test_decisions_preserves_conversation_media_and_cache_namespace(
+    client, monkeypatch
+):
+    from concurrent.futures import Future
+
+    import mlx_vlm.server.decisions as decisions
+
+    image = "https://example.com/cat.png"
+    inputs = [
+        {"role": "developer", "content": "Evaluate the conversation"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "Inspect"},
+                {"type": "input_image", "image_url": image},
+            ],
+        },
+        {
+            "type": "function_call",
+            "call_id": "call1",
+            "name": "inspect",
+            "arguments": "{}",
+        },
+        {"type": "function_call_output", "call_id": "call1", "output": "cat"},
+        {
+            "type": "custom_tool_call",
+            "call_id": "call2",
+            "name": "verify",
+            "input": "cat",
+        },
+        {
+            "type": "custom_tool_call_output",
+            "call_id": "call2",
+            "output": [{"type": "input_image", "image_url": image}],
+        },
+        {
+            "role": "assistant",
+            "phase": "final_answer",
+            "content": [{"type": "output_text", "text": "A cat."}],
+        },
+    ]
+    future = Future()
+    future.set_result(
+        {
+            "response": {
+                "answers": {"0": {"probability": 0.8}},
+                "usage": {"input_tokens": 30},
+            },
+            "cached_tokens": 12,
+            "cache_write_tokens": 8,
+        }
+    )
+    submit = Mock(return_value=NS(future=future))
+    monkeypatch.setattr(decisions, "get_scheduler", lambda deps: NS(submit=submit))
+    with patch.object(
+        server._app_module._protocol_deps, "read_tenant_id", return_value="tenant-a"
+    ):
+        response = client.post(
+            "/v1/decisions",
+            json={
+                "model": "decision",
+                "input": inputs,
+                "questions": [{"type": "predicate", "instructions": "Cat?"}],
+                "prompt_cache_key": "session-1",
+                "prompt_cache_options": {"mode": "implicit"},
+                "safety_identifier": "user-1",
+            },
+        )
+    assert response.status_code == 200, response.text
+    assert submit.call_args.kwargs == {"namespace": ("tenant-a", "session-1")}
+    body = submit.call_args.args[0]
+    assert set(body) == {"model", "state", "questions", "images"}
+    assert body["images"] == [image, image]
+    history = json.loads(body["state"])
+    assert history[0]["role"] == "developer"
+    assert history[1]["content"][1] == {"type": "input_image", "image_index": 0}
+    assert history[3]["call_id"] == "call1" and history[3]["output"] == "cat"
+    assert history[5]["output"][0]["image_index"] == 1
+    assert history[6]["phase"] == "final_answer"
+    assert response.json()["usage"]["input_tokens_details"] == {
+        "cached_tokens": 12,
+        "cache_write_tokens": 8,
+    }
+
+
+@pytest.mark.parametrize(
+    "endpoint,kind", [("/v1/decisions", "predicate"), ("/v1/systemone", "noul")]
 )
 def test_decision_backpressure_is_shared(client, monkeypatch, endpoint, kind):
     import mlx_vlm.server.decisions as decisions
@@ -6859,10 +7206,16 @@ def test_decision_backpressure_is_shared(client, monkeypatch, endpoint, kind):
 
     scheduler = NS(submit=Mock(side_effect=DecisionQueueFull("full")))
     monkeypatch.setattr(decisions, "get_scheduler", lambda deps: scheduler)
-    result = client.post(
-        endpoint,
-        json={"model": "test", "state": "A", "questions": {"q": {"type": kind}}},
+    body = (
+        {
+            "model": "test",
+            "input": "A",
+            "questions": [{"type": kind, "instructions": "Q"}],
+        }
+        if endpoint == "/v1/decisions"
+        else {"model": "test", "state": "A", "questions": {"q": {"type": kind}}}
     )
+    result = client.post(endpoint, json=body)
     assert result.status_code == 429
 
 
@@ -6950,7 +7303,7 @@ def test_decision_scheduler_overload_cancellation_and_shutdown(incremental_decis
         scheduler.submit(body)
 
 
-@pytest.mark.parametrize("wire_format", ["native", "systemone"])
+@pytest.mark.parametrize("wire_format", ["openai", "systemone"])
 def test_decision_disconnect_cancels_shared_job(monkeypatch, wire_format):
     from fastapi import FastAPI, Response
 
@@ -6963,6 +7316,12 @@ def test_decision_disconnect_cancels_shared_job(monkeypatch, wire_format):
         "state": "A",
         "questions": {"q": {"type": "noul" if wire_format == "systemone" else "bool"}},
     }
+    if wire_format == "openai":
+        body = {
+            "model": "test",
+            "input": "A",
+            "questions": [{"type": "predicate", "instructions": "Q"}],
+        }
     job = DecisionJob(body)
     monkeypatch.setattr(
         decisions, "get_scheduler", lambda deps: NS(submit=lambda *a, **k: job)

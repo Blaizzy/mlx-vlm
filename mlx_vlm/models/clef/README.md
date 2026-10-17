@@ -12,14 +12,25 @@ Prepared checkpoints: Clef
 from mlx_vlm import load, predict
 
 model, processor = load("nativ-community/clef-flash-MLX-8bit")
-result = predict(model, processor, "Please refund my duplicate charge", {
-    "department": {
+result = predict(model, processor, "Please refund my duplicate charge", [
+    {
+        "name": "department",
         "type": "choice",
         "instructions": "Which team should handle this ticket?",
-        "criteria": ["billing", "technical", "sales"],
-    },
-})
-print(result["answers"]["department"]["choice"])
+        "choices": [
+            {
+                "value": "billing"
+            },
+            {
+                "value": "technical"
+            },
+            {
+                "value": "sales"
+            }
+        ]
+    }
+])
+print(result["answers"][0]["choice"])
 ```
 
 Standard loading accepts prepared `model_type: "clef"` checkpoints with
@@ -29,15 +40,16 @@ separate `joint_head.safetensors`, and earlier MLX conversions using
 does not list it. Sanitization accepts the published fused attention weights,
 earlier MLX head layouts, and the current split projection layout.
 
-Clef supports `choice`, `score`, and `bool`; `noul` is a Boolean alias. All
+The public API supports `choice`, `score`, and `predicate`. All
 questions are scored jointly in one forward pass, and no answer tokens are
 generated. Choice and score answers include `probabilities`, Boolean answers
 the probability of true. `images` and `videos` may be passed to `predict`.
 
 See [shared decision serving](../../../docs/decisions.md) for scheduling,
 state-prefix caching, cancellation, JSONL evaluation, and the TypeSafe adapter.
-The shared `predict()`, CLI, and `/v1/decisions` return System One answers:
-`choice`, `score`, or `noul`, with top-level confidence and score legend.
+The shared `predict()`, CLI, and `/v1/decisions` use the OpenAI Decisions schema:
+ordered answers, typed choice values, predicate probabilities, and score levels.
+`/v1/systemone` retains the TypeSafe schema; both use the same local confidence statistics.
 
 ## Quantization
 

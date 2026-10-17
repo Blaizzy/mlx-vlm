@@ -2245,11 +2245,15 @@ def test_decision_prefill_and_prefix_contract(incremental_decision, cache_bytes,
     _assert_decision_answers(
         engine.finish(states[0])["response"]["answers"], expected["answers"]
     )
+    assert states[0].cache_write_tokens == (
+        states[0].record.prefix_length if cache_bytes else 0
+    )
     assert bool(engine.prefix_cache.entries) == bool(cache_bytes)
     cached = engine.prepare(body)
     assert cached.cached_tokens == (cached.record.prefix_length if cache_bytes else 0)
     while not cached.done:
         engine.step([cached])
+    assert cached.cache_write_tokens == 0
     _assert_decision_answers(
         engine.finish(cached)["response"]["answers"], expected["answers"]
     )
@@ -2317,14 +2321,16 @@ def test_decision_overflow_and_context_configuration(incremental_decision):
     from mlx_vlm import predict
     from mlx_vlm.decision import context_limit
     from mlx_vlm.decision_scheduler import make_decision_engine
+    from mlx_vlm.tests.test_extraction_models import _public_decision_request
 
     _, (model, processor, body) = incremental_decision
+    questions = _public_decision_request(body)["questions"]
     limit = context_limit(model.config)
     engine = make_decision_engine(model, processor)
     too_long = {**body, "state": " A" * limit}
     for call in (
         lambda: engine.prepare(too_long),
-        lambda: predict(model, processor, too_long["state"], body["questions"]),
+        lambda: predict(model, processor, too_long["state"], questions),
     ):
         with pytest.raises(ValueError, match="maximum"):
             call()
@@ -2332,7 +2338,7 @@ def test_decision_overflow_and_context_configuration(incremental_decision):
         with pytest.raises(ValueError):
             make_decision_engine(model, processor, max_length=value)
     with pytest.raises(ValueError, match="State exceeds"):
-        predict(model, processor, "A B", body["questions"], max_state_tokens=1)
+        predict(model, processor, "A B", questions, max_state_tokens=1)
 
 
 def test_decision_mixed_media_cache_contract(incremental_decision):

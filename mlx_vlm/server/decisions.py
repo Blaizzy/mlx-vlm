@@ -4,20 +4,17 @@ import asyncio
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional, Union
+from typing import Optional
 from uuid import uuid4
 
 from fastapi import HTTPException, Request, Response
-from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .. import decision_protocol
+from .. import systemone as systemone_protocol
 from ..decision import DecisionCancelled
+from ..decision_protocol import DecisionRequest, DecisionResponse, cache_namespace
 from ..decision_scheduler import DecisionQueueFull, DecisionScheduler
-from ..systemone import (
-    SystemOneRequest,
-    SystemOneResponse,
-    format_response,
-    native_request,
-)
+from ..systemone import SystemOneRequest, SystemOneResponse
 from .generation import get_configured_context_limit
 from .openai import _decode_input_audio_data
 from .runtime import runtime
@@ -33,24 +30,6 @@ def _default_decision_model() -> Optional[str]:
     if hasattr(registry, "for_kind"):
         return registry.for_kind("decision").get("model_path")
     return None
-
-
-class DecisionRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    model: Optional[str] = Field(default=None, min_length=1)
-    state: Union[str, Dict[str, Any], list, None] = None
-    questions: Dict[str, Dict[str, Any]] = Field(min_length=1)
-    images: Optional[List[str]] = None
-    videos: Optional[List[List[str]]] = None
-    audio: Optional[str] = None
-
-    @model_validator(mode="after")
-    def _state_or_media(self):
-        if self.state is None and not (self.images or self.videos or self.audio):
-            raise ValueError(
-                "state is required unless images, videos, or audio are given"
-            )
-        return self
 
 
 def get_scheduler(deps):
@@ -85,12 +64,13 @@ async def _execute(body, request, response, deps, *, systemone=False):
     runtime.metrics.begin_request(endpoint=endpoint, model=model_id, stream=False)
     job = future = None
     try:
-        native = native_request(body) if systemone else dict(body)
+        protocol = systemone_protocol if systemone else decision_protocol
+        native = protocol.native_request(body)
         if native.get("audio"):
             native["audio"] = _decode_input_audio_data({"data": native["audio"]})
         job = get_scheduler(deps).submit(
             native,
-            namespace=deps.read_tenant_id(request),
+            namespace=cache_namespace(body, deps.read_tenant_id(request)),
         )
         future = asyncio.wrap_future(job.future)
         while not future.done():
@@ -99,7 +79,7 @@ async def _execute(body, request, response, deps, *, systemone=False):
                 job.cancel()
                 raise HTTPException(status_code=499, detail="Client disconnected")
         output = await future
-        result = format_response(body, output)
+        result = protocol.format_response(body, output)
     except asyncio.CancelledError:
         if job is not None:
             job.cancel()
@@ -146,13 +126,15 @@ async def _execute(body, request, response, deps, *, systemone=False):
         )
     )
     result["model"] = model_id
-    response.headers["x-typesafe-request-id"] = uuid4().hex
-    response.headers["x-clef-cached-tokens"] = str(output["cached_tokens"])
+    response.headers["x-typesafe-request-id" if systemone else "x-request-id"] = (
+        uuid4().hex
+    )
+    response.headers["x-clef-cached-tokens"] = str(output.get("cached_tokens", 0))
     return result
 
 
 def register_routes(app, deps):
-    @app.post("/v1/decisions")
+    @app.post("/v1/decisions", response_model=DecisionResponse)
     async def create_decisions(
         body: DecisionRequest, request: Request, response: Response
     ):

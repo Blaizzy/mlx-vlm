@@ -6,29 +6,68 @@ Published checkpoint: [LiquidAI/d1-3B](https://huggingface.co/LiquidAI/d1-3B).
 from mlx_vlm import load, predict
 
 model, processor = load("LiquidAI/d1-3B")
-result = predict(model, processor, "I was charged twice, please refund one.", {
-    "refund": {"type": "bool", "instructions": "Is the customer asking for a refund?"},
-    "team": {
+result = predict(model, processor, "I was charged twice, please refund one.", [
+    {
+        "name": "refund",
+        "type": "predicate",
+        "instructions": "Is the customer asking for a refund?"
+    },
+    {
+        "name": "team",
         "type": "choice",
         "instructions": "Which team should handle this?",
-        "criteria": {"billing": "Charges, refunds", "technical": "App faults"},
+        "choices": [
+            {
+                "value": "billing",
+                "description": "Charges, refunds"
+            },
+            {
+                "value": "technical",
+                "description": "App faults"
+            }
+        ]
     },
-    "urgency": {
+    {
+        "name": "urgency",
         "type": "score",
         "instructions": "How urgent is this?",
-        "criteria": ["Can wait", "Today", "Blocking the customer now"],
-    },
-})
-print(result["answers"]["team"]["choice"])
+        "levels": [
+            {
+                "label": "Can wait"
+            },
+            {
+                "label": "Today"
+            },
+            {
+                "label": "Blocking the customer now"
+            }
+        ]
+    }
+])
+print(result["answers"][1]["choice"])
 
-photo = predict(model, processor, None, {
-    "cats": {"type": "choice", "instructions": "How many cats are there?",
-             "criteria": ["one", "two", "more"]},
-}, images=["http://images.cocodataset.org/val2017/000000039769.jpg"])
+photo = predict(model, processor, None, [
+    {
+        "name": "cats",
+        "type": "choice",
+        "instructions": "How many cats are there?",
+        "choices": [
+            {
+                "value": "one"
+            },
+            {
+                "value": "two"
+            },
+            {
+                "value": "more"
+            }
+        ]
+    }
+], images=["http://images.cocodataset.org/val2017/000000039769.jpg"])
 ```
 
 From the command line, `python -m mlx_vlm decide --model LiquidAI/d1-3B` takes
-`--state` and/or one or more `--image` options; the server's `/v1/decisions`
+`--input` and/or one or more `--image` options; the server's `/v1/decisions`
 takes `"images"` the same way.
 
 The checkpoint is an LFM2.5-VL-3B finetune. Its `config.json` keeps
@@ -39,19 +78,19 @@ LFM2-VL.
 
 A decision is one forward pass that stops at the answer slot; no tokens are
 generated. The prompt and readout follow the published System One defaults.
-The state (a string, any JSON value, or `None` when images are the whole state)
+The native state (text, JSON, or `None` when images carry the whole input)
 and each question are rendered into the chat template. Each option scores the
 best log-probability among its answer tokens (`yes`/`no` forms, level digits,
 or single-token option codes), and the scores are softmaxed over the options
 without calibration.
 
-d1 supports `choice`, `score`, and `bool`; `noul` is a Boolean alias. Choice
-criteria map labels to descriptions or list labels; score criteria are an
-ordered list of 2 to 10 levels; Boolean criteria optionally describe `true` and
-`false`. Choice returns a label, score its expected level, and Boolean the
-probability of `true`. The shared Python API, CLI, and `/v1/decisions` return
-System One answers with `choice`, `score`, or `noul` fields and top-level
-System One `confidence` and score `legend`.
+The shared Python API, CLI, and `/v1/decisions` use the
+[OpenAI Decisions schema](../../../docs/decisions.md). Supply an ordered array
+of `predicate`, `choice`, or `score` questions. Choice values have optional
+descriptions; scores take 2–10 labeled levels. Answers are ordered, Boolean
+answers carry `probability`, and choice/score answers include probability arrays
+and the local confidence statistic. The native `model.predict()` and System One
+adapter retain named questions, `criteria`, and `bool`/`noul`.
 
 `images` is one image or a list of PIL images, paths, or URLs; files are
 turned upright by their EXIF orientation, PIL images are read as given. Each is

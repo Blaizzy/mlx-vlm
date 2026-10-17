@@ -13,24 +13,50 @@ def _validate_question_structure(questions):
         raise ValueError("Questions must map names to question dictionaries")
 
 
-def predict(model, processor, state, questions, **kwargs):
-    """Predict named decisions with System One answers.
+def predict(model, processor, input, questions, **kwargs):
+    """Return OpenAI Decisions answers in question order.
 
-    Questions contain a type, instructions, and criteria. Types are ``choice``,
-    ``score``, and ``bool`` (or ``noul``); support is model-specific. Answers use
-    ``choice``, ``score``, and ``noul`` fields and System One confidence formulas.
-    Model calibration is applied before the response is formatted.
-    ``state`` may be ``None`` when supported media carry the whole state.
+    ``input`` is text or an ordered conversation. Questions use ``predicate``,
+    ``choice`` with typed choices, or ``score`` with ordered levels. Supported
+    Python image/audio/video objects may be supplied through keyword arguments.
+    Model calibration is applied before formatting; confidence uses the local
+    decision statistics, not an OpenAI calibration guarantee.
     """
-    from .systemone import format_response
+    from .decision_protocol import DecisionRequest, format_response, native_request
 
     if "format" in kwargs:
-        raise TypeError(
-            "predict() does not accept 'format'; decisions return System One answers"
-        )
-    normalized, kwargs = normalize_questions(model, questions, **kwargs)
-    body = {"state": state, "questions": normalized, **kwargs}
-    return format_response(body, _predict_output(model, processor, body))
+        raise TypeError("predict() does not accept 'format'; decisions use one schema")
+    metadata = {
+        key: kwargs[key]
+        for key in ("prompt_cache_key", "prompt_cache_options", "safety_identifier")
+        if key in kwargs
+    }
+    validation = {"input": input, "questions": questions, **metadata}
+    request = DecisionRequest.model_validate(
+        validation,
+        context={"has_media": any(kwargs.get(key) is not None for key in _MEDIA)},
+    ).model_dump(exclude_none=True)
+    request.update(kwargs)
+    body = native_request(request)
+    body.update(
+        {
+            key: value
+            for key, value in kwargs.items()
+            if key
+            not in (
+                *_MEDIA,
+                "prompt_cache_key",
+                "prompt_cache_options",
+                "safety_identifier",
+            )
+        }
+    )
+    options = {
+        key: value for key, value in body.items() if key not in ("state", "questions")
+    }
+    normalized, options = normalize_questions(model, body["questions"], **options)
+    body = {"state": body["state"], "questions": normalized, **options}
+    return format_response(request, _predict_output(model, processor, body))
 
 
 def normalize_questions(model, questions, **kwargs):

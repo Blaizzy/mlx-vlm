@@ -56,7 +56,7 @@ class PrefixCache:
     def put(self, key, caches, hidden):
         size = hidden.nbytes + sum(v.nbytes for c in caches for v in c.state)
         if size > self.max_bytes or not self.max_bytes:
-            return
+            return False
         if key in self.entries:
             self.nbytes -= self.entries.pop(key)[2]
         while self.entries and self.nbytes + size > self.max_bytes:
@@ -68,6 +68,7 @@ class PrefixCache:
         mx.eval(hidden)
         self.entries[key] = saved, hidden, size
         self.nbytes += size
+        return True
 
     def clear(self):
         self.entries.clear()
@@ -101,6 +102,7 @@ class DecisionState:
     key: object
     cancelled: Event
     cached_tokens: int = 0
+    cache_write_tokens: int = 0
 
     @property
     def done(self):
@@ -261,9 +263,10 @@ class DecisionEngine:
                 and not state.cancelled.is_set()
                 and self.prefix_cache.max_bytes
             ):
-                self.prefix_cache.put(
+                if self.prefix_cache.put(
                     state.key, state.cache, mx.concatenate(state.hidden, axis=1)
-                )
+                ):
+                    state.cache_write_tokens = state.record.prefix_length
 
     def finish(self, state):
         check_cancelled(state.cancelled)
@@ -284,6 +287,7 @@ class DecisionEngine:
         checkpoint(logits)
         output = format_result(state.record, state.request["questions"], logits)
         output["cached_tokens"] = state.cached_tokens
+        output["cache_write_tokens"] = state.cache_write_tokens
         return output
 
     def decide(self, record, **kwargs):

@@ -6,14 +6,25 @@ Prepared checkpoint: [nativ-community/decider-2b](https://huggingface.co/nativ-c
 from mlx_vlm import load, predict
 
 model, processor = load("nativ-community/decider-2b")
-result = predict(model, processor, "Please refund my duplicate charge", {
-    "department": {
+result = predict(model, processor, "Please refund my duplicate charge", [
+    {
+        "name": "department",
         "type": "choice",
         "instructions": "Which team should handle this ticket?",
-        "criteria": ["billing", "technical", "sales"],
-    },
-})
-print(result["answers"]["department"]["choice"])
+        "choices": [
+            {
+                "value": "billing"
+            },
+            {
+                "value": "technical"
+            },
+            {
+                "value": "sales"
+            }
+        ]
+    }
+])
+print(result["answers"][0]["choice"])
 ```
 
 Use a checkpoint with `model_type: "decider2"` in its root `config.json`,
@@ -25,16 +36,16 @@ Mapika checkpoint or an older conversion labeled `qwen3_5_text`.
 Weights use the existing Qwen3.5 text backbone and sanitization. No special
 loader or runtime sidecar detection is required.
 
-The shared `predict(model, processor, state, questions)` API, CLI, and
-`/v1/decisions` return System One answers. Decider supports `choice`, `score`,
-and `bool`; `noul` is a Boolean alias. Answers put the selected label in `choice`,
-the expected level index in `score`, and the probability of true in `noul`.
-Choice and score answers include `probabilities` and shared System One confidence.
-Unsupported question types fail before inference. No answer tokens are generated.
+The shared `predict(model, processor, input, questions)` API, CLI, and
+`/v1/decisions` use the [OpenAI Decisions schema](../../../docs/decisions.md).
+Questions are an ordered array of `choice`, `score`, or `predicate` objects.
+Answers contain the selected typed `choice`, the expected level index in `score`,
+or the probability of true in `probability`. Choice and score answers include
+probability arrays and the local confidence statistic. No answer tokens are generated.
 
-Choice criteria are 2–255 labels or a mapping of labels to descriptions. Score
-criteria are an ordered list of 2–10 level descriptions. Boolean criteria are
-optional descriptions keyed by `false` and `true`.
+Choices contain 2–255 values with optional descriptions. Scores contain 2–10
+ordered levels with labels and optional descriptions. The native model interface
+continues to use named questions with `criteria` and `bool`/`noul` types.
 
 `independent=True` evaluates questions separately. Score levels are isolated
 according to the checkpoint settings unless overridden with `isolated`.
