@@ -35,6 +35,15 @@ output = generate(model, processor, formatted_prompt, image, verbose=False)
 print(output)
 ```
 
+The CLI, `generate()`, and `stream_generate()` use the checkpoint's
+`generation_config.json` defaults for `temperature`, `top_p`, and `top_k` when
+you omit them (or pass `None` in Python). Missing or null checkpoint values fall
+back to `0.0`, `1.0`, and `0`, respectively. A checkpoint with `do_sample: false`
+defaults to greedy decoding. Explicit sampling options take precedence, so
+`--temperature 0` (or `temperature=0` in Python) always selects greedy decoding,
+while an explicit positive temperature enables sampling. A custom Python
+`sampler` continues to take precedence over these options.
+
 ## Streaming tool calls
 
 With `stream: true`, Chat Completions sends argument fragments in

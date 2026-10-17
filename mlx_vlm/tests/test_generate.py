@@ -2120,7 +2120,7 @@ def test_sampler_clamps_positive_temperature(temperature, options):
 @pytest.mark.parametrize("top_p", [0.0, 0.9])
 @pytest.mark.parametrize("temperature", [1e-39, 1e-5])
 def test_generate_step_clamps_temperature(seed, dtype, top_p, temperature):
-    model = MagicMock()
+    model = MagicMock(config=SimpleNamespace())
     model.language_model.return_value = LanguageModelOutput(
         logits=mx.array([[[-4.0, 0.0, 0.003]]], dtype=dtype)
     )
