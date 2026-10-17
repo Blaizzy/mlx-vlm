@@ -99,7 +99,7 @@ class AudioResultChunk:
 
 @dataclass
 class AudioInferenceRequest:
-    kind: Literal["tts", "stt"]
+    kind: Literal["tts", "stt", "stt_realtime"]
     model_name: str
     payload: Any
     request_id: str = ""
@@ -112,20 +112,33 @@ class AudioInferenceRequest:
         if not self.request_id:
             self.request_id = uuid.uuid4().hex
         if self.result_queue is None:
-            self.result_queue = queue.Queue()
+            self.result_queue = queue.Queue(
+                maxsize=64 if self.kind == "stt_realtime" else 0
+            )
         if self.cancel_event is None:
             self.cancel_event = threading.Event()
         if self.ready_event is None:
             self.ready_event = threading.Event()
 
     def emit_data(self, payload: Any) -> None:
-        self.result_queue.put(AudioResultChunk(kind="data", payload=payload))
+        self._emit(AudioResultChunk(kind="data", payload=payload))
 
     def emit_error(self, error: BaseException) -> None:
-        self.result_queue.put(AudioResultChunk(kind="error", error=error))
+        self._emit(AudioResultChunk(kind="error", error=error))
 
     def emit_done(self) -> None:
-        self.result_queue.put(AudioResultChunk(kind="done"))
+        self._emit(AudioResultChunk(kind="done"))
+
+    def _emit(self, chunk: AudioResultChunk) -> None:
+        if self.kind != "stt_realtime":
+            self.result_queue.put(chunk)
+            return
+        while not self.cancel_event.is_set():
+            try:
+                self.result_queue.put(chunk, timeout=0.1)
+                return
+            except queue.Full:
+                pass
 
     def mark_ready(self, error: BaseException | None = None) -> None:
         self.ready_error = error
@@ -152,6 +165,10 @@ class AudioRequestQueue:
     def __init__(self):
         self._requests: "queue.Queue[AudioInferenceRequest | None]" = queue.Queue()
         self._stop = threading.Event()
+        self._admission = threading.Lock()
+        self._outstanding = 0
+        self._realtime_reserved = False
+        self._active_request = None
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -164,7 +181,7 @@ class AudioRequestQueue:
     def submit(
         self,
         *,
-        kind: Literal["tts", "stt"],
+        kind: Literal["tts", "stt", "stt_realtime"],
         model_name: str,
         payload: Any,
     ) -> AudioInferenceHandle:
@@ -173,7 +190,16 @@ class AudioRequestQueue:
             model_name=model_name,
             payload=payload,
         )
-        self._requests.put(request)
+        with self._admission:
+            if self._stop.is_set():
+                raise HTTPException(status_code=503, detail="Audio queue is stopping")
+            if self._realtime_reserved or (
+                kind == "stt_realtime" and self._outstanding
+            ):
+                raise HTTPException(status_code=409, detail="Audio worker is busy")
+            self._outstanding += 1
+            self._realtime_reserved = kind == "stt_realtime"
+            self._requests.put(request)
         return AudioInferenceHandle(
             request_id=request.request_id,
             result_queue=request.result_queue,
@@ -183,9 +209,15 @@ class AudioRequestQueue:
         )
 
     def stop_and_join(self, timeout: float = 5.0) -> None:
-        self._stop.set()
-        self._requests.put(None)
+        with self._admission:
+            if not self._stop.is_set():
+                self._stop.set()
+                if self._active_request is not None:
+                    self._active_request.cancel_event.set()
+                self._requests.put(None)
         self._thread.join(timeout=timeout)
+        if self._thread.is_alive():
+            raise RuntimeError("Audio worker did not stop; models must remain loaded")
 
     def _run(self) -> None:
         try:
@@ -194,19 +226,26 @@ class AudioRequestQueue:
             clear_mlx_streams()
 
     def _run_impl(self) -> None:
-        while not self._stop.is_set():
+        while True:
             request = self._requests.get()
             if request is None:
                 break
-            if request.cancel_event.is_set():
-                request.mark_ready()
-                request.emit_done()
-                continue
+            with self._admission:
+                self._active_request = request
+                if self._stop.is_set():
+                    request.cancel_event.set()
             try:
+                if request.cancel_event.is_set():
+                    request.mark_ready(RuntimeError("Audio request cancelled"))
+                    continue
                 if request.kind == "tts":
                     _run_tts_request(request)
                 elif request.kind == "stt":
                     _run_stt_request(request)
+                elif request.kind == "stt_realtime":
+                    from .audio_realtime import run_request
+
+                    run_request(request, get_cached_model)
                 else:
                     raise ValueError(f"Unsupported audio request kind: {request.kind}")
             except Exception as exc:
@@ -217,6 +256,12 @@ class AudioRequestQueue:
             finally:
                 request.emit_done()
                 mx.clear_cache()
+                with self._admission:
+                    self._outstanding -= 1
+                    self._active_request = None
+                    if request.kind == "stt_realtime":
+                        self._realtime_reserved = False
+                request = None
 
 
 _AUDIO_QUEUE_LOCK = threading.Lock()
@@ -234,6 +279,10 @@ def register_routes(app, deps):
 
     get_cached_model = deps.get_cached_model
     _build_metrics_envelope = deps.build_metrics_envelope
+
+    from .audio_realtime import audio_realtime_endpoint
+
+    app.websocket("/v1/audio/transcriptions/realtime")(audio_realtime_endpoint)
 
     app.post("/audio/speech", response_model=None)(audio_speech_endpoint)
     app.post("/v1/audio/speech", response_model=None, include_in_schema=False)(
