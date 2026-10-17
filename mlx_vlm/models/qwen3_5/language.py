@@ -18,9 +18,13 @@ from ..rope_utils import MRoPERotaryEmbedding
 from ..rope_utils import apply_multimodal_rotary_pos_emb as _apply_mrope
 from .config import ModelConfig, TextConfig
 from .gated_delta import gated_delta_update
-from .speculative_verifier import Qwen3_5ExactSpeculativeVerifier
+from .speculative_verifier import (
+    Qwen3_5BatchInvariantForward,
+    Qwen3_5SpeculativeVerifier,
+)
 
-_EXACT_SPECULATIVE_VERIFIER = Qwen3_5ExactSpeculativeVerifier()
+_SPECULATIVE_VERIFIER = Qwen3_5SpeculativeVerifier()
+_STANDARD_FORWARD = Qwen3_5BatchInvariantForward()
 
 
 class Qwen3_5RotaryEmbedding(MRoPERotaryEmbedding):
@@ -1411,6 +1415,7 @@ class LanguageModel(nn.Module):
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         super().__init__()
         self.args = args
+        self.use_simd_verifier = getattr(args, "use_simd_verifier", False)
         self.config = config
         self.model_type = args.model_type
         self.model = Qwen3_5Model(args)
@@ -1419,6 +1424,15 @@ class LanguageModel(nn.Module):
 
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+
+    # Opt-in because SIMD reductions differ from MLX's native matmul. Keep
+    # this fixed for a request so singleton decoding and verification agree.
+    use_simd_verifier = False
+
+    def _get_speculative_verifier(self):
+        if self.use_simd_verifier and _SPECULATIVE_VERIFIER.supports_model(self):
+            return _SPECULATIVE_VERIFIER
+        return _STANDARD_FORWARD
 
     def chunked_prefill_policy(
         self,
@@ -1791,7 +1805,28 @@ class LanguageModel(nn.Module):
                     )
 
         if speculative_verify:
-            return _EXACT_SPECULATIVE_VERIFIER.verify(
+            return self._get_speculative_verifier().verify(
+                self,
+                inputs,
+                cache=cache,
+                inputs_embeds=inputs_embeds,
+                position_ids=position_ids,
+                capture_layer_ids=capture_layer_ids,
+                return_hidden=return_hidden,
+                return_shared_kv=return_shared_kv,
+                skip_logits=skip_logits,
+            )
+
+        # Embedding-based prefill keeps the regular prefill arithmetic. Token
+        # decode and speculative verification share the same arithmetic.
+        if (
+            inputs_embeds is None
+            and cache is not None
+            and inputs.ndim == 2
+            and inputs.shape[1] == 1
+            and self._get_speculative_verifier().uses_simd
+        ):
+            return self._get_speculative_verifier()(
                 self,
                 inputs,
                 cache=cache,
@@ -1858,14 +1893,16 @@ class LanguageModel(nn.Module):
     def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
         if self.args.tie_word_embeddings:
             return self.model.embed_tokens.as_linear(hidden)
-        out = _EXACT_SPECULATIVE_VERIFIER.quantized_linear(self.lm_head, hidden)
+        out = self._get_speculative_verifier().quantized_linear(self.lm_head, hidden)
         if out is not None:
             return out
         return self.lm_head(hidden)
 
     def speculative_argmax_from_hidden(self, hidden: mx.array) -> Optional[mx.array]:
         if not self.args.tie_word_embeddings:
-            out = _EXACT_SPECULATIVE_VERIFIER.quantized_argmax(self.lm_head, hidden)
+            out = self._get_speculative_verifier().quantized_argmax(
+                self.lm_head, hidden
+            )
             if out is not None:
                 return out
         logits = self.speculative_logits_from_hidden(hidden)
@@ -1881,7 +1918,7 @@ class LanguageModel(nn.Module):
                 for processors in logits_processors
             )
             and not self.args.tie_word_embeddings
-            and _EXACT_SPECULATIVE_VERIFIER.can_quantized_head(self.lm_head)
+            and self._get_speculative_verifier().can_quantized_head(self.lm_head)
             and "bias" not in self.lm_head
         )
 
@@ -1894,7 +1931,7 @@ class LanguageModel(nn.Module):
     ):
         if (
             self.args.tie_word_embeddings
-            or not _EXACT_SPECULATIVE_VERIFIER.can_quantized_head(self.lm_head)
+            or not self._get_speculative_verifier().can_quantized_head(self.lm_head)
             or "bias" in self.lm_head
         ):
             return None
@@ -1912,7 +1949,7 @@ class LanguageModel(nn.Module):
                 ],
                 axis=0,
             )
-            token_mask = _EXACT_SPECULATIVE_VERIFIER.pad_token_mask(
+            token_mask = self._get_speculative_verifier().pad_token_mask(
                 token_mask, self.lm_head.weight.shape[0]
             )
 
@@ -1924,7 +1961,7 @@ class LanguageModel(nn.Module):
             **kwargs,
         )
         hidden = output.hidden_states[-1]
-        sampled = _EXACT_SPECULATIVE_VERIFIER.quantized_argmax(
+        sampled = self._get_speculative_verifier().quantized_argmax(
             self.lm_head, hidden, token_mask=token_mask
         )
         if sampled is not None:
