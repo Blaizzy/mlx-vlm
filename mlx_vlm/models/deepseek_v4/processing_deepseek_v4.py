@@ -1,8 +1,9 @@
 import base64
 import io
+import json
 import math
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 from urllib.request import urlopen
 
 import mlx.core as mx
@@ -11,6 +12,7 @@ from PIL import Image, ImageOps
 from transformers.processing_utils import ProcessorMixin
 
 from ..base import install_auto_processor_patch
+from . import encoding_dsv4
 
 IMAGE_START, IMAGE_PAD, IMAGE, IMAGE_NEW_LINE, IMAGE_END = range(5)
 IMAGE_PLACEHOLDER = "<｜deepseek_image｜>"
@@ -35,6 +37,73 @@ DEFAULT_CHAT_TEMPLATE = (
     "{{- '<｜Assistant｜></think>' -}}"
     "{%- endif -%}"
 )
+
+# Request reasoning efforts mapped onto the levels DeepSeek-V4 defines (low/high/max).
+REASONING_EFFORT_LEVELS = {
+    "minimal": "low",
+    "low": "low",
+    "medium": "high",
+    "high": "high",
+    "xhigh": "max",
+    "max": "max",
+}
+GENERATION_PROMPTS = (
+    encoding_dsv4.ASSISTANT_SP_TOKEN + encoding_dsv4.thinking_start_token,
+    encoding_dsv4.ASSISTANT_SP_TOKEN + encoding_dsv4.thinking_end_token,
+)
+
+
+def _arguments_as_json(tool_call: dict) -> dict:
+    """Return a copy of an OpenAI tool call whose arguments are a JSON string."""
+    function = dict(tool_call.get("function") or {})
+    arguments = function.get("arguments")
+    if not isinstance(arguments, str):
+        function["arguments"] = json.dumps(arguments or {}, ensure_ascii=False)
+    return {**tool_call, "function": function}
+
+
+def encode_deepseek_v4_prompt(
+    messages: List[dict],
+    tools: Optional[List[dict]] = None,
+    enable_thinking: bool = False,
+    reasoning_effort: Optional[str] = None,
+    add_generation_prompt: bool = True,
+) -> str:
+    """Render text-only messages with the official DeepSeek-V4 encoding.
+
+    Tools are attached to the (possibly synthesized) leading system message,
+    which is where the reference encoder renders the ``## Tools`` section.
+    """
+    prepared = []
+    for message in messages:
+        message = dict(message)
+        if message.get("content") is None:
+            message["content"] = ""
+        if message.get("tool_calls"):
+            message["tool_calls"] = [
+                _arguments_as_json(tc) for tc in message["tool_calls"]
+            ]
+        prepared.append(message)
+    if tools:
+        if prepared and prepared[0].get("role") == "system":
+            prepared[0] = {**prepared[0], "tools": tools}
+        else:
+            prepared.insert(0, {"role": "system", "content": "", "tools": tools})
+
+    thinking_mode = "thinking" if enable_thinking else "chat"
+    effort = (
+        REASONING_EFFORT_LEVELS.get(str(reasoning_effort).lower())
+        if reasoning_effort
+        else None
+    )
+    prompt = encoding_dsv4.encode_messages(
+        prepared, thinking_mode=thinking_mode, reasoning_effort=effort
+    )
+    if not add_generation_prompt:
+        for suffix in GENERATION_PROMPTS:
+            if prompt.endswith(suffix):
+                return prompt[: -len(suffix)]
+    return prompt
 
 
 def grid_tokens(
@@ -263,6 +332,9 @@ def load_deepseek_v4_chat_template(model_path, **kwargs) -> Optional[str]:
 class DeepseekV4Processor(ProcessorMixin):
     attributes = ["tokenizer"]
     tokenizer_class = "AutoTokenizer"
+    # Prompts are rendered in code (encoding_dsv4), so there is no chat template
+    # for the tool registry to inspect; declare the DSML parser explicitly.
+    tool_parser_type = "deepseek_v4"
 
     def __init__(
         self,
@@ -316,6 +388,13 @@ class DeepseekV4Processor(ProcessorMixin):
         return "".join(parts)
 
     def apply_chat_template(self, conversation, *args, **kwargs):
+        """Render a conversation.
+
+        With the built-in template, prompts go through the official DeepSeek-V4
+        encoding so that ``tools``, ``enable_thinking`` and ``reasoning_effort``
+        take effect. A checkpoint-provided template or an explicit
+        ``chat_template`` argument keeps the Jinja path.
+        """
         if isinstance(conversation, dict):
             conversation = [conversation]
         normalized = []
@@ -326,7 +405,34 @@ class DeepseekV4Processor(ProcessorMixin):
             message = dict(message)
             message["content"] = self._content_to_text(message.get("content", ""))
             normalized.append(message)
-        return self.tokenizer.apply_chat_template(normalized, *args, **kwargs)
+
+        use_jinja = (
+            args
+            or kwargs.get("chat_template") is not None
+            or self.chat_template != DEFAULT_CHAT_TEMPLATE
+            or not all(isinstance(m, dict) for m in normalized)
+        )
+        if use_jinja:
+            return self.tokenizer.apply_chat_template(normalized, *args, **kwargs)
+
+        prompt = encode_deepseek_v4_prompt(
+            normalized,
+            tools=kwargs.get("tools"),
+            enable_thinking=bool(kwargs.get("enable_thinking")),
+            reasoning_effort=kwargs.get("reasoning_effort"),
+            add_generation_prompt=bool(kwargs.get("add_generation_prompt", False)),
+        )
+        if not kwargs.get("tokenize", True):
+            return prompt
+        # The prompt already carries BOS.
+        if kwargs.get("return_dict") or kwargs.get("return_tensors"):
+            encoded = self.tokenizer(
+                prompt,
+                add_special_tokens=False,
+                return_tensors=kwargs.get("return_tensors"),
+            )
+            return encoded if kwargs.get("return_dict") else encoded["input_ids"]
+        return self.tokenizer.encode(prompt, add_special_tokens=False)
 
     def encode(self, *args, **kwargs):
         return self.tokenizer.encode(*args, **kwargs)
