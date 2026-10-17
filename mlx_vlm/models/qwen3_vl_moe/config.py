@@ -68,8 +68,10 @@ class TextConfig(BaseModelConfig):
             if not all(key in self.rope_scaling for key in required_keys):
                 raise ValueError(f"rope_scaling must contain keys {required_keys}")
 
-            if not self.rope_scaling["type"] in ["mrope", "default"]:
-                raise ValueError(f"rope_scaling type must be 'mrope' or 'default'")
+            if not self.rope_scaling["type"] in ["mrope", "default", "yarn"]:
+                raise ValueError(
+                    f"rope_scaling type must be 'mrope', 'default' or 'yarn'"
+                )
 
 
 @dataclass
