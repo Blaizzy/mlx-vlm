@@ -11,7 +11,7 @@ from fastapi import HTTPException, Request, Response
 
 from .. import decision_protocol
 from .. import systemone as systemone_protocol
-from ..decision import DecisionCancelled
+from ..decide import DecisionCancelled
 from ..decision_protocol import DecisionRequest, DecisionResponse, cache_namespace
 from ..decision_scheduler import DecisionQueueFull, DecisionScheduler
 from ..systemone import SystemOneRequest, SystemOneResponse

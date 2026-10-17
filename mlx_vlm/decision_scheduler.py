@@ -8,7 +8,7 @@ from threading import BoundedSemaphore, Event, Thread, current_thread
 from types import SimpleNamespace
 
 from ._stream_cleanup import clear_mlx_streams
-from .decision import DecisionCancelled, check_cancelled, normalize_questions
+from .decide import DecisionCancelled, check_cancelled, normalize_questions
 
 
 class PredictionEngine:

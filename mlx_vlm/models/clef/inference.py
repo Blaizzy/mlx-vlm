@@ -13,7 +13,7 @@ from threading import Event
 import mlx.core as mx
 import numpy as np
 
-from ...decision import DecisionCancelled, check_cancelled, context_limit
+from ...decide import DecisionCancelled, check_cancelled, context_limit
 from ..cache import ArraysCache, KVCache
 from .clef import format_result
 from .processing_clef import encode_record

@@ -2292,7 +2292,7 @@ def test_decision_prefix_isolation_eviction_and_clear(incremental_decision):
 def test_decision_cancellation_boundaries_and_live_batch_row(incremental_decision):
     from threading import Event
 
-    from mlx_vlm.decision import DecisionCancelled
+    from mlx_vlm.decide import DecisionCancelled
     from mlx_vlm.decision_scheduler import make_decision_engine
 
     _, (model, processor, body) = incremental_decision
@@ -2319,7 +2319,7 @@ def test_decision_cancellation_boundaries_and_live_batch_row(incremental_decisio
 
 def test_decision_overflow_and_context_configuration(incremental_decision):
     from mlx_vlm import predict
-    from mlx_vlm.decision import context_limit
+    from mlx_vlm.decide import context_limit
     from mlx_vlm.decision_scheduler import make_decision_engine
     from mlx_vlm.tests.test_extraction_models import _public_decision_request
 
@@ -2348,7 +2348,7 @@ def test_decision_mixed_media_cache_contract(incremental_decision):
 
     from PIL import Image
 
-    from mlx_vlm.decision import DecisionCancelled
+    from mlx_vlm.decide import DecisionCancelled
     from mlx_vlm.decision_scheduler import make_decision_engine
     from mlx_vlm.tests.test_extraction_models import (
         _assert_decision_answers,

@@ -655,9 +655,12 @@ def test_decision_cli_requires_state_or_media(monkeypatch, capsys):
     load.assert_not_called()
 
 
-def test_decide_registered_as_package_subcommand():
+@pytest.mark.parametrize(
+    "command", [["-m", "mlx_vlm", "decide"], ["-m", "mlx_vlm.decide"]]
+)
+def test_decide_cli_entrypoints(command):
     result = subprocess.run(
-        [sys.executable, "-m", "mlx_vlm", "decide", "--help"],
+        [sys.executable, "-W", "error::RuntimeWarning", *command, "--help"],
         capture_output=True,
         text=True,
         check=True,
@@ -732,7 +735,7 @@ def decision_cli_responses(monkeypatch):
         return NS(config=NS()), None
 
     monkeypatch.setattr(decide, "load", loader)
-    monkeypatch.setattr(decide, "DecisionScheduler", Scheduler)
+    monkeypatch.setattr("mlx_vlm.decision_scheduler.DecisionScheduler", Scheduler)
     return calls
 
 

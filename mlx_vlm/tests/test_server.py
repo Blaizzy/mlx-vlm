@@ -6774,7 +6774,7 @@ def test_systemone_rejects_invalid_questions(client, question):
 def test_systemone_adapts_shared_predictions_and_confidence(
     client, surface, tmp_path, capsys, raw
 ):
-    from mlx_vlm.decision import systemone
+    from mlx_vlm.decide import systemone
     from mlx_vlm.systemone import SystemOneRequest
 
     questions = {
@@ -7250,7 +7250,7 @@ def test_decision_backpressure_is_shared(client, monkeypatch, endpoint, kind):
 
 
 def test_decision_scheduler_admission_switching_and_recovery(incremental_decision):
-    from mlx_vlm.decision import context_limit
+    from mlx_vlm.decide import context_limit
     from mlx_vlm.decision_scheduler import DecisionScheduler, make_decision_engine
 
     _, (model, processor, body) = incremental_decision
@@ -7305,7 +7305,7 @@ def test_decision_scheduler_admission_switching_and_recovery(incremental_decisio
 
 
 def test_decision_scheduler_overload_cancellation_and_shutdown(incremental_decision):
-    from mlx_vlm.decision import DecisionCancelled
+    from mlx_vlm.decide import DecisionCancelled
     from mlx_vlm.decision_scheduler import DecisionQueueFull, DecisionScheduler
 
     _, (model, processor, body) = incremental_decision

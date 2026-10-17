@@ -2,7 +2,8 @@
 
 `mlx_vlm.predict(model, processor, input, questions)`, `mlx_vlm.decide`, and
 `POST /v1/decisions` target the [OpenAI Decisions schema](https://developers.openai.com/api/reference/resources/decisions/methods/create).
-They share model loading, inference, and response formatting. Clef, Decider,
+The Python prediction API and CLI live in `mlx_vlm/decide.py`; HTTP endpoints
+share their model loading, inference, and response formatting. Clef, Decider,
 Laya, and the LiquidAI d1 models use this interface. Each model declares its
 supported question types and media. There is one public schema, without a
 format selector; `/v1/systemone` is a separate compatibility adapter.
@@ -202,6 +203,6 @@ or image data URLs on this endpoint.
 ```
 
 Send this body to `/v1/systemone`, or use
-`mlx_vlm.decision.systemone(model, processor, request)`. The CLI takes the
+`mlx_vlm.decide.systemone(model, processor, request)`. The CLI takes the
 OpenAI Decisions request shown above. Both endpoints share the same scheduler,
 model loader, and raw probability handling.

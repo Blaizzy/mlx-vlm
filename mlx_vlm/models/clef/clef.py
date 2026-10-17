@@ -4,7 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from ...decision import context_limit
+from ...decide import context_limit
 from ..base import InputEmbeddingsFeatures
 from ..qwen3_5 import Model as Qwen3_5Model
 from .processing_clef import encode_record
