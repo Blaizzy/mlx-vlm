@@ -37,6 +37,7 @@ from mlx_vlm.utils import (
     load,
     load_config,
     load_model,
+    load_model_weights,
 )
 
 # Shared model contracts
@@ -1835,9 +1836,9 @@ def test_patch_embed_is_transposed_from_ncdhw_to_ndhwc():
     assert sanitized[QWEN_SANITIZED_KEY].shape == expected
 
 
-def test_glm_quantized_head_sanitization_loads_strictly():
+def _tiny_glm_model():
     module = importlib.import_module("mlx_vlm.models.glm5_next")
-    model = module.Model(
+    return module.Model(
         module.ModelConfig(
             text_config=tiny_config("glm", hidden_size=32),
             vision_config=module.VisionConfig(
@@ -1852,6 +1853,10 @@ def test_glm_quantized_head_sanitization_loads_strictly():
             ),
         )
     )
+
+
+def test_glm_quantized_head_sanitization_loads_strictly():
+    model = _tiny_glm_model()
     nn.quantize(
         model,
         group_size=32,
@@ -1872,6 +1877,53 @@ def test_glm_quantized_head_sanitization_loads_strictly():
     for key, value in sanitized.items():
         assert mx.array_equal(again[key], value).item()
     model.load_weights(list(model.sanitize(checkpoint | head).items()), strict=True)
+
+
+@pytest.mark.parametrize("key_prefix", ["", "language_model."])
+def test_glm_mixed_quantization_loads_into_fused_projections(key_prefix):
+    sources = {
+        "gate_up_proj": ("gate_proj", "up_proj"),
+        "qkv_proj": ("q_proj", "k_proj", "v_proj"),
+        "fbg_a_proj": ("f_a_proj", "b_proj", "g_a_proj"),
+        "qkv_a_proj": ("q_a_proj", "kv_a_proj_with_mqa"),
+    }
+    reference = _tiny_glm_model()
+    nn.quantize(
+        reference,
+        group_size=32,
+        bits=8,
+        class_predicate=lambda path, _: path.rpartition(".")[2] in sources,
+    )
+    fused = [
+        path
+        for path, _ in reference.named_modules()
+        if path.rpartition(".")[2] in sources
+    ]
+    checkpoint = dict(tree_flatten(reference.parameters()))
+    quantization = {"group_size": 32, "bits": 4}
+    for path in fused:
+        parent, _, name = path.rpartition(".")
+        for suffix in ("weight", "scales", "biases"):
+            parts = mx.split(
+                checkpoint.pop(f"{path}.{suffix}"), list(range(1, len(sources[name])))
+            )
+            for source, part in zip(sources[name], parts):
+                checkpoint[f"{parent}.{source}.{suffix}"] = part
+        for source in sources[name]:
+            key = key_prefix + f"{parent}.{source}".removeprefix("language_model.")
+            quantization[key] = {"group_size": 32, "bits": 8}
+
+    model = _tiny_glm_model()
+    load_model_weights(
+        model,
+        {"quantization": quantization},
+        model.sanitize(checkpoint),
+        Path("/tmp/model"),
+    )
+
+    modules = dict(model.named_modules())
+    assert {path.rpartition(".")[2] for path in fused} == set(sources)
+    assert all(modules[path].bits == 8 for path in fused)
 
 
 def test_moondream2_sanitize_remaps_checkpoint_layout():

@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -7,6 +7,14 @@ from ..base import InputEmbeddingsFeatures, LanguageModelOutput
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
+
+# sanitize() merges these, but checkpoints key per-module quantization by source.
+FUSED_PROJECTION_SOURCES = {
+    "gate_up_proj": "gate_proj",
+    "qkv_proj": "q_proj",
+    "fbg_a_proj": "f_a_proj",
+    "qkv_a_proj": "q_a_proj",
+}
 
 
 def _replace_features(inputs_embeds, positions, features, label):
@@ -139,6 +147,15 @@ class Model(nn.Module):
 
         remapped = self.language_model.sanitize(remapped)
         return self.vision_tower.sanitize(remapped)
+
+    @staticmethod
+    def quantization_path_aliases(path: str) -> Tuple[str, ...]:
+        parent, _, name = path.rpartition(".")
+        source = FUSED_PROJECTION_SOURCES.get(name)
+        if source is None:
+            return ()
+        alias = f"{parent}.{source}"
+        return (alias, alias.removeprefix("language_model."))
 
     @property
     def layers(self):
