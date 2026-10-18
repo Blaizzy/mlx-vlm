@@ -5,7 +5,9 @@ import mlx.nn as nn
 
 from ..base import (
     LanguageModelOutput,
+    cache_position_offset,
     create_attention_mask,
+    kv_sequence_length,
     scaled_dot_product_attention,
 )
 from ..cache import KVCache
@@ -84,15 +86,11 @@ class Attention(nn.Module):
             0, 2, 1, 3
         )
 
-        kv_seq_len = keys.shape[-2]
-
         if position_ids is None:
-            kv_seq_len += cache.offset + 1
-            position_ids = mx.arange(cache.offset, cache.offset + L)
+            offset_for_pos = cache.offset if cache is not None else 0
+            position_ids = mx.arange(offset_for_pos, offset_for_pos + L)
             position_ids = mx.expand_dims(position_ids, axis=0)
             position_ids = mx.tile(position_ids, (3, B, 1))
-        else:
-            kv_seq_len += cache.offset + 1 if cache is not None else 0
 
         if position_embeddings is None:
             queries, keys = self.rotary_emb.apply_rotary(
@@ -107,11 +105,11 @@ class Attention(nn.Module):
                 queries, keys, cos, sin, unqueeze_dim=1
             )
 
-        if mask is not None and isinstance(mask, mx.array):
-            mask = mask[..., : keys.shape[-2]]
-
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
+
+        if isinstance(mask, mx.array):
+            mask = mask[..., : kv_sequence_length(keys)]
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache, scale=self.scale, mask=mask
@@ -423,17 +421,13 @@ class LanguageModel(nn.Module):
         if rope_deltas_kw is not None:
             self._rope_deltas = rope_deltas_kw
 
-        # Use ``_idx`` — the Python-int token counter maintained by
-        # ``BatchKVCache`` — instead of syncing on ``cache[0].offset`` every
-        # decode step. Rope positions count across the full (possibly padded)
-        # sequence; per-sequence left-padding is handled by the attention
-        # mask, matching upstream mlx-lm's convention. Falls back to
-        # ``cache[0].offset`` for plain caches that don't expose ``_idx``.
+        # Slice prompt metadata on the shared timeline; RoPE below still uses
+        # per-row offsets for padded batches.
         cache_offset = 0
         cache_offsets = None  # per-element offsets for batched caches (divergent state)
         if cache and cache[0] is not None:
             c0 = cache[0]
-            cache_offset = c0._idx if hasattr(c0, "_idx") else c0.offset
+            cache_offset = cache_position_offset(c0)
             if (
                 isinstance(c0.offset, mx.array)
                 and c0.offset.ndim > 0
