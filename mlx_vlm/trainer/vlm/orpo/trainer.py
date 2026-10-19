@@ -18,7 +18,8 @@ from ...common.metrics import (
     report_loss_metrics,
 )
 from ...core import Colors, grad_checkpoint, save_adapter
-from ..sft.runtime import vlm_batch_metrics
+from ..sft.mtp import vlm_mtp_loss
+from ..sft.runtime import _completion_mask, vlm_batch_metrics
 from ..sft.trainer import (
     TrainingArgs,
     _collate_arrays,
@@ -39,6 +40,13 @@ class ORPOTrainingArgs(TrainingArgs):
         default=1e-8,
         metadata={"help": "Small constant for numerical stability in log calculations"},
     )
+
+
+def _auxiliary_mtp_loss(model, batch, train_on_completions, assistant_id):
+    mask = batch["attention_mask"][:, 1:]
+    if train_on_completions:
+        mask = mx.logical_and(mask, _completion_mask(batch, assistant_id)[:, 1:])
+    return vlm_mtp_loss(model, batch, loss_mask=mask)
 
 
 def get_logps(model, batch, train_on_completions=False, assistant_id=77091):
@@ -252,6 +260,7 @@ def evaluate_orpo(
     train_on_completions=False,
     assistant_id=77091,
     return_metrics=False,
+    mtp_loss_weight=0.0,
 ):
     """
     Evaluate the model on validation dataset.
@@ -303,6 +312,12 @@ def evaluate_orpo(
             beta=0.1,
         )
 
+        if mtp_loss_weight:
+            auxiliary, mtp_metrics = _auxiliary_mtp_loss(
+                model, chosen_batch, train_on_completions, assistant_id
+            )
+            losses = losses + mtp_loss_weight * auxiliary
+            metrics.update(mtp_metrics)
         metrics.update(vlm_batch_metrics(batch, model))
         accumulator.add(losses, metrics)
         mx.eval(accumulator.state())
@@ -381,6 +396,12 @@ def train_orpo(
                 rejected_batch["attention_mask"],
                 beta=args.beta,
             )
+            if getattr(args, "mtp_loss_weight", 0.0):
+                auxiliary, mtp_metrics = _auxiliary_mtp_loss(
+                    model, chosen_batch, train_on_completions, assistant_id
+                )
+                losses = losses + args.mtp_loss_weight * auxiliary
+                metrics.update(mtp_metrics)
             metrics.update(
                 vlm_batch_metrics(
                     {"chosen": chosen_batch, "rejected": rejected_batch}, model
@@ -438,6 +459,7 @@ def train_orpo(
                 train_on_completions=train_on_completions,
                 assistant_id=assistant_id,
                 return_metrics=True,
+                mtp_loss_weight=getattr(args, "mtp_loss_weight", 0.0),
             )
             model.train()
             val_time = time.perf_counter() - tic_val

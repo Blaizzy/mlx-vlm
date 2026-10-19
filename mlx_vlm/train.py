@@ -40,11 +40,10 @@ def build_parser(task="vlm", algorithm=None):
     )
     parser.add_argument("-c", "--config")
     parser.add_argument("--model", "--model-path", help="Model path or Hub identifier.")
-    if algorithm == "sft":
-        parser.add_argument(
-            "--mtp-model",
-            help="Matching floating-point Qwen3.5 native checkpoint or split MTP head.",
-        )
+    parser.add_argument(
+        "--mtp-model",
+        help="Matching floating-point Qwen3.5 native checkpoint or split MTP head.",
+    )
     parser.add_argument(
         "--data", default="data", help="JSONL split folder, file, or Hub dataset."
     )
@@ -258,18 +257,6 @@ def run(args, settings, training_callback=None):
 
     mx.random.seed(args.seed)
     model, processor = _load_model(args.task, args.model)
-    if settings.mtp_loss_weight:
-        if args.algorithm != "sft":
-            raise ValueError("MTP training is currently supported only by SFT.")
-        if not args.mtp_model:
-            raise ValueError("--mtp-loss-weight requires --mtp-model.")
-        from .speculative.drafters import load_drafter
-        from .trainer.vlm.sft.mtp import attach_mtp_head
-
-        head, _ = load_drafter(args.mtp_model, kind="mtp")
-        attach_mtp_head(model, head)
-    elif getattr(args, "mtp_model", None):
-        raise ValueError("--mtp-model requires a positive --mtp-loss-weight.")
     reference = None
     if args.algorithm == "dpo" or (args.algorithm == "grpo" and settings.beta):
         reference, _ = _load_model(args.task, args.reference_model or args.model)
@@ -283,7 +270,22 @@ def run(args, settings, training_callback=None):
         train_rows, val_rows = raw, None
     if len(train_rows) == 0:
         raise ValueError(f"Dataset has no non-empty {args.train_split!r} split.")
+    head = None
+    if settings.mtp_loss_weight:
+        if not args.mtp_model:
+            raise ValueError("--mtp-loss-weight requires --mtp-model.")
+        from .speculative.drafters import load_drafter
+        from .trainer.vlm.sft.mtp import attach_mtp_head
+
+        head, _ = load_drafter(args.mtp_model, kind="mtp")
+        if args.train_type == "full":
+            # Full checkpoints restore strictly, so register the head first.
+            attach_mtp_head(model, head)
+    elif getattr(args, "mtp_model", None):
+        raise ValueError("--mtp-model requires a positive --mtp-loss-weight.")
     model = _configure_model(model, args)
+    if head is not None and args.train_type != "full":
+        attach_mtp_head(model, head, checkpoint_path=args.resume_adapter_file)
     reward_options = {}
     if args.algorithm == "grpo":
         from .trainer.vlm.grpo import rewards

@@ -88,6 +88,16 @@ def tiny_model(moe=False, tied=False):
     return attach_mtp_head(model, head)
 
 
+def prepare_tiny_model(*, checkpoint_path=None, **kwargs):
+    model = tiny_model()
+    head = model.mtp_head
+    del model["mtp_head"]
+    prepare_model_for_training(
+        model, checkpoint_path=checkpoint_path, verbose=False, **kwargs
+    )
+    return attach_mtp_head(model, head, checkpoint_path=checkpoint_path)
+
+
 def batch():
     return {
         "input_ids": mx.array([[1, 2, 3, 4, 0], [5, 6, 7, 0, 0]]),
@@ -122,7 +132,7 @@ def test_mtp_uses_next_next_targets_and_completion_padding_masks(moe, tied):
 
 
 def test_mtp_gradients_reach_native_head_and_base_adapters(tmp_path):
-    model = prepare_model_for_training(tiny_model(), lora_rank=2, verbose=False)
+    model = prepare_tiny_model(lora_rank=2)
     loss_fn = lambda m, b: vlm_sft_loss(m, b, mtp_loss_weight=0.3)
     (_, _), gradients = nn.value_and_grad(model, loss_fn)(model, batch())
     flat = dict(tree_flatten(gradients))
@@ -134,9 +144,7 @@ def test_mtp_gradients_reach_native_head_and_base_adapters(tmp_path):
     save_trainable_weights(model, path)
     saved = mx.load(str(path))
     assert "mtp_head.fc.weight" in saved
-    restored = prepare_model_for_training(
-        tiny_model(), checkpoint_path=path, verbose=False
-    )
+    restored = prepare_tiny_model(checkpoint_path=path)
     np.testing.assert_allclose(
         loss_fn(model, batch())[0].item(),
         loss_fn(restored, batch())[0].item(),
@@ -179,6 +187,31 @@ def test_configuration_and_missing_head_fail_early():
         Trainer(model, VLMTrainingArgs(mtp_loss_weight=0.3), prepared=True)
 
 
+def test_mtp_config_preserves_existing_positional_argument_order():
+    import inspect
+
+    from mlx_vlm.trainer import DPOTrainingArgs, ORPOTrainingArgs
+    from mlx_vlm.trainer.core import TrainingArgs
+
+    for config in (TrainingArgs, VLMTrainingArgs, DPOTrainingArgs, ORPOTrainingArgs):
+        assert (
+            inspect.signature(config).parameters["mtp_loss_weight"].kind
+            is inspect.Parameter.KEYWORD_ONLY
+        )
+
+
+def test_full_checkpoint_restores_head_with_base(tmp_path):
+    model = prepare_model_for_training(tiny_model(), train_type="full", verbose=False)
+    path = tmp_path / "weights.safetensors"
+    save_trainable_weights(model, path)
+    restored = prepare_model_for_training(
+        tiny_model(), train_type="full", checkpoint_path=path, verbose=False
+    )
+    np.testing.assert_array_equal(
+        np.array(model.mtp_head.fc.weight), np.array(restored.mtp_head.fc.weight)
+    )
+
+
 def test_legacy_loss_uses_same_mtp_objective():
     from mlx_vlm.trainer.vlm.sft.trainer import vision_language_loss_fn
 
@@ -190,12 +223,10 @@ def test_legacy_loss_uses_same_mtp_objective():
 
 
 def test_base_quantization_preserves_floating_point_mtp_head():
-    model = prepare_model_for_training(
-        tiny_model(),
+    model = prepare_tiny_model(
         lora_rank=2,
         quantization_bits=4,
         quantization_group_size=32,
-        verbose=False,
     )
     assert any(
         isinstance(layer, nn.QuantizedLinear)
@@ -216,6 +247,93 @@ def test_cli_exposes_mtp_options():
     assert settings.mtp_loss_weight == 0.3
 
 
+@pytest.mark.parametrize("algorithm", ["dpo", "orpo"])
+def test_preference_mtp_supervises_only_chosen_policy(algorithm, monkeypatch):
+    from mlx_vlm.trainer.vlm.preference.loss import dpo_vlm_loss, orpo_vlm_loss
+    from mlx_vlm.trainer.vlm.sft.mtp import vlm_mtp_loss
+
+    model = tiny_model()
+    pairs = {
+        "chosen": batch(),
+        "rejected": {
+            **batch(),
+            "input_ids": mx.array([[1, 2, 8, 9, 0], [5, 6, 8, 0, 0]]),
+        },
+    }
+    options = {}
+    if algorithm == "dpo":
+        reference = tiny_model()
+        reference.freeze()
+        reference.eval()
+        original = type(reference).__call__
+
+        def reference_forward(self, *args, **kwargs):
+            assert not kwargs.get("return_hidden", False)
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(type(reference), "__call__", reference_forward)
+        options["reference_model"] = reference
+    objective = dpo_vlm_loss if algorithm == "dpo" else orpo_vlm_loss
+    baseline, baseline_metrics = objective(model, pairs, **options)
+    auxiliary, _ = vlm_mtp_loss(model, pairs["chosen"])
+    enabled, metrics = objective(model, pairs, mtp_loss_weight=0.3, **options)
+    np.testing.assert_allclose(
+        enabled.item(), (baseline + 0.3 * auxiliary).item(), rtol=1e-5
+    )
+    assert metrics["num_mtp_tokens"].item() == 3
+    assert "mtp_loss" not in baseline_metrics
+    from mlx_vlm.trainer import DPOTrainingArgs, ORPOTrainingArgs
+
+    config = DPOTrainingArgs if algorithm == "dpo" else ORPOTrainingArgs
+    trainer = Trainer(model, config(mtp_loss_weight=0.3), prepared=True, **options)
+    bound, bound_metrics = trainer.task.loss(model, pairs)
+    np.testing.assert_allclose(bound.item(), enabled.item(), rtol=1e-5)
+    assert bound_metrics["num_mtp_tokens"].item() == 3
+    (_, _), grads = nn.value_and_grad(
+        model, lambda m: objective(m, pairs, mtp_loss_weight=0.3, **options)
+    )(model)
+    assert mx.abs(dict(tree_flatten(grads))["mtp_head.fc.weight"]).sum().item() > 0
+
+
+@pytest.mark.parametrize("loss_type", ["grpo", "bnpo", "dr_grpo"])
+def test_grpo_mtp_uses_generated_tokens_only(loss_type):
+    from mlx_vlm.trainer import GRPOTrainingArgs
+    from mlx_vlm.trainer.vlm.grpo.trainer import make_task
+    from mlx_vlm.trainer.vlm.sft.mtp import vlm_mtp_loss
+
+    model = tiny_model()
+    model.config.model_type = "qwen3_5_text"
+    data = {
+        "input_ids": mx.array([[1, 2, 3, 4]]),
+        "attention_mask": mx.ones((1, 4), mx.int32),
+    }
+    rollout = {
+        "samples": [{"batch": data, "start": 1, "advantage": mx.array([1.0])}],
+        "reward_metrics": {},
+    }
+    processor = SimpleNamespace(tokenizer=SimpleNamespace())
+    baseline_task = make_task(
+        model, GRPOTrainingArgs(grpo_loss_type=loss_type), processing_class=processor
+    )
+    task = make_task(
+        model,
+        GRPOTrainingArgs(mtp_loss_weight=0.3, grpo_loss_type=loss_type),
+        processing_class=processor,
+    )
+    baseline, baseline_metrics = baseline_task.loss(model, rollout)
+    value, metrics = task.loss(model, rollout)
+    auxiliary, _ = vlm_mtp_loss(
+        model, {**data, "completion_mask": mx.array([[0, 0, 1, 1]])}
+    )
+    np.testing.assert_allclose(
+        value.item(), (baseline + 0.3 * auxiliary).item(), rtol=1e-5
+    )
+    assert metrics["num_mtp_tokens"].item() == 2
+    assert "mtp_loss" not in baseline_metrics
+    (_, _), grads = task.value_and_grad_factory(model, False)(model, rollout)
+    assert mx.abs(dict(tree_flatten(grads))["mtp_head.fc.weight"]).sum().item() > 0
+
+
 def test_native_head_is_causal_and_has_no_inference_cache_side_effects():
     model = tiny_model()
     hidden = mx.random.normal((1, 3, 16))
@@ -234,7 +352,7 @@ def test_native_head_is_causal_and_has_no_inference_cache_side_effects():
 def test_trainer_updates_and_evaluates_auxiliary_objective(tmp_path):
     import mlx.optimizers as optim
 
-    model = prepare_model_for_training(tiny_model(), lora_rank=2, verbose=False)
+    model = prepare_tiny_model(lora_rank=2)
     before = mx.array(model.mtp_head.fc.weight)
     mx.eval(before)
     rows = [{key: value[i] for key, value in batch().items()} for i in range(2)]

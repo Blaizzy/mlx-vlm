@@ -159,35 +159,12 @@ def vlm_sft_loss(
         logits, targets, loss_mask, vision_mask=vlm_vision_mask(model, batch)
     )
     if mtp_loss_weight:
-        hidden_states = (
-            output.get("hidden_states")
-            if isinstance(output, Mapping)
-            else getattr(output, "hidden_states", None)
+        from .mtp import vlm_mtp_loss
+
+        mtp_loss, mtp_metrics = vlm_mtp_loss(
+            model, batch, output=output, loss_mask=loss_mask
         )
-        if not hidden_states or hidden_states[-1].shape[:2] != input_ids.shape:
-            raise ValueError(
-                "MTP requires target hidden states aligned with input_ids."
-            )
-        mtp_loss = mx.array(0.0)
-        mtp_tokens = mx.array(0, dtype=mx.int32)
-        if full_input_ids.shape[1] > 2:
-            # h[t] + ground-truth x[t+1] predicts x[t+2]. Padding must
-            # invalidate both the source context and the teacher-forced token.
-            context_mask = mx.logical_and(
-                attention_mask[:, :-2], attention_mask[:, 1:-1]
-            )
-            mtp_mask = mx.logical_and(loss_mask[:, 1:], context_mask)
-            mtp_logits = model.mtp_head.training_logits(
-                full_input_ids[:, 1:-1],
-                hidden_states[-1][:, :-1],
-                context_mask,
-                model,
-            )
-            mtp_loss, mtp_metrics = cross_entropy(
-                mtp_logits.astype(mx.float32), targets[:, 1:], mtp_mask
-            )
-            mtp_tokens = mtp_metrics["num_tokens"]
-        metrics.update(mtp_loss=mtp_loss, num_mtp_tokens=mtp_tokens)
+        metrics.update(mtp_metrics)
         loss = loss + mtp_loss_weight * mtp_loss
     return loss, {**metrics, **vlm_batch_metrics(batch)}
 
