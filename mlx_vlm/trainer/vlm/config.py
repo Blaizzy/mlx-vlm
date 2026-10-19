@@ -18,8 +18,9 @@ class VLMTrainingArgs(CoreTrainingArgs):
     assistant_id: int | None = 77091
     mtp_loss_weight: float = field(
         default=0.0,
+        kw_only=True,
         metadata={
-            "help": "SFT auxiliary next-next-token loss weight (0 disables MTP)."
+            "help": "Auxiliary next-next-token loss weight (0 disables MTP)."
         },
     )
 

@@ -449,7 +449,7 @@ def train(
         raise ValueError("gradient_accumulation_steps must be at least 1")
 
     # Create loss function with partial application
-    if args.mtp_loss_weight:
+    if getattr(args, "mtp_loss_weight", 0.0):
         loss_fn = partial(loss_fn, mtp_loss_weight=args.mtp_loss_weight)
     loss_fn_partial = partial(
         loss_fn, train_on_completions=train_on_completions, assistant_id=assistant_id

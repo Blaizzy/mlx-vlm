@@ -101,7 +101,6 @@ def _quantize_model(model, bits, group_size):
     for name, layer in model.named_modules():
         if (
             isinstance(layer, (nn.Linear, nn.Embedding))
-            and not name.startswith("mtp_head.")
             and layer.weight.shape[-1] % group_size == 0
         ):
             config[name] = parameters
@@ -270,8 +269,6 @@ def prepare_model_for_training(
         if quantization:
             model._vlm_adapter_config["base_quantization"] = quantization
 
-    if hasattr(model, "mtp_head"):
-        model.mtp_head.unfreeze()
     model.train()
     if verbose:
         from mlx_vlm.trainer.common.utils import print_trainable_parameters

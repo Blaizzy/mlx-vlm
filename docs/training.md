@@ -81,13 +81,14 @@ the algorithm automatically, or set `algorithm="orpo"` / `"dpo"` explicitly.
 Load a separate compatible base for DPO. The trainer freezes it and checks its
 model type, image token identifiers, and vocabulary size against the policy.
 
-## Native multi-token prediction in SFT
+## Native multi-token prediction
 
-SFT optionally trains a native MTP head alongside the usual next-token loss.
+SFT, DPO, ORPO, and GRPO optionally train a native MTP head alongside their
+existing objective. Shared cross-entropy keeps its existing API and behavior.
 The initial implementation supports matching **Qwen3.5 dense and MoE** heads,
 with one additional prediction: hidden state `h[t]` and ground-truth token
 `x[t+1]` predict `x[t+2]`. The objective is
-`next_token_loss + mtp_loss_weight * mtp_loss`. The default weight is zero.
+`algorithm_loss + mtp_loss_weight * mtp_loss`. The default weight is zero.
 Padding and completion-only supervision are shifted with the MTP targets.
 
 ```sh
@@ -100,24 +101,26 @@ python -m mlx_vlm.train \
 
 `--mtp-model` must contain floating-point native MTP weights. The base can be
 quantized; optional training-time base quantization leaves the MTP head in
-floating point. MTP is currently available for SFT only.
+floating point. Select the algorithm with `--algorithm sft`, `dpo`, `orpo`,
+or `grpo`.
 
-In Python, attach a fresh, unbound head **before** preparing the model:
+In Python, attach a fresh, unbound head **after** preparing the base model:
 
 ```python
 from mlx_vlm.speculative.drafters import load_drafter
 from mlx_vlm.trainer import attach_mtp_head
 
 head, _ = load_drafter("/path/to/matching-mtp", kind="mtp")
-attach_mtp_head(model, head)
 model = prepare_model_for_training(model, lora_rank=8)
+attach_mtp_head(model, head)
 args = VLMTrainingArgs(mtp_loss_weight=0.3, train_on_completions=True)
 # Pass model and args to Trainer as above.
 ```
 
 Adapter training updates the base adapters and the full MTP head. Checkpoints
-include the head under `mtp_head.*`. To resume, attach the matching head first,
-then use `prepare_model_for_training(..., checkpoint_path=...)`; the CLI needs
+include the head under `mtp_head.*`. To resume, prepare the base with
+`prepare_model_for_training(..., checkpoint_path=...)`, then call
+`attach_mtp_head(model, head, checkpoint_path=...)` with the same checkpoint. The CLI needs
 the same `--mtp-model` and `--mtp-loss-weight` with `--resume-adapter-file`.
 For speculative inference, load the base adapters, then restore the head's
 `mtp_head.*` weights into the matching drafter with that prefix removed.
@@ -126,7 +129,19 @@ Reports include `mtp_loss` and `num_mtp_tokens`. `nll`, perplexity, and token
 accuracy still describe the base next-token predictions; the reported `loss`
 includes the weighted auxiliary objective. Sequences with fewer than three
 tokens contribute zero MTP loss. The legacy `TrainingArgs` / `SFTTrainer` API
-also accepts `mtp_loss_weight` after attaching and preparing the head.
+also accepts `mtp_loss_weight` after preparing the base and attaching the head.
+
+DPO and ORPO apply auxiliary MTP supervision to chosen responses only. GRPO
+applies it to generated completion tokens, including samples with negative
+advantages; it is an additional supervised objective, independent of rewards.
+Reference-model scoring is unchanged. Preference and GRPO MTP use an extra
+policy forward when enabled; SFT reuses its existing forward. Other native
+heads can implement `training_logits(tokens, hidden, attention_mask, model)`
+and register as `model.mtp_head`; the built-in attachment helper currently
+validates Qwen3.5 heads only.
+
+For `train_type="full"`, attach the head before preparing the model so strict
+full-checkpoint loading can restore it with the base. The CLI handles this order.
 
 ## Training and validation metrics
 
