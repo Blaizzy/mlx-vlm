@@ -1844,12 +1844,17 @@ def prepare_inputs(
         # Ensure pad_token exists when padding text-only inputs
         if padding and tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
+        # Keep media and generation options out of the text tokenizer call.
+        text_kwargs = {
+            key: kwargs[key] for key in ("truncation", "max_length") if key in kwargs
+        }
         inputs = tokenizer(
             prompts,
             add_special_tokens=add_special_tokens,
             padding=padding,
             padding_side=padding_side,
             return_tensors=return_tensors,
+            **text_kwargs,
         )
         input_ids = (
             inputs.input_ids

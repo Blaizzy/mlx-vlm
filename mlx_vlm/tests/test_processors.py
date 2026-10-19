@@ -2734,6 +2734,81 @@ def test_prepare_inputs(prompt, with_image, error, pad_token):
         assert mx.array_equal(inputs["attention_mask"], mx.array([7, 8, 9]))
 
 
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("padding_side", ["left", "right"])
+@pytest.mark.parametrize(
+    "options,expected_length",
+    [
+        ({}, 10),
+        ({"truncation": True, "max_length": 4}, 4),
+        ({"truncation": True}, 6),
+        ({"truncation": False, "max_length": 4}, 10),
+        ({"padding": "max_length", "max_length": 12}, 12),
+    ],
+    ids=["default", "truncate", "model-limit", "no-truncation", "fixed-padding"],
+)
+def test_prepare_inputs_text_length_options(
+    wrapped, padding_side, options, expected_length
+):
+    tokenizer = fast_tokenizer(
+        (
+            "[UNK]",
+            "[PAD]",
+            "hello",
+            "world",
+            "one",
+            "two",
+            "three",
+            "four",
+            "five",
+            "six",
+        ),
+        model_max_length=6,
+    )
+    prompts = ["hello world one two three four five six hello world", "hello world"]
+    expected = tokenizer(
+        prompts,
+        **{
+            "add_special_tokens": False,
+            "padding": True,
+            "padding_side": padding_side,
+            "return_tensors": "np",
+            **options,
+        },
+    )
+    processor = NS(tokenizer=tokenizer) if wrapped else tokenizer
+    actual = prepare_inputs(
+        processor, prompts=prompts, padding_side=padding_side, **options
+    )
+
+    assert actual["input_ids"].shape == (2, expected_length)
+    for key in ("input_ids", "attention_mask"):
+        assert mx.array_equal(actual[key], mx.array(expected[key]))
+
+
+def test_prepare_inputs_text_options_do_not_forward_media_or_generation_options():
+    tokenizer = fast_tokenizer()
+    spy = Mock(wraps=tokenizer, pad_token=tokenizer.pad_token)
+    unrelated = dict(
+        min_pixels=1024,
+        max_pixels=4096,
+        fps=2.0,
+        nframes=4,
+        temperature=0.7,
+        max_tokens=16,
+    )
+    actual = prepare_inputs(
+        NS(tokenizer=spy),
+        prompts="hello hello hello hello hello hello",
+        truncation=True,
+        max_length=4,
+        **unrelated,
+    )
+
+    assert actual["input_ids"].shape == (1, 4)
+    assert unrelated.keys().isdisjoint(spy.call_args.kwargs)
+
+
 def test_prepare_inputs_preserves_mlx_attention_mask_for_thread_handoff():
     attention_mask = mx.array([[1, 1]], dtype=mx.int32)
 
