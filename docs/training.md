@@ -15,6 +15,7 @@ callbacks, and MLX engine as the Python API. VLM SFT, ORPO, DPO, and GRPO are su
 Start with one of the standalone notebooks:
 
 - [SFT](../examples/training/sft_text_only.ipynb): text-only JOSIE instruction training.
+- [Native MTP SFT](../examples/training/sft_mtp.ipynb): train only the native head against assistant responses, reload checkpoints, and export a standalone drafter.
 - [LaTeX OCR SFT](../examples/training/sft_vison_text.ipynb): map Hugging Face `image`/`text` rows into messages and preprocess with `VisionDataset`.
 - [ORPO](../examples/training/orpo.ipynb): chosen/rejected responses without a reference model.
 - [DPO](../examples/training/dpo.ipynb): chosen/rejected responses with a separate frozen reference.
