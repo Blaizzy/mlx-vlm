@@ -9,6 +9,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from ..base import (
     LanguageModelOutput,
+    cache_position_offset,
     create_attention_mask,
     scaled_dot_product_attention,
 )
@@ -2051,12 +2052,10 @@ class LanguageModel(nn.Module):
             cache_offset = 0
             cache_offsets = None
             if first_cache is not None:
-                cache_offset = first_cache._idx if hasattr(first_cache, "_idx") else 0
+                cache_offset = cache_position_offset(first_cache)
                 offset = getattr(first_cache, "offset", None)
                 if isinstance(offset, mx.array) and offset.ndim > 0:
                     cache_offsets = offset
-                elif offset is not None and not hasattr(first_cache, "_idx"):
-                    cache_offset = offset
 
             scalar_cache_offset = self._scalar_cache_offset(cache_offset)
             if mask is None and first_cache is not None and scalar_cache_offset == 0:
