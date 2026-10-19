@@ -362,13 +362,15 @@ class Gemma4VideoProcessor(BaseVideoProcessor):
             return video
 
         resized = np.empty((T, C, target_h, target_w), dtype=video.dtype)
+        is_float = video.dtype in (np.float32, np.float64)
         for i, frame in enumerate(video):
             arr = np.transpose(frame, (1, 2, 0))
-            if arr.dtype in (np.float32, np.float64):
+            if is_float:
                 arr = (arr * 255).clip(0, 255).astype(np.uint8)
             pil = Image.fromarray(arr)
             pil = pil.resize((target_w, target_h), resample=Image.BICUBIC)
-            resized[i] = np.transpose(np.array(pil), (2, 0, 1))
+            out_i = np.transpose(np.array(pil), (2, 0, 1))
+            resized[i] = out_i.astype(video.dtype) / 255.0 if is_float else out_i
         return resized
 
     def __call__(self, videos, fps=None):
