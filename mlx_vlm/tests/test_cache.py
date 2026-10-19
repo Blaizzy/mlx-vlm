@@ -3290,3 +3290,69 @@ def test_restored_tokens_count_successful_restores(
     manager.reset_stats()
     assert manager.stats_snapshot()["restored_tokens"] == 0
     assert manager.stats_snapshot()["stored_tokens"] == 0
+
+
+def test_rotating_cache_mask_keep():
+    cache = RotatingKVCache(max_size=8, keep=2)
+    mask = cache.make_mask(20)
+    assert mask.shape == (20, 20)
+    assert mx.all(mask[2:, :2]).item()
+    assert not mask[19, 10].item()
+
+    kv = mx.zeros((1, 1, 20, 32))
+    cache.update_and_fetch(kv, kv)
+    mask = cache.make_mask(5)
+    assert mask.shape == (5, 12)
+    assert mx.all(mask[:, :2]).item()
+    assert mx.all(mask.sum(axis=-1) == 8).item()
+
+
+@pytest.mark.parametrize("size", [2, 4, 8])
+def test_rotating_cache_keep_token_visibility(size):
+    for keep, history, step, n, window, return_array in product(
+        sorted({0, 1, size - 1}),
+        [0, 1, size - 1, size, 2 * size + 3],
+        [1, size + 1],
+        [2, 3, size + 2],
+        [None, size],
+        [False, True],
+    ):
+        cache = RotatingKVCache(max_size=size, keep=keep)
+        for start in range(0, history, step):
+            kv = mx.arange(start, min(start + step, history)).reshape(1, 1, -1, 1)
+            cache.update_and_fetch(kv, kv)
+        mask = cache.make_mask(n, window, return_array)
+        kv = mx.arange(history, history + n).reshape(1, 1, n, 1)
+        keys, _ = cache.update_and_fetch(kv, kv)
+        ids = keys[0, 0, :, 0].tolist()
+        rows = None if isinstance(mask, str) else mask.tolist()
+        for row in range(n):
+            end = history + row + 1
+            actual = [
+                token
+                for col, token in enumerate(ids)
+                if (token < end if rows is None else rows[row][col])
+            ]
+            expected = list(range(min(keep, end))) + list(
+                range(max(keep, end - (size - keep)), end)
+            )
+            assert sorted(actual) == expected
+
+
+def test_rotating_cache_keep_explicit_window():
+    # A different attention window must not force retained tokens visible.
+    for keep, history, n, window, return_array in product(
+        [0, 1, 3], [0, 3, 4, 9], [2, 6], [1, 2, 3, 7], [False, True]
+    ):
+        cache = RotatingKVCache(max_size=4, keep=keep)
+        kv = mx.zeros((1, 1, 1, 1))
+        for _ in range(history):
+            cache.update_and_fetch(kv, kv)
+        offset = min(3, history)
+        actual = cache.make_mask(n, window, return_array)
+        if offset + n > window or return_array:
+            expected = create_causal_mask(n, offset, window_size=window)
+            assert mx.array_equal(actual, expected).item()
+        else:
+            assert actual == "causal"
+
