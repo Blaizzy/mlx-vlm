@@ -527,6 +527,10 @@ def interpolate(pos_embed, size, mode="cubic", align_corners=False):
     Returns:
         Interpolated array with shape [B, C, H_dst, W_dst] or [C, H_dst, W_dst]
     """
+    # `bicubic` is the PyTorch name for the 2D cubic kernel, which MLX spells "cubic".
+    if mode == "bicubic":
+        mode = "cubic"
+
     # Handle different input shapes
     input_dim = pos_embed.ndim
     original_shape = pos_embed.shape
@@ -548,8 +552,11 @@ def interpolate(pos_embed, size, mode="cubic", align_corners=False):
         scale_factor=(scale_h, scale_w), mode=mode, align_corners=align_corners
     )
 
-    # Apply upsampling
-    result = upsampler(pos_embed)
+    # MLX's `Upsample` interpolates the dimensions between the batch dimension and the channel
+    # dimension, i.e. it expects channels-last (NHWC). `pos_embed` is channels-first (NCHW), like
+    # PyTorch's `F.interpolate`, so the layout has to be converted around the call -- otherwise the
+    # scaling is applied to the channel and height dimensions instead of height and width.
+    result = upsampler(pos_embed.transpose(0, 2, 3, 1)).transpose(0, 3, 1, 2)
 
     # Return in the original dimension format
     if input_dim == 3:
