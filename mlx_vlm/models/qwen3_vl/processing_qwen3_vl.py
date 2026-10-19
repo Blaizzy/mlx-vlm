@@ -13,7 +13,11 @@ import numpy as np
 from PIL import Image
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_processing_utils import ImageProcessingMixin
-from transformers.image_utils import ImageInput
+from transformers.image_utils import (
+    ChannelDimension,
+    ImageInput,
+    infer_channel_dimension_format,
+)
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 from transformers.video_processing_utils import BaseVideoProcessor
@@ -211,20 +215,26 @@ def _smart_resize_video(
 
 
 def _resize_video_frames(video: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
-    """Bicubic resize each frame of a ``(T, C, H, W)`` video."""
+    """Bicubic resize each frame of a ``(T, C, H, W)`` video.
+
+    The value domain of the input is preserved: uint8 stays in [0, 255] and
+    float stays in [0, 1], so callers can keep gating rescale on the input dtype.
+    """
     from PIL import Image
 
     T, C, H, W = video.shape
+    is_float = video.dtype in (np.float32, np.float64)
     if target_h == H and target_w == W:
         return video
     out = np.empty((T, C, target_h, target_w), dtype=video.dtype)
     for i, frame in enumerate(video):
         arr = np.transpose(frame, (1, 2, 0))
-        if arr.dtype in (np.float32, np.float64):
+        if is_float:
             arr = (arr * 255).clip(0, 255).astype(np.uint8)
         pil = Image.fromarray(arr)
         pil = pil.resize((target_w, target_h), resample=Image.BICUBIC)
-        out[i] = np.transpose(np.array(pil), (2, 0, 1))
+        out_i = np.transpose(np.array(pil), (2, 0, 1))
+        out[i] = out_i.astype(video.dtype) / 255.0 if is_float else out_i
     return out
 
 
@@ -404,14 +414,16 @@ class Qwen3VLImageProcessor(ImageProcessingMixin):
 
     def __call__(self, images, **kwargs):
         images = _flatten_images(images)
-        imgs = [
-            (
-                img
-                if (isinstance(img, np.ndarray) and img.ndim == 3)
-                else _to_numpy_image(img)
-            )
-            for img in images
-        ]
+        imgs = []
+        for img in images:
+            if isinstance(img, np.ndarray) and img.ndim == 3:
+                # numpy images may arrive channels-last (HF convention); only treat
+                # them as CHW when the layout inference says so.
+                if infer_channel_dimension_format(img) == ChannelDimension.LAST:
+                    img = np.transpose(img, (2, 0, 1))
+            else:
+                img = _to_numpy_image(img)
+            imgs.append(img)
         all_patches = []
         all_thw = []
         image_kwargs = {
