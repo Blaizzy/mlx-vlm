@@ -830,6 +830,18 @@ class TestGemma4UnifiedProcessor:
             [x, y] for y in range(2) for x in range(2)
         ]
 
+    @pytest.mark.parametrize("height", [1, 3], ids=["1px-tall", "3px-tall"])
+    def test_short_pil_images_stay_channels_last(self, height):
+        pixels = np.arange(height * 4 * 3, dtype=np.uint8).reshape(height, 4, 3)
+        p = m.g4.Gemma4ImageProcessor(do_resize=False, do_rescale=False)
+        data, _ = p(Image.fromarray(pixels))
+        equal(data["pixel_values"][0], pixels.transpose(2, 0, 1))
+
+        p = _gemma_image()
+        p.do_resize = True
+        data, _ = p(Image.new("RGB", (900, height)))
+        assert data["image_position_ids"][0].max(axis=0).tolist() == [3, 0]
+
     def test_video_padding_and_positions(self):
         video = np.zeros((2, 3, 4, 8), np.uint8)
         p = _gemma_image(m.g4.Gemma4VideoProcessor, max_soft_tokens=70)
@@ -1671,6 +1683,74 @@ def test_checkpoint_loading(tmp_path, name):
         assert TestMageVLProcessor.image_counts(
             p(text=m.mage.VIDEO_PAD, videos=[TestMageVLProcessor.frames()])
         ) == [3]
+
+
+def test_nemotron_processor_modalities_and_metadata(tmp_path):
+    metadata = deepcopy(DATA["checkpoints"]["nemotron"])
+    config = metadata["config"]
+    config["model_type"] = "nemotron_h_omni"
+    metadata["processor_config"][
+        "processor_class"
+    ] = "NemotronH_Omni_Reasoning_V3Processor"
+    metadata["preprocessor_config"].update(
+        norm_mean=[0.5] * 3,
+        norm_std=[0.5] * 3,
+        min_num_patches=4,
+        max_num_patches=16,
+        video_target_num_patches=8,
+    )
+    _write_configs(tmp_path, **metadata)
+    vocab = {str(i): i for i in range(21)}
+    for index, token in [
+        (0, "[UNK]"),
+        (5, "seconds"),
+        (18, "<image>"),
+        (19, "<img>"),
+        (20, "</img>"),
+    ]:
+        del vocab[str(index)]
+        vocab[token] = index
+    backend = Tokenizer(WordLevel(vocab, unk_token="[UNK]"))
+    backend.pre_tokenizer = Whitespace()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        unk_token="[UNK]",
+        eos_token="[UNK]",
+        pad_token="[UNK]",
+        additional_special_tokens=["<image>", "<img>", "</img>"],
+    )
+    tokenizer.save_pretrained(tmp_path)
+    processor = load_processor(tmp_path, add_detokenizer=False, trust_remote_code=False)
+    assert processor_handles_video(processor)
+    messages = apply_chat_template(
+        processor, config, "Describe.", num_images=1, return_messages=True
+    )
+    assert messages[0]["content"][0] == {"type": "image"}
+    messages = apply_chat_template(
+        processor, config, "Describe.", video="clip.mp4", return_messages=True
+    )
+    assert messages[0]["content"][0]["type"] == "video"
+    image = Image.new("RGB", (32, 32), "red")
+    inputs = prepare_inputs(processor, prompts="<image>Describe.", images=[image])
+    assert int(mx.sum(inputs["input_ids"] == 18)) == int(inputs["num_tokens"].sum())
+    frames = np.zeros((5, 3, 32, 64), dtype=np.uint8)
+    inputs = prepare_inputs(processor, prompts="<video>Describe.", videos=[frames])
+    assert inputs["pixel_values_videos"].shape[0] == 5
+    assert int(mx.sum(inputs["input_ids"] == 18)) == 3 * int(inputs["num_tokens"][0])
+    assert (
+        int(mx.sum(inputs["input_ids"] == 5)) == 5
+    )  # Per-frame timestamps survived the loader.
+    assert processor.image_processor._is_video_mode is False
+    with pytest.raises(ValueError, match="one video"):
+        prepare_inputs(processor, prompts="<video><video>", videos=[frames, frames])
+
+    waveform = np.linspace(-1, 1, 1600, dtype=np.float32)
+    keyword = processor(text="<so_embedding>", audio=waveform)
+    positional = processor(None, "<so_embedding>", None, waveform)
+    for inputs in (keyword, positional):
+        assert len(inputs["sound_clips"]) == 1
+        np.testing.assert_array_equal(inputs["sound_clips"][0], waveform)
+    np.testing.assert_array_equal(positional["input_ids"], keyword["input_ids"])
 
 
 # Prompt construction
@@ -2683,6 +2763,37 @@ def test_prepare_inputs_preserves_mlx_attention_mask_for_thread_handoff():
     assert consumed == [[[1, 1]]]
 
 
+@pytest.mark.parametrize("name", ["qwen3_vl", "qwen2_5_vl"])
+def test_prepare_inputs_image_limits_are_per_request(name):
+    processor = _make_processor(name)
+    processor.image_processor = m.qwen3.Qwen3VLImageProcessor(
+        min_pixels=1024, max_pixels=1048576, patch_size=16, merge_size=2
+    )
+    processor.tokenizer.special_tokens = {processor.image_token: 100}
+    for options, expected_tokens in [
+        ({}, 4),
+        (dict(min_pixels=16384), 16),
+        (dict(max_pixels=1024), 1),
+        ({}, 4),
+    ]:
+        inputs = prepare_inputs(
+            processor,
+            prompts=processor.image_token,
+            images=[Image.new("RGB", (64, 64))],
+            temperature=0.7,
+            max_tokens=8,
+            **options,
+        )
+        assert inputs["input_ids"].shape[-1] == expected_tokens
+        assert int(inputs["image_grid_thw"][0].prod()) // 4 == expected_tokens
+        assert not (
+            {"min_pixels", "max_pixels", "temperature", "max_tokens"}
+            & processor.tokenizer.last_kwargs.keys()
+        )
+    assert processor.image_processor.min_pixels == 1024
+    assert processor.image_processor.max_pixels == 1048576
+
+
 def _make_test_image_bytes():
     """Create a small valid PNG in memory."""
     from PIL import Image as PILImage
@@ -3094,6 +3205,99 @@ def test_embedding_gemma2_image_options(embedding_gemma2_processor, floating):
     assert np.isfinite(
         processor([image], do_rescale=not floating)["pixel_values"]
     ).all()
+
+
+@pytest.mark.parametrize("height", [1, 3], ids=["1px-tall", "3px-tall"])
+def test_embedding_gemma2_short_pil_images_stay_channels_last(height):
+    # A 3-pixel-tall RGB PIL image becomes (3, W, 3) after conversion, which
+    # shape-based channel inference reads as channels-first; a 1-pixel-tall
+    # one becomes (1, W, 3) and loses two of its three channels. PIL pixels
+    # are always HWC, so the layout must not be guessed for PIL inputs.
+    from mlx_vlm.models.embedding_gemma2.image_processing_embedding_gemma2 import (
+        EmbeddingGemma2ImageProcessor,
+    )
+
+    processor = EmbeddingGemma2ImageProcessor(
+        patch_size=16, pooling_kernel_size=4, max_soft_tokens=280
+    )
+    output = processor.preprocess(
+        [Image.new("RGB", (900, height))], return_tensors="np"
+    )
+
+    # Every patch keeps all 3 channels: 16 * 16 * 3, not 16 * 16 * 1.
+    assert output["pixel_values"].shape[-1] == 768
+    # A landscape image spans the x axis, not y (position ids are [x, y]).
+    equal(output["image_position_ids"][0].max(axis=0).tolist(), [1119, 3])
+
+    portrait = processor.preprocess(
+        [Image.new("RGB", (height, 900))], return_tensors="np"
+    )
+    equal(portrait["image_position_ids"][0].max(axis=0).tolist(), [3, 1119])
+
+
+def test_embedding_gemma2_pil_frames_stay_channels_last():
+    # The video processor stacks PIL frames into (T, H, W, C) before
+    # inferring the layout, so a 3-frame batch of short frames is mistaken
+    # for channels-first and reaches the vision tower transposed.
+    from transformers.image_utils import ChannelDimension
+
+    from mlx_vlm.models.embedding_gemma2.image_processing_embedding_gemma2 import (
+        EmbeddingGemma2ImageProcessor,
+    )
+    from mlx_vlm.models.embedding_gemma2.video_processing_embedding_gemma2 import (
+        EmbeddingGemma2VideoProcessor,
+    )
+
+    image_processor = EmbeddingGemma2ImageProcessor(
+        patch_size=16, pooling_kernel_size=4, max_soft_tokens=280
+    )
+    video_processor = EmbeddingGemma2VideoProcessor(
+        patch_size=16, pooling_kernel_size=4, max_soft_tokens=280
+    )
+
+    height = 3
+    content = np.zeros((height, 900, 3), np.uint8)
+    content[:, :450, 0] = 255
+    content[height // 2 :, :, 1] = 255
+    frames = [Image.fromarray(content) for _ in range(3)]
+
+    video = video_processor.preprocess(
+        [frames], return_tensors="np", do_sample_frames=False
+    )
+    reference = image_processor.preprocess(
+        frames,
+        return_tensors="np",
+        input_data_format=ChannelDimension.LAST,
+    )
+    equal(video["pixel_values_videos"], reference["pixel_values"])
+    equal(video["video_position_ids"], reference["image_position_ids"])
+
+    # Unambiguous numpy frame stacks (height not in (1, 3, 4)) infer HWC and
+    # match the PIL result.
+    tall = [Image.fromarray(np.zeros((40, 900, 3), np.uint8)) for _ in range(3)]
+    raw_video = video_processor.preprocess(
+        [np.stack([np.asarray(frame) for frame in tall])],
+        return_tensors="np",
+        do_sample_frames=False,
+    )
+    pil_video = video_processor.preprocess(
+        [tall], return_tensors="np", do_sample_frames=False
+    )
+    equal(raw_video["pixel_values_videos"], pil_video["pixel_values_videos"])
+
+    # An ambiguous *array* stack is still resolved by shape inference: raw
+    # arrays carry no layout guarantee, so their behaviour is unchanged.
+    ambiguous = np.zeros((3, 3, 900, 3), np.uint8)
+    forced_first = video_processor.preprocess(
+        [ambiguous],
+        return_tensors="np",
+        do_sample_frames=False,
+        input_data_format=ChannelDimension.FIRST,
+    )
+    inferred = video_processor.preprocess(
+        [ambiguous], return_tensors="np", do_sample_frames=False
+    )
+    equal(inferred["pixel_values_videos"], forced_first["pixel_values_videos"])
 
 
 def test_embedding_gemma2_chat_audio_from_video(
@@ -3511,3 +3715,92 @@ def test_embedding_gemma2_prepare_inputs_routes_media(
     actual = prepare_inputs(p, prompts=[prompt], **media, return_tensors="mlx")
     for key in expected:
         equal(np.asarray(actual[key]), np.asarray(expected[key]))
+
+
+class TestMiniCPMV47Processor:
+    @staticmethod
+    def processor():
+        from mlx_vlm.models.minicpmv4_7.processing_minicpmv4_7 import (
+            MiniCPMV4_7Processor,
+            MiniCPMVImageProcessor,
+            MiniCPMVVideoProcessor,
+        )
+
+        options = dict(PROFILES["minicpm_image"])
+        return MiniCPMV4_7Processor(
+            tokenizer=ProcessorTokenizer(**PROFILES["minicpm_tokenizer"]),
+            image_processor=MiniCPMVImageProcessor(**options),
+            video_processor=MiniCPMVVideoProcessor(**options),
+        )
+
+    @pytest.mark.parametrize("mode,count", [("16x", 1), ("4x", 4)])
+    def test_mixed_media_and_mode(self, mode, count):
+        processor = self.processor()
+        processor.image_processor.use_image_id = True
+        inputs = processor(
+            text="<|video_pad|> then <|image_pad|>",
+            images=[Image.new("RGB", (56, 56), "red")],
+            videos=[np.zeros((2, 3, 56, 56), dtype=np.uint8)],
+            downsample_mode=mode,
+        )
+        assert inputs["downsample_mode"] == mode
+        assert np.count_nonzero(inputs["mm_token_type_ids"] == 2) == 2 * count
+        assert np.count_nonzero(inputs["mm_token_type_ids"] == 1) == count
+        assert len(inputs["pixel_values"][0]) == 3
+        assert inputs["input_ids"][0, 0] == processor.tokenizer.im_start_id
+        assert (
+            np.count_nonzero(inputs["input_ids"] == processor.tokenizer.im_id_start_id)
+            == 1
+        )
+        assert processor.image_processor.downsample_mode == "16x"
+        np.testing.assert_array_equal(inputs["pixel_values"][0][0], -1)
+        assert np.any(inputs["pixel_values"][0][-1] == 1)
+
+    def test_placeholder_validation_and_thinking(self):
+        processor = self.processor()
+        with pytest.raises(ValueError, match="placeholders"):
+            processor(text="Describe", images=[Image.new("RGB", (56, 56))])
+        with pytest.raises(ValueError, match="placeholders"):
+            processor(text="<|image_pad|>")
+        prompt = "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        assert processor._strip_think_prefix(prompt) == prompt
+        processor.tokenizer.apply_chat_template = Mock(return_value=prompt)
+        assert processor.apply_chat_template([], enable_thinking=False) == prompt
+        processor.tokenizer.apply_chat_template.assert_called_once_with(
+            [], enable_thinking=False
+        )
+
+    def test_save_load_roundtrip(self, tmp_path):
+        from mlx_vlm.models.minicpmv4_7 import MiniCPMV4_7Processor
+
+        processor = self.processor()
+        tokens = processor.tokenizer.special_tokens
+        backend = Tokenizer(
+            WordLevel(
+                vocab={token: i for i, token in enumerate(tokens)}, unk_token="<unk>"
+            )
+        )
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=backend,
+            unk_token="<unk>",
+            eos_token="</image>",
+            pad_token="<unk>",
+            additional_special_tokens=list(tokens),
+        )
+        tokenizer.chat_template = (
+            "{% for message in messages %}{{ message.content }}{% endfor %}"
+        )
+        processor.tokenizer = tokenizer
+        processor.video_processor.max_num_frames = 7
+        processor.image_processor.downsample_mode = "4x"
+        processor.save_pretrained(tmp_path)
+        (tmp_path / "config.json").write_text(
+            json.dumps({"model_type": "minicpmv4_7", "downsample_mode": "16x"})
+        )
+        loaded = AutoProcessor.from_pretrained(tmp_path)
+        assert isinstance(loaded, MiniCPMV4_7Processor)
+        assert loaded.image_processor.downsample_mode == "4x"
+        assert loaded.video_processor.max_num_frames == 7
+        assert loaded.tokenizer.chat_template == tokenizer.chat_template
+        result = loaded(text="<|image_pad|>", images=[Image.new("RGB", (56, 56))])
+        assert np.count_nonzero(result["mm_token_type_ids"] == 1) == 4

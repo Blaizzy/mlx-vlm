@@ -802,7 +802,14 @@ class RotatingKVCache(_BaseCache):
             window_size = window_size or self.max_size
             offset = min(self.max_size - 1, self.offset)
             if offset + N > window_size or return_array:
-                return create_causal_mask(N, offset, window_size=window_size)
+                if self.keep == 0 or window_size != self.max_size:
+                    return create_causal_mask(N, offset, window_size=window_size)
+                # The retained prefix shares the cache budget with recent tokens.
+                rinds = mx.arange(offset + N)[None]
+                linds = mx.arange(offset, offset + N)[:, None]
+                return (linds >= rinds) & (
+                    (rinds < self.keep) | (linds < rinds + window_size - self.keep)
+                )
             else:
                 return "causal"
         else:
@@ -1666,7 +1673,7 @@ class BatchKVCache(_BaseCache):
             self._right_padding = self._right_padding[batch_indices]
 
         # Shift left to reduce padding
-        min_left_pad = self.left_padding.min().item()
+        min_left_pad = min(self.left_padding.min().item(), self._idx)
         if min_left_pad > 0:
             if self.keys is not None:
                 self.keys = self.keys[..., min_left_pad:, :]
@@ -2484,7 +2491,7 @@ class BatchQuantizedKVCache(_BaseCache):
         if self._right_padding is not None:
             self._right_padding = self._right_padding[batch_indices]
 
-        min_lp = self.left_padding.min().item()
+        min_lp = min(self.left_padding.min().item(), self._idx)
         if min_lp > 0:
             if self.keys is not None:
                 self.keys = tuple(k[..., min_lp:, :] for k in self.keys)

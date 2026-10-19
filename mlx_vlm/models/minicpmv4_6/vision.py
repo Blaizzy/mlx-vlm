@@ -248,6 +248,7 @@ class VisionModel(nn.Module):
             "siglip_vision_model",
             "siglip",
             "minicpmv4_6_vision",
+            "minicpmv4_7_vision",
         ]:
             raise ValueError(f"Unsupported model type: {self.model_type}")
 

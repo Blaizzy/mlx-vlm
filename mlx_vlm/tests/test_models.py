@@ -11,7 +11,7 @@ import math
 import struct
 import textwrap
 import unittest
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict
 from operator import attrgetter
 from pathlib import Path
@@ -26,8 +26,8 @@ import pytest
 from mlx.utils import tree_flatten, tree_map
 
 from mlx_vlm import embedding_loader
-from mlx_vlm.models.base import InputEmbeddingsFeatures
-from mlx_vlm.models.cache import make_prompt_cache
+from mlx_vlm.models.base import InputEmbeddingsFeatures, create_attention_mask
+from mlx_vlm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
 from mlx_vlm.models.lfm2_encoder import Model as Lfm2Encoder
 from mlx_vlm.utils import (
     _drop_modules_without_weights,
@@ -314,6 +314,44 @@ class ModelChecks:
             ).logits
             assert logits.shape == (1, 1, config.vocab_size) and logits.dtype == dtype
 
+    def language_hidden_states(self, model):
+        ids = mx.array([[1, 2, 3]])
+        embeds = model.get_input_embeddings(ids)
+        captured = []
+
+        def record_input(forward):
+            def call(layer, hidden, *args, **kwargs):
+                captured.append(hidden)
+                return forward(layer, hidden, *args, **kwargs)
+
+            return call
+
+        reference_cache = model.make_cache()
+        with ExitStack() as stack:
+            for layer_type in {type(layer) for layer in model.layers}:
+                stack.enter_context(
+                    patch.object(
+                        layer_type, "__call__", record_input(layer_type.__call__)
+                    )
+                )
+            reference = model(ids, cache=reference_cache)
+        assert reference.hidden_states is None
+        next_ids = mx.array([[4]])
+        next_logits = model(next_ids, cache=reference_cache).logits
+        for inputs in (
+            {"inputs": ids},
+            {"input_ids": ids},
+            {"inputs_embeds": embeds},
+        ):
+            cache = model.make_cache()
+            output = model(**inputs, cache=cache, output_hidden_states=True)
+            assert len(output.hidden_states) == len(model.layers) + 1
+            for actual, expected in zip(output.hidden_states[:-1], captured):
+                self.assert_close(actual, expected)
+            self.assert_close(output.logits, reference.logits)
+            self.assert_close(model.lm_head(output.hidden_states[-1]), output.logits)
+            self.assert_close(model(next_ids, cache=cache).logits, next_logits)
+
     def projector(
         self, model, input_width, output_width, *, grid_hw=None, downsample_ratio=1
     ):
@@ -507,9 +545,21 @@ TINY_DEFAULTS = DATA["tiny_defaults"]
 TINY_MODELS = DATA["shared_configs"]
 
 
+def model_case(name):
+    """Return fresh case data for shared model and checkpoint tests."""
+    return copy.deepcopy(next(case for case in DATA["cases"] if case["id"] == name))
+
+
 def build_config(module, values, config_type="ModelConfig"):
     """Construct the model family's config classes from ordinary nested data."""
     fields = copy.deepcopy(values)
+    if (
+        module.__name__
+        in ("mlx_vlm.models.minicpmv4_7", "mlx_vlm.models.nemotron_h_nano_omni")
+        and config_type == "ModelConfig"
+    ):
+        # Preserve checkpoint aliases and per-layer text-config dispatch.
+        return module.ModelConfig.from_dict(fields)
     for name, value in fields.items():
         if name in CONFIG_TYPES and isinstance(value, dict):
             fields[name] = build_config(module, value, CONFIG_TYPES[name])
@@ -543,6 +593,8 @@ def check_arguments(kind, case, model, config):
         return (model, config, name), case.get("audio", {})
     if kind in {"request_positions", "chunked_positions"}:
         return (model,), {}
+    if kind == "language_hidden_states":
+        return (model.language_model,), {}
     if kind in {"language", "mrope_cache_index", "mrope_deltas"}:
         if kind == "language":
             options = (
@@ -621,6 +673,148 @@ def test_model_contract(case):
     for kind in case["checks"]:
         args, kwargs = check_arguments(kind, case, model, config)
         getattr(checks, kind)(*args, **kwargs)
+
+
+@pytest.fixture
+def nemotron_case(request):
+    case = model_case(getattr(request, "param", "nemotron_super_vl"))
+    module = importlib.import_module("mlx_vlm.models." + case["module"])
+    return module, case["config"]
+
+
+@pytest.mark.parametrize("nemotron_case", ["nemotron_bolt"], indirect=True)
+def test_nemotron_puzzle_layer_configs(nemotron_case):
+    arch, config = nemotron_case
+    # The block list takes precedence, as in NVIDIA's Puzzle config.
+    config["llm_config"]["layers_block_type"] = ["attention"]
+    _, family = get_model_and_args({"model_type": "nemotron_h_puzzle"})
+    assert family == "nemotron_h"
+    model = arch.Model(build_config(arch, config))
+    assert [layer.block_type for layer in model.language_model.layers] == [
+        "M",
+        "E",
+        "*",
+        "E",
+    ]
+    assert model.config.text_config.time_step_limit == (0, float("inf"))
+    for idx, experts, width, topk in [(1, 2, 32, 1), (3, 3, 64, 2)]:
+        moe = model.language_model.layers[idx].mixer
+        assert moe.switch_mlp.fc1.weight.shape == (experts, width, 32)
+        assert moe.switch_mlp.fc2.weight.shape == (experts, 32, width)
+        assert moe.gate.weight.shape == (experts, 32)
+        assert moe.gate.top_k == topk
+
+
+@pytest.mark.parametrize("vision_norm,mtp_depth", [(True, 0), (False, 1), (None, 1)])
+def test_nemotron_explicit_vision_norm_overrides_mtp(
+    nemotron_case, vision_norm, mtp_depth
+):
+    arch, config = nemotron_case
+    config["vision_final_layernorm"] = vision_norm
+    config["llm_config"]["num_nextn_predict_layers"] = mtp_depth
+    model = arch.Model(build_config(arch, config))
+    expected = vision_norm if vision_norm is not None else mtp_depth > 0
+    assert isinstance(model.vision_final_layernorm, nn.LayerNorm) == expected
+    assert model.config.to_dict().get("vision_final_layernorm") == vision_norm
+
+
+@pytest.mark.parametrize(
+    "nemotron_case", ["nemotron_super_vl", "nemotron_bolt"], indirect=True
+)
+@pytest.mark.parametrize("text_key", ["llm_config", "text_config"])
+def test_nemotron_checkpoint_loading(tmp_path, nemotron_case, text_key):
+    arch, config = nemotron_case
+    config[text_key] = config.pop("llm_config")
+    _, family = get_model_and_args(config)
+    assert family == arch.__name__.rsplit(".", 1)[-1]
+    model = arch.Model(build_config(arch, config))
+    expected = dict(tree_flatten(model.parameters()))
+    weights = {}
+    for key, value in expected.items():
+        if ".switch_mlp." in key:
+            prefix, projection = key.split(".switch_mlp.")
+            projection = projection.replace("fc1", "up_proj").replace(
+                "fc2", "down_proj"
+            )
+            for expert, weight in enumerate(value):
+                weights[f"{prefix}.experts.{expert}.{projection}"] = weight
+        else:
+            if "conv1d.weight" in key:
+                value = value.moveaxis(1, 2)
+            key = key.replace("mlp1.layers.", "mlp1.")
+            if key.startswith("vision_final_layernorm."):
+                key = "vision_projector." + key
+            weights[key] = value
+    weights["vision_model.summary_idxs"] = mx.array([0, 1])
+    weights["language_model.mtp.unused.weight"] = mx.ones((2, 2))
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+    loaded = load_model(tmp_path)
+    assert asdict(loaded.config) == asdict(model.config)
+    actual = dict(tree_flatten(loaded.parameters()))
+    assert actual.keys() == expected.keys()
+    for key, value in expected.items():
+        assert mx.array_equal(actual[key], value), key
+
+
+@pytest.mark.parametrize(
+    "rate,expected",
+    [
+        (0.0, [True] * 6),
+        (0.5, [True, True, False, True, False, False]),
+        (1.0, [True, True, False, False, False, False]),
+    ],
+)
+def test_nemotron_video_retention_order_and_first_tubelet(
+    nemotron_case, rate, expected
+):
+    arch, _ = nemotron_case
+    vision = inspect.getmodule(arch.Model)
+    # The second token changes most in frame 2; equal scores preserve order.
+    features = mx.array(
+        [[[1.0, 0.0], [1.0, 0.0]], [[1.0, 0.0], [-1.0, 0.0]], [[1.0, 0.0], [-1.0, 0.0]]]
+    )
+    assert vision.compute_retention_mask(features, rate).tolist() == expected
+    assert vision.compute_retention_mask(mx.zeros((1, 2, 4)), rate).tolist() == [
+        True,
+        True,
+    ]
+
+
+def test_nemotron_vision_normalization_and_video_pruning(nemotron_case):
+    arch, config = nemotron_case
+    vision = inspect.getmodule(arch.Model)
+    model = arch.Model(build_config(arch, config))
+    features = mx.random.normal((1, 4, 16))
+    # The projector must normalize BEFORE spatially merging the four patches.
+    expected = model.mlp1(model.vision_final_layernorm(features).reshape(1, 1, 64))
+    np.testing.assert_allclose(
+        model._project_vision_features(features, 2, 2), expected, rtol=1e-5, atol=1e-5
+    )
+    # Five rectangular frames pad to three tubelets, two tokens per tubelet.
+    pixels = mx.random.normal((5, 3, 32, 64))
+    ids = mx.array([[1, 18, 18, 2, 18, 18, 3, 18, 18, 4]])
+    full = model.extract_video_feature(pixels)
+    assert full.shape == (3, 2, 32)
+    keep = np.flatnonzero(vision.compute_retention_mask(full, 0.7))
+    actual = model.get_input_embeddings(ids, pixel_values_videos=pixels).inputs_embeds
+    assert actual.shape == (1, 6, 32)
+    unpruned = model.get_input_embeddings(
+        ids, pixel_values_videos=pixels, video_pruning_rate=0
+    ).inputs_embeds
+    assert unpruned.shape == (1, 10, 32)
+    assert model.video_pruning_rate == 0.7
+    with pytest.raises(ValueError, match="video_pruning_rate"):
+        model.get_input_embeddings(
+            ids, pixel_values_videos=pixels, video_pruning_rate=-1
+        )
+    np.testing.assert_allclose(actual[0, 1:3], full.reshape(-1, 32)[mx.array(keep)])
+    expected_text = model.language_model.get_input_embeddings(mx.array([[1, 2, 3, 4]]))
+    np.testing.assert_allclose(actual[:, [0, 3, 4, 5]], expected_text)
+    images = [mx.zeros((3, 32, 32)), mx.zeros((3, 32, 64))]
+    assert model.get_input_embeddings(
+        mx.array([[1, 18, 18, 18, 2]]), images
+    ).inputs_embeds.shape == (1, 5, 32)
 
 
 def test_lfm2_encoder_sanitize_and_dispatch():
@@ -850,6 +1044,184 @@ def test_embedding_gemma2_quantized_checkpoint_roundtrip(
     np.testing.assert_allclose(mx.linalg.norm(actual, axis=-1), 1, atol=1e-6)
 
 
+@pytest.fixture(params=[c["id"] for c in DATA["cases"] if c["module"] == "minicpmv4_7"])
+def minicpmv47_case(request):
+    case = next(c for c in DATA["cases"] if c["id"] == request.param)
+    module = importlib.import_module("mlx_vlm.models." + case["module"])
+    return module, build_config(module, case["config"])
+
+
+@pytest.mark.parametrize("mode,count", [("16x", 4), ("4x", 16)])
+def test_minicpmv47_vision_and_chunked_prefill(minicpmv47_case, mode, count):
+    module, config = minicpmv47_case
+
+    model = module.Model(config)
+    ids = mx.array([[1, 50] + [48] * count + [51, 2]])
+    media = {
+        "pixel_values": [[mx.random.normal((3, 2, 128))]],
+        "tgt_sizes": [np.array([[8, 8]])],
+        "downsample_mode": mode,
+    }
+    features = model.get_input_embeddings(ids, **media)
+    assert features.inputs_embeds.shape == (*ids.shape, 16)
+    assert features.position_ids.shape == (3, 1, ids.shape[-1])
+    assert features.rope_deltas.item() < 0
+    ModelChecks().prefill_parity(model, ids, media, chunk_sizes=(3,))
+
+    # The outer model must preserve the canvas delta when decoding without images.
+    cache = model.language_model.make_cache()
+    model(ids, cache=cache, **media)
+    next_logits = model(mx.array([[3]]), cache=cache).logits
+    extended = mx.concatenate([ids, mx.array([[3]])], axis=1)
+    expected = model(extended, **media).logits[:, -1:]
+    assert mx.allclose(next_logits, expected, atol=2e-5)
+
+
+def test_minicpmv47_canvas_and_padding(minicpmv47_case):
+    module, config = minicpmv47_case
+    rope_module = importlib.import_module(module.__name__ + ".rope")
+
+    rope = rope_module.CanvasRoPE(config)
+    ids = np.array([[0, 0, 1, 50, 48, 48, 48, 48, 51, 2]])
+    positions, deltas = rope.get_rope_index(
+        ids,
+        (ids == 48).astype(np.int32),
+        np.array([[8, 8]]),
+        attention_mask=ids != 0,
+    )
+    expected = [
+        [0, 0, 0, 1, 1, 1, 1, 1, 1, 4],
+        [0, 0, 0, 0, 1, 1, 2, 2, 3, 4],
+        [0, 0, 0, 0, 1, 2, 1, 2, 3, 4],
+    ]
+    np.testing.assert_array_equal(positions[:, 0], expected)
+    assert deltas.item() == -3
+
+
+def test_minicpmv47_grid_validation(minicpmv47_case):
+    module, config = minicpmv47_case
+
+    model = module.Model(config)
+    ids = mx.array([[50, 48, 51]])
+    with pytest.raises(ValueError, match="crop grids"):
+        model.get_input_embeddings(ids)
+    with pytest.raises(ValueError, match="token count"):
+        model.get_input_embeddings(ids, tgt_sizes=[[[8, 8]]])
+    with pytest.raises(ValueError, match="crop grids"):
+        model.language_model.get_rope_index(ids)
+
+
+def test_minicpmv47_slices_share_the_thumbnail_canvas(minicpmv47_case):
+    module, config = minicpmv47_case
+    rope_module = importlib.import_module(module.__name__ + ".rope")
+
+    ids = np.array([[1, 50, 48, 51, 52, 48, 53, 52, 48, 53, 2]])
+    positions, _ = rope_module.CanvasRoPE(config).get_rope_index(
+        ids, (ids == 48).astype(np.int32), np.array([[4, 4]] * 3)
+    )
+    expected = [
+        [0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 4],
+        [0, 0, 1, 2, 1, 1, 1, 1, 1, 1, 4],
+        [0, 0, 1, 3, 1, 1, 1, 2, 2, 2, 4],
+    ]
+    np.testing.assert_array_equal(positions[:, 0], expected)
+
+
+@pytest.mark.parametrize("minicpmv47_case", ["minicpmv4_7"], indirect=True)
+def test_minicpmv47_sanitize_is_idempotent(minicpmv47_case):
+    module, config = minicpmv47_case
+
+    model = module.Model(config)
+    weights = {
+        "model.language_model.layers.0.input_layernorm.weight": mx.zeros((16,)),
+        "model.language_model.layers.0.linear_attn.conv1d.weight": mx.ones((80, 1, 3)),
+        "model.vision_tower.embeddings.patch_embedding.weight": mx.zeros((16, 3, 2, 2)),
+    }
+    first = model.sanitize(weights)
+    second = model.sanitize(first)
+    assert first.keys() == second.keys()
+    for key in first:
+        assert mx.array_equal(first[key], second[key])
+    assert mx.array_equal(
+        first["language_model.model.layers.0.input_layernorm.weight"],
+        mx.ones((16,)),
+    )
+    assert first["vision_tower.embeddings.patch_embedding.weight"].shape == (
+        16,
+        2,
+        2,
+        3,
+    )
+
+
+@pytest.mark.parametrize("minicpmv47_case", ["minicpmv4_7_moe"], indirect=True)
+def test_minicpmv47_native_expert_checkpoint_and_reload(minicpmv47_case, tmp_path):
+    module, config = minicpmv47_case
+    qwen = importlib.import_module("mlx_vlm.models.qwen3_5.qwen3_5")
+    moe = importlib.import_module("mlx_vlm.models.qwen3_5_moe.language")
+
+    model = module.Model(config)
+    assert isinstance(model.layers[0].mlp, moe.Qwen3_5MoeSparseMoeBlock)
+    expected = dict(tree_flatten(model.parameters()))
+    raw = {}
+    for key, value in expected.items():
+        if ".switch_mlp." in key:
+            continue
+        if key.startswith("language_model.model."):
+            key = key.replace("language_model.model.", "model.language_model.", 1)
+            if key.endswith(qwen.NORM_WEIGHT_SUFFIXES):
+                value = value - 1
+            if "conv1d.weight" in key:
+                value = value.swapaxes(1, 2)
+        elif key.startswith("language_model.lm_head."):
+            key = key.replace("language_model.", "", 1)
+        else:
+            key = "model." + key.replace("vit_merger.", "vision_tower.vit_merger.", 1)
+            if key.endswith("patch_embedding.weight"):
+                value = value.transpose(0, 3, 1, 2)
+        raw[key] = value
+    for index, layer in enumerate(model.layers):
+        prefix = f"model.language_model.layers.{index}.mlp.experts"
+        experts = layer.mlp.switch_mlp
+        raw[f"{prefix}.gate_up_proj"] = mx.concatenate(
+            [experts.gate_proj.weight, experts.up_proj.weight], axis=-2
+        )
+        raw[f"{prefix}.down_proj"] = experts.down_proj.weight
+
+    sanitized = model.sanitize(raw)
+    assert sanitized.keys() == expected.keys()
+    for key, value in expected.items():
+        assert mx.array_equal(sanitized[key], value), key
+    reloaded = model.sanitize(sanitized)
+    for key, value in sanitized.items():
+        assert mx.array_equal(reloaded[key], value), key
+    model.load_weights(list(reloaded.items()), strict=True)
+    mx.eval(model(mx.array([[1, 2, 3]])).logits)
+    (tmp_path / "config.json").write_text(json.dumps(asdict(model.config)))
+    for weights in (raw, sanitized):
+        mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+        loaded = load_model(tmp_path)
+        assert isinstance(loaded.layers[0].mlp, moe.Qwen3_5MoeSparseMoeBlock)
+        for key, value in tree_flatten(loaded.parameters()):
+            assert mx.array_equal(value, expected[key]), key
+
+
+@pytest.mark.parametrize("minicpmv47_case", ["minicpmv4_7_moe"], indirect=True)
+def test_minicpmv47_router_quantization_and_state_dtype(minicpmv47_case):
+    module, config = minicpmv47_case
+
+    model = module.Model(config)
+    prefix = "language_model.model.layers.0"
+    assert model.quant_predicate(f"{prefix}.mlp.gate", None) == {
+        "group_size": 64,
+        "bits": 8,
+    }
+    assert model.quant_predicate(f"{prefix}.mlp.switch_mlp.up_proj", None)
+    assert not model.quant_predicate(f"{prefix}.linear_attn.in_proj_qkv", None)
+    assert not model.cast_predicate(f"{prefix}.linear_attn.A_log")
+    assert model.cast_predicate(f"{prefix}.mlp.switch_mlp.up_proj.weight")
+
+
 @pytest.mark.parametrize("name", DATA["dense"])
 def test_dense_model(name):
     module = importlib.import_module("mlx_vlm.models." + name)
@@ -884,6 +1256,206 @@ def test_gemma3_can_preserve_caller_supplied_embedding_scale():
 
     assert mx.array_equal(capture.call_args.args[0], expected)
     assert mx.array_equal(output, expected)
+
+
+def rotating_language_model(case):
+    """Reuse model contracts and tiny defaults for cache-specific model checks."""
+    name = case["module"]
+    module = importlib.import_module(f"mlx_vlm.models.{name}")
+    language = importlib.import_module(f"mlx_vlm.models.{name}.language")
+    outer, text = None, {}
+    if "case" in case:
+        outer = build_config(module, model_case(case["case"])["config"])
+        outer = getattr(outer, "thinker_config", outer)
+        text = asdict(outer.text_config)
+    defaults = {} if name == "florence2" else TINY_DEFAULTS
+    config = build_config(
+        language,
+        text | defaults | case["config"],
+        case.get("config_type", "TextConfig"),
+    )
+    if name == "florence2":
+        return language.Florence2Decoder(config), config
+    if name in ("qwen2", "qwen3", "mllama", "moondream3", "minimax_m3_vl", "gemma3n"):
+        return language.LanguageModel(config), config
+    if outer is None:
+        outer = module.ModelConfig(
+            text_config=config, vision_config=module.VisionConfig()
+        )
+    else:
+        outer.text_config = config
+    model = (
+        language.LanguageModel(outer)
+        if name == "hunyuan_vl"
+        else language.LanguageModel(config, outer)
+    )
+    return model, config
+
+
+@pytest.mark.parametrize(
+    "case",
+    [c for c in DATA["rotating_cache"] if "chunk_parity" in c["checks"]],
+    ids=lambda c: c["module"],
+)
+@pytest.mark.parametrize("keep", [0, 2])
+def test_rotating_cache_random_model_chunk_parity(case, keep):
+    mx.random.seed(17)
+    model, config = rotating_language_model(case)
+    model.eval()
+    mx.eval(model.parameters())
+    ids = (mx.arange(41)[None] * 7 + 3) % config.vocab_size
+
+    def forward(schedule):
+        for attr in ("_rope_deltas", "_position_ids"):
+            if hasattr(model, attr):
+                setattr(model, attr, None)
+        caches = [RotatingKVCache(8, keep=keep) for _ in model.layers]
+        result, start = [], 0
+        for n in schedule:
+            logits = model(ids[:, start : start + n], cache=caches).logits
+            mx.eval(logits, [c.state for c in caches])
+            result.append(logits)
+            start += n
+        assert start == ids.shape[1]
+        return np.array(mx.concatenate(result, axis=1))
+
+    expected = forward([1] * 41)
+    # Include a chunk larger than the cache and multi-token continuation after
+    # single-token decoding has wrapped the storage cursor.
+    for schedule in ([3] * 13 + [1, 1], [17, 7, 8, 8, 1], [1] * 19 + [5, 8, 8, 1]):
+        np.testing.assert_allclose(forward(schedule), expected, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [c for c in DATA["rotating_cache"] if "prompt_metadata" in c["checks"]],
+    ids=lambda c: c["module"],
+)
+def test_rotated_model_slices_full_prompt_metadata(case):
+    name = case["module"]
+    mx.random.seed(19)
+    model, config = rotating_language_model(case)
+    model.eval()
+    ids = (mx.arange(24)[None] * 7 + 3) % config.vocab_size
+    positions = mx.broadcast_to(mx.arange(24)[None, None, :], (3, 1, 24))
+    positions = positions + mx.array([3, 7, 11])[:, None, None]
+    if name == "falcon_ocr":
+        positions = positions[0]
+    metadata = {"position_ids": positions}
+    if name in ("qwen3_vl", "qwen3_vl_moe", "qwen3_omni_moe"):
+        metadata["visual_pos_masks"] = mx.ones((1, 24), mx.bool_)
+        metadata["deepstack_visual_embeds"] = (
+            mx.random.normal((1, 24, 2, config.hidden_size))
+            if name == "qwen3_omni_moe"
+            else [mx.random.normal((24, config.hidden_size)) for _ in range(2)]
+        )
+
+    def forward(full_metadata):
+        for attr in ("_rope_deltas", "_position_ids"):
+            if hasattr(model, attr):
+                setattr(model, attr, None)
+        cache = [RotatingKVCache(8, keep=2) for _ in model.layers]
+        for start in range(21):
+            out = model(ids[:, start : start + 1], cache=cache)
+            mx.eval(out.logits)
+        assert cache[0].offset == 21 and cache[0]._idx != 21
+        kwargs = dict(metadata)
+        if not full_metadata:
+            kwargs["position_ids"] = positions[..., 21:24]
+            if "visual_pos_masks" in kwargs:
+                kwargs["visual_pos_masks"] = kwargs["visual_pos_masks"][:, 21:24]
+                embeds = kwargs["deepstack_visual_embeds"]
+                kwargs["deepstack_visual_embeds"] = (
+                    [e[21:24] for e in embeds]
+                    if isinstance(embeds, list)
+                    else embeds[:, 21:24]
+                )
+        if name == "falcon_ocr":
+            # Falcon's full-prompt metadata is passed with precomputed embeddings.
+            kwargs["inputs_embeds"] = model.model.embed_tokens(ids[:, 21:24])
+            if not full_metadata:
+                # This wrapper accepts full position IDs only; compare the
+                # internally selected positions against a direct model call.
+                mask = create_attention_mask(kwargs["inputs_embeds"], cache)
+                return np.array(
+                    model.lm_head(
+                        model.model(
+                            ids[:, 21:24],
+                            inputs_embeds=kwargs["inputs_embeds"],
+                            position_ids=positions[..., 21:24],
+                            mask=mask,
+                            cache=cache,
+                        )
+                    )
+                )
+        return np.array(model(ids[:, 21:24], cache=cache, **kwargs).logits)
+
+    np.testing.assert_allclose(forward(True), forward(False), atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [c for c in DATA["rotating_cache"] if "per_layer_inputs" in c["checks"]],
+    ids=lambda c: c["module"],
+)
+def test_rotated_per_layer_inputs(case):
+    mx.random.seed(23)
+    model, config = rotating_language_model(case)
+    # The constructor initializes this gate to zero, which would hide a bad
+    # per-layer-input slice in an otherwise randomly initialized model.
+    for layer in model.layers:
+        layer.altup.correct_output_scale = mx.random.uniform(
+            low=0.5, high=1.5, shape=(config.hidden_size,)
+        )
+    model.eval()
+    ids = (mx.arange(41)[None] * 7 + 3) % config.vocab_size
+    per_layer_inputs = model.model.get_per_layer_inputs(ids)
+
+    def forward(step, full_metadata):
+        cache, outputs = model.make_cache(), []
+        for start in range(0, 41, step):
+            metadata = (
+                per_layer_inputs
+                if full_metadata
+                else per_layer_inputs[:, start : start + step]
+            )
+            out = model(
+                ids[:, start : start + step], cache=cache, per_layer_inputs=metadata
+            )
+            mx.eval(out.logits)
+            outputs.append(out.logits)
+        return np.array(mx.concatenate(outputs, axis=1))
+
+    expected = forward(1, False)
+    np.testing.assert_allclose(forward(3, True), expected, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [c for c in DATA["rotating_cache"] if "decoder_positions" in c["checks"]],
+    ids=lambda c: c["module"],
+)
+def test_rotated_decoder_positions_and_mask(case):
+    mx.random.seed(29)
+    decoder, config = rotating_language_model(case)
+    decoder.eval()
+    encoder_states = mx.random.normal((1, 4, config.d_model))
+    embeddings = mx.random.normal((1, 41, config.d_model))
+
+    def forward(step):
+        cache = [[RotatingKVCache(8, keep=2), KVCache()] for _ in decoder.layers]
+        outputs = []
+        for start in range(0, 41, step):
+            out = decoder(
+                inputs_embeds=embeddings[:, start : start + step],
+                encoder_hidden_states=encoder_states,
+                cache=cache,
+            )
+            mx.eval(out)
+            outputs.append(out)
+        return np.array(mx.concatenate(outputs, axis=1))
+
+    np.testing.assert_allclose(forward(3), forward(1), atol=1e-4, rtol=1e-4)
 
 
 # Document layout
@@ -2165,6 +2737,9 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
 
         case = next(case for case in DATA["cases"] if case["module"] == "deepseek_v41")
         config = build_config(deepseek_v41, case["config"])
+        # MLX's sorted affine GEMM can read past a partial 64-element K tile.
+        # Use aligned projections while retaining decode and sorted dispatch.
+        config.hidden_size = config.moe_intermediate_size = 64
 
         def project(layer, x, expert=None):
             # Use MLX's native MXFP8 codec as an independent rounding oracle.

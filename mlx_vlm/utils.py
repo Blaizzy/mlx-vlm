@@ -31,7 +31,7 @@ from .quantization.checkpoint import (
 from .quantization.nvfp4 import replace_scaled_quantized_linears
 from .quantization.one_bit import _quantization_for_path, replace_one_bit_modules
 from .tokenizer_utils import load_tokenizer
-from .trainer.utils import apply_lora_layers
+from .trainer.peft.utils import apply_lora_layers
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +40,7 @@ ACTIVATION_QUANTIZATION_MODES = {"nvfp4", "mxfp8"}
 
 # Constants
 MODEL_REMAPPING = {
+    "nemotron_h_puzzle": "nemotron_h",
     "moondream1": "moondream2",
     "llava_qwen2": "fastvlm",  # Apple's FastVLM, note it's different to the one below
     "llava-qwen2": "llava_bunny",
@@ -57,6 +58,7 @@ MODEL_REMAPPING = {
     "dinov2_with_registers": "dinov2",
     "falcon-perception": "falcon_perception",
     "nemotronh_nano_omni_reasoning_v3": "nemotron_h_nano_omni",
+    "nemotron_h_omni": "nemotron_h_nano_omni",
     "cohere2moe": "cohere2_moe",
     "unlimited-ocr": "unlimited_ocr",
     "mistral": "llama",
@@ -1778,6 +1780,13 @@ def process_inputs(
     for param in parameters.keys():
         if param in kwargs.keys():
             args[param] = kwargs.get(param, None)
+
+    # Qwen-style processors route image sizing through **kwargs. Forward only
+    # these preprocessing options, not arbitrary decoder/sampler arguments.
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        for key in ("min_pixels", "max_pixels", "resized_height", "resized_width"):
+            if kwargs.get(key) is not None:
+                args[key] = kwargs[key]
 
     # Add audio if provided and supported
     if audio is not None and len(audio) > 0:

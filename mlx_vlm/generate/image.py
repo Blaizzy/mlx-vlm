@@ -182,12 +182,16 @@ def _model_type_from_id(model: str) -> str:
     if not model_id:
         return ""
     name = model_id.rsplit("/", 1)[-1]
+    if name.startswith("flux-3-") and not name.startswith("flux-3-image-klein-pup"):
+        return "flux3"
     model_type = name.split("-", 1)[0]
     return {
         "ternary": "bonsai",
         "2bit": "bonsai",
         "flux.2": "flux2",
         "flux2": "flux2",
+        "flux3": "flux3",
+        "flux.3": "flux3",
         "klein": "flux2",
         "mage": "mage_flow",
         "mageflow": "mage_flow",
@@ -195,6 +199,7 @@ def _model_type_from_id(model: str) -> str:
         "zimage": "z_image",
         "ming": "ming_image",
         "mingimage": "ming_image",
+        "moss": "moss_image",
         "ernie": "ernie_image",
         "ideogram": "ideogram4",
         "qwen": "qwen_image",
@@ -232,6 +237,15 @@ def _model_types_from_class_name(class_name: str) -> tuple[str, ...]:
 
 def _image_model_types_from_metadata(metadata: dict[str, Any]) -> tuple[str, ...]:
     candidates: list[str] = []
+    # BFL's native Flux3 package has a `dit` configuration instead of a
+    # Diffusers pipeline class. Identify it before the Qwen text component.
+    dit = metadata.get("dit")
+    if (
+        isinstance(dit, dict)
+        and metadata.get("model", "").startswith("flux-3-image")
+        and {"image", "image_cond", "text"} <= set(dit.get("in_channels", {}))
+    ):
+        _add_model_type(candidates, "flux3")
     _add_model_type(candidates, metadata.get("model_type"))
     candidates.extend(
         candidate
@@ -415,6 +429,12 @@ def _resolve_image_model_path(
     model_path = Path(model).expanduser()
     if model_path.exists():
         return model_path
+    if _model_type_from_id(model) == "flux3":
+        from ..models.flux3.download import download_model
+
+        # BFL keeps alternative CUDA quantizations in variants/. Fetch only
+        # the root package that this MLX implementation consumes.
+        return download_model(model, revision=revision, force_download=force_download)
     return get_model_path(
         model,
         revision=revision,
@@ -706,6 +726,10 @@ def run_image_generation_cli(args: Any) -> None:
             else Path("outputs") / f"edit-{seed}.png"
         )
         model = load_image_model(args.model, task="edit", **load_kwargs)
+        extra = dict(getattr(args, "gen_kwargs", {}) or {})
+        prompt_expansion_model = getattr(args, "prompt_expansion_model", None)
+        if prompt_expansion_model is not None:
+            extra["prompt_expansion_model"] = prompt_expansion_model
         request = ImageEditRequest(
             prompt=prompt,
             image_paths=tuple(args.image),
@@ -714,7 +738,7 @@ def run_image_generation_cli(args: Any) -> None:
             width=width,
             height=height,
             guidance=args.guidance,
-            extra=dict(getattr(args, "gen_kwargs", {}) or {}),
+            extra=extra,
         )
         result = generate_image(
             model,

@@ -24,6 +24,7 @@ from ..utils import (
     prepare_inputs,
     should_add_special_tokens,
 )
+from ..vision_cache import processed_image_key
 from .audio import generate_audio
 from .common import (
     DEFAULT_DIFFUSION_MAX_DENOISING_STEPS,
@@ -40,6 +41,7 @@ from .common import (
     DEFAULT_TOP_P,
     GenerationResult,
     generation_stream,
+    resolve_sampling_defaults,
     wired_limit,
 )
 from .image import DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_TASK, run_image_generation_cli
@@ -200,8 +202,8 @@ def parse_arguments():
         type=str,
         default=None,
         help=(
-            "Text model path or Hugging Face repo used to expand plain image "
-            "prompts into Ideogram 4 JSON captions."
+            "Prompt expansion model path or Hugging Face repo. Overrides the "
+            "Flux3 upsampler, or enables Ideogram 4 JSON caption expansion."
         ),
     )
     parser.add_argument(
@@ -388,21 +390,25 @@ def parse_arguments():
     parser.add_argument(
         "--temperature",
         type=float,
-        default=DEFAULT_TEMPERATURE,
-        help="Temperature for sampling. Zero is greedy; positive values below 0.01 are clamped to 0.01.",
+        default=None,
+        help="Temperature for sampling. Defaults to the checkpoint setting, "
+        f"or {DEFAULT_TEMPERATURE} if unset. Zero is greedy; positive values below "
+        "0.01 are clamped to 0.01.",
     )
     parser.add_argument(
         "--top-p",
         type=float,
-        default=DEFAULT_TOP_P,
+        default=None,
         help="Nucleus sampling: keep the smallest set of tokens whose "
-        "probabilities sum to this. 1.0 disables it.",
+        "probabilities sum to this. 1.0 disables it. Defaults to the checkpoint "
+        f"setting, or {DEFAULT_TOP_P} if unset.",
     )
     parser.add_argument(
         "--top-k",
         type=int,
-        default=DEFAULT_TOP_K,
-        help="Keep only the k most probable tokens. 0 disables it.",
+        default=None,
+        help="Keep only the k most probable tokens. 0 disables it. Defaults "
+        f"to the checkpoint setting, or {DEFAULT_TOP_K} if unset.",
     )
     parser.add_argument(
         "--min-p",
@@ -584,7 +590,7 @@ def parse_arguments():
         "--draft-model",
         type=str,
         default=None,
-        help="Speculative drafter path or HF id. Qwen3.5/3.6/3.8 checkpoints "
+        help="Speculative drafter path or HF id. Qwen3.5/3.6/3.8 and Nemotron checkpoints "
         "with bundled MTP weights can use the same path as --model.",
     )
     parser.add_argument(
@@ -859,6 +865,14 @@ def stream_generate(
     )
 
     if is_diffusion_model(model, kwargs):
+        kwargs["temperature"], kwargs["top_p"], kwargs["top_k"] = (
+            resolve_sampling_defaults(
+                model.config,
+                temperature=kwargs.get("temperature"),
+                top_p=kwargs.get("top_p"),
+                top_k=kwargs.get("top_k"),
+            )
+        )
         yield from stream_diffusion_generate_from_kwargs(
             model,
             processor,
@@ -875,18 +889,19 @@ def stream_generate(
 
     # Vision feature caching: reuse cached image features across turns
     if vision_cache is not None and image is not None and pixel_values is not None:
-        cached = vision_cache.get(image)
+        image_key = processed_image_key(pixel_values, **kwargs)
+        cached = vision_cache.get(image_key)
         if cached is not None:
             kwargs["cached_image_features"] = cached
         elif hasattr(model, "encode_images"):
             features = model.encode_images(pixel_values, **kwargs)
             mx.eval(*features)
-            vision_cache.put(image, features)
+            vision_cache.put(image_key, features)
             kwargs["cached_image_features"] = features
         elif hasattr(model, "encode_image"):
             features = model.encode_image(pixel_values)
             mx.eval(features)
-            vision_cache.put(image, features)
+            vision_cache.put(image_key, features)
             kwargs["cached_image_features"] = features
 
     # Prompt cache reuse: skip common prefix from previous turn
@@ -1197,7 +1212,9 @@ def generate(
        model (nn.Module): The language model.
        tokenizer (PreTrainedTokenizer): The tokenizer.
        prompt (str): The string prompt.
-       temperature (float): The temperature for sampling (default 0).
+       temperature (float, optional): Sampling temperature. Unset temperature,
+           top_p, and top_k use the checkpoint defaults, then 0.0, 1.0, and 0.
+           An explicit temperature overrides the checkpoint's do_sample flag.
        max_tokens (int): The maximum number of tokens (default 100).
        verbose (bool): If ``True``, print tokens and timing information
            (default ``False``).
@@ -1366,6 +1383,12 @@ def main():
         max_kv_size=args.max_kv_size,
     )
     config = model.config
+    args.temperature, args.top_p, args.top_k = resolve_sampling_defaults(
+        config,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
+    )
 
     draft_model = None
     if args.draft_model is not None:
