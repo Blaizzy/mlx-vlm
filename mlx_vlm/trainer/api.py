@@ -79,6 +79,8 @@ class Trainer:
             if not isinstance(args, config_type):
                 raise TypeError(f"{task}/{algorithm} expects {config_type.__name__}.")
             args.validate()
+            if algorithm != "sft" and args.mtp_loss_weight:
+                raise ValueError("mtp_loss_weight is currently supported only by SFT.")
             if not prepared and processing_class is None:
                 raise ValueError(f"{task} raw datasets require processing_class.")
             options = {}

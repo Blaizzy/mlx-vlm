@@ -40,6 +40,11 @@ def build_parser(task="vlm", algorithm=None):
     )
     parser.add_argument("-c", "--config")
     parser.add_argument("--model", "--model-path", help="Model path or Hub identifier.")
+    if algorithm == "sft":
+        parser.add_argument(
+            "--mtp-model",
+            help="Matching floating-point Qwen3.5 native checkpoint or split MTP head.",
+        )
     parser.add_argument(
         "--data", default="data", help="JSONL split folder, file, or Hub dataset."
     )
@@ -253,6 +258,18 @@ def run(args, settings, training_callback=None):
 
     mx.random.seed(args.seed)
     model, processor = _load_model(args.task, args.model)
+    if settings.mtp_loss_weight:
+        if args.algorithm != "sft":
+            raise ValueError("MTP training is currently supported only by SFT.")
+        if not args.mtp_model:
+            raise ValueError("--mtp-loss-weight requires --mtp-model.")
+        from .speculative.drafters import load_drafter
+        from .trainer.vlm.sft.mtp import attach_mtp_head
+
+        head, _ = load_drafter(args.mtp_model, kind="mtp")
+        attach_mtp_head(model, head)
+    elif getattr(args, "mtp_model", None):
+        raise ValueError("--mtp-model requires a positive --mtp-loss-weight.")
     reference = None
     if args.algorithm == "dpo" or (args.algorithm == "grpo" and settings.beta):
         reference, _ = _load_model(args.task, args.reference_model or args.model)
