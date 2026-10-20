@@ -42,6 +42,8 @@ from mlx_vlm.models.base import (
     LanguageModelOutput,
     _turboquant_attention_applies,
     align_attention_mask_to_scores,
+    cache_position_offset,
+    create_attention_mask,
     quantized_scaled_dot_product_attention,
     scaled_dot_product_attention,
 )
@@ -51,6 +53,7 @@ from mlx_vlm.models.cache import (
     BatchPoolingCache,
     BatchQuantizedKVCache,
     BatchRotatingKVCache,
+    BufferedRotatingKVCache,
     CacheList,
     ChunkedKVCache,
     KVCache,
@@ -689,6 +692,85 @@ def test_chunked_kv_cache_trims_on_valid_length_not_buffer_width():
     assert window[-1] == n_tokens - 1
     assert window == list(range(window[0], window[0] + len(window)))
     assert cache.start_position <= cache.offset
+
+
+@pytest.mark.parametrize("size", [2, 8, 255, 256, 257])
+@pytest.mark.parametrize("keep_kind", ["none", "prefix", "all_but_one"])
+def test_rotating_cache_visible_tokens(size, keep_kind):
+    keep = {"none": 0, "prefix": min(4, size - 1), "all_but_one": size - 1}[keep_kind]
+    cache = RotatingKVCache(size, keep)
+    retained, start = [], 0
+    # Exercise allocation, rotation, and concatenation in both directions.
+    for n in [1] * (size + 3) + [7, 1, size + 5, 1, 3]:
+        mask = cache.make_mask(n)
+        kv = mx.arange(start, start + n).reshape(1, 1, n, 1)
+        keys, _ = cache.update_and_fetch(kv, kv)
+        ids = keys[0, 0, :, 0].tolist()
+        rows = mask.tolist() if isinstance(mask, mx.array) else None
+        for row in range(n):
+            # Independent reference: evict the oldest token outside the prefix.
+            retained.append(start + row)
+            if len(retained) > size:
+                del retained[keep]
+            visible = [
+                token
+                for col, token in enumerate(ids)
+                if (token <= start + row if rows is None else rows[row][col])
+            ]
+            assert sorted(visible) == retained
+        start += n
+
+
+def test_rotating_cache_explicit_windows():
+    for keep, history, n, window, return_array in product(
+        [0, 1, 3], [0, 3, 4, 9], [2, 6], [1, 2, 3, 7], [False, True]
+    ):
+        cache = RotatingKVCache(4, keep)
+        kv = mx.zeros((1, 1, 1, 1))
+        for _ in range(history):
+            cache.update_and_fetch(kv, kv)
+        actual = cache.make_mask(n, window, return_array)
+        offset = min(3, history)
+        if offset + n > window or return_array:
+            expected = create_causal_mask(n, offset, window_size=window)
+            assert mx.array_equal(actual, expected)
+        else:
+            assert actual == "causal"
+
+
+@pytest.mark.parametrize("container", [None, list, tuple])
+def test_rotating_cache_mask_dispatch(container):
+    cache = RotatingKVCache(8, keep=2)
+    wrapped = container([cache]) if container in (list, tuple) else cache
+    mask = create_attention_mask(mx.zeros((1, 20, 8)), wrapped)
+    assert mask.shape == (20, 20)
+    assert mx.all(mask[2:, :2])
+    assert mask[-1].sum().item() == 8
+
+
+@pytest.mark.parametrize("kind", [KVCache, RotatingKVCache, BufferedRotatingKVCache])
+def test_cache_position_offset_is_absolute(kind):
+    cache = kind() if kind is KVCache else kind(8, keep=2)
+    for _ in range(21):
+        kv = mx.zeros((1, 1, 1, 8))
+        cache.update_and_fetch(kv, kv)
+    assert cache_position_offset(cache) == 21
+    if kind is not KVCache:
+        assert cache._idx != 21
+
+
+@pytest.mark.parametrize("rotating", [False, True])
+def test_cache_position_offset_includes_batch_padding(rotating):
+    cache = (
+        BatchRotatingKVCache(8, left_padding=[2, 3])
+        if rotating
+        else BatchKVCache(left_padding=[2, 3])
+    )
+    for _ in range(21):
+        kv = mx.zeros((2, 1, 1, 8))
+        cache.update_and_fetch(kv, kv)
+    assert cache_position_offset(cache) == 21
+    assert cache.offset.tolist() == [19, 18]
 
 
 @pytest.mark.parametrize("max_kv_size", [None, 1024])
