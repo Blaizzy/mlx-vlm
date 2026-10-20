@@ -6474,3 +6474,39 @@ def test_qwen3_5_attention_forwards_rope_parameters(omit_original_max):
         QWEN3_5_YARN_HF_ATTENTION_FACTOR, rel=1e-6
     )
     assert not rotary.fused_apply
+
+
+def test_qwen3_vl_embedding_does_not_reuse_earlier_position_ids():
+    import mlx_vlm.models.qwen3_vl_embedding as module
+
+    config = build_config(
+        module, model_case("TestGetInputEmbeddings.qwen3_vl_input_embeddings")["config"]
+    )
+    model = module.Model(config)
+    model.eval()
+    vc = config.vision_config
+    grid = [1, 4, 4]
+    count = math.prod(grid) // vc.spatial_merge_size**2
+    image_ids = mx.array(
+        [
+            [1, 2, config.vision_start_token_id]
+            + [config.image_token_id] * count
+            + [config.vision_end_token_id, 3]
+        ]
+    )
+    patch_width = vc.in_channels * vc.temporal_patch_size * vc.patch_size**2
+    image = dict(
+        pixel_values=mx.random.normal((math.prod(grid), patch_width)),
+        image_grid_thw=mx.array([grid]),
+    )
+    texts = mx.array([[0, 0, 5, 6, 7], [4, 5, 6, 7, 8]])
+    mask = mx.array([[0, 0, 1, 1, 1], [1, 1, 1, 1, 1]])
+
+    expected = model(texts, attention_mask=mask).text_embeds
+    for earlier in (
+        lambda: model(image_ids, **image),
+        lambda: model(mx.ones((1, 8), dtype=mx.int32)),
+    ):
+        earlier()
+        actual = model(texts, attention_mask=mask).text_embeds
+        np.testing.assert_allclose(np.array(actual), np.array(expected), atol=1e-5)
