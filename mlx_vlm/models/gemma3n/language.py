@@ -7,6 +7,7 @@ import mlx.nn as nn
 
 from ..base import (
     LanguageModelOutput,
+    cache_position_offset,
     create_attention_mask,
     kv_sequence_length,
     scaled_dot_product_attention,
@@ -487,28 +488,10 @@ class Gemma3Model(nn.Module):
                 target_len = h.shape[1]
 
             c0 = next(
-                (c for c in (cache or []) if c is not None and hasattr(c, "_idx")),
+                (c for c in (cache or []) if c is not None and hasattr(c, "offset")),
                 None,
             )
-            if c0 is not None:
-                cache_offset = int(c0._idx)
-            else:
-                raw_offset = next(
-                    (
-                        c.offset
-                        for c in (cache or [])
-                        if c is not None and hasattr(c, "offset")
-                    ),
-                    0,
-                )
-                if isinstance(raw_offset, mx.array):
-                    cache_offset = (
-                        int(raw_offset.max().item())
-                        if raw_offset.size > 1
-                        else int(raw_offset.item())
-                    )
-                else:
-                    cache_offset = int(raw_offset)
+            cache_offset = cache_position_offset(c0)
             max_start = max(per_layer_inputs.shape[1] - target_len, 0)
             start = min(cache_offset, max_start)
             per_layer_inputs = per_layer_inputs[:, start : start + target_len]
