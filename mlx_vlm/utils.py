@@ -356,6 +356,7 @@ def get_model_path(
                     "*.tiktoken",
                     "*.txt",
                     "*.jinja",
+                    "head.pt",  # Kev's pointer head
                 ],
                 force_download=force_download,
             )
@@ -960,6 +961,14 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
                 )
             with open(encoder_config_path, encoding="utf-8") as f:
                 config["encoder_config"] = json.load(f)
+
+    # Kev releases are Qwen3.5 text backbones with their pointer head saved
+    # beside them in head.pt.
+    if (
+        config.get("model_type") == "qwen3_5_text"
+        and (model_path / "head.pt").is_file()
+    ):
+        config["model_type"] = "kev"
 
     return config
 
