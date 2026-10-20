@@ -1,5 +1,5 @@
 import json
-from typing import Any
+from typing import Any, List, Optional
 
 import mlx.core as mx
 import numpy as np
@@ -119,6 +119,63 @@ class LLGuidanceLogitsProcessor:
             self._consume_tokens([last_token])
         return self._fill_next_token_mask()
 
+    def speculative_masks(
+        self, last_token: Optional[int], draft_tokens: List[int]
+    ) -> np.ndarray:
+        """Token masks for one speculative verify block.
+
+        ``last_token`` is the last emitted token, which the next ``__call__``
+        would consume (None when the grammar starts at this block). Returns
+        ``len(draft_tokens) + 1`` packed masks: row ``i`` is the mask after
+        ``draft_tokens[:i]``. The grammar decides how many drafts it allows;
+        the matcher consumes those to compute their masks, then rolls them
+        back, so it ends after ``last_token``. Rows after a draft the grammar
+        rejects allow every token: the verifier stops at that draft, so it
+        never emits a token from them. Once the value is complete, the
+        remaining rows allow only EOS, as decoding without drafts would.
+        """
+        import llguidance.numpy
+
+        if self.is_first_token:
+            self._setup(1)
+            self.is_first_token = False
+        elif last_token is not None:
+            self._consume_tokens([last_token])
+        matcher = self.ll_matchers[0]
+        masks = np.full(
+            (len(draft_tokens) + 1, (self.llg_tokenizer.vocab_size + 31) // 32),
+            -1,
+            dtype=np.int32,
+        )
+        allowed = matcher.validate_tokens(draft_tokens) if draft_tokens else 0
+        llguidance.numpy.fill_next_token_bitmask(matcher, masks, 0)
+        consumed = 0
+        # A stopped matcher allows only EOS and does not record consuming it,
+        # so a rollback would overshoot; nothing follows EOS anyway.
+        while consumed < allowed and not matcher.is_stopped():
+            if not matcher.consume_token(draft_tokens[consumed]):
+                raise ValueError(f"LLGuidance matcher error: {matcher.get_error()}")
+            consumed += 1
+            llguidance.numpy.fill_next_token_bitmask(matcher, masks, consumed)
+        if matcher.is_stopped():
+            masks[consumed + 1 :] = masks[consumed]
+        if consumed and not matcher.rollback(consumed):
+            raise ValueError(f"LLGuidance matcher error: {matcher.get_error()}")
+        return masks
+
+    def speculative_accept(self, tokens: List[int]) -> None:
+        """Consume the drafts a verify block accepted.
+
+        The block's last emitted token (the target's correction or bonus) is
+        not passed: it stays pending, as after a ``__call__``.
+        """
+        matcher = self.ll_matchers[0]
+        for token in tokens:
+            if matcher.is_stopped():
+                break
+            if not matcher.consume_token(token):
+                raise ValueError(f"LLGuidance matcher error: {matcher.get_error()}")
+
     def process_last_token(self, last_token: int, logits: mx.array) -> mx.array:
         if logits.ndim == 1:
             return self.process_last_token(last_token, mx.expand_dims(logits, 0))[0]
@@ -171,6 +228,9 @@ class ThinkingAwareLogitsProcessor:
         self.enable_thinking = enable_thinking
         self._active = not enable_thinking
         self._active_context: list[int] = []
+        # Row of the current speculative block where a drafted thinking end
+        # token activates the grammar, until the block's drafts are verified.
+        self._tentative_start: Optional[int] = None
 
         self.thinking_start_token_id = tokenizer.encode(
             thinking_start_token, add_special_tokens=False
@@ -196,7 +256,53 @@ class ThinkingAwareLogitsProcessor:
     def reset(self):
         self._active = not self.enable_thinking
         self._active_context = []
+        self._tentative_start = None
         if hasattr(self.processor, "reset"):
+            self.processor.reset()
+
+    @property
+    def supports_speculative_masks(self) -> bool:
+        return supports_speculative_masks(self.processor)
+
+    def speculative_masks(
+        self, last_token: Optional[int], draft_tokens: List[int]
+    ) -> Optional[np.ndarray]:
+        """Speculative block masks: none until the thinking end token.
+
+        Returns None for a block that is all thinking. When the end token is
+        one of the drafts, the grammar starts after it tentatively;
+        ``speculative_accept`` keeps or undoes that start.
+        """
+        self._tentative_start = None
+        if not self._active and last_token == self.thinking_end_token_id:
+            self._active = True
+            self._active_context = []
+            return self.processor.speculative_masks(None, draft_tokens)
+        if self._active:
+            return self.processor.speculative_masks(last_token, draft_tokens)
+        if self.thinking_end_token_id not in draft_tokens:
+            return None
+        start = draft_tokens.index(self.thinking_end_token_id) + 1
+        self._tentative_start = start
+        grammar_masks = self.processor.speculative_masks(None, draft_tokens[start:])
+        masks = np.full(
+            (len(draft_tokens) + 1, grammar_masks.shape[1]), -1, dtype=np.int32
+        )
+        masks[start:] = grammar_masks
+        return masks
+
+    def speculative_accept(self, tokens: List[int]) -> None:
+        start, self._tentative_start = self._tentative_start, None
+        if start is None:
+            if self._active:
+                self.processor.speculative_accept(tokens)
+            return
+        if len(tokens) >= start:
+            self._active = True
+            self._active_context = []
+            self.processor.speculative_accept(tokens[start:])
+        else:
+            # The drafted thinking end was rejected: the grammar has not started.
             self.processor.reset()
 
     def _activate_if_thinking_done(self, token_id: int) -> bool:
@@ -246,6 +352,28 @@ class ThinkingAwareLogitsProcessor:
             return self.processor(input_ids, logits)
 
         return logits
+
+
+def supports_speculative_masks(processor) -> bool:
+    """Whether a logits processor can mask speculative verify blocks."""
+    return callable(getattr(processor, "speculative_masks", None)) and bool(
+        getattr(processor, "supports_speculative_masks", True)
+    )
+
+
+def speculative_constraint(processors) -> Optional[Any]:
+    """The processor that constrains a request's speculative verify blocks.
+
+    Returns None when no processor of the request masks speculative blocks.
+    Processors without that support (penalties, logit bias) keep their
+    existing behavior under a drafter.
+    """
+    constraints = [p for p in processors or [] if supports_speculative_masks(p)]
+    if len(constraints) > 1:
+        raise ValueError(
+            "Speculative decoding supports one structured-output processor per request."
+        )
+    return constraints[0] if constraints else None
 
 
 def _serialize_schema(schema: str | dict[str, Any]) -> str:

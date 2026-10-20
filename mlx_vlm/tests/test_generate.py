@@ -1916,6 +1916,135 @@ def test_json_schema_processor_uses_compact_whitespace_pattern(monkeypatch):
     assert observed["schema_text"] == '{"type": "object"}'
 
 
+class ByteTokenizer:
+    """llguidance tokenizer: token ``i`` is the byte ``33 + i``, the last is EOS."""
+
+    def __init__(self, vocab_size=32):
+        self.tokens = [bytes([33 + i]) for i in range(vocab_size - 1)] + [b"<eos>"]
+        self.eos_token_id = vocab_size - 1
+        self.bos_token_id = None
+        self.special_token_ids = [vocab_size - 1]
+
+    def __call__(self, text):
+        return [byte - 33 for byte in text]
+
+
+def regex_processor(pattern):
+    """A real llguidance processor; ``[!-%]`` is tokens 0-4, ``[&-*]`` 5-9."""
+    import llguidance as llg
+
+    tokenizer = llg.LLTokenizer(llg.TokenizerWrapper(ByteTokenizer()))
+    return structured.LLGuidanceLogitsProcessor(
+        llg.grammar_from("regex", pattern), tokenizer
+    )
+
+
+def reference_masks(pattern, consumed, drafts):
+    """Masks after ``consumed`` and each draft prefix, from a fresh matcher."""
+    import llguidance.numpy
+
+    processor = regex_processor(pattern)
+    processor._setup(1)
+    matcher = processor.ll_matchers[0]
+    assert matcher.consume_tokens(consumed)
+    masks = np.zeros((len(drafts) + 1, 1), dtype=np.int32)
+    llguidance.numpy.fill_next_token_bitmask(matcher, masks, 0)
+    for i, token in enumerate(drafts):
+        assert matcher.consume_token(token)
+        llguidance.numpy.fill_next_token_bitmask(matcher, masks, i + 1)
+    return masks
+
+
+def start_grammar(processor, first_token):
+    """Sample ``first_token`` from the prompt step; it stays pending."""
+    mx.eval(processor(mx.array([20]), mx.zeros((1, 32))))
+    return first_token
+
+
+def test_speculative_masks_cut_at_rejected_draft_and_roll_back():
+    pattern = "(?:[!-%][&-*]){3}"
+    processor = regex_processor(pattern)
+    last = start_grammar(processor, 1)
+    # 6 and 2 follow the grammar; 20 cannot, so 3 is never masked for.
+    masks = processor.speculative_masks(last, [6, 2, 20, 3])
+    np.testing.assert_array_equal(masks[:3], reference_masks(pattern, [1], [6, 2]))
+    np.testing.assert_array_equal(masks[3:], np.full((2, 1), -1, np.int32))
+
+    # The verifier accepted 6, then picked 3 instead of 2: 6 is consumed and 3
+    # stays pending until the next step consumes it.
+    processor.speculative_accept([6])
+    out = processor(mx.array([20, 1, 6, 3]), mx.zeros((1, 32)))
+    expected = reference_masks(pattern, [1, 6, 3], [])[0, 0]
+    allowed = [i for i in range(32) if (int(expected) >> i) & 1]
+    assert [i for i, x in enumerate(out[0].tolist()) if x == 0] == allowed
+    assert allowed == [5, 6, 7, 8, 9]
+
+
+def test_speculative_masks_stop_after_the_value():
+    processor = regex_processor("[!-%]{2}")
+    last = start_grammar(processor, 0)
+    # The value ends after 1: only EOS (31) may follow, as after it.
+    masks = processor.speculative_masks(last, [1, 31, 2])
+    assert masks[1].view(np.uint32)[0] == 1 << 31
+    np.testing.assert_array_equal(masks[2:], masks[[1, 1]])
+    processor.speculative_accept([1, 31, 2])
+    matcher = processor.ll_matchers[0]
+    assert matcher.is_accepting() and not matcher.is_error()
+    # The matcher holds the two emitted tokens, not EOS or what follows it.
+    assert matcher.rollback(2)
+    np.testing.assert_array_equal(
+        processor.speculative_masks(None, [])[:1],
+        reference_masks("[!-%]{2}", [], []),
+    )
+
+
+@pytest.mark.parametrize("end_accepted", [False, True])
+def test_thinking_processor_starts_grammar_at_drafted_thinking_end(end_accepted):
+    pattern = "(?:[!-%][&-*]){3}"
+    processor = ThinkingAwareLogitsProcessor(
+        regex_processor(pattern), FakeTokenizer(), enable_thinking=True
+    )
+    assert structured.speculative_constraint([processor]) is processor
+    # Thinking (3), then the end token (100), then the grammar's first tokens.
+    masks = processor.speculative_masks(11, [3, 100, 1, 6])
+    np.testing.assert_array_equal(masks[:2], np.full((2, 1), -1, np.int32))
+    np.testing.assert_array_equal(masks[2:], reference_masks(pattern, [], [1, 6]))
+
+    if not end_accepted:
+        # The verifier rejected the end token: the grammar has not started.
+        processor.speculative_accept([3])
+        assert processor.speculative_masks(4, [5, 6]) is None
+        processor.speculative_accept([])
+        assert not processor._active
+        return
+    # Accepted through 1, then the verifier picked 7 (pending).
+    processor.speculative_accept([3, 100, 1])
+    assert processor._active
+    masks = processor.speculative_masks(7, [2])
+    np.testing.assert_array_equal(masks, reference_masks(pattern, [1, 7], [2]))
+
+
+def test_thinking_processor_starts_grammar_after_emitted_thinking_end():
+    pattern = "(?:[!-%][&-*]){3}"
+    processor = ThinkingAwareLogitsProcessor(
+        regex_processor(pattern), FakeTokenizer(), enable_thinking=True
+    )
+    masks = processor.speculative_masks(100, [1, 20])
+    np.testing.assert_array_equal(masks[:2], reference_masks(pattern, [], [1]))
+    assert masks[2, 0] == -1 and processor._active
+
+
+def test_speculative_constraint_selects_structured_processor():
+    plain = lambda tokens, logits: logits
+    grammar = regex_processor("[!-%]")
+    assert structured.speculative_constraint([plain]) is None
+    assert structured.speculative_constraint([plain, grammar]) is grammar
+    with pytest.raises(ValueError, match="one structured-output processor"):
+        structured.speculative_constraint([grammar, regex_processor("[!-%]")])
+    wrapped = ThinkingAwareLogitsProcessor(plain, FakeTokenizer())
+    assert not structured.supports_speculative_masks(wrapped)
+
+
 def _np_p_less_keep(logits, temp):
     z = np.asarray(logits, dtype=np.float64) / temp
     z = z - z.max()
