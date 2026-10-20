@@ -197,7 +197,9 @@ class Qwen3_5MTPDraftModel(nn.Module):
             mx.bool_
         )
         # Finite masking also keeps entirely padded query rows well-defined.
-        mask = mx.where(valid, mx.array(0, hidden.dtype), mx.array(-1e9, mx.float32))
+        mask = mx.where(
+            valid, mx.array(0, hidden.dtype), mx.array(-1e9, hidden.dtype)
+        )
         h = self._forward_hidden(
             token_embed,
             hidden,

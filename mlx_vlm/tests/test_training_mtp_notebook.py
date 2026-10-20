@@ -1,4 +1,4 @@
-"""Execute native MTP notebook cells with a frozen tiny MLX target."""
+"""Execute native MTP notebook cells with LoRA, full, and frozen targets."""
 
 import ast
 import json
@@ -27,7 +27,8 @@ STANDARD_NOTEBOOKS = (
 )
 
 
-def test_mtp_notebook_trains_only_head_reloads_and_exports(tmp_path):
+@pytest.mark.parametrize("train_type", ["lora", "full", "head"])
+def test_mtp_notebook_trains_reloads_and_exports(tmp_path, train_type):
     document = json.loads((NOTEBOOKS / "sft_mtp.ipynb").read_text())
     namespace = {"__name__": "__notebook__"}
     rows = Dataset.from_dict(
@@ -58,6 +59,11 @@ def test_mtp_notebook_trains_only_head_reloads_and_exports(tmp_path):
         # Exercise the real local export loader, not a replacement artifact.
         return load_drafter(path, **kwargs)
 
+    def load_target(*args, **kwargs):
+        fresh = tiny_model()
+        del fresh["mtp_head"]
+        return fresh, processor
+
     def template(*args, add_generation_prompt=False, **kwargs):
         return "prefix" if add_generation_prompt else "full"
 
@@ -66,7 +72,7 @@ def test_mtp_notebook_trains_only_head_reloads_and_exports(tmp_path):
         return {"input_ids": np.array([ids], dtype=np.int32)}
 
     with (
-        patch("mlx_vlm.load", return_value=(target, processor)),
+        patch("mlx_vlm.load", side_effect=load_target),
         patch("datasets.load_dataset", return_value=rows),
         patch("mlx_vlm.speculative.drafters.load_drafter", side_effect=drafter),
         patch("mlx_vlm.prompt_utils.apply_chat_template", side_effect=template),
@@ -82,6 +88,7 @@ def test_mtp_notebook_trains_only_head_reloads_and_exports(tmp_path):
             ast.parse(source)
             exec(compile(source, f"sft_mtp:cell:{index}", "exec"), namespace)
             if "MODEL_ID =" in source:
+                namespace["TRAIN_TYPE"] = train_type
                 namespace["OUTPUT_DIR"] = tmp_path
                 namespace["EXPORT_DIR"] = tmp_path / "mtp_drafter"
                 namespace["args"] = replace(
@@ -95,18 +102,41 @@ def test_mtp_notebook_trains_only_head_reloads_and_exports(tmp_path):
                     steps_per_save=2,
                     adapter_file=str(tmp_path / "weights.safetensors"),
                 )
+    target = namespace["model"]
     after = dict(tree_flatten(target.parameters()))
-    for key, value in base_before.items():
-        np.testing.assert_array_equal(np.array(value), np.array(after[key]))
+    if train_type == "full":
+        assert any(
+            not np.array_equal(np.array(value), np.array(after[key]))
+            for key, value in base_before.items()
+        )
+    else:
+        for key, value in base_before.items():
+            # LoRA wraps each adapted linear under its `linear` child.
+            adapted_key = key
+            if key not in after:
+                prefix, suffix = key.rsplit(".", 1)
+                adapted_key = f"{prefix}.linear.{suffix}"
+            np.testing.assert_array_equal(
+                np.array(value), np.array(after[adapted_key])
+            )
+    if train_type == "lora":
+        assert any(
+            key.endswith("lora_b") and mx.abs(value).sum().item() > 0
+            for key, value in after.items()
+        )
     assert mx.abs(target.mtp_head.fc.weight - before).sum().item() > 0
     assert namespace["validation"]["val_num_mtp_tokens"] > 0
     assert namespace["exported_kind"] == "mtp"
     config = json.loads((tmp_path / "mtp_drafter/config.json").read_text())
     assert config["model_type"] == "qwen3_5_mtp"
     assert config["text_config"]["mtp_num_hidden_layers"] == 1
-    assert json.loads((tmp_path / "mtp_drafter/training_info.json").read_text())[
-        "head_only"
-    ]
+    restored = dict(tree_flatten(namespace["reloaded_model"].parameters()))
+    for key, value in after.items():
+        np.testing.assert_array_equal(np.array(value), np.array(restored[key]))
+    info = json.loads((tmp_path / "mtp_drafter/training_info.json").read_text())
+    assert info["head_only"] == (train_type == "head")
+    assert info["train_type"] == train_type
+    assert bool(info["target_checkpoint"]) == (train_type != "head")
 
 
 @pytest.mark.parametrize("notebook", (*STANDARD_NOTEBOOKS, "custom_loss"))

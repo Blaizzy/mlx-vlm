@@ -212,6 +212,37 @@ def test_full_checkpoint_restores_head_with_base(tmp_path):
     )
 
 
+@pytest.mark.parametrize("moe,tied", [(False, False), (False, True), (True, False)])
+def test_full_mtp_gradients_update_target_and_head(moe, tied):
+    import mlx.optimizers as optim
+
+    from mlx_vlm.trainer.vlm.sft.mtp import vlm_mtp_loss
+
+    model = prepare_model_for_training(
+        tiny_model(moe=moe, tied=tied), train_type="full", verbose=False
+    )
+    # Isolate the auxiliary loss so base SFT gradients cannot hide a detached
+    # hidden state or frozen shared embedding/output projection.
+    (_, _), gradients = nn.value_and_grad(model, vlm_mtp_loss)(model, batch())
+    flat = dict(tree_flatten(gradients))
+    for name in (
+        "mtp_head.fc.weight",
+        "language_model.model.embed_tokens.weight",
+        "language_model.model.layers.0.self_attn.q_proj.weight",
+    ):
+        assert mx.abs(flat[name]).sum().item() > 0
+    if not tied:
+        assert mx.abs(flat["language_model.lm_head.weight"]).sum().item() > 0
+    before = dict(tree_flatten(model.parameters()))
+    mx.eval(before)
+    optimizer = optim.Adam(learning_rate=0.001)
+    optimizer.update(model, gradients)
+    mx.eval(model.parameters(), optimizer.state)
+    after = dict(tree_flatten(model.parameters()))
+    for name in ("mtp_head.fc.weight", "language_model.model.embed_tokens.weight"):
+        assert mx.abs(after[name] - before[name]).sum().item() > 0
+
+
 def test_legacy_loss_uses_same_mtp_objective():
     from mlx_vlm.trainer.vlm.sft.trainer import vision_language_loss_fn
 
