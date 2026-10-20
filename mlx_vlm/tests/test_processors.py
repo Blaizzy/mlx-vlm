@@ -1595,6 +1595,18 @@ class TestDiffusionGemma4Processor:
         assert mx.all(pixels[:2] == 0).item() and mx.all(pixels[2] == 1).item()
 
 
+@pytest.mark.parametrize("template", [None, "{{ messages }}"])
+def test_gemma4_falls_back_to_bundled_chat_template(tmp_path, template):
+    tok = ProcessorTokenizer(chat_template=template)
+    with patch("transformers.AutoTokenizer.from_pretrained", return_value=tok):
+        p = c.g4.from_pretrained(tmp_path)
+    if template is None:
+        assert "<|turn>" in p.chat_template
+    else:
+        assert p.chat_template == template
+    assert p.tokenizer.chat_template == p.chat_template
+
+
 @pytest.mark.parametrize("name", DATA["checkpoints"])
 def test_checkpoint_loading(tmp_path, name):
     _write_configs(tmp_path, **DATA["checkpoints"][name])
