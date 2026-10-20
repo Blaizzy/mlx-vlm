@@ -15,7 +15,7 @@ callbacks, and MLX engine as the Python API. VLM SFT, ORPO, DPO, and GRPO are su
 Start with one of the standalone notebooks:
 
 - [SFT](../examples/training/sft_text_only.ipynb): text-only JOSIE instruction training.
-- [Native MTP SFT](../examples/training/sft_mtp.ipynb): train only the native head against assistant responses, reload checkpoints, and export a standalone drafter.
+- [Native MTP SFT](../examples/training/sft_mtp.ipynb): train Qwen3.5 LoRA adapters and its native head together, reload checkpoints, and export a standalone drafter; full and frozen-target training are also available.
 - [LaTeX OCR SFT](../examples/training/sft_vison_text.ipynb): map Hugging Face `image`/`text` rows into messages and preprocess with `VisionDataset`.
 - [ORPO](../examples/training/orpo.ipynb): chosen/rejected responses without a reference model.
 - [DPO](../examples/training/dpo.ipynb): chosen/rejected responses with a separate frozen reference.
@@ -143,6 +143,25 @@ validates Qwen3.5 heads only.
 
 For `train_type="full"`, attach the head before preparing the model so strict
 full-checkpoint loading can restore it with the base. The CLI handles this order.
+This trains all target weights and the MTP head together. The MTP objective also
+backpropagates through the target hidden states and shared embeddings/output
+projection. Full training requires floating-point weights and more memory;
+preparation dequantizes packed target weights if necessary.
+
+```python
+head, _ = load_drafter("/path/to/matching-mtp", kind="mtp")
+attach_mtp_head(model, head)
+model = prepare_model_for_training(
+    model, train_type="full", checkpoint_path=None,
+)
+args = VLMTrainingArgs(mtp_loss_weight=0.3, train_on_completions=True)
+# Pass model and args to Trainer with an explicit optimizer.
+```
+
+For the CLI recipe above, add `--train-type full`. Full checkpoints contain both
+target and `mtp_head.*` weights. Resume with the same model/head configuration
+and `--resume-adapter-file`. A separately exported head must be paired with the
+fine-tuned target, including its updated shared embeddings and output projection.
 
 ## Training and validation metrics
 
