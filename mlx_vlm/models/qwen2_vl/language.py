@@ -32,7 +32,6 @@ class Qwen2RotaryEmbedding(MRoPERotaryEmbedding):
             rope_scaling=rope_scaling,
             style="chunked",
         )
-        self.attention_scaling = 1.0  # type: default
 
 
 def apply_multimodal_rotary_pos_emb(q, k, cos, sin, unqueeze_dim=1):

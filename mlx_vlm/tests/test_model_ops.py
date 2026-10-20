@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import importlib
 import json
+import math
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
@@ -900,6 +901,154 @@ def test_selected_frequency_fast_path_matches_layout_helper(style, expected_sele
 
     mx.eval(fast, layout)
     assert _max_diff(fast, layout) < 1e-4
+
+
+# (rotary dim, rope_theta, max_position_embeddings, rope config). The Qwen2.5-VL
+# and Qwen3.5 overrides are from their model cards; the last case sets the
+# optional beta and mscale knobs.
+YARN_CASES = {
+    "qwen2_5_vl": (
+        128,
+        1_000_000.0,
+        128_000,
+        {
+            "type": "yarn",
+            "mrope_section": [16, 24, 24],
+            "factor": 4,
+            "original_max_position_embeddings": 32_768,
+        },
+    ),
+    "qwen3_5": (
+        64,
+        10_000_000.0,
+        1_048_576,
+        {
+            "rope_type": "yarn",
+            "mrope_section": [11, 11, 10],
+            "mrope_interleaved": True,
+            "rope_theta": 10_000_000.0,
+            "partial_rotary_factor": 0.25,
+            "factor": 4.0,
+            "original_max_position_embeddings": 262_144,
+        },
+    ),
+    "beta_and_mscale": (
+        64,
+        10_000.0,
+        32_768,
+        {
+            "type": "yarn",
+            "mrope_section": [16, 8, 8],
+            "factor": 8.0,
+            "original_max_position_embeddings": 4_096,
+            "beta_fast": 16,
+            "beta_slow": 2,
+            "mscale": 1.0,
+            "mscale_all_dim": 0.8,
+        },
+    ),
+}
+
+
+def _yarn_rotary(name):
+    dim, base, max_positions, rope = YARN_CASES[name]
+    return MRoPERotaryEmbedding(
+        dim, max_positions, base, rope_parameters=copy.deepcopy(rope)
+    )
+
+
+@pytest.mark.parametrize("name", YARN_CASES)
+def test_mrope_yarn_matches_transformers_rope_init(name):
+    pytest.importorskip("torch")
+    try:
+        from transformers import PretrainedConfig
+        from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+    except Exception as exc:
+        pytest.skip(f"Transformers rope init unavailable: {exc}")
+
+    dim, base, max_positions, rope = YARN_CASES[name]
+    # MRoPE gets the rotary dim directly, so hand transformers the same dim.
+    hf_rope = {
+        key: value
+        for key, value in rope.items()
+        if not key.startswith("mrope") and key != "partial_rotary_factor"
+    }
+    config = PretrainedConfig(
+        hidden_size=dim,
+        num_attention_heads=1,
+        head_dim=dim,
+        max_position_embeddings=max_positions,
+        rope_parameters={**hf_rope, "rope_theta": base},
+    )
+    expected_inv_freq, expected_scaling = ROPE_INIT_FUNCTIONS["yarn"](config)
+
+    rotary = _yarn_rotary(name)
+    np.testing.assert_allclose(
+        np.array(rotary.inv_freq), expected_inv_freq.numpy(), rtol=1e-6, atol=0
+    )
+    assert rotary.attention_scaling == pytest.approx(expected_scaling, rel=1e-12)
+
+
+@pytest.mark.parametrize("name", ["qwen2_5_vl", "qwen3_5"])
+def test_mrope_yarn_stretches_only_low_frequencies(name):
+    dim, base, _, rope = YARN_CASES[name]
+    rotary = _yarn_rotary(name)
+    stretch = (rope_utils.compute_inv_freq(dim, base) / rotary.inv_freq).tolist()
+
+    # Fast-rotating dims keep their period, slow ones are stretched by the
+    # full factor, and the ramp in between never goes backwards.
+    assert stretch[0] == pytest.approx(1.0, rel=1e-6)
+    assert stretch[-1] == pytest.approx(rope["factor"], rel=1e-6)
+    assert all(b >= a * (1 - 1e-6) for a, b in zip(stretch, stretch[1:]))
+    assert rotary.attention_scaling == pytest.approx(
+        0.1 * math.log(rope["factor"]) + 1.0
+    )
+
+
+def test_mrope_llama3_scaling_goes_through_initialize_rope():
+    rope = {"type": "llama3", "factor": 8.0, "mrope_section": [16, 8, 8]}
+    rotary = MRoPERotaryEmbedding(64, 8192, 500_000.0, rope_scaling=rope)
+    stretch = (rope_utils.compute_inv_freq(64, 500_000.0) / rotary.inv_freq).tolist()
+
+    assert stretch[0] == pytest.approx(1.0)
+    assert stretch[-1] == pytest.approx(8.0)
+    assert rotary.attention_scaling == 1.0
+
+
+def test_mrope_default_rope_keeps_plain_frequencies_and_fused_kernel(monkeypatch):
+    monkeypatch.setattr(rope_utils, "_HAS_METAL", True)
+    rotary = MRoPERotaryEmbedding(
+        8, rope_scaling={"type": "default", "mrope_section": [2, 1, 1]}
+    )
+
+    assert mx.array_equal(rotary.inv_freq, rope_utils.compute_inv_freq(8, 10000)).item()
+    assert rotary.attention_scaling == 1.0
+    assert rotary.fused_apply
+
+
+def test_mrope_yarn_scales_rotation_outside_fused_kernel(monkeypatch):
+    dim = YARN_CASES["qwen3_5"][0]
+    with monkeypatch.context() as metal:
+        # Built as on Apple silicon; no kernel runs in this block.
+        metal.setattr(rope_utils, "_HAS_METAL", True)
+        yarn = _yarn_rotary("qwen3_5")
+    assert not yarn.fused_apply
+
+    mx.random.seed(0)
+    q = mx.random.normal((1, 2, 5, dim + 16))
+    k = mx.random.normal((1, 1, 5, dim + 16))
+    position_ids = _position_ids(batch=1, seq_len=5) * 50_000
+    q_out, k_out = yarn.apply_rotary(q, k, position_ids)
+
+    # A rotation keeps the length of every (i, i + dim/2) pair, so the only
+    # length change is YaRN's attention scaling. Pass-through dims are as-is.
+    def pair_norm(x):
+        return mx.sqrt(x[..., : dim // 2] ** 2 + x[..., dim // 2 : dim] ** 2)
+
+    for x, out in ((q, q_out), (k, k_out)):
+        scale = pair_norm(out) / pair_norm(x)
+        assert mx.allclose(scale, mx.array(yarn.attention_scaling), rtol=1e-5).item()
+        assert mx.array_equal(out[..., dim:], x[..., dim:]).item()
 
 
 def _build_on_worker(factory):

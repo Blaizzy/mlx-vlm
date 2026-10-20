@@ -397,6 +397,12 @@ class ProportionalRoPE(nn.Module):
         )
 
 
+def _rope_type(scaling_config: Optional[dict]) -> str:
+    if not scaling_config:
+        return "default"
+    return scaling_config.get("type") or scaling_config.get("rope_type", "default")
+
+
 def initialize_rope(
     dims,
     base,
@@ -406,12 +412,7 @@ def initialize_rope(
     implementation: str = "fast",
     original_max_position_embeddings: Optional[int] = None,
 ):
-    if scaling_config is not None:
-        rope_type = scaling_config.get("type") or scaling_config.get(
-            "rope_type", "default"
-        )
-    else:
-        rope_type = "default"
+    rope_type = _rope_type(scaling_config)
 
     if implementation not in ("fast", "eager"):
         raise ValueError(f"Unsupported RoPE implementation {implementation}")
@@ -1181,7 +1182,28 @@ class MRoPERotaryEmbedding(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.base = base
         self.style = style
-        self._inv_freq = compute_inv_freq(dim, base)
+        rope_config = rope_parameters or rope_scaling
+        rope = None
+        if _rope_type(rope_config) not in ("default", "mrope"):
+            # Scaled types reuse the same RoPE the 1D models get. Like
+            # transformers, fall back to max_position_embeddings for the
+            # pretraining length.
+            rope = initialize_rope(
+                dim,
+                base,
+                traditional=False,
+                scaling_config={
+                    "original_max_position_embeddings": max_position_embeddings,
+                    **rope_config,
+                },
+                max_position_embeddings=max_position_embeddings,
+            )
+        freqs = getattr(rope, "_freqs", None)
+        if freqs is None:
+            self._inv_freq = compute_inv_freq(dim, base)
+        else:
+            self._inv_freq = 1.0 / freqs
+            attention_scaling *= getattr(rope, "mscale", 1.0)
         self.attention_scaling = attention_scaling
         self.cast_output = cast_output
         self._mrope_section = list(
@@ -1201,7 +1223,13 @@ class MRoPERotaryEmbedding(nn.Module):
         else:
             self._position_selector = None
         self.pairing = _pairing_for_style(style)
-        self.fused_apply = self.position_selector is not None and _HAS_METAL
+        # The fused kernel only takes inv_freq, so a scaled rotary (YaRN) uses
+        # the cos/sin path, which applies attention_scaling.
+        self.fused_apply = (
+            self.position_selector is not None
+            and _HAS_METAL
+            and self.attention_scaling == 1.0
+        )
         self._compiled_apply = {} if self.fused_apply else None
         self.eval_cached_arrays()
 

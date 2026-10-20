@@ -1965,6 +1965,87 @@ def test_qwen3_omni_rope_delta_ignores_batch_padding():
     assert rope_deltas.tolist() == [[0], [0]]
 
 
+# YaRN long-context overrides on the shared MRoPE rotary
+
+
+@pytest.mark.parametrize(
+    ("case_id", "rope_key"),
+    [
+        ("TestGetInputEmbeddings.qwen2_vl_input_embeddings", "rope_scaling"),
+        ("TestGetInputEmbeddings.qwen2_5_vl_input_embeddings", "rope_scaling"),
+        ("TestGetInputEmbeddings.qwen3_vl_input_embeddings", "rope_scaling"),
+        ("TestGetInputEmbeddings.qwen3_vl_moe_input_embeddings", "rope_scaling"),
+        ("TestGetInputEmbeddings.qwen3_omni_moe_input_embeddings", "rope_scaling"),
+        ("qwen3_5", "rope_parameters"),
+        ("qwen3_5_moe", "rope_parameters"),
+    ],
+)
+def test_mrope_models_take_yarn_from_the_text_config(case_id, rope_key):
+    from mlx_vlm.models.rope_utils import MRoPERotaryEmbedding
+
+    case = next(case for case in DATA["cases"] if case["id"] == case_id)
+    module = importlib.import_module("mlx_vlm.models." + case["module"])
+    config = copy.deepcopy(case["config"])
+    text = config.get("thinker_config", config)["text_config"]
+    rope = {
+        key: value
+        for key, value in (text.get(rope_key) or {}).items()
+        if key not in ("type", "rope_type")
+    }
+    text[rope_key] = rope | {
+        "type": "yarn",
+        "factor": 4.0,
+        "original_max_position_embeddings": 32,
+    }
+    model = module.Model(build_config(module, config))
+
+    rotaries = [
+        layer
+        for _, layer in model.named_modules()
+        if isinstance(layer, MRoPERotaryEmbedding)
+    ]
+    assert rotaries
+    for rotary in rotaries:
+        assert rotary.attention_scaling == pytest.approx(1 + 0.1 * math.log(4))
+
+
+def test_qwen2_5_vl_checkpoint_with_yarn_override_loads(tmp_path):
+    from mlx_vlm.models import qwen2_5_vl
+
+    case = next(
+        case
+        for case in DATA["cases"]
+        if case["id"] == "TestGetInputEmbeddings.qwen2_5_vl_input_embeddings"
+    )
+    model = qwen2_5_vl.Model(build_config(qwen2_5_vl, case["config"]))
+    mx.save_safetensors(
+        str(tmp_path / "model.safetensors"),
+        dict(tree_flatten(model.parameters())),
+        metadata={"format": "mlx"},
+    )
+
+    # Qwen2.5-VL's config.json keeps the text fields at the top level. The
+    # rope_scaling below is the model card's override for inputs past 32k.
+    config = copy.deepcopy(case["config"])
+    config.update(config.pop("text_config"))
+    config["max_position_embeddings"] = 128000
+    config["rope_scaling"] = {
+        "type": "yarn",
+        "mrope_section": [2, 1, 1],
+        "factor": 4,
+        "original_max_position_embeddings": 32768,
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    model = load_model(tmp_path)
+
+    rotary = model.language_model.model.layers[0].self_attn.rotary_emb
+    assert rotary.attention_scaling == pytest.approx(1 + 0.1 * math.log(4))
+    logits = model.language_model(mx.array([[1, 2, 3, 4]])).logits
+    assert logits.shape == (1, 4, config["vocab_size"])
+    assert mx.isfinite(logits).all().item()
+
+
 # Patch embedding layouts
 
 
