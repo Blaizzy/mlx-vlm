@@ -652,6 +652,125 @@ class TestBatchGenerator:
         assert closed == [True]
         assert batch.next() == []
 
+    def test_speculative_generation_batch_logprobs(self, monkeypatch):
+        def fake_rounds(*args, **kwargs):
+            del args
+            assert kwargs["want_logprobs"] is True
+            assert kwargs["top_logprobs_k"] == 2
+            yield [1, 10], {
+                "round_pos": 0,
+                "round_len": 2,
+                "token_logprobs": [
+                    (-0.5, [(1, -0.5), (7, -1.0)]),
+                    (-2.0, [(10, -2.0), (3, -2.5)]),
+                ],
+            }
+            yield [2, 11], {
+                "round_pos": 1,
+                "round_len": 2,
+                "token_logprobs": [(-0.25, [(2, -0.25), (1, -0.6)]), None],
+            }
+            yield [3, 12], {"round_pos": 0, "round_len": 1}
+
+        monkeypatch.setattr(ar_module, "run_speculative_server_rounds", fake_rounds)
+
+        batch = SpeculativeGenerationBatch(
+            model=SimpleNamespace(),
+            draft_model=SimpleNamespace(),
+            draft_kind="mtp",
+            uids=[100, 200],
+            first_tokens=mx.array([0, 9], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            stop_criteria=lambda token: False,
+            max_tokens=[10, 10],
+            hidden=mx.zeros((2, 1, 1)),
+            shared_kv_states=None,
+            prompt_tokens=mx.array([[0], [9]], dtype=mx.int32),
+            compute_logprobs=True,
+            top_logprobs_k=2,
+            first_token_logprobs=mx.array([-0.7, -1.3]),
+            first_top_idx=mx.array([[0, 5], [9, 2]], dtype=mx.int32),
+            first_top_lp=mx.array([[-0.7, -1.8], [-1.3, -2.2]]),
+        )
+        assert batch.compute_logprobs is True
+
+        first = batch.next()
+        assert [(r.uid, r.token) for r in first] == [(100, 0), (200, 9)]
+        assert first[0].token_logprob == pytest.approx(-0.7)
+        assert first[1].token_logprob == pytest.approx(-1.3)
+        assert first[0].top_logprobs == [
+            (0, pytest.approx(-0.7)),
+            (5, pytest.approx(-1.8)),
+        ]
+        assert first[1].top_logprobs == [
+            (9, pytest.approx(-1.3)),
+            (2, pytest.approx(-2.2)),
+        ]
+
+        second = batch.next()
+        assert [(r.uid, r.token) for r in second] == [
+            (100, 1),
+            (200, 10),
+            (100, 2),
+            (200, 11),
+        ]
+        assert [r.token_logprob for r in second] == pytest.approx(
+            [-0.5, -2.0, -0.25, 0.0]
+        )
+        assert second[0].top_logprobs == [
+            (1, pytest.approx(-0.5)),
+            (7, pytest.approx(-1.0)),
+        ]
+        assert second[1].top_logprobs == [
+            (10, pytest.approx(-2.0)),
+            (3, pytest.approx(-2.5)),
+        ]
+        assert second[2].top_logprobs == [
+            (2, pytest.approx(-0.25)),
+            (1, pytest.approx(-0.6)),
+        ]
+        assert second[3].top_logprobs is None
+
+        # Round meta without "token_logprobs" still emits tokens.
+        third = batch.next()
+        assert [(r.uid, r.token, r.token_logprob) for r in third] == [
+            (100, 3, 0.0),
+            (200, 12, 0.0),
+        ]
+
+    def test_speculative_generation_batch_logprobs_mtp_only(self, monkeypatch):
+        seen = {}
+
+        def fake_rounds(*args, **kwargs):
+            del args
+            seen.update(kwargs)
+            yield [1], {"round_pos": 0, "round_len": 1}
+
+        monkeypatch.setattr(ar_module, "run_speculative_server_rounds", fake_rounds)
+
+        batch = SpeculativeGenerationBatch(
+            model=SimpleNamespace(),
+            draft_model=SimpleNamespace(),
+            draft_kind="eagle3",
+            uids=[100],
+            first_tokens=mx.array([0], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            stop_criteria=lambda token: False,
+            max_tokens=[10],
+            hidden=mx.zeros((1, 1, 1)),
+            shared_kv_states=None,
+            prompt_tokens=mx.array([[0]], dtype=mx.int32),
+            compute_logprobs=True,
+            top_logprobs_k=2,
+        )
+        assert batch.compute_logprobs is False
+        batch.next()
+        batch.next()
+        assert seen["want_logprobs"] is False
+        assert seen["top_logprobs_k"] == 0
+
     def test_generation_batch_extend_expands_compact_processor_state(self):
         sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
         stop_criteria = lambda token: False
