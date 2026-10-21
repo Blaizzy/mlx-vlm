@@ -11,7 +11,6 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 import numpy as np
-import pytest
 from mlx.utils import tree_flatten
 
 from mlx_vlm.train import _configure_model
@@ -58,57 +57,6 @@ def example(ids=(1, 3, 2)):
         "attention_mask": mx.ones((len(ids),), dtype=mx.int32),
         "completion_mask": mx.array([0] + [1] * (len(ids) - 1)),
     }
-
-
-@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
-@pytest.mark.parametrize(
-    "mode,args_class",
-    [("sft", VLMTrainingArgs), ("dpo", DPOTrainingArgs), ("orpo", ORPOTrainingArgs)],
-    ids=["sft", "dpo", "orpo"],
-)
-def test_builtin_sft_dpo_orpo_update_policy_and_keep_reference_frozen(
-    mode, args_class, compiled, tmp_path
-):
-    # Separate cases let CI schedule the three cold compiled graphs independently.
-    mx.random.seed(7)
-    model, reference = TinyLM(), TinyLM()
-    before = [mx.array(value) for _, value in tree_flatten(model.parameters())]
-    ref_before = [mx.array(value) for _, value in tree_flatten(reference.parameters())]
-    rows = (
-        [example()]
-        if mode == "sft"
-        else [{"chosen": example(), "rejected": example((1, 4, 2))}]
-    )
-    args = args_class(
-        iters=2,
-        steps_per_report=2,
-        max_seq_length=8,
-        pad_to_multiple=1,
-        compile=compiled,
-        adapter_file=str(tmp_path / "adapter.safetensors"),
-    )
-    trainer = Trainer(
-        model,
-        args,
-        optimizer=optim.AdamW(learning_rate=1e-5, weight_decay=0.0),
-        task="vlm",
-        algorithm=mode,
-        train_dataset=rows,
-        eval_dataset=rows,
-        prepared=True,
-        reference_model=reference if mode == "dpo" else None,
-    )
-    assert mx.isfinite(mx.array(trainer.train()["train_loss"])).item()
-    after = [value for _, value in tree_flatten(model.parameters())]
-    assert any(not mx.array_equal(a, b).item() for a, b in zip(before, after))
-    assert all(
-        mx.array_equal(a, b).item()
-        for a, b in zip(
-            ref_before,
-            [value for _, value in tree_flatten(reference.parameters())],
-        )
-    )
-    assert mx.isfinite(mx.array(trainer.evaluate()["val_loss"])).item()
 
 
 class EngineTest(unittest.TestCase):
@@ -200,6 +148,73 @@ class EngineTest(unittest.TestCase):
                 model.eval()
                 self.assertEqual(trainer.evaluate()["val_loss"], 8.0)
                 self.assertFalse(model.training)
+
+    def test_builtin_sft_dpo_orpo_update_policy_and_keep_reference_frozen(self):
+        for mode, cls in (
+            ("sft", VLMTrainingArgs),
+            ("dpo", DPOTrainingArgs),
+            ("orpo", ORPOTrainingArgs),
+        ):
+            for compiled in (False, True):
+                with (
+                    self.subTest(mode=mode, compiled=compiled),
+                    tempfile.TemporaryDirectory() as folder,
+                ):
+                    mx.random.seed(7)
+                    model, reference = TinyLM(), TinyLM()
+                    before = [
+                        mx.array(value) for _, value in tree_flatten(model.parameters())
+                    ]
+                    ref_before = [
+                        mx.array(value)
+                        for _, value in tree_flatten(reference.parameters())
+                    ]
+                    rows = (
+                        [example()]
+                        if mode == "sft"
+                        else [{"chosen": example(), "rejected": example((1, 4, 2))}]
+                    )
+                    args = cls(
+                        iters=2,
+                        steps_per_report=2,
+                        max_seq_length=8,
+                        pad_to_multiple=1,
+                        compile=compiled,
+                        adapter_file=f"{folder}/adapter.safetensors",
+                    )
+                    trainer = Trainer(
+                        model,
+                        args,
+                        optimizer=optim.AdamW(learning_rate=1e-5, weight_decay=0.0),
+                        task="vlm",
+                        algorithm=mode,
+                        train_dataset=rows,
+                        eval_dataset=rows,
+                        prepared=True,
+                        reference_model=reference if mode == "dpo" else None,
+                    )
+                    self.assertTrue(
+                        mx.isfinite(mx.array(trainer.train()["train_loss"])).item()
+                    )
+                    after = [value for _, value in tree_flatten(model.parameters())]
+                    self.assertTrue(
+                        any(
+                            not mx.array_equal(a, b).item()
+                            for a, b in zip(before, after)
+                        )
+                    )
+                    self.assertTrue(
+                        all(
+                            mx.array_equal(a, b).item()
+                            for a, b in zip(
+                                ref_before,
+                                [v for _, v in tree_flatten(reference.parameters())],
+                            )
+                        )
+                    )
+                    self.assertTrue(
+                        mx.isfinite(mx.array(trainer.evaluate()["val_loss"])).item()
+                    )
 
     def test_reference_cannot_be_policy(self):
         model = TinyLM()
