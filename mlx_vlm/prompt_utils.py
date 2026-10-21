@@ -997,7 +997,7 @@ def apply_chat_template(
         if isinstance(prompt, str):
             messages = [{"role": "user", "content": prompt}]
         elif isinstance(prompt, dict):
-            msg = dict(prompt)
+            msg = _normalize_tool_message(prompt)
             msg["content"] = extract_text_from_content(msg.get("content", ""))
             messages = [msg]
         elif isinstance(prompt, list):
@@ -1007,7 +1007,11 @@ def apply_chat_template(
                     messages.append({"role": "user", "content": item})
                 elif (role_content := _get_role_content(item)) is not None:
                     role, content = role_content
-                    msg = dict(item) if isinstance(item, dict) else {"role": role}
+                    msg = (
+                        _normalize_tool_message(item)
+                        if isinstance(item, dict)
+                        else {"role": role}
+                    )
                     if role != "tool":
                         msg["content"] = extract_text_from_content(content)
                     messages.append(msg)
