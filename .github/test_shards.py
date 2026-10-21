@@ -66,7 +66,7 @@ if __name__ == "__main__":
                 "pytest",
                 "-q",
                 "-n",
-                "3",
+                "4",
                 "--dist=worksteal",
                 "--durations=30",
                 f"--junitxml={ROOT}/test-results/shard-{args.shard}.xml",
