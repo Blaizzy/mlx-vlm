@@ -15,11 +15,15 @@ GROUPS = (
         "test_cache.py",
         "test_moe_offload.py",
         "test_model_ops.py",
+        "test_processors.py",
+        "test_cli.py",
+        "test_sampling_defaults.py",
     },
     {
         "test_models.py",
         "test_audio_models.py",
         "test_training_metrics.py",
+        "test_training_api.py",
     },
     {
         "test_speculative.py",
@@ -29,7 +33,6 @@ GROUPS = (
         "test_extraction_models.py",
         "test_server.py",
         "test_generate.py",
-        "test_training_api.py",
     },
 )
 
@@ -45,7 +48,12 @@ def shards():
         raise ValueError("A test file is assigned to more than one shard")
     if missing := assigned - files:
         raise ValueError(f"Shard configuration references missing tests: {missing}")
-    return [sorted(group) for group in (*GROUPS, files - assigned)]
+    # Start the long training contract early so it can compile while other
+    # workers drain the model cases instead of leaving it as a final straggler.
+    return [
+        sorted(group, key=lambda name: (name != "test_training_api.py", name))
+        for group in (*GROUPS, files - assigned)
+    ]
 
 
 if __name__ == "__main__":
