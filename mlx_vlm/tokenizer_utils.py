@@ -473,7 +473,12 @@ def load_tokenizer(model_path, return_tokenizer=True, tokenizer_config_extra={})
             elif _is_spm_decoder_no_space(tokenizer_content["decoder"]):
                 detokenizer_class = partial(SPMStreamingDetokenizer, trim_space=False)
             elif _is_bpe_decoder(tokenizer_content["decoder"]):
-                detokenizer_class = BPEStreamingDetokenizer
+                # Added tokens contain literal text, not byte-level glyphs.
+                # Nemotron 3.5 includes a literal newline; the fast BPE decoder
+                # cannot decode it (or literal Unicode added tokens).
+                added = tokenizer_content.get("added_tokens", [])
+                if all(all(32 <= ord(c) < 127 for c in t["content"]) for t in added):
+                    detokenizer_class = BPEStreamingDetokenizer
 
     if return_tokenizer:
         return TokenizerWrapper(
