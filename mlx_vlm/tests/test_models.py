@@ -384,7 +384,7 @@ class ModelChecks:
         batch = kwargs.pop("batch_size", 1)
         flat = (
             "qwen2_5_vl qwen3_5 qwen3_5_moe qwen4_exp "
-            "glm4v_moe glm4v hunyuan_vl siglip2_vision_model mimovl"
+            "glm4v_moe glm4v hunyuan_vl siglip2_vision_model mimovl siglip2_navit"
         ).split()
         shape = (
             image_size
