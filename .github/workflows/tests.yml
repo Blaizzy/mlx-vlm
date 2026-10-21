@@ -48,12 +48,16 @@ jobs:
           fi
 
   test:
-    runs-on: macos-14
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6]
+        include:
+          - {shard: 1, os: ubuntu-24.04, extras: 'test,cpu'}
+          - {shard: 2, os: macos-14, extras: test}
+          - {shard: 3, os: macos-14, extras: test}
+          - {shard: 4, os: macos-14, extras: test}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -70,7 +74,25 @@ jobs:
             pyproject.toml
 
       - name: Install package and dependencies
-        run: uv pip install -e ".[test]"
+        run: uv pip install -e ".[${{ matrix.extras }}]"
+
+      - name: Locate Metal compiler cache
+        if: runner.os == 'macOS'
+        id: metal
+        run: |
+          echo "path=$(getconf DARWIN_USER_CACHE_DIR)" >> "$GITHUB_OUTPUT"
+          echo "version=$(sw_vers -buildVersion)-$(python -c 'import importlib.metadata; print(importlib.metadata.version("mlx"))')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Metal compilation
+        if: runner.os == 'macOS'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ steps.metal.outputs.path }}/com.apple.metal
+            ${{ steps.metal.outputs.path }}/com.apple.metalfe
+          key: metal-${{ runner.arch }}-${{ steps.metal.outputs.version }}-${{ matrix.shard }}-${{ hashFiles('mlx_vlm/tests/**', '.github/test_shards.py') }}
+          restore-keys: |
+            metal-${{ runner.arch }}-${{ steps.metal.outputs.version }}-${{ matrix.shard }}-
 
       - name: Run Python tests
         run: python .github/test_shards.py ${{ matrix.shard }}

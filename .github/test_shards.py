@@ -8,36 +8,33 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 TESTS = ROOT / "mlx_vlm" / "tests"
 
-# Keep the full verifier matrix intact, but run it with the lighter loading
-# shard. New speculative tests remain in the main speculative shard.
+# Keep the full verifier matrix intact, but run it with the loading shard.
+# New speculative tests remain in the main speculative shard.
 VERIFIER_PARITY = "test_speculative.py::test_verify_commit_matches_decode"
 
 # Balance using Actions timings, not test counts. The last shard also picks up
 # new test files automatically, so adding a suite never silently drops coverage.
 GROUPS = (
     {
-        "test_cache.py",
-        "test_moe_offload.py",
-        "test_gated_delta.py",
+        "test_server.py",
+        "test_cli.py",
+        "test_sampling_defaults.py",
+        "test_tool_streaming.py",
     },
     {
-        "test_models.py",
+        "test_cache.py",
+        "test_moe_offload.py",
+        "test_model_ops.py",
+        "test_processors.py",
         "test_training_api.py",
     },
     {
-        "test_speculative.py",
-    },
-    {
+        "test_models.py",
         "test_extraction_models.py",
-        "test_server.py",
         "test_generate.py",
         "test_audio_models.py",
-    },
-    {
-        "test_model_ops.py",
-        "test_processors.py",
-        "test_cli.py",
-        "test_sampling_defaults.py",
+        "test_image_generation_models.py",
+        "test_training_metrics.py",
     },
 )
 
@@ -73,7 +70,7 @@ if __name__ == "__main__":
     if str(TESTS / "test_speculative.py") in paths:
         # Match parameter cases without excluding future similarly named tests.
         deselect = [f"--deselect=mlx_vlm/tests/{VERIFIER_PARITY}["]
-    if args.shard == 5:
+    if args.shard == 2:
         paths.append(str(TESTS / VERIFIER_PARITY))
     if not paths:
         parser.error("Shard has no test files")
