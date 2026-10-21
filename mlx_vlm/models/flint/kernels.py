@@ -1,11 +1,17 @@
 """Inference kernels preserving Flint's FP32 expert weighting."""
 
-from functools import lru_cache
+from functools import lru_cache, partial
 
 import mlx.core as mx
 
 from ..fast_ops import _affine_exact_header
 from ..switch_layers import QuantizedSwitchLinear, SwiGLU
+
+
+@partial(mx.compile, shapeless=True)
+def normalize_expert_weights(scores, indices):
+    weights = mx.take_along_axis(scores, indices, axis=-1)
+    return weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
 
 
 def weighted_sum(routed, weights):
@@ -20,7 +26,7 @@ def weighted_sum(routed, weights):
 def _weighted_kernel():
     return mx.fast.metal_kernel(
         name="flint_weighted_sum",
-        input_names=["routed", "weights", "limit"],
+        input_names=["routed", "weights", "shared", "limit"],
         output_names=["out"],
         header="#pragma clang fp contract(off)\n",
         source="""
@@ -33,12 +39,14 @@ def _weighted_kernel():
             float term = float(routed[(row * K + k) * D + col]) * weights[row * K + k];
             value = value + term;
         }
-        out[i] = T(value);
+        T result = T(value);
+        if (HAS_SHARED) result = T(result + shared[i]);
+        out[i] = result;
         """,
     )
 
 
-def metal_sum(routed, weights):
+def metal_sum(routed, weights, shared=None):
     if (
         not mx.metal.is_available()
         or mx.default_device() != mx.gpu
@@ -46,16 +54,30 @@ def metal_sum(routed, weights):
         or weights.dtype != mx.float32
         or routed.shape[-2] != 6
         or routed.size == 0
+        or (
+            shared is not None
+            and (
+                shared.dtype != routed.dtype
+                or shared.shape != (*routed.shape[:-2], routed.shape[-1])
+            )
+        )
     ):
-        return weighted_sum(routed, weights)
+        output = weighted_sum(routed, weights)
+        return output if shared is None else output + shared
     shape = (*routed.shape[:-2], routed.shape[-1])
     size = routed.size // routed.shape[-2]
     return _weighted_kernel()(
-        inputs=[routed, weights, mx.array(size, mx.uint32)],
+        inputs=[
+            routed,
+            weights,
+            shared if shared is not None else routed,
+            mx.array(size, mx.uint32),
+        ],
         template=[
             ("T", routed.dtype),
             ("D", routed.shape[-1]),
             ("K", routed.shape[-2]),
+            ("HAS_SHARED", shared is not None),
         ],
         grid=(size, 1, 1),
         threadgroup=(256, 1, 1),
@@ -152,7 +174,6 @@ def gate_up_silu(switch, x, indices):
     if (
         type(getattr(switch, "activation", None)) is not SwiGLU
         or x.ndim != 3
-        or x.shape[1] != 1
         or indices.shape[:2] != x.shape[:2]
         or indices.size >= 64
         or indices.shape[-1] != 6
@@ -176,7 +197,6 @@ def gate_up_silu(switch, x, indices):
         ],
         template=[
             ("T", x.dtype),
-            ("VERIFY_T", l),
             ("K_SIZE", d),
             ("N_SIZE", n),
             ("TOP_K", k),
@@ -257,7 +277,6 @@ def down_kernel():
 def down_reduce(linear, x, indices, weights, shared):
     if (
         x.ndim != 4
-        or x.shape[1] != 1
         or indices.shape != x.shape[:3]
         or weights.shape != indices.shape
         or weights.dtype != mx.float32
@@ -282,7 +301,6 @@ def down_reduce(linear, x, indices, weights, shared):
         ],
         template=[
             ("T", x.dtype),
-            ("VERIFY_T", l),
             ("K_SIZE", d),
             ("N_SIZE", n),
             ("TOP_K", k),

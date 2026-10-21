@@ -5392,12 +5392,12 @@ class TestFlintInferenceKernels:
         module.set_dtype(dtype)
         nn.quantize(module, group_size=64, bits=4)
         module.eval()
-        for length in (1, 17):
+        for length in (1, 3, 17):
             x = mx.random.normal((batch, length, 2048)).astype(dtype)
             expected = module._forward(x)
             actual = module(x)
             assert mx.array_equal(actual, expected).item()
-            if length == 1:
+            if batch * length * module.top_k < 64:
                 indices, weights = module.route(x)
                 activation = gate_up_silu(module.switch_mlp, x, indices)
                 assert activation is not None
@@ -5505,7 +5505,8 @@ class TestFlintInferenceKernels:
         x = mx.random.normal((1, 1, 64))
         assert mx.array_equal(module(x), module._forward(x)).item()
 
-    def test_variable_prefill_does_not_compile_whole_moe(self):
+    @pytest.mark.parametrize("quantized", [False, True])
+    def test_variable_shapes_reuse_preparation_graph(self, quantized):
         from mlx_vlm.models.flint import ModelConfig
         from mlx_vlm.models.flint.language import SparseMoeBlock
 
@@ -5513,17 +5514,45 @@ class TestFlintInferenceKernels:
             ModelConfig(
                 hidden_size=64,
                 moe_intermediate_size=64,
-                shared_expert_intermediate_size=0,
+                shared_expert_intermediate_size=64,
                 num_experts=8,
                 num_experts_per_tok=6,
             )
         )
+        module.set_dtype(mx.bfloat16)
+        if quantized:
+            nn.quantize(module, group_size=32, bits=4)
         module.eval()
 
-        def fail_if_compiled(_):
-            pytest.fail("Variable prefill shapes must not create whole-MoE traces")
+        traces = []
 
-        module._compiled = fail_if_compiled
-        for length in (3, 7, 17):
-            x = mx.random.normal((2, length, 64))
+        def prepare(x):
+            traces.append(x.shape)
+            return module._prepare(x)
+
+        module._compiled = mx.compile(prepare, inputs=module, shapeless=True)
+        for batch, length in (
+            (1, 1),
+            (8, 1),
+            (2, 17),
+            (1, 1023),
+            (4, 3),
+            (1, 2048),
+            (2, 1),
+        ):
+            x = mx.random.normal((batch, length, 64)).astype(mx.bfloat16)
             assert mx.array_equal(module(x), module._forward(x)).item()
+        assert len(traces) == 1
+
+    @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+    def test_weighted_sum_with_shared_expert(self, dtype):
+        from mlx_vlm.models.flint.kernels import metal_sum, weighted_sum
+
+        for length in (1, 7, 127):
+            routed = mx.random.normal((2, length, 6, 64)).astype(dtype)
+            weights = mx.softmax(mx.random.normal((2, length, 6)))
+            shared = mx.random.normal((2, length, 64)).astype(dtype)
+            assert mx.array_equal(
+                metal_sum(routed, weights, shared),
+                weighted_sum(routed, weights) + shared,
+            ).item()
