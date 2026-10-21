@@ -63,6 +63,7 @@ MODEL_CONFIG = {
     "glm5_next": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm_ocr": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "dots_ocr": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "oxr": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "ernie4_5_moe_vl": MessageFormat.LIST_WITH_IMAGE_URL_FIRST,
     "internvl_chat": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "internvl": MessageFormat.LIST_WITH_IMAGE_TYPE,
