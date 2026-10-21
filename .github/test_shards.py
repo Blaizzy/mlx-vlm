@@ -11,9 +11,9 @@ TESTS = ROOT / "mlx_vlm" / "tests"
 # Balance using Actions timings, not test counts. The last shard also picks up
 # new test files automatically, so adding a suite never silently drops coverage.
 GROUPS = (
-    {"test_cache.py", "test_moe_offload.py"},
-    {"test_models.py", "test_audio_models.py"},
-    {"test_speculative.py", "test_model_ops.py", "test_gated_delta.py"},
+    {"test_cache.py", "test_moe_offload.py", "test_model_ops.py"},
+    {"test_models.py", "test_extraction_models.py"},
+    {"test_speculative.py", "test_gated_delta.py"},
     {
         "test_server.py",
         "test_generate.py",
@@ -21,7 +21,6 @@ GROUPS = (
         "test_cli.py",
         "test_tool_streaming.py",
         "test_sampling_defaults.py",
-        "test_extraction_models.py",
     },
 )
 
@@ -48,6 +47,8 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     paths = [str(TESTS / name) for name in shards()[args.shard - 1]]
+    if not paths:
+        parser.error("Shard has no test files")
     if args.list:
         print("\n".join(paths))
     else:
