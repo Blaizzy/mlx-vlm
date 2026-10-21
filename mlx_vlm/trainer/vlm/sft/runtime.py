@@ -31,6 +31,11 @@ _AUDIO_VIDEO_FIELDS = (
     "videos",
 )
 _SIGNATURE_FIELDS = ("pixel_values", "image_embeds", *_AUDIO_VIDEO_FIELDS)
+# These models get no padding mask: glm_ocr builds its causal mask only when it
+# receives none, so a padding mask would replace it. Batches are right-padded.
+# Right padding cannot affect earlier real-token logits under causal attention;
+# existing loss masks are unchanged.
+CAUSAL_MASK_MODEL_TYPES = frozenset({"gemma4_unified", "glm_ocr"})
 
 
 def _model_type(model: nn.Module) -> str | None:
@@ -67,7 +72,7 @@ def forward_vlm_logits(
         key: value for key, value in batch.items() if key not in _TEXT_FIELDS
     }
     pixel_values = model_inputs.pop("pixel_values", None)
-    if _model_type(model) == "gemma4_unified":
+    if _model_type(model) in CAUSAL_MASK_MODEL_TYPES:
         attention_mask = None
     return _logits_from_output(
         model(input_ids, pixel_values, attention_mask, **model_inputs)
