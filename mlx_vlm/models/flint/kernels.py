@@ -16,24 +16,26 @@ def weighted_sum(routed, weights):
     )
 
 
-_weighted_kernel = mx.fast.metal_kernel(
-    name="flint_weighted_sum",
-    input_names=["routed", "weights"],
-    output_names=["out"],
-    header="#pragma clang fp contract(off)\n",
-    source="""
-    uint i = thread_position_in_grid.x;
-    if (i >= SIZE) return;
-    uint row = i / D;
-    uint col = i % D;
-    float value = 0.0f;
-    for (int k = 0; k < K; ++k) {
-        float term = float(routed[(row * K + k) * D + col]) * weights[row * K + k];
-        value = value + term;
-    }
-    out[i] = T(value);
-    """,
-)
+@lru_cache(None)
+def _weighted_kernel():
+    return mx.fast.metal_kernel(
+        name="flint_weighted_sum",
+        input_names=["routed", "weights"],
+        output_names=["out"],
+        header="#pragma clang fp contract(off)\n",
+        source="""
+        uint i = thread_position_in_grid.x;
+        if (i >= SIZE) return;
+        uint row = i / D;
+        uint col = i % D;
+        float value = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            float term = float(routed[(row * K + k) * D + col]) * weights[row * K + k];
+            value = value + term;
+        }
+        out[i] = T(value);
+        """,
+    )
 
 
 def metal_sum(routed, weights):
@@ -48,7 +50,7 @@ def metal_sum(routed, weights):
         return weighted_sum(routed, weights)
     shape = (*routed.shape[:-2], routed.shape[-1])
     size = routed.size // routed.shape[-2]
-    return _weighted_kernel(
+    return _weighted_kernel()(
         inputs=[routed, weights],
         template=[
             ("T", routed.dtype),

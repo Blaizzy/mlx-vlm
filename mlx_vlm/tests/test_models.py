@@ -3217,6 +3217,7 @@ class TestPhiMoE:
 
 
 class TestFlintInferenceKernels:
+    @pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
     @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
     @pytest.mark.parametrize("batch", [1, 2, 4, 8])
     def test_fused_experts_match_reference(self, dtype, batch):
