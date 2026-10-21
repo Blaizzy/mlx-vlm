@@ -8,6 +8,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 TESTS = ROOT / "mlx_vlm" / "tests"
 
+# Keep the full verifier matrix intact, but run it with the loading shard.
+# New speculative tests remain in the main speculative shard.
+VERIFIER_PARITY = "test_speculative.py::test_verify_commit_matches_decode"
+
 # The first shard covers portable interfaces on Linux; model and Metal checks
 # stay on macOS. Balance using Actions timings, not test counts. The last Mac
 # shard picks up new files automatically so adding a suite cannot drop coverage.
@@ -59,6 +63,12 @@ if __name__ == "__main__":
     parser.add_argument("shard", type=int, choices=range(1, len(GROUPS) + 2))
     args = parser.parse_args()
     paths = [str(TESTS / name) for name in shards()[args.shard - 1]]
+    deselect = []
+    if str(TESTS / "test_speculative.py") in paths:
+        # Match parameter cases without excluding future similarly named tests.
+        deselect = [f"--deselect=mlx_vlm/tests/{VERIFIER_PARITY}["]
+    if args.shard == 2:
+        paths.append(str(TESTS / VERIFIER_PARITY))
     if not paths:
         parser.error("Shard has no test files")
     result = subprocess.run(
@@ -72,6 +82,7 @@ if __name__ == "__main__":
             "--dist=worksteal",
             "--durations=30",
             f"--junitxml={ROOT}/test-results/shard-{args.shard}.xml",
+            *deselect,
             *paths,
         ],
         cwd=ROOT / "mlx_vlm",
