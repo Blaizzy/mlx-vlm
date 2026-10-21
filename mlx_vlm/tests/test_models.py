@@ -26,8 +26,8 @@ import pytest
 from mlx.utils import tree_flatten, tree_map
 
 from mlx_vlm import embedding_loader
-from mlx_vlm.models.base import InputEmbeddingsFeatures
-from mlx_vlm.models.cache import make_prompt_cache
+from mlx_vlm.models.base import InputEmbeddingsFeatures, create_attention_mask
+from mlx_vlm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
 from mlx_vlm.models.lfm2_encoder import Model as Lfm2Encoder
 from mlx_vlm.utils import (
     _drop_modules_without_weights,
@@ -1256,6 +1256,206 @@ def test_gemma3_can_preserve_caller_supplied_embedding_scale():
 
     assert mx.array_equal(capture.call_args.args[0], expected)
     assert mx.array_equal(output, expected)
+
+
+def rotating_language_model(case):
+    """Reuse model contracts and tiny defaults for cache-specific model checks."""
+    name = case["module"]
+    module = importlib.import_module(f"mlx_vlm.models.{name}")
+    language = importlib.import_module(f"mlx_vlm.models.{name}.language")
+    outer, text = None, {}
+    if "case" in case:
+        outer = build_config(module, model_case(case["case"])["config"])
+        outer = getattr(outer, "thinker_config", outer)
+        text = asdict(outer.text_config)
+    defaults = {} if name == "florence2" else TINY_DEFAULTS
+    config = build_config(
+        language,
+        text | defaults | case["config"],
+        case.get("config_type", "TextConfig"),
+    )
+    if name == "florence2":
+        return language.Florence2Decoder(config), config
+    if name in ("qwen2", "qwen3", "mllama", "moondream3", "minimax_m3_vl", "gemma3n"):
+        return language.LanguageModel(config), config
+    if outer is None:
+        outer = module.ModelConfig(
+            text_config=config, vision_config=module.VisionConfig()
+        )
+    else:
+        outer.text_config = config
+    model = (
+        language.LanguageModel(outer)
+        if name == "hunyuan_vl"
+        else language.LanguageModel(config, outer)
+    )
+    return model, config
+
+
+@pytest.mark.parametrize(
+    "case",
+    [c for c in DATA["rotating_cache"] if "chunk_parity" in c["checks"]],
+    ids=lambda c: c["module"],
+)
+@pytest.mark.parametrize("keep", [0, 2])
+def test_rotating_cache_random_model_chunk_parity(case, keep):
+    mx.random.seed(17)
+    model, config = rotating_language_model(case)
+    model.eval()
+    mx.eval(model.parameters())
+    ids = (mx.arange(41)[None] * 7 + 3) % config.vocab_size
+
+    def forward(schedule):
+        for attr in ("_rope_deltas", "_position_ids"):
+            if hasattr(model, attr):
+                setattr(model, attr, None)
+        caches = [RotatingKVCache(8, keep=keep) for _ in model.layers]
+        result, start = [], 0
+        for n in schedule:
+            logits = model(ids[:, start : start + n], cache=caches).logits
+            mx.eval(logits, [c.state for c in caches])
+            result.append(logits)
+            start += n
+        assert start == ids.shape[1]
+        return np.array(mx.concatenate(result, axis=1))
+
+    expected = forward([1] * 41)
+    # Include a chunk larger than the cache and multi-token continuation after
+    # single-token decoding has wrapped the storage cursor.
+    for schedule in ([3] * 13 + [1, 1], [17, 7, 8, 8, 1], [1] * 19 + [5, 8, 8, 1]):
+        np.testing.assert_allclose(forward(schedule), expected, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [c for c in DATA["rotating_cache"] if "prompt_metadata" in c["checks"]],
+    ids=lambda c: c["module"],
+)
+def test_rotated_model_slices_full_prompt_metadata(case):
+    name = case["module"]
+    mx.random.seed(19)
+    model, config = rotating_language_model(case)
+    model.eval()
+    ids = (mx.arange(24)[None] * 7 + 3) % config.vocab_size
+    positions = mx.broadcast_to(mx.arange(24)[None, None, :], (3, 1, 24))
+    positions = positions + mx.array([3, 7, 11])[:, None, None]
+    if name == "falcon_ocr":
+        positions = positions[0]
+    metadata = {"position_ids": positions}
+    if name in ("qwen3_vl", "qwen3_vl_moe", "qwen3_omni_moe"):
+        metadata["visual_pos_masks"] = mx.ones((1, 24), mx.bool_)
+        metadata["deepstack_visual_embeds"] = (
+            mx.random.normal((1, 24, 2, config.hidden_size))
+            if name == "qwen3_omni_moe"
+            else [mx.random.normal((24, config.hidden_size)) for _ in range(2)]
+        )
+
+    def forward(full_metadata):
+        for attr in ("_rope_deltas", "_position_ids"):
+            if hasattr(model, attr):
+                setattr(model, attr, None)
+        cache = [RotatingKVCache(8, keep=2) for _ in model.layers]
+        for start in range(21):
+            out = model(ids[:, start : start + 1], cache=cache)
+            mx.eval(out.logits)
+        assert cache[0].offset == 21 and cache[0]._idx != 21
+        kwargs = dict(metadata)
+        if not full_metadata:
+            kwargs["position_ids"] = positions[..., 21:24]
+            if "visual_pos_masks" in kwargs:
+                kwargs["visual_pos_masks"] = kwargs["visual_pos_masks"][:, 21:24]
+                embeds = kwargs["deepstack_visual_embeds"]
+                kwargs["deepstack_visual_embeds"] = (
+                    [e[21:24] for e in embeds]
+                    if isinstance(embeds, list)
+                    else embeds[:, 21:24]
+                )
+        if name == "falcon_ocr":
+            # Falcon's full-prompt metadata is passed with precomputed embeddings.
+            kwargs["inputs_embeds"] = model.model.embed_tokens(ids[:, 21:24])
+            if not full_metadata:
+                # This wrapper accepts full position IDs only; compare the
+                # internally selected positions against a direct model call.
+                mask = create_attention_mask(kwargs["inputs_embeds"], cache)
+                return np.array(
+                    model.lm_head(
+                        model.model(
+                            ids[:, 21:24],
+                            inputs_embeds=kwargs["inputs_embeds"],
+                            position_ids=positions[..., 21:24],
+                            mask=mask,
+                            cache=cache,
+                        )
+                    )
+                )
+        return np.array(model(ids[:, 21:24], cache=cache, **kwargs).logits)
+
+    np.testing.assert_allclose(forward(True), forward(False), atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [c for c in DATA["rotating_cache"] if "per_layer_inputs" in c["checks"]],
+    ids=lambda c: c["module"],
+)
+def test_rotated_per_layer_inputs(case):
+    mx.random.seed(23)
+    model, config = rotating_language_model(case)
+    # The constructor initializes this gate to zero, which would hide a bad
+    # per-layer-input slice in an otherwise randomly initialized model.
+    for layer in model.layers:
+        layer.altup.correct_output_scale = mx.random.uniform(
+            low=0.5, high=1.5, shape=(config.hidden_size,)
+        )
+    model.eval()
+    ids = (mx.arange(41)[None] * 7 + 3) % config.vocab_size
+    per_layer_inputs = model.model.get_per_layer_inputs(ids)
+
+    def forward(step, full_metadata):
+        cache, outputs = model.make_cache(), []
+        for start in range(0, 41, step):
+            metadata = (
+                per_layer_inputs
+                if full_metadata
+                else per_layer_inputs[:, start : start + step]
+            )
+            out = model(
+                ids[:, start : start + step], cache=cache, per_layer_inputs=metadata
+            )
+            mx.eval(out.logits)
+            outputs.append(out.logits)
+        return np.array(mx.concatenate(outputs, axis=1))
+
+    expected = forward(1, False)
+    np.testing.assert_allclose(forward(3, True), expected, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [c for c in DATA["rotating_cache"] if "decoder_positions" in c["checks"]],
+    ids=lambda c: c["module"],
+)
+def test_rotated_decoder_positions_and_mask(case):
+    mx.random.seed(29)
+    decoder, config = rotating_language_model(case)
+    decoder.eval()
+    encoder_states = mx.random.normal((1, 4, config.d_model))
+    embeddings = mx.random.normal((1, 41, config.d_model))
+
+    def forward(step):
+        cache = [[RotatingKVCache(8, keep=2), KVCache()] for _ in decoder.layers]
+        outputs = []
+        for start in range(0, 41, step):
+            out = decoder(
+                inputs_embeds=embeddings[:, start : start + step],
+                encoder_hidden_states=encoder_states,
+                cache=cache,
+            )
+            mx.eval(out)
+            outputs.append(out)
+        return np.array(mx.concatenate(outputs, axis=1))
+
+    np.testing.assert_allclose(forward(3), forward(1), atol=1e-4, rtol=1e-4)
 
 
 # Document layout
