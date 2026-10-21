@@ -11,6 +11,7 @@ from ..mlp import SwiGLUMLP
 from ..rope_utils import initialize_rope
 from ..switch_layers import SwitchGLU, stack_expert_projection
 from .config import ModelConfig
+from .kernels import down_reduce, gate_up_silu, metal_sum
 
 
 class Attention(nn.Module):
@@ -95,6 +96,9 @@ class SparseMoeBlock(nn.Module):
             if args.shared_expert_intermediate_size > 0
             else None
         )
+        # Track module arrays as inputs: loading/replacing/quantizing weights must
+        # invalidate the trace instead of retaining captured checkpoint tensors.
+        self._compiled = mx.compile(self._inference, inputs=self)
 
     def route(self, x):
         # The reference computes the projection in the activation dtype, then
@@ -108,7 +112,7 @@ class SparseMoeBlock(nn.Module):
         weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
         return indices, weights
 
-    def __call__(self, x):
+    def _forward(self, x):
         indices, weights = self.route(x)
         routed = self.switch_mlp(x, indices)
         out = (
@@ -119,6 +123,28 @@ class SparseMoeBlock(nn.Module):
         if self.shared_expert is not None:
             out = out + self.shared_expert(x)
         return out
+
+    def _inference(self, x):
+        indices, weights = self.route(x)
+        shared = (
+            self.shared_expert(x)
+            if self.shared_expert is not None
+            else mx.zeros_like(x)
+        )
+        switch = self.switch_mlp
+        activated = gate_up_silu(switch, x, indices)
+        if activated is not None:
+            output = down_reduce(switch.down_proj, activated, indices, weights, shared)
+            if output is not None:
+                return output
+            routed = switch.down_proj(activated[..., None, :], indices).squeeze(-2)
+        else:
+            routed = switch(x, indices)
+        output = metal_sum(routed, weights)
+        return output + shared if self.shared_expert is not None else output
+
+    def __call__(self, x):
+        return self._forward(x) if self.training else self._compiled(x)
 
 
 class DecoderLayer(nn.Module):
