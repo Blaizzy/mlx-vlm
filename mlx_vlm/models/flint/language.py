@@ -11,7 +11,7 @@ from ..mlp import SwiGLUMLP
 from ..rope_utils import initialize_rope
 from ..switch_layers import SwitchGLU, stack_expert_projection
 from .config import ModelConfig
-from .kernels import down_reduce, gate_up_silu, metal_sum
+from .kernels import down_reduce, gate_up_silu, metal_sum, normalize_expert_weights
 
 
 class Attention(nn.Module):
@@ -96,9 +96,10 @@ class SparseMoeBlock(nn.Module):
             if args.shared_expert_intermediate_size > 0
             else None
         )
-        # Track module arrays as inputs: loading/replacing/quantizing weights must
-        # invalidate the trace instead of retaining captured checkpoint tensors.
-        self._compiled = mx.compile(self._inference, inputs=self)
+        # Keep weights as inputs and reuse the graph across batch/prompt sizes.
+        # Index selection and expert dispatch stay outside this shape-independent
+        # graph; both can choose different algorithms as the workload changes.
+        self._compiled = mx.compile(self._prepare, inputs=self, shapeless=True)
 
     def route(self, x):
         # The reference computes the projection in the activation dtype, then
@@ -124,13 +125,20 @@ class SparseMoeBlock(nn.Module):
             out = out + self.shared_expert(x)
         return out
 
-    def _inference(self, x):
-        indices, weights = self.route(x)
+    def _prepare(self, x):
+        scores = mx.sigmoid(self.gate(x).astype(mx.float32))
+        choice = scores + self.expert_bias.astype(mx.float32)
         shared = (
             self.shared_expert(x)
             if self.shared_expert is not None
             else mx.zeros_like(x)
         )
+        return scores, choice, shared
+
+    def _inference(self, x):
+        scores, choice, shared = self._compiled(x)
+        indices = mx.argpartition(choice, kth=-self.top_k, axis=-1)[..., -self.top_k :]
+        weights = normalize_expert_weights(scores, indices)
         switch = self.switch_mlp
         activated = gate_up_silu(switch, x, indices)
         if activated is not None:
@@ -140,15 +148,15 @@ class SparseMoeBlock(nn.Module):
             routed = switch.down_proj(activated[..., None, :], indices).squeeze(-2)
         else:
             routed = switch(x, indices)
-        output = metal_sum(routed, weights)
-        return output + shared if self.shared_expert is not None else output
+        return metal_sum(
+            routed, weights, shared if self.shared_expert is not None else None
+        )
 
     def __call__(self, x):
         # Paged experts perform data-dependent I/O and cannot be traced.
         if self.training or type(self.switch_mlp) is not SwitchGLU:
             return self._forward(x)
-        # Prompt lengths vary: avoid retaining a trace for each prefill shape.
-        return self._compiled(x) if x.shape[1] == 1 else self._inference(x)
+        return self._inference(x)
 
 
 class DecoderLayer(nn.Module):
