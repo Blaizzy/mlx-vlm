@@ -12,8 +12,9 @@ TESTS = ROOT / "mlx_vlm" / "tests"
 # New speculative tests remain in the main speculative shard.
 VERIFIER_PARITY = "test_speculative.py::test_verify_commit_matches_decode"
 
-# Balance using Actions timings, not test counts. The last shard also picks up
-# new test files automatically, so adding a suite never silently drops coverage.
+# The first shard covers portable interfaces on Linux; model and Metal checks
+# stay on macOS. Balance using Actions timings, not test counts. The last Mac
+# shard picks up new files automatically so adding a suite cannot drop coverage.
 GROUPS = (
     {
         "test_server.py",
@@ -24,7 +25,6 @@ GROUPS = (
     {
         "test_cache.py",
         "test_moe_offload.py",
-        "test_model_ops.py",
         "test_processors.py",
         "test_training_api.py",
     },

@@ -90,7 +90,7 @@ jobs:
           path: |
             ${{ steps.metal.outputs.path }}/com.apple.metal
             ${{ steps.metal.outputs.path }}/com.apple.metalfe
-          key: metal-${{ runner.arch }}-${{ steps.metal.outputs.version }}-${{ matrix.shard }}-${{ hashFiles('mlx_vlm/tests/**', '.github/test_shards.py') }}
+          key: metal-${{ runner.arch }}-${{ steps.metal.outputs.version }}-${{ matrix.shard }}-${{ hashFiles('mlx_vlm/**/*.py', 'mlx_vlm/**/*.json', '.github/test_shards.py') }}
           restore-keys: |
             metal-${{ runner.arch }}-${{ steps.metal.outputs.version }}-${{ matrix.shard }}-
 
