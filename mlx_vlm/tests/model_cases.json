@@ -2,6 +2,46 @@
   "version": 2,
   "cases": [
     {
+      "id": "step5_vl",
+      "module": "step5_vl",
+      "config": {
+        "model_type": "step5_vl",
+        "text_config": {
+          "hidden_size": 64,
+          "intermediate_size": 128,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 4,
+          "num_attention_groups": 2,
+          "head_dim": 16,
+          "vocab_size": 256,
+          "moe_num_experts": 4,
+          "moe_top_k": 2,
+          "moe_intermediate_size": 64,
+          "share_expert_dim": 64,
+          "moe_layer_list": [1],
+          "layer_types": ["sliding_attention", "full_attention"],
+          "sliding_window": 4,
+          "sparse_config": {
+            "enabled": true,
+            "proxy_dim": 16,
+            "sparse_indexer_num_heads": 4,
+            "sparse_indexer_rope_dim": 8,
+            "region_block_size": 2,
+            "topk": 2
+          }
+        },
+        "vision_config": {
+          "width": 32,
+          "layers": 1,
+          "heads": 4,
+          "image_size": 28,
+          "patch_size": 14,
+          "mlp_ratio": 2
+        }
+      },
+      "checks": ["forward_cache"]
+    },
+    {
       "id": "nemotron_super_vl",
       "module": "nemotron_h_nano_omni",
       "config": {
