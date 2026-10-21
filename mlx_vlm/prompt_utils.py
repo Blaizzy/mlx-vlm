@@ -1081,8 +1081,12 @@ def apply_chat_template(
         audio_counts = [0] * len(prompt)
         if last_user_idx >= 0:
             audio_counts[last_user_idx] = num_audios
+        # Like side-channel audio, a side-channel video belongs to the last
+        # user message only; other turns would each get its placeholder.
+        history_kwargs = {k: v for k, v in kwargs.items() if k != "video"}
 
         for i, p in enumerate(prompt):
+            message_kwargs = kwargs if i == last_user_idx else history_kwargs
             if isinstance(p, str):
                 messages.append(
                     get_message_json(
@@ -1092,7 +1096,7 @@ def apply_chat_template(
                         skip_audio_token=audio_counts[i] == 0,
                         num_images=image_counts[i],
                         num_audios=audio_counts[i],
-                        **kwargs,
+                        **message_kwargs,
                     )
                 )
             elif (role_content := _get_role_content(p)) is not None:
@@ -1116,7 +1120,7 @@ def apply_chat_template(
                             or role in ["system", "assistant"],
                             num_images=image_counts[i],
                             num_audios=audio_counts[i],
-                            **kwargs,
+                            **message_kwargs,
                         )
                     )
 
