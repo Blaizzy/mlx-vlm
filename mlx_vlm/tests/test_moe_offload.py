@@ -39,10 +39,10 @@ def offload_device(request):
 
 @pytest.mark.parametrize("fused", [False, True])
 @pytest.mark.parametrize("scale_name", ["weight_scale_2", "weight_global_scale"])
-@pytest.mark.parametrize("scalar", [False, True])
+@pytest.mark.parametrize("scale_layout", ["scalar", "expert", "expert_column", "row"])
 @pytest.mark.parametrize("decode", [False, True])
 def test_native_nvfp4_global_scales_survive_repack(
-    tmp_path, fused, scale_name, scalar, decode, offload_device
+    tmp_path, fused, scale_name, scale_layout, decode, offload_device
 ):
     from mlx.utils import tree_flatten
 
@@ -57,7 +57,15 @@ def test_native_nvfp4_global_scales_survive_repack(
     scales = {}
     for path, value in tree_flatten(model.parameters()):
         if path.endswith(".weight"):
-            scale = mx.array(0.137) if scalar else mx.array([0.137, 0.348, 0.779, 0.29])
+            scale = mx.array([0.137, 0.348, 0.779, 0.29])
+            if scale_layout == "scalar":
+                scale = mx.array(0.137)
+            elif scale_layout == "expert_column":
+                scale = scale[:, None]
+            elif scale_layout == "row":
+                # Sanitizing separately scaled gate/up weights produces this
+                # layout. Vary every row so copying or swapping halves fails.
+                scale = scale[:, None] * mx.linspace(0.7, 1.3, value.shape[-2])
             scales[path.removesuffix("weight") + scale_name] = scale
     replace_scaled_quantized_linears(model, scales)
     x = mx.random.normal((1, 3, 64)).astype(mx.bfloat16)
