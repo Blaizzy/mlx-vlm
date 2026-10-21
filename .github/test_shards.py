@@ -15,23 +15,21 @@ GROUPS = (
         "test_cache.py",
         "test_moe_offload.py",
         "test_model_ops.py",
-        "test_processors.py",
-        "test_cli.py",
-        "test_tool_streaming.py",
-        "test_sampling_defaults.py",
-        "test_diffusion_models.py",
-        "test_video_generation_models.py",
-        "test_training_grpo.py",
-        "test_training_grpo_text_notebook.py",
     },
     {
         "test_models.py",
+        "test_audio_models.py",
+        "test_training_metrics.py",
+    },
+    {
+        "test_speculative.py",
+        "test_gated_delta.py",
+    },
+    {
         "test_extraction_models.py",
         "test_server.py",
         "test_generate.py",
-        "test_audio_models.py",
         "test_training_api.py",
-        "test_training_metrics.py",
     },
 )
 
