@@ -3214,3 +3214,105 @@ class TestPhiMoE:
         )
 
         assert isinstance(Attention(config).rope, nn.RoPE)
+
+
+class TestFlintInferenceKernels:
+    @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+    @pytest.mark.parametrize("batch", [1, 2, 4, 8])
+    def test_fused_experts_match_reference(self, dtype, batch):
+        from mlx_vlm.models.flint import ModelConfig
+        from mlx_vlm.models.flint.kernels import down_reduce, gate_up_silu
+        from mlx_vlm.models.flint.language import SparseMoeBlock
+
+        mx.random.seed(31)
+        module = SparseMoeBlock(
+            ModelConfig(
+                hidden_size=2048,
+                moe_intermediate_size=512,
+                shared_expert_intermediate_size=64,
+                num_experts=8,
+                num_experts_per_tok=6,
+            )
+        )
+        module.set_dtype(dtype)
+        nn.quantize(module, group_size=64, bits=4)
+        module.eval()
+        for length in (1, 17):
+            x = mx.random.normal((batch, length, 2048)).astype(dtype)
+            expected = module._forward(x)
+            actual = module(x)
+            assert mx.array_equal(actual, expected).item()
+            if length == 1:
+                indices, weights = module.route(x)
+                activation = gate_up_silu(module.switch_mlp, x, indices)
+                assert activation is not None
+                fused = down_reduce(
+                    module.switch_mlp.down_proj,
+                    activation,
+                    indices,
+                    weights,
+                    module.shared_expert(x),
+                )
+                assert fused is not None
+                assert mx.array_equal(fused, expected).item()
+
+    @pytest.mark.parametrize("width", [64, 1536, 2048])
+    def test_weighted_sum_noncontiguous_rows(self, width):
+        from mlx_vlm.models.flint.kernels import metal_sum, weighted_sum
+
+        mx.random.seed(39)
+        routed = mx.random.normal((1, width, 6)).astype(mx.bfloat16).swapaxes(-1, -2)
+        weights = mx.softmax(mx.random.normal((1, 6)))
+        assert mx.array_equal(
+            metal_sum(routed, weights), weighted_sum(routed, weights)
+        ).item()
+
+    def test_compiled_moe_tracks_weights_and_quantization(self):
+        from mlx_vlm.models.flint import ModelConfig
+        from mlx_vlm.models.flint.language import SparseMoeBlock
+
+        mx.random.seed(32)
+        module = SparseMoeBlock(
+            ModelConfig(
+                hidden_size=64,
+                moe_intermediate_size=64,
+                shared_expert_intermediate_size=0,
+                num_experts=8,
+                num_experts_per_tok=6,
+            )
+        )
+        module.eval()
+        x = mx.random.normal((2, 1, 64))
+        original = module(x)
+        mx.eval(original)
+        module.switch_mlp.down_proj.weight *= 2
+        changed = module(x)
+        assert not mx.array_equal(original, changed).item()
+        np.testing.assert_array_equal(np.array(changed), np.array(module._forward(x)))
+        nn.quantize(module, group_size=32, bits=4)
+        np.testing.assert_array_equal(np.array(module(x)), np.array(module._forward(x)))
+
+    @pytest.mark.parametrize("top_k", [2, 6])
+    def test_cpu_fallback_and_training_gradients(self, top_k):
+        from mlx_vlm.models.flint import ModelConfig
+        from mlx_vlm.models.flint.language import SparseMoeBlock
+
+        module = SparseMoeBlock(
+            ModelConfig(
+                hidden_size=64,
+                moe_intermediate_size=64,
+                shared_expert_intermediate_size=0,
+                num_experts=8,
+                num_experts_per_tok=top_k,
+            )
+        )
+        x = mx.random.normal((1, 3, 64))
+        module.eval()
+        with mx.stream(mx.cpu):
+            actual, expected = module(x), module._forward(x)
+            np.testing.assert_allclose(np.array(actual), np.array(expected), atol=1e-6)
+        module.train()
+        loss, gradients = nn.value_and_grad(module, lambda m: mx.sum(m(x)))(module)
+        mx.eval(loss, gradients)
+        assert mx.isfinite(loss).item()
+        assert all(mx.all(mx.isfinite(v)).item() for _, v in tree_flatten(gradients))
