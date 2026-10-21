@@ -18,6 +18,7 @@ GROUPS = (
     {
         "test_cache.py",
         "test_moe_offload.py",
+        "test_gated_delta.py",
     },
     {
         "test_models.py",
@@ -31,8 +32,6 @@ GROUPS = (
         "test_extraction_models.py",
         "test_server.py",
         "test_generate.py",
-        "test_gated_delta.py",
-        "test_training_metrics.py",
     },
     {
         "test_model_ops.py",
