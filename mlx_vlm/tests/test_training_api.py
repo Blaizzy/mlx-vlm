@@ -30,11 +30,11 @@ from mlx_vlm.trainer.vlm.orpo.trainer import ORPOTrainingArgs as LegacyORPOTrain
 
 
 class TinyLM(nn.Module):
-    def __init__(self, *, bias=True):
+    def __init__(self):
         super().__init__()
         self.config = SimpleNamespace(model_type="tiny", vocab_size=8)
         self.embedding = nn.Embedding(8, 4)
-        self.projection = nn.Linear(4, 8, bias=bias)
+        self.projection = nn.Linear(4, 8)
 
     def __call__(self, input_ids, pixel_values=None, attention_mask=None, **kwargs):
         return self.projection(self.embedding(input_ids))
@@ -161,7 +161,7 @@ class EngineTest(unittest.TestCase):
                     tempfile.TemporaryDirectory() as folder,
                 ):
                     mx.random.seed(7)
-                    model, reference = TinyLM(bias=False), TinyLM(bias=False)
+                    model, reference = TinyLM(), TinyLM()
                     before = [
                         mx.array(value) for _, value in tree_flatten(model.parameters())
                     ]
