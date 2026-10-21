@@ -20,12 +20,12 @@ def weighted_sum(routed, weights):
 def _weighted_kernel():
     return mx.fast.metal_kernel(
         name="flint_weighted_sum",
-        input_names=["routed", "weights"],
+        input_names=["routed", "weights", "limit"],
         output_names=["out"],
         header="#pragma clang fp contract(off)\n",
         source="""
         uint i = thread_position_in_grid.x;
-        if (i >= SIZE) return;
+        if (i >= limit) return;
         uint row = i / D;
         uint col = i % D;
         float value = 0.0f;
@@ -51,12 +51,11 @@ def metal_sum(routed, weights):
     shape = (*routed.shape[:-2], routed.shape[-1])
     size = routed.size // routed.shape[-2]
     return _weighted_kernel()(
-        inputs=[routed, weights],
+        inputs=[routed, weights, mx.array(size, mx.uint32)],
         template=[
             ("T", routed.dtype),
             ("D", routed.shape[-1]),
             ("K", routed.shape[-2]),
-            ("SIZE", size),
         ],
         grid=(size, 1, 1),
         threadgroup=(256, 1, 1),

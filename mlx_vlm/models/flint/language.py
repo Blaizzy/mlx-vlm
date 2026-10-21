@@ -147,7 +147,8 @@ class SparseMoeBlock(nn.Module):
         # Paged experts perform data-dependent I/O and cannot be traced.
         if self.training or type(self.switch_mlp) is not SwitchGLU:
             return self._forward(x)
-        return self._compiled(x)
+        # Prompt lengths vary: avoid retaining a trace for each prefill shape.
+        return self._compiled(x) if x.shape[1] == 1 else self._inference(x)
 
 
 class DecoderLayer(nn.Module):
