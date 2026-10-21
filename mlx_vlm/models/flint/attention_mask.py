@@ -15,11 +15,13 @@ def _mask_kernel():
         input_names=["padding", "parameters"],
         output_names=["mask"],
         source="""
-        uint i = thread_position_in_grid.x;
-        uint n = parameters[0], k = parameters[1], batch = parameters[2];
-        if (i >= batch * n * k) return;
-        uint row = i / (n * k), query = (i / k) % n, column = i % k;
-        uint key = (column + k - parameters[5]) % k;
+        uint column = thread_position_in_grid.x;
+        uint query = thread_position_in_grid.y;
+        uint row = thread_position_in_grid.z;
+        uint n = parameters[0], k = parameters[1], shift = parameters[5];
+        if (column >= k) return;
+        size_t i = (size_t(row) * n + query) * k + column;
+        uint key = column >= shift ? column - shift : column + k - shift;
         int left = int(padding[row]) - int(parameters[6]);
         uint position = query + parameters[3];
         mask[i] = position >= key &&
@@ -65,7 +67,7 @@ def create_attention_mask(
             parameter_cache[geometry] = parameters
     return _mask_kernel()(
         inputs=[cache.left_padding, parameters],
-        grid=(batch * length * keys, 1, 1),
+        grid=(keys, length, batch),
         threadgroup=(256, 1, 1),
         output_shapes=[(batch, 1, length, keys)],
         output_dtypes=[mx.bool_],
