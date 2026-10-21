@@ -8,10 +8,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 TESTS = ROOT / "mlx_vlm" / "tests"
 
-# Keep training and speculation together to leave two Mac runners for the
-# heavier model suites. Portable interfaces and generation run on Linux.
+# Keep RAM-sensitive cache tests away from the larger model contracts.
+# Portable interfaces and generation run on Linux; other groups use three Macs.
 GROUPS = {
-    "training-ops": {"test_speculative.py", "test_model_ops.py"},
+    "training-ops": {"test_cache.py", "test_moe_offload.py", "test_model_ops.py"},
     "media": {
         "test_extraction_models.py",
         "test_audio_models.py",

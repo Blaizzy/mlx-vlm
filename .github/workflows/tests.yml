@@ -60,11 +60,11 @@ jobs:
             os: ubuntu-24.04
             extras: 'test,cpu'
           - group: training-ops
-            suite: Training, speculation & model operations
+            suite: Training, cache, offloading & model operations
             os: macos-14
             extras: test
           - group: models
-            suite: Models, cache, processors & offloading
+            suite: Models, processors & speculation
             os: macos-14
             extras: test
           - group: media
