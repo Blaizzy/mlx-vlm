@@ -19,6 +19,10 @@ GROUPS = (
         "test_cli.py",
         "test_tool_streaming.py",
         "test_sampling_defaults.py",
+        "test_diffusion_models.py",
+        "test_video_generation_models.py",
+        "test_training_grpo.py",
+        "test_training_grpo_text_notebook.py",
     },
     {
         "test_models.py",
