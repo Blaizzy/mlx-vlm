@@ -34,7 +34,9 @@ this endpoint. This is not a claim of full OpenAI Realtime protocol compatibilit
 
 Limits: 128 KiB per JSON message, 64 queued input messages, 64 queued output
 events, 30 seconds idle/input-stall timeout, 120 seconds per socket and per
-utterance. Input waits for queue space to absorb encoder cold-start latency;
+utterance. The input-idle timeout applies until commit; final decoding uses the
+remaining session time while cancellation and disconnects remain supported.
+Input waits for queue space to absorb encoder cold-start latency;
 slow consumers eventually time out. Backend buffering limits still apply.
 Send small chunks at playback pace; do not upload a whole recording at once.
 WebSocket transports may buffer frames before application validation; configure
@@ -52,7 +54,9 @@ Run `python -m pytest -q mlx_vlm/tests/test_server.py
 mlx_vlm/tests/test_server_stt_realtime.py` on an MLX-capable host. The realtime
 STT tests use an in-memory fake model and cover partial-before-commit,
 finalization, malformed input, authentication, contention, disconnect,
-post-commit rejection, cold-step backpressure and shutdown with pending requests.
+post-commit rejection, idle and session timeouts, slow finalization, cold-step
+backpressure and cancellation errors for active and pending batch requests during
+shutdown.
 They do not download model weights.
 
 On 16 October 2026, the candidate on upstream `6d2f226` passed 672 tests, with

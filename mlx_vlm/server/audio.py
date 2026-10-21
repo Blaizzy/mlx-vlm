@@ -234,9 +234,9 @@ class AudioRequestQueue:
                 self._active_request = request
                 if self._stop.is_set():
                     request.cancel_event.set()
+            failed = False
             try:
                 if request.cancel_event.is_set():
-                    request.mark_ready(RuntimeError("Audio request cancelled"))
                     continue
                 if request.kind == "tts":
                     _run_tts_request(request)
@@ -249,11 +249,19 @@ class AudioRequestQueue:
                 else:
                     raise ValueError(f"Unsupported audio request kind: {request.kind}")
             except Exception as exc:
+                failed = True
                 traceback.print_exc()
                 if not request.ready_event.is_set():
                     request.mark_ready(exc)
                 request.emit_error(exc)
             finally:
+                if request.cancel_event.is_set() and not failed:
+                    error = HTTPException(
+                        status_code=503, detail="Audio request cancelled"
+                    )
+                    if not request.ready_event.is_set():
+                        request.mark_ready(error)
+                    request.emit_error(error)
                 request.emit_done()
                 mx.clear_cache()
                 with self._admission:

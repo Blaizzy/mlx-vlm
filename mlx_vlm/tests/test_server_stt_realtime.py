@@ -1,14 +1,17 @@
 import base64
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
+from fastapi import WebSocketDisconnect
 from fastapi.testclient import TestClient
 
 import mlx_vlm.server as server
-from mlx_vlm.server import audio
-from mlx_vlm.tests.test_server import reset_audio_runtime as reset_audio_runtime
+from mlx_vlm.server import audio, audio_realtime
+from mlx_vlm.tests.test_server import reset_audio_runtime  # noqa: F401
 
 
 class Session:
@@ -160,6 +163,94 @@ def test_post_commit_audio_is_rejected(session):
     assert not session.pending
 
 
+def test_finalization_outlasts_input_idle_timeout(session, monkeypatch):
+    monkeypatch.setattr(audio_realtime, "IDLE_TIMEOUT", 0.15)
+    monkeypatch.setattr(audio_realtime, "SESSION_TIMEOUT", 2)
+    closed_at = None
+
+    def close():
+        nonlocal closed_at
+        closed_at = time.monotonic()
+
+    def step(**kwargs):
+        if closed_at is None:
+            return []
+        time.sleep(0.02)
+        if time.monotonic() - closed_at >= 0.4:
+            session.done = True
+        return ["word "]
+
+    session.close = close
+    session.step = step
+    with TestClient(server.app) as client:
+        with client.websocket_connect(
+            "/v1/audio/transcriptions/realtime?model=fake"
+        ) as ws:
+            assert ws.receive_json()["type"] == "session.created"
+            ws.send_json({"type": "input_audio_buffer.append", "audio": "AAA="})
+            receive_until(ws, "conversation.item.added")
+            ws.send_json({"type": "input_audio_buffer.commit"})
+            receive_until(ws, "input_audio_buffer.committed")
+            deltas = []
+            while True:
+                message = ws.receive_json()
+                assert message["type"] != "error", message
+                if (
+                    message["type"]
+                    == "conversation.item.input_audio_transcription.delta"
+                ):
+                    deltas.append(message["delta"])
+                else:
+                    assert message["type"] == (
+                        "conversation.item.input_audio_transcription.completed"
+                    )
+                    assert deltas
+                    assert message["transcript"] == "".join(deltas)
+                    break
+
+
+@pytest.mark.parametrize("committed", [False, True])
+def test_session_timeouts(session, monkeypatch, committed):
+    monkeypatch.setattr(audio_realtime, "IDLE_TIMEOUT", 0.1)
+    monkeypatch.setattr(audio_realtime, "SESSION_TIMEOUT", 0.5)
+    session.close = lambda: None
+    with TestClient(server.app) as client:
+        with client.websocket_connect(
+            "/v1/audio/transcriptions/realtime?model=fake"
+        ) as ws:
+            assert ws.receive_json()["type"] == "session.created"
+            if committed:
+                ws.send_json({"type": "input_audio_buffer.commit"})
+                receive_until(ws, "input_audio_buffer.committed")
+            error = ws.receive_json()
+            assert error["type"] == "error"
+            expected = (
+                "Session duration limit exceeded" if committed else "TimeoutError"
+            )
+            assert error["error"]["message"] == expected
+    assert session.cancelled.wait(2)
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_post_commit_cancellation_and_disconnect(session, cancel):
+    session.close = lambda: None
+    with TestClient(server.app) as client:
+        with client.websocket_connect(
+            "/v1/audio/transcriptions/realtime?model=fake"
+        ) as ws:
+            assert ws.receive_json()["type"] == "session.created"
+            ws.send_json({"type": "input_audio_buffer.commit"})
+            receive_until(ws, "input_audio_buffer.committed")
+            if cancel:
+                ws.send_json({"type": "session.cancel"})
+            else:
+                ws.close()
+            assert session.cancelled.wait(2)
+            if cancel:
+                with pytest.raises(WebSocketDisconnect):
+                    ws.receive_json()
+
+
 def test_shutdown_resolves_active_and_pending(monkeypatch, reset_audio_runtime):
     started = threading.Event()
 
@@ -176,10 +267,69 @@ def test_shutdown_resolves_active_and_pending(monkeypatch, reset_audio_runtime):
     worker.stop_and_join()
     assert active.cancel_event.is_set()
     assert pending.ready_event.is_set()
-    assert pending.ready_error is not None
+    assert pending.ready_error.status_code == 503
+    error = pending.result_queue.get_nowait()
+    assert error.kind == "error"
+    assert error.error is pending.ready_error
     assert pending.result_queue.get_nowait().kind == "done"
+    active_error = active.result_queue.get_nowait()
+    assert active_error.kind == "error"
+    assert active_error.error.status_code == 503
+    assert active.result_queue.get_nowait().kind == "done"
     with pytest.raises(Exception, match="stopping"):
         worker.submit(kind="stt", model_name="fake", payload={})
+
+
+@pytest.mark.parametrize("endpoint", ["speech", "transcriptions"])
+@pytest.mark.parametrize("pending", [False, True])
+@pytest.mark.parametrize("stream", [False, True])
+def test_shutdown_returns_error_for_cancelled_batch(
+    monkeypatch, reset_audio_runtime, endpoint, pending, stream
+):
+    started = threading.Event()
+    submitted = threading.Event()
+
+    def run(request):
+        started.set()
+        assert request.cancel_event.wait(5)
+
+    monkeypatch.setattr(audio, "_run_stt_request", run)
+    monkeypatch.setattr(audio, "_run_tts_request", run)
+    monkeypatch.setattr(
+        audio, "audio_read", lambda *args, **kwargs: (np.zeros(160), 16000)
+    )
+    with TestClient(server.app) as client:
+        worker = audio._get_audio_queue()
+        if pending:
+            worker.submit(kind="stt", model_name="active", payload={})
+            assert started.wait(2)
+        original_submit = worker.submit
+
+        def submit(**kwargs):
+            handle = original_submit(**kwargs)
+            submitted.set()
+            return handle
+
+        monkeypatch.setattr(worker, "submit", submit)
+        if endpoint == "speech":
+            options = {"json": {"model": "fake", "input": "hello", "stream": stream}}
+        else:
+            options = {
+                "files": {"file": ("test.wav", b"audio-bytes", "audio/wav")},
+                "data": {"model": "fake", "stream": stream},
+            }
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            response_future = pool.submit(
+                client.post, "/v1/audio/" + endpoint, **options
+            )
+            try:
+                assert submitted.wait(2)
+                assert started.wait(2)
+            finally:
+                worker.stop_and_join()
+            response = response_future.result(timeout=2)
+        assert response.status_code == 503
+        assert response.json()["detail"] == "Audio request cancelled"
 
 
 def test_authentication_applies_to_websocket(session, monkeypatch):

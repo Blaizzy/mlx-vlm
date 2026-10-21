@@ -154,8 +154,14 @@ async def audio_realtime_endpoint(websocket: WebSocket, model: str):
         )
 
         async def receive():
+            committed = False
             while True:
-                raw = await asyncio.wait_for(websocket.receive_text(), IDLE_TIMEOUT)
+                # After commit, decoding may outlast the input-idle limit.
+                # Keep receiving cancellation/disconnects under the session deadline.
+                raw = await asyncio.wait_for(
+                    websocket.receive_text(),
+                    timeout=None if committed else IDLE_TIMEOUT,
+                )
                 if len(raw.encode("utf-8")) > MAX_MESSAGE_BYTES:
                     raise ValueError("Message size limit exceeded")
                 message = json.loads(raw)
@@ -172,6 +178,8 @@ async def audio_realtime_endpoint(websocket: WebSocket, model: str):
                         if time.monotonic() >= deadline:
                             raise ValueError("Audio input queue stalled") from None
                         await asyncio.sleep(0.01)
+                if message.get("type") == "input_audio_buffer.commit":
+                    committed = True
 
         async def transmit():
             while not handle.cancel_event.is_set():
