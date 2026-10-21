@@ -15,7 +15,6 @@ GROUPS = (
         "test_cache.py",
         "test_moe_offload.py",
         "test_model_ops.py",
-        "test_generate.py",
         "test_processors.py",
         "test_cli.py",
         "test_tool_streaming.py",
@@ -25,8 +24,10 @@ GROUPS = (
         "test_models.py",
         "test_extraction_models.py",
         "test_server.py",
+        "test_generate.py",
         "test_audio_models.py",
         "test_training_api.py",
+        "test_training_metrics.py",
     },
 )
 
