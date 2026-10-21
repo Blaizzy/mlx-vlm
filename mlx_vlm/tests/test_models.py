@@ -5504,3 +5504,26 @@ class TestFlintInferenceKernels:
         module._compiled = fail_if_compiled
         x = mx.random.normal((1, 1, 64))
         assert mx.array_equal(module(x), module._forward(x)).item()
+
+    def test_variable_prefill_does_not_compile_whole_moe(self):
+        from mlx_vlm.models.flint import ModelConfig
+        from mlx_vlm.models.flint.language import SparseMoeBlock
+
+        module = SparseMoeBlock(
+            ModelConfig(
+                hidden_size=64,
+                moe_intermediate_size=64,
+                shared_expert_intermediate_size=0,
+                num_experts=8,
+                num_experts_per_tok=6,
+            )
+        )
+        module.eval()
+
+        def fail_if_compiled(_):
+            pytest.fail("Variable prefill shapes must not create whole-MoE traces")
+
+        module._compiled = fail_if_compiled
+        for length in (3, 7, 17):
+            x = mx.random.normal((2, length, 64))
+            assert mx.array_equal(module(x), module._forward(x)).item()
