@@ -1,15 +1,12 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import (
-    LanguageModelOutput,
-    create_attention_mask,
-    scaled_dot_product_attention,
-)
+from ..base import LanguageModelOutput, scaled_dot_product_attention
 from ..cache import KVCache, RotatingKVCache
 from ..mlp import SwiGLUMLP
 from ..rope_utils import initialize_rope
 from ..switch_layers import SwitchGLU, stack_expert_projection
+from .attention_mask import create_attention_mask
 from .config import ModelConfig
 from .kernels import down_reduce, gate_up_silu, metal_sum, normalize_expert_weights
 
@@ -188,8 +185,14 @@ class FlintModel(nn.Module):
     def __call__(self, inputs, cache=None, inputs_embeds=None):
         x = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
         cache = [None] * len(self.layers) if cache is None else cache
+        mask_parameters = {}
         for layer, c in zip(self.layers, cache):
-            mask = create_attention_mask(x, c, window_size=layer.self_attn.window_size)
+            mask = create_attention_mask(
+                x,
+                c,
+                window_size=layer.self_attn.window_size,
+                parameter_cache=mask_parameters,
+            )
             x = layer(x, mask, c)
         return self.norm(x)
 

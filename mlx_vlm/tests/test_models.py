@@ -5556,3 +5556,65 @@ class TestFlintInferenceKernels:
                 metal_sum(routed, weights, shared),
                 weighted_sum(routed, weights) + shared,
             ).item()
+
+
+class TestFlintAttentionMasks:
+    @pytest.mark.parametrize("rotating", [False, True])
+    @pytest.mark.parametrize("right_padded", [False, True])
+    def test_matches_cache_through_prefill_rotation_and_finalize(
+        self, rotating, right_padded
+    ):
+        from mlx_vlm.models.cache import BatchKVCache, BatchRotatingKVCache
+        from mlx_vlm.models.flint.attention_mask import create_attention_mask
+
+        padding = [0, 5, 2]
+        cache = BatchRotatingKVCache(17, padding) if rotating else BatchKVCache(padding)
+        window = 17 if rotating else None
+        if right_padded:
+            cache.prepare(lengths=[18, 15, 17], right_padding=[0, 3, 1])
+        for step, length in enumerate((3, 14, 1, 1, 1, 7, 1, 1, 13, 1, 1)):
+            x = mx.zeros((3, length, 16))
+            expected = cache.make_mask(length, window_size=window)
+            actual = create_attention_mask(x, cache, window)
+            assert mx.array_equal(actual, expected).item()
+            kv = mx.random.normal((3, 2, length, 8))
+            mx.eval(cache.update_and_fetch(kv, kv))
+            if step == 2:
+                cache.finalize()
+            if step == 6:
+                cache.filter(mx.array([2, 0, 1]))
+
+    def test_geometry_reuse_keeps_independent_padding(self):
+        from mlx_vlm.models.cache import BatchKVCache
+        from mlx_vlm.models.flint.attention_mask import create_attention_mask
+
+        parameters = {}
+        x = mx.zeros((2, 7, 16))
+        first, second = BatchKVCache([0, 0]), BatchKVCache([2, 4])
+        a = create_attention_mask(x, first, parameter_cache=parameters)
+        b = create_attention_mask(x, second, parameter_cache=parameters)
+        assert not mx.array_equal(a, b).item()
+        assert mx.array_equal(a, first.make_mask(7)).item()
+        assert mx.array_equal(b, second.make_mask(7)).item()
+        if mx.metal.is_available() and mx.default_device() == mx.gpu:
+            assert len(parameters) == 1
+        second.left_padding = mx.array([1, 3])
+        changed = create_attention_mask(x, second, parameter_cache=parameters)
+        assert mx.array_equal(changed, second.make_mask(7)).item()
+        assert not mx.array_equal(changed, b).item()
+
+    def test_custom_cache_and_cpu_fallback(self):
+        from mlx_vlm.models.cache import BatchKVCache
+        from mlx_vlm.models.flint.attention_mask import create_attention_mask
+
+        class CustomCache(BatchKVCache):
+            def make_mask(self, length, **kwargs):
+                return "causal"
+
+        x = mx.zeros((1, 3, 16))
+        assert create_attention_mask(x, CustomCache([0])) == "causal"
+        cache = BatchKVCache([1])
+        with mx.stream(mx.cpu):
+            assert mx.array_equal(
+                create_attention_mask(x, cache), cache.make_mask(3)
+            ).item()
