@@ -5,6 +5,9 @@ import mlx.core as mx
 import numpy as np
 import pytest
 from PIL import Image
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from transformers import PreTrainedTokenizerFast
 
 from mlx_vlm.models import oxr
 from mlx_vlm.models.oxr.vision import bicubic_matrix
@@ -118,6 +121,115 @@ def test_processor_expands_image_placeholder():
     assert ids[2] == 61 and ids[3 + n_atoms] == 62
     assert out["pixel_values"].shape == (int(np.prod(grid)), 3 * 4 * 4)
     assert grid[1] % 2 == 0 and grid[2] % 2 == 0
+
+
+@pytest.fixture
+def oxr_processor():
+    specials = ["<|image_pad|>", "<|vision_start|>", "<|vision_end|>"]
+    vocab = {token: i for i, token in enumerate(["<unk>", "<eos>"] + specials)}
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(WordLevel(vocab, unk_token="<unk>")),
+        unk_token="<unk>",
+        eos_token="<eos>",
+        pad_token="<eos>",
+        additional_special_tokens=specials,
+        chat_template="{{ messages[0]['content'] }}",
+    )
+    return oxr.OXRProcessor(
+        image_processor=oxr.OXRImageProcessor(
+            min_pixels=65536,
+            max_pixels=65536,
+            patch_size=8,
+            hidden_stride=4,
+            image_mean=[0.1, 0.2, 0.3],
+            image_std=[0.7, 0.8, 0.9],
+        ),
+        tokenizer=tokenizer,
+        chat_template=tokenizer.chat_template,
+    )
+
+
+@pytest.mark.parametrize("save_processor", [True, False], ids=["nested", "standalone"])
+def test_processor_from_pretrained_restores_image_settings(
+    oxr_processor, tmp_path, save_processor
+):
+    if save_processor:
+        oxr_processor.save_pretrained(tmp_path)
+    else:
+        oxr_processor.tokenizer.save_pretrained(tmp_path)
+        oxr_processor.image_processor.save_pretrained(tmp_path)
+        # Legacy processor configs need not contain nested image settings.
+        (tmp_path / "processor_config.json").write_text(
+            json.dumps({"processor_class": "OXRProcessor"})
+        )
+    restored = oxr.OXRProcessor.from_pretrained(tmp_path, local_files_only=True)
+    image = Image.new("RGB", (2048, 2048), (64, 128, 192))
+    expected = oxr_processor(images=[image], text="<image>")
+    actual = restored(images=[image], text="<image>")
+    assert restored.image_processor.max_pixels == 65536
+    assert restored.image_processor.min_pixels == 65536
+    assert restored.image_processor.patch_size == 8
+    assert restored.image_processor.hidden_stride == 4
+    assert actual["input_ids"][0].count(2) == 64
+    assert actual["pixel_values"].shape == (1024, 192)
+    assert actual["input_ids"] == expected["input_ids"]
+    np.testing.assert_array_equal(actual["image_grid_thw"], expected["image_grid_thw"])
+    np.testing.assert_array_equal(actual["pixel_values"], expected["pixel_values"])
+
+
+def test_processor_from_pretrained_applies_image_overrides(oxr_processor, tmp_path):
+    oxr_processor.save_pretrained(tmp_path)
+    restored = oxr.OXRProcessor.from_pretrained(
+        tmp_path,
+        local_files_only=True,
+        min_pixels=262144,
+        max_pixels=262144,
+        patch_size=16,
+        hidden_stride=2,
+        image_mean=[0.5, 0.5, 0.5],
+        image_std=[0.5, 0.5, 0.5],
+    )
+    actual = restored(
+        images=[Image.new("RGB", (2048, 2048), (64, 128, 192))], text="<image>"
+    )
+    assert restored.image_processor.min_pixels == 262144
+    assert restored.image_processor.max_pixels == 262144
+    assert restored.image_processor.merge_size == 2
+    assert actual["input_ids"][0].count(2) == 256
+    assert actual["pixel_values"].shape == (1024, 768)
+    np.testing.assert_array_equal(actual["image_grid_thw"], [[1, 32, 32]])
+    normalized = (np.array([64, 128, 192], dtype=np.float32) / 255 - 0.5) / 0.5
+    np.testing.assert_allclose(
+        actual["pixel_values"][0].reshape(3, 16, 16)[:, 0, 0], normalized
+    )
+
+
+@pytest.mark.parametrize("config_key", ["vit_config", "vision_config"])
+def test_processor_from_pretrained_uses_checkpoint_patch_config(
+    oxr_processor, tmp_path, config_key
+):
+    oxr_processor.tokenizer.save_pretrained(tmp_path)
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "oxr", config_key: {"patch_size": 4}})
+    )
+    (tmp_path / "preprocessor_config.json").write_text(
+        json.dumps({"image_processor_type": "SiglipImageProcessor"})
+    )
+    restored = oxr.OXRProcessor.from_pretrained(tmp_path, local_files_only=True)
+    assert restored.image_processor.patch_size == 4
+    assert restored.image_processor.hidden_stride == 2
+    assert restored.image_processor.min_pixels == 448**2
+    assert restored.image_processor.max_pixels == 960**2
+
+
+def test_processor_from_pretrained_without_image_sidecars(oxr_processor, tmp_path):
+    oxr_processor.tokenizer.save_pretrained(tmp_path)
+    restored = oxr.OXRProcessor.from_pretrained(
+        tmp_path, local_files_only=True, min_pixels=65536, max_pixels=65536
+    )
+    assert restored.image_processor.patch_size == 16
+    actual = restored(images=[Image.new("RGB", (2048, 2048))], text="<image>")
+    assert actual["input_ids"][0].count(2) == 64
 
 
 def test_input_embeddings_splice_visual_tokens_and_indicators(model):

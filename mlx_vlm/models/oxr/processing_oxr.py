@@ -11,6 +11,7 @@ from transformers import AutoTokenizer
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_processing_utils import BaseImageProcessor
 from transformers.processing_utils import ProcessorMixin
+from transformers.utils import cached_file
 
 from ..base import install_auto_processor_patch, load_chat_template
 
@@ -215,6 +216,31 @@ class OXRProcessor(ProcessorMixin):
 
         kwargs.pop("trust_remote_code", None)
         kwargs.pop("use_fast", None)
+        image_kwargs = {
+            key: kwargs.pop(key)
+            for key in (
+                "min_pixels",
+                "max_pixels",
+                "patch_size",
+                "hidden_stride",
+                "temporal_patch_size",
+                "image_mean",
+                "image_std",
+            )
+            if key in kwargs
+        }
+        hub_kwargs = {
+            key: kwargs[key]
+            for key in (
+                "cache_dir",
+                "force_download",
+                "local_files_only",
+                "revision",
+                "token",
+                "subfolder",
+            )
+            if key in kwargs
+        }
         model_path = Path(pretrained_model_name_or_path)
         is_local = model_path.exists() and model_path.is_dir()
         # OXR uses the built-in Qwen2 tokenizer; its remote code is torch-only.
@@ -228,27 +254,47 @@ class OXRProcessor(ProcessorMixin):
         else:
             try:
                 template = hf_hub_download(
-                    pretrained_model_name_or_path, "chat_template.jinja"
+                    pretrained_model_name_or_path, "chat_template.jinja", **hub_kwargs
                 )
                 tokenizer.chat_template = Path(template).read_text()
             except Exception:
                 pass
 
-        vit = {}
-        try:
-            config_path = (
-                model_path / "config.json"
-                if is_local
-                else Path(hf_hub_download(pretrained_model_name_or_path, "config.json"))
-            )
-            vit = json.loads(config_path.read_text()).get("vit_config", {})
-        except Exception:
-            pass
-        image_processor = OXRImageProcessor(
-            patch_size=vit.get("patch_size", 16),
-            hidden_stride=vit.get("hidden_stride", 2),
-            temporal_patch_size=vit.get("temporal_patch_size", 1),
+        config_path = cached_file(
+            pretrained_model_name_or_path,
+            "config.json",
+            _raise_exceptions_for_missing_entries=False,
+            **hub_kwargs,
         )
+        config = json.loads(Path(config_path).read_text()) if config_path else {}
+        vit = config.get("vision_config") or config.get("vit_config", {})
+
+        # Transformers saves nested processor settings in newer versions and
+        # standalone image processor settings in older versions.
+        image_config = {}
+        for filename in ("processor_config.json", "preprocessor_config.json"):
+            saved_path = cached_file(
+                pretrained_model_name_or_path,
+                filename,
+                _raise_exceptions_for_missing_entries=False,
+                **hub_kwargs,
+            )
+            if saved_path is None:
+                continue
+            saved_config = json.loads(Path(saved_path).read_text())
+            if filename == "processor_config.json":
+                saved_config = saved_config.get("image_processor")
+            if saved_config is not None:
+                image_config = saved_config
+                break
+        for key, default in (
+            ("patch_size", 16),
+            ("hidden_stride", 2),
+            ("temporal_patch_size", 1),
+        ):
+            image_config.setdefault(key, vit.get(key, default))
+        image_config.update(image_kwargs)
+        image_processor = OXRImageProcessor(**image_config)
         return cls(
             image_processor=image_processor,
             tokenizer=tokenizer,
