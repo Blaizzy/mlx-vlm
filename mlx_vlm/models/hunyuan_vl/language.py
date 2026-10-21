@@ -6,6 +6,7 @@ import numpy as np
 
 from ..base import (
     LanguageModelOutput,
+    cache_position_offset,
     create_attention_mask,
     kv_sequence_length,
     scaled_dot_product_attention,
@@ -202,16 +203,7 @@ class Attention(nn.Module):
         kv_seq_len = L
         offset_scalar = 0
         if cache is not None:
-            # Prefer cache._idx (Python int) to avoid a per-step GPU sync.
-            if hasattr(cache, "_idx"):
-                offset_scalar = int(cache._idx)
-            else:
-                off = cache.offset
-                offset_scalar = (
-                    int(off)
-                    if isinstance(off, int)
-                    else (int(off.max().item()) if off.ndim > 0 else int(off.item()))
-                )
+            offset_scalar = cache_position_offset(cache)
             kv_seq_len += offset_scalar
 
         cos, sin = self.rotary_emb(values, seq_len=kv_seq_len)
