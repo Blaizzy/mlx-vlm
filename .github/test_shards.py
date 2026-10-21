@@ -11,16 +11,22 @@ TESTS = ROOT / "mlx_vlm" / "tests"
 # Balance using Actions timings, not test counts. The last shard also picks up
 # new test files automatically, so adding a suite never silently drops coverage.
 GROUPS = (
-    {"test_cache.py", "test_moe_offload.py", "test_model_ops.py"},
-    {"test_models.py", "test_extraction_models.py"},
-    {"test_speculative.py", "test_gated_delta.py"},
     {
-        "test_server.py",
+        "test_cache.py",
+        "test_moe_offload.py",
+        "test_model_ops.py",
         "test_generate.py",
         "test_processors.py",
         "test_cli.py",
         "test_tool_streaming.py",
         "test_sampling_defaults.py",
+    },
+    {
+        "test_models.py",
+        "test_extraction_models.py",
+        "test_server.py",
+        "test_audio_models.py",
+        "test_training_api.py",
     },
 )
 
@@ -59,7 +65,7 @@ if __name__ == "__main__":
                 "pytest",
                 "-q",
                 "-n",
-                "2",
+                "3",
                 "--dist=worksteal",
                 "--durations=30",
                 f"--junitxml={ROOT}/test-results/shard-{args.shard}.xml",
