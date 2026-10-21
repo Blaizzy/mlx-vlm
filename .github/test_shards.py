@@ -8,35 +8,31 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 TESTS = ROOT / "mlx_vlm" / "tests"
 
-# Keep the full verifier matrix intact, but run it with the loading shard.
-# New speculative tests remain in the main speculative shard.
-VERIFIER_PARITY = "test_speculative.py::test_verify_commit_matches_decode"
-
-# The first shard covers portable interfaces on Linux; model and Metal checks
-# stay on macOS. Balance using Actions timings, not test counts. The last Mac
-# shard picks up new files automatically so adding a suite cannot drop coverage.
-GROUPS = (
-    {
+# Keep training and speculation together to leave two Mac runners for the
+# heavier model suites. Portable interfaces and generation run on Linux.
+GROUPS = {
+    "training-ops": {"test_speculative.py", "test_model_ops.py"},
+    "media": {
+        "test_extraction_models.py",
+        "test_audio_models.py",
+        "test_image_generation_models.py",
+        "test_video_generation_models.py",
+        "test_diffusion_models.py",
+        "test_flux3.py",
+        "test_flux3_upsampler.py",
+        "test_llada_image.py",
+        "test_moss_image.py",
+        "test_muse_spark_video.py",
+    },
+    "interfaces": {
         "test_server.py",
+        "test_server_stt_realtime.py",
         "test_cli.py",
         "test_sampling_defaults.py",
         "test_tool_streaming.py",
-    },
-    {
-        "test_cache.py",
-        "test_moe_offload.py",
-        "test_processors.py",
-        "test_training_api.py",
-    },
-    {
-        "test_models.py",
-        "test_extraction_models.py",
         "test_generate.py",
-        "test_audio_models.py",
-        "test_image_generation_models.py",
-        "test_training_metrics.py",
     },
-)
+}
 
 
 def shards():
@@ -45,30 +41,33 @@ def shards():
         for pattern in ("test_*.py", "*_test.py")
         for path in TESTS.rglob(pattern)
     }
-    assigned = set().union(*GROUPS)
-    if len(assigned) != sum(map(len, GROUPS)):
+    groups = {name: set(files) for name, files in GROUPS.items()}
+    groups["training-ops"].update(
+        name for name in files if Path(name).name.startswith("test_train")
+    )
+    groups["interfaces"].update(
+        name for name in files if Path(name).name.startswith("test_server")
+    )
+    assigned = set().union(*groups.values())
+    if len(assigned) != sum(map(len, groups.values())):
         raise ValueError("A test file is assigned to more than one shard")
     if missing := assigned - files:
         raise ValueError(f"Shard configuration references missing tests: {missing}")
-    # Start the long training contract early so it can compile while other
-    # workers drain the model cases instead of leaving it as a final straggler.
-    return [
-        sorted(group, key=lambda name: (name != "test_training_api.py", name))
-        for group in (*GROUPS, files - assigned)
-    ]
+    # New model suites join this group automatically instead of losing coverage.
+    groups["models"] = files - assigned
+    # Start training compilation early instead of leaving it as a straggler.
+    return {
+        name: sorted(group, key=lambda path: (path != "test_training_api.py", path))
+        for name, group in groups.items()
+    }
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("shard", type=int, choices=range(1, len(GROUPS) + 2))
+    groups = shards()
+    parser.add_argument("group", choices=groups)
     args = parser.parse_args()
-    paths = [str(TESTS / name) for name in shards()[args.shard - 1]]
-    deselect = []
-    if str(TESTS / "test_speculative.py") in paths:
-        # Match parameter cases without excluding future similarly named tests.
-        deselect = [f"--deselect=mlx_vlm/tests/{VERIFIER_PARITY}["]
-    if args.shard == 2:
-        paths.append(str(TESTS / VERIFIER_PARITY))
+    paths = [str(TESTS / name) for name in groups[args.group]]
     if not paths:
         parser.error("Shard has no test files")
     result = subprocess.run(
@@ -81,8 +80,7 @@ if __name__ == "__main__":
             "3",
             "--dist=worksteal",
             "--durations=30",
-            f"--junitxml={ROOT}/test-results/shard-{args.shard}.xml",
-            *deselect,
+            f"--junitxml={ROOT}/test-results/{args.group}.xml",
             *paths,
         ],
         cwd=ROOT / "mlx_vlm",
