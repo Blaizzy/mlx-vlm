@@ -26,6 +26,7 @@ SYSTEM_PROMPT = (
     "Judge whether the Document meets the requirements based on the Query and the "
     'Instruct provided. Note that the answer can only be "yes" or "no".'
 )
+TEXT_PREFIX = "<|im_start|>system\n" + SYSTEM_PROMPT + "<|im_end|>\n<|im_start|>user\n"
 TEXT_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 DEFAULT_MAX_LENGTH = 8192
 
@@ -120,20 +121,6 @@ def _token_id(tokenizer, token: str) -> int:
     return int(token_id)
 
 
-def _input_ids(value) -> List[int]:
-    if hasattr(value, "input_ids"):
-        value = value.input_ids
-    elif isinstance(value, dict) and "input_ids" in value:
-        value = value["input_ids"]
-    if hasattr(value, "tolist"):
-        value = value.tolist()
-    if len(value) > 0 and isinstance(value[0], list):
-        if len(value) != 1:
-            raise ValueError("Expected one tokenized reranker prompt.")
-        value = value[0]
-    return list(value)
-
-
 def _binary_scores(model, hidden_states, attention_mask, tokenizer):
     last_from_end = mx.argmax(attention_mask[:, ::-1], axis=1)
     positions = attention_mask.shape[1] - last_from_end - 1
@@ -160,19 +147,6 @@ def _attention_mask(attention_mask):
     return causal[None, None, :, :] & key_mask & query_mask
 
 
-def _text_messages(query: RerankItem, document: RerankItem, instruction: str):
-    return [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": (
-                f"<Instruct>: {instruction}\n\n<Query>: {query.text}"
-                f"\n\n<Document>: {document.text}"
-            ),
-        },
-    ]
-
-
 def _padded_tokens(tokenizer, sequences: List[List[int]]):
     pad_id = tokenizer.pad_token_id
     if pad_id is None:
@@ -188,18 +162,17 @@ def _padded_tokens(tokenizer, sequences: List[List[int]]):
 
 def _score_text_batch(model, processor, query, documents, instruction):
     tokenizer = _tokenizer(processor)
+    prefix = tokenizer.encode(TEXT_PREFIX, add_special_tokens=False)
     suffix = tokenizer.encode(TEXT_SUFFIX, add_special_tokens=False)
+    body_max = DEFAULT_MAX_LENGTH - len(prefix) - len(suffix)
     sequences = []
     for document in documents:
-        tokens = _input_ids(
-            tokenizer.apply_chat_template(
-                _text_messages(query, document, instruction),
-                tokenize=True,
-                add_generation_prompt=False,
-                enable_thinking=False,
-            )
+        body = (
+            f"<Instruct>: {instruction}\n<Query>: {query.text}\n"
+            f"<Document>: {document.text}"
         )
-        sequences.append(tokens[: DEFAULT_MAX_LENGTH - len(suffix)] + suffix)
+        tokens = tokenizer.encode(body, add_special_tokens=False)[:body_max]
+        sequences.append(prefix + tokens + suffix)
     input_ids, attention_mask = _padded_tokens(tokenizer, sequences)
     inner = model.language_model.model
     hidden_states = inner.embed_tokens(input_ids)
