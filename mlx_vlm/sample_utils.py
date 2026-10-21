@@ -333,7 +333,8 @@ def _typical_p(logprobs: mx.array, typical_p: float) -> mx.array:
     # remaining probabilities are below its precision.
     f = logprobs.astype(mx.float32)
     p = mx.exp(f)
-    ent = -mx.sum(p * f, axis=-1, keepdims=True)
+    # Zero-probability tokens contribute zero to entropy, including masked -inf.
+    ent = -mx.sum(mx.where(p > 0, p * f, 0.0), axis=-1, keepdims=True)
     shifted = mx.abs(-f - ent)
     sorted_indices = mx.argsort(shifted, axis=-1)
     sorted_probs = mx.take_along_axis(p, sorted_indices, axis=-1)
