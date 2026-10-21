@@ -67,6 +67,22 @@ reasoning/tool-message replay. Original checkpoint layers 0, 2, and 48 also
 matched an independent PyTorch calculation using FP32 views of the BF16 weights
 (maximum absolute error below `2.4e-5`).
 
+An end-to-end comparison exercised all 49 layers against the checkpoint's
+published Flint SGLang classes, with eager PyTorch/MPS replacements for the
+CUDA backends. The arithmetic sequence had 67 tokens; the coding sequence had
+577 tokens and was also evaluated in chunks of 256, 256, 32, 1, and 32 tokens.
+FP32, with `MLX_ENABLE_TF32=0`, matched all 207 checked next-token choices.
+Full-prefill maximum logit errors were `0.00114` and `0.000271`; the cached
+comparison reached `0.504` after a reference-side expert-selection difference,
+with mean KL divergence `1.58e-7` and unchanged checked top-five choices.
+
+BF16 matched 203/207 checked next-token choices. Four arithmetic positions
+differed, including two in the supplied continuation; neither coding path had
+a top-one mismatch. Actual greedy reference generation also returned `391`,
+with different reasoning text, and matched the first 64 coding output tokens.
+The reference coding run ended at that budget. These are adapted-reference
+checks, not official Transformers Flint or unmodified SGLang/CUDA parity.
+
 A real 545-token coding continuation exercised the sliding-window boundary with
 cached chunks of 256, 256, 32, and 1 tokens. Full and chunked BF16 evaluation had
 the same top-five next tokens but different logits (maximum absolute difference
