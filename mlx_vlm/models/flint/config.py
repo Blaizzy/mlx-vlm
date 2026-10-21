@@ -36,8 +36,12 @@ class ModelConfig(BaseModelConfig):
     norm_topk_prob: bool = True
     tie_word_embeddings: bool = False
     eos_token_id: Optional[Union[int, List[int]]] = None
+    prefill_causal_mask: bool = False  # Elide unpadded full-attention batch masks.
+    prefill_query_tile_size: int = 0  # Tile sliding attention; 0 keeps the dense path.
 
     def __post_init__(self):
+        if self.prefill_query_tile_size < 0:
+            raise ValueError("prefill_query_tile_size must be non-negative")
         if self.layer_types is None:
             self.layer_types = ["full_attention"] * self.num_hidden_layers
         self.mlp_only_layers = self.mlp_only_layers or []

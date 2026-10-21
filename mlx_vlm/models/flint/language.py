@@ -10,6 +10,7 @@ from ..cache import KVCache, RotatingKVCache
 from ..mlp import SwiGLUMLP
 from ..rope_utils import initialize_rope
 from ..switch_layers import SwitchGLU, stack_expert_projection
+from .attention import prefill_attention, unpadded_full_attention_caches
 from .config import ModelConfig
 
 
@@ -20,6 +21,7 @@ class Attention(nn.Module):
         self.n_kv_heads = args.num_key_value_heads
         self.head_dim = args.head_dim
         self.scale = self.head_dim**-0.5
+        self.prefill_query_tile_size = args.prefill_query_tile_size
         self.window_size = (
             args.sliding_window
             if args.layer_types[layer_idx] == "sliding_attention"
@@ -69,15 +71,32 @@ class Attention(nn.Module):
             k = self.rope(k, offset=offset)
         if cache is not None:
             k, v = cache.update_and_fetch(k, v)
-        out = scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            cache=cache,
-            scale=self.scale,
-            mask=mask,
-            sinks=self.softmax_offset.astype(q.dtype),
-        )
+        if (
+            self.prefill_query_tile_size > 0
+            and length > self.prefill_query_tile_size
+            and self.window_size is not None
+        ):
+            out = prefill_attention(
+                q,
+                k,
+                v,
+                cache=cache,
+                scale=self.scale,
+                mask=mask,
+                sinks=self.softmax_offset.astype(q.dtype),
+                window_size=self.window_size,
+                tile_size=self.prefill_query_tile_size,
+            )
+        else:
+            out = scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                cache=cache,
+                scale=self.scale,
+                mask=mask,
+                sinks=self.softmax_offset.astype(q.dtype),
+            )
         return self.o_proj(out.transpose(0, 2, 1, 3).reshape(batch, length, -1))
 
 
@@ -143,6 +162,7 @@ class DecoderLayer(nn.Module):
 class FlintModel(nn.Module):
     def __init__(self, args: ModelConfig):
         super().__init__()
+        self.prefill_causal_mask = args.prefill_causal_mask
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [DecoderLayer(args, i) for i in range(args.num_hidden_layers)]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
@@ -150,8 +170,19 @@ class FlintModel(nn.Module):
     def __call__(self, inputs, cache=None, inputs_embeds=None):
         x = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
         cache = [None] * len(self.layers) if cache is None else cache
+        causal_caches = (
+            unpadded_full_attention_caches(self.layers, cache)
+            if self.prefill_causal_mask and x.shape[1] > 1
+            else set()
+        )
         for layer, c in zip(self.layers, cache):
-            mask = create_attention_mask(x, c, window_size=layer.self_attn.window_size)
+            mask = (
+                "causal"
+                if id(c) in causal_caches
+                else create_attention_mask(
+                    x, c, window_size=layer.self_attn.window_size
+                )
+            )
             x = layer(x, mask, c)
         return self.norm(x)
 

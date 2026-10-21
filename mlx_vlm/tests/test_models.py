@@ -863,6 +863,159 @@ def test_flint_padded_batch_matches_individual_decoding(flint_model):
         )
 
 
+class TestFlintPrefillAttention:
+    @staticmethod
+    def configure(model, enabled, tile=3):
+        model.language_model.model.prefill_causal_mask = enabled
+        for layer in model.layers:
+            layer.self_attn.prefill_query_tile_size = tile if enabled else 0
+
+    @pytest.mark.parametrize(
+        "length,offset", [(513, 0), (511, 511), (1023, 127), (263, 512)]
+    )
+    def test_bf16_uneven_key_offsets_and_short_final_tiles(self, length, offset):
+        from mlx_vlm.models.cache import BatchKVCache, create_causal_mask
+        from mlx_vlm.models.flint.attention import prefill_attention
+
+        mx.random.seed(5)
+        q = mx.random.normal((2, 32, length, 128), dtype=mx.bfloat16)
+        k = mx.random.normal((2, 4, length + offset, 128), dtype=mx.bfloat16)
+        v = mx.random.normal(k.shape, dtype=mx.bfloat16)
+        mask = create_causal_mask(
+            length, offset, window_size=513, left_padding=mx.array([17, 0])
+        )
+        kwargs = dict(
+            cache=BatchKVCache([17, 0]),
+            scale=128**-0.5,
+            mask=mask,
+            sinks=mx.arange(32).astype(mx.bfloat16),
+            window_size=513,
+        )
+        baseline = prefill_attention(q, k, v, **kwargs, tile_size=0)
+        tiled = prefill_attention(q, k, v, **kwargs, tile_size=256)
+        assert mx.array_equal(baseline, tiled).item()
+
+    @pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+    @pytest.mark.parametrize("padding", [[0, 0], [5, 0]])
+    @pytest.mark.parametrize("schedule", [[23, 1], [7, 1, 1, 1, 1, 1, 11, 1]])
+    def test_chunked_rotated_and_padded_parity(
+        self, flint_model, dtype, padding, schedule
+    ):
+        from mlx_vlm.generate.ar import _make_cache
+
+        model = flint_model
+        model.update(tree_map(lambda p: p.astype(dtype), model.parameters()))
+        for layer in model.layers:
+            layer.self_attn.softmax_offset = mx.array([-2.0, 0.0, 1.0, 3.0], dtype)
+        ids = (mx.arange(48).reshape(2, 24) * 7 + 3) % model.config.vocab_size
+        results, states = [], []
+        for enabled in (False, True):
+            self.configure(model, enabled)
+            caches = _make_cache(model.language_model, padding)
+            outputs, start = [], 0
+            for size in schedule:
+                outputs.append(model(ids[:, start : start + size], cache=caches).logits)
+                mx.eval(outputs[-1], [c.state for c in caches])
+                start += size
+            results.append(mx.concatenate(outputs, axis=1))
+            states.append([c.state for c in caches])
+        tolerance = 0.04 if dtype == mx.bfloat16 else 3e-5
+        assert mx.allclose(*results, atol=tolerance, rtol=tolerance).item()
+        assert mx.array_equal(
+            mx.argmax(results[0], -1), mx.argmax(results[1], -1)
+        ).item()
+        for baseline, candidate in zip(states[0], states[1]):
+            for a, b in zip(baseline, candidate):
+                assert mx.allclose(a, b, atol=tolerance, rtol=tolerance).item()
+
+    @pytest.mark.parametrize("right_padding", [[0, 0], [3, 0]])
+    def test_restored_right_padded_batch_parity(self, flint_model, right_padding):
+        from mlx_vlm.generate.ar import _make_cache
+
+        ids = (mx.arange(30).reshape(2, 15) * 3 + 1) % 64
+        outputs = []
+        for enabled in (False, True):
+            self.configure(flint_model, enabled, tile=2)
+            caches = _make_cache(flint_model.language_model, [0, 0])
+            for c in caches:
+                c.prepare(
+                    right_padding=right_padding, lengths=[8 - p for p in right_padding]
+                )
+            for start, stop in ((0, 7), (7, 8)):
+                result = flint_model(ids[:, start:stop], cache=caches).logits
+                mx.eval(result, [c.state for c in caches])
+            for c in caches:
+                c.finalize()
+            fresh = _make_cache(flint_model.language_model, [0, 0])
+            for target, source in zip(fresh, caches):
+                target.prefix_cache_restore(source.prefix_cache_snapshot())
+            outputs.append(flint_model(ids[:, 8:], cache=fresh).logits)
+            mx.eval(outputs[-1])
+        assert mx.allclose(*outputs, atol=3e-5, rtol=3e-5).item()
+
+    def test_padding_guard_tracks_mutations_and_batch_lifecycle(self, flint_model):
+        from mlx_vlm.models.cache import BatchKVCache
+        from mlx_vlm.models.flint.attention import unpadded_full_attention_caches
+
+        c = BatchKVCache([0, 0])
+        layers = [flint_model.layers[0]]
+        eligible = lambda: unpadded_full_attention_caches(layers, [c])
+        assert eligible() == {id(c)}
+        c.left_padding[0] = 3
+        assert eligible() == set()
+        c.prepare(left_padding=[1, 0])
+        assert eligible() == set()
+        c.filter([1])
+        assert eligible() == {id(c)}
+        c.extend(BatchKVCache([2]))
+        assert eligible() == set()
+        c.left_padding = mx.zeros((2,), mx.int32)
+        c.prepare(right_padding=[1, 0])
+        assert eligible() == set()
+        c.finalize()
+        assert eligible() == {id(c)}
+        state = list(c.state)
+        state[-1] = mx.array([0, 2])
+        c.state = state
+        assert eligible() == set()
+
+    @pytest.mark.parametrize("tile", [1, 3, 8])
+    def test_independent_reference_with_optimizations(self, flint_model, tile):
+        self.configure(flint_model, True, tile)
+        test_flint_matches_independent_attention_and_moe_reference(flint_model)
+
+    @pytest.mark.parametrize(
+        "fallback", ["decode", "keep", "disabled", "no_mask", "one_dimensional_mask"]
+    )
+    def test_baseline_fallback(self, fallback):
+        from mlx_vlm.models.flint.attention import prefill_attention
+
+        length = 1 if fallback == "decode" else 8
+        q = mx.ones((1, 4, length, 8))
+        k = v = mx.ones((1, 2, length, 8))
+        cache = RotatingKVCache(4, keep=1 if fallback == "keep" else 0)
+        mask = None if fallback == "no_mask" else mx.ones((length, length), mx.bool_)
+        if fallback == "one_dimensional_mask":
+            mask = mx.ones((length,), mx.bool_)
+        with patch(
+            "mlx_vlm.models.flint.attention.scaled_dot_product_attention",
+            return_value=q,
+        ) as baseline:
+            result = prefill_attention(
+                q,
+                k,
+                v,
+                cache=cache,
+                scale=8**-0.5,
+                mask=mask,
+                sinks=mx.zeros((4,)),
+                window_size=4,
+                tile_size=0 if fallback == "disabled" else 2,
+            )
+        assert result is q
+        baseline.assert_called_once()
+
+
 @pytest.mark.parametrize("with_bias", [False, True])
 @pytest.mark.parametrize("quantized", [False, True])
 def test_flint_checkpoint_strict_loading_and_roundtrip(
