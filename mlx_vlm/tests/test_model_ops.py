@@ -1104,23 +1104,25 @@ def test_transform_modelopt_leaves_other_fp8_exports_unchanged(moe_quant_algo):
 @pytest.mark.parametrize("family", ["deepseek_v4", "deepseek_v41"])
 def test_deepseek_mixed_fp8_nvfp4_strict_load(tmp_path, family):
     module = importlib.import_module(f"mlx_vlm.models.{family}")
+    # Keep multiple FP8 blocks for V4.1; V4's export uses 128-wide blocks.
+    width = 128 if family == "deepseek_v4" else 64
     config = module.ModelConfig.from_dict(
         dict(
             model_type=family,
             vocab_size=128,
-            hidden_size=128,
-            moe_intermediate_size=128,
+            hidden_size=width,
+            moe_intermediate_size=width,
             num_hidden_layers=1,
             num_attention_heads=2,
             num_key_value_heads=1,
             n_routed_experts=2,
             n_shared_experts=1,
             num_experts_per_tok=2,
-            q_lora_rank=128,
+            q_lora_rank=width,
             qk_rope_head_dim=32,
-            head_dim=128,
+            head_dim=width,
             o_groups=2,
-            o_lora_rank=64,
+            o_lora_rank=width // 2,
             compress_ratios=[0],
             num_hash_layers=0,
             engram_layer_ids=[],

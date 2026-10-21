@@ -67,7 +67,7 @@ if __name__ == "__main__":
                 "-q",
                 "-n",
                 "3",
-                "--dist=worksteal",
+                "--dist=loadgroup",
                 "--durations=30",
                 f"--junitxml={ROOT}/test-results/shard-{args.shard}.xml",
                 *paths,

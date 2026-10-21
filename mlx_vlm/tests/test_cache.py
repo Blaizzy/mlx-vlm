@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from itertools import product
 from pathlib import Path
@@ -1223,6 +1224,10 @@ def coordinate(manager, caches):
 @pytest.fixture
 def managers(tmp_path, monkeypatch):
     """Own writers and readers, including reopened namespaces and memory budgets."""
+    # Keep one real host-memory reading per case. Budget/pressure tests override
+    # this explicitly; repeated vm_stat processes add no cache-lifecycle coverage.
+    free_ram = P._free_ram_bytes()
+    monkeypatch.setattr(P, "_free_ram_bytes", lambda: free_ram)
     owned = []
 
     def make(
@@ -1333,12 +1338,14 @@ def test_hashes_and_dependencies():
     variants = [("a", image), ("b", image), ("a", 42)]
     assert len({tenant_hash(t, i) for t, i in variants}) == 3
     code = "from mlx_vlm.apc import tenant_scoped_hash; print(tenant_scoped_hash('a', 123456789))"
-    outputs = [
-        subprocess.check_output(
+
+    def run(seed):
+        return subprocess.check_output(
             [sys.executable, "-c", code], env={**os.environ, "PYTHONHASHSEED": seed}
         )
-        for seed in ("1", "2")
-    ]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outputs = list(pool.map(run, ("1", "2")))
     assert outputs[0] == outputs[1]
     base = P.semantic_extra_hash(image_hash=5)
     good = NS(apc_key_dependencies=lambda: ["adapter-x"])

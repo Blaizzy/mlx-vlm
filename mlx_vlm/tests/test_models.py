@@ -128,7 +128,14 @@ class ModelChecks:
             features = model.get_input_embeddings(ids, **media)
         features = features.to_dict()
         embeds = features.pop("inputs_embeds")
-        reference = model(ids, cache=make_prompt_cache(language), **media).logits
+        token = mx.full((ids.shape[0], 1), 7, mx.int32)
+        full = model(
+            mx.concatenate([ids, token], axis=1),
+            cache=make_prompt_cache(language),
+            **media,
+        ).logits
+        # One causal full pass supplies both the prefill and decode references.
+        reference, extended = full[:, :-1], full[:, -1:]
         if ids.shape[0] > 1:
             solo = []
             for row in range(ids.shape[0]):
@@ -145,12 +152,6 @@ class ModelChecks:
                     ).logits
                 )
             self.assert_close(reference, mx.concatenate(solo), logits=True)
-        token = mx.full((ids.shape[0], 1), 7, mx.int32)
-        extended = model(
-            mx.concatenate([ids, token], axis=1),
-            cache=make_prompt_cache(language),
-            **media,
-        ).logits[:, -1:]
         for size in (ids.shape[1] - 1, *chunk_sizes):
             cache, chunks = make_prompt_cache(language), []
             for start in range(0, ids.shape[1], size):
