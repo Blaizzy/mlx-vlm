@@ -185,7 +185,9 @@ class EngineTest(unittest.TestCase):
                     trainer = Trainer(
                         model,
                         args,
-                        optimizer=optim.AdamW(learning_rate=1e-5, weight_decay=0.0),
+                        # This checks algorithm updates and reference isolation;
+                        # test_training_metrics covers compiled AdamW training.
+                        optimizer=optim.SGD(learning_rate=1e-3),
                         task="vlm",
                         algorithm=mode,
                         train_dataset=rows,
