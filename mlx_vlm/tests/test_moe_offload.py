@@ -623,3 +623,35 @@ def test_diffusion_gemma_layer_applies_router_weights():
     # Doubling the router weights must change the layer's output; if the
     # combine were dropped, the expert branch would ignore them entirely.
     assert float(mx.abs(once - twice).max()) > 1e-4
+
+
+def test_expert_store_reuses_lazy_handles_and_drops_evicted_handles(tmp_path):
+    _, offload = _build_and_repack(tmp_path)
+    # A 1-byte budget evicts every expert right after its get(), so every
+    # call below after the first pass is a post-eviction miss.
+    store = ExpertStore(str(offload), expert_cache_bytes=1)
+    for j in range(4):
+        store.get(1, j)
+    base = store.stats()["metadata_reloads"]
+    with patch.object(mx, "load", wraps=mx.load) as load:
+        first = store.get(1, 0)
+        mx.eval(first)
+        assert load.call_count == 1
+        # Experts 1 and 2 were evicted too, but their handles are in the dict
+        # loaded for expert 0: their misses must not re-parse the header.
+        store.get(1, 1)
+        store.get(1, 2)
+        assert load.call_count == 1
+        assert store.stats()["metadata_reloads"] == base + 1
+        # Eviction drops the handles from both dicts, so the buffer is freed
+        # and the next miss on that expert reloads.
+        assert "e0.gate_proj.weight" not in store._maps[1]
+        assert "e0.gate_proj.weight" not in store._fresh[1]
+        again = store.get(1, 0)
+        mx.eval(again)
+        assert load.call_count == 2
+        assert store.stats()["metadata_reloads"] == base + 2
+    for got, want in zip(again, first):
+        for g, w in zip(got, want):
+            if g is not None:
+                assert mx.array_equal(g, w)
