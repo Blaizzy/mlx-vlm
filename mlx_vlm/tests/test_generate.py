@@ -1930,12 +1930,13 @@ def _np_typical_keep(logits, typical_p):
     logp = logp - logp.max()
     logp = logp - np.log(np.exp(logp).sum())
     p = np.exp(logp)
-    ent = -(p * logp).sum()
+    positive = p > 0
+    ent = -np.dot(p[positive], logp[positive])
     order = np.argsort(np.abs(-logp - ent), kind="stable")
     cum_before_sorted = np.cumsum(p[order]) - p[order]
     cum_before = np.zeros(len(p))
     cum_before[order] = cum_before_sorted
-    return cum_before < typical_p, np.abs(cum_before - typical_p)
+    return (cum_before < typical_p) & np.isfinite(logp), np.abs(cum_before - typical_p)
 
 
 @pytest.mark.parametrize(
@@ -1965,6 +1966,124 @@ def test_sampling_filter_matches_numpy(name, values, reference, tolerance):
     if name == "p_less":
         output = sampling.apply_p_less(mx.array([10.0, 0.0, 0.0, 0.0, 0.0]), 1.0)
         assert (output != -mx.inf).tolist() == [True, False, False, False, False]
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize(
+    "typical_p,expected",
+    [
+        (0.3, [[False, True, False, False], [False, False, False, True]]),
+        (0.5, [[False, True, True, False], [False, True, False, True]]),
+        (0.7, [[False, True, True, False], [False, True, False, True]]),
+    ],
+)
+def test_typical_p_masked_logprobs_match_reference(dtype, typical_p, expected):
+    # These rows have distinct typicality distances, away from cutoff boundaries.
+    # A NaN entropy can either add or remove candidates, depending on token order.
+    logprobs = mx.log(
+        mx.array([[0.05, 0.35, 0.60, 0.0], [0.0, 0.60, 0.05, 0.35]])
+    ).astype(dtype)
+    reference = [
+        _np_typical_keep(row, typical_p)[0].tolist() for row in logprobs.tolist()
+    ]
+    assert reference == expected
+
+    filtered = sampling.apply_typical_p(logprobs, typical_p)
+    kept = mx.isfinite(filtered)
+    assert kept.tolist() == expected
+    assert filtered.shape == logprobs.shape
+    assert filtered.dtype == dtype
+    assert not mx.any(mx.isnan(filtered)).item()
+    assert mx.array_equal(
+        mx.where(kept, filtered, 0.0), mx.where(kept, logprobs, 0.0)
+    ).item()
+    for row, expected_row in zip(logprobs, expected):
+        isolated = sampling.apply_typical_p(row, typical_p)
+        assert mx.isfinite(isolated).tolist() == expected_row
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("typical_p", [1e-8, 0.5])
+def test_typical_p_single_survivor(dtype, typical_p):
+    logprobs = mx.array([-mx.inf, 0.0, -mx.inf], dtype=dtype)
+    filtered = sampling.apply_typical_p(logprobs, typical_p)
+    assert filtered.dtype == dtype
+    assert mx.array_equal(filtered, logprobs).item()
+
+
+@pytest.fixture
+def typical_p_categorical_inputs(monkeypatch):
+    captured = []
+    original = sampling.categorical_sampling
+
+    def capture(logprobs, temp):
+        captured.append(logprobs)
+        return original(logprobs, temp)
+
+    monkeypatch.setattr(sampling, "categorical_sampling", capture)
+    return captured
+
+
+@pytest.mark.parametrize(
+    "scores,masked_token,expected",
+    [
+        ([0.05, 0.35, 0.60, 1.0], 3, [False, True, True, False]),
+        ([1.0, 0.60, 0.05, 0.35], 0, [False, True, False, True]),
+    ],
+)
+def test_generate_step_typical_p_with_masked_logits(
+    scores, masked_token, expected, typical_p_categorical_inputs
+):
+    model = MagicMock(config=SimpleNamespace())
+    model.language_model.return_value = LanguageModelOutput(
+        logits=mx.log(mx.array([[scores]]))
+    )
+    model.get_input_embeddings.return_value = InputEmbeddingsFeatures(
+        inputs_embeds=mx.zeros((1, 1, 4))
+    )
+    output = list(
+        ar_module.generate_step(
+            mx.array([[1]], mx.int32),
+            model,
+            None,
+            None,
+            prompt_cache=[],
+            max_tokens=1,
+            temperature=1.0,
+            top_p=1.0,
+            top_k=0,
+            min_p=0.0,
+            typical_p=0.5,
+            logit_bias={masked_token: -mx.inf},
+        )
+    )
+    assert len(output) == 1
+    assert typical_p_categorical_inputs
+    for logprobs in typical_p_categorical_inputs:
+        assert mx.isfinite(logprobs).tolist() == [expected]
+
+
+def test_generation_batch_typical_p_with_masked_logits(typical_p_categorical_inputs):
+    model = MagicMock(spec=FixedLogitModel)
+    model.return_value = LanguageModelOutput(
+        logits=mx.log(mx.array([[[0.05, 0.35, 0.60, 1.0]], [[1.0, 0.60, 0.05, 0.35]]]))
+    )
+    batch = _generation_batch(
+        model,
+        inputs=(1, 1),
+        sampler=sampling.make_sampler(temp=1.0, typical_p=0.5),
+        token_context=[[1], [1]],
+        logits_processors=[
+            sampling.make_logits_processors(logit_bias={3: -mx.inf}),
+            sampling.make_logits_processors(logit_bias={0: -mx.inf}),
+        ],
+    )
+    batch.next()
+    assert len(typical_p_categorical_inputs) == 1
+    assert mx.isfinite(typical_p_categorical_inputs[0]).tolist() == [
+        [False, True, True, False],
+        [False, True, False, True],
+    ]
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
