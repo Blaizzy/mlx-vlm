@@ -106,22 +106,27 @@ class ModelChecks:
 
     def assert_close(self, actual, expected, *, logits=False):
         assert actual.shape == expected.shape
-        assert mx.all(mx.isfinite(actual)).item()
         tolerance = 5e-3 if actual.dtype == mx.float16 else 1e-4
         # One-token attention uses a different Metal kernel from full prefill.
         if logits:
             tolerance = max(tolerance, 2e-3)
+        actual, expected = actual.astype(mx.float32), expected.astype(mx.float32)
+        mx.eval(actual, expected)
+        actual, expected = np.array(actual), np.array(expected)
+        assert np.isfinite(actual).all()
         np.testing.assert_allclose(
-            np.array(actual.astype(mx.float32)),
-            np.array(expected.astype(mx.float32)),
+            actual,
+            expected,
             atol=tolerance,
             rtol=tolerance,
         )
 
-    def prefill_parity(self, model, ids, media, chunk_sizes):
+    def prefill_parity(self, model, ids, media, chunk_sizes, *, features=None):
         """Compare full, cached and chunked prefill, then decode one new token."""
         language = model.language_model
-        features = model.get_input_embeddings(ids, **media).to_dict()
+        if features is None:
+            features = model.get_input_embeddings(ids, **media)
+        features = features.to_dict()
         embeds = features.pop("inputs_embeds")
         reference = model(ids, cache=make_prompt_cache(language), **media).logits
         if ids.shape[0] > 1:
@@ -201,6 +206,7 @@ class ModelChecks:
                             ids += [config.vision_end_token_id]
                         rows.append(ids + [3, 4, 5])
                     ids = mx.array(rows, mx.int32)
+                    flat_ids = [token for row in rows for token in row]
                     for kind in layout:
                         pixels = mx.random.normal(
                             (batch * math.prod(grids[kind]), patch_width)
@@ -223,11 +229,7 @@ class ModelChecks:
                     expected_embeds = model.language_model.model.embed_tokens(ids)
                     for kind in layout:
                         positions = mx.array(
-                            [
-                                i
-                                for i, t in enumerate(ids.flatten().tolist())
-                                if t == tokens[kind]
-                            ],
+                            [i for i, t in enumerate(flat_ids) if t == tokens[kind]],
                             mx.uint32,
                         )
                         embeddings, layer_features = encoded[kind]
@@ -243,7 +245,7 @@ class ModelChecks:
                         self.assert_close(residuals, expected)
                     else:
                         positions = mx.array(
-                            [i for i, v in enumerate(mask.flatten().tolist()) if v],
+                            [i for i, t in enumerate(flat_ids) if t in tokens.values()],
                             mx.uint32,
                         )
                         self.assert_close(
@@ -262,7 +264,9 @@ class ModelChecks:
                             mx.zeros_like(features.inputs_embeds), mask, value
                         )
                         self.assert_close(injected, expected[:, :, layer])
-                    self.prefill_parity(model, ids, media, chunk_sizes)
+                    self.prefill_parity(
+                        model, ids, media, chunk_sizes, features=features
+                    )
 
     def input_embeddings(self, model, model_name):
         result = model.get_input_embeddings(input_ids=mx.array([[1, 2, 3, 4, 5]]))
@@ -3095,30 +3099,38 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
         )
         self.assertIsNone(output.hidden_states)
         expected = output.logits
-        mx.eval(expected)
-
+        comparisons = []
         for chunks in ((8,), (3, 2, 3), (1,) * 8):
-            with self.subTest(chunks=chunks):
-                cache = model.make_cache()
-                outputs, start = [], 0
-                for length in chunks:
-                    stop = start + length
-                    outputs.append(
-                        model(
-                            inputs=ids[:, start:stop],
-                            inputs_embeds=embeds[:, start:stop],
-                            cache=cache,
-                            n_to_process=length,
-                        ).logits
-                    )
-                    start = stop
-                actual = mx.concatenate(outputs, axis=1)
-                mx.eval(actual)
-                self.assertTrue(
-                    bool(mx.array_equal(cache[0].engram, reference_cache[0].engram))
+            cache = model.make_cache()
+            outputs, start = [], 0
+            for length in chunks:
+                stop = start + length
+                outputs.append(
+                    model(
+                        inputs=ids[:, start:stop],
+                        inputs_embeds=embeds[:, start:stop],
+                        cache=cache,
+                        n_to_process=length,
+                    ).logits
                 )
-                self.assertTrue(bool(mx.all(cache[0].engram[:, 2:5] == -1)))
-                self.assertTrue(bool(mx.allclose(actual, expected, atol=1e-4)))
+                start = stop
+            comparisons.append(
+                (
+                    chunks,
+                    (
+                        mx.array_equal(cache[0].engram, reference_cache[0].engram),
+                        mx.all(cache[0].engram[:, 2:5] == -1),
+                        mx.allclose(
+                            mx.concatenate(outputs, axis=1), expected, atol=1e-4
+                        ),
+                    ),
+                )
+            )
+        mx.eval([checks for _, checks in comparisons])
+        for chunks, checks in comparisons:
+            with self.subTest(chunks=chunks):
+                for check in checks:
+                    self.assertTrue(check.item())
 
 
 class TestMoERouterStopGradient:

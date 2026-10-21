@@ -573,6 +573,7 @@
         "index_head_dim": 2,
         "index_topk": 2,
         "hc_mult": 2,
+        "hc_sinkhorn_iters": 2,
         "vision_n_layers": 1,
         "vision_dim": 8,
         "vision_n_heads": 2,
