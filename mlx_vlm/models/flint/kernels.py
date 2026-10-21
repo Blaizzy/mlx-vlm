@@ -5,7 +5,7 @@ from functools import lru_cache
 import mlx.core as mx
 
 from ..fast_ops import _affine_exact_header
-from ..switch_layers import QuantizedSwitchLinear
+from ..switch_layers import QuantizedSwitchLinear, SwiGLU
 
 
 def weighted_sum(routed, weights):
@@ -67,7 +67,7 @@ def supported(linear, x):
     return (
         mx.metal.is_available()
         and mx.default_device() == mx.gpu
-        and isinstance(linear, QuantizedSwitchLinear)
+        and type(linear) is QuantizedSwitchLinear
         and linear.bits == 4
         and linear.group_size == 64
         and linear.mode == "affine"
@@ -147,9 +147,10 @@ def gate_kernel():
 
 
 def gate_up_silu(switch, x, indices):
-    up, gate = switch.up_proj, switch.gate_proj
+    up, gate = getattr(switch, "up_proj", None), getattr(switch, "gate_proj", None)
     if (
-        x.ndim != 3
+        type(getattr(switch, "activation", None)) is not SwiGLU
+        or x.ndim != 3
         or x.shape[1] != 1
         or indices.shape[:2] != x.shape[:2]
         or indices.size >= 64

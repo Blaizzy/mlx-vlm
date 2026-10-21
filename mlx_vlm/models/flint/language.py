@@ -144,7 +144,10 @@ class SparseMoeBlock(nn.Module):
         return output + shared if self.shared_expert is not None else output
 
     def __call__(self, x):
-        return self._forward(x) if self.training else self._compiled(x)
+        # Paged experts perform data-dependent I/O and cannot be traced.
+        if self.training or type(self.switch_mlp) is not SwitchGLU:
+            return self._forward(x)
+        return self._compiled(x)
 
 
 class DecoderLayer(nn.Module):
