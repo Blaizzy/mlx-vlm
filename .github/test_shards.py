@@ -22,7 +22,6 @@ GROUPS = (
     },
     {
         "test_models.py",
-        "test_audio_models.py",
         "test_training_api.py",
     },
     {
@@ -32,6 +31,7 @@ GROUPS = (
         "test_extraction_models.py",
         "test_server.py",
         "test_generate.py",
+        "test_audio_models.py",
     },
     {
         "test_model_ops.py",
@@ -65,13 +65,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("shard", type=int, choices=range(1, len(GROUPS) + 2))
     parser.add_argument(
-        "--list", action="store_true", help="List files without running"
+        "--list", action="store_true", help="List pytest selectors without running"
     )
     args = parser.parse_args()
     paths = [str(TESTS / name) for name in shards()[args.shard - 1]]
     deselect = []
     if str(TESTS / "test_speculative.py") in paths:
-        deselect = [f"--deselect=mlx_vlm/tests/{VERIFIER_PARITY}"]
+        # Match parameter cases without excluding future similarly named tests.
+        deselect = [f"--deselect=mlx_vlm/tests/{VERIFIER_PARITY}["]
     if args.shard == 5:
         paths.append(str(TESTS / VERIFIER_PARITY))
     if not paths:
