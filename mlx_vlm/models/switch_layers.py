@@ -398,23 +398,99 @@ class OffloadedSwitchGLU(nn.Module):
         self.gate_scale, self.out_scale = gate_scale, out_scale
         self.gate_bias, self.up_bias, self.down_bias = gate_bias, up_bias, down_bias
 
-    def _proj(self, xr, w, scales, biases, quant):
-        """One expert's projection. ``scales is None`` means this expert's
-        weight was never quantized (a plain bf16/float32 checkpoint) --
-        matches ``SwitchLinear.__call__``'s plain matmul in that case."""
-        if scales is None:
-            return xr @ w.T
-        group_size, bits, mode = quant
-        return mx.quantized_matmul(
-            xr,
-            w,
-            scales=scales,
-            biases=biases,
-            transpose=True,
-            group_size=group_size,
-            bits=bits,
-            mode=mode,
-        )
+    def _apply_selected(self, x, experts, local_indices, selected):
+        """Batch a bounded set of experts into three gathered projections."""
+        experts = [int(j) for j in experts]
+        routed_experts = mx.array(experts)[local_indices]
+
+        def project(value, projection, quant):
+            name = ("gate_proj", "up_proj", "down_proj")[projection]
+            tensors = [selected[j][projection] for j in experts]
+            weight = mx.stack([t[0] for t in tensors])
+            scales = [self.store.global_scale(self.layer_id, j, name) for j in experts]
+            has_global_scale = any(s is not None for s, _ in scales)
+            if tensors[0][1] is None:
+                dtype = mx.result_type(value.dtype, weight.dtype)
+                # CPU gather_mm only supports FP32, unlike ordinary matmul.
+                compute_dtype = mx.float32 if mx.default_device() == mx.cpu else dtype
+                output = mx.gather_mm(
+                    value.astype(compute_dtype),
+                    weight.astype(compute_dtype).swapaxes(-1, -2),
+                    rhs_indices=local_indices,
+                ).astype(dtype)
+            else:
+                group_size, bits, mode = quant
+                fused_scale = (
+                    mode == "nvfp4"
+                    and has_global_scale
+                    and mx.default_device() == mx.gpu
+                    and all(s is None or s.size == 1 for s, _ in scales)
+                )
+                # MLX expects tensor absmax: 448 * 6 times the checkpoint's
+                # multiplicative factor. Fuse it before rounding to BF16.
+                global_scale = (
+                    mx.stack(
+                        [
+                            (
+                                mx.array(2688.0)
+                                if s is None
+                                else (2688.0 / s if divide else 2688.0 * s).reshape(())
+                            )
+                            for s, divide in scales
+                        ]
+                    )
+                    if fused_scale
+                    else None
+                )
+                output = mx.gather_qmm(
+                    (
+                        value.astype(mx.float32)
+                        if has_global_scale and not fused_scale
+                        else value
+                    ),
+                    weight,
+                    mx.stack([t[1] for t in tensors]),
+                    (
+                        mx.stack([t[2] for t in tensors])
+                        if tensors[0][2] is not None
+                        else None
+                    ),
+                    rhs_indices=local_indices,
+                    transpose=True,
+                    group_size=group_size,
+                    bits=bits,
+                    mode=mode,
+                    global_scale=global_scale,
+                )
+                if has_global_scale and not fused_scale:
+                    # Global factors can be scalars or one value per output row.
+                    factors = mx.stack(
+                        [
+                            mx.broadcast_to(
+                                s if s is not None else mx.array(1.0),
+                                (weight.shape[-2],),
+                            )
+                            for s, _ in scales
+                        ]
+                    )[local_indices][:, None, :]
+                    divide = mx.array([d for _, d in scales])[local_indices][
+                        :, None, None
+                    ]
+                    output = mx.where(divide, output / factors, output * factors)
+                output = output.astype(value.dtype)
+            bias = (self.gate_bias, self.up_bias, self.down_bias)[projection]
+            if bias is not None:
+                output += bias[routed_experts][:, None, :].astype(output.dtype)
+            return output
+
+        gate = project(x, 0, self.gate_quant)
+        if self.gate_scale is not None:
+            gate *= self.gate_scale[routed_experts][:, None, None].astype(gate.dtype)
+        up = project(x, 1, self.up_quant)
+        output = project(self.activation(up, gate), 2, self.down_quant)
+        if self.out_scale is not None:
+            output *= self.out_scale[routed_experts][:, None, None].astype(output.dtype)
+        return output.squeeze(-2).astype(x.dtype)
 
     def __call__(self, x, indices) -> mx.array:
         lead, D = x.shape[:-1], x.shape[-1]
@@ -429,33 +505,22 @@ class OffloadedSwitchGLU(nn.Module):
         # touched anyway) and its LRU/eviction bookkeeping just thrashes.
         # Bulk-load the whole layer once instead; decode's later selective
         # get() calls are unaffected (see ExpertStore.get_all).
-        bulk = (
+        selected = (
             self.store.get_all(self.layer_id, uniq)
             if len(uniq) * 2 > self.store.num_experts
-            else None
+            else self.store.get_many(self.layer_id, uniq)
         )
-        for j in uniq:
-            j = int(j)
-            tok, slot = np.where(idx == j)
-            xr = xf[mx.array(tok)]
-            (gw, gsc, gb), (uw, usc, ub), (dw, dsc, db) = (
-                bulk[j] if bulk is not None else self.store.get(self.layer_id, j)
-            )
-            x_gate = self._proj(xr, gw, gsc, gb, self.gate_quant)
-            if self.gate_bias is not None:
-                x_gate = x_gate + self.gate_bias[j].astype(x_gate.dtype)
-            if self.gate_scale is not None:
-                # one scalar per iteration (every row shares expert j), not a gather.
-                x_gate = x_gate * self.gate_scale[j].astype(x_gate.dtype)
-            x_up = self._proj(xr, uw, usc, ub, self.up_quant)
-            if self.up_bias is not None:
-                x_up = x_up + self.up_bias[j].astype(x_up.dtype)
-            h = self.activation(x_up, x_gate)
-            d = self._proj(h, dw, dsc, db, self.down_quant)
-            if self.down_bias is not None:
-                d = d + self.down_bias[j].astype(d.dtype)
-            if self.out_scale is not None:
-                d = d * self.out_scale[j].astype(d.dtype)
+        if N == 1:
+            local = mx.array(np.searchsorted(uniq, idx[0]), dtype=mx.uint32)
+            return self._apply_selected(xf, uniq, local, selected).reshape(*lead, K, D)
+        # Prefill touches many experts. Bound temporary stacked weights to eight
+        # experts rather than materializing an entire layer's batched weights.
+        for start in range(0, len(uniq), 8):
+            group = uniq[start : start + 8]
+            tok, slot = np.where(np.isin(idx, group))
+            local = mx.array(np.searchsorted(group, idx[tok, slot]), dtype=mx.uint32)
+            xr = xf[mx.array(tok)][:, None, :]
+            d = self._apply_selected(xr, group, local, selected)
             out = out.at[mx.array(tok), mx.array(slot)].add(d)
         return out.reshape(*lead, K, D)
 
