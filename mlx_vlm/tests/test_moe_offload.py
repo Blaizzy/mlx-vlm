@@ -251,13 +251,16 @@ def test_expert_store_get_is_thread_safe(tmp_path):
         thread.join()
     assert errors == []
     assert sum(map(len, results)) == n_threads * n_iters
+    comparisons = []
     for thread_results in results:
         for key, val in thread_results:
             for got, want in zip(val, reference[key]):
                 for g, w in zip(got, want):
                     assert (g is None) == (w is None)
                     if g is not None:
-                        assert mx.array_equal(g, w)
+                        comparisons.append(mx.array_equal(g, w))
+    # Check every returned tensor with one synchronization instead of thousands.
+    assert mx.all(mx.stack(comparisons)).item()
 
 
 def test_selected_experts_reload_once_and_survive_tiny_cache(tmp_path):

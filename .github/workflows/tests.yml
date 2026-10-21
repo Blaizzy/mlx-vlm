@@ -8,22 +8,33 @@ on:
     branches:
       - main
 
-jobs:
-  test:
-    runs-on: macos-14
-    timeout-minutes: 30
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@v6
         with:
-          python-version: '3.10'
+          version: '0.12.24'
+          python-version: '3.10.22'
+          activate-environment: true
+
+      - name: Cache pre-commit environments
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ runner.os }}-${{ runner.arch }}-py3.10.22-${{ hashFiles('.pre-commit-config.yaml') }}
 
       - name: Install pre-commit
-        run: python -m pip install pre-commit
+        run: uv pip install pre-commit
 
       - name: Run pre-commit checks
         run: |
@@ -36,11 +47,38 @@ jobs:
             exit 1
           fi
 
+  test:
+    runs-on: macos-14
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.12.24'
+          python-version: '3.10.22'
+          activate-environment: true
+          enable-cache: true
+          cache-dependency-glob: |
+            requirements.txt
+            pyproject.toml
+
       - name: Install package and dependencies
-        run: |
-          python -m pip install -e ".[test]"
+        run: uv pip install -e ".[test]"
 
       - name: Run Python tests
-        run: |
-          cd mlx_vlm/
-          pytest -s ./tests
+        run: python .github/test_shards.py ${{ matrix.shard }}
+
+      - name: Upload test timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-timings-${{ matrix.shard }}
+          path: test-results/shard-${{ matrix.shard }}.xml
+          retention-days: 14
