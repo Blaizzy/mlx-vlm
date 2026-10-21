@@ -3316,3 +3316,36 @@ class TestFlintInferenceKernels:
         mx.eval(loss, gradients)
         assert mx.isfinite(loss).item()
         assert all(mx.all(mx.isfinite(v)).item() for _, v in tree_flatten(gradients))
+
+    def test_paged_expert_wrapper_stays_eager(self):
+        from mlx_vlm.models.flint import ModelConfig
+        from mlx_vlm.models.flint.language import SparseMoeBlock
+
+        class PagedExperts(nn.Module):
+            def __init__(self, delegate):
+                super().__init__()
+                self.delegate = delegate
+
+            def __call__(self, x, indices):
+                # Paging needs actual route values, which are unavailable in a trace.
+                assert indices.tolist()
+                return self.delegate(x, indices)
+
+        module = SparseMoeBlock(
+            ModelConfig(
+                hidden_size=64,
+                moe_intermediate_size=64,
+                shared_expert_intermediate_size=0,
+                num_experts=8,
+                num_experts_per_tok=6,
+            )
+        )
+        module.switch_mlp = PagedExperts(module.switch_mlp)
+        module.eval()
+
+        def fail_if_compiled(_):
+            pytest.fail("Paged experts must stay outside compiled graphs")
+
+        module._compiled = fail_if_compiled
+        x = mx.random.normal((1, 1, 64))
+        assert mx.array_equal(module(x), module._forward(x)).item()
