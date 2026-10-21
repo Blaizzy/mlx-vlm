@@ -218,8 +218,11 @@ def _expand_expert_layer(entries, get_value) -> Tuple[dict, int]:
             n_experts = max(n_experts, E)
             mm = STACKED_FUSED_RE.match(src)
             kind = mm["kind"]
-            if kind in ("weight_scale_2", "weight_global_scale"):
-                E = stacked_count
+            if kind in ("weight_scale_2", "weight_global_scale") and (
+                arr.ndim < 2 or arr.shape[1] == 1
+            ):
+                # Scalar/per-expert factors apply to both projections. Rowwise
+                # factors must be split with the corresponding weight rows below.
                 gate_half = up_half = (
                     mx.broadcast_to(arr, (E,)) if arr.ndim == 0 else arr
                 )
