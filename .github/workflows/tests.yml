@@ -55,9 +55,9 @@ jobs:
       matrix:
         include:
           - {shard: 1, os: ubuntu-24.04, extras: 'test,cpu'}
-          - {shard: 2, os: macos-14, extras: test}
-          - {shard: 3, os: macos-14, extras: test}
-          - {shard: 4, os: macos-14, extras: test}
+          - {shard: 2, os: macos-26, extras: test}
+          - {shard: 3, os: macos-26, extras: test}
+          - {shard: 4, os: macos-26, extras: test}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
