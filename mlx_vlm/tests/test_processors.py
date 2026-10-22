@@ -13,6 +13,7 @@ import textwrap
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, nullcontext
 from copy import deepcopy
+from functools import wraps
 from io import BytesIO
 from operator import attrgetter
 from pathlib import Path
@@ -2799,6 +2800,141 @@ def test_prepare_inputs(prompt, with_image, error, pad_token):
     if prompt == "test <image>":
         assert mx.array_equal(inputs["pixel_values"], mx.zeros((4, 5, 6)))
         assert mx.array_equal(inputs["attention_mask"], mx.array([7, 8, 9]))
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("padding_side", ["left", "right"])
+@pytest.mark.parametrize(
+    "options,expected_length",
+    [
+        ({}, 10),
+        ({"truncation": True, "max_length": 4}, 4),
+        ({"truncation": True}, 6),
+        ({"truncation": False, "max_length": 4}, 10),
+        ({"padding": "max_length", "max_length": 12}, 12),
+    ],
+    ids=["default", "truncate", "model-limit", "no-truncation", "fixed-padding"],
+)
+def test_prepare_inputs_text_length_options(
+    wrapped, padding_side, options, expected_length
+):
+    tokens = "[UNK] [PAD] hello world one two three four five six".split()
+    tokenizer = fast_tokenizer(tokens, model_max_length=6)
+    prompts = ["hello world one two three four five six hello world", "hello world"]
+    expected = tokenizer(
+        prompts,
+        **{
+            "add_special_tokens": False,
+            "padding": True,
+            "padding_side": padding_side,
+            "return_tensors": "np",
+            **options,
+        },
+    )
+    processor = NS(tokenizer=tokenizer) if wrapped else tokenizer
+    actual = prepare_inputs(
+        processor, prompts=prompts, padding_side=padding_side, **options
+    )
+
+    assert actual["input_ids"].shape == (2, expected_length)
+    for key in ("input_ids", "attention_mask"):
+        assert mx.array_equal(actual[key], mx.array(expected[key]))
+
+
+def test_prepare_inputs_text_options_do_not_forward_media_or_generation_options():
+    tokenizer = fast_tokenizer()
+    spy = Mock(wraps=tokenizer, pad_token=tokenizer.pad_token)
+    unrelated = dict(
+        min_pixels=1024,
+        max_pixels=4096,
+        fps=2.0,
+        nframes=4,
+        temperature=0.7,
+        max_tokens=16,
+    )
+    actual = prepare_inputs(
+        NS(tokenizer=spy),
+        prompts="hello hello hello hello hello hello",
+        truncation=True,
+        max_length=4,
+        **unrelated,
+    )
+
+    assert actual["input_ids"].shape == (1, 4)
+    assert unrelated.keys().isdisjoint(spy.call_args.kwargs)
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize(
+    "call,expected,error",
+    [
+        (lambda: (), (), None),
+        (lambda *, max_length=None: (max_length,), (2,), None),
+        (
+            lambda truncation=False, max_length=None, /: (truncation, max_length),
+            (False, None),
+            None,
+        ),
+        (lambda: (), (), TypeError),
+        (lambda: (), (), ValueError),
+    ],
+    ids=["strict", "max-length", "positional", "signature-type", "signature-value"],
+)
+def test_prepare_inputs_text_custom_length_parameters(wrapped, call, expected, error):
+    result = NS(input_ids=[[1, 2]], attention_mask=[[1, 1]])
+
+    class Tokenizer:
+        pad_token = "[PAD]"
+
+        # Inspect and enforce the delegated length-option signature.
+        @wraps(call)
+        def __call__(self, text, **kwargs):
+            for key in (
+                "add_special_tokens",
+                "padding",
+                "padding_side",
+                "return_tensors",
+            ):
+                kwargs.pop(key)
+            assert call(**kwargs) == expected
+            return result
+
+    tokenizer = Tokenizer()
+    context = (
+        patch("mlx_vlm.utils.inspect.signature", side_effect=error)
+        if error
+        else nullcontext()
+    )
+    with context:
+        actual = prepare_inputs(
+            NS(tokenizer=tokenizer) if wrapped else tokenizer,
+            prompts="hello hello",
+            truncation=True,
+            max_length=2,
+        )
+    assert actual["input_ids"].tolist() == result.input_ids
+    assert actual["attention_mask"].tolist() == result.attention_mask
+
+
+@pytest.mark.parametrize(
+    "options,expected_length",
+    [
+        ({}, 2),
+        ({"truncation": False, "max_length": 4}, 6),
+        ({"truncation": None, "max_length": None}, 6),
+    ],
+    ids=["custom-defaults", "disabled", "explicit-none"],
+)
+def test_prepare_inputs_text_preserves_custom_length_defaults(options, expected_length):
+    class DefaultLengthTokenizer(PreTrainedTokenizerFast):
+        def __call__(self, text, truncation=True, max_length=2, **kwargs):
+            return super().__call__(
+                text, truncation=truncation, max_length=max_length, **kwargs
+            )
+
+    tokenizer = fast_tokenizer(tokenizer_class=DefaultLengthTokenizer)
+    actual = prepare_inputs(tokenizer, prompts="hello " * 6, **options)
+    assert actual["input_ids"].shape == (1, expected_length)
 
 
 def test_prepare_inputs_preserves_mlx_attention_mask_for_thread_handoff():
