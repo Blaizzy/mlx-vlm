@@ -38,6 +38,8 @@ MODEL_CONFIG = {
     "idefics3": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "lfm2-vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "lfm2_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "lfm3_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "lfm3": MessageFormat.TEXT_ONLY,
     "aya_vision": MessageFormat.LIST_WITH_IMAGE,
     "cohere2_vision": MessageFormat.LIST_WITH_IMAGE,
     "cohere_compass": MessageFormat.LIST_WITH_IMAGE_FIRST,
