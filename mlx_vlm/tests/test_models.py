@@ -1111,6 +1111,57 @@ def test_lfm2_colbert_sanitize_and_loader(tmp_path, monkeypatch):
     assert captured["config_overrides"]["embedding_dim"] == 128
 
 
+class TestLfm2ColbertCheckpoint:
+    @pytest.mark.parametrize("bits", [None, 4, 8])
+    @pytest.mark.parametrize("layout", ["native", "huggingface"])
+    def test_roundtrip(self, tmp_path, bits, layout):
+        case = next(case for case in DATA["cases"] if case["module"] == "lfm2_colbert")
+        module = importlib.import_module("mlx_vlm.models.lfm2_colbert")
+        config = {
+            **case["config"],
+            "vocab_size": 64,
+            "hidden_size": 64,
+            "block_dim": 64,
+            "block_ff_dim": 128,
+            "embedding_dim": 32,
+        }
+        mx.random.seed(19)
+        model = module.Model(build_config(module, config))
+        if bits is not None:
+            nn.quantize(model, group_size=32, bits=bits)
+            config["quantization"] = dict(group_size=32, bits=bits)
+        weights = dict(tree_flatten(model.parameters()))
+        if layout == "huggingface":
+            original = {}
+            for key, value in weights.items():
+                if key.startswith("projection."):
+                    key = "1_Dense.linear." + key[len("projection.") :]
+                elif key.startswith("model."):
+                    key = key[len("model.") :]
+                if "conv.weight" in key:
+                    value = value.transpose(0, 2, 1)
+                original[key] = value
+        else:
+            original = weights
+        sanitized = model.sanitize(original)
+        twice = model.sanitize(sanitized)
+        assert weights.keys() == sanitized.keys() == twice.keys()
+        for key in weights:
+            np.testing.assert_array_equal(sanitized[key], weights[key])
+            np.testing.assert_array_equal(twice[key], weights[key])
+        mx.save_safetensors(str(tmp_path / "model.safetensors"), sanitized)
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        loaded = embedding_loader.load_embedding_model(tmp_path)
+        ids = mx.array([[1, 2, 3, 0], [4, 5, 6, 7]])
+        mask = mx.array([[1, 1, 1, 0], [1, 1, 1, 1]])
+        expected = model(ids, attention_mask=mask)
+        actual = loaded(ids, attention_mask=mask)
+        np.testing.assert_array_equal(actual.text_embeds, expected.text_embeds)
+        np.testing.assert_array_equal(
+            actual.last_hidden_state, expected.last_hidden_state
+        )
+
+
 @pytest.fixture
 def embedding_gemma2_case():
     case = next(c for c in DATA["cases"] if c["module"] == "embedding_gemma2")
