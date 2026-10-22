@@ -332,6 +332,76 @@ def test_bpe_streaming_uses_canonical_added_tokens(
         assert detokenizer.text == expected
 
 
+@pytest.mark.parametrize("server_stream", [False, True], ids=["cli", "server"])
+@pytest.mark.parametrize("stride", [1, 2], ids=["dense-vocab", "sparse-vocab"])
+@pytest.mark.parametrize(
+    "pieces, expected",
+    [
+        ([None], ""),
+        ([None, "Ġhello"], "hello"),
+        (["Ã", None, "©"], "é"),
+        (["Ã", None], "\ufffd"),
+        (["z", None, "z"], "zz"),
+    ],
+    ids=["only-unmapped", "leading-space", "split-utf8", "truncated-utf8", "ascii"],
+)
+def test_bpe_streaming_skips_unmapped_ids(stride, pieces, expected, server_stream):
+    vocab = {piece: i * stride for i, piece in enumerate(["Ã", "©", "Ġhello", "z"])}
+    backend = Tokenizer(WordLevel(vocab))
+    backend.decoder = ByteLevelDecoder()
+    tokenizer = NS(
+        vocab=backend.get_vocab(),
+        convert_ids_to_tokens=backend.id_to_token,
+        decode=backend.decode,
+    )
+    unmapped = [
+        i for i in range(max(vocab.values()) + 2) if backend.id_to_token(i) is None
+    ]
+    unmapped.append(2**32 - 1)
+    tokens = [
+        token
+        for piece in pieces
+        for token in (unmapped if piece is None else [vocab[piece]])
+    ]
+    assert tokenizer.decode(tokens).removeprefix(" ") == expected
+
+    detokenizer = BPEStreamingDetokenizer(tokenizer, trim_space=True)
+    streamer = _ServerTokenStreamer(tokenizer, detokenizer) if server_stream else None
+    segments = []
+    for token in tokens:
+        if server_stream:
+            segment = streamer.advance(token, finish_reason=None)
+        else:
+            detokenizer.add_token(token)
+            segment = detokenizer.last_segment
+        if token in unmapped:
+            assert segment == ""
+        segments.append(segment)
+    if server_stream:
+        segments.append(streamer.finalize())
+    else:
+        detokenizer.finalize()
+        segments.append(detokenizer.last_segment)
+        assert detokenizer.text == expected
+    assert "".join(segments) == expected
+
+
+@pytest.mark.parametrize("server_stream", [False, True], ids=["cli", "server"])
+def test_bpe_streaming_empty_vocab(server_stream):
+    backend = Tokenizer(WordLevel({}))
+    tokenizer = NS(vocab=backend.get_vocab(), decode=backend.decode)
+    assert tokenizer.decode([0]) == ""
+    detokenizer = BPEStreamingDetokenizer(tokenizer)
+    if server_stream:
+        streamer = _ServerTokenStreamer(tokenizer, detokenizer)
+        assert streamer.advance(0, finish_reason=None) == ""
+        assert streamer.finalize() == ""
+    else:
+        detokenizer.add_token(0)
+        detokenizer.finalize()
+        assert detokenizer.text == ""
+
+
 def test_bpe_streaming_copies_isolate_partial_utf8_and_skip_tokens():
     source = BPEStreamingDetokenizer(
         MockTokenizer({"Ã": 0, "©": 1, "高": 2, "<skip>": 3})

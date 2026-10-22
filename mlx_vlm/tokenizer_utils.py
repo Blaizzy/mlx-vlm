@@ -218,7 +218,7 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
         # can retain spellings that differ from the tokenizer's ID decoder.
         vocab = tokenizer.vocab
         convert_token = getattr(tokenizer, "convert_ids_to_tokens", None)
-        self.tokenmap = [None] * len(vocab)
+        self.tokenmap = [None] * (max(vocab.values(), default=-1) + 1)
         for value, tokenid in vocab.items():
             if convert_token is not None:
                 value = convert_token(tokenid)
@@ -248,7 +248,14 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
     def add_token(self, token, skip_special_token_ids: List[int] = []):
         if token in skip_special_token_ids:
             return
-        token_bytes = bytes(self._byte_decoder[c] for c in self.tokenmap[token])
+        # Native ByteLevel decoding skips unmapped IDs, including padded model
+        # outputs. Preserve pending UTF-8 bytes across these gaps.
+        if not 0 <= token < len(self.tokenmap):
+            return
+        value = self.tokenmap[token]
+        if value is None:
+            return
+        token_bytes = bytes(self._byte_decoder[c] for c in value)
         self._append_text(self._decoder.decode(token_bytes, final=False))
 
     def finalize(self):
