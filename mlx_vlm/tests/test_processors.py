@@ -25,9 +25,10 @@ import mlx.core as mx
 import numpy as np
 import pytest
 from PIL import Image
-from tokenizers import Tokenizer
+from tokenizers import AddedToken, Tokenizer
 from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 from tokenizers.models import WordLevel
+from tokenizers.normalizers import NFKC
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import AutoProcessor, PreTrainedTokenizerBase, PreTrainedTokenizerFast
 
@@ -293,6 +294,42 @@ def test_bpe_streaming_matches_native_bytelevel(
             assert detokenizer.last_segment == ""
             assert detokenizer.text == expected
         assert "".join(segments) + final_segment == expected
+
+
+@pytest.mark.parametrize("server_stream", [False, True], ids=["cli", "server"])
+@pytest.mark.parametrize("normalized", [False, True], ids=["literal", "normalized"])
+@pytest.mark.parametrize(
+    "piece, canonical",
+    [("ŉ", "ʼn"), ("ำ", "ํา"), ("ﭏ", "אל"), ("ﬃ", "ffi"), ("ͺ", " ͅ")],
+    ids=["apostrophe-n", "thai", "hebrew", "ligature", "leading-space"],
+)
+def test_bpe_streaming_uses_canonical_added_tokens(
+    tmp_path, piece, canonical, normalized, server_stream
+):
+    backend = Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
+    backend.normalizer = NFKC()
+    backend.decoder = ByteLevelDecoder()
+    backend.add_tokens([AddedToken(piece, normalized=normalized)])
+    backend.save(str(tmp_path / "tokenizer.json"))
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend, clean_up_tokenization_spaces=False
+    )
+    token = tokenizer.vocab[piece]
+    expected = canonical if normalized else piece
+    assert tokenizer.convert_ids_to_tokens(token) == expected
+    assert tokenizer.decode([token]) == expected
+
+    detokenizer = load_tokenizer(tmp_path, return_tokenizer=False)(tokenizer)
+    if server_stream:
+        streamer = _ServerTokenStreamer(tokenizer, detokenizer)
+        assert streamer.advance(token, finish_reason=None) == expected
+        assert streamer.finalize() == ""
+    else:
+        detokenizer.add_token(token)
+        assert detokenizer.last_segment == expected
+        detokenizer.finalize()
+        assert detokenizer.last_segment == ""
+        assert detokenizer.text == expected
 
 
 def test_bpe_streaming_copies_isolate_partial_utf8_and_skip_tokens():

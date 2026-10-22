@@ -214,9 +214,14 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
         self.make_byte_decoder()
         byte_encoder = {b: c for c, b in self._byte_decoder.items()}
 
-        # Extract the tokens in a list from id to text
-        self.tokenmap = [None] * len(tokenizer.vocab)
-        for value, tokenid in tokenizer.vocab.items():
+        # Extract the tokens in a list from id to text. Added-token vocab keys
+        # can retain spellings that differ from the tokenizer's ID decoder.
+        vocab = tokenizer.vocab
+        convert_token = getattr(tokenizer, "convert_ids_to_tokens", None)
+        self.tokenmap = [None] * len(vocab)
+        for value, tokenid in vocab.items():
+            if convert_token is not None:
+                value = convert_token(tokenid)
             # ByteLevel decodes the whole token as literal UTF-8 if any
             # character is outside its byte alphabet. Normalize it once so
             # both streaming paths can keep using the byte decoder.
