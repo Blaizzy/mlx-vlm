@@ -5,8 +5,9 @@ from ..base import LanguageModelOutput, scaled_dot_product_attention
 from ..cache import KVCache, RotatingKVCache
 from ..mlp import SwiGLUMLP
 from ..rope_utils import initialize_rope
-from ..switch_layers import SwitchGLU, stack_expert_projection
+from ..switch_layers import SwiGLU, SwitchGLU, stack_expert_projection
 from .attention_mask import create_attention_mask
+from .compilation import CompiledStage, linear_signature
 from .config import ModelConfig
 from .kernels import down_reduce, gate_up_silu, metal_sum, route_experts
 from .normalization import norm_rope, residual_norm
@@ -100,6 +101,7 @@ class SparseMoeBlock(nn.Module):
         # Index selection and expert dispatch stay outside this shape-independent
         # graph; both can choose different algorithms as the workload changes.
         self._compiled = mx.compile(self._prepare, inputs=self, shapeless=True)
+        self._compiled_inference = CompiledStage(self._inference, self)
 
     def route(self, x):
         # The reference computes the projection in the activation dtype, then
@@ -155,6 +157,22 @@ class SparseMoeBlock(nn.Module):
         # Paged experts perform data-dependent I/O and cannot be traced.
         if self.training or type(self.switch_mlp) is not SwitchGLU:
             return self._forward(x)
+        switch = self.switch_mlp
+        shared = self.shared_expert
+        if type(switch.activation) is not SwiGLU or (
+            shared is not None and type(shared) is not SwiGLUMLP
+        ):
+            return self._forward(x)
+        projections = [self.gate, switch.gate_proj, switch.up_proj, switch.down_proj]
+        if shared is not None:
+            projections += [shared.gate_proj, shared.up_proj, shared.down_proj]
+        signature = tuple(linear_signature(p) for p in projections)
+        if any(p is None for p in signature):
+            return self._forward(x)
+        if mx.default_device() == mx.gpu:
+            return self._compiled_inference(
+                x, signature=(self.top_k, switch.training, signature)
+            )
         return self._inference(x)
 
 
