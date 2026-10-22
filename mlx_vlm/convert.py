@@ -277,6 +277,19 @@ def _apply_awq_calibration(
     print(f"[INFO] AWQ scaling applied: {summary}")
 
 
+def _record_conversion_dtype(config: dict, dtype: str) -> None:
+    """Record the cast dtype without changing quantization declarations."""
+    config["dtype"] = dtype
+    for name, section in config.items():
+        if (
+            name.endswith("_config")
+            and name != "quantization_config"
+            and isinstance(section, dict)
+        ):
+            for key in section.keys() & {"dtype", "torch_dtype"}:
+                section[key] = dtype
+
+
 def convert(
     hf_path: str,
     mlx_path: str = "mlx_model",
@@ -319,21 +332,22 @@ def convert(
     quant_predicate = quant_predicate or base_quant_predicate
 
     if dtype is None:
-        dtype = config.get("torch_dtype", None)
+        dtype = config.get("dtype") or config.get("torch_dtype")
     if dtype is None and (text_config := config.get("text_config", None)):
         dtype = text_config.get("dtype", None)
     if dtype in MODEL_CONVERSION_DTYPES:
         print("[INFO] Using dtype:", dtype)
-        dtype = getattr(mx, dtype)
+        mlx_dtype = getattr(mx, dtype)
         cast_predicate = getattr(model, "cast_predicate", lambda _: True)
 
         def set_dtype(k, v):
             if cast_predicate(k) and mx.issubdtype(v.dtype, mx.floating):
-                return v.astype(dtype)
+                return v.astype(mlx_dtype)
             else:
                 return v
 
         target.update(tree_map_with_path(set_dtype, target.parameters()))
+        _record_conversion_dtype(config, dtype)
 
     if quantize and dequantize:
         raise ValueError("Choose either quantize or dequantize, not both.")
@@ -521,7 +535,10 @@ def configure_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--dtype",
-        help="Type to save the parameter. Defaults to config.json's `torch_dtype` or the current model weights dtype",
+        help=(
+            "Type to save the parameter. Defaults to config.json's `dtype` or "
+            "`torch_dtype`, then `text_config.dtype`, or the current model weights dtype"
+        ),
         type=str,
         choices=MODEL_CONVERSION_DTYPES,
         default=None,

@@ -2163,6 +2163,83 @@ def test_mixed_recipe_finds_lfm2_down_projection():
         assert bits[f"layers.{i}.feed_forward.w1"] == 4
 
 
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@pytest.mark.parametrize("quantize", [False, True])
+def test_convert_dtype_round_trip_preserves_cast_exclusions(tmp_path, dtype, quantize):
+    from mlx_vlm.convert import convert
+    from mlx_vlm.tests.test_models import model_case
+
+    config = model_case("qwen3_5")["config"]
+    config.update(dtype="bfloat16", torch_dtype="bfloat16")
+    config["text_config"]["dtype"] = "bfloat16"
+    config["vision_config"]["torch_dtype"] = "bfloat16"
+    source = tmp_path / "source"
+    source.mkdir()
+    model = qwen35.Model(qwen35.ModelConfig.from_dict(config))
+    original_weights = dict(tree_flatten(model.parameters()))
+    mx.save_safetensors(str(source / "model.safetensors"), original_weights)
+    (source / "config.json").write_text(json.dumps(config))
+
+    with patch("mlx_vlm.utils.load_processor", return_value=SimpleNamespace()):
+        for attempt, options in enumerate((dict(dtype=dtype, quantize=quantize), {})):
+            destination = tmp_path / f"converted-{attempt}"
+            convert(str(source), str(destination), q_group_size=32, **options)
+            exported = json.loads((destination / "config.json").read_text())
+            assert exported["dtype"] == dtype
+            assert "torch_dtype" not in exported
+            assert exported["text_config"]["dtype"] == dtype
+            assert exported["vision_config"]["torch_dtype"] == dtype
+            weights = dict(tree_flatten(load_model(destination).parameters()))
+            protected = [key for key in weights if key.endswith("A_log")]
+            assert protected
+            for key in protected:
+                assert weights[key].dtype == mx.float32
+                assert mx.array_equal(weights[key], original_weights[key]).item()
+            assert weights["vision_tower.patch_embed.proj.weight"].dtype == getattr(
+                mx, dtype
+            )
+            if quantize:
+                assert exported["quantization"]["bits"] == 4
+                assert any(weight.dtype == mx.uint32 for weight in weights.values())
+            source = destination
+
+
+@pytest.mark.parametrize(
+    "metadata,expected",
+    [
+        ({"dtype": "float16", "torch_dtype": "bfloat16"}, "float16"),
+        ({"torch_dtype": "float16"}, "float16"),
+        ({"text_config": {"dtype": "float16"}}, "float16"),
+        ({"dtype": None, "torch_dtype": "float16"}, "float16"),
+        ({}, None),
+    ],
+)
+def test_convert_default_dtype_metadata(tmp_path, metadata, expected):
+    conversion = importlib.import_module("mlx_vlm.convert")
+    unchanged = {
+        "audio_config": {"hidden_size": 8},
+        "vision_config": None,
+        "quantization": {"bits": 4, "dtype": "uint32"},
+        "quantization_config": {"bits": 4, "dtype": "uint32"},
+    }
+    config = copy.deepcopy({**metadata, **unchanged})
+    source, destination = tmp_path / "source", tmp_path / "converted"
+    source.mkdir()
+    with patch.object(
+        conversion,
+        "fetch_from_hub",
+        return_value=(nn.Linear(4, 4), config, SimpleNamespace()),
+    ):
+        conversion.convert(str(source), str(destination))
+    exported = json.loads((destination / "config.json").read_text())
+    assert exported.get("dtype") == expected
+    assert {key: exported[key] for key in unchanged} == unchanged
+    weights = mx.load(str(destination / "model.safetensors"))
+    assert {weight.dtype for weight in weights.values()} == {
+        getattr(mx, expected or "float32")
+    }
+
+
 def test_convert_preserves_existing_deepseek_v4_quantization():
     config = {
         "model_type": "deepseek_v4",
