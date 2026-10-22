@@ -989,6 +989,19 @@ def test_gemma3n_batches_images_and_audio():
     assert processor.tokenizer.last_kwargs["padding"] is True
 
 
+def test_nemotron_parse_packed_page_geometry_and_patch_order():
+    image = Image.fromarray(np.arange(17 * 65 * 3, dtype=np.uint8).reshape(17, 65, 3))
+    inputs = m.nemotron_parse_v3_5.ImageProcessor()(image)
+    assert inputs["image_sizes"].tolist() == [[32, 128]]
+    assert inputs["content_sizes"].tolist() == [[17, 65]]
+    assert inputs["pixel_values"].shape == (16, 768)
+    expected = (
+        np.asarray(image).transpose(2, 0, 1).astype(np.float32) / 255
+        - np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)[:, None, None]
+    ) / np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)[:, None, None]
+    equal(inputs["pixel_values"][0], expected[:, :16, :16].reshape(-1))
+
+
 def test_unlimited_ocr_default_chat_template_omits_trailing_space():
     Template = pytest.importorskip("jinja2").Template
     p = object.__new__(c.ocr)
