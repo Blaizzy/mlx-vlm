@@ -31,6 +31,16 @@ QUANT_RECIPES = [
 ]
 
 
+def _copy_writable_file(src, dst):
+    """Copy cache contents without carrying read-only permissions into the export."""
+    src, dst = Path(src), Path(dst)
+    if dst.exists() and src.samefile(dst):
+        raise shutil.SameFileError(f"{src!s} and {dst!s} are the same file")
+    # A previous conversion may have left a read-only file at the destination.
+    dst.unlink(missing_ok=True)
+    return shutil.copyfile(src, dst)
+
+
 def _preserve_existing_deepseek_v4_quantization(
     config: dict,
     model: nn.Module,
@@ -377,7 +387,7 @@ def convert(
             # Skip the index file - save_weights() already generated the correct one
             if Path(file).name == "model.safetensors.index.json":
                 continue
-            shutil.copy(file, mlx_path)
+            _copy_writable_file(file, mlx_path / Path(file).name)
 
     # Copy folders from the model path to the MLX path
     for item in model_path.iterdir():
@@ -385,7 +395,7 @@ def convert(
             dest = mlx_path / item.name
             if dest.exists():
                 shutil.rmtree(dest)
-            shutil.copytree(item, dest)
+            shutil.copytree(item, dest, copy_function=_copy_writable_file)
 
     # Not every remote-code processor inherits ProcessorMixin — Mage-VL's `MageVLProcessor`
     # deliberately does not ("We deliberately do NOT inherit transformers.ProcessorMixin"), so it
@@ -403,7 +413,7 @@ def convert(
             for pattern in ("*.json", "*.txt", "*.jinja", "*.model"):
                 for f in src.glob(pattern):
                     if f.name not in ("config.json", "model.safetensors.index.json"):
-                        shutil.copy2(f, Path(mlx_path) / f.name)
+                        _copy_writable_file(f, mlx_path / f.name)
         print("[INFO] processor lacks save_pretrained; copied processor files verbatim")
 
     save_config(config, config_path=mlx_path / "config.json")

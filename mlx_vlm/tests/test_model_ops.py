@@ -5,6 +5,8 @@ from __future__ import annotations
 import copy
 import importlib
 import json
+import shutil
+import stat
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
@@ -2194,6 +2196,83 @@ def test_convert_preserves_existing_deepseek_v4_quantization():
         "bits": 8,
         "mode": "mxfp8",
     }
+
+
+@pytest.mark.parametrize("existing_output", [False, True])
+@pytest.mark.parametrize("save_processor", [False, True])
+def test_convert_readonly_metadata(tmp_path, existing_output, save_processor):
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+
+    conversion = importlib.import_module("mlx_vlm.convert")
+    source, destination = tmp_path / "source", tmp_path / "converted"
+    source.mkdir()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(
+            WordLevel({"[UNK]": 0, "hello": 1}, unk_token="[UNK]")
+        ),
+        unk_token="[UNK]",
+        chat_template="{{ messages[0]['content'] }}",
+    )
+    tokenizer.save_pretrained(source)
+    (source / "config.json").write_text("{}")
+    (source / "processor.py").write_text("# Custom processor\n")
+    (source / "assets").mkdir()
+    (source / "assets" / "vocab.txt").write_text("hello\n")
+    # Model snapshots link to immutable files in the shared Hub cache.
+    blob = tmp_path / "tokenizer-blob"
+    (source / "tokenizer.json").rename(blob)
+    (source / "tokenizer.json").symlink_to(blob)
+    originals = {}
+    for file in source.rglob("*"):
+        if file.is_file():
+            originals[file.relative_to(source)] = file.read_bytes()
+            file.chmod(0o444)
+            if existing_output and (not save_processor or file.suffix != ".jinja"):
+                output = destination / file.relative_to(source)
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text("stale output")
+                output.chmod(0o444)
+
+    model = nn.Linear(4, 4)
+    processor = tokenizer if save_processor else SimpleNamespace()
+    with patch.object(
+        conversion, "fetch_from_hub", return_value=(model, {}, processor)
+    ):
+        conversion.convert(str(source), str(destination))
+
+    reloaded = PreTrainedTokenizerFast.from_pretrained(
+        destination, local_files_only=True
+    )
+    assert reloaded.encode("hello") == tokenizer.encode("hello")
+    assert reloaded.chat_template == tokenizer.chat_template
+    assert (destination / "model.safetensors").is_file()
+    for relative, contents in originals.items():
+        original, output = source / relative, destination / relative
+        assert original.read_bytes() == contents
+        assert stat.S_IMODE(original.stat().st_mode) == 0o444
+        assert output.stat().st_mode & stat.S_IWUSR
+        assert not output.is_symlink()
+    assert (destination / "assets" / "vocab.txt").read_text() == "hello\n"
+    assert (source / "tokenizer.json").is_symlink()
+
+
+@pytest.mark.parametrize("alias", [False, True])
+def test_convert_copy_rejects_same_file_without_modifying_source(tmp_path, alias):
+    from mlx_vlm.convert import _copy_writable_file
+
+    source = tmp_path / "tokenizer.json"
+    source.write_text("original tokenizer")
+    source.chmod(0o444)
+    destination = source
+    if alias:
+        destination = tmp_path / "alias.json"
+        destination.symlink_to(source)
+    with pytest.raises(shutil.SameFileError):
+        _copy_writable_file(source, destination)
+    assert source.read_text() == "original tokenizer"
+    assert stat.S_IMODE(source.stat().st_mode) == 0o444
 
 
 def test_modelopt_mixed_drops_fp8_kv_cache_scales():
