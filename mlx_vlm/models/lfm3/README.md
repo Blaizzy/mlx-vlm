@@ -76,9 +76,11 @@ also match all reference logits within `3e-7`. BF16 inference answered `42`,
 read `CODE 5739`, and identified the left red shape and right blue circle.
 These are smoke checks, not a comprehensive quality benchmark.
 
-Regression coverage is in `mlx_vlm/tests/test_lfm3.py`, including mixed caches,
-sliding-window wraparound, batch offsets, partial rotary coordinates,
-frame separation, placeholder counts, and quantized checkpoint round trips.
+Regression coverage lives in `test_models.py`, `test_processors.py`, and
+`test_model_ops.py` under `mlx_vlm/tests`, with tiny configs in `model_cases.json`.
+It includes mixed caches, sliding-window wraparound, batch offsets, partial
+rotary coordinates, frame separation, placeholder counts, and quantized
+checkpoint round trips.
 
 LFM3-Omni is not included: its checkpoint does not supply reference code for
 the audio encoder, depth model, and LiquidCodec.

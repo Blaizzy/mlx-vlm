@@ -4689,3 +4689,148 @@ class TestUnlimitedOCR2Dash:
         )
         maybe_quantize_kv_cache(cache, 0, 64, 4, **kwargs)
         assert all(old is new for old, new in zip(previous, cache))
+
+
+@pytest.fixture
+def lfm3_case(request):
+    case = model_case(getattr(request, "param", "lfm3"))
+    module = importlib.import_module("mlx_vlm.models." + case["module"])
+    return module, module.ModelConfig.from_dict(case["config"])
+
+
+@pytest.mark.parametrize("chunks", [[13], [1] * 13, [3, 2, 1, 4, 3]])
+@pytest.mark.parametrize("sandwich", [True, False])
+def test_lfm3_cached_chunks_match_full_forward_across_window(
+    lfm3_case, chunks, sandwich
+):
+    mx.random.seed(31)
+    module, config = lfm3_case
+    config.use_sandwich_norm = sandwich
+    model = module.Model(config)
+    model.eval()
+    tokens = mx.array([[i % 64 for i in range(13)]])
+    expected = model(tokens).logits
+    cache = model.make_cache()
+    actual, offset = [], 0
+    for length in chunks:
+        actual.append(model(tokens[:, offset : offset + length], cache=cache).logits)
+        mx.eval(actual[-1], [c.state for c in cache])
+        offset += length
+    np.testing.assert_allclose(
+        np.array(mx.concatenate(actual, axis=1)),
+        np.array(expected),
+        atol=2e-5,
+        rtol=2e-5,
+    )
+    assert cache[1].offset == 13
+    assert cache[2].offset == 13
+
+
+def test_lfm3_merged_batch_cache_respects_per_row_rotary_offsets(lfm3_case):
+    module, config = lfm3_case
+    model = module.Model(config)
+    model.eval()
+    caches = [model.make_cache(), model.make_cache()]
+    for tokens, cache in zip([[1, 2, 3], [4, 5, 6, 7, 8, 9]], caches):
+        mx.eval(model(mx.array([tokens]), cache=cache).logits)
+    batched = [type(a).merge([a, b]) for a, b in zip(*caches)]
+    actual = model(mx.array([[10], [11]]), cache=batched).logits
+    expected = mx.concatenate(
+        [
+            model(mx.array([[token]]), cache=cache).logits
+            for token, cache in zip([10, 11], caches)
+        ]
+    )
+    np.testing.assert_allclose(
+        np.asarray(actual), np.asarray(expected), atol=2e-5, rtol=2e-5
+    )
+
+
+@pytest.mark.parametrize("lfm3_case", ["lfm3", "lfm3_vl"], indirect=True)
+def test_lfm3_hf_checkpoint_keys_and_sanitize_idempotency(lfm3_case):
+    module, config = lfm3_case
+    model = module.Model(config)
+    visual = config.model_type == "lfm3_vl"
+    native = dict(tree_flatten(model.parameters()))
+    hf = {}
+    for name, value in native.items():
+        value = (
+            mx.arange(value.size, dtype=mx.float32).reshape(value.shape) / value.size
+        )
+        native[name] = value
+        if name.endswith("conv.conv.weight"):
+            value = value.transpose(0, 2, 1)
+        elif name.endswith("spatial_conv.weight"):
+            value = value.transpose(0, 3, 1, 2)
+        if visual:
+            name = name.replace("language_model.model.", "language_model.")
+            name = "model." + name
+        else:
+            name = name.removeprefix("language_model.")
+        hf[name] = value
+    hf["lm_head.weight"] = mx.ones((64, 32))
+    once = model.sanitize(hf)
+    twice = model.sanitize(once)
+    assert once.keys() == native.keys() == twice.keys()
+    for name in native:
+        np.testing.assert_array_equal(np.asarray(once[name]), np.asarray(native[name]))
+        np.testing.assert_array_equal(np.asarray(twice[name]), np.asarray(native[name]))
+    model.load_weights(list(once.items()), strict=True)
+
+
+@pytest.mark.parametrize("lfm3_case", ["lfm3_vl"], indirect=True)
+def test_lfm3_visual_frame_boundaries_and_cached_features(lfm3_case):
+    module, config = lfm3_case
+    model = module.Model(config)
+    pixels = mx.random.normal((24, 24))
+    grid = mx.array([[1, 4, 4], [2, 2, 2]])
+    combined = model.encode_images(pixels, image_grid_thw=grid)
+    separate = mx.concatenate(
+        [
+            model.encode_images(pixels[:16], image_grid_thw=mx.array([[1, 4, 4]])),
+            model.encode_images(pixels[16:], image_grid_thw=mx.array([[2, 2, 2]])),
+        ]
+    )
+    np.testing.assert_allclose(np.asarray(combined), np.asarray(separate), atol=1e-5)
+    ids = mx.array([[1] + [60] * 6 + [2]])
+    full = model.get_input_embeddings(ids, pixels, image_grid_thw=grid).inputs_embeds
+    cached = model.get_input_embeddings(
+        ids, pixels, cached_image_features=combined
+    ).inputs_embeds
+    np.testing.assert_array_equal(np.asarray(full), np.asarray(cached))
+    with pytest.raises(ValueError, match="tokens"):
+        model.get_input_embeddings(mx.array([[60]]), pixels, image_grid_thw=grid)
+
+
+@pytest.mark.parametrize("lfm3_case", ["lfm3", "lfm3_vl"], indirect=True)
+def test_lfm3_quantized_checkpoint_roundtrip(tmp_path, lfm3_case):
+    from dataclasses import asdict
+
+    from mlx_vlm.utils import load_model
+
+    module, config = lfm3_case
+    visual = config.model_type == "lfm3_vl"
+    if visual:
+        config.vision_config.patch_size = 4
+        config.projector_hidden_size = 64
+    model = module.Model(config)
+    nn.quantize(model, group_size=32, bits=4)
+    model.eval()
+    ids = mx.array([[1, 60, 2]]) if visual else mx.array([[1, 2, 3]])
+    kwargs = (
+        dict(
+            pixel_values=mx.random.normal((4, 96)), image_grid_thw=mx.array([[1, 2, 2]])
+        )
+        if visual
+        else {}
+    )
+    expected = model(ids, **kwargs).logits
+    config = asdict(model.config)
+    config["quantization"] = dict(group_size=32, bits=4)
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(
+        str(tmp_path / "model.safetensors"), dict(tree_flatten(model.parameters()))
+    )
+    restored = load_model(tmp_path)
+    actual = restored(ids, **kwargs).logits
+    np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))

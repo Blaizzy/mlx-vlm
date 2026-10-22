@@ -4291,3 +4291,79 @@ class TestMiniCPMV47Processor:
         assert loaded.tokenizer.chat_template == tokenizer.chat_template
         result = loaded(text="<|image_pad|>", images=[Image.new("RGB", (56, 56))])
         assert np.count_nonzero(result["mm_token_type_ids"] == 1) == 4
+
+
+@pytest.fixture
+def lfm3_processor():
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+
+    module = importlib.import_module("mlx_vlm.models.lfm3_vl.processing_lfm3_vl")
+    image_module = importlib.import_module(
+        "mlx_vlm.models.qwen3_vl.processing_qwen3_vl"
+    )
+    tokens = ["<unk>", "<|image|>", "<|video|>", "<|vision_start|>", "<|vision_end|>"]
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(
+            WordLevel(dict(zip(tokens, range(len(tokens)))), unk_token="<unk>")
+        ),
+        unk_token="<unk>",
+        additional_special_tokens=tokens[1:],
+    )
+    return module.Lfm3VlProcessor(
+        image_module.Qwen3VLImageProcessor(min_pixels=4096, max_pixels=16384),
+        tokenizer,
+        module.Lfm3VlVideoProcessor(min_pixels=4096, max_pixels=65536),
+    )
+
+
+def test_lfm3_media_placeholders_are_validated_without_replacing_inserted_tokens():
+    module = importlib.import_module("mlx_vlm.models.lfm3_vl.processing_lfm3_vl")
+    result = module.Lfm3VlProcessor._expand(
+        ["a<|image|>b<|image|>c"], "<|image|>", ["<|image|>" * 2, "<|image|>" * 3]
+    )
+    assert result == ["a<|image|><|image|>b<|image|><|image|><|image|>c"]
+    with pytest.raises(ValueError, match="placeholders"):
+        module.Lfm3VlProcessor._expand(["a"], "<|image|>", ["image"])
+    with pytest.raises(ValueError, match="placeholders"):
+        module.Lfm3VlProcessor._expand(["<|image|>"], "<|image|>", [])
+
+
+def test_lfm3_processor_save_preserves_resolution_override(tmp_path, lfm3_processor):
+    processor = lfm3_processor
+    processor.image_processor.max_pixels = 4096
+    image = Image.fromarray(np.zeros((128, 128, 3), dtype=np.uint8))
+    expected = processor(text="<|image|>", images=image, return_tensors="np")
+    processor.save_pretrained(tmp_path)
+    restored = type(processor).from_pretrained(tmp_path)
+    actual = restored(text="<|image|>", images=image, return_tensors="np")
+    for name in expected:
+        np.testing.assert_array_equal(actual[name], expected[name])
+
+
+def test_lfm3_video_timestamps_use_sampled_fps_and_repeat_the_last_odd_frame(
+    lfm3_processor,
+):
+    processor = lfm3_processor
+    tokenizer = processor.tokenizer
+
+    class RecordingTokenizer:
+        def __call__(self, text, **kwargs):
+            self.text = text
+            return tokenizer(text, **kwargs)
+
+    processor.tokenizer = RecordingTokenizer()
+    frames = np.stack(
+        [np.full((64, 64, 3), value, dtype=np.uint8) for value in (0, 100, 255)]
+    )
+    result = processor(
+        text="<|video|>", videos=[frames], fps=[2.0], return_tensors="np"
+    )
+    text = processor.tokenizer.text[0]
+    assert "<0.2 seconds>" in text  # average of frames at 0.0 and 0.5 seconds
+    assert "<1.0 seconds>" in text  # the final frame is duplicated, not extrapolated
+    np.testing.assert_array_equal(result["video_grid_thw"], [[2, 4, 4]])
+    np.testing.assert_allclose(result["pixel_values_videos"][-16:], 1.0)
+    with pytest.raises(ValueError, match="pre-sampled"):
+        processor(text="<|video|>", videos=[frames], do_sample_frames=True)
