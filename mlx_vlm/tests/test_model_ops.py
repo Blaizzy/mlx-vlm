@@ -5,6 +5,8 @@ from __future__ import annotations
 import copy
 import importlib
 import json
+import shutil
+import stat
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
@@ -18,11 +20,7 @@ import pytest
 from mlx.utils import tree_flatten
 
 import mlx_vlm.models.rope_utils as rope_utils
-from mlx_vlm.convert import (
-    _copy_file,
-    _preserve_existing_deepseek_v4_quantization,
-    _record_conversion_dtype,
-)
+from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
 from mlx_vlm.fp8 import _dequantize_fp8_weight, _quantize_fp8_weight
 from mlx_vlm.models.cache import KVCache
 from mlx_vlm.models.kernels import grid_sample
@@ -2200,48 +2198,81 @@ def test_convert_preserves_existing_deepseek_v4_quantization():
     }
 
 
-def test_convert_copies_read_only_sidecars_as_writable(tmp_path):
-    """Hub blobs fetched through xet are cached read-only (0444).
+@pytest.mark.parametrize("existing_output", [False, True])
+@pytest.mark.parametrize("save_processor", [False, True])
+def test_convert_readonly_metadata(tmp_path, existing_output, save_processor):
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
 
-    Copying their mode across leaves a read-only ``tokenizer.json`` in the
-    output, and ``processor.save_pretrained`` then fails with "Permission
-    denied" before ``save_config`` ever runs.
-    """
-    src = tmp_path / "cache" / "tokenizer.json"
-    src.parent.mkdir(parents=True)
-    src.write_text("{}")
-    src.chmod(0o444)
-    dst = tmp_path / "out" / "tokenizer.json"
-    dst.parent.mkdir()
-    # A previous run of the buggy copy left one of those read-only files behind.
-    dst.write_text("stale")
-    dst.chmod(0o444)
+    conversion = importlib.import_module("mlx_vlm.convert")
+    source, destination = tmp_path / "source", tmp_path / "converted"
+    source.mkdir()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(
+            WordLevel({"[UNK]": 0, "hello": 1}, unk_token="[UNK]")
+        ),
+        unk_token="[UNK]",
+        chat_template="{{ messages[0]['content'] }}",
+    )
+    tokenizer.save_pretrained(source)
+    (source / "config.json").write_text("{}")
+    (source / "processor.py").write_text("# Custom processor\n")
+    (source / "assets").mkdir()
+    (source / "assets" / "vocab.txt").write_text("hello\n")
+    # Model snapshots link to immutable files in the shared Hub cache.
+    blob = tmp_path / "tokenizer-blob"
+    (source / "tokenizer.json").rename(blob)
+    (source / "tokenizer.json").symlink_to(blob)
+    originals = {}
+    for file in source.rglob("*"):
+        if file.is_file():
+            originals[file.relative_to(source)] = file.read_bytes()
+            file.chmod(0o444)
+            if existing_output and (not save_processor or file.suffix != ".jinja"):
+                output = destination / file.relative_to(source)
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text("stale output")
+                output.chmod(0o444)
 
-    _copy_file(src, dst)
+    model = nn.Linear(4, 4)
+    processor = tokenizer if save_processor else SimpleNamespace()
+    with patch.object(
+        conversion, "fetch_from_hub", return_value=(model, {}, processor)
+    ):
+        conversion.convert(str(source), str(destination))
 
-    assert dst.read_text() == "{}"
-    dst.write_text('{"replaced": true}')
+    reloaded = PreTrainedTokenizerFast.from_pretrained(
+        destination, local_files_only=True
+    )
+    assert reloaded.encode("hello") == tokenizer.encode("hello")
+    assert reloaded.chat_template == tokenizer.chat_template
+    assert (destination / "model.safetensors").is_file()
+    for relative, contents in originals.items():
+        original, output = source / relative, destination / relative
+        assert original.read_bytes() == contents
+        assert stat.S_IMODE(original.stat().st_mode) == 0o444
+        assert output.stat().st_mode & stat.S_IWUSR
+        assert not output.is_symlink()
+    assert (destination / "assets" / "vocab.txt").read_text() == "hello\n"
+    assert (source / "tokenizer.json").is_symlink()
 
 
-def test_convert_records_the_dtype_it_cast_to():
-    config = {
-        "model_type": "lfm2_vl",
-        "dtype": "bfloat16",
-        "text_config": {"dtype": "bfloat16"},
-        "vision_config": {"torch_dtype": "bfloat16"},
-        "audio_config": {"hidden_size": 8},
-        "quantization": {"bits": 4, "dtype": "uint32"},
-    }
+@pytest.mark.parametrize("alias", [False, True])
+def test_convert_copy_rejects_same_file_without_modifying_source(tmp_path, alias):
+    from mlx_vlm.convert import _copy_writable_file
 
-    _record_conversion_dtype(config, "float16")
-
-    assert config["dtype"] == "float16"
-    assert config["text_config"]["dtype"] == "float16"
-    assert config["vision_config"]["torch_dtype"] == "float16"
-    # A sub-config that never declared a dtype does not gain one...
-    assert config["audio_config"] == {"hidden_size": 8}
-    # ...and sections that aren't sub-configs are off limits entirely.
-    assert config["quantization"] == {"bits": 4, "dtype": "uint32"}
+    source = tmp_path / "tokenizer.json"
+    source.write_text("original tokenizer")
+    source.chmod(0o444)
+    destination = source
+    if alias:
+        destination = tmp_path / "alias.json"
+        destination.symlink_to(source)
+    with pytest.raises(shutil.SameFileError):
+        _copy_writable_file(source, destination)
+    assert source.read_text() == "original tokenizer"
+    assert stat.S_IMODE(source.stat().st_mode) == 0o444
 
 
 def test_modelopt_mixed_drops_fp8_kv_cache_scales():
