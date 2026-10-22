@@ -45,7 +45,7 @@ def waveform(audio):
         try:
             if hasattr(audio, "read") and not isinstance(audio, BytesIO):
                 audio = BytesIO(audio.read())  # mlx-audio reads paths and BytesIO
-            audio = load_audio(audio, sr=SAMPLE_RATE, max_seconds=MAX_SECONDS)
+            audio = load_audio(audio, sr=SAMPLE_RATE)
         except Exception as error:
             raise ValueError(f"Failed to load audio: {error}") from error
     if isinstance(audio, mx.array) and audio.dtype != mx.int16:

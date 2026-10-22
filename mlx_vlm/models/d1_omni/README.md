@@ -61,9 +61,9 @@ a thumbnail. `audio` is one clip: 16 kHz mono samples (a NumPy array, list, or
 `mx.array`; int16 PCM is scaled by 1/32768, floats are read as is), or a path,
 URL, or binary file object of an audio file, which is downmixed and resampled
 to 16 kHz; a file that fails to decode or holds no samples raises `ValueError`.
-Clips are cut to 30 s, files before they are downmixed and resampled, and
-padded with silence to 0.5 s; every 80 ms is one prefix position. A request
-carries images or audio, not both.
+The model only listens to the first 30 s of a clip: longer clips are cut to
+30 s, and shorter ones are padded with silence to 0.5 s; every 80 ms is one
+prefix position. A request carries images or audio, not both.
 
 Text answers are calibrated with the per-type temperatures in `config.json`.
 Image and audio answers are the model's softmax as trained. With images, Boolean
