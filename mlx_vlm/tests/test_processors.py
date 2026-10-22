@@ -13,6 +13,7 @@ import textwrap
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, nullcontext
 from copy import deepcopy
+from functools import wraps
 from io import BytesIO
 from operator import attrgetter
 from pathlib import Path
@@ -2750,21 +2751,8 @@ def test_prepare_inputs(prompt, with_image, error, pad_token):
 def test_prepare_inputs_text_length_options(
     wrapped, padding_side, options, expected_length
 ):
-    tokenizer = fast_tokenizer(
-        (
-            "[UNK]",
-            "[PAD]",
-            "hello",
-            "world",
-            "one",
-            "two",
-            "three",
-            "four",
-            "five",
-            "six",
-        ),
-        model_max_length=6,
-    )
+    tokens = "[UNK] [PAD] hello world one two three four five six".split()
+    tokenizer = fast_tokenizer(tokens, model_max_length=6)
     prompts = ["hello world one two three four five six hello world", "hello world"]
     expected = tokenizer(
         prompts,
@@ -2810,60 +2798,53 @@ def test_prepare_inputs_text_options_do_not_forward_media_or_generation_options(
 
 
 @pytest.mark.parametrize("wrapped", [False, True])
-@pytest.mark.parametrize("signature", ["strict", "max_length", "positional"])
-def test_prepare_inputs_text_custom_length_parameters(wrapped, signature):
+@pytest.mark.parametrize(
+    "call,expected,error",
+    [
+        (lambda: (), (), None),
+        (lambda *, max_length=None: (max_length,), (2,), None),
+        (
+            lambda truncation=False, max_length=None, /: (truncation, max_length),
+            (False, None),
+            None,
+        ),
+        (lambda: (), (), TypeError),
+        (lambda: (), (), ValueError),
+    ],
+    ids=["strict", "max-length", "positional", "signature-type", "signature-value"],
+)
+def test_prepare_inputs_text_custom_length_parameters(wrapped, call, expected, error):
     result = NS(input_ids=[[1, 2]], attention_mask=[[1, 1]])
 
-    class StrictTokenizer:
+    class Tokenizer:
         pad_token = "[PAD]"
 
-        def __call__(
-            self, text, *, add_special_tokens, padding, padding_side, return_tensors
-        ):
+        # Inspect and enforce the delegated length-option signature.
+        @wraps(call)
+        def __call__(self, text, **kwargs):
+            for key in (
+                "add_special_tokens",
+                "padding",
+                "padding_side",
+                "return_tensors",
+            ):
+                kwargs.pop(key)
+            assert call(**kwargs) == expected
             return result
 
-    class MaxLengthTokenizer(StrictTokenizer):
-        def __call__(
-            self,
-            text,
-            *,
-            add_special_tokens,
-            padding,
-            padding_side,
-            return_tensors,
-            max_length=None,
-        ):
-            assert max_length == 2
-            return result
-
-    class PositionalTokenizer(StrictTokenizer):
-        def __call__(
-            self,
-            text,
-            truncation=False,
-            max_length=None,
-            /,
-            *,
-            add_special_tokens,
-            padding,
-            padding_side,
-            return_tensors,
-        ):
-            assert truncation is False
-            assert max_length is None
-            return result
-
-    tokenizer = {
-        "strict": StrictTokenizer,
-        "max_length": MaxLengthTokenizer,
-        "positional": PositionalTokenizer,
-    }[signature]()
-    actual = prepare_inputs(
-        NS(tokenizer=tokenizer) if wrapped else tokenizer,
-        prompts="hello hello",
-        truncation=True,
-        max_length=2,
+    tokenizer = Tokenizer()
+    context = (
+        patch("mlx_vlm.utils.inspect.signature", side_effect=error)
+        if error
+        else nullcontext()
     )
+    with context:
+        actual = prepare_inputs(
+            NS(tokenizer=tokenizer) if wrapped else tokenizer,
+            prompts="hello hello",
+            truncation=True,
+            max_length=2,
+        )
     assert actual["input_ids"].tolist() == result.input_ids
     assert actual["attention_mask"].tolist() == result.attention_mask
 
@@ -2888,23 +2869,6 @@ def test_prepare_inputs_text_preserves_custom_length_defaults(options, expected_
     tokenizer = fast_tokenizer(tokenizer_class=DefaultLengthTokenizer)
     actual = prepare_inputs(tokenizer, prompts="hello " * 6, **options)
     assert actual["input_ids"].shape == (1, expected_length)
-
-
-@pytest.mark.parametrize("error", [TypeError, ValueError])
-def test_prepare_inputs_text_unavailable_tokenizer_signature(error):
-    class Tokenizer:
-        pad_token = "[PAD]"
-
-        def __call__(
-            self, text, *, add_special_tokens, padding, padding_side, return_tensors
-        ):
-            return NS(input_ids=[[1, 2]], attention_mask=[[1, 1]])
-
-    with patch("mlx_vlm.utils.inspect.signature", side_effect=error):
-        actual = prepare_inputs(
-            Tokenizer(), prompts="hello hello", truncation=True, max_length=2
-        )
-    assert actual["input_ids"].tolist() == [[1, 2]]
 
 
 def test_prepare_inputs_preserves_mlx_attention_mask_for_thread_handoff():
