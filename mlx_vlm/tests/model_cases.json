@@ -107,6 +107,28 @@
       ]
     },
     {
+      "id": "nemotron_parse_v3_5",
+      "module": "nemotron_parse_v3_5",
+      "config": {
+        "text_config": {
+          "d_model": 32,
+          "decoder_attention_heads": 4,
+          "self_attention_kv_heads": 2,
+          "decoder_ffn_dim": 64,
+          "decoder_layers": 2,
+          "vocab_size": 48
+        },
+        "vision_config": {
+          "hidden_size": 32,
+          "num_heads": 4,
+          "mlp_ratio": 2,
+          "num_layers": 1,
+          "neck_dim": 32
+        }
+      },
+      "checks": ["causal_visual_prefix"]
+    },
+    {
       "id": "nemotron_super_vl",
       "module": "nemotron_h_nano_omni",
       "config": {

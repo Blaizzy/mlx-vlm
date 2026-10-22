@@ -64,6 +64,31 @@ def capture_positions(
 class ModelChecks:
     """Reusable assertions; each JSON case constructs fresh configs and models."""
 
+    def causal_visual_prefix(self, language, config):
+        vision = mx.random.normal((1, 3, config.d_model))
+        prompt = mx.array([[2, 0, 7]])
+        embeddings = mx.concatenate([vision, language.embed(prompt)], axis=1)
+        full = language(inputs_embeds=embeddings).logits
+        # A later visual token cannot change earlier visual states.
+        changed = mx.concatenate(
+            [vision[:, :2], vision[:, 2:] + 10, language.embed(prompt)], axis=1
+        )
+        np.testing.assert_allclose(
+            np.asarray(full[:, :2]),
+            np.asarray(language(inputs_embeds=changed).logits[:, :2]),
+            atol=1e-5,
+        )
+        cache = language.make_cache()
+        first = language(inputs_embeds=embeddings[:, :4], cache=cache).logits
+        rest = language(inputs_embeds=embeddings[:, 4:], cache=cache).logits
+        np.testing.assert_allclose(
+            np.asarray(full),
+            np.asarray(mx.concatenate([first, rest], axis=1)),
+            atol=1e-5,
+        )
+        assert cache[0].offset == 6
+        assert cache[0].keys.shape[1] == config.self_attention_kv_heads
+
     def forward_cache(self, model, vocab_size, *, chunk_sizes=()):
         model.eval()
         mx.eval(model.parameters())
@@ -588,6 +613,8 @@ def check_arguments(kind, case, model, config):
     )
     if kind == "forward_cache":
         return (model, text.vocab_size), case.get("forward_cache", {})
+    if kind == "causal_visual_prefix":
+        return (model.language_model, text), {}
     if kind in {"masked_lm", "token_embeddings", "sentence_embeddings"}:
         return (model, config), {}
     if kind == "multimodal":
@@ -669,7 +696,7 @@ def check_arguments(kind, case, model, config):
 
 @pytest.mark.parametrize("case", DATA["cases"], ids=lambda case: case["id"])
 def test_model_contract(case):
-    if "multimodal" in case["checks"]:
+    if {"multimodal", "causal_visual_prefix"}.intersection(case["checks"]):
         mx.random.seed(17)
     module = importlib.import_module("mlx_vlm.models." + case["module"])
     config = build_config(module, case["config"])
@@ -678,6 +705,25 @@ def test_model_contract(case):
     for kind in case["checks"]:
         args, kwargs = check_arguments(kind, case, model, config)
         getattr(checks, kind)(*args, **kwargs)
+
+
+def test_nemotron_parse_source_architecture_and_tied_head_mapping():
+    config = {
+        "model_type": "nemotron_parse",
+        "architectures": ["RadioMBartPrefixForCausalLM"],
+        "decoder": {"vocab_size": 72512, "self_attention_kv_heads": 8},
+    }
+    module, model_type = get_model_and_args(config)
+    assert model_type == "nemotron_parse_v3_5"
+    assert module.ModelConfig.from_dict(config).text_config.vocab_size == 72512
+    weights = module.Model.sanitize(
+        {
+            "decoder.embed_tokens.weight": mx.zeros((4, 2)),
+            "decoder.extra_heads.0.weight": mx.ones((2, 2)),
+            "lm_head.weight": mx.zeros((4, 2)),
+        }
+    )
+    assert list(weights) == ["language_model.embed_tokens.weight"]
 
 
 @pytest.fixture
