@@ -41,6 +41,7 @@ from .generation import (
     _count_prompt_tokens,
 )
 from .request_normalization import (
+    _build_tool_call_logits_processors,
     _chat_message_to_prompt,
     _normalize_instruction_messages,
 )
@@ -1118,6 +1119,15 @@ async def responses_endpoint(request: Request):
             raise HTTPException(status_code=400, detail=str(e))
         if chat_tools and tool_module is not None:
             gen_args.skip_special_tokens = False
+            tool_logits_processors = _build_tool_call_logits_processors(
+                gen_args,
+                processor,
+                tool_parser_type,
+                chat_tools,
+                openai_request.tool_choice,
+            )
+            if tool_logits_processors is not None:
+                gen_args.logits_processors = tool_logits_processors
         if output_limit is not None:
             gen_args.max_tokens = output_limit
 
@@ -2022,6 +2032,11 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             raise HTTPException(status_code=400, detail=str(e))
         if tools and tool_module is not None:
             gen_args.skip_special_tokens = False
+            tool_logits_processors = _build_tool_call_logits_processors(
+                gen_args, processor, tool_parser_type, tools, tool_choice
+            )
+            if tool_logits_processors is not None:
+                gen_args.logits_processors = tool_logits_processors
         if compacted_context is not None:
             gen_args.max_tokens = compacted_context.max_output_tokens
 

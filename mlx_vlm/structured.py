@@ -259,20 +259,53 @@ def _serialize_schema(schema: str | dict[str, Any]) -> str:
 _llg_tokenizer_cache = {}
 
 
+def _stop_token_ids(tokenizer) -> list[int]:
+    """All token ids that end generation for this tokenizer.
+
+    Models such as GLM-4.7 and Flint end a tool-call turn on a token other than
+    ``eos_token_id`` (e.g. ``<|observation|>``). The grammar must allow every
+    stop token, or a complete output cannot end and generation runs on.
+    """
+    stop_ids = []
+    criteria = getattr(tokenizer, "stopping_criteria", None)
+    for source in (
+        getattr(criteria, "eos_token_ids", None),
+        getattr(tokenizer, "eos_token_id", None),
+    ):
+        if isinstance(source, int):
+            source = [source]
+        for token_id in source or ():
+            if isinstance(token_id, int) and token_id not in stop_ids:
+                stop_ids.append(token_id)
+    return stop_ids
+
+
+def _get_llg_tokenizer(tokenizer):
+    import llguidance.hf
+
+    stop_ids = _stop_token_ids(tokenizer)
+    key = (id(tokenizer), tuple(stop_ids))
+    llg_tokenizer = _llg_tokenizer_cache.get(key)
+    if llg_tokenizer is None:
+        if len(stop_ids) > 1:
+            llg_tokenizer = llguidance.hf.from_tokenizer(tokenizer, eos_token=stop_ids)
+        else:
+            llg_tokenizer = llguidance.hf.from_tokenizer(tokenizer)
+        _llg_tokenizer_cache[key] = llg_tokenizer
+    return llg_tokenizer
+
+
 def build_json_schema_logits_processor(tokenizer, schema: str | dict[str, Any]):
     try:
         import llguidance as llg
-        import llguidance.hf
+        import llguidance.hf  # noqa: F401
     except ImportError as exc:
         raise ImportError(
             "llguidance is required for structured response_format generation. "
             "Install mlx-vlm with llguidance available."
         ) from exc
 
-    llg_tokenizer = _llg_tokenizer_cache.get(id(tokenizer))
-    if llg_tokenizer is None:
-        llg_tokenizer = llguidance.hf.from_tokenizer(tokenizer)
-        _llg_tokenizer_cache[id(tokenizer)] = llg_tokenizer
+    llg_tokenizer = _get_llg_tokenizer(tokenizer)
 
     schema_text = _serialize_schema(schema)
     if hasattr(llg, "JsonCompiler"):
@@ -283,3 +316,109 @@ def build_json_schema_logits_processor(tokenizer, schema: str | dict[str, Any]):
     else:
         grammar = llg.grammar_from("json_schema", schema_text)
     return LLGuidanceLogitsProcessor(grammar, llg_tokenizer)
+
+
+# Tool-call formats with a grammar builder. GLM-4.7 and Flint share the
+# `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>` format.
+_TOOL_CALL_GRAMMAR_PARSERS = ("glm47",)
+
+_JSON_VALUE_PATTERNS = {
+    "integer": r"/-?(0|[1-9][0-9]*)/",
+    "number": r"/-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?/",
+    "boolean": '"true" | "false"',
+}
+
+
+def _marker(tokenizer, text: str) -> str:
+    """Reference a marker by token id when it is one token, else as text."""
+    token_ids = tokenizer.encode(text, add_special_tokens=False)
+    if len(token_ids) == 1:
+        return f"<[{token_ids[0]}]>"
+    return json.dumps(text)
+
+
+def _tool_function(tool: dict[str, Any]) -> dict[str, Any]:
+    return tool.get("function", tool) if isinstance(tool, dict) else {}
+
+
+def build_glm47_tool_call_grammar(tokenizer, tools: list[dict[str, Any]]) -> str:
+    """Build an llguidance Lark grammar for GLM-4.7 / Flint tool calls.
+
+    Text and `<think>` blocks stay free. Inside `<tool_call>`, the function
+    name must be one of `tools`, each `<arg_key>` must be a parameter of that
+    tool, and integer/number/boolean values must match their JSON type.
+    """
+    m = {
+        name: _marker(tokenizer, text)
+        for name, text in (
+            ("think", "<think>"),
+            ("think_end", "</think>"),
+            ("call", "<tool_call>"),
+            ("call_end", "</tool_call>"),
+            ("key", "<arg_key>"),
+            ("key_end", "</arg_key>"),
+            ("value", "<arg_value>"),
+            ("value_end", "</arg_value>"),
+        )
+    }
+
+    rules = []
+    functions = []
+    for i, tool in enumerate(tools):
+        fn = _tool_function(tool)
+        name = fn.get("name")
+        if not name:
+            continue
+        parameters = fn.get("parameters") or {}
+        properties = parameters.get("properties") or {}
+        required = set(parameters.get("required") or ())
+        # Arguments follow the schema order: required ones must appear, optional
+        # ones may be skipped, and none can repeat. Order does not change a call.
+        args = []
+        for j, (key, schema) in enumerate(properties.items()):
+            json_type = schema.get("type") if isinstance(schema, dict) else None
+            pattern = _JSON_VALUE_PATTERNS.get(json_type)
+            value = f"({pattern})" if pattern else "TEXT?"
+            rules.append(
+                f'arg_{i}_{j}: {m["key"]} {json.dumps(key)} {m["key_end"]} '
+                f'{m["value"]} {value} {m["value_end"]}'
+            )
+            args.append(f"arg_{i}_{j}" if key in required else f"arg_{i}_{j}?")
+        functions.append(" ".join([json.dumps(name), *args]))
+
+    if not functions:
+        raise ValueError("tools must contain at least one named function")
+
+    return (
+        "\n".join(
+            [
+                "%llguidance {}",
+                "start: TEXT? (block TEXT?)*",
+                "block: think | call",
+                f'think: {m["think"]} TEXT? {m["think_end"]}',
+                f'call: {m["call"]} function {m["call_end"]}',
+                "function: " + "\n    | ".join(functions),
+                *rules,
+                r"TEXT: /(.|\n)+/",
+            ]
+        )
+        + "\n"
+    )
+
+
+def build_tool_call_logits_processor(tokenizer, tool_parser_type, tools):
+    """Return a processor that keeps tool calls inside the request's schemas.
+
+    Returns None when the tool format has no grammar builder or no tools are
+    given, so callers can fall back to unconstrained generation.
+    """
+    if tool_parser_type not in _TOOL_CALL_GRAMMAR_PARSERS or not tools:
+        return None
+    try:
+        import llguidance as llg
+    except ImportError:
+        return None
+
+    tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
+    grammar = llg.grammar_from("lark", build_glm47_tool_call_grammar(tokenizer, tools))
+    return LLGuidanceLogitsProcessor(grammar, _get_llg_tokenizer(tokenizer))
