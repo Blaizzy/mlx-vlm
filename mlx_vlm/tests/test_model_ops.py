@@ -2213,8 +2213,7 @@ def test_convert_dtype_round_trip_preserves_cast_exclusions(tmp_path, dtype, qua
     ],
 )
 def test_convert_default_dtype_metadata(tmp_path, metadata, expected):
-    from mlx_vlm.convert import convert
-
+    conversion = importlib.import_module("mlx_vlm.convert")
     unchanged = {
         "audio_config": {"hidden_size": 8},
         "vision_config": None,
@@ -2224,11 +2223,12 @@ def test_convert_default_dtype_metadata(tmp_path, metadata, expected):
     config = copy.deepcopy({**metadata, **unchanged})
     source, destination = tmp_path / "source", tmp_path / "converted"
     source.mkdir()
-    with patch(
-        "mlx_vlm.convert.fetch_from_hub",
+    with patch.object(
+        conversion,
+        "fetch_from_hub",
         return_value=(nn.Linear(4, 4), config, SimpleNamespace()),
     ):
-        convert(str(source), str(destination))
+        conversion.convert(str(source), str(destination))
     exported = json.loads((destination / "config.json").read_text())
     assert exported.get("dtype") == expected
     assert {key: exported[key] for key in unchanged} == unchanged
