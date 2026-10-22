@@ -267,23 +267,6 @@ def _apply_awq_calibration(
     print(f"[INFO] AWQ scaling applied: {summary}")
 
 
-def _record_conversion_dtype(config: dict, dtype: str) -> None:
-    """Record the floating-point cast dtype, allowing model-specific exceptions."""
-    config["dtype"] = dtype
-    if "torch_dtype" in config:
-        config["torch_dtype"] = dtype
-    for name, section in config.items():
-        if (
-            not name.endswith("_config")
-            or name == "quantization_config"
-            or not isinstance(section, dict)
-        ):
-            continue
-        for key in ("dtype", "torch_dtype"):
-            if key in section:
-                section[key] = dtype
-
-
 def convert(
     hf_path: str,
     mlx_path: str = "mlx_model",
@@ -341,7 +324,15 @@ def convert(
                 return v
 
         target.update(tree_map_with_path(set_dtype, target.parameters()))
-        _record_conversion_dtype(config, dtype)
+        config["dtype"] = dtype
+        for name, section in config.items():
+            if (
+                name.endswith("_config")
+                and name != "quantization_config"
+                and isinstance(section, dict)
+            ):
+                for key in section.keys() & {"dtype", "torch_dtype"}:
+                    section[key] = dtype
 
     if quantize and dequantize:
         raise ValueError("Choose either quantize or dequantize, not both.")

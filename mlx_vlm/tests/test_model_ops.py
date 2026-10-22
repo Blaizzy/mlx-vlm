@@ -2164,9 +2164,9 @@ def test_mixed_recipe_finds_lfm2_down_projection():
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 @pytest.mark.parametrize("quantize", [False, True])
 def test_convert_dtype_round_trip_preserves_cast_exclusions(tmp_path, dtype, quantize):
+    from mlx_vlm.convert import convert
     from mlx_vlm.tests.test_models import model_case
 
-    conversion = importlib.import_module("mlx_vlm.convert")
     config = model_case("qwen3_5")["config"]
     config.update(dtype="bfloat16", torch_dtype="bfloat16")
     config["text_config"]["dtype"] = "bfloat16"
@@ -2179,15 +2179,9 @@ def test_convert_dtype_round_trip_preserves_cast_exclusions(tmp_path, dtype, qua
     (source / "config.json").write_text(json.dumps(config))
 
     with patch("mlx_vlm.utils.load_processor", return_value=SimpleNamespace()):
-        for attempt in ("converted", "reconverted"):
-            destination = tmp_path / attempt
-            conversion.convert(
-                str(source),
-                str(destination),
-                dtype=dtype if attempt == "converted" else None,
-                quantize=quantize if attempt == "converted" else False,
-                q_group_size=32,
-            )
+        for attempt, options in enumerate((dict(dtype=dtype, quantize=quantize), {})):
+            destination = tmp_path / f"converted-{attempt}"
+            convert(str(source), str(destination), q_group_size=32, **options)
             exported = json.loads((destination / "config.json").read_text())
             assert exported["dtype"] == dtype
             assert "torch_dtype" not in exported
@@ -2219,37 +2213,29 @@ def test_convert_dtype_round_trip_preserves_cast_exclusions(tmp_path, dtype, qua
     ],
 )
 def test_convert_default_dtype_metadata(tmp_path, metadata, expected):
-    conversion = importlib.import_module("mlx_vlm.convert")
-    source, destination = tmp_path / "source", tmp_path / "converted"
-    source.mkdir()
-    (source / "config.json").write_text(json.dumps(metadata))
-    with patch.object(
-        conversion,
-        "fetch_from_hub",
-        return_value=(nn.Linear(4, 4), copy.deepcopy(metadata), SimpleNamespace()),
-    ):
-        conversion.convert(str(source), str(destination))
-    exported = json.loads((destination / "config.json").read_text())
-    assert exported.get("dtype") == expected
-    weights = mx.load(str(destination / "model.safetensors"))
-    assert all(
-        weight.dtype == getattr(mx, expected or "float32")
-        for weight in weights.values()
-    )
+    from mlx_vlm.convert import convert
 
-
-def test_convert_dtype_metadata_leaves_quantization_and_undeclared_sections_alone():
-    from mlx_vlm.convert import _record_conversion_dtype
-
-    config = {
+    unchanged = {
         "audio_config": {"hidden_size": 8},
         "vision_config": None,
         "quantization": {"bits": 4, "dtype": "uint32"},
         "quantization_config": {"bits": 4, "dtype": "uint32"},
     }
-    expected = copy.deepcopy(config)
-    _record_conversion_dtype(config, "float16")
-    assert config == {**expected, "dtype": "float16"}
+    config = copy.deepcopy({**metadata, **unchanged})
+    source, destination = tmp_path / "source", tmp_path / "converted"
+    source.mkdir()
+    with patch(
+        "mlx_vlm.convert.fetch_from_hub",
+        return_value=(nn.Linear(4, 4), config, SimpleNamespace()),
+    ):
+        convert(str(source), str(destination))
+    exported = json.loads((destination / "config.json").read_text())
+    assert exported.get("dtype") == expected
+    assert {key: exported[key] for key in unchanged} == unchanged
+    weights = mx.load(str(destination / "model.safetensors"))
+    assert {weight.dtype for weight in weights.values()} == {
+        getattr(mx, expected or "float32")
+    }
 
 
 def test_convert_preserves_existing_deepseek_v4_quantization():
