@@ -3,6 +3,8 @@
 
 MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VLMs) and Omni Models (VLMs with audio and video support) on your Mac using MLX.
 
+[![Open it in Nativ. Download for macOS](assets/open-in-nativ.png)](https://blaizzy.github.io/nativ/)
+
 ## Table of Contents
 - [Installation](#installation)
 - [Usage](#usage)
