@@ -3227,3 +3227,71 @@ class TestPhiMoE:
         )
 
         assert isinstance(Attention(config).rope, nn.RoPE)
+
+
+class TestEncoderActivations:
+    """Checkpoint activation names select the matching values and gradients."""
+
+    @staticmethod
+    def _layer(family, hidden_act):
+        module = importlib.import_module(f"mlx_vlm.models.{family}.{family}")
+        config = module.ModelConfig(
+            model_type=family,
+            vocab_size=8,
+            hidden_size=4,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            intermediate_size=4,
+            max_position_embeddings=16,
+            hidden_act=hidden_act,
+        )
+        name = "BertIntermediate" if family == "bert" else "XLMRobertaIntermediate"
+        return getattr(module, name)(config)
+
+    @staticmethod
+    def _reference(value, name):
+        if name == "relu":
+            return max(0.0, value), float(value > 0)
+        if name == "silu":
+            sigmoid = 1.0 / (1.0 + math.exp(-value))
+            return value * sigmoid, sigmoid + value * sigmoid * (1.0 - sigmoid)
+        if name == "gelu_new":
+            scale = math.sqrt(2.0 / math.pi)
+            inner = scale * (value + 0.044715 * value**3)
+            tangent = math.tanh(inner)
+            return (
+                0.5 * value * (1.0 + tangent),
+                0.5 * (1.0 + tangent)
+                + 0.5
+                * value
+                * (1.0 - tangent**2)
+                * scale
+                * (1.0 + 3 * 0.044715 * value**2),
+            )
+        cdf = 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
+        pdf = math.exp(-0.5 * value**2) / math.sqrt(2.0 * math.pi)
+        return value * cdf, cdf + value * pdf
+
+    @pytest.mark.parametrize("hidden_act", ["gelu", "relu", "silu", "gelu_new"])
+    @pytest.mark.parametrize("family", ["bert", "xlm_roberta"])
+    def test_configured_activation(self, family, hidden_act):
+        layer = self._layer(family, hidden_act)
+        layer.dense.weight = mx.eye(4)
+        layer.dense.bias = mx.zeros(4)
+        values = [-2.0, -0.5, 0.5, 2.0]
+        inputs = mx.array([values])
+        expected, expected_gradient = zip(
+            *[self._reference(value, hidden_act) for value in values]
+        )
+        output = layer(inputs)
+        gradient = mx.grad(lambda x: mx.sum(layer(x)))(inputs)
+        mx.eval(output, gradient)
+        np.testing.assert_allclose(np.asarray(output), [expected], rtol=1e-5, atol=1e-6)
+        np.testing.assert_allclose(
+            np.asarray(gradient), [expected_gradient], rtol=1e-5, atol=1e-6
+        )
+
+    @pytest.mark.parametrize("family", ["bert", "xlm_roberta"])
+    def test_unknown_activation_is_rejected(self, family):
+        with pytest.raises(ValueError, match="not-an-activation"):
+            self._layer(family, "not-an-activation")
