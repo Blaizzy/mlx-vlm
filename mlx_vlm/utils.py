@@ -8,6 +8,7 @@ import math
 import struct
 import warnings
 from dataclasses import dataclass, fields
+from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
@@ -1814,6 +1815,22 @@ def process_inputs_with_fallback(
         raise ValueError(f"Failed to process inputs with error: {e}")
 
 
+@lru_cache(maxsize=128)
+def _tokenizer_length_kwargs(cls):
+    try:
+        params = inspect.signature(cls.__call__).parameters.values()
+    except (TypeError, ValueError):
+        return set()
+
+    names = {"truncation", "max_length"}
+    if any(p.kind == p.VAR_KEYWORD for p in params):
+        return names
+
+    return names.intersection(
+        p.name for p in params if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+    )
+
+
 def prepare_inputs(
     processor,
     images=None,
@@ -1844,17 +1861,16 @@ def prepare_inputs(
         # Ensure pad_token exists when padding text-only inputs
         if padding and tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
-        # Keep media and generation options out of the text tokenizer call.
-        text_kwargs = {
-            key: kwargs[key] for key in ("truncation", "max_length") if key in kwargs
-        }
         inputs = tokenizer(
             prompts,
             add_special_tokens=add_special_tokens,
             padding=padding,
             padding_side=padding_side,
             return_tensors=return_tensors,
-            **text_kwargs,
+            **{
+                key: kwargs[key]
+                for key in kwargs.keys() & _tokenizer_length_kwargs(type(tokenizer))
+            },
         )
         input_ids = (
             inputs.input_ids
