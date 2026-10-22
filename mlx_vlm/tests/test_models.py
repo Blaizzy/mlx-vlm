@@ -3420,6 +3420,83 @@ class TestFlintInferenceKernels:
         np.testing.assert_array_equal(np.array(changed), np.array(module._forward(x)))
         nn.quantize(module, group_size=32, bits=4)
         np.testing.assert_array_equal(np.array(module(x)), np.array(module._forward(x)))
+        module.top_k = 2
+        np.testing.assert_array_equal(np.array(module(x)), np.array(module._forward(x)))
+
+    @pytest.mark.skipif(not mx.metal.is_available(), reason="Metal graph cache")
+    def test_compiled_moe_bounds_graphs_across_prefill_and_decode(self):
+        from mlx_vlm.models.flint import ModelConfig
+        from mlx_vlm.models.flint.language import SparseMoeBlock
+
+        module = SparseMoeBlock(
+            ModelConfig(
+                hidden_size=128,
+                moe_intermediate_size=128,
+                shared_expert_intermediate_size=128,
+                num_experts=8,
+                num_experts_per_tok=6,
+            )
+        )
+        module.set_dtype(mx.bfloat16)
+        nn.quantize(module, group_size=64, bits=4)
+        module.eval()
+        # Visit more prefill shapes than the resident graph budget, then return
+        # to decode. Eviction must not change output or freeze the weights.
+        for length in (*range(1, 12), 1, 1):
+            x = mx.random.normal((1, length, 128)).astype(mx.bfloat16)
+            assert mx.array_equal(module(x), module._forward(x)).item()
+        cache = module._compiled_inference._cache.cache_info()
+        assert cache.currsize <= 8
+        assert cache.hits > 0
+
+    @pytest.mark.skipif(not mx.metal.is_available(), reason="Metal graph cache")
+    def test_compiled_moe_respects_execution_stream(self):
+        from mlx_vlm.models.flint import ModelConfig
+        from mlx_vlm.models.flint.language import SparseMoeBlock
+
+        module = SparseMoeBlock(
+            ModelConfig(
+                hidden_size=64,
+                moe_intermediate_size=64,
+                shared_expert_intermediate_size=0,
+                num_experts=8,
+                num_experts_per_tok=6,
+            )
+        )
+        module.eval()
+        x = mx.ones((1, 3, 64))
+        streams = [mx.new_stream(mx.gpu), mx.new_stream(mx.gpu)]
+        for stream in streams * 2:
+            with mx.stream(stream):
+                assert mx.array_equal(module(x), module._forward(x)).item()
+        cache = module._compiled_inference._cache.cache_info()
+        assert cache.currsize == 2
+        assert cache.hits == 2
+
+    def test_compiled_moe_custom_projection_stays_eager(self):
+        from mlx_vlm.models.flint import ModelConfig
+        from mlx_vlm.models.flint.language import SparseMoeBlock
+
+        class CustomRouter(nn.Linear):
+            def __call__(self, x):
+                # Data-dependent Python is valid for an uncompiled custom layer.
+                assert mx.all(mx.isfinite(x)).item()
+                return super().__call__(x)
+
+        module = SparseMoeBlock(
+            ModelConfig(
+                hidden_size=64,
+                moe_intermediate_size=64,
+                shared_expert_intermediate_size=0,
+                num_experts=8,
+                num_experts_per_tok=6,
+            )
+        )
+        module.eval()
+        x = mx.ones((1, 3, 64))
+        mx.eval(module(x))
+        module.gate = CustomRouter(64, 8, bias=False)
+        assert mx.array_equal(module(x), module._forward(x)).item()
 
     @pytest.mark.parametrize("top_k", [2, 6])
     def test_cpu_fallback_and_training_gradients(self, top_k):
@@ -3515,7 +3592,7 @@ class TestFlintInferenceKernels:
             (2, 1),
         ):
             x = mx.random.normal((batch, length, 64)).astype(mx.bfloat16)
-            assert mx.array_equal(module(x), module._forward(x)).item()
+            assert mx.array_equal(module._inference(x), module._forward(x)).item()
         assert len(traces) == 1
 
     @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
