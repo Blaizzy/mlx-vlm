@@ -3,7 +3,6 @@
 
 import math
 
-import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import (
@@ -70,11 +69,6 @@ class LanguageModel(nn.Module):
         super().__init__()
         self.config = config
         self.max_sequence_length = max_sequence_length
-        # Chunked prefill slices raw input_ids by the expanded visual-prefix
-        # length in mlx-vlm. This loses prompt IDs (including EOS) from the
-        # repetition history. Keep prefill whole until that bookkeeping supports
-        # prefixes whose embeddings have no corresponding text IDs.
-        self.no_chunked_prefill = True
         self.embed_tokens = nn.Embedding(config.vocab_size, config.d_model)
         self.embed_scale = math.sqrt(config.d_model) if config.scale_embedding else 1.0
         self.layers = [DecoderLayer(config) for _ in range(config.decoder_layers)]

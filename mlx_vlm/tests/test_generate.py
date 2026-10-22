@@ -2149,6 +2149,160 @@ def test_generate_step_clamps_temperature(seed, dtype, top_p, temperature):
     assert set(actual) == {1, 2}
 
 
+@pytest.mark.parametrize("prefix_length", [0, 2, 9])
+@pytest.mark.parametrize("prefill_step_size", [None, 1, 4, 2048])
+@pytest.mark.parametrize("penalty", ["repetition", "presence", "frequency"])
+def test_generate_step_preserves_history_across_prefill(
+    prefix_length, prefill_step_size, penalty
+):
+    prompt = mx.array([[2, 0, 2, 4]])
+    scores = mx.array([0.0, 0.0, 10.0, 9.5, 0.0])
+    model = SimpleNamespace(
+        config=SimpleNamespace(),
+        language_model=lambda *args, **kwargs: LanguageModelOutput(
+            logits=scores[None, None, :]
+        ),
+        get_input_embeddings=lambda *args, **kwargs: InputEmbeddingsFeatures(
+            inputs_embeds=mx.zeros((1, prefix_length + prompt.shape[1], 4))
+        ),
+    )
+    seen = []
+
+    def record_history(tokens, logits):
+        seen.append(tokens.tolist())
+        return logits
+
+    generated = list(
+        generate_module.generate_step(
+            prompt,
+            model,
+            pixel_values=None,
+            mask=None,
+            prompt_cache=[],
+            max_tokens=4,
+            temperature=0,
+            prefill_step_size=prefill_step_size,
+            logits_processors=[record_history],
+            **{f"{penalty}_penalty": 1.1, f"{penalty}_context_size": 0},
+        )
+    )
+    tokens = [token for token, _ in generated]
+    # Token 2 wins without the prompt penalty; token 3 wins with it.
+    assert tokens[0] == 3
+    assert len(seen) == len(tokens) + 1  # Includes the pending decode step.
+    for i, history in enumerate(seen):
+        assert history == prompt[0].tolist() + tokens[:i]
+
+
+@pytest.mark.parametrize("batch", [False, True])
+@pytest.mark.parametrize("prefill_step_size", [1, 2, 4, 2048])
+def test_nemotron_visual_prefix_chunked_generation(
+    batch, prefill_step_size, mock_processor, monkeypatch
+):
+    from mlx_vlm.models.nemotron_parse_v3_5 import (
+        Model,
+        ModelConfig,
+        TextConfig,
+        VisionConfig,
+    )
+
+    mx.random.seed(7)
+    model = Model(
+        ModelConfig(
+            vision_config=VisionConfig(
+                hidden_size=32, num_heads=4, mlp_ratio=2, num_layers=1, neck_dim=32
+            ),
+            text_config=TextConfig(
+                d_model=32,
+                decoder_attention_heads=4,
+                self_attention_kv_heads=2,
+                decoder_ffn_dim=64,
+                decoder_layers=2,
+                vocab_size=48,
+            ),
+        )
+    )
+    prompt = mx.array([[2, 0, 7, 8, 9, 10]])
+    pixels = mx.zeros((16, 768))
+    media = {
+        "image_sizes": mx.array([[32, 128]]),
+        "content_sizes": mx.array([[32, 128]]),
+    }
+    embeds = model.get_input_embeddings(prompt, pixels, **media).inputs_embeds
+    prefill_lengths, prefill_logits = [], []
+    original_call = type(model.language_model).__call__
+
+    def record_forward(self, *args, **kwargs):
+        output = original_call(self, *args, **kwargs)
+        if kwargs.get("inputs_embeds") is not None:
+            prefill_lengths.append(kwargs["inputs_embeds"].shape[1])
+            prefill_logits.append(output.logits[:, -1, :])
+        return output
+
+    monkeypatch.setattr(type(model.language_model), "__call__", record_forward)
+
+    def run(step):
+        prefill_lengths.clear()
+        prefill_logits.clear()
+        seen = []
+
+        def record_history(tokens, logits):
+            seen.append(tokens.tolist())
+            return logits
+
+        if batch:
+            processors = sampling.make_logits_processors(
+                repetition_penalty=1.1, repetition_context_size=0
+            ) + [record_history]
+            with contextlib.closing(
+                BatchGenerator(
+                    model.language_model,
+                    mock_processor,
+                    max_tokens=4,
+                    stop_tokens={100},
+                    prefill_step_size=step,
+                )
+            ) as generator:
+                generator.insert(
+                    prompt,
+                    prompt_kwargs=[{"inputs_embeds": embeds}],
+                    logits_processors=[processors],
+                )
+                tokens = []
+                while generator.has_work:
+                    _, responses = generator.next()
+                    tokens.extend(response.token for response in responses)
+        else:
+            tokens = [
+                token
+                for token, _ in generate_module.generate_step(
+                    prompt,
+                    model,
+                    pixels,
+                    None,
+                    **media,
+                    max_tokens=4,
+                    temperature=0,
+                    prefill_step_size=step,
+                    repetition_penalty=1.1,
+                    repetition_context_size=0,
+                    logits_processors=[record_history],
+                )
+            ]
+        assert len(tokens) == 4
+        for i, history in enumerate(seen):
+            assert history == prompt[0].tolist() + tokens[:i]
+        return tokens, np.asarray(prefill_logits[-1])
+
+    expected_tokens, expected_logits = run(None)
+    actual_tokens, actual_logits = run(prefill_step_size)
+    assert len(prefill_lengths) > 1
+    assert max(prefill_lengths) <= prefill_step_size
+    assert sum(prefill_lengths) == embeds.shape[1]
+    assert actual_tokens == expected_tokens
+    np.testing.assert_allclose(actual_logits, expected_logits, atol=1e-5, rtol=1e-5)
+
+
 # Loading and utility contracts
 
 
