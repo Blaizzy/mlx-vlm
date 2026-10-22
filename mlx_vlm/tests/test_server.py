@@ -39,6 +39,7 @@ import mlx_vlm.server as server
 import mlx_vlm.server.anthropic as anthropic
 import mlx_vlm.server.audio as server_audio
 import mlx_vlm.server.cli as cli
+import mlx_vlm.server.embeddings as embeddings
 import mlx_vlm.server.generation as generation
 import mlx_vlm.server.openai as openai
 import mlx_vlm.server.reranking as reranking
@@ -601,6 +602,63 @@ def _reset_runtime(monkeypatch, **overrides):
 def client():
     with TestClient(server.app) as test_client:
         yield test_client
+
+
+class TestEmbeddingEncoding:
+    @pytest.mark.parametrize("encoding", ["default", "float", None, "base64"])
+    @pytest.mark.parametrize("kind", ["single", "batch", "mixed"])
+    def test_response_encoding(self, client, encoding, kind):
+        vectors = [[0.0, -0.0, 1.25, -2.5, 1 / 3], [9.0, 8.0, 7.0, 6.0, 5.0]]
+        if kind == "single":
+            inputs = "text"
+            expected = vectors[:1]
+        elif kind == "batch":
+            inputs = ["first", "second"]
+            expected = vectors
+        else:
+            inputs = ["text", {"type": "image_url", "image_url": "image.png"}]
+            expected = vectors
+        body = dict(input=inputs, model="embedding")
+        if encoding != "default":
+            body["encoding_format"] = encoding
+        with (
+            patch.object(server, "get_cached_model", return_value=(None, None)) as load,
+            patch.object(embeddings, "_embed", return_value=(expected, 3)),
+            patch.object(embeddings, "_embed_image", return_value=(vectors[1], 4)),
+        ):
+            response = client.post("/v1/embeddings", json=body)
+        assert response.status_code == 200
+        result = response.json()
+        assert result["object"] == "list" and result["model"] == "embedding"
+        assert result["usage"] == dict(
+            prompt_tokens=7 if kind == "mixed" else 3,
+            total_tokens=7 if kind == "mixed" else 3,
+        )
+        load.assert_called_once_with("embedding", model_kind="embedding")
+        assert len(result["data"]) == len(expected)
+        for index, (item, vector) in enumerate(zip(result["data"], expected)):
+            assert item["object"] == "embedding" and item["index"] == index
+            if encoding == "base64":
+                assert isinstance(item["embedding"], str)
+                raw = base64.b64decode(item["embedding"], validate=True)
+                assert len(raw) == 4 * len(vector)
+                decoded = np.frombuffer(raw, dtype="<f4")
+                np.testing.assert_array_equal(
+                    decoded, np.array(vector, dtype=np.float32)
+                )
+                assert np.signbit(decoded[1]) == np.signbit(vector[1])
+            else:
+                assert item["embedding"] == vector
+
+    @pytest.mark.parametrize("encoding", ["binary", ""])
+    def test_invalid_encoding(self, client, encoding):
+        with patch.object(server, "get_cached_model") as load:
+            response = client.post(
+                "/v1/embeddings",
+                json=dict(input="text", model="embedding", encoding_format=encoding),
+            )
+        assert response.status_code == 422
+        load.assert_not_called()
 
 
 @pytest.mark.parametrize(
