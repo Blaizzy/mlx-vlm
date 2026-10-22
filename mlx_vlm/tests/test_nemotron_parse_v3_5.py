@@ -77,20 +77,3 @@ def test_source_architecture_and_tied_head_mapping():
         }
     )
     assert list(weights) == ["language_model.embed_tokens.weight"]
-
-
-def test_bytelevel_added_newline_uses_literal_token_decoder(tmp_path):
-    import json
-
-    from mlx_vlm.tokenizer_utils import NaiveStreamingDetokenizer, load_tokenizer
-
-    (tmp_path / "tokenizer.json").write_text(
-        json.dumps(
-            {
-                "decoder": {"type": "ByteLevel"},
-                "added_tokens": [{"content": "\n", "id": 1}],
-            }
-        ),
-        encoding="utf-8",
-    )
-    assert load_tokenizer(tmp_path, return_tokenizer=False) is NaiveStreamingDetokenizer

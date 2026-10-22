@@ -209,16 +209,22 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
     def __init__(self, tokenizer, trim_space=False):
         self.trim_space = trim_space
 
-        # Extract the tokens in a list from id to text
-        self.tokenmap = [None] * len(tokenizer.vocab)
-        for value, tokenid in tokenizer.vocab.items():
-            self.tokenmap[tokenid] = value
-
-        self.reset()
-
         # Make the BPE byte decoder from
         # https://github.com/openai/gpt-2/blob/master/src/encoder.py
         self.make_byte_decoder()
+        byte_encoder = {b: c for c, b in self._byte_decoder.items()}
+
+        # Extract the tokens in a list from id to text
+        self.tokenmap = [None] * len(tokenizer.vocab)
+        for value, tokenid in tokenizer.vocab.items():
+            # ByteLevel decodes the whole token as literal UTF-8 if any
+            # character is outside its byte alphabet. Normalize it once so
+            # both streaming paths can keep using the byte decoder.
+            if any(c not in self._byte_decoder for c in value):
+                value = "".join(byte_encoder[b] for b in value.encode("utf-8"))
+            self.tokenmap[tokenid] = value
+
+        self.reset()
 
     def reset(self):
         self.offset = 0
@@ -473,12 +479,7 @@ def load_tokenizer(model_path, return_tokenizer=True, tokenizer_config_extra={})
             elif _is_spm_decoder_no_space(tokenizer_content["decoder"]):
                 detokenizer_class = partial(SPMStreamingDetokenizer, trim_space=False)
             elif _is_bpe_decoder(tokenizer_content["decoder"]):
-                # Added tokens contain literal text, not byte-level glyphs.
-                # Nemotron 3.5 includes a literal newline; the fast BPE decoder
-                # cannot decode it (or literal Unicode added tokens).
-                added = tokenizer_content.get("added_tokens", [])
-                if all(all(32 <= ord(c) < 127 for c in t["content"]) for t in added):
-                    detokenizer_class = BPEStreamingDetokenizer
+                detokenizer_class = BPEStreamingDetokenizer
 
     if return_tokenizer:
         return TokenizerWrapper(

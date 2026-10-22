@@ -26,6 +26,7 @@ import numpy as np
 import pytest
 from PIL import Image
 from tokenizers import Tokenizer
+from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import AutoProcessor, PreTrainedTokenizerBase, PreTrainedTokenizerFast
@@ -49,6 +50,8 @@ from mlx_vlm.tokenizer_utils import (
     _is_spm_decoder,
     _is_spm_decoder_no_space,
     _match,
+    _ServerTokenStreamer,
+    load_tokenizer,
 )
 from mlx_vlm.tools import (
     SPECS,
@@ -205,6 +208,67 @@ def test_initialization():
 
     assert detokenizer._byte_decoder is not None
     assert detokenizer.text == ""
+
+
+@pytest.mark.parametrize("server_stream", [False, True], ids=["cli", "server"])
+@pytest.mark.parametrize("trim_space", [False, True], ids=["keep-space", "trim-space"])
+@pytest.mark.parametrize(
+    "pieces, expected",
+    [
+        (["Ġhello", "Ġworld"], " hello world"),
+        (["hello", "\n\n", "world"], "hello\n\nworld"),
+        (["高", "ა", "🙂"], "高ა🙂"),
+        (["Ġé\n高", "Ġdone"], "Ġé\n高 done"),
+        ([" hello", "\t", "world"], " hello\tworld"),
+        (["Ã", "©", "\n\n", "高"], "é\n\n高"),
+        (["Ã", "高", "©", "Ġdone"], "\ufffd高\ufffd done"),
+    ],
+    ids=[
+        "byte-alphabet",
+        "literal-newlines",
+        "literal-unicode",
+        "whole-token-fallback",
+        "literal-whitespace",
+        "split-utf8",
+        "interrupted-utf8",
+    ],
+)
+def test_bpe_streaming_matches_native_bytelevel(
+    tmp_path, pieces, expected, trim_space, server_stream
+):
+    backend = Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
+    backend.decoder = ByteLevelDecoder()
+    backend.add_tokens(list(dict.fromkeys(pieces)))
+    backend.save(str(tmp_path / "tokenizer.json"))
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend, clean_up_tokenization_spaces=False
+    )
+    tokens = [backend.token_to_id(piece) for piece in pieces]
+    assert tokenizer.decode(tokens) == expected
+
+    factory = load_tokenizer(tmp_path, return_tokenizer=False)
+    assert factory is BPEStreamingDetokenizer
+    detokenizer = factory(tokenizer, trim_space=trim_space)
+    if trim_space:
+        expected = expected.removeprefix(" ")
+
+    # Resetting an existing detokenizer must preserve its normalized token map.
+    for _ in range(2):
+        detokenizer.reset()
+        segments = []
+        if server_stream:
+            streamer = _ServerTokenStreamer(tokenizer, detokenizer)
+            for token in tokens:
+                segments.append(streamer.advance(token, finish_reason=None))
+            segments.append(streamer.finalize())
+        else:
+            for token in tokens:
+                detokenizer.add_token(token)
+                segments.append(detokenizer.last_segment)
+            detokenizer.finalize()
+            segments.append(detokenizer.last_segment)
+            assert detokenizer.text == expected
+        assert "".join(segments) == expected
 
 
 @pytest.mark.parametrize("factory", [None, SPMStreamingDetokenizer])
