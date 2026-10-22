@@ -14,6 +14,82 @@ def normalize_expert_weights(scores, indices):
     return weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
 
 
+@lru_cache(None)
+def _route_kernel():
+    return mx.fast.metal_kernel(
+        name="flint_route_six",
+        input_names=["scores", "choice"],
+        output_names=["indices", "weights"],
+        header="#pragma clang fp contract(off)\n",
+        source="""
+        uint row = threadgroup_position_in_grid.x;
+        uint lane = thread_index_in_simdgroup;
+        float values[8];
+        bool valid[8];
+        int selected[6];
+        for (int j = 0; j < 8; ++j) {
+            values[j] = choice[row * 256 + j * 32 + lane];
+            valid[j] = true;
+        }
+        // Match the stable ascending sort used by MLX argpartition, including
+        // ties, infinities and NaNs. Invalid entries cannot be selected again.
+        for (int k = 5; k >= 0; --k) {
+            float best = -INFINITY;
+            int nan_index = -1;
+            for (int j = 0; j < 8; ++j) {
+                if (!valid[j]) continue;
+                if (isnan(values[j])) nan_index = j * 32 + lane;
+                else best = max(best, values[j]);
+            }
+            best = simd_max(best);
+            nan_index = simd_max(nan_index);
+            int index = -1;
+            for (int j = 0; j < 8; ++j) {
+                if (valid[j] && values[j] == best) index = j * 32 + lane;
+            }
+            index = nan_index >= 0 ? nan_index : simd_max(index);
+            selected[k] = index;
+            for (int j = 0; j < 8; ++j) {
+                if (j * 32 + lane == index) valid[j] = false;
+            }
+        }
+        if (lane == 0) {
+            float total = 0.0f;
+            for (int k = 0; k < 6; ++k) total += scores[row * 256 + selected[k]];
+            total += 1e-20f;
+            for (int k = 0; k < 6; ++k) {
+                indices[row * 6 + k] = selected[k];
+                weights[row * 6 + k] = scores[row * 256 + selected[k]] / total;
+            }
+        }
+        """,
+    )
+
+
+def route_experts(scores, choice, top_k):
+    if (
+        mx.metal.is_available()
+        and mx.default_device() == mx.gpu
+        and top_k == 6
+        and scores.shape[-1] == 256
+        and scores.shape == choice.shape
+        and scores.dtype == choice.dtype == mx.float32
+        and scores.size > 0
+    ):
+        shape = (*scores.shape[:-1], top_k)
+        return _route_kernel()(
+            inputs=[scores, choice],
+            grid=(32 * (scores.size // 256), 1, 1),
+            threadgroup=(32, 1, 1),
+            output_shapes=[shape, shape],
+            output_dtypes=[mx.int32, mx.float32],
+        )
+    indices = mx.stop_gradient(
+        mx.argpartition(choice, kth=-top_k, axis=-1)[..., -top_k:]
+    )
+    return indices, normalize_expert_weights(scores, indices)
+
+
 def weighted_sum(routed, weights):
     return (
         (routed.astype(mx.float32) * weights[..., None])
@@ -164,7 +240,7 @@ def gate_kernel():
             "gate_biases",
         ],
         output_names=["y"],
-        header=_affine_exact_header(4, 64, 4, 2),
+        header=_affine_exact_header(4, 64, 2, 1),
         source=source,
     )
 
@@ -202,8 +278,8 @@ def gate_up_silu(switch, x, indices):
             ("TOP_K", k),
             ("GROUP_SIZE", 64),
         ],
-        grid=(32, 2 * (n // 8), b * l * k),
-        threadgroup=(32, 2, 1),
+        grid=(32, n // 2, b * l * k),
+        threadgroup=(32, 1, 1),
         output_shapes=[(b, l, k, n)],
         output_dtypes=[x.dtype],
     )[0]
@@ -213,48 +289,42 @@ def gate_up_silu(switch, x, indices):
 def down_kernel():
     source = r"""
     uint lane = thread_index_in_simdgroup;
+    uint route = simdgroup_index_in_threadgroup;
     int token = threadgroup_position_in_grid.z;
-    int row0 = threadgroup_position_in_grid.y * ROWS_PER_TG +
-        simdgroup_index_in_threadgroup * RESULTS_PER_SIMDGROUP;
+    int row = threadgroup_position_in_grid.y;
     constexpr int ROW_BYTES = K_SIZE / 2;
     constexpr int GROUPS = K_SIZE / GROUP_SIZE;
-    float routed_sum[RESULTS_PER_SIMDGROUP] = {0};
-    for (int route = 0; route < TOP_K; ++route) {
-      int slot = token * TOP_K + route;
-      int expert = int(indices[slot]);
-      const device T* xp = x + slot * K_SIZE + lane * VALUES_PER_THREAD;
-      int woff = expert * N_SIZE * ROW_BYTES + row0 * ROW_BYTES +
-          lane * PACKS_PER_THREAD * BYTES_PER_PACK;
-      int soff = expert * N_SIZE * GROUPS + row0 * GROUPS +
-          lane / SCALE_STEP_PER_THREAD;
-      float result[RESULTS_PER_SIMDGROUP] = {0};
-      float xt[VALUES_PER_THREAD];
-      for (int k = 0; k < K_SIZE; k += BLOCK_SIZE) {
+    threadgroup float projected[TOP_K];
+    int slot = token * TOP_K + route;
+    int expert = int(indices[slot]);
+    const device T* xp = x + slot * K_SIZE + lane * VALUES_PER_THREAD;
+    int woff = expert * N_SIZE * ROW_BYTES + row * ROW_BYTES +
+        lane * PACKS_PER_THREAD * BYTES_PER_PACK;
+    int soff = expert * N_SIZE * GROUPS + row * GROUPS +
+        lane / SCALE_STEP_PER_THREAD;
+    float result = 0.0f;
+    float xt[VALUES_PER_THREAD];
+    for (int k = 0; k < K_SIZE; k += BLOCK_SIZE) {
         float sum = load_affine4_vector_exact<T>(xp, xt);
-        for (int r = 0; r < RESULTS_PER_SIMDGROUP; ++r) {
-          result[r] += affine4_qdot_exact(
-              (const device uint8_t*)w + woff + r * ROW_BYTES, xt,
-              float(scales[soff + r * GROUPS]),
-              float(biases[soff + r * GROUPS]), sum);
-        }
+        result += affine4_qdot_exact(
+            (const device uint8_t*)w + woff, xt,
+            float(scales[soff]), float(biases[soff]), sum);
         xp += BLOCK_SIZE;
         woff += BLOCK_SIZE / 2;
         soff += BLOCK_SIZE / GROUP_SIZE;
-      }
-      for (int r = 0; r < RESULTS_PER_SIMDGROUP; ++r) {
-        float projected = float(T(simd_sum(result[r])));
-        if (lane == 0) {
-          float product = projected * route_weights[slot];
-          routed_sum[r] = routed_sum[r] + product;
-        }
-      }
     }
-    if (lane == 0) {
-      for (int r = 0; r < RESULTS_PER_SIMDGROUP; ++r) {
-        int pos = token * N_SIZE + row0 + r;
-        // Cast after FP32 reduction, then add the shared expert in T.
-        y[pos] = T(T(routed_sum[r]) + shared_y[pos]);
-      }
+    float value = float(T(simd_sum(result)));
+    if (lane == 0) projected[route] = value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (route == 0 && lane == 0) {
+        // Parallel projections retain the original ordered FP32 reduction.
+        float total = 0.0f;
+        for (int k = 0; k < TOP_K; ++k) {
+            float term = projected[k] * route_weights[token * TOP_K + k];
+            total = total + term;
+        }
+        int pos = token * N_SIZE + row;
+        y[pos] = T(T(total) + shared_y[pos]);
     }
     """
     return mx.fast.metal_kernel(
@@ -269,7 +339,7 @@ def down_kernel():
             "shared_y",
         ],
         output_names=["y"],
-        header=_affine_exact_header(4, 64, 2, 4) + "\n#pragma clang fp contract(off)\n",
+        header=_affine_exact_header(4, 64, 1, 6) + "\n#pragma clang fp contract(off)\n",
         source=source,
     )
 
@@ -306,8 +376,8 @@ def down_reduce(linear, x, indices, weights, shared):
             ("TOP_K", k),
             ("GROUP_SIZE", 64),
         ],
-        grid=(32, n // 2, b * l),
-        threadgroup=(32, 4, 1),
+        grid=(32, 6 * n, b * l),
+        threadgroup=(32, 6, 1),
         output_shapes=[(b, l, n)],
         output_dtypes=[x.dtype],
     )[0]

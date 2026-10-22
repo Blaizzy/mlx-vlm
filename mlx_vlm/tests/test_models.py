@@ -5371,6 +5371,121 @@ def test_lfm3_omni_quantized_checkpoint_roundtrip(tmp_path, lfm3_omni):
 
 
 class TestFlintInferenceKernels:
+    @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+    def test_normalized_layer_handoff_matches_reference(self, dtype):
+        from mlx_vlm.models.flint import ModelConfig
+        from mlx_vlm.models.flint.language import LanguageModel
+
+        mx.random.seed(84)
+        model = LanguageModel(
+            ModelConfig(
+                vocab_size=128,
+                hidden_size=256,
+                num_hidden_layers=3,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                intermediate_size=512,
+                moe_intermediate_size=512,
+                shared_expert_intermediate_size=512,
+                num_experts=8,
+                num_experts_per_tok=6,
+                layer_types=["full_attention", "sliding_attention", "full_attention"],
+                no_rope_layer_indices=[0, 2],
+                sliding_window=16,
+                mlp_only_layers=[0],
+            )
+        )
+        model.set_dtype(dtype)
+        nn.quantize(model, group_size=64, bits=4)
+        ids = mx.arange(21)[None]
+        results = []
+        for training in (True, False):
+            model.train(training)
+            cache = model.make_cache()
+            results.append([model(ids[:, :17], cache=cache).logits])
+            for i in range(17, 21):
+                results[-1].append(model(ids[:, i : i + 1], cache=cache).logits)
+            mx.eval(results[-1])
+        for expected, actual in zip(*results):
+            assert mx.array_equal(actual, expected).item()
+
+    @pytest.mark.parametrize("length", [1, 7, 1023])
+    @pytest.mark.parametrize("kind", ["random", "ties", "negative_inf", "nan"])
+    def test_fused_route_matches_stable_selection(self, length, kind):
+        from mlx_vlm.models.flint.kernels import normalize_expert_weights, route_experts
+
+        mx.random.seed(81)
+        scores = mx.sigmoid(mx.random.normal((2, length, 256)))
+        choice = scores + mx.random.normal((256,))
+        if kind == "ties":
+            choice = mx.floor(choice * 4)
+        elif kind == "negative_inf":
+            choice = mx.full(choice.shape, -float("inf"))
+        elif kind == "nan":
+            choice = mx.where(mx.arange(256) % 3 == 0, float("nan"), choice)
+        # Include noncontiguous inputs in the routing contract.
+        scores, choice = scores.swapaxes(0, 1), choice.swapaxes(0, 1)
+        expected = mx.argpartition(choice, kth=-6, axis=-1)[..., -6:]
+        indices, weights = route_experts(scores, choice, 6)
+        assert mx.array_equal(indices, expected).item()
+        assert mx.array_equal(
+            weights, normalize_expert_weights(scores, expected)
+        ).item()
+
+    @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+    @pytest.mark.parametrize("length", [1, 17])
+    @pytest.mark.parametrize("base", [None, 10000, 500000])
+    def test_fused_qk_normalization_and_rotary(self, dtype, length, base):
+        from mlx_vlm.models.flint import ModelConfig
+        from mlx_vlm.models.flint.language import Attention
+        from mlx_vlm.models.flint.normalization import norm_rope
+
+        mx.random.seed(82)
+        module = Attention(ModelConfig(), 0)
+        module.rope = nn.RoPE(128, base=base) if base is not None else None
+        module.set_dtype(dtype)
+        module.eval()
+        batch = 2
+        q = mx.random.normal((batch, length, module.n_heads * 128)).astype(dtype)
+        k = mx.random.normal((batch, length, module.n_kv_heads * 128)).astype(dtype)
+        offset = mx.array([3, 101] if length == 1 else [131072, 262080], mx.int32)
+        actual = norm_rope(module, q, k, offset)
+        if not mx.metal.is_available():
+            assert actual is None
+            return
+        expected = [
+            norm(value.reshape(batch, length, heads, 128)).transpose(0, 2, 1, 3)
+            for value, norm, heads in (
+                (q, module.q_norm, module.n_heads),
+                (k, module.k_norm, module.n_kv_heads),
+            )
+        ]
+        if base is not None:
+            expected = [module.rope(value, offset=offset) for value in expected]
+        for a, b in zip(actual, expected):
+            assert mx.array_equal(a, b).item()
+        module.train()
+        assert norm_rope(module, q, k, offset) is None
+        module.eval()
+        module.rope = nn.RoPE(128, scale=0.5)
+        assert norm_rope(module, q, k, offset) is None
+
+    @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16, mx.float32])
+    @pytest.mark.parametrize("width", [64, 128, 1536, 2048, 4096])
+    def test_fused_residual_normalization(self, dtype, width):
+        from mlx_vlm.models.flint.normalization import residual_norm
+
+        mx.random.seed(83)
+        norm = nn.RMSNorm(width)
+        norm.set_dtype(dtype)
+        norm.eval()
+        x = mx.random.normal((2, width, 3)).astype(dtype).swapaxes(-1, -2)
+        delta = mx.random.normal(x.shape).astype(dtype)
+        residual, normalized = residual_norm(x, delta, norm)
+        expected = x + delta
+        assert mx.array_equal(residual, expected).item()
+        assert mx.array_equal(normalized, norm(expected)).item()
+
     @pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
     @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
     @pytest.mark.parametrize("batch", [1, 2, 4, 8])
