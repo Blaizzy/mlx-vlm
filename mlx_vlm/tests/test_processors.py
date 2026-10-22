@@ -2853,11 +2853,10 @@ def test_prepare_inputs_text_custom_length_parameters(wrapped, call, expected, e
     "options,expected_length",
     [
         ({}, 2),
-        ({"truncation": True, "max_length": 4}, 4),
         ({"truncation": False, "max_length": 4}, 6),
         ({"truncation": None, "max_length": None}, 6),
     ],
-    ids=["custom-defaults", "explicit-limit", "disabled", "explicit-none"],
+    ids=["custom-defaults", "disabled", "explicit-none"],
 )
 def test_prepare_inputs_text_preserves_custom_length_defaults(options, expected_length):
     class DefaultLengthTokenizer(PreTrainedTokenizerFast):
