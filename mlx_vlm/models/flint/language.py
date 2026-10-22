@@ -8,7 +8,8 @@ from ..rope_utils import initialize_rope
 from ..switch_layers import SwitchGLU, stack_expert_projection
 from .attention_mask import create_attention_mask
 from .config import ModelConfig
-from .kernels import down_reduce, gate_up_silu, metal_sum, normalize_expert_weights
+from .kernels import down_reduce, gate_up_silu, metal_sum, route_experts
+from .normalization import norm_rope, residual_norm
 
 
 class Attention(nn.Module):
@@ -50,21 +51,23 @@ class Attention(nn.Module):
 
     def __call__(self, x, mask=None, cache=None):
         batch, length, _ = x.shape
-        q = self.q_norm(
-            self.q_proj(x).reshape(batch, length, self.n_heads, self.head_dim)
-        ).transpose(0, 2, 1, 3)
-        k = self.k_norm(
-            self.k_proj(x).reshape(batch, length, self.n_kv_heads, self.head_dim)
-        ).transpose(0, 2, 1, 3)
-        v = (
-            self.v_proj(x)
-            .reshape(batch, length, self.n_kv_heads, self.head_dim)
-            .transpose(0, 2, 1, 3)
+        q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        offset = cache.offset if cache is not None else 0
+        normalized = norm_rope(self, q, k, offset)
+        if normalized is None:
+            q = self.q_norm(
+                q.reshape(batch, length, self.n_heads, self.head_dim)
+            ).transpose(0, 2, 1, 3)
+            k = self.k_norm(
+                k.reshape(batch, length, self.n_kv_heads, self.head_dim)
+            ).transpose(0, 2, 1, 3)
+            if self.rope is not None:
+                q, k = self.rope(q, offset=offset), self.rope(k, offset=offset)
+        else:
+            q, k = normalized
+        v = v.reshape(batch, length, self.n_kv_heads, self.head_dim).transpose(
+            0, 2, 1, 3
         )
-        if self.rope is not None:
-            offset = cache.offset if cache is not None else 0
-            q = self.rope(q, offset=offset)
-            k = self.rope(k, offset=offset)
         if cache is not None:
             k, v = cache.update_and_fetch(k, v)
         out = scaled_dot_product_attention(
@@ -134,8 +137,7 @@ class SparseMoeBlock(nn.Module):
 
     def _inference(self, x):
         scores, choice, shared = self._compiled(x)
-        indices = mx.argpartition(choice, kth=-self.top_k, axis=-1)[..., -self.top_k :]
-        weights = normalize_expert_weights(scores, indices)
+        indices, weights = route_experts(scores, choice, self.top_k)
         switch = self.switch_mlp
         activated = gate_up_silu(switch, x, indices)
         if activated is not None:
@@ -171,8 +173,12 @@ class DecoderLayer(nn.Module):
         )
 
     def __call__(self, x, mask=None, cache=None):
-        x = x + self.self_attn(self.input_layernorm(x), mask, cache)
-        return x + self.mlp(self.post_attention_layernorm(x))
+        x, normalized = residual_norm(
+            x,
+            self.self_attn(self.input_layernorm(x), mask, cache),
+            self.post_attention_layernorm,
+        )
+        return x + self.mlp(normalized)
 
 
 class FlintModel(nn.Module):
@@ -186,6 +192,35 @@ class FlintModel(nn.Module):
         x = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
         cache = [None] * len(self.layers) if cache is None else cache
         mask_parameters = {}
+        # Carry the normalization into the next layer so its residual addition
+        # and RMS reduction share a kernel. Training and custom layers retain
+        # their normal module calls.
+        if (
+            not self.training
+            and self.layers
+            and len(cache) == len(self.layers)
+            and all(type(layer) is DecoderLayer for layer in self.layers)
+        ):
+            normalized = self.layers[0].input_layernorm(x)
+            for i, (layer, c) in enumerate(zip(self.layers, cache)):
+                mask = create_attention_mask(
+                    x,
+                    c,
+                    window_size=layer.self_attn.window_size,
+                    parameter_cache=mask_parameters,
+                )
+                x, normalized = residual_norm(
+                    x,
+                    layer.self_attn(normalized, mask, c),
+                    layer.post_attention_layernorm,
+                )
+                next_norm = (
+                    self.layers[i + 1].input_layernorm
+                    if i + 1 < len(self.layers)
+                    else self.norm
+                )
+                x, normalized = residual_norm(x, layer.mlp(normalized), next_norm)
+            return normalized
         for layer, c in zip(self.layers, cache):
             mask = create_attention_mask(
                 x,
