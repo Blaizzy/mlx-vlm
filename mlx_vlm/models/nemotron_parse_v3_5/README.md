@@ -22,9 +22,11 @@ mlx_vlm.generate --model Nemotron-3.5-Parse-bf16 --image page.png \
 Use `--quantize --q-bits 8` or `--quantize --q-bits 4` to quantize the language
 model. The vision tower remains in the selected floating-point dtype.
 
-The NVIDIA model materials, including its architecture and weights, are licensed
-under OpenMDW-1.1. See [LICENSE](LICENSE). Retain the source model's license,
-third-party notices, and tokenizer attribution when redistributing converted
-weights. Local full-checkpoint fidelity measurements are separate from the
-small architecture contract tests. They require model downloads and Apple
-Silicon; they are not CI checks.
+The forward-pass port follows NVIDIA's provided implementation and is covered by
+the OpenMDW-1.1 license. The NVIDIA model materials, including its architecture
+and weights, use the same license; see [LICENSE](LICENSE). The tokenizer is
+separately licensed under MIT. Retain the source model's license, third-party
+notices, and tokenizer attribution when redistributing converted weights. Local
+full-checkpoint fidelity measurements are separate from the small architecture
+contract tests. They require model downloads and Apple Silicon; they are not CI
+checks.

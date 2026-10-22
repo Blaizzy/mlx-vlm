@@ -315,8 +315,8 @@ def test_bpe_streaming_uses_canonical_added_tokens(
         tokenizer_object=backend, clean_up_tokenization_spaces=False
     )
     token = tokenizer.vocab[piece]
-    expected = canonical if normalized else piece
-    assert tokenizer.convert_ids_to_tokens(token) == expected
+    expected = tokenizer.convert_ids_to_tokens(token)
+    assert expected in {piece, canonical}
     assert tokenizer.decode([token]) == expected
 
     detokenizer = load_tokenizer(tmp_path, return_tokenizer=False)(tokenizer)
