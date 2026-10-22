@@ -1,8 +1,11 @@
 import json
+import logging
 from typing import Any
 
 import mlx.core as mx
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 _LLGUIDANCE_MASK_KERNEL = mx.fast.metal_kernel(
     name="mlx_vlm_llguidance_mask",
@@ -371,6 +374,8 @@ def build_glm47_tool_call_grammar(tokenizer, tools: list[dict[str, Any]]) -> str
             continue
         parameters = fn.get("parameters") or {}
         properties = parameters.get("properties") or {}
+        if not isinstance(properties, dict) or not all(properties):
+            raise ValueError(f"tool {name!r} has invalid parameter names")
         required = set(parameters.get("required") or ())
         # Arguments follow the schema order: required ones must appear, optional
         # ones may be skipped, and none can repeat. Order does not change a call.
@@ -420,5 +425,15 @@ def build_tool_call_logits_processor(tokenizer, tool_parser_type, tools):
         return None
 
     tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
-    grammar = llg.grammar_from("lark", build_glm47_tool_call_grammar(tokenizer, tools))
-    return LLGuidanceLogitsProcessor(grammar, _get_llg_tokenizer(tokenizer))
+    try:
+        grammar = llg.grammar_from(
+            "lark", build_glm47_tool_call_grammar(tokenizer, tools)
+        )
+        llg_tokenizer = _get_llg_tokenizer(tokenizer)
+        error = llg.LLMatcher.validate_grammar(grammar, llg_tokenizer)
+    except Exception as exc:  # client-supplied schemas can be malformed
+        error = str(exc)
+    if error:
+        logger.warning("Tool-call grammar disabled for this request: %s", error)
+        return None
+    return LLGuidanceLogitsProcessor(grammar, llg_tokenizer)

@@ -240,6 +240,27 @@ class TestBuildToolCallLogitsProcessor:
     def test_no_tools_returns_none(self, tokenizer, tools):
         assert build_tool_call_logits_processor(tokenizer, "glm47", tools) is None
 
+    @pytest.mark.parametrize(
+        "tools",
+        [
+            [
+                {
+                    "type": "function",
+                    "function": {"name": "x", "parameters": {"properties": {"": {}}}},
+                }
+            ],
+            [{"type": "function", "function": {"name": ""}}],
+            [
+                {
+                    "type": "function",
+                    "function": {"name": "x", "parameters": {"properties": "bad"}},
+                }
+            ],
+        ],
+    )
+    def test_odd_schemas_fall_back_to_none(self, tokenizer, tools):
+        assert build_tool_call_logits_processor(tokenizer, "glm47", tools) is None
+
     def test_unwraps_processor_tokenizer(self, tokenizer):
         class Processor:
             pass
