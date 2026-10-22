@@ -12,6 +12,7 @@ from ..gemma4.processing_gemma4 import (
     Gemma4VideoProcessor,
     _convert_to_rgb,
     _to_channel_first,
+    _to_numpy_with_format,
 )
 
 
@@ -101,9 +102,7 @@ class Gemma4UnifiedImageProcessor(Gemma4ImageProcessor):
 
         from transformers.image_utils import (
             ChannelDimension,
-            infer_channel_dimension_format,
             make_flat_list_of_images,
-            to_numpy_array,
             valid_images,
         )
 
@@ -119,8 +118,7 @@ class Gemma4UnifiedImageProcessor(Gemma4ImageProcessor):
         num_soft_tokens_per_image = []
 
         for image in images:
-            image = to_numpy_array(image)
-            input_data_format = infer_channel_dimension_format(image)
+            image, input_data_format = _to_numpy_with_format(image)
 
             if self.do_resize:
                 image = self.aspect_ratio_preserving_resize(

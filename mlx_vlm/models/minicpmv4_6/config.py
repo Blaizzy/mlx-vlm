@@ -131,6 +131,10 @@ class ModelConfig(BaseModelConfig):
     merger_times: int = 1
     eos_token_id: Optional[list[int]] = None
 
+    @staticmethod
+    def _parse_text_config(params):
+        return TextConfig.from_dict(params)
+
     def __post_init__(self):
         # Prefer chat turn-end token for MiniCPM-V decoding.
         # Using <|endoftext|> (248044) as EOS can cause immediate empty stop.
@@ -179,7 +183,7 @@ class ModelConfig(BaseModelConfig):
             text_params = {k: v for k, v in params.items() if k in text_fields}
         if source_params is not None:
             source_params["text_config"] = dict(text_params)
-        text_config = TextConfig.from_dict(text_params)
+        text_config = cls._parse_text_config(text_params)
 
         vision_params = dict(params.pop("vision_config", {}))
         if vision_params.get("model_type") == "siglip":

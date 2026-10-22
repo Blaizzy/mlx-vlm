@@ -46,6 +46,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | Phi-4 Reasoning Vision | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/phi4_siglip/README.md) |
 | MiniCPM-o | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minicpmo/README.md) |
 | PaddleOCR-VL | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/paddleocr_vl/README.md) |
+| OXR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/oxr/README.md) |
 | Phi-4 Multimodal | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/phi4mm/README.md) |
 | MolmoPoint | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/molmo_point/README.md) |
 | LocateAnything | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/locateanything/README.md) |
@@ -53,12 +54,14 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | Moondream3 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/moondream3/README.md) |
 | EmbeddingGemma 2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/embedding_gemma2/README.md) |
 | Gemma 4 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/gemma4/README.md) |
+| Muse Spark Open | [Docs](mlx_vlm/models/muse_spark/README.md) |
 | MiniMax M3 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minimax_m3_vl/README.md) |
 | Falcon-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/falcon_ocr/README.md) |
 | IndicOCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/indic_ocr/README.md) |
 | PP-DocLayoutV3 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/pp_doclayout_v3/README.md) |
 | Granite Vision 3.2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite_vision/README.md) |
 | Granite 4.0 Vision | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite4_vision/README.md) |
+| MiniCPM-V 4.7 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minicpmv4_7/README.md) |
 | MiniCPM-V 4.6 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minicpmv4_6/README.md) |
 | GLiNER2.5 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/gliner2_5/README.md) |
 | BERT | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/bert/README.md) |
@@ -67,6 +70,8 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | Z1T-0 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/z1t/README.md) |
 | Spark-X2.5 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/spark2_5/README.md) |
 | Ternary Bonsai 2 | [Docs](mlx_vlm/models/prism_hadamard_qwen35/README.md) |
+| Flint | [Docs](mlx_vlm/models/flint/README.md) |
+| Nemotron 3.5 Super VL / Bolt / Nano Omni | [Docs](mlx_vlm/models/nemotron_h_nano_omni/README.md) |
 
 ## Installation
 
@@ -523,6 +528,19 @@ python -m mlx_vlm decide --model nativ-community/decider-2b \
 Use `--state-file request.txt` for UTF-8 text and `--questions-file questions.json`
 for named questions. `mlx_vlm.decide` runs the same command.
 
+Models that read images take a repeatable `--image`, and models that read
+speech take one `--audio` (each a path or URL). The state is optional when
+media are given:
+
+```sh
+python -m mlx_vlm decide --model LiquidAI/d1-omni-600M \
+  --image http://images.cocodataset.org/val2017/000000039769.jpg \
+  --questions '{"cats":{"type":"choice","instructions":"How many cats are there?","criteria":["one","two","more"]}}'
+python -m mlx_vlm decide --model LiquidAI/d1-omni-600M \
+  --audio https://huggingface.co/datasets/Narsil/asr_dummy/resolve/main/1.flac \
+  --questions '{"speaking":{"type":"bool","instructions":"Is anyone speaking in this clip?"}}'
+```
+
 Preload a decision model in the existing server:
 
 ```sh
@@ -534,11 +552,15 @@ curl http://localhost:8080/v1/decisions \
 
 An explicit `model` in the request selects a checkpoint; otherwise the currently
 loaded decision model is used. Without either, the endpoint returns HTTP 400.
-Decision requests are non-streaming and use the server's API-key authentication.
+Requests may add `"images"`, a list of URLs, paths, or data URIs, or `"audio"`,
+one URL, path, or base64 data URI; `state` may then be `null`. Decision requests
+are non-streaming and use the server's API-key authentication.
 
 Both interfaces return the shared `predict()` result and preserve model-specific
-scoring. Decider and Laya support `choice`, `bool`, and `score`; consult each
-model's README for criteria and calibration details.
+scoring. Decider, Laya, [d1-3B](mlx_vlm/models/d1/README.md), and
+[d1-omni-600M](mlx_vlm/models/d1_omni/README.md) support `choice`, `bool`, and
+`score`; the two LiquidAI d1 models also read images, and d1-omni reads speech.
+Consult each model's README for criteria and calibration details.
 
 ### Server (FastAPI)
 
@@ -606,9 +628,50 @@ mlx_vlm.server --model-dir /Volumes/Models --model-dir ~/my-custom-model
 - `--kv-group-size`: Group size for uniform KV cache quantization (default: `64`)
 - `--max-kv-size`: Maximum KV cache size in tokens
 - `--vision-cache-size`: Max number of cached vision features (default: `20`)
+- `--min-pixels` / `--max-pixels`: Default minimum/maximum input image pixel area for processors that support these options (also `MLX_VLM_MIN_PIXELS` / `MLX_VLM_MAX_PIXELS`). Unset values use the model's preprocessing defaults.
 - `--log-progress-interval`: Decoded tokens between progress log messages; `0` disables periodic decode progress (default: `10`)
 - `--api-key`: Bearer token required for inference, model discovery, and management endpoints
 - `--log-level`: Logging level — `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (default: `INFO`)
+
+For higher-resolution image input, including OCR with Bonsai 2, set pixel-area
+defaults at startup:
+
+```sh
+mlx_vlm.server --model prism-ml/Ternary-Bonsai-2-2B-mlx-2bit \
+  --min-pixels 1048576 --max-pixels 4194304
+```
+
+Chat Completions, Responses, and Messages requests can override these defaults
+with top-level `min_pixels` and `max_pixels` fields (use `extra_body` with an
+OpenAI client). For example, `"min_pixels": 1048576` requests at least 1024 × 1024
+pixels of area, preserving aspect ratio and rounding to the processor's patch
+size. On Bonsai 2 this corresponds to approximately 1024 image tokens. Higher
+resolution uses more context, memory, and processing time. Both limits must be
+positive and the effective minimum must not exceed the maximum. Omitted or null
+request values inherit the server defaults.
+
+Change these defaults on a running server without restarting or reloading the
+model:
+
+```sh
+curl -X PATCH http://localhost:8080/v1/settings \
+  -H 'Content-Type: application/json' \
+  -d '{"min_pixels": 1048576, "max_pixels": 4194304}'
+```
+
+Use `GET /v1/settings` to inspect the current values. New requests inherit the
+updated limits; requests already queued for generation keep their resolved
+options, and per-request overrides still take precedence. The pair is updated
+atomically; invalid limits appear in `rejected` and leave both limits unchanged.
+Set either setting to `null` to use that limit from the model's preprocessing
+configuration. Updates last until the server restarts; the
+`{"op": "replace", "values": {}}` form resets **all** runtime settings to their
+startup defaults, including CLI pixel limits. Include
+`Authorization: Bearer <key>` when the server has an API key configured.
+
+The existing `resize_shape` request field also applies before image processing
+in the batching server. Processor pixel limits still apply afterward. Token
+counting and streaming context checks use the same options as generation.
 
 At `INFO`, the server logs request start/completion, chunked-prefill progress,
 time to first token, periodic decode throughput, and the final token counts. Set
@@ -1632,6 +1695,7 @@ The following models support video chat:
 5. MiniMax M3
 6. LLaVA-OneVision
 7. Mage-VL
+8. Muse Spark Open
 
 With more coming soon.
 
@@ -1807,13 +1871,29 @@ See [docs/usage.md](https://github.com/Blaizzy/mlx-vlm/blob/main/docs/usage.md#d
 
 # Fine-tuning
 
-MLX-VLM supports fine-tuning models with LoRA and QLoRA. Fine-tuning (and the
+MLX-VLM supports VLM SFT, ORPO, DPO, and GRPO with LoRA, QLoRA, DoRA, or full
+fine-tuning. Fine-tuning (and the
 eval scripts) need the training extra, which is not installed by default:
 
 ```bash
 pip install "mlx-vlm[train]"
 ```
 
-## LoRA & QLoRA
+Train from the CLI with `python -m mlx_vlm.train`:
 
-To learn more about LoRA, please refer to the [LoRA.md](./mlx_vlm/LORA.MD) file.
+```bash
+python -m mlx_vlm.train \
+  --model mlx-community/Qwen2.5-VL-3B-Instruct-4bit \
+  --data data --train-on-completions \
+  --batch-size 1 --gradient-accumulation-steps 4 \
+  --iters 100 --adapter-file adapters/sft/weights.safetensors
+```
+
+For Python and notebooks, import `Trainer`, `VLMTrainingArgs`, and
+`prepare_model_for_training` from `mlx_vlm.trainer`. The CLI and notebook API
+share model preparation and the training engine.
+
+Start with the [SFT notebook](examples/training/sft_text_only.ipynb), or explore the
+[ORPO, DPO, vision GRPO, and custom-loss examples](examples/training/README.md). See the
+[training guide](docs/training.md) for dataset formats, configuration, saving,
+resuming, and the existing functional trainer APIs.

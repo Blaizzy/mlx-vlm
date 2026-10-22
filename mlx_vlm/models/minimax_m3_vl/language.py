@@ -9,6 +9,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from ..base import (
     LanguageModelOutput,
+    cache_position_offset,
     create_attention_mask,
     scaled_dot_product_attention,
 )
@@ -782,13 +783,14 @@ class MiniMaxM3BatchKVCache:
         return self.kv_cache.make_mask(*args, **kwargs)
 
     def filter(self, batch_indices):
-        min_left_pad = self.left_padding[batch_indices].min().item()
+        previous_length = self.kv_cache._idx
         self.kv_cache.filter(batch_indices)
+        trimmed = previous_length - self.kv_cache._idx
         if self.index_keys is not None:
             self.index_keys = self.index_keys[batch_indices]
-            if min_left_pad > 0:
-                self.index_keys = self.index_keys[..., min_left_pad:, :]
-                self.index_offset -= min_left_pad
+            if trimmed > 0:
+                self.index_keys = self.index_keys[..., trimmed:, :]
+                self.index_offset -= trimmed
 
     def extend(self, other):
         if not isinstance(other, MiniMaxM3BatchKVCache):
@@ -2050,12 +2052,10 @@ class LanguageModel(nn.Module):
             cache_offset = 0
             cache_offsets = None
             if first_cache is not None:
-                cache_offset = first_cache._idx if hasattr(first_cache, "_idx") else 0
+                cache_offset = cache_position_offset(first_cache)
                 offset = getattr(first_cache, "offset", None)
                 if isinstance(offset, mx.array) and offset.ndim > 0:
                     cache_offsets = offset
-                elif offset is not None and not hasattr(first_cache, "_idx"):
-                    cache_offset = offset
 
             scalar_cache_offset = self._scalar_cache_offset(cache_offset)
             if mask is None and first_cache is not None and scalar_cache_offset == 0:

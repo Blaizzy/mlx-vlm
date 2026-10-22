@@ -19,6 +19,7 @@ import copy
 from functools import partial
 
 import numpy as np
+from PIL import Image
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_utils import ChannelDimension, infer_channel_dimension_format
 from transformers.processing_utils import VideosKwargs
@@ -35,6 +36,21 @@ from ..gemma4.processing_gemma4 import Gemma4VideoProcessor
 from .image_processing_embedding_gemma2 import EmbeddingGemma2ImageProcessor
 
 logger = logging.get_logger(__name__)
+
+
+def _all_pil_frames(video) -> bool:
+    """True when every leaf of a (possibly nested) video input is a PIL image.
+
+    ``make_batched_videos`` stacks PIL frames into ``(T, H, W, C)`` arrays and
+    erases their type, so the fact that the pixels came from PIL, whose layout
+    is always channels-last, has to be recorded before batching turns it into
+    a shape guess.
+    """
+    if isinstance(video, Image.Image):
+        return True
+    if isinstance(video, (list, tuple)):
+        return bool(video) and all(_all_pil_frames(frame) for frame in video)
+    return False
 
 
 class EmbeddingGemma2VideoProcessorKwargs(VideosKwargs, total=False):
@@ -89,6 +105,11 @@ class EmbeddingGemma2VideoProcessor(Gemma4VideoProcessor):
         return_tensors=None,
         **kwargs,
     ):
+        # ``make_batched_videos`` stacks PIL frames into (T, H, W, C) arrays
+        # and erases their type, so record that the batch came from PIL images
+        # (whose layout is always channels-last) before batching turns the
+        # layout into a shape guess.
+        frames_are_pil = _all_pil_frames(videos)
         videos = make_batched_videos(videos)
         metadata = copy.deepcopy(make_batched_metadata(videos, video_metadata))
         options = {
@@ -106,6 +127,7 @@ class EmbeddingGemma2VideoProcessor(Gemma4VideoProcessor):
         image_processor = EmbeddingGemma2ImageProcessor(**self.__dict__)
         pixels, positions, counts, frame_counts = [], [], [], []
         for index, video in enumerate(videos):
+            video_is_pil = frames_are_pil
             if is_valid_video(video):
                 video = np.asarray(video)
                 if sampler is not None:
@@ -118,12 +140,16 @@ class EmbeddingGemma2VideoProcessor(Gemma4VideoProcessor):
                         "Sampling frames from a list of images is not supported! Set `do_sample_frames=False`."
                     )
                 video = image_processor.fetch_images(video)
+                video_is_pil = _all_pil_frames(video)
             else:
                 video, metadata[index] = self._decode_video(video, sampler)
             video = np.asarray(video)
-            layout = kwargs.get("input_data_format") or infer_channel_dimension_format(
-                video, num_channels=(1, 3, 4)
-            )
+            if kwargs.get("input_data_format") is not None:
+                layout = kwargs["input_data_format"]
+            elif video_is_pil:
+                layout = ChannelDimension.LAST
+            else:
+                layout = infer_channel_dimension_format(video, num_channels=(1, 3, 4))
             if kwargs.get("do_convert_rgb", self.do_convert_rgb):
                 video = convert_to_rgb(video, input_data_format=layout)
                 layout = ChannelDimension.FIRST

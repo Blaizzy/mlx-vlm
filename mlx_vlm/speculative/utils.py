@@ -132,6 +132,15 @@ class SpeculativePrefill:
             mx.async_eval(hidden)
             self.chunks.append(hidden)
 
+    def filter(self, keep: List[int]):
+        if not keep:
+            self.chunks.clear()
+        elif self.chunks:
+            indices = mx.array(keep, dtype=mx.int32)
+            self.chunks = [
+                [hidden[indices] for hidden in chunk] for chunk in self.chunks
+            ]
+
     def finish(self, output):
         if self.chunks:
             self.chunks.append(output.hidden_states)

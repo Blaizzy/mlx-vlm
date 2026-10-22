@@ -46,13 +46,11 @@ from .common import (
     DEFAULT_PREFILL_STEP_SIZE,
     DEFAULT_QUANTIZED_KV_START,
     DEFAULT_REPETITION_CONTEXT_SIZE,
-    DEFAULT_TEMPERATURE,
-    DEFAULT_TOP_K,
-    DEFAULT_TOP_P,
     _chunked_prefill_enabled,
     _default_prefill_step_size_for_offload,
     generation_stream,
     maybe_quantize_kv_cache,
+    resolve_sampling_defaults,
     wired_limit,
 )
 from .types import GenerateKwargs, ProcessorLike, Unpack
@@ -174,16 +172,16 @@ def generate_step(
     mask,
     *,
     max_tokens: int = DEFAULT_MAX_TOKENS,
-    temperature: float = DEFAULT_TEMPERATURE,
+    temperature: Optional[float] = None,
     repetition_penalty: Optional[float] = None,
     repetition_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE,
     presence_penalty: Optional[float] = None,
     presence_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE,
     frequency_penalty: Optional[float] = None,
     frequency_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE,
-    top_p: float = DEFAULT_TOP_P,
+    top_p: Optional[float] = None,
     min_p: float = DEFAULT_MIN_P,
-    top_k: int = DEFAULT_TOP_K,
+    top_k: Optional[int] = None,
     top_n_sigma: float = DEFAULT_TOP_N_SIGMA,
     p_less: bool = False,
     typical_p: float = 1.0,
@@ -220,7 +218,10 @@ def generate_step(
         pixel_values: The pixel values for vision models (optional).
         mask: The attention mask (optional).
         max_tokens (int): Maximum number of tokens to generate.
-        temperature (float): The temperature for sampling, if 0 the argmax is used.
+        temperature (float, optional): The temperature for sampling; 0 uses argmax.
+          Unset sampling options use the checkpoint's generation_config.json,
+          falling back to temperature=0.0, top_p=1.0, top_k=0. A checkpoint with
+          do_sample=False defaults to greedy unless temperature is explicit.
         repetition_penalty (float, optional): The penalty factor for repeating
           tokens.
         repetition_context_size (int, optional): The number of tokens to
@@ -280,6 +281,12 @@ def generate_step(
         kv_value_scheme=kv_value_scheme,
     )
 
+    temperature, top_p, top_k = resolve_sampling_defaults(
+        getattr(model, "config", None),
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+    )
     temperature = clamp_temperature(temperature)
     sampler_is_greedy = sampler is None and temperature == 0
     if sampler is None:
@@ -1574,6 +1581,21 @@ class SpeculativeGenerationBatch:
         self.uids = [
             uid for uid, done in zip(self._all_uids, self._finished) if not done
         ]
+        if not self.uids:
+            self._release()
+
+    def _release(self):
+        # A finished batch stays installed as the generator's batch until the
+        # next request's prefill completes; holding its prompt cache that long
+        # keeps a dead copy of the whole context resident during that prefill.
+        if self._rounds_iter is not None:
+            self._rounds_iter.close()
+            self._rounds_iter = None
+        self.prompt_cache = []
+        self.hidden = None
+        self.shared_kv_states = None
+        self.prompt_tokens = None
+        mx.clear_cache()
 
     def extend(self, other: "SpeculativeGenerationBatch"):
         if len(self) == 0:
@@ -1914,6 +1936,57 @@ class PromptProcessingBatch:
     def __len__(self):
         return len(self.uids)
 
+    def remove(self, uid):
+        """Remove one prefill row without restarting the remaining prompts."""
+        batch_size = len(self.uids)
+        idx = self.uids.index(uid)
+        keep = [i for i in range(batch_size) if i != idx]
+        keep_arr = mx.array(keep, dtype=mx.int32)
+        mx.eval(
+            [c.state for c in self.prompt_cache],
+            list(self._finished_prompt_logits.values()),
+            self._speculative_prefill.chunks,
+        )
+        if self._apc_manager is not None and self._apc_meta:
+            meta = self._apc_meta[idx]
+            if meta is not None:
+                self._apc_manager.release(meta.get("apc_blocks", []))
+
+        for rows in (
+            self.uids,
+            self._prompt_uids,
+            self.max_tokens,
+            self.logits_processors,
+            self.thinking_budget_criteria,
+            self._token_context,
+            self._left_padding_per_row,
+            self._right_pad_per_row,
+            self._suffix_lens,
+            self._apc_meta,
+            self._prompt_tokens_per_row,
+            self._cached_tokens_per_row,
+        ):
+            if rows:
+                rows.pop(idx)
+        self._finished_prompt_logits.pop(uid, None)
+        self._speculative_prefill.filter(keep)
+        self._total_prompt_tokens = sum(self._suffix_lens)
+
+        if not keep:
+            self.prompt_cache.clear()
+        for c in self.prompt_cache:
+            c.filter(keep_arr)
+        self._input_ids = self._input_ids[keep_arr]
+        if self._inputs_embeds is not None:
+            self._inputs_embeds = self._inputs_embeds[keep_arr]
+        for key, value in self._prompt_kwargs.items():
+            if (
+                isinstance(value, mx.array)
+                and _prompt_kwarg_batch_size(key, value) == batch_size
+            ):
+                axis = 1 if _is_mrope_position_ids_prompt_kwarg(key, value) else 0
+                self._prompt_kwargs[key] = mx.take(value, keep_arr, axis=axis)
+
     def _release_apc_meta_blocks(self):
         if self._apc_manager is None:
             return
@@ -2089,9 +2162,13 @@ class PromptProcessingBatch:
             ]
             logits = output.logits if hasattr(output, "logits") else output
             for i in finished_rows:
-                self._finished_prompt_logits[i] = mx.contiguous(mx.array(logits[i, -1]))
+                self._finished_prompt_logits[self.uids[i]] = mx.contiguous(
+                    mx.array(logits[i, -1])
+                )
         eval_targets = [c.state for c in self.prompt_cache]
-        eval_targets.extend(self._finished_prompt_logits[i] for i in finished_rows)
+        eval_targets.extend(
+            self._finished_prompt_logits[self.uids[i]] for i in finished_rows
+        )
         mx.async_eval(eval_targets)
         self._processed_prompt_columns += n
         if self._apc_coordinator is not None:
@@ -2145,7 +2222,7 @@ class PromptProcessingBatch:
             (
                 padding
                 for i, padding in enumerate(self._right_pad_per_row or [])
-                if i not in self._finished_prompt_logits
+                if self.uids[i] not in self._finished_prompt_logits
             ),
             default=0,
         )
@@ -2164,8 +2241,8 @@ class PromptProcessingBatch:
             logits = mx.stack(
                 [
                     (
-                        self._finished_prompt_logits[i]
-                        if i in self._finished_prompt_logits
+                        self._finished_prompt_logits[self.uids[i]]
+                        if self.uids[i] in self._finished_prompt_logits
                         else logits[i, logits.shape[1] - 1 - padding]
                     )
                     for i, padding in enumerate(self._right_pad_per_row)
@@ -2909,12 +2986,11 @@ class BatchGenerator:
 
             # Being prefilled
             if self._prompt_batch is not None and uid in self._prompt_batch.uids:
-                if len(self._prompt_batch.uids) == 1:
-                    self._prompt_batch.uids = []
-                    self._prompt_batch.prompt_cache = []
+                self._prompt_batch.remove(uid)
+                if not self._prompt_batch.uids:
                     self._prompt_batch = None
-                    mx.clear_cache()
-                    return True
+                mx.clear_cache()
+                return True
 
             # Already decoding.
             if uid in self._generation_batch.uids:

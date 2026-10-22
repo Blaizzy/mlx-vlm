@@ -10,10 +10,81 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-from mlx_vlm.models import deepseek_v3, laguna, minimax
+from mlx_vlm.models import deepseek_v3, diffusion_gemma, laguna, minimax
+from mlx_vlm.models.diffusion_gemma.language import DecoderLayer as DiffusionGemmaLayer
+from mlx_vlm.models.diffusion_gemma.language import Experts as DiffusionGemmaExperts
+from mlx_vlm.models.hy_v4.fused_switch_glu import FusedSwitchGLU
+from mlx_vlm.models.inkling.language import InklingSwitchGLU
 from mlx_vlm.models.laguna.language import LagunaPackedSwitchGLU
+from mlx_vlm.models.minimax_m3_vl.language import (
+    MiniMaxPackedSwitchGLU,
+    MiniMaxSwiGLUOAI,
+)
+from mlx_vlm.models.openai_privacy_filter.config import (
+    ModelConfig as PrivacyFilterConfig,
+)
+from mlx_vlm.models.openai_privacy_filter.openai_privacy_filter import (
+    Experts as PrivacyFilterExperts,
+)
+from mlx_vlm.models.switch_layers import SwitchGLU
 from mlx_vlm.moe_offload import ExpertStore, patch_model, plan, repack
 from mlx_vlm.utils import load_model, save_weights
+
+
+@pytest.fixture(params=[None, mx.cpu], ids=["default", "cpu"])
+def offload_device(request):
+    with mx.stream(request.param or mx.default_device()):
+        yield
+
+
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("scale_name", ["weight_scale_2", "weight_global_scale"])
+@pytest.mark.parametrize("scale_layout", ["scalar", "expert", "expert_column", "row"])
+@pytest.mark.parametrize("decode", [False, True])
+def test_native_nvfp4_global_scales_survive_repack(
+    tmp_path, fused, scale_name, scale_layout, decode, offload_device
+):
+    from mlx.utils import tree_flatten
+
+    from mlx_vlm.quantization.nvfp4 import replace_scaled_quantized_linears
+
+    model = nn.Module()
+    model.model = nn.Module()
+    layer = nn.Module()
+    layer.switch_mlp = (LagunaPackedSwitchGLU if fused else SwitchGLU)(64, 64, 4)
+    model.model.layers = [layer]
+    nn.quantize(model, mode="nvfp4", group_size=16, bits=4)
+    scales = {}
+    for path, value in tree_flatten(model.parameters()):
+        if path.endswith(".weight"):
+            scale = mx.array([0.137, 0.348, 0.779, 0.29])
+            if scale_layout == "scalar":
+                scale = mx.array(0.137)
+            elif scale_layout == "expert_column":
+                scale = scale[:, None]
+            elif scale_layout == "row":
+                # Sanitizing separately scaled gate/up weights produces this
+                # layout. Vary every row so copying or swapping halves fails.
+                scale = scale[:, None] * mx.linspace(0.7, 1.3, value.shape[-2])
+            scales[path.removesuffix("weight") + scale_name] = scale
+    replace_scaled_quantized_linears(model, scales)
+    x = mx.random.normal((1, 3, 64)).astype(mx.bfloat16)
+    indices = mx.array([[[0, 1], [2, 3], [0, 3]]])
+    if decode:
+        x, indices = x[:, :1], indices[:, :1]
+    expected = layer.switch_mlp(x, indices)
+    mx.eval(expected)
+    build, out = tmp_path / "build", tmp_path / "out"
+    save_weights(str(build), model)
+    (build / "config.json").write_text(
+        json.dumps({"quantization": {"group_size": 16, "bits": 4, "mode": "nvfp4"}})
+    )
+    repack(str(build), str(out))
+    patch_model(model, str(out), expert_cache_gb=0.00001)
+    actual = layer.switch_mlp(x, indices)
+    _assert_offload_parity(expected, actual)
+    # The same experts must still produce the same result after eviction/reload.
+    _assert_offload_parity(expected, layer.switch_mlp(x, indices))
 
 
 def _deepseek_config():
@@ -49,7 +120,7 @@ def _deepseek_config():
     )
 
 
-def _build_and_repack(root, model=None, config=None):
+def _build_and_repack(root, model=None, config=None, quant_paths=("switch_mlp",)):
     if model is None:
         config = _deepseek_config()
         model = deepseek_v3.Model(config)
@@ -58,7 +129,7 @@ def _build_and_repack(root, model=None, config=None):
         model,
         group_size=32,
         bits=4,
-        class_predicate=lambda path, module: "switch_mlp" in path
+        class_predicate=lambda path, module: any(q in path for q in quant_paths)
         and hasattr(module, "to_quantized"),
     )
     mx.eval(model.parameters())
@@ -180,13 +251,36 @@ def test_expert_store_get_is_thread_safe(tmp_path):
         thread.join()
     assert errors == []
     assert sum(map(len, results)) == n_threads * n_iters
+    comparisons = []
     for thread_results in results:
         for key, val in thread_results:
             for got, want in zip(val, reference[key]):
                 for g, w in zip(got, want):
                     assert (g is None) == (w is None)
                     if g is not None:
-                        assert mx.array_equal(g, w)
+                        comparisons.append(mx.array_equal(g, w))
+    # Check every returned tensor with one synchronization instead of thousands.
+    assert mx.all(mx.stack(comparisons)).item()
+
+
+def test_selected_experts_reload_once_and_survive_tiny_cache(tmp_path):
+    _, offload = _build_and_repack(tmp_path)
+    store = ExpertStore(str(offload), expert_cache_bytes=1)
+    first = store.get_many(1, [0, 2, 0])
+    mx.eval(first)
+    assert store.stats()["resident_bytes"] <= 1
+    # Both experts were evicted. Reloading them must parse the layer only once,
+    # and eviction must not invalidate tensors returned to the current graph.
+    with patch("mlx.core.load", wraps=mx.load) as load:
+        second = store.get_many(1, [0, 2])
+        assert load.call_count == 1
+    for j in first:
+        for got, want in zip(second[j], first[j]):
+            for g, w in zip(got, want):
+                if w is not None:
+                    assert mx.array_equal(g, w).item()
+    assert store.stats()["metadata_reloads"] == 1
+    assert store.stats()["resident_bytes"] <= 1
 
 
 def test_fused_switch_layer_offloads_correctly(tmp_path):
@@ -303,3 +397,232 @@ def test_repack_sanitizes_raw_mixtral_style_expert_naming(tmp_path):
     offloaded = load_model(offload_raw)
     assert getattr(offloaded, "moe_offload_store", None) is not None
     _assert_offload_parity(resident, offloaded(prompt).logits)
+
+
+def test_repack_rewrites_stale_source_weight_index(tmp_path):
+    config = _deepseek_config()
+    model = deepseek_v3.Model(config)
+    mx.eval(model.parameters())
+    nn.quantize(
+        model,
+        group_size=32,
+        bits=4,
+        class_predicate=lambda path, module: "switch_mlp" in path
+        and hasattr(module, "to_quantized"),
+    )
+    mx.eval(model.parameters())
+    build, offload = tmp_path / "build", tmp_path / "offload"
+    save_weights(str(build), model)
+    config_dict = dataclasses.asdict(config)
+    config_dict["quantization"] = dict(group_size=32, bits=4, mode="affine")
+    (build / "config.json").write_text(json.dumps(config_dict))
+
+    index_path = build / "model.safetensors.index.json"
+    index = json.loads(index_path.read_text())
+    weights = {
+        k: mx.array(v) for k, v in mx.load(str(build / "model.safetensors")).items()
+    }
+    mx.eval(list(weights.values()))
+    sidecar_key = "language_model.model.embed_tokens.weight"
+    assert sidecar_key in weights
+    (build / "sidecar").mkdir()
+    mx.save_safetensors(
+        str(build / "sidecar" / "extra.safetensors"),
+        {sidecar_key: weights[sidecar_key]},
+    )
+    mx.save_safetensors(
+        str(build / "model.safetensors"),
+        {k: v for k, v in weights.items() if k != sidecar_key},
+    )
+    index["weight_map"][sidecar_key] = "sidecar/extra.safetensors"
+    index_path.write_text(json.dumps(index))
+
+    repack(str(build), str(offload))
+    assert (offload / "sidecar" / "extra.safetensors").exists()
+    rewritten = json.loads((offload / "model.safetensors.index.json").read_text())
+    shards = set(rewritten["weight_map"].values())
+    assert shards and all(s.startswith("resident-") for s in shards)
+    assert sidecar_key in rewritten["weight_map"]
+    assert not any(
+        "switch_mlp.gate_proj.weight" in k for k in rewritten["weight_map"]
+    ), "routed experts must not be named in the resident index"
+
+    prompt = mx.array([[1, 2, 3, 4, 5, 6]])
+    resident = load_model(build)(prompt).logits
+    mx.eval(resident)
+    offloaded = load_model(offload)
+    assert getattr(offloaded, "moe_offload_store", None) is not None
+    _assert_offload_parity(resident, offloaded(prompt).logits)
+
+
+_H, _I, _E, _K = 32, 64, 4, 2
+
+# Every switch layer patch_model can swap, so a differently shaped one cannot
+# reach the swap without a parity test. Keyed by what builds it.
+_SWAPPABLE_BLOCKS = {
+    "switch_glu": lambda: SwitchGLU(_H, _I, _E),
+    "inkling": lambda: InklingSwitchGLU(_H, _I, _E),
+    "hy_v4": lambda: FusedSwitchGLU(_H, _I, _E),
+    "laguna": lambda: LagunaPackedSwitchGLU(_H, _I, _E),
+    "minimax_m3_vl": lambda: MiniMaxPackedSwitchGLU(_H, _I, _E, MiniMaxSwiGLUOAI()),
+    "diffusion_gemma": lambda: DiffusionGemmaExperts(
+        diffusion_gemma.TextConfig(
+            hidden_size=_H,
+            moe_intermediate_size=_I,
+            num_experts=_E,
+            top_k_experts=_K,
+        )
+    ),
+    "openai_privacy_filter": lambda: PrivacyFilterExperts(
+        PrivacyFilterConfig(
+            hidden_size=_H,
+            intermediate_size=_I,
+            num_local_experts=_E,
+            num_experts_per_tok=_K,
+        )
+    ),
+}
+
+
+def _wrap_block(block):
+    """A model exposing ``block`` at ``model.layers.0.experts``."""
+
+    class Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.experts = block
+
+    class InnerModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = [Layer()]
+
+    class BlockModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = {"model_type": "switch_block_probe"}
+            self.model_type = "switch_block_probe"
+            self.model = InnerModel()
+
+    return BlockModel()
+
+
+@pytest.mark.parametrize("family", sorted(_SWAPPABLE_BLOCKS))
+@pytest.mark.parametrize("tokens", [1, 5])
+def test_every_swappable_block_matches_resident(tmp_path, family, tokens):
+    model = _wrap_block(_SWAPPABLE_BLOCKS[family]())
+    _, offload = _build_and_repack(
+        tmp_path, model, model.config, quant_paths=("experts",)
+    )
+    x = mx.random.normal((tokens, _H)).astype(mx.bfloat16)
+    indices = mx.random.randint(0, _E, (tokens, _K)).astype(mx.uint32)
+    mx.eval(x, indices)
+    resident = model.model.layers[0].experts(x, indices)
+    mx.eval(resident)
+
+    store = patch_model(model, str(offload))
+    assert store.swapped == 1
+    _assert_offload_parity(resident, model.model.layers[0].experts(x, indices))
+
+
+@pytest.mark.parametrize("shape", [(1, 1), (2, 9)])
+def test_nontrivial_expert_scales_preserve_bfloat16(tmp_path, shape, offload_device):
+    mx.random.seed(53)
+    block = InklingSwitchGLU(64, 128, 16, bias=True)
+    for projection in (block.gate_proj, block.up_proj, block.down_proj):
+        projection.bias = mx.random.normal(projection.bias.shape) * 0.1
+    block.set_dtype(mx.bfloat16)
+    block.gate_scale = mx.linspace(0.17, 1.7, 16)
+    block.out_scale = mx.linspace(0.23, 1.2, 16)
+    model = _wrap_block(block)
+    _, offload = _build_and_repack(
+        tmp_path, model, model.config, quant_paths=("experts",)
+    )
+    x = mx.random.normal((*shape, 64)).astype(mx.bfloat16)
+    # Repeated routes, multiple batch axes, and more than eight unique experts.
+    base = mx.arange(shape[0] * shape[1]).reshape(*shape, 1)
+    indices = ((base + mx.array([0, 0, 5, 11])) % 16).astype(mx.uint32)
+    resident = block(x, indices)
+    mx.eval(resident)
+    patch_model(model, str(offload), expert_cache_gb=1e-9)
+    for _ in range(2):
+        _assert_offload_parity(resident, model.model.layers[0].experts(x, indices))
+
+
+@pytest.mark.parametrize("tokens", [1, 9])
+def test_dense_bfloat16_experts_still_run_on_cpu(tmp_path, tokens):
+    with mx.stream(mx.cpu):
+        mx.random.seed(53)
+        block = SwitchGLU(64, 128, 16)
+        block.set_dtype(mx.bfloat16)
+        model = _wrap_block(block)
+        x = mx.random.normal((tokens, 64)).astype(mx.bfloat16)
+        indices = (mx.arange(tokens * 2).reshape(tokens, 2) % 16).astype(mx.uint32)
+        # CPU gather_mm cannot evaluate BF16. Use the original dense matmuls
+        # as the reference, which supported CPU offloading before batching.
+        expected = []
+        for token, experts in enumerate(indices.tolist()):
+            routed = []
+            for expert in experts:
+                gate = x[token : token + 1] @ block.gate_proj.weight[expert].T
+                up = x[token : token + 1] @ block.up_proj.weight[expert].T
+                routed.append(
+                    block.activation(up, gate) @ block.down_proj.weight[expert].T
+                )
+            expected.append(mx.concatenate(routed))
+        expected = mx.stack(expected)
+        mx.eval(expected)
+        build, offload = tmp_path / "build", tmp_path / "offload"
+        save_weights(str(build), model)
+        (build / "config.json").write_text(json.dumps(model.config))
+        repack(str(build), str(offload))
+        patch_model(model, str(offload), expert_cache_gb=1e-9)
+        for _ in range(2):
+            actual = model.model.layers[0].experts(x, indices)
+            assert actual.dtype == mx.bfloat16
+            _assert_offload_parity(expected, actual)
+
+
+def test_patch_model_refuses_a_layer_that_declares_no_gating(tmp_path):
+    model = _wrap_block(SwitchGLU(_H, _I, _E))
+    _, offload = _build_and_repack(
+        tmp_path, model, model.config, quant_paths=("experts",)
+    )
+    del model.model.layers[0].experts.activation
+    with pytest.raises(ValueError, match="(?i)activation"):
+        patch_model(model, str(offload))
+
+
+def test_diffusion_gemma_layer_applies_router_weights():
+    """The block returns [..., K, D]; its caller must still weight and sum."""
+    config = diffusion_gemma.TextConfig(
+        hidden_size=_H,
+        moe_intermediate_size=_I,
+        num_experts=_E,
+        top_k_experts=_K,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=16,
+        global_head_dim=16,
+        intermediate_size=_I,
+        vocab_size=128,
+    )
+    layer = DiffusionGemmaLayer(config, 0)
+    mx.eval(layer.parameters())
+    x = mx.random.normal((1, 4, _H))
+    mx.eval(x)
+
+    indices = mx.zeros((4, _K), dtype=mx.uint32)
+    base = mx.full((4, _K), 0.25)
+
+    def run(weights):
+        layer.router = lambda _flat: (indices, weights)
+        out = layer(x)
+        mx.eval(out)
+        return out
+
+    once, twice = run(base), run(base * 2.0)
+    # Doubling the router weights must change the layer's output; if the
+    # combine were dropped, the expert branch would ignore them entirely.
+    assert float(mx.abs(once - twice).max()) > 1e-4

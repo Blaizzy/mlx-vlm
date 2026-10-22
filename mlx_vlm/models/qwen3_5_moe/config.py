@@ -54,6 +54,7 @@ class TextConfig(BaseModelConfig):
         }
     )
     full_attention_interval: int = 4
+    norm_topk_prob: bool = True
 
     def __post_init__(self):
         if self.rope_parameters:

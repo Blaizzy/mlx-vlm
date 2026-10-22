@@ -24,7 +24,7 @@ from threading import Event, Lock, Thread, Timer
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
-import httpx
+import httpx2
 import mlx.core as mx
 import numpy as np
 import pytest
@@ -65,6 +65,40 @@ from mlx_vlm.server.runtime_config import RuntimeConfig
 from mlx_vlm.tests.test_processors import MINICPM_MULTICALL
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
 from mlx_vlm.tools import load_tool_module, process_tool_calls
+
+
+def test_cancellation_is_acknowledged_only_after_removal():
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen._cancelled = {7}
+    gen._cancel_lock = Lock()
+    rqueue = Queue()
+    active = {7: {"rqueue": rqueue}}
+    batch_gen = NS(remove=MagicMock(side_effect=[False, True]))
+
+    gen._apply_cancellations(batch_gen, active)
+    assert 7 in active
+    assert rqueue.empty()
+    assert gen._cancelled == {7}
+
+    gen._apply_cancellations(batch_gen, active)
+    assert active == {}
+    assert rqueue.get_nowait() is None
+    assert rqueue.empty()
+    assert gen._cancelled == set()
+    assert batch_gen.remove.call_count == 2
+
+
+def test_cancellation_of_finished_request_is_ignored():
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen._cancelled = {7}
+    gen._cancel_lock = Lock()
+    batch_gen = NS(remove=MagicMock())
+
+    gen._apply_cancellations(batch_gen, {})
+
+    batch_gen.remove.assert_not_called()
+    assert gen._cancelled == set()
+
 
 _MUSE_RESPONSE_TEMPLATE = {
     "defaults": {"role": "assistant"},
@@ -288,6 +322,176 @@ def _chat_events(response, reason):
 
 def _assert_fields(actual, **expected):
     assert {key: actual[key] for key in expected} == expected
+
+
+class TestImageProcessingOptions:
+    @pytest.mark.parametrize("api", ["chat", "responses", "messages"])
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("batched", [False, True])
+    def test_endpoints_forward_options(self, client, api, stream, batched):
+        options = dict(min_pixels=1048576, max_pixels=4194304, resize_shape=[1024])
+        expected = dict(options, resize_shape=(1024, 1024))
+        worker = _streaming([_token("done", finish_reason="stop")]) if batched else None
+        with _endpoint(generator=worker) as fake:
+            response = _post(client, api, stream=stream, **options)
+        assert response.status_code == 200, response.text
+        if worker is not None:
+            call = worker.generate.call_args
+            args = call.kwargs.get("args") or call.args[3]
+            assert args.preprocessing_kwargs() == expected
+            if stream:
+                checked = worker.validate_context_budget.call_args.kwargs["args"]
+                assert checked.preprocessing_kwargs() == expected
+        else:
+            call = fake.stream if stream else fake.generate
+            _assert_fields(call.call_args.kwargs, **expected)
+
+    @pytest.mark.parametrize("api", ["chat", "responses", "messages"])
+    @pytest.mark.parametrize(
+        "options",
+        [dict(min_pixels=0), dict(max_pixels=-1), dict(min_pixels=100, max_pixels=50)],
+    )
+    def test_invalid_pixel_limits(self, client, api, options):
+        with _endpoint() as fake:
+            response = _post(client, api, **options)
+        assert response.status_code in (400, 422), response.text
+        fake.generate.assert_not_called()
+
+    def test_defaults_overrides_and_effective_validation(self, monkeypatch):
+        for key in ("MLX_VLM_MIN_PIXELS", "MLX_VLM_MAX_PIXELS"):
+            monkeypatch.delenv(key, raising=False)
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
+        assert server._build_gen_args(_chat_request()).preprocessing_kwargs() == {}
+        monkeypatch.setenv("MLX_VLM_MIN_PIXELS", "1048576")
+        monkeypatch.setenv("MLX_VLM_MAX_PIXELS", "4194304")
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
+        for options, expected in [
+            ({}, dict(min_pixels=1048576, max_pixels=4194304)),
+            (dict(min_pixels=None), dict(min_pixels=1048576, max_pixels=4194304)),
+            (dict(min_pixels=65536), dict(min_pixels=65536, max_pixels=4194304)),
+        ]:
+            args = server._build_gen_args(_chat_request(**options))
+            assert args.preprocessing_kwargs() == expected
+        with pytest.raises(ValueError, match="min_pixels must not exceed max_pixels"):
+            server._build_gen_args(_chat_request(max_pixels=65536))
+
+    @pytest.mark.parametrize(
+        "options,valid",
+        [
+            (["--min-pixels", "1048576", "--max-pixels", "4194304"], True),
+            (["--min-pixels", "0"], False),
+            (["--min-pixels", "100", "--max-pixels", "50"], False),
+        ],
+    )
+    def test_cli(self, monkeypatch, options, valid):
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
+        monkeypatch.setattr(sys, "argv", ["mlx_vlm.server", *options])
+        with patch.dict(os.environ), patch.object(cli.uvicorn, "run") as run:
+            for key in ("MLX_VLM_MIN_PIXELS", "MLX_VLM_MAX_PIXELS"):
+                os.environ.pop(key, None)
+            if valid:
+                cli.main()
+                assert os.environ["MLX_VLM_MIN_PIXELS"] == "1048576"
+                assert os.environ["MLX_VLM_MAX_PIXELS"] == "4194304"
+                assert server.runtime.config.image_pixel_limits() == dict(
+                    min_pixels=1048576, max_pixels=4194304
+                )
+                server.runtime.config.apply_changes(
+                    dict(min_pixels=None, max_pixels=None)
+                )
+                server.runtime.config.apply_changes({}, op="replace")
+                assert server.runtime.config.image_pixel_limits() == dict(
+                    min_pixels=1048576, max_pixels=4194304
+                )
+                run.assert_called_once()
+            else:
+                with pytest.raises(SystemExit):
+                    cli.main()
+                run.assert_not_called()
+
+    def test_worker_preprocessing_and_context_budget(self, monkeypatch):
+        prepare = Mock(return_value={"input_ids": np.zeros((1, 1024), np.int32)})
+        monkeypatch.setattr(generation, "prepare_inputs", prepare)
+        monkeypatch.setenv("MAX_KV_SIZE", "2048")
+        gen = _ready_generator(
+            model=NS(config=NS(model_type="qwen3_5")), processor=NS()
+        )
+        gen._cpu_preprocess = Generator._cpu_preprocess.__get__(gen)
+        queued = _capture_requests(gen)
+        options = dict(
+            min_pixels=1048576, max_pixels=4194304, resize_shape=(1024, 1024)
+        )
+        args = Args(max_tokens=1, **options)
+        gen.validate_context_budget("prompt", images=["same.png"], args=args)
+        _, tokens = gen.generate("prompt", images=["same.png"], args=args)
+        tokens.close()
+        assert queued[0].prompt_tokens == 1024
+        assert prepare.call_count == 2
+        for call in prepare.call_args_list:
+            _assert_fields(call.kwargs, **options)
+        monkeypatch.setenv("MAX_KV_SIZE", "512")
+        with pytest.raises(server.PromptTooLongError):
+            gen.validate_context_budget("prompt", images=["same.png"], args=args)
+
+    @pytest.mark.parametrize("api", ["responses/input_tokens", "messages/count_tokens"])
+    @pytest.mark.parametrize("batched", [False, True])
+    def test_token_count_options(self, client, api, batched):
+        options = dict(min_pixels=1048576, max_pixels=4194304)
+        prepare = Mock(return_value={"input_ids": np.zeros((1, 1024), np.int32)})
+        worker = NS(_cpu_preprocess=prepare) if batched else None
+        module = openai if api.startswith("responses") else anthropic
+        with (
+            _endpoint(generator=worker),
+            patch.object(module, "prepare_inputs", prepare),
+        ):
+            response = _post(client, "/v1/" + api, **options)
+        assert response.status_code == 200, response.text
+        assert response.json()["input_tokens"] == 1024
+        _assert_fields(prepare.call_args.kwargs, **options)
+
+    @pytest.mark.parametrize(
+        "geometry",
+        [
+            "pixel_values",
+            "image_grid_thw",
+            "image_position_ids",
+            "image_grid_hw",
+            "image_permutations",
+        ],
+    )
+    def test_worker_cache_separates_processed_resolutions(self, geometry):
+        from mlx_vlm.vision_cache import VisionFeatureCache
+
+        cache = VisionFeatureCache()
+        encoded = []
+
+        def embed(ids, pixels, **kwargs):
+            key = kwargs["_image_key"]
+            marker = (
+                pixels.shape[0]
+                if geometry == "pixel_values"
+                else kwargs[geometry].item()
+            )
+            features = cache.get(key)
+            if features is None:
+                features = mx.full((pixels.shape[0], 4), marker)
+                cache.put(key, features)
+                encoded.append(key)
+            assert features.shape[0] == pixels.shape[0]
+            assert features[0, 0].item() == marker
+            return NS(to_dict=lambda: {"inputs_embeds": features})
+
+        gen = _generator(model=NS(get_input_embeddings=embed), vision_cache=cache)
+        for size in (256, 1024, 256):
+            inputs = dict(input_ids=mx.array([[1]]), pixel_values=mx.zeros((256, 3)))
+            inputs[geometry] = (
+                mx.zeros((size, 3)) if geometry == "pixel_values" else mx.array([size])
+            )
+            gen._gpu_embed(
+                inputs,
+                images=["same.png"],
+            )
+        assert len(encoded) == len(cache) == 2
 
 
 def _sse_events(body):
@@ -972,6 +1176,7 @@ class TestModelDiscovery:
 
     @pytest.mark.parametrize("use_cli_paths", [False, True])
     def test_cli_custom_model_paths(self, monkeypatch, tmp_path, use_cli_paths):
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
         monkeypatch.setattr(os, "environ", dict(os.environ))
         monkeypatch.setenv("MLX_VLM_MODEL_PATHS", "/existing/models")
         paths = [str(tmp_path / "model with spaces"), str(tmp_path / "other")]
@@ -1225,6 +1430,36 @@ def test_image_editing_forwards_model_options(client, monkeypatch, options):
     assert request.extra == options
     assert request.width == request.height == 512
     assert request.steps == 30
+
+
+@pytest.mark.parametrize("method", ["generations", "edits"])
+def test_flux3_prompt_upsampling_options_and_revised_prompt(
+    client, monkeypatch, method
+):
+    options = {
+        "upsample_prompt": False,
+        "prompt_expansion_model": "local-flux3-pup",
+        "boxes": [{"id": "pot", "bbox": [0.1, 0.2, 0.8, 0.9]}],
+    }
+    result = _fake_image_result(seed=7)
+    result.metadata["revised_prompt"] = "A detailed scene caption."
+    generate = Mock(return_value=result)
+    edit = method == "edits"
+    monkeypatch.setattr(openai, "edit_image" if edit else "generate_image", generate)
+    with _endpoint(model_type="flux3"):
+        response = client.post(
+            f"/v1/images/{method}",
+            json={
+                "model": "flux3-klein",
+                "prompt": "a teapot",
+                "seed": 7,
+                **({"image": "reference.png"} if edit else {}),
+                **options,
+            },
+        )
+    assert response.status_code == 200
+    assert generate.call_args.args[1].extra == options
+    assert response.json()["data"][0]["revised_prompt"] == "A detailed scene caption."
 
 
 @pytest.mark.parametrize("api", ["/responses", "/chat/completions"])
@@ -1749,7 +1984,11 @@ def test_responses_native_tool_calls(client, kind, stream):
 
 def _completed_response(response):
     events = _data(response)
-    final = next(e["response"] for e in events if e["type"] == "response.completed")
+    final = next(
+        e["response"]
+        for e in events
+        if e["type"] in ("response.completed", "response.incomplete")
+    )
     output = final["output"]
     for kind in ("added", "done"):
         items = [e for e in events if e["type"] == f"response.output_item.{kind}"]
@@ -1866,6 +2105,8 @@ def test_responses_truncated_preopened_reasoning(client, continuous, stream):
         ),
     ):
         response = _response(client, stream=stream)
+    assert response["status"] == "incomplete"
+    assert response["incomplete_details"] == {"reason": "max_output_tokens"}
     assert response["output_text"] == ""
     assert len(response["output"]) == 1
     item = response["output"][0]
@@ -2406,17 +2647,122 @@ class TestCompaction:
         )
         mocked.generate.assert_not_called()
 
-    def test_pending_parallel_tools_cannot_be_split(self):
+    @pytest.fixture(params=["chat", "function", "shell", "apply_patch", "tool_result"])
+    def tool_group(self, request):
+        def make(ids, output="recent evidence"):
+            if request.param == "chat":
+                calls = [
+                    dict(
+                        type="message",
+                        role="assistant",
+                        content="",
+                        tool_calls=[
+                            dict(
+                                id=id,
+                                type="function",
+                                function=dict(name="inspect", arguments="{}"),
+                            )
+                            for id in ids
+                        ],
+                    )
+                ]
+                results = [
+                    dict(type="message", role="tool", tool_call_id=id, content=output)
+                    for id in ids
+                ]
+            else:
+                kind = "function" if request.param == "tool_result" else request.param
+                calls = [
+                    dict(
+                        type=f"{kind}_call", call_id=id, name="inspect", arguments="{}"
+                    )
+                    for id in ids
+                ]
+                results = [
+                    dict(
+                        type=(
+                            "tool_result"
+                            if request.param == "tool_result"
+                            else f"{kind}_call_output"
+                        ),
+                        call_id=id,
+                        output=output,
+                    )
+                    for id in ids
+                ]
+            return calls, results
+
+        return make
+
+    def test_pending_parallel_tools_cannot_be_split(self, tool_group):
+        calls, results = tool_group(["a", "b"])
         items = [
             _compaction_message("start"),
-            {"type": "function_call", "call_id": "a"},
-            {"type": "function_call", "call_id": "b"},
-            {"type": "function_call_output", "call_id": "a"},
+            *calls,
+            results[0],
             _compaction_message("steering during tools"),
-            {"type": "function_call_output", "call_id": "b"},
+            results[1],
             _compaction_message("next"),
         ]
-        assert compaction.safe_boundaries(items) == [0, 6]
+        for keep_last_group in (False, True):
+            assert compaction.safe_boundaries(
+                items, keep_last_group=keep_last_group
+            ) == [0, len(items) - 1]
+
+    @pytest.mark.parametrize("pending", [False, True])
+    @pytest.mark.parametrize("retain_tokens", [0, 500])
+    def test_single_turn_tool_compaction_preserves_protected_context(
+        self, tool_group, pending, retain_tokens
+    ):
+        instruction = _compaction_message("Keep the constraints.", "system")
+        request = _compaction_message("Inspect the project; never edit secrets.env.")
+        calls, results = tool_group(["old"], "old evidence " * 1000)
+        head = [instruction, request, *calls, *results]
+        calls, results = tool_group(["recent"])
+        tail = [
+            *calls,
+            *results,
+            _compaction_message("Checking the evidence.", "assistant"),
+        ]
+        if pending:
+            calls, results = tool_group(["a", "b"])
+            tail += [*calls, results[0]]
+        items = head + tail
+        original = copy.deepcopy(items)
+        summarize = AsyncMock(return_value=("Earlier evidence reviewed.", None))
+
+        async def count(items):
+            return len(json.dumps(items))
+
+        compact = partial(
+            compaction.compact,
+            count=count,
+            summarize=summarize,
+            keep_tokens=0,
+            retain_tokens=retain_tokens,
+        )
+        with pytest.raises(
+            compaction.ContextBudgetError, match="no room for a summary"
+        ):
+            asyncio.run(
+                compact(
+                    items,
+                    target_tokens=asyncio.run(count([instruction, request] + tail)),
+                )
+            )
+        summarize.assert_not_called()
+        result = asyncio.run(compact(items, target_tokens=3000))
+        summarize.assert_awaited_once_with(head)
+        assert result.changed and result.after_tokens < 3000
+        assert result.items[:2] == [instruction, request]
+        assert result.items[3:] == tail
+        assert result.items.count(request) == 1 and items == original
+        capsule = _seal_context(result.items, covered=result.covered)
+        assert _resolve_context([request, capsule]) == result.items
+        summarize.reset_mock()
+        unchanged = asyncio.run(compact(result.items, target_tokens=3000))
+        assert not unchanged.changed
+        summarize.assert_not_called()
 
     @pytest.mark.parametrize("api", ["standalone", "trigger", "automatic"])
     @pytest.mark.parametrize("limit", [4096, 16384])
@@ -2570,8 +2916,93 @@ class TestCompaction:
         assert mocked.generate.call_count == 1
 
     @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("api", ["responses", "chat"])
+    @pytest.mark.parametrize("limit", [2048, 4096, 8192, 128000])
+    @pytest.mark.parametrize("output", [64, 128000, 256000])
+    def test_max_output_is_a_ceiling_for_short_prompts(
+        self, mocked, client, monkeypatch, api, stream, limit, output
+    ):
+        mocked.config.max_position_embeddings = 128000
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", limit)
+        options = dict(
+            stream=stream,
+            context_management=[
+                {"type": "compaction", "compact_threshold": limit * 3 // 4}
+            ],
+        )
+        if api == "chat":
+            options.update(
+                messages=[_msg("Are you ready to help me with some coding?")],
+                max_tokens=output,
+            )
+        else:
+            options.update(
+                input="Are you ready to help me with some coding?",
+                max_output_tokens=output,
+            )
+        original = copy.deepcopy(options)
+        response = _post(client, api, **options)
+        assert response.status_code == 200, response.text
+        assert options == original
+        assert mocked.generate.call_count == (0 if stream else 1)
+        answer = mocked.stream.call_args if stream else mocked.generate.call_args
+        prompt_tokens = len(answer.kwargs["prompt"]) // 4
+        assert answer.kwargs["max_tokens"] == min(output, limit - prompt_tokens)
+        assert "Conversation handoff" not in answer.kwargs["prompt"]
+
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("api", ["responses", "chat"])
+    @pytest.mark.parametrize("offset", [-1, 0, 1])
+    def test_actual_input_triggers_compaction_and_output_uses_compacted_size(
+        self, mocked, client, monkeypatch, api, stream, offset
+    ):
+        items = [_compaction_message("older evidence " * 150) for _ in range(5)]
+        items.append(_compaction_message("Continue"))
+        before = mocked.count(input=items)["input_tokens"]
+        limit = before * 2
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", limit)
+        options = dict(
+            stream=stream,
+            context_management=[
+                {"type": "compaction", "compact_threshold": before + offset}
+            ],
+        )
+        if api == "chat":
+            options.update(messages=items, max_tokens=limit)
+        else:
+            options.update(input=items, max_output_tokens=limit)
+        response = _post(client, api, **options)
+        assert response.status_code == 200, response.text
+        should_compact = offset <= 0
+        assert mocked.generate.call_count == int(should_compact) + int(not stream)
+        answer = mocked.stream.call_args if stream else mocked.generate.call_args
+        after = len(answer.kwargs["prompt"]) // 4
+        assert answer.kwargs["max_tokens"] == limit - after
+        assert ("Conversation handoff" in answer.kwargs["prompt"]) == should_compact
+        if should_compact:
+            assert after < before
+
+    @pytest.mark.parametrize("api", ["responses", "chat"])
+    def test_required_input_must_leave_room_for_generation(
+        self, mocked, api, monkeypatch
+    ):
+        items = [_compaction_message("protected input " * 500)]
+        before = mocked.count(input=items)["input_tokens"]
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", before)
+        options = dict(
+            context_management=[{"type": "compaction", "compact_threshold": 1}]
+        )
+        if api == "chat":
+            options.update(messages=items, max_tokens=before)
+        else:
+            options.update(input=items, max_output_tokens=before)
+        response = mocked.request(api, status=400, **options)
+        assert "Protected conversation" in response["detail"]
+        mocked.generate.assert_not_called()
+
+    @pytest.mark.parametrize("stream", [False, True])
     @pytest.mark.parametrize("api", ["responses", "chat", "chat-default"])
-    def test_output_budget_overrides_compaction_threshold(
+    def test_unused_output_does_not_override_compaction_threshold(
         self, mocked, client, monkeypatch, api, stream
     ):
         items = [_compaction_message("old evidence " * 150) for _ in range(6)]
@@ -2591,24 +3022,33 @@ class TestCompaction:
             options.update(input=items, max_output_tokens=256)
         response = _post(client, api, **options)
         assert response.status_code == 200, response.text
-        assert mocked.generate.call_count == (1 if stream else 2)
+        assert mocked.generate.call_count == (0 if stream else 1)
         answer_call = mocked.stream.call_args if stream else mocked.generate.call_args
-        assert len(answer_call.kwargs["prompt"]) // 4 + 256 <= before + 32
-        assert "Conversation handoff" in answer_call.kwargs["prompt"]
+        assert answer_call.kwargs["max_tokens"] == 32
+        assert len(answer_call.kwargs["prompt"]) // 4 + 32 == before + 32
+        assert "Conversation handoff" not in answer_call.kwargs["prompt"]
 
+    @pytest.mark.parametrize("single_turn", [False, True])
     @pytest.mark.parametrize("stream", [False, True])
     @pytest.mark.parametrize("mode", ["automatic", "trigger", "chat"])
     def test_oversized_history_uses_bounded_summary_calls(
-        self, mocked, client, monkeypatch, mode, stream
+        self, mocked, client, monkeypatch, mode, stream, single_turn
     ):
         monkeypatch.setattr(server.runtime.config, "max_kv_size", 2048)
         items = [_compaction_message("Keep the constraints.", "system")]
+        if single_turn:
+            items.append(_compaction_message("Inspect all six batches."))
         for index in range(6):
-            items += [
-                _compaction_message(f"batch-{index} " + "evidence " * 200),
-                *_function_result("done", name="read_file", call_id=f"c{index}"),
-            ]
-        items.append(_compaction_message("Continue"))
+            evidence = f"batch-{index} " + "evidence " * 200
+            if not single_turn:
+                items.append(_compaction_message(evidence))
+            items += _function_result(
+                evidence if single_turn else "done",
+                name="read_file",
+                call_id=f"c{index}",
+            )
+        if not single_turn:
+            items.append(_compaction_message("Continue"))
         original = copy.deepcopy(items)
         options = dict(stream=stream)
         api = "responses"
@@ -2617,8 +3057,7 @@ class TestCompaction:
         elif mode == "chat":
             api = "chat"
             options.update(
-                messages=[_compaction_message("old evidence " * 180) for _ in range(10)]
-                + [items[-1]],
+                messages=_response_items_to_chat(items)[0],
                 max_tokens=64,
             )
         else:
@@ -2935,8 +3374,8 @@ class TestCompaction:
     @pytest.mark.parametrize(
         "threshold, output_tokens, status",
         [
-            pytest.param(1, 32768, 400, id="budget-above-threshold"),
-            pytest.param(100000, 32768, 400, id="budget-below-threshold"),
+            pytest.param(1, 0, 400, id="zero-output"),
+            pytest.param(100000, -1, 400, id="negative-output"),
             pytest.param(0, 64, 422, id="zero-threshold"),
             pytest.param(-1, 64, 422, id="negative-threshold"),
             pytest.param("bad", 64, 422, id="nonnumeric-threshold"),
@@ -3273,7 +3712,7 @@ class TestCompaction:
                 "responses",
                 input=_compaction_history(),
                 stream=True,
-                max_output_tokens=32768,
+                max_output_tokens=0,
                 context_management=[{"type": "compaction", "compact_threshold": 1}],
             )
         )
@@ -3372,7 +3811,7 @@ class TestCompaction:
                     url = f"http://127.0.0.1:{port}"
                     headers = {"X-APC-Tenant": "compaction-test"}
                     with (
-                        httpx.Client(
+                        httpx2.Client(
                             base_url=url, timeout=180, headers=headers
                         ) as client,
                         OpenAI(
@@ -3386,7 +3825,7 @@ class TestCompaction:
                             try:
                                 if client.get("/health", timeout=1).is_success:
                                     break
-                            except httpx.TransportError:
+                            except httpx2.TransportError:
                                 pass
                             time.sleep(0.25)
                         else:
@@ -3499,7 +3938,7 @@ class TestCompaction:
                     if event.get("type", "").startswith("mlx.compaction."):
                         progress.append((time.perf_counter() - started, event))
         completed = _completed_response(
-            httpx.Response(200, text="\n".join(lines) + "\n")
+            httpx2.Response(200, text="\n".join(lines) + "\n")
         )
         assert completed["output"][0]["type"] == "compaction"
         _assert_recalled(completed["output_text"])
@@ -4228,6 +4667,7 @@ class TestResponseGenerator:
             _assert_fields(vars(server._build_gen_args(legacy)), **expected)
 
     def test_server_cli_sets_thinking_defaults(self, monkeypatch):
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
         flags = [
             ("model", "PRELOAD_MODEL", "demo"),
             ("image-model", "PRELOAD_IMAGE_MODEL", "image-demo"),
@@ -5027,6 +5467,89 @@ def test_apc_patch_reaches_next_model_request(settings_client, tmp_path):
     server.get_cached_model("demo")
     assert server.runtime.apc_manager is None
     assert client.get("/v1/cache/stats").json() == {"enabled": False}
+
+
+def test_live_image_limits_preserve_loaded_model_and_request_snapshot(
+    settings_client, monkeypatch
+):
+    client, generators = settings_client
+    monkeypatch.setenv("MLX_VLM_MIN_PIXELS", "1048576")
+    monkeypatch.setenv("MLX_VLM_MAX_PIXELS", "4194304")
+    monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
+    before_env = dict(os.environ)
+    loaded = server.get_cached_model("demo")
+    before = client.get("/v1/settings").json()
+    for name in ("min_pixels", "max_pixels"):
+        knob = next(k for k in before["schema"] if k["name"] == name)
+        assert knob["reload_kinds"] == []
+    queued_args = server._build_gen_args(_chat_request())
+
+    low = dict(min_pixels=65536, max_pixels=262144)
+    body = client.patch("/v1/settings", json=low).json()
+    assert body["applied"] == low and body["rejected"] == []
+    assert body["reload_kinds"] == []
+    assert body["fingerprint"] == before["fingerprint"]
+    assert server.get_cached_model("demo") == loaded
+    assert len(generators) == 1 and not generators[0].stopped
+    assert server._build_gen_args(_chat_request()).preprocessing_kwargs() == low
+    assert queued_args.preprocessing_kwargs() == dict(
+        min_pixels=1048576, max_pixels=4194304
+    )
+    override = dict(min_pixels=32768, max_pixels=131072)
+    assert (
+        server._build_gen_args(_chat_request(**override)).preprocessing_kwargs()
+        == override
+    )
+
+    # Clearing runtime settings must not fall back to the startup environment.
+    client.patch("/v1/settings", json=dict(min_pixels=None, max_pixels=None))
+    assert server._build_gen_args(_chat_request()).preprocessing_kwargs() == {}
+    restored = client.patch("/v1/settings", json={"op": "replace", "values": {}}).json()
+    assert restored["current"] == before["current"]
+    assert restored["reload_kinds"] == []
+    assert dict(os.environ) == before_env
+
+
+@pytest.mark.parametrize("api", ["chat", "responses", "messages"])
+def test_live_image_defaults_reach_inference_endpoints(client, monkeypatch, api):
+    monkeypatch.setattr(server.runtime, "config", RuntimeConfig())
+    options = dict(min_pixels=1048576, max_pixels=4194304)
+    assert client.patch("/v1/settings", json=options).json()["applied"] == options
+    worker = _streaming([_token("done", finish_reason="stop")])
+    with _endpoint(generator=worker):
+        response = _post(client, api)
+    assert response.status_code == 200, response.text
+    call = worker.generate.call_args
+    args = call.kwargs.get("args") or call.args[3]
+    assert args.preprocessing_kwargs() == options
+
+
+@pytest.mark.parametrize("op", ["merge", "replace"])
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"min_pixels": 0},
+        {"max_pixels": -1},
+        {"min_pixels": True},
+        {"max_pixels": 1024.5},
+        {"min_pixels": "bad", "max_pixels": 2097152},
+        {"min_pixels": 8388608},
+        {"max_pixels": 262144},
+        {"min_pixels": 2097152, "max_pixels": 1048576},
+    ],
+)
+def test_invalid_live_image_limits_keep_pair(settings_client, monkeypatch, op, values):
+    client, _ = settings_client
+    monkeypatch.setenv("MLX_VLM_MIN_PIXELS", "1048576")
+    monkeypatch.setenv("MLX_VLM_MAX_PIXELS", "4194304")
+    monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
+    before = client.get("/v1/settings").json()
+    body = client.patch("/v1/settings", json={"op": op, "values": values}).json()
+    assert body["applied"] == {}
+    assert {r["name"] for r in body["rejected"]} == set(values)
+    assert body["current"] == before["current"]
+    assert body["fingerprint"] == before["fingerprint"]
+    assert body["reload_kinds"] == []
 
 
 def _apc_budget(manager, memory, reserve, disk, queue):
@@ -6122,3 +6645,220 @@ def test_decisions_generic_prediction_failure_returns_500(client):
     assert response.status_code == 500
     assert response.json()["detail"] == "Decision prediction failed"
     model.predict.assert_called_once()
+
+
+@pytest.mark.parametrize("state", [{"state": None}, {}, {"state": "text"}])
+def test_decisions_pass_images_and_allow_null_state(client, state):
+    images = ["data:image/png;base64,iVBORw0KGgo=", "https://example.com/cat.jpg"]
+    questions = {"cat": {"type": "bool"}}
+    result = {"answers": {"cat": {"type": "bool", "value": True}}, "usage": {}}
+    model = NS(
+        decision_types=("bool",),
+        decision_media=("images",),
+        predict=MagicMock(return_value=result),
+    )
+    processor = object()
+    with patch.object(server, "get_cached_model", return_value=(model, processor, {})):
+        response = client.post(
+            "/v1/decisions",
+            json={"model": "d1", "questions": questions, "images": images, **state},
+        )
+    assert response.status_code == 200
+    assert response.json() == {**result, "model": "d1"}
+    model.predict.assert_called_once_with(
+        processor, state.get("state"), questions, images=images
+    )
+
+
+@pytest.mark.parametrize(
+    "body", [{"state": None}, {}, {"state": None, "images": [], "audio": ""}]
+)
+def test_decisions_require_state_without_media(client, body):
+    with patch.object(server, "get_cached_model") as load:
+        response = client.post(
+            "/v1/decisions",
+            json={"model": "d1", "questions": {"x": {"type": "bool"}}, **body},
+        )
+    assert response.status_code == 422
+    load.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "media, kind", [({"images": ["cat.png"]}, "image"), ({"audio": "a.wav"}, "audio")]
+)
+def test_decisions_reject_media_for_text_only_models(client, media, kind):
+    model = NS(decision_types=("bool",), predict=MagicMock())
+    with patch.object(server, "get_cached_model", return_value=(model, None, {})):
+        response = client.post(
+            "/v1/decisions",
+            json={
+                "model": "decider",
+                "state": "text",
+                "questions": {"x": {"type": "bool"}},
+                **media,
+            },
+        )
+    assert response.status_code == 400
+    assert response.json()["detail"] == f"This model does not support {kind} input"
+    model.predict.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "audio, expected",
+    [
+        ("https://example.com/clip.flac", "https://example.com/clip.flac"),
+        ("clips/meow.wav", "clips/meow.wav"),
+        ("data:audio/wav;base64," + base64.b64encode(b"RIFF").decode(), b"RIFF"),
+        (base64.b64encode(b"fLaC").decode(), b"fLaC"),
+    ],
+)
+def test_decisions_pass_audio_and_allow_null_state(client, audio, expected):
+    questions = {"speech": {"type": "bool"}}
+    result = {"answers": {"speech": {"type": "bool", "value": True}}, "usage": {}}
+    model = NS(
+        decision_types=("bool",),
+        decision_media=("audio",),
+        predict=MagicMock(return_value=result),
+    )
+    with patch.object(server, "get_cached_model", return_value=(model, None, {})):
+        response = client.post(
+            "/v1/decisions",
+            json={"model": "d1", "state": None, "questions": questions, "audio": audio},
+        )
+    assert response.status_code == 200
+    assert response.json() == {**result, "model": "d1"}
+    args, kwargs = model.predict.call_args
+    assert args == (None, None, questions) and set(kwargs) == {"audio"}
+    sent = kwargs["audio"]
+    assert (sent if isinstance(sent, str) else sent.read()) == expected
+
+
+def test_decisions_leave_mixed_media_to_the_model(client):
+    questions = {"x": {"type": "bool"}}
+    error = ValueError("a request carries images or audio, not both")
+    model = NS(
+        decision_types=("bool",),
+        decision_media=("images", "audio"),
+        predict=MagicMock(side_effect=error),
+    )
+    with patch.object(server, "get_cached_model", return_value=(model, None, {})):
+        response = client.post(
+            "/v1/decisions",
+            json={
+                "model": "d1-omni",
+                "questions": questions,
+                "images": ["cat.png"],
+                "audio": "meow.wav",
+            },
+        )
+    assert response.status_code == 400
+    assert response.json()["detail"] == str(error)
+    model.predict.assert_called_once_with(
+        None, None, questions, images=["cat.png"], audio="meow.wav"
+    )
+
+
+@pytest.mark.parametrize("api", ["chat", "responses"])
+@pytest.mark.parametrize("batching", [False, True])
+@pytest.mark.parametrize("truncated", [False, True])
+@pytest.mark.parametrize("response_template", [False, True])
+def test_tool_arguments_stream_incrementally(
+    client, api, batching, truncated, response_template
+):
+    chunks = [
+        '<tool_call>{"name":"get_weather","arguments":{"city":"',
+        "War",
+        "saw",
+        '"}}</tool_call>',
+    ]
+    if truncated:
+        chunks = chunks[:-1]
+    tokens = [
+        _token(text, finish_reason="stop" if i == len(chunks) - 1 else None)
+        for i, text in enumerate(chunks)
+    ]
+    template = {
+        "defaults": {"role": "assistant"},
+        "fields": {
+            "content": {"content": "text"},
+            "tool_calls": {
+                "open": "<tool_call>",
+                "close": "</tool_call>",
+                "content": "json",
+                "repeats": True,
+            },
+        },
+    }
+    processor = (
+        NS(
+            response_template=template,
+            get_response_parser=lambda prefix: ResponseParser(template, prefix=prefix),
+            parse_response=lambda text, prefix: parse_response(
+                text, template, prefix=prefix
+            ),
+        )
+        if response_template
+        else None
+    )
+    with _endpoint(
+        generator=_streaming(tokens) if batching else None,
+        chunks=[
+            _result(token.text, finish_reason=token.finish_reason) for token in tokens
+        ],
+        parser=load_tool_module("json_tools"),
+        processor=processor,
+    ):
+        response = _post(client, api, stream=True, tools=[_tool()])
+    events = _data(response)
+    if api == "responses":
+        deltas = [
+            event
+            for event in events
+            if event.get("type") == "response.function_call_arguments.delta"
+        ]
+        assert len(deltas) >= 3
+        assert deltas[0]["delta"] == '{"city":"'
+        added = next(
+            event
+            for event in events
+            if event.get("type") == "response.output_item.added"
+        )
+        assert added["item"]["arguments"] == ""
+        assert all(
+            event["item_id"] == added["item"]["id"]
+            and event["output_index"] == added["output_index"]
+            for event in deltas
+        )
+        completed = [
+            event for event in events if event.get("type") == "response.completed"
+        ]
+        if truncated:
+            assert not completed and any(
+                event.get("type") in ("error", "response.failed") for event in events
+            )
+        else:
+            final = completed[0]["response"]["output"][0]
+            assert final["arguments"] == _joined(deltas, "delta") == '{"city":"Warsaw"}'
+            assert final["id"] == added["item"]["id"]
+            assert final["call_id"] == added["item"]["call_id"]
+    else:
+        choices = [event["choices"][0] for event in events if event.get("choices")]
+        calls = [
+            call
+            for choice in choices
+            for call in choice["delta"].get("tool_calls") or []
+        ]
+        assert len(calls) >= 3
+        assert calls[0]["function"]["name"] == "get_weather"
+        assert calls[0]["function"]["arguments"] == '{"city":"'
+        finishes = [
+            choice["finish_reason"] for choice in choices if choice.get("finish_reason")
+        ]
+        if truncated:
+            assert not finishes and any("error" in event for event in events)
+        else:
+            assert finishes == ["tool_calls"]
+            assert (
+                "".join(call["function"].get("arguments", "") for call in calls)
+                == '{"city":"Warsaw"}'
+            )

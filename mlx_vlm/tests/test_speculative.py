@@ -24,9 +24,11 @@ from mlx_vlm.models.base import InputEmbeddingsFeatures, LanguageModelOutput
 from mlx_vlm.models.cache import ArraysCache, BatchKVCache, KVCache
 from mlx_vlm.models.linear import native_batch_linear
 from mlx_vlm.models.switch_layers import QuantizedSwitchLinear, SwitchGLU
+from mlx_vlm.quantization.nvfp4 import ScaledQuantizedLinear
 from mlx_vlm.speculative import common, mtp
 from mlx_vlm.speculative.cache_state import start_speculative_cache
 from mlx_vlm.speculative.drafters import (
+    load_drafter,
     resolve_drafter_kind,
     validate_drafter_compatibility,
 )
@@ -37,6 +39,7 @@ from mlx_vlm.tests.test_models import (
     TINY_DEFAULTS,
     TINY_MODELS,
     build_config,
+    model_case,
     tiny_config,
 )
 from mlx_vlm.utils import get_model_and_args
@@ -233,15 +236,27 @@ class TransactionDrafter:
 
 
 def equal(actual, expected, **tolerance):
-    if isinstance(actual, (list, tuple)):
-        assert len(actual) == len(expected)
-        for a, b in zip(actual, expected):
-            equal(a, b, **tolerance)
-    elif actual is None or expected is None:
-        assert actual is expected
-    else:
-        compare = mx.allclose if tolerance else mx.array_equal
-        assert compare(actual, expected, **tolerance).item()
+    comparisons = []
+
+    def collect(actual, expected):
+        if isinstance(actual, dict):
+            assert actual.keys() == expected.keys()
+            for key in actual:
+                collect(actual[key], expected[key])
+        elif isinstance(actual, (list, tuple)):
+            assert len(actual) == len(expected)
+            for a, b in zip(actual, expected):
+                collect(a, b)
+        elif actual is None or expected is None:
+            assert actual is expected
+        else:
+            compare = mx.allclose if tolerance else mx.array_equal
+            comparisons.append(compare(actual, expected, **tolerance))
+
+    collect(actual, expected)
+    mx.eval(comparisons)
+    for index, comparison in enumerate(comparisons):
+        assert comparison.item(), f"comparison {index}"
 
 
 def greedy(logits):
@@ -380,20 +395,23 @@ def test_verify_commit_matches_decode(family, batch, dtype):
     for retained in (1, 4, 3):
         tokens = mx.broadcast_to(mx.array([[4, 5, 6, 7]]), (batch, 4))
         oracle = deepcopy(reference)
+        accepted = None
         hidden_steps, logit_steps = [], []
         for i in range(4):
             hidden, logits, transaction = verify(tokens[:, i : i + 1], oracle)
             hidden_steps.append(hidden)
             logit_steps.append(logits)
             transaction.commit([1] * batch)
+            if i + 1 == retained:
+                accepted = deepcopy(oracle)
         hidden, logits, transaction = verify(tokens, actual)
         compare(hidden, mx.concatenate(hidden_steps, 1))
         compare(logits, mx.concatenate(logit_steps, 1))
         equal(greedy(logits), greedy(mx.concatenate(logit_steps, 1)))
         transaction.commit([retained] * batch)
-        for i in range(retained):
-            _, _, transaction = verify(tokens[:, i : i + 1], reference)
-            transaction.commit([1] * batch)
+        # Reuse the independent one-token oracle at the accepted prefix.
+        # Replaying that prefix again would perform the same verifier calls.
+        reference = accepted
         probe = mx.full((batch, 1), 20)
         compare(model(probe, cache=reference).logits, model(probe, cache=actual).logits)
 
@@ -484,6 +502,55 @@ def test_fused_projection_parity(bits, widths, length):
         verifier_linear._target_verify_timewise(linear, inputs) for linear in linears
     ]
     actual = verifier_linear._target_verify_linears(linears, inputs)
+    equal(actual, expected)
+
+
+@parametrize("bits", [4, 5])
+@parametrize("dtype", [mx.bfloat16, mx.float16])
+@parametrize("projection", ["gate_up", "down"])
+def test_affine_switch_projection_parity(bits, dtype, projection):
+    mx.random.seed(2527)
+    linears = [QuantizedSwitchLinear(512, 32, 4, False, 64, bits) for _ in range(2)]
+    for linear in linears:
+        linear.scales = linear.scales.astype(dtype)
+        linear.biases = linear.biases.astype(dtype)
+    indices = mx.arange(6, dtype=mx.int32).reshape(1, 3, 2) % 4
+    if projection == "gate_up":
+        inputs = mx.random.normal((1, 3, 512)).astype(dtype)
+        expected = [
+            quantized.exact_quantized_switch_linear(linear, inputs, indices)
+            for linear in linears
+        ]
+        actual = fast_ops.exact_affine_switch_gate_up(
+            NS(up_proj=linears[0], gate_proj=linears[1]), inputs, indices
+        )
+    else:
+        inputs = mx.random.normal((1, 3, 2, 512)).astype(dtype)
+        weights = mx.softmax(mx.random.normal((1, 3, 2)), axis=-1)
+        shared = mx.random.normal((1, 3, 32)).astype(dtype)
+        routed = quantized.exact_quantized_selected_linear(linears[0], inputs, indices)
+        expected = SwitchGLU._combine(routed, weights, shared)
+        actual = fast_ops.exact_affine_moe_down(
+            linears[0], inputs, indices, weights, shared
+        )
+    assert actual is not None
+    equal(actual, expected)
+
+
+@parametrize("bits", [4, 5, 8])
+@parametrize("dtype", [mx.bfloat16, mx.float16])
+@parametrize("batch", [1, 2])
+def test_glm_quantized_head_parity(bits, dtype, batch):
+    mx.random.seed(2527)
+    head = nn.QuantizedLinear(512, 32, bias=False, group_size=64, bits=bits)
+    head.scales = head.scales.astype(dtype)
+    head.biases = head.biases.astype(dtype)
+    inputs = mx.random.normal((batch, 3, 512)).astype(dtype)
+    expected = verifier_linear._target_verify_singletons(head, inputs)
+    actual = module("models.glm_moe_dsa.speculative_verifier")._quantized_head_logits(
+        head, inputs
+    )
+    assert actual is not None
     equal(actual, expected)
 
 
@@ -633,6 +700,66 @@ def test_checkpoint_routing_and_validation(tmp_path, family):
         validate_drafter_compatibility(target, drafter, "dflash")
 
 
+@parametrize("family", ["dflash2", "dspark-qwen"])
+@parametrize("nested", [False, True])
+def test_standalone_drafter_with_mtp_backbone(tmp_path, family, nested):
+    from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter
+
+    config = dflash_config(family)
+    config["model_type"] = "qwen3_5"
+    if nested:
+        config["text_config"] = tiny_config("qwen").to_dict()
+        config["text_config"]["model_type"] = "qwen3_5"
+    model_type = "dflash2" if family == "dflash2" else "dspark"
+    arch = module(f"speculative.drafters.{model_type}")
+    reference = arch.Model(arch.ModelConfig.from_dict(config))
+    expected = dict(tree_flatten(reference.parameters()))
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(
+        str(tmp_path / "model.safetensors"), expected, metadata={"format": "mlx"}
+    )
+
+    draft, kind = load_drafter(str(tmp_path))
+    assert isinstance(draft, arch.Model)
+    assert kind == resolve_drafter_kind(tmp_path) == "dflash"
+    assert detect_mtp_splitter(tmp_path) is None
+    equal(dict(tree_flatten(draft.parameters())), expected)
+
+
+def test_custom_drafter_with_mtp_backbone(tmp_path):
+    from mlx_vlm.speculative.drafters.mtp_split import get_mtp_splitter
+
+    config = values(
+        model_type="qwen3_5",
+        model_file="model.py",
+        head_dim=8,
+        mask_token_id=31,
+        target_layer_ids=[0],
+        block_size=3,
+    )
+    arch = module("speculative.drafters.qwen3_dflash")
+    reference = arch.Model(arch.ModelConfig.from_dict(config))
+    expected = dict(tree_flatten(reference.parameters()))
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    model_file = tmp_path / "model.py"
+    model_file.write_text(
+        "from mlx_vlm.speculative.drafters.qwen3_dflash import Model, ModelConfig\n"
+    )
+    mx.save_safetensors(
+        str(tmp_path / "model.safetensors"), expected, metadata={"format": "mlx"}
+    )
+
+    draft, kind = load_drafter(str(tmp_path))
+    assert isinstance(draft, arch.Model)
+    assert kind == resolve_drafter_kind(tmp_path) == "dflash"
+    assert get_mtp_splitter(source_config=config) is None
+    equal(dict(tree_flatten(draft.parameters())), expected)
+
+    model_file.unlink()
+    with pytest.raises(FileNotFoundError, match="model_file"):
+        load_drafter(str(tmp_path))
+
+
 def split_checkpoint(
     path, config, weights, *, separate=False, indexed=False, **options
 ):
@@ -657,6 +784,555 @@ def split_checkpoint(
         for k, v in mx.load(str(shard)).items()
     }
     return config, weights, output
+
+
+@parametrize("family", ["qwen3_5", "qwen3_5_moe", "qwen3_next"])
+@parametrize("layout", ["hf", "mlx", "affine", "fp8"])
+@parametrize("indexed", [False, True])
+@parametrize("config_location", ["text", "root"])
+def test_load_bundled_qwen_mtp(
+    tmp_path, monkeypatch, family, layout, indexed, config_location
+):
+    arch = module("speculative.drafters.qwen3_5_mtp")
+    text = tiny_config(
+        "qwen", hidden_size=128, intermediate_size=128, head_dim=16
+    ).to_dict()
+    text.update(model_type=family + "_text", mtp_num_hidden_layers=1)
+    if family != "qwen3_5":
+        text.update(
+            num_experts=2,
+            num_experts_per_tok=1,
+            shared_expert_intermediate_size=128,
+            moe_intermediate_size=128,
+        )
+    reference = arch.Model(arch.ModelConfig.from_dict({"text_config": text}))
+    reference.set_dtype(mx.bfloat16)
+    config = dict(model_type=family, text_config=text)
+    if family == "qwen3_next":
+        config = dict(text, model_type=family)
+        rope = config.pop("rope_parameters")
+        config.update(
+            rope_theta=rope["rope_theta"],
+            partial_rotary_factor=rope["partial_rotary_factor"],
+            decoder_sparse_step=1,
+            mlp_only_layers=[],
+            full_attention_interval=1,
+        )
+        if indexed:
+            config["norm_topk_prob"] = True
+        next_arch = module("models.qwen3_next.language")
+        reference.layers = [
+            next_arch.Qwen3NextDecoderLayer(next_arch.ModelConfig.from_dict(config), 0)
+        ]
+        reference.set_dtype(mx.bfloat16)
+    text_config = config.get("text_config") or config
+    config = (
+        dict(text_config, model_type=family)
+        if config_location == "root"
+        else dict(model_type=family, text_config=text_config)
+    )
+    mlx_layout = layout in ("mlx", "affine")
+    if layout == "affine":
+        quant = dict(group_size=32, bits=4, mode="affine")
+        fc_quant = dict(group_size=32, bits=8, mode="affine")
+        nn.quantize(
+            reference,
+            **quant,
+            class_predicate=lambda path, layer: (
+                fc_quant if path == "fc" else hasattr(layer, "to_quantized")
+            ),
+        )
+        config["quantization"] = {**quant, "fc": quant, "mtp.fc": fc_quant}
+    weights = {
+        "mtp." + key: value if mlx_layout or value.ndim != 1 else value - 1
+        for key, value in tree_flatten(reference.parameters())
+    }
+    if family == "qwen3_next" and not mlx_layout:
+        for key in list(weights):
+            if ".switch_mlp." in key:
+                for expert, value in enumerate(weights.pop(key)):
+                    weights[key.replace(".switch_mlp.", f".experts.{expert}.")] = value
+    elif family.endswith("moe") and not mlx_layout:
+        prefix = "mtp.layers.0.mlp."
+        weights[prefix + "experts.gate_up_proj"] = mx.concatenate(
+            [
+                weights.pop(prefix + f"switch_mlp.{p}.weight")
+                for p in ("gate_proj", "up_proj")
+            ],
+            axis=-2,
+        )
+        weights[prefix + "experts.down_proj"] = weights.pop(
+            prefix + "switch_mlp.down_proj.weight"
+        )
+    if layout == "fp8":
+        config["quantization_config"] = dict(
+            quant_method="fp8", fmt="e4m3", weight_block_size=[128, 128]
+        )
+        weights["mtp.fc.weight"] = mx.to_fp8(weights["mtp.fc.weight"])
+        weights["mtp.fc.weight_scale_inv"] = mx.ones((1, 2), dtype=mx.bfloat16)
+        reference.fc.weight = mx.from_fp8(weights["mtp.fc.weight"], dtype=mx.bfloat16)
+        reference.fc = nn.QuantizedLinear.from_linear(
+            reference.fc, group_size=32, bits=8, mode="mxfp8"
+        )
+    elif layout == "hf":
+        # The target's quantization must not quantize its bundled BF16 head.
+        config["quantization_config"] = dict(
+            quant_method="compressed-tensors", format="nvfp4-pack-quantized"
+        )
+    weights["model.unused.weight"] = mx.ones((2, 2))
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(
+        str(tmp_path / "model.safetensors"),
+        weights,
+        metadata={"format": "mlx" if mlx_layout else "pt"},
+    )
+    if indexed:
+        weight_map = dict.fromkeys(weights, "model.safetensors")
+        # A base-only shard must not be opened by the drafter loader.
+        weight_map["model.unused.weight"] = "unavailable-base.safetensors"
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": weight_map})
+        )
+    before = {p.name: p.stat().st_mtime_ns for p in tmp_path.iterdir()}
+    with monkeypatch.context() as patcher:
+        patcher.setattr(
+            "mlx_vlm.utils.load_model",
+            Mock(side_effect=AssertionError("must not load the target as a drafter")),
+        )
+        draft, kind = load_drafter(str(tmp_path), lazy=indexed)
+    assert kind == "mtp" and draft.config.model_type == "qwen3_5_mtp"
+    assert draft.config.block_size == 3 and len(draft.layers) == 1
+    assert {p.name: p.stat().st_mtime_ns for p in tmp_path.iterdir()} == before
+    inputs = mx.random.normal((1, 2, 128)).astype(mx.bfloat16)
+    positions = mx.array([[0, 1]])
+    actual = draft._forward_hidden(inputs, inputs, draft.make_cache(), positions)
+    if family == "qwen3_next":
+        hidden = reference.fc(
+            mx.concatenate(
+                [
+                    reference.pre_fc_norm_embedding(inputs),
+                    reference.pre_fc_norm_hidden(inputs),
+                ],
+                axis=-1,
+            )
+        )
+        expected = reference.norm(
+            reference.layers[0](hidden, mask="causal", cache=KVCache())
+        )
+        equal(actual, expected, atol=1e-3, rtol=1e-3)
+    else:
+        expected = reference._forward_hidden(
+            inputs, inputs, reference.make_cache(), positions
+        )
+        equal(actual, expected)
+    assert mx.isfinite(actual).all().item()
+
+    output = split_mtp(str(tmp_path), str(tmp_path / "draft"))
+    standalone, standalone_kind = load_drafter(str(output))
+    assert standalone_kind == kind
+    equal(
+        dict(tree_flatten(draft.parameters())),
+        dict(tree_flatten(standalone.parameters())),
+    )
+
+    if layout in ("hf", "fp8"):
+        if layout == "hf":
+            with pytest.raises(ValueError, match="Activation quantization requires"):
+                load_drafter(str(tmp_path), quantize_activations=True)
+        else:
+            activated, _ = load_drafter(str(tmp_path), quantize_activations=True)
+            standalone_activated, _ = load_drafter(
+                str(output), quantize_activations=True
+            )
+            assert isinstance(activated.fc, nn.QQLinear)
+            fc_inputs = mx.concatenate([inputs, inputs], axis=-1)
+            equal(activated.fc(fc_inputs), standalone_activated.fc(fc_inputs))
+
+
+@parametrize("missing", ["all", "most", "norm"])
+def test_load_bundled_qwen_mtp_rejects_missing_weights(tmp_path, missing):
+    config = dict(model_type="qwen3_5", text_config=tiny_config("qwen").to_dict())
+    config["text_config"]["mtp_num_hidden_layers"] = 1
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    if missing == "norm":
+        arch = module("speculative.drafters.qwen3_5_mtp")
+        model = arch.Model(arch.ModelConfig.from_dict(config))
+        weights = {
+            "mtp." + key: value for key, value in tree_flatten(model.parameters())
+        }
+        del weights["mtp.norm.weight"]
+    else:
+        weights = {
+            "mtp.fc.weight" if missing == "most" else "model.unused": mx.ones((16, 32))
+        }
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+    with pytest.raises(ValueError, match="Missing|missing|No MTP tensors"):
+        load_drafter(str(tmp_path), kind="mtp")
+
+
+@parametrize("type_key", ["model_type", "speculators_model_type"])
+@parametrize("model_type", ["qwen3_5_mtp", "QWEN3_5_MTP"])
+def test_bundled_qwen_mtp_kind_and_standalone_loading(tmp_path, type_key, model_type):
+    from mlx_vlm.speculative.drafters.mtp_split import get_mtp_splitter
+
+    arch = module("speculative.drafters.qwen3_5_mtp")
+    text = tiny_config("qwen").to_dict()
+    text["model_type"] = "qwen3_5"
+    config = dict(model_type="qwen3_5", text_config=text)
+    reference = arch.Model(arch.ModelConfig.from_dict(config))
+    weights = {
+        "mtp." + k: v if v.ndim != 1 else v - 1
+        for k, v in tree_flatten(reference.parameters())
+    }
+    _, _, output = split_checkpoint(tmp_path, config, weights)
+    assert resolve_drafter_kind(tmp_path, "dflash") == "mtp"
+    standalone_config_path = output / "config.json"
+    standalone_config = json.loads(standalone_config_path.read_text())
+    standalone_config.pop("model_type")
+    standalone_config[type_key] = model_type
+    standalone_config_path.write_text(json.dumps(standalone_config))
+
+    standalone, kind = load_drafter(str(output))
+    assert isinstance(standalone, arch.Model)
+    assert kind == resolve_drafter_kind(output) == "mtp"
+    assert get_mtp_splitter(source_config=standalone_config) is None
+    expected = dict(tree_flatten(reference.parameters()))
+    equal(dict(tree_flatten(standalone.parameters())), expected)
+
+
+@parametrize(
+    "family, model_type",
+    [
+        ("glm", "glm5_next"),
+        ("glm", "glm5_next_text"),
+        ("deepseek", "deepseek_v4"),
+        ("hy_v4", "hy_v4"),
+        ("glm_moe_dsa", "glm_moe_dsa"),
+        ("qwen4_exp", "qwen4_exp"),
+        ("qwen4_exp", "qwen4_exp_text"),
+        ("inkling", "inkling"),
+        ("inkling", "inkling_mm_model"),
+    ],
+)
+@parametrize("config_location", ["root", "text", "root-fallback"])
+def test_load_registered_native_drafter(
+    tmp_path, monkeypatch, family, model_type, config_location
+):
+    if family in TINY_MODELS:
+        text = tiny_config(family).to_dict()
+        runtime = TINY_MODELS[family]["module"]
+    elif family in ("hy_v4", "glm_moe_dsa"):
+        text = values("mla_mtp", model_type=family)
+        runtime = family
+    else:
+        case = next(
+            c
+            for c in module("tests.test_models").DATA["cases"]
+            if c["module"] == family
+        )
+        text = deepcopy(case["config"]["text_config"])
+        runtime = family
+    arch = module(f"speculative.drafters.{runtime}_mtp")
+    reference = arch.Model(arch.ModelConfig.from_dict({"text_config": text}))
+    reference.set_dtype(mx.bfloat16)
+    weights = {}
+    for key, value in tree_flatten(reference.parameters()):
+        if family == "glm":
+            key = key.removeprefix("mtp_block.")
+            key = key.replace("shared_head_norm.", "shared_head.norm.")
+            key = f"model.language_model.layers.{text['num_hidden_layers']}.{key}"
+        elif family == "deepseek":
+            key = "mtp.0." + key.removeprefix("decoder.")
+            for component in ("attn", "ffn"):
+                key = key.replace(f"{component}_hc.", f"hc_{component}_")
+        elif family == "hy_v4":
+            key = key.removeprefix("decoder.")
+            if key == "norm.weight":
+                key = "final_layernorm.weight"
+            key = "model.mtp_layers.0." + key
+        elif family == "glm_moe_dsa":
+            key = key.removeprefix("mtp.").replace(
+                "shared_head_norm.", "shared_head.norm."
+            )
+            key = f"model.layers.{text['num_hidden_layers']}.{key}"
+            if ".switch_mlp." in key:
+                for expert, tensor in enumerate(value):
+                    weights[key.replace(".switch_mlp.", f".experts.{expert}.")] = tensor
+                continue
+        elif family == "qwen4_exp":
+            key = "language_model.mtp." + key
+        elif family == "inkling":
+            if key == "norm.weight":
+                weights["model.llm.norm.weight"] = value
+                continue
+            key = "model.mtp." + key.replace("blocks.", "layers.")
+            if ".qkvr_proj.weight" in key:
+                sizes = reference.blocks[0].transformer_block.self_attn.qkvr_dims
+                for name, tensor in zip(
+                    ("wq_du", "wk_dv", "wv_dv", "wr_du"),
+                    mx.split(value, np.cumsum(sizes[:-1]).tolist()),
+                ):
+                    weights[key.replace("self_attn.qkvr_proj", f"attn.{name}")] = tensor
+                continue
+            key = key.replace("self_attn.o_proj", "attn.wo_ud")
+            key = key.replace("self_attn.rel_proj", "attn.rel_logits_proj.weight")
+            key = key.replace("self_attn.", "attn.")
+            key = key.replace("input_layernorm", "attn_norm").replace(
+                "post_attention_layernorm", "mlp_norm"
+            )
+            if ".conv.weight" in key:
+                key = key.replace(".conv.weight", ".weight")
+                value = value.transpose(0, 2, 1)
+        weights[key] = value
+    config = dict(model_type=model_type, text_config=text)
+    if config_location == "root":
+        config = dict(text, model_type=model_type)
+    elif config_location == "text":
+        config["model_type"] = "multimodal_wrapper"
+        text["model_type"] = model_type
+    elif config_location == "root-fallback":
+        text["model_type"] = "unregistered_text_type"
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(tmp_path / "mtp.safetensors"), weights)
+    weight_map = dict.fromkeys(weights, "mtp.safetensors")
+    weight_map["model.unused.weight"] = "unavailable-base.safetensors"
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map})
+    )
+    before = {p.name: p.stat().st_mtime_ns for p in tmp_path.iterdir()}
+    with monkeypatch.context() as patcher:
+        patcher.setattr(
+            "mlx_vlm.utils.load_model",
+            Mock(side_effect=AssertionError("must not load the target as a drafter")),
+        )
+        draft, kind = load_drafter(str(tmp_path), kind="dflash")
+    assert kind == "mtp" and isinstance(draft, arch.Model)
+    assert {p.name: p.stat().st_mtime_ns for p in tmp_path.iterdir()} == before
+    expected = dict(tree_flatten(reference.parameters()))
+    actual = dict(tree_flatten(draft.parameters()))
+    assert actual.keys() == expected.keys()
+    for key, value in actual.items():
+        equal(value, expected[key])
+
+    from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter
+
+    assert detect_mtp_splitter(tmp_path).output_model_type == draft.config.model_type
+    output = split_mtp(str(tmp_path), str(tmp_path / "draft"))
+    standalone, standalone_kind = load_drafter(str(output))
+    assert standalone_kind == kind
+    equal(actual, dict(tree_flatten(standalone.parameters())))
+
+
+def nemotron_target_and_drafter():
+    config = model_case("nemotron_super_vl")["config"]
+    target = module("models.nemotron_h_nano_omni")
+    draft = module("speculative.drafters.nemotron_h_mtp")
+    return (
+        config,
+        target.Model(target.ModelConfig.from_dict(config)),
+        draft.Model(draft.ModelConfig(text_config=config["llm_config"])),
+    )
+
+
+@parametrize("case_name", ["nemotron_super_vl", "nemotron_bolt"])
+def test_hidden_state_output_preserves_speculative_flags(case_name):
+    case = model_case(case_name)
+    arch = module("models." + case["module"])
+    model = arch.Model(build_config(arch, case["config"])).language_model
+    ids = mx.array([[1, 2, 3]])
+    output = model(
+        ids,
+        cache=model.make_cache(),
+        output_hidden_states=True,
+        speculative_verify=True,
+        skip_logits=True,
+        return_shared_kv=True,
+    )
+    assert output.logits is None
+    assert output.shared_kv_states == {}
+    assert output.gdn_states
+    assert len(output.hidden_states) == len(model.layers) + 1
+    equal(output.hidden_states[0], model.get_input_embeddings(ids))
+
+
+@parametrize("quantized", [False, True])
+def test_nemotron_native_mtp_load_split_and_forward(tmp_path, quantized):
+    mx.random.seed(42)
+    config, target, reference = nemotron_target_and_drafter()
+    expected = dict(tree_flatten(reference.parameters()))
+    source = {}
+    for key, weight in expected.items():
+        if ".switch_mlp." not in key:
+            source["language_model.mtp." + key] = weight
+            continue
+        prefix, projection = key.split(".switch_mlp.")
+        projection = projection.replace("fc1", "up_proj").replace("fc2", "down_proj")
+        decoded = []
+        for expert, value in enumerate(weight):
+            path = f"language_model.mtp.{prefix}.experts.{expert}.{projection}"
+            if quantized:
+                scale = 0.137 * (expert + 1)
+                packed, scales = mx.quantize(value / scale, mode="nvfp4")
+                source[path] = packed.view(mx.uint8)
+                source[path.removesuffix("weight") + "weight_scale"] = scales
+                source[path.removesuffix("weight") + "weight_scale_2"] = mx.array(scale)
+                source[path.removesuffix("weight") + "input_scale"] = mx.array(1.0)
+                value = (
+                    mx.dequantize(packed, scales, mode="nvfp4", dtype=mx.float32)
+                    * scale
+                )
+            else:
+                source[path] = value
+            decoded.append(value)
+        expected[key] = mx.stack(decoded)
+    if quantized:
+        config["quantization_config"] = {
+            "quant_method": "modelopt_mixed",
+            "quant_algo": "MIXED_PRECISION",
+        }
+        source["language_model.mtp.layers.0.mixer.k_proj.k_scale"] = mx.array(1.0)
+    reference.load_weights(list(expected.items()))
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(tmp_path / "mtp.safetensors"), source)
+    weight_map = dict.fromkeys(source, "mtp.safetensors")
+    # Loading the drafter must not open the much larger target shards.
+    weight_map["language_model.backbone.embeddings.weight"] = "absent.safetensors"
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map})
+    )
+    draft, kind = load_drafter(str(tmp_path))
+    assert kind == "mtp"
+    ids = mx.array([[1, 2, 3]])
+    hidden = target.language_model(ids, return_hidden=True).hidden_states[-1]
+    reference.reset(target)
+    expected_hidden, _ = reference._forward_tokens(ids, hidden, mx.int32)
+    draft.reset(target)
+    actual_hidden, _ = draft._forward_tokens(ids, hidden, mx.int32)
+    equal(actual_hidden, expected_hidden, atol=1e-4, rtol=1e-4)
+    # Cached singleton forwards must match a causal block.
+    draft.reset(target)
+    steps = [
+        draft._forward_tokens(ids[:, i : i + 1], hidden[:, i : i + 1], mx.int32)[0]
+        for i in range(ids.shape[1])
+    ]
+    equal(mx.concatenate(steps, axis=1), actual_hidden, atol=1e-4, rtol=1e-7)
+    output = split_mtp(str(tmp_path), str(tmp_path / "draft"))
+    reloaded, kind = load_drafter(str(output))
+    reloaded.reset(target)
+    roundtrip, _ = reloaded._forward_tokens(ids, hidden, mx.int32)
+    equal(roundtrip, actual_hidden)
+    source.pop("language_model.mtp.layers.0.eh_proj.weight")
+    mx.save_safetensors(str(tmp_path / "mtp.safetensors"), source)
+    weight_map.pop("language_model.mtp.layers.0.eh_proj.weight")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map})
+    )
+    with pytest.raises(ValueError, match="Missing"):
+        load_drafter(str(tmp_path))
+
+
+@parametrize("media", ["text", "image", "video"])
+@parametrize("dtype", [mx.float32, mx.bfloat16])
+@parametrize("temperature", [0, 0.7])
+def test_nemotron_mtp_generation_matches_autoregressive(
+    media, dtype, temperature, monkeypatch
+):
+    mx.random.seed(19)
+    config, model, draft = nemotron_target_and_drafter()
+    model.set_dtype(dtype)
+    draft.set_dtype(dtype)
+    model.eval()
+    draft.eval()
+    prefill = Mock(wraps=draft.prefill_from_target_hidden)
+    monkeypatch.setattr(draft, "prefill_from_target_hidden", prefill)
+    ids = mx.array([[1, 2, 3]])
+    pixels = None
+    kwargs = {}
+    if media == "image":
+        ids = mx.array([[1, 18, 3]])
+        pixels = mx.random.normal((1, 3, 32, 32))
+    elif media == "video":
+        ids = mx.array([[1, 18, 18, 18, 3]])
+        kwargs["pixel_values_videos"] = mx.random.normal((6, 3, 32, 32))
+        kwargs["video_pruning_rate"] = 0
+        embeds = model.get_input_embeddings(ids, **kwargs)
+        assert embeds.inputs_embeds.shape[1] == ids.shape[1]
+    common = dict(
+        max_tokens=12, temperature=temperature, seed=19, prefill_step_size=2, **kwargs
+    )
+    expected = [t for t, _ in generate_step(ids, model, pixels, None, **common)]
+    actual = [
+        t
+        for t, _ in generate_step(
+            ids,
+            model,
+            pixels,
+            None,
+            draft_model=draft,
+            draft_kind="mtp",
+            draft_block_size=4,
+            **common,
+        )
+    ]
+    assert actual == expected
+    assert draft.draft_lens and any(
+        a < d for a, d in zip(draft.accept_lens, draft.draft_lens)
+    )
+    prompt_ids, prompt_hidden = prefill.call_args.args[:2]
+    assert prompt_ids.tolist() == ids.tolist()
+    assert prompt_hidden.shape[1] == ids.shape[1]
+
+
+def test_nemotron_mtp_rejects_pruned_video():
+    config, model, draft = nemotron_target_and_drafter()
+    with pytest.raises(ValueError, match="video_pruning_rate=0"):
+        list(
+            generate_step(
+                mx.array([[1, 18, 18, 18, 3]]),
+                model,
+                None,
+                None,
+                pixel_values_videos=mx.zeros((6, 3, 32, 32)),
+                draft_model=draft,
+                draft_kind="mtp",
+                max_tokens=3,
+                temperature=0,
+            )
+        )
+
+
+@parametrize("accepted", [0, 1, 3])
+def test_nemotron_mtp_mamba_rollback_matches_accepted_prefix(accepted):
+    mx.random.seed(71)
+    config = model_case("nemotron_super_vl")["config"]
+    arch = module("models.nemotron_h_nano_omni")
+    # Exercise the same Metal state replay used by the released model.
+    config["llm_config"]["ssm_state_size"] = 32
+    model = arch.Model(arch.ModelConfig.from_dict(config)).language_model
+    model.eval()
+    ordinary, speculative = model.make_cache(), model.make_cache()
+    prompt = mx.array([[1, 2, 3]])
+    model(prompt, cache=ordinary)
+    model(prompt, cache=speculative)
+    block = mx.array([[4, 5, 6, 7]])
+    hidden, _, states = model.speculative_verify_hidden(block, speculative)
+    mx.eval(hidden)
+    model.rollback_speculative_cache(speculative, states, accepted, 4)
+    for i in range(accepted + 1):
+        model(block[:, i : i + 1], cache=ordinary)
+    equal(
+        [c.state for c in speculative],
+        [c.state for c in ordinary],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    probe = mx.array([[8]])
+    equal(
+        model(probe, cache=speculative).logits,
+        model(probe, cache=ordinary).logits,
+        atol=1e-5,
+        rtol=1e-5,
+    )
 
 
 def test_deepseek_dspark_split_load_and_draft(tmp_path):
@@ -717,6 +1393,17 @@ def test_deepseek_dspark_split_load_and_draft(tmp_path):
     weights = fresh.sanitize(weights)
     fresh.load_weights(list(weights.items()), strict=True)
     assert not any("confidence_head" in key or "bias_vl" in key for key in weights)
+    bundled, kind = load_drafter(str(tmp_path))
+    assert kind == "dflash" and isinstance(bundled, arch.Model)
+    assert bundled.config.n_mtp_layers == 3
+    expected = dict(tree_flatten(fresh.parameters()))
+    actual = dict(tree_flatten(bundled.parameters()))
+    assert actual.keys() == expected.keys()
+    for key, value in actual.items():
+        equal(value, expected[key])
+    standalone, standalone_kind = load_drafter(str(output), kind="mtp")
+    assert standalone_kind == "dflash"
+    equal(dict(tree_flatten(standalone.parameters())), expected)
     target = NS(
         embed_tokens=nn.Embedding(32, 16), lm_head=nn.Linear(16, 32, bias=False)
     )
@@ -801,6 +1488,18 @@ def test_laguna_checkpoint_contract():
         arch.validate_laguna_dflash_weights(weights, config)
 
 
+def test_speculative_prefill_filter_keeps_hidden_chunks_aligned():
+    drafter = NS(config=NS(target_layer_ids=[0]))
+    prefill = speculative.SpeculativePrefill("dflash", drafter)
+    prefill.append(NS(hidden_states=[mx.array([[[1]], [[2]]])]))
+    prefill.filter([1])
+    output = prefill.finish(NS(hidden_states=[mx.array([[[3]]])]))
+    assert output.hidden_states[0].tolist() == [[[2], [3]]]
+    prefill.append(output)
+    prefill.filter([])
+    assert prefill.chunks == []
+
+
 @parametrize("padding", [[5, 0], [5, 5]])
 def test_padded_prefill_chunks(padding):
     lm, cfg = language("qwen")
@@ -820,6 +1519,24 @@ def test_padded_prefill_chunks(padding):
             padding if padding[1] == 0 else [max(5 - 3 * (step + 1), 0)] * 2
         )
         assert caches[1].left_padding.tolist() == expected_padding
+
+
+def test_qwen3_5_cancelled_prefill_row_preserves_survivor_output():
+    lm, _ = language("qwen")
+    model = lm.model
+    cache = [ArraysCache(2, left_padding=[5, 0]), BatchKVCache([5, 0])]
+    model(mx.array([[0, 0, 0], [1, 2, 3]]), cache=cache)
+    for layer_cache in cache:
+        layer_cache.filter(mx.array([0]))
+
+    singleton_cache = [ArraysCache(2), KVCache()]
+    actual = model(mx.array([[0, 0, 4]]), cache=cache)
+    expected = model(mx.array([[4]]), cache=singleton_cache)
+    assert mx.array_equal(actual[:, -1:], expected).item()
+
+    actual = model(mx.array([[5]]), cache=cache)
+    expected = model(mx.array([[5]]), cache=singleton_cache)
+    assert mx.array_equal(actual, expected).item()
 
 
 @parametrize(
@@ -1171,6 +1888,32 @@ def test_wide_quantized_verifier(batch, length, bits):
         verifier_linear._target_verify_quantized_argmax(linear, inputs),
         greedy(expected),
     )
+
+
+@parametrize("batch,length", [(1, 1), (1, 3), (2, 3)])
+@parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+def test_scaled_quantized_verifier(batch, length, dtype):
+    mx.random.seed(43)
+    linears = [
+        ScaledQuantizedLinear(
+            nn.QuantizedLinear.from_linear(
+                nn.Linear(512, 128, bias=bias), group_size=16, bits=4, mode="nvfp4"
+            ),
+            mx.array(0.37),
+            scale_name,
+        )
+        for bias, scale_name in [
+            (False, "weight_scale_2"),
+            (True, "weight_global_scale"),
+        ]
+    ]
+    inputs = mx.random.normal((batch, length, 512)).astype(dtype)
+    expected = [
+        verifier_linear._target_verify_singletons(linear, inputs) for linear in linears
+    ]
+    for linear, reference in zip(linears, expected):
+        equal(verifier_linear._target_verify_linear(linear, inputs), reference)
+    equal(verifier_linear._target_verify_linears(linears, inputs), expected)
 
 
 def test_glm_mtp_native_weight_fusion():

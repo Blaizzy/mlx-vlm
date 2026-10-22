@@ -56,17 +56,20 @@ MODEL_CONFIG = {
     "qwen3_omni_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "minicpmo": MessageFormat.IMAGE_TOKEN,
     "minicpmv4_6": MessageFormat.IMAGE_TOKEN_WRAPPED,
+    "minicpmv4_7": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "mistral3": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm4v": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm4v_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm5_next": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm_ocr": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "dots_ocr": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "oxr": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "ernie4_5_moe_vl": MessageFormat.LIST_WITH_IMAGE_URL_FIRST,
     "internvl_chat": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "internvl": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "llmjpvl": MessageFormat.IMAGE_TOKEN,
     "nemotron_h_nano_omni": MessageFormat.LIST_WITH_IMAGE_TYPE,
+    "nemotron_h_omni": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "nemotronh_nano_omni_reasoning_v3": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "kimi_vl": MessageFormat.LIST_WITH_IMAGE,
     "kimi_k25": MessageFormat.LIST_WITH_IMAGE,
@@ -91,6 +94,8 @@ MODEL_CONFIG = {
     "step3p7": MessageFormat.IMAGE_PATCH_TOKEN,
     "minimax_m3_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "muse_glimmer": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "muse_spark": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "muse_spark_open": MessageFormat.LIST_WITH_IMAGE_FIRST,
     # Token-based models
     "llava-qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "llava_qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,  # fastvlm
@@ -342,9 +347,15 @@ class MessageFormatter:
             "gemma4_unified",
             "diffusion_gemma",
             "minicpmv4_6",
+            "minicpmv4_7",
             "minimax_m3_vl",
+            "muse_spark",
+            "muse_spark_open",
             "llava_onevision",
             "glm5_next",
+            "nemotron_h_omni",
+            "nemotron_h_nano_omni",
+            "nemotronh_nano_omni_reasoning_v3",
         ] and kwargs.get("video"):
             return self._format_video_message(
                 prompt,
@@ -707,6 +718,14 @@ def get_message_json(
     )
 
 
+def _sort_tool_schema_keys(value):
+    if isinstance(value, dict):
+        return {key: _sort_tool_schema_keys(value[key]) for key in sorted(value)}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_sort_tool_schema_keys(item) for item in value)
+    return value
+
+
 def get_chat_template(
     processor,
     messages: List[Dict[str, Any]],
@@ -916,6 +935,9 @@ def get_chat_template(
             return _messages_to_plain_prompt()
 
         template_kwargs = dict(kwargs)
+        if "tools" in template_kwargs:
+            # Equivalent schemas must render the same token prefix for APC.
+            template_kwargs["tools"] = _sort_tool_schema_keys(template_kwargs["tools"])
         if "enable_thinking" not in template_kwargs and _supports_template_kw(
             template_processor, "enable_thinking"
         ):
@@ -976,7 +998,7 @@ def apply_chat_template(
         if isinstance(prompt, str):
             messages = [{"role": "user", "content": prompt}]
         elif isinstance(prompt, dict):
-            msg = dict(prompt)
+            msg = _normalize_tool_message(prompt)
             msg["content"] = extract_text_from_content(msg.get("content", ""))
             messages = [msg]
         elif isinstance(prompt, list):
@@ -986,7 +1008,11 @@ def apply_chat_template(
                     messages.append({"role": "user", "content": item})
                 elif (role_content := _get_role_content(item)) is not None:
                     role, content = role_content
-                    msg = dict(item) if isinstance(item, dict) else {"role": role}
+                    msg = (
+                        _normalize_tool_message(item)
+                        if isinstance(item, dict)
+                        else {"role": role}
+                    )
                     if role != "tool":
                         msg["content"] = extract_text_from_content(content)
                     messages.append(msg)
