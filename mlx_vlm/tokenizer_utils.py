@@ -200,8 +200,7 @@ class SPMStreamingDetokenizer(StreamingDetokenizer):
 class BPEStreamingDetokenizer(StreamingDetokenizer):
     """A streaming detokenizer for OpenAI style BPE models.
 
-    It adds tokens to the text if the next token starts with a space similar to
-    the SPM detokenizer.
+    It adds each token's text as soon as it forms complete UTF-8 characters.
     """
 
     _byte_decoder = None
@@ -230,18 +229,21 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
         if token in skip_special_token_ids:
             return
         v = self.tokenmap[token]
-        # if the token starts with space
-        if self._byte_decoder[v[0]] == 32:
-            current_text = bytearray(
-                self._byte_decoder[c] for c in self._unflushed
-            ).decode("utf-8", errors="replace")
+        self._unflushed += v
+        current_text = bytearray(self._byte_decoder[c] for c in self._unflushed).decode(
+            "utf-8", errors="replace"
+        )
+
+        # For multi-byte utf-8 wait until they are complete
+        # For single spaces wait until the next token to clean it if needed
+        if not current_text.endswith(REPLACEMENT_CHAR) and not (
+            len(v) == 1 and self._byte_decoder[v] == 32
+        ):
             if self.text or not self.trim_space:
                 self.text += current_text
             else:
                 self.text += _remove_space(current_text)
-            self._unflushed = v
-        else:
-            self._unflushed += v
+            self._unflushed = ""
 
     def finalize(self):
         try:

@@ -199,6 +199,31 @@ def test_last_segment_basic():
     assert "world" in segment2 or "world" in detokenizer.text
 
 
+@pytest.mark.parametrize(
+    "vocab, trim, expected",
+    [
+        (
+            ['{"', "a", '":', "1", "}"],
+            False,
+            ['{"', '{"a', '{"a":', '{"a":1', '{"a":1}'],
+        ),
+        (["Ġhello", "Ġworld"], True, ["hello", "hello world"]),
+        (["caf", "Ã", "©"], False, ["caf", "caf", "café"]),
+    ],
+    ids=["no-spaces", "trim-space", "split-utf8"],
+)
+def test_bpe_text_streams_per_token(vocab, trim, expected):
+    tokenizer = MockTokenizer(dict(zip(vocab, range(len(vocab)))))
+    detokenizer = BPEStreamingDetokenizer(tokenizer, trim_space=trim)
+    texts = []
+    for token in range(len(vocab)):
+        detokenizer.add_token(token)
+        texts.append(detokenizer.text)
+    assert texts == expected
+    detokenizer.finalize()
+    assert detokenizer.text == expected[-1]
+
+
 def test_initialization():
     tokenizer = MockBPETokenizer()
     detokenizer = BPEStreamingDetokenizer(tokenizer)
