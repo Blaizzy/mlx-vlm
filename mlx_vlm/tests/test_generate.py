@@ -2149,6 +2149,109 @@ def test_generate_step_clamps_temperature(seed, dtype, top_p, temperature):
     assert set(actual) == {1, 2}
 
 
+@pytest.mark.parametrize("penalty", ["repetition", "presence", "frequency"])
+@pytest.mark.parametrize("context_size", [0, 3, 20])
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize(
+    "history",
+    [
+        [],
+        [0, 0, 2, 5, 0],
+        [-1, 0, 2, -1, 2, 0],
+        [-200, -1, 6, 7, 2**31 - 1],
+        [2, 2, 2, -200, 6, 0],
+    ],
+    ids=["empty", "valid-repeats", "negative-marker", "only-invalid", "window-edge"],
+)
+def test_penalties_ignore_non_vocabulary_ids(
+    penalty, context_size, compiled, dtype, history
+):
+    values = [[0, -3, 3, 6, -6, 9], [3, 6, -6, 0, 9, -3]]
+    expected = np.array(values, dtype=np.float32)
+    window = history[-context_size:]
+    for token in set(window):
+        if not 0 <= token < expected.shape[-1]:
+            continue
+        if penalty == "repetition":
+            expected[:, token] = np.where(
+                expected[:, token] < 0,
+                expected[:, token] * 1.5,
+                expected[:, token] / 1.5,
+            )
+        else:
+            count = window.count(token) if penalty == "frequency" else 1
+            expected[:, token] -= 1.5 * count
+
+    processor = getattr(sampling, f"make_{penalty}_penalty")(1.5, context_size)
+    if compiled:
+        processor = mx.compile(processor)
+    actual = processor(mx.array(history, dtype=mx.int32), mx.array(values, dtype=dtype))
+    assert actual.dtype == dtype
+    np.testing.assert_array_equal(np.array(actual.astype(mx.float32)), expected)
+
+
+@pytest.mark.parametrize("penalty", ["repetition", "presence", "frequency"])
+@pytest.mark.parametrize("unsigned_array", [False, True], ids=["list", "uint32"])
+def test_penalties_preserve_token_container_support(penalty, unsigned_array):
+    tokens = [0, 0, 1, 1000]
+    if unsigned_array:
+        tokens = mx.array(tokens + [2**32 - 1], dtype=mx.uint32)
+    else:
+        tokens.append(-200)
+    processor = getattr(sampling, f"make_{penalty}_penalty")(1.5)
+    expected = {
+        "repetition": [[2.0, 4.0, 9.0]],
+        "presence": [[1.5, 4.5, 9.0]],
+        "frequency": [[0.0, 4.5, 9.0]],
+    }
+    assert processor(tokens, mx.array([[3.0, 6.0, 9.0]])).tolist() == expected[penalty]
+
+
+@pytest.mark.parametrize("penalty", ["repetition", "presence", "frequency"])
+@pytest.mark.parametrize("marker", [-200, 256], ids=["negative", "past-vocab"])
+@pytest.mark.parametrize("prefill_step_size", [None, 1, 2048])
+def test_generate_step_penalties_ignore_image_markers(
+    penalty, marker, prefill_step_size
+):
+    prompt = mx.array([[1, marker, 2]])
+    scores = [0.0] * 256
+    scores[56], scores[57] = 10.0, 9.5
+    model = SimpleNamespace(
+        config=SimpleNamespace(),
+        language_model=lambda *args, **kwargs: LanguageModelOutput(
+            logits=mx.array(scores)[None, None, :]
+        ),
+        get_input_embeddings=lambda *args, **kwargs: InputEmbeddingsFeatures(
+            inputs_embeds=mx.zeros((1, 12, 4))
+        ),
+    )
+    seen = []
+
+    def record_history(tokens, logits):
+        seen.append(tokens.tolist())
+        return logits
+
+    generated = list(
+        generate_module.generate_step(
+            prompt,
+            model,
+            pixel_values=None,
+            mask=None,
+            prompt_cache=[],
+            max_tokens=2,
+            temperature=0,
+            prefill_step_size=prefill_step_size,
+            logits_processors=[record_history],
+            **{f"{penalty}_penalty": 1.1, f"{penalty}_context_size": 0},
+        )
+    )
+    tokens = [token for token, _ in generated]
+    assert tokens == [56, 57]
+    for i, history in enumerate(seen):
+        assert history == prompt[0].tolist() + tokens[:i]
+
+
 @pytest.mark.parametrize("prefix_length", [0, 2, 9])
 @pytest.mark.parametrize("prefill_step_size", [None, 1, 4, 2048])
 @pytest.mark.parametrize("penalty", ["repetition", "presence", "frequency"])
