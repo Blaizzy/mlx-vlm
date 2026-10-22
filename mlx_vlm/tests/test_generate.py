@@ -1978,8 +1978,7 @@ def test_sampling_filter_matches_numpy(name, values, reference, tolerance):
     ],
 )
 def test_typical_p_masked_logprobs_match_reference(dtype, typical_p, expected):
-    # These rows have distinct typicality distances, away from cutoff boundaries.
-    # A NaN entropy can either add or remove candidates, depending on token order.
+    # Both token orders expose incorrect filtering, without cutoff ties.
     logprobs = mx.log(
         mx.array([[0.05, 0.35, 0.60, 0.0], [0.0, 0.60, 0.05, 0.35]])
     ).astype(dtype)
