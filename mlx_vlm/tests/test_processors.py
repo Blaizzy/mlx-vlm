@@ -52,6 +52,7 @@ from mlx_vlm.tokenizer_utils import (
     _match,
     _ServerTokenStreamer,
     load_tokenizer,
+    make_streaming_detokenizer,
 )
 from mlx_vlm.tools import (
     SPECS,
@@ -213,15 +214,21 @@ def test_initialization():
 @pytest.mark.parametrize("server_stream", [False, True], ids=["cli", "server"])
 @pytest.mark.parametrize("trim_space", [False, True], ids=["keep-space", "trim-space"])
 @pytest.mark.parametrize(
-    "pieces, expected",
+    "pieces, expected_segments, final_segment",
     [
-        (["Ġhello", "Ġworld"], " hello world"),
-        (["hello", "\n\n", "world"], "hello\n\nworld"),
-        (["高", "ა", "🙂"], "高ა🙂"),
-        (["Ġé\n高", "Ġdone"], "Ġé\n高 done"),
-        ([" hello", "\t", "world"], " hello\tworld"),
-        (["Ã", "©", "\n\n", "高"], "é\n\n高"),
-        (["Ã", "高", "©", "Ġdone"], "\ufffd高\ufffd done"),
+        (["Ġhello", "Ġworld"], [" hello", " world"], ""),
+        (["hello", "\n\n", "world"], ["hello", "\n\n", "world"], ""),
+        (["高", "ა", "🙂"], ["高", "ა", "🙂"], ""),
+        (["Ġé\n高", "Ġdone"], ["Ġé\n高", " done"], ""),
+        ([" hello", "\t", "world"], [" hello", "\t", "world"], ""),
+        (["Ã", "©", "\n\n", "高"], ["", "é", "\n\n", "高"], ""),
+        (["Ã", "高", "©", "Ġdone"], ["", "\ufffd高", "\ufffd", " done"], ""),
+        (["Ã", "高", "©"], ["", "\ufffd高", "\ufffd"], ""),
+        (["hello", "Ã"], ["hello", ""], "\ufffd"),
+        (["ðŁ", "ĻĤ"], ["", "🙂"], ""),
+        (["ðŁ"], [""], "\ufffd"),
+        (["\ufffd"], ["\ufffd"], ""),
+        (["Ġ", "Ġ", "hello"], [" ", " ", "hello"], ""),
     ],
     ids=[
         "byte-alphabet",
@@ -231,10 +238,16 @@ def test_initialization():
         "literal-whitespace",
         "split-utf8",
         "interrupted-utf8",
+        "invalid-utf8-at-end",
+        "incomplete-utf8-at-end",
+        "split-emoji",
+        "incomplete-emoji-at-end",
+        "literal-replacement-character",
+        "trim-only-first-space",
     ],
 )
 def test_bpe_streaming_matches_native_bytelevel(
-    tmp_path, pieces, expected, trim_space, server_stream
+    tmp_path, pieces, expected_segments, final_segment, trim_space, server_stream
 ):
     backend = Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
     backend.decoder = ByteLevelDecoder()
@@ -244,13 +257,18 @@ def test_bpe_streaming_matches_native_bytelevel(
         tokenizer_object=backend, clean_up_tokenization_spaces=False
     )
     tokens = [backend.token_to_id(piece) for piece in pieces]
-    assert tokenizer.decode(tokens) == expected
+    assert tokenizer.decode(tokens) == "".join(expected_segments) + final_segment
 
     factory = load_tokenizer(tmp_path, return_tokenizer=False)
     assert factory is BPEStreamingDetokenizer
     detokenizer = factory(tokenizer, trim_space=trim_space)
+    expected_segments = expected_segments.copy()
     if trim_space:
-        expected = expected.removeprefix(" ")
+        for i, segment in enumerate(expected_segments):
+            if segment:
+                expected_segments[i] = segment.removeprefix(" ")
+                break
+    expected = "".join(expected_segments) + final_segment
 
     # Resetting an existing detokenizer must preserve its normalized token map.
     for _ in range(2):
@@ -260,15 +278,40 @@ def test_bpe_streaming_matches_native_bytelevel(
             streamer = _ServerTokenStreamer(tokenizer, detokenizer)
             for token in tokens:
                 segments.append(streamer.advance(token, finish_reason=None))
-            segments.append(streamer.finalize())
+            assert segments == expected_segments
+            assert streamer.finalize() == final_segment
+            assert streamer.finalize() == ""
         else:
             for token in tokens:
                 detokenizer.add_token(token)
                 segments.append(detokenizer.last_segment)
+                assert detokenizer.last_segment == ""
+            assert segments == expected_segments
             detokenizer.finalize()
-            segments.append(detokenizer.last_segment)
+            assert detokenizer.last_segment == final_segment
+            detokenizer.finalize()
+            assert detokenizer.last_segment == ""
             assert detokenizer.text == expected
-        assert "".join(segments) == expected
+        assert "".join(segments) + final_segment == expected
+
+
+def test_bpe_streaming_copies_isolate_partial_utf8_and_skip_tokens():
+    source = BPEStreamingDetokenizer(
+        MockTokenizer({"Ã": 0, "©": 1, "高": 2, "<skip>": 3})
+    )
+    source.add_token(0)
+    processor = NS(detokenizer=source)
+    left = make_streaming_detokenizer(processor)
+    right = make_streaming_detokenizer(processor)
+    left.add_token(0)
+    assert left.last_segment == ""
+    right.add_token(2)
+    assert right.last_segment == "高"
+    left.add_token(3, skip_special_token_ids=[3])
+    left.add_token(1)
+    assert left.last_segment == "é"
+    source.add_token(1)
+    assert source.last_segment == "é"
 
 
 @pytest.mark.parametrize("factory", [None, SPMStreamingDetokenizer])
