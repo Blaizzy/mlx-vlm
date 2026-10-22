@@ -8,22 +8,60 @@ on:
     branches:
       - main
 
-jobs:
-  test:
-    runs-on: macos-14
-    timeout-minutes: 30
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@v6
         with:
-          python-version: '3.10'
+          version: '0.12.24'
+          python-version: '3.10.22'
+          activate-environment: true
+
+      - name: Cache pre-commit environments
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ runner.os }}-${{ runner.arch }}-py3.10.22-${{ hashFiles('.pre-commit-config.yaml') }}
 
       - name: Install pre-commit
-        run: python -m pip install pre-commit
+        run: uv pip install pre-commit
+
+      - name: Validate test groups
+        run: |
+          python - <<'PY'
+          from collections import Counter
+          from pathlib import Path
+
+          import yaml
+
+          workflow = yaml.safe_load(Path('.github/workflows/tests.yml').read_text())
+          groups = workflow['jobs']['test']['strategy']['matrix']['include']
+          assigned = Counter(path for group in groups for path in group['tests'].split())
+          discovered = {
+              path.relative_to('mlx_vlm').as_posix()
+              for pattern in ('test_*.py', '*_test.py')
+              for path in Path('mlx_vlm/tests').rglob(pattern)
+          }
+          errors = {
+              'unassigned': sorted(discovered - assigned.keys()),
+              'missing': sorted(assigned.keys() - discovered),
+              'duplicates': sorted(path for path, count in assigned.items() if count > 1),
+              'empty groups': [group['group'] for group in groups if not group['tests'].split()],
+          }
+          if any(errors.values()):
+              raise SystemExit(f'Invalid test groups: {errors}')
+          print(f'All {len(discovered)} test files are assigned exactly once.')
+          PY
 
       - name: Run pre-commit checks
         run: |
@@ -36,11 +74,129 @@ jobs:
             exit 1
           fi
 
+  test:
+    name: ${{ matrix.suite }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: interfaces
+            suite: Server, CLI, sampling, tool streaming & generation
+            os: ubuntu-24.04
+            extras: 'test,cpu'
+            tests: >-
+              tests/test_cli.py
+              tests/test_generate.py
+              tests/test_sampling_defaults.py
+              tests/test_server.py
+              tests/test_server_stt_realtime.py
+              tests/test_tool_streaming.py
+          - group: training-ops
+            suite: Training, cache, offloading & model operations
+            os: macos-14
+            extras: test
+            # Keep cache pressure checks away from the larger model contracts.
+            # Run the training API first so its compilation starts early.
+            tests: >-
+              tests/test_training_api.py
+              tests/test_cache.py
+              tests/test_model_ops.py
+              tests/test_moe_offload.py
+              tests/test_trainer.py
+              tests/test_trainer_facades.py
+              tests/test_training_batching.py
+              tests/test_training_callbacks.py
+              tests/test_training_cli.py
+              tests/test_training_cross_entropy.py
+              tests/test_training_data_loading.py
+              tests/test_training_dataset_preparation.py
+              tests/test_training_grpo.py
+              tests/test_training_grpo_text_notebook.py
+              tests/test_training_helpers.py
+              tests/test_training_metrics.py
+              tests/test_training_model_preparation.py
+              tests/test_training_notebooks.py
+              tests/test_training_vlm.py
+          - group: models
+            suite: Models, processors & speculation
+            os: macos-14
+            extras: test
+            tests: >-
+              tests/test_gated_delta.py
+              tests/test_inkling_kernel_gates.py
+              tests/test_models.py
+              tests/test_muse_spark.py
+              tests/test_muse_spark_kernels.py
+              tests/test_oxr.py
+              tests/test_processors.py
+              tests/test_speculative.py
+          - group: media
+            suite: Diffusion, audio, images, video & extraction
+            os: macos-14
+            extras: test
+            tests: >-
+              tests/test_audio_models.py
+              tests/test_diffusion_models.py
+              tests/test_extraction_models.py
+              tests/test_flux3.py
+              tests/test_flux3_upsampler.py
+              tests/test_image_generation_models.py
+              tests/test_llada_image.py
+              tests/test_moss_image.py
+              tests/test_muse_spark_video.py
+              tests/test_video_generation_models.py
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.12.24'
+          python-version: '3.10.22'
+          activate-environment: true
+          enable-cache: true
+          cache-dependency-glob: |
+            requirements.txt
+            pyproject.toml
+
       - name: Install package and dependencies
+        run: uv pip install -e ".[${{ matrix.extras }}]"
+
+      - name: Locate Metal compiler cache
+        if: runner.os == 'macOS'
+        id: metal
         run: |
-          python -m pip install -e ".[test]"
+          echo "path=$(getconf DARWIN_USER_CACHE_DIR)" >> "$GITHUB_OUTPUT"
+          echo "version=$(sw_vers -buildVersion)-$(python -c 'import importlib.metadata; print(importlib.metadata.version("mlx"))')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Metal compilation
+        if: runner.os == 'macOS'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ steps.metal.outputs.path }}/com.apple.metal
+            ${{ steps.metal.outputs.path }}/com.apple.metalfe
+          key: metal-${{ runner.arch }}-${{ steps.metal.outputs.version }}-${{ matrix.group }}-${{ hashFiles('mlx_vlm/**/*.py', 'mlx_vlm/**/*.json', '.github/workflows/tests.yml') }}
+          restore-keys: |
+            metal-${{ runner.arch }}-${{ steps.metal.outputs.version }}-${{ matrix.group }}-
+            metal-${{ runner.arch }}-${{ steps.metal.outputs.version }}-
 
       - name: Run Python tests
+        working-directory: mlx_vlm
+        env:
+          TEST_FILES: ${{ matrix.tests }}
         run: |
-          cd mlx_vlm/
-          pytest -s ./tests
+          read -r -a tests <<< "$TEST_FILES"
+          python -m pytest -q -n 3 --dist=worksteal --durations=30 \
+            --junitxml=../test-results/${{ matrix.group }}.xml "${tests[@]}"
+
+      - name: Upload test timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-timings-${{ matrix.group }}
+          path: test-results/${{ matrix.group }}.xml
+          retention-days: 14

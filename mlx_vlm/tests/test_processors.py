@@ -851,6 +851,73 @@ def test_auto_processor_routes_to_custom_loader(
         loader.assert_called_once_with(tmp_path, trust_remote_code=True)
 
 
+def test_flint_tokenizer_prompt_and_stop_tokens(tmp_path):
+    importlib.import_module("mlx_vlm.models.flint")
+    raw = Tokenizer(
+        WordLevel(
+            {
+                "[UNK]": 0,
+                "hello": 1,
+                "<|end_of_text|>": 2,
+                "<|user|>": 3,
+                "<|assistant|>": 4,
+            },
+            unk_token="[UNK]",
+        )
+    )
+    raw.pre_tokenizer = Whitespace()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=raw,
+        unk_token="[UNK]",
+        eos_token="<|end_of_text|>",
+        additional_special_tokens=["<|user|>", "<|assistant|>"],
+    )
+    tokenizer.chat_template = (
+        "{% for m in messages %}<|{{ m.role }}|>"
+        "{% if m.reasoning_content %}<think>{{ m.reasoning_content }}</think>{% endif %}"
+        "{{ m.content }}{% for tc in m.tool_calls %}<tool_call>{{ tc.function.name }}"
+        "{% for k, v in tc.function.arguments.items() %}"
+        "<arg_key>{{ k }}</arg_key><arg_value>{{ v }}</arg_value>{% endfor %}"
+        "</tool_call>{% endfor %}{% endfor %}"
+        "{% if add_generation_prompt %}<|assistant|>{% endif %}"
+    )
+    tokenizer.save_pretrained(tmp_path)
+    _write_configs(
+        tmp_path,
+        config={
+            "model_type": "flint",
+            "auto_map": {"AutoConfig": "must_not_execute.FlintConfig"},
+        },
+    )
+    processor = load_processor(tmp_path, eos_token_ids=[2, 4], trust_remote_code=False)
+    assert isinstance(processor, PreTrainedTokenizerBase)
+    assert processor.backend_tokenizer.to_str() == tokenizer.backend_tokenizer.to_str()
+    prompt = apply_chat_template(processor, {"model_type": "flint"}, "hello")
+    assert prompt == "<|user|>hello<|assistant|>"
+    assert processor.encode(prompt) == [3, 1, 4]
+    assert processor.stopping_criteria(2)
+    assert processor.stopping_criteria(4)
+    assert not processor.stopping_criteria(1)
+    assert _infer_tool_parser_from_processor(processor) == "glm47"
+    previous_answer = dict(
+        role="assistant", content="hello", reasoning_content="Remember this."
+    )
+    previous_call = dict(
+        role="assistant",
+        content=None,
+        reasoning_content="Look it up.",
+        tool_calls=[dict(function=dict(name="lookup", arguments='{"query": "hello"}'))],
+    )
+    for messages in (previous_call, [previous_answer, previous_call]):
+        original = deepcopy(messages)
+        rendered = apply_chat_template(processor, {"model_type": "flint"}, messages)
+        assert "<think>Look it up.</think><tool_call>lookup" in rendered
+        assert "<arg_key>query</arg_key><arg_value>hello</arg_value>" in rendered
+        if isinstance(messages, list):
+            assert "<think>Remember this.</think>hello" in rendered
+        assert messages == original
+
+
 def test_qwen3_5_moe_text_stale_vl_processor_loads_tokenizer(tmp_path):
     from transformers import Qwen2Tokenizer
 

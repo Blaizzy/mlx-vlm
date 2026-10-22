@@ -131,24 +131,36 @@ class ModelChecks:
 
     def assert_close(self, actual, expected, *, logits=False):
         assert actual.shape == expected.shape
-        assert mx.all(mx.isfinite(actual)).item()
         tolerance = 5e-3 if actual.dtype == mx.float16 else 1e-4
         # One-token attention uses a different Metal kernel from full prefill.
         if logits:
             tolerance = max(tolerance, 2e-3)
+        actual, expected = actual.astype(mx.float32), expected.astype(mx.float32)
+        mx.eval(actual, expected)
+        actual, expected = np.array(actual), np.array(expected)
+        assert np.isfinite(actual).all()
         np.testing.assert_allclose(
-            np.array(actual.astype(mx.float32)),
-            np.array(expected.astype(mx.float32)),
+            actual,
+            expected,
             atol=tolerance,
             rtol=tolerance,
         )
 
-    def prefill_parity(self, model, ids, media, chunk_sizes):
+    def prefill_parity(self, model, ids, media, chunk_sizes, *, features=None):
         """Compare full, cached and chunked prefill, then decode one new token."""
         language = model.language_model
-        features = model.get_input_embeddings(ids, **media).to_dict()
+        if features is None:
+            features = model.get_input_embeddings(ids, **media)
+        features = features.to_dict()
         embeds = features.pop("inputs_embeds")
-        reference = model(ids, cache=make_prompt_cache(language), **media).logits
+        token = mx.full((ids.shape[0], 1), 7, mx.int32)
+        full = model(
+            mx.concatenate([ids, token], axis=1),
+            cache=make_prompt_cache(language),
+            **media,
+        ).logits
+        # One causal full pass supplies both the prefill and decode references.
+        reference, extended = full[:, :-1], full[:, -1:]
         if ids.shape[0] > 1:
             solo = []
             for row in range(ids.shape[0]):
@@ -165,12 +177,6 @@ class ModelChecks:
                     ).logits
                 )
             self.assert_close(reference, mx.concatenate(solo), logits=True)
-        token = mx.full((ids.shape[0], 1), 7, mx.int32)
-        extended = model(
-            mx.concatenate([ids, token], axis=1),
-            cache=make_prompt_cache(language),
-            **media,
-        ).logits[:, -1:]
         for size in (ids.shape[1] - 1, *chunk_sizes):
             cache, chunks = make_prompt_cache(language), []
             for start in range(0, ids.shape[1], size):
@@ -226,6 +232,7 @@ class ModelChecks:
                             ids += [config.vision_end_token_id]
                         rows.append(ids + [3, 4, 5])
                     ids = mx.array(rows, mx.int32)
+                    flat_ids = [token for row in rows for token in row]
                     for kind in layout:
                         pixels = mx.random.normal(
                             (batch * math.prod(grids[kind]), patch_width)
@@ -248,11 +255,7 @@ class ModelChecks:
                     expected_embeds = model.language_model.model.embed_tokens(ids)
                     for kind in layout:
                         positions = mx.array(
-                            [
-                                i
-                                for i, t in enumerate(ids.flatten().tolist())
-                                if t == tokens[kind]
-                            ],
+                            [i for i, t in enumerate(flat_ids) if t == tokens[kind]],
                             mx.uint32,
                         )
                         embeddings, layer_features = encoded[kind]
@@ -268,7 +271,7 @@ class ModelChecks:
                         self.assert_close(residuals, expected)
                     else:
                         positions = mx.array(
-                            [i for i, v in enumerate(mask.flatten().tolist()) if v],
+                            [i for i, t in enumerate(flat_ids) if t in tokens.values()],
                             mx.uint32,
                         )
                         self.assert_close(
@@ -287,7 +290,9 @@ class ModelChecks:
                             mx.zeros_like(features.inputs_embeds), mask, value
                         )
                         self.assert_close(injected, expected[:, :, layer])
-                    self.prefill_parity(model, ids, media, chunk_sizes)
+                    self.prefill_parity(
+                        model, ids, media, chunk_sizes, features=features
+                    )
 
     def input_embeddings(self, model, model_name):
         result = model.get_input_embeddings(input_ids=mx.array([[1, 2, 3, 4, 5]]))
@@ -409,7 +414,7 @@ class ModelChecks:
         batch = kwargs.pop("batch_size", 1)
         flat = (
             "qwen2_5_vl qwen3_5 qwen3_5_moe qwen4_exp "
-            "glm4v_moe glm4v hunyuan_vl siglip2_vision_model mimovl"
+            "glm4v_moe glm4v hunyuan_vl siglip2_vision_model mimovl siglip2_navit"
         ).split()
         shape = (
             image_size
@@ -719,6 +724,242 @@ def test_nemotron_parse_source_architecture_and_tied_head_mapping():
         }
     )
     assert list(weights) == ["language_model.embed_tokens.weight"]
+
+
+@pytest.fixture
+def flint_model():
+    from mlx_vlm.models import flint
+
+    mx.random.seed(17)
+    model = flint.Model(build_config(flint, model_case("flint")["config"]))
+    model.eval()
+    mx.eval(model.parameters())
+    return model
+
+
+def _flint_numpy_reference(model, ids):
+    """Independent dense attention and explicit expert oracle for tiny Flint."""
+    config = model.config
+    weights = {
+        k.removeprefix("language_model."): np.array(v.astype(mx.float32)).astype(
+            np.float64
+        )
+        for k, v in tree_flatten(model.parameters())
+    }
+
+    def linear(x, name):
+        return x @ weights[name + ".weight"].T
+
+    def norm(x, name):
+        return (
+            x
+            / np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + config.rms_norm_eps)
+            * weights[name + ".weight"]
+        )
+
+    def mlp(x, prefix):
+        gate = linear(x, prefix + ".gate_proj")
+        return linear(
+            gate / (1 + np.exp(-gate)) * linear(x, prefix + ".up_proj"),
+            prefix + ".down_proj",
+        )
+
+    x = weights["model.embed_tokens.weight"][ids]
+    batch, length, _ = x.shape
+    positions = np.arange(length)
+    for i in range(config.num_hidden_layers):
+        prefix = f"model.layers.{i}"
+        a = prefix + ".self_attn"
+        hidden = norm(x, prefix + ".input_layernorm")
+        q = norm(
+            linear(hidden, a + ".q_proj").reshape(
+                batch, length, config.num_attention_heads, config.head_dim
+            ),
+            a + ".q_norm",
+        )
+        k = norm(
+            linear(hidden, a + ".k_proj").reshape(
+                batch, length, config.num_key_value_heads, config.head_dim
+            ),
+            a + ".k_norm",
+        )
+        v = linear(hidden, a + ".v_proj").reshape(
+            batch, length, config.num_key_value_heads, config.head_dim
+        )
+        if i not in config.no_rope_layer_indices:
+            angles = positions[:, None] / config.rope_theta ** (
+                np.arange(0, config.head_dim, 2) / config.head_dim
+            )
+            angles = np.concatenate([angles, angles], -1)[None, :, None, :]
+
+            def rotate(t):
+                left, right = np.split(t, 2, axis=-1)
+                return t * np.cos(angles) + np.concatenate([-right, left], -1) * np.sin(
+                    angles
+                )
+
+            q, k = rotate(q), rotate(k)
+        repeat = config.num_attention_heads // config.num_key_value_heads
+        q = q.transpose(0, 2, 1, 3)
+        k, v = (np.repeat(t, repeat, axis=2).transpose(0, 2, 1, 3) for t in (k, v))
+        scores = (q @ k.swapaxes(-2, -1)) / np.sqrt(config.head_dim)
+        allowed = positions[:, None] >= positions[None, :]
+        if config.layer_types[i] == "sliding_attention" and config.sliding_window:
+            allowed &= positions[:, None] - positions[None, :] < config.sliding_window
+        scores = np.where(allowed, scores, -np.inf)
+        sink = np.broadcast_to(
+            weights[a + ".softmax_offset"][None, :, None, None], (*scores.shape[:-1], 1)
+        )
+        scores = np.concatenate([scores, sink], axis=-1)
+        probs = np.exp(scores - scores.max(axis=-1, keepdims=True))
+        probs /= probs.sum(axis=-1, keepdims=True)
+        attention = (
+            (probs[..., :-1] @ v).transpose(0, 2, 1, 3).reshape(batch, length, -1)
+        )
+        x = x + linear(attention, a + ".o_proj")
+        hidden = norm(x, prefix + ".post_attention_layernorm")
+        p = prefix + ".mlp"
+        if i in config.mlp_only_layers:
+            x = x + mlp(hidden, p)
+            continue
+        scores = 1 / (1 + np.exp(-linear(hidden, p + ".gate")))
+        indices = np.argsort(scores + weights[p + ".expert_bias"], axis=-1)[
+            ..., -config.num_experts_per_tok :
+        ]
+        route_weights = np.take_along_axis(scores, indices, axis=-1)
+        route_weights /= route_weights.sum(axis=-1, keepdims=True) + 1e-20
+        routed = np.zeros_like(hidden)
+        for b in range(batch):
+            for t in range(length):
+                for e, score in zip(indices[b, t], route_weights[b, t]):
+                    gate = (
+                        hidden[b, t] @ weights[p + ".switch_mlp.gate_proj.weight"][e].T
+                    )
+                    up = hidden[b, t] @ weights[p + ".switch_mlp.up_proj.weight"][e].T
+                    routed[b, t] += score * (
+                        (gate / (1 + np.exp(-gate)) * up)
+                        @ weights[p + ".switch_mlp.down_proj.weight"][e].T
+                    )
+        shared = (
+            mlp(hidden, p + ".shared_expert")
+            if config.shared_expert_intermediate_size
+            else 0
+        )
+        x = x + routed + shared
+    return linear(norm(x, "model.norm"), "lm_head")
+
+
+def test_flint_matches_independent_attention_and_moe_reference(flint_model):
+    for layer in flint_model.layers:
+        layer.self_attn.softmax_offset = mx.array([-2.0, 0.0, 1.0, 3.0])
+        if hasattr(layer.mlp, "expert_bias"):
+            layer.mlp.expert_bias = mx.array([0.5, -0.4, 0.1, 0.3])
+    ids = np.array([[1, 4, 7, 2, 9, 3, 8, 5, 6], [7, 3, 8, 5, 6, 1, 2, 9, 4]])
+    actual = flint_model(mx.array(ids)).logits
+    expected = _flint_numpy_reference(flint_model, ids)
+    np.testing.assert_allclose(np.array(actual), expected, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.parametrize("window", [1, 4, None])
+def test_flint_hybrid_cache_matches_full_forward(flint_model, window):
+    flint_model.layers[1].self_attn.window_size = window
+    ids = (mx.arange(41)[None] * 7 + 3) % flint_model.config.vocab_size
+    expected = flint_model(ids).logits
+    for schedule in ([1] * 41, [17, 7, 8, 8, 1], [1] * 19 + [5, 8, 8, 1]):
+        cache = flint_model.make_cache()
+        out, start = [], 0
+        for size in schedule:
+            logits = flint_model(ids[:, start : start + size], cache=cache).logits
+            mx.eval(logits)
+            out.append(logits)
+            start += size
+        np.testing.assert_allclose(
+            np.array(mx.concatenate(out, axis=1)),
+            np.array(expected),
+            atol=2e-5,
+            rtol=2e-5,
+        )
+        assert isinstance(cache[0], KVCache)
+        assert isinstance(cache[1], KVCache if window is None else RotatingKVCache)
+        assert all(c.offset == 41 for c in cache)
+
+
+def test_flint_padded_batch_matches_individual_decoding(flint_model):
+    from mlx_vlm.models.cache import BatchKVCache, BatchRotatingKVCache
+
+    ids = mx.array([[0, 0, 1, 2, 3, 4, 5], [1, 2, 3, 4, 5, 6, 7]])
+    cache = [
+        (
+            BatchRotatingKVCache(layer.self_attn.window_size, [2, 0])
+            if layer.self_attn.window_size
+            else BatchKVCache([2, 0])
+        )
+        for layer in flint_model.layers
+    ]
+    actual = flint_model(ids, cache=cache).logits[:, -1:]
+    for row, pad in enumerate([2, 0]):
+        expected = flint_model(ids[row : row + 1, pad:]).logits[:, -1:]
+        np.testing.assert_allclose(
+            np.array(actual[row : row + 1]), np.array(expected), atol=2e-5, rtol=2e-5
+        )
+    token = mx.array([[8], [9]])
+    actual = flint_model(token, cache=cache).logits
+    for row, pad in enumerate([2, 0]):
+        extended = mx.concatenate(
+            [ids[row : row + 1, pad:], token[row : row + 1]], axis=1
+        )
+        expected = flint_model(extended).logits[:, -1:]
+        np.testing.assert_allclose(
+            np.array(actual[row : row + 1]), np.array(expected), atol=2e-5, rtol=2e-5
+        )
+
+
+@pytest.mark.parametrize("with_bias", [False, True])
+@pytest.mark.parametrize("quantized", [False, True])
+def test_flint_checkpoint_strict_loading_and_roundtrip(
+    flint_model, tmp_path, with_bias, quantized
+):
+    model = flint_model
+    if quantized:
+        nn.quantize(
+            model,
+            group_size=32,
+            bits=4,
+            class_predicate=lambda path, m: hasattr(m, "to_quantized")
+            and "mlp.gate" not in path
+            and m.weight.shape[-1] % 32 == 0,
+        )
+    expected = dict(tree_flatten(model.parameters()))
+    checkpoint = {}
+    for key, value in expected.items():
+        key = key.removeprefix("language_model.")
+        if key.endswith(".mlp.expert_bias"):
+            if with_bias:
+                checkpoint[
+                    key.replace(".mlp.expert_bias", ".mlp.gate.e_score_correction_bias")
+                ] = value
+        elif ".mlp.switch_mlp." in key:
+            prefix, suffix = key.split(".mlp.switch_mlp.")
+            for e in range(model.config.num_experts):
+                checkpoint[f"{prefix}.mlp.experts.{e}.{suffix}"] = value[e]
+        else:
+            checkpoint[key] = value
+    sanitized = model.sanitize(checkpoint)
+    assert sanitized.keys() == expected.keys()
+    assert model.sanitize(sanitized).keys() == expected.keys()
+    for key, value in expected.items():
+        assert mx.array_equal(sanitized[key], value).item(), key
+    model.load_weights(list(sanitized.items()), strict=True)
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), sanitized)
+    config = model.config.to_dict()
+    if quantized:
+        config["quantization"] = {"group_size": 32, "bits": 4}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    reloaded = load_model(tmp_path)
+    ids = mx.array([[1, 2, 3, 4, 5]])
+    np.testing.assert_array_equal(
+        np.array(reloaded(ids).logits), np.array(model(ids).logits)
+    )
 
 
 @pytest.fixture
@@ -2905,30 +3146,38 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
         )
         self.assertIsNone(output.hidden_states)
         expected = output.logits
-        mx.eval(expected)
-
+        comparisons = []
         for chunks in ((8,), (3, 2, 3), (1,) * 8):
-            with self.subTest(chunks=chunks):
-                cache = model.make_cache()
-                outputs, start = [], 0
-                for length in chunks:
-                    stop = start + length
-                    outputs.append(
-                        model(
-                            inputs=ids[:, start:stop],
-                            inputs_embeds=embeds[:, start:stop],
-                            cache=cache,
-                            n_to_process=length,
-                        ).logits
-                    )
-                    start = stop
-                actual = mx.concatenate(outputs, axis=1)
-                mx.eval(actual)
-                self.assertTrue(
-                    bool(mx.array_equal(cache[0].engram, reference_cache[0].engram))
+            cache = model.make_cache()
+            outputs, start = [], 0
+            for length in chunks:
+                stop = start + length
+                outputs.append(
+                    model(
+                        inputs=ids[:, start:stop],
+                        inputs_embeds=embeds[:, start:stop],
+                        cache=cache,
+                        n_to_process=length,
+                    ).logits
                 )
-                self.assertTrue(bool(mx.all(cache[0].engram[:, 2:5] == -1)))
-                self.assertTrue(bool(mx.allclose(actual, expected, atol=1e-4)))
+                start = stop
+            comparisons.append(
+                (
+                    chunks,
+                    (
+                        mx.array_equal(cache[0].engram, reference_cache[0].engram),
+                        mx.all(cache[0].engram[:, 2:5] == -1),
+                        mx.allclose(
+                            mx.concatenate(outputs, axis=1), expected, atol=1e-4
+                        ),
+                    ),
+                )
+            )
+        mx.eval([checks for _, checks in comparisons])
+        for chunks, checks in comparisons:
+            with self.subTest(chunks=chunks):
+                for check in checks:
+                    self.assertTrue(check.item())
 
 
 class TestMoERouterStopGradient:
