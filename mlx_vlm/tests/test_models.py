@@ -414,9 +414,17 @@ class TestMiniMaxSparseAccuracy(unittest.TestCase):
             queries = rng.normal(size=(batch, 4, 3, 4)).astype(np.float32)
             keys = rng.normal(size=(batch, 1, 23, 4)).astype(np.float32)
             positions = np.broadcast_to([0, 17, 22], (batch, 3)).copy()
-            for score_type, masked in (("max", False), ("max", True), ("lse", True)):
-                with self.subTest(batch=batch, score_type=score_type, masked=masked):
+            for score_type, masked, initial in (
+                ("max", False, 0),
+                ("max", False, 1),
+                ("max", True, 0),
+                ("lse", True, 0),
+            ):
+                with self.subTest(
+                    batch=batch, score_type=score_type, masked=masked, initial=initial
+                ):
                     attention.indexer.score_type = score_type
+                    attention.indexer.init_blocks = initial
                     valid = np.ones((batch, 1, 3, 23), dtype=bool)
                     if masked:
                         valid[..., 4:8] = False  # Exclude an entire earlier block.
@@ -439,6 +447,10 @@ class TestMiniMaxSparseAccuracy(unittest.TestCase):
                         else np.logaddexp.reduce(blocks, axis=-1)
                     )
                     allowed = np.isfinite(pooled)
+                    if initial:
+                        pooled[..., :initial] = np.where(
+                            allowed[..., :initial], 1e30, -np.inf
+                        )
                     for b in range(batch):
                         for t in range(3):
                             local = positions[b, t] // 4
@@ -459,7 +471,8 @@ class TestMiniMaxSparseAccuracy(unittest.TestCase):
                         mx.array(positions),
                     )
                     np.testing.assert_array_equal(np.array(actual), selected)
-                    self.assertFalse(np.array_equal(selected[:, 0], selected[:, 1]))
+                    if not initial:
+                        self.assertFalse(np.array_equal(selected[:, 0], selected[:, 1]))
                     expected_mask = np.any(
                         selected[..., None] == np.arange(23) // 4, axis=-2
                     )
@@ -472,6 +485,24 @@ class TestMiniMaxSparseAccuracy(unittest.TestCase):
                         mx.array(positions),
                     )
                     np.testing.assert_array_equal(np.array(actual_mask), expected_mask)
+                    unsorted = attention.indexer.select_blocks(
+                        mx.array(queries),
+                        mx.array(keys),
+                        0,
+                        mx.array(valid) if masked else None,
+                        mx.array(positions),
+                        sort_blocks=False,
+                    )
+                    unsorted_mask = attention.indexer.build_block_mask(
+                        unsorted,
+                        mx.array(valid) if masked else None,
+                        23,
+                        mx.float32,
+                        mx.array(positions),
+                    )
+                    np.testing.assert_array_equal(
+                        np.array(unsorted_mask), expected_mask
+                    )
                     legacy = attention._build_sparse_mask(
                         mx.array(queries),
                         mx.array(keys),
@@ -481,27 +512,65 @@ class TestMiniMaxSparseAccuracy(unittest.TestCase):
                     )
                     np.testing.assert_array_equal(np.array(legacy), expected_mask)
 
+    def test_sparse_block_mask_invalid_duplicate_and_partial_blocks(self):
+        attention = self.attention()
+        indices = np.array(
+            [
+                [
+                    [[5, 1, 1, -1], [-1, -1, 6, 99], [0, 5, -2, 2]],
+                    [[0, 2, 4, 4], [1, -1, 3, 5], [-1, -1, -1, -1]],
+                ]
+            ],
+            dtype=np.int32,
+        )
+        positions = np.array([[10, 17, 22]])
+        expected = np.any(indices[..., None] == np.arange(23) // 4, axis=-2)
+        expected &= np.arange(23)[None, None, None, :] <= positions[:, None, :, None]
+        expected = np.repeat(expected, 4, axis=1)
+        allowed = np.ones((1, 8, 3, 23), dtype=bool)
+        allowed[:, ::2, :, 4:9] = False
+        for kind in ("none", "bool", "additive"):
+            with self.subTest(mask=kind):
+                mask = None
+                ref = expected
+                if kind == "bool":
+                    mask = mx.array(allowed)
+                    ref = expected & allowed
+                elif kind == "additive":
+                    bias = np.where(allowed, -0.25, -np.inf).astype(np.float32)
+                    mask = mx.array(bias)
+                    ref = np.where(expected, 0.0, -np.inf) + bias
+                actual = attention.indexer.build_block_mask(
+                    mx.array(indices), mask, 23, mx.float32, mx.array(positions)
+                )
+                np.testing.assert_array_equal(np.array(actual), ref)
+
     def test_sparse_attention_full_prefill_matches_cached_chunks(self):
         from mlx_vlm.models.minimax_m3_vl.language import MiniMaxM3KVCache
 
         mx.random.seed(31)
         attention = self.attention()
         for batch in (1, 4):
-            with self.subTest(batch=batch):
-                x = mx.random.normal((batch, 23, 64))
-                expected = attention(x, mask="causal")
-                cache = MiniMaxM3KVCache()
-                chunks = []
-                for start, stop in ((0, 7), (7, 14), (14, 22), (22, 23)):
-                    chunk = attention(x[:, start:stop], mask="causal", cache=cache)
-                    mx.eval(chunk)
-                    chunks.append(chunk)
-                np.testing.assert_allclose(
-                    np.array(mx.concatenate(chunks, axis=1)),
-                    np.array(expected),
-                    rtol=2e-5,
-                    atol=2e-6,
-                )
+            for length in (23, 513):
+                with self.subTest(batch=batch, length=length):
+                    x = mx.random.normal((batch, length, 64))
+                    expected = attention(x, mask="causal")
+                    cache = MiniMaxM3KVCache()
+                    chunks = []
+                    # The long case crosses the dense/sparse decode boundary.
+                    stops = (
+                        (0, 7, 14, 22, 23) if length == 23 else (0, 500, 511, 512, 513)
+                    )
+                    for start, stop in zip(stops, stops[1:]):
+                        chunk = attention(x[:, start:stop], mask="causal", cache=cache)
+                        mx.eval(chunk)
+                        chunks.append(chunk)
+                    np.testing.assert_allclose(
+                        np.array(mx.concatenate(chunks, axis=1)),
+                        np.array(expected),
+                        rtol=2e-5,
+                        atol=2e-6,
+                    )
 
     @unittest.skipUnless(mx.metal.is_available(), "Requires Metal sparse attention")
     def test_sparse_metal_kernel_per_group(self):

@@ -107,6 +107,34 @@ def _minimax_moe_select(
     return inds, weights * routed_scaling_factor
 
 
+@partial(mx.compile, shapeless=True)
+def _minimax_mask_index_scores(scores, k_positions, q_positions, scale):
+    return mx.where(k_positions <= q_positions, scores * scale, -mx.inf)
+
+
+@partial(mx.compile, shapeless=True)
+def _minimax_mask_block_indices(indices, num_blocks):
+    return mx.where((indices >= 0) & (indices < num_blocks), indices, num_blocks)
+
+
+@partial(mx.compile, shapeless=True)
+def _minimax_sparse_block_scores(
+    block_scores,
+    cur_block,
+    blocks,
+    init_blocks,
+    local_blocks,
+):
+    causal = blocks <= cur_block
+    scores = mx.where(causal & (block_scores == block_scores), block_scores, -mx.inf)
+    if init_blocks > 0:
+        scores = mx.where((blocks < init_blocks) & causal, 1e30, scores)
+    if local_blocks > 0:
+        local = (blocks >= mx.maximum(cur_block - local_blocks + 1, 0)) & causal
+        scores = mx.where(local, 1e29, scores)
+    return scores
+
+
 # Deliberately not @mx.compile: `idx_keys` grows a position every decode step,
 # so a shape-keyed compiled function re-traces on every call and each trace
 # permanently grows MLX's compiler cache, eventually tripping
@@ -120,68 +148,52 @@ def _select_sparse_block_indices_compiled(
     sparse_topk_blocks: int,
     sparse_init_blocks: int,
     sparse_local_blocks: int,
+    sort_blocks: bool = True,
 ):
     B, H_idx, L, _ = idx_queries.shape
     total_len = idx_keys.shape[2]
-    neg = mx.array(-float("inf"), dtype=mx.float32)
-
     scores = mx.matmul(
         idx_queries.astype(mx.float32),
         idx_keys.astype(mx.float32).swapaxes(-1, -2),
     )
-    scores = scores * scale
-
     qpos = q_positions
-    kpos = mx.arange(total_len)
-    causal = kpos[None, None, :] <= qpos[:, :, None]
-    scores = mx.where(causal[:, None], scores, neg)
+    scores = _minimax_mask_index_scores(
+        scores, mx.arange(total_len), qpos[:, None, :, None], scale
+    )
 
-    num_blocks = (total_len + block_size - 1) // block_size
-    pad = num_blocks * block_size - total_len
-    pad_values = mx.full((*scores.shape[:-1], pad), -float("inf"), dtype=scores.dtype)
-    scores = mx.concatenate([scores, pad_values], axis=-1)
-
-    blocks = mx.arange(num_blocks)
-    cur_block = qpos // block_size
-    causal_block = blocks[None, None, :] <= cur_block[:, :, None]
-    valid_blocks = causal_block[:, None]
-
-    scores = scores.reshape(B, H_idx, L, num_blocks, block_size)
-    block_scores = mx.max(scores, axis=-1)
-    selected_scores = mx.where(block_scores == block_scores, block_scores, neg)
-    valid_blocks = mx.broadcast_to(valid_blocks, selected_scores.shape)
-    selected_scores = mx.where(valid_blocks, selected_scores, neg)
-
-    if sparse_init_blocks > 0:
-        init_blocks = blocks[None, None, :] < sparse_init_blocks
-        selected_scores = mx.where(
-            (init_blocks & causal_block)[:, None] & valid_blocks,
-            mx.array(1e30, dtype=selected_scores.dtype),
-            selected_scores,
+    full_blocks, tail = divmod(total_len, block_size)
+    num_blocks = full_blocks + bool(tail)
+    split = full_blocks * block_size
+    block_scores = scores[..., :split].reshape(B, H_idx, L, full_blocks, block_size)
+    block_scores = mx.max(block_scores, axis=-1)
+    if tail:
+        block_scores = mx.concatenate(
+            [block_scores, mx.max(scores[..., split:], axis=-1, keepdims=True)],
+            axis=-1,
         )
 
-    if sparse_local_blocks > 0:
-        local_start = mx.maximum(cur_block - sparse_local_blocks + 1, 0)
-        local_blocks = (blocks[None, None, :] >= local_start[:, :, None]) & (
-            blocks[None, None, :] <= cur_block[:, :, None]
-        )
-        selected_scores = mx.where(
-            (local_blocks & causal_block)[:, None] & valid_blocks,
-            mx.array(1e29, dtype=selected_scores.dtype),
-            selected_scores,
-        )
+    cur_block = (qpos // block_size)[:, None, :, None]
+    selected_scores = _minimax_sparse_block_scores(
+        block_scores,
+        cur_block,
+        mx.arange(num_blocks),
+        sparse_init_blocks,
+        sparse_local_blocks,
+    )
+    indices = mx.stop_gradient(
+        mx.argpartition(-selected_scores, kth=sparse_topk_blocks - 1, axis=-1)[
+            ..., :sparse_topk_blocks
+        ]
+    )
+    indices = mx.where(indices <= cur_block, indices, num_blocks)
+    if sort_blocks:
+        indices = mx.sort(indices, axis=-1)
+    return mx.where(indices == num_blocks, mx.array(-1), indices)
 
-    topk_idx = mx.argpartition(-selected_scores, kth=sparse_topk_blocks - 1, axis=-1)[
-        ..., :sparse_topk_blocks
-    ]
-    topk_idx = mx.stop_gradient(topk_idx)
-    topk_valid = mx.take_along_axis(valid_blocks, topk_idx, axis=-1)
-    invalid = mx.full(topk_idx.shape, num_blocks, dtype=topk_idx.dtype)
-    block_indices = mx.where(topk_valid, topk_idx, invalid)
-    order = mx.argsort(block_indices, axis=-1)
-    order = mx.stop_gradient(order)
-    block_indices = mx.take_along_axis(block_indices, order, axis=-1)
-    return mx.where(block_indices == num_blocks, mx.array(-1), block_indices)
+
+def _minimax_sparse_decode_min_length(selected_length, mask):
+    has_explicit_mask = mask is not None and not isinstance(mask, str)
+    return selected_length * (16 if has_explicit_mask else 64)
 
 
 _MINIMAX_M3_SPARSE_PREFILL_ONE_PASS_SOURCE = r"""
@@ -487,6 +499,11 @@ class MiniMaxSwiGLUOAI(nn.Module):
         return _swiglu_oai(x, gate, self.alpha, self.limit, self.beta)
 
 
+@partial(mx.compile, shapeless=True)
+def _minimax_gemma_rms_norm(x, weight, eps):
+    return mx.fast.rms_norm(x, weight.astype(mx.float32) + 1, eps).astype(x.dtype)
+
+
 class MiniMaxRMSNorm(nn.Module):
     def __init__(self, dims: int, eps: float = 1e-6, gemma: bool = True):
         super().__init__()
@@ -497,8 +514,9 @@ class MiniMaxRMSNorm(nn.Module):
     def __call__(self, x):
         # Gemma normalization applies (1 + weight) in FP32, then rounds once
         # to the activation dtype. Adding 1 in BF16 loses small learned offsets.
-        weight = self.weight.astype(mx.float32) + 1 if self.gemma else self.weight
-        return mx.fast.rms_norm(x, weight, self.eps).astype(x.dtype)
+        if self.gemma:
+            return _minimax_gemma_rms_norm(x, self.weight, self.eps)
+        return mx.fast.rms_norm(x, self.weight, self.eps).astype(x.dtype)
 
 
 def _minimax_memory_profile(c, token_count):
@@ -1215,7 +1233,7 @@ class MiniMaxAttention(nn.Module):
         selected_length = block_indices.shape[-1] * self.sparse_block_size
         has_explicit_mask = mask is not None and not isinstance(mask, str)
         # Dense SDPA is still faster before these measured crossover points.
-        min_sparse_length = selected_length * (16 if has_explicit_mask else 64)
+        min_sparse_length = _minimax_sparse_decode_min_length(selected_length, mask)
         if selected_length >= key_length or key_length < min_sparse_length:
             return None
 
@@ -1344,6 +1362,13 @@ class MiniMaxAttention(nn.Module):
                 int(sparse_q_start),
                 mask,
                 sparse_q_positions,
+                # Block order is irrelevant for a dense mask. Preserve sorted
+                # order when a sparse kernel/gather can consume the selection.
+                sort_blocks=L != 1
+                or keys.shape[2]
+                >= _minimax_sparse_decode_min_length(
+                    self.sparse_topk_blocks * self.sparse_block_size, mask
+                ),
             )
             if block_indices is not None:
                 output = self._sparse_prefill_attention(
@@ -1412,6 +1437,7 @@ class MiniMaxM3Indexer:
         q_start: int,
         mask: Optional[mx.array],
         q_positions: Optional[mx.array],
+        sort_blocks: bool = True,
     ):
         attention = self.attention
         B, L, _ = x.shape
@@ -1440,6 +1466,7 @@ class MiniMaxM3Indexer:
             q_start,
             mask,
             q_positions,
+            sort_blocks=sort_blocks,
         )
         return block_indices, total_len, q_positions
 
@@ -1450,6 +1477,7 @@ class MiniMaxM3Indexer:
         q_start: int,
         mask: Optional[mx.array] = None,
         q_positions: Optional[mx.array] = None,
+        sort_blocks: bool = True,
     ):
         attention = self.attention
         B, H_idx, L, _ = idx_queries.shape
@@ -1476,6 +1504,7 @@ class MiniMaxM3Indexer:
                 self.topk_blocks,
                 self.init_blocks,
                 self.local_blocks,
+                sort_blocks,
             )
 
         scale = attention.scale
@@ -1484,11 +1513,9 @@ class MiniMaxM3Indexer:
             idx_queries.astype(mx.float32),
             idx_keys.astype(mx.float32).swapaxes(-1, -2),
         )
-        scores = scores * scale
-
-        kpos = mx.arange(total_len)
-        causal = kpos[None, None, :] <= qpos[:, :, None]
-        scores = mx.where(causal[:, None], scores, neg)
+        scores = _minimax_mask_index_scores(
+            scores, mx.arange(total_len), qpos[:, None, :, None], scale
+        )
         valid = attention._selection_valid_mask(mask, B, H_idx, L, total_len)
         if valid is not None:
             scores = mx.where(valid, scores, neg)
@@ -1549,19 +1576,19 @@ class MiniMaxM3Indexer:
         topk_idx = mx.argpartition(-selected_scores, kth=topk - 1, axis=-1)[..., :topk]
         topk_idx = mx.stop_gradient(topk_idx)
         topk_valid = mx.take_along_axis(valid_blocks, topk_idx, axis=-1)
-        return self._pack_block_indices(topk_idx, topk_valid, num_blocks)
+        return self._pack_block_indices(topk_idx, topk_valid, num_blocks, sort_blocks)
 
     @staticmethod
     def _pack_block_indices(
         topk_idx: mx.array,
         topk_valid: mx.array,
         num_blocks: int,
+        sort_blocks: bool = True,
     ):
         invalid = mx.full(topk_idx.shape, num_blocks, dtype=topk_idx.dtype)
         block_indices = mx.where(topk_valid, topk_idx, invalid)
-        order = mx.argsort(block_indices, axis=-1)
-        order = mx.stop_gradient(order)
-        block_indices = mx.take_along_axis(block_indices, order, axis=-1)
+        if sort_blocks:
+            block_indices = mx.sort(block_indices, axis=-1)
         return mx.where(block_indices == num_blocks, mx.array(-1), block_indices)
 
     def build_block_mask(
@@ -1575,15 +1602,20 @@ class MiniMaxM3Indexer:
         del dtype
         B, H_idx, L, _ = block_indices.shape
         num_blocks = (key_length + self.block_size - 1) // self.block_size
-        blocks = mx.arange(num_blocks, dtype=block_indices.dtype)
-        block_keep = mx.any(block_indices[..., None] == blocks, axis=-2)
+        # Invalid selections share a discarded sentinel slot, so they cannot
+        # accidentally enable the last block through negative indexing.
+        indices = _minimax_mask_block_indices(
+            block_indices, mx.array(num_blocks, dtype=block_indices.dtype)
+        )
+        block_keep = mx.put_along_axis(
+            mx.zeros((B, H_idx, L, num_blocks + 1), dtype=mx.bool_),
+            indices,
+            mx.array(True),
+            axis=-1,
+        )[..., :num_blocks]
 
         kpos = mx.arange(key_length)
-        key_blocks = (kpos // self.block_size).astype(block_indices.dtype)
-        key_blocks = mx.broadcast_to(
-            key_blocks[None, None, None, :], (B, H_idx, L, key_length)
-        )
-        key_keep = mx.take_along_axis(block_keep, key_blocks, axis=-1)
+        key_keep = mx.repeat(block_keep, self.block_size, axis=-1)[..., :key_length]
         causal = kpos[None, None, :] <= q_positions[:, :, None]
         sparse_mask = key_keep & causal[:, None]
         sparse_mask = mx.repeat(
@@ -1688,7 +1720,7 @@ class MiniMaxSparseMoeBlock(nn.Module):
             inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
             scores = mx.take_along_axis(scores, inds, axis=-1)
             scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
-        order = mx.argsort(inds, axis=-1)
+        order = mx.stop_gradient(mx.argsort(inds, axis=-1))
         inds = mx.stop_gradient(mx.take_along_axis(inds, order, axis=-1))
         scores = mx.take_along_axis(scores, order, axis=-1)
         if self.pack_shared_expert:
