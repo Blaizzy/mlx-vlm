@@ -562,6 +562,70 @@
         "slat_steps": 2
       },
       "checks": ["registry_and_config"]
+    },
+    {
+      "id": "hi3d",
+      "module": "hi3d",
+      "config": {
+        "transformer_512": {
+          "resolution": 8,
+          "in_channels": 4,
+          "out_channels": 4,
+          "model_channels": 12,
+          "cond_channels": 16,
+          "num_blocks": 1,
+          "num_heads": 2,
+          "io_block_channels": [8],
+          "latent_mean": [0.0, 0.1, -0.1, 0.0],
+          "latent_std": [1.0, 0.5, 2.0, 1.0]
+        },
+        "transformer_1024": {
+          "resolution": 16,
+          "in_channels": 4,
+          "out_channels": 4,
+          "model_channels": 12,
+          "cond_channels": 16,
+          "num_blocks": 1,
+          "num_heads": 2,
+          "io_block_channels": [8],
+          "latent_mean": [0.0, 0.1, -0.1, 0.0],
+          "latent_std": [1.0, 0.5, 2.0, 1.0]
+        },
+        "decoder": {
+          "z_channels": 4,
+          "depths": [1, 1],
+          "channels": [8, 16],
+          "mid_depth": 2,
+          "mid_num_head": 2,
+          "patch_size": 4
+        },
+        "dino_config": {
+          "model_type": "dinov2",
+          "hidden_size": 8,
+          "num_hidden_layers": 1,
+          "num_attention_heads": 2,
+          "image_size": 28,
+          "patch_size": 14
+        },
+        "clip_config": {
+          "model_type": "clip_vision_model",
+          "hidden_size": 8,
+          "intermediate_size": 16,
+          "num_hidden_layers": 1,
+          "num_attention_heads": 2,
+          "image_size": 28,
+          "patch_size": 14,
+          "projection_dim": 8
+        },
+        "dino_image_size": 28,
+        "clip_image_size": 28,
+        "num_inference_steps": 2,
+        "structure_resolutions": [8, 16, 24],
+        "output_resolutions": [16, 32, 48],
+        "pass_budgets": [600, 2000, 4000],
+        "target_face_counts": [100000, 100000, 100000]
+      },
+      "checks": ["registry_and_config"]
     }
   ],
   "shared_configs": {

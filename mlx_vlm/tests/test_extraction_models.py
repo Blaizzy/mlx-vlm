@@ -3023,3 +3023,395 @@ class TestD1OmniDecisionModel(unittest.TestCase):
             predict(model, tok, None, questions, images=[image], audio=clip)
         with self.assertRaisesRegex(ValueError, "mono"):
             predict(model, tok, None, questions, audio=np.zeros((2, 8000), np.int16))
+
+
+class TestHi3D(unittest.TestCase):
+    """Hi3D v1.0 mesh refinement: sparse operators, sampling, voxelization,
+    mesh extraction and bundle loading on a tiny random model."""
+
+    def setUp(self):
+        self._device = mx.default_device()
+        mx.set_default_device(mx.cpu)
+
+    def tearDown(self):
+        mx.set_default_device(self._device)
+
+    def _config(self, **overrides):
+        from mlx_vlm.models.hi3d import ModelConfig
+
+        args = _extraction_config("hi3d")
+        args.update(overrides)
+        return ModelConfig.from_dict(args)
+
+    @staticmethod
+    def _cube_mesh(subdivisions=1):
+        """A closed axis-aligned cube surface, ``2 * 6 * subdivisions²`` faces."""
+        n = subdivisions
+        vertices, faces = [], []
+        for axis in range(3):
+            for side in (0.0, 1.0):
+                base = len(vertices)
+                for i in range(n + 1):
+                    for j in range(n + 1):
+                        p = [0.0, 0.0, 0.0]
+                        p[axis] = side
+                        p[(axis + 1) % 3] = i / n
+                        p[(axis + 2) % 3] = j / n
+                        vertices.append(p)
+                for i in range(n):
+                    for j in range(n):
+                        a = base + i * (n + 1) + j
+                        b, c, d = a + 1, a + n + 1, a + n + 2
+                        quad = (
+                            [[a, c, b], [b, c, d]] if side else [[a, b, c], [b, d, c]]
+                        )
+                        faces.extend(quad)
+        # Weld the duplicated edge vertices of neighbouring sides.
+        vertices, inverse = np.unique(
+            np.round(np.array(vertices), 6), axis=0, return_inverse=True
+        )
+        return vertices.astype(np.float32), inverse.reshape(-1)[np.array(faces)]
+
+    def test_config_routes_and_round_trips(self):
+        from mlx_vlm.models import hi3d
+        from mlx_vlm.models.hi3d import ModelConfig
+        from mlx_vlm.models.hi3d.config import TransformerConfig
+
+        module, model_type = get_model_and_args({"model_type": "hi3d"})
+        self.assertIs(module, hi3d)
+        self.assertEqual(model_type, "hi3d")
+        config = self._config()
+        self.assertEqual(ModelConfig.from_dict(config.to_dict()), config)
+        self.assertEqual(config.transformer_1024.resolution, 16)
+        released = ModelConfig()
+        self.assertEqual(released.transformer_512.model_channels, 2112)
+        self.assertEqual(released.output_resolutions, [512, 1024, 1536])
+        with self.assertRaisesRegex(ValueError, "RoPE"):
+            TransformerConfig(model_channels=16, num_heads=2)
+
+    def test_bundle_loads_strict_with_released_dtypes(self):
+        """Mixed float16/float32 weights load unchanged through
+        ``from_pretrained`` and ``load_model``; the constant ``inv_grid_coord``
+        buffers are dropped idempotently and a missing tensor is rejected."""
+        from mlx_vlm.models.hi3d import Model
+        from mlx_vlm.utils import load_model
+
+        model = Model(self._config())
+        self.assertEqual(tree_flatten(model.trainable_parameters()), [])
+        with self.assertRaisesRegex(ValueError, "inference-only"):
+            model.train()
+        weights = {
+            k: (v.astype(mx.float16) if ".blocks." in k else v) + 0.25
+            for k, v in tree_flatten(model.parameters())
+        }
+        constant = "vae.decoder.dec.dec1.up.upsample.inv_grid_coord"
+        once = Model.sanitize({**weights, constant: mx.zeros((8, 3), mx.int64)})
+        self.assertNotIn(constant, once)
+        self.assertEqual(sorted(Model.sanitize(dict(once))), sorted(once))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model.config.save(root / "config.json")
+            mx.save_safetensors(
+                str(root / "model.safetensors"),
+                {**weights, constant: mx.zeros((8, 3), mx.int64)},
+            )
+            for loaded in (Model.from_pretrained(root), load_model(root)):
+                for name, value in tree_flatten(loaded.parameters()):
+                    self.assertEqual(value.dtype, weights[name].dtype, name)
+                    self.assertTrue(mx.array_equal(value, weights[name]).item(), name)
+            weights.pop(next(iter(weights)))
+            mx.save_safetensors(str(root / "model.safetensors"), weights)
+            with self.assertRaises(ValueError):
+                Model.from_pretrained(root)
+
+    def test_sparse_conv_matches_dense_conv3d(self):
+        """The submanifold convolution equals a dense ``conv3d`` (cross-correlation
+        with ``(O, kx, ky, kz, I)`` weights) gathered at the active voxels, for
+        unbatched and batched features and any im2col chunk size."""
+        from mlx_vlm.models.hi3d import sparse
+
+        rng = np.random.default_rng(0)
+        coords = np.unique(rng.integers(0, 5, (40, 3)), axis=0)
+        x = mx.array(rng.standard_normal((len(coords), 3)), dtype=mx.float32)
+        w = mx.array(rng.standard_normal((4, 3, 3, 3, 3)), dtype=mx.float32)
+        b = mx.array(rng.standard_normal(4), dtype=mx.float32)
+        c = mx.array(coords)
+        dense = mx.zeros((1, 5, 5, 5, 3))
+        dense[0, c[:, 0], c[:, 1], c[:, 2]] = x
+        expected = mx.conv3d(dense, w, padding=1)[0, c[:, 0], c[:, 1], c[:, 2]] + b
+        grid = sparse.Grid(c, 5)
+        self.assertTrue(
+            mx.allclose(sparse.sparse_conv(x, grid, w, b), expected, atol=1e-5)
+        )
+        batched = sparse.sparse_conv(mx.stack([x, 2 * x]), grid, w, b)
+        self.assertTrue(mx.allclose(batched[0], expected, atol=1e-5))
+        self.assertTrue(mx.allclose(batched[1], 2 * expected - b, atol=1e-4))
+        chunk = sparse.CONV_CHUNK_BYTES
+        try:
+            sparse.CONV_CHUNK_BYTES = 27 * 3 * 4 * 3
+            self.assertTrue(
+                mx.allclose(
+                    sparse.sparse_conv(x, sparse.Grid(c, 5), w, b), expected, atol=1e-5
+                )
+            )
+        finally:
+            sparse.CONV_CHUNK_BYTES = chunk
+
+    def test_downsample_mean_counts_the_initial_zero(self):
+        """Pooling divides by the child count plus one, as torch's default
+        ``scatter_reduce(mean)`` does, with parents in lexicographic order."""
+        from mlx_vlm.models.hi3d.sparse import Grid, downsample_mean
+
+        cube = [[i, j, k] for i in range(2) for j in range(2) for k in range(2)]
+        coords = mx.array([[6, 0, 0]] + cube)
+        values, child = downsample_mean(mx.full((9, 1), 7.0), Grid(coords, 8))
+        self.assertEqual(child.coords.tolist(), [[0, 0, 0], [3, 0, 0]])
+        self.assertTrue(np.allclose(np.array(values)[:, 0], [8 * 7 / 9, 7 / 2]))
+        self.assertEqual(child.resolution, 4)
+
+    def test_window_attention_matches_reference_padding(self):
+        """Serialized windows equal the reference's padded flash-attention
+        patches: a remainder attends within the last ``size`` points."""
+        from mlx_vlm.models.hi3d.decoder import window_attention
+
+        rng = np.random.default_rng(1)
+        for n, size in ((11, 4), (3, 4), (8, 4)):
+            qkv = rng.standard_normal((n, 3, 2, 4)).astype(np.float32)
+            perm = rng.permutation(n)
+            inverse = np.argsort(perm)
+            seq = qkv[perm]
+            out = np.zeros((n, 2, 4), np.float32)
+            starts = list(range(0, n - n % size if n > size else 1, size))
+            windows = [(np.arange(s, min(s + size, n)), 0) for s in starts]
+            if n > size and n % size:
+                # Only the remainder's outputs come from the trailing window.
+                windows.append((np.arange(n - size, n), size - n % size))
+            for rows, skip in windows:
+                q, k, v = (seq[rows, i].transpose(1, 0, 2) for i in range(3))
+                logits = q @ k.transpose(0, 2, 1) * 0.5
+                weights = np.exp(logits - logits.max(-1, keepdims=True))
+                weights /= weights.sum(-1, keepdims=True)
+                out[rows[skip:]] = (weights @ v).transpose(1, 0, 2)[skip:]
+            expected = out.reshape(n, -1)[inverse]
+            got = window_attention(
+                mx.array(qkv), mx.array(perm), mx.array(inverse), size, 0.5
+            )
+            self.assertTrue(np.allclose(np.array(got), expected, atol=1e-5), (n, size))
+
+    def test_serialization_sorts_by_morton_code(self):
+        from mlx_vlm.models.hi3d.decoder import serialize
+
+        rng = np.random.default_rng(2)
+        coords = np.unique(rng.integers(0, 16, (60, 3)), axis=0)
+
+        def morton(c):
+            code = 0
+            for bit in range(4):
+                for axis, shift in ((0, 2), (1, 1), (2, 0)):
+                    code |= ((int(c[axis]) >> bit) & 1) << (3 * bit + shift)
+            return code
+
+        for order, view in (("z", coords), ("z-trans", coords[:, [1, 0, 2]])):
+            perm, inverse = serialize(mx.array(coords), order)
+            codes = [morton(c) for c in view]
+            self.assertEqual(np.array(perm).tolist(), np.argsort(codes).tolist())
+            self.assertEqual(
+                np.array(perm)[np.array(inverse)].tolist(), list(range(len(coords)))
+            )
+
+    def test_rope_stretches_frequencies_on_long_grids(self):
+        from mlx_vlm.models.hi3d.transformer import rope_tables
+
+        freqs = 1.0 / 10000 ** (np.arange(16) / 16)
+        coords = mx.array([[0, 1, 2], [3, 4, 63]])
+        cos, _ = rope_tables(coords, 96)
+        phases = np.array(coords)[..., None] * freqs
+        self.assertTrue(
+            np.allclose(np.array(cos), np.cos(phases.reshape(2, -1)), atol=1e-5)
+        )
+        coords = mx.array([[0, 1, 2], [3, 4, 100]])
+        cos, sin = rope_tables(coords, 96)
+        wavelengths = freqs * 64 / (2 * np.pi)
+        ratio = (wavelengths - 1) / 23
+        ratio = ratio + (1 - ratio) * 64 / 82
+        ratio = np.where(wavelengths > 24, 1.0, ratio)
+        ratio = np.where(wavelengths < 1, 64 / 82, ratio)
+        phases = (np.array(coords)[..., None] * freqs * ratio).reshape(2, -1)
+        self.assertTrue(np.allclose(np.array(cos), np.cos(phases), atol=1e-5))
+        self.assertTrue(np.allclose(np.array(sin), np.sin(phases), atol=1e-5))
+
+    def test_schedule_and_guidance_match_the_released_sampler(self):
+        """Values from the reference ``FlowMatchHeunScheduler`` for 15704 voxels."""
+        from mlx_vlm.models.hi3d.pipeline import guidance_scale, schedule, velocity
+
+        sigmas, times = schedule(25, 15704)
+        self.assertTrue(
+            np.allclose(
+                times[[0, 3, 12, 24]],
+                [
+                    1.0399998426437378,
+                    0.9764360785484314,
+                    0.8511937856674194,
+                    0.18002493679523468,
+                ],
+                atol=1e-7,
+            )
+        )
+        self.assertTrue(
+            np.allclose(
+                sigmas[[1, 13, 25]],
+                [0.9920635223388672, 0.827872097492218, 0.002],
+                atol=1e-7,
+            )
+        )
+        self.assertEqual(guidance_scale(1.04), 4.0)
+        self.assertAlmostEqual(guidance_scale(0.8), 6.4, places=5)
+
+        def transformer(x, t, cond, grid):
+            return mx.ones(x.shape) * mx.sum(cond, axis=(1, 2))[:, None, None]
+
+        x, cond = mx.zeros((1, 3, 4)), mx.ones((1, 2, 5))
+        self.assertTrue(
+            mx.allclose(
+                velocity(transformer, x, 0.5, cond, None), 10 * mx.ones(x.shape)
+            )
+        )
+        guided = velocity(transformer, x, 0.8, cond, None)
+        self.assertTrue(mx.allclose(guided, 64 * mx.ones(x.shape), atol=1e-4))
+
+    def test_voxelize_matches_a_dense_overlap_test(self):
+        from mlx_vlm.models.hi3d import voxelize as vox
+
+        rng = np.random.default_rng(3)
+        vertices = rng.uniform(0.5, 11.5, (30, 3)).astype(np.float32)
+        faces = rng.integers(0, 30, (12, 3))
+        got = vox.voxelize(vertices, faces, 12)
+        grid = np.stack(np.meshgrid(*[np.arange(12)] * 3, indexing="ij"), -1).reshape(
+            -1, 3
+        )
+        hits = set()
+        for face in faces:
+            a, b, c = (np.repeat(vertices[i][None], len(grid), 0) for i in face)
+            hits |= {tuple(v) for v in grid[vox._overlaps(a, b, c, grid)]}
+        self.assertEqual({tuple(v) for v in got.tolist()}, hits)
+        keys = (got[:, 2].astype(np.int64) << 22) | (got[:, 1] << 11) | got[:, 0]
+        self.assertTrue(np.all(np.diff(keys) > 0))
+        normalized = vox.normalize_vertices(vertices, 64)
+        extent = normalized.max(0) - normalized.min(0)
+        self.assertAlmostEqual(float(extent.max()), 58.0, places=3)
+        self.assertTrue(
+            np.allclose((normalized.max(0) + normalized.min(0)) / 2, 32.0, atol=1e-4)
+        )
+
+    def test_adaptive_voxelize_shrinks_to_the_budget(self):
+        from mlx_vlm.models.hi3d.voxelize import adaptive_voxelize
+
+        vertices, faces = self._cube_mesh(4)
+        full = adaptive_voxelize(vertices, faces, 32, 10**6)
+        small = adaptive_voxelize(vertices, faces, 32, len(full) // 2)
+        self.assertLessEqual(len(small), len(full) // 2)
+        self.assertLess(int(small.max()), 32)
+
+    def _sphere_cubes(self, resolution=16, radius=5.0):
+        """Cubes near a sphere with the decoder's per-corner outputs."""
+        from mlx_vlm.models.hi3d.mesh import CUBE_CORNERS
+
+        grid = np.stack(
+            np.meshgrid(*[np.arange(resolution)] * 3, indexing="ij"), -1
+        ).reshape(-1, 3)
+        center = resolution / 2
+        corners = grid[:, None] + CUBE_CORNERS[None]
+        sdf = np.linalg.norm(corners - center, axis=-1) - radius
+        coords = grid[np.abs(sdf).min(1) < 1.5]
+        corners = coords[:, None] + CUBE_CORNERS[None]
+        sdf = (np.linalg.norm(corners - center, axis=-1) - radius) / resolution
+        sign = np.where(sdf > 0, 10.0, -10.0)
+        feats = np.concatenate([sdf, np.zeros((len(coords), 24))], 1)
+        return coords, sign.astype(np.float32), feats.astype(np.float32)
+
+    @staticmethod
+    def _boundary_edges(faces):
+        edges = np.sort(
+            np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]]), 1
+        )
+        _, counts = np.unique(edges, axis=0, return_counts=True)
+        return int((counts == 1).sum()), int((counts > 2).sum())
+
+    def test_flexicubes_extracts_a_closed_sphere(self):
+        from mlx_vlm.models.hi3d.mesh import decoded_mesh
+
+        coords, sign, feats = self._sphere_cubes()
+        vertices, faces = decoded_mesh(
+            sign, feats, coords, 16, np.eye(4, dtype=np.float32)
+        )
+        self.assertGreater(len(faces), 100)
+        self.assertEqual(self._boundary_edges(faces.astype(np.int64)), (0, 0))
+        radius = np.linalg.norm(vertices - 8.0, axis=1)
+        self.assertTrue(np.all(np.abs(radius - 5.0) < 0.6))
+        tri = vertices[faces]
+        volume = (
+            np.einsum("ij,ij->i", tri[:, 0], np.cross(tri[:, 1], tri[:, 2])).sum() / 6
+        )
+        # Outward-facing triangles; flat dual facets sit inside the sphere.
+        self.assertTrue(0.8 < volume / (4 / 3 * np.pi * 125) < 1.0)
+
+    def test_fill_holes_closes_boundary_loops(self):
+        from mlx_vlm.models.hi3d.mesh import fill_holes
+
+        vertices, faces = self._cube_mesh(2)
+        opened = faces[2:]
+        self.assertGreater(self._boundary_edges(opened)[0], 0)
+        filled = fill_holes(vertices, opened)
+        self.assertEqual(self._boundary_edges(filled), (0, 0))
+        self.assertTrue(np.array_equal(filled[: len(opened)], opened))
+
+    def test_postprocess_drops_debris_and_normalizes(self):
+        from mlx_vlm.models.hi3d.mesh import postprocess
+
+        vertices, faces = self._cube_mesh(12)
+        debris_v, debris_f = self._cube_mesh(1)
+        vertices = np.concatenate([vertices, debris_v * 0.1 + 5.0])
+        faces = np.concatenate([faces, debris_f[:4] + len(vertices) - len(debris_v)])
+        out_v, out_f = postprocess(vertices, faces, target_faces=10**7)
+        self.assertLessEqual(len(out_f), 1728)
+        self.assertTrue(np.allclose(out_v.mean(0), 0.0, atol=1e-5))
+        self.assertAlmostEqual(
+            float(np.linalg.norm(out_v, axis=1).max()), 1.0, places=5
+        )
+
+    def test_tiny_pipeline_refines_through_two_passes(self):
+        """Conditioning, voxelization, Heun sampling with both transformers,
+        decoding, extraction, hole filling and post-processing run end to end;
+        the decoder is replaced by a sphere field since random weights predict
+        no surface."""
+        from PIL import Image
+
+        from mlx_vlm.models.hi3d import Model, pipeline
+        from mlx_vlm.models.hi3d.sparse import Grid
+
+        model = Model(self._config())
+        calls = []
+
+        def decode(vae, latents, grid):
+            calls.append((latents.shape, grid.resolution))
+            self.assertTrue(mx.all(mx.isfinite(latents)).item())
+            resolution = grid.resolution * 2
+            coords, sign, feats = self._sphere_cubes(resolution, resolution / 3)
+            return sign, feats, Grid(mx.array(coords), resolution)
+
+        image = Image.fromarray(
+            np.random.default_rng(4).integers(0, 255, (40, 30, 4), np.uint8)
+        )
+        vertices, faces = self._cube_mesh(3)
+        original = pipeline.decode
+        pipeline.decode = decode
+        try:
+            result = model(image, vertices, faces, resolution=32, seed=0)
+        finally:
+            pipeline.decode = original
+        self.assertEqual([r for _, r in calls], [8, 16])
+        self.assertEqual(calls[0][0][-1], 4)
+        self.assertEqual(self._boundary_edges(result.faces.astype(np.int64))[0], 0)
+        self.assertAlmostEqual(
+            float(np.linalg.norm(result.vertices, axis=1).max()), 1.0, places=5
+        )
