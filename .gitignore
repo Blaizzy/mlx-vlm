@@ -26,4 +26,5 @@ var/
 .myenv
 .venv
 .codex_tmp/
+test-results/
 .vscode

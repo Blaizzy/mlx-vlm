@@ -390,6 +390,17 @@ def categorical_sampling(logits, temp):
     return mx.random.categorical(logits * (1 / temp))
 
 
+def _penalty_inputs(tokens, logits, context_size):
+    tokens = tokens[-context_size:]
+    if not isinstance(tokens, mx.array):
+        tokens = mx.array(tokens)
+    vocab_size = logits.shape[-1]
+    # Image markers may be negative or beyond the output vocabulary. Route
+    # them to a disposable column without dynamic shapes or a CPU sync.
+    tokens = mx.where((tokens >= 0) & (tokens < vocab_size), tokens, vocab_size)
+    return tokens, mx.pad(logits, [(0, 0), (0, 1)])
+
+
 def make_repetition_penalty(penalty: float, context_size: int = 20):
     """
     Make repetition penalty processor.
@@ -410,7 +421,7 @@ def make_repetition_penalty(penalty: float, context_size: int = 20):
 
     def repetition_penalty_processor(tokens, logits):
         if len(tokens) > 0:
-            tokens = tokens[-context_size:]
+            tokens, logits = _penalty_inputs(tokens, logits, context_size)
             selected_logits = logits[:, tokens]
             selected_logits = mx.where(
                 selected_logits < 0,
@@ -418,6 +429,7 @@ def make_repetition_penalty(penalty: float, context_size: int = 20):
                 selected_logits / penalty,
             )
             logits[:, tokens] = selected_logits
+            logits = logits[:, :-1]
         return logits
 
     return repetition_penalty_processor
@@ -442,8 +454,9 @@ def make_presence_penalty(penalty: float, context_size: int = 20):
 
     def presence_penalty_processor(tokens, logits):
         if len(tokens) > 0:
-            tokens = tokens[-context_size:]
+            tokens, logits = _penalty_inputs(tokens, logits, context_size)
             logits[:, tokens] -= penalty
+            logits = logits[:, :-1]
         return logits
 
     return presence_penalty_processor
@@ -471,8 +484,9 @@ def make_frequency_penalty(penalty: float, context_size: int = 20):
 
     def frequency_penalty_processor(tokens, logits):
         if len(tokens) > 0:
-            tokens = tokens[-context_size:]
+            tokens, logits = _penalty_inputs(tokens, logits, context_size)
             logits = logits.at[:, tokens].subtract(penalty)
+            logits = logits[:, :-1]
         return logits
 
     return frequency_penalty_processor

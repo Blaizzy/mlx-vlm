@@ -236,19 +236,27 @@ class TransactionDrafter:
 
 
 def equal(actual, expected, **tolerance):
-    if isinstance(actual, dict):
-        assert actual.keys() == expected.keys()
-        for key in actual:
-            equal(actual[key], expected[key], **tolerance)
-    elif isinstance(actual, (list, tuple)):
-        assert len(actual) == len(expected)
-        for a, b in zip(actual, expected):
-            equal(a, b, **tolerance)
-    elif actual is None or expected is None:
-        assert actual is expected
-    else:
-        compare = mx.allclose if tolerance else mx.array_equal
-        assert compare(actual, expected, **tolerance).item()
+    comparisons = []
+
+    def collect(actual, expected):
+        if isinstance(actual, dict):
+            assert actual.keys() == expected.keys()
+            for key in actual:
+                collect(actual[key], expected[key])
+        elif isinstance(actual, (list, tuple)):
+            assert len(actual) == len(expected)
+            for a, b in zip(actual, expected):
+                collect(a, b)
+        elif actual is None or expected is None:
+            assert actual is expected
+        else:
+            compare = mx.allclose if tolerance else mx.array_equal
+            comparisons.append(compare(actual, expected, **tolerance))
+
+    collect(actual, expected)
+    mx.eval(comparisons)
+    for index, comparison in enumerate(comparisons):
+        assert comparison.item(), f"comparison {index}"
 
 
 def greedy(logits):
@@ -387,20 +395,23 @@ def test_verify_commit_matches_decode(family, batch, dtype):
     for retained in (1, 4, 3):
         tokens = mx.broadcast_to(mx.array([[4, 5, 6, 7]]), (batch, 4))
         oracle = deepcopy(reference)
+        accepted = None
         hidden_steps, logit_steps = [], []
         for i in range(4):
             hidden, logits, transaction = verify(tokens[:, i : i + 1], oracle)
             hidden_steps.append(hidden)
             logit_steps.append(logits)
             transaction.commit([1] * batch)
+            if i + 1 == retained:
+                accepted = deepcopy(oracle)
         hidden, logits, transaction = verify(tokens, actual)
         compare(hidden, mx.concatenate(hidden_steps, 1))
         compare(logits, mx.concatenate(logit_steps, 1))
         equal(greedy(logits), greedy(mx.concatenate(logit_steps, 1)))
         transaction.commit([retained] * batch)
-        for i in range(retained):
-            _, _, transaction = verify(tokens[:, i : i + 1], reference)
-            transaction.commit([1] * batch)
+        # Reuse the independent one-token oracle at the accepted prefix.
+        # Replaying that prefix again would perform the same verifier calls.
+        reference = accepted
         probe = mx.full((batch, 1), 20)
         compare(model(probe, cache=reference).logits, model(probe, cache=actual).logits)
 
