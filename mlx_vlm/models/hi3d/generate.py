@@ -10,9 +10,30 @@ import time
 from pathlib import Path
 
 import mlx.core as mx
+import numpy as np
 from PIL import Image
 
 from .mesh import coarse_from_sam3d, read_mesh, write_obj
+
+
+def masked_image(image_path, mask_path=None):
+    """The object image, with ``mask_path`` (read as SAM 3D reads it) as alpha.
+
+    Hi3D frames its conditioning image by the alpha channel, so an opaque photo
+    passed with a mask would otherwise condition on its background too.
+    """
+    image = Image.open(image_path)
+    if mask_path is None:
+        return image
+    with Image.open(mask_path) as mask:
+        channel = 3 if mask.has_transparency_data else 0
+        pixels = np.asarray(mask.convert("RGBA"))[..., channel] > 0
+    alpha = Image.fromarray(pixels.astype(np.uint8) * 255)
+    if alpha.size != image.size:
+        alpha = alpha.resize(image.size, Image.NEAREST)
+    image = image.convert("RGB")
+    image.putalpha(alpha)
+    return image
 
 
 def sam3d_coarse_mesh(model_path, image_path, mask_path=None, seed=0):
@@ -42,7 +63,7 @@ def main():
     source.add_argument(
         "--sam3d-model", help="SAM 3D Objects bundle for the coarse mesh"
     )
-    parser.add_argument("--mask", help="Object mask for SAM 3D (default: image alpha)")
+    parser.add_argument("--mask", help="Object mask (default: image alpha)")
     parser.add_argument(
         "--save-coarse", help="Also write the SAM 3D coarse mesh (.obj)"
     )
@@ -74,7 +95,7 @@ def main():
     model = Model.from_pretrained(args.model)
     timings["load"] = time.perf_counter() - start
     result = model(
-        Image.open(args.image),
+        masked_image(args.image, args.mask),
         vertices,
         faces,
         resolution=args.resolution,

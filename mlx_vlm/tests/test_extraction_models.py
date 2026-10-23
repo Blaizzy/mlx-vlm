@@ -3379,6 +3379,28 @@ class TestHi3D(unittest.TestCase):
             float(np.linalg.norm(out_v, axis=1).max()), 1.0, places=5
         )
 
+    def test_mask_frames_the_conditioning_image(self):
+        import tempfile
+
+        from PIL import Image
+
+        from mlx_vlm.models.hi3d.generate import masked_image
+        from mlx_vlm.models.hi3d.vision import prepare_image
+
+        with tempfile.TemporaryDirectory() as tmp:
+            Image.new("RGB", (40, 20), (0, 0, 255)).save(f"{tmp}/photo.png")
+            mask = Image.new("L", (40, 20), 0)
+            mask.paste(255, (30, 5, 40, 15))
+            mask.save(f"{tmp}/mask.png")
+            self.assertEqual(masked_image(f"{tmp}/photo.png").mode, "RGB")
+            image = masked_image(f"{tmp}/photo.png", f"{tmp}/mask.png")
+            self.assertEqual(int(np.asarray(image.getchannel("A")).sum()), 100 * 255)
+            # Framed around the 10x10 masked square, not the whole 40x20 photo.
+            framed = prepare_image(image)
+        self.assertEqual(framed.size, (12, 12))
+        self.assertEqual(framed.getpixel((6, 6)), (0, 0, 255))
+        self.assertEqual(framed.getpixel((0, 0)), (255, 255, 255))
+
     def test_tiny_pipeline_refines_through_two_passes(self):
         """Conditioning, voxelization, Heun sampling with both transformers,
         decoding, extraction, hole filling and post-processing run end to end;
