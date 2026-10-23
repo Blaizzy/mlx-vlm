@@ -15,6 +15,9 @@ experts separate because their quantization differs from the routed experts.
 Inference uses floating-point activations. Floating router weights and correction
 biases follow the token embedding dtype; router probabilities and NVFP4 global
 scales remain in FP32.
+SwiGLU rounds intermediate results to the activation dtype. Routed expert
+contributions are accumulated in expert-ID order, with the routed scaling
+factor applied after the sum, matching the reference's BF16 operation boundaries.
 
 Convert without `--quantize` to preserve the released precision:
 

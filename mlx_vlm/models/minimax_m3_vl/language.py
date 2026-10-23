@@ -445,9 +445,30 @@ def _swiglu_oai(
     limit: float = 7.0,
     beta: float = 1.0,
 ):
+    dtype = x_glu.dtype
     x_glu = mx.clip(x_glu, a_min=None, a_max=limit)
     x_linear = mx.clip(x_linear, a_min=-limit, a_max=limit)
-    return x_glu * mx.sigmoid(alpha * x_glu) * (x_linear + beta)
+    # Eager BF16 arithmetic rounds after each operation, while scalar
+    # multiplication and sigmoid evaluate in FP32 before that rounding.
+    scaled = (x_glu.astype(mx.float32) * alpha).astype(dtype)
+    sigmoid = mx.sigmoid(scaled.astype(mx.float32)).astype(dtype)
+    glu = (x_glu.astype(mx.float32) * sigmoid.astype(mx.float32)).astype(dtype)
+    linear = (x_linear.astype(mx.float32) + beta).astype(dtype)
+    return (linear.astype(mx.float32) * glu.astype(mx.float32)).astype(dtype)
+
+
+@mx.compile
+def _minimax_moe_combine(outputs, scores, routed_scaling_factor):
+    # The reference accumulates experts in ascending expert-ID order, rounds
+    # each weighted contribution and addition, then applies the routed scale.
+    dtype = outputs.dtype
+    weighted = (outputs.astype(mx.float32) * scores[..., None]).astype(dtype)
+    result = weighted[..., 0, :]
+    for i in range(1, weighted.shape[-2]):
+        result = (
+            result.astype(mx.float32) + weighted[..., i, :].astype(mx.float32)
+        ).astype(dtype)
+    return (result.astype(mx.float32) * routed_scaling_factor).astype(dtype)
 
 
 class MiniMaxSwiGLUOAI(nn.Module):
@@ -1654,7 +1675,7 @@ class MiniMaxSparseMoeBlock(nn.Module):
                 gates,
                 self.e_score_correction_bias,
                 self.num_experts_per_tok,
-                self.routed_scaling_factor,
+                1.0,
                 self.scoring_func,
             )
         else:
@@ -1667,7 +1688,9 @@ class MiniMaxSparseMoeBlock(nn.Module):
             inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
             scores = mx.take_along_axis(scores, inds, axis=-1)
             scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
-            scores = scores * self.routed_scaling_factor
+        order = mx.argsort(inds, axis=-1)
+        inds = mx.stop_gradient(mx.take_along_axis(inds, order, axis=-1))
+        scores = mx.take_along_axis(scores, order, axis=-1)
         if self.pack_shared_expert:
             shared_inds = mx.full(
                 (*inds.shape[:-1], 1), self.shared_expert_index, dtype=inds.dtype
@@ -1677,10 +1700,15 @@ class MiniMaxSparseMoeBlock(nn.Module):
             scores = mx.concatenate([scores, shared_scores], axis=-1)
 
         y = self.switch_mlp(x, inds)
-        # Keep router probabilities and the weighted expert reduction in FP32.
-        # Rounding the probabilities to BF16 before multiplication adds error
-        # independently of the quantized expert projections.
-        y = (y.astype(mx.float32) * scores[..., None]).sum(axis=-2).astype(x.dtype)
+        if self.pack_shared_expert:
+            y = (
+                _minimax_moe_combine(
+                    y[..., :-1, :], scores[..., :-1], self.routed_scaling_factor
+                )
+                + y[..., -1, :]
+            )
+        else:
+            y = _minimax_moe_combine(y, scores, self.routed_scaling_factor)
 
         if self.sharding_group is not None:
             y = mx.distributed.all_sum(y, group=self.sharding_group)

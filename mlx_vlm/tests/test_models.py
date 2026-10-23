@@ -311,6 +311,61 @@ class TestMiniMaxM31Flash(unittest.TestCase):
 
 class TestMiniMaxSparseAccuracy(unittest.TestCase):
     @staticmethod
+    def round_bf16(value):
+        bits = np.asarray(value, dtype=np.float32).view(np.uint32)
+        rounded = bits + np.uint32(0x7FFF) + ((bits >> 16) & 1)
+        return (rounded & np.uint32(0xFFFF0000)).view(np.float32)
+
+    def test_swiglu_preserves_bf16_operation_boundaries(self):
+        from mlx_vlm.models.minimax_m3_vl.language import _swiglu_oai
+
+        rng = np.random.default_rng(876)
+        gate = self.round_bf16(rng.normal(size=(4, 257)) * 4)
+        up = self.round_bf16(rng.normal(size=gate.shape) * 4)
+        clipped_gate = np.minimum(gate, 7)
+        clipped_up = np.clip(up, -7, 7)
+        scaled = self.round_bf16(clipped_gate * np.float32(1.702))
+        sigmoid = self.round_bf16(1 / (1 + np.exp(-scaled.astype(np.float64))))
+        glu = self.round_bf16(clipped_gate * sigmoid)
+        linear = self.round_bf16(clipped_up + np.float32(1))
+        expected = self.round_bf16(linear * glu)
+        actual = _swiglu_oai(
+            mx.array(up).astype(mx.bfloat16), mx.array(gate).astype(mx.bfloat16)
+        )
+        self.assertEqual(actual.dtype, mx.bfloat16)
+        np.testing.assert_array_equal(np.array(actual.astype(mx.float32)), expected)
+
+    def test_expert_sum_is_independent_of_topk_output_order(self):
+        from mlx_vlm.models.minimax_m3_vl.config import TextConfig
+        from mlx_vlm.models.minimax_m3_vl.language import MiniMaxSparseMoeBlock
+
+        layer = MiniMaxSparseMoeBlock(
+            TextConfig(
+                hidden_size=32,
+                intermediate_size=32,
+                num_local_experts=4,
+                num_experts_per_tok=4,
+                n_shared_experts=0,
+                pack_shared_expert=False,
+                routed_scaling_factor=1.0,
+            )
+        )
+        # Equal probabilities, different selection orders. The BF16 reference
+        # sums 256, 1, -256, 1 in expert-ID order, producing 1 rather than 2.
+        layer.gate = lambda x: mx.zeros((*x.shape[:-1], 4))
+        values = mx.broadcast_to(
+            mx.array([1024, 4, -1024, 4], mx.bfloat16)[:, None], (4, 32)
+        )
+        layer.switch_mlp = lambda x, indices: values[indices]
+        x = mx.zeros((1, 1, 32), mx.bfloat16)
+        for bias in ([1, 2, 4, 3], [4, 3, 2, 1], [2, 4, 1, 3]):
+            with self.subTest(bias=bias):
+                layer.e_score_correction_bias = mx.array(bias, mx.float32)
+                np.testing.assert_array_equal(
+                    np.array(layer(x).astype(mx.float32)), np.ones((1, 1, 32))
+                )
+
+    @staticmethod
     def attention():
         from mlx_vlm.models.minimax_m3_vl.config import TextConfig
         from mlx_vlm.models.minimax_m3_vl.language import MiniMaxAttention
@@ -573,19 +628,23 @@ class TestMiniMaxSparseAccuracy(unittest.TestCase):
         probabilities = 1 / (1 + np.exp(-rounded))
         indices = np.argsort(-probabilities, axis=-1)[..., :2]
         scores = np.take_along_axis(probabilities, indices, axis=-1)
-        scores = scores / scores.sum(-1, keepdims=True) * layer.routed_scaling_factor
-        expected = (
+        scores = scores / scores.sum(-1, keepdims=True)
+        order = np.argsort(indices, axis=-1)
+        indices = np.take_along_axis(indices, order, -1)
+        scores = np.take_along_axis(scores, order, -1).astype(np.float32)
+        weighted = self.round_bf16(
             np.array(values.astype(mx.float32))[indices] * scores[..., None]
-        ).sum(-2)
-        expected = mx.array(expected.astype(np.float32)).astype(mx.bfloat16)
+        )
+        expected = self.round_bf16(weighted[..., 0, :] + weighted[..., 1, :])
+        expected = self.round_bf16(expected * layer.routed_scaling_factor)
         actual = layer(x)
         self.assertEqual(actual.dtype, mx.bfloat16)
         np.testing.assert_array_equal(
             np.array(actual.astype(mx.float32)),
-            np.array(expected.astype(mx.float32)),
+            expected,
         )
 
-    def test_expert_weights_and_reduction_keep_fp32_precision(self):
+    def test_expert_contributions_round_in_expert_order(self):
         from mlx_vlm.models.minimax_m3_vl.config import TextConfig
         from mlx_vlm.models.minimax_m3_vl.language import MiniMaxSparseMoeBlock
 
@@ -621,19 +680,25 @@ class TestMiniMaxSparseAccuracy(unittest.TestCase):
                         ..., :2
                     ]
                     weights = np.take_along_axis(probability, indices, -1)
-                    weights = weights / weights.sum(-1, keepdims=True) * 1.7
+                    weights = weights / weights.sum(-1, keepdims=True)
+                    order = np.argsort(indices, axis=-1)
+                    indices = np.take_along_axis(indices, order, -1)
+                    weights = np.take_along_axis(weights, order, -1)
                     values = np.array(expert_outputs.astype(mx.float32)).astype(
                         np.float64
                     )
-                    expected = (values[indices] * weights[..., None]).sum(-2)
+                    weighted = self.round_bf16(values[indices] * weights[..., None])
+                    expected = self.round_bf16(
+                        weighted[..., 0, :] + weighted[..., 1, :]
+                    )
+                    expected = self.round_bf16(expected * np.float32(1.7))
                     if packed:
-                        expected += values[4]
-                    expected = mx.array(expected.astype(np.float32)).astype(mx.bfloat16)
+                        expected = self.round_bf16(expected + values[4])
                     actual = layer(x)
                     self.assertEqual(actual.dtype, mx.bfloat16)
                     np.testing.assert_array_equal(
                         np.array(actual.astype(mx.float32)),
-                        np.array(expected.astype(mx.float32)),
+                        expected,
                     )
 
     def test_gemma_norm_preserves_small_weight_offsets(self):
