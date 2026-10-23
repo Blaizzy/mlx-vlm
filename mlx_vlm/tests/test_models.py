@@ -233,6 +233,319 @@ class TestMiniMaxM31Flash(unittest.TestCase):
             )
 
 
+class TestMiniMaxSparseAccuracy(unittest.TestCase):
+    @staticmethod
+    def attention():
+        from mlx_vlm.models.minimax_m3_vl.config import TextConfig
+        from mlx_vlm.models.minimax_m3_vl.language import MiniMaxAttention
+
+        return MiniMaxAttention(
+            TextConfig(
+                hidden_size=64,
+                num_attention_heads=8,
+                num_key_value_heads=4,
+                head_dim=32,
+                rotary_dim=16,
+                num_hidden_layers=1,
+                sparse_attention_config={
+                    "use_sparse_attention": True,
+                    "sparse_attention_freq": [1],
+                    "sparse_index_dim": 32,
+                    "sparse_num_index_heads": 4,
+                    "sparse_block_size": 4,
+                    "sparse_topk_blocks": 2,
+                    "sparse_local_block": 1,
+                },
+            ),
+            0,
+        )
+
+    @staticmethod
+    def attention_reference(q, k, v, mask):
+        # Independent FP64 attention over explicitly expanded KV heads.
+        q, k, v = (
+            np.asarray(a.astype(mx.float32), dtype=np.float64) for a in (q, k, v)
+        )
+        k = np.repeat(k, q.shape[1] // k.shape[1], axis=1)
+        v = np.repeat(v, q.shape[1] // v.shape[1], axis=1)
+        scores = (q @ k.swapaxes(-1, -2)) / np.sqrt(q.shape[-1])
+        scores = (
+            np.where(mask, scores, -np.inf) if mask.dtype == bool else scores + mask
+        )
+        peak = np.max(scores, axis=-1, keepdims=True)
+        scores = np.exp(scores - np.where(np.isfinite(peak), peak, 0))
+        return (scores / np.maximum(scores.sum(-1, keepdims=True), 1e-30)) @ v
+
+    def test_independent_index_heads_and_padding(self):
+        attention = self.attention()
+        rng = np.random.default_rng(31)
+        for batch in (1, 4):
+            queries = rng.normal(size=(batch, 4, 3, 4)).astype(np.float32)
+            keys = rng.normal(size=(batch, 1, 23, 4)).astype(np.float32)
+            positions = np.broadcast_to([0, 17, 22], (batch, 3)).copy()
+            for score_type, masked in (("max", False), ("max", True), ("lse", True)):
+                with self.subTest(batch=batch, score_type=score_type, masked=masked):
+                    attention.indexer.score_type = score_type
+                    valid = np.ones((batch, 1, 3, 23), dtype=bool)
+                    if masked:
+                        valid[..., 4:8] = False  # Exclude an entire earlier block.
+                        valid[..., 21:] = False  # Partially padded final block.
+                    scores = (queries @ keys.swapaxes(-1, -2)) * attention.scale
+                    causal = (
+                        np.arange(23)[None, None, None, :]
+                        <= positions[:, None, :, None]
+                    )
+                    scores = np.where(causal & valid, scores, -np.inf)
+                    scores = np.pad(
+                        scores,
+                        ((0, 0), (0, 0), (0, 0), (0, 1)),
+                        constant_values=-np.inf,
+                    )
+                    blocks = scores.reshape(batch, 4, 3, 6, 4)
+                    pooled = (
+                        blocks.max(-1)
+                        if score_type == "max"
+                        else np.logaddexp.reduce(blocks, axis=-1)
+                    )
+                    allowed = np.isfinite(pooled)
+                    for b in range(batch):
+                        for t in range(3):
+                            local = positions[b, t] // 4
+                            pooled[b, :, t, local] = np.where(
+                                allowed[b, :, t, local], 1e29, -np.inf
+                            )
+                    selected = np.argsort(-pooled, axis=-1)[..., :2]
+                    selected = np.where(
+                        np.take_along_axis(allowed, selected, -1), selected, 6
+                    )
+                    selected = np.sort(selected, axis=-1)
+                    selected[selected == 6] = -1
+                    actual = attention.indexer.select_blocks(
+                        mx.array(queries),
+                        mx.array(keys),
+                        0,
+                        mx.array(valid) if masked else None,
+                        mx.array(positions),
+                    )
+                    np.testing.assert_array_equal(np.array(actual), selected)
+                    self.assertFalse(np.array_equal(selected[:, 0], selected[:, 1]))
+                    expected_mask = np.any(
+                        selected[..., None] == np.arange(23) // 4, axis=-2
+                    )
+                    expected_mask = np.repeat(expected_mask & causal & valid, 2, axis=1)
+                    actual_mask = attention.indexer.build_block_mask(
+                        actual,
+                        mx.array(valid) if masked else None,
+                        23,
+                        mx.float32,
+                        mx.array(positions),
+                    )
+                    np.testing.assert_array_equal(np.array(actual_mask), expected_mask)
+                    legacy = attention._build_sparse_mask(
+                        mx.array(queries),
+                        mx.array(keys),
+                        0,
+                        mx.array(valid) if masked else None,
+                        q_positions=mx.array(positions),
+                    )
+                    np.testing.assert_array_equal(np.array(legacy), expected_mask)
+
+    def test_sparse_attention_full_prefill_matches_cached_chunks(self):
+        from mlx_vlm.models.minimax_m3_vl.language import MiniMaxM3KVCache
+
+        mx.random.seed(31)
+        attention = self.attention()
+        for batch in (1, 4):
+            with self.subTest(batch=batch):
+                x = mx.random.normal((batch, 23, 64))
+                expected = attention(x, mask="causal")
+                cache = MiniMaxM3KVCache()
+                chunks = []
+                for start, stop in ((0, 7), (7, 14), (14, 22), (22, 23)):
+                    chunk = attention(x[:, start:stop], mask="causal", cache=cache)
+                    mx.eval(chunk)
+                    chunks.append(chunk)
+                np.testing.assert_allclose(
+                    np.array(mx.concatenate(chunks, axis=1)),
+                    np.array(expected),
+                    rtol=2e-5,
+                    atol=2e-6,
+                )
+
+    @unittest.skipUnless(mx.metal.is_available(), "Requires Metal sparse attention")
+    def test_sparse_metal_kernel_per_group(self):
+        from mlx_vlm.models.minimax_m3_vl.language import (
+            _minimax_m3_sparse_prefill_attention,
+        )
+
+        mx.random.seed(31)
+        for batch, heads in ((1, 1), (1, 4), (4, 2), (4, 4)):
+            for dtype in (mx.float16, mx.bfloat16):
+                with self.subTest(batch=batch, index_heads=heads, dtype=dtype):
+                    q = mx.random.normal((batch, 8, 3, 32)).astype(dtype)
+                    k = mx.random.normal((batch, 4, 137, 32)).astype(dtype)
+                    v = mx.random.normal(k.shape).astype(dtype)
+                    indices = np.empty((batch, heads, 3, 2), dtype=np.int32)
+                    for b in range(batch):
+                        for h in range(heads):
+                            indices[b, h, :, 0] = 1 + (b + h) % 4
+                            indices[b, h, :, 1] = 34
+                    indices[..., 0, 1] = -1
+                    positions = np.broadcast_to([20, 130, 136], (batch, 3)).copy()
+                    mask = np.any(indices[..., None] == np.arange(137) // 4, axis=-2)
+                    mask &= (
+                        np.arange(137)[None, None, None, :]
+                        <= positions[:, None, :, None]
+                    )
+                    mask = np.repeat(mask, 8 // heads, axis=1)
+                    actual = _minimax_m3_sparse_prefill_attention(
+                        q,
+                        k,
+                        v,
+                        mx.array(indices),
+                        mx.array(positions),
+                        32**-0.5,
+                        4,
+                    )
+                    self.assertIsNotNone(actual)
+                    expected = self.attention_reference(q, k, v, mask)
+                    np.testing.assert_allclose(
+                        np.array(actual.astype(mx.float32)),
+                        expected,
+                        rtol=0.008 if dtype == mx.bfloat16 else 0.002,
+                        atol=0.004 if dtype == mx.bfloat16 else 0.0005,
+                    )
+
+    def test_sparse_gather_decode_per_group(self):
+        attention = self.attention()
+        mx.random.seed(31)
+        for heads in (1, 2, 4):
+            for mask_type in ("none", "bool", "additive"):
+                with self.subTest(index_heads=heads, mask_type=mask_type):
+                    batch, length = 4, 1027
+                    q = mx.random.normal((batch, 8, 1, 32))
+                    k = mx.random.normal((batch, 4, length, 32))
+                    v = mx.random.normal(k.shape)
+                    indices = np.empty((batch, heads, 1, 2), dtype=np.int32)
+                    for b in range(batch):
+                        for h in range(heads):
+                            indices[b, h, 0] = [1 + b + h, 256]
+                    indices[0, 0, 0, 1] = -1
+                    positions = np.array([[1024], [1025], [1026], [1026]])
+                    mask = np.any(indices[..., None] == np.arange(length) // 4, axis=-2)
+                    mask &= (
+                        np.arange(length)[None, None, None, :]
+                        <= positions[:, None, :, None]
+                    )
+                    mask = np.repeat(mask, 8 // heads, axis=1)
+                    explicit = None
+                    if mask_type != "none":
+                        allowed = np.ones((batch, 8, 1, length), dtype=bool)
+                        allowed[:, ::2, :, ::3] = False
+                        explicit = (
+                            allowed
+                            if mask_type == "bool"
+                            else np.where(allowed, -0.7, -np.inf).astype(np.float32)
+                        )
+                        mask = (
+                            mask & explicit
+                            if mask_type == "bool"
+                            else np.where(mask, explicit, -np.inf)
+                        )
+                    actual = attention._sparse_decode_attention(
+                        q,
+                        k,
+                        v,
+                        mx.array(indices),
+                        None if explicit is None else mx.array(explicit),
+                        mx.array(positions),
+                    )
+                    self.assertIsNotNone(actual)
+                    np.testing.assert_allclose(
+                        np.array(actual),
+                        self.attention_reference(q, k, v, mask),
+                        rtol=2e-5,
+                        atol=2e-6,
+                    )
+
+    def test_expert_weights_and_reduction_keep_fp32_precision(self):
+        from mlx_vlm.models.minimax_m3_vl.config import TextConfig
+        from mlx_vlm.models.minimax_m3_vl.language import MiniMaxSparseMoeBlock
+
+        mx.random.seed(31)
+        for biased in (False, True):
+            for packed in (False, True):
+                with self.subTest(biased=biased, packed=packed):
+                    layer = MiniMaxSparseMoeBlock(
+                        TextConfig(
+                            hidden_size=32,
+                            intermediate_size=32,
+                            shared_intermediate_size=32,
+                            num_local_experts=4,
+                            num_experts_per_tok=2,
+                            pack_shared_expert=packed,
+                            n_shared_experts=int(packed),
+                            use_routing_bias=biased,
+                            routed_scaling_factor=1.7,
+                        )
+                    )
+                    logits = mx.array([[-1.25, 0.17, 1.13, 0.61]])[None]
+                    bias = mx.array([0.0, 0.5, 0.0, 0.0]) if biased else mx.zeros(4)
+                    layer.gate = lambda x: logits
+                    if biased:
+                        layer.e_score_correction_bias = bias
+                    expert_outputs = (mx.random.normal((5, 32)) * 10).astype(
+                        mx.bfloat16
+                    )
+                    layer.switch_mlp = lambda x, inds: expert_outputs[inds]
+                    x = mx.zeros((1, 1, 32), dtype=mx.bfloat16)
+                    probability = 1 / (1 + np.exp(-np.array(logits).astype(np.float64)))
+                    indices = np.argsort(-(probability + np.array(bias)), axis=-1)[
+                        ..., :2
+                    ]
+                    weights = np.take_along_axis(probability, indices, -1)
+                    weights = weights / weights.sum(-1, keepdims=True) * 1.7
+                    values = np.array(expert_outputs.astype(mx.float32)).astype(
+                        np.float64
+                    )
+                    expected = (values[indices] * weights[..., None]).sum(-2)
+                    if packed:
+                        expected += values[4]
+                    expected = mx.array(expected.astype(np.float32)).astype(mx.bfloat16)
+                    actual = layer(x)
+                    self.assertEqual(actual.dtype, mx.bfloat16)
+                    np.testing.assert_array_equal(
+                        np.array(actual.astype(mx.float32)),
+                        np.array(expected.astype(mx.float32)),
+                    )
+
+    def test_gemma_norm_preserves_small_weight_offsets(self):
+        from mlx_vlm.models.minimax_m3_vl.language import MiniMaxRMSNorm
+
+        mx.random.seed(31)
+        norm = MiniMaxRMSNorm(128)
+        for dtype in (mx.bfloat16, mx.float16, mx.float32):
+            with self.subTest(dtype=dtype):
+                norm.weight = (mx.random.normal((128,)) * 0.003).astype(dtype)
+                x = mx.random.normal((2, 3, 128)).astype(dtype)
+                xf = np.array(x.astype(mx.float32)).astype(np.float64)
+                weight = np.array(norm.weight.astype(mx.float32)).astype(np.float64)
+                expected = xf / np.sqrt(
+                    np.mean(xf * xf, axis=-1, keepdims=True) + norm.eps
+                )
+                expected = mx.array(
+                    (expected * (1 + weight)).astype(np.float32)
+                ).astype(dtype)
+                actual = norm(x)
+                self.assertEqual(actual.dtype, dtype)
+                np.testing.assert_allclose(
+                    np.array(actual.astype(mx.float32)),
+                    np.array(expected.astype(mx.float32)),
+                    rtol=2e-6,
+                    atol=2e-6,
+                )
+
+
 # Shared model contracts
 
 
