@@ -107,3 +107,14 @@ def vlm_mtp_loss(model, batch, *, output=None, loss_mask=None):
         mx.logical_and(loss_mask[:, 1:], context_mask),
     )
     return loss, {"mtp_loss": loss, "num_mtp_tokens": metrics["num_tokens"]}
+
+
+def add_mtp_loss(model, batch, loss, metrics, weight, *, output=None, loss_mask=None):
+    """Add optional MTP supervision, reusing the policy forward when available."""
+    if weight:
+        auxiliary, auxiliary_metrics = vlm_mtp_loss(
+            model, batch, output=output, loss_mask=loss_mask
+        )
+        loss = loss + weight * auxiliary
+        metrics.update(auxiliary_metrics)
+    return loss, metrics
