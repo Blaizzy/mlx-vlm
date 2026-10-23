@@ -1,5 +1,6 @@
 """Convert source checkpoint quantization formats to MLX weight layouts."""
 
+import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
@@ -53,6 +54,7 @@ def _transform_modelopt_nvfp4_weights(
         "quant_algo"
     ) not in {
         "NVFP4",
+        "NVFP4_AWQ",
         "W4A16_NVFP4",
         "MIXED_PRECISION",
     }:
@@ -117,6 +119,20 @@ def _transform_modelopt_nvfp4_weights(
                 or weight.shape[-1] != 8 * scale.shape[-1]
             ):
                 raise ValueError(f"Invalid ModelOpt NVFP4 scale shape for {prefix}.")
+
+            if quantization_config.get("quant_algo") == "NVFP4_AWQ":
+                # Some ModelOpt AWQ exports contain E4M3 NaN block scales
+                # (0x7F/0xFF). Match their reference loader's recovery: zero
+                # those blocks instead of poisoning every downstream layer.
+                nan_scales = (scale & 0x7F) == 0x7F
+                nan_count = mx.sum(nan_scales).item()
+                if nan_count:
+                    logging.warning(
+                        "Zeroing %d NaN NVFP4 AWQ block scales for %s",
+                        nan_count,
+                        prefix,
+                    )
+                    scale = mx.where(nan_scales, mx.array(0, mx.uint8), scale)
 
             transformed[weight_key] = weight.view(mx.uint32)
             transformed[f"{prefix}.scales"] = scale

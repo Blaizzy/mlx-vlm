@@ -1061,6 +1061,7 @@ def test_replace_one_bit_checkpoint_modules_only():
         {"quant_method": method, "quant_algo": algo}
         for method, algo in [
             ("modelopt", "NVFP4"),
+            ("modelopt", "NVFP4_AWQ"),
             ("modelopt", "W4A16_NVFP4"),
             ("modelopt_mixed", "NVFP4"),
         ]
@@ -1086,6 +1087,27 @@ def test_transform_modelopt_nvfp4_weights(config):
     assert "layer.weight_scale" not in transformed
     assert "layer.input_scale" not in transformed
     assert quantization == {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+
+
+def test_transform_modelopt_nvfp4_awq_zeroes_nan_scale_blocks(caplog):
+    weights = _nvfp4_weights()
+    weights["layer.weight_scale"] = mx.array([[127, 126], [255, 56]], mx.uint8)
+    weights["layer.pre_quant_scale"] = mx.linspace(0.25, 2.0, 32)
+    transformed, _ = _transform_modelopt_nvfp4_weights(
+        weights, {"quant_method": "modelopt", "quant_algo": "NVFP4_AWQ"}
+    )
+
+    assert transformed["layer.scales"].tolist() == [[0, 126], [0, 56]]
+    assert weights["layer.weight_scale"].tolist() == [[127, 126], [255, 56]]
+    assert mx.array_equal(
+        transformed["layer.pre_quant_scale"], weights["layer.pre_quant_scale"]
+    ).item()
+    decoded = mx.dequantize(
+        transformed["layer.weight"], transformed["layer.scales"], mode="nvfp4"
+    )
+    assert mx.all(mx.isfinite(decoded)).item()
+    assert mx.array_equal(decoded[:, :16], mx.zeros((2, 16))).item()
+    assert "Zeroing 2 NaN NVFP4 AWQ block scales for layer" in caplog.text
 
 
 @pytest.mark.parametrize("moe_quant_algo", [None, "MXFP4"])
@@ -1238,7 +1260,10 @@ def test_transform_modelopt_mixed_nvfp4_fp8_weights():
 @pytest.mark.parametrize("bias", [False, True])
 @pytest.mark.parametrize("shape", [(1, 64), (2, 3, 64)])
 @pytest.mark.parametrize("scale_name", ["weight_scale_2", "weight_global_scale"])
-def test_scaled_nvfp4_linear_matches_reference(dtype, bias, shape, scale_name):
+@pytest.mark.parametrize("pre_quant_scale", [False, True])
+def test_scaled_nvfp4_linear_matches_reference(
+    dtype, bias, shape, scale_name, pre_quant_scale
+):
     model = nn.Module()
     model.layer = nn.QuantizedLinear(64, 4, bias=bias, mode="nvfp4")
     global_scale = mx.array(
@@ -1252,6 +1277,8 @@ def test_scaled_nvfp4_linear_matches_reference(dtype, bias, shape, scale_name):
     }
     if bias:
         weights["layer.bias"] = mx.array([0.25, -0.5, 1.0, -2.0], dtype)
+    if pre_quant_scale:
+        weights["layer.pre_quant_scale"] = mx.linspace(0.25, 2.0, 64).astype(dtype)
     replace_scaled_quantized_linears(model, weights)
     model.load_weights(list(weights.items()))
     x = mx.linspace(0.1, 1.7, np.prod(shape)).reshape(shape).astype(dtype)
@@ -1261,7 +1288,10 @@ def test_scaled_nvfp4_linear_matches_reference(dtype, bias, shape, scale_name):
         reference_weight /= global_scale
     else:
         reference_weight *= global_scale
-    expected = (x.astype(mx.float32) @ reference_weight.T).astype(dtype)
+    scaled_x = x.astype(mx.float32)
+    if pre_quant_scale:
+        scaled_x *= weights["layer.pre_quant_scale"].astype(mx.float32)
+    expected = (scaled_x @ reference_weight.T).astype(dtype)
     if bias:
         expected += weights["layer.bias"]
     actual = model.layer(x)
@@ -1286,9 +1316,25 @@ def test_scaled_nvfp4_rejects_conflicting_scale_conventions():
         )
 
 
+@pytest.mark.parametrize(
+    "shape,dtype", [((63,), mx.float32), ((2, 64), mx.float32), ((64,), mx.uint8)]
+)
+def test_scaled_nvfp4_rejects_invalid_pre_quant_scale(shape, dtype):
+    model = nn.Module()
+    model.layer = nn.QuantizedLinear(64, 4, bias=False, mode="nvfp4")
+    with pytest.raises(ValueError, match="Invalid NVFP4 pre-quant scale for layer"):
+        replace_scaled_quantized_linears(
+            model,
+            {
+                "layer.weight_scale_2": mx.array(0.5),
+                "layer.pre_quant_scale": mx.ones(shape, dtype),
+            },
+        )
+
+
 @pytest.mark.parametrize("activation_quantization", [False, True])
 @pytest.mark.parametrize(
-    "format", ["modelopt", "nvfp4-pack-quantized", "mixed-precision"]
+    "format", ["modelopt", "modelopt_awq", "nvfp4-pack-quantized", "mixed-precision"]
 )
 def test_nvfp4_global_scale_load_and_save(tmp_path, activation_quantization, format):
     class Model(nn.Module):
@@ -1313,7 +1359,13 @@ def test_nvfp4_global_scale_load_and_save(tmp_path, activation_quantization, for
         "model_type": "test_modelopt",
         "quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4"},
     }
-    if format != "modelopt":
+    is_modelopt = format.startswith("modelopt")
+    if format == "modelopt_awq":
+        config["quantization_config"]["quant_algo"] = "NVFP4_AWQ"
+        weights["layer.pre_quant_scale"] = mx.repeat(
+            mx.array([0.25, 0.5, 1.0, 2.0], mx.bfloat16), 16
+        )
+    if not is_modelopt:
         weights["layer.weight_packed"] = weights.pop("layer.weight")
         weights["layer.weight_global_scale"] = mx.array([14400], mx.bfloat16)
         weights["layer.input_global_scale"] = weights.pop("layer.input_scale")
@@ -1323,10 +1375,10 @@ def test_nvfp4_global_scale_load_and_save(tmp_path, activation_quantization, for
             "quant_method": "compressed-tensors",
             "format": format,
         }
-    scale_name = "weight_scale_2" if format == "modelopt" else "weight_global_scale"
-    other_scale = "weight_global_scale" if format == "modelopt" else "weight_scale_2"
+    scale_name = "weight_scale_2" if is_modelopt else "weight_global_scale"
+    other_scale = "weight_global_scale" if is_modelopt else "weight_scale_2"
     source_scale = weights[f"layer.{scale_name}"].astype(mx.float32).reshape(())
-    factor = source_scale if format == "modelopt" else 1 / source_scale
+    factor = source_scale if is_modelopt else 1 / source_scale
     (tmp_path / "config.json").write_text(json.dumps(config))
     mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
     with patch("mlx_vlm.utils.get_model_and_args", return_value=(architecture, "test")):
@@ -1335,6 +1387,8 @@ def test_nvfp4_global_scale_load_and_save(tmp_path, activation_quantization, for
         assert model.layer._quantize_activations == activation_quantization
         x = mx.full((2, 3, 64), 6.0, mx.bfloat16)
         expected = mx.full((2, 3, 4), 6 * 64 * 256 * factor.item())
+        if format == "modelopt_awq":
+            expected *= weights["layer.pre_quant_scale"].astype(mx.float32).mean()
         assert other_scale not in model.layer
         assert model.layer[scale_name].dtype == mx.float32
         assert mx.array_equal(model.layer[scale_name], source_scale).item()
@@ -1350,6 +1404,10 @@ def test_nvfp4_global_scale_load_and_save(tmp_path, activation_quantization, for
         assert other_scale not in restored.layer
         assert mx.array_equal(restored.layer[scale_name], source_scale).item()
         assert mx.array_equal(restored.layer.weight, model.layer.weight).item()
+        if format == "modelopt_awq":
+            assert mx.array_equal(
+                restored.layer.pre_quant_scale, weights["layer.pre_quant_scale"]
+            ).item()
         assert mx.array_equal(
             restored.layer.scales, weights["layer.weight_scale"]
         ).item()
@@ -1362,8 +1420,9 @@ def test_nvfp4_global_scale_load_and_save(tmp_path, activation_quantization, for
 @pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
 @pytest.mark.parametrize("sorted_indices", [False, True])
 @pytest.mark.parametrize("scale_name", ["weight_scale_2", "weight_global_scale"])
+@pytest.mark.parametrize("pre_quant_scale", [False, True])
 def test_scaled_nvfp4_experts_preserve_individual_scales(
-    dtype, sorted_indices, scale_name
+    dtype, sorted_indices, scale_name, pre_quant_scale
 ):
     model = nn.Module()
     model.layer = QuantizedSwitchLinear(
@@ -1382,6 +1441,10 @@ def test_scaled_nvfp4_experts_preserve_individual_scales(
         "layer.scales": mx.full((2, 4, 4), 120, mx.uint8),
         f"layer.{scale_name}": scales,
     }
+    if pre_quant_scale:
+        weights["layer.pre_quant_scale"] = mx.stack(
+            [mx.linspace(0.25, 1.0, 64), mx.linspace(1.0, 3.0, 64)]
+        ).astype(dtype)
     replace_scaled_quantized_linears(model, weights)
     model.load_weights(list(weights.items()))
     assert isinstance(model.layer, ScaledQuantizedSwitchLinear)
@@ -1392,6 +1455,10 @@ def test_scaled_nvfp4_experts_preserve_individual_scales(
         if scale_name == "weight_global_scale"
         else 64 * 256 * scales[indices]
     )
+    if pre_quant_scale:
+        expected *= (
+            weights["layer.pre_quant_scale"].astype(mx.float32).mean(-1)[indices]
+        )
     expected = mx.broadcast_to(expected[..., None, None], (2, 2, 1, 4))
     assert mx.allclose(
         model.layer(x, indices, sorted_indices=sorted_indices),
