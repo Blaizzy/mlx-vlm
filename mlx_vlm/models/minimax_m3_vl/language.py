@@ -184,67 +184,6 @@ def _select_sparse_block_indices_compiled(
     return mx.where(block_indices == num_blocks, mx.array(-1), block_indices)
 
 
-@partial(mx.compile, shapeless=True)
-def _minimax_attention_probabilities(scores, scale, mask):
-    dtype = scores.dtype
-    scores = (scores.astype(mx.float32) * scale).astype(dtype)
-    if mask is not None:
-        scores = (
-            mx.where(mask, scores, -mx.inf) if mask.dtype == mx.bool_ else scores + mask
-        )
-    probabilities = mx.softmax(scores, axis=-1, precise=True).astype(dtype)
-    return mx.where(mx.isfinite(scores), probabilities, 0)
-
-
-_MINIMAX_ATTENTION_MAX_SCORE_ELEMENTS = 1 << 26
-
-
-def _minimax_scaled_dot_product_attention(queries, keys, values, cache, scale, mask):
-    if (
-        queries.dtype != mx.bfloat16
-        or not isinstance(keys, mx.array)
-        or not isinstance(values, mx.array)
-        or keys.dtype != queries.dtype
-        or values.dtype != queries.dtype
-        or hasattr(cache, "bits")
-    ):
-        return scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=scale, mask=mask
-        )
-
-    # Preserve the reference's BF16 QK, scaled-score and probability boundaries.
-    # Broadcast KV groups instead of repeating their storage, and split queries
-    # to keep each score tensor near 128 MiB even for long cached prefills.
-    batch, heads, query_length, dims = queries.shape
-    kv_heads, key_length = keys.shape[1:3]
-    groups = heads // kv_heads
-    chunk_size = max(
-        1, _MINIMAX_ATTENTION_MAX_SCORE_ELEMENTS // (batch * heads * key_length)
-    )
-    outputs = []
-    for start in range(0, query_length, chunk_size):
-        end = min(start + chunk_size, query_length)
-        length = end - start
-        q = queries[:, :, start:end].reshape(batch, kv_heads, groups, length, dims)
-        scores = q @ keys[:, :, None].swapaxes(-1, -2)
-        active_mask = mask
-        if isinstance(mask, str):
-            active_mask = (
-                mx.arange(key_length)[None, :]
-                <= (mx.arange(start, end) + key_length - query_length)[:, None]
-            )
-        elif mask is not None:
-            if mask.shape[-2] == query_length:
-                active_mask = mask[..., start:end, :]
-            active_mask = mx.broadcast_to(
-                active_mask, (batch, heads, length, key_length)
-            ).reshape(batch, kv_heads, groups, length, key_length)
-        probabilities = _minimax_attention_probabilities(scores, scale, active_mask)
-        output = probabilities @ values[:, :, None]
-        outputs.append(output.reshape(batch, heads, length, values.shape[-1]))
-    return outputs[0] if len(outputs) == 1 else mx.concatenate(outputs, axis=-2)
-
-
 _MINIMAX_M3_SPARSE_PREFILL_ONE_PASS_SOURCE = r"""
     uint row_idx = threadgroup_position_in_grid.y;
     uint simd_gid = simdgroup_index_in_threadgroup;
@@ -261,7 +200,6 @@ _MINIMAX_M3_SPARSE_PREFILL_ONE_PASS_SOURCE = r"""
     threadgroup U outputs[BN * BD];
     threadgroup U max_scores[BN];
     threadgroup U sum_exp_scores[BN];
-    threadgroup U rounded_scores[ROUND_BF16 ? SELECTED_LENGTH : 1];
 
     int key_length = int(k_size[0]);
     int query_idx = int(row_idx % Q_LEN);
@@ -279,7 +217,7 @@ _MINIMAX_M3_SPARSE_PREFILL_ONE_PASS_SOURCE = r"""
 
     U s = U(scale[0]);
     for (int i = 0; i < qk_per_thread; i++) {
-        q[i] = (ROUND_BF16 ? U(1) : s) * static_cast<U>(qptr[i]);
+        q[i] = s * static_cast<U>(qptr[i]);
     }
     for (int i = 0; i < v_per_thread; i++) {
         o[i] = 0;
@@ -314,12 +252,6 @@ _MINIMAX_M3_SPARSE_PREFILL_ONE_PASS_SOURCE = r"""
                 score += q[j] * static_cast<U>(kptr[j]);
             }
             score = simd_sum(score);
-            if (ROUND_BF16) {
-                score = U(T(U(T(score)) * s));
-            }
-        }
-        if (ROUND_BF16 && simd_lid == 0) {
-            rounded_scores[selected_idx] = score;
         }
 
         U new_max = max(max_score, score);
@@ -329,7 +261,7 @@ _MINIMAX_M3_SPARSE_PREFILL_ONE_PASS_SOURCE = r"""
         max_score = new_max;
         sum_exp_score = sum_exp_score * factor + exp_score;
 
-        if (!ROUND_BF16 && valid) {
+        if (valid) {
             const device T* vptr =
                 values + (((batch_idx * NUM_KV_HEADS + kv_head_idx) * key_length +
                            key_pos) *
@@ -338,7 +270,7 @@ _MINIMAX_M3_SPARSE_PREFILL_ONE_PASS_SOURCE = r"""
             for (int j = 0; j < v_per_thread; j++) {
                 o[j] = o[j] * factor + exp_score * static_cast<U>(vptr[j]);
             }
-        } else if (!ROUND_BF16) {
+        } else {
             for (int j = 0; j < v_per_thread; j++) {
                 o[j] = o[j] * factor;
             }
@@ -356,35 +288,11 @@ _MINIMAX_M3_SPARSE_PREFILL_ONE_PASS_SOURCE = r"""
     U factor = fast::exp(max_score - new_max);
     U total_sum = simd_sum(sum_exp_scores[simd_lid] * factor);
 
-    if (ROUND_BF16) {
-        for (int selected_idx = int(simd_gid); selected_idx < SELECTED_LENGTH;
-             selected_idx += BN) {
-            int block_slot = selected_idx / BLOCK_SIZE;
-            int block_offset = selected_idx - block_slot * BLOCK_SIZE;
-            int block_idx = int(block_indices[blocks_offset + block_slot]);
-            int key_pos = block_idx * BLOCK_SIZE + block_offset;
-            if (block_idx >= 0 && key_pos < key_length && key_pos <= qpos &&
-                total_sum > U(0)) {
-                U probability = U(T(fast::exp(
-                    rounded_scores[selected_idx] - new_max) / total_sum));
-                const device T* vptr = values +
-                    (((batch_idx * NUM_KV_HEADS + kv_head_idx) * key_length +
-                      key_pos) * D_SIZE) + int(simd_lid) * v_per_thread;
-                for (int j = 0; j < v_per_thread; j++) {
-                    o[j] += probability * static_cast<U>(vptr[j]);
-                }
-            }
-        }
-    }
-
     for (int i = 0; i < v_per_thread; i++) {
         outputs[simd_lid * BD + simd_gid] = o[i];
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        o[i] = simd_sum(outputs[simd_gid * BD + simd_lid] *
-                       (ROUND_BF16 ? U(1) : factor));
-        if (!ROUND_BF16) {
-            o[i] = total_sum == 0 ? U(0) : (o[i] / total_sum);
-        }
+        o[i] = simd_sum(outputs[simd_gid * BD + simd_lid] * factor);
+        o[i] = total_sum == 0 ? U(0) : (o[i] / total_sum);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
@@ -476,12 +384,8 @@ def _minimax_m3_sparse_prefill_attention(
         or q_heads % index_heads != 0
         or d_size != values.shape[-1]
         or d_size % 32 != 0
-        or (queries.dtype == mx.bfloat16 and selected_length > 4096)
         or selected_length >= key_length
-        or (
-            key_length < selected_length * 7
-            and not (queries.dtype == mx.bfloat16 and query_length == 1)
-        )
+        or key_length < selected_length * 7
     ):
         return None
 
@@ -525,7 +429,6 @@ def _minimax_m3_sparse_prefill_attention(
             ("BLOCK_SIZE", int(block_size)),
             ("TOPK_BLOCKS", int(topk_blocks)),
             ("SELECTED_LENGTH", int(selected_length)),
-            ("ROUND_BF16", queries.dtype == mx.bfloat16),
         ],
         grid=(1024, B * q_heads * query_length, 1),
         threadgroup=(1024, 1, 1),
@@ -1311,13 +1214,8 @@ class MiniMaxAttention(nn.Module):
         key_length = keys.shape[2]
         selected_length = block_indices.shape[-1] * self.sparse_block_size
         has_explicit_mask = mask is not None and not isinstance(mask, str)
-        # Use the rounded BF16 kernel once selection excludes blocks.
-        # Other paths retain the crossover measured against fused dense SDPA.
-        min_sparse_length = (
-            selected_length + 1
-            if queries.dtype == mx.bfloat16 and not has_explicit_mask
-            else selected_length * (16 if has_explicit_mask else 64)
-        )
+        # Dense SDPA is still faster before these measured crossover points.
+        min_sparse_length = selected_length * (16 if has_explicit_mask else 64)
         if selected_length >= key_length or key_length < min_sparse_length:
             return None
 
@@ -1374,7 +1272,7 @@ class MiniMaxAttention(nn.Module):
                 )
                 compact_mask = sparse_bias + gathered_mask
 
-        return _minimax_scaled_dot_product_attention(
+        return scaled_dot_product_attention(
             queries,
             compact_keys,
             compact_values,
@@ -1482,7 +1380,7 @@ class MiniMaxAttention(nn.Module):
                 mask, B, L, keys.shape[2], causal=True
             )
 
-        output = _minimax_scaled_dot_product_attention(
+        output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)

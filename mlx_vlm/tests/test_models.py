@@ -394,68 +394,18 @@ class TestMiniMaxSparseAccuracy(unittest.TestCase):
     @staticmethod
     def attention_reference(q, k, v, mask):
         # Independent FP64 attention over explicitly expanded KV heads.
-        bf16 = q.dtype == mx.bfloat16
-        rounded = TestMiniMaxSparseAccuracy.round_bf16
         q, k, v = (
             np.asarray(a.astype(mx.float32), dtype=np.float64) for a in (q, k, v)
         )
         k = np.repeat(k, q.shape[1] // k.shape[1], axis=1)
         v = np.repeat(v, q.shape[1] // v.shape[1], axis=1)
-        scores = q @ k.swapaxes(-1, -2)
-        if bf16:
-            scores = rounded(scores)
-        scores = scores * np.float32(q.shape[-1] ** -0.5)
-        if bf16:
-            scores = rounded(scores)
+        scores = (q @ k.swapaxes(-1, -2)) / np.sqrt(q.shape[-1])
         scores = (
             np.where(mask, scores, -np.inf) if mask.dtype == bool else scores + mask
         )
         peak = np.max(scores, axis=-1, keepdims=True)
         scores = np.exp(scores - np.where(np.isfinite(peak), peak, 0))
-        probabilities = scores / np.maximum(scores.sum(-1, keepdims=True), 1e-30)
-        if bf16:
-            probabilities = rounded(probabilities)
-        output = probabilities @ v
-        return rounded(output) if bf16 else output
-
-    def test_bf16_attention_rounds_scores_and_probabilities(self):
-        from mlx_vlm.models.minimax_m3_vl import language
-
-        rng = np.random.default_rng(920)
-        q = mx.array(rng.normal(size=(2, 8, 7, 32)) * 3, mx.bfloat16)
-        k = mx.array(rng.normal(size=(2, 2, 19, 32)) * 3, mx.bfloat16)
-        v = mx.array(rng.normal(size=k.shape), mx.bfloat16)
-        causal = np.arange(19)[None, :] <= np.arange(12, 19)[:, None]
-        allowed = np.broadcast_to(causal, (2, 8, 7, 19)).copy()
-        allowed[:, ::2, :, 3:8] = False
-        allowed[0, 0, 0, :] = False
-        for kind in ("causal", "bool", "additive"):
-            mask = (
-                "causal"
-                if kind == "causal"
-                else (
-                    mx.array(allowed)
-                    if kind == "bool"
-                    else mx.array(np.where(allowed, -0.25, -np.inf), mx.float32)
-                )
-            )
-            ref_mask = causal if kind == "causal" else np.array(mask)
-            expected = self.attention_reference(q, k, v, ref_mask)
-            for budget in (1 << 26, 1024):
-                with self.subTest(mask=kind, score_budget=budget):
-                    with patch.object(
-                        language, "_MINIMAX_ATTENTION_MAX_SCORE_ELEMENTS", budget
-                    ):
-                        actual = language._minimax_scaled_dot_product_attention(
-                            q, k, v, cache=None, scale=32**-0.5, mask=mask
-                        )
-                    self.assertEqual(actual.dtype, mx.bfloat16)
-                    np.testing.assert_allclose(
-                        np.array(actual.astype(mx.float32)),
-                        expected,
-                        rtol=0.008,
-                        atol=0.0001,
-                    )
+        return (scores / np.maximum(scores.sum(-1, keepdims=True), 1e-30)) @ v
 
     def test_independent_index_heads_and_padding(self):
         attention = self.attention()
@@ -551,34 +501,6 @@ class TestMiniMaxSparseAccuracy(unittest.TestCase):
                     np.array(expected),
                     rtol=2e-5,
                     atol=2e-6,
-                )
-
-    @unittest.skipUnless(mx.metal.is_available(), "Requires Metal sparse attention")
-    def test_bf16_sparse_decode_rounds_at_short_crossover(self):
-        attention = self.attention()
-        mx.random.seed(920)
-        for batch in (1, 4):
-            with self.subTest(batch=batch):
-                q = (mx.random.normal((batch, 8, 1, 32)) * 2).astype(mx.bfloat16)
-                k = (mx.random.normal((batch, 4, 23, 32)) * 2).astype(mx.bfloat16)
-                v = mx.random.normal(k.shape).astype(mx.bfloat16)
-                indices = mx.broadcast_to(
-                    mx.stack([mx.arange(4), mx.full((4,), 5)], axis=-1)[None, :, None],
-                    (batch, 4, 1, 2),
-                )
-                mask = np.any(
-                    np.array(indices)[..., None] == np.arange(23) // 4, axis=-2
-                )
-                mask = np.repeat(mask, 2, axis=1)
-                actual = attention._sparse_decode_attention(
-                    q, k, v, indices, None, mx.full((batch, 1), 22, mx.int32)
-                )
-                self.assertIsNotNone(actual)
-                np.testing.assert_allclose(
-                    np.array(actual.astype(mx.float32)),
-                    self.attention_reference(q, k, v, mask),
-                    rtol=0.008,
-                    atol=0.0001,
                 )
 
     @unittest.skipUnless(mx.metal.is_available(), "Requires Metal sparse attention")
