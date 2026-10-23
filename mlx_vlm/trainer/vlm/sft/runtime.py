@@ -158,15 +158,17 @@ def vlm_sft_loss(
     loss, metrics = cross_entropy(
         logits, targets, loss_mask, vision_mask=vlm_vision_mask(model, batch)
     )
-    if mtp_loss_weight:
-        from .mtp import vlm_mtp_loss
+    from .mtp import add_mtp_loss
 
-        mtp_loss, mtp_metrics = vlm_mtp_loss(
-            model, batch, output=output, loss_mask=loss_mask
-        )
-        metrics.update(mtp_metrics)
-        loss = loss + mtp_loss_weight * mtp_loss
-    return loss, {**metrics, **vlm_batch_metrics(batch)}
+    return add_mtp_loss(
+        model,
+        batch,
+        loss,
+        {**metrics, **vlm_batch_metrics(batch)},
+        mtp_loss_weight,
+        output=output if mtp_loss_weight else None,
+        loss_mask=loss_mask,
+    )
 
 
 def _squeeze_batch(value: Any) -> Any:

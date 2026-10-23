@@ -10,7 +10,7 @@ import mlx.nn as nn
 
 from mlx_vlm.trainer.losses.cross_entropy import token_cross_entropy
 from mlx_vlm.trainer.losses.preference import dpo_objective, orpo_objective
-from mlx_vlm.trainer.vlm.sft.mtp import vlm_mtp_loss
+from mlx_vlm.trainer.vlm.sft.mtp import add_mtp_loss
 from mlx_vlm.trainer.vlm.sft.runtime import forward_vlm_logits, vlm_batch_metrics
 
 
@@ -99,11 +99,7 @@ def dpo_vlm_loss(
     )
     metrics["num_reference_tokens"] = metrics["num_processed_tokens"]
     loss = mx.mean(losses)
-    if mtp_loss_weight:
-        auxiliary, mtp_metrics = vlm_mtp_loss(model, batch["chosen"])
-        loss = loss + mtp_loss_weight * auxiliary
-        metrics.update(mtp_metrics)
-    return loss, metrics
+    return add_mtp_loss(model, batch["chosen"], loss, metrics, mtp_loss_weight)
 
 
 def orpo_vlm_loss(
@@ -128,8 +124,4 @@ def orpo_vlm_loss(
         mx.int32
     )
     loss = mx.mean(losses)
-    if mtp_loss_weight:
-        auxiliary, mtp_metrics = vlm_mtp_loss(model, batch["chosen"])
-        loss = loss + mtp_loss_weight * auxiliary
-        metrics.update(mtp_metrics)
-    return loss, metrics
+    return add_mtp_loss(model, batch["chosen"], loss, metrics, mtp_loss_weight)
