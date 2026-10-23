@@ -17,6 +17,7 @@ from ..cache import BatchKVCache, KVCache, dynamic_roll
 from ..rope_utils import initialize_rope
 from ..switch_layers import QuantizedSwitchLinear, SwitchGLU, SwitchLinear
 from .config import ModelConfig, TextConfig
+from .precision import CachedFP32Linear
 
 
 def _is_bool_mask(mask: mx.array) -> bool:
@@ -1786,7 +1787,8 @@ class LanguageModel(nn.Module):
         self._position_ids = None
         self._rope_deltas = None
         if not args.tie_word_embeddings:
-            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+            linear = CachedFP32Linear if args.fp32_activations else nn.Linear
+            self.lm_head = linear(args.hidden_size, args.vocab_size, bias=False)
 
     def get_rope_index(
         self,

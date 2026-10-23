@@ -20,6 +20,10 @@ rounding their intermediates and residual additions to BF16 can change later
 expert selections. The sparse Metal attention kernel supports this FP32 path.
 Weights retain their packed MXFP8/NVFP4 representation and stored floating-point
 dtypes; existing converted checkpoints need no reconversion.
+During inference, the output projection retains a reusable FP32 weight cast
+(about 4.6 GiB for M3.1 Flash) to avoid casting the entire matrix on every token.
+This temporary inference cache is excluded from saved checkpoint parameters and
+is refreshed when the source weight changes; training uses the uncached path.
 
 FP32 activations increase compute cost and double unquantized K/V/index-cache
 storage from 135 KiB to 270 KiB per token across the 60 language layers. Set

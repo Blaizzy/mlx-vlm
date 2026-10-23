@@ -235,6 +235,33 @@ class TestMiniMaxM31Flash(unittest.TestCase):
 
 
 class TestMiniMaxActivationPrecision(unittest.TestCase):
+    def test_output_precision_cache_respects_weight_updates_and_training(self):
+        from mlx_vlm.models.minimax_m3_vl.precision import CachedFP32Linear
+
+        mx.random.seed(31)
+        layer = CachedFP32Linear(64, 128, bias=True)
+        layer.set_dtype(mx.bfloat16)
+        layer.eval()
+        x = mx.random.normal((2, 3, 64))
+        for factor in (1.0, 2.0):
+            layer.load_weights([("weight", layer.weight * factor)], strict=False)
+            expected = x @ layer.weight.astype(mx.float32).T + layer.bias
+            for _ in range(2):
+                np.testing.assert_array_equal(np.array(layer(x)), np.array(expected))
+            self.assertEqual(set(layer.parameters()), {"weight", "bias"})
+            self.assertEqual(layer.weight.dtype, mx.bfloat16)
+        layer.train()
+        reference = nn.Linear(64, 128, bias=True)
+        reference.load_weights(list(layer.parameters().items()))
+        loss = lambda module: module(x).sum()
+        actual = nn.value_and_grad(layer, loss)(layer)[1]
+        expected = nn.value_and_grad(reference, loss)(reference)[1]
+        for name in expected:
+            np.testing.assert_array_equal(
+                np.array(actual[name].astype(mx.float32)),
+                np.array(expected[name].astype(mx.float32)),
+            )
+
     def test_precision_default_and_override(self):
         from mlx_vlm.models.minimax_m3_vl.config import TextConfig
 
