@@ -100,6 +100,16 @@ class TextConfig(BaseModelConfig):
     pack_shared_expert: Optional[bool] = None
     # M3.1 Flash routed experts use NVFP4; shared experts remain MXFP8.
     nvfp4_experts: bool = False
+    # M3.1's NVFP4 projections accumulate in FP32. Preserve that precision
+    # through the residual stream, MLPs and attention instead of rounding each
+    # intermediate to BF16. None enables this only for NVFP4 checkpoints.
+    use_fp32_activations: Optional[bool] = None
+
+    @property
+    def fp32_activations(self) -> bool:
+        if self.use_fp32_activations is None:
+            return self.nvfp4_experts
+        return self.use_fp32_activations
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
