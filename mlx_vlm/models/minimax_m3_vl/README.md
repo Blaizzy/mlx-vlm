@@ -18,6 +18,9 @@ scales remain in FP32.
 SwiGLU rounds intermediate results to the activation dtype. Routed expert
 contributions are accumulated in expert-ID order, with the routed scaling
 factor applied after the sum, matching the reference's BF16 operation boundaries.
+BF16 attention also rounds the QK product, scaled scores and softmax probabilities
+before the value projection. Query chunking bounds the dense score intermediates;
+the sparse Metal kernel applies the same rounding to selected blocks.
 
 Convert without `--quantize` to preserve the released precision:
 
