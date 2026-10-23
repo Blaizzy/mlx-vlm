@@ -245,9 +245,16 @@ jobs:
             const preCommitStep = jobs
               .flatMap((job) => job.steps ?? [])
               .find((step) => step.name === "Run pre-commit checks");
-            const testStep = jobs
-              .flatMap((job) => job.steps ?? [])
-              .find((step) => step.name === "Run Python tests");
+            function getTestConclusion(jobs) {
+              const steps = jobs
+                .flatMap((job) => job.steps ?? [])
+                .filter((step) => step.name === "Run Python tests");
+              if (steps.length === 0) return null;
+              if (steps.some((step) => step.conclusion === "failure")) return "failure";
+              if (steps.every((step) => step.conclusion === "success")) return "success";
+              return "unknown";
+            }
+            const testConclusion = getTestConclusion(jobs);
 
             async function getMainTestBaseline() {
               const { data } = await github.rest.actions.listWorkflowRuns({
@@ -277,12 +284,8 @@ jobs:
                   per_page: 100,
                 }
               );
-              const baselineTestStep = baselineJobs
-                .flatMap((job) => job.steps ?? [])
-                .find((step) => step.name === "Run Python tests");
-
               return {
-                conclusion: baselineTestStep?.conclusion ?? "unknown",
+                conclusion: getTestConclusion(baselineJobs) ?? "unknown",
                 url: baselineRun.html_url,
               };
             }
@@ -306,7 +309,7 @@ jobs:
 
             The bot could not compare this result with the current \`main\` baseline. Review the CI output to determine whether the failure is related to this PR.`;
 
-            if (testStep?.conclusion === "failure") {
+            if (testConclusion === "failure") {
               const baseline = await getMainTestBaseline();
 
               if (baseline.conclusion === "failure") {
@@ -341,11 +344,11 @@ jobs:
               core.warning("The Test PRs run did not contain the pre-commit step.");
             }
 
-            if (testStep) {
+            if (testConclusion) {
               await updateFailureReminder({
                 marker: testMarker,
                 body: testBody,
-                conclusion: testStep.conclusion,
+                conclusion: testConclusion,
                 label: "Python tests",
               });
             } else {

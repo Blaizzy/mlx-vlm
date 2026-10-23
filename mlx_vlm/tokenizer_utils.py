@@ -200,8 +200,8 @@ class SPMStreamingDetokenizer(StreamingDetokenizer):
 class BPEStreamingDetokenizer(StreamingDetokenizer):
     """A streaming detokenizer for OpenAI style BPE models.
 
-    It adds tokens to the text if the next token starts with a space similar to
-    the SPM detokenizer.
+    Emits complete UTF-8 characters per token, buffering only incomplete byte
+    sequences until the next token or finalization.
     """
 
     _byte_decoder = None
@@ -209,52 +209,65 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
     def __init__(self, tokenizer, trim_space=False):
         self.trim_space = trim_space
 
-        # Extract the tokens in a list from id to text
-        self.tokenmap = [None] * len(tokenizer.vocab)
-        for value, tokenid in tokenizer.vocab.items():
+        # Make the BPE byte decoder from
+        # https://github.com/openai/gpt-2/blob/master/src/encoder.py
+        self.make_byte_decoder()
+        byte_encoder = {b: c for c, b in self._byte_decoder.items()}
+
+        # Extract the tokens in a list from id to text. Added-token vocab keys
+        # can retain spellings that differ from the tokenizer's ID decoder.
+        vocab = tokenizer.vocab
+        convert_token = getattr(tokenizer, "convert_ids_to_tokens", None)
+        self.tokenmap = [None] * (max(vocab.values(), default=-1) + 1)
+        for value, tokenid in vocab.items():
+            if convert_token is not None:
+                value = convert_token(tokenid)
+            # ByteLevel decodes the whole token as literal UTF-8 if any
+            # character is outside its byte alphabet. Normalize it once so
+            # both streaming paths can keep using the byte decoder.
+            if any(c not in self._byte_decoder for c in value):
+                value = "".join(byte_encoder[b] for b in value.encode("utf-8"))
             self.tokenmap[tokenid] = value
 
         self.reset()
 
-        # Make the BPE byte decoder from
-        # https://github.com/openai/gpt-2/blob/master/src/encoder.py
-        self.make_byte_decoder()
-
     def reset(self):
         self.offset = 0
-        self._unflushed = ""
+        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self._started = False
         self.text = ""
         self.tokens = []
+
+    def _append_text(self, text):
+        if text and not self._started:
+            self._started = True
+            if self.trim_space:
+                text = _remove_space(text)
+        self.text += text
 
     def add_token(self, token, skip_special_token_ids: List[int] = []):
         if token in skip_special_token_ids:
             return
-        v = self.tokenmap[token]
-        # if the token starts with space
-        if self._byte_decoder[v[0]] == 32:
-            current_text = bytearray(
-                self._byte_decoder[c] for c in self._unflushed
-            ).decode("utf-8", errors="replace")
-            if self.text or not self.trim_space:
-                self.text += current_text
-            else:
-                self.text += _remove_space(current_text)
-            self._unflushed = v
-        else:
-            self._unflushed += v
+        # Native ByteLevel decoding skips unmapped IDs, including padded model
+        # outputs. Preserve pending UTF-8 bytes across these gaps.
+        if not 0 <= token < len(self.tokenmap):
+            return
+        value = self.tokenmap[token]
+        if value is None:
+            return
+        token_bytes = bytes(self._byte_decoder[c] for c in value)
+        self._append_text(self._decoder.decode(token_bytes, final=False))
 
     def finalize(self):
-        try:
-            current_text = bytearray(
-                self._byte_decoder[c] for c in self._unflushed
-            ).decode("utf-8", errors="ignore")
-            if self.text or not self.trim_space:
-                self.text += current_text
-            else:
-                self.text += _remove_space(current_text)
-        except (UnicodeDecodeError, KeyError):
-            print(f"Warning: could not decode bytes: {self._unflushed}")
-        self._unflushed = ""
+        self._append_text(self._decoder.decode(b"", final=True))
+
+    @property
+    def last_segment(self):
+        # The incremental decoder buffers incomplete UTF-8, so an emitted
+        # replacement character is final and must not be suppressed.
+        segment = self.text[self.offset :]
+        self.offset = len(self.text)
+        return segment
 
     @classmethod
     def make_byte_decoder(cls):
@@ -311,10 +324,10 @@ class _ServerTokenStreamer:
             self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
 
     def _emit_text(self, text: str) -> str:
-        if text and not self._started and self._trim_space and text[0] == " ":
-            text = text[1:]
-        if text:
+        if text and not self._started:
             self._started = True
+            if self._trim_space:
+                text = _remove_space(text)
         return text
 
     def _fallback_decode(self, token: int) -> str:

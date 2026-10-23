@@ -330,7 +330,9 @@ def generate_step(
         processors.extend(logits_processors)
 
     y = input_ids
-    tokens = mx.array([], dtype=input_ids.dtype)
+    # Processor history follows text IDs, independently of embedding chunks.
+    # Visual prefixes can add embedding positions without corresponding IDs.
+    tokens = input_ids.flatten()
     target_sample_position = 0
 
     thinking_budget_criteria = kwargs.pop("thinking_budget_criteria", None)
@@ -361,7 +363,7 @@ def generate_step(
             lm._rope_deltas = None
 
     def _step(y, inputs_embeds=None):
-        nonlocal tokens, kwargs, last_outputs, target_sample_position
+        nonlocal kwargs, last_outputs, target_sample_position
 
         step_kwargs = {
             **kwargs,
@@ -386,11 +388,8 @@ def generate_step(
             last_outputs = outputs
             logits = outputs.logits[:, -1, :]
 
-            if len(processors) > 0 and len(y) > 0:
-                tokens = mx.concat([tokens, y.flatten()])
-
-                for processor in processors:
-                    logits = processor(tokens, logits)
+            for processor in processors:
+                logits = processor(tokens, logits)
 
             quantize_cache_fn(prompt_cache)
 
@@ -541,6 +540,9 @@ def generate_step(
     n = 0
     while True:
         if n != max_tokens:
+            if processors:
+                with mx.stream(generation_stream):
+                    tokens = mx.concat([tokens, y.flatten()])
             next_y, next_logprobs = _step(y[None])
             mx.async_eval(next_y, next_logprobs)
         if n == 0:
