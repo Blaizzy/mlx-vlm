@@ -216,6 +216,8 @@ def dequantize_model(model: nn.Module) -> nn.Module:
             weight = module.apply_scale(
                 weight, scale.reshape(scale.shape + (1,) * (weight.ndim - scale.ndim))
             )
+            if "pre_quant_scale" in module:
+                weight = weight * mx.expand_dims(module.pre_quant_scale, axis=-2)
         args = weight.shape[::-1]
         m = cls(*args, **kwargs)
         if bias:
