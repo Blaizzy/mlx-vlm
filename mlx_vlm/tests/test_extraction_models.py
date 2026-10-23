@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import importlib
+import inspect
 import io
 import json
 import math
@@ -14,7 +15,7 @@ import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -2449,6 +2450,24 @@ class TestD1DecisionModel(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "alias"):
             aliases(_VocabTokenizer([]), [f"label {i}" for i in range(53)])
 
+    def test_bool_criteria_take_only_true_and_false(self):
+        from mlx_vlm import predict
+        from mlx_vlm.models.d1.prompt import as_question, suffix_text
+
+        model, tok = _extraction_model("d1"), _d1_tokenizer()
+        for criteria in (
+            {"yes": "refund", "no": "keep"},
+            {True: "refund", False: "keep"},
+            {"true": "refund", "maybe": "keep"},
+        ):
+            question = {"type": "bool", "instructions": "Q", "criteria": criteria}
+            with self.subTest(criteria=criteria):
+                with self.assertRaisesRegex(ValueError, 'describe "true" and "false"'):
+                    predict(model, tok, "A B", {"q": question})
+        # A missing side still reads None, as in the reference.
+        partial = {"type": "bool", "instructions": "Q", "criteria": {"true": "refund"}}
+        self.assertIn("Yes: refund\nNo: None", suffix_text(tok, as_question(partial)))
+
     def test_cap_pixels(self):
         from PIL import Image
 
@@ -2480,6 +2499,79 @@ class TestD1DecisionModel(unittest.TestCase):
         for question, probabilities in zip(questions, together):
             alone, read = model.probabilities(tok, state, [question])
             self.assertEqual(read, len(encode(prefix + suffix_text(tok, question))))
+            np.testing.assert_allclose(alone[0], probabilities, atol=1e-5)
+
+    def test_long_trunks_are_prefilled_in_chunks(self):
+        from mlx_vlm.models.d1 import d1
+
+        model = _extraction_model("d1")
+        lm = model.language_model.model
+        forward, widths = type(lm).__call__, []
+
+        def spy(self, inputs, *args, **kwargs):
+            widths.append(inputs.shape[1])
+            return forward(self, inputs, *args, **kwargs)
+
+        rng = np.random.default_rng(0)
+        trunk = rng.integers(0, 320, 2500).tolist()
+        branches = [[1, 2, 3], [4, 5, 6]]
+        with patch.object(type(lm), "__call__", spy):
+            # Trunk widths, then one width per branch batch.
+            for length, questions, budget, expected in [
+                (2500, branches, 65536, [2048, 452, 3]),
+                (2500, [], 65536, [2048, 452]),
+                (2500, branches, 1000, [1000, 1000, 500, 3, 3]),
+                (300, branches, 65536, [300, 3]),
+                (300, [], 65536, [300]),
+            ]:
+                with self.subTest(length=length, questions=questions, budget=budget):
+                    ids = trunk[:length]
+                    widths.clear()
+                    chunked = model.answer_logprobs(ids, questions, None, budget)
+                    self.assertEqual(widths, expected)
+                    with patch.object(d1, "PREFILL_STEP", len(ids)):
+                        whole = model.answer_logprobs(ids, questions)
+                    np.testing.assert_allclose(chunked, whole, atol=1e-5)
+        for budget in (0, -1, None):
+            with self.assertRaisesRegex(ValueError, "token_budget must be at least 1"):
+                model.answer_logprobs(trunk[:300], [], None, budget)
+        # Each chunk is evaluated before the next, so a long trunk peaks far below
+        # one pass.
+        ids, peaks = rng.integers(0, 320, 16384).tolist(), []
+        for step in (d1.PREFILL_STEP, len(ids)):
+            with patch.object(d1, "PREFILL_STEP", step):
+                mx.synchronize()
+                mx.clear_cache()
+                mx.reset_peak_memory()
+                start = mx.get_active_memory()
+                model.answer_logprobs(ids, branches)
+                peaks.append(mx.get_peak_memory() - start)
+        self.assertLess(peaks[0], peaks[1] / 2)
+
+    def test_questions_are_batched_by_length(self):
+        from mlx_vlm.models.d1 import d1
+        from mlx_vlm.models.d1.prompt import as_question
+
+        # Longest first, each batch in request order; a new batch starts when a
+        # branch is under half the longest, or the budget is full.
+        lengths = [20, 981, 20, 97, 25, 50]
+        self.assertEqual(d1._chunks(lengths, 200, 65536), [[1], [3, 5], [0, 2, 4]])
+        self.assertEqual(d1._chunks([10] * 5, 10, 60), [[0, 1, 2], [3, 4]])
+        model, tok = _extraction_model("d1"), _d1_tokenizer()
+        choice = {
+            "type": "choice",
+            "instructions": "Route",
+            "criteria": {f"t{i}": "a long topic description" for i in range(20)},
+        }
+        questions = [as_question(q) for q in _D1_QUESTIONS.values()]
+        questions.insert(1, as_question(choice))
+        grouped, _ = model.probabilities(tok, "A B", questions)
+        one_batch = lambda lengths, trunk, budget: [list(range(len(lengths)))]
+        with patch.object(d1, "_chunks", one_batch):
+            padded, _ = model.probabilities(tok, "A B", questions)
+        np.testing.assert_allclose(sum(grouped, []), sum(padded, []), atol=1e-5)
+        for question, probabilities in zip(questions, grouped):
+            alone, _ = model.probabilities(tok, "A B", [question])
             np.testing.assert_allclose(alone[0], probabilities, atol=1e-5)
 
     def test_image_decisions_use_the_processor(self):
@@ -2587,6 +2679,66 @@ class _CharTokenizer:
 
     def __call__(self, text, add_special_tokens=False):
         return {"input_ids": _chars(text)}
+
+
+# torchvision 0.29.1 ``resize(uint8, BILINEAR, antialias=True)`` of
+# ``_resize_input(h, w)`` to (height, width), as hex bytes in (H, W, C) order.
+_TORCHVISION_RESIZE = {
+    ((13, 17), (5, 7)): (
+        "5e7b986b819e7b7f8a758e76949c6b9d826e70718c6e8b8e64819e7693af6e8595817486"
+        "5b4c6587607d627f7a7b897f8185a27c7f768f7c5a6668768a728f7d9a7770839b7a8a97"
+        "7f9a8281986b898b758d7e68617e7d64778a945a4985835b86a39892afad939667"
+    ),
+    ((5, 7), (8, 11)): (
+        "001d3a2c49666a87a4a8c5e288a5c223405d617e9b9e7693dc102d8e3754466380173451"
+        "49668386a3c085a2bf7895b263809d627f9c7f7693c6607d805c793f5c793855726c89a6"
+        "a0bdda5a77946683a0aecbe8607d9a567390a8c5e2708daa3653705976934d6a8745627f"
+        "718eab7b98b56986a3375471425f7ca1bedb7592af44617e7b98b553708d2b486564819e"
+        "617e9b314e6b3d5a77607d9aa0bdda7a97b4526f8c9cb9d67d9ab753708d324f6c183552"
+        "04213e7491aeafcce9a5c2df7f9cb9607d9abdda67a7c4928aa7c47996b36683a0526f8c"
+        "89a6c39fbcd98ba8c57996b36d8aa7d4f10ec4e172b1ceebb4d1eea8c5e292afcc95b2cf"
+        "8ca9c67693b07592af7794b1"
+    ),
+    ((6, 40), (9, 7)): (
+        "70728f72747481787a85817c8789808d8d8f728f7272829a82916d7c86736b77837c8b86"
+        "8f9b708f826f6f8ca08da46d7f8e725e6d8a6d878b8f9d59a873705a77937e7d89a07687"
+        "946c89636f878a707a9a6980597693717c99906b88926b8876708d90738a89737d67849c"
+        "6683a073607a8b75888a7e99877a8c82786b94b1b55f7c99604e5aaf9f8c8599ac4e5e79"
+        "97623f6f8c9a81848f665867b39d897c899e6c5e7b7f67623e5b78a48e8670667cad8f84"
+        "74728b98648160728f"
+    ),
+    ((3, 130), (3, 12)): (
+        "75707f7e7d7b8a8983798379817e79838786777b85807d7c8b85847d747e81807a8e8984"
+        "83a08469867778927799796f7889688c6b676f879d7e9b7b6683929e8d6f8d7a88918662"
+        "6b73909f6d8a78698698627f95787a8f84758b706e839f697f86767996627390816b8891"
+    ),
+    ((2, 1000), (2, 7)): (
+        "7f7f7f7f7f80807f7f7f8080807f7f7f808080808080847d827e7d7f7e7f7d7f807e8081"
+        "7f81827f837e"
+    ),
+}
+
+
+def _resize_input(height, width):
+    i, j, c = np.meshgrid(*map(np.arange, (height, width, 3)), indexing="ij")
+    return ((i * 53 + j * 97 + c * 29 + (i * j) % 7 * 31) % 256).astype(np.uint8)
+
+
+def _numpy_resize(x, height, width):
+    """The int64 numpy resize d1-omni used before its int32 MLX version."""
+    from mlx_vlm.models.d1_omni.vision import _taps
+
+    for axis, n in ((1, width), (0, height)):
+        if x.shape[axis] == n:
+            continue
+        index, weights, bits = _taps(x.shape[axis], n)
+        shape = (1, -1, 1) if axis == 1 else (-1, 1, 1)
+        acc = np.int64(1 << (bits - 1))
+        for k in range(index.shape[1]):
+            src = np.take(x, index[:, k], axis=axis).astype(np.int64)
+            acc = acc + src * weights[:, k].reshape(shape)
+        x = np.clip(acc >> bits, 0, 255).astype(np.uint8)
+    return x
 
 
 def _random_d1_omni():
@@ -2725,6 +2877,29 @@ class TestD1OmniDecisionModel(unittest.TestCase):
                 {"type": "score", "instructions": "", "criteria": list("abcdefghijk")}
             )
 
+    def test_bool_criteria_take_true_and_false_or_yes_and_no(self):
+        from mlx_vlm import predict
+        from mlx_vlm.models.d1_omni.prompt import as_question
+
+        model, tok = _random_d1_omni(), _CharTokenizer()
+        for criteria in (
+            {True: "refund", False: "keep"},
+            {"True": "refund", "False": "keep"},
+            {"true": "refund", "yes": "refund"},
+            {"no": "keep", "maybe": "refund"},
+        ):
+            question = {"type": "bool", "instructions": "Q", "criteria": criteria}
+            with self.subTest(criteria=criteria):
+                with self.assertRaisesRegex(ValueError, 'describe "true" and "false"'):
+                    predict(model, tok, "A B", {"q": question})
+        for criteria in (
+            {"true": "a", "false": "b"},
+            {"yes": "a", "no": "b"},
+            {"no": "b"},
+        ):
+            question = {"type": "bool", "instructions": "Q", "criteria": criteria}
+            self.assertEqual(as_question(question), ("noul", "Q", criteria))
+
     def test_image_layout_matches_reference(self):
         from PIL import Image
 
@@ -2757,6 +2932,28 @@ class TestD1OmniDecisionModel(unittest.TestCase):
             inputs["pixel_values"][0, 0, :6], [1, -1, -0.5 / 127.5] * 2, atol=1e-6
         )
         self.assertFalse(inputs["pixel_values"][0, 280:].any())
+
+    def test_image_resize_matches_torchvision(self):
+        from mlx_vlm.models.d1_omni.vision import TILE, layout, resize
+
+        for ((h, w), (height, width)), expected in _TORCHVISION_RESIZE.items():
+            with self.subTest(size=(h, w), to=(height, width)):
+                actual = resize(_resize_input(h, w), height, width)
+                self.assertEqual(actual.shape, (height, width, 3))
+                self.assertEqual(actual.tobytes().hex(), expected)
+        # The same bytes as the int64 numpy resize, at the sizes images take.
+        rng = np.random.default_rng(0)
+        for h, w in [(1, 1), (17, 9), (480, 640), (1200, 2000), (4097, 3)]:
+            x = rng.integers(0, 256, (h, w, 3), np.uint8)
+            plan = layout(w, h)
+            sizes = [plan["thumbnail"]]
+            if plan["tiled"]:
+                sizes.append((plan["grid"][1] * TILE, plan["grid"][0] * TILE))
+            for size in sizes:
+                with self.subTest(size=(h, w), to=size):
+                    np.testing.assert_array_equal(
+                        resize(x, *size), _numpy_resize(x, *size)
+                    )
 
     def test_sanitize_converts_reference_checkpoint(self):
         from mlx_vlm.models.d1_omni.audio import RENAMES
@@ -2866,6 +3063,71 @@ class TestD1OmniDecisionModel(unittest.TestCase):
             answers["c"]["metadata"]["legend"], {"0": "low", "1": "mid", "2": "high"}
         )
 
+    def test_default_token_budget_bounds_batches(self):
+        from mlx_vlm.models.d1 import d1
+        from mlx_vlm.models.d1_omni import d1_omni
+
+        model, tok = _random_d1_omni(), _CharTokenizer()
+        batches = []
+
+        def forward(rows, *args):
+            batches.append(len(rows))
+            return [[0.5, 0.5]] * len(rows)
+
+        model._forward = forward
+        question = {"type": "bool", "instructions": "Q"}
+        model.probabilities(tok, [("x" * 3000, [question] * 6)])
+        # Rows of about 3,100 positions: 5 fit in 16384 (all 6 fit in 65536).
+        self.assertEqual(batches, [5, 1])
+        # d1-3B keeps 65536: a smaller budget is slower there and saves no memory.
+        for module, budget in ((d1_omni, 16384), (d1, 65536)):
+            for method in (module.Model.predict, module.Model.probabilities):
+                parameter = inspect.signature(method).parameters["token_budget"]
+                self.assertEqual(parameter.default, budget)
+
+    def test_rows_are_batched_by_length(self):
+        from PIL import Image
+
+        from mlx_vlm.models.d1_omni import d1_omni
+
+        rows = [(None, [0] * n) for n in (40, 900, 45, 300, 160, 100)]
+        batches = lambda budget: list(d1_omni._batches(rows, range(6), budget))
+        self.assertEqual(batches(16384), [[1], [3, 4], [5], [2, 0]])
+        self.assertEqual(batches(320), [[1], [3], [4, 5], [2, 0]])
+        # After a shared prefix, only the text lengths count against padding.
+        media = mx.zeros((1000, 8))
+        rows = [(media, [0] * n) for n in (40, 900, 45)]
+        self.assertEqual(list(d1_omni._batches(rows, range(3), 16384)), [[1, 2, 0]])
+        shared = d1_omni._batches(rows, range(3), 16384, shared=True)
+        self.assertEqual(list(shared), [[1], [2, 0]])
+
+        model, tok = _random_d1_omni(), _CharTokenizer()
+        image = Image.fromarray(
+            np.random.default_rng(0).integers(0, 256, (48, 64, 3), np.uint8)
+        )
+        choice = {
+            "type": "choice",
+            "instructions": "Pick one",
+            "criteria": {f"t{i}": "a long topic description" for i in range(20)},
+        }
+        questions = [
+            {"type": "bool", "instructions": "Short?"},
+            choice,
+            {"type": "score", "instructions": "Rate", "criteria": ["low", "high"]},
+            {"type": "bool", "instructions": "Is it?"},
+        ]
+        requests = [("x" * 50, questions), (None, questions, [image])]
+        grouped = model.probabilities(tok, requests)
+        one_batch = lambda rows, indices, budget, shared=False: [sorted(indices)]
+        with patch.object(d1_omni, "_batches", one_batch):
+            padded = model.probabilities(tok, requests)
+        np.testing.assert_allclose(_flat(grouped), _flat(padded), atol=1e-5)
+        for request, (probabilities, _) in zip(requests, grouped):
+            for question, expected in zip(questions, probabilities):
+                alone = (request[0], [question], *request[2:])
+                [(actual, _)] = model.probabilities(tok, [alone])
+                np.testing.assert_allclose(actual[0], expected, atol=1e-5)
+
     def test_media_prefix_reads_only_media(self):
         # Prefix queries never see text keys and the centred convolution never lets
         # the last prefix position read the first text one, so the media prefix is
@@ -2880,6 +3142,59 @@ class TestD1OmniDecisionModel(unittest.TestCase):
         first, second = run([1, 2, 3, 4]), run([9, 8, 7, 6])
         np.testing.assert_array_equal(first[:5], second[:5])
         self.assertFalse(np.allclose(first[5:], second[5:]))
+
+    def test_shared_media_prefix_matches_per_row_prefix(self):
+        from PIL import Image
+
+        model, tok = _random_d1_omni(), _CharTokenizer()
+        trunk = model.encoder
+        # Text rows after one shared prefix read what [prefix; text] rows read.
+        P, lengths = 5, [7, 3, 5]
+        media = mx.random.normal((P, 64), key=mx.random.key(1))
+        h = mx.random.normal((3, max(lengths), 64), key=mx.random.key(2))
+        pad = mx.arange(max(lengths))[None] < mx.array(lengths)[:, None]
+        rows = mx.concatenate([mx.broadcast_to(media, (3, P, 64)), h], axis=1)
+        rows_pad = mx.concatenate([mx.ones((3, P), mx.bool_), pad], axis=1)
+        expected = np.array(trunk(rows, rows_pad, [P] * 3)[:, P:])
+        actual = np.array(trunk.after(h, pad, trunk.prefix_state(media)))
+        for row, n in enumerate(lengths):
+            np.testing.assert_allclose(actual[row, :n], expected[row, :n], atol=1e-5)
+
+        calls = []
+        prefix_state = trunk.prefix_state
+        trunk.prefix_state = lambda media: calls.append(media) or prefix_state(media)
+        rng = np.random.default_rng(0)
+        image = Image.fromarray(rng.integers(0, 256, (48, 64, 3), np.uint8))
+        clip = (rng.normal(0, 0.1, 12000) * 32768).astype(np.int16)
+        questions = [
+            {"type": "bool", "instructions": "Short?"},
+            {"type": "choice", "instructions": "Pick one", "criteria": ["a", "bb"]},
+            {"type": "score", "instructions": "Rate it", "criteria": list("abcd")},
+        ]
+        for kind, media in (("image", ([image],)), ("audio", (None, clip))):
+            with self.subTest(media=kind):
+                calls.clear()
+                [shared] = model.probabilities(tok, [(None, questions, *media)])
+                self.assertEqual(len(calls), 1)
+                # One question per request runs its prefix in the row.
+                alone = model.probabilities(
+                    tok, [(None, [q], *media) for q in questions]
+                )
+                self.assertEqual(len(calls), 1)
+                np.testing.assert_allclose(_flat([shared]), _flat(alone), atol=1e-5)
+                self.assertEqual(shared[1], sum(read for _, read in alone))
+        # Every request that has several questions on media runs its prefix once.
+        calls.clear()
+        model.probabilities(
+            tok,
+            [
+                (None, questions[:2], [image]),
+                ("hi", questions),
+                (None, questions[1:], None, clip),
+                (None, questions[:1], [image]),
+            ],
+        )
+        self.assertEqual(len(calls), 2)
 
     def test_short_conv_taps_left_centre_right(self):
         trunk = _random_d1_omni().encoder
