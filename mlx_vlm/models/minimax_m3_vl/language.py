@@ -174,6 +174,7 @@ def _select_sparse_block_indices_compiled(
     topk_idx = mx.argpartition(-selected_scores, kth=sparse_topk_blocks - 1, axis=-1)[
         ..., :sparse_topk_blocks
     ]
+    topk_idx = mx.stop_gradient(topk_idx)
     topk_valid = mx.take_along_axis(valid_blocks, topk_idx, axis=-1)
     invalid = mx.full(topk_idx.shape, num_blocks, dtype=topk_idx.dtype)
     block_indices = mx.where(topk_valid, topk_idx, invalid)
@@ -1525,6 +1526,7 @@ class MiniMaxM3Indexer:
 
         topk = min(self.topk_blocks, num_blocks)
         topk_idx = mx.argpartition(-selected_scores, kth=topk - 1, axis=-1)[..., :topk]
+        topk_idx = mx.stop_gradient(topk_idx)
         topk_valid = mx.take_along_axis(valid_blocks, topk_idx, axis=-1)
         return self._pack_block_indices(topk_idx, topk_valid, num_blocks)
 
@@ -1537,6 +1539,7 @@ class MiniMaxM3Indexer:
         invalid = mx.full(topk_idx.shape, num_blocks, dtype=topk_idx.dtype)
         block_indices = mx.where(topk_valid, topk_idx, invalid)
         order = mx.argsort(block_indices, axis=-1)
+        order = mx.stop_gradient(order)
         block_indices = mx.take_along_axis(block_indices, order, axis=-1)
         return mx.where(block_indices == num_blocks, mx.array(-1), block_indices)
 
