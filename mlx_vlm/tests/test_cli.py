@@ -515,11 +515,18 @@ def test_decision_cli_routes_inputs_and_returns_json(
     from mlx_vlm import decide
 
     state = "Please refund my café purchase."
-    questions = {"route": {"type": "choice", "criteria": ["billing", "support"]}}
-    result = {"answers": {"route": {"type": "choice", "value": "billing"}}}
+    questions = [
+        {
+            "name": "route",
+            "type": "choice",
+            "instructions": "Route",
+            "choices": [{"value": "billing"}, {"value": "support"}],
+        }
+    ]
+    result = {"answers": [{"name": "route", "type": "choice", "choice": "billing"}]}
     args = ["--model", "model/path"]
     for name, value, use_file in (
-        ("state", state, state_file),
+        ("input", state, state_file),
         ("questions", json.dumps(questions), questions_file),
     ):
         if use_file:
@@ -535,7 +542,17 @@ def test_decision_cli_routes_inputs_and_returns_json(
     monkeypatch.setattr(decide, "predict", predict)
     decide.main(args)
     load.assert_called_once_with("model/path")
-    predict.assert_called_once_with(model, processor, state, questions)
+    predict.assert_called_once_with(
+        model,
+        processor,
+        state,
+        [
+            {
+                **questions[0],
+                "choices": [{**c, "description": ""} for c in questions[0]["choices"]],
+            }
+        ],
+    )
     assert json.loads(capsys.readouterr().out) == result
 
 
@@ -545,7 +562,7 @@ def test_decision_cli_rejects_invalid_questions_before_loading(
 ):
     from mlx_vlm import decide
 
-    args = ["--model", "model/path", "--state", "text"]
+    args = ["--model", "model/path", "--input", "text"]
     if source == "inline":
         args.extend(["--questions", "{invalid"])
     else:
@@ -572,10 +589,10 @@ def test_decision_cli_reports_unsupported_question(capsys, monkeypatch):
             [
                 "--model",
                 "model/path",
-                "--state",
+                "--input",
                 "text",
                 "--questions",
-                '{"q":{"type":"score","criteria":["low","high"]}}',
+                '[{"type":"score","instructions":"Rate","levels":[{"label":"low"},{"label":"high"}]}]',
             ]
         )
     assert error.value.code == 2
@@ -600,10 +617,16 @@ def test_decision_cli_reports_unsupported_question(capsys, monkeypatch):
 def test_decision_cli_passes_media(monkeypatch, state, media, flags):
     from mlx_vlm import decide
 
-    questions = {"cat": {"type": "bool"}}
-    args = ["--model", "d1", "--questions", json.dumps(questions), *flags]
+    questions = [{"name": "cat", "type": "predicate", "instructions": "Cat?"}]
+    args = [
+        "--model",
+        "d1",
+        "--questions",
+        json.dumps(questions),
+        *flags,
+    ]
     if state is not None:
-        args += ["--state", state]
+        args += ["--input", state]
     model, processor = object(), object()
     predict = Mock(return_value={"answers": {}})
     monkeypatch.setattr(decide, "load", Mock(return_value=(model, processor)))
@@ -618,22 +641,32 @@ def test_decision_cli_requires_state_or_media(monkeypatch, capsys):
     load = Mock()
     monkeypatch.setattr(decide, "load", load)
     with pytest.raises(SystemExit) as error:
-        decide.main(["--model", "d1", "--questions", '{"q":{"type":"bool"}}'])
+        decide.main(
+            [
+                "--model",
+                "d1",
+                "--questions",
+                '[{"type":"predicate","instructions":"Q"}]',
+            ]
+        )
     assert error.value.code == 2
-    message = "--state --state-file --image --audio is required"
+    message = "--input --input-file --image --audio is required"
     assert message in capsys.readouterr().err
     load.assert_not_called()
 
 
-def test_decide_registered_as_package_subcommand():
+@pytest.mark.parametrize(
+    "command", [["-m", "mlx_vlm", "decide"], ["-m", "mlx_vlm.decide"]]
+)
+def test_decide_cli_entrypoints(command):
     result = subprocess.run(
-        [sys.executable, "-m", "mlx_vlm", "decide", "--help"],
+        [sys.executable, "-W", "error::RuntimeWarning", *command, "--help"],
         capture_output=True,
         text=True,
         check=True,
     )
     assert "--questions-file" in result.stdout
-    assert "--state-file" in result.stdout
+    assert "--input-file" in result.stdout
 
 
 @pytest.mark.parametrize("questions", [[], {}, None, "question", {"q": []}])
@@ -643,7 +676,7 @@ def test_decision_cli_rejects_question_structure_before_loading(
 ):
     from mlx_vlm import decide
 
-    args = ["--model", "model/path", "--state", "text"]
+    args = ["--model", "model/path", "--input", "text"]
     content = json.dumps(questions)
     if from_file:
         path = tmp_path / "questions.json"
@@ -658,3 +691,141 @@ def test_decision_cli_rejects_question_structure_before_loading(
     assert error.value.code == 2
     assert "question" in capsys.readouterr().err.lower()
     load.assert_not_called()
+
+
+@pytest.fixture
+def decision_cli_responses(monkeypatch):
+    from concurrent.futures import Future
+
+    from mlx_vlm import decide
+
+    calls = []
+
+    class Scheduler:
+        def __init__(self, loader, **kwargs):
+            self.loader, self.loaded = loader, set()
+
+        def submit(self, body, **kwargs):
+            calls.append(body)
+            if body["model"] not in self.loaded:
+                self.loader(body["model"])
+                self.loaded.add(body["model"])
+            p = 0.2 if body["model"] == "reference" else 0.8
+            future = Future()
+            future.set_result(
+                {
+                    "response": {
+                        "model": body["model"],
+                        "answers": {
+                            "0": {"type": "bool", "value": p >= 0.5, "probability": p}
+                        },
+                        "usage": {"input_tokens": 9, "output_tokens": 0},
+                    },
+                    "probabilities": {"0": {"true": p, "false": 1 - p}},
+                    "cached_tokens": 0,
+                }
+            )
+            return NS(future=future)
+
+        def stop_and_join(self):
+            pass
+
+    def loader(name):
+        print("loader diagnostic")
+        return NS(config=NS()), None
+
+    monkeypatch.setattr(decide, "load", loader)
+    monkeypatch.setattr("mlx_vlm.decision_scheduler.DecisionScheduler", Scheduler)
+    return calls
+
+
+@pytest.mark.parametrize("kind", ["file", "stdin", "jsonl"])
+def test_decision_cli_request_streams(
+    decision_cli_responses, monkeypatch, tmp_path, capsys, kind
+):
+    import io
+
+    from mlx_vlm import decide
+
+    body = {
+        "model": "test",
+        "input": "A",
+        "questions": [{"name": "q", "type": "predicate", "instructions": "Q"}],
+    }
+    content = (
+        "\n".join(json.dumps({**body, "input": str(i)}) for i in range(5))
+        if kind == "jsonl"
+        else json.dumps(body)
+    )
+    path = tmp_path / "requests.json"
+    path.write_text(content)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(content))
+    args = ["--request", str(path) if kind == "file" else "-"]
+    if kind == "jsonl":
+        args += ["--jsonl", "--batch-size", "2"]
+    decide.main(args)
+    captured = capsys.readouterr()
+    assert "loader diagnostic" in captured.err
+    outputs = (
+        [json.loads(line) for line in captured.out.splitlines()]
+        if kind == "jsonl"
+        else [json.loads(captured.out)]
+    )
+    assert len(outputs) == len(decision_cli_responses) == (5 if kind == "jsonl" else 1)
+    assert [body["state"] for body in decision_cli_responses] == (
+        [str(i) for i in range(5)] if kind == "jsonl" else ["A"]
+    )
+    answer = outputs[0]["answers"][0]
+    assert answer == {"type": "predicate", "name": "q", "probability": 0.8}
+
+
+def test_decision_cli_comparison_gate(decision_cli_responses, tmp_path, capsys):
+    from mlx_vlm.decide import main
+
+    questions = tmp_path / "questions.json"
+    questions.write_text(
+        json.dumps([{"name": "q", "type": "predicate", "instructions": "Q"}])
+    )
+    report = tmp_path / "drift.json"
+    with pytest.raises(SystemExit) as error:
+        main(
+            [
+                "--model",
+                "candidate",
+                "--input",
+                "A",
+                "--questions",
+                "@" + str(questions),
+                "--compare-model",
+                "reference",
+                "--report",
+                str(report),
+            ]
+        )
+    assert error.value.code == 1
+    assert json.loads(capsys.readouterr().out)["answers"][0] == {
+        "type": "predicate",
+        "name": "q",
+        "probability": 0.8,
+    }
+    result = json.loads(report.read_text())
+    assert not result["passed"] and result["argmax_flips"] == 1
+    assert [body["model"] for body in decision_cli_responses] == [
+        "candidate",
+        "reference",
+    ]
+
+
+def test_decision_comparison_checks_unrounded_probabilities_and_label_alignment():
+    from mlx_vlm.decide import comparison_report
+
+    reference = [{"q": {"a": 0.50001, "b": 0.49999}}]
+    candidate = [{"q": {"b": 0.50001, "a": 0.49999}}]
+    report = comparison_report(reference, candidate)
+    assert report["argmax_flips"] == 1 and not report["passed"]
+    assert 0 < report["max_probability_drift"] < 0.0001
+    assert comparison_report(reference, reference)["passed"]
+    with pytest.raises(ValueError, match="unrounded"):
+        comparison_report([None], reference)
+    with pytest.raises(ValueError, match="labels"):
+        comparison_report(reference, [{"q": {"a": 0.5, "c": 0.5}}])

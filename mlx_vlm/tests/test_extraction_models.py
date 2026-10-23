@@ -1929,11 +1929,22 @@ class TestSAM3DObjects(unittest.TestCase):
             )
 
 
-def _extraction_model(name):
+def _merge_decision_config(values, overrides):
+    values = copy.deepcopy(values)
+    for key, value in overrides.items():
+        values[key] = (
+            _merge_decision_config(values.get(key, {}), value)
+            if isinstance(value, dict)
+            else value
+        )
+    return values
+
+
+def _extraction_model(name, config_overrides=None):
     module = importlib.import_module(
         f"mlx_vlm.models.{EXTRACTION_CASES[name]['module']}"
     )
-    raw = _extraction_config(name)
+    raw = _merge_decision_config(_extraction_config(name), config_overrides or {})
     config = update_module_configs(
         module.ModelConfig.from_dict(raw), module, raw, ["text", "vision", "audio"]
     )
@@ -2002,7 +2013,10 @@ class ExtractionChecks:
         model = _extraction_model(case["id"])
         settings = case["decision_models"]
         state = settings["state"]
-        questions = settings["questions"]
+        request = _public_decision_request(
+            {"state": state, "questions": settings["questions"]}
+        )
+        state, questions = request["input"], request["questions"]
         processor = _decision_tokenizer(
             settings.get("tokens", ()), **settings.get("special_tokens", {})
         )
@@ -2021,26 +2035,27 @@ class ExtractionChecks:
             actual = predict(loaded, tokenizer, state, questions)
             assert actual["answers"] == expected["answers"]
             assert actual.get("usage") == expected.get("usage")
-        assert set(expected["answers"]) == set(questions)
-        for name, answer in expected["answers"].items():
-            question = questions[name]
+        assert len(expected["answers"]) == len(questions)
+        for question, answer in zip(questions, expected["answers"]):
             kind = question["type"]
-            assert answer["type"] == kind
+            assert answer["type"] == kind and answer["name"] == question["name"]
             if kind == "choice":
-                assert answer["value"] in question["criteria"]
+                assert answer["choice"] in [c["value"] for c in question["choices"]]
             elif kind == "score":
-                assert 0 <= answer["value"] <= len(question["criteria"]) - 1
-            elif kind == "bool":
-                assert isinstance(answer["value"], bool)
+                assert 0 <= answer["score"] <= len(question["levels"]) - 1
+                assert [p["label"] for p in answer["probabilities"]] == [
+                    l["label"] for l in question["levels"]
+                ]
+            else:
                 assert 0 <= answer["probability"] <= 1
-            elif kind == "multi_label":
-                assert set(answer["value"]) <= set(question["criteria"])
-            if "probabilities" in answer:
-                assert sum(answer["probabilities"].values()) == pytest.approx(
-                    1, abs=1e-3
-                )
-        with pytest.raises(ValueError, match="does not support"):
-            predict(model, processor, state, {"invalid": {"type": "unknown"}})
+            if kind in ("choice", "score"):
+                assert 0 <= answer["confidence"] <= 1
+                assert sum(
+                    p["probability"] for p in answer["probabilities"]
+                ) == pytest.approx(1, abs=1e-3)
+            assert "metadata" not in answer and "value" not in answer
+        with pytest.raises(ValueError, match="unknown"):
+            predict(model, processor, state, [{"type": "unknown", "instructions": "Q"}])
 
     def registry_and_config(self, case):
         name = case["module"]
@@ -2426,7 +2441,6 @@ class TestD1DecisionModel(unittest.TestCase):
         self.assertEqual(_answer(score, [0.2, 0.3, 0.5])["value"], 1.3)
 
     def test_malformed_questions_are_value_errors(self):
-        from mlx_vlm import predict
         from mlx_vlm.models.d1.prompt import aliases, as_question
 
         model, tok = _extraction_model("d1"), _d1_tokenizer()
@@ -2440,7 +2454,7 @@ class TestD1DecisionModel(unittest.TestCase):
         ]:
             with self.subTest(question=question):
                 with self.assertRaisesRegex(ValueError, message):
-                    predict(model, tok, "A B", {"q": question})
+                    model.predict(tok, "A B", {"q": question})
         with self.assertRaisesRegex(ValueError, "noul criteria"):
             as_question({"type": "noul", "instructions": "Q", "criteria": "yes"})
         with self.assertRaisesRegex(ValueError, "two options"):
@@ -2486,7 +2500,6 @@ class TestD1DecisionModel(unittest.TestCase):
         from PIL import Image
         from transformers import Lfm2VlProcessor
 
-        from mlx_vlm import predict
         from mlx_vlm.models.d1.prompt import as_question
         from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import Lfm2VlNumpyImageProcessor
 
@@ -2504,7 +2517,7 @@ class TestD1DecisionModel(unittest.TestCase):
             path = str(Path(directory) / "photo.png")
             Image.fromarray(pixels).save(path)
             images = [Image.fromarray(pixels), path]
-            result = predict(model, processor, None, _D1_QUESTIONS, images=images)
+            result = model.predict(processor, None, _D1_QUESTIONS, images=images)
             trunk, branches, vision = model.decision_inputs(
                 processor, None, questions, images
             )
@@ -2533,7 +2546,7 @@ class TestD1DecisionModel(unittest.TestCase):
     def test_lfm2_vl_checkpoint_with_d1_auto_map_loads_as_d1(self):
         from dataclasses import asdict
 
-        from mlx_vlm import load, predict
+        from mlx_vlm import load
         from mlx_vlm.models import d1, lfm2_vl
 
         auto_map = {"AutoModel": "modeling_d1.D1Model"}
@@ -2548,7 +2561,7 @@ class TestD1DecisionModel(unittest.TestCase):
             )
         model, tok = _extraction_model("d1"), _d1_tokenizer()
         questions = {"route": _D1_QUESTIONS["route"]}
-        expected = predict(model, tok, "A B", questions)
+        expected = model.predict(tok, "A B", questions)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = {**asdict(model.config), "model_type": "lfm2_vl"}
@@ -2565,7 +2578,7 @@ class TestD1DecisionModel(unittest.TestCase):
                 weights[key] = value
             mx.save_safetensors(str(root / "model.safetensors"), weights)
             loaded, processor = load(directory)
-            actual = predict(loaded, processor, "A B", questions)
+            actual = loaded.predict(processor, "A B", questions)
         self.assertIsInstance(loaded, d1.Model)
         self.assertEqual(loaded.config.model_type, "lfm2_vl")
         self.assertEqual(actual["answers"], expected["answers"])
@@ -2811,7 +2824,6 @@ class TestD1OmniDecisionModel(unittest.TestCase):
     def test_image_decisions_batching_and_usage(self):
         from PIL import Image
 
-        from mlx_vlm import predict
         from mlx_vlm.models.d1_omni.prompt import as_question, encode
 
         model, tok = _random_d1_omni(), _CharTokenizer()
@@ -2848,10 +2860,10 @@ class TestD1OmniDecisionModel(unittest.TestCase):
             _flat(uncalibrated[1:]), _flat(batched[2:3]), atol=1e-5
         )
 
-        result = predict(model, tok, None, {"a": q1, "b": q2, "c": q3}, images=[image])
+        result = model.predict(tok, None, {"a": q1, "b": q2, "c": q3}, images=[image])
         answers = result["answers"]
-        alone = predict(
-            model, tok, None, {"a": q1, "b": q2}, images=[image], token_budget=1
+        alone = model.predict(
+            tok, None, {"a": q1, "b": q2}, images=[image], token_budget=1
         )["answers"]
         self.assertAlmostEqual(
             alone["a"]["probability"], answers["a"]["probability"], places=3
@@ -2862,9 +2874,7 @@ class TestD1OmniDecisionModel(unittest.TestCase):
         [(same, _)] = model.probabilities(tok, [(None, [q1, q2, q3], [image])])
         self.assertEqual(answers["a"]["probability"], round(same[0][1], 4))
         self.assertEqual(set(answers["b"]["probabilities"]), {"a", "b", "c"})
-        self.assertEqual(
-            answers["c"]["metadata"]["legend"], {"0": "low", "1": "mid", "2": "high"}
-        )
+        self.assertEqual(set(answers["c"]["probabilities"]), {"0", "1", "2"})
 
     def test_media_prefix_reads_only_media(self):
         # Prefix queries never see text keys and the centred convolution never lets
@@ -2901,14 +2911,12 @@ class TestD1OmniDecisionModel(unittest.TestCase):
     def test_exif_orientation_applies_to_files_only(self):
         from PIL import Image, ImageOps
 
-        from mlx_vlm import predict
-
         model, tok = _random_d1_omni(), _CharTokenizer()
         pixels = np.random.default_rng(0).integers(0, 256, (48, 96, 3), np.uint8)
         questions = {"q": {"type": "bool", "instructions": "Upright?"}}
 
         def answer(image):
-            return predict(model, tok, None, questions, images=[image])["answers"]
+            return model.predict(tok, None, questions, images=[image])["answers"]
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "photo.jpg"
@@ -2946,7 +2954,6 @@ class TestD1OmniDecisionModel(unittest.TestCase):
 
         from PIL import Image
 
-        from mlx_vlm import predict
         from mlx_vlm.models.d1_omni.prompt import as_question, encode
 
         model, tok = _random_d1_omni(), _CharTokenizer()
@@ -2983,7 +2990,7 @@ class TestD1OmniDecisionModel(unittest.TestCase):
         np.testing.assert_allclose(_flat(uncalibrated), _flat(batched[1:3]), atol=1e-5)
 
         questions = {"a": q1, "b": q2, "c": q3}
-        result = predict(model, tok, None, questions, audio=clip)
+        result = model.predict(tok, None, questions, audio=clip)
         answers = result["answers"]
         self.assertEqual(
             [a["type"] for a in answers.values()], ["bool", "choice", "score"]
@@ -3001,10 +3008,10 @@ class TestD1OmniDecisionModel(unittest.TestCase):
             for audio in (floats, mx.array(clip), str(path), path):
                 with self.subTest(audio=type(audio)):
                     self.assertEqual(
-                        predict(model, tok, None, questions, audio=audio), result
+                        model.predict(tok, None, questions, audio=audio), result
                     )
             with open(path, "rb") as f:
-                self.assertEqual(predict(model, tok, None, questions, audio=f), result)
+                self.assertEqual(model.predict(tok, None, questions, audio=f), result)
             # Files that fail to decode, or decode to nothing, are caller errors.
             empty, garbage = path.with_name("empty.wav"), path.with_name("bad.wav")
             with wave.open(str(empty), "wb") as f:
@@ -3018,8 +3025,240 @@ class TestD1OmniDecisionModel(unittest.TestCase):
             ):
                 with self.subTest(audio=audio):
                     with self.assertRaisesRegex(ValueError, message):
-                        predict(model, tok, None, questions, audio=audio)
+                        model.predict(tok, None, questions, audio=audio)
         with self.assertRaisesRegex(ValueError, "images or audio, not both"):
-            predict(model, tok, None, questions, images=[image], audio=clip)
+            model.predict(tok, None, questions, images=[image], audio=clip)
         with self.assertRaisesRegex(ValueError, "mono"):
-            predict(model, tok, None, questions, audio=np.zeros((2, 8000), np.int16))
+            model.predict(tok, None, questions, audio=np.zeros((2, 8000), np.int16))
+
+
+def _public_decision_request(body):
+    """Express the existing native model fixtures in the public API contract."""
+    questions = []
+    for name, original in body["questions"].items():
+        kind = original["type"]
+        q = {
+            "name": name,
+            "type": "predicate" if kind in ("bool", "noul") else kind,
+            "instructions": original.get("instructions", ""),
+        }
+        criteria = original.get("criteria", [])
+        if kind == "choice":
+            q["choices"] = [
+                {
+                    "value": label,
+                    "description": (
+                        (criteria[label] or "") if isinstance(criteria, dict) else ""
+                    ),
+                }
+                for label in criteria
+            ]
+        elif kind == "score":
+            q["levels"] = [{"label": label} for label in criteria]
+        questions.append(q)
+    state = body["state"]
+    return {
+        **{k: v for k, v in body.items() if k not in ("state", "questions")},
+        "input": (
+            state if isinstance(state, str) or state is None else json.dumps(state)
+        ),
+        "questions": questions,
+    }
+
+
+def _decision_fixture(case, config_overrides=None):
+    settings = case["decision_models"]
+    model = _extraction_model(case["id"], config_overrides)
+    mx.eval(model.parameters())
+    processor = _decision_tokenizer(
+        settings.get("tokens", ()), **settings.get("special_tokens", {})
+    )
+    body = {
+        "model": case["id"],
+        "state": settings["state"],
+        "questions": settings["questions"],
+    }
+    return model, processor, body
+
+
+def _assert_decision_answers(actual, expected):
+    if isinstance(expected, dict):
+        assert actual.keys() == expected.keys()
+        for key in expected:
+            _assert_decision_answers(actual[key], expected[key])
+    elif isinstance(expected, list):
+        assert len(actual) == len(expected)
+        for a, b in zip(actual, expected):
+            _assert_decision_answers(a, b)
+    elif isinstance(expected, float):
+        assert actual == pytest.approx(expected, abs=3e-4, rel=3e-4)
+    else:
+        assert actual == expected
+
+
+@pytest.mark.parametrize(
+    "case",
+    [case for case in EXTRACTION_DATA["cases"] if "decision_models" in case["checks"]],
+    ids=lambda case: case["id"],
+)
+def test_decision_scheduler_preserves_prediction(case):
+    from mlx_vlm import predict
+    from mlx_vlm.decision_protocol import format_response, native_request
+    from mlx_vlm.decision_scheduler import DecisionScheduler
+
+    model, processor, body = _decision_fixture(case)
+    request = _public_decision_request(body)
+    expected = predict(model, processor, request["input"], request["questions"])
+    scheduler = DecisionScheduler(lambda name: (model, processor, model.config))
+    try:
+        jobs = [scheduler.submit(native_request(request)) for _ in range(2)]
+        for job in jobs:
+            output = job.future.result(timeout=10)
+            actual = format_response(request, output)
+            _assert_decision_answers(actual["answers"], expected["answers"])
+            assert actual["usage"]["input_tokens"] == expected["usage"]["input_tokens"]
+    finally:
+        scheduler.stop_and_join()
+    assert not scheduler.worker.is_alive()
+    assert scheduler.engine is None
+
+
+@pytest.mark.parametrize(
+    "case",
+    [case for case in EXTRACTION_DATA["cases"] if "decision_checkpoint" in case],
+    ids=lambda case: case["id"],
+)
+@pytest.mark.parametrize("indexed", [False, True])
+def test_decision_auxiliary_checkpoint(case, indexed, tmp_path):
+    from dataclasses import asdict
+
+    from mlx_vlm import predict
+    from mlx_vlm.utils import load_model
+
+    model, processor, body = _decision_fixture(case)
+    spec = case["decision_checkpoint"]
+    config = asdict(model.config)
+    head_config = config.pop(spec["config_key"])
+    config["model_type"] = spec["backbone_type"]
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    (tmp_path / spec["config_file"]).write_text(json.dumps(head_config))
+    weights = dict(tree_flatten(model.parameters()))
+    backbone = {k: v for k, v in weights.items() if not k.startswith(spec["prefix"])}
+    head = {
+        k.removeprefix(spec["prefix"]): v
+        for k, v in weights.items()
+        if k.startswith(spec["prefix"])
+    }
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), backbone)
+    mx.save_safetensors(str(tmp_path / spec["weights_file"]), head)
+    if indexed:
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": dict.fromkeys(backbone, "model.safetensors")})
+        )
+    loaded = load_model(tmp_path)
+    request = _public_decision_request(body)
+    expected = predict(model, processor, request["input"], request["questions"])
+    actual = predict(loaded, processor, request["input"], request["questions"])
+    _assert_decision_answers(actual, expected)
+    (tmp_path / spec["weights_file"]).unlink()
+    with pytest.raises(FileNotFoundError, match="Missing decision head"):
+        load_model(tmp_path)
+
+
+DECISION_QUANTIZATION_CASES = [
+    (case, variant)
+    for case in EXTRACTION_DATA["cases"]
+    for variant in case.get("decision_quantization", {}).get("variants", [])
+]
+
+
+@pytest.mark.parametrize(
+    "recipe",
+    [None, "mixed_4_8", lambda path, module: True],
+    ids=["default", "mixed", "custom"],
+)
+@pytest.mark.parametrize(
+    "case,variant",
+    DECISION_QUANTIZATION_CASES,
+    ids=[
+        case["id"] + "-" + variant["id"]
+        for case, variant in DECISION_QUANTIZATION_CASES
+    ],
+)
+def test_decision_quantization_roundtrip(case, variant, recipe, monkeypatch, tmp_path):
+    from dataclasses import asdict
+    from operator import attrgetter
+    from types import SimpleNamespace
+
+    from mlx_vlm import predict
+    from mlx_vlm.utils import load_model
+
+    conversion = importlib.import_module("mlx_vlm.convert")
+    spec = case["decision_quantization"]
+    model, processor, body = _decision_fixture(
+        case,
+        _merge_decision_config(
+            spec["config_overrides"], variant.get("config_overrides", {})
+        ),
+    )
+    protected = {
+        name: np.array(value)
+        for name, value in tree_flatten(model.parameters())
+        if any(
+            name == path or name.startswith(path + ".")
+            for path in variant["protected_paths"]
+        )
+    }
+    assert protected
+    source, destination = tmp_path / "source", tmp_path / "converted"
+    source.mkdir()
+    monkeypatch.setattr(conversion, "get_model_path", lambda *a, **k: source)
+    monkeypatch.setattr(
+        conversion,
+        "fetch_from_hub",
+        lambda *a, **k: (
+            model,
+            {k: v for k, v in asdict(model.config).items() if v is not None},
+            SimpleNamespace(save_pretrained=lambda p: None),
+        ),
+    )
+    monkeypatch.setattr(conversion, "create_model_card", lambda *a, **k: None)
+    conversion.convert(
+        str(source),
+        str(destination),
+        quantize=True,
+        q_group_size=spec["group_size"],
+        q_bits=spec["bits"],
+        quant_predicate=recipe,
+        **variant["convert_options"],
+    )
+    loaded = load_model(destination)
+    weights = dict(tree_flatten(loaded.parameters()))
+    for name, expected in protected.items():
+        np.testing.assert_array_equal(np.array(weights[name]), expected)
+    modules = dict(loaded.named_modules())
+    for path in spec["quantized_paths"]:
+        assert isinstance(modules[path], (nn.QuantizedLinear, nn.QuantizedEmbedding))
+    for name, expected in variant["convert_options"].items():
+        assert getattr(loaded.config, name) == expected
+    layer = modules[variant["row_layer"]]
+    assert hasattr(layer, "scales") == variant["quantized_rows"]
+    ids = mx.array([1, 5, 5, 10])
+    expected = (
+        mx.dequantize(
+            layer.weight,
+            layer.scales,
+            layer.biases,
+            group_size=layer.group_size,
+            bits=layer.bits,
+            mode=layer.mode,
+        )
+        if hasattr(layer, "scales")
+        else layer.weight
+    )
+    np.testing.assert_allclose(
+        np.array(attrgetter(spec["row_reader"])(loaded)(ids)), np.array(expected[ids])
+    )
+    request = _public_decision_request(body)
+    result = predict(loaded, processor, request["input"], request["questions"])
+    assert [answer["name"] for answer in result["answers"]] == list(body["questions"])
