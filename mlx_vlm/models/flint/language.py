@@ -1,16 +1,16 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import (
-    LanguageModelOutput,
-    create_attention_mask,
-    scaled_dot_product_attention,
-)
+from ..base import LanguageModelOutput, scaled_dot_product_attention
 from ..cache import KVCache, RotatingKVCache
 from ..mlp import SwiGLUMLP
 from ..rope_utils import initialize_rope
-from ..switch_layers import SwitchGLU, stack_expert_projection
+from ..switch_layers import SwiGLU, SwitchGLU, stack_expert_projection
+from .attention_mask import create_attention_mask
+from .compilation import CompiledStage, linear_signature
 from .config import ModelConfig
+from .kernels import down_reduce, gate_up_silu, metal_sum, route_experts
+from .normalization import norm_rope, residual_norm
 
 
 class Attention(nn.Module):
@@ -52,21 +52,23 @@ class Attention(nn.Module):
 
     def __call__(self, x, mask=None, cache=None):
         batch, length, _ = x.shape
-        q = self.q_norm(
-            self.q_proj(x).reshape(batch, length, self.n_heads, self.head_dim)
-        ).transpose(0, 2, 1, 3)
-        k = self.k_norm(
-            self.k_proj(x).reshape(batch, length, self.n_kv_heads, self.head_dim)
-        ).transpose(0, 2, 1, 3)
-        v = (
-            self.v_proj(x)
-            .reshape(batch, length, self.n_kv_heads, self.head_dim)
-            .transpose(0, 2, 1, 3)
+        q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        offset = cache.offset if cache is not None else 0
+        normalized = norm_rope(self, q, k, offset)
+        if normalized is None:
+            q = self.q_norm(
+                q.reshape(batch, length, self.n_heads, self.head_dim)
+            ).transpose(0, 2, 1, 3)
+            k = self.k_norm(
+                k.reshape(batch, length, self.n_kv_heads, self.head_dim)
+            ).transpose(0, 2, 1, 3)
+            if self.rope is not None:
+                q, k = self.rope(q, offset=offset), self.rope(k, offset=offset)
+        else:
+            q, k = normalized
+        v = v.reshape(batch, length, self.n_kv_heads, self.head_dim).transpose(
+            0, 2, 1, 3
         )
-        if self.rope is not None:
-            offset = cache.offset if cache is not None else 0
-            q = self.rope(q, offset=offset)
-            k = self.rope(k, offset=offset)
         if cache is not None:
             k, v = cache.update_and_fetch(k, v)
         out = scaled_dot_product_attention(
@@ -95,6 +97,11 @@ class SparseMoeBlock(nn.Module):
             if args.shared_expert_intermediate_size > 0
             else None
         )
+        # Keep weights as inputs and reuse the graph across batch/prompt sizes.
+        # Index selection and expert dispatch stay outside this shape-independent
+        # graph; both can choose different algorithms as the workload changes.
+        self._compiled = mx.compile(self._prepare, inputs=self, shapeless=True)
+        self._compiled_inference = CompiledStage(self._inference, self)
 
     def route(self, x):
         # The reference computes the projection in the activation dtype, then
@@ -108,7 +115,7 @@ class SparseMoeBlock(nn.Module):
         weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
         return indices, weights
 
-    def __call__(self, x):
+    def _forward(self, x):
         indices, weights = self.route(x)
         routed = self.switch_mlp(x, indices)
         out = (
@@ -119,6 +126,54 @@ class SparseMoeBlock(nn.Module):
         if self.shared_expert is not None:
             out = out + self.shared_expert(x)
         return out
+
+    def _prepare(self, x):
+        scores = mx.sigmoid(self.gate(x).astype(mx.float32))
+        choice = scores + self.expert_bias.astype(mx.float32)
+        shared = (
+            self.shared_expert(x)
+            if self.shared_expert is not None
+            else mx.zeros_like(x)
+        )
+        return scores, choice, shared
+
+    def _inference(self, x):
+        scores, choice, shared = self._compiled(x)
+        indices, weights = route_experts(scores, choice, self.top_k)
+        switch = self.switch_mlp
+        activated = gate_up_silu(switch, x, indices)
+        if activated is not None:
+            output = down_reduce(switch.down_proj, activated, indices, weights, shared)
+            if output is not None:
+                return output
+            routed = switch.down_proj(activated[..., None, :], indices).squeeze(-2)
+        else:
+            routed = switch(x, indices)
+        return metal_sum(
+            routed, weights, shared if self.shared_expert is not None else None
+        )
+
+    def __call__(self, x):
+        # Paged experts perform data-dependent I/O and cannot be traced.
+        if self.training or type(self.switch_mlp) is not SwitchGLU:
+            return self._forward(x)
+        switch = self.switch_mlp
+        shared = self.shared_expert
+        if type(switch.activation) is not SwiGLU or (
+            shared is not None and type(shared) is not SwiGLUMLP
+        ):
+            return self._forward(x)
+        projections = [self.gate, switch.gate_proj, switch.up_proj, switch.down_proj]
+        if shared is not None:
+            projections += [shared.gate_proj, shared.up_proj, shared.down_proj]
+        signature = tuple(linear_signature(p) for p in projections)
+        if any(p is None for p in signature):
+            return self._forward(x)
+        if mx.default_device() == mx.gpu:
+            return self._compiled_inference(
+                x, signature=(self.top_k, switch.training, signature)
+            )
+        return self._inference(x)
 
 
 class DecoderLayer(nn.Module):
@@ -136,8 +191,12 @@ class DecoderLayer(nn.Module):
         )
 
     def __call__(self, x, mask=None, cache=None):
-        x = x + self.self_attn(self.input_layernorm(x), mask, cache)
-        return x + self.mlp(self.post_attention_layernorm(x))
+        x, normalized = residual_norm(
+            x,
+            self.self_attn(self.input_layernorm(x), mask, cache),
+            self.post_attention_layernorm,
+        )
+        return x + self.mlp(normalized)
 
 
 class FlintModel(nn.Module):
@@ -150,8 +209,43 @@ class FlintModel(nn.Module):
     def __call__(self, inputs, cache=None, inputs_embeds=None):
         x = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
         cache = [None] * len(self.layers) if cache is None else cache
+        mask_parameters = {}
+        # Carry the normalization into the next layer so its residual addition
+        # and RMS reduction share a kernel. Training and custom layers retain
+        # their normal module calls.
+        if (
+            not self.training
+            and self.layers
+            and len(cache) == len(self.layers)
+            and all(type(layer) is DecoderLayer for layer in self.layers)
+        ):
+            normalized = self.layers[0].input_layernorm(x)
+            for i, (layer, c) in enumerate(zip(self.layers, cache)):
+                mask = create_attention_mask(
+                    x,
+                    c,
+                    window_size=layer.self_attn.window_size,
+                    parameter_cache=mask_parameters,
+                )
+                x, normalized = residual_norm(
+                    x,
+                    layer.self_attn(normalized, mask, c),
+                    layer.post_attention_layernorm,
+                )
+                next_norm = (
+                    self.layers[i + 1].input_layernorm
+                    if i + 1 < len(self.layers)
+                    else self.norm
+                )
+                x, normalized = residual_norm(x, layer.mlp(normalized), next_norm)
+            return normalized
         for layer, c in zip(self.layers, cache):
-            mask = create_attention_mask(x, c, window_size=layer.self_attn.window_size)
+            mask = create_attention_mask(
+                x,
+                c,
+                window_size=layer.self_attn.window_size,
+                parameter_cache=mask_parameters,
+            )
             x = layer(x, mask, c)
         return self.norm(x)
 
