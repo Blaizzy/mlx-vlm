@@ -121,7 +121,6 @@ class TestMiniMaxM31Flash(unittest.TestCase):
                 "num_experts_per_tok": 1,
                 "moe_layer_freq": [0, 1],
                 "pack_shared_expert": False,
-                "use_fp32_activations": False,
                 "sparse_attention_config": {
                     "use_sparse_attention": True,
                     "sparse_attention_freq": [1, 1],
@@ -232,107 +231,6 @@ class TestMiniMaxM31Flash(unittest.TestCase):
             np.testing.assert_allclose(
                 np.array(reloaded(tokens).logits), np.array(actual), atol=2e-4
             )
-
-
-class TestMiniMaxActivationPrecision(unittest.TestCase):
-    def test_output_precision_cache_respects_weight_updates_and_training(self):
-        from mlx_vlm.models.minimax_m3_vl.precision import CachedFP32Linear
-
-        mx.random.seed(31)
-        layer = CachedFP32Linear(64, 128, bias=True)
-        layer.set_dtype(mx.bfloat16)
-        layer.eval()
-        x = mx.random.normal((2, 3, 64))
-        for factor in (1.0, 2.0):
-            layer.load_weights([("weight", layer.weight * factor)], strict=False)
-            expected = x @ layer.weight.astype(mx.float32).T + layer.bias
-            for _ in range(2):
-                np.testing.assert_array_equal(np.array(layer(x)), np.array(expected))
-            self.assertEqual(set(layer.parameters()), {"weight", "bias"})
-            self.assertEqual(layer.weight.dtype, mx.bfloat16)
-        layer.train()
-        reference = nn.Linear(64, 128, bias=True)
-        reference.load_weights(list(layer.parameters().items()))
-        loss = lambda module: module(x).sum()
-        actual = nn.value_and_grad(layer, loss)(layer)[1]
-        expected = nn.value_and_grad(reference, loss)(reference)[1]
-        for name in expected:
-            np.testing.assert_array_equal(
-                np.array(actual[name].astype(mx.float32)),
-                np.array(expected[name].astype(mx.float32)),
-            )
-
-    def test_precision_default_and_override(self):
-        from mlx_vlm.models.minimax_m3_vl.config import TextConfig
-
-        self.assertFalse(TextConfig().fp32_activations)
-        self.assertTrue(TextConfig(nvfp4_experts=True).fp32_activations)
-        self.assertFalse(
-            TextConfig(nvfp4_experts=True, use_fp32_activations=False).fp32_activations
-        )
-        self.assertTrue(TextConfig(use_fp32_activations=True).fp32_activations)
-
-    def test_bf16_weights_preserve_fp32_hidden_and_cached_attention(self):
-        from mlx_vlm.models.minimax_m3_vl.config import TextConfig
-        from mlx_vlm.models.minimax_m3_vl.language import LanguageModel
-
-        mx.random.seed(31)
-        model = LanguageModel(
-            TextConfig(
-                hidden_size=64,
-                dense_intermediate_size=128,
-                num_hidden_layers=2,
-                num_attention_heads=2,
-                num_key_value_heads=1,
-                head_dim=32,
-                rotary_dim=16,
-                vocab_size=128,
-                moe_layer_freq=[0, 0],
-                nvfp4_experts=True,
-                sparse_attention_config={
-                    "use_sparse_attention": True,
-                    "sparse_attention_freq": [1, 1],
-                    "sparse_index_dim": 32,
-                    "sparse_num_index_heads": 1,
-                    "sparse_block_size": 4,
-                    "sparse_topk_blocks": 2,
-                },
-            )
-        )
-        model.set_dtype(mx.bfloat16)
-        reference = copy.deepcopy(model)
-        reference.set_dtype(mx.float32)
-        reference.args.use_fp32_activations = False
-        for layer in reference.layers:
-            layer.use_fp32_activations = False
-
-        for batch in (1, 4):
-            with self.subTest(batch=batch):
-                tokens = mx.random.randint(0, 128, (batch, 23))
-                actual = model.model(tokens)
-                expected = reference.model(tokens)
-                self.assertEqual(actual.dtype, mx.float32)
-                np.testing.assert_allclose(
-                    np.array(actual), np.array(expected), rtol=2e-5, atol=2e-6
-                )
-                self.assertEqual(model(tokens).logits.dtype, mx.float32)
-                cache = model.make_cache()
-                chunks = []
-                for start, stop in ((0, 7), (7, 14), (14, 22), (22, 23)):
-                    chunks.append(model.model(tokens[:, start:stop], cache=cache))
-                    mx.eval(chunks[-1])
-                np.testing.assert_allclose(
-                    np.array(mx.concatenate(chunks, axis=1)),
-                    np.array(expected),
-                    rtol=3e-5,
-                    atol=3e-6,
-                )
-                for entry in cache:
-                    self.assertEqual(entry.kv_cache.keys.dtype, mx.float32)
-                    self.assertEqual(entry.kv_cache.values.dtype, mx.float32)
-                    self.assertEqual(entry.index_keys.dtype, mx.float32)
-                self.assertEqual(model.model.embed_tokens.weight.dtype, mx.bfloat16)
-                self.assertEqual(model.lm_head.weight.dtype, mx.bfloat16)
 
 
 class TestMiniMaxSparseAccuracy(unittest.TestCase):
@@ -482,7 +380,7 @@ class TestMiniMaxSparseAccuracy(unittest.TestCase):
 
         mx.random.seed(31)
         for batch, heads in ((1, 1), (1, 4), (4, 2), (4, 4)):
-            for dtype in (mx.float16, mx.bfloat16, mx.float32):
+            for dtype in (mx.float16, mx.bfloat16):
                 with self.subTest(batch=batch, index_heads=heads, dtype=dtype):
                     q = mx.random.normal((batch, 8, 3, 32)).astype(dtype)
                     k = mx.random.normal((batch, 4, 137, 32)).astype(dtype)
@@ -511,16 +409,11 @@ class TestMiniMaxSparseAccuracy(unittest.TestCase):
                     )
                     self.assertIsNotNone(actual)
                     expected = self.attention_reference(q, k, v, mask)
-                    rtol, atol = {
-                        mx.bfloat16: (0.008, 0.004),
-                        mx.float16: (0.002, 0.0005),
-                        mx.float32: (2e-5, 2e-6),
-                    }[dtype]
                     np.testing.assert_allclose(
                         np.array(actual.astype(mx.float32)),
                         expected,
-                        rtol=rtol,
-                        atol=atol,
+                        rtol=0.008 if dtype == mx.bfloat16 else 0.002,
+                        atol=0.004 if dtype == mx.bfloat16 else 0.0005,
                     )
 
     def test_sparse_gather_decode_per_group(self):

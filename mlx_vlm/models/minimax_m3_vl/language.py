@@ -17,7 +17,6 @@ from ..cache import BatchKVCache, KVCache, dynamic_roll
 from ..rope_utils import initialize_rope
 from ..switch_layers import QuantizedSwitchLinear, SwitchGLU, SwitchLinear
 from .config import ModelConfig, TextConfig
-from .precision import CachedFP32Linear
 
 
 def _is_bool_mask(mask: mx.array) -> bool:
@@ -316,7 +315,7 @@ def _minimax_m3_sparse_prefill_one_pass_kernel(
     kv_heads: int,
     index_heads: int,
 ):
-    dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16", mx.float32: "fp32"}[dtype]
+    dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
     return mx.fast.metal_kernel(
         name=(
             "minimax_m3_sparse_prefill_1p_"
@@ -361,7 +360,7 @@ def _minimax_m3_sparse_prefill_attention(
         or values.ndim != 4
         or block_indices.ndim != 4
         or q_positions.ndim != 2
-        or queries.dtype not in (mx.bfloat16, mx.float16, mx.float32)
+        or queries.dtype not in (mx.bfloat16, mx.float16)
         or keys.dtype != queries.dtype
         or values.dtype != queries.dtype
         or mx.default_device() != mx.gpu
@@ -1693,7 +1692,6 @@ class MiniMaxSparseMoeBlock(nn.Module):
 class MiniMaxDecoderLayer(nn.Module):
     def __init__(self, args: TextConfig, layer_idx: int):
         super().__init__()
-        self.use_fp32_activations = args.fp32_activations
         self.self_attn = MiniMaxAttention(args, layer_idx)
         self.input_layernorm = MiniMaxRMSNorm(
             args.hidden_size, eps=args.rms_norm_eps, gemma=args.use_gemma_norm
@@ -1721,10 +1719,6 @@ class MiniMaxDecoderLayer(nn.Module):
         cache: Optional[KVCache] = None,
         position_ids: Optional[mx.array] = None,
     ) -> mx.array:
-        if self.use_fp32_activations:
-            # NVFP4 GEMMs already accumulate in FP32. Keep their outputs and
-            # residual additions in FP32 to avoid perturbing later MoE routing.
-            x = x.astype(mx.float32)
         h = x + self.self_attn(
             self.input_layernorm(x), mask, cache, position_ids=position_ids
         )
@@ -1787,8 +1781,7 @@ class LanguageModel(nn.Module):
         self._position_ids = None
         self._rope_deltas = None
         if not args.tie_word_embeddings:
-            linear = CachedFP32Linear if args.fp32_activations else nn.Linear
-            self.lm_head = linear(args.hidden_size, args.vocab_size, bias=False)
+            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
     def get_rope_index(
         self,

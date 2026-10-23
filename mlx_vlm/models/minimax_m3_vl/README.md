@@ -14,26 +14,6 @@ preserves the packed weights and both NVFP4 scale levels; it keeps the shared
 experts separate because their quantization differs from the routed experts.
 Inference uses floating-point activations.
 
-M3.1 Flash keeps language-model activations, residuals, attention caches, and
-logits in FP32 by default. Its NVFP4 projections already accumulate in FP32;
-rounding their intermediates and residual additions to BF16 can change later
-expert selections. The sparse Metal attention kernel supports this FP32 path.
-Weights retain their packed MXFP8/NVFP4 representation and stored floating-point
-dtypes; existing converted checkpoints need no reconversion.
-During inference, the output projection retains a reusable FP32 weight cast
-(about 4.6 GiB for M3.1 Flash) to avoid casting the entire matrix on every token.
-This temporary inference cache is excluded from saved checkpoint parameters and
-is refreshed when the source weight changes; training uses the uncached path.
-
-FP32 activations increase compute cost and double unquantized K/V/index-cache
-storage from 135 KiB to 270 KiB per token across the 60 language layers. Set
-`text_config.use_fp32_activations` to `false` to restore the previous activation
-precision and cache footprint, at the cost of numerical accuracy. `true`
-explicitly enables FP32 activations; the default `null` enables them only for
-NVFP4 expert checkpoints. Existing MiniMax M3 configurations keep their original
-behavior. FP32 reduces rounding drift but does not guarantee identical expert
-choices across frameworks when router scores are nearly tied.
-
 Convert without `--quantize` to preserve the released precision:
 
 ```sh
