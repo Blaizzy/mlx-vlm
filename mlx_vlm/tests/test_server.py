@@ -2267,6 +2267,51 @@ def test_chat_completions_streaming_emits_timings_on_finish(client):
     )
 
 
+@pytest.mark.parametrize("continuous", [False, True])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("finish_reason", ["stop", "length"])
+def test_responses_include_generation_timings(
+    client, continuous, stream, finish_reason
+):
+    measurements = dict(
+        prompt_tps=20.0, generation_tps=5.0, peak_memory=1.25, cached_tokens=2
+    )
+    result = _result("Hello", finish_reason=finish_reason, **measurements)
+    tokens = [_token("Hello", finish_reason=finish_reason, **measurements)]
+    with _endpoint(
+        result=result,
+        chunks=[result],
+        generator=_streaming(tokens, prompt_tokens=8) if continuous else None,
+    ):
+        wire = _post(client, "responses", stream=stream)
+    assert wire.status_code == 200, wire.text
+    status = "incomplete" if finish_reason == "length" else "completed"
+    if stream:
+        terminal = next(e for e in _data(wire) if e["type"] == f"response.{status}")
+        response = terminal["response"]
+        assert terminal["timings"] == response["timings"]
+        if status == "completed":
+            parsed = server.ResponseCompletedEvent.model_validate(terminal)
+            assert parsed.timings.model_dump() == terminal["timings"]
+    else:
+        response = wire.json()
+    assert response["status"] == status
+    timings = response["timings"]
+    assert timings["prompt_per_second"] == 15.0
+    assert timings["predicted_per_second"] == 5.0
+    assert timings["peak_memory"] == 1.25
+    assert timings["prompt_n"] == 6
+    assert timings["cache_n"] == 2
+    assert response["usage"]["input_tokens"] == 8
+    assert response["usage"]["input_tokens_details"]["cached_tokens"] == 2
+    assert timings["predicted_n"] == response["usage"]["output_tokens"]
+    retrieved = client.get(f'/v1/responses/{response["id"]}')
+    assert retrieved.status_code == 200
+    assert retrieved.json()["timings"] == {
+        key: value for key, value in timings.items() if value is not None
+    }
+
+
 @pytest.mark.parametrize("api", ["chat", "messages"])
 def test_response_template_tool_calls(client, api):
     config = NS(model_type="muse_glimmer")
