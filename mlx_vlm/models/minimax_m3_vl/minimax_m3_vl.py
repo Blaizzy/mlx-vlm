@@ -437,6 +437,19 @@ class Model(nn.Module):
 
         args = self.language_model.args
         if args.nvfp4_experts:
+            # Floating router parameters follow the language model dtype.
+            embedding = sanitized_weights.get(
+                "language_model.model.embed_tokens.weight"
+            )
+            if embedding is not None and mx.issubdtype(embedding.dtype, mx.floating):
+                for key, value in sanitized_weights.items():
+                    if mx.issubdtype(value.dtype, mx.floating) and key.endswith(
+                        (
+                            ".block_sparse_moe.gate.weight",
+                            ".block_sparse_moe.e_score_correction_bias",
+                        )
+                    ):
+                        sanitized_weights[key] = value.astype(embedding.dtype)
             sanitize_nvfp4_experts(sanitized_weights, args)
         _sanitize_moe_weights(sanitized_weights, args)
         return sanitized_weights

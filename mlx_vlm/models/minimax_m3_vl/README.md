@@ -12,7 +12,9 @@ sparse attention in all 60 layers. Its released checkpoint mixes MXFP8
 attention, dense MLPs, and shared experts with NVFP4 routed experts. MLX-VLM
 preserves the packed weights and both NVFP4 scale levels; it keeps the shared
 experts separate because their quantization differs from the routed experts.
-Inference uses floating-point activations.
+Inference uses floating-point activations. Floating router weights and correction
+biases follow the token embedding dtype; router probabilities and NVFP4 global
+scales remain in FP32.
 
 Convert without `--quantize` to preserve the released precision:
 

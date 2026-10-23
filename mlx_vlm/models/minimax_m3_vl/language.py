@@ -1647,7 +1647,8 @@ class MiniMaxSparseMoeBlock(nn.Module):
         if self.sharding_group is not None:
             x = sum_gradients(self.sharding_group)(x)
 
-        gates = self.gate(x.astype(mx.float32))
+        # Round router projections in the model dtype before scoring in FP32.
+        gates = self.gate(x).astype(mx.float32)
         if self.e_score_correction_bias is not None:
             inds, scores = _minimax_moe_select(
                 gates,
@@ -2070,9 +2071,12 @@ class LanguageModel(nn.Module):
     def cast_predicate(self):
         def predicate(k):
             keep_fp32 = (
-                "e_score_correction_bias" in k
-                or k.endswith("block_sparse_moe.gate.weight")
-                or k.endswith(".weight_global_scale")
+                k.endswith(".weight_global_scale")
+                or not self.args.nvfp4_experts
+                and (
+                    "e_score_correction_bias" in k
+                    or k.endswith("block_sparse_moe.gate.weight")
+                )
             )
             return not keep_fp32
 

@@ -41,6 +41,82 @@ from mlx_vlm.utils import (
 
 
 class TestMiniMaxM31Flash(unittest.TestCase):
+    def test_router_dtype_sanitization_is_idempotent(self):
+        from mlx_vlm.models.minimax_m3_vl import Model, ModelConfig
+
+        config = ModelConfig.from_dict(
+            {
+                "text_config": {
+                    "hidden_size": 64,
+                    "intermediate_size": 64,
+                    "shared_intermediate_size": 64,
+                    "num_hidden_layers": 1,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 1,
+                    "head_dim": 32,
+                    "vocab_size": 128,
+                    "num_local_experts": 2,
+                    "num_experts_per_tok": 1,
+                    "moe_layer_freq": [1],
+                    "nvfp4_experts": True,
+                },
+                "vision_config": {
+                    "hidden_size": 32,
+                    "intermediate_size": 64,
+                    "num_attention_heads": 4,
+                    "num_hidden_layers": 0,
+                    "image_size": 8,
+                    "patch_size": 2,
+                },
+                "projector_hidden_size": 64,
+            }
+        )
+        model = Model(config)
+        prefix = "language_model.model.layers.0.block_sparse_moe"
+        gate_key = f"{prefix}.gate.weight"
+        bias_key = f"{prefix}.e_score_correction_bias"
+        scale_key = f"{prefix}.switch_mlp.gate_proj.weight_global_scale"
+        for dtype in (mx.bfloat16, mx.float16, mx.float32):
+            with self.subTest(dtype=dtype):
+                gate = mx.arange(128).reshape(2, 64) / 129.0
+                bias = mx.array([0.137, -0.271])
+                source = {
+                    "language_model.model.embed_tokens.weight": mx.zeros(
+                        (128, 64), dtype
+                    ),
+                    gate_key: gate,
+                    bias_key: bias,
+                    scale_key: mx.array([17.3, 15123.7]),
+                }
+                first = model.sanitize(dict(source))
+                second = model.sanitize(dict(first))
+                for key in source:
+                    expected = (
+                        source[key].astype(dtype)
+                        if key in (gate_key, bias_key)
+                        else source[key]
+                    )
+                    self.assertEqual(first[key].dtype, expected.dtype)
+                    np.testing.assert_array_equal(
+                        np.array(first[key].astype(mx.float32)),
+                        np.array(expected.astype(mx.float32)),
+                    )
+                    np.testing.assert_array_equal(
+                        np.array(second[key].astype(mx.float32)),
+                        np.array(first[key].astype(mx.float32)),
+                    )
+                self.assertTrue(model.cast_predicate(gate_key))
+                self.assertTrue(model.cast_predicate(bias_key))
+                self.assertFalse(model.cast_predicate(scale_key))
+
+                # A previously quantized router must retain its packed bits.
+                source[gate_key] = mx.full((2, 16), 0x12345678, dtype=mx.uint32)
+                sanitized = model.sanitize(dict(source))
+                self.assertEqual(sanitized[gate_key].dtype, mx.uint32)
+                np.testing.assert_array_equal(
+                    np.array(sanitized[gate_key]), np.array(source[gate_key])
+                )
+
     def test_nvfp4_global_scales_match_explicit_dequantization(self):
         from mlx_vlm.models.switch_layers import QuantizedSwitchLinear
         from mlx_vlm.quantization.nvfp4 import ScaledQuantizedSwitchLinear
@@ -467,6 +543,47 @@ class TestMiniMaxSparseAccuracy(unittest.TestCase):
                         rtol=2e-5,
                         atol=2e-6,
                     )
+
+    def test_router_projection_rounds_before_fp32_scoring(self):
+        from mlx_vlm.models.minimax_m3_vl.config import TextConfig
+        from mlx_vlm.models.minimax_m3_vl.language import MiniMaxSparseMoeBlock
+
+        mx.random.seed(31)
+        layer = MiniMaxSparseMoeBlock(
+            TextConfig(
+                hidden_size=32,
+                intermediate_size=32,
+                num_local_experts=4,
+                num_experts_per_tok=2,
+                n_shared_experts=0,
+                pack_shared_expert=False,
+            )
+        )
+        layer.gate.weight = mx.random.normal((4, 32)).astype(mx.bfloat16)
+        x = mx.random.normal((2, 3, 32)).astype(mx.bfloat16)
+        values = (mx.random.normal((4, 32)) * 100).astype(mx.bfloat16)
+        layer.switch_mlp = lambda x, inds: values[inds]
+        logits = (
+            np.array(x.astype(mx.float32)).astype(np.float64)
+            @ np.array(layer.gate.weight.astype(mx.float32)).astype(np.float64).T
+        )
+        rounded = np.array(
+            mx.array(logits.astype(np.float32)).astype(mx.bfloat16).astype(mx.float32)
+        ).astype(np.float64)
+        probabilities = 1 / (1 + np.exp(-rounded))
+        indices = np.argsort(-probabilities, axis=-1)[..., :2]
+        scores = np.take_along_axis(probabilities, indices, axis=-1)
+        scores = scores / scores.sum(-1, keepdims=True) * layer.routed_scaling_factor
+        expected = (
+            np.array(values.astype(mx.float32))[indices] * scores[..., None]
+        ).sum(-2)
+        expected = mx.array(expected.astype(np.float32)).astype(mx.bfloat16)
+        actual = layer(x)
+        self.assertEqual(actual.dtype, mx.bfloat16)
+        np.testing.assert_array_equal(
+            np.array(actual.astype(mx.float32)),
+            np.array(expected.astype(mx.float32)),
+        )
 
     def test_expert_weights_and_reduction_keep_fp32_precision(self):
         from mlx_vlm.models.minimax_m3_vl.config import TextConfig
