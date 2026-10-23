@@ -796,6 +796,125 @@ class TestMiniMaxSparseAccuracy(unittest.TestCase):
                     atol=2e-6,
                 )
 
+    @unittest.skipUnless(mx.metal.is_available(), "Requires Metal")
+    def test_fused_gemma_norm_matches_live_weights_and_strided_inputs(self):
+        from mlx_vlm.models.minimax_m3_vl.language import MiniMaxRMSNorm
+
+        mx.random.seed(41)
+        for dtype in (mx.bfloat16, mx.float16, mx.float32):
+            for dims in (7, 128, 6144):
+                norm = MiniMaxRMSNorm(dims)
+                norm.eval()
+                x = mx.random.normal((2, 3, dims * 2)).astype(dtype)[..., ::2]
+                norm.weight = (mx.random.normal((dims,)) * 0.003).astype(dtype)
+                for change in (False, True):
+                    with self.subTest(dtype=dtype, dims=dims, changed=change):
+                        if change:
+                            norm.weight[::2] = mx.array(0.25, dtype)
+                        expected = mx.fast.rms_norm(
+                            x, norm.weight.astype(mx.float32) + 1, norm.eps
+                        ).astype(dtype)
+                        self.assertTrue(mx.array_equal(norm(x), expected))
+
+    @unittest.skipUnless(mx.metal.is_available(), "Requires Metal")
+    def test_decode_block_kernels_handle_padding_tails_and_invalid_indices(self):
+        from mlx_vlm.models.minimax_m3_vl import language
+        from mlx_vlm.models.minimax_m3_vl.kernels import (
+            decode_block_mask,
+            decode_block_scores,
+        )
+
+        mx.random.seed(42)
+        for length in (129, 256, 513):
+            q = mx.random.normal((4, 4, 1, 128)).astype(mx.bfloat16)
+            k = mx.random.normal((4, 1, length + 19, 256)).astype(mx.bfloat16)
+            k = k[:, :, :length, ::2]
+            positions = mx.array([[-1], [63], [length - 1], [2**32]], mx.int64)
+            for init, local in ((0, 0), (1, 1)):
+                # Include NaNs in a non-local block and verify priority overrides.
+                k[2, 0, 3, 0] = mx.array(float("nan"), mx.bfloat16)
+                scores = decode_block_scores(
+                    q, k, positions, 128**-0.5, 128, init, local
+                )
+                indices = mx.argpartition(-scores, kth=1, axis=-1)[..., :2]
+                valid = indices <= positions[:, None, :, None] // 128
+                actual = language.MiniMaxM3Indexer._pack_block_indices(
+                    indices, valid, scores.shape[-1]
+                )
+                expected = language._select_sparse_block_indices_compiled(
+                    q, k, positions, 128**-0.5, 128, 2, init, local
+                )
+                self.assertTrue(mx.array_equal(actual, expected))
+
+            # Duplicate, negative, and large invalid selections must not enable keys.
+            selections = mx.array([0, 0, -1, 2**32], mx.int64)
+            selections = mx.broadcast_to(selections, (4, 4, 1, 4))
+            actual = decode_block_mask(selections, positions, length, 128, 8)
+            keys = np.arange(length)
+            selected = np.any(
+                keys[None, :] // 128 == np.array(selections)[0, 0, 0, :, None],
+                axis=0,
+            )
+            expected = selected[None, None, None, :] & (
+                keys[None, None, None, :] <= np.array(positions)[:, None, :, None]
+            )
+            np.testing.assert_array_equal(
+                np.array(actual), np.broadcast_to(expected, (4, 8, 1, length))
+            )
+
+    @unittest.skipUnless(mx.metal.is_available(), "Requires Metal")
+    def test_compiled_nvfp4_decode_uses_updated_weights_and_configuration(self):
+        from mlx_vlm.models.minimax_m3_vl.config import TextConfig
+        from mlx_vlm.models.minimax_m3_vl.language import MiniMaxSparseMoeBlock
+        from mlx_vlm.quantization.nvfp4 import ScaledQuantizedSwitchLinear
+
+        mx.random.seed(43)
+        layer = MiniMaxSparseMoeBlock(
+            TextConfig(
+                hidden_size=128,
+                intermediate_size=64,
+                shared_intermediate_size=64,
+                num_local_experts=4,
+                num_experts_per_tok=2,
+                nvfp4_experts=True,
+            )
+        )
+        layer.gate.weight = layer.gate.weight.astype(mx.bfloat16)
+        for name in ("up_proj", "gate_proj", "down_proj"):
+            projection = getattr(layer.switch_mlp, name)
+            setattr(
+                layer.switch_mlp,
+                name,
+                ScaledQuantizedSwitchLinear(
+                    projection, mx.full((4,), 2688.0), "weight_global_scale"
+                ),
+            )
+            shared = getattr(layer.shared_experts, name)
+            setattr(
+                layer.shared_experts,
+                name,
+                shared.to_quantized(group_size=32, bits=8, mode="mxfp8"),
+            )
+        layer.eval()
+        for batch in (1, 4):
+            x = mx.random.normal((batch, 1, 128)).astype(mx.bfloat16)
+            previous = layer(x)
+            mx.eval(previous)
+            for changed in (False, True):
+                if changed:
+                    layer.gate.weight *= 2
+                    layer.switch_mlp.down_proj.weight_global_scale[1] = 4000
+                    layer.shared_experts.down_proj.scales[0, 0] += 1
+                    layer.routed_scaling_factor = 1.7
+                    layer.scoring_func = "softmax"
+                self.assertIsNotNone(layer._decode_config())
+                actual = layer(x)
+                with patch.object(layer, "_decode_config", return_value=None):
+                    expected = layer(x)
+                self.assertTrue(mx.array_equal(actual, expected))
+                if changed:
+                    self.assertFalse(mx.array_equal(actual, previous))
+
 
 # Shared model contracts
 

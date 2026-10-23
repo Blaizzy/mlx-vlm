@@ -7,6 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
+from ...quantization.nvfp4 import ScaledQuantizedSwitchLinear
 from ..base import (
     LanguageModelOutput,
     cache_position_offset,
@@ -17,6 +18,7 @@ from ..cache import BatchKVCache, KVCache, dynamic_roll
 from ..rope_utils import initialize_rope
 from ..switch_layers import QuantizedSwitchLinear, SwitchGLU, SwitchLinear
 from .config import ModelConfig, TextConfig
+from .kernels import decode_block_mask, decode_block_scores, gemma_rms_norm
 
 
 def _is_bool_mask(mask: mx.array) -> bool:
@@ -515,6 +517,8 @@ class MiniMaxRMSNorm(nn.Module):
         # Gemma normalization applies (1 + weight) in FP32, then rounds once
         # to the activation dtype. Adding 1 in BF16 loses small learned offsets.
         if self.gemma:
+            if not self.training and x.size > 0 and mx.default_device() == mx.gpu:
+                return gemma_rms_norm(x, self.weight, self.eps)
             return _minimax_gemma_rms_norm(x, self.weight, self.eps)
         return mx.fast.rms_norm(x, self.weight, self.eps).astype(x.dtype)
 
@@ -1495,6 +1499,31 @@ class MiniMaxM3Indexer:
                     f"{H_idx} index heads, {attention.num_attention_heads} "
                     "attention heads."
                 )
+            if (
+                L == 1
+                and not attention.training
+                and mx.default_device() == mx.gpu
+                and idx_keys.shape[1] == 1
+                and _is_integer_mask(qpos)
+            ):
+                # Pool directly from the cached keys. The kernel's cache key
+                # depends on model dimensions, never the growing cache length.
+                scores = decode_block_scores(
+                    idx_queries,
+                    idx_keys,
+                    qpos,
+                    attention.scale,
+                    self.block_size,
+                    self.init_blocks,
+                    self.local_blocks,
+                )
+                indices = mx.stop_gradient(
+                    mx.argpartition(-scores, kth=self.topk_blocks - 1, axis=-1)[
+                        ..., : self.topk_blocks
+                    ]
+                )
+                valid = indices <= (qpos[:, None, :, None] // self.block_size)
+                return self._pack_block_indices(indices, valid, num_blocks, sort_blocks)
             return _select_sparse_block_indices_compiled(
                 idx_queries,
                 idx_keys,
@@ -1601,6 +1630,22 @@ class MiniMaxM3Indexer:
     ):
         del dtype
         B, H_idx, L, _ = block_indices.shape
+        if (
+            L == 1
+            and self.block_size % 32 == 0
+            and key_length > 0
+            and _is_integer_mask(q_positions)
+            and not self.attention.training
+            and mx.default_device() == mx.gpu
+        ):
+            sparse_mask = decode_block_mask(
+                block_indices,
+                q_positions,
+                key_length,
+                self.block_size,
+                self.attention.num_attention_heads,
+            )
+            return self.attention._merge_sparse_mask(sparse_mask, mask)
         num_blocks = (key_length + self.block_size - 1) // self.block_size
         # Invalid selections share a discarded sentinel slot, so they cannot
         # accidentally enable the last block through negative indexing.
@@ -1622,6 +1667,66 @@ class MiniMaxM3Indexer:
             sparse_mask, self.attention.num_attention_heads // H_idx, axis=1
         )
         return self.attention._merge_sparse_mask(sparse_mask, mask)
+
+
+def _minimax_quantized_linear(x, p, config):
+    group, bits, mode = config
+    y = mx.quantized_matmul(
+        x,
+        p["weight"],
+        p["scales"],
+        p.get("biases"),
+        transpose=True,
+        group_size=group,
+        bits=bits,
+        mode=mode,
+    )
+    return y + p["bias"] if "bias" in p else y
+
+
+def _minimax_nvfp4_projection(x, p, inds, scale_name):
+    scale = p[scale_name].astype(mx.float32)
+    factor = 2688.0 / scale if scale_name == "weight_global_scale" else 2688.0 * scale
+    factor = mx.broadcast_to(factor.reshape(-1), (p["weight"].shape[0],))
+    return mx.gather_qmm(
+        x,
+        p["weight"],
+        p["scales"],
+        rhs_indices=inds,
+        transpose=True,
+        group_size=16,
+        bits=4,
+        mode="nvfp4",
+        global_scale=factor,
+    )
+
+
+@mx.compile
+def _minimax_nvfp4_decode(
+    x, p, k, scoring, factor, activation, shared_activation, scales, configs
+):
+    # Pass all weights explicitly: compiled graphs must see later weight updates.
+    gates = (x @ p["gate"]["weight"].T).astype(mx.float32)
+    inds, scores = _minimax_moe_select(
+        gates, p["e_score_correction_bias"], k, 1.0, scoring
+    )
+    order = mx.stop_gradient(mx.argsort(inds, axis=-1))
+    inds = mx.stop_gradient(mx.take_along_axis(inds, order, axis=-1))
+    scores = mx.take_along_axis(scores, order, axis=-1)
+    xx = mx.expand_dims(x, (-2, -3))
+    bank = p["switch_mlp"]
+    up = _minimax_nvfp4_projection(xx, bank["up_proj"], inds, scales[0])
+    gate = _minimax_nvfp4_projection(xx, bank["gate_proj"], inds, scales[1])
+    y = _minimax_nvfp4_projection(
+        _swiglu_oai(up, gate, *activation), bank["down_proj"], inds, scales[2]
+    ).squeeze(-2)
+    y = _minimax_moe_combine(y, scores, factor)
+    shared = p["shared_experts"]
+    up = _minimax_quantized_linear(x, shared["up_proj"], configs[0])
+    gate = _minimax_quantized_linear(x, shared["gate_proj"], configs[1])
+    return y + _minimax_quantized_linear(
+        _swiglu_oai(up, gate, *shared_activation), shared["down_proj"], configs[2]
+    )
 
 
 class MiniMaxSparseMoeBlock(nn.Module):
@@ -1696,7 +1801,64 @@ class MiniMaxSparseMoeBlock(nn.Module):
         )
         self.sharding_group = None
 
+    def _decode_config(self):
+        if (
+            self.sharding_group is not None
+            or self.pack_shared_expert
+            or type(self.gate) is not nn.Linear
+            or "bias" in self.gate
+            or self.e_score_correction_bias is None
+            or type(self.switch_mlp) is not SwitchGLU
+            or type(self.shared_experts) is not MiniMaxMLP
+            or type(self.switch_mlp.activation) is not MiniMaxSwiGLUOAI
+            or type(self.shared_experts.act_fn) is not MiniMaxSwiGLUOAI
+        ):
+            return None
+        scale_names, shared_configs = [], []
+        for name in ("up_proj", "gate_proj", "down_proj"):
+            projection = getattr(self.switch_mlp, name)
+            shared = getattr(self.shared_experts, name)
+            if (
+                type(projection) is not ScaledQuantizedSwitchLinear
+                or projection.mode != "nvfp4"
+                or projection.group_size != 16
+                or projection.bits != 4
+                or "bias" in projection
+                or "pre_quant_scale" in projection
+                or projection.global_scale.size not in (1, projection.num_experts)
+                or type(shared) is not nn.QuantizedLinear
+                or "global_scale" in shared
+            ):
+                return None
+            scale_names.append(projection._scale_name)
+            shared_configs.append((shared.group_size, shared.bits, shared.mode))
+        return tuple(scale_names), tuple(shared_configs)
+
     def __call__(self, x: mx.array) -> mx.array:
+        if (
+            not self.training
+            and x.ndim == 3
+            and x.shape[1] == 1
+            and x.shape[0] * self.num_experts_per_tok < 64
+            and mx.default_device() == mx.gpu
+            and (decode_config := self._decode_config()) is not None
+        ):
+            activation = self.switch_mlp.activation
+            shared_activation = self.shared_experts.act_fn
+            return _minimax_nvfp4_decode(
+                x,
+                self,
+                self.num_experts_per_tok,
+                self.scoring_func,
+                self.routed_scaling_factor,
+                (activation.alpha, activation.limit, activation.beta),
+                (
+                    shared_activation.alpha,
+                    shared_activation.limit,
+                    shared_activation.beta,
+                ),
+                *decode_config,
+            )
         if self.sharding_group is not None:
             x = sum_gradients(self.sharding_group)(x)
 
