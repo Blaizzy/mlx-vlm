@@ -55,7 +55,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | EmbeddingGemma 2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/embedding_gemma2/README.md) |
 | Gemma 4 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/gemma4/README.md) |
 | Muse Spark Open | [Docs](mlx_vlm/models/muse_spark/README.md) |
-| MiniMax M3 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minimax_m3_vl/README.md) |
+| MiniMax M3 / M3.1 Flash | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minimax_m3_vl/README.md) |
 | Falcon-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/falcon_ocr/README.md) |
 | IndicOCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/indic_ocr/README.md) |
 | PP-DocLayoutV3 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/pp_doclayout_v3/README.md) |
@@ -1692,7 +1692,7 @@ The following models support video chat:
 2. Qwen2.5-VL
 3. Idefics3
 4. LLaVA
-5. MiniMax M3
+5. MiniMax M3 / M3.1 Flash
 6. LLaVA-OneVision
 7. Mage-VL
 8. Muse Spark Open

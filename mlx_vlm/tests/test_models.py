@@ -39,6 +39,200 @@ from mlx_vlm.utils import (
     load_model,
 )
 
+
+class TestMiniMaxM31Flash(unittest.TestCase):
+    def test_nvfp4_global_scales_match_explicit_dequantization(self):
+        from mlx_vlm.models.switch_layers import QuantizedSwitchLinear
+        from mlx_vlm.quantization.nvfp4 import ScaledQuantizedSwitchLinear
+
+        mx.random.seed(31)
+
+        layer = ScaledQuantizedSwitchLinear(
+            QuantizedSwitchLinear(
+                64, 32, 3, bias=False, group_size=16, bits=4, mode="nvfp4"
+            ),
+            mx.array([0.5, 17.3, 15123.7]),
+            "weight_global_scale",
+        )
+        layer.weight, layer.scales = mx.quantize(
+            mx.random.normal((3, 32, 64)) * 1000,
+            group_size=16,
+            bits=4,
+            mode="nvfp4",
+        )
+        # Decode the source E2M1 nibbles and E4M3 bytes independently of MLX.
+        packed = np.array(layer.weight).view(np.uint8)
+        codes = np.stack((packed & 15, packed >> 4), axis=-1).reshape(3, 32, 64)
+        fp4 = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6], dtype=np.float32)
+        values = fp4[codes & 7] * np.where(codes & 8, -1.0, 1.0)
+        scales = np.array(layer.scales)
+        exponent = (scales >> 3) & 15
+        mantissa = scales & 7
+        decoded_scales = np.where(
+            exponent == 0,
+            mantissa / 512.0,
+            (1 + mantissa / 8.0) * np.exp2(exponent.astype(np.int32) - 7),
+        ) * np.where(scales & 128, -1.0, 1.0)
+        weights = values * np.repeat(decoded_scales, 16, axis=-1)
+        weights /= np.array(layer.weight_global_scale)[:, None, None]
+
+        for sorted_indices in (False, True):
+            indices = mx.array([0, 1, 2] if sorted_indices else [2, 0, 1])
+            for dtype in (mx.float32, mx.float16, mx.bfloat16):
+                with self.subTest(sorted_indices=sorted_indices, dtype=dtype):
+                    x = mx.random.normal((3, 1, 64)).astype(dtype)
+                    actual = layer(x, indices, sorted_indices=sorted_indices)
+                    expected = np.array(x.astype(mx.float32)) @ weights[
+                        np.array(indices)
+                    ].transpose(0, 2, 1)
+                    np.testing.assert_allclose(
+                        np.array(actual.astype(mx.float32)),
+                        expected,
+                        rtol=0.02 if dtype == mx.bfloat16 else 0.002,
+                        atol=2.0 if dtype != mx.float32 else 0.02,
+                    )
+                    self.assertEqual(actual.dtype, dtype)
+
+    def test_mixed_checkpoint_load_forward_cache_and_roundtrip(self):
+        import copy
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.models.minimax_m3_vl import Model, ModelConfig
+        from mlx_vlm.quantization.nvfp4 import ScaledQuantizedSwitchLinear
+        from mlx_vlm.utils import load_model, save_weights
+
+        config = {
+            "model_type": "minimax_m3_vl",
+            "text_config": {
+                "hidden_size": 64,
+                "intermediate_size": 64,
+                "dense_intermediate_size": 128,
+                "shared_intermediate_size": 64,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "head_dim": 32,
+                "rotary_dim": 16,
+                "rope_theta": 10000000,
+                "vocab_size": 128,
+                "num_local_experts": 2,
+                "num_experts_per_tok": 1,
+                "moe_layer_freq": [0, 1],
+                "pack_shared_expert": False,
+                "sparse_attention_config": {
+                    "use_sparse_attention": True,
+                    "sparse_attention_freq": [1, 1],
+                    "sparse_index_dim": 32,
+                    "sparse_num_index_heads": 1,
+                    "sparse_block_size": 4,
+                    "sparse_topk_blocks": 2,
+                },
+            },
+            "vision_config": {
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "num_attention_heads": 4,
+                "num_hidden_layers": 0,
+                "image_size": 8,
+                "patch_size": 2,
+            },
+            "projector_hidden_size": 64,
+            "vocab_size": 128,
+        }
+        mx.random.seed(31)
+        reference = Model(ModelConfig.from_dict(copy.deepcopy(config)))
+        source = {}
+        reference_weights = {}
+        for key, value in tree_flatten(reference.parameters()):
+            if ".switch_mlp." in key:
+                prefix, projection = key.split(".switch_mlp.")
+                source_name = {
+                    "gate_proj.weight": "w1",
+                    "down_proj.weight": "w2",
+                    "up_proj.weight": "w3",
+                }[projection]
+                dequantized = []
+                for expert in range(2):
+                    global_scale = mx.array(0.7 if expert == 0 else 15123.7)
+                    packed, scales = mx.quantize(
+                        value[expert] * global_scale,
+                        group_size=16,
+                        bits=4,
+                        mode="nvfp4",
+                    )
+                    target = f"{prefix}.experts.{expert}.{source_name}"
+                    source[f"{target}.weight_packed"] = packed.view(mx.uint8)
+                    source[f"{target}.weight_scale"] = scales
+                    source[f"{target}.weight_global_scale"] = global_scale
+                    source[f"{target}.input_global_scale"] = mx.array(1.0)
+                    dequantized.append(
+                        mx.dequantize(
+                            packed, scales, group_size=16, bits=4, mode="nvfp4"
+                        )
+                        / global_scale
+                    )
+                reference_weights[key] = mx.stack(dequantized)
+            elif key.startswith("language_model.") and key.endswith("_proj.weight"):
+                packed, scales = mx.quantize(value, 32, 8, mode="mxfp8")
+                source[key] = packed.view(mx.uint8)
+                source[key.replace(".weight", ".weight_scale_inv")] = scales
+                reference_weights[key] = mx.dequantize(
+                    packed, scales, group_size=32, bits=8, mode="mxfp8"
+                )
+            else:
+                source[key] = value
+                reference_weights[key] = value
+        reference.load_weights(list(reference_weights.items()))
+        reference.eval()
+        config["quantization_config"] = {
+            "quant_method": "mxfp8",
+            "weight_block_size": [1, 32],
+            "group_size": 16,
+            "moe_quant_algo": "NVFP4",
+            "moe_quant_format": "nvfp4-pack-quantized",
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / "config.json").write_text(json.dumps(config))
+            mx.save_safetensors(str(path / "model.safetensors"), source)
+            model = load_model(path)
+            moe = model.layers[1].block_sparse_moe
+            self.assertIsInstance(moe.switch_mlp.gate_proj, ScaledQuantizedSwitchLinear)
+            self.assertIsInstance(moe.shared_experts.gate_proj, nn.QuantizedLinear)
+            self.assertEqual(moe.shared_experts.gate_proj.mode, "mxfp8")
+            self.assertFalse(moe.pack_shared_expert)
+            self.assertTrue(
+                all(layer.self_attn.has_sparse_index for layer in model.layers)
+            )
+            self.assertFalse(
+                model.cast_predicate(
+                    "language_model.model.layers.1.block_sparse_moe.switch_mlp.gate_proj.weight_global_scale"
+                )
+            )
+
+            tokens = mx.array([[1, 2, 3, 4, 5]])
+            expected = reference(tokens).logits
+            actual = model(tokens).logits
+            np.testing.assert_allclose(np.array(actual), np.array(expected), atol=2e-4)
+            cache = model.make_cache()
+            model(tokens[:, :-1], cache=cache)
+            decoded = model(tokens[:, -1:], cache=cache).logits
+            np.testing.assert_allclose(
+                np.array(decoded), np.array(actual[:, -1:]), atol=2e-4
+            )
+
+            converted = path / "converted"
+            save_weights(converted, model)
+            (converted / "config.json").write_text(json.dumps(config))
+            reloaded = load_model(converted)
+            np.testing.assert_allclose(
+                np.array(reloaded(tokens).logits), np.array(actual), atol=2e-4
+            )
+
+
 # Shared model contracts
 
 

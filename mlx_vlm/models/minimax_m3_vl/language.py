@@ -15,7 +15,7 @@ from ..base import (
 )
 from ..cache import BatchKVCache, KVCache, dynamic_roll
 from ..rope_utils import initialize_rope
-from ..switch_layers import SwitchGLU, SwitchLinear
+from ..switch_layers import QuantizedSwitchLinear, SwitchGLU, SwitchLinear
 from .config import ModelConfig, TextConfig
 
 
@@ -1758,7 +1758,7 @@ class MiniMaxSparseMoeBlock(nn.Module):
             )
             if getattr(args, "pack_shared_expert", None) is None
             else args.pack_shared_expert
-        )
+        ) and not args.nvfp4_experts
 
         self.gate = nn.Linear(args.hidden_size, args.num_local_experts, bias=False)
         activation = MiniMaxSwiGLUOAI(
@@ -1780,6 +1780,25 @@ class MiniMaxSparseMoeBlock(nn.Module):
                 args.num_local_experts,
                 activation=activation,
             )
+            if args.nvfp4_experts:
+                for name, input_dims, output_dims in (
+                    ("gate_proj", args.hidden_size, args.intermediate_size),
+                    ("up_proj", args.hidden_size, args.intermediate_size),
+                    ("down_proj", args.intermediate_size, args.hidden_size),
+                ):
+                    setattr(
+                        self.switch_mlp,
+                        name,
+                        QuantizedSwitchLinear(
+                            input_dims,
+                            output_dims,
+                            args.num_local_experts,
+                            bias=False,
+                            group_size=16,
+                            bits=4,
+                            mode="nvfp4",
+                        ),
+                    )
         self.shared_experts = (
             MiniMaxMLP(
                 args.hidden_size,
@@ -2221,8 +2240,10 @@ class LanguageModel(nn.Module):
     @property
     def cast_predicate(self):
         def predicate(k):
-            keep_fp32 = "e_score_correction_bias" in k or k.endswith(
-                "block_sparse_moe.gate.weight"
+            keep_fp32 = (
+                "e_score_correction_bias" in k
+                or k.endswith("block_sparse_moe.gate.weight")
+                or k.endswith(".weight_global_scale")
             )
             return not keep_fp32
 
