@@ -33,10 +33,22 @@ class NotebookVLM(TinyVLM):
 
 
 @pytest.mark.parametrize(
-    "notebook", ["sft_text_only", "sft_vison_text", "orpo", "dpo", "custom_loss"]
+    "notebook",
+    [
+        "sft_text_only",
+        "sft_vison_text",
+        "orpo",
+        "dpo",
+        "custom_loss",
+        "qat_sft_text_only",
+        "qat_sft_vision",
+    ],
 )
 @pytest.mark.parametrize("train_type", ["lora", "dora", "full"])
 def test_notebook_cells_train_evaluate_and_reload(notebook, train_type, tmp_path):
+    qat = notebook.startswith("qat_")
+    if qat and train_type != "full":
+        pytest.skip("QAT requires full training.")
     document = json.loads((NOTEBOOKS / f"{notebook}.ipynb").read_text())
     assert document["nbformat"] == 4
     processor = type("Processor", (), {"pad_token_id": 0})()
@@ -157,7 +169,7 @@ def test_notebook_cells_train_evaluate_and_reload(notebook, train_type, tmp_path
                     steps_per_save=2,
                     adapter_file=str(tmp_path / "weights.safetensors"),
                 )
-    if notebook in {"sft_text_only", "custom_loss"}:
+    if notebook in {"sft_text_only", "custom_loss", "qat_sft_text_only"}:
         train_rows = namespace["train_rows"]
         assert namespace["dropped_rows"] == len(invalid_text_conversations)
         assert train_rows.column_names == ["messages"]
@@ -169,7 +181,7 @@ def test_notebook_cells_train_evaluate_and_reload(notebook, train_type, tmp_path
         assert "pixel_values" not in prepared
         assert all(call.get("num_images", 0) == 0 for call in template_calls)
         assert namespace["metrics"]["total_vision_tokens"] == 0
-    if notebook == "sft_vison_text":
+    if notebook in {"sft_vison_text", "qat_sft_vision"}:
         train_rows = namespace["train_rows"]
         assert set(train_rows.column_names) == {"image", "messages"}
         assert isinstance(train_rows.features["image"], Image)
@@ -189,7 +201,7 @@ def test_notebook_cells_train_evaluate_and_reload(notebook, train_type, tmp_path
         assert prepared["completion_mask"].tolist() == [0, 0, 1, 1]
         assert "pixel_values" in prepared
     assert mx.isfinite(mx.array(namespace["metrics"]["train_loss"])).item()
-    if notebook not in {"sft_text_only", "custom_loss"}:
+    if notebook not in {"sft_text_only", "custom_loss", "qat_sft_text_only"}:
         expected = 4 if notebook in {"dpo", "orpo"} else 2
         assert namespace["metrics"]["total_vision_tokens"] == expected
         assert namespace["validation"]["val_num_vision_tokens"] > 0
@@ -197,12 +209,20 @@ def test_notebook_cells_train_evaluate_and_reload(notebook, train_type, tmp_path
     assert (tmp_path / "weights.safetensors").is_file()
     metadata = json.loads((tmp_path / "adapter_config.json").read_text())
     assert metadata["fine_tune_type"] == train_type
+    if qat:
+        from mlx_vlm.trainer.common.qat import QATLinear
+
+        assert any(
+            isinstance(layer, QATLinear)
+            for _, layer in namespace["model"].named_modules()
+        )
     original = namespace["model"]
     original.eval()
     restored, _ = load("unused")
     restored = prepare_model_for_training(
         restored,
         train_type=train_type,
+        qat=qat,
         checkpoint_path=tmp_path,
         verbose=False,
     )

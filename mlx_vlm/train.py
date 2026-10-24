@@ -75,6 +75,11 @@ def build_parser(task="vlm", algorithm=None):
         action="store_true",
         help="Also unfreeze the vision tower/projector.",
     )
+    parser.add_argument(
+        "--qat",
+        action="store_true",
+        help="Weight-only affine QAT for --train-type full (defaults to 4 bits).",
+    )
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--lora-alpha", type=float, default=16.0)
     parser.add_argument("--lora-dropout", type=float, default=0.0)
@@ -212,6 +217,7 @@ def _configure_model(model, args):
     model = prepare_model_for_training(
         model,
         train_type=args.train_type,
+        qat=getattr(args, "qat", False),
         lora_rank=getattr(args, "lora_rank", 8),
         lora_alpha=getattr(args, "lora_alpha", 16),
         lora_dropout=getattr(args, "lora_dropout", 0),

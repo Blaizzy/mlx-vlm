@@ -484,3 +484,22 @@ Custom callbacks can be defined in `--reward-functions-file rewards.py`, selecte
 with `--reward-functions first_reward,second_reward`, and weighted with
 `--reward-weights '[0.8, 0.2]'`. The CLI loads a separate base reference when
 `--beta` is positive; override it with `--reference-model` if needed.
+
+### Quantization-aware full training
+
+Use weight-only affine QAT through the same preparation and Trainer path:
+
+```python
+model = prepare_model_for_training(
+    model, train_type="full", qat=True, quantization_bits=4,
+    quantization_group_size=64,
+)
+```
+
+The equivalent CLI options are `--train-type full --qat --quantization-bits 4`.
+QAT simulates quantization on eligible standard Linear weights with straight-through
+gradients; embeddings and Linear layers whose input width is incompatible with
+the group size remain floating point. It supports 4/8 bits and groups of 32/64/128.
+Checkpoints contain floating-point master weights in the existing full checkpoint
+format. Resume with `qat=True` (or `--qat`); quantize the trained model separately
+for packed inference. This uses full-training memory rather than adapter memory.

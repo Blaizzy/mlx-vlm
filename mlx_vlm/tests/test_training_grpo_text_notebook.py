@@ -181,9 +181,12 @@ def test_text_grpo_notebook_trains_evaluates_saves_and_reloads(
                 )
 
     conversion.assert_not_called()
-    wandb_callback.assert_called_once()
-    wandb_callback.return_value.finish.assert_called_once_with()
-    assert wandb_callback.call_args.kwargs["project_name"] == "mlx-vlm-grpo-text"
+    if namespace["WANDB_PROJECT"]:
+        wandb_callback.assert_called_once()
+        wandb_callback.return_value.finish.assert_called_once_with()
+        assert wandb_callback.call_args.kwargs["project_name"] == "mlx-vlm-grpo-text"
+    else:
+        wandb_callback.assert_not_called()
     data_loading.assert_called_once_with("mlx-community/simple-grpo")
     assert namespace["MODEL_ID"] == "mlx-community/Qwen3.5-2B-4bit"
     assert namespace["train_rows"]["question"] == train["prompt"]
@@ -237,7 +240,11 @@ def test_text_grpo_notebook_trains_evaluates_saves_and_reloads(
     # A saved adapter reload reproduces the trained policy on the original base.
     restored, _ = load(namespace["MODEL_ID"])
     restored = prepare_model_for_training(
-        restored, train_type=train_type, checkpoint_path=output, verbose=False
+        restored,
+        train_type=train_type,
+        qat=namespace.get("QAT", False),
+        checkpoint_path=output,
+        verbose=False,
     )
     original = namespace["model"]
     original.eval()
@@ -299,3 +306,14 @@ def test_mapping_uses_published_instruction_without_answer_leakage():
     assert all(
         "CHAT_TEMPLATE" not in "".join(cell["source"]) for cell in notebook_cells()
     )
+
+
+def test_qat_grpo_notebook_trains_evaluates_and_reloads(tmp_path, monkeypatch):
+    monkeypatch.setitem(
+        globals(), "NOTEBOOK", NOTEBOOK.with_name("qat_grpo_text_only.ipynb")
+    )
+    test_text_grpo_notebook_trains_evaluates_saves_and_reloads(tmp_path, "full", 0.0)
+    config = json.loads((tmp_path / "adapters/run_config.json").read_text())
+    assert config["qat"] is True
+    assert config["quantization_bits"] == 4
+    assert config["quantization_group_size"] == 64
