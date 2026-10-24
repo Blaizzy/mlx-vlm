@@ -19,9 +19,7 @@ class VLMTrainingArgs(CoreTrainingArgs):
     mtp_loss_weight: float = field(
         default=0.0,
         kw_only=True,
-        metadata={
-            "help": "Auxiliary next-next-token loss weight (0 disables MTP)."
-        },
+        metadata={"help": "Auxiliary next-next-token loss weight (0 disables MTP)."},
     )
 
     def validate(self) -> None:

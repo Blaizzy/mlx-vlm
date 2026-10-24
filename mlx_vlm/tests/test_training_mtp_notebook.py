@@ -116,9 +116,7 @@ def test_mtp_notebook_trains_reloads_and_exports(tmp_path, train_type):
             if key not in after:
                 prefix, suffix = key.rsplit(".", 1)
                 adapted_key = f"{prefix}.linear.{suffix}"
-            np.testing.assert_array_equal(
-                np.array(value), np.array(after[adapted_key])
-            )
+            np.testing.assert_array_equal(np.array(value), np.array(after[adapted_key]))
     if train_type == "lora":
         assert any(
             key.endswith("lora_b") and mx.abs(value).sum().item() > 0
