@@ -1193,11 +1193,11 @@ class ResponseGenerator:
     ) -> Tuple[GenerationContext, "_TokenIterator"]:
         self.wait_until_ready()
         args = args or GenerationArguments(max_tokens=get_server_max_tokens())
-        if self.draft_model is not None and args.logits_processors is not None:
-            raise ValueError(
-                "Structured response_format is not supported with speculative decoding."
-            )
-        if self.draft_model is not None and args.thinking_budget is not None:
+        if (
+            self.draft_model is not None
+            and args.logits_processors is None
+            and args.thinking_budget is not None
+        ):
             raise ValueError(
                 "thinking_budget is not supported with speculative decoding in the server."
             )
@@ -1748,6 +1748,7 @@ class ResponseGenerator:
         # uid -> {rqueue, tokens, gen_kwargs}
         active: dict = {}
         max_num_seqs = get_max_num_seqs()
+        next_uid = 0
 
         while not (self._stop and not active and self.requests.empty()):
             new_items = []
@@ -1785,6 +1786,21 @@ class ResponseGenerator:
                     prompt_tokens = request.prompt_tokens
                     args = request.args
                     images = request.images
+                    # Speculation is batch-wide. Drain before switching modes;
+                    # constrained requests retain their normal AR processors.
+                    draft_model = (
+                        self.draft_model if args.logits_processors is None else None
+                    )
+                    if (
+                        batch_gen is not None
+                        and batch_gen.draft_model is not draft_model
+                    ):
+                        while batch_gen.has_work:
+                            self._apply_cancellations(batch_gen, active)
+                            if batch_gen.has_work:
+                                self._step(batch_gen, active)
+                        batch_gen.close()
+                        batch_gen = None
                     log_state = self._log_prefill_started(
                         request, backend="continuous_batching"
                     )
@@ -1806,12 +1822,16 @@ class ResponseGenerator:
                             top_logprobs_k=self.top_logprobs_k if args.logprobs else 0,
                             stream=generation_stream,
                             apc_manager=self.apc_manager,
-                            draft_model=self.draft_model,
-                            draft_kind=self.draft_kind,
+                            draft_model=draft_model,
+                            draft_kind=(
+                                self.draft_kind if draft_model is not None else None
+                            ),
                             draft_block_size=_get_draft_block_size_from_env(),
                             greedy_sampling=args.temperature == 0,
                             prefill_step_size=self._effective_prefill_step_size(),
                         )
+                        # Late iterator cancellation must not target a later batch.
+                        batch_gen.uid_count = next_uid
 
                     # Vision encoder runs on the GPU thread; text tokenization
                     # already happened on the caller thread.
@@ -1855,6 +1875,7 @@ class ResponseGenerator:
                             ],
                             thinking_budget_criteria=[thinking_budget_criteria],
                         )
+                        next_uid = batch_gen.uid_count
                     except Exception as e:
                         rqueue.put(e)
                         continue
@@ -1871,7 +1892,7 @@ class ResponseGenerator:
                         "cached_tokens": 0,
                         "spec_snapshot": (
                             speculative_stats_snapshot(self.draft_model)
-                            if self.draft_model is not None
+                            if draft_model is not None
                             else None
                         ),
                         **log_state,
