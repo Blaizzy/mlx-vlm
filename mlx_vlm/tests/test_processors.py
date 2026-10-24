@@ -2300,6 +2300,31 @@ class TestApplyChatTemplateIntegration:
         ]
         assert parts[2]["text"] == "before" and parts[4]["text"] == "after"
 
+    @pytest.mark.parametrize("family", ["qwen2_5_vl", "gemma4", "glm5_next"])
+    def test_side_channel_video_only_reaches_last_user_turn(self, family):
+        messages = [
+            dict(role="system", content="Answer directly."),
+            dict(role="user", content="Hi"),
+            dict(role="assistant", content="Hello!"),
+            dict(role="user", content="Describe this video."),
+        ]
+        result = apply_chat_template(
+            None,
+            dict(model_type=family),
+            messages,
+            video="clip.mp4",
+            return_messages=True,
+        )
+        video_turns = [
+            i
+            for i, message in enumerate(result)
+            if isinstance(message["content"], list)
+            and any(part.get("type") == "video" for part in message["content"])
+        ]
+        assert video_turns == [3]
+        rendered = get_chat_template(None, result, add_generation_prompt=True)
+        assert rendered.count("<video>") == 1
+
     def test_explicit_images_do_not_bypass_single_image_limit(self):
         message = dict(role="user", content=[dict(type="image"), dict(type="image")])
         with pytest.raises(ValueError, match="multi-image"):
