@@ -69,10 +69,13 @@ class Model(Qwen3VLModel):
         mask = kwargs.get("mask", None)
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
+        position_ids = kwargs.get("position_ids")
+        rope_deltas = kwargs.get("rope_deltas")
         if pixel_values is None:
-            position_ids, rope_deltas = self.language_model.get_rope_index(
-                input_ids, attention_mask=mask
-            )
+            if position_ids is None or rope_deltas is None:
+                position_ids, rope_deltas = self.language_model.get_rope_index(
+                    input_ids, attention_mask=mask
+                )
             return InputEmbeddingsFeatures(
                 inputs_embeds=self.language_model.model.embed_tokens(input_ids),
                 position_ids=position_ids,
@@ -107,9 +110,12 @@ class Model(Qwen3VLModel):
             self.config.video_token_index,
         )
 
-        position_ids, rope_deltas = self.language_model.get_rope_index(
-            input_ids, image_grid_thw, video_grid_thw, mask
-        )
+        # A restored prefix supplies full-prompt positions. Only the remaining
+        # image features are encoded here; suffix-local RoPE would lose history.
+        if position_ids is None or rope_deltas is None:
+            position_ids, rope_deltas = self.language_model.get_rope_index(
+                input_ids, image_grid_thw, video_grid_thw, mask
+            )
 
         return InputEmbeddingsFeatures(
             inputs_embeds=inputs_embeds,
