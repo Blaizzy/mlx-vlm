@@ -502,3 +502,22 @@ mlx.launch \
 ```
 
 We recommend you use the JACCL protocol over Thunderbolt. For more information, please refer to [the MLX distributed communication guide](https://ml-explore.github.io/mlx/build/html/usage/distributed.html).
+
+
+MiniMax-M3.1-Flash also supports distributed inference through this example. It
+partitions complete routed experts and the untied vocabulary projection across
+ranks, while attention, shared experts and vision remain replicated. The number
+of ranks must divide the routed-expert count. Native MXFP8/NVFP4 checkpoints can
+be loaded directly:
+
+```bash
+mlx.launch --hostfile /path/to/hosts.json --backend jaccl -- \
+    python examples/sharded_generate.py --backend jaccl \
+    --model MiniMaxAI/MiniMax-M3.1-Flash \
+    --prompt "Explain how expert parallel inference works." --max-tokens 128
+```
+
+Use `ring` in both backend arguments for TCP transport. Each rank reconstructs
+expert outputs before BF16 weighting and accumulation, then gathers vocabulary
+logits so all ranks receive the same result. This mode uses expert parallelism;
+MiniMax pipeline parallelism is not implemented.

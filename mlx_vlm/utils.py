@@ -512,6 +512,15 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                     quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
             elif quant_method == "mxfp4":
                 quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+            elif quant_method == "mxfp8":
+                # Preserve architecture metadata such as MiniMax's NVFP4 MoE
+                # layout while selecting MXFP8 for the remaining linear layers.
+                quantization = {
+                    **quantization_config,
+                    "group_size": 32,
+                    "bits": 8,
+                    "mode": "mxfp8",
+                }
             elif quant_method == "fp8":
                 from .fp8 import transform_fp8_weights
 

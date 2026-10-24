@@ -89,13 +89,43 @@ class ScaledQuantizedSwitchLinear(ScaledQuantizedLinear):
         return self.weight.shape[0]
 
     def __call__(self, x, indices, sorted_indices=False):
+        scale = self.global_scale
+        if (
+            mx.default_device() == mx.gpu
+            and scale.size in (1, self.num_experts)
+            and "pre_quant_scale" not in self
+        ):
+            # The GPU kernel accepts one tensor absmax per expert. Keep its
+            # scaling inside the projection before rounding to the input dtype.
+            scale = scale.astype(mx.float32)
+            factor = (
+                2688.0 / scale
+                if self._scale_name == "weight_global_scale"
+                else 2688.0 * scale
+            )
+            factor = mx.broadcast_to(factor.reshape(-1), (self.num_experts,))
+            output = mx.gather_qmm(
+                x,
+                self.weight,
+                self.scales,
+                rhs_indices=indices,
+                transpose=True,
+                group_size=self.group_size,
+                bits=self.bits,
+                mode=self.mode,
+                global_scale=factor,
+                sorted_indices=sorted_indices,
+            )
+            if "bias" in self:
+                output = output + self.bias[indices][..., None, :]
+            return output
         dtype = x.dtype
         x = x.astype(mx.float32)
         if "pre_quant_scale" in self:
-            scale = self.pre_quant_scale.astype(mx.float32)
-            if scale.ndim == 2:
-                scale = scale[indices][..., None, :]
-            x = x * scale
+            pre_scale = self.pre_quant_scale.astype(mx.float32)
+            if pre_scale.ndim == 2:
+                pre_scale = pre_scale[indices][..., None, :]
+            x = x * pre_scale
         output = mx.gather_qmm(
             x,
             self.weight,
@@ -107,7 +137,6 @@ class ScaledQuantizedSwitchLinear(ScaledQuantizedLinear):
             mode=self.mode,
             sorted_indices=sorted_indices,
         )
-        scale = self.global_scale
         if scale.size != 1:
             scale = scale.reshape(self.num_experts, -1)[indices][..., None, :]
         output = self.apply_scale(output, scale).astype(dtype)
