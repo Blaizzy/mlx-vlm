@@ -885,8 +885,16 @@ def _mtp_rounds_batch(
     eos_token_ids: Optional[set] = None,
     greedy_sampling: bool = False,
     row_ids: Optional[List[int]] = None,
+    want_logprobs: bool = False,
+    top_logprobs_k: int = 0,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     """Batched Gemma 4 MTP round loop (B >= 1).
+
+    When ``want_logprobs`` is set, each yield's meta dict gains
+    ``"token_logprobs"``: a per-row list parallel to the token list holding
+    ``(target_logprob, top_logprobs | None)`` for the emitted token — the
+    logprob under the *target* model's distribution at that position, read
+    off one extra hidden->logits projection over the verify block.
 
     Mirrors ``_dflash_rounds_batch``: per-row state tracked by original
     index, continuous-batching filter on row finish. Differences vs DFlash
@@ -1058,6 +1066,57 @@ def _mtp_rounds_batch(
                 sampler_rng.target_sampled(
                     sync_draft=not _sampler_supports_positioned_target(sampler)
                 )
+
+            # Optional per-token logprobs: emitted token index i was sampled
+            # from the target distribution at hidden_full[:, i] on both walk
+            # paths (greedy argmax or sampler over projected logits), so one
+            # hidden->logits projection over the emitted span covers the
+            # round. Only paid when a request asks for logprobs.
+            new_lps_list = None
+            if want_logprobs and hidden_full is not None and new_tokens_list:
+                n_new = max(len(nt) for nt in new_tokens_list)
+                if n_new:
+                    with mx.stream(generation_stream):
+                        round_logits = _mtp_logits_from_hidden(
+                            lm, hidden_full[:, :n_new, :]
+                        ).astype(mx.float32)
+                        round_lps = round_logits - mx.logsumexp(
+                            round_logits, axis=-1, keepdims=True
+                        )
+                        tok_idx = mx.array(
+                            [
+                                (list(nt) + [0] * n_new)[:n_new]
+                                for nt in new_tokens_list
+                            ],
+                            dtype=mx.int32,
+                        )
+                        sel_lps = mx.take_along_axis(
+                            round_lps, tok_idx[:, :, None], axis=-1
+                        )[:, :, 0]
+                        top_idx = top_lp = None
+                        if top_logprobs_k > 0:
+                            k = min(top_logprobs_k, round_lps.shape[-1])
+                            sort_idx = mx.argsort(round_lps, axis=-1)
+                            top_idx = sort_idx[..., -k:][..., ::-1].astype(mx.int32)
+                            top_lp = mx.take_along_axis(round_lps, top_idx, axis=-1)
+                            mx.eval(sel_lps, top_idx, top_lp)
+                        else:
+                            mx.eval(sel_lps)
+                    sel_lists = sel_lps.tolist()
+                    top_idx_l = top_idx.tolist() if top_idx is not None else None
+                    top_lp_l = top_lp.tolist() if top_lp is not None else None
+                    new_lps_list = [
+                        [
+                            (
+                                sel_lists[j][i],
+                                list(zip(top_idx_l[j][i], top_lp_l[j][i]))
+                                if top_idx_l is not None
+                                else None,
+                            )
+                            for i in range(len(new_tokens_list[j]))
+                        ]
+                        for j in range(n_active)
+                    ]
             # Keep the adaptive block-size history on a per-round basis so
             # batched MTP reacts like the singleton loop instead of letting
             # batch size change the controller signal.
@@ -1107,11 +1166,14 @@ def _mtp_rounds_batch(
         max_new = max(len(nt) for nt in new_tokens_list) if new_tokens_list else 0
         for pos in range(max_new):
             tokens_out: List[Optional[int]] = [None] * B
+            lps_out = [None] * B if new_lps_list is not None else None
             for j in range(n_active):
                 orig = active_idx[j]
                 if pos < len(new_tokens_list[j]) and not finished[orig]:
                     tok = new_tokens_list[j][pos]
                     tokens_out[orig] = tok
+                    if lps_out is not None and pos < len(new_lps_list[j]):
+                        lps_out[orig] = new_lps_list[j][pos]
                     emitted[orig] += 1
                     if emitted[orig] >= max_tokens:
                         finished[orig] = True
@@ -1119,7 +1181,10 @@ def _mtp_rounds_batch(
                         finished[orig] = True
                     if stop_check is not None and stop_check(orig, tok):
                         finished[orig] = True
-            yield tokens_out, {"round_pos": pos, "round_len": max_new}
+            meta = {"round_pos": pos, "round_len": max_new}
+            if lps_out is not None:
+                meta["token_logprobs"] = lps_out
+            yield tokens_out, meta
 
         # Update bonus tokens and per-row positions
         for j in range(n_active):

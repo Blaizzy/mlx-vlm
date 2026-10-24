@@ -1554,6 +1554,11 @@ class SpeculativeGenerationBatch:
         draft_block_size: Optional[int] = None,
         token_dtype: mx.Dtype = mx.int32,
         greedy_sampling: bool = False,
+        compute_logprobs: bool = False,
+        top_logprobs_k: int = 0,
+        first_token_logprobs: Optional[mx.array] = None,
+        first_top_idx: Optional[mx.array] = None,
+        first_top_lp: Optional[mx.array] = None,
     ):
         self.model = model
         self.draft_model = draft_model
@@ -1575,6 +1580,15 @@ class SpeculativeGenerationBatch:
         self._finished = [False] * len(uids)
         self._sent_first = False
         self._rounds_iter = None
+        # Per-token logprobs are only produced by the MTP speculative path
+        # today; other draft kinds keep emitting token_logprob=0.0.
+        self.compute_logprobs = bool(
+            (compute_logprobs or top_logprobs_k > 0) and draft_kind == "mtp"
+        )
+        self.top_logprobs_k = top_logprobs_k if self.compute_logprobs else 0
+        self._first_lps = first_token_logprobs
+        self._first_top_idx = first_top_idx
+        self._first_top_lp = first_top_lp
 
     def __len__(self):
         return sum(not done for done in self._finished)
@@ -1626,6 +1640,7 @@ class SpeculativeGenerationBatch:
         self,
         responses: List[GenerationBatch.Response],
         tok_list: List[Optional[int]],
+        lps_list: Optional[List[Optional[Tuple[float, Optional[list]]]]] = None,
     ) -> None:
         for row, token in enumerate(tok_list):
             if token is None or self._finished[row]:
@@ -1635,12 +1650,17 @@ class SpeculativeGenerationBatch:
             finish_reason = self._finish_reason(row, token)
             if finish_reason is not None:
                 self._finished[row] = True
+            lp = 0.0
+            top_lp = None
+            if lps_list is not None and row < len(lps_list) and lps_list[row]:
+                lp, top_lp = lps_list[row]
             responses.append(
                 self.Response(
                     uid=self._all_uids[row],
                     token=token,
-                    token_logprob=0.0,
+                    token_logprob=lp,
                     finish_reason=finish_reason,
+                    top_logprobs=top_lp,
                 )
             )
 
@@ -1672,6 +1692,8 @@ class SpeculativeGenerationBatch:
             eos_token_ids=None,
             prompt_tokens=self.prompt_tokens,
             row_ids=[0] * len(self._all_uids),
+            want_logprobs=self.compute_logprobs,
+            top_logprobs_k=self.top_logprobs_k,
         )
 
     def next(self) -> List[GenerationBatch.Response]:
@@ -1682,6 +1704,17 @@ class SpeculativeGenerationBatch:
         if not self._sent_first:
             self._sent_first = True
             mx.eval(self.first_tokens)
+            first_lps = (
+                self._first_lps.tolist() if self._first_lps is not None else None
+            )
+            first_top = None
+            if self._first_top_idx is not None and self._first_top_lp is not None:
+                top_idx_l = self._first_top_idx.tolist()
+                top_lp_l = self._first_top_lp.tolist()
+                first_top = [
+                    list(zip(top_idx_l[i], top_lp_l[i]))
+                    for i in range(len(self._all_uids))
+                ]
             for row, token in enumerate(self.first_tokens.tolist()):
                 if self._finished[row]:
                     continue
@@ -1694,10 +1727,16 @@ class SpeculativeGenerationBatch:
                     self.Response(
                         uid=self._all_uids[row],
                         token=token,
-                        token_logprob=0.0,
+                        token_logprob=(
+                            first_lps[row] if first_lps is not None else 0.0
+                        ),
                         finish_reason=finish_reason,
+                        top_logprobs=(
+                            first_top[row] if first_top is not None else None
+                        ),
                     )
                 )
+            self._first_lps = self._first_top_idx = self._first_top_lp = None
             self._refresh_uids()
             return responses
 
@@ -1719,7 +1758,12 @@ class SpeculativeGenerationBatch:
             self._refresh_uids()
             return responses
 
-        self._append_token_responses(responses, tok_list)
+        lps_list = (
+            round_meta.get("token_logprobs")
+            if isinstance(round_meta, dict)
+            else None
+        )
+        self._append_token_responses(responses, tok_list, lps_list)
         while isinstance(round_meta, dict) and int(
             round_meta.get("round_pos", 0)
         ) + 1 < int(round_meta.get("round_len", 1)):
@@ -1727,7 +1771,12 @@ class SpeculativeGenerationBatch:
                 tok_list, round_meta = next(self._rounds_iter)
             except StopIteration:
                 break
-            self._append_token_responses(responses, tok_list)
+            lps_list = (
+                round_meta.get("token_logprobs")
+                if isinstance(round_meta, dict)
+                else None
+            )
+            self._append_token_responses(responses, tok_list, lps_list)
 
         self._refresh_uids()
         return responses
@@ -2302,6 +2351,21 @@ class PromptProcessingBatch:
                 )
 
         if self.draft_model is not None and self.draft_kind is not None:
+            # MTP speculative rounds report target-model logprobs; the other
+            # draft kinds do not (yet), so keep the historical disable there.
+            spec_logprobs = bool(
+                compute_logprobs or top_logprobs_k > 0
+            ) and self.draft_kind == "mtp"
+            first_lps = first_top_idx = first_top_lp = None
+            if spec_logprobs:
+                first_lps = logprobs[
+                    mx.arange(first_tokens.shape[0]), first_tokens
+                ]
+                if top_logprobs_k > 0:
+                    k = min(top_logprobs_k, logprobs.shape[-1])
+                    sort_idx = mx.argsort(logprobs, axis=-1)
+                    first_top_idx = sort_idx[..., -k:][..., ::-1].astype(mx.int32)
+                    first_top_lp = mx.take_along_axis(logprobs, first_top_idx, axis=-1)
             gen_batch = SpeculativeGenerationBatch(
                 model=self.model,
                 draft_model=self.draft_model,
@@ -2320,8 +2384,13 @@ class PromptProcessingBatch:
                 draft_block_size=self.draft_block_size,
                 token_dtype=self._input_ids.dtype,
                 greedy_sampling=self.greedy_sampling,
+                compute_logprobs=spec_logprobs,
+                top_logprobs_k=top_logprobs_k if spec_logprobs else 0,
+                first_token_logprobs=first_lps,
+                first_top_idx=first_top_idx,
+                first_top_lp=first_top_lp,
             )
-            compute_logprobs = False
+            compute_logprobs = spec_logprobs
         else:
             gen_batch = GenerationBatch(
                 model=self.model,
@@ -2548,7 +2617,9 @@ class BatchGenerator:
         self.draft_kind = draft_kind
         self.draft_block_size = draft_block_size
         self.greedy_sampling = greedy_sampling or sampler is None
-        if self.draft_model is not None:
+        if self.draft_model is not None and self.draft_kind != "mtp":
+            # Only the MTP speculative path reports target-model logprobs;
+            # the other draft kinds keep the historical disable.
             compute_logprobs = False
             top_logprobs_k = 0
             self.compute_logprobs = False

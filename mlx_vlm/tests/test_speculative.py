@@ -356,6 +356,60 @@ def test_mtp_generation(family, failure, monkeypatch):
     assert drafter._round_appended == 0
 
 
+@parametrize("greedy_mode", [True, False])
+def test_mtp_batch_logprobs(greedy_mode):
+    mx.random.seed(2127)
+    model, config = language("qwen", inference=True)
+    drafter = mtp_drafter("qwen", config)
+    model.eval()
+    drafter.eval()
+    prompt = mx.array([[1, 2, 3]])
+    speculative = model.make_cache()
+    out = model(
+        prompt, cache=speculative, return_hidden=True, return_shared_kv=True
+    )
+    first = greedy(out.logits[:, -1]).item()
+    emitted = []
+    rounds = mtp._mtp_rounds_batch(
+        model,
+        drafter,
+        speculative,
+        out.hidden_states[-1],
+        out.shared_kv_states or {},
+        prompt_tokens=prompt,
+        first_bonus=mx.array([first], dtype=mx.int32),
+        max_tokens=8,
+        sampler=greedy,
+        draft_block_size=4,
+        greedy_sampling=greedy_mode,
+        want_logprobs=True,
+        top_logprobs_k=3,
+    )
+    for tokens, meta in rounds:
+        lps = meta.get("token_logprobs")
+        assert lps is not None and len(lps) == len(tokens)
+        for tok, entry in zip(tokens, lps):
+            if tok is not None:
+                emitted.append((tok, entry[0], entry[1]))
+    assert emitted
+
+    # Each emitted token's logprob must equal the target model's own
+    # next-token distribution for the same (greedy) decode position. The
+    # first emitted token follows `first`, so step the reference decode past
+    # the prompt AND the bonus before comparing.
+    ordinary = model.make_cache()
+    logits = model(prompt, cache=ordinary).logits[:, -1]
+    assert greedy(logits).item() == first
+    logits = model(mx.array([[first]]), cache=ordinary).logits[:, -1]
+    for tok, lp, top in emitted:
+        lps_row = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        assert lp == pytest.approx(float(lps_row[0, tok]), abs=1e-5)
+        assert len(top) == 3
+        assert top[0][0] == tok  # greedy argmax leads the top-k list
+        assert [t for _, t in top] == sorted((t for _, t in top), reverse=True)
+        logits = model(mx.array([[tok]]), cache=ordinary).logits[:, -1]
+
+
 @parametrize("family", list(TINY_MODELS))
 @parametrize("batch", [1, 2, 4])
 @parametrize("dtype", [mx.float32, mx.bfloat16])
