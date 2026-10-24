@@ -437,6 +437,11 @@ class VisionModel(nn.Module):
         grid_thw: mx.array,
         output_hidden_states: Optional[bool] = None,
     ) -> mx.array:
+        # Patches packed as (total_patches, C, H, W), e.g. a training batch of
+        # differently sized images, are one sequence split by grid_thw.
+        if hidden_states.ndim == 4:
+            hidden_states = mx.expand_dims(hidden_states, axis=0)
+
         if self._use_same_grid_batch_path(
             hidden_states, grid_thw, output_hidden_states
         ):
