@@ -1338,6 +1338,32 @@ Structured outputs are not currently supported with speculative decoding.
 - Text-only requests are batched together for efficient prefill
 - After prefill, all requests decode together in a single batch, sharing GPU compute
 
+#### Batch-invariant decoding (opt-in)
+
+By default a request's output can depend on how many other requests share the
+batch. `mx.quantized_matmul` picks a different Metal kernel for one row than
+for several (`qmv` vs `qmv_wide`/`qmm`), and the kernels add in a different
+order. A temperature-0 request can therefore return different tokens when it
+runs alongside others than when it runs alone, usually after a few hundred
+tokens.
+
+Pass `--batch-invariant` to the server (or set `MLX_VLM_BATCH_INVARIANT=1`), or
+`batch_invariant=True` to `BatchGenerator` / `batch_generate`, to remove that
+dependence:
+
+- **Guarantee:** each row's tokens and log-probabilities are bit-identical to
+  running the same request alone (batch size 1), whatever the batch size.
+- **Cost:** batched decode runs every projection through a per-row exact
+  kernel, and batched prefill runs one row at a time. Batch size 1 is
+  unchanged. On a 27B 4-bit model (M4 Pro), aggregate decode throughput drops
+  about 9% at batch size 4 and 21% at 8.
+- **When to use it:** whenever temperature-0 output must be reproducible under
+  batching: evals, regression tests, RL rollouts, and checking exact
+  speculative decoding at batch size > 1.
+- **Coverage:** dense Qwen3.5 models (`qwen3_5`, `qwen3_5_text`, and models
+  that reuse their language model). Other models, including Qwen3.5 MoE, ignore
+  the flag and log a warning once.
+
 #### Available Endpoints
 
 - `/models` and `/v1/models` - Discover cached and local models, including their loaded status; accepts repeated `model_dir` query parameters

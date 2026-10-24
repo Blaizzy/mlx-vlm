@@ -2062,6 +2062,9 @@ _QWEN4_EXACT_SPECULATIVE_VERIFIER = _QWEN4_BATCH_INVARIANT_FORWARD
 
 
 class LanguageModel(Qwen3_5LanguageModel):
+    # Its MoE blocks are not covered by BatchGenerator(batch_invariant=True).
+    supports_batch_invariant = False
+
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         nn.Module.__init__(self)
         self.args = args

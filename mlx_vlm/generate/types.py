@@ -43,6 +43,7 @@ class GenerateKwargs(TypedDict, total=False):
     sampler: Callable[[mx.array], mx.array] | None
     logits_processors: list[Callable[[mx.array, mx.array], mx.array]] | None
     prefill_step_size: int | None
+    batch_invariant: bool
     input_ids: mx.array
     pixel_values: Any
     mask: Any

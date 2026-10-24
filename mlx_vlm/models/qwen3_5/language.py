@@ -14,6 +14,7 @@ from ..base import (
     create_attention_mask,
     scaled_dot_product_attention,
 )
+from ..batch_invariant import linear as _batch_invariant_linear
 from ..cache import ArraysCache, KVCache
 from ..rope_utils import MRoPERotaryEmbedding
 from ..rope_utils import apply_multimodal_rotary_pos_emb as _apply_mrope
@@ -932,9 +933,9 @@ class Qwen3_5Attention(nn.Module):
     ) -> mx.array:
         B, L, D = x.shape
         q_proj_output, keys, values = (
-            self.q_proj(x),
-            self.k_proj(x),
-            self.v_proj(x),
+            _batch_invariant_linear(self.q_proj, x),
+            _batch_invariant_linear(self.k_proj, x),
+            _batch_invariant_linear(self.v_proj, x),
         )
         queries, keys, values, gate, mask = self._prepare_projected_qkv(
             q_proj_output,
@@ -963,7 +964,7 @@ class Qwen3_5Attention(nn.Module):
             )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
-        return self.o_proj(output * mx.sigmoid(gate))
+        return _batch_invariant_linear(self.o_proj, output * mx.sigmoid(gate))
 
     def _prepare_projected_qkv(
         self,
@@ -1044,7 +1045,13 @@ class Qwen3_5MLP(nn.Module):
         self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
 
     def __call__(self, x) -> mx.array:
-        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
+        return _batch_invariant_linear(
+            self.down_proj,
+            swiglu(
+                _batch_invariant_linear(self.gate_proj, x),
+                _batch_invariant_linear(self.up_proj, x),
+            ),
+        )
 
 
 class Qwen3_5GatedDeltaNet(nn.Module):
@@ -1113,7 +1120,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         return q, k
 
     def _project_gates(self, inputs: mx.array):
-        return self.in_proj_b(inputs), self.in_proj_a(inputs)
+        return (
+            _batch_invariant_linear(self.in_proj_b, inputs),
+            _batch_invariant_linear(self.in_proj_a, inputs),
+        )
 
     def __call__(
         self,
@@ -1122,8 +1132,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         B, S, _ = inputs.shape
-        mixed_qkv = self.in_proj_qkv(inputs)
-        z = self.in_proj_z(inputs)
+        mixed_qkv = _batch_invariant_linear(self.in_proj_qkv, inputs)
+        z = _batch_invariant_linear(self.in_proj_z, inputs)
         b, a = self._project_gates(inputs)
 
         z = z.reshape(B, S, -1, self.head_v_dim)
@@ -1190,7 +1200,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 _qwen3_5_advance_lengths_info(cache, S)
 
         out = self.norm(out, z)
-        return self.out_proj(out.reshape(B, S, -1))
+        return _batch_invariant_linear(self.out_proj, out.reshape(B, S, -1))
 
 
 class Qwen3_5DecoderLayer(nn.Module):
@@ -1408,6 +1418,9 @@ class Qwen3_5Model(nn.Module):
 
 class LanguageModel(nn.Module):
     requires_uniform_batch_acceptance = True
+    # Every dense projection routes through _batch_invariant_linear, so
+    # BatchGenerator(batch_invariant=True) makes batched rows match B == 1.
+    supports_batch_invariant = True
 
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         super().__init__()
@@ -1846,9 +1859,9 @@ class LanguageModel(nn.Module):
         if skip_logits:
             logits = None
         elif self.args.tie_word_embeddings:
-            logits = self.model.embed_tokens.as_linear(out)
+            logits = _batch_invariant_linear(self.model.embed_tokens.as_linear, out)
         else:
-            logits = self.lm_head(out)
+            logits = _batch_invariant_linear(self.lm_head, out)
         return LanguageModelOutput(
             logits=logits,
             hidden_states=hidden_sink,
