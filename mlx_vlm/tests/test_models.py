@@ -1525,6 +1525,75 @@ def tiny_config(family, profile=None, **overrides):
     return build_config(module, fields | overrides, case["config_type"])
 
 
+def test_gemma4_modelopt_awq_strict_load_and_forward(tmp_path):
+    module = importlib.import_module("mlx_vlm.models.gemma4")
+    fields = model_case("gemma4")["config"]
+    fields["audio_config"] = None
+    fields["text_config"].update(
+        num_hidden_layers=2,
+        head_dim=16,
+        global_head_dim=16,
+        layer_types=["sliding_attention", "full_attention"],
+        attention_k_eq_v=True,
+        use_double_wide_mlp=False,
+    )
+    mx.random.seed(661)
+    reference = module.Model(build_config(module, fields))
+    expected_weights = dict(tree_flatten(reference.parameters()))
+    source = {}
+    for key, value in expected_weights.copy().items():
+        source_key = "model." + key.replace("language_model.model.", "language_model.")
+        if (
+            key.endswith(".weight")
+            and any(
+                f".{projection}." in key
+                for projection in (
+                    "q_proj",
+                    "k_proj",
+                    "v_proj",
+                    "o_proj",
+                    "gate_proj",
+                    "up_proj",
+                    "down_proj",
+                )
+            )
+            and key.startswith("language_model.")
+        ):
+            prefix = source_key.removesuffix(".weight")
+            factor = mx.array(0.137, mx.float32)
+            packed, scales = mx.quantize(value / factor, mode="nvfp4")
+            source[source_key] = packed.view(mx.uint8)
+            source[prefix + ".weight_scale"] = scales
+            source[prefix + ".weight_scale_2"] = factor
+            source[prefix + ".input_scale"] = mx.array(0.25, mx.float32)
+            decoded = mx.dequantize(packed, scales, mode="nvfp4") * factor
+            if key.endswith(("down_proj.weight", "o_proj.weight")):
+                pre_scale = mx.linspace(0.25, 2.0, value.shape[-1]).astype(mx.bfloat16)
+                source[prefix + ".pre_quant_scale"] = pre_scale
+                decoded *= pre_scale.astype(mx.float32)
+            expected_weights[key] = decoded
+        else:
+            source[source_key] = value
+
+    config = asdict(reference.config)
+    config["quantization_config"] = {
+        "quant_method": "modelopt",
+        "quant_algo": "NVFP4_AWQ",
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), source)
+    loaded = load_model(tmp_path, strict=True)
+    reference.load_weights(list(expected_weights.items()))
+    tokens = mx.array([[1, 5, 9]])
+    expected = reference(tokens).logits
+    actual = loaded(tokens).logits
+    assert mx.allclose(actual, expected, atol=2e-5, rtol=2e-4).item()
+    cache = loaded.language_model.make_cache()
+    loaded(tokens[:, :2], cache=cache)
+    decoded = loaded(tokens[:, 2:], cache=cache).logits
+    assert mx.allclose(decoded, expected[:, 2:], atol=2e-5, rtol=2e-4).item()
+
+
 def test_gemma3_can_preserve_caller_supplied_embedding_scale():
     case = next(case for case in DATA["cases"] if case["module"] == "gemma3")
     module = importlib.import_module(f"mlx_vlm.models.{case['module']}.language")
