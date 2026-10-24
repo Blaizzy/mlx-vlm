@@ -501,5 +501,42 @@ QAT simulates quantization on eligible standard Linear weights with straight-thr
 gradients; embeddings and Linear layers whose input width is incompatible with
 the group size remain floating point. It supports 4/8 bits and groups of 32/64/128.
 Checkpoints contain floating-point master weights in the existing full checkpoint
-format. Resume with `qat=True` (or `--qat`); quantize the trained model separately
-for packed inference. This uses full-training memory rather than adapter memory.
+format. Resume with `qat=True` (or `--qat`). This uses full-training memory.
+
+Export packed inference weights after training with one call:
+
+```python
+from mlx_vlm import export_model
+
+export_model(model, processor, "qat-inference", model_path=MODEL_ID)
+# Load directly for inference:
+model, processor = load("qat-inference")
+```
+
+The output must be a new directory. `export_model` automatically packs QAT layers
+at their trained bit/group settings, preserves other layers, fuses LoRA/DoRA
+adapters when present, and saves the config and processor assets. It derives
+quantization metadata from the exported layers. The live training model is
+restored after saving. The result is a standalone inference model.
+
+For non-QAT training the same function keeps the current float/packed layout.
+Force quantization of compatible float layers with:
+
+```python
+export_model(
+    model, processor, "quantized-inference", model_path=MODEL_ID,
+    quantize=True, bits=4, group_size=64,
+)
+```
+
+With `quantize=True`, ordinary float layers default to 4 bits/group 64; QAT layers
+keep their trained settings unless `bits`/`group_size` are explicitly supplied.
+`quantize=False` saves QAT master weights without adding quantization; existing
+packed layers remain packed. Forced quantization skips incompatible float layers.
+Full QAT checkpoints now record their QAT settings, so preparation restores them
+automatically on resume. Older checkpoints need explicit QAT settings.
+
+All QAT notebooks end with `export_model(...)`. CLI training supports
+`--export-model-path inference` (the old `--export-qat-path` remains an alias).
+Add `--export-quantize` to force quantization. Float training checkpoints remain
+separate for resuming. `export_qat_model` remains a compatibility wrapper.

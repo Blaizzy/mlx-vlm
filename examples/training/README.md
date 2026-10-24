@@ -84,4 +84,8 @@ float master weights, and apply weight-only affine QAT to compatible standard
 Linear layers. They use full fine-tuning and its memory costs. Defaults select
 four microsteps and small data subsets; GRPO disables W&B and reference KL by
 default. Saved weights are full floating-point checkpoints. Reapply the same
-QAT bit/group settings when reloading; quantize separately for packed inference.
+QAT bit/group settings when reloading older training checkpoints; new checkpoints
+record and restore these settings automatically. Each QAT notebook ends with
+`export_model(...)`, saving a standalone packed inference model to
+`EXPORT_DIR` using the exact trained quantization settings. Load that directory
+directly with `mlx_vlm.load`; the float training checkpoint remains separate.

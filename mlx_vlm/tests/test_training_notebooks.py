@@ -141,9 +141,13 @@ def test_notebook_cells_train_evaluate_and_reload(notebook, train_type, tmp_path
             result["pixel_values"] = np.ones((1, 2, 4), dtype=np.float32)
         return result
 
+    source_path = tmp_path / "base"
+    source_path.mkdir()
+    (source_path / "config.json").write_text('{"model_type": "tiny"}')
     namespace = {"__name__": "__notebook__"}
     with (
         patch("mlx_vlm.load", side_effect=load),
+        patch("mlx_vlm.utils.get_model_path", return_value=source_path),
         patch("datasets.load_dataset", side_effect=load_dataset_fixture),
         patch("mlx_vlm.prompt_utils.apply_chat_template", side_effect=template),
         patch(
@@ -159,6 +163,7 @@ def test_notebook_cells_train_evaluate_and_reload(notebook, train_type, tmp_path
             exec(compile(source, f"{notebook}:cell:{index}", "exec"), namespace)
             if "MODEL_ID =" in source:
                 namespace["TRAIN_TYPE"] = train_type
+                namespace["EXPORT_DIR"] = tmp_path / "quantized"
                 namespace["args"] = replace(
                     namespace["args"],
                     iters=2,
@@ -210,6 +215,9 @@ def test_notebook_cells_train_evaluate_and_reload(notebook, train_type, tmp_path
     metadata = json.loads((tmp_path / "adapter_config.json").read_text())
     assert metadata["fine_tune_type"] == train_type
     if qat:
+        export_config = json.loads((tmp_path / "quantized/config.json").read_text())
+        assert export_config["quantization"]["bits"] == 4
+        assert (tmp_path / "quantized/model.safetensors").is_file()
         from mlx_vlm.trainer.common.qat import QATLinear
 
         assert any(

@@ -97,6 +97,9 @@ def test_text_grpo_notebook_trains_evaluates_saves_and_reloads(
     test = Dataset.from_dict(
         {"prompt": ["What is 70 + 69?"] * 2, "answer": ["139"] * 2}
     )
+    source_path = tmp_path / "base"
+    source_path.mkdir()
+    (source_path / "config.json").write_text('{"model_type": "tiny"}')
     namespace = {"__name__": "__notebook__"}
     template_calls, generation_calls, models = [], [], []
 
@@ -128,6 +131,7 @@ def test_text_grpo_notebook_trains_evaluates_saves_and_reloads(
     with (
         patch("mlx_vlm.convert") as conversion,
         patch("mlx_vlm.load", side_effect=load),
+        patch("mlx_vlm.utils.get_model_path", return_value=source_path),
         patch("mlx_vlm.trainer.WandBCallback") as wandb_callback,
         patch(
             "datasets.load_dataset",
@@ -149,6 +153,7 @@ def test_text_grpo_notebook_trains_evaluates_saves_and_reloads(
             exec(compile(source, f"grpo_text_only:cell:{i}", "exec"), namespace)
             if "MODEL_ID =" in source:
                 namespace["TRAIN_TYPE"] = train_type
+                namespace["EXPORT_DIR"] = tmp_path / "quantized"
                 namespace["OUTPUT_DIR"] = tmp_path / "adapters"
                 namespace["args"] = replace(
                     namespace["args"],
@@ -314,6 +319,7 @@ def test_qat_grpo_notebook_trains_evaluates_and_reloads(tmp_path, monkeypatch):
     )
     test_text_grpo_notebook_trains_evaluates_saves_and_reloads(tmp_path, "full", 0.0)
     config = json.loads((tmp_path / "adapters/run_config.json").read_text())
+    assert (tmp_path / "quantized/model.safetensors").is_file()
     assert config["qat"] is True
     assert config["quantization_bits"] == 4
     assert config["quantization_group_size"] == 64

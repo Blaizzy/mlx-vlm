@@ -221,6 +221,17 @@ def prepare_model_for_training(
             raise ValueError(
                 "This is an adapter checkpoint; use train_type='lora' or 'dora'."
             )
+        saved_qat = (config or {}).get("qat")
+        if saved_qat and not qat:
+            qat = True
+            quantization_bits = saved_qat["bits"]
+            quantization_group_size = saved_qat["group_size"]
+            if quantization_bits not in {4, 8} or quantization_group_size not in {
+                32,
+                64,
+                128,
+            }:
+                raise ValueError("Invalid QAT settings in checkpoint metadata.")
         _dequantize_model(model)
         if weights is not None:
             model.load_weights(str(weights), strict=True)
@@ -229,7 +240,13 @@ def prepare_model_for_training(
 
             apply_qat(model, bits=quantization_bits, group_size=quantization_group_size)
         model.unfreeze()
-        _record_adapter_config(model, {"fine_tune_type": "full"})
+        metadata = {"fine_tune_type": "full"}
+        if qat:
+            metadata["qat"] = {
+                "bits": quantization_bits,
+                "group_size": quantization_group_size,
+            }
+        _record_adapter_config(model, metadata)
     else:
         if config is not None and config.get("fine_tune_type") == "full":
             raise ValueError(
