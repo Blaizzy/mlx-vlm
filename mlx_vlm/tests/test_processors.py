@@ -2815,6 +2815,39 @@ def test_invalid_calls(name, text, error):
         (
             "qwen3_coder",
             dict,
+            "<function=get_weather>\n<parameter=city>\nnull\n</parameter>\n</function>",
+            _call("get_weather", city="null"),
+            _weather_tools(city="string", days="integer"),
+        ),
+        (
+            "qwen3_coder",
+            dict,
+            "<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n"
+            "<parameter=days>\nnull\n</parameter>\n</function>",
+            _call("get_weather", city="Paris", days=None),
+            _weather_tools(city="string", days="integer"),
+        ),
+        (
+            "qwen3_coder",
+            dict,
+            "<function=get_weather>\n<parameter=city>\nnull\n</parameter>\n</function>",
+            _call("get_weather", city=None),
+            [
+                dict(
+                    type="function",
+                    function=dict(
+                        name="get_weather",
+                        parameters=dict(
+                            type="object",
+                            properties=dict(city=dict(type="string", nullable=True)),
+                        ),
+                    ),
+                )
+            ],
+        ),
+        (
+            "qwen3_coder",
+            dict,
             "<function=write><parameter=content><parameter=</parameter></function>",
             _call("write", content="<parameter="),
             None,
@@ -2857,6 +2890,9 @@ def test_invalid_calls(name, text, error):
         "qwen-unclosed-last",
         "qwen-truncated-parameter-tag",
         "qwen-unclosed-last-invalid",
+        "qwen-string-null-kept",
+        "qwen-integer-null-none",
+        "qwen-nullable-string-null-none",
         "qwen-literal-parameter-prefix",
         "qwen-literal-parameter-tag",
         "qwen-empty-property-schema",
