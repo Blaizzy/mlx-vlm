@@ -454,6 +454,9 @@ class Model(nn.Module):
         _sanitize_moe_weights(sanitized_weights, args)
         return sanitized_weights
 
+    def shard(self, group=None):
+        self.language_model.shard(group)
+
     def make_cache(self):
         return self.language_model.make_cache()
 

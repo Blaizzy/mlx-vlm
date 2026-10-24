@@ -356,7 +356,7 @@ def test_mtp_generation(family, failure, monkeypatch):
     assert drafter._round_appended == 0
 
 
-@parametrize("family", list(TINY_MODELS))
+@parametrize("family", ["qwen", "glm", "deepseek"])
 @parametrize("batch", [1, 2, 4])
 @parametrize("dtype", [mx.float32, mx.bfloat16])
 def test_verify_commit_matches_decode(family, batch, dtype):

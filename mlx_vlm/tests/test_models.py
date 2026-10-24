@@ -8,11 +8,17 @@ import inspect
 import json
 import logging
 import math
+import os
+import signal
+import socket
 import struct
+import subprocess
+import sys
 import textwrap
 import unittest
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict
+from fnmatch import fnmatchcase
 from operator import attrgetter
 from pathlib import Path
 from types import SimpleNamespace
@@ -2301,6 +2307,309 @@ def tiny_config(family, profile=None, **overrides):
     fields = TINY_DEFAULTS | case["config"] | case.get("profiles", {}).get(profile, {})
     module = importlib.import_module("mlx_vlm.models." + case["module"])
     return build_config(module, fields | overrides, case["config_type"])
+
+
+def _prepare_minimax_distributed(model, dtype):
+    from mlx_vlm.quantization.nvfp4 import ScaledQuantizedSwitchLinear
+
+    for layer in model.layers:
+        if not layer.is_moe_layer:
+            continue
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            projection = getattr(layer.block_sparse_moe.switch_mlp, name)
+            scale = mx.arange(1, projection.num_experts + 1, dtype=mx.float32) * 1344
+            setattr(
+                layer.block_sparse_moe.switch_mlp,
+                name,
+                ScaledQuantizedSwitchLinear(projection, scale, "weight_global_scale"),
+            )
+
+
+DISTRIBUTED_MODEL_SETUPS = {"minimax_m3_nvfp4": _prepare_minimax_distributed}
+
+
+@pytest.mark.parametrize(
+    "family", ["minimax_m3", "minimax_m3_nvfp4", "minimax_m3_packed"]
+)
+def test_minimax_shard_validation_and_partitioning(family):
+    mx.random.seed(19)
+    model = _make_distributed_test_model(family, mx.bfloat16)
+    original = dict(tree_flatten(model.parameters()))
+    model.shard(SimpleNamespace(size=lambda: 1, rank=lambda: 0))
+    assert all(p is original[k] for k, p in tree_flatten(model.parameters()))
+    with pytest.raises(ValueError, match="Expert count"):
+        model.shard(SimpleNamespace(size=lambda: 3, rank=lambda: 0))
+    assert all(p is original[k] for k, p in tree_flatten(model.parameters()))
+
+    model.shard(SimpleNamespace(size=lambda: 2, rank=lambda: 1))
+    for key, value in tree_flatten(model.parameters()):
+        old = original[key]
+        if ".switch_mlp." in key:
+            routed = model.args.num_local_experts
+            expected = old[routed // 2 : routed]
+            if model.args.pack_shared_expert:
+                expected = mx.concatenate([expected, old[-1:]], axis=0)
+            assert mx.array_equal(value, expected).item(), key
+        elif key.startswith("lm_head."):
+            assert mx.array_equal(value, old[old.shape[0] // 2 :]).item(), key
+        else:
+            assert value is old, key
+    with pytest.raises(ValueError, match="already sharded"):
+        model.shard(SimpleNamespace(size=lambda: 2, rank=lambda: 1))
+
+
+def test_minimax_shard_rejects_invalid_scales_without_mutating_weights():
+    model = _make_distributed_test_model("minimax_m3_nvfp4", mx.bfloat16)
+    projection = model.layers[-1].block_sparse_moe.switch_mlp.down_proj
+    projection.weight_global_scale = mx.ones(3)
+    original = dict(tree_flatten(model.parameters()))
+    with pytest.raises(ValueError):
+        model.shard(SimpleNamespace(size=lambda: 2, rank=lambda: 0))
+    assert all(p is original[k] for k, p in tree_flatten(model.parameters()))
+
+
+@pytest.mark.parametrize("tied,vocab_size", [(True, 128), (False, 129)])
+def test_minimax_shard_keeps_unsplittable_vocabulary_replicated(tied, vocab_size):
+    from mlx_vlm.models.minimax_m3_vl.language import LanguageModel
+
+    model = LanguageModel(
+        tiny_config("minimax_m3", tie_word_embeddings=tied, vocab_size=vocab_size)
+    )
+    head = model.model.embed_tokens if tied else model.lm_head
+    weight = head.weight
+    model.shard(SimpleNamespace(size=lambda: 2, rank=lambda: 0))
+    assert head.weight is weight
+    assert not model._sharded_lm_head
+
+
+@pytest.mark.parametrize("per_expert", [False, True])
+def test_minimax_shard_preserves_quantization_scale_layouts(per_expert):
+    model = _make_distributed_test_model("minimax_m3_nvfp4", mx.bfloat16)
+    projection = model.layers[-1].block_sparse_moe.switch_mlp.down_proj
+    projection.weight_global_scale = (
+        mx.arange(4 * 128, dtype=mx.float32).reshape(4, 128) + 1
+        if per_expert
+        else mx.array(2688.0)
+    )
+    projection.pre_quant_scale = mx.arange(128, dtype=mx.float32) + 1
+    if per_expert:
+        projection.pre_quant_scale = mx.broadcast_to(
+            projection.pre_quant_scale, (4, 128)
+        )
+    scale, smoothing = projection.weight_global_scale, projection.pre_quant_scale
+    model.shard(SimpleNamespace(size=lambda: 2, rank=lambda: 1))
+    if per_expert:
+        assert mx.array_equal(projection.weight_global_scale, scale[2:]).item()
+        assert mx.array_equal(projection.pre_quant_scale, smoothing[2:]).item()
+    else:
+        assert projection.weight_global_scale is scale
+        assert projection.pre_quant_scale is smoothing
+
+
+def test_minimax_shard_preserves_head_output_scale_broadcasting():
+    from mlx_vlm.quantization.nvfp4 import ScaledQuantizedLinear
+
+    model = _make_distributed_test_model("minimax_m3", mx.bfloat16)
+    model.lm_head = ScaledQuantizedLinear(
+        model.lm_head.to_quantized(group_size=16, bits=4, mode="nvfp4"),
+        (mx.arange(128, dtype=mx.float32) + 1) * 128,
+        "weight_global_scale",
+    )
+    hidden = mx.random.normal((1, 1, 128)).astype(mx.bfloat16)
+    expected = model.lm_head(hidden)[..., 64:]
+    mx.eval(expected)
+    model.shard(SimpleNamespace(size=lambda: 2, rank=lambda: 1))
+    actual = model.lm_head(hidden)
+    assert actual.shape == expected.shape
+    assert mx.array_equal(actual, expected).item()
+
+
+def test_minimax_multimodal_model_exposes_sharding():
+    from mlx_vlm.models import minimax_m3_vl
+
+    model = minimax_m3_vl.Model(
+        build_config(minimax_m3_vl, model_case("minimax_m3_vl")["config"])
+    )
+    group = SimpleNamespace(size=lambda: 1, rank=lambda: 0)
+    with patch.object(model.language_model, "shard") as shard:
+        model.shard(group)
+    shard.assert_called_once_with(group)
+
+
+# Distributed language-model contracts
+
+
+def _make_distributed_test_model(family, dtype):
+    case = TINY_MODELS[family]
+    config = tiny_config(family, "distributed")
+    module = importlib.import_module("mlx_vlm.models." + case["module"] + ".language")
+    model = module.LanguageModel(config)
+    model.update(
+        tree_map(
+            lambda p: p.astype(dtype) if mx.issubdtype(p.dtype, mx.floating) else p,
+            model.parameters(),
+        )
+    )
+    if setup := DISTRIBUTED_MODEL_SETUPS.get(family):
+        setup(model, dtype)
+    if quantization := case["distributed"].get("quantization"):
+        quantization = copy.deepcopy(quantization)
+        if patterns := quantization.pop("modules", None):
+
+            def predicate(path, module):
+                if hasattr(module, "to_quantized"):
+                    for pattern, overrides in patterns.items():
+                        if fnmatchcase(path, pattern):
+                            return overrides
+                return False
+
+            quantization["class_predicate"] = predicate
+        nn.quantize(model, **quantization)
+    model.eval()
+    return model
+
+
+def _distributed_model_worker(family, dtype_name):
+    group = mx.distributed.init(strict=True, backend="ring")
+    options = TINY_MODELS[family]["distributed"]
+    dtype = getattr(mx, dtype_name)
+    mx.random.seed(19)
+    reference = _make_distributed_test_model(family, dtype)
+    mx.eval(reference.parameters())
+    weights = dict(tree_flatten(reference.parameters()))
+    sharded = _make_distributed_test_model(family, dtype)
+    sharded.load_weights(list(weights.items()), strict=True)
+    sharded.shard(group)
+    if error := options.get("reshard_error"):
+        with pytest.raises(ValueError, match=error):
+            sharded.shard(group)
+    mx.eval(sharded.parameters())
+    local_weights = dict(tree_flatten(sharded.parameters()))
+    for pattern in options["sharded_weights"]:
+        names = [name for name in weights if fnmatchcase(name, pattern)]
+        assert names, f"No weights match {pattern!r}"
+        for name in names:
+            assert local_weights[name].size * group.size() == weights[name].size, name
+
+    records = []
+    # Keep model-specific reference tolerances in the fixture. Every rank must
+    # return identical logits; MiniMax also requires exact BF16 reference parity.
+    tolerance = options["tolerances"][dtype_name]
+    vocab_size = reference.args.vocab_size
+    for batch in (1, 4):
+        actual_cache = make_prompt_cache(sharded)
+        expected_cache = make_prompt_cache(reference)
+        for step, tokens in enumerate(
+            ([1, 7, 9, 3, 11, 15, 2, 6, 8, 10, 12, 14], [13], [17], [19], [2, 4, 6])
+        ):
+            ids = mx.array(
+                [[(t + row) % vocab_size for t in tokens] for row in range(batch)]
+            )
+            expected = reference(ids, cache=expected_cache).logits
+            actual = sharded(ids, cache=actual_cache).logits
+            mx.eval(actual, expected)
+            gathered = mx.distributed.all_gather(actual, group=group)
+            mx.eval(gathered)
+            ranks_agree = all(
+                mx.array_equal(
+                    gathered[:batch], gathered[rank * batch : (rank + 1) * batch]
+                ).item()
+                for rank in range(1, group.size())
+            )
+            records.append(
+                dict(
+                    batch=batch,
+                    step=step,
+                    max_error=mx.max(mx.abs(actual - expected)).item(),
+                    ranks_agree=ranks_agree,
+                    passed=mx.allclose(
+                        actual, expected, atol=tolerance, rtol=tolerance
+                    ).item(),
+                )
+            )
+    passed = mx.distributed.all_sum(
+        mx.array(int(all(r["passed"] and r["ranks_agree"] for r in records))),
+        group=group,
+    ).item()
+    print(
+        json.dumps(dict(rank=group.rank(), passed_ranks=passed, checks=records)),
+        flush=True,
+    )
+    assert passed == group.size(), records
+
+
+def _run_distributed_model_test(family, dtype, world_size):
+    repo = Path(__file__).resolve().parents[2]
+    # The ring launcher needs one consecutive port per rank. Probe the entire
+    # range while holding the sockets so a four-rank case cannot reuse a port.
+    for _ in range(100):
+        with ExitStack() as stack:
+            sockets = [stack.enter_context(socket.socket()) for _ in range(world_size)]
+            sockets[0].bind(("127.0.0.1", 0))
+            port = sockets[0].getsockname()[1]
+            if port + world_size > 65536:
+                continue
+            try:
+                for rank, sock in enumerate(sockets[1:], 1):
+                    sock.bind(("127.0.0.1", port + rank))
+            except OSError:
+                continue
+            break
+    else:
+        pytest.fail(f"Could not find {world_size} consecutive ring ports")
+    command = [
+        sys.executable,
+        "-c",
+        "from mlx._distributed_utils.launch import main; main()",
+        "--backend",
+        "ring",
+        "-n",
+        str(world_size),
+        "--starting-port",
+        str(port),
+        "--env",
+        f"PYTHONPATH={repo}",
+        "--",
+        sys.executable,
+        "-c",
+        "import sys; from mlx_vlm.tests.test_models import _distributed_model_worker; "
+        "_distributed_model_worker(*sys.argv[1:])",
+        family,
+        dtype,
+    ]
+    process = subprocess.Popen(
+        command,
+        cwd=repo,
+        env=dict(os.environ, PYTHONPATH=str(repo)),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        output, _ = process.communicate(timeout=180)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        output, _ = process.communicate()
+        pytest.fail(
+            f"Distributed test timed out: {family}/{dtype}/{world_size}\n{output}"
+        )
+    assert process.returncode == 0, output
+    records = [json.loads(line) for line in output.splitlines() if line.startswith("{")]
+    assert len(records) == world_size, output
+    assert {r["rank"] for r in records if r["passed_ranks"] == world_size} == set(
+        range(world_size)
+    ), output
+
+
+@pytest.mark.skipif(not mx.distributed.is_available("ring"), reason="ring required")
+@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+@pytest.mark.parametrize(
+    "family", [name for name, case in TINY_MODELS.items() if "distributed" in case]
+)
+def test_distributed_model(family, dtype, world_size):
+    _run_distributed_model_test(family, dtype, world_size)
 
 
 def test_gemma4_modelopt_awq_strict_load_and_forward(tmp_path):

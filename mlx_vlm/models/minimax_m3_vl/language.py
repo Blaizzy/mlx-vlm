@@ -5,7 +5,7 @@ from typing import Any, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
+from mlx.utils import tree_map_with_path
 
 from ..base import (
     LanguageModelOutput,
@@ -1695,9 +1695,6 @@ class MiniMaxSparseMoeBlock(nn.Module):
         self.sharding_group = None
 
     def __call__(self, x: mx.array) -> mx.array:
-        if self.sharding_group is not None:
-            x = sum_gradients(self.sharding_group)(x)
-
         # Round router projections in the model dtype before scoring in FP32.
         gates = self.gate(x).astype(mx.float32)
         if self.e_score_correction_bias is not None:
@@ -1729,7 +1726,26 @@ class MiniMaxSparseMoeBlock(nn.Module):
             inds = mx.concatenate([inds, shared_inds], axis=-1)
             scores = mx.concatenate([scores, shared_scores], axis=-1)
 
-        y = self.switch_mlp(x, inds)
+        if self.sharding_group is None:
+            y = self.switch_mlp(x, inds)
+        else:
+            count = self.switch_mlp.down_proj.weight.shape[0] - int(
+                self.pack_shared_expert
+            )
+            rank = self.sharding_group.rank()
+            start = rank * count
+            local = (inds >= start) & (inds < start + count)
+            local_inds = mx.where(local, inds - start, 0)
+            if self.pack_shared_expert:
+                shared = inds == self.shared_expert_index
+                local_inds = mx.where(shared, count, local_inds)
+                local = local | (shared & (rank == 0))
+            y = self.switch_mlp(x, mx.stop_gradient(local_inds))
+            # Each route has exactly one owner. Reconstruct its output before
+            # weighting/accumulation to preserve the single-device BF16 order.
+            y = mx.distributed.all_sum(
+                mx.where(local[..., None], y, 0), group=self.sharding_group
+            )
         if self.pack_shared_expert:
             y = (
                 _minimax_moe_combine(
@@ -1739,9 +1755,6 @@ class MiniMaxSparseMoeBlock(nn.Module):
             )
         else:
             y = _minimax_moe_combine(y, scores, self.routed_scaling_factor)
-
-        if self.sharding_group is not None:
-            y = mx.distributed.all_sum(y, group=self.sharding_group)
 
         if self.shared_experts is not None:
             y = y + self.shared_experts(x)
@@ -1839,6 +1852,8 @@ class LanguageModel(nn.Module):
         self.model = MiniMaxM3Model(args)
         self._position_ids = None
         self._rope_deltas = None
+        self._sharding_group = None
+        self._sharded_lm_head = False
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
@@ -2051,7 +2066,13 @@ class LanguageModel(nn.Module):
     def logits_from_hidden(self, hidden: mx.array) -> mx.array:
         if self.args.tie_word_embeddings:
             return self.model.embed_tokens.as_linear(hidden)
-        return self.lm_head(hidden)
+        logits = self.lm_head(hidden)
+        if self._sharded_lm_head:
+            logits = mx.distributed.all_gather(
+                mx.moveaxis(logits, -1, 0), group=self._sharding_group
+            )
+            logits = mx.moveaxis(logits, 0, -1)
+        return logits
 
     def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
         return self.logits_from_hidden(self.model.norm(hidden))
@@ -2150,63 +2171,75 @@ class LanguageModel(nn.Module):
         return predicate
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
+        """Partition complete routed experts and an untied vocabulary head."""
         group = group or mx.distributed.init()
-        n = group.size()
+        size, rank = group.size(), group.rank()
+        if size == 1:
+            return
+        if self._sharding_group is not None:
+            raise ValueError("The language model is already sharded")
 
+        updates = []
+        experts = []
+
+        def partition(projection, rows, shared=False):
+            count = rows - int(shared)
+            if count % size:
+                raise ValueError(f"Expert count ({count}) must be divisible by {size}")
+            first, last = rank * (count // size), (rank + 1) * (count // size)
+
+            def split(path, value):
+                if not isinstance(value, mx.array):
+                    return value
+                # Input smoothing and tensor-wide global scales are replicated.
+                if path == "pre_quant_scale" and value.ndim == 1:
+                    return value
+                if path in ("weight_global_scale", "weight_scale_2", "global_scale"):
+                    if value.size == 1:
+                        return value
+                    if value.shape[0] != rows:
+                        value = value.reshape(rows, -1)
+                if value.ndim == 0 or value.shape[0] != rows:
+                    raise ValueError(
+                        f"Cannot shard {path} with shape {value.shape}: "
+                        f"expected {rows} rows"
+                    )
+                local = value[first:last]
+                if shared:
+                    local = mx.concatenate([local, value[-1:]], axis=0)
+                return mx.contiguous(local)
+
+            updates.append(
+                (projection, tree_map_with_path(split, projection.parameters()))
+            )
+
+        # Build and validate every partition before changing any module.
         for layer in self.layers:
-            if (
-                layer.self_attn.has_sparse_index
-                and layer.self_attn.index_heads % n != 0
-            ):
-                raise ValueError(
-                    "MiniMax M3 sparse index heads must be divisible by "
-                    f"the sharding group size: {layer.self_attn.index_heads} "
-                    f"heads, group size {n}."
-                )
-            layer.self_attn.q_proj = shard_linear(
-                layer.self_attn.q_proj, "all-to-sharded", group=group
-            )
-            layer.self_attn.k_proj = shard_linear(
-                layer.self_attn.k_proj, "all-to-sharded", group=group
-            )
-            layer.self_attn.v_proj = shard_linear(
-                layer.self_attn.v_proj, "all-to-sharded", group=group
-            )
-            layer.self_attn.o_proj = shard_linear(
-                layer.self_attn.o_proj, "sharded-to-all", group=group
-            )
-            layer.self_attn.num_attention_heads //= n
-            layer.self_attn.num_key_value_heads //= n
-            if layer.self_attn.has_sparse_index:
-                layer.self_attn.index_q_proj = shard_linear(
-                    layer.self_attn.index_q_proj,
-                    "all-to-sharded",
-                    group=group,
-                )
-                layer.self_attn.index_heads //= n
-
             if not layer.is_moe_layer:
                 continue
-            if layer.block_sparse_moe.pack_shared_expert:
-                shard_inplace(
-                    layer.block_sparse_moe.switch_mlp.gate_up_proj,
-                    "all-to-sharded",
-                    group=group,
-                )
-            else:
-                shard_inplace(
-                    layer.block_sparse_moe.switch_mlp.gate_proj,
-                    "all-to-sharded",
-                    group=group,
-                )
-                shard_inplace(
-                    layer.block_sparse_moe.switch_mlp.up_proj,
-                    "all-to-sharded",
-                    group=group,
-                )
-            shard_inplace(
-                layer.block_sparse_moe.switch_mlp.down_proj,
-                "sharded-to-all",
-                group=group,
+            moe = layer.block_sparse_moe
+            count = moe.shared_expert_index
+            names = (
+                ("gate_up_proj", "down_proj")
+                if moe.pack_shared_expert
+                else ("gate_proj", "up_proj", "down_proj")
             )
-            layer.block_sparse_moe.sharding_group = group
+            for name in names:
+                partition(
+                    getattr(moe.switch_mlp, name),
+                    count + int(moe.pack_shared_expert),
+                    moe.pack_shared_expert,
+                )
+            experts.append(moe)
+
+        shard_head = (
+            not self.args.tie_word_embeddings and self.args.vocab_size % size == 0
+        )
+        if shard_head:
+            partition(self.lm_head, self.args.vocab_size)
+        for projection, parameters in updates:
+            projection.update(parameters)
+        for moe in experts:
+            moe.sharding_group = group
+        self._sharded_lm_head = shard_head
+        self._sharding_group = group
