@@ -45,6 +45,7 @@ class ParserSpec:
 # overlaps. json_tools is the generic `<tool_call>` JSON fallback at priority 0,
 # so any format-specific parser that shares those markers wins.
 SPECS: Tuple[ParserSpec, ...] = (
+    ParserSpec("apertus", (("<|tools_prefix|>",),)),
     ParserSpec("atem", (("<atem:function_calls>", "<atem:invoke"),)),
     ParserSpec("gemma4", (("<|tool_call>",),)),
     ParserSpec("cohere2_moe", (("<|START_ACTION|>",),)),
