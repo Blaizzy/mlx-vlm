@@ -1677,6 +1677,19 @@ def _can_optimized_affine_linear(linear, x: mx.array) -> bool:
     return x.shape[-1] == K
 
 
+# The 4-bit streamed kernels keep one accumulator per verified token in registers
+# (``result[VERIFY_T]``), so they are bounded; longer 4-bit inputs use token tiling.
+STREAMED_VERIFY_MIN_T = 6
+STREAMED_VERIFY_MAX_T = 16
+
+
+def _affine_verify_path(bits: int, T: int) -> tuple[bool, bool]:
+    """Return ``(streamed, token_tiled)`` for an affine verify of ``T`` tokens."""
+    streamed = bits == 4 and STREAMED_VERIFY_MIN_T <= T <= STREAMED_VERIFY_MAX_T
+    token_tiled = bits == 4 and T > STREAMED_VERIFY_MAX_T
+    return streamed, token_tiled
+
+
 def optimized_affine_linear(linear, x: mx.array) -> Optional[mx.array]:
     if not _can_optimized_affine_linear(linear, x):
         return None
@@ -1685,8 +1698,7 @@ def optimized_affine_linear(linear, x: mx.array) -> Optional[mx.array]:
     N = linear.weight.shape[0]
 
     x = mx.contiguous(x)
-    streamed = linear.bits == 4 and 6 <= T <= 8
-    token_tiled = linear.bits == 4 and T >= 6 and not streamed
+    streamed, token_tiled = _affine_verify_path(linear.bits, T)
     results_per_simdgroup = 1 if streamed else 4
     if streamed:
         kernel_factory = _target_verify_qmv_streamed_kernel
@@ -1727,8 +1739,7 @@ def optimized_affine_argmax(
 
     B, T, K = x.shape
     N = linear.weight.shape[0]
-    streamed = linear.bits == 4 and 6 <= T <= 8
-    token_tiled = linear.bits == 4 and T >= 6 and not streamed
+    streamed, token_tiled = _affine_verify_path(linear.bits, T)
     results_per_simdgroup = 1 if streamed else 4
     rows_per_threadgroup = 2 * results_per_simdgroup
     num_tiles = N // rows_per_threadgroup
@@ -1794,7 +1805,7 @@ def optimized_affine_linears(linears, x: mx.array):
     if (
         not 2 <= len(linears) <= 4
         or x.ndim != 3
-        or not 1 < x.shape[1] <= 8
+        or not 1 < x.shape[1] <= STREAMED_VERIFY_MAX_T
         or bits not in (4, 5, 8)
         or not all(
             isinstance(linear, nn.QuantizedLinear)
@@ -1812,7 +1823,7 @@ def optimized_affine_linears(linears, x: mx.array):
     n_sizes = tuple(int(linear.weight.shape[0]) for linear in linears)
     total_n = sum(n_sizes)
     x = mx.contiguous(x)
-    streamed = bits == 4 and T >= 6
+    streamed = bits == 4 and T >= STREAMED_VERIFY_MIN_T
     kernel_factory = (
         _target_verify_fused_qmv_streamed_kernel
         if streamed
