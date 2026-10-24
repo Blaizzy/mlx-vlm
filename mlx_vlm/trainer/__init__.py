@@ -6,10 +6,12 @@ loss math and raw dataset loading live in ``losses`` and ``datasets``. The
 remain available through ``train``/``train_orpo`` and their object facades.
 """
 
+from ..export import export_model
 from .api import Trainer
 from .common.callbacks import TrainingCallback, WandBCallback
 from .common.config import CoreTrainingArgs
 from .common.model import prepare_model_for_training
+from .common.qat import export_qat_model
 from .common.task import TrainingTask
 from .core import (
     Colors,
@@ -51,3 +53,4 @@ from .vlm.config import VLMTrainingArgs
 from .vlm.dpo.config import DPOTrainingArgs
 from .vlm.grpo import GRPOTrainingArgs, GRPOVisionDataset
 from .vlm.orpo.config import ORPOTrainingArgs
+from .vlm.sft.mtp import attach_mtp_head

@@ -214,3 +214,44 @@ def test_trainer_requires_one_split_and_processor_for_raw_rows():
         Trainer(
             TinyVLM(), VLMTrainingArgs(), train_dataset={"train": []}, prepared=True
         )
+
+
+@pytest.mark.parametrize("qat,force", [(True, None), (False, None), (False, True)])
+def test_cli_qat_export_runs_after_training(tmp_path, qat, force):
+    from unittest.mock import Mock
+
+    args, settings = parse_args(
+        [
+            "--model",
+            "unused",
+            "--train-type",
+            "full",
+            "--export-model-path",
+            str(tmp_path / "packed"),
+            *(["--qat"] if qat else []),
+            *(["--export-quantize"] if force else []),
+        ]
+    )
+    model, processor = TinyVLM(), SimpleNamespace(pad_token_id=0)
+    trainer = Mock()
+    metrics = {"train_loss": 0.5}
+    trainer.train.return_value = metrics
+    with (
+        patch("mlx_vlm.train._load_model", return_value=(model, processor)),
+        patch("mlx_vlm.train._load_dataset", return_value={"train": [{}]}),
+        patch("mlx_vlm.train.Trainer", return_value=trainer),
+        patch("mlx_vlm.export.export_model") as export,
+    ):
+
+        def check_export(*positional, **kwargs):
+            trainer.train.assert_called_once_with()
+            assert isinstance(model.projection, nn.Linear)
+            return tmp_path / "packed"
+
+        export.side_effect = check_export
+        assert run(args, settings) is metrics
+    export.assert_called_once_with(
+        model, processor, str(tmp_path / "packed"), model_path="unused", quantize=force
+    )
+    with pytest.raises(SystemExit):
+        parse_args(["--model", "unused", "--export-quantize"])

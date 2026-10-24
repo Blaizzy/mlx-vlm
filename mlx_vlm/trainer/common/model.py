@@ -152,6 +152,7 @@ def prepare_model_for_training(
     lora_alpha: float = 16.0,
     lora_dropout: float = 0.0,
     target_modules: Sequence[str] | None = None,
+    qat: bool = False,
     quantization_bits: int | None = None,
     quantization_group_size: int = 64,
     checkpoint_path: str | Path | None = None,
@@ -168,6 +169,7 @@ def prepare_model_for_training(
         lora_dropout: Adapter input dropout for a new adapter.
         target_modules: Optional Linear suffixes or qualified module names.
             Defaults to the language/embedding transformer's Linear layers.
+        qat: Enable weight-only affine QAT for full training. Defaults to 4 bits.
         quantization_bits: Optionally quantize eligible Linear/Embedding layers
             before attaching adapters. None keeps the loaded representation,
             or restores the saved representation when loading a checkpoint.
@@ -182,12 +184,17 @@ def prepare_model_for_training(
     """
     if train_type not in {"lora", "dora", "full"}:
         raise ValueError("train_type must be 'lora', 'dora', or 'full'.")
+    if qat:
+        if train_type != "full":
+            raise ValueError("QAT requires train_type='full'.")
+        if quantization_bits is None:
+            quantization_bits = 4
     if quantization_bits is not None:
         if quantization_bits not in {4, 8}:
             raise ValueError("quantization_bits must be 4 or 8, or None.")
         if quantization_group_size not in {32, 64, 128}:
             raise ValueError("quantization_group_size must be 32, 64, or 128.")
-        if train_type == "full":
+        if train_type == "full" and not qat:
             raise ValueError(
                 "Full training needs floating-point weights; leave quantization_bits=None."
             )
@@ -214,11 +221,32 @@ def prepare_model_for_training(
             raise ValueError(
                 "This is an adapter checkpoint; use train_type='lora' or 'dora'."
             )
+        saved_qat = (config or {}).get("qat")
+        if saved_qat and not qat:
+            qat = True
+            quantization_bits = saved_qat["bits"]
+            quantization_group_size = saved_qat["group_size"]
+            if quantization_bits not in {4, 8} or quantization_group_size not in {
+                32,
+                64,
+                128,
+            }:
+                raise ValueError("Invalid QAT settings in checkpoint metadata.")
         _dequantize_model(model)
         if weights is not None:
             model.load_weights(str(weights), strict=True)
+        if qat:
+            from .qat import apply_qat
+
+            apply_qat(model, bits=quantization_bits, group_size=quantization_group_size)
         model.unfreeze()
-        _record_adapter_config(model, {"fine_tune_type": "full"})
+        metadata = {"fine_tune_type": "full"}
+        if qat:
+            metadata["qat"] = {
+                "bits": quantization_bits,
+                "group_size": quantization_group_size,
+            }
+        _record_adapter_config(model, metadata)
     else:
         if config is not None and config.get("fine_tune_type") == "full":
             raise ValueError(

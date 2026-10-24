@@ -41,6 +41,10 @@ def build_parser(task="vlm", algorithm=None):
     parser.add_argument("-c", "--config")
     parser.add_argument("--model", "--model-path", help="Model path or Hub identifier.")
     parser.add_argument(
+        "--mtp-model",
+        help="Matching floating-point Qwen3.5 native checkpoint or split MTP head.",
+    )
+    parser.add_argument(
         "--data", default="data", help="JSONL split folder, file, or Hub dataset."
     )
     parser.add_argument(
@@ -70,6 +74,23 @@ def build_parser(task="vlm", algorithm=None):
         "--train-vision",
         action="store_true",
         help="Also unfreeze the vision tower/projector.",
+    )
+    parser.add_argument(
+        "--qat",
+        action="store_true",
+        help="Weight-only affine QAT for --train-type full (defaults to 4 bits).",
+    )
+    parser.add_argument(
+        "--export-model-path",
+        "--export-qat-path",
+        dest="export_qat_path",
+        help="Export a standalone inference model; detects QAT automatically.",
+    )
+    parser.add_argument(
+        "--export-quantize",
+        action="store_true",
+        default=None,
+        help="Also quantize compatible non-QAT layers during model export.",
     )
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--lora-alpha", type=float, default=16.0)
@@ -157,6 +178,8 @@ def parse_args(argv=None, *, task="vlm"):
         parser.error("Unknown config options: " + ", ".join(sorted(unknown)))
     parser.set_defaults(**config)
     args = parser.parse_args(argv)
+    if args.export_quantize and not args.export_qat_path:
+        parser.error("--export-quantize requires --export-model-path.")
     if not args.model:
         parser.error("--model is required.")
     if args.output_path:
@@ -208,6 +231,7 @@ def _configure_model(model, args):
     model = prepare_model_for_training(
         model,
         train_type=args.train_type,
+        qat=getattr(args, "qat", False),
         lora_rank=getattr(args, "lora_rank", 8),
         lora_alpha=getattr(args, "lora_alpha", 16),
         lora_dropout=getattr(args, "lora_dropout", 0),
@@ -266,7 +290,22 @@ def run(args, settings, training_callback=None):
         train_rows, val_rows = raw, None
     if len(train_rows) == 0:
         raise ValueError(f"Dataset has no non-empty {args.train_split!r} split.")
+    head = None
+    if settings.mtp_loss_weight:
+        if not args.mtp_model:
+            raise ValueError("--mtp-loss-weight requires --mtp-model.")
+        from .speculative.drafters import load_drafter
+        from .trainer.vlm.sft.mtp import attach_mtp_head
+
+        head, _ = load_drafter(args.mtp_model, kind="mtp")
+        if args.train_type == "full":
+            # Full checkpoints restore strictly, so register the head first.
+            attach_mtp_head(model, head)
+    elif getattr(args, "mtp_model", None):
+        raise ValueError("--mtp-model requires a positive --mtp-loss-weight.")
     model = _configure_model(model, args)
+    if head is not None and args.train_type != "full":
+        attach_mtp_head(model, head, checkpoint_path=args.resume_adapter_file)
     reward_options = {}
     if args.algorithm == "grpo":
         from .trainer.vlm.grpo import rewards
@@ -335,7 +374,18 @@ def run(args, settings, training_callback=None):
                 training_callback,
             )
             trainer.training_callback = callback
-        return trainer.train()
+        metrics = trainer.train()
+        if getattr(args, "export_qat_path", None):
+            from .export import export_model
+
+            export_model(
+                model,
+                processor,
+                args.export_qat_path,
+                model_path=args.model,
+                quantize=getattr(args, "export_quantize", None),
+            )
+        return metrics
     finally:
         if callback is not None:
             callback.finish()
