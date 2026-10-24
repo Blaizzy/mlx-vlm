@@ -1661,12 +1661,25 @@ def supports_optimized_affine_head(linear) -> bool:
     return K % 512 == 0 and N % 8 == 0
 
 
+# Widths without streamed or token-tiled verify kernels (4-bit has both) run the
+# generic kernel, which keeps one result per verified token in registers. Past
+# these block lengths it is slower than the singleton gather_qmm fallback,
+# which is also exact, so longer blocks use the fallback.
+_GENERIC_VERIFY_MAX_T = {5: 4, 8: 8}
+
+
+def _generic_verify_too_long(bits: int, length: int) -> bool:
+    limit = _GENERIC_VERIFY_MAX_T.get(bits)
+    return limit is not None and length > limit
+
+
 def _can_optimized_affine_linear(linear, x: mx.array) -> bool:
     """Check the exact affine kernel for a runtime-sized batch."""
     if (
         not supports_optimized_affine_head(linear)
         or x.ndim != 3
         or x.shape[1] < 1
+        or _generic_verify_too_long(linear.bits, x.shape[1])
         or x.dtype != linear.scales.dtype
         or not mx.metal.is_available()
         or mx.default_device() != mx.gpu

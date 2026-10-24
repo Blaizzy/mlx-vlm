@@ -554,6 +554,33 @@ def test_glm_quantized_head_parity(bits, dtype, batch):
     equal(actual, expected)
 
 
+@parametrize("bits", [5, 8])
+@parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_generic_verify_kernel_length_cap(bits, dtype):
+    # 5 and 8-bit verify blocks only have the generic kernel. Up to the cap it
+    # must be selected; past it the singleton fallback is used. Both stay exact.
+    mx.random.seed(800 + bits)
+    dense = nn.Linear(1024, 48, bias=False)
+    dense.weight = dense.weight.astype(dtype)
+    linear = nn.QuantizedLinear.from_linear(dense, bits=bits, group_size=64)
+    limit = quantized._GENERIC_VERIFY_MAX_T[bits]
+    for length in (2, limit, limit + 1, 12, 16):
+        inputs = mx.random.normal((2, length, 1024)).astype(dtype)
+        expected = verifier_linear._target_verify_singletons(linear, inputs)
+        selected = quantized.optimized_affine_linear(linear, inputs)
+        if length <= limit:
+            assert selected is not None
+            equal(selected, expected)
+        else:
+            assert selected is None
+            assert quantized.optimized_affine_argmax(linear, inputs) is None
+        equal(verifier_linear._target_verify_linear(linear, inputs), expected)
+        equal(
+            verifier_linear._target_verify_quantized_argmax(linear, inputs),
+            greedy(expected),
+        )
+
+
 @parametrize("kind", ["mtp", "dflash", "eagle3"])
 @parametrize("batch", [1, 2])
 @parametrize("token,failure", [(4, False), (7, False), (4, True)])
