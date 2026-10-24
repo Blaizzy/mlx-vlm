@@ -1,5 +1,6 @@
 """Shared speculative generation, drafter, verification, and cache contracts."""
 
+import gc
 import importlib
 import json
 from contextlib import nullcontext
@@ -503,6 +504,43 @@ def test_fused_projection_parity(bits, widths, length):
     ]
     actual = verifier_linear._target_verify_linears(linears, inputs)
     equal(actual, expected)
+
+
+def test_fused_decode_projections_share_storage():
+    mx.random.seed(2508)
+    linears = [
+        bf16_parameters(
+            nn.QuantizedLinear(2048, width, bias=False, group_size=64, bits=4)
+        )
+        for width in (1024, 512, 16, 16)
+    ]
+    decode = mx.random.normal((1, 1, 2048)).astype(mx.bfloat16)
+    verify = mx.random.normal((1, 3, 2048)).astype(mx.bfloat16)
+    prefill = mx.random.normal((1, 64, 2048)).astype(mx.bfloat16)
+    expected_decode = [linear(decode) for linear in linears]
+    expected_prefill = [linear(prefill) for linear in linears]
+    expected_verify = verifier_linear._target_verify_linears(linears, verify)
+    mx.eval(linears, expected_decode, expected_prefill, expected_verify)
+    joined_bytes = sum(
+        linear.weight.nbytes + linear.scales.nbytes + linear.biases.nbytes
+        for linear in linears
+    )
+
+    gc.collect()
+    before = mx.get_active_memory()
+    actual = verifier_linear._target_verify_linears(linears, decode)
+    mx.eval(actual)
+    del actual
+    gc.collect()
+    # The joined decode arrays replace the separate ones instead of adding to them.
+    assert mx.get_active_memory() - before < joined_bytes // 2
+
+    cached = linears[0]._fused_decode_linears
+    equal(verifier_linear._target_verify_linears(linears, decode), expected_decode)
+    assert linears[0]._fused_decode_linears is cached
+    equal([linear(decode) for linear in linears], expected_decode)
+    equal([linear(prefill) for linear in linears], expected_prefill)
+    equal(verifier_linear._target_verify_linears(linears, verify), expected_verify)
 
 
 @parametrize("bits", [4, 5])
