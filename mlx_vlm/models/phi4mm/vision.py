@@ -4,7 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from ..interpolate import resize_bilinear
+from ..interpolate import resize_bilinear_nhwc
 from ..mlp import GELUMLP as MLP
 from .config import VisionConfig
 
@@ -127,26 +127,26 @@ class VisionEmbeddings(nn.Module):
         embed_dim = positional_embeddings.shape[-1]
         source_dtype = positional_embeddings.dtype
 
-        pos_size = positional_embeddings.shape[0]
-        # (pos_size, pos_size, embed_dim) -> (1, embed_dim, pos_size, pos_size)
-        pos_emb = positional_embeddings.transpose(2, 0, 1).reshape(
-            1, embed_dim, pos_size, pos_size
-        )
+        # (pos_size, pos_size, embed_dim) -> (1, pos_size, pos_size, embed_dim).
+        # Siglip2 resizes with bilinear + antialias, so use the ATen-matched
+        # helper; the legacy channel-first one antialiases with a Gaussian blur
+        # instead of PyTorch's triangle filter.
+        pos_emb = positional_embeddings[None].astype(mx.float32)
 
         batch_results = []
         for i in range(batch_size):
             height = int(spatial_shapes[i, 0].item())
             width = int(spatial_shapes[i, 1].item())
 
-            resized = resize_bilinear(
+            resized = resize_bilinear_nhwc(
                 pos_emb,
                 (height, width),
                 align_corners=False,
                 antialias=True,
             )
 
-            # (1, embed_dim, h, w) -> (h*w, embed_dim)
-            resized = resized.reshape(embed_dim, height * width).T
+            # (1, h, w, embed_dim) -> (h*w, embed_dim)
+            resized = resized.reshape(height * width, embed_dim)
             resized = resized.astype(source_dtype)
 
             num_patches = height * width
