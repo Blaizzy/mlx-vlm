@@ -2506,9 +2506,14 @@ def _distributed_model_worker(family, dtype_name):
                 [[(t + row) % vocab_size for t in tokens] for row in range(batch)]
             )
             expected = reference(ids, cache=expected_cache).logits
+            mx.eval(expected)
+            # Finish independent reference work on every rank before queuing
+            # distributed work on the shared GPU. Keep test-only collectives
+            # on the CPU so a faster rank cannot block another rank's GPU work.
+            mx.distributed.all_sum(mx.array(0), group=group, stream=mx.cpu).item()
             actual = sharded(ids, cache=actual_cache).logits
-            mx.eval(actual, expected)
-            gathered = mx.distributed.all_gather(actual, group=group)
+            mx.eval(actual)
+            gathered = mx.distributed.all_gather(actual, group=group, stream=mx.cpu)
             mx.eval(gathered)
             ranks_agree = all(
                 mx.array_equal(
@@ -2530,6 +2535,7 @@ def _distributed_model_worker(family, dtype_name):
     passed = mx.distributed.all_sum(
         mx.array(int(all(r["passed"] and r["ranks_agree"] for r in records))),
         group=group,
+        stream=mx.cpu,
     ).item()
     print(
         json.dumps(dict(rank=group.rank(), passed_ranks=passed, checks=records)),
