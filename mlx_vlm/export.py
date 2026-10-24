@@ -105,12 +105,18 @@ def export_model(
                 else:
                     packed = nn.QuantizedLinear.from_linear(
                         layer,
-                        bits=bits
-                        if bits is not None
-                        else getattr(layer, "bits", saved_qat.get("bits")),
-                        group_size=group_size
-                        if group_size is not None
-                        else getattr(layer, "group_size", saved_qat.get("group_size")),
+                        bits=(
+                            bits
+                            if bits is not None
+                            else getattr(layer, "bits", saved_qat.get("bits"))
+                        ),
+                        group_size=(
+                            group_size
+                            if group_size is not None
+                            else getattr(
+                                layer, "group_size", saved_qat.get("group_size")
+                            )
+                        ),
                         mode="affine",
                     )
                 replacements.append((name, packed))
