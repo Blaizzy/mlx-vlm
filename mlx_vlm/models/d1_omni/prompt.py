@@ -45,6 +45,13 @@ def as_question(spec):
         raise ValueError(
             'noul criteria are optional: {"true": "...", "false": "..."} (or "yes", "no")'
         )
+    if kind == "noul" and criteria:
+        named = [{"yes": "true", "no": "false"}.get(k, k) for k in criteria]
+        if not set(named) <= {"true", "false"} or len(set(named)) < len(named):
+            raise ValueError(
+                'bool criteria describe "true" and "false" (or "yes" and "no"), '
+                "got keys " + ", ".join(sorted(map(repr, criteria)))
+            )
     return kind, str(spec["instructions"]), criteria
 
 

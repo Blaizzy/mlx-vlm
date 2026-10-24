@@ -1653,6 +1653,11 @@ async def responses_endpoint(request: Request):
                                 usage_stats["input_tokens"],
                                 usage_stats["output_tokens"],
                             ),
+                            "timings": GenerationTimings.from_metrics(
+                                metrics,
+                                usage_stats["input_tokens"],
+                                usage_stats["output_tokens"],
+                            ),
                         }
                     )
                     _store_response(
@@ -1667,6 +1672,7 @@ async def responses_endpoint(request: Request):
                         {
                             "type": terminal_event,
                             "response": completed_response.model_dump(),
+                            "timings": completed_response.timings.model_dump(),
                         },
                     )
 
@@ -1811,6 +1817,9 @@ async def responses_endpoint(request: Request):
                     previous_response_id=openai_request.previous_response_id,
                     store=openai_request.store,
                     usage=OpenAIUsage.from_metrics(
+                        metrics, prompt_tokens, output_tokens
+                    ),
+                    timings=GenerationTimings.from_metrics(
                         metrics, prompt_tokens, output_tokens
                     ),
                 )
