@@ -138,14 +138,6 @@ def _parse_array(text):
     return [_parse_value(item) for item in items if item.strip()]
 
 
-# Regex that captures the function name and uses a recursive pattern to
-# match the balanced outer braces (handles arbitrary nesting).
-# Function name accepts common namespaced tool ids used by MCP and agents.
-_tool_call_regex = re.compile(
-    r"call:([\w.:-]+)(\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\})"
-)
-
-
 def parse_tool_call(text, tools=None):
     text = (
         text.strip().removeprefix(tool_call_start).removesuffix(tool_call_end).strip()
@@ -155,22 +147,14 @@ def parse_tool_call(text, tools=None):
     elif not text.startswith("call:") and re.match(r"^[\w.:-]+\{", text):
         text = f"call:{text}"
 
-    # Try recursive-group regex first for well-formed calls
-    match = _tool_call_regex.search(text)
-    if not match:
-        # Fallback: find 'call:<name>{' and then balance braces manually
-        m = re.search(r"call:([\w.:-]+)\{", text)
-        if not m:
-            raise ValueError("No function call found in tool call text.")
-        func_name = m.group(1)
-        brace_start = m.end() - 1  # index of the '{'
-        brace_end = _find_matching_brace(text, brace_start)
-        args_str = text[brace_start + 1 : brace_end]
-    else:
-        func_name = match.group(1)
-        # Strip outer braces from the matched balanced group
-        balanced = match.group(2)
-        args_str = balanced[1:-1]
+    # Ignore braces and call-like text inside <|"|>-delimited strings.
+    m = re.search(r"call:([\w.:-]+)\{", text)
+    if not m:
+        raise ValueError("No function call found in tool call text.")
+    func_name = m.group(1)
+    brace_start = m.end() - 1  # index of the '{'
+    brace_end = _find_matching_brace(text, brace_start)
+    args_str = text[brace_start + 1 : brace_end]
 
     arguments = _parse_object(args_str)
     # OpenAI spec requires arguments as a JSON string, not a dict

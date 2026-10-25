@@ -2871,6 +2871,58 @@ def test_parser_syntax(parser, argument_type, text, expected, tools):
     assert [dict(call, arguments=_arguments(call)) for call in calls] == expected_calls
 
 
+class TestGemma4StringArguments:
+    @pytest.mark.parametrize(
+        "content",
+        [
+            'def strip_closing_braces(text):\n    return text.replace("}", "")\n',
+            "a { b",
+            "a } b { c",
+            '{"suffix": "}", "text": "ação 日本 🐦"}\n',
+        ],
+        ids=["python-source", "opening-brace", "closing-before-opening", "json-source"],
+    )
+    def test_literal_braces_preserve_content_and_following_arguments(self, content):
+        text = (
+            f'<|tool_call>call:write_file{{content:<|"|>{content}<|"|>,'
+            'path:<|"|>helpers.py<|"|>}<tool_call|>'
+        )
+        parsed = _parse("gemma4", text)
+        assert parsed["name"] == "write_file"
+        assert _arguments(parsed) == {"content": content, "path": "helpers.py"}
+        result = process_tool_calls(text, load_tool_module("gemma4"), None)
+        assert result.remaining_text == ""
+        assert len(result.calls) == 1
+        assert result.calls[0]["function"] == {
+            "name": "write_file",
+            "arguments": parsed["arguments"],
+        }
+
+    def test_braces_in_nested_array_strings_preserve_following_arguments(self):
+        text = (
+            'call:edit-file{edits:[{oldText:<|"|>a } b<|"|>,'
+            'newText:<|"|>c<|"|>}],path:<|"|>helpers.py<|"|>}'
+        )
+        parsed = _parse("gemma4", text)
+        assert parsed["name"] == "edit-file"
+        assert _arguments(parsed) == {
+            "edits": [{"oldText": "a } b", "newText": "c"}],
+            "path": "helpers.py",
+        }
+
+    def test_deep_string_call_syntax_is_not_selected_as_the_function(self):
+        parsed = _parse(
+            "gemma4",
+            'call:mcp.files:write{a:{b:{c:{d:{text:<|"|>call:fake{value:1}'
+            '<|"|>}}}},path:<|"|>helpers.py<|"|>}',
+        )
+        assert parsed["name"] == "mcp.files:write"
+        assert _arguments(parsed) == {
+            "a": {"b": {"c": {"d": {"text": "call:fake{value:1}"}}}},
+            "path": "helpers.py",
+        }
+
+
 @pytest.mark.parametrize("name", PARSER_NAMES)
 def test_parser_accepts_boolean_property_schemas(name):
     # ``true`` is a valid JSON Schema for a property that admits any value.

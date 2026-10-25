@@ -96,6 +96,42 @@ def test_multiple_calls_keep_separate_ids(parser):
     ]
 
 
+@pytest.mark.parametrize("chunk_size", [1, 7, 31, 8192])
+@pytest.mark.parametrize(
+    "nested", [False, True], ids=["source-code", "nested-call-text"]
+)
+def test_gemma_string_arguments_match_across_chunk_boundaries(chunk_size, nested):
+    if nested:
+        text = (
+            '<|tool_call>call:write_file{a:{b:{c:{d:{text:<|"|>call:fake{value:1}'
+            '<|"|>}}}},path:<|"|>helpers.py<|"|>}<tool_call|>'
+        )
+        expected = {
+            "a": {"b": {"c": {"d": {"text": "call:fake{value:1}"}}}},
+            "path": "helpers.py",
+        }
+    else:
+        content = 'def strip_closing_braces(text):\n    return text.replace("}", "")\n'
+        text = (
+            f'<|tool_call>call:write_file{{content:<|"|>{content}<|"|>,'
+            'path:<|"|>helpers.py<|"|>}<tool_call|>'
+        )
+        expected = {"content": content, "path": "helpers.py"}
+    module = load_tool_module("gemma4")
+    state = ToolCallDeltaState(module, TOOLS)
+    received = ""
+    for offset in range(0, len(text), chunk_size):
+        for delta in state.feed(text[offset : offset + chunk_size]):
+            assert delta["index"] == 0
+            received += delta["function"].get("arguments", "")
+    final = process_tool_calls(text, module, TOOLS).calls
+    assert state.finish(final) == []
+    assert len(final) == 1
+    assert final[0]["function"]["name"] == "write_file"
+    assert json.loads(received) == expected
+    assert json.loads(final[0]["function"]["arguments"]) == expected
+
+
 def test_truncated_call_cannot_finish_successfully():
     module = load_tool_module("json_tools")
     state = ToolCallDeltaState(module, TOOLS)
