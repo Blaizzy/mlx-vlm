@@ -10,6 +10,10 @@ Usage:
     model, processor = load("mlx-community/Video-Depth-Anything-Small-MLX")
     predictor = VideoDepthPredictor(model, processor)
     depths = predictor.infer(frames)  # frames: (T, H, W, 3) uint8 RGB
+
+To opt in to fused Metal input preprocessing on Apple silicon:
+    processor.use_metal_preprocessing = True
+This retains float32 inputs and does not change the model's weights or windows.
 """
 
 from typing import List, Optional
@@ -91,13 +95,18 @@ class VideoDepthPredictor:
 
             iterator = tqdm(iterator, desc="inferring depth")
         for frame_id in iterator:
-            cur = np.stack(
-                [
-                    self.processor.preprocess_frame(frame_list[frame_id + i])
-                    for i in range(INFER_LEN)
-                ]
-            )
-            cur_input = mx.array(cur)[None]  # (1, INFER_LEN, H, W, 3)
+            if getattr(self.processor, "use_metal_preprocessing", False):
+                cur_input = self.processor.preprocess(
+                    frame_list[frame_id : frame_id + INFER_LEN]
+                )["pixel_values"][None]
+            else:
+                cur = np.stack(
+                    [
+                        self.processor.preprocess_frame(frame_list[frame_id + i])
+                        for i in range(INFER_LEN)
+                    ]
+                )
+                cur_input = mx.array(cur)[None]  # (1, INFER_LEN, H, W, 3)
             if pre_input is not None:
                 # Condition on the previous window's keyframes
                 cur_input = mx.concatenate(
