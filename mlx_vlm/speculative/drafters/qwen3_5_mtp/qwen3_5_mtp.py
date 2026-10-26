@@ -158,6 +158,7 @@ class Qwen3_5MTPDraftModel(nn.Module):
         hidden: mx.array,
         cache: Optional[List[KVCache]],
         position_ids: mx.array,
+        attention_mask: Optional[mx.array] = None,
     ) -> mx.array:
         h = mx.concatenate(
             [
@@ -175,8 +176,37 @@ class Qwen3_5MTPDraftModel(nn.Module):
                 if layer_cache is not None
                 else ("causal" if h.shape[1] > 1 else None)
             )
+            if attention_mask is not None:
+                mask = attention_mask
             h = layer(h, mask=mask, cache=layer_cache, position_ids=position_ids)
         return self.norm(h)
+
+    def training_logits(self, tokens, hidden, attention_mask, target_model):
+        """Teacher-forced MTP forward without binding modules or mutating caches.
+
+        Each hidden state precedes its paired ground-truth token by one position;
+        the output predicts the token after that pair. Shared embeddings/head
+        stay owned by the target so checkpoints contain no duplicated weights.
+        """
+        lm = target_model.language_model
+        embedding = lm.model.embed_tokens
+        token_embed = embedding(tokens) * float(getattr(lm.model, "embed_scale", 1.0))
+        positions = mx.arange(tokens.shape[1])
+        causal = positions[:, None] >= positions[None, :]
+        valid = causal[None, None, :, :] & attention_mask[:, None, None, :].astype(
+            mx.bool_
+        )
+        # Finite masking also keeps entirely padded query rows well-defined.
+        mask = mx.where(valid, mx.array(0, hidden.dtype), mx.array(-1e9, hidden.dtype))
+        h = self._forward_hidden(
+            token_embed,
+            hidden,
+            cache=None,
+            position_ids=(positions + 1)[None, :],
+            attention_mask=mask,
+        )
+        head = embedding.as_linear if lm.args.tie_word_embeddings else lm.lm_head
+        return head(h)
 
     def _forward_tokens(
         self,
