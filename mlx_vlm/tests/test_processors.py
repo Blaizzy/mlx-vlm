@@ -2222,6 +2222,19 @@ def test_prompt_does_not_leak_image_payload(representation):
 
 
 class TestApplyChatTemplateIntegration:
+    def test_assistant_reasoning_content_is_preserved(self):
+        messages = [
+            {"role": "user", "content": "What is 17 + 25?"},
+            {"role": "assistant", "content": "42", "reasoning_content": "7+5=12"},
+        ]
+
+        result = apply_chat_template(
+            None, {"model_type": "lfm3"}, messages, return_messages=True
+        )
+
+        assert result[1]["reasoning_content"] == "7+5=12"
+        assert "reasoning_content" not in result[0]
+
     """Integration tests for apply_chat_template with multimodal content.
 
     These tests verify the actual bug fix works end-to-end, not just the helper.

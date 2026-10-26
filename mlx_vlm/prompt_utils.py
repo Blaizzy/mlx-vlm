@@ -183,6 +183,9 @@ def extract_text_from_content(content: Any) -> str:
     return str(content) if content else ""
 
 
+_REASONING_KEYS = ("reasoning_content", "reasoning", "thinking")
+
+
 def _get_role_content(item: Any) -> Union[tuple[str, Any], None]:
     """Return (role, content) for a message-like item (dict or object with .role/.content), else None."""
     if isinstance(item, dict):
@@ -1113,20 +1116,22 @@ def apply_chat_template(
                 if has_tool_metadata:
                     messages.append(_normalize_tool_message(p))
                 else:
-                    messages.append(
-                        get_message_json(
-                            model_type,
-                            content,
-                            role,
-                            skip_image_token=image_counts[i] == 0
-                            or role in ["system", "assistant"],
-                            skip_audio_token=audio_counts[i] == 0
-                            or role in ["system", "assistant"],
-                            num_images=image_counts[i],
-                            num_audios=audio_counts[i],
-                            **kwargs,
-                        )
+                    message = get_message_json(
+                        model_type,
+                        content,
+                        role,
+                        skip_image_token=image_counts[i] == 0
+                        or role in ["system", "assistant"],
+                        skip_audio_token=audio_counts[i] == 0
+                        or role in ["system", "assistant"],
+                        num_images=image_counts[i],
+                        num_audios=audio_counts[i],
+                        **kwargs,
                     )
+                    if isinstance(p, dict) and isinstance(message, dict):
+                        # Templates replay earlier reasoning, e.g. with preserve_thinking
+                        message.update({k: p[k] for k in _REASONING_KEYS if k in p})
+                    messages.append(message)
 
     if return_messages:
         return messages
