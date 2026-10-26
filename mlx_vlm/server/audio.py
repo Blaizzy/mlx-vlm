@@ -99,7 +99,7 @@ class AudioResultChunk:
 
 @dataclass
 class AudioInferenceRequest:
-    kind: Literal["tts", "stt", "stt_realtime"]
+    kind: Literal["tts", "stt", "stt_realtime", "diarization", "speaker_embedding"]
     model_name: str
     payload: Any
     request_id: str = ""
@@ -181,7 +181,7 @@ class AudioRequestQueue:
     def submit(
         self,
         *,
-        kind: Literal["tts", "stt", "stt_realtime"],
+        kind: Literal["tts", "stt", "stt_realtime", "diarization", "speaker_embedding"],
         model_name: str,
         payload: Any,
     ) -> AudioInferenceHandle:
@@ -246,6 +246,10 @@ class AudioRequestQueue:
                     from .audio_realtime import run_request
 
                     run_request(request, get_cached_model)
+                elif request.kind in ("diarization", "speaker_embedding"):
+                    from .audio_speakers import run_request
+
+                    run_request(request, get_cached_model)
                 else:
                     raise ValueError(f"Unsupported audio request kind: {request.kind}")
             except Exception as exc:
@@ -262,6 +266,8 @@ class AudioRequestQueue:
                     if not request.ready_event.is_set():
                         request.mark_ready(error)
                     request.emit_error(error)
+                if request.kind in ("diarization", "speaker_embedding"):
+                    request.payload.close()
                 request.emit_done()
                 mx.clear_cache()
                 with self._admission:
@@ -289,6 +295,9 @@ def register_routes(app, deps):
     _build_metrics_envelope = deps.build_metrics_envelope
 
     from .audio_realtime import audio_realtime_endpoint
+    from .audio_speakers import register_routes as register_speaker_routes
+
+    register_speaker_routes(app)
 
     app.websocket("/v1/audio/transcriptions/realtime")(audio_realtime_endpoint)
 

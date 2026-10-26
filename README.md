@@ -1350,6 +1350,8 @@ Structured outputs are not currently supported with speculative decoding.
 - `/audio/speech` and `/v1/audio/speech` - OpenAI-compatible text-to-speech endpoint backed by `mlx-audio` TTS models
 - `/audio/transcriptions` and `/v1/audio/transcriptions` - OpenAI-compatible speech-to-text endpoint backed by `mlx-audio` STT models
 - `/audio/translations` and `/v1/audio/translations` - OpenAI-compatible audio translation endpoint for STT models that expose a translation task
+- `/audio/diarizations` and `/v1/audio/diarizations` - Recording-wide speaker turns using MLX-Audio Nemotron diarization
+- `/audio/speaker_embeddings` and `/v1/audio/speaker_embeddings` - Normalized ECAPA speaker vectors from separate speech windows
 - `/v1/realtime` - WebSocket-based realtime full-duplex speech. See the [Nemotron VoiceChat guide](mlx_vlm/models/nemotron_voicechat/README.md#realtime-websocket-api) for supported models and usage.
 - `/health` - Check server status
 - `/metrics` and `/v1/metrics` - Inspect rolling request metrics, throughput, and runtime counters
@@ -1519,6 +1521,42 @@ curl -X POST "http://localhost:8080/v1/audio/transcriptions" \
   -F file=@/path/to/audio.mp3 \
   -F response_format=json
 ```
+
+##### Diarization and speaker embeddings
+
+Both endpoints run on the shared audio queue and reuse model weights through the
+server cache. `POST /unload` releases them. Each diarization request starts a new
+speaker session; IDs and timestamps stay consistent across every chunk of that
+recording. They are not identities across recordings: compare speaker embeddings
+for that purpose.
+
+```sh
+curl -X POST http://localhost:8080/v1/audio/diarizations \
+  -F file=@meeting.wav
+
+curl -X POST http://localhost:8080/v1/audio/speaker_embeddings \
+  -F file=@speaker.wav \
+  -F 'windows=[{"start":0,"end":8},{"start":12,"end":20}]'
+```
+
+The defaults are `mlx-community/Nemotron-3-Diarization` and
+`aufklarer/SpeechBrain-ECAPA-VoxCeleb-20M-MLX`, each at a fixed checkpoint revision.
+Optional `model` and `revision` fields select a compatible checkpoint. Responses
+include `model` and `revision`, plus `segments: [{start, end, speaker}]` for
+diarization or a normalized 192-value `embedding` and sampled `duration` for ECAPA.
+
+Embedding windows must be ordered, non-overlapping, and contain only the intended
+speaker: one to three windows of 3–10 seconds each, with at most 30 seconds of
+uploaded audio. Windows are encoded separately and combined with duration weights.
+Diarization accepts recordings up to eight hours. For long recordings, upload
+mono 16 kHz little-endian float32 PCM with `input_format=pcm_f32le` and
+`sample_rate=16000`; this path processes the upload in bounded blocks on disk.
+WAV and other supported audio formats are decoded and resampled when
+`input_format` is omitted.
+
+Disconnecting cancels queued work and stops active inference at the next chunk or
+window boundary. A download or GPU operation already in progress finishes before
+cancellation is observed; the server remains available to other requests.
 
 ##### Multi-Modal (Image + Audio)
 

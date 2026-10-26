@@ -6306,6 +6306,330 @@ def test_audio_transcriptions_undecodable_upload_returns_400(audio_client, monke
     assert "Invalid audio file" in response.json()["detail"]
 
 
+# Speaker analysis uses the same queue and model registry as other audio work.
+
+
+def _speaker_upload(client, kind, samples=None, **fields):
+    if samples is None:
+        samples = np.full(3 * 16000, 0.1, dtype="<f4")
+    return client.post(
+        f"/v1/audio/{kind}",
+        files={"file": ("audio.f32", samples.tobytes(), "application/octet-stream")},
+        data={"input_format": "pcm_f32le", **fields},
+    )
+
+
+@pytest.mark.parametrize("endpoint", ["diarizations", "speaker_embeddings"])
+def test_speaker_endpoints_require_configured_api_key(
+    audio_client, monkeypatch, endpoint
+):
+    monkeypatch.setenv("MLX_VLM_SERVER_API_KEY", "secret-test-key")
+    response = audio_client.post(f"/v1/audio/{endpoint}")
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+
+
+def test_diarization_one_session_per_recording_keeps_global_ids(
+    audio_client, monkeypatch
+):
+    from mlx_vlm.server import audio_speakers as speakers
+
+    calls = []
+
+    def stream(chunks, sample_rate):
+        seen = []
+        calls.append(seen)
+        for chunk, turns in zip(
+            chunks,
+            [[(0, 30, 7)], [(30, 40, 2), (40, 60, 7)], [(60, 61, 7)]],
+            strict=True,
+        ):
+            seen.append(len(chunk))
+            yield NS(segments=[NS(start=a, end=b, speaker=c) for a, b, c in turns])
+
+    loader = Mock(return_value=(NS(generate_stream=stream), None, None))
+    monkeypatch.setattr(server, "get_cached_model", loader)
+    for _ in range(2):
+        response = _speaker_upload(
+            audio_client, "diarizations", np.zeros(61 * 16000, dtype="<f4")
+        )
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "model": speakers.DIARIZATION_MODEL,
+            "revision": speakers.DIARIZATION_REVISION,
+            "segments": [
+                {"start": 0, "end": 30, "speaker": 7},
+                {"start": 30, "end": 40, "speaker": 2},
+                {"start": 40, "end": 61, "speaker": 7},
+            ],
+        }
+    assert calls == [[480000, 480000, 16000]] * 2
+    loader.assert_called_with(
+        speakers.DIARIZATION_MODEL,
+        model_kind="audio_diarization",
+        revision=speakers.DIARIZATION_REVISION,
+    )
+    assert (
+        audio_client.get("/metrics").json()["latest"]["endpoint"]
+        == "/v1/audio/diarizations"
+    )
+
+
+def test_diarization_decodes_and_resamples_wav(audio_client, monkeypatch):
+    import io
+
+    from mlx_audio.audio_io import write
+
+    source = io.BytesIO()
+    write(source, np.full((8000, 2), 0.1, dtype=np.float32), 8000, format="wav")
+    observed = []
+
+    def stream(chunks, sample_rate):
+        observed.extend((len(chunk), sample_rate) for chunk in chunks)
+        yield NS(segments=[NS(start=0, end=1, speaker=4)])
+
+    monkeypatch.setattr(
+        server,
+        "get_cached_model",
+        Mock(return_value=(NS(generate_stream=stream), None, None)),
+    )
+    response = audio_client.post(
+        "/audio/diarizations",
+        files={"file": ("clip.wav", source.getvalue(), "audio/wav")},
+    )
+    assert response.status_code == 200, response.text
+    assert observed == [(16000, 16000)]
+    assert response.json()["segments"] == [{"start": 0, "end": 1, "speaker": 4}]
+
+
+def test_speaker_invalid_encoded_file_returns_400(audio_client, monkeypatch):
+    loader = Mock()
+    monkeypatch.setattr(server, "get_cached_model", loader)
+    response = audio_client.post(
+        "/audio/diarizations", files={"file": ("broken.wav", b"bad", "audio/wav")}
+    )
+    assert response.status_code == 400
+    loader.assert_not_called()
+
+
+def test_speaker_embedding_keeps_window_boundaries_and_weighted_normalization(
+    audio_client, monkeypatch
+):
+    calls = []
+
+    def encode(samples, sample_rate):
+        calls.append((len(samples), sample_rate))
+        result = np.zeros(192, dtype=np.float32)
+        result[len(calls) - 1] = 4
+        return result
+
+    monkeypatch.setattr(
+        server, "get_cached_model", Mock(return_value=(NS(encode=encode), None, None))
+    )
+    response = _speaker_upload(
+        audio_client,
+        "speaker_embeddings",
+        np.full(7 * 16000, 0.1, dtype="<f4"),
+        windows='[{"start":0,"end":3},{"start":3,"end":7}]',
+    )
+    assert response.status_code == 200, response.text
+    assert calls == [(48000, 16000), (64000, 16000)]
+    result = response.json()
+    np.testing.assert_allclose(result["embedding"][:2], [0.6, 0.8], rtol=1e-6)
+    assert len(result["embedding"]) == 192 and result["duration"] == 7
+
+
+@pytest.mark.parametrize(
+    "windows",
+    [
+        "[]",
+        '[{"start":0,"end":2.9}]',
+        '[{"start":0,"end":10.01}]',
+        '[{"start":false,"end":3}]',
+        '[{"start":0,"end":NaN}]',
+        '[{"start":0,"end":3},{"start":2,"end":5}]',
+        '[{"start":0,"end":3.1}]',
+        "null",
+        "not-json",
+    ],
+)
+def test_speaker_bad_windows_never_load_model(audio_client, monkeypatch, windows):
+    loader = Mock()
+    monkeypatch.setattr(server, "get_cached_model", loader)
+    response = _speaker_upload(audio_client, "speaker_embeddings", windows=windows)
+    assert response.status_code == 400, response.text
+    loader.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "kind,samples,fields",
+    [
+        ("diarizations", np.array([], dtype="<f4"), {}),
+        ("diarizations", np.array([0] * 480000 + [np.nan], dtype="<f4"), {}),
+        ("diarizations", np.ones(16000, dtype="<f4"), {"sample_rate": "8000"}),
+        (
+            "speaker_embeddings",
+            np.zeros(48000, dtype="<f4"),
+            {"windows": '[{"start":0,"end":3}]'},
+        ),
+    ],
+)
+def test_speaker_bad_audio_never_loads_model(
+    audio_client, monkeypatch, kind, samples, fields
+):
+    loader = Mock()
+    monkeypatch.setattr(server, "get_cached_model", loader)
+    response = _speaker_upload(audio_client, kind, samples, **fields)
+    assert response.status_code == 400, response.text
+    loader.assert_not_called()
+
+
+@pytest.mark.usefixtures("reset_audio_runtime")
+def test_speaker_cache_distinguishes_model_kind_and_revision(monkeypatch):
+    from mlx_vlm.server import audio_speakers as speakers
+
+    loader = Mock(side_effect=lambda *_: object())
+    monkeypatch.setattr(speakers, "load_speaker_model", loader)
+    first = server.get_cached_model(
+        "speaker", model_kind="audio_speaker_embedding", revision="one"
+    )[0]
+    assert (
+        server.get_cached_model(
+            "speaker", model_kind="audio_speaker_embedding", revision="one"
+        )[0]
+        is first
+    )
+    second = server.get_cached_model(
+        "speaker", model_kind="audio_speaker_embedding", revision="two"
+    )[0]
+    assert second is not first
+    third = server.get_cached_model(
+        "speaker", model_kind="audio_diarization", revision="two"
+    )[0]
+    assert third is not second
+    assert loader.call_count == 3
+    assert server.unload_model_sync()
+    assert not server.runtime.model_cache
+
+
+def test_speaker_cancellation_closes_stream_without_emitting_partial_output():
+    from tempfile import TemporaryFile
+
+    from mlx_vlm.server import audio_speakers as speakers
+
+    with TemporaryFile() as audio:
+        audio.write(np.zeros(61 * 16000, dtype="<f4").tobytes())
+        request = server_audio.AudioInferenceRequest(
+            kind="diarization",
+            model_name="test",
+            payload=speakers.SpeakerTaskPayload(audio, 61 * 16000, "test"),
+        )
+        closed = []
+
+        def stream(chunks, sample_rate):
+            try:
+                for _ in chunks:
+                    request.cancel_event.set()
+                    yield NS(segments=[NS(start=0, end=1, speaker=0)])
+            finally:
+                closed.append(True)
+
+        with pytest.raises(HTTPException, match="cancelled"):
+            speakers.run_request(
+                request, lambda *a, **k: (NS(generate_stream=stream), None, None)
+            )
+        assert closed == [True]
+        assert request.result_queue.empty()
+
+
+@pytest.mark.usefixtures("reset_audio_runtime")
+def test_cancelled_queued_speaker_request_closes_owned_upload(monkeypatch):
+    from tempfile import TemporaryFile
+
+    from mlx_vlm.server import audio_speakers as speakers
+
+    entered, release = Event(), Event()
+
+    def block(_):
+        entered.set()
+        assert release.wait(5)
+
+    monkeypatch.setattr(server_audio, "_run_tts_request", block)
+    worker = server_audio._get_audio_queue()
+    worker.submit(kind="tts", model_name="test", payload=None)
+    assert entered.wait(5)
+    audio = TemporaryFile()
+    handle = worker.submit(
+        kind="diarization",
+        model_name="test",
+        payload=speakers.SpeakerTaskPayload(audio, 1, "test"),
+    )
+    handle.cancel()
+    release.set()
+    while handle.result_queue.get(timeout=5).kind != "done":
+        pass
+    assert audio.closed
+
+
+def test_speaker_disconnect_cancels_queued_job(monkeypatch):
+    from tempfile import TemporaryFile
+
+    from mlx_vlm.server import audio_speakers as speakers
+
+    request = NS(is_disconnected=AsyncMock(return_value=True))
+    audio = TemporaryFile()
+    payload = speakers.SpeakerTaskPayload(audio, 512, "test")
+    monkeypatch.setattr(speakers, "_parse", AsyncMock(return_value=("test", payload)))
+    job = server_audio.AudioInferenceRequest(
+        kind="diarization", model_name="test", payload=payload
+    )
+    handle = server_audio.AudioInferenceHandle(
+        job.request_id, job.result_queue, job.cancel_event, job.ready_event, job
+    )
+    monkeypatch.setattr(
+        server_audio, "_get_audio_queue", lambda: NS(submit=lambda **k: handle)
+    )
+    monkeypatch.setattr(server.runtime, "metrics", server.ServerMetricsStore())
+    try:
+        with pytest.raises(HTTPException) as error:
+            asyncio.run(speakers._response(request, "diarization"))
+        assert error.value.status_code == 499
+        assert job.cancel_event.is_set()
+        assert not audio.closed  # The worker, not the HTTP coroutine, owns it.
+    finally:
+        audio.close()
+
+
+@pytest.mark.parametrize(
+    "value", [np.zeros(192), np.ones(2048), np.full(192, np.nan), np.full(192, np.inf)]
+)
+def test_speaker_encoder_rejects_invalid_vectors(value):
+    from mlx_vlm.server.audio_speakers import normalized
+
+    with pytest.raises(ValueError):
+        normalized(value)
+
+
+def test_speaker_default_checkpoint_is_verified_before_loading(tmp_path, monkeypatch):
+    import hashlib
+
+    from mlx_vlm.server import audio_speakers as speakers
+
+    weights = tmp_path / "model.safetensors"
+    weights.write_bytes(b"model")
+    monkeypatch.setattr(speakers, "WEIGHTS_BYTES", 5)
+    monkeypatch.setattr(
+        speakers, "WEIGHTS_SHA256", hashlib.sha256(b"model").hexdigest()
+    )
+    speakers.validate_weights(weights)
+    weights.write_bytes(b"other")
+    with pytest.raises(ValueError, match="checksum"):
+        speakers.validate_weights(weights)
+    weights.write_bytes(b"shorter")
+    with pytest.raises(ValueError, match="size"):
+        speakers.validate_weights(weights)
+
+
 # Realtime voice sessions
 
 
