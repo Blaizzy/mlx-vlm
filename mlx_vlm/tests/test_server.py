@@ -6356,7 +6356,7 @@ def test_diarization_one_session_per_recording_keeps_global_ids(
         assert response.status_code == 200, response.text
         assert response.json() == {
             "model": speakers.DIARIZATION_MODEL,
-            "revision": speakers.DIARIZATION_REVISION,
+            "revision": None,
             "segments": [
                 {"start": 0, "end": 30, "speaker": 7},
                 {"start": 30, "end": 40, "speaker": 2},
@@ -6367,7 +6367,7 @@ def test_diarization_one_session_per_recording_keeps_global_ids(
     loader.assert_called_with(
         speakers.DIARIZATION_MODEL,
         model_kind="audio_diarization",
-        revision=speakers.DIARIZATION_REVISION,
+        revision=None,
     )
     assert (
         audio_client.get("/metrics").json()["latest"]["endpoint"]
@@ -6435,6 +6435,8 @@ def test_speaker_embedding_keeps_window_boundaries_and_weighted_normalization(
     assert response.status_code == 200, response.text
     assert calls == [(48000, 16000), (64000, 16000)]
     result = response.json()
+    assert result["model"] == "nativ-community/SpeechBrain-ECAPA-VoxCeleb-20M"
+    assert result["revision"] is None
     np.testing.assert_allclose(result["embedding"][:2], [0.6, 0.8], rtol=1e-6)
     assert len(result["embedding"]) == 192 and result["duration"] == 7
 
@@ -7301,6 +7303,8 @@ def test_diarized_transcription_openai_contract_and_global_speakers(
         segments = result["segments"]
     assert result["task"] == "transcribe" and result["duration"] == 61
     assert result["diarization"]["speaker_ids"] == {"A": 2, "B": 7}
+    assert result["diarization"]["model"] == "nativ-community/Nemotron-3-Diarization"
+    assert result["diarization"]["revision"] is None
     assert [s["speaker"] for s in segments] == ["B", "B", "B"]
     assert len({s["id"] for s in segments}) == 3
     assert all(s["type"] == "transcript.text.segment" for s in segments)

@@ -18,10 +18,8 @@ from fastapi import HTTPException, Request
 
 from .runtime import runtime
 
-DIARIZATION_MODEL = "mlx-community/Nemotron-3-Diarization"
-DIARIZATION_REVISION = "59ed2dbfc1346dcea9d423c71306a3a2499c568f"
-EMBEDDING_MODEL = "aufklarer/SpeechBrain-ECAPA-VoxCeleb-20M-MLX"
-EMBEDDING_REVISION = "e749e6e08557f4a3ceb6ce3bf6f0b79efe592a77"
+DIARIZATION_MODEL = "nativ-community/Nemotron-3-Diarization"
+EMBEDDING_MODEL = "nativ-community/SpeechBrain-ECAPA-VoxCeleb-20M"
 WEIGHTS_SHA256 = "76ea14d750a69f900c1545d586f8069f1805c38e7226a2eebf4c90b4dd5804c3"
 WEIGHTS_BYTES = 41637032
 EMBEDDING_DIMENSION = 192
@@ -126,15 +124,11 @@ async def _parse(
     audio = tempfile.NamedTemporaryFile()
     try:
         async with request.form() as form:
-            default_model, default_revision = (
-                (DIARIZATION_MODEL, DIARIZATION_REVISION)
-                if kind == "diarization"
-                else (EMBEDDING_MODEL, EMBEDDING_REVISION)
+            default_model = (
+                DIARIZATION_MODEL if kind == "diarization" else EMBEDDING_MODEL
             )
             model = form.get(model_key, default_model)
-            revision = form.get(revision_key) or (
-                default_revision if model == default_model else None
-            )
+            revision = form.get(revision_key) or None
             if (
                 not isinstance(model, str)
                 or not model.strip()
@@ -218,7 +212,7 @@ def load_speaker_model(model_id: str, kind: str, revision: str | None):
     from mlx_audio.codec import EcapaSpeakerEmbeddingExtractor
 
     weights = Path(hf_hub_download(model_id, "model.safetensors", revision=revision))
-    if model_id == EMBEDDING_MODEL and revision == EMBEDDING_REVISION:
+    if model_id == EMBEDDING_MODEL and revision in (None, "main"):
         validate_weights(weights)
     return EcapaSpeakerEmbeddingExtractor.from_pretrained(weights)
 
