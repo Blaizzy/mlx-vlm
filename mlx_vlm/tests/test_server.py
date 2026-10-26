@@ -6612,26 +6612,6 @@ def test_speaker_encoder_rejects_invalid_vectors(value):
         normalized(value)
 
 
-def test_speaker_default_checkpoint_is_verified_before_loading(tmp_path, monkeypatch):
-    import hashlib
-
-    from mlx_vlm.server import audio_speakers as speakers
-
-    weights = tmp_path / "model.safetensors"
-    weights.write_bytes(b"model")
-    monkeypatch.setattr(speakers, "WEIGHTS_BYTES", 5)
-    monkeypatch.setattr(
-        speakers, "WEIGHTS_SHA256", hashlib.sha256(b"model").hexdigest()
-    )
-    speakers.validate_weights(weights)
-    weights.write_bytes(b"other")
-    with pytest.raises(ValueError, match="checksum"):
-        speakers.validate_weights(weights)
-    weights.write_bytes(b"shorter")
-    with pytest.raises(ValueError, match="size"):
-        speakers.validate_weights(weights)
-
-
 # Realtime voice sessions
 
 

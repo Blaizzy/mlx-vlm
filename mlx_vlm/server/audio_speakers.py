@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import math
 import tempfile
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import BinaryIO
 
 import mlx.core as mx
@@ -20,8 +18,6 @@ from .runtime import runtime
 
 DIARIZATION_MODEL = "nativ-community/Nemotron-3-Diarization"
 EMBEDDING_MODEL = "nativ-community/SpeechBrain-ECAPA-VoxCeleb-20M"
-WEIGHTS_SHA256 = "76ea14d750a69f900c1545d586f8069f1805c38e7226a2eebf4c90b4dd5804c3"
-WEIGHTS_BYTES = 41637032
 EMBEDDING_DIMENSION = 192
 SAMPLE_RATE = 16000
 READ_SAMPLES = 30 * SAMPLE_RATE
@@ -208,13 +204,9 @@ def load_speaker_model(model_id: str, kind: str, revision: str | None):
         from mlx_audio.vad import load
 
         return load(model_id, revision=revision, strict=True)
-    from huggingface_hub import hf_hub_download
     from mlx_audio.codec import EcapaSpeakerEmbeddingExtractor
 
-    weights = Path(hf_hub_download(model_id, "model.safetensors", revision=revision))
-    if model_id == EMBEDDING_MODEL and revision in (None, "main"):
-        validate_weights(weights)
-    return EcapaSpeakerEmbeddingExtractor.from_pretrained(weights)
+    return EcapaSpeakerEmbeddingExtractor.from_pretrained(model_id, revision=revision)
 
 
 def _check_cancelled(request):
@@ -326,17 +318,6 @@ def normalized(vector):
     if not math.isfinite(norm) or norm < 1e-8:
         raise ValueError("The speaker encoder returned an empty embedding.")
     return vector / norm
-
-
-def validate_weights(path: Path) -> None:
-    if path.stat().st_size != WEIGHTS_BYTES:
-        raise ValueError("The ECAPA speaker model has an unexpected size.")
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    if digest.hexdigest() != WEIGHTS_SHA256:
-        raise ValueError("The ECAPA speaker model failed checksum verification.")
 
 
 def diarize_segments(request, model):
