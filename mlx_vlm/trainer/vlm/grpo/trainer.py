@@ -242,6 +242,22 @@ def make_task(
         metrics["num_reference_tokens"] = mx.array(
             batch["input_ids"].size - 1 if args.beta else 0
         )
+        if args.mtp_loss_weight:
+            from mlx_vlm.trainer.vlm.sft.mtp import add_mtp_loss
+
+            # Only generated tokens supervise MTP; reference scores and reward
+            # advantages continue to use the original GRPO objective.
+            completion_mask = mx.broadcast_to(
+                mx.arange(batch["input_ids"].shape[1])[None, :] > start,
+                batch["input_ids"].shape,
+            )
+            return add_mtp_loss(
+                policy,
+                {**batch, "completion_mask": completion_mask},
+                loss,
+                metrics,
+                args.mtp_loss_weight,
+            )
         return loss, metrics
 
     def compute_rollout(policy, rollout, compute, with_grad=False):
