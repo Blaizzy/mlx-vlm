@@ -261,6 +261,7 @@ def aligned_words(result, duration):
 
 
 def stitch(accumulated, incoming, window, previous):
+    """Align the unpublished overlap, preserving match and timestamp tie-breaking."""
     if (
         previous is None
         or previous.end != window.start
@@ -279,6 +280,8 @@ def stitch(accumulated, incoming, window, previous):
     scores = [[(0, 0.0) for _ in range(len(right) + 1)] for _ in range(len(left) + 1)]
     steps = {}
     normalize = lambda w: "".join(c for c in w.text.lower() if c.isalnum())
+    left_text = [normalize(accumulated[i]) for i in left]
+    right_text = [normalize(incoming[i]) for i in right]
     for i, li in enumerate(left, 1):
         for j, ri in enumerate(right, 1):
             best, step = scores[i - 1][j], 1
@@ -286,7 +289,11 @@ def stitch(accumulated, incoming, window, previous):
                 best, step = scores[i][j - 1], 2
             a, b = accumulated[li], incoming[ri]
             difference = abs(a.midpoint - b.midpoint)
-            if normalize(a) and normalize(a) == normalize(b) and difference <= 0.75:
+            if (
+                left_text[i - 1]
+                and left_text[i - 1] == right_text[j - 1]
+                and difference <= 0.75
+            ):
                 before = scores[i - 1][j - 1]
                 match = (before[0] + 1, before[1] - difference)
                 if match > best:
@@ -390,7 +397,7 @@ def run_request(request, get_cached_model):
     if payload.include_diarization:
         request.emit_data({"type": "diarization.completed", "diarization": metadata})
     windows = transcription_windows(segments, duration)
-    words, previous, emitted, segment_count, text_parts = [], None, 0, 0, []
+    words, previous, segment_count, text_parts = [], None, 0, []
     model = None
     if windows:
         model, _, _ = get_cached_model(request.model_name, model_kind="audio_stt")
@@ -425,11 +432,11 @@ def run_request(request, get_cached_model):
             cutoff = (
                 windows[index + 1].audio_start if index + 1 < len(windows) else math.inf
             )
-            stable = emitted
+            stable = 0
             while stable < len(words) and words[stable].midpoint < cutoff:
                 stable += 1
             turns = []
-            for word in words[emitted:stable]:
+            for word in words[:stable]:
                 ids = speakers_for_word(word, segments)
                 text_parts.append(
                     ("" if not text_parts or word.joins_previous else " ") + word.text
@@ -465,7 +472,9 @@ def run_request(request, get_cached_model):
                     event["speakers"] = [labels[s] for s in ids]
                 request.emit_data(event)
                 segment_count += 1
-            emitted = stable
+            # Published words cannot participate in the next overlap. Release
+            # them so alignment work and retained timings stay window-sized.
+            del words[:stable]
     done = {
         "type": "transcript.text.done",
         "task": "transcribe",

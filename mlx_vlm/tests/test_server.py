@@ -7532,6 +7532,90 @@ def test_diarized_overlap_keeps_repeated_words_and_immutable_prefix():
     assert prior[0] is stable
 
 
+def test_diarized_worker_releases_published_words_without_changing_segments(
+    monkeypatch,
+):
+    from mlx_vlm.server import audio_diarized as pipeline
+
+    windows = [
+        pipeline.Window(0, 26, 0, 28),
+        pipeline.Window(26, 52, 24, 54),
+        pipeline.Window(52, 78, 50, 78),
+        pipeline.Window(90, 92, 90, 92),
+    ]
+    chunks = iter(
+        [
+            [("Hello", 1), ("go", 23), ("go", 24), ("home", 25), ("old", 26)],
+            [("go", 0.1), ("home", 1.1), ("now", 2.1), ("old", 26), ("stale", 29)],
+            [("unmatched", 0.1), ("overlap", 1.1), ("here", 2.1), ("!", 2.3)],
+            [("Bye", 0.25)],
+        ]
+    )
+
+    def transcribe(*args, **kwargs):
+        words = [
+            {"word": text, "start": start, "end": start + (0 if text == "!" else 0.2)}
+            for text, start in next(chunks)
+        ]
+        return {
+            "text": " ".join(w["word"] for w in words).replace(" !", "!"),
+            "words": words,
+        }
+
+    monkeypatch.setattr(pipeline, "transcription_windows", lambda *args: windows)
+    monkeypatch.setattr(
+        pipeline,
+        "diarize_segments",
+        lambda *args: [
+            {"start": 0, "end": 78, "speaker": 7},
+            {"start": 90, "end": 92, "speaker": 2},
+        ],
+    )
+    stitch, retained = pipeline.stitch, []
+
+    def check_pending(words, incoming, window, previous):
+        retained.append(len(words))
+        assert all(w.midpoint >= window.audio_start for w in words)
+        stitch(words, incoming, window, previous)
+
+    monkeypatch.setattr(pipeline, "stitch", check_pending)
+    request = server_audio.AudioInferenceRequest(
+        kind="diarized_stt",
+        model_name="test-stt",
+        payload=NS(
+            sample_count=92 * 16000,
+            revision=None,
+            diarization_model="test-diarization",
+            include_diarization=True,
+            transcription=server_audio.AudioTranscriptionRequest(model="test-stt"),
+            chunks=lambda check: [],
+            read_window=lambda start, end: np.zeros(512, dtype="<f4"),
+        ),
+    )
+    events = []
+    request.emit_data = events.append
+    pipeline.run_request(
+        request, lambda *a, **kw: (NS(generate=transcribe), None, None)
+    )
+    segments = events[1:-1]
+    assert retained == [0, 3, 2, 0]
+    assert [s["text"] for s in segments] == [
+        "Hello",
+        "go",
+        "go home now",
+        "old",
+        "here!",
+        "Bye",
+    ]
+    assert [s["id"] for s in segments] == [f"seg_{i:06d}" for i in range(6)]
+    assert [s["speaker"] for s in segments] == ["B"] * 5 + ["A"]
+    assert [s["start"] for s in segments] == pytest.approx([1, 23, 24, 50, 52.1, 90.25])
+    assert [s["end"] for s in segments] == pytest.approx(
+        [1.2, 23.2, 26.3, 50.2, 52.3, 90.45]
+    )
+    assert events[-1]["text"] == "Hello go go home now old here! Bye"
+
+
 def test_diarized_aligned_tokens_keep_punctuation_and_no_space_languages():
     from mlx_vlm.server.audio_diarized import aligned_words
 
