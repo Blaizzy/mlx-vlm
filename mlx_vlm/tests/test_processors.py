@@ -2222,6 +2222,19 @@ def test_prompt_does_not_leak_image_payload(representation):
 
 
 class TestApplyChatTemplateIntegration:
+    def test_lfm3_audio_puts_the_audio_before_the_text(self):
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "lfm3_audio"},
+            "What is said?",
+            return_messages=True,
+            num_images=0,
+            num_audios=1,
+        )
+        assert [item["type"] for item in result[0]["content"]] == ["audio", "text"]
+
     def test_assistant_reasoning_content_is_preserved(self):
         messages = [
             {"role": "user", "content": "What is 17 + 25?"},
@@ -4462,3 +4475,64 @@ def test_lfm3_vl_chat_messages_carry_videos():
         return_messages=True,
     )
     assert [item["type"] for item in messages[0]["content"]] == ["video", "text"]
+
+
+def test_lfm3_audio_processor_expands_speech_placeholders():
+    from mlx_vlm.models.lfm3_audio.processing_lfm3_audio import Lfm3AudioProcessor
+    from mlx_vlm.utils import prepare_inputs
+
+    class Tokenizer:
+        pad_token = "<pad>"
+
+        def convert_tokens_to_ids(self, tokens):
+            return [1, 2]
+
+        def __call__(self, texts, **kwargs):
+            self.texts = texts
+            return {"input_ids": [[0]] * len(texts)}
+
+    processor = Lfm3AudioProcessor(Tokenizer())
+    assert processor.additional_eos_token_ids == [1, 2]
+    clips = [np.zeros(16000, np.float32), np.zeros(5921, np.float32)]
+    out = processor(
+        text="a<|audio|>b<|audio|><|audio_out|>c",
+        audio=clips,
+        audio_out_codes=[np.ones((3, 12))],
+    )
+    # 99 and 36 feature frames -> 13 and 5 encoder tokens; 3 frames + EOS frame
+    assert processor.tokenizer.texts == [
+        "a" + "<|audio|>" * 13 + "b" + "<|audio|>" * 5 + "<|audio_out|>" * 4 + "c"
+    ]
+    assert out["input_features"].shape == (2, 128, 99)
+    assert out["feature_attention_mask"].sum(-1).tolist() == [99, 36]
+    assert out["audio_out_codes"].tolist() == [[1] * 12] * 3 + [[2016] * 12]
+    with pytest.raises(ValueError, match="placeholders"):
+        processor(text="<|audio|>", audio=clips)
+    # codebook-major [12, frames] codes (result.audio_tokens) are refused
+    with pytest.raises(ValueError, match=r"\[frames, 12\]"):
+        processor(text="<|audio_out|>", audio_out_codes=[np.ones((12, 3))])
+    # prior speech without user audio still goes through the processor
+    inputs = prepare_inputs(
+        processor, prompts="<|audio_out|>c", audio_out_codes=[np.ones((2, 12))]
+    )
+    assert processor.tokenizer.texts == ["<|audio_out|>" * 3 + "c"]
+    assert inputs["audio_out_codes"].shape == (3, 12)
+    # every clip reaches the processor, one per <|audio|>
+    with patch("mlx_vlm.utils.load_audio", side_effect=lambda clip, sr: clip):
+        inputs = prepare_inputs(processor, audio=clips, prompts="<|audio|><|audio|>")
+    assert inputs["feature_attention_mask"].shape == (2, 99)
+
+
+def test_load_processor_keeps_processor_stop_ids():
+    processor = SimpleNamespace(
+        additional_eos_token_ids=[9], tokenizer=SimpleNamespace()
+    )
+    with (
+        patch("mlx_vlm.utils.AutoProcessor.from_pretrained", return_value=processor),
+        patch("mlx_vlm.utils.load_tokenizer", return_value=lambda tokenizer: None),
+    ):
+        load_processor(Path("/tmp/model"), eos_token_ids=[2])
+    criteria = processor.tokenizer.stopping_criteria
+    assert criteria.eos_token_ids == [2, 9]
+    criteria.reset([5])
+    assert criteria.eos_token_ids == [5, 9]
