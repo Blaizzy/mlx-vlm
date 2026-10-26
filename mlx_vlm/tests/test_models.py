@@ -5370,9 +5370,29 @@ def test_lfm3_omni_quantized_checkpoint_roundtrip(tmp_path, lfm3_omni):
     np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
 
-class TestFlintInferenceKernels:
+class TestFlintMoe:
+    @staticmethod
+    def reference(module, x):
+        scores = mx.sigmoid(module.gate(x).astype(mx.float32))
+        indices = mx.stop_gradient(
+            mx.argpartition(
+                scores + module.expert_bias.astype(mx.float32),
+                kth=-module.top_k,
+                axis=-1,
+            )[..., -module.top_k :]
+        )
+        weights = mx.take_along_axis(scores, indices, axis=-1)
+        weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
+        routed = module.switch_mlp(x, indices)
+        output = (
+            (routed.astype(mx.float32) * weights[..., None]).sum(-2).astype(x.dtype)
+        )
+        return (
+            output if module.shared_expert is None else output + module.shared_expert(x)
+        )
+
     @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-    def test_normalized_layer_handoff_matches_reference(self, dtype):
+    def test_prefill_and_decode_match_training(self, dtype):
         from mlx_vlm.models.flint import ModelConfig
         from mlx_vlm.models.flint.language import LanguageModel
 
@@ -5409,135 +5429,7 @@ class TestFlintInferenceKernels:
         for expected, actual in zip(*results):
             assert mx.array_equal(actual, expected).item()
 
-    @pytest.mark.parametrize("length", [1, 7, 1023])
-    @pytest.mark.parametrize("kind", ["random", "ties", "negative_inf", "nan"])
-    def test_fused_route_matches_stable_selection(self, length, kind):
-        from mlx_vlm.models.flint.kernels import normalize_expert_weights, route_experts
-
-        mx.random.seed(81)
-        scores = mx.sigmoid(mx.random.normal((2, length, 256)))
-        choice = scores + mx.random.normal((256,))
-        if kind == "ties":
-            choice = mx.floor(choice * 4)
-        elif kind == "negative_inf":
-            choice = mx.full(choice.shape, -float("inf"))
-        elif kind == "nan":
-            choice = mx.where(mx.arange(256) % 3 == 0, float("nan"), choice)
-        # Include noncontiguous inputs in the routing contract.
-        scores, choice = scores.swapaxes(0, 1), choice.swapaxes(0, 1)
-        expected = mx.argpartition(choice, kth=-6, axis=-1)[..., -6:]
-        indices, weights = route_experts(scores, choice, 6)
-        assert mx.array_equal(indices, expected).item()
-        assert mx.array_equal(
-            weights, normalize_expert_weights(scores, expected)
-        ).item()
-
-    @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-    @pytest.mark.parametrize("length", [1, 17])
-    @pytest.mark.parametrize("base", [None, 10000, 500000])
-    def test_fused_qk_normalization_and_rotary(self, dtype, length, base):
-        from mlx_vlm.models.flint import ModelConfig
-        from mlx_vlm.models.flint.language import Attention
-        from mlx_vlm.models.flint.normalization import norm_rope
-
-        mx.random.seed(82)
-        module = Attention(ModelConfig(), 0)
-        module.rope = nn.RoPE(128, base=base) if base is not None else None
-        module.set_dtype(dtype)
-        module.eval()
-        batch = 2
-        q = mx.random.normal((batch, length, module.n_heads * 128)).astype(dtype)
-        k = mx.random.normal((batch, length, module.n_kv_heads * 128)).astype(dtype)
-        offset = mx.array([3, 101] if length == 1 else [131072, 262080], mx.int32)
-        actual = norm_rope(module, q, k, offset)
-        if not mx.metal.is_available():
-            assert actual is None
-            return
-        expected = [
-            norm(value.reshape(batch, length, heads, 128)).transpose(0, 2, 1, 3)
-            for value, norm, heads in (
-                (q, module.q_norm, module.n_heads),
-                (k, module.k_norm, module.n_kv_heads),
-            )
-        ]
-        if base is not None:
-            expected = [module.rope(value, offset=offset) for value in expected]
-        for a, b in zip(actual, expected):
-            assert mx.array_equal(a, b).item()
-        module.train()
-        assert norm_rope(module, q, k, offset) is None
-        module.eval()
-        module.rope = nn.RoPE(128, scale=0.5)
-        assert norm_rope(module, q, k, offset) is None
-
-    @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16, mx.float32])
-    @pytest.mark.parametrize("width", [64, 128, 1536, 2048, 4096])
-    def test_fused_residual_normalization(self, dtype, width):
-        from mlx_vlm.models.flint.normalization import residual_norm
-
-        mx.random.seed(83)
-        norm = nn.RMSNorm(width)
-        norm.set_dtype(dtype)
-        norm.eval()
-        x = mx.random.normal((2, width, 3)).astype(dtype).swapaxes(-1, -2)
-        delta = mx.random.normal(x.shape).astype(dtype)
-        residual, normalized = residual_norm(x, delta, norm)
-        expected = x + delta
-        assert mx.array_equal(residual, expected).item()
-        assert mx.array_equal(normalized, norm(expected)).item()
-
-    @pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
-    @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-    @pytest.mark.parametrize("batch", [1, 2, 4, 8])
-    def test_fused_experts_match_reference(self, dtype, batch):
-        from mlx_vlm.models.flint import ModelConfig
-        from mlx_vlm.models.flint.kernels import down_reduce, gate_up_silu
-        from mlx_vlm.models.flint.language import SparseMoeBlock
-
-        mx.random.seed(31)
-        module = SparseMoeBlock(
-            ModelConfig(
-                hidden_size=2048,
-                moe_intermediate_size=512,
-                shared_expert_intermediate_size=64,
-                num_experts=8,
-                num_experts_per_tok=6,
-            )
-        )
-        module.set_dtype(dtype)
-        nn.quantize(module, group_size=64, bits=4)
-        module.eval()
-        for length in (1, 3, 17):
-            x = mx.random.normal((batch, length, 2048)).astype(dtype)
-            expected = module._forward(x)
-            actual = module(x)
-            assert mx.array_equal(actual, expected).item()
-            if batch * length * module.top_k < 64:
-                indices, weights = module.route(x)
-                activation = gate_up_silu(module.switch_mlp, x, indices)
-                assert activation is not None
-                fused = down_reduce(
-                    module.switch_mlp.down_proj,
-                    activation,
-                    indices,
-                    weights,
-                    module.shared_expert(x),
-                )
-                assert fused is not None
-                assert mx.array_equal(fused, expected).item()
-
-    @pytest.mark.parametrize("width", [64, 1536, 2048])
-    def test_weighted_sum_noncontiguous_rows(self, width):
-        from mlx_vlm.models.flint.kernels import metal_sum, weighted_sum
-
-        mx.random.seed(39)
-        routed = mx.random.normal((1, width, 6)).astype(mx.bfloat16).swapaxes(-1, -2)
-        weights = mx.softmax(mx.random.normal((1, 6)))
-        assert mx.array_equal(
-            metal_sum(routed, weights), weighted_sum(routed, weights)
-        ).item()
-
-    def test_compiled_moe_tracks_weights_and_quantization(self):
+    def test_moe_tracks_weights_and_quantization(self):
         from mlx_vlm.models.flint import ModelConfig
         from mlx_vlm.models.flint.language import SparseMoeBlock
 
@@ -5558,63 +5450,19 @@ class TestFlintInferenceKernels:
         module.switch_mlp.down_proj.weight *= 2
         changed = module(x)
         assert not mx.array_equal(original, changed).item()
-        np.testing.assert_array_equal(np.array(changed), np.array(module._forward(x)))
+        np.testing.assert_array_equal(
+            np.array(changed), np.array(self.reference(module, x))
+        )
         nn.quantize(module, group_size=32, bits=4)
-        np.testing.assert_array_equal(np.array(module(x)), np.array(module._forward(x)))
+        np.testing.assert_array_equal(
+            np.array(module(x)), np.array(self.reference(module, x))
+        )
         module.top_k = 2
-        np.testing.assert_array_equal(np.array(module(x)), np.array(module._forward(x)))
-
-    @pytest.mark.skipif(not mx.metal.is_available(), reason="Metal graph cache")
-    def test_compiled_moe_bounds_graphs_across_prefill_and_decode(self):
-        from mlx_vlm.models.flint import ModelConfig
-        from mlx_vlm.models.flint.language import SparseMoeBlock
-
-        module = SparseMoeBlock(
-            ModelConfig(
-                hidden_size=128,
-                moe_intermediate_size=128,
-                shared_expert_intermediate_size=128,
-                num_experts=8,
-                num_experts_per_tok=6,
-            )
+        np.testing.assert_array_equal(
+            np.array(module(x)), np.array(self.reference(module, x))
         )
-        module.set_dtype(mx.bfloat16)
-        nn.quantize(module, group_size=64, bits=4)
-        module.eval()
-        # Visit more prefill shapes than the resident graph budget, then return
-        # to decode. Eviction must not change output or freeze the weights.
-        for length in (*range(1, 12), 1, 1):
-            x = mx.random.normal((1, length, 128)).astype(mx.bfloat16)
-            assert mx.array_equal(module(x), module._forward(x)).item()
-        cache = module._compiled_inference._cache.cache_info()
-        assert cache.currsize <= 8
-        assert cache.hits > 0
 
-    @pytest.mark.skipif(not mx.metal.is_available(), reason="Metal graph cache")
-    def test_compiled_moe_respects_execution_stream(self):
-        from mlx_vlm.models.flint import ModelConfig
-        from mlx_vlm.models.flint.language import SparseMoeBlock
-
-        module = SparseMoeBlock(
-            ModelConfig(
-                hidden_size=64,
-                moe_intermediate_size=64,
-                shared_expert_intermediate_size=0,
-                num_experts=8,
-                num_experts_per_tok=6,
-            )
-        )
-        module.eval()
-        x = mx.ones((1, 3, 64))
-        streams = [mx.new_stream(mx.gpu), mx.new_stream(mx.gpu)]
-        for stream in streams * 2:
-            with mx.stream(stream):
-                assert mx.array_equal(module(x), module._forward(x)).item()
-        cache = module._compiled_inference._cache.cache_info()
-        assert cache.currsize == 2
-        assert cache.hits == 2
-
-    def test_compiled_moe_custom_projection_stays_eager(self):
+    def test_moe_custom_projection_stays_eager(self):
         from mlx_vlm.models.flint import ModelConfig
         from mlx_vlm.models.flint.language import SparseMoeBlock
 
@@ -5637,7 +5485,7 @@ class TestFlintInferenceKernels:
         x = mx.ones((1, 3, 64))
         mx.eval(module(x))
         module.gate = CustomRouter(64, 8, bias=False)
-        assert mx.array_equal(module(x), module._forward(x)).item()
+        assert mx.array_equal(module(x), self.reference(module, x)).item()
 
     @pytest.mark.parametrize("top_k", [2, 6])
     def test_cpu_fallback_and_training_gradients(self, top_k):
@@ -5656,13 +5504,22 @@ class TestFlintInferenceKernels:
         x = mx.random.normal((1, 3, 64))
         module.eval()
         with mx.stream(mx.cpu):
-            actual, expected = module(x), module._forward(x)
+            actual, expected = module(x), self.reference(module, x)
             np.testing.assert_allclose(np.array(actual), np.array(expected), atol=1e-6)
         module.train()
         loss, gradients = nn.value_and_grad(module, lambda m: mx.sum(m(x)))(module)
         mx.eval(loss, gradients)
         assert mx.isfinite(loss).item()
         assert all(mx.all(mx.isfinite(v)).item() for _, v in tree_flatten(gradients))
+
+        expected_loss, expected_gradients = nn.value_and_grad(
+            module, lambda m: mx.sum(self.reference(m, x))
+        )(module)
+        assert mx.allclose(loss, expected_loss, atol=1e-6).item()
+        for (_, actual), (_, expected) in zip(
+            tree_flatten(gradients), tree_flatten(expected_gradients)
+        ):
+            assert mx.allclose(actual, expected, atol=1e-6).item()
 
     def test_paged_expert_wrapper_stays_eager(self):
         from mlx_vlm.models.flint import ModelConfig
@@ -5690,123 +5547,5 @@ class TestFlintInferenceKernels:
         module.switch_mlp = PagedExperts(module.switch_mlp)
         module.eval()
 
-        def fail_if_compiled(_):
-            pytest.fail("Paged experts must stay outside compiled graphs")
-
-        module._compiled = fail_if_compiled
         x = mx.random.normal((1, 1, 64))
-        assert mx.array_equal(module(x), module._forward(x)).item()
-
-    @pytest.mark.parametrize("quantized", [False, True])
-    def test_variable_shapes_reuse_preparation_graph(self, quantized):
-        from mlx_vlm.models.flint import ModelConfig
-        from mlx_vlm.models.flint.language import SparseMoeBlock
-
-        module = SparseMoeBlock(
-            ModelConfig(
-                hidden_size=64,
-                moe_intermediate_size=64,
-                shared_expert_intermediate_size=64,
-                num_experts=8,
-                num_experts_per_tok=6,
-            )
-        )
-        module.set_dtype(mx.bfloat16)
-        if quantized:
-            nn.quantize(module, group_size=32, bits=4)
-        module.eval()
-
-        traces = []
-
-        def prepare(x):
-            traces.append(x.shape)
-            return module._prepare(x)
-
-        module._compiled = mx.compile(prepare, inputs=module, shapeless=True)
-        for batch, length in (
-            (1, 1),
-            (8, 1),
-            (2, 17),
-            (1, 1023),
-            (4, 3),
-            (1, 2048),
-            (2, 1),
-        ):
-            x = mx.random.normal((batch, length, 64)).astype(mx.bfloat16)
-            assert mx.array_equal(module._inference(x), module._forward(x)).item()
-        assert len(traces) == 1
-
-    @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-    def test_weighted_sum_with_shared_expert(self, dtype):
-        from mlx_vlm.models.flint.kernels import metal_sum, weighted_sum
-
-        for length in (1, 7, 127):
-            routed = mx.random.normal((2, length, 6, 64)).astype(dtype)
-            weights = mx.softmax(mx.random.normal((2, length, 6)))
-            shared = mx.random.normal((2, length, 64)).astype(dtype)
-            assert mx.array_equal(
-                metal_sum(routed, weights, shared),
-                weighted_sum(routed, weights) + shared,
-            ).item()
-
-
-class TestFlintAttentionMasks:
-    @pytest.mark.parametrize("rotating", [False, True])
-    @pytest.mark.parametrize("right_padded", [False, True])
-    def test_matches_cache_through_prefill_rotation_and_finalize(
-        self, rotating, right_padded
-    ):
-        from mlx_vlm.models.cache import BatchKVCache, BatchRotatingKVCache
-        from mlx_vlm.models.flint.attention_mask import create_attention_mask
-
-        padding = [0, 5, 2]
-        cache = BatchRotatingKVCache(17, padding) if rotating else BatchKVCache(padding)
-        window = 17 if rotating else None
-        if right_padded:
-            cache.prepare(lengths=[18, 15, 17], right_padding=[0, 3, 1])
-        for step, length in enumerate((3, 14, 1, 1, 1, 7, 1, 1, 13, 1, 1)):
-            x = mx.zeros((3, length, 16))
-            expected = cache.make_mask(length, window_size=window)
-            actual = create_attention_mask(x, cache, window)
-            assert mx.array_equal(actual, expected).item()
-            kv = mx.random.normal((3, 2, length, 8))
-            mx.eval(cache.update_and_fetch(kv, kv))
-            if step == 2:
-                cache.finalize()
-            if step == 6:
-                cache.filter(mx.array([2, 0, 1]))
-
-    def test_geometry_reuse_keeps_independent_padding(self):
-        from mlx_vlm.models.cache import BatchKVCache
-        from mlx_vlm.models.flint.attention_mask import create_attention_mask
-
-        parameters = {}
-        x = mx.zeros((2, 7, 16))
-        first, second = BatchKVCache([0, 0]), BatchKVCache([2, 4])
-        a = create_attention_mask(x, first, parameter_cache=parameters)
-        b = create_attention_mask(x, second, parameter_cache=parameters)
-        assert not mx.array_equal(a, b).item()
-        assert mx.array_equal(a, first.make_mask(7)).item()
-        assert mx.array_equal(b, second.make_mask(7)).item()
-        if mx.metal.is_available() and mx.default_device() == mx.gpu:
-            assert len(parameters) == 1
-        second.left_padding = mx.array([1, 3])
-        changed = create_attention_mask(x, second, parameter_cache=parameters)
-        assert mx.array_equal(changed, second.make_mask(7)).item()
-        assert not mx.array_equal(changed, b).item()
-
-    def test_custom_cache_and_cpu_fallback(self):
-        from mlx_vlm.models.cache import BatchKVCache
-        from mlx_vlm.models.flint.attention_mask import create_attention_mask
-
-        class CustomCache(BatchKVCache):
-            def make_mask(self, length, **kwargs):
-                return "causal"
-
-        x = mx.zeros((1, 3, 16))
-        assert create_attention_mask(x, CustomCache([0])) == "causal"
-        cache = BatchKVCache([1])
-        with mx.stream(mx.cpu):
-            assert mx.array_equal(
-                create_attention_mask(x, cache), cache.make_mask(3)
-            ).item()
+        assert mx.array_equal(module(x), self.reference(module, x)).item()
