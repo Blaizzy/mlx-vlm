@@ -48,6 +48,7 @@ class TrainingArgs:
     grad_clip: float | None = field(default=1.0)
     full_finetune: bool = field(default=False)
     gradient_accumulation_steps: int = field(default=1)
+    mtp_loss_weight: float = field(default=0.0, kw_only=True)
 
 
 def grad_checkpoint(layer):

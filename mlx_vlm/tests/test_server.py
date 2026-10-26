@@ -6306,6 +6306,430 @@ def test_audio_transcriptions_undecodable_upload_returns_400(audio_client, monke
     assert "Invalid audio file" in response.json()["detail"]
 
 
+# Speaker analysis uses the same queue and model registry as other audio work.
+
+
+def _speaker_upload(client, kind, samples=None, **fields):
+    if samples is None:
+        samples = np.full(3 * 16000, 0.1, dtype="<f4")
+    return client.post(
+        f"/v1/audio/{kind}",
+        files={"file": ("audio.f32", samples.tobytes(), "application/octet-stream")},
+        data={"input_format": "pcm_f32le", **fields},
+    )
+
+
+@pytest.mark.parametrize("endpoint", ["diarizations", "speaker_embeddings"])
+def test_speaker_endpoints_require_configured_api_key(
+    audio_client, monkeypatch, endpoint
+):
+    monkeypatch.setenv("MLX_VLM_SERVER_API_KEY", "secret-test-key")
+    response = audio_client.post(f"/v1/audio/{endpoint}")
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+
+
+def test_diarization_one_session_per_recording_keeps_global_ids(
+    audio_client, monkeypatch
+):
+    from mlx_vlm.server import audio_speakers as speakers
+
+    calls = []
+
+    def stream(chunks, sample_rate):
+        seen = []
+        calls.append(seen)
+        for chunk, turns in zip(
+            chunks,
+            [[(0, 30, 7)], [(30, 40, 2), (40, 60, 7)], [(60, 61, 7)]],
+            strict=True,
+        ):
+            seen.append(len(chunk))
+            yield NS(segments=[NS(start=a, end=b, speaker=c) for a, b, c in turns])
+
+    loader = Mock(return_value=(NS(generate_stream=stream), None, None))
+    monkeypatch.setattr(server, "get_cached_model", loader)
+    for _ in range(2):
+        response = _speaker_upload(
+            audio_client, "diarizations", np.zeros(61 * 16000, dtype="<f4")
+        )
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "model": speakers.DIARIZATION_MODEL,
+            "revision": None,
+            "segments": [
+                {"start": 0, "end": 30, "speaker": 7},
+                {"start": 30, "end": 40, "speaker": 2},
+                {"start": 40, "end": 61, "speaker": 7},
+            ],
+        }
+    assert calls == [[480000, 480000, 16000]] * 2
+    loader.assert_called_with(
+        speakers.DIARIZATION_MODEL,
+        model_kind="audio_diarization",
+        revision=None,
+    )
+    assert (
+        audio_client.get("/metrics").json()["latest"]["endpoint"]
+        == "/v1/audio/diarizations"
+    )
+
+
+def test_diarization_decodes_and_resamples_wav(audio_client, monkeypatch):
+    import io
+
+    from mlx_audio.audio_io import write
+
+    source = io.BytesIO()
+    write(source, np.full((8000, 2), 0.1, dtype=np.float32), 8000, format="wav")
+    observed = []
+
+    def stream(chunks, sample_rate):
+        observed.extend((len(chunk), sample_rate) for chunk in chunks)
+        yield NS(segments=[NS(start=0, end=1, speaker=4)])
+
+    monkeypatch.setattr(
+        server,
+        "get_cached_model",
+        Mock(return_value=(NS(generate_stream=stream), None, None)),
+    )
+    response = audio_client.post(
+        "/audio/diarizations",
+        files={"file": ("clip.wav", source.getvalue(), "audio/wav")},
+    )
+    assert response.status_code == 200, response.text
+    assert observed == [(16000, 16000)]
+    assert response.json()["segments"] == [{"start": 0, "end": 1, "speaker": 4}]
+
+
+def test_speaker_invalid_encoded_file_returns_400(audio_client, monkeypatch):
+    loader = Mock()
+    monkeypatch.setattr(server, "get_cached_model", loader)
+    response = audio_client.post(
+        "/audio/diarizations", files={"file": ("broken.wav", b"bad", "audio/wav")}
+    )
+    assert response.status_code == 400
+    loader.assert_not_called()
+
+
+def test_speaker_embedding_keeps_window_boundaries_and_weighted_normalization(
+    audio_client, monkeypatch
+):
+    calls = []
+
+    def encode(samples, sample_rate):
+        calls.append((samples.copy(), sample_rate))
+        result = np.zeros(192, dtype=np.float32)
+        result[len(calls) - 1] = 4
+        return result
+
+    monkeypatch.setattr(
+        server, "get_cached_model", Mock(return_value=(NS(encode=encode), None, None))
+    )
+    samples = np.linspace(0.1, 0.9, 7 * 16000, dtype="<f4")
+    response = _speaker_upload(
+        audio_client,
+        "speaker_embeddings",
+        samples,
+        windows='[{"start":0,"end":3},{"start":3,"end":7}]',
+    )
+    assert response.status_code == 200, response.text
+    assert [(len(window), rate) for window, rate in calls] == [
+        (48000, 16000),
+        (64000, 16000),
+    ]
+    np.testing.assert_array_equal(calls[0][0], samples[:48000])
+    np.testing.assert_array_equal(calls[1][0], samples[48000:])
+    result = response.json()
+    assert result["model"] == "nativ-community/SpeechBrain-ECAPA-VoxCeleb-20M"
+    assert result["revision"] is None
+    np.testing.assert_allclose(result["embedding"][:2], [0.6, 0.8], rtol=1e-6)
+    assert len(result["embedding"]) == 192 and result["duration"] == 7
+
+
+@pytest.mark.parametrize(
+    "windows",
+    [
+        "[]",
+        '[{"start":0,"end":2.9}]',
+        '[{"start":0,"end":10.01}]',
+        '[{"start":false,"end":3}]',
+        '[{"start":0,"end":NaN}]',
+        '[{"start":0,"end":3},{"start":2,"end":5}]',
+        '[{"start":0,"end":3.1}]',
+        "null",
+        "not-json",
+    ],
+)
+def test_speaker_bad_windows_never_load_model(audio_client, monkeypatch, windows):
+    loader = Mock()
+    monkeypatch.setattr(server, "get_cached_model", loader)
+    response = _speaker_upload(audio_client, "speaker_embeddings", windows=windows)
+    assert response.status_code == 400, response.text
+    loader.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "kind,samples,fields",
+    [
+        ("diarizations", np.array([], dtype="<f4"), {}),
+        ("diarizations", np.array([0] * 480000 + [np.nan], dtype="<f4"), {}),
+        ("diarizations", np.ones(16000, dtype="<f4"), {"sample_rate": "8000"}),
+        (
+            "speaker_embeddings",
+            np.zeros(48000, dtype="<f4"),
+            {"windows": '[{"start":0,"end":3}]'},
+        ),
+    ],
+)
+def test_speaker_bad_audio_never_loads_model(
+    audio_client, monkeypatch, kind, samples, fields
+):
+    loader = Mock()
+    monkeypatch.setattr(server, "get_cached_model", loader)
+    response = _speaker_upload(audio_client, kind, samples, **fields)
+    assert response.status_code == 400, response.text
+    loader.assert_not_called()
+
+
+@pytest.mark.usefixtures("reset_audio_runtime")
+def test_speaker_cache_distinguishes_model_kind_and_revision(monkeypatch):
+    from mlx_vlm.server import audio_speakers as speakers
+
+    loader = Mock(side_effect=lambda *_: object())
+    monkeypatch.setattr(speakers, "load_speaker_model", loader)
+    first = server.get_cached_model(
+        "speaker", model_kind="audio_speaker_embedding", revision="one"
+    )[0]
+    assert (
+        server.get_cached_model(
+            "speaker", model_kind="audio_speaker_embedding", revision="one"
+        )[0]
+        is first
+    )
+    second = server.get_cached_model(
+        "speaker", model_kind="audio_speaker_embedding", revision="two"
+    )[0]
+    assert second is not first
+    third = server.get_cached_model(
+        "speaker", model_kind="audio_diarization", revision="two"
+    )[0]
+    assert third is not second
+    assert loader.call_count == 3
+    assert server.unload_model_sync()
+    assert not server.runtime.model_cache
+
+
+def test_speaker_cancellation_closes_stream_without_emitting_partial_output():
+    from tempfile import TemporaryFile
+
+    from mlx_vlm.server import audio_speakers as speakers
+
+    with TemporaryFile() as audio:
+        audio.write(np.zeros(61 * 16000, dtype="<f4").tobytes())
+        request = server_audio.AudioInferenceRequest(
+            kind="diarization",
+            model_name="test",
+            payload=speakers.SpeakerTaskPayload(audio, 61 * 16000, "test"),
+        )
+        closed = []
+
+        def stream(chunks, sample_rate):
+            try:
+                for _ in chunks:
+                    request.cancel_event.set()
+                    yield NS(segments=[NS(start=0, end=1, speaker=0)])
+            finally:
+                closed.append(True)
+
+        with pytest.raises(HTTPException, match="cancelled"):
+            speakers.run_request(
+                request, lambda *a, **k: (NS(generate_stream=stream), None, None)
+            )
+        assert closed == [True]
+        assert request.result_queue.empty()
+
+
+@pytest.mark.parametrize("kind", ["diarization", "speaker_embedding", "diarized_stt"])
+@pytest.mark.parametrize("queued", [False, True])
+@pytest.mark.usefixtures("reset_audio_runtime")
+def test_cancelled_speaker_job_closes_owned_upload(monkeypatch, kind, queued):
+    from tempfile import TemporaryFile
+
+    from mlx_vlm.server import audio_diarized, audio_speakers
+
+    entered, release = Event(), Event()
+
+    def block(*args):
+        entered.set()
+        assert release.wait(5)
+
+    monkeypatch.setattr(server_audio, "_run_tts_request", block)
+    monkeypatch.setattr(audio_speakers, "run_request", block)
+    monkeypatch.setattr(audio_diarized, "run_request", block)
+    worker = server_audio._get_audio_queue()
+    with TemporaryFile() as audio:
+        try:
+            if queued:
+                worker.submit(kind="tts", model_name="test", payload=None)
+                assert entered.wait(5)
+            handle = worker.submit(
+                kind=kind,
+                model_name="test",
+                payload=audio_speakers.SpeakerTaskPayload(audio, 512, None),
+            )
+            if not queued:
+                assert entered.wait(5)
+            handle.cancel()
+        finally:
+            release.set()
+            worker.stop_and_join()
+        assert audio.closed
+
+
+_ANALYSIS_RESPONSES = [
+    ("diarization", False),
+    ("speaker_embedding", False),
+    ("diarized_stt", False),
+    ("diarized_stt", True),
+]
+
+
+@pytest.fixture(params=_ANALYSIS_RESPONSES)
+def analysis_response(request, monkeypatch, reset_audio_runtime):
+    from tempfile import TemporaryFile
+
+    from starlette.datastructures import FormData
+
+    from mlx_vlm.server import audio_diarized, audio_speakers
+
+    kind, stream = request.param
+    module = audio_diarized if kind == "diarized_stt" else audio_speakers
+    with TemporaryFile() as audio:
+        payload = audio_speakers.SpeakerTaskPayload(audio, 512, None)
+        monkeypatch.setattr(
+            module, "parse_speaker_request", AsyncMock(return_value=("test", payload))
+        )
+        http_request = NS(
+            form=AsyncMock(
+                return_value=FormData({"model": "test", "stream": str(stream).lower()})
+            ),
+            is_disconnected=AsyncMock(return_value=False),
+        )
+        job = server_audio.AudioInferenceRequest(
+            kind=kind, model_name="test", payload=payload
+        )
+        handle = server_audio.AudioInferenceHandle(
+            job.request_id, job.result_queue, job.cancel_event, job.ready_event, job
+        )
+        queue = NS(submit=Mock(return_value=handle))
+        monkeypatch.setattr(server_audio, "_get_audio_queue", lambda: queue)
+        metrics = server.runtime.metrics
+        monkeypatch.setattr(
+            metrics, "record_success", Mock(wraps=metrics.record_success)
+        )
+        monkeypatch.setattr(
+            metrics, "record_failure", Mock(wraps=metrics.record_failure)
+        )
+
+        async def respond():
+            if kind == "diarized_stt":
+                return await audio_diarized.response(http_request)
+            return await audio_speakers._response(http_request, kind)
+
+        yield NS(
+            audio=audio,
+            job=job,
+            http=http_request,
+            queue=queue,
+            metrics=metrics,
+            stream=stream,
+            respond=respond,
+        )
+
+
+@pytest.mark.parametrize("failure", ["disconnect", "worker"])
+def test_analysis_response_failure_cancels_job_but_worker_owns_file(
+    analysis_response, failure
+):
+    case = analysis_response
+    if failure == "disconnect":
+        case.http.is_disconnected.return_value = True
+    else:
+        case.job.emit_error(HTTPException(499, "Audio request disconnected"))
+
+    async def invoke():
+        if case.stream:
+            response = await case.respond()
+            events = [json.loads(value[6:]) async for value in response.body_iterator]
+            assert events == [
+                {"type": "error", "error": {"message": "Audio request disconnected"}}
+            ]
+        else:
+            with pytest.raises(HTTPException) as error:
+                await case.respond()
+            assert error.value.status_code == 499
+
+    asyncio.run(invoke())
+    assert case.job.cancel_event.is_set()
+    assert not case.audio.closed
+    case.metrics.record_failure.assert_called_once()
+    case.metrics.record_success.assert_not_called()
+
+
+def test_analysis_admission_failure_closes_upload_before_stream_headers(
+    analysis_response,
+):
+    case = analysis_response
+    case.queue.submit.side_effect = HTTPException(409, "Audio worker is busy")
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(case.respond())
+    assert error.value.status_code == 409
+    assert case.audio.closed
+    case.metrics.record_failure.assert_called_once()
+    case.metrics.record_success.assert_not_called()
+
+
+@pytest.mark.parametrize("analysis_response", _ANALYSIS_RESPONSES[:3], indirect=True)
+def test_analysis_missing_result_is_recorded_as_failure(analysis_response):
+    case = analysis_response
+    case.job.emit_done()
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(case.respond())
+    assert error.value.status_code == 500
+    assert case.job.cancel_event.is_set()
+    assert not case.audio.closed
+    case.metrics.record_failure.assert_called_once()
+    case.metrics.record_success.assert_not_called()
+
+
+@pytest.mark.parametrize("analysis_response", [_ANALYSIS_RESPONSES[-1]], indirect=True)
+def test_closing_diarized_stream_cancels_job(analysis_response):
+    case = analysis_response
+    case.job.emit_data({"type": "diarization.completed"})
+
+    async def invoke():
+        response = await case.respond()
+        await anext(response.body_iterator)
+        await response.body_iterator.aclose()
+
+    asyncio.run(invoke())
+    assert case.job.cancel_event.is_set()
+    assert not case.audio.closed
+    case.metrics.record_failure.assert_called_once()
+    case.metrics.record_success.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "value", [np.zeros(192), np.ones(2048), np.full(192, np.nan), np.full(192, np.inf)]
+)
+def test_speaker_encoder_rejects_invalid_vectors(value):
+    from mlx_vlm.server.audio_speakers import normalized
+
+    with pytest.raises(ValueError):
+        normalized(value)
+
+
 # Realtime voice sessions
 
 
@@ -6907,3 +7331,358 @@ def test_tool_arguments_stream_incrementally(
                 "".join(call["function"].get("arguments", "") for call in calls)
                 == '{"city":"Warsaw"}'
             )
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_diarized_transcription_openai_contract_and_global_speakers(
+    audio_client, monkeypatch, stream
+):
+    from scipy.io.wavfile import read
+
+    calls, windows = [], []
+    samples = np.linspace(0.1, 0.9, 61 * 16000, dtype="<f4")
+
+    def diarize(chunks, sample_rate):
+        assert sum(len(c) for c in chunks) == 61 * 16000
+        calls.append("diarization")
+        yield NS(
+            segments=[
+                NS(start=0, end=30, speaker=7),
+                NS(start=30, end=40, speaker=2),
+                NS(start=40, end=61, speaker=7),
+            ]
+        )
+
+    def transcribe(path, **kwargs):
+        calls.append("transcription")
+        assert calls[0] == "diarization"
+        rate, window = read(path)
+        assert rate == 16000
+        windows.append(window)
+        return {
+            "text": "Hello world.",
+            "words": [
+                {"word": "Hello", "start": 3.0, "end": 4.0},
+                {"word": "world.", "start": 5.0, "end": 6.0},
+            ],
+        }
+
+    monkeypatch.setattr(
+        server,
+        "get_cached_model",
+        lambda name, **kw: (
+            (
+                NS(generate_stream=diarize)
+                if kw["model_kind"] == "audio_diarization"
+                else NS(generate=transcribe)
+            ),
+            None,
+            None,
+        ),
+    )
+    response = _speaker_upload(
+        audio_client,
+        "transcriptions",
+        samples,
+        model="test-stt",
+        response_format="diarized_json",
+        stream=str(stream).lower(),
+        chunking_strategy="auto",
+        **{"include[]": "diarization"},
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        assert response.headers["content-type"].startswith("text/event-stream")
+        events = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        assert events[0]["type"] == "diarization.completed"
+        result = events[-1]
+        assert result["type"] == "transcript.text.done"
+        segments = [e for e in events if e["type"] == "transcript.text.segment"]
+    else:
+        result = response.json()
+        segments = result["segments"]
+    assert result["task"] == "transcribe" and result["duration"] == 61
+    assert result["diarization"]["speaker_ids"] == {"A": 2, "B": 7}
+    assert result["diarization"]["model"] == "nativ-community/Nemotron-3-Diarization"
+    assert result["diarization"]["revision"] is None
+    assert [s["speaker"] for s in segments] == ["B", "B", "B"]
+    assert len({s["id"] for s in segments}) == 3
+    assert all(s["type"] == "transcript.text.segment" for s in segments)
+    assert result["text"] == "Hello world. Hello world. Hello world."
+    assert calls == ["diarization", "transcription", "transcription", "transcription"]
+
+    for actual, (start, end) in zip(
+        windows, [(0, 28), (24, 45.5), (41.5, 61)], strict=True
+    ):
+        np.testing.assert_array_equal(
+            actual, samples[round(start * 16000) : round(end * 16000)]
+        )
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"known_speaker_names[]": "person"},
+        {"chunking_strategy": "{}"},
+        {"timestamp_granularities[]": "word"},
+        {"include[]": "logprobs"},
+    ],
+)
+def test_diarized_unsupported_options_are_explicit(audio_client, monkeypatch, fields):
+    loader = Mock()
+    monkeypatch.setattr(server, "get_cached_model", loader)
+    response = _speaker_upload(
+        audio_client,
+        "transcriptions",
+        model="test",
+        response_format="diarized_json",
+        **fields,
+    )
+    assert response.status_code == 400
+    loader.assert_not_called()
+
+
+def test_diarized_model_without_word_timing_fails_in_stream(audio_client, monkeypatch):
+    def loader(name, **kwargs):
+        if kwargs["model_kind"] == "audio_diarization":
+            return (
+                NS(
+                    generate_stream=lambda *a, **k: (
+                        v for v in [NS(segments=[NS(start=0, end=3, speaker=0)])]
+                    )
+                ),
+                None,
+                None,
+            )
+        return NS(generate=lambda *a, **k: {"text": "untimed words"}), None, None
+
+    monkeypatch.setattr(server, "get_cached_model", loader)
+    response = _speaker_upload(
+        audio_client,
+        "transcriptions",
+        model="test",
+        response_format="diarized_json",
+        stream="true",
+    )
+    events = [
+        json.loads(s[6:]) for s in response.text.splitlines() if s.startswith("data: ")
+    ]
+    assert events[-1]["type"] == "error"
+    assert "word timestamps" in events[-1]["error"]["message"]
+    assert not any(e["type"] == "transcript.text.done" for e in events)
+
+
+def test_diarized_empty_recording_skips_asr(audio_client, monkeypatch):
+    loader = Mock(
+        return_value=(NS(generate_stream=lambda *a, **k: (v for v in [])), None, None)
+    )
+    monkeypatch.setattr(server, "get_cached_model", loader)
+    response = _speaker_upload(
+        audio_client, "transcriptions", model="test", response_format="diarized_json"
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "task": "transcribe",
+        "duration": 3.0,
+        "text": "",
+        "segments": [],
+    }
+    assert loader.call_count == 1
+
+
+def test_diarized_windows_preserve_context_and_silence():
+    from mlx_vlm.server.audio_diarized import transcription_windows
+
+    windows = transcription_windows(
+        [
+            {"start": 0, "end": 65, "speaker": 0},
+            {"start": 100, "end": 102, "speaker": 0},
+        ],
+        102,
+    )
+    assert len(windows) == 4
+    assert all(w.audio_end - w.audio_start <= 30 for w in windows)
+    assert windows[0].end == windows[1].start
+    assert windows[1].audio_start == windows[0].end - 2
+    assert windows[-1].audio_start == 99.75
+    assert windows[-1].audio_end == 102
+
+
+def test_diarized_overlap_keeps_repeated_words_and_immutable_prefix():
+    from mlx_vlm.server.audio_diarized import Window, Word, stitch
+
+    prior = [
+        Word("go", 23, 23.2),
+        Word("go", 24, 24.2),
+        Word("home", 25, 25.2),
+        Word("old", 26, 26.2),
+    ]
+    stable = prior[0]
+    stitch(
+        prior,
+        [Word("go", 24.1, 24.3), Word("home", 25.1, 25.3), Word("now", 26.1, 26.3)],
+        Window(26, 52, 24, 54),
+        Window(0, 26, 0, 28),
+    )
+    assert [w.text for w in prior] == ["go", "go", "home", "now"]
+    assert prior[0] is stable
+
+
+def test_diarized_worker_releases_published_words_without_changing_segments(
+    monkeypatch,
+):
+    from mlx_vlm.server import audio_diarized as pipeline
+
+    windows = [
+        pipeline.Window(0, 26, 0, 28),
+        pipeline.Window(26, 52, 24, 54),
+        pipeline.Window(52, 78, 50, 78),
+        pipeline.Window(90, 92, 90, 92),
+    ]
+    chunks = iter(
+        [
+            [("Hello", 1), ("go", 23), ("go", 24), ("home", 25), ("old", 26)],
+            [("go", 0.1), ("home", 1.1), ("now", 2.1), ("old", 26), ("stale", 29)],
+            [("unmatched", 0.1), ("overlap", 1.1), ("here", 2.1), ("!", 2.3)],
+            [("Bye", 0.25)],
+        ]
+    )
+
+    def transcribe(*args, **kwargs):
+        words = [
+            {"word": text, "start": start, "end": start + (0 if text == "!" else 0.2)}
+            for text, start in next(chunks)
+        ]
+        return {
+            "text": " ".join(w["word"] for w in words).replace(" !", "!"),
+            "words": words,
+        }
+
+    monkeypatch.setattr(pipeline, "transcription_windows", lambda *args: windows)
+    monkeypatch.setattr(
+        pipeline,
+        "diarize_segments",
+        lambda *args: [
+            {"start": 0, "end": 78, "speaker": 7},
+            {"start": 90, "end": 92, "speaker": 2},
+        ],
+    )
+    stitch, retained = pipeline.stitch, []
+
+    def check_pending(words, incoming, window, previous):
+        retained.append(len(words))
+        assert all(w.midpoint >= window.audio_start for w in words)
+        stitch(words, incoming, window, previous)
+
+    monkeypatch.setattr(pipeline, "stitch", check_pending)
+    request = server_audio.AudioInferenceRequest(
+        kind="diarized_stt",
+        model_name="test-stt",
+        payload=NS(
+            sample_count=92 * 16000,
+            revision=None,
+            diarization_model="test-diarization",
+            include_diarization=True,
+            transcription=server_audio.AudioTranscriptionRequest(model="test-stt"),
+            chunks=lambda check: [],
+            read_window=lambda start, end: np.zeros(512, dtype="<f4"),
+        ),
+    )
+    events = []
+    request.emit_data = events.append
+    pipeline.run_request(
+        request, lambda *a, **kw: (NS(generate=transcribe), None, None)
+    )
+    segments = events[1:-1]
+    assert retained == [0, 3, 2, 0]
+    assert [s["text"] for s in segments] == [
+        "Hello",
+        "go",
+        "go home now",
+        "old",
+        "here!",
+        "Bye",
+    ]
+    assert [s["id"] for s in segments] == [f"seg_{i:06d}" for i in range(6)]
+    assert [s["speaker"] for s in segments] == ["B"] * 5 + ["A"]
+    assert [s["start"] for s in segments] == pytest.approx([1, 23, 24, 50, 52.1, 90.25])
+    assert [s["end"] for s in segments] == pytest.approx(
+        [1.2, 23.2, 26.3, 50.2, 52.3, 90.45]
+    )
+    assert events[-1]["text"] == "Hello go go home now old here! Bye"
+
+
+def test_diarized_aligned_tokens_keep_punctuation_and_no_space_languages():
+    from mlx_vlm.server.audio_diarized import aligned_words
+
+    words = aligned_words(
+        {
+            "text": "Hello, 世界",
+            "tokens": [
+                {"text": " Hello", "start": 0, "duration": 0.3},
+                {"text": ",", "start": 0.3, "duration": 0.1},
+                {"text": " 世", "start": 0.5, "duration": 0.2},
+                {"text": "界", "start": 0.7, "duration": 0.2},
+            ],
+        },
+        1,
+    )
+    assert [w.text for w in words] == ["Hello,", "世界"]
+    with pytest.raises(ValueError, match="timestamps"):
+        aligned_words(
+            {
+                "text": "Bad",
+                "words": [{"word": "Bad", "start": float("nan"), "end": 1}],
+            },
+            2,
+        )
+
+
+def test_diarized_overlap_and_unknown_speaker_assignment():
+    from mlx_vlm.server.audio_diarized import Word, speakers_for_word
+
+    spans = [{"start": 0, "end": 2, "speaker": 1}, {"start": 1, "end": 3, "speaker": 2}]
+    assert speakers_for_word(Word("both", 1.1, 1.5), spans) == [1, 2]
+    assert speakers_for_word(Word("unknown", 10, 11), spans) == []
+
+
+def test_diarized_slow_consumer_cancellation_does_not_block_worker():
+    import threading
+
+    request = server_audio.AudioInferenceRequest(
+        kind="diarized_stt", model_name="test", payload=None
+    )
+    for i in range(64):
+        request.emit_data(i)
+    finished = threading.Event()
+    thread = threading.Thread(target=lambda: (request.emit_data(65), finished.set()))
+    thread.start()
+    request.cancel_event.set()
+    thread.join(timeout=2)
+    assert finished.is_set()
+
+
+def test_diarized_whisper_nested_word_timing():
+    from mlx_vlm.server.audio_diarized import aligned_words
+
+    assert (
+        aligned_words(
+            {
+                "text": "Hello world",
+                "segments": [
+                    {
+                        "words": [
+                            {"word": "Hello", "start": 0, "end": 1},
+                            {"word": "world", "start": 1, "end": 2},
+                        ]
+                    }
+                ],
+            },
+            3,
+        )[1].text
+        == "world"
+    )
