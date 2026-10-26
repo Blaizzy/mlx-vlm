@@ -31,6 +31,10 @@ print(generate(
 ).text)
 ```
 
+`LiquidAI/d1-2B` shares the LFM3-VL `model_type` but is a decision model, not
+a chat model; loading it raises an error. Run it with Transformers
+(`trust_remote_code=True`, `model.system_one(...)`) as its model card shows.
+
 The vision model accepts multiple images and pre-sampled video frames. The
 standard generation API decodes video paths and supplies the sampled FPS;
 direct processor calls should supply `fps` or `video_metadata` to preserve

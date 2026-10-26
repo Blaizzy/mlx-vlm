@@ -4834,3 +4834,20 @@ def test_lfm3_quantized_checkpoint_roundtrip(tmp_path, lfm3_case):
     restored = load_model(tmp_path)
     actual = restored(ids, **kwargs).logits
     np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"model_type": "lfm3_vl", "architectures": ["D1Model"]},
+        {"model_type": "lfm3_omni", "architectures": ["D1Model"]},
+        {
+            "model_type": "lfm3_vl",
+            "architectures": ["Lfm3VlForConditionalGeneration"],
+            "auto_map": {"AutoModel": "modeling_d1.D1Model"},
+        },
+    ],
+)
+def test_get_model_and_args_refuses_d1_checkpoints(config):
+    with pytest.raises(ValueError, match="d1"):
+        get_model_and_args(config)
