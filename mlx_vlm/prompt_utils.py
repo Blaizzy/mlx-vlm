@@ -358,6 +358,7 @@ class MessageFormatter:
             "nemotron_h_omni",
             "nemotron_h_nano_omni",
             "nemotronh_nano_omni_reasoning_v3",
+            "lfm3_vl",
         ] and kwargs.get("video"):
             return self._format_video_message(
                 prompt,
