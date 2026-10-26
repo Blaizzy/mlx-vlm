@@ -1524,6 +1524,44 @@ curl -X POST "http://localhost:8080/v1/audio/transcriptions" \
 
 ##### Diarization and speaker embeddings
 
+For combined transcription and diarization, use the existing transcription route:
+
+```sh
+curl -N http://localhost:8080/v1/audio/transcriptions \
+  -F file=@meeting.wav \
+  -F model=mlx-community/parakeet-tdt-0.6b-v3 \
+  -F response_format=diarized_json \
+  -F chunking_strategy=auto \
+  -F stream=true
+```
+
+This implements OpenAI's diarized response and SSE segment format. Without
+streaming, the response contains `task`, `duration`, `text`, and `segments`.
+With streaming, `transcript.text.segment` events contain `id`, `start`, `end`,
+`text`, and a string `speaker` label (`A`, `B`, …), followed by
+`transcript.text.done`. A recording-wide diarization pass runs first. ASR then
+uses silence-aware windows of at most 30 seconds with two seconds of context
+on either side. Boundary words are aligned before publication, so finalized
+segments do not get rewritten. One ASR window can emit several speaker segments.
+
+The ASR `model` must return word timestamps (Parakeet or a compatible aligned
+model). `diarization_model` and `diarization_revision` optionally override the
+default Nemotron checkpoint. `chunking_strategy=auto` is currently the only
+supported strategy. Known-speaker references, custom VAD configurations, logprobs,
+and `timestamp_granularities` are explicitly rejected. This is a compatible
+response/streaming format, not complete support for every OpenAI request option.
+
+The optional extension `include[]=diarization` adds a `diarization.completed`
+event before ASR, raw speaker turns and a label-to-ID map in the final result,
+and `speakers` arrays on transcript segments to preserve simultaneous voices.
+The standard singular `speaker` is the first active label, or `unknown` when
+the word cannot be assigned. The raw metadata lets clients retain speech turns
+without transcription and identify speakers afterward. Stream failures emit
+an `error` event and no successful `transcript.text.done`; clients must reject
+incomplete results. Cancellation and upload limits match the endpoints below.
+
+The following lower-level endpoints are extensions for independent analysis:
+
 Both endpoints run on the shared audio queue and reuse model weights through the
 server cache. `POST /unload` releases them. Each diarization request starts a new
 speaker session; IDs and timestamps stay consistent across every chunk of that

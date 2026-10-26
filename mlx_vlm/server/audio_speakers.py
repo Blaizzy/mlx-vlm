@@ -120,7 +120,9 @@ async def _response(request: Request, kind: str):
             payload.close()
 
 
-async def _parse(request: Request, kind: str):
+async def _parse(
+    request: Request, kind: str, *, model_key="model", revision_key="revision"
+):
     audio = tempfile.NamedTemporaryFile()
     try:
         async with request.form() as form:
@@ -129,8 +131,8 @@ async def _parse(request: Request, kind: str):
                 if kind == "diarization"
                 else (EMBEDDING_MODEL, EMBEDDING_REVISION)
             )
-            model = form.get("model", default_model)
-            revision = form.get("revision") or (
+            model = form.get(model_key, default_model)
+            revision = form.get(revision_key) or (
                 default_revision if model == default_model else None
             )
             if (
@@ -263,43 +265,7 @@ def run_request(request, get_cached_model):
     _check_cancelled(request)
     request.mark_ready()
     if request.kind == "diarization":
-        duration = payload.sample_count / SAMPLE_RATE
-        segments, last_by_speaker = [], {}
-        # One generator per recording, never one per upload block or ASR chunk.
-        # MLX-Audio owns the recording-wide speaker cache and absolute clock.
-        stream = model.generate_stream(_audio_chunks(request), sample_rate=SAMPLE_RATE)
-        try:
-            for result in stream:
-                _check_cancelled(request)
-                for turn in result.segments:
-                    start, end, speaker = (
-                        float(turn.start),
-                        float(turn.end),
-                        int(turn.speaker),
-                    )
-                    if (
-                        not math.isfinite(start)
-                        or not math.isfinite(end)
-                        or speaker < 0
-                    ):
-                        raise ValueError("Invalid diarization output")
-                    start, end = max(0.0, start), min(duration, end)
-                    if end <= start:
-                        continue
-                    previous = last_by_speaker.get(speaker)
-                    if previous is not None and start <= previous["end"] + 1e-6:
-                        previous["end"] = max(previous["end"], end)
-                    else:
-                        segment = {"start": start, "end": end, "speaker": speaker}
-                        segments.append(segment)
-                        last_by_speaker[speaker] = segment
-        finally:
-            stream.close()
-        result = {
-            "segments": sorted(
-                segments, key=lambda item: (item["start"], item["speaker"])
-            )
-        }
+        result = {"segments": diarize_segments(request, model)}
     else:
         total = np.zeros(EMBEDDING_DIMENSION, dtype=np.float32)
         sample_count = 0
@@ -377,3 +343,37 @@ def validate_weights(path: Path) -> None:
             digest.update(block)
     if digest.hexdigest() != WEIGHTS_SHA256:
         raise ValueError("The ECAPA speaker model failed checksum verification.")
+
+
+def diarize_segments(request, model):
+    """One model stream owns the complete recording and its speaker cache."""
+    payload = request.payload
+    duration = payload.sample_count / SAMPLE_RATE
+    segments, last_by_speaker = [], {}
+    # One generator per recording, never one per upload block or ASR chunk.
+    # MLX-Audio owns the recording-wide speaker cache and absolute clock.
+    stream = model.generate_stream(_audio_chunks(request), sample_rate=SAMPLE_RATE)
+    try:
+        for result in stream:
+            _check_cancelled(request)
+            for turn in result.segments:
+                start, end, speaker = (
+                    float(turn.start),
+                    float(turn.end),
+                    int(turn.speaker),
+                )
+                if not math.isfinite(start) or not math.isfinite(end) or speaker < 0:
+                    raise ValueError("Invalid diarization output")
+                start, end = max(0.0, start), min(duration, end)
+                if end <= start:
+                    continue
+                previous = last_by_speaker.get(speaker)
+                if previous is not None and start <= previous["end"] + 1e-6:
+                    previous["end"] = max(previous["end"], end)
+                else:
+                    segment = {"start": start, "end": end, "speaker": speaker}
+                    segments.append(segment)
+                    last_by_speaker[speaker] = segment
+    finally:
+        stream.close()
+    return sorted(segments, key=lambda item: (item["start"], item["speaker"]))

@@ -113,7 +113,7 @@ class AudioInferenceRequest:
             self.request_id = uuid.uuid4().hex
         if self.result_queue is None:
             self.result_queue = queue.Queue(
-                maxsize=64 if self.kind == "stt_realtime" else 0
+                maxsize=64 if self.kind in ("stt_realtime", "diarized_stt") else 0
             )
         if self.cancel_event is None:
             self.cancel_event = threading.Event()
@@ -130,7 +130,7 @@ class AudioInferenceRequest:
         self._emit(AudioResultChunk(kind="done"))
 
     def _emit(self, chunk: AudioResultChunk) -> None:
-        if self.kind != "stt_realtime":
+        if self.kind not in ("stt_realtime", "diarized_stt"):
             self.result_queue.put(chunk)
             return
         while not self.cancel_event.is_set():
@@ -250,6 +250,10 @@ class AudioRequestQueue:
                     from .audio_speakers import run_request
 
                     run_request(request, get_cached_model)
+                elif request.kind == "diarized_stt":
+                    from .audio_diarized import run_request
+
+                    run_request(request, get_cached_model)
                 else:
                     raise ValueError(f"Unsupported audio request kind: {request.kind}")
             except Exception as exc:
@@ -266,7 +270,7 @@ class AudioRequestQueue:
                     if not request.ready_event.is_set():
                         request.mark_ready(error)
                     request.emit_error(error)
-                if request.kind in ("diarization", "speaker_embedding"):
+                if request.kind in ("diarization", "speaker_embedding", "diarized_stt"):
                     request.payload.close()
                 request.emit_done()
                 mx.clear_cache()
@@ -390,6 +394,15 @@ async def audio_translations_endpoint(request: Request):
 
 
 async def _audio_transcription_response(request: Request, *, translate: bool):
+    if (await request.form()).get("response_format") == "diarized_json":
+        if translate:
+            raise HTTPException(
+                status_code=400,
+                detail="diarized_json is only supported for transcriptions",
+            )
+        from .audio_diarized import response
+
+        return await response(request)
     endpoint = "/v1/audio/translations" if translate else "/v1/audio/transcriptions"
     request_start = time.perf_counter()
     payload = await _parse_transcription_request(request, translate=translate)
