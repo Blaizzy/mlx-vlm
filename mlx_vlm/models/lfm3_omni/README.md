@@ -10,8 +10,9 @@ the Apache-2.0 reference code shipped with the checkpoint; see
 [LICENSE](../lfm3/LICENSE).
 
 `LiquidAI/d1-omni-2B` shares the LFM3-Omni `model_type` but is a decision
-model, not a chat model; loading it raises an error. Run it with Transformers
-(`trust_remote_code=True`, `model.system_one(...)`) as its model card shows.
+model: it loads as `d1_lfm3_*` and answers through `model.system_one(...)`
+or `python -m mlx_vlm.decide`, not `generate`; see
+[d1 on MLX](../d1_lfm3_vl/README.md).
 
 ```python
 from mlx_vlm import generate, load

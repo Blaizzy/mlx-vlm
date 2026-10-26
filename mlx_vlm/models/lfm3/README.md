@@ -46,9 +46,10 @@ LFM3-1.7B writes tool calls as `<tool_call><function=...>` XML, which the
 template expects tool-call arguments as objects; JSON-string arguments are
 parsed before rendering.
 
-`LiquidAI/d1-2B` shares the LFM3-VL `model_type` but is a decision model, not
-a chat model; loading it raises an error. Run it with Transformers
-(`trust_remote_code=True`, `model.system_one(...)`) as its model card shows.
+`LiquidAI/d1-2B` shares the LFM3-VL `model_type` but is a decision
+model: it loads as `d1_lfm3_*` and answers through `model.system_one(...)`
+or `python -m mlx_vlm.decide`, not `generate`; see
+[d1 on MLX](../d1_lfm3_vl/README.md).
 
 The vision model accepts multiple images and pre-sampled video frames. The
 standard generation API decodes video paths and supplies the sampled FPS;

@@ -140,6 +140,7 @@ jobs:
             extras: test
             tests: >-
               tests/test_audio_models.py
+              tests/test_d1.py
               tests/test_diffusion_models.py
               tests/test_extraction_models.py
               tests/test_flux3.py
