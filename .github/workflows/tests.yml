@@ -191,12 +191,22 @@ jobs:
         run: |
           read -r -a tests <<< "$TEST_FILES"
           python -m pytest -q -n 3 --dist=worksteal --durations=30 \
+            -k 'not test_distributed_model' \
             --junitxml=../test-results/${{ matrix.group }}.xml "${tests[@]}"
+
+      # Each distributed case launches multiple GPU processes. Keep these out
+      # of the xdist pool to avoid oversubscribing the runner's single GPU.
+      - name: Run distributed model tests
+        if: matrix.group == 'models'
+        working-directory: mlx_vlm
+        run: |
+          python -m pytest -q tests/test_models.py -k test_distributed_model \
+            --durations=12 --junitxml=../test-results/models-distributed.xml
 
       - name: Upload test timings
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-timings-${{ matrix.group }}
-          path: test-results/${{ matrix.group }}.xml
+          path: test-results/${{ matrix.group }}*.xml
           retention-days: 14
