@@ -4,11 +4,9 @@ Inference windows are independent of speaker turns. A single diarization stream
 owns all speaker IDs; overlapping ASR windows are aligned before publication.
 """
 
-import asyncio
 import json
 import math
 import tempfile
-import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -19,12 +17,9 @@ from fastapi.responses import StreamingResponse
 from .audio_speakers import (
     SAMPLE_RATE,
     SpeakerTaskPayload,
-    _audio_chunks,
-    _check_cancelled,
-    _parse,
     diarize_segments,
+    parse_speaker_request,
 )
-from .runtime import runtime
 
 if TYPE_CHECKING:
     from .audio import AudioTranscriptionRequest
@@ -38,15 +33,7 @@ class DiarizedTranscriptionPayload(SpeakerTaskPayload):
 
 
 async def response(request):
-    from .audio import (
-        AudioTranscriptionRequest,
-        _as_http_exception,
-        _form_bool,
-        _get_audio_queue,
-        _get_queue_chunk,
-        _record_audio_failure,
-        _record_audio_success,
-    )
+    from .audio import AudioTranscriptionRequest, _audio_analysis_events, _form_bool
 
     form = await request.form()
     model = form.get("model")
@@ -76,7 +63,7 @@ async def response(request):
         word_timestamps=True,
         stream=False,
     )
-    diarization_model, payload = await _parse(
+    diarization_model, payload = await parse_speaker_request(
         request,
         "diarization",
         model_key="diarization_model",
@@ -90,76 +77,44 @@ async def response(request):
         diarization_model=diarization_model,
         include_diarization="diarization" in include,
     )
-    endpoint = "/v1/audio/transcriptions"
-    started = time.perf_counter()
-    runtime.metrics.begin_request(endpoint=endpoint, model=model, stream=stream)
-    try:
-        handle = _get_audio_queue().submit(
-            kind="diarized_stt", model_name=model, payload=payload
-        )
-    except BaseException as exc:
-        payload.close()
-        _record_audio_failure(endpoint, model, stream, exc)
-        raise
-
-    async def events():
-        try:
-            while True:
-                if await request.is_disconnected():
-                    raise HTTPException(499, "Audio request disconnected")
-                item = await asyncio.to_thread(
-                    _get_queue_chunk, handle.result_queue, 0.1
-                )
-                if item is None:
-                    continue
-                if item.kind == "error":
-                    raise _as_http_exception(item.error)
-                if item.kind == "done":
-                    break
-                yield item.payload
-            _record_audio_success(
-                endpoint=endpoint,
-                model=model,
-                stream=stream,
-                request_start=started,
-                audio_count=1,
-            )
-        except (Exception, asyncio.CancelledError, GeneratorExit) as exc:
-            _record_audio_failure(endpoint, model, stream, exc)
-            raise
-        finally:
-            handle.cancel()
+    events = _audio_analysis_events(
+        request,
+        kind="diarized_stt",
+        model=model,
+        payload=payload,
+        endpoint="/v1/audio/transcriptions",
+        stream=stream,
+    )
 
     if stream:
 
         async def sse():
-            source = events()
             try:
-                async for event in source:
-                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                async with events as source:
+                    async for event in source:
+                        yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
             except Exception as exc:
                 error = {
                     "type": "error",
                     "error": {"message": str(getattr(exc, "detail", exc))},
                 }
                 yield f"data: {json.dumps(error)}\n\n"
-            finally:
-                await source.aclose()
 
         return StreamingResponse(
             sse(),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
-    segments, result = [], None
-    async for event in events():
-        if event["type"] == "transcript.text.segment":
-            segments.append(event)
-        elif event["type"] == "transcript.text.done":
-            result = {key: value for key, value in event.items() if key != "type"}
-    if result is None:
-        raise HTTPException(500, "Transcription ended without a final result")
-    return {**result, "segments": segments}
+    async with events as source:
+        segments, result = [], None
+        async for event in source:
+            if event["type"] == "transcript.text.segment":
+                segments.append(event)
+            elif event["type"] == "transcript.text.done":
+                result = {key: value for key, value in event.items() if key != "type"}
+        if result is None:
+            raise HTTPException(500, "Transcription ended without a final result")
+        return {**result, "segments": segments}
 
 
 @dataclass(frozen=True)
@@ -411,14 +366,14 @@ def run_request(request, get_cached_model):
     from .audio import _build_stt_generate_kwargs
 
     payload = request.payload
-    for _ in _audio_chunks(request):
+    for _ in payload.chunks(request.check_cancelled):
         pass  # Validate the complete source before publishing anything.
     diarizer, _, _ = get_cached_model(
         payload.diarization_model,
         model_kind="audio_diarization",
         revision=payload.revision,
     )
-    _check_cancelled(request)
+    request.check_cancelled()
     segments = diarize_segments(request, diarizer)
     duration = payload.sample_count / SAMPLE_RATE
     labels = {
@@ -442,14 +397,11 @@ def run_request(request, get_cached_model):
     with tempfile.TemporaryDirectory() as directory:
         path = f"{directory}/chunk.wav"
         for index, window in enumerate(windows):
-            _check_cancelled(request)
+            request.check_cancelled()
             start, end = round(window.audio_start * SAMPLE_RATE), round(
                 window.audio_end * SAMPLE_RATE
             )
-            payload.audio.seek(start * 4)
-            samples = np.frombuffer(
-                payload.audio.read((end - start) * 4), dtype="<f4"
-            ).copy()
+            samples = payload.read_window(start, end).copy()
             if len(samples) < 512:
                 samples = np.pad(samples, (0, 512 - len(samples)))
             # Float WAV preserves the original PCM; MLX-Audio's generic writer
@@ -459,7 +411,7 @@ def run_request(request, get_cached_model):
                 model, payload.transcription, translate=False
             )
             result = model.generate(path, **kwargs)
-            _check_cancelled(request)
+            request.check_cancelled()
             incoming = aligned_words(result, window.audio_end - window.audio_start)
             for word in incoming:
                 word.start = min(
@@ -522,5 +474,5 @@ def run_request(request, get_cached_model):
     }
     if payload.include_diarization:
         done["diarization"] = metadata
-    _check_cancelled(request)
+    request.check_cancelled()
     request.emit_data(done)

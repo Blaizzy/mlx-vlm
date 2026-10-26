@@ -14,8 +14,6 @@ import mlx.core as mx
 import numpy as np
 from fastapi import HTTPException, Request
 
-from .runtime import runtime
-
 DIARIZATION_MODEL = "nativ-community/Nemotron-3-Diarization"
 EMBEDDING_MODEL = "nativ-community/SpeechBrain-ECAPA-VoxCeleb-20M"
 EMBEDDING_DIMENSION = 192
@@ -34,6 +32,19 @@ class SpeakerTaskPayload:
 
     def close(self):
         self.audio.close()
+
+    def read_window(self, start: int, end: int) -> np.ndarray:
+        self.audio.seek(start * 4)
+        return np.frombuffer(self.audio.read((end - start) * 4), dtype="<f4")
+
+    def chunks(self, check_cancelled):
+        self.audio.seek(0)
+        while data := self.audio.read(READ_SAMPLES * 4):
+            check_cancelled()
+            chunk = np.frombuffer(data, dtype="<f4")
+            if not np.isfinite(chunk).all():
+                raise ValueError("The recording contains invalid audio samples")
+            yield chunk
 
 
 def register_routes(app):
@@ -56,13 +67,7 @@ async def audio_speaker_embeddings_endpoint(request: Request):
 
 
 async def _response(request: Request, kind: str):
-    from .audio import (
-        _as_http_exception,
-        _get_audio_queue,
-        _get_queue_chunk,
-        _record_audio_failure,
-        _record_audio_success,
-    )
+    from .audio import _audio_analysis_events
 
     endpoint = (
         "/v1/audio/diarizations"
@@ -70,51 +75,24 @@ async def _response(request: Request, kind: str):
         else "/v1/audio/speaker_embeddings"
     )
     started = time.perf_counter()
-    model, payload = await _parse(request, kind)
-    handle = None
-    runtime.metrics.begin_request(endpoint=endpoint, model=model, stream=False)
-    try:
-        handle = _get_audio_queue().submit(kind=kind, model_name=model, payload=payload)
+    model, payload = await parse_speaker_request(request, kind)
+    async with _audio_analysis_events(
+        request,
+        kind=kind,
+        model=model,
+        payload=payload,
+        endpoint=endpoint,
+        request_start=started,
+    ) as events:
         result = None
-        while True:
-            if await request.is_disconnected():
-                raise HTTPException(
-                    status_code=499, detail="Audio request disconnected"
-                )
-            chunk = await asyncio.to_thread(_get_queue_chunk, handle.result_queue, 0.1)
-            if chunk is None:
-                continue
-            if chunk.kind == "error":
-                raise _as_http_exception(chunk.error)
-            if chunk.kind == "data":
-                result = chunk.payload
-            if chunk.kind == "done":
-                break
+        async for result in events:
+            pass
         if result is None:
-            raise HTTPException(
-                status_code=500, detail="Audio analysis returned no result"
-            )
-        _record_audio_success(
-            endpoint=endpoint,
-            model=model,
-            stream=False,
-            request_start=started,
-            audio_count=1,
-        )
+            raise HTTPException(500, "Audio analysis returned no result")
         return result
-    except Exception as exc:
-        _record_audio_failure(endpoint, model, False, exc)
-        raise
-    finally:
-        if handle is not None:
-            handle.cancel()
-            # The worker owns the file once submitted, even if the client leaves
-            # while the job is queued or a model is still loading.
-        else:
-            payload.close()
 
 
-async def _parse(
+async def parse_speaker_request(
     request: Request, kind: str, *, model_key="model", revision_key="revision"
 ):
     audio = tempfile.NamedTemporaryFile()
@@ -209,46 +187,27 @@ def load_speaker_model(model_id: str, kind: str, revision: str | None):
     return EcapaSpeakerEmbeddingExtractor.from_pretrained(model_id, revision=revision)
 
 
-def _check_cancelled(request):
-    if request.cancel_event.is_set():
-        raise HTTPException(status_code=499, detail="Audio analysis cancelled")
-
-
-def _audio_chunks(request):
-    audio = request.payload.audio
-    audio.seek(0)
-    while data := audio.read(READ_SAMPLES * 4):
-        _check_cancelled(request)
-        chunk = np.frombuffer(data, dtype="<f4")
-        if not np.isfinite(chunk).all():
-            raise ValueError("The recording contains invalid audio samples")
-        yield chunk
-
-
 def run_request(request, get_cached_model):
     payload = request.payload
     try:
         # Validate all samples before loading, so malformed late blocks never
         # generate partial output or trigger a model download.
-        for _ in _audio_chunks(request):
+        for _ in payload.chunks(request.check_cancelled):
             pass
         if request.kind == "speaker_embedding":
             for start, end in payload.windows:
-                payload.audio.seek(start * 4)
-                window = np.frombuffer(
-                    payload.audio.read((end - start) * 4), dtype="<f4"
-                )
+                window = payload.read_window(start, end)
                 if float(np.sqrt(np.mean(np.square(window, dtype=np.float64)))) < 1e-4:
                     raise ValueError("The selected speaker audio is too quiet")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    _check_cancelled(request)
+    request.check_cancelled()
     model, _, _ = get_cached_model(
         request.model_name,
         model_kind=f"audio_{request.kind}",
         revision=payload.revision,
     )
-    _check_cancelled(request)
+    request.check_cancelled()
     request.mark_ready()
     if request.kind == "diarization":
         result = {"segments": diarize_segments(request, model)}
@@ -256,11 +215,8 @@ def run_request(request, get_cached_model):
         total = np.zeros(EMBEDDING_DIMENSION, dtype=np.float32)
         sample_count = 0
         for start, end in payload.windows:
-            _check_cancelled(request)
-            payload.audio.seek(start * 4)
-            window = np.frombuffer(
-                payload.audio.read((end - start) * 4), dtype="<f4"
-            ).copy()
+            request.check_cancelled()
+            window = payload.read_window(start, end).copy()
             vector = model.encode(window, sample_rate=SAMPLE_RATE)
             mx.eval(vector)
             total += normalized(vector) * len(window)
@@ -269,7 +225,7 @@ def run_request(request, get_cached_model):
             "embedding": normalized(total).tolist(),
             "duration": sample_count / SAMPLE_RATE,
         }
-    _check_cancelled(request)
+    request.check_cancelled()
     request.emit_data(
         {"model": request.model_name, "revision": payload.revision, **result}
     )
@@ -327,10 +283,12 @@ def diarize_segments(request, model):
     segments, last_by_speaker = [], {}
     # One generator per recording, never one per upload block or ASR chunk.
     # MLX-Audio owns the recording-wide speaker cache and absolute clock.
-    stream = model.generate_stream(_audio_chunks(request), sample_rate=SAMPLE_RATE)
+    stream = model.generate_stream(
+        payload.chunks(request.check_cancelled), sample_rate=SAMPLE_RATE
+    )
     try:
         for result in stream:
-            _check_cancelled(request)
+            request.check_cancelled()
             for turn in result.segments:
                 start, end, speaker = (
                     float(turn.start),

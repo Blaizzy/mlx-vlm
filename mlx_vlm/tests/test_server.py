@@ -6418,7 +6418,7 @@ def test_speaker_embedding_keeps_window_boundaries_and_weighted_normalization(
     calls = []
 
     def encode(samples, sample_rate):
-        calls.append((len(samples), sample_rate))
+        calls.append((samples.copy(), sample_rate))
         result = np.zeros(192, dtype=np.float32)
         result[len(calls) - 1] = 4
         return result
@@ -6426,14 +6426,20 @@ def test_speaker_embedding_keeps_window_boundaries_and_weighted_normalization(
     monkeypatch.setattr(
         server, "get_cached_model", Mock(return_value=(NS(encode=encode), None, None))
     )
+    samples = np.linspace(0.1, 0.9, 7 * 16000, dtype="<f4")
     response = _speaker_upload(
         audio_client,
         "speaker_embeddings",
-        np.full(7 * 16000, 0.1, dtype="<f4"),
+        samples,
         windows='[{"start":0,"end":3},{"start":3,"end":7}]',
     )
     assert response.status_code == 200, response.text
-    assert calls == [(48000, 16000), (64000, 16000)]
+    assert [(len(window), rate) for window, rate in calls] == [
+        (48000, 16000),
+        (64000, 16000),
+    ]
+    np.testing.assert_array_equal(calls[0][0], samples[:48000])
+    np.testing.assert_array_equal(calls[1][0], samples[48000:])
     result = response.json()
     assert result["model"] == "nativ-community/SpeechBrain-ECAPA-VoxCeleb-20M"
     assert result["revision"] is None
@@ -6544,62 +6550,174 @@ def test_speaker_cancellation_closes_stream_without_emitting_partial_output():
         assert request.result_queue.empty()
 
 
+@pytest.mark.parametrize("kind", ["diarization", "speaker_embedding", "diarized_stt"])
+@pytest.mark.parametrize("queued", [False, True])
 @pytest.mark.usefixtures("reset_audio_runtime")
-def test_cancelled_queued_speaker_request_closes_owned_upload(monkeypatch):
+def test_cancelled_speaker_job_closes_owned_upload(monkeypatch, kind, queued):
     from tempfile import TemporaryFile
 
-    from mlx_vlm.server import audio_speakers as speakers
+    from mlx_vlm.server import audio_diarized, audio_speakers
 
     entered, release = Event(), Event()
 
-    def block(_):
+    def block(*args):
         entered.set()
         assert release.wait(5)
 
     monkeypatch.setattr(server_audio, "_run_tts_request", block)
+    monkeypatch.setattr(audio_speakers, "run_request", block)
+    monkeypatch.setattr(audio_diarized, "run_request", block)
     worker = server_audio._get_audio_queue()
-    worker.submit(kind="tts", model_name="test", payload=None)
-    assert entered.wait(5)
-    audio = TemporaryFile()
-    handle = worker.submit(
-        kind="diarization",
-        model_name="test",
-        payload=speakers.SpeakerTaskPayload(audio, 1, "test"),
-    )
-    handle.cancel()
-    release.set()
-    while handle.result_queue.get(timeout=5).kind != "done":
-        pass
-    assert audio.closed
+    with TemporaryFile() as audio:
+        try:
+            if queued:
+                worker.submit(kind="tts", model_name="test", payload=None)
+                assert entered.wait(5)
+            handle = worker.submit(
+                kind=kind,
+                model_name="test",
+                payload=audio_speakers.SpeakerTaskPayload(audio, 512, None),
+            )
+            if not queued:
+                assert entered.wait(5)
+            handle.cancel()
+        finally:
+            release.set()
+            worker.stop_and_join()
+        assert audio.closed
 
 
-def test_speaker_disconnect_cancels_queued_job(monkeypatch):
+_ANALYSIS_RESPONSES = [
+    ("diarization", False),
+    ("speaker_embedding", False),
+    ("diarized_stt", False),
+    ("diarized_stt", True),
+]
+
+
+@pytest.fixture(params=_ANALYSIS_RESPONSES)
+def analysis_response(request, monkeypatch, reset_audio_runtime):
     from tempfile import TemporaryFile
 
-    from mlx_vlm.server import audio_speakers as speakers
+    from starlette.datastructures import FormData
 
-    request = NS(is_disconnected=AsyncMock(return_value=True))
-    audio = TemporaryFile()
-    payload = speakers.SpeakerTaskPayload(audio, 512, "test")
-    monkeypatch.setattr(speakers, "_parse", AsyncMock(return_value=("test", payload)))
-    job = server_audio.AudioInferenceRequest(
-        kind="diarization", model_name="test", payload=payload
-    )
-    handle = server_audio.AudioInferenceHandle(
-        job.request_id, job.result_queue, job.cancel_event, job.ready_event, job
-    )
-    monkeypatch.setattr(
-        server_audio, "_get_audio_queue", lambda: NS(submit=lambda **k: handle)
-    )
-    monkeypatch.setattr(server.runtime, "metrics", server.ServerMetricsStore())
-    try:
-        with pytest.raises(HTTPException) as error:
-            asyncio.run(speakers._response(request, "diarization"))
-        assert error.value.status_code == 499
-        assert job.cancel_event.is_set()
-        assert not audio.closed  # The worker, not the HTTP coroutine, owns it.
-    finally:
-        audio.close()
+    from mlx_vlm.server import audio_diarized, audio_speakers
+
+    kind, stream = request.param
+    module = audio_diarized if kind == "diarized_stt" else audio_speakers
+    with TemporaryFile() as audio:
+        payload = audio_speakers.SpeakerTaskPayload(audio, 512, None)
+        monkeypatch.setattr(
+            module, "parse_speaker_request", AsyncMock(return_value=("test", payload))
+        )
+        http_request = NS(
+            form=AsyncMock(
+                return_value=FormData({"model": "test", "stream": str(stream).lower()})
+            ),
+            is_disconnected=AsyncMock(return_value=False),
+        )
+        job = server_audio.AudioInferenceRequest(
+            kind=kind, model_name="test", payload=payload
+        )
+        handle = server_audio.AudioInferenceHandle(
+            job.request_id, job.result_queue, job.cancel_event, job.ready_event, job
+        )
+        queue = NS(submit=Mock(return_value=handle))
+        monkeypatch.setattr(server_audio, "_get_audio_queue", lambda: queue)
+        metrics = server.runtime.metrics
+        monkeypatch.setattr(
+            metrics, "record_success", Mock(wraps=metrics.record_success)
+        )
+        monkeypatch.setattr(
+            metrics, "record_failure", Mock(wraps=metrics.record_failure)
+        )
+
+        async def respond():
+            if kind == "diarized_stt":
+                return await audio_diarized.response(http_request)
+            return await audio_speakers._response(http_request, kind)
+
+        yield NS(
+            audio=audio,
+            job=job,
+            http=http_request,
+            queue=queue,
+            metrics=metrics,
+            stream=stream,
+            respond=respond,
+        )
+
+
+@pytest.mark.parametrize("failure", ["disconnect", "worker"])
+def test_analysis_response_failure_cancels_job_but_worker_owns_file(
+    analysis_response, failure
+):
+    case = analysis_response
+    if failure == "disconnect":
+        case.http.is_disconnected.return_value = True
+    else:
+        case.job.emit_error(HTTPException(499, "Audio request disconnected"))
+
+    async def invoke():
+        if case.stream:
+            response = await case.respond()
+            events = [json.loads(value[6:]) async for value in response.body_iterator]
+            assert events == [
+                {"type": "error", "error": {"message": "Audio request disconnected"}}
+            ]
+        else:
+            with pytest.raises(HTTPException) as error:
+                await case.respond()
+            assert error.value.status_code == 499
+
+    asyncio.run(invoke())
+    assert case.job.cancel_event.is_set()
+    assert not case.audio.closed
+    case.metrics.record_failure.assert_called_once()
+    case.metrics.record_success.assert_not_called()
+
+
+def test_analysis_admission_failure_closes_upload_before_stream_headers(
+    analysis_response,
+):
+    case = analysis_response
+    case.queue.submit.side_effect = HTTPException(409, "Audio worker is busy")
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(case.respond())
+    assert error.value.status_code == 409
+    assert case.audio.closed
+    case.metrics.record_failure.assert_called_once()
+    case.metrics.record_success.assert_not_called()
+
+
+@pytest.mark.parametrize("analysis_response", _ANALYSIS_RESPONSES[:3], indirect=True)
+def test_analysis_missing_result_is_recorded_as_failure(analysis_response):
+    case = analysis_response
+    case.job.emit_done()
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(case.respond())
+    assert error.value.status_code == 500
+    assert case.job.cancel_event.is_set()
+    assert not case.audio.closed
+    case.metrics.record_failure.assert_called_once()
+    case.metrics.record_success.assert_not_called()
+
+
+@pytest.mark.parametrize("analysis_response", [_ANALYSIS_RESPONSES[-1]], indirect=True)
+def test_closing_diarized_stream_cancels_job(analysis_response):
+    case = analysis_response
+    case.job.emit_data({"type": "diarization.completed"})
+
+    async def invoke():
+        response = await case.respond()
+        await anext(response.body_iterator)
+        await response.body_iterator.aclose()
+
+    asyncio.run(invoke())
+    assert case.job.cancel_event.is_set()
+    assert not case.audio.closed
+    case.metrics.record_failure.assert_called_once()
+    case.metrics.record_success.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -7219,7 +7337,10 @@ def test_tool_arguments_stream_incrementally(
 def test_diarized_transcription_openai_contract_and_global_speakers(
     audio_client, monkeypatch, stream
 ):
-    calls = []
+    from scipy.io.wavfile import read
+
+    calls, windows = [], []
+    samples = np.linspace(0.1, 0.9, 61 * 16000, dtype="<f4")
 
     def diarize(chunks, sample_rate):
         assert sum(len(c) for c in chunks) == 61 * 16000
@@ -7235,6 +7356,9 @@ def test_diarized_transcription_openai_contract_and_global_speakers(
     def transcribe(path, **kwargs):
         calls.append("transcription")
         assert calls[0] == "diarization"
+        rate, window = read(path)
+        assert rate == 16000
+        windows.append(window)
         return {
             "text": "Hello world.",
             "words": [
@@ -7259,7 +7383,7 @@ def test_diarized_transcription_openai_contract_and_global_speakers(
     response = _speaker_upload(
         audio_client,
         "transcriptions",
-        np.zeros(61 * 16000, dtype="<f4"),
+        samples,
         model="test-stt",
         response_format="diarized_json",
         stream=str(stream).lower(),
@@ -7290,6 +7414,13 @@ def test_diarized_transcription_openai_contract_and_global_speakers(
     assert all(s["type"] == "transcript.text.segment" for s in segments)
     assert result["text"] == "Hello world. Hello world. Hello world."
     assert calls == ["diarization", "transcription", "transcription", "transcription"]
+
+    for actual, (start, end) in zip(
+        windows, [(0, 28), (24, 45.5), (41.5, 61)], strict=True
+    ):
+        np.testing.assert_array_equal(
+            actual, samples[round(start * 16000) : round(end * 16000)]
+        )
 
 
 @pytest.mark.parametrize(
@@ -7433,72 +7564,6 @@ def test_diarized_overlap_and_unknown_speaker_assignment():
     spans = [{"start": 0, "end": 2, "speaker": 1}, {"start": 1, "end": 3, "speaker": 2}]
     assert speakers_for_word(Word("both", 1.1, 1.5), spans) == [1, 2]
     assert speakers_for_word(Word("unknown", 10, 11), spans) == []
-
-
-def test_diarized_disconnection_cancels_and_closes_upload(audio_client, monkeypatch):
-    from tempfile import TemporaryFile
-
-    from starlette.datastructures import FormData
-
-    from mlx_vlm.server import audio_diarized as diarized
-    from mlx_vlm.server.audio_speakers import SpeakerTaskPayload
-
-    audio = TemporaryFile()
-    payload = SpeakerTaskPayload(audio, 512, "test")
-    monkeypatch.setattr(diarized, "_parse", AsyncMock(return_value=("test", payload)))
-    form = FormData({"model": "test", "stream": "true"})
-    request = NS(
-        form=AsyncMock(return_value=form), is_disconnected=AsyncMock(return_value=True)
-    )
-    job = server_audio.AudioInferenceRequest(
-        kind="diarized_stt", model_name="test", payload=payload
-    )
-    handle = server_audio.AudioInferenceHandle(
-        job.request_id, job.result_queue, job.cancel_event, job.ready_event, job
-    )
-    monkeypatch.setattr(
-        server_audio, "_get_audio_queue", lambda: NS(submit=lambda **kw: handle)
-    )
-
-    async def invoke():
-        response = await diarized.response(request)
-        events = [value async for value in response.body_iterator]
-        assert "error" in events[0]
-
-    try:
-        asyncio.run(invoke())
-        assert job.cancel_event.is_set()
-        assert not audio.closed  # Cleanup belongs to the worker.
-    finally:
-        audio.close()
-
-
-def test_diarized_queue_cancellation_releases_upload(audio_client, monkeypatch):
-    import threading
-    from tempfile import TemporaryFile
-
-    from mlx_vlm.server import audio_diarized as diarized
-    from mlx_vlm.server.audio_speakers import SpeakerTaskPayload
-
-    entered, release = threading.Event(), threading.Event()
-
-    def run(request, getter):
-        entered.set()
-        assert release.wait(5)
-
-    monkeypatch.setattr(diarized, "run_request", run)
-    audio = TemporaryFile()
-    worker = server_audio._get_audio_queue()
-    handle = worker.submit(
-        kind="diarized_stt",
-        model_name="test",
-        payload=SpeakerTaskPayload(audio, 512, "test"),
-    )
-    assert entered.wait(5)
-    handle.cancel()
-    release.set()
-    worker.stop_and_join()
-    assert audio.closed
 
 
 def test_diarized_slow_consumer_cancellation_does_not_block_worker():
