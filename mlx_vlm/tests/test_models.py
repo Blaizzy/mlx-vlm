@@ -5166,3 +5166,120 @@ def test_lfm3_audio_checkpoint_transcribes_its_own_speech(tmp_path):
     )
     text = generate(model, processor, prompt, audio=[str(path)], temperature=0.0).text
     assert text.strip().lower().rstrip(".") == sentence.lower().rstrip(".")
+
+
+@pytest.fixture
+def lfm3_omni():
+    module = importlib.import_module("mlx_vlm.models.lfm3_omni")
+    config = module.ModelConfig.from_dict(model_case("lfm3_omni")["config"])
+    model = module.Model(config)
+    mx.eval(model.parameters())
+    return model
+
+
+def test_lfm3_omni_sanitize_maps_canonical_checkpoint_idempotently(lfm3_omni):
+    model = lfm3_omni
+    native = dict(tree_flatten(model.parameters()))
+    # the checkpoint's names and torch layouts
+    hf = {}
+    for name, value in native.items():
+        if name.endswith("conv.conv.weight"):
+            value = value.transpose(0, 2, 1)
+        elif value.ndim == 4:  # spatial_conv and the downsampler's Conv2d
+            value = value.transpose(0, 3, 1, 2)
+        elif name.endswith("lin_out.weight"):  # a Conv1d in the checkpoint
+            value = value[..., None]
+        name = name.replace("language_model.model.", "language_model.")
+        hf["model." + name.replace("audio_tower.", "audio_encoder.")] = value
+    assert hf["model.audio_encoder.downsample.conv_in.weight"].shape == (4, 1, 3, 3)
+    assert hf["model.audio_encoder.downsample.lin_mid.weight"].shape == (4, 4, 1, 1)
+    assert "model.depth_decoder.depth_embeddings.0.embedding.weight" in hf
+    assert "model.vision_tower.layers.0.conv.spatial_conv.weight" in hf
+    once = model.sanitize(hf)
+    twice = model.sanitize(once)
+    assert once.keys() == native.keys() == twice.keys()
+    for name, value in native.items():
+        assert mx.array_equal(once[name], value), name
+        assert mx.array_equal(twice[name], value), name
+    model.load_weights(list(once.items()), strict=True)
+
+
+def test_lfm3_omni_scatters_media_and_never_samples_placeholders(
+    lfm3_omni, monkeypatch
+):
+    model = lfm3_omni
+    pixels, grid = mx.random.normal((16, 24)), mx.array([[1, 4, 4]])
+    video, video_grid = mx.random.normal((32, 24)), mx.array([[2, 4, 4]])
+    features = mx.random.normal((1, 16, 20))
+    image = model.encode_images(pixels, image_grid_thw=grid)
+    clip = model.encode_images(video, image_grid_thw=video_grid)
+    audio = model.audio_projector(model.audio_tower(features, mx.array([20])))
+    assert (image.shape[0], clip.shape[0], audio.shape[0]) == (4, 8, 3)
+    ids = mx.array([[1] + [56] * 4 + [2] + [60] * 3 + [3] + [57] * 8 + [61]])
+    embeds = model.get_input_embeddings(
+        ids,
+        pixels,
+        image_grid_thw=grid,
+        pixel_values_videos=video,
+        video_grid_thw=video_grid,
+        input_features=features,
+        audio_out_codes=[[1] * 12],
+    ).inputs_embeds[0]
+    assert mx.allclose(embeds[1:5], image, atol=1e-6)
+    assert mx.allclose(embeds[6:9], audio, atol=1e-6)
+    assert mx.allclose(embeds[10:18], clip, atol=1e-6)
+    table = model.codebook_embedding.weight
+    assert mx.allclose(embeds[18], table[mx.arange(12) * 5 + 1].sum(0), atol=1e-5)
+    text = model.language_model.model.embed_tokens(mx.array([1, 2, 3]))
+    assert mx.allclose(embeds[mx.array([0, 5, 9])], text)
+    with pytest.raises(ValueError, match="do not match"):
+        model.get_input_embeddings(ids, pixels, image_grid_thw=grid)
+    placeholders = mx.array([56, 57, 60, 61])
+    assert (model(mx.array([[1, 2]])).logits[..., placeholders] == -mx.inf).all()
+    module = importlib.import_module("mlx_vlm.models.lfm3_audio.lfm3_audio")
+    seen = []
+    monkeypatch.setattr(
+        module, "sample", lambda *a: seen.append(sorted(a[5])) or mx.array([50])
+    )
+    list(model.stream_slots(mx.array([[1, 2]])))
+    assert seen == [placeholders.tolist()]
+
+
+def test_lfm3_omni_quantized_checkpoint_roundtrip(tmp_path, lfm3_omni):
+    from dataclasses import asdict
+
+    from mlx_vlm.utils import load_model, skip_multimodal_module
+
+    model = lfm3_omni
+    keep = model.quant_predicate
+    nn.quantize(  # the predicate convert builds
+        model,
+        group_size=32,
+        bits=4,
+        class_predicate=lambda path, m: hasattr(m, "to_quantized")
+        and not skip_multimodal_module(path)
+        and keep(path, m),
+    )
+    model.eval()
+    weights = dict(tree_flatten(model.parameters()))
+    quantized = {k[: -len(".scales")] for k in weights if k.endswith(".scales")}
+    assert "language_model.model.embed_tokens" in quantized
+    speech_and_vision = (
+        "vision_tower",
+        "multi_modal_projector",
+        "audio_tower",
+        "audio_projector",
+        "depth_decoder",
+        "codebook_embedding",
+    )
+    assert not any(k.startswith(speech_and_vision) for k in quantized)
+    ids = mx.array([[1] + [56] * 4 + [2]])
+    kwargs = dict(pixel_values=mx.random.normal((16, 24)), image_grid_thw=[[1, 4, 4]])
+    expected = model(ids, **kwargs).logits
+    config = asdict(model.config)
+    config["quantization"] = dict(group_size=32, bits=4)
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+    restored = load_model(tmp_path)
+    actual = restored(ids, **kwargs).logits
+    np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))

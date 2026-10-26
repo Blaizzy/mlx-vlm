@@ -81,26 +81,7 @@ class Lfm3AudioProcessor:
         if images is not None:
             raise ValueError("LFM3-Audio does not read images")
         texts = [text] if isinstance(text, str) else list(text)
-        data = {}
-        clips = [] if audio is None else audio
-        clips = [clips] if isinstance(clips, np.ndarray) and clips.ndim == 1 else clips
-        counts = []
-        if len(clips):
-            features, mask = extract_features(clips)
-            data.update(input_features=features, feature_attention_mask=mask)
-            counts = num_encoder_tokens(mask.sum(-1)).tolist()
-        texts = self._expand(texts, self.audio_token, counts)
-        codes = []
-        for c in [] if audio_out_codes is None else audio_out_codes:
-            c = np.asarray(c, np.int32)
-            if c.ndim != 2 or c.shape[1] != 12:
-                raise ValueError(
-                    f"audio_out_codes clips must be [frames, 12], got {c.shape}"
-                )
-            codes.append(np.concatenate([c, np.full((1, 12), self.audio_eos_code)]))
-        texts = self._expand(texts, self.audio_out_token, [len(c) for c in codes])
-        if codes:
-            data["audio_out_codes"] = np.concatenate(codes).astype(np.int32)
+        texts, data = self.expand_speech(texts, audio, audio_out_codes)
         data.update(
             self.tokenizer(
                 texts,
@@ -113,6 +94,31 @@ class Lfm3AudioProcessor:
         if return_tensors == "mlx":
             return BatchFeature(data=to_mlx(data))
         return BatchFeature(data=data, tensor_type=return_tensors)
+
+    @classmethod
+    def expand_speech(cls, texts, audio=None, audio_out_codes=None):
+        """Expand the speech placeholders of ``texts``: (texts, numpy model inputs)."""
+        data = {}
+        clips = [] if audio is None else audio
+        clips = [clips] if isinstance(clips, np.ndarray) and clips.ndim == 1 else clips
+        counts = []
+        if len(clips):
+            features, mask = extract_features(clips)
+            data.update(input_features=features, feature_attention_mask=mask)
+            counts = num_encoder_tokens(mask.sum(-1)).tolist()
+        texts = cls._expand(texts, cls.audio_token, counts)
+        codes = []
+        for c in [] if audio_out_codes is None else audio_out_codes:
+            c = np.asarray(c, np.int32)
+            if c.ndim != 2 or c.shape[1] != 12:
+                raise ValueError(
+                    f"audio_out_codes clips must be [frames, 12], got {c.shape}"
+                )
+            codes.append(np.concatenate([c, np.full((1, 12), cls.audio_eos_code)]))
+        texts = cls._expand(texts, cls.audio_out_token, [len(c) for c in codes])
+        if codes:
+            data["audio_out_codes"] = np.concatenate(codes).astype(np.int32)
+        return texts, data
 
     def save_pretrained(self, save_directory, **kwargs):
         self.tokenizer.save_pretrained(save_directory, **kwargs)

@@ -111,4 +111,4 @@ It includes mixed caches, sliding-window wraparound, batch offsets, partial
 rotary coordinates, frame separation, placeholder counts, and quantized
 checkpoint round trips.
 
-LFM3-Audio and LFM3-Omni are not included in this module.
+LFM3-Omni is documented in [its README](../lfm3_omni/README.md).
