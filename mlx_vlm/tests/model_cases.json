@@ -2,6 +2,65 @@
   "version": 2,
   "cases": [
     {
+      "id": "lfm3",
+      "module": "lfm3",
+      "config": {
+        "hidden_size": 32,
+        "intermediate_size": 64,
+        "num_hidden_layers": 3,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "vocab_size": 64,
+        "layer_types": [
+          "conv",
+          "full_attention",
+          "sliding_attention"
+        ],
+        "sliding_window": 4
+      },
+      "checks": [
+        "forward_cache"
+      ]
+    },
+    {
+      "id": "lfm3_vl",
+      "module": "lfm3_vl",
+      "config": {
+        "text_config": {
+          "hidden_size": 32,
+          "intermediate_size": 64,
+          "num_hidden_layers": 3,
+          "num_attention_heads": 4,
+          "num_key_value_heads": 2,
+          "vocab_size": 64,
+          "layer_types": [
+            "conv",
+            "full_attention",
+            "sliding_attention"
+          ],
+          "sliding_window": 4
+        },
+        "vision_config": {
+          "hidden_size": 32,
+          "intermediate_size": 64,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 4,
+          "num_key_value_heads": 2,
+          "patch_size": 2,
+          "layer_types": [
+            "conv",
+            "full_attention"
+          ]
+        },
+        "projector_hidden_size": 48,
+        "image_token_id": 60,
+        "video_token_id": 61
+      },
+      "checks": [
+        "forward_cache"
+      ]
+    },
+    {
       "id": "flint",
       "module": "flint",
       "config": {
