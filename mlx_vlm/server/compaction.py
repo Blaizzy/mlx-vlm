@@ -596,6 +596,14 @@ def _context_limit(config, *, required=True):
     return min(limits)
 
 
+def with_transient_context(items, request):
+    """Append request-local data only when rendering; never persist it as history."""
+    text = request.transient_context
+    if not text:
+        return items
+    return items + [{"type": "message", "role": "user", "content": text}]
+
+
 async def compact_response_context(
     request,
     items,
@@ -623,6 +631,8 @@ async def compact_response_context(
     )
 
     def render(context, generation_args=args):
+        if generation_args is args:
+            context = with_transient_context(context, request)
         if isinstance(request, ChatRequest):
             messages = [_chat_message_to_prompt(item) for item in context]
             _, images = _response_items_to_chat(
@@ -685,7 +695,9 @@ async def compact_response_context(
     fingerprints = []
     restored = False
     if automatic and isinstance(request, ChatRequest):
-        options = request.model_dump(exclude={"messages", "stream"}, exclude_none=True)
+        options = request.model_dump(
+            exclude={"messages", "stream", "transient_context"}, exclude_none=True
+        )
         cache_scope = hashlib.sha256(
             json.dumps(
                 [tenant, id(processor), limit, options], sort_keys=True, default=str

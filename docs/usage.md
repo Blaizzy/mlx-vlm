@@ -65,6 +65,20 @@ after a new summary must be prefilled again because their old KV states depended
 on the discarded history. Repeated continuations can cache the new summary and
 retained turns normally. Compaction also works with APC disabled.
 
+For changing environment snapshots, Chat Completions and Responses accept the
+MLX extension `transient_context` (a string, passed through SDK `extra_body`).
+The server appends it as user context for generation and includes it in token
+counts and context budgets. It is excluded from summary prompts, compaction
+capsules, stored Responses history, and the Chat Completions summary-cache key.
+Send the current snapshot on every request; omitting it removes it from the next
+generation. Keep canonical user turns and tool receipts in `messages`/`input`.
+This prevents a client that replays a capsule and sends fresh environment data
+from accumulating old snapshots. It does not erase snapshots previously sent
+as ordinary messages; rebuild those capsules from the canonical transcript.
+Models may still refer to environment data in their generated output, which
+remains ordinary conversation history. Oversized transient context is subject
+to the same input budget as protected user text.
+
 Start a server with APC:
 
 ```bash

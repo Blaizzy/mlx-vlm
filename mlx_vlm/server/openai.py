@@ -720,7 +720,9 @@ async def responses_input_tokens_endpoint(request: Request):
             prompt_items, model=openai_request.model, tenant=_read_tenant_id(request)
         )
         prompt_items, _ = compaction.split_trigger(prompt_items)
-        chat_messages, images = _response_items_to_chat(prompt_items)
+        chat_messages, images = _response_items_to_chat(
+            compaction.with_transient_context(prompt_items, openai_request)
+        )
         _normalize_instruction_messages(
             chat_messages,
             openai_request.instructions,
@@ -1092,7 +1094,9 @@ async def responses_endpoint(request: Request):
                     *compaction_args, **compaction_options
                 )
             )
-        chat_messages, images = _response_items_to_chat(prompt_items)
+        chat_messages, images = _response_items_to_chat(
+            compaction.with_transient_context(prompt_items, openai_request)
+        )
         instructions = _normalize_instruction_messages(
             chat_messages,
             openai_request.instructions,
@@ -1126,7 +1130,9 @@ async def responses_endpoint(request: Request):
             template_kwargs["tool_choice"] = openai_request.tool_choice
 
         def render_prompt(items):
-            messages, images = _response_items_to_chat(items)
+            messages, images = _response_items_to_chat(
+                compaction.with_transient_context(items, openai_request)
+            )
             _normalize_instruction_messages(messages, openai_request.instructions)
             _ensure_effective_input(messages, images=images)
             prompt = apply_chat_template(
@@ -1985,6 +1991,11 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 videos.append(video)
             processed_messages.append(
                 _chat_message_to_prompt(message.model_dump(exclude_none=True))
+            )
+
+        if request.transient_context:
+            processed_messages.append(
+                {"role": "user", "content": request.transient_context}
             )
 
         _normalize_instruction_messages(processed_messages)
