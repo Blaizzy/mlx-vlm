@@ -4637,6 +4637,68 @@ class TestUnlimitedOCR2Dash:
                 ).max()
                 assert err < (1e-5 if dtype == mx.float32 else 2e-2), (pos, err)
 
+    def test_sparse_prefill_matches_dense_mask(self):
+        from mlx_vlm.models.unlimited_ocr import dash_kernels
+        from mlx_vlm.models.unlimited_ocr.config import TextConfig
+        from mlx_vlm.models.unlimited_ocr.dash import (
+            DashAttention,
+            DashParams,
+            block_scores,
+            route_select,
+        )
+
+        sparse, _ = self.params(
+            sparse_block_size=32,
+            sparse_local_block=4,
+            sparse_index_dim=128,
+            dash_topk_blocks=12,
+        )
+        p = DashParams.from_config(sparse, 1, 128)
+        attn = DashAttention(
+            TextConfig(
+                hidden_size=1280, num_attention_heads=10, num_key_value_heads=10
+            ),
+            0,
+            p,
+        )
+        rng = np.random.default_rng(13)
+        # From the start, a chunk at an unaligned offset, and bfloat16.
+        for offset, L, dtype in (
+            (0, 100, mx.float32),
+            (0, 700, mx.float32),
+            (300, 517, mx.float32),
+            (0, 900, mx.bfloat16),
+        ):
+            total = offset + L
+            nblk = -(-total // p.block_size)
+            alloc = -(-total // 256) * 256
+            shape = (1, 10, alloc, 128)
+            keys = mx.array(rng.normal(size=shape)).astype(dtype)
+            values = mx.array(rng.normal(size=shape)).astype(dtype)
+            q = mx.array(rng.normal(size=(1, 10, L, 128))).astype(dtype)
+            idx_q = mx.array(rng.normal(size=(L, 128)).astype(np.float32))
+            summ = mx.array(rng.normal(size=(total // 32, 128)).astype(np.float32))
+            scores = block_scores(idx_q, summ, mx.arange(offset, total), nblk, p)
+            cand = mx.array(rng.random((L, nblk)) < 0.6)
+            topi, bias, valid = route_select(
+                scores, cand, attn.idx_scale, attn.floor, p
+            )
+            ks, vs = keys[..., :total, :], values[..., :total, :]
+            ref = attn._prefill(q, ks, vs, topi, bias, valid, offset, nblk)
+            outs = [attn._prefill_gather(q, ks, vs, topi, bias, valid, offset)]
+            if dash_kernels.prefill_supported(p, 128, total):
+                outs.append(
+                    dash_kernels.dash_prefill(
+                        q, keys, values, topi, bias, valid, offset, p, attn.scale
+                    )
+                )
+            tol = 1e-5 if dtype == mx.float32 else 2e-2
+            for out in outs:
+                err = np.abs(
+                    np.array(out.astype(mx.float32)) - np.array(ref.astype(mx.float32))
+                ).max()
+                assert err < tol, (offset, L, err)
+
     def test_entmax15_is_a_sparse_distribution(self):
         from mlx_vlm.models.unlimited_ocr.dash import entmax15
 

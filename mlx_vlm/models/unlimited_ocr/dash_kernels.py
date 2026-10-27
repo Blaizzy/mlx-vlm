@@ -1,5 +1,10 @@
 """Metal kernels for Unlimited-OCR-2 DASH attention.
 
+``dash_prefill`` is block-sparse prefill attention: each simdgroup takes 8
+queries, walks the union of their selected blocks and local window in key
+order and runs QK^T / PV on 8x8 simdgroup matrices with an online softmax, so
+the cost follows the attended keys instead of the [L, S] grid.
+
 ``dash_decode`` fuses one decode step of a layer: block routing
 (``_decode_select``) and the gathered attention over the selected blocks plus
 the local window (``DashAttention._decode``), reading keys and values straight
@@ -209,6 +214,277 @@ _DECODE_SOURCE = """
         out[size_t(h) * D + tid] = static_cast<T>(acc / ll);
     }
 """
+
+_PREFILL_SOURCE = """
+    constexpr int NF = D / 8;             // 8-wide dim fragments
+    constexpr int NBK = BK / 8;           // 8-key fragments per staged chunk
+    constexpr int TQ = 8 * NSG;           // queries per threadgroup tile
+    constexpr int TGS = 32 * NSG;
+    threadgroup atomic_uint bits[(1 + NSG) * MAXW];  // tile union + per simdgroup
+    threadgroup int tsel[TQ * K];
+    threadgroup float tbias[TQ * K];
+    constexpr int LD = D + 4;             // padded rows: no bank conflicts
+    threadgroup float ks[BK * LD];
+    threadgroup float vs[BK * LD];
+
+    uint t = threadgroup_position_in_grid.x;
+    uint h = threadgroup_position_in_grid.y;
+    uint tid = thread_position_in_threadgroup.x;
+    uint sg = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    int offset = params[0];
+    int L = params[1];
+    float scale = params_f[0];
+    int t0 = (offset / 32) * 32 + TQ * int(t);
+    int a0 = t0 + 8 * int(sg);
+    int amin = metal::max(a0, offset);
+    int amax = metal::min(a0 + 7, offset + L - 1);
+    int tmin = metal::max(t0, offset);
+    int tmax = metal::min(t0 + TQ - 1, offset + L - 1);
+    threadgroup atomic_uint* ubits = bits;
+    threadgroup atomic_uint* sbits = bits + (1 + sg) * MAXW;
+
+    // Union of the blocks the tile (and each simdgroup) attends, as bitmaps.
+    for (int w = tid; w < (1 + NSG) * MAXW; w += TGS) {
+        atomic_store_explicit(&bits[w], 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane < 8) {
+        int rel = a0 + int(lane) - offset;
+        bool ok = rel >= 0 && rel < L;
+        for (int i = 0; i < K; i++) {
+            int b = ok ? topi[rel * K + i] : -1;
+            tsel[(8 * sg + lane) * K + i] = b;
+            tbias[(8 * sg + lane) * K + i] = ok ? bias[rel * K + i] : 0.0f;
+            if (b >= 0) {
+                atomic_fetch_or_explicit(&sbits[b / 32], 1u << (b % 32), memory_order_relaxed);
+                atomic_fetch_or_explicit(&ubits[b / 32], 1u << (b % 32), memory_order_relaxed);
+            }
+        }
+    }
+    if (amin <= amax) {
+        for (int b = metal::max(amin - LW + 1, 0) / BS + lane; b <= amax / BS; b += 32) {
+            atomic_fetch_or_explicit(&sbits[b / 32], 1u << (b % 32), memory_order_relaxed);
+            atomic_fetch_or_explicit(&ubits[b / 32], 1u << (b % 32), memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 8x8 fragment coordinates of this lane: (fm, fn) and (fm, fn + 1).
+    short qid = lane / 4;
+    short fm = (qid & 4) + ((lane / 2) % 4);
+    short fn = (qid & 2) * 2 + (lane % 2) * 2;
+    int a = a0 + fm;
+    int rel = a - offset;
+    bool row_ok = rel >= 0 && rel < L;
+    bool sg_live = amin <= amax;
+    int S_alloc = keys_shape[2];
+    int kvh = h / (HQ / HK);
+    auto kh = keys + size_t(kvh) * S_alloc * D;
+    auto vh = values + size_t(kvh) * S_alloc * D;
+    auto qr = q + (size_t(h) * L + (row_ok ? rel : 0)) * D;
+
+    constexpr int LQ = D + 4;
+    threadgroup float qs[TQ * LQ];
+    simdgroup_matrix<float, 8, 8> Of[NF];
+    simdgroup_matrix<float, 8, 8> Sf[NBK];
+    for (int c = 0; c < NF; c++) {
+        qs[(8 * sg + fm) * LQ + 8 * c + fn] = row_ok ? static_cast<float>(qr[8 * c + fn]) * scale : 0.0f;
+        qs[(8 * sg + fm) * LQ + 8 * c + fn + 1] = row_ok ? static_cast<float>(qr[8 * c + fn + 1]) * scale : 0.0f;
+        Of[c] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+    float m = -INFINITY;
+    float l = 0.0f;
+
+    // The tile's blocks in key order.
+    threadgroup int ulist[TQ * K + 8];
+    threadgroup int nu_s;
+    if (tid == 0) {
+        int n = 0;
+        for (int w = 0; w <= tmax / BS / 32; w++) {
+            uint word = atomic_load_explicit(&ubits[w], memory_order_relaxed);
+            while (word != 0u) {
+                ulist[n++] = w * 32 + ctz(word);
+                word &= word - 1u;
+            }
+        }
+        nu_s = n;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    constexpr int CPB = BS / BK;
+    constexpr int EPT = BK * D / TGS;     // staged elements per thread
+    int nchunks = nu_s * CPB;
+    T kr[EPT], vr[EPT];
+    {
+        int k0 = ulist[0] * BS;
+        for (int e = 0; e < EPT; e++) {
+            kr[e] = kh[size_t(k0) * D + tid * EPT + e];
+            vr[e] = vh[size_t(k0) * D + tid * EPT + e];
+        }
+    }
+    for (int ci = 0; ci < nchunks; ci++) {
+        int b = ulist[ci / CPB];
+        int k0 = b * BS + (ci % CPB) * BK;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int e = 0; e < EPT; e++) {
+            int i = tid * EPT + e;
+            ks[(i / D) * LD + i % D] = static_cast<float>(kr[e]);
+            vs[(i / D) * LD + i % D] = static_cast<float>(vr[e]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (ci + 1 < nchunks) {
+            // Prefetch the next chunk while this one computes.
+            int n0 = ulist[(ci + 1) / CPB] * BS + ((ci + 1) % CPB) * BK;
+            for (int e = 0; e < EPT; e++) {
+                kr[e] = kh[size_t(n0) * D + tid * EPT + e];
+                vr[e] = vh[size_t(n0) * D + tid * EPT + e];
+            }
+        }
+        uint mine = atomic_load_explicit(&sbits[b / 32], memory_order_relaxed);
+        if (!sg_live || !((mine >> (b % 32)) & 1u)) {
+            continue;
+        }
+        float badd = -INFINITY;
+        for (int i = 0; i < K; i++) {
+            int r = (8 * sg + fm) * K + i;
+            badd = tsel[r] == b ? tbias[r] : badd;
+        }
+        {
+            {
+                // S = (scale Q) K^T over the chunk.
+                for (int j = 0; j < NBK; j++) {
+                    Sf[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+                    for (int c = 0; c < NF; c++) {
+                        simdgroup_matrix<float, 8, 8> Qf, Kf;
+                        simdgroup_load(Qf, qs + 8 * sg * LQ + 8 * c, LQ);
+                        simdgroup_load(Kf, ks + 8 * j * LD + 8 * c, LD, ulong2(0, 0), true);
+                        simdgroup_multiply_accumulate(Sf[j], Qf, Kf, Sf[j]);
+                    }
+                }
+
+                // Local window unbiased, remote keys get the block bias, causal.
+                float rm = -INFINITY;
+                for (int j = 0; j < NBK; j++) {
+                    for (int e = 0; e < 2; e++) {
+                        int key = k0 + 8 * j + fn + e;
+                        float add = key > a ? -INFINITY : (key > a - LW ? 0.0f : badd);
+                        float sv = row_ok ? Sf[j].thread_elements()[e] + add : -INFINITY;
+                        Sf[j].thread_elements()[e] = sv;
+                        rm = metal::max(rm, sv);
+                    }
+                }
+                rm = metal::max(rm, simd_shuffle_xor(rm, ushort(1)));
+                rm = metal::max(rm, simd_shuffle_xor(rm, ushort(8)));
+                float mn = metal::max(m, rm);
+                float factor = m == -INFINITY ? 0.0f : metal::fast::exp(m - mn);
+                float rs = 0.0f;
+                for (int j = 0; j < NBK; j++) {
+                    for (int e = 0; e < 2; e++) {
+                        float sv = Sf[j].thread_elements()[e];
+                        float pe = sv == -INFINITY ? 0.0f : metal::fast::exp(sv - mn);
+                        Sf[j].thread_elements()[e] = pe;
+                        rs += pe;
+                    }
+                }
+                rs += simd_shuffle_xor(rs, ushort(1));
+                rs += simd_shuffle_xor(rs, ushort(8));
+                l = l * factor + rs;
+                m = mn;
+
+                // O = factor O + P V.
+                for (int c = 0; c < NF; c++) {
+                    Of[c].thread_elements()[0] *= factor;
+                    Of[c].thread_elements()[1] *= factor;
+                    for (int j = 0; j < NBK; j++) {
+                        simdgroup_matrix<float, 8, 8> Vf;
+                        simdgroup_load(Vf, vs + 8 * j * LD + 8 * c, LD);
+                        simdgroup_multiply_accumulate(Of[c], Sf[j], Vf, Of[c]);
+                    }
+                }
+            }
+        }
+    }
+    if (row_ok) {
+        float inv = 1.0f / l;
+        auto orow = out + (size_t(h) * L + rel) * D;
+        for (int c = 0; c < NF; c++) {
+            orow[8 * c + fn] = static_cast<T>(Of[c].thread_elements()[0] * inv);
+            orow[8 * c + fn + 1] = static_cast<T>(Of[c].thread_elements()[1] * inv);
+        }
+    }
+"""
+
+# Bitmap words per simdgroup: prompts of up to 32 * MAXW blocks.
+_PREFILL_MAXW = 128
+_PREFILL_NSG = 4
+_PREFILL_BK = 8
+
+_prefill_kernel = (
+    mx.fast.metal_kernel(
+        name="dash_prefill",
+        input_names=["q", "keys", "values", "topi", "bias", "params", "params_f"],
+        output_names=["out"],
+        source=_PREFILL_SOURCE,
+        header="#include <metal_simdgroup_matrix>\n",
+    )
+    if _HAS_METAL
+    else None
+)
+
+
+def prefill_supported(p, head_dim: int, total: int) -> bool:
+    return (
+        _prefill_kernel is not None
+        and mx.default_device() == mx.gpu
+        and head_dim % 8 == 0
+        and p.block_size % 8 == 0
+        and 8192 // (head_dim * 4) >= 8
+        and -(-total // p.block_size) <= 32 * _PREFILL_MAXW
+    )
+
+
+def dash_prefill(q, keys, values, topi, bias, valid, offset: int, p, scale: float):
+    """Block-sparse prefill attention.
+
+    ``q`` [1, HQ, L, D] (rotated), ``keys``/``values`` the full cache buffers
+    [1, HK, S_alloc, D] holding positions ``< offset + L``; ``topi``/``bias``/
+    ``valid`` [L, K] from ``route_select``. Returns [1, HQ, L, D].
+    """
+    _, hq, L, d = q.shape
+    sel = mx.where(valid, topi.astype(mx.int32), -1)
+    # The reference adds the bias through a mask in the query dtype.
+    b = bias.astype(q.dtype).astype(mx.float32)
+    nsg = _PREFILL_NSG
+    tiles = -(-(offset + L - offset // 32 * 32) // (8 * nsg))
+    return _prefill_kernel(
+        inputs=[
+            q,
+            keys,
+            values,
+            sel,
+            b,
+            mx.array([offset, L], dtype=mx.int32),
+            mx.array([scale], dtype=mx.float32),
+        ],
+        template=[
+            ("T", q.dtype),
+            ("D", d),
+            ("HQ", hq),
+            ("HK", keys.shape[1]),
+            ("BS", p.block_size),
+            ("LW", p.local_window),
+            ("K", topi.shape[-1]),
+            ("MAXW", _PREFILL_MAXW),
+            # Staged keys per chunk: f32 K and V chunks fit in 16 KB.
+            ("BK", _PREFILL_BK),
+            ("NSG", nsg),
+        ],
+        grid=(tiles * 32 * nsg, hq, 1),
+        threadgroup=(32 * nsg, 1, 1),
+        output_shapes=[q.shape],
+        output_dtypes=[q.dtype],
+    )[0]
+
 
 _decode_kernel = (
     mx.fast.metal_kernel(

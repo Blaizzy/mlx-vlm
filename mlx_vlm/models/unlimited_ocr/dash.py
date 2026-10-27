@@ -665,7 +665,9 @@ class DashAttention(nn.Module):
             summaries = cache.summary_buffer(cap, idx_k.shape[-1])
             # The fused kernel reads floating-point K/V; packed (quantized) caches
             # keep the gathered path.
-            if not isinstance(cache, QuantizedKVCache) and dash_kernels.decode_supported(
+            if not isinstance(
+                cache, QuantizedKVCache
+            ) and dash_kernels.decode_supported(
                 p, self.n_heads, self.head_dim, idx_k.shape[-1], cap
             ):
                 out = dash_kernels.dash_decode(
@@ -694,16 +696,123 @@ class DashAttention(nn.Module):
             cand = cand[..., :nblk]
         topi, bias, valid = route_select(scores, cand, self.idx_scale, self.floor, p)
 
-        out = self._prefill(
-            q, keys, values, topi, bias, valid, ctx.offset, nblk, cache=cache
-        )
+        # The fused kernel reads floating-point K/V; packed (quantized) caches
+        # take the sparse gather path.
+        if not isinstance(cache, QuantizedKVCache) and dash_kernels.prefill_supported(
+            p, self.head_dim, total
+        ):
+            out = dash_kernels.dash_prefill(
+                q,
+                cache.keys,
+                cache.values,
+                topi,
+                bias,
+                valid,
+                ctx.offset,
+                p,
+                self.scale,
+            )
+        else:
+            out = self._prefill_gather(
+                q, keys, values, topi, bias, valid, ctx.offset, cache=cache
+            )
         out = out.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(out)
+
+    def _prefill_gather(
+        self, q, keys, values, topi, bias, valid, offset, tile=32, cache=None
+    ):
+        """Sparse prefill from mlx ops (off Metal, and for quantized caches).
+
+        Each tile of ``tile`` queries gathers the union of its selected blocks
+        and local window and runs one masked sdpa over those keys only. Tiles
+        are grouped by union size so padding stays small.
+        """
+        p = self.params
+        bs, lw = p.block_size, p.local_window
+        L = q.shape[2]
+        sel = np.where(np.array(valid), np.array(topi).astype(np.int32), -1)
+        nt = -(-L // tile)
+        unions = []
+        for t in range(nt):
+            r0, r1 = t * tile, min((t + 1) * tile, L)
+            lo = max(offset + r0 - lw + 1, 0) // bs
+            u = set(range(lo, (offset + r1 - 1) // bs + 1))
+            u.update(np.unique(sel[r0:r1]).tolist())
+            u.discard(-1)
+            unions.append(sorted(u))
+        pad = nt * tile - L
+        q_t = mx.pad(q[0], [(0, 0), (0, pad), (0, 0)])
+        sel_t = mx.pad(mx.array(sel), [(0, pad), (0, 0)], constant_values=-1)
+        bias_t = mx.pad(bias, [(0, pad), (0, 0)])
+        out = [None] * nt
+        order = sorted(range(nt), key=lambda t: len(unions[t]))
+        for g in range(0, nt, 8):
+            tiles = order[g : g + 8]
+            C = len(unions[tiles[-1]])
+            U = np.full((len(tiles), C), -1, np.int32)
+            for i, t in enumerate(tiles):
+                U[i, : len(unions[t])] = unions[t]
+            o = self._gather_tiles(
+                q_t,
+                keys,
+                values,
+                sel_t,
+                bias_t,
+                mx.array(U),
+                tiles,
+                offset,
+                tile,
+                cache,
+            )
+            for i, t in enumerate(tiles):
+                out[t] = o[i]
+        return mx.concatenate(out, axis=1)[None, :, :L]
+
+    def _gather_tiles(
+        self, q_t, keys, values, sel_t, bias_t, U, tiles, offset, tile, cache=None
+    ):
+        """Attention of query tiles ``tiles`` over their block unions ``U``."""
+        p = self.params
+        bs, lw = p.block_size, p.local_window
+        H, _, D = q_t.shape
+        n, C = U.shape
+        # Packed (quantized) caches hand over (data, scales, biases) tuples.
+        total = (keys[0] if isinstance(keys, (tuple, list)) else keys).shape[2]
+        rows = mx.array([[t * tile + r for r in range(tile)] for t in tiles])
+        qpos = (rows + offset)[..., None]
+        live = U >= 0
+        kpos = (mx.maximum(U, 0)[..., None] * bs + mx.arange(bs)).reshape(n, 1, -1)
+        hit = sel_t[rows][..., None] == U[:, None, None, :]
+        blk = mx.where(hit, bias_t[rows][..., None], -mx.inf).max(axis=2)
+        blk = mx.repeat(mx.where(live[:, None], blk, -mx.inf), bs, axis=-1)
+        causal = (kpos <= qpos) & mx.repeat(live, bs, axis=-1)[:, None]
+        local = causal & (kpos > qpos - lw)
+        mask = mx.where(local, 0.0, mx.where(causal, blk, -mx.inf))
+
+        kidx = mx.minimum(kpos.reshape(-1), total - 1)
+
+        # Gather along the token axis (axis 2) of each array, so packed
+        # (quantized) K/V tuples work too. K/V keep their own head count (GQA).
+        def gather(x):
+            x = mx.take(x, kidx, axis=2)
+            return x.reshape(x.shape[1], n, C * bs, x.shape[-1]).transpose(1, 0, 2, 3)
+
+        k, v = tree_map(gather, (keys, values))
+        qt = q_t[:, rows.reshape(-1)].reshape(H, n, tile, D).transpose(1, 0, 2, 3)
+        return scaled_dot_product_attention(
+            qt,
+            k,
+            v,
+            cache=cache,
+            scale=self.scale,
+            mask=mask.astype(q_t.dtype)[:, None],
+        )
 
     def _prefill(
         self, q, keys, values, topi, bias, valid, offset, nblk, chunk=2048, cache=None
     ):
-        """Selected blocks (+bias) union the local window, as an additive mask."""
+        """Dense-mask reference of the sparse prefill (test oracle only)."""
         p = self.params
         L = q.shape[2]
         S = offset + L
