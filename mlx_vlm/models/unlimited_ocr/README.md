@@ -24,6 +24,8 @@ mlx_vlm.generate --model baidu/Unlimited-OCR-2 --image page_0001.png page_0002.p
     --prompt "Multi page parsing." --max-tokens 16384
 ```
 
+Like upstream `infer`, the crop mode is automatic unless `cropping` is passed: gundam for one page, base for several. Upstream's SGLang example instead sends whole documents with `crop_mode=True` (gundam tiles per page) and a 10-page window; pass `--processor-kwargs '{"cropping": true}'` for that layout.
+
 MLX implementation notes (`dash.py`):
 
 - Decode gathers only the selected blocks and the local window (`12 × 32 + 128 = 512` keys) instead of masking the whole cache, so the per-token attention cost does not grow with the document.

@@ -1,7 +1,7 @@
 import json
 import math
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import mlx.core as mx
 from PIL import Image, ImageOps
@@ -118,7 +118,7 @@ class UnlimitedOCRProcessor(DeepseekOCRProcessor):
         inference_mode: bool = True,
         base_size: int = 1024,
         image_size: int = 640,
-        cropping: bool = True,
+        cropping: Optional[bool] = None,
     ):
         (
             tokenized_str,
@@ -165,13 +165,16 @@ class UnlimitedOCRProcessor(DeepseekOCRProcessor):
         images: List[Image.Image],
         base_size: int = 1024,
         image_size: int = 640,
-        cropping: bool = True,
+        cropping: Optional[bool] = None,
     ):
         patch_size = self.patch_size
         downsample_ratio = self.downsample_ratio
         if self.page_layout:
             conversation = self.page_prompt(conversation, len(images))
-            cropping = cropping and len(images) == 1
+        if cropping is None:
+            # Upstream auto policy: v2 tiles a single page and uses one base view
+            # per page for multi-page requests; v1 always tiles.
+            cropping = len(images) == 1 or not self.page_layout
         valid_img_tokens = 0
         ratio = 1
 
