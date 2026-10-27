@@ -99,6 +99,10 @@ class UnlimitedOCRProcessor(DeepseekOCRProcessor):
         self.page_layout = page_layout
         self.max_crops = max_crops or (16 if page_layout else 32)
 
+    def __call__(self, *, cropping: Optional[bool] = None, **kwargs):
+        # The DeepSeek-OCR parent defaults cropping=True; None keeps the auto policy.
+        return super().__call__(cropping=cropping, **kwargs)
+
     def page_prompt(self, prompt: str, num_images: int) -> str:
         """Rewrite ``prompt`` into the trained ``<PAGE><image>...`` layout."""
         if not self.page_layout or not num_images or "<PAGE>" in prompt:
