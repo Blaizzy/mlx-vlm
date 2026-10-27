@@ -4695,6 +4695,86 @@ class TestUnlimitedOCR2Dash:
         assert all(old is new for old, new in zip(previous, cache))
 
 
+@pytest.mark.parametrize("mode,count", [("4x", 16), ("16x", 4)])
+def test_minicpm_ocr_vision_prefill_and_sanitize(mode, count):
+    from mlx_vlm.models.minicpm_ocr import Model, ModelConfig
+
+    cfg = ModelConfig.from_dict(model_case("minicpm_ocr")["config"])
+    model = Model(cfg)
+    ids = mx.array([[1, 50] + [48] * count + [51, 2]])
+    media = {
+        "pixel_values": [[mx.random.normal((3, 2, 128))]],
+        "tgt_sizes": [np.array([[8, 8]])],
+        "image_bound": [np.array([[2, 2 + count]])],
+        "downsample_mode": mode,
+    }
+    features = model.get_input_embeddings(ids, **media)
+    assert features.inputs_embeds.shape == (*ids.shape, 16)
+    assert features.position_ids.shape == (3, 1, ids.shape[-1])
+    ModelChecks().prefill_parity(model, ids, media, chunk_sizes=(3,))
+
+    norm = mx.linspace(-0.5, 0.5, 16)
+    conv = mx.arange(80 * 3).reshape(80, 1, 3).astype(mx.float32)
+    source = {
+        "model.language_model.layers.0.input_layernorm.weight": norm,
+        "model.language_model.layers.0.linear_attn.conv1d.weight": conv,
+        "model.vision_tower.embeddings.patch_embedding.weight": mx.arange(192).reshape(
+            16, 3, 2, 2
+        ),
+    }
+    first = model.sanitize(source)
+    second = model.sanitize(first)
+    for key in first:
+        assert mx.array_equal(first[key], second[key])
+    assert mx.array_equal(
+        first["language_model.model.layers.0.input_layernorm.weight"], norm + 1
+    )
+    assert mx.array_equal(
+        first["language_model.model.layers.0.linear_attn.conv1d.weight"],
+        conv.transpose(0, 2, 1),
+    )
+    with pytest.raises(ValueError, match="token count"):
+        model.get_input_embeddings(
+            ids, **{**media, "image_bound": [np.array([[2, 3]])]}
+        )
+
+
+def test_minicpm_ocr_position_bucket_rounding():
+    from mlx_vlm.models.minicpmv4_6.config import VisionConfig
+    from mlx_vlm.models.minicpmv4_6.vision import SiglipVisionEmbeddings
+
+    # The pretrained OCR position table is 70x70. Fractional arange in MLX
+    # float32 used to move the exact 0.25 boundary into the previous bucket.
+    embedding = SiglipVisionEmbeddings(
+        VisionConfig(hidden_size=1, image_size=140, patch_size=2)
+    )
+    embedding.patch_embedding.weight = mx.zeros_like(embedding.patch_embedding.weight)
+    embedding.patch_embedding.bias = mx.zeros_like(embedding.patch_embedding.bias)
+    embedding.position_embedding.weight = mx.arange(4900, dtype=mx.float32)[:, None]
+    actual = embedding(mx.zeros((1, 2, 28 * 38 * 2, 3)), tgt_sizes=mx.array([[28, 38]]))
+    boundaries = np.array([i / 70 for i in range(1, 70)], dtype=np.float32)
+    h = np.searchsorted(boundaries, np.arange(28, dtype=np.float32) / 28, side="right")
+    w = np.searchsorted(boundaries, np.arange(38, dtype=np.float32) / 38, side="right")
+    np.testing.assert_array_equal(actual[0, :, 0], (h[:, None] * 70 + w).ravel())
+
+
+def test_minicpm_ocr_preserves_norm_scale_and_activation_precision():
+    from mlx_vlm.models.minicpm_ocr import Model, ModelConfig
+
+    model = Model(ModelConfig.from_dict(model_case("minicpm_ocr")["config"]))
+    key = "model.language_model.layers.0.input_layernorm.weight"
+    value = mx.full((16,), 0.001, dtype=mx.bfloat16)
+    loaded_key = "language_model.model.layers.0.input_layernorm.weight"
+    weights = model.sanitize({key: value})
+    assert weights[loaded_key].dtype == mx.float32
+    assert mx.array_equal(weights[loaded_key], value.astype(mx.float32) + 1)
+    assert not model.cast_predicate(loaded_key)
+    assert not model.cast_predicate("language_model.model.layers.0.linear_attn.A_log")
+    norm = model.language_model.model.layers[0].input_layernorm
+    norm.weight = weights[loaded_key]
+    assert norm(mx.ones((1, 3, 16), dtype=mx.bfloat16)).dtype == mx.bfloat16
+
+
 @pytest.fixture
 def lfm3_case(request):
     case = model_case(getattr(request, "param", "lfm3"))

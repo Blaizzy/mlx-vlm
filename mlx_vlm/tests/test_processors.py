@@ -4329,6 +4329,116 @@ class TestMiniCPMV47Processor:
         assert np.count_nonzero(result["mm_token_type_ids"] == 1) == 4
 
 
+class TestMiniCPMOcrProcessor:
+    @staticmethod
+    def processor(**kwargs):
+        from mlx_vlm.models.minicpm_ocr import (
+            MiniCPMOcrImageProcessor,
+            MiniCPMOcrProcessor,
+        )
+
+        return MiniCPMOcrProcessor(
+            tokenizer=ProcessorTokenizer(**PROFILES["minicpm_tokenizer"]),
+            image_processor=MiniCPMOcrImageProcessor(**kwargs),
+        )
+
+    @pytest.mark.parametrize("mode,target", [("4x", [24, 42]), ("16x", [24, 44])])
+    def test_mode_specific_resize(self, mode, target):
+        p = self.processor()
+        result = p(
+            text="<|image_pad|>",
+            images=[Image.new("RGB", (301, 173))],
+            downsample_mode=mode,
+        )
+        assert result["tgt_sizes"][0].tolist() == [target]
+        assert result["downsample_mode"] == mode
+        divisor = 4 if mode == "4x" else 16
+        assert (
+            np.count_nonzero(result["mm_token_type_ids"] == 1)
+            == np.prod(target) // divisor
+        )
+        assert p.image_processor.downsample_mode == "4x"
+
+    def test_adaptive_resolution_and_per_slice_placeholders(self):
+        p = self.processor()
+        image = Image.new("RGB", (40, 20), "white")
+        result = p(
+            text="<|image_pad|>", images=[image], adaptive_small_image_upsize=True
+        )
+        assert result["tgt_sizes"][0].tolist() == [[4, 8]]
+        assert p.image_processor.adaptive_small_image_upsize is False
+        ids = p._build_placeholder_ids_for_image(
+            np.array([[4, 4], [2, 2], [4, 2]]), (2, 1), 0, 4
+        )
+        assert ids.count(p.image_token_id) == 7
+        assert p._compute_image_bounds(np.array(ids)).tolist() == [
+            [4, 8],
+            [10, 11],
+            [13, 15],
+        ]
+
+    @pytest.mark.parametrize("mode", ["4x", "16x"])
+    @pytest.mark.parametrize("size", [(40, 20), (1000, 800)])
+    def test_generation_routes_image_options(self, mode, size):
+        from mlx_vlm.utils import prepare_inputs
+
+        p = self.processor()
+        image = Image.new("RGB", size, "white")
+        options = {
+            "downsample_mode": mode,
+            "max_slice_nums": 1,
+            "adaptive_small_image_upsize": True,
+            "disable_small_image_upsize": True,
+        }
+        expected = p(text="<|image_pad|>", images=[image], **options)
+        actual = prepare_inputs(p, prompts="<|image_pad|>", images=[image], **options)
+        assert actual["downsample_mode"] == mode
+        np.testing.assert_array_equal(actual["input_ids"], expected["input_ids"])
+        np.testing.assert_array_equal(actual["tgt_sizes"][0], expected["tgt_sizes"][0])
+        assert len(actual["pixel_values"][0]) == 1
+        assert p.image_processor.downsample_mode == "4x"
+        assert p.image_processor.adaptive_small_image_upsize is False
+
+    def test_save_load_adaptive_settings(self, tmp_path):
+        from mlx_vlm.models.minicpm_ocr import MiniCPMOcrProcessor
+
+        p = self.processor(
+            adaptive_small_image_upsize=True,
+            adaptive_tile_upsize=True,
+            disable_small_image_upsize=True,
+            use_image_id=False,
+        )
+        tokens = p.tokenizer.special_tokens
+        p.tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(
+                WordLevel(vocab={t: i for i, t in enumerate(tokens)}, unk_token="<unk>")
+            ),
+            unk_token="<unk>",
+            pad_token="<unk>",
+            additional_special_tokens=list(tokens),
+        )
+        p.tokenizer.chat_template = (
+            "{% for message in messages %}{{ message.content }}{% endfor %}"
+        )
+        p = MiniCPMOcrProcessor(
+            tokenizer=p.tokenizer, image_processor=p.image_processor
+        )
+        p.save_pretrained(tmp_path)
+        (tmp_path / "config.json").write_text(
+            json.dumps({"model_type": "minicpm_ocr", "downsample_mode": "4x"})
+        )
+        loaded = AutoProcessor.from_pretrained(tmp_path)
+        assert isinstance(loaded, MiniCPMOcrProcessor)
+        assert loaded.image_processor.adaptive_tile_upsize
+        assert loaded.image_processor.adaptive_small_image_upsize
+        assert loaded.image_processor.disable_small_image_upsize
+        image = Image.new("RGB", (1000, 800), "white")
+        expected = p(text="<|image_pad|>", images=[image])
+        actual = loaded(text="<|image_pad|>", images=[image])
+        np.testing.assert_array_equal(actual["tgt_sizes"][0], expected["tgt_sizes"][0])
+        np.testing.assert_array_equal(actual["input_ids"], expected["input_ids"])
+
+
 @pytest.fixture
 def lfm3_processor():
     from tokenizers import Tokenizer
