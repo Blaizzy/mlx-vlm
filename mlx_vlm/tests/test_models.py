@@ -4841,20 +4841,25 @@ def test_lfm3_quantized_checkpoint_roundtrip(tmp_path, lfm3_case):
 
 
 @pytest.mark.parametrize(
-    "config",
+    "config, expected",
     [
-        {"model_type": "lfm3_vl", "architectures": ["D1Model"]},
-        {"model_type": "lfm3_omni", "architectures": ["D1Model"]},
-        {
-            "model_type": "lfm3_vl",
-            "architectures": ["Lfm3VlForConditionalGeneration"],
-            "auto_map": {"AutoModel": "modeling_d1.D1Model"},
-        },
+        ({"model_type": "lfm3_vl", "architectures": ["D1Model"]}, "d1_lfm3_vl"),
+        (
+            {
+                "model_type": "lfm3_vl",
+                "auto_map": {"AutoModel": "modeling_d1_lfm3_vl.D1Model"},
+            },
+            "d1_lfm3_vl",
+        ),
+        ({"model_type": "lfm3_omni", "architectures": ["D1Model"]}, "d1_lfm3_omni"),
+        ({"model_type": "lfm3_vl"}, "lfm3_vl"),
     ],
 )
-def test_get_model_and_args_refuses_d1_checkpoints(config):
-    with pytest.raises(ValueError, match="d1"):
-        get_model_and_args(config)
+def test_get_model_and_args_routes_d1_checkpoints(config, expected):
+    model_class, model_type = get_model_and_args(config)
+
+    assert model_type == expected
+    assert model_class.__name__ == f"mlx_vlm.models.{expected}"
 
 
 @pytest.fixture

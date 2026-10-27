@@ -591,6 +591,10 @@ def load_model_resources(model_path: str, adapter_path: Optional[str]):
             expert_cache_gb=get_expert_cache_gb(),
             max_kv_size=get_configured_context_limit(),
         )
+        if hasattr(model, "system_one"):
+            from ..models.d1_lfm3_vl.d1 import REFUSAL
+
+            raise ValueError(REFUSAL)
         config = model.config
         logger.info("Model and processor loaded successfully.")
         return model, processor, config
