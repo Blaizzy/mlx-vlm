@@ -134,6 +134,7 @@ jobs:
               tests/test_oxr.py
               tests/test_processors.py
               tests/test_speculative.py
+              tests/test_drafter_batch_capabilities.py
           - group: media
             suite: Diffusion, audio, images, video & extraction
             os: macos-14
