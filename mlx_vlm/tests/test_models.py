@@ -1393,7 +1393,11 @@ def check_arguments(kind, case, model, config):
     # Phi3-V keeps language dimensions on the outer config.
     core_config = getattr(config, "thinker_config", config)
     text = (
-        config if name == "phi3_v" else getattr(core_config, "text_config", core_config)
+        config
+        if name == "phi3_v"
+        else getattr(
+            core_config, "text_config", getattr(core_config, "lm_config", core_config)
+        )
     )
     if kind == "forward_cache":
         return (model, text.vocab_size), case.get("forward_cache", {})
@@ -4851,3 +4855,314 @@ def test_lfm3_quantized_checkpoint_roundtrip(tmp_path, lfm3_case):
 def test_get_model_and_args_refuses_d1_checkpoints(config):
     with pytest.raises(ValueError, match="d1"):
         get_model_and_args(config)
+
+
+@pytest.fixture
+def lfm3_audio():
+    case = model_case("lfm3_audio")
+    module = importlib.import_module("mlx_vlm.models." + case["module"])
+    model = module.Model(module.ModelConfig.from_dict(case["config"]))
+    mx.eval(model.parameters())
+    return model
+
+
+# the checkpoint's training-export prefixes, written out so a wrong mapping fails
+LFM3_AUDIO_LEGACY_PREFIXES = (
+    ("lfm.model.", "language_model.model."),
+    ("encoder.downsample.", "audio_tower.downsample."),
+    ("encoder.lfm.lfm.", "audio_tower.lfm."),
+    ("mlp.model.0.", "audio_projector.layer_norm."),
+    ("mlp.model.1.", "audio_projector.linear_1."),
+    ("mlp.model.3.", "audio_projector.linear_2."),
+    ("depthformer.model.", "depth_decoder.model."),
+    ("depth_linear.", "depth_decoder.depth_linear."),
+    ("mask_embedding", "depth_decoder.mask_embedding"),
+    ("depth_embeddings.", "depth_decoder.depth_embeddings."),
+)
+
+
+def test_lfm3_audio_sanitize_maps_legacy_checkpoint_idempotently(lfm3_audio):
+    model = lfm3_audio
+    weights = dict(tree_flatten(model.parameters()))
+    # canonical MLX weights -> the checkpoint's training-export names and torch layouts
+    legacy = {}
+    for name, value in weights.items():
+        if "downsample." in name and value.ndim == 4:
+            value = value.transpose(0, 3, 1, 2)
+        elif name.endswith("lin_out.weight"):
+            value = value[..., None]
+        elif name.endswith("conv.conv.weight"):
+            value = value.transpose(0, 2, 1)
+        for old, new in LFM3_AUDIO_LEGACY_PREFIXES:
+            if name.startswith(new):
+                name = old + name[len(new) :]
+                break
+        legacy[name] = value
+        if name.endswith(".embedding.weight") and name.startswith("depth_embeddings."):
+            legacy[name.replace(".embedding.", ".to_logits.")] = value
+    assert "encoder.lfm.lfm.embedding_norm.weight" in legacy
+    assert "mlp.model.3.weight" in legacy and "mask_embedding" in legacy
+    sanitized = model.sanitize(legacy)
+    assert sanitized.keys() == weights.keys()
+    for name, value in weights.items():
+        assert mx.array_equal(sanitized[name], value), name
+    again = model.sanitize(sanitized)
+    assert all(mx.array_equal(again[k], v) for k, v in sanitized.items())
+    model.load_weights(list(sanitized.items()), strict=True)
+
+
+def test_lfm3_audio_quant_predicate_keeps_speech_modules(lfm3_audio):
+    predicate = lfm3_audio.quant_predicate
+    assert predicate("language_model.model.layers.0.feed_forward.w1", None)
+    for path in (
+        "audio_tower.downsample.lin_out",
+        "audio_projector.linear_1",
+        "depth_decoder.model.layers.0.feed_forward.w1",
+        "depth_decoder.depth_embeddings.0.embedding",
+        "codebook_embedding",
+    ):
+        assert not predicate(path, None)
+
+
+def test_lfm3_audio_encoder_hides_padding_and_masks_attention(lfm3_audio):
+    tower = lfm3_audio.audio_tower
+    features = mx.random.normal((2, 16, 20))
+    batch = tower(features, mx.array([20, 9]))
+    alone = tower(features[1:2, :, :9], mx.array([9]))
+    assert mx.allclose(batch[3:], alone, atol=1e-5)
+    x = mx.random.normal((1, 8, 8))
+    h = tower.lfm(x, 4)
+    first = tower.lfm(x.at[:, 0].add(1.0), 4)
+    assert not mx.allclose(h[:, 1], first[:, 1])
+    # conv reach 2 plus the 4-token window
+    assert mx.allclose(h[:, 6:], first[:, 6:], atol=1e-5)
+    last = tower.lfm(x.at[:, -1].add(1.0), 4)
+    assert mx.allclose(h[:, :-1], last[:, :-1], atol=1e-5)
+
+
+def test_lfm3_audio_maskgit_reveals_in_order_and_depth_is_bidirectional(lfm3_audio):
+    from mlx_vlm.models.lfm3_audio.depth import sample, sample_frame
+
+    seen = []
+
+    class Depth:
+        num_codebooks = 12
+
+        def __call__(self, hidden, codes, masked):
+            seen.append(masked[0].tolist())
+            return mx.broadcast_to(mx.eye(5)[len(seen)], (1, 12, 5))
+
+    order = [11, 0, 5, 3, 2, 1, 4, 6, 7, 8, 9, 10]
+    codes = sample_frame(
+        Depth(), mx.zeros((1, 4)), [4, 4, 4], 0, order=mx.array([order])
+    )
+    assert seen[0] == [True] * 12
+    assert [i for i in range(12) if not seen[1][i]] == sorted(order[:4])
+    assert [i for i in range(12) if not seen[2][i]] == sorted(order[:8])
+    # each code is the index of the pass that revealed it
+    expected = [0] * 12
+    for i, k in enumerate(order):
+        expected[k] = i // 4 + 1
+    assert codes[0].tolist() == expected
+    # the repetition penalty applies when greedy: 2 / 4 < 1
+    assert sample(mx.array([[2.0, -2.0, 1.0]]), 0, None, 4.0, mx.array([[0]])) == 2
+    depth = lfm3_audio.depth_decoder
+    hidden, codes = mx.random.normal((1, 32)), mx.zeros((1, 12), mx.int32)
+    masked = mx.zeros((1, 12), mx.bool_)
+    changed = depth(hidden, codes.at[:, 11].add(3), masked)
+    assert not mx.allclose(depth(hidden, codes, masked)[:, 0], changed[:, 0])
+
+
+def test_lfm3_audio_input_embeddings_scatter_speech_in_order(lfm3_audio):
+    model = lfm3_audio
+    features = mx.random.normal((2, 16, 20))
+    mask = mx.array([[1] * 20, [1] * 9 + [0] * 11])
+    audio = model.audio_projector(model.audio_tower(features, mask.sum(-1)))
+    assert audio.shape == (3 + 2, 32)  # ceil(20 / 8) + ceil(9 / 8)
+    codes = mx.array([[1] * 12, [4] * 12])
+    ids = mx.array([[1] + [60] * 5 + [2, 61, 61, 3]])
+    embeds = model.get_input_embeddings(
+        ids, input_features=features, feature_attention_mask=mask, audio_out_codes=codes
+    ).inputs_embeds
+    assert mx.allclose(embeds[0, 1:6], audio, atol=1e-6)
+    # codebook k reads rows k * 5 + code of the shared table
+    table = model.codebook_embedding.weight
+    frames = mx.stack([table[mx.arange(12) * 5 + c].sum(0) for c in (1, 4)])
+    assert mx.allclose(embeds[0, 7:9], frames, atol=1e-5)
+    text = model.language_model.model.embed_tokens(mx.array([1, 2, 3]))
+    assert mx.allclose(embeds[0, mx.array([0, 6, 9])], text)
+    # a prompt-cache hit trims the speech placeholders; the features are then unused
+    tail = model.get_input_embeddings(ids[:, 9:], input_features=features)
+    assert mx.allclose(tail.inputs_embeds[0], text[2:])
+    with pytest.raises(ValueError, match="do not match"):
+        model.get_input_embeddings(ids, input_features=features)
+    with pytest.raises(ValueError, match="do not match"):
+        model.get_input_embeddings(mx.array([[1, 61]]))
+    with pytest.raises(ValueError, match=r"\[0, 5\)"):
+        model.get_input_embeddings(mx.array([[61]]), audio_out_codes=[[5] * 12])
+    logits = model(mx.array([[1, 2]])).logits
+    assert logits.shape == (1, 2, 64)
+    assert (logits[..., mx.array([60, 61])] == -mx.inf).all()
+
+
+def lfm3_audio_scripted_slots(monkeypatch, model, text, frames, prompt, **kwargs):
+    module = importlib.import_module("mlx_vlm.models.lfm3_audio.lfm3_audio")
+    text, frames, seen = iter(text), iter(frames), []
+
+    def sample_frame(
+        depth, hidden, schedule, temperature, top_k, penalty, history, order
+    ):
+        seen.append((None if history is None else history.shape, order))
+        return mx.array([next(frames)])
+
+    monkeypatch.setattr(module, "sample_frame", sample_frame)
+    monkeypatch.setattr(module, "sample", lambda *a, **k: mx.array([next(text)]))
+    slots = list(model.stream_slots(mx.array([prompt]), **kwargs))
+    pattern = "".join("A" if codes is not None else "T" for _, codes in slots)
+    return slots, pattern, seen
+
+
+def test_lfm3_audio_interleaved_state_machine(monkeypatch, lfm3_audio):
+    model = lfm3_audio
+    eos = model.config.audio_eos_code
+    # 6 text, 12 frames, then text ending in <|text_end|>, the audio tail ending in
+    # a frame with one EOS code, and <|im_end|>
+    text = [1, 2, 3, 4, 5, 6, 7, 56, 50]
+    frames = [[1] * 12] * 15 + [[2] * 11 + [eos]]
+    slots, pattern, seen = lfm3_audio_scripted_slots(
+        monkeypatch, model, text, frames, [1, 57], max_tokens=64
+    )
+    assert pattern == "T" * 6 + "A" * 12 + "TT" + "AAAA" + "T"
+    assert [t for t, _ in slots if t != 61] == text
+    assert slots[-2][1].tolist() == [eos] * 12
+    # the penalty history holds the earlier non-EOS frames of this call
+    assert [s[0] for s in seen[:2]] == [None, (1, 1, 12)]
+    assert seen[-1][0] == (1, 15, 12)
+
+
+def test_lfm3_audio_mode_selection_and_injected_order(monkeypatch, lfm3_audio):
+    model = lfm3_audio
+    eos = model.config.audio_eos_code
+    order = np.arange(24).reshape(2, 12) % 12
+    _, pattern, seen = lfm3_audio_scripted_slots(
+        monkeypatch,
+        model,
+        [50],
+        [[1] * 12, [eos] * 12],
+        [1, 2],
+        generation_mode="audio",
+        frame_order=order,
+    )
+    assert pattern == "AAT"
+    assert [s[1].tolist() for s in seen] == [[order[0].tolist()], [order[1].tolist()]]
+    # text mode follows <|audio_start|>; <|im_end|> ends the turn
+    _, pattern, _ = lfm3_audio_scripted_slots(
+        monkeypatch, model, [3, 55, 50], [[eos] * 12], [1, 2]
+    )
+    assert pattern == "TTAT"
+    # <|text_end|> ends a text turn; max_tokens counts slots
+    _, pattern, _ = lfm3_audio_scripted_slots(monkeypatch, model, [3, 56], [], [1])
+    assert pattern == "TT"
+    _, pattern, _ = lfm3_audio_scripted_slots(
+        monkeypatch, model, [], [[1] * 12] * 5, [55], max_tokens=3
+    )
+    assert pattern == "AAA"
+    # a replayed end-of-speech frame resumes the text, any other frame the speech
+    _, pattern, _ = lfm3_audio_scripted_slots(
+        monkeypatch, model, [3, 50], [], [1, 61], audio_out_codes=[[eos] * 12]
+    )
+    assert pattern == "TT"
+    _, pattern, _ = lfm3_audio_scripted_slots(
+        monkeypatch, model, [50], [[eos] * 12], [1, 61], audio_out_codes=[[1] * 12]
+    )
+    assert pattern == "AT"
+
+
+def test_lfm3_audio_explicit_text_mode_forbids_speech_markers(monkeypatch, lfm3_audio):
+    config = lfm3_audio.config
+    module = importlib.import_module("mlx_vlm.models.lfm3_audio.lfm3_audio")
+    suppressed = []
+
+    def sample(logits, temperature, top_k, penalty, history, suppress, *a):
+        suppressed.append(set(suppress))
+        return mx.array([50])
+
+    monkeypatch.setattr(module, "sample", sample)
+    markers = {config.mixed_start_token_id, config.audio_start_token_id}
+    for mode, forbidden in ((None, False), ("text", True)):
+        list(lfm3_audio.stream_slots(mx.array([[1, 2]]), generation_mode=mode))
+        assert markers.issubset(suppressed.pop()) is forbidden
+
+
+def test_lfm3_audio_generate_audio_decodes_speech_frames(monkeypatch, lfm3_audio):
+    model = lfm3_audio
+    eos = model.config.audio_eos_code
+    codec = SimpleNamespace(
+        config=SimpleNamespace(sampling_rate=24000),
+        decode=lambda codes: mx.zeros(codes.shape[-1] * 1920),
+    )
+    object.__setattr__(model, "_codec", codec)
+    tokenizer = SimpleNamespace(decode=lambda ids, **_: " ".join(map(str, ids)))
+    module = importlib.import_module("mlx_vlm.models.lfm3_audio.lfm3_audio")
+    frames = iter([[1] * 12, [2] * 12, [eos] * 12])
+    monkeypatch.setattr(module, "sample_frame", lambda *a: mx.array([next(frames)]))
+    # without a mode the model starts in text and opens speech with <|audio_start|>
+    text = iter([55, 50])
+    monkeypatch.setattr(module, "sample", lambda *a, **k: mx.array([next(text)]))
+    result = model.generate_audio(mx.array([[1, 2]]), tokenizer)
+    assert result.audio_tokens.tolist() == [[1, 2]] * 12
+    assert result.audio.shape == (2 * 1920,)
+    assert result.text == "55 50"
+    assert result.token_ids == [55, 61, 61, 61, 50]
+    assert result.finish_reason == "stop"
+
+
+def test_lfm3_audio_codec_decode_shapes():
+    from mlx_vlm.models.lfm3_audio.codec import CodecConfig, LiquidCodec
+
+    codec = LiquidCodec(CodecConfig(encoder_dim=64, quantizer_dim=16))
+    codec.decoder.istft.window = mx.ones(1280)
+    audio = codec.decode(mx.zeros((12, 3), mx.int32))
+    assert audio.shape == (3 * 1920,) and audio.dtype == mx.float32
+    assert codec.decode(mx.zeros((12, 0), mx.int32)).shape == (0,)
+    with pytest.raises(ValueError, match="strip EOS"):
+        codec.decode(mx.full((12, 2), 2016))
+
+
+@pytest.mark.skipif(
+    not os.environ.get("LFM3_AUDIO_PATH"), reason="set LFM3_AUDIO_PATH to a checkpoint"
+)
+def test_lfm3_audio_checkpoint_transcribes_its_own_speech(tmp_path):
+    from mlx_vlm.generate import generate, generate_audio
+    from mlx_vlm.prompt_utils import apply_chat_template
+    from mlx_vlm.utils import load
+
+    model, processor = load(os.environ["LFM3_AUDIO_PATH"])
+
+    def chat(system, user=""):
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+
+    sentence = "The quick brown fox jumps over the lazy dog."
+    prompt = apply_chat_template(
+        processor,
+        model.config,
+        chat("Perform TTS in American English using a female voice.", sentence),
+    )
+    path = tmp_path / "speech.wav"
+    speech = generate_audio(
+        model,
+        processor,
+        prompt,
+        generation_mode="audio",
+        max_tokens=400,
+        output_audio_path=path,
+    )
+    assert speech.finish_reason == "stop" and speech.audio.size
+    prompt = apply_chat_template(
+        processor, model.config, chat("Perform ASR in English."), num_audios=1
+    )
+    text = generate(model, processor, prompt, audio=[str(path)], temperature=0.0).text
+    assert text.strip().lower().rstrip(".") == sentence.lower().rstrip(".")

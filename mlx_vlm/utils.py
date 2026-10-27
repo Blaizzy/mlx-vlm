@@ -1887,7 +1887,9 @@ def prepare_inputs(
     has_videos = videos is not None and (
         not hasattr(videos, "__len__") or len(videos) > 0
     )
-    if not has_images and not has_audio and not has_videos:
+    # prior speech given as codes still needs the processor to expand its placeholders
+    has_audio_out = kwargs.get("audio_out_codes") is not None
+    if not has_images and not has_audio and not has_videos and not has_audio_out:
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )

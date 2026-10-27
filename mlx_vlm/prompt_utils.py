@@ -39,6 +39,7 @@ MODEL_CONFIG = {
     "lfm2-vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "lfm2_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "lfm3_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "lfm3_audio": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "lfm3": MessageFormat.TEXT_ONLY,
     "aya_vision": MessageFormat.LIST_WITH_IMAGE,
     "cohere2_vision": MessageFormat.LIST_WITH_IMAGE,
@@ -488,7 +489,13 @@ class MessageFormatter:
 
         if role == "user" and not skip_audio_token and num_audios > 0:
             audio_tokens = [MessageBuilder.audio_message()] * num_audios
-            content = audio_tokens + content if image_first else content + audio_tokens
+            if self.model_name in ("lfm3_audio",):
+                # the reference order: images, then audio, then the text
+                content = content[:-1] + audio_tokens + content[-1:]
+            else:
+                content = (
+                    audio_tokens + content if image_first else content + audio_tokens
+                )
 
         return {"role": role, "content": content}
 
