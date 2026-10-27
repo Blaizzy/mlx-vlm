@@ -1723,7 +1723,12 @@ class ResponseGenerator:
             except Exception:
                 logger.exception("Error closing APC after generation worker shutdown")
             finally:
+                # The worker can finish after an unload timeout. Release its
+                # model owners before clearing Metal's allocator cache.
+                self.model = self.processor = self.tokenizer = self.draft_model = None
+                self.apc_manager = None
                 clear_mlx_streams()
+                mx.clear_cache()
 
     def _run_impl(self):
         """Single GPU thread: owns BatchGenerator, runs tight next() loop."""
