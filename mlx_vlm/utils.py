@@ -213,6 +213,13 @@ def get_model_type(config: dict) -> Optional[str]:
         model_type = "nemotron_parse_v3_5"
     elif "BoundaryExtractor" in architectures:
         model_type = "gliner2_5"
+    elif model_type == "qwen3_5" and (
+        "Qwen3_5ForSequenceClassification" in architectures
+        or config.get("problem_type") == "single_label_classification"
+    ):
+        # Jev's source checkpoint declares a causal architecture despite having
+        # a two-class score head. Preserve the classification task when loading.
+        model_type = "minicpm_ocr_jev"
     elif "DFlash2DraftModel" in architectures:
         model_type = "dflash2"
     elif "Gemma4DSparkModel" in architectures:

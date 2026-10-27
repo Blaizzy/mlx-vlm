@@ -57,6 +57,7 @@ MODEL_CONFIG = {
     "minicpmo": MessageFormat.IMAGE_TOKEN,
     "minicpmv4_6": MessageFormat.IMAGE_TOKEN_WRAPPED,
     "minicpmv4_7": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "minicpm_ocr": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "mistral3": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm4v": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm4v_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
