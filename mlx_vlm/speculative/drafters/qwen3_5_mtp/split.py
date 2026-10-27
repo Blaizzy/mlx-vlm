@@ -5,7 +5,7 @@ from typing import Dict, Optional
 
 import mlx.core as mx
 
-from ....models.qwen3_5.fp8 import make_quantization_config
+from ....fp8 import make_quantization_config
 from ..mtp_split import MTPSplitter
 from .qwen3_5_mtp import Qwen3_5MTPDraftModel
 
@@ -49,6 +49,15 @@ class Qwen3_5MTPSplitter(MTPSplitter):
             quantization = source_config.get("quantization")
         if quantization is None:
             quantization = make_quantization_config(source_config)
+        if quantization is not None:
+            quantization = {
+                **quantization,
+                **{
+                    key.removeprefix("mtp."): value
+                    for key, value in quantization.items()
+                    if key.startswith("mtp.")
+                },
+            }
         return quantization
 
 
@@ -62,6 +71,21 @@ class Qwen3NextMTPSplitter(MTPSplitter):
     depth_field = "mtp_num_hidden_layers"
     block_size_extra = 2
     supports_mlx_source = True
+
+    def read_text_config(self, source_config: dict) -> dict:
+        text_config = super().read_text_config(source_config)
+        if "rope_parameters" not in text_config:
+            rotary_dim = int(
+                text_config["head_dim"] * text_config["partial_rotary_factor"]
+            )
+            text_config["rope_parameters"] = {
+                "type": "default",
+                "rope_theta": text_config["rope_theta"],
+                "partial_rotary_factor": text_config["partial_rotary_factor"],
+                "mrope_section": [rotary_dim // 2, 0, 0],
+            }
+        text_config.setdefault("norm_topk_prob", False)
+        return text_config
 
     def select_keys(self, key: str, text_config: dict) -> bool:
         return key.startswith("mtp.")
@@ -113,6 +137,15 @@ class Qwen3NextMTPSplitter(MTPSplitter):
             quantization = source_config.get("quantization")
         if quantization is None:
             quantization = make_quantization_config(source_config)
+        if quantization is not None:
+            quantization = {
+                **quantization,
+                **{
+                    key.removeprefix("mtp."): value
+                    for key, value in quantization.items()
+                    if key.startswith("mtp.")
+                },
+            }
         return quantization
 
 

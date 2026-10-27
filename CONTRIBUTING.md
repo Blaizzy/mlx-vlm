@@ -56,20 +56,28 @@ Getting this wrong fails in two ways. A shape-changing conversion applied twice
 dies loudly at weight-load; a value-changing one (a norm shift, a scale rewrite)
 loads fine and generates garbage.
 
-Additionally, add a test for the new model type to the [model
-tests](https://github.com/Blaizzy/mlx-vlm/tree/main/mlx_vlm/tests/test_models.py),
-and assert the invariant above with the shared helper:
+Register a small configuration in the case file for the model's task:
 
-```python
-from mlx_vlm.tests.sanitize_invariants import assert_sanitize_idempotent
+| Task | Case file | Tests |
+|---|---|---|
+| Text generation | [model_cases.json](mlx_vlm/tests/model_cases.json) | [test_models.py](mlx_vlm/tests/test_models.py) |
+| Image generation | [image_generation_cases.json](mlx_vlm/tests/image_generation_cases.json) | [test_image_generation_models.py](mlx_vlm/tests/test_image_generation_models.py) |
+| Depth, geometry, masks, spans, or decisions | [extraction_cases.json](mlx_vlm/tests/extraction_cases.json) | [test_extraction_models.py](mlx_vlm/tests/test_extraction_models.py) |
 
-sanitized = assert_sanitize_idempotent(model, hf_weights)
-```
+Extraction cases use `id`, `module`, `config`, and `checks`, like text-model
+cases. Shared checks cover `registry_and_config`, `forward`, and `checkpoint`;
+forward checks use `input_shape` and `output_shapes`. Decision models select
+`decision_models` with their `state` and typed `questions` to check standard
+loading and prediction. Specialized tests reuse
+case configs and `shared_configs`, keeping numerical, checkpoint conversion,
+streaming, and IO assertions in Python. Use nonuniform weights to verify
+conversion values and second-pass stability.
 
-From the repository root, you can run the tests with:
+From the repository root, install the test dependencies and run the tests with:
 
 ```shell
-python -m unittest discover mlx_vlm/tests/
+python -m pip install -e ".[test]"
+python -m pytest -q mlx_vlm/tests
 ```
 
 ## Pull Requests

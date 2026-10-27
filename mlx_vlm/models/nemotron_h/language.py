@@ -297,6 +297,7 @@ def group_expert_select(
 
     k = top_k
     inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+    inds = mx.stop_gradient(inds)
     scores = mx.take_along_axis(orig_scores, inds, axis=-1)
     if top_k > 1 and norm_topk_prob:
         denominator = scores.sum(axis=-1, keepdims=True)
@@ -422,8 +423,8 @@ class NemotronHModel(nn.Module):
         if with_embeddings:
             self.embeddings = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
-            NemotronHBlock(args, block_type)
-            for block_type in args.hybrid_override_pattern
+            NemotronHBlock(args.for_layer(index), block_type)
+            for index, block_type in enumerate(args.hybrid_override_pattern)
         ]
         self.norm_f = nn.RMSNorm(args.hidden_size, eps=args.layer_norm_epsilon)
         self.fa_idx = 0
@@ -522,14 +523,19 @@ class Model(nn.Module):
 
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"backbone.layers.{layer_idx}.mixer"
+            num_experts = self.args.n_routed_experts
+            if block_configs := getattr(self.args, "block_configs", None):
+                num_experts = (
+                    block_configs[layer_idx].get("n_routed_experts") or num_experts
+                )
             for m, n in [("down_proj", "fc2"), ("up_proj", "fc1")]:
-                for suffix in ("weight", "scales", "biases"):
+                for suffix in ("weight", "scales", "biases", "weight_scale_2"):
                     first_key = f"{prefix}.experts.0.{m}.{suffix}"
                     if first_key not in weights:
                         continue
                     to_join = [
                         weights.pop(f"{prefix}.experts.{e}.{m}.{suffix}")
-                        for e in range(self.args.n_routed_experts)
+                        for e in range(num_experts)
                     ]
                     weights[f"{prefix}.switch_mlp.{n}.{suffix}"] = mx.stack(to_join)
 
@@ -612,6 +618,8 @@ class LanguageModel(nn.Module):
         del input_ids, inputs_embeds, prompt_cache
         if draft_model is None:
             return True
+        if draft_kind == "mtp":
+            return bool(getattr(draft_model, "supports_chunked_prefill", False))
         prefill_kwargs = prefill_kwargs or {}
         if draft_kind in ("dflash", "dspark"):
             return prefill_kwargs.get("capture_layer_ids") is not None

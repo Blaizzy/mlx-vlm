@@ -1,7 +1,11 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import SequenceClassifierOutput, scaled_dot_product_attention
+from ..base import (
+    SequenceClassifierOutput,
+    TokenClassifierOutput,
+    scaled_dot_product_attention,
+)
 from ..pooling import EmbeddingOutput, normalize_embeddings, pool_by_config
 from .config import ModelConfig
 
@@ -191,3 +195,15 @@ class SequenceClassificationModel(Model):
                 continue
             out[key] = value
         return out
+
+
+class TokenClassificationModel(Model):
+    """BERT encoder with a per-token classification head (NER, PII tagging)."""
+
+    def __init__(self, config: ModelConfig):
+        super().__init__(config)
+        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+
+    def __call__(self, input_ids, attention_mask=None, token_type_ids=None, **kwargs):
+        hidden_states, _ = self._encode(input_ids, attention_mask, token_type_ids)
+        return TokenClassifierOutput(logits=self.classifier(hidden_states))

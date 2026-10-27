@@ -8,9 +8,96 @@ coordinator, adapted to MLX's contiguous runtime cache objects.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, Callable, List, Optional, Sequence, Tuple
 
-from .apc_adapters import PrefixCachePlan, build_prefix_cache_plan
+from .apc_adapters import (
+    PrefixCachePlan,
+    build_prefix_cache_plan,
+    cache_memory_components,
+)
+from .models.cache import CacheMemory
+
+
+class PrefillMemoryPlan:
+    """Per-manager budgets from cache layouts or conservative opaque bounds.
+
+    Empty caches use the device reserve until dimensions are known.
+    """
+
+    def __init__(self):
+        self.components: List[CacheMemory] = []
+        self.lengths: List[int] = []
+        self.prefix_lengths: List[int] = []
+        self.chunk_size: Optional[int] = None
+
+    def prepare(self, lengths, *, chunk_size=None, prefix_lengths=None) -> int:
+        self.lengths = [max(0, int(n)) for n in lengths]
+        self.prefix_lengths = (
+            list(prefix_lengths)
+            if prefix_lengths is not None
+            else [0] * len(self.lengths)
+        )
+        self.chunk_size = chunk_size if chunk_size and chunk_size > 0 else None
+        return self.reserve_bytes()
+
+    def reserve_bytes(self, live_bytes: int = 0) -> int:
+        if not self.lengths or not max(self.lengths):
+            return 0
+        # Prefixes and suffixes are padded separately; cold prefixes are zero.
+        capacity = max(self.prefix_lengths) + max(
+            n - p for n, p in zip(self.lengths, self.prefix_lengths)
+        )
+        row_bytes = sum(c.footprint(capacity, self.chunk_size) for c in self.components)
+        return max(0, 2 * len(self.lengths) * row_bytes - live_bytes)
+
+    def observe(self, components, *, live_bytes: int) -> int:
+        previous = self.components
+        self.components = list(components)
+        if len(previous) == len(self.components):
+            for i, (old, new) in enumerate(zip(previous, self.components)):
+                if not new.source_bytes:
+                    self.components[i] = old
+                elif old.fallback and new.fallback:
+                    self.components[i] = replace(
+                        new,
+                        bytes_per_token=max(old.bytes_per_token, new.bytes_per_token),
+                    )
+        return self.reserve_bytes(live_bytes)
+
+    def observe_cache(
+        self, prompt_cache, token_count, *, batch_size=1, live_bytes=None
+    ) -> int:
+        """Update dimensions and return the reserve beyond live buffers."""
+        from .apc import _cache_nbytes
+
+        if live_bytes is None:
+            live_bytes = _cache_nbytes(prompt_cache)
+        return self.observe(
+            cache_memory_components(prompt_cache, token_count, batch_size=batch_size),
+            live_bytes=live_bytes,
+        )
+
+    def observe_kv(self, keys, values, *, live_bytes: int) -> int:
+        # Raw float KV slabs expose growth through their token axis.
+        return self.observe(
+            (
+                CacheMemory(
+                    source_bytes=k.nbytes + v.nbytes,
+                    bytes_per_token=(k.nbytes + v.nbytes) / k.shape[2],
+                )
+                for k, v in zip(keys, values)
+                if k.shape[2]
+            ),
+            live_bytes=live_bytes,
+        )
+
+    def restore_bytes(self, prompt_cache, token_count, capacity) -> int:
+        components = cache_memory_components(prompt_cache, token_count)
+        return sum(
+            max(c.source_bytes, c.footprint(capacity, self.chunk_size))
+            for c in components
+        )
 
 
 class APCCoordinator:
@@ -25,6 +112,25 @@ class APCCoordinator:
         self.manager = manager
         self.model = model
         self.plan: PrefixCachePlan = build_prefix_cache_plan(model)
+
+    def prepare_prefill(
+        self, prompt_lengths, *, prefill_step_size=None, prefix_lengths=None
+    ) -> None:
+        if self.enabled:
+            lengths = (
+                [prompt_lengths] if isinstance(prompt_lengths, int) else prompt_lengths
+            )
+            reserve = self.manager.memory_plan.prepare(
+                lengths, chunk_size=prefill_step_size, prefix_lengths=prefix_lengths
+            )
+            self.manager.prepare_prefill(reserve)
+
+    def observe_cache(self, prompt_cache, token_count, *, batch_size=1) -> None:
+        """Update runtime dimensions independently of snapshot persistence."""
+        reserve = self.manager.memory_plan.observe_cache(
+            prompt_cache, token_count, batch_size=batch_size
+        )
+        self.manager.prepare_prefill(reserve)
 
     @property
     def enabled(self) -> bool:
@@ -94,6 +200,38 @@ class APCCoordinator:
             max_prefix_tokens=len(token_ids) - 1,
         )
 
+    def checkpoint_lengths(
+        self, token_ids: Sequence[int], media_token_ids: set[int]
+    ) -> List[int]:
+        """Bounded intermediate states plus the final conversation checkpoint.
+
+        Stateful caches cannot roll back the final snapshot to a divergence.
+        Capture earlier states while prefilling, aligned across requests. Limit
+        captures to the resident entry budget (two for a disk-only manager),
+        rather than copying an ever-growing cache at every prefill chunk.
+        """
+        final = self.checkpoint_len(token_ids, media_token_ids)
+        if final <= 0:
+            return []
+        interval = self.manager.checkpoint_interval_tokens
+        budget = self.manager._exact_cache_max or (2 if self.manager.disk else 1)
+        if interval <= 0 or budget <= 1:
+            return [final]
+        from .apc import adjust_prefix_to_text_suffix_boundary
+
+        block_size = self.manager.block_size
+        interval = ((interval + block_size - 1) // block_size) * block_size
+        last = ((final - 1) // interval) * interval
+        first = max(interval, last - (budget - 2) * interval)
+        lengths = {final}
+        for boundary in range(first, last + 1, interval):
+            boundary = adjust_prefix_to_text_suffix_boundary(
+                token_ids, boundary, media_token_ids, max_prefix_tokens=final
+            )
+            if self.manager.exact_cache_min_tokens <= boundary < final:
+                lengths.add(boundary)
+        return sorted(lengths)
+
     def merge_rows(
         self,
         picks: Sequence[Optional[dict]],
@@ -107,21 +245,34 @@ class APCCoordinator:
             make_warm_batch_kv_cache_multi,
         )
 
+        memory = self.manager.memory_plan
+        if len(prefix_lens) == len(memory.lengths):
+            self.prepare_prefill(
+                memory.lengths,
+                prefill_step_size=memory.chunk_size,
+                prefix_lengths=prefix_lens,
+            )
+
         if self.is_checkpoint:
             row_caches = [
                 pick["warm_cache"] if pick is not None else self.fresh_cache()
                 for pick in picks
             ]
-            return make_warm_batch_exact_cache_multi(
+            caches, max_prefix = make_warm_batch_exact_cache_multi(
                 row_caches,
                 prefix_lens,
                 kv_quant_config=kv_quant_config,
             )
-        return make_warm_batch_kv_cache_multi(
-            list(picks),
-            num_layers=len(self.plan.components),
-            kv_quant_config=kv_quant_config,
-        )
+        else:
+            caches, max_prefix = make_warm_batch_kv_cache_multi(
+                list(picks),
+                num_layers=len(self.plan.components),
+                kv_quant_config=kv_quant_config,
+            )
+        if caches is not None:
+            with self.manager.lock:
+                self.manager.stats.restored_tokens += sum(prefix_lens)
+        return caches, max_prefix
 
     def materialize_single(
         self,
@@ -131,15 +282,18 @@ class APCCoordinator:
         kv_quant_config: Optional[dict] = None,
     ) -> List[Any]:
         warm_cache = hit.get("warm_cache")
-        if warm_cache is not None:
-            return warm_cache
-        from .apc import make_warm_kv_cache
+        if warm_cache is None:
+            from .apc import make_warm_kv_cache
 
-        return make_warm_kv_cache(
-            hit.get("matched_blocks", []),
-            min_capacity_tokens=min_capacity_tokens,
-            kv_quant_config=kv_quant_config,
-        )
+            warm_cache = make_warm_kv_cache(
+                hit.get("matched_blocks", []),
+                min_capacity_tokens=min_capacity_tokens,
+                kv_quant_config=kv_quant_config,
+            )
+        if warm_cache:
+            with self.manager.lock:
+                self.manager.stats.restored_tokens += hit["prefix_len"]
+        return warm_cache
 
     def store_checkpoint(
         self,
@@ -151,9 +305,22 @@ class APCCoordinator:
     ) -> bool:
         if not self.enabled or not self.is_checkpoint:
             return False
-        from .apc import snapshot_prompt_cache_row
+        from .apc import (
+            _cache_nbytes,
+            _prompt_cache_is_batch_shaped,
+            snapshot_prompt_cache_row,
+        )
 
-        snapshot = snapshot_prompt_cache_row(prompt_cache, batch_idx or 0)
+        # Batch extraction can itself allocate a full row before store_exact_cache
+        # decides whether it can afford another retained snapshot.
+        if _prompt_cache_is_batch_shaped(prompt_cache):
+            if self.manager.disk is not None:
+                self.manager.disk.flush()
+            if not self.manager._make_room(_cache_nbytes(prompt_cache)):
+                with self.manager.lock:
+                    self.manager.stats.memory_skips += 1
+                return False
+        snapshot = snapshot_prompt_cache_row(prompt_cache, batch_idx or 0, clone=False)
         if snapshot is None:
             return False
         return self.manager.store_exact_cache(

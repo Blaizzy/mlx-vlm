@@ -4,18 +4,9 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ..base import check_array_shape
 from ..mlp import TanhGELUMLP as MLP
 from .config import VisionConfig
-
-
-def check_array_shape(arr):
-    shape = arr.shape
-    if len(shape) != 4:
-        return False
-    out_channels, kH, KW, _ = shape
-    if (out_channels >= kH) and (out_channels >= KW) and (kH == KW):
-        return True
-    return False
 
 
 class Attention(nn.Module):

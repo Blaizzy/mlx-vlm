@@ -319,6 +319,7 @@ class MoEGate(nn.Module):
             flat_scores = scores
             k = self.top_k
             inds = mx.argpartition(flat_scores, kth=-k, axis=-1)[..., -k:]
+            inds = mx.stop_gradient(inds)
             scores_selected = mx.take_along_axis(flat_scores, inds, axis=-1)
 
         elif self.topk_method == "noaux_tc":

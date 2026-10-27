@@ -338,6 +338,7 @@ class Model(nn.Module):
                 "shared_kv_sink",
                 "return_hidden",
                 "return_shared_kv",
+                "logits_to_keep",
             )
             if k in kwargs
         }

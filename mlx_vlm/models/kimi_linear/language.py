@@ -71,6 +71,7 @@ def _group_expert_select(
         scores = mx.flatten(scores, -2, -1)
 
     inds = mx.argpartition(-scores, kth=top_k - 1, axis=-1)[..., :top_k]
+    inds = mx.stop_gradient(inds)
     scores = mx.take_along_axis(orig_scores, inds, axis=-1)
 
     if top_k > 1 and renormalize:
@@ -487,22 +488,24 @@ class LanguageModel(nn.Module):
                     ("w2", "down_proj"),
                     ("w3", "up_proj"),
                 ]:
-                    key = f"{src_prefix}.experts.0.{src}.weight"
-                    if key in weights:
-                        stacked = [
-                            weights.pop(f"{src_prefix}.experts.{i}.{src}.weight")
-                            for i in range(self.args.num_experts)
-                        ]
-                        weights[f"{dst_prefix}.switch_mlp.{dst}.weight"] = mx.stack(
-                            stacked
-                        )
+                    for suffix in ("weight", "scales", "biases", "weight_global_scale"):
+                        key = f"{src_prefix}.experts.0.{src}.{suffix}"
+                        if key in weights:
+                            stacked = [
+                                weights.pop(f"{src_prefix}.experts.{i}.{src}.{suffix}")
+                                for i in range(self.args.num_experts)
+                            ]
+                            weights[f"{dst_prefix}.switch_mlp.{dst}.{suffix}"] = (
+                                mx.stack(stacked)
+                            )
 
                 for name in ("gate_proj", "up_proj", "down_proj"):
-                    src_key = f"{src_prefix}.shared_experts.{name}.weight"
-                    if src_key in weights:
-                        weights[f"{dst_prefix}.shared_experts.{name}.weight"] = (
-                            weights.pop(src_key)
-                        )
+                    for suffix in ("weight", "scales", "biases", "weight_global_scale"):
+                        src_key = f"{src_prefix}.shared_experts.{name}.{suffix}"
+                        if src_key in weights:
+                            weights[f"{dst_prefix}.shared_experts.{name}.{suffix}"] = (
+                                weights.pop(src_key)
+                            )
 
                 gate_key = f"{src_prefix}.gate.weight"
                 if gate_key in weights:

@@ -126,13 +126,20 @@ class Attention(nn.Module):
             if self.use_rope
             else float(args.rope_parameters.get("rope_theta", 500000.0))
         )
+        scaling_config = (
+            dict(args.rope_parameters) if self.use_rope else {"rope_type": "default"}
+        )
+        scaling_config["rope_theta"] = theta
+        rope_type = scaling_config.get("type") or scaling_config.get(
+            "rope_type", "default"
+        )
         self.rope = initialize_rope(
             self.head_dim,
             base=theta,
             traditional=False,
-            scaling_config={"rope_type": "default", "rope_theta": theta},
+            scaling_config=scaling_config,
             max_position_embeddings=args.max_position_embeddings,
-            implementation="eager",
+            implementation="eager" if rope_type in ("default", "linear") else "fast",
         )
 
     def __call__(

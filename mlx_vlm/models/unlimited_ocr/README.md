@@ -4,6 +4,40 @@ Unlimited-OCR is Baidu's OCR/document-parsing model for **one-shot long-horizon 
 
 This README only documents the prompt formats and settings that are either shown by upstream or verified in the MLX implementation.
 
+## Unlimited-OCR-2
+
+[`baidu/Unlimited-OCR-2`](https://huggingface.co/baidu/Unlimited-OCR-2) loads through the same module. It keeps the vision stack and adds a trained decoder attention path (`sparse_attention_config.training_stage == "dash"`):
+
+- **page2d RoPE**: every position gets a (token-in-page, page) coordinate. Each prompt image is preceded by a `<PAGE>` marker; the page index restarts for the answer, and a generated `<PAGE>` advances it.
+- **DASH block-sparse attention**: keys are grouped in 32-token blocks. Each query attends a 128-token local window plus the 12 remote blocks picked by a small per-layer router (`self_attn.dash_router.*`: block summaries via a learned `head_cls` query, top-16 scores, 1.5-entmax prior as a log-bias). Prefill queries are restricted to the image blocks of their own page.
+- Outputs use `<PAGE>`, `<BLOCK>label[x0, y0, x1, y1]<FORK>text`, and `cross_text` / `append_text` labels for paragraphs that continue across a page break.
+
+The processor detects v2 from `config.json` and rewrites the prompt into the trained `<PAGE><image>...` layout, so the prompt text is the same as for v1:
+
+```bash
+# One page: gundam mode (1024 global view + up to 16 local crops).
+mlx_vlm.generate --model baidu/Unlimited-OCR-2 --image page.png \
+    --prompt "Multi page parsing." --max-tokens 8192
+
+# Several pages in one request: gundam tiles for every page.
+mlx_vlm.generate --model baidu/Unlimited-OCR-2 --image page_0001.png page_0002.png \
+    --prompt "Multi page parsing." --max-tokens 16384
+```
+
+MLX defaults to gundam tiles for both single-page and multi-page requests to preserve small text. This differs from upstream `infer`, which defaults to one 1024 base view per page for multi-page requests. Upstream's SGLang example uses tiles per page with a 10-page window. To opt into base mode for lower prefill time and memory, pass `--processor-kwargs '{"cropping": false}'` (or `cropping=False` in Python).
+
+Accuracy: base mode can misread small text and loop on longer documents. In a greedy BF16 run on the first six pages of the Unlimited-OCR-2 technical report (150 DPI, M5 Max), base mode repeated page 3 until the 24,576-token limit, while tiled mode completed all six pages in 3,987 tokens with EOS. Tiling used 5,429 prompt tokens versus 1,649 in base mode. Neither run used logits processors. This is evidence from one document, not a guarantee against repetition on other inputs.
+
+MLX implementation notes (`dash.py`):
+
+- Decode gathers only the selected blocks and the local window (`12 × 32 + 128 = 512` keys) instead of masking the whole cache, so the per-token attention cost does not grow with the document.
+- Block summaries are computed once, when a block completes. Page/RoPE/candidate state for decode stays on device (no host sync per token).
+- The decode-step router and selection are `mx.compile`d on a block capacity that changes every 64 blocks.
+- `dash_router` weights stay dense when quantizing (`quant_predicate`); the warmup-stage `indexer` weights are dropped. Batch size 1 only.
+- Uniform KV-cache quantization (`--kv-bits 4` or `8`) preserves page state, pending router keys, and block summaries. Attention uses the shared quantized path and gathers packed K/V blocks during decode. Hybrid and TurboQuant policies leave DASH caches in floating point, matching the existing auxiliary-state cache mechanism.
+
+Generation uses MLX-VLM's standard sampling path. Optional page-count or repetition constraints can be supplied as caller-owned callables through the existing `logits_processors` argument; no model-specific generation guards are installed automatically. See [Generation Defaults](#generation-defaults) for an example.
+
 ## Model Architecture
 
 ```
@@ -298,7 +332,7 @@ MLX-VLM follows the same opt-in behavior. To keep this model consistent with the
 | Setting | Upstream single image | Upstream multi-page/PDF | MLX behavior |
 |---------|-----------------------|--------------------------|--------------|
 | Prompt | `<image>document parsing.` | `<image>Multi page parsing.` | Template inserts `<image>` automatically |
-| Image mode | `gundam` | `base` | Same via `processor_kwargs` / `generate` kwargs |
+| Image mode | `gundam` | `base` | Tiled by default; explicit `cropping=False` selects base mode |
 | Optional n-gram size | `35` in examples | `35` in examples | Caller-supplied via `logits_processors` |
 | Optional n-gram window | `128` in examples | `1024` in examples | Caller-supplied via `logits_processors` |
 | Output budget | `max_length=32768` | `max_length=32768` | Use `max_tokens` in MLX |
@@ -340,7 +374,7 @@ result = generate(
 ## Tips
 
 1. Do not manually add `<image>` to `mlx_vlm.generate` prompts; use `document parsing.` or `Multi page parsing.`.
-2. Use `cropping=False, image_size=1024` for multi-page or PDF workflows.
+2. For Unlimited-OCR-2, keep the default tiled mode for multi-page accuracy. Use `cropping=False` to trade small-text quality for lower prefill cost. The v1 PDF examples above use `cropping=False, image_size=1024` to match upstream.
 3. Render PDFs to images before calling MLX-VLM, and keep filenames zero-padded so shell glob order matches page order.
 4. Use a high `max_tokens` value for dense documents or long PDFs; lower it for quick smoke tests.
 5. Use `temperature=0.0` for deterministic OCR output.
@@ -349,7 +383,7 @@ result = generate(
 ## Limitations
 
 - The documented MLX workflow expects image files; render PDFs to page images first.
-- Upstream documents `base` mode for multi-page/PDF parsing. Dynamic-crop `gundam` mode is intended for single-image parsing.
+- Upstream v1 documents `base` mode for multi-page/PDF parsing. Unlimited-OCR-2 defaults to dynamic-crop `gundam` mode for every page in MLX.
 - Very dense or long documents can take substantial time and memory even with R-SWA because the full visual/prompt prefill is retained.
 - This README intentionally avoids documenting generic DeepSeek-OCR prompt variants that are not shown in the Baidu Unlimited-OCR repo.
 

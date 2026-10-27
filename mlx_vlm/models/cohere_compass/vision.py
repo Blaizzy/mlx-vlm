@@ -3,13 +3,8 @@ from itertools import accumulate
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..rope_utils import rotate_half as _rotate_half
 from .config import VisionConfig
-
-
-def _rotate_half(x):
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return mx.concatenate([-x2, x1], axis=-1)
 
 
 def _apply_rotary_pos_emb_vision(q, k, cos, sin):

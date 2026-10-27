@@ -136,13 +136,13 @@ class Model(nn.Module):
 
             if new_key == "text.wte":
                 new_key = "text.model.wte.weight"
-            elif new_key.startswith("text.lm_head"):
+            elif new_key.startswith(("text.lm_head", "text.model.")):
                 pass
             elif new_key.startswith("text."):
                 new_key = "text.model." + new_key[len("text.") :]
 
             if new_key.startswith("vision.") and not new_key.startswith(
-                "vision.proj_mlp"
+                ("vision.proj_mlp", "vision.encoder.")
             ):
                 new_key = "vision.encoder." + new_key[len("vision.") :]
 

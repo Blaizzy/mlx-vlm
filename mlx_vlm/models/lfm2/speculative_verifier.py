@@ -107,6 +107,7 @@ class Lfm2ExactSpeculativeVerifier:
             indices = mx.argpartition(gates, kth=-feed_forward.top_k, axis=-1)[
                 ..., -feed_forward.top_k :
             ]
+            indices = mx.stop_gradient(indices)
             scores = mx.take_along_axis(gates, indices, axis=-1)
             if feed_forward.norm_topk_prob:
                 scores /= mx.sum(scores, axis=-1, keepdims=True) + 1e-20

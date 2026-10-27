@@ -4,29 +4,24 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 from ..base import BaseModelConfig
+from ..dinov2.config import DINOV2_PRESETS
 
-# DINOv2 backbone presets per encoder variant.
+# DPT head presets per encoder variant, on top of the shared DINOv2 dims.
 ENCODER_PRESETS = {
     "vits": {
-        "embed_dim": 384,
-        "depth": 12,
-        "num_heads": 6,
+        **DINOV2_PRESETS["vits14"],
         "features": 64,
         "out_channels": [48, 96, 192, 384],
         "intermediate_layer_idx": [2, 5, 8, 11],
     },
     "vitb": {
-        "embed_dim": 768,
-        "depth": 12,
-        "num_heads": 12,
+        **DINOV2_PRESETS["vitb14"],
         "features": 128,
         "out_channels": [96, 192, 384, 768],
         "intermediate_layer_idx": [2, 5, 8, 11],
     },
     "vitl": {
-        "embed_dim": 1024,
-        "depth": 24,
-        "num_heads": 16,
+        **DINOV2_PRESETS["vitl14"],
         "features": 256,
         "out_channels": [256, 512, 1024, 1024],
         "intermediate_layer_idx": [4, 11, 17, 23],
@@ -58,6 +53,7 @@ class ModelConfig(BaseModelConfig):
     embed_dim: Optional[int] = None
     depth: Optional[int] = None
     num_heads: Optional[int] = None
+    ffn: Optional[str] = None  # "mlp" or "swiglu"
     intermediate_layer_idx: Optional[List[int]] = None
     img_size: int = 518
     patch_size: int = 14
