@@ -10,7 +10,6 @@ from .config import (
     TextConfig,
     VisionConfig,
 )
-from .guards import UnlimitedOCRGuards, make_guards
 from .language import LanguageModel, RingSlidingKVCache
 from .processing_unlimitedocr import UnlimitedOCRHFProcessor, UnlimitedOCRProcessor
 from .unlimitedocr import MlpProjector, Model
@@ -26,10 +25,8 @@ __all__ = [
     "SAMEncoder",
     "SAMViTConfig",
     "TextConfig",
-    "UnlimitedOCRGuards",
     "UnlimitedOCRHFProcessor",
     "UnlimitedOCRProcessor",
     "VisionConfig",
     "VisionModel",
-    "make_guards",
 ]
