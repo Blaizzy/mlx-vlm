@@ -130,7 +130,7 @@ class RefPointHead(nn.Module):
         self.layer2 = nn.Linear(hidden_size, hidden_size)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return nn.relu(self.layer2(nn.relu(self.layer1(x))))
+        return self.layer2(nn.relu(self.layer1(x)))
 
 
 class BoxRPBEmbed(nn.Module):
@@ -354,9 +354,8 @@ class DETRDecoder(nn.Module):
         y2 = cy + h / 2
         boxes_xyxy = mx.stack([x1, y1, x2, y2], axis=-1)  # (B, Q, 4)
 
-        # Coordinate grids normalized to [0, 1]
-        coords_h = (mx.arange(height).astype(mx.float32) + 0.5) / height
-        coords_w = (mx.arange(width).astype(mx.float32) + 0.5) / width
+        coords_h = mx.arange(height).astype(mx.float32) / height
+        coords_w = mx.arange(width).astype(mx.float32) / width
 
         # Compute deltas: coords - box boundaries
         # y deltas: (B*Q, HW, 2) = coords_h - [y1, y2]

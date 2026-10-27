@@ -227,6 +227,7 @@ class Lfm2MoeSparseMoeBlock(nn.Module):
         k = self.top_k
         inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
 
+        inds = mx.stop_gradient(inds)
         scores = mx.take_along_axis(gates, inds, axis=-1)
         if self.norm_topk_prob:
             scores /= mx.sum(scores, axis=-1, keepdims=True) + 1e-20

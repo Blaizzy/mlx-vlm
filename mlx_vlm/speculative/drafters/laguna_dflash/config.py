@@ -17,7 +17,6 @@ _REQUIRED_CHECKPOINT_FIELDS = {
     "max_position_embeddings",
     "rope_theta",
     "layer_types",
-    "sliding_windows",
     "sliding_window",
     "gating",
     "eagle_aux_hidden_state_layer_ids",
@@ -65,8 +64,17 @@ def validate_laguna_dflash_target(
     target_model_config: Any = None,
     target_model_layer_count: Optional[int] = None,
     target_tokenizer_length: Optional[int] = None,
+    target_language_model: Any = None,
 ) -> None:
     """Validate target-model identity before binding shared target tensors."""
+    if target_language_model is not None and not hasattr(
+        target_language_model, "rollback_speculative_cache"
+    ):
+        raise ValueError(
+            "Laguna DFlash target "
+            f"{type(target_language_model).__name__} does not expose speculative "
+            "cache rollback support."
+        )
     if target_model_layer_count is None and target_model_config is not None:
         target_model_layer_count = _target_layer_count(target_model_config)
     if target_model_layer_count is None:
@@ -230,6 +238,10 @@ class DFlashConfig(BaseModelConfig):
             merged["aux_hidden_state_layer_ids"] = raw[
                 "eagle_aux_hidden_state_layer_ids"
             ]
+        if not merged.get("sliding_windows"):
+            merged["sliding_windows"] = [merged["sliding_window"]] * int(
+                merged["num_hidden_layers"]
+            )
 
         signature = inspect.signature(cls).parameters
         config = cls(**{k: v for k, v in merged.items() if k in signature})

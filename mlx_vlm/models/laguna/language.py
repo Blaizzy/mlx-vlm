@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -11,7 +11,14 @@ from ..base import (
 from ..cache import KVCache, RotatingKVCache
 from ..mlp import SwiGLUMLP as MLP
 from ..rope_utils import initialize_rope
-from ..switch_layers import SwiGLU, SwitchLinear, _gather_sort, _scatter_unsort
+from ..switch_layers import (
+    EXPERT_WEIGHT_SUFFIXES,
+    SwiGLU,
+    SwitchLinear,
+    _gather_sort,
+    _scatter_unsort,
+    expand_expert_scales,
+)
 from .config import ModelConfig
 
 
@@ -274,6 +281,8 @@ class LagunaModel(nn.Module):
         inputs: mx.array,
         cache=None,
         inputs_embeds: Optional[mx.array] = None,
+        capture_layer_ids: Optional[List[int]] = None,
+        hidden_sink: Optional[list] = None,
     ) -> mx.array:
         if inputs_embeds is not None:
             h = inputs_embeds
@@ -289,13 +298,16 @@ class LagunaModel(nn.Module):
                 h, cache[self.swa_idx], window_size=self.args.sliding_window
             )
 
-        for layer, c in zip(self.layers, cache):
+        capture_set = set(capture_layer_ids) if capture_layer_ids else set()
+        for index, (layer, c) in enumerate(zip(self.layers, cache)):
             mask = (
                 sliding_mask
                 if layer.attention_type == "sliding_attention"
                 else full_mask
             )
             h = layer(h, mask, c)
+            if hidden_sink is not None and index in capture_set:
+                hidden_sink.append(h)
         return self.norm(h)
 
 
@@ -315,25 +327,32 @@ class LanguageModel(nn.Module):
         cache=None,
         input_embeddings: Optional[mx.array] = None,
         inputs_embeds: Optional[mx.array] = None,
+        capture_layer_ids: Optional[List[int]] = None,
         **kwargs,
     ) -> LanguageModelOutput:
         if inputs is None:
             inputs = kwargs.get("input_ids")
         if inputs_embeds is None:
             inputs_embeds = input_embeddings
-        out = self.model(inputs, cache, inputs_embeds)
+        kwargs.pop("speculative_verify", None)
+        hidden_sink: Optional[list] = [] if capture_layer_ids is not None else None
+        out = self.model(
+            inputs,
+            cache,
+            inputs_embeds,
+            capture_layer_ids=capture_layer_ids,
+            hidden_sink=hidden_sink,
+        )
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
             out = self.lm_head(out)
-        return LanguageModelOutput(logits=out)
+        return LanguageModelOutput(logits=out, hidden_states=hidden_sink)
 
     def sanitize(self, weights):
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
 
-        weights = self._stack_compressed_nvfp4_experts(weights)
-        weights = self._fold_compressed_nvfp4_shared_experts(weights)
         weights = self._unpack_compressed_tensors(weights)
         weights = self._remap_router_weights(weights)
         weights = self._stack_experts(weights)
@@ -374,92 +393,6 @@ class LanguageModel(nn.Module):
                 new_weights[k] = v
         return new_weights
 
-    def _stack_compressed_nvfp4_experts(self, weights):
-        quantization = self.args.quantization or {}
-        if quantization.get("mode") != "nvfp4":
-            return weights
-        if not any(
-            ".mlp.experts." in key and key.endswith(".weight_packed") for key in weights
-        ):
-            return weights
-
-        from ...utils import _E4M3_DECODE_LUT, _f32_to_e4m3
-
-        def pop_projection(prefix, proj):
-            packed = []
-            scales = []
-            global_scales = []
-            for expert_idx in range(self.args.num_experts):
-                expert_prefix = f"{prefix}.experts.{expert_idx}.{proj}"
-                packed.append(weights.pop(f"{expert_prefix}.weight_packed"))
-                scales.append(weights.pop(f"{expert_prefix}.weight_scale"))
-                global_scales.append(
-                    weights.pop(f"{expert_prefix}.weight_global_scale").astype(
-                        mx.float32
-                    )
-                )
-                weights.pop(f"{expert_prefix}.input_global_scale", None)
-
-            stacked_scales = mx.stack(scales)
-            global_scale = mx.stack(global_scales).reshape(self.args.num_experts, 1, 1)
-            decoded = _E4M3_DECODE_LUT[stacked_scales.astype(mx.uint32)]
-            return mx.stack([p.view(mx.uint32) for p in packed]), decoded / global_scale
-
-        for layer_idx in range(self.args.num_hidden_layers):
-            prefix = f"model.layers.{layer_idx}.mlp"
-            if f"{prefix}.experts.0.gate_proj.weight_packed" in weights:
-                gate_weight, gate_scales = pop_projection(prefix, "gate_proj")
-                up_weight, up_scales = pop_projection(prefix, "up_proj")
-                weights[f"{prefix}.switch_mlp.gate_up_proj.weight"] = mx.concatenate(
-                    [gate_weight, up_weight], axis=1
-                )
-                weights[f"{prefix}.switch_mlp.gate_up_proj.scales"] = _f32_to_e4m3(
-                    mx.concatenate([gate_scales, up_scales], axis=1)
-                )
-
-            if f"{prefix}.experts.0.down_proj.weight_packed" in weights:
-                down_weight, down_scales = pop_projection(prefix, "down_proj")
-                weights[f"{prefix}.switch_mlp.down_proj.weight"] = down_weight
-                weights[f"{prefix}.switch_mlp.down_proj.scales"] = _f32_to_e4m3(
-                    down_scales
-                )
-
-        return weights
-
-    def _fold_compressed_nvfp4_shared_experts(self, weights):
-        quantization = self.args.quantization or {}
-        if quantization.get("mode") != "nvfp4":
-            return weights
-        if not any(
-            ".mlp.shared_expert." in key and key.endswith(".weight_packed")
-            for key in weights
-        ):
-            return weights
-
-        from ...utils import _E4M3_DECODE_LUT, _f32_to_e4m3
-
-        packed_suffix = ".weight_packed"
-        for key in list(weights.keys()):
-            if ".mlp.shared_expert." not in key or not key.endswith(packed_suffix):
-                continue
-
-            prefix = key[: -len(packed_suffix)]
-            scale_key = f"{prefix}.weight_scale"
-            global_scale_key = f"{prefix}.weight_global_scale"
-            if scale_key not in weights or global_scale_key not in weights:
-                continue
-
-            packed = weights.pop(key)
-            scale = weights.pop(scale_key)
-            global_scale = weights.pop(global_scale_key).astype(mx.float32)
-            weights.pop(f"{prefix}.input_global_scale", None)
-
-            weights[f"{prefix}.weight"] = packed.view(mx.uint32)
-            decoded = _E4M3_DECODE_LUT[scale.astype(mx.uint32)]
-            weights[f"{prefix}.scales"] = _f32_to_e4m3(decoded / global_scale)
-
-        return weights
-
     def _remap_router_weights(self, weights):
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{layer_idx}.mlp"
@@ -475,9 +408,18 @@ class LanguageModel(nn.Module):
         return weights
 
     def _stack_experts(self, weights):
+        expand_expert_scales(
+            weights,
+            [
+                key.removesuffix(".weight")
+                for key in weights
+                if key.endswith((".gate_proj.weight", ".up_proj.weight"))
+                and any(part in key for part in (".experts.", ".switch_mlp."))
+            ],
+        )
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{layer_idx}.mlp"
-            for suffix in ["weight", "scales", "biases"]:
+            for suffix in EXPERT_WEIGHT_SUFFIXES:
                 gate_key = f"{prefix}.experts.0.gate_proj.{suffix}"
                 up_key = f"{prefix}.experts.0.up_proj.{suffix}"
                 if gate_key in weights and up_key in weights:
@@ -512,7 +454,7 @@ class LanguageModel(nn.Module):
     def _fuse_split_switch_gate_up(self, weights):
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{layer_idx}.mlp.switch_mlp"
-            for suffix in ["weight", "scales", "biases"]:
+            for suffix in EXPERT_WEIGHT_SUFFIXES:
                 gate_key = f"{prefix}.gate_proj.{suffix}"
                 up_key = f"{prefix}.up_proj.{suffix}"
                 fused_key = f"{prefix}.gate_up_proj.{suffix}"
@@ -553,6 +495,41 @@ class LanguageModel(nn.Module):
     @property
     def n_kv_heads(self):
         return self.args.num_key_value_heads
+
+    def rollback_speculative_cache(
+        self,
+        caches: List[Any],
+        gdn_states: Any,
+        accepted: Any,
+        block_size: int,
+    ) -> int:
+        """Commit the accepted speculative prefix and drop rejected entries.
+
+        Laguna holds only KV and RotatingKV caches, so committing is a trim.
+        ``gdn_states`` is accepted and ignored, for parity with the targets
+        that carry recurrent state.
+        """
+        del gdn_states
+        if isinstance(accepted, int):
+            accepted = mx.array([accepted], dtype=mx.int32)
+        elif not isinstance(accepted, mx.array):
+            accepted = mx.array(accepted, dtype=mx.int32)
+
+        max_accepted = int(accepted.max().item())
+        if accepted.size > 1 and int(accepted.min().item()) != max_accepted:
+            raise RuntimeError(
+                "Laguna batched speculative rollback requires uniform per-row "
+                f"acceptance; got ragged accepts {accepted.tolist()}. Set "
+                "requires_uniform_batch_acceptance on the drafter or target so "
+                "accepts are clamped before rollback."
+            )
+
+        trim = block_size - max_accepted - 1
+        if trim > 0:
+            for cache in caches:
+                if cache is not None and hasattr(cache, "trim"):
+                    cache.trim(trim)
+        return max_accepted
 
     def make_cache(self):
         return [

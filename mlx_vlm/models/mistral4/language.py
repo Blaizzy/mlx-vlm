@@ -183,6 +183,7 @@ class Mistral4MoE(nn.Module):
         # Top-k expert selection
         k = self.top_k
         inds = mx.argpartition(-gates, kth=k - 1, axis=-1)[..., :k]
+        inds = mx.stop_gradient(inds)
         scores = mx.take_along_axis(gates, inds, axis=-1)
 
         if self.norm_topk_prob:

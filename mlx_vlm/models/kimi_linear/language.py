@@ -12,7 +12,7 @@ from ..base import (
 )
 from ..cache import ArraysCache, KVCache
 from ..gated_delta import gated_delta_update
-from ..mla import MultiLinear
+from ..mla import MultiLinear, latent_length, max_absorbed_queries
 from ..switch_layers import SwitchGLU
 from .config import ModelConfig
 
@@ -71,6 +71,7 @@ def _group_expert_select(
         scores = mx.flatten(scores, -2, -1)
 
     inds = mx.argpartition(-scores, kth=top_k - 1, axis=-1)[..., :top_k]
+    inds = mx.stop_gradient(inds)
     scores = mx.take_along_axis(orig_scores, inds, axis=-1)
 
     if top_k > 1 and renormalize:
@@ -145,6 +146,11 @@ class KimiMLAAttention(nn.Module):
         self.unembed_out = MultiLinear(
             args.kv_lora_rank, self.v_head_dim, self.num_heads
         )
+        self._absorbed_dims = (
+            args.kv_lora_rank,
+            self.qk_nope_head_dim,
+            self.v_head_dim,
+        )
         self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, hidden, bias=False)
 
     def __call__(
@@ -177,7 +183,10 @@ class KimiMLAAttention(nn.Module):
                 mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
             )
 
-        if L == 1:
+        absorbed = L == 1 or L <= max_absorbed_queries(
+            *self._absorbed_dims, latent_length(kv_latent)
+        )
+        if absorbed:
             q_nope = self.embed_q(q_nope)
             k = v = kv_latent
         else:
@@ -188,7 +197,7 @@ class KimiMLAAttention(nn.Module):
             q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
         )
 
-        if L == 1:
+        if absorbed:
             output = self.unembed_out(output)
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
@@ -479,22 +488,24 @@ class LanguageModel(nn.Module):
                     ("w2", "down_proj"),
                     ("w3", "up_proj"),
                 ]:
-                    key = f"{src_prefix}.experts.0.{src}.weight"
-                    if key in weights:
-                        stacked = [
-                            weights.pop(f"{src_prefix}.experts.{i}.{src}.weight")
-                            for i in range(self.args.num_experts)
-                        ]
-                        weights[f"{dst_prefix}.switch_mlp.{dst}.weight"] = mx.stack(
-                            stacked
-                        )
+                    for suffix in ("weight", "scales", "biases", "weight_global_scale"):
+                        key = f"{src_prefix}.experts.0.{src}.{suffix}"
+                        if key in weights:
+                            stacked = [
+                                weights.pop(f"{src_prefix}.experts.{i}.{src}.{suffix}")
+                                for i in range(self.args.num_experts)
+                            ]
+                            weights[f"{dst_prefix}.switch_mlp.{dst}.{suffix}"] = (
+                                mx.stack(stacked)
+                            )
 
                 for name in ("gate_proj", "up_proj", "down_proj"):
-                    src_key = f"{src_prefix}.shared_experts.{name}.weight"
-                    if src_key in weights:
-                        weights[f"{dst_prefix}.shared_experts.{name}.weight"] = (
-                            weights.pop(src_key)
-                        )
+                    for suffix in ("weight", "scales", "biases", "weight_global_scale"):
+                        src_key = f"{src_prefix}.shared_experts.{name}.{suffix}"
+                        if src_key in weights:
+                            weights[f"{dst_prefix}.shared_experts.{name}.{suffix}"] = (
+                                weights.pop(src_key)
+                            )
 
                 gate_key = f"{src_prefix}.gate.weight"
                 if gate_key in weights:

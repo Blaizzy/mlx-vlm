@@ -144,9 +144,8 @@ class DINOv2Attention(nn.Module):
             .transpose(0, 2, 1, 3)
         )
 
-        attn = (q @ k.transpose(0, 1, 3, 2)) * self.scale
-        attn = mx.softmax(attn, axis=-1)
-        x = (attn @ v).transpose(0, 2, 1, 3).reshape(B, N, D)
+        x = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale)
+        x = x.transpose(0, 2, 1, 3).reshape(B, N, D)
         return self.o_proj(x)
 
 

@@ -31,6 +31,16 @@ QUANT_RECIPES = [
 ]
 
 
+def _copy_writable_file(src, dst):
+    """Copy cache contents without carrying read-only permissions into the export."""
+    src, dst = Path(src), Path(dst)
+    if dst.exists() and src.samefile(dst):
+        raise shutil.SameFileError(f"{src!s} and {dst!s} are the same file")
+    # A previous conversion may have left a read-only file at the destination.
+    dst.unlink(missing_ok=True)
+    return shutil.copyfile(src, dst)
+
+
 def _preserve_existing_deepseek_v4_quantization(
     config: dict,
     model: nn.Module,
@@ -75,7 +85,11 @@ def mixed_quant_predicate_builder(
 
     low_bits, high_bits = recipe_config[recipe]
 
-    down_keys = [k for k, _ in model.named_modules() if "down_proj" in k]
+    # LFM2 names its feed-forward down projection `feed_forward.w2`.
+    def is_down_proj(path):
+        return "down_proj" in path or "feed_forward.w2" in path
+
+    down_keys = [k for k, _ in model.named_modules() if is_down_proj(k)]
     if len(down_keys) == 0:
         raise ValueError("Model does not have expected keys for mixed quant.")
 
@@ -115,7 +129,7 @@ def mixed_quant_predicate_builder(
             or (index - num_layers // 8) % 3 == 2
         )
 
-        if use_more_bits and ("v_proj" in path or "down_proj" in path):
+        if use_more_bits and ("v_proj" in path or is_down_proj(path)):
             return {"group_size": group_size, "bits": high_bits}
 
         if "lm_head" in path or "embed_tokens" in path:
@@ -263,6 +277,19 @@ def _apply_awq_calibration(
     print(f"[INFO] AWQ scaling applied: {summary}")
 
 
+def _record_conversion_dtype(config: dict, dtype: str) -> None:
+    """Record the cast dtype without changing quantization declarations."""
+    config["dtype"] = dtype
+    for name, section in config.items():
+        if (
+            name.endswith("_config")
+            and name != "quantization_config"
+            and isinstance(section, dict)
+        ):
+            for key in section.keys() & {"dtype", "torch_dtype"}:
+                section[key] = dtype
+
+
 def convert(
     hf_path: str,
     mlx_path: str = "mlx_model",
@@ -305,21 +332,22 @@ def convert(
     quant_predicate = quant_predicate or base_quant_predicate
 
     if dtype is None:
-        dtype = config.get("torch_dtype", None)
+        dtype = config.get("dtype") or config.get("torch_dtype")
     if dtype is None and (text_config := config.get("text_config", None)):
         dtype = text_config.get("dtype", None)
     if dtype in MODEL_CONVERSION_DTYPES:
         print("[INFO] Using dtype:", dtype)
-        dtype = getattr(mx, dtype)
+        mlx_dtype = getattr(mx, dtype)
         cast_predicate = getattr(model, "cast_predicate", lambda _: True)
 
         def set_dtype(k, v):
             if cast_predicate(k) and mx.issubdtype(v.dtype, mx.floating):
-                return v.astype(dtype)
+                return v.astype(mlx_dtype)
             else:
                 return v
 
         target.update(tree_map_with_path(set_dtype, target.parameters()))
+        _record_conversion_dtype(config, dtype)
 
     if quantize and dequantize:
         raise ValueError("Choose either quantize or dequantize, not both.")
@@ -373,7 +401,7 @@ def convert(
             # Skip the index file - save_weights() already generated the correct one
             if Path(file).name == "model.safetensors.index.json":
                 continue
-            shutil.copy(file, mlx_path)
+            _copy_writable_file(file, mlx_path / Path(file).name)
 
     # Copy folders from the model path to the MLX path
     for item in model_path.iterdir():
@@ -381,7 +409,7 @@ def convert(
             dest = mlx_path / item.name
             if dest.exists():
                 shutil.rmtree(dest)
-            shutil.copytree(item, dest)
+            shutil.copytree(item, dest, copy_function=_copy_writable_file)
 
     # Not every remote-code processor inherits ProcessorMixin — Mage-VL's `MageVLProcessor`
     # deliberately does not ("We deliberately do NOT inherit transformers.ProcessorMixin"), so it
@@ -399,7 +427,7 @@ def convert(
             for pattern in ("*.json", "*.txt", "*.jinja", "*.model"):
                 for f in src.glob(pattern):
                     if f.name not in ("config.json", "model.safetensors.index.json"):
-                        shutil.copy2(f, Path(mlx_path) / f.name)
+                        _copy_writable_file(f, mlx_path / f.name)
         print("[INFO] processor lacks save_pretrained; copied processor files verbatim")
 
     save_config(config, config_path=mlx_path / "config.json")
@@ -507,7 +535,10 @@ def configure_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--dtype",
-        help="Type to save the parameter. Defaults to config.json's `torch_dtype` or the current model weights dtype",
+        help=(
+            "Type to save the parameter. Defaults to config.json's `dtype` or "
+            "`torch_dtype`, then `text_config.dtype`, or the current model weights dtype"
+        ),
         type=str,
         choices=MODEL_CONVERSION_DTYPES,
         default=None,

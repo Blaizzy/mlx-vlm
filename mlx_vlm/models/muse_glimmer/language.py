@@ -126,13 +126,20 @@ class Attention(nn.Module):
             if self.use_rope
             else float(args.rope_parameters.get("rope_theta", 500000.0))
         )
+        scaling_config = (
+            dict(args.rope_parameters) if self.use_rope else {"rope_type": "default"}
+        )
+        scaling_config["rope_theta"] = theta
+        rope_type = scaling_config.get("type") or scaling_config.get(
+            "rope_type", "default"
+        )
         self.rope = initialize_rope(
             self.head_dim,
             base=theta,
             traditional=False,
-            scaling_config={"rope_type": "default", "rope_theta": theta},
+            scaling_config=scaling_config,
             max_position_embeddings=args.max_position_embeddings,
-            implementation="eager",
+            implementation="eager" if rope_type in ("default", "linear") else "fast",
         )
 
     def __call__(
@@ -267,6 +274,8 @@ class TextModel(nn.Module):
 
 
 class LanguageModel(nn.Module):
+    requires_uniform_batch_acceptance = True
+
     def __init__(self, args: TextConfig):
         super().__init__()
         self.args = args
@@ -354,16 +363,18 @@ class LanguageModel(nn.Module):
             ):
                 cache_length = cache._idx
                 verify_start = cache_length - retained
-                for row, valid_end in enumerate(valid_ends.tolist()):
-                    start = verify_start + int(valid_end)
-                    if start >= cache_length:
-                        continue
-                    zero_row_tail = getattr(cache, "zero_row_tail", None)
-                    if callable(zero_row_tail):
-                        zero_row_tail(row, start, cache_length)
-                    else:
-                        cache.keys[row, :, start:cache_length, :] = 0
-                        cache.values[row, :, start:cache_length, :] = 0
+                if any(
+                    verify_start + int(valid_end) < cache_length
+                    for valid_end in valid_ends.tolist()
+                ):
+                    raise RuntimeError(
+                        "Muse Glimmer batched speculative rollback requires uniform "
+                        f"per-row acceptance; got ragged accepts {accepted.tolist()}. "
+                        "Zeroing a rejected row's KV tail leaves phantom keys "
+                        "attended (issue #1962); set "
+                        "requires_uniform_batch_acceptance on the drafter or target "
+                        "so accepts are clamped before rollback."
+                    )
         return max_accepted
 
     @property

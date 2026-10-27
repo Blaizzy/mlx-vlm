@@ -10,7 +10,7 @@ from ..base import (
 )
 from ..mlp import SwiGLUMLP as MLP
 from ..rope_utils import initialize_rope
-from ..switch_layers import SwitchGLU
+from ..switch_layers import EXPERT_WEIGHT_SUFFIXES, SwitchGLU
 from .config import ModelConfig
 
 
@@ -99,6 +99,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         k = self.top_k
         inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+        inds = mx.stop_gradient(inds)
         scores = mx.take_along_axis(gates, inds, axis=-1)
         if self.norm_topk_prob:
             scores /= mx.sum(scores, axis=-1, keepdims=True)
@@ -211,12 +212,15 @@ class LanguageModel(nn.Module):
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
             for n in ["up_proj", "down_proj", "gate_proj"]:
-                if f"{prefix}.mlp.experts.0.{n}.weight" in weights:
-                    to_join = [
-                        weights.pop(f"{prefix}.mlp.experts.{e}.{n}.weight")
-                        for e in range(self.args.num_experts)
-                    ]
-                    weights[f"{prefix}.mlp.switch_mlp.{n}.weight"] = mx.stack(to_join)
+                for suffix in EXPERT_WEIGHT_SUFFIXES:
+                    if f"{prefix}.mlp.experts.0.{n}.{suffix}" in weights:
+                        to_join = [
+                            weights.pop(f"{prefix}.mlp.experts.{e}.{n}.{suffix}")
+                            for e in range(self.args.num_experts)
+                        ]
+                        weights[f"{prefix}.mlp.switch_mlp.{n}.{suffix}"] = mx.stack(
+                            to_join
+                        )
         return weights
 
     @property

@@ -3,6 +3,7 @@ from typing import List, Optional, Sequence, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..base import check_array_shape
 from ..kernels import bicubic_interpolate
 from .config import VisionConfig
 
@@ -22,20 +23,6 @@ def make_block_attention_mask(cu_seqlens: mx.array, seq_length: int) -> mx.array
     pos = mx.arange(seq_length)
     block_id = mx.sum(pos[None, :] >= cu_seqlens[1:, None], axis=0)
     return block_id[:, None] == block_id[None, :]
-
-
-def check_array_shape(arr):
-    shape = arr.shape
-
-    if len(shape) != 4:
-        return False
-
-    out_channels, kH, KW, _ = shape
-
-    if (out_channels >= kH) and (out_channels >= KW) and (kH == KW):
-        return True
-    else:
-        return False
 
 
 class Learnable2DInterpPosEmb(nn.Module):

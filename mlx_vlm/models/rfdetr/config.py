@@ -114,28 +114,21 @@ class ModelConfig(BaseModelConfig):
             self.encoder, dinov2_sizes["dinov2_windowed_small"]
         )
 
-        # Compute window_block_indexes from out_feature_indexes
-        # Global attention layers = out_feature_indexes (in raw config space)
-        # Feature extraction layers = out_feature_indexes - 1 (0-indexed layer output)
+        # out_feature_indexes are 1-based backbone stage numbers, as in the
+        # reference (stage i = output of 0-indexed layer i - 1). The same raw
+        # values select the global attention layers (legacy RF-DETR formula).
+        # self.out_feature_indexes is left unchanged so a saved config reloads
+        # to the same layers.
         num_layers = 12
-        raw_indexes = list(self.out_feature_indexes)
-        is_hf_indexed = any(idx >= num_layers for idx in raw_indexes)
-
-        # Global attention layer indices (0-indexed, within [0, num_layers))
-        global_layers = set()
-        for idx in raw_indexes:
-            layer_idx = idx if not is_hf_indexed else idx
-            if 0 <= layer_idx < num_layers:
-                global_layers.add(layer_idx)
+        global_layers = {idx for idx in self.out_feature_indexes if idx < num_layers}
         window_block_indexes = [i for i in range(num_layers) if i not in global_layers]
 
-        # Feature extraction: convert to 0-indexed layer output indices
-        if is_hf_indexed:
-            self.out_feature_indexes = [idx - 1 for idx in raw_indexes]
+        # Feature extraction: 0-indexed layer output indices
+        feature_layers = [idx - 1 for idx in self.out_feature_indexes]
 
         if self.backbone_config is None:
             self.backbone_config = DINOv2Config(
-                out_feature_indexes=self.out_feature_indexes,
+                out_feature_indexes=feature_layers,
                 patch_size=self.patch_size,
                 positional_encoding_size=self.positional_encoding_size,
                 window_block_indexes=window_block_indexes,

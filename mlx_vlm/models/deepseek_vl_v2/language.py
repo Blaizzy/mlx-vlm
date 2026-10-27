@@ -329,6 +329,7 @@ class MoEGate(nn.Module):
             # Get top-k indices and weights
             k = self.top_k
             inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+            inds = mx.stop_gradient(inds)
             scores = mx.take_along_axis(scores, inds, axis=-1)
 
         elif self.topk_method == "noaux_tc":
@@ -492,7 +493,7 @@ class LanguageModel(nn.Module):
         for l in range(self.config.num_hidden_layers):
             prefix = f"language_model.model.layers.{l}"
             for n, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
-                for k in ["weight", "scales", "biases"]:
+                for k in ("weight", "scales", "biases", "weight_global_scale"):
                     if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
                         to_join = [
                             weights.pop(f"{prefix}.mlp.experts.{e}.{m}.{k}")

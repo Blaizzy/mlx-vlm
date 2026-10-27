@@ -11,7 +11,7 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import KVCache
-from ..switch_layers import SwitchGLU
+from ..switch_layers import EXPERT_WEIGHT_SUFFIXES, SwitchGLU
 from .config import ModelConfig
 
 
@@ -164,6 +164,7 @@ class MiniMaxSparseMoeBlock(nn.Module):
 
         k = self.num_experts_per_tok
         inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+        inds = mx.stop_gradient(inds)
         scores = mx.take_along_axis(orig_scores, inds, axis=-1)
 
         scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
@@ -305,16 +306,20 @@ class LanguageModel(nn.Module):
             prefix = f"model.layers.{l}"
             mapping = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
             for orig_name, new_name in mapping.items():
-                if f"{prefix}.block_sparse_moe.experts.0.{orig_name}.weight" in weights:
-                    to_join = [
-                        weights.pop(
-                            f"{prefix}.block_sparse_moe.experts.{e}.{orig_name}.weight"
-                        )
-                        for e in range(self.args.num_local_experts)
-                    ]
-                    weights[
-                        f"{prefix}.block_sparse_moe.switch_mlp.{new_name}.weight"
-                    ] = mx.stack(to_join)
+                for suffix in EXPERT_WEIGHT_SUFFIXES:
+                    if (
+                        f"{prefix}.block_sparse_moe.experts.0.{orig_name}.{suffix}"
+                        in weights
+                    ):
+                        to_join = [
+                            weights.pop(
+                                f"{prefix}.block_sparse_moe.experts.{e}.{orig_name}.{suffix}"
+                            )
+                            for e in range(self.args.num_local_experts)
+                        ]
+                        weights[
+                            f"{prefix}.block_sparse_moe.switch_mlp.{new_name}.{suffix}"
+                        ] = mx.stack(to_join)
 
         return weights
 

@@ -36,6 +36,7 @@ from ..generate.diffusion import (
 )
 from ..sample_utils import (
     apply_top_k,
+    clamp_temperature,
     make_logits_processors,
     make_sampler,
     top_p_sampling,
@@ -43,7 +44,8 @@ from ..sample_utils import (
 from ..speculative.utils import speculative_stats_since, speculative_stats_snapshot
 from ..structured import ThinkingAwareLogitsProcessor
 from ..tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
-from ..utils import ThinkingBudgetCriteria, load, prepare_inputs
+from ..utils import ThinkingBudgetCriteria, load, prepare_inputs, resolve_eos_token_ids
+from ..vision_cache import processed_image_key
 from .runtime import runtime
 
 logger = logging.getLogger("mlx_vlm.server")
@@ -91,6 +93,16 @@ def get_max_num_seqs():
 
 def get_server_max_tokens():
     return int(os.environ.get("MLX_VLM_MAX_TOKENS", DEFAULT_MAX_TOKENS))
+
+
+def get_server_min_pixels():
+    value = os.environ.get("MLX_VLM_MIN_PIXELS")
+    return int(value) if value else None
+
+
+def get_server_max_pixels():
+    value = os.environ.get("MLX_VLM_MAX_PIXELS")
+    return int(value) if value else None
 
 
 def get_token_queue_timeout():
@@ -153,7 +165,7 @@ class _PositionedTargetSampler:
         top_k: int = 0,
         seed: Optional[int],
     ):
-        self.temperature = float(temperature)
+        self.temperature = clamp_temperature(float(temperature))
         self.top_p = float(top_p)
         self.top_k = int(top_k)
         self.seed = DEFAULT_SEED if seed is None else int(seed)
@@ -196,19 +208,7 @@ class _PositionedTargetSampler:
         return mx.random.categorical(logprobs * (1 / self.temperature), key=key)
 
     def _sample_top_p_one(self, logprobs: mx.array, key: mx.array) -> mx.array:
-        if logprobs.dtype == mx.bfloat16:
-            logprobs = logprobs.astype(mx.float32)
-        probs = mx.softmax(logprobs / self.temperature, axis=-1)
-        sorted_indices = mx.argsort(probs, axis=-1)
-        sorted_probs = mx.take_along_axis(probs, sorted_indices, axis=-1)
-        cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
-        top_probs = mx.where(
-            cumulative_probs > 1 - self.top_p,
-            sorted_probs,
-            mx.zeros_like(sorted_probs),
-        )
-        sampled_pos = mx.random.categorical(mx.log(top_probs), key=key)
-        return mx.take_along_axis(sorted_indices, sampled_pos[..., None], axis=-1)[0]
+        return top_p_sampling(logprobs, self.top_p, self.temperature, key=key)
 
 
 def get_server_enable_thinking():
@@ -650,6 +650,30 @@ class GenerationArguments:
     # cached blocks from one tenant can't be reused (or detected via timing)
     # by another. None = no salt = single-tenant behaviour.
     tenant_id: Optional[str] = None
+    min_pixels: Optional[int] = None
+    max_pixels: Optional[int] = None
+    resize_shape: Optional[Tuple[int, int]] = None
+
+    def __post_init__(self):
+        self.temperature = clamp_temperature(self.temperature)
+        for name in ("min_pixels", "max_pixels"):
+            value = getattr(self, name)
+            if value is not None and value <= 0:
+                raise ValueError(f"{name} must be positive")
+        if (
+            self.min_pixels is not None
+            and self.max_pixels is not None
+            and self.min_pixels > self.max_pixels
+        ):
+            raise ValueError("min_pixels must not exceed max_pixels")
+
+    def preprocessing_kwargs(self) -> dict:
+        """Per-request image options; never mutate the shared processor."""
+        return {
+            key: getattr(self, key)
+            for key in ("min_pixels", "max_pixels", "resize_shape")
+            if getattr(self, key) is not None
+        }
 
     def diffusion_kwargs(self) -> dict:
         """Diffusion-only generation kwargs explicitly supplied by a request."""
@@ -714,6 +738,7 @@ class GenerationArguments:
         if self.tenant_id is not None:
             kw["apc_tenant"] = self.tenant_id
         kw.update(self.diffusion_kwargs())
+        kw.update(self.preprocessing_kwargs())
         return kw
 
     def to_template_kwargs(self) -> dict:
@@ -1074,17 +1099,35 @@ class ResponseGenerator:
             pending, self._cancelled = self._cancelled, set()
             return pending
 
+    def _apply_cancellations(self, batch_gen, active):
+        for uid in self._drain_cancellations():
+            if batch_gen is None or uid not in active:
+                continue
+            if not batch_gen.remove(uid):
+                self._cancel(uid)
+                continue
+            info = active.pop(uid)
+            logger.info(
+                "Generation cancelled: request=%s generated_tokens=%d",
+                info.get("request_id", uid),
+                int(info.get("generated_tokens", 0) or 0),
+            )
+            try:
+                info["rqueue"].put(None)
+            except Exception:
+                pass
+
     def _initialize_model(self):
         model, processor, config = load_model_resources(
             self.model_path, self.adapter_path
         )
 
-        stop_tokens = set()
-        if hasattr(config, "eos_token_id"):
-            if isinstance(config.eos_token_id, list):
-                stop_tokens.update(config.eos_token_id)
-            elif config.eos_token_id is not None:
-                stop_tokens.add(config.eos_token_id)
+        stop_tokens = set(
+            resolve_eos_token_ids(
+                getattr(config, "eos_token_id", None),
+                getattr(processor, "tokenizer", processor),
+            )
+        )
         stop_tokens.update(getattr(processor, "additional_eos_token_ids", ()))
 
         draft_model = None
@@ -1166,7 +1209,9 @@ class ResponseGenerator:
         # races request threads through the mutable fast-tokenizer backend.
         tokenizer_lock = getattr(self, "_tokenizer_lock", None)
         with tokenizer_lock if tokenizer_lock is not None else nullcontext():
-            raw_inputs = self._preprocess_request(prompt, images, audio, videos)
+            raw_inputs = self._preprocess_request(
+                prompt, images, audio, videos, **args.preprocessing_kwargs()
+            )
             thinking_budget_criteria = self._make_thinking_budget_criteria(
                 args, raw_inputs.get("input_ids")
             )
@@ -1227,7 +1272,9 @@ class ResponseGenerator:
             rqueue, ctx.uid, self._cancel, get_token_queue_timeout()
         )
 
-    def _cpu_preprocess(self, prompt, images=None, audio=None, videos=None) -> dict:
+    def _cpu_preprocess(
+        self, prompt, images=None, audio=None, videos=None, **preprocessing_kwargs
+    ) -> dict:
         """CPU-only: tokenize text, load/resize images. Thread-safe."""
         add_special_tokens = (
             getattr(self.processor, "chat_template", None) is None
@@ -1244,12 +1291,17 @@ class ResponseGenerator:
             prompts=prompt,
             image_token_index=image_token_index,
             add_special_tokens=add_special_tokens,
+            **preprocessing_kwargs,
         )
 
-    def _preprocess_request(self, prompt, images=None, audio=None, videos=None) -> dict:
+    def _preprocess_request(
+        self, prompt, images=None, audio=None, videos=None, **preprocessing_kwargs
+    ) -> dict:
         if videos is None:
-            return self._cpu_preprocess(prompt, images, audio)
-        return self._cpu_preprocess(prompt, images, audio, videos)
+            return self._cpu_preprocess(prompt, images, audio, **preprocessing_kwargs)
+        return self._cpu_preprocess(
+            prompt, images, audio, videos, **preprocessing_kwargs
+        )
 
     # -- internals --
 
@@ -1593,7 +1645,7 @@ class ResponseGenerator:
             and images is not None
         ):
             data_kwargs["vision_cache"] = self.vision_cache
-            data_kwargs["_image_key"] = images
+            data_kwargs["_image_key"] = processed_image_key(pixel_values, **data_kwargs)
 
         # Always call get_input_embeddings — BatchGenerator requires inputs_embeds
         embed = self.model.get_input_embeddings(
@@ -1662,7 +1714,21 @@ class ResponseGenerator:
         try:
             self._run_impl()
         finally:
-            clear_mlx_streams()
+            try:
+                # The worker can outlive stop_and_join's timeout. Retire its
+                # disk writer only after its final request/store has finished.
+                manager = getattr(self, "apc_manager", None)
+                if manager is not None:
+                    manager.close()
+            except Exception:
+                logger.exception("Error closing APC after generation worker shutdown")
+            finally:
+                # The worker can finish after an unload timeout. Release its
+                # model owners before clearing Metal's allocator cache.
+                self.model = self.processor = self.tokenizer = self.draft_model = None
+                self.apc_manager = None
+                clear_mlx_streams()
+                mx.clear_cache()
 
     def _run_impl(self):
         """Single GPU thread: owns BatchGenerator, runs tight next() loop."""
@@ -1711,21 +1777,7 @@ class ResponseGenerator:
                     break
 
                 # Drop abandoned requests before doing more work.
-                cancelled = self._drain_cancellations()
-                if cancelled and batch_gen is not None:
-                    for uid in cancelled:
-                        if uid in active:
-                            batch_gen.remove(uid)
-                            info = active.pop(uid)
-                            logger.info(
-                                "Generation cancelled: request=%s generated_tokens=%d",
-                                info.get("request_id", uid),
-                                int(info.get("generated_tokens", 0) or 0),
-                            )
-                            try:
-                                info["rqueue"].put(None)
-                            except Exception:
-                                pass
+                self._apply_cancellations(batch_gen, active)
 
                 if new_items and batch_gen is not None and not active:
                     if not batch_gen.has_work:
@@ -1768,6 +1820,12 @@ class ResponseGenerator:
 
                     # Vision encoder runs on the GPU thread; text tokenization
                     # already happened on the caller thread.
+                    coordinator = getattr(batch_gen, "apc", None)
+                    if coordinator is not None:
+                        coordinator.prepare_prefill(
+                            prompt_tokens,
+                            prefill_step_size=self._effective_prefill_step_size(),
+                        )
                     input_ids, gen_kwargs = self._gpu_embed(
                         raw_inputs,
                         images,
@@ -2088,7 +2146,9 @@ class ResponseGenerator:
             return
         self.wait_until_ready()
         args = args or GenerationArguments(max_tokens=get_server_max_tokens())
-        raw_inputs = self._preprocess_request(prompt, images, audio, videos)
+        raw_inputs = self._preprocess_request(
+            prompt, images, audio, videos, **args.preprocessing_kwargs()
+        )
         _check_configured_context_budget(
             _count_prompt_tokens(raw_inputs), args.max_tokens
         )

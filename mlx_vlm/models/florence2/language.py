@@ -1,15 +1,16 @@
 import math
-from typing import Optional, Tuple
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import (
     LanguageModelOutput,
+    cache_position_offset,
     create_attention_mask,
     scaled_dot_product_attention,
 )
-from ..cache import SimpleKVCache
+from ..cache import CacheList, SimpleKVCache
 from .config import TextConfig
 
 
@@ -43,6 +44,9 @@ class Florence2Attention(nn.Module):
         layer_head_mask=None,
     ):
         batch_size, tgt_len, _ = hidden_states.shape
+
+        if self.is_causal and self.is_decoder:
+            attention_mask = create_attention_mask(hidden_states, cache)
 
         q = (
             self.q_proj(hidden_states)
@@ -111,10 +115,6 @@ class Florence2Attention(nn.Module):
                 .transpose(0, 2, 1, 3)
             )
 
-        if self.is_causal and self.is_decoder:
-            causal_mask = create_attention_mask(hidden_states)
-            attention_mask = causal_mask
-
         attn_output = (
             scaled_dot_product_attention(
                 q, k, v, cache=cache, scale=self.scaling, mask=attention_mask
@@ -176,7 +176,7 @@ class Florence2DecoderLayer(nn.Module):
         encoder_hidden_states,
         attention_mask=None,
         encoder_attention_mask=None,
-        cache: Optional[Tuple[SimpleKVCache, SimpleKVCache]] = None,
+        cache: Optional[CacheList] = None,
     ):
         residual = hidden_states
 
@@ -312,8 +312,8 @@ class Florence2Decoder(nn.Module):
         first_cache = cache[0][0]
         if first_cache.keys is not None:
             cache_length = (
-                first_cache._idx
-                if hasattr(first_cache, "_idx")
+                cache_position_offset(first_cache)
+                if hasattr(first_cache, "offset")
                 else first_cache.cache_length
             )
         else:
@@ -390,7 +390,9 @@ class Florence2LanguageModel(nn.Module):
             inputs_embeds = inputs_embeds * self.embed_scale
 
         if cache is None:
-            cache = [(SimpleKVCache(), SimpleKVCache())] * len(self.decoder.layers)
+            cache = [
+                CacheList(SimpleKVCache(), SimpleKVCache()) for _ in self.decoder.layers
+            ]
 
         if encoder_outputs is None:
             encoder_outputs = self.encoder(
@@ -486,4 +488,4 @@ class LanguageModel(nn.Module):
         return self.config.decoder_attention_heads
 
     def make_cache(self):
-        return [(SimpleKVCache(), SimpleKVCache()) for n in self.layers]
+        return [CacheList(SimpleKVCache(), SimpleKVCache()) for _ in self.layers]

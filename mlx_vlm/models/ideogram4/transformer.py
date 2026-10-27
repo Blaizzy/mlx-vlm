@@ -6,15 +6,11 @@ import mlx.core as mx
 from mlx import nn
 from mlx.core.fast import scaled_dot_product_attention
 
+from ..rope_utils import rotate_half as _rotate_half
 from .config import Ideogram4TransformerConfig
 
 LLM_TOKEN_INDICATOR = 3
 OUTPUT_IMAGE_INDICATOR = 2
-
-
-def _rotate_half(x: mx.array) -> mx.array:
-    x1, x2 = mx.split(x, 2, axis=-1)
-    return mx.concatenate([-x2, x1], axis=-1)
 
 
 def _apply_rotary_pos_emb(

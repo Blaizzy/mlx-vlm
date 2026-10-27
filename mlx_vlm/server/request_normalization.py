@@ -1,12 +1,11 @@
 """Normalize compatible API requests into server generation arguments."""
 
-from typing import Optional, Tuple, Union
+import json
+from typing import List, Optional, Tuple, Union
 
-from ..generate import (
-    DEFAULT_REPETITION_CONTEXT_SIZE,
-    DEFAULT_TEMPERATURE,
-    DEFAULT_TOP_P,
-)
+from ..generate import DEFAULT_REPETITION_CONTEXT_SIZE
+from ..generate.common import resolve_sampling_defaults
+from ..prompt_utils import extract_text_from_content, normalize_image_content
 from ..structured import build_json_schema_logits_processor
 from .generation import (
     GenerationArguments,
@@ -19,6 +18,70 @@ from .generation import (
 from .runtime import runtime
 
 _DISABLED_REASONING_EFFORTS = {"none", "off", "disabled", "false", "0"}
+
+
+def _chat_message_to_prompt(message):
+    content = message.get("content")
+    if isinstance(content, list):
+        content = (
+            normalize_image_content(content)
+            if message["role"] == "user"
+            else extract_text_from_content(content)
+        )
+    msg = {"role": message["role"], "content": content}
+    # Preserve tool-calling metadata.
+    # Ensure arguments are dicts (not JSON strings) for Jinja templates
+    # that iterate them with |items (e.g. Qwen3.5).
+    if message.get("tool_calls") is not None:
+        normalized_calls = []
+        for tc in message.get("tool_calls"):
+            tc = dict(tc) if isinstance(tc, dict) else tc
+            if isinstance(tc, dict) and "function" in tc:
+                fn = dict(tc["function"])
+                args = fn.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        fn["arguments"] = json.loads(args)
+                    except (json.JSONDecodeError, TypeError):
+                        fn["arguments"] = {}
+                tc["function"] = fn
+            normalized_calls.append(tc)
+        msg["tool_calls"] = normalized_calls
+    if message.get("tool_call_id") is not None:
+        msg["tool_call_id"] = message.get("tool_call_id")
+    if message.get("name") is not None:
+        msg["name"] = message.get("name")
+    if message.get("reasoning_content") is not None:
+        msg["reasoning_content"] = message.get("reasoning_content")
+        msg["reasoning"] = message.get("reasoning_content")
+
+    return msg
+
+
+def _normalize_instruction_messages(
+    chat_messages: List[dict],
+    instructions: Optional[str] = None,
+) -> Optional[str]:
+    """Combine API instructions into the leading system message for templates."""
+    instruction_parts = [instructions] if instructions else []
+    conversation = []
+
+    for message in chat_messages:
+        if message.get("role") in ("system", "developer"):
+            content = message.get("content")
+            if content:
+                instruction_parts.append(str(content))
+        else:
+            conversation.append(message)
+
+    normalized_instructions = "\n\n".join(instruction_parts) or None
+    if normalized_instructions:
+        conversation.insert(
+            0,
+            {"role": "system", "content": normalized_instructions},
+        )
+    chat_messages[:] = conversation
+    return normalized_instructions
 
 
 def _request_field_is_set(request, field_name: str) -> bool:
@@ -73,13 +136,6 @@ def _standard_reasoning_control(
             return enabled, effort, True
 
     return None, None, False
-
-
-def _model_config_field_or_default(processor, field_name: str, default):
-    config = getattr(processor, "config", None) if processor is not None else None
-    if config is None:
-        config = runtime.model_cache.get("config")
-    return getattr(config, field_name, default)
 
 
 def _as_plain_dict(value):
@@ -165,20 +221,25 @@ def _build_gen_args(
         # Preserve a model template's native default when the server default is
         # off and the request did not express a reasoning preference.
         template_reasoning = True if server_enable_thinking else None
-    default_temperature = _model_config_field_or_default(
-        processor, "temperature", DEFAULT_TEMPERATURE
+    temperature, top_p, top_k = resolve_sampling_defaults(
+        config if config is not None else runtime.model_cache.get("config"),
+        temperature=_request_field_or_default(request, "temperature", None),
+        top_p=_request_field_or_default(request, "top_p", None),
+        top_k=_request_field_or_default(request, "top_k", None),
     )
-    default_top_p = _model_config_field_or_default(processor, "top_p", DEFAULT_TOP_P)
-    default_top_k = _model_config_field_or_default(processor, "top_k", 0)
-    if _model_config_field_or_default(processor, "do_sample", None) is False:
-        default_temperature = 0.0
+    image_defaults = runtime.config.image_pixel_limits()
     args = GenerationArguments(
         max_tokens=max_tokens,
-        temperature=_request_field_or_default(
-            request, "temperature", default_temperature
+        min_pixels=_request_field_or_default(
+            request, "min_pixels", image_defaults["min_pixels"]
         ),
-        top_p=_request_field_or_default(request, "top_p", default_top_p),
-        top_k=_request_field_or_default(request, "top_k", default_top_k),
+        max_pixels=_request_field_or_default(
+            request, "max_pixels", image_defaults["max_pixels"]
+        ),
+        resize_shape=getattr(request, "resize_shape", None),
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
         min_p=getattr(request, "min_p", 0.0),
         top_n_sigma=getattr(request, "top_n_sigma", 0.0),
         p_less=getattr(request, "p_less", False),

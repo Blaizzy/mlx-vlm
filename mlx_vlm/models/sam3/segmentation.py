@@ -27,7 +27,8 @@ class PixelDecoder(nn.Module):
             for _ in range(num_upsampling_stages)
         ]
         self.norms = [
-            nn.GroupNorm(8, hidden_size) for _ in range(num_upsampling_stages)
+            nn.GroupNorm(8, hidden_size, pytorch_compatible=True)
+            for _ in range(num_upsampling_stages)
         ]
 
     def __call__(self, features: List[mx.array]) -> mx.array:

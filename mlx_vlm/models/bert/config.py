@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Optional
 
 from ..base import BaseModelConfig
 
@@ -17,3 +18,4 @@ class ModelConfig(BaseModelConfig):
     pad_token_id: int = 0
     hidden_act: str = "gelu"
     num_labels: int = 1
+    id2label: Optional[dict] = None

@@ -11,6 +11,7 @@ from mlx_vlm.generate.image import (
     ImageGenerationRequest,
     ImageGenerationResult,
 )
+from mlx_vlm.generate.image_defaults import ImageSamplingDefaults
 
 from .config import BonsaiVariant, get_variant
 from .download import validate_model_layout
@@ -54,6 +55,14 @@ class BonsaiImageGenerationModel(ImageGenerationModel):
     model_id: str
     family: str = "bonsai"
 
+    default_sampling: ClassVar[ImageSamplingDefaults] = ImageSamplingDefaults(4, 1.0)
+
+    @classmethod
+    def resolve_defaults(
+        cls, model: str, *, model_path: Path | None = None
+    ) -> ImageSamplingDefaults:
+        return cls.default_sampling
+
     @property
     def variant(self) -> str:
         return self.pipeline.variant.name
@@ -66,8 +75,9 @@ class BonsaiImageGenerationModel(ImageGenerationModel):
 
     def generate(self, request: ImageGenerationRequest) -> ImageGenerationResult:
         seed = 0 if request.seed is None else request.seed
-        steps = request.resolve_steps()
-        guidance = request.resolve_guidance()
+        defaults = self.default_sampling
+        steps = request.resolve_steps(defaults.steps)
+        guidance = request.resolve_guidance(defaults.guidance)
         max_sequence_length = request.extra.get("max_sequence_length", None)
         tiled_vae = request.extra.get("tiled_vae", None)
         array = self.pipeline.generate_array(

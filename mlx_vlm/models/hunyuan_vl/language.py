@@ -6,11 +6,13 @@ import numpy as np
 
 from ..base import (
     LanguageModelOutput,
+    cache_position_offset,
     create_attention_mask,
     kv_sequence_length,
     scaled_dot_product_attention,
 )
 from ..cache import KVCache
+from ..rope_utils import rotate_half
 from .config import ModelConfig, TextConfig
 
 
@@ -51,12 +53,6 @@ class HunyuanRotaryEmbedding:
     def __call__(self, x: mx.array, seq_len: int) -> Tuple[mx.array, mx.array]:
         self._update_cache(seq_len, x.dtype)
         return self._cos_cached[:seq_len], self._sin_cached[:seq_len]
-
-
-def rotate_half(x: mx.array) -> mx.array:
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return mx.concatenate([-x2, x1], axis=-1)
 
 
 def apply_rotary_pos_emb_xdrope(
@@ -207,16 +203,7 @@ class Attention(nn.Module):
         kv_seq_len = L
         offset_scalar = 0
         if cache is not None:
-            # Prefer cache._idx (Python int) to avoid a per-step GPU sync.
-            if hasattr(cache, "_idx"):
-                offset_scalar = int(cache._idx)
-            else:
-                off = cache.offset
-                offset_scalar = (
-                    int(off)
-                    if isinstance(off, int)
-                    else (int(off.max().item()) if off.ndim > 0 else int(off.item()))
-                )
+            offset_scalar = cache_position_offset(cache)
             kv_seq_len += offset_scalar
 
         cos, sin = self.rotary_emb(values, seq_len=kv_seq_len)

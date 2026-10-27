@@ -11,7 +11,7 @@ from ..base import (
 from ..cache import KVCache, RotatingKVCache
 from ..mlp import SwiGLUMLP
 from ..rope_utils import initialize_rope
-from ..switch_layers import SwitchGLU
+from ..switch_layers import EXPERT_WEIGHT_SUFFIXES, SwitchGLU
 from .config import ModelConfig
 
 
@@ -41,6 +41,7 @@ def group_expert_select(
 
     k = top_k
     inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+    inds = mx.stop_gradient(inds)
     scores = mx.take_along_axis(orig_scores, inds, axis=-1)
 
     if top_k > 1 and norm_topk_prob:
@@ -291,7 +292,7 @@ class LanguageModel(nn.Module):
                 )
 
             for m in ["gate_proj", "down_proj", "up_proj"]:
-                for k in ["weight", "scales", "biases"]:
+                for k in EXPERT_WEIGHT_SUFFIXES:
                     first_key = f"{prefix}.mlp.experts.0.{m}.{k}"
                     last_key = (
                         f"{prefix}.mlp.experts.{self.args.num_experts - 1}.{m}.{k}"

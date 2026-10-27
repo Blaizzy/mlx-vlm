@@ -30,6 +30,9 @@ class Model(DeepseekOCRModel):
         **kwargs,
     ):
         input_embeds = self.language_model.model.embed_tokens(input_ids)
+        if self.language_model.dash_params is not None:
+            # DASH page bookkeeping needs the whole prompt, also under chunked prefill.
+            self.language_model._prompt_ids = np.array(input_ids[0])
 
         if pixel_values is None:
             return InputEmbeddingsFeatures(inputs_embeds=input_embeds)
@@ -184,6 +187,10 @@ class Model(DeepseekOCRModel):
 
     def make_cache(self):
         return self.language_model.make_cache()
+
+    def quant_predicate(self, path, module):
+        # The DASH router picks the attended blocks; keep its tiny projections dense.
+        return "dash_router" not in path
 
 
 __all__ = [

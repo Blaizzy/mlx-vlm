@@ -4,6 +4,11 @@ import mlx.nn as nn
 
 from ..qwen3_5 import Model as Qwen3_5Model
 from ..qwen3_5.qwen3_5 import sanitize_key
+from ..switch_layers import (
+    move_expert_projection,
+    split_expert_projection,
+    stack_expert_projection,
+)
 from .config import ModelConfig
 from .fp8 import convert_qwen4_exp_fp8_weights
 from .language import LanguageModel
@@ -38,18 +43,29 @@ class Model(Qwen3_5Model):
 
         for layer_idx in range(self.config.text_config.num_hidden_layers):
             prefix = f"model.language_model.layers.{layer_idx}.mlp"
+            for name in ("gate_proj", "up_proj", "down_proj"):
+                stack_expert_projection(
+                    weights,
+                    f"{prefix}.experts",
+                    name,
+                    f"{prefix}.switch_mlp.{name}",
+                    self.config.text_config.num_experts,
+                )
             gate_up_key = f"{prefix}.experts.gate_up_proj"
-            if gate_up_key in weights:
-                gate_up = weights.pop(gate_up_key)
-                midpoint = gate_up.shape[-2] // 2
-                weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_up[
-                    ..., :midpoint, :
-                ]
-                weights[f"{prefix}.switch_mlp.up_proj.weight"] = gate_up[
-                    ..., midpoint:, :
-                ]
-                weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
-                    f"{prefix}.experts.down_proj"
+            if gate_up_key in weights or f"{gate_up_key}.weight" in weights:
+                for name in ("gate_up_proj", "down_proj"):
+                    key = f"{prefix}.experts.{name}"
+                    if f"{key}_scales" in weights:
+                        weights[f"{key}.scales"] = weights.pop(f"{key}_scales")
+                split_expert_projection(
+                    weights,
+                    gate_up_key,
+                    [f"{prefix}.switch_mlp.gate_proj", f"{prefix}.switch_mlp.up_proj"],
+                )
+                move_expert_projection(
+                    weights,
+                    f"{prefix}.experts.down_proj",
+                    f"{prefix}.switch_mlp.down_proj",
                 )
 
         sanitized = {}

@@ -3,23 +3,9 @@ from typing import List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..base import check_array_shape
+from ..rope_utils import rotate_half
 from .config import VisionConfig
-
-
-def check_array_shape(arr):
-    shape = arr.shape
-
-    # Check if the shape has 4 dimensions
-    if len(shape) != 4:
-        return False
-
-    out_channels, kH, KW, _ = shape
-
-    # Check if out_channels is the largest, and kH and KW are the same
-    if (out_channels >= kH) and (out_channels >= KW) and (kH == KW):
-        return True
-    else:
-        return False
 
 
 def position_ids_in_meshgrid(patch_embeds_list, max_width):
@@ -52,12 +38,6 @@ def generate_block_attention_mask(patch_embeds_list, tensor):
         causal_mask[None, None, :, :], (tensor.shape[0], 1, seq_len, seq_len)
     )
     return causal_mask.astype(tensor.dtype)
-
-
-def rotate_half(x):
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return mx.concatenate((-x2, x1), axis=-1)
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):

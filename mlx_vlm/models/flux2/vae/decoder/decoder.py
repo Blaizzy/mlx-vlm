@@ -1,7 +1,6 @@
 import mlx.core as mx
 from mlx import nn
 
-from mlx_vlm.models.flux2.constants import ModelConfig
 from mlx_vlm.models.flux2.vae.common.unet_mid_block import Flux2UNetMidBlock2D
 from mlx_vlm.models.flux2.vae.decoder.conv_in import Flux2ConvIn
 from mlx_vlm.models.flux2.vae.decoder.conv_norm_out import Flux2ConvNormOut
@@ -61,6 +60,6 @@ class Flux2Decoder(nn.Module):
             hidden_states = up_block(hidden_states)
 
         hidden_states = self.conv_norm_out(hidden_states)
-        hidden_states = nn.silu(hidden_states).astype(ModelConfig.precision)
+        hidden_states = nn.silu(hidden_states)
         hidden_states = self.conv_out(hidden_states)
         return hidden_states

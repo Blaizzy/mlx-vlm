@@ -5,8 +5,10 @@ import mlx.nn as nn
 import numpy as np
 
 from ..base import InputEmbeddingsFeatures
+from ..switch_layers import expand_expert_scales
 from .config import ModelConfig
 from .language import LanguageModel
+from .quantization import sanitize_nvfp4_experts
 from .vision import VisionModel
 
 
@@ -28,10 +30,7 @@ def _pack_uint8_weight(weight: mx.array) -> mx.array:
     if weight.dtype != mx.uint8 or weight.shape[-1] % 4 != 0:
         return weight
 
-    shape = (*weight.shape[:-1], weight.shape[-1] // 4, 4)
-    weight = weight.reshape(shape).astype(mx.uint32)
-    shifts = mx.array([0, 8, 16, 24], dtype=mx.uint32)
-    return mx.sum(weight << shifts, axis=-1)
+    return weight.view(mx.uint32)
 
 
 def _sanitize_moe_weights(weights: dict, args):
@@ -60,7 +59,16 @@ def _sanitize_moe_weights(weights: dict, args):
     for layer_idx in range(args.num_hidden_layers):
         prefix = f"language_model.model.layers.{layer_idx}.block_sparse_moe"
 
-        for suffix in ("weight", "scales", "biases", "bias"):
+        if pack_shared:
+            expand_expert_scales(
+                weights,
+                [
+                    k.removesuffix(".weight")
+                    for k in weights
+                    if k.startswith(prefix + ".") and k.endswith(".weight")
+                ],
+            )
+        for suffix in ("weight", "scales", "biases", "weight_scale_2", "bias"):
             if pack_shared:
                 gate_keys = expert_keys(prefix, "w1", suffix)
                 up_keys = expert_keys(prefix, "w3", suffix)
@@ -130,6 +138,11 @@ class Model(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
+        quantization = config.quantization_config or config.quantization or {}
+        if quantization.get("moe_quant_algo") == "NVFP4":
+            config.text_config.nvfp4_experts = True
+        if config.text_config.nvfp4_experts:
+            config.text_config.pack_shared_expert = False
         self.vision_tower = VisionModel(config.vision_config)
         self.language_model = LanguageModel(config.text_config, config)
         self.vision_feature_layer = config.vision_feature_layer
@@ -423,8 +436,26 @@ class Model(nn.Module):
                 )
 
         args = self.language_model.args
+        if args.nvfp4_experts:
+            # Floating router parameters follow the language model dtype.
+            embedding = sanitized_weights.get(
+                "language_model.model.embed_tokens.weight"
+            )
+            if embedding is not None and mx.issubdtype(embedding.dtype, mx.floating):
+                for key, value in sanitized_weights.items():
+                    if mx.issubdtype(value.dtype, mx.floating) and key.endswith(
+                        (
+                            ".block_sparse_moe.gate.weight",
+                            ".block_sparse_moe.e_score_correction_bias",
+                        )
+                    ):
+                        sanitized_weights[key] = value.astype(embedding.dtype)
+            sanitize_nvfp4_experts(sanitized_weights, args)
         _sanitize_moe_weights(sanitized_weights, args)
         return sanitized_weights
+
+    def shard(self, group=None):
+        self.language_model.shard(group)
 
     def make_cache(self):
         return self.language_model.make_cache()

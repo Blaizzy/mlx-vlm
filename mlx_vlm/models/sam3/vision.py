@@ -280,6 +280,7 @@ class ViTBackbone(nn.Module):
             feat_size,
             feat_size,
             theta=config.rope_theta,
+            scale=config.window_size / feat_size,
         )
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -312,6 +313,7 @@ class ViTBackbone(nn.Module):
                 H,
                 W,
                 theta=self.config.rope_theta,
+                scale=self.config.window_size / H,
             )
         else:
             global_cos = self._rope_global_cos

@@ -6,12 +6,8 @@ import mlx.nn as nn
 import numpy as np
 
 from ..base import ensure_fused_sdpa
+from ..rope_utils import rotate_half
 from .config import VisionConfig
-
-
-def rotate_half(x: mx.array) -> mx.array:
-    half = x.shape[-1] // 2
-    return mx.concatenate((-x[..., half:], x[..., :half]), axis=-1)
 
 
 @partial(mx.compile, shapeless=True)

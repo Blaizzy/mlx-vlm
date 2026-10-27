@@ -42,6 +42,21 @@ def _convert_to_rgb(image):
     return image.convert("RGB")
 
 
+def _to_numpy_with_format(image):
+    """Convert an image to numpy and return it with its channel layout.
+
+    PIL images are always HWC, so their layout must not be inferred: a 3- or
+    1-pixel-tall image would otherwise be mistaken for channels-first.
+    """
+    from PIL import Image
+
+    is_pil = isinstance(image, Image.Image)
+    image = to_numpy_array(image)
+    if is_pil and image.ndim == 3:
+        return image, ChannelDimension.LAST
+    return image, infer_channel_dimension_format(image)
+
+
 def _to_channel_first(image, input_format):
     if input_format == ChannelDimension.FIRST:
         return image
@@ -101,6 +116,33 @@ def _pad_video_patches(patches: np.ndarray, positions: np.ndarray, target_length
     return patches, positions
 
 
+def get_aspect_ratio_preserving_size(
+    height, width, patch_size, max_patches, pooling_kernel_size
+):
+    """Compute patch-budget dimensions shared by Gemma 4 processors."""
+    target_px = max_patches * (patch_size**2)
+    factor = math.sqrt(target_px / (height * width))
+    side_mult = pooling_kernel_size * patch_size
+
+    target_height = int(math.floor(factor * height / side_mult)) * side_mult
+    target_width = int(math.floor(factor * width / side_mult)) * side_mult
+
+    if target_height == 0 and target_width == 0:
+        raise ValueError("Attempting to resize to a 0 x 0 image.")
+
+    max_side_length = (max_patches // pooling_kernel_size**2) * side_mult
+    if target_height == 0:
+        target_height = side_mult
+        target_width = min(int(math.floor(width / height)) * side_mult, max_side_length)
+    elif target_width == 0:
+        target_width = side_mult
+        target_height = min(
+            int(math.floor(height / width)) * side_mult, max_side_length
+        )
+
+    return target_height, target_width
+
+
 class Gemma4ImageProcessor(HFBaseImageProcessor):
     """Image processor for Gemma 4.
 
@@ -154,27 +196,9 @@ class Gemma4ImageProcessor(HFBaseImageProcessor):
         else:
             height, width = image.shape[0], image.shape[1]
 
-        target_px = max_patches * (patch_size**2)
-        factor = math.sqrt(target_px / (height * width))
-        side_mult = pooling_kernel_size * patch_size
-
-        target_height = int(math.floor(factor * height / side_mult)) * side_mult
-        target_width = int(math.floor(factor * width / side_mult)) * side_mult
-
-        if target_height == 0 and target_width == 0:
-            raise ValueError("Attempting to resize to a 0 x 0 image.")
-
-        max_side_length = (max_patches // pooling_kernel_size**2) * side_mult
-        if target_height == 0:
-            target_height = side_mult
-            target_width = min(
-                int(math.floor(width / height)) * side_mult, max_side_length
-            )
-        elif target_width == 0:
-            target_width = side_mult
-            target_height = min(
-                int(math.floor(height / width)) * side_mult, max_side_length
-            )
+        target_height, target_width = get_aspect_ratio_preserving_size(
+            height, width, patch_size, max_patches, pooling_kernel_size
+        )
 
         if target_height == height and target_width == width:
             return image
@@ -214,13 +238,11 @@ class Gemma4ImageProcessor(HFBaseImageProcessor):
         if self.do_convert_rgb:
             images = [_convert_to_rgb(img) for img in images]
 
-        images = [to_numpy_array(img) for img in images]
-
         processed = []
         num_soft_tokens_per_image = []
 
         for image in images:
-            input_data_format = infer_channel_dimension_format(image)
+            image, input_data_format = _to_numpy_with_format(image)
 
             if self.do_resize:
                 image = self.aspect_ratio_preserving_resize(
@@ -440,6 +462,7 @@ class Gemma4VideoProcessor(BaseVideoProcessor):
 class Gemma4Processor(ProcessorMixin):
     """Combined processor for Gemma 4 (image + text + audio + video)."""
 
+    supports_multiple_audio = True
     model_type = "gemma4"
     attributes = ["image_processor", "tokenizer", "video_processor"]
     image_processor_class = "Gemma4ImageProcessor"

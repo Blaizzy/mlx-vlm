@@ -105,6 +105,7 @@ class MellumSparseMoeBlock(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         gates = mx.softmax(self.gate(x), axis=-1, precise=True)
         indices = mx.argpartition(gates, kth=-self.top_k, axis=-1)[..., -self.top_k :]
+        indices = mx.stop_gradient(indices)
         scores = mx.take_along_axis(gates, indices, axis=-1)
         if self.norm_topk_prob:
             scores /= mx.sum(scores, axis=-1, keepdims=True)
@@ -219,15 +220,18 @@ class LanguageModel(nn.Module):
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{layer_idx}"
             for name in ("up_proj", "down_proj", "gate_proj"):
-                key = f"{prefix}.mlp.experts.0.{name}.weight"
-                if key in weights:
-                    stacked = [
-                        weights.pop(f"{prefix}.mlp.experts.{expert_idx}.{name}.weight")
-                        for expert_idx in range(self.args.num_experts)
-                    ]
-                    weights[f"{prefix}.mlp.switch_mlp.{name}.weight"] = mx.stack(
-                        stacked
-                    )
+                for suffix in ("weight", "scales", "biases", "weight_global_scale"):
+                    key = f"{prefix}.mlp.experts.0.{name}.{suffix}"
+                    if key in weights:
+                        stacked = [
+                            weights.pop(
+                                f"{prefix}.mlp.experts.{expert_idx}.{name}.{suffix}"
+                            )
+                            for expert_idx in range(self.args.num_experts)
+                        ]
+                        weights[f"{prefix}.mlp.switch_mlp.{name}.{suffix}"] = mx.stack(
+                            stacked
+                        )
         return weights
 
     @property
