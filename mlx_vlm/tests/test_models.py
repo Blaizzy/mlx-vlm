@@ -4435,3 +4435,257 @@ class TestPhiMoE:
         )
 
         assert isinstance(Attention(config).rope, nn.RoPE)
+
+
+class TestUnlimitedOCR2Dash:
+    """Unlimited-OCR-2 DASH attention: gathered decode, cached summaries, pages."""
+
+    PAGE, IMAGE = 7, 9
+
+    def params(self, **overrides):
+        from mlx_vlm.models.unlimited_ocr.dash import DashParams
+
+        sparse = {
+            "training_stage": "dash",
+            "use_sparse_attention": True,
+            "dash_stage0": "head_cls",
+            "sparse_block_size": 4,
+            "sparse_local_block": 2,
+            "sparse_index_dim": 8,
+            "dash_topk_blocks": 2,
+            "image_token_id": self.IMAGE,
+            "page_token_id": self.PAGE,
+            "per_page_image_tokens": 6,
+            "sparse_main_rope_mode": "page2d",
+            "sparse_rope_page_pairs": 1,
+            "sparse_main_rope_tok_freq_mode": "resample",
+            "sparse_rope_page_mod": 2,
+            **overrides,
+        }
+        return sparse, DashParams.from_config(sparse, 2, 8)
+
+    def language_model(self, hidden_size=16):
+        from mlx_vlm.models.unlimited_ocr.config import TextConfig
+        from mlx_vlm.models.unlimited_ocr.language import LanguageModel
+
+        sparse, _ = self.params(sparse_index_dim=hidden_size // 2)
+        config = TextConfig(
+            vocab_size=32,
+            hidden_size=hidden_size,
+            intermediate_size=32,
+            moe_intermediate_size=8,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            n_shared_experts=1,
+            n_routed_experts=4,
+            num_experts_per_tok=2,
+            first_k_dense_replace=1,
+            sparse_attention_config=sparse,
+        )
+        mx.random.seed(3)
+        model = LanguageModel(config)
+        model.update(
+            tree_map(lambda w: mx.random.normal(w.shape) * 0.5, model.parameters())
+        )
+        return model
+
+    def prompt(self):
+        page = [self.PAGE] + [self.IMAGE] * 6
+        return [1, 2, 3] + page * 3 + [4, 5, 6, 2, 3]
+
+    @pytest.mark.parametrize("bits", [None, 4, 8])
+    @pytest.mark.parametrize("heads", [2, 4])
+    def test_decode_gather_matches_dense_mask(self, bits, heads):
+        from mlx_vlm.models.cache import QuantizedKVCache
+        from mlx_vlm.models.unlimited_ocr.config import TextConfig
+        from mlx_vlm.models.unlimited_ocr.dash import (
+            DashAttention,
+            _decode_select,
+            block_capacity,
+            block_scores,
+            route_select,
+        )
+
+        _, p = self.params(dash_topk_blocks=3, sparse_local_block=1)
+        dim = 64 if bits else 8
+        attn = DashAttention(
+            TextConfig(
+                hidden_size=heads * dim,
+                num_attention_heads=heads,
+                num_key_value_heads=2,
+            ),
+            0,
+            p,
+        )
+        rng = np.random.default_rng(5)
+        for pos in (2, 9, 21, 22):  # no remote block / partial blocks
+            nblk = -(-(pos + 1) // p.block_size)
+            cap = block_capacity(nblk)
+            q = mx.array(rng.normal(size=(1, heads, 1, dim)).astype(np.float32))
+            keys = mx.array(rng.normal(size=(1, 2, pos + 1, dim)).astype(np.float32))
+            values = mx.array(rng.normal(size=(1, 2, pos + 1, dim)).astype(np.float32))
+            cache = None
+            packed_keys, packed_values = keys, values
+            if bits:
+                cache = QuantizedKVCache(group_size=64, bits=bits)
+                packed_keys, packed_values = cache.update_and_fetch(keys, values)
+                keys, values = cache.dequantize_for_apc()
+            idx_q = mx.array(rng.normal(size=(1, 8)).astype(np.float32))
+            n_sum = (pos + 1) // p.block_size
+            summ = rng.normal(size=(n_sum, 8)).astype(np.float32)
+            for allow in (np.ones(nblk, bool), np.arange(nblk) == 1):
+                scores = block_scores(
+                    idx_q, mx.array(summ) if n_sum else None, mx.array([pos]), nblk, p
+                )
+                topi, bias, valid = route_select(
+                    scores, mx.array(allow[None]), attn.idx_scale, attn.floor, p
+                )
+                dense = attn._prefill(q, keys, values, topi, bias, valid, pos, nblk)
+                padded = np.zeros((cap, 8), np.float32)
+                padded[:n_sum] = summ
+                cand = np.zeros((1, cap), bool)
+                cand[0, :nblk] = allow
+                idx, mask = _decode_select(
+                    idx_q,
+                    mx.array(padded),
+                    mx.array(cand),
+                    mx.array(pos),
+                    *attn._decode_consts,
+                    p,
+                )
+                prefilled = attn._prefill(
+                    q,
+                    packed_keys,
+                    packed_values,
+                    topi,
+                    bias,
+                    valid,
+                    pos,
+                    nblk,
+                    cache=cache,
+                )
+                gathered = attn._decode(
+                    q, packed_keys, packed_values, idx, mask, cache=cache
+                )
+                assert np.allclose(np.array(dense), np.array(prefilled), atol=1e-5)
+                assert np.allclose(np.array(dense), np.array(gathered), atol=1e-5)
+
+    def test_entmax15_is_a_sparse_distribution(self):
+        from mlx_vlm.models.unlimited_ocr.dash import entmax15
+
+        x = mx.array([[3.0, 2.9, 0.5, -1e4], [1.0, 1.0, 1.0, 1.0]])
+        prior = np.array(entmax15(x))
+        assert np.allclose(prior.sum(-1), 1.0, atol=1e-5)
+        assert prior[0, 3] == 0 and prior[0, 0] > prior[0, 1] > prior[0, 2]
+        assert np.allclose(prior[1], 0.25, atol=1e-5)
+
+    def test_prompt_pages_coordinates_and_candidates(self):
+        from mlx_vlm.models.unlimited_ocr.dash import PromptPages
+
+        _, p = self.params()
+        ids = np.array(self.prompt())
+        pages = PromptPages(ids, p)
+        tok, page = pages.coords
+        # BOS + instruction bucket is page 0; each <PAGE> opens the next page.
+        # The instruction after the last image goes back to that bucket.
+        assert page.tolist() == [0] * 3 + [1] * 7 + [2] * 7 + [3] * 7 + [0] * 5
+        assert tok[:4].tolist() == [0, 1, 2, 0] and tok[-1] == 7
+        assert pages.n_pages == 4 and np.array(pages.pf_cnt).tolist() == [3, 7, 7, 7]
+        cand = np.array(pages.prefill_candidates(np.arange(len(ids)), 8))
+        # A page-2 query (position 12) only sees blocks holding page-2 images.
+        assert cand[12].tolist() == [
+            False,
+            False,
+            True,
+            True,
+            True,
+            False,
+            False,
+            False,
+        ]
+        # The answer has no page yet: it falls back to every block.
+        assert cand[-1].all()
+
+    def test_chunked_prefill_and_decode_match_full_prefill(self):
+        model = self.language_model()
+        ids = mx.array([self.prompt()])
+        n = ids.shape[1]
+
+        full = model(ids, cache=model.make_cache()).logits
+        cache = model.make_cache()
+        model._prompt_ids = np.array(ids[0])
+        chunks = []
+        for c0, c1 in ((0, 9), (9, 22), (22, n)):
+            chunks.append(model(ids[:, c0:c1], cache=cache).logits)
+        assert np.allclose(
+            np.array(mx.concatenate(chunks, axis=1)), np.array(full), atol=1e-4
+        )
+
+        # Decode keeps one step's cost bounded and stays finite over block edges.
+        token = mx.argmax(chunks[-1][:, -1], axis=-1, keepdims=True)
+        for _ in range(9):
+            logits = model(token, cache=cache).logits
+            assert logits.shape == (1, 1, 32)
+            assert np.isfinite(np.array(logits)).all()
+            token = mx.argmax(logits[:, -1], axis=-1, keepdims=True)
+        assert cache[0].offset == n + 9
+        assert cache[0].num_summaries == (n + 9) // 4
+
+    @pytest.mark.parametrize("bits", [4, 8])
+    @pytest.mark.parametrize("start", [0, 9, 22, 29])
+    def test_quantized_chunked_prefill_preserves_routing_state(self, bits, start):
+        from mlx_vlm.generate.common import maybe_quantize_kv_cache
+        from mlx_vlm.models.unlimited_ocr.dash import DashQuantizedKVCache
+
+        model = self.language_model(hidden_size=128)
+        ids = mx.array([self.prompt()])
+        model._prompt_ids = np.array(ids[0])
+        cache = model.make_cache()
+        shared_state = cache[0].dash_state
+
+        def quantize():
+            previous = list(cache)
+            maybe_quantize_kv_cache(cache, start, 64, bits)
+            for old, new in zip(previous, cache):
+                assert new.dash_state is shared_state
+                assert new.pending is old.pending
+                assert new.summaries is old.summaries
+                assert new.num_summaries == old.num_summaries
+                assert new.offset == old.offset
+                assert not new.is_trimmable()
+
+        quantize()
+        for c0, c1 in ((0, 9), (9, 22), (22, ids.shape[1])):
+            logits = model(ids[:, c0:c1], cache=cache).logits
+            assert bool(mx.isfinite(logits).all())
+            quantize()
+        # Cross partial block boundaries and advance the generated page state.
+        for token in [self.PAGE, 3, 4, 5, self.PAGE, 6, 2, 3, 4]:
+            logits = model(mx.array([[token]]), cache=cache).logits
+            assert logits.shape == (1, 1, 32)
+            assert bool(mx.isfinite(logits).all())
+            quantize()
+        for entry in cache:
+            assert isinstance(entry, DashQuantizedKVCache)
+            assert entry.bits == bits
+            assert entry.keys[0].dtype == mx.uint32
+            assert entry.offset == ids.shape[1] + 9
+            assert entry.num_summaries == entry.offset // 4
+            assert entry.pending.shape[0] == entry.offset % 4
+
+    @pytest.mark.parametrize("scheme", ["turboquant", "hybrid"])
+    def test_other_quantization_schemes_preserve_dash_cache(self, scheme):
+        from mlx_vlm.generate.common import maybe_quantize_kv_cache
+
+        model = self.language_model()
+        cache = model.make_cache()
+        model(mx.array([self.prompt()]), cache=cache)
+        previous = list(cache)
+        kwargs = (
+            {"kv_quant_scheme": "turboquant"}
+            if scheme == "turboquant"
+            else {"kv_key_scheme": "turboquant", "kv_value_scheme": "uniform"}
+        )
+        maybe_quantize_kv_cache(cache, 0, 64, 4, **kwargs)
+        assert all(old is new for old, new in zip(previous, cache))
