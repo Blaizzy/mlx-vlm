@@ -64,7 +64,7 @@ class Model(nn.Module):
         self.model_type = config.model_type
         hidden = config.lm_config.hidden_size
         self.language_model = LanguageModel(
-            config.lm_config, (config.audio_token_id, config.audio_out_token_id)
+            config.lm_config, self.placeholder_token_ids()
         )
         self.audio_tower = AudioEncoder(config.audio_encoder_config)
         self.audio_projector = AudioProjector(
@@ -77,13 +77,17 @@ class Model(nn.Module):
             config.depth_config, hidden, config.num_codebooks, config.codebook_size
         )
 
+    def placeholder_token_ids(self):
+        """Prompt-only ids the text head never samples."""
+        return [self.config.audio_token_id, self.config.audio_out_token_id]
+
     @staticmethod
     def _merge(embeddings, input_ids, features, token_id):
         indices = np.flatnonzero(np.asarray(input_ids).reshape(-1) == token_id)
         count = 0 if features is None else features.shape[0]
         if len(indices) != count:
             raise ValueError(
-                f"Speech placeholders {token_id} ({len(indices)}) and features ({count}) do not match"
+                f"Placeholders {token_id} ({len(indices)}) and features ({count}) do not match"
             )
         if not count:
             return embeddings
@@ -91,17 +95,24 @@ class Model(nn.Module):
         flat[mx.array(indices)] = features.astype(embeddings.dtype)
         return flat.reshape(embeddings.shape)
 
-    def get_input_embeddings(
+    def get_input_embeddings(self, input_ids, pixel_values=None, **kwargs):
+        embeddings = self.language_model.model.embed_tokens(input_ids)
+        return InputEmbeddingsFeatures(
+            inputs_embeds=self.merge_speech(embeddings, input_ids, **kwargs)
+        )
+
+    def merge_speech(
         self,
+        embeddings,
         input_ids,
-        pixel_values=None,
         input_features=None,
         feature_attention_mask=None,
         audio_out_codes=None,
         **kwargs,
     ):
+        """Scatter the encoded speech into ``<|audio|>`` and prior speech frames
+        into ``<|audio_out|>`` positions of ``embeddings``."""
         config = self.config
-        embeddings = self.language_model.model.embed_tokens(input_ids)
         audio = frames = None
         # a prompt-cache hit drops the cached placeholders but keeps the features
         if input_features is not None and mx.any(input_ids == config.audio_token_id):
@@ -121,10 +132,7 @@ class Model(nn.Module):
                 )
             frames = embed_frames(self.codebook_embedding, codes)
         embeddings = self._merge(embeddings, input_ids, audio, config.audio_token_id)
-        embeddings = self._merge(
-            embeddings, input_ids, frames, config.audio_out_token_id
-        )
-        return InputEmbeddingsFeatures(inputs_embeds=embeddings)
+        return self._merge(embeddings, input_ids, frames, config.audio_out_token_id)
 
     def __call__(self, input_ids, pixel_values=None, mask=None, cache=None, **kwargs):
         features = self.get_input_embeddings(input_ids, pixel_values, **kwargs)
@@ -241,7 +249,7 @@ class Model(nn.Module):
             ids.append(markers[mode][0])
         eos_ids = config.eos_token_id
         eos_ids = set(eos_ids if isinstance(eos_ids, (list, tuple)) else [eos_ids])
-        suppress = [config.audio_token_id, frame_token]
+        suppress = self.placeholder_token_ids()
         # an explicit text mode keeps the reply in text, as the reference does
         if suppress_mixed or generation_mode == TEXT:
             suppress.append(config.mixed_start_token_id)

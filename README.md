@@ -38,6 +38,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 |-------|---------------|
 | LFM3 / LFM3-VL | [Docs](mlx_vlm/models/lfm3/README.md) |
 | LFM3-Audio | [Docs](mlx_vlm/models/lfm3_audio/README.md) |
+| LFM3-Omni | [Docs](mlx_vlm/models/lfm3_omni/README.md) |
 | DeepSeek-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr/README.md) |
 | DeepSeek-OCR-2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr_2/README.md) |
 | Unlimited-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/unlimited_ocr/README.md) |

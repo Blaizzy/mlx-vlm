@@ -40,6 +40,7 @@ MODEL_CONFIG = {
     "lfm2_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "lfm3_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "lfm3_audio": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "lfm3_omni": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "lfm3": MessageFormat.TEXT_ONLY,
     "aya_vision": MessageFormat.LIST_WITH_IMAGE,
     "cohere2_vision": MessageFormat.LIST_WITH_IMAGE,
@@ -363,6 +364,7 @@ class MessageFormatter:
             "nemotron_h_nano_omni",
             "nemotronh_nano_omni_reasoning_v3",
             "lfm3_vl",
+            "lfm3_omni",
         ] and kwargs.get("video"):
             return self._format_video_message(
                 prompt,
@@ -489,7 +491,7 @@ class MessageFormatter:
 
         if role == "user" and not skip_audio_token and num_audios > 0:
             audio_tokens = [MessageBuilder.audio_message()] * num_audios
-            if self.model_name in ("lfm3_audio",):
+            if self.model_name in ("lfm3_audio", "lfm3_omni"):
                 # the reference order: images, then audio, then the text
                 content = content[:-1] + audio_tokens + content[-1:]
             else:
@@ -672,9 +674,11 @@ class MessageFormatter:
                 f"Got {len(fps_list)} fps values for {len(videos)} videos."
             )
 
+        # the videos belong to the user turn, not to a system prompt
         content = [
             MessageBuilder.video_message(v, max_pixels, f)
             for v, f in zip(videos, fps_list)
+            if role == "user"
         ]
         prompt_parts, explicit_images = self._content_parts(
             prompt,

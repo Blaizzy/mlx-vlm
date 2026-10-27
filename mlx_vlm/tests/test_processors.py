@@ -2222,7 +2222,7 @@ def test_prompt_does_not_leak_image_payload(representation):
 
 
 class TestApplyChatTemplateIntegration:
-    def test_lfm3_audio_puts_the_audio_before_the_text(self):
+    def test_lfm3_speech_models_put_the_audio_before_the_text(self):
         from mlx_vlm.prompt_utils import apply_chat_template
 
         result = apply_chat_template(
@@ -2234,6 +2234,16 @@ class TestApplyChatTemplateIntegration:
             num_audios=1,
         )
         assert [item["type"] for item in result[0]["content"]] == ["audio", "text"]
+        result = apply_chat_template(
+            None,
+            {"model_type": "lfm3_omni"},
+            "What is shown and said?",
+            return_messages=True,
+            num_images=1,
+            num_audios=1,
+        )
+        types = [item["type"] for item in result[0]["content"]]
+        assert types == ["image", "audio", "text"]
 
     def test_assistant_reasoning_content_is_preserved(self):
         messages = [
@@ -4475,6 +4485,94 @@ def test_lfm3_vl_chat_messages_carry_videos():
         return_messages=True,
     )
     assert [item["type"] for item in messages[0]["content"]] == ["video", "text"]
+    # a system prompt does not get a copy of the video
+    messages = apply_chat_template(
+        None,
+        {"model_type": "lfm3_omni"},
+        [{"role": "system", "content": "Answer."}, "Describe."],
+        video="clip.mp4",
+        num_audios=1,
+        return_messages=True,
+    )
+    assert [[item["type"] for item in m["content"]] for m in messages] == [
+        ["text"],
+        ["video", "audio", "text"],
+    ]
+
+
+def test_lfm3_omni_wraps_each_media_span_once_and_expands_speech():
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+
+    from mlx_vlm.models.lfm3_omni.processing_lfm3_omni import Lfm3OmniProcessor
+    from mlx_vlm.models.lfm3_vl.processing_lfm3_vl import Lfm3VlVideoProcessor
+    from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLImageProcessor
+
+    tokens = ["<unk>", "<|image|>", "<|video|>", "<|vision_start|>"]
+    tokens += ["<|vision_end|>", "<|audio|>", "<|audio_out|>"]
+    tokens += ["<|audio_start|>", "<|mixed_start|>"]
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(
+            WordLevel(dict(zip(tokens, range(len(tokens)))), unk_token="<unk>")
+        ),
+        unk_token="<unk>",
+        additional_special_tokens=tokens[1:],
+    )
+    processor = Lfm3OmniProcessor(
+        Qwen3VLImageProcessor(min_pixels=4096, max_pixels=16384),
+        tokenizer,
+        Lfm3VlVideoProcessor(min_pixels=4096, max_pixels=65536),
+    )
+    assert processor.additional_eos_token_ids == [7, 8]
+    assert processor.feature_extractor.sampling_rate == 16000
+
+    class RecordingTokenizer:
+        def __call__(self, text, **kwargs):
+            self.text = text
+            return tokenizer(text, **kwargs)
+
+    processor.tokenizer = RecordingTokenizer()
+    span = "<|vision_start|>{}<|vision_end|>".format
+    media = dict(
+        images=Image.fromarray(np.zeros((64, 64, 3), dtype=np.uint8)),
+        videos=[np.zeros((2, 64, 64, 3), dtype=np.uint8)],
+        video_metadata=[dict(fps=2.0, frames_indices=[0, 1])],
+        audio=[np.zeros(16000, np.float32)],
+        audio_out_codes=[np.ones((2, 12))],
+        return_tensors="np",
+    )
+    # the chat template's spans, or bare placeholders: one span pair each
+    for text in (
+        span("<|image|>") + span("<|audio|>") + "x" + span("<|video|>"),
+        "<|image|><|audio|>x<|video|>",
+    ):
+        result = processor(text=text + "<|audio_out|>", **media)
+        assert processor.tokenizer.text == [
+            span("<|image|>" * 4)
+            + span("<|audio|>" * 13)  # 99 feature frames / 8
+            + "x"
+            + span("<0.2 seconds>" + span("<|video|>" * 4))
+            + "<|audio_out|>" * 3  # 2 frames and the end-of-speech frame
+        ]
+    assert result["input_features"].shape == (1, 128, 99)
+    assert result["audio_out_codes"].shape == (3, 12)
+    np.testing.assert_array_equal(result["image_grid_thw"], [[1, 4, 4]])
+    np.testing.assert_array_equal(result["video_grid_thw"], [[1, 4, 4]])
+    # (35 + 52) / 60 = 1.45 rounds down, unlike LFM3-VL's 35 / 30 + 52 / 30
+    processor(
+        text="<|video|>",
+        videos=media["videos"],
+        video_metadata=[dict(fps=30.0, frames_indices=[35, 52])],
+    )
+    assert "<1.4 seconds>" in processor.tokenizer.text[0]
+    with pytest.raises(ValueError, match="hop_length"):
+        Lfm3OmniProcessor(
+            processor.image_processor,
+            tokenizer,
+            processor.video_processor,
+            processor_config={"feature_extractor": {"hop_length": 320}},
+        )
 
 
 def test_lfm3_audio_processor_expands_speech_placeholders():
