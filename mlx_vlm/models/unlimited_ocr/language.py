@@ -31,9 +31,23 @@ class RingSlidingKVCache(KVCache):
         self.window_size = int(window_size)
         self.prefill_length: Optional[int] = None
         self._ring_pos = 0
+        self._processing_prefill = False
+        self._prefill_pending = False
+
+    def begin_prefill(self):
+        self._processing_prefill = True
+        self.prefill_length = None
+
+    def end_prefill(self, finished):
+        self._processing_prefill = False
+        self.prefill_length = self.offset
+        self._ring_pos = 0
+        self._prefill_pending = not finished
 
     def update_and_fetch(self, keys, values):
         seq_len = int(keys.shape[2])
+        if self._processing_prefill:
+            return super().update_and_fetch(keys, values)
 
         if self.prefill_length is None:
             if seq_len > 1:
@@ -89,6 +103,8 @@ class RingSlidingKVCache(KVCache):
         self.offset = 0 if self.keys is None else self.keys.shape[2]
         self.prefill_length = None
         self._ring_pos = 0
+        self._processing_prefill = False
+        self._prefill_pending = False
 
     @property
     def meta_state(self):
@@ -100,13 +116,16 @@ class RingSlidingKVCache(KVCache):
                     -1 if self.prefill_length is None else self.prefill_length,
                     self.offset,
                     self._ring_pos,
+                    int(self._prefill_pending),
                 ),
             )
         )
 
     @meta_state.setter
     def meta_state(self, v):
-        window_size, prefill_length, offset, ring_pos = map(int, v)
+        window_size, prefill_length, offset, ring_pos = map(int, v[:4])
+        self._processing_prefill = False
+        self._prefill_pending = bool(int(v[4])) if len(v) > 4 else False
         self.window_size = window_size
         self.prefill_length = None if prefill_length < 0 else prefill_length
         self.offset = offset
@@ -129,6 +148,11 @@ class DeepseekV2RingSlidingModel(DeepseekV2Model):
         if cache is None:
             cache = [None] * len(self.layers)
 
+        if cache:
+            keys = getattr(cache[0], "keys", None)
+            if isinstance(keys, mx.array) and mx.issubdtype(keys.dtype, mx.floating):
+                h = h.astype(mx.result_type(h.dtype, keys.dtype))
+
         if mask is None:
             mask = self._make_attention_mask(h, cache[0])
 
@@ -149,6 +173,27 @@ class LanguageModel(DeepseekLanguageModel):
     def __init__(self, config: TextConfig):
         super().__init__(config)
         self.model = DeepseekV2RingSlidingModel(config)
+
+    def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, **kwargs):
+        ring_caches = [c for c in cache or [] if isinstance(c, RingSlidingKVCache)]
+        chunk = kwargs.get("n_to_process") is not None
+        # Chunked generation leaves one final prompt token for the first step.
+        prefill = bool(ring_caches) and (
+            chunk
+            or any(c._prefill_pending for c in ring_caches)
+            or all(c.offset == 0 for c in ring_caches)
+        )
+        if prefill:
+            for entry in ring_caches:
+                entry.begin_prefill()
+        try:
+            return super().__call__(
+                inputs, inputs_embeds=inputs_embeds, mask=mask, cache=cache, **kwargs
+            )
+        finally:
+            if prefill:
+                for entry in ring_caches:
+                    entry.end_prefill(finished=not chunk)
 
     def make_cache(self):
         window_size = self.config.sliding_window_size or self.config.sliding_window

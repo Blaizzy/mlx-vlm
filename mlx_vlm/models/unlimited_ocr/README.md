@@ -115,6 +115,46 @@ mlx_vlm.generate \
 These prompts are experimental for Unlimited-OCR; use the output comparison to
 decide whether a prompt changes behavior usefully for your document.
 
+## Floating-point precision with quantized language weights
+
+For dense OCR, preserve precision across the whole visual-to-language path.
+Keeping only the visual encoder in FP32 is insufficient if its features are
+assigned into a BF16 token-embedding buffer. The model promotes the fused buffer
+to the common dtype of the text and visual features, and cached decoding retains
+the floating-point dtype of the prefill keys. This does not requantize token
+embeddings or change packed language weights.
+
+For an 8-bit checkpoint, an explicit FP32 visual path can be configured as follows:
+
+```python
+import mlx.core as mx
+from mlx_vlm import generate, load
+from mlx_vlm.prompt_utils import apply_chat_template
+
+model, processor = load("mlx-community/Unlimited-OCR-8bit")
+for name in ("sam_model", "vision_model", "projector"):
+    getattr(model, name).set_dtype(mx.float32)
+model.image_newline = model.image_newline.astype(mx.float32)
+model.view_separator = model.view_separator.astype(mx.float32)
+prompt = apply_chat_template(
+    processor, model.config, "document parsing.", num_images=1
+).strip()
+result = generate(
+    model, processor, prompt, image=["document.png"],
+    temperature=0.0, max_tokens=32768,
+)
+print(result.text)
+```
+
+`model.set_dtype(mx.float32)` is another explicit option: it casts floating-point
+arrays while retaining packed integer weights. Casting an unquantized BF16
+language model also doubles the storage of those weights, so account for that
+memory cost. Loading a checkpoint does not force a new global dtype.
+
+The R-SWA cache also distinguishes prompt chunks from generated tokens. The last
+single prompt token left by chunked prefill remains part of the persistent
+reference; even a prefill step size of one must not evict visual-prefix keys.
+
 ## CLI Examples
 
 ### Single image (`gundam` mode, default)

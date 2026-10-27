@@ -60,6 +60,7 @@ class TextConfig(BaseModelConfig):
 
 @dataclass
 class VisionConfig(DeepseekOCRVisionConfig):
+    layer_norm_eps: float = 1e-5
     width: Union[int, Dict] = 1152
 
 

@@ -164,6 +164,9 @@ class Model(DeepseekOCRModel):
 
                 if images_in_this_batch:
                     images_in_this_batch = mx.concatenate(images_in_this_batch, axis=0)
+                    input_embeds = input_embeds.astype(
+                        mx.result_type(input_embeds.dtype, images_in_this_batch.dtype)
+                    )
                     batch_idx = 0 if single_prompt_multi_image else idx
                     image_indices = image_token_positions[batch_idx]
                     start = image_token_offsets[batch_idx]
