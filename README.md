@@ -55,12 +55,12 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | EmbeddingGemma 2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/embedding_gemma2/README.md) |
 | Gemma 4 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/gemma4/README.md) |
 | Muse Spark Open | [Docs](mlx_vlm/models/muse_spark/README.md) |
-| MiniMax M3 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minimax_m3_vl/README.md) |
+| MiniMax M3 / M3.1 Flash | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minimax_m3_vl/README.md) |
 | Falcon-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/falcon_ocr/README.md) |
 | IndicOCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/indic_ocr/README.md) |
 | PP-DocLayoutV3 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/pp_doclayout_v3/README.md) |
 | Granite Vision 3.2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite_vision/README.md) |
-| Granite 4.0 Vision | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite4_vision/README.md) |
+| Granite Vision (4.0, 4.1) | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite4_vision/README.md) |
 | MiniCPM-V 4.7 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minicpmv4_7/README.md) |
 | MiniCPM-V 4.6 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minicpmv4_6/README.md) |
 | GLiNER2.5 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/gliner2_5/README.md) |
@@ -1350,6 +1350,8 @@ Structured outputs are not currently supported with speculative decoding.
 - `/audio/speech` and `/v1/audio/speech` - OpenAI-compatible text-to-speech endpoint backed by `mlx-audio` TTS models
 - `/audio/transcriptions` and `/v1/audio/transcriptions` - OpenAI-compatible speech-to-text endpoint backed by `mlx-audio` STT models
 - `/audio/translations` and `/v1/audio/translations` - OpenAI-compatible audio translation endpoint for STT models that expose a translation task
+- `/audio/diarizations` and `/v1/audio/diarizations` - Recording-wide speaker turns using MLX-Audio Nemotron diarization
+- `/audio/speaker_embeddings` and `/v1/audio/speaker_embeddings` - Normalized ECAPA speaker vectors from separate speech windows
 - `/v1/realtime` - WebSocket-based realtime full-duplex speech. See the [Nemotron VoiceChat guide](mlx_vlm/models/nemotron_voicechat/README.md#realtime-websocket-api) for supported models and usage.
 - `/health` - Check server status
 - `/metrics` and `/v1/metrics` - Inspect rolling request metrics, throughput, and runtime counters
@@ -1692,7 +1694,7 @@ The following models support video chat:
 2. Qwen2.5-VL
 3. Idefics3
 4. LLaVA
-5. MiniMax M3
+5. MiniMax M3 / M3.1 Flash
 6. LLaVA-OneVision
 7. Mage-VL
 8. Muse Spark Open
