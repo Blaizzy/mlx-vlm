@@ -33,7 +33,9 @@ class UnlimitedOCRProcessor(DeepseekOCRProcessor):
         kwargs.pop("force_download", None)
         kwargs.pop("quantize_activations", None)
         kwargs.pop("strict", None)
-        path = Path(pretrained_model_name_or_path)
+        kwargs.pop("expert_cache_gb", None)
+        kwargs.pop("max_kv_size", None)
+        path =Path(pretrained_model_name_or_path)
         if not path.exists():
             from huggingface_hub import snapshot_download
 
