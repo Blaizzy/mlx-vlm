@@ -52,10 +52,7 @@ class ModelConfig(BaseModelConfig):
     projector_layer_norm_eps: float = 1e-6
     image_token_id: int = 125030
     video_token_id: int = 125029
-    vision_start_token_id: int = 125009
-    vision_end_token_id: int = 125010
     eos_token_id: int = 124900
-    tie_word_embeddings: bool = True
 
     def __post_init__(self):
         if isinstance(self.text_config, dict):

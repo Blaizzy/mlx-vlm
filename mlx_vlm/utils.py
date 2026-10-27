@@ -205,6 +205,17 @@ def get_model_type(config: dict) -> Optional[str]:
 
     model_type = MODEL_REMAPPING.get(model_type, model_type)
 
+    auto_model = str((config.get("auto_map") or {}).get("AutoModel", ""))
+    if model_type in {"lfm3_vl", "lfm3_omni"} and (
+        "D1Model" in (config.get("architectures") or ())
+        or auto_model.endswith("D1Model")
+    ):
+        raise ValueError(
+            f"LiquidAI d1 checkpoints (model_type {model_type}, D1Model) are "
+            "not supported; run them with transformers (trust_remote_code=True) "
+            "as their model card shows."
+        )
+
     architectures = set(config.get("architectures") or ())
     dflash_config = config.get("dflash_config")
     if "Lfm2BidirectionalForMaskedLM" in architectures:

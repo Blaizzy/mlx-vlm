@@ -33,6 +33,16 @@ def _pixel_kwargs(config):
 
 
 class Lfm3VlVideoProcessor(Qwen3VLVideoProcessor):
+    sample_frames_in_loader = True
+
+    def sample_frames(self, metadata, fps=None, max_frames=None):
+        """The reference rule: odd counts are kept and padded later by repeating
+        the last frame, rather than floored to the temporal patch size."""
+        total = metadata.total_num_frames
+        count = int(total / metadata.fps * (fps or self.fps))
+        count = min(max(count, self.min_frames), max_frames or self.max_frames, total)
+        return np.linspace(0, total - 1, count).round().astype(int)
+
     def _process_one(self, video):
         t, channels, height, width = video.shape
         p, m, temporal = self.patch_size, self.merge_size, self.temporal_patch_size
@@ -136,6 +146,11 @@ class Lfm3VlProcessor(Qwen2VLProcessor):
             )
         return expanded
 
+    @staticmethod
+    def group_seconds(groups, fps):
+        # as the reference: per-frame seconds first, so x.x5 rounds the same way
+        return (groups[:, 0] / fps + groups[:, -1] / fps) / 2
+
     def __call__(
         self,
         text=None,
@@ -199,6 +214,8 @@ class Lfm3VlProcessor(Qwen2VLProcessor):
                     if isinstance(meta, dict)
                     else (meta.fps or 24.0)
                 )
+                # as the reference: drops float noise (torchcodec's 30.000000000000004)
+                fps = round(fps, 6)
                 indices = (
                     meta.get("frames_indices")
                     if isinstance(meta, dict)
@@ -215,7 +232,9 @@ class Lfm3VlProcessor(Qwen2VLProcessor):
                     )
                 group = self.video_processor.temporal_patch_size
                 indices.extend([indices[-1]] * (-len(indices) % group))
-                timestamps = np.asarray(indices).reshape(-1, group).mean(axis=1) / fps
+                timestamps = self.group_seconds(
+                    np.asarray(indices).reshape(-1, group), fps
+                )
                 if len(timestamps) != t:
                     raise ValueError(
                         "Video timestamps do not match the processed frame groups"

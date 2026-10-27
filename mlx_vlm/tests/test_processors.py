@@ -2222,6 +2222,19 @@ def test_prompt_does_not_leak_image_payload(representation):
 
 
 class TestApplyChatTemplateIntegration:
+    def test_assistant_reasoning_content_is_preserved(self):
+        messages = [
+            {"role": "user", "content": "What is 17 + 25?"},
+            {"role": "assistant", "content": "42", "reasoning_content": "7+5=12"},
+        ]
+
+        result = apply_chat_template(
+            None, {"model_type": "lfm3"}, messages, return_messages=True
+        )
+
+        assert result[1]["reasoning_content"] == "7+5=12"
+        assert "reasoning_content" not in result[0]
+
     """Integration tests for apply_chat_template with multimodal content.
 
     These tests verify the actual bug fix works end-to-end, not just the helper.
@@ -4367,3 +4380,85 @@ def test_lfm3_video_timestamps_use_sampled_fps_and_repeat_the_last_odd_frame(
     np.testing.assert_allclose(result["pixel_values_videos"][-16:], 1.0)
     with pytest.raises(ValueError, match="pre-sampled"):
         processor(text="<|video|>", videos=[frames], do_sample_frames=True)
+    # the reference rounds fps to 6 decimals: (1499 + 1501) / 2 / 29.97 = 50.05
+    processor(
+        text="<|video|>",
+        videos=[frames[:2]],
+        video_metadata=[dict(fps=30000 / 1001, frames_indices=[1499, 1501])],
+    )
+    assert "<50.0 seconds>" in processor.tokenizer.text[0]
+    # 35 / 30 + 52 / 30 averages to 1.5, the mean index / 30 to 1.4
+    processor(
+        text="<|video|>",
+        videos=[frames[:2]],
+        video_metadata=[dict(fps=30.0, frames_indices=[35, 52])],
+    )
+    assert "<1.5 seconds>" in processor.tokenizer.text[0]
+
+
+@pytest.mark.parametrize(
+    "total, source_fps, max_frames, expected",
+    [
+        (81, 30.0, None, [0, 20, 40, 60, 80]),  # odd counts are not floored
+        (10, 30.0, None, [0, 3, 6, 9]),  # min_frames
+        (3, 30.0, None, [0, 1, 2]),  # never more than the clip has
+        (1000, 10.0, 8, [0, 143, 285, 428, 571, 714, 856, 999]),
+    ],
+)
+def test_lfm3_video_sampling_follows_the_reference_rule(
+    lfm3_processor, total, source_fps, max_frames, expected
+):
+    sampler = lfm3_processor.video_processor
+    assert sampler.sample_frames_in_loader
+    metadata = SimpleNamespace(total_num_frames=total, fps=source_fps)
+    actual = sampler.sample_frames(metadata, fps=2.0, max_frames=max_frames)
+    assert actual.tolist() == expected
+
+
+def test_lfm3_video_file_keeps_odd_frame_counts_and_source_times(
+    tmp_path, lfm3_processor
+):
+    import cv2
+
+    from mlx_vlm.utils import prepare_inputs
+
+    path = str(tmp_path / "clip.mp4")
+    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), 30.0, (64, 64))
+    for i in range(105):
+        writer.write(np.full((64, 64, 3), i, dtype=np.uint8))
+    writer.release()
+    processor = lfm3_processor
+    tokenizer = processor.tokenizer
+    tokenizer.pad_token = tokenizer.unk_token
+
+    class RecordingTokenizer:
+        pad_token = tokenizer.unk_token
+
+        def __call__(self, text, **kwargs):
+            self.text = text
+            return tokenizer(text, **kwargs)
+
+    processor.tokenizer = RecordingTokenizer()
+    result = prepare_inputs(processor, prompts="<|video|>", videos=[path])
+    # 3.5 s at 2 fps: 7 frames (0, 17, 35, 52, 69, 87, 104), the last repeated
+    times = re.findall(r"<[0-9.]+ seconds>", processor.tokenizer.text[0])
+    assert times == [
+        "<0.3 seconds>",
+        "<1.5 seconds>",
+        "<2.6 seconds>",
+        "<3.5 seconds>",
+    ]
+    assert np.array(result["video_grid_thw"])[0, 0] == 4
+
+
+def test_lfm3_vl_chat_messages_carry_videos():
+    from mlx_vlm.prompt_utils import apply_chat_template
+
+    messages = apply_chat_template(
+        None,
+        {"model_type": "lfm3_vl"},
+        "Describe.",
+        video="clip.mp4",
+        return_messages=True,
+    )
+    assert [item["type"] for item in messages[0]["content"]] == ["video", "text"]
