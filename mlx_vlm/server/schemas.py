@@ -311,6 +311,15 @@ class ImageProcessingRequest(FlexibleBaseModel):
         description="Resize images before processing. Provide one integer for square or two dimensions.",
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_thinking_alias(cls, values):
+        if isinstance(values, dict) and values.get("enable_thinking") is None:
+            options = values.get("chat_template_kwargs")
+            if isinstance(options, dict) and "enable_thinking" in options:
+                values = {**values, "enable_thinking": options["enable_thinking"]}
+        return values
+
     @field_validator("resize_shape", mode="before")
     @classmethod
     def normalize_resize_shape_field(cls, value):

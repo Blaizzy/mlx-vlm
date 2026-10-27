@@ -188,7 +188,7 @@ mlx_vlm.server --model Qwen/Qwen3.5-4B \
   --thinking-end-token "</think>"
 ```
 
-Requests can override the server defaults with `enable_thinking`, `thinking_budget`, `thinking_start_token`, or `thinking_end_token`.
+Requests can override the server defaults with `enable_thinking`, `thinking_budget`, `thinking_start_token`, or `thinking_end_token`. `chat_template_kwargs.enable_thinking` is also accepted; an explicit top-level `enable_thinking` takes precedence.
 
 ### Speculative Decoding
 

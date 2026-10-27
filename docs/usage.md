@@ -132,12 +132,19 @@ Max output setting equal to or larger than the context window. Generation stops
 with a length finish reason if it fills the remaining window; the next request
 can compact that history. Input that leaves no room for generation even after
 compaction is still rejected. Automatic and terminal-trigger compaction can
-summarize oversized history in up to eight bounded passes, preserving instructions
-and splitting only between user turns or completed tool-call/result groups. Every
-summary call must fit the model window and reduce its input; otherwise the request
-fails without replacing the original context. A single oversized message or
-indivisible tool group still needs to be reduced by the caller. The standalone
-`/responses/compact` endpoint still requires its input to fit.
+summarize oversized history in bounded passes, preserving instructions and
+splitting between user turns or completed tool-call/result groups. Each pass must
+consume an exchange and reduce its input. Oversized tool text is shortened with
+an explicit omission marker while retaining call/result pairing. Protected user
+or instruction text that cannot fit still requires a smaller request. The
+standalone `/responses/compact` endpoint still requires its input to fit.
+Automatic summaries reserve 512 tokens at 4K and 1024 at 8K, retry once with up to
+twice that budget, and retain labelled partial content if the cap is still reached.
+Reasoning-only exhaustion falls back to labelled conversation excerpts, not model
+reasoning. Summary prompts close an actually pre-opened thinking suffix when a
+template ignores `enable_thinking=false`. These recovery paths are lossy; they do
+not guarantee factual recall.
+
 When compaction happens, the response output starts with a
 `type: "compaction"` item. Append the output normally, or keep only the newest
 compaction item and everything after it. `previous_response_id` chaining also
@@ -145,15 +152,18 @@ works while that response is stored. `/v1/responses/input_tokens` counts the
 decoded context, not the encrypted payload's string length. Normal response
 usage counts the final inference; explicit compact usage counts the summary pass.
 
-Chat Completions automatically compacts supported history when the actual input
-leaves no room for generation within the context limit. No threshold setting is needed.
-The optional `context_management` field enables earlier compaction; an empty list
+Chat Completions automatically compacts supported history at 75% of the effective
+context limit. `context_management` overrides the threshold; an empty list
 explicitly disables compaction. Recovery supports text, images, and tool history;
 audio/video requests keep their existing behavior. Compaction finishes before the
-Chat Completions stream opens and leaves its response format unchanged. It is
-request-local: clients that resend their full history may need compaction again
-on later requests. Responses clients can
-reuse the returned compaction item.
+Chat Completions stream opens and leaves its response format unchanged.
+
+An in-memory cache reuses compacted exact conversation prefixes when clients resend
+full history. It is scoped by tenant, loaded processor, context limit, and request
+options, expires after ten minutes, and holds at most 32 entries and 2 MB of
+compacted content. Transcript edits or option changes miss the cache; unloading
+the model clears it. This cache is separate from APC and is not durable across
+server restarts. Responses clients can persist and reuse their compaction item.
 
 Streaming automatic compaction and terminal `compaction_trigger` requests emit
 request-scoped MLX extension events after `response.created` / `response.in_progress`
@@ -199,7 +209,7 @@ across repeated compactions.
 
 The server also retains whole older user messages within a budget of 1/16 of the
 effective context limit, capped at 8192 tokens and the available compaction
-budget. It considers newest messages first, skips messages that do not fit, and
+budget. It considers the first user objective, then newest messages, skips messages that do not fit, and
 preserves their original order and roles. Oversized pasted content goes through
 the existing summarizer. This is an MLX retention policy for smaller models, not
 the standalone OpenAI API's documented all-user-messages retention behavior.
