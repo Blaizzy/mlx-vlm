@@ -97,12 +97,12 @@ class UnlimitedOCRProcessor(DeepseekOCRProcessor):
         # Unlimited-OCR's released tokenizer already contains <image> at 128815.
         self.image_token_id = tokenizer.vocab.get(image_token, 128815)
         # Unlimited-OCR-2 prompt layout: one <PAGE> marker before every page image,
-        # gundam tiles (<= 16) for a single page, one 1024 base view per page otherwise.
+        # gundam tiles (<= 16) per page to preserve small text in long documents.
         self.page_layout = page_layout
         self.max_crops = max_crops or (16 if page_layout else 32)
 
     def __call__(self, *, cropping: Optional[bool] = None, **kwargs):
-        # The DeepSeek-OCR parent defaults cropping=True; None keeps the auto policy.
+        # Keep cropping explicit so prepare_inputs forwards the processor kwarg.
         return super().__call__(cropping=cropping, **kwargs)
 
     def page_prompt(self, prompt: str, num_images: int) -> str:
@@ -178,9 +178,7 @@ class UnlimitedOCRProcessor(DeepseekOCRProcessor):
         if self.page_layout:
             conversation = self.page_prompt(conversation, len(images))
         if cropping is None:
-            # Upstream auto policy: v2 tiles a single page and uses one base view
-            # per page for multi-page requests; v1 always tiles.
-            cropping = len(images) == 1 or not self.page_layout
+            cropping = True
         valid_img_tokens = 0
         ratio = 1
 

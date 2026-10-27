@@ -1100,6 +1100,42 @@ def test_unlimited_ocr2_page_prompt_layout(prompt, num_images, expected):
     assert p.page_prompt(prompt, num_images) == prompt
 
 
+@pytest.mark.parametrize("page_layout", [False, True], ids=["v1", "v2"])
+@pytest.mark.parametrize("num_pages", [1, 2])
+@pytest.mark.parametrize("cropping", ["default", None, True, False])
+def test_unlimited_ocr_crop_modes(page_layout, num_pages, cropping):
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(
+            WordLevel({"<unk>": 0, "<image>": 1, "<pad>": 2}, unk_token="<unk>")
+        ),
+        unk_token="<unk>",
+        pad_token="<pad>",
+    )
+    processor = c.ocr(tokenizer=tokenizer, page_layout=page_layout)
+    kwargs = {} if cropping == "default" else {"cropping": cropping}
+    # Two 640-pixel tiles per page, independent of the page count.
+    result = processor(
+        text="<image>Multi page parsing.",
+        images=[Image.new("RGB", (640, 1280))] * num_pages,
+        **kwargs,
+    )
+    tiled = cropping is not False
+    assert (
+        result["images_spatial_crop"].tolist()
+        == ([[1, 2]] if tiled else [[1, 1]]) * num_pages
+    )
+    assert result["images"][1].shape == (
+        num_pages,
+        3,
+        1024 if tiled or page_layout else 640,
+        1024 if tiled or page_layout else 640,
+    )
+    if tiled:
+        assert result["images"][0].shape == (num_pages * 2, 3, 640, 640)
+    expected_image_tokens = 493 if tiled else (273 if page_layout else 111)
+    assert int(result["images_seq_mask"].sum()) == expected_image_tokens * num_pages
+
+
 @pytest.mark.parametrize("name,start,end", DATA["cleanup"])
 def test_output_control_tokens(name, start, end):
     cls = (

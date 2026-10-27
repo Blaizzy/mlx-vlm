@@ -40,8 +40,10 @@ from typing import Any, Dict, Optional
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from mlx.utils import tree_map
 
-from ..cache import KVCache
+from ..base import scaled_dot_product_attention
+from ..cache import KVCache, QuantizedKVCache
 
 _SCORE_NEG = -1.0e9
 _ACT_CLAMP = 1.0e4
@@ -324,16 +326,20 @@ class DashState:
         self.markers = mx.array(self.prompt.marker_count, dtype=mx.int32)
 
 
-class DashKVCache(KVCache):
-    """Full KV cache plus the router's block summaries.
+class _DashCache:
+    """Router state shared by floating-point and quantized DASH caches.
 
     Only completed blocks can ever be routed (a query's remote blocks end
     ``local_blocks`` blocks before its own), so the cache keeps one summary key
     per completed block and the index keys of the block still being filled.
     """
 
-    def __init__(self, state: DashState):
-        super().__init__()
+    # Generic Hybrid/TurboQuant conversion cannot retain the router state.
+    # Uniform quantization uses DashQuantizedKVCache below.
+    preserve_auxiliary_kv_state = True
+
+    def __init__(self, state: DashState, **kwargs):
+        super().__init__(**kwargs)
         self.dash_state = state
         self.pending = None
         self.summaries = None
@@ -378,6 +384,23 @@ class DashKVCache(KVCache):
         if not self.num_summaries:
             return None
         return self.summaries[: self.num_summaries]
+
+
+class DashKVCache(_DashCache, KVCache):
+    """Full KV cache plus the router's block summaries."""
+
+    def to_quantized(self, group_size: int = 64, bits: int = 4):
+        base = super().to_quantized(group_size=group_size, bits=bits)
+        cache = DashQuantizedKVCache(self.dash_state, group_size=group_size, bits=bits)
+        cache.keys, cache.values, cache.offset = base.keys, base.values, base.offset
+        cache.pending = self.pending
+        cache.summaries = self.summaries
+        cache.num_summaries = self.num_summaries
+        return cache
+
+
+class DashQuantizedKVCache(_DashCache, QuantizedKVCache):
+    """Packed K/V tensors with unquantized DASH routing and page state."""
 
 
 def _summarize_blocks(blocks: mx.array, head_cls: mx.array):
@@ -638,7 +661,7 @@ class DashAttention(nn.Module):
             idx, mask = self._select(
                 idx_q, summaries, ctx.candidates, ctx.pos, *self._decode_consts
             )
-            out = self._decode(q, keys, values, idx, mask)
+            out = self._decode(q, keys, values, idx, mask, cache=cache)
             return self.o_proj(out.transpose(0, 2, 1, 3).reshape(B, L, -1))
         total = ctx.offset + L
         nblk = -(-total // p.block_size)
@@ -649,15 +672,19 @@ class DashAttention(nn.Module):
             cand = cand[..., :nblk]
         topi, bias, valid = route_select(scores, cand, self.idx_scale, self.floor, p)
 
-        out = self._prefill(q, keys, values, topi, bias, valid, ctx.offset, nblk)
+        out = self._prefill(
+            q, keys, values, topi, bias, valid, ctx.offset, nblk, cache=cache
+        )
         out = out.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(out)
 
-    def _prefill(self, q, keys, values, topi, bias, valid, offset, nblk, chunk=2048):
+    def _prefill(
+        self, q, keys, values, topi, bias, valid, offset, nblk, chunk=2048, cache=None
+    ):
         """Selected blocks (+bias) union the local window, as an additive mask."""
         p = self.params
         L = q.shape[2]
-        S = keys.shape[2]
+        S = offset + L
         kpos = mx.arange(S)
         kblk = kpos // p.block_size
         blk = mx.full((L, nblk), -mx.inf, dtype=mx.float32)
@@ -671,22 +698,27 @@ class DashAttention(nn.Module):
             local = causal & (kpos[None, :] > (qpos - p.local_window))
             mask = mx.where(local, 0.0, mx.where(causal, base, -mx.inf))
             outs.append(
-                mx.fast.scaled_dot_product_attention(
+                scaled_dot_product_attention(
                     q[:, :, c0:c1],
                     keys,
                     values,
+                    cache=cache,
                     scale=self.scale,
                     mask=mask.astype(q.dtype)[None, None],
                 )
             )
         return outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=2)
 
-    def _decode(self, q, keys, values, idx, mask):
+    def _decode(self, q, keys, values, idx, mask, cache=None):
         """Gather the selected blocks and the local window: K*bs + local keys."""
-        k = mx.take(keys, idx, axis=2)
-        v = mx.take(values, idx, axis=2)
-        return mx.fast.scaled_dot_product_attention(
-            q, k, v, scale=self.scale, mask=mask.astype(q.dtype)[None, None, None]
+        k, v = tree_map(lambda x: mx.take(x, idx, axis=2), (keys, values))
+        return scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            cache=cache,
+            scale=self.scale,
+            mask=mask.astype(q.dtype)[None, None, None],
         )
 
 
@@ -794,6 +826,7 @@ __all__ = [
     "DashContext",
     "DashKVCache",
     "DashParams",
+    "DashQuantizedKVCache",
     "DashRope",
     "DashState",
     "build_context",
