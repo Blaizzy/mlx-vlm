@@ -44,6 +44,7 @@ from mlx.utils import tree_map
 
 from ..base import scaled_dot_product_attention
 from ..cache import KVCache, QuantizedKVCache
+from . import dash_kernels
 
 _SCORE_NEG = -1.0e9
 _ACT_CLAMP = 1.0e4
@@ -640,6 +641,9 @@ class DashAttention(nn.Module):
             mx.array(self.floor, dtype=mx.float32),
         )
         self._select = _compiled_select(params)
+        self._kernel_consts = dash_kernels.decode_consts(
+            self.idx_scale, self.floor, self.scale, params, params.index_dim
+        )
 
     def __call__(self, x: mx.array, ctx: DashContext, cache: DashKVCache):
         B, L, _ = x.shape
@@ -657,11 +661,29 @@ class DashAttention(nn.Module):
         idx_q, idx_k = self.dash_router.index_qk(x, ctx.cos, ctx.sin, ctx.decode)
         cache.add_index_keys(idx_k, self.dash_router.head_cls)
         if ctx.decode:
-            summaries = cache.summary_buffer(ctx.candidates.shape[-1], idx_k.shape[-1])
-            idx, mask = self._select(
-                idx_q, summaries, ctx.candidates, ctx.pos, *self._decode_consts
-            )
-            out = self._decode(q, keys, values, idx, mask, cache=cache)
+            cap = ctx.candidates.shape[-1]
+            summaries = cache.summary_buffer(cap, idx_k.shape[-1])
+            # The fused kernel reads floating-point K/V; packed (quantized) caches
+            # keep the gathered path.
+            if not isinstance(cache, QuantizedKVCache) and dash_kernels.decode_supported(
+                p, self.n_heads, self.head_dim, idx_k.shape[-1], cap
+            ):
+                out = dash_kernels.dash_decode(
+                    q,
+                    cache.keys,
+                    cache.values,
+                    idx_q,
+                    summaries,
+                    ctx.candidates,
+                    ctx.pos,
+                    self._kernel_consts,
+                    p,
+                )
+            else:
+                idx, mask = self._select(
+                    idx_q, summaries, ctx.candidates, ctx.pos, *self._decode_consts
+                )
+                out = self._decode(q, keys, values, idx, mask, cache=cache)
             return self.o_proj(out.transpose(0, 2, 1, 3).reshape(B, L, -1))
         total = ctx.offset + L
         nblk = -(-total // p.block_size)

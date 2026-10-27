@@ -4571,6 +4571,72 @@ class TestUnlimitedOCR2Dash:
                 assert np.allclose(np.array(dense), np.array(prefilled), atol=1e-5)
                 assert np.allclose(np.array(dense), np.array(gathered), atol=1e-5)
 
+    @pytest.mark.skipif(not mx.metal.is_available(), reason="needs Metal")
+    def test_decode_kernel_matches_compiled_select(self):
+        from mlx_vlm.models.unlimited_ocr import dash_kernels
+        from mlx_vlm.models.unlimited_ocr.dash import (
+            DashParams,
+            _decode_select,
+            block_capacity,
+        )
+
+        sparse, _ = self.params(
+            sparse_block_size=32,
+            sparse_local_block=4,
+            sparse_index_dim=128,
+            dash_topk_blocks=12,
+        )
+        p = DashParams.from_config(sparse, 1, 128)
+        heads, d, scale = 10, 128, 128**-0.5
+        rng = np.random.default_rng(11)
+        # No remote block, partial blocks, several capacities, both dtypes.
+        cases = [(100, mx.float32), (700, mx.float32), (2100, mx.float32)]
+        cases += [(1500, mx.bfloat16), (4100, mx.bfloat16)]
+        for pos, dtype in cases:
+            nblk = -(-(pos + 1) // p.block_size)
+            cap = block_capacity(nblk)
+            alloc = -(-(pos + 1) // 256) * 256
+            keys = mx.array(rng.normal(size=(1, heads, alloc, d))).astype(dtype)
+            values = mx.array(rng.normal(size=(1, heads, alloc, d))).astype(dtype)
+            q = mx.array(rng.normal(size=(1, heads, 1, d))).astype(dtype)
+            idx_q = mx.array(rng.normal(size=(1, 128)).astype(np.float32))
+            n_sum = (pos + 1) // p.block_size
+            summ = np.zeros((cap, 128), np.float32)
+            summ[:n_sum] = rng.normal(size=(n_sum, 128))
+            summ = mx.array(summ)
+            pos_a = mx.array(pos, dtype=mx.int32)
+            consts = dash_kernels.decode_consts(
+                p.idx_scale[0], p.floor[0], scale, p, 128
+            )
+            assert dash_kernels.decode_supported(p, heads, d, 128, cap)
+            for allow in (np.ones(nblk, bool), np.arange(nblk) % 5 == 1):
+                cand = np.zeros((1, cap), bool)
+                cand[0, :nblk] = allow
+                cand = mx.array(cand)
+                idx, mask = _decode_select(
+                    idx_q,
+                    summ,
+                    cand,
+                    pos_a,
+                    mx.array(p.idx_scale[0]),
+                    mx.array(p.floor[0]),
+                    p,
+                )
+                ref = mx.fast.scaled_dot_product_attention(
+                    q,
+                    mx.take(keys[..., : pos + 1, :], idx, axis=2),
+                    mx.take(values[..., : pos + 1, :], idx, axis=2),
+                    scale=scale,
+                    mask=mask.astype(dtype)[None, None, None],
+                )
+                out = dash_kernels.dash_decode(
+                    q, keys, values, idx_q, summ, cand, pos_a, consts, p
+                )
+                err = np.abs(
+                    np.array(out.astype(mx.float32)) - np.array(ref.astype(mx.float32))
+                ).max()
+                assert err < (1e-5 if dtype == mx.float32 else 2e-2), (pos, err)
+
     def test_entmax15_is_a_sparse_distribution(self):
         from mlx_vlm.models.unlimited_ocr.dash import entmax15
 
