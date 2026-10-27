@@ -2687,3 +2687,23 @@ def test_rfdetr_backbone_attention_matches_softmax_reference(batch, tokens):
     scores = mx.softmax((q @ k.transpose(0, 1, 3, 2)) * attention.scale, axis=-1)
     expected = (scores @ v).transpose(0, 2, 1, 3).reshape(batch, tokens, 48)
     _assert_allclose(attention(x), attention.o_proj(expected))
+
+
+def test_lfm3_partial_rope_preserves_pairs_in_both_halves():
+    module = importlib.import_module("mlx_vlm.models.lfm3.language")
+    rope = module.RotaryEmbedding(
+        8, {"rope_theta": 10000, "partial_rotary_factor": 0.5}
+    )
+    x = mx.arange(16, dtype=mx.float32).reshape(1, 1, 2, 8) + 1
+    y = np.asarray(rope(x, offset=9))
+    np.testing.assert_array_equal(
+        y[..., [2, 3, 6, 7]], np.asarray(x)[..., [2, 3, 6, 7]]
+    )
+    angles = np.arange(9, 11)[:, None] * np.array([1, 10000 ** (-2 / 8)])
+    a, b = np.asarray(x)[..., :2], np.asarray(x)[..., 4:6]
+    np.testing.assert_allclose(
+        y[..., :2], a * np.cos(angles) - b * np.sin(angles), atol=2e-6
+    )
+    np.testing.assert_allclose(
+        y[..., 4:6], b * np.cos(angles) + a * np.sin(angles), atol=2e-6
+    )

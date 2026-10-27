@@ -2222,6 +2222,42 @@ def test_prompt_does_not_leak_image_payload(representation):
 
 
 class TestApplyChatTemplateIntegration:
+    def test_lfm3_speech_models_put_the_audio_before_the_text(self):
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "lfm3_audio"},
+            "What is said?",
+            return_messages=True,
+            num_images=0,
+            num_audios=1,
+        )
+        assert [item["type"] for item in result[0]["content"]] == ["audio", "text"]
+        result = apply_chat_template(
+            None,
+            {"model_type": "lfm3_omni"},
+            "What is shown and said?",
+            return_messages=True,
+            num_images=1,
+            num_audios=1,
+        )
+        types = [item["type"] for item in result[0]["content"]]
+        assert types == ["image", "audio", "text"]
+
+    def test_assistant_reasoning_content_is_preserved(self):
+        messages = [
+            {"role": "user", "content": "What is 17 + 25?"},
+            {"role": "assistant", "content": "42", "reasoning_content": "7+5=12"},
+        ]
+
+        result = apply_chat_template(
+            None, {"model_type": "lfm3"}, messages, return_messages=True
+        )
+
+        assert result[1]["reasoning_content"] == "7+5=12"
+        assert "reasoning_content" not in result[0]
+
     """Integration tests for apply_chat_template with multimodal content.
 
     These tests verify the actual bug fix works end-to-end, not just the helper.
@@ -4401,3 +4437,310 @@ class TestMiniCPMOcrProcessor:
         actual = loaded(text="<|image_pad|>", images=[image])
         np.testing.assert_array_equal(actual["tgt_sizes"][0], expected["tgt_sizes"][0])
         np.testing.assert_array_equal(actual["input_ids"], expected["input_ids"])
+
+
+@pytest.fixture
+def lfm3_processor():
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+
+    module = importlib.import_module("mlx_vlm.models.lfm3_vl.processing_lfm3_vl")
+    image_module = importlib.import_module(
+        "mlx_vlm.models.qwen3_vl.processing_qwen3_vl"
+    )
+    tokens = ["<unk>", "<|image|>", "<|video|>", "<|vision_start|>", "<|vision_end|>"]
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(
+            WordLevel(dict(zip(tokens, range(len(tokens)))), unk_token="<unk>")
+        ),
+        unk_token="<unk>",
+        additional_special_tokens=tokens[1:],
+    )
+    return module.Lfm3VlProcessor(
+        image_module.Qwen3VLImageProcessor(min_pixels=4096, max_pixels=16384),
+        tokenizer,
+        module.Lfm3VlVideoProcessor(min_pixels=4096, max_pixels=65536),
+    )
+
+
+def test_lfm3_media_placeholders_are_validated_without_replacing_inserted_tokens():
+    module = importlib.import_module("mlx_vlm.models.lfm3_vl.processing_lfm3_vl")
+    result = module.Lfm3VlProcessor._expand(
+        ["a<|image|>b<|image|>c"], "<|image|>", ["<|image|>" * 2, "<|image|>" * 3]
+    )
+    assert result == ["a<|image|><|image|>b<|image|><|image|><|image|>c"]
+    with pytest.raises(ValueError, match="placeholders"):
+        module.Lfm3VlProcessor._expand(["a"], "<|image|>", ["image"])
+    with pytest.raises(ValueError, match="placeholders"):
+        module.Lfm3VlProcessor._expand(["<|image|>"], "<|image|>", [])
+
+
+def test_lfm3_processor_save_preserves_resolution_override(tmp_path, lfm3_processor):
+    processor = lfm3_processor
+    processor.image_processor.max_pixels = 4096
+    image = Image.fromarray(np.zeros((128, 128, 3), dtype=np.uint8))
+    expected = processor(text="<|image|>", images=image, return_tensors="np")
+    processor.save_pretrained(tmp_path)
+    restored = type(processor).from_pretrained(tmp_path)
+    actual = restored(text="<|image|>", images=image, return_tensors="np")
+    for name in expected:
+        np.testing.assert_array_equal(actual[name], expected[name])
+
+
+def test_lfm3_video_timestamps_use_sampled_fps_and_repeat_the_last_odd_frame(
+    lfm3_processor,
+):
+    processor = lfm3_processor
+    tokenizer = processor.tokenizer
+
+    class RecordingTokenizer:
+        def __call__(self, text, **kwargs):
+            self.text = text
+            return tokenizer(text, **kwargs)
+
+    processor.tokenizer = RecordingTokenizer()
+    frames = np.stack(
+        [np.full((64, 64, 3), value, dtype=np.uint8) for value in (0, 100, 255)]
+    )
+    result = processor(
+        text="<|video|>", videos=[frames], fps=[2.0], return_tensors="np"
+    )
+    text = processor.tokenizer.text[0]
+    assert "<0.2 seconds>" in text  # average of frames at 0.0 and 0.5 seconds
+    assert "<1.0 seconds>" in text  # the final frame is duplicated, not extrapolated
+    np.testing.assert_array_equal(result["video_grid_thw"], [[2, 4, 4]])
+    np.testing.assert_allclose(result["pixel_values_videos"][-16:], 1.0)
+    with pytest.raises(ValueError, match="pre-sampled"):
+        processor(text="<|video|>", videos=[frames], do_sample_frames=True)
+    # the reference rounds fps to 6 decimals: (1499 + 1501) / 2 / 29.97 = 50.05
+    processor(
+        text="<|video|>",
+        videos=[frames[:2]],
+        video_metadata=[dict(fps=30000 / 1001, frames_indices=[1499, 1501])],
+    )
+    assert "<50.0 seconds>" in processor.tokenizer.text[0]
+    # 35 / 30 + 52 / 30 averages to 1.5, the mean index / 30 to 1.4
+    processor(
+        text="<|video|>",
+        videos=[frames[:2]],
+        video_metadata=[dict(fps=30.0, frames_indices=[35, 52])],
+    )
+    assert "<1.5 seconds>" in processor.tokenizer.text[0]
+
+
+@pytest.mark.parametrize(
+    "total, source_fps, max_frames, expected",
+    [
+        (81, 30.0, None, [0, 20, 40, 60, 80]),  # odd counts are not floored
+        (10, 30.0, None, [0, 3, 6, 9]),  # min_frames
+        (3, 30.0, None, [0, 1, 2]),  # never more than the clip has
+        (1000, 10.0, 8, [0, 143, 285, 428, 571, 714, 856, 999]),
+    ],
+)
+def test_lfm3_video_sampling_follows_the_reference_rule(
+    lfm3_processor, total, source_fps, max_frames, expected
+):
+    sampler = lfm3_processor.video_processor
+    assert sampler.sample_frames_in_loader
+    metadata = SimpleNamespace(total_num_frames=total, fps=source_fps)
+    actual = sampler.sample_frames(metadata, fps=2.0, max_frames=max_frames)
+    assert actual.tolist() == expected
+
+
+def test_lfm3_video_file_keeps_odd_frame_counts_and_source_times(
+    tmp_path, lfm3_processor
+):
+    import cv2
+
+    from mlx_vlm.utils import prepare_inputs
+
+    path = str(tmp_path / "clip.mp4")
+    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), 30.0, (64, 64))
+    for i in range(105):
+        writer.write(np.full((64, 64, 3), i, dtype=np.uint8))
+    writer.release()
+    processor = lfm3_processor
+    tokenizer = processor.tokenizer
+    tokenizer.pad_token = tokenizer.unk_token
+
+    class RecordingTokenizer:
+        pad_token = tokenizer.unk_token
+
+        def __call__(self, text, **kwargs):
+            self.text = text
+            return tokenizer(text, **kwargs)
+
+    processor.tokenizer = RecordingTokenizer()
+    result = prepare_inputs(processor, prompts="<|video|>", videos=[path])
+    # 3.5 s at 2 fps: 7 frames (0, 17, 35, 52, 69, 87, 104), the last repeated
+    times = re.findall(r"<[0-9.]+ seconds>", processor.tokenizer.text[0])
+    assert times == [
+        "<0.3 seconds>",
+        "<1.5 seconds>",
+        "<2.6 seconds>",
+        "<3.5 seconds>",
+    ]
+    assert np.array(result["video_grid_thw"])[0, 0] == 4
+
+
+def test_lfm3_vl_chat_messages_carry_videos():
+    from mlx_vlm.prompt_utils import apply_chat_template
+
+    messages = apply_chat_template(
+        None,
+        {"model_type": "lfm3_vl"},
+        "Describe.",
+        video="clip.mp4",
+        return_messages=True,
+    )
+    assert [item["type"] for item in messages[0]["content"]] == ["video", "text"]
+    # a system prompt does not get a copy of the video
+    messages = apply_chat_template(
+        None,
+        {"model_type": "lfm3_omni"},
+        [{"role": "system", "content": "Answer."}, "Describe."],
+        video="clip.mp4",
+        num_audios=1,
+        return_messages=True,
+    )
+    assert [[item["type"] for item in m["content"]] for m in messages] == [
+        ["text"],
+        ["video", "audio", "text"],
+    ]
+
+
+def test_lfm3_omni_wraps_each_media_span_once_and_expands_speech():
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+
+    from mlx_vlm.models.lfm3_omni.processing_lfm3_omni import Lfm3OmniProcessor
+    from mlx_vlm.models.lfm3_vl.processing_lfm3_vl import Lfm3VlVideoProcessor
+    from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLImageProcessor
+
+    tokens = ["<unk>", "<|image|>", "<|video|>", "<|vision_start|>"]
+    tokens += ["<|vision_end|>", "<|audio|>", "<|audio_out|>"]
+    tokens += ["<|audio_start|>", "<|mixed_start|>"]
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(
+            WordLevel(dict(zip(tokens, range(len(tokens)))), unk_token="<unk>")
+        ),
+        unk_token="<unk>",
+        additional_special_tokens=tokens[1:],
+    )
+    processor = Lfm3OmniProcessor(
+        Qwen3VLImageProcessor(min_pixels=4096, max_pixels=16384),
+        tokenizer,
+        Lfm3VlVideoProcessor(min_pixels=4096, max_pixels=65536),
+    )
+    assert processor.additional_eos_token_ids == [7, 8]
+    assert processor.feature_extractor.sampling_rate == 16000
+
+    class RecordingTokenizer:
+        def __call__(self, text, **kwargs):
+            self.text = text
+            return tokenizer(text, **kwargs)
+
+    processor.tokenizer = RecordingTokenizer()
+    span = "<|vision_start|>{}<|vision_end|>".format
+    media = dict(
+        images=Image.fromarray(np.zeros((64, 64, 3), dtype=np.uint8)),
+        videos=[np.zeros((2, 64, 64, 3), dtype=np.uint8)],
+        video_metadata=[dict(fps=2.0, frames_indices=[0, 1])],
+        audio=[np.zeros(16000, np.float32)],
+        audio_out_codes=[np.ones((2, 12))],
+        return_tensors="np",
+    )
+    # the chat template's spans, or bare placeholders: one span pair each
+    for text in (
+        span("<|image|>") + span("<|audio|>") + "x" + span("<|video|>"),
+        "<|image|><|audio|>x<|video|>",
+    ):
+        result = processor(text=text + "<|audio_out|>", **media)
+        assert processor.tokenizer.text == [
+            span("<|image|>" * 4)
+            + span("<|audio|>" * 13)  # 99 feature frames / 8
+            + "x"
+            + span("<0.2 seconds>" + span("<|video|>" * 4))
+            + "<|audio_out|>" * 3  # 2 frames and the end-of-speech frame
+        ]
+    assert result["input_features"].shape == (1, 128, 99)
+    assert result["audio_out_codes"].shape == (3, 12)
+    np.testing.assert_array_equal(result["image_grid_thw"], [[1, 4, 4]])
+    np.testing.assert_array_equal(result["video_grid_thw"], [[1, 4, 4]])
+    # (35 + 52) / 60 = 1.45 rounds down, unlike LFM3-VL's 35 / 30 + 52 / 30
+    processor(
+        text="<|video|>",
+        videos=media["videos"],
+        video_metadata=[dict(fps=30.0, frames_indices=[35, 52])],
+    )
+    assert "<1.4 seconds>" in processor.tokenizer.text[0]
+    with pytest.raises(ValueError, match="hop_length"):
+        Lfm3OmniProcessor(
+            processor.image_processor,
+            tokenizer,
+            processor.video_processor,
+            processor_config={"feature_extractor": {"hop_length": 320}},
+        )
+
+
+def test_lfm3_audio_processor_expands_speech_placeholders():
+    from mlx_vlm.models.lfm3_audio.processing_lfm3_audio import Lfm3AudioProcessor
+    from mlx_vlm.utils import prepare_inputs
+
+    class Tokenizer:
+        pad_token = "<pad>"
+
+        def convert_tokens_to_ids(self, tokens):
+            return [1, 2]
+
+        def __call__(self, texts, **kwargs):
+            self.texts = texts
+            return {"input_ids": [[0]] * len(texts)}
+
+    processor = Lfm3AudioProcessor(Tokenizer())
+    assert processor.additional_eos_token_ids == [1, 2]
+    clips = [np.zeros(16000, np.float32), np.zeros(5921, np.float32)]
+    out = processor(
+        text="a<|audio|>b<|audio|><|audio_out|>c",
+        audio=clips,
+        audio_out_codes=[np.ones((3, 12))],
+    )
+    # 99 and 36 feature frames -> 13 and 5 encoder tokens; 3 frames + EOS frame
+    assert processor.tokenizer.texts == [
+        "a" + "<|audio|>" * 13 + "b" + "<|audio|>" * 5 + "<|audio_out|>" * 4 + "c"
+    ]
+    assert out["input_features"].shape == (2, 128, 99)
+    assert out["feature_attention_mask"].sum(-1).tolist() == [99, 36]
+    assert out["audio_out_codes"].tolist() == [[1] * 12] * 3 + [[2016] * 12]
+    with pytest.raises(ValueError, match="placeholders"):
+        processor(text="<|audio|>", audio=clips)
+    # codebook-major [12, frames] codes (result.audio_tokens) are refused
+    with pytest.raises(ValueError, match=r"\[frames, 12\]"):
+        processor(text="<|audio_out|>", audio_out_codes=[np.ones((12, 3))])
+    # prior speech without user audio still goes through the processor
+    inputs = prepare_inputs(
+        processor, prompts="<|audio_out|>c", audio_out_codes=[np.ones((2, 12))]
+    )
+    assert processor.tokenizer.texts == ["<|audio_out|>" * 3 + "c"]
+    assert inputs["audio_out_codes"].shape == (3, 12)
+    # every clip reaches the processor, one per <|audio|>
+    with patch("mlx_vlm.utils.load_audio", side_effect=lambda clip, sr: clip):
+        inputs = prepare_inputs(processor, audio=clips, prompts="<|audio|><|audio|>")
+    assert inputs["feature_attention_mask"].shape == (2, 99)
+
+
+def test_load_processor_keeps_processor_stop_ids():
+    processor = SimpleNamespace(
+        additional_eos_token_ids=[9], tokenizer=SimpleNamespace()
+    )
+    with (
+        patch("mlx_vlm.utils.AutoProcessor.from_pretrained", return_value=processor),
+        patch("mlx_vlm.utils.load_tokenizer", return_value=lambda tokenizer: None),
+    ):
+        load_processor(Path("/tmp/model"), eos_token_ids=[2])
+    criteria = processor.tokenizer.stopping_criteria
+    assert criteria.eos_token_ids == [2, 9]
+    criteria.reset([5])
+    assert criteria.eos_token_ids == [5, 9]

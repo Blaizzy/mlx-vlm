@@ -821,6 +821,17 @@ def test_unload_model_cache_group_resets_apc_around_generator_shutdown(monkeypat
     assert server.runtime.apc_manager is None
 
 
+def test_load_model_resources_refuses_d1_decision_models(monkeypatch):
+    d1_model = NS(system_one=lambda *_: None, config=None)
+    monkeypatch.setattr(generation, "load", lambda *_, **__: (d1_model, None))
+
+    with pytest.raises(HTTPException) as exc_info:
+        generation.load_model_resources("d1-2B", None)
+
+    assert exc_info.value.status_code == 400
+    assert "system_one" in exc_info.value.detail
+
+
 def test_unsupported_model_request_does_not_crash_server(client, monkeypatch):
     def reject_model(*_args, **_kwargs):
         raise ValueError("Model type bert not supported.")
