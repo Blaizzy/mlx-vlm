@@ -46,6 +46,12 @@ class UnlimitedOCRProcessor(DeepseekOCRProcessor):
                 processor_config = json.load(f)
 
         processor_config.pop("processor_class", None)
+        config_path = path / "config.json"
+        if config_path.exists():
+            with open(config_path, encoding="utf-8") as f:
+                sparse = json.load(f).get("sparse_attention_config")
+            if isinstance(sparse, dict) and sparse.get("training_stage") == "dash":
+                processor_config.setdefault("page_layout", True)
         processor_config.update(kwargs)
         tokenizer = PreTrainedTokenizerFast.from_pretrained(path)
         return cls(tokenizer=tokenizer, **processor_config)
@@ -65,6 +71,8 @@ class UnlimitedOCRProcessor(DeepseekOCRProcessor):
         sft_format: str = "unlimitedocr",
         mask_prompt: bool = False,
         ignore_id: int = -100,
+        page_layout: bool = False,
+        max_crops: int = None,
         **kwargs,
     ):
         super().__init__(
@@ -86,6 +94,22 @@ class UnlimitedOCRProcessor(DeepseekOCRProcessor):
 
         # Unlimited-OCR's released tokenizer already contains <image> at 128815.
         self.image_token_id = tokenizer.vocab.get(image_token, 128815)
+        # Unlimited-OCR-2 prompt layout: one <PAGE> marker before every page image,
+        # gundam tiles (<= 16) for a single page, one 1024 base view per page otherwise.
+        self.page_layout = page_layout
+        self.max_crops = max_crops or (16 if page_layout else 32)
+
+    def page_prompt(self, prompt: str, num_images: int) -> str:
+        """Rewrite ``prompt`` into the trained ``<PAGE><image>...`` layout."""
+        if not self.page_layout or not num_images or "<PAGE>" in prompt:
+            return prompt
+        marked = "<PAGE>" + self.image_token
+        placeholders = prompt.count(self.image_token)
+        if placeholders == 0:
+            return marked * num_images + prompt
+        if placeholders == 1:
+            return prompt.replace(self.image_token, marked * num_images)
+        return prompt.replace(self.image_token, marked)
 
     def process_one(
         self,
@@ -145,6 +169,9 @@ class UnlimitedOCRProcessor(DeepseekOCRProcessor):
     ):
         patch_size = self.patch_size
         downsample_ratio = self.downsample_ratio
+        if self.page_layout:
+            conversation = self.page_prompt(conversation, len(images))
+            cropping = cropping and len(images) == 1
         valid_img_tokens = 0
         ratio = 1
 
@@ -183,7 +210,7 @@ class UnlimitedOCRProcessor(DeepseekOCRProcessor):
                     images_crop_raw = []
                 else:
                     images_crop_raw, crop_ratio = dynamic_preprocess(
-                        image, min_num=2, max_num=32, image_size=image_size
+                        image, min_num=2, max_num=self.max_crops, image_size=image_size
                     )
 
                 global_view = ImageOps.pad(
@@ -234,6 +261,26 @@ class UnlimitedOCRProcessor(DeepseekOCRProcessor):
                 tokenized_str += tokenized_image
                 images_seq_mask += [True] * len(tokenized_image)
 
+            elif self.page_layout:
+                # Base mode: the page is padded straight into the global view.
+                global_view = ImageOps.pad(
+                    image,
+                    (base_size, base_size),
+                    color=tuple(int(x * 255) for x in self.image_transform.mean),
+                )
+                images_list.append(
+                    self.image_transform(global_view).astype(mx.bfloat16)
+                )
+                images_spatial_crop.append([1, 1])
+                num_queries_base = math.ceil(
+                    (base_size // patch_size) / downsample_ratio
+                )
+                tokenized_image = (
+                    [self.image_token_id] * num_queries_base + [self.image_token_id]
+                ) * num_queries_base
+                tokenized_image += [self.image_token_id]
+                tokenized_str += tokenized_image
+                images_seq_mask += [True] * len(tokenized_image)
             else:
                 if image_size <= 640:
                     image = image.resize((image_size, image_size))

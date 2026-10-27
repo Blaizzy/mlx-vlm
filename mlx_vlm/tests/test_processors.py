@@ -1079,6 +1079,27 @@ def test_unlimited_ocr_default_chat_template_omits_trailing_space():
     assert rendered == "<image>document parsing. partial continue"
 
 
+@pytest.mark.parametrize(
+    "prompt,num_images,expected",
+    [
+        ("Multi page parsing.", 2, "<PAGE><image><PAGE><image>Multi page parsing."),
+        (
+            "<image>Multi page parsing.",
+            2,
+            "<PAGE><image><PAGE><image>Multi page parsing.",
+        ),
+        ("<image>a<image>b", 2, "<PAGE><image>a<PAGE><image>b"),
+        ("<PAGE><image>Multi page parsing.", 1, "<PAGE><image>Multi page parsing."),
+    ],
+)
+def test_unlimited_ocr2_page_prompt_layout(prompt, num_images, expected):
+    p = object.__new__(c.ocr)
+    p.page_layout, p.image_token = True, "<image>"
+    assert p.page_prompt(prompt, num_images) == expected
+    p.page_layout = False
+    assert p.page_prompt(prompt, num_images) == prompt
+
+
 @pytest.mark.parametrize("name,start,end", DATA["cleanup"])
 def test_output_control_tokens(name, start, end):
     cls = (

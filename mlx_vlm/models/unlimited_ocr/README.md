@@ -4,6 +4,33 @@ Unlimited-OCR is Baidu's OCR/document-parsing model for **one-shot long-horizon 
 
 This README only documents the prompt formats and settings that are either shown by upstream or verified in the MLX implementation.
 
+## Unlimited-OCR-2
+
+[`baidu/Unlimited-OCR-2`](https://huggingface.co/baidu/Unlimited-OCR-2) loads through the same module. It keeps the vision stack and adds a trained decoder attention path (`sparse_attention_config.training_stage == "dash"`):
+
+- **page2d RoPE**: every position gets a (token-in-page, page) coordinate. Each prompt image is preceded by a `<PAGE>` marker; the page index restarts for the answer, and a generated `<PAGE>` advances it.
+- **DASH block-sparse attention**: keys are grouped in 32-token blocks. Each query attends a 128-token local window plus the 12 remote blocks picked by a small per-layer router (`self_attn.dash_router.*`: block summaries via a learned `head_cls` query, top-16 scores, 1.5-entmax prior as a log-bias). Prefill queries are restricted to the image blocks of their own page.
+- Outputs use `<PAGE>`, `<BLOCK>label[x0, y0, x1, y1]<FORK>text`, and `cross_text` / `append_text` labels for paragraphs that continue across a page break.
+
+The processor detects v2 from `config.json` and rewrites the prompt into the trained `<PAGE><image>...` layout, so the prompt text is the same as for v1:
+
+```bash
+# One page: gundam mode (1024 global view + up to 16 local crops).
+mlx_vlm.generate --model baidu/Unlimited-OCR-2 --image page.png \
+    --prompt "Multi page parsing." --max-tokens 8192
+
+# Several pages in one request: one 1024 base view (273 tokens) per page.
+mlx_vlm.generate --model baidu/Unlimited-OCR-2 --image page_0001.png page_0002.png \
+    --prompt "Multi page parsing." --max-tokens 16384
+```
+
+MLX implementation notes (`dash.py`):
+
+- Decode gathers only the selected blocks and the local window (`12 × 32 + 128 = 512` keys) instead of masking the whole cache, so the per-token attention cost does not grow with the document.
+- Block summaries are computed once, when a block completes. Page/RoPE/candidate state for decode stays on device (no host sync per token).
+- The decode-step router and selection are `mx.compile`d on a block capacity that changes every 64 blocks.
+- `dash_router` weights stay dense when quantizing (`quant_predicate`); the warmup-stage `indexer` weights are dropped. Batch size 1 only.
+
 ## Model Architecture
 
 ```

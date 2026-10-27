@@ -4435,3 +4435,171 @@ class TestPhiMoE:
         )
 
         assert isinstance(Attention(config).rope, nn.RoPE)
+
+
+class TestUnlimitedOCR2Dash:
+    """Unlimited-OCR-2 DASH attention: gathered decode, cached summaries, pages."""
+
+    PAGE, IMAGE = 7, 9
+
+    def params(self, **overrides):
+        from mlx_vlm.models.unlimited_ocr.dash import DashParams
+
+        sparse = {
+            "training_stage": "dash",
+            "use_sparse_attention": True,
+            "dash_stage0": "head_cls",
+            "sparse_block_size": 4,
+            "sparse_local_block": 2,
+            "sparse_index_dim": 8,
+            "dash_topk_blocks": 2,
+            "image_token_id": self.IMAGE,
+            "page_token_id": self.PAGE,
+            "per_page_image_tokens": 6,
+            "sparse_main_rope_mode": "page2d",
+            "sparse_rope_page_pairs": 1,
+            "sparse_main_rope_tok_freq_mode": "resample",
+            "sparse_rope_page_mod": 2,
+            **overrides,
+        }
+        return sparse, DashParams.from_config(sparse, 2, 8)
+
+    def language_model(self):
+        from mlx_vlm.models.unlimited_ocr.config import TextConfig
+        from mlx_vlm.models.unlimited_ocr.language import LanguageModel
+
+        sparse, _ = self.params()
+        config = TextConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            moe_intermediate_size=8,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            n_shared_experts=1,
+            n_routed_experts=4,
+            num_experts_per_tok=2,
+            first_k_dense_replace=1,
+            sparse_attention_config=sparse,
+        )
+        mx.random.seed(3)
+        model = LanguageModel(config)
+        model.update(
+            tree_map(lambda w: mx.random.normal(w.shape) * 0.5, model.parameters())
+        )
+        return model
+
+    def prompt(self):
+        page = [self.PAGE] + [self.IMAGE] * 6
+        return [1, 2, 3] + page * 3 + [4, 5, 6, 2, 3]
+
+    def test_decode_gather_matches_dense_mask(self):
+        from mlx_vlm.models.unlimited_ocr.config import TextConfig
+        from mlx_vlm.models.unlimited_ocr.dash import (
+            DashAttention,
+            _decode_select,
+            block_capacity,
+            block_scores,
+            route_select,
+        )
+
+        _, p = self.params(dash_topk_blocks=3, sparse_local_block=1)
+        attn = DashAttention(
+            TextConfig(hidden_size=16, num_attention_heads=2, num_key_value_heads=2),
+            0,
+            p,
+        )
+        rng = np.random.default_rng(5)
+        for pos in (2, 9, 21, 22):  # no remote block / partial blocks
+            nblk = -(-(pos + 1) // p.block_size)
+            cap = block_capacity(nblk)
+            q = mx.array(rng.normal(size=(1, 2, 1, 8)).astype(np.float32))
+            keys = mx.array(rng.normal(size=(1, 2, pos + 1, 8)).astype(np.float32))
+            values = mx.array(rng.normal(size=(1, 2, pos + 1, 8)).astype(np.float32))
+            idx_q = mx.array(rng.normal(size=(1, 8)).astype(np.float32))
+            n_sum = (pos + 1) // p.block_size
+            summ = rng.normal(size=(n_sum, 8)).astype(np.float32)
+            for allow in (np.ones(nblk, bool), np.arange(nblk) == 1):
+                scores = block_scores(
+                    idx_q, mx.array(summ) if n_sum else None, mx.array([pos]), nblk, p
+                )
+                topi, bias, valid = route_select(
+                    scores, mx.array(allow[None]), attn.idx_scale, attn.floor, p
+                )
+                dense = attn._prefill(q, keys, values, topi, bias, valid, pos, nblk)
+                padded = np.zeros((cap, 8), np.float32)
+                padded[:n_sum] = summ
+                cand = np.zeros((1, cap), bool)
+                cand[0, :nblk] = allow
+                idx, mask = _decode_select(
+                    idx_q,
+                    mx.array(padded),
+                    mx.array(cand),
+                    mx.array(pos),
+                    *attn._decode_consts,
+                    p,
+                )
+                gathered = attn._decode(q, keys, values, idx, mask)
+                assert np.allclose(np.array(dense), np.array(gathered), atol=1e-5)
+
+    def test_entmax15_is_a_sparse_distribution(self):
+        from mlx_vlm.models.unlimited_ocr.dash import entmax15
+
+        x = mx.array([[3.0, 2.9, 0.5, -1e4], [1.0, 1.0, 1.0, 1.0]])
+        prior = np.array(entmax15(x))
+        assert np.allclose(prior.sum(-1), 1.0, atol=1e-5)
+        assert prior[0, 3] == 0 and prior[0, 0] > prior[0, 1] > prior[0, 2]
+        assert np.allclose(prior[1], 0.25, atol=1e-5)
+
+    def test_prompt_pages_coordinates_and_candidates(self):
+        from mlx_vlm.models.unlimited_ocr.dash import PromptPages
+
+        _, p = self.params()
+        ids = np.array(self.prompt())
+        pages = PromptPages(ids, p)
+        tok, page = pages.coords
+        # BOS + instruction bucket is page 0; each <PAGE> opens the next page.
+        # The instruction after the last image goes back to that bucket.
+        assert page.tolist() == [0] * 3 + [1] * 7 + [2] * 7 + [3] * 7 + [0] * 5
+        assert tok[:4].tolist() == [0, 1, 2, 0] and tok[-1] == 7
+        assert pages.n_pages == 4 and np.array(pages.pf_cnt).tolist() == [3, 7, 7, 7]
+        cand = np.array(pages.prefill_candidates(np.arange(len(ids)), 8))
+        # A page-2 query (position 12) only sees blocks holding page-2 images.
+        assert cand[12].tolist() == [
+            False,
+            False,
+            True,
+            True,
+            True,
+            False,
+            False,
+            False,
+        ]
+        # The answer has no page yet: it falls back to every block.
+        assert cand[-1].all()
+
+    def test_chunked_prefill_and_decode_match_full_prefill(self):
+        model = self.language_model()
+        ids = mx.array([self.prompt()])
+        n = ids.shape[1]
+
+        full = model(ids, cache=model.make_cache()).logits
+        cache = model.make_cache()
+        model._prompt_ids = np.array(ids[0])
+        chunks = []
+        for c0, c1 in ((0, 9), (9, 22), (22, n)):
+            chunks.append(model(ids[:, c0:c1], cache=cache).logits)
+        assert np.allclose(
+            np.array(mx.concatenate(chunks, axis=1)), np.array(full), atol=1e-4
+        )
+
+        # Decode keeps one step's cost bounded and stays finite over block edges.
+        token = mx.argmax(chunks[-1][:, -1], axis=-1, keepdims=True)
+        for _ in range(9):
+            logits = model(token, cache=cache).logits
+            assert logits.shape == (1, 1, 32)
+            assert np.isfinite(np.array(logits)).all()
+            token = mx.argmax(logits[:, -1], axis=-1, keepdims=True)
+        assert cache[0].offset == n + 9
+        assert cache[0].num_summaries == (n + 9) // 4
