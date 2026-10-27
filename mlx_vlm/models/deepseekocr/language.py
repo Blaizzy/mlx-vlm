@@ -1,16 +1,18 @@
 import math
+from functools import lru_cache
 from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from ...kernels import moe_softmax_topk, moe_swiglu_4bit
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
 )
 from ..mlp import DeepseekMLP as DeepseekV2MLP
-from ..switch_layers import SwitchGLU
+from ..switch_layers import QuantizedSwitchLinear, SwitchGLU
 from .config import TextConfig
 
 
@@ -286,6 +288,137 @@ class LlamaAttention(nn.Module):
         return self.o_proj(output)
 
 
+def _fused_decode_token(x: mx.array) -> bool:
+    """One bfloat16 token on Metal: the fused MoE decode kernels apply."""
+    return (
+        x.ndim == 3
+        and x.shape[0] * x.shape[1] == 1
+        and x.dtype == mx.bfloat16
+        and mx.default_device() == mx.gpu
+        and mx.metal.is_available()
+    )
+
+
+def _affine4_stack(linear, dtype):
+    """``(weight, scales, biases)`` of an affine 4-bit quantized projection,
+    or None when the fused kernels do not cover it. A dense
+    ``nn.QuantizedLinear`` is one expert; a ``QuantizedSwitchLinear`` a stack."""
+    if (
+        not isinstance(linear, (QuantizedSwitchLinear, nn.QuantizedLinear))
+        or getattr(linear, "mode", "affine") != "affine"
+        or linear.bits != 4
+        or linear.group_size % 8
+        or linear.get("biases") is None
+        or "bias" in linear
+        or linear.scales.dtype != dtype
+        or linear.biases.dtype != dtype
+    ):
+        return None
+    return linear.weight, linear.scales, linear.biases
+
+
+def _fused_swiglu_stacks(owner, dtype):
+    """The gate/up/down stacks and group size of ``owner`` (a ``SwitchGLU``
+    or dense SwiGLU MLP) for ``moe_swiglu_4bit``, or None unless every
+    projection is affine 4-bit with kernel-friendly shapes. The answer is
+    cached on the owner until one of its weights is replaced."""
+    projections = (owner.gate_proj, owner.up_proj, owner.down_proj)
+    key = (*(id(p.get("weight")) for p in projections), dtype)
+    cached = owner.__dict__.get("_fused_swiglu_cache")
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    stacks = _fused_swiglu_stacks_uncached(projections, dtype)
+    # Bypasses nn.Module's attribute registration: not a parameter.
+    object.__setattr__(owner, "_fused_swiglu_cache", (key, stacks))
+    return stacks
+
+
+def _fused_swiglu_stacks_uncached(projections, dtype):
+    gate_proj, up_proj, down_proj = projections
+    stacks = [_affine4_stack(p, dtype) for p in projections]
+    if any(s is None for s in stacks):
+        return None
+    group_size = gate_proj.group_size
+    gate, up, down = stacks
+    I, D8 = gate[0].shape[-2:]
+    D = D8 * 8
+    E = gate[0].size // (I * D8)
+    if (
+        up_proj.group_size != group_size
+        or down_proj.group_size != group_size
+        or up[0].shape != gate[0].shape
+        or down[0].shape[-2:] != (D, I // 8)
+        or down[0].size != E * D * (I // 8)
+        or I % 8
+        or D % group_size
+        or I % group_size
+        or D % 4
+    ):
+        return None
+    return gate, up, down, group_size
+
+
+def fused_swiglu_experts(
+    x: mx.array,
+    inds: mx.array,
+    scores: mx.array,
+    switch_mlp,
+    shared_mlp=None,
+    addends=(),
+) -> Optional[mx.array]:
+    """The weighted routed SwiGLU experts of one token, plus the shared MLP
+    and ``addends``, as two kernels bit-identical to the ``gather_qmm``
+    graph; None when the inputs are outside the fused path (the caller
+    keeps its graph). x is (1, 1, D) and the result (1, 1, D); inds and
+    scores hold K values."""
+    if not _fused_decode_token(x) or not 1 <= inds.size <= 30:
+        return None
+    stacks = _fused_swiglu_stacks(switch_mlp, x.dtype)
+    if stacks is None:
+        return None
+    gate, up, down, group_size = stacks
+    D = x.shape[-1]
+    if gate[0].shape[-1] * 8 != D or any(a.shape != x.shape for a in addends):
+        return None
+    shared = None
+    if shared_mlp is not None:
+        shared = _fused_swiglu_stacks(shared_mlp, x.dtype)
+        if (
+            shared is None
+            or shared[3] != group_size
+            or shared[0][0].ndim != 2
+            or shared[0][0].shape[-1] * 8 != D
+        ):
+            return None
+        shared = shared[:3]
+    return moe_swiglu_4bit(
+        x,
+        inds,
+        scores,
+        gate,
+        up,
+        down,
+        group_size=group_size,
+        shared=shared,
+        addends=addends,
+    )
+
+
+@lru_cache
+def _one_expert(dtype: mx.Dtype):
+    """Expert 0 with weight one: a dense MLP as a one-expert stack."""
+    return mx.array([0], dtype=mx.uint32), mx.array([1.0], dtype=dtype)
+
+
+def fused_dense_swiglu(mlp, x: mx.array, addends=()) -> Optional[mx.array]:
+    """A dense SwiGLU MLP (``gate_proj``/``up_proj``/``down_proj``) of one
+    token as a single expert of the fused kernels, plus ``addends``."""
+    if not _fused_decode_token(x):
+        return None
+    inds, scores = _one_expert(x.dtype)
+    return fused_swiglu_experts(x, inds, scores, mlp, None, addends)
+
+
 class MoEGate(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
@@ -307,6 +440,19 @@ class MoEGate(nn.Module):
         layer_idx = getattr(self, "_layer_index", None)
 
         gates = x @ self.weight.T
+
+        if (
+            self.scoring_func == "softmax"
+            and self.topk_method == "greedy"
+            and self.n_routed_experts <= 128
+            and gates.dtype == mx.bfloat16
+            and _fused_decode_token(x)
+        ):
+            # softmax + argpartition + take_along_axis (+ scale) in one kernel,
+            # bit-identical to the graph below.
+            return moe_softmax_topk(
+                gates, top_k=self.top_k, route_scale=self.routed_scaling_factor
+            )
 
         if self.scoring_func == "softmax":
             scores = mx.softmax(gates, axis=-1, precise=True)  # type: ignore[call-arg]
@@ -396,13 +542,29 @@ class DeepseekV2MoE(nn.Module):
                 config=config, intermediate_size=intermediate_size
             )
 
-    def __call__(self, x):
+    def __call__(self, x, residual: Optional[mx.array] = None):
+        """The MoE output, plus ``residual`` when given (the decoder layer's
+        ``h + mlp(norm(h))``, so a single-token decode step can fold the
+        shared experts and the residual into the fused expert kernel)."""
         inds, scores = self.gate(x)
+        has_shared = self.config.n_shared_experts is not None
+        if not self.training and isinstance(self.switch_mlp, SwitchGLU):
+            y = fused_swiglu_experts(
+                x,
+                inds,
+                scores,
+                self.switch_mlp,
+                self.shared_experts if has_shared else None,
+                () if residual is None else (residual,),
+            )
+            if y is not None:
+                return y
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
-        if self.config.n_shared_experts is not None:
+        if has_shared:
             y = y + self.shared_experts(x)
-
+        if residual is not None:
+            y = y + residual
         return y
 
 
@@ -437,9 +599,19 @@ class DeepseekV2DecoderLayer(nn.Module):
     ) -> mx.array:
         r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = x + r
-        r = self.mlp(self.post_attention_layernorm(h))
-        out = h + r
-        return out
+        return self.mlp_residual(h)
+
+    def mlp_residual(self, h: mx.array) -> mx.array:
+        """``h + mlp(post_attention_layernorm(h))``; a single-token decode
+        step folds the residual into the fused expert kernel."""
+        normed = self.post_attention_layernorm(h)
+        if isinstance(self.mlp, DeepseekV2MoE):
+            return self.mlp(normed, residual=h)
+        if isinstance(self.mlp, DeepseekV2MLP) and not self.training:
+            out = fused_dense_swiglu(self.mlp, normed, (h,))
+            if out is not None:
+                return out
+        return h + self.mlp(normed)
 
 
 class DeepseekV2Model(nn.Module):

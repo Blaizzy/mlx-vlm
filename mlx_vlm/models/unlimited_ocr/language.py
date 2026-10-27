@@ -162,7 +162,7 @@ class DashDecoderLayer(DeepseekV2DecoderLayer):
 
     def __call__(self, x, ctx, cache):
         h = x + self.self_attn(self.input_layernorm(x), ctx, cache)
-        return h + self.mlp(self.post_attention_layernorm(h))
+        return self.mlp_residual(h)
 
 
 class DeepseekV2DashModel(DeepseekV2Model):
