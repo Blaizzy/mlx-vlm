@@ -2476,3 +2476,40 @@ def test_generate_step_evaluates_cache_periodically(max_tokens, cache_evals):
     assert eval_mock.call_count == 1 + cache_evals
     if cache_evals:
         eval_mock.assert_called_with([cache_state])
+
+
+def test_generate_step_applies_model_generation_guards():
+    from mlx_vlm.models.unlimited_ocr.guards import make_guards
+
+    page, eos = 3, 1
+    model = MagicMock(config=SimpleNamespace())
+    model.language_model.return_value = LanguageModelOutput(
+        logits=mx.array([[[0.0, 5.0, 0.0, 0.0]]])  # EOS is always the best token
+    )
+    model.get_input_embeddings.return_value = InputEmbeddingsFeatures(
+        inputs_embeds=mx.zeros((1, 1, 4))
+    )
+    model.make_generation_guards = lambda ids, kwargs: make_guards(
+        ids, page, eos, kwargs
+    )
+
+    def run(**kwargs):
+        return [
+            int(token)
+            for token, _ in generate_module.generate_step(
+                mx.array([[page, 2, page]]),  # two pages to answer
+                model,
+                pixel_values=None,
+                mask=None,
+                max_tokens=3,
+                temperature=0,
+                **kwargs,
+            )
+        ]
+
+    assert run(page_count_guard=False, no_repeat_ngram_size=0) == [eos] * 3
+    assert eos not in run()  # EOS is banned until both pages are answered
+    # the guard options never reach the forward pass
+    for call in model.language_model.call_args_list:
+        assert "page_count_guard" not in call.kwargs
+        assert "no_repeat_ngram_size" not in call.kwargs

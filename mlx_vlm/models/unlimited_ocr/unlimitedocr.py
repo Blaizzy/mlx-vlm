@@ -10,6 +10,7 @@ from ..deepseekocr.deepseekocr import Model as DeepseekOCRModel
 from ..deepseekocr.sam import SAMEncoder
 from ..deepseekocr.vision import VisionModel
 from .config import ModelConfig
+from .guards import make_guards
 from .language import LanguageModel
 from .processing_unlimitedocr import UnlimitedOCRHFProcessor, UnlimitedOCRProcessor
 
@@ -187,6 +188,20 @@ class Model(DeepseekOCRModel):
 
     def make_cache(self):
         return self.language_model.make_cache()
+
+    def make_generation_guards(self, input_ids, kwargs):
+        """Logits processors the native Unlimited-OCR-2 stack always applies (see ``guards``).
+
+        Consumes ``page_count_guard``, ``max_page_tokens``, ``no_repeat_ngram_size``, ``ngram_window``
+        and ``ngram_whitelist_token_ids`` from the generation ``kwargs``. Unlimited-OCR (v1) has no
+        ``<PAGE>`` protocol and is left untouched.
+        """
+        params = self.language_model.dash_params
+        if params is None:
+            return []
+        return make_guards(
+            input_ids, params.page_token_id, self.config.eos_token_id, kwargs
+        )
 
     def quant_predicate(self, path, module):
         # The DASH router picks the attended blocks; keep its tiny projections dense.

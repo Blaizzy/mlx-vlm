@@ -328,6 +328,11 @@ def generate_step(
     )
     if logits_processors is not None:
         processors.extend(logits_processors)
+    # Model-owned guards (e.g. Unlimited-OCR-2's native page-count / no-repeat n-gram rules); the
+    # model consumes its own options from kwargs so they are not forwarded to the forward pass.
+    make_generation_guards = getattr(model, "make_generation_guards", None)
+    if make_generation_guards is not None:
+        processors.extend(make_generation_guards(input_ids, kwargs))
 
     y = input_ids
     # Processor history follows text IDs, independently of embedding chunks.

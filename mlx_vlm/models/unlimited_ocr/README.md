@@ -33,6 +33,20 @@ MLX implementation notes (`dash.py`):
 - The decode-step router and selection are `mx.compile`d on a block capacity that changes every 64 blocks.
 - `dash_router` weights stay dense when quantizing (`quant_predicate`); the warmup-stage `indexer` weights are dropped. Batch size 1 only.
 
+Generation guards (`guards.py`). The native stack never decodes unguarded, so MLX applies the same rules to Unlimited-OCR-2 requests by default (generated ids only, state kept on device, ~3% decode cost):
+
+- **page-count guard** (`infer_multi` default): EOS is banned until every prompt `<PAGE>` has been answered, EOS is forced once there are more answered pages than prompt pages, and a page longer than `max_page_tokens` (20000) is cut by forcing the next `<PAGE>` (EOS after the last).
+- **no-repeat n-gram** (the evaluation setup of `infer.py`): 35-grams over a 1024-token window for several pages, 128 for one, so a loop is broken after a few repeats instead of running to the token budget.
+
+Without them, one wrong token can send greedy decoding into a loop ("The document is a key to the development of the document." repeated) that never reaches EOS and loses every later page. Tune or disable them with generation kwargs:
+
+```bash
+mlx_vlm.generate --model baidu/Unlimited-OCR-2 --image p1.png p2.png \
+    --prompt "Multi page parsing." --gen-kwargs '{"no_repeat_ngram_size": 0, "page_count_guard": false}'
+```
+
+Options: `page_count_guard`, `max_page_tokens`, `no_repeat_ngram_size` (0 disables), `ngram_window`, `ngram_whitelist_token_ids`. On healthy output the guards never fire and the text is unchanged.
+
 ## Model Architecture
 
 ```

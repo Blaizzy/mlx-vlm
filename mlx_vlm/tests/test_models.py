@@ -4603,3 +4603,114 @@ class TestUnlimitedOCR2Dash:
             token = mx.argmax(logits[:, -1], axis=-1, keepdims=True)
         assert cache[0].offset == n + 9
         assert cache[0].num_summaries == (n + 9) // 4
+
+
+class TestUnlimitedOCR2Guards:
+    """Unlimited-OCR-2 native generation guards: page-count guard and no-repeat n-gram."""
+
+    PAGE, EOS, VOCAB = 5, 1, 16
+
+    def guard(self, **kwargs):
+        from mlx_vlm.models.unlimited_ocr.guards import UnlimitedOCRGuards
+
+        return UnlimitedOCRGuards(self.PAGE, self.EOS, **kwargs)
+
+    def rows(self, guard, prompt, generated):
+        """Logits rows seen by the sampler, fed the way ``generate_step`` feeds processors."""
+        tokens = mx.array(prompt)
+        out = [np.array(guard(tokens, mx.zeros((1, self.VOCAB)))[0])]
+        for t in generated:
+            tokens = mx.concatenate([tokens, mx.array([t])])
+            out.append(np.array(guard(tokens, mx.zeros((1, self.VOCAB)))[0]))
+        return out
+
+    @staticmethod
+    def native_banned(gen, n, window, whitelist=()):
+        """modeling_unlimitedocr._uocr_no_repeat_ngram, verbatim semantics."""
+        if n <= 0 or len(gen) < n:
+            return set()
+        prefix = tuple(gen[-(n - 1) :]) if n > 1 else tuple()
+        banned = set()
+        for i in range(max(0, len(gen) - window), len(gen) - n + 1):
+            ng = tuple(gen[i : i + n])
+            if ng[:-1] == prefix:
+                banned.add(ng[-1])
+        return banned - set(whitelist)
+
+    @staticmethod
+    def banned(row):
+        return set(np.flatnonzero(np.isneginf(row)).tolist())
+
+    def test_ngram_matches_native_reference(self):
+        rng = np.random.default_rng(0)
+        for n, window in [(1, 5), (2, 7), (3, 16), (5, 64), (4, 3)]:
+            for whitelist in [(), (2,)]:
+                g = self.guard(
+                    page_count_guard=False,
+                    ngram_size=n,
+                    ngram_window=window,
+                    ngram_whitelist=whitelist,
+                )
+                # tiny vocab: constant repeats
+                gen = [int(t) for t in rng.integers(0, 4, 200)]
+                rows = self.rows(g, [9], gen)
+                for k, row in enumerate(rows):
+                    expected = self.native_banned(gen[:k], n, window, whitelist)
+                    assert self.banned(row) == expected, (n, window, k)
+
+    def test_ngram_bans_the_next_token_of_a_loop(self):
+        g = self.guard(page_count_guard=False, ngram_size=4, ngram_window=100)
+        rows = self.rows(g, [9], [3, 4, 5, 6, 3, 4, 5, 6, 3, 4, 5])
+        assert self.banned(rows[-1]) == {6}
+        assert self.banned(rows[3]) == set()  # nothing repeated yet
+
+    def test_page_count_guard(self):
+        g = self.guard(max_page_tokens=3, expected_pages=2)
+        prompt = [self.PAGE, 9, self.PAGE, 9]  # two pages
+        rows = self.rows(g, prompt, [self.PAGE, 7, 7, 7, self.PAGE, 7, 7, 7, 8])
+        # EOS is banned until both pages are answered
+        assert self.banned(rows[0]) == {self.EOS} == self.banned(rows[1])
+        # a page longer than max_page_tokens is cut by forcing the next <PAGE> ...
+        assert set(range(self.VOCAB)) - self.banned(rows[4]) == {self.PAGE}
+        # ... and the last one by forcing EOS
+        assert set(range(self.VOCAB)) - self.banned(rows[8]) == {self.EOS}
+        # a third <PAGE> marker means the document is over
+        g = self.guard()
+        rows = self.rows(g, prompt, [self.PAGE, 7, self.PAGE, 7, self.PAGE])
+        assert set(range(self.VOCAB)) - self.banned(rows[-1]) == {self.EOS}
+        assert self.banned(rows[3]) == set()  # both pages answered: EOS allowed again
+
+    def test_forced_token_survives_ngram_ban(self):
+        g = self.guard(max_page_tokens=2, ngram_size=1, ngram_window=100)
+        rows = self.rows(g, [self.PAGE, self.PAGE], [self.PAGE, 7, 8])
+        assert set(range(self.VOCAB)) - self.banned(rows[-1]) == {self.PAGE}
+
+    def test_guards_never_read_the_host_while_decoding(self):
+        """The decode loop must stay asynchronous: no ``.item()`` / ``tolist`` per step."""
+        g = self.guard(expected_pages=1, ngram_size=3, ngram_window=16)
+        prompt = mx.array([self.PAGE, 9])
+        g(prompt, mx.zeros((1, self.VOCAB)))
+        tokens = prompt
+        with patch.object(mx.array, "item", side_effect=AssertionError("host read")):
+            for t in [4, 4, 4, 4]:
+                tokens = mx.concatenate([tokens, mx.array([t])])
+                g(tokens, mx.zeros((1, self.VOCAB)))
+
+    def test_make_guards_defaults_and_options(self):
+        from mlx_vlm.models.unlimited_ocr.guards import make_guards
+
+        pages = np.array([[self.PAGE, 9, self.PAGE, 9]])
+        kwargs = {"max_page_tokens": 50, "temperature": 0.0}
+        (g,) = make_guards(pages, self.PAGE, [self.EOS], kwargs)
+        assert (g.ngram_size, g.ngram_window, g.max_page_tokens) == (35, 1024, 50)
+        assert g.eos_token_id == self.EOS and g.page_count_guard
+        assert g.expected_pages == 2
+        assert kwargs == {"temperature": 0.0}  # only guard options are consumed
+
+        (g,) = make_guards(pages[:, :2], self.PAGE, self.EOS, {})
+        assert g.ngram_window == 128  # a single page uses the narrow window
+        (g,) = make_guards(pages, self.PAGE, self.EOS, {"no_repeat_ngram_size": 0})
+        assert g.ngram_size == 0 and g.page_count_guard
+        off = {"page_count_guard": False, "no_repeat_ngram_size": 0}
+        assert make_guards(pages, self.PAGE, self.EOS, off) == []  # nothing to apply
+        assert make_guards(pages, None, self.EOS, {}) == []  # no <PAGE> protocol (v1)
