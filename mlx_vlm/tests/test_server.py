@@ -5440,6 +5440,41 @@ def test_thinking_stream_markers(family, enabled):
     assert _thoughts(_feed_thinking(state, [t.text for t in tokens])) == expected
 
 
+@pytest.mark.parametrize(
+    "prefix,text,expected",
+    [
+        ("<think>", "Think.</think>\nAnswer.", ("Think.", "Answer.")),
+        ("<think></think>", "Answer.", ("", "Answer.")),
+        ("<think>", "Unfinished", ("Unfinished", "")),
+        ("", "<think>Think.</think>Answer.", ("Think.", "Answer.")),
+    ],
+)
+def test_response_template_prefilled_thinking(prefix, text, expected):
+    tokenizer = _MuseResponseTemplateTokenizer()
+    tokenizer.response_template = {
+        "start_anchor_pattern": r"<\|im_start\|>assistant\n",
+        "fields": {
+            "reasoning_content": {
+                "open_pattern": r"<think>\n?",
+                "close_pattern": r"</think>\s*",
+                "content": "text",
+            },
+            "content": {"close_pattern": r"<\|im_end\|>\s*", "content": "text"},
+        },
+    }
+    prompt = (
+        "<|im_start|>assistant\n<think>Old.</think>Old answer.<|im_end|>\n"
+        "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n" + prefix
+    )
+    processor = NS(tokenizer=tokenizer)
+    state = server.make_response_stream_state(processor, prompt=prompt)
+    assert _thoughts(_feed_thinking(state, list(text), last=True)) == expected
+    assert server._split_thinking(text, processor=processor, prompt=prompt) == (
+        expected[0] or None,
+        expected[1],
+    )
+
+
 def test_response_template_thinking_stream():
     state = server.make_response_stream_state(
         NS(tokenizer=_MuseResponseTemplateTokenizer()),

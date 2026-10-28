@@ -2685,8 +2685,6 @@ WIRE_CALLS = {
     "pythonic": '<|tool_call_start|>[get_weather(city="Paris", days=3)]<|tool_call_end|>',
     "qwen3_coder": "<tool_call>\n<function=get_weather><parameter=city>Paris</parameter>"
     "<parameter=days>3</parameter></function></tool_call>",
-    "lfm3": "<tool_call>\n<function=get_weather><parameter=city>Paris</parameter>"
-    "<parameter=days>3</parameter></function></tool_call>",
 }
 
 
@@ -2756,8 +2754,6 @@ def test_parser_selection(name):
     # Specific formats must outrank the generic JSON fallback.
     generic = "<tool_call> tool_call.name"
     template = WIRE_CALLS[name] + generic
-    if name == "lfm3":
-        template += "<additional_tools> preserve_thinking"
     for value in (
         template,
         {"default": generic, "tool_use": template},

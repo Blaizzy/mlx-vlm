@@ -54,11 +54,6 @@ SPECS: Tuple[ParserSpec, ...] = (
     ParserSpec("longcat", (("<longcat_tool_call>",),)),
     ParserSpec("glm47", (("<arg_key>",),)),
     ParserSpec(
-        "lfm3",
-        (("<tool_call>", "<function=", "<additional_tools>", "preserve_thinking"),),
-        priority=110,
-    ),
-    ParserSpec(
         "pythonic",
         (("<|tool_call_start|>", "<|tool_call_end|>"), ("<|tool_list_start|>",)),
     ),
