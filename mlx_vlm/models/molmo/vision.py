@@ -221,10 +221,13 @@ class VisionTransformer(nn.Module):
                     patch_num_0 / pos_emb.shape[2],
                     patch_num_1 / pos_emb.shape[3],
                 ),
-                mode="linear",  # MLX doesn't have bicubic, using linear as closest alternative
+                # PyTorch's bicubic is MLX's "cubic" for 2D input.
+                mode="cubic",
                 align_corners=False,
             )
-            pos_emb = upsampler(pos_emb)
+            # `Upsample` scales the dimensions between batch and channel, so it expects
+            # channels-last while `pos_emb` is channels-first here.
+            pos_emb = upsampler(pos_emb.transpose(0, 2, 3, 1)).transpose(0, 3, 1, 2)
 
             # Restore original dimensions
             pos_emb = mx.transpose(pos_emb, (0, 2, 3, 1))
