@@ -161,11 +161,23 @@ class MOSSImagePipeline:
                 prediction = prediction + slg_scale * (conditional - skipped)
             latents = scheduler.step(prediction, i, latents)
             mx.eval(latents)
+        if self.evict_text_encoder:
+            # The next call reloads the transformer anyway; free it before the
+            # fp32 VAE decode instead of holding both.
+            self.transformer = None
+            gc.collect()
+            mx.clear_cache()
         if self.vae is None:
             self.vae = load_vae(self.model_path)
-        decoded = self.vae.decode_packed_latents(latents)
-        images = mx.round(
-            mx.clip(decoded.transpose(0, 2, 3, 1) / 2 + 0.5, 0, 1) * 255
-        ).astype(mx.uint8)
-        mx.eval(images)
+        # Without a limit, freed decoder temporaries accumulate in the MLX
+        # buffer cache (~28 GB at 1024x1024); disable it for the decode.
+        cache_limit = mx.set_cache_limit(0)
+        try:
+            decoded = self.vae.decode_packed_latents(latents)
+            images = mx.round(
+                mx.clip(decoded.transpose(0, 2, 3, 1) / 2 + 0.5, 0, 1) * 255
+            ).astype(mx.uint8)
+            mx.eval(images)
+        finally:
+            mx.set_cache_limit(cache_limit)
         return images[0] if num_images == 1 else images
