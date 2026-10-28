@@ -1062,7 +1062,7 @@ def stream_generate(
             exact_checkpoint_lengths = [
                 n - reused_prefix_len
                 for n in apc_coordinator.checkpoint_lengths(
-                    full_input_ids_list, multimodal_token_ids
+                    full_input_ids_list, multimodal_token_ids, extra_hash=apc_extra_hash
                 )
                 if n > reused_prefix_len
             ]

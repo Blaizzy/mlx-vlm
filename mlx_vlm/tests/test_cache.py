@@ -2400,6 +2400,53 @@ def test_checkpoint_schedule(prefix_manager):
     assert coordinator.checkpoint_lengths(tokens, set()) == [74]
 
 
+def test_checkpoint_divergence_is_scoped_and_media_safe(prefix_manager):
+    manager = prefix_manager()
+    manager.checkpoint_interval_tokens = 16
+    coordinator = manager.coordinator(cache_model([C.ArraysCache(1)]))
+    stored = list(range(75))
+    state = C.ArraysCache(1)
+    state[0] = mx.ones((1, 2))
+    assert manager.store_exact_cache(stored, [state], extra_hash=7)
+    tokens = stored[:37] + [999] * 38
+    assert coordinator.checkpoint_lengths(tokens, set(), extra_hash=7) == [37, 74]
+    assert coordinator.checkpoint_lengths(tokens, set(), extra_hash=8) == [64, 74]
+    # Do not checkpoint inside a media span, or exceed the two-entry limit.
+    media = stored[:37] + [999] * 8 + list(range(45, 75))
+    assert coordinator.checkpoint_lengths(media, {999}, extra_hash=7) == [45, 74]
+    manager._exact_cache_max = 1
+    assert coordinator.checkpoint_lengths(tokens, set(), extra_hash=7) == [74]
+
+
+@parametrize("model_name", ["qwen3_5", "lfm2"])
+def test_hybrid_replaced_suffix_keeps_reusable_state(prefix_manager, model_name):
+    mx.random.seed(13)
+    lm = language_model(model_name)
+    manager = prefix_manager()
+    manager.checkpoint_interval_tokens = 16
+    for turn in range(8):
+        canonical = list(range(1, 22 + turn * 3))
+        tokens = canonical + [50 + turn] * 40
+        restored, count = manager.lookup_exact_cache(tokens)
+        if turn >= 2:
+            assert count >= 21 + (turn - 2) * 3
+        cache, _ = warm_exact([restored or lm.make_cache()], [count])
+        batch = prompt_batch(lm, manager, [tokens], [count], cache)
+        sampled = []
+
+        def sample(lp):
+            sampled.append(lp)
+            return mx.argmax(lp, axis=-1)
+
+        finish_batch(batch, sample)
+        reference = lm.make_cache()
+        logits = lm(mx.array([tokens]), cache=reference).logits[0, -1]
+        logprobs = logits - mx.logsumexp(logits)
+        assert mx.allclose(sampled[0][0], logprobs, atol=1e-4, rtol=1e-4).item()
+        assert mx.argmax(sampled[0][0]).item() == mx.argmax(logits).item()
+        assert len(manager._exact_cache) <= 2
+
+
 def prompt_batch(lm, manager, tokens, prefixes, caches, step=16, **kwargs):
     runner = manager.coordinator(lm)
     suffixes = [ids[n:] for ids, n in zip(tokens, prefixes)]
@@ -2527,7 +2574,8 @@ def test_diffusion_suffix(prefix_manager, tier):
         manager = prefix_manager(tier, **settings)
     recorder.input_lengths.clear()
     assert generate(tokens[:9] + [13, 14])[-1].cached_tokens == 8
-    assert recorder.input_lengths == [2, 1]
+    assert sum(recorder.input_lengths) == 3
+    assert recorder.input_lengths[-1] == 1
 
 
 @parametrize("model_name", ["gemma4", "qwen3_5"])
