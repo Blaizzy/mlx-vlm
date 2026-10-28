@@ -40,13 +40,13 @@ def encoded_call(parser, content):
             )
             + "<|END_ACTION|>"
         )
-    if parser == "qwen3_coder":
+    if parser in ("qwen3_coder", "lfm3"):
         return f"<tool_call><function=write_file><parameter=path>demo.py</parameter><parameter=content>\n{content}\n</parameter></function></tool_call>"
     return f'<|tool_call>call:write_file{{path:<|"|>demo.py<|"|>,content:<|"|>{content}<|"|>}}<tool_call|>'
 
 
 @pytest.mark.parametrize(
-    "parser", ["json_tools", "cohere2_moe", "qwen3_coder", "gemma4"]
+    "parser", ["json_tools", "cohere2_moe", "qwen3_coder", "lfm3", "gemma4"]
 )
 @pytest.mark.parametrize("chunk_size", [1, 7, 31, 8192])
 def test_argument_prefixes_and_final_call_match(parser, chunk_size):
@@ -78,7 +78,7 @@ def test_argument_prefixes_and_final_call_match(parser, chunk_size):
 
 
 @pytest.mark.parametrize(
-    "parser", ["json_tools", "cohere2_moe", "qwen3_coder", "gemma4"]
+    "parser", ["json_tools", "cohere2_moe", "qwen3_coder", "lfm3", "gemma4"]
 )
 def test_multiple_calls_keep_separate_ids(parser):
     module = load_tool_module(parser)
@@ -123,11 +123,59 @@ def test_cohere_parallel_action_and_escape_repair():
 @pytest.mark.parametrize(
     "value", ["null", "number", "", "\ntext\n", "\n\n", "</param", '"\\value']
 )
-def test_xml_strings_preserve_final_parser_semantics(value):
-    module = load_tool_module("qwen3_coder")
-    text = encoded_call("qwen3_coder", value)
+@pytest.mark.parametrize("parser", ["qwen3_coder", "lfm3"])
+def test_xml_strings_preserve_final_parser_semantics(value, parser):
+    module = load_tool_module(parser)
+    text = encoded_call(parser, value)
     state = ToolCallDeltaState(module, TOOLS)
     for char in text:
         state.feed(char)
     expected = process_tool_calls(text, module, TOOLS).calls
     assert state.finish(expected) == []
+
+
+@pytest.mark.parametrize("chunk_size", [1, 3, 7, 8192])
+@pytest.mark.parametrize(
+    "prefix,text,expected",
+    [
+        ("<think>", "Add two and two.</think>\n\n4.", ("Add two and two.", "4.")),
+        ("", "<think>\nAdd two and two.</think>\n4.", ("Add two and two.", "4.")),
+        ("<think></think>", "4.", ("", "4.")),
+        ("", "<think></think>Answer.\n\nMore.", ("", "Answer.\n\nMore.")),
+        ("<think>", "Unfinished reasoning", ("Unfinished reasoning", "")),
+        ("", "Answer <tag> and <thi", ("", "Answer <tag> and <thi")),
+        (
+            "<think></think>",
+            "Literal <think> in the answer",
+            ("", "Literal <think> in the answer"),
+        ),
+        (
+            "<think>",
+            "Thinking.</think>Answer.<|im_end|>ignored",
+            ("Thinking.", "Answer."),
+        ),
+        (
+            "<think>",
+            "An example <tool_call>unclosed example</think>"
+            "<tool_call><function=write_file><parameter=content><think>literal</think>"
+            "</parameter></function></tool_call>\nDone.",
+            ("An example <tool_call>unclosed example", "Done."),
+        ),
+    ],
+)
+def test_lfm3_native_response_parser(chunk_size, prefix, text, expected):
+    module = load_tool_module("lfm3")
+    prompt = (
+        "<|im_start|>assistant\n<think>Old.</think>Old answer.<|im_end|>\n"
+        "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n" + prefix
+    )
+    state = module.ResponseParser(prefix=prompt)
+    reasoning, content = "", ""
+    for offset in range(0, len(text), chunk_size):
+        delta = state.feed(
+            text[offset : offset + chunk_size], last=offset + chunk_size >= len(text)
+        )
+        reasoning += delta.reasoning or ""
+        content += delta.content or ""
+    assert (reasoning, content) == expected
+    assert state.feed("after completion").content is None

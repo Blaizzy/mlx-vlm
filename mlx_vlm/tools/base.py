@@ -6,6 +6,11 @@ string for formats whose call ends at a newline rather than a closing marker.
 The extractor (:mod:`mlx_vlm.tools.extractor`) drives any module shaped like
 this; the :class:`ParserSpec` in :mod:`mlx_vlm.tools.registry` maps a chat
 template to the module that owns it.
+
+A module may also expose ``ResponseParser(prefix=..., starts_in_thinking=...)``
+to split its native response format. Its ``feed(text, last=False)`` result has
+``reasoning``, ``content``, and ``thinking_closed`` fields. The server prefers
+this parser over tokenizer response templates when one is available.
 """
 
 from __future__ import annotations
