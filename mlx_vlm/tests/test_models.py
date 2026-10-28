@@ -4441,382 +4441,263 @@ class TestPhiMoE:
         assert isinstance(Attention(config).rope, nn.RoPE)
 
 
-class TestUnlimitedOCRPrecision(unittest.TestCase):
-    """Precision and reference-encoder regressions without model downloads."""
+@pytest.fixture
+def unlimited_ocr_model():
+    module = importlib.import_module(
+        "mlx_vlm.models." + TINY_MODELS["unlimited_ocr"]["module"]
+    )
 
-    class ConstantEmbedding:
-        def __init__(self, dtype):
-            self.dtype = dtype
+    class TinyModel(nn.Module):
+        # Exercise the production embedding path without the large vision encoders.
+        get_input_embeddings = module.Model.get_input_embeddings
 
-        def __call__(self, ids):
-            return mx.full((*ids.shape, 4), 0.1, dtype=self.dtype)
+        def __init__(self):
+            super().__init__()
+            self.config = tiny_config("unlimited_ocr")
+            self.language_model = module.LanguageModel(self.config)
 
-    class FakeSAM:
-        def __init__(self, dtype):
-            self.dtype = dtype
+    model = TinyModel()
+    model.eval()
+    return model
 
-        def __call__(self, images):
-            return mx.full((images.shape[0], 1, 1, 2), 0.123456, dtype=self.dtype)
 
-    class FakeVision:
-        def __init__(self, dtype):
-            self.dtype = dtype
-
-        def __call__(self, images, patch_embeds=None):
-            return mx.full((images.shape[0], 2, 2), 0.234567, dtype=self.dtype)
-
-    def test_fp32_image_features_are_not_rounded_to_text_dtype(self):
-        from mlx_vlm.models.unlimited_ocr.unlimitedocr import Model
-
-        model = SimpleNamespace(
-            language_model=SimpleNamespace(
-                dash_params=None,
-                model=SimpleNamespace(embed_tokens=self.ConstantEmbedding(mx.bfloat16)),
-            ),
-            sam_model=self.FakeSAM(mx.float32),
-            vision_model=self.FakeVision(mx.float32),
-            projector=nn.Identity(),
-            image_newline=mx.zeros(4),
-            view_separator=mx.zeros(4),
-        )
-        features = Model.get_input_embeddings(
-            model,
-            input_ids=mx.array([[0, 1, 1, 1, 2]]),
-            pixel_values=[mx.zeros((1, 3, 4, 4)), mx.ones((1, 3, 4, 4))],
-            images_spatial_crop=mx.array([[1, 1]]),
-            images_seq_mask=mx.array([[False, True, True, True, False]]),
-        ).inputs_embeds
-        self.assertEqual(features.dtype, mx.float32)
+@pytest.mark.parametrize("quantized", [False, True], ids=["dense", "quantized"])
+def test_unlimited_ocr_fp32_fusion_preserves_features_and_weights(
+    unlimited_ocr_model, quantized
+):
+    model = unlimited_ocr_model
+    width = 64 if quantized else 4
+    embedding = (
+        nn.QuantizedEmbedding(8, width, group_size=64, bits=8)
+        if quantized
+        else nn.Embedding(8, width)
+    )
+    embedding.set_dtype(mx.bfloat16)
+    original_weights = np.array(embedding.weight.view(mx.uint8))
+    model.language_model.model.embed_tokens = embedding
+    model.sam_model = lambda images: mx.full((images.shape[0], 1, 1, 2), 0.123456)
+    model.vision_model = lambda images, patch_embeds=None: mx.full(
+        (images.shape[0], 2, 2), 0.234567
+    )
+    model.projector = nn.Linear(4, width, bias=False) if quantized else nn.Identity()
+    model.image_newline = model.view_separator = mx.zeros(width)
+    features = model.get_input_embeddings(
+        input_ids=mx.array([[0, 1, 1, 1, 2]]),
+        pixel_values=[mx.zeros((1, 3, 4, 4)), mx.ones((1, 3, 4, 4))],
+        images_spatial_crop=mx.array([[1, 1]]),
+        images_seq_mask=mx.array([[False, True, True, True, False]]),
+    ).inputs_embeds
+    assert features.dtype == mx.float32
+    np.testing.assert_array_equal(
+        np.array(embedding.weight.view(mx.uint8)), original_weights
+    )
+    if quantized:
+        assert embedding.weight.dtype == mx.uint32
+        assert embedding.scales.dtype == mx.bfloat16
+    else:
         expected = mx.array([0.234567, 0.234567, 0.123456, 0.123456])
         np.testing.assert_array_equal(np.array(features[0, 1]), np.array(expected))
-        self.assertGreater(
+        assert (
             mx.max(
                 mx.abs(expected.astype(mx.bfloat16).astype(mx.float32) - expected)
-            ).item(),
-            1e-5,
+            ).item()
+            > 1e-5
         )
 
-    def test_fp32_fusion_does_not_requantize_token_embeddings(self):
-        from mlx_vlm.models.unlimited_ocr.unlimitedocr import Model
 
-        embedding = nn.QuantizedEmbedding(8, 64, group_size=64, bits=8)
-        embedding.set_dtype(mx.bfloat16)
-        packed = np.array(embedding.weight)
-        model = SimpleNamespace(
-            language_model=SimpleNamespace(
-                dash_params=None, model=SimpleNamespace(embed_tokens=embedding)
-            ),
-            sam_model=self.FakeSAM(mx.float32),
-            vision_model=self.FakeVision(mx.float32),
-            projector=nn.Linear(4, 64, bias=False),
-            image_newline=mx.zeros(64),
-            view_separator=mx.zeros(64),
+@pytest.mark.parametrize("path", ["embeddings", "language"])
+def test_unlimited_ocr_text_only_keeps_native_dtype(unlimited_ocr_model, path):
+    model = unlimited_ocr_model
+    model.set_dtype(mx.bfloat16)
+    ids = mx.array([[1, 2]])
+    result = (
+        model.get_input_embeddings(ids).inputs_embeds
+        if path == "embeddings"
+        else model.language_model.model(ids)
+    )
+    assert result.dtype == mx.bfloat16
+
+
+def test_unlimited_ocr_cached_decode_preserves_fp32_prefill(unlimited_ocr_model):
+    model = unlimited_ocr_model.language_model
+    model.set_dtype(mx.bfloat16)
+    cache, reference_cache = model.make_cache(), model.make_cache()
+    prefix = mx.arange(24, dtype=mx.float32).reshape(1, 3, 8) / 29.0
+    for current_cache in (cache, reference_cache):
+        mx.eval(model.model(None, inputs_embeds=prefix, cache=current_cache))
+    token = mx.array([[4]])
+    result = model.model(token, cache=cache)
+    expected = model.model(
+        None,
+        inputs_embeds=model.model.embed_tokens(token).astype(mx.float32),
+        cache=reference_cache,
+    )
+    assert result.dtype == mx.float32
+    assert cache[0].keys.dtype == mx.float32
+    np.testing.assert_allclose(np.array(result), np.array(expected), atol=1e-6)
+    assert model.model.embed_tokens.weight.dtype == mx.bfloat16
+
+
+@pytest.mark.parametrize("step_size", [1, 4])
+def test_unlimited_ocr_chunked_prefill_restores_full_prompt(
+    unlimited_ocr_model, step_size
+):
+    model = unlimited_ocr_model.language_model
+    prefix = mx.arange(40, dtype=mx.float32).reshape(1, 5, 8) / 43.0
+    # As with DASH, direct chunked calls supply the complete prompt first.
+    model._prompt_ids = np.arange(prefix.shape[1])
+    expected = model(None, inputs_embeds=prefix, cache=model.make_cache()).logits
+    model._prompt_ids = np.arange(prefix.shape[1])
+    cache, chunks = model.make_cache(), []
+    for start in range(0, 4, step_size):
+        chunks.append(
+            model(
+                None, inputs_embeds=prefix[:, start : start + step_size], cache=cache
+            ).logits
         )
-        result = Model.get_input_embeddings(
-            model,
-            input_ids=mx.array([[0, 1, 1, 1, 2]]),
-            pixel_values=[mx.zeros((1, 3, 4, 4)), mx.ones((1, 3, 4, 4))],
-            images_spatial_crop=mx.array([[1, 1]]),
-            images_seq_mask=mx.array([[False, True, True, True, False]]),
-        ).inputs_embeds
-        self.assertEqual(result.dtype, mx.float32)
-        self.assertEqual(embedding.weight.dtype, mx.uint32)
-        self.assertEqual(embedding.scales.dtype, mx.bfloat16)
-        np.testing.assert_array_equal(np.array(embedding.weight), packed)
+        assert cache[0].prefill_length == 5
+    # Resume a saved partial prefill before processing its last token.
+    restored = model.make_cache()
+    for old, new in zip(cache, restored):
+        new.state, new.meta_state = old.state, old.meta_state
+    cache = restored
+    chunks.append(model(None, inputs_embeds=prefix[:, 4:], cache=cache).logits)
+    np.testing.assert_allclose(
+        np.array(mx.concatenate(chunks, axis=1)), np.array(expected), atol=1e-5
+    )
+    assert cache[0].prefill_length == 5
+    assert cache[0].state[0].shape[2] == 5
+    saved_prefix = np.array(cache[0].state[0])
+    for token in [2, 3, 4]:
+        mx.eval(model(mx.array([[token]]), cache=cache).logits)
+    assert cache[0].state[0].shape[2] == 7
+    np.testing.assert_array_equal(np.array(cache[0].state[0][:, :, :5]), saved_prefix)
 
-    def test_text_only_embeddings_keep_native_dtype(self):
-        from mlx_vlm.models.unlimited_ocr.unlimitedocr import Model
 
-        model = SimpleNamespace(
-            language_model=SimpleNamespace(
-                dash_params=None,
-                model=SimpleNamespace(embed_tokens=self.ConstantEmbedding(mx.bfloat16)),
+def unlimited_ocr_prompt_keys(model, ids, cache=None):
+    cache = model.language_model.make_cache() if cache is None else cache
+    embeds = model.get_input_embeddings(ids).inputs_embeds
+    mx.eval(model.language_model(ids, inputs_embeds=embeds, cache=cache).logits)
+    return np.array(cache[0].state[0])
+
+
+@pytest.mark.parametrize("step", [1, 4, None], ids=["single", "chunked", "unchunked"])
+def test_unlimited_ocr_generation_retains_prompt_on_reuse(unlimited_ocr_model, step):
+    from mlx_vlm.generate.ar import generate_step
+
+    model = unlimited_ocr_model
+    # Reuse the same model with successively shorter prompts to expose stale state.
+    for length in (5, 3, 1):
+        ids = mx.arange(length)[None]
+        reference_keys = unlimited_ocr_prompt_keys(model, ids)
+        cache = model.language_model.make_cache()
+        list(
+            generate_step(
+                ids,
+                model,
+                None,
+                None,
+                temperature=0.0,
+                max_tokens=3,
+                prefill_step_size=step,
+                prompt_cache=cache,
             )
         )
-        features = Model.get_input_embeddings(
-            model, input_ids=mx.array([[0, 1]]), pixel_values=None
-        ).inputs_embeds
-        self.assertEqual(features.dtype, mx.bfloat16)
-
-    def test_cached_decode_preserves_fp32_prefill_activations(self):
-        from mlx_vlm.models.unlimited_ocr.config import TextConfig
-        from mlx_vlm.models.unlimited_ocr.language import LanguageModel
-
-        config = TextConfig(
-            hidden_size=8,
-            intermediate_size=16,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            num_key_value_heads=2,
-            vocab_size=16,
-            n_routed_experts=None,
-            n_shared_experts=None,
-            sliding_window_size=4,
-            sliding_window=4,
+        assert cache[0].prefill_length == length
+        assert cache[0].state[0].shape[2] == length + 2
+        np.testing.assert_allclose(
+            np.array(cache[0].state[0][:, :, :length]),
+            reference_keys,
+            atol=1e-6,
+            rtol=1e-6,
         )
-        model = LanguageModel(config)
-        model.set_dtype(mx.bfloat16)
-        model.eval()
-        cache = model.make_cache()
-        reference_cache = model.make_cache()
-        prefix = mx.arange(24, dtype=mx.float32).reshape(1, 3, 8) / 29.0
-        for current_cache in (cache, reference_cache):
-            mx.eval(model.model(None, inputs_embeds=prefix, cache=current_cache))
-        token = mx.array([[4]])
-        result = model.model(token, cache=cache)
-        expected = model.model(
+
+
+@pytest.mark.parametrize("cached_tokens", [3, 4])
+def test_unlimited_ocr_generation_retains_cached_prefix(
+    unlimited_ocr_model, cached_tokens
+):
+    from mlx_vlm.generate.ar import generate_step
+
+    model = unlimited_ocr_model
+    ids = mx.arange(5)[None]
+    cache = model.language_model.make_cache()
+    unlimited_ocr_prompt_keys(model, ids[:, :cached_tokens], cache)
+    # An APC hit supplies only the uncached suffix to the embedding path.
+    list(
+        generate_step(
+            ids[:, cached_tokens:],
+            model,
             None,
-            inputs_embeds=model.model.embed_tokens(token).astype(mx.float32),
-            cache=reference_cache,
+            None,
+            temperature=0.0,
+            max_tokens=3,
+            prefill_step_size=1,
+            prompt_cache=cache,
         )
-        self.assertEqual(result.dtype, mx.float32)
-        self.assertEqual(cache[0].keys.dtype, mx.float32)
-        np.testing.assert_allclose(np.array(result), np.array(expected), atol=1e-6)
-        self.assertEqual(model.model.embed_tokens.weight.dtype, mx.bfloat16)
+    )
+    assert cache[0].prefill_length == 5
+    assert cache[0].state[0].shape[2] == 7
+    np.testing.assert_allclose(
+        np.array(cache[0].state[0][:, :, :5]),
+        unlimited_ocr_prompt_keys(model, ids),
+        atol=1e-6,
+        rtol=1e-6,
+    )
 
-    def test_chunked_prefill_keeps_final_prompt_token_in_reference(self):
-        from mlx_vlm.models.unlimited_ocr.config import TextConfig
-        from mlx_vlm.models.unlimited_ocr.language import LanguageModel
 
-        config = TextConfig(
-            hidden_size=8,
-            intermediate_size=16,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            num_key_value_heads=2,
-            vocab_size=16,
-            n_routed_experts=None,
-            n_shared_experts=None,
-            sliding_window_size=2,
-            sliding_window=2,
-        )
-        model = LanguageModel(config)
-        model.eval()
-        prefix = mx.arange(40, dtype=mx.float32).reshape(1, 5, 8) / 43.0
-        # As with DASH, direct chunked calls supply the complete prompt first.
-        model._prompt_ids = np.arange(prefix.shape[1])
-        expected = model(None, inputs_embeds=prefix, cache=model.make_cache()).logits
-        for step_size in (1, 4):
-            with self.subTest(step_size=step_size):
-                model._prompt_ids = np.arange(prefix.shape[1])
-                cache = model.make_cache()
-                processed = 0
-                chunks = []
-                while processed < 4:
-                    count = min(step_size, 4 - processed)
-                    chunks.append(
-                        model(
-                            None,
-                            inputs_embeds=prefix[:, processed : processed + count],
-                            cache=cache,
-                        ).logits
-                    )
-                    self.assertEqual(cache[0].prefill_length, 5)
-                    processed += count
-                # Resume a saved partial prefill before processing its last token.
-                restored = model.make_cache()
-                for old, new in zip(cache, restored):
-                    new.state, new.meta_state = old.state, old.meta_state
-                cache = restored
-                chunks.append(
-                    model(None, inputs_embeds=prefix[:, 4:], cache=cache).logits
+@pytest.fixture
+def deepseek_ocr_vision():
+    case = model_case("TestGetInputEmbeddings.deepseekocr_input_embeddings")
+    module = importlib.import_module(f"mlx_vlm.models.{case['module']}.vision")
+    config = build_config(module, case["config"]["vision_config"], "VisionConfig")
+    return module, config
+
+
+def test_deepseek_ocr_absolute_positions_match_bicubic_reference(deepseek_ocr_vision):
+    from PIL import Image
+
+    module, config = deepseek_ocr_vision
+    embeddings = module.VisionEmbeddings(config)
+    width = config.hidden_size
+    grid = np.random.default_rng(42).normal(size=(4, 4, width)).astype(np.float32)
+    cls = np.arange(width, dtype=np.float32).reshape(1, 1, width)
+    positions = np.concatenate([cls, grid.reshape(1, 16, width)], axis=1)
+    result = embeddings._get_abs_pos(mx.array(positions), 10)
+    expected_grid = np.stack(
+        [
+            np.array(
+                Image.fromarray(grid[:, :, channel]).resize(
+                    (3, 3), Image.Resampling.BICUBIC
                 )
-                np.testing.assert_allclose(
-                    np.array(mx.concatenate(chunks, axis=1)),
-                    np.array(expected),
-                    atol=1e-5,
-                )
-                self.assertEqual(cache[0].prefill_length, 5)
-                self.assertEqual(cache[0].state[0].shape[2], 5)
-                saved_prefix = mx.array(cache[0].state[0])
-                for token in [2, 3, 4]:
-                    mx.eval(model(mx.array([[token]]), cache=cache).logits)
-                self.assertEqual(cache[0].state[0].shape[2], 7)
-                np.testing.assert_array_equal(
-                    np.array(cache[0].state[0][:, :, :5]), np.array(saved_prefix)
-                )
+            )
+            for channel in range(width)
+        ],
+        axis=-1,
+    )
+    expected = np.concatenate([cls, expected_grid.reshape(1, 9, width)], axis=1)
+    np.testing.assert_allclose(np.array(result), expected, atol=1e-5, rtol=1e-5)
 
-    def test_generation_keeps_full_prompt_across_ring_wrap_and_reuse(self):
-        from mlx_vlm.generate.ar import generate_step
-        from mlx_vlm.models.unlimited_ocr.config import TextConfig
-        from mlx_vlm.models.unlimited_ocr.language import LanguageModel
-        from mlx_vlm.models.unlimited_ocr.unlimitedocr import Model
 
-        class TinyModel(nn.Module):
-            # Exercise the production embedding path that also supplies DASH's
-            # prompt metadata, without allocating the large vision encoders.
-            get_input_embeddings = Model.get_input_embeddings
+def test_deepseek_ocr_relative_positions_use_half_pixel_centers():
+    module = importlib.import_module("mlx_vlm.models.deepseekocr.sam")
+    result = module.get_rel_pos(2, 2, mx.arange(5, dtype=mx.float32)[:, None])
+    expected = np.array([[[2], [1 / 3]], [[11 / 3], [2]]], dtype=np.float32)
+    np.testing.assert_allclose(np.array(result), expected, atol=1e-6)
 
-            def __init__(self):
-                super().__init__()
-                self.config = TextConfig(
-                    hidden_size=8,
-                    intermediate_size=16,
-                    num_hidden_layers=1,
-                    num_attention_heads=2,
-                    num_key_value_heads=2,
-                    vocab_size=16,
-                    n_routed_experts=None,
-                    n_shared_experts=None,
-                    sliding_window_size=2,
-                    sliding_window=2,
-                )
-                self.language_model = LanguageModel(self.config)
 
-        model = TinyModel()
-        model.eval()
-        for step in (1, 4, None):
-            for length in (5, 3, 1):
-                with self.subTest(step=step, length=length):
-                    ids = mx.arange(length)[None]
-                    embeds = model.get_input_embeddings(ids).inputs_embeds
-                    reference_cache = model.language_model.make_cache()
-                    mx.eval(
-                        model.language_model(
-                            ids, inputs_embeds=embeds, cache=reference_cache
-                        ).logits
-                    )
-                    reference_keys = np.array(reference_cache[0].state[0])
-                    cache = model.language_model.make_cache()
-                    list(
-                        generate_step(
-                            ids,
-                            model,
-                            None,
-                            None,
-                            temperature=0.0,
-                            max_tokens=3,
-                            prefill_step_size=step,
-                            prompt_cache=cache,
-                        )
-                    )
-                    self.assertEqual(cache[0].prefill_length, length)
-                    self.assertEqual(cache[0].state[0].shape[2], length + 2)
-                    np.testing.assert_allclose(
-                        np.array(cache[0].state[0][:, :, :length]),
-                        reference_keys,
-                        atol=1e-6,
-                        rtol=1e-6,
-                    )
+def test_deepseek_ocr_clip_mlp_uses_quick_gelu(deepseek_ocr_vision):
+    module, config = deepseek_ocr_vision
+    x = np.array([-3, -1, 0, 1, 3], dtype=np.float32)
+    actual = module.MLP(config).activation_fn(mx.array(x))
+    expected = x / (1 + np.exp(-1.702 * x))
+    np.testing.assert_allclose(np.array(actual), expected, atol=1e-6)
 
-        # An APC hit may supply only the uncached suffix to the embedding path.
-        # Transfer that suffix length once and include the already cached prefix.
-        ids = mx.arange(5)[None]
-        for cached_tokens in (3, 4):
-            with self.subTest(cached_tokens=cached_tokens):
-                cache = model.language_model.make_cache()
-                prefix = ids[:, :cached_tokens]
-                embeds = model.get_input_embeddings(prefix).inputs_embeds
-                mx.eval(
-                    model.language_model(
-                        prefix, inputs_embeds=embeds, cache=cache
-                    ).logits
-                )
-                list(
-                    generate_step(
-                        ids[:, cached_tokens:],
-                        model,
-                        None,
-                        None,
-                        temperature=0.0,
-                        max_tokens=3,
-                        prefill_step_size=1,
-                        prompt_cache=cache,
-                    )
-                )
-                self.assertEqual(cache[0].prefill_length, 5)
-                self.assertEqual(cache[0].state[0].shape[2], 7)
-                reference_cache = model.language_model.make_cache()
-                embeds = model.get_input_embeddings(ids).inputs_embeds
-                mx.eval(
-                    model.language_model(
-                        ids, inputs_embeds=embeds, cache=reference_cache
-                    ).logits
-                )
-                np.testing.assert_allclose(
-                    np.array(cache[0].state[0][:, :, :5]),
-                    np.array(reference_cache[0].state[0]),
-                    atol=1e-6,
-                    rtol=1e-6,
-                )
 
-    def test_uncached_language_keeps_native_dtype(self):
-        from mlx_vlm.models.unlimited_ocr.config import TextConfig
-        from mlx_vlm.models.unlimited_ocr.language import LanguageModel
-
-        config = TextConfig(
-            hidden_size=8,
-            intermediate_size=16,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            num_key_value_heads=2,
-            vocab_size=16,
-            n_routed_experts=None,
-            n_shared_experts=None,
-        )
-        model = LanguageModel(config)
-        model.set_dtype(mx.bfloat16)
-        self.assertEqual(model.model(mx.array([[1, 2]])).dtype, mx.bfloat16)
-
-    def test_absolute_positions_preserve_channels_and_match_bicubic_reference(self):
-        from PIL import Image
-
-        from mlx_vlm.models.deepseekocr.config import (
-            VisionConfig as DeepseekVisionConfig,
-        )
-        from mlx_vlm.models.deepseekocr.vision import VisionEmbeddings
-
-        config = DeepseekVisionConfig(
-            model_type="vision", hidden_size=8, image_size=56, patch_size=14
-        )
-        embeddings = VisionEmbeddings(config)
-        grid = np.random.default_rng(42).normal(size=(4, 4, 8)).astype(np.float32)
-        cls = np.arange(8, dtype=np.float32).reshape(1, 1, 8)
-        positions = np.concatenate([cls, grid.reshape(1, 16, 8)], axis=1)
-        result = embeddings._get_abs_pos(mx.array(positions), 10)
-        expected_grid = np.stack(
-            [
-                np.array(
-                    Image.fromarray(grid[:, :, channel]).resize(
-                        (3, 3), Image.Resampling.BICUBIC
-                    )
-                )
-                for channel in range(8)
-            ],
-            axis=-1,
-        )
-        expected = np.concatenate([cls, expected_grid.reshape(1, 9, 8)], axis=1)
-        np.testing.assert_allclose(np.array(result), expected, atol=1e-5, rtol=1e-5)
-
-    def test_relative_positions_use_half_pixel_centers(self):
-        from mlx_vlm.models.deepseekocr.sam import get_rel_pos
-
-        result = get_rel_pos(2, 2, mx.arange(5, dtype=mx.float32)[:, None])
-        expected = np.array([[[2], [1 / 3]], [[11 / 3], [2]]], dtype=np.float32)
-        np.testing.assert_allclose(np.array(result), expected, atol=1e-6)
-
-    def test_clip_mlp_uses_quick_gelu(self):
-        from mlx_vlm.models.deepseekocr.config import (
-            VisionConfig as DeepseekVisionConfig,
-        )
-        from mlx_vlm.models.deepseekocr.vision import MLP
-
-        config = DeepseekVisionConfig(
-            model_type="vision", hidden_size=4, intermediate_size=4
-        )
-        x = np.array([-3, -1, 0, 1, 3], dtype=np.float32)
-        actual = MLP(config).activation_fn(mx.array(x))
-        expected = x / (1 + np.exp(-1.702 * x))
-        np.testing.assert_allclose(np.array(actual), expected, atol=1e-6)
-
-    def test_unlimited_clip_norm_default_matches_reference(self):
-        from mlx_vlm.models.deepseekocr.config import (
-            VisionConfig as DeepseekVisionConfig,
-        )
-        from mlx_vlm.models.unlimited_ocr.config import VisionConfig
-
-        self.assertEqual(VisionConfig(model_type="vision").layer_norm_eps, 1e-5)
-        self.assertEqual(DeepseekVisionConfig(model_type="vision").layer_norm_eps, 1e-6)
+@pytest.mark.parametrize("name,eps", [("unlimited_ocr", 1e-5), ("deepseekocr", 1e-6)])
+def test_ocr_clip_norm_default(name, eps):
+    module = importlib.import_module(f"mlx_vlm.models.{name}")
+    assert module.VisionConfig(model_type="vision").layer_norm_eps == eps
 
 
 class TestUnlimitedOCR2Dash:
