@@ -8139,3 +8139,114 @@ def test_unload_releases_model_before_allocator_clear(monkeypatch):
     )
     assert server.unload_model_sync()
     assert observations and all(observations)
+
+
+@pytest.mark.parametrize("api", ["chat", "responses", "messages"])
+@pytest.mark.parametrize("batching", [False, True])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("real_call", [False, True])
+@pytest.mark.parametrize("syntax", ["gemma4", "json_tools", "preopened-custom"])
+def test_tool_examples_in_reasoning_are_not_executed(
+    client, api, batching, stream, real_call, syntax
+):
+    # A missing end marker in the reasoning example used to swallow the actual
+    # call, making final parsing disagree with the already streamed arguments.
+    gemma = syntax == "gemma4"
+    parser = load_tool_module("gemma4" if gemma else "json_tools")
+    call = (
+        '<|tool_call>call:get_weather{city:<|"|>Warsaw<|"|>}<tool_call|>'
+        if gemma
+        else '<tool_call>{"name":"get_weather","arguments":{"city":"Warsaw"}}</tool_call>'
+    )
+    old_call = call.replace("Warsaw", "Berlin")
+    start, end = (
+        ("<|channel>thought", "<channel|>") if gemma else ("<think>", "</think>")
+    )
+    options, prompt = {}, "prompt"
+    if syntax == "preopened-custom":
+        start, end = "<reason>", "</reason>"
+        options = dict(
+            thinking_start_token=start, thinking_end_token=end, enable_thinking=True
+        )
+        prompt += start
+    parts = [
+        "" if syntax == "preopened-custom" else start,
+        "Previous example: "
+        + (old_call.removesuffix(parser.tool_call_end) if gemma else old_call),
+        end,
+        call if real_call else "Done.",
+    ]
+    text = "".join(parts)
+    tokens = [
+        _token(part, finish_reason="stop" if i == len(parts) - 1 else None)
+        for i, part in enumerate(parts)
+    ]
+    with _endpoint(
+        parser=parser,
+        template=prompt,
+        result=_result(text, finish_reason="stop"),
+        chunks=[_result(t.text, finish_reason=t.finish_reason) for t in tokens],
+        generator=_streaming(tokens) if batching else None,
+    ):
+        response = _post(client, api, tools=[_tool(api=api)], stream=stream, **options)
+    assert response.status_code == 200, response.text
+    if api == "responses":
+        body = _completed_response(response) if stream else response.json()
+        calls = [
+            (c["name"], json.loads(c["arguments"]))
+            for c in body["output"]
+            if c["type"] == "function_call"
+        ]
+    elif api == "chat":
+        if stream:
+            events = _data(response)
+            choices = [e["choices"][0] for e in events if e.get("choices")]
+            assert choices[-1]["finish_reason"] == (
+                "tool_calls" if real_call else "stop"
+            )
+            fragments = [
+                c for choice in choices for c in choice["delta"].get("tool_calls") or []
+            ]
+            assert all(c["index"] == 0 for c in fragments)
+            calls = (
+                [
+                    (
+                        fragments[0]["function"]["name"],
+                        json.loads(
+                            "".join(
+                                c["function"].get("arguments", "") for c in fragments
+                            )
+                        ),
+                    )
+                ]
+                if fragments
+                else []
+            )
+        else:
+            calls = [
+                (c["function"]["name"], json.loads(c["function"]["arguments"]))
+                for c in response.json()["choices"][0]["message"].get("tool_calls")
+                or []
+            ]
+    elif stream:
+        events = _data(response)
+        assert events[-1]["type"] == "message_stop"
+        blocks = [
+            e["content_block"]
+            for e in events
+            if e["type"] == "content_block_start"
+            and e["content_block"]["type"] == "tool_use"
+        ]
+        arguments = "".join(
+            e["delta"].get("partial_json", "")
+            for e in events
+            if e["type"] == "content_block_delta"
+        )
+        calls = [(b["name"], json.loads(arguments)) for b in blocks]
+    else:
+        calls = [
+            (b["name"], b["input"])
+            for b in response.json()["content"]
+            if b["type"] == "tool_use"
+        ]
+    assert calls == ([("get_weather", {"city": "Warsaw"})] if real_call else [])

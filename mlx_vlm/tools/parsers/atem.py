@@ -3,10 +3,9 @@
 import json
 import re
 
-# Muse emits a self-reasoning turn before routing an ATEM call. Starting at the
-# reasoning envelope lets the shared server remove the complete protocol block
-# from assistant content after parsing the invocation.
-tool_call_start = "to=self<|message|>"
+# Match the invocation envelope, not the preceding reasoning turn. Server
+# reasoning isolation must be able to remove that turn before parsing calls.
+tool_call_start = "<atem:function_calls>"
 tool_call_end = "</atem:function_calls>"
 
 _INVOKE_PATTERN = re.compile(

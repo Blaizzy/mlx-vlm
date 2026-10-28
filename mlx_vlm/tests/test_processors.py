@@ -2655,7 +2655,7 @@ def _weather_tools(**fields):
 WEATHER_TOOLS = _weather_tools(city="string", days="integer")
 # Literal wire examples are independent of the parser's marker constants.
 WIRE_CALLS = {
-    "atem": 'to=self<|message|><atem:function_calls><atem:invoke name="get_weather">'
+    "atem": '<atem:function_calls><atem:invoke name="get_weather">'
     '<atem:parameter name="city">Paris</atem:parameter>'
     '<atem:parameter name="days">3</atem:parameter></atem:invoke></atem:function_calls>',
     "cohere2_moe": '<|START_ACTION|>{"tool_name":"get_weather",'
