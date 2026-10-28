@@ -4313,6 +4313,7 @@ class _Batch:
     def __init__(self, uids, steps, **kwargs):
         self.uids, self.steps, self.kwargs = uids, steps, kwargs
         self.active, self.inserted, self.sizes = {}, [], []
+        self.draft_model, self.uid_count = kwargs.get("draft_model"), 0
         if kwargs.get("draft_model") is not None:
             self.apc = NS(prepare_prefill=MagicMock())
 
@@ -4320,6 +4321,7 @@ class _Batch:
         uid = next(self.uids)
         self.active[uid] = 0
         self.inserted.append(uid)
+        self.uid_count = uid + 1
         return (uid,)
 
     def remove(self, uid):
@@ -5056,6 +5058,211 @@ class TestResponseGenerator:
 
         assert processors == ["processor"]
         assert mock_build.call_args.args[1] == {"type": "object"}
+
+
+class TestStructuredSpeculativeFallback:
+    @pytest.mark.parametrize("thinking_budget", [None, 8])
+    def test_admission_preserves_processors(self, thinking_budget):
+        processor = lambda tokens, logits: logits
+        args = Args(
+            logits_processors=[processor],
+            enable_thinking=True,
+            thinking_budget=thinking_budget,
+        )
+        gen = _ready_generator(
+            draft_model=object(),
+            _cpu_preprocess=lambda *a: {"input_ids": mx.array([[1, 2, 3]])},
+            tokenizer=NS(
+                encode=lambda text, **kw: {
+                    "<think>": [10],
+                    "</think>": [20],
+                    "\n": [30],
+                }[text]
+            ),
+        )
+        queued = _capture_requests(gen)
+        _, tokens = gen.generate("prompt", args=args)
+        tokens.close()
+        assert queued[0].args is args
+        assert queued[0].args.logits_processors is args.logits_processors
+        assert (queued[0].thinking_budget_criteria is None) == (thinking_budget is None)
+        wrapped = gen._make_logits_processors(args, mx.array([[1, 2, 3]]))
+        assert wrapped[0].processor is processor
+
+    def test_nonstructured_thinking_budget_still_rejected(self):
+        gen = _ready_generator(draft_model=object())
+        with pytest.raises(ValueError, match="thinking_budget is not supported"):
+            gen.generate("prompt", args=Args(thinking_budget=8))
+        assert gen.requests.empty()
+
+    @pytest.mark.parametrize("api", ["chat", "responses"])
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_schema_routes_preserve_processor(self, client, api, stream):
+        # Exercise HTTP normalization and real admission, not model decoding.
+        schema = dict(
+            type="object",
+            properties={"status": {"const": "ok"}},
+            required=["status"],
+            additionalProperties=False,
+        )
+        original_schema = copy.deepcopy(schema)
+        processor = lambda tokens, logits: logits
+        gen = _ready_generator(
+            draft_model=object(), tokenizer=NS(decode=lambda tokens: "")
+        )
+        queued = _capture_requests(gen, prompt_tokens=3)
+        put = gen.requests.put
+
+        def submit(request):
+            put(request)
+            request.rqueue.put(_token('{"status":"ok"}', finish_reason="stop"))
+            request.rqueue.put(None)
+
+        gen.requests.put = submit
+        format = dict(type="json_schema", name="status", schema=schema)
+        payload = (
+            dict(response_format=dict(type="json_schema", json_schema=format))
+            if api == "chat"
+            else dict(text={"format": format})
+        )
+        with (
+            _endpoint(generator=gen),
+            patch.object(
+                server, "build_json_schema_logits_processor", return_value=processor
+            ) as build,
+        ):
+            response = _post(
+                client, api, stream=stream, enable_thinking=False, **payload
+            )
+        assert response.status_code == 200, response.text
+        if stream:
+            text = _thinking_text(response, api)[1]
+        elif api == "chat":
+            text = response.json()["choices"][0]["message"]["content"]
+        else:
+            text = response.json()["output_text"]
+        assert json.loads(text) == {"status": "ok"}
+        assert len(queued) == 1
+        assert queued[0].args.logits_processors[0] is processor
+        assert build.call_count == 1 and build.call_args.args[1] == original_schema
+        assert schema == original_schema
+
+    @pytest.mark.parametrize(
+        "capacity,arrival,cancel",
+        [
+            (None, "coalesced", False),
+            (1, "queued", False),
+            (None, "active", False),
+            (None, "coalesced", True),
+        ],
+    )
+    def test_mtp_ar_mtp_routing(self, monkeypatch, capacity, arrival, cancel):
+        # Use real UID allocation/processor storage; only decoding is synthetic.
+        real_batch = generation.BatchGenerator
+        gen, batches = _worker_setup(monkeypatch, draft_kind="mtp", idle=True)
+        gen._initialize_model()
+        gen._initialize_model = lambda: None
+        draft_model = gen.draft_model
+        processor = lambda tokens, logits: logits
+        processors, removed = [processor], []
+        queues = [_enqueue(gen, max_tokens=2)]
+
+        def enqueue_peers(*args):
+            if len(queues) == 1:
+                queues.append(
+                    _enqueue(gen, 2, max_tokens=2, logits_processors=processors)
+                )
+                queues.append(_enqueue(gen, 3, max_tokens=2))
+
+        class RoutingBatch(_IdleBatch):
+            def __init__(self, *args, **kwargs):
+                assert not batches or batches[-1].closed
+                super().__init__(count(), 2, **kwargs)
+                self._unprocessed_sequences = []
+                self._stream = kwargs["stream"]
+                self.logits_processors, self.max_tokens = [], 2
+
+            @property
+            def unprocessed_prompts(self):
+                return self._unprocessed_sequences
+
+            def insert(self, *args, **kwargs):
+                uids = real_batch.insert(self, *args, **kwargs)
+                for uid in uids:
+                    self.active[uid] = 0
+                self.inserted.extend(uids)
+                return uids
+
+            def remove(self, uid):
+                result = real_batch.remove(self, uid)
+                if result:
+                    self.active.pop(uid)
+                    removed.append(uid)
+                return result
+
+            def next(self, **kwargs):
+                for row in self._unprocessed_sequences:
+                    assert row[4] == (processors if self.draft_model is None else [])
+                    if self.draft_model is None:
+                        assert row[4][0] is processor
+                result = super().next(**kwargs)
+                self._unprocessed_sequences = [
+                    row for row in self._unprocessed_sequences if row[0] in self.active
+                ]
+                if arrival == "active":
+                    enqueue_peers()
+                if cancel and len(self.sizes) == 1 and len(batches) <= 2:
+                    # Cancel the first request, then repeat its stale cancellation
+                    # while the structured request is active in a new batch.
+                    gen._cancel(0)
+                return result
+
+            def close(self):
+                assert not self.has_work
+                super().close()
+
+        def make_batch(*args, **kwargs):
+            batch = RoutingBatch(*args, **kwargs)
+            batches.append(batch)
+            return batch
+
+        monkeypatch.setattr(generation, "BatchGenerator", make_batch)
+        monkeypatch.setattr(generation, "get_max_num_seqs", lambda: capacity)
+        monkeypatch.setattr(
+            generation, "get_speculative_batch_coalesce_s", lambda: 0.01
+        )
+        coalesce = Mock(side_effect=enqueue_peers)
+        monkeypatch.setattr(generation.time, "sleep", coalesce)
+        snapshot = Mock(return_value=(0, 0, 0))
+        monkeypatch.setattr(generation, "speculative_stats_snapshot", snapshot)
+        monkeypatch.setattr(generation, "speculative_stats_since", lambda *a: (2, 1, 2))
+        if arrival == "queued":
+            enqueue_peers()
+        elif arrival == "active":
+            monkeypatch.setattr(
+                generation, "get_speculative_batch_coalesce_s", lambda: 0
+            )
+        gen._stop = True
+        gen._run_impl()
+        results = [_drain(queue) for queue in queues]
+        assert [len(tokens) for _, tokens in results] == [1 if cancel else 2, 2, 2]
+        assert all(queue.empty() for queue in queues)
+        assert [ctx.uid for ctx, _ in results] == [0, 1, 2]
+        assert [b.draft_model for b in batches] == [draft_model, None, draft_model]
+        assert [b.kwargs["draft_kind"] for b in batches] == ["mtp", None, "mtp"]
+        assert all(b.closed for b in batches)
+        assert gen.draft_model is draft_model
+        assert removed == ([0] if cancel else [])
+        assert snapshot.call_count == 2
+        assert (
+            results[1][1][-1].finish_reason
+            == results[2][1][-1].finish_reason
+            == "length"
+        )
+        assert results[1][1][-1].draft_kind is results[1][1][-1].draft_rounds is None
+        assert results[2][1][-1].draft_kind == "mtp"
+        if arrival == "coalesced":
+            coalesce.assert_called_once_with(0.01)
 
 
 @pytest.mark.parametrize(
