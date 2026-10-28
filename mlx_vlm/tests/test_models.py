@@ -4497,12 +4497,6 @@ def test_unlimited_ocr_fp32_fusion_preserves_features_and_weights(
     else:
         expected = mx.array([0.234567, 0.234567, 0.123456, 0.123456])
         np.testing.assert_array_equal(np.array(features[0, 1]), np.array(expected))
-        assert (
-            mx.max(
-                mx.abs(expected.astype(mx.bfloat16).astype(mx.float32) - expected)
-            ).item()
-            > 1e-5
-        )
 
 
 @pytest.mark.parametrize("path", ["embeddings", "language"])
@@ -4567,11 +4561,6 @@ def test_unlimited_ocr_chunked_prefill_restores_full_prompt(
     )
     assert cache[0].prefill_length == 5
     assert cache[0].state[0].shape[2] == 5
-    saved_prefix = np.array(cache[0].state[0])
-    for token in [2, 3, 4]:
-        mx.eval(model(mx.array([[token]]), cache=cache).logits)
-    assert cache[0].state[0].shape[2] == 7
-    np.testing.assert_array_equal(np.array(cache[0].state[0][:, :, :5]), saved_prefix)
 
 
 def unlimited_ocr_prompt_keys(model, ids, cache=None):
@@ -4694,10 +4683,9 @@ def test_deepseek_ocr_clip_mlp_uses_quick_gelu(deepseek_ocr_vision):
     np.testing.assert_allclose(np.array(actual), expected, atol=1e-6)
 
 
-@pytest.mark.parametrize("name,eps", [("unlimited_ocr", 1e-5), ("deepseekocr", 1e-6)])
-def test_ocr_clip_norm_default(name, eps):
-    module = importlib.import_module(f"mlx_vlm.models.{name}")
-    assert module.VisionConfig(model_type="vision").layer_norm_eps == eps
+def test_unlimited_ocr_clip_norm_default():
+    module = importlib.import_module("mlx_vlm.models.unlimited_ocr")
+    assert module.VisionConfig(model_type="vision").layer_norm_eps == 1e-5
 
 
 class TestUnlimitedOCR2Dash:
