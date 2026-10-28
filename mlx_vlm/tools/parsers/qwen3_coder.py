@@ -39,6 +39,18 @@ def _get_arguments_config(func_name: str, tools: Optional[Any]) -> dict:
 
 def _convert_param_value(param_value: str, param_name: str, param_config: dict) -> Any:
     """Convert parameter value based on its type in the schema."""
+    param = param_config.get(param_name)
+    if (
+        isinstance(param, dict)
+        and isinstance(param.get("type"), str)
+        and param["type"].strip().lower() in _string_types
+    ):
+        # A string parameter keeps the text "null" verbatim, unless the schema
+        # declares it nullable (then "null" is the missing value).
+        if param_value.lower() == "null" and param.get("nullable") is True:
+            return None
+        return param_value
+
     if param_value.lower() == "null":
         return None
 
