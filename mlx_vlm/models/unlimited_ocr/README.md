@@ -149,6 +149,56 @@ mlx_vlm.generate \
 These prompts are experimental for Unlimited-OCR; use the output comparison to
 decide whether a prompt changes behavior usefully for your document.
 
+## Floating-point precision with quantized language weights
+
+For dense OCR, preserve precision across the whole visual-to-language path.
+Keeping only the visual encoder in FP32 is insufficient if its features are
+assigned into a BF16 token-embedding buffer. The model promotes the fused buffer
+to the common dtype of the text and visual features, and cached decoding retains
+the floating-point dtype of the prefill keys (or their quantization scales).
+This applies to both v1 R-SWA and v2 DASH decoding, including 4-/8-bit DASH KV
+caches. It does not requantize token embeddings or change packed language weights.
+
+For an 8-bit checkpoint, an explicit FP32 visual path can be configured as follows:
+
+```python
+import mlx.core as mx
+from mlx_vlm import generate, load
+from mlx_vlm.prompt_utils import apply_chat_template
+
+model, processor = load("mlx-community/Unlimited-OCR-8bit")
+for name in ("sam_model", "vision_model", "projector"):
+    getattr(model, name).set_dtype(mx.float32)
+model.image_newline = model.image_newline.astype(mx.float32)
+model.view_separator = model.view_separator.astype(mx.float32)
+prompt = apply_chat_template(
+    processor, model.config, "document parsing.", num_images=1
+).strip()
+result = generate(
+    model, processor, prompt, image=["document.png"],
+    temperature=0.0, max_tokens=32768,
+)
+print(result.text)
+```
+
+`model.set_dtype(mx.float32)` is another explicit option: it casts floating-point
+arrays while retaining packed integer weights. Casting an unquantized BF16
+language model also doubles the storage of those weights, so account for that
+memory cost. Loading a checkpoint does not force a new global dtype.
+
+Use the explicit FP32 visual path when checking low-bit OCR quality, including
+MXFP4. In a six-page Unlimited-OCR-2 smoke test, MXFP4 with BF16 vision omitted a
+paragraph despite reaching EOS; FP32 vision recovered it. Successful termination
+alone does not establish transcription completeness.
+
+Like DASH, R-SWA records the full prompt boundary before processing its first
+chunk. The last single prompt token left by chunked prefill remains part of the
+persistent reference, even with a prefill step size of one. The boundary survives
+partial-prefill checkpoints in the existing four-field cache metadata format.
+The model's embedding path supplies the full prompt automatically. Callers that
+chunk the language model directly must first supply the complete token sequence
+through `language_model._prompt_ids`, as for DASH.
+
 ## CLI Examples
 
 ### Single image (`gundam` mode, default)
