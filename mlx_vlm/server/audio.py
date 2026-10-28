@@ -61,8 +61,10 @@ class AudioSpeechRequest(FlexibleBaseModel):
 
 class AudioTranscriptionRequest(FlexibleBaseModel):
     model: str
+    task: Optional[str] = None
     language: Optional[str] = None
     prompt: Optional[str] = None
+    system_prompt: Optional[str] = None
     temperature: Optional[float] = None
     response_format: str = "json"
     verbose: bool = False
@@ -491,8 +493,10 @@ async def _parse_transcription_request(
 
     payload = AudioTranscriptionRequest(
         model=model,
+        task=_clean_form_value(form.get("task")),
         language=_clean_form_value(form.get("language")),
         prompt=_clean_form_value(form.get("prompt")),
+        system_prompt=_clean_form_value(form.get("system_prompt")),
         temperature=_form_float(form.get("temperature")),
         response_format=_clean_form_value(form.get("response_format")) or "json",
         verbose=_form_bool(form.get("verbose"), default=False),
@@ -662,10 +666,18 @@ def _build_stt_generate_kwargs(
     accepted = _callable_parameters(model.generate)
 
     if prompt:
-        if _accepts_parameter(accepted, "context"):
-            kwargs.setdefault("context", prompt)
-        elif _accepts_parameter(accepted, "text"):
-            kwargs.setdefault("text", prompt)
+        # Prefer a declared parameter over **kwargs, which may silently ignore
+        # aliases (for example a native prompt model also accepting **kwargs).
+        params = accepted.get("params", set()) if accepted else set()
+        for name in ("prompt", "context", "text"):
+            if name in params:
+                kwargs.setdefault(name, prompt)
+                break
+        else:
+            # Preserve the context convention for wrappers with **kwargs only
+            # or callables whose signatures cannot be inspected.
+            if _accepts_parameter(accepted, "context"):
+                kwargs.setdefault("context", prompt)
 
     if translate:
         if _accepts_parameter(accepted, "task"):

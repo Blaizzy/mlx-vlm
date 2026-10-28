@@ -6552,6 +6552,120 @@ def test_audio_transcription_request(
     loader.assert_called_once_with("fake-stt", model_kind="audio_stt")
 
 
+@pytest.mark.parametrize(
+    "endpoint, options, expected",
+    [
+        ("transcriptions", {}, {"task": "asr"}),
+        (
+            "transcriptions",
+            {"task": "qa", "prompt": "What time is the meeting?"},
+            {"task": "qa", "prompt": "What time is the meeting?"},
+        ),
+        (
+            "transcriptions",
+            {"task": "qa", "system_prompt": "Answer the spoken question."},
+            {"task": "qa", "system_prompt": "Answer the spoken question."},
+        ),
+        ("transcriptions", {"task": "saa"}, {"task": "saa"}),
+        ("transcriptions", {"task": "rich"}, {"task": "rich"}),
+        (
+            "translations",
+            {"task": "saa", "language": "German"},
+            {"task": "translate", "language": "German"},
+        ),
+    ],
+    ids=[
+        "default",
+        "audio-question",
+        "spoken-request",
+        "speakers",
+        "rich",
+        "translate",
+    ],
+)
+@pytest.mark.parametrize("stream", [False, True], ids=["json", "stream"])
+def test_audio_native_task_and_prompt(
+    audio_client, monkeypatch, endpoint, options, expected, stream
+):
+    fake, _ = _audio_backend(monkeypatch, {"text": "answer"})
+    calls = []
+
+    def generate(
+        audio,
+        *,
+        task="asr",
+        prompt=None,
+        system_prompt=None,
+        language=None,
+        stream=False,
+        **kwargs,
+    ):
+        assert Path(audio).exists()
+        calls.append(
+            dict(
+                task=task, prompt=prompt, system_prompt=system_prompt, language=language
+            )
+        )
+        assert "context" not in kwargs
+        result = {"text": "answer"}
+        return iter([result]) if stream else result
+
+    monkeypatch.setattr(fake, "generate", generate)
+    monkeypatch.setattr(
+        server_audio,
+        "audio_read",
+        lambda buffer, always_2d=False: (np.zeros(160, dtype=np.float32), 16000),
+    )
+    response = _upload(audio_client, endpoint, stream=str(stream).lower(), **options)
+    assert response.status_code == 200, response.text
+    assert response.json() == {"text": "answer"}
+    assert len(calls) == 1
+    assert {
+        key: value for key, value in calls[0].items() if value is not None
+    } == expected
+
+
+@pytest.mark.parametrize(
+    "generate, options, expected",
+    [
+        (
+            lambda audio, *, prompt=None, context=None, **kwargs: (prompt, context),
+            {"context": "existing context"},
+            ("instruction", "existing context"),
+        ),
+        (lambda audio, *, context=None, **kwargs: context, {}, "instruction"),
+        (lambda audio, *, text=None, **kwargs: text, {}, "instruction"),
+        (
+            lambda audio, *, context=None, **kwargs: context,
+            {"context": "existing context"},
+            "existing context",
+        ),
+        (
+            lambda audio, *, text=None, **kwargs: text,
+            {"text": "existing text"},
+            "existing text",
+        ),
+        (lambda audio, **kwargs: kwargs["context"], {}, "instruction"),
+    ],
+    ids=[
+        "native-prompt",
+        "context",
+        "text",
+        "keep-context",
+        "keep-text",
+        "kwargs-only",
+    ],
+)
+def test_audio_prompt_uses_explicit_parameter(generate, options, expected):
+    request = server_audio.AudioTranscriptionRequest(
+        model="test", prompt="instruction", **options
+    )
+    kwargs = server_audio._build_stt_generate_kwargs(
+        NS(generate=generate), request, translate=False
+    )
+    assert generate("audio.wav", **kwargs) == expected
+
+
 @pytest.mark.usefixtures("reset_audio_runtime")
 def test_audio_tts_and_stt_caches_are_independent(monkeypatch):
     fake_tts = NS(model_type="fake_tts")
