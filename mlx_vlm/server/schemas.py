@@ -402,6 +402,18 @@ class CompactionControl(BaseModel):
     compact_threshold: int = Field(..., gt=0)
 
 
+class ToolResultNote(BaseModel):
+    tool_call_id: str = Field(..., min_length=1)
+    text: str = Field(..., max_length=8192)
+
+
+class ToolResultContext(BaseModel):
+    """Exact client excerpts, rendered only when their tool result is absent."""
+
+    entries: List[ToolResultNote] = Field(default_factory=list, max_length=256)
+    max_bytes: int = Field(8192, ge=512, le=8192)
+
+
 class OpenAIRequest(ImageProcessingRequest):
     """
     OpenAI-compatible request structure.
@@ -415,6 +427,7 @@ class OpenAIRequest(ImageProcessingRequest):
         None,
         description="Request-local text appended as user context for generation and token counting, excluded from stored history and compaction summaries. Resend the current value on each request.",
     )
+    tool_result_context: Optional[ToolResultContext] = None
     model: str = Field(..., description="The model to use for generation.")
     adapter_path: Optional[str] = Field(
         None, description="The path to the adapter weights."
@@ -946,6 +959,7 @@ class ChatRequest(GenerationRequest):
         None,
         description="Request-local text appended as user context for generation and token counting, excluded from compaction summaries and cached conversation prefixes.",
     )
+    tool_result_context: Optional[ToolResultContext] = None
     context_management: Optional[List[CompactionControl]] = Field(None, max_length=1)
     stream_options: Optional[StreamOptions] = None
     tools: Optional[List[Any]] = Field(None, description="Tools the model may call.")

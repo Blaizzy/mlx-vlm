@@ -79,6 +79,21 @@ Models may still refer to environment data in their generated output, which
 remains ordinary conversation history. Oversized transient context is subject
 to the same input budget as protected user text.
 
+Clients can also send `tool_result_context` with `entries` containing
+`tool_call_id` and `text`, plus a `max_bytes` budget (512–8192, default 8192).
+These should be exact source excerpts, not new instructions. An entry contributes
+no model tokens while its tool result remains in the resolved conversation.
+When compaction removes that result, the server renders its excerpt in a bounded
+user-context block before the retained conversation. Newly appended tool results
+therefore do not change the recovered prefix. Resend entries with each request;
+they are excluded from summaries, saved history and compaction capsules, just
+like `transient_context`. Token counting includes only the active excerpts.
+
+For text requests with `transient_context`, the server also renders the stable
+conversation without the changing suffix and verifies its shared token prefix.
+Hybrid APC prioritizes a checkpoint at that boundary within its existing entry
+budget. Multimodal requests retain the existing media-safe checkpoint schedule.
+
 Start a server with APC:
 
 ```bash
@@ -152,8 +167,14 @@ consume an exchange and reduce its input. Oversized tool text is shortened with
 an explicit omission marker while retaining call/result pairing. Protected user
 or instruction text that cannot fit still requires a smaller request. The
 standalone `/responses/compact` endpoint still requires its input to fit.
-Automatic summaries reserve 512 tokens at 4K and 1024 at 8K, retry once with up to
-twice that budget, and retain labelled partial content if the cap is still reached.
+Automatic summaries allow up to 512 tokens at 4K and 1024 at 8K, retry once with up
+to twice that budget, and retain labelled partial content if the cap is still reached.
+Both allowances are capped by the space left after the protected tail and handoff
+envelope. A summary that reduces the input and fits the context window can be used
+even if it misses the desired percentage reduction. If early automatic compaction
+cannot meet its budget but the existing input still fits, generation continues with
+that input and the remaining output capacity. Explicit compaction still reports
+unsuccessful reduction, and the hard context limit is enforced on every route.
 Reasoning-only exhaustion falls back to labelled conversation excerpts, not model
 reasoning. Summary prompts close an actually pre-opened thinking suffix when a
 template ignores `enable_thinking=false`. These recovery paths are lossy; they do

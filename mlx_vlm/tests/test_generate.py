@@ -1974,6 +1974,22 @@ def test_sampling_filter_matches_numpy(name, values, reference, tolerance):
         assert (output != -mx.inf).tolist() == [True, False, False, False, False]
 
 
+@pytest.mark.parametrize("penalty", [None, 0.0, 1.0, 1.1])
+def test_neutral_repetition_penalty_preserves_other_processors(penalty):
+    processors = sampling.make_logits_processors(
+        repetition_penalty=penalty, presence_penalty=1.0, frequency_penalty=1.0
+    )
+    assert len(processors) == (3 if penalty == 1.1 else 2)
+    tokens = mx.array([0, 0, 1])
+    logits = mx.array([[2.0, -2.0, 3.0]])
+    for processor in processors:
+        logits = processor(tokens, logits)
+    expected = [2.0 / 1.1 - 3, -2.0 * 1.1 - 2, 3.0] if penalty == 1.1 else [-1, -4, 3]
+    assert mx.allclose(logits, mx.array([expected])).item()
+    if penalty != 1.1:
+        assert sampling.make_logits_processors(repetition_penalty=penalty) == []
+
+
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 @pytest.mark.parametrize("typical_p", [0.2, 0.5, 0.9])
 def test_typical_p_low_precision_logprobs_match_float32(dtype, typical_p):

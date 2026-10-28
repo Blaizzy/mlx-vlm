@@ -1266,8 +1266,13 @@ class Qwen3_5Model(nn.Module):
             cache = [None] * len(self.layers)
 
         fa_cache = cache[self.fa_idx]
+        # Row extraction keeps padded prefill equivalent to an unpadded prompt.
+        # Unpadded decode retains allocated KV buffers instead of copying the
+        # entire prefix for every generated token; padded rows still use the
+        # row-wise path below, including unfinished single-token prefill chunks.
         if (
             h.shape[0] == 1
+            and h.shape[1] > 1
             and hidden_sink is None
             and fa_cache is not None
             and _is_single_row_batch_cache(fa_cache)

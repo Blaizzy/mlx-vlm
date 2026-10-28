@@ -1104,7 +1104,7 @@ Common APC environment variables:
 | `APC_BLOCK_SIZE` | `16` | Tokens per APC block |
 | `APC_CHECKPOINT_ENTRIES` | `2` | In-memory checkpoint entries; also bounds snapshots captured per hybrid prompt (disk-only mode captures two) |
 | `APC_CHECKPOINT_GUARD_TOKENS` | `1` | Tokens retained after a reusable hybrid checkpoint boundary; the default preserves the normal final-token prefill boundary |
-| `APC_CHECKPOINT_INTERVAL_TOKENS` | `2048` | Spacing of intermediate hybrid checkpoints, rounded up to a multiple of `APC_BLOCK_SIZE`; `0` keeps only the final checkpoint |
+| `APC_CHECKPOINT_INTERVAL_TOKENS` | `2048` | Spacing of intermediate hybrid checkpoints, rounded up to a multiple of `APC_BLOCK_SIZE`; observed prompt divergence takes priority within the entry budget; `0` keeps only the final checkpoint |
 | `APC_MEMORY_MAX_GB` | auto | Resident block and checkpoint budget in GiB: 10% of Metal's recommended working set, capped at 8 GiB; `0` retains caches only on disk |
 | `APC_MEMORY_RESERVE_GB` | auto | Additional memory headroom in GiB: 10% of Metal's recommended working set, at least 1 GiB |
 | `APC_DISK_ENABLED` | `1` | Set to `0` to disable disk persistence |
@@ -1129,8 +1129,11 @@ state cannot be rolled back by slicing K/V tensors.
 
 Hybrid prefill now captures intermediate checkpoints as well as the final guard
 checkpoint, in streaming, continuous batching and DiffusionGemma generation.
-With the defaults, each prompt stores its latest 2,048-token boundary before the
-final checkpoint and the final checkpoint itself. For example, a 30,000-token
+For text API requests with `transient_context`, the server verifies and prioritizes
+the token boundary before that mutable suffix. Otherwise, observed divergence
+from resident prompts takes priority. With neither hint, each prompt stores its
+latest 2,048-token boundary before the final checkpoint and the final checkpoint
+itself. For example, a 30,000-token
 document followed by 20 instruction tokens can reuse 28,672 tokens when the
 instructions change. The same checkpoints persist across server restarts when
 the disk tier is enabled.
