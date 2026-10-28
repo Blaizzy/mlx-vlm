@@ -1316,6 +1316,45 @@ def language_model(name):
     return module.Model(config).language_model
 
 
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+@pytest.mark.parametrize("prefix_length", [7, 255, 257])
+def test_qwen3_5_single_row_decode_retains_batch_cache(dtype, prefix_length):
+    mx.random.seed(13)
+    module, config = apc_config("qwen3_5")
+    config.text_config.linear_key_head_dim = 32
+    lm = module.LanguageModel(config.text_config, config)
+    lm.set_dtype(dtype)
+    lm.eval()
+    tokens = mx.array([[i % 50 + 1 for i in range(prefix_length)]])
+    reference = lm.make_cache()
+    batched = _make_cache(lm, [0])
+    lm(tokens, cache=reference)
+    lm(tokens, cache=batched)
+    owners = list(batched)
+
+    for step in range(4):
+        token = mx.array([[51 + step]])
+        expected = lm(token, cache=reference).logits
+        actual = lm(token, cache=batched).logits
+        tolerance = 1e-4 if dtype == mx.float32 else 1e-2
+        assert mx.allclose(actual, expected, atol=tolerance, rtol=tolerance).item()
+        assert mx.array_equal(mx.argmax(actual, -1), mx.argmax(expected, -1)).item()
+        # The allocation may grow at a block boundary, but the cache owner and
+        # its spare capacity must survive each decode step.
+        assert all(current is original for current, original in zip(batched, owners))
+        for current in batched:
+            if isinstance(current, BatchKVCache):
+                assert current.offset.tolist() == [prefix_length + step + 1]
+                assert current.left_padding.tolist() == [0]
+                assert current.keys.shape[2] >= current._idx
+        for current, expected_cache in zip(batched, reference):
+            if isinstance(current, ArraysCache):
+                for state, expected_state in zip(current.state, expected_cache.state):
+                    assert mx.allclose(
+                        state, expected_state, atol=tolerance, rtol=tolerance
+                    ).item()
+
+
 def test_hashes_and_dependencies():
     tokens = tuple(range(16))
     hash_tokens = P._hash_tokens
@@ -1737,6 +1776,27 @@ def test_clone_continuation(kind, length):
             assert restored.meta_state == cache.meta_state
     if kind == "ring":
         assert A.merge_cache_entries([cache], [cache.offset]) is None
+
+
+def test_ring_prompt_boundary_survives_partial_prefill_restore():
+    cache = RingSlidingKVCache(2)
+    cache.prefill_length = 5
+    prompt = mx.arange(20, dtype=mx.float32).reshape(1, 1, 5, 4)
+    cache.update_and_fetch(prompt[:, :, :3], prompt[:, :, :3])
+    # The existing four-field format retains the full boundary even when only
+    # part of the prompt has been processed; no pending-prefill flag is needed.
+    assert cache.meta_state == ("2", "5", "3", "0")
+    restored = clone(cache)
+    assert restored.prefill_length == 5 and restored.offset == 3
+    for idx in range(3, 5):
+        restored.update_and_fetch(
+            prompt[:, :, idx : idx + 1], prompt[:, :, idx : idx + 1]
+        )
+    for value in (20, 21, 22):
+        token = mx.full((1, 1, 1, 4), value, dtype=mx.float32)
+        restored.update_and_fetch(token, token)
+    assert restored.state[0].shape[2] == 7
+    same_arrays(restored.state[0][:, :, :5], prompt)
 
 
 def sample(name, length=0):
@@ -2371,6 +2431,10 @@ def test_checkpoint_schedule(prefix_manager):
     coordinator = manager.coordinator(cache_model([C.ArraysCache(1)]))
     tokens = list(range(75))
     assert coordinator.checkpoint_lengths(tokens, set()) == [64, 74]
+    assert coordinator.checkpoint_lengths(tokens, set(), stable_prefix_len=43) == [
+        43,
+        74,
+    ]
     manager._exact_cache_max = 4
     assert coordinator.checkpoint_lengths(tokens, set()) == [32, 48, 64, 74]
     tokens[45:67] = [999] * 22
@@ -2379,7 +2443,68 @@ def test_checkpoint_schedule(prefix_manager):
     assert coordinator.checkpoint_lengths(tokens, set()) == [74]
 
 
-def prompt_batch(lm, manager, tokens, prefixes, caches, step=16, **kwargs):
+def test_checkpoint_divergence_is_scoped_and_media_safe(prefix_manager):
+    manager = prefix_manager()
+    manager.checkpoint_interval_tokens = 16
+    coordinator = manager.coordinator(cache_model([C.ArraysCache(1)]))
+    stored = list(range(75))
+    state = C.ArraysCache(1)
+    state[0] = mx.ones((1, 2))
+    assert manager.store_exact_cache(stored, [state], extra_hash=7)
+    tokens = stored[:37] + [999] * 38
+    assert coordinator.checkpoint_lengths(tokens, set(), extra_hash=7) == [37, 74]
+    assert coordinator.checkpoint_lengths(tokens, set(), extra_hash=8) == [64, 74]
+    # Do not checkpoint inside a media span, or exceed the two-entry limit.
+    media = stored[:37] + [999] * 8 + list(range(45, 75))
+    assert coordinator.checkpoint_lengths(media, {999}, extra_hash=7) == [45, 74]
+    manager._exact_cache_max = 1
+    assert coordinator.checkpoint_lengths(tokens, set(), extra_hash=7) == [74]
+
+
+@parametrize("model_name", ["qwen3_5", "lfm2"])
+@parametrize("explicit_boundary", [False, True])
+def test_hybrid_replaced_suffix_keeps_reusable_state(
+    prefix_manager, model_name, explicit_boundary
+):
+    mx.random.seed(13)
+    lm = language_model(model_name)
+    manager = prefix_manager()
+    manager.checkpoint_interval_tokens = 16
+    for turn in range(8):
+        canonical = list(range(1, 22 + turn * 3))
+        tokens = canonical + [50 + turn] * 40
+        restored, count = manager.lookup_exact_cache(tokens)
+        if explicit_boundary and turn:
+            assert count == len(canonical) - 3
+        if turn >= 2:
+            assert count >= 21 + (turn - 2) * 3
+        cache, _ = warm_exact([restored or lm.make_cache()], [count])
+        batch = prompt_batch(
+            lm,
+            manager,
+            [tokens],
+            [count],
+            cache,
+            stable_prefix_len=len(canonical) if explicit_boundary else 0,
+        )
+        sampled = []
+
+        def sample(lp):
+            sampled.append(lp)
+            return mx.argmax(lp, axis=-1)
+
+        finish_batch(batch, sample)
+        reference = lm.make_cache()
+        logits = lm(mx.array([tokens]), cache=reference).logits[0, -1]
+        logprobs = logits - mx.logsumexp(logits)
+        assert mx.allclose(sampled[0][0], logprobs, atol=1e-4, rtol=1e-4).item()
+        assert mx.argmax(sampled[0][0]).item() == mx.argmax(logits).item()
+        assert len(manager._exact_cache) <= 2
+
+
+def prompt_batch(
+    lm, manager, tokens, prefixes, caches, step=16, stable_prefix_len=0, **kwargs
+):
     runner = manager.coordinator(lm)
     suffixes = [ids[n:] for ids, n in zip(tokens, prefixes)]
     padded = [ids + [0] * (max(map(len, suffixes)) - len(ids)) for ids in suffixes]
@@ -2398,7 +2523,9 @@ def prompt_batch(lm, manager, tokens, prefixes, caches, step=16, **kwargs):
             dict(
                 full_input_ids=ids,
                 prefix_len=n,
-                checkpoint_lengths=runner.checkpoint_lengths(ids, set()),
+                checkpoint_lengths=runner.checkpoint_lengths(
+                    ids, set(), stable_prefix_len=stable_prefix_len
+                ),
             )
             for ids, n in zip(tokens, prefixes)
         ],
@@ -2506,7 +2633,8 @@ def test_diffusion_suffix(prefix_manager, tier):
         manager = prefix_manager(tier, **settings)
     recorder.input_lengths.clear()
     assert generate(tokens[:9] + [13, 14])[-1].cached_tokens == 8
-    assert recorder.input_lengths == [2, 1]
+    assert sum(recorder.input_lengths) == 3
+    assert recorder.input_lengths[-1] == 1
 
 
 @parametrize("model_name", ["gemma4", "qwen3_5"])

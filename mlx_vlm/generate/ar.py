@@ -623,6 +623,7 @@ _SEQUENCE_ALIGNED_PROMPT_KWARGS = {
 }
 
 APC_PRIVATE_PROMPT_KEYS = (
+    "_apc_checkpoint_len",
     "_apc_tenant",
     "_apc_image_hash",
     "_apc_semantic_hash",
@@ -2666,10 +2667,17 @@ class BatchGenerator:
             max_prefix_tokens=len(ids_list) - 1,
         )
 
-    def _apc_exact_checkpoint_lengths(self, ids_list: List[int]) -> List[int]:
+    def _apc_exact_checkpoint_lengths(
+        self, ids_list: List[int], extra_hash: int = 0, stable_prefix_len: int = 0
+    ) -> List[int]:
         coordinator = getattr(self, "apc", None)
         if coordinator is not None:
-            return coordinator.checkpoint_lengths(ids_list, self._apc_media_token_ids())
+            return coordinator.checkpoint_lengths(
+                ids_list,
+                self._apc_media_token_ids(),
+                extra_hash=extra_hash,
+                stable_prefix_len=stable_prefix_len,
+            )
         boundary = self._apc_exact_checkpoint_len(ids_list)
         return [boundary] if boundary > 0 else []
 
@@ -2845,7 +2853,11 @@ class BatchGenerator:
                 ),
                 "apc_blocks": picks[i].get("matched_blocks", []) if picks[i] else [],
                 "checkpoint_len": self._apc_exact_checkpoint_len(full_ids[i]),
-                "checkpoint_lengths": self._apc_exact_checkpoint_lengths(full_ids[i]),
+                "checkpoint_lengths": self._apc_exact_checkpoint_lengths(
+                    full_ids[i],
+                    self._apc_extra_hash(prompt_kwargs_list[i] or {}),
+                    (prompt_kwargs_list[i] or {}).get("_apc_checkpoint_len", 0),
+                ),
             }
             for i in range(len(sequences))
         ]
@@ -2907,7 +2919,9 @@ class BatchGenerator:
                     "apc_blocks": [],
                     "checkpoint_len": self._apc_exact_checkpoint_len(list(ids_list)),
                     "checkpoint_lengths": self._apc_exact_checkpoint_lengths(
-                        list(ids_list)
+                        list(ids_list),
+                        extra_hash,
+                        (kw or {}).get("_apc_checkpoint_len", 0),
                     ),
                 }
             )

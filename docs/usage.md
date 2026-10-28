@@ -65,6 +65,35 @@ after a new summary must be prefilled again because their old KV states depended
 on the discarded history. Repeated continuations can cache the new summary and
 retained turns normally. Compaction also works with APC disabled.
 
+For changing environment snapshots, Chat Completions and Responses accept the
+MLX extension `transient_context` (a string, passed through SDK `extra_body`).
+The server appends it as user context for generation and includes it in token
+counts and context budgets. It is excluded from summary prompts, compaction
+capsules, stored Responses history, and the Chat Completions summary-cache key.
+Send the current snapshot on every request; omitting it removes it from the next
+generation. Keep canonical user turns and tool receipts in `messages`/`input`.
+This prevents a client that replays a capsule and sends fresh environment data
+from accumulating old snapshots. It does not erase snapshots previously sent
+as ordinary messages; rebuild those capsules from the canonical transcript.
+Models may still refer to environment data in their generated output, which
+remains ordinary conversation history. Oversized transient context is subject
+to the same input budget as protected user text.
+
+Clients can also send `tool_result_context` with `entries` containing
+`tool_call_id` and `text`, plus a `max_bytes` budget (512–8192, default 8192).
+These should be exact source excerpts, not new instructions. An entry contributes
+no model tokens while its tool result remains in the resolved conversation.
+When compaction removes that result, the server renders its excerpt in a bounded
+user-context block before the retained conversation. Newly appended tool results
+therefore do not change the recovered prefix. Resend entries with each request;
+they are excluded from summaries, saved history and compaction capsules, just
+like `transient_context`. Token counting includes only the active excerpts.
+
+For text requests with `transient_context`, the server also renders the stable
+conversation without the changing suffix and verifies its shared token prefix.
+Hybrid APC prioritizes a checkpoint at that boundary within its existing entry
+budget. Multimodal requests retain the existing media-safe checkpoint schedule.
+
 Start a server with APC:
 
 ```bash
@@ -132,12 +161,25 @@ Max output setting equal to or larger than the context window. Generation stops
 with a length finish reason if it fills the remaining window; the next request
 can compact that history. Input that leaves no room for generation even after
 compaction is still rejected. Automatic and terminal-trigger compaction can
-summarize oversized history in up to eight bounded passes, preserving instructions
-and splitting only between user turns or completed tool-call/result groups. Every
-summary call must fit the model window and reduce its input; otherwise the request
-fails without replacing the original context. A single oversized message or
-indivisible tool group still needs to be reduced by the caller. The standalone
-`/responses/compact` endpoint still requires its input to fit.
+summarize oversized history in bounded passes, preserving instructions and
+splitting between user turns or completed tool-call/result groups. Each pass must
+consume an exchange and reduce its input. Oversized tool text is shortened with
+an explicit omission marker while retaining call/result pairing. Protected user
+or instruction text that cannot fit still requires a smaller request. The
+standalone `/responses/compact` endpoint still requires its input to fit.
+Automatic summaries allow up to 512 tokens at 4K and 1024 at 8K, retry once with up
+to twice that budget, and retain labelled partial content if the cap is still reached.
+Both allowances are capped by the space left after the protected tail and handoff
+envelope. A summary that reduces the input and fits the context window can be used
+even if it misses the desired percentage reduction. If early automatic compaction
+cannot meet its budget but the existing input still fits, generation continues with
+that input and the remaining output capacity. Explicit compaction still reports
+unsuccessful reduction, and the hard context limit is enforced on every route.
+Reasoning-only exhaustion falls back to labelled conversation excerpts, not model
+reasoning. Summary prompts close an actually pre-opened thinking suffix when a
+template ignores `enable_thinking=false`. These recovery paths are lossy; they do
+not guarantee factual recall.
+
 When compaction happens, the response output starts with a
 `type: "compaction"` item. Append the output normally, or keep only the newest
 compaction item and everything after it. `previous_response_id` chaining also
@@ -145,15 +187,18 @@ works while that response is stored. `/v1/responses/input_tokens` counts the
 decoded context, not the encrypted payload's string length. Normal response
 usage counts the final inference; explicit compact usage counts the summary pass.
 
-Chat Completions automatically compacts supported history when the actual input
-leaves no room for generation within the context limit. No threshold setting is needed.
-The optional `context_management` field enables earlier compaction; an empty list
+Chat Completions automatically compacts supported history at 75% of the effective
+context limit. `context_management` overrides the threshold; an empty list
 explicitly disables compaction. Recovery supports text, images, and tool history;
 audio/video requests keep their existing behavior. Compaction finishes before the
-Chat Completions stream opens and leaves its response format unchanged. It is
-request-local: clients that resend their full history may need compaction again
-on later requests. Responses clients can
-reuse the returned compaction item.
+Chat Completions stream opens and leaves its response format unchanged.
+
+An in-memory cache reuses compacted exact conversation prefixes when clients resend
+full history. It is scoped by tenant, loaded processor, context limit, and request
+options, expires after ten minutes, and holds at most 32 entries and 2 MB of
+compacted content. Transcript edits or option changes miss the cache; unloading
+the model clears it. This cache is separate from APC and is not durable across
+server restarts. Responses clients can persist and reuse their compaction item.
 
 Streaming automatic compaction and terminal `compaction_trigger` requests emit
 request-scoped MLX extension events after `response.created` / `response.in_progress`
@@ -199,7 +244,7 @@ across repeated compactions.
 
 The server also retains whole older user messages within a budget of 1/16 of the
 effective context limit, capped at 8192 tokens and the available compaction
-budget. It considers newest messages first, skips messages that do not fit, and
+budget. It considers the first user objective, then newest messages, skips messages that do not fit, and
 preserves their original order and roles. Oversized pasted content goes through
 the existing summarizer. This is an MLX retention policy for smaller models, not
 the standalone OpenAI API's documented all-user-messages retention behavior.

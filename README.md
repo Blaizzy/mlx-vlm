@@ -36,6 +36,9 @@ Some models have detailed documentation with prompt formats, examples, and best 
 
 | Model | Documentation |
 |-------|---------------|
+| LFM3 / LFM3-VL | [Docs](mlx_vlm/models/lfm3/README.md) |
+| LFM3-Audio | [Docs](mlx_vlm/models/lfm3_audio/README.md) |
+| LFM3-Omni | [Docs](mlx_vlm/models/lfm3_omni/README.md) |
 | DeepSeek-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr/README.md) |
 | DeepSeek-OCR-2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr_2/README.md) |
 | Unlimited-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/unlimited_ocr/README.md) |
@@ -61,6 +64,8 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | PP-DocLayoutV3 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/pp_doclayout_v3/README.md) |
 | Granite Vision 3.2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite_vision/README.md) |
 | Granite Vision (4.0, 4.1) | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite4_vision/README.md) |
+| MiniCPM-OCR 1.0 | [Docs](mlx_vlm/models/minicpm_ocr/README.md) |
+| MiniCPM-OCR Jev | [Docs](mlx_vlm/models/minicpm_ocr_jev/README.md) |
 | MiniCPM-V 4.7 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minicpmv4_7/README.md) |
 | MiniCPM-V 4.6 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minicpmv4_6/README.md) |
 | GLiNER2.5 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/gliner2_5/README.md) |
@@ -188,7 +193,7 @@ mlx_vlm.server --model Qwen/Qwen3.5-4B \
   --thinking-end-token "</think>"
 ```
 
-Requests can override the server defaults with `enable_thinking`, `thinking_budget`, `thinking_start_token`, or `thinking_end_token`.
+Requests can override the server defaults with `enable_thinking`, `thinking_budget`, `thinking_start_token`, or `thinking_end_token`. `chat_template_kwargs.enable_thinking` is also accepted; an explicit top-level `enable_thinking` takes precedence.
 
 ### Speculative Decoding
 
@@ -1099,7 +1104,7 @@ Common APC environment variables:
 | `APC_BLOCK_SIZE` | `16` | Tokens per APC block |
 | `APC_CHECKPOINT_ENTRIES` | `2` | In-memory checkpoint entries; also bounds snapshots captured per hybrid prompt (disk-only mode captures two) |
 | `APC_CHECKPOINT_GUARD_TOKENS` | `1` | Tokens retained after a reusable hybrid checkpoint boundary; the default preserves the normal final-token prefill boundary |
-| `APC_CHECKPOINT_INTERVAL_TOKENS` | `2048` | Spacing of intermediate hybrid checkpoints, rounded up to a multiple of `APC_BLOCK_SIZE`; `0` keeps only the final checkpoint |
+| `APC_CHECKPOINT_INTERVAL_TOKENS` | `2048` | Spacing of intermediate hybrid checkpoints, rounded up to a multiple of `APC_BLOCK_SIZE`; observed prompt divergence takes priority within the entry budget; `0` keeps only the final checkpoint |
 | `APC_MEMORY_MAX_GB` | auto | Resident block and checkpoint budget in GiB: 10% of Metal's recommended working set, capped at 8 GiB; `0` retains caches only on disk |
 | `APC_MEMORY_RESERVE_GB` | auto | Additional memory headroom in GiB: 10% of Metal's recommended working set, at least 1 GiB |
 | `APC_DISK_ENABLED` | `1` | Set to `0` to disable disk persistence |
@@ -1124,8 +1129,11 @@ state cannot be rolled back by slicing K/V tensors.
 
 Hybrid prefill now captures intermediate checkpoints as well as the final guard
 checkpoint, in streaming, continuous batching and DiffusionGemma generation.
-With the defaults, each prompt stores its latest 2,048-token boundary before the
-final checkpoint and the final checkpoint itself. For example, a 30,000-token
+For text API requests with `transient_context`, the server verifies and prioritizes
+the token boundary before that mutable suffix. Otherwise, observed divergence
+from resident prompts takes priority. With neither hint, each prompt stores its
+latest 2,048-token boundary before the final checkpoint and the final checkpoint
+itself. For example, a 30,000-token
 document followed by 20 instruction tokens can reuse 28,672 tokens when the
 instructions change. The same checkpoints persist across server restarts when
 the disk tier is enabled.
@@ -1521,6 +1529,27 @@ curl -X POST "http://localhost:8080/v1/audio/transcriptions" \
   -F file=@/path/to/audio.mp3 \
   -F response_format=json
 ```
+
+Models with instruction-based audio tasks can also receive `task`, `prompt`, and
+`system_prompt` as multipart fields. For example, with Nemotron Transcribe support
+installed in `mlx-audio`:
+
+```sh
+curl -X POST "http://localhost:8080/v1/audio/transcriptions" \
+  -F model=/path/to/nemotron-transcribe \
+  -F file=@/path/to/meeting.wav \
+  -F task=qa \
+  -F 'prompt=What time is the meeting?'
+```
+
+Nemotron supports `asr`, `qa`, `saa` (speaker attribution), `rich`, and `translate`.
+For a spoken request, use `task=qa` with `system_prompt=Answer the spoken question.`
+and omit `prompt`. Translation requires a target `language`, such as `German`;
+`/v1/audio/translations` selects `task=translate` regardless of the supplied task.
+Task values and system instructions depend on the selected model. The server
+forwards `prompt` to the model's declared `prompt`, `context`, or `text` parameter,
+preserving an explicitly supplied `context` or `text` value. `stream=true` returns
+NDJSON text chunks; Nemotron encodes the complete audio before emitting text.
 
 ##### Multi-Modal (Image + Audio)
 

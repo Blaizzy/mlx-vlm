@@ -34,6 +34,7 @@ from mlx_vlm.generate import dispatch as dispatch_module
 from mlx_vlm.generate import normalize_resize_shape
 from mlx_vlm.models.base import InputEmbeddingsFeatures, LanguageModelOutput
 from mlx_vlm.models.cache import (
+    ArraysCache,
     BatchKVCache,
     BufferedRotatingKVCache,
     KVCache,
@@ -1382,6 +1383,12 @@ def test_cached_prefix_rope_forwards_full_prompt_metadata():
 
 
 class TestPrefixCacheReuseTrim:
+    def test_hybrid_with_untrimmable_state_is_not_reusable(self):
+        # conv/linear-attention layers keep an ArraysCache, which has no trim()
+        caches = [self._fill(KVCache(), 20), ArraysCache(1)]
+        assert dispatch_module._prefix_cache_trim_amount(caches, 8) is None
+        assert dispatch_module._prefix_cache_trim_amount(caches, 20) == 0
+
     """Prompt-cache prefix reuse must trim each cache through its own trim()
     contract. A raw ``keys[..., :prefix_len, :]`` slice corrupts rotating
     (sliding-window) ring buffers -- silent wrong output, or a shape crash once
@@ -1967,6 +1974,22 @@ def test_sampling_filter_matches_numpy(name, values, reference, tolerance):
         assert (output != -mx.inf).tolist() == [True, False, False, False, False]
 
 
+@pytest.mark.parametrize("penalty", [None, 0.0, 1.0, 1.1])
+def test_neutral_repetition_penalty_preserves_other_processors(penalty):
+    processors = sampling.make_logits_processors(
+        repetition_penalty=penalty, presence_penalty=1.0, frequency_penalty=1.0
+    )
+    assert len(processors) == (3 if penalty == 1.1 else 2)
+    tokens = mx.array([0, 0, 1])
+    logits = mx.array([[2.0, -2.0, 3.0]])
+    for processor in processors:
+        logits = processor(tokens, logits)
+    expected = [2.0 / 1.1 - 3, -2.0 * 1.1 - 2, 3.0] if penalty == 1.1 else [-1, -4, 3]
+    assert mx.allclose(logits, mx.array([expected])).item()
+    if penalty != 1.1:
+        assert sampling.make_logits_processors(repetition_penalty=penalty) == []
+
+
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 @pytest.mark.parametrize("typical_p", [0.2, 0.5, 0.9])
 def test_typical_p_low_precision_logprobs_match_float32(dtype, typical_p):
@@ -2476,3 +2499,54 @@ def test_generate_step_evaluates_cache_periodically(max_tokens, cache_evals):
     assert eval_mock.call_count == 1 + cache_evals
     if cache_evals:
         eval_mock.assert_called_with([cache_state])
+
+
+def test_generate_audio_prepares_inputs_once_and_saves_wav(monkeypatch, tmp_path):
+    audio_module = __import__("mlx_vlm.generate.audio", fromlist=[""])
+    result = audio_module.AudioGenerationResult(
+        text="hi", audio=mx.zeros(240), audio_tokens=mx.zeros((12, 1))
+    )
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="lfm3_audio"),
+        joint_audio_text_generation=True,
+        generate_audio=MagicMock(return_value=result),
+    )
+    features = mx.ones((1, 128, 8))
+    prepare = MagicMock(
+        return_value=dict(
+            input_ids=mx.array([[1, 2]]),
+            attention_mask=mx.ones((1, 2)),
+            input_features=features,
+        )
+    )
+    monkeypatch.setattr(audio_module, "prepare_inputs", prepare)
+    monkeypatch.setattr(
+        audio_module, "wired_limit", lambda *a: contextlib.nullcontext()
+    )
+    processor = SimpleNamespace(tokenizer=object())
+    out = audio_module.generate_audio(
+        model,
+        processor,
+        "prompt",
+        audio=["input.wav"],
+        output_audio_path=tmp_path / "out.wav",
+        temperature=0.0,
+        generation_mode="audio",
+    )
+    assert prepare.call_count == 1
+    assert prepare.call_args.kwargs["audio"] == ["input.wav"]
+    call = model.generate_audio.call_args.kwargs
+    assert call["input_ids"].tolist() == [[1, 2]]
+    assert call["tokenizer"] is processor.tokenizer
+    assert call["input_features"] is features
+    assert "attention_mask" not in call
+    assert call["temperature"] == 0.0
+    assert call["generation_mode"] == "audio"
+    assert out.text == "hi"
+    assert out.path.is_file()
+    with pytest.raises(ValueError, match=r"\.wav"):
+        audio_module.generate_audio(
+            model, processor, "prompt", output_audio_path="out.mp3"
+        )
+    with pytest.raises(ValueError, match="does not support audio generation"):
+        audio_module.generate_audio(SimpleNamespace(), processor, "prompt")

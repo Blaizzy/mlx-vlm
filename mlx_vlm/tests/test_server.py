@@ -821,6 +821,17 @@ def test_unload_model_cache_group_resets_apc_around_generator_shutdown(monkeypat
     assert server.runtime.apc_manager is None
 
 
+def test_load_model_resources_refuses_d1_decision_models(monkeypatch):
+    d1_model = NS(system_one=lambda *_: None, config=None)
+    monkeypatch.setattr(generation, "load", lambda *_, **__: (d1_model, None))
+
+    with pytest.raises(HTTPException) as exc_info:
+        generation.load_model_resources("d1-2B", None)
+
+    assert exc_info.value.status_code == 400
+    assert "system_one" in exc_info.value.detail
+
+
 def test_unsupported_model_request_does_not_crash_server(client, monkeypatch):
     def reject_model(*_args, **_kwargs):
         raise ValueError("Model type bert not supported.")
@@ -2516,6 +2527,7 @@ class TestCompaction:
         monkeypatch.setattr(server.runtime.config, "max_kv_size", None)
         server.response_store.clear()
         server.response_store_order.clear()
+        compaction.chat_cache.clear()
 
     @pytest.fixture
     def mocked(self, client):
@@ -2797,7 +2809,9 @@ class TestCompaction:
             )
         summarize.assert_not_called()
         result = asyncio.run(compact(items, target_tokens=3000))
-        summarize.assert_awaited_once_with(head)
+        assert summarize.await_count == 1
+        assert summarize.await_args.args[0] == head
+        assert 0 < summarize.await_args.args[1] < 3000
         assert result.changed and result.after_tokens < 3000
         assert result.items[:2] == [instruction, request]
         assert result.items[3:] == tail
@@ -2882,7 +2896,7 @@ class TestCompaction:
         async def count(items):
             return len(json.dumps(items))
 
-        async def summarize(items):
+        async def summarize(items, max_summary_tokens):
             return "Earlier requirements summarized.", None
 
         result = asyncio.run(
@@ -2896,17 +2910,76 @@ class TestCompaction:
             )
         )
         originals = [x for x in result.items[:-1] if x.get("role") == "user"]
-        assert originals == messages[-2:]
+        assert originals == [messages[0], messages[-1]]
         base = [x for x in result.items if x not in originals]
         assert result.after_tokens - asyncio.run(count(base)) <= 500
         capsule = _seal_context(result.items, covered=result.covered)
         assert _resolve_context(messages + [capsule, latest]) == result.items + [latest]
 
+    def test_compaction_accepts_reduction_that_fits_hard_budget(self):
+        original = [_compaction_message("x" * 2000), _compaction_message("Continue")]
+
+        async def count(items):
+            return len(json.dumps(items))
+
+        summarize = AsyncMock(return_value=("s" * 1500, None))
+        result = asyncio.run(
+            compaction.compact(
+                original,
+                count=count,
+                summarize=summarize,
+                keep_tokens=0,
+                target_tokens=3000,
+            )
+        )
+        assert result.changed
+        assert result.before_tokens * 0.6 < result.after_tokens < result.before_tokens
+        assert result.after_tokens < 3000
+        assert summarize.await_args.args[1] < 3000
+
+    def test_summary_allowance_reserves_protected_tail_and_handoff(
+        self, mocked, monkeypatch
+    ):
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", 8192)
+        latest = _compaction_message("p" * 20000)
+        items = [_compaction_message("x" * 6000), latest]
+        envelope = mocked.count(input=[compaction._handoff(""), latest])["input_tokens"]
+        response = mocked.compact(input=items, keep_tokens=0, max_output_tokens=2048)
+        assert mocked.generate.call_args.kwargs["max_tokens"] == 8192 - 2048 - envelope
+        assert latest in _resolve_context(response["output"])
+
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("api", ["responses", "chat"])
+    @pytest.mark.parametrize("fits", [False, True])
+    def test_early_compaction_budget_failure_preserves_fitting_input(
+        self, mocked, client, monkeypatch, api, stream, fits
+    ):
+        items = [_compaction_message("history " * 100), _compaction_message("Continue")]
+        before = mocked.count(input=items)["input_tokens"]
+        limit = before + 128 if fits else before - 1
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", limit)
+        failure = compaction.ContextBudgetError("summary does not reduce input")
+        monkeypatch.setattr(compaction, "compact", AsyncMock(side_effect=failure))
+        kwargs = dict(
+            stream=stream,
+            context_management=[{"type": "compaction", "compact_threshold": 1}],
+        )
+        kwargs.update({"input": items} if api == "responses" else {"messages": items})
+        response = _post(client, api, **kwargs)
+        if fits:
+            assert response.status_code == 200, response.text
+            answer = mocked.stream.call_args if stream else mocked.generate.call_args
+            assert "Conversation handoff" not in answer.kwargs["prompt"]
+            assert answer.kwargs["max_tokens"] <= limit - before
+        elif stream and api == "responses":
+            assert _data(response)[-1]["type"] == "response.failed"
+        else:
+            assert response.status_code == 400, response.text
+
     @pytest.mark.parametrize(
         "text, tokens, status, detail",
         [
             pytest.param("", 4, 502, "empty summary", id="empty"),
-            pytest.param("partial summary", 256, 502, "output limit", id="length"),
             pytest.param(
                 "huge " * 10000,
                 4,
@@ -2935,6 +3008,333 @@ class TestCompaction:
         assert detail in response["detail"]
         compact.assert_awaited_once()
         assert compact.call_args.args[1] == original and not server.response_store
+
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_summary_output_limit_retries_then_preserves_partial_content(
+        self, mocked, client, stream
+    ):
+        monkey_result = _result("Goal: ORCHID. Port: 7319.", generation_tokens=10000)
+        mocked.generate.return_value = monkey_result
+        response = _post(
+            client,
+            "responses",
+            input=_compaction_history(),
+            stream=stream,
+            context_management=[{"type": "compaction", "compact_threshold": 1000}],
+        )
+        assert response.status_code == 200, response.text
+        final = _completed_response(response) if stream else response.json()
+        restored = _resolve_context([final["output"][0]])
+        assert "ORCHID" in json.dumps(restored)
+        assert "output limit" in json.dumps(restored)
+        calls = mocked.generate.call_args_list
+        assert calls[0].kwargs["max_tokens"] == 1024
+        assert calls[1].kwargs["max_tokens"] == 2048
+
+    def test_summary_closes_a_template_preopened_reasoning_suffix(self, mocked):
+        mocked.template.side_effect = (
+            lambda processor, config, messages, **kw: json.dumps(messages) + "<think>\n"
+        )
+        mocked.compact(
+            input=_compaction_history(), keep_tokens=0, max_output_tokens=256
+        )
+        prompt = mocked.generate.call_args.kwargs["prompt"]
+        assert prompt.endswith("<think></think>\n")
+
+    def test_reasoning_only_limit_uses_labelled_evidence_not_reasoning(self, mocked):
+        mocked.generate.return_value = _result(
+            "<think>INVENTED_PASSPORT", generation_tokens=10000
+        )
+        response = mocked.request(
+            input=_compaction_history(),
+            context_management=[{"type": "compaction", "compact_threshold": 1000}],
+        )
+        text = json.dumps(_resolve_context([response["output"][0]]))
+        assert "INVENTED_PASSPORT" not in text
+        assert "Incomplete handoff" in text
+
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_transient_context_is_counted_but_not_compacted_or_replayed(
+        self, mocked, client, stream
+    ):
+        items = _compaction_history()
+        for index in range(3):
+            current = f"CURRENT_ENVIRONMENT_{index} " * 40
+            before = mocked.count(input=items)["input_tokens"]
+            assert (
+                mocked.count(input=items, transient_context=current)["input_tokens"]
+                > before
+            )
+            mocked.template.reset_mock()
+            response = _post(
+                client,
+                "responses",
+                input=items,
+                stream=stream,
+                transient_context=current,
+                context_management=[{"type": "compaction", "compact_threshold": 1000}],
+            )
+            assert response.status_code == 200, response.text
+            data = _completed_response(response) if stream else response.json()
+            capsule = data["output"][0]
+            assert capsule["type"] == "compaction"
+            restored = _resolve_context([capsule])
+            assert "CURRENT_ENVIRONMENT" not in json.dumps(restored)
+            templates = [call.args[2] for call in mocked.template.call_args_list]
+            summaries = [
+                messages
+                for messages in templates
+                if messages[-1].get("content") == compaction.SUMMARY_INSTRUCTION
+            ]
+            assert summaries
+            assert all(
+                "CURRENT_ENVIRONMENT" not in json.dumps(messages)
+                for messages in summaries
+            )
+            answer = mocked.stream.call_args if stream else mocked.generate.call_args
+            generation_messages = json.loads(answer.kwargs["prompt"])
+            assert generation_messages[-1]["content"] == current
+            assert (
+                sum(
+                    current in str(message.get("content"))
+                    for message in generation_messages
+                )
+                == 1
+            )
+            # Stored response chaining also carries only canonical input/output.
+            assert "CURRENT_ENVIRONMENT" not in str(server.response_store)
+            items = [capsule] + [
+                _compaction_message("New evidence " * 200) for _ in range(4)
+            ]
+
+    @pytest.mark.parametrize("recovery", [False, True])
+    def test_changing_transient_context_reuses_chat_summary_but_counts_new_value(
+        self, mocked, client, monkeypatch, recovery
+    ):
+        def context(text):
+            if recovery:
+                return {
+                    "tool_result_context": {
+                        "entries": [{"tool_call_id": "removed", "text": text}]
+                    }
+                }
+            return {"transient_context": text}
+
+        items = [_msg("Earlier evidence " * 100) for _ in range(6)] + [_msg("Continue")]
+        before = mocked.count(input=items)["input_tokens"]
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", before + 300)
+        first = _post(
+            client,
+            "chat",
+            messages=items,
+            max_tokens=64,
+            **context("ENVIRONMENT_OLD"),
+        )
+        assert first.status_code == 200, first.text
+        assert mocked.generate.call_count > 1
+        mocked.generate.reset_mock()
+        new = "ENVIRONMENT_NEW " * 20
+        second = _post(
+            client,
+            "chat",
+            messages=items + [_msg("Answer", "assistant"), _msg("Next")],
+            max_tokens=64,
+            **context(new),
+        )
+        assert second.status_code == 200, second.text
+        assert mocked.generate.call_count == 1
+        prompt = mocked.generate.call_args.kwargs["prompt"]
+        assert "ENVIRONMENT_OLD" not in prompt
+        assert new in "\n".join(m.get("content", "") for m in json.loads(prompt))
+        assert "Conversation handoff" in prompt
+        assert "ENVIRONMENT" not in str(compaction.chat_cache.entries)
+
+    def test_transient_context_cannot_exceed_context_budget(self, mocked, monkeypatch):
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", 2048)
+        response = mocked.request(
+            input=[_compaction_message("Keep this request")],
+            transient_context="oversized environment " * 2000,
+            context_management=[{"type": "compaction", "compact_threshold": 1536}],
+            status=400,
+        )
+        assert "context" in response["detail"].lower()
+        mocked.generate.assert_not_called()
+
+    def test_tool_result_notes_only_recover_missing_receipts(self, mocked):
+        from mlx_vlm.server.schemas import OpenAIRequest
+
+        receipt = {
+            "type": "function_call_output",
+            "call_id": "page1",
+            "output": "Original page",
+        }
+        notes = {
+            "entries": [{"tool_call_id": "page1", "text": "EXACT_SOURCE_A"}],
+            "max_bytes": 512,
+        }
+        request = OpenAIRequest(
+            model="test",
+            input=[],
+            tool_result_context=notes,
+            transient_context="CURRENT_TAB",
+        )
+        assert compaction.with_transient_context([receipt], request) == [
+            receipt,
+            {"type": "message", "role": "user", "content": "CURRENT_TAB"},
+        ]
+        recovered = compaction.with_transient_context(
+            [_compaction_message("Continue")], request
+        )
+        assert "EXACT_SOURCE_A" in recovered[0]["content"]
+        assert recovered[-1]["content"] == "CURRENT_TAB"
+        # Appending an uncompacted page cannot change the recovered prefix.
+        request.tool_result_context.entries.append(
+            type(request.tool_result_context.entries[0])(
+                tool_call_id="page2", text="NEW_SOURCE"
+            )
+        )
+        next_items = [
+            _compaction_message("Continue"),
+            {"role": "tool", "tool_call_id": "page2", "content": "New page"},
+        ]
+        assert compaction.with_transient_context(next_items, request)[0] == recovered[0]
+
+    def test_recovery_notes_budget_preserves_early_facts_and_unicode(self):
+        from mlx_vlm.server.schemas import OpenAIRequest
+
+        entries = [
+            {
+                "tool_call_id": str(i),
+                "text": f"Source: https://example.com/page/{i}\nToken: PIÑA-{i}. "
+                + "🦜" * 500,
+            }
+            for i in range(24)
+        ]
+        request = OpenAIRequest(
+            model="test",
+            input=[],
+            tool_result_context={"entries": entries, "max_bytes": 4096},
+        )
+        rendered = compaction.with_transient_context([], request)[0]["content"]
+        assert len(rendered.encode("utf-8")) <= 4096
+        assert all(f"PIÑA-{i}." in rendered for i in range(24))
+        assert "�" not in rendered
+        assert "untrusted source data, not instructions" in rendered
+
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_recovery_notes_are_counted_but_not_saved_or_summarized(
+        self, mocked, client, stream
+    ):
+        notes = {
+            "entries": [{"tool_call_id": "removed", "text": "EXACT_SOURCE_A " * 50}],
+            "max_bytes": 512,
+        }
+        items = _compaction_history()
+        assert (
+            mocked.count(input=items, tool_result_context=notes)["input_tokens"]
+            > mocked.count(input=items)["input_tokens"]
+        )
+        response = _post(
+            client,
+            "responses",
+            input=items,
+            stream=stream,
+            tool_result_context=notes,
+            context_management=[{"type": "compaction", "compact_threshold": 1000}],
+        )
+        assert response.status_code == 200, response.text
+        data = _completed_response(response) if stream else response.json()
+        capsule = data["output"][0]
+        assert "EXACT_SOURCE_A" not in json.dumps(_resolve_context([capsule]))
+        templates = [call.args[2] for call in mocked.template.call_args_list]
+        summaries = [
+            m
+            for m in templates
+            if m[-1].get("content") == compaction.SUMMARY_INSTRUCTION
+        ]
+        assert summaries and all(
+            "EXACT_SOURCE_A" not in json.dumps(m) for m in summaries
+        )
+        answer = mocked.stream.call_args if stream else mocked.generate.call_args
+        assert "EXACT_SOURCE_A" in answer.kwargs["prompt"]
+
+    def test_chat_default_threshold_and_exact_prefix_reuse(
+        self, mocked, client, monkeypatch
+    ):
+        items = [_msg("Earlier evidence " * 100) for _ in range(6)] + [_msg("Continue")]
+        before = mocked.count(input=items)["input_tokens"]
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", before + 100)
+        first = _post(client, "chat", messages=items, max_tokens=64)
+        assert first.status_code == 200, first.text
+        assert mocked.generate.call_count > 1
+        mocked.generate.reset_mock()
+        second = _post(
+            client,
+            "chat",
+            messages=items + [_msg("Answer", "assistant"), _msg("Next")],
+            max_tokens=64,
+        )
+        assert second.status_code == 200, second.text
+        assert mocked.generate.call_count == 1
+        assert "Conversation handoff" in mocked.generate.call_args.kwargs["prompt"]
+        mocked.generate.reset_mock()
+        changed = copy.deepcopy(items)
+        changed[0]["content"] += " A correction"
+        third = _post(client, "chat", messages=changed, max_tokens=64)
+        assert third.status_code == 200, third.text
+        assert mocked.generate.call_count > 1
+
+    def test_bounded_fold_can_consume_more_than_eight_exchanges(self):
+        items = [_compaction_message("evidence " * 100) for _ in range(12)]
+        original = copy.deepcopy(items)
+
+        async def fits(chunk):
+            return sum(item.get("role") == "user" for item in chunk) <= 1
+
+        async def count(chunk):
+            return len(json.dumps(chunk))
+
+        summarize = AsyncMock(
+            return_value=(
+                "facts",
+                server.OpenAIUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+            )
+        )
+        summary, usage = asyncio.run(
+            compaction._summarize_bounded(
+                items, fits=fits, summarize=summarize, count=count
+            )
+        )
+        assert summary == "facts" and summarize.await_count == 12
+        assert usage.total_tokens == 24 and items == original
+
+    @pytest.mark.parametrize("chat", [False, True])
+    def test_single_oversized_tool_result_is_bounded_and_replayable(
+        self, mocked, client, monkeypatch, chat
+    ):
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", 8192)
+        items = [
+            _compaction_message("Read this page and compare OCR models.")
+        ] + _function_result("page " * 20000, name="read_file", call_id="page")
+        original = copy.deepcopy(items)
+        options = (
+            {"messages": _response_items_to_chat(items)[0]}
+            if chat
+            else {
+                "input": items,
+                "context_management": [
+                    {"type": "compaction", "compact_threshold": 6144}
+                ],
+            }
+        )
+        response = _post(client, "chat" if chat else "responses", **options)
+        assert response.status_code == 200, response.text
+        prompt = mocked.generate.call_args.kwargs["prompt"]
+        assert "Tool output truncated" in prompt and "Read this page" in prompt
+        assert len(prompt) // 4 < 8192
+        assert items == original
+        if not chat:
+            assert response.json()["output"][0]["type"] == "compaction"
 
     def test_short_history_is_a_noop(self, mocked):
         items = [_compaction_message("hello")]
@@ -3046,7 +3446,7 @@ class TestCompaction:
         mocked.generate.assert_not_called()
 
     @pytest.mark.parametrize("stream", [False, True])
-    @pytest.mark.parametrize("api", ["responses", "chat", "chat-default"])
+    @pytest.mark.parametrize("api", ["responses", "chat"])
     def test_unused_output_does_not_override_compaction_threshold(
         self, mocked, client, monkeypatch, api, stream
     ):
@@ -3122,7 +3522,7 @@ class TestCompaction:
             if json.loads(call.kwargs["prompt"])[-1]["content"]
             == compaction.SUMMARY_INSTRUCTION
         ]
-        assert 1 < len(summary_calls) <= compaction.MAX_SUMMARY_PASSES
+        assert 1 < len(summary_calls) <= len(items)
         for call in summary_calls:
             assert len(call.kwargs["prompt"]) // 4 + call.kwargs["max_tokens"] <= 2048
             messages = json.loads(call.kwargs["prompt"])
@@ -3191,15 +3591,12 @@ class TestCompaction:
         )
         assert not server.response_store and items == original
 
-    @pytest.mark.parametrize(
-        "failure", ["oversized-exchange", "nonreducing-summary", "pass-limit"]
-    )
+    @pytest.mark.parametrize("failure", ["oversized-exchange", "nonreducing-summary"])
     def test_bounded_summary_recovery_stops_without_mutating_input(
         self, monkeypatch, failure
     ):
         items = [_compaction_message("old evidence " * 200) for _ in range(4)]
         original = copy.deepcopy(items)
-        monkeypatch.setattr(compaction, "MAX_SUMMARY_PASSES", 2)
 
         async def count(items):
             return len(json.dumps(items))
@@ -3237,7 +3634,7 @@ class TestCompaction:
         messages = [_compaction_message("earlier notes " * 120) for _ in range(4)]
         messages.append(_compaction_message("Continue"))
         before = mocked.count(input=messages)["input_tokens"]
-        monkeypatch.setattr(server.runtime.config, "max_kv_size", before + 64)
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", before * 2)
         response = _post(client, messages=messages, max_tokens=64, **options)
         assert response.status_code == 200
         assert mocked.generate.call_count == 1
@@ -3285,7 +3682,7 @@ class TestCompaction:
             **options,
         )
         assert original == history + recent
-        if outcome in ("summary-fails", "protected-too-large"):
+        if outcome == "summary-fails":
             assert response.status_code == (502 if outcome == "summary-fails" else 400)
             assert response.headers["content-type"] == "application/json"
             assert mocked.generate.call_count == (
@@ -3300,7 +3697,15 @@ class TestCompaction:
         assert messages[0] == original[0]
         for expected, actual in zip(recent, messages[-3:]):
             for key in ("role", "content", "tool_call_id"):
-                assert actual.get(key) == expected.get(key)
+                if (
+                    outcome == "protected-too-large"
+                    and key == "content"
+                    and expected["role"] == "tool"
+                ):
+                    assert "Tool output truncated" in actual[key]
+                    assert len(actual[key]) < len(expected[key])
+                else:
+                    assert actual.get(key) == expected.get(key)
         call = messages[-2]["tool_calls"][0]
         assert call["id"] == messages[-1]["tool_call_id"] == "latest"
         assert call["function"] == {"name": "get_weather", "arguments": {}}
@@ -3311,7 +3716,7 @@ class TestCompaction:
             summaries = mocked.generate.call_args_list
             if not stream:
                 summaries = summaries[:-1]
-            assert 1 <= len(summaries) <= compaction.MAX_SUMMARY_PASSES
+            assert 1 <= len(summaries) <= len(original)
             for call in summaries:
                 assert (
                     json.loads(call.kwargs["prompt"])[-1]["content"]
@@ -3492,7 +3897,7 @@ class TestCompaction:
         async def count(items):
             return len(json.dumps(items))
 
-        async def summarize(items):
+        async def summarize(items, max_summary_tokens):
             assert items == original[:3]
             return "Prior work completed.", None
 
@@ -3639,7 +4044,7 @@ class TestCompaction:
     @pytest.mark.parametrize("trigger", [False, True])
     @pytest.mark.parametrize(
         "text, tokens, code",
-        [("", 4, 502), ("partial", 1024, 502), ("huge " * 10000, 4, 400)],
+        [("", 4, 502), ("huge " * 10000, 4, 400)],
     )
     def test_failed_streamed_summary_never_completes(
         self, mocked, client, trigger, text, tokens, code
@@ -3654,6 +4059,19 @@ class TestCompaction:
                 {"type": "compaction", "compact_threshold": 1000}
             ]
         events = _data(_post(client, "responses", input=items, stream=True, **options))
+        if not trigger and code == 400:
+            assert [event["type"] for event in events] == [
+                "response.created",
+                "response.in_progress",
+                "mlx.compaction.started",
+                "mlx.compaction.completed",
+                "response.completed",
+            ]
+            assert events[3]["input_tokens_before"] == events[3]["input_tokens_after"]
+            assert (
+                "Conversation handoff" not in mocked.stream.call_args.kwargs["prompt"]
+            )
+            return
         assert [event["type"] for event in events] == [
             "response.created",
             "response.in_progress",
@@ -3815,7 +4233,7 @@ class TestCompaction:
         iterator.close.assert_called_once_with()
 
     @pytest.fixture
-    def real_server(self, tmp_path):
+    def real_server(self, tmp_path, request):
         model = os.environ.get("MLX_VLM_COMPACTION_TEST_MODEL")
         if not model:
             pytest.skip("Set MLX_VLM_COMPACTION_TEST_MODEL for real inference")
@@ -3847,6 +4265,11 @@ class TestCompaction:
                         "127.0.0.1",
                         "--port",
                         str(port),
+                        *(
+                            ["--max-kv-size", str(request.param)]
+                            if hasattr(request, "param")
+                            else []
+                        ),
                     ],
                     env=env,
                     stdout=log,
@@ -3877,7 +4300,7 @@ class TestCompaction:
                             pytest.fail(
                                 f"Model server did not become ready:\n{log_path.read_text()}"
                             )
-                        yield NS(http=client, sdk=sdk, model=model)
+                        yield NS(http=client, sdk=sdk, model=model, process=process)
                 finally:
                     process.terminate()
                     try:
@@ -3922,6 +4345,55 @@ class TestCompaction:
                 "What is the project name, deployment port, and file you must never edit? Give all three."
             )
         ]
+
+    @pytest.mark.parametrize("real_server", [4096, 8192], indirect=True)
+    def test_real_oversized_tool_recovery_and_unload(self, real_server):
+        with real_server() as client:
+            messages = [
+                _msg(
+                    "Project ORCHID. Read this tool output and repeat the project code."
+                )
+            ]
+            messages += _response_items_to_chat(
+                _function_result(
+                    "OCR evidence " * 10000, name="get_weather", call_id="page"
+                )
+            )[0]
+            payload = dict(
+                model=client.model,
+                messages=messages,
+                tools=[_tool()],
+                max_tokens=64,
+                temperature=0,
+                chat_template_kwargs={"enable_thinking": False},
+            )
+            for step in range(2):
+                response = client.http.post("/v1/chat/completions", json=payload)
+                assert response.status_code == 200, response.text
+                answer = response.json()["choices"][0]["message"]
+                # This regression checks bounded generation and continued replay;
+                # factual recall is measured by the separate real compaction tests.
+                assert answer.get("content") or answer.get("tool_calls")
+                assert response.json()["usage"]["prompt_tokens"] < 8192
+                messages += [answer, _msg("Repeat the project code.")]
+
+            def rss():
+                return (
+                    int(
+                        subprocess.check_output(
+                            ["ps", "-o", "rss=", "-p", str(client.process.pid)]
+                        )
+                    )
+                    * 1024
+                )
+
+            loaded = rss()
+            response = client.http.post("/unload")
+            assert response.status_code == 200, response.text
+            deadline = time.monotonic() + 5
+            while rss() >= loaded * 0.75 and time.monotonic() < deadline:
+                time.sleep(0.1)
+            assert rss() < loaded * 0.75
 
     def test_real_compaction_replay_and_apc(self, real_client, real_history):
         client = real_client
@@ -4277,6 +4749,24 @@ def _step_tokens(tokenizer, responses, *, progress=(), trim_space=True):
 class TestResponseGenerator:
     """Tests for the ResponseGenerator continuous batching engine."""
 
+    @pytest.mark.parametrize("media", [False, True])
+    def test_cache_boundary_matches_tokenized_prefix_and_skips_media(self, media):
+        gen = _ready_generator()
+        gen._preprocess_request = MagicMock(
+            side_effect=[
+                {"input_ids": mx.array([[1, 2, 3, 4, 5]])},
+                {"input_ids": mx.array([[1, 2, 3, 99]])},
+            ]
+        )
+        queued = _capture_requests(gen, prompt_tokens=5)
+        args = Args(max_tokens=1, cache_prefix="stable messages")
+        _, tokens = gen.generate(
+            "full prompt", args=args, images=["image"] if media else None
+        )
+        tokens.close()
+        assert queued[0].args.cache_checkpoint_len == (0 if media else 3)
+        assert gen._preprocess_request.call_count == (1 if media else 2)
+
     def test_context_limit_precedes_image_hashing(self, monkeypatch):
         gen = _ready_generator(apc_manager=object(), apc_mode="block")
         gen._preprocess_request = lambda *a: dict(
@@ -4557,10 +5047,12 @@ class TestResponseGenerator:
             for queue in queues:
                 _, tokens = _drain(queue)
                 assert len(tokens) == 1 and tokens[0].finish_reason == "length"
+            draft_model = gen.draft_model
+        assert gen.draft_model is None
         batch = batches[0]
         _assert_fields(
             batch.kwargs,
-            draft_model=gen.draft_model,
+            draft_model=draft_model,
             draft_kind=draft_kind,
             draft_block_size=6,
             greedy_sampling=True,
@@ -6266,6 +6758,120 @@ def test_audio_transcription_request(
     loader.assert_called_once_with("fake-stt", model_kind="audio_stt")
 
 
+@pytest.mark.parametrize(
+    "endpoint, options, expected",
+    [
+        ("transcriptions", {}, {"task": "asr"}),
+        (
+            "transcriptions",
+            {"task": "qa", "prompt": "What time is the meeting?"},
+            {"task": "qa", "prompt": "What time is the meeting?"},
+        ),
+        (
+            "transcriptions",
+            {"task": "qa", "system_prompt": "Answer the spoken question."},
+            {"task": "qa", "system_prompt": "Answer the spoken question."},
+        ),
+        ("transcriptions", {"task": "saa"}, {"task": "saa"}),
+        ("transcriptions", {"task": "rich"}, {"task": "rich"}),
+        (
+            "translations",
+            {"task": "saa", "language": "German"},
+            {"task": "translate", "language": "German"},
+        ),
+    ],
+    ids=[
+        "default",
+        "audio-question",
+        "spoken-request",
+        "speakers",
+        "rich",
+        "translate",
+    ],
+)
+@pytest.mark.parametrize("stream", [False, True], ids=["json", "stream"])
+def test_audio_native_task_and_prompt(
+    audio_client, monkeypatch, endpoint, options, expected, stream
+):
+    fake, _ = _audio_backend(monkeypatch, {"text": "answer"})
+    calls = []
+
+    def generate(
+        audio,
+        *,
+        task="asr",
+        prompt=None,
+        system_prompt=None,
+        language=None,
+        stream=False,
+        **kwargs,
+    ):
+        assert Path(audio).exists()
+        calls.append(
+            dict(
+                task=task, prompt=prompt, system_prompt=system_prompt, language=language
+            )
+        )
+        assert "context" not in kwargs
+        result = {"text": "answer"}
+        return iter([result]) if stream else result
+
+    monkeypatch.setattr(fake, "generate", generate)
+    monkeypatch.setattr(
+        server_audio,
+        "audio_read",
+        lambda buffer, always_2d=False: (np.zeros(160, dtype=np.float32), 16000),
+    )
+    response = _upload(audio_client, endpoint, stream=str(stream).lower(), **options)
+    assert response.status_code == 200, response.text
+    assert response.json() == {"text": "answer"}
+    assert len(calls) == 1
+    assert {
+        key: value for key, value in calls[0].items() if value is not None
+    } == expected
+
+
+@pytest.mark.parametrize(
+    "generate, options, expected",
+    [
+        (
+            lambda audio, *, prompt=None, context=None, **kwargs: (prompt, context),
+            {"context": "existing context"},
+            ("instruction", "existing context"),
+        ),
+        (lambda audio, *, context=None, **kwargs: context, {}, "instruction"),
+        (lambda audio, *, text=None, **kwargs: text, {}, "instruction"),
+        (
+            lambda audio, *, context=None, **kwargs: context,
+            {"context": "existing context"},
+            "existing context",
+        ),
+        (
+            lambda audio, *, text=None, **kwargs: text,
+            {"text": "existing text"},
+            "existing text",
+        ),
+        (lambda audio, **kwargs: kwargs["context"], {}, "instruction"),
+    ],
+    ids=[
+        "native-prompt",
+        "context",
+        "text",
+        "keep-context",
+        "keep-text",
+        "kwargs-only",
+    ],
+)
+def test_audio_prompt_uses_explicit_parameter(generate, options, expected):
+    request = server_audio.AudioTranscriptionRequest(
+        model="test", prompt="instruction", **options
+    )
+    kwargs = server_audio._build_stt_generate_kwargs(
+        NS(generate=generate), request, translate=False
+    )
+    assert generate("audio.wav", **kwargs) == expected
+
+
 @pytest.mark.usefixtures("reset_audio_runtime")
 def test_audio_tts_and_stt_caches_are_independent(monkeypatch):
     fake_tts = NS(model_type="fake_tts")
@@ -7686,3 +8292,167 @@ def test_diarized_whisper_nested_word_timing():
         )[1].text
         == "world"
     )
+
+
+@pytest.mark.parametrize(
+    "request_type, payload",
+    [
+        (server.ChatRequest, {"messages": [{"role": "user", "content": "Hello"}]}),
+        (server.OpenAIRequest, {"input": "Hello"}),
+    ],
+)
+@pytest.mark.parametrize("top_level", [None, True, False])
+def test_thinking_template_alias(request_type, payload, top_level):
+    values = dict(
+        model="demo", chat_template_kwargs={"enable_thinking": False}, **payload
+    )
+    if top_level is not None:
+        values["enable_thinking"] = top_level
+    request = request_type.model_validate(values)
+    assert request.enable_thinking is (top_level if top_level is not None else False)
+
+
+def test_chat_compaction_cache_is_bounded_expiring_and_scope_isolated(monkeypatch):
+    cache = compaction.ChatCompactionCache(capacity=1, ttl=10)
+    items = [_compaction_message("secret")]
+    fingerprints = cache.fingerprints(items)
+    cache.store("tenant-a/model/tools", fingerprints, [_compaction_message("summary")])
+    assert cache.restore("tenant-b/model/tools", fingerprints) == (0, [])
+    assert cache.restore("tenant-a/other-model/tools", fingerprints) == (0, [])
+    assert cache.restore("tenant-a/model/tools", fingerprints)[0] == 1
+    cache.store("other", fingerprints, items)
+    assert cache.restore("tenant-a/model/tools", fingerprints) == (0, [])
+    now = time.monotonic()
+    monkeypatch.setattr(compaction.time, "monotonic", lambda: now + 11)
+    assert cache.restore("other", fingerprints) == (0, [])
+
+
+def test_unload_releases_model_before_allocator_clear(monkeypatch):
+    import weakref
+
+    class Model:
+        pass
+
+    registry = server.ModelCacheRegistry()
+    model = Model()
+    ref = weakref.ref(model)
+    registry.set("text_generation", {"model": model, "model_path": "demo"})
+    del model
+    _reset_runtime(monkeypatch, model_cache=registry)
+    observations = []
+    monkeypatch.setattr(
+        server._app_module.mx, "clear_cache", lambda: observations.append(ref() is None)
+    )
+    assert server.unload_model_sync()
+    assert observations and all(observations)
+
+
+@pytest.mark.parametrize("api", ["chat", "responses", "messages"])
+@pytest.mark.parametrize("batching", [False, True])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("real_call", [False, True])
+@pytest.mark.parametrize("syntax", ["gemma4", "json_tools", "preopened-custom"])
+def test_tool_examples_in_reasoning_are_not_executed(
+    client, api, batching, stream, real_call, syntax
+):
+    # A missing end marker in the reasoning example used to swallow the actual
+    # call, making final parsing disagree with the already streamed arguments.
+    gemma = syntax == "gemma4"
+    parser = load_tool_module("gemma4" if gemma else "json_tools")
+    call = (
+        '<|tool_call>call:get_weather{city:<|"|>Warsaw<|"|>}<tool_call|>'
+        if gemma
+        else '<tool_call>{"name":"get_weather","arguments":{"city":"Warsaw"}}</tool_call>'
+    )
+    old_call = call.replace("Warsaw", "Berlin")
+    start, end = (
+        ("<|channel>thought", "<channel|>") if gemma else ("<think>", "</think>")
+    )
+    options, prompt = {}, "prompt"
+    if syntax == "preopened-custom":
+        start, end = "<reason>", "</reason>"
+        options = dict(
+            thinking_start_token=start, thinking_end_token=end, enable_thinking=True
+        )
+        prompt += start
+    parts = [
+        "" if syntax == "preopened-custom" else start,
+        "Previous example: "
+        + (old_call.removesuffix(parser.tool_call_end) if gemma else old_call),
+        end,
+        call if real_call else "Done.",
+    ]
+    text = "".join(parts)
+    tokens = [
+        _token(part, finish_reason="stop" if i == len(parts) - 1 else None)
+        for i, part in enumerate(parts)
+    ]
+    with _endpoint(
+        parser=parser,
+        template=prompt,
+        result=_result(text, finish_reason="stop"),
+        chunks=[_result(t.text, finish_reason=t.finish_reason) for t in tokens],
+        generator=_streaming(tokens) if batching else None,
+    ):
+        response = _post(client, api, tools=[_tool(api=api)], stream=stream, **options)
+    assert response.status_code == 200, response.text
+    if api == "responses":
+        body = _completed_response(response) if stream else response.json()
+        calls = [
+            (c["name"], json.loads(c["arguments"]))
+            for c in body["output"]
+            if c["type"] == "function_call"
+        ]
+    elif api == "chat":
+        if stream:
+            events = _data(response)
+            choices = [e["choices"][0] for e in events if e.get("choices")]
+            assert choices[-1]["finish_reason"] == (
+                "tool_calls" if real_call else "stop"
+            )
+            fragments = [
+                c for choice in choices for c in choice["delta"].get("tool_calls") or []
+            ]
+            assert all(c["index"] == 0 for c in fragments)
+            calls = (
+                [
+                    (
+                        fragments[0]["function"]["name"],
+                        json.loads(
+                            "".join(
+                                c["function"].get("arguments", "") for c in fragments
+                            )
+                        ),
+                    )
+                ]
+                if fragments
+                else []
+            )
+        else:
+            calls = [
+                (c["function"]["name"], json.loads(c["function"]["arguments"]))
+                for c in response.json()["choices"][0]["message"].get("tool_calls")
+                or []
+            ]
+    elif stream:
+        events = _data(response)
+        assert events[-1]["type"] == "message_stop"
+        blocks = [
+            e["content_block"]
+            for e in events
+            if e["type"] == "content_block_start"
+            and e["content_block"]["type"] == "tool_use"
+        ]
+        arguments = "".join(
+            e["delta"].get("partial_json", "")
+            for e in events
+            if e["type"] == "content_block_delta"
+        )
+        calls = [(b["name"], json.loads(arguments)) for b in blocks]
+    else:
+        calls = [
+            (b["name"], b["input"])
+            for b in response.json()["content"]
+            if b["type"] == "tool_use"
+        ]
+    assert calls == ([("get_weather", {"city": "Warsaw"})] if real_call else [])

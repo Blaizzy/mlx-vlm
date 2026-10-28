@@ -201,7 +201,12 @@ class APCCoordinator:
         )
 
     def checkpoint_lengths(
-        self, token_ids: Sequence[int], media_token_ids: set[int]
+        self,
+        token_ids: Sequence[int],
+        media_token_ids: set[int],
+        *,
+        extra_hash: int = 0,
+        stable_prefix_len: int = 0,
     ) -> List[int]:
         """Bounded intermediate states plus the final conversation checkpoint.
 
@@ -224,12 +229,22 @@ class APCCoordinator:
         last = ((final - 1) // interval) * interval
         first = max(interval, last - (budget - 2) * interval)
         lengths = {final}
-        for boundary in range(first, last + 1, interval):
+        # Prefer the observed stable prefix over positions inside a changing
+        # suffix. The final checkpoint still serves exact prompt extensions.
+        stable = self.manager.checkpoint_prefix_length(token_ids, extra_hash=extra_hash)
+        candidates = [stable_prefix_len, stable] + list(
+            range(last, first - 1, -interval)
+        )
+        for boundary in candidates:
+            if boundary < self.manager.exact_cache_min_tokens:
+                continue
             boundary = adjust_prefix_to_text_suffix_boundary(
                 token_ids, boundary, media_token_ids, max_prefix_tokens=final
             )
             if self.manager.exact_cache_min_tokens <= boundary < final:
                 lengths.add(boundary)
+            if len(lengths) >= budget:
+                break
         return sorted(lengths)
 
     def merge_rows(

@@ -81,6 +81,9 @@ MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
 
 SAFETENSORS_DTYPE_FALLBACKS = {"F8_E8M0": "U8"}
 
+# LiquidAI d1 decision checkpoints (D1Model) by their backbone's model_type
+D1_MODEL_TYPES = {"lfm3_vl": "d1_lfm3_vl", "lfm3_omni": "d1_lfm3_omni"}
+
 GENERATION_CONFIG_DEFAULT_KEYS = (
     "eos_token_id",
     "temperature",
@@ -205,6 +208,13 @@ def get_model_type(config: dict) -> Optional[str]:
 
     model_type = MODEL_REMAPPING.get(model_type, model_type)
 
+    auto_model = str((config.get("auto_map") or {}).get("AutoModel", ""))
+    if model_type in {"lfm3_vl", "lfm3_omni"} and (
+        "D1Model" in (config.get("architectures") or ())
+        or auto_model.endswith("D1Model")
+    ):
+        model_type = D1_MODEL_TYPES[model_type]
+
     architectures = set(config.get("architectures") or ())
     dflash_config = config.get("dflash_config")
     if "Lfm2BidirectionalForMaskedLM" in architectures:
@@ -213,6 +223,13 @@ def get_model_type(config: dict) -> Optional[str]:
         model_type = "nemotron_parse_v3_5"
     elif "BoundaryExtractor" in architectures:
         model_type = "gliner2_5"
+    elif model_type == "qwen3_5" and (
+        "Qwen3_5ForSequenceClassification" in architectures
+        or config.get("problem_type") == "single_label_classification"
+    ):
+        # Jev's source checkpoint declares a causal architecture despite having
+        # a two-class score head. Preserve the classification task when loading.
+        model_type = "minicpm_ocr_jev"
     elif "DFlash2DraftModel" in architectures:
         model_type = "dflash2"
     elif "Gemma4DSparkModel" in architectures:
@@ -856,6 +873,9 @@ def load(
 
     if image_processor is not None:
         processor.image_processor = image_processor
+
+    if hasattr(model, "attach_processor"):
+        model.attach_processor(processor)
 
     return model, processor
 
@@ -1876,7 +1896,9 @@ def prepare_inputs(
     has_videos = videos is not None and (
         not hasattr(videos, "__len__") or len(videos) > 0
     )
-    if not has_images and not has_audio and not has_videos:
+    # prior speech given as codes still needs the processor to expand its placeholders
+    has_audio_out = kwargs.get("audio_out_codes") is not None
+    if not has_images and not has_audio and not has_videos and not has_audio_out:
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )

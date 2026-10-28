@@ -49,6 +49,8 @@ class TextConfig(BaseModelConfig):
     use_mla: bool = False
     sliding_window_size: Optional[int] = 128
     sliding_window: Optional[int] = 128
+    # Unlimited-OCR-2: page2d RoPE + DASH block-sparse attention (see dash.py).
+    sparse_attention_config: Optional[Dict] = None
 
     def __post_init__(self):
         if self.qk_nope_head_dim == 0:
@@ -60,6 +62,7 @@ class TextConfig(BaseModelConfig):
 
 @dataclass
 class VisionConfig(DeepseekOCRVisionConfig):
+    layer_norm_eps: float = 1e-5  # Released CLIP encoder uses the PyTorch default.
     width: Union[int, Dict] = 1152
 
 
@@ -86,6 +89,11 @@ class ModelConfig(BaseModelConfig):
         if "language_config" in params:
             params["text_config"] = params["language_config"]
             del params["language_config"]
+
+        # Unlimited-OCR-2 keeps its sparse attention settings at the top level.
+        sparse = params.get("sparse_attention_config")
+        if sparse is not None:
+            params["text_config"].setdefault("sparse_attention_config", sparse)
 
         return cls(
             text_config=TextConfig.from_dict(params["text_config"]),

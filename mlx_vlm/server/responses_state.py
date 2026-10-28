@@ -523,6 +523,30 @@ def _split_thinking(
     return None, _strip_content_markers(text).strip()
 
 
+def parse_assistant_tool_calls(
+    text,
+    tool_module,
+    tools,
+    *,
+    starts_in_thinking=False,
+    thinking_start_token=None,
+    thinking_end_token=None,
+):
+    """Parse executable calls from the same content seen by the streaming parser.
+
+    Response-template parsers may consume tool regions, so split reasoning with
+    the delimiter state instead. Examples inside reasoning are never tool calls.
+    """
+    content = (
+        ThinkingStreamState(
+            starts_in_thinking, thinking_start_token, thinking_end_token
+        )
+        .feed(text, last=True)
+        .content
+    )
+    return process_tool_calls(content or "", tool_module, tools)
+
+
 def _response_output_items_from_text(
     full_text: str,
     message_id: str,
@@ -545,21 +569,25 @@ def _response_output_items_from_text(
     )
     reasoning_items = _reasoning_output_items(reasoning, reasoning_item_id)
     if tool_module is not None and chat_tools:
-        tc = process_tool_calls(full_text, tool_module, chat_tools)
+        tc = parse_assistant_tool_calls(
+            full_text,
+            tool_module,
+            chat_tools,
+            starts_in_thinking=starts_in_thinking,
+            thinking_start_token=thinking_start_token,
+            thinking_end_token=thinking_end_token,
+        )
         if tool_delta_state is not None:
             tool_delta_state.finish(tc.calls)
         if tc.calls:
             items = [
                 _tool_call_to_response_item(call, tool_registry) for call in tc.calls
             ]
-            _, remaining = _split_thinking(
+            remaining = strip_protocol_markers(
                 tc.remaining_text or "",
+                tool_module,
                 thinking_start_token,
                 thinking_end_token,
-                starts_in_thinking=starts_in_thinking,
-            )
-            remaining = strip_protocol_markers(
-                remaining, tool_module, thinking_start_token, thinking_end_token
             )
             return reasoning_items + items, remaining, reasoning, "tool_calls"
     if not content:
