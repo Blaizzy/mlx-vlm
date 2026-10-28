@@ -411,6 +411,10 @@ class OpenAIRequest(ImageProcessingRequest):
     input: Union[str, List[Any]] = Field(
         ..., description="Input text or list of chat messages."
     )
+    transient_context: Optional[str] = Field(
+        None,
+        description="Request-local text appended as user context for generation and token counting, excluded from stored history and compaction summaries. Resend the current value on each request.",
+    )
     model: str = Field(..., description="The model to use for generation.")
     adapter_path: Optional[str] = Field(
         None, description="The path to the adapter weights."
@@ -938,6 +942,10 @@ class StreamOptions(BaseModel):
 
 class ChatRequest(GenerationRequest):
     messages: List[ChatMessage]
+    transient_context: Optional[str] = Field(
+        None,
+        description="Request-local text appended as user context for generation and token counting, excluded from compaction summaries and cached conversation prefixes.",
+    )
     context_management: Optional[List[CompactionControl]] = Field(None, max_length=1)
     stream_options: Optional[StreamOptions] = None
     tools: Optional[List[Any]] = Field(None, description="Tools the model may call.")

@@ -2991,6 +2991,98 @@ class TestCompaction:
         assert "INVENTED_PASSPORT" not in text
         assert "Incomplete handoff" in text
 
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_transient_context_is_counted_but_not_compacted_or_replayed(
+        self, mocked, client, stream
+    ):
+        items = _compaction_history()
+        for index in range(3):
+            current = f"CURRENT_ENVIRONMENT_{index} " * 40
+            before = mocked.count(input=items)["input_tokens"]
+            assert (
+                mocked.count(input=items, transient_context=current)["input_tokens"]
+                > before
+            )
+            mocked.template.reset_mock()
+            response = _post(
+                client,
+                "responses",
+                input=items,
+                stream=stream,
+                transient_context=current,
+                context_management=[{"type": "compaction", "compact_threshold": 1000}],
+            )
+            assert response.status_code == 200, response.text
+            data = _completed_response(response) if stream else response.json()
+            capsule = data["output"][0]
+            assert capsule["type"] == "compaction"
+            restored = _resolve_context([capsule])
+            assert "CURRENT_ENVIRONMENT" not in json.dumps(restored)
+            templates = [call.args[2] for call in mocked.template.call_args_list]
+            summaries = [
+                messages
+                for messages in templates
+                if messages[-1].get("content") == compaction.SUMMARY_INSTRUCTION
+            ]
+            assert summaries
+            assert all(
+                "CURRENT_ENVIRONMENT" not in json.dumps(messages)
+                for messages in summaries
+            )
+            assert templates[-1][-1]["content"] == current
+            assert (
+                sum(current in str(message.get("content")) for message in templates[-1])
+                == 1
+            )
+            # Stored response chaining also carries only canonical input/output.
+            assert "CURRENT_ENVIRONMENT" not in str(server.response_store)
+            items = [capsule] + [
+                _compaction_message("New evidence " * 200) for _ in range(4)
+            ]
+
+    def test_changing_transient_context_reuses_chat_summary_but_counts_new_value(
+        self, mocked, client, monkeypatch
+    ):
+        items = [_msg("Earlier evidence " * 100) for _ in range(6)] + [_msg("Continue")]
+        before = mocked.count(input=items)["input_tokens"]
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", before + 300)
+        first = _post(
+            client,
+            "chat",
+            messages=items,
+            max_tokens=64,
+            transient_context="ENVIRONMENT_OLD",
+        )
+        assert first.status_code == 200, first.text
+        assert mocked.generate.call_count > 1
+        mocked.generate.reset_mock()
+        new = "ENVIRONMENT_NEW " * 20
+        second = _post(
+            client,
+            "chat",
+            messages=items + [_msg("Answer", "assistant"), _msg("Next")],
+            max_tokens=64,
+            transient_context=new,
+        )
+        assert second.status_code == 200, second.text
+        assert mocked.generate.call_count == 1
+        prompt = mocked.generate.call_args.kwargs["prompt"]
+        assert "ENVIRONMENT_OLD" not in prompt
+        assert json.loads(prompt)[-1]["content"] == new
+        assert "Conversation handoff" in prompt
+        assert "ENVIRONMENT" not in str(compaction.chat_cache.entries)
+
+    def test_transient_context_cannot_exceed_context_budget(self, mocked, monkeypatch):
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", 2048)
+        response = mocked.request(
+            input=[_compaction_message("Keep this request")],
+            transient_context="oversized environment " * 2000,
+            context_management=[{"type": "compaction", "compact_threshold": 1536}],
+            status=400,
+        )
+        assert "context" in response["detail"].lower()
+        mocked.generate.assert_not_called()
+
     def test_chat_default_threshold_and_exact_prefix_reuse(
         self, mocked, client, monkeypatch
     ):
