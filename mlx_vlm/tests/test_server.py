@@ -2809,7 +2809,9 @@ class TestCompaction:
             )
         summarize.assert_not_called()
         result = asyncio.run(compact(items, target_tokens=3000))
-        summarize.assert_awaited_once_with(head)
+        assert summarize.await_count == 1
+        assert summarize.await_args.args[0] == head
+        assert 0 < summarize.await_args.args[1] < 3000
         assert result.changed and result.after_tokens < 3000
         assert result.items[:2] == [instruction, request]
         assert result.items[3:] == tail
@@ -2894,7 +2896,7 @@ class TestCompaction:
         async def count(items):
             return len(json.dumps(items))
 
-        async def summarize(items):
+        async def summarize(items, max_summary_tokens):
             return "Earlier requirements summarized.", None
 
         result = asyncio.run(
@@ -2913,6 +2915,66 @@ class TestCompaction:
         assert result.after_tokens - asyncio.run(count(base)) <= 500
         capsule = _seal_context(result.items, covered=result.covered)
         assert _resolve_context(messages + [capsule, latest]) == result.items + [latest]
+
+    def test_compaction_accepts_reduction_that_fits_hard_budget(self):
+        original = [_compaction_message("x" * 2000), _compaction_message("Continue")]
+
+        async def count(items):
+            return len(json.dumps(items))
+
+        summarize = AsyncMock(return_value=("s" * 1500, None))
+        result = asyncio.run(
+            compaction.compact(
+                original,
+                count=count,
+                summarize=summarize,
+                keep_tokens=0,
+                target_tokens=3000,
+            )
+        )
+        assert result.changed
+        assert result.before_tokens * 0.6 < result.after_tokens < result.before_tokens
+        assert result.after_tokens < 3000
+        assert summarize.await_args.args[1] < 3000
+
+    def test_summary_allowance_reserves_protected_tail_and_handoff(
+        self, mocked, monkeypatch
+    ):
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", 8192)
+        latest = _compaction_message("p" * 20000)
+        items = [_compaction_message("x" * 6000), latest]
+        envelope = mocked.count(input=[compaction._handoff(""), latest])["input_tokens"]
+        response = mocked.compact(input=items, keep_tokens=0, max_output_tokens=2048)
+        assert mocked.generate.call_args.kwargs["max_tokens"] == 8192 - 2048 - envelope
+        assert latest in _resolve_context(response["output"])
+
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("api", ["responses", "chat"])
+    @pytest.mark.parametrize("fits", [False, True])
+    def test_early_compaction_budget_failure_preserves_fitting_input(
+        self, mocked, client, monkeypatch, api, stream, fits
+    ):
+        items = [_compaction_message("history " * 100), _compaction_message("Continue")]
+        before = mocked.count(input=items)["input_tokens"]
+        limit = before + 128 if fits else before - 1
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", limit)
+        failure = compaction.ContextBudgetError("summary does not reduce input")
+        monkeypatch.setattr(compaction, "compact", AsyncMock(side_effect=failure))
+        kwargs = dict(
+            stream=stream,
+            context_management=[{"type": "compaction", "compact_threshold": 1}],
+        )
+        kwargs.update({"input": items} if api == "responses" else {"messages": items})
+        response = _post(client, api, **kwargs)
+        if fits:
+            assert response.status_code == 200, response.text
+            answer = mocked.stream.call_args if stream else mocked.generate.call_args
+            assert "Conversation handoff" not in answer.kwargs["prompt"]
+            assert answer.kwargs["max_tokens"] <= limit - before
+        elif stream and api == "responses":
+            assert _data(response)[-1]["type"] == "response.failed"
+        else:
+            assert response.status_code == 400, response.text
 
     @pytest.mark.parametrize(
         "text, tokens, status, detail",
@@ -3722,7 +3784,7 @@ class TestCompaction:
         async def count(items):
             return len(json.dumps(items))
 
-        async def summarize(items):
+        async def summarize(items, max_summary_tokens):
             assert items == original[:3]
             return "Prior work completed.", None
 
@@ -3884,6 +3946,19 @@ class TestCompaction:
                 {"type": "compaction", "compact_threshold": 1000}
             ]
         events = _data(_post(client, "responses", input=items, stream=True, **options))
+        if not trigger and code == 400:
+            assert [event["type"] for event in events] == [
+                "response.created",
+                "response.in_progress",
+                "mlx.compaction.started",
+                "mlx.compaction.completed",
+                "response.completed",
+            ]
+            assert events[3]["input_tokens_before"] == events[3]["input_tokens_after"]
+            assert (
+                "Conversation handoff" not in mocked.stream.call_args.kwargs["prompt"]
+            )
+            return
         assert [event["type"] for event in events] == [
             "response.created",
             "response.in_progress",

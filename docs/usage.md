@@ -152,8 +152,14 @@ consume an exchange and reduce its input. Oversized tool text is shortened with
 an explicit omission marker while retaining call/result pairing. Protected user
 or instruction text that cannot fit still requires a smaller request. The
 standalone `/responses/compact` endpoint still requires its input to fit.
-Automatic summaries reserve 512 tokens at 4K and 1024 at 8K, retry once with up to
-twice that budget, and retain labelled partial content if the cap is still reached.
+Automatic summaries allow up to 512 tokens at 4K and 1024 at 8K, retry once with up
+to twice that budget, and retain labelled partial content if the cap is still reached.
+Both allowances are capped by the space left after the protected tail and handoff
+envelope. A summary that reduces the input and fits the context window can be used
+even if it misses the desired percentage reduction. If early automatic compaction
+cannot meet its budget but the existing input still fits, generation continues with
+that input and the remaining output capacity. Explicit compaction still reports
+unsuccessful reduction, and the hard context limit is enforced on every route.
 Reasoning-only exhaustion falls back to labelled conversation excerpts, not model
 reasoning. Summary prompts close an actually pre-opened thinking suffix when a
 template ignores `enable_thinking=false`. These recovery paths are lossy; they do
