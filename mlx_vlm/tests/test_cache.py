@@ -1316,6 +1316,45 @@ def language_model(name):
     return module.Model(config).language_model
 
 
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+@pytest.mark.parametrize("prefix_length", [7, 255, 257])
+def test_qwen3_5_single_row_decode_retains_batch_cache(dtype, prefix_length):
+    mx.random.seed(13)
+    module, config = apc_config("qwen3_5")
+    config.text_config.linear_key_head_dim = 32
+    lm = module.LanguageModel(config.text_config, config)
+    lm.set_dtype(dtype)
+    lm.eval()
+    tokens = mx.array([[i % 50 + 1 for i in range(prefix_length)]])
+    reference = lm.make_cache()
+    batched = _make_cache(lm, [0])
+    lm(tokens, cache=reference)
+    lm(tokens, cache=batched)
+    owners = list(batched)
+
+    for step in range(4):
+        token = mx.array([[51 + step]])
+        expected = lm(token, cache=reference).logits
+        actual = lm(token, cache=batched).logits
+        tolerance = 1e-4 if dtype == mx.float32 else 1e-2
+        assert mx.allclose(actual, expected, atol=tolerance, rtol=tolerance).item()
+        assert mx.array_equal(mx.argmax(actual, -1), mx.argmax(expected, -1)).item()
+        # The allocation may grow at a block boundary, but the cache owner and
+        # its spare capacity must survive each decode step.
+        assert all(current is original for current, original in zip(batched, owners))
+        for current in batched:
+            if isinstance(current, BatchKVCache):
+                assert current.offset.tolist() == [prefix_length + step + 1]
+                assert current.left_padding.tolist() == [0]
+                assert current.keys.shape[2] >= current._idx
+        for current, expected_cache in zip(batched, reference):
+            if isinstance(current, ArraysCache):
+                for state, expected_state in zip(current.state, expected_cache.state):
+                    assert mx.allclose(
+                        state, expected_state, atol=tolerance, rtol=tolerance
+                    ).item()
+
+
 def test_hashes_and_dependencies():
     tokens = tuple(range(16))
     hash_tokens = P._hash_tokens

@@ -1521,7 +1521,8 @@ def test_padded_prefill_chunks(padding):
         assert caches[1].left_padding.tolist() == expected_padding
 
 
-def test_qwen3_5_cancelled_prefill_row_preserves_survivor_output():
+@parametrize("chunk_size", [1, 3])
+def test_qwen3_5_cancelled_prefill_row_preserves_survivor_output(chunk_size):
     lm, _ = language("qwen")
     model = lm.model
     cache = [ArraysCache(2, left_padding=[5, 0]), BatchKVCache([5, 0])]
@@ -1530,7 +1531,9 @@ def test_qwen3_5_cancelled_prefill_row_preserves_survivor_output():
         layer_cache.filter(mx.array([0]))
 
     singleton_cache = [ArraysCache(2), KVCache()]
-    actual = model(mx.array([[0, 0, 4]]), cache=cache)
+    pending = mx.array([[0, 0, 4]])
+    for start in range(0, pending.shape[1], chunk_size):
+        actual = model(pending[:, start : start + chunk_size], cache=cache)
     expected = model(mx.array([[4]]), cache=singleton_cache)
     assert mx.array_equal(actual[:, -1:], expected).item()
 
