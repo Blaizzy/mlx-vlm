@@ -1527,6 +1527,27 @@ curl -X POST "http://localhost:8080/v1/audio/transcriptions" \
   -F response_format=json
 ```
 
+Models with instruction-based audio tasks can also receive `task`, `prompt`, and
+`system_prompt` as multipart fields. For example, with Nemotron Transcribe support
+installed in `mlx-audio`:
+
+```sh
+curl -X POST "http://localhost:8080/v1/audio/transcriptions" \
+  -F model=/path/to/nemotron-transcribe \
+  -F file=@/path/to/meeting.wav \
+  -F task=qa \
+  -F 'prompt=What time is the meeting?'
+```
+
+Nemotron supports `asr`, `qa`, `saa` (speaker attribution), `rich`, and `translate`.
+For a spoken request, use `task=qa` with `system_prompt=Answer the spoken question.`
+and omit `prompt`. Translation requires a target `language`, such as `German`;
+`/v1/audio/translations` selects `task=translate` regardless of the supplied task.
+Task values and system instructions depend on the selected model. The server
+forwards `prompt` to the model's declared `prompt`, `context`, or `text` parameter,
+preserving an explicitly supplied `context` or `text` value. `stream=true` returns
+NDJSON text chunks; Nemotron encodes the complete audio before emitting text.
+
 ##### Multi-Modal (Image + Audio)
 
 ```sh
