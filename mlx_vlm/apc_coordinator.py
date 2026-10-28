@@ -206,6 +206,7 @@ class APCCoordinator:
         media_token_ids: set[int],
         *,
         extra_hash: int = 0,
+        stable_prefix_len: int = 0,
     ) -> List[int]:
         """Bounded intermediate states plus the final conversation checkpoint.
 
@@ -231,7 +232,9 @@ class APCCoordinator:
         # Prefer the observed stable prefix over positions inside a changing
         # suffix. The final checkpoint still serves exact prompt extensions.
         stable = self.manager.checkpoint_prefix_length(token_ids, extra_hash=extra_hash)
-        candidates = [stable] + list(range(last, first - 1, -interval))
+        candidates = [stable_prefix_len, stable] + list(
+            range(last, first - 1, -interval)
+        )
         for boundary in candidates:
             if boundary < self.manager.exact_cache_min_tokens:
                 continue

@@ -657,6 +657,9 @@ class GenerationArguments:
     min_pixels: Optional[int] = None
     max_pixels: Optional[int] = None
     resize_shape: Optional[Tuple[int, int]] = None
+    # Internal rendered boundary, never accepted as an unchecked token offset.
+    cache_prefix: Optional[str] = None
+    cache_checkpoint_len: int = 0
 
     def __post_init__(self):
         self.temperature = clamp_temperature(self.temperature)
@@ -1216,6 +1219,15 @@ class ResponseGenerator:
             raw_inputs = self._preprocess_request(
                 prompt, images, audio, videos, **args.preprocessing_kwargs()
             )
+            args.cache_checkpoint_len = 0
+            if args.cache_prefix and not (images or audio or videos):
+                prefix_inputs = self._preprocess_request(args.cache_prefix)
+                full_ids = raw_inputs["input_ids"].reshape(-1).tolist()
+                prefix_ids = prefix_inputs["input_ids"].reshape(-1).tolist()
+                for actual, expected in zip(full_ids, prefix_ids):
+                    if actual != expected:
+                        break
+                    args.cache_checkpoint_len += 1
             thinking_budget_criteria = self._make_thinking_budget_criteria(
                 args, raw_inputs.get("input_ids")
             )
@@ -1836,6 +1848,8 @@ class ResponseGenerator:
                         apc_semantic_hash=request.apc_semantic_hash,
                     )
                     has_embeds = bool(gen_kwargs.get("inputs_embeds") is not None)
+                    if args.cache_checkpoint_len:
+                        gen_kwargs["_apc_checkpoint_len"] = args.cache_checkpoint_len
                     # Preserve tenant isolation for manually queued requests
                     # that predate server-side semantic hash computation.
                     if request.apc_semantic_hash is None and getattr(

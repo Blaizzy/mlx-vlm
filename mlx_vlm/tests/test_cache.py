@@ -2392,6 +2392,10 @@ def test_checkpoint_schedule(prefix_manager):
     coordinator = manager.coordinator(cache_model([C.ArraysCache(1)]))
     tokens = list(range(75))
     assert coordinator.checkpoint_lengths(tokens, set()) == [64, 74]
+    assert coordinator.checkpoint_lengths(tokens, set(), stable_prefix_len=43) == [
+        43,
+        74,
+    ]
     manager._exact_cache_max = 4
     assert coordinator.checkpoint_lengths(tokens, set()) == [32, 48, 64, 74]
     tokens[45:67] = [999] * 22
@@ -2419,7 +2423,10 @@ def test_checkpoint_divergence_is_scoped_and_media_safe(prefix_manager):
 
 
 @parametrize("model_name", ["qwen3_5", "lfm2"])
-def test_hybrid_replaced_suffix_keeps_reusable_state(prefix_manager, model_name):
+@parametrize("explicit_boundary", [False, True])
+def test_hybrid_replaced_suffix_keeps_reusable_state(
+    prefix_manager, model_name, explicit_boundary
+):
     mx.random.seed(13)
     lm = language_model(model_name)
     manager = prefix_manager()
@@ -2428,10 +2435,19 @@ def test_hybrid_replaced_suffix_keeps_reusable_state(prefix_manager, model_name)
         canonical = list(range(1, 22 + turn * 3))
         tokens = canonical + [50 + turn] * 40
         restored, count = manager.lookup_exact_cache(tokens)
+        if explicit_boundary and turn:
+            assert count == len(canonical) - 3
         if turn >= 2:
             assert count >= 21 + (turn - 2) * 3
         cache, _ = warm_exact([restored or lm.make_cache()], [count])
-        batch = prompt_batch(lm, manager, [tokens], [count], cache)
+        batch = prompt_batch(
+            lm,
+            manager,
+            [tokens],
+            [count],
+            cache,
+            stable_prefix_len=len(canonical) if explicit_boundary else 0,
+        )
         sampled = []
 
         def sample(lp):
@@ -2447,7 +2463,9 @@ def test_hybrid_replaced_suffix_keeps_reusable_state(prefix_manager, model_name)
         assert len(manager._exact_cache) <= 2
 
 
-def prompt_batch(lm, manager, tokens, prefixes, caches, step=16, **kwargs):
+def prompt_batch(
+    lm, manager, tokens, prefixes, caches, step=16, stable_prefix_len=0, **kwargs
+):
     runner = manager.coordinator(lm)
     suffixes = [ids[n:] for ids, n in zip(tokens, prefixes)]
     padded = [ids + [0] * (max(map(len, suffixes)) - len(ids)) for ids in suffixes]
@@ -2466,7 +2484,9 @@ def prompt_batch(lm, manager, tokens, prefixes, caches, step=16, **kwargs):
             dict(
                 full_input_ids=ids,
                 prefix_len=n,
-                checkpoint_lengths=runner.checkpoint_lengths(ids, set()),
+                checkpoint_lengths=runner.checkpoint_lengths(
+                    ids, set(), stable_prefix_len=stable_prefix_len
+                ),
             )
             for ids, n in zip(tokens, prefixes)
         ],

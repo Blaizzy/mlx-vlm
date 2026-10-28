@@ -1144,6 +1144,24 @@ async def responses_endpoint(request: Request):
                 tools=chat_tools or None,
                 **template_kwargs,
             )
+            gen_args.cache_prefix = None
+            if openai_request.transient_context and not images:
+                stable_messages, _ = _response_items_to_chat(
+                    compaction.with_transient_context(
+                        items, openai_request, include_suffix=False
+                    )
+                )
+                _normalize_instruction_messages(
+                    stable_messages, openai_request.instructions
+                )
+                gen_args.cache_prefix = apply_chat_template(
+                    processor,
+                    config,
+                    stable_messages,
+                    add_generation_prompt=False,
+                    tools=chat_tools or None,
+                    **template_kwargs,
+                )
             thinking = prompt_has_open_thinking(
                 prompt,
                 gen_args.enable_thinking,
@@ -1994,10 +2012,12 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 _chat_message_to_prompt(message.model_dump(exclude_none=True))
             )
 
-        if request.transient_context:
-            processed_messages.append(
-                {"role": "user", "content": request.transient_context}
-            )
+        stable_messages = compaction.with_transient_context(
+            processed_messages, request, include_suffix=False
+        )
+        processed_messages = compaction.with_transient_context(
+            processed_messages, request
+        )
 
         _normalize_instruction_messages(processed_messages)
         _ensure_effective_input(processed_messages, images=images, audio=audio)
@@ -2060,6 +2080,16 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             tools=tools,
             **template_kwargs,
         )
+        if request.transient_context and not (images or audio or videos):
+            _normalize_instruction_messages(stable_messages)
+            gen_args.cache_prefix = apply_chat_template(
+                processor,
+                config,
+                stable_messages,
+                add_generation_prompt=False,
+                tools=tools,
+                **template_kwargs,
+            )
 
         parse_tools = partial(
             parse_assistant_tool_calls,

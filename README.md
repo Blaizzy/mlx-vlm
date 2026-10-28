@@ -1129,8 +1129,11 @@ state cannot be rolled back by slicing K/V tensors.
 
 Hybrid prefill now captures intermediate checkpoints as well as the final guard
 checkpoint, in streaming, continuous batching and DiffusionGemma generation.
-With the defaults, each prompt stores its latest 2,048-token boundary before the
-final checkpoint and the final checkpoint itself. For example, a 30,000-token
+For text API requests with `transient_context`, the server verifies and prioritizes
+the token boundary before that mutable suffix. Otherwise, observed divergence
+from resident prompts takes priority. With neither hint, each prompt stores its
+latest 2,048-token boundary before the final checkpoint and the final checkpoint
+itself. For example, a 30,000-token
 document followed by 20 instruction tokens can reuse 28,672 tokens when the
 instructions change. The same checkpoints persist across server restarts when
 the disk tier is enabled.
