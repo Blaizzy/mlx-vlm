@@ -30,9 +30,8 @@ class Model(DeepseekOCRModel):
         **kwargs,
     ):
         input_embeds = self.language_model.model.embed_tokens(input_ids)
-        if self.language_model.dash_params is not None:
-            # DASH page bookkeeping needs the whole prompt, also under chunked prefill.
-            self.language_model._prompt_ids = np.array(input_ids[0])
+        # R-SWA and DASH need the whole prompt, also under chunked prefill.
+        self.language_model._prompt_ids = np.array(input_ids[0])
 
         if pixel_values is None:
             return InputEmbeddingsFeatures(inputs_embeds=input_embeds)

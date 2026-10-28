@@ -191,9 +191,13 @@ MXFP4. In a six-page Unlimited-OCR-2 smoke test, MXFP4 with BF16 vision omitted 
 paragraph despite reaching EOS; FP32 vision recovered it. Successful termination
 alone does not establish transcription completeness.
 
-The R-SWA cache also distinguishes prompt chunks from generated tokens. The last
-single prompt token left by chunked prefill remains part of the persistent
-reference; even a prefill step size of one must not evict visual-prefix keys.
+Like DASH, R-SWA records the full prompt boundary before processing its first
+chunk. The last single prompt token left by chunked prefill remains part of the
+persistent reference, even with a prefill step size of one. The boundary survives
+partial-prefill checkpoints in the existing four-field cache metadata format.
+The model's embedding path supplies the full prompt automatically. Callers that
+chunk the language model directly must first supply the complete token sequence
+through `language_model._prompt_ids`, as for DASH.
 
 ## CLI Examples
 

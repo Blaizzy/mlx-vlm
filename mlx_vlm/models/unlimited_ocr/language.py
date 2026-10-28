@@ -26,6 +26,8 @@ class RingSlidingKVCache(KVCache):
     Upstream keeps the full prompt/prefill cache, then appends generated tokens
     until a small decode ring is full. Afterwards, new decode keys/values
     overwrite that ring while absolute positions keep increasing.
+
+    The language model sets ``prefill_length`` before processing any chunks.
     """
 
     def memory_profile(self, token_count):
@@ -41,23 +43,9 @@ class RingSlidingKVCache(KVCache):
         self.window_size = int(window_size)
         self.prefill_length: Optional[int] = None
         self._ring_pos = 0
-        self._processing_prefill = False
-        self._prefill_pending = False
-
-    def begin_prefill(self):
-        self._processing_prefill = True
-        self.prefill_length = None
-
-    def end_prefill(self, finished):
-        self._processing_prefill = False
-        self.prefill_length = self.offset
-        self._ring_pos = 0
-        self._prefill_pending = not finished
 
     def update_and_fetch(self, keys, values):
         seq_len = int(keys.shape[2])
-        if self._processing_prefill:
-            return super().update_and_fetch(keys, values)
 
         if self.prefill_length is None:
             if seq_len > 1:
@@ -113,8 +101,6 @@ class RingSlidingKVCache(KVCache):
         self.offset = 0 if self.keys is None else self.keys.shape[2]
         self.prefill_length = None
         self._ring_pos = 0
-        self._processing_prefill = False
-        self._prefill_pending = False
 
     @property
     def meta_state(self):
@@ -126,16 +112,13 @@ class RingSlidingKVCache(KVCache):
                     -1 if self.prefill_length is None else self.prefill_length,
                     self.offset,
                     self._ring_pos,
-                    int(self._prefill_pending),
                 ),
             )
         )
 
     @meta_state.setter
     def meta_state(self, v):
-        window_size, prefill_length, offset, ring_pos = map(int, v[:4])
-        self._processing_prefill = False
-        self._prefill_pending = bool(int(v[4])) if len(v) > 4 else False
+        window_size, prefill_length, offset, ring_pos = map(int, v)
         self.window_size = window_size
         self.prefill_length = None if prefill_length < 0 else prefill_length
         self.offset = offset
@@ -262,29 +245,24 @@ class LanguageModel(DeepseekLanguageModel):
         **kwargs,
     ):
         if self.dash_params is None:
-            ring_caches = [c for c in cache or [] if isinstance(c, RingSlidingKVCache)]
-            chunk = kwargs.get("n_to_process") is not None
-            # Chunked generation leaves one final prompt token for the first step.
-            prefill = bool(ring_caches) and (
-                chunk
-                or any(c._prefill_pending for c in ring_caches)
-                or all(c.offset == 0 for c in ring_caches)
+            if (
+                cache
+                and isinstance(cache[0], RingSlidingKVCache)
+                and (cache[0].offset == 0 or self._prompt_ids is not None)
+            ):
+                length = (inputs if inputs_embeds is None else inputs_embeds).shape[1]
+                if self._prompt_ids is not None:
+                    ids = None if inputs is None else inputs[0]
+                    length = len(_prompt_ids(self._prompt_ids, ids, length))
+                # Like DASH, fix the boundary before the first chunk. A final
+                # single-token chunk still belongs to this persistent prefix.
+                for entry in cache:
+                    entry.prefill_length = entry.offset + length
+            # The boundary now belongs to the cache, including restored caches.
+            self._prompt_ids = None
+            return super().__call__(
+                inputs, inputs_embeds=inputs_embeds, mask=mask, cache=cache, **kwargs
             )
-            if prefill:
-                for entry in ring_caches:
-                    entry.begin_prefill()
-            try:
-                return super().__call__(
-                    inputs,
-                    inputs_embeds=inputs_embeds,
-                    mask=mask,
-                    cache=cache,
-                    **kwargs,
-                )
-            finally:
-                if prefill:
-                    for entry in ring_caches:
-                        entry.end_prefill(finished=not chunk)
         if cache is None:
             cache = self.make_cache()
         h = self.model(

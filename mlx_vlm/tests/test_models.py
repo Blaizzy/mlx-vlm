@@ -4593,9 +4593,12 @@ class TestUnlimitedOCRPrecision(unittest.TestCase):
         model = LanguageModel(config)
         model.eval()
         prefix = mx.arange(40, dtype=mx.float32).reshape(1, 5, 8) / 43.0
+        # As with DASH, direct chunked calls supply the complete prompt first.
+        model._prompt_ids = np.arange(prefix.shape[1])
         expected = model(None, inputs_embeds=prefix, cache=model.make_cache()).logits
         for step_size in (1, 4):
             with self.subTest(step_size=step_size):
+                model._prompt_ids = np.arange(prefix.shape[1])
                 cache = model.make_cache()
                 processed = 0
                 chunks = []
@@ -4606,9 +4609,9 @@ class TestUnlimitedOCRPrecision(unittest.TestCase):
                             None,
                             inputs_embeds=prefix[:, processed : processed + count],
                             cache=cache,
-                            n_to_process=count,
                         ).logits
                     )
+                    self.assertEqual(cache[0].prefill_length, 5)
                     processed += count
                 # Resume a saved partial prefill before processing its last token.
                 restored = model.make_cache()
@@ -4624,7 +4627,6 @@ class TestUnlimitedOCRPrecision(unittest.TestCase):
                     atol=1e-5,
                 )
                 self.assertEqual(cache[0].prefill_length, 5)
-                self.assertFalse(cache[0]._prefill_pending)
                 self.assertEqual(cache[0].state[0].shape[2], 5)
                 saved_prefix = mx.array(cache[0].state[0])
                 for token in [2, 3, 4]:
@@ -4634,21 +4636,109 @@ class TestUnlimitedOCRPrecision(unittest.TestCase):
                     np.array(cache[0].state[0][:, :, :5]), np.array(saved_prefix)
                 )
 
-    def test_prefill_progress_metadata_roundtrip_and_legacy_restore(self):
-        from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
+    def test_generation_keeps_full_prompt_across_ring_wrap_and_reuse(self):
+        from mlx_vlm.generate.ar import generate_step
+        from mlx_vlm.models.unlimited_ocr.config import TextConfig
+        from mlx_vlm.models.unlimited_ocr.language import LanguageModel
+        from mlx_vlm.models.unlimited_ocr.unlimitedocr import Model
 
-        cache = RingSlidingKVCache(2)
-        cache.begin_prefill()
-        cache.update_and_fetch(mx.ones((1, 1, 3, 4)), mx.ones((1, 1, 3, 4)))
-        cache.end_prefill(finished=False)
-        restored = RingSlidingKVCache(2)
-        restored.state = cache.state
-        restored.meta_state = cache.meta_state
-        self.assertTrue(restored._prefill_pending)
-        self.assertEqual(restored.prefill_length, 3)
-        restored.meta_state = cache.meta_state[:4]
-        self.assertFalse(restored._prefill_pending)
-        self.assertEqual(restored.prefill_length, 3)
+        class TinyModel(nn.Module):
+            # Exercise the production embedding path that also supplies DASH's
+            # prompt metadata, without allocating the large vision encoders.
+            get_input_embeddings = Model.get_input_embeddings
+
+            def __init__(self):
+                super().__init__()
+                self.config = TextConfig(
+                    hidden_size=8,
+                    intermediate_size=16,
+                    num_hidden_layers=1,
+                    num_attention_heads=2,
+                    num_key_value_heads=2,
+                    vocab_size=16,
+                    n_routed_experts=None,
+                    n_shared_experts=None,
+                    sliding_window_size=2,
+                    sliding_window=2,
+                )
+                self.language_model = LanguageModel(self.config)
+
+        model = TinyModel()
+        model.eval()
+        for step in (1, 4, None):
+            for length in (5, 3, 1):
+                with self.subTest(step=step, length=length):
+                    ids = mx.arange(length)[None]
+                    embeds = model.get_input_embeddings(ids).inputs_embeds
+                    reference_cache = model.language_model.make_cache()
+                    mx.eval(
+                        model.language_model(
+                            ids, inputs_embeds=embeds, cache=reference_cache
+                        ).logits
+                    )
+                    reference_keys = np.array(reference_cache[0].state[0])
+                    cache = model.language_model.make_cache()
+                    list(
+                        generate_step(
+                            ids,
+                            model,
+                            None,
+                            None,
+                            temperature=0.0,
+                            max_tokens=3,
+                            prefill_step_size=step,
+                            prompt_cache=cache,
+                        )
+                    )
+                    self.assertEqual(cache[0].prefill_length, length)
+                    self.assertEqual(cache[0].state[0].shape[2], length + 2)
+                    np.testing.assert_allclose(
+                        np.array(cache[0].state[0][:, :, :length]),
+                        reference_keys,
+                        atol=1e-6,
+                        rtol=1e-6,
+                    )
+
+        # An APC hit may supply only the uncached suffix to the embedding path.
+        # Transfer that suffix length once and include the already cached prefix.
+        ids = mx.arange(5)[None]
+        for cached_tokens in (3, 4):
+            with self.subTest(cached_tokens=cached_tokens):
+                cache = model.language_model.make_cache()
+                prefix = ids[:, :cached_tokens]
+                embeds = model.get_input_embeddings(prefix).inputs_embeds
+                mx.eval(
+                    model.language_model(
+                        prefix, inputs_embeds=embeds, cache=cache
+                    ).logits
+                )
+                list(
+                    generate_step(
+                        ids[:, cached_tokens:],
+                        model,
+                        None,
+                        None,
+                        temperature=0.0,
+                        max_tokens=3,
+                        prefill_step_size=1,
+                        prompt_cache=cache,
+                    )
+                )
+                self.assertEqual(cache[0].prefill_length, 5)
+                self.assertEqual(cache[0].state[0].shape[2], 7)
+                reference_cache = model.language_model.make_cache()
+                embeds = model.get_input_embeddings(ids).inputs_embeds
+                mx.eval(
+                    model.language_model(
+                        ids, inputs_embeds=embeds, cache=reference_cache
+                    ).logits
+                )
+                np.testing.assert_allclose(
+                    np.array(cache[0].state[0][:, :, :5]),
+                    np.array(reference_cache[0].state[0]),
+                    atol=1e-6,
+                    rtol=1e-6,
+                )
 
     def test_uncached_language_keeps_native_dtype(self):
         from mlx_vlm.models.unlimited_ocr.config import TextConfig

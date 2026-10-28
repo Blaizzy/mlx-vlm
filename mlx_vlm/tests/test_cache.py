@@ -1739,6 +1739,27 @@ def test_clone_continuation(kind, length):
         assert A.merge_cache_entries([cache], [cache.offset]) is None
 
 
+def test_ring_prompt_boundary_survives_partial_prefill_restore():
+    cache = RingSlidingKVCache(2)
+    cache.prefill_length = 5
+    prompt = mx.arange(20, dtype=mx.float32).reshape(1, 1, 5, 4)
+    cache.update_and_fetch(prompt[:, :, :3], prompt[:, :, :3])
+    # The existing four-field format retains the full boundary even when only
+    # part of the prompt has been processed; no pending-prefill flag is needed.
+    assert cache.meta_state == ("2", "5", "3", "0")
+    restored = clone(cache)
+    assert restored.prefill_length == 5 and restored.offset == 3
+    for idx in range(3, 5):
+        restored.update_and_fetch(
+            prompt[:, :, idx : idx + 1], prompt[:, :, idx : idx + 1]
+        )
+    for value in (20, 21, 22):
+        token = mx.full((1, 1, 1, 4), value, dtype=mx.float32)
+        restored.update_and_fetch(token, token)
+    assert restored.state[0].shape[2] == 7
+    same_arrays(restored.state[0][:, :, :5], prompt)
+
+
 def sample(name, length=0):
     constructors = {
         "ArraysCache": lambda: C.ArraysCache(2),
