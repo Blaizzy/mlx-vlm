@@ -11,11 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import HTTPException
 
 from ..prompt_utils import _normalize_tool_message
-from ..tools import (
-    _infer_tool_parser_from_processor,
-    load_tool_module,
-    process_tool_calls,
-)
+from ..tools import process_tool_calls
 
 logger = logging.getLogger("mlx_vlm.server")
 
@@ -235,27 +231,12 @@ def _response_template_tokenizer(processor):
     return tokenizer
 
 
-def _model_response_parser(processor, prompt, starts_in_thinking):
-    parser_name = _infer_tool_parser_from_processor(processor)
-    if parser_name is None:
-        return None
-    parser = getattr(load_tool_module(parser_name), "ResponseParser", None)
-    if parser is not None:
-        return parser(prefix=prompt, starts_in_thinking=starts_in_thinking)
-    return None
-
-
 def make_response_stream_state(
     processor,
     enable_thinking: bool = False,
     thinking_start_token: Optional[str] = None,
     thinking_end_token: Optional[str] = None,
-    *,
-    prompt: str = "",
 ):
-    parser = _model_response_parser(processor, prompt, enable_thinking)
-    if parser is not None:
-        return parser
     tokenizer = _response_template_tokenizer(processor)
     if tokenizer is not None and hasattr(tokenizer, "get_response_parser"):
         try:
@@ -488,16 +469,9 @@ def _split_thinking(
     thinking_end_token: Optional[str] = None,
     starts_in_thinking: bool = False,
     processor=None,
-    *,
-    prompt: str = "",
 ) -> Tuple[Optional[str], str]:
     if not text:
         return None, text
-
-    parser = _model_response_parser(processor, prompt, starts_in_thinking)
-    if parser is not None:
-        delta = parser.feed(text, last=True)
-        return (delta.reasoning or "").strip() or None, (delta.content or "").strip()
 
     tokenizer = _response_template_tokenizer(processor)
     if tokenizer is not None and hasattr(tokenizer, "parse_response"):
@@ -585,8 +559,6 @@ def _response_output_items_from_text(
     processor=None,
     starts_in_thinking: bool = False,
     tool_delta_state=None,
-    *,
-    prompt: str = "",
 ) -> Tuple[List[Dict[str, Any]], str, Optional[str], str]:
     reasoning, content = _split_thinking(
         full_text,
@@ -594,7 +566,6 @@ def _response_output_items_from_text(
         thinking_end_token,
         starts_in_thinking=starts_in_thinking,
         processor=processor,
-        prompt=prompt,
     )
     reasoning_items = _reasoning_output_items(reasoning, reasoning_item_id)
     if tool_module is not None and chat_tools:

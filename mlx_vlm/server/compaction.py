@@ -883,7 +883,6 @@ async def compact_response_context(
                 summary_args.thinking_start_token,
                 summary_args.thinking_end_token,
                 processor=processor,
-                prompt=prompt,
             )
             return (
                 content,

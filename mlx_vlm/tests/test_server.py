@@ -155,17 +155,6 @@ class _HarmonyResponseTemplateTokenizer:
         return ResponseParser(self.response_template, prefix=prefix)
 
 
-class _LFM3ResponseTemplateTokenizer:
-    chat_template = "<tool_call>\n<function= <additional_tools> preserve_thinking"
-    response_template = {"invalid": "the native parser must not use this"}
-
-    def parse_response(self, response, prefix=None):
-        raise AssertionError("LFM3 must use its native response parser")
-
-    def get_response_parser(self, prefix=None):
-        raise AssertionError("LFM3 must use its native response parser")
-
-
 def _harmony_processor():
     """A processor prepared exactly as the gpt-oss loader prepares it."""
     return _attach_harmony_template(NS(tokenizer=_HarmonyResponseTemplateTokenizer()))
@@ -2380,69 +2369,6 @@ def test_response_template_tool_calls(client, api):
         arguments = call["input"]
     assert call["name"] == "get_weather" and arguments == {"city": "Warsaw"}
     assert "to=self" not in response.text and "<atem:" not in response.text
-
-
-@pytest.mark.parametrize("api", ["chat", "responses", "messages"])
-@pytest.mark.parametrize("batching", [False, True])
-@pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("mode", ["thinking", "disabled", "truncated"])
-@pytest.mark.parametrize("response_template", [False, True])
-def test_lfm3_prompt_prefilled_thinking(
-    client, api, batching, stream, mode, response_template
-):
-    prefix = (
-        "<|im_start|>assistant\n<think>Old reasoning.</think>Old answer.<|im_end|>\n"
-        "<|im_start|>user\nWhat is 2 + 2?<|im_end|>\n<|im_start|>assistant\n<think>"
-    )
-    parts = ["Add two and two.", "</thi", "nk>", "\n\n", "4."]
-    expected = ("Add two and two.", "4.")
-    finish = "stop"
-    if mode == "disabled":
-        prefix += "</think>"
-        parts, expected = ["4."], ("", "4.")
-    elif mode == "truncated":
-        parts, expected, finish = parts[:1], (expected[0], ""), "length"
-    tokens = [
-        _token(part, finish_reason=finish if i == len(parts) - 1 else None)
-        for i, part in enumerate(parts)
-    ]
-    tokenizer = _LFM3ResponseTemplateTokenizer()
-    if not response_template:
-        tokenizer.response_template = None
-    with _endpoint(
-        model_type="lfm3",
-        processor=NS(tokenizer=tokenizer),
-        template=prefix,
-        result=_result("".join(parts), finish_reason=finish),
-        chunks=[_result(t.text, finish_reason=t.finish_reason) for t in tokens],
-        generator=_streaming(tokens) if batching else None,
-    ):
-        response = _post(client, api, stream=stream, enable_thinking=mode != "disabled")
-    assert response.status_code == 200, response.text
-    if stream:
-        assert _thinking_text(response, api) == expected
-    if api == "responses":
-        body = _completed_response(response) if stream else response.json()
-        reasoning = "".join(
-            part["text"]
-            for item in body["output"]
-            if item["type"] == "reasoning"
-            for part in item["summary"]
-        )
-        assert (reasoning, body["output_text"]) == expected
-    elif not stream:
-        body = response.json()
-        if api == "chat":
-            message = body["choices"][0]["message"]
-            actual = (
-                message.get("reasoning_content") or "",
-                message.get("content") or "",
-            )
-        else:
-            actual = tuple(
-                _joined(body["content"], key) for key in ("thinking", "text")
-            )
-        assert actual == expected
 
 
 def test_chat_completions_endpoint_falls_back_from_video_to_images(client):
@@ -8425,7 +8351,7 @@ def test_unload_releases_model_before_allocator_clear(monkeypatch):
 @pytest.mark.parametrize("batching", [False, True])
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("real_call", [False, True])
-@pytest.mark.parametrize("syntax", ["gemma4", "json_tools", "preopened-custom", "lfm3"])
+@pytest.mark.parametrize("syntax", ["gemma4", "json_tools", "preopened-custom"])
 def test_tool_examples_in_reasoning_are_not_executed(
     client, api, batching, stream, real_call, syntax
 ):
@@ -8438,12 +8364,6 @@ def test_tool_examples_in_reasoning_are_not_executed(
         if gemma
         else '<tool_call>{"name":"get_weather","arguments":{"city":"Warsaw"}}</tool_call>'
     )
-    if syntax == "lfm3":
-        parser = load_tool_module("lfm3")
-        call = (
-            "<tool_call>\n<function=get_weather>\n"
-            "<parameter=city>Warsaw</parameter>\n</function>\n</tool_call>"
-        )
     old_call = call.replace("Warsaw", "Berlin")
     start, end = (
         ("<|channel>thought", "<channel|>") if gemma else ("<think>", "</think>")
@@ -8455,10 +8375,8 @@ def test_tool_examples_in_reasoning_are_not_executed(
             thinking_start_token=start, thinking_end_token=end, enable_thinking=True
         )
         prompt += start
-    elif syntax == "lfm3":
-        prompt = "<|im_start|>assistant\n<think>"
     parts = [
-        "" if syntax in ("preopened-custom", "lfm3") else start,
+        "" if syntax == "preopened-custom" else start,
         "Previous example: "
         + (old_call.removesuffix(parser.tool_call_end) if gemma else old_call),
         end,
@@ -8472,7 +8390,6 @@ def test_tool_examples_in_reasoning_are_not_executed(
     with _endpoint(
         parser=parser,
         template=prompt,
-        processor=_LFM3ResponseTemplateTokenizer() if syntax == "lfm3" else None,
         result=_result(text, finish_reason="stop"),
         chunks=[_result(t.text, finish_reason=t.finish_reason) for t in tokens],
         generator=_streaming(tokens) if batching else None,

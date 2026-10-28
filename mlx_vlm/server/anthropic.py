@@ -594,7 +594,6 @@ async def anthropic_messages_endpoint(http_request: Request):
                     ),
                     gen_args.thinking_start_token,
                     gen_args.thinking_end_token,
-                    prompt=formatted_prompt,
                 )
                 tc_start = (
                     tool_module.tool_call_start if tool_module and tools else None
@@ -1026,7 +1025,6 @@ async def anthropic_messages_endpoint(http_request: Request):
                 gen_args.thinking_start_token,
                 gen_args.thinking_end_token,
                 processor=processor,
-                prompt=formatted_prompt,
             )
             parsed_tool_calls = None
             if tool_module is not None and tools:

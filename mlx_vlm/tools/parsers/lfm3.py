@@ -7,9 +7,6 @@ from typing import Optional
 from . import qwen3_coder
 
 parse_tool_call = qwen3_coder.parse_tool_call
-_convert_param_value = qwen3_coder._convert_param_value
-_get_arguments_config = qwen3_coder._get_arguments_config
-_string_types = qwen3_coder._string_types
 
 tool_call_start = "<tool_call>"
 tool_call_end = "</tool_call>"

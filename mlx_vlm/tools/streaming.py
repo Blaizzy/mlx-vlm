@@ -147,7 +147,6 @@ class ToolCallDeltaState:
             "json_tools",
             "cohere2_moe",
             "qwen3_coder",
-            "lfm3",
             "gemma4",
         ):
             return []
@@ -173,7 +172,7 @@ class ToolCallDeltaState:
                 elif name == "cohere2_moe":
                     body = _without_marker_tail(body, "\\|").replace("\\|", "|")
                     candidates = _json_calls(body, "tool_name", "parameters")
-                elif name in ("qwen3_coder", "lfm3"):
+                elif name == "qwen3_coder":
                     candidates = _xml_call(body, self.tools, self.module)
                 elif name == "gemma4":
                     candidates = _gemma_call(body, self.module)
