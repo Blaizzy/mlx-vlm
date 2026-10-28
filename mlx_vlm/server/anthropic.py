@@ -5,6 +5,7 @@ import logging
 import time
 import traceback
 import uuid
+from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
@@ -17,7 +18,6 @@ from ..tools import (
     _infer_tool_parser_from_processor,
     _prepare_chat_tool_choice,
     load_tool_module,
-    process_tool_calls,
 )
 from ..utils import prepare_inputs
 from .generation import (
@@ -30,6 +30,7 @@ from .responses_state import (
     ToolCallStreamState,
     finish_content_streams,
     make_response_stream_state,
+    parse_assistant_tool_calls,
     prompt_has_open_thinking,
     strip_protocol_markers,
 )
@@ -530,6 +531,20 @@ async def anthropic_messages_endpoint(http_request: Request):
             **template_kwargs,
         )
 
+        parse_tools = partial(
+            parse_assistant_tool_calls,
+            tool_module=tool_module,
+            tools=tools,
+            starts_in_thinking=prompt_has_open_thinking(
+                formatted_prompt,
+                gen_args.enable_thinking,
+                gen_args.thinking_start_token,
+                gen_args.thinking_end_token,
+            ),
+            thinking_start_token=gen_args.thinking_start_token,
+            thinking_end_token=gen_args.thinking_end_token,
+        )
+
         logger.debug(
             "anthropic messages request: model=%s images=%d max_tokens=%s "
             "temp=%s stream=%s tools=%d",
@@ -796,7 +811,7 @@ async def anthropic_messages_endpoint(http_request: Request):
 
                     parsed_tool_calls = None
                     if tool_module is not None and tools:
-                        tc = process_tool_calls(full_output, tool_module, tools)
+                        tc = parse_tools(full_output)
                         if tc.calls:
                             parsed_tool_calls = tc.calls
 
@@ -1013,15 +1028,21 @@ async def anthropic_messages_endpoint(http_request: Request):
             )
             parsed_tool_calls = None
             if tool_module is not None and tools:
-                tc = process_tool_calls(full_text, tool_module, tools)
+                tc = parse_tools(full_text)
                 if tc.calls:
                     parsed_tool_calls = tc.calls
-                    _, content = _split_thinking(
-                        tc.remaining_text or "",
-                        gen_args.thinking_start_token,
-                        gen_args.thinking_end_token,
-                        processor=processor,
-                    )
+                    # Structured templates already removed tool/routing regions
+                    # from the content parsed above. Otherwise use the delimiter
+                    # parser's remainder (reasoning has already been excluded).
+                    if not (
+                        getattr(processor, "response_template", None)
+                        or getattr(
+                            getattr(processor, "tokenizer", None),
+                            "response_template",
+                            None,
+                        )
+                    ):
+                        content = tc.remaining_text or ""
                     content = strip_protocol_markers(
                         content,
                         tool_module,

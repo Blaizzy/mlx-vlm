@@ -9,6 +9,7 @@ import time
 import uuid
 from contextlib import aclosing
 from datetime import datetime
+from functools import partial
 from io import BytesIO
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
@@ -29,7 +30,6 @@ from ..tools import (
     _infer_tool_parser_from_processor,
     _prepare_chat_tool_choice,
     load_tool_module,
-    process_tool_calls,
 )
 from ..tools.streaming import ToolCallDeltaState
 from ..utils import prepare_inputs
@@ -58,6 +58,7 @@ from .responses_state import (
     _store_response,
     finish_content_streams,
     make_response_stream_state,
+    parse_assistant_tool_calls,
     prompt_has_open_thinking,
     response_store,
     response_store_lock,
@@ -2060,6 +2061,20 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             **template_kwargs,
         )
 
+        parse_tools = partial(
+            parse_assistant_tool_calls,
+            tool_module=tool_module,
+            tools=tools,
+            starts_in_thinking=prompt_has_open_thinking(
+                formatted_prompt,
+                gen_args.enable_thinking,
+                gen_args.thinking_start_token,
+                gen_args.thinking_end_token,
+            ),
+            thinking_start_token=gen_args.thinking_start_token,
+            thinking_end_token=gen_args.thinking_end_token,
+        )
+
         logger.debug(
             "chat/completions request: model=%s images=%d audio=%d videos=%d "
             "max_tokens=%s temp=%s stream=%s",
@@ -2258,7 +2273,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         # Parse tool calls from full output and emit final chunk
                         terminal_emitted = False
                         if tool_module is not None:
-                            tc = process_tool_calls(full_output, tool_module, tools)
+                            tc = parse_tools(full_output)
                             remaining_calls = tool_delta_state.finish(tc.calls)
                             if tc.calls:
                                 tool_calls_made = True
@@ -2404,7 +2419,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             yield f"data: {chunk_data.model_dump_json()}\n\n"
 
                         tc = (
-                            process_tool_calls(output_text, tool_module, tools)
+                            parse_tools(output_text)
                             if tool_module is not None
                             else None
                         )
@@ -2653,19 +2668,11 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 # Parse tool calls from generated output
                 parsed_tool_calls = None
                 if tool_module is not None:
-                    tc = process_tool_calls(
-                        model_output=full_text,
-                        tool_module=tool_module,
-                        tools=tools,
-                    )
+                    tc = parse_tools(full_text)
                     if tc.calls:
                         parsed_tool_calls = tc.calls
-                        # Clean thinking tags and control tokens from remaining text
-                        _, clean_remaining = _split_thinking(
-                            tc.remaining_text or "",
-                            gen_args.thinking_start_token,
-                            gen_args.thinking_end_token,
-                        )
+                        # Reasoning was already removed before tool parsing.
+                        clean_remaining = tc.remaining_text or ""
                         content = (
                             strip_protocol_markers(
                                 clean_remaining,
