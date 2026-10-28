@@ -36,6 +36,9 @@ Some models have detailed documentation with prompt formats, examples, and best 
 
 | Model | Documentation |
 |-------|---------------|
+| LFM3 / LFM3-VL | [Docs](mlx_vlm/models/lfm3/README.md) |
+| LFM3-Audio | [Docs](mlx_vlm/models/lfm3_audio/README.md) |
+| LFM3-Omni | [Docs](mlx_vlm/models/lfm3_omni/README.md) |
 | DeepSeek-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr/README.md) |
 | DeepSeek-OCR-2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr_2/README.md) |
 | Unlimited-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/unlimited_ocr/README.md) |
@@ -61,6 +64,8 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | PP-DocLayoutV3 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/pp_doclayout_v3/README.md) |
 | Granite Vision 3.2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite_vision/README.md) |
 | Granite Vision (4.0, 4.1) | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite4_vision/README.md) |
+| MiniCPM-OCR 1.0 | [Docs](mlx_vlm/models/minicpm_ocr/README.md) |
+| MiniCPM-OCR Jev | [Docs](mlx_vlm/models/minicpm_ocr_jev/README.md) |
 | MiniCPM-V 4.7 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minicpmv4_7/README.md) |
 | MiniCPM-V 4.6 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minicpmv4_6/README.md) |
 | GLiNER2.5 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/gliner2_5/README.md) |
@@ -188,7 +193,7 @@ mlx_vlm.server --model Qwen/Qwen3.5-4B \
   --thinking-end-token "</think>"
 ```
 
-Requests can override the server defaults with `enable_thinking`, `thinking_budget`, `thinking_start_token`, or `thinking_end_token`.
+Requests can override the server defaults with `enable_thinking`, `thinking_budget`, `thinking_start_token`, or `thinking_end_token`. `chat_template_kwargs.enable_thinking` is also accepted; an explicit top-level `enable_thinking` takes precedence.
 
 ### Speculative Decoding
 

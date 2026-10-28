@@ -591,6 +591,10 @@ def load_model_resources(model_path: str, adapter_path: Optional[str]):
             expert_cache_gb=get_expert_cache_gb(),
             max_kv_size=get_configured_context_limit(),
         )
+        if hasattr(model, "system_one"):
+            from ..models.d1_lfm3_vl.d1 import REFUSAL
+
+            raise ValueError(REFUSAL)
         config = model.config
         logger.info("Model and processor loaded successfully.")
         return model, processor, config
@@ -1723,7 +1727,12 @@ class ResponseGenerator:
             except Exception:
                 logger.exception("Error closing APC after generation worker shutdown")
             finally:
+                # The worker can finish after an unload timeout. Release its
+                # model owners before clearing Metal's allocator cache.
+                self.model = self.processor = self.tokenizer = self.draft_model = None
+                self.apc_manager = None
                 clear_mlx_streams()
+                mx.clear_cache()
 
     def _run_impl(self):
         """Single GPU thread: owns BatchGenerator, runs tight next() loop."""
