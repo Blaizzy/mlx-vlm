@@ -31,7 +31,7 @@ from . import request_normalization as _request_normalization
 from .anthropic import register_routes as register_anthropic_routes
 from .audio import register_routes as register_audio_routes
 from .continuation import ACTIVE as ACTIVE_CONTINUATION
-from .continuation import ContinuationMiddleware
+from .continuation import ContinuationMiddleware, checkpoint_cleanup
 from .decisions import register_routes as register_decision_routes
 from .embeddings import register_routes as register_embeddings_routes
 from .generation import (
@@ -490,15 +490,16 @@ async def lifespan(app):
             )
             continue
         logger.info("%s ready.", label.capitalize())
-    try:
-        yield
-    finally:
-        if runtime.audio_queue is not None:
-            runtime.audio_queue.stop_and_join()
-            runtime.audio_queue = None
-        if runtime.realtime_engine is not None:
-            runtime.realtime_engine.stop_and_join()
-            runtime.realtime_engine = None
+    async with checkpoint_cleanup():
+        try:
+            yield
+        finally:
+            if runtime.audio_queue is not None:
+                runtime.audio_queue.stop_and_join()
+                runtime.audio_queue = None
+            if runtime.realtime_engine is not None:
+                runtime.realtime_engine.stop_and_join()
+                runtime.realtime_engine = None
 
 
 app = FastAPI(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import copy
+import gc
 import json
 import logging
 import math
@@ -13,6 +14,7 @@ import socket
 import subprocess
 import sys
 import time
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -516,6 +518,161 @@ class TestContinuation:
     def checkpoints(self, monkeypatch):
         monkeypatch.setattr(continuation, "CHECKPOINTS", continuation.Checkpoints())
         monkeypatch.delenv("MLX_VLM_SERVER_API_KEY", raising=False)
+
+    @pytest.mark.parametrize("state", ["paused", "completed", "not_started"])
+    def test_prune_releases_expired_request_text_and_decoder(self, state):
+        store = continuation.Checkpoints(ttl=10)
+        source = Mock()
+        session = None
+        if state != "not_started":
+            session = sessions.InferenceSession(source=source)
+            session.put(_token("buffered text"))
+            if state == "completed":
+                session.put(None)
+            session.pause(0)
+        record = continuation.Generation(
+            {"messages": [{"content": "saved request and media"}]},
+            "tenant",
+            "/responses",
+            prompt="rendered prompt",
+            parts=["saved text"],
+            session=session,
+        )
+        record.touched -= 11
+        reference = weakref.ref(record)
+        store.add(record)
+        del record
+        store.prune()
+        assert not store.records
+        assert reference() is None
+        if session is not None:
+            assert session.history == []
+            assert session.source is None
+            source.close.assert_called_once()
+            with pytest.raises(ValueError):
+                session.claim()
+
+    @pytest.mark.parametrize("started", [False, True])
+    def test_active_request_does_not_expire_and_release_starts_idle_timeout(
+        self, started
+    ):
+        store = continuation.Checkpoints(ttl=10)
+        session = sessions.InferenceSession() if started else None
+        record = continuation.Generation(
+            {}, "tenant", "/responses", session=session, active=True
+        )
+        store.add(record)
+        record.touched -= 100
+        store.prune()
+        assert record.id in store.records
+        if session:
+            assert session.error is None
+        store.release(record)
+        assert not record.active
+        assert time.monotonic() - record.touched < 1
+        store.prune()
+        assert record.id in store.records
+        record.touched -= 11
+        store.prune()
+        assert not store.records
+
+    def test_expiring_old_handle_preserves_active_replacement_and_retries(self):
+        store = continuation.Checkpoints(ttl=10)
+        session = sessions.InferenceSession()
+        record = continuation.Generation(
+            {}, "tenant", "/responses", prompt="prompt", parts=["raw"], session=session
+        )
+        store.add(record)
+        checkpoint = {"id": record.id, "cursor": 1, "content": 3, "reasoning": 0}
+        replacement = store.resume(checkpoint, "tenant", "/responses")
+        store.release(record)  # A late close cannot pause the replacement.
+        assert not session.paused
+        store.prune()
+        retry = store.resume(checkpoint, "tenant", "/responses")
+        store.release(replacement)
+        record.touched -= 11
+        replacement.touched -= 11
+        retry.touched -= 100  # Active even before its first output arrives.
+        store.prune()
+        assert list(store.records) == [retry.id]
+        assert session.error is None and not session.paused
+        store.release(retry)
+        retry.touched -= 11
+        store.prune()
+        assert session.error is not None
+
+    def test_cleanup_failure_does_not_prevent_other_sessions_from_closing(self, caplog):
+        store = continuation.Checkpoints(ttl=10)
+        sources = [Mock(), Mock()]
+        sources[0].close.side_effect = RuntimeError("close failed")
+        for source in sources:
+            record = continuation.Generation(
+                {},
+                "tenant",
+                "/responses",
+                session=sessions.InferenceSession(source=source),
+            )
+            record.touched -= 11
+            store.add(record)
+        store.prune()
+        assert not store.records
+        assert "Error releasing an expired inference checkpoint" in caplog.text
+        for source in sources:
+            source.close.assert_called_once()
+
+    @pytest.mark.parametrize("api", ["chat", "responses"])
+    def test_lifespan_sweeps_without_traffic_and_clears_on_shutdown(
+        self, monkeypatch, api
+    ):
+        store = continuation.CHECKPOINTS
+        store.ttl = 10
+        monkeypatch.setattr(
+            server._app_module,
+            "checkpoint_cleanup",
+            lambda: continuation.checkpoint_cleanup(interval=0.01),
+        )
+        _reset_runtime(monkeypatch, audio_queue=None, realtime_engine=None)
+        for key in list(os.environ):
+            if key.startswith("MLX_VLM_PRELOAD_"):
+                monkeypatch.delenv(key)
+        with TestClient(server.app) as client:
+            with _endpoint(
+                generator=_resumable_streaming([_token("answer", finish_reason="stop")])
+            ):
+                response = _post(client, api, stream=True, resumable=True)
+            checkpoint = _data(response)[-1]["continuation"]
+            record = store.records[checkpoint["id"]]
+            reference = weakref.ref(record)
+            session = record.session
+            disposed = Event()
+            original_dispose = session.dispose
+
+            def dispose():
+                original_dispose()
+                disposed.set()
+
+            session.dispose = dispose
+            record.touched -= store.ttl + 1
+            del record
+            # No HTTP call triggers this cleanup: the lifespan task does it.
+            assert disposed.wait(2)
+            gc.collect()
+            assert reference() is None and not store.records
+            with _endpoint() as fake:
+                expired = _post(client, api, stream=True, continuation=checkpoint)
+            assert expired.status_code == 409
+            fake.cache.assert_not_called()
+            source = Mock()
+            active = continuation.Generation(
+                {},
+                "tenant",
+                "/responses",
+                active=True,
+                session=sessions.InferenceSession(source=source),
+            )
+            store.add(active)
+        assert not store.records
+        source.close.assert_called_once()
 
     @pytest.mark.parametrize("api", ["chat", "responses"])
     @pytest.mark.parametrize("batched", [False, True])
