@@ -9,6 +9,7 @@ from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException
+from transformers.utils.chat_parsing.response_templates import load_response_template
 
 from ..prompt_utils import _normalize_tool_message
 from ..tools import process_tool_calls
@@ -231,16 +232,30 @@ def _response_template_tokenizer(processor):
     return tokenizer
 
 
+def _response_template_prefix(tokenizer, prompt: str) -> str:
+    if not prompt:
+        return ""
+    template = load_response_template(tokenizer.response_template)
+    # Without an assistant anchor, the parser includes the entire prompt as output.
+    return prompt if template.start_anchor_re.search(prompt) else ""
+
+
 def make_response_stream_state(
     processor,
     enable_thinking: bool = False,
     thinking_start_token: Optional[str] = None,
     thinking_end_token: Optional[str] = None,
+    *,
+    prompt: str = "",
 ):
     tokenizer = _response_template_tokenizer(processor)
     if tokenizer is not None and hasattr(tokenizer, "get_response_parser"):
         try:
-            return ResponseTemplateStreamState(tokenizer.get_response_parser(prefix=""))
+            return ResponseTemplateStreamState(
+                tokenizer.get_response_parser(
+                    prefix=_response_template_prefix(tokenizer, prompt)
+                )
+            )
         except (AttributeError, TypeError, ValueError):
             logger.debug(
                 "Falling back from tokenizer response-template parser", exc_info=True
@@ -469,6 +484,8 @@ def _split_thinking(
     thinking_end_token: Optional[str] = None,
     starts_in_thinking: bool = False,
     processor=None,
+    *,
+    prompt: str = "",
 ) -> Tuple[Optional[str], str]:
     if not text:
         return None, text
@@ -476,7 +493,9 @@ def _split_thinking(
     tokenizer = _response_template_tokenizer(processor)
     if tokenizer is not None and hasattr(tokenizer, "parse_response"):
         try:
-            parsed = tokenizer.parse_response(text, prefix="")
+            parsed = tokenizer.parse_response(
+                text, prefix=_response_template_prefix(tokenizer, prompt)
+            )
             if isinstance(parsed, dict) and (
                 "content" in parsed
                 or "reasoning" in parsed
@@ -559,6 +578,8 @@ def _response_output_items_from_text(
     processor=None,
     starts_in_thinking: bool = False,
     tool_delta_state=None,
+    *,
+    prompt: str = "",
 ) -> Tuple[List[Dict[str, Any]], str, Optional[str], str]:
     reasoning, content = _split_thinking(
         full_text,
@@ -566,6 +587,7 @@ def _response_output_items_from_text(
         thinking_end_token,
         starts_in_thinking=starts_in_thinking,
         processor=processor,
+        prompt=prompt,
     )
     reasoning_items = _reasoning_output_items(reasoning, reasoning_item_id)
     if tool_module is not None and chat_tools:
