@@ -84,7 +84,8 @@ accumulator and execute calls only after the resumed stream completes.
 
 This reconstructs generation from the saved prefix. It does not suspend the
 inference worker or preserve its KV cache, sampler/RNG state, or exact future
-tokens. Checkpoints are process-local, bounded to 32 retained streams and expire
+tokens. Re-prefilling can change later wording even with greedy decoding.
+Checkpoints are process-local, bounded to 32 retained streams and expire
 after 24 hours of inactivity. A restart, eviction or expired checkpoint returns
 HTTP 409; do not silently start another conversation turn. Resume uses the same
 authentication and tenant isolation as the original request.
