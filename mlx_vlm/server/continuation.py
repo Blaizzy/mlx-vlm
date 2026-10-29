@@ -14,7 +14,7 @@ import time
 import uuid
 from collections import OrderedDict
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from threading import Lock
 
 from fastapi import HTTPException
@@ -23,7 +23,7 @@ from starlette.requests import HTTPConnection
 from starlette.responses import JSONResponse
 
 from .schemas import ContinuationOptions
-from .sessions import InferenceSession
+from .sessions import InferenceSession, SessionOutput
 
 
 @dataclass
@@ -442,6 +442,23 @@ class ContinuationTokens:
     def __init__(self, iterator, state, prefix_token):
         self.iterator, self.state = iterator, state
         self.prefix_token = prefix_token if state.prefix else None
+        cursor = len(state.record.parts)
+        if self.prefix_token is not None and cursor:
+            previous = state.record.session.history[cursor - 1]
+            # Restore cumulative measurements alongside parser state. Replaying
+            # the acknowledged prefix performs no additional generation.
+            self.prefix_token = SessionOutput(
+                replace(
+                    previous.value,
+                    text=state.prefix,
+                    token=prefix_token.token,
+                    logprobs=prefix_token.logprobs,
+                    finish_reason=None,
+                ),
+                previous.decode_progress,
+                0,
+                previous.emitted_at,
+            )
 
     def __iter__(self):
         return self
