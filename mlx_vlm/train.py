@@ -75,6 +75,23 @@ def build_parser(task="vlm", algorithm=None):
         action="store_true",
         help="Also unfreeze the vision tower/projector.",
     )
+    parser.add_argument(
+        "--qat",
+        action="store_true",
+        help="Weight-only affine QAT for --train-type full (defaults to 4 bits).",
+    )
+    parser.add_argument(
+        "--export-model-path",
+        "--export-qat-path",
+        dest="export_qat_path",
+        help="Export a standalone inference model; detects QAT automatically.",
+    )
+    parser.add_argument(
+        "--export-quantize",
+        action="store_true",
+        default=None,
+        help="Also quantize compatible non-QAT layers during model export.",
+    )
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--lora-alpha", type=float, default=16.0)
     parser.add_argument("--lora-dropout", type=float, default=0.0)
@@ -161,6 +178,8 @@ def parse_args(argv=None, *, task="vlm"):
         parser.error("Unknown config options: " + ", ".join(sorted(unknown)))
     parser.set_defaults(**config)
     args = parser.parse_args(argv)
+    if args.export_quantize and not args.export_qat_path:
+        parser.error("--export-quantize requires --export-model-path.")
     if not args.model:
         parser.error("--model is required.")
     if args.output_path:
@@ -212,6 +231,7 @@ def _configure_model(model, args):
     model = prepare_model_for_training(
         model,
         train_type=args.train_type,
+        qat=getattr(args, "qat", False),
         lora_rank=getattr(args, "lora_rank", 8),
         lora_alpha=getattr(args, "lora_alpha", 16),
         lora_dropout=getattr(args, "lora_dropout", 0),
@@ -354,7 +374,18 @@ def run(args, settings, training_callback=None):
                 training_callback,
             )
             trainer.training_callback = callback
-        return trainer.train()
+        metrics = trainer.train()
+        if getattr(args, "export_qat_path", None):
+            from .export import export_model
+
+            export_model(
+                model,
+                processor,
+                args.export_qat_path,
+                model_path=args.model,
+                quantize=getattr(args, "export_quantize", None),
+            )
+        return metrics
     finally:
         if callback is not None:
             callback.finish()

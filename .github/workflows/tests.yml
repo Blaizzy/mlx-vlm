@@ -119,6 +119,7 @@ jobs:
               tests/test_training_model_preparation.py
               tests/test_training_mtp.py
               tests/test_training_mtp_notebook.py
+              tests/test_training_qat_export.py
               tests/test_training_notebooks.py
               tests/test_training_vlm.py
           - group: models
