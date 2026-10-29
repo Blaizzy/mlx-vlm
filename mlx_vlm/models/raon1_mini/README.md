@@ -23,10 +23,10 @@ Loading uses the built-in implementation without remote model code. The tokenize
 
 The sanitizer combines the source checkpoint's separate convolution and expert tensors, splits latent-attention projections, and packs E4M3/E8M0 expert tensors into native MXFP8 storage. Re-sanitizing saved native weights preserves their values.
 
-The implementation follows the [published Transformers reference](https://huggingface.co/KRAFTON/Raon-1-mini-preview/blob/8c9b802acacdbda9df16606689fcf437cf7262fb/modeling_raon1_mini.py). Shared model tests cover numerical operators, full/chunked prefill and decode, padded batches, recurrent cache rollback, checkpoint loading, and quantized save/load round trips:
+The implementation follows the [published Transformers reference](https://huggingface.co/KRAFTON/Raon-1-mini-preview/blob/8c9b802acacdbda9df16606689fcf437cf7262fb/modeling_raon1_mini.py). Shared checks cover language output, input embeddings, and full/chunked prefill and decode. A source-checkpoint test verifies converted tensors, repeated sanitization, and quantized save/load round trips:
 
 ```sh
-python -m pytest -q mlx_vlm/tests/test_models.py mlx_vlm/tests/test_cache.py -k raon
+python -m pytest -q mlx_vlm/tests/test_models.py -k raon
 ```
 
 A separate two-layer comparison against the pinned Transformers implementation covered dense and expert layers, randomized residual selectors, and chunk sizes 1, 3, and 8. All top tokens matched. Maximum logit error was `2.4e-7` in float32 and `0.00390625` in BF16.

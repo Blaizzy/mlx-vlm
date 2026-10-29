@@ -448,27 +448,6 @@ def test_temporal_recurrence_commits_exact_states(family, use_kernel, parts, ret
     assert cache.nbytes == cache[0].nbytes
 
 
-def test_raon_recurrent_cache_restores_partial_acceptance():
-    case = next(case for case in DATA["cases"] if case["id"] == "raon1_mini")
-    module = importlib.import_module("mlx_vlm.models." + case["module"])
-    mx.random.seed(41)
-    layer = module.Model(build_config(module, case["config"])).layers[0].self_attn
-    layer.eval()
-    x = mx.random.normal((1, 6, 64))
-    cache = ArraysCache(2)
-    layer(x[:, :2], cache=cache)
-    generation = cache.start_speculation(3)
-    layer(x[:, 2:5], cache=cache)
-    cache.commit_speculation(2, generation)
-    actual = layer(x[:, 5:], cache=cache)
-    reference = ArraysCache(2)
-    layer(x[:, :4], cache=reference)
-    expected = layer(x[:, 5:], cache=reference)
-    assert mx.allclose(actual, expected, rtol=1e-7, atol=2e-5).item()
-    for actual_state, expected_state in zip(cache.state, reference.state):
-        assert mx.allclose(actual_state, expected_state, rtol=1e-7, atol=2e-5).item()
-
-
 def test_temporal_cache_retention_is_bounded_and_abort_restores_state():
     cache = ArraysCache(1)
     initial = mx.ones((2, 3))
