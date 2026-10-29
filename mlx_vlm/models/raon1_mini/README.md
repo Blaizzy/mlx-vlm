@@ -8,7 +8,7 @@ The model combines 18 Raon Delta Attention layers, seven NoPE latent-attention l
 from mlx_vlm import generate, load
 from mlx_vlm.prompt_utils import apply_chat_template
 
-model, processor = load("KRAFTON/Raon-1-mini-preview")
+model, processor = load("KRAFTON/Raon-1-mini-preview", trust_remote_code=False)
 prompt = apply_chat_template(
     processor,
     model.config,
