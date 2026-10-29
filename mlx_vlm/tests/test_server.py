@@ -5440,6 +5440,80 @@ def test_thinking_stream_markers(family, enabled):
     assert _thoughts(_feed_thinking(state, [t.text for t in tokens])) == expected
 
 
+@pytest.mark.parametrize(
+    "prefix,text,expected",
+    [
+        ("<think>", "Think.</think>\nAnswer.", ("Think.", "Answer.")),
+        ("<think></think>", "Answer.", ("", "Answer.")),
+        ("<think>", "Unfinished", ("Unfinished", "")),
+        ("", "<think>Think.</think>Answer.", ("Think.", "Answer.")),
+    ],
+)
+def test_response_template_prefilled_thinking(prefix, text, expected):
+    tokenizer = _MuseResponseTemplateTokenizer()
+    tokenizer.response_template = {
+        "start_anchor_pattern": r"<\|im_start\|>assistant\n",
+        "fields": {
+            "reasoning_content": {
+                "open_pattern": r"<think>\n?",
+                "close_pattern": r"</think>\s*",
+                "content": "text",
+            },
+            "content": {"close_pattern": r"<\|im_end\|>\s*", "content": "text"},
+        },
+    }
+    prompt = (
+        "<|im_start|>assistant\n<think>Old.</think>Old answer.<|im_end|>\n"
+        "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n" + prefix
+    )
+    processor = NS(tokenizer=tokenizer)
+    state = server.make_response_stream_state(processor, prompt=prompt)
+    assert _thoughts(_feed_thinking(state, list(text), last=True)) == expected
+    assert server._split_thinking(text, processor=processor, prompt=prompt) == (
+        expected[0] or None,
+        expected[1],
+    )
+
+
+@pytest.mark.parametrize("api", ["chat", "responses", "messages"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize(
+    "anchor",
+    [
+        {"start_anchor": "<|im_start|>assistant\n"},
+        {"start_anchor": ["<|im_start|>assistant\n", "<|tool_response|>"]},
+        {"start_anchor_pattern": r"<\|im_start\|>assistant\n"},
+    ],
+)
+def test_response_template_missing_anchor(client, api, stream, batched, anchor):
+    tokenizer = _MuseResponseTemplateTokenizer()
+    tokenizer.response_template = {**anchor, "fields": {"content": {"content": "text"}}}
+    result = _result("4.", finish_reason="stop")
+    worker = _streaming([_token("4.", finish_reason="stop")]) if batched else None
+    with _endpoint(
+        processor=NS(tokenizer=tokenizer),
+        template="user: Hello\nAssistant:",
+        result=result,
+        chunks=[result],
+        generator=worker,
+    ):
+        response = _post(client, api, stream=stream)
+    assert response.status_code == 200, response.text
+    if stream:
+        assert _thinking_text(response, api) == ("", "4.")
+        if api == "responses":
+            assert _completed_response(response)["output_text"] == "4."
+    else:
+        body = response.json()
+        if api == "chat":
+            assert body["choices"][0]["message"]["content"] == "4."
+        elif api == "responses":
+            assert body["output_text"] == "4."
+        else:
+            assert _joined(body["content"], "text") == "4."
+
+
 def test_response_template_thinking_stream():
     state = server.make_response_stream_state(
         NS(tokenizer=_MuseResponseTemplateTokenizer()),
