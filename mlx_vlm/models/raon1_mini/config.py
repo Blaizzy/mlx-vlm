@@ -45,28 +45,8 @@ class ModelConfig(BaseModelConfig):
     num_nextn_predict_layers: int = 0
     attn_res_block_size: Optional[int] = None
     tie_word_embeddings: bool = False
-    raon_fp32_export_head: bool = False
-    quantization: Optional[dict] = None
-    quantization_config: Optional[dict] = None
 
     def __post_init__(self):
-        # The checkpoint's expert global_scale flag describes its stored
-        # absmax tensors. The sanitizer maps those onto our scaled linears.
-        for name in ("quantization", "quantization_config"):
-            quantization = getattr(self, name)
-            if quantization is not None:
-                setattr(
-                    self,
-                    name,
-                    {
-                        key: (
-                            {k: v for k, v in value.items() if k != "global_scale"}
-                            if isinstance(value, dict)
-                            else value
-                        )
-                        for key, value in quantization.items()
-                    },
-                )
         if self.rda_config is None:
             self.rda_config = {
                 "rda_layers": [

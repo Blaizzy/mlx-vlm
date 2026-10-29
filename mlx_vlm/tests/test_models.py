@@ -1695,7 +1695,6 @@ def test_raon_sanitize_source_layouts_and_second_pass(raon_case):
         weights[f"model.layers.1.moe.experts.{i}.gate_proj.weight"] = mx.full(
             (64, 64), float(i)
         )
-    weights["model.layers.0.self_attn.q_proj.global_scale"] = mx.array(0.125)
     first = model.sanitize(weights)
     prefix = "language_model.model.layers."
     np.testing.assert_array_equal(
@@ -1706,91 +1705,89 @@ def test_raon_sanitize_source_layouts_and_second_pass(raon_case):
         np.array(first[prefix + "1.self_attn.embed_q.weight"]),
         np.array(kv).reshape(2, 64, 32)[:, :32].swapaxes(-1, -2),
     )
-    assert first[prefix + "0.self_attn.q_proj.weight_scale_2"].item() == 0.125
     second = model.sanitize(first)
     assert first.keys() == second.keys()
     for key in first:
         np.testing.assert_array_equal(np.array(first[key]), np.array(second[key]))
 
 
-def test_raon_native_quantized_checkpoint_roundtrip(raon_case, tmp_path):
+def test_raon_source_mxfp8_checkpoint_roundtrip(raon_case, tmp_path):
     config, model = raon_case
-    from mlx_vlm.models.switch_layers import SwitchLinear
-
-    nn.quantize(
-        model,
-        group_size=16,
-        bits=4,
-        mode="nvfp4",
-        class_predicate=lambda p, m: isinstance(m, (nn.Linear, SwitchLinear)),
-    )
-    # The released checkpoint mixes an MXFP8 head with globally scaled NVFP4 layers.
-    model.language_model.lm_head = nn.QuantizedLinear(
-        64, 128, bias=False, group_size=32, bits=8, mode="mxfp8"
-    )
-    weights = dict(tree_flatten(model.parameters()))
     source = {
-        key.removeprefix("language_model."): value for key, value in weights.items()
+        key.removeprefix("language_model."): value
+        for key, value in tree_flatten(model.parameters())
     }
-    for key in list(source):
-        if key.endswith(".scales") and not key.startswith("lm_head."):
-            scale = (
-                mx.array([0.5, 0.75, 1.0, 1.25]) * 2688
-                if ".switch_mlp." in key
-                else mx.array(0.75)
-            )
-            source[key.removesuffix("scales") + "global_scale"] = scale
-    config_dict = asdict(config)
-    # Native loading must not import the custom script in the published config.
-    config_dict["model_file"] = "raon_mlx_model.py"
-    (tmp_path / "raon_mlx_model.py").write_text(
-        "raise AssertionError('remote model executed')\n"
+    # Reconstruct the original checkpoint's unfused convolution and MLA layout.
+    conv = source.pop("model.layers.0.self_attn.qkv_conv1d.weight")
+    for name, value in zip(("q", "k", "v"), mx.split(conv, 3, axis=0)):
+        source[f"model.layers.0.self_attn.{name}_conv1d.weight"] = value[..., 0]
+    prefix = "model.layers.1.self_attn."
+    key = source.pop(prefix + "embed_q.weight").swapaxes(-1, -2)
+    value = source.pop(prefix + "unembed_out.weight")
+    source[prefix + "kv_b_proj.weight"] = mx.concatenate([key, value], axis=1).reshape(
+        128, 32
     )
-    config_dict["quantization"] = {
-        "group_size": 16,
-        "bits": 4,
-        "mode": "nvfp4",
-        "lm_head": {"group_size": 32, "bits": 8, "mode": "mxfp8"},
+    # Source experts are individual E4M3 tensors with E8M0 scales, not native packs.
+    for projection in ("gate_proj", "up_proj", "down_proj"):
+        weight = source.pop(f"model.layers.1.moe.switch_mlp.{projection}.weight")
+        for expert in range(config.num_experts):
+            packed, scales = mx.quantize(
+                weight[expert], group_size=32, bits=8, mode="mxfp8"
+            )
+            prefix = f"model.layers.1.moe.experts.{expert}.{projection}."
+            source[prefix + "weight"] = packed.view(mx.uint8)
+            source[prefix + "weight_scale_inv"] = scales
+    config_dict = asdict(config)
+    config_dict["quantization_config"] = {
+        "quant_method": "mxfp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [1, 32],
+        "dequantize": False,
     }
-    for key in source:
-        if ".switch_mlp." in key and key.endswith(".global_scale"):
-            config_dict["quantization"][key.removesuffix(".global_scale")] = {
-                "group_size": 16,
-                "bits": 4,
-                "mode": "nvfp4",
-                "global_scale": True,
-            }
     (tmp_path / "config.json").write_text(json.dumps(config_dict))
-    mx.save_safetensors(str(tmp_path / "model.safetensors"), source)
+    path = tmp_path / "model.safetensors"
+    mx.save_safetensors(str(path), source)
+    # Exercise the actual source safetensors dtypes through the standard loader.
+    raw = path.read_bytes()
+    header_len = struct.unpack("<Q", raw[:8])[0]
+    header = json.loads(raw[8 : 8 + header_len])
+    for name, info in header.items():
+        if ".experts." in name:
+            info["dtype"] = (
+                "F8_E8M0" if name.endswith("weight_scale_inv") else "F8_E4M3"
+            )
+    encoded = json.dumps(header).encode()
+    encoded += b" " * (-len(encoded) % 8)
+    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + raw[8 + header_len :])
     first = load_model(tmp_path)
     ids = mx.array([[1, 2, 3]])
     expected = first(ids).logits
     assert bool(mx.all(mx.isfinite(expected)))
-    assert first.language_model.lm_head.mode == "mxfp8"
-    scaled = first.layers[0].self_attn.q_proj
-    x = mx.random.normal((1, 64))
-    dense = mx.dequantize(
-        scaled.weight, scaled.scales, group_size=16, bits=4, mode="nvfp4"
-    )
-    np.testing.assert_allclose(
-        np.array(scaled(x)), np.array(x @ dense.T * 0.75), atol=1e-5
-    )
+    assert isinstance(first.language_model.lm_head, nn.Linear)
+    assert not isinstance(first.language_model.lm_head, nn.QuantizedLinear)
     expert = first.layers[1].moe.switch_mlp.gate_proj
-    indices = mx.array([1, 3])
-    inputs = mx.random.normal((2, 1, 64))
-    expanded = mx.dequantize(
-        expert.weight, expert.scales, group_size=16, bits=4, mode="nvfp4"
+    assert expert.mode == "mxfp8" and expert.bits == 8 and expert.group_size == 32
+    prefix = "model.layers.1.moe.experts.1.gate_proj."
+    codes = np.array(source[prefix + "weight"])
+    exponent = (codes >> 3) & 15
+    mantissa = codes & 7
+    decoded = np.where(
+        exponent == 0,
+        mantissa / 512.0,
+        (1 + mantissa / 8.0) * np.exp2(exponent.astype(np.int32) - 7),
     )
-    expected_experts = (
-        mx.gather_mm(inputs, expanded.swapaxes(-1, -2), rhs_indices=indices)
-        * mx.array([0.75, 1.25])[:, None, None]
+    decoded *= np.where(codes & 128, -1.0, 1.0)
+    factors = np.exp2(
+        np.array(source[prefix + "weight_scale_inv"]).astype(np.int32) - 127
     )
+    decoded *= np.repeat(factors, 32, axis=-1)
+    inputs = mx.random.normal((1, 1, 64))
+    actual = expert(inputs, mx.array([1]))
     np.testing.assert_allclose(
-        np.array(expert(inputs, indices)), np.array(expected_experts), atol=2e-5
+        np.array(actual), np.array(inputs) @ decoded.T, atol=2e-6, rtol=2e-5
     )
-    mx.save_safetensors(
-        str(tmp_path / "model.safetensors"), dict(tree_flatten(first.parameters()))
-    )
+    # Saving native tensors must not transpose or reinterpret them a second time.
+    mx.save_safetensors(str(path), dict(tree_flatten(first.parameters())))
     second = load_model(tmp_path)
     np.testing.assert_array_equal(np.array(second(ids).logits), np.array(expected))
 

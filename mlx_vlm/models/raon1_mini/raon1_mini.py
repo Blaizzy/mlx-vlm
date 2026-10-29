@@ -29,25 +29,13 @@ class Model(nn.Module):
 
     @property
     def cast_predicate(self):
-        return lambda path: not (
-            path.endswith(
-                (
-                    "A_log",
-                    "dt_bias",
-                    "e_score_correction_bias",
-                    "res.eta",
-                    "weight_scale_2",
-                )
-            )
-            or (self.config.raon_fp32_export_head and path.endswith("lm_head.weight"))
+        return lambda path: not path.endswith(
+            ("A_log", "dt_bias", "e_score_correction_bias", "res.eta")
         )
 
     @property
     def quant_predicate(self):
-        return lambda path, module: not (
-            path.endswith("moe.gate")
-            or (self.config.raon_fp32_export_head and path.endswith("lm_head"))
-        )
+        return lambda path, module: not path.endswith("moe.gate")
 
     def sanitize(self, weights):
         # Normalize names before transforming values so converted checkpoints
@@ -68,14 +56,7 @@ class Model(nn.Module):
                 if not key.startswith(prefix)
             }
         for key in list(weights):
-            if key.endswith(".global_scale"):
-                scale = weights.pop(key)
-                # Routed experts store an absmax for native NVFP4 gather;
-                # dense projections store the multiplicative scale directly.
-                if ".moe.switch_mlp." in key or ".moe.experts." in key:
-                    scale = scale.astype(mx.float32) / (448 * 6)
-                weights[key.removesuffix("global_scale") + "weight_scale_2"] = scale
-            elif key.endswith(".weight_scale_inv"):
+            if key.endswith(".weight_scale_inv"):
                 prefix = key.removesuffix("weight_scale_inv")
                 value, scales = weights[prefix + "weight"], weights.pop(key)
                 if value.dtype != mx.uint8 or scales.dtype != mx.uint8:
@@ -131,7 +112,7 @@ class Model(nn.Module):
             if layer.is_moe:
                 experts = prefix + "moe.experts."
                 for projection in ("gate_proj", "up_proj", "down_proj"):
-                    for suffix in ("weight", "scales", "biases", "weight_scale_2"):
+                    for suffix in ("weight", "scales", "biases"):
                         if experts + f"0.{projection}.{suffix}" in weights:
                             weights[
                                 prefix + f"moe.switch_mlp.{projection}.{suffix}"
