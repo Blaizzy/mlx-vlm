@@ -30,6 +30,7 @@ from ..vision_cache import VisionFeatureCache
 from . import request_normalization as _request_normalization
 from .anthropic import register_routes as register_anthropic_routes
 from .audio import register_routes as register_audio_routes
+from .continuation import ACTIVE as ACTIVE_CONTINUATION
 from .continuation import ContinuationMiddleware
 from .decisions import register_routes as register_decision_routes
 from .embeddings import register_routes as register_embeddings_routes
@@ -222,6 +223,15 @@ async def _preflight_stream_context_budget(
     args: GenerationArguments,
 ):
     """Reject over-budget streaming requests before the HTTP stream starts."""
+    continuation = ACTIVE_CONTINUATION.get()
+    if continuation is not None and continuation.resuming:
+        # The retained decoder already passed admission with its original
+        # prompt and budget. Re-tokenizing (including media) serves no purpose.
+        try:
+            continuation.record.session.check()
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return
     if runtime.response_generator is None:
         return
     try:

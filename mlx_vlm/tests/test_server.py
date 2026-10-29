@@ -516,6 +516,7 @@ class TestContinuation:
         fake.template.assert_not_called()
         if worker:
             worker.generate.assert_not_called()
+            worker.validate_context_budget.assert_not_called()
             prompt, _, _, args, _ = original_worker.generate.call_args.args
             assert args.temperature == 0.3 and args.max_tokens == 50
             assert args.skip_special_tokens is False
