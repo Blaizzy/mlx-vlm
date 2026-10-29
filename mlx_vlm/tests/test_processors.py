@@ -2660,6 +2660,12 @@ WIRE_CALLS = {
     '<atem:parameter name="days">3</atem:parameter></atem:invoke></atem:function_calls>',
     "cohere2_moe": '<|START_ACTION|>{"tool_name":"get_weather",'
     '"parameters":{"city":"Paris","days":3}}<|END_ACTION|>',
+    "deepseek_v4": "<｜DSML｜tool_calls>\n"
+    '<｜DSML｜invoke name="get_weather">\n'
+    '<｜DSML｜parameter name="city" string="true">Paris</｜DSML｜parameter>\n'
+    '<｜DSML｜parameter name="days" string="false">3</｜DSML｜parameter>\n'
+    "</｜DSML｜invoke>\n"
+    "</｜DSML｜tool_calls>",
     "gemma4": '<|tool_call>call:get_weather{city:<|"|>Paris<|"|>,days:3}<tool_call|>',
     "glm47": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>"
     "<arg_key>days</arg_key><arg_value>3</arg_value></tool_call>",

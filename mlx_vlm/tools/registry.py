@@ -48,6 +48,7 @@ SPECS: Tuple[ParserSpec, ...] = (
     ParserSpec("atem", (("<atem:function_calls>", "<atem:invoke"),)),
     ParserSpec("gemma4", (("<|tool_call>",),)),
     ParserSpec("cohere2_moe", (("<|START_ACTION|>",),)),
+    ParserSpec("deepseek_v4", (("<｜DSML｜tool_calls>",),)),
     ParserSpec("minimax_m3", (("]<]minimax[>[<tool_call>",), ("<mm:think>",))),
     ParserSpec("minimax_m2", (("<minimax:tool_call>",),)),
     ParserSpec("minicpm5", (("<function name=", "<param name="),)),
@@ -122,9 +123,18 @@ def _infer_tool_parser(chat_template, override: Optional[str] = None) -> Optiona
 def _infer_tool_parser_from_processor(
     processor, override: Optional[str] = None
 ) -> Optional[str]:
-    """Infer the tool parser name from a processor's chat template."""
+    """Infer the tool parser name from a processor's chat template.
+
+    A processor that renders prompts in code rather than through a chat
+    template (e.g. DeepSeek-V4) declares its format with a ``tool_parser_type``
+    attribute, which takes precedence over template inference.
+    """
     if override is not None:
         return _infer_tool_parser(None, override=override)
+
+    declared = getattr(processor, "tool_parser_type", None)
+    if isinstance(declared, str):
+        return _infer_tool_parser(None, override=declared)
 
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
     if getattr(tokenizer, "chat_template", None):
