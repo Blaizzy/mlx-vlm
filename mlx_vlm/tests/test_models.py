@@ -1747,15 +1747,13 @@ def test_raon_source_mxfp8_checkpoint_roundtrip(raon_case, tmp_path):
     (tmp_path / "config.json").write_text(json.dumps(config_dict))
     path = tmp_path / "model.safetensors"
     mx.save_safetensors(str(path), source)
-    # Exercise the actual source safetensors dtypes through the standard loader.
+    # Source safetensors store E8M0 scale bytes as U8 and weights as F8_E4M3.
     raw = path.read_bytes()
     header_len = struct.unpack("<Q", raw[:8])[0]
     header = json.loads(raw[8 : 8 + header_len])
     for name, info in header.items():
         if ".experts." in name:
-            info["dtype"] = (
-                "F8_E8M0" if name.endswith("weight_scale_inv") else "F8_E4M3"
-            )
+            info["dtype"] = "U8" if name.endswith("weight_scale_inv") else "F8_E4M3"
     encoded = json.dumps(header).encode()
     encoded += b" " * (-len(encoded) % 8)
     path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + raw[8 + header_len :])
