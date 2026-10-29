@@ -236,6 +236,24 @@ def _streaming(chunks, prompt_tokens=3):
     )
 
 
+def _resumable_streaming(chunks, prompt_tokens=3):
+    def generate(*args, session=None, **kwargs):
+        context = server.GenerationContext(uid=1, prompt_tokens=prompt_tokens)
+        if session is None:
+            return context, iter(chunks)
+        session.context = context
+        for chunk in chunks:
+            session.put(chunk)
+        session.put(None)
+        return context, session.reader()
+
+    return NS(
+        tokenizer=NS(decode=lambda tokens: ""),
+        validate_context_budget=MagicMock(),
+        generate=MagicMock(side_effect=generate),
+    )
+
+
 def _tool(name="get_weather", api="chat"):
     if api == "messages":
         return dict(
@@ -325,6 +343,117 @@ def _assert_fields(actual, **expected):
     assert {key: actual[key] for key in expected} == expected
 
 
+class TestInferenceSession:
+    def test_server_ahead_output_is_replayed_before_new_tokens(self):
+        session = continuation.InferenceSession()
+        first = session.reader()
+        for text in ("one", "two", "three", "four"):
+            session.put(_token(text))
+        assert next(first).text == "one"
+        assert next(first).text == "two"
+        first.close()
+        lease = session.claim()
+        resumed = session.reader(2, lease)
+        assert next(resumed).text == "three"
+        assert next(resumed).text == "four"
+        session.put(_token("five", finish_reason="stop"))
+        assert [token.text for token in resumed] == ["five"]
+
+    def test_late_close_and_blocked_reader_cannot_pause_new_lease(self):
+        session = continuation.InferenceSession()
+        first = session.reader()
+        with ThreadPoolExecutor() as pool:
+            pending = pool.submit(lambda: list(first))
+            lease = session.claim()
+            first.close()
+            assert pending.result(timeout=2) == []
+        assert not session.paused
+        session.put(_token("next", finish_reason="stop"))
+        assert [t.text for t in session.reader(0, lease)] == ["next"]
+
+    @pytest.mark.parametrize("cause", ["expired", "evicted", "unloaded"])
+    def test_unavailable_state_fails_instead_of_regenerating(self, cause):
+        session = continuation.InferenceSession(ttl=1)
+        session.pause(0)
+        if cause == "expired":
+            session.touched -= 2
+        elif cause == "evicted":
+            session.dispose()
+        else:
+            session.owner = NS(_stop=True)
+        with pytest.raises(ValueError):
+            session.claim()
+
+    def test_paused_decoder_is_not_stepped_but_peers_continue(self):
+        worker = Generator.__new__(Generator)
+        paused, peer = continuation.InferenceSession(), continuation.InferenceSession()
+        paused.pause(0)
+
+        def engine():
+            return NS(
+                _generation_batch=NS(prompt_cache=[]),
+                _prompt_batch=None,
+                close=Mock(),
+                remove=Mock(),
+            )
+
+        retained = {paused: (engine(), {0: {}}), peer: (engine(), {0: {}})}
+        worker._step = Mock()
+        worker._step_retained(retained)
+        assert worker._step.call_args_list == [
+            ((retained[peer][0], retained[peer][1]),)
+        ]
+        paused.claim()
+        worker._step.reset_mock()
+        worker._step_retained(retained)
+        assert worker._step.call_count == 2
+
+    def test_cache_budget_evicts_oldest_paused_decoder(self, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_CONTINUATION_CACHE_BYTES", "16")
+        worker = Generator.__new__(Generator)
+        old, new = continuation.InferenceSession(), continuation.InferenceSession()
+        old.pause(0)
+        new.pause(0)
+
+        def engine():
+            return NS(
+                _generation_batch=NS(prompt_cache=[mx.zeros((4,))]),
+                _prompt_batch=None,
+                close=Mock(),
+                remove=Mock(),
+            )
+
+        first, second = engine(), engine()
+        retained = {old: (first, {0: {}}), new: (second, {0: {}})}
+        worker._step_retained(retained)
+        assert old not in retained and new in retained
+        first.close.assert_called_once()
+        second.close.assert_not_called()
+        with pytest.raises(ValueError, match="evicted"):
+            old.claim()
+
+    @pytest.mark.parametrize(
+        "settings", [{}, {"top_n_sigma": 1.5}, {"p_less": True}, {"typical_p": 0.8}]
+    )
+    def test_sampling_positions_survive_other_random_draws(self, settings):
+        sampler = Generator._make_session_sampler(
+            Args(temperature=0.7, seed=91, **settings)
+        )
+        logits = mx.array([[0.4, 0.3, 0.2, 0.1]])
+        expected = [
+            sampler.sample_target(logits, row_ids=[0], positions=[i]).item()
+            for i in range(30)
+        ]
+        actual = []
+        for i in range(30):
+            mx.random.seed(i + 1000)
+            mx.random.uniform(shape=(100,)).tolist()
+            actual.append(
+                sampler.sample_target(logits, row_ids=[0], positions=[i]).item()
+            )
+        assert actual == expected
+
+
 class TestContinuation:
     @pytest.fixture(autouse=True)
     def checkpoints(self, monkeypatch):
@@ -339,8 +468,8 @@ class TestContinuation:
     ):
         first = "<think>why" if thinking else "first"
         suffix = " next</think>answer" if thinking else " next"
-        chunks = [_token(first), _token(" ignored", finish_reason="stop")]
-        worker = _streaming(chunks) if batched else None
+        chunks = [_token(first), _token(suffix, finish_reason="stop")]
+        worker = _resumable_streaming(chunks) if batched else None
         fallback = [
             _result(t.text, generation_tokens=i + 1) for i, t in enumerate(chunks)
         ]
@@ -360,7 +489,12 @@ class TestContinuation:
             if e.get("continuation", {}).get("cursor") == 1
             and e["continuation"]["reasoning" if thinking else "content"]
         )
-        worker = _streaming([_token(suffix, finish_reason="stop")]) if batched else None
+        original_worker = worker
+        worker = (
+            _resumable_streaming([_token("WRONG", finish_reason="stop")])
+            if batched
+            else None
+        )
         with _endpoint(
             generator=worker,
             chunks=[_result(suffix, generation_tokens=1)],
@@ -380,16 +514,14 @@ class TestContinuation:
             "error" in e or e.get("type") == "response.failed" for e in events
         )
         fake.template.assert_not_called()
-        call = worker.generate.call_args if worker else fake.stream.call_args
         if worker:
-            prompt, _, _, args, _ = call.args
-            assert args.temperature == 0.3 and args.max_tokens == 49
+            worker.generate.assert_not_called()
+            prompt, _, _, args, _ = original_worker.generate.call_args.args
+            assert args.temperature == 0.3 and args.max_tokens == 50
             assert args.skip_special_tokens is False
+            assert prompt == "prompt"
         else:
-            prompt = call.kwargs["prompt"]
-            assert call.kwargs["temperature"] == 0.3 and call.kwargs["max_tokens"] == 49
-            assert call.kwargs["skip_special_tokens"] is False
-        assert prompt == "prompt" + first
+            fake.stream.assert_not_called()
         if api == "responses":
             final = _completed_response(response)
             assert final["output_text"] == ("answer" if thinking else " next")
@@ -413,7 +545,7 @@ class TestContinuation:
         prefix = 'checking<tool_call>{"name":"get_weather","arguments":{"city":"'
         suffix = 'Warsaw"}}</tool_call>'
         with _endpoint(
-            generator=_streaming(
+            generator=_resumable_streaming(
                 [_token(prefix), _token(suffix, finish_reason="stop")]
             ),
             parser=_JSON_TOOLS,
@@ -428,7 +560,7 @@ class TestContinuation:
             and e["continuation"]["content"]
         )
         with _endpoint(
-            generator=_streaming([_token(suffix, finish_reason="stop")]),
+            generator=_resumable_streaming([_token(suffix, finish_reason="stop")]),
             parser=_JSON_TOOLS,
         ):
             response = _post(client, api, stream=True, continuation=checkpoint)
@@ -448,36 +580,70 @@ class TestContinuation:
             )
             assert json.loads(arguments) == {"city": "Warsaw"}
 
-    def test_media_and_token_budget_belong_to_saved_generation(self):
-        args = Args(max_tokens=20, temperature=0.2)
+    def test_resume_does_not_prepare_or_retokenize_saved_generation(self):
+        record = continuation.Generation({}, "tenant", "/responses", prompt="prompt")
+        state = continuation.StreamState(record, {"content": 0})
+        token = continuation.ACTIVE.set(state)
+        try:
+            with pytest.raises(RuntimeError, match="restore the retained decoder"):
+                continuation.prepare_generation("new", [], [], Args(), [])
+        finally:
+            continuation.ACTIVE.reset(token)
+
+    def test_disconnect_before_worker_dispatch_does_not_start_generation(self):
+        state = continuation.StreamState(
+            continuation.Generation({}, "tenant", "/responses")
+        )
+        state.closed = True
+        token = continuation.ACTIVE.set(state)
+        generate = Mock()
+        try:
+            with pytest.raises(RuntimeError, match="closed before generation"):
+                continuation.start_generation(generate, "prompt", args=Args())
+            generate.assert_not_called()
+            assert state.record.session.error is not None
+        finally:
+            continuation.ACTIVE.reset(token)
+
+    def test_previous_handle_can_retry_without_forking_decoder(self):
+        store = continuation.Checkpoints(capacity=2)
+        session = continuation.InferenceSession()
+        record = continuation.Generation(
+            {}, "tenant", "/responses", prompt="prompt", parts=["raw"], session=session
+        )
+        store.add(record)
+        checkpoint = {"id": record.id, "cursor": 1, "content": 3, "reasoning": 0}
+        first = store.resume(checkpoint, "tenant", "/responses")
+        second = store.resume(checkpoint, "tenant", "/responses")
+        assert first.session is second.session is session
+        assert first.lease < second.lease
+        assert session.error is None
+        store.add(continuation.Generation({}, "tenant", "/responses"))
+        assert session.error is None  # The current handle still owns the state.
+
+    def test_legacy_prefix_does_not_advance_decoder_cursor(self):
+        session = continuation.InferenceSession()
+        session.context = server.GenerationContext(uid=1, prompt_tokens=3)
+        for text in ("new", " tail"):
+            session.put(_token(text))
+        session.put(None)
         record = continuation.Generation(
             {},
             "tenant",
             "/responses",
             prompt="prompt",
-            args=args,
-            images=["image"],
-            audio=["audio"],
-            videos=["video"],
-            parts=["raw"],
-            token_counts=[3],
+            initial_prefix="old ",
+            parts=["new"],
+            session=session,
         )
-        state = continuation.StreamState(record, {"content": 3})
+        state = continuation.StreamState(record, {"content": 7, "reasoning": 0})
         token = continuation.ACTIVE.set(state)
         try:
-            prompt, images, audio, resumed, videos = continuation.prepare_generation(
-                "new", [], [], Args(), []
-            )
+            generate = Mock(side_effect=AssertionError("must not regenerate"))
+            _, reader = continuation.start_generation(generate, "ignored")
+            assert [t.text for t in reader] == ["old new", " tail"]
         finally:
             continuation.ACTIVE.reset(token)
-        assert (prompt, images, audio, videos) == (
-            "promptraw",
-            ["image"],
-            ["audio"],
-            ["video"],
-        )
-        assert resumed.max_tokens == 17 and args.max_tokens == 20
-        assert resumed.temperature == 0.2
 
     @pytest.mark.parametrize(
         "failure",
@@ -669,21 +835,42 @@ class TestContinuationLive:
             assert second["checkpoint"][channel] == len(
                 first[channel] + second[channel]
             )
+        for channel in ("content", "reasoning"):
+            assert (
+                first[channel] + second[channel] + third[channel] == baseline[channel]
+            )
         if thinking:
-            # Prefix reconstruction does not preserve decode caches. Later
-            # wording can differ after re-prefill, even with greedy decoding.
-            # Check both exact joins and completion of the original math task.
-            offset = len(first[key])
-            assert len(second[key]) > 30
-            assert second[key] == baseline[key][offset : offset + len(second[key])]
-            offset += len(second[key])
-            assert third[key].startswith(baseline[key][offset : offset + 32])
             assert "2520" in third["content"]
-            assert "restart" not in third["content"].lower()
             assert "<think>" not in third["content"]
-        else:
-            assert first[key] + second[key] + third[key] == baseline[key]
-            assert not first["reasoning"] + second["reasoning"] + third["reasoning"]
+
+    @pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/responses"])
+    @pytest.mark.parametrize("typical_p", [1.0, 0.8])
+    def test_sampled_resume_preserves_full_output_across_peer_request(
+        self, path, typical_p
+    ):
+        body = {
+            **self.body(path, thinking=True),
+            "temperature": 0.7,
+            "seed": 91,
+            "top_p": 0.9,
+            "top_k": 40,
+            "typical_p": typical_p,
+            "repetition_penalty": 1.05,
+        }
+        baseline = self.stream(path, body)
+        first = self.stream(path, body, lambda r: len(r["reasoning"]) > 40)
+        assert 40 < len(first["reasoning"]) < len(baseline["reasoning"])
+        self.stream(path, {**self.body(path), "temperature": 1.3, "seed": 12})
+        second = self.stream(
+            path,
+            {**body, "continuation": first["checkpoint"]},
+            lambda r: len(r["reasoning"] + r["content"]) > 30,
+        )
+        final = self.stream(path, {**body, "continuation": second["checkpoint"]})
+        for channel in ("content", "reasoning"):
+            assert (
+                first[channel] + second[channel] + final[channel] == baseline[channel]
+            )
 
     @pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/responses"])
     def test_partial_tool_call_resumes_as_one_complete_call(self, path):
@@ -702,6 +889,11 @@ class TestContinuationLive:
         body["continue_final_message"] = True
         result = self.stream(path, body)
         assert result["content"].startswith(" 5, 6, 7,"), result
+        first = self.stream(path, body, lambda r: len(r["content"]) > 40)
+        resumed = self.stream(
+            path, {"stream": True, "continuation": first["checkpoint"]}
+        )
+        assert first["content"] + resumed["content"] == result["content"]
 
     def test_deferred_context_keeps_original_prompt(self):
         path = "/v1/responses"

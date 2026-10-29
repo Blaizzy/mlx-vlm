@@ -73,22 +73,35 @@ requests.post(
 )
 ```
 
-The server retains the original formatted prompt, media references, generation
-options and raw output prefix, including reasoning and tool delimiters. Resume uses that
-context and the remaining token budget; replacement messages or settings in the
-resume request are ignored. Append the returned text to the interrupted
-assistant message. Each resumed stream returns a new checkpoint, allowing
-repeated stops. Reasoning and content already delivered are suppressed, but
-partial tool arguments are replayed in full: discard the old partial tool-call
-accumulator and execute calls only after the resumed stream completes.
+The server retains the live autoregressive decoder: KV and recurrent caches,
+pipelined next tokens, sampling seed and position, logits processors, thinking
+budget, and detokenizer state. Stop pauses scheduling for this request. Resume
+replays any output generated ahead of the client's acknowledged cursor, then
+continues the same decoder without tokenizing or prefilling again. Replacement
+messages and settings are ignored; the original token budget still applies.
 
-This reconstructs generation from the saved prefix. It does not suspend the
-inference worker or preserve its KV cache, sampler/RNG state, or exact future
-tokens. Re-prefilling can change later wording even with greedy decoding.
-Checkpoints are process-local, bounded to 32 retained streams and expire
-after 24 hours of inactivity. A restart, eviction or expired checkpoint returns
-HTTP 409; do not silently start another conversation turn. Resume uses the same
-authentication and tenant isolation as the original request.
+Append the returned text to the interrupted assistant message. Reasoning and
+content already delivered are suppressed, but partial tool arguments are
+replayed in full: discard the old partial tool-call accumulator and execute
+calls only after the resumed stream completes. Each stream returns a new
+checkpoint. A prior handle remains usable for retrying a failed reconnect;
+only the latest reader runs, and a late close from an older stream cannot pause it.
+
+Resumable requests retain individual decoder batches on the existing GPU worker,
+so other requests can run while they are paused. This preserves the decode batch
+shape and keyed sampling sequence across resumes, at the cost of batching
+throughput and retained memory. APC can warm the initial prompt and its entries
+survive Stop; a resume uses its private live state directly and needs no APC
+lookup. Resume also works with APC disabled. Live inference checkpoints are
+separate from APC's shared prefix cache and disk storage.
+
+Checkpoints are process-local, bounded to 32 handles and expire after 10 minutes
+of inactivity. The worker limits paused target-cache buffers to 1 GiB in aggregate
+(`MLX_VLM_CONTINUATION_CACHE_BYTES`), evicting the oldest paused state first.
+A restart, model unload, eviction or expired checkpoint requires regeneration;
+unavailable checkpoints return HTTP 409 rather than silently restarting the
+answer. Authentication and tenant isolation match the original request.
+Diffusion models do not currently support inference checkpoints.
 
 For older transcripts without a checkpoint, `"continue_final_message": true`
 continues an unfinished final assistant message using its template prefix.

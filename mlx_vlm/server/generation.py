@@ -29,13 +29,18 @@ from ..generate import (  # noqa: F401 - compatibility re-exported by server.__i
     DEFAULT_TOP_P,
     BatchGenerator,
     _make_cache,
+    wired_limit,
 )
 from ..generate.diffusion import (
     is_diffusion_model,
     stream_diffusion_generate_from_kwargs,
 )
+from ..models.cache import cache_nbytes
 from ..sample_utils import (
+    apply_p_less,
     apply_top_k,
+    apply_top_n_sigma,
+    apply_typical_p,
     clamp_temperature,
     make_logits_processors,
     make_sampler,
@@ -47,6 +52,7 @@ from ..tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
 from ..utils import ThinkingBudgetCriteria, load, prepare_inputs, resolve_eos_token_ids
 from ..vision_cache import processed_image_key
 from .runtime import runtime
+from .sessions import InferenceSession
 
 logger = logging.getLogger("mlx_vlm.server")
 
@@ -164,13 +170,23 @@ class _PositionedTargetSampler:
         top_p: float,
         top_k: int = 0,
         seed: Optional[int],
+        top_n_sigma: float = 0,
+        p_less: bool = False,
+        typical_p: float = 1,
     ):
         self.temperature = clamp_temperature(float(temperature))
         self.top_p = float(top_p)
         self.top_k = int(top_k)
         self.seed = DEFAULT_SEED if seed is None else int(seed)
+        self.top_n_sigma, self.p_less, self.typical_p = top_n_sigma, p_less, typical_p
 
     def _apply_top_k(self, logprobs: mx.array) -> mx.array:
+        if self.top_n_sigma > 0:
+            logprobs = apply_top_n_sigma(logprobs, self.top_n_sigma)
+        if self.p_less:
+            logprobs = apply_p_less(logprobs, self.temperature)
+        if self.typical_p < 1:
+            logprobs = apply_typical_p(logprobs, self.typical_p)
         return apply_top_k(logprobs, self.top_k) if self.top_k > 0 else logprobs
 
     def __call__(self, logprobs: mx.array) -> mx.array:
@@ -789,6 +805,7 @@ class QueuedGenerationRequest:
     apc_semantic_hash: Optional[int] = None
     request_id: Optional[str] = None
     queued_at: float = field(default_factory=time.perf_counter)
+    session: Optional[InferenceSession] = None
 
 
 @dataclass
@@ -1197,9 +1214,14 @@ class ResponseGenerator:
         audio: Optional[List] = None,
         args: Optional[GenerationArguments] = None,
         videos: Optional[List] = None,
+        session: Optional[InferenceSession] = None,
     ) -> Tuple[GenerationContext, "_TokenIterator"]:
         self.wait_until_ready()
         args = args or GenerationArguments(max_tokens=get_server_max_tokens())
+        if session is not None and is_diffusion_model(self.model):
+            raise ValueError(
+                "Inference checkpoints currently require an autoregressive model."
+            )
         if self.draft_model is not None and args.logits_processors is not None:
             raise ValueError(
                 "Structured response_format is not supported with speculative decoding."
@@ -1266,6 +1288,7 @@ class ResponseGenerator:
             apc_semantic_hash=apc_semantic_hash,
             request_id=request_id,
             queued_at=request_started_at,
+            session=session,
         )
         logger.info(
             "Generation queued: request=%s prompt_tokens=%d max_tokens=%d "
@@ -1283,6 +1306,10 @@ class ResponseGenerator:
         ctx = rqueue.get()
         if isinstance(ctx, Exception):
             raise ctx
+
+        if session is not None:
+            session.context = ctx
+            return ctx, session.reader(timeout=get_token_queue_timeout())
 
         return ctx, _TokenIterator(
             rqueue, ctx.uid, self._cancel, get_token_queue_timeout()
@@ -1730,6 +1757,10 @@ class ResponseGenerator:
         try:
             self._run_impl()
         finally:
+            self._stop = True
+            wire_context = getattr(self, "_wire_context", None)
+            if wire_context is not None:
+                wire_context.__exit__(None, None, None)
             try:
                 # The worker can outlive stop_and_join's timeout. Retire its
                 # disk writer only after its final request/store has finished.
@@ -1745,6 +1776,166 @@ class ResponseGenerator:
                 self.apc_manager = None
                 clear_mlx_streams()
                 mx.clear_cache()
+
+    def _start_batch_request(self, request, batch_gen, active, generation_stream):
+        rqueue = request.rqueue
+        raw_inputs = request.raw_inputs
+        prompt_tokens = request.prompt_tokens
+        args = request.args
+        images = request.images
+        log_state = self._log_prefill_started(request, backend="continuous_batching")
+        if batch_gen is None:
+            batch_gen = BatchGenerator(
+                self.model.language_model,
+                self.processor,
+                stop_tokens=self.stop_tokens,
+                sampler=(
+                    self._make_session_sampler(args)
+                    if request.session
+                    else self._make_sampler(args)
+                ),
+                kv_bits=self.kv_bits,
+                kv_key_bits=getattr(self, "kv_key_bits", None),
+                kv_value_bits=getattr(self, "kv_value_bits", None),
+                kv_key_scheme=getattr(self, "kv_key_scheme", None),
+                kv_value_scheme=getattr(self, "kv_value_scheme", None),
+                kv_group_size=self.kv_group_size,
+                kv_quant_scheme=self.kv_quant_scheme,
+                quantized_kv_start=self.quantized_kv_start,
+                compute_logprobs=bool(args.logprobs),
+                top_logprobs_k=self.top_logprobs_k if args.logprobs else 0,
+                stream=generation_stream,
+                manage_wired_limit=False,
+                apc_manager=self.apc_manager,
+                draft_model=self.draft_model,
+                draft_kind=self.draft_kind,
+                draft_block_size=_get_draft_block_size_from_env(),
+                greedy_sampling=args.temperature == 0,
+                prefill_step_size=self._effective_prefill_step_size(),
+            )
+
+        # Vision encoder runs on the GPU thread; text tokenization
+        # already happened on the caller thread.
+        coordinator = getattr(batch_gen, "apc", None)
+        if coordinator is not None:
+            coordinator.prepare_prefill(
+                prompt_tokens,
+                prefill_step_size=self._effective_prefill_step_size(),
+            )
+        input_ids, gen_kwargs = self._gpu_embed(
+            raw_inputs,
+            images,
+            apc_semantic_hash=request.apc_semantic_hash,
+        )
+        has_embeds = bool(gen_kwargs.get("inputs_embeds") is not None)
+        if args.cache_checkpoint_len:
+            gen_kwargs["_apc_checkpoint_len"] = args.cache_checkpoint_len
+        # Preserve tenant isolation for manually queued requests
+        # that predate server-side semantic hash computation.
+        if request.apc_semantic_hash is None and getattr(args, "tenant_id", None):
+            gen_kwargs["_apc_tenant"] = args.tenant_id
+
+        # Drain pending text-only prompts before inserting an
+        # embed-bearing request — multi-row PromptProcessingBatch
+        # admission expects all rows to carry inputs_embeds (the
+        # mixed APC path concatenates them per-row).
+        if has_embeds and any(
+            not (s[3] and s[3].get("inputs_embeds") is not None)
+            for s in batch_gen.unprocessed_prompts
+        ):
+            self._flush(batch_gen, active)
+
+        try:
+            thinking_budget_criteria = request.thinking_budget_criteria
+            (uid,) = batch_gen.insert(
+                [input_ids.squeeze(0).tolist()],
+                max_tokens=args.max_tokens,
+                prompt_kwargs=[gen_kwargs],
+                logits_processors=[self._make_logits_processors(args, input_ids)],
+                thinking_budget_criteria=[thinking_budget_criteria],
+            )
+        except Exception as e:
+            rqueue.put(e)
+            return batch_gen
+
+        rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
+        active[uid] = {
+            "rqueue": request.session or rqueue,
+            "streamer": _ServerTokenStreamer(
+                self.tokenizer,
+                make_streaming_detokenizer(self.processor),
+            ),
+            "gen_kwargs": gen_kwargs if has_embeds else None,
+            "prompt_tps": None,
+            "cached_tokens": 0,
+            "spec_snapshot": (
+                speculative_stats_snapshot(self.draft_model)
+                if self.draft_model is not None
+                else None
+            ),
+            **log_state,
+        }
+        return batch_gen
+
+    @staticmethod
+    def _make_session_sampler(args):
+        if args.temperature == 0:
+            return None
+        return _PositionedTargetSampler(
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            seed=args.seed,
+            top_n_sigma=args.top_n_sigma,
+            p_less=args.p_less,
+            typical_p=args.typical_p,
+        )
+
+    def _step_retained(self, retained):
+        # Each resumable request keeps its batch shape, pipelined next token,
+        # sampler positions, processors, caches and detokenizer unchanged.
+        # Paused engines never enter next(), but peers still get scheduled.
+        paused = sorted((s for s in retained if s.paused), key=lambda s: s.touched)
+        sizes = {}
+        for session in paused:
+            engine, active = retained[session]
+            sizes[session] = cache_nbytes(
+                [
+                    getattr(engine._generation_batch, "prompt_cache", None),
+                    getattr(engine._prompt_batch, "prompt_cache", None),
+                    [info.get("gen_kwargs") for info in active.values()],
+                ]
+            )
+        budget = int(os.environ.get("MLX_VLM_CONTINUATION_CACHE_BYTES", 1024**3))
+        resident = sum(sizes.values())
+        for session in paused:
+            if resident <= budget:
+                break
+            with session.condition:
+                if session.paused:
+                    session.dispose(
+                        "The inference checkpoint was evicted to release cache memory. Regenerate the response."
+                    )
+                    resident -= sizes[session]
+        for session, (engine, active) in list(retained.items()):
+            try:
+                session.check()
+                if not session.paused and active:
+                    self._step(engine, active)
+                if active:
+                    continue
+            except Exception as error:
+                session.dispose(str(error))
+            self._close_retained(engine, active)
+            del retained[session]
+
+    @staticmethod
+    def _close_retained(engine, active):
+        try:
+            for uid in active:
+                engine.remove(uid)
+        finally:
+            engine.close()
 
     def _run_impl(self):
         """Single GPU thread: owns BatchGenerator, runs tight next() loop."""
@@ -1764,25 +1955,31 @@ class ResponseGenerator:
             return
 
         generation_stream = mx.default_stream(mx.default_device())
+        self._wire_context = wired_limit(self.model, [generation_stream])
+        self._wire_context.__enter__()
 
         batch_gen = None
         # uid -> {rqueue, tokens, gen_kwargs}
         active: dict = {}
         max_num_seqs = get_max_num_seqs()
+        retained = {}
 
         while not (self._stop and not active and self.requests.empty()):
             new_items = []
             try:
                 # Poll the request queue — non-blocking when generating, short
                 # blocking wait when idle so we don't spin.
-                active_batch = bool(active)
+                running = sum(not session.paused for session in retained)
+                active_batch = bool(active) or bool(running)
                 coalesce_s = (
                     get_speculative_batch_coalesce_s()
                     if not active_batch and self.draft_model is not None
                     else 0.0
                 )
                 capacity = (
-                    None if max_num_seqs is None else max(0, max_num_seqs - len(active))
+                    None
+                    if max_num_seqs is None
+                    else max(0, max_num_seqs - len(active) - running)
                 )
                 new_items, should_stop = self._collect_pending_requests(
                     active=active_batch,
@@ -1801,104 +1998,18 @@ class ResponseGenerator:
                         batch_gen = None
 
                 for request in new_items:
-                    rqueue = request.rqueue
-                    raw_inputs = request.raw_inputs
-                    prompt_tokens = request.prompt_tokens
-                    args = request.args
-                    images = request.images
-                    log_state = self._log_prefill_started(
-                        request, backend="continuous_batching"
-                    )
-                    if batch_gen is None:
-                        batch_gen = BatchGenerator(
-                            self.model.language_model,
-                            self.processor,
-                            stop_tokens=self.stop_tokens,
-                            sampler=self._make_sampler(args),
-                            kv_bits=self.kv_bits,
-                            kv_key_bits=getattr(self, "kv_key_bits", None),
-                            kv_value_bits=getattr(self, "kv_value_bits", None),
-                            kv_key_scheme=getattr(self, "kv_key_scheme", None),
-                            kv_value_scheme=getattr(self, "kv_value_scheme", None),
-                            kv_group_size=self.kv_group_size,
-                            kv_quant_scheme=self.kv_quant_scheme,
-                            quantized_kv_start=self.quantized_kv_start,
-                            compute_logprobs=bool(args.logprobs),
-                            top_logprobs_k=self.top_logprobs_k if args.logprobs else 0,
-                            stream=generation_stream,
-                            apc_manager=self.apc_manager,
-                            draft_model=self.draft_model,
-                            draft_kind=self.draft_kind,
-                            draft_block_size=_get_draft_block_size_from_env(),
-                            greedy_sampling=args.temperature == 0,
-                            prefill_step_size=self._effective_prefill_step_size(),
+                    if request.session is not None:
+                        session_active = {}
+                        engine = self._start_batch_request(
+                            request, None, session_active, generation_stream
+                        )
+                        retained[request.session] = (engine, session_active)
+                    else:
+                        batch_gen = self._start_batch_request(
+                            request, batch_gen, active, generation_stream
                         )
 
-                    # Vision encoder runs on the GPU thread; text tokenization
-                    # already happened on the caller thread.
-                    coordinator = getattr(batch_gen, "apc", None)
-                    if coordinator is not None:
-                        coordinator.prepare_prefill(
-                            prompt_tokens,
-                            prefill_step_size=self._effective_prefill_step_size(),
-                        )
-                    input_ids, gen_kwargs = self._gpu_embed(
-                        raw_inputs,
-                        images,
-                        apc_semantic_hash=request.apc_semantic_hash,
-                    )
-                    has_embeds = bool(gen_kwargs.get("inputs_embeds") is not None)
-                    if args.cache_checkpoint_len:
-                        gen_kwargs["_apc_checkpoint_len"] = args.cache_checkpoint_len
-                    # Preserve tenant isolation for manually queued requests
-                    # that predate server-side semantic hash computation.
-                    if request.apc_semantic_hash is None and getattr(
-                        args, "tenant_id", None
-                    ):
-                        gen_kwargs["_apc_tenant"] = args.tenant_id
-
-                    # Drain pending text-only prompts before inserting an
-                    # embed-bearing request — multi-row PromptProcessingBatch
-                    # admission expects all rows to carry inputs_embeds (the
-                    # mixed APC path concatenates them per-row).
-                    if has_embeds and any(
-                        not (s[3] and s[3].get("inputs_embeds") is not None)
-                        for s in batch_gen.unprocessed_prompts
-                    ):
-                        self._flush(batch_gen, active)
-
-                    try:
-                        thinking_budget_criteria = request.thinking_budget_criteria
-                        (uid,) = batch_gen.insert(
-                            [input_ids.squeeze(0).tolist()],
-                            max_tokens=args.max_tokens,
-                            prompt_kwargs=[gen_kwargs],
-                            logits_processors=[
-                                self._make_logits_processors(args, input_ids)
-                            ],
-                            thinking_budget_criteria=[thinking_budget_criteria],
-                        )
-                    except Exception as e:
-                        rqueue.put(e)
-                        continue
-
-                    rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
-                    active[uid] = {
-                        "rqueue": rqueue,
-                        "streamer": _ServerTokenStreamer(
-                            self.tokenizer,
-                            make_streaming_detokenizer(self.processor),
-                        ),
-                        "gen_kwargs": gen_kwargs if has_embeds else None,
-                        "prompt_tps": None,
-                        "cached_tokens": 0,
-                        "spec_snapshot": (
-                            speculative_stats_snapshot(self.draft_model)
-                            if self.draft_model is not None
-                            else None
-                        ),
-                        **log_state,
-                    }
+                self._step_retained(retained)
 
                 if not active or batch_gen is None:
                     continue
@@ -1921,6 +2032,9 @@ class ResponseGenerator:
 
         if batch_gen is not None and callable(getattr(batch_gen, "close", None)):
             batch_gen.close()
+        for session, (engine, session_active) in retained.items():
+            session.dispose("The model was unloaded. Regenerate the response.")
+            self._close_retained(engine, session_active)
 
     def _run_diffusion(self):
         """GPU thread loop for diffusion models.

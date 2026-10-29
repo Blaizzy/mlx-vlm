@@ -23,6 +23,7 @@ from starlette.requests import HTTPConnection
 from starlette.responses import JSONResponse
 
 from .schemas import ContinuationOptions
+from .sessions import InferenceSession
 
 
 @dataclass
@@ -32,19 +33,17 @@ class Generation:
     path: str
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
     prompt: str | None = None
-    images: object = None
-    audio: object = None
-    videos: object = None
-    args: object = None
+    initial_prefix: str = ""
     parts: list[str] = field(default_factory=list)
-    token_counts: list[int] = field(default_factory=list)
     touched: float = field(default_factory=time.monotonic)
+    session: InferenceSession | None = None
+    lease: int = 0
 
 
 class Checkpoints:
     # Prompt/media references live only in this server process. Bound retention
     # so abandoned chats cannot keep an unbounded amount of context alive.
-    def __init__(self, capacity=32, ttl=24 * 60 * 60):
+    def __init__(self, capacity=32, ttl=600):
         self.capacity, self.ttl = capacity, ttl
         self.records = OrderedDict()
         self.lock = Lock()
@@ -53,7 +52,11 @@ class Checkpoints:
         with self.lock:
             self.records[record.id] = record
             while len(self.records) > self.capacity:
-                self.records.popitem(last=False)
+                _, old = self.records.popitem(last=False)
+                if old.session is not None and not any(
+                    r.session is old.session for r in self.records.values()
+                ):
+                    old.session.dispose()
 
     def resume(self, checkpoint, tenant, path):
         with self.lock:
@@ -70,7 +73,7 @@ class Checkpoints:
             cursor = checkpoint.get("cursor")
             if not isinstance(cursor, int) or not 0 <= cursor <= len(old.parts):
                 raise ValueError("Invalid response checkpoint.")
-            size = sum(map(len, old.parts[:cursor]))
+            size = len(old.initial_prefix) + sum(map(len, old.parts[:cursor]))
             if any(
                 not isinstance(checkpoint.get(key), int)
                 or not 0 <= checkpoint[key] <= size
@@ -81,11 +84,19 @@ class Checkpoints:
                 raise ValueError(
                     "The interrupted response has not started generating yet."
                 )
+            if old.session is None:
+                raise ValueError(
+                    "The inference checkpoint is no longer available. Regenerate the response."
+                )
+            lease = old.session.claim()
             record = copy.copy(old)
+            record.lease = lease
             record.id = uuid.uuid4().hex
             record.parts = old.parts[:cursor]
-            record.token_counts = old.token_counts[:cursor]
             record.touched = time.monotonic()
+            # Keep the previous handle usable if the replacement connection
+            # drops before delivering its first checkpoint. A new lease moves
+            # the reader; it never forks the decoder or duplicates GPU work.
             self.records.move_to_end(old.id)
         self.add(record)
         return record
@@ -98,8 +109,11 @@ ACTIVE = ContextVar("mlx_vlm_continuation", default=None)
 class StreamState:
     def __init__(self, record, checkpoint=None):
         self.record = record
+        self.closed = False
         self.resuming = checkpoint is not None
-        self.prefix = "".join(record.parts) if self.resuming else ""
+        self.prefix = (
+            record.initial_prefix + "".join(record.parts) if self.resuming else ""
+        )
         self.previous = {
             key: int((checkpoint or {}).get(key, 0)) for key in ("content", "reasoning")
         }
@@ -337,6 +351,10 @@ class ContinuationMiddleware:
             }
             await self.app(scope, replay_receive, checkpoint_send)
         finally:
+            if state is not None:
+                state.closed = True
+                if state.record.session is not None:
+                    state.record.session.pause(state.record.lease)
             ACTIVE.reset(token)
 
 
@@ -396,8 +414,7 @@ def render_prompt(template, *args, **kwargs):
                 break
             boundary += 1
         state.prefix = rendered[boundary:]
-        state.record.parts = [state.prefix]
-        state.record.token_counts = [0]
+        state.record.initial_prefix = state.prefix
         state.previous = {"content": len(content), "reasoning": len(reasoning)}
         state.remaining = dict(state.previous)
         state.delivered = dict(state.previous)
@@ -411,19 +428,11 @@ def prepare_generation(prompt, images, audio, args, videos):
         return prompt, images, audio, args, videos
     record = state.record
     if state.resuming:
-        prompt = record.prompt + state.prefix
-        images, audio, videos = record.images, record.audio, record.videos
-        args = copy.copy(record.args)
-        args.max_tokens = max(1, args.max_tokens - sum(record.token_counts))
-    else:
-        record.prompt, record.images, record.audio, record.videos = (
-            prompt,
-            images,
-            audio,
-            videos,
+        raise RuntimeError(
+            "Resume must restore the retained decoder, not rebuild its prompt."
         )
-        record.args = copy.copy(args)
-        prompt += state.prefix
+    record.prompt = prompt
+    prompt += state.prefix
     args = copy.copy(args)
     args.skip_special_tokens = False
     return prompt, images, audio, args, videos
@@ -433,7 +442,6 @@ class ContinuationTokens:
     def __init__(self, iterator, state, prefix_token):
         self.iterator, self.state = iterator, state
         self.prefix_token = prefix_token if state.prefix else None
-        self.generated_tokens = 0
 
     def __iter__(self):
         return self
@@ -444,12 +452,7 @@ class ContinuationTokens:
             return token
         token = next(self.iterator)
         if token is not None and hasattr(token, "text"):
-            count = getattr(token, "token_count", None)
-            if count is None:
-                count = max(0, token.generation_tokens - self.generated_tokens)
-                self.generated_tokens = token.generation_tokens
             self.state.record.parts.append(token.text)
-            self.state.record.token_counts.append(count)
             self.state.record.touched = time.monotonic()
         return token
 
@@ -460,16 +463,33 @@ class ContinuationTokens:
 
 
 def start_generation(generate, prompt, images=None, audio=None, args=None, videos=None):
-    """Start the worker with the saved prefix; replay it to the protocol parsers."""
+    """Restore the same decoder and replay only to seed the protocol parsers."""
     state = ACTIVE.get()
     if state is None:
         return generate(
             prompt, images, audio, args=args, **({"videos": videos} if videos else {})
         )
-    from .generation import StreamingToken
+    from .generation import StreamingToken, get_token_queue_timeout
 
-    prepared = prepare_generation(prompt, images, audio, args, videos)
-    context, iterator = generate(*prepared)
+    if state.resuming:
+        session = state.record.session
+        context = session.context
+        iterator = session.reader(
+            len(state.record.parts), state.record.lease, get_token_queue_timeout()
+        )
+    else:
+        prepared = prepare_generation(prompt, images, audio, args, videos)
+        session = InferenceSession(ttl=CHECKPOINTS.ttl)
+        session.owner = getattr(generate, "__self__", None)
+        state.record.session = session
+        try:
+            if state.closed:
+                raise RuntimeError("The stream closed before generation started.")
+            context, iterator = generate(*prepared, session=session)
+        except Exception as error:
+            session.dispose(str(error))
+            raise
+        session.context = context
     prefix = StreamingToken(
         text=state.prefix, token=0, logprobs=0, finish_reason=None, token_count=0
     )
@@ -492,16 +512,28 @@ def stream_generation(
         )
     from ..generate import GenerationResult
 
-    prompt, image, audio, args, video = prepare_generation(
-        prompt, image, audio, args, video
-    )
-    iterator = generate(
-        prompt=prompt,
-        image=image,
-        audio=audio,
-        video=video,
-        skip_special_tokens=False,
-        **args.to_generate_kwargs(),
-        **kwargs,
-    )
+    if state.resuming:
+        session = state.record.session
+    else:
+        from .generation import ResponseGenerator
+
+        prompt, image, audio, args, video = prepare_generation(
+            prompt, image, audio, args, video
+        )
+        # The retained generator frame owns the cache and decode position.
+        # Keyed sampling also keeps other requests from perturbing its draws.
+        sampler = ResponseGenerator._make_session_sampler(args)
+        iterator = generate(
+            prompt=prompt,
+            image=image,
+            audio=audio,
+            video=video,
+            skip_special_tokens=False,
+            sampler=sampler,
+            **args.to_generate_kwargs(),
+            **kwargs,
+        )
+        session = InferenceSession(ttl=CHECKPOINTS.ttl, source=iterator)
+        state.record.session = session
+    iterator = session.reader(len(state.record.parts), state.record.lease)
     return ContinuationTokens(iterator, state, GenerationResult(text=state.prefix))

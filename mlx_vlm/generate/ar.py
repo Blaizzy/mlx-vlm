@@ -2530,6 +2530,7 @@ class BatchGenerator:
         draft_kind: Optional[str] = None,
         draft_block_size: Optional[int] = None,
         greedy_sampling: bool = False,
+        manage_wired_limit: bool = True,
     ):
         self.model = model
         self.max_tokens = max_tokens
@@ -2594,7 +2595,8 @@ class BatchGenerator:
         self._cache_eval_interval = _get_batch_cache_eval_interval()
 
         self._wire_stack = contextlib.ExitStack()
-        self._wire_stack.enter_context(wired_limit(model, [self._stream]))
+        if manage_wired_limit:
+            self._wire_stack.enter_context(wired_limit(model, [self._stream]))
 
     # ---------------- APC integration helpers ----------------
     # Keys that are APC-only metadata; stripped from ``prompt_kwargs`` before
