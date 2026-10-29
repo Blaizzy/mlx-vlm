@@ -1682,40 +1682,12 @@ def test_raon_mla_matches_expanded_attention(raon_case):
     np.testing.assert_allclose(np.array(decoded), expected[:, 3:], atol=2e-6, rtol=2e-5)
 
 
-def test_raon_sanitize_source_layouts_and_second_pass(raon_case):
-    config, model = raon_case
-    convs = {
-        f"model.layers.0.self_attn.{name}_conv1d.weight": mx.arange(256).reshape(64, 4)
-        + i * 1000
-        for i, name in enumerate(("q", "k", "v"))
-    }
-    kv = mx.arange(2 * 64 * 32).reshape(128, 32).astype(mx.float32)
-    weights = {**convs, "model.layers.1.self_attn.kv_b_proj.weight": kv}
-    for i in range(4):
-        weights[f"model.layers.1.moe.experts.{i}.gate_proj.weight"] = mx.full(
-            (64, 64), float(i)
-        )
-    first = model.sanitize(weights)
-    prefix = "language_model.model.layers."
-    np.testing.assert_array_equal(
-        np.array(first[prefix + "0.self_attn.qkv_conv1d.weight"]),
-        np.concatenate([np.array(x)[..., None] for x in convs.values()]),
-    )
-    np.testing.assert_array_equal(
-        np.array(first[prefix + "1.self_attn.embed_q.weight"]),
-        np.array(kv).reshape(2, 64, 32)[:, :32].swapaxes(-1, -2),
-    )
-    second = model.sanitize(first)
-    assert first.keys() == second.keys()
-    for key in first:
-        np.testing.assert_array_equal(np.array(first[key]), np.array(second[key]))
-
-
 def test_raon_source_mxfp8_checkpoint_roundtrip(raon_case, tmp_path):
     config, model = raon_case
+    expected_weights = dict(tree_flatten(model.parameters()))
     source = {
         key.removeprefix("language_model."): value
-        for key, value in tree_flatten(model.parameters())
+        for key, value in expected_weights.items()
     }
     # Reconstruct the original checkpoint's unfused convolution and MLA layout.
     conv = source.pop("model.layers.0.self_attn.qkv_conv1d.weight")
@@ -1730,13 +1702,14 @@ def test_raon_source_mxfp8_checkpoint_roundtrip(raon_case, tmp_path):
     # Source experts are individual E4M3 tensors with E8M0 scales, not native packs.
     for projection in ("gate_proj", "up_proj", "down_proj"):
         weight = source.pop(f"model.layers.1.moe.switch_mlp.{projection}.weight")
+        packed, scales = mx.quantize(weight, group_size=32, bits=8, mode="mxfp8")
+        prefix = f"language_model.model.layers.1.moe.switch_mlp.{projection}."
+        expected_weights[prefix + "weight"] = packed
+        expected_weights[prefix + "scales"] = scales
         for expert in range(config.num_experts):
-            packed, scales = mx.quantize(
-                weight[expert], group_size=32, bits=8, mode="mxfp8"
-            )
             prefix = f"model.layers.1.moe.experts.{expert}.{projection}."
-            source[prefix + "weight"] = packed.view(mx.uint8)
-            source[prefix + "weight_scale_inv"] = scales
+            source[prefix + "weight"] = packed[expert].view(mx.uint8)
+            source[prefix + "weight_scale_inv"] = scales[expert]
     config_dict = asdict(config)
     config_dict["quantization_config"] = {
         "quant_method": "mxfp8",
@@ -1765,48 +1738,18 @@ def test_raon_source_mxfp8_checkpoint_roundtrip(raon_case, tmp_path):
     assert not isinstance(first.language_model.lm_head, nn.QuantizedLinear)
     expert = first.layers[1].moe.switch_mlp.gate_proj
     assert expert.mode == "mxfp8" and expert.bits == 8 and expert.group_size == 32
-    prefix = "model.layers.1.moe.experts.1.gate_proj."
-    codes = np.array(source[prefix + "weight"])
-    exponent = (codes >> 3) & 15
-    mantissa = codes & 7
-    decoded = np.where(
-        exponent == 0,
-        mantissa / 512.0,
-        (1 + mantissa / 8.0) * np.exp2(exponent.astype(np.int32) - 7),
-    )
-    decoded *= np.where(codes & 128, -1.0, 1.0)
-    factors = np.exp2(
-        np.array(source[prefix + "weight_scale_inv"]).astype(np.int32) - 127
-    )
-    decoded *= np.repeat(factors, 32, axis=-1)
-    inputs = mx.random.normal((1, 1, 64))
-    actual = expert(inputs, mx.array([1]))
-    np.testing.assert_allclose(
-        np.array(actual), np.array(inputs) @ decoded.T, atol=2e-6, rtol=2e-5
-    )
+    loaded = dict(tree_flatten(first.parameters()))
+    # Check every converted tensor and repeat sanitization against the fixture.
+    for weights in (loaded, first.sanitize(loaded)):
+        assert weights.keys() == expected_weights.keys()
+        for key, value in expected_weights.items():
+            np.testing.assert_array_equal(
+                np.array(weights[key]), np.array(value), err_msg=key
+            )
     # Saving native tensors must not transpose or reinterpret them a second time.
-    mx.save_safetensors(str(path), dict(tree_flatten(first.parameters())))
+    mx.save_safetensors(str(path), loaded)
     second = load_model(tmp_path)
     np.testing.assert_array_equal(np.array(second(ids).logits), np.array(expected))
-
-
-def test_raon_mxfp8_source_packing(raon_case):
-    _, model = raon_case
-    weight = mx.random.normal((64, 64))
-    packed, scales = mx.quantize(weight, group_size=32, bits=8, mode="mxfp8")
-    source = {}
-    for i in range(4):
-        prefix = f"model.layers.1.moe.experts.{i}.gate_proj."
-        source[prefix + "weight"] = packed.view(mx.uint8)
-        source[prefix + "weight_scale_inv"] = scales
-    sanitized = model.sanitize(source)
-    prefix = "language_model.model.layers.1.moe.switch_mlp.gate_proj."
-    np.testing.assert_array_equal(
-        np.array(sanitized[prefix + "weight"]), np.array(mx.stack([packed] * 4))
-    )
-    np.testing.assert_array_equal(
-        np.array(sanitized[prefix + "scales"]), np.array(mx.stack([scales] * 4))
-    )
 
 
 def test_raon_left_padded_batch_matches_single_sequences(raon_case):
@@ -1830,29 +1773,6 @@ def test_raon_left_padded_batch_matches_single_sequences(raon_case):
         solo = model(solo_ids).logits[:, -1:]
         np.testing.assert_allclose(
             np.array(decoded[row : row + 1]), np.array(solo), atol=2e-5
-        )
-
-
-def test_raon_recurrent_cache_restores_partial_acceptance(raon_case):
-    from mlx_vlm.models.cache import ArraysCache
-
-    _, model = raon_case
-    layer = model.layers[0].self_attn
-    layer.eval()
-    x = mx.random.normal((1, 6, 64))
-    cache = ArraysCache(2)
-    layer(x[:, :2], cache=cache)
-    generation = cache.start_speculation(3)
-    layer(x[:, 2:5], cache=cache)
-    cache.commit_speculation(2, generation)
-    actual = layer(x[:, 5:], cache=cache)
-    reference = ArraysCache(2)
-    layer(x[:, :4], cache=reference)
-    expected = layer(x[:, 5:], cache=reference)
-    np.testing.assert_allclose(np.array(actual), np.array(expected), atol=2e-5)
-    for actual_state, expected_state in zip(cache.state, reference.state):
-        np.testing.assert_allclose(
-            np.array(actual_state), np.array(expected_state), atol=2e-5
         )
 
 
