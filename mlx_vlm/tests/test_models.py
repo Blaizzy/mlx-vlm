@@ -2779,6 +2779,26 @@ def test_rotating_cache_random_model_chunk_parity(case, keep):
         np.testing.assert_allclose(forward(schedule), expected, atol=1e-4, rtol=1e-4)
 
 
+def test_glm_ocr_trainer_padding_mask_keeps_decoder_causal():
+    # The SFT trainer passes its right-padded [B, T] attention mask as `mask`.
+    # It only feeds RoPE positions; the decoder must still apply its causal
+    # mask, so every row matches an unpadded forward of the same tokens.
+    case = next(c for c in DATA["rotating_cache"] if c["module"] == "glm_ocr")
+    mx.random.seed(17)
+    model, config = rotating_language_model(case)
+    model.eval()
+
+    def logits(ids, mask=None):
+        model._position_ids = model._rope_deltas = None
+        return np.array(model(ids, mask=mask).logits)
+
+    ids = (mx.arange(12)[None] * 7 + 3) % config.vocab_size
+    batch = mx.concatenate([ids, mx.pad(ids[:, :8], ((0, 0), (0, 4)))])
+    padded = logits(batch, mx.array([[1] * 12, [1] * 8 + [0] * 4]))
+    np.testing.assert_allclose(padded[:1], logits(ids), atol=1e-4, rtol=1e-4)
+    np.testing.assert_allclose(padded[1:, :8], logits(ids[:, :8]), atol=1e-4, rtol=1e-4)
+
+
 @pytest.mark.parametrize(
     "case",
     [c for c in DATA["rotating_cache"] if "prompt_metadata" in c["checks"]],
