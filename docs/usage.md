@@ -56,6 +56,45 @@ Incremental arguments are supported for JSON, Cohere, Qwen Coder XML, and Gemma
 tool formats. Other parsers retain their completed-call behavior. XML values
 that require type conversion are buffered until the parameter closes.
 
+## Continuing a stopped stream
+
+Chat Completions and Responses accept `"stream": true, "resumable": true`.
+The stream returns `X-MLX-Continuation: 1` and a `continuation` object on SSE
+events once generation starts. Save that object atomically with the text from
+the same event. To stop, close the stream. To resume, return the saved object
+unchanged to the same endpoint with the same tenant header:
+
+```python
+requests.post(
+    "http://localhost:8080/v1/responses",
+    headers={"X-APC-Tenant": "my-chat"},
+    json={"stream": True, "continuation": saved_checkpoint},
+    stream=True,
+)
+```
+
+The server retains the original formatted prompt, media references, generation
+options and raw output prefix, including reasoning and tool delimiters. Resume uses that
+context and the remaining token budget; replacement messages or settings in the
+resume request are ignored. Append the returned text to the interrupted
+assistant message. Each resumed stream returns a new checkpoint, allowing
+repeated stops. Reasoning and content already delivered are suppressed, but
+partial tool arguments are replayed in full: discard the old partial tool-call
+accumulator and execute calls only after the resumed stream completes.
+
+This reconstructs generation from the saved prefix. It does not suspend the
+inference worker or preserve its KV cache, sampler/RNG state, or exact future
+tokens. Checkpoints are process-local, bounded to 32 retained streams and expire
+after 24 hours of inactivity. A restart, eviction or expired checkpoint returns
+HTTP 409; do not silently start another conversation turn. Resume uses the same
+authentication and tenant isolation as the original request.
+
+For older transcripts without a checkpoint, `"continue_final_message": true`
+continues an unfinished final assistant message using its template prefix.
+It requires a template that preserves that assistant field and cannot recover
+raw delimiters or generation settings absent from the transcript. Do not combine
+it with `continuation`.
+
 ## Conversation compaction and APC
 
 Compaction replaces older conversation turns with a model-generated handoff and

@@ -23,6 +23,7 @@ from queue import Queue
 from threading import Event, Lock, Thread, Timer
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from urllib.request import Request, urlopen
 
 import httpx2
 import mlx.core as mx
@@ -54,7 +55,7 @@ from mlx_vlm.models.gpt_oss.processing_gpt_oss import (
 from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.server import GenerationArguments as Args
 from mlx_vlm.server import ResponseGenerator as Generator
-from mlx_vlm.server import compaction, realtime
+from mlx_vlm.server import compaction, continuation, realtime
 from mlx_vlm.server.model_discovery import discover_models, is_model_directory
 from mlx_vlm.server.responses_state import (
     ToolCallStreamState,
@@ -322,6 +323,379 @@ def _chat_events(response, reason):
 
 def _assert_fields(actual, **expected):
     assert {key: actual[key] for key in expected} == expected
+
+
+class TestContinuation:
+    @pytest.fixture(autouse=True)
+    def checkpoints(self, monkeypatch):
+        monkeypatch.setattr(continuation, "CHECKPOINTS", continuation.Checkpoints())
+        monkeypatch.delenv("MLX_VLM_SERVER_API_KEY", raising=False)
+
+    @pytest.mark.parametrize("api", ["chat", "responses"])
+    @pytest.mark.parametrize("batched", [False, True])
+    @pytest.mark.parametrize("thinking", [False, True])
+    def test_resume_preserves_prompt_settings_and_parser_state(
+        self, client, api, batched, thinking
+    ):
+        first = "<think>why" if thinking else "first"
+        suffix = " next</think>answer" if thinking else " next"
+        chunks = [_token(first), _token(" ignored", finish_reason="stop")]
+        worker = _streaming(chunks) if batched else None
+        fallback = [
+            _result(t.text, generation_tokens=i + 1) for i, t in enumerate(chunks)
+        ]
+        options = {
+            "enable_thinking": thinking,
+            "temperature": 0.3,
+            "max_tokens": 50,
+            "max_output_tokens": 50,
+            "context_management": [],
+        }
+        with _endpoint(generator=worker, chunks=fallback):
+            response = _post(client, api, stream=True, resumable=True, **options)
+        assert response.headers["X-MLX-Continuation"] == "1"
+        checkpoint = next(
+            e["continuation"]
+            for e in _data(response)
+            if e.get("continuation", {}).get("cursor") == 1
+            and e["continuation"]["reasoning" if thinking else "content"]
+        )
+        worker = _streaming([_token(suffix, finish_reason="stop")]) if batched else None
+        with _endpoint(
+            generator=worker,
+            chunks=[_result(suffix, generation_tokens=1)],
+            template="CHANGED",
+        ) as fake:
+            response = _post(
+                client,
+                api,
+                stream=True,
+                continuation=checkpoint,
+                temperature=1.9,
+                messages=[_msg("RESTART")],
+                input="RESTART",
+            )
+        events = _data(response)
+        assert not any(
+            "error" in e or e.get("type") == "response.failed" for e in events
+        )
+        fake.template.assert_not_called()
+        call = worker.generate.call_args if worker else fake.stream.call_args
+        if worker:
+            prompt, _, _, args, _ = call.args
+            assert args.temperature == 0.3 and args.max_tokens == 49
+            assert args.skip_special_tokens is False
+        else:
+            prompt = call.kwargs["prompt"]
+            assert call.kwargs["temperature"] == 0.3 and call.kwargs["max_tokens"] == 49
+            assert call.kwargs["skip_special_tokens"] is False
+        assert prompt == "prompt" + first
+        if api == "responses":
+            final = _completed_response(response)
+            assert final["output_text"] == ("answer" if thinking else " next")
+        else:
+            deltas = _deltas(response)
+            assert "".join(d.get("content") or "" for d in deltas) == (
+                "answer" if thinking else " next"
+            )
+            if thinking:
+                assert "".join(d.get("reasoning") or "" for d in deltas) == " next"
+                assert (
+                    "".join(d.get("reasoning_content") or "" for d in deltas) == " next"
+                )
+        final_checkpoint = events[-1]["continuation"]
+        assert final_checkpoint["id"] != checkpoint["id"]
+        assert final_checkpoint["cursor"] == 2
+        assert final_checkpoint["reasoning"] == (len("why next") if thinking else 0)
+
+    @pytest.mark.parametrize("api", ["chat", "responses"])
+    def test_partial_tool_arguments_replay_without_duplicate_prose(self, client, api):
+        prefix = 'checking<tool_call>{"name":"get_weather","arguments":{"city":"'
+        suffix = 'Warsaw"}}</tool_call>'
+        with _endpoint(
+            generator=_streaming(
+                [_token(prefix), _token(suffix, finish_reason="stop")]
+            ),
+            parser=_JSON_TOOLS,
+        ):
+            events = _data(
+                _post(client, api, stream=True, resumable=True, tools=[_tool()])
+            )
+        checkpoint = next(
+            e["continuation"]
+            for e in events
+            if e.get("continuation", {}).get("cursor") == 1
+            and e["continuation"]["content"]
+        )
+        with _endpoint(
+            generator=_streaming([_token(suffix, finish_reason="stop")]),
+            parser=_JSON_TOOLS,
+        ):
+            response = _post(client, api, stream=True, continuation=checkpoint)
+        if api == "responses":
+            result = _completed_response(response)
+            calls = [i for i in result["output"] if i["type"] == "function_call"]
+            assert result["output_text"] == ""
+            assert len(calls) == 1
+            assert json.loads(calls[0]["arguments"]) == {"city": "Warsaw"}
+        else:
+            deltas = _deltas(response)
+            assert "".join(d.get("content") or "" for d in deltas) == ""
+            arguments = "".join(
+                c["function"].get("arguments", "")
+                for d in deltas
+                for c in d.get("tool_calls") or []
+            )
+            assert json.loads(arguments) == {"city": "Warsaw"}
+
+    def test_media_and_token_budget_belong_to_saved_generation(self):
+        args = Args(max_tokens=20, temperature=0.2)
+        record = continuation.Generation(
+            {},
+            "tenant",
+            "/responses",
+            prompt="prompt",
+            args=args,
+            images=["image"],
+            audio=["audio"],
+            videos=["video"],
+            parts=["raw"],
+            token_counts=[3],
+        )
+        state = continuation.StreamState(record, {"content": 3})
+        token = continuation.ACTIVE.set(state)
+        try:
+            prompt, images, audio, resumed, videos = continuation.prepare_generation(
+                "new", [], [], Args(), []
+            )
+        finally:
+            continuation.ACTIVE.reset(token)
+        assert (prompt, images, audio, videos) == (
+            "promptraw",
+            ["image"],
+            ["audio"],
+            ["video"],
+        )
+        assert resumed.max_tokens == 17 and args.max_tokens == 20
+        assert resumed.temperature == 0.2
+
+    @pytest.mark.parametrize(
+        "failure",
+        ["missing", "tenant", "endpoint", "expired", "evicted", "cursor", "offset"],
+    )
+    def test_invalid_checkpoint_fails_without_generation(self, client, failure):
+        store = continuation.CHECKPOINTS
+        record = continuation.Generation(
+            {}, "tenant", "/v1/responses", prompt="prompt", parts=["raw"]
+        )
+        store.add(record)
+        checkpoint = {
+            "id": record.id,
+            "cursor": 1,
+            "content": 3,
+            "reasoning": 0,
+            "responses": True,
+        }
+        if failure == "missing":
+            checkpoint["id"] = "missing"
+        elif failure == "tenant":
+            record.tenant = "another"
+        elif failure == "endpoint":
+            record.path = "/v1/chat/completions"
+        elif failure == "expired":
+            record.touched -= store.ttl + 1
+        elif failure == "evicted":
+            store.capacity = 1
+            store.add(continuation.Generation({}, "tenant", "/v1/responses"))
+        elif failure == "cursor":
+            checkpoint["cursor"] = 2
+        else:
+            checkpoint["content"] = 4
+        with _endpoint() as fake:
+            response = client.post(
+                "/v1/responses",
+                json={"stream": True, "continuation": checkpoint},
+                headers={"X-APC-Tenant": "tenant"},
+            )
+        assert response.status_code == 409
+        fake.cache.assert_not_called()
+
+    def test_authentication_precedes_checkpoint_lookup(self, client, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_SERVER_API_KEY", "secret")
+        with patch.object(continuation.CHECKPOINTS, "resume") as resume:
+            response = _post(
+                client,
+                "responses",
+                stream=True,
+                continuation={
+                    "id": "missing",
+                    "cursor": 0,
+                    "content": 0,
+                    "reasoning": 0,
+                    "responses": True,
+                },
+            )
+        assert response.status_code == 401
+        resume.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"resumable": True, "stream": False},
+            {"stream": True, "continuation": {"id": "bad", "cursor": -1}},
+            {"stream": True, "continuation": {"id": "bad", "cursor": True}},
+        ],
+    )
+    def test_options_are_validated(self, client, payload):
+        assert _post(client, "responses", **payload).status_code == 400
+
+    def test_normal_stream_has_no_continuation_state(self, client):
+        response = _stream_response(client, [_token("ordinary", finish_reason="stop")])
+        assert "X-MLX-Continuation" not in response.headers
+        assert all("continuation" not in e for e in _data(response))
+        assert not continuation.CHECKPOINTS.records
+
+
+@pytest.mark.skipif(
+    not os.environ.get("MLX_VLM_CONTINUATION_URL"),
+    reason="Set MLX_VLM_CONTINUATION_URL for real-model coverage",
+)
+class TestContinuationLive:
+    """Run against a native server with MLX_VLM_CONTINUATION_MODEL loaded."""
+
+    def stream(self, path, body, stop=None):
+        result = {"content": "", "reasoning": "", "arguments": "", "checkpoint": None}
+        request = Request(
+            os.environ["MLX_VLM_CONTINUATION_URL"] + path,
+            data=json.dumps(body).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "X-APC-Tenant": "resumption-test",
+            },
+        )
+        with urlopen(request, timeout=120) as response:
+            for line in response:
+                if not line.startswith(b"data:") or line[5:].strip() == b"[DONE]":
+                    continue
+                event = json.loads(line[5:])
+                assert (
+                    "error" not in event and event.get("type") != "response.failed"
+                ), event
+                if "continuation" in event:
+                    result["checkpoint"] = event["continuation"]
+                for choice in event.get("choices", []):
+                    delta = choice.get("delta", {})
+                    result["content"] += delta.get("content") or ""
+                    result["reasoning"] += (
+                        delta.get("reasoning") or delta.get("reasoning_content") or ""
+                    )
+                    for call in delta.get("tool_calls") or []:
+                        result["arguments"] += (
+                            call.get("function", {}).get("arguments") or ""
+                        )
+                kind = event.get("type")
+                if kind == "response.output_text.delta":
+                    result["content"] += event["delta"]
+                if kind == "response.reasoning_text.delta":
+                    result["reasoning"] += event["delta"]
+                if kind == "response.function_call_arguments.delta":
+                    result["arguments"] += event["delta"]
+                if stop and stop(result):
+                    assert result["checkpoint"] is not None
+                    break
+        return result
+
+    def body(self, path, thinking=False, tools=False):
+        prompt = "Write the numbers from 1 to 40 separated by commas. No other text."
+        if thinking:
+            prompt = "Find the smallest positive integer divisible by 18, 24, and 35. Explain the calculation."
+        if tools:
+            prompt = "Call record_note with exactly this text: The quick brown fox jumps over the lazy dog and then walks home."
+        body = {
+            "model": os.environ.get("MLX_VLM_CONTINUATION_MODEL", "LiquidAI/LFM3-1.7B"),
+            "stream": True,
+            "temperature": 0,
+            "enable_thinking": thinking,
+            "resumable": True,
+        }
+        body["input" if path.endswith("responses") else "messages"] = [
+            {"role": "user", "content": prompt}
+        ]
+        body["max_output_tokens" if path.endswith("responses") else "max_tokens"] = (
+            2048 if thinking else 512
+        )
+        if tools:
+            definition = {
+                "name": "record_note",
+                "description": "Record a note.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                    "required": ["text"],
+                },
+            }
+            body["tools"] = [
+                (
+                    {"type": "function", **definition}
+                    if path.endswith("responses")
+                    else {"type": "function", "function": definition}
+                )
+            ]
+        return body
+
+    @pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/responses"])
+    @pytest.mark.parametrize("thinking", [False, True])
+    def test_repeated_stop_resume_matches_uninterrupted(self, path, thinking):
+        body = self.body(path, thinking=thinking)
+        baseline = self.stream(path, body)
+        first = self.stream(
+            path, body, lambda r: len(r["reasoning"] if thinking else r["content"]) > 40
+        )
+        resumed_body = {**body, "continuation": first["checkpoint"]}
+        resumed_body["input" if path.endswith("responses") else "messages"] = [
+            _msg("Ignore the original task and say restart.")
+        ]
+        second = self.stream(
+            path, resumed_body, lambda r: len(r["content"] + r["reasoning"]) > 30
+        )
+        third = self.stream(path, {**body, "continuation": second["checkpoint"]})
+        for key in ("content", "reasoning"):
+            assert first[key] + second[key] + third[key] == baseline[key]
+
+    @pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/responses"])
+    def test_partial_tool_call_resumes_as_one_complete_call(self, path):
+        body = self.body(path, tools=True)
+        baseline = self.stream(path, body)
+        first = self.stream(path, body, lambda r: len(r["arguments"]) > 15)
+        assert first["arguments"]
+        resumed = self.stream(path, {**body, "continuation": first["checkpoint"]})
+        assert json.loads(resumed["arguments"]) == json.loads(baseline["arguments"])
+
+    @pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/responses"])
+    def test_legacy_open_message_continues_without_a_new_turn(self, path):
+        body = self.body(path)
+        key = "input" if path.endswith("responses") else "messages"
+        body[key].append(_msg("1, 2, 3, 4,", "assistant"))
+        body["continue_final_message"] = True
+        result = self.stream(path, body)
+        assert result["content"].startswith(" 5, 6, 7,"), result
+
+    def test_deferred_context_keeps_original_prompt(self):
+        path = "/v1/responses"
+        body = self.body(path)
+        body["context_management"] = [{"type": "compaction", "compact_threshold": 4096}]
+        body["transient_context"] = "Current environment: this is a counting exercise."
+        baseline = self.stream(path, body)
+        first = self.stream(path, body, lambda r: len(r["content"]) > 40)
+        resumed = self.stream(
+            path,
+            {
+                **body,
+                "continuation": first["checkpoint"],
+                "transient_context": "A new instruction: say RESTART instead.",
+            },
+        )
+        assert first["content"] + resumed["content"] == baseline["content"]
 
 
 class TestImageProcessingOptions:

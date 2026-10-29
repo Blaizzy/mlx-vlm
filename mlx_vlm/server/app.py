@@ -30,6 +30,7 @@ from ..vision_cache import VisionFeatureCache
 from . import request_normalization as _request_normalization
 from .anthropic import register_routes as register_anthropic_routes
 from .audio import register_routes as register_audio_routes
+from .continuation import ContinuationMiddleware
 from .decisions import register_routes as register_decision_routes
 from .embeddings import register_routes as register_embeddings_routes
 from .generation import (
@@ -506,6 +507,12 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-MLX-Continuation"],
+)
+app.add_middleware(
+    ContinuationMiddleware,
+    authenticate=_require_management_api_key,
+    read_tenant=_read_tenant_id,
 )
 
 MAX_IMAGES = 10  # Maximum number of images to process at once
