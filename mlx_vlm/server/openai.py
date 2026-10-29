@@ -1442,10 +1442,10 @@ async def responses_endpoint(request: Request):
                             token = await asyncio.to_thread(_next_token_resp_stream)
                             if token is None:
                                 break
-                            output_tokens += getattr(token, "token_count", 1)
                             raw_delta = token.text
                             full_text += raw_delta
                             chunk_rate = metrics.record_chunk(token)
+                            output_tokens = metrics.generated_tokens
                             thinking_delta = thinking_state.feed(
                                 raw_delta, last=bool(token.finish_reason)
                             )
@@ -1656,6 +1656,11 @@ async def responses_endpoint(request: Request):
                         token_times=metrics.token_times,
                         prompt_tps=metrics.prompt_tps,
                         generation_tps=metrics.generation_tps,
+                        decode_elapsed_s=(
+                            metrics.decode_progress.elapsed
+                            if metrics.decode_progress is not None
+                            else None
+                        ),
                         peak_memory_gb=metrics.peak_memory or None,
                         finish_reason=finish_reason,
                         image_count=len(images),
@@ -2215,9 +2220,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             token = await asyncio.to_thread(_next_token)
                             if token is None:
                                 break
-                            output_tokens += getattr(token, "token_count", 1)
                             full_output += token.text
                             chunk_rate = metrics.record_chunk(token)
+                            output_tokens = metrics.generated_tokens
 
                             # Detect thinking boundaries
                             thinking_delta = thinking_state.feed(
@@ -2537,6 +2542,11 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         token_times=metrics.token_times,
                         prompt_tps=metrics.prompt_tps,
                         generation_tps=metrics.generation_tps,
+                        decode_elapsed_s=(
+                            metrics.decode_progress.elapsed
+                            if metrics.decode_progress is not None
+                            else None
+                        ),
                         peak_memory_gb=metrics.peak_memory or None,
                         finish_reason=finish_reason,
                         image_count=len(images),

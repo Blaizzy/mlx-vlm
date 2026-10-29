@@ -43,6 +43,7 @@ import mlx_vlm.server.cli as cli
 import mlx_vlm.server.generation as generation
 import mlx_vlm.server.openai as openai
 import mlx_vlm.server.reranking as reranking
+import mlx_vlm.server.sessions as sessions
 from mlx_vlm import apc
 from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.generate import GenerationResult
@@ -343,7 +344,63 @@ def _assert_fields(actual, **expected):
     assert {key: actual[key] for key in expected} == expected
 
 
+@pytest.fixture
+def session_clock(monkeypatch):
+    clock = NS(now=100.0)
+    monkeypatch.setattr(
+        sessions,
+        "time",
+        NS(perf_counter=lambda: clock.now, monotonic=time.monotonic),
+    )
+    return clock
+
+
 class TestInferenceSession:
+    def test_decode_metrics_exclude_pauses_replay_and_peer_work(self, session_clock):
+        session = sessions.InferenceSession()
+
+        def emit(count, duration, finish=None):
+            with session.generating():
+                session_clock.now += duration
+                session.put(_token("text", token_count=count, finish_reason=finish))
+
+        emit(2, 20)  # Prefill and the first block are outside decode timing.
+        emit(3, 0.3)  # Produced ahead of the client's acknowledged first block.
+        first = session.reader()
+        assert next(first).decode_progress.rate is None
+        first.close()
+        session_clock.now += 120  # User pause, including work for another request.
+        resumed = session.reader(1, session.claim())
+        metrics = generation.GenerationMetrics()
+        assert metrics.record_chunk(next(resumed)) == pytest.approx(10)
+        assert metrics.rate == pytest.approx(10)
+        session_clock.now += 30  # Reading/replaying does not consume GPU time.
+        emit(1, 0.1)
+        assert metrics.record_chunk(next(resumed)) == pytest.approx(10)
+        resumed.close()
+        session_clock.now += 60
+        resumed = session.reader(3, session.claim())
+        emit(0, 0.5, "stop")  # Text finalization cannot inflate the token count.
+        assert metrics.record_chunk(next(resumed)) is None
+        assert metrics.generated_tokens == 6
+        assert metrics.rate == pytest.approx(10)
+        assert metrics.decode_progress.elapsed == pytest.approx(0.4)
+
+    def test_stop_during_a_step_counts_its_remaining_work(self, session_clock):
+        session = sessions.InferenceSession()
+        with session.generating():
+            session_clock.now += 20
+            session.put(_token("first"))
+        with session.generating():
+            session_clock.now += 0.04
+            session.pause(0)
+            session_clock.now += 0.06
+            session.put(_token("in flight"))
+        session_clock.now += 300
+        token = next(session.reader(1, session.claim()))
+        assert token.decode_progress.elapsed == pytest.approx(0.1)
+        assert token.decode_progress.rate == pytest.approx(10)
+
     def test_server_ahead_output_is_replayed_before_new_tokens(self):
         session = continuation.InferenceSession()
         first = session.reader()
@@ -459,6 +516,59 @@ class TestContinuation:
     def checkpoints(self, monkeypatch):
         monkeypatch.setattr(continuation, "CHECKPOINTS", continuation.Checkpoints())
         monkeypatch.delenv("MLX_VLM_SERVER_API_KEY", raising=False)
+
+    @pytest.mark.parametrize("api", ["chat", "responses"])
+    @pytest.mark.parametrize("batched", [False, True])
+    def test_resume_keeps_cumulative_producer_timings(
+        self, client, api, batched, session_clock, monkeypatch
+    ):
+        def chunks():
+            for i, text in enumerate(("one", " two", " three")):
+                session_clock.now += 20 if i == 0 else 0.1
+                finish = "stop" if i == 2 else None
+                yield (
+                    _token(text, finish_reason=finish)
+                    if batched
+                    else _result(text, generation_tokens=i + 1, finish_reason=finish)
+                )
+
+        worker = _resumable_streaming([]) if batched else None
+        if worker:
+
+            def generate(*args, session, **kwargs):
+                context = server.GenerationContext(uid=1, prompt_tokens=8)
+                iterator = chunks()
+                for _ in range(3):
+                    with session.generating():
+                        session.put(next(iterator))
+                return context, session.reader()
+
+            worker.generate.side_effect = generate
+        monkeypatch.setattr(server.runtime, "metrics", server.ServerMetricsStore())
+        options = dict(stream=True, stream_options={"include_usage": True})
+        with _endpoint(generator=worker, chunks=chunks()):
+            original = _post(client, api, resumable=True, **options)
+            checkpoint = next(
+                e["continuation"]
+                for e in _data(original)
+                if e.get("continuation", {}).get("cursor") == 1
+            )
+            session_clock.now += 120
+            resumed = _post(client, api, continuation=checkpoint, **options)
+            # Also resume a finished cursor: replay of the parser prefix alone
+            # must restore counts and rates without measuring delivery speed.
+            terminal = _data(resumed)[-1]["continuation"]
+            finished = _post(client, api, continuation=terminal, **options)
+        for response in (original, resumed, finished):
+            event = _data(response)[-1]
+            timings = event["timings"]
+            assert timings["predicted_n"] == 3
+            assert timings["predicted_per_second"] == pytest.approx(10)
+            usage = event.get("usage") or event["response"]["usage"]
+            assert usage.get("prompt_tokens", usage.get("input_tokens")) == 8
+        latest = server.runtime.metrics.snapshot()["latest"]
+        assert latest["decode_tok_s"] == pytest.approx(10)
+        assert latest["decode_elapsed_s"] == pytest.approx(0.2)
 
     @pytest.mark.parametrize("api", ["chat", "responses"])
     @pytest.mark.parametrize("batched", [False, True])
@@ -750,6 +860,9 @@ class TestContinuationLive:
                 ), event
                 if "continuation" in event:
                     result["checkpoint"] = event["continuation"]
+                timings = event.get("timings")
+                if timings and "predicted_n" in timings:
+                    result["timings"] = timings
                 for choice in event.get("choices", []):
                     delta = choice.get("delta", {})
                     result["content"] += delta.get("content") or ""
@@ -809,6 +922,35 @@ class TestContinuationLive:
                 )
             ]
         return body
+
+    @pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/responses"])
+    def test_decode_rate_and_token_count_survive_pause_and_replay(self, path):
+        body = self.body(path)
+        if path.endswith("completions"):
+            body["stream_options"] = {"include_usage": True}
+        baseline = self.stream(path, body)
+        acknowledged = []
+
+        def stop(result):
+            if len(result["content"]) > 20 and not acknowledged:
+                acknowledged.append(copy.deepcopy(result))
+            # Leave some already-generated output beyond the acknowledged cursor.
+            return len(result["content"]) > 70
+
+        self.stream(path, body, stop)
+        first = acknowledged[0]
+        time.sleep(3)
+        resumed = self.stream(path, {**body, "continuation": first["checkpoint"]})
+        assert first["content"] + resumed["content"] == baseline["content"]
+        before, after = baseline["timings"], resumed["timings"]
+        print(f"{path}: before={before}, resumed={after}")
+        assert after["predicted_n"] == before["predicted_n"]
+        assert after["predicted_per_second"] > 0.6 * before["predicted_per_second"]
+        replayed = self.stream(path, {**body, "continuation": resumed["checkpoint"]})
+        assert replayed["timings"]["predicted_n"] == after["predicted_n"]
+        assert (
+            replayed["timings"]["predicted_per_second"] == after["predicted_per_second"]
+        )
 
     @pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/responses"])
     @pytest.mark.parametrize("thinking", [False, True])

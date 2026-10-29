@@ -52,7 +52,7 @@ from ..tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
 from ..utils import ThinkingBudgetCriteria, load, prepare_inputs, resolve_eos_token_ids
 from ..vision_cache import processed_image_key
 from .runtime import runtime
-from .sessions import InferenceSession
+from .sessions import DecodeProgress, InferenceSession
 
 logger = logging.getLogger("mlx_vlm.server")
 
@@ -530,6 +530,7 @@ def _build_metrics_envelope(
     token_times: Optional[List[float]] = None,
     prompt_tps: Optional[float] = None,
     generation_tps: Optional[float] = None,
+    decode_elapsed_s: Optional[float] = None,
     peak_memory_gb: Optional[float] = None,
     finish_reason: Optional[str] = None,
     image_count: int = 0,
@@ -541,9 +542,10 @@ def _build_metrics_envelope(
 ) -> dict:
     token_times = token_times or []
     ttft_s = max(0.0, token_times[0] - request_started_s) if token_times else None
-    decode_elapsed_s = _decode_elapsed_from_metrics(
-        token_times, generated_tokens, generation_tps
-    )
+    if decode_elapsed_s is None:
+        decode_elapsed_s = _decode_elapsed_from_metrics(
+            token_times, generated_tokens, generation_tps
+        )
     decode_tok_s = None
     if generation_tps is not None and generation_tps > 0:
         decode_tok_s = generation_tps
@@ -821,6 +823,7 @@ class GenerationMetrics:
     last_chunk_rate: Optional[float] = None
     generated_tokens: int = 0
     first_chunk_tokens: int = 0
+    decode_progress: Optional[DecodeProgress] = None
     draft_kind: Optional[str] = None
     draft_rounds: Optional[int] = None
     draft_n_accepted: Optional[int] = None
@@ -846,11 +849,18 @@ class GenerationMetrics:
                 self.last_chunk_rate = emitted_tokens / (now - self.last_chunk_at)
             self.last_chunk_at = now
             self.token_times.append(now)
+        progress = getattr(chunk, "decode_progress", None)
+        if progress is not None:
+            self.decode_progress = progress
+            self.generated_tokens = progress.tokens
+            self.last_chunk_rate = progress.chunk_rate if emitted_tokens else None
         self.record_result(chunk)
         return self.last_chunk_rate
 
     @property
     def rate(self) -> Optional[float]:
+        if self.decode_progress is not None:
+            return self.decode_progress.rate
         if len(self.token_times) < 2:
             return None
         elapsed = self.token_times[-1] - self.token_times[0]
@@ -1456,7 +1466,13 @@ class ResponseGenerator:
         finish_reason: Optional[str],
         token_count: int = 1,
     ) -> float:
-        now = time.perf_counter()
+        emitted_at = time.perf_counter()
+        session = info.get("rqueue")
+        now = (
+            session.generation_time
+            if isinstance(session, InferenceSession)
+            else emitted_at
+        )
         previous_tokens = int(info.get("generated_tokens", 0) or 0)
         emitted_tokens = max(0, int(token_count or 0))
         generated_tokens = previous_tokens + emitted_tokens
@@ -1479,7 +1495,7 @@ class ResponseGenerator:
             logger.info(
                 "Decode started: request=%s time_to_first_token=%.3fs",
                 request_id,
-                max(0.0, now - queued_at),
+                max(0.0, emitted_at - queued_at),
             )
 
         elapsed = max(0.0, now - decode_started_at)
@@ -1526,7 +1542,7 @@ class ResponseGenerator:
                 elapsed,
                 progress_rate_text,
             )
-        return now
+        return emitted_at
 
     def _make_sampler(self, args: GenerationArguments) -> Optional[Callable]:
         if args.temperature == 0:
@@ -1921,7 +1937,8 @@ class ResponseGenerator:
             try:
                 session.check()
                 if not session.paused and active:
-                    self._step(engine, active)
+                    with session.generating():
+                        self._step(engine, active)
                 if active:
                     continue
             except Exception as error:

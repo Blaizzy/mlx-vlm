@@ -80,6 +80,11 @@ replays any output generated ahead of the client's acknowledged cursor, then
 continues the same decoder without tokenizing or prefilling again. Replacement
 messages and settings are ignored; the original token budget still applies.
 
+Output token counts and decode throughput remain cumulative across resumes.
+Decode timing measures producer work after the first token, excluding paused
+time, replay delivery, and work on other requests. Buffered tokens keep their
+original measurements; receiving them quickly does not inflate the decode rate.
+
 Append the returned text to the interrupted assistant message. Reasoning and
 content already delivered are suppressed, but partial tool arguments are
 replayed in full: discard the old partial tool-call accumulator and execute
