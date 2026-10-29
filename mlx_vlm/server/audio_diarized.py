@@ -1,7 +1,7 @@
 """Diarized file transcription with finalized OpenAI SSE segment events.
 
-Inference windows are independent of speaker turns. A single diarization stream
-owns all speaker IDs; overlapping ASR windows are aligned before publication.
+A single diarization stream owns all speaker IDs. Word-timed ASR uses aligned
+overlapping windows; text-only ASR uses contextual windows timed by diarization.
 """
 
 import json
@@ -200,7 +200,7 @@ class Word:
 
 
 def aligned_words(result, duration):
-    """Normalize Parakeet token pieces or explicit word timestamps, never guess."""
+    """Normalize aligned words, or return None for text-only output; never guess."""
     from .audio import _stt_item_to_dict
 
     result = _stt_item_to_dict(result)
@@ -216,6 +216,12 @@ def aligned_words(result, duration):
             for sentence in result["sentences"]
             for token in sentence.get("tokens", [])
         ]
+    # Some text-only models expose token IDs or counts, without token timing.
+    if tokens and (
+        not isinstance(tokens, (list, tuple))
+        or all(not isinstance(token, dict) or "start" not in token for token in tokens)
+    ):
+        tokens = None
     words = []
     if tokens:
         for token in tokens:
@@ -236,9 +242,7 @@ def aligned_words(result, duration):
             for w in result["words"]
         ]
     elif text:
-        raise ValueError(
-            "diarized_json requires a model with word timestamps (for example Parakeet)"
-        )
+        return None
     words = [Word(w.text.strip(), w.start, w.end) for w in words if w.text.strip()]
     cursor, previous = 0, -1.0
     for i, word in enumerate(words):
@@ -367,6 +371,162 @@ def speaker_label(index):
     return label
 
 
+@dataclass
+class SpeakerWindow:
+    start: float
+    end: float
+    speakers: list[int]
+
+
+def speaker_windows(segments):
+    """Keep speaker context across <=2s pauses, with <=30s nonoverlapping audio."""
+    events = {}
+    for segment in segments:
+        start, end = round(segment["start"] * SAMPLE_RATE), round(
+            segment["end"] * SAMPLE_RATE
+        )
+        if end <= start:
+            continue
+        events.setdefault(start, []).append((segment["speaker"], 1))
+        events.setdefault(end, []).append((segment["speaker"], -1))
+    turns, active, previous = [], {}, None
+    for sample in sorted(events):
+        speakers = sorted(active)
+        if previous is not None and sample > previous and speakers:
+            start, end = previous / SAMPLE_RATE, sample / SAMPLE_RATE
+            if turns and turns[-1].end == start and turns[-1].speakers == speakers:
+                turns[-1].end = end
+            else:
+                turns.append(SpeakerWindow(start, end, speakers))
+        for speaker, delta in events[sample]:
+            count = active.get(speaker, 0) + delta
+            if count:
+                active[speaker] = count
+            else:
+                active.pop(speaker)
+        previous = sample
+    windows = []
+    for turn in turns:
+        start = turn.start
+        while start < turn.end:
+            end = min(turn.end, start + 30)
+            windows.append(SpeakerWindow(start, end, turn.speakers))
+            start = end
+
+    def can_join(first, last):
+        return last.start - first.end <= 2 and last.end - first.start <= 30
+
+    def join(lower, upper):
+        windows[lower : upper + 1] = [
+            SpeakerWindow(
+                windows[lower].start,
+                windows[upper].end,
+                sorted({s for w in windows[lower : upper + 1] for s in w.speakers}),
+            )
+        ]
+
+    index = 0
+    while index < len(windows):
+        window = windows[index]
+        if window.end - window.start >= 1:
+            index += 1
+            continue
+        before, after = index - 1, index + 1
+        if (
+            before >= 0
+            and after < len(windows)
+            and windows[before].speakers == windows[after].speakers
+            and can_join(windows[before], window)
+            and can_join(window, windows[after])
+            and windows[after].end - windows[before].start <= 30
+        ):
+            join(before, after)
+            index = max(0, before - 1)
+            continue
+        neighbors = [
+            i
+            for i in (before, after)
+            if 0 <= i < len(windows)
+            and can_join(windows[min(i, index)], windows[max(i, index)])
+        ]
+        if neighbors:
+            neighbor = max(
+                neighbors,
+                key=lambda i: (
+                    bool(set(window.speakers) & set(windows[i].speakers)),
+                    windows[i].end - windows[i].start,
+                ),
+            )
+            lower = min(index, neighbor)
+            join(lower, max(index, neighbor))
+            index = max(0, lower - 1)
+        else:
+            index += 1
+    # Fold short interruptions before joining longer stretches across pauses,
+    # so a later stretch cannot consume the context needed on either side.
+    grouped = []
+    for window in windows:
+        if (
+            grouped
+            and grouped[-1].speakers == window.speakers
+            and can_join(grouped[-1], window)
+        ):
+            grouped[-1].end = window.end
+        else:
+            grouped.append(window)
+    return grouped
+
+
+def segment_event(turn, index, labels, include_diarization):
+    ids = turn["speakers"]
+    event = {
+        "type": "transcript.text.segment",
+        "id": f"seg_{index:06d}",
+        **{key: value for key, value in turn.items() if key != "speakers"},
+        "speaker": labels[ids[0]] if ids else "unknown",
+    }
+    if include_diarization:
+        event["speakers"] = [labels[s] for s in ids]
+    return event
+
+
+def transcribe_speaker_windows(
+    request, segments, labels, transcribe, first_window, first_result
+):
+    """Attach existing diarization timing to text without inventing word times."""
+    from .audio import _stt_item_to_dict
+
+    text_parts = []
+    for window in speaker_windows(segments):
+        request.check_cancelled()
+        if (window.start, window.end) == (
+            first_window.audio_start,
+            first_window.audio_end,
+        ):
+            result = first_result
+        else:
+            result = transcribe(window.start, window.end)
+        text = _stt_item_to_dict(result).get("text", "").strip()
+        if not text:
+            continue
+        request.check_cancelled()
+        request.emit_data(
+            segment_event(
+                {
+                    "start": window.start,
+                    "end": window.end,
+                    "text": text,
+                    "speakers": window.speakers,
+                },
+                len(text_parts),
+                labels,
+                request.payload.include_diarization,
+            )
+        )
+        text_parts.append(text)
+    return " ".join(text_parts)
+
+
 def run_request(request, get_cached_model):
     from scipy.io.wavfile import write
 
@@ -403,11 +563,10 @@ def run_request(request, get_cached_model):
         model, _, _ = get_cached_model(request.model_name, model_kind="audio_stt")
     with tempfile.TemporaryDirectory() as directory:
         path = f"{directory}/chunk.wav"
-        for index, window in enumerate(windows):
+
+        def transcribe(start, end):
             request.check_cancelled()
-            start, end = round(window.audio_start * SAMPLE_RATE), round(
-                window.audio_end * SAMPLE_RATE
-            )
+            start, end = round(start * SAMPLE_RATE), round(end * SAMPLE_RATE)
             samples = payload.read_window(start, end).copy()
             if len(samples) < 512:
                 samples = np.pad(samples, (0, 512 - len(samples)))
@@ -419,7 +578,22 @@ def run_request(request, get_cached_model):
             )
             result = model.generate(path, **kwargs)
             request.check_cancelled()
+            return result
+
+        for index, window in enumerate(windows):
+            result = transcribe(window.audio_start, window.audio_end)
             incoming = aligned_words(result, window.audio_end - window.audio_start)
+            if incoming is None:
+                if segment_count or words:
+                    raise ValueError(
+                        "The transcription model stopped returning word timestamps"
+                    )
+                text_parts = [
+                    transcribe_speaker_windows(
+                        request, segments, labels, transcribe, window, result
+                    )
+                ]
+                break
             for word in incoming:
                 word.start = min(
                     window.audio_end - 1 / SAMPLE_RATE, window.audio_start + word.start
@@ -461,16 +635,11 @@ def run_request(request, get_cached_model):
                         }
                     )
             for turn in turns:
-                ids = turn.pop("speakers")
-                event = {
-                    "type": "transcript.text.segment",
-                    "id": f"seg_{segment_count:06d}",
-                    **turn,
-                    "speaker": labels[ids[0]] if ids else "unknown",
-                }
-                if payload.include_diarization:
-                    event["speakers"] = [labels[s] for s in ids]
-                request.emit_data(event)
+                request.emit_data(
+                    segment_event(
+                        turn, segment_count, labels, payload.include_diarization
+                    )
+                )
                 segment_count += 1
             # Published words cannot participate in the next overlap. Release
             # them so alignment work and retained timings stay window-sized.

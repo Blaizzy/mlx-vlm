@@ -8126,8 +8126,15 @@ def test_diarized_unsupported_options_are_explicit(audio_client, monkeypatch, fi
     loader.assert_not_called()
 
 
-def test_diarized_model_without_word_timing_fails_in_stream(audio_client, monkeypatch):
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("include", [False, True])
+def test_diarized_text_only_model_uses_speaker_timing(
+    audio_client, monkeypatch, stream, include
+):
+    calls = []
+
     def loader(name, **kwargs):
+        calls.append((name, kwargs["model_kind"]))
         if kwargs["model_kind"] == "audio_diarization":
             return (
                 NS(
@@ -8138,22 +8145,194 @@ def test_diarized_model_without_word_timing_fails_in_stream(audio_client, monkey
                 None,
                 None,
             )
-        return NS(generate=lambda *a, **k: {"text": "untimed words"}), None, None
+        assert name == "selected-text-model"
+        return (
+            NS(generate=lambda *a, **k: {"text": "untimed words", "tokens": [1, 2]}),
+            None,
+            None,
+        )
 
     monkeypatch.setattr(server, "get_cached_model", loader)
     response = _speaker_upload(
         audio_client,
         "transcriptions",
-        model="test",
+        model="selected-text-model",
         response_format="diarized_json",
-        stream="true",
+        stream=str(stream).lower(),
+        **({"include[]": "diarization"} if include else {}),
     )
-    events = [
-        json.loads(s[6:]) for s in response.text.splitlines() if s.startswith("data: ")
+    assert response.status_code == 200
+    if stream:
+        events = [
+            json.loads(s[6:])
+            for s in response.text.splitlines()
+            if s.startswith("data: ")
+        ]
+        assert not any(e["type"] == "error" for e in events)
+        result = events[-1]
+        assert result["type"] == "transcript.text.done"
+        turns = [e for e in events if e["type"] == "transcript.text.segment"]
+        if include:
+            assert events[0]["type"] == "diarization.completed"
+    else:
+        result = response.json()
+        turns = result["segments"]
+    assert result["text"] == "untimed words"
+    assert len(turns) == 1
+    assert (turns[0]["start"], turns[0]["end"], turns[0]["speaker"]) == (0, 3, "A")
+    assert ("diarization" in result) == include
+    assert ("speakers" in turns[0]) == include
+    assert [kind for _, kind in calls] == ["audio_diarization", "audio_stt"]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_diarized_text_windows_preserve_pcm_context_speakers_and_options(
+    audio_client, monkeypatch, stream
+):
+    from scipy.io.wavfile import read
+
+    samples = np.linspace(0.1, 0.9, 40 * 16000, dtype="<f4")
+    intervals = [(0, 3, 7), (3.3, 8, 7), (4, 4.2, 2), (10, 33, 7), (38, 39, 2)]
+    actual, diarizations = [], []
+
+    def diarize(chunks, sample_rate):
+        diarizations.append(sum(len(chunk) for chunk in chunks))
+        yield NS(segments=[NS(start=s, end=e, speaker=p) for s, e, p in intervals])
+
+    def transcribe(path, **kwargs):
+        rate, pcm = read(path)
+        assert rate == 16000
+        assert kwargs["language"] == "en" and kwargs["context"] == "names"
+        actual.append(pcm)
+        return {"text": f"window {len(actual)}"}
+
+    def loader(name, **kwargs):
+        if kwargs["model_kind"] == "audio_diarization":
+            return NS(generate_stream=diarize), None, None
+        assert name == "selected-text-model"
+        return NS(generate=transcribe), None, None
+
+    monkeypatch.setattr(server, "get_cached_model", loader)
+    response = _speaker_upload(
+        audio_client,
+        "transcriptions",
+        samples,
+        model="selected-text-model",
+        response_format="diarized_json",
+        language="en",
+        prompt="names",
+        stream=str(stream).lower(),
+        **{"include[]": "diarization"},
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        events = [
+            json.loads(s[6:])
+            for s in response.text.splitlines()
+            if s.startswith("data: ")
+        ]
+        result = events[-1]
+        assert result["type"] == "transcript.text.done"
+        turns = [e for e in events if e["type"] == "transcript.text.segment"]
+    else:
+        result = response.json()
+        turns = result["segments"]
+    assert diarizations == [len(samples)]
+    assert [(t["start"], t["end"], t["speakers"]) for t in turns] == [
+        (0, 8, ["A", "B"]),
+        (10, 33, ["B"]),
+        (38, 39, ["A"]),
     ]
-    assert events[-1]["type"] == "error"
-    assert "word timestamps" in events[-1]["error"]["message"]
-    assert not any(e["type"] == "transcript.text.done" for e in events)
+    assert result["text"] == "window 2 window 3 window 4"
+    for pcm, turn in zip(actual[1:], turns, strict=True):
+        np.testing.assert_array_equal(
+            pcm, samples[round(turn["start"] * 16000) : round(turn["end"] * 16000)]
+        )
+    assert result["diarization"]["segments"] == [
+        dict(start=s, end=e, speaker=p) for s, e, p in intervals
+    ]
+
+
+@pytest.mark.parametrize(
+    "intervals, expected",
+    [
+        (
+            [(0, 1.5, 0), (1.8, 2.3, 0), (3, 5, 0), (5.2, 29, 0), (29.3, 34, 0)],
+            [(0, 29, [0]), (29.3, 34, [0])],
+        ),
+        (
+            [(0, 30, 0), (30, 30.2, 1), (30.2, 33, 0), (40, 40.5, 1)],
+            [(0, 30, [0]), (30, 33, [0, 1]), (40, 40.5, [1])],
+        ),
+    ],
+)
+def test_diarized_speaker_windows_keep_context_without_crossing_limits(
+    intervals, expected
+):
+    from mlx_vlm.server.audio_diarized import speaker_windows
+
+    windows = speaker_windows(
+        [dict(start=s, end=e, speaker=p) for s, e, p in intervals]
+    )
+    assert [(w.start, w.end, w.speakers) for w in windows] == expected
+
+
+@pytest.mark.parametrize("outcome", ["empty", "cancelled", "failed"])
+def test_diarized_text_only_windows_skip_empty_and_propagate_failure(
+    monkeypatch, outcome
+):
+    from mlx_vlm.server import audio_diarized as pipeline
+
+    monkeypatch.setattr(
+        pipeline,
+        "diarize_segments",
+        lambda *args: [
+            {"start": 1, "end": 3, "speaker": 0},
+            {"start": 7, "end": 9, "speaker": 1},
+        ],
+    )
+    request = server_audio.AudioInferenceRequest(
+        kind="diarized_stt",
+        model_name="test-stt",
+        payload=NS(
+            sample_count=10 * 16000,
+            revision=None,
+            diarization_model="test-diarization",
+            include_diarization=True,
+            transcription=server_audio.AudioTranscriptionRequest(model="test-stt"),
+            chunks=lambda check: [],
+            read_window=lambda start, end: np.zeros(end - start, dtype="<f4"),
+        ),
+    )
+    events, calls = [], []
+    request.emit_data = events.append
+
+    def transcribe(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            if outcome == "cancelled":
+                request.cancel_event.set()
+            if outcome == "failed":
+                raise RuntimeError("ASR failed")
+            return {"text": "  "}
+        return {"text": "Hello"}
+
+    def run():
+        pipeline.run_request(
+            request, lambda *a, **kw: (NS(generate=transcribe), None, None)
+        )
+
+    if outcome == "empty":
+        run()
+        assert events[-1]["type"] == "transcript.text.done"
+        assert events[-1]["text"] == "Hello"
+        segments = [e for e in events if e["type"] == "transcript.text.segment"]
+        assert [(s["start"], s["end"]) for s in segments] == [(7, 9)]
+    else:
+        with pytest.raises(Exception, match="cancelled|ASR failed"):
+            run()
+        assert [e["type"] for e in events] == ["diarization.completed"]
+        assert len(calls) == 2
 
 
 def test_diarized_empty_recording_skips_asr(audio_client, monkeypatch):
