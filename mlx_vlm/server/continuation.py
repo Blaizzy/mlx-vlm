@@ -8,11 +8,14 @@ suppressed. Tool arguments are replayed in full for the new stream accumulator.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
+import logging
 import time
 import uuid
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from threading import Lock
@@ -24,6 +27,8 @@ from starlette.responses import JSONResponse
 
 from .schemas import ContinuationOptions
 from .sessions import InferenceSession, SessionOutput
+
+logger = logging.getLogger("mlx_vlm.server")
 
 
 @dataclass
@@ -38,6 +43,7 @@ class Generation:
     touched: float = field(default_factory=time.monotonic)
     session: InferenceSession | None = None
     lease: int = 0
+    active: bool = False
 
 
 class Checkpoints:
@@ -50,13 +56,51 @@ class Checkpoints:
 
     def add(self, record):
         with self.lock:
-            self.records[record.id] = record
-            while len(self.records) > self.capacity:
-                _, old = self.records.popitem(last=False)
-                if old.session is not None and not any(
-                    r.session is old.session for r in self.records.values()
-                ):
-                    old.session.dispose()
+            retired = self._add_locked(record)
+        self._dispose(retired)
+
+    def _remove_locked(self, ids):
+        removed = [self.records.pop(key) for key in ids]
+        retained = {r.session for r in self.records.values()}
+        return {r.session for r in removed if r.session is not None} - retained
+
+    def _add_locked(self, record):
+        self.records[record.id] = record
+        excess = max(0, len(self.records) - self.capacity)
+        return self._remove_locked(list(self.records)[:excess])
+
+    @staticmethod
+    def _dispose(sessions):
+        # Closing a legacy generator may wait for its producer. Never hold the
+        # registry lock while releasing decoder resources.
+        for session in sessions:
+            try:
+                session.dispose()
+            except Exception:
+                logger.exception("Error releasing an expired inference checkpoint")
+
+    def prune(self):
+        with self.lock:
+            now = time.monotonic()
+            expired = [
+                key
+                for key, record in self.records.items()
+                if not record.active and now - record.touched > self.ttl
+            ]
+            retired = self._remove_locked(expired)
+        self._dispose(retired)
+
+    def clear(self):
+        with self.lock:
+            retired = self._remove_locked(list(self.records))
+        self._dispose(retired)
+
+    def release(self, record):
+        with self.lock:
+            record.active = False
+            record.touched = time.monotonic()
+            if record.session is not None:
+                record.session.pause(record.lease)
 
     def resume(self, checkpoint, tenant, path):
         with self.lock:
@@ -65,7 +109,7 @@ class Checkpoints:
                 old is None
                 or old.tenant != tenant
                 or old.path != path
-                or time.monotonic() - old.touched > self.ttl
+                or (not old.active and time.monotonic() - old.touched > self.ttl)
             ):
                 raise ValueError(
                     "This response checkpoint is no longer available. Regenerate the response to continue."
@@ -94,16 +138,45 @@ class Checkpoints:
             record.id = uuid.uuid4().hex
             record.parts = old.parts[:cursor]
             record.touched = time.monotonic()
+            record.active = True
             # Keep the previous handle usable if the replacement connection
             # drops before delivering its first checkpoint. A new lease moves
             # the reader; it never forks the decoder or duplicates GPU work.
             self.records.move_to_end(old.id)
-        self.add(record)
+            # Claiming and registering the replacement must be atomic with
+            # pruning, so the shared decoder never temporarily loses its owner.
+            retired = self._add_locked(record)
+        self._dispose(retired)
         return record
 
 
 CHECKPOINTS = Checkpoints()
 ACTIVE = ContextVar("mlx_vlm_continuation", default=None)
+
+
+@asynccontextmanager
+async def checkpoint_cleanup(interval=30):
+    """Sweep idle records without traffic, and release all on server shutdown."""
+    store = CHECKPOINTS
+    stop = asyncio.Event()
+
+    async def sweep():
+        while True:
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+                return
+            except asyncio.TimeoutError:
+                await asyncio.to_thread(store.prune)
+
+    task = asyncio.create_task(sweep())
+    try:
+        yield
+    finally:
+        stop.set()
+        try:
+            await task
+        finally:
+            await asyncio.to_thread(store.clear)
 
 
 class StreamState:
@@ -283,7 +356,7 @@ class ContinuationMiddleware:
                     body.pop("transient_context", None)
                     body["context_management"] = []
                     raw_body = json.dumps(body).encode()
-                record = Generation(copy.deepcopy(body), tenant, path)
+                record = Generation(copy.deepcopy(body), tenant, path, active=True)
                 CHECKPOINTS.add(record)
             state = StreamState(record, checkpoint)
         delivered_body = False
@@ -353,8 +426,7 @@ class ContinuationMiddleware:
         finally:
             if state is not None:
                 state.closed = True
-                if state.record.session is not None:
-                    state.record.session.pause(state.record.lease)
+                CHECKPOINTS.release(state.record)
             ACTIVE.reset(token)
 
 

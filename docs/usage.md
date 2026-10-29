@@ -101,7 +101,12 @@ lookup. Resume also works with APC disabled. Live inference checkpoints are
 separate from APC's shared prefix cache and disk storage.
 
 Checkpoints are process-local, bounded to 32 handles and expire after 10 minutes
-of inactivity. The worker limits paused target-cache buffers to 1 GiB in aggregate
+of inactivity. A background sweep runs every 30 seconds, removing expired
+records and their saved request/text even when no new requests arrive. Active
+streams are exempt; closing a stream starts its inactivity window. Expiring an
+older handle does not release a decoder still referenced by another handle.
+Server shutdown clears the remaining records and retained sessions.
+The worker limits paused target-cache buffers to 1 GiB in aggregate
 (`MLX_VLM_CONTINUATION_CACHE_BYTES`), evicting the oldest paused state first.
 A restart, model unload, eviction or expired checkpoint requires regeneration;
 unavailable checkpoints return HTTP 409 rather than silently restarting the
