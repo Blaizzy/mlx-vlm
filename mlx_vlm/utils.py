@@ -253,16 +253,11 @@ def get_model_type(config: dict) -> Optional[str]:
 def get_model_and_args(config: dict, model_path: Optional[Path] = None):
     """Resolve a model package and its normalized model type.
 
-    Raon checkpoints use the native implementation even when their config
-    includes a custom model file. Other checkpoints may select a local module
-    through ``model_file`` when ``model_path`` is provided.
+    If the config declares ``model_file`` and ``model_path`` is provided, the
+    model module is imported from that file inside the checkpoint (the same
+    mechanism mlx_lm supports) instead of the built-in registry.
     """
-    model_type = get_model_type(config)
-    if (
-        model_path is not None
-        and model_type != "raon1_mini"
-        and (model_file := config.get("model_file"))
-    ):
+    if model_path is not None and (model_file := config.get("model_file")):
         model_file_path = Path(model_path) / model_file
         if not model_file_path.is_file():
             raise FileNotFoundError(
@@ -274,6 +269,7 @@ def get_model_and_args(config: dict, model_path: Optional[Path] = None):
         spec.loader.exec_module(arch)
         return arch, "custom"
 
+    model_type = get_model_type(config)
     if model_type is None:
         raise KeyError("model_type")
 
