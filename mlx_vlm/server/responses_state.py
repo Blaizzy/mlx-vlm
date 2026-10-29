@@ -9,6 +9,7 @@ from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException
+from transformers.utils.chat_parsing.response_templates import load_response_template
 
 from ..prompt_utils import _normalize_tool_message
 from ..tools import process_tool_calls
@@ -231,6 +232,14 @@ def _response_template_tokenizer(processor):
     return tokenizer
 
 
+def _response_template_prefix(tokenizer, prompt: str) -> str:
+    if not prompt:
+        return ""
+    template = load_response_template(tokenizer.response_template)
+    # Without an assistant anchor, the parser includes the entire prompt as output.
+    return prompt if template.start_anchor_re.search(prompt) else ""
+
+
 def make_response_stream_state(
     processor,
     enable_thinking: bool = False,
@@ -243,7 +252,9 @@ def make_response_stream_state(
     if tokenizer is not None and hasattr(tokenizer, "get_response_parser"):
         try:
             return ResponseTemplateStreamState(
-                tokenizer.get_response_parser(prefix=prompt)
+                tokenizer.get_response_parser(
+                    prefix=_response_template_prefix(tokenizer, prompt)
+                )
             )
         except (AttributeError, TypeError, ValueError):
             logger.debug(
@@ -482,7 +493,9 @@ def _split_thinking(
     tokenizer = _response_template_tokenizer(processor)
     if tokenizer is not None and hasattr(tokenizer, "parse_response"):
         try:
-            parsed = tokenizer.parse_response(text, prefix=prompt)
+            parsed = tokenizer.parse_response(
+                text, prefix=_response_template_prefix(tokenizer, prompt)
+            )
             if isinstance(parsed, dict) and (
                 "content" in parsed
                 or "reasoning" in parsed
