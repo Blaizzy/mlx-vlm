@@ -27,5 +27,9 @@ class Model(Lfm2BidirectionalModel):
 
     def sanitize(self, weights):
         out = super().sanitize(weights)
-        out["projection.weight"] = out.pop("model.1_Dense.linear.weight")
+        for key in list(out):
+            for prefix in ("model.1_Dense.linear.", "model.projection."):
+                if key.startswith(prefix):
+                    out["projection." + key[len(prefix) :]] = out.pop(key)
+                    break
         return out
