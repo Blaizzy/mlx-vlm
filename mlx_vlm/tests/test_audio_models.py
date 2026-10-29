@@ -1528,6 +1528,24 @@ def test_load_audio_downmixes_stereo_before_resampling(monkeypatch):
     np.testing.assert_allclose(audio, expected, rtol=1e-5, atol=1e-6)
 
 
+def test_load_audio_rejects_files_that_decode_to_no_samples(monkeypatch, tmp_path):
+    from mlx_audio import audio_io
+
+    path = tmp_path / "empty.wav"
+    with wave.open(str(path), "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(16000)
+    with pytest.raises(ValueError, match="empty.wav returned no samples"):
+        load_audio(str(path), sr=16000)
+    # ffmpeg returns nothing for some inputs it reads from a pipe.
+    monkeypatch.setattr(audio_io, "read", lambda file, dtype: (np.zeros((0, 2)), 44100))
+    with pytest.raises(ValueError, match="the audio data returned no samples"):
+        load_audio(BytesIO(b"audio"), sr=16000)
+    # Arrays are the caller's samples, even when empty.
+    assert load_audio(np.zeros(0, np.float32), sr=16000).shape == (0,)
+
+
 def _host(a):
     return np.array(a.astype(mx.float32))
 
@@ -1694,7 +1712,7 @@ def _mixed_batch(model, rows, prompts, prefix, warm_cache=None):
             else ([], prefix)
         ),
         checkpoint_len=lambda *a: 0,
-        checkpoint_lengths=lambda *a: [],
+        checkpoint_lengths=lambda *a, **kw: [],
     )
     bg.apc_mode = "exact"
     bg.prefill_step_size = 2

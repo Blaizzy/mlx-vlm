@@ -9,6 +9,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ..utils import prepare_inputs, should_add_special_tokens
 from .common import GenerationResult, generation_stream, wired_limit
 from .types import ProcessorLike
 
@@ -90,6 +91,18 @@ def generate_audio(
         and Path(output_audio_path).suffix.lower() != ".wav"
     ):
         raise ValueError("Audio output must use a .wav extension.")
+    if getattr(model, "joint_audio_text_generation", False):
+        return _generate_joint_audio(
+            model,
+            processor,
+            prompt,
+            image,
+            audio,
+            video,
+            verbose,
+            output_audio_path,
+            **kwargs,
+        )
     validate = getattr(model, "validate_audio_generation", None)
     if callable(validate):
         validate(audio=audio, ref_audio_path=ref_audio_path)
@@ -147,6 +160,58 @@ def generate_audio(
         },
     )
     result.text = spoken_text
+    result.peak_memory = mx.get_peak_memory() / 1e9
+    if output_audio_path is not None:
+        save_audio(result, output_audio_path)
+    return result
+
+
+def _generate_joint_audio(
+    model: nn.Module,
+    processor: ProcessorLike,
+    prompt: str,
+    image: Union[str, List[str], None] = None,
+    audio: Union[str, List[str], None] = None,
+    video: Union[str, List[str], None] = None,
+    verbose: bool = False,
+    output_audio_path: Union[str, Path, None] = None,
+    **kwargs,
+) -> AudioGenerationResult:
+    """Generate text and speech for a formatted chat prompt.
+
+    The model's ``generate_audio`` samples both in one loop; ``audio`` is an
+    input to understand. Other keyword arguments go to the processor and the
+    model. The waveform is returned even without ``output_audio_path``.
+    """
+    if not callable(getattr(model, "generate_audio", None)):
+        raise ValueError(f"{type(model).__name__} does not support audio generation.")
+    if (
+        output_audio_path is not None
+        and Path(output_audio_path).suffix.lower() != ".wav"
+    ):
+        raise ValueError("Audio output must use a .wav extension.")
+
+    inputs = prepare_inputs(
+        processor,
+        images=image or None,
+        audio=audio or None,
+        videos=video or None,
+        prompts=prompt,
+        add_special_tokens=should_add_special_tokens(
+            model.config.model_type, processor
+        ),
+        **kwargs,
+    )
+    input_ids = inputs.pop("input_ids")
+    inputs.pop("attention_mask", None)
+    with wired_limit(model, [generation_stream]), mx.stream(generation_stream):
+        result = model.generate_audio(
+            input_ids=input_ids,
+            tokenizer=getattr(processor, "tokenizer", processor),
+            verbose=verbose,
+            **{**kwargs, **inputs},
+        )
+        mx.eval(result.audio, result.audio_tokens)
     result.peak_memory = mx.get_peak_memory() / 1e9
     if output_audio_path is not None:
         save_audio(result, output_audio_path)

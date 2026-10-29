@@ -3325,6 +3325,27 @@ class APCManager:
         self._make_room()
 
     # ---------- Public API ----------
+    def checkpoint_prefix_length(
+        self, token_ids: Sequence[int], *, extra_hash: int = 0
+    ) -> int:
+        """Find an observed divergence to checkpoint during this prefill.
+
+        Recurrent state cannot be rolled back from a later snapshot. Capture
+        the shared prefix before a replaced suffix so subsequent requests can
+        reuse it even with a small resident checkpoint budget.
+        """
+        tokens = tuple(int(t) for t in token_ids)
+        boundary = 0
+        with self.lock:
+            for entry in self._exact_cache.values():
+                if entry.extra_hash != extra_hash:
+                    continue
+                end = min(len(tokens), len(entry.token_ids))
+                shared = _checkpoint_match_len(tokens, entry.token_ids, end, 1, True)
+                if shared < end:
+                    boundary = max(boundary, shared)
+        return boundary
+
     def lookup_exact_cache(
         self,
         token_ids: Sequence[int],

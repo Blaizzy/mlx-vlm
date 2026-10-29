@@ -2,6 +2,400 @@
   "version": 2,
   "cases": [
     {
+      "id": "raon1_mini",
+      "module": "raon1_mini",
+      "config": {
+        "hidden_size": 64,
+        "vocab_size": 128,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "head_dim": 32,
+        "intermediate_size": 128,
+        "num_experts": 4,
+        "num_experts_per_token": 2,
+        "moe_intermediate_size": 64,
+        "q_lora_rank": 32,
+        "kv_lora_rank": 32,
+        "qk_nope_head_dim": 32,
+        "qk_rope_head_dim": 16,
+        "v_head_dim": 32,
+        "rda_decay_rank": 32,
+        "rda_config": {
+          "num_heads": 2,
+          "head_dim": 32,
+          "conv_kernel_size": 4,
+          "rda_layers": [
+            1
+          ],
+          "mla_layers": [
+            2
+          ]
+        }
+      },
+      "checks": [
+        "language",
+        "input_embeddings",
+        "forward_cache"
+      ],
+      "forward_cache": {
+        "chunk_sizes": [
+          2,
+          1,
+          3
+        ]
+      }
+    },
+    {
+      "id": "lfm3_omni",
+      "module": "lfm3_omni",
+      "config": {
+        "text_config": {
+          "hidden_size": 32,
+          "intermediate_size": 64,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 2,
+          "num_key_value_heads": 1,
+          "head_dim": 16,
+          "vocab_size": 64,
+          "layer_types": [
+            "conv",
+            "full_attention"
+          ]
+        },
+        "vision_config": {
+          "hidden_size": 32,
+          "intermediate_size": 64,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 4,
+          "num_key_value_heads": 2,
+          "patch_size": 2,
+          "layer_types": [
+            "conv",
+            "full_attention"
+          ]
+        },
+        "audio_encoder_config": {
+          "conv_channels": 4,
+          "hidden_size": 8,
+          "num_mel_bins": 16,
+          "sliding_window": 4,
+          "text_config": {
+            "model_type": "lfm2",
+            "vocab_size": 2,
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "max_position_embeddings": 64,
+            "norm_eps": 1e-05,
+            "conv_bias": false,
+            "conv_L_cache": 3,
+            "block_multiple_of": 8,
+            "block_ffn_dim_multiplier": 1.0,
+            "block_auto_adjust_ff_dim": false,
+            "layer_types": [
+              "conv",
+              "full_attention"
+            ]
+          }
+        },
+        "depth_config": {
+          "hidden_size": 16,
+          "intermediate_size": 32,
+          "num_hidden_layers": 1,
+          "num_attention_heads": 2,
+          "num_key_value_heads": 1,
+          "head_dim": 8,
+          "vocab_size": 1,
+          "layer_types": [
+            "full_attention"
+          ],
+          "use_sandwich_norm": false
+        },
+        "projector_hidden_size": 48,
+        "codebook_size": 5,
+        "audio_eos_code": 4,
+        "image_token_id": 56,
+        "video_token_id": 57,
+        "audio_start_token_id": 52,
+        "text_end_token_id": 53,
+        "mixed_start_token_id": 54,
+        "audio_token_id": 60,
+        "audio_out_token_id": 61,
+        "eos_token_id": [
+          50,
+          53
+        ]
+      },
+      "checks": ["forward_cache"]
+    },
+    {
+      "id": "lfm3_audio",
+      "module": "lfm3_audio",
+      "config": {
+        "lfm": {
+          "hidden_size": 32,
+          "intermediate_size": 64,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 2,
+          "num_key_value_heads": 1,
+          "head_dim": 16,
+          "vocab_size": 64,
+          "conv_L_cache": 3,
+          "layer_types": [
+            "conv",
+            "full_attention"
+          ]
+        },
+        "encoder": {
+          "dim_in": 16,
+          "dim_conv": 4,
+          "dim_out": 8,
+          "sliding_window": 4,
+          "lfm": {
+            "model_type": "lfm2",
+            "vocab_size": 2,
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "max_position_embeddings": 64,
+            "norm_eps": 1e-05,
+            "conv_bias": false,
+            "conv_L_cache": 3,
+            "block_multiple_of": 8,
+            "block_ffn_dim_multiplier": 1.0,
+            "block_auto_adjust_ff_dim": false,
+            "layer_types": [
+              "conv",
+              "full_attention"
+            ],
+            "rope_parameters": {
+              "rope_theta": 1000000.0
+            }
+          }
+        },
+        "depthformer": {
+          "hidden_size": 16,
+          "intermediate_size": 32,
+          "num_hidden_layers": 1,
+          "num_attention_heads": 2,
+          "num_key_value_heads": 1,
+          "head_dim": 8,
+          "vocab_size": 1,
+          "layer_types": [
+            "full_attention"
+          ],
+          "rope_parameters": {
+            "full_attention": {
+              "rope_theta": 1000000.0,
+              "partial_rotary_factor": 1.0
+            }
+          },
+          "use_sandwich_norm": false
+        },
+        "audio_vocab_size": 5,
+        "audio_token_id": 60,
+        "audio_out_token_id": 61,
+        "audio_start_token_id": 55,
+        "text_end_token_id": 56,
+        "mixed_start_token_id": 57,
+        "eos_token_id": [
+          50,
+          56
+        ]
+      },
+      "checks": ["forward_cache"]
+    },
+    {
+      "id": "lfm3",
+      "module": "lfm3",
+      "config": {
+        "hidden_size": 32,
+        "intermediate_size": 64,
+        "num_hidden_layers": 3,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "vocab_size": 64,
+        "layer_types": [
+          "conv",
+          "full_attention",
+          "sliding_attention"
+        ],
+        "sliding_window": 4
+      },
+      "checks": [
+        "forward_cache"
+      ]
+    },
+    {
+      "id": "lfm3_vl",
+      "module": "lfm3_vl",
+      "config": {
+        "text_config": {
+          "hidden_size": 32,
+          "intermediate_size": 64,
+          "num_hidden_layers": 3,
+          "num_attention_heads": 4,
+          "num_key_value_heads": 2,
+          "vocab_size": 64,
+          "layer_types": [
+            "conv",
+            "full_attention",
+            "sliding_attention"
+          ],
+          "sliding_window": 4
+        },
+        "vision_config": {
+          "hidden_size": 32,
+          "intermediate_size": 64,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 4,
+          "num_key_value_heads": 2,
+          "patch_size": 2,
+          "layer_types": [
+            "conv",
+            "full_attention"
+          ]
+        },
+        "projector_hidden_size": 48,
+        "image_token_id": 60,
+        "video_token_id": 61
+      },
+      "checks": [
+        "forward_cache"
+      ]
+    },
+    {
+      "id": "flint",
+      "module": "flint",
+      "config": {
+        "model_type": "flint",
+        "hidden_size": 64,
+        "intermediate_size": 64,
+        "num_hidden_layers": 3,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 8,
+        "vocab_size": 64,
+        "layer_types": ["full_attention", "sliding_attention", "full_attention"],
+        "no_rope_layer_indices": [0, 2],
+        "mlp_only_layers": [0],
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 32,
+        "shared_expert_intermediate_size": 32,
+        "sliding_window": 4
+      },
+      "checks": ["forward_cache"],
+      "forward_cache": {"chunk_sizes": [1, 2, 3, 9]}
+    },
+    {
+      "id": "muse_spark",
+      "module": "muse_spark",
+      "config": {
+        "model_type": "muse_spark",
+        "video_token_id": 253,
+        "image_token_id": 255,
+        "text_config": {
+          "vocab_size": 256,
+          "hidden_size": 64,
+          "num_hidden_layers": 4,
+          "num_attention_heads": 4,
+          "num_key_value_heads": 2,
+          "head_dim": 16,
+          "rms_norm_eps": 1e-05,
+          "post_norm_eps": 1e-08,
+          "rope_parameters": {
+            "rope_theta": 10000.0,
+            "rope_type": "default"
+          },
+          "layer_rope_theta": [
+            10000.0,
+            10000.0,
+            10000.0,
+            0
+          ],
+          "layer_types": [
+            "sliding_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "full_attention"
+          ],
+          "sliding_window": 8,
+          "final_logit_softcapping": 20.0,
+          "output_multiplier": 0.7071067811865476,
+          "num_local_experts": 4,
+          "num_experts_per_tok": 2,
+          "moe_hidden_size": 32,
+          "moe_intermediate_size": 32,
+          "routed_scaling_factor": 1.5
+        },
+        "vision_config": {
+          "hidden_size": 32,
+          "intermediate_size": 64,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 2,
+          "patch_size": 2,
+          "merge_size": 2,
+          "pos_emb_height": 4,
+          "pos_emb_width": 4,
+          "layer_types": [
+            "window_attention",
+            "full_attention"
+          ]
+        },
+        "audio_config": {
+          "patch_sizes": [
+            2,
+            2
+          ],
+          "hidden_sizes": [
+            8,
+            16
+          ],
+          "depths": [
+            2,
+            1
+          ],
+          "num_hidden_layers": 2,
+          "mlp_ratio": 2.0,
+          "conv_kernel_size": 3,
+          "out_hidden_size": 64
+        },
+        "audio_token_id": 254,
+        "projector_hidden_size": 48
+      },
+      "checks": [
+        "forward_cache",
+        "input_embeddings"
+      ]
+    },
+    {
+      "id": "nemotron_parse_v3_5",
+      "module": "nemotron_parse_v3_5",
+      "config": {
+        "text_config": {
+          "d_model": 32,
+          "decoder_attention_heads": 4,
+          "self_attention_kv_heads": 2,
+          "decoder_ffn_dim": 64,
+          "decoder_layers": 2,
+          "vocab_size": 48
+        },
+        "vision_config": {
+          "hidden_size": 32,
+          "num_heads": 4,
+          "mlp_ratio": 2,
+          "num_layers": 1,
+          "neck_dim": 32
+        }
+      },
+      "checks": ["causal_visual_prefix"]
+    },
+    {
       "id": "nemotron_super_vl",
       "module": "nemotron_h_nano_omni",
       "config": {
@@ -188,6 +582,68 @@
         "language_hidden_states",
         "input_embeddings"
       ]
+    },
+    {
+      "id": "minicpm_ocr",
+      "module": "minicpm_ocr",
+      "config": {
+        "model_type": "minicpm_ocr",
+        "text_config": {
+          "model_type": "qwen3_5_text",
+          "hidden_size": 16,
+          "intermediate_size": 32,
+          "num_hidden_layers": 2,
+          "full_attention_interval": 2,
+          "num_attention_heads": 2,
+          "num_key_value_heads": 2,
+          "head_dim": 8,
+          "linear_num_value_heads": 2,
+          "linear_num_key_heads": 2,
+          "linear_key_head_dim": 32,
+          "linear_value_head_dim": 8,
+          "linear_conv_kernel_dim": 3,
+          "rms_norm_eps": 1e-05,
+          "vocab_size": 64,
+          "rope_parameters": {
+            "rope_type": "default",
+            "mrope_section": [
+              1,
+              0,
+              0
+            ],
+            "partial_rotary_factor": 0.25
+          }
+        },
+        "vision_config": {
+          "model_type": "minicpm_ocr_vision",
+          "hidden_size": 16,
+          "intermediate_size": 32,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 2,
+          "image_size": 8,
+          "patch_size": 2
+        },
+        "patch_size": 2,
+        "insert_layer_id": 0,
+        "image_token_id": 48,
+        "video_token_id": 49,
+        "downsample_mode": "4x"
+      },
+      "checks": [
+        "forward_cache",
+        "language",
+        "vision",
+        "input_embeddings"
+      ],
+      "forward_cache": {
+        "chunk_sizes": [
+          1,
+          3
+        ]
+      },
+      "vision": {
+        "feature_layer": null
+      }
     },
     {
       "id": "minicpmv4_7",
@@ -468,6 +924,7 @@
         "index_head_dim": 2,
         "index_topk": 2,
         "hc_mult": 2,
+        "hc_sinkhorn_iters": 2,
         "vision_n_layers": 1,
         "vision_dim": 8,
         "vision_n_heads": 2,
@@ -488,7 +945,7 @@
         "vocab_size": 64,
         "hidden_size": 32,
         "moe_intermediate_size": 32,
-        "num_hidden_layers": 5,
+        "num_hidden_layers": 4,
         "num_attention_heads": 2,
         "num_key_value_heads": 1,
         "n_shared_experts": 1,
@@ -502,7 +959,7 @@
         "index_n_heads": 2,
         "index_head_dim": 32,
         "index_topk": 4,
-        "compress_ratios": [0, 2, 2, 1, 0],
+        "compress_ratios": [0, 2, 2, 1],
         "kv_source_layer_ids": [1, 3],
         "index_source_layer_ids": [1, 2, 3],
         "candidate_source_layer_id": 3,
@@ -2371,6 +2828,61 @@
           ]
         ]
       }
+    },
+    {
+      "id": "TestModels.oxr",
+      "module": "oxr",
+      "config": {
+        "text_config": {
+          "model_type": "qwen3",
+          "hidden_size": 16,
+          "num_hidden_layers": 2,
+          "intermediate_size": 32,
+          "num_attention_heads": 4,
+          "num_key_value_heads": 2,
+          "head_dim": 4,
+          "rms_norm_eps": 1e-06,
+          "vocab_size": 64,
+          "max_position_embeddings": 64,
+          "rope_theta": 10000.0,
+          "tie_word_embeddings": true
+        },
+        "vision_config": {
+          "model_type": "siglip2_navit",
+          "hidden_size": 16,
+          "intermediate_size": 32,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 4,
+          "patch_size": 4,
+          "image_size": 16,
+          "hidden_stride": 2
+        },
+        "model_type": "oxr",
+        "hidden_size": 16,
+        "visual_vocab_size": 36,
+        "image_token_id": 60,
+        "vision_start_token_id": 61,
+        "vision_end_token_id": 62
+      },
+      "checks": [
+        "language",
+        "vision",
+        "input_embeddings"
+      ],
+      "vision": {
+        "input_shape": [
+          16,
+          48
+        ],
+        "grid_thw": [
+          [
+            1,
+            4,
+            4
+          ]
+        ],
+        "feature_layer": null
+      }
     }
   ],
   "dense": {
@@ -2821,6 +3333,187 @@
     "max_position_embeddings": 128
   },
   "shared_configs": {
+    "unlimited_ocr": {
+      "module": "unlimited_ocr",
+      "config_type": "TextConfig",
+      "config": {
+        "hidden_size": 8,
+        "intermediate_size": 16,
+        "num_key_value_heads": 2,
+        "vocab_size": 16,
+        "n_routed_experts": null,
+        "n_shared_experts": null,
+        "sliding_window_size": 2,
+        "sliding_window": 2
+      }
+    },
+    "minimax_m3": {
+      "module": "minimax_m3_vl",
+      "config_type": "TextConfig",
+      "config": {
+        "model_type": "minimax_m3_vl",
+        "vocab_size": 128,
+        "hidden_size": 128,
+        "intermediate_size": 128,
+        "dense_intermediate_size": 256,
+        "shared_intermediate_size": 128,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 1,
+        "head_dim": 32,
+        "num_local_experts": 4,
+        "num_experts_per_tok": 2,
+        "moe_layer_freq": [
+          0,
+          1
+        ],
+        "pack_shared_expert": false,
+        "sparse_attention_config": {
+          "sparse_block_size": 4,
+          "sparse_topk_blocks": 2,
+          "sparse_num_index_heads": 2,
+          "sparse_index_dim": 32,
+          "sparse_local_block": 1
+        },
+        "max_position_embeddings": 128,
+        "tie_word_embeddings": false
+      },
+      "distributed": {
+        "sharded_weights": [
+          "lm_head.weight",
+          "model.layers.*.block_sparse_moe.switch_mlp.*.weight"
+        ],
+        "tolerances": {
+          "float32": 1e-06,
+          "bfloat16": 0.0
+        },
+        "reshard_error": "already sharded"
+      }
+    },
+    "minimax_m3_nvfp4": {
+      "module": "minimax_m3_vl",
+      "config_type": "TextConfig",
+      "config": {
+        "model_type": "minimax_m3_vl",
+        "vocab_size": 128,
+        "hidden_size": 128,
+        "intermediate_size": 128,
+        "dense_intermediate_size": 256,
+        "shared_intermediate_size": 128,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 1,
+        "head_dim": 32,
+        "num_local_experts": 4,
+        "num_experts_per_tok": 2,
+        "moe_layer_freq": [
+          0,
+          1
+        ],
+        "pack_shared_expert": false,
+        "sparse_attention_config": {
+          "sparse_block_size": 4,
+          "sparse_topk_blocks": 2,
+          "sparse_num_index_heads": 2,
+          "sparse_index_dim": 32,
+          "sparse_local_block": 1
+        },
+        "max_position_embeddings": 128,
+        "tie_word_embeddings": false,
+        "nvfp4_experts": true
+      },
+      "distributed": {
+        "sharded_weights": [
+          "lm_head.weight",
+          "model.layers.*.block_sparse_moe.switch_mlp.*.weight"
+        ],
+        "tolerances": {
+          "float32": 1e-06,
+          "bfloat16": 0.0
+        },
+        "reshard_error": "already sharded",
+        "quantization": {
+          "modules": {
+            "model.layers.*.mlp.*": {
+              "group_size": 32,
+              "bits": 8,
+              "mode": "mxfp8"
+            },
+            "model.layers.*.self_attn.*_proj": {
+              "group_size": 32,
+              "bits": 8,
+              "mode": "mxfp8"
+            },
+            "model.layers.*.block_sparse_moe.shared_experts.*": {
+              "group_size": 32,
+              "bits": 8,
+              "mode": "mxfp8"
+            },
+            "lm_head": {
+              "group_size": 32,
+              "bits": 8,
+              "mode": "mxfp8"
+            }
+          }
+        }
+      }
+    },
+    "minimax_m3_packed": {
+      "module": "minimax_m3_vl",
+      "config_type": "TextConfig",
+      "config": {
+        "model_type": "minimax_m3_vl",
+        "vocab_size": 128,
+        "hidden_size": 128,
+        "intermediate_size": 128,
+        "dense_intermediate_size": 256,
+        "shared_intermediate_size": 128,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 1,
+        "head_dim": 32,
+        "num_local_experts": 4,
+        "num_experts_per_tok": 2,
+        "moe_layer_freq": [
+          0,
+          1
+        ],
+        "pack_shared_expert": true,
+        "sparse_attention_config": {
+          "sparse_block_size": 4,
+          "sparse_topk_blocks": 2,
+          "sparse_num_index_heads": 2,
+          "sparse_index_dim": 32,
+          "sparse_local_block": 1
+        },
+        "max_position_embeddings": 128,
+        "tie_word_embeddings": false
+      },
+      "distributed": {
+        "sharded_weights": [
+          "lm_head.weight"
+        ],
+        "tolerances": {
+          "float32": 1e-06,
+          "bfloat16": 0.0
+        },
+        "reshard_error": "already sharded",
+        "quantization": {
+          "modules": {
+            "model.layers.*.block_sparse_moe.switch_mlp.*": {
+              "group_size": 32,
+              "bits": 4,
+              "mode": "affine"
+            },
+            "lm_head": {
+              "group_size": 32,
+              "bits": 4,
+              "mode": "affine"
+            }
+          }
+        }
+      }
+    },
     "qwen": {
       "module": "qwen3_5",
       "config_type": "TextConfig",
@@ -3183,5 +3876,339 @@
       "markov_rank": 4,
       "enable_confidence_head": true
     }
-  }
+  },
+  "rotating_cache": [
+    {
+      "module": "qwen2",
+      "config_type": "ModelConfig",
+      "config": {
+        "model_type": "qwen2",
+        "num_hidden_layers": 2,
+        "intermediate_size": 64,
+        "rms_norm_eps": 1e-05,
+        "rope_theta": 10000.0,
+        "tie_word_embeddings": false
+      },
+      "checks": ["chunk_parity"]
+    },
+    {
+      "module": "qwen3",
+      "config_type": "ModelConfig",
+      "config": {
+        "model_type": "qwen3",
+        "num_hidden_layers": 2,
+        "intermediate_size": 64,
+        "rms_norm_eps": 1e-05,
+        "rope_theta": 10000.0,
+        "head_dim": 8,
+        "tie_word_embeddings": false
+      },
+      "checks": ["chunk_parity"]
+    },
+    {
+      "module": "qwen3_5",
+      "case": "qwen3_5",
+      "config": {
+        "intermediate_size": 64,
+        "linear_num_value_heads": 4,
+        "linear_key_head_dim": 8,
+        "linear_conv_kernel_dim": 4,
+        "num_hidden_layers": 2,
+        "rope_parameters": {
+          "type": "default",
+          "rope_type": "default",
+          "mrope_section": [1, 1, 2],
+          "partial_rotary_factor": 1.0,
+          "rope_theta": 10000.0
+        },
+        "full_attention_interval": 1
+      },
+      "checks": ["chunk_parity", "prompt_metadata"]
+    },
+    {
+      "module": "qwen2_vl",
+      "case": "TestGetInputEmbeddings.qwen2_vl_input_embeddings",
+      "config": {
+        "num_hidden_layers": 2,
+        "intermediate_size": 64,
+        "rms_norm_eps": 1e-05,
+        "rope_theta": 10000.0,
+        "rope_scaling": {
+          "type": "default",
+          "rope_type": "default",
+          "mrope_section": [1, 1, 2]
+        }
+      },
+      "checks": ["chunk_parity", "prompt_metadata"]
+    },
+    {
+      "module": "qwen2_5_vl",
+      "case": "TestGetInputEmbeddings.qwen2_5_vl_input_embeddings",
+      "config": {
+        "num_hidden_layers": 2,
+        "intermediate_size": 64,
+        "rms_norm_eps": 1e-05,
+        "rope_theta": 10000.0,
+        "rope_scaling": {
+          "type": "default",
+          "rope_type": "default",
+          "mrope_section": [1, 1, 2]
+        },
+        "tie_word_embeddings": false
+      },
+      "checks": ["chunk_parity", "prompt_metadata"]
+    },
+    {
+      "module": "qwen3_vl",
+      "case": "TestGetInputEmbeddings.qwen3_vl_input_embeddings",
+      "config": {
+        "model_type": "qwen3_vl",
+        "num_hidden_layers": 2,
+        "intermediate_size": 64,
+        "rope_theta": 10000.0,
+        "rope_scaling": {
+          "type": "default",
+          "rope_type": "default",
+          "mrope_section": [1, 1, 2]
+        }
+      },
+      "checks": ["chunk_parity", "prompt_metadata"]
+    },
+    {
+      "module": "qwen3_vl_moe",
+      "case": "TestGetInputEmbeddings.qwen3_vl_moe_input_embeddings",
+      "config": {
+        "num_hidden_layers": 2,
+        "intermediate_size": 64,
+        "moe_intermediate_size": 32,
+        "rope_scaling": {
+          "type": "default",
+          "rope_type": "default",
+          "mrope_section": [1, 1, 2]
+        }
+      },
+      "checks": ["chunk_parity", "prompt_metadata"]
+    },
+    {
+      "module": "qwen3_omni_moe",
+      "case": "TestGetInputEmbeddings.qwen3_omni_moe_input_embeddings",
+      "config": {
+        "num_hidden_layers": 2,
+        "intermediate_size": 64,
+        "moe_intermediate_size": 32,
+        "model_type": "qwen3_omni_moe",
+        "rope_scaling": {
+          "type": "default",
+          "rope_type": "default",
+          "mrope_section": [1, 1, 2]
+        },
+        "use_qk_norm": true
+      },
+      "checks": ["chunk_parity", "prompt_metadata"]
+    },
+    {
+      "module": "glm4v",
+      "case": "TestModels.glm4v",
+      "config": {
+        "intermediate_size": 64,
+        "num_hidden_layers": 2,
+        "attention_bias": false,
+        "partial_rotary_factor": 1.0,
+        "rope_scaling": {
+          "type": "default",
+          "rope_type": "default",
+          "mrope_section": [1, 1, 2]
+        }
+      },
+      "checks": ["chunk_parity"]
+    },
+    {
+      "module": "glm4v_moe",
+      "case": "TestModels.glm4v_moe",
+      "config": {
+        "intermediate_size": 64,
+        "moe_intermediate_size": 32,
+        "norm_topk_prob": true,
+        "head_dim": 8,
+        "n_shared_experts": 1,
+        "n_routed_experts": 2,
+        "num_experts_per_tok": 1,
+        "num_hidden_layers": 2,
+        "partial_rotary_factor": 1.0,
+        "rope_theta": 10000.0,
+        "rope_scaling": {
+          "type": "default",
+          "rope_type": "default",
+          "mrope_section": [1, 1, 2]
+        }
+      },
+      "checks": ["chunk_parity"]
+    },
+    {
+      "module": "glm_ocr",
+      "config": {
+        "model_type": "glm_ocr",
+        "intermediate_size": 64,
+        "num_hidden_layers": 2,
+        "head_dim": 8,
+        "rope_parameters": {
+          "type": "default",
+          "rope_type": "default",
+          "mrope_section": [1, 1, 2],
+          "partial_rotary_factor": 1.0,
+          "rope_theta": 10000.0
+        }
+      },
+      "checks": ["chunk_parity"]
+    },
+    {
+      "module": "ernie4_5_moe_vl",
+      "case": "TestModels.ernie4_5_moe_vl",
+      "config": {
+        "intermediate_size": 64,
+        "model_type": "ernie4_5_moe_vl",
+        "num_hidden_layers": 2,
+        "rms_norm_eps": 1e-05,
+        "rope_theta": 10000.0,
+        "tie_word_embeddings": false,
+        "moe_num_experts": 2,
+        "moe_layer_start_index": 1,
+        "moe_layer_end_index": 2,
+        "moe_intermediate_size": 32,
+        "moe_k": 1,
+        "moe_num_shared_experts": 0,
+        "head_dim": 8,
+        "mrope_section": [1, 1, 2],
+        "rope_scaling": {
+          "type": "default",
+          "rope_type": "default",
+          "mrope_section": [1, 1, 2]
+        }
+      },
+      "checks": ["chunk_parity"]
+    },
+    {
+      "module": "paddleocr_vl",
+      "case": "TestGetInputEmbeddings.paddleocr_vl_input_embeddings",
+      "config": {
+        "num_hidden_layers": 2,
+        "intermediate_size": 64,
+        "rope_theta": 10000.0,
+        "rope_scaling": {
+          "type": "default",
+          "rope_type": "default",
+          "mrope_section": [1, 1, 2]
+        }
+      },
+      "checks": ["chunk_parity"]
+    },
+    {
+      "module": "falcon_ocr",
+      "case": "TestModels.falcon_ocr",
+      "config": {
+        "num_hidden_layers": 2,
+        "head_dim": 8,
+        "intermediate_size": 64
+      },
+      "checks": ["chunk_parity", "prompt_metadata"]
+    },
+    {
+      "module": "hunyuan_vl",
+      "case": "TestModels.hunyuan_vl",
+      "config": {
+        "org_vocab_size": 64,
+        "num_hidden_layers": 2,
+        "head_dim": 8,
+        "attention_head_dim": 8,
+        "intermediate_size": 64,
+        "rope_scaling": {
+          "type": "xdrope",
+          "xdrope_section": [1, 1, 1, 1]
+        },
+        "tie_word_embeddings": false,
+        "num_experts": 2
+      },
+      "checks": ["chunk_parity"]
+    },
+    {
+      "module": "mllama",
+      "config": {
+        "intermediate_size": 64,
+        "num_hidden_layers": 2,
+        "rms_norm_eps": 1e-05,
+        "cross_attention_layers": []
+      },
+      "checks": ["chunk_parity"]
+    },
+    {
+      "module": "moondream3",
+      "config": {
+        "intermediate_size": 64,
+        "num_hidden_layers": 2,
+        "num_key_value_heads": 2,
+        "head_dim": 8,
+        "rope_theta": 10000.0,
+        "rope_dim": 8,
+        "num_experts": 2,
+        "num_experts_per_tok": 1,
+        "moe_intermediate_size": 32,
+        "moe_start_layer": 1,
+        "attention_bias": false,
+        "prefix_attn": 0
+      },
+      "checks": ["chunk_parity"]
+    },
+    {
+      "module": "minimax_m3_vl",
+      "case": "minimax_m3_vl",
+      "config": {
+        "model_type": "minimax_m3_vl",
+        "intermediate_size": 64,
+        "dense_intermediate_size": 64,
+        "shared_intermediate_size": 32,
+        "head_dim": 8,
+        "num_hidden_layers": 2,
+        "rms_norm_eps": 1e-05,
+        "rope_theta": 10000.0,
+        "rotary_dim": 8,
+        "partial_rotary_factor": 1.0,
+        "rope_scaling": {
+          "type": "default",
+          "rope_type": "default",
+          "mrope_section": [1, 1, 2]
+        },
+        "routed_scaling_factor": 1.0,
+        "sparse_attention_config": {
+          "use_sparse_attention": true,
+          "sparse_index_dim": 128,
+          "sparse_num_index_heads": 4,
+          "sparse_topk_blocks": 16,
+          "sparse_block_size": 128,
+          "sparse_disable_index_value": [0, 0],
+          "sparse_score_type": "max",
+          "sparse_init_block": 0,
+          "sparse_local_block": 1,
+          "sparse_attention_freq": [0, 0]
+        }
+      },
+      "checks": ["chunk_parity"]
+    },
+    {
+      "module": "gemma3n",
+      "case": "TestGetInputEmbeddings.gemma3n_input_embeddings",
+      "config": {
+        "num_hidden_layers": 2,
+        "num_key_value_heads": 2,
+        "sliding_window": 8,
+        "max_position_embeddings": 32768
+      },
+      "checks": ["per_layer_inputs"]
+    },
+    {
+      "module": "florence2",
+      "case": "TestGetInputEmbeddings.florence2_input_embeddings",
+      "config": {},
+      "checks": ["decoder_positions"]
+    }
+  ]
 }

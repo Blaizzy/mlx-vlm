@@ -9,6 +9,7 @@ import time
 import uuid
 from contextlib import aclosing
 from datetime import datetime
+from functools import partial
 from io import BytesIO
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
@@ -29,7 +30,6 @@ from ..tools import (
     _infer_tool_parser_from_processor,
     _prepare_chat_tool_choice,
     load_tool_module,
-    process_tool_calls,
 )
 from ..tools.streaming import ToolCallDeltaState
 from ..utils import prepare_inputs
@@ -58,6 +58,7 @@ from .responses_state import (
     _store_response,
     finish_content_streams,
     make_response_stream_state,
+    parse_assistant_tool_calls,
     prompt_has_open_thinking,
     response_store,
     response_store_lock,
@@ -720,7 +721,9 @@ async def responses_input_tokens_endpoint(request: Request):
             prompt_items, model=openai_request.model, tenant=_read_tenant_id(request)
         )
         prompt_items, _ = compaction.split_trigger(prompt_items)
-        chat_messages, images = _response_items_to_chat(prompt_items)
+        chat_messages, images = _response_items_to_chat(
+            compaction.with_transient_context(prompt_items, openai_request)
+        )
         _normalize_instruction_messages(
             chat_messages,
             openai_request.instructions,
@@ -1092,7 +1095,9 @@ async def responses_endpoint(request: Request):
                     *compaction_args, **compaction_options
                 )
             )
-        chat_messages, images = _response_items_to_chat(prompt_items)
+        chat_messages, images = _response_items_to_chat(
+            compaction.with_transient_context(prompt_items, openai_request)
+        )
         instructions = _normalize_instruction_messages(
             chat_messages,
             openai_request.instructions,
@@ -1126,7 +1131,9 @@ async def responses_endpoint(request: Request):
             template_kwargs["tool_choice"] = openai_request.tool_choice
 
         def render_prompt(items):
-            messages, images = _response_items_to_chat(items)
+            messages, images = _response_items_to_chat(
+                compaction.with_transient_context(items, openai_request)
+            )
             _normalize_instruction_messages(messages, openai_request.instructions)
             _ensure_effective_input(messages, images=images)
             prompt = apply_chat_template(
@@ -1137,6 +1144,24 @@ async def responses_endpoint(request: Request):
                 tools=chat_tools or None,
                 **template_kwargs,
             )
+            gen_args.cache_prefix = None
+            if openai_request.transient_context and not images:
+                stable_messages, _ = _response_items_to_chat(
+                    compaction.with_transient_context(
+                        items, openai_request, include_suffix=False
+                    )
+                )
+                _normalize_instruction_messages(
+                    stable_messages, openai_request.instructions
+                )
+                gen_args.cache_prefix = apply_chat_template(
+                    processor,
+                    config,
+                    stable_messages,
+                    add_generation_prompt=False,
+                    tools=chat_tools or None,
+                    **template_kwargs,
+                )
             thinking = prompt_has_open_thinking(
                 prompt,
                 gen_args.enable_thinking,
@@ -1386,6 +1411,7 @@ async def responses_endpoint(request: Request):
                         starts_in_thinking,
                         gen_args.thinking_start_token,
                         gen_args.thinking_end_token,
+                        prompt=formatted_prompt,
                     )
                     reasoning_item_id = f"rs_{uuid.uuid4().hex}"
                     streamed_reasoning = ""
@@ -1526,6 +1552,7 @@ async def responses_endpoint(request: Request):
                             processor=processor,
                             starts_in_thinking=starts_in_thinking,
                             tool_delta_state=tool_delta_state,
+                            prompt=formatted_prompt,
                         )
                     )
                     for item in output_items:
@@ -1653,6 +1680,11 @@ async def responses_endpoint(request: Request):
                                 usage_stats["input_tokens"],
                                 usage_stats["output_tokens"],
                             ),
+                            "timings": GenerationTimings.from_metrics(
+                                metrics,
+                                usage_stats["input_tokens"],
+                                usage_stats["output_tokens"],
+                            ),
                         }
                     )
                     _store_response(
@@ -1667,6 +1699,7 @@ async def responses_endpoint(request: Request):
                         {
                             "type": terminal_event,
                             "response": completed_response.model_dump(),
+                            "timings": completed_response.timings.model_dump(),
                         },
                     )
 
@@ -1785,6 +1818,7 @@ async def responses_endpoint(request: Request):
                         gen_args.thinking_end_token,
                         processor=processor,
                         starts_in_thinking=starts_in_thinking,
+                        prompt=formatted_prompt,
                     )
                 )
                 if finish_reason != "length" and output_finish_reason == "tool_calls":
@@ -1811,6 +1845,9 @@ async def responses_endpoint(request: Request):
                     previous_response_id=openai_request.previous_response_id,
                     store=openai_request.store,
                     usage=OpenAIUsage.from_metrics(
+                        metrics, prompt_tokens, output_tokens
+                    ),
+                    timings=GenerationTimings.from_metrics(
                         metrics, prompt_tokens, output_tokens
                     ),
                 )
@@ -1978,6 +2015,13 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 _chat_message_to_prompt(message.model_dump(exclude_none=True))
             )
 
+        stable_messages = compaction.with_transient_context(
+            processed_messages, request, include_suffix=False
+        )
+        processed_messages = compaction.with_transient_context(
+            processed_messages, request
+        )
+
         _normalize_instruction_messages(processed_messages)
         _ensure_effective_input(processed_messages, images=images, audio=audio)
 
@@ -2038,6 +2082,30 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             video=videos or None,
             tools=tools,
             **template_kwargs,
+        )
+        if request.transient_context and not (images or audio or videos):
+            _normalize_instruction_messages(stable_messages)
+            gen_args.cache_prefix = apply_chat_template(
+                processor,
+                config,
+                stable_messages,
+                add_generation_prompt=False,
+                tools=tools,
+                **template_kwargs,
+            )
+
+        parse_tools = partial(
+            parse_assistant_tool_calls,
+            tool_module=tool_module,
+            tools=tools,
+            starts_in_thinking=prompt_has_open_thinking(
+                formatted_prompt,
+                gen_args.enable_thinking,
+                gen_args.thinking_start_token,
+                gen_args.thinking_end_token,
+            ),
+            thinking_start_token=gen_args.thinking_start_token,
+            thinking_end_token=gen_args.thinking_end_token,
         )
 
         logger.debug(
@@ -2124,6 +2192,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             ),
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
+                            prompt=formatted_prompt,
                         )
                         full_output = ""  # raw output for tool call parsing
                         # Track tool-call state to suppress markup from content
@@ -2238,7 +2307,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         # Parse tool calls from full output and emit final chunk
                         terminal_emitted = False
                         if tool_module is not None:
-                            tc = process_tool_calls(full_output, tool_module, tools)
+                            tc = parse_tools(full_output)
                             remaining_calls = tool_delta_state.finish(tc.calls)
                             if tc.calls:
                                 tool_calls_made = True
@@ -2308,6 +2377,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             ),
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
+                            prompt=formatted_prompt,
                         )
                         tool_call_state = ToolCallStreamState(
                             tool_module.tool_call_start if tool_module else None,
@@ -2384,7 +2454,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             yield f"data: {chunk_data.model_dump_json()}\n\n"
 
                         tc = (
-                            process_tool_calls(output_text, tool_module, tools)
+                            parse_tools(output_text)
                             if tool_module is not None
                             else None
                         )
@@ -2617,6 +2687,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         gen_args.thinking_end_token,
                     ),
                     processor=processor,
+                    prompt=formatted_prompt,
                 )
 
                 # Count raw generated tokens minus thinking tag tokens
@@ -2633,19 +2704,11 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 # Parse tool calls from generated output
                 parsed_tool_calls = None
                 if tool_module is not None:
-                    tc = process_tool_calls(
-                        model_output=full_text,
-                        tool_module=tool_module,
-                        tools=tools,
-                    )
+                    tc = parse_tools(full_text)
                     if tc.calls:
                         parsed_tool_calls = tc.calls
-                        # Clean thinking tags and control tokens from remaining text
-                        _, clean_remaining = _split_thinking(
-                            tc.remaining_text or "",
-                            gen_args.thinking_start_token,
-                            gen_args.thinking_end_token,
-                        )
+                        # Reasoning was already removed before tool parsing.
+                        clean_remaining = tc.remaining_text or ""
                         content = (
                             strip_protocol_markers(
                                 clean_remaining,

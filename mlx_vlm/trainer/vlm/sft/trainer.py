@@ -97,8 +97,18 @@ def _model_type(model):
 
 
 def vision_language_loss_fn(
-    model, batch, train_on_completions=False, assistant_id=77091
+    model, batch, train_on_completions=False, assistant_id=77091, mtp_loss_weight=0.0
 ):
+    if mtp_loss_weight:
+        from .runtime import vlm_sft_loss
+
+        return vlm_sft_loss(
+            model,
+            batch,
+            train_on_completions=train_on_completions,
+            assistant_id=assistant_id,
+            mtp_loss_weight=mtp_loss_weight,
+        )
     pixel_values = batch["pixel_values"]
     input_ids = batch["input_ids"]
     attention_mask = batch["attention_mask"]
@@ -439,6 +449,8 @@ def train(
         raise ValueError("gradient_accumulation_steps must be at least 1")
 
     # Create loss function with partial application
+    if getattr(args, "mtp_loss_weight", 0.0):
+        loss_fn = partial(loss_fn, mtp_loss_weight=args.mtp_loss_weight)
     loss_fn_partial = partial(
         loss_fn, train_on_completions=train_on_completions, assistant_id=assistant_id
     )

@@ -5,6 +5,7 @@ import mlx.nn as nn
 
 from ..base import (
     LanguageModelOutput,
+    cache_position_offset,
     create_attention_mask,
     scaled_dot_product_attention,
 )
@@ -146,17 +147,7 @@ class MllamaTextSelfAttention(nn.Module):
         )
 
         if cache is not None:
-            # Prefer cache._idx (Python int) to avoid a per-step GPU sync.
-            if hasattr(cache, "_idx"):
-                offset = int(cache._idx)
-            else:
-                offset = cache.offset
-                if isinstance(offset, mx.array):
-                    offset = (
-                        int(offset.max().item())
-                        if offset.size > 1
-                        else int(offset.item())
-                    )
+            offset = cache_position_offset(cache)
             query_states = self.rope(query_states, offset=offset)
             key_states = self.rope(key_states, offset=offset)
             key_states, value_states = cache.update_and_fetch(key_states, value_states)
@@ -322,13 +313,7 @@ class MllamaTextModel(nn.Module):
             offset = 0
             for idx, c in enumerate(cache):
                 if c is not None and idx not in self.config.cross_attention_layers:
-                    offset = c.offset
-                    if isinstance(offset, mx.array):
-                        # Batched masks include padding, so use the shared column
-                        # count rather than per-row (unpadded) token offsets.
-                        offset = (
-                            c._idx if hasattr(c, "_idx") else int(offset.max().item())
-                        )
+                    offset = cache_position_offset(c)
                     break
 
             if (

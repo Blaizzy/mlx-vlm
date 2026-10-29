@@ -8,6 +8,7 @@ import math
 import struct
 import warnings
 from dataclasses import dataclass, fields
+from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
@@ -40,6 +41,7 @@ ACTIVATION_QUANTIZATION_MODES = {"nvfp4", "mxfp8"}
 
 # Constants
 MODEL_REMAPPING = {
+    "muse_spark_open": "muse_spark",
     "nemotron_h_puzzle": "nemotron_h",
     "moondream1": "moondream2",
     "llava_qwen2": "fastvlm",  # Apple's FastVLM, note it's different to the one below
@@ -78,6 +80,9 @@ MAX_FILE_SIZE_GB = 5
 MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
 
 SAFETENSORS_DTYPE_FALLBACKS = {"F8_E8M0": "U8"}
+
+# LiquidAI d1 decision checkpoints (D1Model) by their backbone's model_type
+D1_MODEL_TYPES = {"lfm3_vl": "d1_lfm3_vl", "lfm3_omni": "d1_lfm3_omni"}
 
 GENERATION_CONFIG_DEFAULT_KEYS = (
     "eos_token_id",
@@ -203,12 +208,28 @@ def get_model_type(config: dict) -> Optional[str]:
 
     model_type = MODEL_REMAPPING.get(model_type, model_type)
 
+    auto_model = str((config.get("auto_map") or {}).get("AutoModel", ""))
+    if model_type in {"lfm3_vl", "lfm3_omni"} and (
+        "D1Model" in (config.get("architectures") or ())
+        or auto_model.endswith("D1Model")
+    ):
+        model_type = D1_MODEL_TYPES[model_type]
+
     architectures = set(config.get("architectures") or ())
     dflash_config = config.get("dflash_config")
     if "Lfm2BidirectionalForMaskedLM" in architectures:
         model_type = "lfm2_encoder"
+    elif "RadioMBartPrefixForCausalLM" in architectures:
+        model_type = "nemotron_parse_v3_5"
     elif "BoundaryExtractor" in architectures:
         model_type = "gliner2_5"
+    elif model_type == "qwen3_5" and (
+        "Qwen3_5ForSequenceClassification" in architectures
+        or config.get("problem_type") == "single_label_classification"
+    ):
+        # Jev's source checkpoint declares a causal architecture despite having
+        # a two-class score head. Preserve the classification task when loading.
+        model_type = "minicpm_ocr_jev"
     elif "DFlash2DraftModel" in architectures:
         model_type = "dflash2"
     elif "Gemma4DSparkModel" in architectures:
@@ -508,6 +529,15 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                     quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
             elif quant_method == "mxfp4":
                 quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+            elif quant_method == "mxfp8":
+                # Preserve architecture metadata such as MiniMax's NVFP4 MoE
+                # layout while selecting MXFP8 for the remaining linear layers.
+                quantization = {
+                    **quantization_config,
+                    "group_size": 32,
+                    "bits": 8,
+                    "mode": "mxfp8",
+                }
             elif quant_method == "fp8":
                 from .fp8 import transform_fp8_weights
 
@@ -517,6 +547,13 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                     from .models.deepseek_v4.language import make_quantization_config
 
                     quantization = make_quantization_config(model)
+            elif (
+                quant_method == "modelopt"
+                and quantization_config.get("quant_algo") == "NVFP4"
+            ):
+                # Some ModelOpt MoE exports use fused, underscore-delimited
+                # tensor names handled by the model's sanitizer below.
+                quantization = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
             elif (
                 quant_method == "modelopt"
                 and quantization_config.get("quant_algo") == "MXFP8"
@@ -836,6 +873,9 @@ def load(
 
     if image_processor is not None:
         processor.image_processor = image_processor
+
+    if hasattr(model, "attach_processor"):
+        model.attach_processor(processor)
 
     return model, processor
 
@@ -1503,10 +1543,13 @@ def load_audio(
     else:
         audio, sample_rate = read_audio(file, dtype="float32")
 
+    audio = np.asarray(audio, dtype=np.float32)
+    if audio.size == 0:
+        source = file if isinstance(file, str) else "the audio data"
+        raise ValueError(f"Decoding {source} returned no samples")
     # Downmix before resampling: read_audio returns (samples, channels), and
     # resample_audio works on the last axis, so resampling stereo first would
     # resample the channel axis and leave the samples at the source rate.
-    audio = np.asarray(audio, dtype=np.float32)
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
     if sample_rate != sr:
@@ -1814,6 +1857,22 @@ def process_inputs_with_fallback(
         raise ValueError(f"Failed to process inputs with error: {e}")
 
 
+@lru_cache(maxsize=128)
+def _tokenizer_length_kwargs(cls):
+    try:
+        params = inspect.signature(cls.__call__).parameters.values()
+    except (TypeError, ValueError):
+        return set()
+
+    names = {"truncation", "max_length"}
+    if any(p.kind == p.VAR_KEYWORD for p in params):
+        return names
+
+    return names.intersection(
+        p.name for p in params if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+    )
+
+
 def prepare_inputs(
     processor,
     images=None,
@@ -1837,7 +1896,9 @@ def prepare_inputs(
     has_videos = videos is not None and (
         not hasattr(videos, "__len__") or len(videos) > 0
     )
-    if not has_images and not has_audio and not has_videos:
+    # prior speech given as codes still needs the processor to expand its placeholders
+    has_audio_out = kwargs.get("audio_out_codes") is not None
+    if not has_images and not has_audio and not has_videos and not has_audio_out:
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
@@ -1850,6 +1911,10 @@ def prepare_inputs(
             padding=padding,
             padding_side=padding_side,
             return_tensors=return_tensors,
+            **{
+                key: kwargs[key]
+                for key in kwargs.keys() & _tokenizer_length_kwargs(type(tokenizer))
+            },
         )
         input_ids = (
             inputs.input_ids

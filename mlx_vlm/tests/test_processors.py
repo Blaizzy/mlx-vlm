@@ -13,6 +13,7 @@ import textwrap
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, nullcontext
 from copy import deepcopy
+from functools import wraps
 from io import BytesIO
 from operator import attrgetter
 from pathlib import Path
@@ -25,8 +26,10 @@ import mlx.core as mx
 import numpy as np
 import pytest
 from PIL import Image
-from tokenizers import Tokenizer
+from tokenizers import AddedToken, Tokenizer
+from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 from tokenizers.models import WordLevel
+from tokenizers.normalizers import NFKC
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import AutoProcessor, PreTrainedTokenizerBase, PreTrainedTokenizerFast
 
@@ -49,6 +52,9 @@ from mlx_vlm.tokenizer_utils import (
     _is_spm_decoder,
     _is_spm_decoder_no_space,
     _match,
+    _ServerTokenStreamer,
+    load_tokenizer,
+    make_streaming_detokenizer,
 )
 from mlx_vlm.tools import (
     SPECS,
@@ -205,6 +211,215 @@ def test_initialization():
 
     assert detokenizer._byte_decoder is not None
     assert detokenizer.text == ""
+
+
+@pytest.mark.parametrize("server_stream", [False, True], ids=["cli", "server"])
+@pytest.mark.parametrize("trim_space", [False, True], ids=["keep-space", "trim-space"])
+@pytest.mark.parametrize(
+    "pieces, expected_segments, final_segment",
+    [
+        (["Ġhello", "Ġworld"], [" hello", " world"], ""),
+        (["hello", "\n\n", "world"], ["hello", "\n\n", "world"], ""),
+        (["高", "ა", "🙂"], ["高", "ა", "🙂"], ""),
+        (["Ġé\n高", "Ġdone"], ["Ġé\n高", " done"], ""),
+        ([" hello", "\t", "world"], [" hello", "\t", "world"], ""),
+        (["Ã", "©", "\n\n", "高"], ["", "é", "\n\n", "高"], ""),
+        (["Ã", "高", "©", "Ġdone"], ["", "\ufffd高", "\ufffd", " done"], ""),
+        (["Ã", "高", "©"], ["", "\ufffd高", "\ufffd"], ""),
+        (["hello", "Ã"], ["hello", ""], "\ufffd"),
+        (["ðŁ", "ĻĤ"], ["", "🙂"], ""),
+        (["ðŁ"], [""], "\ufffd"),
+        (["\ufffd"], ["\ufffd"], ""),
+        (["Ġ", "Ġ", "hello"], [" ", " ", "hello"], ""),
+    ],
+    ids=[
+        "byte-alphabet",
+        "literal-newlines",
+        "literal-unicode",
+        "whole-token-fallback",
+        "literal-whitespace",
+        "split-utf8",
+        "interrupted-utf8",
+        "invalid-utf8-at-end",
+        "incomplete-utf8-at-end",
+        "split-emoji",
+        "incomplete-emoji-at-end",
+        "literal-replacement-character",
+        "trim-only-first-space",
+    ],
+)
+def test_bpe_streaming_matches_native_bytelevel(
+    tmp_path, pieces, expected_segments, final_segment, trim_space, server_stream
+):
+    backend = Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
+    backend.decoder = ByteLevelDecoder()
+    backend.add_tokens(list(dict.fromkeys(pieces)))
+    backend.save(str(tmp_path / "tokenizer.json"))
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend, clean_up_tokenization_spaces=False
+    )
+    tokens = [backend.token_to_id(piece) for piece in pieces]
+    assert tokenizer.decode(tokens) == "".join(expected_segments) + final_segment
+
+    factory = load_tokenizer(tmp_path, return_tokenizer=False)
+    assert factory is BPEStreamingDetokenizer
+    detokenizer = factory(tokenizer, trim_space=trim_space)
+    expected_segments = expected_segments.copy()
+    if trim_space:
+        for i, segment in enumerate(expected_segments):
+            if segment:
+                expected_segments[i] = segment.removeprefix(" ")
+                break
+    expected = "".join(expected_segments) + final_segment
+
+    # Resetting an existing detokenizer must preserve its normalized token map.
+    for _ in range(2):
+        detokenizer.reset()
+        segments = []
+        if server_stream:
+            streamer = _ServerTokenStreamer(tokenizer, detokenizer)
+            for token in tokens:
+                segments.append(streamer.advance(token, finish_reason=None))
+            assert segments == expected_segments
+            assert streamer.finalize() == final_segment
+            assert streamer.finalize() == ""
+        else:
+            for token in tokens:
+                detokenizer.add_token(token)
+                segments.append(detokenizer.last_segment)
+                assert detokenizer.last_segment == ""
+            assert segments == expected_segments
+            detokenizer.finalize()
+            assert detokenizer.last_segment == final_segment
+            detokenizer.finalize()
+            assert detokenizer.last_segment == ""
+            assert detokenizer.text == expected
+        assert "".join(segments) + final_segment == expected
+
+
+@pytest.mark.parametrize("server_stream", [False, True], ids=["cli", "server"])
+@pytest.mark.parametrize("normalized", [False, True], ids=["literal", "normalized"])
+@pytest.mark.parametrize(
+    "piece, canonical",
+    [("ŉ", "ʼn"), ("ำ", "ํา"), ("ﭏ", "אל"), ("ﬃ", "ffi"), ("ͺ", " ͅ")],
+    ids=["apostrophe-n", "thai", "hebrew", "ligature", "leading-space"],
+)
+def test_bpe_streaming_uses_canonical_added_tokens(
+    tmp_path, piece, canonical, normalized, server_stream
+):
+    backend = Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
+    backend.normalizer = NFKC()
+    backend.decoder = ByteLevelDecoder()
+    backend.add_tokens([AddedToken(piece, normalized=normalized)])
+    backend.save(str(tmp_path / "tokenizer.json"))
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend, clean_up_tokenization_spaces=False
+    )
+    token = tokenizer.vocab[piece]
+    expected = tokenizer.convert_ids_to_tokens(token)
+    assert expected in {piece, canonical}
+    assert tokenizer.decode([token]) == expected
+
+    detokenizer = load_tokenizer(tmp_path, return_tokenizer=False)(tokenizer)
+    if server_stream:
+        streamer = _ServerTokenStreamer(tokenizer, detokenizer)
+        assert streamer.advance(token, finish_reason=None) == expected
+        assert streamer.finalize() == ""
+    else:
+        detokenizer.add_token(token)
+        assert detokenizer.last_segment == expected
+        detokenizer.finalize()
+        assert detokenizer.last_segment == ""
+        assert detokenizer.text == expected
+
+
+@pytest.mark.parametrize("server_stream", [False, True], ids=["cli", "server"])
+@pytest.mark.parametrize("stride", [1, 2], ids=["dense-vocab", "sparse-vocab"])
+@pytest.mark.parametrize(
+    "pieces, expected",
+    [
+        ([None], ""),
+        ([None, "Ġhello"], "hello"),
+        (["Ã", None, "©"], "é"),
+        (["Ã", None], "\ufffd"),
+        (["z", None, "z"], "zz"),
+    ],
+    ids=["only-unmapped", "leading-space", "split-utf8", "truncated-utf8", "ascii"],
+)
+def test_bpe_streaming_skips_unmapped_ids(stride, pieces, expected, server_stream):
+    vocab = {piece: i * stride for i, piece in enumerate(["Ã", "©", "Ġhello", "z"])}
+    backend = Tokenizer(WordLevel(vocab))
+    backend.decoder = ByteLevelDecoder()
+    tokenizer = NS(
+        vocab=backend.get_vocab(),
+        convert_ids_to_tokens=backend.id_to_token,
+        decode=backend.decode,
+    )
+    unmapped = [
+        i for i in range(max(vocab.values()) + 2) if backend.id_to_token(i) is None
+    ]
+    unmapped.append(2**32 - 1)
+    tokens = [
+        token
+        for piece in pieces
+        for token in (unmapped if piece is None else [vocab[piece]])
+    ]
+    assert tokenizer.decode(tokens).removeprefix(" ") == expected
+
+    detokenizer = BPEStreamingDetokenizer(tokenizer, trim_space=True)
+    streamer = _ServerTokenStreamer(tokenizer, detokenizer) if server_stream else None
+    segments = []
+    for token in tokens:
+        if server_stream:
+            segment = streamer.advance(token, finish_reason=None)
+        else:
+            detokenizer.add_token(token)
+            segment = detokenizer.last_segment
+        if token in unmapped:
+            assert segment == ""
+        segments.append(segment)
+    if server_stream:
+        segments.append(streamer.finalize())
+    else:
+        detokenizer.finalize()
+        segments.append(detokenizer.last_segment)
+        assert detokenizer.text == expected
+    assert "".join(segments) == expected
+
+
+@pytest.mark.parametrize("server_stream", [False, True], ids=["cli", "server"])
+def test_bpe_streaming_empty_vocab(server_stream):
+    backend = Tokenizer(WordLevel({}))
+    tokenizer = NS(vocab=backend.get_vocab(), decode=backend.decode)
+    assert tokenizer.decode([0]) == ""
+    detokenizer = BPEStreamingDetokenizer(tokenizer)
+    if server_stream:
+        streamer = _ServerTokenStreamer(tokenizer, detokenizer)
+        assert streamer.advance(0, finish_reason=None) == ""
+        assert streamer.finalize() == ""
+    else:
+        detokenizer.add_token(0)
+        detokenizer.finalize()
+        assert detokenizer.text == ""
+
+
+def test_bpe_streaming_copies_isolate_partial_utf8_and_skip_tokens():
+    source = BPEStreamingDetokenizer(
+        MockTokenizer({"Ã": 0, "©": 1, "高": 2, "<skip>": 3})
+    )
+    source.add_token(0)
+    processor = NS(detokenizer=source)
+    left = make_streaming_detokenizer(processor)
+    right = make_streaming_detokenizer(processor)
+    left.add_token(0)
+    assert left.last_segment == ""
+    right.add_token(2)
+    assert right.last_segment == "高"
+    left.add_token(3, skip_special_token_ids=[3])
+    left.add_token(1)
+    assert left.last_segment == "é"
+    source.add_token(1)
+    assert source.last_segment == "é"
 
 
 @pytest.mark.parametrize("factory", [None, SPMStreamingDetokenizer])
@@ -637,6 +852,73 @@ def test_auto_processor_routes_to_custom_loader(
         loader.assert_called_once_with(tmp_path, trust_remote_code=True)
 
 
+def test_flint_tokenizer_prompt_and_stop_tokens(tmp_path):
+    importlib.import_module("mlx_vlm.models.flint")
+    raw = Tokenizer(
+        WordLevel(
+            {
+                "[UNK]": 0,
+                "hello": 1,
+                "<|end_of_text|>": 2,
+                "<|user|>": 3,
+                "<|assistant|>": 4,
+            },
+            unk_token="[UNK]",
+        )
+    )
+    raw.pre_tokenizer = Whitespace()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=raw,
+        unk_token="[UNK]",
+        eos_token="<|end_of_text|>",
+        additional_special_tokens=["<|user|>", "<|assistant|>"],
+    )
+    tokenizer.chat_template = (
+        "{% for m in messages %}<|{{ m.role }}|>"
+        "{% if m.reasoning_content %}<think>{{ m.reasoning_content }}</think>{% endif %}"
+        "{{ m.content }}{% for tc in m.tool_calls %}<tool_call>{{ tc.function.name }}"
+        "{% for k, v in tc.function.arguments.items() %}"
+        "<arg_key>{{ k }}</arg_key><arg_value>{{ v }}</arg_value>{% endfor %}"
+        "</tool_call>{% endfor %}{% endfor %}"
+        "{% if add_generation_prompt %}<|assistant|>{% endif %}"
+    )
+    tokenizer.save_pretrained(tmp_path)
+    _write_configs(
+        tmp_path,
+        config={
+            "model_type": "flint",
+            "auto_map": {"AutoConfig": "must_not_execute.FlintConfig"},
+        },
+    )
+    processor = load_processor(tmp_path, eos_token_ids=[2, 4], trust_remote_code=False)
+    assert isinstance(processor, PreTrainedTokenizerBase)
+    assert processor.backend_tokenizer.to_str() == tokenizer.backend_tokenizer.to_str()
+    prompt = apply_chat_template(processor, {"model_type": "flint"}, "hello")
+    assert prompt == "<|user|>hello<|assistant|>"
+    assert processor.encode(prompt) == [3, 1, 4]
+    assert processor.stopping_criteria(2)
+    assert processor.stopping_criteria(4)
+    assert not processor.stopping_criteria(1)
+    assert _infer_tool_parser_from_processor(processor) == "glm47"
+    previous_answer = dict(
+        role="assistant", content="hello", reasoning_content="Remember this."
+    )
+    previous_call = dict(
+        role="assistant",
+        content=None,
+        reasoning_content="Look it up.",
+        tool_calls=[dict(function=dict(name="lookup", arguments='{"query": "hello"}'))],
+    )
+    for messages in (previous_call, [previous_answer, previous_call]):
+        original = deepcopy(messages)
+        rendered = apply_chat_template(processor, {"model_type": "flint"}, messages)
+        assert "<think>Look it up.</think><tool_call>lookup" in rendered
+        assert "<arg_key>query</arg_key><arg_value>hello</arg_value>" in rendered
+        if isinstance(messages, list):
+            assert "<think>Remember this.</think>hello" in rendered
+        assert messages == original
+
+
 def test_qwen3_5_moe_text_stale_vl_processor_loads_tokenizer(tmp_path):
     from transformers import Qwen2Tokenizer
 
@@ -775,6 +1057,19 @@ def test_gemma3n_batches_images_and_audio():
     assert processor.tokenizer.last_kwargs["padding"] is True
 
 
+def test_nemotron_parse_packed_page_geometry_and_patch_order():
+    image = Image.fromarray(np.arange(17 * 65 * 3, dtype=np.uint8).reshape(17, 65, 3))
+    inputs = m.nemotron_parse_v3_5.ImageProcessor()(image)
+    assert inputs["image_sizes"].tolist() == [[32, 128]]
+    assert inputs["content_sizes"].tolist() == [[17, 65]]
+    assert inputs["pixel_values"].shape == (16, 768)
+    expected = (
+        np.asarray(image).transpose(2, 0, 1).astype(np.float32) / 255
+        - np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)[:, None, None]
+    ) / np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)[:, None, None]
+    equal(inputs["pixel_values"][0], expected[:, :16, :16].reshape(-1))
+
+
 def test_unlimited_ocr_default_chat_template_omits_trailing_space():
     Template = pytest.importorskip("jinja2").Template
     p = object.__new__(c.ocr)
@@ -782,6 +1077,63 @@ def test_unlimited_ocr_default_chat_template_omits_trailing_space():
         messages=DATA["ocr_messages"], add_generation_prompt=True
     )
     assert rendered == "<image>document parsing. partial continue"
+
+
+@pytest.mark.parametrize(
+    "prompt,num_images,expected",
+    [
+        ("Multi page parsing.", 2, "<PAGE><image><PAGE><image>Multi page parsing."),
+        (
+            "<image>Multi page parsing.",
+            2,
+            "<PAGE><image><PAGE><image>Multi page parsing.",
+        ),
+        ("<image>a<image>b", 2, "<PAGE><image>a<PAGE><image>b"),
+        ("<PAGE><image>Multi page parsing.", 1, "<PAGE><image>Multi page parsing."),
+    ],
+)
+def test_unlimited_ocr2_page_prompt_layout(prompt, num_images, expected):
+    p = object.__new__(c.ocr)
+    p.page_layout, p.image_token = True, "<image>"
+    assert p.page_prompt(prompt, num_images) == expected
+    p.page_layout = False
+    assert p.page_prompt(prompt, num_images) == prompt
+
+
+@pytest.mark.parametrize("page_layout", [False, True], ids=["v1", "v2"])
+@pytest.mark.parametrize("num_pages", [1, 2])
+@pytest.mark.parametrize("cropping", ["default", None, True, False])
+def test_unlimited_ocr_crop_modes(page_layout, num_pages, cropping):
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(
+            WordLevel({"<unk>": 0, "<image>": 1, "<pad>": 2}, unk_token="<unk>")
+        ),
+        unk_token="<unk>",
+        pad_token="<pad>",
+    )
+    processor = c.ocr(tokenizer=tokenizer, page_layout=page_layout)
+    kwargs = {} if cropping == "default" else {"cropping": cropping}
+    # Two 640-pixel tiles per page, independent of the page count.
+    result = processor(
+        text="<image>Multi page parsing.",
+        images=[Image.new("RGB", (640, 1280))] * num_pages,
+        **kwargs,
+    )
+    tiled = cropping is not False
+    assert (
+        result["images_spatial_crop"].tolist()
+        == ([[1, 2]] if tiled else [[1, 1]]) * num_pages
+    )
+    assert result["images"][1].shape == (
+        num_pages,
+        3,
+        1024 if tiled or page_layout else 640,
+        1024 if tiled or page_layout else 640,
+    )
+    if tiled:
+        assert result["images"][0].shape == (num_pages * 2, 3, 640, 640)
+    expected_image_tokens = 493 if tiled else (273 if page_layout else 111)
+    assert int(result["images_seq_mask"].sum()) == expected_image_tokens * num_pages
 
 
 @pytest.mark.parametrize("name,start,end", DATA["cleanup"])
@@ -1870,6 +2222,42 @@ def test_prompt_does_not_leak_image_payload(representation):
 
 
 class TestApplyChatTemplateIntegration:
+    def test_lfm3_speech_models_put_the_audio_before_the_text(self):
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "lfm3_audio"},
+            "What is said?",
+            return_messages=True,
+            num_images=0,
+            num_audios=1,
+        )
+        assert [item["type"] for item in result[0]["content"]] == ["audio", "text"]
+        result = apply_chat_template(
+            None,
+            {"model_type": "lfm3_omni"},
+            "What is shown and said?",
+            return_messages=True,
+            num_images=1,
+            num_audios=1,
+        )
+        types = [item["type"] for item in result[0]["content"]]
+        assert types == ["image", "audio", "text"]
+
+    def test_assistant_reasoning_content_is_preserved(self):
+        messages = [
+            {"role": "user", "content": "What is 17 + 25?"},
+            {"role": "assistant", "content": "42", "reasoning_content": "7+5=12"},
+        ]
+
+        result = apply_chat_template(
+            None, {"model_type": "lfm3"}, messages, return_messages=True
+        )
+
+        assert result[1]["reasoning_content"] == "7+5=12"
+        assert "reasoning_content" not in result[0]
+
     """Integration tests for apply_chat_template with multimodal content.
 
     These tests verify the actual bug fix works end-to-end, not just the helper.
@@ -2267,7 +2655,7 @@ def _weather_tools(**fields):
 WEATHER_TOOLS = _weather_tools(city="string", days="integer")
 # Literal wire examples are independent of the parser's marker constants.
 WIRE_CALLS = {
-    "atem": 'to=self<|message|><atem:function_calls><atem:invoke name="get_weather">'
+    "atem": '<atem:function_calls><atem:invoke name="get_weather">'
     '<atem:parameter name="city">Paris</atem:parameter>'
     '<atem:parameter name="days">3</atem:parameter></atem:invoke></atem:function_calls>',
     "cohere2_moe": '<|START_ACTION|>{"tool_name":"get_weather",'
@@ -2732,6 +3120,141 @@ def test_prepare_inputs(prompt, with_image, error, pad_token):
     if prompt == "test <image>":
         assert mx.array_equal(inputs["pixel_values"], mx.zeros((4, 5, 6)))
         assert mx.array_equal(inputs["attention_mask"], mx.array([7, 8, 9]))
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("padding_side", ["left", "right"])
+@pytest.mark.parametrize(
+    "options,expected_length",
+    [
+        ({}, 10),
+        ({"truncation": True, "max_length": 4}, 4),
+        ({"truncation": True}, 6),
+        ({"truncation": False, "max_length": 4}, 10),
+        ({"padding": "max_length", "max_length": 12}, 12),
+    ],
+    ids=["default", "truncate", "model-limit", "no-truncation", "fixed-padding"],
+)
+def test_prepare_inputs_text_length_options(
+    wrapped, padding_side, options, expected_length
+):
+    tokens = "[UNK] [PAD] hello world one two three four five six".split()
+    tokenizer = fast_tokenizer(tokens, model_max_length=6)
+    prompts = ["hello world one two three four five six hello world", "hello world"]
+    expected = tokenizer(
+        prompts,
+        **{
+            "add_special_tokens": False,
+            "padding": True,
+            "padding_side": padding_side,
+            "return_tensors": "np",
+            **options,
+        },
+    )
+    processor = NS(tokenizer=tokenizer) if wrapped else tokenizer
+    actual = prepare_inputs(
+        processor, prompts=prompts, padding_side=padding_side, **options
+    )
+
+    assert actual["input_ids"].shape == (2, expected_length)
+    for key in ("input_ids", "attention_mask"):
+        assert mx.array_equal(actual[key], mx.array(expected[key]))
+
+
+def test_prepare_inputs_text_options_do_not_forward_media_or_generation_options():
+    tokenizer = fast_tokenizer()
+    spy = Mock(wraps=tokenizer, pad_token=tokenizer.pad_token)
+    unrelated = dict(
+        min_pixels=1024,
+        max_pixels=4096,
+        fps=2.0,
+        nframes=4,
+        temperature=0.7,
+        max_tokens=16,
+    )
+    actual = prepare_inputs(
+        NS(tokenizer=spy),
+        prompts="hello hello hello hello hello hello",
+        truncation=True,
+        max_length=4,
+        **unrelated,
+    )
+
+    assert actual["input_ids"].shape == (1, 4)
+    assert unrelated.keys().isdisjoint(spy.call_args.kwargs)
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize(
+    "call,expected,error",
+    [
+        (lambda: (), (), None),
+        (lambda *, max_length=None: (max_length,), (2,), None),
+        (
+            lambda truncation=False, max_length=None, /: (truncation, max_length),
+            (False, None),
+            None,
+        ),
+        (lambda: (), (), TypeError),
+        (lambda: (), (), ValueError),
+    ],
+    ids=["strict", "max-length", "positional", "signature-type", "signature-value"],
+)
+def test_prepare_inputs_text_custom_length_parameters(wrapped, call, expected, error):
+    result = NS(input_ids=[[1, 2]], attention_mask=[[1, 1]])
+
+    class Tokenizer:
+        pad_token = "[PAD]"
+
+        # Inspect and enforce the delegated length-option signature.
+        @wraps(call)
+        def __call__(self, text, **kwargs):
+            for key in (
+                "add_special_tokens",
+                "padding",
+                "padding_side",
+                "return_tensors",
+            ):
+                kwargs.pop(key)
+            assert call(**kwargs) == expected
+            return result
+
+    tokenizer = Tokenizer()
+    context = (
+        patch("mlx_vlm.utils.inspect.signature", side_effect=error)
+        if error
+        else nullcontext()
+    )
+    with context:
+        actual = prepare_inputs(
+            NS(tokenizer=tokenizer) if wrapped else tokenizer,
+            prompts="hello hello",
+            truncation=True,
+            max_length=2,
+        )
+    assert actual["input_ids"].tolist() == result.input_ids
+    assert actual["attention_mask"].tolist() == result.attention_mask
+
+
+@pytest.mark.parametrize(
+    "options,expected_length",
+    [
+        ({}, 2),
+        ({"truncation": False, "max_length": 4}, 6),
+        ({"truncation": None, "max_length": None}, 6),
+    ],
+    ids=["custom-defaults", "disabled", "explicit-none"],
+)
+def test_prepare_inputs_text_preserves_custom_length_defaults(options, expected_length):
+    class DefaultLengthTokenizer(PreTrainedTokenizerFast):
+        def __call__(self, text, truncation=True, max_length=2, **kwargs):
+            return super().__call__(
+                text, truncation=truncation, max_length=max_length, **kwargs
+            )
+
+    tokenizer = fast_tokenizer(tokenizer_class=DefaultLengthTokenizer)
+    actual = prepare_inputs(tokenizer, prompts="hello " * 6, **options)
+    assert actual["input_ids"].shape == (1, expected_length)
 
 
 def test_prepare_inputs_preserves_mlx_attention_mask_for_thread_handoff():
@@ -3804,3 +4327,420 @@ class TestMiniCPMV47Processor:
         assert loaded.tokenizer.chat_template == tokenizer.chat_template
         result = loaded(text="<|image_pad|>", images=[Image.new("RGB", (56, 56))])
         assert np.count_nonzero(result["mm_token_type_ids"] == 1) == 4
+
+
+class TestMiniCPMOcrProcessor:
+    @staticmethod
+    def processor(**kwargs):
+        from mlx_vlm.models.minicpm_ocr import (
+            MiniCPMOcrImageProcessor,
+            MiniCPMOcrProcessor,
+        )
+
+        return MiniCPMOcrProcessor(
+            tokenizer=ProcessorTokenizer(**PROFILES["minicpm_tokenizer"]),
+            image_processor=MiniCPMOcrImageProcessor(**kwargs),
+        )
+
+    @pytest.mark.parametrize("mode,target", [("4x", [24, 42]), ("16x", [24, 44])])
+    def test_mode_specific_resize(self, mode, target):
+        p = self.processor()
+        result = p(
+            text="<|image_pad|>",
+            images=[Image.new("RGB", (301, 173))],
+            downsample_mode=mode,
+        )
+        assert result["tgt_sizes"][0].tolist() == [target]
+        assert result["downsample_mode"] == mode
+        divisor = 4 if mode == "4x" else 16
+        assert (
+            np.count_nonzero(result["mm_token_type_ids"] == 1)
+            == np.prod(target) // divisor
+        )
+        assert p.image_processor.downsample_mode == "4x"
+
+    def test_adaptive_resolution_and_per_slice_placeholders(self):
+        p = self.processor()
+        image = Image.new("RGB", (40, 20), "white")
+        result = p(
+            text="<|image_pad|>", images=[image], adaptive_small_image_upsize=True
+        )
+        assert result["tgt_sizes"][0].tolist() == [[4, 8]]
+        assert p.image_processor.adaptive_small_image_upsize is False
+        ids = p._build_placeholder_ids_for_image(
+            np.array([[4, 4], [2, 2], [4, 2]]), (2, 1), 0, 4
+        )
+        assert ids.count(p.image_token_id) == 7
+        assert p._compute_image_bounds(np.array(ids)).tolist() == [
+            [4, 8],
+            [10, 11],
+            [13, 15],
+        ]
+
+    @pytest.mark.parametrize("mode", ["4x", "16x"])
+    @pytest.mark.parametrize("size", [(40, 20), (1000, 800)])
+    def test_generation_routes_image_options(self, mode, size):
+        from mlx_vlm.utils import prepare_inputs
+
+        p = self.processor()
+        image = Image.new("RGB", size, "white")
+        options = {
+            "downsample_mode": mode,
+            "max_slice_nums": 1,
+            "adaptive_small_image_upsize": True,
+            "disable_small_image_upsize": True,
+        }
+        expected = p(text="<|image_pad|>", images=[image], **options)
+        actual = prepare_inputs(p, prompts="<|image_pad|>", images=[image], **options)
+        assert actual["downsample_mode"] == mode
+        np.testing.assert_array_equal(actual["input_ids"], expected["input_ids"])
+        np.testing.assert_array_equal(actual["tgt_sizes"][0], expected["tgt_sizes"][0])
+        assert len(actual["pixel_values"][0]) == 1
+        assert p.image_processor.downsample_mode == "4x"
+        assert p.image_processor.adaptive_small_image_upsize is False
+
+    def test_save_load_adaptive_settings(self, tmp_path):
+        from mlx_vlm.models.minicpm_ocr import MiniCPMOcrProcessor
+
+        p = self.processor(
+            adaptive_small_image_upsize=True,
+            adaptive_tile_upsize=True,
+            disable_small_image_upsize=True,
+            use_image_id=False,
+        )
+        tokens = p.tokenizer.special_tokens
+        p.tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(
+                WordLevel(vocab={t: i for i, t in enumerate(tokens)}, unk_token="<unk>")
+            ),
+            unk_token="<unk>",
+            pad_token="<unk>",
+            additional_special_tokens=list(tokens),
+        )
+        p.tokenizer.chat_template = (
+            "{% for message in messages %}{{ message.content }}{% endfor %}"
+        )
+        p = MiniCPMOcrProcessor(
+            tokenizer=p.tokenizer, image_processor=p.image_processor
+        )
+        p.save_pretrained(tmp_path)
+        (tmp_path / "config.json").write_text(
+            json.dumps({"model_type": "minicpm_ocr", "downsample_mode": "4x"})
+        )
+        loaded = AutoProcessor.from_pretrained(tmp_path)
+        assert isinstance(loaded, MiniCPMOcrProcessor)
+        assert loaded.image_processor.adaptive_tile_upsize
+        assert loaded.image_processor.adaptive_small_image_upsize
+        assert loaded.image_processor.disable_small_image_upsize
+        image = Image.new("RGB", (1000, 800), "white")
+        expected = p(text="<|image_pad|>", images=[image])
+        actual = loaded(text="<|image_pad|>", images=[image])
+        np.testing.assert_array_equal(actual["tgt_sizes"][0], expected["tgt_sizes"][0])
+        np.testing.assert_array_equal(actual["input_ids"], expected["input_ids"])
+
+
+@pytest.fixture
+def lfm3_processor():
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+
+    module = importlib.import_module("mlx_vlm.models.lfm3_vl.processing_lfm3_vl")
+    image_module = importlib.import_module(
+        "mlx_vlm.models.qwen3_vl.processing_qwen3_vl"
+    )
+    tokens = ["<unk>", "<|image|>", "<|video|>", "<|vision_start|>", "<|vision_end|>"]
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(
+            WordLevel(dict(zip(tokens, range(len(tokens)))), unk_token="<unk>")
+        ),
+        unk_token="<unk>",
+        additional_special_tokens=tokens[1:],
+    )
+    return module.Lfm3VlProcessor(
+        image_module.Qwen3VLImageProcessor(min_pixels=4096, max_pixels=16384),
+        tokenizer,
+        module.Lfm3VlVideoProcessor(min_pixels=4096, max_pixels=65536),
+    )
+
+
+def test_lfm3_media_placeholders_are_validated_without_replacing_inserted_tokens():
+    module = importlib.import_module("mlx_vlm.models.lfm3_vl.processing_lfm3_vl")
+    result = module.Lfm3VlProcessor._expand(
+        ["a<|image|>b<|image|>c"], "<|image|>", ["<|image|>" * 2, "<|image|>" * 3]
+    )
+    assert result == ["a<|image|><|image|>b<|image|><|image|><|image|>c"]
+    with pytest.raises(ValueError, match="placeholders"):
+        module.Lfm3VlProcessor._expand(["a"], "<|image|>", ["image"])
+    with pytest.raises(ValueError, match="placeholders"):
+        module.Lfm3VlProcessor._expand(["<|image|>"], "<|image|>", [])
+
+
+def test_lfm3_processor_save_preserves_resolution_override(tmp_path, lfm3_processor):
+    processor = lfm3_processor
+    processor.image_processor.max_pixels = 4096
+    image = Image.fromarray(np.zeros((128, 128, 3), dtype=np.uint8))
+    expected = processor(text="<|image|>", images=image, return_tensors="np")
+    processor.save_pretrained(tmp_path)
+    restored = type(processor).from_pretrained(tmp_path)
+    actual = restored(text="<|image|>", images=image, return_tensors="np")
+    for name in expected:
+        np.testing.assert_array_equal(actual[name], expected[name])
+
+
+def test_lfm3_video_timestamps_use_sampled_fps_and_repeat_the_last_odd_frame(
+    lfm3_processor,
+):
+    processor = lfm3_processor
+    tokenizer = processor.tokenizer
+
+    class RecordingTokenizer:
+        def __call__(self, text, **kwargs):
+            self.text = text
+            return tokenizer(text, **kwargs)
+
+    processor.tokenizer = RecordingTokenizer()
+    frames = np.stack(
+        [np.full((64, 64, 3), value, dtype=np.uint8) for value in (0, 100, 255)]
+    )
+    result = processor(
+        text="<|video|>", videos=[frames], fps=[2.0], return_tensors="np"
+    )
+    text = processor.tokenizer.text[0]
+    assert "<0.2 seconds>" in text  # average of frames at 0.0 and 0.5 seconds
+    assert "<1.0 seconds>" in text  # the final frame is duplicated, not extrapolated
+    np.testing.assert_array_equal(result["video_grid_thw"], [[2, 4, 4]])
+    np.testing.assert_allclose(result["pixel_values_videos"][-16:], 1.0)
+    with pytest.raises(ValueError, match="pre-sampled"):
+        processor(text="<|video|>", videos=[frames], do_sample_frames=True)
+    # the reference rounds fps to 6 decimals: (1499 + 1501) / 2 / 29.97 = 50.05
+    processor(
+        text="<|video|>",
+        videos=[frames[:2]],
+        video_metadata=[dict(fps=30000 / 1001, frames_indices=[1499, 1501])],
+    )
+    assert "<50.0 seconds>" in processor.tokenizer.text[0]
+    # 35 / 30 + 52 / 30 averages to 1.5, the mean index / 30 to 1.4
+    processor(
+        text="<|video|>",
+        videos=[frames[:2]],
+        video_metadata=[dict(fps=30.0, frames_indices=[35, 52])],
+    )
+    assert "<1.5 seconds>" in processor.tokenizer.text[0]
+
+
+@pytest.mark.parametrize(
+    "total, source_fps, max_frames, expected",
+    [
+        (81, 30.0, None, [0, 20, 40, 60, 80]),  # odd counts are not floored
+        (10, 30.0, None, [0, 3, 6, 9]),  # min_frames
+        (3, 30.0, None, [0, 1, 2]),  # never more than the clip has
+        (1000, 10.0, 8, [0, 143, 285, 428, 571, 714, 856, 999]),
+    ],
+)
+def test_lfm3_video_sampling_follows_the_reference_rule(
+    lfm3_processor, total, source_fps, max_frames, expected
+):
+    sampler = lfm3_processor.video_processor
+    assert sampler.sample_frames_in_loader
+    metadata = SimpleNamespace(total_num_frames=total, fps=source_fps)
+    actual = sampler.sample_frames(metadata, fps=2.0, max_frames=max_frames)
+    assert actual.tolist() == expected
+
+
+def test_lfm3_video_file_keeps_odd_frame_counts_and_source_times(
+    tmp_path, lfm3_processor
+):
+    import cv2
+
+    from mlx_vlm.utils import prepare_inputs
+
+    path = str(tmp_path / "clip.mp4")
+    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), 30.0, (64, 64))
+    for i in range(105):
+        writer.write(np.full((64, 64, 3), i, dtype=np.uint8))
+    writer.release()
+    processor = lfm3_processor
+    tokenizer = processor.tokenizer
+    tokenizer.pad_token = tokenizer.unk_token
+
+    class RecordingTokenizer:
+        pad_token = tokenizer.unk_token
+
+        def __call__(self, text, **kwargs):
+            self.text = text
+            return tokenizer(text, **kwargs)
+
+    processor.tokenizer = RecordingTokenizer()
+    result = prepare_inputs(processor, prompts="<|video|>", videos=[path])
+    # 3.5 s at 2 fps: 7 frames (0, 17, 35, 52, 69, 87, 104), the last repeated
+    times = re.findall(r"<[0-9.]+ seconds>", processor.tokenizer.text[0])
+    assert times == [
+        "<0.3 seconds>",
+        "<1.5 seconds>",
+        "<2.6 seconds>",
+        "<3.5 seconds>",
+    ]
+    assert np.array(result["video_grid_thw"])[0, 0] == 4
+
+
+def test_lfm3_vl_chat_messages_carry_videos():
+    from mlx_vlm.prompt_utils import apply_chat_template
+
+    messages = apply_chat_template(
+        None,
+        {"model_type": "lfm3_vl"},
+        "Describe.",
+        video="clip.mp4",
+        return_messages=True,
+    )
+    assert [item["type"] for item in messages[0]["content"]] == ["video", "text"]
+    # a system prompt does not get a copy of the video
+    messages = apply_chat_template(
+        None,
+        {"model_type": "lfm3_omni"},
+        [{"role": "system", "content": "Answer."}, "Describe."],
+        video="clip.mp4",
+        num_audios=1,
+        return_messages=True,
+    )
+    assert [[item["type"] for item in m["content"]] for m in messages] == [
+        ["text"],
+        ["video", "audio", "text"],
+    ]
+
+
+def test_lfm3_omni_wraps_each_media_span_once_and_expands_speech():
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+
+    from mlx_vlm.models.lfm3_omni.processing_lfm3_omni import Lfm3OmniProcessor
+    from mlx_vlm.models.lfm3_vl.processing_lfm3_vl import Lfm3VlVideoProcessor
+    from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLImageProcessor
+
+    tokens = ["<unk>", "<|image|>", "<|video|>", "<|vision_start|>"]
+    tokens += ["<|vision_end|>", "<|audio|>", "<|audio_out|>"]
+    tokens += ["<|audio_start|>", "<|mixed_start|>"]
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(
+            WordLevel(dict(zip(tokens, range(len(tokens)))), unk_token="<unk>")
+        ),
+        unk_token="<unk>",
+        additional_special_tokens=tokens[1:],
+    )
+    processor = Lfm3OmniProcessor(
+        Qwen3VLImageProcessor(min_pixels=4096, max_pixels=16384),
+        tokenizer,
+        Lfm3VlVideoProcessor(min_pixels=4096, max_pixels=65536),
+    )
+    assert processor.additional_eos_token_ids == [7, 8]
+    assert processor.feature_extractor.sampling_rate == 16000
+
+    class RecordingTokenizer:
+        def __call__(self, text, **kwargs):
+            self.text = text
+            return tokenizer(text, **kwargs)
+
+    processor.tokenizer = RecordingTokenizer()
+    span = "<|vision_start|>{}<|vision_end|>".format
+    media = dict(
+        images=Image.fromarray(np.zeros((64, 64, 3), dtype=np.uint8)),
+        videos=[np.zeros((2, 64, 64, 3), dtype=np.uint8)],
+        video_metadata=[dict(fps=2.0, frames_indices=[0, 1])],
+        audio=[np.zeros(16000, np.float32)],
+        audio_out_codes=[np.ones((2, 12))],
+        return_tensors="np",
+    )
+    # the chat template's spans, or bare placeholders: one span pair each
+    for text in (
+        span("<|image|>") + span("<|audio|>") + "x" + span("<|video|>"),
+        "<|image|><|audio|>x<|video|>",
+    ):
+        result = processor(text=text + "<|audio_out|>", **media)
+        assert processor.tokenizer.text == [
+            span("<|image|>" * 4)
+            + span("<|audio|>" * 13)  # 99 feature frames / 8
+            + "x"
+            + span("<0.2 seconds>" + span("<|video|>" * 4))
+            + "<|audio_out|>" * 3  # 2 frames and the end-of-speech frame
+        ]
+    assert result["input_features"].shape == (1, 128, 99)
+    assert result["audio_out_codes"].shape == (3, 12)
+    np.testing.assert_array_equal(result["image_grid_thw"], [[1, 4, 4]])
+    np.testing.assert_array_equal(result["video_grid_thw"], [[1, 4, 4]])
+    # (35 + 52) / 60 = 1.45 rounds down, unlike LFM3-VL's 35 / 30 + 52 / 30
+    processor(
+        text="<|video|>",
+        videos=media["videos"],
+        video_metadata=[dict(fps=30.0, frames_indices=[35, 52])],
+    )
+    assert "<1.4 seconds>" in processor.tokenizer.text[0]
+    with pytest.raises(ValueError, match="hop_length"):
+        Lfm3OmniProcessor(
+            processor.image_processor,
+            tokenizer,
+            processor.video_processor,
+            processor_config={"feature_extractor": {"hop_length": 320}},
+        )
+
+
+def test_lfm3_audio_processor_expands_speech_placeholders():
+    from mlx_vlm.models.lfm3_audio.processing_lfm3_audio import Lfm3AudioProcessor
+    from mlx_vlm.utils import prepare_inputs
+
+    class Tokenizer:
+        pad_token = "<pad>"
+
+        def convert_tokens_to_ids(self, tokens):
+            return [1, 2]
+
+        def __call__(self, texts, **kwargs):
+            self.texts = texts
+            return {"input_ids": [[0]] * len(texts)}
+
+    processor = Lfm3AudioProcessor(Tokenizer())
+    assert processor.additional_eos_token_ids == [1, 2]
+    clips = [np.zeros(16000, np.float32), np.zeros(5921, np.float32)]
+    out = processor(
+        text="a<|audio|>b<|audio|><|audio_out|>c",
+        audio=clips,
+        audio_out_codes=[np.ones((3, 12))],
+    )
+    # 99 and 36 feature frames -> 13 and 5 encoder tokens; 3 frames + EOS frame
+    assert processor.tokenizer.texts == [
+        "a" + "<|audio|>" * 13 + "b" + "<|audio|>" * 5 + "<|audio_out|>" * 4 + "c"
+    ]
+    assert out["input_features"].shape == (2, 128, 99)
+    assert out["feature_attention_mask"].sum(-1).tolist() == [99, 36]
+    assert out["audio_out_codes"].tolist() == [[1] * 12] * 3 + [[2016] * 12]
+    with pytest.raises(ValueError, match="placeholders"):
+        processor(text="<|audio|>", audio=clips)
+    # codebook-major [12, frames] codes (result.audio_tokens) are refused
+    with pytest.raises(ValueError, match=r"\[frames, 12\]"):
+        processor(text="<|audio_out|>", audio_out_codes=[np.ones((12, 3))])
+    # prior speech without user audio still goes through the processor
+    inputs = prepare_inputs(
+        processor, prompts="<|audio_out|>c", audio_out_codes=[np.ones((2, 12))]
+    )
+    assert processor.tokenizer.texts == ["<|audio_out|>" * 3 + "c"]
+    assert inputs["audio_out_codes"].shape == (3, 12)
+    # every clip reaches the processor, one per <|audio|>
+    with patch("mlx_vlm.utils.load_audio", side_effect=lambda clip, sr: clip):
+        inputs = prepare_inputs(processor, audio=clips, prompts="<|audio|><|audio|>")
+    assert inputs["feature_attention_mask"].shape == (2, 99)
+
+
+def test_load_processor_keeps_processor_stop_ids():
+    processor = SimpleNamespace(
+        additional_eos_token_ids=[9], tokenizer=SimpleNamespace()
+    )
+    with (
+        patch("mlx_vlm.utils.AutoProcessor.from_pretrained", return_value=processor),
+        patch("mlx_vlm.utils.load_tokenizer", return_value=lambda tokenizer: None),
+    ):
+        load_processor(Path("/tmp/model"), eos_token_ids=[2])
+    criteria = processor.tokenizer.stopping_criteria
+    assert criteria.eos_token_ids == [2, 9]
+    criteria.reset([5])
+    assert criteria.eos_token_ids == [5, 9]

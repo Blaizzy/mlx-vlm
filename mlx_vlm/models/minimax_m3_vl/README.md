@@ -1,9 +1,46 @@
-# MiniMax M3
+# MiniMax M3 and M3.1 Flash
 
 MiniMax M3 is supported as a native multimodal model in mlx-vlm. The
 implementation covers text, image, and video prompts, MiniMax Sparse Attention
 (MSA), MiniMax thinking tags, MiniMax XML-style tool calls, MXFP8 config loading,
 and EAGLE-3 speculative decoding with the released drafter.
+
+## MiniMax M3.1 Flash
+
+`MiniMaxAI/MiniMax-M3.1-Flash` uses the same multimodal architecture, with
+sparse attention in all 60 layers. Its released checkpoint mixes MXFP8
+attention, dense MLPs, and shared experts with NVFP4 routed experts. MLX-VLM
+preserves the packed weights and both NVFP4 scale levels; it keeps the shared
+experts separate because their quantization differs from the routed experts.
+Inference uses floating-point activations. Floating router weights and correction
+biases follow the token embedding dtype; router probabilities and NVFP4 global
+scales remain in FP32.
+SwiGLU rounds intermediate results to the activation dtype. Routed expert
+contributions are accumulated in expert-ID order, with the routed scaling
+factor applied after the sum, matching the reference's BF16 operation boundaries.
+Dense attention and compact sparse gathers use the shared fused attention
+operation. Long-context sparse attention retains the optimized Metal kernel.
+
+Convert without `--quantize` to preserve the released precision:
+
+```sh
+mlx_vlm.convert \
+  --hf-path MiniMaxAI/MiniMax-M3.1-Flash \
+  --mlx-path ~/models/MiniMax-M3.1-Flash-MLX \
+  --trust-remote-code
+
+mlx_vlm.generate \
+  --model ~/models/MiniMax-M3.1-Flash-MLX \
+  --prompt "Explain why the sky is blue in two sentences." \
+  --temperature 0 \
+  --max-tokens 128
+```
+
+The source download is approximately 235 GiB, including the bundled DSpark
+draft head. Keep room for another approximately 235 GiB when saving a converted
+copy. The base model supports text, images, and video; the bundled DSpark head
+is not yet integrated with MLX-VLM speculative decoding. The EAGLE-3 instructions
+below apply to MiniMax M3.
 
 ## Convert
 

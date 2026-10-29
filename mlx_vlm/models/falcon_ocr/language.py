@@ -5,6 +5,7 @@ import mlx.nn as nn
 
 from ..base import (
     LanguageModelOutput,
+    cache_position_offset,
     create_attention_mask,
     scaled_dot_product_attention,
 )
@@ -366,17 +367,10 @@ class LanguageModel(nn.Module):
         else:
             rope_deltas = self._rope_deltas
 
-        # Use ``cache._idx`` — the Python-int token counter — instead of
-        # syncing on ``cache[0].offset``. See Qwen2.5-VL for details.
         c0 = cache[0] if cache and cache[0] is not None else None
         offset = c0.offset if c0 is not None else 0
         is_batch = isinstance(offset, mx.array) and offset.size > 1
-        if c0 is not None and hasattr(c0, "_idx"):
-            cache_offset = int(c0._idx)
-        elif isinstance(offset, mx.array):
-            cache_offset = int(offset[0].item()) if offset.size > 0 else 0
-        else:
-            cache_offset = int(offset)
+        cache_offset = cache_position_offset(c0)
         cache_offset = max(cache_offset, 0)
 
         if inputs_embeds is not None:

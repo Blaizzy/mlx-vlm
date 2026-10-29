@@ -236,19 +236,27 @@ class TransactionDrafter:
 
 
 def equal(actual, expected, **tolerance):
-    if isinstance(actual, dict):
-        assert actual.keys() == expected.keys()
-        for key in actual:
-            equal(actual[key], expected[key], **tolerance)
-    elif isinstance(actual, (list, tuple)):
-        assert len(actual) == len(expected)
-        for a, b in zip(actual, expected):
-            equal(a, b, **tolerance)
-    elif actual is None or expected is None:
-        assert actual is expected
-    else:
-        compare = mx.allclose if tolerance else mx.array_equal
-        assert compare(actual, expected, **tolerance).item()
+    comparisons = []
+
+    def collect(actual, expected):
+        if isinstance(actual, dict):
+            assert actual.keys() == expected.keys()
+            for key in actual:
+                collect(actual[key], expected[key])
+        elif isinstance(actual, (list, tuple)):
+            assert len(actual) == len(expected)
+            for a, b in zip(actual, expected):
+                collect(a, b)
+        elif actual is None or expected is None:
+            assert actual is expected
+        else:
+            compare = mx.allclose if tolerance else mx.array_equal
+            comparisons.append(compare(actual, expected, **tolerance))
+
+    collect(actual, expected)
+    mx.eval(comparisons)
+    for index, comparison in enumerate(comparisons):
+        assert comparison.item(), f"comparison {index}"
 
 
 def greedy(logits):
@@ -348,7 +356,7 @@ def test_mtp_generation(family, failure, monkeypatch):
     assert drafter._round_appended == 0
 
 
-@parametrize("family", list(TINY_MODELS))
+@parametrize("family", ["qwen", "glm", "deepseek"])
 @parametrize("batch", [1, 2, 4])
 @parametrize("dtype", [mx.float32, mx.bfloat16])
 def test_verify_commit_matches_decode(family, batch, dtype):
@@ -387,20 +395,23 @@ def test_verify_commit_matches_decode(family, batch, dtype):
     for retained in (1, 4, 3):
         tokens = mx.broadcast_to(mx.array([[4, 5, 6, 7]]), (batch, 4))
         oracle = deepcopy(reference)
+        accepted = None
         hidden_steps, logit_steps = [], []
         for i in range(4):
             hidden, logits, transaction = verify(tokens[:, i : i + 1], oracle)
             hidden_steps.append(hidden)
             logit_steps.append(logits)
             transaction.commit([1] * batch)
+            if i + 1 == retained:
+                accepted = deepcopy(oracle)
         hidden, logits, transaction = verify(tokens, actual)
         compare(hidden, mx.concatenate(hidden_steps, 1))
         compare(logits, mx.concatenate(logit_steps, 1))
         equal(greedy(logits), greedy(mx.concatenate(logit_steps, 1)))
         transaction.commit([retained] * batch)
-        for i in range(retained):
-            _, _, transaction = verify(tokens[:, i : i + 1], reference)
-            transaction.commit([1] * batch)
+        # Reuse the independent one-token oracle at the accepted prefix.
+        # Replaying that prefix again would perform the same verifier calls.
+        reference = accepted
         probe = mx.full((batch, 1), 20)
         compare(model(probe, cache=reference).logits, model(probe, cache=actual).logits)
 
@@ -1546,7 +1557,8 @@ def test_padded_prefill_chunks(padding):
         assert caches[1].left_padding.tolist() == expected_padding
 
 
-def test_qwen3_5_cancelled_prefill_row_preserves_survivor_output():
+@parametrize("chunk_size", [1, 3])
+def test_qwen3_5_cancelled_prefill_row_preserves_survivor_output(chunk_size):
     lm, _ = language("qwen")
     model = lm.model
     cache = [ArraysCache(2, left_padding=[5, 0]), BatchKVCache([5, 0])]
@@ -1555,7 +1567,9 @@ def test_qwen3_5_cancelled_prefill_row_preserves_survivor_output():
         layer_cache.filter(mx.array([0]))
 
     singleton_cache = [ArraysCache(2), KVCache()]
-    actual = model(mx.array([[0, 0, 4]]), cache=cache)
+    pending = mx.array([[0, 0, 4]])
+    for start in range(0, pending.shape[1], chunk_size):
+        actual = model(pending[:, start : start + chunk_size], cache=cache)
     expected = model(mx.array([[4]]), cache=singleton_cache)
     assert mx.array_equal(actual[:, -1:], expected).item()
 

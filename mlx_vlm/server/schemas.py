@@ -311,6 +311,15 @@ class ImageProcessingRequest(FlexibleBaseModel):
         description="Resize images before processing. Provide one integer for square or two dimensions.",
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_thinking_alias(cls, values):
+        if isinstance(values, dict) and values.get("enable_thinking") is None:
+            options = values.get("chat_template_kwargs")
+            if isinstance(options, dict) and "enable_thinking" in options:
+                values = {**values, "enable_thinking": options["enable_thinking"]}
+        return values
+
     @field_validator("resize_shape", mode="before")
     @classmethod
     def normalize_resize_shape_field(cls, value):
@@ -393,6 +402,18 @@ class CompactionControl(BaseModel):
     compact_threshold: int = Field(..., gt=0)
 
 
+class ToolResultNote(BaseModel):
+    tool_call_id: str = Field(..., min_length=1)
+    text: str = Field(..., max_length=8192)
+
+
+class ToolResultContext(BaseModel):
+    """Exact client excerpts, rendered only when their tool result is absent."""
+
+    entries: List[ToolResultNote] = Field(default_factory=list, max_length=256)
+    max_bytes: int = Field(8192, ge=512, le=8192)
+
+
 class OpenAIRequest(ImageProcessingRequest):
     """
     OpenAI-compatible request structure.
@@ -402,6 +423,11 @@ class OpenAIRequest(ImageProcessingRequest):
     input: Union[str, List[Any]] = Field(
         ..., description="Input text or list of chat messages."
     )
+    transient_context: Optional[str] = Field(
+        None,
+        description="Request-local text appended as user context for generation and token counting, excluded from stored history and compaction summaries. Resend the current value on each request.",
+    )
+    tool_result_context: Optional[ToolResultContext] = None
     model: str = Field(..., description="The model to use for generation.")
     adapter_path: Optional[str] = Field(
         None, description="The path to the adapter weights."
@@ -647,6 +673,7 @@ class OpenAIResponse(BaseModel):
     usage: OpenAIUsage = Field(
         ..., description="Token usage details"
     )  # we need the model to return stats
+    timings: Optional[GenerationTimings] = None
     user: Optional[str] = Field(
         None, description="A unique identifier representing your end-user"
     )
@@ -735,6 +762,7 @@ class ResponseOutputItemDoneEvent(BaseStreamEvent):
 class ResponseCompletedEvent(BaseStreamEvent):
     type: Literal["response.completed"]
     response: OpenAIResponse
+    timings: Optional[GenerationTimings] = None
 
 
 StreamEvent = Union[
@@ -927,6 +955,11 @@ class StreamOptions(BaseModel):
 
 class ChatRequest(GenerationRequest):
     messages: List[ChatMessage]
+    transient_context: Optional[str] = Field(
+        None,
+        description="Request-local text appended as user context for generation and token counting, excluded from compaction summaries and cached conversation prefixes.",
+    )
+    tool_result_context: Optional[ToolResultContext] = None
     context_management: Optional[List[CompactionControl]] = Field(None, max_length=1)
     stream_options: Optional[StreamOptions] = None
     tools: Optional[List[Any]] = Field(None, description="Tools the model may call.")

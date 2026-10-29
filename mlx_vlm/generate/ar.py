@@ -46,13 +46,11 @@ from .common import (
     DEFAULT_PREFILL_STEP_SIZE,
     DEFAULT_QUANTIZED_KV_START,
     DEFAULT_REPETITION_CONTEXT_SIZE,
-    DEFAULT_TEMPERATURE,
-    DEFAULT_TOP_K,
-    DEFAULT_TOP_P,
     _chunked_prefill_enabled,
     _default_prefill_step_size_for_offload,
     generation_stream,
     maybe_quantize_kv_cache,
+    resolve_sampling_defaults,
     wired_limit,
 )
 from .types import GenerateKwargs, ProcessorLike, Unpack
@@ -174,16 +172,16 @@ def generate_step(
     mask,
     *,
     max_tokens: int = DEFAULT_MAX_TOKENS,
-    temperature: float = DEFAULT_TEMPERATURE,
+    temperature: Optional[float] = None,
     repetition_penalty: Optional[float] = None,
     repetition_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE,
     presence_penalty: Optional[float] = None,
     presence_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE,
     frequency_penalty: Optional[float] = None,
     frequency_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE,
-    top_p: float = DEFAULT_TOP_P,
+    top_p: Optional[float] = None,
     min_p: float = DEFAULT_MIN_P,
-    top_k: int = DEFAULT_TOP_K,
+    top_k: Optional[int] = None,
     top_n_sigma: float = DEFAULT_TOP_N_SIGMA,
     p_less: bool = False,
     typical_p: float = 1.0,
@@ -220,7 +218,10 @@ def generate_step(
         pixel_values: The pixel values for vision models (optional).
         mask: The attention mask (optional).
         max_tokens (int): Maximum number of tokens to generate.
-        temperature (float): The temperature for sampling, if 0 the argmax is used.
+        temperature (float, optional): The temperature for sampling; 0 uses argmax.
+          Unset sampling options use the checkpoint's generation_config.json,
+          falling back to temperature=0.0, top_p=1.0, top_k=0. A checkpoint with
+          do_sample=False defaults to greedy unless temperature is explicit.
         repetition_penalty (float, optional): The penalty factor for repeating
           tokens.
         repetition_context_size (int, optional): The number of tokens to
@@ -280,6 +281,12 @@ def generate_step(
         kv_value_scheme=kv_value_scheme,
     )
 
+    temperature, top_p, top_k = resolve_sampling_defaults(
+        getattr(model, "config", None),
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+    )
     temperature = clamp_temperature(temperature)
     sampler_is_greedy = sampler is None and temperature == 0
     if sampler is None:
@@ -323,7 +330,9 @@ def generate_step(
         processors.extend(logits_processors)
 
     y = input_ids
-    tokens = mx.array([], dtype=input_ids.dtype)
+    # Processor history follows text IDs, independently of embedding chunks.
+    # Visual prefixes can add embedding positions without corresponding IDs.
+    tokens = input_ids.flatten()
     target_sample_position = 0
 
     thinking_budget_criteria = kwargs.pop("thinking_budget_criteria", None)
@@ -354,7 +363,7 @@ def generate_step(
             lm._rope_deltas = None
 
     def _step(y, inputs_embeds=None):
-        nonlocal tokens, kwargs, last_outputs, target_sample_position
+        nonlocal kwargs, last_outputs, target_sample_position
 
         step_kwargs = {
             **kwargs,
@@ -379,11 +388,8 @@ def generate_step(
             last_outputs = outputs
             logits = outputs.logits[:, -1, :]
 
-            if len(processors) > 0 and len(y) > 0:
-                tokens = mx.concat([tokens, y.flatten()])
-
-                for processor in processors:
-                    logits = processor(tokens, logits)
+            for processor in processors:
+                logits = processor(tokens, logits)
 
             quantize_cache_fn(prompt_cache)
 
@@ -534,6 +540,9 @@ def generate_step(
     n = 0
     while True:
         if n != max_tokens:
+            if processors:
+                with mx.stream(generation_stream):
+                    tokens = mx.concat([tokens, y.flatten()])
             next_y, next_logprobs = _step(y[None])
             mx.async_eval(next_y, next_logprobs)
         if n == 0:
@@ -614,6 +623,7 @@ _SEQUENCE_ALIGNED_PROMPT_KWARGS = {
 }
 
 APC_PRIVATE_PROMPT_KEYS = (
+    "_apc_checkpoint_len",
     "_apc_tenant",
     "_apc_image_hash",
     "_apc_semantic_hash",
@@ -2657,10 +2667,17 @@ class BatchGenerator:
             max_prefix_tokens=len(ids_list) - 1,
         )
 
-    def _apc_exact_checkpoint_lengths(self, ids_list: List[int]) -> List[int]:
+    def _apc_exact_checkpoint_lengths(
+        self, ids_list: List[int], extra_hash: int = 0, stable_prefix_len: int = 0
+    ) -> List[int]:
         coordinator = getattr(self, "apc", None)
         if coordinator is not None:
-            return coordinator.checkpoint_lengths(ids_list, self._apc_media_token_ids())
+            return coordinator.checkpoint_lengths(
+                ids_list,
+                self._apc_media_token_ids(),
+                extra_hash=extra_hash,
+                stable_prefix_len=stable_prefix_len,
+            )
         boundary = self._apc_exact_checkpoint_len(ids_list)
         return [boundary] if boundary > 0 else []
 
@@ -2836,7 +2853,11 @@ class BatchGenerator:
                 ),
                 "apc_blocks": picks[i].get("matched_blocks", []) if picks[i] else [],
                 "checkpoint_len": self._apc_exact_checkpoint_len(full_ids[i]),
-                "checkpoint_lengths": self._apc_exact_checkpoint_lengths(full_ids[i]),
+                "checkpoint_lengths": self._apc_exact_checkpoint_lengths(
+                    full_ids[i],
+                    self._apc_extra_hash(prompt_kwargs_list[i] or {}),
+                    (prompt_kwargs_list[i] or {}).get("_apc_checkpoint_len", 0),
+                ),
             }
             for i in range(len(sequences))
         ]
@@ -2898,7 +2919,9 @@ class BatchGenerator:
                     "apc_blocks": [],
                     "checkpoint_len": self._apc_exact_checkpoint_len(list(ids_list)),
                     "checkpoint_lengths": self._apc_exact_checkpoint_lengths(
-                        list(ids_list)
+                        list(ids_list),
+                        extra_hash,
+                        (kw or {}).get("_apc_checkpoint_len", 0),
                     ),
                 }
             )

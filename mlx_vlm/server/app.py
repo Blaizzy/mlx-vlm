@@ -288,6 +288,8 @@ def _split_thinking(
     thinking_end_token: Optional[str] = None,
     starts_in_thinking: bool = False,
     processor=None,
+    *,
+    prompt: str = "",
 ) -> Tuple[Optional[str], str]:
     """Split thinking tags from content. Returns (reasoning, content)."""
     return _split_thinking_text(
@@ -296,6 +298,7 @@ def _split_thinking(
         thinking_end_token,
         starts_in_thinking,
         processor=processor,
+        prompt=prompt,
     )
 
 
@@ -550,13 +553,24 @@ def _unload_model_cache_group(cache_group: str) -> bool:
         cache["vision_cache"].clear()
 
     registry.pop(cache_group)
+    from .compaction import chat_cache
+
+    chat_cache.clear()
+    cache.clear()
+    del response_generator, apc_manager
     gc.collect()
     mx.clear_cache()
     return True
 
 
 def _audio_model_kind(model_kind: str) -> bool:
-    return model_kind in ("audio", "audio_tts", "audio_stt")
+    return model_kind in (
+        "audio",
+        "audio_tts",
+        "audio_stt",
+        "audio_diarization",
+        "audio_speaker_embedding",
+    )
 
 
 def _audio_cache_group(model_kind: str) -> str:
@@ -564,6 +578,8 @@ def _audio_cache_group(model_kind: str) -> str:
         return "tts"
     if model_kind == "audio_stt":
         return "stt"
+    if model_kind in ("audio_diarization", "audio_speaker_embedding"):
+        return model_kind
     return "audio"
 
 
@@ -572,6 +588,7 @@ def get_cached_model(
     adapter_path=_INHERIT_ADAPTER,
     *,
     model_kind: str = "auto",
+    revision: str | None = None,
 ):
     """
     Factory function to get or load the appropriate model resources from cache or by loading.
@@ -619,6 +636,8 @@ def get_cached_model(
         effective_model_kind,
         runtime.config.fingerprint(kinds={effective_model_kind}),
     )
+    if revision is not None:
+        cache_key += (revision,)
     cached_cache = registry.for_kind(cache_group)
 
     # Return from cache if already loaded and matches the requested paths
@@ -714,9 +733,14 @@ def get_cached_model(
             )
         logger.info("Loading audio model: %s", model_path)
         try:
-            model = _server_package_attr("load_audio_model", load_audio_model)(
-                model_path
-            )
+            if model_kind in ("audio_diarization", "audio_speaker_embedding"):
+                from .audio_speakers import load_speaker_model
+
+                model = load_speaker_model(model_path, model_kind, revision)
+            else:
+                model = _server_package_attr("load_audio_model", load_audio_model)(
+                    model_path
+                )
         except RepositoryNotFoundError as e:
             raise HTTPException(
                 status_code=404,
@@ -1002,7 +1026,7 @@ def unload_model_sync():
             unloaded_any = True
 
     registry = _model_cache_registry()
-    for cache_group, _ in list(registry.items()):
+    for cache_group in [key for key, _ in registry.items()]:
         unloaded_any = _unload_model_cache_group(cache_group) or unloaded_any
 
     runtime.response_generator = None

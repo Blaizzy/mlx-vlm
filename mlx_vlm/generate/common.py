@@ -35,6 +35,37 @@ DEFAULT_DIFFUSION_MAX_DENOISING_STEPS = 48
 generation_stream = mx.new_thread_local_stream(mx.default_device())
 
 
+def resolve_sampling_defaults(
+    config,
+    *,
+    temperature: Optional[float] = None,
+    top_p: Optional[float] = None,
+    top_k: Optional[int] = None,
+):
+    """Resolve explicit values, then checkpoint defaults, then library defaults.
+
+    ``do_sample=False`` makes the checkpoint's default temperature greedy;
+    an explicit temperature (or a caller-supplied sampler) still takes precedence.
+    Missing and null checkpoint fields both use the library defaults.
+    """
+
+    def config_value(name, default):
+        value = getattr(config, name, None)
+        return default if value is None else value
+
+    if temperature is None:
+        temperature = (
+            0.0
+            if config_value("do_sample", None) is False
+            else config_value("temperature", DEFAULT_TEMPERATURE)
+        )
+    return (
+        temperature,
+        config_value("top_p", DEFAULT_TOP_P) if top_p is None else top_p,
+        config_value("top_k", DEFAULT_TOP_K) if top_k is None else top_k,
+    )
+
+
 def _policy_enabled(policy) -> bool:
     return bool(getattr(policy, "enabled", policy))
 

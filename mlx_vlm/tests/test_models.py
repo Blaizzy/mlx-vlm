@@ -8,11 +8,17 @@ import inspect
 import json
 import logging
 import math
+import os
+import signal
+import socket
 import struct
+import subprocess
+import sys
 import textwrap
 import unittest
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict
+from fnmatch import fnmatchcase
 from operator import attrgetter
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,8 +32,8 @@ import pytest
 from mlx.utils import tree_flatten, tree_map
 
 from mlx_vlm import embedding_loader
-from mlx_vlm.models.base import InputEmbeddingsFeatures
-from mlx_vlm.models.cache import make_prompt_cache
+from mlx_vlm.models.base import InputEmbeddingsFeatures, create_attention_mask
+from mlx_vlm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
 from mlx_vlm.models.lfm2_encoder import Model as Lfm2Encoder
 from mlx_vlm.utils import (
     _drop_modules_without_weights,
@@ -38,6 +44,784 @@ from mlx_vlm.utils import (
     load_config,
     load_model,
 )
+
+
+class TestMiniMaxM31Flash(unittest.TestCase):
+    def test_router_dtype_sanitization_is_idempotent(self):
+        from mlx_vlm.models.minimax_m3_vl import Model, ModelConfig
+
+        config = ModelConfig.from_dict(
+            {
+                "text_config": {
+                    "hidden_size": 64,
+                    "intermediate_size": 64,
+                    "shared_intermediate_size": 64,
+                    "num_hidden_layers": 1,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 1,
+                    "head_dim": 32,
+                    "vocab_size": 128,
+                    "num_local_experts": 2,
+                    "num_experts_per_tok": 1,
+                    "moe_layer_freq": [1],
+                    "nvfp4_experts": True,
+                },
+                "vision_config": {
+                    "hidden_size": 32,
+                    "intermediate_size": 64,
+                    "num_attention_heads": 4,
+                    "num_hidden_layers": 0,
+                    "image_size": 8,
+                    "patch_size": 2,
+                },
+                "projector_hidden_size": 64,
+            }
+        )
+        model = Model(config)
+        prefix = "language_model.model.layers.0.block_sparse_moe"
+        gate_key = f"{prefix}.gate.weight"
+        bias_key = f"{prefix}.e_score_correction_bias"
+        scale_key = f"{prefix}.switch_mlp.gate_proj.weight_global_scale"
+        for dtype in (mx.bfloat16, mx.float16, mx.float32):
+            with self.subTest(dtype=dtype):
+                gate = mx.arange(128).reshape(2, 64) / 129.0
+                bias = mx.array([0.137, -0.271])
+                source = {
+                    "language_model.model.embed_tokens.weight": mx.zeros(
+                        (128, 64), dtype
+                    ),
+                    gate_key: gate,
+                    bias_key: bias,
+                    scale_key: mx.array([17.3, 15123.7]),
+                }
+                first = model.sanitize(dict(source))
+                second = model.sanitize(dict(first))
+                for key in source:
+                    expected = (
+                        source[key].astype(dtype)
+                        if key in (gate_key, bias_key)
+                        else source[key]
+                    )
+                    self.assertEqual(first[key].dtype, expected.dtype)
+                    np.testing.assert_array_equal(
+                        np.array(first[key].astype(mx.float32)),
+                        np.array(expected.astype(mx.float32)),
+                    )
+                    np.testing.assert_array_equal(
+                        np.array(second[key].astype(mx.float32)),
+                        np.array(first[key].astype(mx.float32)),
+                    )
+                self.assertTrue(model.cast_predicate(gate_key))
+                self.assertTrue(model.cast_predicate(bias_key))
+                self.assertFalse(model.cast_predicate(scale_key))
+
+                # A previously quantized router must retain its packed bits.
+                source[gate_key] = mx.full((2, 16), 0x12345678, dtype=mx.uint32)
+                sanitized = model.sanitize(dict(source))
+                self.assertEqual(sanitized[gate_key].dtype, mx.uint32)
+                np.testing.assert_array_equal(
+                    np.array(sanitized[gate_key]), np.array(source[gate_key])
+                )
+
+    def test_nvfp4_global_scales_match_explicit_dequantization(self):
+        from mlx_vlm.models.switch_layers import QuantizedSwitchLinear
+        from mlx_vlm.quantization.nvfp4 import ScaledQuantizedSwitchLinear
+
+        mx.random.seed(31)
+
+        layer = ScaledQuantizedSwitchLinear(
+            QuantizedSwitchLinear(
+                64, 32, 3, bias=False, group_size=16, bits=4, mode="nvfp4"
+            ),
+            mx.array([0.5, 17.3, 15123.7]),
+            "weight_global_scale",
+        )
+        layer.weight, layer.scales = mx.quantize(
+            mx.random.normal((3, 32, 64)) * 1000,
+            group_size=16,
+            bits=4,
+            mode="nvfp4",
+        )
+        # Decode the source E2M1 nibbles and E4M3 bytes independently of MLX.
+        packed = np.array(layer.weight).view(np.uint8)
+        codes = np.stack((packed & 15, packed >> 4), axis=-1).reshape(3, 32, 64)
+        fp4 = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6], dtype=np.float32)
+        values = fp4[codes & 7] * np.where(codes & 8, -1.0, 1.0)
+        scales = np.array(layer.scales)
+        exponent = (scales >> 3) & 15
+        mantissa = scales & 7
+        decoded_scales = np.where(
+            exponent == 0,
+            mantissa / 512.0,
+            (1 + mantissa / 8.0) * np.exp2(exponent.astype(np.int32) - 7),
+        ) * np.where(scales & 128, -1.0, 1.0)
+        weights = values * np.repeat(decoded_scales, 16, axis=-1)
+        weights /= np.array(layer.weight_global_scale)[:, None, None]
+
+        for sorted_indices in (False, True):
+            indices = mx.array([0, 1, 2] if sorted_indices else [2, 0, 1])
+            for dtype in (mx.float32, mx.float16, mx.bfloat16):
+                with self.subTest(sorted_indices=sorted_indices, dtype=dtype):
+                    x = mx.random.normal((3, 1, 64)).astype(dtype)
+                    actual = layer(x, indices, sorted_indices=sorted_indices)
+                    expected = np.array(x.astype(mx.float32)) @ weights[
+                        np.array(indices)
+                    ].transpose(0, 2, 1)
+                    np.testing.assert_allclose(
+                        np.array(actual.astype(mx.float32)),
+                        expected,
+                        rtol=0.02 if dtype == mx.bfloat16 else 0.002,
+                        atol=2.0 if dtype != mx.float32 else 0.02,
+                    )
+                    self.assertEqual(actual.dtype, dtype)
+
+    def test_mixed_checkpoint_load_forward_cache_and_roundtrip(self):
+        import copy
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.models.minimax_m3_vl import Model, ModelConfig
+        from mlx_vlm.quantization.nvfp4 import ScaledQuantizedSwitchLinear
+        from mlx_vlm.utils import load_model, save_weights
+
+        config = {
+            "model_type": "minimax_m3_vl",
+            "text_config": {
+                "hidden_size": 64,
+                "intermediate_size": 64,
+                "dense_intermediate_size": 128,
+                "shared_intermediate_size": 64,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "head_dim": 32,
+                "rotary_dim": 16,
+                "rope_theta": 10000000,
+                "vocab_size": 128,
+                "num_local_experts": 2,
+                "num_experts_per_tok": 1,
+                "moe_layer_freq": [0, 1],
+                "pack_shared_expert": False,
+                "sparse_attention_config": {
+                    "use_sparse_attention": True,
+                    "sparse_attention_freq": [1, 1],
+                    "sparse_index_dim": 32,
+                    "sparse_num_index_heads": 1,
+                    "sparse_block_size": 4,
+                    "sparse_topk_blocks": 2,
+                },
+            },
+            "vision_config": {
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "num_attention_heads": 4,
+                "num_hidden_layers": 0,
+                "image_size": 8,
+                "patch_size": 2,
+            },
+            "projector_hidden_size": 64,
+            "vocab_size": 128,
+        }
+        mx.random.seed(31)
+        reference = Model(ModelConfig.from_dict(copy.deepcopy(config)))
+        source = {}
+        reference_weights = {}
+        for key, value in tree_flatten(reference.parameters()):
+            if ".switch_mlp." in key:
+                prefix, projection = key.split(".switch_mlp.")
+                source_name = {
+                    "gate_proj.weight": "w1",
+                    "down_proj.weight": "w2",
+                    "up_proj.weight": "w3",
+                }[projection]
+                dequantized = []
+                for expert in range(2):
+                    global_scale = mx.array(0.7 if expert == 0 else 15123.7)
+                    packed, scales = mx.quantize(
+                        value[expert] * global_scale,
+                        group_size=16,
+                        bits=4,
+                        mode="nvfp4",
+                    )
+                    target = f"{prefix}.experts.{expert}.{source_name}"
+                    source[f"{target}.weight_packed"] = packed.view(mx.uint8)
+                    source[f"{target}.weight_scale"] = scales
+                    source[f"{target}.weight_global_scale"] = global_scale
+                    source[f"{target}.input_global_scale"] = mx.array(1.0)
+                    dequantized.append(
+                        mx.dequantize(
+                            packed, scales, group_size=16, bits=4, mode="nvfp4"
+                        )
+                        / global_scale
+                    )
+                reference_weights[key] = mx.stack(dequantized)
+            elif key.startswith("language_model.") and key.endswith("_proj.weight"):
+                packed, scales = mx.quantize(value, 32, 8, mode="mxfp8")
+                source[key] = packed.view(mx.uint8)
+                source[key.replace(".weight", ".weight_scale_inv")] = scales
+                reference_weights[key] = mx.dequantize(
+                    packed, scales, group_size=32, bits=8, mode="mxfp8"
+                )
+            else:
+                source[key] = value
+                reference_weights[key] = value
+        reference.load_weights(list(reference_weights.items()))
+        reference.eval()
+        config["quantization_config"] = {
+            "quant_method": "mxfp8",
+            "weight_block_size": [1, 32],
+            "group_size": 16,
+            "moe_quant_algo": "NVFP4",
+            "moe_quant_format": "nvfp4-pack-quantized",
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / "config.json").write_text(json.dumps(config))
+            mx.save_safetensors(str(path / "model.safetensors"), source)
+            model = load_model(path)
+            moe = model.layers[1].block_sparse_moe
+            self.assertIsInstance(moe.switch_mlp.gate_proj, ScaledQuantizedSwitchLinear)
+            self.assertIsInstance(moe.shared_experts.gate_proj, nn.QuantizedLinear)
+            self.assertEqual(moe.shared_experts.gate_proj.mode, "mxfp8")
+            self.assertFalse(moe.pack_shared_expert)
+            self.assertTrue(
+                all(layer.self_attn.has_sparse_index for layer in model.layers)
+            )
+            self.assertFalse(
+                model.cast_predicate(
+                    "language_model.model.layers.1.block_sparse_moe.switch_mlp.gate_proj.weight_global_scale"
+                )
+            )
+
+            tokens = mx.array([[1, 2, 3, 4, 5]])
+            expected = reference(tokens).logits
+            actual = model(tokens).logits
+            np.testing.assert_allclose(np.array(actual), np.array(expected), atol=2e-4)
+            cache = model.make_cache()
+            model(tokens[:, :-1], cache=cache)
+            decoded = model(tokens[:, -1:], cache=cache).logits
+            np.testing.assert_allclose(
+                np.array(decoded), np.array(actual[:, -1:]), atol=2e-4
+            )
+
+            converted = path / "converted"
+            save_weights(converted, model)
+            (converted / "config.json").write_text(json.dumps(config))
+            reloaded = load_model(converted)
+            np.testing.assert_allclose(
+                np.array(reloaded(tokens).logits), np.array(actual), atol=2e-4
+            )
+
+
+class TestMiniMaxSparseAccuracy(unittest.TestCase):
+    @staticmethod
+    def round_bf16(value):
+        bits = np.asarray(value, dtype=np.float32).view(np.uint32)
+        rounded = bits + np.uint32(0x7FFF) + ((bits >> 16) & 1)
+        return (rounded & np.uint32(0xFFFF0000)).view(np.float32)
+
+    def test_swiglu_preserves_bf16_operation_boundaries(self):
+        from mlx_vlm.models.minimax_m3_vl.language import _swiglu_oai
+
+        rng = np.random.default_rng(876)
+        gate = self.round_bf16(rng.normal(size=(4, 257)) * 4)
+        up = self.round_bf16(rng.normal(size=gate.shape) * 4)
+        clipped_gate = np.minimum(gate, 7)
+        clipped_up = np.clip(up, -7, 7)
+        scaled = self.round_bf16(clipped_gate * np.float32(1.702))
+        sigmoid = self.round_bf16(1 / (1 + np.exp(-scaled.astype(np.float64))))
+        glu = self.round_bf16(clipped_gate * sigmoid)
+        linear = self.round_bf16(clipped_up + np.float32(1))
+        expected = self.round_bf16(linear * glu)
+        actual = _swiglu_oai(
+            mx.array(up).astype(mx.bfloat16), mx.array(gate).astype(mx.bfloat16)
+        )
+        self.assertEqual(actual.dtype, mx.bfloat16)
+        np.testing.assert_array_equal(np.array(actual.astype(mx.float32)), expected)
+
+    def test_expert_sum_is_independent_of_topk_output_order(self):
+        from mlx_vlm.models.minimax_m3_vl.config import TextConfig
+        from mlx_vlm.models.minimax_m3_vl.language import MiniMaxSparseMoeBlock
+
+        layer = MiniMaxSparseMoeBlock(
+            TextConfig(
+                hidden_size=32,
+                intermediate_size=32,
+                num_local_experts=4,
+                num_experts_per_tok=4,
+                n_shared_experts=0,
+                pack_shared_expert=False,
+                routed_scaling_factor=1.0,
+            )
+        )
+        # Equal probabilities, different selection orders. The BF16 reference
+        # sums 256, 1, -256, 1 in expert-ID order, producing 1 rather than 2.
+        layer.gate = lambda x: mx.zeros((*x.shape[:-1], 4))
+        values = mx.broadcast_to(
+            mx.array([1024, 4, -1024, 4], mx.bfloat16)[:, None], (4, 32)
+        )
+        layer.switch_mlp = lambda x, indices: values[indices]
+        x = mx.zeros((1, 1, 32), mx.bfloat16)
+        for bias in ([1, 2, 4, 3], [4, 3, 2, 1], [2, 4, 1, 3]):
+            with self.subTest(bias=bias):
+                layer.e_score_correction_bias = mx.array(bias, mx.float32)
+                np.testing.assert_array_equal(
+                    np.array(layer(x).astype(mx.float32)), np.ones((1, 1, 32))
+                )
+
+    @staticmethod
+    def attention():
+        from mlx_vlm.models.minimax_m3_vl.config import TextConfig
+        from mlx_vlm.models.minimax_m3_vl.language import MiniMaxAttention
+
+        return MiniMaxAttention(
+            TextConfig(
+                hidden_size=64,
+                num_attention_heads=8,
+                num_key_value_heads=4,
+                head_dim=32,
+                rotary_dim=16,
+                num_hidden_layers=1,
+                sparse_attention_config={
+                    "use_sparse_attention": True,
+                    "sparse_attention_freq": [1],
+                    "sparse_index_dim": 32,
+                    "sparse_num_index_heads": 4,
+                    "sparse_block_size": 4,
+                    "sparse_topk_blocks": 2,
+                    "sparse_local_block": 1,
+                },
+            ),
+            0,
+        )
+
+    @staticmethod
+    def attention_reference(q, k, v, mask):
+        # Independent FP64 attention over explicitly expanded KV heads.
+        q, k, v = (
+            np.asarray(a.astype(mx.float32), dtype=np.float64) for a in (q, k, v)
+        )
+        k = np.repeat(k, q.shape[1] // k.shape[1], axis=1)
+        v = np.repeat(v, q.shape[1] // v.shape[1], axis=1)
+        scores = (q @ k.swapaxes(-1, -2)) / np.sqrt(q.shape[-1])
+        scores = (
+            np.where(mask, scores, -np.inf) if mask.dtype == bool else scores + mask
+        )
+        peak = np.max(scores, axis=-1, keepdims=True)
+        scores = np.exp(scores - np.where(np.isfinite(peak), peak, 0))
+        return (scores / np.maximum(scores.sum(-1, keepdims=True), 1e-30)) @ v
+
+    def test_independent_index_heads_and_padding(self):
+        attention = self.attention()
+        rng = np.random.default_rng(31)
+        for batch in (1, 4):
+            queries = rng.normal(size=(batch, 4, 3, 4)).astype(np.float32)
+            keys = rng.normal(size=(batch, 1, 23, 4)).astype(np.float32)
+            positions = np.broadcast_to([0, 17, 22], (batch, 3)).copy()
+            for score_type, masked, initial in (
+                ("max", False, 0),
+                ("max", False, 1),
+                ("max", True, 0),
+                ("lse", True, 0),
+            ):
+                with self.subTest(
+                    batch=batch, score_type=score_type, masked=masked, initial=initial
+                ):
+                    attention.indexer.score_type = score_type
+                    attention.indexer.init_blocks = initial
+                    valid = np.ones((batch, 1, 3, 23), dtype=bool)
+                    if masked:
+                        valid[..., 4:8] = False  # Exclude an entire earlier block.
+                        valid[..., 21:] = False  # Partially padded final block.
+                    scores = (queries @ keys.swapaxes(-1, -2)) * attention.scale
+                    causal = (
+                        np.arange(23)[None, None, None, :]
+                        <= positions[:, None, :, None]
+                    )
+                    scores = np.where(causal & valid, scores, -np.inf)
+                    scores = np.pad(
+                        scores,
+                        ((0, 0), (0, 0), (0, 0), (0, 1)),
+                        constant_values=-np.inf,
+                    )
+                    blocks = scores.reshape(batch, 4, 3, 6, 4)
+                    pooled = (
+                        blocks.max(-1)
+                        if score_type == "max"
+                        else np.logaddexp.reduce(blocks, axis=-1)
+                    )
+                    allowed = np.isfinite(pooled)
+                    if initial:
+                        pooled[..., :initial] = np.where(
+                            allowed[..., :initial], 1e30, -np.inf
+                        )
+                    for b in range(batch):
+                        for t in range(3):
+                            local = positions[b, t] // 4
+                            pooled[b, :, t, local] = np.where(
+                                allowed[b, :, t, local], 1e29, -np.inf
+                            )
+                    selected = np.argsort(-pooled, axis=-1)[..., :2]
+                    selected = np.where(
+                        np.take_along_axis(allowed, selected, -1), selected, 6
+                    )
+                    selected = np.sort(selected, axis=-1)
+                    selected[selected == 6] = -1
+                    actual = attention.indexer.select_blocks(
+                        mx.array(queries),
+                        mx.array(keys),
+                        0,
+                        mx.array(valid) if masked else None,
+                        mx.array(positions),
+                    )
+                    np.testing.assert_array_equal(np.array(actual), selected)
+                    if not initial:
+                        self.assertFalse(np.array_equal(selected[:, 0], selected[:, 1]))
+                    expected_mask = np.any(
+                        selected[..., None] == np.arange(23) // 4, axis=-2
+                    )
+                    expected_mask = np.repeat(expected_mask & causal & valid, 2, axis=1)
+                    actual_mask = attention.indexer.build_block_mask(
+                        actual,
+                        mx.array(valid) if masked else None,
+                        23,
+                        mx.float32,
+                        mx.array(positions),
+                    )
+                    np.testing.assert_array_equal(np.array(actual_mask), expected_mask)
+                    unsorted = attention.indexer.select_blocks(
+                        mx.array(queries),
+                        mx.array(keys),
+                        0,
+                        mx.array(valid) if masked else None,
+                        mx.array(positions),
+                        sort_blocks=False,
+                    )
+                    unsorted_mask = attention.indexer.build_block_mask(
+                        unsorted,
+                        mx.array(valid) if masked else None,
+                        23,
+                        mx.float32,
+                        mx.array(positions),
+                    )
+                    np.testing.assert_array_equal(
+                        np.array(unsorted_mask), expected_mask
+                    )
+                    legacy = attention._build_sparse_mask(
+                        mx.array(queries),
+                        mx.array(keys),
+                        0,
+                        mx.array(valid) if masked else None,
+                        q_positions=mx.array(positions),
+                    )
+                    np.testing.assert_array_equal(np.array(legacy), expected_mask)
+
+    def test_sparse_block_mask_invalid_duplicate_and_partial_blocks(self):
+        attention = self.attention()
+        indices = np.array(
+            [
+                [
+                    [[5, 1, 1, -1], [-1, -1, 6, 99], [0, 5, -2, 2]],
+                    [[0, 2, 4, 4], [1, -1, 3, 5], [-1, -1, -1, -1]],
+                ]
+            ],
+            dtype=np.int32,
+        )
+        positions = np.array([[10, 17, 22]])
+        expected = np.any(indices[..., None] == np.arange(23) // 4, axis=-2)
+        expected &= np.arange(23)[None, None, None, :] <= positions[:, None, :, None]
+        expected = np.repeat(expected, 4, axis=1)
+        allowed = np.ones((1, 8, 3, 23), dtype=bool)
+        allowed[:, ::2, :, 4:9] = False
+        for kind in ("none", "bool", "additive"):
+            with self.subTest(mask=kind):
+                mask = None
+                ref = expected
+                if kind == "bool":
+                    mask = mx.array(allowed)
+                    ref = expected & allowed
+                elif kind == "additive":
+                    bias = np.where(allowed, -0.25, -np.inf).astype(np.float32)
+                    mask = mx.array(bias)
+                    ref = np.where(expected, 0.0, -np.inf) + bias
+                actual = attention.indexer.build_block_mask(
+                    mx.array(indices), mask, 23, mx.float32, mx.array(positions)
+                )
+                np.testing.assert_array_equal(np.array(actual), ref)
+
+    def test_sparse_attention_full_prefill_matches_cached_chunks(self):
+        from mlx_vlm.models.minimax_m3_vl.language import MiniMaxM3KVCache
+
+        mx.random.seed(31)
+        attention = self.attention()
+        for batch in (1, 4):
+            for length in (23, 513):
+                with self.subTest(batch=batch, length=length):
+                    x = mx.random.normal((batch, length, 64))
+                    expected = attention(x, mask="causal")
+                    cache = MiniMaxM3KVCache()
+                    chunks = []
+                    # The long case crosses the dense/sparse decode boundary.
+                    stops = (
+                        (0, 7, 14, 22, 23) if length == 23 else (0, 500, 511, 512, 513)
+                    )
+                    for start, stop in zip(stops, stops[1:]):
+                        chunk = attention(x[:, start:stop], mask="causal", cache=cache)
+                        mx.eval(chunk)
+                        chunks.append(chunk)
+                    np.testing.assert_allclose(
+                        np.array(mx.concatenate(chunks, axis=1)),
+                        np.array(expected),
+                        rtol=2e-5,
+                        atol=2e-6,
+                    )
+
+    @unittest.skipUnless(mx.metal.is_available(), "Requires Metal sparse attention")
+    def test_sparse_metal_kernel_per_group(self):
+        from mlx_vlm.models.minimax_m3_vl.language import (
+            _minimax_m3_sparse_prefill_attention,
+        )
+
+        mx.random.seed(31)
+        for batch, heads in ((1, 1), (1, 4), (4, 2), (4, 4)):
+            for dtype in (mx.float16, mx.bfloat16):
+                with self.subTest(batch=batch, index_heads=heads, dtype=dtype):
+                    q = mx.random.normal((batch, 8, 3, 32)).astype(dtype)
+                    k = mx.random.normal((batch, 4, 137, 32)).astype(dtype)
+                    v = mx.random.normal(k.shape).astype(dtype)
+                    indices = np.empty((batch, heads, 3, 2), dtype=np.int32)
+                    for b in range(batch):
+                        for h in range(heads):
+                            indices[b, h, :, 0] = 1 + (b + h) % 4
+                            indices[b, h, :, 1] = 34
+                    indices[..., 0, 1] = -1
+                    positions = np.broadcast_to([20, 130, 136], (batch, 3)).copy()
+                    mask = np.any(indices[..., None] == np.arange(137) // 4, axis=-2)
+                    mask &= (
+                        np.arange(137)[None, None, None, :]
+                        <= positions[:, None, :, None]
+                    )
+                    mask = np.repeat(mask, 8 // heads, axis=1)
+                    actual = _minimax_m3_sparse_prefill_attention(
+                        q,
+                        k,
+                        v,
+                        mx.array(indices),
+                        mx.array(positions),
+                        32**-0.5,
+                        4,
+                    )
+                    self.assertIsNotNone(actual)
+                    expected = self.attention_reference(q, k, v, mask)
+                    np.testing.assert_allclose(
+                        np.array(actual.astype(mx.float32)),
+                        expected,
+                        rtol=0.008 if dtype == mx.bfloat16 else 0.002,
+                        atol=0.004 if dtype == mx.bfloat16 else 0.0005,
+                    )
+
+    def test_sparse_gather_decode_per_group(self):
+        attention = self.attention()
+        mx.random.seed(31)
+        for heads in (1, 2, 4):
+            for mask_type in ("none", "bool", "additive"):
+                with self.subTest(index_heads=heads, mask_type=mask_type):
+                    batch, length = 4, 1027
+                    q = mx.random.normal((batch, 8, 1, 32))
+                    k = mx.random.normal((batch, 4, length, 32))
+                    v = mx.random.normal(k.shape)
+                    indices = np.empty((batch, heads, 1, 2), dtype=np.int32)
+                    for b in range(batch):
+                        for h in range(heads):
+                            indices[b, h, 0] = [1 + b + h, 256]
+                    indices[0, 0, 0, 1] = -1
+                    positions = np.array([[1024], [1025], [1026], [1026]])
+                    mask = np.any(indices[..., None] == np.arange(length) // 4, axis=-2)
+                    mask &= (
+                        np.arange(length)[None, None, None, :]
+                        <= positions[:, None, :, None]
+                    )
+                    mask = np.repeat(mask, 8 // heads, axis=1)
+                    explicit = None
+                    if mask_type != "none":
+                        allowed = np.ones((batch, 8, 1, length), dtype=bool)
+                        allowed[:, ::2, :, ::3] = False
+                        explicit = (
+                            allowed
+                            if mask_type == "bool"
+                            else np.where(allowed, -0.7, -np.inf).astype(np.float32)
+                        )
+                        mask = (
+                            mask & explicit
+                            if mask_type == "bool"
+                            else np.where(mask, explicit, -np.inf)
+                        )
+                    actual = attention._sparse_decode_attention(
+                        q,
+                        k,
+                        v,
+                        mx.array(indices),
+                        None if explicit is None else mx.array(explicit),
+                        mx.array(positions),
+                    )
+                    self.assertIsNotNone(actual)
+                    np.testing.assert_allclose(
+                        np.array(actual),
+                        self.attention_reference(q, k, v, mask),
+                        rtol=2e-5,
+                        atol=2e-6,
+                    )
+
+    def test_router_projection_rounds_before_fp32_scoring(self):
+        from mlx_vlm.models.minimax_m3_vl.config import TextConfig
+        from mlx_vlm.models.minimax_m3_vl.language import MiniMaxSparseMoeBlock
+
+        mx.random.seed(31)
+        layer = MiniMaxSparseMoeBlock(
+            TextConfig(
+                hidden_size=32,
+                intermediate_size=32,
+                num_local_experts=4,
+                num_experts_per_tok=2,
+                n_shared_experts=0,
+                pack_shared_expert=False,
+            )
+        )
+        layer.gate.weight = mx.random.normal((4, 32)).astype(mx.bfloat16)
+        x = mx.random.normal((2, 3, 32)).astype(mx.bfloat16)
+        values = (mx.random.normal((4, 32)) * 100).astype(mx.bfloat16)
+        layer.switch_mlp = lambda x, inds: values[inds]
+        logits = (
+            np.array(x.astype(mx.float32)).astype(np.float64)
+            @ np.array(layer.gate.weight.astype(mx.float32)).astype(np.float64).T
+        )
+        rounded = np.array(
+            mx.array(logits.astype(np.float32)).astype(mx.bfloat16).astype(mx.float32)
+        ).astype(np.float64)
+        probabilities = 1 / (1 + np.exp(-rounded))
+        indices = np.argsort(-probabilities, axis=-1)[..., :2]
+        scores = np.take_along_axis(probabilities, indices, axis=-1)
+        scores = scores / scores.sum(-1, keepdims=True)
+        order = np.argsort(indices, axis=-1)
+        indices = np.take_along_axis(indices, order, -1)
+        scores = np.take_along_axis(scores, order, -1).astype(np.float32)
+        weighted = self.round_bf16(
+            np.array(values.astype(mx.float32))[indices] * scores[..., None]
+        )
+        expected = self.round_bf16(weighted[..., 0, :] + weighted[..., 1, :])
+        expected = self.round_bf16(expected * layer.routed_scaling_factor)
+        actual = layer(x)
+        self.assertEqual(actual.dtype, mx.bfloat16)
+        np.testing.assert_array_equal(
+            np.array(actual.astype(mx.float32)),
+            expected,
+        )
+
+    def test_expert_contributions_round_in_expert_order(self):
+        from mlx_vlm.models.minimax_m3_vl.config import TextConfig
+        from mlx_vlm.models.minimax_m3_vl.language import MiniMaxSparseMoeBlock
+
+        mx.random.seed(31)
+        for biased in (False, True):
+            for packed in (False, True):
+                with self.subTest(biased=biased, packed=packed):
+                    layer = MiniMaxSparseMoeBlock(
+                        TextConfig(
+                            hidden_size=32,
+                            intermediate_size=32,
+                            shared_intermediate_size=32,
+                            num_local_experts=4,
+                            num_experts_per_tok=2,
+                            pack_shared_expert=packed,
+                            n_shared_experts=int(packed),
+                            use_routing_bias=biased,
+                            routed_scaling_factor=1.7,
+                        )
+                    )
+                    logits = mx.array([[-1.25, 0.17, 1.13, 0.61]])[None]
+                    bias = mx.array([0.0, 0.5, 0.0, 0.0]) if biased else mx.zeros(4)
+                    layer.gate = lambda x: logits
+                    if biased:
+                        layer.e_score_correction_bias = bias
+                    expert_outputs = (mx.random.normal((5, 32)) * 10).astype(
+                        mx.bfloat16
+                    )
+                    layer.switch_mlp = lambda x, inds: expert_outputs[inds]
+                    x = mx.zeros((1, 1, 32), dtype=mx.bfloat16)
+                    probability = 1 / (1 + np.exp(-np.array(logits).astype(np.float64)))
+                    indices = np.argsort(-(probability + np.array(bias)), axis=-1)[
+                        ..., :2
+                    ]
+                    weights = np.take_along_axis(probability, indices, -1)
+                    weights = weights / weights.sum(-1, keepdims=True)
+                    order = np.argsort(indices, axis=-1)
+                    indices = np.take_along_axis(indices, order, -1)
+                    weights = np.take_along_axis(weights, order, -1)
+                    values = np.array(expert_outputs.astype(mx.float32)).astype(
+                        np.float64
+                    )
+                    weighted = self.round_bf16(values[indices] * weights[..., None])
+                    expected = self.round_bf16(
+                        weighted[..., 0, :] + weighted[..., 1, :]
+                    )
+                    expected = self.round_bf16(expected * np.float32(1.7))
+                    if packed:
+                        expected = self.round_bf16(expected + values[4])
+                    actual = layer(x)
+                    self.assertEqual(actual.dtype, mx.bfloat16)
+                    np.testing.assert_array_equal(
+                        np.array(actual.astype(mx.float32)),
+                        expected,
+                    )
+
+    def test_gemma_norm_preserves_small_weight_offsets(self):
+        from mlx_vlm.models.minimax_m3_vl.language import MiniMaxRMSNorm
+
+        mx.random.seed(31)
+        norm = MiniMaxRMSNorm(128)
+        for dtype in (mx.bfloat16, mx.float16, mx.float32):
+            with self.subTest(dtype=dtype):
+                norm.weight = (mx.random.normal((128,)) * 0.003).astype(dtype)
+                x = mx.random.normal((2, 3, 128)).astype(dtype)
+                xf = np.array(x.astype(mx.float32)).astype(np.float64)
+                weight = np.array(norm.weight.astype(mx.float32)).astype(np.float64)
+                expected = xf / np.sqrt(
+                    np.mean(xf * xf, axis=-1, keepdims=True) + norm.eps
+                )
+                expected = mx.array(
+                    (expected * (1 + weight)).astype(np.float32)
+                ).astype(dtype)
+                actual = norm(x)
+                self.assertEqual(actual.dtype, dtype)
+                np.testing.assert_allclose(
+                    np.array(actual.astype(mx.float32)),
+                    np.array(expected.astype(mx.float32)),
+                    rtol=2e-6,
+                    atol=2e-6,
+                )
+
+    @unittest.skipUnless(mx.metal.is_available(), "Requires Metal")
+    def test_gemma_norm_matches_live_weights_and_strided_inputs(self):
+        from mlx_vlm.models.minimax_m3_vl.language import MiniMaxRMSNorm
+
+        mx.random.seed(41)
+        for dtype in (mx.bfloat16, mx.float16, mx.float32):
+            for dims in (7, 128, 6144):
+                norm = MiniMaxRMSNorm(dims)
+                norm.eval()
+                x = mx.random.normal((2, 3, dims * 2)).astype(dtype)[..., ::2]
+                norm.weight = (mx.random.normal((dims,)) * 0.003).astype(dtype)
+                for change in (False, True):
+                    with self.subTest(dtype=dtype, dims=dims, changed=change):
+                        if change:
+                            norm.weight[::2] = mx.array(0.25, dtype)
+                        expected = mx.fast.rms_norm(
+                            x, norm.weight.astype(mx.float32) + 1, norm.eps
+                        ).astype(dtype)
+                        self.assertTrue(mx.array_equal(norm(x), expected))
+
 
 # Shared model contracts
 
@@ -63,6 +847,31 @@ def capture_positions(
 
 class ModelChecks:
     """Reusable assertions; each JSON case constructs fresh configs and models."""
+
+    def causal_visual_prefix(self, language, config):
+        vision = mx.random.normal((1, 3, config.d_model))
+        prompt = mx.array([[2, 0, 7]])
+        embeddings = mx.concatenate([vision, language.embed(prompt)], axis=1)
+        full = language(inputs_embeds=embeddings).logits
+        # A later visual token cannot change earlier visual states.
+        changed = mx.concatenate(
+            [vision[:, :2], vision[:, 2:] + 10, language.embed(prompt)], axis=1
+        )
+        np.testing.assert_allclose(
+            np.asarray(full[:, :2]),
+            np.asarray(language(inputs_embeds=changed).logits[:, :2]),
+            atol=1e-5,
+        )
+        cache = language.make_cache()
+        first = language(inputs_embeds=embeddings[:, :4], cache=cache).logits
+        rest = language(inputs_embeds=embeddings[:, 4:], cache=cache).logits
+        np.testing.assert_allclose(
+            np.asarray(full),
+            np.asarray(mx.concatenate([first, rest], axis=1)),
+            atol=1e-5,
+        )
+        assert cache[0].offset == 6
+        assert cache[0].keys.shape[1] == config.self_attention_kv_heads
 
     def forward_cache(self, model, vocab_size, *, chunk_sizes=()):
         model.eval()
@@ -106,24 +915,36 @@ class ModelChecks:
 
     def assert_close(self, actual, expected, *, logits=False):
         assert actual.shape == expected.shape
-        assert mx.all(mx.isfinite(actual)).item()
         tolerance = 5e-3 if actual.dtype == mx.float16 else 1e-4
         # One-token attention uses a different Metal kernel from full prefill.
         if logits:
             tolerance = max(tolerance, 2e-3)
+        actual, expected = actual.astype(mx.float32), expected.astype(mx.float32)
+        mx.eval(actual, expected)
+        actual, expected = np.array(actual), np.array(expected)
+        assert np.isfinite(actual).all()
         np.testing.assert_allclose(
-            np.array(actual.astype(mx.float32)),
-            np.array(expected.astype(mx.float32)),
+            actual,
+            expected,
             atol=tolerance,
             rtol=tolerance,
         )
 
-    def prefill_parity(self, model, ids, media, chunk_sizes):
+    def prefill_parity(self, model, ids, media, chunk_sizes, *, features=None):
         """Compare full, cached and chunked prefill, then decode one new token."""
         language = model.language_model
-        features = model.get_input_embeddings(ids, **media).to_dict()
+        if features is None:
+            features = model.get_input_embeddings(ids, **media)
+        features = features.to_dict()
         embeds = features.pop("inputs_embeds")
-        reference = model(ids, cache=make_prompt_cache(language), **media).logits
+        token = mx.full((ids.shape[0], 1), 7, mx.int32)
+        full = model(
+            mx.concatenate([ids, token], axis=1),
+            cache=make_prompt_cache(language),
+            **media,
+        ).logits
+        # One causal full pass supplies both the prefill and decode references.
+        reference, extended = full[:, :-1], full[:, -1:]
         if ids.shape[0] > 1:
             solo = []
             for row in range(ids.shape[0]):
@@ -140,12 +961,6 @@ class ModelChecks:
                     ).logits
                 )
             self.assert_close(reference, mx.concatenate(solo), logits=True)
-        token = mx.full((ids.shape[0], 1), 7, mx.int32)
-        extended = model(
-            mx.concatenate([ids, token], axis=1),
-            cache=make_prompt_cache(language),
-            **media,
-        ).logits[:, -1:]
         for size in (ids.shape[1] - 1, *chunk_sizes):
             cache, chunks = make_prompt_cache(language), []
             for start in range(0, ids.shape[1], size):
@@ -201,6 +1016,7 @@ class ModelChecks:
                             ids += [config.vision_end_token_id]
                         rows.append(ids + [3, 4, 5])
                     ids = mx.array(rows, mx.int32)
+                    flat_ids = [token for row in rows for token in row]
                     for kind in layout:
                         pixels = mx.random.normal(
                             (batch * math.prod(grids[kind]), patch_width)
@@ -223,11 +1039,7 @@ class ModelChecks:
                     expected_embeds = model.language_model.model.embed_tokens(ids)
                     for kind in layout:
                         positions = mx.array(
-                            [
-                                i
-                                for i, t in enumerate(ids.flatten().tolist())
-                                if t == tokens[kind]
-                            ],
+                            [i for i, t in enumerate(flat_ids) if t == tokens[kind]],
                             mx.uint32,
                         )
                         embeddings, layer_features = encoded[kind]
@@ -243,7 +1055,7 @@ class ModelChecks:
                         self.assert_close(residuals, expected)
                     else:
                         positions = mx.array(
-                            [i for i, v in enumerate(mask.flatten().tolist()) if v],
+                            [i for i, t in enumerate(flat_ids) if t in tokens.values()],
                             mx.uint32,
                         )
                         self.assert_close(
@@ -262,7 +1074,9 @@ class ModelChecks:
                             mx.zeros_like(features.inputs_embeds), mask, value
                         )
                         self.assert_close(injected, expected[:, :, layer])
-                    self.prefill_parity(model, ids, media, chunk_sizes)
+                    self.prefill_parity(
+                        model, ids, media, chunk_sizes, features=features
+                    )
 
     def input_embeddings(self, model, model_name):
         result = model.get_input_embeddings(input_ids=mx.array([[1, 2, 3, 4, 5]]))
@@ -384,7 +1198,7 @@ class ModelChecks:
         batch = kwargs.pop("batch_size", 1)
         flat = (
             "qwen2_5_vl qwen3_5 qwen3_5_moe qwen4_exp "
-            "glm4v_moe glm4v hunyuan_vl siglip2_vision_model mimovl"
+            "glm4v_moe glm4v hunyuan_vl siglip2_vision_model mimovl siglip2_navit"
         ).split()
         shape = (
             image_size
@@ -579,10 +1393,16 @@ def check_arguments(kind, case, model, config):
     # Phi3-V keeps language dimensions on the outer config.
     core_config = getattr(config, "thinker_config", config)
     text = (
-        config if name == "phi3_v" else getattr(core_config, "text_config", core_config)
+        config
+        if name == "phi3_v"
+        else getattr(
+            core_config, "text_config", getattr(core_config, "lm_config", core_config)
+        )
     )
     if kind == "forward_cache":
         return (model, text.vocab_size), case.get("forward_cache", {})
+    if kind == "causal_visual_prefix":
+        return (model.language_model, text), {}
     if kind in {"masked_lm", "token_embeddings", "sentence_embeddings"}:
         return (model, config), {}
     if kind == "multimodal":
@@ -664,7 +1484,7 @@ def check_arguments(kind, case, model, config):
 
 @pytest.mark.parametrize("case", DATA["cases"], ids=lambda case: case["id"])
 def test_model_contract(case):
-    if "multimodal" in case["checks"]:
+    if {"multimodal", "causal_visual_prefix"}.intersection(case["checks"]):
         mx.random.seed(17)
     module = importlib.import_module("mlx_vlm.models." + case["module"])
     config = build_config(module, case["config"])
@@ -673,6 +1493,261 @@ def test_model_contract(case):
     for kind in case["checks"]:
         args, kwargs = check_arguments(kind, case, model, config)
         getattr(checks, kind)(*args, **kwargs)
+
+
+def test_nemotron_parse_source_architecture_and_tied_head_mapping():
+    config = {
+        "model_type": "nemotron_parse",
+        "architectures": ["RadioMBartPrefixForCausalLM"],
+        "decoder": {"vocab_size": 72512, "self_attention_kv_heads": 8},
+    }
+    module, model_type = get_model_and_args(config)
+    assert model_type == "nemotron_parse_v3_5"
+    assert module.ModelConfig.from_dict(config).text_config.vocab_size == 72512
+    weights = module.Model.sanitize(
+        {
+            "decoder.embed_tokens.weight": mx.zeros((4, 2)),
+            "decoder.extra_heads.0.weight": mx.ones((2, 2)),
+            "lm_head.weight": mx.zeros((4, 2)),
+        }
+    )
+    assert list(weights) == ["language_model.embed_tokens.weight"]
+
+
+@pytest.fixture
+def flint_model():
+    from mlx_vlm.models import flint
+
+    mx.random.seed(17)
+    model = flint.Model(build_config(flint, model_case("flint")["config"]))
+    model.eval()
+    mx.eval(model.parameters())
+    return model
+
+
+def _flint_numpy_reference(model, ids):
+    """Independent dense attention and explicit expert oracle for tiny Flint."""
+    config = model.config
+    weights = {
+        k.removeprefix("language_model."): np.array(v.astype(mx.float32)).astype(
+            np.float64
+        )
+        for k, v in tree_flatten(model.parameters())
+    }
+
+    def linear(x, name):
+        return x @ weights[name + ".weight"].T
+
+    def norm(x, name):
+        return (
+            x
+            / np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + config.rms_norm_eps)
+            * weights[name + ".weight"]
+        )
+
+    def mlp(x, prefix):
+        gate = linear(x, prefix + ".gate_proj")
+        return linear(
+            gate / (1 + np.exp(-gate)) * linear(x, prefix + ".up_proj"),
+            prefix + ".down_proj",
+        )
+
+    x = weights["model.embed_tokens.weight"][ids]
+    batch, length, _ = x.shape
+    positions = np.arange(length)
+    for i in range(config.num_hidden_layers):
+        prefix = f"model.layers.{i}"
+        a = prefix + ".self_attn"
+        hidden = norm(x, prefix + ".input_layernorm")
+        q = norm(
+            linear(hidden, a + ".q_proj").reshape(
+                batch, length, config.num_attention_heads, config.head_dim
+            ),
+            a + ".q_norm",
+        )
+        k = norm(
+            linear(hidden, a + ".k_proj").reshape(
+                batch, length, config.num_key_value_heads, config.head_dim
+            ),
+            a + ".k_norm",
+        )
+        v = linear(hidden, a + ".v_proj").reshape(
+            batch, length, config.num_key_value_heads, config.head_dim
+        )
+        if i not in config.no_rope_layer_indices:
+            angles = positions[:, None] / config.rope_theta ** (
+                np.arange(0, config.head_dim, 2) / config.head_dim
+            )
+            angles = np.concatenate([angles, angles], -1)[None, :, None, :]
+
+            def rotate(t):
+                left, right = np.split(t, 2, axis=-1)
+                return t * np.cos(angles) + np.concatenate([-right, left], -1) * np.sin(
+                    angles
+                )
+
+            q, k = rotate(q), rotate(k)
+        repeat = config.num_attention_heads // config.num_key_value_heads
+        q = q.transpose(0, 2, 1, 3)
+        k, v = (np.repeat(t, repeat, axis=2).transpose(0, 2, 1, 3) for t in (k, v))
+        scores = (q @ k.swapaxes(-2, -1)) / np.sqrt(config.head_dim)
+        allowed = positions[:, None] >= positions[None, :]
+        if config.layer_types[i] == "sliding_attention" and config.sliding_window:
+            allowed &= positions[:, None] - positions[None, :] < config.sliding_window
+        scores = np.where(allowed, scores, -np.inf)
+        sink = np.broadcast_to(
+            weights[a + ".softmax_offset"][None, :, None, None], (*scores.shape[:-1], 1)
+        )
+        scores = np.concatenate([scores, sink], axis=-1)
+        probs = np.exp(scores - scores.max(axis=-1, keepdims=True))
+        probs /= probs.sum(axis=-1, keepdims=True)
+        attention = (
+            (probs[..., :-1] @ v).transpose(0, 2, 1, 3).reshape(batch, length, -1)
+        )
+        x = x + linear(attention, a + ".o_proj")
+        hidden = norm(x, prefix + ".post_attention_layernorm")
+        p = prefix + ".mlp"
+        if i in config.mlp_only_layers:
+            x = x + mlp(hidden, p)
+            continue
+        scores = 1 / (1 + np.exp(-linear(hidden, p + ".gate")))
+        indices = np.argsort(scores + weights[p + ".expert_bias"], axis=-1)[
+            ..., -config.num_experts_per_tok :
+        ]
+        route_weights = np.take_along_axis(scores, indices, axis=-1)
+        route_weights /= route_weights.sum(axis=-1, keepdims=True) + 1e-20
+        routed = np.zeros_like(hidden)
+        for b in range(batch):
+            for t in range(length):
+                for e, score in zip(indices[b, t], route_weights[b, t]):
+                    gate = (
+                        hidden[b, t] @ weights[p + ".switch_mlp.gate_proj.weight"][e].T
+                    )
+                    up = hidden[b, t] @ weights[p + ".switch_mlp.up_proj.weight"][e].T
+                    routed[b, t] += score * (
+                        (gate / (1 + np.exp(-gate)) * up)
+                        @ weights[p + ".switch_mlp.down_proj.weight"][e].T
+                    )
+        shared = (
+            mlp(hidden, p + ".shared_expert")
+            if config.shared_expert_intermediate_size
+            else 0
+        )
+        x = x + routed + shared
+    return linear(norm(x, "model.norm"), "lm_head")
+
+
+def test_flint_matches_independent_attention_and_moe_reference(flint_model):
+    for layer in flint_model.layers:
+        layer.self_attn.softmax_offset = mx.array([-2.0, 0.0, 1.0, 3.0])
+        if hasattr(layer.mlp, "expert_bias"):
+            layer.mlp.expert_bias = mx.array([0.5, -0.4, 0.1, 0.3])
+    ids = np.array([[1, 4, 7, 2, 9, 3, 8, 5, 6], [7, 3, 8, 5, 6, 1, 2, 9, 4]])
+    actual = flint_model(mx.array(ids)).logits
+    expected = _flint_numpy_reference(flint_model, ids)
+    np.testing.assert_allclose(np.array(actual), expected, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.parametrize("window", [1, 4, None])
+def test_flint_hybrid_cache_matches_full_forward(flint_model, window):
+    flint_model.layers[1].self_attn.window_size = window
+    ids = (mx.arange(41)[None] * 7 + 3) % flint_model.config.vocab_size
+    expected = flint_model(ids).logits
+    for schedule in ([1] * 41, [17, 7, 8, 8, 1], [1] * 19 + [5, 8, 8, 1]):
+        cache = flint_model.make_cache()
+        out, start = [], 0
+        for size in schedule:
+            logits = flint_model(ids[:, start : start + size], cache=cache).logits
+            mx.eval(logits)
+            out.append(logits)
+            start += size
+        np.testing.assert_allclose(
+            np.array(mx.concatenate(out, axis=1)),
+            np.array(expected),
+            atol=2e-5,
+            rtol=2e-5,
+        )
+        assert isinstance(cache[0], KVCache)
+        assert isinstance(cache[1], KVCache if window is None else RotatingKVCache)
+        assert all(c.offset == 41 for c in cache)
+
+
+def test_flint_padded_batch_matches_individual_decoding(flint_model):
+    from mlx_vlm.models.cache import BatchKVCache, BatchRotatingKVCache
+
+    ids = mx.array([[0, 0, 1, 2, 3, 4, 5], [1, 2, 3, 4, 5, 6, 7]])
+    cache = [
+        (
+            BatchRotatingKVCache(layer.self_attn.window_size, [2, 0])
+            if layer.self_attn.window_size
+            else BatchKVCache([2, 0])
+        )
+        for layer in flint_model.layers
+    ]
+    actual = flint_model(ids, cache=cache).logits[:, -1:]
+    for row, pad in enumerate([2, 0]):
+        expected = flint_model(ids[row : row + 1, pad:]).logits[:, -1:]
+        np.testing.assert_allclose(
+            np.array(actual[row : row + 1]), np.array(expected), atol=2e-5, rtol=2e-5
+        )
+    token = mx.array([[8], [9]])
+    actual = flint_model(token, cache=cache).logits
+    for row, pad in enumerate([2, 0]):
+        extended = mx.concatenate(
+            [ids[row : row + 1, pad:], token[row : row + 1]], axis=1
+        )
+        expected = flint_model(extended).logits[:, -1:]
+        np.testing.assert_allclose(
+            np.array(actual[row : row + 1]), np.array(expected), atol=2e-5, rtol=2e-5
+        )
+
+
+@pytest.mark.parametrize("with_bias", [False, True])
+@pytest.mark.parametrize("quantized", [False, True])
+def test_flint_checkpoint_strict_loading_and_roundtrip(
+    flint_model, tmp_path, with_bias, quantized
+):
+    model = flint_model
+    if quantized:
+        nn.quantize(
+            model,
+            group_size=32,
+            bits=4,
+            class_predicate=lambda path, m: hasattr(m, "to_quantized")
+            and "mlp.gate" not in path
+            and m.weight.shape[-1] % 32 == 0,
+        )
+    expected = dict(tree_flatten(model.parameters()))
+    checkpoint = {}
+    for key, value in expected.items():
+        key = key.removeprefix("language_model.")
+        if key.endswith(".mlp.expert_bias"):
+            if with_bias:
+                checkpoint[
+                    key.replace(".mlp.expert_bias", ".mlp.gate.e_score_correction_bias")
+                ] = value
+        elif ".mlp.switch_mlp." in key:
+            prefix, suffix = key.split(".mlp.switch_mlp.")
+            for e in range(model.config.num_experts):
+                checkpoint[f"{prefix}.mlp.experts.{e}.{suffix}"] = value[e]
+        else:
+            checkpoint[key] = value
+    sanitized = model.sanitize(checkpoint)
+    assert sanitized.keys() == expected.keys()
+    assert model.sanitize(sanitized).keys() == expected.keys()
+    for key, value in expected.items():
+        assert mx.array_equal(sanitized[key], value).item(), key
+    model.load_weights(list(sanitized.items()), strict=True)
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), sanitized)
+    config = model.config.to_dict()
+    if quantized:
+        config["quantization"] = {"group_size": 32, "bits": 4}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    reloaded = load_model(tmp_path)
+    ids = mx.array([[1, 2, 3, 4, 5]])
+    np.testing.assert_array_equal(
+        np.array(reloaded(ids).logits), np.array(model(ids).logits)
+    )
 
 
 @pytest.fixture
@@ -1238,6 +2313,384 @@ def tiny_config(family, profile=None, **overrides):
     return build_config(module, fields | overrides, case["config_type"])
 
 
+def _prepare_minimax_distributed(model, dtype):
+    from mlx_vlm.quantization.nvfp4 import ScaledQuantizedSwitchLinear
+
+    for layer in model.layers:
+        if not layer.is_moe_layer:
+            continue
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            projection = getattr(layer.block_sparse_moe.switch_mlp, name)
+            scale = mx.arange(1, projection.num_experts + 1, dtype=mx.float32) * 1344
+            setattr(
+                layer.block_sparse_moe.switch_mlp,
+                name,
+                ScaledQuantizedSwitchLinear(projection, scale, "weight_global_scale"),
+            )
+
+
+DISTRIBUTED_MODEL_SETUPS = {"minimax_m3_nvfp4": _prepare_minimax_distributed}
+
+
+@pytest.mark.parametrize(
+    "family", ["minimax_m3", "minimax_m3_nvfp4", "minimax_m3_packed"]
+)
+def test_minimax_shard_validation_and_partitioning(family):
+    mx.random.seed(19)
+    model = _make_distributed_test_model(family, mx.bfloat16)
+    original = dict(tree_flatten(model.parameters()))
+    model.shard(SimpleNamespace(size=lambda: 1, rank=lambda: 0))
+    assert all(p is original[k] for k, p in tree_flatten(model.parameters()))
+    with pytest.raises(ValueError, match="Expert count"):
+        model.shard(SimpleNamespace(size=lambda: 3, rank=lambda: 0))
+    assert all(p is original[k] for k, p in tree_flatten(model.parameters()))
+
+    model.shard(SimpleNamespace(size=lambda: 2, rank=lambda: 1))
+    for key, value in tree_flatten(model.parameters()):
+        old = original[key]
+        if ".switch_mlp." in key:
+            routed = model.args.num_local_experts
+            expected = old[routed // 2 : routed]
+            if model.args.pack_shared_expert:
+                expected = mx.concatenate([expected, old[-1:]], axis=0)
+            assert mx.array_equal(value, expected).item(), key
+        elif key.startswith("lm_head."):
+            assert mx.array_equal(value, old[old.shape[0] // 2 :]).item(), key
+        else:
+            assert value is old, key
+    with pytest.raises(ValueError, match="already sharded"):
+        model.shard(SimpleNamespace(size=lambda: 2, rank=lambda: 1))
+
+
+def test_minimax_shard_rejects_invalid_scales_without_mutating_weights():
+    model = _make_distributed_test_model("minimax_m3_nvfp4", mx.bfloat16)
+    projection = model.layers[-1].block_sparse_moe.switch_mlp.down_proj
+    projection.weight_global_scale = mx.ones(3)
+    original = dict(tree_flatten(model.parameters()))
+    with pytest.raises(ValueError):
+        model.shard(SimpleNamespace(size=lambda: 2, rank=lambda: 0))
+    assert all(p is original[k] for k, p in tree_flatten(model.parameters()))
+
+
+@pytest.mark.parametrize("tied,vocab_size", [(True, 128), (False, 129)])
+def test_minimax_shard_keeps_unsplittable_vocabulary_replicated(tied, vocab_size):
+    from mlx_vlm.models.minimax_m3_vl.language import LanguageModel
+
+    model = LanguageModel(
+        tiny_config("minimax_m3", tie_word_embeddings=tied, vocab_size=vocab_size)
+    )
+    head = model.model.embed_tokens if tied else model.lm_head
+    weight = head.weight
+    model.shard(SimpleNamespace(size=lambda: 2, rank=lambda: 0))
+    assert head.weight is weight
+    assert not model._sharded_lm_head
+
+
+@pytest.mark.parametrize("per_expert", [False, True])
+def test_minimax_shard_preserves_quantization_scale_layouts(per_expert):
+    model = _make_distributed_test_model("minimax_m3_nvfp4", mx.bfloat16)
+    projection = model.layers[-1].block_sparse_moe.switch_mlp.down_proj
+    projection.weight_global_scale = (
+        mx.arange(4 * 128, dtype=mx.float32).reshape(4, 128) + 1
+        if per_expert
+        else mx.array(2688.0)
+    )
+    projection.pre_quant_scale = mx.arange(128, dtype=mx.float32) + 1
+    if per_expert:
+        projection.pre_quant_scale = mx.broadcast_to(
+            projection.pre_quant_scale, (4, 128)
+        )
+    scale, smoothing = projection.weight_global_scale, projection.pre_quant_scale
+    model.shard(SimpleNamespace(size=lambda: 2, rank=lambda: 1))
+    if per_expert:
+        assert mx.array_equal(projection.weight_global_scale, scale[2:]).item()
+        assert mx.array_equal(projection.pre_quant_scale, smoothing[2:]).item()
+    else:
+        assert projection.weight_global_scale is scale
+        assert projection.pre_quant_scale is smoothing
+
+
+def test_minimax_shard_preserves_head_output_scale_broadcasting():
+    from mlx_vlm.quantization.nvfp4 import ScaledQuantizedLinear
+
+    model = _make_distributed_test_model("minimax_m3", mx.bfloat16)
+    model.lm_head = ScaledQuantizedLinear(
+        model.lm_head.to_quantized(group_size=16, bits=4, mode="nvfp4"),
+        (mx.arange(128, dtype=mx.float32) + 1) * 128,
+        "weight_global_scale",
+    )
+    hidden = mx.random.normal((1, 1, 128)).astype(mx.bfloat16)
+    expected = model.lm_head(hidden)[..., 64:]
+    mx.eval(expected)
+    model.shard(SimpleNamespace(size=lambda: 2, rank=lambda: 1))
+    actual = model.lm_head(hidden)
+    assert actual.shape == expected.shape
+    assert mx.array_equal(actual, expected).item()
+
+
+def test_minimax_multimodal_model_exposes_sharding():
+    from mlx_vlm.models import minimax_m3_vl
+
+    model = minimax_m3_vl.Model(
+        build_config(minimax_m3_vl, model_case("minimax_m3_vl")["config"])
+    )
+    group = SimpleNamespace(size=lambda: 1, rank=lambda: 0)
+    with patch.object(model.language_model, "shard") as shard:
+        model.shard(group)
+    shard.assert_called_once_with(group)
+
+
+# Distributed language-model contracts
+
+
+def _make_distributed_test_model(family, dtype):
+    case = TINY_MODELS[family]
+    config = tiny_config(family, "distributed")
+    module = importlib.import_module("mlx_vlm.models." + case["module"] + ".language")
+    model = module.LanguageModel(config)
+    model.update(
+        tree_map(
+            lambda p: p.astype(dtype) if mx.issubdtype(p.dtype, mx.floating) else p,
+            model.parameters(),
+        )
+    )
+    if setup := DISTRIBUTED_MODEL_SETUPS.get(family):
+        setup(model, dtype)
+    if quantization := case["distributed"].get("quantization"):
+        quantization = copy.deepcopy(quantization)
+        if patterns := quantization.pop("modules", None):
+
+            def predicate(path, module):
+                if hasattr(module, "to_quantized"):
+                    for pattern, overrides in patterns.items():
+                        if fnmatchcase(path, pattern):
+                            return overrides
+                return False
+
+            quantization["class_predicate"] = predicate
+        nn.quantize(model, **quantization)
+    model.eval()
+    return model
+
+
+def _distributed_model_worker(family, dtype_name):
+    group = mx.distributed.init(strict=True, backend="ring")
+    options = TINY_MODELS[family]["distributed"]
+    dtype = getattr(mx, dtype_name)
+    mx.random.seed(19)
+    reference = _make_distributed_test_model(family, dtype)
+    mx.eval(reference.parameters())
+    weights = dict(tree_flatten(reference.parameters()))
+    sharded = _make_distributed_test_model(family, dtype)
+    sharded.load_weights(list(weights.items()), strict=True)
+    sharded.shard(group)
+    if error := options.get("reshard_error"):
+        with pytest.raises(ValueError, match=error):
+            sharded.shard(group)
+    mx.eval(sharded.parameters())
+    local_weights = dict(tree_flatten(sharded.parameters()))
+    for pattern in options["sharded_weights"]:
+        names = [name for name in weights if fnmatchcase(name, pattern)]
+        assert names, f"No weights match {pattern!r}"
+        for name in names:
+            assert local_weights[name].size * group.size() == weights[name].size, name
+
+    records = []
+    # Keep model-specific reference tolerances in the fixture. Every rank must
+    # return identical logits; MiniMax also requires exact BF16 reference parity.
+    tolerance = options["tolerances"][dtype_name]
+    vocab_size = reference.args.vocab_size
+    for batch in (1, 4):
+        actual_cache = make_prompt_cache(sharded)
+        expected_cache = make_prompt_cache(reference)
+        for step, tokens in enumerate(
+            ([1, 7, 9, 3, 11, 15, 2, 6, 8, 10, 12, 14], [13], [17], [19], [2, 4, 6])
+        ):
+            ids = mx.array(
+                [[(t + row) % vocab_size for t in tokens] for row in range(batch)]
+            )
+            expected = reference(ids, cache=expected_cache).logits
+            mx.eval(expected)
+            # Finish independent reference work on every rank before queuing
+            # distributed work on the shared GPU. Keep test-only collectives
+            # on the CPU so a faster rank cannot block another rank's GPU work.
+            mx.distributed.all_sum(mx.array(0), group=group, stream=mx.cpu).item()
+            actual = sharded(ids, cache=actual_cache).logits
+            mx.eval(actual)
+            gathered = mx.distributed.all_gather(actual, group=group, stream=mx.cpu)
+            mx.eval(gathered)
+            ranks_agree = all(
+                mx.array_equal(
+                    gathered[:batch], gathered[rank * batch : (rank + 1) * batch]
+                ).item()
+                for rank in range(1, group.size())
+            )
+            records.append(
+                dict(
+                    batch=batch,
+                    step=step,
+                    max_error=mx.max(mx.abs(actual - expected)).item(),
+                    ranks_agree=ranks_agree,
+                    passed=mx.allclose(
+                        actual, expected, atol=tolerance, rtol=tolerance
+                    ).item(),
+                )
+            )
+    passed = mx.distributed.all_sum(
+        mx.array(int(all(r["passed"] and r["ranks_agree"] for r in records))),
+        group=group,
+        stream=mx.cpu,
+    ).item()
+    print(
+        json.dumps(dict(rank=group.rank(), passed_ranks=passed, checks=records)),
+        flush=True,
+    )
+    assert passed == group.size(), records
+
+
+def _run_distributed_model_test(family, dtype, world_size):
+    repo = Path(__file__).resolve().parents[2]
+    # The ring launcher needs one consecutive port per rank. Probe the entire
+    # range while holding the sockets so a four-rank case cannot reuse a port.
+    for _ in range(100):
+        with ExitStack() as stack:
+            sockets = [stack.enter_context(socket.socket()) for _ in range(world_size)]
+            sockets[0].bind(("127.0.0.1", 0))
+            port = sockets[0].getsockname()[1]
+            if port + world_size > 65536:
+                continue
+            try:
+                for rank, sock in enumerate(sockets[1:], 1):
+                    sock.bind(("127.0.0.1", port + rank))
+            except OSError:
+                continue
+            break
+    else:
+        pytest.fail(f"Could not find {world_size} consecutive ring ports")
+    command = [
+        sys.executable,
+        "-c",
+        "from mlx._distributed_utils.launch import main; main()",
+        "--backend",
+        "ring",
+        "-n",
+        str(world_size),
+        "--starting-port",
+        str(port),
+        "--env",
+        f"PYTHONPATH={repo}",
+        "--",
+        sys.executable,
+        "-c",
+        "import sys; from mlx_vlm.tests.test_models import _distributed_model_worker; "
+        "_distributed_model_worker(*sys.argv[1:])",
+        family,
+        dtype,
+    ]
+    process = subprocess.Popen(
+        command,
+        cwd=repo,
+        env=dict(os.environ, PYTHONPATH=str(repo)),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        output, _ = process.communicate(timeout=180)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        output, _ = process.communicate()
+        pytest.fail(
+            f"Distributed test timed out: {family}/{dtype}/{world_size}\n{output}"
+        )
+    assert process.returncode == 0, output
+    records = [json.loads(line) for line in output.splitlines() if line.startswith("{")]
+    assert len(records) == world_size, output
+    assert {r["rank"] for r in records if r["passed_ranks"] == world_size} == set(
+        range(world_size)
+    ), output
+
+
+@pytest.mark.skipif(not mx.distributed.is_available("ring"), reason="ring required")
+@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+@pytest.mark.parametrize(
+    "family", [name for name, case in TINY_MODELS.items() if "distributed" in case]
+)
+def test_distributed_model(family, dtype, world_size):
+    _run_distributed_model_test(family, dtype, world_size)
+
+
+def test_gemma4_modelopt_awq_strict_load_and_forward(tmp_path):
+    module = importlib.import_module("mlx_vlm.models.gemma4")
+    fields = model_case("gemma4")["config"]
+    fields["audio_config"] = None
+    fields["text_config"].update(
+        num_hidden_layers=2,
+        head_dim=16,
+        global_head_dim=16,
+        layer_types=["sliding_attention", "full_attention"],
+        attention_k_eq_v=True,
+        use_double_wide_mlp=False,
+    )
+    mx.random.seed(661)
+    reference = module.Model(build_config(module, fields))
+    expected_weights = dict(tree_flatten(reference.parameters()))
+    source = {}
+    for key, value in expected_weights.copy().items():
+        source_key = "model." + key.replace("language_model.model.", "language_model.")
+        if (
+            key.endswith(".weight")
+            and any(
+                f".{projection}." in key
+                for projection in (
+                    "q_proj",
+                    "k_proj",
+                    "v_proj",
+                    "o_proj",
+                    "gate_proj",
+                    "up_proj",
+                    "down_proj",
+                )
+            )
+            and key.startswith("language_model.")
+        ):
+            prefix = source_key.removesuffix(".weight")
+            factor = mx.array(0.137, mx.float32)
+            packed, scales = mx.quantize(value / factor, mode="nvfp4")
+            source[source_key] = packed.view(mx.uint8)
+            source[prefix + ".weight_scale"] = scales
+            source[prefix + ".weight_scale_2"] = factor
+            source[prefix + ".input_scale"] = mx.array(0.25, mx.float32)
+            decoded = mx.dequantize(packed, scales, mode="nvfp4") * factor
+            if key.endswith(("down_proj.weight", "o_proj.weight")):
+                pre_scale = mx.linspace(0.25, 2.0, value.shape[-1]).astype(mx.bfloat16)
+                source[prefix + ".pre_quant_scale"] = pre_scale
+                decoded *= pre_scale.astype(mx.float32)
+            expected_weights[key] = decoded
+        else:
+            source[source_key] = value
+
+    config = asdict(reference.config)
+    config["quantization_config"] = {
+        "quant_method": "modelopt",
+        "quant_algo": "NVFP4_AWQ",
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), source)
+    loaded = load_model(tmp_path, strict=True)
+    reference.load_weights(list(expected_weights.items()))
+    tokens = mx.array([[1, 5, 9]])
+    expected = reference(tokens).logits
+    actual = loaded(tokens).logits
+    assert mx.allclose(actual, expected, atol=2e-5, rtol=2e-4).item()
+    cache = loaded.language_model.make_cache()
+    loaded(tokens[:, :2], cache=cache)
+    decoded = loaded(tokens[:, 2:], cache=cache).logits
+    assert mx.allclose(decoded, expected[:, 2:], atol=2e-5, rtol=2e-4).item()
+
+
 def test_gemma3_can_preserve_caller_supplied_embedding_scale():
     case = next(case for case in DATA["cases"] if case["module"] == "gemma3")
     module = importlib.import_module(f"mlx_vlm.models.{case['module']}.language")
@@ -1256,6 +2709,206 @@ def test_gemma3_can_preserve_caller_supplied_embedding_scale():
 
     assert mx.array_equal(capture.call_args.args[0], expected)
     assert mx.array_equal(output, expected)
+
+
+def rotating_language_model(case):
+    """Reuse model contracts and tiny defaults for cache-specific model checks."""
+    name = case["module"]
+    module = importlib.import_module(f"mlx_vlm.models.{name}")
+    language = importlib.import_module(f"mlx_vlm.models.{name}.language")
+    outer, text = None, {}
+    if "case" in case:
+        outer = build_config(module, model_case(case["case"])["config"])
+        outer = getattr(outer, "thinker_config", outer)
+        text = asdict(outer.text_config)
+    defaults = {} if name == "florence2" else TINY_DEFAULTS
+    config = build_config(
+        language,
+        text | defaults | case["config"],
+        case.get("config_type", "TextConfig"),
+    )
+    if name == "florence2":
+        return language.Florence2Decoder(config), config
+    if name in ("qwen2", "qwen3", "mllama", "moondream3", "minimax_m3_vl", "gemma3n"):
+        return language.LanguageModel(config), config
+    if outer is None:
+        outer = module.ModelConfig(
+            text_config=config, vision_config=module.VisionConfig()
+        )
+    else:
+        outer.text_config = config
+    model = (
+        language.LanguageModel(outer)
+        if name == "hunyuan_vl"
+        else language.LanguageModel(config, outer)
+    )
+    return model, config
+
+
+@pytest.mark.parametrize(
+    "case",
+    [c for c in DATA["rotating_cache"] if "chunk_parity" in c["checks"]],
+    ids=lambda c: c["module"],
+)
+@pytest.mark.parametrize("keep", [0, 2])
+def test_rotating_cache_random_model_chunk_parity(case, keep):
+    mx.random.seed(17)
+    model, config = rotating_language_model(case)
+    model.eval()
+    mx.eval(model.parameters())
+    ids = (mx.arange(41)[None] * 7 + 3) % config.vocab_size
+
+    def forward(schedule):
+        for attr in ("_rope_deltas", "_position_ids"):
+            if hasattr(model, attr):
+                setattr(model, attr, None)
+        caches = [RotatingKVCache(8, keep=keep) for _ in model.layers]
+        result, start = [], 0
+        for n in schedule:
+            logits = model(ids[:, start : start + n], cache=caches).logits
+            mx.eval(logits, [c.state for c in caches])
+            result.append(logits)
+            start += n
+        assert start == ids.shape[1]
+        return np.array(mx.concatenate(result, axis=1))
+
+    expected = forward([1] * 41)
+    # Include a chunk larger than the cache and multi-token continuation after
+    # single-token decoding has wrapped the storage cursor.
+    for schedule in ([3] * 13 + [1, 1], [17, 7, 8, 8, 1], [1] * 19 + [5, 8, 8, 1]):
+        np.testing.assert_allclose(forward(schedule), expected, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [c for c in DATA["rotating_cache"] if "prompt_metadata" in c["checks"]],
+    ids=lambda c: c["module"],
+)
+def test_rotated_model_slices_full_prompt_metadata(case):
+    name = case["module"]
+    mx.random.seed(19)
+    model, config = rotating_language_model(case)
+    model.eval()
+    ids = (mx.arange(24)[None] * 7 + 3) % config.vocab_size
+    positions = mx.broadcast_to(mx.arange(24)[None, None, :], (3, 1, 24))
+    positions = positions + mx.array([3, 7, 11])[:, None, None]
+    if name == "falcon_ocr":
+        positions = positions[0]
+    metadata = {"position_ids": positions}
+    if name in ("qwen3_vl", "qwen3_vl_moe", "qwen3_omni_moe"):
+        metadata["visual_pos_masks"] = mx.ones((1, 24), mx.bool_)
+        metadata["deepstack_visual_embeds"] = (
+            mx.random.normal((1, 24, 2, config.hidden_size))
+            if name == "qwen3_omni_moe"
+            else [mx.random.normal((24, config.hidden_size)) for _ in range(2)]
+        )
+
+    def forward(full_metadata):
+        for attr in ("_rope_deltas", "_position_ids"):
+            if hasattr(model, attr):
+                setattr(model, attr, None)
+        cache = [RotatingKVCache(8, keep=2) for _ in model.layers]
+        for start in range(21):
+            out = model(ids[:, start : start + 1], cache=cache)
+            mx.eval(out.logits)
+        assert cache[0].offset == 21 and cache[0]._idx != 21
+        kwargs = dict(metadata)
+        if not full_metadata:
+            kwargs["position_ids"] = positions[..., 21:24]
+            if "visual_pos_masks" in kwargs:
+                kwargs["visual_pos_masks"] = kwargs["visual_pos_masks"][:, 21:24]
+                embeds = kwargs["deepstack_visual_embeds"]
+                kwargs["deepstack_visual_embeds"] = (
+                    [e[21:24] for e in embeds]
+                    if isinstance(embeds, list)
+                    else embeds[:, 21:24]
+                )
+        if name == "falcon_ocr":
+            # Falcon's full-prompt metadata is passed with precomputed embeddings.
+            kwargs["inputs_embeds"] = model.model.embed_tokens(ids[:, 21:24])
+            if not full_metadata:
+                # This wrapper accepts full position IDs only; compare the
+                # internally selected positions against a direct model call.
+                mask = create_attention_mask(kwargs["inputs_embeds"], cache)
+                return np.array(
+                    model.lm_head(
+                        model.model(
+                            ids[:, 21:24],
+                            inputs_embeds=kwargs["inputs_embeds"],
+                            position_ids=positions[..., 21:24],
+                            mask=mask,
+                            cache=cache,
+                        )
+                    )
+                )
+        return np.array(model(ids[:, 21:24], cache=cache, **kwargs).logits)
+
+    np.testing.assert_allclose(forward(True), forward(False), atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [c for c in DATA["rotating_cache"] if "per_layer_inputs" in c["checks"]],
+    ids=lambda c: c["module"],
+)
+def test_rotated_per_layer_inputs(case):
+    mx.random.seed(23)
+    model, config = rotating_language_model(case)
+    # The constructor initializes this gate to zero, which would hide a bad
+    # per-layer-input slice in an otherwise randomly initialized model.
+    for layer in model.layers:
+        layer.altup.correct_output_scale = mx.random.uniform(
+            low=0.5, high=1.5, shape=(config.hidden_size,)
+        )
+    model.eval()
+    ids = (mx.arange(41)[None] * 7 + 3) % config.vocab_size
+    per_layer_inputs = model.model.get_per_layer_inputs(ids)
+
+    def forward(step, full_metadata):
+        cache, outputs = model.make_cache(), []
+        for start in range(0, 41, step):
+            metadata = (
+                per_layer_inputs
+                if full_metadata
+                else per_layer_inputs[:, start : start + step]
+            )
+            out = model(
+                ids[:, start : start + step], cache=cache, per_layer_inputs=metadata
+            )
+            mx.eval(out.logits)
+            outputs.append(out.logits)
+        return np.array(mx.concatenate(outputs, axis=1))
+
+    expected = forward(1, False)
+    np.testing.assert_allclose(forward(3, True), expected, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [c for c in DATA["rotating_cache"] if "decoder_positions" in c["checks"]],
+    ids=lambda c: c["module"],
+)
+def test_rotated_decoder_positions_and_mask(case):
+    mx.random.seed(29)
+    decoder, config = rotating_language_model(case)
+    decoder.eval()
+    encoder_states = mx.random.normal((1, 4, config.d_model))
+    embeddings = mx.random.normal((1, 41, config.d_model))
+
+    def forward(step):
+        cache = [[RotatingKVCache(8, keep=2), KVCache()] for _ in decoder.layers]
+        outputs = []
+        for start in range(0, 41, step):
+            out = decoder(
+                inputs_embeds=embeddings[:, start : start + step],
+                encoder_hidden_states=encoder_states,
+                cache=cache,
+            )
+            mx.eval(out)
+            outputs.append(out)
+        return np.array(mx.concatenate(outputs, axis=1))
+
+    np.testing.assert_allclose(forward(3), forward(1), atol=1e-4, rtol=1e-4)
 
 
 # Document layout
@@ -2659,30 +4312,38 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
         )
         self.assertIsNone(output.hidden_states)
         expected = output.logits
-        mx.eval(expected)
-
+        comparisons = []
         for chunks in ((8,), (3, 2, 3), (1,) * 8):
-            with self.subTest(chunks=chunks):
-                cache = model.make_cache()
-                outputs, start = [], 0
-                for length in chunks:
-                    stop = start + length
-                    outputs.append(
-                        model(
-                            inputs=ids[:, start:stop],
-                            inputs_embeds=embeds[:, start:stop],
-                            cache=cache,
-                            n_to_process=length,
-                        ).logits
-                    )
-                    start = stop
-                actual = mx.concatenate(outputs, axis=1)
-                mx.eval(actual)
-                self.assertTrue(
-                    bool(mx.array_equal(cache[0].engram, reference_cache[0].engram))
+            cache = model.make_cache()
+            outputs, start = [], 0
+            for length in chunks:
+                stop = start + length
+                outputs.append(
+                    model(
+                        inputs=ids[:, start:stop],
+                        inputs_embeds=embeds[:, start:stop],
+                        cache=cache,
+                        n_to_process=length,
+                    ).logits
                 )
-                self.assertTrue(bool(mx.all(cache[0].engram[:, 2:5] == -1)))
-                self.assertTrue(bool(mx.allclose(actual, expected, atol=1e-4)))
+                start = stop
+            comparisons.append(
+                (
+                    chunks,
+                    (
+                        mx.array_equal(cache[0].engram, reference_cache[0].engram),
+                        mx.all(cache[0].engram[:, 2:5] == -1),
+                        mx.allclose(
+                            mx.concatenate(outputs, axis=1), expected, atol=1e-4
+                        ),
+                    ),
+                )
+            )
+        mx.eval([checks for _, checks in comparisons])
+        for chunks, checks in comparisons:
+            with self.subTest(chunks=chunks):
+                for check in checks:
+                    self.assertTrue(check.item())
 
 
 class TestMoERouterStopGradient:
@@ -2778,3 +4439,1226 @@ class TestPhiMoE:
         )
 
         assert isinstance(Attention(config).rope, nn.RoPE)
+
+
+@pytest.fixture
+def unlimited_ocr_model():
+    module = importlib.import_module(
+        "mlx_vlm.models." + TINY_MODELS["unlimited_ocr"]["module"]
+    )
+
+    class TinyModel(nn.Module):
+        # Exercise the production embedding path without the large vision encoders.
+        get_input_embeddings = module.Model.get_input_embeddings
+
+        def __init__(self):
+            super().__init__()
+            self.config = tiny_config("unlimited_ocr")
+            self.language_model = module.LanguageModel(self.config)
+
+    model = TinyModel()
+    model.eval()
+    return model
+
+
+@pytest.mark.parametrize("quantized", [False, True], ids=["dense", "quantized"])
+def test_unlimited_ocr_fp32_fusion_preserves_features_and_weights(
+    unlimited_ocr_model, quantized
+):
+    model = unlimited_ocr_model
+    width = 64 if quantized else 4
+    embedding = (
+        nn.QuantizedEmbedding(8, width, group_size=64, bits=8)
+        if quantized
+        else nn.Embedding(8, width)
+    )
+    embedding.set_dtype(mx.bfloat16)
+    original_weights = np.array(embedding.weight.view(mx.uint8))
+    model.language_model.model.embed_tokens = embedding
+    model.sam_model = lambda images: mx.full((images.shape[0], 1, 1, 2), 0.123456)
+    model.vision_model = lambda images, patch_embeds=None: mx.full(
+        (images.shape[0], 2, 2), 0.234567
+    )
+    model.projector = nn.Linear(4, width, bias=False) if quantized else nn.Identity()
+    model.image_newline = model.view_separator = mx.zeros(width)
+    features = model.get_input_embeddings(
+        input_ids=mx.array([[0, 1, 1, 1, 2]]),
+        pixel_values=[mx.zeros((1, 3, 4, 4)), mx.ones((1, 3, 4, 4))],
+        images_spatial_crop=mx.array([[1, 1]]),
+        images_seq_mask=mx.array([[False, True, True, True, False]]),
+    ).inputs_embeds
+    assert features.dtype == mx.float32
+    np.testing.assert_array_equal(
+        np.array(embedding.weight.view(mx.uint8)), original_weights
+    )
+    if quantized:
+        assert embedding.weight.dtype == mx.uint32
+        assert embedding.scales.dtype == mx.bfloat16
+    else:
+        expected = mx.array([0.234567, 0.234567, 0.123456, 0.123456])
+        np.testing.assert_array_equal(np.array(features[0, 1]), np.array(expected))
+
+
+@pytest.mark.parametrize("path", ["embeddings", "language"])
+def test_unlimited_ocr_text_only_keeps_native_dtype(unlimited_ocr_model, path):
+    model = unlimited_ocr_model
+    model.set_dtype(mx.bfloat16)
+    ids = mx.array([[1, 2]])
+    result = (
+        model.get_input_embeddings(ids).inputs_embeds
+        if path == "embeddings"
+        else model.language_model.model(ids)
+    )
+    assert result.dtype == mx.bfloat16
+
+
+def test_unlimited_ocr_cached_decode_preserves_fp32_prefill(unlimited_ocr_model):
+    model = unlimited_ocr_model.language_model
+    model.set_dtype(mx.bfloat16)
+    cache, reference_cache = model.make_cache(), model.make_cache()
+    prefix = mx.arange(24, dtype=mx.float32).reshape(1, 3, 8) / 29.0
+    for current_cache in (cache, reference_cache):
+        mx.eval(model.model(None, inputs_embeds=prefix, cache=current_cache))
+    token = mx.array([[4]])
+    result = model.model(token, cache=cache)
+    expected = model.model(
+        None,
+        inputs_embeds=model.model.embed_tokens(token).astype(mx.float32),
+        cache=reference_cache,
+    )
+    assert result.dtype == mx.float32
+    assert cache[0].keys.dtype == mx.float32
+    np.testing.assert_allclose(np.array(result), np.array(expected), atol=1e-6)
+    assert model.model.embed_tokens.weight.dtype == mx.bfloat16
+
+
+@pytest.mark.parametrize("step_size", [1, 4])
+def test_unlimited_ocr_chunked_prefill_restores_full_prompt(
+    unlimited_ocr_model, step_size
+):
+    model = unlimited_ocr_model.language_model
+    prefix = mx.arange(40, dtype=mx.float32).reshape(1, 5, 8) / 43.0
+    # As with DASH, direct chunked calls supply the complete prompt first.
+    model._prompt_ids = np.arange(prefix.shape[1])
+    expected = model(None, inputs_embeds=prefix, cache=model.make_cache()).logits
+    model._prompt_ids = np.arange(prefix.shape[1])
+    cache, chunks = model.make_cache(), []
+    for start in range(0, 4, step_size):
+        chunks.append(
+            model(
+                None, inputs_embeds=prefix[:, start : start + step_size], cache=cache
+            ).logits
+        )
+        assert cache[0].prefill_length == 5
+    # Resume a saved partial prefill before processing its last token.
+    restored = model.make_cache()
+    for old, new in zip(cache, restored):
+        new.state, new.meta_state = old.state, old.meta_state
+    cache = restored
+    chunks.append(model(None, inputs_embeds=prefix[:, 4:], cache=cache).logits)
+    np.testing.assert_allclose(
+        np.array(mx.concatenate(chunks, axis=1)), np.array(expected), atol=1e-5
+    )
+    assert cache[0].prefill_length == 5
+    assert cache[0].state[0].shape[2] == 5
+
+
+def unlimited_ocr_prompt_keys(model, ids, cache=None):
+    cache = model.language_model.make_cache() if cache is None else cache
+    embeds = model.get_input_embeddings(ids).inputs_embeds
+    mx.eval(model.language_model(ids, inputs_embeds=embeds, cache=cache).logits)
+    return np.array(cache[0].state[0])
+
+
+@pytest.mark.parametrize("step", [1, 4, None], ids=["single", "chunked", "unchunked"])
+def test_unlimited_ocr_generation_retains_prompt_on_reuse(unlimited_ocr_model, step):
+    from mlx_vlm.generate.ar import generate_step
+
+    model = unlimited_ocr_model
+    # Reuse the same model with successively shorter prompts to expose stale state.
+    for length in (5, 3, 1):
+        ids = mx.arange(length)[None]
+        reference_keys = unlimited_ocr_prompt_keys(model, ids)
+        cache = model.language_model.make_cache()
+        list(
+            generate_step(
+                ids,
+                model,
+                None,
+                None,
+                temperature=0.0,
+                max_tokens=3,
+                prefill_step_size=step,
+                prompt_cache=cache,
+            )
+        )
+        assert cache[0].prefill_length == length
+        assert cache[0].state[0].shape[2] == length + 2
+        np.testing.assert_allclose(
+            np.array(cache[0].state[0][:, :, :length]),
+            reference_keys,
+            atol=1e-6,
+            rtol=1e-6,
+        )
+
+
+@pytest.mark.parametrize("cached_tokens", [3, 4])
+def test_unlimited_ocr_generation_retains_cached_prefix(
+    unlimited_ocr_model, cached_tokens
+):
+    from mlx_vlm.generate.ar import generate_step
+
+    model = unlimited_ocr_model
+    ids = mx.arange(5)[None]
+    cache = model.language_model.make_cache()
+    unlimited_ocr_prompt_keys(model, ids[:, :cached_tokens], cache)
+    # An APC hit supplies only the uncached suffix to the embedding path.
+    list(
+        generate_step(
+            ids[:, cached_tokens:],
+            model,
+            None,
+            None,
+            temperature=0.0,
+            max_tokens=3,
+            prefill_step_size=1,
+            prompt_cache=cache,
+        )
+    )
+    assert cache[0].prefill_length == 5
+    assert cache[0].state[0].shape[2] == 7
+    np.testing.assert_allclose(
+        np.array(cache[0].state[0][:, :, :5]),
+        unlimited_ocr_prompt_keys(model, ids),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+@pytest.fixture
+def deepseek_ocr_vision():
+    case = model_case("TestGetInputEmbeddings.deepseekocr_input_embeddings")
+    module = importlib.import_module(f"mlx_vlm.models.{case['module']}.vision")
+    config = build_config(module, case["config"]["vision_config"], "VisionConfig")
+    return module, config
+
+
+def test_deepseek_ocr_absolute_positions_match_bicubic_reference(deepseek_ocr_vision):
+    from PIL import Image
+
+    module, config = deepseek_ocr_vision
+    embeddings = module.VisionEmbeddings(config)
+    width = config.hidden_size
+    grid = np.random.default_rng(42).normal(size=(4, 4, width)).astype(np.float32)
+    cls = np.arange(width, dtype=np.float32).reshape(1, 1, width)
+    positions = np.concatenate([cls, grid.reshape(1, 16, width)], axis=1)
+    result = embeddings._get_abs_pos(mx.array(positions), 10)
+    expected_grid = np.stack(
+        [
+            np.array(
+                Image.fromarray(grid[:, :, channel]).resize(
+                    (3, 3), Image.Resampling.BICUBIC
+                )
+            )
+            for channel in range(width)
+        ],
+        axis=-1,
+    )
+    expected = np.concatenate([cls, expected_grid.reshape(1, 9, width)], axis=1)
+    np.testing.assert_allclose(np.array(result), expected, atol=1e-5, rtol=1e-5)
+
+
+def test_deepseek_ocr_relative_positions_use_half_pixel_centers():
+    module = importlib.import_module("mlx_vlm.models.deepseekocr.sam")
+    result = module.get_rel_pos(2, 2, mx.arange(5, dtype=mx.float32)[:, None])
+    expected = np.array([[[2], [1 / 3]], [[11 / 3], [2]]], dtype=np.float32)
+    np.testing.assert_allclose(np.array(result), expected, atol=1e-6)
+
+
+def test_deepseek_ocr_clip_mlp_uses_quick_gelu(deepseek_ocr_vision):
+    module, config = deepseek_ocr_vision
+    x = np.array([-3, -1, 0, 1, 3], dtype=np.float32)
+    actual = module.MLP(config).activation_fn(mx.array(x))
+    expected = x / (1 + np.exp(-1.702 * x))
+    np.testing.assert_allclose(np.array(actual), expected, atol=1e-6)
+
+
+def test_unlimited_ocr_clip_norm_default():
+    module = importlib.import_module("mlx_vlm.models.unlimited_ocr")
+    assert module.VisionConfig(model_type="vision").layer_norm_eps == 1e-5
+
+
+class TestUnlimitedOCR2Dash:
+    """Unlimited-OCR-2 DASH attention: gathered decode, cached summaries, pages."""
+
+    PAGE, IMAGE = 7, 9
+
+    def params(self, **overrides):
+        from mlx_vlm.models.unlimited_ocr.dash import DashParams
+
+        sparse = {
+            "training_stage": "dash",
+            "use_sparse_attention": True,
+            "dash_stage0": "head_cls",
+            "sparse_block_size": 4,
+            "sparse_local_block": 2,
+            "sparse_index_dim": 8,
+            "dash_topk_blocks": 2,
+            "image_token_id": self.IMAGE,
+            "page_token_id": self.PAGE,
+            "per_page_image_tokens": 6,
+            "sparse_main_rope_mode": "page2d",
+            "sparse_rope_page_pairs": 1,
+            "sparse_main_rope_tok_freq_mode": "resample",
+            "sparse_rope_page_mod": 2,
+            **overrides,
+        }
+        return sparse, DashParams.from_config(sparse, 2, 8)
+
+    def language_model(self, hidden_size=16):
+        from mlx_vlm.models.unlimited_ocr.config import TextConfig
+        from mlx_vlm.models.unlimited_ocr.language import LanguageModel
+
+        sparse, _ = self.params(sparse_index_dim=hidden_size // 2)
+        config = TextConfig(
+            vocab_size=32,
+            hidden_size=hidden_size,
+            intermediate_size=32,
+            moe_intermediate_size=8,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            n_shared_experts=1,
+            n_routed_experts=4,
+            num_experts_per_tok=2,
+            first_k_dense_replace=1,
+            sparse_attention_config=sparse,
+        )
+        mx.random.seed(3)
+        model = LanguageModel(config)
+        model.update(
+            tree_map(lambda w: mx.random.normal(w.shape) * 0.5, model.parameters())
+        )
+        return model
+
+    def prompt(self):
+        page = [self.PAGE] + [self.IMAGE] * 6
+        return [1, 2, 3] + page * 3 + [4, 5, 6, 2, 3]
+
+    @pytest.mark.parametrize("bits", [None, 4, 8])
+    @pytest.mark.parametrize("heads", [2, 4])
+    def test_decode_gather_matches_dense_mask(self, bits, heads):
+        from mlx_vlm.models.cache import QuantizedKVCache
+        from mlx_vlm.models.unlimited_ocr.config import TextConfig
+        from mlx_vlm.models.unlimited_ocr.dash import (
+            DashAttention,
+            _decode_select,
+            block_capacity,
+            block_scores,
+            route_select,
+        )
+
+        _, p = self.params(dash_topk_blocks=3, sparse_local_block=1)
+        dim = 64 if bits else 8
+        attn = DashAttention(
+            TextConfig(
+                hidden_size=heads * dim,
+                num_attention_heads=heads,
+                num_key_value_heads=2,
+            ),
+            0,
+            p,
+        )
+        rng = np.random.default_rng(5)
+        for pos in (2, 9, 21, 22):  # no remote block / partial blocks
+            nblk = -(-(pos + 1) // p.block_size)
+            cap = block_capacity(nblk)
+            q = mx.array(rng.normal(size=(1, heads, 1, dim)).astype(np.float32))
+            keys = mx.array(rng.normal(size=(1, 2, pos + 1, dim)).astype(np.float32))
+            values = mx.array(rng.normal(size=(1, 2, pos + 1, dim)).astype(np.float32))
+            cache = None
+            packed_keys, packed_values = keys, values
+            if bits:
+                cache = QuantizedKVCache(group_size=64, bits=bits)
+                packed_keys, packed_values = cache.update_and_fetch(keys, values)
+                keys, values = cache.dequantize_for_apc()
+            idx_q = mx.array(rng.normal(size=(1, 8)).astype(np.float32))
+            n_sum = (pos + 1) // p.block_size
+            summ = rng.normal(size=(n_sum, 8)).astype(np.float32)
+            for allow in (np.ones(nblk, bool), np.arange(nblk) == 1):
+                scores = block_scores(
+                    idx_q, mx.array(summ) if n_sum else None, mx.array([pos]), nblk, p
+                )
+                topi, bias, valid = route_select(
+                    scores, mx.array(allow[None]), attn.idx_scale, attn.floor, p
+                )
+                dense = attn._prefill(q, keys, values, topi, bias, valid, pos, nblk)
+                padded = np.zeros((cap, 8), np.float32)
+                padded[:n_sum] = summ
+                cand = np.zeros((1, cap), bool)
+                cand[0, :nblk] = allow
+                idx, mask = _decode_select(
+                    idx_q,
+                    mx.array(padded),
+                    mx.array(cand),
+                    mx.array(pos),
+                    *attn._decode_consts,
+                    p,
+                )
+                prefilled = attn._prefill(
+                    q,
+                    packed_keys,
+                    packed_values,
+                    topi,
+                    bias,
+                    valid,
+                    pos,
+                    nblk,
+                    cache=cache,
+                )
+                gathered = attn._decode(
+                    q, packed_keys, packed_values, idx, mask, cache=cache
+                )
+                assert np.allclose(np.array(dense), np.array(prefilled), atol=1e-5)
+                assert np.allclose(np.array(dense), np.array(gathered), atol=1e-5)
+
+    def test_entmax15_is_a_sparse_distribution(self):
+        from mlx_vlm.models.unlimited_ocr.dash import entmax15
+
+        x = mx.array([[3.0, 2.9, 0.5, -1e4], [1.0, 1.0, 1.0, 1.0]])
+        prior = np.array(entmax15(x))
+        assert np.allclose(prior.sum(-1), 1.0, atol=1e-5)
+        assert prior[0, 3] == 0 and prior[0, 0] > prior[0, 1] > prior[0, 2]
+        assert np.allclose(prior[1], 0.25, atol=1e-5)
+
+    def test_prompt_pages_coordinates_and_candidates(self):
+        from mlx_vlm.models.unlimited_ocr.dash import PromptPages
+
+        _, p = self.params()
+        ids = np.array(self.prompt())
+        pages = PromptPages(ids, p)
+        tok, page = pages.coords
+        # BOS + instruction bucket is page 0; each <PAGE> opens the next page.
+        # The instruction after the last image goes back to that bucket.
+        assert page.tolist() == [0] * 3 + [1] * 7 + [2] * 7 + [3] * 7 + [0] * 5
+        assert tok[:4].tolist() == [0, 1, 2, 0] and tok[-1] == 7
+        assert pages.n_pages == 4 and np.array(pages.pf_cnt).tolist() == [3, 7, 7, 7]
+        cand = np.array(pages.prefill_candidates(np.arange(len(ids)), 8))
+        # A page-2 query (position 12) only sees blocks holding page-2 images.
+        assert cand[12].tolist() == [
+            False,
+            False,
+            True,
+            True,
+            True,
+            False,
+            False,
+            False,
+        ]
+        # The answer has no page yet: it falls back to every block.
+        assert cand[-1].all()
+
+    def test_chunked_prefill_and_decode_match_full_prefill(self):
+        model = self.language_model()
+        ids = mx.array([self.prompt()])
+        n = ids.shape[1]
+
+        full = model(ids, cache=model.make_cache()).logits
+        cache = model.make_cache()
+        model._prompt_ids = np.array(ids[0])
+        chunks = []
+        for c0, c1 in ((0, 9), (9, 22), (22, n)):
+            chunks.append(model(ids[:, c0:c1], cache=cache).logits)
+        assert np.allclose(
+            np.array(mx.concatenate(chunks, axis=1)), np.array(full), atol=1e-4
+        )
+
+        # Decode keeps one step's cost bounded and stays finite over block edges.
+        token = mx.argmax(chunks[-1][:, -1], axis=-1, keepdims=True)
+        for _ in range(9):
+            logits = model(token, cache=cache).logits
+            assert logits.shape == (1, 1, 32)
+            assert np.isfinite(np.array(logits)).all()
+            token = mx.argmax(logits[:, -1], axis=-1, keepdims=True)
+        assert cache[0].offset == n + 9
+        assert cache[0].num_summaries == (n + 9) // 4
+
+    @pytest.mark.parametrize("bits", [None, 4, 8])
+    @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
+    def test_cached_decode_preserves_prefill_precision(self, bits, dtype):
+        model = self.language_model(hidden_size=128)
+        model.set_dtype(mx.bfloat16)
+        model.eval()
+        ids = mx.array([self.prompt()])
+        model._prompt_ids = np.array(ids[0])
+        prefix = model.model.embed_tokens(ids).astype(dtype)
+        caches = [model.make_cache(), model.make_cache()]
+        if bits:
+            caches = [
+                [entry.to_quantized(group_size=64, bits=bits) for entry in cache]
+                for cache in caches
+            ]
+        for cache in caches:
+            for start, end in ((0, 9), (9, ids.shape[1] - 1)):
+                mx.eval(
+                    model(
+                        ids[:, start:end],
+                        inputs_embeds=prefix[:, start:end],
+                        cache=cache,
+                        n_to_process=end - start,
+                    ).logits
+                )
+        # Compare native token embeddings to an explicit activation cast across
+        # the final prompt token, decode block boundaries, and page changes.
+        for token in [int(ids[0, -1]), self.PAGE, 3, 4, 5, self.PAGE]:
+            x = mx.array([[token]])
+            actual = model(x, cache=caches[0]).logits
+            expected = model(
+                x,
+                inputs_embeds=model.model.embed_tokens(x).astype(dtype),
+                cache=caches[1],
+            ).logits
+            assert actual.dtype == dtype
+            np.testing.assert_allclose(
+                np.array(actual.astype(mx.float32)),
+                np.array(expected.astype(mx.float32)),
+                atol=1e-6,
+            )
+        for cache in caches:
+            assert cache[0].offset == ids.shape[1] + 5
+            keys = cache[0].keys
+            assert (keys[1] if bits else keys).dtype == dtype
+        assert model.model.embed_tokens.weight.dtype == mx.bfloat16
+
+    @pytest.mark.parametrize("bits", [4, 8])
+    @pytest.mark.parametrize("start", [0, 9, 22, 29])
+    def test_quantized_chunked_prefill_preserves_routing_state(self, bits, start):
+        from mlx_vlm.generate.common import maybe_quantize_kv_cache
+        from mlx_vlm.models.unlimited_ocr.dash import DashQuantizedKVCache
+
+        model = self.language_model(hidden_size=128)
+        ids = mx.array([self.prompt()])
+        model._prompt_ids = np.array(ids[0])
+        cache = model.make_cache()
+        shared_state = cache[0].dash_state
+
+        def quantize():
+            previous = list(cache)
+            maybe_quantize_kv_cache(cache, start, 64, bits)
+            for old, new in zip(previous, cache):
+                assert new.dash_state is shared_state
+                assert new.pending is old.pending
+                assert new.summaries is old.summaries
+                assert new.num_summaries == old.num_summaries
+                assert new.offset == old.offset
+                assert not new.is_trimmable()
+
+        quantize()
+        for c0, c1 in ((0, 9), (9, 22), (22, ids.shape[1])):
+            logits = model(ids[:, c0:c1], cache=cache).logits
+            assert bool(mx.isfinite(logits).all())
+            quantize()
+        # Cross partial block boundaries and advance the generated page state.
+        for token in [self.PAGE, 3, 4, 5, self.PAGE, 6, 2, 3, 4]:
+            logits = model(mx.array([[token]]), cache=cache).logits
+            assert logits.shape == (1, 1, 32)
+            assert bool(mx.isfinite(logits).all())
+            quantize()
+        for entry in cache:
+            assert isinstance(entry, DashQuantizedKVCache)
+            assert entry.bits == bits
+            assert entry.keys[0].dtype == mx.uint32
+            assert entry.offset == ids.shape[1] + 9
+            assert entry.num_summaries == entry.offset // 4
+            assert entry.pending.shape[0] == entry.offset % 4
+
+    @pytest.mark.parametrize("scheme", ["turboquant", "hybrid"])
+    def test_other_quantization_schemes_preserve_dash_cache(self, scheme):
+        from mlx_vlm.generate.common import maybe_quantize_kv_cache
+
+        model = self.language_model()
+        cache = model.make_cache()
+        model(mx.array([self.prompt()]), cache=cache)
+        previous = list(cache)
+        kwargs = (
+            {"kv_quant_scheme": "turboquant"}
+            if scheme == "turboquant"
+            else {"kv_key_scheme": "turboquant", "kv_value_scheme": "uniform"}
+        )
+        maybe_quantize_kv_cache(cache, 0, 64, 4, **kwargs)
+        assert all(old is new for old, new in zip(previous, cache))
+
+
+@pytest.mark.parametrize("mode,count", [("4x", 16), ("16x", 4)])
+def test_minicpm_ocr_vision_prefill_and_sanitize(mode, count):
+    from mlx_vlm.models.minicpm_ocr import Model, ModelConfig
+
+    cfg = ModelConfig.from_dict(model_case("minicpm_ocr")["config"])
+    model = Model(cfg)
+    ids = mx.array([[1, 50] + [48] * count + [51, 2]])
+    media = {
+        "pixel_values": [[mx.random.normal((3, 2, 128))]],
+        "tgt_sizes": [np.array([[8, 8]])],
+        "image_bound": [np.array([[2, 2 + count]])],
+        "downsample_mode": mode,
+    }
+    features = model.get_input_embeddings(ids, **media)
+    assert features.inputs_embeds.shape == (*ids.shape, 16)
+    assert features.position_ids.shape == (3, 1, ids.shape[-1])
+    ModelChecks().prefill_parity(model, ids, media, chunk_sizes=(3,))
+
+    norm = mx.linspace(-0.5, 0.5, 16)
+    conv = mx.arange(80 * 3).reshape(80, 1, 3).astype(mx.float32)
+    source = {
+        "model.language_model.layers.0.input_layernorm.weight": norm,
+        "model.language_model.layers.0.linear_attn.conv1d.weight": conv,
+        "model.vision_tower.embeddings.patch_embedding.weight": mx.arange(192).reshape(
+            16, 3, 2, 2
+        ),
+    }
+    first = model.sanitize(source)
+    second = model.sanitize(first)
+    for key in first:
+        assert mx.array_equal(first[key], second[key])
+    assert mx.array_equal(
+        first["language_model.model.layers.0.input_layernorm.weight"], norm + 1
+    )
+    assert mx.array_equal(
+        first["language_model.model.layers.0.linear_attn.conv1d.weight"],
+        conv.transpose(0, 2, 1),
+    )
+    with pytest.raises(ValueError, match="token count"):
+        model.get_input_embeddings(
+            ids, **{**media, "image_bound": [np.array([[2, 3]])]}
+        )
+
+
+def test_minicpm_ocr_position_bucket_rounding():
+    from mlx_vlm.models.minicpmv4_6.config import VisionConfig
+    from mlx_vlm.models.minicpmv4_6.vision import SiglipVisionEmbeddings
+
+    # The pretrained OCR position table is 70x70. Fractional arange in MLX
+    # float32 used to move the exact 0.25 boundary into the previous bucket.
+    embedding = SiglipVisionEmbeddings(
+        VisionConfig(hidden_size=1, image_size=140, patch_size=2)
+    )
+    embedding.patch_embedding.weight = mx.zeros_like(embedding.patch_embedding.weight)
+    embedding.patch_embedding.bias = mx.zeros_like(embedding.patch_embedding.bias)
+    embedding.position_embedding.weight = mx.arange(4900, dtype=mx.float32)[:, None]
+    actual = embedding(mx.zeros((1, 2, 28 * 38 * 2, 3)), tgt_sizes=mx.array([[28, 38]]))
+    boundaries = np.array([i / 70 for i in range(1, 70)], dtype=np.float32)
+    h = np.searchsorted(boundaries, np.arange(28, dtype=np.float32) / 28, side="right")
+    w = np.searchsorted(boundaries, np.arange(38, dtype=np.float32) / 38, side="right")
+    np.testing.assert_array_equal(actual[0, :, 0], (h[:, None] * 70 + w).ravel())
+
+
+def test_minicpm_ocr_preserves_norm_scale_and_activation_precision():
+    from mlx_vlm.models.minicpm_ocr import Model, ModelConfig
+
+    model = Model(ModelConfig.from_dict(model_case("minicpm_ocr")["config"]))
+    key = "model.language_model.layers.0.input_layernorm.weight"
+    value = mx.full((16,), 0.001, dtype=mx.bfloat16)
+    loaded_key = "language_model.model.layers.0.input_layernorm.weight"
+    weights = model.sanitize({key: value})
+    assert weights[loaded_key].dtype == mx.float32
+    assert mx.array_equal(weights[loaded_key], value.astype(mx.float32) + 1)
+    assert not model.cast_predicate(loaded_key)
+    assert not model.cast_predicate("language_model.model.layers.0.linear_attn.A_log")
+    norm = model.language_model.model.layers[0].input_layernorm
+    norm.weight = weights[loaded_key]
+    assert norm(mx.ones((1, 3, 16), dtype=mx.bfloat16)).dtype == mx.bfloat16
+
+
+@pytest.fixture
+def lfm3_case(request):
+    case = model_case(getattr(request, "param", "lfm3"))
+    module = importlib.import_module("mlx_vlm.models." + case["module"])
+    return module, module.ModelConfig.from_dict(case["config"])
+
+
+@pytest.mark.parametrize("chunks", [[13], [1] * 13, [3, 2, 1, 4, 3]])
+@pytest.mark.parametrize("sandwich", [True, False])
+def test_lfm3_cached_chunks_match_full_forward_across_window(
+    lfm3_case, chunks, sandwich
+):
+    mx.random.seed(31)
+    module, config = lfm3_case
+    config.use_sandwich_norm = sandwich
+    model = module.Model(config)
+    model.eval()
+    tokens = mx.array([[i % 64 for i in range(13)]])
+    expected = model(tokens).logits
+    cache = model.make_cache()
+    actual, offset = [], 0
+    for length in chunks:
+        actual.append(model(tokens[:, offset : offset + length], cache=cache).logits)
+        mx.eval(actual[-1], [c.state for c in cache])
+        offset += length
+    np.testing.assert_allclose(
+        np.array(mx.concatenate(actual, axis=1)),
+        np.array(expected),
+        atol=2e-5,
+        rtol=2e-5,
+    )
+    assert cache[1].offset == 13
+    assert cache[2].offset == 13
+
+
+def test_lfm3_merged_batch_cache_respects_per_row_rotary_offsets(lfm3_case):
+    module, config = lfm3_case
+    model = module.Model(config)
+    model.eval()
+    caches = [model.make_cache(), model.make_cache()]
+    for tokens, cache in zip([[1, 2, 3], [4, 5, 6, 7, 8, 9]], caches):
+        mx.eval(model(mx.array([tokens]), cache=cache).logits)
+    batched = [type(a).merge([a, b]) for a, b in zip(*caches)]
+    actual = model(mx.array([[10], [11]]), cache=batched).logits
+    expected = mx.concatenate(
+        [
+            model(mx.array([[token]]), cache=cache).logits
+            for token, cache in zip([10, 11], caches)
+        ]
+    )
+    np.testing.assert_allclose(
+        np.asarray(actual), np.asarray(expected), atol=2e-5, rtol=2e-5
+    )
+
+
+@pytest.mark.parametrize("lfm3_case", ["lfm3", "lfm3_vl"], indirect=True)
+def test_lfm3_hf_checkpoint_keys_and_sanitize_idempotency(lfm3_case):
+    module, config = lfm3_case
+    model = module.Model(config)
+    visual = config.model_type == "lfm3_vl"
+    native = dict(tree_flatten(model.parameters()))
+    hf = {}
+    for name, value in native.items():
+        value = (
+            mx.arange(value.size, dtype=mx.float32).reshape(value.shape) / value.size
+        )
+        native[name] = value
+        if name.endswith("conv.conv.weight"):
+            value = value.transpose(0, 2, 1)
+        elif name.endswith("spatial_conv.weight"):
+            value = value.transpose(0, 3, 1, 2)
+        if visual:
+            name = name.replace("language_model.model.", "language_model.")
+            name = "model." + name
+        else:
+            name = name.removeprefix("language_model.")
+        hf[name] = value
+    hf["lm_head.weight"] = mx.ones((64, 32))
+    once = model.sanitize(hf)
+    twice = model.sanitize(once)
+    assert once.keys() == native.keys() == twice.keys()
+    for name in native:
+        np.testing.assert_array_equal(np.asarray(once[name]), np.asarray(native[name]))
+        np.testing.assert_array_equal(np.asarray(twice[name]), np.asarray(native[name]))
+    model.load_weights(list(once.items()), strict=True)
+
+
+@pytest.mark.parametrize("lfm3_case", ["lfm3_vl"], indirect=True)
+def test_lfm3_visual_frame_boundaries_and_cached_features(lfm3_case):
+    module, config = lfm3_case
+    model = module.Model(config)
+    pixels = mx.random.normal((24, 24))
+    grid = mx.array([[1, 4, 4], [2, 2, 2]])
+    combined = model.encode_images(pixels, image_grid_thw=grid)
+    separate = mx.concatenate(
+        [
+            model.encode_images(pixels[:16], image_grid_thw=mx.array([[1, 4, 4]])),
+            model.encode_images(pixels[16:], image_grid_thw=mx.array([[2, 2, 2]])),
+        ]
+    )
+    np.testing.assert_allclose(np.asarray(combined), np.asarray(separate), atol=1e-5)
+    ids = mx.array([[1] + [60] * 6 + [2]])
+    full = model.get_input_embeddings(ids, pixels, image_grid_thw=grid).inputs_embeds
+    cached = model.get_input_embeddings(
+        ids, pixels, cached_image_features=combined
+    ).inputs_embeds
+    np.testing.assert_array_equal(np.asarray(full), np.asarray(cached))
+    with pytest.raises(ValueError, match="tokens"):
+        model.get_input_embeddings(mx.array([[60]]), pixels, image_grid_thw=grid)
+
+
+@pytest.mark.parametrize("lfm3_case", ["lfm3", "lfm3_vl"], indirect=True)
+def test_lfm3_quantized_checkpoint_roundtrip(tmp_path, lfm3_case):
+    from dataclasses import asdict
+
+    from mlx_vlm.utils import load_model
+
+    module, config = lfm3_case
+    visual = config.model_type == "lfm3_vl"
+    if visual:
+        config.vision_config.patch_size = 4
+        config.projector_hidden_size = 64
+    model = module.Model(config)
+    nn.quantize(model, group_size=32, bits=4)
+    model.eval()
+    ids = mx.array([[1, 60, 2]]) if visual else mx.array([[1, 2, 3]])
+    kwargs = (
+        dict(
+            pixel_values=mx.random.normal((4, 96)), image_grid_thw=mx.array([[1, 2, 2]])
+        )
+        if visual
+        else {}
+    )
+    expected = model(ids, **kwargs).logits
+    config = asdict(model.config)
+    config["quantization"] = dict(group_size=32, bits=4)
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(
+        str(tmp_path / "model.safetensors"), dict(tree_flatten(model.parameters()))
+    )
+    restored = load_model(tmp_path)
+    actual = restored(ids, **kwargs).logits
+    np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+
+@pytest.mark.parametrize(
+    "config, expected",
+    [
+        ({"model_type": "lfm3_vl", "architectures": ["D1Model"]}, "d1_lfm3_vl"),
+        (
+            {
+                "model_type": "lfm3_vl",
+                "auto_map": {"AutoModel": "modeling_d1_lfm3_vl.D1Model"},
+            },
+            "d1_lfm3_vl",
+        ),
+        ({"model_type": "lfm3_omni", "architectures": ["D1Model"]}, "d1_lfm3_omni"),
+        ({"model_type": "lfm3_vl"}, "lfm3_vl"),
+    ],
+)
+def test_get_model_and_args_routes_d1_checkpoints(config, expected):
+    model_class, model_type = get_model_and_args(config)
+
+    assert model_type == expected
+    assert model_class.__name__ == f"mlx_vlm.models.{expected}"
+
+
+@pytest.fixture
+def lfm3_audio():
+    case = model_case("lfm3_audio")
+    module = importlib.import_module("mlx_vlm.models." + case["module"])
+    model = module.Model(module.ModelConfig.from_dict(case["config"]))
+    mx.eval(model.parameters())
+    return model
+
+
+# the checkpoint's training-export prefixes, written out so a wrong mapping fails
+LFM3_AUDIO_LEGACY_PREFIXES = (
+    ("lfm.model.", "language_model.model."),
+    ("encoder.downsample.", "audio_tower.downsample."),
+    ("encoder.lfm.lfm.", "audio_tower.lfm."),
+    ("mlp.model.0.", "audio_projector.layer_norm."),
+    ("mlp.model.1.", "audio_projector.linear_1."),
+    ("mlp.model.3.", "audio_projector.linear_2."),
+    ("depthformer.model.", "depth_decoder.model."),
+    ("depth_linear.", "depth_decoder.depth_linear."),
+    ("mask_embedding", "depth_decoder.mask_embedding"),
+    ("depth_embeddings.", "depth_decoder.depth_embeddings."),
+)
+
+
+def test_lfm3_audio_sanitize_maps_legacy_checkpoint_idempotently(lfm3_audio):
+    model = lfm3_audio
+    weights = dict(tree_flatten(model.parameters()))
+    # canonical MLX weights -> the checkpoint's training-export names and torch layouts
+    legacy = {}
+    for name, value in weights.items():
+        if "downsample." in name and value.ndim == 4:
+            value = value.transpose(0, 3, 1, 2)
+        elif name.endswith("lin_out.weight"):
+            value = value[..., None]
+        elif name.endswith("conv.conv.weight"):
+            value = value.transpose(0, 2, 1)
+        for old, new in LFM3_AUDIO_LEGACY_PREFIXES:
+            if name.startswith(new):
+                name = old + name[len(new) :]
+                break
+        legacy[name] = value
+        if name.endswith(".embedding.weight") and name.startswith("depth_embeddings."):
+            legacy[name.replace(".embedding.", ".to_logits.")] = value
+    assert "encoder.lfm.lfm.embedding_norm.weight" in legacy
+    assert "mlp.model.3.weight" in legacy and "mask_embedding" in legacy
+    sanitized = model.sanitize(legacy)
+    assert sanitized.keys() == weights.keys()
+    for name, value in weights.items():
+        assert mx.array_equal(sanitized[name], value), name
+    again = model.sanitize(sanitized)
+    assert all(mx.array_equal(again[k], v) for k, v in sanitized.items())
+    model.load_weights(list(sanitized.items()), strict=True)
+
+
+def test_lfm3_audio_quant_predicate_keeps_speech_modules(lfm3_audio):
+    predicate = lfm3_audio.quant_predicate
+    assert predicate("language_model.model.layers.0.feed_forward.w1", None)
+    for path in (
+        "audio_tower.downsample.lin_out",
+        "audio_projector.linear_1",
+        "depth_decoder.model.layers.0.feed_forward.w1",
+        "depth_decoder.depth_embeddings.0.embedding",
+        "codebook_embedding",
+    ):
+        assert not predicate(path, None)
+
+
+def test_lfm3_audio_encoder_hides_padding_and_masks_attention(lfm3_audio):
+    tower = lfm3_audio.audio_tower
+    features = mx.random.normal((2, 16, 20))
+    batch = tower(features, mx.array([20, 9]))
+    alone = tower(features[1:2, :, :9], mx.array([9]))
+    assert mx.allclose(batch[3:], alone, atol=1e-5)
+    x = mx.random.normal((1, 8, 8))
+    h = tower.lfm(x, 4)
+    first = tower.lfm(x.at[:, 0].add(1.0), 4)
+    assert not mx.allclose(h[:, 1], first[:, 1])
+    # conv reach 2 plus the 4-token window
+    assert mx.allclose(h[:, 6:], first[:, 6:], atol=1e-5)
+    last = tower.lfm(x.at[:, -1].add(1.0), 4)
+    assert mx.allclose(h[:, :-1], last[:, :-1], atol=1e-5)
+
+
+def test_lfm3_audio_maskgit_reveals_in_order_and_depth_is_bidirectional(lfm3_audio):
+    from mlx_vlm.models.lfm3_audio.depth import sample, sample_frame
+
+    seen = []
+
+    class Depth:
+        num_codebooks = 12
+
+        def __call__(self, hidden, codes, masked):
+            seen.append(masked[0].tolist())
+            return mx.broadcast_to(mx.eye(5)[len(seen)], (1, 12, 5))
+
+    order = [11, 0, 5, 3, 2, 1, 4, 6, 7, 8, 9, 10]
+    codes = sample_frame(
+        Depth(), mx.zeros((1, 4)), [4, 4, 4], 0, order=mx.array([order])
+    )
+    assert seen[0] == [True] * 12
+    assert [i for i in range(12) if not seen[1][i]] == sorted(order[:4])
+    assert [i for i in range(12) if not seen[2][i]] == sorted(order[:8])
+    # each code is the index of the pass that revealed it
+    expected = [0] * 12
+    for i, k in enumerate(order):
+        expected[k] = i // 4 + 1
+    assert codes[0].tolist() == expected
+    # the repetition penalty applies when greedy: 2 / 4 < 1
+    assert sample(mx.array([[2.0, -2.0, 1.0]]), 0, None, 4.0, mx.array([[0]])) == 2
+    depth = lfm3_audio.depth_decoder
+    hidden, codes = mx.random.normal((1, 32)), mx.zeros((1, 12), mx.int32)
+    masked = mx.zeros((1, 12), mx.bool_)
+    changed = depth(hidden, codes.at[:, 11].add(3), masked)
+    assert not mx.allclose(depth(hidden, codes, masked)[:, 0], changed[:, 0])
+
+
+def test_lfm3_audio_input_embeddings_scatter_speech_in_order(lfm3_audio):
+    model = lfm3_audio
+    features = mx.random.normal((2, 16, 20))
+    mask = mx.array([[1] * 20, [1] * 9 + [0] * 11])
+    audio = model.audio_projector(model.audio_tower(features, mask.sum(-1)))
+    assert audio.shape == (3 + 2, 32)  # ceil(20 / 8) + ceil(9 / 8)
+    codes = mx.array([[1] * 12, [4] * 12])
+    ids = mx.array([[1] + [60] * 5 + [2, 61, 61, 3]])
+    embeds = model.get_input_embeddings(
+        ids, input_features=features, feature_attention_mask=mask, audio_out_codes=codes
+    ).inputs_embeds
+    assert mx.allclose(embeds[0, 1:6], audio, atol=1e-6)
+    # codebook k reads rows k * 5 + code of the shared table
+    table = model.codebook_embedding.weight
+    frames = mx.stack([table[mx.arange(12) * 5 + c].sum(0) for c in (1, 4)])
+    assert mx.allclose(embeds[0, 7:9], frames, atol=1e-5)
+    text = model.language_model.model.embed_tokens(mx.array([1, 2, 3]))
+    assert mx.allclose(embeds[0, mx.array([0, 6, 9])], text)
+    # a prompt-cache hit trims the speech placeholders; the features are then unused
+    tail = model.get_input_embeddings(ids[:, 9:], input_features=features)
+    assert mx.allclose(tail.inputs_embeds[0], text[2:])
+    with pytest.raises(ValueError, match="do not match"):
+        model.get_input_embeddings(ids, input_features=features)
+    with pytest.raises(ValueError, match="do not match"):
+        model.get_input_embeddings(mx.array([[1, 61]]))
+    with pytest.raises(ValueError, match=r"\[0, 5\)"):
+        model.get_input_embeddings(mx.array([[61]]), audio_out_codes=[[5] * 12])
+    logits = model(mx.array([[1, 2]])).logits
+    assert logits.shape == (1, 2, 64)
+    assert (logits[..., mx.array([60, 61])] == -mx.inf).all()
+
+
+def lfm3_audio_scripted_slots(monkeypatch, model, text, frames, prompt, **kwargs):
+    module = importlib.import_module("mlx_vlm.models.lfm3_audio.lfm3_audio")
+    text, frames, seen = iter(text), iter(frames), []
+
+    def sample_frame(
+        depth, hidden, schedule, temperature, top_k, penalty, history, order
+    ):
+        seen.append((None if history is None else history.shape, order))
+        return mx.array([next(frames)])
+
+    monkeypatch.setattr(module, "sample_frame", sample_frame)
+    monkeypatch.setattr(module, "sample", lambda *a, **k: mx.array([next(text)]))
+    slots = list(model.stream_slots(mx.array([prompt]), **kwargs))
+    pattern = "".join("A" if codes is not None else "T" for _, codes in slots)
+    return slots, pattern, seen
+
+
+def test_lfm3_audio_interleaved_state_machine(monkeypatch, lfm3_audio):
+    model = lfm3_audio
+    eos = model.config.audio_eos_code
+    # 6 text, 12 frames, then text ending in <|text_end|>, the audio tail ending in
+    # a frame with one EOS code, and <|im_end|>
+    text = [1, 2, 3, 4, 5, 6, 7, 56, 50]
+    frames = [[1] * 12] * 15 + [[2] * 11 + [eos]]
+    slots, pattern, seen = lfm3_audio_scripted_slots(
+        monkeypatch, model, text, frames, [1, 57], max_tokens=64
+    )
+    assert pattern == "T" * 6 + "A" * 12 + "TT" + "AAAA" + "T"
+    assert [t for t, _ in slots if t != 61] == text
+    assert slots[-2][1].tolist() == [eos] * 12
+    # the penalty history holds the earlier non-EOS frames of this call
+    assert [s[0] for s in seen[:2]] == [None, (1, 1, 12)]
+    assert seen[-1][0] == (1, 15, 12)
+
+
+def test_lfm3_audio_mode_selection_and_injected_order(monkeypatch, lfm3_audio):
+    model = lfm3_audio
+    eos = model.config.audio_eos_code
+    order = np.arange(24).reshape(2, 12) % 12
+    _, pattern, seen = lfm3_audio_scripted_slots(
+        monkeypatch,
+        model,
+        [50],
+        [[1] * 12, [eos] * 12],
+        [1, 2],
+        generation_mode="audio",
+        frame_order=order,
+    )
+    assert pattern == "AAT"
+    assert [s[1].tolist() for s in seen] == [[order[0].tolist()], [order[1].tolist()]]
+    # text mode follows <|audio_start|>; <|im_end|> ends the turn
+    _, pattern, _ = lfm3_audio_scripted_slots(
+        monkeypatch, model, [3, 55, 50], [[eos] * 12], [1, 2]
+    )
+    assert pattern == "TTAT"
+    # <|text_end|> ends a text turn; max_tokens counts slots
+    _, pattern, _ = lfm3_audio_scripted_slots(monkeypatch, model, [3, 56], [], [1])
+    assert pattern == "TT"
+    _, pattern, _ = lfm3_audio_scripted_slots(
+        monkeypatch, model, [], [[1] * 12] * 5, [55], max_tokens=3
+    )
+    assert pattern == "AAA"
+    # a replayed end-of-speech frame resumes the text, any other frame the speech
+    _, pattern, _ = lfm3_audio_scripted_slots(
+        monkeypatch, model, [3, 50], [], [1, 61], audio_out_codes=[[eos] * 12]
+    )
+    assert pattern == "TT"
+    _, pattern, _ = lfm3_audio_scripted_slots(
+        monkeypatch, model, [50], [[eos] * 12], [1, 61], audio_out_codes=[[1] * 12]
+    )
+    assert pattern == "AT"
+
+
+def test_lfm3_audio_explicit_text_mode_forbids_speech_markers(monkeypatch, lfm3_audio):
+    config = lfm3_audio.config
+    module = importlib.import_module("mlx_vlm.models.lfm3_audio.lfm3_audio")
+    suppressed = []
+
+    def sample(logits, temperature, top_k, penalty, history, suppress, *a):
+        suppressed.append(set(suppress))
+        return mx.array([50])
+
+    monkeypatch.setattr(module, "sample", sample)
+    markers = {config.mixed_start_token_id, config.audio_start_token_id}
+    for mode, forbidden in ((None, False), ("text", True)):
+        list(lfm3_audio.stream_slots(mx.array([[1, 2]]), generation_mode=mode))
+        assert markers.issubset(suppressed.pop()) is forbidden
+
+
+def test_lfm3_audio_generate_audio_decodes_speech_frames(monkeypatch, lfm3_audio):
+    model = lfm3_audio
+    eos = model.config.audio_eos_code
+    codec = SimpleNamespace(
+        config=SimpleNamespace(sampling_rate=24000),
+        decode=lambda codes: mx.zeros(codes.shape[-1] * 1920),
+    )
+    object.__setattr__(model, "_codec", codec)
+    tokenizer = SimpleNamespace(decode=lambda ids, **_: " ".join(map(str, ids)))
+    module = importlib.import_module("mlx_vlm.models.lfm3_audio.lfm3_audio")
+    frames = iter([[1] * 12, [2] * 12, [eos] * 12])
+    monkeypatch.setattr(module, "sample_frame", lambda *a: mx.array([next(frames)]))
+    # without a mode the model starts in text and opens speech with <|audio_start|>
+    text = iter([55, 50])
+    monkeypatch.setattr(module, "sample", lambda *a, **k: mx.array([next(text)]))
+    result = model.generate_audio(mx.array([[1, 2]]), tokenizer)
+    assert result.audio_tokens.tolist() == [[1, 2]] * 12
+    assert result.audio.shape == (2 * 1920,)
+    assert result.text == "55 50"
+    assert result.token_ids == [55, 61, 61, 61, 50]
+    assert result.finish_reason == "stop"
+
+
+def test_lfm3_audio_codec_decode_shapes():
+    from mlx_vlm.models.lfm3_audio.codec import CodecConfig, LiquidCodec
+
+    codec = LiquidCodec(CodecConfig(encoder_dim=64, quantizer_dim=16))
+    codec.decoder.istft.window = mx.ones(1280)
+    audio = codec.decode(mx.zeros((12, 3), mx.int32))
+    assert audio.shape == (3 * 1920,) and audio.dtype == mx.float32
+    assert codec.decode(mx.zeros((12, 0), mx.int32)).shape == (0,)
+    with pytest.raises(ValueError, match="strip EOS"):
+        codec.decode(mx.full((12, 2), 2016))
+
+
+@pytest.mark.skipif(
+    not os.environ.get("LFM3_AUDIO_PATH"), reason="set LFM3_AUDIO_PATH to a checkpoint"
+)
+def test_lfm3_audio_checkpoint_transcribes_its_own_speech(tmp_path):
+    from mlx_vlm.generate import generate, generate_audio
+    from mlx_vlm.prompt_utils import apply_chat_template
+    from mlx_vlm.utils import load
+
+    model, processor = load(os.environ["LFM3_AUDIO_PATH"])
+
+    def chat(system, user=""):
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+
+    sentence = "The quick brown fox jumps over the lazy dog."
+    prompt = apply_chat_template(
+        processor,
+        model.config,
+        chat("Perform TTS in American English using a female voice.", sentence),
+    )
+    path = tmp_path / "speech.wav"
+    speech = generate_audio(
+        model,
+        processor,
+        prompt,
+        generation_mode="audio",
+        max_tokens=400,
+        output_audio_path=path,
+    )
+    assert speech.finish_reason == "stop" and speech.audio.size
+    prompt = apply_chat_template(
+        processor, model.config, chat("Perform ASR in English."), num_audios=1
+    )
+    text = generate(model, processor, prompt, audio=[str(path)], temperature=0.0).text
+    assert text.strip().lower().rstrip(".") == sentence.lower().rstrip(".")
+
+
+@pytest.fixture
+def lfm3_omni():
+    module = importlib.import_module("mlx_vlm.models.lfm3_omni")
+    config = module.ModelConfig.from_dict(model_case("lfm3_omni")["config"])
+    model = module.Model(config)
+    mx.eval(model.parameters())
+    return model
+
+
+def test_lfm3_omni_sanitize_maps_canonical_checkpoint_idempotently(lfm3_omni):
+    model = lfm3_omni
+    native = dict(tree_flatten(model.parameters()))
+    # the checkpoint's names and torch layouts
+    hf = {}
+    for name, value in native.items():
+        if name.endswith("conv.conv.weight"):
+            value = value.transpose(0, 2, 1)
+        elif value.ndim == 4:  # spatial_conv and the downsampler's Conv2d
+            value = value.transpose(0, 3, 1, 2)
+        elif name.endswith("lin_out.weight"):  # a Conv1d in the checkpoint
+            value = value[..., None]
+        name = name.replace("language_model.model.", "language_model.")
+        hf["model." + name.replace("audio_tower.", "audio_encoder.")] = value
+    assert hf["model.audio_encoder.downsample.conv_in.weight"].shape == (4, 1, 3, 3)
+    assert hf["model.audio_encoder.downsample.lin_mid.weight"].shape == (4, 4, 1, 1)
+    assert "model.depth_decoder.depth_embeddings.0.embedding.weight" in hf
+    assert "model.vision_tower.layers.0.conv.spatial_conv.weight" in hf
+    once = model.sanitize(hf)
+    twice = model.sanitize(once)
+    assert once.keys() == native.keys() == twice.keys()
+    for name, value in native.items():
+        assert mx.array_equal(once[name], value), name
+        assert mx.array_equal(twice[name], value), name
+    model.load_weights(list(once.items()), strict=True)
+
+
+def test_lfm3_omni_scatters_media_and_never_samples_placeholders(
+    lfm3_omni, monkeypatch
+):
+    model = lfm3_omni
+    pixels, grid = mx.random.normal((16, 24)), mx.array([[1, 4, 4]])
+    video, video_grid = mx.random.normal((32, 24)), mx.array([[2, 4, 4]])
+    features = mx.random.normal((1, 16, 20))
+    image = model.encode_images(pixels, image_grid_thw=grid)
+    clip = model.encode_images(video, image_grid_thw=video_grid)
+    audio = model.audio_projector(model.audio_tower(features, mx.array([20])))
+    assert (image.shape[0], clip.shape[0], audio.shape[0]) == (4, 8, 3)
+    ids = mx.array([[1] + [56] * 4 + [2] + [60] * 3 + [3] + [57] * 8 + [61]])
+    embeds = model.get_input_embeddings(
+        ids,
+        pixels,
+        image_grid_thw=grid,
+        pixel_values_videos=video,
+        video_grid_thw=video_grid,
+        input_features=features,
+        audio_out_codes=[[1] * 12],
+    ).inputs_embeds[0]
+    assert mx.allclose(embeds[1:5], image, atol=1e-6)
+    assert mx.allclose(embeds[6:9], audio, atol=1e-6)
+    assert mx.allclose(embeds[10:18], clip, atol=1e-6)
+    table = model.codebook_embedding.weight
+    assert mx.allclose(embeds[18], table[mx.arange(12) * 5 + 1].sum(0), atol=1e-5)
+    text = model.language_model.model.embed_tokens(mx.array([1, 2, 3]))
+    assert mx.allclose(embeds[mx.array([0, 5, 9])], text)
+    with pytest.raises(ValueError, match="do not match"):
+        model.get_input_embeddings(ids, pixels, image_grid_thw=grid)
+    placeholders = mx.array([56, 57, 60, 61])
+    assert (model(mx.array([[1, 2]])).logits[..., placeholders] == -mx.inf).all()
+    module = importlib.import_module("mlx_vlm.models.lfm3_audio.lfm3_audio")
+    seen = []
+    monkeypatch.setattr(
+        module, "sample", lambda *a: seen.append(sorted(a[5])) or mx.array([50])
+    )
+    list(model.stream_slots(mx.array([[1, 2]])))
+    assert seen == [placeholders.tolist()]
+
+
+def test_lfm3_omni_quantized_checkpoint_roundtrip(tmp_path, lfm3_omni):
+    from dataclasses import asdict
+
+    from mlx_vlm.utils import load_model, skip_multimodal_module
+
+    model = lfm3_omni
+    keep = model.quant_predicate
+    nn.quantize(  # the predicate convert builds
+        model,
+        group_size=32,
+        bits=4,
+        class_predicate=lambda path, m: hasattr(m, "to_quantized")
+        and not skip_multimodal_module(path)
+        and keep(path, m),
+    )
+    model.eval()
+    weights = dict(tree_flatten(model.parameters()))
+    quantized = {k[: -len(".scales")] for k in weights if k.endswith(".scales")}
+    assert "language_model.model.embed_tokens" in quantized
+    speech_and_vision = (
+        "vision_tower",
+        "multi_modal_projector",
+        "audio_tower",
+        "audio_projector",
+        "depth_decoder",
+        "codebook_embedding",
+    )
+    assert not any(k.startswith(speech_and_vision) for k in quantized)
+    ids = mx.array([[1] + [56] * 4 + [2]])
+    kwargs = dict(pixel_values=mx.random.normal((16, 24)), image_grid_thw=[[1, 4, 4]])
+    expected = model(ids, **kwargs).logits
+    config = asdict(model.config)
+    config["quantization"] = dict(group_size=32, bits=4)
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+    restored = load_model(tmp_path)
+    actual = restored(ids, **kwargs).logits
+    np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
