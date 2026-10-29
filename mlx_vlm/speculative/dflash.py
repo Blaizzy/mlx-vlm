@@ -6,6 +6,7 @@ import mlx.nn as nn
 from .cache_state import abort_speculative_round, commit_speculative_round
 from .common import (
     _dflash_block_total,
+    _filter_rope_deltas,
     _record_speculative_round,
     _requires_uniform_batch_acceptance,
     _speculative_walk,
@@ -663,6 +664,7 @@ def _dflash_rounds_batch(
             for c in prompt_cache:
                 if hasattr(c, "filter"):
                     c.filter(keep_mx)
+            _filter_rope_deltas(lm, keep_mx, n_active)
             # Update active index mapping
             active_idx = [active_idx[j] for j in keep_slots]
 
