@@ -2402,6 +2402,60 @@ def test_convert_readonly_metadata(tmp_path, existing_output, save_processor):
     assert (source / "tokenizer.json").is_symlink()
 
 
+def test_convert_keeps_source_tokenizer_json_pipeline(tmp_path):
+    # #2496: Qwen3.5-family checkpoints name Qwen2Tokenizer, whose save_pretrained writes
+    # Qwen2's pre-tokenizer regex (no \p{M}) and decoder flags over the checkpoint's own.
+    from tokenizers import Regex, Tokenizer, decoders, pre_tokenizers, trainers
+    from tokenizers.models import BPE
+    from transformers import PreTrainedTokenizerFast, Qwen2Tokenizer
+
+    conversion = importlib.import_module("mlx_vlm.convert")
+    regex = (
+        r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}"
+        r"| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+    )
+    text = "स्त्री"
+    backend = Tokenizer(BPE())
+    backend.pre_tokenizer = pre_tokenizers.Sequence(
+        [
+            pre_tokenizers.Split(Regex(regex), behavior="isolated"),
+            pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
+        ]
+    )
+    backend.decoder = decoders.ByteLevel(
+        add_prefix_space=False, trim_offsets=False, use_regex=False
+    )
+    # Merge the whole word into one token; the Qwen2 regex splits it before BPE runs.
+    backend.train_from_iterator(
+        [text],
+        trainers.BpeTrainer(
+            vocab_size=1000,
+            initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+            show_progress=False,
+        ),
+    )
+    source, destination = tmp_path / "source", tmp_path / "converted"
+    PreTrainedTokenizerFast(tokenizer_object=backend).save_pretrained(source)
+    (source / "config.json").write_text("{}")
+    original = json.loads((source / "tokenizer.json").read_text())
+
+    processor = Qwen2Tokenizer.from_pretrained(source)
+    with patch.object(
+        conversion, "fetch_from_hub", return_value=(nn.Linear(4, 4), {}, processor)
+    ):
+        conversion.convert(str(source), str(destination))
+
+    exported = json.loads((destination / "tokenizer.json").read_text())
+    assert exported["pre_tokenizer"] == original["pre_tokenizer"]
+    assert exported["decoder"] == original["decoder"]
+    expected = Tokenizer.from_file(str(source / "tokenizer.json")).encode(text).ids
+    assert len(expected) == 1
+    assert (
+        Tokenizer.from_file(str(destination / "tokenizer.json")).encode(text).ids
+        == expected
+    )
+
+
 @pytest.mark.parametrize("alias", [False, True])
 def test_convert_copy_rejects_same_file_without_modifying_source(tmp_path, alias):
     from mlx_vlm.convert import _copy_writable_file
