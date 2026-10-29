@@ -168,6 +168,17 @@ def _decode_quantized_linears_fused(linears, x: mx.array):
             offset += linear.weight.shape[0]
             split_indices.append(offset)
         mx.eval(weights, scales, biases)
+        # Point each projection at its rows of the joined arrays, so prefill
+        # and verify keep using them without the model holding a second copy.
+        bounds = zip([0, *split_indices], [*split_indices, weights.shape[0]])
+        for linear, (start, end) in zip(linears, bounds):
+            linear.weight = weights[start:end]
+            linear.scales = scales[start:end]
+            linear.biases = biases[start:end]
+        cache_key = tuple(
+            (id(linear.weight), id(linear.scales), id(linear.biases))
+            for linear in linears
+        )
         cached = (cache_key, weights, scales, biases, split_indices)
         first._fused_decode_linears = cached
 
