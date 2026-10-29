@@ -1495,6 +1495,372 @@ def test_model_contract(case):
         getattr(checks, kind)(*args, **kwargs)
 
 
+@pytest.fixture
+def raon_case():
+    from mlx_vlm.models.raon1_mini import Model, ModelConfig
+
+    config = ModelConfig.from_dict(model_case("raon1_mini")["config"])
+    mx.random.seed(41)
+    return config, Model(config)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"hidden_act": "silu"},
+        {"num_experts_per_token": 5},
+        {"raon_mhc_streams": 1},
+        {"mla_use_nope": False},
+        {"rda_config": {"rda_layers": [1, 2], "mla_layers": [2]}},
+        {"rda_config": {"rda_layers": [1], "mla_layers": [2], "full_rank_gate": False}},
+    ],
+)
+def test_raon_rejects_unsupported_architecture(changes):
+    from mlx_vlm.models.raon1_mini import ModelConfig
+
+    values = model_case("raon1_mini")["config"]
+    with pytest.raises(ValueError):
+        ModelConfig.from_dict({**values, **changes})
+
+
+def test_raon_mhc_matches_residual_chart(raon_case):
+    _, model = raon_case
+    mhc = model.layers[0].self_attn_raon_mhc
+    mhc.phi_pre = mx.random.normal(mhc.phi_pre.shape) * 0.2
+    mhc.phi_post = mx.random.normal(mhc.phi_post.shape) * 0.2
+    mhc.res.phi_z = mx.random.normal(mhc.res.phi_z.shape) * 0.4
+    mhc.res.eta = mx.array(0.7)
+    streams = mx.random.normal((2, 3, 4, 64))
+    pre, post, residual = mhc(streams)
+    flat = np.array(streams).reshape(6, -1)
+    selector = np.concatenate(
+        [np.array(mhc.phi_pre), np.array(mhc.phi_post), np.array(mhc.res.phi_z)]
+    )
+    z = (flat @ selector.T) / np.sqrt(
+        np.mean(flat**2, axis=-1, keepdims=True) + mhc.eps
+    )
+    sigmoid = lambda x: 1 / (1 + np.exp(-x))
+    expected_pre, expected_post = sigmoid(z[:, :4]), 2 * sigmoid(z[:, 4:8])
+    basis = np.zeros((4, 3))
+    for k in range(1, 4):
+        basis[:k, k - 1] = 1 / np.sqrt(k * (k + 1))
+        basis[k, k - 1] = -k / np.sqrt(k * (k + 1))
+    e = basis @ z[:, 8:].reshape(6, 3, 3) @ basis.T
+    chart = (np.eye(4) + np.ones((4, 4)) / 4) / 2
+    radius = np.maximum(0, np.max(-e / chart, axis=(-2, -1), keepdims=True))
+    expected_residual = (1 - sigmoid(0.7)) * np.eye(4) + sigmoid(0.7) * (
+        chart + e / (1 + radius)
+    )
+    for actual, expected in (
+        (pre, expected_pre),
+        (post, expected_post),
+        (residual, expected_residual),
+    ):
+        np.testing.assert_allclose(np.array(actual), expected, atol=2e-6, rtol=2e-6)
+    np.testing.assert_allclose(np.array(residual.sum(-1)), 1, atol=2e-6)
+    np.testing.assert_allclose(np.array(residual.sum(-2)), 1, atol=2e-6)
+    assert float(mx.min(residual)) >= 0
+    rows, branch = streams.reshape(6, 4, 64), mx.random.normal((6, 64))
+    np.testing.assert_allclose(
+        np.array(mhc.aggregate(rows, pre)),
+        (np.array(rows) * expected_pre[..., None]).sum(1),
+        atol=2e-6,
+    )
+    np.testing.assert_allclose(
+        np.array(mhc.mix(rows, branch, post, residual)),
+        expected_residual @ np.array(rows)
+        + expected_post[..., None] * np.array(branch)[:, None],
+        atol=3e-6,
+    )
+
+
+@pytest.mark.parametrize("top_k", [1, 2])
+def test_raon_router_bias_only_selects_experts(raon_case, top_k):
+    _, model = raon_case
+    router = model.layers[1].moe.gate
+    router.top_k = top_k
+    router.weight = mx.arange(256).reshape(4, 64) / 1000
+    router.e_score_correction_bias = mx.array([2.0, 1.0, -1.0, -2.0])
+    x = mx.ones((1, 64)) * 0.1
+    indices, weights = router(x)
+    scores = 1 / (1 + np.exp(-np.array(x) @ np.array(router.weight).T))
+    expected = np.take_along_axis(scores, np.array(indices), axis=-1)
+    expected /= expected.sum(-1, keepdims=True)
+    assert set(np.array(indices).ravel()) == set(range(top_k))
+    np.testing.assert_allclose(np.array(weights), expected, atol=1e-6)
+
+
+@pytest.mark.parametrize("lower_bound", [-5.0, None])
+@pytest.mark.parametrize("kernel", [False, True])
+def test_raon_rda_matches_numpy_recurrence(raon_case, lower_bound, kernel):
+    _, model = raon_case
+    layer = model.layers[0].self_attn
+    layer.lower_bound = lower_bound
+    layer.train(not kernel)
+    x = mx.random.normal((2, 5, 64)) * 0.3
+    # Independent causal convolution, normalisation, write/erase gates and recurrence.
+    values = [
+        np.array(getattr(layer, name)(x)) for name in ("q_proj", "k_proj", "v_proj")
+    ]
+    raw = np.concatenate(values, axis=-1)
+    signal = np.pad(raw, ((0, 0), (3, 0), (0, 0)))
+    conv = sum(
+        signal[:, i : i + 5] * np.array(layer.qkv_conv1d.weight)[:, i, 0]
+        for i in range(4)
+    )
+    conv = conv / (1 + np.exp(-conv))
+    q, k, v = [a.reshape(2, 5, 2, 32) for a in np.split(conv, 3, axis=-1)]
+    q = q / np.maximum(np.linalg.norm(q, axis=-1, keepdims=True), 1e-6) / np.sqrt(32)
+    k = k / np.maximum(np.linalg.norm(k, axis=-1, keepdims=True), 1e-6)
+    beta_raw, delta = np.array(layer.b_proj(x)), np.array(layer.rda_w_proj(x))
+    beta = 1 / (1 + np.exp(-beta_raw))
+    v *= np.exp(np.logaddexp(0, -beta_raw) - np.logaddexp(0, -beta_raw - delta))[
+        ..., None
+    ]
+    decay = np.array(layer.f_b_proj(layer.f_a_proj(x))).reshape(2, 5, 2, 32)
+    decay = (decay + np.array(layer.dt_bias).reshape(2, 32)) * np.exp(
+        np.array(layer.A_log)
+    )[:, None]
+    decay = (
+        -np.logaddexp(0, decay)
+        if lower_bound is None
+        else lower_bound / (1 + np.exp(-decay))
+    )
+    state = np.zeros((2, 2, 32, 32), dtype=np.float32)
+    outputs = []
+    for t in range(5):
+        state *= np.exp(decay[:, t, :, None])
+        error = v[:, t] - np.einsum("bhvk,bhk->bhv", state, k[:, t])
+        state += beta[:, t, :, None, None] * error[..., None] * k[:, t, :, None]
+        outputs.append(np.einsum("bhvk,bhk->bhv", state, q[:, t]))
+    out = np.stack(outputs, axis=1)
+    out = (
+        out
+        / np.sqrt(np.mean(out**2, axis=-1, keepdims=True) + layer.eps)
+        * np.array(layer.o_norm.weight)
+    )
+    out *= 1 / (1 + np.exp(-np.array(layer.g_proj(x)).reshape(2, 5, 2, 32)))
+    expected = out.reshape(2, 5, 64) @ np.array(layer.o_proj.weight).T
+    from mlx_vlm.models.cache import ArraysCache
+
+    cache = ArraysCache(2)
+    actual = layer(x, cache=cache)
+    np.testing.assert_allclose(np.array(actual), expected, atol=3e-6, rtol=2e-5)
+    np.testing.assert_allclose(np.array(cache[1]), state, atol=3e-6, rtol=2e-5)
+    np.testing.assert_array_equal(np.array(cache[0]), raw[:, -3:])
+
+
+def test_raon_mla_matches_expanded_attention(raon_case):
+    _, model = raon_case
+    layer = model.layers[1].self_attn
+    x = mx.random.normal((1, 4, 64))
+    q = (
+        np.array(layer.q_b_proj(layer.q_a_layernorm(layer.q_a_proj(x))))
+        .reshape(1, 4, 2, 48)
+        .transpose(0, 2, 1, 3)
+    )
+    latent, extra = mx.split(layer.kv_a_proj_with_mqa(x), [32], axis=-1)
+    latent = np.array(layer.kv_a_layernorm(latent))[:, None]
+    key = latent @ np.array(layer.embed_q.weight)
+    key = np.concatenate(
+        [key, np.broadcast_to(np.array(extra)[:, None], (1, 2, 4, 16))], axis=-1
+    )
+    value = latent @ np.array(layer.unembed_out.weight).swapaxes(-1, -2)
+    scores = (q @ key.swapaxes(-1, -2)) * layer.scale
+    mask = np.tril(np.ones((4, 4), dtype=bool))
+    scores = np.where(mask, scores, -np.inf)
+    probs = np.exp(scores - np.max(scores, axis=-1, keepdims=True))
+    probs /= probs.sum(-1, keepdims=True)
+    out = (probs @ value).transpose(0, 2, 1, 3).reshape(1, 4, 64)
+    out *= 1 / (1 + np.exp(-np.array(layer.g_proj(x))))
+    expected = out @ np.array(layer.o_proj.weight).T
+    actual = layer(x, mask=mx.array(mask))
+    np.testing.assert_allclose(np.array(actual), expected, atol=2e-6, rtol=2e-5)
+    cache = KVCache()
+    layer(x[:, :3], mask=mx.array(mask[:3, :3]), cache=cache)
+    decoded = layer(x[:, 3:], cache=cache)
+    np.testing.assert_allclose(np.array(decoded), expected[:, 3:], atol=2e-6, rtol=2e-5)
+
+
+def test_raon_sanitize_source_layouts_and_second_pass(raon_case):
+    config, model = raon_case
+    convs = {
+        f"model.layers.0.self_attn.{name}_conv1d.weight": mx.arange(256).reshape(64, 4)
+        + i * 1000
+        for i, name in enumerate(("q", "k", "v"))
+    }
+    kv = mx.arange(2 * 64 * 32).reshape(128, 32).astype(mx.float32)
+    weights = {**convs, "model.layers.1.self_attn.kv_b_proj.weight": kv}
+    for i in range(4):
+        weights[f"model.layers.1.moe.experts.{i}.gate_proj.weight"] = mx.full(
+            (64, 64), float(i)
+        )
+    weights["model.layers.0.self_attn.q_proj.global_scale"] = mx.array(0.125)
+    first = model.sanitize(weights)
+    prefix = "language_model.model.layers."
+    np.testing.assert_array_equal(
+        np.array(first[prefix + "0.self_attn.qkv_conv1d.weight"]),
+        np.concatenate([np.array(x)[..., None] for x in convs.values()]),
+    )
+    np.testing.assert_array_equal(
+        np.array(first[prefix + "1.self_attn.embed_q.weight"]),
+        np.array(kv).reshape(2, 64, 32)[:, :32].swapaxes(-1, -2),
+    )
+    assert first[prefix + "0.self_attn.q_proj.weight_scale_2"].item() == 0.125
+    second = model.sanitize(first)
+    assert first.keys() == second.keys()
+    for key in first:
+        np.testing.assert_array_equal(np.array(first[key]), np.array(second[key]))
+
+
+def test_raon_native_quantized_checkpoint_roundtrip(raon_case, tmp_path):
+    config, model = raon_case
+    from mlx_vlm.models.switch_layers import SwitchLinear
+
+    nn.quantize(
+        model,
+        group_size=16,
+        bits=4,
+        mode="nvfp4",
+        class_predicate=lambda p, m: isinstance(m, (nn.Linear, SwitchLinear)),
+    )
+    # The released checkpoint mixes an MXFP8 head with globally scaled NVFP4 layers.
+    model.language_model.lm_head = nn.QuantizedLinear(
+        64, 128, bias=False, group_size=32, bits=8, mode="mxfp8"
+    )
+    weights = dict(tree_flatten(model.parameters()))
+    source = {
+        key.removeprefix("language_model."): value for key, value in weights.items()
+    }
+    for key in list(source):
+        if key.endswith(".scales") and not key.startswith("lm_head."):
+            scale = (
+                mx.array([0.5, 0.75, 1.0, 1.25]) * 2688
+                if ".switch_mlp." in key
+                else mx.array(0.75)
+            )
+            source[key.removesuffix("scales") + "global_scale"] = scale
+    config_dict = asdict(config)
+    # Native loading must not import the custom script in the published config.
+    config_dict["model_file"] = "raon_mlx_model.py"
+    (tmp_path / "raon_mlx_model.py").write_text(
+        "raise AssertionError('remote model executed')\n"
+    )
+    config_dict["quantization"] = {
+        "group_size": 16,
+        "bits": 4,
+        "mode": "nvfp4",
+        "lm_head": {"group_size": 32, "bits": 8, "mode": "mxfp8"},
+    }
+    for key in source:
+        if ".switch_mlp." in key and key.endswith(".global_scale"):
+            config_dict["quantization"][key.removesuffix(".global_scale")] = {
+                "group_size": 16,
+                "bits": 4,
+                "mode": "nvfp4",
+                "global_scale": True,
+            }
+    (tmp_path / "config.json").write_text(json.dumps(config_dict))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), source)
+    first = load_model(tmp_path)
+    ids = mx.array([[1, 2, 3]])
+    expected = first(ids).logits
+    assert bool(mx.all(mx.isfinite(expected)))
+    assert first.language_model.lm_head.mode == "mxfp8"
+    scaled = first.layers[0].self_attn.q_proj
+    x = mx.random.normal((1, 64))
+    dense = mx.dequantize(
+        scaled.weight, scaled.scales, group_size=16, bits=4, mode="nvfp4"
+    )
+    np.testing.assert_allclose(
+        np.array(scaled(x)), np.array(x @ dense.T * 0.75), atol=1e-5
+    )
+    expert = first.layers[1].moe.switch_mlp.gate_proj
+    indices = mx.array([1, 3])
+    inputs = mx.random.normal((2, 1, 64))
+    expanded = mx.dequantize(
+        expert.weight, expert.scales, group_size=16, bits=4, mode="nvfp4"
+    )
+    expected_experts = (
+        mx.gather_mm(inputs, expanded.swapaxes(-1, -2), rhs_indices=indices)
+        * mx.array([0.75, 1.25])[:, None, None]
+    )
+    np.testing.assert_allclose(
+        np.array(expert(inputs, indices)), np.array(expected_experts), atol=2e-5
+    )
+    mx.save_safetensors(
+        str(tmp_path / "model.safetensors"), dict(tree_flatten(first.parameters()))
+    )
+    second = load_model(tmp_path)
+    np.testing.assert_array_equal(np.array(second(ids).logits), np.array(expected))
+
+
+def test_raon_mxfp8_source_packing(raon_case):
+    _, model = raon_case
+    weight = mx.random.normal((64, 64))
+    packed, scales = mx.quantize(weight, group_size=32, bits=8, mode="mxfp8")
+    source = {}
+    for i in range(4):
+        prefix = f"model.layers.1.moe.experts.{i}.gate_proj."
+        source[prefix + "weight"] = packed.view(mx.uint8)
+        source[prefix + "weight_scale_inv"] = scales
+    sanitized = model.sanitize(source)
+    prefix = "language_model.model.layers.1.moe.switch_mlp.gate_proj."
+    np.testing.assert_array_equal(
+        np.array(sanitized[prefix + "weight"]), np.array(mx.stack([packed] * 4))
+    )
+    np.testing.assert_array_equal(
+        np.array(sanitized[prefix + "scales"]), np.array(mx.stack([scales] * 4))
+    )
+
+
+def test_raon_left_padded_batch_matches_single_sequences(raon_case):
+    from mlx_vlm.models.cache import ArraysCache, BatchKVCache
+
+    _, model = raon_case
+    model.eval()
+    ids = mx.array([[0, 0, 1, 2], [3, 4, 5, 6]])
+    caches = [ArraysCache(2, left_padding=[2, 0]), BatchKVCache([2, 0])]
+    actual = model(ids, cache=caches).logits
+    for row, start in ((0, 2), (1, 0)):
+        solo = model(ids[row : row + 1, start:]).logits
+        np.testing.assert_allclose(
+            np.array(actual[row : row + 1, start:]), np.array(solo), atol=2e-5
+        )
+    decoded = model(mx.array([[7], [8]]), cache=caches).logits
+    for row, start in ((0, 2), (1, 0)):
+        solo_ids = mx.concatenate(
+            [ids[row : row + 1, start:], mx.array([[7 + row]])], axis=1
+        )
+        solo = model(solo_ids).logits[:, -1:]
+        np.testing.assert_allclose(
+            np.array(decoded[row : row + 1]), np.array(solo), atol=2e-5
+        )
+
+
+def test_raon_recurrent_cache_restores_partial_acceptance(raon_case):
+    from mlx_vlm.models.cache import ArraysCache
+
+    _, model = raon_case
+    layer = model.layers[0].self_attn
+    layer.eval()
+    x = mx.random.normal((1, 6, 64))
+    cache = ArraysCache(2)
+    layer(x[:, :2], cache=cache)
+    generation = cache.start_speculation(3)
+    layer(x[:, 2:5], cache=cache)
+    cache.commit_speculation(2, generation)
+    actual = layer(x[:, 5:], cache=cache)
+    reference = ArraysCache(2)
+    layer(x[:, :4], cache=reference)
+    expected = layer(x[:, 5:], cache=reference)
+    np.testing.assert_allclose(np.array(actual), np.array(expected), atol=2e-5)
+    for actual_state, expected_state in zip(cache.state, reference.state):
+        np.testing.assert_allclose(
+            np.array(actual_state), np.array(expected_state), atol=2e-5
+        )
+
+
 def test_nemotron_parse_source_architecture_and_tied_head_mapping():
     config = {
         "model_type": "nemotron_parse",
