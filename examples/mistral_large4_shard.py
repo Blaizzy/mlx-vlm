@@ -12,6 +12,23 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
+def configure(output):
+    """Write standard MLX metadata for native weights, including staged ranks."""
+    from mlx_vlm.models.mistral_large4.config import config_from_params
+
+    config = config_from_params(json.loads((output / "params.json").read_text()))
+    marker = output / "rank.json"
+    if marker.exists():
+        partition = json.loads(marker.read_text())
+        config["text_config"].update(
+            expert_start=partition["expert_start"],
+            expert_end=partition["expert_end"],
+        )
+    config_path = output / "config.json"
+    config_path.write_text(json.dumps(config, indent=2) + "\n")
+    return config_path
+
+
 def serve(source, bind, port):
     files = {}
     for path in sorted(source.glob("*.safetensors")):
@@ -181,6 +198,7 @@ def stage(url, rank, size, output):
 
     with concurrent.futures.ThreadPoolExecutor(4) as executor:
         list(executor.map(download, manifest["files"].items()))
+    configure(output)
     print(
         json.dumps(
             {
@@ -205,6 +223,10 @@ if __name__ == "__main__":
     s.add_argument("url")
     s.add_argument("rank", type=int)
     s.add_argument("size", type=int)
+    s.add_argument("output", type=Path)
+    s = sub.add_parser(
+        "configure", help="Prepare config.json for existing native weights"
+    )
     s.add_argument("output", type=Path)
     a = vars(p.parse_args())
     command = a.pop("command")

@@ -46,14 +46,14 @@ The original snapshot occupies 610.1 GB. To avoid copying every expert to every
 device, run the staging server on the Mac holding the original snapshot:
 
 ```sh
-python examples/mistral_large4_shard.py serve /path/to/original/snapshot \
+python -m examples.mistral_large4_shard serve /path/to/original/snapshot \
   --bind 169.254.216.98 --port 8944
 ```
 
 Then run the following on each device, replacing `RANK` with 0, 1, or 2:
 
 ```sh
-python examples/mistral_large4_shard.py stage \
+python -m examples.mistral_large4_shard stage \
   http://169.254.216.98:8944 RANK 3 /path/to/model
 ```
 
@@ -61,7 +61,8 @@ Use a separate destination from the original snapshot. Each destination needs
 about 217–222 GB plus 10 GiB of free space. The script copies only the assigned
 experts, replicates dense and vision weights, and omits optional MTP draft weights.
 It preserves tensor bytes, rewriting unsupported FP8 header types as U8 for
-decoding by the shared loader. `rank.json` records the partition.
+decoding by the shared loader. `rank.json` records the partition, and staging writes a
+standard `config.json` containing the model configuration and expert range.
 `model.shard(group)` rejects a partition that does not match the rank. Stop the temporary HTTP server after staging;
 it is intended for a trusted private link.
 
@@ -99,9 +100,17 @@ model.shard(group)
 mx.eval(model.parameters())
 ```
 
-`load_config` recognizes native `params.json` and reads the expert range from
-`rank.json` when staged. The common loader handles quantization conversion and
-strict weight loading; the model sanitizer maps names and stacks experts.
+Staging translates `params.json` and `rank.json` into `config.json` before loading.
+For an existing native snapshot or a previously staged directory, prepare that
+metadata once with the same Python environment used for inference:
+
+```sh
+python -m examples.mistral_large4_shard configure /path/to/model
+```
+
+This writes only `config.json`; tensor files remain byte-for-byte unchanged.
+The common loader reads the standard configuration, converts quantization, and
+loads weights strictly. The model sanitizer maps names and stacks experts.
 A full checkpoint can also be sharded after lazy loading, but staging avoids
 keeping the entire 610 GB checkpoint on every machine.
 

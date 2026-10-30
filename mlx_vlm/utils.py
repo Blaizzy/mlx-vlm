@@ -953,28 +953,9 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
             force_download=kwargs.get("force_download", False),
         )
 
-    config = None
-    params_path = model_path / "params.json"
-    if not (model_path / "config.json").exists() and params_path.exists():
-        with open(params_path, encoding="utf-8") as f:
-            params = json.load(f)
-        if params.get("lerope") and params.get("ssmax_scaling") and params.get("dsa"):
-            from .models.mistral_large4.config import config_from_params
-
-            config = config_from_params(params)
-            rank_path = model_path / "rank.json"
-            if rank_path.exists():
-                with open(rank_path, encoding="utf-8") as f:
-                    partition = json.load(f)
-                config["text_config"].update(
-                    expert_start=partition["expert_start"],
-                    expert_end=partition["expert_end"],
-                )
-
     try:
-        if config is None:
-            with open(model_path / "config.json", encoding="utf-8") as f:
-                config = json.load(f)
+        with open(model_path / "config.json", encoding="utf-8") as f:
+            config = json.load(f)
 
         generation_config_file = model_path / "generation_config.json"
         if generation_config_file.exists():
