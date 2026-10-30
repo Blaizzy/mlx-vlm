@@ -77,7 +77,7 @@ from mlx_vlm.models.qwen4_exp.language import (
 )
 from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
 from mlx_vlm.models.z1t.language import AFTConv, Z1TCache
-from mlx_vlm.tests.test_models import DATA, build_config
+from mlx_vlm.tests.test_models import DATA, build_config, model_case
 from mlx_vlm.turboquant import (
     BatchTurboQuantKVCache,
     TurboQuantKVCache,
@@ -202,6 +202,50 @@ def test_arrays_cache_advance_matches_decremented_values():
 
     cache.finalize()
     assert cache.left_padding is None and cache.lengths is None
+
+
+@pytest.fixture
+def mistral_large4_language():
+    from mlx_vlm.models import mistral_large4
+
+    fields = model_case("mistral_large4")["config"]["text_config"]
+    config = build_config(mistral_large4, fields, "TextConfig")
+    mx.random.seed(17)
+    model = mistral_large4.LanguageModel(config)
+    model.eval()
+    return model
+
+
+def test_mistral_large4_cached_dsa_and_shared_kv_match_full_sequence(
+    mistral_large4_language,
+):
+    model = mistral_large4_language
+    ids = mx.array([[1, 2, 7, 5, 9, 13, 11], [2, 4, 6, 8, 10, 12, 14]])
+    expected = model(ids).logits
+    cache = model.make_cache()
+    chunks = [
+        model(ids[:, a:b], cache=cache).logits for a, b in [(0, 3), (3, 5), (5, 7)]
+    ]
+    actual = mx.concatenate(chunks, axis=1)
+    assert mx.allclose(actual, expected, atol=3e-6, rtol=3e-5).item()
+    assert all(c.offset == 7 for c in cache)
+    assert cache[7].keys is None  # This layer reuses layer 3's compressed KV.
+    assert cache[3].keys.shape == (2, 1, 7, 16)
+    assert cache[0].index_keys.shape == (2, 7, 16)
+    assert cache[2].index_keys is None  # Indexer sharing carries only indices.
+
+
+def test_mistral_large4_cache_restore_and_trim(mistral_large4_language):
+    model = mistral_large4_language
+    ids = mx.array([[1, 2, 3, 4, 5, 6]])
+    cache = model.make_cache()
+    model(ids, cache=cache)
+    restored = [LatentCache.from_state(c.state, c.meta_state) for c in cache]
+    for c in restored:
+        assert c.trim(2) == 2
+    actual = model(ids[:, 4:], cache=restored).logits
+    expected = model(ids).logits[:, 4:]
+    assert mx.allclose(actual, expected, atol=3e-6, rtol=3e-5).item()
 
 
 @pytest.mark.parametrize("right_pad", [False, True])

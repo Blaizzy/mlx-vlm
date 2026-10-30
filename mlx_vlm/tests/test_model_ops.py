@@ -635,6 +635,28 @@ def test_grid_sample_half_precision_matches_float32(dtype, grid_dtype):
 
 # Rotary embeddings
 
+
+def test_mistral_large4_rotary_pair_layout_and_position_scaling():
+    from mlx_vlm.models.mistral_large4.language import SoftmaxScaling, rotate
+
+    x = mx.array([[[[1.0, 2.0, 3.0, 4.0]]]])
+    cos, sin = mx.array([[[[0.0, 1.0]]]]), mx.array([[[[1.0, 0.0]]]])
+    np.testing.assert_array_equal(
+        np.array(rotate(x, cos, sin)), [[[[-2.0, 3.0, 1.0, 4.0]]]]
+    )
+    scaling = SoftmaxScaling(2)
+    scaling.s = mx.array([0.25, -0.5])
+    scaling.b = mx.array([1.0, 2.0])
+    positions = mx.array([[0, 3]])
+    actual = scaling(mx.ones((1, 2, 2, 3)), positions)
+    expected = np.array(
+        [[[1.0, 1.0 + 0.25 * np.log(4)], [2.0, 2.0 - 0.5 * np.log(4)]]]
+    )[..., None]
+    np.testing.assert_allclose(
+        np.array(actual), np.broadcast_to(expected, (1, 2, 2, 3)), atol=1e-6
+    )
+
+
 # Multimodal position IDs
 
 QWEN_STYLE_MODULES = [
@@ -1228,6 +1250,21 @@ def _nvfp4_weights():
         "layer.weight_scale_2": mx.array(0.5, dtype=mx.float32),
         "layer.input_scale": mx.array(0.25, dtype=mx.float32),
     }
+
+
+def test_transform_modelopt_fp8_block_scales():
+    values = mx.arange(256 * 256).reshape(256, 256) % 17 - 8
+    packed = mx.to_fp8(values.astype(mx.float32))
+    scales = mx.array([0.25, 0.5, 1.0, 2.0]).reshape(2, 1, 2, 1)
+    expected = (values.reshape(2, 128, 2, 128) * scales).reshape(256, 256)
+    weights, _ = _transform_modelopt_nvfp4_weights(
+        {"linear.weight": packed, "linear.weight_scale": scales},
+        {"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION"},
+    )
+    assert set(weights) == {"linear.weight"}
+    np.testing.assert_array_equal(
+        np.array(weights["linear.weight"].astype(mx.float32)), np.array(expected)
+    )
 
 
 def test_transform_modelopt_mixed_nvfp4_fp8_weights():

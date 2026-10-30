@@ -174,7 +174,8 @@ versus 2.04 seconds on three Macs; image prefill took 3.76 versus 2.93 seconds.
 These single short-request measurements show comparable decode speed with more
 memory per device and slower prefill; long-context behavior remains unvalidated.
 
-The shared-loader refactor passed 677 local checks covering Mistral loading,
-cache behavior, native expert partitions, sanitizer idempotence, save/reload,
-MiniMax, shared quantization operations, and sampling defaults. CI now includes
-the Mistral test file and its cache contract.
+Mistral uses the existing JSON model case and the shared model, cache, and
+operation test suites, including the cache contract. Those suites and sampling
+defaults passed 1,431 local checks after the test refactor, with one optional
+audio checkpoint test skipped locally. Coverage includes native expert partitions, sanitizer
+idempotence, save/reload, MiniMax, and shared quantization operations.
