@@ -91,6 +91,7 @@ jobs:
               tests/test_generate.py
               tests/test_sampling_defaults.py
               tests/test_server.py
+              tests/test_server_sse.py
               tests/test_server_stt_realtime.py
               tests/test_tool_streaming.py
           - group: training-ops

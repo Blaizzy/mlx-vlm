@@ -635,8 +635,46 @@ mlx_vlm.server --model-dir /Volumes/Models --model-dir ~/my-custom-model
 - `--vision-cache-size`: Max number of cached vision features (default: `20`)
 - `--min-pixels` / `--max-pixels`: Default minimum/maximum input image pixel area for processors that support these options (also `MLX_VLM_MIN_PIXELS` / `MLX_VLM_MAX_PIXELS`). Unset values use the model's preprocessing defaults.
 - `--log-progress-interval`: Decoded tokens between progress log messages; `0` disables periodic decode progress (default: `10`)
+- `--stream-keepalive-interval`: Idle SSE comment interval in seconds for Chat Completions and Responses (default: `15`, or `MLX_VLM_STREAM_KEEPALIVE_INTERVAL`); `0` disables comments
 - `--api-key`: Bearer token required for inference, model discovery, and management endpoints
 - `--log-level`: Logging level — `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (default: `INFO`)
+
+#### Long-running OpenAI streams
+
+Streaming `/v1/chat/completions` and `/v1/responses` send an SSE comment after
+15 seconds without an event, including while waiting for generation admission
+or the first token of a long prefill:
+
+```text
+: keepalive
+
+```
+
+SSE clients ignore these comments. They contain no model output, do not affect
+token usage, and do not replace the normal completion events. They keep bytes
+flowing to clients with a body-idle timeout, such as VS Code's Node fetch path.
+They do not extend an absolute request deadline or the server's separate token
+queue timeout (`MLX_VLM_TOKEN_QUEUE_TIMEOUT`, default 600 seconds).
+
+Set a different interval at startup, or update the default for new streams
+without restarting or reloading the model:
+
+```sh
+mlx_vlm.server --model <model> --stream-keepalive-interval 15
+
+curl -X PATCH http://localhost:8080/v1/settings \
+  -H 'Content-Type: application/json' \
+  -d '{"stream_keepalive_interval": 10}'
+```
+
+`GET /v1/settings` lists the current value and setting description. The interval
+must be a finite, nonnegative number; `0` disables keepalives. CLI values override
+the environment variable. Runtime updates last until restart and affect new
+streams; an active stream retains its starting interval. Add the configured
+bearer token when authentication is enabled. A disconnected stream cancels its
+queued request or stops active generation at the next available worker boundary.
+
+#### Image preprocessing defaults
 
 For higher-resolution image input, including OCR with Bonsai 2, set pixel-area
 defaults at startup:

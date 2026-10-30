@@ -23,7 +23,7 @@ from .generation import (
 )
 from .model_discovery import MODEL_PATHS_ENV
 from .runtime import runtime
-from .runtime_config import RuntimeConfig
+from .runtime_config import RuntimeConfig, parse_stream_keepalive_interval
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
@@ -138,6 +138,15 @@ def main():
         help=(
             "Decoded tokens between progress log messages; 0 disables periodic "
             "decode progress (default: %(default)s)."
+        ),
+    )
+    parser.add_argument(
+        "--stream-keepalive-interval",
+        type=parse_stream_keepalive_interval,
+        default=None,
+        help=(
+            "Idle SSE comment interval in seconds (default: 15, or "
+            "MLX_VLM_STREAM_KEEPALIVE_INTERVAL); 0 disables comments."
         ),
     )
     parser.add_argument(
@@ -357,6 +366,10 @@ def main():
     if args.prefill_step_size:
         os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
     os.environ["MLX_VLM_LOG_PROGRESS_INTERVAL"] = str(args.log_progress_interval)
+    if args.stream_keepalive_interval is not None:
+        os.environ["MLX_VLM_STREAM_KEEPALIVE_INTERVAL"] = str(
+            args.stream_keepalive_interval
+        )
     os.environ["MLX_VLM_MAX_TOKENS"] = str(args.max_tokens)
     os.environ["MLX_VLM_ENABLE_THINKING"] = "1" if args.enable_thinking else "0"
     if args.thinking_budget is not None:

@@ -39,6 +39,7 @@ from .generation import (
     PromptTooLongError,
     _build_metrics_envelope,
     _count_prompt_tokens,
+    start_generation,
 )
 from .request_normalization import (
     _chat_message_to_prompt,
@@ -94,6 +95,7 @@ from .schemas import (
     StreamingTimings,
     UsageStats,
 )
+from .sse import with_keepalives
 
 logger = logging.getLogger("mlx_vlm.server")
 
@@ -1419,7 +1421,7 @@ async def responses_endpoint(request: Request):
                     if runtime.response_generator is not None:
                         # generate() blocks on _cpu_preprocess + queue.get;
                         # offload so concurrent handlers preprocess in parallel.
-                        ctx, token_iter = await asyncio.to_thread(
+                        ctx, token_iter = await start_generation(
                             runtime.response_generator.generate,
                             formatted_prompt,
                             images if images else None,
@@ -1731,7 +1733,9 @@ async def responses_endpoint(request: Request):
                     logger.debug("Responses stream closed.")
 
             return StreamingResponse(
-                stream_generator(),
+                with_keepalives(
+                    stream_generator(), runtime.config.stream_keepalive_interval
+                ),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -2172,7 +2176,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         generate_kwargs = {"args": gen_args}
                         if videos:
                             generate_kwargs["videos"] = videos
-                        ctx, token_iter = await asyncio.to_thread(
+                        ctx, token_iter = await start_generation(
                             runtime.response_generator.generate,
                             formatted_prompt,
                             images if images else None,
@@ -2583,7 +2587,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     logger.debug("Chat completion stream closed.")
 
             return StreamingResponse(
-                stream_generator(),
+                with_keepalives(
+                    stream_generator(), runtime.config.stream_keepalive_interval
+                ),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",

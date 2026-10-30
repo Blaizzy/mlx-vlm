@@ -16,6 +16,7 @@ VISION_KINDS: Tuple[str, ...] = ("image_generation", "image_edit")
 
 KV_SCHEMES: Tuple[str, ...] = ("uniform", "turboquant")
 DEFAULT_TOKEN_QUEUE_TIMEOUT = 600.0
+DEFAULT_STREAM_KEEPALIVE_INTERVAL = 15.0
 
 logger = logging.getLogger("mlx_vlm.server")
 
@@ -180,6 +181,14 @@ KNOBS: Tuple[
         "Token queue wait timeout in seconds; null disables the timeout.",
     ),
     (
+        "stream_keepalive_interval",
+        "float",
+        DEFAULT_STREAM_KEEPALIVE_INTERVAL,
+        TEXT_KINDS,
+        None,
+        "Idle SSE comment interval in seconds for new OpenAI streams; 0 disables comments.",
+    ),
+    (
         "draft_model",
         "str_or_none",
         None,
@@ -238,6 +247,7 @@ _IMAGE_PIXEL_LIMITS: Tuple[str, ...] = ("min_pixels", "max_pixels")
 _LIVE_KNOBS: Tuple[str, ...] = (
     "max_kv_size",
     "token_queue_timeout",
+    "stream_keepalive_interval",
     *_IMAGE_PIXEL_LIMITS,
 )
 
@@ -308,6 +318,15 @@ def _env_token_queue_timeout() -> Optional[float]:
     return timeout if timeout > 0 else None
 
 
+def parse_stream_keepalive_interval(raw: Any) -> float:
+    if isinstance(raw, bool):
+        raise ValueError("expected a finite number >= 0")
+    value = float(raw)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError("expected a finite number >= 0")
+    return value
+
+
 @dataclass
 class RuntimeConfig:
     kv_bits: Optional[float] = None
@@ -333,6 +352,7 @@ class RuntimeConfig:
     apc_checkpoint_guard_tokens: int = 1
     max_kv_size: Optional[int] = None
     token_queue_timeout: Optional[float] = DEFAULT_TOKEN_QUEUE_TIMEOUT
+    stream_keepalive_interval: float = DEFAULT_STREAM_KEEPALIVE_INTERVAL
     draft_model: Optional[str] = None
     draft_kind: Optional[str] = None
     vision_cache_size: int = 20
@@ -392,6 +412,12 @@ class RuntimeConfig:
             ),
             max_kv_size=_env_int("MAX_KV_SIZE", None),
             token_queue_timeout=_env_token_queue_timeout(),
+            stream_keepalive_interval=parse_stream_keepalive_interval(
+                os.environ.get(
+                    "MLX_VLM_STREAM_KEEPALIVE_INTERVAL",
+                    DEFAULT_STREAM_KEEPALIVE_INTERVAL,
+                )
+            ),
             draft_model=os.environ.get("MLX_VLM_DRAFT_MODEL") or None,
             draft_kind=os.environ.get("MLX_VLM_DRAFT_KIND") or None,
             vision_cache_size=int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20")),
@@ -464,6 +490,8 @@ class RuntimeConfig:
                         if name.startswith("apc_")
                         else _coerce(spec["type"], raw, spec.get("allowed"))
                     )
+                    if name == "stream_keepalive_interval":
+                        value = parse_stream_keepalive_interval(raw)
                     if name in _IMAGE_PIXEL_LIMITS and value is not None:
                         if (
                             isinstance(raw, bool)
@@ -553,6 +581,8 @@ def _coerce(kind: str, raw: Any, allowed: Optional[List[str]] = None) -> Any:
         raise ValueError(f"expected a boolean, got {raw!r}")
     if kind == "int":
         return int(raw)
+    if kind == "float":
+        return float(raw)
     if kind == "int_or_none":
         if raw is None or raw == "":
             return None
