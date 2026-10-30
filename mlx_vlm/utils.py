@@ -408,6 +408,17 @@ def load_model(
     """
     config = load_config(model_path, **kwargs)
 
+    if config.get("_native_mistral_large4"):
+        from .models.mistral_large4.checkpoint import load_native
+
+        if kwargs.get("quantize_activations", False):
+            raise ValueError(
+                "Mistral Large 4 native loading uses unquantized activations."
+            )
+        model = load_native(model_path, lazy=lazy, group=kwargs.get("expert_group"))
+        model.config = apply_generation_config_defaults(model.config, config)
+        return model
+
     index_file = model_path / "model.safetensors.index.json"
     weight_files = []
     declared_keys: set = set()
@@ -953,9 +964,20 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
             force_download=kwargs.get("force_download", False),
         )
 
+    config = None
+    params_path = model_path / "params.json"
+    if not (model_path / "config.json").exists() and params_path.exists():
+        with open(params_path, encoding="utf-8") as f:
+            params = json.load(f)
+        if params.get("lerope") and params.get("ssmax_scaling") and params.get("dsa"):
+            from .models.mistral_large4.config import config_from_params
+
+            config = dict(config_from_params(params), _native_mistral_large4=True)
+
     try:
-        with open(model_path / "config.json", encoding="utf-8") as f:
-            config = json.load(f)
+        if config is None:
+            with open(model_path / "config.json", encoding="utf-8") as f:
+                config = json.load(f)
 
         generation_config_file = model_path / "generation_config.json"
         if generation_config_file.exists():
