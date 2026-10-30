@@ -1760,6 +1760,33 @@ class TestQwen3VLVideoTimestamps:
             p(text=[self.VIDEO_BLOCK], videos=[self.frames()], video_metadata=metadata)
 
 
+@pytest.mark.parametrize("model_type", ["mage_vl", "llava_onevision2"])
+def test_mage_checkpoint_alias_uses_native_processor(tmp_path, model_type):
+    _write_configs(
+        tmp_path,
+        config={"model_type": model_type},
+        preprocessor_config=DATA["checkpoints"]["mage"]["preprocessor_config"],
+    )
+    tokenizer = TestMageVLProcessor().processor().tokenizer
+    with patch("transformers.AutoTokenizer.from_pretrained", return_value=tokenizer):
+        processor = load_processor(
+            tmp_path, add_detokenizer=False, trust_remote_code=False
+        )
+    assert isinstance(processor, c.mage)
+    prompt = apply_chat_template(
+        processor, {"model_type": model_type}, "Click Save.", num_images=1
+    )
+    assert prompt.count(m.mage.IMAGE_PAD) == 1
+    inputs = prepare_inputs(
+        processor,
+        prompts=prompt,
+        images=[Image.new("RGB", (64, 32), "blue")],
+    )
+    assert inputs["image_grid_thw"].tolist() == [[1, 2, 4]]
+    assert inputs["pixel_values"].shape == (8, 3 * 16 * 16)
+    assert int((inputs["input_ids"] == 2).sum()) == 2
+
+
 class TestMageVLProcessor:
     """Mage VL image/video processing and processor-to-model compatibility."""
 

@@ -1495,6 +1495,59 @@ def test_model_contract(case):
         getattr(checks, kind)(*args, **kwargs)
 
 
+@pytest.mark.parametrize("model_type", ["mage_vl", "llava_onevision2"])
+@pytest.mark.parametrize("quantized", [False, True])
+def test_mage_checkpoint_layout_and_roundtrip(tmp_path, model_type, quantized):
+    config = model_case("mage_vl_cowork")["config"]
+    config["model_type"] = model_type
+    module, resolved = get_model_and_args(config)
+    assert resolved == "mage_vl"
+    model = module.Model(module.ModelConfig.from_dict(config))
+    if quantized:
+        nn.quantize(model, group_size=32, bits=4)
+        config["quantization"] = {"group_size": 32, "bits": 4}
+    expected = dict(tree_flatten(model.parameters()))
+    source = {}
+    for key, value in expected.items():
+        if key.startswith("vision_tower."):
+            prefix = "visual." if model_type == "llava_onevision2" else "model.visual."
+            key = prefix + key.removeprefix("vision_tower.")
+            if key.endswith("patch_embedding.weight"):
+                value = value.transpose(0, 3, 1, 2)
+        elif key.startswith("language_model.model."):
+            prefix = (
+                "model."
+                if model_type == "llava_onevision2"
+                else "model.language_model."
+            )
+            key = prefix + key.removeprefix("language_model.model.")
+        else:
+            key = key.removeprefix("language_model.")
+        source[key] = value
+    converted = model.sanitize(source)
+    again = model.sanitize(converted)
+    assert converted.keys() == again.keys() == expected.keys()
+    for key, value in expected.items():
+        assert mx.array_equal(converted[key], value), key
+        assert mx.array_equal(again[key], value), key
+    model.load_weights(list(converted.items()), strict=True)
+
+    ids = mx.array([[1, 60, 60, 60, 60, 2]])
+    pixels = mx.random.normal((16, 12))
+    kwargs = {"image_grid_thw": mx.array([[1, 4, 4]])}
+    logits = model(ids, pixels, **kwargs).logits
+    assert mx.all(mx.isfinite(logits))
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    for weights in (source, converted):
+        mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+        loaded = load_model(tmp_path)
+        np.testing.assert_allclose(
+            np.array(loaded(ids, pixels, **kwargs).logits),
+            np.array(logits),
+            atol=1e-6,
+        )
+
+
 def test_nemotron_parse_source_architecture_and_tied_head_mapping():
     config = {
         "model_type": "nemotron_parse",
