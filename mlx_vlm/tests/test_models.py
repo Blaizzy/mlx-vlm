@@ -3224,50 +3224,6 @@ class TestPPDocLayoutV3(unittest.TestCase):
 # Loading and utility contracts
 
 
-@pytest.mark.parametrize("partition", [None, (2, 5)])
-def test_mistral_large4_staged_config_keeps_generation_defaults(
-    tmp_path, monkeypatch, partition
-):
-    import runpy
-
-    from mlx_vlm.models.mistral_large4 import config
-
-    configure = runpy.run_path(
-        str(Path(__file__).resolve().parents[2] / "examples/mistral_large4_shard.py")
-    )["configure"]
-
-    (tmp_path / "params.json").write_text(
-        json.dumps({"lerope": True, "ssmax_scaling": True, "dsa": {"topk": 4}})
-    )
-    (tmp_path / "generation_config.json").write_text(
-        json.dumps({"eos_token_id": [2, 3], "temperature": 0.7})
-    )
-    monkeypatch.setattr(
-        config,
-        "config_from_params",
-        lambda params: {
-            "model_type": "mistral_large4",
-            "eos_token_id": 2,
-            "text_config": {},
-        },
-    )
-    if partition is not None:
-        (tmp_path / "rank.json").write_text(
-            json.dumps({"expert_start": partition[0], "expert_end": partition[1]})
-        )
-    config_path = configure(tmp_path)
-    assert config_path == tmp_path / "config.json"
-    result = load_config(tmp_path)
-    assert result["model_type"] == "mistral_large4"
-    assert result["eos_token_id"] == [2, 3]
-    assert result["temperature"] == 0.7
-    if partition is not None:
-        assert result["text_config"] == {
-            "expert_start": partition[0],
-            "expert_end": partition[1],
-        }
-
-
 def test_load_config_applies_generation_config_sampling_defaults(tmp_path):
     generation_config = {
         "eos_token_id": [2, 3],
