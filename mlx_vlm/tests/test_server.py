@@ -24,6 +24,7 @@ from threading import Event, Lock, Thread, Timer
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
+import anyio
 import httpx2
 import mlx.core as mx
 import numpy as np
@@ -67,6 +68,73 @@ from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreame
 from mlx_vlm.tools import load_tool_module, process_tool_calls
 
 
+@pytest.mark.parametrize("interval", ["0", "0.001"])
+@pytest.mark.parametrize("fail", [False, True])
+def test_stream_keepalives_preserve_output(monkeypatch, interval, fail):
+    monkeypatch.setenv("MLX_VLM_STREAM_KEEPALIVE_INTERVAL", interval)
+
+    async def check():
+        calls, chunks = [], []
+
+        async def source():
+            calls.append("start")
+            try:
+                await asyncio.sleep(0.02)
+                yield 'data: {"content":"OK"}\n\n'
+                if fail:
+                    raise RuntimeError("generation failed")
+                yield "data: [DONE]\n\n"
+            finally:
+                calls.append("closed")
+
+        async def consume():
+            async for chunk in openai._with_keepalives(source()):
+                chunks.append(chunk)
+
+        if fail:
+            with pytest.raises(RuntimeError, match="generation failed"):
+                await consume()
+        else:
+            await consume()
+        expected = ['data: {"content":"OK"}\n\n']
+        if not fail:
+            expected.append("data: [DONE]\n\n")
+        assert [chunk for chunk in chunks if not chunk.startswith(":")] == expected
+        assert (": keepalive\n\n" in chunks) == (interval != "0")
+        assert calls == ["start", "closed"]
+
+    asyncio.run(check())
+
+
+def test_stream_keepalives_close_on_disconnect(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_STREAM_KEEPALIVE_INTERVAL", "0.001")
+
+    async def check():
+        started, closed = asyncio.Event(), asyncio.Event()
+
+        async def source():
+            try:
+                started.set()
+                await asyncio.Event().wait()
+                yield "unreachable"
+            finally:
+                await asyncio.sleep(0)
+                closed.set()
+
+        async def consume():
+            async for _ in openai._with_keepalives(source()):
+                pass
+
+        async with anyio.create_task_group() as group:
+            group.start_soon(consume)
+            await started.wait()
+            group.cancel_scope.cancel()
+        assert closed.is_set()
+        assert len(asyncio.all_tasks()) == 1
+
+    asyncio.run(check())
+
+
 def test_cancellation_is_acknowledged_only_after_removal():
     gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
     gen._cancelled = {7}
@@ -98,98 +166,6 @@ def test_cancellation_of_finished_request_is_ignored():
 
     batch_gen.remove.assert_not_called()
     assert gen._cancelled == set()
-
-
-def test_start_generation_cancels_before_queue_admission():
-    async def check():
-        gen = _ready_generator()
-        gen._ready.set()
-        finished = Event()
-
-        def generate():
-            try:
-                return gen.generate("hello")
-            finally:
-                finished.set()
-
-        task = asyncio.create_task(generation.start_generation(generate))
-        request = await asyncio.to_thread(gen.requests.get, True, 2)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert request.cancel_event.is_set()
-        assert await asyncio.to_thread(finished.wait, 1)
-
-        # The abandoned request must not consume the only free batch slot.
-        gen.requests.put(request)
-        survivor_queue = _enqueue(gen, request_id=2)
-        pending, stopped = gen._collect_pending_requests(active=False, capacity=1)
-        assert not stopped and len(pending) == 1
-        assert pending[0].rqueue is survivor_queue
-
-    asyncio.run(check())
-
-
-def test_start_generation_closes_late_iterator_after_disconnect():
-    async def check():
-        started, release, closed = Event(), Event(), Event()
-        events = []
-
-        def generate():
-            events.append(generation._generation_cancel_event.get())
-            started.set()
-            assert release.wait(2)
-            return NS(uid=1), NS(close=closed.set)
-
-        task = asyncio.create_task(generation.start_generation(generate))
-        assert await asyncio.to_thread(started.wait, 1)
-        assert generation._generation_cancel_event.get() is None
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert events[0].is_set()
-        release.set()
-        assert await asyncio.to_thread(closed.wait, 1)
-
-    asyncio.run(check())
-
-
-def test_start_generation_cancelled_during_model_readiness():
-    async def check():
-        gen = _generator()
-        gen._preprocess_request = Mock()
-        started, finished = Event(), Event()
-
-        def generate():
-            started.set()
-            try:
-                return gen.generate("hello")
-            finally:
-                finished.set()
-
-        task = asyncio.create_task(generation.start_generation(generate))
-        assert await asyncio.to_thread(started.wait, 1)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert await asyncio.to_thread(finished.wait, 1)
-        gen._preprocess_request.assert_not_called()
-        assert gen.requests.empty()
-
-    asyncio.run(check())
-
-
-def test_cancellation_event_reaches_active_request_before_iterator_exists():
-    gen = _generator()
-    event, queue = Event(), Queue()
-    active = {7: {"rqueue": queue, "cancel_event": event}}
-    batch = NS(remove=Mock(side_effect=[False, True]))
-    event.set()
-    gen._apply_cancellations(batch, active)
-    assert 7 in active
-    gen._apply_cancellations(batch, active)
-    assert not active and queue.get_nowait() is None
-    assert batch.remove.call_count == 2
 
 
 _MUSE_RESPONSE_TEMPLATE = {
@@ -5074,6 +5050,7 @@ class TestResponseGenerator:
 
         assert cancelled == ["req-1"]
 
+        rqueue.put(None)
         thread.join(timeout=1.0)
         assert not thread.is_alive()
         assert isinstance(result[0], StopIteration)
@@ -5689,51 +5666,6 @@ def test_kv_bits_independent_of_model_path(monkeypatch):
 
 
 class TestRuntimeConfig:
-    @pytest.mark.parametrize("raw,expected", [(None, 15.0), ("0", 0.0), ("2.5", 2.5)])
-    def test_keepalive_env(self, monkeypatch, raw, expected):
-        monkeypatch.delenv("MLX_VLM_STREAM_KEEPALIVE_INTERVAL", raising=False)
-        if raw is not None:
-            monkeypatch.setenv("MLX_VLM_STREAM_KEEPALIVE_INTERVAL", raw)
-        assert RuntimeConfig.from_env().stream_keepalive_interval == expected
-
-    @pytest.mark.parametrize("value", [-1, "nan", "inf", True, None, "bad"])
-    def test_invalid_keepalive_interval(self, value):
-        cfg = RuntimeConfig()
-        applied, rejected = cfg.apply_changes({"stream_keepalive_interval": value})
-        assert not applied and len(rejected) == 1
-        assert cfg.stream_keepalive_interval == 15
-
-    @pytest.mark.parametrize("interval", [0, 2.5])
-    def test_keepalive_is_live(self, client, monkeypatch, interval):
-        cfg = RuntimeConfig()
-        monkeypatch.setattr(server.runtime, "config", cfg)
-        before = cfg.fingerprint()
-        response = client.patch(
-            "/v1/settings", json={"stream_keepalive_interval": interval}
-        )
-        assert response.status_code == 200
-        assert cfg.stream_keepalive_interval == interval
-        assert cfg.fingerprint() == before
-        assert cfg.reload_kinds(["stream_keepalive_interval"]) == set()
-
-    @pytest.mark.parametrize(
-        "value,valid", [("0", True), ("2.5", True), ("-1", False), ("nan", False)]
-    )
-    def test_keepalive_cli(self, monkeypatch, value, valid):
-        monkeypatch.setattr(server.runtime, "config", RuntimeConfig())
-        monkeypatch.setattr(
-            sys, "argv", ["mlx_vlm.server", "--stream-keepalive-interval", value]
-        )
-        with patch.dict(os.environ), patch.object(cli.uvicorn, "run") as run:
-            if valid:
-                cli.main()
-                assert server.runtime.config.stream_keepalive_interval == float(value)
-                run.assert_called_once()
-            else:
-                with pytest.raises(SystemExit):
-                    cli.main()
-                run.assert_not_called()
-
     def test_apply_changes_validates_and_coerces(self):
         cfg = RuntimeConfig.from_env()
         applied, rejected = cfg.apply_changes(

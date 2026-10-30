@@ -1,12 +1,9 @@
-import asyncio
 import gc
 import logging
 import os
 import time
 from collections import deque
-from concurrent.futures import CancelledError
 from contextlib import nullcontext
-from contextvars import ContextVar
 from dataclasses import dataclass, field
 from queue import Empty as QueueEmpty
 from queue import Queue
@@ -58,42 +55,6 @@ DEFAULT_LOG_PROGRESS_INTERVAL = 10
 DEFAULT_ENABLE_THINKING = False
 METRICS_HISTORY_LIMIT = 100
 METRICS_RECENT_LIMIT = 32
-
-# asyncio.to_thread copies context. This gives synchronous generation a request
-# lifetime without changing its public call signature or cancelling other work.
-_generation_cancel_event: ContextVar[Optional[Event]] = ContextVar(
-    "generation_cancel_event", default=None
-)
-
-
-async def start_generation(generate_fn, *args, **kwargs):
-    """Offload generation startup while retaining ownership on disconnect."""
-    cancel_event = Event()
-    token = _generation_cancel_event.set(cancel_event)
-    try:
-        task = asyncio.create_task(asyncio.to_thread(generate_fn, *args, **kwargs))
-    finally:
-        _generation_cancel_event.reset(token)
-
-    def close_abandoned_result(done):
-        try:
-            _, iterator = done.result()
-            iterator.close()
-        except (Exception, asyncio.CancelledError):
-            # Retrieve startup errors too, avoiding unobserved task exceptions.
-            pass
-
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        cancel_event.set()
-        task.add_done_callback(close_abandoned_result)
-        raise
-
-
-def _check_generation_cancelled(cancel_event):
-    if cancel_event is not None and cancel_event.is_set():
-        raise CancelledError("Generation request was cancelled")
 
 
 class PromptTooLongError(ValueError):
@@ -828,7 +789,6 @@ class QueuedGenerationRequest:
     apc_semantic_hash: Optional[int] = None
     request_id: Optional[str] = None
     queued_at: float = field(default_factory=time.perf_counter)
-    cancel_event: Optional[Event] = None
 
 
 @dataclass
@@ -1036,11 +996,7 @@ class _TokenIterator:
                 return
             self._closed = True
         if not self._ended:
-            self._ended = True
             self._cancel_fn(self._uid)
-            # Release a concurrent blocking next() immediately, even while the
-            # GPU worker is still finishing its current prefill step.
-            self._rqueue.put(None)
 
     def __del__(self):
         # Mirror generator semantics: implicit close on GC.
@@ -1151,10 +1107,6 @@ class ResponseGenerator:
             return pending
 
     def _apply_cancellations(self, batch_gen, active):
-        for uid, info in active.items():
-            event = info.get("cancel_event")
-            if event is not None and event.is_set():
-                self._cancel(uid)
         for uid in self._drain_cancellations():
             if batch_gen is None or uid not in active:
                 continue
@@ -1246,11 +1198,6 @@ class ResponseGenerator:
         args: Optional[GenerationArguments] = None,
         videos: Optional[List] = None,
     ) -> Tuple[GenerationContext, "_TokenIterator"]:
-        cancel_event = _generation_cancel_event.get()
-        if cancel_event is not None:
-            while not self._ready.wait(0.1):
-                _check_generation_cancelled(cancel_event)
-        _check_generation_cancelled(cancel_event)
         self.wait_until_ready()
         args = args or GenerationArguments(max_tokens=get_server_max_tokens())
         if self.draft_model is not None and args.logits_processors is not None:
@@ -1269,7 +1216,6 @@ class ResponseGenerator:
         # races request threads through the mutable fast-tokenizer backend.
         tokenizer_lock = getattr(self, "_tokenizer_lock", None)
         with tokenizer_lock if tokenizer_lock is not None else nullcontext():
-            _check_generation_cancelled(cancel_event)
             raw_inputs = self._preprocess_request(
                 prompt, images, audio, videos, **args.preprocessing_kwargs()
             )
@@ -1286,7 +1232,6 @@ class ResponseGenerator:
                 args, raw_inputs.get("input_ids")
             )
         prompt_tokens = _count_prompt_tokens(raw_inputs)
-        _check_generation_cancelled(cancel_event)
         _check_configured_context_budget(prompt_tokens, args.max_tokens)
 
         apc_semantic_hash = None
@@ -1321,7 +1266,6 @@ class ResponseGenerator:
             apc_semantic_hash=apc_semantic_hash,
             request_id=request_id,
             queued_at=request_started_at,
-            cancel_event=cancel_event,
         )
         logger.info(
             "Generation queued: request=%s prompt_tokens=%d max_tokens=%d "
@@ -1336,17 +1280,7 @@ class ResponseGenerator:
         self.requests.put(queued_request)
 
         # Block until the GPU thread sends back the context
-        if cancel_event is None:
-            ctx = rqueue.get()
-        else:
-            while True:
-                _check_generation_cancelled(cancel_event)
-                try:
-                    ctx = rqueue.get(timeout=0.1)
-                    break
-                except QueueEmpty:
-                    continue
-            _check_generation_cancelled(cancel_event)
+        ctx = rqueue.get()
         if isinstance(ctx, Exception):
             raise ctx
 
@@ -1767,8 +1701,6 @@ class ResponseGenerator:
                 if self._stop and not pending:
                     should_stop = True
                 return
-            if item.cancel_event is not None and item.cancel_event.is_set():
-                return
             pending.append(item)
 
         def _has_room():
@@ -1869,11 +1801,6 @@ class ResponseGenerator:
                         batch_gen = None
 
                 for request in new_items:
-                    if (
-                        request.cancel_event is not None
-                        and request.cancel_event.is_set()
-                    ):
-                        continue
                     rqueue = request.rqueue
                     raw_inputs = request.raw_inputs
                     prompt_tokens = request.prompt_tokens
@@ -1920,11 +1847,6 @@ class ResponseGenerator:
                         images,
                         apc_semantic_hash=request.apc_semantic_hash,
                     )
-                    if (
-                        request.cancel_event is not None
-                        and request.cancel_event.is_set()
-                    ):
-                        continue
                     has_embeds = bool(gen_kwargs.get("inputs_embeds") is not None)
                     if args.cache_checkpoint_len:
                         gen_kwargs["_apc_checkpoint_len"] = args.cache_checkpoint_len
@@ -1963,7 +1885,6 @@ class ResponseGenerator:
                     rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
                     active[uid] = {
                         "rqueue": rqueue,
-                        "cancel_event": request.cancel_event,
                         "streamer": _ServerTokenStreamer(
                             self.tokenizer,
                             make_streaming_detokenizer(self.processor),
@@ -1982,7 +1903,6 @@ class ResponseGenerator:
                 if not active or batch_gen is None:
                     continue
 
-                self._apply_cancellations(batch_gen, active)
                 self._step(batch_gen, active)
 
             except Exception as e:
@@ -2019,11 +1939,6 @@ class ResponseGenerator:
                     break
                 cancelled |= self._drain_cancellations()
                 for request in new_items:
-                    if (
-                        request.cancel_event is not None
-                        and request.cancel_event.is_set()
-                    ):
-                        continue
                     rqueue = request.rqueue
                     raw_inputs = request.raw_inputs
                     prompt_tokens = request.prompt_tokens
@@ -2041,7 +1956,6 @@ class ResponseGenerator:
                             cancelled,
                             log_state,
                             apc_semantic_hash=request.apc_semantic_hash,
-                            cancel_event=request.cancel_event,
                         )
                         rqueue.put(None)
                     except Exception as e:
@@ -2066,7 +1980,6 @@ class ResponseGenerator:
         cancelled,
         log_state=None,
         apc_semantic_hash=None,
-        cancel_event=None,
     ):
         log_state = log_state or {"request_id": uid, "generated_tokens": 0}
         input_ids = raw_inputs.get("input_ids")
@@ -2105,8 +2018,6 @@ class ResponseGenerator:
 
         def on_result(result):
             nonlocal prefill_logged
-            if cancel_event is not None and cancel_event.is_set():
-                return False
             if not prefill_logged and getattr(result, "prompt_tps", None) is not None:
                 prompt_tps = float(result.prompt_tps or 0.0)
                 prompt_tokens = int(getattr(result, "prompt_tokens", 0) or 0)
