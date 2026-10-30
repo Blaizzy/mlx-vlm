@@ -259,6 +259,89 @@
       }
     },
     {
+      "id": "kev",
+      "module": "kev",
+      "config": {
+        "model_type": "kev",
+        "hidden_size": 16,
+        "intermediate_size": 32,
+        "linear_num_value_heads": 2,
+        "linear_num_key_heads": 2,
+        "linear_key_head_dim": 32,
+        "linear_value_head_dim": 8,
+        "linear_conv_kernel_dim": 3,
+        "num_hidden_layers": 2,
+        "full_attention_interval": 2,
+        "num_attention_heads": 2,
+        "rms_norm_eps": 1e-05,
+        "vocab_size": 512,
+        "num_key_value_heads": 2,
+        "max_position_embeddings": 128,
+        "head_dim": 8,
+        "rope_parameters": {
+          "type": "default",
+          "mrope_section": [
+            1,
+            0,
+            0
+          ],
+          "rope_theta": 10000,
+          "partial_rotary_factor": 0.25
+        },
+        "pointer_dim": 8
+      },
+      "checks": [
+        "registry_and_config",
+        "checkpoint",
+        "decision_models"
+      ],
+      "decision_models": {
+        "state": {
+          "ticket": "A B",
+          "items": [
+            "C",
+            "D"
+          ]
+        },
+        "special_tokens": {
+          "additional_special_tokens": [
+            "<|fim_prefix|>",
+            "<|fim_middle|>",
+            "<|box_start|>",
+            "<|box_end|>",
+            "<|fim_suffix|>"
+          ]
+        },
+        "questions": {
+          "route": {
+            "type": "choice",
+            "instructions": "Route",
+            "criteria": {
+              "A": "AB",
+              "B": null,
+              "C": "CD"
+            }
+          },
+          "quality": {
+            "type": "score",
+            "instructions": "Rate",
+            "criteria": [
+              "low",
+              "high",
+              "top"
+            ]
+          },
+          "finished": {
+            "type": "bool",
+            "instructions": "Finished",
+            "criteria": {
+              "true": "E"
+            }
+          }
+        }
+      }
+    },
+    {
       "id": "d1",
       "module": "d1",
       "config": {
