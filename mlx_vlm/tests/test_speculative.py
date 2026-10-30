@@ -1542,6 +1542,60 @@ def test_qwen3_5_cancelled_prefill_row_preserves_survivor_output(chunk_size):
     assert mx.array_equal(actual, expected).item()
 
 
+def test_mtp_batch_filter_keeps_survivor_rope_deltas():
+    """A finished row's M-RoPE delta must leave the batch with its row: the
+    continuous-batching filter drops the row from the caches and the drafter,
+    and the target's stored per-row deltas are sliced with ``[:batch_size]``
+    on the next verify, so an unfiltered store hands a surviving row the
+    finished row's position offset. The survivor must keep its own delta and
+    match the plain autoregressive continuation."""
+
+    def build():
+        mx.random.seed(23)
+        lm, cfg = language("qwen", inference=True)
+        lm.eval()
+        return lm, cfg
+
+    prompt = mx.array([[1, 5, 2, 7], [1, 5, 2, 7]])
+    model, config = build()
+    drafter = mtp_drafter("qwen", config)
+    drafter.eval()
+    caches = [ArraysCache(2, left_padding=[0, 0]), BatchKVCache([0, 0])]
+    out = model(prompt, cache=caches, return_hidden=True, return_shared_kv=True)
+    first = greedy(out.logits[:, -1])
+    # distinct per-row deltas, as images of different grid sizes would leave
+    model._rope_deltas = mx.array([[0], [1000]], dtype=mx.int32)
+    model._position_ids = None
+    rounds = mtp._mtp_rounds_batch(
+        model,
+        drafter,
+        caches,
+        out.hidden_states[-1],
+        {},
+        prompt_tokens=prompt,
+        first_bonus=first,
+        max_tokens=8,
+        sampler=greedy,
+        draft_block_size=4,
+        greedy_sampling=True,
+        stop_check=lambda row, _token: row == 0,
+    )
+    survivor = [first[1].item()]
+    survivor += [tokens[1] for tokens, _ in rounds if tokens[1] is not None]
+    assert model._rope_deltas.tolist() == [[1000]]
+
+    reference_model, _ = build()
+    cache = reference_model.make_cache()
+    token = greedy(reference_model(prompt[1:2], cache=cache).logits[:, -1])
+    reference_model._rope_deltas = mx.array([[1000]], dtype=mx.int32)
+    reference_model._position_ids = None
+    reference = [token.item()]
+    for _ in range(7):
+        token = greedy(reference_model(token[:, None], cache=cache).logits[:, -1])
+        reference.append(token.item())
+    assert survivor == reference
+
+
 @parametrize(
     "family,accepted", [("qwen", [1, 0]), ("qwen", [1, 1]), ("deepseek", [0, 0])]
 )

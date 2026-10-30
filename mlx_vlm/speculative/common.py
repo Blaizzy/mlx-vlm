@@ -411,6 +411,24 @@ def _batch_cache_left_padding(prompt_cache: List[Any]) -> Optional[mx.array]:
     return None
 
 
+def _filter_rope_deltas(lm: nn.Module, keep_mx: mx.array, n_active: int) -> None:
+    """Drop finished rows from the target's stored per-row M-RoPE deltas.
+
+    M-RoPE models (Qwen-family VLMs) keep one rope delta per batch row on
+    the language model and slice them with ``[:batch_size]`` on decode.
+    When the continuous-batching filter drops a finished row, the stored
+    deltas must be filtered with the caches, or every surviving row after
+    the dropped one decodes with another row's position offset.
+    """
+    rope_deltas = getattr(lm, "_rope_deltas", None)
+    if (
+        rope_deltas is not None
+        and rope_deltas.ndim >= 1
+        and rope_deltas.shape[0] == n_active
+    ):
+        lm._rope_deltas = rope_deltas[keep_mx]
+
+
 def _format_speculative_stats(draft_model: nn.Module) -> Optional[str]:
     accepted_lens = getattr(draft_model, "accept_lens", None) or []
     if not accepted_lens:

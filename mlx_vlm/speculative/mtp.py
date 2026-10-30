@@ -15,6 +15,7 @@ from .cache_state import (
 from .common import (
     _batch_cache_left_padding,
     _dflash_block_total,
+    _filter_rope_deltas,
     _record_speculative_round,
     _requires_uniform_batch_acceptance,
     _speculative_walk,
@@ -1183,6 +1184,7 @@ def _mtp_rounds_batch(
                 filter_drafter = getattr(draft_model, "filter_batch", None)
                 if callable(filter_drafter):
                     filter_drafter(keep_mx)
+                _filter_rope_deltas(lm, keep_mx, n_active)
                 hidden = hidden[keep_mx]
                 for k in next_shared_kv:
                     K_next, V_next = next_shared_kv[k]
