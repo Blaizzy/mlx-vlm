@@ -627,6 +627,17 @@ def parse_arguments():
         ),
     )
     parser.add_argument(
+        "--reasoning-effort",
+        type=str.lower,
+        default=None,
+        help=(
+            "Reasoning effort forwarded to the chat template (for example "
+            "low, medium, high). Templates that use reasoning_strength "
+            "receive the same value, matching the server's reasoning_effort "
+            "handling. When omitted, the template default is left untouched."
+        ),
+    )
+    parser.add_argument(
         "--thinking-budget",
         type=int,
         default=None,
@@ -1497,6 +1508,10 @@ def main():
         chat_template_kwargs["use_tts_template"] = True
     if args.thinking_mode is not None:
         chat_template_kwargs["thinking_mode"] = args.thinking_mode
+    if args.reasoning_effort is not None:
+        chat_template_kwargs["reasoning_effort"] = args.reasoning_effort
+        # Muse Glimmer's chat template reads the reasoning_strength alias.
+        chat_template_kwargs["reasoning_strength"] = args.reasoning_effort
     if args.video:
         chat_template_kwargs["video"] = args.video
         chat_template_kwargs["fps"] = args.fps
