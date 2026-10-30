@@ -1797,7 +1797,7 @@ class LanguageModel(nn.Module):
                     )
 
         if speculative_verify:
-            return _EXACT_SPECULATIVE_VERIFIER.verify(
+            return self._speculative_verifier().verify(
                 self,
                 inputs,
                 cache=cache,
@@ -1817,6 +1817,9 @@ class LanguageModel(nn.Module):
             cache is not None
             and inputs.ndim == 2
             and inputs.shape[1] == 1
+            # The invariant decode cannot honor per-layer captures; an empty
+            # capture list (the final pre-mixer contract) needs no layer hooks.
+            and not capture_layer_ids
             and callable(batch_invariant_decode)
             and (
                 supports_batch_invariant_decode is None
@@ -1860,6 +1863,14 @@ class LanguageModel(nn.Module):
             gdn_states=None,
             shared_kv_states={} if return_shared_kv else None,
         )
+
+    def _speculative_verifier(self):
+        """Batch-invariant forward backing the ``speculative_verify`` entry.
+
+        Subclasses whose decoder layers diverge from the plain Qwen3.5 module
+        layout override this so the shared entry point stays on their
+        architecture-aware path."""
+        return _EXACT_SPECULATIVE_VERIFIER
 
     def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
         if self.args.tie_word_embeddings:

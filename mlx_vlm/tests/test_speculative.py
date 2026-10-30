@@ -2226,6 +2226,74 @@ def test_qwen_quantized_cache_ragged_rollback():
     assert kv.left_padding.tolist() == [1, 0]
 
 
+def qwen4_exp_language():
+    arch = module("models.qwen4_exp")
+    config = build_config(arch, deepcopy(model_case("qwen4_exp")["config"]))
+    return arch.Model(config).language_model
+
+
+def test_qwen4_exp_decode_capture_bypasses_invariant_fast_path():
+    mx.random.seed(11)
+    lm = qwen4_exp_language()
+    caches = lm.make_cache()
+    prefill = lm(mx.array([[1, 2, 3]]), cache=caches, capture_layer_ids=[0])
+    step = lm(mx.array([[4]]), cache=caches, capture_layer_ids=[0])
+    hidden_size = lm.args.hidden_size
+    assert [h.shape for h in prefill.hidden_states] == [(1, 3, hidden_size)]
+    assert [h.shape for h in step.hidden_states] == [(1, 1, hidden_size)]
+    # SpeculativePrefill.finish concatenates chunk captures along time.
+    mx.eval(mx.concatenate([prefill.hidden_states[0], step.hidden_states[0]], axis=1))
+
+
+def test_qwen4_exp_decode_without_capture_keeps_premixer_contract():
+    mx.random.seed(11)
+    lm = qwen4_exp_language()
+    caches = lm.make_cache()
+    mx.eval(lm(mx.array([[1, 2, 3]]), cache=caches).logits)
+    out = lm(mx.array([[4]]), cache=caches, return_hidden=True, skip_logits=True)
+    (hidden,) = out.hidden_states
+    assert hidden.shape == (1, 1, lm.args.hc_count * lm.args.hidden_size)
+
+
+def test_qwen4_exp_speculative_verify_matches_plain_forward():
+    mx.random.seed(13)
+    lm = qwen4_exp_language()
+    prompt, verify = mx.array([[1, 2, 3, 4]]), mx.array([[5, 6, 7]])
+    caches = lm.make_cache()
+    mx.eval(lm(prompt, cache=caches).logits)
+    out = lm(verify, cache=caches, speculative_verify=True)
+    reference = lm.make_cache()
+    lm(prompt, cache=reference)
+    equal(out.logits, lm(verify, cache=reference).logits, atol=1e-4)
+    lm.rollback_speculative_cache(caches, out.gdn_states, 1, block_size=3)
+    committed = lm.make_cache()
+    lm(mx.array([[1, 2, 3, 4, 5, 6]]), cache=committed)
+    probe = mx.array([[8]])
+    equal(lm(probe, cache=caches).logits, lm(probe, cache=committed).logits, atol=1e-4)
+
+
+def test_qwen4_exp_dflash_verify_hook_is_lossless():
+    mx.random.seed(17)
+    lm = qwen4_exp_language()
+    prompt, verify = mx.array([[1, 2, 3, 4]]), mx.array([[5, 6, 7, 8]])
+    caches = lm.make_cache()
+    mx.eval(lm(prompt, cache=caches).logits)
+    captured, transaction, target_tokens = module(
+        "speculative.dflash"
+    )._dflash_verify_greedy(lm, verify, caches, [0], greedy)
+    assert [h.shape for h in captured] == [(1, 4, lm.args.hidden_size)]
+    reference = lm.make_cache()
+    lm(prompt, cache=reference)
+    reference_out = lm(verify, cache=reference, capture_layer_ids=[0])
+    equal(target_tokens, greedy(reference_out.logits))
+    equal(captured[0], reference_out.hidden_states[0], atol=1e-4)
+    lm.rollback_speculative_cache(caches, transaction, 2, block_size=4)
+    committed = lm.make_cache()
+    lm(mx.array([[1, 2, 3, 4, 5, 6, 7]]), cache=committed)
+    probe = mx.array([[9]])
+    equal(lm(probe, cache=caches).logits, lm(probe, cache=committed).logits, atol=1e-4)
+
+
 def test_lfm_ragged_rollback_matches_committed_prefixes():
     mx.random.seed(5)
     model = dflash_target("dspark-lfm2").language_model
