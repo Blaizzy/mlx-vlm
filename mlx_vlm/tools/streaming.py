@@ -16,7 +16,7 @@ def _json_calls(text, name_key="name", args_key="arguments"):
         if text[offset : offset + 1] != "{":
             return
         offset += 1
-        name, arguments = None, ""
+        name, arguments, saw_arguments = None, "", False
         while offset < len(text):
             offset += len(text[offset:]) - len(text[offset:].lstrip())
             if text[offset : offset + 1] == "}":
@@ -43,17 +43,20 @@ def _json_calls(text, name_key="name", args_key="arguments"):
             if key == args_key:
                 # String-encoded arguments are decoded only once complete.
                 arguments = value if isinstance(value, str) else text[start:offset]
+                saw_arguments = True
             offset += len(text[offset:]) - len(text[offset:].lstrip())
             if text[offset : offset + 1] == ",":
                 offset += 1
             elif text[offset : offset + 1] != "}":
-                if name:
+                if name and saw_arguments:
                     yield name, arguments
                 return
-        if name:
-            yield name, arguments
-        else:
+        if name is None:
             return
+        # A call without an arguments member is dropped by the final parser;
+        # streaming it here would open a call the stream can never retract.
+        if saw_arguments:
+            yield name, arguments
 
 
 def _xml_call(text, tools, module):
@@ -91,10 +94,24 @@ def _xml_call(text, tools, module):
                         + json.dumps(value, ensure_ascii=False)[:-1],
                     )
                 ]
+            if not arguments:
+                # Nothing validated yet: opening the call now would stream a
+                # delta that cannot be retracted if this pending non-string
+                # value fails conversion when it closes.
+                return []
             break
-        arguments[key] = module._convert_param_value(value, key, properties)
+        try:
+            arguments[key] = module._convert_param_value(value, key, properties)
+        except Exception:
+            # The final parser rejects this call; emitting a partial prefix
+            # here would stream deltas for a call that never completes.
+            return []
         body = body[end + len("</parameter>") :]
-    return [(name, json.dumps(arguments, ensure_ascii=False)[:-1])]
+    if arguments or not properties:
+        return [(name, json.dumps(arguments, ensure_ascii=False)[:-1])]
+    # A parameterized call opens only once a value has validated: the stream
+    # cannot retract the call if its first value fails conversion later.
+    return []
 
 
 def _without_marker_tail(text, marker):
@@ -181,14 +198,20 @@ class ToolCallDeltaState:
             else:
                 try:
                     parsed = self.module.parse_tool_call(body.strip(), self.tools)
+                    parsed = [parsed] if isinstance(parsed, dict) else iter(parsed)
                 except (ValueError, KeyError, TypeError):
                     if len(self.calls) > self.offset:
                         raise
                     parsed = []
-                candidates = [parsed] if isinstance(parsed, dict) else parsed
-                candidates = [
-                    (call["name"].strip(), call["arguments"]) for call in candidates
-                ]
+                # Normalize per call, like the final extractor: an element of
+                # an unexpected shape is dropped, not allowed to abort the
+                # stream alongside its well-formed neighbours.
+                candidates = []
+                for call in parsed:
+                    try:
+                        candidates.append((call["name"].strip(), call["arguments"]))
+                    except (KeyError, TypeError, AttributeError):
+                        continue
             count = 0
             for count, (name, arguments) in enumerate(candidates, 1):
                 index = self.offset + count - 1
