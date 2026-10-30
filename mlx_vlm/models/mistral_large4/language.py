@@ -5,13 +5,14 @@ Packed NVFP4 experts retain their original per-block and global scales.
 """
 
 import math
+from functools import partial
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import LanguageModelOutput
 from ..cache import _BaseCache
-from ..switch_layers import SwitchLinear
+from ..switch_layers import QuantizedSwitchLinear, SwitchLinear
 from .config import TextConfig
 
 
@@ -279,35 +280,17 @@ class Attention(nn.Module):
         return self.wo(out), topk
 
 
-class NVFP4SwitchLinear(nn.Module):
-    def __init__(self, input_dims, output_dims, experts):
-        super().__init__()
-        self.weight = mx.zeros((experts, output_dims, input_dims // 8), dtype=mx.uint32)
-        self.scales = mx.zeros((experts, output_dims, input_dims // 16), dtype=mx.uint8)
-        self.global_scale = mx.ones((experts,), dtype=mx.float32)
-
-    def __call__(self, x, indices):
-        return mx.gather_qmm(
-            x,
-            self.weight,
-            self.scales,
-            rhs_indices=indices,
-            group_size=16,
-            bits=4,
-            mode="nvfp4",
-            global_scale=2688.0 * self.global_scale,
-        )
-
-
 class Experts(nn.Module):
     def __init__(self, args):
         super().__init__()
         n = args.expert_end - args.expert_start
         d, h = args.hidden_size, args.moe_intermediate_size
         linear = (
-            NVFP4SwitchLinear
+            partial(
+                QuantizedSwitchLinear, bias=False, group_size=16, bits=4, mode="nvfp4"
+            )
             if args.nvfp4
-            else lambda i, o, n: SwitchLinear(i, o, n, bias=False)
+            else partial(SwitchLinear, bias=False)
         )
         self.w1 = linear(d, h, n)
         self.w3 = linear(d, h, n)
@@ -369,7 +352,7 @@ class MoE(nn.Module):
             ..., : a.num_experts_per_tok
         ]
         # Ascending expert order matches the reference scatter accumulation.
-        inds = mx.sort(inds, axis=-1)
+        inds = mx.stop_gradient(mx.sort(inds, axis=-1))
         weights = mx.take_along_axis(scores, inds, axis=-1)
         weights = (
             weights

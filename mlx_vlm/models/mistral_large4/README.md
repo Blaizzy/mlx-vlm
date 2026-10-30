@@ -7,7 +7,9 @@ indexers, NoPE layers, LeRoPE, SSMax, and logit softcapping. Vision uses the
 existing Pixtral encoder and Mistral projector.
 
 Expert weights keep their original packed NVFP4 values, E4M3 block scales, and
-FP32 global scales. Dense FP8 weights are expanded to BF16 at load time.
+FP32 global scales. Dense FP8 weights are expanded to BF16 at load time by the shared quantization
+converter. Like MiniMax, the model uses the standard `load_model` pipeline,
+model sanitization, and shared scaled NVFP4 expert layers.
 The expert partition is `N * rank // size : N * (rank + 1) // size`, allowing
 128 experts to be split across three devices as 42/43/43. Dense layers and the
 vision encoder are replicated. Following the MiniMax distributed implementation,
@@ -59,8 +61,8 @@ Use a separate destination from the original snapshot. Each destination needs
 about 217–222 GB plus 10 GiB of free space. The script copies only the assigned
 experts, replicates dense and vision weights, and omits optional MTP draft weights.
 It preserves tensor bytes, rewriting unsupported FP8 header types as U8 for
-explicit decoding by the native loader. `rank.json` records the partition.
-The loader rejects a rank mismatch. Stop the temporary HTTP server after staging;
+decoding by the shared loader. `rank.json` records the partition.
+`model.shard(group)` rejects a partition that does not match the rank. Stop the temporary HTTP server after staging;
 it is intended for a trusted private link.
 
 ## Run
@@ -83,11 +85,25 @@ IDs. Each rank writes its own JSON to its local output directory. Decode timing
 excludes prefill and the first generated token. Image encoding is excluded from
 prefill timing.
 
-The native loader is also available as
-`load_native(path, group=mx.distributed.init(backend="jaccl", strict=True))`.
-`mlx_vlm.utils.load_model(path, expert_group=group)` detects the native
-`params.json` format. A full checkpoint can be partitioned while loading, but
-staging avoids keeping the entire 610 GB checkpoint on every machine.
+The example uses the same loading and sharding interface as MiniMax:
+
+```python
+from pathlib import Path
+
+import mlx.core as mx
+from mlx_vlm.utils import load_model
+
+group = mx.distributed.init(backend="jaccl", strict=True)
+model = load_model(Path("/path/to/model"), lazy=True)
+model.shard(group)
+mx.eval(model.parameters())
+```
+
+`load_config` recognizes native `params.json` and reads the expert range from
+`rank.json` when staged. The common loader handles quantization conversion and
+strict weight loading; the model sanitizer maps names and stacks experts.
+A full checkpoint can also be sharded after lazy loading, but staging avoids
+keeping the entire 610 GB checkpoint on every machine.
 
 ## Validation and limits
 
@@ -117,7 +133,7 @@ cache retains compressed KV, but attention currently expands historical KV and
 builds dense selection masks. Long-context performance needs further work.
 FP8 KV/indexer activation quantization, DSpark/MTP speculative decoding,
 continuous batching, and padded variable-length batches are not implemented or
-validated here. The native loader currently supports the released NVFP4 variant.
+validated here. Native-format loading supports the released NVFP4 variant.
 
 ### MLX main comparison
 
@@ -144,15 +160,21 @@ The same checkpoint also ran successfully on two of the 512 GiB M3 Ultra Macs
 over TB5 RDMA, using the same MLX `main` build. Use a two-host JACCL hostfile
 and stage with `SIZE=2`, assigning ranks 0 and 1. This gives 64 experts per Mac
 and requires about 316.4 GB of checkpoint storage per device. Stage into new
-directories; the loader checks that the checkpoint partition matches the group.
+directories; `model.shard(group)` checks that the partition matches the group.
 
 | Request | Two-Mac decode tokens/s | Three-Mac decode tokens/s | Two-Mac peak memory/device |
 | --- | ---: | ---: | ---: |
-| Text | 9.43 | 9.31 | 333.3 GB |
-| Image | 9.17 | 9.27 | 333.6 GB |
+| Text | 9.44 | 9.31 | 334.4 GB |
+| Image | 9.14 | 9.27 | 334.1 GB |
 
-Both outputs matched the three-Mac token sequences exactly. The small two-rank
-model also matched unsharded logits exactly. Text prefill took 3.11 seconds
-versus 2.04 seconds on three Macs; image prefill took 3.78 versus 2.93 seconds.
+The two-Mac results above use the shared loader and shared NVFP4 expert layers.
+Both outputs matched the previous two- and three-Mac token sequences exactly. The small two-rank
+model also matched unsharded logits exactly. Text prefill took 3.12 seconds
+versus 2.04 seconds on three Macs; image prefill took 3.76 versus 2.93 seconds.
 These single short-request measurements show comparable decode speed with more
 memory per device and slower prefill; long-context behavior remains unvalidated.
+
+The shared-loader refactor passed 677 local checks covering Mistral loading,
+cache behavior, native expert partitions, sanitizer idempotence, save/reload,
+MiniMax, shared quantization operations, and sampling defaults. CI now includes
+the Mistral test file and its cache contract.

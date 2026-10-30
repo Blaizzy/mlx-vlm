@@ -138,5 +138,6 @@ def config_from_params(params):
         image_token_index=vision["image_token_id"],
         spatial_merge_size=vision["spatial_merge_size"],
         multimodal_projector_bias=vision["adapter_bias"],
+        quantization_config=q,
         eos_token_id=2,
     )

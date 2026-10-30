@@ -129,6 +129,7 @@ jobs:
               tests/test_gated_delta.py
               tests/test_inkling_kernel_gates.py
               tests/test_models.py
+              tests/test_mistral_large4.py
               tests/test_muse_spark.py
               tests/test_muse_spark_kernels.py
               tests/test_oxr.py

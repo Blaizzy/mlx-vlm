@@ -15,7 +15,7 @@ from mlx_lm.generate import wired_limit
 from PIL import Image
 from transformers import AutoProcessor
 
-from mlx_vlm.models.mistral_large4.checkpoint import load_native
+from mlx_vlm.utils import load_model
 
 
 def generate(model, processor, group, args):
@@ -125,7 +125,9 @@ def main():
         parser.error("--max-tokens must be positive")
     group = mx.distributed.init(backend=args.backend, strict=True)
     mx.set_cache_limit(512 * 1024**2)
-    model = load_native(args.model, group=group)
+    model = load_model(args.model, lazy=True)
+    model.shard(group)
+    mx.eval(model.parameters())
     processor = AutoProcessor.from_pretrained(args.model)
     # Match the normal MLX generation path and the MiniMax distributed runner.
     # Without a wired working set, large models incur substantial residency costs.

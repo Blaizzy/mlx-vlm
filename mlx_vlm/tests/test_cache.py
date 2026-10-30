@@ -68,6 +68,7 @@ from mlx_vlm.models.minimax_m3_vl.language import (
     MiniMaxM3BatchKVCache,
     MiniMaxM3KVCache,
 )
+from mlx_vlm.models.mistral_large4.language import LatentCache
 from mlx_vlm.models.qwen4_exp.language import (
     BatchQSAKVCache,
     QSAKVCache,
@@ -1807,6 +1808,7 @@ def sample(name, length=0):
         ),
         "ChunkedKVCache": lambda: C.ChunkedKVCache(8),
         "DeepseekV41Cache": lambda: DeepseekV41Cache(1),
+        "LatentCache": LatentCache,
         "PoolingCache": lambda: C.PoolingCache(2),
         "RingSlidingKVCache": lambda: RingSlidingKVCache(max(16, length)),
         "RotatingKVCache": lambda: C.RotatingKVCache(max(16, length * 2)),
@@ -1834,6 +1836,10 @@ def sample(name, length=0):
         cache.offset = length
         cache.cum_eKV, cache.cum_eK = mx.ones((1, 4)), mx.ones((1, 4)) * 2
         cache.win_eKV, cache.win_eK = mx.ones((1, 3, 4)) * 3, mx.ones((1, 3, 4)) * 4
+    elif name == "LatentCache":
+        cache.update_latent(keys, keys * 2)
+        cache.update_index(keys[:, 0] * 3)
+        cache.offset = length
     elif name in ("SimpleKVCache", "MiniMaxM3KVCache"):
         cache.update_and_fetch(keys, keys * 2)
         if name == "MiniMaxM3KVCache":
