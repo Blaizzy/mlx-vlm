@@ -356,6 +356,218 @@ def test_mtp_generation(family, failure, monkeypatch):
     assert drafter._round_appended == 0
 
 
+class ScriptedMTPDrafter:
+    """Proposes each row's next tokens of a known reply.
+
+    ``wrong`` replaces the draft at a reply position, so rounds mix accepted
+    drafts, drafts the target rejects and drafts the grammar rejects.
+    """
+
+    prefer_requested_block_size = True
+
+    def __init__(self, replies, wrong):
+        self.config = NS(block_size=4)
+        self.accept_lens, self.draft_lens = [], []
+        self.replies, self.wrong, self.prompt_lens = replies, wrong, None
+
+    def reset(self, model, left_padding=None):
+        self.prompt_lens = None
+        return []
+
+    def set_shared_kv(self, shared_kv, kv_offset, position=None, **kwargs):
+        valid = kwargs.get("kv_valid_len")
+        valid = kv_offset if valid is None else valid
+        self.valid = [int(v) for v in mx.array(valid).reshape(-1).tolist()]
+        self.prompt_lens = self.prompt_lens or list(self.valid)
+
+    def draft_block(
+        self, bonus, hidden, cache, block_size, sampler, token_dtype, **kwargs
+    ):
+        rows = []
+        for reply, valid, prompt_len in zip(self.replies, self.valid, self.prompt_lens):
+            start = valid - prompt_len + 1  # reply position of the first draft
+            rows.append(
+                [
+                    self.wrong.get(i, reply[i] if i < len(reply) else 0)
+                    for i in range(start, start + block_size - 1)
+                ]
+            )
+        return mx.array(rows, dtype=token_dtype)
+
+
+GRAMMAR = "(?:[!-%][&-*]){6}"  # tokens 0-4 and 5-9 alternate, then EOS (31)
+
+
+@parametrize("sampling", ["greedy", "positioned", "rng"])
+def test_mtp_generation_under_grammar(sampling):
+    from mlx_vlm.tests.test_generate import regex_processor
+
+    mx.random.seed(2127)
+    model, _ = language("qwen", inference=True)
+    model.eval()
+    prompt = mx.array([[1, 2, 3]])
+    sampler = {
+        "greedy": greedy,
+        "positioned": module("generate.ar")._PositionedTargetSampler(
+            temperature=0.8, top_p=1.0, seed=5
+        ),
+        "rng": module("sample_utils").make_sampler(temp=0.8),
+    }[sampling]
+
+    def pick(logits, position):
+        if sampling == "greedy":
+            return greedy(logits).item()
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        if sampling == "rng":
+            return sampler(logprobs).item()
+        return sampler.sample_target(logprobs, row_ids=[0], positions=[position]).item()
+
+    def first_step(processor, cache, **kwargs):
+        mx.random.seed(5)
+        out = model(prompt, cache=cache, **kwargs)
+        return out, pick(processor(prompt[0], out.logits[:, -1]), 0)
+
+    # Constrained decoding without a drafter.
+    processor, cache = regex_processor(GRAMMAR), model.make_cache()
+    _, token = first_step(processor, cache)
+    expected = [token]
+    while len(expected) < 16:
+        logits = model(mx.array([[token]]), cache=cache).logits[:, -1]
+        token = pick(processor(mx.array(expected), logits), len(expected))
+        expected.append(token)
+    assert expected[12:] == [31] * 4
+
+    processor, cache = regex_processor(GRAMMAR), model.make_cache()
+    out, first = first_step(processor, cache, return_hidden=True, return_shared_kv=True)
+    # 20 is outside the grammar; the other wrong drafts follow it.
+    wrong = {2: 20, 5: 5 if expected[5] != 5 else 6, 9: 20, 11: 0}
+    drafter = ScriptedMTPDrafter([expected], wrong)
+    rounds = mtp._mtp_rounds(
+        model,
+        drafter,
+        cache,
+        out.hidden_states[-1],
+        {},
+        prompt_tokens=prompt,
+        first_bonus=first,
+        max_tokens=16,
+        sampler=sampler,
+        draft_block_size=4,
+        greedy_sampling=sampling == "greedy",
+        constraint=processor,
+    )
+    assert [first] + [token for token, _ in rounds] == expected
+    assert drafter.accept_lens[:3] == [1, 2, 3] and drafter.draft_lens[0] == 3
+    assert processor.ll_matchers[0].is_accepting()
+
+
+def test_mtp_batch_under_grammar_matches_batch_without_drafter():
+    from mlx_vlm.tests.test_generate import regex_processor
+
+    mx.random.seed(2127)
+    model, _ = language("qwen", inference=True)
+    model.eval()
+    prompts = [[1, 2, 3], [4, 5, 6]]
+
+    def run(draft_model=None, processors=None):
+        prompt = mx.array(prompts)
+        processing = module("generate.ar").PromptProcessingBatch(
+            model=model,
+            uids=[0, 1],
+            input_ids=prompts,
+            max_tokens=[13, 13],
+            inputs_embeds=model.model.embed_tokens(prompt),
+            prompt_kwargs={},
+            logits_processors=processors,
+            prefill_step_size=None,
+            draft_model=draft_model,
+            draft_kind="mtp" if draft_model is not None else None,
+            draft_block_size=4,
+            greedy_sampling=True,
+        )
+        batch = processing.generate(greedy, lambda token: False, compute_logprobs=False)
+        tokens = {0: [], 1: []}
+        while len(batch):
+            for response in batch.next():
+                if response.token is not None:
+                    tokens[response.uid].append(response.token)
+        return [tokens[0], tokens[1]]
+
+    # Row 0 follows the grammar, row 1 is unconstrained.
+    expected = run(processors=[[regex_processor(GRAMMAR)], None])
+    assert expected[0][-1] == 31 and expected[0] != expected[1]
+    drafter = ScriptedMTPDrafter(expected, {2: 20, 5: 20})
+    processor = regex_processor(GRAMMAR)
+    assert run(drafter, [[processor], None]) == expected
+    assert any(0 < accepted < 3 for accepted in drafter.accept_lens)
+    assert processor.ll_matchers[0].is_accepting()
+
+
+@parametrize("temperature,seed", [(0, None), (0.8, 3), (0.8, None)])
+def test_generate_step_with_drafter_follows_grammar(temperature, seed):
+    from mlx_vlm.tests.test_generate import regex_processor
+
+    mx.random.seed(2127)
+    model, config = language("qwen", inference=True)
+    drafter = mtp_drafter("qwen", config)
+    model.eval()
+    drafter.eval()
+
+    def embeddings(input_ids, pixel_values=None, mask=None, **kwargs):
+        positions, deltas = model.get_rope_index(input_ids, attention_mask=mask)
+        return InputEmbeddingsFeatures(
+            inputs_embeds=model.model.embed_tokens(input_ids),
+            position_ids=positions,
+            rope_deltas=deltas,
+        )
+
+    target = NS(language_model=model, get_input_embeddings=embeddings, config=NS())
+
+    def run(**options):
+        mx.random.seed(47)  # without a seed, sampling draws from MLX's RNG
+        return [
+            int(token)
+            for token, _ in generate_step(
+                mx.array([[1, 2, 3, 4]]),
+                target,
+                None,
+                None,
+                max_tokens=13,
+                temperature=temperature,
+                seed=seed,
+                prefill_step_size=None,
+                logits_processors=[regex_processor(GRAMMAR)],
+                **options,
+            )
+        ]
+
+    expected = run()
+    assert expected[-1] == 31
+    assert run(draft_model=drafter, draft_kind="mtp", draft_block_size=4) == expected
+    assert drafter.draft_lens
+
+
+def test_structured_speculation_requires_mtp():
+    from mlx_vlm.tests.test_generate import regex_processor
+
+    constraint = [regex_processor(GRAMMAR)]
+    with pytest.raises(ValueError, match="requires an MTP drafter"):
+        next(
+            speculative.run_speculative_server_rounds(
+                None,
+                NS(),
+                [],
+                None,
+                draft_kind="dflash",
+                first_bonus=mx.array([1]),
+                max_tokens=4,
+                sampler=greedy,
+                logits_processors=[constraint],
+            )
+        )
+    assert speculative._speculative_constraints("mtp", [[lambda t, x: x]]) is None
+
+
 @parametrize("family", ["qwen", "glm", "deepseek"])
 @parametrize("batch", [1, 2, 4])
 @parametrize("dtype", [mx.float32, mx.bfloat16])

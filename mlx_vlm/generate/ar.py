@@ -260,7 +260,8 @@ def generate_step(
           is supported via the same ``get_input_embeddings`` path the normal
           decoder uses; decode itself is text-only. ``temperature`` and
           ``sampler`` are respected; ``logprobs`` is always ``None`` on the
-          speculative path.
+          speculative path. A structured-output processor in
+          ``logits_processors`` masks every verify position of an MTP drafter.
         draft_block_size (int, optional): Override the drafter's configured
           block size.
 
@@ -534,6 +535,7 @@ def generate_step(
             sampler=sampler,
             draft_block_size=draft_block_size,
             sampler_is_greedy=sampler_is_greedy,
+            logits_processors=logits_processors,
         )
         return
 
@@ -1555,6 +1557,7 @@ class SpeculativeGenerationBatch:
         draft_block_size: Optional[int] = None,
         token_dtype: mx.Dtype = mx.int32,
         greedy_sampling: bool = False,
+        logits_processors: Optional[List[Any]] = None,
     ):
         self.model = model
         self.draft_model = draft_model
@@ -1572,6 +1575,8 @@ class SpeculativeGenerationBatch:
         self.draft_block_size = draft_block_size
         self.token_dtype = token_dtype
         self.greedy_sampling = greedy_sampling
+        # Per-row processors: structured-output ones mask the verify blocks.
+        self.logits_processors = list(logits_processors or [])
         self._num_tokens = [0] * len(uids)
         self._finished = [False] * len(uids)
         self._sent_first = False
@@ -1598,6 +1603,7 @@ class SpeculativeGenerationBatch:
         self.hidden = None
         self.shared_kv_states = None
         self.prompt_tokens = None
+        self.logits_processors = []
         mx.clear_cache()
 
     def extend(self, other: "SpeculativeGenerationBatch"):
@@ -1673,6 +1679,7 @@ class SpeculativeGenerationBatch:
             eos_token_ids=None,
             prompt_tokens=self.prompt_tokens,
             row_ids=[0] * len(self._all_uids),
+            logits_processors=self.logits_processors,
         )
 
     def next(self) -> List[GenerationBatch.Response]:
@@ -2321,6 +2328,7 @@ class PromptProcessingBatch:
                 draft_block_size=self.draft_block_size,
                 token_dtype=self._input_ids.dtype,
                 greedy_sampling=self.greedy_sampling,
+                logits_processors=list(self.logits_processors),
             )
             compute_logprobs = False
         else:

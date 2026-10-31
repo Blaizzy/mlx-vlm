@@ -3,6 +3,7 @@ from typing import Any, Callable, Generator, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..structured import speculative_constraint
 from .common import (
     _dflash_block_total,
     _format_speculative_stats,
@@ -71,6 +72,22 @@ __all__ = [
 
 def format_speculative_stats(draft_model: nn.Module) -> Optional[str]:
     return _format_speculative_stats(draft_model)
+
+
+def _speculative_constraints(
+    draft_kind: str, logits_processors: Optional[List[Any]]
+) -> Optional[List[Any]]:
+    """Each row's structured-output processor, or None when no row has one."""
+    constraints = [
+        speculative_constraint(processors) for processors in logits_processors or []
+    ]
+    if not any(constraint is not None for constraint in constraints):
+        return None
+    if draft_kind != "mtp":
+        raise ValueError(
+            "Structured output with speculative decoding requires an MTP drafter."
+        )
+    return constraints
 
 
 def _validate_speculative_sampling(draft_model: nn.Module, greedy: bool) -> None:
@@ -184,9 +201,11 @@ def run_speculative_server_rounds(
     eos_token_ids: Optional[set] = None,
     prompt_tokens: Optional[mx.array] = None,
     row_ids: Optional[List[int]] = None,
+    logits_processors: Optional[List[Any]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     batch_size = int(first_bonus.shape[0]) if first_bonus.ndim > 0 else 1
     _validate_speculative_sampling(draft_model, greedy_sampling)
+    constraints = _speculative_constraints(draft_kind, logits_processors)
 
     if draft_kind == "eagle3":
         if batch_size == 1:
@@ -242,6 +261,7 @@ def run_speculative_server_rounds(
             eos_token_ids=eos_token_ids,
             greedy_sampling=greedy_sampling,
             row_ids=row_ids,
+            constraints=constraints,
         )
         return
 
@@ -299,9 +319,18 @@ def run_speculative_rounds(
     sampler: Callable[[mx.array], mx.array],
     draft_block_size: Optional[int] = None,
     sampler_is_greedy: bool = False,
+    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
 ) -> Generator[Tuple[Any, mx.array], None, None]:
     B = input_ids.shape[0]
     _validate_speculative_sampling(draft_model, sampler_is_greedy)
+    # One processor list serves the whole prompt batch here; a structured
+    # processor tracks one sequence under speculation.
+    constraints = _speculative_constraints(draft_kind, [logits_processors])
+    if constraints is not None and B != 1:
+        raise ValueError(
+            "Structured output with speculative decoding takes one prompt per "
+            "generate call; use the batch generator for several."
+        )
 
     if draft_kind == "mtp":
         shared_kv_states = last_outputs.shared_kv_states
@@ -324,6 +353,7 @@ def run_speculative_rounds(
                 draft_block_size=draft_block_size,
                 token_dtype=input_ids.dtype,
                 greedy_sampling=sampler_is_greedy,
+                constraint=constraints[0] if constraints is not None else None,
             )
         else:
             mx.eval(first_token)

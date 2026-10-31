@@ -4848,6 +4848,25 @@ class TestResponseGenerator:
         assert gen.requests.empty()
         image_hash.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "draft_kind,structured,admitted",
+        [("mtp", True, True), ("dflash", True, False), ("mtp", False, False)],
+    )
+    def test_structured_requests_with_drafter(self, draft_kind, structured, admitted):
+        from mlx_vlm.tests.test_generate import regex_processor
+
+        gen = _ready_generator(draft_model=object(), draft_kind=draft_kind)
+        gen._preprocess_request = MagicMock(side_effect=RuntimeError("admitted"))
+        processor = regex_processor("[!-%]") if structured else (lambda t, x: x)
+        args = Args(max_tokens=4, logits_processors=[processor])
+        if admitted:
+            with pytest.raises(RuntimeError, match="admitted"):
+                gen.generate("prompt", args=args)
+        else:
+            with pytest.raises(ValueError, match="requires an MTP drafter"):
+                gen.generate("prompt", args=args)
+            gen._preprocess_request.assert_not_called()
+
     def test_tokenizer_and_budget_criteria_share_lock(self):
         gen = _ready_generator(_tokenizer_lock=Lock())
         lock, active, maximum = Lock(), 0, 0

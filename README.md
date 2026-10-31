@@ -1342,7 +1342,9 @@ Structured outputs are also supported with:
 - The responses API via `text.format` on `/v1/responses`
 - Text-only requests using the same `response_format` shape
 
-Structured outputs are not currently supported with speculative decoding.
+With an MTP drafter, structured requests keep speculative decoding: the schema's
+grammar masks every verified position. Other drafter kinds reject
+`response_format`.
 
 #### How It Works
 
