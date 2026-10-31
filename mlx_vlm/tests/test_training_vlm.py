@@ -6,8 +6,10 @@ from types import SimpleNamespace
 import mlx.core as mx
 import numpy as np
 
+from mlx_vlm.models import glm_ocr
 from mlx_vlm.trainer.vlm.dpo.trainer import make_task
 from mlx_vlm.trainer.vlm.sft.runtime import collate_vlm_batch, forward_vlm_logits
+from mlx_vlm.trainer.vlm.sft.trainer import vision_language_loss_fn
 
 
 class VLMBatchingTest(unittest.TestCase):
@@ -96,6 +98,57 @@ class VLMBatchingTest(unittest.TestCase):
         self.assertIs(model.inputs[1], batch["pixel_values"])
         self.assertIsNone(model.inputs[2])
         self.assertEqual(set(model.inputs[3]), {"image_grid_thw"})
+
+    def _tiny_glm_ocr(self):
+        mx.random.seed(0)
+        text = glm_ocr.TextConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            rope_parameters={
+                "rope_type": "default",
+                "mrope_section": [1, 1, 2],
+                "partial_rotary_factor": 1.0,
+                "rope_theta": 10000.0,
+            },
+        )
+        vision = glm_ocr.VisionConfig(
+            depth=1, hidden_size=16, intermediate_size=32, num_heads=2
+        )
+        model = glm_ocr.Model(
+            glm_ocr.ModelConfig(text_config=text, vision_config=vision)
+        )
+        model.eval()
+        return model
+
+    def test_glm_ocr_logits_ignore_later_tokens_under_padding_mask(self):
+        model = self._tiny_glm_ocr()
+        ids = mx.array([[1, 2, 3, 4, 5, 6]])
+        changed = mx.array([[1, 2, 3, 9, 8, 7]])
+        mask = mx.ones_like(ids)
+        before = forward_vlm_logits(model, ids, mask, {"pixel_values": None})
+        after = forward_vlm_logits(model, changed, mask, {"pixel_values": None})
+        self.assertTrue(mx.allclose(before[:, :3], after[:, :3], atol=1e-4).item())
+
+    def test_glm_ocr_sft_loss_ignores_later_tokens(self):
+        model = self._tiny_glm_ocr()
+
+        def loss(ids):
+            batch = {
+                "input_ids": ids,
+                "attention_mask": mx.ones_like(ids),
+                "completion_mask": mx.array([[0, 1, 0, 0, 0, 0]]),
+                "pixel_values": None,
+            }
+            return vision_language_loss_fn(model, batch, train_on_completions=True)[0]
+
+        first = loss(mx.array([[1, 2, 3, 4, 5, 6]]))
+        second = loss(mx.array([[1, 2, 9, 8, 7, 3]]))
+        self.assertTrue(mx.allclose(first, second, atol=1e-4).item())
 
 
 class DPOReferenceTest(unittest.TestCase):

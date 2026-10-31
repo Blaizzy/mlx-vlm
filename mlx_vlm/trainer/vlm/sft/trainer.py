@@ -22,7 +22,7 @@ from ...common.metrics import (
 )
 from ...core import Colors, TrainingArgs, grad_checkpoint, save_adapter
 from ...losses.cross_entropy import cross_entropy
-from .runtime import vlm_batch_metrics, vlm_vision_mask
+from .runtime import CAUSAL_MASK_MODEL_TYPES, vlm_batch_metrics, vlm_vision_mask
 
 
 def _squeeze_leading_batch_dim(value):
@@ -129,7 +129,7 @@ def vision_language_loss_fn(
     }
 
     model_attention_mask = (
-        None if _model_type(model) == "gemma4_unified" else attention_mask
+        None if _model_type(model) in CAUSAL_MASK_MODEL_TYPES else attention_mask
     )
     outputs = model(input_ids, pixel_values, model_attention_mask, **kwargs)
     logits = outputs.logits.astype(mx.float32)
