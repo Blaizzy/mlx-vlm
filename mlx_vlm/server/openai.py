@@ -4,16 +4,19 @@ import binascii
 import gc
 import json
 import logging
+import math
+import os
 import random
 import time
 import uuid
-from contextlib import aclosing
+from contextlib import aclosing, suppress
 from datetime import datetime
 from functools import partial
 from io import BytesIO
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
+import anyio
 import mlx.core as mx
 from fastapi import HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -110,6 +113,37 @@ _AUDIO_REFERENCE_SUFFIXES = (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".
 _MISSING_INPUT_DETAIL = (
     "Request must include at least one non-empty message content or media input."
 )
+
+
+async def _with_keepalives(source):
+    """Send idle SSE comments while keeping the same pending producer read."""
+    interval = float(os.environ.get("MLX_VLM_STREAM_KEEPALIVE_INTERVAL", "15"))
+    if not math.isfinite(interval) or interval < 0:
+        raise ValueError("MLX_VLM_STREAM_KEEPALIVE_INTERVAL must be finite and >= 0")
+    pending = None
+    try:
+        while True:
+            if pending is None:
+                pending = asyncio.create_task(anext(source))
+            ready, _ = await asyncio.wait({pending}, timeout=interval or None)
+            if not ready:
+                yield ": keepalive\n\n"
+                continue
+            task, pending = pending, None
+            try:
+                yield task.result()
+            except StopAsyncIteration:
+                break
+    finally:
+        # Let the existing stream cleanup run even in Starlette's cancel scope.
+        with anyio.CancelScope(shield=True):
+            try:
+                if pending is not None:
+                    pending.cancel()
+                    with suppress(asyncio.CancelledError, StopAsyncIteration):
+                        await pending
+            finally:
+                await source.aclose()
 
 
 def _has_non_empty_text(value: Any) -> bool:
@@ -1731,7 +1765,7 @@ async def responses_endpoint(request: Request):
                     logger.debug("Responses stream closed.")
 
             return StreamingResponse(
-                stream_generator(),
+                _with_keepalives(stream_generator()),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -2583,7 +2617,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     logger.debug("Chat completion stream closed.")
 
             return StreamingResponse(
-                stream_generator(),
+                _with_keepalives(stream_generator()),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
