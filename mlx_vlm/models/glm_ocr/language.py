@@ -526,12 +526,13 @@ class LanguageModel(nn.Module):
                     position_ids, (3, batch_size, seq_length)
                 )
 
+        # Like GLM-4V, the decoder builds its own causal mask; `mask` (the
+        # trainer's [B, T] padding mask) only feeds the RoPE index above.
         out = self.model(
             inputs,
             cache=cache,
             inputs_embeds=inputs_embeds,
             position_ids=position_ids,
-            mask=mask,
         )
 
         out = self.lm_head(out)
