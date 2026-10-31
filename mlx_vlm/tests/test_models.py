@@ -1495,6 +1495,184 @@ def test_model_contract(case):
         getattr(checks, kind)(*args, **kwargs)
 
 
+@pytest.fixture
+def mistral_large4_case():
+    case = model_case("mistral_large4")
+    module = importlib.import_module("mlx_vlm.models." + case["module"])
+    return module, build_config(module, case["config"])
+
+
+def test_mistral_large4_partitions_allow_three_ranks_and_reject_wrong_shards(
+    mistral_large4_case,
+):
+    module, config = mistral_large4_case
+    model = module.LanguageModel(config.text_config)
+    original = model.layers[1].feed_forward.experts.w1.weight
+    model.shard(SimpleNamespace(rank=lambda: 1, size=lambda: 3))
+    moe = model.layers[1].feed_forward
+    assert (moe.start, moe.end) == (2, 5)
+    np.testing.assert_array_equal(
+        np.array(moe.experts.w1.weight), np.array(original[2:5])
+    )
+    with pytest.raises(ValueError, match="partition"):
+        model.shard(SimpleNamespace(rank=lambda: 2, size=lambda: 3))
+
+
+@pytest.mark.parametrize(
+    "source, message", [(0, "rotary layout"), (8, "Invalid KV source")]
+)
+def test_mistral_large4_invalid_kv_sharing_fails_at_configuration(
+    mistral_large4_case, source, message
+):
+    module, config = mistral_large4_case
+    fields = asdict(config.text_config)
+    fields["kv_source_layers"][-1] = source
+    with pytest.raises(ValueError, match=message):
+        module.TextConfig.from_dict(fields)
+
+
+def test_mistral_large4_shared_loader_native_weights_and_roundtrip(
+    tmp_path, mistral_large4_case
+):
+    from mlx_vlm.quantization.nvfp4 import ScaledQuantizedSwitchLinear
+
+    mx.random.seed(31)
+    module, args = mistral_large4_case
+    reference = module.Model(args)
+    native = {}
+    direct = {
+        "language_model.model.embed_tokens.weight": "tok_embeddings.weight",
+        "language_model.model.norm.weight": "norm.weight",
+        "language_model.model.rotary_emb.alpha": "lerope.alpha",
+        "language_model.lm_head.weight": "output.weight",
+        "multi_modal_projector.norm.weight": "pre_mm_projector_norm.weight",
+        "multi_modal_projector.patch_merger.merging_layer.weight": "patch_merger.merging_layer.weight",
+        "multi_modal_projector.linear_1.weight": "vision_language_adapter.w_in.weight",
+        "multi_modal_projector.linear_2.weight": "vision_language_adapter.w_out.weight",
+    }
+    expected = {}
+    for key, value in tree_flatten(reference.parameters()):
+        name = direct.get(key, key)
+        if key.startswith("language_model.model.layers."):
+            name = key.removeprefix("language_model.model.")
+            if not name.startswith("layers.0."):
+                name = name.replace(".feed_forward.", ".")
+        elif key.startswith("vision_tower.vision_model."):
+            name = key.replace("vision_tower.vision_model.", "vision_encoder.")
+            for dest, source in (
+                ("q_proj", "wq"),
+                ("k_proj", "wk"),
+                ("v_proj", "wv"),
+                ("o_proj", "wo"),
+                ("gate_proj", "w1"),
+                ("down_proj", "w2"),
+                ("up_proj", "w3"),
+            ):
+                name = name.replace(f".{dest}.", f".{source}.")
+        value = value.astype(mx.bfloat16)
+        if ".experts." in key:
+            prefix, projection = name.split(".experts.")
+            decoded = []
+            for expert in range(args.text_config.n_routed_experts):
+                global_scale = float(expert + 1)
+                packed, scales = mx.quantize(
+                    value[expert] / (expert + 1), group_size=16, bits=4, mode="nvfp4"
+                )
+                base = f"{prefix}.experts.{expert}.{projection.removesuffix('.weight')}"
+                native[f"{base}.weight"] = packed.view(mx.uint8)
+                native[f"{base}.weight_scale"] = scales
+                native[f"{base}.weight_scale_2"] = mx.array([global_scale])
+                native[f"{base}.input_scale"] = mx.array(1.0)
+                decoded.append(
+                    (
+                        mx.dequantize(
+                            packed, scales, group_size=16, bits=4, mode="nvfp4"
+                        )
+                        * (expert + 1)
+                    ).astype(mx.bfloat16)
+                )
+            expected[key] = mx.stack(decoded)
+        else:
+            if name.endswith(".wq.weight"):
+                # Per-tensor FP8 alongside NVFP4 routed experts.
+                scale = mx.array(0.5, mx.float32)
+                packed = mx.to_fp8(value.astype(mx.float32) / scale)
+                native[name] = packed
+                native[name.removesuffix(".weight") + ".weight_scale"] = scale
+                value = (mx.from_fp8(packed, dtype=mx.float32) * scale).astype(
+                    mx.bfloat16
+                )
+            else:
+                native[name] = (
+                    value.transpose(0, 3, 1, 2)
+                    if name.endswith("patch_conv.weight")
+                    else value
+                )
+            expected[key] = value
+    native["mtp.extra.weight"] = mx.ones((2, 2))
+    reference.load_weights(list(expected.items()))
+    reference.eval()
+    config = asdict(args)
+    config["text_config"]["nvfp4"] = True
+    config["quantization_config"] = {
+        "quant_method": "modelopt",
+        "quant_algo": "MIXED_PRECISION",
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), native)
+    model = load_model(tmp_path)
+    assert isinstance(
+        model.language_model.layers[1].feed_forward.experts.w1,
+        ScaledQuantizedSwitchLinear,
+    )
+    ids = mx.array([[1, 2, 3, 4]])
+    actual = model(ids).logits
+    np.testing.assert_allclose(
+        np.array(actual.astype(mx.float32)),
+        np.array(reference(ids).logits.astype(mx.float32)),
+        atol=0.06,
+        rtol=0.06,
+    )
+    cache = model.language_model.make_cache()
+    cached = mx.concatenate(
+        [model(ids[:, :2], cache=cache).logits, model(ids[:, 2:], cache=cache).logits],
+        axis=1,
+    )
+    np.testing.assert_allclose(
+        np.array(cached.astype(mx.float32)),
+        np.array(actual.astype(mx.float32)),
+        atol=0.06,
+        rtol=0.06,
+    )
+    saved = dict(tree_flatten(model.parameters()))
+    sanitized = model.sanitize(dict(saved))
+    assert saved.keys() == sanitized.keys()
+    for key in saved:
+        assert sanitized[key].dtype == saved[key].dtype, key
+        assert mx.array_equal(sanitized[key], saved[key]).item(), key
+    # Native staging uses global expert IDs, including nonzero starting ranks.
+    config["text_config"].update(expert_start=2, expert_end=5)
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    partition = load_model(tmp_path)
+    for key, value in tree_flatten(partition.parameters()):
+        if ".experts." in key:
+            assert value.dtype == saved[key].dtype, key
+            assert mx.array_equal(value, saved[key][2:5]).item(), key
+    config["text_config"].update(expert_start=0, expert_end=8)
+    config["quantization_config"] = config["quantization"] = {
+        "group_size": 16,
+        "bits": 4,
+        "mode": "nvfp4",
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), saved)
+    restored = load_model(tmp_path)
+    np.testing.assert_array_equal(
+        np.array(restored(ids).logits.astype(mx.float32)),
+        np.array(actual.astype(mx.float32)),
+    )
+
+
 def test_nemotron_parse_source_architecture_and_tied_head_mapping():
     config = {
         "model_type": "nemotron_parse",

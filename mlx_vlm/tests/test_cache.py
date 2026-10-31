@@ -68,6 +68,7 @@ from mlx_vlm.models.minimax_m3_vl.language import (
     MiniMaxM3BatchKVCache,
     MiniMaxM3KVCache,
 )
+from mlx_vlm.models.mistral_large4.language import LatentCache
 from mlx_vlm.models.qwen4_exp.language import (
     BatchQSAKVCache,
     QSAKVCache,
@@ -76,7 +77,7 @@ from mlx_vlm.models.qwen4_exp.language import (
 )
 from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
 from mlx_vlm.models.z1t.language import AFTConv, Z1TCache
-from mlx_vlm.tests.test_models import DATA, build_config
+from mlx_vlm.tests.test_models import DATA, build_config, model_case
 from mlx_vlm.turboquant import (
     BatchTurboQuantKVCache,
     TurboQuantKVCache,
@@ -201,6 +202,134 @@ def test_arrays_cache_advance_matches_decremented_values():
 
     cache.finalize()
     assert cache.left_padding is None and cache.lengths is None
+
+
+@pytest.fixture
+def mistral_large4_language():
+    from mlx_vlm.models import mistral_large4
+
+    fields = model_case("mistral_large4")["config"]["text_config"]
+    config = build_config(mistral_large4, fields, "TextConfig")
+    mx.random.seed(17)
+    model = mistral_large4.LanguageModel(config)
+    model.eval()
+    return model
+
+
+@pytest.mark.parametrize(
+    "chunks",
+    [((0, 3), (3, 5), (5, 7)), tuple((i, i + 1) for i in range(7))],
+)
+@pytest.mark.parametrize("mask_ndim", [None, 2, 4])
+def test_mistral_large4_cached_dsa_and_shared_kv_match_full_sequence(
+    mistral_large4_language, chunks, mask_ndim
+):
+    model = mistral_large4_language
+    ids = mx.array([[1, 2, 7, 5, 9, 13, 11], [2, 4, 6, 8, 10, 12, 14]])
+    mask = None
+    if mask_ndim is not None:
+        mask = mx.array([[True, False, True, True, False, True, True]] * 2)
+        if mask_ndim == 4:
+            mask = mask[:, None, None, :]
+    expected = model(ids, mask=mask).logits
+    cache = model.make_cache()
+    outputs = [
+        model(
+            ids[:, a:b], cache=cache, mask=mask[..., :b] if mask is not None else None
+        ).logits
+        for a, b in chunks
+    ]
+    actual = mx.concatenate(outputs, axis=1)
+    assert mx.allclose(actual, expected, atol=3e-6, rtol=3e-5).item()
+    assert all(c.offset == 7 for c in cache)
+    assert cache[7].keys is None  # This layer reuses layer 3's compressed KV.
+    assert cache[3].state[0].shape == (2, 1, 7, 16)
+    assert cache[0].state[2].shape == (2, 7, 16)
+    assert cache[2].index_keys is None  # Indexer sharing carries only indices.
+
+
+def test_mistral_large4_cache_restore_and_trim(mistral_large4_language):
+    model = mistral_large4_language
+    ids = mx.array([[1, 2, 3, 4, 5, 6]])
+    cache = model.make_cache()
+    model(ids, cache=cache)
+    restored = [LatentCache.from_state(c.state, c.meta_state) for c in cache]
+    for c in restored:
+        assert c.trim(2) == 2
+    actual = model(ids[:, 4:], cache=restored).logits
+    expected = model(ids).logits[:, 4:]
+    assert mx.allclose(actual, expected, atol=3e-6, rtol=3e-5).item()
+
+
+@pytest.mark.parametrize("rope_dim", [0, 8])
+def test_mistral_large4_cache_growth_and_overwrite_after_trim(rope_dim):
+    cache = LatentCache()
+    length = 2 * cache.step + 3
+    keys = mx.arange(2 * length * 16).reshape(2, 1, length, 16)
+    values = mx.arange(2 * length * rope_dim).reshape(2, 1, length, rope_dim)
+    index = keys[:, 0, :, :8] * 3
+
+    def append(start, end):
+        k, v = cache.update_latent(keys[:, :, start:end], values[:, :, start:end])
+        i = cache.update_index(index[:, start:end])
+        cache.offset += end - start
+        mx.eval(cache.state)
+        assert mx.array_equal(k, keys[:, :, :end]).item()
+        assert mx.array_equal(v, values[:, :, :end]).item()
+        assert mx.array_equal(i, index[:, :end]).item()
+
+    append(0, cache.step - 1)
+    append(cache.step - 1, cache.step)
+    assert cache.keys.shape[2] == cache.step
+    append(cache.step, cache.step + 1)
+    append(cache.step + 1, length - 2)
+    assert cache.nbytes == sum(
+        x.nbytes for x in (cache.keys, cache.values, cache.index_keys)
+    )
+    restored = LatentCache.from_state(cache.state, cache.meta_state)
+    keys[:, :, 5:] += 17
+    values[:, :, 5:] += 29
+    index[:, 5:] += 31
+    for candidate in (cache, restored):
+        cache = candidate
+        assert cache.trim(length - 7) == length - 7
+        # Overwrite stale entries, then cross the restored buffer's boundary.
+        append(5, 8)
+        append(8, length)
+        assert all(x.shape[-2] == length for x in cache.state)
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("layer_idx", [0, 3])
+def test_mistral_large4_decode_projects_only_selected_latents(
+    mistral_large4_language, dtype, layer_idx
+):
+    model = mistral_large4_language.model
+    attention = model.layers[layer_idx].attention
+    attention.set_dtype(dtype)
+    x = mx.random.normal((2, 11, 32)).astype(dtype)
+    positions = mx.broadcast_to(mx.arange(11)[None], (2, 11))
+    cos, sin = model.rotary_emb(positions, dtype)
+    expected, _ = attention(x, positions, cos, sin, None, {}, None, None)
+    mx.eval(expected)
+    projected_lengths = []
+    projection = attention.wkv_b
+
+    def project(latents):
+        projected_lengths.append(latents.shape[2])
+        return projection(latents)
+
+    attention.wkv_b = project
+    cache = LatentCache()
+    attention(
+        x[:, :10], positions[:, :10], cos[:, :10], sin[:, :10], cache, {}, None, None
+    )
+    actual, _ = attention(
+        x[:, 10:], positions[:, 10:], cos[:, 10:], sin[:, 10:], cache, {}, None, None
+    )
+    tolerance = {mx.float32: 1e-6, mx.float16: 1e-3, mx.bfloat16: 1e-2}[dtype]
+    assert mx.allclose(actual, expected[:, -1:], atol=tolerance, rtol=tolerance).item()
+    assert projected_lengths == [10, attention.indexer.topk]
 
 
 @pytest.mark.parametrize("right_pad", [False, True])
@@ -1807,6 +1936,7 @@ def sample(name, length=0):
         ),
         "ChunkedKVCache": lambda: C.ChunkedKVCache(8),
         "DeepseekV41Cache": lambda: DeepseekV41Cache(1),
+        "LatentCache": LatentCache,
         "PoolingCache": lambda: C.PoolingCache(2),
         "RingSlidingKVCache": lambda: RingSlidingKVCache(max(16, length)),
         "RotatingKVCache": lambda: C.RotatingKVCache(max(16, length * 2)),
@@ -1834,6 +1964,10 @@ def sample(name, length=0):
         cache.offset = length
         cache.cum_eKV, cache.cum_eK = mx.ones((1, 4)), mx.ones((1, 4)) * 2
         cache.win_eKV, cache.win_eK = mx.ones((1, 3, 4)) * 3, mx.ones((1, 3, 4)) * 4
+    elif name == "LatentCache":
+        cache.update_latent(keys, keys * 2)
+        cache.update_index(keys[:, 0] * 3)
+        cache.offset = length
     elif name in ("SimpleKVCache", "MiniMaxM3KVCache"):
         cache.update_and_fetch(keys, keys * 2)
         if name == "MiniMaxM3KVCache":
