@@ -17,26 +17,44 @@ from .config import TextConfig
 
 
 class LatentCache(_BaseCache):
+    step = 256
+
     def __init__(self):
         self.keys = self.values = self.index_keys = None
         self.offset = 0
 
+    def _append(self, cache, values):
+        end = self.offset + values.shape[-2]
+        if cache is None or end > cache.shape[-2]:
+            capacity = ((values.shape[-2] + self.step - 1) // self.step) * self.step
+            padding = mx.zeros(
+                (*values.shape[:-2], capacity, values.shape[-1]), dtype=values.dtype
+            )
+            cache = (
+                padding
+                if cache is None
+                else mx.concatenate([cache[..., : self.offset, :], padding], axis=-2)
+            )
+        cache[..., self.offset : end, :] = values
+        return cache
+
     def update_latent(self, keys, values):
-        if self.keys is not None:
-            keys = mx.concatenate([self.keys, keys], axis=2)
-            values = mx.concatenate([self.values, values], axis=2)
-        self.keys, self.values = keys, values
-        return keys, values
+        end = self.offset + keys.shape[2]
+        self.keys = self._append(self.keys, keys)
+        self.values = self._append(self.values, values)
+        return self.keys[..., :end, :], self.values[..., :end, :]
 
     def update_index(self, keys):
-        if self.index_keys is not None:
-            keys = mx.concatenate([self.index_keys, keys], axis=1)
-        self.index_keys = keys
-        return keys
+        self.index_keys = self._append(self.index_keys, keys)
+        return self.index_keys[:, : self.offset + keys.shape[1]]
 
     @property
     def state(self):
-        return [x for x in (self.keys, self.values, self.index_keys) if x is not None]
+        return [
+            x[..., : self.offset, :]
+            for x in (self.keys, self.values, self.index_keys)
+            if x is not None
+        ]
 
     @state.setter
     def state(self, value):
@@ -68,7 +86,9 @@ class LatentCache(_BaseCache):
 
     @property
     def nbytes(self):
-        return sum(x.nbytes for x in self.state)
+        return sum(
+            x.nbytes for x in (self.keys, self.values, self.index_keys) if x is not None
+        )
 
     def is_trimmable(self):
         return True
@@ -76,11 +96,6 @@ class LatentCache(_BaseCache):
     def trim(self, n):
         n = min(n, self.offset)
         self.offset -= n
-        if self.keys is not None:
-            self.keys = self.keys[:, :, : self.offset]
-            self.values = self.values[:, :, : self.offset]
-        if self.index_keys is not None:
-            self.index_keys = self.index_keys[:, : self.offset]
         return n
 
 
@@ -245,15 +260,6 @@ class Attention(nn.Module):
             latent, kr = shared[self.source]
         q = self.ssmax_scaling(q, positions)
         length = latent.shape[2]
-        kv = (
-            self.wkv_b(latent)
-            .reshape(b, length, self.heads, self.nope_dim + self.value_dim)
-            .transpose(0, 2, 1, 3)
-        )
-        kn, values = kv[..., : self.nope_dim], kv[..., self.nope_dim :]
-        keys = mx.concatenate(
-            [kn, mx.broadcast_to(kr, (b, self.heads, length, self.rope_dim))], axis=-1
-        )
         causal = mx.arange(length)[None, None, None, :] <= positions[:, None, :, None]
         if mask is not None:
             if mask.ndim == 2:
@@ -268,9 +274,26 @@ class Attention(nn.Module):
             else previous
         )
         if topk is not None:
-            selected = mx.zeros((b, t, length), dtype=mx.bool_)
-            selected = mx.put_along_axis(selected, topk, mx.array(True), axis=-1)
-            causal = causal & selected[:, None]
+            if t == 1:
+                # Expand only selected latents during decode, in sequence order.
+                indices = mx.sort(topk, axis=-1)[:, None]
+                latent = mx.take_along_axis(latent, indices[..., 0, :, None], axis=2)
+                kr = mx.take_along_axis(kr, indices[..., 0, :, None], axis=2)
+                causal = mx.take_along_axis(causal, indices, axis=-1)
+                length = latent.shape[2]
+            else:
+                selected = mx.zeros((b, t, length), dtype=mx.bool_)
+                selected = mx.put_along_axis(selected, topk, mx.array(True), axis=-1)
+                causal = causal & selected[:, None]
+        kv = (
+            self.wkv_b(latent)
+            .reshape(b, length, self.heads, self.nope_dim + self.value_dim)
+            .transpose(0, 2, 1, 3)
+        )
+        kn, values = kv[..., : self.nope_dim], kv[..., self.nope_dim :]
+        keys = mx.concatenate(
+            [kn, mx.broadcast_to(kr, (b, self.heads, length, self.rope_dim))], axis=-1
+        )
         out = mx.fast.scaled_dot_product_attention(
             q, keys, values, scale=self.head_dim**-0.5, mask=causal
         )
