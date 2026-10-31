@@ -940,6 +940,12 @@ class Gemma4Processor(ProcessorMixin):
             local_files_only=is_local,
         )
         load_chat_template(tokenizer, pretrained_model_name_or_path)
+        if tokenizer.chat_template is None:
+            # Some checkpoints (e.g. base conversions) ship without a template;
+            # fall back to the official Gemma 4 template.
+            tokenizer.chat_template = (
+                Path(__file__).with_name("chat_template.jinja").read_text()
+            )
 
         # Load processor config (contains image_processor and feature_extractor settings)
         proc_config = {}
