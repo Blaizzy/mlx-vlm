@@ -196,6 +196,86 @@ def test_batch_generator_apc_media_token_ids_handles_text_only_model(mock_proces
 class TestGenerationBatch:
     """Tests for GenerationBatch class."""
 
+    @pytest.mark.parametrize("seeded", [False, True])
+    def test_extract_preserves_pending_token_and_row_state_across_peer_work(
+        self, seeded
+    ):
+        class Model:
+            def __call__(self, inputs, cache, **kwargs):
+                values = inputs[:, None, :, None].astype(mx.float32)
+                keys, _ = cache[0].update_and_fetch(values, values)
+                # Batch-invariant toy logits expose skipped/duplicated tokens.
+                sums = keys.sum(axis=(1, 2, 3))
+                logits = -mx.abs(mx.arange(32)[None, :] - (sums[:, None] % 32))
+                return SimpleNamespace(logits=logits[:, None, :])
+
+        def make_batch():
+            sampler = (
+                ar_module._PositionedTargetSampler(
+                    temperature=0.7, top_p=0.9, top_k=8, seed=91
+                )
+                if seeded
+                else lambda x: mx.argmax(x, axis=-1)
+            )
+            rows = []
+            for length in (3, 5):
+                c = KVCache()
+                values = mx.arange(length).reshape(1, 1, length, 1).astype(mx.float32)
+                c.update_and_fetch(values, values)
+                rows.append(c)
+            batch = GenerationBatch(
+                Model(),
+                [7, 8],
+                mx.array([1, 2]),
+                [BatchKVCache.merge(rows)],
+                sampler,
+                lambda token: False,
+                [100, 100],
+            )
+            batch._num_tokens = [3, 9]
+            batch._rope_deltas = mx.array([[2], [4]])
+            return batch
+
+        baseline, interrupted = make_batch(), make_batch()
+        baseline.next()
+        interrupted.next()
+        expected = [baseline.next()[0].token for _ in range(8)]
+        saved = interrupted.extract(7)
+        assert interrupted.uids == [8] and saved.uids == [7]
+        assert saved._num_tokens == [4]
+        assert saved._rope_deltas.tolist() == [[2]]
+        frozen = np.array(saved.prompt_cache[0].state[0])
+        for _ in range(5):
+            interrupted.next()
+        np.testing.assert_array_equal(saved.prompt_cache[0].state[0], frozen)
+        interrupted.extend(saved)
+        assert interrupted.uids == [8, 7]
+        actual = [
+            next(r.token for r in interrupted.next() if r.uid == 7) for _ in range(8)
+        ]
+        assert actual == expected
+
+    def test_extract_keeps_per_request_processors_and_budget(self):
+        processor, thinking = object(), object()
+        batch = self._mrope_batch([3, 4], [[2], [5]])
+        batch._next_tokens = mx.array([11, 12])
+        batch.logits_processors = [[processor], None]
+        batch.token_context = [[2, 7], [8, 9]]
+        batch.thinking_budget_criteria = [thinking, None]
+        saved = batch.extract(3)
+        assert saved.logits_processors == [[processor]]
+        assert saved.token_context == [[2, 7]]
+        assert saved.thinking_budget_criteria == [thinking]
+        assert batch.logits_processors == [None]
+        assert batch.thinking_budget_criteria == [None]
+
+    def test_extract_rejects_cache_without_row_extraction(self):
+        batch = self._mrope_batch([3, 4], [[2], [5]])
+        batch.prompt_cache = [SimpleNamespace(state=[], filter=lambda _: None)]
+        with pytest.raises(ValueError, match="cache snapshots"):
+            batch.extract(3)
+        assert batch.uids == [3, 4]
+
     def test_filter(self):
         mock_model = MagicMock()
         sampler = lambda x: mx.argmax(x, axis=-1)
@@ -240,6 +320,7 @@ class TestGenerationBatch:
         b._rope_deltas = None
         with pytest.raises(RuntimeError, match="MRoPE"):
             a.extend(b)
+        assert a.uids == [0]
 
     def test_extend_into_empty_accumulator_absorbs_mrope_state(self):
         empty = GenerationBatch.empty(
@@ -420,6 +501,68 @@ def _generation_batch(model, inputs=(5, 6), uids=None, **options):
 
 class TestBatchGenerator:
     """Tests for BatchGenerator class."""
+
+    def test_suspend_queued_prompt_readmits_same_request(
+        self, mock_model, mock_processor
+    ):
+        gen = BatchGenerator(model=mock_model.language_model, processor=mock_processor)
+        (uid,) = gen.insert([[1, 4, 7]], resumable=True)
+        saved = gen.suspend(uid)
+        assert not gen.has_work
+        gen.resume(saved)
+        assert gen.unprocessed_prompts[0][0:2] == (uid, [1, 4, 7])
+        gen.remove(uid)
+        assert not gen._resume_inputs
+
+    def test_suspend_during_prefill_keeps_peer_and_restarts_original_prompt(
+        self, mock_model, mock_processor
+    ):
+        with contextlib.closing(
+            BatchGenerator(
+                mock_model.language_model,
+                mock_processor,
+                prefill_batch_size=2,
+                prefill_step_size=3,
+                max_tokens=2,
+            )
+        ) as gen:
+            prompts = [list(range(3, 16)), list(range(4, 12))]
+            uids = gen.insert(
+                prompts,
+                prompt_kwargs=[
+                    {"inputs_embeds": mx.zeros((1, len(ids), 4))} for ids in prompts
+                ],
+                resumable=True,
+            )
+            gen.next()
+            saved = gen.suspend(uids[0])
+            assert gen._prompt_batch.uids == [uids[1]]
+            peer_tokens = []
+            while gen.has_work:
+                _, tokens = gen.next()
+                peer_tokens.extend(tokens)
+            assert peer_tokens and all(t.uid == uids[1] for t in peer_tokens)
+            gen.resume(saved)
+            assert gen.unprocessed_prompts[0][:2] == (uids[0], prompts[0])
+            resumed = []
+            while gen.has_work:
+                progress, tokens = gen.next()
+                if progress:
+                    assert not gen._resume_inputs
+                resumed.extend(tokens)
+            assert len(resumed) == 2 and all(t.uid == uids[0] for t in resumed)
+
+    def test_discard_speculative_checkpoint_closes_iterator(self):
+        batch = SpeculativeGenerationBatch.__new__(SpeculativeGenerationBatch)
+        batch.uids = batch._all_uids = [7]
+        batch._finished = [False]
+        iterator = batch._rounds_iter = MagicMock()
+        batch.prompt_cache = [object()]
+        batch.hidden = batch.shared_kv_states = batch.prompt_tokens = object()
+        BatchGenerator.discard(batch)
+        iterator.close.assert_called_once_with()
+        assert not batch.prompt_cache and not batch.uids
+        assert batch.hidden is batch.shared_kv_states is batch.prompt_tokens is None
 
     def test_insert_with_max_tokens(self, mock_model, mock_processor):
         gen = BatchGenerator(

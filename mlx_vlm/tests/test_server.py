@@ -443,53 +443,78 @@ class TestInferenceSession:
         with pytest.raises(ValueError):
             session.claim()
 
-    def test_paused_decoder_is_not_stepped_but_peers_continue(self):
+    def test_paused_row_releases_slot_and_resume_obeys_capacity(self):
         worker = Generator.__new__(Generator)
-        paused, peer = continuation.InferenceSession(), continuation.InferenceSession()
+        paused, peer = sessions.InferenceSession(), sessions.InferenceSession()
         paused.pause(0)
-
-        def engine():
-            return NS(
-                _generation_batch=NS(prompt_cache=[]),
-                _prompt_batch=None,
-                close=Mock(),
-                remove=Mock(),
-            )
-
-        retained = {paused: (engine(), {0: {}}), peer: (engine(), {0: {}})}
-        worker._step = Mock()
-        worker._step_retained(retained)
-        assert worker._step.call_args_list == [
-            ((retained[peer][0], retained[peer][1]),)
-        ]
+        snapshot = NS(prompt_cache=[])
+        engine = NS(
+            suspend=Mock(return_value=snapshot),
+            resume=Mock(),
+            remove=Mock(),
+            apc_manager=None,
+        )
+        active = {10: {"rqueue": paused}, 11: {"rqueue": peer}}
+        groups, suspended = {"same-settings": (engine, active)}, {}
+        worker._schedule_continuations(groups, suspended, 1)
+        assert list(active) == [11]
+        assert suspended[paused][1] is snapshot
+        engine.suspend.assert_called_once_with(10)
         paused.claim()
-        worker._step.reset_mock()
-        worker._step_retained(retained)
-        assert worker._step.call_count == 2
+        worker._schedule_continuations(groups, suspended, 1)
+        engine.resume.assert_not_called()
+        assert paused in suspended
+        active.pop(11)
+        worker._schedule_continuations(groups, suspended, 1)
+        engine.resume.assert_called_once_with(snapshot)
+        assert list(active) == [10] and not suspended
 
-    def test_cache_budget_evicts_oldest_paused_decoder(self, monkeypatch):
+    def test_cache_budget_evicts_oldest_paused_row(self, monkeypatch):
         monkeypatch.setenv("MLX_VLM_CONTINUATION_CACHE_BYTES", "16")
         worker = Generator.__new__(Generator)
-        old, new = continuation.InferenceSession(), continuation.InferenceSession()
+        old, new = sessions.InferenceSession(), sessions.InferenceSession()
         old.pause(0)
         new.pause(0)
-
-        def engine():
-            return NS(
-                _generation_batch=NS(prompt_cache=[mx.zeros((4,))]),
-                _prompt_batch=None,
-                close=Mock(),
-                remove=Mock(),
-            )
-
-        first, second = engine(), engine()
-        retained = {old: (first, {0: {}}), new: (second, {0: {}})}
-        worker._step_retained(retained)
-        assert old not in retained and new in retained
-        first.close.assert_called_once()
-        second.close.assert_not_called()
+        states = [NS(prompt_cache=[mx.zeros((4,))]) for _ in range(2)]
+        engine = NS(suspend=Mock(side_effect=states), resume=Mock(), remove=Mock())
+        active = {1: {"rqueue": old}, 2: {"rqueue": new}}
+        groups, suspended = {0: (engine, active)}, {}
+        worker._schedule_continuations(groups, suspended, 4)
+        assert old not in suspended and new in suspended
+        assert not active
         with pytest.raises(ValueError, match="evicted"):
             old.claim()
+        assert new.error is None
+
+    def test_resume_waits_for_apc_memory_admission(self):
+        worker = Generator.__new__(Generator)
+        session = sessions.InferenceSession()
+        manager = NS(_make_room=Mock(return_value=False))
+        engine = NS(
+            apc_manager=manager,
+            resume=Mock(),
+            _generation_batch=NS(prompt_cache=[mx.zeros((4,))]),
+        )
+        snapshot = NS(prompt_cache=[mx.zeros((4,))])
+        groups = {0: (engine, {})}
+        suspended = {session: (0, snapshot, 1, {"rqueue": session})}
+        worker._schedule_continuations(groups, suspended, 4)
+        engine.resume.assert_not_called()
+        manager._make_room.assert_called_once_with(32)
+        manager._make_room.return_value = True
+        worker._schedule_continuations(groups, suspended, 4)
+        engine.resume.assert_called_once_with(snapshot)
+
+    def test_compatible_resumable_and_regular_requests_share_group(self):
+        worker = Generator.__new__(Generator)
+        worker.draft_model = None
+        first = NS(
+            args=Args(temperature=0.7, seed=91), session=sessions.InferenceSession()
+        )
+        second = NS(args=Args(temperature=0.7, seed=91), session=None)
+        assert worker._batch_key(first) == worker._batch_key(second)
+        second.args.seed = 92
+        assert worker._batch_key(first) != worker._batch_key(second)
 
     @pytest.mark.parametrize(
         "settings", [{}, {"top_n_sigma": 1.5}, {"p_less": True}, {"typical_p": 0.8}]
@@ -5925,6 +5950,44 @@ class TestResponseGenerator:
                 (str(ctx.uid * 10 + 1), "length"),
             ]
 
+    def test_run_mixes_resumable_and_ordinary_requests_in_one_batch(self, monkeypatch):
+        gen, batches = _worker_setup(monkeypatch, steps=3)
+        ordinary = _enqueue(gen, max_tokens=3)
+        session = sessions.InferenceSession()
+        context_queue = Queue()
+        gen.requests.put(
+            generation.QueuedGenerationRequest(
+                rqueue=context_queue,
+                raw_inputs={"request_id": 2},
+                prompt_tokens=1,
+                args=Args(max_tokens=3),
+                session=session,
+            )
+        )
+        with _running(gen):
+            ordinary_context, ordinary_tokens = _drain(ordinary)
+            context = context_queue.get(timeout=1)
+            resumed_tokens = list(session.reader(timeout=1))
+        assert len(batches) == 1 and batches[0].sizes == [2, 2, 2]
+        assert context.uid != ordinary_context.uid
+        assert len(ordinary_tokens) == len(resumed_tokens) == 3
+        assert [t.generation_tokens for t in resumed_tokens] == [1, 2, 3]
+
+    def test_shutdown_drains_active_ordinary_request(self, monkeypatch):
+        gen, batches = _worker_setup(monkeypatch, steps=3)
+        original_step = gen._step
+
+        def step(*args, **kwargs):
+            original_step(*args, **kwargs)
+            gen._stop = True
+            gen.requests.put(None)
+
+        gen._step = step
+        queue = _enqueue(gen, max_tokens=3)
+        with _running(gen):
+            _, tokens = _drain(queue)
+        assert len(tokens) == 3 and tokens[-1].finish_reason == "length"
+
     @pytest.mark.parametrize("draft_kind", ["dflash", "eagle3", "mtp"])
     def test_speculative_batch_options_and_apc(self, monkeypatch, draft_kind):
         gen, batches = _worker_setup(monkeypatch, draft_kind=draft_kind)
@@ -5955,7 +6018,7 @@ class TestResponseGenerator:
 
     def test_new_sampler_recreates_idle_batch(self, monkeypatch):
         gen, batches = _worker_setup(monkeypatch, idle=True)
-        gen._make_sampler = lambda args: f"sampler-{args.temperature}"
+        gen._make_session_sampler = lambda args: f"sampler-{args.temperature}"
         with _running(gen):
             for i, temperature in enumerate([0.0, 0.6]):
                 _, tokens = _drain(

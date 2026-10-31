@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import functools
 import logging
 import os
@@ -1312,10 +1313,64 @@ class GenerationBatch:
         if targets:
             mx.eval(*targets)
 
+    def extract(self, uid: int) -> "GenerationBatch":
+        """Detach one decode row, including its already sampled next token.
+
+        APC owns cache normalization: recurrent state and logical positions
+        travel with the row, while padding/allocation may change on re-entry.
+        No prompt or generated token is replayed by this operation.
+        """
+        index = self.uids.index(uid)
+        if (
+            len(self.uids) > 1
+            and self.prompt_cache
+            and not _apc._prompt_cache_is_batch_shaped(self.prompt_cache)
+        ):
+            raise ValueError("This model does not support continuation cache snapshots")
+        self._eval_pending_state()
+        caches = _apc.snapshot_prompt_cache_row(self.prompt_cache, index)
+        if caches is None:
+            raise ValueError("This model does not support continuation cache snapshots")
+        row = copy.copy(self)
+        row.prompt_cache = caches
+        for name in (
+            "uids",
+            "max_tokens",
+            "_num_tokens",
+            "token_context",
+            "logits_processors",
+            "thinking_budget_criteria",
+        ):
+            values = getattr(self, name)
+            setattr(row, name, [values[index]] if values else [])
+        for name in (
+            "_current_tokens",
+            "_current_lps",
+            "_next_tokens",
+            "_next_lps",
+            "_next_top_idx",
+            "_next_top_lp",
+            "_rope_deltas",
+        ):
+            value = getattr(self, name)
+            setattr(
+                row,
+                name,
+                None if value is None else mx.contiguous(value[index : index + 1]),
+            )
+        row._eval_pending_state()
+        self.filter([i for i in range(len(self.uids)) if i != index])
+        return row
+
     def extend(self, other: "GenerationBatch"):
         """Extend this batch with another generation batch."""
         self_was_empty = len(self.uids) == 0
         if not self_was_empty and len(other.uids) > 0:
+            if (self._rope_deltas is None) != (other._rope_deltas is None):
+                raise RuntimeError(
+                    "extend() mixes MRoPE and non-MRoPE batches; both sides must "
+                    "carry rope_deltas or neither side may."
+                )
             self._eval_pending_state()
             other._eval_pending_state()
 
@@ -1342,17 +1397,10 @@ class GenerationBatch:
         self._ensure_logits_processor_slots()
         self._ensure_token_context()
 
-        if self._current_tokens is None:
-            self._current_tokens = other._current_tokens
-            self._current_lps = other._current_lps
-        elif other._current_tokens is not None:
-            self._current_tokens = mx.concatenate(
-                [self._current_tokens, other._current_tokens]
-            )
-            if self._current_lps is not None and other._current_lps is not None:
-                self._current_lps = mx.concatenate(
-                    [self._current_lps, other._current_lps]
-                )
+        # These tokens were already emitted. Fresh prefill rows have no
+        # corresponding current buffer; the next step reads only _next_*.
+        self._current_tokens = None
+        self._current_lps = None
 
         if self._next_tokens is None:
             self._next_tokens = other._next_tokens
@@ -1381,11 +1429,6 @@ class GenerationBatch:
 
         if self_was_empty:
             self._rope_deltas = other._rope_deltas
-        elif (self._rope_deltas is None) != (other._rope_deltas is None):
-            raise RuntimeError(
-                "extend() mixes MRoPE and non-MRoPE batches; both sides must "
-                "carry rope_deltas or neither side may."
-            )
         elif self._rope_deltas is not None:
             self._rope_deltas = mx.concatenate([self._rope_deltas, other._rope_deltas])
 
@@ -1424,6 +1467,10 @@ class GenerationBatch:
                 c.filter(keep_arr)
             if self._next_tokens is not None:
                 self._next_tokens = self._next_tokens[keep_arr]
+            if self._current_tokens is not None:
+                self._current_tokens = self._current_tokens[keep_arr]
+            if self._current_lps is not None:
+                self._current_lps = self._current_lps[keep_arr]
             if self._next_lps is not None:
                 self._next_lps = self._next_lps[keep_arr]
             if self._next_top_idx is not None:
@@ -2569,6 +2616,7 @@ class BatchGenerator:
         )
         self.sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
         self.uid_count = 0
+        self._resume_inputs = {}
         self.prefill_step_size = prefill_step_size
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = completion_batch_size
@@ -2951,6 +2999,7 @@ class BatchGenerator:
         ] = None,
         thinking_budget_criteria: Optional[List[Any]] = None,
         attention_mask: Optional[mx.array] = None,
+        resumable: bool = False,
     ):
         """Queue prompts, consuming tokenizer padding metadata when provided.
 
@@ -2984,7 +3033,10 @@ class BatchGenerator:
             logits_processors,
             thinking_budget_criteria,
         ):
-            self._unprocessed_sequences.append((self.uid_count, p, m, kw, lp, tc))
+            sequence = (self.uid_count, p, m, kw, lp, tc)
+            self._unprocessed_sequences.append(sequence)
+            if resumable:
+                self._resume_inputs[self.uid_count] = sequence
             uids.append(self.uid_count)
             self.uid_count += 1
         # Sort in ascending order of length
@@ -2996,6 +3048,7 @@ class BatchGenerator:
     def remove(self, uid) -> bool:
         """Remove a sequence from the batch by uid."""
         with mx.stream(self._stream):
+            self._resume_inputs.pop(uid, None)
             # Waiting in the queue.
             for i, (seq_uid, _, _, _, _, _) in enumerate(self._unprocessed_sequences):
                 if seq_uid == uid:
@@ -3018,6 +3071,55 @@ class BatchGenerator:
                 return True
 
             return False
+
+    def suspend(self, uid):
+        """Remove a resumable row from scheduling and return its owned state.
+
+        Before the first decode token, requeue the original prompt on resume;
+        APC can reuse any completed prefill checkpoints. No output is lost.
+        """
+        with mx.stream(self._stream):
+            if (
+                isinstance(self._generation_batch, GenerationBatch)
+                and uid in self._generation_batch.uids
+            ):
+                self._resume_inputs.pop(uid, None)
+                return self._generation_batch.extract(uid)
+            if isinstance(
+                self._generation_batch, SpeculativeGenerationBatch
+            ) and self._generation_batch.uids == [uid]:
+                checkpoint = self._generation_batch
+                self._generation_batch = GenerationBatch.empty(
+                    self.model,
+                    self.sampler,
+                    self.tokenizer.stopping_criteria,
+                    self.compute_logprobs,
+                    self.top_logprobs_k,
+                    self.greedy_sampling,
+                )
+                return checkpoint
+            sequence = self._resume_inputs.get(uid)
+            if sequence is None:
+                raise ValueError("The request has no resumable decode state")
+            if not self.remove(uid):
+                raise ValueError("The request is no longer scheduled")
+            return sequence
+
+    def resume(self, checkpoint):
+        """Admit a checkpoint after the caller checks concurrency/memory limits."""
+        with mx.stream(self._stream):
+            if isinstance(checkpoint, (GenerationBatch, SpeculativeGenerationBatch)):
+                self._extend_generation_batch(checkpoint)
+            else:
+                uid = checkpoint[0]
+                self._resume_inputs[uid] = checkpoint
+                self._unprocessed_sequences.append(checkpoint)
+
+    @staticmethod
+    def discard(checkpoint):
+        """Release a detached row, including a speculative iterator's closure."""
+        if isinstance(checkpoint, (GenerationBatch, SpeculativeGenerationBatch)):
+            checkpoint.filter([])
 
     @property
     def unprocessed_prompts(self):
@@ -3259,7 +3361,11 @@ class BatchGenerator:
 
     def next(self, **kwargs):
         with mx.stream(self._stream):
-            return self._next(**kwargs)
+            result = self._next(**kwargs)
+            for response in result[0] + result[1]:
+                # Original prompt tensors are only needed for a prefill pause.
+                self._resume_inputs.pop(response.uid, None)
+            return result
 
 
 def batch_generate(

@@ -225,8 +225,8 @@ async def _preflight_stream_context_budget(
     """Reject over-budget streaming requests before the HTTP stream starts."""
     continuation = ACTIVE_CONTINUATION.get()
     if continuation is not None and continuation.resuming:
-        # The retained decoder already passed admission with its original
-        # prompt and budget. Re-tokenizing (including media) serves no purpose.
+        # The original prompt already passed the context budget check. The GPU
+        # scheduler checks concurrency and memory again when restoring its row.
         try:
             continuation.record.session.check()
         except ValueError as error:
