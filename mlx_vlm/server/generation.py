@@ -53,6 +53,7 @@ logger = logging.getLogger("mlx_vlm.server")
 DEFAULT_SPECULATIVE_BATCH_COALESCE_MS = 5.0
 DEFAULT_LOG_PROGRESS_INTERVAL = 10
 DEFAULT_ENABLE_THINKING = False
+DEFAULT_CONSTRAIN_TOOL_CALLS = False
 METRICS_HISTORY_LIMIT = 100
 METRICS_RECENT_LIMIT = 32
 
@@ -215,6 +216,13 @@ def get_server_enable_thinking():
     raw = os.environ.get("MLX_VLM_ENABLE_THINKING")
     if raw is None:
         return DEFAULT_ENABLE_THINKING
+    return raw.lower() in ("1", "true", "yes", "on")
+
+
+def get_server_constrain_tool_calls():
+    raw = os.environ.get("MLX_VLM_CONSTRAIN_TOOL_CALLS")
+    if raw is None:
+        return DEFAULT_CONSTRAIN_TOOL_CALLS
     return raw.lower() in ("1", "true", "yes", "on")
 
 

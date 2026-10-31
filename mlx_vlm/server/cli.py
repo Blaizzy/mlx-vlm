@@ -156,6 +156,16 @@ def main():
         ),
     )
     parser.add_argument(
+        "--constrain-tool-calls",
+        action="store_true",
+        default=False,
+        help=(
+            "Constrain tool calls to each request's tool schemas (tool names, "
+            "argument names and JSON value types). Supported for the glm47 tool "
+            "format (GLM-4.7, Flint)."
+        ),
+    )
+    parser.add_argument(
         "--thinking-budget",
         type=int,
         default=get_server_thinking_budget(),
@@ -359,6 +369,9 @@ def main():
     os.environ["MLX_VLM_LOG_PROGRESS_INTERVAL"] = str(args.log_progress_interval)
     os.environ["MLX_VLM_MAX_TOKENS"] = str(args.max_tokens)
     os.environ["MLX_VLM_ENABLE_THINKING"] = "1" if args.enable_thinking else "0"
+    os.environ["MLX_VLM_CONSTRAIN_TOOL_CALLS"] = (
+        "1" if args.constrain_tool_calls else "0"
+    )
     if args.thinking_budget is not None:
         os.environ["MLX_VLM_THINKING_BUDGET"] = str(args.thinking_budget)
     if args.thinking_start_token is not None:
