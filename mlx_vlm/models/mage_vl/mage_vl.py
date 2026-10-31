@@ -107,6 +107,7 @@ class Model(nn.Module):
         model.language_model.*          -> language_model.model.*
         lm_head.*                       -> language_model.lm_head.*
         model.visual.*                  -> vision_tower.*
+        visual.*                        -> vision_tower.* (Mage-VL-Cowork)
         model.*                         -> language_model.model.*
         """
         out = {}
@@ -115,6 +116,8 @@ class Model(nn.Module):
                 k = "language_model.model." + k[len("model.language_model.") :]
             elif k.startswith("model.visual."):
                 k = "vision_tower." + k[len("model.visual.") :]
+            elif k.startswith("visual."):
+                k = "vision_tower." + k[len("visual.") :]
             elif k.startswith("lm_head."):
                 k = "language_model.lm_head." + k[len("lm_head.") :]
             elif k.startswith("model."):
