@@ -58,6 +58,8 @@ class DSparkConfig(BaseModelConfig):
     draft_window_size: int | None = None
     block_size_policy: str = "fixed"
     dflash_initial_block_size: int | None = None
+    proposal_head_bits: int | None = None
+    proposal_head_group_size: int = 64
 
     markov_rank: int = 256
     markov_head_type: str = "vanilla"
@@ -70,6 +72,10 @@ class DSparkConfig(BaseModelConfig):
         self.validate()
 
     def validate(self) -> None:
+        if self.proposal_head_bits not in (None, 4, 8):
+            raise ValueError("DSpark proposal_head_bits must be 4, 8 or None.")
+        if self.proposal_head_group_size not in (32, 64, 128):
+            raise ValueError("DSpark proposal_head_group_size must be 32, 64 or 128.")
         if self.model_type != "dspark":
             raise ValueError(
                 f"DSpark requires normalized model_type='dspark', got "
@@ -147,6 +153,8 @@ class DSparkConfig(BaseModelConfig):
     def from_dict(cls, params: dict) -> "DSparkConfig":
         flat = dict(params)
         dflash = flat.pop("dflash_config", None)
+        if dflash is None and flat.get("projector_type") == "dspark":
+            dflash = {"projector_type": "dspark"}
         if not isinstance(dflash, Mapping):
             raise TypeError("DSpark requires a dflash_config object.")
 
@@ -171,6 +179,8 @@ class DSparkConfig(BaseModelConfig):
             "draft_window_size",
             "block_size_policy",
             "dflash_initial_block_size",
+            "proposal_head_bits",
+            "proposal_head_group_size",
             "markov_rank",
             "markov_head_type",
             "enable_confidence_head",
