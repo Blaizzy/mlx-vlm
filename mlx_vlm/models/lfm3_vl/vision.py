@@ -7,6 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ...kernels.vision_rotate import vision_rotate
 from ..lfm3.language import MLP
 
 
@@ -57,14 +58,29 @@ class VisionAttention(nn.Module):
                 t * cos[:, None] + mx.concatenate([-b, a], axis=-1) * sin[:, None]
             ).astype(dtype)
 
-        q, k = rotate(q), rotate(k)
+        if self._fused_rotate_applies(q, cos, sin):
+            # One kernel per tensor, written in the layout attention reads.
+            q, k = vision_rotate(q, cos, sin), vision_rotate(k, cos, sin)
+        else:
+            q = rotate(q).transpose(1, 0, 2)[None]
+            k = rotate(k).transpose(1, 0, 2)[None]
         out = mx.fast.scaled_dot_product_attention(
-            q.transpose(1, 0, 2)[None],
-            k.transpose(1, 0, 2)[None],
+            q,
+            k,
             v.transpose(1, 0, 2)[None],
             scale=self.scale,
         )
         return self.out_proj(out[0].transpose(1, 0, 2).reshape(n, -1))
+
+    def _fused_rotate_applies(self, q, cos, sin):
+        return (
+            not self.training
+            and q.dtype in (mx.float16, mx.bfloat16)
+            and cos.dtype == sin.dtype == mx.float32
+            and cos.shape == (q.shape[0], self.head_dim)
+            and mx.default_device() == mx.gpu
+            and mx.metal.is_available()
+        )
 
 
 class VisionConv(nn.Module):
