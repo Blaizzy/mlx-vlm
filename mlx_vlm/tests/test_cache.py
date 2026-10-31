@@ -22,6 +22,7 @@ from unittest.mock import Mock, patch
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 import pytest
 
 import mlx_vlm.models as models
@@ -301,7 +302,7 @@ def test_mistral_large4_cache_growth_and_overwrite_after_trim(rope_dim):
 
 @pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
 @pytest.mark.parametrize("layer_idx", [0, 3])
-def test_mistral_large4_decode_projects_only_selected_latents(
+def test_mistral_large4_decode_absorbs_selected_latents(
     mistral_large4_language, dtype, layer_idx
 ):
     model = mistral_large4_language.model
@@ -315,11 +316,16 @@ def test_mistral_large4_decode_projects_only_selected_latents(
     projected_lengths = []
     projection = attention.wkv_b
 
-    def project(latents):
-        projected_lengths.append(latents.shape[2])
-        return projection(latents)
+    class TrackedLinear(nn.Linear):
+        def __call__(self, latents):
+            projected_lengths.append(latents.shape[2])
+            return super().__call__(latents)
 
-    attention.wkv_b = project
+    tracked = TrackedLinear(
+        projection.weight.shape[1], projection.weight.shape[0], bias=False
+    )
+    tracked.weight = projection.weight
+    attention.wkv_b = tracked
     cache = LatentCache()
     attention(
         x[:, :10], positions[:, :10], cos[:, :10], sin[:, :10], cache, {}, None, None
@@ -329,7 +335,75 @@ def test_mistral_large4_decode_projects_only_selected_latents(
     )
     tolerance = {mx.float32: 1e-6, mx.float16: 1e-3, mx.bfloat16: 1e-2}[dtype]
     assert mx.allclose(actual, expected[:, -1:], atol=tolerance, rtol=tolerance).item()
-    assert projected_lengths == [10, attention.indexer.topk]
+    assert projected_lengths == [10]
+
+
+@pytest.mark.parametrize("layer_idx", [0, 3])
+def test_mistral_large4_absorbed_decode_precision(mistral_large4_language, layer_idx):
+    attention = mistral_large4_language.model.layers[layer_idx].attention
+    attention.set_dtype(mx.bfloat16)
+    q = (4 * mx.random.normal((2, attention.heads, 1, attention.head_dim))).astype(
+        mx.bfloat16
+    )
+    latent = mx.random.normal((2, 1, 257, attention.latent)).astype(mx.bfloat16)
+    kr = mx.random.normal((2, 1, 257, attention.rope_dim)).astype(mx.bfloat16)
+    mask = (
+        mx.arange(257)[None, None, None, :] < mx.array([257, 193])[:, None, None, None]
+    )
+    weight = attention.wkv_b.weight.reshape(
+        attention.heads, attention.nope_dim + attention.value_dim, attention.latent
+    )
+
+    def as_double(value):
+        return np.array(value.astype(mx.float32)).astype(np.float64)
+
+    def round_bf16(value):
+        return as_double(mx.array(value.astype(np.float32)).astype(mx.bfloat16))
+
+    # Independent NumPy attention oracle with the reference's BF16 projection
+    # boundaries. Scores and softmax retain precision before rounding the
+    # latent attention output and applying the value projection.
+    q_np, latent_np, kr_np, weight_np = map(as_double, (q, latent, kr, weight))
+    query = round_bf16(
+        q_np[..., : attention.nope_dim] @ weight_np[:, : attention.nope_dim]
+    )
+    query = np.concatenate((query, q_np[..., attention.nope_dim :]), axis=-1)
+    keys = np.concatenate((latent_np, kr_np), axis=-1)
+    scores = (query @ keys.swapaxes(-1, -2)) * attention.head_dim**-0.5
+    scores = np.where(np.array(mask), scores, -np.inf)
+    probabilities = np.exp(scores - scores.max(axis=-1, keepdims=True))
+    probabilities /= probabilities.sum(axis=-1, keepdims=True)
+    expected = round_bf16(
+        round_bf16(probabilities @ latent_np)
+        @ weight_np[:, attention.nope_dim :].swapaxes(-1, -2)
+    )
+    actual = attention._decode_attention(q, latent, kr, mask)
+    assert actual.dtype == mx.bfloat16
+    relative_error = np.linalg.norm(as_double(actual) - expected) / np.linalg.norm(
+        expected
+    )
+    assert relative_error < 1e-3
+
+
+@pytest.mark.parametrize("layer_idx", [0, 3])
+def test_mistral_large4_quantized_kv_projection_decode(
+    mistral_large4_language, layer_idx
+):
+    model = mistral_large4_language.model
+    attention = model.layers[layer_idx].attention
+    attention.wkv_b = attention.wkv_b.to_quantized(group_size=16, bits=4, mode="nvfp4")
+    x = mx.random.normal((2, 11, 32))
+    positions = mx.broadcast_to(mx.arange(11)[None], (2, 11))
+    cos, sin = model.rotary_emb(positions, x.dtype)
+    expected, _ = attention(x, positions, cos, sin, None, {}, None, None)
+    cache = LatentCache()
+    attention(
+        x[:, :10], positions[:, :10], cos[:, :10], sin[:, :10], cache, {}, None, None
+    )
+    actual, _ = attention(
+        x[:, 10:], positions[:, 10:], cos[:, 10:], sin[:, 10:], cache, {}, None, None
+    )
+    assert mx.allclose(actual, expected[:, -1:], atol=1e-6, rtol=1e-5).item()
 
 
 @pytest.mark.parametrize("right_pad", [False, True])

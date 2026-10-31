@@ -236,6 +236,29 @@ class Attention(nn.Module):
         self.ssmax_scaling = SoftmaxScaling(self.heads)
         self.indexer = Indexer(args, idx) if args.indexer_types[idx] == "full" else None
 
+    def _decode_attention(self, q, latent, kr, mask):
+        # Absorb the K projection into Q and apply the V projection after
+        # attention, avoiding expansion of every selected cached latent.
+        weight = self.wkv_b.weight.reshape(
+            self.heads, self.nope_dim + self.value_dim, self.latent
+        )
+        # Keep projection rounding in the model dtype, with an FP32 attention
+        # core, matching the reference's query and latent-output boundaries.
+        q_latent = q[..., : self.nope_dim] @ weight[:, : self.nope_dim]
+        q_latent = q_latent.astype(mx.float32)
+        latent = latent.astype(mx.float32)
+        kr = kr.astype(mx.float32)
+        scale = self.head_dim**-0.5
+        if self.rope_dim:
+            pe_scores = (
+                q[..., self.nope_dim :].astype(mx.float32) @ kr.swapaxes(-1, -2)
+            ) * scale
+            mask = mx.where(mask, pe_scores, -float("inf"))
+        out = mx.fast.scaled_dot_product_attention(
+            q_latent, latent, latent, scale=scale, mask=mask
+        ).astype(q.dtype)
+        return out @ weight[:, self.nope_dim :].swapaxes(-1, -2)
+
     def __call__(self, x, positions, cos, sin, cache, shared, previous, mask):
         b, t, _ = x.shape
         q = self.wq(x).reshape(b, t, self.heads, self.head_dim).transpose(0, 2, 1, 3)
@@ -285,18 +308,22 @@ class Attention(nn.Module):
                 selected = mx.zeros((b, t, length), dtype=mx.bool_)
                 selected = mx.put_along_axis(selected, topk, mx.array(True), axis=-1)
                 causal = causal & selected[:, None]
-        kv = (
-            self.wkv_b(latent)
-            .reshape(b, length, self.heads, self.nope_dim + self.value_dim)
-            .transpose(0, 2, 1, 3)
-        )
-        kn, values = kv[..., : self.nope_dim], kv[..., self.nope_dim :]
-        keys = mx.concatenate(
-            [kn, mx.broadcast_to(kr, (b, self.heads, length, self.rope_dim))], axis=-1
-        )
-        out = mx.fast.scaled_dot_product_attention(
-            q, keys, values, scale=self.head_dim**-0.5, mask=causal
-        )
+        if t == 1 and isinstance(self.wkv_b, nn.Linear):
+            out = self._decode_attention(q, latent, kr, causal)
+        else:
+            kv = (
+                self.wkv_b(latent)
+                .reshape(b, length, self.heads, self.nope_dim + self.value_dim)
+                .transpose(0, 2, 1, 3)
+            )
+            kn, values = kv[..., : self.nope_dim], kv[..., self.nope_dim :]
+            keys = mx.concatenate(
+                [kn, mx.broadcast_to(kr, (b, self.heads, length, self.rope_dim))],
+                axis=-1,
+            )
+            out = mx.fast.scaled_dot_product_attention(
+                q, keys, values, scale=self.head_dim**-0.5, mask=causal
+            )
         out = out.transpose(0, 2, 1, 3).reshape(b, t, -1)
         if cache is not None:
             cache.offset += t
