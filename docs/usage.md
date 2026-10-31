@@ -56,6 +56,69 @@ Incremental arguments are supported for JSON, Cohere, Qwen Coder XML, and Gemma
 tool formats. Other parsers retain their completed-call behavior. XML values
 that require type conversion are buffered until the parameter closes.
 
+## Continuing a stopped stream
+
+Chat Completions and Responses accept `"stream": true, "resumable": true`.
+The stream returns `X-MLX-Continuation: 1` and a `continuation` object on SSE
+events once generation starts. Save that object atomically with the text from
+the same event. To stop, close the stream. To resume, return the saved object
+unchanged to the same endpoint with the same tenant header:
+
+```python
+requests.post(
+    "http://localhost:8080/v1/responses",
+    headers={"X-APC-Tenant": "my-chat"},
+    json={"stream": True, "continuation": saved_checkpoint},
+    stream=True,
+)
+```
+
+The server retains the live autoregressive decoder: KV and recurrent caches,
+pipelined next tokens, sampling seed and position, logits processors, thinking
+budget, and detokenizer state. Stop pauses scheduling for this request. Resume
+replays any output generated ahead of the client's acknowledged cursor, then
+continues the same decoder without tokenizing or prefilling again. Replacement
+messages and settings are ignored; the original token budget still applies.
+
+Output token counts and decode throughput remain cumulative across resumes.
+Decode timing measures producer work after the first token, excluding paused
+time, replay delivery, and work on other requests. Buffered tokens keep their
+original measurements; receiving them quickly does not inflate the decode rate.
+
+Append the returned text to the interrupted assistant message. Reasoning and
+content already delivered are suppressed, but partial tool arguments are
+replayed in full: discard the old partial tool-call accumulator and execute
+calls only after the resumed stream completes. Each stream returns a new
+checkpoint. A prior handle remains usable for retrying a failed reconnect;
+only the latest reader runs, and a late close from an older stream cannot pause it.
+
+Resumable requests retain individual decoder batches on the existing GPU worker,
+so other requests can run while they are paused. This preserves the decode batch
+shape and keyed sampling sequence across resumes, at the cost of batching
+throughput and retained memory. APC can warm the initial prompt and its entries
+survive Stop; a resume uses its private live state directly and needs no APC
+lookup. Resume also works with APC disabled. Live inference checkpoints are
+separate from APC's shared prefix cache and disk storage.
+
+Checkpoints are process-local, bounded to 32 handles and expire after 10 minutes
+of inactivity. A background sweep runs every 30 seconds, removing expired
+records and their saved request/text even when no new requests arrive. Active
+streams are exempt; closing a stream starts its inactivity window. Expiring an
+older handle does not release a decoder still referenced by another handle.
+Server shutdown clears the remaining records and retained sessions.
+The worker limits paused target-cache buffers to 1 GiB in aggregate
+(`MLX_VLM_CONTINUATION_CACHE_BYTES`), evicting the oldest paused state first.
+A restart, model unload, eviction or expired checkpoint requires regeneration;
+unavailable checkpoints return HTTP 409 rather than silently restarting the
+answer. Authentication and tenant isolation match the original request.
+Diffusion models do not currently support inference checkpoints.
+
+For older transcripts without a checkpoint, `"continue_final_message": true`
+continues an unfinished final assistant message using its template prefix.
+It requires a template that preserves that assistant field and cannot recover
+raw delimiters or generation settings absent from the transcript. Do not combine
+it with `continuation`.
+
 ## Conversation compaction and APC
 
 Compaction replaces older conversation turns with a model-generated handoff and
