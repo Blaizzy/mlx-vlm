@@ -1,6 +1,6 @@
 """Fused short-block projection, expert, and hyperconnection kernels."""
 
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import Optional
 
 import mlx.core as mx
@@ -1166,3 +1166,325 @@ def exact_hc_expand(
         output_dtypes=[x.dtype],
     )[0]
     return output
+
+
+@partial(mx.compile, shapeless=True)
+def normalize_expert_weights(scores, indices):
+    weights = mx.take_along_axis(scores, indices, axis=-1)
+    return weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
+
+
+@lru_cache(None)
+def _route_kernel():
+    return mx.fast.metal_kernel(
+        name="select_experts",
+        input_names=["scores", "choice"],
+        output_names=["indices", "weights"],
+        header="#pragma clang fp contract(off)\n",
+        source="""
+        uint row = threadgroup_position_in_grid.x;
+        uint lane = thread_index_in_simdgroup;
+        float values[EXPERTS / 32];
+        bool valid[EXPERTS / 32];
+        int selected[TOP_K];
+        for (int j = 0; j < EXPERTS / 32; ++j) {
+            values[j] = choice[row * EXPERTS + j * 32 + lane];
+            valid[j] = true;
+        }
+        // Match the stable ascending sort used by MLX argpartition, including
+        // ties, infinities and NaNs. Invalid entries cannot be selected again.
+        for (int k = TOP_K - 1; k >= 0; --k) {
+            float best = -INFINITY;
+            int nan_index = -1;
+            for (int j = 0; j < EXPERTS / 32; ++j) {
+                if (!valid[j]) continue;
+                if (isnan(values[j])) nan_index = j * 32 + lane;
+                else best = max(best, values[j]);
+            }
+            best = simd_max(best);
+            nan_index = simd_max(nan_index);
+            int index = -1;
+            for (int j = 0; j < EXPERTS / 32; ++j) {
+                if (valid[j] && values[j] == best) index = j * 32 + lane;
+            }
+            index = nan_index >= 0 ? nan_index : simd_max(index);
+            selected[k] = index;
+            for (int j = 0; j < EXPERTS / 32; ++j) {
+                if (j * 32 + lane == index) valid[j] = false;
+            }
+        }
+        if (lane == 0) {
+            float total = 0.0f;
+            for (int k = 0; k < TOP_K; ++k) total += scores[row * EXPERTS + selected[k]];
+            total += 1e-20f;
+            for (int k = 0; k < TOP_K; ++k) {
+                indices[row * TOP_K + k] = selected[k];
+                weights[row * TOP_K + k] = scores[row * EXPERTS + selected[k]] / total;
+            }
+        }
+        """,
+    )
+
+
+def select_experts(scores, choice, top_k):
+    """Inference selection of stable top-k choices and normalized FP32 scores."""
+    if (
+        mx.metal.is_available()
+        and mx.default_device() == mx.gpu
+        and 1 <= top_k <= 8
+        and scores.shape[-1] in (32, 64, 128, 256)
+        and scores.shape == choice.shape
+        and scores.dtype == choice.dtype == mx.float32
+        and scores.size > 0
+    ):
+        shape = (*scores.shape[:-1], top_k)
+        return _route_kernel()(
+            inputs=[scores, choice],
+            template=[("EXPERTS", scores.shape[-1]), ("TOP_K", top_k)],
+            grid=(32 * (scores.size // scores.shape[-1]), 1, 1),
+            threadgroup=(32, 1, 1),
+            output_shapes=[shape, shape],
+            output_dtypes=[mx.int32, mx.float32],
+        )
+    indices = mx.stop_gradient(
+        mx.argpartition(choice, kth=-top_k, axis=-1)[..., -top_k:]
+    )
+    return indices, normalize_expert_weights(scores, indices)
+
+
+def _supports_affine_swiglu(linear, x):
+    from .switch_layers import QuantizedSwitchLinear
+
+    return (
+        mx.metal.is_available()
+        and mx.default_device() == mx.gpu
+        and type(linear) is QuantizedSwitchLinear
+        and linear.bits == 4
+        and linear.group_size == 64
+        and linear.mode == "affine"
+        and "bias" not in linear
+        and linear.biases is not None
+        and x.dtype in (mx.bfloat16, mx.float16)
+        and linear.scales.dtype == x.dtype
+        and linear.biases.dtype == x.dtype
+        and linear.input_dims == x.shape[-1]
+        and linear.input_dims % 512 == 0
+        and linear.output_dims % 8 == 0
+    )
+
+
+@lru_cache(None)
+def _affine_swiglu_kernel():
+    source = r"""
+    uint lane = thread_index_in_simdgroup;
+    int route = threadgroup_position_in_grid.z;
+    int row0 = threadgroup_position_in_grid.y * ROWS_PER_TG +
+        simdgroup_index_in_threadgroup * RESULTS_PER_SIMDGROUP;
+    int expert = int(indices[route]);
+    constexpr int ROW_BYTES = K_SIZE / 2;
+    constexpr int GROUPS = K_SIZE / GROUP_SIZE;
+    const device T* xp = x + (route / TOP_K) * K_SIZE + lane * VALUES_PER_THREAD;
+    int woff = expert * N_SIZE * ROW_BYTES + row0 * ROW_BYTES +
+        lane * PACKS_PER_THREAD * BYTES_PER_PACK;
+    int soff = expert * N_SIZE * GROUPS + row0 * GROUPS +
+        lane / SCALE_STEP_PER_THREAD;
+    float up_result[RESULTS_PER_SIMDGROUP] = {0};
+    float gate_result[RESULTS_PER_SIMDGROUP] = {0};
+    float xt[VALUES_PER_THREAD];
+    for (int k = 0; k < K_SIZE; k += BLOCK_SIZE) {
+      float sum = load_affine4_vector_exact<T>(xp, xt);
+      for (int r = 0; r < RESULTS_PER_SIMDGROUP; ++r) {
+        up_result[r] += affine4_qdot_exact(
+            (const device uint8_t*)up_w + woff + r * ROW_BYTES, xt,
+            float(up_scales[soff + r * GROUPS]),
+            float(up_biases[soff + r * GROUPS]), sum);
+        gate_result[r] += affine4_qdot_exact(
+            (const device uint8_t*)gate_w + woff + r * ROW_BYTES, xt,
+            float(gate_scales[soff + r * GROUPS]),
+            float(gate_biases[soff + r * GROUPS]), sum);
+      }
+      xp += BLOCK_SIZE;
+      woff += BLOCK_SIZE / 2;
+      soff += BLOCK_SIZE / GROUP_SIZE;
+    }
+    for (int r = 0; r < RESULTS_PER_SIMDGROUP; ++r) {
+      T up = T(simd_sum(up_result[r]));
+      T gate = T(simd_sum(gate_result[r]));
+      if (lane == 0) {
+        // Match MLX Sigmoid and both BF16 rounding points in compiled SwiGLU.
+        auto z = 1 / (1 + metal::precise::exp(metal::abs(gate)));
+        T sigmoid = gate < 0 ? z : 1 - z;
+        T silu = T(gate * sigmoid);
+        y[route * N_SIZE + row0 + r] = T(silu * up);
+      }
+    }
+    """
+    return mx.fast.metal_kernel(
+        name="affine_swiglu",
+        input_names=[
+            "x",
+            "indices",
+            "up_w",
+            "up_scales",
+            "up_biases",
+            "gate_w",
+            "gate_scales",
+            "gate_biases",
+        ],
+        output_names=["y"],
+        header=_affine_exact_header(4, 64, 2, 1),
+        source=source,
+    )
+
+
+def exact_affine_swiglu(switch, x, indices):
+    """Fuse affine vector projections and SwiGLU, or return None for native dispatch."""
+    from .switch_layers import SwiGLU
+
+    up, gate = getattr(switch, "up_proj", None), getattr(switch, "gate_proj", None)
+    # Match SwitchGLU's vector/matrix dispatch. Sorted matrix projections use
+    # MLX's native grouped matmul, whose accumulation order differs.
+    if (
+        type(getattr(switch, "activation", None)) is not SwiGLU
+        or x.ndim != 3
+        or indices.shape[:2] != x.shape[:2]
+        or not 0 < indices.size < 64
+        or not 1 <= indices.shape[-1] <= 8
+        or not (_supports_affine_swiglu(up, x) and _supports_affine_swiglu(gate, x))
+        or up.weight.shape != gate.weight.shape
+    ):
+        return None
+    b, l, d = x.shape
+    k = indices.shape[-1]
+    n = up.output_dims
+    return _affine_swiglu_kernel()(
+        inputs=[
+            x,
+            indices.astype(mx.int32),
+            up.weight,
+            up.scales,
+            up.biases,
+            gate.weight,
+            gate.scales,
+            gate.biases,
+        ],
+        template=[
+            ("T", x.dtype),
+            ("K_SIZE", d),
+            ("N_SIZE", n),
+            ("TOP_K", k),
+            ("GROUP_SIZE", 64),
+        ],
+        grid=(32, n // 2, b * l * k),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(b, l, k, n)],
+        output_dtypes=[x.dtype],
+    )[0]
+
+
+@lru_cache(None)
+def _affine_fp32_down_kernel(top_k):
+    source = r"""
+    uint lane = thread_index_in_simdgroup;
+    uint route = simdgroup_index_in_threadgroup;
+    int token = threadgroup_position_in_grid.z;
+    int row = threadgroup_position_in_grid.y;
+    constexpr int ROW_BYTES = K_SIZE / 2;
+    constexpr int GROUPS = K_SIZE / GROUP_SIZE;
+    threadgroup float projected[TOP_K];
+    int slot = token * TOP_K + route;
+    int expert = int(indices[slot]);
+    const device T* xp = x + slot * K_SIZE + lane * VALUES_PER_THREAD;
+    int woff = expert * N_SIZE * ROW_BYTES + row * ROW_BYTES +
+        lane * PACKS_PER_THREAD * BYTES_PER_PACK;
+    int soff = expert * N_SIZE * GROUPS + row * GROUPS +
+        lane / SCALE_STEP_PER_THREAD;
+    float result = 0.0f;
+    float xt[VALUES_PER_THREAD];
+    for (int k = 0; k < K_SIZE; k += BLOCK_SIZE) {
+        float sum = load_affine4_vector_exact<T>(xp, xt);
+        result += affine4_qdot_exact(
+            (const device uint8_t*)w + woff, xt,
+            float(scales[soff]), float(biases[soff]), sum);
+        xp += BLOCK_SIZE;
+        woff += BLOCK_SIZE / 2;
+        soff += BLOCK_SIZE / GROUP_SIZE;
+    }
+    float value = float(T(simd_sum(result)));
+    if (lane == 0) projected[route] = value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (route == 0 && lane == 0) {
+        // Parallel projections retain the original ordered FP32 reduction.
+        float total = 0.0f;
+        for (int k = 0; k < TOP_K; ++k) {
+            float term = projected[k] * route_weights[token * TOP_K + k];
+            total = total + term;
+        }
+        int pos = token * N_SIZE + row;
+        T output = T(total);
+        if (HAS_SHARED) output = T(output + shared_y[pos]);
+        y[pos] = output;
+    }
+    """
+    return mx.fast.metal_kernel(
+        name="affine_down_fp32_reduce",
+        input_names=[
+            "x",
+            "indices",
+            "route_weights",
+            "w",
+            "scales",
+            "biases",
+            "shared_y",
+        ],
+        output_names=["y"],
+        header=_affine_exact_header(4, 64, 1, top_k)
+        + "\n#pragma clang fp contract(off)\n",
+        source=source,
+    )
+
+
+def exact_affine_moe_down_fp32(linear, x, indices, weights, shared):
+    """Fuse selected affine vectors with FP32 weighting and a rounded shared add."""
+    if (
+        x.ndim != 4
+        or indices.shape != x.shape[:3]
+        or weights.shape != indices.shape
+        or weights.dtype != mx.float32
+        or not 0 < indices.size < 64
+        or not 1 <= indices.shape[-1] <= 8
+        or not _supports_affine_swiglu(linear, x)
+        or (
+            shared is not None
+            and (
+                shared.shape != (*x.shape[:2], linear.output_dims)
+                or shared.dtype != x.dtype
+            )
+        )
+    ):
+        return None
+    b, l, k, d = x.shape
+    n = linear.output_dims
+    return _affine_fp32_down_kernel(k)(
+        inputs=[
+            x,
+            indices.astype(mx.int32),
+            weights,
+            linear.weight,
+            linear.scales,
+            linear.biases,
+            shared if shared is not None else x,
+        ],
+        template=[
+            ("T", x.dtype),
+            ("K_SIZE", d),
+            ("N_SIZE", n),
+            ("TOP_K", k),
+            ("GROUP_SIZE", 64),
+            ("HAS_SHARED", shared is not None),
+        ],
+        grid=(32, k * n, b * l),
+        threadgroup=(32, k, 1),
+        output_shapes=[(b, l, n)],
+        output_dtypes=[x.dtype],
+    )[0]

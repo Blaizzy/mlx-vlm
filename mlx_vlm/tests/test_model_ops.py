@@ -2707,3 +2707,153 @@ def test_lfm3_partial_rope_preserves_pairs_in_both_halves():
     np.testing.assert_allclose(
         y[..., 4:6], b * np.cos(angles) + a * np.sin(angles), atol=2e-6
     )
+
+
+class TestWeightedSwitchGLU:
+    @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+    @pytest.mark.parametrize("batch", [1, 8, 16])
+    @pytest.mark.parametrize("top_k", [1, 2, 3, 4, 5, 6, 7, 8])
+    def test_fused_and_native_experts(self, dtype, batch, top_k):
+        from mlx_vlm.models.fast_ops import (
+            exact_affine_moe_down_fp32,
+            exact_affine_swiglu,
+        )
+        from mlx_vlm.models.switch_layers import SwitchGLU
+
+        mx.random.seed(31)
+        module = SwitchGLU(512, 512, 8)
+        module.set_dtype(dtype)
+        nn.quantize(module, group_size=64, bits=4)
+        module.eval()
+        for length in (1, 3, 17):
+            x = mx.random.normal((batch, 512, length)).astype(dtype).swapaxes(-1, -2)
+            indices = mx.argsort(mx.random.normal((batch, length, 8)), axis=-1)[
+                ..., :top_k
+            ]
+            weights = mx.softmax(mx.random.normal(indices.shape))
+            routed = module(x, indices)
+            expected = (
+                (routed.astype(mx.float32) * weights[..., None]).sum(-2).astype(dtype)
+            )
+            for shared in (None, mx.random.normal((batch, length, 512)).astype(dtype)):
+                target = expected if shared is None else expected + shared
+                actual = module(
+                    x, indices, weights, shared, accumulation_dtype=mx.float32
+                )
+                assert mx.array_equal(actual, target).item()
+                activated = exact_affine_swiglu(module, x, indices)
+                if mx.metal.is_available() and indices.size < 64:
+                    assert activated is not None
+                    fused = exact_affine_moe_down_fp32(
+                        module.down_proj, activated, indices, weights, shared
+                    )
+                    assert fused is not None
+                    assert mx.array_equal(fused, target).item()
+                else:
+                    assert activated is None
+
+    @pytest.mark.parametrize("top_k", [2, 6, 8])
+    @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16, mx.float32])
+    def test_accumulation_precision_and_default(self, top_k, dtype):
+        from mlx_vlm.models.switch_layers import SwitchGLU
+
+        routed = mx.random.normal((2, 64, top_k, 17)).astype(dtype).swapaxes(1, 3)
+        weights = mx.softmax(mx.random.normal(routed.shape[:-1]))
+        shared = mx.random.normal((*routed.shape[:-2], routed.shape[-1])).astype(dtype)
+        expected = (routed.astype(mx.float32) * weights[..., None]).sum(-2).astype(
+            dtype
+        ) + shared
+        actual = SwitchGLU._combine(
+            routed, weights, shared, accumulation_dtype=mx.float32
+        )
+        assert mx.array_equal(actual, expected).item()
+        native = (routed * weights[..., None].astype(dtype)).sum(-2) + shared
+        assert mx.array_equal(
+            SwitchGLU._combine(routed, weights, shared), native
+        ).item()
+
+    @pytest.mark.parametrize(
+        "experts,top_k",
+        [
+            (32, 2),
+            (64, 4),
+            (128, 8),
+            (256, 1),
+            (256, 3),
+            (256, 5),
+            (256, 6),
+            (256, 7),
+            (12, 3),
+        ],
+    )
+    @pytest.mark.parametrize("kind", ["random", "ties", "negative_inf", "nan"])
+    def test_selection(self, experts, top_k, kind):
+        from mlx_vlm.models.fast_ops import select_experts
+
+        mx.random.seed(81)
+        scores = mx.sigmoid(mx.random.normal((2, 17, experts)))
+        choice = scores + mx.random.normal((experts,))
+        if kind == "ties":
+            choice = mx.floor(choice * 4)
+        elif kind == "negative_inf":
+            choice = mx.full(choice.shape, -float("inf"))
+        elif kind == "nan":
+            choice = mx.where(mx.arange(experts) % 3 == 0, float("nan"), choice)
+        scores, choice = scores.swapaxes(0, 1), choice.swapaxes(0, 1)
+        expected = mx.argpartition(choice, kth=-top_k, axis=-1)[..., -top_k:]
+        indices, weights = select_experts(scores, choice, top_k)
+        reference = mx.take_along_axis(scores, expected, axis=-1)
+        reference /= reference.sum(axis=-1, keepdims=True) + 1e-20
+        assert mx.array_equal(indices, expected).item()
+        assert mx.array_equal(weights, reference).item()
+
+    @pytest.mark.parametrize(
+        "kind", ["cpu", "bias", "group32", "bits8", "activation", "projection"]
+    )
+    def test_native_fallbacks(self, kind):
+        from mlx_vlm.models.fast_ops import exact_affine_swiglu, select_experts
+        from mlx_vlm.models.switch_layers import SwitchGLU
+
+        class CustomActivation(nn.Module):
+            def __call__(self, up, gate):
+                return up * nn.relu(gate)
+
+        class CustomProjection(nn.Module):
+            def __init__(self, projection):
+                super().__init__()
+                self.projection = projection
+
+            def __call__(self, x, indices, sorted_indices=False):
+                assert mx.all(mx.isfinite(x)).item()
+                return self.projection(x, indices, sorted_indices=sorted_indices)
+
+        with mx.stream(mx.cpu if kind == "cpu" else mx.default_device()):
+            module = SwitchGLU(512, 512, 8, bias=kind == "bias")
+            module.set_dtype(mx.bfloat16)
+            nn.quantize(
+                module,
+                group_size=32 if kind == "group32" else 64,
+                bits=8 if kind == "bits8" else 4,
+            )
+            if kind == "activation":
+                module.activation = CustomActivation()
+            if kind == "projection":
+                module.up_proj = CustomProjection(module.up_proj)
+            module.eval()
+            x = mx.random.normal((1, 1, 512)).astype(mx.bfloat16)
+            indices = mx.arange(6)[None, None]
+            weights = mx.softmax(mx.random.normal((1, 1, 6)))
+            assert exact_affine_swiglu(module, x, indices) is None
+            expected = (
+                (module(x, indices).astype(mx.float32) * weights[..., None])
+                .sum(-2)
+                .astype(x.dtype)
+            )
+            actual = module(x, indices, weights, accumulation_dtype=mx.float32)
+            assert mx.array_equal(actual, expected).item()
+            if kind == "cpu":
+                scores = mx.sigmoid(mx.random.normal((1, 256)))
+                selected, normalized = select_experts(scores, scores, 6)
+                reference = mx.argpartition(scores, kth=-6, axis=-1)[..., -6:]
+                assert mx.array_equal(selected, reference).item()
+                assert mx.all(mx.isfinite(normalized)).item()

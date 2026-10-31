@@ -5662,3 +5662,184 @@ def test_lfm3_omni_quantized_checkpoint_roundtrip(tmp_path, lfm3_omni):
     restored = load_model(tmp_path)
     actual = restored(ids, **kwargs).logits
     np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+
+class TestFlintMoe:
+    @staticmethod
+    def reference(module, x):
+        scores = mx.sigmoid(module.gate(x).astype(mx.float32))
+        indices = mx.stop_gradient(
+            mx.argpartition(
+                scores + module.expert_bias.astype(mx.float32),
+                kth=-module.top_k,
+                axis=-1,
+            )[..., -module.top_k :]
+        )
+        weights = mx.take_along_axis(scores, indices, axis=-1)
+        weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
+        routed = module.switch_mlp(x, indices)
+        output = (
+            (routed.astype(mx.float32) * weights[..., None]).sum(-2).astype(x.dtype)
+        )
+        return (
+            output if module.shared_expert is None else output + module.shared_expert(x)
+        )
+
+    @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+    def test_prefill_and_decode_match_training(self, dtype):
+        from mlx_vlm.models.flint import ModelConfig
+        from mlx_vlm.models.flint.language import LanguageModel
+
+        mx.random.seed(84)
+        model = LanguageModel(
+            ModelConfig(
+                vocab_size=128,
+                hidden_size=256,
+                num_hidden_layers=3,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                intermediate_size=512,
+                moe_intermediate_size=512,
+                shared_expert_intermediate_size=512,
+                num_experts=8,
+                num_experts_per_tok=6,
+                layer_types=["full_attention", "sliding_attention", "full_attention"],
+                no_rope_layer_indices=[0, 2],
+                sliding_window=16,
+                mlp_only_layers=[0],
+            )
+        )
+        model.set_dtype(dtype)
+        nn.quantize(model, group_size=64, bits=4)
+        ids = mx.arange(21)[None]
+        results = []
+        for training in (True, False):
+            model.train(training)
+            cache = model.make_cache()
+            results.append([model(ids[:, :17], cache=cache).logits])
+            for i in range(17, 21):
+                results[-1].append(model(ids[:, i : i + 1], cache=cache).logits)
+            mx.eval(results[-1])
+        for expected, actual in zip(*results):
+            assert mx.array_equal(actual, expected).item()
+
+    def test_moe_tracks_weights_and_quantization(self):
+        from mlx_vlm.models.flint import ModelConfig
+        from mlx_vlm.models.flint.language import SparseMoeBlock
+
+        mx.random.seed(32)
+        module = SparseMoeBlock(
+            ModelConfig(
+                hidden_size=64,
+                moe_intermediate_size=64,
+                shared_expert_intermediate_size=0,
+                num_experts=8,
+                num_experts_per_tok=6,
+            )
+        )
+        module.eval()
+        x = mx.random.normal((2, 1, 64))
+        original = module(x)
+        mx.eval(original)
+        module.switch_mlp.down_proj.weight *= 2
+        changed = module(x)
+        assert not mx.array_equal(original, changed).item()
+        np.testing.assert_array_equal(
+            np.array(changed), np.array(self.reference(module, x))
+        )
+        nn.quantize(module, group_size=32, bits=4)
+        np.testing.assert_array_equal(
+            np.array(module(x)), np.array(self.reference(module, x))
+        )
+        module.top_k = 2
+        np.testing.assert_array_equal(
+            np.array(module(x)), np.array(self.reference(module, x))
+        )
+
+    def test_moe_custom_projection_stays_eager(self):
+        from mlx_vlm.models.flint import ModelConfig
+        from mlx_vlm.models.flint.language import SparseMoeBlock
+
+        class CustomRouter(nn.Linear):
+            def __call__(self, x):
+                # Data-dependent Python is valid for an uncompiled custom layer.
+                assert mx.all(mx.isfinite(x)).item()
+                return super().__call__(x)
+
+        module = SparseMoeBlock(
+            ModelConfig(
+                hidden_size=64,
+                moe_intermediate_size=64,
+                shared_expert_intermediate_size=0,
+                num_experts=8,
+                num_experts_per_tok=6,
+            )
+        )
+        module.eval()
+        x = mx.ones((1, 3, 64))
+        mx.eval(module(x))
+        module.gate = CustomRouter(64, 8, bias=False)
+        assert mx.array_equal(module(x), self.reference(module, x)).item()
+
+    @pytest.mark.parametrize("top_k", [2, 6])
+    def test_cpu_fallback_and_training_gradients(self, top_k):
+        from mlx_vlm.models.flint import ModelConfig
+        from mlx_vlm.models.flint.language import SparseMoeBlock
+
+        module = SparseMoeBlock(
+            ModelConfig(
+                hidden_size=64,
+                moe_intermediate_size=64,
+                shared_expert_intermediate_size=0,
+                num_experts=8,
+                num_experts_per_tok=top_k,
+            )
+        )
+        x = mx.random.normal((1, 3, 64))
+        module.eval()
+        with mx.stream(mx.cpu):
+            actual, expected = module(x), self.reference(module, x)
+            np.testing.assert_allclose(np.array(actual), np.array(expected), atol=1e-6)
+        module.train()
+        loss, gradients = nn.value_and_grad(module, lambda m: mx.sum(m(x)))(module)
+        mx.eval(loss, gradients)
+        assert mx.isfinite(loss).item()
+        assert all(mx.all(mx.isfinite(v)).item() for _, v in tree_flatten(gradients))
+
+        expected_loss, expected_gradients = nn.value_and_grad(
+            module, lambda m: mx.sum(self.reference(m, x))
+        )(module)
+        assert mx.allclose(loss, expected_loss, atol=1e-6).item()
+        for (_, actual), (_, expected) in zip(
+            tree_flatten(gradients), tree_flatten(expected_gradients)
+        ):
+            assert mx.allclose(actual, expected, atol=1e-6).item()
+
+    def test_paged_expert_wrapper_stays_eager(self):
+        from mlx_vlm.models.flint import ModelConfig
+        from mlx_vlm.models.flint.language import SparseMoeBlock
+
+        class PagedExperts(nn.Module):
+            def __init__(self, delegate):
+                super().__init__()
+                self.delegate = delegate
+
+            def __call__(self, x, indices):
+                # Paging needs actual route values, which are unavailable in a trace.
+                assert indices.tolist()
+                return self.delegate(x, indices)
+
+        module = SparseMoeBlock(
+            ModelConfig(
+                hidden_size=64,
+                moe_intermediate_size=64,
+                shared_expert_intermediate_size=0,
+                num_experts=8,
+                num_experts_per_tok=6,
+            )
+        )
+        module.switch_mlp = PagedExperts(module.switch_mlp)
+        module.eval()
+
+        x = mx.random.normal((1, 1, 64))
+        assert mx.array_equal(module(x), self.reference(module, x)).item()

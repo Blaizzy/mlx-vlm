@@ -1,4 +1,5 @@
 import math
+from functools import partial
 from typing import Any, Optional, Tuple
 
 import mlx.core as mx
@@ -230,7 +231,18 @@ class SwiGLU(nn.Module):
         return swiglu(gate, x)
 
 
+@partial(mx.compile, shapeless=True)
+def _weighted_sum(routed, weights):
+    return (
+        (routed.astype(weights.dtype) * weights[..., None])
+        .sum(axis=-2)
+        .astype(routed.dtype)
+    )
+
+
 class SwitchGLU(nn.Module):
+    """Selected experts with optional weighting in an explicit accumulation dtype."""
+
     def __init__(
         self,
         input_dims: int,
@@ -247,8 +259,30 @@ class SwitchGLU(nn.Module):
         self.activation = activation
 
     def __call__(
-        self, x, indices, weights=None, shared=None, residual=None
+        self,
+        x,
+        indices,
+        weights=None,
+        shared=None,
+        residual=None,
+        *,
+        accumulation_dtype=None,
     ) -> mx.array:
+        if (
+            not self.training
+            and accumulation_dtype is not None
+            and accumulation_dtype == mx.float32
+            and weights is not None
+        ):
+            from .fast_ops import exact_affine_moe_down_fp32, exact_affine_swiglu
+
+            activated = exact_affine_swiglu(self, x, indices)
+            if activated is not None:
+                output = exact_affine_moe_down_fp32(
+                    self.down_proj, activated, indices, weights, shared
+                )
+                if output is not None:
+                    return self._combine(output, None, None, residual)
         if not self.training and x.ndim == 3 and 1 < x.shape[1] <= DECODE_BLOCK_SIZE:
             from .fast_ops import exact_affine_moe_down, exact_affine_switch_gate_up
             from .linear import tokenwise
@@ -269,7 +303,7 @@ class SwitchGLU(nn.Module):
                     up, gate = gate_up
                 if up is not None and gate is not None:
                     activated = self.activation(up, gate)
-                    if residual is not None:
+                    if residual is not None and accumulation_dtype is None:
                         output = exact_quantized_moe_hc_expand(
                             self.down_proj,
                             activated,
@@ -280,7 +314,11 @@ class SwitchGLU(nn.Module):
                         )
                         if output is not None:
                             return output
-                    if weights is not None and shared is not None:
+                    if (
+                        weights is not None
+                        and shared is not None
+                        and accumulation_dtype is None
+                    ):
                         output = exact_affine_moe_down(
                             self.down_proj, activated, indices, weights, shared
                         )
@@ -291,7 +329,9 @@ class SwitchGLU(nn.Module):
                     )
             if routed is None:
                 routed = tokenwise(self, x, indices)
-            return self._combine(routed, weights, shared, residual)
+            return self._combine(
+                routed, weights, shared, residual, accumulation_dtype=accumulation_dtype
+            )
 
         x = mx.expand_dims(x, (-2, -3))
 
@@ -313,12 +353,21 @@ class SwitchGLU(nn.Module):
         if do_sort:
             x = _scatter_unsort(x, inv_order, indices.shape)
 
-        return self._combine(x.squeeze(-2), weights, shared, residual)
+        return self._combine(
+            x.squeeze(-2),
+            weights,
+            shared,
+            residual,
+            accumulation_dtype=accumulation_dtype,
+        )
 
     @staticmethod
-    def _combine(routed, weights, shared, residual=None):
+    def _combine(routed, weights, shared, residual=None, *, accumulation_dtype=None):
         if weights is not None:
-            routed = (routed * weights[..., None].astype(routed.dtype)).sum(axis=-2)
+            if accumulation_dtype is None:
+                routed = (routed * weights[..., None].astype(routed.dtype)).sum(axis=-2)
+            else:
+                routed = _weighted_sum(routed, weights.astype(accumulation_dtype))
         output = routed if shared is None else routed + shared
         if residual is not None:
             from .deepseek_v4.hyper_connection import hc_expand

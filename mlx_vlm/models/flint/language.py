@@ -1,3 +1,5 @@
+from functools import partial
+
 import mlx.core as mx
 import mlx.nn as nn
 
@@ -7,6 +9,7 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import KVCache, RotatingKVCache
+from ..fast_ops import select_experts
 from ..mlp import SwiGLUMLP
 from ..rope_utils import initialize_rope
 from ..switch_layers import SwitchGLU, stack_expert_projection
@@ -81,6 +84,12 @@ class Attention(nn.Module):
         return self.o_proj(out.transpose(0, 2, 1, 3).reshape(batch, length, -1))
 
 
+@partial(mx.compile, shapeless=True)
+def _routing_scores(logits, bias):
+    scores = mx.sigmoid(logits.astype(mx.float32))
+    return scores, scores + bias.astype(mx.float32)
+
+
 class SparseMoeBlock(nn.Module):
     def __init__(self, args: ModelConfig):
         super().__init__()
@@ -99,8 +108,9 @@ class SparseMoeBlock(nn.Module):
     def route(self, x):
         # The reference computes the projection in the activation dtype, then
         # sigmoid and normalization in FP32. Bias affects selection only.
-        scores = mx.sigmoid(self.gate(x).astype(mx.float32))
-        choice = scores + self.expert_bias.astype(mx.float32)
+        scores, choice = _routing_scores(self.gate(x), self.expert_bias)
+        if not self.training:
+            return select_experts(scores, choice, self.top_k)
         indices = mx.stop_gradient(
             mx.argpartition(choice, kth=-self.top_k, axis=-1)[..., -self.top_k :]
         )
@@ -110,15 +120,15 @@ class SparseMoeBlock(nn.Module):
 
     def __call__(self, x):
         indices, weights = self.route(x)
-        routed = self.switch_mlp(x, indices)
-        out = (
-            (routed.astype(mx.float32) * weights[..., None])
-            .sum(axis=-2)
-            .astype(x.dtype)
+        shared = self.shared_expert(x) if self.shared_expert is not None else None
+        if type(self.switch_mlp) is SwitchGLU:
+            return self.switch_mlp(
+                x, indices, weights, shared, accumulation_dtype=mx.float32
+            )
+        # Offloaded and custom expert modules keep their two-argument interface.
+        return SwitchGLU._combine(
+            self.switch_mlp(x, indices), weights, shared, accumulation_dtype=mx.float32
         )
-        if self.shared_expert is not None:
-            out = out + self.shared_expert(x)
-        return out
 
 
 class DecoderLayer(nn.Module):
