@@ -4264,36 +4264,30 @@ def make_warm_batch_kv_cache_multi(
         vs = [b.values[layer_idx] for b in blocks]
         return mx.concatenate(ks, axis=2), mx.concatenate(vs, axis=2)
 
-    # Discover dtype / head dims from the first non-empty pick.
-    sample = next(p for p in picks if p)
-    sample_k, _ = layer_tensors(sample, 0)  # [1, H, prefix_len, D]
-    n_kv_heads = sample_k.shape[1]
-    head_dim = sample_k.shape[-1]
-    dtype = sample_k.dtype
+    def zeros_like_rows(ref: mx.array, length: int) -> mx.array:
+        # Padding takes heads / width / dtype from the tensor it pads: keys and
+        # values can differ (e.g. MLA latent vs. rope part), and so can layers.
+        return mx.zeros((1, ref.shape[1], length, ref.shape[-1]), dtype=ref.dtype)
 
     out: List[Any] = []
     for layer_idx in range(num_layers):
         # Build per-row warm K/V tensors of shape [1, H, max_prefix, D]; rows
         # without a hit get zeros, rows with a shorter prefix get zero left-pad.
+        warm = [layer_tensors(p, layer_idx) if p else None for p in picks]
+        ref_k, ref_v = next(kv for kv in warm if kv is not None)
         row_keys: List[mx.array] = []
         row_values: List[mx.array] = []
-        for pick in picks:
-            if pick is None:
+        for pick, kv in zip(picks, warm):
+            if kv is None:
                 # Cold row: full pre-warm zone is left padding (zeros).
-                row_keys.append(
-                    mx.zeros((1, n_kv_heads, max_prefix, head_dim), dtype=dtype)
-                )
-                row_values.append(
-                    mx.zeros((1, n_kv_heads, max_prefix, head_dim), dtype=dtype)
-                )
+                row_keys.append(zeros_like_rows(ref_k, max_prefix))
+                row_values.append(zeros_like_rows(ref_v, max_prefix))
                 continue
-            warm_k, warm_v = layer_tensors(pick, layer_idx)
+            warm_k, warm_v = kv
             lp = max_prefix - pick["prefix_len"]
             if lp > 0:
-                pad_k = mx.zeros((1, n_kv_heads, lp, head_dim), dtype=dtype)
-                pad_v = mx.zeros((1, n_kv_heads, lp, head_dim), dtype=dtype)
-                warm_k = mx.concatenate([pad_k, warm_k], axis=2)
-                warm_v = mx.concatenate([pad_v, warm_v], axis=2)
+                warm_k = mx.concatenate([zeros_like_rows(warm_k, lp), warm_k], axis=2)
+                warm_v = mx.concatenate([zeros_like_rows(warm_v, lp), warm_v], axis=2)
             row_keys.append(warm_k)
             row_values.append(warm_v)
         merged_k = mx.concatenate(row_keys, axis=0)  # [B, H, max_prefix, D]
