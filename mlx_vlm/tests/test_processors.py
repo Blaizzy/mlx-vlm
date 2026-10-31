@@ -1634,6 +1634,28 @@ def test_locate_anything_save_pretrained_round_trips_custom_config(tmp_path):
     assert loaded.chat_template == loaded.tokenizer.chat_template == template
 
 
+def test_muse_glimmer_save_pretrained_round_trips_without_model_config(tmp_path):
+    from mlx_vlm.models.muse_glimmer import ModelConfig
+
+    tokens = ("[UNK]", "[PAD]", "hello", "<|patch|>")
+    p = c.muse_glimmer(
+        image_processor=m.muse_glimmer.MuseGlimmerImageProcessor(max_image_tokens=1234),
+        tokenizer=fast_tokenizer(tokens),
+        config=ModelConfig(),
+    )
+    p.save_pretrained(tmp_path)
+    saved = json.loads((tmp_path / "processor_config.json").read_text())
+    assert "config" not in saved
+    with patch(
+        "transformers.AutoTokenizer.from_pretrained",
+        return_value=fast_tokenizer(tokens),
+    ):
+        loaded = c.muse_glimmer.from_pretrained(
+            tmp_path, config={"model_type": "muse_glimmer"}
+        )
+    assert loaded.image_processor.max_image_tokens == 1234
+
+
 def test_qwen3_vl_video_timestamp_video_prompt_falls_back_to_processor_fps():
     p = _make_processor("qwen3_vl")
     p.tokenizer = ProcessorTokenizer(
