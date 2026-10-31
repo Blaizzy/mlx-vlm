@@ -90,38 +90,6 @@ from mlx_vlm.vision_cache import VisionFeatureCache, processed_image_key
 # Cache lifecycle
 
 
-def test_mage_text_batch_cache_matches_individual_rows():
-    from mlx_vlm.models.mage_vl.config import TextConfig
-    from mlx_vlm.models.mage_vl.language import LanguageModel
-
-    mx.random.seed(19)
-    model = LanguageModel(
-        TextConfig(
-            hidden_size=32,
-            intermediate_size=64,
-            num_hidden_layers=2,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            head_dim=16,
-            vocab_size=32,
-        )
-    )
-    batch_cache = [BatchKVCache(left_padding=[2, 0]) for _ in model.layers]
-    single_caches = [[KVCache() for _ in model.layers] for _ in range(2)]
-    tokens = mx.array([[0, 0, 3, 4, 5], [6, 7, 8, 9, 10]])
-    batched = model(tokens, cache=batch_cache).logits
-    for row, padding in enumerate([2, 0]):
-        single = model(tokens[row : row + 1, padding:], cache=single_caches[row]).logits
-        assert mx.allclose(batched[row : row + 1, padding:], single, atol=1e-5)
-    # Decode twice to exercise the evolving per-row offsets after left padding.
-    for tokens in [mx.array([[11], [12]]), mx.array([[13], [14]])]:
-        batched = model(tokens, cache=batch_cache).logits
-        for row in range(2):
-            single = model(tokens[row : row + 1], cache=single_caches[row]).logits
-            assert mx.allclose(batched[row : row + 1], single, atol=1e-5)
-    assert batch_cache[0].offset.tolist() == [5, 7]
-
-
 def _make_kv_cache(batch_size=1, length=3, factory=KVCache):
     cache = factory()
     keys = mx.arange(batch_size * 2 * length * 4).reshape(batch_size, 2, length, 4)

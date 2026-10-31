@@ -1,7 +1,7 @@
 """Mage-VL — codec-native streaming multimodal model (microsoft/Mage-VL, Apache-2.0).
 
 Composition only: a Mage-ViT tower (`vision.py`, net-new) feeding a stock Qwen3-4B decoder
-(`language.py`, with source-compatible rounding). See those modules for details.
+(`language.py`, reused verbatim). See those modules for the reproduced-upstream quirks.
 """
 
 from typing import List, Optional, Tuple
