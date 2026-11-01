@@ -633,6 +633,80 @@ def test_grid_sample_half_precision_matches_float32(dtype, grid_dtype):
     )
 
 
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+@pytest.mark.parametrize("latent,rope", [(16, 0), (16, 4), (512, 0), (512, 64)])
+@pytest.mark.parametrize("batch", [1, 3])
+def test_mistral_large4_sparse_mla_strided_cache_and_mask(dtype, latent, rope, batch):
+    from mlx_vlm.models.mistral_large4.mla_kernel import sparse_mla
+
+    mx.random.seed(17)
+    heads, length = 4, 257
+    q = mx.random.normal((batch, heads, 1, latent)).astype(dtype)
+    qr = mx.random.normal((batch, heads, 1, rope)).astype(dtype)
+    kv = mx.random.normal((batch, 1, length + 13, latent)).astype(dtype)[:, :, :length]
+    kr = mx.random.normal((batch, 1, length + 13, rope)).astype(dtype)[:, :, :length]
+    indices = mx.broadcast_to(mx.arange(0, length, 2)[None], (batch, 129))
+    limits = mx.array([length - 9] if batch == 1 else [length - 9, 97, 0])
+    mask = mx.arange(length)[None, None, None, :] < limits[:, None, None, None]
+    actual = sparse_mla(
+        q, qr, kv, kr, indices, mask, 128**-0.5, chunk=64 if batch == 1 else 128
+    )
+
+    def numpy(x):
+        return np.array(x.astype(mx.float32)).astype(np.float64)
+
+    selected = np.array(indices)[:, None, :, None]
+    values = np.take_along_axis(numpy(kv), selected, axis=2)
+    keys = np.take_along_axis(numpy(kr), selected, axis=2)
+    scores = (
+        numpy(q) @ values.swapaxes(-1, -2) + numpy(qr) @ keys.swapaxes(-1, -2)
+    ) * 128**-0.5
+    valid = np.take_along_axis(np.array(mask), np.array(indices)[:, None, None], -1)
+    scores = np.where(valid, scores, -np.inf)
+    maximum = np.max(scores, axis=-1, keepdims=True)
+    probabilities = np.exp(scores - np.where(np.isfinite(maximum), maximum, 0))
+    denominator = probabilities.sum(axis=-1, keepdims=True)
+    probabilities /= np.where(denominator > 0, denominator, 1)
+    expected = mx.array((probabilities @ values).astype(np.float32)).astype(dtype)
+    actual, expected = numpy(actual), numpy(expected)
+    assert np.isfinite(actual).all()
+    relative_l2 = np.linalg.norm(actual - expected) / np.linalg.norm(expected)
+    assert relative_l2 < (1e-3 if dtype == mx.bfloat16 else 1e-5)
+    if batch == 3:
+        np.testing.assert_array_equal(actual[-1], 0)
+
+
+def test_mistral_large4_compiled_indexer_growing_cache_and_head_dimensions():
+    from mlx_vlm.models.mistral_large4.language import _compiled_indexer_scores
+
+    mx.random.seed(23)
+    for batch, length, dim in ((1, 65, 16), (3, 79, 16), (1, 65, 32), (1, 97, 16)):
+        q = mx.random.normal((batch, 4, 1, dim)).astype(mx.bfloat16)
+        k = mx.random.normal((batch, length + 13, dim)).astype(mx.bfloat16)[:, :length]
+        weights = mx.random.normal((batch, 4, 1)) * 0.5
+        mask = mx.broadcast_to(
+            mx.arange(length)[None, None, None, :] < length - 7,
+            (batch, 1, 1, length),
+        )
+        actual = _compiled_indexer_scores(q, k, weights, mask, dim**-0.5)
+        scores = np.maximum(
+            np.array(q.astype(mx.float32))
+            @ np.array(k.astype(mx.float32))[:, None].swapaxes(-1, -2)
+            * dim**-0.5,
+            0,
+        )
+        expected = np.where(
+            np.array(mask)[:, 0],
+            (scores * np.array(weights)[..., None]).sum(axis=1),
+            -np.inf,
+        )
+        np.testing.assert_allclose(np.array(actual), expected, atol=1e-5, rtol=1e-5)
+        selected = mx.sort(mx.argpartition(-actual, kth=7, axis=-1)[..., :8])
+        expected_topk = np.sort(np.argpartition(-expected, kth=7, axis=-1)[..., :8])
+        np.testing.assert_array_equal(np.array(selected), expected_topk)
+
+
 # Rotary embeddings
 
 

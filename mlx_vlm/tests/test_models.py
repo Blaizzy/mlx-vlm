@@ -1502,6 +1502,49 @@ def mistral_large4_case():
     return module, build_config(module, case["config"])
 
 
+@pytest.mark.parametrize("prefix", [0, 255])
+@pytest.mark.parametrize("per_head_mask", [False, True])
+def test_mistral_large4_decode_cache_matches_unfused_attention(
+    mistral_large4_case, prefix, per_head_mask
+):
+    from mlx_vlm.models.mistral_large4.language import LatentCache
+
+    mx.random.seed(17)
+    module, config = mistral_large4_case
+    model = module.LanguageModel(config.text_config)
+    model.eval()
+    ids = mx.random.randint(0, config.text_config.vocab_size, (2, prefix + 6))
+    initial = model.make_cache()
+    if prefix:
+        model(ids[:, :prefix], cache=initial)
+        mx.eval([c.state for c in initial])
+    outputs = []
+    # Training uses the differentiable, unfused attention core. Inference
+    # uses the Metal kernel where available; both update their own caches.
+    for training in (True, False):
+        model.train(training)
+        cache = [LatentCache.from_state(c.state, c.meta_state) for c in initial]
+        logits = []
+        for position in range(prefix, prefix + 6):
+            mask = mx.broadcast_to(
+                mx.arange(position + 1)[None] % 3 != 1, (2, position + 1)
+            )
+            if per_head_mask:
+                mask = mx.broadcast_to(
+                    mask[:, None, None],
+                    (2, config.text_config.num_attention_heads, 1, position + 1),
+                )
+            logits.append(
+                model(ids[:, position : position + 1], cache=cache, mask=mask).logits
+            )
+            mx.eval(logits[-1])
+        outputs.append(mx.concatenate(logits, axis=1))
+        assert all(c.offset == prefix + 6 for c in cache)
+    np.testing.assert_allclose(
+        np.array(outputs[1]), np.array(outputs[0]), atol=1e-4, rtol=1e-4
+    )
+
+
 def test_mistral_large4_partitions_allow_three_ranks_and_reject_wrong_shards(
     mistral_large4_case,
 ):

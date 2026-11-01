@@ -14,6 +14,7 @@ from ..base import LanguageModelOutput
 from ..cache import _BaseCache
 from ..switch_layers import QuantizedSwitchLinear, SwitchLinear
 from .config import TextConfig
+from .mla_kernel import sparse_mla
 
 
 class LatentCache(_BaseCache):
@@ -154,6 +155,20 @@ class SoftmaxScaling(nn.Module):
         return q * scale[..., None]
 
 
+def _indexer_scores(q, k, weights, mask, scale):
+    scores = mx.maximum(
+        q.astype(mx.float32) @ k[:, None].swapaxes(-1, -2).astype(mx.float32) * scale,
+        0,
+    )
+    scores = (scores * weights[..., None]).sum(axis=1)
+    return mx.where(mask[:, 0], scores, -float("inf"))
+
+
+# Cache length changes during decode. Keep the head-dependent scale explicit
+# so a shapeless trace can also be reused safely across model configurations.
+_compiled_indexer_scores = mx.compile(_indexer_scores, shapeless=True)
+
+
 class Indexer(nn.Module):
     def __init__(self, args, idx):
         super().__init__()
@@ -195,18 +210,12 @@ class Indexer(nn.Module):
                 ],
                 axis=-1,
             )
-        scores = mx.maximum(
-            q.astype(mx.float32)
-            @ k[:, None].swapaxes(-1, -2).astype(mx.float32)
-            * self.dim**-0.5,
-            0,
-        )
         weights = (
             self.weights_proj(x).transpose(0, 2, 1).astype(mx.float32)
             * self.heads**-0.5
         )
-        scores = (scores * weights[..., None]).sum(axis=1)
-        scores = mx.where(causal[:, 0], scores, -float("inf"))
+        score_fn = _compiled_indexer_scores if t == 1 else _indexer_scores
+        scores = score_fn(q, k, weights, causal, self.dim**-0.5)
         return mx.argpartition(-scores, kth=self.topk - 1, axis=-1)[..., : self.topk]
 
 
@@ -236,7 +245,7 @@ class Attention(nn.Module):
         self.ssmax_scaling = SoftmaxScaling(self.heads)
         self.indexer = Indexer(args, idx) if args.indexer_types[idx] == "full" else None
 
-    def _decode_attention(self, q, latent, kr, mask):
+    def _decode_attention(self, q, latent, kr, mask, topk=None):
         # Absorb the K projection into Q and apply the V projection after
         # attention, avoiding expansion of every selected cached latent.
         weight = self.wkv_b.weight.reshape(
@@ -245,18 +254,45 @@ class Attention(nn.Module):
         # Keep projection rounding in the model dtype, with an FP32 attention
         # core, matching the reference's query and latent-output boundaries.
         q_latent = q[..., : self.nope_dim] @ weight[:, : self.nope_dim]
-        q_latent = q_latent.astype(mx.float32)
-        latent = latent.astype(mx.float32)
-        kr = kr.astype(mx.float32)
         scale = self.head_dim**-0.5
-        if self.rope_dim:
-            pe_scores = (
-                q[..., self.nope_dim :].astype(mx.float32) @ kr.swapaxes(-1, -2)
-            ) * scale
-            mask = mx.where(mask, pe_scores, -float("inf"))
-        out = mx.fast.scaled_dot_product_attention(
-            q_latent, latent, latent, scale=scale, mask=mask
-        ).astype(q.dtype)
+        indices = mx.sort(topk, axis=-1)[:, 0] if topk is not None else None
+        if (
+            not self.training
+            and mx.default_device() == mx.gpu
+            and mx.metal.is_available()
+            and mask.shape[1] == 1
+        ):
+            if indices is None:
+                indices = mx.broadcast_to(
+                    mx.arange(latent.shape[2])[None], (q.shape[0], latent.shape[2])
+                )
+            # Fuse cache reads, scores, online softmax and latent accumulation.
+            out = sparse_mla(
+                q_latent,
+                q[..., self.nope_dim :],
+                latent,
+                kr,
+                indices,
+                mask,
+                scale,
+                chunk=64 if q.shape[0] == 1 else 128,
+            ).astype(q.dtype)
+        else:
+            if indices is not None:
+                latent = mx.take_along_axis(latent, indices[:, None, :, None], axis=2)
+                kr = mx.take_along_axis(kr, indices[:, None, :, None], axis=2)
+                mask = mx.take_along_axis(mask, indices[:, None, None, :], axis=-1)
+            q_latent = q_latent.astype(mx.float32)
+            latent = latent.astype(mx.float32)
+            kr = kr.astype(mx.float32)
+            if self.rope_dim:
+                pe_scores = (
+                    q[..., self.nope_dim :].astype(mx.float32) @ kr.swapaxes(-1, -2)
+                ) * scale
+                mask = mx.where(mask, pe_scores, -float("inf"))
+            out = mx.fast.scaled_dot_product_attention(
+                q_latent, latent, latent, scale=scale, mask=mask
+            ).astype(q.dtype)
         return out @ weight[:, self.nope_dim :].swapaxes(-1, -2)
 
     def __call__(self, x, positions, cos, sin, cache, shared, previous, mask):
@@ -296,7 +332,8 @@ class Attention(nn.Module):
             if self.indexer is not None
             else previous
         )
-        if topk is not None:
+        decode = t == 1 and isinstance(self.wkv_b, nn.Linear)
+        if topk is not None and not decode:
             if t == 1:
                 # Expand only selected latents during decode, in sequence order.
                 indices = mx.sort(topk, axis=-1)[:, None]
@@ -308,8 +345,8 @@ class Attention(nn.Module):
                 selected = mx.zeros((b, t, length), dtype=mx.bool_)
                 selected = mx.put_along_axis(selected, topk, mx.array(True), axis=-1)
                 causal = causal & selected[:, None]
-        if t == 1 and isinstance(self.wkv_b, nn.Linear):
-            out = self._decode_attention(q, latent, kr, causal)
+        if decode:
+            out = self._decode_attention(q, latent, kr, causal, topk)
         else:
             kv = (
                 self.wkv_b(latent)
