@@ -62,7 +62,15 @@ Small distributed models matched unsharded logits. A small eight-layer model
 matched the Transformers reference within `1.08e-6` maximum hidden-state error.
 Model, cache, and quantization coverage lives in the shared test suites.
 
-Long-context performance remains unvalidated: attention expands historical KV
-and builds dense DSA selection masks. FP8 activation/KV quantization, DSpark/MTP
-speculative decoding, continuous batching, and padded variable-length batches
-are not implemented or validated here.
+Continuous batching uses the standard `BatchGenerator` with a model-specific
+`BatchLatentCache`. It supports variable-length prompts, chunked prefill,
+request insertion/removal, and warm cache merging. Latent, rotary, and indexer
+keys share the same padding layout, while positions advance per request.
+Distributed callers must submit the same requests and scheduling operations
+on every rank.
+
+Floating-point KV projections use absorbed sparse attention during decode;
+prefill still expands historical KV and builds dense DSA selection masks.
+FP8 activation/KV quantization and DSpark/MTP speculative decoding are not
+implemented here. Native NVFP4 expert weights are supported with continuous
+batching; additional KV-cache quantization is not.

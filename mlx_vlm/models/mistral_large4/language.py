@@ -11,7 +11,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import LanguageModelOutput
-from ..cache import _BaseCache
+from ..cache import _BaseCache, create_causal_mask, dynamic_roll
 from ..switch_layers import QuantizedSwitchLinear, SwitchLinear
 from .config import TextConfig
 from .mla_kernel import sparse_mla
@@ -26,7 +26,8 @@ class LatentCache(_BaseCache):
         self.offset = 0
 
     def _append(self, cache, values):
-        end = self.offset + values.shape[-2]
+        start = self.size()
+        end = start + values.shape[-2]
         if cache is None or end > cache.shape[-2]:
             capacity = ((values.shape[-2] + self.step - 1) // self.step) * self.step
             padding = mx.zeros(
@@ -35,25 +36,51 @@ class LatentCache(_BaseCache):
             cache = (
                 padding
                 if cache is None
-                else mx.concatenate([cache[..., : self.offset, :], padding], axis=-2)
+                else mx.concatenate([cache[..., :start, :], padding], axis=-2)
             )
-        cache[..., self.offset : end, :] = values
+        cache[..., start:end, :] = values
         return cache
 
     def update_latent(self, keys, values):
-        end = self.offset + keys.shape[2]
+        end = self.size() + keys.shape[2]
         self.keys = self._append(self.keys, keys)
         self.values = self._append(self.values, values)
         return self.keys[..., :end, :], self.values[..., :end, :]
 
     def update_index(self, keys):
         self.index_keys = self._append(self.index_keys, keys)
-        return self.index_keys[:, : self.offset + keys.shape[1]]
+        return self.index_keys[:, : self.size() + keys.shape[1]]
+
+    def advance(self, n):
+        self.offset += n
+
+    def make_mask(self, n):
+        return create_causal_mask(n, offset=self.size())[None, None]
+
+    def to_batch(self, left_padding):
+        if self.empty():
+            return BatchLatentCache(left_padding)
+        if len(left_padding) != 1:
+            raise ValueError(
+                "A populated LatentCache must contain one request to batch"
+            )
+        cache = BatchLatentCache.merge([self])
+        padding = left_padding[0]
+        cache._map(
+            lambda x: mx.pad(x, [(0, 0)] * (x.ndim - 2) + [(padding, 0), (0, 0)])
+        )
+        cache.left_padding += padding
+        cache._idx += padding
+        return cache
+
+    @classmethod
+    def merge(cls, caches, prefix_lens=None):
+        return BatchLatentCache.merge(caches, prefix_lens)
 
     @property
     def state(self):
         return [
-            x[..., : self.offset, :]
+            x[..., : self.size(), :]
             for x in (self.keys, self.values, self.index_keys)
             if x is not None
         ]
@@ -84,7 +111,7 @@ class LatentCache(_BaseCache):
         return self.offset
 
     def empty(self):
-        return self.offset == 0
+        return self.size() == 0
 
     @property
     def nbytes(self):
@@ -96,9 +123,183 @@ class LatentCache(_BaseCache):
         return True
 
     def trim(self, n):
-        n = min(n, self.offset)
-        self.offset -= n
+        n = min(n, self.size())
+        self.advance(-n)
         return n
+
+
+class BatchLatentCache(LatentCache):
+    """Keep latent, rotary and indexer keys aligned across padded requests.
+
+    ``_idx`` is the physical append position; ``offset`` holds each request's
+    logical position. Shared KV/indexer layers still advance both positions,
+    even when they own no tensors.
+    """
+
+    def __init__(self, left_padding):
+        super().__init__()
+        self.left_padding = mx.array(left_padding, dtype=mx.int32)
+        self.offset = -self.left_padding
+        self._idx = 0
+        self._right_padding = None
+
+    def _map(self, fn):
+        for name in ("keys", "values", "index_keys"):
+            value = getattr(self, name)
+            if value is not None:
+                setattr(self, name, fn(value))
+
+    def size(self):
+        return self._idx
+
+    @property
+    def batch_size(self):
+        return self.offset.shape[0]
+
+    def is_single_row(self):
+        return self.batch_size == 1
+
+    def advance(self, n):
+        super().advance(n)
+        self._idx += n
+
+    def make_mask(self, n):
+        return create_causal_mask(n, offset=self._idx, left_padding=self.left_padding)
+
+    def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
+        if left_padding is not None:
+            if not self.empty():
+                raise ValueError(
+                    "Left padding can only be added to an empty BatchLatentCache"
+                )
+            padding = mx.array(left_padding, dtype=mx.int32)
+            self.left_padding += padding
+            self.offset -= padding
+        if right_padding is not None and max(right_padding) > 0:
+            self._right_padding = mx.array(right_padding, dtype=mx.int32)
+
+    def finalize(self):
+        if self._right_padding is not None:
+            padding = self._right_padding
+            self._map(
+                lambda x: dynamic_roll(
+                    x, padding.reshape((-1,) + (1,) * (x.ndim - 3)), axis=x.ndim - 2
+                )
+            )
+            self.offset -= padding
+            self.left_padding += padding
+            self._right_padding = None
+
+    def filter(self, batch_indices):
+        self.offset = self.offset[batch_indices]
+        self.left_padding = self.left_padding[batch_indices]
+        if self._right_padding is not None:
+            self._right_padding = self._right_padding[batch_indices]
+        # A chunk can consist entirely of padding for the remaining rows.
+        removed = min(self.left_padding.min().item(), self._idx)
+        self._map(lambda x: x[batch_indices][..., removed:, :])
+        self.left_padding -= removed
+        self._idx -= removed
+
+    def extend(self, other):
+        length = max(self._idx, other._idx)
+        for name in ("keys", "values", "index_keys"):
+            arrays = [getattr(c, name) for c in (self, other)]
+            sample = next((x for x in arrays if x is not None), None)
+            if sample is None:
+                continue
+            capacity = max(length, *(x.shape[-2] for x in arrays if x is not None))
+            rows = []
+            for c, x in zip((self, other), arrays):
+                if x is None:
+                    x = mx.zeros(
+                        (c.batch_size, *sample.shape[1:-2], 0, sample.shape[-1]),
+                        dtype=sample.dtype,
+                    )
+                x = x[..., : c._idx, :]
+                padding = [(0, 0)] * (x.ndim - 2) + [
+                    (length - x.shape[-2], capacity - length),
+                    (0, 0),
+                ]
+                rows.append(mx.pad(x, padding))
+            setattr(self, name, mx.concatenate(rows))
+        self.left_padding = mx.concatenate(
+            [c.left_padding + length - c._idx for c in (self, other)]
+        )
+        self.offset = mx.concatenate([self.offset, other.offset])
+        self._idx = length
+
+    def extract(self, idx):
+        cache = LatentCache()
+        padding = self.left_padding[idx].item()
+        for name in ("keys", "values", "index_keys"):
+            value = getattr(self, name)
+            if value is not None:
+                setattr(
+                    cache,
+                    name,
+                    mx.contiguous(value[idx : idx + 1, ..., padding : self._idx, :]),
+                )
+        cache.offset = max(0, self._idx - padding)
+        return cache
+
+    @classmethod
+    def merge(cls, caches, prefix_lens=None):
+        lengths = [c.size() for c in caches] if prefix_lens is None else prefix_lens
+        length = max(lengths, default=0)
+        padding = [length - n for n in lengths]
+        cache = cls(padding)
+        for name in ("keys", "values", "index_keys"):
+            arrays = [getattr(c, name) for c in caches]
+            sample = next((x for x in arrays if x is not None), None)
+            if sample is None:
+                continue
+            rows = []
+            for x, n, pad in zip(arrays, lengths, padding):
+                if x is None:
+                    x = mx.zeros(
+                        (1, *sample.shape[1:-2], n, sample.shape[-1]),
+                        dtype=sample.dtype,
+                    )
+                elif x.shape[0] != 1:
+                    raise ValueError("LatentCache.merge expects single-request caches")
+                rows.append(
+                    mx.pad(x[..., :n, :], [(0, 0)] * (x.ndim - 2) + [(pad, 0), (0, 0)])
+                )
+            setattr(cache, name, mx.concatenate(rows))
+        cache.advance(length)
+        return cache
+
+    @property
+    def state(self):
+        state = super().state + [self.offset, self.left_padding]
+        if self._right_padding is not None:
+            state.append(self._right_padding)
+        return state
+
+    @state.setter
+    def state(self, value):
+        self._restored_state = value
+
+    @property
+    def meta_state(self):
+        return (
+            str(self._idx),
+            str(int(self.keys is not None)),
+            str(int(self.index_keys is not None)),
+            str(int(self._right_padding is not None)),
+        )
+
+    @meta_state.setter
+    def meta_state(self, value):
+        self._idx, latent, index, right = map(int, value)
+        state = iter(self._restored_state)
+        self.keys = next(state) if latent else None
+        self.values = next(state) if latent else None
+        self.index_keys = next(state) if index else None
+        self.offset, self.left_padding = next(state), next(state)
+        self._right_padding = next(state) if right else None
+        del self._restored_state
 
 
 class LeRoPE(nn.Module):
@@ -193,7 +394,7 @@ class Indexer(nn.Module):
 
     def __call__(self, x, positions, cos, sin, cache, causal):
         b, t, _ = x.shape
-        length = (cache.offset if cache is not None else 0) + t
+        length = (cache.size() if cache is not None else 0) + t
         k, weights = self._project(x, length > self.topk)
         k = self.k_norm(k)
         if self.use_rope:
@@ -339,7 +540,12 @@ class Attention(nn.Module):
             latent, kr = shared[self.source]
         q = self.ssmax_scaling(q, positions)
         length = latent.shape[2]
-        causal = mx.arange(length)[None, None, None, :] <= positions[:, None, :, None]
+        causal = (
+            cache.make_mask(t)
+            if cache is not None
+            else create_causal_mask(t)[None, None]
+        )
+        causal = mx.broadcast_to(causal, (b, 1, t, length))
         if mask is not None:
             if mask.ndim == 2:
                 causal = causal & mask[:, None, None, :length].astype(mx.bool_)
@@ -383,7 +589,7 @@ class Attention(nn.Module):
             )
         out = out.transpose(0, 2, 1, 3).reshape(b, t, -1)
         if cache is not None:
-            cache.offset += t
+            cache.advance(t)
         return self.wo(out), topk
 
 
@@ -551,7 +757,8 @@ class TextModel(nn.Module):
         x = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
         offset = cache[0].offset if cache else 0
         positions = mx.broadcast_to(
-            mx.arange(offset, offset + x.shape[1])[None], x.shape[:2]
+            mx.maximum(mx.array(offset).reshape(-1, 1) + mx.arange(x.shape[1]), 0),
+            x.shape[:2],
         )
         cos, sin = self.rotary_emb(positions, x.dtype)
         shared, topk = {}, None
