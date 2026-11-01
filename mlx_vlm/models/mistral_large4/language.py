@@ -12,7 +12,12 @@ import mlx.nn as nn
 
 from ..base import LanguageModelOutput
 from ..cache import _BaseCache, create_causal_mask, dynamic_roll
-from ..switch_layers import QuantizedSwitchLinear, SwitchLinear
+from ..switch_layers import (
+    QuantizedSwitchLinear,
+    SwitchLinear,
+    _gather_sort,
+    _scatter_unsort,
+)
 from .config import TextConfig
 from .mla_kernel import sparse_mla
 from .moe_kernel import masked_qmv, supports_masked_qmv
@@ -611,9 +616,20 @@ class Experts(nn.Module):
 
     def __call__(self, x, indices):
         x = mx.expand_dims(x, (-2, -3))
-        return self.w2(
-            nn.silu(self.w1(x, indices)) * self.w3(x, indices), indices
-        ).squeeze(-2)
+        do_sort = indices.size >= 64
+        idx = indices
+        inv_order = None
+        if do_sort:
+            x, idx, inv_order = _gather_sort(x, indices)
+        if self.training:
+            idx = mx.stop_gradient(idx)
+        gate = self.w1(x, idx, sorted_indices=do_sort)
+        up = self.w3(x, idx, sorted_indices=do_sort)
+        out = self.w2(nn.silu(gate) * up, idx, sorted_indices=do_sort)
+        if do_sort:
+            # Restore route order before weighting and expert-parallel reduction.
+            out = _scatter_unsort(out, inv_order, indices.shape)
+        return out.squeeze(-2)
 
     def masked(self, x, indices):
         """Evaluate local routes; negative indices denote non-local experts."""

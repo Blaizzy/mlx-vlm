@@ -1631,7 +1631,53 @@ def test_mistral_large4_pack_dense_projections_and_preserve_quantized(
         )
 
 
-@pytest.mark.parametrize("training,length", [(False, 1), (True, 1), (False, 3)])
+@pytest.mark.parametrize("batch,length", [(1, 1), (1, 15), (1, 16), (2, 32)])
+@pytest.mark.parametrize("quantization", ["dense", "nvfp4", "scaled_nvfp4"])
+def test_mistral_large4_experts_preserve_route_order(batch, length, quantization):
+    from mlx_vlm.models.mistral_large4.config import TextConfig
+    from mlx_vlm.models.mistral_large4.language import Experts
+    from mlx_vlm.quantization.nvfp4 import ScaledQuantizedSwitchLinear
+
+    mx.random.seed(71)
+    args = TextConfig(
+        hidden_size=64,
+        moe_intermediate_size=128,
+        n_routed_experts=4,
+        nvfp4=quantization != "dense",
+    )
+    experts = Experts(args)
+    dtype = mx.bfloat16 if mx.default_device() == mx.gpu else mx.float32
+    experts.set_dtype(dtype)
+    if quantization == "scaled_nvfp4":
+        for name in ("w1", "w3", "w2"):
+            experts[name] = ScaledQuantizedSwitchLinear(
+                experts[name], mx.array([0.25, 0.5, 0.75, 1.0]), "weight_scale_2"
+            )
+    experts.eval()
+    x = mx.random.normal((batch, length, args.hidden_size)).astype(dtype)
+    # Repeated, non-monotonic routes differ between tokens and batch rows.
+    indices = (
+        mx.arange(batch * length).reshape(batch, length, 1) + mx.array([3, 0, 3, 1])
+    ) % args.n_routed_experts
+    expanded = mx.expand_dims(x, (-2, -3))
+    expected = experts.w2(
+        nn.silu(experts.w1(expanded, indices)) * experts.w3(expanded, indices),
+        indices,
+    ).squeeze(-2)
+    actual = experts(x, indices)
+    assert actual.shape == (batch, length, 4, args.hidden_size)
+    assert actual.dtype == expected.dtype == dtype
+    np.testing.assert_allclose(
+        np.array(actual.astype(mx.float32)),
+        np.array(expected.astype(mx.float32)),
+        atol=1e-3 if dtype == mx.bfloat16 else 1e-6,
+        rtol=1e-2 if dtype == mx.bfloat16 else 1e-5,
+    )
+
+
+@pytest.mark.parametrize(
+    "training,length", [(False, 1), (True, 1), (False, 3), (False, 16), (True, 16)]
+)
 def test_mistral_large4_owned_experts_match_masked_reference(training, length):
     from mlx_vlm.models.mistral_large4.config import TextConfig
     from mlx_vlm.models.mistral_large4.language import Experts
