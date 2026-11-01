@@ -608,6 +608,31 @@ def thinking_criteria(budget, *, enabled=True, preopened=True):
     )
 
 
+def test_thinking_budget_preview_preserves_budget_and_closing_tokens():
+    criteria = thinking_criteria(5)
+    assert common._apply_thinking_budget(
+        7, list(range(50, 58)), criteria, preview=True
+    ) == (6, [50, 51, 52, 53, 54, 55, 2])
+    assert criteria.thinking_token_count == 0
+    assert criteria.pop_forced_token_id() is None
+
+    # Accept a shorter prefix, then continue from its actual budget state.
+    assert common._apply_thinking_budget(2, [50, 51, 52], criteria) == (
+        2,
+        [50, 51, 52],
+    )
+    assert common._apply_thinking_budget(4, [53, 54, 55, 56, 57], criteria) == (
+        3,
+        [53, 54, 55, 2],
+    )
+    assert common._apply_thinking_budget(1, [56, 57], criteria, preview=True) == (
+        0,
+        [3],
+    )
+    assert common._apply_thinking_budget(1, [56, 57], criteria) == (0, [3])
+    assert not criteria.in_thinking
+
+
 @parametrize("kind", ["mtp", "dflash", "eagle3"])
 @parametrize("batch,uniform", [(1, False), (2, False), (2, True)])
 @parametrize(

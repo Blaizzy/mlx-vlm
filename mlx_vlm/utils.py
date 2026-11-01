@@ -7,7 +7,6 @@ import logging
 import math
 import struct
 import warnings
-from copy import copy
 from dataclasses import dataclass, fields
 from functools import lru_cache
 from io import BytesIO
@@ -2363,24 +2362,6 @@ class ThinkingBudgetCriteria:
         forced_token_id = self.forced_token_id
         self.forced_token_id = None
         return forced_token_id
-
-    def apply_to_tokens(self, tokens: List[int], *, preview: bool = False) -> List[int]:
-        """Apply pending closing tokens to a sampled block.
-
-        Stop at the first replacement: subsequent tokens were sampled from a
-        different prefix. Preview leaves this criterion unchanged so callers
-        can choose a shorter prefix before advancing its state.
-        """
-        state = copy(self) if preview else self
-        result = []
-        for token in tokens:
-            forced = state.pop_forced_token_id()
-            chosen = token if forced is None else forced
-            state(chosen)
-            result.append(chosen)
-            if chosen != token:
-                break
-        return result
 
 
 def print_array_report(t: mx.array, label: Optional[str]) -> dict:

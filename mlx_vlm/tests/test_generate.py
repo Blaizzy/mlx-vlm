@@ -1202,27 +1202,6 @@ class TestThinkingBudgetCriteria:
         assert criteria.pop_forced_token_id() == 10
         assert criteria.pop_forced_token_id() is None
 
-    def test_preview_block_does_not_spend_budget_or_consume_closing_tokens(self):
-        criteria = self._make_criteria()
-        assert criteria.apply_to_tokens(list(range(50, 58)), preview=True) == [
-            50,
-            51,
-            52,
-            53,
-            54,
-            55,
-            10,
-        ]
-        assert criteria.thinking_token_count == 0
-        assert criteria.pop_forced_token_id() is None
-
-        # Accept a shorter prefix, then continue from its actual budget state.
-        assert criteria.apply_to_tokens([50, 51, 52]) == [50, 51, 52]
-        assert criteria.apply_to_tokens([53, 54, 55, 56, 57]) == [53, 54, 55, 10]
-        assert criteria.apply_to_tokens([56, 57], preview=True) == [100]
-        assert criteria.apply_to_tokens([56, 57]) == [100]
-        assert not criteria.in_thinking
-
 
 @pytest.mark.parametrize("reused_prefix", [0, 1, 2])
 def test_stream_generate_stores_checkpoint_only_before_decode(reused_prefix):

@@ -1,3 +1,4 @@
+from copy import copy
 from typing import Any, Callable, List, Optional, Tuple
 
 import mlx.core as mx
@@ -11,12 +12,23 @@ generation_stream = mx.new_thread_local_stream(mx.default_device())
 
 
 def _apply_thinking_budget(accepted, tokens, criteria, *, preview=False):
-    """Make a forced replacement the uncached bonus of this round."""
+    """Make a forced replacement the uncached bonus of this round.
+
+    Preview leaves the criterion unchanged until the retained prefix is known.
+    """
     if criteria is None:
         return accepted, tokens
-    constrained = criteria.apply_to_tokens(tokens, preview=preview)
-    if constrained != tokens:
-        accepted = min(accepted, len(constrained) - 1)
+    state = copy(criteria) if preview else criteria
+    constrained = []
+    for index, token in enumerate(tokens):
+        forced = state.pop_forced_token_id()
+        chosen = token if forced is None else forced
+        state(chosen)
+        constrained.append(chosen)
+        if chosen != token:
+            # The remaining tokens were sampled from a different prefix.
+            accepted = min(accepted, index)
+            break
     return accepted, constrained
 
 
@@ -37,9 +49,8 @@ def _apply_thinking_budget_batch(
         accepted = [retained] * len(accepted)
         token_rows = [tokens[: retained + 1] for tokens in token_rows]
     # Only advance criteria after choosing the prefix each cache can retain.
-    for state, tokens in zip(active_criteria, token_rows):
-        if state is not None:
-            state.apply_to_tokens(tokens)
+    for count, tokens, state in zip(accepted, token_rows, active_criteria):
+        _apply_thinking_budget(count, tokens, state)
     return accepted, token_rows
 
 
