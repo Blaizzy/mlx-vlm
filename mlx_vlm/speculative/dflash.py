@@ -6,7 +6,6 @@ import mlx.nn as nn
 from .cache_state import abort_speculative_round, commit_speculative_round
 from .common import (
     _apply_thinking_budget,
-    _apply_thinking_budget_batch,
     _dflash_block_total,
     _record_speculative_round,
     _requires_uniform_batch_acceptance,
@@ -420,8 +419,8 @@ def _dflash_rounds(
                 accepted = accepted_list[0]
                 new_tokens = new_tokens_list[0]
                 sampler_rng.target_sampled(sync_draft=not positioned_sampling)
-            accepted, new_tokens = _apply_thinking_budget(
-                accepted, new_tokens, thinking_budget_criteria
+            [accepted], [new_tokens] = _apply_thinking_budget(
+                [accepted], [new_tokens], [thinking_budget_criteria], [0]
             )
             _record_speculative_round(draft_model, accepted, bs - 1)
 
@@ -623,7 +622,7 @@ def _dflash_rounds_batch(
                 new_tokens_list = [nt[: uniform + 1] for nt in new_tokens_list]
                 accepted_list = [uniform] * n_active
 
-            accepted_list, new_tokens_list = _apply_thinking_budget_batch(
+            accepted_list, new_tokens_list = _apply_thinking_budget(
                 accepted_list,
                 new_tokens_list,
                 thinking_budget_criteria,

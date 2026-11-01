@@ -608,29 +608,32 @@ def thinking_criteria(budget, *, enabled=True, preopened=True):
     )
 
 
-def test_thinking_budget_preview_preserves_budget_and_closing_tokens():
-    criteria = thinking_criteria(5)
+def test_thinking_budget_uniform_truncation_counts_only_retained_tokens():
+    criteria = [thinking_criteria(1), thinking_criteria(5)]
     assert common._apply_thinking_budget(
-        7, list(range(50, 58)), criteria, preview=True
-    ) == (6, [50, 51, 52, 53, 54, 55, 2])
-    assert criteria.thinking_token_count == 0
-    assert criteria.pop_forced_token_id() is None
+        [7, 7], [list(range(50, 58))] * 2, criteria, [0, 1], uniform=True
+    ) == ([2, 2], [[50, 51, 2], [50, 51, 52]])
+    assert criteria[1].thinking_token_count == 3
+    assert criteria[1].pop_forced_token_id() is None
 
-    # Accept a shorter prefix, then continue from its actual budget state.
-    assert common._apply_thinking_budget(2, [50, 51, 52], criteria) == (
-        2,
-        [50, 51, 52],
+    # The first row's pending closing token shortens the second row again.
+    assert common._apply_thinking_budget(
+        [4, 4], [list(range(53, 58))] * 2, criteria, [0, 1], uniform=True
+    ) == ([0, 0], [[3], [53]])
+    assert not criteria[0].in_thinking
+    assert criteria[1].thinking_token_count == 4
+    assert criteria[1].pop_forced_token_id() is None
+
+    # The remaining row closes only after spending its own retained budget.
+    assert common._apply_thinking_budget([3], [[54, 55, 56, 57]], criteria, [1]) == (
+        [2],
+        [[54, 55, 2]],
     )
-    assert common._apply_thinking_budget(4, [53, 54, 55, 56, 57], criteria) == (
-        3,
-        [53, 54, 55, 2],
+    assert common._apply_thinking_budget([1], [[56, 57]], criteria, [1]) == (
+        [0],
+        [[3]],
     )
-    assert common._apply_thinking_budget(1, [56, 57], criteria, preview=True) == (
-        0,
-        [3],
-    )
-    assert common._apply_thinking_budget(1, [56, 57], criteria) == (0, [3])
-    assert not criteria.in_thinking
+    assert not criteria[1].in_thinking
 
 
 @parametrize("kind", ["mtp", "dflash", "eagle3"])
@@ -735,10 +738,10 @@ def test_thinking_budget_tracks_generated_opening_and_filtered_rows():
     ]
     for state, token in zip(states, [4, 1]):
         state(token)
-    counts, rows = common._apply_thinking_budget_batch([3], [[4, 4, 4, 4]], states, [1])
+    counts, rows = common._apply_thinking_budget([3], [[4, 4, 4, 4]], states, [1])
     assert counts == [2] and rows == [[4, 4, 2]]
     assert states[0].thinking_token_count == 0
-    counts, rows = common._apply_thinking_budget_batch([2], [[4, 4, 4]], states, [1])
+    counts, rows = common._apply_thinking_budget([2], [[4, 4, 4]], states, [1])
     assert counts == [0] and rows == [[3]]
     assert not states[1].in_thinking
 

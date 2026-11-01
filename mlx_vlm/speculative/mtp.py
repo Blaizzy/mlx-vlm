@@ -14,7 +14,6 @@ from .cache_state import (
 )
 from .common import (
     _apply_thinking_budget,
-    _apply_thinking_budget_batch,
     _batch_cache_left_padding,
     _dflash_block_total,
     _record_speculative_round,
@@ -697,8 +696,8 @@ def _mtp_rounds(
             sampler_rng.target_sampled(
                 sync_draft=not _sampler_supports_positioned_target(sampler)
             )
-            accepted, new_tokens = _apply_thinking_budget(
-                accepted, new_tokens, thinking_budget_criteria
+            [accepted], [new_tokens] = _apply_thinking_budget(
+                [accepted], [new_tokens], [thinking_budget_criteria], [0]
             )
             _record_speculative_round(draft_model, accepted, bs - 1)
 
@@ -1070,7 +1069,7 @@ def _mtp_rounds_batch(
                 sampler_rng.target_sampled(
                     sync_draft=not _sampler_supports_positioned_target(sampler)
                 )
-            accepted_list, new_tokens_list = _apply_thinking_budget_batch(
+            accepted_list, new_tokens_list = _apply_thinking_budget(
                 accepted_list,
                 new_tokens_list,
                 thinking_budget_criteria,

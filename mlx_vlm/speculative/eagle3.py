@@ -6,7 +6,6 @@ import mlx.nn as nn
 from .cache_state import abort_speculative_round, commit_speculative_round
 from .common import (
     _apply_thinking_budget,
-    _apply_thinking_budget_batch,
     _batch_cache_left_padding,
     _record_speculative_round,
     _requires_uniform_batch_acceptance,
@@ -458,8 +457,8 @@ def _eagle3_rounds(
                 target_tokens,
                 max_tokens - emitted,
             )
-            accepted, new_tokens = _apply_thinking_budget(
-                accepted, new_tokens, thinking_budget_criteria
+            [accepted], [new_tokens] = _apply_thinking_budget(
+                [accepted], [new_tokens], [thinking_budget_criteria], [0]
             )
             _record_speculative_round(draft_model, accepted, bs - 1)
 
@@ -642,7 +641,7 @@ def _eagle3_rounds_batch(
                     accepted_list,
                     budgets,
                 )
-            accepted_list, new_tokens_list = _apply_thinking_budget_batch(
+            accepted_list, new_tokens_list = _apply_thinking_budget(
                 accepted_list,
                 new_tokens_list,
                 thinking_budget_criteria,

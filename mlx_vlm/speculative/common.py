@@ -11,46 +11,42 @@ from .cache_state import start_speculative_cache
 generation_stream = mx.new_thread_local_stream(mx.default_device())
 
 
-def _apply_thinking_budget(accepted, tokens, criteria, *, preview=False):
-    """Make a forced replacement the uncached bonus of this round.
-
-    Preview leaves the criterion unchanged until the retained prefix is known.
-    """
-    if criteria is None:
-        return accepted, tokens
-    state = copy(criteria) if preview else criteria
-    constrained = []
-    for index, token in enumerate(tokens):
-        forced = state.pop_forced_token_id()
-        chosen = token if forced is None else forced
-        state(chosen)
-        constrained.append(chosen)
-        if chosen != token:
-            # The remaining tokens were sampled from a different prefix.
-            accepted = min(accepted, index)
-            break
-    return accepted, constrained
-
-
-def _apply_thinking_budget_batch(
+def _apply_thinking_budget(
     accepted, token_rows, criteria, row_indices, *, uniform=False
 ):
+    """Apply budgets to token rows, keeping forced replacements uncached.
+
+    Uniform batches preview each row before advancing the actual budgets.
+    """
     if not criteria or not any(criteria):
         return accepted, token_rows
     active_criteria = [criteria[i] for i in row_indices]
-    rows = [
-        _apply_thinking_budget(count, tokens, state, preview=True)
-        for count, tokens, state in zip(accepted, token_rows, active_criteria)
-    ]
-    accepted = [count for count, _ in rows]
-    token_rows = [tokens for _, tokens in rows]
-    if uniform and len(set(accepted)) > 1:
+    accepted, token_rows = list(accepted), list(token_rows)
+    for row, state in enumerate(active_criteria):
+        if state is None:
+            continue
+        state = copy(state) if uniform else state
+        constrained = []
+        for index, token in enumerate(token_rows[row]):
+            forced = state.pop_forced_token_id()
+            chosen = token if forced is None else forced
+            state(chosen)
+            constrained.append(chosen)
+            if chosen != token:
+                # The remaining tokens were sampled from a different prefix.
+                accepted[row] = min(accepted[row], index)
+                break
+        token_rows[row] = constrained
+    if uniform:
         retained = min(accepted)
         accepted = [retained] * len(accepted)
         token_rows = [tokens[: retained + 1] for tokens in token_rows]
-    # Only advance criteria after choosing the prefix each cache can retain.
-    for count, tokens, state in zip(accepted, token_rows, active_criteria):
-        _apply_thinking_budget(count, tokens, state)
+        # Only count the prefix each cache can retain.
+        for state, tokens in zip(active_criteria, token_rows):
+            if state is not None:
+                for token in tokens:
+                    state.pop_forced_token_id()
+                    state(token)
     return accepted, token_rows
 
 
