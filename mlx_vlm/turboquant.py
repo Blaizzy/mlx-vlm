@@ -2312,6 +2312,11 @@ def _fused_mse_decode_kernel(key_bits: int, val_bits: int, dim: int = 256):
         return None
     if dim < 32 or dim % 32 != 0:
         return None  # dim must be a multiple of 32 SIMD lanes
+    if dim > 256:
+        # At dim > 256 (e.g. Gemma 4 full-attention layers with head_dim=512),
+        # register pressure drops maxTotalThreadsPerThreadgroup below 1024 (typically 640).
+        # Returning None routes decode attention to the 2-pass or separate-kernel path.
+        return None
 
     k_mask = (1 << key_bits) - 1
     v_mask = (1 << val_bits) - 1
@@ -6145,30 +6150,38 @@ class _TurboQuantAttentionMixin:
                     # Single-pass: 32 simdgroups cooperate per q_head
                     fused_kernel = _fused_mse_decode_kernel(key_bits, val_bits, D)
                     if fused_kernel is not None:
-                        out = fused_kernel(
-                            inputs=[
-                                q_rot_flat,
-                                keys_state.norms,
-                                keys_state.indices,
-                                self.key_codec.codebook,
-                                values_state.norms,
-                                values_state.indices,
-                                self.value_codec.codebook,
-                            ],
-                            template=[
-                                ("Dim", D),
-                                ("RepeatCount", n_repeats),
-                                ("KPackedWidth", keys_state.indices.shape[-1]),
-                                ("VPackedWidth", values_state.indices.shape[-1]),
-                            ],
-                            grid=(BQH * 1024, 1, 1),
-                            threadgroup=(1024, 1, 1),
-                            output_shapes=[(BQH, D)],
-                            output_dtypes=[mx.float32],
-                        )[0]
-                        out_rotated = out.reshape(B, n_kv_heads, n_repeats, D)
-                        output = self.value_codec._rotate_inverse(out_rotated)
-                        return output.reshape(B, n_q_heads, L, value_dim).astype(dtype)
+                        try:
+                            out = fused_kernel(
+                                inputs=[
+                                    q_rot_flat,
+                                    keys_state.norms,
+                                    keys_state.indices,
+                                    self.key_codec.codebook,
+                                    values_state.norms,
+                                    values_state.indices,
+                                    self.value_codec.codebook,
+                                ],
+                                template=[
+                                    ("Dim", D),
+                                    ("RepeatCount", n_repeats),
+                                    ("KPackedWidth", keys_state.indices.shape[-1]),
+                                    ("VPackedWidth", values_state.indices.shape[-1]),
+                                ],
+                                grid=(BQH * 1024, 1, 1),
+                                threadgroup=(1024, 1, 1),
+                                output_shapes=[(BQH, D)],
+                                output_dtypes=[mx.float32],
+                            )[0]
+                            out_rotated = out.reshape(B, n_kv_heads, n_repeats, D)
+                            output = self.value_codec._rotate_inverse(out_rotated)
+                            return output.reshape(B, n_q_heads, L, value_dim).astype(dtype)
+                        except (ValueError, RuntimeError) as e:
+                            err_msg = str(e)
+                            if (
+                                "Thread group size" not in err_msg
+                                and "threads per threadgroup" not in err_msg
+                            ):
+                                raise
 
                 # 2-pass: split KV across blocks for GPU saturation
                 pass1 = _fused_mse_decode_2pass_1_kernel(key_bits, val_bits, D)
