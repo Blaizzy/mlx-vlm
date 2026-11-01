@@ -616,7 +616,7 @@ class Experts(nn.Module):
 
     def __call__(self, x, indices):
         x = mx.expand_dims(x, (-2, -3))
-        do_sort = indices.size >= 64
+        do_sort = indices.size >= 32
         idx = indices
         inv_order = None
         if do_sort:

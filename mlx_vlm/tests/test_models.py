@@ -1631,7 +1631,10 @@ def test_mistral_large4_pack_dense_projections_and_preserve_quantized(
         )
 
 
-@pytest.mark.parametrize("batch,length", [(1, 1), (1, 15), (1, 16), (2, 32)])
+@pytest.mark.parametrize(
+    "batch,length",
+    [(1, 1), (1, 7), (1, 8), (1, 15), (1, 16), (2, 4), (2, 8), (2, 32)],
+)
 @pytest.mark.parametrize("quantization", ["dense", "nvfp4", "scaled_nvfp4"])
 def test_mistral_large4_experts_preserve_route_order(batch, length, quantization):
     from mlx_vlm.models.mistral_large4.config import TextConfig
