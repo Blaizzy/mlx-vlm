@@ -10,6 +10,39 @@ from .cache_state import start_speculative_cache
 generation_stream = mx.new_thread_local_stream(mx.default_device())
 
 
+def _apply_thinking_budget(accepted, tokens, criteria, *, preview=False):
+    """Make a forced replacement the uncached bonus of this round."""
+    if criteria is None:
+        return accepted, tokens
+    constrained = criteria.apply_to_tokens(tokens, preview=preview)
+    if constrained != tokens:
+        accepted = min(accepted, len(constrained) - 1)
+    return accepted, constrained
+
+
+def _apply_thinking_budget_batch(
+    accepted, token_rows, criteria, row_indices, *, uniform=False
+):
+    if not criteria or not any(criteria):
+        return accepted, token_rows
+    active_criteria = [criteria[i] for i in row_indices]
+    rows = [
+        _apply_thinking_budget(count, tokens, state, preview=True)
+        for count, tokens, state in zip(accepted, token_rows, active_criteria)
+    ]
+    accepted = [count for count, _ in rows]
+    token_rows = [tokens for _, tokens in rows]
+    if uniform and len(set(accepted)) > 1:
+        retained = min(accepted)
+        accepted = [retained] * len(accepted)
+        token_rows = [tokens[: retained + 1] for tokens in token_rows]
+    # Only advance criteria after choosing the prefix each cache can retain.
+    for state, tokens in zip(active_criteria, token_rows):
+        if state is not None:
+            state.apply_to_tokens(tokens)
+    return accepted, token_rows
+
+
 def verify_forward(model, inputs, cache, **kwargs):
     """Run ordinary short-block forwards inside one cache transaction."""
     transaction = start_speculative_cache(cache, inputs.shape[1])

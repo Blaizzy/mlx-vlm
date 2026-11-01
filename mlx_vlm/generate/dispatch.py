@@ -1100,7 +1100,7 @@ def stream_generate(
             generated_tokens.append(token)
 
             # Check thinking budget and force token if needed
-            if thinking_criteria is not None:
+            if thinking_criteria is not None and kwargs.get("draft_model") is None:
                 thinking_criteria(token)
 
             # Stop generation if the token is in the eos_token_ids

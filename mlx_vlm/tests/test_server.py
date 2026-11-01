@@ -4817,6 +4817,25 @@ def _step_tokens(tokenizer, responses, *, progress=(), trim_space=True):
 class TestResponseGenerator:
     """Tests for the ResponseGenerator continuous batching engine."""
 
+    @pytest.mark.parametrize("draft_kind", ["dflash", "eagle3", "mtp"])
+    def test_speculative_request_accepts_thinking_budget_and_effort(self, draft_kind):
+        tokenizer = NS(
+            encode=lambda text, **kw: [{"<think>": 1, "\n": 2, "</think>": 3}[text]]
+        )
+        gen = _ready_generator(
+            draft_model=object(), draft_kind=draft_kind, tokenizer=tokenizer
+        )
+        gen._preprocess_request = lambda *a, **kw: {"input_ids": mx.array([[1]])}
+        queued = _capture_requests(gen)
+        args = server._build_gen_args(
+            _chat_request(reasoning_effort="low", thinking_budget=2, max_tokens=12)
+        )
+        _, tokens = gen.generate("prompt", args=args)
+        tokens.close()
+        assert args.to_template_kwargs()["reasoning_effort"] == "low"
+        criteria = queued[0].thinking_budget_criteria
+        assert criteria.thinking_budget == 2 and criteria.in_thinking
+
     @pytest.mark.parametrize("media", [False, True])
     def test_cache_boundary_matches_tokenized_prefix_and_skips_media(self, media):
         gen = _ready_generator()

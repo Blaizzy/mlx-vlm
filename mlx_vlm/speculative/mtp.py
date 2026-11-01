@@ -13,6 +13,8 @@ from .cache_state import (
     iter_leaf_caches,
 )
 from .common import (
+    _apply_thinking_budget,
+    _apply_thinking_budget_batch,
     _batch_cache_left_padding,
     _dflash_block_total,
     _record_speculative_round,
@@ -598,6 +600,7 @@ def _mtp_rounds(
     draft_block_size: Optional[int] = None,
     token_dtype: mx.Dtype = mx.int32,
     greedy_sampling: bool = False,
+    thinking_budget_criteria: Optional[Any] = None,
 ) -> Generator[Tuple[int, None], None, None]:
     """Verify autoregressive MTP drafts and commit accepted state before emission."""
     lm = model.language_model if hasattr(model, "language_model") else model
@@ -643,6 +646,8 @@ def _mtp_rounds(
         kv_valid_len=kv_offset,
     )
 
+    if thinking_budget_criteria is not None:
+        thinking_budget_criteria(first_bonus)
     b = first_bonus
     emitted = 1  # caller already yielded the first bonus
 
@@ -691,6 +696,9 @@ def _mtp_rounds(
             )
             sampler_rng.target_sampled(
                 sync_draft=not _sampler_supports_positioned_target(sampler)
+            )
+            accepted, new_tokens = _apply_thinking_budget(
+                accepted, new_tokens, thinking_budget_criteria
             )
             _record_speculative_round(draft_model, accepted, bs - 1)
 
@@ -885,6 +893,7 @@ def _mtp_rounds_batch(
     eos_token_ids: Optional[set] = None,
     greedy_sampling: bool = False,
     row_ids: Optional[List[int]] = None,
+    thinking_budget_criteria: Optional[List[Any]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     """Batched Gemma 4 MTP round loop (B >= 1).
 
@@ -961,6 +970,9 @@ def _mtp_rounds_batch(
     )
 
     b = first_bonus.tolist()
+    for state, token in zip(thinking_budget_criteria or [], b):
+        if state is not None:
+            state(token)
     emitted = [1] * B
     finished = [False] * B
     active_idx = list(range(B))
@@ -1058,6 +1070,13 @@ def _mtp_rounds_batch(
                 sampler_rng.target_sampled(
                     sync_draft=not _sampler_supports_positioned_target(sampler)
                 )
+            accepted_list, new_tokens_list = _apply_thinking_budget_batch(
+                accepted_list,
+                new_tokens_list,
+                thinking_budget_criteria,
+                active_idx,
+                uniform=_requires_uniform_batch_acceptance(draft_model, lm),
+            )
             # Keep the adaptive block-size history on a per-round basis so
             # batched MTP reacts like the singleton loop instead of letting
             # batch size change the controller signal.
