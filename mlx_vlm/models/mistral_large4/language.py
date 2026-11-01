@@ -691,7 +691,7 @@ class MoE(nn.Module):
         self.group = None
         self.start, self.end = args.expert_start, args.expert_end
 
-    def __call__(self, x):
+    def route(self, x):
         a = self.args
         scores = mx.softmax(
             x.astype(mx.float32) @ self.gate.weight.T.astype(mx.float32),
@@ -722,6 +722,11 @@ class MoE(nn.Module):
             / (weights.sum(axis=-1, keepdims=True) + 1e-20)
             * a.routed_scaling_factor
         )
+        return inds, weights
+
+    def __call__(self, x):
+        a = self.args
+        inds, weights = self.route(x)
         if self.group is None:
             if self.start or self.end != a.n_routed_experts:
                 raise ValueError("An expert partition requires a distributed group")
@@ -769,7 +774,15 @@ class TextModel(nn.Module):
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.rotary_emb = LeRoPE(args)
 
-    def __call__(self, input_ids, inputs_embeds=None, cache=None, mask=None):
+    def __call__(
+        self,
+        input_ids,
+        inputs_embeds=None,
+        cache=None,
+        mask=None,
+        capture_layer_ids=None,
+        capture_sink=None,
+    ):
         x = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
         offset = cache[0].offset if cache else 0
         positions = mx.broadcast_to(
@@ -779,8 +792,20 @@ class TextModel(nn.Module):
         cos, sin = self.rotary_emb(positions, x.dtype)
         shared, topk = {}, None
         cache = cache or [None] * len(self.layers)
-        for layer, c in zip(self.layers, cache):
+        capture = set(capture_layer_ids or [])
+        if len(capture) != len(capture_layer_ids or []) or any(
+            i < 0 or i >= len(self.layers) for i in capture
+        ):
+            raise ValueError(
+                "capture_layer_ids must be unique indices inside the model"
+            )
+        captured = {}
+        for i, (layer, c) in enumerate(zip(self.layers, cache)):
             x, topk = layer(x, positions, cos, sin, c, shared, topk, mask)
+            if i in capture:
+                captured[i] = x
+        if capture_sink is not None:
+            capture_sink.extend(captured[i] for i in capture_layer_ids or [])
         return self.norm(x)
 
 
@@ -793,14 +818,53 @@ class LanguageModel(nn.Module):
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
     def __call__(
-        self, inputs=None, inputs_embeds=None, mask=None, cache=None, **kwargs
+        self,
+        inputs=None,
+        inputs_embeds=None,
+        mask=None,
+        cache=None,
+        capture_layer_ids=None,
+        **kwargs,
     ):
-        x = self.model(inputs, inputs_embeds, cache, mask)
+        if kwargs.get("speculative_verify", False):
+            from .speculative_verifier import verify_logits
+
+            captured, x, transaction = self.speculative_verify_dflash_hidden(
+                inputs, cache, capture_layer_ids or []
+            )
+            try:
+                logits = verify_logits(self, x)
+                return LanguageModelOutput(
+                    logits=logits, hidden_states=captured, gdn_states=transaction
+                )
+            except BaseException:
+                transaction.abort()
+                raise
+        captured = [] if capture_layer_ids is not None else None
+        x = self.model(inputs, inputs_embeds, cache, mask, capture_layer_ids, captured)
         logits = self.lm_head(x)
         cap = self.args.final_logit_softcapping
         if cap:
             logits = mx.tanh(logits / cap) * cap
-        return LanguageModelOutput(logits=logits)
+        return LanguageModelOutput(logits=logits, hidden_states=captured)
+
+    def speculative_verify_dflash_hidden(self, inputs, cache, capture_layer_ids):
+        from .speculative_verifier import verify_hidden
+
+        return verify_hidden(self, inputs, cache, capture_layer_ids)
+
+    def speculative_argmax_from_hidden(self, hidden):
+        from .speculative_verifier import verify_logits
+
+        logits = verify_logits(self, hidden)
+        # Match generate_step's BF16 log-probability rounding and tie-breaking.
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        return mx.argmax(logprobs, axis=-1)
+
+    def rollback_speculative_cache(self, cache, transaction, accepted, block_size):
+        from ...speculative.cache_state import rollback_speculative_cache
+
+        return rollback_speculative_cache(cache, transaction, accepted, block_size)
 
     @property
     def layers(self):
@@ -808,6 +872,11 @@ class LanguageModel(nn.Module):
 
     def make_cache(self):
         return [LatentCache() for _ in self.layers]
+
+    def chunked_prefill_policy(self, **kwargs):
+        # Captured post-layer features can be concatenated across prompt chunks.
+        # Keep the same prefill/absorbed-decode boundary with and without DSpark.
+        return True
 
     def shard(self, group=None):
         group = group or mx.distributed.init()

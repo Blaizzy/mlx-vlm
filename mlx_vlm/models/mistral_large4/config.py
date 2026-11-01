@@ -40,6 +40,7 @@ class TextConfig(BaseModelConfig):
     nvfp4: bool = False
     expert_start: int = 0
     expert_end: Optional[int] = None
+    mtp_config: Optional[dict] = None
 
     def __post_init__(self):
         n = self.num_hidden_layers

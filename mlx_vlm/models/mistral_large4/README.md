@@ -69,8 +69,39 @@ keys share the same padding layout, while positions advance per request.
 Distributed callers must submit the same requests and scheduling operations
 on every rank.
 
+## DSpark speculative decoding
+
+The native checkpoint includes a 4.20 GB BF16 draft head. Load it with the shared
+drafter API and pass it to the standard generator on every rank:
+
+```python
+from mlx_vlm.speculative import load_drafter
+
+draft, kind = load_drafter(model_path)
+for response in stream_generate(
+    model, processor, prompt=prompt, max_tokens=128, temperature=0,
+    draft_model=draft, draft_kind=kind, draft_block_size=4,
+):
+    if rank == 0:
+        print(response.text, end="", flush=True)
+```
+
+The block width of four means one anchor plus three proposed tokens. The head
+shares the target embedding and output projection and uses three dense MLA
+layers, position-specific masks and a recurrent Markov correction. Its metadata
+comes from `text_config.mtp_config` or the native `params.json` sidecar.
+
+For rank-local target shards that omit `mtp_dspark.*`, extract the head once with
+`python -m mlx_vlm.split_mtp --model /path/to/full-model --output /path/to/draft`,
+copy it to each Mac, and pass that directory to `load_drafter`. Draft weights are
+replicated; the target retains its existing expert partition.
+
+Verification preserves absorbed decode attention and native NVFP4 accumulation,
+and rolls rejected positions back through the shared cache transaction. Batched
+speculation uses uniform acceptance across active requests.
+
 Floating-point KV projections use absorbed sparse attention during decode;
 prefill still expands historical KV and builds dense DSA selection masks.
-FP8 activation/KV quantization and DSpark/MTP speculative decoding are not
-implemented here. Native NVFP4 expert weights are supported with continuous
-batching; additional KV-cache quantization is not.
+FP8 activation/KV quantization is not implemented here. Native NVFP4 expert
+weights are supported with continuous batching; additional KV-cache quantization
+is not.

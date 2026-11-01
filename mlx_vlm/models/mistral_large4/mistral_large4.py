@@ -131,7 +131,11 @@ class Model(Mistral3Model):
     def __call__(self, input_ids, pixel_values=None, mask=None, cache=None, **kwargs):
         features = self.get_input_embeddings(input_ids, pixel_values, **kwargs)
         return self.language_model(
-            input_ids, inputs_embeds=features.inputs_embeds, mask=mask, cache=cache
+            input_ids,
+            inputs_embeds=features.inputs_embeds,
+            mask=mask,
+            cache=cache,
+            capture_layer_ids=kwargs.get("capture_layer_ids"),
         )
 
     @property
