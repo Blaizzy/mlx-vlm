@@ -179,28 +179,22 @@ class Indexer(nn.Module):
         self.use_rope = args.no_rope_layers[idx]
         self.topk = args.index_topk
         self.wq_b = nn.Linear(args.hidden_size, self.heads * self.dim, bias=False)
-        self.wk = nn.Linear(args.hidden_size, self.dim, bias=False)
         self.q_input_norm = nn.LayerNorm(args.hidden_size, eps=1e-6)
         self.k_norm = nn.LayerNorm(self.dim, eps=1e-6)
-        self.weights_proj = nn.Linear(args.hidden_size, self.heads, bias=False)
         self.ssmax_scaling = SoftmaxScaling(self.heads)
+        self._init_projections(args.hidden_size)
+
+    def _init_projections(self, hidden_size):
+        self.wk = nn.Linear(hidden_size, self.dim, bias=False)
+        self.weights_proj = nn.Linear(hidden_size, self.heads, bias=False)
+
+    def _project(self, x, need_weights):
+        return self.wk(x), self.weights_proj(x) if need_weights else None
 
     def __call__(self, x, positions, cos, sin, cache, causal):
         b, t, _ = x.shape
-        weights = None
-        if "wk_weights_proj" in self:
-            projection = self.wk_weights_proj
-            length = (cache.offset if cache is not None else 0) + t
-            if isinstance(projection, nn.Linear) and (t != 1 or length <= self.topk):
-                # Preserve prefill GEMM shapes and avoid unused short-prefix work.
-                k = x @ projection.weight[: self.dim].T
-                if length > self.topk:
-                    weights = x @ projection.weight[self.dim :].T
-            else:
-                kw = projection(x)
-                k, weights = kw[..., : self.dim], kw[..., self.dim :]
-        else:
-            k = self.wk(x)
+        length = (cache.offset if cache is not None else 0) + t
+        k, weights = self._project(x, length > self.topk)
         k = self.k_norm(k)
         if self.use_rope:
             k = mx.concatenate(
@@ -225,12 +219,24 @@ class Indexer(nn.Module):
                 ],
                 axis=-1,
             )
-        if weights is None:
-            weights = self.weights_proj(x)
         weights = weights.transpose(0, 2, 1).astype(mx.float32) * self.heads**-0.5
         score_fn = _compiled_indexer_scores if t == 1 else _indexer_scores
         scores = score_fn(q, k, weights, causal, self.dim**-0.5)
         return mx.argpartition(-scores, kth=self.topk - 1, axis=-1)[..., : self.topk]
+
+
+class PackedIndexer(Indexer):
+    def _init_projections(self, hidden_size):
+        self.wk_weights_proj = nn.Linear(hidden_size, self.dim + self.heads, bias=False)
+
+    def _project(self, x, need_weights):
+        projection = self.wk_weights_proj
+        if isinstance(projection, nn.Linear) and (x.shape[1] != 1 or not need_weights):
+            # Preserve prefill GEMM shapes and avoid unused short-prefix work.
+            k = x @ projection.weight[: self.dim].T
+            weights = x @ projection.weight[self.dim :].T if need_weights else None
+            return k, weights
+        return mx.split(projection(x), [self.dim], axis=-1)
 
 
 class Attention(nn.Module):
@@ -397,10 +403,16 @@ class Experts(nn.Module):
         self.w3 = linear(d, h, n)
         self.w2 = linear(h, d, n)
 
-    def __call__(self, x, indices, owned=None):
+    def __call__(self, x, indices):
+        x = mx.expand_dims(x, (-2, -3))
+        return self.w2(
+            nn.silu(self.w1(x, indices)) * self.w3(x, indices), indices
+        ).squeeze(-2)
+
+    def masked(self, x, indices):
+        """Evaluate local routes; negative indices denote non-local experts."""
         if (
-            owned is not None
-            and not self.training
+            not self.training
             and x.ndim == 3
             and x.shape[1] == 1
             and x.dtype in (mx.float32, mx.float16, mx.bfloat16)
@@ -408,17 +420,11 @@ class Experts(nn.Module):
             and mx.metal.is_available()
             and all(supports_masked_qmv(w) for w in (self.w1, self.w3, self.w2))
         ):
-            local = mx.where(owned, indices.astype(mx.int32), -1)
-            gate = masked_qmv(x, self.w1, local)
-            up = masked_qmv(x, self.w3, local)
-            return masked_qmv(nn.silu(gate) * up, self.w2, local)
-        if owned is not None:
-            indices = mx.where(owned, indices, 0)
-        x = mx.expand_dims(x, (-2, -3))
-        out = self.w2(
-            nn.silu(self.w1(x, indices)) * self.w3(x, indices), indices
-        ).squeeze(-2)
-        return out if owned is None else mx.where(owned[..., None], out, 0)
+            gate = masked_qmv(x, self.w1, indices)
+            up = masked_qmv(x, self.w3, indices)
+            return masked_qmv(nn.silu(gate) * up, self.w2, indices)
+        out = self(x, mx.maximum(indices, 0))
+        return mx.where(indices[..., None] >= 0, out, 0)
 
 
 class MLP(nn.Module):
@@ -429,16 +435,24 @@ class MLP(nn.Module):
         self.w2 = nn.Linear(hidden, dim, bias=False)
 
     def __call__(self, x):
-        if "gate_up_proj" in self:
-            projection = self.gate_up_proj
-            if x.shape[-2] != 1 and isinstance(projection, nn.Linear):
-                # Keep prefill accumulation unchanged without duplicate weights.
-                w1, w3 = mx.split(projection.weight, 2, axis=0)
-                gate, up = x @ w1.T, x @ w3.T
-            else:
-                gate, up = mx.split(projection(x), 2, axis=-1)
-            return self.w2(nn.silu(gate) * up)
         return self.w2(nn.silu(self.w1(x)) * self.w3(x))
+
+
+class PackedMLP(nn.Module):
+    def __init__(self, dim, hidden):
+        super().__init__()
+        self.gate_up_proj = nn.Linear(dim, 2 * hidden, bias=False)
+        self.w2 = nn.Linear(hidden, dim, bias=False)
+
+    def __call__(self, x):
+        projection = self.gate_up_proj
+        if x.shape[-2] != 1 and isinstance(projection, nn.Linear):
+            # Keep prefill accumulation unchanged without duplicate weights.
+            w1, w3 = mx.split(projection.weight, 2, axis=0)
+            gate, up = x @ w1.T, x @ w3.T
+        else:
+            gate, up = mx.split(projection(x), 2, axis=-1)
+        return self.w2(nn.silu(gate) * up)
 
 
 class MoE(nn.Module):
@@ -492,8 +506,8 @@ class MoE(nn.Module):
             outputs = self.experts(x, inds)
         else:
             owned = (inds >= self.start) & (inds < self.end)
-            local = inds.astype(mx.int32) - self.start
-            outputs = self.experts(x, local, owned)
+            local = mx.where(owned, inds.astype(mx.int32) - self.start, -1)
+            outputs = self.experts.masked(x, local)
             # Preserve each route before reduction, as in MiniMax's EP path.
             outputs = mx.distributed.all_sum(outputs, group=self.group)
         weighted = (outputs.astype(mx.float32) * weights[..., None]).astype(x.dtype)

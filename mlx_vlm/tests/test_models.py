@@ -1651,7 +1651,7 @@ def test_mistral_large4_owned_experts_match_masked_reference(training, length):
     with patch(
         "mlx_vlm.models.mistral_large4.language.masked_qmv", wraps=masked_qmv
     ) as kernel:
-        actual = experts(x, indices, owned)
+        actual = experts.masked(x, indices)
         eligible = (
             not training
             and length == 1

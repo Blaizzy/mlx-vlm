@@ -7,7 +7,7 @@ from ..mistral3.mistral3 import Mistral3MultiModalProjector
 from ..mistral3.mistral3 import Model as Mistral3Model
 from ..pixtral import VisionModel
 from .config import ModelConfig
-from .language import LanguageModel
+from .language import LanguageModel, PackedIndexer, PackedMLP
 
 
 class Model(Mistral3Model):
@@ -72,12 +72,12 @@ class Model(Mistral3Model):
             sanitized[key] = value
         weights.clear()
 
-        def pack_dense(module, prefix, left, right, target):
+        def pack_dense(prefix, left, right, target):
             key = f"{prefix}.{target}.weight"
             if key not in sanitized:
                 keys = [f"{prefix}.{name}.weight" for name in (left, right)]
                 if not all(k in sanitized for k in keys):
-                    return
+                    return False
                 a, b = (sanitized[k] for k in keys)
                 # Keep quantized projections separate: their formats and global
                 # scales may differ. Native FP8 has already been decoded here.
@@ -86,31 +86,29 @@ class Model(Mistral3Model):
                     or not mx.issubdtype(a.dtype, mx.floating)
                     or a.shape[1:] != b.shape[1:]
                 ):
-                    return
+                    return False
                 sanitized[key] = mx.concatenate([sanitized.pop(k) for k in keys])
-            if target not in module:
-                rows = module[left].weight.shape[0] + module[right].weight.shape[0]
-                columns = module[left].weight.shape[1]
-                module[target] = nn.Linear(columns, rows, bias=False)
-                del module[left], module[right]
+            return True
 
         for i, layer in enumerate(self.language_model.layers):
             prefix = f"language_model.model.layers.{i}"
-            mlp = layer.feed_forward
+            parent, name = layer, "feed_forward"
             mlp_prefix = f"{prefix}.feed_forward"
+            hidden = args.intermediate_size
             if i >= args.first_k_dense_replace:
-                mlp = mlp.shared_experts
+                parent, name = layer.feed_forward, "shared_experts"
                 mlp_prefix += ".shared_experts"
-            if mlp is not None:
-                pack_dense(mlp, mlp_prefix, "w1", "w3", "gate_up_proj")
-            if layer.attention.indexer is not None:
-                pack_dense(
-                    layer.attention.indexer,
-                    f"{prefix}.attention.indexer",
-                    "wk",
-                    "weights_proj",
-                    "wk_weights_proj",
-                )
+                hidden = args.moe_intermediate_size * args.n_shared_experts
+            if parent[name] is not None and pack_dense(
+                mlp_prefix, "w1", "w3", "gate_up_proj"
+            ):
+                if not isinstance(parent[name], PackedMLP):
+                    parent[name] = PackedMLP(args.hidden_size, hidden)
+            if layer.attention.indexer is not None and pack_dense(
+                f"{prefix}.attention.indexer", "wk", "weights_proj", "wk_weights_proj"
+            ):
+                if not isinstance(layer.attention.indexer, PackedIndexer):
+                    layer.attention.indexer = PackedIndexer(args, i)
 
         for i in range(args.first_k_dense_replace, args.num_hidden_layers):
             prefix = f"language_model.model.layers.{i}.feed_forward.experts"
