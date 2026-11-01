@@ -24,6 +24,7 @@ from threading import Event, Lock, Thread, Timer
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
+import anyio
 import httpx2
 import mlx.core as mx
 import numpy as np
@@ -65,6 +66,73 @@ from mlx_vlm.server.runtime_config import RuntimeConfig
 from mlx_vlm.tests.test_processors import MINICPM_MULTICALL
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
 from mlx_vlm.tools import load_tool_module, process_tool_calls
+
+
+@pytest.mark.parametrize("interval", ["0", "0.001"])
+@pytest.mark.parametrize("fail", [False, True])
+def test_stream_keepalives_preserve_output(monkeypatch, interval, fail):
+    monkeypatch.setenv("MLX_VLM_STREAM_KEEPALIVE_INTERVAL", interval)
+
+    async def check():
+        calls, chunks = [], []
+
+        async def source():
+            calls.append("start")
+            try:
+                await asyncio.sleep(0.02)
+                yield 'data: {"content":"OK"}\n\n'
+                if fail:
+                    raise RuntimeError("generation failed")
+                yield "data: [DONE]\n\n"
+            finally:
+                calls.append("closed")
+
+        async def consume():
+            async for chunk in openai._with_keepalives(source()):
+                chunks.append(chunk)
+
+        if fail:
+            with pytest.raises(RuntimeError, match="generation failed"):
+                await consume()
+        else:
+            await consume()
+        expected = ['data: {"content":"OK"}\n\n']
+        if not fail:
+            expected.append("data: [DONE]\n\n")
+        assert [chunk for chunk in chunks if not chunk.startswith(":")] == expected
+        assert (": keepalive\n\n" in chunks) == (interval != "0")
+        assert calls == ["start", "closed"]
+
+    asyncio.run(check())
+
+
+def test_stream_keepalives_close_on_disconnect(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_STREAM_KEEPALIVE_INTERVAL", "0.001")
+
+    async def check():
+        started, closed = asyncio.Event(), asyncio.Event()
+
+        async def source():
+            try:
+                started.set()
+                await asyncio.Event().wait()
+                yield "unreachable"
+            finally:
+                await asyncio.sleep(0)
+                closed.set()
+
+        async def consume():
+            async for _ in openai._with_keepalives(source()):
+                pass
+
+        async with anyio.create_task_group() as group:
+            group.start_soon(consume)
+            await started.wait()
+            group.cancel_scope.cancel()
+        assert closed.is_set()
+        assert len(asyncio.all_tasks()) == 1
+
+    asyncio.run(check())
 
 
 def test_cancellation_is_acknowledged_only_after_removal():
