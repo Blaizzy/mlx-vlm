@@ -3441,6 +3441,17 @@ class TestEstimateNumImageTokens:
             estimate_num_image_tokens(SimpleNamespace(), 480, 640)
 
 
+def test_qwen3_vl_image_processor_exposes_size_and_valid_kwargs():
+    """Serving engines read the transformers image processor contract."""
+    from mlx_vlm.models.qwen3_vl import processing_qwen3_vl as module
+
+    processor = module.Qwen3VLImageProcessor(min_pixels=4096, max_pixels=16384)
+    assert processor.size == {"shortest_edge": 4096, "longest_edge": 16384}
+    accepted = set(processor.valid_kwargs.__annotations__)
+    assert module._IMAGE_PROCESSOR_KWARGS <= accepted
+    assert {"size", "patch_size", "merge_size"} <= accepted
+
+
 class TestMiMoV2Processor:
     def test_processor_attributes(self):
         from mlx_vlm.models.mimo_v2.processing import MiMoV2Processor
@@ -4501,6 +4512,19 @@ def test_lfm3_media_placeholders_are_validated_without_replacing_inserted_tokens
         module.Lfm3VlProcessor._expand(["a"], "<|image|>", ["image"])
     with pytest.raises(ValueError, match="placeholders"):
         module.Lfm3VlProcessor._expand(["<|image|>"], "<|image|>", [])
+
+
+def test_lfm3_processor_returns_image_features_without_text(lfm3_processor):
+    """Serving engines process media first and insert the tokens themselves."""
+    image = Image.new("RGB", (256, 256), color=(9, 30, 51))
+    features = lfm3_processor(images=[image], return_tensors="np")
+    assert set(features) == {"pixel_values", "image_grid_thw"}
+    assert features["image_grid_thw"].tolist() == [[1, 8, 8]]
+    size = {"shortest_edge": 1024, "longest_edge": 4096}
+    capped = lfm3_processor(images=[image], size=size, return_tensors="np")
+    assert capped["image_grid_thw"].tolist() == [[1, 4, 4]]
+    with pytest.raises(ValueError, match="placeholders"):
+        lfm3_processor(text=["no placeholder"], images=[image], return_tensors="np")
 
 
 def test_lfm3_processor_save_preserves_resolution_override(tmp_path, lfm3_processor):
