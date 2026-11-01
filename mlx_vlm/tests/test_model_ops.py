@@ -677,6 +677,55 @@ def test_mistral_large4_sparse_mla_strided_cache_and_mask(dtype, latent, rope, b
         np.testing.assert_array_equal(actual[-1], 0)
 
 
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("scale_name", [None, "weight_scale_2", "weight_global_scale"])
+@pytest.mark.parametrize("down", [False, True])
+def test_mistral_large4_masked_nvfp4_route_ownership_and_rounding(
+    dtype, scale_name, down
+):
+    from mlx_vlm.models.mistral_large4.moe_kernel import masked_qmv
+
+    mx.random.seed(93)
+    k, n = 512, 24
+    linear = QuantizedSwitchLinear(
+        k, n, 4, bias=False, group_size=16, bits=4, mode="nvfp4"
+    )
+    if scale_name is not None:
+        linear = ScaledQuantizedSwitchLinear(
+            linear, mx.array([0.125, 0.77, 1.23, 2.5]), scale_name
+        )
+    # One batch has no local experts, one has all, one has mixed ownership.
+    ids = mx.array([[-1, -1, -1, -1], [0, 1, 2, 3], [-1, 2, 3, -1]], mx.int32)
+    x = mx.random.normal((3, 4 if down else 1, 1, k)).astype(dtype)
+    x[0] = float("nan")  # Unowned routes must not read inputs or weights.
+    actual = masked_qmv(x, linear, ids)
+    expected = linear(x, mx.maximum(ids, 0)).squeeze(-2)
+    expected = mx.where(ids[..., None] >= 0, expected, 0)
+    np.testing.assert_array_equal(
+        np.array(actual.astype(mx.float32)), np.array(expected.astype(mx.float32))
+    )
+
+
+@pytest.mark.parametrize("scale_name", ["weight_scale_2", "weight_global_scale"])
+def test_mistral_large4_masked_nvfp4_tensor_scale_and_noncontiguous_input(scale_name):
+    from mlx_vlm.models.mistral_large4.moe_kernel import masked_qmv
+
+    mx.random.seed(19)
+    linear = QuantizedSwitchLinear(
+        512, 16, 3, bias=False, group_size=16, bits=4, mode="nvfp4"
+    )
+    linear = ScaledQuantizedSwitchLinear(linear, mx.array(0.73), scale_name)
+    x = mx.random.normal((2, 1, 1, 1024)).astype(mx.bfloat16)[..., ::2]
+    ids = mx.array([[0, -1, 2], [-1, 1, -1]], mx.int32)
+    actual = masked_qmv(x, linear, ids)
+    expected = mx.where(
+        ids[..., None] >= 0, linear(x, mx.maximum(ids, 0)).squeeze(-2), 0
+    )
+    np.testing.assert_array_equal(
+        np.array(actual.astype(mx.float32)), np.array(expected.astype(mx.float32))
+    )
+
+
 def test_mistral_large4_compiled_indexer_growing_cache_and_head_dimensions():
     from mlx_vlm.models.mistral_large4.language import _compiled_indexer_scores
 

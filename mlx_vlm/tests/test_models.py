@@ -1574,6 +1574,97 @@ def test_mistral_large4_invalid_kv_sharing_fails_at_configuration(
         module.TextConfig.from_dict(fields)
 
 
+@pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("wide", [False, True])
+def test_mistral_large4_pack_dense_projections_and_preserve_quantized(
+    mistral_large4_case, quantized, wide
+):
+    module, config = mistral_large4_case
+    if wide:
+        config = copy.deepcopy(config)
+        config.text_config.hidden_size = 512
+        config.text_config.intermediate_size = 1024
+        config.text_config.moe_intermediate_size = 512
+    mx.random.seed(71)
+    reference = module.Model(config)
+    reference.set_dtype(mx.bfloat16 if mx.default_device() == mx.gpu else mx.float32)
+    if quantized:
+        nn.quantize(
+            reference,
+            group_size=32,
+            bits=4,
+            class_predicate=lambda path, child: ".experts." not in path
+            and path.endswith((".w1", ".w3", ".wk", ".weights_proj")),
+        )
+    reference.eval()
+    weights = dict(tree_flatten(reference.parameters()))
+    model = module.Model(config)
+    packed = model.sanitize(dict(weights))
+    if quantized:
+        assert packed.keys() == weights.keys()
+        nn.quantize(
+            model,
+            group_size=32,
+            bits=4,
+            class_predicate=lambda path, child: f"{path}.scales" in packed,
+        )
+    else:
+        assert "w1" not in model.language_model.layers[0].feed_forward
+        assert "w3" not in model.language_model.layers[1].feed_forward.shared_experts
+        assert "wk" not in model.language_model.layers[0].attention.indexer
+        assert "weights_proj" not in model.language_model.layers[0].attention.indexer
+    model.load_weights(list(packed.items()))
+    model.eval()
+    # Cover both the short-prefix indexer bypass and indexed cached decode.
+    caches = [m.language_model.make_cache() for m in (reference, model)]
+    chunks = (32, 1, 1) if wide else (3, 2, 1)
+    for length in chunks:
+        ids = mx.broadcast_to(
+            mx.arange(length)[None] % 9 + 1, (8 if wide else 1, length)
+        )
+        a, b = [m(ids, cache=c).logits for m, c in zip((reference, model), caches)]
+        np.testing.assert_allclose(
+            np.array(a.astype(mx.float32)),
+            np.array(b.astype(mx.float32)),
+            atol=1e-5,
+            rtol=1e-5,
+        )
+
+
+@pytest.mark.parametrize("training,length", [(False, 1), (True, 1), (False, 3)])
+def test_mistral_large4_owned_experts_match_masked_reference(training, length):
+    from mlx_vlm.models.mistral_large4.config import TextConfig
+    from mlx_vlm.models.mistral_large4.language import Experts
+    from mlx_vlm.models.mistral_large4.moe_kernel import masked_qmv
+
+    args = TextConfig(
+        hidden_size=512, moe_intermediate_size=512, n_routed_experts=4, nvfp4=True
+    )
+    experts = Experts(args)
+    experts.train(training)
+    x = mx.random.normal((3, length, 512)).astype(mx.bfloat16)
+    indices = mx.broadcast_to(
+        mx.array([[-1, -1, -1, -1], [0, 1, 2, 3], [-1, 1, 2, -1]])[:, None],
+        (3, length, 4),
+    )
+    owned = indices >= 0
+    with patch(
+        "mlx_vlm.models.mistral_large4.language.masked_qmv", wraps=masked_qmv
+    ) as kernel:
+        actual = experts(x, indices, owned)
+        eligible = (
+            not training
+            and length == 1
+            and mx.default_device() == mx.gpu
+            and mx.metal.is_available()
+        )
+        assert kernel.call_count == (3 if eligible else 0)
+    expected = mx.where(owned[..., None], experts(x, mx.maximum(indices, 0)), 0)
+    np.testing.assert_array_equal(
+        np.array(actual.astype(mx.float32)), np.array(expected.astype(mx.float32))
+    )
+
+
 def test_mistral_large4_shared_loader_native_weights_and_roundtrip(
     tmp_path, mistral_large4_case
 ):

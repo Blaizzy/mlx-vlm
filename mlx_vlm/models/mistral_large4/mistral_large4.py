@@ -72,6 +72,46 @@ class Model(Mistral3Model):
             sanitized[key] = value
         weights.clear()
 
+        def pack_dense(module, prefix, left, right, target):
+            key = f"{prefix}.{target}.weight"
+            if key not in sanitized:
+                keys = [f"{prefix}.{name}.weight" for name in (left, right)]
+                if not all(k in sanitized for k in keys):
+                    return
+                a, b = (sanitized[k] for k in keys)
+                # Keep quantized projections separate: their formats and global
+                # scales may differ. Native FP8 has already been decoded here.
+                if (
+                    a.dtype != b.dtype
+                    or not mx.issubdtype(a.dtype, mx.floating)
+                    or a.shape[1:] != b.shape[1:]
+                ):
+                    return
+                sanitized[key] = mx.concatenate([sanitized.pop(k) for k in keys])
+            if target not in module:
+                rows = module[left].weight.shape[0] + module[right].weight.shape[0]
+                columns = module[left].weight.shape[1]
+                module[target] = nn.Linear(columns, rows, bias=False)
+                del module[left], module[right]
+
+        for i, layer in enumerate(self.language_model.layers):
+            prefix = f"language_model.model.layers.{i}"
+            mlp = layer.feed_forward
+            mlp_prefix = f"{prefix}.feed_forward"
+            if i >= args.first_k_dense_replace:
+                mlp = mlp.shared_experts
+                mlp_prefix += ".shared_experts"
+            if mlp is not None:
+                pack_dense(mlp, mlp_prefix, "w1", "w3", "gate_up_proj")
+            if layer.attention.indexer is not None:
+                pack_dense(
+                    layer.attention.indexer,
+                    f"{prefix}.attention.indexer",
+                    "wk",
+                    "weights_proj",
+                    "wk_weights_proj",
+                )
+
         for i in range(args.first_k_dense_replace, args.num_hidden_layers):
             prefix = f"language_model.model.layers.{i}.feed_forward.experts"
             for projection in ("w1", "w2", "w3"):
