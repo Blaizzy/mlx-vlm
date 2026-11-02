@@ -1,6 +1,6 @@
 """Batched verifier projections with the native small-batch reduction order."""
 
-# Copyright © 2023 Apple Inc. (MLX portions). MIT; see LICENSE.
+# Copyright © 2023 Apple Inc.
 
 from functools import lru_cache
 

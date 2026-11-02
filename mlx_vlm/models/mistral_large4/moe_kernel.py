@@ -4,7 +4,7 @@ Same 16-value dot grouping, FP32 accumulation, global scale and output
 rounding; skip unowned route tiles.
 """
 
-# Copyright © 2023 Apple Inc. (MLX portions). MIT; see LICENSE.
+# Copyright © 2023 Apple Inc.
 
 from functools import lru_cache
 
