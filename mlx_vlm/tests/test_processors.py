@@ -3149,6 +3149,45 @@ def test_prepare_inputs(prompt, with_image, error, pad_token):
         assert mx.array_equal(inputs["attention_mask"], mx.array([7, 8, 9]))
 
 
+@pytest.mark.parametrize(
+    "size,expected_size",
+    [
+        ({"shortest_edge": 1024, "longest_edge": 4096}, (64, 64)),
+        ({"longest_edge": 64}, (64, 64)),
+        ({"height": 32, "width": 64}, (64, 32)),
+        ((32, 64), (64, 32)),
+        (32, (32, 32)),
+    ],
+    ids=["pixel-area", "edge-bound", "dimensions", "tuple", "square"],
+)
+def test_prepare_inputs_uniform_images_respect_size_contract(size, expected_size):
+    class RecordingProcessor(MockProcessor):
+        def __call__(self, text=None, images=None, **kwargs):
+            self.images = images
+            return super().__call__(text=text, images=images, **kwargs)
+
+    processor = RecordingProcessor()
+    processor.image_processor = SimpleNamespace(size=size)
+    images = [Image.new("RGB", (64, 32), "red"), Image.new("RGB", (32, 64), "blue")]
+    prepare_inputs(
+        processor,
+        prompts="<image><image>",
+        images=images,
+        pad_to_uniform_size=True,
+    )
+
+    assert [image.size for image in processor.images] == [expected_size] * 2
+    if expected_size == (64, 64):
+        # Flexible sizing must preserve the source pixels and aspect ratios.
+        for source, padded in zip(images, processor.images):
+            x, y = (64 - source.width) // 2, (64 - source.height) // 2
+            np.testing.assert_array_equal(
+                np.asarray(padded.crop((x, y, x + source.width, y + source.height))),
+                np.asarray(source),
+            )
+            assert padded.getpixel((0, 0)) == (255, 255, 255)
+
+
 @pytest.mark.parametrize("wrapped", [False, True])
 @pytest.mark.parametrize("padding_side", ["left", "right"])
 @pytest.mark.parametrize(
