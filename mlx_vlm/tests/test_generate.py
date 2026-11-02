@@ -2056,6 +2056,14 @@ def test_sampling_validation_does_not_corrupt_compile(name, bad, valid):
     assert tokens.shape == (1,)
 
 
+def test_top_k_equal_to_vocab_size_keeps_all_tokens():
+    logprobs = mx.log(mx.array([[0.1, 0.2, 0.3, 0.4]]))
+    filtered = sampling.apply_top_k(logprobs, 4)
+    assert mx.array_equal(filtered, logprobs).item()
+    with pytest.raises(ValueError):
+        sampling.apply_top_k(logprobs, 5)
+
+
 @pytest.mark.parametrize(
     "module_name", ["mlx_vlm.generate.ar", "mlx_vlm.server.generation"]
 )
