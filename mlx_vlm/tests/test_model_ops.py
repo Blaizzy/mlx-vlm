@@ -792,7 +792,7 @@ def test_mistral_large4_compiled_local_experts_match_decode(
     dtype, batch, length, start
 ):
     from mlx_vlm.models.linear import tokenwise
-    from mlx_vlm.models.mistral_large4 import verify_ops
+    from mlx_vlm.models.mistral_large4 import speculative_verifier as verifier
     from mlx_vlm.models.mistral_large4.config import TextConfig
     from mlx_vlm.models.mistral_large4.language import MoE
     from mlx_vlm.models.mistral_large4.moe_kernel import masked_qmv
@@ -836,12 +836,12 @@ def test_mistral_large4_compiled_local_experts_match_decode(
         batch, length, 4, 512
     )
     modules = [ffn.experts.w1, ffn.experts.w3, ffn.experts.w2]
-    output, actual_weights = verify_ops.local_experts(
+    output, actual_weights = verifier.local_experts(
         x,
         ffn.gate.weight,
         [m.weight for m in modules],
         [m.scales for m in modules],
-        [verify_ops.expert_factor(m) for m in modules],
+        [verifier.expert_factor(m) for m in modules],
         start,
         1.0,
     )
