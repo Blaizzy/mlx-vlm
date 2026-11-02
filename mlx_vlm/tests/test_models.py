@@ -10,6 +10,7 @@ import json
 import logging
 import math
 import os
+import secrets
 import signal
 import socket
 import struct
@@ -3047,17 +3048,15 @@ def _distributed_model_worker(family, dtype_name):
 
 def _run_distributed_model_test(family, dtype, world_size):
     repo = Path(__file__).resolve().parents[2]
-    # The ring launcher needs one consecutive port per rank. Probe the entire
-    # range while holding the sockets so a four-rank case cannot reuse a port.
+    # Select a whole block outside the ephemeral range. Binding only the first
+    # port to zero leaves the allocator free to hand the remaining ports to a
+    # concurrent launch or an outgoing ring connection.
     for _ in range(100):
         with ExitStack() as stack:
             sockets = [stack.enter_context(socket.socket()) for _ in range(world_size)]
-            sockets[0].bind(("127.0.0.1", 0))
-            port = sockets[0].getsockname()[1]
-            if port + world_size > 65536:
-                continue
+            port = 10000 + world_size * secrets.randbelow((30000 - 10000) // world_size)
             try:
-                for rank, sock in enumerate(sockets[1:], 1):
+                for rank, sock in enumerate(sockets):
                     sock.bind(("127.0.0.1", port + rank))
             except OSError:
                 continue
