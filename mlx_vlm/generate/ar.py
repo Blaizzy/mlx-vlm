@@ -3096,7 +3096,9 @@ class BatchGenerator:
                 kv_quant_config=_quant_cfg,
             )
         if warm_cache is None:
-            raise _apc.APCAdmissionError("The APC prefix could not be materialized")
+            # A restorable cache may not support batch merging. Recompute it;
+            # genuine memory pressure is raised separately by the coordinator.
+            return None
 
         apc_meta = [
             {

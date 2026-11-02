@@ -33,7 +33,7 @@ deviations, all value-preserving:
 """
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from functools import partial
 from typing import Any, Dict, Optional
 
@@ -43,7 +43,7 @@ import numpy as np
 from mlx.utils import tree_map
 
 from ..base import scaled_dot_product_attention
-from ..cache import KVCache, QuantizedKVCache
+from ..cache import KVCache, QuantizedKVCache, cache_nbytes
 
 _SCORE_NEG = -1.0e9
 _ACT_CLAMP = 1.0e4
@@ -229,6 +229,7 @@ class PromptPages:
 
     def __init__(self, ids: np.ndarray, p: DashParams):
         ids = np.asarray(ids, dtype=np.int64).reshape(-1)
+        self.ids = ids
         self.length = S = int(ids.shape[0])
         bs = p.block_size
         img = ids == p.image_token_id
@@ -344,6 +345,59 @@ class _DashCache:
         self.pending = None
         self.summaries = None
         self.num_summaries = 0
+
+    def prefix_cache_snapshot(self):
+        state = self.dash_state
+        return {
+            "state": (None, None) if self.keys is None else self.state,
+            "meta_state": self.meta_state,
+            "params": asdict(state.params),
+            # The remaining prompt bookkeeping is derived from these ids.
+            "prompt_ids": None if state.prompt is None else mx.array(state.prompt.ids),
+            "position": (state.page, state.tok, state.markers),
+            "pending": self.pending,
+            "summaries": self.block_summaries(),
+            "num_summaries": self.num_summaries,
+        }
+
+    def prefix_cache_restore(self, snapshot):
+        state = DashState(DashParams(**snapshot["params"]))
+        if snapshot["prompt_ids"] is not None:
+            state.start(np.array(snapshot["prompt_ids"]))
+        state.page, state.tok, state.markers = snapshot["position"]
+        self.__init__(state)
+        self.state = snapshot["state"]
+        self.meta_state = snapshot["meta_state"]
+        self.pending = snapshot["pending"]
+        self.summaries = snapshot["summaries"]
+        self.num_summaries = snapshot["num_summaries"]
+
+    def extract(self, idx):
+        # DASH currently processes a single document at a time. Keep its full
+        # state when the generic APC/continuation path extracts that row.
+        if idx not in (0, -1):
+            raise IndexError("DASH cache row index out of range")
+        out = type(self).__new__(type(self))
+        out.prefix_cache_restore(self.prefix_cache_snapshot())
+        return out
+
+    def prefix_cache_merge(self, rows, prefix_lens):
+        # Inheriting the packed-K/V merge would discard the router state.
+        return None
+
+    @property
+    def nbytes(self):
+        state = self.dash_state
+        return super().nbytes + cache_nbytes(
+            (
+                self.pending,
+                self.summaries,
+                state.page,
+                state.tok,
+                state.markers,
+                vars(state.prompt) if state.prompt is not None else None,
+            )
+        )
 
     def is_trimmable(self):
         return False

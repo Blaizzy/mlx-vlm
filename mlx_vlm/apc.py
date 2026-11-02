@@ -61,7 +61,10 @@ import mlx.core as mx
 import numpy as np
 
 from ._stream_cleanup import clear_mlx_streams
-from .apc_adapters import reserve_checkpoint_capacity
+from .apc_adapters import (
+    build_prefix_cache_plan_from_caches,
+    reserve_checkpoint_capacity,
+)
 from .apc_coordinator import APCCoordinator, PrefillMemoryPlan
 from .apc_storage import APCNode, ComponentId, StateHandle
 from .kv_quant import from_config as kv_quant_from_config
@@ -3581,6 +3584,8 @@ class APCManager:
                 self.stats.memory_skips += 1
             if self.disk is None:
                 return False
+            if not build_prefix_cache_plan_from_caches(prompt_cache).restorable:
+                return False
             # Serialize the live state on its producer thread. It cannot be
             # queued by reference: generation will mutate it after this call.
             # This path avoids a second full snapshot just to spill to disk.
@@ -4419,10 +4424,28 @@ def make_warm_batch_exact_cache_multi(
     converted to match live ``_make_cache``. Hybrid non-KV entries are
     unchanged.
     """
-    # Copy only the containers: the caller retains ownership of the caches.
-    return _merge_and_release_cache_rows(
+    # Copy the containers because the caller retains ownership of the rows.
+    merged, prefix_len = _merge_and_release_cache_rows(
         [list(row) for row in row_caches], prefix_lens, kv_quant_config
     )
+    if merged is not None and len(row_caches) == 1:
+        merged = _detach_borrowed_cache_entries(merged, row_caches[0])
+    return merged, prefix_len if merged is not None else 0
+
+
+def _detach_borrowed_cache_entries(caches, source):
+    """Detach native pass-through entries returned by a public merge API."""
+    eval_targets: List[mx.array] = []
+    for i, entry in enumerate(caches):
+        if entry is source[i]:
+            caches[i] = _clone_cache_entry_for_apc(
+                entry, min_capacity_tokens=None, eval_targets=eval_targets
+            )
+            if caches[i] is None:
+                return None
+    if eval_targets:
+        mx.eval(eval_targets)
+    return caches
 
 
 def _merge_and_release_cache_rows(
@@ -4454,7 +4477,11 @@ def _merge_and_release_cache_rows(
             prefix_lens,
         )
         if merged is None:
-            return None, 0
+            if len(row_caches) != 1:
+                return None, 0
+            # A single request needs no batch conversion. Preserve custom
+            # checkpoint state when its cache has no multi-row merge.
+            merged = row_caches[0][entry_idx]
         out.append(merged)
         eval_targets: List[mx.array] = []
         _collect_mx_arrays(merged.state, eval_targets)
@@ -4527,6 +4554,9 @@ def snapshot_prompt_cache_row(
     """
     if not caches:
         return []
+    # Reject incomplete composite contracts before extracting their rows.
+    if not build_prefix_cache_plan_from_caches(caches).restorable:
+        return None
     source: Sequence[Any] = caches
     if _prompt_cache_is_batch_shaped(caches):
         row = extract_prompt_cache_from_batch(caches, batch_idx)

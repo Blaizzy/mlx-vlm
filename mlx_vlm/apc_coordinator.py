@@ -278,6 +278,11 @@ class APCCoordinator:
         kv_quant_config: Optional[dict] = None,
     ) -> Tuple[Optional[List[Any]], int]:
         """Materialize a mixed batch while preserving the caller's cache rows."""
+        source = (
+            picks[0]["warm_cache"]
+            if self.is_checkpoint and len(picks) == 1 and picks[0] is not None
+            else None
+        )
         if self.is_checkpoint:
             picks = [
                 (
@@ -287,9 +292,14 @@ class APCCoordinator:
                 )
                 for pick in picks
             ]
-        return self._merge_and_release_cache_rows(
+        caches, prefix_len = self._merge_and_release_cache_rows(
             picks, prefix_lens, kv_quant_config=kv_quant_config
         )
+        if caches is not None and source is not None:
+            from .apc import _detach_borrowed_cache_entries
+
+            caches = _detach_borrowed_cache_entries(caches, source)
+        return caches, prefix_len if caches is not None else 0
 
     def _merge_and_release_cache_rows(
         self,

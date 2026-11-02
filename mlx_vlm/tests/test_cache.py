@@ -2237,6 +2237,161 @@ def test_ring_prompt_boundary_survives_partial_prefill_restore():
     same_arrays(restored.state[0][:, :, :5], prompt)
 
 
+@parametrize("decode_steps", [0, 1, 5])
+def test_ring_snapshot_preserves_type_and_decode_position(decode_steps):
+    cache = RingSlidingKVCache(2)
+    cache.prefill_length = 3
+    prompt = mx.arange(24, dtype=mx.float32).reshape(2, 1, 3, 4)
+    cache.update_and_fetch(prompt, prompt)
+    for step in range(decode_steps):
+        token = mx.full((2, 1, 1, 4), step + 30, dtype=mx.float32)
+        cache.update_and_fetch(token, token)
+
+    restored = snapshot_row([cache], 1)[0]
+    assert type(restored) is RingSlidingKVCache
+    assert restored.meta_state == cache.meta_state
+    same_arrays(restored.state, tuple(t[1:2] for t in cache.state))
+    token = mx.full((2, 1, 1, 4), 99, dtype=mx.float32)
+    expected = cache.update_and_fetch(token, token)
+    actual = restored.update_and_fetch(token[1:2], token[1:2])
+    same_arrays(actual, tuple(t[1:2] for t in expected))
+    assert restored.meta_state == cache.meta_state
+
+
+@parametrize("api", ["helper", "coordinator"])
+def test_native_single_row_merge_preserves_public_input(api, managers):
+    source = RingSlidingKVCache(2)
+    filled(source, 4, heads=1, dim=4)
+    original_meta = source.meta_state
+    if api == "helper":
+        caches, prefix_len = warm_exact([[source]], [4])
+    else:
+        runner = coordinate(managers(), [source])
+        caches, prefix_len = runner.merge_rows([{"warm_cache": [source]}], [4])
+    assert prefix_len == 4 and type(caches[0]) is type(source)
+    assert caches[0] is not source
+    keys, values = kv(1, heads=1, dim=4)
+    caches[0].update_and_fetch(keys, values)
+    assert source.meta_state == original_meta
+    assert caches[0].offset == source.offset + 1
+
+
+@parametrize("quantized", [False, True])
+@parametrize("nested", [False, True])
+@parametrize("tier", ["memory", "disk-only"])
+def test_dash_checkpoint_preserves_router_and_page_state(
+    managers, quantized, nested, tier
+):
+    from mlx_vlm.models.unlimited_ocr.dash import (
+        DashKVCache,
+        DashParams,
+        DashQuantizedKVCache,
+        DashState,
+    )
+
+    state = DashState(
+        DashParams(block_size=4, index_dim=8, image_token_id=9, page_token_id=7)
+    )
+    tokens = [1, 7] + [9] * 12 + [4, 5]
+    state.start(tokens)
+    state.page, state.tok, state.markers = mx.array(1), mx.array(19), mx.array(2)
+    cache = (
+        DashQuantizedKVCache(state, group_size=32, bits=4)
+        if quantized
+        else DashKVCache(state)
+    )
+    filled(cache, 16, heads=1, dim=32)
+    cache.add_index_keys(mx.arange(120, dtype=mx.float32).reshape(15, 8), mx.ones(8))
+    caches = [C.CacheList(cache)] if nested else [cache]
+    manager = managers(tier)
+    runner = coordinate(manager, caches)
+    assert runner.enabled and runner.is_checkpoint
+    assert A.apc_exact_eligible(cache) and not A.apc_block_eligible(cache)
+    expected = cache.prefix_cache_snapshot()
+    for copy in (False, True):
+        row = snapshot_row(caches, clone=copy)[0]
+        restored = row.caches[0] if nested else row
+        assert type(restored) is type(cache)
+        same_arrays(restored.prefix_cache_snapshot(), expected)
+    assert runner.store_checkpoint(tokens, caches)
+    if tier == "disk-only":
+        manager.disk.flush()
+        manager.close()
+        manager = managers(tier)
+    rows, count = manager.lookup_exact_cache(tokens + [6])
+    assert count == len(tokens)
+    restored = rows[0].caches[0] if nested else rows[0]
+    assert type(restored) is type(cache)
+    same_arrays(restored.prefix_cache_snapshot(), expected)
+    assert restored.dash_state is not state
+    if tier == "disk-only":
+        assert manager.stats.disk_hits == 1
+
+    # Completing the partial router block and updating K/V must match the
+    # uninterrupted cache, including the packed quantization configuration.
+    new_keys = mx.ones((1, 8))
+    for item in (cache, restored):
+        item.add_index_keys(new_keys, mx.ones(8))
+    keys, values = kv(1, heads=1, dim=32)
+    same_arrays(
+        cache.update_and_fetch(keys, values), restored.update_and_fetch(keys, values)
+    )
+    same_arrays(cache.prefix_cache_snapshot(), restored.prefix_cache_snapshot())
+    restored.pending = mx.zeros((1, 8))
+    restored.dash_state.markers = mx.array(99)
+    assert cache.pending is None and state.markers.item() == 2
+
+
+@parametrize(
+    "names",
+    [
+        ("Z1TCache",),
+        ("KVCache", "RingSlidingKVCache"),
+        ("CacheList", "HyV4KVCache"),
+        ("CacheList", "SimpleKVCache"),
+    ],
+)
+@parametrize("memory_pressure", [False, True])
+def test_unmergeable_cache_falls_back_but_memory_pressure_propagates(
+    names, memory_pressure, managers, monkeypatch
+):
+    from mlx_vlm.generate.ar import BatchGenerator
+
+    model = cache_model([sample(name) for name in names])
+    processor = NS(stopping_criteria=NS(add_eos_token_ids=lambda _: None))
+    manager = managers()
+    runner = BatchGenerator(
+        model, processor, apc_manager=manager, manage_wired_limit=False
+    )
+    try:
+        tokens = list(range(20))
+        rows = [sample(name, 16) for name in names]
+        assert manager.store_exact_cache(tokens[:16], rows)
+        pick = runner.apc.lookup(
+            tokens,
+            extra_hash=0,
+            safe_lookup_min=0,
+            suffix_is_text_only=lambda _: True,
+            prefix_has_media=lambda _: False,
+        )
+        assert pick is not None
+        runner.apc.prepare_prefill([20, 20], prefix_lengths=[16, 16])
+        if memory_pressure:
+            monkeypatch.setattr(runner.apc, "prepare_prefill", lambda *a, **kw: False)
+        sequence = (0, tokens, 3, {"inputs_embeds": mx.zeros((1, 20, 4))}, [], None)
+        if memory_pressure:
+            with pytest.raises(P.APCAdmissionError):
+                runner._build_mixed_prompt_batch([sequence, sequence], [pick, pick])
+        else:
+            assert (
+                runner._build_mixed_prompt_batch([sequence, sequence], [pick, pick])
+                is None
+            )
+        runner._release_prefill_pick(pick)
+    finally:
+        runner.close()
+
+
 def sample(name, length=0):
     constructors = {
         "ArraysCache": lambda: C.ArraysCache(2),
