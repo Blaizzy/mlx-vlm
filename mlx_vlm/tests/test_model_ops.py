@@ -2456,6 +2456,72 @@ def test_convert_keeps_source_tokenizer_json_pipeline(tmp_path):
     )
 
 
+@pytest.mark.parametrize("token_origin", ["config", "processor"])
+def test_convert_preserves_loaded_added_tokens(tmp_path, token_origin):
+    from tokenizers import AddedToken, Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import WhitespaceSplit
+    from transformers import PreTrainedTokenizerFast
+
+    conversion = importlib.import_module("mlx_vlm.convert")
+    source, destination = tmp_path / "source", tmp_path / "converted"
+    backend = Tokenizer(WordLevel({"[UNK]": 0, "hello": 1}, unk_token="[UNK]"))
+    backend.pre_tokenizer = WhitespaceSplit()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        unk_token="[UNK]",
+    )
+    tokenizer.add_tokens([AddedToken("<existing>", normalized=False)])
+    tokenizer.save_pretrained(source)
+    (source / "config.json").write_text("{}")
+    added_tokens = [
+        AddedToken("<extra>", normalized=False, lstrip=True, rstrip=True),
+        AddedToken("<special>", normalized=False, single_word=True, special=True),
+    ]
+    if token_origin == "config":
+        # Legacy exports may store added tokens only in tokenizer_config.json.
+        config_path = source / "tokenizer_config.json"
+        config = json.loads(config_path.read_text())
+        config["added_tokens_decoder"] = {
+            str(len(tokenizer) + i): token.__getstate__()
+            for i, token in enumerate(added_tokens)
+        }
+        config_path.write_text(json.dumps(config))
+
+    processor = PreTrainedTokenizerFast.from_pretrained(source, local_files_only=True)
+    if token_origin == "processor":
+        processor.add_tokens(added_tokens)
+    originals = {path.name: path.read_bytes() for path in source.iterdir()}
+    expected_tokens = {
+        token_id: token.__getstate__()
+        for token_id, token in processor.added_tokens_decoder.items()
+    }
+    text = "hello <existing> <extra> <special>"
+    expected_ids = processor.encode(text, add_special_tokens=False)
+    assert expected_ids == [1, 2, 3, 4]
+
+    with patch.object(
+        conversion, "fetch_from_hub", return_value=(nn.Linear(4, 4), {}, processor)
+    ):
+        conversion.convert(str(source), str(destination))
+
+    backend = Tokenizer.from_file(str(destination / "tokenizer.json"))
+    assert backend.encode(text, add_special_tokens=False).ids == expected_ids
+    assert {
+        token_id: token.__getstate__()
+        for token_id, token in backend.get_added_tokens_decoder().items()
+    } == expected_tokens
+    reloaded = PreTrainedTokenizerFast.from_pretrained(
+        destination, local_files_only=True
+    )
+    assert reloaded.encode(text, add_special_tokens=False) == expected_ids
+    assert {
+        token_id: token.__getstate__()
+        for token_id, token in reloaded.added_tokens_decoder.items()
+    } == expected_tokens
+    assert {path.name: path.read_bytes() for path in source.iterdir()} == originals
+
+
 @pytest.mark.parametrize("alias", [False, True])
 def test_convert_copy_rejects_same_file_without_modifying_source(tmp_path, alias):
     from mlx_vlm.convert import _copy_writable_file
