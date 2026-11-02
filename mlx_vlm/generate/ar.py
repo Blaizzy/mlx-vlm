@@ -3069,7 +3069,7 @@ class BatchGenerator:
         _quant_cfg = _quant_policy.to_config() if _quant_policy is not None else None
         coordinator = getattr(self, "apc", None)
         if coordinator is not None:
-            warm_cache, _ = coordinator.merge_rows(
+            warm_cache, _ = coordinator._merge_and_release_cache_rows(
                 picks,
                 prefix_lens,
                 kv_quant_config=_quant_cfg,
@@ -3079,7 +3079,7 @@ class BatchGenerator:
                 p["warm_cache"] if p is not None else self.model.make_cache()
                 for p in picks
             ]
-            warm_cache, _ = _apc.make_warm_batch_exact_cache_multi(
+            warm_cache, _ = _apc._merge_and_release_cache_rows(
                 row_caches,
                 prefix_lens,
                 kv_quant_config=_quant_cfg,

@@ -1706,8 +1706,8 @@ def _mixed_batch(model, rows, prompts, prefix, warm_cache=None):
         manager=SimpleNamespace(memory_plan=PrefillMemoryPlan()),
         prepare_prefill=lambda *a, **k: None,
         observe_cache=lambda *a, **k: None,
-        merge_rows=lambda *a, **k: (
-            ar._apc.make_warm_batch_exact_cache_multi(
+        _merge_and_release_cache_rows=lambda *a, **k: (
+            ar._apc._merge_and_release_cache_rows(
                 [warm_cache, make_prompt_cache(model)], [prefix, 0]
             )
             if warm_cache is not None

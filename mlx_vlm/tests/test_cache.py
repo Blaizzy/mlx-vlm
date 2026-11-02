@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from itertools import product
@@ -2328,7 +2329,8 @@ def discover_contracts():
 
 
 @parametrize("names", discover_contracts(), ids=lambda names: "+".join(names))
-def test_model_cache_contract(names, managers, monkeypatch):
+@parametrize("merge_method", ["merge_rows", "_merge_and_release_cache_rows"])
+def test_model_cache_contract(names, merge_method, managers, monkeypatch):
     monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "2")
     for name in names:
         cache = sample(name)
@@ -2364,11 +2366,93 @@ def test_model_cache_contract(names, managers, monkeypatch):
     assert runner.materialize_single(hit, min_capacity_tokens=17) is not None
     assert manager.stats_snapshot()["restored_tokens"] == 16
     manager.reset_stats()
-    merged, _ = runner.merge_rows([hit], [16])
+    original_entries = tuple(hit["warm_cache"]) if plan.strategy != "block" else None
+    merged, _ = getattr(runner, merge_method)([hit], [16])
     assert manager.stats_snapshot()["restored_tokens"] == (
         16 if merged is not None else 0
     )
+    if original_entries is not None and merged is not None:
+        if merge_method == "merge_rows":
+            assert all(a is b for a, b in zip(hit["warm_cache"], original_entries))
+        else:
+            assert hit["warm_cache"] == [None] * len(original_entries)
     runner.release_hit(hit)
+
+
+@parametrize("row_type", [list, tuple])
+@parametrize("fail_last_layer", [False, True])
+def test_exact_merge_preserves_borrowed_rows(row_type, fail_last_layer, monkeypatch):
+    rows = tuple(
+        row_type(sample(name, 16) for name in ("KVCache", "ArraysCache"))
+        for _ in range(2)
+    )
+    originals = [tuple(row) for row in rows]
+    merge = P._merge_exact_cache_entries
+
+    def checked_merge(entries, lengths):
+        if fail_last_layer and entries[0] is originals[0][-1]:
+            return None
+        return merge(entries, lengths)
+
+    monkeypatch.setattr(P, "_merge_exact_cache_entries", checked_merge)
+    merged, count = warm_exact(rows, [16, 16])
+    assert (merged is None) == fail_last_layer
+    assert count == (0 if fail_last_layer else 16)
+    for row, original in zip(rows, originals):
+        assert all(a is b for a, b in zip(row, original))
+
+
+@parametrize("fail_last_layer", [False, True])
+def test_consumed_exact_merge_releases_layers(monkeypatch, fail_last_layer):
+    rows = [
+        [sample(name, 16) for name in ("KVCache", "ArraysCache", "KVCache")]
+        for _ in range(2)
+    ]
+    expected, _ = warm_exact(rows, [16, 16])
+    refs = [[weakref.ref(entry) for entry in row] for row in rows]
+    merge = P._merge_exact_cache_entries
+    layer = 0
+
+    def checked_merge(entries, lengths):
+        nonlocal layer
+        if layer:
+            assert all(refs[row][layer - 1]() is None for row in range(2))
+        current, layer = layer, layer + 1
+        return None if fail_last_layer and current == 2 else merge(entries, lengths)
+
+    monkeypatch.setattr(P, "_merge_exact_cache_entries", checked_merge)
+    actual, count = P._merge_and_release_cache_rows(rows, [16, 16])
+    consumed = 2 if fail_last_layer else 3
+    assert all(row[:consumed] == [None] * consumed for row in rows)
+    if fail_last_layer:
+        assert actual is None and count == 0
+    else:
+        assert count == 16
+        for result, reference in zip(actual, expected):
+            same_arrays(result.state, reference.state)
+
+
+def test_consumed_exact_merge_preserves_retained_apc_snapshots(managers):
+    manager = managers()
+    source = [sample("ArraysCache", 16), sample("KVCache", 16)]
+    tokens = list(range(16))
+    assert manager.store_exact_cache(tokens, source)
+    coordinator = coordinate(manager, source)
+    hit = coordinator.lookup(
+        tokens + [99],
+        extra_hash=0,
+        safe_lookup_min=0,
+        suffix_is_text_only=lambda _: True,
+        prefix_has_media=lambda _: False,
+    )
+    merged, count = coordinator._merge_and_release_cache_rows([hit], [16])
+    assert count == 16 and hit["warm_cache"] == [None, None]
+    merged[0][0] = mx.zeros_like(merged[0][0])
+    merged[1].keys = mx.zeros_like(merged[1].keys)
+    restored, count = manager.lookup_exact_cache(tokens + [99])
+    assert count == 16
+    for result, reference in zip(restored, source):
+        same_arrays(result.state, reference.state)
 
 
 @parametrize("kind", ["qsa", "deepseek", "composite", "ring-indexed"])
@@ -3198,7 +3282,8 @@ def test_quantized_hybrid_snapshots(managers):
 
 
 @parametrize("scheme", ["uniform", "turboquant"])
-def test_warm_cache_quantization_policy(scheme, managers):
+@parametrize("merge", [warm_exact, P._merge_and_release_cache_rows])
+def test_warm_cache_quantization_policy(scheme, merge, managers):
     bits = 8 if scheme == "uniform" else 3.5
     config = dict(bits=bits, group_size=32, scheme=scheme)
     manager = managers(blocks=32)
@@ -3249,7 +3334,7 @@ def test_warm_cache_quantization_policy(scheme, managers):
             )
             for i in range(1, 4)
         ]
-        warm, _ = warm_exact([row], [16], kv_quant_config=config)
+        warm, _ = merge([row], [16], kv_quant_config=config)
         assert [type(c) for c in warm] == [type(c) for c in live]
         extended = _extend_cache(live, warm)
         assert extended[1].offset.shape[0] == 2
@@ -3955,10 +4040,12 @@ def test_restored_tokens_count_successful_restores(
         caches = runner.materialize_single(hit, min_capacity_tokens=33)
     else:
         if restore == "failed-batch":
-            builder = "exact" if mode == "exact" else "kv"
-            monkeypatch.setattr(
-                P, f"make_warm_batch_{builder}_cache_multi", lambda *a, **kw: (None, 0)
+            builder = (
+                "_merge_and_release_cache_rows"
+                if mode == "exact"
+                else "make_warm_batch_kv_cache_multi"
             )
+            monkeypatch.setattr(P, builder, lambda *a, **kw: (None, 0))
         caches, _ = runner.merge_rows([hit, None], [hit["prefix_len"], 0])
     runner.release_hit(hit)
     stats = manager.stats_snapshot()
@@ -3995,7 +4082,7 @@ def test_prefill_admission_is_authoritative_before_merge(memory_manager, monkeyp
     monkeypatch.setattr(manager, "_memory_headroom", lambda: 0)
     assert coordinator.prepare_prefill([32, 32]) is False
     forbid(monkeypatch, P, "make_warm_batch_kv_cache_multi")
-    forbid(monkeypatch, P, "make_warm_batch_exact_cache_multi")
+    forbid(monkeypatch, P, "_merge_and_release_cache_rows")
     with pytest.raises(P.APCAdmissionError, match="merge"):
         coordinator.merge_rows([None, None], [0, 0])
 

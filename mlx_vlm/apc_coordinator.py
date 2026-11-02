@@ -277,11 +277,33 @@ class APCCoordinator:
         *,
         kv_quant_config: Optional[dict] = None,
     ) -> Tuple[Optional[List[Any]], int]:
-        """Materialize a mixed warm/cold batch at the common prefix boundary."""
-        from .apc import (
-            make_warm_batch_exact_cache_multi,
-            make_warm_batch_kv_cache_multi,
+        """Materialize a mixed batch while preserving the caller's cache rows."""
+        if self.is_checkpoint:
+            picks = [
+                (
+                    {**pick, "warm_cache": list(pick["warm_cache"])}
+                    if pick is not None
+                    else None
+                )
+                for pick in picks
+            ]
+        return self._merge_and_release_cache_rows(
+            picks, prefix_lens, kv_quant_config=kv_quant_config
         )
+
+    def _merge_and_release_cache_rows(
+        self,
+        picks: Sequence[Optional[dict]],
+        prefix_lens: Sequence[int],
+        *,
+        kv_quant_config: Optional[dict] = None,
+    ) -> Tuple[Optional[List[Any]], int]:
+        """Merge scheduler-owned rows; discard picks after success or failure.
+
+        Exact-cache input entries are released layer by layer. Block leases
+        retain their existing lifecycle in the scheduler.
+        """
+        from .apc import _merge_and_release_cache_rows, make_warm_batch_kv_cache_multi
 
         memory = self.manager.memory_plan
         if len(prefix_lens) == len(memory.lengths):
@@ -300,7 +322,7 @@ class APCCoordinator:
                 pick["warm_cache"] if pick is not None else self.fresh_cache()
                 for pick in picks
             ]
-            caches, max_prefix = make_warm_batch_exact_cache_multi(
+            caches, max_prefix = _merge_and_release_cache_rows(
                 row_caches,
                 prefix_lens,
                 kv_quant_config=kv_quant_config,

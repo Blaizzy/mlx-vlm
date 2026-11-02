@@ -4412,12 +4412,29 @@ def make_warm_batch_exact_cache_multi(
     prefix_lens: Sequence[int],
     kv_quant_config: Optional[dict] = None,
 ) -> Tuple[Optional[List[Any]], int]:
-    """Merge single-row exact-cache snapshots into batch-aware caches.
+    """Merge exact-cache rows without releasing the caller's input entries.
 
     Native quantized rows are merged in their packed representation. When
     *kv_quant_config* is provided, legacy float ``BatchKVCache`` snapshots are
     converted to match live ``_make_cache``. Hybrid non-KV entries are
     unchanged.
+    """
+    # Copy only the containers: the caller retains ownership of the caches.
+    return _merge_and_release_cache_rows(
+        [list(row) for row in row_caches], prefix_lens, kv_quant_config
+    )
+
+
+def _merge_and_release_cache_rows(
+    row_caches: Sequence[List[Any]],
+    prefix_lens: Sequence[int],
+    kv_quant_config: Optional[dict] = None,
+) -> Tuple[Optional[List[Any]], int]:
+    """Take ownership of temporary rows and release each layer after merging.
+
+    Materialize each merged layer before clearing its input entries, bounding
+    the overlap to one layer instead of another full batch. Callers must not
+    reuse the rows, including after a failure that leaves them partly cleared.
     """
 
     if not row_caches:
@@ -4427,6 +4444,8 @@ def make_warm_batch_exact_cache_multi(
     num_entries = len(row_caches[0])
     if any(len(row) != num_entries for row in row_caches):
         return None, 0
+    if any(not isinstance(row, list) for row in row_caches):
+        raise TypeError("Merging and releasing caches requires owned row lists")
 
     out: List[Any] = []
     for entry_idx in range(num_entries):
@@ -4437,6 +4456,12 @@ def make_warm_batch_exact_cache_multi(
         if merged is None:
             return None, 0
         out.append(merged)
+        eval_targets: List[mx.array] = []
+        _collect_mx_arrays(merged.state, eval_targets)
+        if eval_targets:
+            mx.eval(eval_targets)
+        for row in row_caches:
+            row[entry_idx] = None
 
     if kv_quant_config is not None:
         out = _align_exact_batch_caches_to_kv_policy(out, kv_quant_config)
