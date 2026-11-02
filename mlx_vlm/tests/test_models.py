@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import faulthandler
 import importlib
 import inspect
 import json
@@ -2957,7 +2958,14 @@ def _make_distributed_test_model(family, dtype):
 
 
 def _distributed_model_worker(family, dtype_name):
+    faulthandler.dump_traceback_later(25)
+
+    def stage(name):
+        print(f"[rank {os.environ.get('MLX_RANK')}] {name}", flush=True)
+
+    stage("initializing ring")
     group = mx.distributed.init(strict=True, backend="ring")
+    stage("building models")
     options = TINY_MODELS[family]["distributed"]
     dtype = getattr(mx, dtype_name)
     mx.random.seed(19)
@@ -2971,6 +2979,7 @@ def _distributed_model_worker(family, dtype_name):
         with pytest.raises(ValueError, match=error):
             sharded.shard(group)
     mx.eval(sharded.parameters())
+    stage("models ready")
     local_weights = dict(tree_flatten(sharded.parameters()))
     for pattern in options["sharded_weights"]:
         names = [name for name in weights if fnmatchcase(name, pattern)]
@@ -2989,17 +2998,21 @@ def _distributed_model_worker(family, dtype_name):
         for step, tokens in enumerate(
             ([1, 7, 9, 3, 11, 15, 2, 6, 8, 10, 12, 14], [13], [17], [19], [2, 4, 6])
         ):
+            stage(f"batch={batch} step={step} reference")
             ids = mx.array(
                 [[(t + row) % vocab_size for t in tokens] for row in range(batch)]
             )
             expected = reference(ids, cache=expected_cache).logits
             mx.eval(expected)
+            stage(f"batch={batch} step={step} barrier")
             # Finish independent reference work on every rank before queuing
             # distributed work on the shared GPU. Keep test-only collectives
             # on the CPU so a faster rank cannot block another rank's GPU work.
             mx.distributed.all_sum(mx.array(0), group=group, stream=mx.cpu).item()
+            stage(f"batch={batch} step={step} sharded")
             actual = sharded(ids, cache=actual_cache).logits
             mx.eval(actual)
+            stage(f"batch={batch} step={step} gather")
             gathered = mx.distributed.all_gather(actual, group=group, stream=mx.cpu)
             mx.eval(gathered)
             ranks_agree = all(
@@ -3029,6 +3042,7 @@ def _distributed_model_worker(family, dtype_name):
         flush=True,
     )
     assert passed == group.size(), records
+    stage("completed")
 
 
 def _run_distributed_model_test(family, dtype, world_size):
@@ -3080,7 +3094,7 @@ def _run_distributed_model_test(family, dtype, world_size):
         start_new_session=True,
     )
     try:
-        output, _ = process.communicate(timeout=180)
+        output, _ = process.communicate(timeout=30)
     except subprocess.TimeoutExpired:
         os.killpg(process.pid, signal.SIGKILL)
         output, _ = process.communicate()
