@@ -638,7 +638,7 @@ class TestBatchGenerator:
         )
         prompt_tokens = 5
         gen._prompt_batch = SimpleNamespace(
-            needs_processing=lambda: True, prompt_step=lambda: 2
+            needs_processing=lambda: True, prompt_step=lambda: 2, prefill_step_size=2
         )
         gen._prompt_tokens_counter = prompt_tokens
 
@@ -1745,6 +1745,7 @@ def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
         captured.update(kwargs)
         return SimpleNamespace(
             total_prompt_tokens=sum(len(ids) for ids in kwargs["input_ids"]),
+            prefill_step_size=kwargs["prefill_step_size"],
             needs_processing=lambda: True,
             prompt_step=lambda: 0,
         )
@@ -2724,3 +2725,99 @@ def test_generate_audio_prepares_inputs_once_and_saves_wav(monkeypatch, tmp_path
         )
     with pytest.raises(ValueError, match="does not support audio generation"):
         audio_module.generate_audio(SimpleNamespace(), processor, "prompt")
+
+
+@pytest.mark.parametrize("cold", [False, True])
+def test_apc_admission_separates_long_suffix_and_keeps_fifo_priority(cold):
+    bg = object.__new__(BatchGenerator)
+    bg._wire_stack = None
+    bg.prefill_step_size = 2048
+    bg.apc = SimpleNamespace(prepare_prefill=lambda *a, **kw: True)
+    bg.apc_manager = MagicMock()
+    sequences = [(i, list(range(32768)), 4, {}, [], None) for i in range(8)]
+
+    def pick(s, **kw):
+        if s[0] == 7 and cold:
+            return None
+        return dict(prefix_len=32767 if s[0] != 7 else 16000, matched_blocks=[])
+
+    bg._apc_pick_for = pick
+    admitted, picks = bg._admit_prefill(sequences)
+    assert [s[0] for s in admitted] == list(range(7))
+    assert all(p["prefix_len"] == 32767 for p in picks)
+    # A new warm arrival cannot continually displace the older long suffix.
+    admitted, _ = bg._admit_prefill([sequences[7], sequences[0]])
+    assert [s[0] for s in admitted] == [7]
+
+
+def test_apc_admission_shrinks_batch_and_releases_excluded_leases():
+    bg = object.__new__(BatchGenerator)
+    bg._wire_stack = None
+    bg.prefill_step_size = 2048
+    bg.apc = SimpleNamespace(
+        prepare_prefill=lambda lengths, **kw: isinstance(lengths, int)
+        or len(lengths) <= 2
+    )
+    bg.apc_manager = MagicMock()
+    bg._apc_pick_for = lambda s, **kw: dict(prefix_len=31, matched_blocks=[s[0]])
+    sequences = [(i, list(range(32)), 4, {}, [], None) for i in range(4)]
+    admitted, picks = bg._admit_prefill(sequences)
+    assert [s[0] for s in admitted] == [0, 1]
+    assert [c.args[0] for c in bg.apc_manager.release.call_args_list] == [[3], [2]]
+    assert [p["matched_blocks"] for p in picks] == [[0], [1]]
+
+
+def test_apc_refused_restore_stays_queued_while_peer_decodes(
+    mock_model, mock_processor
+):
+    with patch.object(ar_module, "wired_limit", return_value=contextlib.nullcontext()):
+        gen = BatchGenerator(mock_model, mock_processor, completion_batch_size=2)
+    gen.apc = SimpleNamespace(prepare_prefill=lambda *a, **kw: True)
+    gen.apc_manager = MagicMock()
+    gen._apc_pick_for = MagicMock(side_effect=apc_module.APCAdmissionError())
+    uid = gen.insert([[1, 2, 3]])[0]
+    gen._generation_batch = MagicMock()
+    gen._generation_batch.__len__.return_value = 1
+    gen._generation_batch.uids = [99]
+    gen._generation_batch.prompt_cache = []
+    gen._generation_batch.is_speculative = False
+    gen._generation_batch.logits_processors = []
+    gen._generation_batch.next.return_value = [SimpleNamespace(uid=99)]
+    for _ in range(3):
+        _, responses = gen._next()
+        assert [r.uid for r in responses] == [99]
+        assert gen.unprocessed_prompts[0][0] == uid
+        assert gen._prompt_batch is None
+    assert gen._apc_pick_for.call_count == 1
+    gen._generation_batch.__len__.return_value = 0
+    gen._generation_batch.uids = []
+    with pytest.raises(apc_module.APCAdmissionError) as error:
+        gen._next()
+    assert error.value.uid == uid
+
+
+def test_prefill_chunk_bounds_work_with_decoding_peers():
+    gen = object.__new__(BatchGenerator)
+    gen._wire_stack = None
+    gen.prefill_step_size = 2048
+    gen._generation_batch = [99]
+    gen._prompt_batch = SimpleNamespace(
+        uids=[0, 1], prefill_step_size=2048, prompt_step=lambda: 1
+    )
+    gen._step_prompt_batch()
+    assert gen._prompt_batch.prefill_step_size == 128
+    gen._generation_batch = []
+    gen._step_prompt_batch()
+    assert gen._prompt_batch.prefill_step_size == 2048
+
+
+def test_prefill_chunk_limit_respects_model_disabling_chunking():
+    gen = object.__new__(BatchGenerator)
+    gen._wire_stack = None
+    gen.prefill_step_size = 2048
+    gen._generation_batch = [99]
+    gen._prompt_batch = SimpleNamespace(
+        uids=[0], prefill_step_size=None, prompt_step=lambda: 1
+    )
+    assert gen._step_prompt_batch() == 1
+    assert gen._prompt_batch.prefill_step_size is None

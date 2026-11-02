@@ -2242,7 +2242,15 @@ class ResponseGenerator:
     def _step(self, batch_gen, active, gen_kwargs=None):
         """One batch generation step: prefill + decode."""
         kwargs = gen_kwargs or {}
-        prompt_responses, responses = batch_gen.next(**kwargs)
+        try:
+            prompt_responses, responses = batch_gen.next(**kwargs)
+        except _apc.APCAdmissionError as error:
+            if error.uid not in active:
+                raise
+            info = active.pop(error.uid)
+            batch_gen.remove(error.uid)
+            _notify_queues([info["rqueue"]], error, None)
+            return
         self._log_prefill_progress(batch_gen, active)
         for prompt_response in prompt_responses:
             if prompt_response.uid in active:

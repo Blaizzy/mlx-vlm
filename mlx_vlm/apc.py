@@ -581,6 +581,14 @@ def adjust_prefix_to_text_suffix_boundary(
     return prefix_len
 
 
+class APCAdmissionError(MemoryError):
+    """A prefix restore or prefill must wait for memory to become available."""
+
+    def __init__(self, message="Insufficient memory for APC prefill", *, uid=None):
+        super().__init__(message)
+        self.uid = uid
+
+
 @dataclass
 class APCBlock(APCNode):
     """Pooled logical node for one fixed-size KV block; its pageable K/V lives in the "kv" component handle."""
@@ -3317,12 +3325,12 @@ class APCManager:
             and self._memory_headroom() >= required
         )
 
-    def prepare_prefill(self, reserve_bytes: int) -> None:
+    def prepare_prefill(self, reserve_bytes: int) -> bool:
         """Enforce the coordinator's byte budget before new allocations."""
         if self.disk is not None:
             self.disk.flush()
         self._prefill_reserve_bytes = max(0, int(reserve_bytes))
-        self._make_room()
+        return self._make_room()
 
     # ---------- Public API ----------
     def checkpoint_prefix_length(
@@ -3352,6 +3360,8 @@ class APCManager:
         extra_hash: int = 0,
         max_prefix_tokens: Optional[int] = None,
         min_prefix_tokens: int = 0,
+        *,
+        defer_on_pressure: bool = False,
     ) -> Tuple[Optional[List[Any]], int]:
         """Return the longest restorable prefix from prompt-cache snapshots.
 
@@ -3406,17 +3416,8 @@ class APCManager:
                             source_cache, prefix_len
                         )
 
+        restore_deferred = False
         can_try_disk = disk is not None and prefix_len < max_len
-        if can_try_disk and self._disk_min_free_ram_bytes > 0:
-            free_now = _free_ram_bytes()
-            if free_now is not None and free_now < self._disk_min_free_ram_bytes:
-                logger.info(
-                    "APC: skipping exact disk restore " "(free RAM %.1f GB < %.1f GB)",
-                    free_now / (1 << 30),
-                    self._disk_min_free_ram_bytes / (1 << 30),
-                )
-                can_try_disk = False
-
         if can_try_disk and disk is not None:
             disk_match = disk.find_exact_prefix(
                 token_tuple,
@@ -3429,9 +3430,14 @@ class APCManager:
                 cache_hash, disk_prefix_len = disk_match
                 # Admit stored buffers before estimating expansion from their layout.
                 restore_bytes = disk.exact_cache_bytes(cache_hash)
-                if not self._make_room(2 * restore_bytes):
+                free_now = _free_ram_bytes() if self._disk_min_free_ram_bytes else None
+                low_ram = (
+                    free_now is not None and free_now < self._disk_min_free_ram_bytes
+                )
+                if low_ram or not self._make_room(2 * restore_bytes):
                     with self.lock:
                         self.stats.memory_skips += 1
+                    restore_deferred = True
                     disk_match = None
             if disk_match is not None:
                 cache_hash, disk_prefix_len = disk_match
@@ -3456,6 +3462,7 @@ class APCManager:
                         if not self._make_room(2 * expanded_bytes):
                             with self.lock:
                                 self.stats.memory_skips += 1
+                            restore_deferred = True
                             # Drop disk buffers and credit before memory fallback.
                             loaded = prompt_cache = None
                             self._prefill_reserve_bytes = (
@@ -3516,6 +3523,10 @@ class APCManager:
                             return prompt_cache, disk_prefix_len
 
         if source_cache is None:
+            if restore_deferred and defer_on_pressure:
+                raise APCAdmissionError(
+                    "APC prefix restore deferred by memory admission"
+                )
             return None, 0
         restore_bytes = self.memory_plan.restore_bytes(
             source_cache, prefix_len, prompt_capacity_tokens
@@ -3523,6 +3534,10 @@ class APCManager:
         if not self._make_room(restore_bytes):
             with self.lock:
                 self.stats.memory_skips += 1
+            if defer_on_pressure:
+                raise APCAdmissionError(
+                    "APC prefix restore deferred by memory admission"
+                )
             return None, 0
         prompt_cache = _clone_prompt_cache_for_apc(
             source_cache,
@@ -3633,6 +3648,7 @@ class APCManager:
         max_prefix_tokens: Optional[int] = None,
         min_prefix_tokens: int = 0,
         allow_memory_overlap: bool = False,
+        defer_on_pressure: bool = False,
     ) -> Tuple[Optional[List[Any]], int]:
         """Return a ready prompt cache from a layer-major disk shard.
 
@@ -3644,17 +3660,6 @@ class APCManager:
         if disk is None:
             return None, 0
         with self.lock:
-            if self._disk_min_free_ram_bytes > 0:
-                free_now = _free_ram_bytes()
-                if free_now is not None and free_now < self._disk_min_free_ram_bytes:
-                    logger.info(
-                        "APC: skipping disk prompt-cache restore "
-                        "(free RAM %.1f GB < %.1f GB)",
-                        free_now / (1 << 30),
-                        self._disk_min_free_ram_bytes / (1 << 30),
-                    )
-                    return None, 0
-
             n_full = len(token_ids) // self.block_size
             if max_prefix_tokens is not None and max_prefix_tokens > 0:
                 n_full = min(n_full, int(max_prefix_tokens) // self.block_size)
@@ -3688,9 +3693,15 @@ class APCManager:
             if matched_tokens <= min_prefix_tokens:
                 return None, 0
 
-        if not self._make_room(2 * disk.prefix_cache_bytes(block_hashes)):
+        free_now = _free_ram_bytes() if self._disk_min_free_ram_bytes else None
+        low_ram = free_now is not None and free_now < self._disk_min_free_ram_bytes
+        if low_ram or not self._make_room(2 * disk.prefix_cache_bytes(block_hashes)):
             with self.lock:
                 self.stats.memory_skips += 1
+            if defer_on_pressure:
+                raise APCAdmissionError(
+                    "APC prefix restore deferred by memory admission"
+                )
             return None, 0
         loaded = disk.load_layer_major_prefix(block_hashes)
         if loaded is None:
@@ -4666,6 +4677,7 @@ def apc_lookup_plan(
     safe_lookup_min: int,
     suffix_is_text_only,
     prefix_has_media,
+    defer_on_pressure: bool = False,
 ) -> Optional[dict]:
     """Pick the best APC prefix (disk > exact > block); shared by both generate paths, releases losers, callers apply."""
     n = len(ids_list)
@@ -4674,7 +4686,10 @@ def apc_lookup_plan(
 
     if apc_mode == "exact":
         exact_cache, exact_prefix_len = manager.lookup_exact_cache(
-            ids_list, extra_hash=extra_hash, min_prefix_tokens=safe_lookup_min
+            ids_list,
+            extra_hash=extra_hash,
+            min_prefix_tokens=safe_lookup_min,
+            defer_on_pressure=defer_on_pressure,
         )
         if exact_cache is not None and 0 < exact_prefix_len < n:
             if not suffix_is_text_only(exact_prefix_len):
@@ -4700,6 +4715,7 @@ def apc_lookup_plan(
             ids_list,
             extra_hash=extra_hash,
             min_prefix_tokens=max(prefix_len, safe_lookup_min),
+            defer_on_pressure=defer_on_pressure and not matched,
         )
     warm_cache = None
     disk_prefix_len = 0
@@ -4709,6 +4725,7 @@ def apc_lookup_plan(
             extra_hash=extra_hash,
             min_prefix_tokens=max(prefix_len, exact_prefix_len, safe_lookup_min),
             allow_memory_overlap=max(prefix_len, exact_prefix_len) > 0,
+            defer_on_pressure=defer_on_pressure and not (matched or exact_cache),
         )
     if disk_prefix_len > max(prefix_len, exact_prefix_len) and disk_prefix_len < n:
         if matched:
