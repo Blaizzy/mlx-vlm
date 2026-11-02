@@ -44,10 +44,6 @@ class Model(Qwen3VLModel):
         )
 
         language_model = self.language_model
-        if pixel_values is not None:
-            language_model._rope_deltas = None
-            language_model._position_ids = None
-
         rope_mask = attention_mask
         model_mask = attention_mask
         if attention_mask is not None and attention_mask.ndim == 2:
@@ -64,21 +60,14 @@ class Model(Qwen3VLModel):
             rope_mask = None
 
         position_ids = None
+        # Each embedding forward is independent, so never reuse cached positions.
         if rope_mask is None or rope_mask.ndim == 2:
-            if (
-                language_model._position_ids is not None
-                and language_model._position_ids.shape[-1] >= input_ids.shape[-1]
-            ):
-                position_ids = language_model._position_ids[..., : input_ids.shape[-1]]
-            else:
-                position_ids, rope_deltas = language_model.get_rope_index(
-                    input_ids,
-                    image_grid_thw=image_grid_thw,
-                    video_grid_thw=video_grid_thw,
-                    attention_mask=rope_mask,
-                )
-                language_model._rope_deltas = rope_deltas
-                language_model._position_ids = position_ids
+            position_ids, _ = language_model.get_rope_index(
+                input_ids,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                attention_mask=rope_mask,
+            )
 
         return language_model.model(
             input_ids,
