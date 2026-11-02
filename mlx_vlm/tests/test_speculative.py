@@ -336,6 +336,90 @@ def test_mistral_dspark_admits_requests_while_batch_is_active(cancel, sampling):
         generator.close()
 
 
+@parametrize("family", ["dflash2", "dspark-lfm2", "mistral"])
+@parametrize("pause_after", [1, 8])
+@parametrize("sampling", [False, True])
+def test_speculative_row_resume_preserves_state_and_other_requests(
+    family, pause_after, sampling
+):
+    from mlx_vlm.sample_utils import make_sampler
+
+    mx.random.seed(23)
+    if family == "mistral":
+        target, draft = mistral_dspark_case()
+    else:
+        target, draft = dflash_target(family).language_model, dflash_drafter(family)
+    generator = BatchGenerator(
+        target,
+        NS(stopping_criteria=StoppingCriteria([])),
+        completion_batch_size=2,
+        prefill_batch_size=2,
+        prefill_step_size=2,
+        draft_model=draft,
+        draft_kind="dflash",
+        draft_block_size=4,
+        sampler=make_sampler(temp=0.7) if sampling else None,
+        greedy_sampling=not sampling,
+        compute_logprobs=False,
+    )
+    prompts = [[1, 3, 5, 7], [2, 4]]
+    outputs = [[], []]
+    generator.insert(
+        prompts,
+        max_tokens=32,
+        resumable=True,
+        prompt_kwargs=[
+            {"inputs_embeds": target.model.embed_tokens(mx.array([p]))} for p in prompts
+        ],
+    )
+
+    def step():
+        _, responses = generator.next()
+        for response in responses:
+            if response.token is not None:
+                outputs[response.uid].append(response.token)
+
+    try:
+        while len(outputs[0]) < pause_after:
+            step()
+        checkpoint = generator.suspend(0)
+        assert generator._generation_batch.uids == [1]
+        saved = deepcopy(checkpoint._batch_state.state)
+        stopped_count, other_count = map(len, outputs)
+        for _ in range(3):
+            step()
+        assert len(outputs[0]) == stopped_count
+        assert len(outputs[1]) > other_count
+        for (_, before), (_, after) in zip(
+            tree_flatten(saved), tree_flatten(checkpoint._batch_state.state)
+        ):
+            if isinstance(before, mx.array):
+                assert mx.array_equal(before, after).item()
+        draft_cache = checkpoint._batch_state.draft_caches[0]
+        generator.resume(checkpoint)
+        assert generator._generation_batch.uids == [1, 0]
+        assert generator._generation_batch._batch_state.draft_caches[-1] is draft_cache
+        for _ in range(100):
+            if not generator.has_work:
+                break
+            step()
+        assert not generator.has_work
+        assert [len(row) for row in outputs] == [32, 32]
+        if not sampling:
+            for prompt, actual in zip(prompts, outputs):
+                cache = target.make_cache()
+                inputs, expected = mx.array([prompt]), []
+                for _ in range(32):
+                    token = mx.argmax(
+                        target(inputs, cache=cache).logits[:, -1], axis=-1
+                    )
+                    expected.append(token.item())
+                    inputs = token[:, None]
+                assert actual == expected
+    finally:
+        generator.close()
+
+
 @parametrize("dtype", [mx.float16, mx.bfloat16])
 @parametrize(
     "batch,length",

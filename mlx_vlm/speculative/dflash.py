@@ -1,8 +1,10 @@
+import copy
 from typing import Any, Callable, Generator, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from .. import apc
 from .cache_state import abort_speculative_round, commit_speculative_round
 from .common import (
     _apply_thinking_budget,
@@ -292,7 +294,9 @@ def unpad_hidden(hidden, cache):
     """Return real target context only; padding has no position in a draft cache."""
     batch = hidden.shape[0]
     lengths = [hidden.shape[1]] * batch
-    offsets = getattr(cache[0], "offset", None) if cache else None
+    offsets = next(
+        (c.offset for c in cache if getattr(c, "offset", None) is not None), None
+    )
     if isinstance(offsets, mx.array) and offsets.size == batch:
         lengths = [
             min(hidden.shape[1], max(0, n)) for n in offsets.reshape(-1).tolist()
@@ -321,6 +325,15 @@ class DFlashBatch:
         self.hidden = unpad_hidden(hidden, cache)
         self.bonus = bonus.reshape(-1).tolist()
         self.block_size = _dflash_block_total(draft, block_size)
+        choose_ceiling = getattr(draft, "choose_block_ceiling", None)
+        if callable(choose_ceiling):
+            self.block_size = choose_ceiling(int(hidden.shape[1]), self.block_size)
+        self.initial_block_size = getattr(draft, "dflash_initial_block_size", None)
+        choose_initial = getattr(draft, "choose_initial_block_size", None)
+        if callable(choose_initial):
+            self.initial_block_size = choose_initial(
+                int(hidden.shape[1]), self.block_size
+            )
         self.sampler = sampler
         self.dtype = dtype
         self.greedy = greedy
@@ -331,21 +344,51 @@ class DFlashBatch:
         )
         self.draft_caches = [draft.make_cache() for _ in self.bonus]
 
-    def extend(self, cache, hidden, bonus):
-        incoming_hidden = unpad_hidden(hidden, cache)
+    @property
+    def state(self):
+        # Include drafter buffers in the server's continuation memory budget.
+        return self.cache, self.hidden, self.draft_caches
+
+    def snapshot(self, index):
+        """Own a single row at a completed verification boundary."""
+        caches = apc.snapshot_prompt_cache_row(self.cache, index)
+        if caches is None:
+            raise ValueError("This model does not support continuation cache snapshots")
+        offsets = next(
+            (c.offset for c in self.cache if getattr(c, "offset", None) is not None), 0
+        )
+        length = (
+            int(offsets.reshape(-1)[index].item())
+            if isinstance(offsets, mx.array)
+            else int(offsets)
+        )
+        caches, _ = apc.make_warm_batch_exact_cache_multi([caches], [length])
+        if caches is None:
+            raise ValueError("This model does not support continuation cache merging")
+        row = copy.copy(self)
+        row.cache = caches
+        row.hidden = [mx.contiguous(self.hidden[index])]
+        row.bonus = [self.bonus[index]]
+        # These objects belong exclusively to this row; the caller removes it
+        # from the live batch immediately after taking the snapshot.
+        row.draft_caches = [self.draft_caches[index]]
+        row.sampler_rng = copy.copy(self.sampler_rng)
+        mx.eval(row.hidden, [c.state for c in row.draft_caches[0]])
+        return row
+
+    def extend(self, other):
         # Finish pending rollback copies before mutating batch layouts.
         mx.eval(
             [c.state for c in self.cache],
-            [c.state for c in cache],
+            [c.state for c in other.cache],
             self.hidden,
-            incoming_hidden,
+            other.hidden,
         )
-        for current, incoming in zip(self.cache, cache):
+        for current, incoming in zip(self.cache, other.cache):
             current.extend(incoming)
-        self.hidden.extend(incoming_hidden)
-        values = bonus.reshape(-1).tolist()
-        self.bonus.extend(values)
-        self.draft_caches.extend(self.draft.make_cache() for _ in values)
+        self.hidden.extend(other.hidden)
+        self.bonus.extend(other.bonus)
+        self.draft_caches.extend(other.draft_caches)
 
     def filter(self, keep):
         if len(keep) == len(self.bonus):
@@ -361,25 +404,58 @@ class DFlashBatch:
         self.bonus = [self.bonus[i] for i in keep]
         self.draft_caches = [self.draft_caches[i] for i in keep]
 
-    def step(self, budgets, positions):
+    def step(self, budgets, positions, thinking_budget_criteria=None):
         if not budgets or min(budgets) <= 0:
             raise ValueError("Only live requests with remaining tokens can decode")
-        block_size = min(self.block_size, max(budgets) + 1)
+        block_size = _dflash_next_block_size(
+            self.draft, self.block_size, max(budgets) + 1, self.initial_block_size
+        )
         sampler = self.sampler
         row_ids = [0] * len(budgets)
         if not self.greedy and self.positioned_sampling:
             sampler = _PositionedDraftSampler(
                 sampler, row_ids=row_ids, positions=positions
             )
-        draft_tokens = self.sampler_rng.draft_tokens(
-            self.draft.draft_batch,
-            self.bonus,
-            self.hidden,
-            self.draft_caches,
-            block_size,
-            sampler,
-            self.dtype,
-        )
+
+        def draft_rows():
+            draft_batch = getattr(self.draft, "draft_batch", None)
+            if callable(draft_batch):
+                return draft_batch(
+                    self.bonus,
+                    self.hidden,
+                    self.draft_caches,
+                    block_size,
+                    sampler,
+                    self.dtype,
+                )
+            draft_block = (
+                getattr(self.draft, "draft_block_greedy", self.draft.draft_block)
+                if self.greedy
+                else self.draft.draft_block
+            )
+            return mx.concatenate(
+                [
+                    draft_block(
+                        bonus,
+                        hidden,
+                        cache,
+                        block_size,
+                        (
+                            _PositionedDraftSampler(
+                                self.sampler, row_ids=[0], positions=[position]
+                            )
+                            if not self.greedy and self.positioned_sampling
+                            else self.sampler
+                        ),
+                        self.dtype,
+                    )
+                    for bonus, hidden, cache, position in zip(
+                        self.bonus, self.hidden, self.draft_caches, positions
+                    )
+                ]
+            )
+
+        draft_tokens = self.sampler_rng.draft_tokens(draft_rows)
         inputs = mx.concatenate(
             [mx.array(self.bonus, self.dtype)[:, None], draft_tokens], axis=1
         )
@@ -420,6 +496,18 @@ class DFlashBatch:
                 self.sampler_rng.target_sampled(sync_draft=not self.positioned_sampling)
             # A clipped final round must never commit past the emitted prefix.
             accepted = [min(n, len(row) - 1) for n, row in zip(accepted, tokens)]
+            uniform = _requires_uniform_batch_acceptance(self.draft, self.model)
+            if uniform:
+                count = min(accepted)
+                tokens = [row[: count + 1] for row in tokens]
+                accepted = [count] * len(tokens)
+            accepted, tokens = _apply_thinking_budget(
+                accepted,
+                tokens,
+                thinking_budget_criteria,
+                list(range(len(tokens))),
+                uniform=uniform,
+            )
             commit_speculative_round(
                 self.model, self.cache, transaction, accepted, block_size
             )
