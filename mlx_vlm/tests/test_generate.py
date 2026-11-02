@@ -196,10 +196,22 @@ def test_batch_generator_apc_media_token_ids_handles_text_only_model(mock_proces
 class TestGenerationBatch:
     """Tests for GenerationBatch class."""
 
-    @pytest.mark.parametrize("seeded", [False, True])
+    @pytest.mark.parametrize(
+        "sampling",
+        [
+            None,
+            {},
+            {"top_n_sigma": 1.5},
+            {"p_less": True},
+            {"typical_p": 0.8},
+            {"top_n_sigma": 1.5, "p_less": True, "typical_p": 0.8},
+        ],
+    )
     def test_extract_preserves_pending_token_and_row_state_across_peer_work(
-        self, seeded
+        self, sampling
     ):
+        from mlx_vlm.server.generation import GenerationArguments, ResponseGenerator
+
         class Model:
             def __call__(self, inputs, cache, **kwargs):
                 values = inputs[:, None, :, None].astype(mx.float32)
@@ -211,10 +223,12 @@ class TestGenerationBatch:
 
         def make_batch():
             sampler = (
-                ar_module._PositionedTargetSampler(
-                    temperature=0.7, top_p=0.9, top_k=8, seed=91
+                ResponseGenerator._make_session_sampler(
+                    GenerationArguments(
+                        temperature=0.7, top_p=0.9, top_k=8, seed=91, **sampling
+                    )
                 )
-                if seeded
+                if sampling is not None
                 else lambda x: mx.argmax(x, axis=-1)
             )
             rows = []

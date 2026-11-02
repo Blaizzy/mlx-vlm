@@ -47,7 +47,7 @@ import mlx_vlm.server.generation as generation
 import mlx_vlm.server.openai as openai
 import mlx_vlm.server.reranking as reranking
 import mlx_vlm.server.sessions as sessions
-from mlx_vlm import apc
+from mlx_vlm import apc, sample_utils
 from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.generate import GenerationResult
 from mlx_vlm.generate.image import ImageGenerationResult
@@ -6256,6 +6256,64 @@ class TestResponseGenerator:
                 assert len(tokens) == 1 and tokens[0].finish_reason == "length"
         assert [b.kwargs["sampler"] for b in batches] == ["sampler-0.0", "sampler-0.6"]
         assert batches[0].closed
+
+    @pytest.mark.parametrize("positioned", [False, True])
+    @pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {},
+            {"top_k": 2},
+            {"top_n_sigma": 1.5},
+            {"top_n_sigma": 1.5, "top_k": 2},
+            {"p_less": True},
+            {"typical_p": 0.95, "top_p": 0.6},
+            {"typical_p": 0.95, "top_k": 2},
+            {"top_n_sigma": 1.5, "p_less": True, "top_p": 1.0},
+            {"p_less": True, "typical_p": 0.3},
+            {"top_n_sigma": 1.5, "p_less": True, "typical_p": 0.3},
+        ],
+    )
+    def test_session_sampler_preserves_standard_filtering(
+        self, monkeypatch, options, dtype, positioned
+    ):
+        from mlx_vlm.generate.ar import _sample_with_positions
+
+        args = Args(**({"temperature": 0.5, "top_p": 0.7, "seed": 91} | options))
+        gen = _generator()
+        reference = gen._make_sampler(args)
+        sampler = gen._make_session_sampler(args)
+        logprobs = mx.log(
+            mx.array([[0.5, 0.3, 0.2], [0.2, 0.5, 0.3], [0.3, 0.2, 0.5]] * 128)
+        ).astype(dtype)
+        if positioned:
+            row_ids = [0] * len(logprobs)
+            positions = list(range(len(logprobs)))
+            keys = generation._position_keys(args.seed, row_ids, positions)
+
+            # Supply the same draws to main's standard sampler without
+            # duplicating its filtering logic in this compatibility test.
+            def categorical(logits, temperature):
+                return mx.vmap(
+                    lambda row, key: mx.random.categorical(
+                        row * (1 / temperature), key=key
+                    )
+                )(logits, keys)
+
+            monkeypatch.setattr(sample_utils, "categorical_sampling", categorical)
+            expected = _sample_with_positions(
+                reference, logprobs, row_ids=row_ids, positions=positions
+            )
+            actual = _sample_with_positions(
+                sampler, logprobs, row_ids=row_ids, positions=positions
+            )
+        else:
+            mx.random.seed(21)
+            expected = reference(logprobs)
+            mx.eval(expected)
+            mx.random.seed(21)
+            actual = sampler(logprobs)
+        assert actual.tolist() == expected.tolist()
 
     @pytest.mark.parametrize("temperature", [0.0, 1e-300, 1e-5, 0.009, 0.01, 0.1])
     @pytest.mark.parametrize(

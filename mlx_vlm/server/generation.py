@@ -40,6 +40,7 @@ from ..sample_utils import (
     apply_p_less,
     apply_top_k,
     apply_top_n_sigma,
+    apply_top_p,
     apply_typical_p,
     clamp_temperature,
     make_logits_processors,
@@ -179,19 +180,24 @@ class _PositionedTargetSampler:
         self.top_k = int(top_k)
         self.seed = DEFAULT_SEED if seed is None else int(seed)
         self.top_n_sigma, self.p_less, self.typical_p = top_n_sigma, p_less, typical_p
+        # Match _make_sampler: special filters use make_sampler's unscaled
+        # top-p before top-k; ordinary sampling uses temperature-scaled top-p.
+        self._top_p_after_temperature = not (top_n_sigma > 0 or p_less or typical_p < 1)
 
-    def _apply_top_k(self, logprobs: mx.array) -> mx.array:
+    def _apply_filters(self, logprobs: mx.array) -> mx.array:
         if self.top_n_sigma > 0:
             logprobs = apply_top_n_sigma(logprobs, self.top_n_sigma)
-        if self.p_less:
+        elif self.p_less:
             logprobs = apply_p_less(logprobs, self.temperature)
-        if self.typical_p < 1:
+        elif self.typical_p < 1:
             logprobs = apply_typical_p(logprobs, self.typical_p)
+        if not self._top_p_after_temperature and 0 < self.top_p < 1:
+            logprobs = apply_top_p(logprobs, self.top_p)
         return apply_top_k(logprobs, self.top_k) if self.top_k > 0 else logprobs
 
     def __call__(self, logprobs: mx.array) -> mx.array:
-        logprobs = self._apply_top_k(logprobs)
-        if self.top_p > 0 and self.top_p < 1.0:
+        logprobs = self._apply_filters(logprobs)
+        if self._top_p_after_temperature and 0 < self.top_p < 1:
             return top_p_sampling(logprobs, self.top_p, self.temperature)
         return mx.random.categorical(logprobs * (1 / self.temperature))
 
@@ -204,9 +210,9 @@ class _PositionedTargetSampler:
     ) -> mx.array:
         if logprobs.shape[0] != len(row_ids) or len(row_ids) != len(positions):
             raise ValueError("row_ids and positions must match logprobs batch size.")
-        logprobs = self._apply_top_k(logprobs)
+        logprobs = self._apply_filters(logprobs)
         keys = _position_keys(self.seed, row_ids, positions)
-        if self.top_p > 0 and self.top_p < 1.0:
+        if self._top_p_after_temperature and 0 < self.top_p < 1:
             return mx.vmap(self._sample_top_p_one, in_axes=(0, 0))(logprobs, keys)
         return mx.vmap(self._sample_one, in_axes=(0, 0))(logprobs, keys)
 
