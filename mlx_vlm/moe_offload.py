@@ -26,8 +26,9 @@ from typing import Optional, Tuple
 
 # stacked: switch_mlp.gate_proj.weight [E,out,in]; per-expert: experts.{j}.gate_proj.weight;
 # stacked-fused: switch_mlp.gate_up_proj.weight [E,2*out,in], gate = first half of axis 1.
-_PROJ = r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight|scales|biases)$"
-_FUSED_PROJ = r"gate_up_proj\.(?P<kind>weight|scales|biases)$"
+_KINDS = r"weight|scales|biases|weight_scale_2|weight_global_scale"
+_PROJ = rf"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>{_KINDS})$"
+_FUSED_PROJ = rf"gate_up_proj\.(?P<kind>{_KINDS})$"
 PEREXPERT_RE = re.compile(
     r"^(?:.*\.)?layers\.(?P<layer>\d+)\..*?experts\.(?P<j>\d+)\." + _PROJ
 )
@@ -189,24 +190,45 @@ def _expand_expert_layer(entries, get_value) -> Tuple[dict, int]:
     expansion logic serves both repack()'s fast path (load on demand from the
     original checkpoint) and its sanitize() fallback (index into an
     already-sanitized in-memory dict)."""
+    import mlx.core as mx
+
     layer = {}
     n_experts = 0
+    stacked_count = next(
+        (
+            get_value(src).shape[0]
+            for _, src, mode in entries
+            if mode and src.endswith(".weight")
+        ),
+        0,
+    )
     for key, src, mode in entries:
         arr = get_value(src)
         if mode == "STACK":
-            E = arr.shape[0]
+            E = stacked_count
             n_experts = max(n_experts, E)
             mm = STACKED_RE.match(src)
             for j in range(E):
-                layer[f"e{j}.{mm['proj']}.{mm['kind']}"] = arr[j]
+                layer[f"e{j}.{mm['proj']}.{mm['kind']}"] = (
+                    arr if arr.ndim == 0 else arr[j]
+                )
         elif mode == "STACK_FUSED":
             # gate = first half of axis 1 (the doubled output dim), up = second.
-            E = arr.shape[0]
-            half = arr.shape[1] // 2
+            E = stacked_count
             n_experts = max(n_experts, E)
             mm = STACKED_FUSED_RE.match(src)
             kind = mm["kind"]
-            gate_half, up_half = arr[:, :half, ...], arr[:, half:, ...]
+            if kind in ("weight_scale_2", "weight_global_scale") and (
+                arr.ndim < 2 or arr.shape[1] == 1
+            ):
+                # Scalar/per-expert factors apply to both projections. Rowwise
+                # factors must be split with the corresponding weight rows below.
+                gate_half = up_half = (
+                    mx.broadcast_to(arr, (E,)) if arr.ndim == 0 else arr
+                )
+            else:
+                half = arr.shape[1] // 2
+                gate_half, up_half = arr[:, :half, ...], arr[:, half:, ...]
             for j in range(E):
                 layer[f"e{j}.gate_proj.{kind}"] = gate_half[j]
                 layer[f"e{j}.up_proj.{kind}"] = up_half[j]
@@ -241,6 +263,12 @@ def repack(build: str, out: str, resident_shard_gb: float = 5.0) -> None:
         for f in files:
             fname = os.path.basename(f)
             wmap.update({k: fname for k in mx.load(f)})
+    config = json.load(open(os.path.join(build, "config.json")))
+    source_quant = config.get("quantization_config") or (
+        config.get("text_config") or {}
+    ).get("quantization_config")
+    external_quant = bool(source_quant and source_quant.get("quant_method"))
+    converted_quant = None
     p = plan(list(wmap))
 
     def clear():
@@ -287,7 +315,7 @@ def repack(build: str, out: str, resident_shard_gb: float = 5.0) -> None:
     n_experts = None
     written_layers = []
 
-    if p["layers"]:
+    if p["layers"] and not external_quant:
         # ---- FAST PATH: raw checkpoint names already match plan()'s convention
         # directly (true for DeepSeek/Kimi-K2, GLM's glm4_moe, Qwen3-MoE, and
         # ERNIE4.5-MoE checked against their real upstream checkpoints). RESIDENT:
@@ -334,11 +362,9 @@ def repack(build: str, out: str, resident_shard_gb: float = 5.0) -> None:
         # dict is processed correctly), then classify+write exactly like the
         # fast path above, just fed from sanitized names/values.
         print(
-            "repack: raw checkpoint names don't match the offload convention "
-            "directly; falling back to the model's own sanitize()",
+            "repack: normalizing source quantization and model tensor names",
             flush=True,
         )
-        config = json.load(open(os.path.join(build, "config.json")))
         sanitize = _get_language_sanitizer(config)
         if sanitize is None:
             raise ValueError(
@@ -371,7 +397,13 @@ def repack(build: str, out: str, resident_shard_gb: float = 5.0) -> None:
             names = groups[lid]
             raw = load_names(names)
             merged = {**probe_raw, **raw} if (lid != 0 and probe_raw) else raw
-            sanitized = sanitize(dict(merged))
+            from .quantization.checkpoint import transform_quantized_weights
+
+            transformed, quant = transform_quantized_weights(dict(merged), source_quant)
+            if quant is not None:
+                converted_quant = quant
+            sanitized = sanitize(transformed)
+            del transformed
             del raw, merged
             gp = plan(list(sanitized))
             for n in gp["resident"]:
@@ -422,6 +454,10 @@ def repack(build: str, out: str, resident_shard_gb: float = 5.0) -> None:
                 dirs_exist_ok=True,
                 ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
             )
+    if converted_quant is not None:
+        config["quantization"] = converted_quant
+        config["quantization_config"] = converted_quant
+        json.dump(config, open(os.path.join(out, "config.json"), "w"), indent=2)
     json.dump(
         {
             "metadata": {"total_size": res_bytes},
@@ -440,7 +476,7 @@ def repack(build: str, out: str, resident_shard_gb: float = 5.0) -> None:
 _PROJ_KEYS = tuple(
     f"{p}.{k}"
     for p in ("gate_proj", "up_proj", "down_proj")
-    for k in ("weight", "scales", "biases")
+    for k in ("weight", "scales", "biases", "weight_scale_2", "weight_global_scale")
 )
 
 
@@ -573,12 +609,18 @@ class ExpertStore:
         self.num_experts = idx["num_experts"]
         self._paths = {}
         self._maps = {}  # {layer_id: {name: lazy mx.array}}
+        self._global_scales = {}
         for path in glob.glob(
             os.path.join(offload_dir, "experts", "layer_*.safetensors")
         ):
             lid = int(os.path.basename(path).split("_")[1].split(".")[0])
             self._paths[lid] = path
             self._maps[lid] = mx.load(path)  # mmap, lazy
+            self._global_scales[lid] = {
+                name: value
+                for name, value in self._maps[lid].items()
+                if name.endswith((".weight_scale_2", ".weight_global_scale"))
+            }
         self._budget = (
             expert_cache_bytes
             if expert_cache_bytes is not None
@@ -592,20 +634,35 @@ class ExpertStore:
         self._hits = 0
         self._misses = 0
         self._evictions = 0
+        self._metadata_reloads = 0
 
     def experts_present(self, layer_id: int) -> bool:
         return layer_id in self._maps
 
-    def _ensure_loaded(self, layer_id: int, j: int, m: dict) -> None:
+    def global_scale(self, layer_id: int, j: int, projection: str):
+        scales = self._global_scales[layer_id]
+        prefix = f"e{j}.{projection}"
+        multiply = scales.get(f"{prefix}.weight_scale_2")
+        divide = scales.get(f"{prefix}.weight_global_scale")
+        if multiply is not None and divide is not None:
+            raise ValueError(
+                f"Conflicting NVFP4 global scales: layer {layer_id}, {prefix}"
+            )
+        return (divide, True) if divide is not None else (multiply, False)
+
+    def _ensure_loaded(self, layer_id: int, needed, m: dict) -> None:
         import mlx.core as mx
 
-        if f"e{j}.gate_proj.weight" in m:
+        missing = [j for j in needed if f"e{j}.gate_proj.weight" not in m]
+        if not missing:
             return
         fresh = mx.load(self._paths[layer_id])
-        for k in _PROJ_KEYS:
-            name = f"e{j}.{k}"
-            if name in fresh:
-                m[name] = fresh[name]
+        self._metadata_reloads += 1
+        for j in missing:
+            for k in _PROJ_KEYS:
+                name = f"e{j}.{k}"
+                if name in fresh:
+                    m[name] = fresh[name]
 
     def _evict_until_fits(self, incoming_bytes: int) -> None:
         import mlx.core as mx
@@ -621,7 +678,9 @@ class ExpertStore:
             self._resident_bytes -= nbytes
             self._evictions += 1
             evicted = True
-        if evicted:
+        # Keep reusable allocator buffers. Clearing on every expert miss forces
+        # repeated Metal allocations; cap spare buffers instead of flushing them.
+        if evicted and mx.get_cache_memory() > min(self._budget // 10, 1 << 30):
             try:
                 mx.clear_cache()
             except Exception:
@@ -632,24 +691,38 @@ class ExpertStore:
         ``scales``/``biases`` are ``None`` for an unquantized (plain
         bf16/float32) expert -- ``e{j}.{proj}.weight`` is the only key repack
         wrote for it."""
+        return self.get_many(layer_id, [j])[j]
+
+    def get_many(self, layer_id: int, needed) -> dict:
+        """Fetch a routed set with one metadata load and one eviction pass.
+
+        Hold the returned tensors before eviction: even a cache smaller than
+        the selected set must keep this forward call's inputs alive.
+        """
+        needed = list(dict.fromkeys(int(j) for j in needed))
         m = self._maps[layer_id]
-        self._ensure_loaded(layer_id, j, m)
-        key = (layer_id, j)
-        if key in self._lru:
-            self._lru.move_to_end(key)
-            self._hits += 1
-        else:
-            self._misses += 1
-            nbytes = sum(m[f"e{j}.{k}"].nbytes for k in _PROJ_KEYS if f"e{j}.{k}" in m)
-            self._evict_until_fits(nbytes)
-            self._lru[key] = nbytes
-            self._resident_bytes += nbytes
-        trip = lambda p: (
-            m[f"e{j}.{p}.weight"],
-            m.get(f"e{j}.{p}.scales"),
-            m.get(f"e{j}.{p}.biases"),
-        )
-        return (trip("gate_proj"), trip("up_proj"), trip("down_proj"))
+        self._ensure_loaded(layer_id, needed, m)
+        out = {}
+        for j in needed:
+            key = (layer_id, j)
+            if key in self._lru:
+                self._lru.move_to_end(key)
+                self._hits += 1
+            else:
+                self._misses += 1
+                nbytes = sum(
+                    m[f"e{j}.{k}"].nbytes for k in _PROJ_KEYS if f"e{j}.{k}" in m
+                )
+                self._lru[key] = nbytes
+                self._resident_bytes += nbytes
+            trip = lambda p: (
+                m[f"e{j}.{p}.weight"],
+                m.get(f"e{j}.{p}.scales"),
+                m.get(f"e{j}.{p}.biases"),
+            )
+            out[j] = (trip("gate_proj"), trip("up_proj"), trip("down_proj"))
+        self._evict_until_fits(0)
+        return out
 
     def get_all(self, layer_id: int, needed) -> dict:
         """Bulk variant of ``get()`` for calls that touch most of a layer's
@@ -696,6 +769,7 @@ class ExpertStore:
             "hits": self._hits,
             "misses": self._misses,
             "evictions": self._evictions,
+            "metadata_reloads": self._metadata_reloads,
             "hit_rate": (self._hits / total) if total else None,
         }
 

@@ -627,6 +627,17 @@ def parse_arguments():
         ),
     )
     parser.add_argument(
+        "--reasoning-effort",
+        type=str.lower,
+        default=None,
+        help=(
+            "Reasoning effort forwarded to the chat template (for example "
+            "low, medium, high). Templates that use reasoning_strength "
+            "receive the same value, matching the server's reasoning_effort "
+            "handling. When omitted, the template default is left untouched."
+        ),
+    )
+    parser.add_argument(
         "--thinking-budget",
         type=int,
         default=None,
@@ -1062,7 +1073,7 @@ def stream_generate(
             exact_checkpoint_lengths = [
                 n - reused_prefix_len
                 for n in apc_coordinator.checkpoint_lengths(
-                    full_input_ids_list, multimodal_token_ids
+                    full_input_ids_list, multimodal_token_ids, extra_hash=apc_extra_hash
                 )
                 if n > reused_prefix_len
             ]
@@ -1100,7 +1111,7 @@ def stream_generate(
             generated_tokens.append(token)
 
             # Check thinking budget and force token if needed
-            if thinking_criteria is not None:
+            if thinking_criteria is not None and kwargs.get("draft_model") is None:
                 thinking_criteria(token)
 
             # Stop generation if the token is in the eos_token_ids
@@ -1497,6 +1508,10 @@ def main():
         chat_template_kwargs["use_tts_template"] = True
     if args.thinking_mode is not None:
         chat_template_kwargs["thinking_mode"] = args.thinking_mode
+    if args.reasoning_effort is not None:
+        chat_template_kwargs["reasoning_effort"] = args.reasoning_effort
+        # Muse Glimmer's chat template reads the reasoning_strength alias.
+        chat_template_kwargs["reasoning_strength"] = args.reasoning_effort
     if args.video:
         chat_template_kwargs["video"] = args.video
         chat_template_kwargs["fps"] = args.fps

@@ -31,6 +31,62 @@ from mlx_vlm.moe_offload import ExpertStore, patch_model, plan, repack
 from mlx_vlm.utils import load_model, save_weights
 
 
+@pytest.fixture(params=[None, mx.cpu], ids=["default", "cpu"])
+def offload_device(request):
+    with mx.stream(request.param or mx.default_device()):
+        yield
+
+
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("scale_name", ["weight_scale_2", "weight_global_scale"])
+@pytest.mark.parametrize("scale_layout", ["scalar", "expert", "expert_column", "row"])
+@pytest.mark.parametrize("decode", [False, True])
+def test_native_nvfp4_global_scales_survive_repack(
+    tmp_path, fused, scale_name, scale_layout, decode, offload_device
+):
+    from mlx.utils import tree_flatten
+
+    from mlx_vlm.quantization.nvfp4 import replace_scaled_quantized_linears
+
+    model = nn.Module()
+    model.model = nn.Module()
+    layer = nn.Module()
+    layer.switch_mlp = (LagunaPackedSwitchGLU if fused else SwitchGLU)(64, 64, 4)
+    model.model.layers = [layer]
+    nn.quantize(model, mode="nvfp4", group_size=16, bits=4)
+    scales = {}
+    for path, value in tree_flatten(model.parameters()):
+        if path.endswith(".weight"):
+            scale = mx.array([0.137, 0.348, 0.779, 0.29])
+            if scale_layout == "scalar":
+                scale = mx.array(0.137)
+            elif scale_layout == "expert_column":
+                scale = scale[:, None]
+            elif scale_layout == "row":
+                # Sanitizing separately scaled gate/up weights produces this
+                # layout. Vary every row so copying or swapping halves fails.
+                scale = scale[:, None] * mx.linspace(0.7, 1.3, value.shape[-2])
+            scales[path.removesuffix("weight") + scale_name] = scale
+    replace_scaled_quantized_linears(model, scales)
+    x = mx.random.normal((1, 3, 64)).astype(mx.bfloat16)
+    indices = mx.array([[[0, 1], [2, 3], [0, 3]]])
+    if decode:
+        x, indices = x[:, :1], indices[:, :1]
+    expected = layer.switch_mlp(x, indices)
+    mx.eval(expected)
+    build, out = tmp_path / "build", tmp_path / "out"
+    save_weights(str(build), model)
+    (build / "config.json").write_text(
+        json.dumps({"quantization": {"group_size": 16, "bits": 4, "mode": "nvfp4"}})
+    )
+    repack(str(build), str(out))
+    patch_model(model, str(out), expert_cache_gb=0.00001)
+    actual = layer.switch_mlp(x, indices)
+    _assert_offload_parity(expected, actual)
+    # The same experts must still produce the same result after eviction/reload.
+    _assert_offload_parity(expected, layer.switch_mlp(x, indices))
+
+
 def _deepseek_config():
     return deepseek_v3.ModelConfig(
         model_type="deepseek_v3",
@@ -195,13 +251,36 @@ def test_expert_store_get_is_thread_safe(tmp_path):
         thread.join()
     assert errors == []
     assert sum(map(len, results)) == n_threads * n_iters
+    comparisons = []
     for thread_results in results:
         for key, val in thread_results:
             for got, want in zip(val, reference[key]):
                 for g, w in zip(got, want):
                     assert (g is None) == (w is None)
                     if g is not None:
-                        assert mx.array_equal(g, w)
+                        comparisons.append(mx.array_equal(g, w))
+    # Check every returned tensor with one synchronization instead of thousands.
+    assert mx.all(mx.stack(comparisons)).item()
+
+
+def test_selected_experts_reload_once_and_survive_tiny_cache(tmp_path):
+    _, offload = _build_and_repack(tmp_path)
+    store = ExpertStore(str(offload), expert_cache_bytes=1)
+    first = store.get_many(1, [0, 2, 0])
+    mx.eval(first)
+    assert store.stats()["resident_bytes"] <= 1
+    # Both experts were evicted. Reloading them must parse the layer only once,
+    # and eviction must not invalidate tensors returned to the current graph.
+    with patch("mlx.core.load", wraps=mx.load) as load:
+        second = store.get_many(1, [0, 2])
+        assert load.call_count == 1
+    for j in first:
+        for got, want in zip(second[j], first[j]):
+            for g, w in zip(got, want):
+                if w is not None:
+                    assert mx.array_equal(g, w).item()
+    assert store.stats()["metadata_reloads"] == 1
+    assert store.stats()["resident_bytes"] <= 1
 
 
 def test_fused_switch_layer_offloads_correctly(tmp_path):
@@ -429,13 +508,14 @@ def _wrap_block(block):
 
 
 @pytest.mark.parametrize("family", sorted(_SWAPPABLE_BLOCKS))
-def test_every_swappable_block_matches_resident(tmp_path, family):
+@pytest.mark.parametrize("tokens", [1, 5])
+def test_every_swappable_block_matches_resident(tmp_path, family, tokens):
     model = _wrap_block(_SWAPPABLE_BLOCKS[family]())
     _, offload = _build_and_repack(
         tmp_path, model, model.config, quant_paths=("experts",)
     )
-    x = mx.random.normal((5, _H)).astype(mx.bfloat16)
-    indices = mx.random.randint(0, _E, (5, _K)).astype(mx.uint32)
+    x = mx.random.normal((tokens, _H)).astype(mx.bfloat16)
+    indices = mx.random.randint(0, _E, (tokens, _K)).astype(mx.uint32)
     mx.eval(x, indices)
     resident = model.model.layers[0].experts(x, indices)
     mx.eval(resident)
@@ -443,6 +523,64 @@ def test_every_swappable_block_matches_resident(tmp_path, family):
     store = patch_model(model, str(offload))
     assert store.swapped == 1
     _assert_offload_parity(resident, model.model.layers[0].experts(x, indices))
+
+
+@pytest.mark.parametrize("shape", [(1, 1), (2, 9)])
+def test_nontrivial_expert_scales_preserve_bfloat16(tmp_path, shape, offload_device):
+    mx.random.seed(53)
+    block = InklingSwitchGLU(64, 128, 16, bias=True)
+    for projection in (block.gate_proj, block.up_proj, block.down_proj):
+        projection.bias = mx.random.normal(projection.bias.shape) * 0.1
+    block.set_dtype(mx.bfloat16)
+    block.gate_scale = mx.linspace(0.17, 1.7, 16)
+    block.out_scale = mx.linspace(0.23, 1.2, 16)
+    model = _wrap_block(block)
+    _, offload = _build_and_repack(
+        tmp_path, model, model.config, quant_paths=("experts",)
+    )
+    x = mx.random.normal((*shape, 64)).astype(mx.bfloat16)
+    # Repeated routes, multiple batch axes, and more than eight unique experts.
+    base = mx.arange(shape[0] * shape[1]).reshape(*shape, 1)
+    indices = ((base + mx.array([0, 0, 5, 11])) % 16).astype(mx.uint32)
+    resident = block(x, indices)
+    mx.eval(resident)
+    patch_model(model, str(offload), expert_cache_gb=1e-9)
+    for _ in range(2):
+        _assert_offload_parity(resident, model.model.layers[0].experts(x, indices))
+
+
+@pytest.mark.parametrize("tokens", [1, 9])
+def test_dense_bfloat16_experts_still_run_on_cpu(tmp_path, tokens):
+    with mx.stream(mx.cpu):
+        mx.random.seed(53)
+        block = SwitchGLU(64, 128, 16)
+        block.set_dtype(mx.bfloat16)
+        model = _wrap_block(block)
+        x = mx.random.normal((tokens, 64)).astype(mx.bfloat16)
+        indices = (mx.arange(tokens * 2).reshape(tokens, 2) % 16).astype(mx.uint32)
+        # CPU gather_mm cannot evaluate BF16. Use the original dense matmuls
+        # as the reference, which supported CPU offloading before batching.
+        expected = []
+        for token, experts in enumerate(indices.tolist()):
+            routed = []
+            for expert in experts:
+                gate = x[token : token + 1] @ block.gate_proj.weight[expert].T
+                up = x[token : token + 1] @ block.up_proj.weight[expert].T
+                routed.append(
+                    block.activation(up, gate) @ block.down_proj.weight[expert].T
+                )
+            expected.append(mx.concatenate(routed))
+        expected = mx.stack(expected)
+        mx.eval(expected)
+        build, offload = tmp_path / "build", tmp_path / "offload"
+        save_weights(str(build), model)
+        (build / "config.json").write_text(json.dumps(model.config))
+        repack(str(build), str(offload))
+        patch_model(model, str(offload), expert_cache_gb=1e-9)
+        for _ in range(2):
+            actual = model.model.layers[0].experts(x, indices)
+            assert actual.dtype == mx.bfloat16
+            _assert_offload_parity(expected, actual)
 
 
 def test_patch_model_refuses_a_layer_that_declares_no_gating(tmp_path):
