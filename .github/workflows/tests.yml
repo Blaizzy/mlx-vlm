@@ -191,7 +191,9 @@ jobs:
           TEST_FILES: ${{ matrix.tests }}
         run: |
           read -r -a tests <<< "$TEST_FILES"
-          python -m pytest -q -n 3 --dist=worksteal --durations=30 \
+          python -m pytest -vv -n 3 --dist=worksteal --durations=30 \
+            --max-worker-restart=0 \
+            -o faulthandler_timeout=120 -o faulthandler_exit_on_timeout=true \
             --junitxml=../test-results/${{ matrix.group }}.xml "${tests[@]}"
 
       - name: Upload test timings
