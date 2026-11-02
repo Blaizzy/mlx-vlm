@@ -4,9 +4,8 @@ on:
   push:
     branches:
       - main
+  # Stacked PRs also target feature branches.
   pull_request:
-    branches:
-      - main
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

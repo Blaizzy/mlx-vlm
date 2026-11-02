@@ -21,6 +21,7 @@ import numpy as np
 import pytest
 
 from mlx_vlm import load
+from mlx_vlm.apc_coordinator import PrefillMemoryPlan
 from mlx_vlm.generate import AudioGenerationResult, ar
 from mlx_vlm.generate import audio as audio_module
 from mlx_vlm.generate import dispatch, generate_audio, save_audio
@@ -1702,6 +1703,7 @@ def _mixed_batch(model, rows, prompts, prefix, warm_cache=None):
     bg.model = model
     bg.apc_manager = object()
     bg.apc = SimpleNamespace(
+        manager=SimpleNamespace(memory_plan=PrefillMemoryPlan()),
         prepare_prefill=lambda *a, **k: None,
         observe_cache=lambda *a, **k: None,
         merge_rows=lambda *a, **k: (

@@ -2770,9 +2770,7 @@ def test_apc_admission_shrinks_batch_and_releases_excluded_leases():
 def test_apc_refused_restore_stays_queued_while_peer_decodes(
     mock_model, mock_processor
 ):
-    with patch(
-        "mlx_vlm.generate.ar.wired_limit", return_value=contextlib.nullcontext()
-    ):
+    with patch.object(ar_module, "wired_limit", return_value=contextlib.nullcontext()):
         gen = BatchGenerator(mock_model, mock_processor, completion_batch_size=2)
     gen.apc = SimpleNamespace(prepare_prefill=lambda *a, **kw: True)
     gen.apc_manager = MagicMock()
