@@ -1247,6 +1247,24 @@ class TestModelDiscovery:
         assert entry["reasoning_efforts"] == ["xhigh", "medium", "low"]
         assert entry["loaded"] is (source == "loaded")
 
+    @pytest.mark.parametrize("endpoint", ["/models", "/v1/models"])
+    @pytest.mark.parametrize("loaded", [False, True])
+    def test_endpoint_none_effort(self, model_listing, client, endpoint, loaded):
+        template = (
+            "{% set reasoning = reasoning if reasoning is defined else "
+            "(false if reasoning_effort is defined and "
+            "reasoning_effort | lower == 'none' else true) %}"
+        )
+        (model_listing.path / "chat_template.jinja").write_text(template)
+        if loaded:
+            model_listing.registry.set(
+                "text_generation",
+                dict(model_path="local/vision", processor=NS(chat_template=template)),
+            )
+        entry = client.get(endpoint).json()["data"][0]
+        assert entry["reasoning_efforts"] == ["none"]
+        assert entry["loaded"] is loaded
+
     def test_endpoint_unknown_reasoning_efforts(self, model_listing, client):
         assert client.get("/v1/models").json()["data"][0]["reasoning_efforts"] is None
         template_file = model_listing.path / "chat_template.jinja"
@@ -1289,7 +1307,19 @@ class TestModelDiscovery:
             ),
             ("{# reasoning_effort not in ['low', 'high'] #}", None),
             ("{% if reasoning_effort not in ['low'] %}higher{% endif %}", None),
-            ("{% if reasoning_effort == 'none' %}disabled{% endif %}", None),
+            ("{% if reasoning_effort == 'none' %}disabled{% endif %}", ["none"]),
+            ("{# reasoning_effort == 'none' #}", None),
+            (
+                "{% if reasoning_effort == 'none' %}"
+                "{{ raise_exception('unsupported') }}{% endif %}",
+                None,
+            ),
+            (
+                "{% if reasoning_effort == 'none' %}disabled{% endif %}"
+                "{% if reasoning_effort not in ['low', 'high'] %}"
+                "{{ raise_exception('unsupported') }}{% endif %}",
+                ["low", "high"],
+            ),
             (
                 "{% if reasoning_effort not in levels %}"
                 "{{ raise_exception('unsupported') }}{% endif %}",

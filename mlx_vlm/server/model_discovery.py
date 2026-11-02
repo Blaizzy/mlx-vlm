@@ -20,7 +20,7 @@ def read_json_object(path: Path) -> dict:
 
 @lru_cache(maxsize=128)
 def _declared_reasoning_efforts(template: str) -> list[str] | None:
-    """Read literal effort allowlists without rendering checkpoint templates."""
+    """Read explicit effort lists and off branches without rendering templates."""
     try:
         tree = Environment(extensions=["jinja2.ext.loopcontrols"]).parse(template)
     except TemplateSyntaxError:
@@ -32,12 +32,14 @@ def _declared_reasoning_efforts(template: str) -> list[str] | None:
         while isinstance(expression, nodes.Filter) and expression.name in {
             "default",
             "d",
+            "lower",
         }:
             expression = expression.node
         return isinstance(expression, nodes.Name) and expression.name in aliases
 
     allowlists = []
-    for statement in tree.find_all((nodes.Assign, nodes.If)):
+    has_none = False
+    for statement in tree.find_all((nodes.Assign, nodes.If, nodes.CondExpr)):
         # Qwen validates a defaulted alias; follow assignments before their use.
         if isinstance(statement, nodes.Assign):
             if isinstance(statement.target, nodes.Name) and is_effort(statement.node):
@@ -45,8 +47,24 @@ def _declared_reasoning_efforts(template: str) -> list[str] | None:
             continue
 
         test = statement.test
+        # North uses a conditional expression rather than an effort allowlist.
+        if not any(
+            isinstance(call.node, nodes.Name) and call.node.name == "raise_exception"
+            for call in statement.find_all(nodes.Call)
+        ):
+            for comparison in (test, *test.find_all(nodes.Compare)):
+                if (
+                    isinstance(comparison, nodes.Compare)
+                    and is_effort(comparison.expr)
+                    and len(comparison.ops) == 1
+                    and comparison.ops[0].op == "eq"
+                    and isinstance(comparison.ops[0].expr, nodes.Const)
+                    and comparison.ops[0].expr.value == "none"
+                ):
+                    has_none = True
         if not (
-            isinstance(test, nodes.Compare)
+            isinstance(statement, nodes.If)
+            and isinstance(test, nodes.Compare)
             and is_effort(test.expr)
             and len(test.ops) == 1
             and test.ops[0].op == "notin"
@@ -70,7 +88,7 @@ def _declared_reasoning_efforts(template: str) -> list[str] | None:
     # Conflicting conditional allowlists need request context to resolve.
     if allowlists and all(set(values) == set(allowlists[0]) for values in allowlists):
         return allowlists[0]
-    return None
+    return ["none"] if has_none and not allowlists else None
 
 
 def model_reasoning_efforts(directory: Path | None = None, processor=None):
