@@ -16,7 +16,9 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import textwrap
+import time
 import unittest
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict
@@ -2966,6 +2968,18 @@ def _distributed_model_worker(family, dtype_name):
 
     stage("initializing ring")
     group = mx.distributed.init(strict=True, backend="ring")
+    barrier_dir = Path(os.environ["MLX_TEST_BARRIER_DIR"])
+
+    def host_barrier(name):
+        # All test ranks share this directory. Waiting here must not enqueue
+        # MLX work: even a CPU collective can stall a peer's shared-GPU work.
+        (barrier_dir / f"{name}-{group.rank()}").touch()
+        while any(
+            not (barrier_dir / f"{name}-{rank}").exists()
+            for rank in range(group.size())
+        ):
+            time.sleep(0.001)
+
     stage("building models")
     options = TINY_MODELS[family]["distributed"]
     dtype = getattr(mx, dtype_name)
@@ -3006,13 +3020,11 @@ def _distributed_model_worker(family, dtype_name):
             expected = reference(ids, cache=expected_cache).logits
             mx.eval(expected)
             stage(f"batch={batch} step={step} barrier")
-            # Finish independent reference work on every rank before queuing
-            # distributed work on the shared GPU. Keep test-only collectives
-            # on the CPU so a faster rank cannot block another rank's GPU work.
-            mx.distributed.all_sum(mx.array(0), group=group, stream=mx.cpu).item()
+            host_barrier(f"reference-{batch}-{step}")
             stage(f"batch={batch} step={step} sharded")
             actual = sharded(ids, cache=actual_cache).logits
             mx.eval(actual)
+            host_barrier(f"actual-{batch}-{step}")
             stage(f"batch={batch} step={step} gather")
             gathered = mx.distributed.all_gather(actual, group=group, stream=mx.cpu)
             mx.eval(gathered)
@@ -3033,6 +3045,7 @@ def _distributed_model_worker(family, dtype_name):
                     ).item(),
                 )
             )
+    host_barrier("checks")
     passed = mx.distributed.all_sum(
         mx.array(int(all(r["passed"] and r["ranks_agree"] for r in records))),
         group=group,
@@ -3083,23 +3096,28 @@ def _run_distributed_model_test(family, dtype, world_size):
         family,
         dtype,
     ]
-    process = subprocess.Popen(
-        command,
-        cwd=repo,
-        env=dict(os.environ, PYTHONPATH=str(repo)),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        start_new_session=True,
-    )
-    try:
-        output, _ = process.communicate(timeout=30)
-    except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
-        output, _ = process.communicate()
-        pytest.fail(
-            f"Distributed test timed out: {family}/{dtype}/{world_size}\n{output}"
+    with tempfile.TemporaryDirectory(prefix="mlx-vlm-distributed-") as barrier_dir:
+        process = subprocess.Popen(
+            command,
+            cwd=repo,
+            env=dict(
+                os.environ,
+                PYTHONPATH=str(repo),
+                MLX_TEST_BARRIER_DIR=barrier_dir,
+            ),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
         )
+        try:
+            output, _ = process.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            output, _ = process.communicate()
+            pytest.fail(
+                f"Distributed test timed out: {family}/{dtype}/{world_size}\n{output}"
+            )
     assert process.returncode == 0, output
     records = [json.loads(line) for line in output.splitlines() if line.startswith("{")]
     assert len(records) == world_size, output
