@@ -861,6 +861,8 @@ class LanguageModel(nn.Module):
         self.model_type = args.model_type
         self.model = TextModel(args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        # Derived scalar buffers only; excluded from serialized model parameters.
+        self._verification_scales = {}
 
     def __call__(
         self,

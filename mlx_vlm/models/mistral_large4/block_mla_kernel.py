@@ -1,4 +1,4 @@
-"""Prototype: independent causal latent-attention queries in one dispatch."""
+"""Independent causal latent-attention queries in one dispatch."""
 
 from functools import lru_cache
 

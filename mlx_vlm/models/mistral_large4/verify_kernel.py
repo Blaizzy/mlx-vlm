@@ -13,7 +13,7 @@ def _wide_kernel():
         output_names=["out"],
         header=_HEADER,
         source=r"""
-        GemvWide<T, V, KL, float>::run(
+        GemvWide<T, V, KL, float, SG>::run(
             weight, x, weight, out,
             x_shape[2], weight_shape[0], x_shape[0]*x_shape[1],
             x_shape[2], x_shape[2], 1.0f, 0.0f, 0, 0,
@@ -23,8 +23,12 @@ def _wide_kernel():
     )
 
 
-def native_wide_linear(weight, x):
-    """Reuse dense weights across positions without changing K-lane reductions."""
+def native_wide_linear(weight, x, group=None):
+    """Reuse weights across positions while retaining decode's K reductions.
+
+    Large replicated projections split complete output rows across the expert
+    group, then gather them in order. Each scalar dot stays on one device.
+    """
     if (
         not mx.metal.is_available()
         or mx.default_device() != mx.gpu
@@ -36,27 +40,54 @@ def native_wide_linear(weight, x):
         or weight.shape[0] <= 1
     ):
         return None
-    architecture = mx.device_info().get("architecture", "")
-    # The native wide-GEMV dispatch starts with Apple GPU generation 15 (M3).
-    generation = architecture.split("_g")[-1][:2]
+    generation = mx.device_info().get("architecture", "").split("_g")[-1][:2]
     if not generation.isdigit() or int(generation) < 15:
         return None
-    passes = (x.shape[0] + 4) // 5
-    lanes = 32 if passes == 1 or weight.shape[0] <= 64 else 16
-    groups = lanes // 8
-    # Short speculative blocks expose more vectors than single-token decode.
-    # Reuse each weight load across eight vectors and split the work over two
-    # grid columns, retaining the original batch's K-lane reduction geometry.
-    wide_block = x.shape[0] >= 6 and x.shape[1] > 1
-    vectors, columns = (8, 2) if wide_block else (4, 1)
-    return _wide_kernel()(
+    b = x.shape[0]
+    n, k = weight.shape
+    total_rows = n
+    partition = (
+        group is not None
+        and group.size() > 1
+        and n >= 6144
+        and k >= 6144
+        and n % group.size() == 0
+    )
+    if partition:
+        n //= group.size()
+        weight = weight[group.rank() * n : (group.rank() + 1) * n]
+    lanes = 32 if b <= 5 or n <= 64 else 16
+    # Change tile occupancy, never the original batch's reduction geometry.
+    if x.shape[1] == 1:
+        v, c, sg = 4, 1, lanes // 8
+    elif n >= 49152:
+        v, c, sg = (8, 2, lanes // 8) if b >= 6 else (8, 1, lanes // 8)
+    elif b >= 6:
+        v, c, sg = 8, 4, 8
+    elif n <= 1024:
+        v, c, sg = 4, 4, 1
+    elif k >= 16384:
+        v, c, sg = 8, (4 if b >= 5 else 2), lanes // 8
+    elif n >= 12288:
+        v, c, sg = 8, 4, 8
+    else:
+        v, c, sg = 4, 4, 4
+    rows = sg * 32 // lanes
+    output = _wide_kernel()(
         inputs=[x, weight],
-        template=[("T", x.dtype), ("KL", lanes), ("V", vectors)],
-        grid=(32 * columns, ((weight.shape[0] + 3) // 4) * groups, 1),
-        threadgroup=(32, groups, 1),
-        output_shapes=[(*x.shape[:-1], weight.shape[0])],
+        template=[("T", x.dtype), ("KL", lanes), ("V", v), ("SG", sg)],
+        grid=(32 * c, ((n + rows - 1) // rows) * sg, 1),
+        threadgroup=(32, sg, 1),
+        output_shapes=[(*x.shape[:-1], n)],
         output_dtypes=[x.dtype],
     )[0]
+    if partition:
+        return (
+            mx.distributed.all_gather(output.reshape(1, -1, n), group=group)
+            .transpose(1, 0, 2)
+            .reshape(*x.shape[:-1], total_rows)
+        )
+    return output
 
 
 _HEADER = r"""
@@ -95,10 +126,10 @@ template <
     typename T,
     const int vecs_per_tg,
     const int k_lanes,
-    typename AccT = float>
+    typename AccT = float, const int SG = k_lanes / 8>
 struct GemvWide {
   static constexpr constant int unroll = 8;
-  static constexpr constant int num_simdgroups = k_lanes / 8;
+  static constexpr constant int num_simdgroups = SG;
 
   static METAL_FUNC void run(
       const device T* mat,
