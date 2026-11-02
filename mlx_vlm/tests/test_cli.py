@@ -381,7 +381,7 @@ def test_text_cli_media_and_arguments(capsys, mode):
         assert output.strip() == "done"
 
 
-@pytest.mark.parametrize("modality", ["image", "video"])
+@pytest.mark.parametrize("modality", ["image", "video", "3d"])
 def test_modality_routing_precedes_vlm_load(modality):
     args = NS(output_modality=modality)
     with (

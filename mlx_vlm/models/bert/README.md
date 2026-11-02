@@ -10,6 +10,10 @@ task heads, selected from the checkpoint's `architectures`:
 | `SequenceClassificationModel` | `BertForSequenceClassification` | Reranking | `mlx_vlm.reranker_loader.load_reranker` |
 | `TokenClassificationModel` | `BertForTokenClassification` | Per-token tagging (NER, PII detection) | `mlx_vlm.token_classification.load_token_classifier` |
 
+The BERT and XLM-R encoders use `hidden_act` from the checkpoint config. Supported values are
+`gelu` (the default), `relu`, `silu`, and `gelu_new` (the tanh approximation).
+An unsupported activation name raises `ValueError`.
+
 ## Token classification
 
 Any BERT `*ForTokenClassification` checkpoint with BIO labels in `id2label`

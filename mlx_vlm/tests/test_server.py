@@ -624,6 +624,38 @@ class TestContinuation:
         monkeypatch.setattr(continuation, "CHECKPOINTS", continuation.Checkpoints())
         monkeypatch.delenv("MLX_VLM_SERVER_API_KEY", raising=False)
 
+    @pytest.mark.parametrize("api", ["chat", "responses"])
+    @pytest.mark.parametrize("ttl", [None, 0, 60, 600])
+    def test_checkpoint_advertises_server_idle_timeout(self, client, api, ttl):
+        if ttl is not None:
+            continuation.CHECKPOINTS.ttl = ttl
+        with _endpoint(
+            generator=_resumable_streaming([_token("answer", finish_reason="stop")])
+        ):
+            response = _post(client, api, stream=True, resumable=True)
+        checkpoints = [
+            e["continuation"] for e in _data(response) if "continuation" in e
+        ]
+        assert checkpoints
+        expected_ttl = 120 if ttl is None else ttl
+        assert all(c["idle_timeout_seconds"] == expected_ttl for c in checkpoints)
+
+    def test_client_timeout_metadata_does_not_change_server_retention(self):
+        record = continuation.Generation(
+            {},
+            "tenant",
+            "/responses",
+            prompt="prompt",
+            parts=["raw"],
+            session=sessions.InferenceSession(),
+        )
+        continuation.CHECKPOINTS.add(record)
+        checkpoint = continuation.StreamState(record).checkpoint()
+        checkpoint["idle_timeout_seconds"] = 10_000
+        record.touched -= continuation.CHECKPOINTS.ttl + 1
+        with pytest.raises(ValueError, match="no longer available"):
+            continuation.CHECKPOINTS.resume(checkpoint, "tenant", "/responses")
+
     @pytest.mark.parametrize("state", ["paused", "completed", "not_started"])
     def test_prune_releases_expired_request_text_and_decoder(self, state):
         store = continuation.Checkpoints(ttl=10)
@@ -6579,6 +6611,7 @@ class TestResponseGenerator:
         flags = [
             ("model", "PRELOAD_MODEL", "demo"),
             ("image-model", "PRELOAD_IMAGE_MODEL", "image-demo"),
+            ("mesh-model", "PRELOAD_MESH_MODEL", "mesh-demo"),
             ("tts-model", "PRELOAD_TTS_MODEL", "tts-demo"),
             ("stt-model", "PRELOAD_STT_MODEL", "stt-demo"),
             ("decision-model", "PRELOAD_DECISION_MODEL", "decision-demo"),
@@ -6619,6 +6652,7 @@ class TestResponseGenerator:
     def test_lifespan_continues_when_optional_preload_fails(self, monkeypatch):
         kinds = dict(
             MODEL="text_generation",
+            MESH_MODEL="mesh_generation",
             TTS_MODEL="audio_tts",
             STT_MODEL="audio_stt",
             EMBEDDING_MODEL="embedding",
@@ -7197,18 +7231,51 @@ class TestReranking:
             model, hidden, padding, tokenizer
         ) == pytest.approx([1 / (1 + math.exp(-4)), 1 / (1 + math.exp(6))])
 
-    @pytest.mark.parametrize(
-        "value",
-        [
-            [1, 2, 3],
-            {"input_ids": [1, 2, 3]},
-            NS(input_ids=[1, 2, 3]),
-            NS(input_ids=[[1, 2, 3]]),
-            mx.array([1, 2, 3]),
-        ],
-    )
-    def test_input_ids(self, value):
-        assert reranking._input_ids(value) == [1, 2, 3]
+    def test_text_prompt_built_without_chat_template(self, monkeypatch):
+        # The text reranker prompt must not depend on the tokenizer's chat
+        # template: it is prefix + "<Instruct>: i\n<Query>: q\n<Document>: d"
+        # + suffix, all tokenized with add_special_tokens=False.
+        encoded = {}
+
+        def encode(text, add_special_tokens=False):
+            assert not add_special_tokens
+            if text not in encoded:
+                encoded[text] = list(range(len(encoded) * 10, len(encoded) * 10 + 2))
+            return encoded[text]
+
+        # No apply_chat_template attribute: using it would raise.
+        tokenizer = NS(
+            encode=encode,
+            pad_token_id=0,
+            eos_token_id=0,
+            unk_token_id=None,
+            convert_tokens_to_ids=lambda token: 0,
+        )
+        captured = []
+
+        def padded(tokenizer, sequences):
+            captured.extend(sequences)
+            return (
+                mx.zeros((len(sequences), 4), mx.int32),
+                mx.ones((len(sequences), 4), mx.int32),
+            )
+
+        monkeypatch.setattr(reranking, "_padded_tokens", padded)
+        inner = NS(
+            embed_tokens=lambda ids: mx.zeros((ids.shape[0], ids.shape[1], 1)),
+            layers=[],
+            norm=lambda hidden: hidden,
+        )
+        model = NS(language_model=NS(model=inner, lm_head=lambda hidden: hidden))
+        query = reranking.RerankItem(text="query")
+        document = reranking.RerankItem(text="document")
+        reranking._score_text_batch(model, tokenizer, query, [document], "instruct")
+        body = "<Instruct>: instruct\n<Query>: query\n<Document>: document"
+        assert captured == [
+            encoded[reranking.TEXT_PREFIX]
+            + encoded[body]
+            + encoded[reranking.TEXT_SUFFIX]
+        ]
 
     def test_packaged_template(self, tmp_path, monkeypatch):
         (tmp_path / "chat_template.jinja").write_text("template", encoding="utf-8")

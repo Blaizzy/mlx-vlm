@@ -4,7 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from ..interpolate import resize_bilinear
+from ..interpolate import resize_bilinear_nhwc
 from ..mlp import GELUMLP as MLP
 from .config import VisionConfig
 
@@ -114,6 +114,8 @@ class VisionEmbeddings(nn.Module):
         positional_embeddings: mx.array,
         spatial_shapes: mx.array,
         max_length: int,
+        *,
+        training: bool = False,
     ) -> mx.array:
         """
         Resize 2D positional embeddings per image and pad to fixed size.
@@ -122,31 +124,33 @@ class VisionEmbeddings(nn.Module):
             positional_embeddings: (pos_size, pos_size, embed_dim)
             spatial_shapes: (batch_size, 2) - (h_patches, w_patches) per image
             max_length: max number of patches to pad to
+            training: Use differentiable MLX operations when training the vision tower
         """
         batch_size = spatial_shapes.shape[0]
         embed_dim = positional_embeddings.shape[-1]
         source_dtype = positional_embeddings.dtype
 
-        pos_size = positional_embeddings.shape[0]
-        # (pos_size, pos_size, embed_dim) -> (1, embed_dim, pos_size, pos_size)
-        pos_emb = positional_embeddings.transpose(2, 0, 1).reshape(
-            1, embed_dim, pos_size, pos_size
-        )
+        # (pos_size, pos_size, embed_dim) -> (1, pos_size, pos_size, embed_dim).
+        # Siglip2 resizes with bilinear + antialias, so use the ATen-matched
+        # helper; the legacy channel-first one antialiases with a Gaussian blur
+        # instead of PyTorch's triangle filter.
+        pos_emb = positional_embeddings[None].astype(mx.float32)
 
         batch_results = []
         for i in range(batch_size):
             height = int(spatial_shapes[i, 0].item())
             width = int(spatial_shapes[i, 1].item())
 
-            resized = resize_bilinear(
+            resized = resize_bilinear_nhwc(
                 pos_emb,
                 (height, width),
                 align_corners=False,
                 antialias=True,
+                training=training,
             )
 
-            # (1, embed_dim, h, w) -> (h*w, embed_dim)
-            resized = resized.reshape(embed_dim, height * width).T
+            # (1, h, w, embed_dim) -> (h*w, embed_dim)
+            resized = resized.reshape(height * width, embed_dim)
             resized = resized.astype(source_dtype)
 
             num_patches = height * width
@@ -172,7 +176,10 @@ class VisionEmbeddings(nn.Module):
                 self.position_embedding_size, self.position_embedding_size, -1
             )
             resized_pos_embeddings = self.resize_positional_embeddings(
-                positional_embeddings, spatial_shapes, max_length=x.shape[1]
+                positional_embeddings,
+                spatial_shapes,
+                max_length=x.shape[1],
+                training=self.training,
             )
             embeddings = patch_embeddings + resized_pos_embeddings
         else:

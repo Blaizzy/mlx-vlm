@@ -131,6 +131,7 @@ jobs:
               tests/test_muse_spark.py
               tests/test_muse_spark_kernels.py
               tests/test_oxr.py
+              tests/test_position_embedding_resize.py
               tests/test_processors.py
               tests/test_speculative.py
           - group: media
@@ -148,6 +149,7 @@ jobs:
               tests/test_llada_image.py
               tests/test_moss_image.py
               tests/test_muse_spark_video.py
+              tests/test_three_d.py
               tests/test_video_generation_models.py
     steps:
       - name: Checkout code
