@@ -7,6 +7,7 @@ from .cache_state import abort_speculative_round, commit_speculative_round
 from .common import (
     _apply_thinking_budget,
     _batch_cache_left_padding,
+    _filter_rope_deltas,
     _record_speculative_round,
     _requires_uniform_batch_acceptance,
     _SpeculativeSamplerRNG,
@@ -713,6 +714,7 @@ def _eagle3_rounds_batch(
             filter_drafter = getattr(draft_model, "filter_batch", None)
             if callable(filter_drafter):
                 filter_drafter(keep_mx)
+            _filter_rope_deltas(lm, keep_mx, n_active)
             hidden = hidden[keep_mx]
             active_idx = [active_idx[j] for j in keep_slots]
             cache_slots = [cache_slots[j] for j in keep_slots]
