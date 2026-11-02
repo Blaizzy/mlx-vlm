@@ -17,7 +17,7 @@ import pytest
 from mlx.utils import tree_flatten
 
 import mlx_vlm.speculative.utils as speculative
-from mlx_vlm.generate.ar import _make_cache, generate_step
+from mlx_vlm.generate.ar import BatchGenerator, _make_cache, generate_step
 from mlx_vlm.models import fast_ops
 from mlx_vlm.models import quantized_verifier as quantized
 from mlx_vlm.models.base import InputEmbeddingsFeatures, LanguageModelOutput
@@ -42,7 +42,7 @@ from mlx_vlm.tests.test_models import (
     model_case,
     tiny_config,
 )
-from mlx_vlm.utils import get_model_and_args
+from mlx_vlm.utils import StoppingCriteria, ThinkingBudgetCriteria, get_model_and_args
 
 parametrize = pytest.mark.parametrize
 DATA = json.loads(Path(__file__).with_name("model_cases.json").read_text())[
@@ -593,6 +593,221 @@ def test_round_commit_close_and_abort(kind, batch, token, failure):
     offset = caches[1].offset
     equal(mx.array(offset).reshape(-1), mx.array([2 + retained] * batch))
     generator.close()
+
+
+def thinking_criteria(budget, *, enabled=True, preopened=True):
+    tokenizer = NS(
+        encode=lambda text, **kw: [{"<think>": 1, "\n": 2, "</think>": 3}[text]]
+    )
+    return ThinkingBudgetCriteria(
+        tokenizer,
+        budget,
+        thinking_start_token="<think>",
+        enable_thinking=enabled,
+        prompt_preopens_thinking=preopened,
+    )
+
+
+def test_thinking_budget_uniform_truncation_counts_only_retained_tokens():
+    criteria = [thinking_criteria(1), thinking_criteria(5)]
+    assert common._apply_thinking_budget(
+        [7, 7], [list(range(50, 58))] * 2, criteria, [0, 1], uniform=True
+    ) == ([2, 2], [[50, 51, 2], [50, 51, 52]])
+    assert criteria[1].thinking_token_count == 3
+    assert criteria[1].pop_forced_token_id() is None
+
+    # The first row's pending closing token shortens the second row again.
+    assert common._apply_thinking_budget(
+        [4, 4], [list(range(53, 58))] * 2, criteria, [0, 1], uniform=True
+    ) == ([0, 0], [[3], [53]])
+    assert not criteria[0].in_thinking
+    assert criteria[1].thinking_token_count == 4
+    assert criteria[1].pop_forced_token_id() is None
+
+    # The remaining row closes only after spending its own retained budget.
+    assert common._apply_thinking_budget([3], [[54, 55, 56, 57]], criteria, [1]) == (
+        [2],
+        [[54, 55, 2]],
+    )
+    assert common._apply_thinking_budget([1], [[56, 57]], criteria, [1]) == (
+        [0],
+        [[3]],
+    )
+    assert not criteria[1].in_thinking
+
+
+@parametrize("kind", ["mtp", "dflash", "eagle3"])
+@parametrize("batch,uniform", [(1, False), (2, False), (2, True)])
+@parametrize(
+    "budget,token,enabled",
+    [
+        (0, 4, True),
+        (2, 4, True),
+        (20, 4, True),
+        (0, 3, True),
+        (0, 2, True),
+        (0, 4, False),
+    ],
+)
+@parametrize("greedy_sampling", [True, False])
+def test_thinking_budget_rounds(
+    kind, batch, uniform, budget, token, enabled, greedy_sampling
+):
+    target = TransactionTarget(token)
+    target.requires_uniform_batch_acceptance = uniform
+    drafter = TransactionDrafter()
+    drafter.config.block_size = 5
+    caches = [ArraysCache(1), BatchKVCache([0] * batch) if batch > 1 else KVCache()]
+    caches[0][0] = mx.zeros((batch, 1))
+    initial = mx.zeros((batch, 1, 2, 1))
+    caches[1].update_and_fetch(initial, initial)
+    criteria = [
+        thinking_criteria(budget + row * 3, enabled=enabled) for row in range(batch)
+    ]
+    expected = []
+    references = []
+    for row in range(batch):
+        reference = thinking_criteria(budget + row * 3, enabled=enabled)
+        tokens = [token]
+        reference(token)
+        for _ in range(11):
+            forced = reference.pop_forced_token_id()
+            next_token = token if forced is None else forced
+            tokens.append(next_token)
+            reference(next_token)
+        expected.append(tokens)
+        references.append(reference)
+
+    rounds = getattr(speculative, f"_{kind}_rounds" + ("_batch" if batch > 1 else ""))
+    options = dict(
+        first_bonus=token if batch == 1 else mx.full((batch,), token, dtype=mx.int32),
+        max_tokens=12,
+        sampler=greedy,
+        greedy_sampling=greedy_sampling,
+        draft_block_size=5,
+        thinking_budget_criteria=criteria[0] if batch == 1 else criteria,
+    )
+    if kind == "mtp":
+        options["shared_kv_states"] = {}
+    actual = [[token] for _ in range(batch)]
+    iterator = rounds(target, drafter, caches, mx.zeros((batch, 1, 4)), **options)
+    for tokens, _ in iterator:
+        for row, value in enumerate([tokens] if batch == 1 else tokens):
+            if value is not None:
+                actual[row].append(value)
+    assert actual == expected
+    for state, reference in zip(criteria, references):
+        assert state.in_thinking == reference.in_thinking
+        assert state.thinking_token_count == reference.thinking_token_count
+
+
+@parametrize("kind", ["mtp", "dflash", "eagle3"])
+@parametrize("budget", [0, 2])
+def test_thinking_budget_trims_cache_before_forced_bonus(kind, budget):
+    target, drafter = TransactionTarget(4), TransactionDrafter()
+    drafter.config.block_size = 5
+    caches = [ArraysCache(1), KVCache()]
+    caches[0][0] = mx.zeros((1, 1))
+    initial = mx.zeros((1, 1, 2, 1))
+    caches[1].update_and_fetch(initial, initial)
+    options = dict(
+        first_bonus=4,
+        max_tokens=12,
+        sampler=greedy,
+        draft_block_size=5,
+        thinking_budget_criteria=thinking_criteria(budget),
+    )
+    if kind == "mtp":
+        options["shared_kv_states"] = {}
+    iterator = getattr(speculative, f"_{kind}_rounds")(
+        target, drafter, caches, mx.zeros((1, 1, 4)), **options
+    )
+    assert next(iterator)[0] == (2 if budget == 0 else 4)
+    # The forced newline is the uncached bonus. Only the preceding tokens
+    # (including the old bonus) may remain in either cache.
+    assert drafter.accept_lens == [budget]
+    assert caches[1].offset == 2 + budget + 1
+    assert caches[0][0].item() == budget + 1
+    iterator.close()
+
+
+def test_thinking_budget_tracks_generated_opening_and_filtered_rows():
+    states = [
+        thinking_criteria(0, preopened=False),
+        thinking_criteria(1, preopened=False),
+    ]
+    for state, token in zip(states, [4, 1]):
+        state(token)
+    counts, rows = common._apply_thinking_budget([3], [[4, 4, 4, 4]], states, [1])
+    assert counts == [2] and rows == [[4, 4, 2]]
+    assert states[0].thinking_token_count == 0
+    counts, rows = common._apply_thinking_budget([2], [[4, 4, 4]], states, [1])
+    assert counts == [0] and rows == [[3]]
+    assert not states[1].in_thinking
+
+
+@parametrize("batch", [False, True])
+def test_thinking_budget_generation_matches_autoregressive(batch):
+    mx.random.seed(37)
+    target, drafter = dflash_target("dflash2"), dflash_drafter("dflash2")
+    results = []
+    for use_draft in (False, True):
+        options = (
+            dict(draft_model=drafter, draft_kind="dflash", draft_block_size=5)
+            if use_draft
+            else {}
+        )
+        if batch:
+            processor = NS(stopping_criteria=StoppingCriteria([99]))
+            generator = BatchGenerator(
+                target.language_model,
+                processor,
+                max_tokens=16,
+                greedy_sampling=True,
+                **options,
+            )
+            try:
+                prompts = [[4, 5, 6], [7, 8]]
+                uids = generator.insert(
+                    prompts,
+                    prompt_kwargs=[
+                        target.get_input_embeddings(mx.array([ids])).to_dict()
+                        for ids in prompts
+                    ],
+                    thinking_budget_criteria=[
+                        thinking_criteria(0),
+                        thinking_criteria(4),
+                    ],
+                )
+                tokens = {uid: [] for uid in uids}
+                while generator.has_work:
+                    _, responses = generator.next()
+                    for response in responses:
+                        if response.token is not None:
+                            tokens[response.uid].append(response.token)
+                results.append(list(tokens.values()))
+            finally:
+                generator.close()
+        else:
+            criteria = thinking_criteria(2)
+            tokens = []
+            for token, _ in generate_step(
+                mx.array([[4, 5, 6]]),
+                target,
+                None,
+                None,
+                max_tokens=16,
+                temperature=0,
+                thinking_budget_criteria=criteria,
+                **options,
+            ):
+                tokens.append(token)
+                if not use_draft:
+                    criteria(token)
+            results.append([tokens])
+    assert results[0] == results[1]
+    assert all(3 in row for row in results[1])
+    assert drafter.draft_lens
 
 
 def test_acceptance_walk_and_budgets():

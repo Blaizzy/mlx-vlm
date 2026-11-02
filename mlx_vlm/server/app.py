@@ -47,7 +47,7 @@ from .generation import (
     get_quantized_kv_start,
     get_top_logprobs_k,
 )
-from .model_discovery import MODEL_PATHS_ENV, discover_models
+from .model_discovery import MODEL_PATHS_ENV, discover_models, model_reasoning_efforts
 from .openai import register_routes as register_openai_routes
 from .realtime import register_routes as register_realtime_routes
 from .reranking import ensure_chat_template as ensure_reranker_chat_template
@@ -94,13 +94,16 @@ def _cache_group_for_cache(cache: dict) -> str:
     return model_kind or "text_generation"
 
 
-def _model_info(model_id: str, created: int, *, loaded: bool = False) -> dict:
+def _model_info(
+    model_id: str, created: int, *, loaded: bool = False, reasoning_efforts=None
+) -> dict:
     model_id = str(model_id)
     return {
         "id": model_id,
         "object": "model",
         "created": created,
         "loaded": loaded,
+        "reasoning_efforts": reasoning_efforts,
     }
 
 
@@ -111,7 +114,14 @@ def _served_model_entries() -> list[dict]:
         model_id = cache.get("model_path")
         if not model_id:
             continue
-        models[model_id] = _model_info(model_id, created, loaded=True)
+        models[model_id] = _model_info(
+            model_id,
+            created,
+            loaded=True,
+            reasoning_efforts=model_reasoning_efforts(
+                Path(model_id).expanduser(), cache.get("processor")
+            ),
+        )
     return list(models.values())
 
 
@@ -1116,7 +1126,11 @@ def models_endpoint(
     paths.extend(p for p in model_dir or [] if p)
     for model in discover_models(hf_cache_info, paths):
         if model["id"] not in models and model["path"] not in loaded_paths:
-            models[model["id"]] = _model_info(model["id"], model["created"])
+            models[model["id"]] = _model_info(
+                model["id"],
+                model["created"],
+                reasoning_efforts=model_reasoning_efforts(model["path"]),
+            )
 
     return {
         "object": "list",
