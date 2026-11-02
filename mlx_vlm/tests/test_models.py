@@ -46,30 +46,6 @@ from mlx_vlm.utils import (
 )
 
 
-class TestIdol(unittest.TestCase):
-    def test_idol(self):
-        from mlx_vlm.models.idol.dit import LatentSeqMMFlowModel
-
-        model = LatentSeqMMFlowModel(
-            q_token_length=8,
-            in_channels=4,
-            cam_channels=5,
-            model_channels=24,
-            cond_channels=12,
-            cond2_channels=8,
-            num_blocks=1,
-            num_heads=2,
-            num_head_channels=12,
-        )
-        model.dtype = mx.float32
-        sample = {"latent": mx.zeros((1, 8, 4)), "camera": mx.zeros((1, 1, 5))}
-        cond = {"feature1": mx.zeros((1, 6, 12)), "feature2": mx.zeros((1, 6, 8))}
-        output = model(sample, mx.array([500.0]), cond)
-        for name, value in output.items():
-            self.assertEqual(value.shape, sample[name].shape)
-            self.assertTrue(bool(mx.all(mx.isfinite(value))))
-
-
 class TestMiniMaxM31Flash(unittest.TestCase):
     def test_router_dtype_sanitization_is_idempotent(self):
         from mlx_vlm.models.minimax_m3_vl import Model, ModelConfig

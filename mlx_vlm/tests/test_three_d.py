@@ -1,12 +1,14 @@
-"""Idol inference contracts and optional PyTorch numerical parity checks."""
+"""3D generation contracts, model components, and optional numerical parity checks."""
 
 import base64
 import importlib
 import io
 import json
 import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -14,6 +16,8 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from mlx_vlm.generate import generate_3d, load_3d_model, three_d
+from mlx_vlm.generate.dispatch import parse_arguments
 from mlx_vlm.models.idol.birefnet import _DeformableConv2d, _image2patches, resize
 from mlx_vlm.models.idol.camera import decode_camera
 from mlx_vlm.models.idol.conditioning import DINOv3, Flux2ImageEncoder
@@ -29,7 +33,157 @@ from mlx_vlm.models.idol.preprocess import preprocess_image
 from mlx_vlm.models.idol.sampler import sample_flow
 from mlx_vlm.models.idol.weights import load_weights
 
-DENOISER_ARGS = dict(
+THREE_D_CASES = json.loads(Path(__file__).with_name("three_d_cases.json").read_text())
+THREE_D_FAMILIES = THREE_D_CASES["families"]
+
+
+def _cli_args(*flags):
+    with patch.object(sys, "argv", ["mlx_vlm.generate", "--model", "demo", *flags]):
+        return parse_arguments()
+
+
+def _checkpoint_path(family):
+    env = THREE_D_FAMILIES[family]["weights_env"]
+    path = os.environ.get(env)
+    if not path:
+        pytest.skip(f"Set {env} to a downloaded {family} snapshot for checkpoint tests")
+    return Path(path)
+
+
+# Shared API, loader, and CLI contracts.
+
+
+@pytest.mark.parametrize("save", [False, True])
+def test_generate_3d_returns_model_result(tmp_path, save):
+    result = SimpleNamespace(save=Mock())
+    model = Mock(return_value=result)
+    output = tmp_path / "object.ply" if save else None
+    actual = generate_3d(model, "object.png", output_path=output, seed=7, steps=2)
+    assert actual is result
+    model.assert_called_once_with("object.png", seed=7, steps=2)
+    if save:
+        result.save.assert_called_once_with(output)
+    else:
+        result.save.assert_not_called()
+
+
+@pytest.mark.parametrize("family", THREE_D_FAMILIES)
+@pytest.mark.parametrize("source", ["local", "remote"])
+def test_3d_loader_keeps_download_options(tmp_path, monkeypatch, family, source):
+    case = THREE_D_FAMILIES[family]
+    module = importlib.import_module(f"mlx_vlm.models.{family}")
+    cls = getattr(module, case["pipeline_class"])
+    (tmp_path / "config.json").write_text(json.dumps(case["config"]))
+    download = Mock(return_value=str(tmp_path))
+    init = Mock(return_value=None)
+    monkeypatch.setattr("mlx_vlm.utils.snapshot_download", download)
+    monkeypatch.setattr(cls, "__init__", init)
+    # Remote IDs deliberately omit the family name to exercise config dispatch.
+    model_id = tmp_path if source == "local" else "test-org/renamed-model"
+    model = load_3d_model(model_id, revision="pinned", local_files_only=True)
+    assert isinstance(model, cls)
+    init.assert_called_once_with(tmp_path, local_files_only=True)
+    if source == "local":
+        download.assert_not_called()
+    else:
+        assert [c.kwargs["allow_patterns"] for c in download.call_args_list] == [
+            ["config.json"],
+            case["weight_files"],
+        ]
+        for call in download.call_args_list:
+            assert call.kwargs["repo_id"] == model_id
+            assert call.kwargs["revision"] == "pinned"
+            assert call.kwargs["local_files_only"] is True
+
+
+def test_3d_loader_rejects_unsupported_config(tmp_path, monkeypatch):
+    (tmp_path / "config.json").write_text('{"model_type": "qwen2_vl"}')
+    download = Mock(side_effect=AssertionError("Unexpected download"))
+    monkeypatch.setattr("mlx_vlm.utils.snapshot_download", download)
+    with pytest.raises(ValueError, match="Unsupported 3D generation model"):
+        load_3d_model(tmp_path)
+    download.assert_not_called()
+
+
+@pytest.mark.parametrize("family", THREE_D_FAMILIES)
+def test_image_conditioned_generation(family, tmp_path):
+    case = THREE_D_FAMILIES[family]
+    weights = _checkpoint_path(family)
+    image_path = os.environ.get(case["image_env"])
+    if not image_path:
+        pytest.skip(f"Set {case['image_env']} and cache encoders for image integration")
+    model = load_3d_model(weights, local_files_only=True)
+    output = tmp_path / "image.ply"
+    result = generate_3d(
+        model, image_path, output_path=output, **case["generate_kwargs"]
+    )
+    assert result.preprocessed_image.size == tuple(case["image_size"])
+    assert result.gaussian.xyz.shape == (case["num_gaussians"], 3)
+    for name in case["gaussian_attributes"]:
+        assert bool(mx.all(mx.isfinite(getattr(result.gaussian, name))))
+    assert all(np.isfinite(value) for value in result.camera.values())
+    assert result.path == output
+    assert output.stat().st_size > case["num_gaussians"] * 17 * 4
+    assert (tmp_path / "image_input.png").is_file()
+    assert json.loads((tmp_path / "image_camera.json").read_text()) == result.camera
+
+
+def test_3d_cli_uses_shared_options_and_saves(tmp_path):
+    output = tmp_path / "castle.ply"
+    args = _cli_args(
+        "--output-modality",
+        "3d",
+        "--image",
+        "castle.png",
+        "--output",
+        str(output),
+        "--steps",
+        "12",
+        "--seed",
+        "7",
+        "--guidance",
+        "2.5",
+        "--revision",
+        "checkpoint",
+        "--gen-kwargs",
+        '{"mode": "real", "num_gaussians": 32768}',
+    )
+    result = SimpleNamespace(path=output, save=Mock())
+    model = Mock(return_value=result)
+    with patch.object(three_d, "load_3d_model", return_value=model) as load:
+        three_d.run_3d_generation_cli(args)
+    load.assert_called_once_with("demo", revision="checkpoint", force_download=False)
+    model.assert_called_once_with(
+        "castle.png",
+        mode="real",
+        num_gaussians=32768,
+        steps=12,
+        seed=7,
+        cfg_strength=2.5,
+        verbose=False,
+    )
+    result.save.assert_called_once_with(output)
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        [],
+        ["--image", "one.png", "two.png"],
+        ["--image", "one.png", "--output", "out.png"],
+        ["--image", "one.png", "--task", "edit"],
+    ],
+)
+def test_3d_cli_rejects_invalid_inputs_before_loading(flags):
+    with patch.object(three_d, "load_3d_model") as load:
+        with pytest.raises(ValueError):
+            three_d.run_3d_generation_cli(_cli_args("--output-modality", "3d", *flags))
+    load.assert_not_called()
+
+
+# Idol model components and reference comparisons.
+
+IDOL_DENOISER_ARGS = dict(
     q_token_length=8,
     in_channels=4,
     cam_channels=5,
@@ -40,7 +194,7 @@ DENOISER_ARGS = dict(
     num_heads=2,
     num_head_channels=12,
 )
-REPRESENTATION = {
+IDOL_REPRESENTATION = {
     "num_gaussians": 2,
     "lr": {
         "_xyz": 1.0,
@@ -54,6 +208,17 @@ REPRESENTATION = {
     "scaling_bias": 0.004,
     "opacity_bias": 0.1,
 }
+
+
+def test_idol_denoiser_forward():
+    model = LatentSeqMMFlowModel(**(IDOL_DENOISER_ARGS | {"num_blocks": 1}))
+    model.dtype = mx.float32
+    sample = {"latent": mx.zeros((1, 8, 4)), "camera": mx.zeros((1, 1, 5))}
+    cond = {"feature1": mx.zeros((1, 6, 12)), "feature2": mx.zeros((1, 6, 8))}
+    output = model(sample, mx.array([500.0]), cond)
+    for name, value in output.items():
+        assert value.shape == sample[name].shape
+        assert bool(mx.all(mx.isfinite(value)))
 
 
 @pytest.mark.parametrize("offset", [0.0, 0.125, 0.73])
@@ -202,37 +367,6 @@ def test_pipeline_uses_shared_image_loading_with_alpha(tmp_path, source_kind):
     # Existing VLM callers keep the RGB default.
     assert load_image(path).mode == "RGB"
     assert load_image(path, mode="RGBA").getchannel("A").getextrema() == (0, 255)
-
-
-def test_shared_3d_loader_keeps_download_options(tmp_path, monkeypatch):
-    from unittest.mock import Mock
-
-    from mlx_vlm.generate import load_3d_model
-    from mlx_vlm.models.idol.weights import WEIGHT_FILES
-
-    (tmp_path / "config.json").write_text(
-        json.dumps(
-            {
-                "denoiser": {"name": "LatentSeqMMFlowModel"},
-            }
-        )
-    )
-    download = Mock(return_value=str(tmp_path))
-    init = Mock(return_value=None)
-    monkeypatch.setattr("mlx_vlm.utils.snapshot_download", download)
-    monkeypatch.setattr(IdolPipeline, "__init__", init)
-    load_3d_model("org/renamed-idol", revision="pinned", local_files_only=True)
-    assert [c.kwargs["allow_patterns"] for c in download.call_args_list] == [
-        ["config.json"],
-        WEIGHT_FILES,
-    ]
-    for call in download.call_args_list:
-        assert call.kwargs["revision"] == "pinned"
-        assert call.kwargs["local_files_only"] is True
-    init.assert_called_once_with(tmp_path, local_files_only=True)
-    (tmp_path / "config.json").write_text('{"model_type": "qwen2_vl"}')
-    with pytest.raises(ValueError, match="Unsupported 3D generation model"):
-        load_3d_model(tmp_path)
 
 
 def test_camera_conventions():
@@ -402,7 +536,7 @@ def test_flux2_posterior_and_token_packing_matches_diffusers():
 
 
 @pytest.fixture
-def upstream(monkeypatch):
+def idol_upstream(monkeypatch):
     path = os.environ.get("IDOL_REFERENCE_SDK")
     if not path:
         pytest.skip(
@@ -416,13 +550,15 @@ def upstream(monkeypatch):
     )
 
 
-def test_denoiser_matches_upstream(upstream):
+def test_denoiser_matches_upstream(idol_upstream):
     torch = pytest.importorskip("torch")
     tensordict = pytest.importorskip("tensordict")
     torch.manual_seed(0)
-    ref = upstream.dit.LatentSeqMMFlowModel(**DENOISER_ARGS).float().eval()
+    ref = idol_upstream.dit.LatentSeqMMFlowModel(**IDOL_DENOISER_ARGS).float().eval()
     ref.dtype = torch.float32
-    model = load_weights(LatentSeqMMFlowModel(**DENOISER_ARGS), _torch_weights(ref))
+    model = load_weights(
+        LatentSeqMMFlowModel(**IDOL_DENOISER_ARGS), _torch_weights(ref)
+    )
     model.dtype = mx.float32
     sample = tensordict.TensorDict(
         {"latent": torch.randn(2, 8, 4), "camera": torch.randn(2, 1, 5)}, batch_size=2
@@ -441,16 +577,20 @@ def test_denoiser_matches_upstream(upstream):
 
 
 @pytest.mark.parametrize("gaussian", [False, True])
-def test_decoders_match_upstream(upstream, gaussian):
+def test_decoders_match_upstream(idol_upstream, gaussian):
     torch = pytest.importorskip("torch")
     torch.manual_seed(0)
     args = dict(model_channels=24, cond_channels=4, num_blocks=2, num_heads=2)
     if gaussian:
-        args.update(in_channels=3, representation_config=REPRESENTATION)
-        ref = upstream.decoder.GaussianFixedlenDecoder(**args).float().eval()
+        args.update(in_channels=3, representation_config=IDOL_REPRESENTATION)
+        ref = idol_upstream.decoder.GaussianFixedlenDecoder(**args).float().eval()
         model = GaussianFixedlenDecoder(**args)
     else:
-        ref = upstream.decoder.OctreeProbabilityFixedlenDecoder(**args).float().eval()
+        ref = (
+            idol_upstream.decoder.OctreeProbabilityFixedlenDecoder(**args)
+            .float()
+            .eval()
+        )
         model = OctreeProbabilityFixedlenDecoder(**args)
     load_weights(model, _torch_weights(ref))
     ref.dtype, model.dtype = torch.float32, mx.float32
@@ -468,42 +608,37 @@ def test_decoders_match_upstream(upstream, gaussian):
 
 
 @pytest.fixture
-def checkpoint_path():
-    path = os.environ.get("IDOL_WEIGHTS")
-    if not path:
-        pytest.skip(
-            "Set IDOL_WEIGHTS to a downloaded Idol snapshot for checkpoint tests"
-        )
-    return Path(path)
+def idol_checkpoint_path():
+    return _checkpoint_path("idol")
 
 
 @pytest.mark.parametrize("name", ["denoiser", "decoder", "decoder_gs"])
-def test_trained_checkpoint_matches_upstream(upstream, checkpoint_path, name):
+def test_trained_checkpoint_matches_upstream(idol_upstream, idol_checkpoint_path, name):
     torch = pytest.importorskip("torch")
     safetensors = pytest.importorskip("safetensors.torch")
     tensordict = pytest.importorskip("tensordict")
     torch.manual_seed(0)
-    config = json.loads((checkpoint_path / "config.json").read_text())
+    config = json.loads((idol_checkpoint_path / "config.json").read_text())
     classes = {
-        "denoiser": (LatentSeqMMFlowModel, upstream.dit.LatentSeqMMFlowModel),
+        "denoiser": (LatentSeqMMFlowModel, idol_upstream.dit.LatentSeqMMFlowModel),
         "decoder": (
             OctreeProbabilityFixedlenDecoder,
-            upstream.decoder.OctreeProbabilityFixedlenDecoder,
+            idol_upstream.decoder.OctreeProbabilityFixedlenDecoder,
         ),
         "decoder_gs": (
             GaussianFixedlenDecoder,
-            upstream.decoder.GaussianFixedlenDecoder,
+            idol_upstream.decoder.GaussianFixedlenDecoder,
         ),
     }
     mlx_cls, torch_cls = classes[name]
     model = load_weights(
         mlx_cls(**config[name]["args"]),
-        checkpoint_path / f"{name}.safetensors",
+        idol_checkpoint_path / f"{name}.safetensors",
         mixed_precision=True,
     )
     ref = torch_cls(**config[name]["args"]).eval()
     ref.load_state_dict(
-        safetensors.load_file(str(checkpoint_path / f"{name}.safetensors"))
+        safetensors.load_file(str(idol_checkpoint_path / f"{name}.safetensors"))
     )
     with torch.no_grad():
         if name == "denoiser":
@@ -550,9 +685,9 @@ def test_trained_checkpoint_matches_upstream(upstream, checkpoint_path, name):
         assert np.linalg.norm(a - b) / max(np.linalg.norm(b), 1e-10) < 0.01
 
 
-def test_checkpoint_sampling_and_export(checkpoint_path, tmp_path):
+def test_checkpoint_sampling_and_export(idol_checkpoint_path, tmp_path):
     pipeline = IdolPipeline.from_pretrained(
-        checkpoint_path, local_files_only=True, background_removal=False
+        idol_checkpoint_path, local_files_only=True, background_removal=False
     )
     condition = {
         "feature1": mx.zeros((1, 4101, 1280)),
@@ -564,29 +699,3 @@ def test_checkpoint_sampling_and_export(checkpoint_path, tmp_path):
     assert bool(mx.all(mx.isfinite(gaussian.xyz)))
     gaussian.save_ply(tmp_path / "smoke.ply")
     assert (tmp_path / "smoke.ply").stat().st_size > 32768 * 17 * 4
-
-
-def test_image_conditioned_pipeline(checkpoint_path, tmp_path):
-    from mlx_vlm.generate import generate_3d, load_3d_model
-
-    image_path = os.environ.get("IDOL_TEST_IMAGE")
-    if not image_path:
-        pytest.skip("Set IDOL_TEST_IMAGE and cache both encoders for image integration")
-    pipeline = load_3d_model(checkpoint_path, local_files_only=True)
-    result = generate_3d(
-        pipeline,
-        image_path,
-        seed=42,
-        steps=2,
-        num_gaussians=32768,
-        output_path=tmp_path / "image.ply",
-    )
-    assert result.preprocessed_image.size == (1024, 1024)
-    assert result.gaussian.xyz.shape == (32768, 3)
-    for name in ("xyz", "features_dc", "scaling", "rotation", "opacity"):
-        assert bool(mx.all(mx.isfinite(getattr(result.gaussian, name))))
-    assert all(np.isfinite(value) for value in result.camera.values())
-    assert result.path == tmp_path / "image.ply"
-    assert (tmp_path / "image.ply").stat().st_size > 32768 * 17 * 4
-    assert (tmp_path / "image_input.png").is_file()
-    assert json.loads((tmp_path / "image_camera.json").read_text()) == result.camera

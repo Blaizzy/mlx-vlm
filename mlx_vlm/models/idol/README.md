@@ -100,9 +100,11 @@ a text tokenizer or applying a chat template.
 ## Validation
 
 ```sh
-python -m pytest mlx_vlm/tests/test_idol.py \
-  mlx_vlm/tests/test_models.py::TestIdol::test_idol -q
+python -m pytest mlx_vlm/tests/test_three_d.py -q
 ```
+
+The suite covers the shared 3D API and CLI, model-family cases in
+`mlx_vlm/tests/three_d_cases.json`, and Idol component and numerical checks.
 
 Optional reference comparisons need PyTorch, torchvision, diffusers, and the
 SDK's test dependencies (`tensordict` and `plyfile`). No model download occurs
@@ -110,7 +112,7 @@ during the unit tests. To include SDK parity tests:
 
 ```sh
 git clone https://github.com/speridlabs/idol-sdk /tmp/idol-sdk
-IDOL_REFERENCE_SDK=/tmp/idol-sdk python -m pytest mlx_vlm/tests/test_idol.py -q
+IDOL_REFERENCE_SDK=/tmp/idol-sdk python -m pytest mlx_vlm/tests/test_three_d.py -q
 ```
 
 To include tests with downloaded checkpoints, also set `IDOL_WEIGHTS` to the
