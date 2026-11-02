@@ -47,28 +47,6 @@ outputs are reduced before weighting and accumulation, preserving BF16 operation
 order. A directory containing only one rank's experts must declare its
 `expert_start` and `expert_end` in `text_config`; sharding validates that range.
 
-## Validation and limitations
-
-The released NVFP4 weights have run on two and three 512 GiB M3 Ultra Macs over
-TB5 RDMA with MLX main `1ba7f969ad05d86decfeeb83787cc9b79e440962`. Prepared
-rank-local weights occupy approximately 316 GB per Mac for two ranks or
-217–222 GB for three ranks. Short-request peak MLX allocation was approximately
-334 GB and 234–239 GB per device, respectively.
-
-The unmodified `examples/sharded_generate.py` completed both text and image
-requests on two Macs: it answered `4` for `2 + 2` and identified a red image.
-
-Small distributed models matched unsharded logits. A small eight-layer model
-matched the Transformers reference within `1.08e-6` maximum hidden-state error.
-Model, cache, and quantization coverage lives in the shared test suites.
-
-Continuous batching uses the standard `BatchGenerator` with a model-specific
-`BatchLatentCache`. It supports variable-length prompts, chunked prefill,
-request insertion/removal, and warm cache merging. Latent, rotary, and indexer
-keys share the same padding layout, while positions advance per request.
-Distributed callers must submit the same requests and scheduling operations
-on every rank.
-
 ## DSpark speculative decoding
 
 The native checkpoint includes a 4.20 GB BF16 draft head. Load it with the shared
