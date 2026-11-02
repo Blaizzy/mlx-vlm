@@ -1,5 +1,6 @@
 import argparse
 import glob
+import json
 import shutil
 from pathlib import Path
 from typing import Callable, Optional, Union
@@ -418,6 +419,31 @@ def convert(
     # files verbatim, which is what save_pretrained would have produced anyway.
     if hasattr(processor, "save_pretrained"):
         processor.save_pretrained(mlx_path)
+        # save_pretrained rebuilds tokenizer.json from the tokenizer class transformers picked,
+        # not from the source file. Qwen3.5-family checkpoints name Qwen2Tokenizer, which swaps in
+        # Qwen2's pre-tokenizer regex (no \p{M}) and decoder flags, so text with combining marks
+        # tokenizes differently from training (#2496). Keep the checkpoint's pipeline,
+        # but retain added tokens from the loaded processor: Transformers 5 stores
+        # them only in the saved tokenizer.json, including config-only added tokens.
+        source_tokenizer = model_path / "tokenizer.json"
+        if source_tokenizer.is_file():
+            destination_tokenizer = mlx_path / "tokenizer.json"
+            added_tokens = None
+            if destination_tokenizer.is_file():
+                added_tokens = json.loads(
+                    destination_tokenizer.read_text(encoding="utf-8")
+                ).get("added_tokens")
+            _copy_writable_file(source_tokenizer, destination_tokenizer)
+            if added_tokens is not None:
+                tokenizer_data = json.loads(
+                    destination_tokenizer.read_text(encoding="utf-8")
+                )
+                if tokenizer_data.get("added_tokens") != added_tokens:
+                    tokenizer_data["added_tokens"] = added_tokens
+                    destination_tokenizer.write_text(
+                        json.dumps(tokenizer_data, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
     else:
         # NOTE: no local `import shutil` here — convert.py already imports it at module scope,
         # and a function-local import would make the name local for the WHOLE function, unbinding
