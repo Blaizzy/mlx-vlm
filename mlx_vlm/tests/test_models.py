@@ -9,12 +9,14 @@ import json
 import logging
 import math
 import os
-import signal
+import secrets
 import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import textwrap
+import time
 import unittest
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict
@@ -2957,7 +2959,24 @@ def _make_distributed_test_model(family, dtype):
 
 
 def _distributed_model_worker(family, dtype_name):
+    def stage(name):
+        print(f"[rank {os.environ.get('MLX_RANK')}] {name}", flush=True)
+
+    stage("initializing ring")
     group = mx.distributed.init(strict=True, backend="ring")
+    barrier_dir = Path(os.environ["MLX_TEST_BARRIER_DIR"])
+
+    def host_barrier(name):
+        # All test ranks share this directory. Waiting here must not enqueue
+        # MLX work: even a CPU collective can stall a peer's shared-GPU work.
+        (barrier_dir / f"{name}-{group.rank()}").touch()
+        while any(
+            not (barrier_dir / f"{name}-{rank}").exists()
+            for rank in range(group.size())
+        ):
+            time.sleep(0.001)
+
+    stage("building models")
     options = TINY_MODELS[family]["distributed"]
     dtype = getattr(mx, dtype_name)
     mx.random.seed(19)
@@ -2971,6 +2990,7 @@ def _distributed_model_worker(family, dtype_name):
         with pytest.raises(ValueError, match=error):
             sharded.shard(group)
     mx.eval(sharded.parameters())
+    stage("models ready")
     local_weights = dict(tree_flatten(sharded.parameters()))
     for pattern in options["sharded_weights"]:
         names = [name for name in weights if fnmatchcase(name, pattern)]
@@ -2989,17 +3009,19 @@ def _distributed_model_worker(family, dtype_name):
         for step, tokens in enumerate(
             ([1, 7, 9, 3, 11, 15, 2, 6, 8, 10, 12, 14], [13], [17], [19], [2, 4, 6])
         ):
+            stage(f"batch={batch} step={step} reference")
             ids = mx.array(
                 [[(t + row) % vocab_size for t in tokens] for row in range(batch)]
             )
             expected = reference(ids, cache=expected_cache).logits
             mx.eval(expected)
-            # Finish independent reference work on every rank before queuing
-            # distributed work on the shared GPU. Keep test-only collectives
-            # on the CPU so a faster rank cannot block another rank's GPU work.
-            mx.distributed.all_sum(mx.array(0), group=group, stream=mx.cpu).item()
+            stage(f"batch={batch} step={step} barrier")
+            host_barrier(f"reference-{batch}-{step}")
+            stage(f"batch={batch} step={step} sharded")
             actual = sharded(ids, cache=actual_cache).logits
             mx.eval(actual)
+            host_barrier(f"actual-{batch}-{step}")
+            stage(f"batch={batch} step={step} gather")
             gathered = mx.distributed.all_gather(actual, group=group, stream=mx.cpu)
             mx.eval(gathered)
             ranks_agree = all(
@@ -3019,6 +3041,7 @@ def _distributed_model_worker(family, dtype_name):
                     ).item(),
                 )
             )
+    host_barrier("checks")
     passed = mx.distributed.all_sum(
         mx.array(int(all(r["passed"] and r["ranks_agree"] for r in records))),
         group=group,
@@ -3029,21 +3052,20 @@ def _distributed_model_worker(family, dtype_name):
         flush=True,
     )
     assert passed == group.size(), records
+    stage("completed")
 
 
 def _run_distributed_model_test(family, dtype, world_size):
     repo = Path(__file__).resolve().parents[2]
-    # The ring launcher needs one consecutive port per rank. Probe the entire
-    # range while holding the sockets so a four-rank case cannot reuse a port.
+    # Select a whole block outside the ephemeral range. Binding only the first
+    # port to zero leaves the allocator free to hand the remaining ports to a
+    # concurrent launch or an outgoing ring connection.
     for _ in range(100):
         with ExitStack() as stack:
             sockets = [stack.enter_context(socket.socket()) for _ in range(world_size)]
-            sockets[0].bind(("127.0.0.1", 0))
-            port = sockets[0].getsockname()[1]
-            if port + world_size > 65536:
-                continue
+            port = 10000 + world_size * secrets.randbelow((30000 - 10000) // world_size)
             try:
-                for rank, sock in enumerate(sockets[1:], 1):
+                for rank, sock in enumerate(sockets):
                     sock.bind(("127.0.0.1", port + rank))
             except OSError:
                 continue
@@ -3070,23 +3092,20 @@ def _run_distributed_model_test(family, dtype, world_size):
         family,
         dtype,
     ]
-    process = subprocess.Popen(
-        command,
-        cwd=repo,
-        env=dict(os.environ, PYTHONPATH=str(repo)),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        start_new_session=True,
-    )
-    try:
-        output, _ = process.communicate(timeout=180)
-    except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
-        output, _ = process.communicate()
-        pytest.fail(
-            f"Distributed test timed out: {family}/{dtype}/{world_size}\n{output}"
+    with tempfile.TemporaryDirectory(prefix="mlx-vlm-distributed-") as barrier_dir:
+        process = subprocess.Popen(
+            command,
+            cwd=repo,
+            env=dict(
+                os.environ,
+                PYTHONPATH=str(repo),
+                MLX_TEST_BARRIER_DIR=barrier_dir,
+            ),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
         )
+        output, _ = process.communicate()
     assert process.returncode == 0, output
     records = [json.loads(line) for line in output.splitlines() if line.startswith("{")]
     assert len(records) == world_size, output
