@@ -12,7 +12,7 @@ from typing import Any, Optional
 
 import regex as re
 
-_function_regex = re.compile(r"<function=(.*?)</function>$", re.DOTALL)
+_function_regex = re.compile(r"<function=(.*?)</function>\s*$", re.DOTALL)
 # A parameter ends at </parameter>. Only an unclosed last parameter ends at
 # the end of the function body: splitting at an inner "<parameter=" would
 # corrupt closed values that contain that text.

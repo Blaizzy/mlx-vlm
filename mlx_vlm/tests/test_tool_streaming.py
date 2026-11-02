@@ -96,6 +96,94 @@ def test_multiple_calls_keep_separate_ids(parser):
     ]
 
 
+INT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "count": {"type": "integer"},
+                    "content": {"type": "string"},
+                },
+            },
+        },
+    }
+]
+
+NO_PARAM_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_time",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+]
+
+
+@pytest.mark.parametrize("chunk_size", [1, 8192])
+@pytest.mark.parametrize(
+    "parser, tools, text, kept",
+    [
+        ("json_tools", TOOLS, '<tool_call>{"name": "get_time"}</tool_call>', []),
+        (
+            "json_tools",
+            TOOLS,
+            '<tool_call>{"name": 5, "arguments": {}}</tool_call>',
+            [],
+        ),
+        ("json_tools", TOOLS, "<tool_call>5</tool_call>", []),
+        ("json_tools", TOOLS, '<tool_call>"get_time"</tool_call>', []),
+        (
+            "json_tools",
+            TOOLS,
+            '<tool_call>[{"name": "write_file", "arguments": {"path": "x"}},'
+            ' "oops"]</tool_call>',
+            ["write_file"],
+        ),
+        (
+            "qwen3_coder",
+            INT_TOOLS,
+            "<tool_call><function=write_file><parameter=count>twenty</parameter>"
+            "<parameter=content>x</parameter></function></tool_call>",
+            [],
+        ),
+    ],
+)
+def test_streaming_tolerates_what_the_final_parser_drops(
+    parser, tools, text, kept, chunk_size
+):
+    """A malformed call the final parser drops must not abort the stream."""
+    module = load_tool_module(parser)
+    state = ToolCallDeltaState(module, tools)
+    received = {}
+    for offset in range(0, len(text), chunk_size):
+        for delta in state.feed(text[offset : offset + chunk_size]):
+            call = received.setdefault(delta["index"], {"arguments": ""})
+            call["name"] = delta["function"].get("name", call.get("name"))
+            call["arguments"] += delta["function"].get("arguments", "")
+    final = process_tool_calls(text, module, tools).calls
+    assert [call["function"]["name"] for call in final] == kept
+    state.finish(final)
+    assert [call["name"] for call in received.values()] == kept
+
+
+def test_trailing_whitespace_before_tool_call_end_keeps_the_call():
+    """A blank line before </tool_call> is not grounds to drop the call."""
+    module = load_tool_module("qwen3_coder")
+    text = "<tool_call><function=get_time></function>\n\n</tool_call>"
+    final = process_tool_calls(text, module, NO_PARAM_TOOLS).calls
+    assert [call["function"]["name"] for call in final] == ["get_time"]
+    state = ToolCallDeltaState(module, NO_PARAM_TOOLS)
+    deltas = [delta for ch in text for delta in state.feed(ch)]
+    assert state.finish(final) == []
+    assert [delta["function"]["name"] for delta in deltas if "id" in delta] == [
+        "get_time"
+    ]
+
+
 def test_truncated_call_cannot_finish_successfully():
     module = load_tool_module("json_tools")
     state = ToolCallDeltaState(module, TOOLS)
@@ -118,6 +206,80 @@ def test_cohere_parallel_action_and_escape_repair():
         "a|b",
         "c",
     ]
+
+
+def _assert_streamed_calls(parser, tools, text, chunk_size, expected):
+    module = load_tool_module(parser)
+    state = ToolCallDeltaState(module, tools)
+    received = {}
+    for offset in range(0, len(text), chunk_size):
+        for delta in state.feed(text[offset : offset + chunk_size]):
+            call = received.setdefault(delta["index"], {"arguments": ""})
+            if "id" in delta:
+                assert "id" not in call
+                call["id"] = delta["id"]
+                call["name"] = delta["function"]["name"]
+            call["arguments"] += delta["function"].get("arguments", "")
+    final = process_tool_calls(text, module, tools).calls
+    assert [
+        (call["function"]["name"], json.loads(call["function"]["arguments"]))
+        for call in final
+    ] == expected
+    assert state.finish(final) == []
+    assert list(received) == list(range(len(expected)))
+    assert len({call["id"] for call in received.values()}) == len(expected)
+    for index, (name, arguments) in enumerate(expected):
+        assert received[index]["name"] == name
+        assert json.loads(received[index]["arguments"]) == arguments
+        assert received[index]["id"] == final[index]["id"]
+
+
+@pytest.mark.parametrize("chunk_size", [1, 7, 31, 8192])
+@pytest.mark.parametrize("no_param_index", [0, 1, 2])
+def test_cohere_parallel_calls_allow_missing_parameters(chunk_size, no_param_index):
+    expected = [
+        ("write_file", {"content": "first"}),
+        ("write_file", {"content": "second"}),
+    ]
+    calls = [{"tool_name": name, "parameters": args} for name, args in expected]
+    calls.insert(no_param_index, {"tool_name": "get_time"})
+    expected.insert(no_param_index, ("get_time", {}))
+    # Compact JSON also exercises raw-prefix recovery after a parameterless call.
+    text = (
+        "<|START_ACTION|>" + json.dumps(calls, separators=(",", ":")) + "<|END_ACTION|>"
+    )
+    _assert_streamed_calls(
+        "cohere2_moe", TOOLS + NO_PARAM_TOOLS, text, chunk_size, expected
+    )
+
+
+@pytest.mark.parametrize("chunk_size", [1, 7, 31, 8192])
+@pytest.mark.parametrize("junk_index", [0, 1, 2])
+@pytest.mark.parametrize(
+    "junk",
+    [
+        "oops",
+        5,
+        None,
+        {"name": "get_time"},
+        {"name": 5, "arguments": {}},
+        {"arguments": {}},
+    ],
+)
+def test_json_arrays_keep_valid_calls_around_junk(chunk_size, junk_index, junk):
+    expected = [
+        ("write_file", {"path": "first.txt"}),
+        ("write_file", {"path": "second.txt"}),
+    ]
+    calls = [{"name": name, "arguments": args} for name, args in expected]
+    calls.insert(junk_index, junk)
+    text = "<tool_call>" + json.dumps(calls, separators=(",", ":")) + "</tool_call>"
+    # A following block must retain its own index after filtering the array.
+    text += '<tool_call>{"name":"get_time","arguments":{}}</tool_call>'
+    expected.append(("get_time", {}))
+    _assert_streamed_calls(
+        "json_tools", TOOLS + NO_PARAM_TOOLS, text, chunk_size, expected
+    )
 
 
 @pytest.mark.parametrize(
