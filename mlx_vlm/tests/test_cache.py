@@ -2612,6 +2612,8 @@ def test_consumed_exact_merge_preserves_retained_apc_snapshots(managers):
 
 @parametrize("kind", ["qsa", "deepseek", "composite", "ring-indexed"])
 def test_disk_custom_state(kind, managers, monkeypatch):
+    # This checks serialization, not the host-dependent disk admission guard.
+    monkeypatch.setenv("APC_DISK_MIN_FREE_RAM_GB", "0")
     monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "1" if kind == "qsa" else "0")
     monkeypatch.setenv("APC_EXACT_MIN_TOKENS", "1")
     if kind == "qsa":
