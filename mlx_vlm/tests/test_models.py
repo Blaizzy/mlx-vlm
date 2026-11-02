@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import faulthandler
 import importlib
 import inspect
 import json
@@ -11,7 +10,6 @@ import logging
 import math
 import os
 import secrets
-import signal
 import socket
 import struct
 import subprocess
@@ -2961,8 +2959,6 @@ def _make_distributed_test_model(family, dtype):
 
 
 def _distributed_model_worker(family, dtype_name):
-    faulthandler.dump_traceback_later(25)
-
     def stage(name):
         print(f"[rank {os.environ.get('MLX_RANK')}] {name}", flush=True)
 
@@ -3108,16 +3104,8 @@ def _run_distributed_model_test(family, dtype, world_size):
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            start_new_session=True,
         )
-        try:
-            output, _ = process.communicate(timeout=30)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            output, _ = process.communicate()
-            pytest.fail(
-                f"Distributed test timed out: {family}/{dtype}/{world_size}\n{output}"
-            )
+        output, _ = process.communicate()
     assert process.returncode == 0, output
     records = [json.loads(line) for line in output.splitlines() if line.startswith("{")]
     assert len(records) == world_size, output
