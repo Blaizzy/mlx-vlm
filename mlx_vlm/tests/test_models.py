@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import faulthandler
 import importlib
 import inspect
 import json
@@ -10,6 +11,7 @@ import logging
 import math
 import os
 import secrets
+import signal
 import socket
 import struct
 import subprocess
@@ -2959,8 +2961,13 @@ def _make_distributed_test_model(family, dtype):
 
 
 def _distributed_model_worker(family, dtype_name):
+    # Report a stalled rank when the CI run is cancelled, without a time limit.
+    faulthandler.register(signal.SIGTERM, chain=True)
+
     def stage(name):
-        print(f"[rank {os.environ.get('MLX_RANK')}] {name}", flush=True)
+        print(
+            f"[rank {os.environ.get('MLX_RANK')}] {name}", file=sys.stderr, flush=True
+        )
 
     stage("initializing ring")
     group = mx.distributed.init(strict=True, backend="ring")
@@ -3102,7 +3109,6 @@ def _run_distributed_model_test(family, dtype, world_size):
                 MLX_TEST_BARRIER_DIR=barrier_dir,
             ),
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
             text=True,
         )
         output, _ = process.communicate()
