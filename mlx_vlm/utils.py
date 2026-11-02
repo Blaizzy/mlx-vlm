@@ -1949,9 +1949,8 @@ def prepare_inputs(
         )
         images = [process_image(img, resize_shape, image_processor) for img in images]
 
-        # For batching, we need uniform image sizes. Instead of padding to the
-        # largest image (which adds white borders that hurt accuracy), we resize
-        # all images to the model's expected input size.
+        # Use a fixed input size only when the processor declares dimensions.
+        # Otherwise pad to the largest image and let the processor size it.
         if len(images) > 1 and pad_to_uniform_size:
             # Get target size from image processor if available
             target_size = None
@@ -1960,7 +1959,9 @@ def prepare_inputs(
                 if isinstance(size, tuple):
                     target_size = size
                 elif isinstance(size, dict):
-                    target_size = (size.get("height", 384), size.get("width", 384))
+                    # Edge and pixel-area bounds are not fixed dimensions.
+                    if "height" in size and "width" in size:
+                        target_size = (size["height"], size["width"])
                 elif isinstance(size, int):
                     target_size = (size, size)
 

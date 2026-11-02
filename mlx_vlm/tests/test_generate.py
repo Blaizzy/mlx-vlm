@@ -196,6 +196,108 @@ def test_batch_generator_apc_media_token_ids_handles_text_only_model(mock_proces
 class TestGenerationBatch:
     """Tests for GenerationBatch class."""
 
+    @pytest.mark.parametrize(
+        "sampling",
+        [
+            None,
+            {},
+            {"top_n_sigma": 1.5},
+            {"p_less": True},
+            {"typical_p": 0.8},
+            {"top_n_sigma": 1.5, "p_less": True, "typical_p": 0.8},
+        ],
+    )
+    def test_extract_preserves_pending_token_and_row_state_across_peer_work(
+        self, sampling
+    ):
+        from mlx_vlm.server.generation import GenerationArguments, ResponseGenerator
+
+        class Model:
+            def __call__(self, inputs, cache, **kwargs):
+                values = inputs[:, None, :, None].astype(mx.float32)
+                keys, _ = cache[0].update_and_fetch(values, values)
+                # Batch-invariant toy logits expose skipped/duplicated tokens.
+                sums = keys.sum(axis=(1, 2, 3))
+                logits = -mx.abs(mx.arange(32)[None, :] - (sums[:, None] % 32))
+                return SimpleNamespace(logits=logits[:, None, :])
+
+        def make_batch():
+            sampler = (
+                ResponseGenerator.__new__(ResponseGenerator)._make_sampler(
+                    GenerationArguments(
+                        temperature=0.7, top_p=0.9, top_k=8, seed=91, **sampling
+                    )
+                )
+                if sampling is not None
+                else lambda x: mx.argmax(x, axis=-1)
+            )
+            rows = []
+            for length in (3, 5):
+                c = KVCache()
+                values = mx.arange(length).reshape(1, 1, length, 1).astype(mx.float32)
+                c.update_and_fetch(values, values)
+                rows.append(c)
+            batch = GenerationBatch(
+                Model(),
+                [7, 8],
+                mx.array([1, 2]),
+                [BatchKVCache.merge(rows)],
+                sampler,
+                lambda token: False,
+                [100, 100],
+            )
+            batch._num_tokens = [3, 9]
+            batch._rope_deltas = mx.array([[2], [4]])
+            return batch
+
+        baseline, interrupted = make_batch(), make_batch()
+        mx.random.seed(91)
+        baseline.next()
+        expected = [baseline.next()[0].token for _ in range(8)]
+        mx.random.seed(91)
+        interrupted.next()
+        saved = interrupted.extract(7)
+        assert interrupted.uids == [8] and saved.uids == [7]
+        assert saved._num_tokens == [4]
+        assert saved._rope_deltas.tolist() == [[2]]
+        pending = saved._next_tokens.item()
+        frozen = np.array(saved.prompt_cache[0].state[0])
+        for _ in range(5):
+            interrupted.next()
+        np.testing.assert_array_equal(saved.prompt_cache[0].state[0], frozen)
+        interrupted.extend(saved)
+        assert interrupted.uids == [8, 7]
+        actual = [
+            next(r.token for r in interrupted.next() if r.uid == 7) for _ in range(8)
+        ]
+        assert actual[0] == pending
+        assert interrupted._num_tokens[interrupted.uids.index(7)] == 12
+        # Main's special-filter samplers share RNG with peer requests; only
+        # greedy and positioned samplers promise draw isolation here.
+        if sampling is None or hasattr(interrupted.sampler, "sample_target"):
+            assert actual == expected
+
+    def test_extract_keeps_per_request_processors_and_budget(self):
+        processor, thinking = object(), object()
+        batch = self._mrope_batch([3, 4], [[2], [5]])
+        batch._next_tokens = mx.array([11, 12])
+        batch.logits_processors = [[processor], None]
+        batch.token_context = [[2, 7], [8, 9]]
+        batch.thinking_budget_criteria = [thinking, None]
+        saved = batch.extract(3)
+        assert saved.logits_processors == [[processor]]
+        assert saved.token_context == [[2, 7]]
+        assert saved.thinking_budget_criteria == [thinking]
+        assert batch.logits_processors == [None]
+        assert batch.thinking_budget_criteria == [None]
+
+    def test_extract_rejects_cache_without_row_extraction(self):
+        batch = self._mrope_batch([3, 4], [[2], [5]])
+        batch.prompt_cache = [SimpleNamespace(state=[], filter=lambda _: None)]
+        with pytest.raises(ValueError, match="cache snapshots"):
+            batch.extract(3)
+        assert batch.uids == [3, 4]
+
     def test_filter(self):
         mock_model = MagicMock()
         sampler = lambda x: mx.argmax(x, axis=-1)
@@ -240,6 +342,7 @@ class TestGenerationBatch:
         b._rope_deltas = None
         with pytest.raises(RuntimeError, match="MRoPE"):
             a.extend(b)
+        assert a.uids == [0]
 
     def test_extend_into_empty_accumulator_absorbs_mrope_state(self):
         empty = GenerationBatch.empty(
@@ -421,6 +524,69 @@ def _generation_batch(model, inputs=(5, 6), uids=None, **options):
 class TestBatchGenerator:
     """Tests for BatchGenerator class."""
 
+    def test_suspend_queued_prompt_readmits_same_request(
+        self, mock_model, mock_processor
+    ):
+        gen = BatchGenerator(model=mock_model.language_model, processor=mock_processor)
+        (uid,) = gen.insert([[1, 4, 7]], resumable=True)
+        saved = gen.suspend(uid)
+        assert not gen.has_work
+        gen.resume(saved)
+        assert gen.unprocessed_prompts[0][0:2] == (uid, [1, 4, 7])
+        gen.remove(uid)
+        assert not gen._resume_inputs
+
+    def test_suspend_during_prefill_keeps_peer_and_restarts_original_prompt(
+        self, mock_model, mock_processor
+    ):
+        with contextlib.closing(
+            BatchGenerator(
+                mock_model.language_model,
+                mock_processor,
+                prefill_batch_size=2,
+                prefill_step_size=3,
+                max_tokens=2,
+            )
+        ) as gen:
+            prompts = [list(range(3, 16)), list(range(4, 12))]
+            uids = gen.insert(
+                prompts,
+                prompt_kwargs=[
+                    {"inputs_embeds": mx.zeros((1, len(ids), 4))} for ids in prompts
+                ],
+                resumable=True,
+            )
+            gen.next()
+            saved = gen.suspend(uids[0])
+            assert gen._prompt_batch.uids == [uids[1]]
+            peer_tokens = []
+            while gen.has_work:
+                _, tokens = gen.next()
+                peer_tokens.extend(tokens)
+            assert peer_tokens and all(t.uid == uids[1] for t in peer_tokens)
+            gen.resume(saved)
+            assert gen.unprocessed_prompts[0][:2] == (uids[0], prompts[0])
+            resumed = []
+            while gen.has_work:
+                progress, tokens = gen.next()
+                if progress:
+                    assert not gen._resume_inputs
+                resumed.extend(tokens)
+            assert len(resumed) == 2 and all(t.uid == uids[0] for t in resumed)
+
+    def test_discard_speculative_checkpoint_closes_iterator(self):
+        batch = SpeculativeGenerationBatch.__new__(SpeculativeGenerationBatch)
+        batch.can_extend = False
+        batch.uids = batch._all_uids = [7]
+        batch._finished = [False]
+        iterator = batch._rounds_iter = MagicMock()
+        batch.prompt_cache = [object()]
+        batch.hidden = batch.shared_kv_states = batch.prompt_tokens = object()
+        BatchGenerator.discard(batch)
+        iterator.close.assert_called_once_with()
+        assert not batch.prompt_cache and not batch.uids
+        assert batch.hidden is batch.shared_kv_states is batch.prompt_tokens is None
+
     def test_insert_with_max_tokens(self, mock_model, mock_processor):
         gen = BatchGenerator(
             model=mock_model.language_model, processor=mock_processor, max_tokens=50
@@ -472,7 +638,7 @@ class TestBatchGenerator:
         )
         prompt_tokens = 5
         gen._prompt_batch = SimpleNamespace(
-            needs_processing=lambda: True, prompt_step=lambda: 2
+            needs_processing=lambda: True, prompt_step=lambda: 2, prefill_step_size=2
         )
         gen._prompt_tokens_counter = prompt_tokens
 
@@ -1579,6 +1745,7 @@ def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
         captured.update(kwargs)
         return SimpleNamespace(
             total_prompt_tokens=sum(len(ids) for ids in kwargs["input_ids"]),
+            prefill_step_size=kwargs["prefill_step_size"],
             needs_processing=lambda: True,
             prompt_step=lambda: 0,
         )
@@ -2054,6 +2221,14 @@ def test_sampling_validation_does_not_corrupt_compile(name, bad, valid):
     tokens = sampling.make_sampler(temp=1.0, **{name: valid})(logits)
     mx.eval(tokens)
     assert tokens.shape == (1,)
+
+
+def test_top_k_equal_to_vocab_size_keeps_all_tokens():
+    logprobs = mx.log(mx.array([[0.1, 0.2, 0.3, 0.4]]))
+    filtered = sampling.apply_top_k(logprobs, 4)
+    assert mx.array_equal(filtered, logprobs).item()
+    with pytest.raises(ValueError):
+        sampling.apply_top_k(logprobs, 5)
 
 
 @pytest.mark.parametrize(
@@ -2550,3 +2725,178 @@ def test_generate_audio_prepares_inputs_once_and_saves_wav(monkeypatch, tmp_path
         )
     with pytest.raises(ValueError, match="does not support audio generation"):
         audio_module.generate_audio(SimpleNamespace(), processor, "prompt")
+
+
+@pytest.mark.parametrize("cold", [False, True])
+def test_apc_admission_separates_long_suffix_and_keeps_fifo_priority(cold):
+    bg = object.__new__(BatchGenerator)
+    bg._wire_stack = None
+    bg.prefill_step_size = 2048
+    bg.apc = SimpleNamespace(prepare_prefill=lambda *a, **kw: True)
+    bg.apc_manager = MagicMock()
+    sequences = [(i, list(range(32768)), 4, {}, [], None) for i in range(8)]
+
+    def pick(s, **kw):
+        if s[0] == 7 and cold:
+            return None
+        return dict(prefix_len=32767 if s[0] != 7 else 16000, matched_blocks=[])
+
+    bg._apc_pick_for = pick
+    admitted, picks = bg._admit_prefill(sequences)
+    assert [s[0] for s in admitted] == list(range(7))
+    assert all(p["prefix_len"] == 32767 for p in picks)
+    # A new warm arrival cannot continually displace the older long suffix.
+    admitted, _ = bg._admit_prefill([sequences[7], sequences[0]])
+    assert [s[0] for s in admitted] == [7]
+
+
+def test_apc_admission_shrinks_batch_and_releases_excluded_leases():
+    bg = object.__new__(BatchGenerator)
+    bg._wire_stack = None
+    bg.prefill_step_size = 2048
+    bg.apc = SimpleNamespace(
+        prepare_prefill=lambda lengths, **kw: isinstance(lengths, int)
+        or len(lengths) <= 2
+    )
+    bg.apc_manager = MagicMock()
+    bg._apc_pick_for = lambda s, **kw: dict(prefix_len=31, matched_blocks=[s[0]])
+    sequences = [(i, list(range(32)), 4, {}, [], None) for i in range(4)]
+    admitted, picks = bg._admit_prefill(sequences)
+    assert [s[0] for s in admitted] == [0, 1]
+    assert [c.args[0] for c in bg.apc_manager.release.call_args_list] == [[3], [2]]
+    assert [p["matched_blocks"] for p in picks] == [[0], [1]]
+
+
+def test_apc_refused_restore_stays_queued_while_peer_decodes(
+    mock_model, mock_processor
+):
+    with patch.object(ar_module, "wired_limit", return_value=contextlib.nullcontext()):
+        gen = BatchGenerator(mock_model, mock_processor, completion_batch_size=2)
+    gen.apc = SimpleNamespace(prepare_prefill=lambda *a, **kw: True)
+    gen.apc_manager = MagicMock()
+    gen._apc_pick_for = MagicMock(side_effect=apc_module.APCAdmissionError())
+    uid = gen.insert([[1, 2, 3]])[0]
+    gen._generation_batch = MagicMock()
+    gen._generation_batch.__len__.return_value = 1
+    gen._generation_batch.uids = [99]
+    gen._generation_batch.prompt_cache = []
+    gen._generation_batch.is_speculative = False
+    gen._generation_batch.logits_processors = []
+    gen._generation_batch.next.return_value = [SimpleNamespace(uid=99)]
+    for _ in range(3):
+        _, responses = gen._next()
+        assert [r.uid for r in responses] == [99]
+        assert gen.unprocessed_prompts[0][0] == uid
+        assert gen._prompt_batch is None
+    assert gen._apc_pick_for.call_count == 1
+    gen._generation_batch.__len__.return_value = 0
+    gen._generation_batch.uids = []
+    with pytest.raises(apc_module.APCAdmissionError) as error:
+        gen._next()
+    assert error.value.uid == uid
+
+
+@pytest.mark.parametrize("family", ["z1t", "unlimited_ocr"])
+def test_apc_native_checkpoint_reuses_repeated_request(
+    family, mock_processor, monkeypatch
+):
+    monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "4")
+    mx.random.seed(1234)
+    if family == "z1t":
+        from mlx_vlm.models.z1t import Model, ModelConfig
+
+        model = Model(
+            ModelConfig(
+                vocab_size=32,
+                hidden_size=8,
+                num_hidden_layers=2,
+                aft_heads=2,
+                aft_ksize=4,
+            )
+        ).language_model
+    else:
+        from mlx_vlm.models.unlimited_ocr.config import TextConfig
+        from mlx_vlm.models.unlimited_ocr.language import LanguageModel
+
+        model = LanguageModel(
+            TextConfig(
+                vocab_size=32,
+                hidden_size=8,
+                intermediate_size=16,
+                num_hidden_layers=2,
+                num_attention_heads=2,
+                num_key_value_heads=2,
+                n_routed_experts=None,
+                n_shared_experts=None,
+                sliding_window_size=2,
+                sliding_window=2,
+            )
+        )
+    model.eval()
+    tokens = list(range(1, 21))
+    embeds = model.model.embed_tokens(mx.array([tokens]))
+    mock_processor.tokenizer.stopping_criteria.eos_token_ids = []
+    manager = apc_module.APCManager(num_blocks=16, block_size=8, disk=None)
+    results = []
+    try:
+        for enabled in (False, True):
+            engine = BatchGenerator(
+                model,
+                mock_processor,
+                max_tokens=6,
+                completion_batch_size=1,
+                prefill_batch_size=1,
+                prefill_step_size=8,
+                apc_manager=manager if enabled else None,
+                manage_wired_limit=False,
+            )
+            try:
+                for _ in range(2 if enabled else 1):
+                    if family == "unlimited_ocr":
+                        # The production embedding path provides the full
+                        # prompt boundary before any prefill chunks run.
+                        model._prompt_ids = mx.array(tokens)
+                    engine.insert([tokens], prompt_kwargs=[{"inputs_embeds": embeds}])
+                    output = []
+                    for _ in range(20):
+                        _, generated = engine.next()
+                        output.extend(r.token for r in generated)
+                        if len(output) == 6:
+                            break
+                    assert len(output) == 6
+                    results.append(output)
+            finally:
+                engine.close()
+        assert results[0] == results[1] == results[2]
+        assert manager.stats.exact_hits == 1
+        assert manager.stats.restored_tokens == len(tokens) - 1
+        assert manager.stats.memory_skips == 0
+    finally:
+        manager.close()
+
+
+def test_prefill_chunk_bounds_work_with_decoding_peers():
+    gen = object.__new__(BatchGenerator)
+    gen._wire_stack = None
+    gen.prefill_step_size = 2048
+    gen._generation_batch = [99]
+    gen._prompt_batch = SimpleNamespace(
+        uids=[0, 1], prefill_step_size=2048, prompt_step=lambda: 1
+    )
+    gen._step_prompt_batch()
+    assert gen._prompt_batch.prefill_step_size == 128
+    gen._generation_batch = []
+    gen._step_prompt_batch()
+    assert gen._prompt_batch.prefill_step_size == 2048
+
+
+def test_prefill_chunk_limit_respects_model_disabling_chunking():
+    gen = object.__new__(BatchGenerator)
+    gen._wire_stack = None
+    gen.prefill_step_size = 2048
+    gen._generation_batch = [99]
+    gen._prompt_batch = SimpleNamespace(
+        uids=[0], prefill_step_size=None, prompt_step=lambda: 1
+    )
+    assert gen._step_prompt_batch() == 1
+    assert gen._prompt_batch.prefill_step_size is None

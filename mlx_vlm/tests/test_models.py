@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import copy
+import faulthandler
 import importlib
 import inspect
 import json
 import logging
 import math
 import os
+import secrets
 import signal
 import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import textwrap
+import time
 import unittest
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict
@@ -2111,6 +2115,77 @@ def test_flint_checkpoint_strict_loading_and_roundtrip(
     )
 
 
+@pytest.mark.parametrize("prefixed", [False, True])
+@pytest.mark.parametrize("byte_storage", [False, True])
+def test_flint_mixed_bit_export_loading(flint_model, tmp_path, prefixed, byte_storage):
+    model = flint_model
+
+    def predicate(path, module):
+        if not hasattr(module, "to_quantized") or path.endswith("mlp.gate"):
+            return False
+        if path.endswith("embed_tokens"):
+            return {"group_size": 32, "bits": 8}
+        return True
+
+    nn.quantize(model, group_size=32, bits=4, class_predicate=predicate)
+    expected = dict(tree_flatten(model.parameters()))
+    checkpoint = {}
+    for key, value in expected.items():
+        if not prefixed:
+            key = key.removeprefix("language_model.")
+        if byte_storage and value.dtype == mx.uint32:
+            value = mx.array(np.array(value).view(np.uint8).copy())
+        checkpoint[key] = value
+
+    first = model.sanitize(dict(checkpoint))
+    second = model.sanitize(dict(first))
+    assert first.keys() == second.keys() == expected.keys()
+    for key, value in expected.items():
+        for sanitized in (first[key], second[key]):
+            assert sanitized.dtype == value.dtype, key
+            np.testing.assert_array_equal(np.array(sanitized), np.array(value))
+
+    config = model.config.to_dict()
+    config["quantization"] = {"group_size": 32, "bits": 4}
+    config["mlx_export"] = {"bits": 4, "embedding_bits": 8}
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config))
+    original_config = config_path.read_bytes()
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), checkpoint)
+
+    reloaded = load_model(tmp_path)
+    assert reloaded.language_model.model.embed_tokens.bits == 8
+    assert reloaded.language_model.layers[0].self_attn.q_proj.bits == 4
+    assert config_path.read_bytes() == original_config
+    ids = mx.array([[1, 2, 3, 4, 5]])
+    np.testing.assert_array_equal(
+        np.array(reloaded(ids).logits), np.array(model(ids).logits)
+    )
+
+
+@pytest.mark.parametrize(
+    "path", ["model.embed_tokens", "language_model.model.embed_tokens"]
+)
+def test_flint_export_metadata_preserves_explicit_embedding_quantization(path):
+    from mlx_vlm.models.flint import Model, ModelConfig
+    from mlx_vlm.utils import _quantization_for_module_path
+
+    override = {"group_size": 32, "bits": 4}
+    quantization = {"group_size": 64, "bits": 4, path: override}
+    config = ModelConfig.from_dict(
+        {
+            **model_case("flint")["config"],
+            "quantization": quantization,
+            "mlx_export": {"embedding_bits": 8},
+        }
+    )
+    effective = _quantization_for_module_path(
+        config.quantization, "language_model.model.embed_tokens", Model(config)
+    )
+    assert effective == override
+    assert quantization == {"group_size": 64, "bits": 4, path: override}
+
+
 @pytest.fixture
 def nemotron_case(request):
     case = model_case(getattr(request, "param", "nemotron_super_vl"))
@@ -2304,6 +2379,57 @@ def test_lfm2_colbert_sanitize_and_loader(tmp_path, monkeypatch):
     embedding_loader.load_embedding_model(tmp_path)
     assert captured["model_remapping"]["lfm2"] == "lfm2_colbert"
     assert captured["config_overrides"]["embedding_dim"] == 128
+
+
+class TestLfm2ColbertCheckpoint:
+    @pytest.mark.parametrize("bits", [None, 4, 8])
+    @pytest.mark.parametrize("layout", ["native", "huggingface"])
+    def test_roundtrip(self, tmp_path, bits, layout):
+        case = next(case for case in DATA["cases"] if case["module"] == "lfm2_colbert")
+        module = importlib.import_module("mlx_vlm.models.lfm2_colbert")
+        config = {
+            **case["config"],
+            "vocab_size": 64,
+            "hidden_size": 64,
+            "block_dim": 64,
+            "block_ff_dim": 128,
+            "embedding_dim": 32,
+        }
+        mx.random.seed(19)
+        model = module.Model(build_config(module, config))
+        if bits is not None:
+            nn.quantize(model, group_size=32, bits=bits)
+            config["quantization"] = dict(group_size=32, bits=bits)
+        weights = dict(tree_flatten(model.parameters()))
+        if layout == "huggingface":
+            original = {}
+            for key, value in weights.items():
+                if key.startswith("projection."):
+                    key = "1_Dense.linear." + key[len("projection.") :]
+                elif key.startswith("model."):
+                    key = key[len("model.") :]
+                if "conv.weight" in key:
+                    value = value.transpose(0, 2, 1)
+                original[key] = value
+        else:
+            original = weights
+        sanitized = model.sanitize(original)
+        twice = model.sanitize(sanitized)
+        assert weights.keys() == sanitized.keys() == twice.keys()
+        for key in weights:
+            np.testing.assert_array_equal(sanitized[key], weights[key])
+            np.testing.assert_array_equal(twice[key], weights[key])
+        mx.save_safetensors(str(tmp_path / "model.safetensors"), sanitized)
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        loaded = embedding_loader.load_embedding_model(tmp_path)
+        ids = mx.array([[1, 2, 3, 0], [4, 5, 6, 7]])
+        mask = mx.array([[1, 1, 1, 0], [1, 1, 1, 1]])
+        expected = model(ids, attention_mask=mask)
+        actual = loaded(ids, attention_mask=mask)
+        np.testing.assert_array_equal(actual.text_embeds, expected.text_embeds)
+        np.testing.assert_array_equal(
+            actual.last_hidden_state, expected.last_hidden_state
+        )
 
 
 @pytest.fixture
@@ -2835,20 +2961,51 @@ def _make_distributed_test_model(family, dtype):
 
 
 def _distributed_model_worker(family, dtype_name):
+    # Report a stalled rank when the CI run is cancelled, without a time limit.
+    faulthandler.register(signal.SIGTERM, chain=True)
+
+    def stage(name):
+        print(
+            f"[rank {os.environ.get('MLX_RANK')}] {name}", file=sys.stderr, flush=True
+        )
+
+    stage("initializing ring")
     group = mx.distributed.init(strict=True, backend="ring")
+    barrier_dir = Path(os.environ["MLX_TEST_BARRIER_DIR"])
+
+    def host_barrier(name):
+        # All test ranks share this directory. Waiting here must not enqueue
+        # MLX work: even a CPU collective can stall a peer's shared-GPU work.
+        (barrier_dir / f"{name}-{group.rank()}").touch()
+        while any(
+            not (barrier_dir / f"{name}-{rank}").exists()
+            for rank in range(group.size())
+        ):
+            time.sleep(0.001)
+
     options = TINY_MODELS[family]["distributed"]
     dtype = getattr(mx, dtype_name)
-    mx.random.seed(19)
-    reference = _make_distributed_test_model(family, dtype)
-    mx.eval(reference.parameters())
-    weights = dict(tree_flatten(reference.parameters()))
-    sharded = _make_distributed_test_model(family, dtype)
-    sharded.load_weights(list(weights.items()), strict=True)
-    sharded.shard(group)
-    if error := options.get("reshard_error"):
-        with pytest.raises(ValueError, match=error):
+    # These local ranks share one GPU. Initialize them in order so weight
+    # evaluation/compilation does not race another rank's first GPU work.
+    # The distributed forward passes below still run concurrently.
+    for rank in range(group.size()):
+        if group.rank() == rank:
+            stage("building models")
+            mx.random.seed(19)
+            reference = _make_distributed_test_model(family, dtype)
+            stage("evaluating reference weights")
+            mx.eval(reference.parameters())
+            weights = dict(tree_flatten(reference.parameters()))
+            sharded = _make_distributed_test_model(family, dtype)
+            sharded.load_weights(list(weights.items()), strict=True)
             sharded.shard(group)
-    mx.eval(sharded.parameters())
+            if error := options.get("reshard_error"):
+                with pytest.raises(ValueError, match=error):
+                    sharded.shard(group)
+            stage("evaluating sharded weights")
+            mx.eval(sharded.parameters())
+            stage("models ready")
+        host_barrier(f"models-ready-{rank}")
     local_weights = dict(tree_flatten(sharded.parameters()))
     for pattern in options["sharded_weights"]:
         names = [name for name in weights if fnmatchcase(name, pattern)]
@@ -2867,17 +3024,19 @@ def _distributed_model_worker(family, dtype_name):
         for step, tokens in enumerate(
             ([1, 7, 9, 3, 11, 15, 2, 6, 8, 10, 12, 14], [13], [17], [19], [2, 4, 6])
         ):
+            stage(f"batch={batch} step={step} reference")
             ids = mx.array(
                 [[(t + row) % vocab_size for t in tokens] for row in range(batch)]
             )
             expected = reference(ids, cache=expected_cache).logits
             mx.eval(expected)
-            # Finish independent reference work on every rank before queuing
-            # distributed work on the shared GPU. Keep test-only collectives
-            # on the CPU so a faster rank cannot block another rank's GPU work.
-            mx.distributed.all_sum(mx.array(0), group=group, stream=mx.cpu).item()
+            stage(f"batch={batch} step={step} barrier")
+            host_barrier(f"reference-{batch}-{step}")
+            stage(f"batch={batch} step={step} sharded")
             actual = sharded(ids, cache=actual_cache).logits
             mx.eval(actual)
+            host_barrier(f"actual-{batch}-{step}")
+            stage(f"batch={batch} step={step} gather")
             gathered = mx.distributed.all_gather(actual, group=group, stream=mx.cpu)
             mx.eval(gathered)
             ranks_agree = all(
@@ -2897,6 +3056,7 @@ def _distributed_model_worker(family, dtype_name):
                     ).item(),
                 )
             )
+    host_barrier("checks")
     passed = mx.distributed.all_sum(
         mx.array(int(all(r["passed"] and r["ranks_agree"] for r in records))),
         group=group,
@@ -2907,21 +3067,20 @@ def _distributed_model_worker(family, dtype_name):
         flush=True,
     )
     assert passed == group.size(), records
+    stage("completed")
 
 
 def _run_distributed_model_test(family, dtype, world_size):
     repo = Path(__file__).resolve().parents[2]
-    # The ring launcher needs one consecutive port per rank. Probe the entire
-    # range while holding the sockets so a four-rank case cannot reuse a port.
+    # Select a whole block outside the ephemeral range. Binding only the first
+    # port to zero leaves the allocator free to hand the remaining ports to a
+    # concurrent launch or an outgoing ring connection.
     for _ in range(100):
         with ExitStack() as stack:
             sockets = [stack.enter_context(socket.socket()) for _ in range(world_size)]
-            sockets[0].bind(("127.0.0.1", 0))
-            port = sockets[0].getsockname()[1]
-            if port + world_size > 65536:
-                continue
+            port = 10000 + world_size * secrets.randbelow((30000 - 10000) // world_size)
             try:
-                for rank, sock in enumerate(sockets[1:], 1):
+                for rank, sock in enumerate(sockets):
                     sock.bind(("127.0.0.1", port + rank))
             except OSError:
                 continue
@@ -2948,23 +3107,19 @@ def _run_distributed_model_test(family, dtype, world_size):
         family,
         dtype,
     ]
-    process = subprocess.Popen(
-        command,
-        cwd=repo,
-        env=dict(os.environ, PYTHONPATH=str(repo)),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        start_new_session=True,
-    )
-    try:
-        output, _ = process.communicate(timeout=180)
-    except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
-        output, _ = process.communicate()
-        pytest.fail(
-            f"Distributed test timed out: {family}/{dtype}/{world_size}\n{output}"
+    with tempfile.TemporaryDirectory(prefix="mlx-vlm-distributed-") as barrier_dir:
+        process = subprocess.Popen(
+            command,
+            cwd=repo,
+            env=dict(
+                os.environ,
+                PYTHONPATH=str(repo),
+                MLX_TEST_BARRIER_DIR=barrier_dir,
+            ),
+            stdout=subprocess.PIPE,
+            text=True,
         )
+        output, _ = process.communicate()
     assert process.returncode == 0, output
     records = [json.loads(line) for line in output.splitlines() if line.startswith("{")]
     assert len(records) == world_size, output
@@ -5105,6 +5260,103 @@ class TestUnlimitedOCR2Dash:
     def prompt(self):
         page = [self.PAGE] + [self.IMAGE] * 6
         return [1, 2, 3] + page * 3 + [4, 5, 6, 2, 3]
+
+    @pytest.mark.parametrize("disk", [False, True])
+    def test_apc_reuses_dash_checkpoint_during_generation(
+        self, tmp_path, disk, monkeypatch
+    ):
+        from mlx_vlm.apc import APCManager, DiskBlockStore
+        from mlx_vlm.generate.ar import BatchGenerator
+        from mlx_vlm.utils import StoppingCriteria
+
+        model = self.language_model()
+        ids = self.prompt()
+        processor = NS(stopping_criteria=StoppingCriteria([]))
+        manager = APCManager(
+            num_blocks=16,
+            block_size=8,
+            disk=DiskBlockStore(tmp_path, namespace="dash") if disk else None,
+            overrides={"memory_max_gb": 1 / 1024, "memory_reserve_gb": 0},
+        )
+        # Exercise checkpoint reuse within 1 MiB, independently of other CI
+        # workers' RAM use. Memory-pressure admission is covered in test_cache.
+        monkeypatch.setattr(manager, "_memory_headroom", lambda: 1 << 20)
+        monkeypatch.setattr(manager, "_disk_min_free_ram_bytes", 0)
+        if disk:
+            manager._exact_cache_max = 0
+
+        def generate(tokens, apc):
+            # Production supplies the full prompt for page bookkeeping before
+            # prefill; the cached prefix may precede a new, longer text suffix.
+            model._prompt_ids = mx.array([tokens])
+            embeds = model.model.embed_tokens(mx.array([tokens]))
+            runner = BatchGenerator(
+                model,
+                processor,
+                max_tokens=6,
+                prefill_batch_size=1,
+                completion_batch_size=1,
+                prefill_step_size=8,
+                apc_manager=apc,
+                manage_wired_limit=False,
+            )
+            try:
+                assert (runner.apc is not None) == (apc is not None)
+                # Same document/media identity; text tokens are hashed separately.
+                runner.insert(
+                    [tokens],
+                    prompt_kwargs=[
+                        {
+                            "inputs_embeds": embeds,
+                            "_apc_semantic_hash": 42,
+                        }
+                    ],
+                )
+                output = []
+                for _ in range(40):
+                    _, results = runner.next()
+                    output.extend(result.token for result in results)
+                    if len(output) == 6:
+                        break
+                assert len(output) == 6
+                return output
+            finally:
+                runner.close()
+
+        try:
+            expected = generate(ids, None)
+            assert generate(ids, manager) == expected
+            assert generate(ids, manager) == expected
+            assert manager.stats.restored_tokens == len(ids) - 1
+            extended = ids + [2, 3, 4]
+            assert generate(extended, manager) == generate(extended, None)
+            assert manager.stats.restored_tokens >= 2 * (len(ids) - 1)
+            if disk:
+                assert manager.stats.disk_hits >= 2
+        finally:
+            manager.close()
+
+    @pytest.mark.parametrize("bits", [None, 4])
+    def test_dash_snapshot_continues_decode(self, bits):
+        from mlx_vlm.apc import snapshot_prompt_cache_row
+
+        model = self.language_model(hidden_size=64 if bits else 16)
+        ids = mx.array([self.prompt()])
+        model._prompt_ids = ids
+        cache = model.make_cache()
+        model(ids, cache=cache)
+        if bits:
+            cache = [c.to_quantized(group_size=32, bits=bits) for c in cache]
+        # Stop after crossing a page marker and during an incomplete block.
+        for token in (self.PAGE, 4, 5):
+            mx.eval(model(mx.array([[token]]), cache=cache).logits)
+        restored = snapshot_prompt_cache_row(cache)
+        assert all(a is not b for a, b in zip(cache, restored))
+        for token in (6, self.PAGE, 3, 2):
+            expected = model(mx.array([[token]]), cache=cache).logits
+            actual = model(mx.array([[token]]), cache=restored).logits
+            assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5).item()
+        assert all(c.dash_state is restored[0].dash_state for c in restored)
 
     @pytest.mark.parametrize("bits", [None, 4, 8])
     @pytest.mark.parametrize("heads", [2, 4])
