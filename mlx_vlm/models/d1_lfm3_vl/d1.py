@@ -24,6 +24,7 @@ from .pointer import SPAN_CAPS, position_logits, spans, state_positions
 from .prompt import (
     DEFAULT_STATE_STYLE,
     DEFAULT_SYSTEM,
+    QUESTION_TYPES,
     Box,
     Boxes,
     Choice,
@@ -261,9 +262,43 @@ class SystemOne(SystemOneApi):
         }
 
 
+def decision_question(question):
+    """A question of the shared decision API as `system_one` reads it: `bool` is a
+    noul, and a choice's list of labels names options without descriptions."""
+    kind, criteria = question.get("type"), question.get("criteria")
+    if kind == "bool":
+        return {**question, "type": "noul"}
+    if kind == "choice" and isinstance(criteria, list):
+        return {**question, "criteria": dict.fromkeys(criteria)}
+    return question
+
+
+def decision_answer(answer):
+    """A `system_one` answer in the shared decision API's fields. Multiple choice
+    and the typed answers have no shared fields and stay as they are."""
+    kind = answer["type"]
+    if kind == "noul":
+        probability = round(answer["noul"], 4)
+        return {"type": "bool", "value": probability >= 0.5, "probability": probability}
+    if kind not in ("choice", "score") or "choices" in answer:
+        return answer
+    metadata = {"confidence": round(answer["confidence"], 4)}
+    if kind == "score":
+        metadata["legend"] = answer["legend"]
+    return {
+        "type": kind,
+        "value": answer[kind] if kind == "choice" else round(answer[kind], 4),
+        "probabilities": {k: round(p, 4) for k, p in answer["probabilities"].items()},
+        "metadata": metadata,
+    }
+
+
 class D1:
     """What a d1 checkpoint adds to its LFM3 backbone: `system_one` over set
     attention, and no text generation."""
+
+    decision_types = (*QUESTION_TYPES, "bool")
+    decision_media = ("images",)
 
     def __call__(self, *args, **kwargs):
         raise ValueError(REFUSAL)
@@ -307,6 +342,33 @@ class D1:
     def system_one_batch(self, requests, score_readout=SCORE_READOUT, set_size=None):
         """`(state, questions)` or `(state, questions, media)` requests, one response each."""
         return self.engine.system_one_batch(requests, score_readout, set_size=set_size)
+
+    def predict(self, processor, state, questions, images=None, audio=None):
+        """`system_one` behind the shared decision API (`mlx_vlm.predict`,
+        `/v1/decisions`), with a score's value the expected level as in d1-3B."""
+        from ...utils import load_audio, load_image
+
+        media = [load_image(image) for image in images or ()]
+        if audio is not None:
+            # the Reader resamples to the checkpoint's rate if it is another
+            media.append(
+                {
+                    "type": "audio",
+                    "audio": load_audio(audio, 16000),
+                    "sampling_rate": 16000,
+                }
+            )
+        result = self.system_one(
+            state,
+            {name: decision_question(q) for name, q in questions.items()},
+            media or None,
+            score_readout="mean",
+        )
+        return {
+            "model": str(getattr(self, "model_path", "d1")),
+            "answers": {n: decision_answer(a) for n, a in result["answers"].items()},
+            "usage": result["usage"],
+        }
 
     def d1_features(self, part):
         """One media item's encoder features and the placeholder token they fill."""
