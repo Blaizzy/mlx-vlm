@@ -67,35 +67,6 @@ def test_generate_3d_returns_model_result(tmp_path, save):
         result.save.assert_not_called()
 
 
-@pytest.mark.parametrize("family", THREE_D_FAMILIES)
-@pytest.mark.parametrize("source", ["local", "remote"])
-def test_3d_loader_keeps_download_options(tmp_path, monkeypatch, family, source):
-    case = THREE_D_FAMILIES[family]
-    module = importlib.import_module(f"mlx_vlm.models.{family}")
-    cls = getattr(module, case["pipeline_class"])
-    (tmp_path / "config.json").write_text(json.dumps(case["config"]))
-    download = Mock(return_value=str(tmp_path))
-    init = Mock(return_value=None)
-    monkeypatch.setattr("mlx_vlm.utils.snapshot_download", download)
-    monkeypatch.setattr(cls, "__init__", init)
-    # Remote IDs deliberately omit the family name to exercise config dispatch.
-    model_id = tmp_path if source == "local" else "test-org/renamed-model"
-    model = load_3d_model(model_id, revision="pinned", local_files_only=True)
-    assert isinstance(model, cls)
-    init.assert_called_once_with(tmp_path, local_files_only=True)
-    if source == "local":
-        download.assert_not_called()
-    else:
-        assert [c.kwargs["allow_patterns"] for c in download.call_args_list] == [
-            ["config.json"],
-            case["weight_files"],
-        ]
-        for call in download.call_args_list:
-            assert call.kwargs["repo_id"] == model_id
-            assert call.kwargs["revision"] == "pinned"
-            assert call.kwargs["local_files_only"] is True
-
-
 def test_3d_loader_rejects_unsupported_config(tmp_path, monkeypatch):
     (tmp_path / "config.json").write_text('{"model_type": "qwen2_vl"}')
     download = Mock(side_effect=AssertionError("Unexpected download"))

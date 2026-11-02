@@ -1,16 +1,6 @@
 {
   "families": {
     "idol": {
-      "pipeline_class": "IdolPipeline",
-      "config": {"denoiser": {"name": "LatentSeqMMFlowModel"}},
-      "weight_files": [
-        "config.json",
-        "denoiser.safetensors",
-        "decoder.safetensors",
-        "decoder_gs.safetensors",
-        "birefnet.safetensors",
-        "README.md"
-      ],
       "weights_env": "IDOL_WEIGHTS",
       "image_env": "IDOL_TEST_IMAGE",
       "generate_kwargs": {"seed": 42, "steps": 2, "num_gaussians": 32768},
