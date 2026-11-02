@@ -2983,21 +2983,29 @@ def _distributed_model_worker(family, dtype_name):
         ):
             time.sleep(0.001)
 
-    stage("building models")
     options = TINY_MODELS[family]["distributed"]
     dtype = getattr(mx, dtype_name)
-    mx.random.seed(19)
-    reference = _make_distributed_test_model(family, dtype)
-    mx.eval(reference.parameters())
-    weights = dict(tree_flatten(reference.parameters()))
-    sharded = _make_distributed_test_model(family, dtype)
-    sharded.load_weights(list(weights.items()), strict=True)
-    sharded.shard(group)
-    if error := options.get("reshard_error"):
-        with pytest.raises(ValueError, match=error):
+    # These local ranks share one GPU. Initialize them in order so weight
+    # evaluation/compilation does not race another rank's first GPU work.
+    # The distributed forward passes below still run concurrently.
+    for rank in range(group.size()):
+        if group.rank() == rank:
+            stage("building models")
+            mx.random.seed(19)
+            reference = _make_distributed_test_model(family, dtype)
+            stage("evaluating reference weights")
+            mx.eval(reference.parameters())
+            weights = dict(tree_flatten(reference.parameters()))
+            sharded = _make_distributed_test_model(family, dtype)
+            sharded.load_weights(list(weights.items()), strict=True)
             sharded.shard(group)
-    mx.eval(sharded.parameters())
-    stage("models ready")
+            if error := options.get("reshard_error"):
+                with pytest.raises(ValueError, match=error):
+                    sharded.shard(group)
+            stage("evaluating sharded weights")
+            mx.eval(sharded.parameters())
+            stage("models ready")
+        host_barrier(f"models-ready-{rank}")
     local_weights = dict(tree_flatten(sharded.parameters()))
     for pattern in options["sharded_weights"]:
         names = [name for name in weights if fnmatchcase(name, pattern)]
