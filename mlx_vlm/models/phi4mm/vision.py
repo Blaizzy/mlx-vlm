@@ -114,6 +114,8 @@ class VisionEmbeddings(nn.Module):
         positional_embeddings: mx.array,
         spatial_shapes: mx.array,
         max_length: int,
+        *,
+        training: bool = False,
     ) -> mx.array:
         """
         Resize 2D positional embeddings per image and pad to fixed size.
@@ -122,6 +124,7 @@ class VisionEmbeddings(nn.Module):
             positional_embeddings: (pos_size, pos_size, embed_dim)
             spatial_shapes: (batch_size, 2) - (h_patches, w_patches) per image
             max_length: max number of patches to pad to
+            training: Use differentiable MLX operations when training the vision tower
         """
         batch_size = spatial_shapes.shape[0]
         embed_dim = positional_embeddings.shape[-1]
@@ -143,6 +146,7 @@ class VisionEmbeddings(nn.Module):
                 (height, width),
                 align_corners=False,
                 antialias=True,
+                training=training,
             )
 
             # (1, h, w, embed_dim) -> (h*w, embed_dim)
@@ -172,7 +176,10 @@ class VisionEmbeddings(nn.Module):
                 self.position_embedding_size, self.position_embedding_size, -1
             )
             resized_pos_embeddings = self.resize_positional_embeddings(
-                positional_embeddings, spatial_shapes, max_length=x.shape[1]
+                positional_embeddings,
+                spatial_shapes,
+                max_length=x.shape[1],
+                training=self.training,
             )
             embeddings = patch_embeddings + resized_pos_embeddings
         else:
