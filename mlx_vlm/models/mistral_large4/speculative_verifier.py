@@ -126,7 +126,9 @@ def attention_block(attention, x, positions, cos, sin, cache, shared, topk):
     return linear(attention.wo, mx.concatenate(outputs, axis=1))
 
 
-def verify_hidden(language_model, inputs, cache, capture_layer_ids):
+def verify_hidden(
+    language_model, inputs, cache, capture_layer_ids, evaluation_interval=0
+):
     model = language_model.model
     if len(set(capture_layer_ids)) != len(capture_layer_ids) or any(
         i < 0 or i >= len(model.layers) for i in capture_layer_ids
@@ -173,6 +175,8 @@ def verify_hidden(language_model, inputs, cache, capture_layer_ids):
                 attended = mx.concatenate(attended, axis=1)
             x = x + attended
             x = x + feed_forward(layer.feed_forward, layer.ffn_norm(x))
+            if evaluation_interval and (i + 1) % evaluation_interval == 0:
+                mx.async_eval(x)
             if i in capture_layer_ids:
                 captured[i] = x
         return [captured[i] for i in capture_layer_ids], model.norm(x), transaction

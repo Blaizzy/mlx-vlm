@@ -13,7 +13,7 @@ def _wide_kernel():
         output_names=["out"],
         header=_HEADER,
         source=r"""
-        GemvWide<T, 4, KL, float>::run(
+        GemvWide<T, V, KL, float>::run(
             weight, x, weight, out,
             x_shape[2], weight_shape[0], x_shape[0]*x_shape[1],
             x_shape[2], x_shape[2], 1.0f, 0.0f, 0, 0,
@@ -44,10 +44,15 @@ def native_wide_linear(weight, x):
     passes = (x.shape[0] + 4) // 5
     lanes = 32 if passes == 1 or weight.shape[0] <= 64 else 16
     groups = lanes // 8
+    # Short speculative blocks expose more vectors than single-token decode.
+    # Reuse each weight load across eight vectors and split the work over two
+    # grid columns, retaining the original batch's K-lane reduction geometry.
+    wide_block = x.shape[0] >= 6 and x.shape[1] > 1
+    vectors, columns = (8, 2) if wide_block else (4, 1)
     return _wide_kernel()(
         inputs=[x, weight],
-        template=[("T", x.dtype), ("KL", lanes)],
-        grid=(32, ((weight.shape[0] + 3) // 4) * groups, 1),
+        template=[("T", x.dtype), ("KL", lanes), ("V", vectors)],
+        grid=(32 * columns, ((weight.shape[0] + 3) // 4) * groups, 1),
         threadgroup=(32, groups, 1),
         output_shapes=[(*x.shape[:-1], weight.shape[0])],
         output_dtypes=[x.dtype],
