@@ -4045,7 +4045,12 @@ def test_warm_rows_decode_while_cold_row_prefills(prefix_manager, model_name):
     outputs = {uids[0]: [r.token for r in replies], uids[1]: []}
     merged = False
     for _ in range(30):
+        # Another group sharing APC may finish its prefill between our steps.
+        gen.apc.finish_prefill()
         _, replies = gen.next()
+        if gen._prompt_batch is not None:
+            assert manager.memory_plan.lengths == [len(cold)]
+            assert manager.memory_plan.extra_reserve_bytes > 0
         merged |= len(gen._generation_batch) == 2
         for reply in replies:
             outputs[reply.uid].append(reply.token)

@@ -1983,6 +1983,11 @@ class PromptProcessingBatch:
         self._apc_meta = apc_meta or []
         self._apc_manager = apc_manager
         self._apc_coordinator = apc_coordinator
+        self._prefill_extra_reserve_bytes = (
+            apc_coordinator.manager.memory_plan.extra_reserve_bytes
+            if apc_coordinator is not None
+            else 0
+        )
         self._apc_mode = apc_mode
         self._apc_harvest_enabled = True
         self._prompt_time_s = 0.0
@@ -2081,6 +2086,18 @@ class PromptProcessingBatch:
                 self._prompt_tokens_per_row,
                 prefix_lengths=self._cached_tokens_per_row,
                 prefill_step_size=self.prefill_step_size,
+                extra_reserve_bytes=self._prefill_extra_reserve_bytes,
+            )
+
+    def _activate_apc_memory_plan(self):
+        # Other batch groups share this manager and can replace or clear its
+        # transient plan between steps. Restore this prompt's shape first.
+        if self._apc_coordinator is not None:
+            self._apc_coordinator.manager.memory_plan.prepare(
+                self._prompt_tokens_per_row,
+                prefix_lengths=self._cached_tokens_per_row,
+                chunk_size=self.prefill_step_size,
+                extra_reserve_bytes=self._prefill_extra_reserve_bytes,
             )
 
     def __len__(self):
@@ -2277,6 +2294,7 @@ class PromptProcessingBatch:
         if not self.needs_processing():
             return 0
 
+        self._activate_apc_memory_plan()
         step = self.prefill_step_size or self._inputs_embeds.shape[1]
         n = min(step, self._inputs_embeds.shape[1] - 1)
         # Finish shorter right-padded rows at a chunk boundary so we can keep
@@ -2362,6 +2380,7 @@ class PromptProcessingBatch:
         self, sampler, stop_criteria, compute_logprobs=True, top_logprobs_k=0
     ) -> GenerationBatch:
         """Process final tokens and transition to GenerationBatch."""
+        self._activate_apc_memory_plan()
         call_kwargs = dict(self._prompt_kwargs)
         if self.draft_model is not None and self.draft_kind is not None:
             call_kwargs.update(
