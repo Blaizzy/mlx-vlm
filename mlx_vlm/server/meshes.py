@@ -1,4 +1,4 @@
-"""SGLang-style asynchronous image-to-3D jobs, including Gaussian-splat PLY."""
+"""Asynchronous image-to-3D jobs, including Gaussian-splat PLY."""
 
 import io
 import logging
@@ -34,7 +34,7 @@ class MeshGenerationRequest(BaseModel):
     guidance_scale: float = Field(
         3.0, ge=0, validation_alias=AliasChoices("guidance_scale", "guidance")
     )
-    # Idol is image-conditioned; retain SGLang's default placeholder only.
+    # Idol is image-conditioned; accept only empty or placeholder prompts.
     prompt: Literal["", "generate 3d mesh"] | None = None
     negative_prompt: Literal[""] | None = None
     mode: Literal["synthetic", "real"] = "synthetic"
@@ -75,7 +75,7 @@ class MeshJobs:
     """Serialize model loading and generation off the HTTP event loop.
 
     Records live in this process. Deleting a record does not cancel generation
-    or remove exported files, matching SGLang's mesh API.
+    or remove exported files.
     """
 
     def __init__(self, deps):

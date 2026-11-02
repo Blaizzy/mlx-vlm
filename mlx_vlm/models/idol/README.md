@@ -120,8 +120,8 @@ a text tokenizer or applying a chat template.
 
 ## Server
 
-The server follows [SGLang's mesh-job API](https://docs.sglang.io/docs/sglang-diffusion/api/openai_api#mesh-generation-sglang-extension),
-with `ply` added alongside `glb` and `obj`. This is an extension, not an OpenAI API.
+The server provides asynchronous image-to-3D generation at `/v1/meshes`,
+with `ply`, `glb`, and `obj` output formats.
 
 ```sh
 mlx_vlm.server --mesh-model speridlabs/idol
@@ -144,7 +144,7 @@ curl http://localhost:8080/v1/meshes/MESH_ID/content -o object.glb
 
 Supply `model` in the request if it was not preloaded. Multipart requests accept
 one `image` upload or `url`; JSON requests accept `input_image` (a path, URL,
-or image data URI). The API defaults to GLB, matching SGLang. `num_inference_steps`
+or image data URI). The API defaults to GLB. `num_inference_steps`
 and `guidance_scale` also accept the shared aliases `steps` and `guidance`.
 Idol options include `mode`, `num_gaussians`, `rescale_t`, `crop_margin`,
 `batch_cfg`, `mesh_resolution`, and `mesh_threshold`. Idol uses image conditioning;
@@ -158,7 +158,7 @@ model switches. Polling and downloads remain responsive; `/unload` and server
 shutdown wait for accepted jobs to finish before releasing weights.
 
 `GET /v1/meshes` lists jobs with `limit` (1–100), `order` (`asc` or `desc`), and
-an `after` cursor. `DELETE /v1/meshes/MESH_ID` removes the record; as in SGLang,
+an `after` cursor. `DELETE /v1/meshes/MESH_ID` removes the record;
 it does not cancel generation or remove output files. Failed or incomplete
 outputs cannot be downloaded. Records are process-local and disappear on
 restart. Files remain under `outputs/meshes/MESH_ID/`; configure the parent with

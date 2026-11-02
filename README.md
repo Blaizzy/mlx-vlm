@@ -1364,7 +1364,7 @@ Structured outputs are not currently supported with speculative decoding.
 - `/responses/compact` and `/v1/responses/compact` - Compact conversation history into replayable state; see [compaction and APC](docs/usage.md#conversation-compaction-and-apc)
 - `/embeddings` and `/v1/embeddings` - OpenAI-compatible embeddings endpoint backed by native MLX embedding models
 - `/v1/decisions` - Predict named typed decisions using the shared decision API
-- `/v1/meshes` - SGLang-style image-to-3D jobs, with polling and downloads at `/v1/meshes/{id}` and `/v1/meshes/{id}/content`; see [3D serving](mlx_vlm/models/idol/README.md#server)
+- `/v1/meshes` - Asynchronous image-to-3D jobs, with polling and downloads at `/v1/meshes/{id}` and `/v1/meshes/{id}/content`; see [3D serving](mlx_vlm/models/idol/README.md#server)
 - `/v1/rerank` - Rank text or multimodal documents by relevance to a query
 - `/audio/speech` and `/v1/audio/speech` - OpenAI-compatible text-to-speech endpoint backed by `mlx-audio` TTS models
 - `/audio/transcriptions` and `/v1/audio/transcriptions` - OpenAI-compatible speech-to-text endpoint backed by `mlx-audio` STT models
