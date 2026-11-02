@@ -100,7 +100,7 @@ survive Stop; a resume uses its private live state directly and needs no APC
 lookup. Resume also works with APC disabled. Live inference checkpoints are
 separate from APC's shared prefix cache and disk storage.
 
-Checkpoints are process-local, bounded to 32 handles and expire after 10 minutes
+Checkpoints are process-local, bounded to 32 handles and expire after 2 minutes
 of inactivity. A background sweep runs every 30 seconds, removing expired
 records and their saved request/text even when no new requests arrive. Active
 streams are exempt; closing a stream starts its inactivity window. Expiring an
