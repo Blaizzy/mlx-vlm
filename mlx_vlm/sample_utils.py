@@ -143,6 +143,10 @@ def make_logits_processors(
 
         logits_processors.append(logit_bias_processor)
 
+    # A unit repetition penalty leaves logits unchanged and needs no processor.
+    if repetition_penalty == 1.0:
+        repetition_penalty = None
+
     repetition_penalties = [
         (make_repetition_penalty, repetition_penalty, repetition_context_size),
         (make_presence_penalty, presence_penalty, presence_context_size),
@@ -168,7 +172,7 @@ def apply_top_k(
         top_k (int): Top k tokens to sample from.
     """
     vocab_size = logprobs.shape[-1]
-    if not isinstance(top_k, int) or not (0 < top_k < vocab_size):
+    if not isinstance(top_k, int) or not (0 < top_k <= vocab_size):
         raise ValueError(
             f"`top_k` has to be an integer in the (0, {vocab_size}] interval,"
             f" but is {top_k}."

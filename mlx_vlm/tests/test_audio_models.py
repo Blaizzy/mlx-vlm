@@ -1712,7 +1712,7 @@ def _mixed_batch(model, rows, prompts, prefix, warm_cache=None):
             else ([], prefix)
         ),
         checkpoint_len=lambda *a: 0,
-        checkpoint_lengths=lambda *a: [],
+        checkpoint_lengths=lambda *a, **kw: [],
     )
     bg.apc_mode = "exact"
     bg.prefill_step_size = 2

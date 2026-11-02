@@ -95,7 +95,7 @@ jobs:
               tests/test_tool_streaming.py
           - group: training-ops
             suite: Training, cache, offloading & model operations
-            os: macos-14
+            os: macos-15
             extras: test
             # Keep cache pressure checks away from the larger model contracts.
             # Run the training API first so its compilation starts early.
@@ -117,11 +117,13 @@ jobs:
               tests/test_training_helpers.py
               tests/test_training_metrics.py
               tests/test_training_model_preparation.py
+              tests/test_training_mtp.py
+              tests/test_training_mtp_notebook.py
               tests/test_training_notebooks.py
               tests/test_training_vlm.py
           - group: models
             suite: Models, processors & speculation
-            os: macos-14
+            os: macos-15
             extras: test
             tests: >-
               tests/test_gated_delta.py
@@ -134,10 +136,11 @@ jobs:
               tests/test_speculative.py
           - group: media
             suite: Diffusion, audio, images, video & extraction
-            os: macos-14
+            os: macos-15
             extras: test
             tests: >-
               tests/test_audio_models.py
+              tests/test_d1.py
               tests/test_diffusion_models.py
               tests/test_extraction_models.py
               tests/test_flux3.py
