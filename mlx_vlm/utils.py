@@ -1522,20 +1522,9 @@ def read_audio(file) -> tuple:
     return audio, sample_rate
 
 
-def load_audio(
-    file,
-    sr: int,
-    timeout: int = 10,
-):
-    """
-    Helper function to load audio from either a URL, file path, or numpy array.
-    """
-    if isinstance(file, np.ndarray):
-        audio = file.astype(np.float32, copy=False)
-        return audio.mean(axis=1) if audio.ndim > 1 else audio
-
+def decode_audio(file, timeout: int = 10):
+    """Mono float32 samples of a URL, file path or file object, and their rate."""
     from mlx_audio.audio_io import read as read_audio
-    from mlx_audio.utils import resample_audio
 
     if isinstance(file, Path):
         file = str(file)
@@ -1560,6 +1549,24 @@ def load_audio(
     # resample the channel axis and leave the samples at the source rate.
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
+    return audio, sample_rate
+
+
+def load_audio(
+    file,
+    sr: int,
+    timeout: int = 10,
+):
+    """
+    Helper function to load audio from either a URL, file path, or numpy array.
+    """
+    if isinstance(file, np.ndarray):
+        audio = file.astype(np.float32, copy=False)
+        return audio.mean(axis=1) if audio.ndim > 1 else audio
+
+    from mlx_audio.utils import resample_audio
+
+    audio, sample_rate = decode_audio(file, timeout)
     if sample_rate != sr:
         audio = resample_audio(audio, sample_rate, sr)
     return np.asarray(audio, dtype=np.float32)

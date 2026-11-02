@@ -346,18 +346,15 @@ class D1:
     def predict(self, processor, state, questions, images=None, audio=None):
         """`system_one` behind the shared decision API (`mlx_vlm.predict`,
         `/v1/decisions`), with a score's value the expected level as in d1-3B."""
-        from ...utils import load_audio, load_image
+        from ...utils import decode_audio, load_image
 
         media = [load_image(image) for image in images or ()]
         if audio is not None:
-            # the Reader resamples to the checkpoint's rate if it is another
-            media.append(
-                {
-                    "type": "audio",
-                    "audio": load_audio(audio, 16000),
-                    "sampling_rate": 16000,
-                }
+            # Kept at its own rate: the Reader's resampler matches the checkpoints' code.
+            wave, rate = (
+                (audio, 16000) if isinstance(audio, np.ndarray) else decode_audio(audio)
             )
+            media.append({"type": "audio", "audio": wave, "sampling_rate": rate})
         result = self.system_one(
             state,
             {name: decision_question(q) for name, q in questions.items()},

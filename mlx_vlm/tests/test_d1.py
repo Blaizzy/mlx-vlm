@@ -566,8 +566,12 @@ def test_tiny_omni_decision_api_decodes_audio(tokenizer, monkeypatch):
     clip.seek(0)
     predict(model, None, None, {"x": QUESTIONS["refund"]}, audio=clip)
     [item] = seen["media"]
-    assert item["type"] == "audio" and item["sampling_rate"] == 16000
-    assert item["audio"].shape == (16000,)
+    assert item["type"] == "audio" and item["sampling_rate"] == 8000
+    assert item["audio"].shape == (8000,)
+    samples = np.zeros(4000, np.float32)
+    predict(model, None, None, {"x": QUESTIONS["refund"]}, audio=samples)
+    [item] = seen["media"]
+    assert item["sampling_rate"] == 16000 and item["audio"] is samples
 
 
 def test_tiny_model_serves_decisions_over_http(tiny_model, monkeypatch):
