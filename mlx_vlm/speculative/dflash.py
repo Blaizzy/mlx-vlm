@@ -5,6 +5,7 @@ import mlx.nn as nn
 
 from .cache_state import abort_speculative_round, commit_speculative_round
 from .common import (
+    _apply_thinking_budget,
     _dflash_block_total,
     _record_speculative_round,
     _requires_uniform_batch_acceptance,
@@ -444,6 +445,7 @@ def _dflash_rounds(
     token_dtype: mx.Dtype = mx.int32,
     use_model_initial_block_size: bool = True,
     greedy_sampling: bool = True,
+    thinking_budget_criteria: Optional[Any] = None,
 ) -> Generator[Tuple[int, None], None, None]:
     """DFlash speculative-decoding **round loop**.
 
@@ -478,6 +480,8 @@ def _dflash_rounds(
         hidden = prepare_target_hidden(hidden)
         mx.async_eval(hidden)
 
+    if thinking_budget_criteria is not None:
+        thinking_budget_criteria(first_bonus)
     b = first_bonus
     emitted = 1  # the first bonus has already been yielded by the caller
 
@@ -560,6 +564,9 @@ def _dflash_rounds(
                 accepted = accepted_list[0]
                 new_tokens = new_tokens_list[0]
                 sampler_rng.target_sampled(sync_draft=not positioned_sampling)
+            [accepted], [new_tokens] = _apply_thinking_budget(
+                [accepted], [new_tokens], [thinking_budget_criteria], [0]
+            )
             _record_speculative_round(draft_model, accepted, bs - 1)
 
             if accepted < bs - 1:
@@ -602,6 +609,7 @@ def _dflash_rounds_batch(
     stop_check: Optional[Callable[[int, int], bool]] = None,
     greedy_sampling: bool = True,
     row_ids: Optional[List[int]] = None,
+    thinking_budget_criteria: Optional[List[Any]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     """Batch DFlash speculative-decoding round loop (B > 1).
 
@@ -644,6 +652,9 @@ def _dflash_rounds_batch(
     # Per-sequence state tracked by ORIGINAL index so the caller sees
     # stable indices in the yielded token lists.
     b = first_bonus.tolist()  # active bonus tokens
+    for state, token in zip(thinking_budget_criteria or [], b):
+        if state is not None:
+            state(token)
     emitted = [1] * B
     finished = [False] * B
     active_idx = list(range(B))  # maps active-slot → original-index
@@ -774,6 +785,13 @@ def _dflash_rounds_batch(
                 new_tokens_list = [nt[: uniform + 1] for nt in new_tokens_list]
                 accepted_list = [uniform] * n_active
 
+            accepted_list, new_tokens_list = _apply_thinking_budget(
+                accepted_list,
+                new_tokens_list,
+                thinking_budget_criteria,
+                active_idx,
+                uniform=_requires_uniform_batch_acceptance(draft_model, lm),
+            )
             hidden_segments = _dflash_committed_hidden_segments(
                 hidden_full, new_tokens_list
             )

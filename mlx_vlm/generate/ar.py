@@ -534,6 +534,7 @@ def generate_step(
             sampler=sampler,
             draft_block_size=draft_block_size,
             sampler_is_greedy=sampler_is_greedy,
+            thinking_budget_criteria=thinking_budget_criteria,
         )
         return
 
@@ -1555,6 +1556,7 @@ class SpeculativeGenerationBatch:
         draft_block_size: Optional[int] = None,
         token_dtype: mx.Dtype = mx.int32,
         greedy_sampling: bool = False,
+        thinking_budget_criteria: Optional[List[Any]] = None,
     ):
         self.model = model
         self.draft_model = draft_model
@@ -1572,6 +1574,7 @@ class SpeculativeGenerationBatch:
         self.draft_block_size = draft_block_size
         self.token_dtype = token_dtype
         self.greedy_sampling = greedy_sampling
+        self.thinking_budget_criteria = thinking_budget_criteria or []
         self._num_tokens = [0] * len(uids)
         self._finished = [False] * len(uids)
         self._sent_first = False
@@ -1766,6 +1769,7 @@ class SpeculativeGenerationBatch:
             eos_token_ids=None,
             prompt_tokens=self.prompt_tokens,
             row_ids=[0] * len(self._all_uids),
+            thinking_budget_criteria=self.thinking_budget_criteria,
         )
 
     def next(self) -> List[GenerationBatch.Response]:
@@ -2417,6 +2421,7 @@ class PromptProcessingBatch:
                 draft_block_size=self.draft_block_size,
                 token_dtype=self._input_ids.dtype,
                 greedy_sampling=self.greedy_sampling,
+                thinking_budget_criteria=list(self.thinking_budget_criteria),
             )
             compute_logprobs = False
         else:
