@@ -584,8 +584,9 @@ def test_gaussian_ply_activation_and_coordinate_convention(tmp_path):
     assert np.isfinite(values).all()
     np.testing.assert_allclose(values[0, :3], [0.1, -0.3, 0.2], atol=1e-7)
     np.testing.assert_allclose(values[0, -4:], [2**-0.5, 2**-0.5, 0, 0], atol=1e-7)
+    # Metal softplus rounding varies across GPUs at these small scales.
     np.testing.assert_allclose(
-        np.array(g.scaling), np.sqrt(0.004**2 + 0.0009**2), rtol=1e-6
+        np.array(g.scaling), np.sqrt(0.004**2 + 0.0009**2), rtol=1e-5
     )
 
 
