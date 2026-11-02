@@ -1,3 +1,4 @@
+from copy import copy
 from typing import Any, Callable, Generator, List, Optional, Tuple
 
 import mlx.core as mx
@@ -184,6 +185,7 @@ def run_speculative_server_rounds(
     eos_token_ids: Optional[set] = None,
     prompt_tokens: Optional[mx.array] = None,
     row_ids: Optional[List[int]] = None,
+    thinking_budget_criteria: Optional[List[Any]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     batch_size = int(first_bonus.shape[0]) if first_bonus.ndim > 0 else 1
     _validate_speculative_sampling(draft_model, greedy_sampling)
@@ -198,6 +200,7 @@ def run_speculative_server_rounds(
                     prompt_cache,
                     hidden,
                     prompt_tokens=prompt_tokens,
+                    thinking_budget_criteria=(thinking_budget_criteria or [None])[0],
                     first_bonus=int(first_bonus.reshape(-1).item()),
                     max_tokens=max_tokens,
                     sampler=sampler,
@@ -214,6 +217,7 @@ def run_speculative_server_rounds(
             prompt_cache,
             hidden,
             prompt_tokens=prompt_tokens,
+            thinking_budget_criteria=thinking_budget_criteria,
             first_bonus=first_bonus,
             max_tokens=max_tokens,
             sampler=sampler,
@@ -233,6 +237,7 @@ def run_speculative_server_rounds(
             hidden,
             shared_kv_states,
             prompt_tokens=prompt_tokens,
+            thinking_budget_criteria=thinking_budget_criteria,
             first_bonus=first_bonus,
             max_tokens=max_tokens,
             sampler=sampler,
@@ -252,6 +257,7 @@ def run_speculative_server_rounds(
                 draft_model,
                 prompt_cache,
                 hidden,
+                thinking_budget_criteria=(thinking_budget_criteria or [None])[0],
                 first_bonus=int(first_bonus.reshape(-1).item()),
                 max_tokens=max_tokens,
                 sampler=sampler,
@@ -269,6 +275,7 @@ def run_speculative_server_rounds(
             draft_model,
             prompt_cache,
             hidden,
+            thinking_budget_criteria=thinking_budget_criteria,
             first_bonus=first_bonus,
             max_tokens=max_tokens,
             sampler=sampler,
@@ -299,6 +306,7 @@ def run_speculative_rounds(
     sampler: Callable[[mx.array], mx.array],
     draft_block_size: Optional[int] = None,
     sampler_is_greedy: bool = False,
+    thinking_budget_criteria: Optional[Any] = None,
 ) -> Generator[Tuple[Any, mx.array], None, None]:
     B = input_ids.shape[0]
     _validate_speculative_sampling(draft_model, sampler_is_greedy)
@@ -318,6 +326,7 @@ def run_speculative_rounds(
                 hidden,
                 shared_kv_states,
                 prompt_tokens=input_ids,
+                thinking_budget_criteria=thinking_budget_criteria,
                 first_bonus=bonus,
                 max_tokens=max_tokens,
                 sampler=sampler,
@@ -345,6 +354,9 @@ def run_speculative_rounds(
                 hidden,
                 shared_kv_states,
                 prompt_tokens=input_ids,
+                thinking_budget_criteria=[
+                    copy(thinking_budget_criteria) for _ in range(B)
+                ],
                 first_bonus=first_bonus,
                 max_tokens=max_tokens,
                 sampler=sampler,
@@ -367,6 +379,7 @@ def run_speculative_rounds(
                 prompt_cache,
                 hidden,
                 prompt_tokens=input_ids,
+                thinking_budget_criteria=thinking_budget_criteria,
                 first_bonus=bonus,
                 max_tokens=max_tokens,
                 sampler=sampler,
@@ -391,6 +404,9 @@ def run_speculative_rounds(
                 prompt_cache,
                 hidden,
                 prompt_tokens=input_ids,
+                thinking_budget_criteria=[
+                    copy(thinking_budget_criteria) for _ in range(B)
+                ],
                 first_bonus=first_bonus,
                 max_tokens=max_tokens,
                 sampler=sampler,
@@ -416,6 +432,7 @@ def run_speculative_rounds(
             draft_model,
             prompt_cache,
             hidden,
+            thinking_budget_criteria=thinking_budget_criteria,
             first_bonus=bonus,
             max_tokens=max_tokens,
             sampler=sampler,
@@ -432,6 +449,7 @@ def run_speculative_rounds(
             draft_model,
             prompt_cache,
             hidden,
+            thinking_budget_criteria=[copy(thinking_budget_criteria) for _ in range(B)],
             first_bonus=first_bonus,
             max_tokens=max_tokens,
             sampler=sampler,

@@ -357,6 +357,8 @@ def _apc_type_tables():
 
 def apc_block_eligible(cache: Any) -> bool:
     """True if ``cache`` supports block-level (pageable KV) APC reuse."""
+    if resolve_capability(cache) != Capability.PAGEABLE:
+        return False
     if hasattr(cache, "dequantize_for_apc"):
         return True
     _, block_types = _apc_type_tables()

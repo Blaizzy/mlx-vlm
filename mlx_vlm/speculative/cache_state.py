@@ -261,7 +261,7 @@ def _trim_append_caches(caches, retained, block_size, transaction=None):
         if has_ragged_tail:
             prepare = getattr(cache, "prepare", None)
             finalize = getattr(cache, "finalize", None)
-            if (
+            if callable(getattr(cache, "trim_right", None)) or (
                 getattr(cache, "keys", None) is not None
                 and callable(prepare)
                 and callable(finalize)
@@ -284,8 +284,11 @@ def _trim_append_caches(caches, retained, block_size, transaction=None):
         if cache_trim > 0:
             trim_cache(cache_trim)
         if right_trimmed:
-            cache.prepare(right_padding=right_padding)
-            cache.finalize()
+            if callable(getattr(cache, "trim_right", None)):
+                cache.trim_right(right_padding)
+            else:
+                cache.prepare(right_padding=right_padding)
+                cache.finalize()
 
 
 __all__ = [

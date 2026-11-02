@@ -6,7 +6,9 @@ import numpy as np
 
 from ..base import (
     LanguageModelOutput,
+    cache_position_offset,
     create_attention_mask,
+    kv_sequence_length,
     scaled_dot_product_attention,
 )
 from ..cache import KVCache
@@ -91,24 +93,11 @@ class Attention(nn.Module):
             0, 2, 1, 3
         )
 
-        kv_seq_len = keys.shape[-2]
-        # Use cache._idx (the Python-int cursor) when available so the mask
-        # slice matches the cache size after update_and_fetch. cache.offset is
-        # per-row in batched mode, where max(offset) < _idx if any row carries
-        # left padding — slicing on it then under-sizes the mask.
-        if cache is not None:
-            cache_size = cache._idx if hasattr(cache, "_idx") else cache.offset
-        else:
-            cache_size = 0
-
         if position_ids is None:
-            kv_seq_len += cache.offset + 1 if cache is not None else 0
             offset_for_pos = cache.offset if cache is not None else 0
             position_ids = mx.arange(offset_for_pos, offset_for_pos + L)
             position_ids = mx.expand_dims(position_ids, axis=0)
             position_ids = mx.tile(position_ids, (3, 1, 1))
-        else:
-            kv_seq_len += cache_size
 
         if position_embeddings is None:
             queries, keys = self.rotary_emb.apply_rotary(
@@ -121,13 +110,11 @@ class Attention(nn.Module):
             cos, sin = position_embeddings
             queries, keys = apply_multimodal_rotary_pos_emb(queries, keys, cos, sin)
 
-        if mask is not None and isinstance(mask, mx.array):
-            if isinstance(kv_seq_len, mx.array):
-                kv_seq_len = kv_seq_len.max().item()
-            mask = mask[..., : int(kv_seq_len)]
-
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
+
+        if isinstance(mask, mx.array):
+            mask = mask[..., : kv_sequence_length(keys)]
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache, scale=self.scale, mask=mask
@@ -516,13 +503,11 @@ class LanguageModel(nn.Module):
         if rope_deltas_kw is not None:
             self._rope_deltas = rope_deltas_kw
 
-        # Use ``cache._idx`` — the Python-int token counter — instead of
-        # syncing on ``cache[0].offset``. See Qwen2.5-VL for details.
         cache_offset = 0
         cache_offset_array = None  # For per-sequence offsets in batch mode
         if cache and cache[0] is not None:
             c0 = cache[0]
-            cache_offset = c0._idx if hasattr(c0, "_idx") else c0.offset
+            cache_offset = cache_position_offset(c0)
             if isinstance(c0.offset, mx.array) and c0.offset.ndim > 0:
                 cache_offset_array = c0.offset
 

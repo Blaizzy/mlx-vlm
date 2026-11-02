@@ -47,7 +47,11 @@ def process_tool_calls(
                 try:
                     parsed = tool_module.parse_tool_call(call, tools)
                     parsed_calls = parsed if isinstance(parsed, list) else [parsed]
-                    for tool_call in parsed_calls:
+                except Exception as exc:
+                    logger.warning("Invalid tool call %r: %s", call, exc)
+                    continue
+                for tool_call in parsed_calls:
+                    try:
                         args = tool_call["arguments"]
                         called_tools.append(
                             {
@@ -64,6 +68,6 @@ def process_tool_calls(
                                 },
                             },
                         )
-                except Exception as exc:
-                    logger.warning("Invalid tool call %r: %s", call, exc)
+                    except Exception as exc:
+                        logger.warning("Invalid tool call %r: %s", tool_call, exc)
     return ParseResult(calls=called_tools, remaining_text=remaining)

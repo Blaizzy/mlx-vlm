@@ -1,3 +1,4 @@
+from copy import copy
 from typing import Any, Callable, List, Optional, Tuple
 
 import mlx.core as mx
@@ -8,6 +9,45 @@ from ..models.linear import DECODE_BLOCK_SIZE
 from .cache_state import start_speculative_cache
 
 generation_stream = mx.new_thread_local_stream(mx.default_device())
+
+
+def _apply_thinking_budget(
+    accepted, token_rows, criteria, row_indices, *, uniform=False
+):
+    """Apply budgets to token rows, keeping forced replacements uncached.
+
+    Uniform batches preview each row before advancing the actual budgets.
+    """
+    if not criteria or not any(criteria):
+        return accepted, token_rows
+    active_criteria = [criteria[i] for i in row_indices]
+    accepted, token_rows = list(accepted), list(token_rows)
+    for row, state in enumerate(active_criteria):
+        if state is None:
+            continue
+        state = copy(state) if uniform else state
+        constrained = []
+        for index, token in enumerate(token_rows[row]):
+            forced = state.pop_forced_token_id()
+            chosen = token if forced is None else forced
+            state(chosen)
+            constrained.append(chosen)
+            if chosen != token:
+                # The remaining tokens were sampled from a different prefix.
+                accepted[row] = min(accepted[row], index)
+                break
+        token_rows[row] = constrained
+    if uniform:
+        retained = min(accepted)
+        accepted = [retained] * len(accepted)
+        token_rows = [tokens[: retained + 1] for tokens in token_rows]
+        # Only count the prefix each cache can retain.
+        for state, tokens in zip(active_criteria, token_rows):
+            if state is not None:
+                for token in tokens:
+                    state.pop_forced_token_id()
+                    state(token)
+    return accepted, token_rows
 
 
 def verify_forward(model, inputs, cache, **kwargs):
@@ -409,6 +449,24 @@ def _batch_cache_left_padding(prompt_cache: List[Any]) -> Optional[mx.array]:
         if left_padding is not None:
             return left_padding
     return None
+
+
+def _filter_rope_deltas(lm: nn.Module, keep_mx: mx.array, n_active: int) -> None:
+    """Drop finished rows from the target's stored per-row M-RoPE deltas.
+
+    M-RoPE models (Qwen-family VLMs) keep one rope delta per batch row on
+    the language model and slice them with ``[:batch_size]`` on decode.
+    When the continuous-batching filter drops a finished row, the stored
+    deltas must be filtered with the caches, or every surviving row after
+    the dropped one decodes with another row's position offset.
+    """
+    rope_deltas = getattr(lm, "_rope_deltas", None)
+    if (
+        rope_deltas is not None
+        and rope_deltas.ndim >= 1
+        and rope_deltas.shape[0] == n_active
+    ):
+        lm._rope_deltas = rope_deltas[keep_mx]
 
 
 def _format_speculative_stats(draft_model: nn.Module) -> Optional[str]:

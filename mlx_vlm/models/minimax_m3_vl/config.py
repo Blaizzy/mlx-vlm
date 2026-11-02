@@ -98,6 +98,8 @@ class TextConfig(BaseModelConfig):
     # intermediate_size). False forces the unpacked layout so the shared
     # expert can carry different (higher) quantization bits than the bank.
     pack_shared_expert: Optional[bool] = None
+    # M3.1 Flash routed experts use NVFP4; shared experts remain MXFP8.
+    nvfp4_experts: bool = False
 
     def __post_init__(self):
         if self.num_key_value_heads is None:

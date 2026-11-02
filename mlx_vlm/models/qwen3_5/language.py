@@ -10,6 +10,7 @@ from ...speculative.cache_state import (
 from ..activations import swiglu
 from ..base import (
     LanguageModelOutput,
+    cache_position_offset,
     create_attention_mask,
     scaled_dot_product_attention,
 )
@@ -1265,8 +1266,13 @@ class Qwen3_5Model(nn.Module):
             cache = [None] * len(self.layers)
 
         fa_cache = cache[self.fa_idx]
+        # Row extraction keeps padded prefill equivalent to an unpadded prompt.
+        # Unpadded decode retains allocated KV buffers instead of copying the
+        # entire prefix for every generated token; padded rows still use the
+        # row-wise path below, including unfinished single-token prefill chunks.
         if (
             h.shape[0] == 1
+            and h.shape[1] > 1
             and hidden_sink is None
             and fa_cache is not None
             and _is_single_row_batch_cache(fa_cache)
@@ -1678,7 +1684,7 @@ class LanguageModel(nn.Module):
         c0 = None
         if cache and cache[self.model.fa_idx] is not None:
             c0 = cache[self.model.fa_idx]
-            cache_offset = c0._idx if hasattr(c0, "_idx") else c0.offset
+            cache_offset = cache_position_offset(c0)
             if (
                 isinstance(c0.offset, mx.array)
                 and c0.offset.ndim > 0

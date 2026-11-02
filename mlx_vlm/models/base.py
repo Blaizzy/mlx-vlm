@@ -260,10 +260,33 @@ def dequantize_kv_state(cache, keys, values):
     return cache.dequantize(keys, values)
 
 
+def cache_position_offset(cache) -> int:
+    """Processed prompt columns, independent of the cache's storage cursor.
+
+    Single-sequence caches keep an absolute Python-int ``offset`` even when
+    their buffer rotates. Batched caches have per-row offsets; use their
+    shared timeline (including padding) when slicing full-prompt metadata.
+    RoPE callers with per-row positions must still use ``cache.offset``.
+    """
+    if cache is None:
+        return 0
+    offset = cache.offset
+    if not isinstance(offset, mx.array):
+        return int(offset)
+    shared_offset = getattr(cache, "_offset", None)
+    if shared_offset is None:
+        shared_offset = getattr(cache, "_idx", None)
+    if shared_offset is not None:
+        return int(shared_offset)
+    return int(offset.max().item()) if offset.size else 0
+
+
 def create_attention_mask(
     h, cache=None, window_size: Optional[int] = None, return_array: bool = False
 ):
     N = h.shape[1]
+    if isinstance(cache, (list, tuple)):
+        cache = cache[0] if cache else None
     if (
         cache is not None
         and not isinstance(cache, mx.array)

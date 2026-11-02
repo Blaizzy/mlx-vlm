@@ -208,9 +208,11 @@ class SiglipVisionEmbeddings(nn.Module):
         elif patch_attention_mask.ndim == 2:
             patch_attention_mask = patch_attention_mask[:, None, :]
 
-        boundaries = mx.arange(
-            1 / self._position_grid_size(), 1.0, 1 / self._position_grid_size()
-        )
+        # Construct in double precision before rounding, like torch.arange.
+        # A float32 step can put an exact grid boundary (e.g. 0.25 on the
+        # OCR checkpoint's 70x70 table) in the adjacent positional bucket.
+        side = self._position_grid_size()
+        boundaries = mx.array(np.arange(1 / side, 1.0, 1 / side).astype(np.float32))
         position_ids = np.zeros((batch_size, seq_len), dtype=np.int32)
 
         for batch_idx in range(batch_size):
@@ -249,6 +251,7 @@ class VisionModel(nn.Module):
             "siglip",
             "minicpmv4_6_vision",
             "minicpmv4_7_vision",
+            "minicpm_ocr_vision",
         ]:
             raise ValueError(f"Unsupported model type: {self.model_type}")
 

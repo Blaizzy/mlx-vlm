@@ -81,6 +81,7 @@ def evaluate_dpo(
     beta: float = 0.1,
     loss_type: str = "sigmoid",
     delta: float = 50.0,
+    mtp_loss_weight: float = 0.0,
 ) -> float:
     _prepare_reference_model(model, reference_model)
     objective = partial(
@@ -89,6 +90,7 @@ def evaluate_dpo(
         beta=beta,
         loss_type=loss_type,
         delta=delta,
+        mtp_loss_weight=mtp_loss_weight,
     )
     return evaluate_preference_vlm(
         model,
@@ -153,6 +155,7 @@ def make_task(
         beta=args.beta,
         loss_type=args.loss_type,
         delta=args.delta,
+        mtp_loss_weight=args.mtp_loss_weight,
     )
 
     task = preference_task(
