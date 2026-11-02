@@ -50,6 +50,525 @@ DATA = json.loads(Path(__file__).with_name("model_cases.json").read_text())[
 ]
 
 
+def mistral_dspark_case():
+    from mlx_vlm.models.mistral_large4.config import TextConfig
+    from mlx_vlm.models.mistral_large4.language import LanguageModel
+    from mlx_vlm.speculative.drafters.mistral_large4_dspark import Model, ModelConfig
+
+    args = TextConfig(
+        hidden_size=32,
+        intermediate_size=64,
+        moe_intermediate_size=32,
+        num_hidden_layers=4,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        vocab_size=64,
+        kv_lora_rank=8,
+        qk_rope_head_dim=8,
+        qk_nope_head_dim=8,
+        v_head_dim=8,
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+        index_topk=4,
+        index_head_dim=8,
+        index_n_heads=2,
+        mtp_config={
+            "n_layers": 2,
+            "depth": 3,
+            "target_activation_layers": "0,2,3",
+            "ragged_attention": "4,4",
+            "norm_strategy": "eagle",
+            "dspark": {
+                "markov_rank": 8,
+                "head_type": "rnn",
+                "draft_input": "position_specific",
+            },
+        },
+    )
+    target = LanguageModel(args)
+    draft = Model(ModelConfig(text_config=args))
+    target.eval()
+    draft.eval()
+    return target, draft
+
+
+@parametrize("sidecar", [False, True])
+def test_mistral_dspark_native_loading(tmp_path, sidecar):
+    target, draft = mistral_dspark_case()
+    settings = {"model_type": "mistral_large4", "text_config": target.args.to_dict()}
+    if sidecar:
+        mtp_config = settings["text_config"].pop("mtp_config")
+        (tmp_path / "params.json").write_text(json.dumps({"mtp": mtp_config}))
+    (tmp_path / "config.json").write_text(json.dumps(settings))
+    weights = {"mtp_dspark." + k: v for k, v in tree_flatten(draft.parameters())}
+    weights["norm.weight"] = mx.ones((32,))
+    mx.save_safetensors(
+        str(tmp_path / "consolidated-00001-of-00001.safetensors"), weights
+    )
+    loaded, kind = load_drafter(str(tmp_path))
+    assert kind == "dflash"
+    assert loaded.config.target_layer_ids == [0, 2, 3]
+    assert loaded.config.block_size == 4
+    expected = dict(tree_flatten(draft.parameters()))
+    actual = dict(tree_flatten(loaded.parameters()))
+    assert actual.keys() == expected.keys()
+    for key in expected:
+        np.testing.assert_array_equal(np.array(actual[key]), np.array(expected[key]))
+    from mlx_vlm.speculative.drafters.mistral_large4_dspark.split import (
+        MistralLarge4DsparkSplitter,
+    )
+
+    separate = MistralLarge4DsparkSplitter().split(
+        str(tmp_path), str(tmp_path / "draft")
+    )
+    extracted, kind = load_drafter(str(separate))
+    assert kind == "dflash"
+    for key, value in tree_flatten(extracted.parameters()):
+        np.testing.assert_array_equal(np.array(value), np.array(expected[key]))
+    del weights["mtp_dspark.backbone.mask_embedding"]
+    mx.save_safetensors(
+        str(tmp_path / "consolidated-00001-of-00001.safetensors"), weights
+    )
+    with pytest.raises(ValueError):
+        load_drafter(str(tmp_path))
+
+
+def test_mistral_dspark_capture_and_latent_rollback():
+    target, draft = mistral_dspark_case()
+    ids = mx.array([[1, 2, 3, 4, 5, 6]])
+    reference, cache = target.make_cache(), target.make_cache()
+    prefix = target(ids[:, :2], cache=cache, capture_layer_ids=[0, 2, 3])
+    target(ids[:, :2], cache=reference)
+    assert len(prefix.hidden_states) == 3
+    captured = []
+    # A tap is the residual stream after the named layer, before final norm.
+    last = target.model.norm
+    probe = target.model(ids[:, :2], capture_layer_ids=[3], capture_sink=captured)
+    np.testing.assert_allclose(np.array(probe), np.array(last(captured[0])), atol=1e-6)
+    output, transaction = common.verify_forward(
+        target, ids[:, 2:], cache, capture_layer_ids=draft.config.target_layer_ids
+    )
+    mx.eval(output.logits, output.hidden_states)
+    transaction.commit(2)
+    target(ids[:, 2:4], cache=reference)
+    assert all(c.offset == 4 for c in cache)
+    a = target(mx.array([[9]]), cache=cache).logits
+    b = target(mx.array([[9]]), cache=reference).logits
+    np.testing.assert_allclose(np.array(a), np.array(b), atol=2e-5, rtol=2e-5)
+
+
+def test_mistral_dspark_context_window_and_short_budget():
+    target, draft = mistral_dspark_case()
+    draft.bind(target)
+    hidden = mx.random.normal((1, 9, 96))
+    c1, c2 = draft.make_cache(), draft.make_cache()
+    sampler = lambda logits: mx.argmax(logits, axis=-1)
+    full = draft.draft_block(3, hidden, c1, 4, sampler)
+    # Incremental context ingestion retains exactly the same last window.
+    draft.draft_block(2, hidden[:, :6], c2, 4, sampler)
+    partial = draft.draft_block(3, hidden[:, 6:], c2, 2, sampler)
+    np.testing.assert_array_equal(np.array(full[:, :1]), np.array(partial))
+    assert [c.offset for c in c1] == [9, 9]
+    assert [c.offset for c in c2] == [9, 9]
+    for a, b in zip(c1, c2):
+        np.testing.assert_allclose(
+            np.array(a._temporal_order(a.keys)[..., -4:, :]),
+            np.array(b._temporal_order(b.keys)[..., -4:, :]),
+            atol=1e-5,
+        )
+
+
+def test_mistral_dspark_recurrent_head_equations():
+    _, draft = mistral_dspark_case()
+    head = draft.autoregressive_head
+    h = mx.random.normal((1, 3, 32))
+    tokens = mx.array([3])
+    state = None
+    reference = np.zeros((1, 8), dtype=np.float32)
+    for i in range(3):
+        bias, state = head.step(tokens, h[:, i], state)
+        embed = np.array(head.embedding.weight)[np.array(tokens)]
+        joined = np.concatenate([reference, embed, np.array(h[:, i])], axis=-1)
+        joined = joined @ np.array(head.joint_proj.weight).T + np.array(
+            head.joint_proj.bias
+        )
+        gate, candidate, out = np.split(joined, 3, axis=-1)
+        gate = 1 / (1 + np.exp(-gate))
+        reference = gate * reference + (1 - gate) * np.tanh(candidate)
+        expected = np.tanh(out) @ np.array(head.output.weight).T
+        np.testing.assert_allclose(np.array(state), reference, atol=1e-6, rtol=1e-5)
+        np.testing.assert_allclose(np.array(bias), expected, atol=1e-6, rtol=1e-5)
+        tokens = mx.argmax(bias, axis=-1)
+
+
+def test_mistral_dspark_batched_drafts_keep_independent_context_positions():
+    mx.random.seed(17)
+    target, draft = mistral_dspark_case()
+    draft.bind(target)
+    batched = [draft.make_cache() for _ in range(2)]
+    separate = [draft.make_cache() for _ in range(2)]
+    sampler = lambda logits: mx.argmax(logits, axis=-1)
+    for lengths in ([9, 3], [1, 3], [4, 2]):
+        hidden = [mx.random.normal((1, length, 96)) for length in lengths]
+        actual = draft.draft_batch([3, 5], hidden, batched, 4, sampler, mx.int32)
+        expected = mx.concatenate(
+            [
+                draft.draft_block(token, h, cache, 4, sampler)
+                for token, h, cache in zip([3, 5], hidden, separate)
+            ]
+        )
+        np.testing.assert_array_equal(np.array(actual), np.array(expected))
+        for actual_row, expected_row in zip(batched, separate):
+            for a, b in zip(actual_row, expected_row):
+                assert a.offset == b.offset
+                np.testing.assert_allclose(
+                    np.array(a.keys), np.array(b.keys), atol=1e-5
+                )
+                np.testing.assert_allclose(
+                    np.array(a.values), np.array(b.values), atol=1e-5
+                )
+
+
+def test_mistral_dspark_ragged_rollback_includes_shared_and_index_only_caches():
+    from mlx_vlm.models.mistral_large4.language import LanguageModel
+
+    mx.random.seed(19)
+    target, _ = mistral_dspark_case()
+    args = target.args
+    args.kv_source_layers = [0, 1, 0, 1]
+    args.no_rope_layers = [1, 1, 1, 1]
+    args.indexer_types = ["full", "full", "full", "shared"]
+    target = LanguageModel(args)
+    target.eval()
+    cache = [c.to_batch([0, 0]) for c in target.make_cache()]
+    mx.eval(target(mx.array([[1, 2, 3, 4], [5, 6, 7, 8]]), cache=cache).logits)
+    reference = [[c.extract(row) for c in cache] for row in range(2)]
+    block = mx.array([[9, 10, 11, 12], [13, 14, 15, 16]])
+    out = target(block, cache=cache, speculative_verify=True)
+    mx.eval(out.logits)
+    out.gdn_states.commit([1, 3])
+    for c in cache:
+        assert c.offset.tolist() == [5, 7]
+        assert c.left_padding.tolist() == [0, 0]
+    cache = [type(c).from_state(c.state, c.meta_state) for c in cache]
+    assert all(c._ragged and c.offset.tolist() == [5, 7] for c in cache)
+    for row, retained in enumerate([1, 3]):
+        for index in range(retained):
+            mx.eval(
+                target(
+                    block[row : row + 1, index : index + 1], cache=reference[row]
+                ).logits
+            )
+        actual = target(mx.array([[17]]), cache=[c.extract(row) for c in cache]).logits
+        expected = target(mx.array([[17]]), cache=reference[row]).logits
+        np.testing.assert_allclose(
+            np.array(actual), np.array(expected), atol=5e-5, rtol=5e-5
+        )
+
+
+@parametrize("cancel", [False, True])
+@parametrize("sampling", ["greedy", "random", "positioned"])
+def test_mistral_dspark_admits_requests_while_batch_is_active(cancel, sampling):
+    from types import SimpleNamespace
+
+    from mlx_vlm.generate.ar import BatchGenerator
+    from mlx_vlm.sample_utils import make_sampler
+    from mlx_vlm.server.generation import _PositionedTargetSampler
+    from mlx_vlm.utils import StoppingCriteria
+
+    mx.random.seed(23)
+    sampler = make_sampler(temp=0.7) if sampling == "random" else None
+    if sampling == "positioned":
+        sampler = _PositionedTargetSampler(temperature=0.7, top_p=1.0, seed=23)
+    target, draft = mistral_dspark_case()
+    generator = BatchGenerator(
+        target,
+        SimpleNamespace(stopping_criteria=StoppingCriteria([])),
+        completion_batch_size=2,
+        prefill_batch_size=2,
+        prefill_step_size=2,
+        draft_model=draft,
+        draft_kind="dflash",
+        draft_block_size=4,
+        sampler=sampler,
+        greedy_sampling=sampling == "greedy",
+        compute_logprobs=False,
+    )
+    prompts = [[1, 3, 5, 7], [2, 4], [11, 12, 13]]
+    outputs = [[], [], []]
+
+    def insert(rows, limits):
+        generator.insert(
+            rows,
+            max_tokens=limits,
+            prompt_kwargs=[
+                {"inputs_embeds": target.model.embed_tokens(mx.array([p]))}
+                for p in rows
+            ],
+        )
+
+    insert(prompts[:2], [40, 3])
+    added = False
+    overlapped = False
+    try:
+        for _ in range(100):
+            if not generator.has_work:
+                break
+            _, responses = generator.next()
+            for response in responses:
+                if response.token is not None:
+                    outputs[response.uid].append(response.token)
+            if not added and len(outputs[0]) >= 2:
+                insert(prompts[2:], [6])
+                added = True
+            if outputs[2] and len(outputs[0]) < 40:
+                overlapped = True
+                if cancel:
+                    assert generator.remove(0)
+                    cancel = False
+            batch = generator._generation_batch
+            assert len(getattr(batch, "_all_uids", batch.uids)) <= 2
+        assert not generator.has_work
+        assert overlapped
+        assert len(outputs[1]) == 3
+        assert len(outputs[2]) == 6
+    finally:
+        generator.close()
+
+
+@parametrize("dtype", [mx.float16, mx.bfloat16])
+@parametrize(
+    "batch,length",
+    [
+        (2, 1),
+        (2, 4),
+        (3, 3),
+        (3, 4),
+        (4, 4),
+        (5, 3),
+        (6, 3),
+        (8, 4),
+        (13, 2),
+        (15, 2),
+        (15, 4),
+    ],
+)
+def test_mistral_dspark_wide_projection_matches_native_decode(dtype, batch, length):
+    from mlx_vlm.models.mistral_large4.verify_kernel import native_wide_linear
+
+    mx.random.seed(71)
+    # Include non-tile-aligned output and input tails as well as a large K.
+    for k, n in [(68, 61), (128, 131), (2048, 256), (512, 6144)]:
+        weight = mx.random.normal((n, k)).astype(dtype)
+        x = mx.random.normal((batch, length, k)).astype(dtype)
+        actual = native_wide_linear(weight, x)
+        if actual is None:
+            pytest.skip("Native wide-GEMV is unavailable on this device")
+        expected = mx.concatenate(
+            [mx.contiguous(x[:, t : t + 1]) @ weight.T for t in range(length)], axis=1
+        )
+        equal(actual, expected)
+        if n == 6144:
+            parts = [native_wide_linear(w, x) for w in mx.split(weight, 2)]
+            equal(mx.concatenate(parts, axis=-1), expected)
+
+
+@parametrize("dtype", [mx.float32, mx.bfloat16])
+@parametrize("batch", [1, 2])
+def test_mistral_dspark_verifier_matches_decode(dtype, batch):
+    target, draft = mistral_dspark_case()
+    target.set_dtype(dtype)
+    prompt = mx.array([[1, 2, 3, 4, 5, 6], [6, 5, 4, 3, 2, 1]][:batch])
+    block = mx.array([[7, 8, 9, 10], [10, 9, 8, 7]][:batch])
+    caches = [target.make_cache(), target.make_cache()]
+    if batch > 1:
+        caches = [[c.to_batch([0] * batch) for c in entries] for entries in caches]
+    for cache in caches:
+        mx.eval(target(prompt, cache=cache).logits)
+    ordinary = [
+        target(block[:, i : i + 1], cache=caches[0], capture_layer_ids=[0, 2, 3])
+        for i in range(4)
+    ]
+    output = target(
+        block, cache=caches[1], capture_layer_ids=[0, 2, 3], speculative_verify=True
+    )
+    expected = mx.concatenate([x.logits for x in ordinary], axis=1)
+    np.testing.assert_allclose(
+        np.array(output.logits.astype(mx.float32)),
+        np.array(expected.astype(mx.float32)),
+        atol=0.04 if dtype == mx.bfloat16 else 2e-5,
+        rtol=0.02 if dtype == mx.bfloat16 else 2e-5,
+    )
+    np.testing.assert_array_equal(
+        np.array(mx.argmax(output.logits, axis=-1)),
+        np.array(mx.argmax(expected, axis=-1)),
+    )
+    output.gdn_states.commit(2)
+    for cache in caches[0]:
+        cache.trim(2)
+    next_token = mx.array([[12], [13]][:batch])
+    actual = target(next_token, cache=caches[1]).logits
+    reference = target(next_token, cache=caches[0]).logits
+    np.testing.assert_allclose(
+        np.array(actual.astype(mx.float32)),
+        np.array(reference.astype(mx.float32)),
+        atol=0.04 if dtype == mx.bfloat16 else 2e-5,
+        rtol=0.02 if dtype == mx.bfloat16 else 2e-5,
+    )
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
+@parametrize("prefix,topk", [(3, 2048), (127, 2048), (255, 2048), (127, 128)])
+@parametrize("batch,length", [(2, 1), (2, 4), (8, 2), (8, 4)])
+@parametrize("ragged", [False, True])
+def test_mistral_dspark_verifier_preserves_hidden_logits_and_cache(
+    prefix, topk, batch, length, ragged
+):
+    from mlx_vlm.models.mistral_large4 import speculative_verifier as verifier
+
+    mx.random.seed(79)
+    model, _ = mistral_dspark_case()
+    model.set_dtype(mx.bfloat16)
+    for layer in model.layers:
+        if layer.attention.indexer is not None:
+            layer.attention.indexer.topk = topk
+    initial = [c.to_batch([i % 3 for i in range(batch)]) for c in model.make_cache()]
+    ids = mx.random.randint(1, 60, (batch, prefix))
+    mx.eval(model(ids, cache=initial).logits)
+    if ragged:
+        for c in initial:
+            c._ragged = True
+            c.offset -= mx.arange(batch) % 3
+    ids = mx.random.randint(1, 60, (batch, length))
+    reference_cache, actual_cache = deepcopy(initial), deepcopy(initial)
+    ordinary = [
+        model(ids[:, t : t + 1], cache=reference_cache, capture_layer_ids=[0, 1, 2, 3])
+        for t in range(length)
+    ]
+    expected_hidden = [
+        mx.concatenate([r.hidden_states[i] for r in ordinary], axis=1) for i in range(4)
+    ]
+    expected_logits = mx.concatenate([r.logits for r in ordinary], axis=1)
+    hidden, norm, transaction = verifier.verify_hidden(
+        model, ids, actual_cache, [0, 1, 2, 3]
+    )
+    logits = verifier.verify_logits(model, norm)
+    equal(hidden, expected_hidden)
+    equal(logits, expected_logits)
+    equal([c.state for c in actual_cache], [c.state for c in reference_cache])
+    transaction.abort()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
+def test_mistral_dspark_expert_scales_refresh_without_serializing_runtime_state():
+    from mlx_vlm.models.mistral_large4 import speculative_verifier as verifier
+    from mlx_vlm.models.mistral_large4.config import TextConfig
+    from mlx_vlm.models.mistral_large4.language import MoE
+    from mlx_vlm.quantization.nvfp4 import ScaledQuantizedSwitchLinear
+
+    model, _ = mistral_dspark_case()
+    ffn = MoE(
+        TextConfig(
+            hidden_size=512,
+            moe_intermediate_size=512,
+            n_routed_experts=8,
+            expert_start=0,
+            expert_end=4,
+            n_shared_experts=0,
+            nvfp4=True,
+        )
+    )
+    for name in ("w1", "w3", "w2"):
+        setattr(
+            ffn.experts,
+            name,
+            ScaledQuantizedSwitchLinear(
+                getattr(ffn.experts, name),
+                mx.array([0.25, 0.5, 1.0, 0.75]),
+                "weight_scale_2",
+            ),
+        )
+    ffn.eval()
+    ffn.group = object()
+    model.layers[0].feed_forward = ffn
+    first = verifier._expert_parameters(model, mx.bfloat16)
+    second = verifier._expert_parameters(model, mx.bfloat16)
+    assert all(a is b for a, b in zip(first[id(ffn)][2], second[id(ffn)][2]))
+    assert "_verification_scales" not in model.parameters()
+    ffn.experts.w1.weight_scale_2 = mx.array([0.5, 1.0, 2.0, 1.5])
+    third = verifier._expert_parameters(model, mx.bfloat16)
+    equal(third[id(ffn)][2][0], first[id(ffn)][2][0] * 2)
+    assert third[id(ffn)][2][0] is not first[id(ffn)][2][0]
+    assert third[id(ffn)][2][1] is first[id(ffn)][2][1]
+    ffn.experts.w1.weight = mx.zeros_like(ffn.experts.w1.weight)
+    fourth = verifier._expert_parameters(model, mx.bfloat16)
+    assert fourth[id(ffn)][0][0] is ffn.experts.w1.weight
+    assert fourth[id(ffn)][2][0] is third[id(ffn)][2][0]
+
+
+def test_mistral_dspark_cpu_verification_uses_portable_fallback():
+    with mx.stream(mx.cpu):
+        model, _ = mistral_dspark_case()
+        cache = [c.to_batch([0, 0]) for c in model.make_cache()]
+        mx.eval(model(mx.array([[1, 2, 3], [3, 2, 1]]), cache=cache).logits)
+        expected_cache = deepcopy(cache)
+        ids = mx.array([[4, 5], [5, 4]])
+        expected = mx.concatenate(
+            [model(ids[:, t : t + 1], cache=expected_cache).logits for t in range(2)],
+            axis=1,
+        )
+        result = model(ids, cache=cache, speculative_verify=True)
+        equal(result.logits, expected, atol=2e-5, rtol=2e-5)
+        result.gdn_states.abort()
+
+
+@parametrize("temperature", [0, 0.7])
+@parametrize("prefill_step_size", [None, 2])
+def test_mistral_dspark_standard_generation(
+    temperature, prefill_step_size, monkeypatch
+):
+    lm, draft = mistral_dspark_case()
+    calls = []
+    forward = type(lm).__call__
+
+    def record(self, inputs, *args, **kwargs):
+        calls.append(inputs.shape[1])
+        return forward(self, inputs, *args, **kwargs)
+
+    monkeypatch.setattr(type(lm), "__call__", record)
+    model = NS(
+        language_model=lm,
+        get_input_embeddings=lambda ids, *args, **kwargs: InputEmbeddingsFeatures(
+            inputs_embeds=lm.model.embed_tokens(ids)
+        ),
+    )
+    options = dict(temperature=temperature, prefill_step_size=prefill_step_size)
+    expected = generated(model, **options)
+    calls.clear()
+    actual = generated(model, draft, **options)
+    # Preserve the ordinary prefill boundary, including the final singleton.
+    prefix = [2, 1, 1] if prefill_step_size else [4]
+    assert calls[: len(prefix)] == prefix
+    assert actual == expected
+    assert draft.draft_lens and sum(draft.draft_lens) > 0
+    assert generated(model, draft, **options) == expected
+
+
+def test_mistral_dspark_greedy_matches_bf16_logprob_ties():
+    target, _ = mistral_dspark_case()
+    target.set_dtype(mx.bfloat16)
+    target.lm_head.weight = mx.zeros_like(target.lm_head.weight)
+    target.lm_head.weight[1, 0] = 1e-4
+    hidden = mx.zeros((1, 4, 32), dtype=mx.bfloat16)
+    hidden[..., 0] = 1
+    from mlx_vlm.models.mistral_large4.speculative_verifier import verify_logits
+
+    logits = verify_logits(target, hidden)
+    assert mx.argmax(logits, axis=-1).tolist() == [[1, 1, 1, 1]]
+    # Subtraction rounds these nearby logits to a BF16 tie in generate_step.
+    assert target.speculative_argmax_from_hidden(hidden).tolist() == [[0, 0, 0, 0]]
+
+
 def module(name):
     return importlib.import_module("mlx_vlm." + name)
 
@@ -263,7 +782,7 @@ def greedy(logits):
     return mx.argmax(logits, axis=-1)
 
 
-def generated(target, drafter=None, *, seed=41, temperature=0):
+def generated(target, drafter=None, *, seed=41, temperature=0, prefill_step_size=None):
     if seed is None:
         mx.random.seed(47)
     options = {} if drafter is None else dict(draft_model=drafter, draft_kind="dflash")
@@ -277,7 +796,7 @@ def generated(target, drafter=None, *, seed=41, temperature=0):
             max_tokens=24 if seed is None else 12,
             temperature=temperature,
             seed=seed,
-            prefill_step_size=None,
+            prefill_step_size=prefill_step_size,
             **options,
         )
     ]

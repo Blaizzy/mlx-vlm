@@ -1579,6 +1579,14 @@ class SpeculativeGenerationBatch:
         self._finished = [False] * len(uids)
         self._sent_first = False
         self._rounds_iter = None
+        self.can_extend = (
+            draft_kind == "dflash"
+            and callable(getattr(draft_model, "draft_batch", None))
+            and all(callable(getattr(c, "extend", None)) for c in prompt_cache)
+        )
+        self._batch_state = None
+        self._batch_rows = list(range(len(uids)))
+        self._pending_first = list(range(len(uids)))
 
     def __len__(self):
         return sum(not done for done in self._finished)
@@ -1601,11 +1609,30 @@ class SpeculativeGenerationBatch:
         self.hidden = None
         self.shared_kv_states = None
         self.prompt_tokens = None
+        self._batch_state = None
+        self._batch_rows = []
+        self._pending_first = []
         mx.clear_cache()
 
     def extend(self, other: "SpeculativeGenerationBatch"):
         if len(self) == 0:
             self.__dict__.update(other.__dict__)
+            return
+        if self.can_extend and other.can_extend:
+            self._ensure_batch_state()
+            self._batch_state.extend(
+                other.prompt_cache, other.hidden, other.first_tokens
+            )
+            start = len(self._all_uids)
+            incoming = list(range(start, start + len(other._all_uids)))
+            self._all_uids.extend(other._all_uids)
+            self.first_tokens = mx.concatenate([self.first_tokens, other.first_tokens])
+            self.max_tokens.extend(other.max_tokens)
+            self._num_tokens.extend(other._num_tokens)
+            self._finished.extend(other._finished)
+            self._batch_rows.extend(incoming)
+            self._pending_first.extend(incoming)
+            self._refresh_uids()
             return
         raise RuntimeError("Cannot extend an active speculative generation batch.")
 
@@ -1614,7 +1641,73 @@ class SpeculativeGenerationBatch:
         for i, uid in enumerate(self._all_uids):
             if uid not in keep_uids:
                 self._finished[i] = True
+        if self.can_extend:
+            self._prune_batch_state()
         self._refresh_uids()
+
+    def _ensure_batch_state(self):
+        if self._batch_state is None:
+            from ..speculative.dflash import DFlashBatch
+
+            self._batch_state = DFlashBatch(
+                self.model,
+                self.draft_model,
+                self.prompt_cache,
+                self.hidden,
+                self.first_tokens[mx.array(self._batch_rows, mx.int32)],
+                self.draft_block_size,
+                self.sampler,
+                self.token_dtype,
+                self.greedy_sampling,
+            )
+            self.hidden = None
+
+    def _prune_batch_state(self):
+        keep = [i for i, row in enumerate(self._batch_rows) if not self._finished[row]]
+        if len(keep) != len(self._batch_rows):
+            if self._batch_state is not None:
+                self._batch_state.filter(keep)
+            elif keep:
+                indices = mx.array(keep, mx.int32)
+                for cache in self.prompt_cache:
+                    cache.filter(indices)
+                self.hidden = self.hidden[indices]
+            rows = [self._batch_rows[i] for i in keep]
+            pending = set(self._pending_first)
+            self._pending_first = [i for i, row in enumerate(rows) if row in pending]
+            self.first_tokens = self.first_tokens[mx.array(rows, mx.int32)]
+            self._all_uids = [self._all_uids[row] for row in rows]
+            self.max_tokens = [self.max_tokens[row] for row in rows]
+            self._num_tokens = [self._num_tokens[row] for row in rows]
+            self._finished = [False] * len(rows)
+            self._batch_rows = list(range(len(rows)))
+
+    def _next_continuous(self):
+        responses = []
+        if self._pending_first:
+            first = self.first_tokens.tolist()
+            pending, self._pending_first = self._pending_first, []
+            tokens = [
+                first[row] if row in pending else None
+                for row in range(len(self._all_uids))
+            ]
+            self._append_token_responses(responses, tokens)
+        else:
+            self._ensure_batch_state()
+            rows = self._batch_rows[:]
+            budgets = [self.max_tokens[row] - self._num_tokens[row] for row in rows]
+            emitted = self._batch_state.step(
+                budgets, [self._num_tokens[row] for row in rows]
+            )
+            for position in range(max(map(len, emitted))):
+                tokens = [None] * len(self._all_uids)
+                for row, values in zip(rows, emitted):
+                    if position < len(values):
+                        tokens[row] = values[position]
+                self._append_token_responses(responses, tokens)
+        self._prune_batch_state()
+        self._refresh_uids()
+        return responses
 
     def cache_states(self):
         return [c.state for c in self.prompt_cache if hasattr(c, "state")]
@@ -1682,6 +1775,9 @@ class SpeculativeGenerationBatch:
     def next(self) -> List[GenerationBatch.Response]:
         if len(self) == 0:
             return []
+
+        if self.can_extend:
+            return self._next_continuous()
 
         responses: List[GenerationBatch.Response] = []
         if not self._sent_first:
@@ -3103,6 +3199,7 @@ class BatchGenerator:
 
         if (
             getattr(self._generation_batch, "is_speculative", False)
+            and not getattr(self._generation_batch, "can_extend", False)
             and len(self._generation_batch) > 0
         ):
             return prompt_responses, generation_responses
@@ -3137,12 +3234,14 @@ class BatchGenerator:
 
         num_active = len(self._generation_batch)
         num_to_add = self.completion_batch_size - num_active
-        if self._unprocessed_sequences and num_to_add >= self.prefill_batch_size:
+        if self._unprocessed_sequences and num_to_add > 0:
             # Take up to prefill_batch_size pending sequences. If APC is on
             # and at least one of them has a prefix hit, build a mixed
             # warm/cold PromptProcessingBatch with right-padded suffixes so
             # warm and cold rows prefill in a single forward pass.
-            n = min(self.prefill_batch_size, len(self._unprocessed_sequences))
+            n = min(
+                num_to_add, self.prefill_batch_size, len(self._unprocessed_sequences)
+            )
             sequences = self._unprocessed_sequences[:n]
             coordinator = getattr(self, "apc", None)
             if coordinator is not None:
