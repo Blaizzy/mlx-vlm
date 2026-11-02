@@ -1,8 +1,10 @@
-"""Masked NVFP4 decode matvec, adapted from MLX's fp_qmv_fast_impl.
+"""Masked NVFP4 decode matvec for locally owned expert routes.
 
-MLX copyright Apple Inc., MIT license. Same 16-value dot grouping, FP32
-accumulation, global scale and output rounding; skip unowned route tiles.
+Same 16-value dot grouping, FP32 accumulation, global scale and output
+rounding; skip unowned route tiles.
 """
+
+# Copyright © 2023 Apple Inc. (MLX portions). MIT; see LICENSE.
 
 from functools import lru_cache
 
@@ -99,34 +101,6 @@ def masked_qmv(x, linear, indices):
 # Keep the native runtime loop bounds and arithmetic order: constexpr loop
 # bounds or fast math can change BF16 rounding and subsequent expert routing.
 _HEADER = r"""
-/*
-MIT License
-
-Copyright © 2023 Apple Inc.
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-Copied from MLX 1ba7f969ad05d86decfeeb83787cc9b79e440962:
-mlx/backend/metal/kernels/{fp4.h,fp8.h,fp_quantized.h}.
-*/
-// Copyright Apple Inc. MIT license. From MLX 1ba7f969.
-
 
 constant constexpr float F8E4M3_MAX = 448.0f;
 constant constexpr float F4E2M1_MAX = 6.0f;

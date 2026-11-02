@@ -1,5 +1,7 @@
 """Batched verifier projections with the native small-batch reduction order."""
 
+# Copyright © 2023 Apple Inc. (MLX portions). MIT; see LICENSE.
+
 from functools import lru_cache
 
 import mlx.core as mx
@@ -92,34 +94,6 @@ def native_wide_linear(weight, x, group=None):
 
 _HEADER = r"""
 
-/*
-MIT License
-
-Copyright © 2023 Apple Inc.
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-Copied from MLX 1ba7f969ad05d86decfeeb83787cc9b79e440962:
-mlx/backend/metal/kernels/gemv.h.
-*/
-
-// GemvWide from MLX 1ba7f969, mlx/backend/metal/kernels/gemv.h.
 #define MLX_MTL_PRAGMA_UNROLL _Pragma("unroll")
 constant constexpr bool gemv_wide_do_axpby = false;
 template <
