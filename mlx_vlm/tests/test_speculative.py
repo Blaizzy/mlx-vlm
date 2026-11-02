@@ -271,9 +271,8 @@ def test_mistral_dspark_ragged_rollback_includes_shared_and_index_only_caches():
 def test_mistral_dspark_admits_requests_while_batch_is_active(cancel, sampling):
     from types import SimpleNamespace
 
-    from mlx_lm.sample_utils import make_sampler
-
     from mlx_vlm.generate.ar import BatchGenerator
+    from mlx_vlm.sample_utils import make_sampler
     from mlx_vlm.server.generation import _PositionedTargetSampler
     from mlx_vlm.utils import StoppingCriteria
 
