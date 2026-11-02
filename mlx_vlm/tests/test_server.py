@@ -615,9 +615,10 @@ class TestContinuation:
         monkeypatch.delenv("MLX_VLM_SERVER_API_KEY", raising=False)
 
     @pytest.mark.parametrize("api", ["chat", "responses"])
-    @pytest.mark.parametrize("ttl", [0, 60, 600])
+    @pytest.mark.parametrize("ttl", [None, 0, 60, 600])
     def test_checkpoint_advertises_server_idle_timeout(self, client, api, ttl):
-        continuation.CHECKPOINTS.ttl = ttl
+        if ttl is not None:
+            continuation.CHECKPOINTS.ttl = ttl
         with _endpoint(
             generator=_resumable_streaming([_token("answer", finish_reason="stop")])
         ):
@@ -626,7 +627,8 @@ class TestContinuation:
             e["continuation"] for e in _data(response) if "continuation" in e
         ]
         assert checkpoints
-        assert all(c["idle_timeout_seconds"] == ttl for c in checkpoints)
+        expected_ttl = 120 if ttl is None else ttl
+        assert all(c["idle_timeout_seconds"] == expected_ttl for c in checkpoints)
 
     def test_client_timeout_metadata_does_not_change_server_retention(self):
         record = continuation.Generation(

@@ -45,7 +45,7 @@ class SessionOutput:
 
 
 class InferenceSession:
-    def __init__(self, *, ttl=600, source=None):
+    def __init__(self, *, ttl=120, source=None):
         self.condition = Condition()
         self.history = []
         self.context = None
