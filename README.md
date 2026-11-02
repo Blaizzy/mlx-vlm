@@ -77,7 +77,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | Ternary Bonsai 2 | [Docs](mlx_vlm/models/prism_hadamard_qwen35/README.md) |
 | Flint | [Docs](mlx_vlm/models/flint/README.md) |
 | Nemotron 3.5 Super VL / Bolt / Nano Omni | [Docs](mlx_vlm/models/nemotron_h_nano_omni/README.md) |
-| Idol (image to 3D: PLY, GLB, OBJ) | [Docs](mlx_vlm/models/idol/README.md) |
+| Idol (image to 3D Gaussian splats) | [Docs](mlx_vlm/models/idol/README.md) |
 
 ## Installation
 
@@ -613,7 +613,7 @@ mlx_vlm.server --model-dir /Volumes/Models --model-dir ~/my-custom-model
 
 - `--model`: Preload a language model at server startup, accepts a Hugging Face repo ID or local path (optional, loads lazily on first request if omitted)
 - `--image-model`: Preload an image generation model at server startup
-- `--mesh-model`: Preload an image-to-3D model for asynchronous PLY, GLB, and OBJ generation
+- `--mesh-model`: Preload an image-to-3D model for asynchronous PLY generation
 - `--tts-model`: Preload a text-to-speech model at server startup
 - `--stt-model`: Preload a speech-to-text model at server startup
 - `--embedding-model`: Preload an embedding model at server startup

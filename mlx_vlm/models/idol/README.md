@@ -4,7 +4,6 @@ Native MLX port of [speridlabs/idol-sdk](https://github.com/speridlabs/idol-sdk)
 using the original [speridlabs/idol](https://huggingface.co/speridlabs/idol) weights.
 An object image becomes a standard 3D Gaussian Splatting `.ply` file, a prepared
 input PNG, and predicted camera parameters in JSON.
-GLB and OBJ outputs reconstruct a colored surface mesh from the splats.
 
 The denoiser, octree decoder, Gaussian decoder, DINOv3, FLUX.2 VAE encoder, and
 BiRefNet (including deformable convolutions) run in MLX. NumPy and Pillow handle
@@ -17,12 +16,6 @@ From this checkout:
 
 ```sh
 pip install -e .
-```
-
-For GLB and OBJ surface reconstruction, install the optional CPU mesh dependencies:
-
-```sh
-pip install -e '.[three_d]'
 ```
 
 The first generation downloads all four Idol checkpoints (about 3.1 GB) to the
@@ -52,17 +45,8 @@ Use `mode="real"` for photos; the default `synthetic` mode is for renders and
 generated images. The shared CLI accepts one image path, URL, or data URI.
 A transparent input skips background removal. The default output is
 `outputs/object-42.ply`, with prepared input and camera files beside it.
-Use a `.glb` or `.obj` output suffix to export a surface mesh instead. PLY keeps
-the original splats; GLB and OBJ use marching cubes on an opacity-weighted
-anisotropic Gaussian density field and transfer the splats' colors to vertices.
-This is an approximate reconstruction: thin details, transparency, and splat
-appearance can change. GLB embeds vertex colors; OBJ uses the vertex-color
-extension, which some viewers ignore. No texture atlas is generated.
-
-Mesh export options go in `--gen-kwargs`: `mesh_resolution` is the grid size
-(32–256, default 128), and `mesh_threshold` is a positive density level
-(default 0.5). Higher resolution costs more CPU time and memory. All three
-formats use y-up coordinates.
+PLY preserves the original splats in y-up coordinates and needs a Gaussian-splat
+viewer. Export uses NumPy and does not require additional dependencies.
 
 Defaults match the SDK: 50 Euler steps, guidance strength 3.0, time shift 3.0,
 seed 42, and 262,144 Gaussians. Use the shared `--steps`, `--guidance`, `--seed`,
@@ -85,9 +69,6 @@ print(result.path, result.camera)
 
 # Or export just the splats:
 result.gaussian.save_ply("outputs/splats.ply")
-
-# Reuse the generated splats to export a surface, without running Idol again:
-result.save("outputs/object.glb", mesh_resolution=128, mesh_threshold=0.5)
 ```
 
 For local encoders or offline use:
@@ -121,14 +102,14 @@ a text tokenizer or applying a chat template.
 ## Server
 
 The server provides asynchronous image-to-3D generation at `/v1/meshes`,
-with `ply`, `glb`, and `obj` output formats.
+with Gaussian-splat PLY output.
 
 ```sh
 mlx_vlm.server --mesh-model speridlabs/idol
 
 curl http://localhost:8080/v1/meshes \
   -F 'image=@object.png' \
-  -F 'output_format=glb' \
+  -F 'output_format=ply' \
   -F 'num_inference_steps=50' \
   -F 'guidance_scale=3' \
   -F 'seed=42'
@@ -139,22 +120,22 @@ or `failed`, then download the artifact:
 
 ```sh
 curl http://localhost:8080/v1/meshes/MESH_ID
-curl http://localhost:8080/v1/meshes/MESH_ID/content -o object.glb
+curl http://localhost:8080/v1/meshes/MESH_ID/content -o object.ply
 ```
 
 Supply `model` in the request if it was not preloaded. Multipart requests accept
 one `image` upload or `url`; JSON requests accept `input_image` (a path, URL,
-or image data URI). The API defaults to GLB. `num_inference_steps`
+or image data URI). The API defaults to PLY. `num_inference_steps`
 and `guidance_scale` also accept the shared aliases `steps` and `guidance`.
 Idol options include `mode`, `num_gaussians`, `rescale_t`, `crop_margin`,
-`batch_cfg`, `mesh_resolution`, and `mesh_threshold`. Idol uses image conditioning;
-text and negative prompts are not supported.
+and `batch_cfg`. Idol uses image conditioning; text and negative prompts are
+not supported.
 
 Jobs move through `queued`, `in_progress`, and `completed` or `failed`. Progress
 is 0 until completion, then 100. Responses include `format`, `representation`
-(`gaussian_splat` for PLY, `surface_mesh` for GLB/OBJ), camera parameters,
-file size, and a download URL. Generation runs serially in a worker, including
-model switches. Polling and downloads remain responsive; `/unload` and server
+(`gaussian_splat`), camera parameters, file size, and a download URL.
+Generation and model switches run serially in a worker. Polling and downloads
+remain responsive; `/unload` and server
 shutdown wait for accepted jobs to finish before releasing weights.
 
 `GET /v1/meshes` lists jobs with `limit` (1–100), `order` (`asc` or `desc`), and
@@ -216,14 +197,11 @@ access to both encoder checkpoints:
   0.9993 to Transformers on CPU. The pretrained VAE posterior mean and log
   variance had relative L2 differences of 0.0255 and 0.0080 against Diffusers
   on MPS. These are numerical comparisons, not reconstruction-quality scores.
-- The preloaded HTTP server completed queued PLY, GLB, and OBJ requests using
-  the castle image, two steps, and 32,768 Gaussians. Its PLY matched the shared
-  CLI output byte for byte; GLB and OBJ reloaded as watertight meshes with
-  17,545 vertices and 34,690 triangles. Authentication, polling, and downloads
-  after model unload were also checked.
-- Reconstructing the full 262,144-splat castle at mesh resolution 128 took
-  5.2 seconds on CPU and produced a watertight mesh with 199,656 triangles.
-  Front, side, and rear views of the colored surface were inspected.
+- The preloaded HTTP server completed queued castle, factory, and robot jobs
+  using 50 steps and 262,144 Gaussians each. All three PLYs were downloaded
+  through the content endpoint and matched the Python API outputs byte for
+  byte. Authentication, polling, and downloads after model unload were also
+  checked.
 
 ## Attribution
 

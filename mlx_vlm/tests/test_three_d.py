@@ -107,9 +107,8 @@ def test_image_conditioned_generation(family, tmp_path):
     assert json.loads((tmp_path / "image_camera.json").read_text()) == result.camera
 
 
-@pytest.mark.parametrize("extension", ["ply", "glb", "obj"])
-def test_3d_cli_uses_shared_options_and_saves(tmp_path, extension):
-    output = tmp_path / f"castle.{extension}"
+def test_3d_cli_uses_shared_options_and_saves(tmp_path):
+    output = tmp_path / "castle.ply"
     args = _cli_args(
         "--output-modality",
         "3d",
@@ -151,6 +150,8 @@ def test_3d_cli_uses_shared_options_and_saves(tmp_path, extension):
         [],
         ["--image", "one.png", "two.png"],
         ["--image", "one.png", "--output", "out.png"],
+        ["--image", "one.png", "--output", "out.glb"],
+        ["--image", "one.png", "--output", "out.obj"],
         ["--image", "one.png", "--task", "edit"],
     ],
 )
@@ -196,65 +197,6 @@ def _ellipsoid():
     return gaussian
 
 
-@pytest.mark.parametrize("extension", ["glb", "obj"])
-def test_surface_export_matches_gaussian_isosurface(tmp_path, extension):
-    trimesh = pytest.importorskip("trimesh")
-    pytest.importorskip("skimage")
-    gaussian = _ellipsoid()
-    result = IdolOutput(gaussian, Image.new("RGB", (8, 8)), {"fov": 30.0})
-    path = result.save(tmp_path / f"ellipsoid.{extension}", mesh_resolution=64)
-    mesh = trimesh.load(path, force="mesh", process=False)
-    assert len(mesh.faces) > 100 and mesh.is_watertight
-    assert mesh.volume > 0  # Outward face winding survives the y-up rotation.
-    expected_center = np.array([0.1, -0.3, 0.2])
-    expected_radius = np.array([0.12, 0.04, 0.07]) * np.sqrt(2 * np.log(0.9 / 0.5))
-    np.testing.assert_allclose(
-        mesh.bounds,
-        [expected_center - expected_radius, expected_center + expected_radius],
-        atol=0.002,
-    )
-    colors = np.array([0.5 + 0.28209479, 0.5 - 0.28209479, 0.5]) * 255
-    np.testing.assert_allclose(
-        mesh.visual.vertex_colors[:, :3].mean(axis=0), colors, atol=1
-    )
-    assert path.with_name("ellipsoid_input.png").is_file()
-    assert (
-        json.loads(path.with_name("ellipsoid_camera.json").read_text()) == result.camera
-    )
-
-
-@pytest.mark.parametrize(
-    "options",
-    [
-        {"resolution": 0},
-        {"resolution": 257},
-        {"threshold": 0},
-        {"threshold": float("nan")},
-    ],
-)
-def test_surface_rejects_invalid_settings(options):
-    from mlx_vlm.models.idol.mesh import reconstruct_mesh
-
-    with pytest.raises(ValueError):
-        reconstruct_mesh(_ellipsoid(), **options)
-
-
-def test_3d_export_options_do_not_reach_model(tmp_path):
-    result = SimpleNamespace(save=Mock())
-    model = Mock(return_value=result)
-    path = tmp_path / "object.obj"
-    generate_3d(
-        model,
-        "image.png",
-        output_path=path,
-        mesh_resolution=64,
-        mesh_threshold=0.3,
-        seed=7,
-    )
-    model.assert_called_once_with("image.png", seed=7)
-    result.save.assert_called_once_with(path, mesh_resolution=64, mesh_threshold=0.3)
-
-
 @pytest.fixture
 def mesh_client(monkeypatch, tmp_path):
     from fastapi.testclient import TestClient
@@ -282,14 +224,10 @@ def _wait_mesh(client, job_id):
     pytest.fail("Mesh job did not finish")
 
 
-@pytest.mark.parametrize("extension", ["ply", "glb", "obj"])
-def test_mesh_server_job_lifecycle(mesh_client, monkeypatch, tmp_path, extension):
+def test_mesh_server_job_lifecycle(mesh_client, monkeypatch, tmp_path):
     import mlx_vlm.server as server
     from mlx_vlm.utils import load_image
 
-    if extension != "ply":
-        pytest.importorskip("trimesh")
-        pytest.importorskip("skimage")
     started, release = Event(), Event()
     calls = []
 
@@ -309,10 +247,8 @@ def test_mesh_server_job_lifecycle(mesh_client, monkeypatch, tmp_path, extension
             "/v1/meshes",
             data={
                 "model": "idol",
-                "output_format": extension,
                 "num_inference_steps": "2",
                 "guidance_scale": "2.5",
-                "mesh_resolution": "32",
             },
             files={"image": ("../../input.png", image.getvalue(), "image/png")},
         )
@@ -329,16 +265,13 @@ def test_mesh_server_job_lifecycle(mesh_client, monkeypatch, tmp_path, extension
         release.set()
     completed = _wait_mesh(mesh_client, job["id"])
     assert completed["status"] == "completed", completed
-    assert completed["representation"] == (
-        "gaussian_splat" if extension == "ply" else "surface_mesh"
-    )
+    assert completed["format"] == "ply"
+    assert completed["representation"] == "gaussian_splat"
     assert completed["camera"] == {"fov": 30.0}
     content = mesh_client.get(completed["url"])
     assert content.status_code == 200
     assert len(content.content) == completed["file_size_bytes"]
-    assert content.content.startswith(
-        {"ply": b"ply\n", "glb": b"glTF", "obj": b"#"}[extension]
-    )
+    assert content.content.startswith(b"ply\n")
     assert calls[0][0].getpixel((0, 0))[-1] == 127
     assert calls[0][1]["steps"] == 2 and calls[0][1]["cfg_strength"] == 2.5
     load.assert_called_once_with("idol", model_kind="mesh_generation")
@@ -348,7 +281,7 @@ def test_mesh_server_job_lifecycle(mesh_client, monkeypatch, tmp_path, extension
     assert mesh_client.delete(f"/v1/meshes/{job['id']}").json()["status"] == "deleted"
     assert mesh_client.get(f"/v1/meshes/{job['id']}").status_code == 404
     assert mesh_client.get(completed["url"]).status_code == 404
-    assert (tmp_path / job["id"] / f"output.{extension}").is_file()
+    assert (tmp_path / job["id"] / "output.ply").is_file()
     assert not (tmp_path.parent / "input.png").exists()
 
 
@@ -358,6 +291,8 @@ def test_mesh_server_job_lifecycle(mesh_client, monkeypatch, tmp_path, extension
         ({"model": "idol"}, 422),
         ({"input_image": "image.png"}, 400),
         ({"model": "idol", "input_image": "image.png", "output_format": "stl"}, 422),
+        ({"model": "idol", "input_image": "image.png", "output_format": "glb"}, 422),
+        ({"model": "idol", "input_image": "image.png", "output_format": "obj"}, 422),
         ({"model": "idol", "input_image": "image.png", "num_inference_steps": 0}, 422),
         ({"model": "idol", "input_image": "image.png", "guidance_scale": "nan"}, 422),
         ({"model": "idol", "input_image": "image.png", "prompt": "red castle"}, 422),

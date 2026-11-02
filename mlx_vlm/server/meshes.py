@@ -26,7 +26,7 @@ class MeshGenerationRequest(BaseModel):
 
     model: str | None = Field(None, min_length=1)
     input_image: str | None = None
-    output_format: Literal["ply", "glb", "obj"] = "glb"
+    output_format: Literal["ply"] = "ply"
     seed: int = Field(42, ge=0, le=2**32 - 1)
     num_inference_steps: int = Field(
         50, ge=1, validation_alias=AliasChoices("num_inference_steps", "steps")
@@ -42,8 +42,6 @@ class MeshGenerationRequest(BaseModel):
     rescale_t: float = Field(3.0, gt=0)
     crop_margin: float | None = Field(None, gt=0)
     batch_cfg: bool = False
-    mesh_resolution: int = Field(128, ge=32, le=256)
-    mesh_threshold: float = Field(0.5, gt=0)
 
 
 class MeshResponse(BaseModel):
@@ -54,8 +52,8 @@ class MeshResponse(BaseModel):
     progress: int = 0
     created_at: int
     completed_at: int | None = None
-    format: Literal["ply", "glb", "obj"]
-    representation: Literal["gaussian_splat", "surface_mesh"]
+    format: Literal["ply"] = "ply"
+    representation: Literal["gaussian_splat"] = "gaussian_splat"
     seed: int
     url: str | None = None
     file_size_bytes: int | None = None
@@ -88,16 +86,12 @@ class MeshJobs:
     def submit(self, request, image):
         job_id = f"mesh_{uuid.uuid4().hex}"
         root = Path(os.environ.get("MLX_VLM_MESH_OUTPUT_DIR", "outputs/meshes"))
-        path = root.expanduser().resolve() / job_id / f"output.{request.output_format}"
+        path = root.expanduser().resolve() / job_id / "output.ply"
         job = MeshResponse(
             id=job_id,
             model=request.model,
             status="queued",
             created_at=int(time.time()),
-            format=request.output_format,
-            representation=(
-                "gaussian_splat" if request.output_format == "ply" else "surface_mesh"
-            ),
             seed=request.seed,
         )
         with self.lock:
@@ -138,8 +132,6 @@ class MeshJobs:
                 rescale_t=request.rescale_t,
                 crop_margin=request.crop_margin,
                 batch_cfg=request.batch_cfg,
-                mesh_resolution=request.mesh_resolution,
-                mesh_threshold=request.mesh_threshold,
             )
             self._update(
                 job_id,
@@ -306,9 +298,6 @@ def register_routes(app, deps):
             path = store.paths.get(mesh_id)
         if job.status != "completed" or path is None or not path.is_file():
             raise HTTPException(404, "Mesh output is not available")
-        media_type = {
-            "ply": "application/octet-stream",
-            "glb": "model/gltf-binary",
-            "obj": "text/plain",
-        }[job.format]
-        return FileResponse(path, media_type=media_type, filename=path.name)
+        return FileResponse(
+            path, media_type="application/octet-stream", filename=path.name
+        )

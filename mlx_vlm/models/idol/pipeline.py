@@ -24,9 +24,10 @@ class IdolOutput:
     camera: dict
     path: Path | None = None
 
-    def save(self, path, **export_kwargs):
-        """Save the 3D artifact, prepared input, and predicted camera beside it."""
-        path = self.gaussian.save(path, **export_kwargs)
+    def save(self, path):
+        """Save .ply, the prepared input, and predicted camera beside it."""
+        path = Path(path).expanduser().with_suffix(".ply")
+        self.gaussian.save_ply(path)
         self.preprocessed_image.save(path.with_name(path.stem + "_input.png"))
         path.with_name(path.stem + "_camera.json").write_text(
             json.dumps(self.camera, indent=2) + "\n"
