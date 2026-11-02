@@ -614,6 +614,36 @@ class TestContinuation:
         monkeypatch.setattr(continuation, "CHECKPOINTS", continuation.Checkpoints())
         monkeypatch.delenv("MLX_VLM_SERVER_API_KEY", raising=False)
 
+    @pytest.mark.parametrize("api", ["chat", "responses"])
+    @pytest.mark.parametrize("ttl", [0, 60, 600])
+    def test_checkpoint_advertises_server_idle_timeout(self, client, api, ttl):
+        continuation.CHECKPOINTS.ttl = ttl
+        with _endpoint(
+            generator=_resumable_streaming([_token("answer", finish_reason="stop")])
+        ):
+            response = _post(client, api, stream=True, resumable=True)
+        checkpoints = [
+            e["continuation"] for e in _data(response) if "continuation" in e
+        ]
+        assert checkpoints
+        assert all(c["idle_timeout_seconds"] == ttl for c in checkpoints)
+
+    def test_client_timeout_metadata_does_not_change_server_retention(self):
+        record = continuation.Generation(
+            {},
+            "tenant",
+            "/responses",
+            prompt="prompt",
+            parts=["raw"],
+            session=sessions.InferenceSession(),
+        )
+        continuation.CHECKPOINTS.add(record)
+        checkpoint = continuation.StreamState(record).checkpoint()
+        checkpoint["idle_timeout_seconds"] = 10_000
+        record.touched -= continuation.CHECKPOINTS.ttl + 1
+        with pytest.raises(ValueError, match="no longer available"):
+            continuation.CHECKPOINTS.resume(checkpoint, "tenant", "/responses")
+
     @pytest.mark.parametrize("state", ["paused", "completed", "not_started"])
     def test_prune_releases_expired_request_text_and_decoder(self, state):
         store = continuation.Checkpoints(ttl=10)

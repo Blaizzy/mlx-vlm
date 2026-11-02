@@ -209,6 +209,9 @@ class StreamState:
             "content": self.delivered["content"],
             "reasoning": self.delivered["reasoning"],
             "responses": self.record.path.endswith("/responses"),
+            # The idle clock starts when the stream is disconnected, not when
+            # this event is emitted. Clients can start their own timer on Stop.
+            "idle_timeout_seconds": CHECKPOINTS.ttl,
         }
 
     def event(self, event):
