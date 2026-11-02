@@ -638,6 +638,11 @@ mlx_vlm.server --model-dir /Volumes/Models --model-dir ~/my-custom-model
 - `--api-key`: Bearer token required for inference, model discovery, and management endpoints
 - `--log-level`: Logging level — `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (default: `INFO`)
 
+Streaming `/v1/chat/completions` and `/v1/responses` send invisible SSE comments
+every 15 seconds while idle, keeping connections alive during queueing and long
+prefills. Set `MLX_VLM_STREAM_KEEPALIVE_INTERVAL` to a different interval in seconds
+or `0` to disable it. This does not change model output or generation timeouts.
+
 For higher-resolution image input, including OCR with Bonsai 2, set pixel-area
 defaults at startup:
 
