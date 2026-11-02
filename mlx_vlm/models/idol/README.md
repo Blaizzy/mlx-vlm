@@ -16,12 +16,10 @@ From this checkout:
 
 ```sh
 pip install -e .
-python -m mlx_vlm.models.idol --download-only
 ```
 
-This downloads all four Idol checkpoints (about 3.1 GB) to the Hugging Face
-cache and prints their snapshot directory. Pass `--model /path/to/idol` to
-use an existing local directory. `--local-files-only` disables downloads.
+The first generation downloads all four Idol checkpoints (about 3.1 GB) to the
+Hugging Face cache. Pass `--model /path/to/idol` to use a local directory.
 
 Image conditioning also requires authorized access to both upstream encoders:
 
@@ -36,62 +34,68 @@ or to sample and decode precomputed conditioning features.
 ## Generate
 
 ```sh
-python -m mlx_vlm.models.idol \
+python -m mlx_vlm.generate \
+  --model speridlabs/idol --output-modality 3d \
   --image photo.jpg \
-  --mode real \
-  --output outputs/object.ply
+  --output outputs/object.ply \
+  --gen-kwargs '{"mode": "real"}'
 ```
 
-Use `--mode synthetic` (the default) for renders and generated images. A directory
-can be passed to `--image` to process multiple images; use an output directory
-in that case. A transparent RGBA input skips background removal. To require
-transparency, pass `--no-background-removal`.
+Use `mode="real"` for photos; the default `synthetic` mode is for renders and
+generated images. The shared CLI accepts one image path, URL, or data URI.
+A transparent input skips background removal. The default output is
+`outputs/object-42.ply`, with prepared input and camera files beside it.
 
 Defaults match the SDK: 50 Euler steps, guidance strength 3.0, time shift 3.0,
-seed 42, and 262,144 Gaussians. `--num-gaussians` accepts multiples of 32 from
-32,768 to 1,048,576. `--steps`, `--cfg-strength`, `--rescale-t`, `--crop-margin`,
-and `--seed` override these settings. `--batch-cfg` batches the positive and
-negative passes at the cost of more memory. MLX and PyTorch use different random
-number generators, so matching seeds do not produce identical objects across
-the two implementations.
-
-For local encoders:
-
-```sh
-python -m mlx_vlm.models.idol --image object.png \
-  --dinov3 /path/to/dinov3 \
-  --flux2-vae /path/to/FLUX.2-dev/vae \
-  --local-files-only
-```
-
-DINOv3 defaults to bfloat16 (`--dinov3-dtype fp32` selects full precision).
-The generation transformers use float16 linear layers and float32 embeddings,
-norm parameters, and learned rotary positions, matching the SDK. BiRefNet uses
-float32, and the VAE uses bfloat16.
+seed 42, and 262,144 Gaussians. Use the shared `--steps`, `--guidance`, `--seed`,
+and `--verbose` flags. Model-specific options go in `--gen-kwargs`, for example
+`'{"mode": "real", "num_gaussians": 32768, "batch_cfg": true}'`.
+`num_gaussians` accepts multiples of 32 from 32,768 to 1,048,576;
+`rescale_t` and `crop_margin` override time shift and framing. `batch_cfg`
+batches the positive and negative passes at the cost of more memory.
+MLX and PyTorch use different random number generators, so matching seeds
+do not produce identical objects across the two implementations.
 
 ## Python
 
 ```python
-from mlx_vlm.models.idol import IdolPipeline
+from mlx_vlm.generate import generate_3d, load_3d_model
 
-pipeline = IdolPipeline.from_pretrained("speridlabs/idol")
-result = pipeline("photo.jpg", mode="real", seed=42)
-result.save("outputs/object.ply")  # also writes _input.png and _camera.json
+model = load_3d_model("speridlabs/idol")
+result = generate_3d(model, "photo.jpg", mode="real", output_path="outputs/object.ply")
+print(result.path, result.camera)
 
 # Or export just the splats:
 result.gaussian.save_ply("outputs/splats.ply")
-print(result.camera)
 ```
 
-`pipeline.sample(condition, ...)` accepts `feature1` (DINOv3) and `feature2`
+For local encoders or offline use:
+
+```python
+model = load_3d_model(
+    "/path/to/idol",
+    dinov3="/path/to/dinov3",
+    flux2_vae="/path/to/FLUX.2-dev/vae",
+    local_files_only=True,
+)
+```
+
+Loader options also include `dinov3_dtype="fp32"` (default: `"bf16"`) and
+`background_removal=False` to require an image with transparency.
+The generation transformers use float16 linear layers and float32 embeddings,
+norm parameters, and learned rotary positions, matching the SDK. BiRefNet uses
+float32, and the VAE uses bfloat16.
+
+`model.sample(condition, ...)` accepts `feature1` (DINOv3) and `feature2`
 (VAE) MLX arrays, and returns a dictionary with `latent` and `camera` arrays.
 At the standard 1024px resolution, conditioning shapes are `[1, 4101, 1280]`
-and `[1, 4101, 128]`. `pipeline.decode(latent, num_gaussians=...)` converts a
+and `[1, 4101, 128]`. `model.decode(latent, num_gaussians=...)` converts a
 `[1, 8192, 16]` latent to a `Gaussian` without loading the image encoders.
 Gaussians are z-up in memory; PLY export rotates positions and quaternions to y-up.
 
-Idol uses this dedicated image-to-3D API and CLI; it does not implement the
-text-generation interface used by `mlx_vlm.generate`.
+`IdolPipeline.from_pretrained(...)` remains available for direct model use.
+The shared CLI routes `--output-modality 3d` to this pipeline without loading
+a text tokenizer or applying a chat template.
 
 ## Validation
 

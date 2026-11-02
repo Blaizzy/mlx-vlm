@@ -8,6 +8,7 @@ import mlx.core as mx
 import numpy as np
 from PIL import Image
 
+from ...utils import load_image
 from .camera import decode_camera
 from .decoder import GaussianFixedlenDecoder, OctreeProbabilityFixedlenDecoder
 from .dit import LatentSeqMMFlowModel
@@ -22,15 +23,18 @@ class IdolOutput:
     gaussian: Gaussian
     preprocessed_image: Image.Image
     camera: dict
+    path: Path | None = None
 
     def save(self, path):
         """Save .ply, the prepared input, and predicted camera beside it."""
-        path = Path(path).with_suffix(".ply")
+        path = Path(path).expanduser().with_suffix(".ply")
         self.gaussian.save_ply(path)
         self.preprocessed_image.save(path.with_name(path.stem + "_input.png"))
         path.with_name(path.stem + "_camera.json").write_text(
             json.dumps(self.camera, indent=2) + "\n"
         )
+        self.path = path
+        return path
 
 
 class IdolPipeline:
@@ -77,10 +81,20 @@ class IdolPipeline:
             )
 
     @classmethod
-    def from_pretrained(cls, repo_or_dir="speridlabs/idol", **kwargs):
+    def from_pretrained(
+        cls,
+        repo_or_dir="speridlabs/idol",
+        *,
+        revision=None,
+        force_download=False,
+        **kwargs,
+    ):
         return cls(
             resolve_model(
-                repo_or_dir, local_files_only=kwargs.get("local_files_only", False)
+                repo_or_dir,
+                local_files_only=kwargs.get("local_files_only", False),
+                revision=revision,
+                force_download=force_download,
             ),
             **kwargs,
         )
@@ -88,9 +102,7 @@ class IdolPipeline:
     def preprocess(self, image, mode="synthetic", crop_margin=None):
         if mode not in CROP_MARGIN:
             raise ValueError("mode must be synthetic or real")
-        if isinstance(image, (str, Path)):
-            with Image.open(image) as source:
-                image = source.copy()
+        image = load_image(image, mode="RGBA")
         if (
             not has_real_alpha(image)
             and self.background_removal
@@ -138,7 +150,8 @@ class IdolPipeline:
         batch_cfg=False,
     ):
         """Sample from precomputed image features without loading the encoders."""
-        mx.random.seed(seed)
+        if seed is not None:
+            mx.random.seed(seed)
         batch = condition["feature1"].shape[0]
         noise = {
             "latent": mx.random.normal(
@@ -205,18 +218,10 @@ class IdolPipeline:
         self._validate_num_gaussians(num_gaussians)
         prepared = self.preprocess(image, mode, crop_margin)
         condition = self.encode_image(prepared, seed=seed)
-        # Preserve the seeded RNG stream after sampling the VAE posterior.
-        batch = condition["feature1"].shape[0]
-        noise = {
-            "latent": mx.random.normal(
-                (batch, self.denoiser.q_token_length, self.denoiser.in_channels)
-            ),
-            "camera": mx.random.normal((batch, 1, self.denoiser.cam_channels)),
-        }
-        sample = sample_flow(
-            self.denoiser,
-            noise,
+        # Continue the RNG stream after sampling the VAE posterior.
+        sample = self.sample(
             condition,
+            seed=None,
             steps=steps,
             cfg_strength=cfg_strength,
             rescale_t=rescale_t,

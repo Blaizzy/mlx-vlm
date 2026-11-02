@@ -347,7 +347,7 @@ def test_text_cli_media_and_arguments(capsys, mode):
         assert output.strip() == "done"
 
 
-@pytest.mark.parametrize("modality", ["image", "video"])
+@pytest.mark.parametrize("modality", ["image", "video", "3d"])
 def test_modality_routing_precedes_vlm_load(modality):
     args = NS(output_modality=modality)
     with (
@@ -357,6 +357,63 @@ def test_modality_routing_precedes_vlm_load(modality):
     ):
         dispatch.main()
     run.assert_called_once_with(args)
+    load.assert_not_called()
+
+
+def test_3d_cli_uses_shared_options_and_saves(tmp_path):
+    from mlx_vlm.generate import three_d
+
+    output = tmp_path / "castle.ply"
+    args = _args(
+        "--output-modality",
+        "3d",
+        "--image",
+        "castle.png",
+        "--output",
+        str(output),
+        "--steps",
+        "12",
+        "--seed",
+        "7",
+        "--guidance",
+        "2.5",
+        "--revision",
+        "checkpoint",
+        "--gen-kwargs",
+        '{"mode": "real", "num_gaussians": 32768}',
+    )
+    result = NS(path=output, save=Mock())
+    model = Mock(return_value=result)
+    with patch.object(three_d, "load_3d_model", return_value=model) as load:
+        three_d.run_3d_generation_cli(args)
+    load.assert_called_once_with("demo", revision="checkpoint", force_download=False)
+    model.assert_called_once_with(
+        "castle.png",
+        mode="real",
+        num_gaussians=32768,
+        steps=12,
+        seed=7,
+        cfg_strength=2.5,
+        verbose=False,
+    )
+    result.save.assert_called_once_with(output)
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        [],
+        ["--image", "one.png", "two.png"],
+        ["--image", "one.png", "--output", "out.png"],
+        ["--image", "one.png", "--task", "edit"],
+    ],
+)
+def test_3d_cli_rejects_invalid_inputs_before_loading(flags):
+    from mlx_vlm.generate import three_d
+
+    with patch.object(three_d, "load_3d_model") as load:
+        with pytest.raises(ValueError):
+            three_d.run_3d_generation_cli(_args("--output-modality", "3d", *flags))
     load.assert_not_called()
 
 

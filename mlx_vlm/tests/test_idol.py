@@ -1,6 +1,8 @@
 """Idol inference contracts and optional PyTorch numerical parity checks."""
 
+import base64
 import importlib
+import io
 import json
 import os
 from pathlib import Path
@@ -170,6 +172,67 @@ def test_preprocess_alpha_and_empty_foreground():
         preprocess_image(Image.new("RGBA", (8, 8)), None, image_size=8)
     with pytest.raises(ValueError, match="background removal"):
         preprocess_image(Image.new("RGB", (8, 8)), None, image_size=8)
+
+
+@pytest.mark.parametrize("source_kind", ["path", "bytes", "data_uri", "pil"])
+def test_pipeline_uses_shared_image_loading_with_alpha(tmp_path, source_kind):
+    from mlx_vlm.utils import load_image
+
+    pixels = np.zeros((16, 16, 4), dtype=np.uint8)
+    pixels[4:12, 4:12] = [255, 0, 0, 255]
+    image = Image.fromarray(pixels)
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    path = tmp_path / "cutout.png"
+    path.write_bytes(buffer.getvalue())
+    source = {
+        "path": path,
+        "bytes": io.BytesIO(buffer.getvalue()),
+        "data_uri": "data:image/png;base64,"
+        + base64.b64encode(buffer.getvalue()).decode(),
+        "pil": image,
+    }[source_kind]
+    pipeline = object.__new__(IdolPipeline)
+    pipeline.config = {"image_size": 32}
+    pipeline.background_removal = False
+    pipeline.background_remover = None
+    result = pipeline.preprocess(source)
+    assert result.size == (32, 32)
+    assert np.asarray(result)[16, 16, 0] > 200
+    # Existing VLM callers keep the RGB default.
+    assert load_image(path).mode == "RGB"
+    assert load_image(path, mode="RGBA").getchannel("A").getextrema() == (0, 255)
+
+
+def test_shared_3d_loader_keeps_download_options(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+
+    from mlx_vlm.generate import load_3d_model
+    from mlx_vlm.models.idol.weights import WEIGHT_FILES
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "denoiser": {"name": "LatentSeqMMFlowModel"},
+            }
+        )
+    )
+    download = Mock(return_value=str(tmp_path))
+    init = Mock(return_value=None)
+    monkeypatch.setattr("mlx_vlm.utils.snapshot_download", download)
+    monkeypatch.setattr(IdolPipeline, "__init__", init)
+    load_3d_model("org/renamed-idol", revision="pinned", local_files_only=True)
+    assert [c.kwargs["allow_patterns"] for c in download.call_args_list] == [
+        ["config.json"],
+        WEIGHT_FILES,
+    ]
+    for call in download.call_args_list:
+        assert call.kwargs["revision"] == "pinned"
+        assert call.kwargs["local_files_only"] is True
+    init.assert_called_once_with(tmp_path, local_files_only=True)
+    (tmp_path / "config.json").write_text('{"model_type": "qwen2_vl"}')
+    with pytest.raises(ValueError, match="Unsupported 3D generation model"):
+        load_3d_model(tmp_path)
 
 
 def test_camera_conventions():
@@ -504,17 +567,26 @@ def test_checkpoint_sampling_and_export(checkpoint_path, tmp_path):
 
 
 def test_image_conditioned_pipeline(checkpoint_path, tmp_path):
+    from mlx_vlm.generate import generate_3d, load_3d_model
+
     image_path = os.environ.get("IDOL_TEST_IMAGE")
     if not image_path:
         pytest.skip("Set IDOL_TEST_IMAGE and cache both encoders for image integration")
-    pipeline = IdolPipeline.from_pretrained(checkpoint_path, local_files_only=True)
-    result = pipeline(image_path, seed=42, steps=2, num_gaussians=32768)
+    pipeline = load_3d_model(checkpoint_path, local_files_only=True)
+    result = generate_3d(
+        pipeline,
+        image_path,
+        seed=42,
+        steps=2,
+        num_gaussians=32768,
+        output_path=tmp_path / "image.ply",
+    )
     assert result.preprocessed_image.size == (1024, 1024)
     assert result.gaussian.xyz.shape == (32768, 3)
     for name in ("xyz", "features_dc", "scaling", "rotation", "opacity"):
         assert bool(mx.all(mx.isfinite(getattr(result.gaussian, name))))
     assert all(np.isfinite(value) for value in result.camera.values())
-    result.save(tmp_path / "image.ply")
+    assert result.path == tmp_path / "image.ply"
     assert (tmp_path / "image.ply").stat().st_size > 32768 * 17 * 4
     assert (tmp_path / "image_input.png").is_file()
     assert json.loads((tmp_path / "image_camera.json").read_text()) == result.camera

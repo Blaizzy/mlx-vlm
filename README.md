@@ -154,6 +154,9 @@ mlx_vlm.generate --model mlx-community/gemma-3n-E2B-it-4bit --max-tokens 100 --p
 
 # Speech generation
 mlx_vlm.generate --model openbmb/MiniCPM-o-4_5 --output-modality audio --prompt "Say hello." --ref-audio /path/to/voice.wav --output speech.wav --max-tokens 256
+
+# Image to 3D Gaussian splats
+mlx_vlm.generate --model speridlabs/idol --output-modality 3d --image object.png --output object.ply
 ```
 
 #### Thinking Budget

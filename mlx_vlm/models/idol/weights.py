@@ -4,8 +4,9 @@ from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
-from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten
+
+from ...utils import get_model_path
 
 WEIGHT_FILES = [
     "config.json",
@@ -17,16 +18,19 @@ WEIGHT_FILES = [
 ]
 
 
-def resolve_model(repo_or_dir="speridlabs/idol", *, local_files_only=False):
-    path = Path(repo_or_dir).expanduser()
-    if path.is_dir():
-        return path
-    return Path(
-        snapshot_download(
-            str(repo_or_dir),
-            allow_patterns=WEIGHT_FILES,
-            local_files_only=local_files_only,
-        )
+def resolve_model(
+    repo_or_dir="speridlabs/idol",
+    *,
+    local_files_only=False,
+    revision=None,
+    force_download=False,
+):
+    return get_model_path(
+        str(Path(repo_or_dir).expanduser()),
+        allow_patterns=WEIGHT_FILES,
+        local_files_only=local_files_only,
+        revision=revision,
+        force_download=force_download,
     )
 
 
