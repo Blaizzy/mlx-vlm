@@ -2937,7 +2937,10 @@ class BatchGenerator:
     def _step_prompt_batch(self):
         # Bound GPU work between decode steps across all prefill rows. Keep the
         # configured larger chunk when there are no decoding peers to delay.
-        step = self.prefill_step_size
+        # The prompt constructor may disable chunking for this model/request.
+        if self._prompt_batch.prefill_step_size is None:
+            return self._prompt_batch.prompt_step()
+        step = self.prefill_step_size or self._prompt_batch.prefill_step_size
         if len(self._generation_batch):
             step = min(step or 256, max(1, 256 // len(self._prompt_batch.uids)))
         self._prompt_batch.prefill_step_size = step

@@ -638,7 +638,7 @@ class TestBatchGenerator:
         )
         prompt_tokens = 5
         gen._prompt_batch = SimpleNamespace(
-            needs_processing=lambda: True, prompt_step=lambda: 2
+            needs_processing=lambda: True, prompt_step=lambda: 2, prefill_step_size=2
         )
         gen._prompt_tokens_counter = prompt_tokens
 
@@ -1745,6 +1745,7 @@ def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
         captured.update(kwargs)
         return SimpleNamespace(
             total_prompt_tokens=sum(len(ids) for ids in kwargs["input_ids"]),
+            prefill_step_size=kwargs["prefill_step_size"],
             needs_processing=lambda: True,
             prompt_step=lambda: 0,
         )
@@ -2802,9 +2803,23 @@ def test_prefill_chunk_bounds_work_with_decoding_peers():
     gen._wire_stack = None
     gen.prefill_step_size = 2048
     gen._generation_batch = [99]
-    gen._prompt_batch = SimpleNamespace(uids=[0, 1], prompt_step=lambda: 1)
+    gen._prompt_batch = SimpleNamespace(
+        uids=[0, 1], prefill_step_size=2048, prompt_step=lambda: 1
+    )
     gen._step_prompt_batch()
     assert gen._prompt_batch.prefill_step_size == 128
     gen._generation_batch = []
     gen._step_prompt_batch()
     assert gen._prompt_batch.prefill_step_size == 2048
+
+
+def test_prefill_chunk_limit_respects_model_disabling_chunking():
+    gen = object.__new__(BatchGenerator)
+    gen._wire_stack = None
+    gen.prefill_step_size = 2048
+    gen._generation_batch = [99]
+    gen._prompt_batch = SimpleNamespace(
+        uids=[0], prefill_step_size=None, prompt_step=lambda: 1
+    )
+    assert gen._step_prompt_batch() == 1
+    assert gen._prompt_batch.prefill_step_size is None
