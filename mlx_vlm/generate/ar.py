@@ -1644,7 +1644,7 @@ class SpeculativeGenerationBatch:
 
     def _ensure_batch_state(self):
         if self._batch_state is None:
-            from ..speculative.batch import DFlashBatch
+            from ..speculative.dflash import DFlashBatch
 
             self._batch_state = DFlashBatch(
                 self.model,
