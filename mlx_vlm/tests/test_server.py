@@ -1270,6 +1270,19 @@ class TestModelDiscovery:
                 ["low", "high"],
             ),
             (
+                "{% set effort = reasoning_effort | default('high') %}"
+                "{% set resolved = effort %}"
+                "{% if resolved not in ['low', 'high'] %}"
+                "{{ raise_exception('unsupported') }}{% endif %}",
+                ["low", "high"],
+            ),
+            (
+                "{% if effort not in ['low', 'high'] %}"
+                "{{ raise_exception('unsupported') }}{% endif %}"
+                "{% set effort = reasoning_effort %}",
+                None,
+            ),
+            (
                 "{% if role not in ['user', 'assistant'] %}"
                 "{{ raise_exception('unsupported') }}{% endif %}",
                 None,
