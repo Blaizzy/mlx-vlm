@@ -30,8 +30,12 @@ class PrefillMemoryPlan:
         self.lengths: List[int] = []
         self.prefix_lengths: List[int] = []
         self.chunk_size: Optional[int] = None
+        self.extra_reserve_bytes = 0
 
-    def prepare(self, lengths, *, chunk_size=None, prefix_lengths=None) -> int:
+    def prepare(
+        self, lengths, *, chunk_size=None, prefix_lengths=None, extra_reserve_bytes=0
+    ) -> int:
+        self.extra_reserve_bytes = max(0, int(extra_reserve_bytes))
         self.lengths = [max(0, int(n)) for n in lengths]
         self.prefix_lengths = (
             list(prefix_lengths)
@@ -49,7 +53,9 @@ class PrefillMemoryPlan:
             n - p for n, p in zip(self.lengths, self.prefix_lengths)
         )
         row_bytes = sum(c.footprint(capacity, self.chunk_size) for c in self.components)
-        return max(0, 2 * len(self.lengths) * row_bytes - live_bytes)
+        return self.extra_reserve_bytes + max(
+            0, 2 * len(self.lengths) * row_bytes - live_bytes
+        )
 
     def observe(self, components, *, live_bytes: int) -> int:
         previous = self.components
@@ -114,16 +120,31 @@ class APCCoordinator:
         self.plan: PrefixCachePlan = build_prefix_cache_plan(model)
 
     def prepare_prefill(
-        self, prompt_lengths, *, prefill_step_size=None, prefix_lengths=None
-    ) -> None:
+        self,
+        prompt_lengths,
+        *,
+        prefill_step_size=None,
+        prefix_lengths=None,
+        extra_reserve_bytes=0,
+    ) -> bool:
         if self.enabled:
             lengths = (
                 [prompt_lengths] if isinstance(prompt_lengths, int) else prompt_lengths
             )
             reserve = self.manager.memory_plan.prepare(
-                lengths, chunk_size=prefill_step_size, prefix_lengths=prefix_lengths
+                lengths,
+                chunk_size=prefill_step_size,
+                prefix_lengths=prefix_lengths,
+                extra_reserve_bytes=extra_reserve_bytes,
             )
-            self.manager.prepare_prefill(reserve)
+            return self.manager.prepare_prefill(reserve)
+        return True
+
+    def finish_prefill(self) -> None:
+        """Release the transient plan after admission is deferred or completed."""
+        if self.enabled:
+            self.manager.memory_plan.prepare([])
+            self.manager._prefill_reserve_bytes = 0
 
     def observe_cache(self, prompt_cache, token_count, *, batch_size=1) -> None:
         """Update runtime dimensions independently of snapshot persistence."""
@@ -167,6 +188,7 @@ class APCCoordinator:
         safe_lookup_min: int,
         suffix_is_text_only: Callable[[int], bool],
         prefix_has_media: Callable[[int], bool],
+        defer_on_pressure: bool = False,
     ) -> Optional[dict]:
         if not self.enabled:
             return None
@@ -180,6 +202,7 @@ class APCCoordinator:
             safe_lookup_min=safe_lookup_min,
             suffix_is_text_only=suffix_is_text_only,
             prefix_has_media=prefix_has_media,
+            defer_on_pressure=defer_on_pressure,
         )
         if hit is not None:
             hit["cache_plan"] = self.plan
@@ -262,11 +285,15 @@ class APCCoordinator:
 
         memory = self.manager.memory_plan
         if len(prefix_lens) == len(memory.lengths):
-            self.prepare_prefill(
+            if not self.prepare_prefill(
                 memory.lengths,
                 prefill_step_size=memory.chunk_size,
                 prefix_lengths=prefix_lens,
-            )
+                extra_reserve_bytes=memory.extra_reserve_bytes,
+            ):
+                from .apc import APCAdmissionError
+
+                raise APCAdmissionError("APC batch merge deferred by memory admission")
 
         if self.is_checkpoint:
             row_caches = [

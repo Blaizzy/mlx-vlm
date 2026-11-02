@@ -3970,3 +3970,94 @@ def test_restored_tokens_count_successful_restores(
     manager.reset_stats()
     assert manager.stats_snapshot()["restored_tokens"] == 0
     assert manager.stats_snapshot()["stored_tokens"] == 0
+
+
+@parametrize("tier", ["memory", "disk"])
+def test_prefix_pressure_is_deferred_not_a_cache_miss(
+    memory_manager, monkeypatch, tier
+):
+    manager = memory_manager(budget=4096, disk=tier == "disk")
+    tokens = list(range(16))
+    assert manager.store_exact_cache(tokens, [allocated(16)])
+    if tier == "disk":
+        manager.disk.flush()
+        manager = memory_manager(disk=True)
+    monkeypatch.setattr(manager, "_memory_headroom", lambda: 0)
+    with pytest.raises(P.APCAdmissionError, match="deferred"):
+        manager.lookup_exact_cache(tokens + [99], defer_on_pressure=True)
+    assert manager.lookup_exact_cache([999] * 17, defer_on_pressure=True) == (None, 0)
+
+
+def test_prefill_admission_is_authoritative_before_merge(memory_manager, monkeypatch):
+    manager = memory_manager()
+    coordinator = coordinate(manager, [allocated(16)])
+    coordinator.observe_cache([allocated(16)], 16)
+    monkeypatch.setattr(manager, "_memory_headroom", lambda: 0)
+    assert coordinator.prepare_prefill([32, 32]) is False
+    forbid(monkeypatch, P, "make_warm_batch_kv_cache_multi")
+    forbid(monkeypatch, P, "make_warm_batch_exact_cache_multi")
+    with pytest.raises(P.APCAdmissionError, match="merge"):
+        coordinator.merge_rows([None, None], [0, 0])
+
+
+@parametrize("model_name", ["lfm2", "qwen3_5"])
+def test_warm_rows_decode_while_cold_row_prefills(prefix_manager, model_name):
+    from mlx_vlm.generate.ar import BatchGenerator
+    from mlx_vlm.tests.test_generate import MockProcessor
+
+    mx.random.seed(19)
+    lm = language_model(model_name)
+    manager = prefix_manager(budget=1 << 30)
+    warm = [i % 40 + 1 for i in range(65)]
+    cold = [i % 40 + 41 for i in range(513)]
+    cache = lm.make_cache()
+    lm(mx.array([warm[:-1]]), cache=cache)
+    assert manager.store_exact_cache(warm[:-1], cache)
+    processor = MockProcessor()
+    processor.tokenizer.stopping_criteria.eos_token_ids = []
+    gen = BatchGenerator(
+        lm,
+        processor,
+        apc_manager=manager,
+        prefill_batch_size=8,
+        completion_batch_size=8,
+        prefill_step_size=2048,
+        manage_wired_limit=False,
+    )
+    uids = gen.insert(
+        [warm, cold],
+        max_tokens=[20, 3],
+        prompt_kwargs=[
+            {
+                "inputs_embeds": embeddings(lm, mx.array([tokens])),
+                "_apc_semantic_hash": 0,
+            }
+            for tokens in (warm, cold)
+        ],
+    )
+    gen.next()
+    assert gen._generation_batch.uids == [uids[0]]
+    assert [s[0] for s in gen.unprocessed_prompts] == [uids[1]]
+    _, replies = gen.next()
+    assert [r.uid for r in replies] == [uids[0]]
+    assert gen._prompt_batch.uids == [uids[1]]
+    assert gen._prompt_batch._processed_prompt_columns <= 256
+    outputs = {uids[0]: [r.token for r in replies], uids[1]: []}
+    merged = False
+    for _ in range(30):
+        _, replies = gen.next()
+        merged |= len(gen._generation_batch) == 2
+        for reply in replies:
+            outputs[reply.uid].append(reply.token)
+        if (
+            not gen.unprocessed_prompts
+            and gen._prompt_batch is None
+            and not len(gen._generation_batch)
+        ):
+            break
+    assert merged
+    assert [len(outputs[uid]) for uid in uids] == [20, 3]
+    assert manager.stats.hits >= 1
+    assert manager._prefill_reserve_bytes == 0
+    assert manager.memory_plan.lengths == []
+    gen.close()

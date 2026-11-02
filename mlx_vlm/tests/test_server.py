@@ -10083,3 +10083,24 @@ def test_tool_examples_in_reasoning_are_not_executed(
             if b["type"] == "tool_use"
         ]
     assert calls == ([("get_weather", {"city": "Warsaw"})] if real_call else [])
+
+
+def test_prefill_memory_error_only_fails_the_refused_request():
+    from queue import Queue
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from mlx_vlm.apc import APCAdmissionError
+    from mlx_vlm.server.generation import ResponseGenerator
+
+    refused, peer = Queue(), Queue()
+    active = {10: {"rqueue": refused}, 11: {"rqueue": peer}}
+    error = APCAdmissionError("Cannot fit prefill", uid=10)
+    engine = SimpleNamespace(next=Mock(side_effect=error), remove=Mock())
+    generator = ResponseGenerator.__new__(ResponseGenerator)
+    generator._step(engine, active)
+    assert list(active) == [11]
+    assert refused.get_nowait() is error
+    assert refused.get_nowait() is None
+    assert peer.empty()
+    engine.remove.assert_called_once_with(10)
