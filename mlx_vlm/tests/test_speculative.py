@@ -338,13 +338,28 @@ def test_mistral_dspark_admits_requests_while_batch_is_active(cancel, sampling):
 
 
 @parametrize("dtype", [mx.float16, mx.bfloat16])
-@parametrize("batch,length", [(2, 1), (2, 4), (3, 3), (4, 4), (6, 3), (15, 2)])
+@parametrize(
+    "batch,length",
+    [
+        (2, 1),
+        (2, 4),
+        (3, 3),
+        (3, 4),
+        (4, 4),
+        (5, 3),
+        (6, 3),
+        (8, 4),
+        (13, 2),
+        (15, 2),
+        (15, 4),
+    ],
+)
 def test_mistral_dspark_wide_projection_matches_native_decode(dtype, batch, length):
     from mlx_vlm.models.mistral_large4.verify_kernel import native_wide_linear
 
     mx.random.seed(71)
     # Include non-tile-aligned output and input tails as well as a large K.
-    for k, n in [(68, 61), (128, 131), (2048, 256)]:
+    for k, n in [(68, 61), (128, 131), (2048, 256), (512, 6144)]:
         weight = mx.random.normal((n, k)).astype(dtype)
         x = mx.random.normal((batch, length, k)).astype(dtype)
         actual = native_wide_linear(weight, x)
@@ -353,9 +368,10 @@ def test_mistral_dspark_wide_projection_matches_native_decode(dtype, batch, leng
         expected = mx.concatenate(
             [mx.contiguous(x[:, t : t + 1]) @ weight.T for t in range(length)], axis=1
         )
-        np.testing.assert_array_equal(
-            np.array(actual.astype(mx.float32)), np.array(expected.astype(mx.float32))
-        )
+        equal(actual, expected)
+        if n == 6144:
+            parts = [native_wide_linear(w, x) for w in mx.split(weight, 2)]
+            equal(mx.concatenate(parts, axis=-1), expected)
 
 
 @parametrize("dtype", [mx.float32, mx.bfloat16])
@@ -400,6 +416,111 @@ def test_mistral_dspark_verifier_matches_decode(dtype, batch):
         atol=0.04 if dtype == mx.bfloat16 else 2e-5,
         rtol=0.02 if dtype == mx.bfloat16 else 2e-5,
     )
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
+@parametrize("prefix,topk", [(3, 2048), (127, 2048), (255, 2048), (127, 128)])
+@parametrize("batch,length", [(2, 1), (2, 4), (8, 2), (8, 4)])
+@parametrize("ragged", [False, True])
+def test_mistral_dspark_verifier_preserves_hidden_logits_and_cache(
+    prefix, topk, batch, length, ragged
+):
+    from mlx_vlm.models.mistral_large4 import speculative_verifier as verifier
+
+    mx.random.seed(79)
+    model, _ = mistral_dspark_case()
+    model.set_dtype(mx.bfloat16)
+    for layer in model.layers:
+        if layer.attention.indexer is not None:
+            layer.attention.indexer.topk = topk
+    initial = [c.to_batch([i % 3 for i in range(batch)]) for c in model.make_cache()]
+    ids = mx.random.randint(1, 60, (batch, prefix))
+    mx.eval(model(ids, cache=initial).logits)
+    if ragged:
+        for c in initial:
+            c._ragged = True
+            c.offset -= mx.arange(batch) % 3
+    ids = mx.random.randint(1, 60, (batch, length))
+    reference_cache, actual_cache = deepcopy(initial), deepcopy(initial)
+    ordinary = [
+        model(ids[:, t : t + 1], cache=reference_cache, capture_layer_ids=[0, 1, 2, 3])
+        for t in range(length)
+    ]
+    expected_hidden = [
+        mx.concatenate([r.hidden_states[i] for r in ordinary], axis=1) for i in range(4)
+    ]
+    expected_logits = mx.concatenate([r.logits for r in ordinary], axis=1)
+    hidden, norm, transaction = verifier.verify_hidden(
+        model, ids, actual_cache, [0, 1, 2, 3]
+    )
+    logits = verifier.verify_logits(model, norm)
+    equal(hidden, expected_hidden)
+    equal(logits, expected_logits)
+    equal([c.state for c in actual_cache], [c.state for c in reference_cache])
+    transaction.abort()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
+def test_mistral_dspark_expert_scales_refresh_without_serializing_runtime_state():
+    from mlx_vlm.models.mistral_large4 import speculative_verifier as verifier
+    from mlx_vlm.models.mistral_large4.config import TextConfig
+    from mlx_vlm.models.mistral_large4.language import MoE
+    from mlx_vlm.quantization.nvfp4 import ScaledQuantizedSwitchLinear
+
+    model, _ = mistral_dspark_case()
+    ffn = MoE(
+        TextConfig(
+            hidden_size=512,
+            moe_intermediate_size=512,
+            n_routed_experts=8,
+            expert_start=0,
+            expert_end=4,
+            n_shared_experts=0,
+            nvfp4=True,
+        )
+    )
+    for name in ("w1", "w3", "w2"):
+        setattr(
+            ffn.experts,
+            name,
+            ScaledQuantizedSwitchLinear(
+                getattr(ffn.experts, name),
+                mx.array([0.25, 0.5, 1.0, 0.75]),
+                "weight_scale_2",
+            ),
+        )
+    ffn.eval()
+    ffn.group = object()
+    model.layers[0].feed_forward = ffn
+    first = verifier._expert_parameters(model, mx.bfloat16)
+    second = verifier._expert_parameters(model, mx.bfloat16)
+    assert all(a is b for a, b in zip(first[id(ffn)][2], second[id(ffn)][2]))
+    assert "_verification_scales" not in model.parameters()
+    ffn.experts.w1.weight_scale_2 = mx.array([0.5, 1.0, 2.0, 1.5])
+    third = verifier._expert_parameters(model, mx.bfloat16)
+    equal(third[id(ffn)][2][0], first[id(ffn)][2][0] * 2)
+    assert third[id(ffn)][2][0] is not first[id(ffn)][2][0]
+    assert third[id(ffn)][2][1] is first[id(ffn)][2][1]
+    ffn.experts.w1.weight = mx.zeros_like(ffn.experts.w1.weight)
+    fourth = verifier._expert_parameters(model, mx.bfloat16)
+    assert fourth[id(ffn)][0][0] is ffn.experts.w1.weight
+    assert fourth[id(ffn)][2][0] is third[id(ffn)][2][0]
+
+
+def test_mistral_dspark_cpu_verification_uses_portable_fallback():
+    with mx.stream(mx.cpu):
+        model, _ = mistral_dspark_case()
+        cache = [c.to_batch([0, 0]) for c in model.make_cache()]
+        mx.eval(model(mx.array([[1, 2, 3], [3, 2, 1]]), cache=cache).logits)
+        expected_cache = deepcopy(cache)
+        ids = mx.array([[4, 5], [5, 4]])
+        expected = mx.concatenate(
+            [model(ids[:, t : t + 1], cache=expected_cache).logits for t in range(2)],
+            axis=1,
+        )
+        result = model(ids, cache=cache, speculative_verify=True)
+        equal(result.logits, expected, atol=2e-5, rtol=2e-5)
+        result.gdn_states.abort()
 
 
 @parametrize("temperature", [0, 0.7])

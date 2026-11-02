@@ -677,6 +677,64 @@ def test_mistral_large4_sparse_mla_strided_cache_and_mask(dtype, latent, rope, b
         np.testing.assert_array_equal(actual[-1], 0)
 
 
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16, mx.float32])
+@pytest.mark.parametrize("context", [127, 129, 257, 2051])
+@pytest.mark.parametrize("rope", [0, 64])
+def test_mistral_large4_sparse_block_queries_match_decode(dtype, context, rope):
+    from mlx_vlm.models.mistral_large4.block_mla_kernel import block_sparse_mla
+    from mlx_vlm.models.mistral_large4.mla_kernel import sparse_mla
+
+    mx.random.seed(71)
+    b, h, length, d = 3, 4, 4, 512
+    q = mx.random.normal((b, h, length, d)).astype(dtype)
+    qr = mx.random.normal((b, h, length, rope)).astype(dtype)
+    kv = mx.random.normal((b, 1, context, d)).astype(dtype)
+    kr = mx.random.normal((b, 1, context, rope)).astype(dtype)
+    counts = []
+    selected = []
+    masks = []
+    expected = []
+    for t in range(length):
+        end = context - length + t + 1
+        k = min(end, 2048)
+        indices = mx.sort(
+            mx.argsort(mx.random.uniform(shape=(b, end)), axis=-1)[:, :k], axis=-1
+        )
+        # Unequal row lengths plus one fully masked row.
+        lower = mx.array([0, 5, context])[:, None, None, None]
+        upper = mx.array([end, end - 2, end])[:, None, None, None]
+        mask = (mx.arange(context)[None, None, None, :] >= lower) & (
+            mx.arange(context)[None, None, None, :] < upper
+        )
+        expected.append(
+            sparse_mla(
+                q[:, :, t : t + 1],
+                qr[:, :, t : t + 1],
+                kv[:, :, :end],
+                kr[:, :, :end],
+                indices,
+                mask[..., :end],
+                0.125,
+                chunk=128,
+            )
+        )
+        masks.append(mask)
+        selected.append(indices)
+        counts.append(k)
+    width = max(counts)
+    indices = mx.stack(
+        [mx.pad(i, [(0, 0), (0, width - i.shape[-1])]) for i in selected], axis=1
+    )
+    actual = block_sparse_mla(
+        q, qr, kv, kr, indices, mx.concatenate(masks, axis=2), 0.125, counts, chunk=128
+    )
+    np.testing.assert_array_equal(
+        np.array(actual.astype(mx.float32)),
+        np.array(mx.concatenate(expected, axis=2).astype(mx.float32)),
+    )
+
+
 @pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
 @pytest.mark.parametrize("scale_name", [None, "weight_scale_2", "weight_global_scale"])
 @pytest.mark.parametrize("down", [False, True])
@@ -723,6 +781,77 @@ def test_mistral_large4_masked_nvfp4_tensor_scale_and_noncontiguous_input(scale_
     )
     np.testing.assert_array_equal(
         np.array(actual.astype(mx.float32)), np.array(expected.astype(mx.float32))
+    )
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("batch,length", [(1, 1), (2, 1), (2, 4), (8, 4)])
+@pytest.mark.parametrize("start", [0, 4])
+def test_mistral_large4_compiled_local_experts_match_decode(
+    dtype, batch, length, start
+):
+    from mlx_vlm.models.linear import tokenwise
+    from mlx_vlm.models.mistral_large4 import verify_ops
+    from mlx_vlm.models.mistral_large4.config import TextConfig
+    from mlx_vlm.models.mistral_large4.language import MoE
+    from mlx_vlm.models.mistral_large4.moe_kernel import masked_qmv
+
+    mx.random.seed(79)
+    ffn = MoE(
+        TextConfig(
+            hidden_size=512,
+            moe_intermediate_size=512,
+            n_routed_experts=8,
+            expert_start=start,
+            expert_end=start + 4,
+            n_shared_experts=0,
+            nvfp4=True,
+        )
+    )
+    for name in ("w1", "w3", "w2"):
+        setattr(
+            ffn.experts,
+            name,
+            ScaledQuantizedSwitchLinear(
+                getattr(ffn.experts, name),
+                mx.array([0.25, 0.5, 1.0, 0.75]),
+                "weight_scale_2",
+            ),
+        )
+    ffn.eval()
+    ffn.gate.weight = ffn.gate.weight.astype(dtype)
+    x = mx.random.normal((batch, length, 512)).astype(dtype)
+    indices, weights = tokenwise(ffn.route, x)
+    local = mx.where(
+        (indices >= start) & (indices < start + 4), indices.astype(mx.int32) - start, -1
+    )
+    order = mx.argsort(local.reshape(-1))
+    inverse = mx.argsort(order)
+    rx = x.reshape(-1, 512)[order // 4, None]
+    ri = local.reshape(-1)[order, None]
+    gate = masked_qmv(rx, ffn.experts.w1, ri)
+    up = masked_qmv(rx, ffn.experts.w3, ri)
+    reference = masked_qmv(nn.silu(gate) * up, ffn.experts.w2, ri)[inverse].reshape(
+        batch, length, 4, 512
+    )
+    modules = [ffn.experts.w1, ffn.experts.w3, ffn.experts.w2]
+    output, actual_weights = verify_ops.local_experts(
+        x,
+        ffn.gate.weight,
+        [m.weight for m in modules],
+        [m.scales for m in modules],
+        [verify_ops.expert_factor(m) for m in modules],
+        start,
+        1.0,
+    )
+    np.testing.assert_array_equal(
+        np.array(actual_weights.astype(mx.float32)),
+        np.array(weights.astype(mx.float32)),
+    )
+    np.testing.assert_array_equal(
+        np.array(output.astype(mx.float32)),
+        np.array(reference.astype(mx.float32)),
     )
 
 
