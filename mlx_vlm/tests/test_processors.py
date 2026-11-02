@@ -2272,6 +2272,23 @@ class TestApplyChatTemplateIntegration:
         types = [item["type"] for item in result[0]["content"]]
         assert types == ["image", "audio", "text"]
 
+    def test_lfm3_media_only_turn_keeps_audio_after_image(self):
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        # A user turn carrying an image but no trailing text part (e.g. an
+        # image plus a spoken question). Audio must still follow the image to
+        # match the reference image -> audio -> text order.
+        result = apply_chat_template(
+            None,
+            {"model_type": "lfm3_omni"},
+            [{"role": "user", "content": [{"type": "image"}]}],
+            return_messages=True,
+            num_images=1,
+            num_audios=1,
+        )
+        types = [item["type"] for item in result[0]["content"]]
+        assert types == ["image", "audio"]
+
     def test_assistant_reasoning_content_is_preserved(self):
         messages = [
             {"role": "user", "content": "What is 17 + 25?"},
