@@ -163,7 +163,6 @@ class AutoregressiveHead(nn.Module):
 
 class Model(nn.Module):
     prefer_requested_block_size = True
-    requires_uniform_batch_acceptance = True
 
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -250,6 +249,42 @@ class Model(nn.Module):
         x = mx.concatenate([embed, masks], axis=1)
         for layer, entry in zip(self.backbone.layers, cache):
             x = layer(x, context, entry)
+        return self._sample_block(x, anchor, count, sampler, token_dtype)
+
+    def draft_batch(self, anchors, hidden, caches, block_size, sampler, token_dtype):
+        """Batch dense draft work while retaining independent context caches."""
+        count = int(block_size) - 1
+        if not 0 <= count <= self.config.proposal_length:
+            raise ValueError("Requested DSpark block exceeds the trained depth")
+        if count == 0:
+            return mx.zeros((len(hidden), 0), dtype=token_dtype)
+        lengths = [h.shape[1] for h in hidden]
+        context = self.prepare_target_hidden(mx.concatenate(hidden, axis=1))
+        boundaries, total = [], 0
+        for length in lengths[:-1]:
+            total += length
+            boundaries.append(total)
+        contexts = mx.split(context, boundaries, axis=1)
+        anchor = mx.array(anchors, dtype=token_dtype).reshape(-1)
+        embed = self._input_embed(anchor[:, None])
+        masks = mx.broadcast_to(
+            self.backbone.mask_embedding.astype(embed.dtype),
+            (anchor.size, self.config.proposal_length - 1, embed.shape[-1]),
+        )
+        x = mx.concatenate([embed, masks], axis=1)
+        for index, layer in enumerate(self.backbone.layers):
+            normalized = layer.attention_norm(x)
+            attended = mx.concatenate(
+                [
+                    layer.attention(normalized[row : row + 1], ctx, caches[row][index])
+                    for row, ctx in enumerate(contexts)
+                ]
+            )
+            x = x + attended
+            x = x + layer.feed_forward(layer.ffn_norm(x))
+        return self._sample_block(x, anchor, count, sampler, token_dtype)
+
+    def _sample_block(self, x, anchor, count, sampler, token_dtype):
         x = self.backbone.final_norm(x)
         logits = self._lm_head(x)
         cap = self.config.text_config.final_logit_softcapping

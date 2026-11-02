@@ -503,6 +503,14 @@ def _dflash_rounds_batch(
     finished = [False] * B
     active_idx = list(range(B))  # maps active-slot → original-index
     hidden_by_orig = [hidden[i : i + 1] for i in range(B)]
+    draft_batch = getattr(draft_model, "draft_batch", None)
+    if callable(draft_batch):
+        offsets = getattr(prompt_cache[0], "offset", None)
+        if isinstance(offsets, mx.array) and offsets.size == B:
+            lengths = offsets.reshape(-1).tolist()
+            hidden_by_orig = [
+                h[:, -min(h.shape[1], n) :] for h, n in zip(hidden_by_orig, lengths)
+            ]
 
     total_emitted = sum(emitted)
 
@@ -528,6 +536,15 @@ def _dflash_rounds_batch(
         # proven unsafe as a single batched cache on MLX/Metal. Target verify
         # remains batched below.
         def draft_active_rows():
+            if callable(draft_batch) and greedy_sampling:
+                return draft_batch(
+                    b_active,
+                    [hidden_by_orig[i] for i in active_idx],
+                    [draft_caches[i] for i in active_idx],
+                    bs,
+                    sampler,
+                    token_dtype,
+                )
             return mx.concatenate(
                 [
                     (
@@ -559,9 +576,10 @@ def _dflash_rounds_batch(
                 axis=0,
             )
 
-        draft_tokens = sampler_rng.draft_tokens(
-            draft_active_rows,
-        )
+        # Keep draft collectives on the verifier stream so distributed ranks
+        # cannot submit draft and target reductions in different orders.
+        with mx.stream(generation_stream):
+            draft_tokens = sampler_rng.draft_tokens(draft_active_rows)
 
         gdn_states = None
         try:

@@ -136,9 +136,10 @@ class LatentCache(_BaseCache):
 class BatchLatentCache(LatentCache):
     """Keep latent, rotary and indexer keys aligned across padded requests.
 
-    ``_idx`` is the physical append position; ``offset`` holds each request's
-    logical position. Shared KV/indexer layers still advance both positions,
-    even when they own no tensors.
+    ``_idx`` bounds the physical cache extent; ``offset`` holds each request's
+    logical position. After ragged rollback, rows append at offset + padding
+    without moving earlier keys across attention reduction boundaries. Shared
+    KV/indexer layers still advance positions even when they own no tensors.
     """
 
     def __init__(self, left_padding):
@@ -147,6 +148,31 @@ class BatchLatentCache(LatentCache):
         self.offset = -self.left_padding
         self._idx = 0
         self._right_padding = None
+        self._ragged = False
+
+    def _append(self, cache, values):
+        if not self._ragged:
+            return super()._append(cache, values)
+        end = self._idx + values.shape[-2]
+        if cache is None or end > cache.shape[-2]:
+            capacity = ((end + self.step - 1) // self.step) * self.step
+            if cache is None:
+                cache = mx.zeros(
+                    (*values.shape[:-2], capacity, values.shape[-1]), values.dtype
+                )
+            else:
+                cache = mx.pad(
+                    cache,
+                    [(0, 0)] * (cache.ndim - 2)
+                    + [(0, capacity - cache.shape[-2]), (0, 0)],
+                )
+        positions = (self.offset + self.left_padding)[:, None] + mx.arange(
+            values.shape[-2]
+        )
+        positions = positions.reshape(
+            (values.shape[0],) + (1,) * (values.ndim - 3) + (values.shape[-2], 1)
+        )
+        return mx.put_along_axis(cache, positions, values, axis=values.ndim - 2)
 
     def _map(self, fn):
         for name in ("keys", "values", "index_keys"):
@@ -169,6 +195,13 @@ class BatchLatentCache(LatentCache):
         self._idx += n
 
     def make_mask(self, n):
+        if self._ragged:
+            positions = (self.offset + self.left_padding)[:, None] + mx.arange(n)
+            columns = mx.arange(self._idx + n)[None, None]
+            return (
+                (columns <= positions[..., None])
+                & (columns >= self.left_padding[:, None, None])
+            )[:, None]
         return create_causal_mask(n, offset=self._idx, left_padding=self.left_padding)
 
     def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
@@ -194,6 +227,12 @@ class BatchLatentCache(LatentCache):
             self.offset -= padding
             self.left_padding += padding
             self._right_padding = None
+
+    def trim_right(self, padding):
+        # Shared KV layers and index-only layers must advance the same logical
+        # positions as layers owning latent keys, even when keys is None.
+        self.offset -= mx.array(padding, mx.int32)
+        self._ragged = True
 
     def filter(self, batch_indices):
         self.offset = self.offset[batch_indices]
@@ -233,19 +272,23 @@ class BatchLatentCache(LatentCache):
         )
         self.offset = mx.concatenate([self.offset, other.offset])
         self._idx = length
+        self._ragged = self._ragged or other._ragged
 
     def extract(self, idx):
         cache = LatentCache()
         padding = self.left_padding[idx].item()
+        length = max(0, self.offset[idx].item())
         for name in ("keys", "values", "index_keys"):
             value = getattr(self, name)
             if value is not None:
                 setattr(
                     cache,
                     name,
-                    mx.contiguous(value[idx : idx + 1, ..., padding : self._idx, :]),
+                    mx.contiguous(
+                        value[idx : idx + 1, ..., padding : padding + length, :]
+                    ),
                 )
-        cache.offset = max(0, self._idx - padding)
+        cache.offset = length
         return cache
 
     @classmethod
@@ -293,11 +336,13 @@ class BatchLatentCache(LatentCache):
             str(int(self.keys is not None)),
             str(int(self.index_keys is not None)),
             str(int(self._right_padding is not None)),
+            str(int(self._ragged)),
         )
 
     @meta_state.setter
     def meta_state(self, value):
-        self._idx, latent, index, right = map(int, value)
+        self._idx, latent, index, right = map(int, value[:4])
+        self._ragged = bool(int(value[4])) if len(value) > 4 else False
         state = iter(self._restored_state)
         self.keys = next(state) if latent else None
         self.values = next(state) if latent else None

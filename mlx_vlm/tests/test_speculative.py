@@ -201,6 +201,163 @@ def test_mistral_dspark_recurrent_head_equations():
         tokens = mx.argmax(bias, axis=-1)
 
 
+def test_mistral_dspark_batched_drafts_keep_independent_context_positions():
+    mx.random.seed(17)
+    target, draft = mistral_dspark_case()
+    draft.bind(target)
+    batched = [draft.make_cache() for _ in range(2)]
+    separate = [draft.make_cache() for _ in range(2)]
+    sampler = lambda logits: mx.argmax(logits, axis=-1)
+    for lengths in ([9, 3], [1, 3], [4, 2]):
+        hidden = [mx.random.normal((1, length, 96)) for length in lengths]
+        actual = draft.draft_batch([3, 5], hidden, batched, 4, sampler, mx.int32)
+        expected = mx.concatenate(
+            [
+                draft.draft_block(token, h, cache, 4, sampler)
+                for token, h, cache in zip([3, 5], hidden, separate)
+            ]
+        )
+        np.testing.assert_array_equal(np.array(actual), np.array(expected))
+        for actual_row, expected_row in zip(batched, separate):
+            for a, b in zip(actual_row, expected_row):
+                assert a.offset == b.offset
+                np.testing.assert_allclose(
+                    np.array(a.keys), np.array(b.keys), atol=1e-5
+                )
+                np.testing.assert_allclose(
+                    np.array(a.values), np.array(b.values), atol=1e-5
+                )
+
+
+def test_mistral_dspark_ragged_rollback_includes_shared_and_index_only_caches():
+    from mlx_vlm.models.mistral_large4.language import LanguageModel
+
+    mx.random.seed(19)
+    target, _ = mistral_dspark_case()
+    args = target.args
+    args.kv_source_layers = [0, 1, 0, 1]
+    args.no_rope_layers = [1, 1, 1, 1]
+    args.indexer_types = ["full", "full", "full", "shared"]
+    target = LanguageModel(args)
+    target.eval()
+    cache = [c.to_batch([0, 0]) for c in target.make_cache()]
+    mx.eval(target(mx.array([[1, 2, 3, 4], [5, 6, 7, 8]]), cache=cache).logits)
+    reference = [[c.extract(row) for c in cache] for row in range(2)]
+    block = mx.array([[9, 10, 11, 12], [13, 14, 15, 16]])
+    out = target(block, cache=cache, speculative_verify=True)
+    mx.eval(out.logits)
+    out.gdn_states.commit([1, 3])
+    for c in cache:
+        assert c.offset.tolist() == [5, 7]
+        assert c.left_padding.tolist() == [0, 0]
+    cache = [type(c).from_state(c.state, c.meta_state) for c in cache]
+    assert all(c._ragged and c.offset.tolist() == [5, 7] for c in cache)
+    for row, retained in enumerate([1, 3]):
+        for index in range(retained):
+            mx.eval(
+                target(
+                    block[row : row + 1, index : index + 1], cache=reference[row]
+                ).logits
+            )
+        actual = target(mx.array([[17]]), cache=[c.extract(row) for c in cache]).logits
+        expected = target(mx.array([[17]]), cache=reference[row]).logits
+        np.testing.assert_allclose(
+            np.array(actual), np.array(expected), atol=5e-5, rtol=5e-5
+        )
+
+
+@parametrize("cancel", [False, True])
+@parametrize("sampling", ["greedy", "random", "positioned"])
+def test_mistral_dspark_admits_requests_while_batch_is_active(cancel, sampling):
+    from types import SimpleNamespace
+
+    from mlx_lm.sample_utils import make_sampler
+
+    from mlx_vlm.generate.ar import BatchGenerator
+    from mlx_vlm.server.generation import _PositionedTargetSampler
+    from mlx_vlm.utils import StoppingCriteria
+
+    mx.random.seed(23)
+    sampler = make_sampler(temp=0.7) if sampling == "random" else None
+    if sampling == "positioned":
+        sampler = _PositionedTargetSampler(temperature=0.7, top_p=1.0, seed=23)
+    target, draft = mistral_dspark_case()
+    generator = BatchGenerator(
+        target,
+        SimpleNamespace(stopping_criteria=StoppingCriteria([])),
+        completion_batch_size=2,
+        prefill_batch_size=2,
+        prefill_step_size=2,
+        draft_model=draft,
+        draft_kind="dflash",
+        draft_block_size=4,
+        sampler=sampler,
+        greedy_sampling=sampling == "greedy",
+        compute_logprobs=False,
+    )
+    prompts = [[1, 3, 5, 7], [2, 4], [11, 12, 13]]
+    outputs = [[], [], []]
+
+    def insert(rows, limits):
+        generator.insert(
+            rows,
+            max_tokens=limits,
+            prompt_kwargs=[
+                {"inputs_embeds": target.model.embed_tokens(mx.array([p]))}
+                for p in rows
+            ],
+        )
+
+    insert(prompts[:2], [40, 3])
+    added = False
+    overlapped = False
+    try:
+        for _ in range(100):
+            if not generator.has_work:
+                break
+            _, responses = generator.next()
+            for response in responses:
+                if response.token is not None:
+                    outputs[response.uid].append(response.token)
+            if not added and len(outputs[0]) >= 2:
+                insert(prompts[2:], [6])
+                added = True
+            if outputs[2] and len(outputs[0]) < 40:
+                overlapped = True
+                if cancel:
+                    assert generator.remove(0)
+                    cancel = False
+            batch = generator._generation_batch
+            assert len(getattr(batch, "_all_uids", batch.uids)) <= 2
+        assert not generator.has_work
+        assert overlapped
+        assert len(outputs[1]) == 3
+        assert len(outputs[2]) == 6
+    finally:
+        generator.close()
+
+
+@parametrize("dtype", [mx.float16, mx.bfloat16])
+@parametrize("batch,length", [(2, 1), (2, 4), (3, 3), (4, 4), (6, 3), (15, 2)])
+def test_mistral_dspark_wide_projection_matches_native_decode(dtype, batch, length):
+    from mlx_vlm.models.mistral_large4.verify_kernel import native_wide_linear
+
+    mx.random.seed(71)
+    # Include non-tile-aligned output and input tails as well as a large K.
+    for k, n in [(68, 61), (128, 131), (2048, 256)]:
+        weight = mx.random.normal((n, k)).astype(dtype)
+        x = mx.random.normal((batch, length, k)).astype(dtype)
+        actual = native_wide_linear(weight, x)
+        if actual is None:
+            pytest.skip("Native wide-GEMV is unavailable on this device")
+        expected = mx.concatenate(
+            [mx.contiguous(x[:, t : t + 1]) @ weight.T for t in range(length)], axis=1
+        )
+        np.testing.assert_array_equal(
+            np.array(actual.astype(mx.float32)), np.array(expected.astype(mx.float32))
+        )
+
+
 @parametrize("dtype", [mx.float32, mx.bfloat16])
 @parametrize("batch", [1, 2])
 def test_mistral_dspark_verifier_matches_decode(dtype, batch):
