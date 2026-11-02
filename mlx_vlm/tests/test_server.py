@@ -6601,6 +6601,7 @@ class TestResponseGenerator:
         flags = [
             ("model", "PRELOAD_MODEL", "demo"),
             ("image-model", "PRELOAD_IMAGE_MODEL", "image-demo"),
+            ("mesh-model", "PRELOAD_MESH_MODEL", "mesh-demo"),
             ("tts-model", "PRELOAD_TTS_MODEL", "tts-demo"),
             ("stt-model", "PRELOAD_STT_MODEL", "stt-demo"),
             ("decision-model", "PRELOAD_DECISION_MODEL", "decision-demo"),
@@ -6641,6 +6642,7 @@ class TestResponseGenerator:
     def test_lifespan_continues_when_optional_preload_fails(self, monkeypatch):
         kinds = dict(
             MODEL="text_generation",
+            MESH_MODEL="mesh_generation",
             TTS_MODEL="audio_tts",
             STT_MODEL="audio_stt",
             EMBEDDING_MODEL="embedding",

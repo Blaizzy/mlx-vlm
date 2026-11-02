@@ -346,6 +346,7 @@ def get_model_path(
     revision: Optional[str] = None,
     force_download: bool = False,
     allow_patterns: Optional[List[str]] = None,
+    local_files_only: bool = False,
 ) -> Path:
     """
     Ensures the model is available locally. If the path does not exist locally,
@@ -376,6 +377,7 @@ def get_model_path(
                     "*.jinja",
                 ],
                 force_download=force_download,
+                local_files_only=local_files_only,
             )
         )
     return model_path
@@ -1271,10 +1273,15 @@ def save_config(
         json.dump(config, fid, indent=4)
 
 
-def load_image(image_source: Union[str, Path, BytesIO, Image.Image], timeout: int = 10):
+def load_image(
+    image_source: Union[str, Path, BytesIO, Image.Image],
+    timeout: int = 10,
+    *,
+    mode: str = "RGB",
+):
     """
     Helper function to load an image from either a URL, file path, data URI,
-    or BytesIO object.
+    or BytesIO object. Use mode="RGBA" to preserve transparency.
     """
     import base64
 
@@ -1310,7 +1317,7 @@ def load_image(image_source: Union[str, Path, BytesIO, Image.Image], timeout: in
         raise ValueError(f"Failed to load image from {original_source}: {e}") from e
 
     image = ImageOps.exif_transpose(image)
-    return image.convert("RGB")
+    return image.convert(mode)
 
 
 def resize_image(img, max_size):
