@@ -8013,6 +8013,77 @@ def test_tool_arguments_stream_incrementally(
             )
 
 
+@pytest.mark.parametrize("api", ["chat", "responses"])
+@pytest.mark.parametrize("batching", [False, True])
+@pytest.mark.parametrize(
+    "parser,text,expected",
+    [
+        (
+            "cohere2_moe",
+            '<|START_ACTION|>[{"tool_name":"get_time"},'
+            '{"tool_name":"write_file","parameters":{"content":"x"}}]'
+            "<|END_ACTION|>",
+            [("get_time", {}), ("write_file", {"content": "x"})],
+        ),
+        (
+            "json_tools",
+            '<tool_call>["oops",{"name":"write_file","arguments":{"path":"x"}},'
+            '5,{"name":"get_time","arguments":{}}]</tool_call>',
+            [("write_file", {"path": "x"}), ("get_time", {})],
+        ),
+    ],
+)
+def test_tool_streaming_filters_calls_consistently(
+    client, api, batching, parser, text, expected
+):
+    chunks = [text[offset : offset + 7] for offset in range(0, len(text), 7)]
+    tokens = [
+        _token(chunk, finish_reason="stop" if i == len(chunks) - 1 else None)
+        for i, chunk in enumerate(chunks)
+    ]
+    with _endpoint(
+        generator=_streaming(tokens) if batching else None,
+        chunks=[
+            _result(token.text, finish_reason=token.finish_reason) for token in tokens
+        ],
+        parser=load_tool_module(parser),
+    ):
+        response = _post(
+            client, api, stream=True, tools=[_tool("get_time"), _tool("write_file")]
+        )
+    events = _data(response)
+    assert not any(
+        "error" in event or event.get("type") in ("error", "response.failed")
+        for event in events
+    )
+    if api == "responses":
+        completed = [
+            event for event in events if event.get("type") == "response.completed"
+        ]
+        assert len(completed) == 1
+        calls = completed[0]["response"]["output"]
+        assert all(call["type"] == "function_call" for call in calls)
+        actual = [(call["name"], json.loads(call["arguments"])) for call in calls]
+    else:
+        choices = [event["choices"][0] for event in events if event.get("choices")]
+        assert [
+            choice["finish_reason"] for choice in choices if choice.get("finish_reason")
+        ] == ["tool_calls"]
+        received = {}
+        for choice in choices:
+            for delta in choice["delta"].get("tool_calls") or []:
+                call = received.setdefault(delta["index"], {"arguments": ""})
+                function = delta["function"]
+                if "name" in function:
+                    call["name"] = function["name"]
+                call["arguments"] += function.get("arguments", "")
+        assert list(received) == list(range(len(expected)))
+        actual = [
+            (call["name"], json.loads(call["arguments"])) for call in received.values()
+        ]
+    assert actual == expected
+
+
 @pytest.mark.parametrize("stream", [False, True])
 def test_diarized_transcription_openai_contract_and_global_speakers(
     audio_client, monkeypatch, stream

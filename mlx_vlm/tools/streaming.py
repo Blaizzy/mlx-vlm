@@ -7,7 +7,7 @@ import uuid
 _DECODER = json.JSONDecoder()
 
 
-def _json_calls(text, name_key="name", args_key="arguments"):
+def _json_calls(text, name_key="name", args_key="arguments", *, require_arguments=True):
     """Read complete metadata and the argument value's received JSON prefix."""
     text = text.lstrip()
     offset = 1 if text.startswith("[") else 0
@@ -48,14 +48,14 @@ def _json_calls(text, name_key="name", args_key="arguments"):
             if text[offset : offset + 1] == ",":
                 offset += 1
             elif text[offset : offset + 1] != "}":
-                if name and saw_arguments:
+                if name and (saw_arguments or not require_arguments):
                     yield name, arguments
                 return
         if name is None:
             return
-        # A call without an arguments member is dropped by the final parser;
-        # streaming it here would open a call the stream can never retract.
-        if saw_arguments:
+        # Generic JSON calls require arguments; Cohere defaults parameters to {}.
+        # Keep the prefix empty until parameters arrive or final parsing fills it.
+        if saw_arguments or not require_arguments:
             yield name, arguments
 
 
@@ -188,7 +188,9 @@ class ToolCallDeltaState:
                     candidates = _json_calls(body)
                 elif name == "cohere2_moe":
                     body = _without_marker_tail(body, "\\|").replace("\\|", "|")
-                    candidates = _json_calls(body, "tool_name", "parameters")
+                    candidates = _json_calls(
+                        body, "tool_name", "parameters", require_arguments=False
+                    )
                 elif name == "qwen3_coder":
                     candidates = _xml_call(body, self.tools, self.module)
                 elif name == "gemma4":
@@ -232,7 +234,13 @@ class ToolCallDeltaState:
                             if self.parser_name == "cohere2_moe"
                             else body
                         )
-                        raw = list(_json_calls(raw_body, *fields))
+                        raw = list(
+                            _json_calls(
+                                raw_body,
+                                *fields,
+                                require_arguments=self.parser_name != "cohere2_moe",
+                            )
+                        )
                         if (
                             count <= len(raw)
                             and raw[count - 1][1].startswith(sent)

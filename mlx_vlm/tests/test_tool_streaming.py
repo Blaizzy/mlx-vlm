@@ -208,6 +208,80 @@ def test_cohere_parallel_action_and_escape_repair():
     ]
 
 
+def _assert_streamed_calls(parser, tools, text, chunk_size, expected):
+    module = load_tool_module(parser)
+    state = ToolCallDeltaState(module, tools)
+    received = {}
+    for offset in range(0, len(text), chunk_size):
+        for delta in state.feed(text[offset : offset + chunk_size]):
+            call = received.setdefault(delta["index"], {"arguments": ""})
+            if "id" in delta:
+                assert "id" not in call
+                call["id"] = delta["id"]
+                call["name"] = delta["function"]["name"]
+            call["arguments"] += delta["function"].get("arguments", "")
+    final = process_tool_calls(text, module, tools).calls
+    assert [
+        (call["function"]["name"], json.loads(call["function"]["arguments"]))
+        for call in final
+    ] == expected
+    assert state.finish(final) == []
+    assert list(received) == list(range(len(expected)))
+    assert len({call["id"] for call in received.values()}) == len(expected)
+    for index, (name, arguments) in enumerate(expected):
+        assert received[index]["name"] == name
+        assert json.loads(received[index]["arguments"]) == arguments
+        assert received[index]["id"] == final[index]["id"]
+
+
+@pytest.mark.parametrize("chunk_size", [1, 7, 31, 8192])
+@pytest.mark.parametrize("no_param_index", [0, 1, 2])
+def test_cohere_parallel_calls_allow_missing_parameters(chunk_size, no_param_index):
+    expected = [
+        ("write_file", {"content": "first"}),
+        ("write_file", {"content": "second"}),
+    ]
+    calls = [{"tool_name": name, "parameters": args} for name, args in expected]
+    calls.insert(no_param_index, {"tool_name": "get_time"})
+    expected.insert(no_param_index, ("get_time", {}))
+    # Compact JSON also exercises raw-prefix recovery after a parameterless call.
+    text = (
+        "<|START_ACTION|>" + json.dumps(calls, separators=(",", ":")) + "<|END_ACTION|>"
+    )
+    _assert_streamed_calls(
+        "cohere2_moe", TOOLS + NO_PARAM_TOOLS, text, chunk_size, expected
+    )
+
+
+@pytest.mark.parametrize("chunk_size", [1, 7, 31, 8192])
+@pytest.mark.parametrize("junk_index", [0, 1, 2])
+@pytest.mark.parametrize(
+    "junk",
+    [
+        "oops",
+        5,
+        None,
+        {"name": "get_time"},
+        {"name": 5, "arguments": {}},
+        {"arguments": {}},
+    ],
+)
+def test_json_arrays_keep_valid_calls_around_junk(chunk_size, junk_index, junk):
+    expected = [
+        ("write_file", {"path": "first.txt"}),
+        ("write_file", {"path": "second.txt"}),
+    ]
+    calls = [{"name": name, "arguments": args} for name, args in expected]
+    calls.insert(junk_index, junk)
+    text = "<tool_call>" + json.dumps(calls, separators=(",", ":")) + "</tool_call>"
+    # A following block must retain its own index after filtering the array.
+    text += '<tool_call>{"name":"get_time","arguments":{}}</tool_call>'
+    expected.append(("get_time", {}))
+    _assert_streamed_calls(
+        "json_tools", TOOLS + NO_PARAM_TOOLS, text, chunk_size, expected
+    )
+
+
 @pytest.mark.parametrize(
     "value", ["null", "number", "", "\ntext\n", "\n\n", "</param", '"\\value']
 )
