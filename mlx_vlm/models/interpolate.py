@@ -248,16 +248,19 @@ def resize_nearest_nhwc(x, new_size):
     return x
 
 
-def resize_bilinear_nhwc(x, new_size, align_corners=False, antialias=False):
+def resize_bilinear_nhwc(
+    x, new_size, align_corners=False, antialias=False, *, training=False
+):
     """Channel-last bilinear resize matching ``F.interpolate``; ``antialias``
-    is PyTorch's triangle filter rather than ``resize_bilinear``'s Gaussian blur."""
+    is PyTorch's triangle filter rather than ``resize_bilinear``'s Gaussian blur.
+    Set ``training=True`` to use differentiable MLX operations."""
     _, H, W, _ = x.shape
     new_height, new_width = new_size
     if (H, W) == (new_height, new_width):
         return x
     iy, wy = _bilinear_weights_1d(H, new_height, align_corners, antialias)
     ix, wx = _bilinear_weights_1d(W, new_width, align_corners, antialias)
-    return separable_interpolate(x, iy, wy, ix, wx)
+    return separable_interpolate(x, iy, wy, ix, wx, training=training)
 
 
 @lru_cache(maxsize=64)

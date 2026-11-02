@@ -49,7 +49,7 @@ class Generation:
 class Checkpoints:
     # Prompt/media references live only in this server process. Bound retention
     # so abandoned chats cannot keep an unbounded amount of context alive.
-    def __init__(self, capacity=32, ttl=600):
+    def __init__(self, capacity=32, ttl=120):
         self.capacity, self.ttl = capacity, ttl
         self.records = OrderedDict()
         self.lock = Lock()
@@ -209,6 +209,9 @@ class StreamState:
             "content": self.delivered["content"],
             "reasoning": self.delivered["reasoning"],
             "responses": self.record.path.endswith("/responses"),
+            # The idle clock starts when the stream is disconnected, not when
+            # this event is emitted. Clients can start their own timer on Stop.
+            "idle_timeout_seconds": CHECKPOINTS.ttl,
         }
 
     def event(self, event):

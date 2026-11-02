@@ -50,6 +50,12 @@ class ContinuationCheckpoint(BaseModel):
     content: int = Field(ge=0, strict=True)
     reasoning: int = Field(ge=0, strict=True)
     responses: bool
+    idle_timeout_seconds: Optional[float] = Field(
+        None,
+        ge=0,
+        allow_inf_nan=False,
+        description="Idle lifetime after disconnection.",
+    )
 
 
 class ContinuationOptions(FlexibleBaseModel):

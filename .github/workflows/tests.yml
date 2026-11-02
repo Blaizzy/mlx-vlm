@@ -131,6 +131,7 @@ jobs:
               tests/test_muse_spark.py
               tests/test_muse_spark_kernels.py
               tests/test_oxr.py
+              tests/test_position_embedding_resize.py
               tests/test_processors.py
               tests/test_speculative.py
           - group: media
