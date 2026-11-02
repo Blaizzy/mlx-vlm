@@ -159,6 +159,10 @@ mlx_vlm.generate --model openbmb/MiniCPM-o-4_5 --output-modality audio --prompt 
 mlx_vlm.generate --model speridlabs/idol --output-modality 3d --image object.png --output object.ply
 ```
 
+Idol also accepts several views with `--image front.png side.png back.png` to
+generate one object. This is experimental; see [multi-image generation](mlx_vlm/models/idol/README.md#multiple-images-experimental)
+for the method, limitations, and server examples.
+
 #### Thinking Budget
 
 For thinking models (e.g., Qwen3.5), you can limit the number of tokens spent in the thinking block:

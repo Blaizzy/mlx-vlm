@@ -39,7 +39,7 @@ from mlx_vlm.models.idol.layers import (
 )
 from mlx_vlm.models.idol.pipeline import IdolOutput, IdolPipeline
 from mlx_vlm.models.idol.preprocess import preprocess_image
-from mlx_vlm.models.idol.sampler import sample_flow
+from mlx_vlm.models.idol.sampler import sample_flow, sample_multiview
 
 THREE_D_CASES = json.loads(Path(__file__).with_name("three_d_cases.json").read_text())
 THREE_D_FAMILIES = THREE_D_CASES["families"]
@@ -107,13 +107,14 @@ def test_image_conditioned_generation(family, tmp_path):
     assert json.loads((tmp_path / "image_camera.json").read_text()) == result.camera
 
 
-def test_3d_cli_uses_shared_options_and_saves(tmp_path):
+@pytest.mark.parametrize("images", [["castle.png"], ["front.png", "back.png"]])
+def test_3d_cli_uses_shared_options_and_saves(tmp_path, images):
     output = tmp_path / "castle.ply"
     args = _cli_args(
         "--output-modality",
         "3d",
         "--image",
-        "castle.png",
+        *images,
         "--output",
         str(output),
         "--steps",
@@ -133,7 +134,7 @@ def test_3d_cli_uses_shared_options_and_saves(tmp_path):
         three_d.run_3d_generation_cli(args)
     load.assert_called_once_with("demo", revision="checkpoint", force_download=False)
     model.assert_called_once_with(
-        "castle.png",
+        images[0] if len(images) == 1 else images,
         mode="real",
         num_gaussians=32768,
         steps=12,
@@ -148,7 +149,6 @@ def test_3d_cli_uses_shared_options_and_saves(tmp_path):
     "flags",
     [
         [],
-        ["--image", "one.png", "two.png"],
         ["--image", "one.png", "--output", "out.png"],
         ["--image", "one.png", "--output", "out.glb"],
         ["--image", "one.png", "--output", "out.obj"],
@@ -289,6 +289,12 @@ def test_mesh_server_job_lifecycle(mesh_client, monkeypatch, tmp_path):
     "payload,status",
     [
         ({"model": "idol"}, 422),
+        ({"model": "idol", "input_images": []}, 422),
+        ({"model": "idol", "input_images": ["a.png"] * 11}, 422),
+        ({"model": "idol", "input_images": ["a.png", ""]}, 422),
+        ({"model": "idol", "input_images": ["a.png", 7]}, 422),
+        ({"model": "idol", "input_images": "a.png"}, 422),
+        ({"model": "idol", "input_image": "a.png", "input_images": ["b.png"]}, 422),
         ({"input_image": "image.png"}, 400),
         ({"model": "idol", "input_image": "image.png", "output_format": "stl"}, 422),
         ({"model": "idol", "input_image": "image.png", "output_format": "glb"}, 422),
@@ -328,6 +334,93 @@ def test_mesh_server_failed_export_is_not_downloadable(
     job = _wait_mesh(mesh_client, response.json()["id"])
     assert job["status"] == "failed" and job["error"]["message"] == "export failed"
     assert mesh_client.get(f"/v1/meshes/{job['id']}/content").status_code == 404
+
+
+@pytest.mark.parametrize("transport", ["json", "images", "image", "mixed"])
+def test_mesh_server_preserves_view_order_and_saves_cameras(
+    mesh_client, monkeypatch, tmp_path, transport
+):
+    import mlx_vlm.server as server
+    from mlx_vlm.utils import load_image
+
+    colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
+    cameras = [{"yaw": yaw} for yaw in (0.1, 2.0, -1.0)]
+    data = []
+    for color in colors:
+        stream = io.BytesIO()
+        Image.new("RGB", (8, 8), color).save(stream, format="PNG")
+        data.append(stream.getvalue())
+    uris = [
+        "data:image/png;base64," + base64.b64encode(value).decode() for value in data
+    ]
+
+    def model(images, **kwargs):
+        prepared = [load_image(image) for image in images]
+        assert [image.getpixel((0, 0)) for image in prepared] == colors
+        return IdolOutput(
+            _ellipsoid(),
+            prepared[0],
+            cameras[0],
+            preprocessed_images=prepared,
+            cameras=cameras,
+        )
+
+    monkeypatch.setattr(
+        server, "get_cached_model", Mock(return_value=(model, None, None))
+    )
+    if transport == "json":
+        response = mesh_client.post(
+            "/v1/meshes", json={"model": "idol", "input_images": uris}
+        )
+    else:
+        files = [
+            (transport, (f"{i}.png", value, "image/png"))
+            for i, value in enumerate(data)
+        ]
+        if transport == "mixed":
+            files = [
+                ("images", ("first.png", data[0], "image/png")),
+                ("url", (None, uris[1])),
+                ("image[]", ("last.png", data[2], "image/png")),
+            ]
+        response = mesh_client.post("/v1/meshes", data={"model": "idol"}, files=files)
+    assert response.status_code == 200, response.text
+    job = _wait_mesh(mesh_client, response.json()["id"])
+    assert job["status"] == "completed", job
+    assert job["input_count"] == 3
+    assert job["camera"] == cameras[0] and job["cameras"] == cameras
+    folder = tmp_path / job["id"]
+    for index, color in enumerate(colors):
+        name = "output_input.png" if index == 0 else f"output_input_{index}.png"
+        with Image.open(folder / name) as image:
+            assert image.getpixel((0, 0)) == color
+    assert json.loads((folder / "output_cameras.json").read_text()) == cameras
+    assert mesh_client.get(job["url"]).content == (folder / "output.ply").read_bytes()
+
+
+def test_mesh_server_bounds_multipart_views_before_loading(mesh_client, monkeypatch):
+    import mlx_vlm.server as server
+
+    load = Mock()
+    monkeypatch.setattr(server, "get_cached_model", load)
+    response = mesh_client.post(
+        "/v1/meshes",
+        data={"model": "idol"},
+        files=[("images", (f"{i}.png", b"unused", "image/png")) for i in range(11)],
+    )
+    assert response.status_code == 422
+    load.assert_not_called()
+    assert mesh_client.get("/v1/meshes").json()["data"] == []
+
+
+def test_mesh_schema_advertises_multiple_views(mesh_client):
+    body = mesh_client.get("/openapi.json").json()["paths"]["/v1/meshes"]["post"][
+        "requestBody"
+    ]["content"]
+    images = body["multipart/form-data"]["schema"]["properties"]["images"]
+    assert images["type"] == "array" and images["maxItems"] == 10
+    assert images["items"]["format"] == "binary"
+    assert "input_images" in body["application/json"]["schema"]["properties"]
 
 
 def test_mesh_cache_reuse_switch_and_unload(monkeypatch):
@@ -525,6 +618,72 @@ def test_sampler_rejects_invalid_settings(kwargs):
         sample_flow(None, {}, {}, **kwargs)
 
 
+@pytest.mark.parametrize("batch_cfg", [False, True])
+@pytest.mark.parametrize("strength", [0.0, 3.0])
+def test_multiview_shared_latent_and_independent_cameras(batch_cfg, strength):
+    def model(sample, t, cond):
+        value = cond["feature1"][:, :1, :1]
+        return {
+            "latent": 0.1 * sample["latent"] + sample["camera"] + value,
+            "camera": 0.5 * sample["camera"] + value,
+        }
+
+    noise = {"latent": mx.zeros((1, 2, 1)), "camera": mx.zeros((1, 1, 1))}
+    conditions = [{"feature1": mx.full((1, 1, 1), v)} for v in (1.0, 3.0)]
+    for views in (conditions, conditions[::-1]):
+        result = sample_multiview(
+            model,
+            noise,
+            views,
+            steps=2,
+            rescale_t=1.0,
+            cfg_strength=strength,
+            batch_cfg=batch_cfg,
+        )
+        # Two Euler steps, dt=1/2. All views must see the same old latent.
+        np.testing.assert_allclose(
+            np.array(result["latent"]), -1.45 * (1 + strength), rtol=1e-6
+        )
+        for camera, cond in zip(result["cameras"], views):
+            expected = -0.875 * (1 + strength) * np.array(cond["feature1"])
+            np.testing.assert_allclose(np.array(camera), expected, rtol=1e-6)
+        np.testing.assert_array_equal(
+            np.array(result["camera"]), np.array(result["cameras"][0])
+        )
+
+
+@pytest.mark.parametrize("batch_cfg", [False, True])
+@pytest.mark.parametrize("strength", [0.0, 3.0])
+def test_multiview_one_or_duplicate_view_matches_single_sampler(batch_cfg, strength):
+    mx.random.seed(7)
+    model = LatentSeqMMFlowModel(**IDOL_DENOISER_ARGS)
+    model.dtype = mx.float32
+    noise = {
+        "latent": mx.random.normal((1, 8, 4)),
+        "camera": mx.random.normal((1, 1, 5)),
+    }
+    cond = {
+        "feature1": mx.random.normal((1, 6, 12)),
+        "feature2": mx.random.normal((1, 6, 8)),
+    }
+    options = dict(steps=3, cfg_strength=strength, batch_cfg=batch_cfg)
+    expected = sample_flow(model, noise, cond, **options)
+    for count in (1, 2):
+        actual = sample_multiview(model, noise, [cond] * count, **options)
+        for key in ("latent", "camera"):
+            np.testing.assert_array_equal(
+                np.array(actual[key]), np.array(expected[key])
+            )
+
+
+def test_multiview_rejects_empty_or_batched_conditions():
+    noise = {"latent": mx.zeros((1, 2, 3)), "camera": mx.zeros((1, 1, 5))}
+    with pytest.raises(ValueError, match="At least one"):
+        sample_multiview(None, noise, [])
+    with pytest.raises(ValueError, match="one image per view"):
+        sample_multiview(None, noise, [{"feature1": mx.zeros((2, 2, 3))}])
+
+
 def test_sanitize_nested_sequential_weights():
     class Nested(nn.Module):
         def __init__(self):
@@ -657,6 +816,46 @@ def test_seed_is_applied_after_lazy_encoder_initialization(monkeypatch):
     mx.eval(first)
     second = pipeline.encode_image(Image.new("RGB", (16, 16)), seed=42)
     np.testing.assert_array_equal(np.array(first), np.array(second))
+
+
+def test_pipeline_multiview_keeps_primary_rng_and_single_image_outputs(tmp_path):
+    pipe = object.__new__(IdolPipeline)
+    pipe.config = {"image_size": 16}
+    pipe.background_removal = False
+    pipe.background_remover = None
+    pipe.denoiser = LatentSeqMMFlowModel(**IDOL_DENOISER_ARGS)
+    pipe.denoiser.dtype = mx.float32
+    pipe.decoder_gs = SimpleNamespace(rep_config={"num_gaussians": 32})
+    pipe.image_encoder = lambda pixels: {
+        "feature1": mx.random.normal((1, 6, 12)) + pixels.mean(),
+        "feature2": mx.random.normal((1, 6, 8)),
+    }
+    decoded = []
+
+    def decode(latent, count):
+        decoded.append((np.array(latent), np.array(mx.random.normal((8,)))))
+        return _ellipsoid()
+
+    pipe.decode = decode
+    image = Image.new("RGBA", (8, 8), (255, 0, 0, 127))
+    outputs = [pipe(source, steps=2) for source in (image, [image], [image, image])]
+    for (latent, decoder_noise), output in zip(decoded[1:], outputs[1:]):
+        np.testing.assert_array_equal(latent, decoded[0][0])
+        np.testing.assert_array_equal(decoder_noise, decoded[0][1])
+        assert output.camera == outputs[0].camera
+        assert (
+            output.preprocessed_image.tobytes()
+            == outputs[0].preprocessed_image.tobytes()
+        )
+    assert len(outputs[2].cameras) == len(outputs[2].preprocessed_images) == 2
+    outputs[0].save(tmp_path / "single.ply")
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        "single.ply",
+        "single_camera.json",
+        "single_input.png",
+    ]
+    with pytest.raises(ValueError, match="At least one"):
+        pipe([], steps=2)
 
 
 def _torch_weights(model):

@@ -8,24 +8,38 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Lock
-from typing import Literal
+from typing import Annotated, Literal
 
 from fastapi import HTTPException, Query, Request
 from fastapi.responses import FileResponse
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    model_validator,
+)
 from starlette.datastructures import UploadFile
 
 from ..generate.three_d import generate_3d
 from .runtime import runtime
 
 logger = logging.getLogger(__name__)
+MAX_MESH_IMAGES = 10
 
 
 class MeshGenerationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
     model: str | None = Field(None, min_length=1)
-    input_image: str | None = None
+    input_image: str | None = Field(None, min_length=1)
+    input_images: list[Annotated[str, Field(min_length=1)]] | None = Field(
+        None,
+        min_length=1,
+        max_length=MAX_MESH_IMAGES,
+        description="Ordered views of one object; experimental multi-image conditioning.",
+    )
     output_format: Literal["ply"] = "ply"
     seed: int = Field(42, ge=0, le=2**32 - 1)
     num_inference_steps: int = Field(
@@ -43,6 +57,12 @@ class MeshGenerationRequest(BaseModel):
     crop_margin: float | None = Field(None, gt=0)
     batch_cfg: bool = False
 
+    @model_validator(mode="after")
+    def validate_image_source(self):
+        if self.input_image is not None and self.input_images is not None:
+            raise ValueError("Provide input_image or input_images, not both")
+        return self
+
 
 class MeshResponse(BaseModel):
     id: str
@@ -58,6 +78,8 @@ class MeshResponse(BaseModel):
     url: str | None = None
     file_size_bytes: int | None = None
     camera: dict | None = None
+    cameras: list[dict] | None = None
+    input_count: int = 1
     error: dict | None = None
 
 
@@ -93,6 +115,7 @@ class MeshJobs:
             status="queued",
             created_at=int(time.time()),
             seed=request.seed,
+            input_count=len(image) if isinstance(image, list) else 1,
         )
         with self.lock:
             if self.executor is None:
@@ -141,6 +164,7 @@ class MeshJobs:
                 url=f"/v1/meshes/{job_id}/content",
                 file_size_bytes=path.stat().st_size,
                 camera=result.camera,
+                cameras=result.cameras,
             )
             if metrics is not None:
                 metrics.record_success(
@@ -193,6 +217,13 @@ def register_routes(app, deps):
         "properties": {
             **schema["properties"],
             "image": {"type": "string", "format": "binary"},
+            "images": {
+                "type": "array",
+                "items": {"type": "string", "format": "binary"},
+                "minItems": 1,
+                "maxItems": MAX_MESH_IMAGES,
+                "description": "Ordered views of one object; experimental multi-image conditioning.",
+            },
             "url": {"type": "string"},
         },
     }
@@ -211,15 +242,36 @@ def register_routes(app, deps):
         },
     )
     async def create_mesh(request: Request):
+        image = None
         if "multipart/form-data" in request.headers.get("content-type", ""):
             async with request.form() as form:
-                image_keys = ("image", "image[]", "url", "url[]", "input_image")
-                images = [value for key in image_keys for value in form.getlist(key)]
-                if len(images) != 1:
-                    raise HTTPException(422, "Exactly one image or url is required")
-                image = images[0]
-                if isinstance(image, UploadFile):
-                    image = io.BytesIO(await image.read())
+                image_keys = (
+                    "image",
+                    "image[]",
+                    "images",
+                    "images[]",
+                    "url",
+                    "url[]",
+                    "input_image",
+                )
+                images = [
+                    value for key, value in form.multi_items() if key in image_keys
+                ]
+                if not 1 <= len(images) <= MAX_MESH_IMAGES or any(
+                    value == "" for value in images
+                ):
+                    raise HTTPException(
+                        422, f"Provide 1 to {MAX_MESH_IMAGES} images or urls"
+                    )
+                images = [
+                    (
+                        io.BytesIO(await value.read())
+                        if isinstance(value, UploadFile)
+                        else value
+                    )
+                    for value in images
+                ]
+                image = images[0] if len(images) == 1 else images
                 payload = {
                     key: value for key, value in form.items() if key not in image_keys
                 }
@@ -228,14 +280,19 @@ def register_routes(app, deps):
                 payload = await request.json()
             except ValueError as error:
                 raise HTTPException(400, "Invalid JSON body") from error
-            image = payload.get("input_image") if isinstance(payload, dict) else None
         try:
             body = MeshGenerationRequest.model_validate(payload)
         except ValidationError as error:
             raise HTTPException(
                 422, error.errors(include_context=False, include_input=False)
             ) from error
-        if image is None or image == "":
+        if image is None:
+            image = (
+                body.input_images if body.input_images is not None else body.input_image
+            )
+        elif body.input_images is not None:
+            raise HTTPException(422, "Use images uploads or input_images, not both")
+        if image is None:
             raise HTTPException(422, "An input image is required")
         registry = runtime.model_cache
         cached = (

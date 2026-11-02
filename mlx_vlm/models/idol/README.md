@@ -42,7 +42,7 @@ python -m mlx_vlm.generate \
 ```
 
 Use `mode="real"` for photos; the default `synthetic` mode is for renders and
-generated images. The shared CLI accepts one image path, URL, or data URI.
+generated images. The shared CLI accepts image paths, URLs, or data URIs.
 A transparent input skips background removal. The default output is
 `outputs/object-42.ply`, with prepared input and camera files beside it.
 PLY preserves the original splats in y-up coordinates and needs a Gaussian-splat
@@ -99,6 +99,57 @@ Gaussians are z-up in memory; PLY export rotates positions and quaternions to y-
 The shared CLI routes `--output-modality 3d` to this pipeline without loading
 a text tokenizer or applying a chat template.
 
+## Multiple images (experimental)
+
+Pass several views of the same object to generate one PLY:
+
+```sh
+python -m mlx_vlm.generate \
+  --model speridlabs/idol --output-modality 3d \
+  --image front.png side.png back.png \
+  --output outputs/object.ply \
+  --gen-kwargs '{"mode": "real"}'
+```
+
+The Python API accepts an ordered list or tuple in the existing image argument:
+
+```python
+result = generate_3d(
+    model, ["front.png", "side.png", "back.png"],
+    mode="real", output_path="outputs/object.ply",
+)
+print(result.cameras)  # One predicted camera per input, in input order.
+```
+
+Idol's released checkpoint was trained for single-image conditioning. This
+inference-only extension averages each view's guided object velocity at each
+Euler step. Every view sees the same object latent, while its camera state is
+updated only from its own prediction. All views have equal weight. It uses the
+same checkpoints and adds no dependencies, camera calibration, training, or
+rendering-based refinement.
+
+Use views of the same object with consistent pose and appearance. More images
+do not guarantee more detail: conflicting predictions can blur features, repeat
+textures, or misalign front and back views. The earlier five-photo prototype
+did not improve facial fidelity. This is experimental conditioning, not a
+calibrated photogrammetry pipeline.
+
+The first image is the primary view: `result.camera` and
+`result.preprocessed_image` still refer to it. `result.cameras` and
+`result.preprocessed_images` contain all views in input order. A one-image list
+uses the ordinary single-image sampler. With a fixed seed, encoding extra views
+does not change the primary image's encoding or the sampling/decoder RNG stream.
+
+Saving preserves `object_input.png` and `object_camera.json` for the primary
+view. Multiple-image results also save `object_input_1.png`, `object_input_2.png`,
+etc. for the additional views and `object_cameras.json` for all cameras. PLY
+coordinates remain y-up; cameras retain the pipeline's z-up convention.
+
+Each image is encoded separately and each denoising step evaluates each view
+sequentially. Denoising cost grows approximately with the number of views;
+intermediate denoiser graphs are evaluated between views to limit peak memory.
+`batch_cfg` continues to batch the positive/negative pair within each view.
+
 ## Server
 
 The server provides asynchronous image-to-3D generation at `/v1/meshes`,
@@ -124,8 +175,27 @@ curl http://localhost:8080/v1/meshes/MESH_ID/content -o object.ply
 ```
 
 Supply `model` in the request if it was not preloaded. Multipart requests accept
-one `image` upload or `url`; JSON requests accept `input_image` (a path, URL,
-or image data URI). The API defaults to PLY. `num_inference_steps`
+`image` uploads or `url` fields; JSON requests accept `input_image` (a path, URL,
+or image data URI). For experimental multi-image generation, upload repeated
+`images` fields in view order, or use JSON `input_images`:
+
+```sh
+curl http://localhost:8080/v1/meshes \
+  -F 'images=@front.png' -F 'images=@side.png' -F 'images=@back.png' \
+  -F 'mode=real'
+
+curl http://localhost:8080/v1/meshes \
+  -H 'Content-Type: application/json' \
+  -d '{"input_images": ["/data/front.png", "/data/side.png"], "mode": "real"}'
+```
+
+JSON paths refer to files on the server. Use either `input_image` or
+`input_images`, not both. The server accepts 1–10 views per job, preserving their
+order; repeated `image`/`image[]` and `url`/`url[]` fields also work. Polling and
+downloading use the same endpoints. Job responses include `input_count`, and
+completed responses include ordered `cameras` alongside the primary `camera`.
+
+The API defaults to PLY. `num_inference_steps`
 and `guidance_scale` also accept the shared aliases `steps` and `guidance`.
 Idol options include `mode`, `num_gaussians`, `rescale_t`, `crop_margin`,
 and `batch_cfg`. Idol uses image conditioning; text and negative prompts are

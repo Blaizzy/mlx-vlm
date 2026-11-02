@@ -27,7 +27,7 @@ def load_3d_model(model, *, revision=None, force_download=False, **kwargs):
 
 
 def generate_3d(model, image, *, output_path=None, guidance=None, **kwargs):
-    """Generate Gaussian splats from an image and optionally save the result."""
+    """Generate one object from an image or image list and optionally save it."""
     if guidance is not None:
         kwargs["cfg_strength"] = guidance
     result = model(image, **kwargs)
@@ -38,8 +38,8 @@ def generate_3d(model, image, *, output_path=None, guidance=None, **kwargs):
 
 def run_3d_generation_cli(args):
     images = args.image or []
-    if len(images) != 1:
-        raise ValueError("3D generation requires exactly one --image")
+    if not images:
+        raise ValueError("3D generation requires at least one --image")
     incompatible = [
         f"--{name.replace('_', '-')}"
         for name in (
@@ -74,5 +74,6 @@ def run_3d_generation_cli(args):
     model = load_3d_model(
         args.model, revision=args.revision, force_download=args.force_download
     )
-    result = generate_3d(model, images[0], output_path=output, **kwargs)
+    image = images[0] if len(images) == 1 else images
+    result = generate_3d(model, image, output_path=output, **kwargs)
     print(f"Saved {result.path}")

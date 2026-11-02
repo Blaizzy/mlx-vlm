@@ -1,7 +1,7 @@
-"""Single-image to 3D Gaussian splats on Apple silicon."""
+"""Image-to-3D Gaussian splats, with experimental multi-image conditioning."""
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import mlx.core as mx
@@ -14,7 +14,7 @@ from .decoder import GaussianFixedlenDecoder, OctreeProbabilityFixedlenDecoder
 from .dit import LatentSeqMMFlowModel
 from .gaussian import Gaussian
 from .preprocess import CROP_MARGIN, has_real_alpha, preprocess_image
-from .sampler import sample_flow, validate_sampling
+from .sampler import sample_flow, sample_multiview, validate_sampling
 
 
 @dataclass
@@ -23,6 +23,14 @@ class IdolOutput:
     preprocessed_image: Image.Image
     camera: dict
     path: Path | None = None
+    preprocessed_images: list[Image.Image] = field(default_factory=list)
+    cameras: list[dict] = field(default_factory=list)
+
+    def __post_init__(self):
+        if not self.preprocessed_images:
+            self.preprocessed_images = [self.preprocessed_image]
+        if not self.cameras:
+            self.cameras = [self.camera]
 
     def save(self, path):
         """Save .ply, the prepared input, and predicted camera beside it."""
@@ -32,6 +40,12 @@ class IdolOutput:
         path.with_name(path.stem + "_camera.json").write_text(
             json.dumps(self.camera, indent=2) + "\n"
         )
+        if len(self.preprocessed_images) > 1:
+            for index, image in enumerate(self.preprocessed_images[1:], start=1):
+                image.save(path.with_name(f"{path.stem}_input_{index}.png"))
+            path.with_name(path.stem + "_cameras.json").write_text(
+                json.dumps(self.cameras, indent=2) + "\n"
+            )
         self.path = path
         return path
 
@@ -152,17 +166,24 @@ class IdolPipeline:
         verbose=False,
         batch_cfg=False,
     ):
-        """Sample from precomputed image features without loading the encoders."""
+        """Sample from a condition dict or a list of single-view condition dicts."""
+        if isinstance(condition, (list, tuple)):
+            if not condition:
+                raise ValueError("At least one image condition is required")
+            if len(condition) == 1:
+                condition = condition[0]
+        multiview = isinstance(condition, (list, tuple))
         if seed is not None:
             mx.random.seed(seed)
-        batch = condition["feature1"].shape[0]
+        batch = 1 if multiview else condition["feature1"].shape[0]
         noise = {
             "latent": mx.random.normal(
                 (batch, self.denoiser.q_token_length, self.denoiser.in_channels)
             ),
             "camera": mx.random.normal((batch, 1, self.denoiser.cam_channels)),
         }
-        return sample_flow(
+        sampler = sample_multiview if multiview else sample_flow
+        return sampler(
             self.denoiser,
             noise,
             condition,
@@ -219,11 +240,19 @@ class IdolPipeline:
     ):
         validate_sampling(steps, rescale_t, cfg_strength)
         self._validate_num_gaussians(num_gaussians)
-        prepared = self.preprocess(image, mode, crop_margin)
-        condition = self.encode_image(prepared, seed=seed)
+        images = list(image) if isinstance(image, (list, tuple)) else [image]
+        if not images:
+            raise ValueError("At least one image is required")
+        prepared = [self.preprocess(item, mode, crop_margin) for item in images]
+        conditions = [None] * len(images)
+        # Encode the primary view last so seeded sampling and decoding continue
+        # the same RNG stream as a run with only that image, regardless of count.
+        for index in reversed(range(len(images))):
+            conditions[index] = self.encode_image(prepared[index], seed=seed)
+            mx.eval(conditions[index])
         # Continue the RNG stream after sampling the VAE posterior.
         sample = self.sample(
-            condition,
+            conditions,
             seed=None,
             steps=steps,
             cfg_strength=cfg_strength,
@@ -231,8 +260,14 @@ class IdolPipeline:
             verbose=verbose,
             batch_cfg=batch_cfg,
         )
+        cameras = [
+            decode_camera(camera[0, 0])
+            for camera in sample.get("cameras", [sample["camera"]])
+        ]
         return IdolOutput(
             self.decode(sample["latent"], num_gaussians),
-            prepared,
-            decode_camera(sample["camera"][0, 0]),
+            prepared[0],
+            cameras[0],
+            preprocessed_images=prepared,
+            cameras=cameras,
         )
