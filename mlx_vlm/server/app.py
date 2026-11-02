@@ -22,6 +22,7 @@ from .. import apc as _apc
 from ..generate.edit_image import load_image_edit_model
 from ..generate.image import is_image_generation_model, load_image_generation_model
 from ..generate.image_defaults import ImageSamplingDefaults, resolve_image_defaults
+from ..generate.three_d import load_3d_model
 from ..reranker import RerankerKind, reranker_kind
 from ..structured import build_json_schema_logits_processor
 from ..tools import _infer_tool_parser_from_processor
@@ -47,6 +48,7 @@ from .generation import (
     get_quantized_kv_start,
     get_top_logprobs_k,
 )
+from .meshes import register_routes as register_mesh_routes
 from .model_discovery import MODEL_PATHS_ENV, discover_models
 from .openai import register_routes as register_openai_routes
 from .realtime import register_routes as register_realtime_routes
@@ -417,6 +419,12 @@ async def lifespan(app):
 
     preload_models = (
         (
+            os.environ.pop("MLX_VLM_PRELOAD_MESH_MODEL", None),
+            None,
+            "mesh_generation",
+            "3D generation model",
+        ),
+        (
             os.environ.pop("MLX_VLM_PRELOAD_IMAGE_MODEL", None),
             None,
             "image_generation",
@@ -482,6 +490,8 @@ async def lifespan(app):
     try:
         yield
     finally:
+        if runtime.mesh_jobs is not None:
+            await asyncio.to_thread(runtime.mesh_jobs.shutdown)
         if runtime.audio_queue is not None:
             runtime.audio_queue.stop_and_join()
             runtime.audio_queue = None
@@ -599,6 +609,7 @@ def get_cached_model(
     load_as_embedding = model_kind == "embedding"
     load_as_reranker = model_kind == "reranker"
     load_as_decision = model_kind == "decision"
+    load_as_mesh = model_kind == "mesh_generation"
     load_as_image = model_kind == "image_generation" or (
         model_kind == "auto" and is_image_generation_model(model_path)
     )
@@ -617,6 +628,9 @@ def get_cached_model(
     elif load_as_decision:
         cache_group = "decision"
         effective_model_kind = "decision"
+    elif load_as_mesh:
+        cache_group = "mesh_generation"
+        effective_model_kind = "mesh_generation"
     elif load_as_image:
         cache_group = "image_generation"
         effective_model_kind = "image_generation"
@@ -656,6 +670,25 @@ def get_cached_model(
     if cached_cache:
         logger.info("New %s model requested; clearing its existing cache.", cache_group)
         _unload_model_cache_group(cache_group)
+
+    if load_as_mesh:
+        if adapter_path is not None:
+            raise HTTPException(400, "Adapters are not supported for 3D generation")
+        model = load_3d_model(model_path, revision=revision)
+        config = SimpleNamespace(model_type="idol", text_config=None)
+        registry.set(
+            cache_group,
+            {
+                "cache_key": cache_key,
+                "model_path": model_path,
+                "adapter_path": None,
+                "model": model,
+                "processor": None,
+                "config": config,
+                "model_kind": "mesh_generation",
+            },
+        )
+        return model, None, config
 
     if load_as_edit:
         if adapter_path is not None:
@@ -1006,6 +1039,8 @@ def get_cached_model(
 # Synchronous unload function for internal use
 def unload_model_sync():
     unloaded_any = False
+    if runtime.mesh_jobs is not None:
+        runtime.mesh_jobs.shutdown()
     if runtime.audio_queue is not None:
         is_audio_worker = getattr(
             runtime.audio_queue, "is_worker_thread", lambda: False
@@ -1070,6 +1105,7 @@ register_openai_routes(inference_router, _protocol_deps)
 register_audio_routes(inference_router, _protocol_deps)
 register_realtime_routes(inference_router, _protocol_deps)
 register_decision_routes(inference_router, _protocol_deps)
+register_mesh_routes(inference_router, _protocol_deps)
 register_embeddings_routes(inference_router, _protocol_deps)
 register_reranking_routes(inference_router, _protocol_deps)
 

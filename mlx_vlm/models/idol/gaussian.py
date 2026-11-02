@@ -88,3 +88,23 @@ class Gaussian:
         with path.open("wb") as handle:
             handle.write(header.encode("ascii"))
             handle.write(attributes.tobytes())
+
+    def save(self, path, *, mesh_resolution=128, mesh_threshold=0.5):
+        """Save original splats as PLY, or a reconstructed surface as GLB/OBJ."""
+        path = Path(path).expanduser()
+        if not path.suffix:
+            path = path.with_suffix(".ply")
+        extension = path.suffix.lower()
+        if extension == ".ply":
+            self.save_ply(path)
+        elif extension in (".glb", ".obj"):
+            from .mesh import reconstruct_mesh
+
+            mesh = reconstruct_mesh(
+                self, resolution=mesh_resolution, threshold=mesh_threshold
+            )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            mesh.export(str(path), file_type=extension[1:])
+        else:
+            raise ValueError("3D output must use .ply, .glb, or .obj")
+        return path

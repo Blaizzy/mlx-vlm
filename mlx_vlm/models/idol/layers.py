@@ -106,6 +106,9 @@ class PcdAbsolutePositionEmbedder(nn.Module):
             ]
         )[:dim]
         self._freqs = 2**logs
+        # Private constants are not evaluated by the standard weight loader.
+        # Materialize them here so a preloaded model can run on another thread.
+        mx.eval(self._freqs)
 
     def __call__(self, x):
         angles = x[..., None] * self._freqs * (2 * math.pi)
@@ -119,6 +122,7 @@ class PcdAbsolutePositionEmbedderv2(PcdAbsolutePositionEmbedder):
         super().__init__(channels, in_channels, max_res)
         # Base class multiplies by 2*pi; decoder positions use pi.
         self._freqs = 2 ** mx.linspace(0, max_res, channels // in_channels // 2) / 2
+        mx.eval(self._freqs)
 
 
 class SinusoidalEmbedder(nn.Module):
@@ -135,6 +139,7 @@ class SinusoidalEmbedder(nn.Module):
         self._freqs = mx.exp(
             -math.log(max_period) * mx.arange(half, dtype=mx.float32) / half
         )
+        mx.eval(self._freqs)
         self.two_pi = two_pi
 
     def __call__(self, t):

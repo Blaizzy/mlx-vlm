@@ -26,13 +26,30 @@ def load_3d_model(model, *, revision=None, force_download=False, **kwargs):
     )
 
 
-def generate_3d(model, image, *, output_path=None, guidance=None, **kwargs):
+def generate_3d(
+    model,
+    image,
+    *,
+    output_path=None,
+    guidance=None,
+    mesh_resolution=None,
+    mesh_threshold=None,
+    **kwargs,
+):
     """Generate Gaussian splats from an image and optionally save the result."""
     if guidance is not None:
         kwargs["cfg_strength"] = guidance
     result = model(image, **kwargs)
     if output_path is not None:
-        result.save(output_path)
+        export_kwargs = {
+            key: value
+            for key, value in (
+                ("mesh_resolution", mesh_resolution),
+                ("mesh_threshold", mesh_threshold),
+            )
+            if value is not None
+        }
+        result.save(output_path, **export_kwargs)
     return result
 
 
@@ -69,8 +86,8 @@ def run_3d_generation_cli(args):
         if args.output
         else (Path("outputs") / f"object-{kwargs.get('seed', 42)}.ply")
     )
-    if output.suffix.lower() != ".ply":
-        raise ValueError("3D generation requires a .ply --output path")
+    if output.suffix.lower() not in (".ply", ".glb", ".obj"):
+        raise ValueError("3D generation requires a .ply, .glb, or .obj --output path")
     model = load_3d_model(
         args.model, revision=args.revision, force_download=args.force_download
     )

@@ -6,7 +6,10 @@ import io
 import json
 import os
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -28,8 +31,13 @@ from mlx_vlm.models.idol.decoder import (
 )
 from mlx_vlm.models.idol.dit import LatentSeqMMFlowModel
 from mlx_vlm.models.idol.gaussian import Gaussian
-from mlx_vlm.models.idol.layers import sanitize_weights
-from mlx_vlm.models.idol.pipeline import IdolPipeline
+from mlx_vlm.models.idol.layers import (
+    PcdAbsolutePositionEmbedder,
+    PcdAbsolutePositionEmbedderv2,
+    SinusoidalEmbedder,
+    sanitize_weights,
+)
+from mlx_vlm.models.idol.pipeline import IdolOutput, IdolPipeline
 from mlx_vlm.models.idol.preprocess import preprocess_image
 from mlx_vlm.models.idol.sampler import sample_flow
 
@@ -99,8 +107,9 @@ def test_image_conditioned_generation(family, tmp_path):
     assert json.loads((tmp_path / "image_camera.json").read_text()) == result.camera
 
 
-def test_3d_cli_uses_shared_options_and_saves(tmp_path):
-    output = tmp_path / "castle.ply"
+@pytest.mark.parametrize("extension", ["ply", "glb", "obj"])
+def test_3d_cli_uses_shared_options_and_saves(tmp_path, extension):
+    output = tmp_path / f"castle.{extension}"
     args = _cli_args(
         "--output-modality",
         "3d",
@@ -153,6 +162,334 @@ def test_3d_cli_rejects_invalid_inputs_before_loading(flags):
 
 
 # Idol model components and reference comparisons.
+
+
+@pytest.mark.parametrize(
+    "layer_class,input_shape",
+    [
+        (PcdAbsolutePositionEmbedder, (2, 3)),
+        (PcdAbsolutePositionEmbedderv2, (2, 3)),
+        (SinusoidalEmbedder, (2,)),
+    ],
+)
+def test_preloaded_embeddings_run_on_worker_thread(layer_class, input_shape):
+    layer = layer_class(48)
+    mx.eval(layer.parameters())
+
+    def run():
+        return np.array(layer(mx.ones(input_shape)))
+
+    # The worker must be the first caller: evaluating on the loading thread
+    # beforehand would hide lazy constants tied to that thread's MLX stream.
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        actual = executor.submit(run).result()
+    np.testing.assert_array_equal(actual, run())
+
+
+def _ellipsoid():
+    gaussian = object.__new__(Gaussian)
+    gaussian.xyz = mx.array([[0.1, 0.2, 0.3]])
+    gaussian.scaling = mx.array([[0.12, 0.07, 0.04]])
+    gaussian.rotation = mx.array([[1.0, 0.0, 0.0, 0.0]])
+    gaussian.opacity = mx.array([[0.9]])
+    gaussian.features_dc = mx.array([[[1.0, -1.0, 0.0]]])
+    return gaussian
+
+
+@pytest.mark.parametrize("extension", ["glb", "obj"])
+def test_surface_export_matches_gaussian_isosurface(tmp_path, extension):
+    trimesh = pytest.importorskip("trimesh")
+    pytest.importorskip("skimage")
+    gaussian = _ellipsoid()
+    result = IdolOutput(gaussian, Image.new("RGB", (8, 8)), {"fov": 30.0})
+    path = result.save(tmp_path / f"ellipsoid.{extension}", mesh_resolution=64)
+    mesh = trimesh.load(path, force="mesh", process=False)
+    assert len(mesh.faces) > 100 and mesh.is_watertight
+    assert mesh.volume > 0  # Outward face winding survives the y-up rotation.
+    expected_center = np.array([0.1, -0.3, 0.2])
+    expected_radius = np.array([0.12, 0.04, 0.07]) * np.sqrt(2 * np.log(0.9 / 0.5))
+    np.testing.assert_allclose(
+        mesh.bounds,
+        [expected_center - expected_radius, expected_center + expected_radius],
+        atol=0.002,
+    )
+    colors = np.array([0.5 + 0.28209479, 0.5 - 0.28209479, 0.5]) * 255
+    np.testing.assert_allclose(
+        mesh.visual.vertex_colors[:, :3].mean(axis=0), colors, atol=1
+    )
+    assert path.with_name("ellipsoid_input.png").is_file()
+    assert (
+        json.loads(path.with_name("ellipsoid_camera.json").read_text()) == result.camera
+    )
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"resolution": 0},
+        {"resolution": 257},
+        {"threshold": 0},
+        {"threshold": float("nan")},
+    ],
+)
+def test_surface_rejects_invalid_settings(options):
+    from mlx_vlm.models.idol.mesh import reconstruct_mesh
+
+    with pytest.raises(ValueError):
+        reconstruct_mesh(_ellipsoid(), **options)
+
+
+def test_3d_export_options_do_not_reach_model(tmp_path):
+    result = SimpleNamespace(save=Mock())
+    model = Mock(return_value=result)
+    path = tmp_path / "object.obj"
+    generate_3d(
+        model,
+        "image.png",
+        output_path=path,
+        mesh_resolution=64,
+        mesh_threshold=0.3,
+        seed=7,
+    )
+    model.assert_called_once_with("image.png", seed=7)
+    result.save.assert_called_once_with(path, mesh_resolution=64, mesh_threshold=0.3)
+
+
+@pytest.fixture
+def mesh_client(monkeypatch, tmp_path):
+    from fastapi.testclient import TestClient
+
+    import mlx_vlm.server as server
+
+    monkeypatch.setattr(server.runtime, "mesh_jobs", None)
+    monkeypatch.setattr(server.runtime, "model_cache", server.ModelCacheRegistry())
+    monkeypatch.setattr(server.runtime, "metrics", server.ServerMetricsStore())
+    monkeypatch.setenv("MLX_VLM_MESH_OUTPUT_DIR", str(tmp_path))
+    monkeypatch.delenv("MLX_VLM_PRELOAD_MESH_MODEL", raising=False)
+    with TestClient(server.app) as client:
+        yield client
+
+
+def _wait_mesh(client, job_id):
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        response = client.get(f"/v1/meshes/{job_id}")
+        assert response.status_code == 200
+        job = response.json()
+        if job["status"] in ("completed", "failed"):
+            return job
+        time.sleep(0.01)
+    pytest.fail("Mesh job did not finish")
+
+
+@pytest.mark.parametrize("extension", ["ply", "glb", "obj"])
+def test_mesh_server_job_lifecycle(mesh_client, monkeypatch, tmp_path, extension):
+    import mlx_vlm.server as server
+    from mlx_vlm.utils import load_image
+
+    if extension != "ply":
+        pytest.importorskip("trimesh")
+        pytest.importorskip("skimage")
+    started, release = Event(), Event()
+    calls = []
+
+    def model(image, **kwargs):
+        image = load_image(image, mode="RGBA")
+        calls.append((image, kwargs))
+        started.set()
+        assert release.wait(5)
+        return IdolOutput(_ellipsoid(), image.convert("RGB"), {"fov": 30.0})
+
+    load = Mock(return_value=(model, None, None))
+    monkeypatch.setattr(server, "get_cached_model", load)
+    image = io.BytesIO()
+    Image.new("RGBA", (8, 8), (255, 0, 0, 127)).save(image, format="PNG")
+    try:
+        response = mesh_client.post(
+            "/v1/meshes",
+            data={
+                "model": "idol",
+                "output_format": extension,
+                "num_inference_steps": "2",
+                "guidance_scale": "2.5",
+                "mesh_resolution": "32",
+            },
+            files={"image": ("../../input.png", image.getvalue(), "image/png")},
+        )
+        assert response.status_code == 200, response.text
+        job = response.json()
+        assert job["status"] == "queued"
+        assert started.wait(2)
+        assert (
+            mesh_client.get(f"/v1/meshes/{job['id']}").json()["status"] == "in_progress"
+        )
+        assert mesh_client.get(f"/v1/meshes/{job['id']}/content").status_code == 404
+        assert mesh_client.get("/health").status_code == 200
+    finally:
+        release.set()
+    completed = _wait_mesh(mesh_client, job["id"])
+    assert completed["status"] == "completed", completed
+    assert completed["representation"] == (
+        "gaussian_splat" if extension == "ply" else "surface_mesh"
+    )
+    assert completed["camera"] == {"fov": 30.0}
+    content = mesh_client.get(completed["url"])
+    assert content.status_code == 200
+    assert len(content.content) == completed["file_size_bytes"]
+    assert content.content.startswith(
+        {"ply": b"ply\n", "glb": b"glTF", "obj": b"#"}[extension]
+    )
+    assert calls[0][0].getpixel((0, 0))[-1] == 127
+    assert calls[0][1]["steps"] == 2 and calls[0][1]["cfg_strength"] == 2.5
+    load.assert_called_once_with("idol", model_kind="mesh_generation")
+    listing = mesh_client.get("/v1/meshes").json()
+    assert listing["first_id"] == listing["last_id"] == job["id"]
+    assert listing["has_more"] is False
+    assert mesh_client.delete(f"/v1/meshes/{job['id']}").json()["status"] == "deleted"
+    assert mesh_client.get(f"/v1/meshes/{job['id']}").status_code == 404
+    assert mesh_client.get(completed["url"]).status_code == 404
+    assert (tmp_path / job["id"] / f"output.{extension}").is_file()
+    assert not (tmp_path.parent / "input.png").exists()
+
+
+@pytest.mark.parametrize(
+    "payload,status",
+    [
+        ({"model": "idol"}, 422),
+        ({"input_image": "image.png"}, 400),
+        ({"model": "idol", "input_image": "image.png", "output_format": "stl"}, 422),
+        ({"model": "idol", "input_image": "image.png", "num_inference_steps": 0}, 422),
+        ({"model": "idol", "input_image": "image.png", "guidance_scale": "nan"}, 422),
+        ({"model": "idol", "input_image": "image.png", "prompt": "red castle"}, 422),
+        ({"model": "idol", "input_image": "image.png", "num_gaussians": 32769}, 422),
+        ([], 422),
+    ],
+)
+def test_mesh_server_rejects_invalid_requests(mesh_client, payload, status):
+    response = mesh_client.post("/v1/meshes", json=payload)
+    assert response.status_code == status, response.text
+    assert mesh_client.get("/v1/meshes").json()["data"] == []
+
+
+def test_mesh_server_failed_export_is_not_downloadable(
+    mesh_client, monkeypatch, tmp_path
+):
+    import mlx_vlm.server as server
+    from mlx_vlm.server import meshes
+
+    monkeypatch.setattr(
+        server, "get_cached_model", Mock(return_value=(None, None, None))
+    )
+
+    def fail(*args, output_path, **kwargs):
+        output_path.parent.mkdir(parents=True)
+        output_path.write_bytes(b"partial output")
+        raise ValueError("export failed")
+
+    monkeypatch.setattr(meshes, "generate_3d", fail)
+    response = mesh_client.post(
+        "/v1/meshes", json={"model": "idol", "input_image": "image.png"}
+    )
+    job = _wait_mesh(mesh_client, response.json()["id"])
+    assert job["status"] == "failed" and job["error"]["message"] == "export failed"
+    assert mesh_client.get(f"/v1/meshes/{job['id']}/content").status_code == 404
+
+
+def test_mesh_cache_reuse_switch_and_unload(monkeypatch):
+    import mlx_vlm.server as server
+
+    registry = server.ModelCacheRegistry()
+    registry.set("image_generation", {"model": "image model"})
+    monkeypatch.setattr(server.runtime, "model_cache", registry)
+    monkeypatch.setattr(server.runtime, "mesh_jobs", None)
+    load = Mock(side_effect=[object(), object()])
+    monkeypatch.setattr(server._app_module, "load_3d_model", load)
+    first = server.get_cached_model("idol-a", model_kind="mesh_generation")
+    assert server.get_cached_model("idol-a", model_kind="mesh_generation") == first
+    second = server.get_cached_model("idol-b", model_kind="mesh_generation")
+    assert first[0] is not second[0] and load.call_count == 2
+    assert registry.for_kind("image_generation")["model"] == "image model"
+    assert server._app_module._unload_model_cache_group("mesh_generation")
+    assert registry.for_kind("mesh_generation") == {}
+
+
+def test_mesh_jobs_serialize_and_survive_record_deletion_and_unload(
+    mesh_client, monkeypatch, tmp_path
+):
+    import mlx_vlm.server as server
+    from mlx_vlm.utils import load_image
+
+    started, release = Event(), Event()
+    loads = []
+    server.runtime.model_cache.set("mesh_generation", {"model_path": "preloaded"})
+    image = io.BytesIO()
+    Image.new("RGB", (8, 8)).save(image, format="PNG")
+    source = "data:image/png;base64," + base64.b64encode(image.getvalue()).decode()
+
+    def load(name, **options):
+        loads.append(name)
+
+        def model(image, **kwargs):
+            if kwargs["seed"] == 0:
+                started.set()
+                assert release.wait(5)
+            return IdolOutput(_ellipsoid(), load_image(image), {"fov": 30.0})
+
+        return model, None, None
+
+    monkeypatch.setattr(server, "get_cached_model", load)
+    payload = dict(input_image=source, output_format="ply", steps=2, guidance=2)
+    try:
+        first = mesh_client.post("/v1/meshes", json={**payload, "seed": 0}).json()
+        assert first["model"] == "preloaded" and started.wait(2)
+        second = mesh_client.post(
+            "/v1/meshes", json={**payload, "model": "other", "seed": 1}
+        ).json()
+        third = mesh_client.post(
+            "/v1/meshes", json={**payload, "model": "other", "seed": 2}
+        ).json()
+        assert loads == ["preloaded"]
+        assert (
+            mesh_client.get(f"/v1/meshes/{second['id']}").json()["status"] == "queued"
+        )
+        page = mesh_client.get("/v1/meshes?limit=1&order=asc").json()
+        assert page["last_id"] == first["id"] and page["has_more"]
+        next_page = mesh_client.get(
+            f"/v1/meshes?limit=1&order=asc&after={first['id']}"
+        ).json()
+        assert next_page["first_id"] == second["id"]
+        assert mesh_client.get("/v1/meshes?limit=0").status_code == 422
+        assert mesh_client.get("/v1/meshes?after=unknown").status_code == 404
+        assert mesh_client.delete(f"/v1/meshes/{first['id']}").status_code == 200
+    finally:
+        release.set()
+    for job in (second, third):
+        assert _wait_mesh(mesh_client, job["id"])["status"] == "completed"
+    assert loads == ["preloaded", "other", "other"]
+    assert mesh_client.get(f"/v1/meshes/{first['id']}").status_code == 404
+    assert (tmp_path / first["id"] / "output.ply").is_file()
+    assert mesh_client.post("/unload").status_code == 200
+    assert mesh_client.get(f"/v1/meshes/{third['id']}/content").status_code == 200
+    resumed = mesh_client.post(
+        "/v1/meshes", json={**payload, "model": "other", "seed": 3}
+    ).json()
+    assert _wait_mesh(mesh_client, resumed["id"])["status"] == "completed"
+
+
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("post", "/v1/meshes"),
+        ("get", "/v1/meshes"),
+        ("get", "/v1/meshes/id"),
+        ("get", "/v1/meshes/id/content"),
+        ("delete", "/v1/meshes/id"),
+    ],
+)
+def test_mesh_endpoints_require_configured_auth(mesh_client, monkeypatch, method, path):
+    monkeypatch.setenv("MLX_VLM_SERVER_API_KEY", "secret")
+    assert getattr(mesh_client, method)(path).status_code == 401
+
 
 IDOL_DENOISER_ARGS = dict(
     q_token_length=8,
