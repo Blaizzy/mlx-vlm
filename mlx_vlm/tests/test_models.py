@@ -6343,3 +6343,124 @@ class TestEncoderActivations:
     def test_unknown_activation_is_rejected(self, family):
         with pytest.raises(ValueError, match="not-an-activation"):
             self._layer(family, "not-an-activation")
+
+
+# sensenova/SenseNova-6.8-Code2Video text_config (Qwen3.5-27B, head_dim 256, partial 0.25).
+QWEN3_5_YARN_PARAMETERS = {
+    "type": "yarn",
+    "factor": 2.0,
+    "original_max_position_embeddings": 262144,
+    "rope_theta": 10000000,
+    "mrope_section": [11, 11, 10],
+    "partial_rotary_factor": 0.25,
+}
+# transformers 5.22.1 ROPE_INIT_FUNCTIONS["yarn"] on the same config.
+QWEN3_5_YARN_HF_INV_FREQ = [
+    1,
+    0.604296386,
+    0.365174145,
+    0.220673397,
+    0.133352146,
+    0.0805842131,
+    0.0486967526,
+    0.0294272732,
+    0.0177827943,
+    0.0107460786,
+    0.00649381662,
+    0.0039241896,
+    0.00237137382,
+    0.00143301266,
+    0.000865964335,
+    0.000490592909,
+    0.000276699313,
+    0.000155264934,
+    8.66086484e-05,
+    4.79758528e-05,
+    2.63560341e-05,
+    1.43341686e-05,
+    7.69963208e-06,
+    4.6528603e-06,
+    2.81170674e-06,
+    1.69910413e-06,
+    1.02676245e-06,
+    6.20468882e-07,
+    3.7494712e-07,
+    2.26579189e-07,
+    1.36920988e-07,
+    8.27408542e-08,
+]
+QWEN3_5_YARN_HF_ATTENTION_FACTOR = 1.0693147180559945
+
+
+def test_qwen3_5_rotary_applies_yarn_from_rope_parameters():
+    from mlx_vlm.models.qwen3_5.language import Qwen3_5RotaryEmbedding
+
+    rope = Qwen3_5RotaryEmbedding(
+        64,
+        base=10000000,
+        mrope_section=[11, 11, 10],
+        rope_parameters=QWEN3_5_YARN_PARAMETERS,
+    )
+    np.testing.assert_allclose(
+        np.asarray(rope.inv_freq), QWEN3_5_YARN_HF_INV_FREQ, rtol=1e-5
+    )
+    assert rope.attention_scaling == pytest.approx(
+        QWEN3_5_YARN_HF_ATTENTION_FACTOR, rel=1e-6
+    )
+    # The fused kernel ignores attention_scaling, so YaRN takes the cos/sin path.
+    assert not rope.fused_apply
+
+    x = mx.zeros((1, 1, 1, 256))
+    cos, sin = rope(x, mx.zeros((3, 1, 1), dtype=mx.int32))
+    assert cos.max().item() == pytest.approx(QWEN3_5_YARN_HF_ATTENTION_FACTOR, rel=1e-6)
+    assert mx.abs(sin).max().item() == 0
+
+
+def test_qwen3_5_rotary_without_yarn_is_unchanged():
+    from mlx_vlm.models.qwen3_5.language import Qwen3_5RotaryEmbedding
+
+    plain = Qwen3_5RotaryEmbedding(64, base=10000000, mrope_section=[11, 11, 10])
+    default = Qwen3_5RotaryEmbedding(
+        64,
+        base=10000000,
+        mrope_section=[11, 11, 10],
+        rope_parameters={**QWEN3_5_YARN_PARAMETERS, "type": "default"},
+    )
+    np.testing.assert_array_equal(
+        np.asarray(plain.inv_freq), np.asarray(default.inv_freq)
+    )
+    assert default.attention_scaling == 1.0
+    assert default.fused_apply == plain.fused_apply
+
+
+def test_qwen3_5_attention_forwards_rope_parameters():
+    qwen = importlib.import_module("mlx_vlm.models.qwen3_5")
+    text_config = qwen.TextConfig(
+        model_type="qwen3_5_text",
+        hidden_size=32,
+        intermediate_size=64,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=8,
+        linear_value_head_dim=8,
+        linear_conv_kernel_dim=4,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        rms_norm_eps=1e-6,
+        vocab_size=64,
+        num_key_value_heads=1,
+        max_position_embeddings=128,
+        full_attention_interval=2,
+        head_dim=256,
+        rope_parameters={**QWEN3_5_YARN_PARAMETERS, "rope_type": "yarn"},
+    )
+    model = qwen.LanguageModel(text_config)
+    rotary = next(
+        layer.self_attn.rotary_emb
+        for layer in model.model.layers
+        if not layer.is_linear
+    )
+    assert rotary.attention_scaling == pytest.approx(
+        QWEN3_5_YARN_HF_ATTENTION_FACTOR, rel=1e-6
+    )
+    assert not rotary.fused_apply
