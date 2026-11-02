@@ -3528,3 +3528,38 @@ def test_restored_tokens_count_successful_restores(
     manager.reset_stats()
     assert manager.stats_snapshot()["restored_tokens"] == 0
     assert manager.stats_snapshot()["stored_tokens"] == 0
+
+
+def test_warm_batch_multi_pads_keys_and_values_by_own_shape():
+    # MLA-style caches: K and V widths differ, and so do layers.
+    dims = [((1, 512), (1, 64)), ((4, 128), (4, 96))]
+
+    def warm_cache(length, seed):
+        return [
+            NS(
+                keys=mx.random.normal((1, kh, length, kd), key=mx.random.key(seed)),
+                values=mx.random.normal(
+                    (1, vh, length, vd), key=mx.random.key(seed + 1)
+                ),
+            )
+            for (kh, kd), (vh, vd) in dims
+        ]
+
+    long_c, short_c = warm_cache(24, 1), warm_cache(16, 3)
+    picks = [
+        {"prefix_len": 24, "warm_cache": long_c},
+        {"prefix_len": 16, "warm_cache": short_c},
+        None,
+    ]
+    caches, max_prefix = warm_blocks(picks, num_layers=len(dims))
+    assert max_prefix == 24
+    for i, c in enumerate(caches):
+        k, v, offset, left_padding = c.state
+        (kh, kd), (vh, vd) = dims[i]
+        assert k.shape == (3, kh, 24, kd) and v.shape == (3, vh, 24, vd)
+        assert offset.tolist() == [24, 16, 0]
+        assert left_padding.tolist() == [0, 8, 24]
+        assert mx.array_equal(k[0:1], long_c[i].keys)
+        assert mx.array_equal(v[1:2, :, 8:], short_c[i].values)
+        assert mx.all(k[1:2, :, :8] == 0) and mx.all(v[1:2, :, :8] == 0)
+        assert mx.all(k[2:3] == 0) and mx.all(v[2:3] == 0)
