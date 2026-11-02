@@ -16,6 +16,24 @@ def _length(row):
     return (0 if row[0] is None else row[0].shape[0]) + len(row[1])
 
 
+def _batches(rows, indices, budget, shared=False):
+    """``indices`` of ``rows`` in batches, longest first: at most ``budget`` padded
+    positions, media prefix included, and no row padded past twice its length (its
+    text length after a ``shared`` prefix, as only the text runs)."""
+    order = sorted(indices, key=lambda i: _length(rows[i]), reverse=True)
+    width = (lambda i: len(rows[i][1])) if shared else (lambda i: _length(rows[i]))
+    while order:
+        longest, size = _length(rows[order[0]]), 1
+        while (
+            size < len(order)
+            and (size + 1) * longest <= budget
+            and 2 * width(order[size]) >= width(order[0])
+        ):
+            size += 1
+        yield order[:size]
+        order = order[size:]
+
+
 def _image(image):
     """A PIL image as given (no EXIF turn), as in the reference; else loaded."""
     from ...utils import load_image
@@ -109,7 +127,7 @@ class Model(nn.Module):
         return predicate
 
     def predict(
-        self, processor, state, questions, images=None, audio=None, token_budget=65536
+        self, processor, state, questions, images=None, audio=None, token_budget=16384
     ):
         tokenizer = getattr(processor, "tokenizer", processor)
         parsed = {name: as_question(spec) for name, spec in questions.items()}
@@ -122,7 +140,7 @@ class Model(nn.Module):
             "usage": {"input_tokens": read, "output_tokens": 0},
         }
 
-    def probabilities(self, tokenizer, requests, token_budget=65536):
+    def probabilities(self, tokenizer, requests, token_budget=16384):
         """``(state, questions[, images[, audio]])`` requests -> per request, each
         question's distribution over its options in option order (``[false, true]``
         for a noul) and the positions the trunk read. ``audio`` is one clip: 16 kHz
@@ -168,24 +186,40 @@ class Model(nn.Module):
             results = results[len(request) :]
         return out
 
-    def _run(self, rows, token_budget=65536):
+    def _run(self, rows, token_budget=16384):
         """Rows (prefix, ids, markers, question, calibrate) -> probabilities, batched
-        longest first under a token budget."""
+        longest first under a token budget. Rows that share a media prefix (the
+        questions of one request) run it once; a lone row runs with its prefix."""
+        groups = {}
+        for i, row in enumerate(rows):
+            groups.setdefault(None if row[0] is None else id(row[0]), []).append(i)
+        alone = [i for k, g in groups.items() if k is None or len(g) == 1 for i in g]
+        plan = [(sorted(alone), None)] + [
+            (g, rows[g[0]][0])
+            for k, g in groups.items()
+            if k is not None and len(g) > 1
+        ]
+        dtype = self.encoder.embedding_norm.weight.dtype
         results = [None] * len(rows)
-        order = sorted(range(len(rows)), key=lambda i: _length(rows[i]), reverse=True)
-        while order:
-            longest, size = _length(rows[order[0]]), 1
-            while size < len(order) and (size + 1) * longest <= token_budget:
-                size += 1
-            batch, order = order[:size], order[size:]
-            for i, probs in zip(batch, self._forward([rows[i] for i in batch])):
-                results[i] = probs
+        for group, media in plan:
+            shared = None
+            if media is not None:
+                shared = self.encoder.prefix_state(media.astype(dtype))
+                mx.eval(shared[1])  # finish the prefix before the text takes memory
+            for batch in _batches(rows, group, token_budget, shared is not None):
+                for i, probs in zip(
+                    batch, self._forward([rows[i] for i in batch], shared)
+                ):
+                    results[i] = probs
         return results
 
-    def _forward(self, rows):
+    def _forward(self, rows, shared=None):
+        """Probabilities for one batch; with ``shared``, the ``prefix_state`` of the
+        media prefix every row follows, only the text runs."""
         dtype = self.encoder.embedding_norm.weight.dtype
         seqs, prefix, lengths = [], [], []
         for media, ids, *_ in rows:
+            media = None if shared is not None else media
             text = self.encoder.embed_tokens(mx.array(ids)).astype(dtype)
             seqs.append(
                 text if media is None else mx.concatenate([media.astype(dtype), text])
@@ -201,7 +235,11 @@ class Model(nn.Module):
             mx.arange(k)[None] < mx.array([len(row[2]) for row in rows])[:, None]
         )
         qtype = mx.array([QTYPES[row[3][0]] for row in rows])
-        logits = self(h, pad, prefix, lengths, marker_pos, marker_mask, qtype)
+        if shared is None:
+            logits = self(h, pad, prefix, lengths, marker_pos, marker_mask, qtype)
+        else:
+            text = mx.where(pad[..., None], self.encoder.after(h, pad, shared), 0)
+            logits = self.head(text, pad, marker_pos, marker_mask, qtype)
         temperatures = self.config.temperatures
         out = []
         for (_, _, _, question, calibrate), z in zip(rows, logits):

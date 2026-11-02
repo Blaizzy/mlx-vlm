@@ -48,8 +48,6 @@ def waveform(audio):
             audio = load_audio(audio, sr=SAMPLE_RATE)
         except Exception as error:
             raise ValueError(f"Failed to load audio: {error}") from error
-        if audio.size == 0:
-            raise ValueError("Failed to load audio: the file has no samples")
     if isinstance(audio, mx.array) and audio.dtype != mx.int16:
         audio = audio.astype(mx.float32)
     x = np.asarray(audio)

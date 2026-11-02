@@ -484,6 +484,33 @@ def test_invalid_inputs_fail_before_loading(monkeypatch, kwargs):
         pipeline.generate_array("cat", **kwargs)
 
 
+def test_vae_decodes_without_transformer_or_buffer_cache(monkeypatch):
+    pipeline, _, captured = fake_pipeline(monkeypatch)
+    pipeline.evict_text_encoder = True
+    transformer, decode = pipeline.transformer, pipeline.vae.decode_packed_latents
+
+    def checked_decode(latents):
+        assert pipeline.transformer is None
+        assert mx.set_cache_limit(0) == 0
+        return decode(latents)
+
+    module = importlib.import_module("mlx_vlm.models.moss_image.pipeline")
+    loaded = {
+        "load_text_encoder": object(),
+        "load_transformer": transformer,
+        "load_vae": SimpleNamespace(decode_packed_latents=checked_decode),
+    }
+    for name, value in loaded.items():
+        monkeypatch.setattr(module, name, lambda path, value=value: value)
+    limit = mx.set_cache_limit(1 << 20)
+    try:
+        pipeline.generate_array("cat", steps=1, width=16, height=16)
+        assert mx.set_cache_limit(limit) == 1 << 20
+    finally:
+        mx.set_cache_limit(limit)
+    assert len(captured) == 1
+
+
 @pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
 def test_shared_flux2_vae_decoder_preserves_precision(dtype):
     vae = Flux2VAE(decoder_block_out_channels=(32, 32))

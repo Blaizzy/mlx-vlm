@@ -15,6 +15,7 @@ and the same public API as
 | Notebook | Training objective |
 | --- | --- |
 | [sft_text_only.ipynb](sft_text_only.ipynb) | Text-only response SFT with JOSIE-v2-Instruct-5K |
+| [sft_mtp.ipynb](sft_mtp.ipynb) | Joint LoRA + native Qwen3.5 MTP training, optional full or frozen-target training, checkpoint reload, and standalone drafter export |
 | [sft_vison_text.ipynb](sft_vison_text.ipynb) | LaTeX OCR from Hugging Face image/text rows with `.map()` and `VisionDataset` |
 | [orpo.ipynb](orpo.ipynb) | Reference-free preference optimization |
 | [dpo.ipynb](dpo.ipynb) | Preference optimization with a separate frozen reference |
@@ -36,6 +37,12 @@ model. DPO loads two models, so allow memory for the policy and reference.
 Each notebook constructs an MLX `AdamW` optimizer beside its `Trainer` setup.
 Edit learning rate, weight decay, or schedules on the optimizer directly;
 training arguments do not contain optimizer settings.
+
+Only `sft_mtp.ipynb` uses MTP. By default it trains base LoRA adapters and a
+matching floating-point native head together, then exports a standalone drafter
+to pair with the trained target checkpoint. Set `TRAIN_TYPE="head"` for a frozen
+target, or `TRAIN_TYPE="full"` for full fine-tuning. The existing
+SFT, preference, GRPO, and custom-loss notebooks retain their original objectives.
 
 Reports include dynamic loss metrics, learning rate, supervised/processed
 token counts and rates, timings, memory, and progress. Inspect

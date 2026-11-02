@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from functools import partial
 from typing import Any
@@ -63,15 +64,20 @@ def forward_vlm_logits(
     batch: Mapping[str, Any],
 ) -> mx.array:
     """Run a VLM with its processor-produced multimodal fields and return logits."""
+    return _logits_from_output(
+        _forward_vlm(model, input_ids, attention_mask, batch)
+    ).astype(mx.float32)
+
+
+def _forward_vlm(model, input_ids, attention_mask, batch, **kwargs):
     model_inputs = {
         key: value for key, value in batch.items() if key not in _TEXT_FIELDS
     }
     pixel_values = model_inputs.pop("pixel_values", None)
     if _model_type(model) == "gemma4_unified":
         attention_mask = None
-    return _logits_from_output(
-        model(input_ids, pixel_values, attention_mask, **model_inputs)
-    ).astype(mx.float32)
+    model_inputs.update(kwargs)
+    return model(input_ids, pixel_values, attention_mask, **model_inputs)
 
 
 def _completion_mask(batch: Mapping[str, Any], assistant_id: int | None) -> mx.array:
@@ -98,6 +104,7 @@ def vlm_sft_loss(
     *,
     train_on_completions: bool = False,
     assistant_id: int | None = 77091,
+    mtp_loss_weight: float = 0.0,
 ) -> tuple[mx.array, dict[str, mx.array]]:
     """Compute masked causal cross-entropy for a VLM batch.
 
@@ -105,6 +112,8 @@ def vlm_sft_loss(
     last token and predicts the remaining targets. Padding and (optionally)
     prompt tokens are excluded from the shared cross-entropy objective.
     """
+    if not math.isfinite(mtp_loss_weight) or mtp_loss_weight < 0:
+        raise ValueError("mtp_loss_weight must be finite and non-negative.")
     required = {"input_ids", "attention_mask"}
     missing = required.difference(batch)
     if missing:
@@ -129,12 +138,17 @@ def vlm_sft_loss(
             raise ValueError("completion_mask must have the same shape as input_ids.")
         loss_mask = mx.logical_and(loss_mask, completion_mask[:, 1:].astype(mx.bool_))
 
-    logits = forward_vlm_logits(
-        model,
-        input_ids,
-        model_attention_mask,
-        batch,
-    )
+    if mtp_loss_weight:
+        if not hasattr(model, "mtp_head"):
+            raise ValueError(
+                "MTP loss requires attach_mtp_head(model, head) before training."
+            )
+        output = _forward_vlm(
+            model, input_ids, model_attention_mask, batch, return_hidden=True
+        )
+        logits = _logits_from_output(output).astype(mx.float32)
+    else:
+        logits = forward_vlm_logits(model, input_ids, model_attention_mask, batch)
     if logits.ndim != 3 or logits.shape[:-1] != targets.shape:
         raise ValueError(
             "VLM logits must align position-for-position with shifted targets; "
@@ -144,7 +158,17 @@ def vlm_sft_loss(
     loss, metrics = cross_entropy(
         logits, targets, loss_mask, vision_mask=vlm_vision_mask(model, batch)
     )
-    return loss, {**metrics, **vlm_batch_metrics(batch)}
+    from .mtp import add_mtp_loss
+
+    return add_mtp_loss(
+        model,
+        batch,
+        loss,
+        {**metrics, **vlm_batch_metrics(batch)},
+        mtp_loss_weight,
+        output=output if mtp_loss_weight else None,
+        loss_mask=loss_mask,
+    )
 
 
 def _squeeze_batch(value: Any) -> Any:
@@ -552,16 +576,23 @@ def make_task(
     """Bind VLM preprocessing and supervised cross-entropy."""
     from mlx_vlm.trainer.vlm.sft.dataset import VisionDataset
 
+    loss_options = dict(
+        train_on_completions=args.train_on_completions,
+        assistant_id=args.assistant_id,
+    )
+    if args.mtp_loss_weight:
+        if not hasattr(model, "mtp_head"):
+            raise ValueError(
+                "MTP loss requires attach_mtp_head(model, head) before training."
+            )
+        loss_options["mtp_loss_weight"] = args.mtp_loss_weight
+
     return _make_vlm_task(
         args,
         lambda rows: VisionDataset(
             rows, model.config, processing_class, config=dataset_config or args
         ),
-        loss_fn=partial(
-            loss_fn,
-            train_on_completions=args.train_on_completions,
-            assistant_id=args.assistant_id,
-        ),
+        loss_fn=partial(loss_fn, **loss_options),
         iterate_batches=iterate_batches,
     )
 
