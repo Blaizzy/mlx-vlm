@@ -153,5 +153,6 @@ tested with model revision `2731c2291fc65a797c5cb627a5e5526fc1490902`.
 Image-conditioned validation used DINOv3 revision
 `c807c9eeea853df70aec4069e6f56b28ddc82acc` and FLUX.2 revision
 `26afe3a78bb242c0a8bb181dcc8937bb16e5c66c`.
-Adapted SDK code is licensed under Apache-2.0; see [LICENSE](LICENSE).
+Adapted SDK code is licensed under Apache-2.0; see the
+[upstream license](https://github.com/speridlabs/idol-sdk/blob/4702a7f00850e34b6e83a2170cc123c3e9570744/LICENSE).
 The original denoiser also credits the Wan and Hugging Face teams.
