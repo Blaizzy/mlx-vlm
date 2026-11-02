@@ -11,6 +11,8 @@ import mlx.nn as nn
 import numpy as np
 from PIL import Image
 
+from .layers import sanitize_weights
+
 
 def resize(x, size):
     """Bilinear resize with PyTorch's align_corners=True convention."""
@@ -413,6 +415,9 @@ class BiRefNet(nn.Module):
         self.bb = _SwinLarge()
         self.squeeze_module = nn.Sequential(_BasicDecBlk(3072 + 384 + 768 + 1536, 3072))
         self.decoder = _BiRefNetDecoder()
+
+    def sanitize(self, weights):
+        return sanitize_weights(self, weights)
 
     def __call__(self, x):
         full = self.bb(x)

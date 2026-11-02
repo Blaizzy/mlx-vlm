@@ -4,6 +4,44 @@ import math
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_flatten
+
+
+def sanitize_weights(model, weights, *, transformer_dtype=mx.float32):
+    """Convert original PyTorch keys, convolution layouts, and inference dtypes."""
+    names = {key: key for key, _ in tree_flatten(model.parameters())}
+    transformer_keys, conv_keys = set(), set()
+    # Strip only Sequential's extra component, preserving actual layers lists.
+    # Work from the deepest module so nested Sequential paths also match.
+    for path, module in sorted(
+        model.named_modules(), key=lambda item: len(item[0]), reverse=True
+    ):
+        if isinstance(module, nn.Sequential):
+            prefix = f"{path}.layers." if path else "layers."
+            for key in names:
+                if key.startswith(prefix):
+                    names[key] = names[key].replace(prefix, f"{path}." if path else "")
+        if isinstance(module, nn.Conv2d):
+            conv_keys.add(f"{path}.weight")
+        if isinstance(module, nn.Linear) and path.startswith(
+            ("blocks.", "noise_refiner.", "context_refiner.")
+        ):
+            transformer_keys.update(f"{path}.{name}" for name in ("weight", "bias"))
+
+    names = {source: target for target, source in names.items()}
+    sanitized = {}
+    for key, value in weights.items():
+        if key.endswith(".num_batches_tracked"):
+            continue
+        key = names.get(key, key)
+        if key in conv_keys:
+            value = value.transpose(0, 2, 3, 1)
+        if mx.issubdtype(value.dtype, mx.floating):
+            # Embeddings, norms and learned RePo angles stay in float32.
+            dtype = transformer_dtype if key in transformer_keys else mx.float32
+            value = value.astype(dtype)
+        sanitized[key] = value
+    return sanitized
 
 
 class LayerNorm32(nn.LayerNorm):

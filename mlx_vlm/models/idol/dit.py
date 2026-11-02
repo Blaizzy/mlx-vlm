@@ -27,6 +27,7 @@ from .layers import (
     RePo3DRotaryEmbedding,
     SinusoidalEmbedder,
     UnifiedTransformerBlock,
+    sanitize_weights,
 )
 
 
@@ -103,6 +104,9 @@ class LatentSeqMMFlowModel(nn.Module):
         self.shift_table = mx.zeros((1, 2, model_channels))
         self.out_layer = nn.Linear(model_channels, in_channels)
         self.cam_out_layer = nn.Linear(model_channels, cam_channels)
+
+    def sanitize(self, weights):
+        return sanitize_weights(self, weights, transformer_dtype=self.dtype)
 
     def __call__(self, x: dict, t: mx.array, cond: dict) -> dict:
         """

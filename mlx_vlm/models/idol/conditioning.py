@@ -11,7 +11,7 @@ from huggingface_hub import snapshot_download
 from ..flux2.vae.common.batch_norm_stats import Flux2BatchNormStats
 from ..flux2.vae.encoder.encoder import Flux2Encoder
 from ..sam3d_body.rope import apply_rope
-from .weights import load_weights
+from .layers import sanitize_weights
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -142,10 +142,9 @@ class DINOv3(nn.Module):
             config["hidden_size"], eps=config.get("layer_norm_eps", 1e-5)
         )
 
-    @staticmethod
-    def sanitize(weights):
+    def sanitize(self, weights):
         # Transformers has used both top-level layer.* and model.layer.*.
-        return {
+        weights = {
             (
                 "encoder." + key
                 if key.startswith("layer.")
@@ -157,6 +156,7 @@ class DINOv3(nn.Module):
             ): value
             for key, value in weights.items()
         }
+        return sanitize_weights(self, weights)
 
     def __call__(self, images):
         patch = self.config.get("patch_size", 16)
@@ -200,6 +200,14 @@ class Flux2ImageEncoder(nn.Module):
             nn.Conv2d(2 * c, 2 * c, 1) if config.get("use_quant_conv", True) else None
         )
         self.bn = Flux2BatchNormStats(4 * c, eps=config.get("batch_norm_eps", 1e-4))
+
+    def sanitize(self, weights):
+        weights = {
+            key.replace(".to_out.0.", ".to_out."): value
+            for key, value in weights.items()
+            if key.startswith(("encoder.", "quant_conv.", "bn."))
+        }
+        return sanitize_weights(self, weights)
 
     def moments(self, images):
         h = self.encoder(images.transpose(0, 3, 1, 2)).transpose(0, 2, 3, 1)
@@ -261,21 +269,16 @@ class ImageEncoder:
         vae_path = resolve_encoder(
             flux2_vae, vae=True, local_files_only=local_files_only
         )
-        self.dinov3 = load_weights(
-            DINOv3(json.loads((dino_path / "config.json").read_text())),
-            read_encoder_weights(dino_path),
-            dtype=dinov3_dtype,
-        )
-        vae_weights = {
-            key.replace(".to_out.0.", ".to_out."): value
-            for key, value in read_encoder_weights(vae_path).items()
-            if key.startswith(("encoder.", "quant_conv.", "bn."))
-        }
-        self.flux2_vae = load_weights(
-            Flux2ImageEncoder(json.loads((vae_path / "config.json").read_text())),
-            vae_weights,
-            dtype=mx.bfloat16,
-        )
+        for name, cls, path, dtype in (
+            ("dinov3", DINOv3, dino_path, dinov3_dtype),
+            ("flux2_vae", Flux2ImageEncoder, vae_path, mx.bfloat16),
+        ):
+            model = cls(json.loads((path / "config.json").read_text()))
+            model.load_weights(list(model.sanitize(read_encoder_weights(path)).items()))
+            model.set_dtype(dtype)
+            model.eval()
+            mx.eval(model.parameters())
+            setattr(self, name, model)
 
     def __call__(self, images):
         normalized = (images - mx.array(IMAGENET_MEAN)) / mx.array(IMAGENET_STD)

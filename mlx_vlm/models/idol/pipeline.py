@@ -8,14 +8,13 @@ import mlx.core as mx
 import numpy as np
 from PIL import Image
 
-from ...utils import load_image
+from ...utils import get_model_path, load_image
 from .camera import decode_camera
 from .decoder import GaussianFixedlenDecoder, OctreeProbabilityFixedlenDecoder
 from .dit import LatentSeqMMFlowModel
 from .gaussian import Gaussian
 from .preprocess import CROP_MARGIN, has_real_alpha, preprocess_image
 from .sampler import sample_flow, validate_sampling
-from .weights import load_weights, resolve_model
 
 
 @dataclass
@@ -70,15 +69,13 @@ class IdolPipeline:
         }
         for name, cls in classes.items():
             model = cls(**self.config[name]["args"])
-            setattr(
-                self,
-                name,
-                load_weights(
-                    model,
-                    self.weights_dir / f"{name}.safetensors",
-                    mixed_precision=True,
-                ),
+            weights = model.sanitize(
+                mx.load(str(self.weights_dir / f"{name}.safetensors"))
             )
+            model.load_weights(list(weights.items()))
+            model.eval()
+            mx.eval(model.parameters())
+            setattr(self, name, model)
 
     @classmethod
     def from_pretrained(
@@ -90,8 +87,9 @@ class IdolPipeline:
         **kwargs,
     ):
         return cls(
-            resolve_model(
-                repo_or_dir,
+            get_model_path(
+                str(Path(repo_or_dir).expanduser()),
+                allow_patterns=["config.json", "*.safetensors"],
                 local_files_only=kwargs.get("local_files_only", False),
                 revision=revision,
                 force_download=force_download,
@@ -111,9 +109,14 @@ class IdolPipeline:
             from .birefnet import BiRefNet
 
             # Keep the one-time background pass in float32 for numerical stability.
-            self.background_remover = load_weights(
-                BiRefNet(), self.weights_dir / "birefnet.safetensors"
+            model = BiRefNet()
+            weights = model.sanitize(
+                mx.load(str(self.weights_dir / "birefnet.safetensors"))
             )
+            model.load_weights(list(weights.items()))
+            model.eval()
+            mx.eval(model.parameters())
+            self.background_remover = model
         return preprocess_image(
             image,
             self.background_remover,

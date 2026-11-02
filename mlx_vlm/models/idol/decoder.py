@@ -12,6 +12,7 @@ from .layers import (
     PcdAbsolutePositionEmbedderv2,
     SinusoidalEmbedder,
     TransformerCrossBlock,
+    sanitize_weights,
 )
 
 
@@ -62,6 +63,9 @@ class OctreeProbabilityFixedlenDecoder(nn.Module):
             for _ in range(num_blocks)
         ]
         self.out_proj = nn.Linear(model_channels, 8)
+
+    def sanitize(self, weights):
+        return sanitize_weights(self, weights, transformer_dtype=self.dtype)
 
     def __call__(self, x, level, cond):
         h = self.input_layer(self.in_proj(x) + self.pos_embedder(x))
@@ -148,6 +152,9 @@ class GaussianFixedlenDecoder(nn.Module):
         self.out_proj = nn.Linear(model_channels, start)
         self.points_offset_perturbation = mx.zeros((per_anchor, 3))
         self.base_offset_scale = mx.array(0.0)
+
+    def sanitize(self, weights):
+        return sanitize_weights(self, weights, transformer_dtype=self.dtype)
 
     def __call__(self, points, cond):
         h = self.input_layer(self.in_proj(points) + self.pos_embedder(points))

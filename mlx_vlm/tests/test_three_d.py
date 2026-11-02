@@ -28,10 +28,10 @@ from mlx_vlm.models.idol.decoder import (
 )
 from mlx_vlm.models.idol.dit import LatentSeqMMFlowModel
 from mlx_vlm.models.idol.gaussian import Gaussian
+from mlx_vlm.models.idol.layers import sanitize_weights
 from mlx_vlm.models.idol.pipeline import IdolPipeline
 from mlx_vlm.models.idol.preprocess import preprocess_image
 from mlx_vlm.models.idol.sampler import sample_flow
-from mlx_vlm.models.idol.weights import load_weights
 
 THREE_D_CASES = json.loads(Path(__file__).with_name("three_d_cases.json").read_text())
 THREE_D_FAMILIES = THREE_D_CASES["families"]
@@ -253,24 +253,43 @@ def test_sampler_rejects_invalid_settings(kwargs):
         sample_flow(None, {}, {}, **kwargs)
 
 
-def test_nested_sequential_weight_mapping_and_strictness():
+def test_sanitize_nested_sequential_weights():
     class Nested(nn.Module):
         def __init__(self):
             super().__init__()
-            self.stages = [nn.Sequential(nn.Sequential(nn.Linear(2, 3)))]
+            self.layers = [nn.Sequential(nn.Sequential(nn.Linear(2, 3)))]
 
     weights = {
-        "stages.0.0.0.weight": mx.ones((3, 2)),
-        "stages.0.0.0.bias": mx.zeros((3,)),
+        "layers.0.0.0.weight": mx.ones((3, 2)),
+        "layers.0.0.0.bias": mx.zeros((3,)),
     }
-    model = load_weights(Nested(), weights)
+    model = Nested()
+    model.load_weights(list(sanitize_weights(model, weights).items()))
     np.testing.assert_array_equal(
-        np.array(model.stages[0](mx.ones((1, 2)))), [[2, 2, 2]]
+        np.array(model.layers[0](mx.ones((1, 2)))), [[2, 2, 2]]
     )
-    with pytest.raises(ValueError, match="missing"):
-        load_weights(Nested(), {})
-    with pytest.raises(ValueError, match="unexpected"):
-        load_weights(Nested(), {**weights, "unrelated": mx.array(1)})
+    # Preserve unknown keys so standard strict loading can report them.
+    with pytest.raises(ValueError, match="not in model"):
+        model.load_weights(
+            list(sanitize_weights(model, {**weights, "unrelated": mx.array(1)}).items())
+        )
+
+
+def test_denoiser_sanitize_preserves_mixed_precision():
+    model = LatentSeqMMFlowModel(**IDOL_DENOISER_ARGS)
+    weights = model.sanitize(
+        {
+            "blocks.0.mlp.mlp.0.weight": mx.ones((96, 24)),
+            "noise_refiner.0.mlp.mlp.0.weight": mx.ones((96, 24)),
+            "context_refiner.0.mlp.mlp.0.weight": mx.ones((96, 24)),
+            "input_layer.weight": mx.ones((24, 4), dtype=mx.float16),
+            "repo_layers.0.final_map.weight": mx.ones((6, 24), dtype=mx.float16),
+        }
+    )
+    for prefix in ("blocks", "noise_refiner", "context_refiner"):
+        assert weights[f"{prefix}.0.mlp.mlp.layers.0.weight"].dtype == mx.float16
+    assert weights["input_layer.weight"].dtype == mx.float32
+    assert weights["repo_layers.0.final_map.weight"].dtype == mx.float32
 
 
 def test_gaussian_ply_activation_and_coordinate_convention(tmp_path):
@@ -455,7 +474,9 @@ def test_dinov3_matches_transformers(gated):
         hidden_act="silu" if gated else "gelu",
     )
     ref = transformers.DINOv3ViTModel(config).eval()
-    model = load_weights(DINOv3(config.to_dict()), _torch_weights(ref))
+    model = DINOv3(config.to_dict())
+    model.load_weights(list(model.sanitize(_torch_weights(ref)).items()))
+    model.eval()
     x = torch.randn(2, 3, 16, 20)
     with torch.no_grad():
         expected = ref(x).last_hidden_state
@@ -475,12 +496,10 @@ def test_flux2_posterior_and_token_packing_matches_diffusers():
         layers_per_block=1,
     )
     ref = diffusers.AutoencoderKLFlux2(**config).eval().to(torch.bfloat16)
-    weights = {
-        k.replace(".to_out.0.", ".to_out."): v
-        for k, v in _torch_weights(ref).items()
-        if k.startswith(("encoder.", "quant_conv.", "bn."))
-    }
-    model = load_weights(Flux2ImageEncoder(config), weights, dtype=mx.bfloat16)
+    model = Flux2ImageEncoder(config)
+    model.load_weights(list(model.sanitize(_torch_weights(ref)).items()))
+    model.set_dtype(mx.bfloat16)
+    model.eval()
     pixels = torch.randn(1, 3, 32, 32).to(torch.bfloat16)
     with torch.no_grad():
         posterior = ref.encode(pixels).latent_dist
@@ -527,10 +546,10 @@ def test_denoiser_matches_upstream(idol_upstream):
     torch.manual_seed(0)
     ref = idol_upstream.dit.LatentSeqMMFlowModel(**IDOL_DENOISER_ARGS).float().eval()
     ref.dtype = torch.float32
-    model = load_weights(
-        LatentSeqMMFlowModel(**IDOL_DENOISER_ARGS), _torch_weights(ref)
-    )
+    model = LatentSeqMMFlowModel(**IDOL_DENOISER_ARGS)
     model.dtype = mx.float32
+    model.load_weights(list(model.sanitize(_torch_weights(ref)).items()))
+    model.eval()
     sample = tensordict.TensorDict(
         {"latent": torch.randn(2, 8, 4), "camera": torch.randn(2, 1, 5)}, batch_size=2
     )
@@ -563,8 +582,9 @@ def test_decoders_match_upstream(idol_upstream, gaussian):
             .eval()
         )
         model = OctreeProbabilityFixedlenDecoder(**args)
-    load_weights(model, _torch_weights(ref))
     ref.dtype, model.dtype = torch.float32, mx.float32
+    model.load_weights(list(model.sanitize(_torch_weights(ref)).items()))
+    model.eval()
     p, c = torch.rand(2, 5, 3), torch.randn(2, 8, 4)
     pm, cm = mx.array(p.numpy()), mx.array(c.numpy())
     with torch.no_grad():
@@ -602,11 +622,11 @@ def test_trained_checkpoint_matches_upstream(idol_upstream, idol_checkpoint_path
         ),
     }
     mlx_cls, torch_cls = classes[name]
-    model = load_weights(
-        mlx_cls(**config[name]["args"]),
-        idol_checkpoint_path / f"{name}.safetensors",
-        mixed_precision=True,
-    )
+    model = mlx_cls(**config[name]["args"])
+    weights = model.sanitize(mx.load(str(idol_checkpoint_path / f"{name}.safetensors")))
+    model.load_weights(list(weights.items()))
+    model.eval()
+    mx.eval(model.parameters())
     ref = torch_cls(**config[name]["args"]).eval()
     ref.load_state_dict(
         safetensors.load_file(str(idol_checkpoint_path / f"{name}.safetensors"))
