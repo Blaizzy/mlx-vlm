@@ -5248,7 +5248,9 @@ class TestUnlimitedOCR2Dash:
         return [1, 2, 3] + page * 3 + [4, 5, 6, 2, 3]
 
     @pytest.mark.parametrize("disk", [False, True])
-    def test_apc_reuses_dash_checkpoint_during_generation(self, tmp_path, disk):
+    def test_apc_reuses_dash_checkpoint_during_generation(
+        self, tmp_path, disk, monkeypatch
+    ):
         from mlx_vlm.apc import APCManager, DiskBlockStore
         from mlx_vlm.generate.ar import BatchGenerator
         from mlx_vlm.utils import StoppingCriteria
@@ -5260,7 +5262,12 @@ class TestUnlimitedOCR2Dash:
             num_blocks=16,
             block_size=8,
             disk=DiskBlockStore(tmp_path, namespace="dash") if disk else None,
+            overrides={"memory_max_gb": 1 / 1024, "memory_reserve_gb": 0},
         )
+        # Exercise checkpoint reuse within 1 MiB, independently of other CI
+        # workers' RAM use. Memory-pressure admission is covered in test_cache.
+        monkeypatch.setattr(manager, "_memory_headroom", lambda: 1 << 20)
+        monkeypatch.setattr(manager, "_disk_min_free_ram_bytes", 0)
         if disk:
             manager._exact_cache_max = 0
 
