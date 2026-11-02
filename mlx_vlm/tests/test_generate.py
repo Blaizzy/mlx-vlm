@@ -223,7 +223,7 @@ class TestGenerationBatch:
 
         def make_batch():
             sampler = (
-                ResponseGenerator._make_session_sampler(
+                ResponseGenerator.__new__(ResponseGenerator)._make_sampler(
                     GenerationArguments(
                         temperature=0.7, top_p=0.9, top_k=8, seed=91, **sampling
                     )
@@ -251,13 +251,16 @@ class TestGenerationBatch:
             return batch
 
         baseline, interrupted = make_batch(), make_batch()
+        mx.random.seed(91)
         baseline.next()
-        interrupted.next()
         expected = [baseline.next()[0].token for _ in range(8)]
+        mx.random.seed(91)
+        interrupted.next()
         saved = interrupted.extract(7)
         assert interrupted.uids == [8] and saved.uids == [7]
         assert saved._num_tokens == [4]
         assert saved._rope_deltas.tolist() == [[2]]
+        pending = saved._next_tokens.item()
         frozen = np.array(saved.prompt_cache[0].state[0])
         for _ in range(5):
             interrupted.next()
@@ -267,7 +270,12 @@ class TestGenerationBatch:
         actual = [
             next(r.token for r in interrupted.next() if r.uid == 7) for _ in range(8)
         ]
-        assert actual == expected
+        assert actual[0] == pending
+        assert interrupted._num_tokens[interrupted.uids.index(7)] == 12
+        # Main's special-filter samplers share RNG with peer requests; only
+        # greedy and positioned samplers promise draw isolation here.
+        if sampling is None or hasattr(interrupted.sampler, "sample_target"):
+            assert actual == expected
 
     def test_extract_keeps_per_request_processors_and_budget(self):
         processor, thinking = object(), object()

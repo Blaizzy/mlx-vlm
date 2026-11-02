@@ -588,12 +588,9 @@ class TestInferenceSession:
         second.args.seed = 92
         assert worker._batch_key(first) != worker._batch_key(second)
 
-    @pytest.mark.parametrize(
-        "settings", [{}, {"top_n_sigma": 1.5}, {"p_less": True}, {"typical_p": 0.8}]
-    )
-    def test_sampling_positions_survive_other_random_draws(self, settings):
-        sampler = Generator._make_session_sampler(
-            Args(temperature=0.7, seed=91, **settings)
+    def test_standard_sampling_positions_survive_other_random_draws(self):
+        sampler = Generator.__new__(Generator)._make_sampler(
+            Args(temperature=0.7, seed=91)
         )
         logits = mx.array([[0.4, 0.3, 0.2, 0.1]])
         expected = [
@@ -844,8 +841,10 @@ class TestContinuation:
             "max_output_tokens": 50,
             "context_management": [],
         }
-        with _endpoint(generator=worker, chunks=fallback):
+        with _endpoint(generator=worker, chunks=fallback) as original:
             response = _post(client, api, stream=True, resumable=True, **options)
+        if not batched:
+            assert "sampler" not in original.stream.call_args.kwargs
         assert response.headers["X-MLX-Continuation"] == "1"
         checkpoint = next(
             e["continuation"]
@@ -6247,7 +6246,7 @@ class TestResponseGenerator:
 
     def test_new_sampler_recreates_idle_batch(self, monkeypatch):
         gen, batches = _worker_setup(monkeypatch, idle=True)
-        gen._make_session_sampler = lambda args: f"sampler-{args.temperature}"
+        gen._make_sampler = lambda args: f"sampler-{args.temperature}"
         with _running(gen):
             for i, temperature in enumerate([0.0, 0.6]):
                 _, tokens = _drain(
@@ -6274,7 +6273,7 @@ class TestResponseGenerator:
             {"top_n_sigma": 1.5, "p_less": True, "typical_p": 0.3},
         ],
     )
-    def test_session_sampler_preserves_standard_filtering(
+    def test_positioned_sampler_preserves_standard_filtering(
         self, monkeypatch, options, dtype, positioned
     ):
         from mlx_vlm.generate.ar import _sample_with_positions
@@ -6282,7 +6281,15 @@ class TestResponseGenerator:
         args = Args(**({"temperature": 0.5, "top_p": 0.7, "seed": 91} | options))
         gen = _generator()
         reference = gen._make_sampler(args)
-        sampler = gen._make_session_sampler(args)
+        sampler = generation._PositionedTargetSampler(
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            seed=args.seed,
+            top_n_sigma=args.top_n_sigma,
+            p_less=args.p_less,
+            typical_p=args.typical_p,
+        )
         logprobs = mx.log(
             mx.array([[0.5, 0.3, 0.2], [0.2, 0.5, 0.3], [0.3, 0.2, 0.5]] * 128)
         ).astype(dtype)
@@ -6314,6 +6321,63 @@ class TestResponseGenerator:
             mx.random.seed(21)
             actual = sampler(logprobs)
         assert actual.tolist() == expected.tolist()
+
+    @pytest.mark.parametrize("resumable", [False, True])
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {},
+            {"top_k": 2},
+            {"top_n_sigma": 1.5},
+            {"p_less": True},
+            {"typical_p": 0.95},
+            {"top_n_sigma": 1.5, "p_less": True, "typical_p": 0.3},
+        ],
+    )
+    def test_batch_sampler_preserves_standard_rng(
+        self, monkeypatch, resumable, options
+    ):
+        from mlx_vlm.generate.ar import _sample_with_positions
+
+        gen, batches = _worker_setup(monkeypatch)
+        args = Args(max_tokens=1, temperature=0.5, top_p=0.7, seed=91, **options)
+        session = sessions.InferenceSession() if resumable else None
+        queue = Queue()
+        gen.requests.put(
+            generation.QueuedGenerationRequest(
+                rqueue=queue,
+                raw_inputs={"request_id": 1},
+                prompt_tokens=1,
+                args=args,
+                session=session,
+            )
+        )
+        with _running(gen):
+            if resumable:
+                queue.get(timeout=1)
+                assert len(list(session.reader(timeout=1))) == 1
+            else:
+                assert len(_drain(queue)[1]) == 1
+
+        logprobs = mx.log(mx.array([[0.5, 0.3, 0.2]] * 128))
+
+        def draws(sampler):
+            mx.random.seed(21)
+            result = []
+            for position in range(3):
+                result.append(
+                    _sample_with_positions(
+                        sampler,
+                        logprobs,
+                        row_ids=[0] * len(logprobs),
+                        positions=[position] * len(logprobs),
+                    ).tolist()
+                )
+                # Interleaved work must consume the same shared RNG stream.
+                result.append(mx.random.uniform(shape=(8,)).tolist())
+            return result
+
+        assert draws(batches[0].kwargs["sampler"]) == draws(gen._make_sampler(args))
 
     @pytest.mark.parametrize("temperature", [0.0, 1e-300, 1e-5, 0.009, 0.01, 0.1])
     @pytest.mark.parametrize(

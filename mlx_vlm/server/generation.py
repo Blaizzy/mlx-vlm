@@ -1807,11 +1807,7 @@ class ResponseGenerator:
                 self.model.language_model,
                 self.processor,
                 stop_tokens=self.stop_tokens,
-                sampler=(
-                    self._make_session_sampler(args)
-                    if self.draft_model is None or request.session
-                    else self._make_sampler(args)
-                ),
+                sampler=self._make_sampler(args),
                 kv_bits=self.kv_bits,
                 kv_key_bits=getattr(self, "kv_key_bits", None),
                 kv_value_bits=getattr(self, "kv_value_bits", None),
@@ -1898,20 +1894,6 @@ class ResponseGenerator:
             **log_state,
         }
         return batch_gen
-
-    @staticmethod
-    def _make_session_sampler(args):
-        if args.temperature == 0:
-            return None
-        return _PositionedTargetSampler(
-            temperature=args.temperature,
-            top_p=args.top_p,
-            top_k=args.top_k,
-            seed=args.seed,
-            top_n_sigma=args.top_n_sigma,
-            p_less=args.p_less,
-            typical_p=args.typical_p,
-        )
 
     def _batch_key(self, request):
         """Only combine requests with compatible sampling and output settings."""

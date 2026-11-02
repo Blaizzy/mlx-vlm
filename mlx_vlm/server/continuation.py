@@ -604,21 +604,16 @@ def stream_generation(
     if state.resuming:
         session = state.record.session
     else:
-        from .generation import ResponseGenerator
-
         prompt, image, audio, args, video = prepare_generation(
             prompt, image, audio, args, video
         )
         # The retained generator frame owns the cache and decode position.
-        # Keyed sampling also keeps other requests from perturbing its draws.
-        sampler = ResponseGenerator._make_session_sampler(args)
         iterator = generate(
             prompt=prompt,
             image=image,
             audio=audio,
             video=video,
             skip_special_tokens=False,
-            sampler=sampler,
             **args.to_generate_kwargs(),
             **kwargs,
         )
