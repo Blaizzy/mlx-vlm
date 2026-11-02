@@ -2111,6 +2111,77 @@ def test_flint_checkpoint_strict_loading_and_roundtrip(
     )
 
 
+@pytest.mark.parametrize("prefixed", [False, True])
+@pytest.mark.parametrize("byte_storage", [False, True])
+def test_flint_mixed_bit_export_loading(flint_model, tmp_path, prefixed, byte_storage):
+    model = flint_model
+
+    def predicate(path, module):
+        if not hasattr(module, "to_quantized") or path.endswith("mlp.gate"):
+            return False
+        if path.endswith("embed_tokens"):
+            return {"group_size": 32, "bits": 8}
+        return True
+
+    nn.quantize(model, group_size=32, bits=4, class_predicate=predicate)
+    expected = dict(tree_flatten(model.parameters()))
+    checkpoint = {}
+    for key, value in expected.items():
+        if not prefixed:
+            key = key.removeprefix("language_model.")
+        if byte_storage and value.dtype == mx.uint32:
+            value = mx.array(np.array(value).view(np.uint8).copy())
+        checkpoint[key] = value
+
+    first = model.sanitize(dict(checkpoint))
+    second = model.sanitize(dict(first))
+    assert first.keys() == second.keys() == expected.keys()
+    for key, value in expected.items():
+        for sanitized in (first[key], second[key]):
+            assert sanitized.dtype == value.dtype, key
+            np.testing.assert_array_equal(np.array(sanitized), np.array(value))
+
+    config = model.config.to_dict()
+    config["quantization"] = {"group_size": 32, "bits": 4}
+    config["mlx_export"] = {"bits": 4, "embedding_bits": 8}
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config))
+    original_config = config_path.read_bytes()
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), checkpoint)
+
+    reloaded = load_model(tmp_path)
+    assert reloaded.language_model.model.embed_tokens.bits == 8
+    assert reloaded.language_model.layers[0].self_attn.q_proj.bits == 4
+    assert config_path.read_bytes() == original_config
+    ids = mx.array([[1, 2, 3, 4, 5]])
+    np.testing.assert_array_equal(
+        np.array(reloaded(ids).logits), np.array(model(ids).logits)
+    )
+
+
+@pytest.mark.parametrize(
+    "path", ["model.embed_tokens", "language_model.model.embed_tokens"]
+)
+def test_flint_export_metadata_preserves_explicit_embedding_quantization(path):
+    from mlx_vlm.models.flint import Model, ModelConfig
+    from mlx_vlm.utils import _quantization_for_module_path
+
+    override = {"group_size": 32, "bits": 4}
+    quantization = {"group_size": 64, "bits": 4, path: override}
+    config = ModelConfig.from_dict(
+        {
+            **model_case("flint")["config"],
+            "quantization": quantization,
+            "mlx_export": {"embedding_bits": 8},
+        }
+    )
+    effective = _quantization_for_module_path(
+        config.quantization, "language_model.model.embed_tokens", Model(config)
+    )
+    assert effective == override
+    assert quantization == {"group_size": 64, "bits": 4, path: override}
+
+
 @pytest.fixture
 def nemotron_case(request):
     case = model_case(getattr(request, "param", "nemotron_super_vl"))
