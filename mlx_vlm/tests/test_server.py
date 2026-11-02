@@ -56,7 +56,11 @@ from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.server import GenerationArguments as Args
 from mlx_vlm.server import ResponseGenerator as Generator
 from mlx_vlm.server import compaction, realtime
-from mlx_vlm.server.model_discovery import discover_models, is_model_directory
+from mlx_vlm.server.model_discovery import (
+    discover_models,
+    is_model_directory,
+    model_reasoning_efforts,
+)
 from mlx_vlm.server.responses_state import (
     ToolCallStreamState,
     _response_items_to_chat,
@@ -1217,6 +1221,101 @@ class TestModelDiscovery:
         assert listing.get() == {"local/vision": False}
         (listing.path / "model.safetensors").unlink()
         assert listing.get() == {}
+
+    @pytest.mark.parametrize("endpoint", ["/models", "/v1/models"])
+    @pytest.mark.parametrize("source", ["jinja", "tokenizer", "processor", "loaded"])
+    def test_endpoint_reasoning_efforts(self, model_listing, client, endpoint, source):
+        template = (
+            "{% set effort = reasoning_effort | default('xhigh') %}"
+            "{% if effort not in ('xhigh', 'medium', 'low') %}"
+            "{{ raise_exception('unsupported effort') }}{% endif %}"
+        )
+        if source == "jinja":
+            (model_listing.path / "chat_template.jinja").write_text(template)
+        elif source == "loaded":
+            # The active template takes precedence over stale checkpoint metadata.
+            (model_listing.path / "chat_template.jinja").write_text("{{ messages }}")
+            model_listing.registry.set(
+                "text_generation",
+                dict(model_path="local/vision", processor=NS(chat_template=template)),
+            )
+        else:
+            (model_listing.path / f"{source}_config.json").write_text(
+                json.dumps(dict(chat_template=template))
+            )
+        entry = client.get(endpoint).json()["data"][0]
+        assert entry["reasoning_efforts"] == ["xhigh", "medium", "low"]
+        assert entry["loaded"] is (source == "loaded")
+
+    def test_endpoint_unknown_reasoning_efforts(self, model_listing, client):
+        assert client.get("/v1/models").json()["data"][0]["reasoning_efforts"] is None
+        template_file = model_listing.path / "chat_template.jinja"
+        template_file.write_text(
+            "{% if reasoning_effort not in ['low', 'high'] %}"
+            "{{ raise_exception('bad effort') }}{% endif %}"
+        )
+        assert client.get("/v1/models").json()["data"][0]["reasoning_efforts"] == [
+            "low",
+            "high",
+        ]
+        template_file.write_text("{{ reasoning_effort }}")
+        assert client.get("/v1/models").json()["data"][0]["reasoning_efforts"] is None
+
+    @pytest.mark.parametrize(
+        "template, expected",
+        [
+            (
+                "{% if reasoning_strength not in ['low', 'high'] %}"
+                "{{ raise_exception('unsupported') }}{% endif %}",
+                ["low", "high"],
+            ),
+            (
+                "{% if role not in ['user', 'assistant'] %}"
+                "{{ raise_exception('unsupported') }}{% endif %}",
+                None,
+            ),
+            ("{# reasoning_effort not in ['low', 'high'] #}", None),
+            ("{% if reasoning_effort not in ['low'] %}higher{% endif %}", None),
+            ("{% if reasoning_effort == 'none' %}disabled{% endif %}", None),
+            (
+                "{% if reasoning_effort not in levels %}"
+                "{{ raise_exception('unsupported') }}{% endif %}",
+                None,
+            ),
+            (
+                "{% if reasoning_effort not in ['low', dynamic] %}"
+                "{{ raise_exception('unsupported') }}{% endif %}",
+                None,
+            ),
+            (
+                "{% if reasoning_effort not in ['low'] %}{{ raise_exception('bad') }}{% endif %}"
+                "{% if reasoning_effort not in ['high'] %}{{ raise_exception('bad') }}{% endif %}",
+                None,
+            ),
+            ("{% broken template %}", None),
+        ],
+    )
+    def test_reasoning_efforts_require_literal_allowlist(self, template, expected):
+        assert model_reasoning_efforts(processor=NS(chat_template=template)) == expected
+
+    @pytest.mark.parametrize("source", ["processor", "tokenizer", "named", "legacy"])
+    def test_reasoning_efforts_active_template(self, source, tmp_path):
+        template = (
+            "{% if reasoning_effort not in ['low', 'high'] %}"
+            "{{ raise_exception('unsupported') }}{% endif %}"
+        )
+        variants = dict(
+            processor=NS(chat_template=template),
+            tokenizer=NS(tokenizer=NS(chat_template=template)),
+            named=NS(chat_template={"default": template, "tool_use": "{{ messages }}"}),
+            legacy=NS(chat_template=[dict(name="default", template=template)]),
+        )
+        assert model_reasoning_efforts(processor=variants[source]) == ["low", "high"]
+        (tmp_path / "chat_template.jinja").write_text(template)
+        assert (
+            model_reasoning_efforts(tmp_path, NS(chat_template="{{ messages }}"))
+            is None
+        )
 
     @pytest.mark.parametrize("cached", [False, True], ids=["missing-cache", "cached"])
     @pytest.mark.parametrize("source", ["environment", "query"])

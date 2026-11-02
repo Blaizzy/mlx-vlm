@@ -1384,6 +1384,19 @@ Hugging Face cache and any configured or request-specific model directories. Eac
 `loaded: false` when it is discovered but not loaded. Discovery does not load
 models or guarantee that every discovered architecture is supported.
 
+Each entry also includes `reasoning_efforts`, for example
+`["xhigh", "medium", "low"]`. These are the values explicitly allowed by the
+model's active/default chat template. Loaded models use their active processor;
+unloaded models are inspected through local template and tokenizer metadata,
+without loading weights. The field is `null` when an explicit list cannot be
+determined; this does not mean the model cannot reason. Discovery recognizes
+literal allowlists validated by `raise_exception`, including aliases such as
+`reasoning_effort | default('xhigh')`.
+
+Pass a listed value as `reasoning_effort` in a chat-completions request, or as
+`reasoning.effort` in a Responses request. This model-specific control is separate
+from `thinking_budget`, which enforces a reasoning token limit during generation.
+
 Discovery reads model metadata (`config.json`, or `model_index.json` for image
 pipelines) and checks for nonempty safetensors files. Sharded checkpoints must
 have every shard referenced by their weight index. Tokenizer metadata is not

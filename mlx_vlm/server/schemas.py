@@ -1127,6 +1127,14 @@ class ModelInfo(BaseModel):
     loaded: bool = Field(
         default=False, description="Whether the model is loaded in this server process."
     )
+    reasoning_efforts: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Reasoning effort values explicitly allowed by the active/default chat "
+            "template. Null when the values cannot be determined. Independent of "
+            "the runtime thinking_budget."
+        ),
+    )
 
 
 class ModelsResponse(BaseModel):
