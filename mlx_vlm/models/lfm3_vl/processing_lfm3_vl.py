@@ -164,7 +164,13 @@ class Lfm3VlProcessor(Qwen2VLProcessor):
     ):
         text = [text] if isinstance(text, str) else list(text or [])
         image_kwargs = dict(kwargs.pop("images_kwargs", {}))
-        for key in ("min_pixels", "max_pixels", "resized_height", "resized_width"):
+        for key in (
+            "size",
+            "min_pixels",
+            "max_pixels",
+            "resized_height",
+            "resized_width",
+        ):
             if key in kwargs:
                 image_kwargs[key] = kwargs.pop(key)
         if "size" in image_kwargs:
@@ -172,13 +178,16 @@ class Lfm3VlProcessor(Qwen2VLProcessor):
         data = {}
         if images is not None:
             data.update(self.image_processor(images=images, **image_kwargs))
-            counts = (
-                data["image_grid_thw"].prod(axis=-1)
-                // self.image_processor.merge_size**2
-            )
-            text = self._expand(
-                text, self.image_token, [self.image_token * int(n) for n in counts]
-            )
+            if text:
+                counts = (
+                    data["image_grid_thw"].prod(axis=-1)
+                    // self.image_processor.merge_size**2
+                )
+                text = self._expand(
+                    text,
+                    self.image_token,
+                    [self.image_token * int(n) for n in counts],
+                )
         video_kwargs = dict(kwargs.pop("videos_kwargs", {}))
         metadata = video_metadata or video_kwargs.pop("video_metadata", None)
         if kwargs.pop("do_sample_frames", video_kwargs.get("do_sample_frames", False)):
@@ -248,18 +257,20 @@ class Lfm3VlProcessor(Qwen2VLProcessor):
                         for timestamp in timestamps
                     )
                 )
-            text = self._expand(text, self.video_token, replacements)
+            if text:
+                text = self._expand(text, self.video_token, replacements)
         return_tensors = kwargs.pop("return_tensors", "mlx")
         kwargs.pop("return_mm_token_type_ids", None)
         kwargs.setdefault("return_token_type_ids", False)
-        data.update(
-            self.tokenizer(
-                text,
-                add_special_tokens=add_special_tokens,
-                padding_side=padding_side,
-                **kwargs,
+        if text:
+            data.update(
+                self.tokenizer(
+                    text,
+                    add_special_tokens=add_special_tokens,
+                    padding_side=padding_side,
+                    **kwargs,
+                )
             )
-        )
         if return_tensors == "mlx":
             return BatchFeature(data=to_mlx(data))
         return BatchFeature(data=data, tensor_type=return_tensors)

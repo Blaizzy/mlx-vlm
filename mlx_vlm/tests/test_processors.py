@@ -3150,6 +3150,45 @@ def test_prepare_inputs(prompt, with_image, error, pad_token):
         assert mx.array_equal(inputs["attention_mask"], mx.array([7, 8, 9]))
 
 
+@pytest.mark.parametrize(
+    "size,expected_size",
+    [
+        ({"shortest_edge": 1024, "longest_edge": 4096}, (64, 64)),
+        ({"longest_edge": 64}, (64, 64)),
+        ({"height": 32, "width": 64}, (64, 32)),
+        ((32, 64), (64, 32)),
+        (32, (32, 32)),
+    ],
+    ids=["pixel-area", "edge-bound", "dimensions", "tuple", "square"],
+)
+def test_prepare_inputs_uniform_images_respect_size_contract(size, expected_size):
+    class RecordingProcessor(MockProcessor):
+        def __call__(self, text=None, images=None, **kwargs):
+            self.images = images
+            return super().__call__(text=text, images=images, **kwargs)
+
+    processor = RecordingProcessor()
+    processor.image_processor = SimpleNamespace(size=size)
+    images = [Image.new("RGB", (64, 32), "red"), Image.new("RGB", (32, 64), "blue")]
+    prepare_inputs(
+        processor,
+        prompts="<image><image>",
+        images=images,
+        pad_to_uniform_size=True,
+    )
+
+    assert [image.size for image in processor.images] == [expected_size] * 2
+    if expected_size == (64, 64):
+        # Flexible sizing must preserve the source pixels and aspect ratios.
+        for source, padded in zip(images, processor.images):
+            x, y = (64 - source.width) // 2, (64 - source.height) // 2
+            np.testing.assert_array_equal(
+                np.asarray(padded.crop((x, y, x + source.width, y + source.height))),
+                np.asarray(source),
+            )
+            assert padded.getpixel((0, 0)) == (255, 255, 255)
+
+
 @pytest.mark.parametrize("wrapped", [False, True])
 @pytest.mark.parametrize("padding_side", ["left", "right"])
 @pytest.mark.parametrize(
@@ -3440,6 +3479,17 @@ class TestEstimateNumImageTokens:
     def test_unsupported_processor_raises(self):
         with pytest.raises(NotImplementedError, match="num_image_tokens"):
             estimate_num_image_tokens(SimpleNamespace(), 480, 640)
+
+
+def test_qwen3_vl_image_processor_exposes_size_and_valid_kwargs():
+    """Serving engines read the transformers image processor contract."""
+    from mlx_vlm.models.qwen3_vl import processing_qwen3_vl as module
+
+    processor = module.Qwen3VLImageProcessor(min_pixels=4096, max_pixels=16384)
+    assert processor.size == {"shortest_edge": 4096, "longest_edge": 16384}
+    accepted = set(processor.valid_kwargs.__annotations__)
+    assert module._IMAGE_PROCESSOR_KWARGS <= accepted
+    assert {"size", "patch_size", "merge_size"} <= accepted
 
 
 class TestMiMoV2Processor:
@@ -4502,6 +4552,19 @@ def test_lfm3_media_placeholders_are_validated_without_replacing_inserted_tokens
         module.Lfm3VlProcessor._expand(["a"], "<|image|>", ["image"])
     with pytest.raises(ValueError, match="placeholders"):
         module.Lfm3VlProcessor._expand(["<|image|>"], "<|image|>", [])
+
+
+def test_lfm3_processor_returns_image_features_without_text(lfm3_processor):
+    """Serving engines process media first and insert the tokens themselves."""
+    image = Image.new("RGB", (256, 256), color=(9, 30, 51))
+    features = lfm3_processor(images=[image], return_tensors="np")
+    assert set(features) == {"pixel_values", "image_grid_thw"}
+    assert features["image_grid_thw"].tolist() == [[1, 8, 8]]
+    size = {"shortest_edge": 1024, "longest_edge": 4096}
+    capped = lfm3_processor(images=[image], size=size, return_tensors="np")
+    assert capped["image_grid_thw"].tolist() == [[1, 4, 4]]
+    with pytest.raises(ValueError, match="placeholders"):
+        lfm3_processor(text=["no placeholder"], images=[image], return_tensors="np")
 
 
 def test_lfm3_processor_save_preserves_resolution_override(tmp_path, lfm3_processor):
