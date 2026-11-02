@@ -77,6 +77,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | Ternary Bonsai 2 | [Docs](mlx_vlm/models/prism_hadamard_qwen35/README.md) |
 | Flint | [Docs](mlx_vlm/models/flint/README.md) |
 | Nemotron 3.5 Super VL / Bolt / Nano Omni | [Docs](mlx_vlm/models/nemotron_h_nano_omni/README.md) |
+| Idol (image to 3D Gaussian splats) | [Docs](mlx_vlm/models/idol/README.md) |
 
 ## Installation
 
