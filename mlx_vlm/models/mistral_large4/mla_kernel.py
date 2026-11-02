@@ -93,11 +93,16 @@ def sparse_mla(ql, qr, kv, kr, indices, mask, scale, chunk=128):
     b, h, _, d = ql.shape
     k = indices.shape[-1]
     splits = (k + chunk - 1) // chunk
+    rope_dim = qr.shape[-1]
+    if rope_dim == 0:
+        # Empty cache views can have no Metal buffer after growth/filtering.
+        # R=0 removes all rotary reads; bind existing nonempty buffers instead.
+        qr, kr = ql, kv
     partial, stats = parts_kernel(
         inputs=[ql, qr, kv, kr, indices, mask, mx.array(scale, mx.float32)],
         template=[
             ("D", d),
-            ("R", qr.shape[-1]),
+            ("R", rope_dim),
             ("H", h),
             ("S", splits),
             ("K", k),

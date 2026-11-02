@@ -10,7 +10,7 @@ from mlx_vlm.models.mistral_large4 import speculative_verifier as verifier
 from mlx_vlm.models.mistral_large4 import verify_kernel, verify_ops
 from mlx_vlm.models.mistral_large4.block_mla_kernel import block_sparse_mla
 from mlx_vlm.models.mistral_large4.config import TextConfig
-from mlx_vlm.models.mistral_large4.language import MoE
+from mlx_vlm.models.mistral_large4.language import BatchLatentCache, MoE
 from mlx_vlm.models.mistral_large4.mla_kernel import sparse_mla
 from mlx_vlm.models.mistral_large4.moe_kernel import masked_qmv
 from mlx_vlm.quantization.nvfp4 import ScaledQuantizedSwitchLinear
@@ -76,6 +76,46 @@ def test_sparse_block_queries(dtype, context, rope):
         q, qr, kv, kr, indices, mx.concatenate(masks, axis=2), 0.125, counts, chunk=128
     )
     exact(mx.concatenate(expected, axis=2), actual)
+
+
+@pytest.mark.parametrize("length", [1, 4])
+def test_no_rope_attention_after_cache_growth_and_filtering(length):
+    cache = BatchLatentCache([1, 0, 2])
+    cache.step = 8
+    cache._ragged = True
+    batch, heads, dim = 3, 2, 64
+    for step in range(48):
+        if step in (10, 20):
+            batch -= 1
+            cache.filter(mx.array([1, 2] if batch == 2 else [1]))
+        query = mx.ones((batch, heads, length, dim), mx.bfloat16)
+        latent, rotary = cache.update_latent(
+            mx.ones((batch, 1, length, dim), mx.bfloat16),
+            mx.zeros((batch, 1, length, 0), mx.bfloat16),
+        )
+        mask = cache.make_mask(length)
+        counts = [cache.size() + t + 1 for t in range(length)]
+        indices = mx.broadcast_to(
+            mx.arange(latent.shape[2])[None], (batch, latent.shape[2])
+        )
+        if length == 1:
+            output = sparse_mla(
+                query, query[..., :0], latent, rotary, indices, mask, 0.125
+            )
+        else:
+            output = block_sparse_mla(
+                query,
+                query[..., :0],
+                latent,
+                rotary,
+                mx.broadcast_to(indices[:, None], (batch, length, indices.shape[-1])),
+                mask,
+                0.125,
+                counts,
+            )
+        expected = mx.broadcast_to(mx.any(mask, axis=-1, keepdims=True), query.shape)
+        exact(output, expected.astype(query.dtype))
+        cache.advance(length)
 
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])

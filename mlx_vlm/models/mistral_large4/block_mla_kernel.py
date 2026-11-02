@@ -67,6 +67,10 @@ def _parts():
 def block_sparse_mla(ql, qr, kv, kr, indices, mask, scale, counts, chunk=128):
     b, h, length, d = ql.shape
     splits = (indices.shape[-1] + chunk - 1) // chunk
+    rope_dim = qr.shape[-1]
+    if rope_dim == 0:
+        # R=0 never reads rotary inputs, but Metal still needs valid bindings.
+        qr, kr = ql, kv
     partial, stats = _parts()(
         inputs=[
             ql,
@@ -80,7 +84,7 @@ def block_sparse_mla(ql, qr, kv, kr, indices, mask, scale, counts, chunk=128):
         ],
         template=[
             ("D", d),
-            ("R", qr.shape[-1]),
+            ("R", rope_dim),
             ("H", h),
             ("L", length),
             ("S", splits),
