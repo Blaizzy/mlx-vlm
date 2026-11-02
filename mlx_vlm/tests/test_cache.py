@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from itertools import product
@@ -2236,6 +2237,161 @@ def test_ring_prompt_boundary_survives_partial_prefill_restore():
     same_arrays(restored.state[0][:, :, :5], prompt)
 
 
+@parametrize("decode_steps", [0, 1, 5])
+def test_ring_snapshot_preserves_type_and_decode_position(decode_steps):
+    cache = RingSlidingKVCache(2)
+    cache.prefill_length = 3
+    prompt = mx.arange(24, dtype=mx.float32).reshape(2, 1, 3, 4)
+    cache.update_and_fetch(prompt, prompt)
+    for step in range(decode_steps):
+        token = mx.full((2, 1, 1, 4), step + 30, dtype=mx.float32)
+        cache.update_and_fetch(token, token)
+
+    restored = snapshot_row([cache], 1)[0]
+    assert type(restored) is RingSlidingKVCache
+    assert restored.meta_state == cache.meta_state
+    same_arrays(restored.state, tuple(t[1:2] for t in cache.state))
+    token = mx.full((2, 1, 1, 4), 99, dtype=mx.float32)
+    expected = cache.update_and_fetch(token, token)
+    actual = restored.update_and_fetch(token[1:2], token[1:2])
+    same_arrays(actual, tuple(t[1:2] for t in expected))
+    assert restored.meta_state == cache.meta_state
+
+
+@parametrize("api", ["helper", "coordinator"])
+def test_native_single_row_merge_preserves_public_input(api, managers):
+    source = RingSlidingKVCache(2)
+    filled(source, 4, heads=1, dim=4)
+    original_meta = source.meta_state
+    if api == "helper":
+        caches, prefix_len = warm_exact([[source]], [4])
+    else:
+        runner = coordinate(managers(), [source])
+        caches, prefix_len = runner.merge_rows([{"warm_cache": [source]}], [4])
+    assert prefix_len == 4 and type(caches[0]) is type(source)
+    assert caches[0] is not source
+    keys, values = kv(1, heads=1, dim=4)
+    caches[0].update_and_fetch(keys, values)
+    assert source.meta_state == original_meta
+    assert caches[0].offset == source.offset + 1
+
+
+@parametrize("quantized", [False, True])
+@parametrize("nested", [False, True])
+@parametrize("tier", ["memory", "disk-only"])
+def test_dash_checkpoint_preserves_router_and_page_state(
+    managers, quantized, nested, tier
+):
+    from mlx_vlm.models.unlimited_ocr.dash import (
+        DashKVCache,
+        DashParams,
+        DashQuantizedKVCache,
+        DashState,
+    )
+
+    state = DashState(
+        DashParams(block_size=4, index_dim=8, image_token_id=9, page_token_id=7)
+    )
+    tokens = [1, 7] + [9] * 12 + [4, 5]
+    state.start(tokens)
+    state.page, state.tok, state.markers = mx.array(1), mx.array(19), mx.array(2)
+    cache = (
+        DashQuantizedKVCache(state, group_size=32, bits=4)
+        if quantized
+        else DashKVCache(state)
+    )
+    filled(cache, 16, heads=1, dim=32)
+    cache.add_index_keys(mx.arange(120, dtype=mx.float32).reshape(15, 8), mx.ones(8))
+    caches = [C.CacheList(cache)] if nested else [cache]
+    manager = managers(tier)
+    runner = coordinate(manager, caches)
+    assert runner.enabled and runner.is_checkpoint
+    assert A.apc_exact_eligible(cache) and not A.apc_block_eligible(cache)
+    expected = cache.prefix_cache_snapshot()
+    for copy in (False, True):
+        row = snapshot_row(caches, clone=copy)[0]
+        restored = row.caches[0] if nested else row
+        assert type(restored) is type(cache)
+        same_arrays(restored.prefix_cache_snapshot(), expected)
+    assert runner.store_checkpoint(tokens, caches)
+    if tier == "disk-only":
+        manager.disk.flush()
+        manager.close()
+        manager = managers(tier)
+    rows, count = manager.lookup_exact_cache(tokens + [6])
+    assert count == len(tokens)
+    restored = rows[0].caches[0] if nested else rows[0]
+    assert type(restored) is type(cache)
+    same_arrays(restored.prefix_cache_snapshot(), expected)
+    assert restored.dash_state is not state
+    if tier == "disk-only":
+        assert manager.stats.disk_hits == 1
+
+    # Completing the partial router block and updating K/V must match the
+    # uninterrupted cache, including the packed quantization configuration.
+    new_keys = mx.ones((1, 8))
+    for item in (cache, restored):
+        item.add_index_keys(new_keys, mx.ones(8))
+    keys, values = kv(1, heads=1, dim=32)
+    same_arrays(
+        cache.update_and_fetch(keys, values), restored.update_and_fetch(keys, values)
+    )
+    same_arrays(cache.prefix_cache_snapshot(), restored.prefix_cache_snapshot())
+    restored.pending = mx.zeros((1, 8))
+    restored.dash_state.markers = mx.array(99)
+    assert cache.pending is None and state.markers.item() == 2
+
+
+@parametrize(
+    "names",
+    [
+        ("Z1TCache",),
+        ("KVCache", "RingSlidingKVCache"),
+        ("CacheList", "HyV4KVCache"),
+        ("CacheList", "SimpleKVCache"),
+    ],
+)
+@parametrize("memory_pressure", [False, True])
+def test_unmergeable_cache_falls_back_but_memory_pressure_propagates(
+    names, memory_pressure, managers, monkeypatch
+):
+    from mlx_vlm.generate.ar import BatchGenerator
+
+    model = cache_model([sample(name) for name in names])
+    processor = NS(stopping_criteria=NS(add_eos_token_ids=lambda _: None))
+    manager = managers()
+    runner = BatchGenerator(
+        model, processor, apc_manager=manager, manage_wired_limit=False
+    )
+    try:
+        tokens = list(range(20))
+        rows = [sample(name, 16) for name in names]
+        assert manager.store_exact_cache(tokens[:16], rows)
+        pick = runner.apc.lookup(
+            tokens,
+            extra_hash=0,
+            safe_lookup_min=0,
+            suffix_is_text_only=lambda _: True,
+            prefix_has_media=lambda _: False,
+        )
+        assert pick is not None
+        runner.apc.prepare_prefill([20, 20], prefix_lengths=[16, 16])
+        if memory_pressure:
+            monkeypatch.setattr(runner.apc, "prepare_prefill", lambda *a, **kw: False)
+        sequence = (0, tokens, 3, {"inputs_embeds": mx.zeros((1, 20, 4))}, [], None)
+        if memory_pressure:
+            with pytest.raises(P.APCAdmissionError):
+                runner._build_mixed_prompt_batch([sequence, sequence], [pick, pick])
+        else:
+            assert (
+                runner._build_mixed_prompt_batch([sequence, sequence], [pick, pick])
+                is None
+            )
+        runner._release_prefill_pick(pick)
+    finally:
+        runner.close()
+
+
 def sample(name, length=0):
     constructors = {
         "ArraysCache": lambda: C.ArraysCache(2),
@@ -2328,7 +2484,8 @@ def discover_contracts():
 
 
 @parametrize("names", discover_contracts(), ids=lambda names: "+".join(names))
-def test_model_cache_contract(names, managers, monkeypatch):
+@parametrize("merge_method", ["merge_rows", "_merge_and_release_cache_rows"])
+def test_model_cache_contract(names, merge_method, managers, monkeypatch):
     monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "2")
     for name in names:
         cache = sample(name)
@@ -2364,15 +2521,99 @@ def test_model_cache_contract(names, managers, monkeypatch):
     assert runner.materialize_single(hit, min_capacity_tokens=17) is not None
     assert manager.stats_snapshot()["restored_tokens"] == 16
     manager.reset_stats()
-    merged, _ = runner.merge_rows([hit], [16])
+    original_entries = tuple(hit["warm_cache"]) if plan.strategy != "block" else None
+    merged, _ = getattr(runner, merge_method)([hit], [16])
     assert manager.stats_snapshot()["restored_tokens"] == (
         16 if merged is not None else 0
     )
+    if original_entries is not None and merged is not None:
+        if merge_method == "merge_rows":
+            assert all(a is b for a, b in zip(hit["warm_cache"], original_entries))
+        else:
+            assert hit["warm_cache"] == [None] * len(original_entries)
     runner.release_hit(hit)
+
+
+@parametrize("row_type", [list, tuple])
+@parametrize("fail_last_layer", [False, True])
+def test_exact_merge_preserves_borrowed_rows(row_type, fail_last_layer, monkeypatch):
+    rows = tuple(
+        row_type(sample(name, 16) for name in ("KVCache", "ArraysCache"))
+        for _ in range(2)
+    )
+    originals = [tuple(row) for row in rows]
+    merge = P._merge_exact_cache_entries
+
+    def checked_merge(entries, lengths):
+        if fail_last_layer and entries[0] is originals[0][-1]:
+            return None
+        return merge(entries, lengths)
+
+    monkeypatch.setattr(P, "_merge_exact_cache_entries", checked_merge)
+    merged, count = warm_exact(rows, [16, 16])
+    assert (merged is None) == fail_last_layer
+    assert count == (0 if fail_last_layer else 16)
+    for row, original in zip(rows, originals):
+        assert all(a is b for a, b in zip(row, original))
+
+
+@parametrize("fail_last_layer", [False, True])
+def test_consumed_exact_merge_releases_layers(monkeypatch, fail_last_layer):
+    rows = [
+        [sample(name, 16) for name in ("KVCache", "ArraysCache", "KVCache")]
+        for _ in range(2)
+    ]
+    expected, _ = warm_exact(rows, [16, 16])
+    refs = [[weakref.ref(entry) for entry in row] for row in rows]
+    merge = P._merge_exact_cache_entries
+    layer = 0
+
+    def checked_merge(entries, lengths):
+        nonlocal layer
+        if layer:
+            assert all(refs[row][layer - 1]() is None for row in range(2))
+        current, layer = layer, layer + 1
+        return None if fail_last_layer and current == 2 else merge(entries, lengths)
+
+    monkeypatch.setattr(P, "_merge_exact_cache_entries", checked_merge)
+    actual, count = P._merge_and_release_cache_rows(rows, [16, 16])
+    consumed = 2 if fail_last_layer else 3
+    assert all(row[:consumed] == [None] * consumed for row in rows)
+    if fail_last_layer:
+        assert actual is None and count == 0
+    else:
+        assert count == 16
+        for result, reference in zip(actual, expected):
+            same_arrays(result.state, reference.state)
+
+
+def test_consumed_exact_merge_preserves_retained_apc_snapshots(managers):
+    manager = managers()
+    source = [sample("ArraysCache", 16), sample("KVCache", 16)]
+    tokens = list(range(16))
+    assert manager.store_exact_cache(tokens, source)
+    coordinator = coordinate(manager, source)
+    hit = coordinator.lookup(
+        tokens + [99],
+        extra_hash=0,
+        safe_lookup_min=0,
+        suffix_is_text_only=lambda _: True,
+        prefix_has_media=lambda _: False,
+    )
+    merged, count = coordinator._merge_and_release_cache_rows([hit], [16])
+    assert count == 16 and hit["warm_cache"] == [None, None]
+    merged[0][0] = mx.zeros_like(merged[0][0])
+    merged[1].keys = mx.zeros_like(merged[1].keys)
+    restored, count = manager.lookup_exact_cache(tokens + [99])
+    assert count == 16
+    for result, reference in zip(restored, source):
+        same_arrays(result.state, reference.state)
 
 
 @parametrize("kind", ["qsa", "deepseek", "composite", "ring-indexed"])
 def test_disk_custom_state(kind, managers, monkeypatch):
+    # This checks serialization, not the host-dependent disk admission guard.
+    monkeypatch.setenv("APC_DISK_MIN_FREE_RAM_GB", "0")
     monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "1" if kind == "qsa" else "0")
     monkeypatch.setenv("APC_EXACT_MIN_TOKENS", "1")
     if kind == "qsa":
@@ -3198,7 +3439,8 @@ def test_quantized_hybrid_snapshots(managers):
 
 
 @parametrize("scheme", ["uniform", "turboquant"])
-def test_warm_cache_quantization_policy(scheme, managers):
+@parametrize("merge", [warm_exact, P._merge_and_release_cache_rows])
+def test_warm_cache_quantization_policy(scheme, merge, managers):
     bits = 8 if scheme == "uniform" else 3.5
     config = dict(bits=bits, group_size=32, scheme=scheme)
     manager = managers(blocks=32)
@@ -3249,7 +3491,7 @@ def test_warm_cache_quantization_policy(scheme, managers):
             )
             for i in range(1, 4)
         ]
-        warm, _ = warm_exact([row], [16], kv_quant_config=config)
+        warm, _ = merge([row], [16], kv_quant_config=config)
         assert [type(c) for c in warm] == [type(c) for c in live]
         extended = _extend_cache(live, warm)
         assert extended[1].offset.shape[0] == 2
@@ -3955,10 +4197,12 @@ def test_restored_tokens_count_successful_restores(
         caches = runner.materialize_single(hit, min_capacity_tokens=33)
     else:
         if restore == "failed-batch":
-            builder = "exact" if mode == "exact" else "kv"
-            monkeypatch.setattr(
-                P, f"make_warm_batch_{builder}_cache_multi", lambda *a, **kw: (None, 0)
+            builder = (
+                "_merge_and_release_cache_rows"
+                if mode == "exact"
+                else "make_warm_batch_kv_cache_multi"
             )
+            monkeypatch.setattr(P, builder, lambda *a, **kw: (None, 0))
         caches, _ = runner.merge_rows([hit, None], [hit["prefix_len"], 0])
     runner.release_hit(hit)
     stats = manager.stats_snapshot()
@@ -3995,7 +4239,7 @@ def test_prefill_admission_is_authoritative_before_merge(memory_manager, monkeyp
     monkeypatch.setattr(manager, "_memory_headroom", lambda: 0)
     assert coordinator.prepare_prefill([32, 32]) is False
     forbid(monkeypatch, P, "make_warm_batch_kv_cache_multi")
-    forbid(monkeypatch, P, "make_warm_batch_exact_cache_multi")
+    forbid(monkeypatch, P, "_merge_and_release_cache_rows")
     with pytest.raises(P.APCAdmissionError, match="merge"):
         coordinator.merge_rows([None, None], [0, 0])
 

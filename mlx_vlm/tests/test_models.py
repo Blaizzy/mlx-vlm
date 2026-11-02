@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import faulthandler
 import importlib
 import inspect
 import json
@@ -10,6 +11,7 @@ import logging
 import math
 import os
 import secrets
+import signal
 import socket
 import struct
 import subprocess
@@ -2959,8 +2961,13 @@ def _make_distributed_test_model(family, dtype):
 
 
 def _distributed_model_worker(family, dtype_name):
+    # Report a stalled rank when the CI run is cancelled, without a time limit.
+    faulthandler.register(signal.SIGTERM, chain=True)
+
     def stage(name):
-        print(f"[rank {os.environ.get('MLX_RANK')}] {name}", flush=True)
+        print(
+            f"[rank {os.environ.get('MLX_RANK')}] {name}", file=sys.stderr, flush=True
+        )
 
     stage("initializing ring")
     group = mx.distributed.init(strict=True, backend="ring")
@@ -2976,21 +2983,29 @@ def _distributed_model_worker(family, dtype_name):
         ):
             time.sleep(0.001)
 
-    stage("building models")
     options = TINY_MODELS[family]["distributed"]
     dtype = getattr(mx, dtype_name)
-    mx.random.seed(19)
-    reference = _make_distributed_test_model(family, dtype)
-    mx.eval(reference.parameters())
-    weights = dict(tree_flatten(reference.parameters()))
-    sharded = _make_distributed_test_model(family, dtype)
-    sharded.load_weights(list(weights.items()), strict=True)
-    sharded.shard(group)
-    if error := options.get("reshard_error"):
-        with pytest.raises(ValueError, match=error):
+    # These local ranks share one GPU. Initialize them in order so weight
+    # evaluation/compilation does not race another rank's first GPU work.
+    # The distributed forward passes below still run concurrently.
+    for rank in range(group.size()):
+        if group.rank() == rank:
+            stage("building models")
+            mx.random.seed(19)
+            reference = _make_distributed_test_model(family, dtype)
+            stage("evaluating reference weights")
+            mx.eval(reference.parameters())
+            weights = dict(tree_flatten(reference.parameters()))
+            sharded = _make_distributed_test_model(family, dtype)
+            sharded.load_weights(list(weights.items()), strict=True)
             sharded.shard(group)
-    mx.eval(sharded.parameters())
-    stage("models ready")
+            if error := options.get("reshard_error"):
+                with pytest.raises(ValueError, match=error):
+                    sharded.shard(group)
+            stage("evaluating sharded weights")
+            mx.eval(sharded.parameters())
+            stage("models ready")
+        host_barrier(f"models-ready-{rank}")
     local_weights = dict(tree_flatten(sharded.parameters()))
     for pattern in options["sharded_weights"]:
         names = [name for name in weights if fnmatchcase(name, pattern)]
@@ -3102,7 +3117,6 @@ def _run_distributed_model_test(family, dtype, world_size):
                 MLX_TEST_BARRIER_DIR=barrier_dir,
             ),
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
             text=True,
         )
         output, _ = process.communicate()
@@ -5246,6 +5260,103 @@ class TestUnlimitedOCR2Dash:
     def prompt(self):
         page = [self.PAGE] + [self.IMAGE] * 6
         return [1, 2, 3] + page * 3 + [4, 5, 6, 2, 3]
+
+    @pytest.mark.parametrize("disk", [False, True])
+    def test_apc_reuses_dash_checkpoint_during_generation(
+        self, tmp_path, disk, monkeypatch
+    ):
+        from mlx_vlm.apc import APCManager, DiskBlockStore
+        from mlx_vlm.generate.ar import BatchGenerator
+        from mlx_vlm.utils import StoppingCriteria
+
+        model = self.language_model()
+        ids = self.prompt()
+        processor = NS(stopping_criteria=StoppingCriteria([]))
+        manager = APCManager(
+            num_blocks=16,
+            block_size=8,
+            disk=DiskBlockStore(tmp_path, namespace="dash") if disk else None,
+            overrides={"memory_max_gb": 1 / 1024, "memory_reserve_gb": 0},
+        )
+        # Exercise checkpoint reuse within 1 MiB, independently of other CI
+        # workers' RAM use. Memory-pressure admission is covered in test_cache.
+        monkeypatch.setattr(manager, "_memory_headroom", lambda: 1 << 20)
+        monkeypatch.setattr(manager, "_disk_min_free_ram_bytes", 0)
+        if disk:
+            manager._exact_cache_max = 0
+
+        def generate(tokens, apc):
+            # Production supplies the full prompt for page bookkeeping before
+            # prefill; the cached prefix may precede a new, longer text suffix.
+            model._prompt_ids = mx.array([tokens])
+            embeds = model.model.embed_tokens(mx.array([tokens]))
+            runner = BatchGenerator(
+                model,
+                processor,
+                max_tokens=6,
+                prefill_batch_size=1,
+                completion_batch_size=1,
+                prefill_step_size=8,
+                apc_manager=apc,
+                manage_wired_limit=False,
+            )
+            try:
+                assert (runner.apc is not None) == (apc is not None)
+                # Same document/media identity; text tokens are hashed separately.
+                runner.insert(
+                    [tokens],
+                    prompt_kwargs=[
+                        {
+                            "inputs_embeds": embeds,
+                            "_apc_semantic_hash": 42,
+                        }
+                    ],
+                )
+                output = []
+                for _ in range(40):
+                    _, results = runner.next()
+                    output.extend(result.token for result in results)
+                    if len(output) == 6:
+                        break
+                assert len(output) == 6
+                return output
+            finally:
+                runner.close()
+
+        try:
+            expected = generate(ids, None)
+            assert generate(ids, manager) == expected
+            assert generate(ids, manager) == expected
+            assert manager.stats.restored_tokens == len(ids) - 1
+            extended = ids + [2, 3, 4]
+            assert generate(extended, manager) == generate(extended, None)
+            assert manager.stats.restored_tokens >= 2 * (len(ids) - 1)
+            if disk:
+                assert manager.stats.disk_hits >= 2
+        finally:
+            manager.close()
+
+    @pytest.mark.parametrize("bits", [None, 4])
+    def test_dash_snapshot_continues_decode(self, bits):
+        from mlx_vlm.apc import snapshot_prompt_cache_row
+
+        model = self.language_model(hidden_size=64 if bits else 16)
+        ids = mx.array([self.prompt()])
+        model._prompt_ids = ids
+        cache = model.make_cache()
+        model(ids, cache=cache)
+        if bits:
+            cache = [c.to_quantized(group_size=32, bits=bits) for c in cache]
+        # Stop after crossing a page marker and during an incomplete block.
+        for token in (self.PAGE, 4, 5):
+            mx.eval(model(mx.array([[token]]), cache=cache).logits)
+        restored = snapshot_prompt_cache_row(cache)
+        assert all(a is not b for a, b in zip(cache, restored))
+        for token in (6, self.PAGE, 3, 2):
+            expected = model(mx.array([[token]]), cache=cache).logits
+            actual = model(mx.array([[token]]), cache=restored).logits
+            assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5).item()
+        assert all(c.dash_state is restored[0].dash_state for c in restored)
 
     @pytest.mark.parametrize("bits", [None, 4, 8])
     @pytest.mark.parametrize("heads", [2, 4])

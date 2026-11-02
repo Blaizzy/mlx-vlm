@@ -2796,6 +2796,85 @@ def test_apc_refused_restore_stays_queued_while_peer_decodes(
     assert error.value.uid == uid
 
 
+@pytest.mark.parametrize("family", ["z1t", "unlimited_ocr"])
+def test_apc_native_checkpoint_reuses_repeated_request(
+    family, mock_processor, monkeypatch
+):
+    monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "4")
+    mx.random.seed(1234)
+    if family == "z1t":
+        from mlx_vlm.models.z1t import Model, ModelConfig
+
+        model = Model(
+            ModelConfig(
+                vocab_size=32,
+                hidden_size=8,
+                num_hidden_layers=2,
+                aft_heads=2,
+                aft_ksize=4,
+            )
+        ).language_model
+    else:
+        from mlx_vlm.models.unlimited_ocr.config import TextConfig
+        from mlx_vlm.models.unlimited_ocr.language import LanguageModel
+
+        model = LanguageModel(
+            TextConfig(
+                vocab_size=32,
+                hidden_size=8,
+                intermediate_size=16,
+                num_hidden_layers=2,
+                num_attention_heads=2,
+                num_key_value_heads=2,
+                n_routed_experts=None,
+                n_shared_experts=None,
+                sliding_window_size=2,
+                sliding_window=2,
+            )
+        )
+    model.eval()
+    tokens = list(range(1, 21))
+    embeds = model.model.embed_tokens(mx.array([tokens]))
+    mock_processor.tokenizer.stopping_criteria.eos_token_ids = []
+    manager = apc_module.APCManager(num_blocks=16, block_size=8, disk=None)
+    results = []
+    try:
+        for enabled in (False, True):
+            engine = BatchGenerator(
+                model,
+                mock_processor,
+                max_tokens=6,
+                completion_batch_size=1,
+                prefill_batch_size=1,
+                prefill_step_size=8,
+                apc_manager=manager if enabled else None,
+                manage_wired_limit=False,
+            )
+            try:
+                for _ in range(2 if enabled else 1):
+                    if family == "unlimited_ocr":
+                        # The production embedding path provides the full
+                        # prompt boundary before any prefill chunks run.
+                        model._prompt_ids = mx.array(tokens)
+                    engine.insert([tokens], prompt_kwargs=[{"inputs_embeds": embeds}])
+                    output = []
+                    for _ in range(20):
+                        _, generated = engine.next()
+                        output.extend(r.token for r in generated)
+                        if len(output) == 6:
+                            break
+                    assert len(output) == 6
+                    results.append(output)
+            finally:
+                engine.close()
+        assert results[0] == results[1] == results[2]
+        assert manager.stats.exact_hits == 1
+        assert manager.stats.restored_tokens == len(tokens) - 1
+        assert manager.stats.memory_skips == 0
+    finally:
+        manager.close()
+
+
 def test_prefill_chunk_bounds_work_with_decoding_peers():
     gen = object.__new__(BatchGenerator)
     gen._wire_stack = None

@@ -61,7 +61,10 @@ import mlx.core as mx
 import numpy as np
 
 from ._stream_cleanup import clear_mlx_streams
-from .apc_adapters import reserve_checkpoint_capacity
+from .apc_adapters import (
+    build_prefix_cache_plan_from_caches,
+    reserve_checkpoint_capacity,
+)
 from .apc_coordinator import APCCoordinator, PrefillMemoryPlan
 from .apc_storage import APCNode, ComponentId, StateHandle
 from .kv_quant import from_config as kv_quant_from_config
@@ -3581,6 +3584,8 @@ class APCManager:
                 self.stats.memory_skips += 1
             if self.disk is None:
                 return False
+            if not build_prefix_cache_plan_from_caches(prompt_cache).restorable:
+                return False
             # Serialize the live state on its producer thread. It cannot be
             # queued by reference: generation will mutate it after this call.
             # This path avoids a second full snapshot just to spill to disk.
@@ -4412,12 +4417,47 @@ def make_warm_batch_exact_cache_multi(
     prefix_lens: Sequence[int],
     kv_quant_config: Optional[dict] = None,
 ) -> Tuple[Optional[List[Any]], int]:
-    """Merge single-row exact-cache snapshots into batch-aware caches.
+    """Merge exact-cache rows without releasing the caller's input entries.
 
     Native quantized rows are merged in their packed representation. When
     *kv_quant_config* is provided, legacy float ``BatchKVCache`` snapshots are
     converted to match live ``_make_cache``. Hybrid non-KV entries are
     unchanged.
+    """
+    # Copy the containers because the caller retains ownership of the rows.
+    merged, prefix_len = _merge_and_release_cache_rows(
+        [list(row) for row in row_caches], prefix_lens, kv_quant_config
+    )
+    if merged is not None and len(row_caches) == 1:
+        merged = _detach_borrowed_cache_entries(merged, row_caches[0])
+    return merged, prefix_len if merged is not None else 0
+
+
+def _detach_borrowed_cache_entries(caches, source):
+    """Detach native pass-through entries returned by a public merge API."""
+    eval_targets: List[mx.array] = []
+    for i, entry in enumerate(caches):
+        if entry is source[i]:
+            caches[i] = _clone_cache_entry_for_apc(
+                entry, min_capacity_tokens=None, eval_targets=eval_targets
+            )
+            if caches[i] is None:
+                return None
+    if eval_targets:
+        mx.eval(eval_targets)
+    return caches
+
+
+def _merge_and_release_cache_rows(
+    row_caches: Sequence[List[Any]],
+    prefix_lens: Sequence[int],
+    kv_quant_config: Optional[dict] = None,
+) -> Tuple[Optional[List[Any]], int]:
+    """Take ownership of temporary rows and release each layer after merging.
+
+    Materialize each merged layer before clearing its input entries, bounding
+    the overlap to one layer instead of another full batch. Callers must not
+    reuse the rows, including after a failure that leaves them partly cleared.
     """
 
     if not row_caches:
@@ -4427,6 +4467,8 @@ def make_warm_batch_exact_cache_multi(
     num_entries = len(row_caches[0])
     if any(len(row) != num_entries for row in row_caches):
         return None, 0
+    if any(not isinstance(row, list) for row in row_caches):
+        raise TypeError("Merging and releasing caches requires owned row lists")
 
     out: List[Any] = []
     for entry_idx in range(num_entries):
@@ -4435,8 +4477,18 @@ def make_warm_batch_exact_cache_multi(
             prefix_lens,
         )
         if merged is None:
-            return None, 0
+            if len(row_caches) != 1:
+                return None, 0
+            # A single request needs no batch conversion. Preserve custom
+            # checkpoint state when its cache has no multi-row merge.
+            merged = row_caches[0][entry_idx]
         out.append(merged)
+        eval_targets: List[mx.array] = []
+        _collect_mx_arrays(merged.state, eval_targets)
+        if eval_targets:
+            mx.eval(eval_targets)
+        for row in row_caches:
+            row[entry_idx] = None
 
     if kv_quant_config is not None:
         out = _align_exact_batch_caches_to_kv_policy(out, kv_quant_config)
@@ -4502,6 +4554,9 @@ def snapshot_prompt_cache_row(
     """
     if not caches:
         return []
+    # Reject incomplete composite contracts before extracting their rows.
+    if not build_prefix_cache_plan_from_caches(caches).restorable:
+        return None
     source: Sequence[Any] = caches
     if _prompt_cache_is_batch_shaped(caches):
         row = extract_prompt_cache_from_batch(caches, batch_idx)
