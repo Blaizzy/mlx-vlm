@@ -6433,8 +6433,15 @@ def test_qwen3_5_rotary_without_yarn_is_unchanged():
     assert default.fused_apply == plain.fused_apply
 
 
-def test_qwen3_5_attention_forwards_rope_parameters():
+@pytest.mark.parametrize("omit_original_max", [False, True])
+def test_qwen3_5_attention_forwards_rope_parameters(omit_original_max):
     qwen = importlib.import_module("mlx_vlm.models.qwen3_5")
+    rope_parameters = {**QWEN3_5_YARN_PARAMETERS, "rope_type": "yarn"}
+    max_position_embeddings = 128
+    if omit_original_max:
+        max_position_embeddings = rope_parameters.pop(
+            "original_max_position_embeddings"
+        )
     text_config = qwen.TextConfig(
         model_type="qwen3_5_text",
         hidden_size=32,
@@ -6449,16 +6456,19 @@ def test_qwen3_5_attention_forwards_rope_parameters():
         rms_norm_eps=1e-6,
         vocab_size=64,
         num_key_value_heads=1,
-        max_position_embeddings=128,
+        max_position_embeddings=max_position_embeddings,
         full_attention_interval=2,
         head_dim=256,
-        rope_parameters={**QWEN3_5_YARN_PARAMETERS, "rope_type": "yarn"},
+        rope_parameters=rope_parameters,
     )
     model = qwen.LanguageModel(text_config)
     rotary = next(
         layer.self_attn.rotary_emb
         for layer in model.model.layers
         if not layer.is_linear
+    )
+    np.testing.assert_allclose(
+        np.asarray(rotary.inv_freq), QWEN3_5_YARN_HF_INV_FREQ, rtol=1e-5
     )
     assert rotary.attention_scaling == pytest.approx(
         QWEN3_5_YARN_HF_ATTENTION_FACTOR, rel=1e-6

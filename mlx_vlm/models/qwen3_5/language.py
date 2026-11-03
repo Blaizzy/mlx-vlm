@@ -46,7 +46,7 @@ class Qwen3_5RotaryEmbedding(MRoPERotaryEmbedding):
         )
         if rope_type == "yarn":
             self._inv_freq, self.attention_scaling = _yarn_inv_freq(
-                dim, base, rope_parameters
+                dim, base, rope_parameters, max_position_embeddings
             )
             # The fused MRoPE kernel ignores attention_scaling; the cos/sin path
             # scales only the rotary slice of q and k, as HF does.
@@ -55,10 +55,12 @@ class Qwen3_5RotaryEmbedding(MRoPERotaryEmbedding):
         mx.eval(self.inv_freq)
 
 
-def _yarn_inv_freq(dim, base, rope_parameters):
+def _yarn_inv_freq(dim, base, rope_parameters, max_position_embeddings):
     # HF modeling_rope_utils._compute_yarn_parameters (truncate=True default).
     factor = float(rope_parameters["factor"])
-    original_max = rope_parameters["original_max_position_embeddings"]
+    original_max = rope_parameters.get(
+        "original_max_position_embeddings", max_position_embeddings
+    )
     beta_fast = rope_parameters.get("beta_fast") or 32
     beta_slow = rope_parameters.get("beta_slow") or 1
 
