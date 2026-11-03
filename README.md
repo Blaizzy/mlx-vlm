@@ -22,6 +22,7 @@
 
 <p align="center">
   <a href="https://github.com/Blaizzy/mlx-vlm/actions/workflows/python-publish.yml"><img src="https://github.com/Blaizzy/mlx-vlm/actions/workflows/python-publish.yml/badge.svg" alt="Upload Python Package"></a>
+  <a href="https://pypi.org/project/mlx-vlm/"><img src="https://img.shields.io/pypi/v/mlx-vlm" alt="PyPI version"></a>
   <a href="https://pypi.org/project/mlx-vlm/"><img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python 3.10+"></a>
   <a href="https://github.com/Blaizzy/mlx-vlm/blob/main/LICENSE"><img src="https://img.shields.io/github/license/Blaizzy/mlx-vlm" alt="MIT license"></a>
 </p>
