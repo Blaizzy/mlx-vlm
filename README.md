@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  macOS &middot; Apple silicon &middot; Powered by <a href="https://github.com/ml-explore/mlx">MLX</a>
+  macOS &middot; Apple silicon
 </p>
 
 <p align="center">
