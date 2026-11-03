@@ -9,6 +9,17 @@ import mlx.core as mx
 MIN_SAMPLING_TEMPERATURE = 0.01
 
 
+@partial(mx.compile, shapeless=True)
+def greedy_argmax(logits: mx.array) -> mx.array:
+    """Select the normalized greedy token without returning vocabulary scores.
+
+    Subtraction can create ties in low precision, so argmax on raw logits is
+    not equivalent to the existing normalized target sampler.
+    """
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    return mx.argmax(logprobs, axis=-1)
+
+
 def clamp_temperature(temperature: float) -> float:
     """Clamp positive sampling temperatures, preserving zero for greedy decoding."""
     if 0 < temperature < MIN_SAMPLING_TEMPERATURE:

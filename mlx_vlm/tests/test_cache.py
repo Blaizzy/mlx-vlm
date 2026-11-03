@@ -3241,6 +3241,68 @@ def embeddings(lm, tokens):
     return lm.model.embed_tokens(tokens) * getattr(lm.model, "embed_scale", 1)
 
 
+@parametrize(
+    "case_id",
+    [
+        "lfm2",
+        "gemma4",
+        "mistral_large4",
+        "qwen3_5",
+        "qwen3_5_moe",
+        "TestGetInputEmbeddings.qwen2_vl_input_embeddings",
+        "TestGetInputEmbeddings.qwen2_5_vl_input_embeddings",
+        "TestGetInputEmbeddings.qwen3_vl_input_embeddings",
+        "TestGetInputEmbeddings.qwen3_vl_moe_input_embeddings",
+    ],
+)
+@parametrize("tied", [False, True])
+@parametrize("keep", [None, 0, 1, 3, 8])
+@parametrize("dtype", [mx.float32, mx.bfloat16])
+def test_trailing_logits_preserve_cache_and_hidden_states(case_id, tied, keep, dtype):
+    from mlx_vlm.models.cache import make_prompt_cache
+
+    mx.random.seed(19)
+    if case_id in ("lfm2", "gemma4"):
+        module, config = apc_config(case_id)
+    else:
+        case = next(case for case in DATA["cases"] if case["id"] == case_id)
+        module = importlib.import_module("mlx_vlm.models." + case["module"])
+        config = build_config(module, case["config"])
+    text = getattr(config, "text_config", config)
+    if hasattr(text, "tie_word_embeddings"):
+        text.tie_word_embeddings = tied
+    lm = module.Model(config).language_model
+    lm.set_dtype(dtype)
+    lm.eval()
+    tokens = mx.array([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]])
+    full_cache, tail_cache = make_prompt_cache(lm), make_prompt_cache(lm)
+    full = lm(tokens, cache=full_cache, capture_layer_ids=[0])
+    # Observe the vocabulary projection, not a slice of already-computed logits.
+    head = getattr(lm, "lm_head", lm.model.embed_tokens)
+    method = "as_linear" if isinstance(head, nn.Embedding) else "__call__"
+    project = getattr(type(head), method)
+    widths = []
+
+    def observed(owner, hidden, *args, **kwargs):
+        if owner is head:
+            widths.append(hidden.shape[1])
+        return project(owner, hidden, *args, **kwargs)
+
+    with patch.object(type(head), method, observed):
+        tail = lm(tokens, cache=tail_cache, logits_to_keep=keep, capture_layer_ids=[0])
+    assert widths == [min(keep, 5) if keep else 5]
+    tolerance = 0.02 if dtype == mx.bfloat16 else 1e-5
+    expected = full.logits[:, -keep:] if keep else full.logits
+    assert mx.allclose(tail.logits, expected, atol=tolerance, rtol=tolerance).item()
+    same_arrays(full.hidden_states, tail.hidden_states)
+    same_cache(full_cache, tail_cache)
+    next_tokens = mx.array([[11], [12]])
+    assert mx.array_equal(
+        lm(next_tokens, cache=tail_cache).logits,
+        lm(next_tokens, cache=full_cache).logits,
+    ).item()
+
+
 @parametrize("prefill_step_size", [None, 4, 16, 32])
 def test_lfm_padded_prefill(prefix_manager, prefill_step_size):
     mx.random.seed(19)
