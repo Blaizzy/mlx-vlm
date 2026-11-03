@@ -3,7 +3,7 @@
 
 Built by [Neywa Labs](https://www.neywalabs.ai), the local AI company behind [Nativ](https://runnativ.ai).
 
-[![Ask any image anything. Runs locally on your Mac. Install with pip install mlx-vlm or try it in Nativ.](https://raw.githubusercontent.com/Blaizzy/mlx-vlm/main/docs/assets/mlx-vlm-banner.png)](https://runnativ.ai)
+[![Ask any image anything. Runs locally on your Mac. Install with pip install mlx-vlm or try it in Nativ.](https://raw.githubusercontent.com/Blaizzy/mlx-vlm/6e0fba58459c22d3a64959f6461ce6a247f000a2/docs/assets/mlx-vlm-banner.png)](https://runnativ.ai)
 
 MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VLMs) and Omni Models (VLMs with audio and video support) on your Mac using MLX.
 
