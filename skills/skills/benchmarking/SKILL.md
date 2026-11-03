@@ -26,7 +26,7 @@ Clones upstream `main` and your fork, runs the *identical* bench on both, and jo
 # <feature> perf: upstream main vs fork, random-init tiny <model>, swept over <param>.
 set -euo pipefail
 W=$(mktemp -d)
-git clone -q --depth 1 https://github.com/Blaizzy/mlx-vlm "$W/main"
+git clone -q --depth 1 https://github.com/Neywa-Labs/mlx-vlm "$W/main"
 git clone -q --depth 1 https://github.com/<you>/mlx-vlm   "$W/fork"
 
 cat > "$W/b.py" <<'PY'

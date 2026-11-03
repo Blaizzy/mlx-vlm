@@ -1,9 +1,9 @@
 site_name: MLX-VLM
 site_description: MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VLMs) on your Mac using MLX.
 site_author: Prince Canuma
-repo_name: Blaizzy/mlx-vlm
-site_url: https://Blaizzy.github.io/mlx-vlm
-repo_url: https://github.com/Blaizzy/mlx-vlm
+repo_name: Neywa-Labs/mlx-vlm
+site_url: https://neywa-labs.github.io/mlx-vlm
+repo_url: https://github.com/Neywa-Labs/mlx-vlm
 
 copyright: "Copyright \u00a9 2024 - 2024 Prince Canuma"
 
@@ -64,7 +64,7 @@ markdown_extensions:
 extra:
     social:
         - icon: fontawesome/brands/github
-          link: https://github.com/Blaizzy
+          link: https://github.com/Neywa-Labs
         - icon: fontawesome/brands/twitter
           link: https://twitter.com/Prince_Canuma
     version:
