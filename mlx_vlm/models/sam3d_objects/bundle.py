@@ -27,7 +27,7 @@ tags:
 """
 
 SOURCE_URL = (
-    "https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/sam3d_objects/"
+    "https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/sam3d_objects/"
 )
 
 PERFORMANCE = """
