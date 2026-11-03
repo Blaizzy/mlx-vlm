@@ -983,6 +983,13 @@ class StreamOptions(BaseModel):
 
 class ChatRequest(GenerationRequest, ContinuationOptions):
     messages: List[ChatMessage]
+    max_completion_tokens: Optional[int] = Field(
+        None,
+        description=(
+            "Maximum number of tokens to generate; OpenAI's replacement for "
+            "max_tokens, which it takes precedence over."
+        ),
+    )
     transient_context: Optional[str] = Field(
         None,
         description="Request-local text appended as user context for generation and token counting, excluded from compaction summaries and cached conversation prefixes.",
