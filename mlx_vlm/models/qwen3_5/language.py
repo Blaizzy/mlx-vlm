@@ -13,6 +13,7 @@ from ..base import (
     LanguageModelOutput,
     cache_position_offset,
     create_attention_mask,
+    project_logits,
     scaled_dot_product_attention,
 )
 from ..cache import ArraysCache, KVCache
@@ -1909,10 +1910,13 @@ class LanguageModel(nn.Module):
 
         if skip_logits:
             logits = None
-        elif self.args.tie_word_embeddings:
-            logits = self.model.embed_tokens.as_linear(out)
         else:
-            logits = self.lm_head(out)
+            projection = (
+                self.model.embed_tokens.as_linear
+                if self.args.tie_word_embeddings
+                else self.lm_head
+            )
+            logits = project_logits(out, projection, kwargs.get("logits_to_keep"))
         return LanguageModelOutput(
             logits=logits,
             hidden_states=hidden_sink,
