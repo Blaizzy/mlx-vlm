@@ -42,6 +42,34 @@ class FlexibleBaseModel(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+class ContinuationCheckpoint(BaseModel):
+    """Opaque stream position; clients return this object unchanged to resume."""
+
+    id: str = Field(min_length=1, max_length=64)
+    cursor: int = Field(ge=0, strict=True)
+    content: int = Field(ge=0, strict=True)
+    reasoning: int = Field(ge=0, strict=True)
+    responses: bool
+    idle_timeout_seconds: Optional[float] = Field(
+        None,
+        ge=0,
+        allow_inf_nan=False,
+        description="Idle lifetime after disconnection.",
+    )
+
+
+class ContinuationOptions(FlexibleBaseModel):
+    resumable: bool = Field(
+        False, description="Emit continuation checkpoints during streaming."
+    )
+    continuation: Optional[ContinuationCheckpoint] = Field(
+        None, description="Resume a saved stream on the same endpoint and tenant."
+    )
+    continue_final_message: bool = Field(
+        False, description="Continue the final assistant message as an open prefix."
+    )
+
+
 # OpenAI API Models
 
 
@@ -78,9 +106,16 @@ class ImageGenerationRequest(FlexibleBaseModel):
     prompt_expansion_model: Optional[str] = Field(
         None,
         description=(
-            "Text model path or Hugging Face repo used to expand plain "
-            "Ideogram 4 prompts into structured JSON captions."
+            "Model path or Hugging Face repo for prompt expansion. Flux3 uses "
+            "its default upsampler when omitted; Ideogram 4 expansion is optional."
         ),
+    )
+    upsample_prompt: bool | None = Field(
+        None, description="For Flux3, expand prompts automatically; enabled by default."
+    )
+    boxes: list[dict[str, Any]] | None = Field(
+        None,
+        description="For Flux3, normalized layout boxes passed to the prompt upsampler.",
     )
     response_format: Literal["b64_json", "path"] = Field(
         "b64_json",
@@ -156,6 +191,18 @@ class ImageEditRequest(FlexibleBaseModel):
     use_kv_cache: Optional[bool] = Field(
         None,
         description="Reuse fixed conditioning keys/values when supported by the model.",
+    )
+    prompt_expansion_model: str | None = Field(
+        None,
+        description="For Flux3, override the default prompt upsampler with a model path or Hub ID.",
+    )
+    upsample_prompt: bool | None = Field(
+        None,
+        description="For Flux3, expand the instruction using reference images; enabled by default.",
+    )
+    boxes: list[dict[str, Any]] | None = Field(
+        None,
+        description="For Flux3, normalized layout/edit boxes passed to the prompt upsampler.",
     )
     response_format: Literal["b64_json", "path"] = Field(
         "b64_json",
@@ -275,6 +322,48 @@ class ResponseVideoParam(TypedDict, total=False):
 
 ResizeShapeInput: TypeAlias = Union[Tuple[int], Tuple[int, int]]
 
+
+class ImageProcessingRequest(FlexibleBaseModel):
+    min_pixels: Optional[int] = Field(
+        None,
+        gt=0,
+        description="Minimum image pixel area for supported processors. Overrides the server default.",
+    )
+    max_pixels: Optional[int] = Field(
+        None,
+        gt=0,
+        description="Maximum image pixel area for supported processors. Overrides the server default.",
+    )
+    resize_shape: Optional[ResizeShapeInput] = Field(
+        None,
+        description="Resize images before processing. Provide one integer for square or two dimensions.",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_thinking_alias(cls, values):
+        if isinstance(values, dict) and values.get("enable_thinking") is None:
+            options = values.get("chat_template_kwargs")
+            if isinstance(options, dict) and "enable_thinking" in options:
+                values = {**values, "enable_thinking": options["enable_thinking"]}
+        return values
+
+    @field_validator("resize_shape", mode="before")
+    @classmethod
+    def normalize_resize_shape_field(cls, value):
+        return normalize_resize_shape(value)
+
+    @model_validator(mode="after")
+    def validate_pixel_limits(self):
+        if (
+            self.min_pixels is not None
+            and self.max_pixels is not None
+            and self.min_pixels > self.max_pixels
+        ):
+            raise ValueError("min_pixels must not exceed max_pixels")
+        return self
+
+
 ResponseInputContentParam: TypeAlias = Union[
     ResponseInputTextParam,
     ResponseInputImageParam,
@@ -341,7 +430,19 @@ class CompactionControl(BaseModel):
     compact_threshold: int = Field(..., gt=0)
 
 
-class OpenAIRequest(FlexibleBaseModel):
+class ToolResultNote(BaseModel):
+    tool_call_id: str = Field(..., min_length=1)
+    text: str = Field(..., max_length=8192)
+
+
+class ToolResultContext(BaseModel):
+    """Exact client excerpts, rendered only when their tool result is absent."""
+
+    entries: List[ToolResultNote] = Field(default_factory=list, max_length=256)
+    max_bytes: int = Field(8192, ge=512, le=8192)
+
+
+class OpenAIRequest(ImageProcessingRequest, ContinuationOptions):
     """
     OpenAI-compatible request structure.
     Using this structure : https://github.com/openai/openai-python/blob/main/src/openai/resources/responses/responses.py
@@ -350,6 +451,11 @@ class OpenAIRequest(FlexibleBaseModel):
     input: Union[str, List[Any]] = Field(
         ..., description="Input text or list of chat messages."
     )
+    transient_context: Optional[str] = Field(
+        None,
+        description="Request-local text appended as user context for generation and token counting, excluded from stored history and compaction summaries. Resend the current value on each request.",
+    )
+    tool_result_context: Optional[ToolResultContext] = None
     model: str = Field(..., description="The model to use for generation.")
     adapter_path: Optional[str] = Field(
         None, description="The path to the adapter weights."
@@ -562,6 +668,7 @@ class OpenAIResponse(BaseModel):
     status: Literal["completed", "failed", "in_progress", "incomplete"] = Field(
         ..., description="The status of the response generation"
     )
+    incomplete_details: Optional[dict[str, str]] = None
     error: Optional[OpenAIErrorObject] = Field(
         None,
         description="An error object returned when the model fails to generate a Response",
@@ -594,6 +701,7 @@ class OpenAIResponse(BaseModel):
     usage: OpenAIUsage = Field(
         ..., description="Token usage details"
     )  # we need the model to return stats
+    timings: Optional[GenerationTimings] = None
     user: Optional[str] = Field(
         None, description="A unique identifier representing your end-user"
     )
@@ -682,6 +790,7 @@ class ResponseOutputItemDoneEvent(BaseStreamEvent):
 class ResponseCompletedEvent(BaseStreamEvent):
     type: Literal["response.completed"]
     response: OpenAIResponse
+    timings: Optional[GenerationTimings] = None
 
 
 StreamEvent = Union[
@@ -700,7 +809,7 @@ StreamEvent = Union[
 # Models for /chat/completion endpoint
 
 
-class VLMRequest(FlexibleBaseModel):
+class VLMRequest(ImageProcessingRequest):
     model: str = Field(
         ...,
         description="The path to the local model directory or Hugging Face repo.",
@@ -827,18 +936,9 @@ class VLMRequest(FlexibleBaseModel):
             "the TOP_LOGPROBS_K env var; values above the cap are clamped."
         ),
     )
-    resize_shape: Optional[ResizeShapeInput] = Field(
-        None,
-        description="Resize shape for the image. Provide one integer for square or two for (height, width).",
-    )
     response_format: Optional[Any] = Field(
         None, description="OpenAI-compatible response_format for structured outputs."
     )
-
-    @field_validator("resize_shape", mode="before")
-    @classmethod
-    def normalize_resize_shape_field(cls, value):
-        return normalize_resize_shape(value)
 
 
 class GenerationRequest(VLMRequest):
@@ -881,8 +981,13 @@ class StreamOptions(BaseModel):
     include_usage: bool = False
 
 
-class ChatRequest(GenerationRequest):
+class ChatRequest(GenerationRequest, ContinuationOptions):
     messages: List[ChatMessage]
+    transient_context: Optional[str] = Field(
+        None,
+        description="Request-local text appended as user context for generation and token counting, excluded from compaction summaries and cached conversation prefixes.",
+    )
+    tool_result_context: Optional[ToolResultContext] = None
     context_management: Optional[List[CompactionControl]] = Field(None, max_length=1)
     stream_options: Optional[StreamOptions] = None
     tools: Optional[List[Any]] = Field(None, description="Tools the model may call.")
@@ -955,7 +1060,7 @@ class AnthropicMessageParam(FlexibleBaseModel):
     content: Union[str, List[Any]]
 
 
-class AnthropicRequest(FlexibleBaseModel):
+class AnthropicRequest(ImageProcessingRequest):
     model: str = Field(..., description="The model to use for generation.")
     messages: List[AnthropicMessageParam]
     max_tokens: int = Field(
@@ -1049,6 +1154,14 @@ class ModelInfo(BaseModel):
     created: int
     loaded: bool = Field(
         default=False, description="Whether the model is loaded in this server process."
+    )
+    reasoning_efforts: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Reasoning effort values explicitly allowed by the active/default chat "
+            "template. Null when the values cannot be determined. Independent of "
+            "the runtime thinking_budget."
+        ),
     )
 
 

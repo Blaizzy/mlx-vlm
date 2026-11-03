@@ -7,6 +7,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from ..base import (
     LanguageModelOutput,
+    cache_position_offset,
     create_attention_mask,
     scaled_dot_product_attention,
 )
@@ -14,7 +15,7 @@ from ..cache import KVCache
 from ..mlp import SwiGLUMLP as Qwen3VLMoEMLP
 from ..rope_utils import MRoPERotaryEmbedding
 from ..rope_utils import apply_multimodal_rotary_pos_emb as _apply_mrope
-from ..switch_layers import SwitchGLU
+from ..switch_layers import SwitchGLU, move_expert_projection, stack_expert_projection
 from .config import ModelConfig, TextConfig
 
 
@@ -540,13 +541,11 @@ class LanguageModel(nn.Module):
         if rope_deltas_kw is not None:
             self._rope_deltas = rope_deltas_kw
 
-        # Use ``cache._idx`` — the Python-int token counter — instead of
-        # syncing on ``cache[0].offset``. See Qwen2.5-VL for details.
         cache_offset = 0
         cache_offsets = None
         if cache and cache[0] is not None:
             c0 = cache[0]
-            cache_offset = c0._idx if hasattr(c0, "_idx") else c0.offset
+            cache_offset = cache_position_offset(c0)
             if (
                 isinstance(c0.offset, mx.array)
                 and c0.offset.ndim > 0
@@ -688,11 +687,17 @@ class LanguageModel(nn.Module):
     def sanitize(self, weights):
         for l in range(self.args.num_hidden_layers):
             prefix = f"language_model.model.layers.{l}.mlp"
-            # Only sanitize MoE layer weights
-            if f"{prefix}.experts.up_proj" in weights:
-                for n in ["up_proj", "down_proj", "gate_proj"]:
-                    to_join = weights.pop(f"{prefix}.experts.{n}")
-                    weights[f"{prefix}.switch_mlp.{n}.weight"] = to_join
+            for name in ("up_proj", "down_proj", "gate_proj"):
+                stack_expert_projection(
+                    weights,
+                    f"{prefix}.experts",
+                    name,
+                    f"{prefix}.switch_mlp.{name}",
+                    self.args.num_experts,
+                )
+                move_expert_projection(
+                    weights, f"{prefix}.experts.{name}", f"{prefix}.switch_mlp.{name}"
+                )
         return weights
 
     @property

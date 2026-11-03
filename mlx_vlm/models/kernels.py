@@ -506,8 +506,8 @@ def grid_sample(x, grid):
         int b_stride = H * h_stride;
 
         uint grid_idx = elem / C * 2;
-        float ix = ((grid[grid_idx] + 1) * W - 1) / 2;
-        float iy = ((grid[grid_idx + 1] + 1) * H - 1) / 2;
+        float ix = ((static_cast<float>(grid[grid_idx]) + 1) * W - 1) / 2;
+        float iy = ((static_cast<float>(grid[grid_idx + 1]) + 1) * H - 1) / 2;
 
         int ix_nw = floor(ix);
         int iy_nw = floor(iy);
@@ -521,10 +521,10 @@ def grid_sample(x, grid):
         int ix_se = ix_nw + 1;
         int iy_se = iy_nw + 1;
 
-        T nw = (ix_se - ix)    * (iy_se - iy);
-        T ne = (ix    - ix_sw) * (iy_sw - iy);
-        T sw = (ix_ne - ix)    * (iy    - iy_ne);
-        T se = (ix    - ix_nw) * (iy    - iy_nw);
+        float nw = (ix_se - ix)    * (iy_se - iy);
+        float ne = (ix    - ix_sw) * (iy_sw - iy);
+        float sw = (ix_ne - ix)    * (iy    - iy_ne);
+        float se = (ix    - ix_nw) * (iy    - iy_nw);
 
         int batch_idx = elem / C / gH / gW * b_stride;
         int channel_idx = elem % C;
@@ -540,7 +540,7 @@ def grid_sample(x, grid):
         I_sw = iy_sw >= 0 && iy_sw <= H - 1 && ix_sw >= 0 && ix_sw <= W - 1 ? I_sw : 0;
         I_se = iy_se >= 0 && iy_se <= H - 1 && ix_se >= 0 && ix_se <= W - 1 ? I_se : 0;
 
-        out[elem] = nw * I_nw + ne * I_ne + sw * I_sw + se * I_se;
+        out[elem] = static_cast<T>(nw * I_nw + ne * I_ne + sw * I_sw + se * I_se);
     """
 
     kernel = mx.fast.metal_kernel(
@@ -587,7 +587,7 @@ def _separable_interpolate_mlx(x, iy, wy, ix, wx):
     return _separable_interpolate_axis(y, iy, wy).reshape(N, out_h, out_w, C)
 
 
-def separable_interpolate(x, iy, wy, ix, wx):
+def separable_interpolate(x, iy, wy, ix, wx, *, training=False):
     """
     Separable interpolation of a channel-last tensor from per-axis tap tables.
 
@@ -595,11 +595,12 @@ def separable_interpolate(x, iy, wy, ix, wx):
         x: MLX tensor of shape [B, H, W, C]
         iy, ix: int32 source indices of shape [out_h, taps_y] and [out_w, taps_x]
         wy, wx: float32 weights with the same shapes as iy and ix
+        training: Use differentiable MLX operations instead of the Metal kernel.
 
     Returns:
         float32 tensor of shape [B, out_h, out_w, C]
     """
-    if not _HAS_METAL:
+    if training or not _HAS_METAL:
         return _separable_interpolate_mlx(x, iy, wy, ix, wx)
 
     batch_size, _, _, channels = x.shape

@@ -7,6 +7,11 @@ import mlx.nn as nn
 # --- Vendored from mlx_lm.models.gated_delta (mlx-lm 0.31.3) to drop the
 # --- module-level mlx_lm import so qwen3_5 loads without mlx-lm (and under
 # --- transformers>=5.13). Pure mlx.core/mlx.nn; behaviour is identical.
+# --- The packed Dk=128 kernel is synced from mlx-lm (ml-explore/mlx-lm#1559).
+# --- gated_delta_kernel uses it for multi-token calls (prefill, multi-token
+# --- recurrent updates) with no mask, a scalar gate, Dv % 8 == 0 and fp32 gate
+# --- and state; one-token decode keeps the generic kernel. On the Apple GPUs
+# --- tested its output is bitwise-identical to the generic simd_sum kernel.
 
 
 def _make_gated_delta_kernel(has_mask=False, vectorized=False):
@@ -114,12 +119,135 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False):
     )
 
 
+def _make_gated_delta_packed_kernel():
+    """Make the scalar-gate Dk=128 prefill specialization.
+
+    The generic kernel assigns one 32-lane SIMD-group to each value row. For
+    Dk=128 that leaves every lane with only four state elements and performs
+    two full-SIMD reductions per row and token. This kernel instead packs
+    eight independent value rows into a SIMD-group: four lanes own each row
+    and each lane keeps 32 contiguous state elements in registers.
+
+    The reduction is an explicitly written ascending butterfly (shuffle_xor
+    1,2,4 inside a packed lane, then 1,2 across the four-lane row group), the
+    order simd_sum lowers to on current Apple GPUs, so y and the state are
+    bit-identical to the generic kernel there (tests/test_gated_delta.py).
+    Synced from mlx-lm (ml-explore/mlx-lm#1559), which also pins it against an
+    explicit-tree comparator kernel.
+    """
+    if not mx.metal.is_available():
+        return None
+
+    source = r"""
+        constexpr int lanes_per_row = 4;
+        constexpr int rows_per_simdgroup = 32 / lanes_per_row;
+        constexpr int values_per_lane = Dk / lanes_per_row;
+        constexpr int partials_per_lane = values_per_lane / 4;
+
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / Hv;
+        auto hv_idx = n % Hv;
+        auto hk_idx = hv_idx / (Hv / Hk);
+
+        auto lane = thread_index_in_simdgroup;
+        auto row_in_simdgroup = lane / lanes_per_row;
+        auto lane_in_row = lane & (lanes_per_row - 1);
+        auto row_group = thread_position_in_grid.y;
+        auto dv_idx = row_group * rows_per_simdgroup + row_in_simdgroup;
+
+        // q, k: [B, T, Hk, Dk]
+        auto q_ = q + (b_idx * T * Hk + hk_idx) * Dk + lane_in_row * values_per_lane;
+        auto k_ = k + (b_idx * T * Hk + hk_idx) * Dk + lane_in_row * values_per_lane;
+
+        // v, y: [B, T, Hv, Dv]
+        auto v_ = v + (b_idx * T * Hv + hv_idx) * Dv;
+        y += (b_idx * T * Hv + hv_idx) * Dv;
+
+        // state_in, state_out: [B, Hv, Dv, Dk]
+        auto i_state = state_in + (n * Dv + dv_idx) * Dk + lane_in_row * values_per_lane;
+        auto o_state = state_out + (n * Dv + dv_idx) * Dk + lane_in_row * values_per_lane;
+
+        float state[values_per_lane];
+        for (int i = 0; i < values_per_lane; ++i) {
+          state[i] = static_cast<float>(i_state[i]);
+        }
+
+        // g, beta: [B, T, Hv]
+        auto g_ = g + b_idx * T * Hv;
+        auto beta_ = beta + b_idx * T * Hv;
+
+        for (int t = 0; t < T; ++t) {
+          float gt = static_cast<float>(g_[hv_idx]);
+
+          // Partials mirror the generic kernel: each 4-element chain is one
+          // original lane's sequential accumulation.
+          float part[partials_per_lane];
+          for (int pb = 0; pb < partials_per_lane; ++pb) {
+            float acc = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+              int e = pb * 4 + i;
+              state[e] = state[e] * gt;
+              acc += state[e] * static_cast<float>(k_[e]);
+            }
+            part[pb] = acc;
+          }
+          // Butterfly levels xor 1,2,4 stay inside this lane (commutative
+          // pairwise tree); levels xor 8,16 become the row-group shuffles.
+          float kv_mem =
+              ((part[0] + part[1]) + (part[2] + part[3])) +
+              ((part[4] + part[5]) + (part[6] + part[7]));
+          kv_mem += simd_shuffle_xor(kv_mem, 1);
+          kv_mem += simd_shuffle_xor(kv_mem, 2);
+
+          auto delta =
+              (static_cast<float>(v_[dv_idx]) - kv_mem) *
+              static_cast<float>(beta_[hv_idx]);
+
+          for (int pb = 0; pb < partials_per_lane; ++pb) {
+            float acc = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+              int e = pb * 4 + i;
+              state[e] = state[e] + static_cast<float>(k_[e]) * delta;
+              acc += state[e] * static_cast<float>(q_[e]);
+            }
+            part[pb] = acc;
+          }
+          float out =
+              ((part[0] + part[1]) + (part[2] + part[3])) +
+              ((part[4] + part[5]) + (part[6] + part[7]));
+          out += simd_shuffle_xor(out, 1);
+          out += simd_shuffle_xor(out, 2);
+          if (lane_in_row == 0) {
+            y[dv_idx] = static_cast<InT>(out);
+          }
+
+          q_ += Hk * Dk;
+          k_ += Hk * Dk;
+          v_ += Hv * Dv;
+          y += Hv * Dv;
+          g_ += Hv;
+          beta_ += Hv;
+        }
+
+        for (int i = 0; i < values_per_lane; ++i) {
+          o_state[i] = static_cast<StT>(state[i]);
+        }
+    """
+    return mx.fast.metal_kernel(
+        name="gated_delta_step_packed_btree",
+        input_names=["q", "k", "v", "g", "beta", "state_in", "T"],
+        output_names=["y", "state_out"],
+        source=source,
+    )
+
+
 _gated_delta_kernel = _make_gated_delta_kernel(has_mask=False, vectorized=False)
 _gated_delta_kernel_masked = _make_gated_delta_kernel(has_mask=True, vectorized=False)
 _gated_delta_kernel_vec = _make_gated_delta_kernel(has_mask=False, vectorized=True)
 _gated_delta_kernel_vec_masked = _make_gated_delta_kernel(
     has_mask=True, vectorized=True
 )
+_gated_delta_kernel_packed = _make_gated_delta_packed_kernel()
 
 
 @mx.compile
@@ -180,7 +308,25 @@ def gated_delta_kernel(
     Hv, Dv = v.shape[2:]
     input_type = q.dtype
     state_type = state.dtype
-    if g.ndim == 4:
+    grid = (32, Dv, B * Hv)
+    threadgroup = (32, 4, 1)
+    if (
+        _gated_delta_kernel_packed is not None
+        and T > 1  # one-token decode stays on the generic kernel
+        and mask is None
+        and g.ndim == 3
+        and Dk == 128
+        and Dv % 8 == 0
+        and g.dtype == mx.float32
+        and state.dtype == mx.float32
+    ):
+        # Eight value rows per SIMD-group, four lanes per row (see
+        # _make_gated_delta_packed_kernel).
+        kernel = _gated_delta_kernel_packed
+        inputs = [q, k, v, g, beta, state, T]
+        grid = (32, Dv // 8, B * Hv)
+        threadgroup = (32, 2, 1)
+    elif g.ndim == 4:
         kernel = _gated_delta_kernel_vec
         inputs = [q, k, v, g, beta, state, T]
         if mask is not None:
@@ -203,8 +349,8 @@ def gated_delta_kernel(
             ("Hk", Hk),
             ("Hv", Hv),
         ],
-        grid=(32, Dv, B * Hv),
-        threadgroup=(32, 4, 1),
+        grid=grid,
+        threadgroup=threadgroup,
         output_shapes=[(B, T, Hv, Dv), state.shape],
         output_dtypes=[input_type, state_type],
     )

@@ -6,7 +6,7 @@ import numpy as np
 
 from ..attention import VisionAttention as Attention
 from ..base import check_array_shape
-from ..interpolate import resize_bilinear
+from ..interpolate import resize_bilinear_nhwc
 from ..mlp import GELUMLP as MLP
 from .config import VisionConfig
 
@@ -116,6 +116,8 @@ class VisionEmbeddings(nn.Module):
         positional_embeddings: mx.array,
         spatial_shapes: mx.array,
         max_length: int,
+        *,
+        training: bool = False,
     ) -> mx.array:
         """
         Resize positional embeddings to image-specific size and pad to a fixed size.
@@ -127,6 +129,8 @@ class VisionEmbeddings(nn.Module):
                 Spatial shapes of shape (batch_size, 2) to resize the positional embeddings to
             max_length (`int`):
                 Maximum length of the positional embeddings to pad resized positional embeddings to
+            training (`bool`):
+                Use differentiable MLX operations when training the vision tower
 
         Returns:
             `mx.array`: Embeddings of shape (batch_size, max_length, embed_dim)
@@ -139,30 +143,26 @@ class VisionEmbeddings(nn.Module):
             (batch_size, max_length, embed_dim)
         ).astype(source_dtype)
 
-        # (height, width, embed_dim) -> (1, embed_dim, height, width) for interpolation
-        positional_embeddings = positional_embeddings.transpose(2, 0, 1).reshape(
-            1, embed_dim, -1
-        )
-
-        # Upcast to float32 on CPU because antialias is not supported for bfloat16/float16 on CPU
-        if positional_embeddings.device.type == "cpu":
-            positional_embeddings = positional_embeddings.astype(mx.float32)
+        # (height, width, embed_dim) -> (1, height, width, embed_dim) for interpolation.
+        # Siglip2 resizes with bilinear + antialias, so use the ATen-matched helper;
+        # the legacy channel-first one antialiases with a Gaussian blur instead of
+        # PyTorch's triangle filter. Upcast to float32 because antialias is not
+        # supported for bfloat16/float16.
+        positional_embeddings = positional_embeddings[None].astype(mx.float32)
 
         for i in range(batch_size):
-            # (1, dim, height, width) -> (1, dim, target_height, target_width)
+            # (1, height, width, dim) -> (1, target_height, target_width, dim)
             height, width = spatial_shapes[i].tolist()
-            # Then upsample width dimension
-            resized_embeddings = resize_bilinear(
+            resized_embeddings = resize_bilinear_nhwc(
                 positional_embeddings,
                 (height, width),
                 align_corners=False,
                 antialias=True,
+                training=training,
             )
 
-            # (1, dim, target_height, target_width) -> (target_height * target_width, dim)
-            resized_embeddings = resized_embeddings.reshape(
-                embed_dim, height * width
-            ).transpose(0, 1)
+            # (1, target_height, target_width, dim) -> (target_height * target_width, dim)
+            resized_embeddings = resized_embeddings.reshape(height * width, embed_dim)
 
             # Cast to original dtype
             resized_embeddings = resized_embeddings.astype(source_dtype)
@@ -190,7 +190,10 @@ class VisionEmbeddings(nn.Module):
             )
 
             resized_positional_embeddings = self.resize_positional_embeddings(
-                positional_embeddings, spatial_shapes, max_length=x.shape[1]
+                positional_embeddings,
+                spatial_shapes,
+                max_length=x.shape[1],
+                training=self.training,
             )
 
             # Add positional embeddings to patch embeddings

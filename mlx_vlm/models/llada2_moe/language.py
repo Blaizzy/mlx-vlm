@@ -10,7 +10,7 @@ from ..activations import swiglu
 from ..base import LanguageModelOutput, scaled_dot_product_attention
 from ..cache import KVCache, StaticPrefixKVCache
 from ..diffusion_visualizer import DiffusionUnmaskingVisualizer
-from ..switch_layers import SwitchGLU
+from ..switch_layers import EXPERT_WEIGHT_SUFFIXES, SwitchGLU
 from .config import ModelConfig
 
 
@@ -710,7 +710,7 @@ class LanguageModel(nn.Module):
                 continue
             prefix = f"language_model.model.layers.{layer_idx}.mlp"
             for module in ("gate_proj", "down_proj", "up_proj"):
-                for suffix in ("weight", "scales", "biases"):
+                for suffix in EXPERT_WEIGHT_SUFFIXES:
                     first_key = f"{prefix}.experts.0.{module}.{suffix}"
                     if first_key not in weights:
                         continue

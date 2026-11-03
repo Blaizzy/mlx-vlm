@@ -708,7 +708,9 @@ def stream_diffusion_generate(
                     media_token_ids,
                 ),
             )
-            checkpoint_lengths = apc.checkpoint_lengths(full_token_ids, media_token_ids)
+            checkpoint_lengths = apc.checkpoint_lengths(
+                full_token_ids, media_token_ids, extra_hash=int(apc_extra_hash or 0)
+            )
             if apc_hit is not None:
                 cached_tokens = int(apc_hit.get("prefix_len", 0) or 0)
 
