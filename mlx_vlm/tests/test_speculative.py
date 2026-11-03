@@ -268,7 +268,8 @@ def test_mistral_dspark_ragged_rollback_includes_shared_and_index_only_caches():
 
 @parametrize("cancel", [False, True])
 @parametrize("sampling", ["greedy", "random", "positioned"])
-def test_mistral_dspark_admits_requests_while_batch_is_active(cancel, sampling):
+@parametrize("phased", [False, True])
+def test_mistral_dspark_admits_requests_while_batch_is_active(cancel, sampling, phased):
     from types import SimpleNamespace
 
     from mlx_vlm.generate.ar import BatchGenerator
@@ -314,7 +315,9 @@ def test_mistral_dspark_admits_requests_while_batch_is_active(cancel, sampling):
         for _ in range(100):
             if not generator.has_work:
                 break
-            _, responses = generator.next()
+            responses = generator.decode_step() if phased else generator.next()[1]
+            if phased:
+                generator.prefill_step()
             for response in responses:
                 if response.token is not None:
                     outputs[response.uid].append(response.token)
@@ -339,8 +342,9 @@ def test_mistral_dspark_admits_requests_while_batch_is_active(cancel, sampling):
 @parametrize("family", ["dflash2", "dspark-lfm2", "mistral", "gemma"])
 @parametrize("pause_after", [1, 8])
 @parametrize("sampling", [False, True])
+@parametrize("phased", [False, True])
 def test_speculative_row_resume_preserves_state_and_other_requests(
-    family, pause_after, sampling
+    family, pause_after, sampling, phased
 ):
     from mlx_vlm.sample_utils import make_sampler
 
@@ -380,7 +384,9 @@ def test_speculative_row_resume_preserves_state_and_other_requests(
     )
 
     def step():
-        _, responses = generator.next()
+        responses = generator.decode_step() if phased else generator.next()[1]
+        if phased:
+            generator.prefill_step()
         for response in responses:
             if response.token is not None:
                 outputs[response.uid].append(response.token)
@@ -647,7 +653,10 @@ def test_mtp_ragged_acceptance_respects_remaining_token_budgets(monkeypatch):
 @parametrize("family", ["qwen", "glm", "deepseek", "gemma"])
 @parametrize("pause_after", [1, 8])
 @parametrize("sampling", [False, True, "positioned"])
-def test_mtp_shared_resume_preserves_rows(family, pause_after, sampling, monkeypatch):
+@parametrize("phased", [False, True])
+def test_mtp_shared_resume_preserves_rows(
+    family, pause_after, sampling, monkeypatch, phased
+):
     from mlx_vlm.models.cache import cache_nbytes
     from mlx_vlm.sample_utils import make_sampler
     from mlx_vlm.server.generation import _PositionedTargetSampler
@@ -696,7 +705,9 @@ def test_mtp_shared_resume_preserves_rows(family, pause_after, sampling, monkeyp
     )
 
     def step():
-        _, responses = generator.next()
+        responses = generator.decode_step() if phased else generator.next()[1]
+        if phased:
+            generator.prefill_step()
         for response in responses:
             if response.token is not None:
                 outputs[response.uid].append(response.token)
