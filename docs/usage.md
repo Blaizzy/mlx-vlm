@@ -106,24 +106,12 @@ records and their saved request/text even when no new requests arrive. Active
 streams are exempt; closing a stream starts its inactivity window. Expiring an
 older handle does not release a decoder still referenced by another handle.
 Server shutdown clears the remaining records and retained sessions.
-The autoregressive worker limits paused target-cache buffers to 1 GiB in aggregate
+The worker limits paused target-cache buffers to 1 GiB in aggregate
 (`MLX_VLM_CONTINUATION_CACHE_BYTES`), evicting the oldest paused state first.
 A restart, model unload, eviction or expired checkpoint requires regeneration;
 unavailable checkpoints return HTTP 409 rather than silently restarting the
 answer. Authentication and tenant isolation match the original request.
-Diffusion models exposing `language_model.generate_blocks` also support
-checkpoints. LLaDA2, Nemotron in diffusion mode, and DiffusionGemma pause after
-the current block finishes denoising. The server retains their canvas, caches,
-loop position, and request-owned random keys; resume continues the next block
-without reconstructing the prompt. Other requests can run while one is paused,
-but diffusion requests still execute individually, not in a shared decode batch.
-The synchronous model `generate` API continues to support its existing callbacks.
-
-Diffusion state stays in memory until completion, expiry, handle eviction, or
-model unload; it cannot survive a server restart. The autoregressive paused-cache
-byte limit does not apply to these live diffusion iterators. APC can still warm
-the initial prompt where supported, but does not store the paused diffusion
-state. Pausing inside an unfinished denoising block is not supported.
+Diffusion models do not currently support inference checkpoints.
 
 For older transcripts without a checkpoint, `"continue_final_message": true`
 continues an unfinished final assistant message using its template prefix.
