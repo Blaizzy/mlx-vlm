@@ -3662,6 +3662,11 @@ def test_filter_batch_keeps_padding_and_positions():
 def test_speculative_dispatch_errors_and_hidden_state():
     with pytest.raises(ValueError):
         speculative.get_speculative_rounds_batch("nope")
+    for kind in ("eagle3", "nope"):
+        with pytest.raises(ValueError, match="Shared speculative batches"):
+            speculative.make_speculative_batch(
+                None, None, [], None, draft_kind=kind, first_bonus=None, sampler=None
+            )
     hidden = [mx.zeros((1, 1, 4)), mx.ones((1, 1, 4))]
     assert (
         speculative.speculative_hidden_state("mtp", NS(hidden_states=hidden))

@@ -29,6 +29,7 @@ from ..sample_utils import (
 )
 from ..speculative.utils import (
     SpeculativePrefill,
+    make_speculative_batch,
     make_speculative_prompt_cache,
     run_speculative_rounds,
     run_speculative_server_rounds,
@@ -1719,40 +1720,24 @@ class SpeculativeGenerationBatch:
         self._refresh_uids()
 
     def _ensure_batch_state(self):
-        if self._batch_state is None:
-            if self.draft_kind == "mtp":
-                from ..speculative.mtp import MTPBatch
-
-                self._batch_state = MTPBatch(
-                    self.model,
-                    self.draft_model,
-                    self.prompt_cache,
-                    self.hidden,
-                    self.first_tokens,
-                    self.draft_block_size,
-                    self.sampler,
-                    self.token_dtype,
-                    self.greedy_sampling,
-                    shared_kv_states=self.shared_kv_states,
-                    prompt_tokens=self.prompt_tokens,
-                    rope_deltas=getattr(self, "_rope_deltas", None),
-                )
-                self.hidden = self.shared_kv_states = self.prompt_tokens = None
-                return
-            from ..speculative.dflash import DFlashBatch
-
-            self._batch_state = DFlashBatch(
-                self.model,
-                self.draft_model,
-                self.prompt_cache,
-                self.hidden,
-                self.first_tokens[mx.array(self._batch_rows, mx.int32)],
-                self.draft_block_size,
-                self.sampler,
-                self.token_dtype,
-                self.greedy_sampling,
-            )
-            self.hidden = None
+        if self._batch_state is not None:
+            return
+        self._batch_state = make_speculative_batch(
+            self.model,
+            self.draft_model,
+            self.prompt_cache,
+            self.hidden,
+            draft_kind=self.draft_kind,
+            first_bonus=self.first_tokens,
+            draft_block_size=self.draft_block_size,
+            sampler=self.sampler,
+            token_dtype=self.token_dtype,
+            greedy_sampling=self.greedy_sampling,
+            shared_kv_states=self.shared_kv_states,
+            prompt_tokens=self.prompt_tokens,
+            rope_deltas=getattr(self, "_rope_deltas", None),
+        )
+        self.hidden = self.shared_kv_states = self.prompt_tokens = None
 
     def _prune_batch_state(self):
         keep = [i for i, row in enumerate(self._batch_rows) if not self._finished[row]]
