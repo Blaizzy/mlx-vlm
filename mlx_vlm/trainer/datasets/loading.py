@@ -90,6 +90,8 @@ class CacheDataset:
         if isinstance(processed, dict):
             if "input_ids" in processed:
                 return int(processed["input_ids"].shape[-1])
+            if "inputs" in processed and "input_ids" in processed["inputs"]:
+                return int(processed["inputs"]["input_ids"].shape[-1])
             if "chosen" in processed:
                 return max(
                     int(processed[key]["input_ids"].shape[-1])

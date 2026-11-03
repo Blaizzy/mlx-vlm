@@ -104,7 +104,7 @@ class ViTPatchGenerator(nn.Module):
         if (self.num_rows, self.num_cols) == input_dims:
             pos_embed = self.pos_embed
         else:
-            pos_embed = self.pos_embed.reshape(
+            pos_embed = self.pos_embed.astype(mx.float32).reshape(
                 1, self.num_rows, self.num_cols, self.embed_dim
             )[0]
 

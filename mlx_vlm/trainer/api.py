@@ -9,6 +9,7 @@ from mlx_vlm.trainer.common.config import CoreTrainingArgs
 from mlx_vlm.trainer.common.task import TrainingTask
 from mlx_vlm.trainer.vlm.config import VLMTrainingArgs
 from mlx_vlm.trainer.vlm.dpo.config import DPOTrainingArgs
+from mlx_vlm.trainer.vlm.grpo.config import GRPOTrainingArgs
 from mlx_vlm.trainer.vlm.orpo.config import ORPOTrainingArgs
 
 # Explicit supported combinations, without importing optional modality libraries.
@@ -16,6 +17,7 @@ TASKS = {
     ("vlm", "sft"): ("vlm.sft.runtime", VLMTrainingArgs),
     ("vlm", "dpo"): ("vlm.dpo.trainer", DPOTrainingArgs),
     ("vlm", "orpo"): ("vlm.orpo.runtime", ORPOTrainingArgs),
+    ("vlm", "grpo"): ("vlm.grpo.trainer", GRPOTrainingArgs),
 }
 
 
@@ -34,9 +36,12 @@ class Trainer:
     """Train/evaluate loaded MLX models from raw rows or prepared datasets.
 
     Provide ``processing_class`` for VLMs, and a separate frozen
-    ``reference_model`` for DPO. Configure adapters/dtype on the model before
+    ``reference_model`` for DPO or GRPO with KL regularization. GRPO accepts
+    batched ``reward_funcs`` and optional ``reward_weights``. Configure adapters/dtype on the model before
     construction. ``prepared=True`` skips preprocessing for the low-level API.
     A custom ``TrainingTask`` extends this API without editing the engine.
+    Training requires an explicit MLX ``optimizer``; configure its learning
+    rate, schedule, and weight decay on the optimizer itself.
     """
 
     def __init__(
@@ -51,6 +56,8 @@ class Trainer:
         processing_class=None,
         optimizer=None,
         reference_model=None,
+        reward_funcs=None,
+        reward_weights=None,
         dataset_config=None,
         prepared=False,
         training_callback=None,
@@ -65,6 +72,8 @@ class Trainer:
                     algorithm = "dpo"
                 elif isinstance(args, ORPOTrainingArgs):
                     algorithm = "orpo"
+                elif isinstance(args, GRPOTrainingArgs):
+                    algorithm = "grpo"
             algorithm, (module_name, config_type) = task_spec(task, algorithm)
             args = args or config_type()
             if not isinstance(args, config_type):
@@ -73,10 +82,14 @@ class Trainer:
             if not prepared and processing_class is None:
                 raise ValueError(f"{task} raw datasets require processing_class.")
             options = {}
-            if algorithm == "dpo":
+            if algorithm in {"dpo", "grpo"}:
                 options["reference_model"] = reference_model
             elif reference_model is not None:
-                raise ValueError("reference_model is only used by DPO.")
+                raise ValueError("reference_model is only used by DPO or GRPO.")
+            if algorithm == "grpo":
+                options.update(reward_funcs=reward_funcs, reward_weights=reward_weights)
+            elif reward_funcs is not None or reward_weights is not None:
+                raise ValueError("Reward callbacks are only used by GRPO.")
             if task == "vlm" and processing_class is not None:
                 tokenizer = getattr(processing_class, "tokenizer", processing_class)
                 pad_id = getattr(tokenizer, "pad_token_id", None)
@@ -120,25 +133,14 @@ class Trainer:
 
     def train(self) -> dict:
         """Train configured parameters and return final loss/throughput metrics."""
-        import mlx.optimizers as optim
-
         from mlx_vlm.trainer.common.engine import train
 
         if self.train_dataset is None:
             raise ValueError("train() requires train_dataset.")
         if self.optimizer is None:
-            cls = {
-                "adam": optim.Adam,
-                "adamw": optim.AdamW,
-                "sgd": optim.SGD,
-                "muon": optim.Muon,
-            }[self.args.optimizer]
-            options = (
-                {"weight_decay": self.args.weight_decay}
-                if self.args.optimizer in {"adamw", "muon"}
-                else {}
+            raise ValueError(
+                "train() requires optimizer. Pass an MLX optimizer to Trainer."
             )
-            self.optimizer = cls(learning_rate=self.args.learning_rate, **options)
         self.log_history.clear()
         self.metrics = train(
             self.model,

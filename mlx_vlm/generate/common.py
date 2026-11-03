@@ -35,6 +35,62 @@ DEFAULT_DIFFUSION_MAX_DENOISING_STEPS = 48
 generation_stream = mx.new_thread_local_stream(mx.default_device())
 
 
+class DiffusionRNG:
+    """Request-owned PRNG keys using the same split order as MLX's global RNG."""
+
+    def __init__(self, seed=None):
+        if seed is None:
+            seed = int(mx.random.randint(0, 2**31 - 1).item())
+        self.key = mx.random.key(seed)
+
+    def __call__(self):
+        self.key, key = mx.random.split(self.key)
+        return key
+
+
+def consume_generator(iterator):
+    """Drain a generator and return its final value, closing it on failure."""
+    try:
+        while True:
+            try:
+                next(iterator)
+            except StopIteration as done:
+                return done.value
+    finally:
+        iterator.close()
+
+
+def resolve_sampling_defaults(
+    config,
+    *,
+    temperature: Optional[float] = None,
+    top_p: Optional[float] = None,
+    top_k: Optional[int] = None,
+):
+    """Resolve explicit values, then checkpoint defaults, then library defaults.
+
+    ``do_sample=False`` makes the checkpoint's default temperature greedy;
+    an explicit temperature (or a caller-supplied sampler) still takes precedence.
+    Missing and null checkpoint fields both use the library defaults.
+    """
+
+    def config_value(name, default):
+        value = getattr(config, name, None)
+        return default if value is None else value
+
+    if temperature is None:
+        temperature = (
+            0.0
+            if config_value("do_sample", None) is False
+            else config_value("temperature", DEFAULT_TEMPERATURE)
+        )
+    return (
+        temperature,
+        config_value("top_p", DEFAULT_TOP_P) if top_p is None else top_p,
+        config_value("top_k", DEFAULT_TOP_K) if top_k is None else top_k,
+    )
+
+
 def _policy_enabled(policy) -> bool:
     return bool(getattr(policy, "enabled", policy))
 

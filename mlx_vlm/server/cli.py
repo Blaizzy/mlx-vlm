@@ -12,13 +12,18 @@ from ..generate import (
 )
 from .generation import (
     DEFAULT_ENABLE_THINKING,
+    GenerationArguments,
     get_log_progress_interval,
+    get_server_max_pixels,
     get_server_max_tokens,
+    get_server_min_pixels,
     get_server_thinking_budget,
     get_server_thinking_end_token,
     get_server_thinking_start_token,
 )
 from .model_discovery import MODEL_PATHS_ENV
+from .runtime import runtime
+from .runtime_config import RuntimeConfig
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
@@ -56,6 +61,12 @@ def main():
         type=str,
         default=None,
         help="Pre-load an image generation model at startup.",
+    )
+    parser.add_argument(
+        "--mesh-model",
+        type=str,
+        default=None,
+        help="Pre-load an image-to-3D model for /v1/meshes.",
     )
     parser.add_argument(
         "--tts-model",
@@ -109,10 +120,23 @@ def main():
         help="Max number of cached vision features (default: 20).",
     )
     parser.add_argument(
+        "--min-pixels",
+        type=int,
+        default=get_server_min_pixels(),
+        help="Default minimum image pixel area for supported processors; requests may override it.",
+    )
+    parser.add_argument(
+        "--max-pixels",
+        type=int,
+        default=get_server_max_pixels(),
+        help="Default maximum image pixel area for supported processors; requests may override it.",
+    )
+    parser.add_argument(
         "--prefill-step-size",
         type=int,
         default=DEFAULT_PREFILL_STEP_SIZE,
-        help="Tokens per prefill step (default: %(default)s).",
+        help="Prompt-token budget per batch step, including padding "
+        "(default: %(default)s). Lower values reduce pauses in active streams.",
     )
     parser.add_argument(
         "--log-progress-interval",
@@ -298,6 +322,14 @@ def main():
         help="Set the logging level (default: INFO).",
     )
     args = parser.parse_args()
+    try:
+        GenerationArguments(min_pixels=args.min_pixels, max_pixels=args.max_pixels)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.min_pixels is not None:
+        os.environ["MLX_VLM_MIN_PIXELS"] = str(args.min_pixels)
+    if args.max_pixels is not None:
+        os.environ["MLX_VLM_MAX_PIXELS"] = str(args.max_pixels)
     if args.trust_remote_code:
         os.environ["MLX_TRUST_REMOTE_CODE"] = "true"
     if args.model:
@@ -306,6 +338,8 @@ def main():
             os.environ["MLX_VLM_PRELOAD_ADAPTER"] = args.adapter_path
     if args.image_model:
         os.environ["MLX_VLM_PRELOAD_IMAGE_MODEL"] = args.image_model
+    if args.mesh_model:
+        os.environ["MLX_VLM_PRELOAD_MESH_MODEL"] = args.mesh_model
     if args.tts_model:
         os.environ["MLX_VLM_PRELOAD_TTS_MODEL"] = args.tts_model
     if args.stt_model:
@@ -369,6 +403,9 @@ def main():
     )
     logger.setLevel(log_level)
 
+    # The runtime was imported before CLI flags populated the environment.
+    # Capture the final startup values for live settings and replace/reset.
+    runtime.config = RuntimeConfig.from_env()
     uvicorn.run(
         "mlx_vlm.server:app",
         host=args.host,

@@ -587,11 +587,10 @@ class KVCache(_BaseCache):
         return n
 
     def extract(self, idx):
-        cache = KVCache()
         if self.keys is None:
             if idx not in (0, -1):
                 raise IndexError("KVCache row index out of range")
-            return cache
+            return type(self).from_state((None, None), self.meta_state)
 
         batch_size = int(self.keys.shape[0])
         if idx < 0:
@@ -601,10 +600,12 @@ class KVCache(_BaseCache):
                 f"KVCache row index {idx} out of range for batch size {batch_size}"
             )
 
-        cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, : self.offset, :])
-        cache.values = mx.contiguous(self.values[idx : idx + 1, :, : self.offset, :])
-        cache.offset = self.offset
-        return cache
+        # Subclasses can retain a bounded window at a larger logical offset.
+        # Restore their metadata as well as the tensors instead of downcasting.
+        keys, values = self.state
+        keys = mx.contiguous(keys[idx : idx + 1])
+        values = mx.contiguous(values[idx : idx + 1])
+        return type(self).from_state((keys, values), self.meta_state)
 
     def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
         quant_cache = QuantizedKVCache(group_size=group_size, bits=bits)
@@ -802,7 +803,14 @@ class RotatingKVCache(_BaseCache):
             window_size = window_size or self.max_size
             offset = min(self.max_size - 1, self.offset)
             if offset + N > window_size or return_array:
-                return create_causal_mask(N, offset, window_size=window_size)
+                if self.keep == 0 or window_size != self.max_size:
+                    return create_causal_mask(N, offset, window_size=window_size)
+                # The retained prefix shares the cache budget with recent tokens.
+                rinds = mx.arange(offset + N)[None]
+                linds = mx.arange(offset, offset + N)[:, None]
+                return (linds >= rinds) & (
+                    (rinds < self.keep) | (linds < rinds + window_size - self.keep)
+                )
             else:
                 return "causal"
         else:
@@ -1721,6 +1729,13 @@ class BatchKVCache(_BaseCache):
 
     def extract(self, idx):
         cache = KVCache()
+        batch_size = self.offset.size
+        if idx < 0:
+            idx += batch_size
+        if idx < 0 or idx >= batch_size:
+            raise IndexError("BatchKVCache row index out of range")
+        if self.keys is None:
+            return cache
         padding = self.left_padding[idx].item()
         cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, padding : self._idx])
         cache.values = mx.contiguous(self.values[idx : idx + 1, :, padding : self._idx])

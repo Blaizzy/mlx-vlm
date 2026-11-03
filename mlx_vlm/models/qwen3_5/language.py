@@ -1,3 +1,4 @@
+import math
 from functools import lru_cache, partial
 from typing import Any, List, Optional
 
@@ -10,7 +11,9 @@ from ...speculative.cache_state import (
 from ..activations import swiglu
 from ..base import (
     LanguageModelOutput,
+    cache_position_offset,
     create_attention_mask,
+    project_logits,
     scaled_dot_product_attention,
 )
 from ..cache import ArraysCache, KVCache
@@ -30,6 +33,7 @@ class Qwen3_5RotaryEmbedding(MRoPERotaryEmbedding):
         max_position_embeddings=2048,
         base=10000,
         mrope_section=[11, 11, 0],
+        rope_parameters=None,
     ):
         super().__init__(
             dim,
@@ -38,7 +42,61 @@ class Qwen3_5RotaryEmbedding(MRoPERotaryEmbedding):
             mrope_section=mrope_section,
             style="interleaved",
         )
+        rope_type = (rope_parameters or {}).get("type") or (rope_parameters or {}).get(
+            "rope_type"
+        )
+        if rope_type == "yarn":
+            self._inv_freq, self.attention_scaling = _yarn_inv_freq(
+                dim, base, rope_parameters, max_position_embeddings
+            )
+            # The fused MRoPE kernel ignores attention_scaling; the cos/sin path
+            # scales only the rotary slice of q and k, as HF does.
+            self.fused_apply = False
+            self._compiled_apply = None
         mx.eval(self.inv_freq)
+
+
+def _yarn_inv_freq(dim, base, rope_parameters, max_position_embeddings):
+    # HF modeling_rope_utils._compute_yarn_parameters (truncate=True default).
+    factor = float(rope_parameters["factor"])
+    original_max = rope_parameters.get(
+        "original_max_position_embeddings", max_position_embeddings
+    )
+    beta_fast = rope_parameters.get("beta_fast") or 32
+    beta_slow = rope_parameters.get("beta_slow") or 1
+
+    def get_mscale(scale, mscale=1):
+        return 1.0 if scale <= 1 else 0.1 * mscale * math.log(scale) + 1.0
+
+    attention_factor = rope_parameters.get("attention_factor")
+    if attention_factor is None:
+        mscale = rope_parameters.get("mscale")
+        mscale_all_dim = rope_parameters.get("mscale_all_dim")
+        if mscale and mscale_all_dim:
+            attention_factor = get_mscale(factor, mscale) / get_mscale(
+                factor, mscale_all_dim
+            )
+        else:
+            attention_factor = get_mscale(factor)
+
+    def correction_dim(num_rotations):
+        return (dim * math.log(original_max / (num_rotations * 2 * math.pi))) / (
+            2 * math.log(base)
+        )
+
+    low, high = correction_dim(beta_fast), correction_dim(beta_slow)
+    if rope_parameters.get("truncate", True):
+        low, high = math.floor(low), math.ceil(high)
+    low, high = max(low, 0), min(high, dim - 1)
+    if low == high:
+        high += 0.001
+    ramp = mx.clip((mx.arange(dim // 2, dtype=mx.float32) - low) / (high - low), 0, 1)
+    extrapolation = 1 - ramp
+    pos_freqs = base ** (mx.arange(0, dim, 2).astype(mx.float32) / dim)
+    inv_freq = (1.0 / (factor * pos_freqs)) * (1 - extrapolation) + (
+        1.0 / pos_freqs
+    ) * extrapolation
+    return inv_freq, float(attention_factor)
 
 
 def apply_multimodal_rotary_pos_emb(q, k, cos, sin, unqueeze_dim=1):
@@ -919,6 +977,7 @@ class Qwen3_5Attention(nn.Module):
             max_position_embeddings=args.max_position_embeddings,
             base=args.rope_parameters["rope_theta"],
             mrope_section=args.rope_parameters["mrope_section"],
+            rope_parameters=args.rope_parameters,
         )
 
     def __call__(
@@ -1104,8 +1163,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
     def _normalize_qk(self, q: mx.array, k: mx.array):
         inv_scale = k.shape[-1] ** -0.5
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        # Upstream L2 normalization adds epsilon to the sum of squares;
+        # RMSNorm adds it to the mean, so divide epsilon by the head width.
+        eps = 1e-6 / k.shape[-1]
+        q = (inv_scale**2) * mx.fast.rms_norm(q, None, eps)
+        k = inv_scale * mx.fast.rms_norm(k, None, eps)
         return q, k
 
     def _project_gates(self, inputs: mx.array):
@@ -1262,8 +1324,13 @@ class Qwen3_5Model(nn.Module):
             cache = [None] * len(self.layers)
 
         fa_cache = cache[self.fa_idx]
+        # Row extraction keeps padded prefill equivalent to an unpadded prompt.
+        # Unpadded decode retains allocated KV buffers instead of copying the
+        # entire prefix for every generated token; padded rows still use the
+        # row-wise path below, including unfinished single-token prefill chunks.
         if (
             h.shape[0] == 1
+            and h.shape[1] > 1
             and hidden_sink is None
             and fa_cache is not None
             and _is_single_row_batch_cache(fa_cache)
@@ -1622,11 +1689,13 @@ class LanguageModel(nn.Module):
         else:
             if attention_mask is not None:
                 position_ids = mx.cumsum(attention_mask.astype(mx.int64), axis=-1) - 1
+                max_position_ids = position_ids.max(axis=-1, keepdims=True)
                 position_ids = mx.where(
                     attention_mask == 0, mx.ones_like(position_ids), position_ids
                 )
-                max_position_ids = position_ids.max(axis=-1, keepdims=True)
-                mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
+                mrope_position_deltas = (
+                    max_position_ids + 1 - attention_mask.sum(axis=-1, keepdims=True)
+                )
             else:
                 position_ids = mx.arange(input_ids.shape[1]).reshape(1, -1)
                 position_ids = mx.broadcast_to(
@@ -1675,7 +1744,7 @@ class LanguageModel(nn.Module):
         c0 = None
         if cache and cache[self.model.fa_idx] is not None:
             c0 = cache[self.model.fa_idx]
-            cache_offset = c0._idx if hasattr(c0, "_idx") else c0.offset
+            cache_offset = cache_position_offset(c0)
             if (
                 isinstance(c0.offset, mx.array)
                 and c0.offset.ndim > 0
@@ -1841,10 +1910,13 @@ class LanguageModel(nn.Module):
 
         if skip_logits:
             logits = None
-        elif self.args.tie_word_embeddings:
-            logits = self.model.embed_tokens.as_linear(out)
         else:
-            logits = self.lm_head(out)
+            projection = (
+                self.model.embed_tokens.as_linear
+                if self.args.tie_word_embeddings
+                else self.lm_head
+            )
+            logits = project_logits(out, projection, kwargs.get("logits_to_keep"))
         return LanguageModelOutput(
             logits=logits,
             hidden_states=hidden_sink,

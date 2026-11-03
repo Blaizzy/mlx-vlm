@@ -7,7 +7,9 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from ..base import (
     LanguageModelOutput,
+    cache_position_offset,
     create_attention_mask,
+    project_logits,
     scaled_dot_product_attention,
 )
 from ..cache import KVCache
@@ -500,11 +502,13 @@ class LanguageModel(nn.Module):
         else:
             if attention_mask is not None:
                 position_ids = mx.cumsum(attention_mask.astype(mx.int64), axis=-1) - 1
+                max_position_ids = position_ids.max(axis=-1, keepdims=True)
                 position_ids = mx.where(
                     attention_mask == 0, mx.ones_like(position_ids), position_ids
                 )
-                max_position_ids = position_ids.max(axis=-1, keepdims=True)
-                mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
+                mrope_position_deltas = (
+                    max_position_ids + 1 - attention_mask.sum(axis=-1, keepdims=True)
+                )
             else:
                 position_ids = mx.arange(input_ids.shape[1]).reshape(1, -1)
                 position_ids = mx.broadcast_to(
@@ -540,13 +544,11 @@ class LanguageModel(nn.Module):
         if rope_deltas_kw is not None:
             self._rope_deltas = rope_deltas_kw
 
-        # Use ``cache._idx`` — the Python-int token counter — instead of
-        # syncing on ``cache[0].offset``. See Qwen2.5-VL for details.
         cache_offset = 0
         cache_offsets = None
         if cache and cache[0] is not None:
             c0 = cache[0]
-            cache_offset = c0._idx if hasattr(c0, "_idx") else c0.offset
+            cache_offset = cache_position_offset(c0)
             if (
                 isinstance(c0.offset, mx.array)
                 and c0.offset.ndim > 0
@@ -679,10 +681,12 @@ class LanguageModel(nn.Module):
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
         )
-        if self.args.tie_word_embeddings:
-            out = self.model.embed_tokens.as_linear(out)
-        else:
-            out = self.lm_head(out)
+        projection = (
+            self.model.embed_tokens.as_linear
+            if self.args.tie_word_embeddings
+            else self.lm_head
+        )
+        out = project_logits(out, projection, kwargs.get("logits_to_keep"))
         return LanguageModelOutput(logits=out)
 
     def sanitize(self, weights):

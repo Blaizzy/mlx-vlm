@@ -97,7 +97,11 @@ def train(
         mx.random.seed(seed)
     optimizer.init(model.trainable_parameters())
     state = [model.state, optimizer.state, mx.random.state]
-    value_and_grad = nn.value_and_grad(model, task.loss)
+    value_and_grad = (
+        task.value_and_grad_factory(model, args.compile)
+        if task.value_and_grad_factory is not None
+        else nn.value_and_grad(model, task.loss)
+    )
 
     def step(batch, previous, update, *extra):
         return apply_gradient_step(
@@ -111,7 +115,7 @@ def train(
             loss_args=extra,
         )
 
-    if args.compile:
+    if args.compile and task.value_and_grad_factory is None:
         step = mx.compile(step, inputs=state + task.state, outputs=state)
     iterator = iter(task.batches(train_dataset, train=True, seed=seed))
     save = task.save_weights or save_trainable_weights

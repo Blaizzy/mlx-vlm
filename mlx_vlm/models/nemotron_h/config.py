@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Optional, Tuple
 
 from ..base import BaseModelConfig
@@ -27,6 +27,7 @@ class ModelConfig(BaseModelConfig):
     use_conv_bias: bool
     hybrid_override_pattern: Optional[List[str]] = None
     layers_block_type: Optional[List[str]] = None
+    block_configs: Optional[List[dict]] = None
     head_dim: Optional[int] = None
     moe_intermediate_size: Optional[int] = None
     moe_shared_expert_intermediate_size: Optional[int] = None
@@ -41,12 +42,40 @@ class ModelConfig(BaseModelConfig):
     time_step_limit: Optional[Tuple[float, float]] = None
     time_step_min: Optional[float] = None
     time_step_max: Optional[float] = None
+    num_nextn_predict_layers: int = 0
+    mtp_layers_block_type: Optional[List[str]] = None
+    mtp_hybrid_override_pattern: Optional[str] = None
 
     _block_type_to_char = {"mamba": "M", "attention": "*", "moe": "E", "mlp": "-"}
 
+    @classmethod
+    def from_dict(cls, params):
+        params = dict(params or {})
+        pattern = (
+            params.get("block_configs")
+            or params.get("hybrid_override_pattern")
+            or params.get("layers_block_type")
+        )
+        if pattern is not None:
+            params.setdefault("num_hidden_layers", len(pattern))
+        return super().from_dict(params)
+
     def __post_init__(self):
+        if self.block_configs:
+            # Puzzle checkpoints move heterogeneous MoE fields out of the
+            # global config. Their block list also defines the layer order.
+            self.layers_block_type = [b["block_type"] for b in self.block_configs]
+            self.hybrid_override_pattern = [
+                self._block_type_to_char[t] for t in self.layers_block_type
+            ]
         if self.time_step_limit is None:
             self.time_step_limit = (0.0, float("inf"))
+        else:
+            # Transformers serializes non-finite floats as tagged JSON objects.
+            self.time_step_limit = tuple(
+                float(value["__float__"]) if isinstance(value, dict) else value
+                for value in self.time_step_limit
+            )
 
         if self.hybrid_override_pattern is None and self.layers_block_type is not None:
             self.hybrid_override_pattern = [
@@ -54,3 +83,13 @@ class ModelConfig(BaseModelConfig):
             ]
         if self.hybrid_override_pattern is not None:
             self.num_hidden_layers = len(self.hybrid_override_pattern)
+
+    def for_layer(self, layer_idx: int):
+        if not self.block_configs:
+            return self
+        overrides = {
+            key: value
+            for key, value in self.block_configs[layer_idx].items()
+            if key != "block_type" and value is not None
+        }
+        return replace(self, block_configs=None, **overrides)

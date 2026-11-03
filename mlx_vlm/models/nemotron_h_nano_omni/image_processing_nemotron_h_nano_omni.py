@@ -8,6 +8,7 @@ https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16/blob/m
 import math
 from typing import Optional, Union
 
+import mlx.core as mx
 import numpy as np
 from PIL import Image
 from transformers.image_processing_base import BatchFeature
@@ -19,6 +20,8 @@ from transformers.image_utils import (
     make_list_of_images,
 )
 from transformers.utils import TensorType
+
+from ..interpolate import resize_bicubic_nhwc
 
 
 class NemotronHNanoOmniImageProcessor(BaseImageProcessorFast):
@@ -103,16 +106,16 @@ class NemotronHNanoOmniImageProcessor(BaseImageProcessorFast):
         for img, (wp, hp) in zip(images, target_sizes):
             target_w = wp * self.patch_size
             target_h = hp * self.patch_size
+            arr = np.asarray(img, dtype=np.float32)
             if img.size != (target_w, target_h):
-                # PIL's BICUBIC isn't antialiased like torch's, but with reducing_gap
-                # it pre-filters during downsample — close to the reference for
-                # typical token-bounded sizes.
-                img = img.resize(
-                    (target_w, target_h),
-                    resample=Image.Resampling.BICUBIC,
-                    reducing_gap=3.0,
+                # Match the reference's float bicubic antialiased interpolation;
+                # PIL resize rounds/clips pixels before normalization.
+                arr = np.array(
+                    resize_bicubic_nhwc(
+                        mx.array(arr)[None], (target_h, target_w), antialias=True
+                    )[0]
                 )
-            arr = np.asarray(img, dtype=np.float32).transpose(2, 0, 1)  # (3, H, W)
+            arr = arr.transpose(2, 0, 1)  # (3, H, W)
             arr = (arr / 255.0 - norm_mean) / norm_std
             pixel_values_list.append(arr)
             num_tokens_per_image.append((wp * hp) // (self._downsample_factor**2))

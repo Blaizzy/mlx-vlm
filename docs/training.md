@@ -8,16 +8,19 @@ python -m pip install -e '.[train]'
 
 The CLI is `python -m mlx_vlm.train` (or the installed `mlx_vlm.train`
 command). It uses the same `Trainer`, argument dataclasses, preprocessing,
-callbacks, and MLX engine as the Python API. VLM SFT, ORPO, and DPO are supported.
+callbacks, and MLX engine as the Python API. VLM SFT, ORPO, DPO, and GRPO are supported.
 
 ## Notebook and Python API
 
 Start with one of the standalone notebooks:
 
 - [SFT](../examples/training/sft_text_only.ipynb): text-only JOSIE instruction training.
+- [Native MTP SFT](../examples/training/sft_mtp.ipynb): train Qwen3.5 LoRA adapters and its native head together, reload checkpoints, and export a standalone drafter; full and frozen-target training are also available.
 - [LaTeX OCR SFT](../examples/training/sft_vison_text.ipynb): map Hugging Face `image`/`text` rows into messages and preprocess with `VisionDataset`.
 - [ORPO](../examples/training/orpo.ipynb): chosen/rejected responses without a reference model.
 - [DPO](../examples/training/dpo.ipynb): chosen/rejected responses with a separate frozen reference.
+- [Vision GRPO](../examples/training/grpo_vision.ipynb): sampled image responses with group-relative rewards.
+- [Text-only GRPO](../examples/training/grpo_text_only.ipynb): Qwen3.5-2B-4bit on simple-grpo with rule-based correctness/format rewards.
 - [Custom loss](../examples/training/custom_loss.ipynb): replace the SFT objective with chunked cross-entropy.
 
 The examples include generated color images or a Hub vision dataset, editable model/data/settings, training,
@@ -28,6 +31,8 @@ The toy examples demonstrate usage, so replace them with representative data
 before assessing model quality.
 
 ```python
+import mlx.optimizers as optim
+
 from mlx_vlm import load
 from mlx_vlm.trainer import Trainer, VLMTrainingArgs, prepare_model_for_training
 from mlx_vlm.trainer.datasets import load as load_dataset
@@ -44,6 +49,7 @@ args = VLMTrainingArgs(
 )
 trainer = Trainer(
     model, args,
+    optimizer=optim.AdamW(learning_rate=1e-5, weight_decay=0.0),
     processing_class=processor,
     train_dataset=rows["train"],
     eval_dataset=rows.get("validation", rows.get("valid")),
@@ -58,6 +64,11 @@ Pass one finite, indexable split: a list of row dictionaries or a Hugging Face
 processor outputs directly, including `input_ids` and optional masks/media.
 `Trainer.evaluate()` restores the model's previous training/evaluation mode.
 
+Training requires an explicit MLX optimizer passed as `optimizer=`. Configure
+the learning rate, schedules, and weight decay on that optimizer; training
+argument dataclasses contain only loop, data, and algorithm settings.
+Evaluation and saving do not require an optimizer.
+
 `prepare_model_for_training` accepts `train_type="lora"`, `"dora"`, or `"full"`.
 Adapter modes freeze the whole base and discover language transformer linear
 layers by default. `target_modules` accepts linear suffixes or qualified names,
@@ -70,6 +81,87 @@ For ORPO, pass `ORPOTrainingArgs(beta=0.1)` and preference rows; for DPO, pass
 the algorithm automatically, or set `algorithm="orpo"` / `"dpo"` explicitly.
 Load a separate compatible base for DPO. The trainer freezes it and checks its
 model type, image token identifiers, and vocabulary size against the policy.
+
+## Native multi-token prediction
+
+SFT, DPO, ORPO, and GRPO optionally train a native MTP head alongside their
+existing objective. Shared cross-entropy keeps its existing API and behavior.
+The initial implementation supports matching **Qwen3.5 dense and MoE** heads,
+with one additional prediction: hidden state `h[t]` and ground-truth token
+`x[t+1]` predict `x[t+2]`. The objective is
+`algorithm_loss + mtp_loss_weight * mtp_loss`. The default weight is zero.
+Padding and completion-only supervision are shifted with the MTP targets.
+
+```sh
+python -m mlx_vlm.train \
+  --model /path/to/qwen3.5-target \
+  --mtp-model /path/to/matching-original-checkpoint-or-split-mtp \
+  --mtp-loss-weight 0.3 \
+  --data data --train-on-completions
+```
+
+`--mtp-model` must contain floating-point native MTP weights. The base can be
+quantized; optional training-time base quantization leaves the MTP head in
+floating point. Select the algorithm with `--algorithm sft`, `dpo`, `orpo`,
+or `grpo`.
+
+In Python, attach a fresh, unbound head **after** preparing the base model:
+
+```python
+from mlx_vlm.speculative.drafters import load_drafter
+from mlx_vlm.trainer import attach_mtp_head
+
+head, _ = load_drafter("/path/to/matching-mtp", kind="mtp")
+model = prepare_model_for_training(model, lora_rank=8)
+attach_mtp_head(model, head)
+args = VLMTrainingArgs(mtp_loss_weight=0.3, train_on_completions=True)
+# Pass model and args to Trainer as above.
+```
+
+Adapter training updates the base adapters and the full MTP head. Checkpoints
+include the head under `mtp_head.*`. To resume, prepare the base with
+`prepare_model_for_training(..., checkpoint_path=...)`, then call
+`attach_mtp_head(model, head, checkpoint_path=...)` with the same checkpoint. The CLI needs
+the same `--mtp-model` and `--mtp-loss-weight` with `--resume-adapter-file`.
+For speculative inference, load the base adapters, then restore the head's
+`mtp_head.*` weights into the matching drafter with that prefix removed.
+
+Reports include `mtp_loss` and `num_mtp_tokens`. `nll`, perplexity, and token
+accuracy still describe the base next-token predictions; the reported `loss`
+includes the weighted auxiliary objective. Sequences with fewer than three
+tokens contribute zero MTP loss. The legacy `TrainingArgs` / `SFTTrainer` API
+also accepts `mtp_loss_weight` after preparing the base and attaching the head.
+
+DPO and ORPO apply auxiliary MTP supervision to chosen responses only. GRPO
+applies it to generated completion tokens, including samples with negative
+advantages; it is an additional supervised objective, independent of rewards.
+Reference-model scoring is unchanged. Preference and GRPO MTP use an extra
+policy forward when enabled; SFT reuses its existing forward. Other native
+heads can implement `training_logits(tokens, hidden, attention_mask, model)`
+and register as `model.mtp_head`; the built-in attachment helper currently
+validates Qwen3.5 heads only.
+
+For `train_type="full"`, attach the head before preparing the model so strict
+full-checkpoint loading can restore it with the base. The CLI handles this order.
+This trains all target weights and the MTP head together. The MTP objective also
+backpropagates through the target hidden states and shared embeddings/output
+projection. Full training requires floating-point weights and more memory;
+preparation dequantizes packed target weights if necessary.
+
+```python
+head, _ = load_drafter("/path/to/matching-mtp", kind="mtp")
+attach_mtp_head(model, head)
+model = prepare_model_for_training(
+    model, train_type="full", checkpoint_path=None,
+)
+args = VLMTrainingArgs(mtp_loss_weight=0.3, train_on_completions=True)
+# Pass model and args to Trainer with an explicit optimizer.
+```
+
+For the CLI recipe above, add `--train-type full`. Full checkpoints contain both
+target and `mtp_head.*` weights. Resume with the same model/head configuration
+and `--resume-adapter-file`. A separately exported head must be paired with the
+fine-tuned target, including its updated shared embeddings and output projection.
 
 ## Training and validation metrics
 
@@ -213,6 +305,10 @@ updates. Incomplete global batches are dropped, so start with batch size 1.
 evaluates the full prepared split, and `--cache-size` bounds the media cache.
 Compilation is opt-in with `--compile`.
 
+The CLI constructs the optimizer separately using `--optimizer` (default
+`adamw`), `--learning-rate` (default `1e-5`), and `--weight-decay` (default
+`0.0`). These CLI options are not fields of the training argument dataclasses.
+
 ## Row formats
 
 SFT rows contain chat messages and optional images:
@@ -276,3 +372,115 @@ configures the notebook/shared engine API; import
 `mlx_vlm.trainer.vlm.LegacyORPOTrainingArgs`) for the older `ORPOTrainer` /
 `train_orpo` recipe. `TrainingArgs` continues to configure the older SFT recipe;
 use `VLMTrainingArgs` with the new `Trainer`.
+
+## GRPO with optional vision inputs
+
+[Text-only GRPO notebook](../examples/training/grpo_text_only.ipynb) starts
+from `mlx-community/Qwen3.5-2B-4bit`, loading the already quantized model directly.
+It trains directly on `mlx-community/simple-grpo` using correctness and
+`<think>...</think><answer>...</answer>` format rewards, inspired by
+[DeepSeek-R1-Zero](https://arxiv.org/html/2501.12948v1#S2.SS2). The supplied
+`valid` and `test` partitions remain separate from training. The notebook
+includes baseline/final evaluation, numeric answer verification, KL against a
+frozen copy of the starting checkpoint, and prompt-template saving/reload. It
+uses the published training instruction from
+[Table 1 of the R1 paper](https://arxiv.org/html/2501.12948v1#S2.T1), inserting
+the question between `User:` and `Assistant:` without arithmetic-specific
+instruction additions or a prefilled `<think>` token. Its map function builds
+the complete prompt string and keeps the answer in a separate reward column.
+`dataset_config={"apply_chat_template": False}` passes the mapped prompt directly
+to the processor; no chat-template override is needed. This
+checkpoint is already post-trained, so the tutorial adds reasoning rewards
+without another SFT warm-up; it does not reproduce DeepSeek's pretrained-only
+initialization, training scale, or reasoning results.
+
+[Vision GRPO notebook](../examples/training/grpo_vision.ipynb) trains
+`mlx-community/Qwen3.5-2B-4bit` on LaTeX OCR with image-conditioned sampled
+responses, similarity/exact-match rewards, evaluation, and adapter saving.
+
+```python
+import mlx.optimizers as optim
+
+from mlx_vlm.trainer import GRPOTrainingArgs, Trainer
+
+args = GRPOTrainingArgs(
+    group_size=4, max_completion_length=128, max_seq_length=4096,
+    beta=0.0, grad_checkpoint=True,
+)
+rows = [{"prompt": "What color is the object?", "image": image, "answer": "red"}]
+trainer = Trainer(
+    model, args, processing_class=processor, train_dataset=rows,
+    optimizer=optim.AdamW(learning_rate=1e-5, weight_decay=0.0),
+    reward_funcs=[my_reward], reward_weights=[1.0],
+)
+metrics = trainer.train()
+```
+
+Omit `image` for text-only GRPO. Use `images` for multiple images, or `messages`
+for a chat conversation ending with a user prompt. Optional `system` adds a
+system message to string prompts. `dataset_config` accepts `prompt_feature`,
+`answer_feature`, `image_feature`, and the existing image resize settings.
+Answers are reward metadata only; they never enter the model prompt.
+For a prompt already formatted by your dataset map function, set
+`dataset_config={"apply_chat_template": False}`. Supply a non-empty string in
+`prompt` containing the complete instruction and generation prefix; omit a
+separate `system` field. The default applies the model's chat template to raw
+questions or conversations. Keep the reference answer in `answer` for rewards.
+Prepared rows have `inputs` (processor IDs, mask, and media), `prompt`, `answer`,
+and optional `metadata`; even with `prepared=True`, GRPO needs a processor or
+its tokenizer for decoding. Audio and video GRPO are not currently supported.
+
+A reward callback accepts keyword arguments `prompts`, `completions`, `answer`,
+`types`, and `metadata` (use `**kwargs` for unused fields) and returns one
+float per completion. Multiple callbacks are combined with `reward_weights`.
+`None`/NaN means an inapplicable reward; every completion needs at least one
+valid reward. The default `accuracy_reward` compares stripped answers exactly,
+including responses inside `<answer>...</answer>`. Reward normalization uses
+CPU population standard deviation per prompt group and `advantage_epsilon`.
+Equal rewards yield zero policy advantages; monitor `grouped_reward_std`.
+
+The loss and optimizations follow
+[MLX-LM-LoRA's GRPO implementation](https://github.com/Goekdeniz-Guelmez/mlx-lm-lora/blob/main/mlx_lm_lora/trainer/grpo_trainer.py):
+
+- Preserve sampled token IDs, including EOS; decode only for rewards.
+- Compute each reward once over complete groups on the CPU.
+- Generate and differentiate one completion at a time, synchronizing gradients
+  between completions to avoid retaining all rollout activation graphs.
+- Normalize loss chunks by their actual denominator: sequence mean for `grpo`,
+  total completion tokens for `bnpo`, fixed maximum length for `dr_grpo`.
+- Score only completion positions. Qwen3.5 runs its vocabulary head in bounded
+  `logit_chunk_size` chunks and reuses frozen vision features within each group.
+  Other VLMs use their public model forward.
+- Reuse the shared gradient accumulation, checkpointing, distributed gradient
+  averaging, callbacks, metrics, and adapter persistence.
+
+`importance_sampling_level="sequence"` enables GSPO-style sequence ratios;
+`"token"` is the default. `epsilon_high` supplies the asymmetric upper clipping
+width used by DAPO. Each rollout is consumed once before its generating policy
+updates, so ratios start at one and clipping diagnostics normally remain zero;
+this is not multi-epoch PPO or DAPO dynamic resampling. Keep adapter dropout at
+zero for consistent rollout/scoring probabilities.
+
+`beta=0` skips reference scoring. For KL regularization, set `beta>0` and pass a
+separate compatible `reference_model`; the trainer freezes it. A reference is
+never treated as the old policy. KL uses a stable `expm1` estimator, caps extreme
+positive log ratios, and reports saturation as `kl_clip_ratio`. Sequence limits
+include prompt, image, and generated tokens; oversized prompts raise an error
+instead of truncating image slots. Evaluation samples fresh groups, so reward
+means and actual completions are more useful quality measures than GRPO loss.
+
+CLI example (JSONL rows use the same schema):
+
+```sh
+python -m mlx_vlm.train \
+  --algorithm grpo --model mlx-community/Qwen3.5-2B-4bit \
+  --data ./vision_grpo_data --group-size 4 \
+  --max-completion-length 128 --max-seq-length 4096 \
+  --grad-checkpoint --reward-functions accuracy_reward \
+  --output-path adapters/grpo
+```
+
+Custom callbacks can be defined in `--reward-functions-file rewards.py`, selected
+with `--reward-functions first_reward,second_reward`, and weighted with
+`--reward-weights '[0.8, 0.2]'`. The CLI loads a separate base reference when
+`--beta` is positive; override it with `--reference-model` if needed.

@@ -30,8 +30,12 @@ class PrefillMemoryPlan:
         self.lengths: List[int] = []
         self.prefix_lengths: List[int] = []
         self.chunk_size: Optional[int] = None
+        self.extra_reserve_bytes = 0
 
-    def prepare(self, lengths, *, chunk_size=None, prefix_lengths=None) -> int:
+    def prepare(
+        self, lengths, *, chunk_size=None, prefix_lengths=None, extra_reserve_bytes=0
+    ) -> int:
+        self.extra_reserve_bytes = max(0, int(extra_reserve_bytes))
         self.lengths = [max(0, int(n)) for n in lengths]
         self.prefix_lengths = (
             list(prefix_lengths)
@@ -49,7 +53,9 @@ class PrefillMemoryPlan:
             n - p for n, p in zip(self.lengths, self.prefix_lengths)
         )
         row_bytes = sum(c.footprint(capacity, self.chunk_size) for c in self.components)
-        return max(0, 2 * len(self.lengths) * row_bytes - live_bytes)
+        return self.extra_reserve_bytes + max(
+            0, 2 * len(self.lengths) * row_bytes - live_bytes
+        )
 
     def observe(self, components, *, live_bytes: int) -> int:
         previous = self.components
@@ -114,16 +120,31 @@ class APCCoordinator:
         self.plan: PrefixCachePlan = build_prefix_cache_plan(model)
 
     def prepare_prefill(
-        self, prompt_lengths, *, prefill_step_size=None, prefix_lengths=None
-    ) -> None:
+        self,
+        prompt_lengths,
+        *,
+        prefill_step_size=None,
+        prefix_lengths=None,
+        extra_reserve_bytes=0,
+    ) -> bool:
         if self.enabled:
             lengths = (
                 [prompt_lengths] if isinstance(prompt_lengths, int) else prompt_lengths
             )
             reserve = self.manager.memory_plan.prepare(
-                lengths, chunk_size=prefill_step_size, prefix_lengths=prefix_lengths
+                lengths,
+                chunk_size=prefill_step_size,
+                prefix_lengths=prefix_lengths,
+                extra_reserve_bytes=extra_reserve_bytes,
             )
-            self.manager.prepare_prefill(reserve)
+            return self.manager.prepare_prefill(reserve)
+        return True
+
+    def finish_prefill(self) -> None:
+        """Release the transient plan after admission is deferred or completed."""
+        if self.enabled:
+            self.manager.memory_plan.prepare([])
+            self.manager._prefill_reserve_bytes = 0
 
     def observe_cache(self, prompt_cache, token_count, *, batch_size=1) -> None:
         """Update runtime dimensions independently of snapshot persistence."""
@@ -167,6 +188,7 @@ class APCCoordinator:
         safe_lookup_min: int,
         suffix_is_text_only: Callable[[int], bool],
         prefix_has_media: Callable[[int], bool],
+        defer_on_pressure: bool = False,
     ) -> Optional[dict]:
         if not self.enabled:
             return None
@@ -180,6 +202,7 @@ class APCCoordinator:
             safe_lookup_min=safe_lookup_min,
             suffix_is_text_only=suffix_is_text_only,
             prefix_has_media=prefix_has_media,
+            defer_on_pressure=defer_on_pressure,
         )
         if hit is not None:
             hit["cache_plan"] = self.plan
@@ -201,7 +224,12 @@ class APCCoordinator:
         )
 
     def checkpoint_lengths(
-        self, token_ids: Sequence[int], media_token_ids: set[int]
+        self,
+        token_ids: Sequence[int],
+        media_token_ids: set[int],
+        *,
+        extra_hash: int = 0,
+        stable_prefix_len: int = 0,
     ) -> List[int]:
         """Bounded intermediate states plus the final conversation checkpoint.
 
@@ -224,12 +252,22 @@ class APCCoordinator:
         last = ((final - 1) // interval) * interval
         first = max(interval, last - (budget - 2) * interval)
         lengths = {final}
-        for boundary in range(first, last + 1, interval):
+        # Prefer the observed stable prefix over positions inside a changing
+        # suffix. The final checkpoint still serves exact prompt extensions.
+        stable = self.manager.checkpoint_prefix_length(token_ids, extra_hash=extra_hash)
+        candidates = [stable_prefix_len, stable] + list(
+            range(last, first - 1, -interval)
+        )
+        for boundary in candidates:
+            if boundary < self.manager.exact_cache_min_tokens:
+                continue
             boundary = adjust_prefix_to_text_suffix_boundary(
                 token_ids, boundary, media_token_ids, max_prefix_tokens=final
             )
             if self.manager.exact_cache_min_tokens <= boundary < final:
                 lengths.add(boundary)
+            if len(lengths) >= budget:
+                break
         return sorted(lengths)
 
     def merge_rows(
@@ -239,26 +277,62 @@ class APCCoordinator:
         *,
         kv_quant_config: Optional[dict] = None,
     ) -> Tuple[Optional[List[Any]], int]:
-        """Materialize a mixed warm/cold batch at the common prefix boundary."""
-        from .apc import (
-            make_warm_batch_exact_cache_multi,
-            make_warm_batch_kv_cache_multi,
+        """Materialize a mixed batch while preserving the caller's cache rows."""
+        source = (
+            picks[0]["warm_cache"]
+            if self.is_checkpoint and len(picks) == 1 and picks[0] is not None
+            else None
         )
+        if self.is_checkpoint:
+            picks = [
+                (
+                    {**pick, "warm_cache": list(pick["warm_cache"])}
+                    if pick is not None
+                    else None
+                )
+                for pick in picks
+            ]
+        caches, prefix_len = self._merge_and_release_cache_rows(
+            picks, prefix_lens, kv_quant_config=kv_quant_config
+        )
+        if caches is not None and source is not None:
+            from .apc import _detach_borrowed_cache_entries
+
+            caches = _detach_borrowed_cache_entries(caches, source)
+        return caches, prefix_len if caches is not None else 0
+
+    def _merge_and_release_cache_rows(
+        self,
+        picks: Sequence[Optional[dict]],
+        prefix_lens: Sequence[int],
+        *,
+        kv_quant_config: Optional[dict] = None,
+    ) -> Tuple[Optional[List[Any]], int]:
+        """Merge scheduler-owned rows; discard picks after success or failure.
+
+        Exact-cache input entries are released layer by layer. Block leases
+        retain their existing lifecycle in the scheduler.
+        """
+        from .apc import _merge_and_release_cache_rows, make_warm_batch_kv_cache_multi
 
         memory = self.manager.memory_plan
         if len(prefix_lens) == len(memory.lengths):
-            self.prepare_prefill(
+            if not self.prepare_prefill(
                 memory.lengths,
                 prefill_step_size=memory.chunk_size,
                 prefix_lengths=prefix_lens,
-            )
+                extra_reserve_bytes=memory.extra_reserve_bytes,
+            ):
+                from .apc import APCAdmissionError
+
+                raise APCAdmissionError("APC batch merge deferred by memory admission")
 
         if self.is_checkpoint:
             row_caches = [
                 pick["warm_cache"] if pick is not None else self.fresh_cache()
                 for pick in picks
             ]
-            caches, max_prefix = make_warm_batch_exact_cache_multi(
+            caches, max_prefix = _merge_and_release_cache_rows(
                 row_caches,
                 prefix_lens,
                 kv_quant_config=kv_quant_config,

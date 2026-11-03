@@ -12,6 +12,8 @@ import shutil
 import subprocess
 import sys
 import threading
+import weakref
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from itertools import product
 from pathlib import Path
@@ -21,6 +23,7 @@ from unittest.mock import Mock, patch
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 import pytest
 
 import mlx_vlm.models as models
@@ -35,13 +38,20 @@ from mlx_vlm.apc_adapters import cache_memory_components
 from mlx_vlm.apc_adapters import cache_memory_components as memory_components
 from mlx_vlm.apc_adapters import clone_cache_entry
 from mlx_vlm.generate import generate_step, maybe_quantize_kv_cache
-from mlx_vlm.generate.ar import PromptProcessingBatch, _extend_cache, _make_cache
+from mlx_vlm.generate.ar import (
+    BatchGenerator,
+    PromptProcessingBatch,
+    _extend_cache,
+    _make_cache,
+)
 from mlx_vlm.models import cache as C
 from mlx_vlm.models.base import (
     InputEmbeddingsFeatures,
     LanguageModelOutput,
     _turboquant_attention_applies,
     align_attention_mask_to_scores,
+    cache_position_offset,
+    create_attention_mask,
     quantized_scaled_dot_product_attention,
     scaled_dot_product_attention,
 )
@@ -51,6 +61,7 @@ from mlx_vlm.models.cache import (
     BatchPoolingCache,
     BatchQuantizedKVCache,
     BatchRotatingKVCache,
+    BufferedRotatingKVCache,
     CacheList,
     ChunkedKVCache,
     KVCache,
@@ -64,6 +75,7 @@ from mlx_vlm.models.minimax_m3_vl.language import (
     MiniMaxM3BatchKVCache,
     MiniMaxM3KVCache,
 )
+from mlx_vlm.models.mistral_large4.language import BatchLatentCache, LatentCache
 from mlx_vlm.models.qwen4_exp.language import (
     BatchQSAKVCache,
     QSAKVCache,
@@ -72,7 +84,7 @@ from mlx_vlm.models.qwen4_exp.language import (
 )
 from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
 from mlx_vlm.models.z1t.language import AFTConv, Z1TCache
-from mlx_vlm.tests.test_models import DATA, build_config
+from mlx_vlm.tests.test_models import DATA, build_config, model_case
 from mlx_vlm.turboquant import (
     BatchTurboQuantKVCache,
     TurboQuantKVCache,
@@ -81,7 +93,7 @@ from mlx_vlm.turboquant import (
     _TurboQuantProdCodec,
     resolve_kv_bits,
 )
-from mlx_vlm.vision_cache import VisionFeatureCache
+from mlx_vlm.vision_cache import VisionFeatureCache, processed_image_key
 
 # Cache lifecycle
 
@@ -199,6 +211,436 @@ def test_arrays_cache_advance_matches_decremented_values():
     assert cache.left_padding is None and cache.lengths is None
 
 
+@pytest.fixture
+def mistral_large4_language():
+    from mlx_vlm.models import mistral_large4
+
+    fields = model_case("mistral_large4")["config"]["text_config"]
+    config = build_config(mistral_large4, fields, "TextConfig")
+    mx.random.seed(17)
+    model = mistral_large4.LanguageModel(config)
+    model.eval()
+    return model
+
+
+@pytest.mark.parametrize(
+    "chunks",
+    [((0, 3), (3, 5), (5, 7)), tuple((i, i + 1) for i in range(7))],
+)
+@pytest.mark.parametrize("mask_ndim", [None, 2, 4])
+def test_mistral_large4_cached_dsa_and_shared_kv_match_full_sequence(
+    mistral_large4_language, chunks, mask_ndim
+):
+    model = mistral_large4_language
+    ids = mx.array([[1, 2, 7, 5, 9, 13, 11], [2, 4, 6, 8, 10, 12, 14]])
+    mask = None
+    if mask_ndim is not None:
+        mask = mx.array([[True, False, True, True, False, True, True]] * 2)
+        if mask_ndim == 4:
+            mask = mask[:, None, None, :]
+    expected = model(ids, mask=mask).logits
+    cache = model.make_cache()
+    outputs = [
+        model(
+            ids[:, a:b], cache=cache, mask=mask[..., :b] if mask is not None else None
+        ).logits
+        for a, b in chunks
+    ]
+    actual = mx.concatenate(outputs, axis=1)
+    assert mx.allclose(actual, expected, atol=3e-6, rtol=3e-5).item()
+    assert all(c.offset == 7 for c in cache)
+    assert cache[7].keys is None  # This layer reuses layer 3's compressed KV.
+    assert cache[3].state[0].shape == (2, 1, 7, 16)
+    assert cache[0].state[2].shape == (2, 7, 16)
+    assert cache[2].index_keys is None  # Indexer sharing carries only indices.
+
+
+def test_mistral_large4_cache_restore_and_trim(mistral_large4_language):
+    model = mistral_large4_language
+    ids = mx.array([[1, 2, 3, 4, 5, 6]])
+    cache = model.make_cache()
+    model(ids, cache=cache)
+    restored = [LatentCache.from_state(c.state, c.meta_state) for c in cache]
+    for c in restored:
+        assert c.trim(2) == 2
+    actual = model(ids[:, 4:], cache=restored).logits
+    expected = model(ids).logits[:, 4:]
+    assert mx.allclose(actual, expected, atol=3e-6, rtol=3e-5).item()
+
+
+@pytest.mark.parametrize("right_pad", [False, True])
+@pytest.mark.parametrize("chunks", [((0, 9),), ((0, 2), (2, 5), (5, 8), (8, 9))])
+def test_mistral_large4_batch_cache_matches_independent_requests(
+    mistral_large4_language, right_pad, chunks
+):
+    model = mistral_large4_language
+    prompts = [[3, 7, 5, 5, 11, 15, 19, 23, 27], [9, 5, 13], [17, 5, 21, 25]]
+    references = [model.make_cache() for _ in prompts]
+    for prompt, reference in zip(prompts, references):
+        mx.eval(model(mx.array([prompt]), cache=reference).logits)
+
+    padding = [0, 6]
+    cache = _make_cache(model, [0, 0] if right_pad else padding)
+    if right_pad:
+        for c in cache:
+            c.prepare(lengths=[9, 3], right_padding=padding)
+    ids = mx.array(
+        [
+            prompt + [0] * pad if right_pad else [0] * pad + prompt
+            for prompt, pad in zip(prompts[:2], padding)
+        ]
+    )
+    expected = [model(mx.array([prompt])).logits for prompt in prompts[:2]]
+    for start, stop in chunks:
+        actual = model(ids[:, start:stop], cache=cache).logits
+        assert mx.all(mx.isfinite(actual)).item()
+        for row, prompt in enumerate(prompts[:2]):
+            first = 0 if right_pad else padding[row]
+            begin, end = max(start, first), min(stop, first + len(prompt))
+            if begin < end:
+                assert mx.allclose(
+                    actual[row : row + 1, begin - start : end - start],
+                    expected[row][:, begin - first : end - first],
+                    atol=3e-6,
+                    rtol=3e-5,
+                ).item()
+        # Restore during prefill, including any pending right padding.
+        cache = [BatchLatentCache.from_state(c.state, c.meta_state) for c in cache]
+    for c in cache:
+        c.finalize()
+        assert c.offset.tolist() == [9, 3]
+
+    active = [0, 1]
+    for step in range(6):
+        if step == 2:
+            # The live scheduler joins a single-row prefill into a running batch.
+            cache = _extend_cache(cache, references[2])
+            active.append(2)
+        if step == 4:
+            for c in cache:
+                c.filter(mx.array([2, 0]))
+            active = [2, 0]
+        tokens = mx.array([[31 + step + row] for row in active])
+        actual = model(tokens, cache=cache).logits
+        expected = mx.concatenate(
+            [
+                model(tokens[i : i + 1], cache=references[row]).logits
+                for i, row in enumerate(active)
+            ]
+        )
+        assert mx.allclose(actual, expected, atol=3e-6, rtol=3e-5).item()
+        for i, row in enumerate(active):
+            for c, reference in zip(cache, references[row]):
+                extracted = c.extract(i)
+                assert extracted.offset == reference.offset
+                for value, ref in zip(extracted.state, reference.state):
+                    assert mx.allclose(value, ref, atol=5e-6, rtol=5e-5).item()
+
+    # Merge scalar cache snapshots, then trim and overwrite the last token.
+    merged = [
+        LatentCache.merge([references[row][i] for row in active])
+        for i in range(len(cache))
+    ]
+    for c, other in zip(cache, merged):
+        assert c.trim(1) == other.trim(1) == 1
+    assert mx.allclose(
+        model(tokens, cache=cache).logits,
+        model(tokens, cache=merged).logits,
+        atol=3e-6,
+        rtol=3e-5,
+    ).item()
+
+
+@pytest.mark.parametrize("layer", [0, 3, 7])
+def test_mistral_large4_batch_filter_during_padding(mistral_large4_language, layer):
+    model = mistral_large4_language
+    cache = _make_cache(model, [0, 6])
+    mx.eval(model(mx.array([[1, 2], [0, 0]]), cache=cache).logits)
+    c = cache[layer]
+    c.filter(mx.array([1]))
+    assert c.size() == 0
+    assert c.left_padding.tolist() == [4]
+    assert c.offset.tolist() == [-4]
+    assert c.extract(0).empty()
+
+
+def test_mistral_large4_warm_batch_cache(mistral_large4_language):
+    model = mistral_large4_language
+    prompts = [[1, 3, 5, 7, 9, 11, 13, 15, 17], [2, 4, 6, 8, 10, 12, 14, 16]]
+    prefixes = [5, 2]
+    references = [model.make_cache() for _ in prompts]
+    for prompt, reference in zip(prompts, references):
+        mx.eval(model(mx.array([prompt]), cache=reference).logits)
+    # Merge only the requested prefix from longer reusable snapshots.
+    cache = [LatentCache.merge(rows, prefixes) for rows in zip(*references)]
+    suffixes = mx.array([prompts[0][5:] + [0, 0], prompts[1][2:]])
+    for c in cache:
+        c.prepare(lengths=[4, 6], right_padding=[2, 0])
+    for start in range(0, 6, 2):
+        mx.eval(model(suffixes[:, start : start + 2], cache=cache).logits)
+    for c in cache:
+        c.finalize()
+        assert c.offset.tolist() == [9, 8]
+    # The same warm row can be converted directly with extra left padding.
+    warm = [c.to_batch([3]) for c in references[0]]
+    token = mx.array([[21]])
+    expected = mx.concatenate([model(token, cache=c).logits for c in references])
+    actual = model(mx.array([[21], [21]]), cache=cache).logits
+    assert mx.allclose(actual, expected, atol=3e-6, rtol=3e-5).item()
+    assert mx.allclose(
+        model(token, cache=warm).logits, expected[:1], atol=3e-6, rtol=3e-5
+    ).item()
+
+
+@pytest.mark.parametrize("prefill_batch_size", [1, 2])
+def test_mistral_large4_continuous_batch_generator(
+    mistral_large4_language, prefill_batch_size
+):
+    from mlx_vlm.utils import StoppingCriteria
+
+    model = mistral_large4_language
+    prompts = [[1, 3, 5, 7, 9, 11, 13], [2, 4, 6], [8, 10, 12, 14, 16]]
+    limits = [8, 4, 5]
+    expected = []
+    for prompt, limit in zip(prompts, limits):
+        cache = model.make_cache()
+        tokens = mx.array([prompt])
+        output = []
+        for _ in range(limit):
+            tokens = mx.argmax(model(tokens, cache=cache).logits[:, -1:], axis=-1)
+            output.append(tokens.item())
+        expected.append(output)
+
+    processor = SimpleNamespace(stopping_criteria=StoppingCriteria([]))
+    prompt_kwargs = [
+        {"inputs_embeds": model.model.embed_tokens(mx.array([prompt]))}
+        for prompt in prompts
+    ]
+    generator = BatchGenerator(
+        model,
+        processor,
+        prefill_batch_size=prefill_batch_size,
+        completion_batch_size=3,
+        prefill_step_size=2,
+    )
+    actual = [[], [], []]
+    added = False
+    saw_join = False
+    saw_departure = False
+    try:
+        assert generator.insert(
+            prompts[:2], max_tokens=limits[:2], prompt_kwargs=prompt_kwargs[:2]
+        ) == [0, 1]
+        for _ in range(100):
+            if not generator.has_work:
+                break
+            _, responses = generator.next()
+            for response in responses:
+                actual[response.uid].append(response.token)
+            if not added and len(actual[0]) >= 2:
+                assert generator.insert(
+                    prompts[2:], max_tokens=limits[2:], prompt_kwargs=prompt_kwargs[2:]
+                ) == [2]
+                added = True
+            active = generator._generation_batch.uids
+            saw_join |= 0 in active and 2 in active
+            saw_departure |= bool(actual[1]) and 1 not in active and 0 in active
+        assert not generator.has_work
+        assert added and saw_join and saw_departure
+        assert actual == expected
+    finally:
+        generator.close()
+
+
+@pytest.mark.parametrize("rope_dim", [0, 8])
+@pytest.mark.parametrize("padding", [None, [0, 7]])
+def test_mistral_large4_cache_growth_and_overwrite_after_trim(rope_dim, padding):
+    cache = LatentCache() if padding is None else BatchLatentCache(padding)
+    length = 2 * cache.step + 3
+    keys = mx.arange(2 * length * 16).reshape(2, 1, length, 16)
+    values = mx.arange(2 * length * rope_dim).reshape(2, 1, length, rope_dim)
+    index = keys[:, 0, :, :8] * 3
+
+    def append(start, end):
+        k, v = cache.update_latent(keys[:, :, start:end], values[:, :, start:end])
+        i = cache.update_index(index[:, start:end])
+        cache.advance(end - start)
+        mx.eval(cache.state)
+        assert mx.array_equal(k, keys[:, :, :end]).item()
+        assert mx.array_equal(v, values[:, :, :end]).item()
+        assert mx.array_equal(i, index[:, :end]).item()
+
+    append(0, cache.step - 1)
+    append(cache.step - 1, cache.step)
+    assert cache.keys.shape[2] == cache.step
+    append(cache.step, cache.step + 1)
+    append(cache.step + 1, length - 2)
+    assert cache.nbytes == sum(
+        x.nbytes for x in (cache.keys, cache.values, cache.index_keys)
+    )
+    restored = type(cache).from_state(cache.state, cache.meta_state)
+    keys[:, :, 5:] += 17
+    values[:, :, 5:] += 29
+    index[:, 5:] += 31
+    for candidate in (cache, restored):
+        cache = candidate
+        assert cache.trim(length - 7) == length - 7
+        # Overwrite stale entries, then cross the restored buffer's boundary.
+        append(5, 8)
+        append(8, length)
+        assert all(x.shape[-2] == length for x in cache.state[:3])
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
+@pytest.mark.parametrize("length", [1, 4])
+def test_mistral_large4_no_rope_attention_after_cache_growth_and_filtering(length):
+    from mlx_vlm.models.mistral_large4.block_mla_kernel import block_sparse_mla
+    from mlx_vlm.models.mistral_large4.mla_kernel import sparse_mla
+
+    cache = BatchLatentCache([1, 0, 2])
+    cache.step = 8
+    cache._ragged = True
+    batch, heads, dim = 3, 2, 64
+    for step in range(48):
+        if step in (10, 20):
+            batch -= 1
+            cache.filter(mx.array([1, 2] if batch == 2 else [1]))
+        query = mx.ones((batch, heads, length, dim), mx.bfloat16)
+        latent, rotary = cache.update_latent(
+            mx.ones((batch, 1, length, dim), mx.bfloat16),
+            mx.zeros((batch, 1, length, 0), mx.bfloat16),
+        )
+        mask = cache.make_mask(length)
+        counts = [cache.size() + t + 1 for t in range(length)]
+        indices = mx.broadcast_to(
+            mx.arange(latent.shape[2])[None], (batch, latent.shape[2])
+        )
+        if length == 1:
+            output = sparse_mla(
+                query, query[..., :0], latent, rotary, indices, mask, 0.125
+            )
+        else:
+            output = block_sparse_mla(
+                query,
+                query[..., :0],
+                latent,
+                rotary,
+                mx.broadcast_to(indices[:, None], (batch, length, indices.shape[-1])),
+                mask,
+                0.125,
+                counts,
+            )
+        expected = mx.broadcast_to(mx.any(mask, axis=-1, keepdims=True), query.shape)
+        assert mx.array_equal(output, expected.astype(query.dtype)).item()
+        cache.advance(length)
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("layer_idx", [0, 3])
+def test_mistral_large4_decode_absorbs_selected_latents(
+    mistral_large4_language, dtype, layer_idx
+):
+    model = mistral_large4_language.model
+    attention = model.layers[layer_idx].attention
+    attention.set_dtype(dtype)
+    x = mx.random.normal((2, 11, 32)).astype(dtype)
+    positions = mx.broadcast_to(mx.arange(11)[None], (2, 11))
+    cos, sin = model.rotary_emb(positions, dtype)
+    expected, _ = attention(x, positions, cos, sin, None, {}, None, None)
+    mx.eval(expected)
+    projected_lengths = []
+    projection = attention.wkv_b
+
+    class TrackedLinear(nn.Linear):
+        def __call__(self, latents):
+            projected_lengths.append(latents.shape[2])
+            return super().__call__(latents)
+
+    tracked = TrackedLinear(
+        projection.weight.shape[1], projection.weight.shape[0], bias=False
+    )
+    tracked.weight = projection.weight
+    attention.wkv_b = tracked
+    cache = LatentCache()
+    attention(
+        x[:, :10], positions[:, :10], cos[:, :10], sin[:, :10], cache, {}, None, None
+    )
+    actual, _ = attention(
+        x[:, 10:], positions[:, 10:], cos[:, 10:], sin[:, 10:], cache, {}, None, None
+    )
+    tolerance = {mx.float32: 1e-6, mx.float16: 1e-3, mx.bfloat16: 1e-2}[dtype]
+    assert mx.allclose(actual, expected[:, -1:], atol=tolerance, rtol=tolerance).item()
+    assert projected_lengths == [10]
+
+
+@pytest.mark.parametrize("layer_idx", [0, 3])
+def test_mistral_large4_absorbed_decode_precision(mistral_large4_language, layer_idx):
+    attention = mistral_large4_language.model.layers[layer_idx].attention
+    attention.set_dtype(mx.bfloat16)
+    q = (4 * mx.random.normal((2, attention.heads, 1, attention.head_dim))).astype(
+        mx.bfloat16
+    )
+    latent = mx.random.normal((2, 1, 257, attention.latent)).astype(mx.bfloat16)
+    kr = mx.random.normal((2, 1, 257, attention.rope_dim)).astype(mx.bfloat16)
+    mask = (
+        mx.arange(257)[None, None, None, :] < mx.array([257, 193])[:, None, None, None]
+    )
+    weight = attention.wkv_b.weight.reshape(
+        attention.heads, attention.nope_dim + attention.value_dim, attention.latent
+    )
+
+    def as_double(value):
+        return np.array(value.astype(mx.float32)).astype(np.float64)
+
+    def round_bf16(value):
+        return as_double(mx.array(value.astype(np.float32)).astype(mx.bfloat16))
+
+    # Independent NumPy attention oracle with the reference's BF16 projection
+    # boundaries. Scores and softmax retain precision before rounding the
+    # latent attention output and applying the value projection.
+    q_np, latent_np, kr_np, weight_np = map(as_double, (q, latent, kr, weight))
+    query = round_bf16(
+        q_np[..., : attention.nope_dim] @ weight_np[:, : attention.nope_dim]
+    )
+    query = np.concatenate((query, q_np[..., attention.nope_dim :]), axis=-1)
+    keys = np.concatenate((latent_np, kr_np), axis=-1)
+    scores = (query @ keys.swapaxes(-1, -2)) * attention.head_dim**-0.5
+    scores = np.where(np.array(mask), scores, -np.inf)
+    probabilities = np.exp(scores - scores.max(axis=-1, keepdims=True))
+    probabilities /= probabilities.sum(axis=-1, keepdims=True)
+    expected = round_bf16(
+        round_bf16(probabilities @ latent_np)
+        @ weight_np[:, attention.nope_dim :].swapaxes(-1, -2)
+    )
+    actual = attention._decode_attention(q, latent, kr, mask)
+    assert actual.dtype == mx.bfloat16
+    relative_error = np.linalg.norm(as_double(actual) - expected) / np.linalg.norm(
+        expected
+    )
+    assert relative_error < 1e-3
+
+
+@pytest.mark.parametrize("layer_idx", [0, 3])
+def test_mistral_large4_quantized_kv_projection_decode(
+    mistral_large4_language, layer_idx
+):
+    model = mistral_large4_language.model
+    attention = model.layers[layer_idx].attention
+    attention.wkv_b = attention.wkv_b.to_quantized(group_size=16, bits=4, mode="nvfp4")
+    x = mx.random.normal((2, 11, 32))
+    positions = mx.broadcast_to(mx.arange(11)[None], (2, 11))
+    cos, sin = model.rotary_emb(positions, x.dtype)
+    expected, _ = attention(x, positions, cos, sin, None, {}, None, None)
+    cache = LatentCache()
+    attention(
+        x[:, :10], positions[:, :10], cos[:, :10], sin[:, :10], cache, {}, None, None
+    )
+    actual, _ = attention(
+        x[:, 10:], positions[:, 10:], cos[:, 10:], sin[:, 10:], cache, {}, None, None
+    )
+    assert mx.allclose(actual, expected[:, -1:], atol=1e-6, rtol=1e-5).item()
+
+
 @pytest.mark.parametrize("right_pad", [False, True])
 @pytest.mark.parametrize("chunks", [((0, 9),), ((0, 2), (2, 5), (5, 8), (8, 9))])
 def test_deepseek_v41_batch_cache_matches_independent_requests(right_pad, chunks):
@@ -214,13 +656,26 @@ def test_deepseek_v41_batch_cache_matches_independent_requests(right_pad, chunks
         config, model.layout, token_map=[i % 7 for i in range(config.vocab_size)]
     )
     model.head.weight = mx.random.normal(model.head.weight.shape) * 0.05
-    prompts = [[3, 7, 5, 5, 11, 15, 19, 23, 27], [9, 5, 13]]
+    prompts = [[3, 7, 5, 5, 11, 15, 19, 23, 27], [9, 5, 13], [17, 5, 21, 25]]
+    continuations = [[31, 32, 33, 34, 36, 37], [32, 33, 34, 35], [35, 36, 35, 36]]
+    streams = [prompt + tokens for prompt, tokens in zip(prompts, continuations)]
+    # Causal full-sequence logits are an independent oracle for every prefix.
+    # Reuse their slices instead of recomputing each growing history.
+    full_logits = [model(mx.array([stream])).logits for stream in streams]
 
-    def assert_logits(actual, expected):
-        mx.eval(actual, expected)
-        assert mx.allclose(actual, expected, atol=1e-4).item()
+    comparisons = []
 
-    references = [model.make_cache() for _ in prompts]
+    def compare_logits(actual, expected):
+        comparisons.append(mx.allclose(actual, expected, atol=1e-4))
+
+    def check_comparisons():
+        # Evaluate each phase together instead of synchronizing every row/check.
+        mx.eval(comparisons)
+        for index, comparison in enumerate(comparisons):
+            assert comparison.item(), f"comparison {index}"
+        comparisons.clear()
+
+    references = [model.make_cache() for _ in prompts[:2]]
     padding = [0, 6]
     cache = _make_cache(model, [0, 0] if right_pad else padding)
     if right_pad:
@@ -228,44 +683,50 @@ def test_deepseek_v41_batch_cache_matches_independent_requests(right_pad, chunks
     ids = mx.array(
         [
             prompt + [0] * pad if right_pad else [0] * pad + prompt
-            for prompt, pad in zip(prompts, padding)
+            for prompt, pad in zip(prompts[:2], padding)
         ]
     )
     # One row is entirely padding in two of these chunks.
     for start, stop in chunks:
         actual = model(ids[:, start:stop], cache=cache).logits
         mx.eval(actual, cache[0].state)
-        for index, (prompt, reference) in enumerate(zip(prompts, references)):
+        for index, (prompt, reference) in enumerate(zip(prompts[:2], references)):
             first = 0 if right_pad else padding[index]
             begin, end = max(start, first), min(stop, first + len(prompt))
             if begin < end:
                 expected = model(
                     ids[index : index + 1, begin:end], cache=reference
                 ).logits
-                full = model(mx.array([prompt[: end - first]])).logits
-                assert_logits(expected, full[:, -(end - begin) :])
-                assert_logits(
+                full = full_logits[index][:, begin - first : end - first]
+                compare_logits(expected, full)
+                compare_logits(
                     actual[index : index + 1, begin - start : end - start],
                     expected,
                 )
+        check_comparisons()
     if right_pad:
         cache[0].finalize()
     assert cache[0].offset.tolist() == [9, 3]
 
     # Exercise different compression phases, then admit a new request.
-    histories = [list(prompt) for prompt in prompts]
+    active = [0, 1]
+    lengths = [len(prompt) for prompt in prompts[:2]]
     for step in range(6):
         if step == 2:
             joined = model.make_cache()
-            mx.eval(model(mx.array([[17, 5, 21, 25]]), cache=joined).logits)
+            mx.eval(model(mx.array([prompts[2]]), cache=joined).logits)
             cache = _extend_cache(cache, joined)
             references.append([joined[0].extract(0)])
-            histories.append([17, 5, 21, 25])
+            active.append(2)
+            lengths.append(len(prompts[2]))
         if step == 4:
             cache[0].filter(mx.array([2, 0]))
             references = [references[2], references[0]]
-            histories = [histories[2], histories[0]]
-        tokens = mx.array([[31 + index + step] for index in range(len(references))])
+            active = [active[2], active[0]]
+            lengths = [lengths[2], lengths[0]]
+        tokens = mx.array(
+            [[streams[request][length]] for request, length in zip(active, lengths)]
+        )
         actual = model(tokens, cache=cache).logits
         expected = mx.concatenate(
             [
@@ -273,11 +734,11 @@ def test_deepseek_v41_batch_cache_matches_independent_requests(right_pad, chunks
                 for index, reference in enumerate(references)
             ]
         )
-        assert_logits(actual, expected)
+        compare_logits(actual, expected)
         for index, reference in enumerate(references):
-            histories[index].append(31 + index + step)
-            full = model(mx.array([histories[index]])).logits[:, -1:]
-            assert_logits(actual[index : index + 1], full)
+            lengths[index] += 1
+            full = full_logits[active[index]][:, lengths[index] - 1 : lengths[index]]
+            compare_logits(actual[index : index + 1], full)
             row = cache[0].extract(index)
             assert row.offset == reference[0].offset
             for ring in row.window:
@@ -289,12 +750,13 @@ def test_deepseek_v41_batch_cache_matches_independent_requests(right_pad, chunks
                 if array is not None and array.shape[1]
             )
             assert row.memory_profile(row.offset).fixed_bytes == fixed + reserve
-            assert mx.array_equal(row.engram, reference[0].engram).item()
+            comparisons.append(mx.array_equal(row.engram, reference[0].engram))
+        check_comparisons()
 
     # Merging already-populated scalar caches is the server join path.
     merged = _extend_cache(references[0], references[1])
     tokens = mx.array([[41], [43]])
-    assert_logits(
+    compare_logits(
         model(tokens, cache=merged).logits,
         model(tokens, cache=cache).logits,
     )
@@ -306,10 +768,11 @@ def test_deepseek_v41_batch_cache_matches_independent_requests(right_pad, chunks
     assert not cache[0].is_trimmable()
     assert all(not row.is_trimmable() for row in restored)
     # Restored compressor state must continue from each request's exact prefix.
-    assert_logits(
+    compare_logits(
         model(tokens, cache=cache).logits,
         model(tokens, cache=merged).logits,
     )
+    check_comparisons()
 
 
 @pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
@@ -558,6 +1021,18 @@ def test_empty_batch_kv_cache_ignores_unapplied_right_padding():
     assert cache._right_padding is None
 
 
+def test_empty_batch_kv_cache_extracts_unused_composite_layer():
+    cache = BatchKVCache([0, 2])
+    for idx in (0, 1, -1):
+        extracted = cache.extract(idx)
+        assert isinstance(extracted, KVCache)
+        assert extracted.empty()
+        assert extracted.offset == 0
+    for idx in (-3, 2):
+        with pytest.raises(IndexError):
+            cache.extract(idx)
+
+
 @pytest.mark.parametrize(
     "factory", [BatchKVCache, BatchQuantizedKVCache, BatchQSAKVCache]
 )
@@ -689,6 +1164,85 @@ def test_chunked_kv_cache_trims_on_valid_length_not_buffer_width():
     assert window[-1] == n_tokens - 1
     assert window == list(range(window[0], window[0] + len(window)))
     assert cache.start_position <= cache.offset
+
+
+@pytest.mark.parametrize("size", [2, 8, 255, 256, 257])
+@pytest.mark.parametrize("keep_kind", ["none", "prefix", "all_but_one"])
+def test_rotating_cache_visible_tokens(size, keep_kind):
+    keep = {"none": 0, "prefix": min(4, size - 1), "all_but_one": size - 1}[keep_kind]
+    cache = RotatingKVCache(size, keep)
+    retained, start = [], 0
+    # Exercise allocation, rotation, and concatenation in both directions.
+    for n in [1] * (size + 3) + [7, 1, size + 5, 1, 3]:
+        mask = cache.make_mask(n)
+        kv = mx.arange(start, start + n).reshape(1, 1, n, 1)
+        keys, _ = cache.update_and_fetch(kv, kv)
+        ids = keys[0, 0, :, 0].tolist()
+        rows = mask.tolist() if isinstance(mask, mx.array) else None
+        for row in range(n):
+            # Independent reference: evict the oldest token outside the prefix.
+            retained.append(start + row)
+            if len(retained) > size:
+                del retained[keep]
+            visible = [
+                token
+                for col, token in enumerate(ids)
+                if (token <= start + row if rows is None else rows[row][col])
+            ]
+            assert sorted(visible) == retained
+        start += n
+
+
+def test_rotating_cache_explicit_windows():
+    for keep, history, n, window, return_array in product(
+        [0, 1, 3], [0, 3, 4, 9], [2, 6], [1, 2, 3, 7], [False, True]
+    ):
+        cache = RotatingKVCache(4, keep)
+        kv = mx.zeros((1, 1, 1, 1))
+        for _ in range(history):
+            cache.update_and_fetch(kv, kv)
+        actual = cache.make_mask(n, window, return_array)
+        offset = min(3, history)
+        if offset + n > window or return_array:
+            expected = create_causal_mask(n, offset, window_size=window)
+            assert mx.array_equal(actual, expected)
+        else:
+            assert actual == "causal"
+
+
+@pytest.mark.parametrize("container", [None, list, tuple])
+def test_rotating_cache_mask_dispatch(container):
+    cache = RotatingKVCache(8, keep=2)
+    wrapped = container([cache]) if container in (list, tuple) else cache
+    mask = create_attention_mask(mx.zeros((1, 20, 8)), wrapped)
+    assert mask.shape == (20, 20)
+    assert mx.all(mask[2:, :2])
+    assert mask[-1].sum().item() == 8
+
+
+@pytest.mark.parametrize("kind", [KVCache, RotatingKVCache, BufferedRotatingKVCache])
+def test_cache_position_offset_is_absolute(kind):
+    cache = kind() if kind is KVCache else kind(8, keep=2)
+    for _ in range(21):
+        kv = mx.zeros((1, 1, 1, 8))
+        cache.update_and_fetch(kv, kv)
+    assert cache_position_offset(cache) == 21
+    if kind is not KVCache:
+        assert cache._idx != 21
+
+
+@pytest.mark.parametrize("rotating", [False, True])
+def test_cache_position_offset_includes_batch_padding(rotating):
+    cache = (
+        BatchRotatingKVCache(8, left_padding=[2, 3])
+        if rotating
+        else BatchKVCache(left_padding=[2, 3])
+    )
+    for _ in range(21):
+        kv = mx.zeros((2, 1, 1, 8))
+        cache.update_and_fetch(kv, kv)
+    assert cache_position_offset(cache) == 21
+    assert cache.offset.tolist() == [19, 18]
 
 
 @pytest.mark.parametrize("max_kv_size", [None, 1024])
@@ -964,6 +1518,44 @@ def test_prepare_left_padding_on_empty_only():
 
 
 class TestVisionFeatureCache:
+    def test_processed_key_preserves_gemma_patch_positions(self):
+        from PIL import Image
+
+        from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
+            Gemma4UnifiedImageProcessor,
+        )
+
+        processor = Gemma4UnifiedImageProcessor(
+            do_resize=False, max_soft_tokens=8, patch_size=16, pooling_kernel_size=2
+        )
+        square, _ = processor.preprocess(Image.new("RGB", (64, 64)))
+        wide, _ = processor.preprocess(Image.new("RGB", (128, 32)))
+        assert mx.array_equal(
+            mx.array(square["pixel_values"]), mx.array(wide["pixel_values"])
+        )
+        assert not mx.array_equal(
+            mx.array(square["image_position_ids"]), mx.array(wide["image_position_ids"])
+        )
+        assert processed_image_key(**square) != processed_image_key(**wide)
+        assert processed_image_key(**square) == processed_image_key(
+            **square, input_ids=mx.array([[1, 2]]), temperature=0.5, max_tokens=16
+        )
+
+    def test_processed_key_preserves_patch_geometry(self):
+        pixels = mx.zeros((16, 3))
+        square = processed_image_key(pixels, mx.array([[1, 4, 4]]))
+        wide = processed_image_key(pixels, mx.array([[1, 2, 8]]))
+        assert square != wide
+        assert square == processed_image_key(mx.zeros((16, 3)), mx.array([[1, 4, 4]]))
+
+    def test_processed_key_handles_ragged_image_batches(self):
+        images = [mx.zeros((4, 3)), mx.ones((16, 3))]
+        key = processed_image_key(images)
+        assert key == processed_image_key([mx.zeros((4, 3)), mx.ones((16, 3))])
+        assert key != processed_image_key(list(reversed(images)))
+        assert key != processed_image_key([mx.ones((4, 3)), images[1]])
+        assert key != processed_image_key([images[0], mx.ones((32, 3))])
+
     def test_lru_eviction(self):
         cache = VisionFeatureCache(max_size=2)
         cache.put("a.jpg", mx.ones((1, 10, 64)))
@@ -1082,6 +1674,10 @@ def coordinate(manager, caches):
 @pytest.fixture
 def managers(tmp_path, monkeypatch):
     """Own writers and readers, including reopened namespaces and memory budgets."""
+    # Keep one real host-memory reading per case. Budget/pressure tests override
+    # this explicitly; repeated vm_stat processes add no cache-lifecycle coverage.
+    free_ram = P._free_ram_bytes()
+    monkeypatch.setattr(P, "_free_ram_bytes", lambda: free_ram)
     owned = []
 
     def make(
@@ -1170,6 +1766,45 @@ def language_model(name):
     return module.Model(config).language_model
 
 
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+@pytest.mark.parametrize("prefix_length", [7, 255, 257])
+def test_qwen3_5_single_row_decode_retains_batch_cache(dtype, prefix_length):
+    mx.random.seed(13)
+    module, config = apc_config("qwen3_5")
+    config.text_config.linear_key_head_dim = 32
+    lm = module.LanguageModel(config.text_config, config)
+    lm.set_dtype(dtype)
+    lm.eval()
+    tokens = mx.array([[i % 50 + 1 for i in range(prefix_length)]])
+    reference = lm.make_cache()
+    batched = _make_cache(lm, [0])
+    lm(tokens, cache=reference)
+    lm(tokens, cache=batched)
+    owners = list(batched)
+
+    for step in range(4):
+        token = mx.array([[51 + step]])
+        expected = lm(token, cache=reference).logits
+        actual = lm(token, cache=batched).logits
+        tolerance = 1e-4 if dtype == mx.float32 else 1e-2
+        assert mx.allclose(actual, expected, atol=tolerance, rtol=tolerance).item()
+        assert mx.array_equal(mx.argmax(actual, -1), mx.argmax(expected, -1)).item()
+        # The allocation may grow at a block boundary, but the cache owner and
+        # its spare capacity must survive each decode step.
+        assert all(current is original for current, original in zip(batched, owners))
+        for current in batched:
+            if isinstance(current, BatchKVCache):
+                assert current.offset.tolist() == [prefix_length + step + 1]
+                assert current.left_padding.tolist() == [0]
+                assert current.keys.shape[2] >= current._idx
+        for current, expected_cache in zip(batched, reference):
+            if isinstance(current, ArraysCache):
+                for state, expected_state in zip(current.state, expected_cache.state):
+                    assert mx.allclose(
+                        state, expected_state, atol=tolerance, rtol=tolerance
+                    ).item()
+
+
 def test_hashes_and_dependencies():
     tokens = tuple(range(16))
     hash_tokens = P._hash_tokens
@@ -1192,12 +1827,14 @@ def test_hashes_and_dependencies():
     variants = [("a", image), ("b", image), ("a", 42)]
     assert len({tenant_hash(t, i) for t, i in variants}) == 3
     code = "from mlx_vlm.apc import tenant_scoped_hash; print(tenant_scoped_hash('a', 123456789))"
-    outputs = [
-        subprocess.check_output(
+
+    def run(seed):
+        return subprocess.check_output(
             [sys.executable, "-c", code], env={**os.environ, "PYTHONHASHSEED": seed}
         )
-        for seed in ("1", "2")
-    ]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outputs = list(pool.map(run, ("1", "2")))
     assert outputs[0] == outputs[1]
     base = P.semantic_extra_hash(image_hash=5)
     good = NS(apc_key_dependencies=lambda: ["adapter-x"])
@@ -1591,6 +2228,182 @@ def test_clone_continuation(kind, length):
         assert A.merge_cache_entries([cache], [cache.offset]) is None
 
 
+def test_ring_prompt_boundary_survives_partial_prefill_restore():
+    cache = RingSlidingKVCache(2)
+    cache.prefill_length = 5
+    prompt = mx.arange(20, dtype=mx.float32).reshape(1, 1, 5, 4)
+    cache.update_and_fetch(prompt[:, :, :3], prompt[:, :, :3])
+    # The existing four-field format retains the full boundary even when only
+    # part of the prompt has been processed; no pending-prefill flag is needed.
+    assert cache.meta_state == ("2", "5", "3", "0")
+    restored = clone(cache)
+    assert restored.prefill_length == 5 and restored.offset == 3
+    for idx in range(3, 5):
+        restored.update_and_fetch(
+            prompt[:, :, idx : idx + 1], prompt[:, :, idx : idx + 1]
+        )
+    for value in (20, 21, 22):
+        token = mx.full((1, 1, 1, 4), value, dtype=mx.float32)
+        restored.update_and_fetch(token, token)
+    assert restored.state[0].shape[2] == 7
+    same_arrays(restored.state[0][:, :, :5], prompt)
+
+
+@parametrize("decode_steps", [0, 1, 5])
+def test_ring_snapshot_preserves_type_and_decode_position(decode_steps):
+    cache = RingSlidingKVCache(2)
+    cache.prefill_length = 3
+    prompt = mx.arange(24, dtype=mx.float32).reshape(2, 1, 3, 4)
+    cache.update_and_fetch(prompt, prompt)
+    for step in range(decode_steps):
+        token = mx.full((2, 1, 1, 4), step + 30, dtype=mx.float32)
+        cache.update_and_fetch(token, token)
+
+    restored = snapshot_row([cache], 1)[0]
+    assert type(restored) is RingSlidingKVCache
+    assert restored.meta_state == cache.meta_state
+    same_arrays(restored.state, tuple(t[1:2] for t in cache.state))
+    token = mx.full((2, 1, 1, 4), 99, dtype=mx.float32)
+    expected = cache.update_and_fetch(token, token)
+    actual = restored.update_and_fetch(token[1:2], token[1:2])
+    same_arrays(actual, tuple(t[1:2] for t in expected))
+    assert restored.meta_state == cache.meta_state
+
+
+@parametrize("api", ["helper", "coordinator"])
+def test_native_single_row_merge_preserves_public_input(api, managers):
+    source = RingSlidingKVCache(2)
+    filled(source, 4, heads=1, dim=4)
+    original_meta = source.meta_state
+    if api == "helper":
+        caches, prefix_len = warm_exact([[source]], [4])
+    else:
+        runner = coordinate(managers(), [source])
+        caches, prefix_len = runner.merge_rows([{"warm_cache": [source]}], [4])
+    assert prefix_len == 4 and type(caches[0]) is type(source)
+    assert caches[0] is not source
+    keys, values = kv(1, heads=1, dim=4)
+    caches[0].update_and_fetch(keys, values)
+    assert source.meta_state == original_meta
+    assert caches[0].offset == source.offset + 1
+
+
+@parametrize("quantized", [False, True])
+@parametrize("nested", [False, True])
+@parametrize("tier", ["memory", "disk-only"])
+def test_dash_checkpoint_preserves_router_and_page_state(
+    managers, quantized, nested, tier
+):
+    from mlx_vlm.models.unlimited_ocr.dash import (
+        DashKVCache,
+        DashParams,
+        DashQuantizedKVCache,
+        DashState,
+    )
+
+    state = DashState(
+        DashParams(block_size=4, index_dim=8, image_token_id=9, page_token_id=7)
+    )
+    tokens = [1, 7] + [9] * 12 + [4, 5]
+    state.start(tokens)
+    state.page, state.tok, state.markers = mx.array(1), mx.array(19), mx.array(2)
+    cache = (
+        DashQuantizedKVCache(state, group_size=32, bits=4)
+        if quantized
+        else DashKVCache(state)
+    )
+    filled(cache, 16, heads=1, dim=32)
+    cache.add_index_keys(mx.arange(120, dtype=mx.float32).reshape(15, 8), mx.ones(8))
+    caches = [C.CacheList(cache)] if nested else [cache]
+    manager = managers(tier)
+    runner = coordinate(manager, caches)
+    assert runner.enabled and runner.is_checkpoint
+    assert A.apc_exact_eligible(cache) and not A.apc_block_eligible(cache)
+    expected = cache.prefix_cache_snapshot()
+    for copy in (False, True):
+        row = snapshot_row(caches, clone=copy)[0]
+        restored = row.caches[0] if nested else row
+        assert type(restored) is type(cache)
+        same_arrays(restored.prefix_cache_snapshot(), expected)
+    assert runner.store_checkpoint(tokens, caches)
+    if tier == "disk-only":
+        manager.disk.flush()
+        manager.close()
+        manager = managers(tier)
+    rows, count = manager.lookup_exact_cache(tokens + [6])
+    assert count == len(tokens)
+    restored = rows[0].caches[0] if nested else rows[0]
+    assert type(restored) is type(cache)
+    same_arrays(restored.prefix_cache_snapshot(), expected)
+    assert restored.dash_state is not state
+    if tier == "disk-only":
+        assert manager.stats.disk_hits == 1
+
+    # Completing the partial router block and updating K/V must match the
+    # uninterrupted cache, including the packed quantization configuration.
+    new_keys = mx.ones((1, 8))
+    for item in (cache, restored):
+        item.add_index_keys(new_keys, mx.ones(8))
+    keys, values = kv(1, heads=1, dim=32)
+    same_arrays(
+        cache.update_and_fetch(keys, values), restored.update_and_fetch(keys, values)
+    )
+    same_arrays(cache.prefix_cache_snapshot(), restored.prefix_cache_snapshot())
+    restored.pending = mx.zeros((1, 8))
+    restored.dash_state.markers = mx.array(99)
+    assert cache.pending is None and state.markers.item() == 2
+
+
+@parametrize(
+    "names",
+    [
+        ("Z1TCache",),
+        ("KVCache", "RingSlidingKVCache"),
+        ("CacheList", "HyV4KVCache"),
+        ("CacheList", "SimpleKVCache"),
+    ],
+)
+@parametrize("memory_pressure", [False, True])
+def test_unmergeable_cache_falls_back_but_memory_pressure_propagates(
+    names, memory_pressure, managers, monkeypatch
+):
+    from mlx_vlm.generate.ar import BatchGenerator
+
+    model = cache_model([sample(name) for name in names])
+    processor = NS(stopping_criteria=NS(add_eos_token_ids=lambda _: None))
+    manager = managers()
+    runner = BatchGenerator(
+        model, processor, apc_manager=manager, manage_wired_limit=False
+    )
+    try:
+        tokens = list(range(20))
+        rows = [sample(name, 16) for name in names]
+        assert manager.store_exact_cache(tokens[:16], rows)
+        pick = runner.apc.lookup(
+            tokens,
+            extra_hash=0,
+            safe_lookup_min=0,
+            suffix_is_text_only=lambda _: True,
+            prefix_has_media=lambda _: False,
+        )
+        assert pick is not None
+        runner.apc.prepare_prefill([20, 20], prefix_lengths=[16, 16])
+        if memory_pressure:
+            monkeypatch.setattr(runner.apc, "prepare_prefill", lambda *a, **kw: False)
+        sequence = (0, tokens, 3, {"inputs_embeds": mx.zeros((1, 20, 4))}, [], None)
+        if memory_pressure:
+            with pytest.raises(P.APCAdmissionError):
+                runner._build_mixed_prompt_batch([sequence, sequence], [pick, pick])
+        else:
+            assert (
+                runner._build_mixed_prompt_batch([sequence, sequence], [pick, pick])
+                is None
+            )
+        runner._release_prefill_pick(pick)
+    finally:
+        runner.close()
+
+
 def sample(name, length=0):
     constructors = {
         "ArraysCache": lambda: C.ArraysCache(2),
@@ -1599,6 +2412,7 @@ def sample(name, length=0):
         ),
         "ChunkedKVCache": lambda: C.ChunkedKVCache(8),
         "DeepseekV41Cache": lambda: DeepseekV41Cache(1),
+        "LatentCache": LatentCache,
         "PoolingCache": lambda: C.PoolingCache(2),
         "RingSlidingKVCache": lambda: RingSlidingKVCache(max(16, length)),
         "RotatingKVCache": lambda: C.RotatingKVCache(max(16, length * 2)),
@@ -1626,6 +2440,10 @@ def sample(name, length=0):
         cache.offset = length
         cache.cum_eKV, cache.cum_eK = mx.ones((1, 4)), mx.ones((1, 4)) * 2
         cache.win_eKV, cache.win_eK = mx.ones((1, 3, 4)) * 3, mx.ones((1, 3, 4)) * 4
+    elif name == "LatentCache":
+        cache.update_latent(keys, keys * 2)
+        cache.update_index(keys[:, 0] * 3)
+        cache.offset = length
     elif name in ("SimpleKVCache", "MiniMaxM3KVCache"):
         cache.update_and_fetch(keys, keys * 2)
         if name == "MiniMaxM3KVCache":
@@ -1678,7 +2496,8 @@ def discover_contracts():
 
 
 @parametrize("names", discover_contracts(), ids=lambda names: "+".join(names))
-def test_model_cache_contract(names, managers, monkeypatch):
+@parametrize("merge_method", ["merge_rows", "_merge_and_release_cache_rows"])
+def test_model_cache_contract(names, merge_method, managers, monkeypatch):
     monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "2")
     for name in names:
         cache = sample(name)
@@ -1714,15 +2533,99 @@ def test_model_cache_contract(names, managers, monkeypatch):
     assert runner.materialize_single(hit, min_capacity_tokens=17) is not None
     assert manager.stats_snapshot()["restored_tokens"] == 16
     manager.reset_stats()
-    merged, _ = runner.merge_rows([hit], [16])
+    original_entries = tuple(hit["warm_cache"]) if plan.strategy != "block" else None
+    merged, _ = getattr(runner, merge_method)([hit], [16])
     assert manager.stats_snapshot()["restored_tokens"] == (
         16 if merged is not None else 0
     )
+    if original_entries is not None and merged is not None:
+        if merge_method == "merge_rows":
+            assert all(a is b for a, b in zip(hit["warm_cache"], original_entries))
+        else:
+            assert hit["warm_cache"] == [None] * len(original_entries)
     runner.release_hit(hit)
+
+
+@parametrize("row_type", [list, tuple])
+@parametrize("fail_last_layer", [False, True])
+def test_exact_merge_preserves_borrowed_rows(row_type, fail_last_layer, monkeypatch):
+    rows = tuple(
+        row_type(sample(name, 16) for name in ("KVCache", "ArraysCache"))
+        for _ in range(2)
+    )
+    originals = [tuple(row) for row in rows]
+    merge = P._merge_exact_cache_entries
+
+    def checked_merge(entries, lengths):
+        if fail_last_layer and entries[0] is originals[0][-1]:
+            return None
+        return merge(entries, lengths)
+
+    monkeypatch.setattr(P, "_merge_exact_cache_entries", checked_merge)
+    merged, count = warm_exact(rows, [16, 16])
+    assert (merged is None) == fail_last_layer
+    assert count == (0 if fail_last_layer else 16)
+    for row, original in zip(rows, originals):
+        assert all(a is b for a, b in zip(row, original))
+
+
+@parametrize("fail_last_layer", [False, True])
+def test_consumed_exact_merge_releases_layers(monkeypatch, fail_last_layer):
+    rows = [
+        [sample(name, 16) for name in ("KVCache", "ArraysCache", "KVCache")]
+        for _ in range(2)
+    ]
+    expected, _ = warm_exact(rows, [16, 16])
+    refs = [[weakref.ref(entry) for entry in row] for row in rows]
+    merge = P._merge_exact_cache_entries
+    layer = 0
+
+    def checked_merge(entries, lengths):
+        nonlocal layer
+        if layer:
+            assert all(refs[row][layer - 1]() is None for row in range(2))
+        current, layer = layer, layer + 1
+        return None if fail_last_layer and current == 2 else merge(entries, lengths)
+
+    monkeypatch.setattr(P, "_merge_exact_cache_entries", checked_merge)
+    actual, count = P._merge_and_release_cache_rows(rows, [16, 16])
+    consumed = 2 if fail_last_layer else 3
+    assert all(row[:consumed] == [None] * consumed for row in rows)
+    if fail_last_layer:
+        assert actual is None and count == 0
+    else:
+        assert count == 16
+        for result, reference in zip(actual, expected):
+            same_arrays(result.state, reference.state)
+
+
+def test_consumed_exact_merge_preserves_retained_apc_snapshots(managers):
+    manager = managers()
+    source = [sample("ArraysCache", 16), sample("KVCache", 16)]
+    tokens = list(range(16))
+    assert manager.store_exact_cache(tokens, source)
+    coordinator = coordinate(manager, source)
+    hit = coordinator.lookup(
+        tokens + [99],
+        extra_hash=0,
+        safe_lookup_min=0,
+        suffix_is_text_only=lambda _: True,
+        prefix_has_media=lambda _: False,
+    )
+    merged, count = coordinator._merge_and_release_cache_rows([hit], [16])
+    assert count == 16 and hit["warm_cache"] == [None, None]
+    merged[0][0] = mx.zeros_like(merged[0][0])
+    merged[1].keys = mx.zeros_like(merged[1].keys)
+    restored, count = manager.lookup_exact_cache(tokens + [99])
+    assert count == 16
+    for result, reference in zip(restored, source):
+        same_arrays(result.state, reference.state)
 
 
 @parametrize("kind", ["qsa", "deepseek", "composite", "ring-indexed"])
 def test_disk_custom_state(kind, managers, monkeypatch):
+    # This checks serialization, not the host-dependent disk admission guard.
+    monkeypatch.setenv("APC_DISK_MIN_FREE_RAM_GB", "0")
     monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "1" if kind == "qsa" else "0")
     monkeypatch.setenv("APC_EXACT_MIN_TOKENS", "1")
     if kind == "qsa":
@@ -2223,6 +3126,10 @@ def test_checkpoint_schedule(prefix_manager):
     coordinator = manager.coordinator(cache_model([C.ArraysCache(1)]))
     tokens = list(range(75))
     assert coordinator.checkpoint_lengths(tokens, set()) == [64, 74]
+    assert coordinator.checkpoint_lengths(tokens, set(), stable_prefix_len=43) == [
+        43,
+        74,
+    ]
     manager._exact_cache_max = 4
     assert coordinator.checkpoint_lengths(tokens, set()) == [32, 48, 64, 74]
     tokens[45:67] = [999] * 22
@@ -2231,7 +3138,68 @@ def test_checkpoint_schedule(prefix_manager):
     assert coordinator.checkpoint_lengths(tokens, set()) == [74]
 
 
-def prompt_batch(lm, manager, tokens, prefixes, caches, step=16, **kwargs):
+def test_checkpoint_divergence_is_scoped_and_media_safe(prefix_manager):
+    manager = prefix_manager()
+    manager.checkpoint_interval_tokens = 16
+    coordinator = manager.coordinator(cache_model([C.ArraysCache(1)]))
+    stored = list(range(75))
+    state = C.ArraysCache(1)
+    state[0] = mx.ones((1, 2))
+    assert manager.store_exact_cache(stored, [state], extra_hash=7)
+    tokens = stored[:37] + [999] * 38
+    assert coordinator.checkpoint_lengths(tokens, set(), extra_hash=7) == [37, 74]
+    assert coordinator.checkpoint_lengths(tokens, set(), extra_hash=8) == [64, 74]
+    # Do not checkpoint inside a media span, or exceed the two-entry limit.
+    media = stored[:37] + [999] * 8 + list(range(45, 75))
+    assert coordinator.checkpoint_lengths(media, {999}, extra_hash=7) == [45, 74]
+    manager._exact_cache_max = 1
+    assert coordinator.checkpoint_lengths(tokens, set(), extra_hash=7) == [74]
+
+
+@parametrize("model_name", ["qwen3_5", "lfm2"])
+@parametrize("explicit_boundary", [False, True])
+def test_hybrid_replaced_suffix_keeps_reusable_state(
+    prefix_manager, model_name, explicit_boundary
+):
+    mx.random.seed(13)
+    lm = language_model(model_name)
+    manager = prefix_manager()
+    manager.checkpoint_interval_tokens = 16
+    for turn in range(8):
+        canonical = list(range(1, 22 + turn * 3))
+        tokens = canonical + [50 + turn] * 40
+        restored, count = manager.lookup_exact_cache(tokens)
+        if explicit_boundary and turn:
+            assert count == len(canonical) - 3
+        if turn >= 2:
+            assert count >= 21 + (turn - 2) * 3
+        cache, _ = warm_exact([restored or lm.make_cache()], [count])
+        batch = prompt_batch(
+            lm,
+            manager,
+            [tokens],
+            [count],
+            cache,
+            stable_prefix_len=len(canonical) if explicit_boundary else 0,
+        )
+        sampled = []
+
+        def sample(lp):
+            sampled.append(lp)
+            return mx.argmax(lp, axis=-1)
+
+        finish_batch(batch, sample)
+        reference = lm.make_cache()
+        logits = lm(mx.array([tokens]), cache=reference).logits[0, -1]
+        logprobs = logits - mx.logsumexp(logits)
+        assert mx.allclose(sampled[0][0], logprobs, atol=1e-4, rtol=1e-4).item()
+        assert mx.argmax(sampled[0][0]).item() == mx.argmax(logits).item()
+        assert len(manager._exact_cache) <= 2
+
+
+def prompt_batch(
+    lm, manager, tokens, prefixes, caches, step=16, stable_prefix_len=0, **kwargs
+):
     runner = manager.coordinator(lm)
     suffixes = [ids[n:] for ids, n in zip(tokens, prefixes)]
     padded = [ids + [0] * (max(map(len, suffixes)) - len(ids)) for ids in suffixes]
@@ -2250,7 +3218,9 @@ def prompt_batch(lm, manager, tokens, prefixes, caches, step=16, **kwargs):
             dict(
                 full_input_ids=ids,
                 prefix_len=n,
-                checkpoint_lengths=runner.checkpoint_lengths(ids, set()),
+                checkpoint_lengths=runner.checkpoint_lengths(
+                    ids, set(), stable_prefix_len=stable_prefix_len
+                ),
             )
             for ids, n in zip(tokens, prefixes)
         ],
@@ -2269,6 +3239,68 @@ def finish_batch(batch, sample=None):
 
 def embeddings(lm, tokens):
     return lm.model.embed_tokens(tokens) * getattr(lm.model, "embed_scale", 1)
+
+
+@parametrize(
+    "case_id",
+    [
+        "lfm2",
+        "gemma4",
+        "mistral_large4",
+        "qwen3_5",
+        "qwen3_5_moe",
+        "TestGetInputEmbeddings.qwen2_vl_input_embeddings",
+        "TestGetInputEmbeddings.qwen2_5_vl_input_embeddings",
+        "TestGetInputEmbeddings.qwen3_vl_input_embeddings",
+        "TestGetInputEmbeddings.qwen3_vl_moe_input_embeddings",
+    ],
+)
+@parametrize("tied", [False, True])
+@parametrize("keep", [None, 0, 1, 3, 8])
+@parametrize("dtype", [mx.float32, mx.bfloat16])
+def test_trailing_logits_preserve_cache_and_hidden_states(case_id, tied, keep, dtype):
+    from mlx_vlm.models.cache import make_prompt_cache
+
+    mx.random.seed(19)
+    if case_id in ("lfm2", "gemma4"):
+        module, config = apc_config(case_id)
+    else:
+        case = next(case for case in DATA["cases"] if case["id"] == case_id)
+        module = importlib.import_module("mlx_vlm.models." + case["module"])
+        config = build_config(module, case["config"])
+    text = getattr(config, "text_config", config)
+    if hasattr(text, "tie_word_embeddings"):
+        text.tie_word_embeddings = tied
+    lm = module.Model(config).language_model
+    lm.set_dtype(dtype)
+    lm.eval()
+    tokens = mx.array([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]])
+    full_cache, tail_cache = make_prompt_cache(lm), make_prompt_cache(lm)
+    full = lm(tokens, cache=full_cache, capture_layer_ids=[0])
+    # Observe the vocabulary projection, not a slice of already-computed logits.
+    head = getattr(lm, "lm_head", lm.model.embed_tokens)
+    method = "as_linear" if isinstance(head, nn.Embedding) else "__call__"
+    project = getattr(type(head), method)
+    widths = []
+
+    def observed(owner, hidden, *args, **kwargs):
+        if owner is head:
+            widths.append(hidden.shape[1])
+        return project(owner, hidden, *args, **kwargs)
+
+    with patch.object(type(head), method, observed):
+        tail = lm(tokens, cache=tail_cache, logits_to_keep=keep, capture_layer_ids=[0])
+    assert widths == [min(keep, 5) if keep else 5]
+    tolerance = 0.02 if dtype == mx.bfloat16 else 1e-5
+    expected = full.logits[:, -keep:] if keep else full.logits
+    assert mx.allclose(tail.logits, expected, atol=tolerance, rtol=tolerance).item()
+    same_arrays(full.hidden_states, tail.hidden_states)
+    same_cache(full_cache, tail_cache)
+    next_tokens = mx.array([[11], [12]])
+    assert mx.array_equal(
+        lm(next_tokens, cache=tail_cache).logits,
+        lm(next_tokens, cache=full_cache).logits,
+    ).item()
 
 
 @parametrize("prefill_step_size", [None, 4, 16, 32])
@@ -2358,7 +3390,8 @@ def test_diffusion_suffix(prefix_manager, tier):
         manager = prefix_manager(tier, **settings)
     recorder.input_lengths.clear()
     assert generate(tokens[:9] + [13, 14])[-1].cached_tokens == 8
-    assert recorder.input_lengths == [2, 1]
+    assert sum(recorder.input_lengths) == 3
+    assert recorder.input_lengths[-1] == 1
 
 
 @parametrize("model_name", ["gemma4", "qwen3_5"])
@@ -2480,7 +3513,8 @@ def test_quantized_hybrid_snapshots(managers):
 
 
 @parametrize("scheme", ["uniform", "turboquant"])
-def test_warm_cache_quantization_policy(scheme, managers):
+@parametrize("merge", [warm_exact, P._merge_and_release_cache_rows])
+def test_warm_cache_quantization_policy(scheme, merge, managers):
     bits = 8 if scheme == "uniform" else 3.5
     config = dict(bits=bits, group_size=32, scheme=scheme)
     manager = managers(blocks=32)
@@ -2531,7 +3565,7 @@ def test_warm_cache_quantization_policy(scheme, managers):
             )
             for i in range(1, 4)
         ]
-        warm, _ = warm_exact([row], [16], kv_quant_config=config)
+        warm, _ = merge([row], [16], kv_quant_config=config)
         assert [type(c) for c in warm] == [type(c) for c in live]
         extended = _extend_cache(live, warm)
         assert extended[1].offset.shape[0] == 2
@@ -3237,10 +4271,12 @@ def test_restored_tokens_count_successful_restores(
         caches = runner.materialize_single(hit, min_capacity_tokens=33)
     else:
         if restore == "failed-batch":
-            builder = "exact" if mode == "exact" else "kv"
-            monkeypatch.setattr(
-                P, f"make_warm_batch_{builder}_cache_multi", lambda *a, **kw: (None, 0)
+            builder = (
+                "_merge_and_release_cache_rows"
+                if mode == "exact"
+                else "make_warm_batch_kv_cache_multi"
             )
+            monkeypatch.setattr(P, builder, lambda *a, **kw: (None, 0))
         caches, _ = runner.merge_rows([hit, None], [hit["prefix_len"], 0])
     runner.release_hit(hit)
     stats = manager.stats_snapshot()
@@ -3252,3 +4288,99 @@ def test_restored_tokens_count_successful_restores(
     manager.reset_stats()
     assert manager.stats_snapshot()["restored_tokens"] == 0
     assert manager.stats_snapshot()["stored_tokens"] == 0
+
+
+@parametrize("tier", ["memory", "disk"])
+def test_prefix_pressure_is_deferred_not_a_cache_miss(
+    memory_manager, monkeypatch, tier
+):
+    manager = memory_manager(budget=4096, disk=tier == "disk")
+    tokens = list(range(16))
+    assert manager.store_exact_cache(tokens, [allocated(16)])
+    if tier == "disk":
+        manager.disk.flush()
+        manager = memory_manager(disk=True)
+    monkeypatch.setattr(manager, "_memory_headroom", lambda: 0)
+    with pytest.raises(P.APCAdmissionError, match="deferred"):
+        manager.lookup_exact_cache(tokens + [99], defer_on_pressure=True)
+    assert manager.lookup_exact_cache([999] * 17, defer_on_pressure=True) == (None, 0)
+
+
+def test_prefill_admission_is_authoritative_before_merge(memory_manager, monkeypatch):
+    manager = memory_manager()
+    coordinator = coordinate(manager, [allocated(16)])
+    coordinator.observe_cache([allocated(16)], 16)
+    monkeypatch.setattr(manager, "_memory_headroom", lambda: 0)
+    assert coordinator.prepare_prefill([32, 32]) is False
+    forbid(monkeypatch, P, "make_warm_batch_kv_cache_multi")
+    forbid(monkeypatch, P, "_merge_and_release_cache_rows")
+    with pytest.raises(P.APCAdmissionError, match="merge"):
+        coordinator.merge_rows([None, None], [0, 0])
+
+
+@parametrize("model_name", ["lfm2", "qwen3_5"])
+def test_warm_rows_decode_while_cold_row_prefills(prefix_manager, model_name):
+    from mlx_vlm.generate.ar import BatchGenerator
+    from mlx_vlm.tests.test_generate import MockProcessor
+
+    mx.random.seed(19)
+    lm = language_model(model_name)
+    manager = prefix_manager(budget=1 << 30)
+    warm = [i % 40 + 1 for i in range(65)]
+    cold = [i % 40 + 41 for i in range(513)]
+    cache = lm.make_cache()
+    lm(mx.array([warm[:-1]]), cache=cache)
+    assert manager.store_exact_cache(warm[:-1], cache)
+    processor = MockProcessor()
+    processor.tokenizer.stopping_criteria.eos_token_ids = []
+    gen = BatchGenerator(
+        lm,
+        processor,
+        apc_manager=manager,
+        prefill_batch_size=8,
+        completion_batch_size=8,
+        prefill_step_size=2048,
+        manage_wired_limit=False,
+    )
+    uids = gen.insert(
+        [warm, cold],
+        max_tokens=[20, 3],
+        prompt_kwargs=[
+            {
+                "inputs_embeds": embeddings(lm, mx.array([tokens])),
+                "_apc_semantic_hash": 0,
+            }
+            for tokens in (warm, cold)
+        ],
+    )
+    gen.next()
+    assert gen._generation_batch.uids == [uids[0]]
+    assert [s[0] for s in gen.unprocessed_prompts] == [uids[1]]
+    _, replies = gen.next()
+    assert [r.uid for r in replies] == [uids[0]]
+    assert gen._prompt_batch.uids == [uids[1]]
+    assert gen._prompt_batch._processed_prompt_columns <= 256
+    outputs = {uids[0]: [r.token for r in replies], uids[1]: []}
+    merged = False
+    for _ in range(30):
+        # Another group sharing APC may finish its prefill between our steps.
+        gen.apc.finish_prefill()
+        _, replies = gen.next()
+        if gen._prompt_batch is not None:
+            assert manager.memory_plan.lengths == [len(cold)]
+            assert manager.memory_plan.extra_reserve_bytes > 0
+        merged |= len(gen._generation_batch) == 2
+        for reply in replies:
+            outputs[reply.uid].append(reply.token)
+        if (
+            not gen.unprocessed_prompts
+            and gen._prompt_batch is None
+            and not len(gen._generation_batch)
+        ):
+            break
+    assert merged
+    assert [len(outputs[uid]) for uid in uids] == [20, 3]
+    assert manager.stats.hits >= 1
+    assert manager._prefill_reserve_bytes == 0
+    assert manager.memory_plan.lengths == []
+    gen.close()

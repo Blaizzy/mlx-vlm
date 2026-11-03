@@ -5,6 +5,8 @@ from __future__ import annotations
 import copy
 import importlib
 import json
+import shutil
+import stat
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
@@ -645,7 +647,281 @@ def test_grid_sample_half_precision_matches_float32(dtype, grid_dtype):
     )
 
 
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+@pytest.mark.parametrize("latent,rope", [(16, 0), (16, 4), (512, 0), (512, 64)])
+@pytest.mark.parametrize("batch", [1, 3])
+def test_mistral_large4_sparse_mla_strided_cache_and_mask(dtype, latent, rope, batch):
+    from mlx_vlm.models.mistral_large4.mla_kernel import sparse_mla
+
+    mx.random.seed(17)
+    heads, length = 4, 257
+    q = mx.random.normal((batch, heads, 1, latent)).astype(dtype)
+    qr = mx.random.normal((batch, heads, 1, rope)).astype(dtype)
+    kv = mx.random.normal((batch, 1, length + 13, latent)).astype(dtype)[:, :, :length]
+    kr = mx.random.normal((batch, 1, length + 13, rope)).astype(dtype)[:, :, :length]
+    indices = mx.broadcast_to(mx.arange(0, length, 2)[None], (batch, 129))
+    limits = mx.array([length - 9] if batch == 1 else [length - 9, 97, 0])
+    mask = mx.arange(length)[None, None, None, :] < limits[:, None, None, None]
+    actual = sparse_mla(
+        q, qr, kv, kr, indices, mask, 128**-0.5, chunk=64 if batch == 1 else 128
+    )
+
+    def numpy(x):
+        return np.array(x.astype(mx.float32)).astype(np.float64)
+
+    selected = np.array(indices)[:, None, :, None]
+    values = np.take_along_axis(numpy(kv), selected, axis=2)
+    keys = np.take_along_axis(numpy(kr), selected, axis=2)
+    scores = (
+        numpy(q) @ values.swapaxes(-1, -2) + numpy(qr) @ keys.swapaxes(-1, -2)
+    ) * 128**-0.5
+    valid = np.take_along_axis(np.array(mask), np.array(indices)[:, None, None], -1)
+    scores = np.where(valid, scores, -np.inf)
+    maximum = np.max(scores, axis=-1, keepdims=True)
+    probabilities = np.exp(scores - np.where(np.isfinite(maximum), maximum, 0))
+    denominator = probabilities.sum(axis=-1, keepdims=True)
+    probabilities /= np.where(denominator > 0, denominator, 1)
+    expected = mx.array((probabilities @ values).astype(np.float32)).astype(dtype)
+    actual, expected = numpy(actual), numpy(expected)
+    assert np.isfinite(actual).all()
+    relative_l2 = np.linalg.norm(actual - expected) / np.linalg.norm(expected)
+    assert relative_l2 < (1e-3 if dtype == mx.bfloat16 else 1e-5)
+    if batch == 3:
+        np.testing.assert_array_equal(actual[-1], 0)
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16, mx.float32])
+@pytest.mark.parametrize("context", [127, 129, 257, 2051])
+@pytest.mark.parametrize("rope", [0, 64])
+def test_mistral_large4_sparse_block_queries_match_decode(dtype, context, rope):
+    from mlx_vlm.models.mistral_large4.block_mla_kernel import block_sparse_mla
+    from mlx_vlm.models.mistral_large4.mla_kernel import sparse_mla
+
+    mx.random.seed(71)
+    b, h, length, d = 3, 4, 4, 512
+    q = mx.random.normal((b, h, length, d)).astype(dtype)
+    qr = mx.random.normal((b, h, length, rope)).astype(dtype)
+    kv = mx.random.normal((b, 1, context, d)).astype(dtype)
+    kr = mx.random.normal((b, 1, context, rope)).astype(dtype)
+    counts = []
+    selected = []
+    masks = []
+    expected = []
+    for t in range(length):
+        end = context - length + t + 1
+        k = min(end, 2048)
+        indices = mx.sort(
+            mx.argsort(mx.random.uniform(shape=(b, end)), axis=-1)[:, :k], axis=-1
+        )
+        # Unequal row lengths plus one fully masked row.
+        lower = mx.array([0, 5, context])[:, None, None, None]
+        upper = mx.array([end, end - 2, end])[:, None, None, None]
+        mask = (mx.arange(context)[None, None, None, :] >= lower) & (
+            mx.arange(context)[None, None, None, :] < upper
+        )
+        expected.append(
+            sparse_mla(
+                q[:, :, t : t + 1],
+                qr[:, :, t : t + 1],
+                kv[:, :, :end],
+                kr[:, :, :end],
+                indices,
+                mask[..., :end],
+                0.125,
+                chunk=128,
+            )
+        )
+        masks.append(mask)
+        selected.append(indices)
+        counts.append(k)
+    width = max(counts)
+    indices = mx.stack(
+        [mx.pad(i, [(0, 0), (0, width - i.shape[-1])]) for i in selected], axis=1
+    )
+    actual = block_sparse_mla(
+        q, qr, kv, kr, indices, mx.concatenate(masks, axis=2), 0.125, counts, chunk=128
+    )
+    np.testing.assert_array_equal(
+        np.array(actual.astype(mx.float32)),
+        np.array(mx.concatenate(expected, axis=2).astype(mx.float32)),
+    )
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("scale_name", [None, "weight_scale_2", "weight_global_scale"])
+@pytest.mark.parametrize("down", [False, True])
+def test_mistral_large4_masked_nvfp4_route_ownership_and_rounding(
+    dtype, scale_name, down
+):
+    from mlx_vlm.models.mistral_large4.moe_kernel import masked_qmv
+
+    mx.random.seed(93)
+    k, n = 512, 24
+    linear = QuantizedSwitchLinear(
+        k, n, 4, bias=False, group_size=16, bits=4, mode="nvfp4"
+    )
+    if scale_name is not None:
+        linear = ScaledQuantizedSwitchLinear(
+            linear, mx.array([0.125, 0.77, 1.23, 2.5]), scale_name
+        )
+    # One batch has no local experts, one has all, one has mixed ownership.
+    ids = mx.array([[-1, -1, -1, -1], [0, 1, 2, 3], [-1, 2, 3, -1]], mx.int32)
+    x = mx.random.normal((3, 4 if down else 1, 1, k)).astype(dtype)
+    x[0] = float("nan")  # Unowned routes must not read inputs or weights.
+    actual = masked_qmv(x, linear, ids)
+    expected = linear(x, mx.maximum(ids, 0)).squeeze(-2)
+    expected = mx.where(ids[..., None] >= 0, expected, 0)
+    np.testing.assert_array_equal(
+        np.array(actual.astype(mx.float32)), np.array(expected.astype(mx.float32))
+    )
+
+
+@pytest.mark.parametrize("scale_name", ["weight_scale_2", "weight_global_scale"])
+def test_mistral_large4_masked_nvfp4_tensor_scale_and_noncontiguous_input(scale_name):
+    from mlx_vlm.models.mistral_large4.moe_kernel import masked_qmv
+
+    mx.random.seed(19)
+    linear = QuantizedSwitchLinear(
+        512, 16, 3, bias=False, group_size=16, bits=4, mode="nvfp4"
+    )
+    linear = ScaledQuantizedSwitchLinear(linear, mx.array(0.73), scale_name)
+    x = mx.random.normal((2, 1, 1, 1024)).astype(mx.bfloat16)[..., ::2]
+    ids = mx.array([[0, -1, 2], [-1, 1, -1]], mx.int32)
+    actual = masked_qmv(x, linear, ids)
+    expected = mx.where(
+        ids[..., None] >= 0, linear(x, mx.maximum(ids, 0)).squeeze(-2), 0
+    )
+    np.testing.assert_array_equal(
+        np.array(actual.astype(mx.float32)), np.array(expected.astype(mx.float32))
+    )
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("batch,length", [(1, 1), (2, 1), (2, 4), (8, 4)])
+@pytest.mark.parametrize("start", [0, 4])
+def test_mistral_large4_compiled_local_experts_match_decode(
+    dtype, batch, length, start
+):
+    from mlx_vlm.models.linear import tokenwise
+    from mlx_vlm.models.mistral_large4 import speculative_verifier as verifier
+    from mlx_vlm.models.mistral_large4.config import TextConfig
+    from mlx_vlm.models.mistral_large4.language import MoE
+    from mlx_vlm.models.mistral_large4.moe_kernel import masked_qmv
+
+    mx.random.seed(79)
+    ffn = MoE(
+        TextConfig(
+            hidden_size=512,
+            moe_intermediate_size=512,
+            n_routed_experts=8,
+            expert_start=start,
+            expert_end=start + 4,
+            n_shared_experts=0,
+            nvfp4=True,
+        )
+    )
+    for name in ("w1", "w3", "w2"):
+        setattr(
+            ffn.experts,
+            name,
+            ScaledQuantizedSwitchLinear(
+                getattr(ffn.experts, name),
+                mx.array([0.25, 0.5, 1.0, 0.75]),
+                "weight_scale_2",
+            ),
+        )
+    ffn.eval()
+    ffn.gate.weight = ffn.gate.weight.astype(dtype)
+    x = mx.random.normal((batch, length, 512)).astype(dtype)
+    indices, weights = tokenwise(ffn.route, x)
+    local = mx.where(
+        (indices >= start) & (indices < start + 4), indices.astype(mx.int32) - start, -1
+    )
+    order = mx.argsort(local.reshape(-1))
+    inverse = mx.argsort(order)
+    rx = x.reshape(-1, 512)[order // 4, None]
+    ri = local.reshape(-1)[order, None]
+    gate = masked_qmv(rx, ffn.experts.w1, ri)
+    up = masked_qmv(rx, ffn.experts.w3, ri)
+    reference = masked_qmv(nn.silu(gate) * up, ffn.experts.w2, ri)[inverse].reshape(
+        batch, length, 4, 512
+    )
+    modules = [ffn.experts.w1, ffn.experts.w3, ffn.experts.w2]
+    output, actual_weights = verifier.local_experts(
+        x,
+        ffn.gate.weight,
+        [m.weight for m in modules],
+        [m.scales for m in modules],
+        [verifier.expert_factor(m) for m in modules],
+        start,
+        1.0,
+    )
+    np.testing.assert_array_equal(
+        np.array(actual_weights.astype(mx.float32)),
+        np.array(weights.astype(mx.float32)),
+    )
+    np.testing.assert_array_equal(
+        np.array(output.astype(mx.float32)),
+        np.array(reference.astype(mx.float32)),
+    )
+
+
+def test_mistral_large4_compiled_indexer_growing_cache_and_head_dimensions():
+    from mlx_vlm.models.mistral_large4.language import _compiled_indexer_scores
+
+    mx.random.seed(23)
+    for batch, length, dim in ((1, 65, 16), (3, 79, 16), (1, 65, 32), (1, 97, 16)):
+        q = mx.random.normal((batch, 4, 1, dim)).astype(mx.bfloat16)
+        k = mx.random.normal((batch, length + 13, dim)).astype(mx.bfloat16)[:, :length]
+        weights = mx.random.normal((batch, 4, 1)) * 0.5
+        mask = mx.broadcast_to(
+            mx.arange(length)[None, None, None, :] < length - 7,
+            (batch, 1, 1, length),
+        )
+        actual = _compiled_indexer_scores(q, k, weights, mask, dim**-0.5)
+        scores = np.maximum(
+            np.array(q.astype(mx.float32))
+            @ np.array(k.astype(mx.float32))[:, None].swapaxes(-1, -2)
+            * dim**-0.5,
+            0,
+        )
+        expected = np.where(
+            np.array(mask)[:, 0],
+            (scores * np.array(weights)[..., None]).sum(axis=1),
+            -np.inf,
+        )
+        np.testing.assert_allclose(np.array(actual), expected, atol=1e-5, rtol=1e-5)
+        selected = mx.sort(mx.argpartition(-actual, kth=7, axis=-1)[..., :8])
+        expected_topk = np.sort(np.argpartition(-expected, kth=7, axis=-1)[..., :8])
+        np.testing.assert_array_equal(np.array(selected), expected_topk)
+
+
 # Rotary embeddings
+
+
+def test_mistral_large4_rotary_pair_layout_and_position_scaling():
+    from mlx_vlm.models.mistral_large4.language import SoftmaxScaling, rotate
+
+    x = mx.array([[[[1.0, 2.0, 3.0, 4.0]]]])
+    cos, sin = mx.array([[[[0.0, 1.0]]]]), mx.array([[[[1.0, 0.0]]]])
+    np.testing.assert_array_equal(
+        np.array(rotate(x, cos, sin)), [[[[-2.0, 3.0, 1.0, 4.0]]]]
+    )
+    scaling = SoftmaxScaling(2)
+    scaling.s = mx.array([0.25, -0.5])
+    scaling.b = mx.array([1.0, 2.0])
+    positions = mx.array([[0, 3]])
+    actual = scaling(mx.ones((1, 2, 2, 3)), positions)
+    expected = np.array(
+        [[[1.0, 1.0 + 0.25 * np.log(4)], [2.0, 2.0 - 0.5 * np.log(4)]]]
+    )[..., None]
+    np.testing.assert_allclose(
+        np.array(actual), np.broadcast_to(expected, (1, 2, 2, 3)), atol=1e-6
+    )
+
 
 # Multimodal position IDs
 
@@ -1073,6 +1349,7 @@ def test_replace_one_bit_checkpoint_modules_only():
         {"quant_method": method, "quant_algo": algo}
         for method, algo in [
             ("modelopt", "NVFP4"),
+            ("modelopt", "NVFP4_AWQ"),
             ("modelopt", "W4A16_NVFP4"),
             ("modelopt_mixed", "NVFP4"),
         ]
@@ -1098,6 +1375,27 @@ def test_transform_modelopt_nvfp4_weights(config):
     assert "layer.weight_scale" not in transformed
     assert "layer.input_scale" not in transformed
     assert quantization == {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+
+
+def test_transform_modelopt_nvfp4_awq_zeroes_nan_scale_blocks(caplog):
+    weights = _nvfp4_weights()
+    weights["layer.weight_scale"] = mx.array([[127, 126], [255, 56]], mx.uint8)
+    weights["layer.pre_quant_scale"] = mx.linspace(0.25, 2.0, 32)
+    transformed, _ = _transform_modelopt_nvfp4_weights(
+        weights, {"quant_method": "modelopt", "quant_algo": "NVFP4_AWQ"}
+    )
+
+    assert transformed["layer.scales"].tolist() == [[0, 126], [0, 56]]
+    assert weights["layer.weight_scale"].tolist() == [[127, 126], [255, 56]]
+    assert mx.array_equal(
+        transformed["layer.pre_quant_scale"], weights["layer.pre_quant_scale"]
+    ).item()
+    decoded = mx.dequantize(
+        transformed["layer.weight"], transformed["layer.scales"], mode="nvfp4"
+    )
+    assert mx.all(mx.isfinite(decoded)).item()
+    assert mx.array_equal(decoded[:, :16], mx.zeros((2, 16))).item()
+    assert "Zeroing 2 NaN NVFP4 AWQ block scales for layer" in caplog.text
 
 
 @pytest.mark.parametrize("moe_quant_algo", [None, "MXFP4"])
@@ -1220,6 +1518,21 @@ def _nvfp4_weights():
     }
 
 
+def test_transform_modelopt_fp8_block_scales():
+    values = mx.arange(256 * 256).reshape(256, 256) % 17 - 8
+    packed = mx.to_fp8(values.astype(mx.float32))
+    scales = mx.array([0.25, 0.5, 1.0, 2.0]).reshape(2, 1, 2, 1)
+    expected = (values.reshape(2, 128, 2, 128) * scales).reshape(256, 256)
+    weights, _ = _transform_modelopt_nvfp4_weights(
+        {"linear.weight": packed, "linear.weight_scale": scales},
+        {"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION"},
+    )
+    assert set(weights) == {"linear.weight"}
+    np.testing.assert_array_equal(
+        np.array(weights["linear.weight"].astype(mx.float32)), np.array(expected)
+    )
+
+
 def test_transform_modelopt_mixed_nvfp4_fp8_weights():
     weights = {
         "experts.weight": mx.arange(32, dtype=mx.uint8).reshape(2, 16),
@@ -1250,7 +1563,10 @@ def test_transform_modelopt_mixed_nvfp4_fp8_weights():
 @pytest.mark.parametrize("bias", [False, True])
 @pytest.mark.parametrize("shape", [(1, 64), (2, 3, 64)])
 @pytest.mark.parametrize("scale_name", ["weight_scale_2", "weight_global_scale"])
-def test_scaled_nvfp4_linear_matches_reference(dtype, bias, shape, scale_name):
+@pytest.mark.parametrize("pre_quant_scale", [False, True])
+def test_scaled_nvfp4_linear_matches_reference(
+    dtype, bias, shape, scale_name, pre_quant_scale
+):
     model = nn.Module()
     model.layer = nn.QuantizedLinear(64, 4, bias=bias, mode="nvfp4")
     global_scale = mx.array(
@@ -1264,6 +1580,8 @@ def test_scaled_nvfp4_linear_matches_reference(dtype, bias, shape, scale_name):
     }
     if bias:
         weights["layer.bias"] = mx.array([0.25, -0.5, 1.0, -2.0], dtype)
+    if pre_quant_scale:
+        weights["layer.pre_quant_scale"] = mx.linspace(0.25, 2.0, 64).astype(dtype)
     replace_scaled_quantized_linears(model, weights)
     model.load_weights(list(weights.items()))
     x = mx.linspace(0.1, 1.7, np.prod(shape)).reshape(shape).astype(dtype)
@@ -1273,7 +1591,10 @@ def test_scaled_nvfp4_linear_matches_reference(dtype, bias, shape, scale_name):
         reference_weight /= global_scale
     else:
         reference_weight *= global_scale
-    expected = (x.astype(mx.float32) @ reference_weight.T).astype(dtype)
+    scaled_x = x.astype(mx.float32)
+    if pre_quant_scale:
+        scaled_x *= weights["layer.pre_quant_scale"].astype(mx.float32)
+    expected = (scaled_x @ reference_weight.T).astype(dtype)
     if bias:
         expected += weights["layer.bias"]
     actual = model.layer(x)
@@ -1298,9 +1619,25 @@ def test_scaled_nvfp4_rejects_conflicting_scale_conventions():
         )
 
 
+@pytest.mark.parametrize(
+    "shape,dtype", [((63,), mx.float32), ((2, 64), mx.float32), ((64,), mx.uint8)]
+)
+def test_scaled_nvfp4_rejects_invalid_pre_quant_scale(shape, dtype):
+    model = nn.Module()
+    model.layer = nn.QuantizedLinear(64, 4, bias=False, mode="nvfp4")
+    with pytest.raises(ValueError, match="Invalid NVFP4 pre-quant scale for layer"):
+        replace_scaled_quantized_linears(
+            model,
+            {
+                "layer.weight_scale_2": mx.array(0.5),
+                "layer.pre_quant_scale": mx.ones(shape, dtype),
+            },
+        )
+
+
 @pytest.mark.parametrize("activation_quantization", [False, True])
 @pytest.mark.parametrize(
-    "format", ["modelopt", "nvfp4-pack-quantized", "mixed-precision"]
+    "format", ["modelopt", "modelopt_awq", "nvfp4-pack-quantized", "mixed-precision"]
 )
 def test_nvfp4_global_scale_load_and_save(tmp_path, activation_quantization, format):
     class Model(nn.Module):
@@ -1325,7 +1662,13 @@ def test_nvfp4_global_scale_load_and_save(tmp_path, activation_quantization, for
         "model_type": "test_modelopt",
         "quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4"},
     }
-    if format != "modelopt":
+    is_modelopt = format.startswith("modelopt")
+    if format == "modelopt_awq":
+        config["quantization_config"]["quant_algo"] = "NVFP4_AWQ"
+        weights["layer.pre_quant_scale"] = mx.repeat(
+            mx.array([0.25, 0.5, 1.0, 2.0], mx.bfloat16), 16
+        )
+    if not is_modelopt:
         weights["layer.weight_packed"] = weights.pop("layer.weight")
         weights["layer.weight_global_scale"] = mx.array([14400], mx.bfloat16)
         weights["layer.input_global_scale"] = weights.pop("layer.input_scale")
@@ -1335,10 +1678,10 @@ def test_nvfp4_global_scale_load_and_save(tmp_path, activation_quantization, for
             "quant_method": "compressed-tensors",
             "format": format,
         }
-    scale_name = "weight_scale_2" if format == "modelopt" else "weight_global_scale"
-    other_scale = "weight_global_scale" if format == "modelopt" else "weight_scale_2"
+    scale_name = "weight_scale_2" if is_modelopt else "weight_global_scale"
+    other_scale = "weight_global_scale" if is_modelopt else "weight_scale_2"
     source_scale = weights[f"layer.{scale_name}"].astype(mx.float32).reshape(())
-    factor = source_scale if format == "modelopt" else 1 / source_scale
+    factor = source_scale if is_modelopt else 1 / source_scale
     (tmp_path / "config.json").write_text(json.dumps(config))
     mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
     with patch("mlx_vlm.utils.get_model_and_args", return_value=(architecture, "test")):
@@ -1347,6 +1690,8 @@ def test_nvfp4_global_scale_load_and_save(tmp_path, activation_quantization, for
         assert model.layer._quantize_activations == activation_quantization
         x = mx.full((2, 3, 64), 6.0, mx.bfloat16)
         expected = mx.full((2, 3, 4), 6 * 64 * 256 * factor.item())
+        if format == "modelopt_awq":
+            expected *= weights["layer.pre_quant_scale"].astype(mx.float32).mean()
         assert other_scale not in model.layer
         assert model.layer[scale_name].dtype == mx.float32
         assert mx.array_equal(model.layer[scale_name], source_scale).item()
@@ -1362,6 +1707,10 @@ def test_nvfp4_global_scale_load_and_save(tmp_path, activation_quantization, for
         assert other_scale not in restored.layer
         assert mx.array_equal(restored.layer[scale_name], source_scale).item()
         assert mx.array_equal(restored.layer.weight, model.layer.weight).item()
+        if format == "modelopt_awq":
+            assert mx.array_equal(
+                restored.layer.pre_quant_scale, weights["layer.pre_quant_scale"]
+            ).item()
         assert mx.array_equal(
             restored.layer.scales, weights["layer.weight_scale"]
         ).item()
@@ -1374,8 +1723,9 @@ def test_nvfp4_global_scale_load_and_save(tmp_path, activation_quantization, for
 @pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
 @pytest.mark.parametrize("sorted_indices", [False, True])
 @pytest.mark.parametrize("scale_name", ["weight_scale_2", "weight_global_scale"])
+@pytest.mark.parametrize("pre_quant_scale", [False, True])
 def test_scaled_nvfp4_experts_preserve_individual_scales(
-    dtype, sorted_indices, scale_name
+    dtype, sorted_indices, scale_name, pre_quant_scale
 ):
     model = nn.Module()
     model.layer = QuantizedSwitchLinear(
@@ -1394,6 +1744,10 @@ def test_scaled_nvfp4_experts_preserve_individual_scales(
         "layer.scales": mx.full((2, 4, 4), 120, mx.uint8),
         f"layer.{scale_name}": scales,
     }
+    if pre_quant_scale:
+        weights["layer.pre_quant_scale"] = mx.stack(
+            [mx.linspace(0.25, 1.0, 64), mx.linspace(1.0, 3.0, 64)]
+        ).astype(dtype)
     replace_scaled_quantized_linears(model, weights)
     model.load_weights(list(weights.items()))
     assert isinstance(model.layer, ScaledQuantizedSwitchLinear)
@@ -1404,6 +1758,10 @@ def test_scaled_nvfp4_experts_preserve_individual_scales(
         if scale_name == "weight_global_scale"
         else 64 * 256 * scales[indices]
     )
+    if pre_quant_scale:
+        expected *= (
+            weights["layer.pre_quant_scale"].astype(mx.float32).mean(-1)[indices]
+        )
     expected = mx.broadcast_to(expected[..., None, None], (2, 2, 1, 4))
     assert mx.allclose(
         model.layer(x, indices, sorted_indices=sorted_indices),
@@ -2175,6 +2533,83 @@ def test_mixed_recipe_finds_lfm2_down_projection():
         assert bits[f"layers.{i}.feed_forward.w1"] == 4
 
 
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@pytest.mark.parametrize("quantize", [False, True])
+def test_convert_dtype_round_trip_preserves_cast_exclusions(tmp_path, dtype, quantize):
+    from mlx_vlm.convert import convert
+    from mlx_vlm.tests.test_models import model_case
+
+    config = model_case("qwen3_5")["config"]
+    config.update(dtype="bfloat16", torch_dtype="bfloat16")
+    config["text_config"]["dtype"] = "bfloat16"
+    config["vision_config"]["torch_dtype"] = "bfloat16"
+    source = tmp_path / "source"
+    source.mkdir()
+    model = qwen35.Model(qwen35.ModelConfig.from_dict(config))
+    original_weights = dict(tree_flatten(model.parameters()))
+    mx.save_safetensors(str(source / "model.safetensors"), original_weights)
+    (source / "config.json").write_text(json.dumps(config))
+
+    with patch("mlx_vlm.utils.load_processor", return_value=SimpleNamespace()):
+        for attempt, options in enumerate((dict(dtype=dtype, quantize=quantize), {})):
+            destination = tmp_path / f"converted-{attempt}"
+            convert(str(source), str(destination), q_group_size=32, **options)
+            exported = json.loads((destination / "config.json").read_text())
+            assert exported["dtype"] == dtype
+            assert "torch_dtype" not in exported
+            assert exported["text_config"]["dtype"] == dtype
+            assert exported["vision_config"]["torch_dtype"] == dtype
+            weights = dict(tree_flatten(load_model(destination).parameters()))
+            protected = [key for key in weights if key.endswith("A_log")]
+            assert protected
+            for key in protected:
+                assert weights[key].dtype == mx.float32
+                assert mx.array_equal(weights[key], original_weights[key]).item()
+            assert weights["vision_tower.patch_embed.proj.weight"].dtype == getattr(
+                mx, dtype
+            )
+            if quantize:
+                assert exported["quantization"]["bits"] == 4
+                assert any(weight.dtype == mx.uint32 for weight in weights.values())
+            source = destination
+
+
+@pytest.mark.parametrize(
+    "metadata,expected",
+    [
+        ({"dtype": "float16", "torch_dtype": "bfloat16"}, "float16"),
+        ({"torch_dtype": "float16"}, "float16"),
+        ({"text_config": {"dtype": "float16"}}, "float16"),
+        ({"dtype": None, "torch_dtype": "float16"}, "float16"),
+        ({}, None),
+    ],
+)
+def test_convert_default_dtype_metadata(tmp_path, metadata, expected):
+    conversion = importlib.import_module("mlx_vlm.convert")
+    unchanged = {
+        "audio_config": {"hidden_size": 8},
+        "vision_config": None,
+        "quantization": {"bits": 4, "dtype": "uint32"},
+        "quantization_config": {"bits": 4, "dtype": "uint32"},
+    }
+    config = copy.deepcopy({**metadata, **unchanged})
+    source, destination = tmp_path / "source", tmp_path / "converted"
+    source.mkdir()
+    with patch.object(
+        conversion,
+        "fetch_from_hub",
+        return_value=(nn.Linear(4, 4), config, SimpleNamespace()),
+    ):
+        conversion.convert(str(source), str(destination))
+    exported = json.loads((destination / "config.json").read_text())
+    assert exported.get("dtype") == expected
+    assert {key: exported[key] for key in unchanged} == unchanged
+    weights = mx.load(str(destination / "model.safetensors"))
+    assert {weight.dtype for weight in weights.values()} == {
+        getattr(mx, expected or "float32")
+    }
+
+
 def test_convert_preserves_existing_deepseek_v4_quantization():
     config = {
         "model_type": "deepseek_v4",
@@ -2208,6 +2643,203 @@ def test_convert_preserves_existing_deepseek_v4_quantization():
         "bits": 8,
         "mode": "mxfp8",
     }
+
+
+@pytest.mark.parametrize("existing_output", [False, True])
+@pytest.mark.parametrize("save_processor", [False, True])
+def test_convert_readonly_metadata(tmp_path, existing_output, save_processor):
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+
+    conversion = importlib.import_module("mlx_vlm.convert")
+    source, destination = tmp_path / "source", tmp_path / "converted"
+    source.mkdir()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(
+            WordLevel({"[UNK]": 0, "hello": 1}, unk_token="[UNK]")
+        ),
+        unk_token="[UNK]",
+        chat_template="{{ messages[0]['content'] }}",
+    )
+    tokenizer.save_pretrained(source)
+    (source / "config.json").write_text("{}")
+    (source / "processor.py").write_text("# Custom processor\n")
+    (source / "assets").mkdir()
+    (source / "assets" / "vocab.txt").write_text("hello\n")
+    # Model snapshots link to immutable files in the shared Hub cache.
+    blob = tmp_path / "tokenizer-blob"
+    (source / "tokenizer.json").rename(blob)
+    (source / "tokenizer.json").symlink_to(blob)
+    originals = {}
+    for file in source.rglob("*"):
+        if file.is_file():
+            originals[file.relative_to(source)] = file.read_bytes()
+            file.chmod(0o444)
+            if existing_output and (not save_processor or file.suffix != ".jinja"):
+                output = destination / file.relative_to(source)
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text("stale output")
+                output.chmod(0o444)
+
+    model = nn.Linear(4, 4)
+    processor = tokenizer if save_processor else SimpleNamespace()
+    with patch.object(
+        conversion, "fetch_from_hub", return_value=(model, {}, processor)
+    ):
+        conversion.convert(str(source), str(destination))
+
+    reloaded = PreTrainedTokenizerFast.from_pretrained(
+        destination, local_files_only=True
+    )
+    assert reloaded.encode("hello") == tokenizer.encode("hello")
+    assert reloaded.chat_template == tokenizer.chat_template
+    assert (destination / "model.safetensors").is_file()
+    for relative, contents in originals.items():
+        original, output = source / relative, destination / relative
+        assert original.read_bytes() == contents
+        assert stat.S_IMODE(original.stat().st_mode) == 0o444
+        assert output.stat().st_mode & stat.S_IWUSR
+        assert not output.is_symlink()
+    assert (destination / "assets" / "vocab.txt").read_text() == "hello\n"
+    assert (source / "tokenizer.json").is_symlink()
+
+
+def test_convert_keeps_source_tokenizer_json_pipeline(tmp_path):
+    # #2496: Qwen3.5-family checkpoints name Qwen2Tokenizer, whose save_pretrained writes
+    # Qwen2's pre-tokenizer regex (no \p{M}) and decoder flags over the checkpoint's own.
+    from tokenizers import Regex, Tokenizer, decoders, pre_tokenizers, trainers
+    from tokenizers.models import BPE
+    from transformers import PreTrainedTokenizerFast, Qwen2Tokenizer
+
+    conversion = importlib.import_module("mlx_vlm.convert")
+    regex = (
+        r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}"
+        r"| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+    )
+    text = "स्त्री"
+    backend = Tokenizer(BPE())
+    backend.pre_tokenizer = pre_tokenizers.Sequence(
+        [
+            pre_tokenizers.Split(Regex(regex), behavior="isolated"),
+            pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
+        ]
+    )
+    backend.decoder = decoders.ByteLevel(
+        add_prefix_space=False, trim_offsets=False, use_regex=False
+    )
+    # Merge the whole word into one token; the Qwen2 regex splits it before BPE runs.
+    backend.train_from_iterator(
+        [text],
+        trainers.BpeTrainer(
+            vocab_size=1000,
+            initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+            show_progress=False,
+        ),
+    )
+    source, destination = tmp_path / "source", tmp_path / "converted"
+    PreTrainedTokenizerFast(tokenizer_object=backend).save_pretrained(source)
+    (source / "config.json").write_text("{}")
+    original = json.loads((source / "tokenizer.json").read_text())
+
+    processor = Qwen2Tokenizer.from_pretrained(source)
+    with patch.object(
+        conversion, "fetch_from_hub", return_value=(nn.Linear(4, 4), {}, processor)
+    ):
+        conversion.convert(str(source), str(destination))
+
+    exported = json.loads((destination / "tokenizer.json").read_text())
+    assert exported["pre_tokenizer"] == original["pre_tokenizer"]
+    assert exported["decoder"] == original["decoder"]
+    expected = Tokenizer.from_file(str(source / "tokenizer.json")).encode(text).ids
+    assert len(expected) == 1
+    assert (
+        Tokenizer.from_file(str(destination / "tokenizer.json")).encode(text).ids
+        == expected
+    )
+
+
+@pytest.mark.parametrize("token_origin", ["config", "processor"])
+def test_convert_preserves_loaded_added_tokens(tmp_path, token_origin):
+    from tokenizers import AddedToken, Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import WhitespaceSplit
+    from transformers import PreTrainedTokenizerFast
+
+    conversion = importlib.import_module("mlx_vlm.convert")
+    source, destination = tmp_path / "source", tmp_path / "converted"
+    backend = Tokenizer(WordLevel({"[UNK]": 0, "hello": 1}, unk_token="[UNK]"))
+    backend.pre_tokenizer = WhitespaceSplit()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        unk_token="[UNK]",
+    )
+    tokenizer.add_tokens([AddedToken("<existing>", normalized=False)])
+    tokenizer.save_pretrained(source)
+    (source / "config.json").write_text("{}")
+    added_tokens = [
+        AddedToken("<extra>", normalized=False, lstrip=True, rstrip=True),
+        AddedToken("<special>", normalized=False, single_word=True, special=True),
+    ]
+    if token_origin == "config":
+        # Legacy exports may store added tokens only in tokenizer_config.json.
+        config_path = source / "tokenizer_config.json"
+        config = json.loads(config_path.read_text())
+        config["added_tokens_decoder"] = {
+            str(len(tokenizer) + i): token.__getstate__()
+            for i, token in enumerate(added_tokens)
+        }
+        config_path.write_text(json.dumps(config))
+
+    processor = PreTrainedTokenizerFast.from_pretrained(source, local_files_only=True)
+    if token_origin == "processor":
+        processor.add_tokens(added_tokens)
+    originals = {path.name: path.read_bytes() for path in source.iterdir()}
+    expected_tokens = {
+        token_id: token.__getstate__()
+        for token_id, token in processor.added_tokens_decoder.items()
+    }
+    text = "hello <existing> <extra> <special>"
+    expected_ids = processor.encode(text, add_special_tokens=False)
+    assert expected_ids == [1, 2, 3, 4]
+
+    with patch.object(
+        conversion, "fetch_from_hub", return_value=(nn.Linear(4, 4), {}, processor)
+    ):
+        conversion.convert(str(source), str(destination))
+
+    backend = Tokenizer.from_file(str(destination / "tokenizer.json"))
+    assert backend.encode(text, add_special_tokens=False).ids == expected_ids
+    assert {
+        token_id: token.__getstate__()
+        for token_id, token in backend.get_added_tokens_decoder().items()
+    } == expected_tokens
+    reloaded = PreTrainedTokenizerFast.from_pretrained(
+        destination, local_files_only=True
+    )
+    assert reloaded.encode(text, add_special_tokens=False) == expected_ids
+    assert {
+        token_id: token.__getstate__()
+        for token_id, token in reloaded.added_tokens_decoder.items()
+    } == expected_tokens
+    assert {path.name: path.read_bytes() for path in source.iterdir()} == originals
+
+
+@pytest.mark.parametrize("alias", [False, True])
+def test_convert_copy_rejects_same_file_without_modifying_source(tmp_path, alias):
+    from mlx_vlm.convert import _copy_writable_file
+
+    source = tmp_path / "tokenizer.json"
+    source.write_text("original tokenizer")
+    source.chmod(0o444)
+    destination = source
+    if alias:
+        destination = tmp_path / "alias.json"
+        destination.symlink_to(source)
+    with pytest.raises(shutil.SameFileError):
+        _copy_writable_file(source, destination)
+    assert source.read_text() == "original tokenizer"
+    assert stat.S_IMODE(source.stat().st_mode) == 0o444
 
 
 def test_modelopt_mixed_drops_fp8_kv_cache_scales():
@@ -2478,3 +3110,23 @@ def test_rfdetr_backbone_attention_matches_softmax_reference(batch, tokens):
     scores = mx.softmax((q @ k.transpose(0, 1, 3, 2)) * attention.scale, axis=-1)
     expected = (scores @ v).transpose(0, 2, 1, 3).reshape(batch, tokens, 48)
     _assert_allclose(attention(x), attention.o_proj(expected))
+
+
+def test_lfm3_partial_rope_preserves_pairs_in_both_halves():
+    module = importlib.import_module("mlx_vlm.models.lfm3.language")
+    rope = module.RotaryEmbedding(
+        8, {"rope_theta": 10000, "partial_rotary_factor": 0.5}
+    )
+    x = mx.arange(16, dtype=mx.float32).reshape(1, 1, 2, 8) + 1
+    y = np.asarray(rope(x, offset=9))
+    np.testing.assert_array_equal(
+        y[..., [2, 3, 6, 7]], np.asarray(x)[..., [2, 3, 6, 7]]
+    )
+    angles = np.arange(9, 11)[:, None] * np.array([1, 10000 ** (-2 / 8)])
+    a, b = np.asarray(x)[..., :2], np.asarray(x)[..., 4:6]
+    np.testing.assert_allclose(
+        y[..., :2], a * np.cos(angles) - b * np.sin(angles), atol=2e-6
+    )
+    np.testing.assert_allclose(
+        y[..., 4:6], b * np.cos(angles) + a * np.sin(angles), atol=2e-6
+    )

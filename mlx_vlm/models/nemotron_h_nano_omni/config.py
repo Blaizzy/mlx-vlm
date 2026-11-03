@@ -14,6 +14,7 @@ class VisionConfig(BaseModelConfig):
     num_hidden_layers: int = 32
     num_attention_heads: int = 16
     intermediate_size: int = 5120
+    layer_norm_eps: float = 1e-6
     image_size: int = 224
     patch_size: int = 16
     max_resolution: int = 2048
@@ -91,6 +92,7 @@ class ModelConfig(BaseModelConfig):
     image_tag_type: str = "internvl"
     projector_hidden_size: int = 4096
     vit_hidden_size: int = 1280
+    vision_final_layernorm: Optional[bool] = None
     attn_implementation: Optional[str] = None
     video_pruning_rate: float = 0.0
     video_temporal_patch_size: int = 2

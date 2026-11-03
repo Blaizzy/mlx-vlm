@@ -11,7 +11,20 @@ from typing import Any, Optional, Sequence, Union
 
 import mlx.core as mx
 
+from .apc import semantic_extra_hash
+
 VisionFeatures = Union[mx.array, Sequence[mx.array]]
+
+
+def processed_image_key(pixel_values, image_grid_thw=None, **kwargs) -> str:
+    """Hash pixels and image metadata, excluding text and generation options."""
+    # Identical flattened patches can have different layouts. Include Gemma's
+    # positions and DeepSeek's grids/permutations as well as Qwen's patch grid.
+    image_inputs = {
+        key: value for key, value in kwargs.items() if key.startswith("image_")
+    }
+    image_inputs.update(pixel_values=pixel_values, image_grid_thw=image_grid_thw)
+    return f"processed:{semantic_extra_hash(media=image_inputs)}"
 
 
 class VisionFeatureCache:
