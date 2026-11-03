@@ -476,21 +476,33 @@ class StopSequenceStreamState:
         if not self.stop_sequences:
             return text or None
         self.pending += text or ""
-        emit, self.matched = _apply_stop_sequences(self.pending, self.stop_sequences)
-        if self.matched is not None:
+        emit, matched = _apply_stop_sequences(self.pending, self.stop_sequences)
+        candidate = (
+            len(emit),
+            (
+                self.stop_sequences.index(matched)
+                if matched is not None
+                else len(self.stop_sequences)
+            ),
+        )
+        hold = 0 if last else self._partial_match_length(self.pending, candidate)
+        if matched is not None and not hold:
+            self.matched = matched
             self.pending = ""
             return emit or None
-        hold = 0 if last else self._partial_match_length(self.pending)
         emit = self.pending[: len(self.pending) - hold]
         self.pending = self.pending[len(emit) :]
         return emit or None
 
-    def _partial_match_length(self, text: str) -> int:
+    def _partial_match_length(self, text: str, candidate: Tuple[int, int]) -> int:
+        # A partial match can beat a complete match by starting earlier, or
+        # by having the same start and appearing first in stop_sequences.
         hold = 0
-        for sequence in self.stop_sequences:
+        for priority, sequence in enumerate(self.stop_sequences):
             for length in range(min(len(sequence) - 1, len(text)), hold, -1):
                 if text.endswith(sequence[:length]):
-                    hold = length
+                    if (len(text) - length, priority) < candidate:
+                        hold = length
                     break
         return hold
 
@@ -606,17 +618,21 @@ async def anthropic_messages_endpoint(http_request: Request):
                 open_block_type = None
                 full_output = ""
                 text_output = ""
-                thinking_state = make_response_stream_state(
-                    processor,
-                    prompt_has_open_thinking(
-                        formatted_prompt,
-                        gen_args.enable_thinking,
+
+                def make_thinking_state():
+                    return make_response_stream_state(
+                        processor,
+                        prompt_has_open_thinking(
+                            formatted_prompt,
+                            gen_args.enable_thinking,
+                            gen_args.thinking_start_token,
+                            gen_args.thinking_end_token,
+                        ),
                         gen_args.thinking_start_token,
                         gen_args.thinking_end_token,
-                    ),
-                    gen_args.thinking_start_token,
-                    gen_args.thinking_end_token,
-                )
+                    )
+
+                thinking_state = make_thinking_state()
                 tc_start = (
                     tool_module.tool_call_start if tool_module and tools else None
                 )
@@ -682,6 +698,37 @@ async def anthropic_messages_endpoint(http_request: Request):
                             "message": start_message.model_dump(),
                         },
                     )
+
+                def tool_output_before_stop():
+                    if stop_state.matched is None or not tc_start:
+                        return full_output
+                    call_start = full_output.find(tc_start)
+                    while call_start >= 0:
+                        # Match the extractor's non-overlapping call spans,
+                        # including parsers whose calls end at a newline/EOF.
+                        marker = tc_end or "\n"
+                        call_end = full_output.find(marker, call_start + len(tc_start))
+                        if call_end < 0:
+                            if tc_end:
+                                break
+                            call_end = len(full_output)
+
+                        # Compare visible offsets: raw prefixes also contain
+                        # thinking and tool markup, which never reach the
+                        # stop matcher.
+                        prefix = make_thinking_state().feed(
+                            full_output[:call_start], last=True
+                        )
+                        prefix_tools = ToolCallStreamState(tc_start, tc_end)
+                        visible = prefix_tools.feed(prefix.content) or ""
+                        # Whitespace held before a call still precedes that
+                        # call when later visible text releases it.
+                        pending_space = prefix_tools.pending_space
+                        visible += prefix_tools.finish() or pending_space
+                        if len(visible) > len(text_output):
+                            return full_output[:call_start]
+                        call_start = full_output.find(tc_start, call_end + len(marker))
+                    return full_output
 
                 try:
                     if runtime.response_generator is not None:
@@ -838,7 +885,9 @@ async def anthropic_messages_endpoint(http_request: Request):
 
                     parsed_tool_calls = None
                     if tool_module is not None and tools:
-                        tc = process_tool_calls(full_output, tool_module, tools)
+                        tc = process_tool_calls(
+                            tool_output_before_stop(), tool_module, tools
+                        )
                         if tc.calls:
                             parsed_tool_calls = tc.calls
 
