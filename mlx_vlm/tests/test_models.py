@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import copy
+import faulthandler
 import importlib
 import inspect
 import json
 import logging
 import math
 import os
+import secrets
 import signal
 import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import textwrap
+import time
 import unittest
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict
@@ -1495,6 +1499,367 @@ def test_model_contract(case):
         getattr(checks, kind)(*args, **kwargs)
 
 
+@pytest.fixture
+def mistral_large4_case():
+    case = model_case("mistral_large4")
+    module = importlib.import_module("mlx_vlm.models." + case["module"])
+    return module, build_config(module, case["config"])
+
+
+@pytest.mark.parametrize("prefix", [0, 255])
+@pytest.mark.parametrize("per_head_mask", [False, True])
+def test_mistral_large4_decode_cache_matches_unfused_attention(
+    mistral_large4_case, prefix, per_head_mask
+):
+    from mlx_vlm.models.mistral_large4.language import LatentCache
+
+    mx.random.seed(17)
+    module, config = mistral_large4_case
+    model = module.LanguageModel(config.text_config)
+    model.eval()
+    ids = mx.random.randint(0, config.text_config.vocab_size, (2, prefix + 6))
+    initial = model.make_cache()
+    if prefix:
+        model(ids[:, :prefix], cache=initial)
+        mx.eval([c.state for c in initial])
+    outputs = []
+    # Training uses the differentiable, unfused attention core. Inference
+    # uses the Metal kernel where available; both update their own caches.
+    for training in (True, False):
+        model.train(training)
+        cache = [LatentCache.from_state(c.state, c.meta_state) for c in initial]
+        logits = []
+        for position in range(prefix, prefix + 6):
+            mask = mx.broadcast_to(
+                mx.arange(position + 1)[None] % 3 != 1, (2, position + 1)
+            )
+            if per_head_mask:
+                mask = mx.broadcast_to(
+                    mask[:, None, None],
+                    (2, config.text_config.num_attention_heads, 1, position + 1),
+                )
+            logits.append(
+                model(ids[:, position : position + 1], cache=cache, mask=mask).logits
+            )
+            mx.eval(logits[-1])
+        outputs.append(mx.concatenate(logits, axis=1))
+        assert all(c.offset == prefix + 6 for c in cache)
+    np.testing.assert_allclose(
+        np.array(outputs[1]), np.array(outputs[0]), atol=1e-4, rtol=1e-4
+    )
+
+
+def test_mistral_large4_partitions_allow_three_ranks_and_reject_wrong_shards(
+    mistral_large4_case,
+):
+    module, config = mistral_large4_case
+    model = module.LanguageModel(config.text_config)
+    original = model.layers[1].feed_forward.experts.w1.weight
+    model.shard(SimpleNamespace(rank=lambda: 1, size=lambda: 3))
+    moe = model.layers[1].feed_forward
+    assert (moe.start, moe.end) == (2, 5)
+    np.testing.assert_array_equal(
+        np.array(moe.experts.w1.weight), np.array(original[2:5])
+    )
+    with pytest.raises(ValueError, match="partition"):
+        model.shard(SimpleNamespace(rank=lambda: 2, size=lambda: 3))
+
+
+@pytest.mark.parametrize(
+    "source, message", [(0, "rotary layout"), (8, "Invalid KV source")]
+)
+def test_mistral_large4_invalid_kv_sharing_fails_at_configuration(
+    mistral_large4_case, source, message
+):
+    module, config = mistral_large4_case
+    fields = asdict(config.text_config)
+    fields["kv_source_layers"][-1] = source
+    with pytest.raises(ValueError, match=message):
+        module.TextConfig.from_dict(fields)
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("wide", [False, True])
+def test_mistral_large4_pack_dense_projections_and_preserve_quantized(
+    mistral_large4_case, quantized, wide
+):
+    module, config = mistral_large4_case
+    if wide:
+        config = copy.deepcopy(config)
+        config.text_config.hidden_size = 512
+        config.text_config.intermediate_size = 1024
+        config.text_config.moe_intermediate_size = 512
+    mx.random.seed(71)
+    reference = module.Model(config)
+    reference.set_dtype(mx.bfloat16 if mx.default_device() == mx.gpu else mx.float32)
+    if quantized:
+        nn.quantize(
+            reference,
+            group_size=32,
+            bits=4,
+            class_predicate=lambda path, child: ".experts." not in path
+            and path.endswith((".w1", ".w3", ".wk", ".weights_proj")),
+        )
+    reference.eval()
+    weights = dict(tree_flatten(reference.parameters()))
+    model = module.Model(config)
+    packed = model.sanitize(dict(weights))
+    if quantized:
+        assert packed.keys() == weights.keys()
+        nn.quantize(
+            model,
+            group_size=32,
+            bits=4,
+            class_predicate=lambda path, child: f"{path}.scales" in packed,
+        )
+    else:
+        assert "w1" not in model.language_model.layers[0].feed_forward
+        assert "w3" not in model.language_model.layers[1].feed_forward.shared_experts
+        assert "wk" not in model.language_model.layers[0].attention.indexer
+        assert "weights_proj" not in model.language_model.layers[0].attention.indexer
+    model.load_weights(list(packed.items()))
+    model.eval()
+    # Cover both the short-prefix indexer bypass and indexed cached decode.
+    caches = [m.language_model.make_cache() for m in (reference, model)]
+    chunks = (32, 1, 1) if wide else (3, 2, 1)
+    for length in chunks:
+        ids = mx.broadcast_to(
+            mx.arange(length)[None] % 9 + 1, (8 if wide else 1, length)
+        )
+        a, b = [m(ids, cache=c).logits for m, c in zip((reference, model), caches)]
+        np.testing.assert_allclose(
+            np.array(a.astype(mx.float32)),
+            np.array(b.astype(mx.float32)),
+            atol=1e-5,
+            rtol=1e-5,
+        )
+
+
+@pytest.mark.parametrize(
+    "batch,length",
+    [(1, 1), (1, 7), (1, 8), (1, 15), (1, 16), (2, 4), (2, 8), (2, 32)],
+)
+@pytest.mark.parametrize("quantization", ["dense", "nvfp4", "scaled_nvfp4"])
+def test_mistral_large4_experts_preserve_route_order(batch, length, quantization):
+    from mlx_vlm.models.mistral_large4.config import TextConfig
+    from mlx_vlm.models.mistral_large4.language import Experts
+    from mlx_vlm.quantization.nvfp4 import ScaledQuantizedSwitchLinear
+
+    mx.random.seed(71)
+    args = TextConfig(
+        hidden_size=64,
+        moe_intermediate_size=128,
+        n_routed_experts=4,
+        nvfp4=quantization != "dense",
+    )
+    experts = Experts(args)
+    dtype = mx.bfloat16 if mx.default_device() == mx.gpu else mx.float32
+    experts.set_dtype(dtype)
+    if quantization == "scaled_nvfp4":
+        for name in ("w1", "w3", "w2"):
+            experts[name] = ScaledQuantizedSwitchLinear(
+                experts[name], mx.array([0.25, 0.5, 0.75, 1.0]), "weight_scale_2"
+            )
+    experts.eval()
+    x = mx.random.normal((batch, length, args.hidden_size)).astype(dtype)
+    # Repeated, non-monotonic routes differ between tokens and batch rows.
+    indices = (
+        mx.arange(batch * length).reshape(batch, length, 1) + mx.array([3, 0, 3, 1])
+    ) % args.n_routed_experts
+    expanded = mx.expand_dims(x, (-2, -3))
+    expected = experts.w2(
+        nn.silu(experts.w1(expanded, indices)) * experts.w3(expanded, indices),
+        indices,
+    ).squeeze(-2)
+    actual = experts(x, indices)
+    assert actual.shape == (batch, length, 4, args.hidden_size)
+    assert actual.dtype == expected.dtype == dtype
+    np.testing.assert_allclose(
+        np.array(actual.astype(mx.float32)),
+        np.array(expected.astype(mx.float32)),
+        atol=1e-3 if dtype == mx.bfloat16 else 1e-6,
+        rtol=1e-2 if dtype == mx.bfloat16 else 1e-5,
+    )
+
+
+@pytest.mark.parametrize(
+    "training,length", [(False, 1), (True, 1), (False, 3), (False, 16), (True, 16)]
+)
+def test_mistral_large4_owned_experts_match_masked_reference(training, length):
+    from mlx_vlm.models.mistral_large4.config import TextConfig
+    from mlx_vlm.models.mistral_large4.language import Experts
+    from mlx_vlm.models.mistral_large4.moe_kernel import masked_qmv
+
+    args = TextConfig(
+        hidden_size=512, moe_intermediate_size=512, n_routed_experts=4, nvfp4=True
+    )
+    experts = Experts(args)
+    experts.train(training)
+    x = mx.random.normal((3, length, 512)).astype(mx.bfloat16)
+    indices = mx.broadcast_to(
+        mx.array([[-1, -1, -1, -1], [0, 1, 2, 3], [-1, 1, 2, -1]])[:, None],
+        (3, length, 4),
+    )
+    owned = indices >= 0
+    with patch(
+        "mlx_vlm.models.mistral_large4.language.masked_qmv", wraps=masked_qmv
+    ) as kernel:
+        actual = experts.masked(x, indices)
+        eligible = (
+            not training
+            and length == 1
+            and mx.default_device() == mx.gpu
+            and mx.metal.is_available()
+        )
+        assert kernel.call_count == (3 if eligible else 0)
+    expected = mx.where(owned[..., None], experts(x, mx.maximum(indices, 0)), 0)
+    np.testing.assert_array_equal(
+        np.array(actual.astype(mx.float32)), np.array(expected.astype(mx.float32))
+    )
+
+
+def test_mistral_large4_shared_loader_native_weights_and_roundtrip(
+    tmp_path, mistral_large4_case
+):
+    from mlx_vlm.quantization.nvfp4 import ScaledQuantizedSwitchLinear
+
+    mx.random.seed(31)
+    module, args = mistral_large4_case
+    reference = module.Model(args)
+    native = {}
+    direct = {
+        "language_model.model.embed_tokens.weight": "tok_embeddings.weight",
+        "language_model.model.norm.weight": "norm.weight",
+        "language_model.model.rotary_emb.alpha": "lerope.alpha",
+        "language_model.lm_head.weight": "output.weight",
+        "multi_modal_projector.norm.weight": "pre_mm_projector_norm.weight",
+        "multi_modal_projector.patch_merger.merging_layer.weight": "patch_merger.merging_layer.weight",
+        "multi_modal_projector.linear_1.weight": "vision_language_adapter.w_in.weight",
+        "multi_modal_projector.linear_2.weight": "vision_language_adapter.w_out.weight",
+    }
+    expected = {}
+    for key, value in tree_flatten(reference.parameters()):
+        name = direct.get(key, key)
+        if key.startswith("language_model.model.layers."):
+            name = key.removeprefix("language_model.model.")
+            if not name.startswith("layers.0."):
+                name = name.replace(".feed_forward.", ".")
+        elif key.startswith("vision_tower.vision_model."):
+            name = key.replace("vision_tower.vision_model.", "vision_encoder.")
+            for dest, source in (
+                ("q_proj", "wq"),
+                ("k_proj", "wk"),
+                ("v_proj", "wv"),
+                ("o_proj", "wo"),
+                ("gate_proj", "w1"),
+                ("down_proj", "w2"),
+                ("up_proj", "w3"),
+            ):
+                name = name.replace(f".{dest}.", f".{source}.")
+        value = value.astype(mx.bfloat16)
+        if ".experts." in key:
+            prefix, projection = name.split(".experts.")
+            decoded = []
+            for expert in range(args.text_config.n_routed_experts):
+                global_scale = float(expert + 1)
+                packed, scales = mx.quantize(
+                    value[expert] / (expert + 1), group_size=16, bits=4, mode="nvfp4"
+                )
+                base = f"{prefix}.experts.{expert}.{projection.removesuffix('.weight')}"
+                native[f"{base}.weight"] = packed.view(mx.uint8)
+                native[f"{base}.weight_scale"] = scales
+                native[f"{base}.weight_scale_2"] = mx.array([global_scale])
+                native[f"{base}.input_scale"] = mx.array(1.0)
+                decoded.append(
+                    (
+                        mx.dequantize(
+                            packed, scales, group_size=16, bits=4, mode="nvfp4"
+                        )
+                        * (expert + 1)
+                    ).astype(mx.bfloat16)
+                )
+            expected[key] = mx.stack(decoded)
+        else:
+            if name.endswith(".wq.weight"):
+                # Per-tensor FP8 alongside NVFP4 routed experts.
+                scale = mx.array(0.5, mx.float32)
+                packed = mx.to_fp8(value.astype(mx.float32) / scale)
+                native[name] = packed
+                native[name.removesuffix(".weight") + ".weight_scale"] = scale
+                value = (mx.from_fp8(packed, dtype=mx.float32) * scale).astype(
+                    mx.bfloat16
+                )
+            else:
+                native[name] = (
+                    value.transpose(0, 3, 1, 2)
+                    if name.endswith("patch_conv.weight")
+                    else value
+                )
+            expected[key] = value
+    native["mtp.extra.weight"] = mx.ones((2, 2))
+    reference.load_weights(list(expected.items()))
+    reference.eval()
+    config = asdict(args)
+    config["text_config"]["nvfp4"] = True
+    config["quantization_config"] = {
+        "quant_method": "modelopt",
+        "quant_algo": "MIXED_PRECISION",
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), native)
+    model = load_model(tmp_path)
+    assert isinstance(
+        model.language_model.layers[1].feed_forward.experts.w1,
+        ScaledQuantizedSwitchLinear,
+    )
+    ids = mx.array([[1, 2, 3, 4]])
+    actual = model(ids).logits
+    np.testing.assert_allclose(
+        np.array(actual.astype(mx.float32)),
+        np.array(reference(ids).logits.astype(mx.float32)),
+        atol=0.06,
+        rtol=0.06,
+    )
+    cache = model.language_model.make_cache()
+    cached = mx.concatenate(
+        [model(ids[:, :2], cache=cache).logits, model(ids[:, 2:], cache=cache).logits],
+        axis=1,
+    )
+    np.testing.assert_allclose(
+        np.array(cached.astype(mx.float32)),
+        np.array(actual.astype(mx.float32)),
+        atol=0.06,
+        rtol=0.06,
+    )
+    saved = dict(tree_flatten(model.parameters()))
+    sanitized = model.sanitize(dict(saved))
+    assert saved.keys() == sanitized.keys()
+    for key in saved:
+        assert sanitized[key].dtype == saved[key].dtype, key
+        assert mx.array_equal(sanitized[key], saved[key]).item(), key
+    # Native staging uses global expert IDs, including nonzero starting ranks.
+    config["text_config"].update(expert_start=2, expert_end=5)
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    partition = load_model(tmp_path)
+    for key, value in tree_flatten(partition.parameters()):
+        if ".experts." in key:
+            assert value.dtype == saved[key].dtype, key
+            assert mx.array_equal(value, saved[key][2:5]).item(), key
+    config["text_config"].update(expert_start=0, expert_end=8)
+    config["quantization_config"] = config["quantization"] = {
+        "group_size": 16,
+        "bits": 4,
+        "mode": "nvfp4",
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), saved)
+    restored = load_model(tmp_path)
+    np.testing.assert_array_equal(
+        np.array(restored(ids).logits.astype(mx.float32)),
+        np.array(actual.astype(mx.float32)),
+    )
+
+
 def test_nemotron_parse_source_architecture_and_tied_head_mapping():
     config = {
         "model_type": "nemotron_parse",
@@ -1750,6 +2115,77 @@ def test_flint_checkpoint_strict_loading_and_roundtrip(
     )
 
 
+@pytest.mark.parametrize("prefixed", [False, True])
+@pytest.mark.parametrize("byte_storage", [False, True])
+def test_flint_mixed_bit_export_loading(flint_model, tmp_path, prefixed, byte_storage):
+    model = flint_model
+
+    def predicate(path, module):
+        if not hasattr(module, "to_quantized") or path.endswith("mlp.gate"):
+            return False
+        if path.endswith("embed_tokens"):
+            return {"group_size": 32, "bits": 8}
+        return True
+
+    nn.quantize(model, group_size=32, bits=4, class_predicate=predicate)
+    expected = dict(tree_flatten(model.parameters()))
+    checkpoint = {}
+    for key, value in expected.items():
+        if not prefixed:
+            key = key.removeprefix("language_model.")
+        if byte_storage and value.dtype == mx.uint32:
+            value = mx.array(np.array(value).view(np.uint8).copy())
+        checkpoint[key] = value
+
+    first = model.sanitize(dict(checkpoint))
+    second = model.sanitize(dict(first))
+    assert first.keys() == second.keys() == expected.keys()
+    for key, value in expected.items():
+        for sanitized in (first[key], second[key]):
+            assert sanitized.dtype == value.dtype, key
+            np.testing.assert_array_equal(np.array(sanitized), np.array(value))
+
+    config = model.config.to_dict()
+    config["quantization"] = {"group_size": 32, "bits": 4}
+    config["mlx_export"] = {"bits": 4, "embedding_bits": 8}
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config))
+    original_config = config_path.read_bytes()
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), checkpoint)
+
+    reloaded = load_model(tmp_path)
+    assert reloaded.language_model.model.embed_tokens.bits == 8
+    assert reloaded.language_model.layers[0].self_attn.q_proj.bits == 4
+    assert config_path.read_bytes() == original_config
+    ids = mx.array([[1, 2, 3, 4, 5]])
+    np.testing.assert_array_equal(
+        np.array(reloaded(ids).logits), np.array(model(ids).logits)
+    )
+
+
+@pytest.mark.parametrize(
+    "path", ["model.embed_tokens", "language_model.model.embed_tokens"]
+)
+def test_flint_export_metadata_preserves_explicit_embedding_quantization(path):
+    from mlx_vlm.models.flint import Model, ModelConfig
+    from mlx_vlm.utils import _quantization_for_module_path
+
+    override = {"group_size": 32, "bits": 4}
+    quantization = {"group_size": 64, "bits": 4, path: override}
+    config = ModelConfig.from_dict(
+        {
+            **model_case("flint")["config"],
+            "quantization": quantization,
+            "mlx_export": {"embedding_bits": 8},
+        }
+    )
+    effective = _quantization_for_module_path(
+        config.quantization, "language_model.model.embed_tokens", Model(config)
+    )
+    assert effective == override
+    assert quantization == {"group_size": 64, "bits": 4, path: override}
+
+
 @pytest.fixture
 def nemotron_case(request):
     case = model_case(getattr(request, "param", "nemotron_super_vl"))
@@ -1943,6 +2379,57 @@ def test_lfm2_colbert_sanitize_and_loader(tmp_path, monkeypatch):
     embedding_loader.load_embedding_model(tmp_path)
     assert captured["model_remapping"]["lfm2"] == "lfm2_colbert"
     assert captured["config_overrides"]["embedding_dim"] == 128
+
+
+class TestLfm2ColbertCheckpoint:
+    @pytest.mark.parametrize("bits", [None, 4, 8])
+    @pytest.mark.parametrize("layout", ["native", "huggingface"])
+    def test_roundtrip(self, tmp_path, bits, layout):
+        case = next(case for case in DATA["cases"] if case["module"] == "lfm2_colbert")
+        module = importlib.import_module("mlx_vlm.models.lfm2_colbert")
+        config = {
+            **case["config"],
+            "vocab_size": 64,
+            "hidden_size": 64,
+            "block_dim": 64,
+            "block_ff_dim": 128,
+            "embedding_dim": 32,
+        }
+        mx.random.seed(19)
+        model = module.Model(build_config(module, config))
+        if bits is not None:
+            nn.quantize(model, group_size=32, bits=bits)
+            config["quantization"] = dict(group_size=32, bits=bits)
+        weights = dict(tree_flatten(model.parameters()))
+        if layout == "huggingface":
+            original = {}
+            for key, value in weights.items():
+                if key.startswith("projection."):
+                    key = "1_Dense.linear." + key[len("projection.") :]
+                elif key.startswith("model."):
+                    key = key[len("model.") :]
+                if "conv.weight" in key:
+                    value = value.transpose(0, 2, 1)
+                original[key] = value
+        else:
+            original = weights
+        sanitized = model.sanitize(original)
+        twice = model.sanitize(sanitized)
+        assert weights.keys() == sanitized.keys() == twice.keys()
+        for key in weights:
+            np.testing.assert_array_equal(sanitized[key], weights[key])
+            np.testing.assert_array_equal(twice[key], weights[key])
+        mx.save_safetensors(str(tmp_path / "model.safetensors"), sanitized)
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        loaded = embedding_loader.load_embedding_model(tmp_path)
+        ids = mx.array([[1, 2, 3, 0], [4, 5, 6, 7]])
+        mask = mx.array([[1, 1, 1, 0], [1, 1, 1, 1]])
+        expected = model(ids, attention_mask=mask)
+        actual = loaded(ids, attention_mask=mask)
+        np.testing.assert_array_equal(actual.text_embeds, expected.text_embeds)
+        np.testing.assert_array_equal(
+            actual.last_hidden_state, expected.last_hidden_state
+        )
 
 
 @pytest.fixture
@@ -2474,20 +2961,51 @@ def _make_distributed_test_model(family, dtype):
 
 
 def _distributed_model_worker(family, dtype_name):
+    # Report a stalled rank when the CI run is cancelled, without a time limit.
+    faulthandler.register(signal.SIGTERM, chain=True)
+
+    def stage(name):
+        print(
+            f"[rank {os.environ.get('MLX_RANK')}] {name}", file=sys.stderr, flush=True
+        )
+
+    stage("initializing ring")
     group = mx.distributed.init(strict=True, backend="ring")
+    barrier_dir = Path(os.environ["MLX_TEST_BARRIER_DIR"])
+
+    def host_barrier(name):
+        # All test ranks share this directory. Waiting here must not enqueue
+        # MLX work: even a CPU collective can stall a peer's shared-GPU work.
+        (barrier_dir / f"{name}-{group.rank()}").touch()
+        while any(
+            not (barrier_dir / f"{name}-{rank}").exists()
+            for rank in range(group.size())
+        ):
+            time.sleep(0.001)
+
     options = TINY_MODELS[family]["distributed"]
     dtype = getattr(mx, dtype_name)
-    mx.random.seed(19)
-    reference = _make_distributed_test_model(family, dtype)
-    mx.eval(reference.parameters())
-    weights = dict(tree_flatten(reference.parameters()))
-    sharded = _make_distributed_test_model(family, dtype)
-    sharded.load_weights(list(weights.items()), strict=True)
-    sharded.shard(group)
-    if error := options.get("reshard_error"):
-        with pytest.raises(ValueError, match=error):
+    # These local ranks share one GPU. Initialize them in order so weight
+    # evaluation/compilation does not race another rank's first GPU work.
+    # The distributed forward passes below still run concurrently.
+    for rank in range(group.size()):
+        if group.rank() == rank:
+            stage("building models")
+            mx.random.seed(19)
+            reference = _make_distributed_test_model(family, dtype)
+            stage("evaluating reference weights")
+            mx.eval(reference.parameters())
+            weights = dict(tree_flatten(reference.parameters()))
+            sharded = _make_distributed_test_model(family, dtype)
+            sharded.load_weights(list(weights.items()), strict=True)
             sharded.shard(group)
-    mx.eval(sharded.parameters())
+            if error := options.get("reshard_error"):
+                with pytest.raises(ValueError, match=error):
+                    sharded.shard(group)
+            stage("evaluating sharded weights")
+            mx.eval(sharded.parameters())
+            stage("models ready")
+        host_barrier(f"models-ready-{rank}")
     local_weights = dict(tree_flatten(sharded.parameters()))
     for pattern in options["sharded_weights"]:
         names = [name for name in weights if fnmatchcase(name, pattern)]
@@ -2506,17 +3024,19 @@ def _distributed_model_worker(family, dtype_name):
         for step, tokens in enumerate(
             ([1, 7, 9, 3, 11, 15, 2, 6, 8, 10, 12, 14], [13], [17], [19], [2, 4, 6])
         ):
+            stage(f"batch={batch} step={step} reference")
             ids = mx.array(
                 [[(t + row) % vocab_size for t in tokens] for row in range(batch)]
             )
             expected = reference(ids, cache=expected_cache).logits
             mx.eval(expected)
-            # Finish independent reference work on every rank before queuing
-            # distributed work on the shared GPU. Keep test-only collectives
-            # on the CPU so a faster rank cannot block another rank's GPU work.
-            mx.distributed.all_sum(mx.array(0), group=group, stream=mx.cpu).item()
+            stage(f"batch={batch} step={step} barrier")
+            host_barrier(f"reference-{batch}-{step}")
+            stage(f"batch={batch} step={step} sharded")
             actual = sharded(ids, cache=actual_cache).logits
             mx.eval(actual)
+            host_barrier(f"actual-{batch}-{step}")
+            stage(f"batch={batch} step={step} gather")
             gathered = mx.distributed.all_gather(actual, group=group, stream=mx.cpu)
             mx.eval(gathered)
             ranks_agree = all(
@@ -2536,6 +3056,7 @@ def _distributed_model_worker(family, dtype_name):
                     ).item(),
                 )
             )
+    host_barrier("checks")
     passed = mx.distributed.all_sum(
         mx.array(int(all(r["passed"] and r["ranks_agree"] for r in records))),
         group=group,
@@ -2546,21 +3067,20 @@ def _distributed_model_worker(family, dtype_name):
         flush=True,
     )
     assert passed == group.size(), records
+    stage("completed")
 
 
 def _run_distributed_model_test(family, dtype, world_size):
     repo = Path(__file__).resolve().parents[2]
-    # The ring launcher needs one consecutive port per rank. Probe the entire
-    # range while holding the sockets so a four-rank case cannot reuse a port.
+    # Select a whole block outside the ephemeral range. Binding only the first
+    # port to zero leaves the allocator free to hand the remaining ports to a
+    # concurrent launch or an outgoing ring connection.
     for _ in range(100):
         with ExitStack() as stack:
             sockets = [stack.enter_context(socket.socket()) for _ in range(world_size)]
-            sockets[0].bind(("127.0.0.1", 0))
-            port = sockets[0].getsockname()[1]
-            if port + world_size > 65536:
-                continue
+            port = 10000 + world_size * secrets.randbelow((30000 - 10000) // world_size)
             try:
-                for rank, sock in enumerate(sockets[1:], 1):
+                for rank, sock in enumerate(sockets):
                     sock.bind(("127.0.0.1", port + rank))
             except OSError:
                 continue
@@ -2587,23 +3107,19 @@ def _run_distributed_model_test(family, dtype, world_size):
         family,
         dtype,
     ]
-    process = subprocess.Popen(
-        command,
-        cwd=repo,
-        env=dict(os.environ, PYTHONPATH=str(repo)),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        start_new_session=True,
-    )
-    try:
-        output, _ = process.communicate(timeout=180)
-    except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
-        output, _ = process.communicate()
-        pytest.fail(
-            f"Distributed test timed out: {family}/{dtype}/{world_size}\n{output}"
+    with tempfile.TemporaryDirectory(prefix="mlx-vlm-distributed-") as barrier_dir:
+        process = subprocess.Popen(
+            command,
+            cwd=repo,
+            env=dict(
+                os.environ,
+                PYTHONPATH=str(repo),
+                MLX_TEST_BARRIER_DIR=barrier_dir,
+            ),
+            stdout=subprocess.PIPE,
+            text=True,
         )
+        output, _ = process.communicate()
     assert process.returncode == 0, output
     records = [json.loads(line) for line in output.splitlines() if line.startswith("{")]
     assert len(records) == world_size, output
@@ -4745,6 +5261,103 @@ class TestUnlimitedOCR2Dash:
         page = [self.PAGE] + [self.IMAGE] * 6
         return [1, 2, 3] + page * 3 + [4, 5, 6, 2, 3]
 
+    @pytest.mark.parametrize("disk", [False, True])
+    def test_apc_reuses_dash_checkpoint_during_generation(
+        self, tmp_path, disk, monkeypatch
+    ):
+        from mlx_vlm.apc import APCManager, DiskBlockStore
+        from mlx_vlm.generate.ar import BatchGenerator
+        from mlx_vlm.utils import StoppingCriteria
+
+        model = self.language_model()
+        ids = self.prompt()
+        processor = NS(stopping_criteria=StoppingCriteria([]))
+        manager = APCManager(
+            num_blocks=16,
+            block_size=8,
+            disk=DiskBlockStore(tmp_path, namespace="dash") if disk else None,
+            overrides={"memory_max_gb": 1 / 1024, "memory_reserve_gb": 0},
+        )
+        # Exercise checkpoint reuse within 1 MiB, independently of other CI
+        # workers' RAM use. Memory-pressure admission is covered in test_cache.
+        monkeypatch.setattr(manager, "_memory_headroom", lambda: 1 << 20)
+        monkeypatch.setattr(manager, "_disk_min_free_ram_bytes", 0)
+        if disk:
+            manager._exact_cache_max = 0
+
+        def generate(tokens, apc):
+            # Production supplies the full prompt for page bookkeeping before
+            # prefill; the cached prefix may precede a new, longer text suffix.
+            model._prompt_ids = mx.array([tokens])
+            embeds = model.model.embed_tokens(mx.array([tokens]))
+            runner = BatchGenerator(
+                model,
+                processor,
+                max_tokens=6,
+                prefill_batch_size=1,
+                completion_batch_size=1,
+                prefill_step_size=8,
+                apc_manager=apc,
+                manage_wired_limit=False,
+            )
+            try:
+                assert (runner.apc is not None) == (apc is not None)
+                # Same document/media identity; text tokens are hashed separately.
+                runner.insert(
+                    [tokens],
+                    prompt_kwargs=[
+                        {
+                            "inputs_embeds": embeds,
+                            "_apc_semantic_hash": 42,
+                        }
+                    ],
+                )
+                output = []
+                for _ in range(40):
+                    _, results = runner.next()
+                    output.extend(result.token for result in results)
+                    if len(output) == 6:
+                        break
+                assert len(output) == 6
+                return output
+            finally:
+                runner.close()
+
+        try:
+            expected = generate(ids, None)
+            assert generate(ids, manager) == expected
+            assert generate(ids, manager) == expected
+            assert manager.stats.restored_tokens == len(ids) - 1
+            extended = ids + [2, 3, 4]
+            assert generate(extended, manager) == generate(extended, None)
+            assert manager.stats.restored_tokens >= 2 * (len(ids) - 1)
+            if disk:
+                assert manager.stats.disk_hits >= 2
+        finally:
+            manager.close()
+
+    @pytest.mark.parametrize("bits", [None, 4])
+    def test_dash_snapshot_continues_decode(self, bits):
+        from mlx_vlm.apc import snapshot_prompt_cache_row
+
+        model = self.language_model(hidden_size=64 if bits else 16)
+        ids = mx.array([self.prompt()])
+        model._prompt_ids = ids
+        cache = model.make_cache()
+        model(ids, cache=cache)
+        if bits:
+            cache = [c.to_quantized(group_size=32, bits=bits) for c in cache]
+        # Stop after crossing a page marker and during an incomplete block.
+        for token in (self.PAGE, 4, 5):
+            mx.eval(model(mx.array([[token]]), cache=cache).logits)
+        restored = snapshot_prompt_cache_row(cache)
+        assert all(a is not b for a, b in zip(cache, restored))
+        for token in (6, self.PAGE, 3, 2):
+            expected = model(mx.array([[token]]), cache=cache).logits
+            actual = model(mx.array([[token]]), cache=restored).logits
+            assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5).item()
+        assert all(c.dash_state is restored[0].dash_state for c in restored)
+
     @pytest.mark.parametrize("bits", [None, 4, 8])
     @pytest.mark.parametrize("heads", [2, 4])
     def test_decode_gather_matches_dense_mask(self, bits, heads):
@@ -5662,3 +6275,71 @@ def test_lfm3_omni_quantized_checkpoint_roundtrip(tmp_path, lfm3_omni):
     restored = load_model(tmp_path)
     actual = restored(ids, **kwargs).logits
     np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+
+class TestEncoderActivations:
+    """Checkpoint activation names select the matching values and gradients."""
+
+    @staticmethod
+    def _layer(family, hidden_act):
+        module = importlib.import_module(f"mlx_vlm.models.{family}.{family}")
+        config = module.ModelConfig(
+            model_type=family,
+            vocab_size=8,
+            hidden_size=4,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            intermediate_size=4,
+            max_position_embeddings=16,
+            hidden_act=hidden_act,
+        )
+        name = "BertIntermediate" if family == "bert" else "XLMRobertaIntermediate"
+        return getattr(module, name)(config)
+
+    @staticmethod
+    def _reference(value, name):
+        if name == "relu":
+            return max(0.0, value), float(value > 0)
+        if name == "silu":
+            sigmoid = 1.0 / (1.0 + math.exp(-value))
+            return value * sigmoid, sigmoid + value * sigmoid * (1.0 - sigmoid)
+        if name == "gelu_new":
+            scale = math.sqrt(2.0 / math.pi)
+            inner = scale * (value + 0.044715 * value**3)
+            tangent = math.tanh(inner)
+            return (
+                0.5 * value * (1.0 + tangent),
+                0.5 * (1.0 + tangent)
+                + 0.5
+                * value
+                * (1.0 - tangent**2)
+                * scale
+                * (1.0 + 3 * 0.044715 * value**2),
+            )
+        cdf = 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
+        pdf = math.exp(-0.5 * value**2) / math.sqrt(2.0 * math.pi)
+        return value * cdf, cdf + value * pdf
+
+    @pytest.mark.parametrize("hidden_act", ["gelu", "relu", "silu", "gelu_new"])
+    @pytest.mark.parametrize("family", ["bert", "xlm_roberta"])
+    def test_configured_activation(self, family, hidden_act):
+        layer = self._layer(family, hidden_act)
+        layer.dense.weight = mx.eye(4)
+        layer.dense.bias = mx.zeros(4)
+        values = [-2.0, -0.5, 0.5, 2.0]
+        inputs = mx.array([values])
+        expected, expected_gradient = zip(
+            *[self._reference(value, hidden_act) for value in values]
+        )
+        output = layer(inputs)
+        gradient = mx.grad(lambda x: mx.sum(layer(x)))(inputs)
+        mx.eval(output, gradient)
+        np.testing.assert_allclose(np.asarray(output), [expected], rtol=1e-5, atol=1e-6)
+        np.testing.assert_allclose(
+            np.asarray(gradient), [expected_gradient], rtol=1e-5, atol=1e-6
+        )
+
+    @pytest.mark.parametrize("family", ["bert", "xlm_roberta"])
+    def test_unknown_activation_is_rejected(self, family):
+        with pytest.raises(ValueError, match="not-an-activation"):
+            self._layer(family, "not-an-activation")

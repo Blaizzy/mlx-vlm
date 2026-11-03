@@ -144,8 +144,14 @@ def _transform_modelopt_nvfp4_weights(
                 raise ValueError(f"Invalid ModelOpt FP8 tensors for {prefix}.")
             if not mx.issubdtype(value.dtype, mx.floating):
                 raise ValueError(f"Invalid ModelOpt FP8 scale for {prefix}.")
+            # ModelOpt FP8_PB_WO stores 128x128 block scales as
+            # [row_blocks, 1, col_blocks, 1], rather than per-channel scales.
+            block_structure = None
+            if value.ndim == 4 and value.shape[1] == value.shape[3] == 1:
+                value = value[:, 0, :, 0]
+                block_structure = [128, 128]
             transformed[weight_key] = _dequantize_compressed_tensors_fp8_weight(
-                weights[weight_key], value
+                weights[weight_key], value, block_structure
             )
             pending.append(transformed[weight_key])
             _flush()

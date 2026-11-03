@@ -45,6 +45,7 @@ from .common import (
     wired_limit,
 )
 from .image import DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_TASK, run_image_generation_cli
+from .three_d import run_3d_generation_cli
 from .video_generation import DEFAULT_VIDEO_STEPS, run_video_generation_cli
 
 logger = logging.getLogger("mlx_vlm.generate")
@@ -95,7 +96,7 @@ DEFAULT_THINKING_END_TOKEN = "</think>"
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description="Generate text, an image, a video, or audio with a supported model."
+        description="Generate text, images, video, audio, or 3D with a supported model."
     )
     parser.add_argument(
         "--model",
@@ -106,18 +107,18 @@ def parse_arguments():
     parser.add_argument(
         "--output-modality",
         type=str,
-        choices=("text", "image", "video", "audio"),
+        choices=("text", "image", "video", "audio", "3d"),
         default="text",
         help=(
             "Generate text with a VLM, an image with a supported image model, "
-            "a video with a supported video model, or speech with an omni model."
+            "a video, speech with an omni model, or 3D Gaussian splats from an image."
         ),
     )
     parser.add_argument(
         "--output",
         type=str,
         default=None,
-        help="Output path for image, video, or audio generation (.wav for audio).",
+        help="Output path for image, video, audio (.wav), or 3D (.ply) generation.",
     )
     parser.add_argument(
         "--ref-audio",
@@ -147,7 +148,7 @@ def parse_arguments():
         type=int,
         default=None,
         help=(
-            "Number of inference steps. Uses the model default for images "
+            "Number of inference steps. Uses the model default for images and 3D "
             f"and {DEFAULT_VIDEO_STEPS} for videos when omitted."
         ),
     )
@@ -195,7 +196,7 @@ def parse_arguments():
         "--guidance",
         type=float,
         default=None,
-        help="Classifier-free guidance for image generation/editing.",
+        help="Classifier-free guidance for image generation/editing or 3D generation.",
     )
     parser.add_argument(
         "--prompt-expansion-model",
@@ -624,6 +625,17 @@ def parse_arguments():
         help=(
             "Set the chat-template thinking mode when supported. "
             "Choices: enabled, disabled, adaptive."
+        ),
+    )
+    parser.add_argument(
+        "--reasoning-effort",
+        type=str.lower,
+        default=None,
+        help=(
+            "Reasoning effort forwarded to the chat template (for example "
+            "low, medium, high). Templates that use reasoning_strength "
+            "receive the same value, matching the server's reasoning_effort "
+            "handling. When omitted, the template default is left untouched."
         ),
     )
     parser.add_argument(
@@ -1100,7 +1112,7 @@ def stream_generate(
             generated_tokens.append(token)
 
             # Check thinking budget and force token if needed
-            if thinking_criteria is not None:
+            if thinking_criteria is not None and kwargs.get("draft_model") is None:
                 thinking_criteria(token)
 
             # Stop generation if the token is in the eos_token_ids
@@ -1335,6 +1347,9 @@ def main():
     if output_modality == "video":
         run_video_generation_cli(args)
         return
+    if output_modality == "3d":
+        run_3d_generation_cli(args)
+        return
     if output_modality == "audio":
         if getattr(args, "output", None) is None:
             raise ValueError(
@@ -1497,6 +1512,10 @@ def main():
         chat_template_kwargs["use_tts_template"] = True
     if args.thinking_mode is not None:
         chat_template_kwargs["thinking_mode"] = args.thinking_mode
+    if args.reasoning_effort is not None:
+        chat_template_kwargs["reasoning_effort"] = args.reasoning_effort
+        # Muse Glimmer's chat template reads the reasoning_strength alias.
+        chat_template_kwargs["reasoning_strength"] = args.reasoning_effort
     if args.video:
         chat_template_kwargs["video"] = args.video
         chat_template_kwargs["fps"] = args.fps

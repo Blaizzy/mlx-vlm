@@ -200,20 +200,32 @@ class DeepseekV2DashModel(DeepseekV2Model):
         offset = cache[0].offset
         if offset == 0:
             state.start(_prompt_ids(prompt_ids, x, h.shape[1]))
+        elif (
+            inputs_embeds is not None
+            and prompt_ids is not None
+            and not np.array_equal(state.prompt.ids, np.asarray(prompt_ids).reshape(-1))
+        ):
+            # A reused prefix can precede a different text suffix. Rebuild the
+            # prompt bookkeeping while preserving cached K/V and summaries.
+            ids = _prompt_ids(prompt_ids, x, h.shape[1], offset=offset)
+            state.start(ids)
         ctx = build_context(state, self._rope, x, offset, h.shape[1], h.dtype)
         for layer, c in zip(self.layers, cache):
+            # Per-layer checkpoint restoration creates independent objects;
+            # all layers use the first cache's authoritative decode position.
+            c.dash_state = state
             h = layer(h, ctx, c)
         return self.norm(h)
 
 
-def _prompt_ids(stashed, inputs, length):
+def _prompt_ids(stashed, inputs, length, offset=0):
     """Full prompt ids: the processor's (chunked prefill sees slices) or ``inputs``."""
     current = None if inputs is None else np.array(inputs).reshape(-1)
     if stashed is not None:
         stashed = np.asarray(stashed).reshape(-1)
         if current is None or (
-            stashed.shape[0] >= length
-            and np.array_equal(stashed[: current.shape[0]], current)
+            stashed.shape[0] >= offset + length
+            and np.array_equal(stashed[offset : offset + current.shape[0]], current)
         ):
             return stashed
     if current is None:

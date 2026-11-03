@@ -36,8 +36,22 @@ class ModelConfig(BaseModelConfig):
     norm_topk_prob: bool = True
     tie_word_embeddings: bool = False
     eos_token_id: Optional[Union[int, List[int]]] = None
+    quantization: Optional[Dict] = None
+    mlx_export: Optional[Dict] = None
 
     def __post_init__(self):
+        embedding_bits = (self.mlx_export or {}).get("embedding_bits")
+        if self.quantization is not None and embedding_bits is not None:
+            # The official INT4 export records its INT8 embeddings separately.
+            self.quantization = dict(self.quantization)
+            self.quantization.setdefault(
+                "model.embed_tokens",
+                {
+                    "group_size": self.quantization["group_size"],
+                    "bits": embedding_bits,
+                    "mode": self.quantization.get("mode", "affine"),
+                },
+            )
         if self.layer_types is None:
             self.layer_types = ["full_attention"] * self.num_hidden_layers
         self.mlp_only_layers = self.mlp_only_layers or []

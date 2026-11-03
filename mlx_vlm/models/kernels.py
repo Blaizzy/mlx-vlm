@@ -587,7 +587,7 @@ def _separable_interpolate_mlx(x, iy, wy, ix, wx):
     return _separable_interpolate_axis(y, iy, wy).reshape(N, out_h, out_w, C)
 
 
-def separable_interpolate(x, iy, wy, ix, wx):
+def separable_interpolate(x, iy, wy, ix, wx, *, training=False):
     """
     Separable interpolation of a channel-last tensor from per-axis tap tables.
 
@@ -595,11 +595,12 @@ def separable_interpolate(x, iy, wy, ix, wx):
         x: MLX tensor of shape [B, H, W, C]
         iy, ix: int32 source indices of shape [out_h, taps_y] and [out_w, taps_x]
         wy, wx: float32 weights with the same shapes as iy and ix
+        training: Use differentiable MLX operations instead of the Metal kernel.
 
     Returns:
         float32 tensor of shape [B, out_h, out_w, C]
     """
-    if not _HAS_METAL:
+    if training or not _HAS_METAL:
         return _separable_interpolate_mlx(x, iy, wy, ix, wx)
 
     batch_size, _, _, channels = x.shape

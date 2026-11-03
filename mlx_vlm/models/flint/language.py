@@ -181,6 +181,12 @@ class LanguageModel(nn.Module):
         return LanguageModelOutput(logits=logits)
 
     def sanitize(self, weights):
+        # Flint INT4 checkpoints store quantized weights as flat uint8;
+        # view them to the packed uint32 layout QuantizedLinear expects.
+        for k, v in list(weights.items()):
+            name = k.removesuffix(".weight")
+            if v.dtype == mx.uint8 and f"{name}.scales" in weights:
+                weights[k] = v.view(mx.uint32)
         weights = {k.removeprefix("language_model."): v for k, v in weights.items()}
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)

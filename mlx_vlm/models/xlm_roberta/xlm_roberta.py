@@ -81,7 +81,15 @@ class XLMRobertaIntermediate(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
-        self.intermediate_act_fn = nn.GELU()
+        activation = {
+            "gelu": nn.GELU,
+            "relu": nn.ReLU,
+            "silu": nn.SiLU,
+            "gelu_new": lambda: nn.GELU(approx="precise"),
+        }.get(config.hidden_act)
+        if activation is None:
+            raise ValueError(f"Unsupported XLM-R activation: {config.hidden_act}")
+        self.intermediate_act_fn = activation()
 
     def __call__(self, hidden_states):
         return self.intermediate_act_fn(self.dense(hidden_states))

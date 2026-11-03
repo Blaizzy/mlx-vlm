@@ -42,6 +42,34 @@ class FlexibleBaseModel(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+class ContinuationCheckpoint(BaseModel):
+    """Opaque stream position; clients return this object unchanged to resume."""
+
+    id: str = Field(min_length=1, max_length=64)
+    cursor: int = Field(ge=0, strict=True)
+    content: int = Field(ge=0, strict=True)
+    reasoning: int = Field(ge=0, strict=True)
+    responses: bool
+    idle_timeout_seconds: Optional[float] = Field(
+        None,
+        ge=0,
+        allow_inf_nan=False,
+        description="Idle lifetime after disconnection.",
+    )
+
+
+class ContinuationOptions(FlexibleBaseModel):
+    resumable: bool = Field(
+        False, description="Emit continuation checkpoints during streaming."
+    )
+    continuation: Optional[ContinuationCheckpoint] = Field(
+        None, description="Resume a saved stream on the same endpoint and tenant."
+    )
+    continue_final_message: bool = Field(
+        False, description="Continue the final assistant message as an open prefix."
+    )
+
+
 # OpenAI API Models
 
 
@@ -414,7 +442,7 @@ class ToolResultContext(BaseModel):
     max_bytes: int = Field(8192, ge=512, le=8192)
 
 
-class OpenAIRequest(ImageProcessingRequest):
+class OpenAIRequest(ImageProcessingRequest, ContinuationOptions):
     """
     OpenAI-compatible request structure.
     Using this structure : https://github.com/openai/openai-python/blob/main/src/openai/resources/responses/responses.py
@@ -953,7 +981,7 @@ class StreamOptions(BaseModel):
     include_usage: bool = False
 
 
-class ChatRequest(GenerationRequest):
+class ChatRequest(GenerationRequest, ContinuationOptions):
     messages: List[ChatMessage]
     transient_context: Optional[str] = Field(
         None,
@@ -1126,6 +1154,14 @@ class ModelInfo(BaseModel):
     created: int
     loaded: bool = Field(
         default=False, description="Whether the model is loaded in this server process."
+    )
+    reasoning_efforts: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Reasoning effort values explicitly allowed by the active/default chat "
+            "template. Null when the values cannot be determined. Independent of "
+            "the runtime thinking_budget."
+        ),
     )
 
 

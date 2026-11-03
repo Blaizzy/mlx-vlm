@@ -2295,6 +2295,7 @@ class TestApplyChatTemplateIntegration:
         "family,markers",
         [
             ("deepseek_v4", ("<image>", "<image>")),
+            ("mistral_large4", ("<image>", "<image>")),
             ("qwen3_vl", ("<image>", "<image>")),
             ("ernie4_5_moe_vl", ("<image>", "<image>")),
             ("internvl_chat", ("<image>", "<image>")),
@@ -2935,6 +2936,39 @@ def test_invalid_calls(name, text, error):
         (
             "qwen3_coder",
             dict,
+            "<function=get_weather>\n<parameter=city>\nnull\n</parameter>\n</function>",
+            _call("get_weather", city="null"),
+            _weather_tools(city="string", days="integer"),
+        ),
+        (
+            "qwen3_coder",
+            dict,
+            "<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n"
+            "<parameter=days>\nnull\n</parameter>\n</function>",
+            _call("get_weather", city="Paris", days=None),
+            _weather_tools(city="string", days="integer"),
+        ),
+        (
+            "qwen3_coder",
+            dict,
+            "<function=get_weather>\n<parameter=city>\nnull\n</parameter>\n</function>",
+            _call("get_weather", city=None),
+            [
+                dict(
+                    type="function",
+                    function=dict(
+                        name="get_weather",
+                        parameters=dict(
+                            type="object",
+                            properties=dict(city=dict(type="string", nullable=True)),
+                        ),
+                    ),
+                )
+            ],
+        ),
+        (
+            "qwen3_coder",
+            dict,
             "<function=write><parameter=content><parameter=</parameter></function>",
             _call("write", content="<parameter="),
             None,
@@ -2977,6 +3011,9 @@ def test_invalid_calls(name, text, error):
         "qwen-unclosed-last",
         "qwen-truncated-parameter-tag",
         "qwen-unclosed-last-invalid",
+        "qwen-string-null-kept",
+        "qwen-integer-null-none",
+        "qwen-nullable-string-null-none",
         "qwen-literal-parameter-prefix",
         "qwen-literal-parameter-tag",
         "qwen-empty-property-schema",
@@ -2989,6 +3026,58 @@ def test_parser_syntax(parser, argument_type, text, expected, tools):
     expected_calls = expected if isinstance(expected, list) else [expected]
     assert all(isinstance(call["arguments"], argument_type) for call in calls)
     assert [dict(call, arguments=_arguments(call)) for call in calls] == expected_calls
+
+
+class TestGemma4StringArguments:
+    @pytest.mark.parametrize(
+        "content",
+        [
+            'def strip_closing_braces(text):\n    return text.replace("}", "")\n',
+            "a { b",
+            "a } b { c",
+            '{"suffix": "}", "text": "ação 日本 🐦"}\n',
+        ],
+        ids=["python-source", "opening-brace", "closing-before-opening", "json-source"],
+    )
+    def test_literal_braces_preserve_content_and_following_arguments(self, content):
+        text = (
+            f'<|tool_call>call:write_file{{content:<|"|>{content}<|"|>,'
+            'path:<|"|>helpers.py<|"|>}<tool_call|>'
+        )
+        parsed = _parse("gemma4", text)
+        assert parsed["name"] == "write_file"
+        assert _arguments(parsed) == {"content": content, "path": "helpers.py"}
+        result = process_tool_calls(text, load_tool_module("gemma4"), None)
+        assert result.remaining_text == ""
+        assert len(result.calls) == 1
+        assert result.calls[0]["function"] == {
+            "name": "write_file",
+            "arguments": parsed["arguments"],
+        }
+
+    def test_braces_in_nested_array_strings_preserve_following_arguments(self):
+        text = (
+            'call:edit-file{edits:[{oldText:<|"|>a } b<|"|>,'
+            'newText:<|"|>c<|"|>}],path:<|"|>helpers.py<|"|>}'
+        )
+        parsed = _parse("gemma4", text)
+        assert parsed["name"] == "edit-file"
+        assert _arguments(parsed) == {
+            "edits": [{"oldText": "a } b", "newText": "c"}],
+            "path": "helpers.py",
+        }
+
+    def test_deep_string_call_syntax_is_not_selected_as_the_function(self):
+        parsed = _parse(
+            "gemma4",
+            'call:mcp.files:write{a:{b:{c:{d:{text:<|"|>call:fake{value:1}'
+            '<|"|>}}}},path:<|"|>helpers.py<|"|>}',
+        )
+        assert parsed["name"] == "mcp.files:write"
+        assert _arguments(parsed) == {
+            "a": {"b": {"c": {"d": {"text": "call:fake{value:1}"}}}},
+            "path": "helpers.py",
+        }
 
 
 @pytest.mark.parametrize("name", PARSER_NAMES)
@@ -3147,6 +3236,45 @@ def test_prepare_inputs(prompt, with_image, error, pad_token):
     if prompt == "test <image>":
         assert mx.array_equal(inputs["pixel_values"], mx.zeros((4, 5, 6)))
         assert mx.array_equal(inputs["attention_mask"], mx.array([7, 8, 9]))
+
+
+@pytest.mark.parametrize(
+    "size,expected_size",
+    [
+        ({"shortest_edge": 1024, "longest_edge": 4096}, (64, 64)),
+        ({"longest_edge": 64}, (64, 64)),
+        ({"height": 32, "width": 64}, (64, 32)),
+        ((32, 64), (64, 32)),
+        (32, (32, 32)),
+    ],
+    ids=["pixel-area", "edge-bound", "dimensions", "tuple", "square"],
+)
+def test_prepare_inputs_uniform_images_respect_size_contract(size, expected_size):
+    class RecordingProcessor(MockProcessor):
+        def __call__(self, text=None, images=None, **kwargs):
+            self.images = images
+            return super().__call__(text=text, images=images, **kwargs)
+
+    processor = RecordingProcessor()
+    processor.image_processor = SimpleNamespace(size=size)
+    images = [Image.new("RGB", (64, 32), "red"), Image.new("RGB", (32, 64), "blue")]
+    prepare_inputs(
+        processor,
+        prompts="<image><image>",
+        images=images,
+        pad_to_uniform_size=True,
+    )
+
+    assert [image.size for image in processor.images] == [expected_size] * 2
+    if expected_size == (64, 64):
+        # Flexible sizing must preserve the source pixels and aspect ratios.
+        for source, padded in zip(images, processor.images):
+            x, y = (64 - source.width) // 2, (64 - source.height) // 2
+            np.testing.assert_array_equal(
+                np.asarray(padded.crop((x, y, x + source.width, y + source.height))),
+                np.asarray(source),
+            )
+            assert padded.getpixel((0, 0)) == (255, 255, 255)
 
 
 @pytest.mark.parametrize("wrapped", [False, True])
@@ -3439,6 +3567,17 @@ class TestEstimateNumImageTokens:
     def test_unsupported_processor_raises(self):
         with pytest.raises(NotImplementedError, match="num_image_tokens"):
             estimate_num_image_tokens(SimpleNamespace(), 480, 640)
+
+
+def test_qwen3_vl_image_processor_exposes_size_and_valid_kwargs():
+    """Serving engines read the transformers image processor contract."""
+    from mlx_vlm.models.qwen3_vl import processing_qwen3_vl as module
+
+    processor = module.Qwen3VLImageProcessor(min_pixels=4096, max_pixels=16384)
+    assert processor.size == {"shortest_edge": 4096, "longest_edge": 16384}
+    accepted = set(processor.valid_kwargs.__annotations__)
+    assert module._IMAGE_PROCESSOR_KWARGS <= accepted
+    assert {"size", "patch_size", "merge_size"} <= accepted
 
 
 class TestMiMoV2Processor:
@@ -4501,6 +4640,19 @@ def test_lfm3_media_placeholders_are_validated_without_replacing_inserted_tokens
         module.Lfm3VlProcessor._expand(["a"], "<|image|>", ["image"])
     with pytest.raises(ValueError, match="placeholders"):
         module.Lfm3VlProcessor._expand(["<|image|>"], "<|image|>", [])
+
+
+def test_lfm3_processor_returns_image_features_without_text(lfm3_processor):
+    """Serving engines process media first and insert the tokens themselves."""
+    image = Image.new("RGB", (256, 256), color=(9, 30, 51))
+    features = lfm3_processor(images=[image], return_tensors="np")
+    assert set(features) == {"pixel_values", "image_grid_thw"}
+    assert features["image_grid_thw"].tolist() == [[1, 8, 8]]
+    size = {"shortest_edge": 1024, "longest_edge": 4096}
+    capped = lfm3_processor(images=[image], size=size, return_tensors="np")
+    assert capped["image_grid_thw"].tolist() == [[1, 4, 4]]
+    with pytest.raises(ValueError, match="placeholders"):
+        lfm3_processor(text=["no placeholder"], images=[image], return_tensors="np")
 
 
 def test_lfm3_processor_save_preserves_resolution_override(tmp_path, lfm3_processor):

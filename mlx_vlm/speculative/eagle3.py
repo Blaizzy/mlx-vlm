@@ -5,7 +5,9 @@ import mlx.nn as nn
 
 from .cache_state import abort_speculative_round, commit_speculative_round
 from .common import (
+    _apply_thinking_budget,
     _batch_cache_left_padding,
+    _filter_rope_deltas,
     _record_speculative_round,
     _requires_uniform_batch_acceptance,
     _SpeculativeSamplerRNG,
@@ -362,6 +364,7 @@ def _eagle3_rounds(
     draft_block_size: Optional[int] = None,
     token_dtype: mx.Dtype = mx.int32,
     greedy_sampling: bool = False,
+    thinking_budget_criteria: Optional[Any] = None,
 ) -> Generator[Tuple[int, None], None, None]:
     lm = model.language_model if hasattr(model, "language_model") else model
     if not hasattr(lm, "rollback_speculative_cache"):
@@ -395,6 +398,8 @@ def _eagle3_rounds(
     if hidden.shape[1] > 1:
         hidden = hidden[:, -1:, :]
 
+    if thinking_budget_criteria is not None:
+        thinking_budget_criteria(first_bonus)
     b = first_bonus
     emitted = 1
 
@@ -453,6 +458,9 @@ def _eagle3_rounds(
                 target_tokens,
                 max_tokens - emitted,
             )
+            [accepted], [new_tokens] = _apply_thinking_budget(
+                [accepted], [new_tokens], [thinking_budget_criteria], [0]
+            )
             _record_speculative_round(draft_model, accepted, bs - 1)
 
             accept_verified = getattr(draft_model, "accept_verified_tokens", None)
@@ -503,6 +511,7 @@ def _eagle3_rounds_batch(
     stop_check: Optional[Callable[[int, int], bool]] = None,
     eos_token_ids: Optional[set] = None,
     greedy_sampling: bool = False,
+    thinking_budget_criteria: Optional[List[Any]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     lm = model.language_model if hasattr(model, "language_model") else model
     if not hasattr(lm, "rollback_speculative_cache"):
@@ -548,6 +557,9 @@ def _eagle3_rounds_batch(
         hidden = hidden[:, -1:, :]
 
     b = first_bonus.tolist()
+    for state, token in zip(thinking_budget_criteria or [], b):
+        if state is not None:
+            state(token)
     emitted = [1] * B
     finished = [False] * B
     active_idx = list(range(B))
@@ -630,6 +642,13 @@ def _eagle3_rounds_batch(
                     accepted_list,
                     budgets,
                 )
+            accepted_list, new_tokens_list = _apply_thinking_budget(
+                accepted_list,
+                new_tokens_list,
+                thinking_budget_criteria,
+                active_idx,
+                uniform=_requires_uniform_batch_acceptance(draft_model, lm),
+            )
             _record_speculative_round(
                 draft_model,
                 sum(accepted_list) / len(accepted_list),
@@ -695,6 +714,7 @@ def _eagle3_rounds_batch(
             filter_drafter = getattr(draft_model, "filter_batch", None)
             if callable(filter_drafter):
                 filter_drafter(keep_mx)
+            _filter_rope_deltas(lm, keep_mx, n_active)
             hidden = hidden[keep_mx]
             active_idx = [active_idx[j] for j in keep_slots]
             cache_slots = [cache_slots[j] for j in keep_slots]

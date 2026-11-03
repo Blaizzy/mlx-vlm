@@ -77,6 +77,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | Ternary Bonsai 2 | [Docs](mlx_vlm/models/prism_hadamard_qwen35/README.md) |
 | Flint | [Docs](mlx_vlm/models/flint/README.md) |
 | Nemotron 3.5 Super VL / Bolt / Nano Omni | [Docs](mlx_vlm/models/nemotron_h_nano_omni/README.md) |
+| Idol (image to 3D Gaussian splats) | [Docs](mlx_vlm/models/idol/README.md) |
 
 ## Installation
 
@@ -153,6 +154,9 @@ mlx_vlm.generate --model mlx-community/gemma-3n-E2B-it-4bit --max-tokens 100 --p
 
 # Speech generation
 mlx_vlm.generate --model openbmb/MiniCPM-o-4_5 --output-modality audio --prompt "Say hello." --ref-audio /path/to/voice.wav --output speech.wav --max-tokens 256
+
+# Image to 3D Gaussian splats
+mlx_vlm.generate --model speridlabs/idol --output-modality 3d --image object.png --output object.ply
 ```
 
 #### Thinking Budget
@@ -609,6 +613,7 @@ mlx_vlm.server --model-dir /Volumes/Models --model-dir ~/my-custom-model
 
 - `--model`: Preload a language model at server startup, accepts a Hugging Face repo ID or local path (optional, loads lazily on first request if omitted)
 - `--image-model`: Preload an image generation model at server startup
+- `--mesh-model`: Preload an image-to-3D model for asynchronous PLY generation
 - `--tts-model`: Preload a text-to-speech model at server startup
 - `--stt-model`: Preload a speech-to-text model at server startup
 - `--embedding-model`: Preload an embedding model at server startup
@@ -1359,6 +1364,7 @@ Structured outputs are not currently supported with speculative decoding.
 - `/responses/compact` and `/v1/responses/compact` - Compact conversation history into replayable state; see [compaction and APC](docs/usage.md#conversation-compaction-and-apc)
 - `/embeddings` and `/v1/embeddings` - OpenAI-compatible embeddings endpoint backed by native MLX embedding models
 - `/v1/decisions` - Predict named typed decisions using the shared decision API
+- `/v1/meshes` - Asynchronous image-to-3D jobs, with polling and downloads at `/v1/meshes/{id}` and `/v1/meshes/{id}/content`; see [3D serving](mlx_vlm/models/idol/README.md#server)
 - `/v1/rerank` - Rank text or multimodal documents by relevance to a query
 - `/audio/speech` and `/v1/audio/speech` - OpenAI-compatible text-to-speech endpoint backed by `mlx-audio` TTS models
 - `/audio/transcriptions` and `/v1/audio/transcriptions` - OpenAI-compatible speech-to-text endpoint backed by `mlx-audio` STT models

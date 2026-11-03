@@ -61,7 +61,10 @@ import mlx.core as mx
 import numpy as np
 
 from ._stream_cleanup import clear_mlx_streams
-from .apc_adapters import reserve_checkpoint_capacity
+from .apc_adapters import (
+    build_prefix_cache_plan_from_caches,
+    reserve_checkpoint_capacity,
+)
 from .apc_coordinator import APCCoordinator, PrefillMemoryPlan
 from .apc_storage import APCNode, ComponentId, StateHandle
 from .kv_quant import from_config as kv_quant_from_config
@@ -579,6 +582,14 @@ def adjust_prefix_to_text_suffix_boundary(
     if prefix_len > max_len:
         return 0
     return prefix_len
+
+
+class APCAdmissionError(MemoryError):
+    """A prefix restore or prefill must wait for memory to become available."""
+
+    def __init__(self, message="Insufficient memory for APC prefill", *, uid=None):
+        super().__init__(message)
+        self.uid = uid
 
 
 @dataclass
@@ -3317,12 +3328,12 @@ class APCManager:
             and self._memory_headroom() >= required
         )
 
-    def prepare_prefill(self, reserve_bytes: int) -> None:
+    def prepare_prefill(self, reserve_bytes: int) -> bool:
         """Enforce the coordinator's byte budget before new allocations."""
         if self.disk is not None:
             self.disk.flush()
         self._prefill_reserve_bytes = max(0, int(reserve_bytes))
-        self._make_room()
+        return self._make_room()
 
     # ---------- Public API ----------
     def checkpoint_prefix_length(
@@ -3352,6 +3363,8 @@ class APCManager:
         extra_hash: int = 0,
         max_prefix_tokens: Optional[int] = None,
         min_prefix_tokens: int = 0,
+        *,
+        defer_on_pressure: bool = False,
     ) -> Tuple[Optional[List[Any]], int]:
         """Return the longest restorable prefix from prompt-cache snapshots.
 
@@ -3406,17 +3419,8 @@ class APCManager:
                             source_cache, prefix_len
                         )
 
+        restore_deferred = False
         can_try_disk = disk is not None and prefix_len < max_len
-        if can_try_disk and self._disk_min_free_ram_bytes > 0:
-            free_now = _free_ram_bytes()
-            if free_now is not None and free_now < self._disk_min_free_ram_bytes:
-                logger.info(
-                    "APC: skipping exact disk restore " "(free RAM %.1f GB < %.1f GB)",
-                    free_now / (1 << 30),
-                    self._disk_min_free_ram_bytes / (1 << 30),
-                )
-                can_try_disk = False
-
         if can_try_disk and disk is not None:
             disk_match = disk.find_exact_prefix(
                 token_tuple,
@@ -3429,9 +3433,14 @@ class APCManager:
                 cache_hash, disk_prefix_len = disk_match
                 # Admit stored buffers before estimating expansion from their layout.
                 restore_bytes = disk.exact_cache_bytes(cache_hash)
-                if not self._make_room(2 * restore_bytes):
+                free_now = _free_ram_bytes() if self._disk_min_free_ram_bytes else None
+                low_ram = (
+                    free_now is not None and free_now < self._disk_min_free_ram_bytes
+                )
+                if low_ram or not self._make_room(2 * restore_bytes):
                     with self.lock:
                         self.stats.memory_skips += 1
+                    restore_deferred = True
                     disk_match = None
             if disk_match is not None:
                 cache_hash, disk_prefix_len = disk_match
@@ -3456,6 +3465,7 @@ class APCManager:
                         if not self._make_room(2 * expanded_bytes):
                             with self.lock:
                                 self.stats.memory_skips += 1
+                            restore_deferred = True
                             # Drop disk buffers and credit before memory fallback.
                             loaded = prompt_cache = None
                             self._prefill_reserve_bytes = (
@@ -3516,6 +3526,10 @@ class APCManager:
                             return prompt_cache, disk_prefix_len
 
         if source_cache is None:
+            if restore_deferred and defer_on_pressure:
+                raise APCAdmissionError(
+                    "APC prefix restore deferred by memory admission"
+                )
             return None, 0
         restore_bytes = self.memory_plan.restore_bytes(
             source_cache, prefix_len, prompt_capacity_tokens
@@ -3523,6 +3537,10 @@ class APCManager:
         if not self._make_room(restore_bytes):
             with self.lock:
                 self.stats.memory_skips += 1
+            if defer_on_pressure:
+                raise APCAdmissionError(
+                    "APC prefix restore deferred by memory admission"
+                )
             return None, 0
         prompt_cache = _clone_prompt_cache_for_apc(
             source_cache,
@@ -3565,6 +3583,8 @@ class APCManager:
             with self.lock:
                 self.stats.memory_skips += 1
             if self.disk is None:
+                return False
+            if not build_prefix_cache_plan_from_caches(prompt_cache).restorable:
                 return False
             # Serialize the live state on its producer thread. It cannot be
             # queued by reference: generation will mutate it after this call.
@@ -3633,6 +3653,7 @@ class APCManager:
         max_prefix_tokens: Optional[int] = None,
         min_prefix_tokens: int = 0,
         allow_memory_overlap: bool = False,
+        defer_on_pressure: bool = False,
     ) -> Tuple[Optional[List[Any]], int]:
         """Return a ready prompt cache from a layer-major disk shard.
 
@@ -3644,17 +3665,6 @@ class APCManager:
         if disk is None:
             return None, 0
         with self.lock:
-            if self._disk_min_free_ram_bytes > 0:
-                free_now = _free_ram_bytes()
-                if free_now is not None and free_now < self._disk_min_free_ram_bytes:
-                    logger.info(
-                        "APC: skipping disk prompt-cache restore "
-                        "(free RAM %.1f GB < %.1f GB)",
-                        free_now / (1 << 30),
-                        self._disk_min_free_ram_bytes / (1 << 30),
-                    )
-                    return None, 0
-
             n_full = len(token_ids) // self.block_size
             if max_prefix_tokens is not None and max_prefix_tokens > 0:
                 n_full = min(n_full, int(max_prefix_tokens) // self.block_size)
@@ -3688,9 +3698,15 @@ class APCManager:
             if matched_tokens <= min_prefix_tokens:
                 return None, 0
 
-        if not self._make_room(2 * disk.prefix_cache_bytes(block_hashes)):
+        free_now = _free_ram_bytes() if self._disk_min_free_ram_bytes else None
+        low_ram = free_now is not None and free_now < self._disk_min_free_ram_bytes
+        if low_ram or not self._make_room(2 * disk.prefix_cache_bytes(block_hashes)):
             with self.lock:
                 self.stats.memory_skips += 1
+            if defer_on_pressure:
+                raise APCAdmissionError(
+                    "APC prefix restore deferred by memory admission"
+                )
             return None, 0
         loaded = disk.load_layer_major_prefix(block_hashes)
         if loaded is None:
@@ -4401,12 +4417,47 @@ def make_warm_batch_exact_cache_multi(
     prefix_lens: Sequence[int],
     kv_quant_config: Optional[dict] = None,
 ) -> Tuple[Optional[List[Any]], int]:
-    """Merge single-row exact-cache snapshots into batch-aware caches.
+    """Merge exact-cache rows without releasing the caller's input entries.
 
     Native quantized rows are merged in their packed representation. When
     *kv_quant_config* is provided, legacy float ``BatchKVCache`` snapshots are
     converted to match live ``_make_cache``. Hybrid non-KV entries are
     unchanged.
+    """
+    # Copy the containers because the caller retains ownership of the rows.
+    merged, prefix_len = _merge_and_release_cache_rows(
+        [list(row) for row in row_caches], prefix_lens, kv_quant_config
+    )
+    if merged is not None and len(row_caches) == 1:
+        merged = _detach_borrowed_cache_entries(merged, row_caches[0])
+    return merged, prefix_len if merged is not None else 0
+
+
+def _detach_borrowed_cache_entries(caches, source):
+    """Detach native pass-through entries returned by a public merge API."""
+    eval_targets: List[mx.array] = []
+    for i, entry in enumerate(caches):
+        if entry is source[i]:
+            caches[i] = _clone_cache_entry_for_apc(
+                entry, min_capacity_tokens=None, eval_targets=eval_targets
+            )
+            if caches[i] is None:
+                return None
+    if eval_targets:
+        mx.eval(eval_targets)
+    return caches
+
+
+def _merge_and_release_cache_rows(
+    row_caches: Sequence[List[Any]],
+    prefix_lens: Sequence[int],
+    kv_quant_config: Optional[dict] = None,
+) -> Tuple[Optional[List[Any]], int]:
+    """Take ownership of temporary rows and release each layer after merging.
+
+    Materialize each merged layer before clearing its input entries, bounding
+    the overlap to one layer instead of another full batch. Callers must not
+    reuse the rows, including after a failure that leaves them partly cleared.
     """
 
     if not row_caches:
@@ -4416,6 +4467,8 @@ def make_warm_batch_exact_cache_multi(
     num_entries = len(row_caches[0])
     if any(len(row) != num_entries for row in row_caches):
         return None, 0
+    if any(not isinstance(row, list) for row in row_caches):
+        raise TypeError("Merging and releasing caches requires owned row lists")
 
     out: List[Any] = []
     for entry_idx in range(num_entries):
@@ -4424,8 +4477,18 @@ def make_warm_batch_exact_cache_multi(
             prefix_lens,
         )
         if merged is None:
-            return None, 0
+            if len(row_caches) != 1:
+                return None, 0
+            # A single request needs no batch conversion. Preserve custom
+            # checkpoint state when its cache has no multi-row merge.
+            merged = row_caches[0][entry_idx]
         out.append(merged)
+        eval_targets: List[mx.array] = []
+        _collect_mx_arrays(merged.state, eval_targets)
+        if eval_targets:
+            mx.eval(eval_targets)
+        for row in row_caches:
+            row[entry_idx] = None
 
     if kv_quant_config is not None:
         out = _align_exact_batch_caches_to_kv_policy(out, kv_quant_config)
@@ -4491,6 +4554,9 @@ def snapshot_prompt_cache_row(
     """
     if not caches:
         return []
+    # Reject incomplete composite contracts before extracting their rows.
+    if not build_prefix_cache_plan_from_caches(caches).restorable:
+        return None
     source: Sequence[Any] = caches
     if _prompt_cache_is_batch_shaped(caches):
         row = extract_prompt_cache_from_batch(caches, batch_idx)
@@ -4666,6 +4732,7 @@ def apc_lookup_plan(
     safe_lookup_min: int,
     suffix_is_text_only,
     prefix_has_media,
+    defer_on_pressure: bool = False,
 ) -> Optional[dict]:
     """Pick the best APC prefix (disk > exact > block); shared by both generate paths, releases losers, callers apply."""
     n = len(ids_list)
@@ -4674,7 +4741,10 @@ def apc_lookup_plan(
 
     if apc_mode == "exact":
         exact_cache, exact_prefix_len = manager.lookup_exact_cache(
-            ids_list, extra_hash=extra_hash, min_prefix_tokens=safe_lookup_min
+            ids_list,
+            extra_hash=extra_hash,
+            min_prefix_tokens=safe_lookup_min,
+            defer_on_pressure=defer_on_pressure,
         )
         if exact_cache is not None and 0 < exact_prefix_len < n:
             if not suffix_is_text_only(exact_prefix_len):
@@ -4700,6 +4770,7 @@ def apc_lookup_plan(
             ids_list,
             extra_hash=extra_hash,
             min_prefix_tokens=max(prefix_len, safe_lookup_min),
+            defer_on_pressure=defer_on_pressure and not matched,
         )
     warm_cache = None
     disk_prefix_len = 0
@@ -4709,6 +4780,7 @@ def apc_lookup_plan(
             extra_hash=extra_hash,
             min_prefix_tokens=max(prefix_len, exact_prefix_len, safe_lookup_min),
             allow_memory_overlap=max(prefix_len, exact_prefix_len) > 0,
+            defer_on_pressure=defer_on_pressure and not (matched or exact_cache),
         )
     if disk_prefix_len > max(prefix_len, exact_prefix_len) and disk_prefix_len < n:
         if matched:
