@@ -2272,6 +2272,64 @@ class TestApplyChatTemplateIntegration:
         types = [item["type"] for item in result[0]["content"]]
         assert types == ["image", "audio", "text"]
 
+    @pytest.mark.parametrize("num_images", [1, 2])
+    def test_lfm3_media_only_turn_keeps_audio_after_image(self, num_images):
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        # A user turn carrying an image but no trailing text part (e.g. an
+        # image plus a spoken question). Audio must still follow the image to
+        # match the reference image -> audio -> text order.
+        result = apply_chat_template(
+            None,
+            {"model_type": "lfm3_omni"},
+            [{"role": "user", "content": [{"type": "image"}] * num_images}],
+            return_messages=True,
+            num_images=num_images,
+            num_audios=1,
+        )
+        types = [item["type"] for item in result[0]["content"]]
+        assert types == ["image"] * num_images + ["audio"]
+
+    @pytest.mark.parametrize(
+        "content,expected_types",
+        [
+            (
+                [
+                    {"type": "text", "text": "Here is the image:"},
+                    {"type": "image"},
+                    {"type": "text", "text": "Answer the spoken question."},
+                ],
+                ["text", "image", "audio", "text"],
+            ),
+            (
+                [
+                    {"type": "image"},
+                    {"type": "text", "text": "Compare with this image:"},
+                    {"type": "image"},
+                    {"type": "text", "text": "Answer the spoken question."},
+                ],
+                ["image", "text", "image", "audio", "text"],
+            ),
+            (
+                [
+                    {"type": "image"},
+                    {"type": "text", "text": "Compare with this image:"},
+                    {"type": "image"},
+                ],
+                ["image", "text", "image", "audio"],
+            ),
+        ],
+    )
+    def test_lfm3_interleaved_images_stay_before_audio(self, content, expected_types):
+        result = apply_chat_template(
+            None,
+            {"model_type": "lfm3_omni"},
+            [{"role": "user", "content": content}],
+            return_messages=True,
+            num_audios=1,
+        )
+        assert [item["type"] for item in result[0]["content"]] == expected_types
+
     def test_assistant_reasoning_content_is_preserved(self):
         messages = [
             {"role": "user", "content": "What is 17 + 25?"},

@@ -496,8 +496,12 @@ class MessageFormatter:
         if role == "user" and not skip_audio_token and num_audios > 0:
             audio_tokens = [MessageBuilder.audio_message()] * num_audios
             if self.model_name in ("lfm3_audio", "lfm3_omni"):
-                # the reference order: images, then audio, then the text
-                content = content[:-1] + audio_tokens + content[-1:]
+                # Keep audio before trailing text, or after all media when
+                # there is no trailing text. Images may be interleaved with text.
+                split = len(content)
+                if content and content[-1].get("type") == "text":
+                    split -= 1
+                content = content[:split] + audio_tokens + content[split:]
             else:
                 content = (
                     audio_tokens + content if image_first else content + audio_tokens
