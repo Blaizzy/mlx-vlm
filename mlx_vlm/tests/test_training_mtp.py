@@ -21,7 +21,7 @@ from mlx_vlm.trainer import (
 )
 from mlx_vlm.trainer.common.utils import save_trainable_weights
 from mlx_vlm.trainer.losses.cross_entropy import cross_entropy
-from mlx_vlm.trainer.vlm.sft.runtime import vlm_sft_loss
+from mlx_vlm.trainer.vlm.cross_entropy.runtime import vlm_sft_loss
 
 
 def tiny_model(moe=False, tied=False):
@@ -279,7 +279,7 @@ def test_full_mtp_gradients_update_target_and_head(moe, tied):
 
 
 def test_legacy_loss_uses_same_mtp_objective():
-    from mlx_vlm.trainer.vlm.sft.trainer import vision_language_loss_fn
+    from mlx_vlm.trainer.vlm.cross_entropy.trainer import vision_language_loss_fn
 
     model = tiny_model()
     expected, _ = vlm_sft_loss(model, batch(), mtp_loss_weight=0.3)

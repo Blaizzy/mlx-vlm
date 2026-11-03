@@ -1,48 +1,12 @@
-"""Optional VLM MTP auxiliary loss shared by SFT, DPO, ORPO, and GRPO."""
+"""VLM MTP head attachment and auxiliary loss shared by SFT, DPO, ORPO, and GRPO."""
 
-import json
 from collections.abc import Mapping
-from dataclasses import asdict
-from pathlib import Path
 
 import mlx.core as mx
 from mlx.utils import tree_flatten
 
-MTP_PREFIX = "mtp_head."
-
-
-def mtp_head_dir(weights_file):
-    """Return the drafter directory saved beside a trainable-weights file."""
-    path = Path(weights_file)
-    step, sep, _ = path.name.partition("_")
-    return path.with_name(f"{step}_mtp" if sep and step.isdigit() else "mtp")
-
-
-def split_mtp_weights(weights):
-    """Split flat weights into ``(main, head)`` with the head prefix removed."""
-    main = {k: v for k, v in weights.items() if not k.startswith(MTP_PREFIX)}
-    head = {
-        k.removeprefix(MTP_PREFIX): v
-        for k, v in weights.items()
-        if k.startswith(MTP_PREFIX)
-    }
-    return main, head
-
-
-def save_mtp_head(head, weights, directory):
-    """Write a trained MTP head as a standalone drafter loadable by ``load_drafter``."""
-    directory = Path(directory)
-    directory.mkdir(parents=True, exist_ok=True)
-    mx.save_safetensors(
-        str(directory / "model.safetensors"), weights, metadata={"format": "mlx"}
-    )
-    config = asdict(head.config)
-    config["text_config"]["mtp_num_hidden_layers"] = len(head.layers)
-    (directory / "config.json").write_text(
-        json.dumps(config, indent=2, sort_keys=True) + "\n"
-    )
-    return directory
-
+from mlx_vlm.trainer.common.mtp import mtp_head_dir, split_mtp_weights
+from mlx_vlm.trainer.losses.mtp import mtp_objective
 
 def attach_mtp_head(model, head, *, checkpoint_path=None):
     """Attach an unbound Qwen3.5 dense/MoE MTP head after base training setup.
@@ -103,8 +67,7 @@ def vlm_mtp_loss(model, batch, *, output=None, loss_mask=None):
     Forwarding and causal shifting belong here, outside shared cross-entropy.
     An existing policy output/mask avoids another forward during SFT.
     """
-    from mlx_vlm.trainer.losses.cross_entropy import cross_entropy
-    from mlx_vlm.trainer.vlm.sft.runtime import _forward_vlm
+    from mlx_vlm.trainer.vlm.cross_entropy.runtime import _forward_vlm
 
     if not hasattr(model, "mtp_head"):
         raise ValueError(
@@ -138,12 +101,7 @@ def vlm_mtp_loss(model, batch, *, output=None, loss_mask=None):
     logits = model.mtp_head.training_logits(
         ids[:, 1:-1], hidden[-1][:, :-1], context_mask, model
     )
-    loss, metrics = cross_entropy(
-        logits.astype(mx.float32),
-        ids[:, 2:],
-        mx.logical_and(loss_mask[:, 1:], context_mask),
-    )
-    return loss, {"mtp_loss": loss, "num_mtp_tokens": metrics["num_tokens"]}
+    return mtp_objective(logits, ids, loss_mask, context_mask)
 
 
 def add_mtp_loss(model, batch, loss, metrics, weight, *, output=None, loss_mask=None):

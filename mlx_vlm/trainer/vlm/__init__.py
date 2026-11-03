@@ -7,4 +7,4 @@ from .orpo.config import ORPOTrainConfig, ORPOTrainingArgs
 from .orpo.trainer import ORPOTrainer
 from .orpo.trainer import ORPOTrainingArgs as LegacyORPOTrainingArgs
 from .orpo.trainer import train_orpo
-from .sft.trainer import SFTTrainer, TrainingArgs, train
+from .cross_entropy.trainer import SFTTrainer, TrainingArgs, train

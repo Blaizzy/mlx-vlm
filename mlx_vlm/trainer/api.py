@@ -14,7 +14,10 @@ from mlx_vlm.trainer.vlm.orpo.config import ORPOTrainingArgs
 
 # Explicit supported combinations, without importing optional modality libraries.
 TASKS = {
-    ("vlm", "sft"): ("vlm.sft.runtime", SFTTrainConfig),
+    # SFT and UFT (unsupervised fine-tuning/pretraining) share one CE runtime;
+    # train_on_completions selects completion-only or full-sequence targets.
+    ("vlm", "sft"): ("vlm.cross_entropy.runtime", SFTTrainConfig),
+    ("vlm", "uft"): ("vlm.cross_entropy.runtime", SFTTrainConfig),
     ("vlm", "dpo"): ("vlm.dpo.trainer", DPOTrainingArgs),
     ("vlm", "orpo"): ("vlm.orpo.runtime", ORPOTrainingArgs),
     ("vlm", "grpo"): ("vlm.grpo.trainer", GRPOTrainingArgs),
@@ -81,6 +84,8 @@ class Trainer:
             if not isinstance(args, accepted):
                 raise TypeError(f"{task}/{algorithm} expects {config_type.__name__}.")
             args.validate()
+            if algorithm == "uft" and args.train_on_completions:
+                raise ValueError("UFT trains on full sequences; use algorithm='sft'.")
             if not prepared and processing_class is None:
                 raise ValueError(f"{task} raw datasets require processing_class.")
             options = {}

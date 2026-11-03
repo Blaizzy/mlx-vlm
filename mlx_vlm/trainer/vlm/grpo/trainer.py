@@ -17,13 +17,14 @@ from mlx_vlm.trainer.common.utils import (
 )
 from mlx_vlm.trainer.datasets.loading import CacheDataset
 from mlx_vlm.trainer.vlm.grpo.dataset import GRPOVisionDataset
-from mlx_vlm.trainer.vlm.grpo.loss import completion_logps, grpo_objective
+from mlx_vlm.trainer.losses.grpo import grpo_objective
+from mlx_vlm.trainer.vlm.grpo.loss import completion_logps
 from mlx_vlm.trainer.vlm.grpo.rewards import (
     accuracy_reward,
     calculate_rewards_and_advantages,
 )
-from mlx_vlm.trainer.vlm.sft.dataset import _config_mapping, _get_option
-from mlx_vlm.trainer.vlm.sft.runtime import _model_type, vlm_batch_metrics
+from mlx_vlm.trainer.vlm.cross_entropy.dataset import _config_mapping, _get_option
+from mlx_vlm.trainer.vlm.cross_entropy.runtime import _model_type, vlm_batch_metrics
 
 
 def _cache_frozen_vision(model, rows):

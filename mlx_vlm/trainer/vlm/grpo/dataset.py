@@ -4,7 +4,7 @@ from collections.abc import Mapping
 
 import mlx.core as mx
 
-from mlx_vlm.trainer.vlm.sft.dataset import (
+from mlx_vlm.trainer.vlm.cross_entropy.dataset import (
     VisionDataset,
     _as_media_list,
     _get_option,

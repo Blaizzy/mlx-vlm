@@ -10,8 +10,8 @@ from typing import Any, Iterable
 import mlx.core as mx
 
 from mlx_vlm.trainer.common.utils import iterate_batch_indices
-from mlx_vlm.trainer.vlm.sft.dataset import VisionDataset
-from mlx_vlm.trainer.vlm.sft.runtime import (
+from mlx_vlm.trainer.vlm.cross_entropy.dataset import VisionDataset
+from mlx_vlm.trainer.vlm.cross_entropy.runtime import (
     _image_token_id,
     _sample_signature,
     collate_vlm_batch,

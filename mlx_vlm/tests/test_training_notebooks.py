@@ -151,7 +151,7 @@ def test_notebook_cells_train_evaluate_and_reload(notebook, train_type, tmp_path
         patch("datasets.load_dataset", side_effect=load_dataset_fixture),
         patch("mlx_vlm.prompt_utils.apply_chat_template", side_effect=template),
         patch(
-            "mlx_vlm.trainer.vlm.sft.dataset._load_vlm_helpers",
+            "mlx_vlm.trainer.vlm.cross_entropy.dataset._load_vlm_helpers",
             return_value=({}, template, prepare, None),
         ),
     ):

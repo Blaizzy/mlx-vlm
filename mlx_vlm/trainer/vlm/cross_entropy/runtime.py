@@ -580,7 +580,7 @@ def make_task(
     iterate_batches=iterate_vlm_batches,
 ):
     """Bind VLM preprocessing and supervised cross-entropy."""
-    from mlx_vlm.trainer.vlm.sft.dataset import VisionDataset
+    from mlx_vlm.trainer.vlm.cross_entropy.dataset import VisionDataset
 
     loss_options = dict(
         train_on_completions=args.train_on_completions,

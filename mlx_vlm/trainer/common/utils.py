@@ -343,7 +343,7 @@ def save_trainable_weights(
     head = getattr(model, "mtp_head", None) if isinstance(model, nn.Module) else None
     head_weights = {}
     if head is not None:
-        from mlx_vlm.trainer.vlm.mtp import (
+        from mlx_vlm.trainer.common.mtp import (
             mtp_head_dir,
             save_mtp_head,
             split_mtp_weights,

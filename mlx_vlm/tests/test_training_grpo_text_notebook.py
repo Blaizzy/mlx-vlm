@@ -138,7 +138,7 @@ def test_text_grpo_notebook_trains_evaluates_saves_and_reloads(
             return_value=DatasetDict(train=train, valid=valid, test=test),
         ) as data_loading,
         patch(
-            "mlx_vlm.trainer.vlm.sft.dataset._load_vlm_helpers",
+            "mlx_vlm.trainer.vlm.cross_entropy.dataset._load_vlm_helpers",
             return_value=({}, template, prepare, None),
         ),
         patch.object(

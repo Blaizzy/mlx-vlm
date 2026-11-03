@@ -11,7 +11,7 @@ import mlx.nn as nn
 from mlx_vlm.trainer.losses.cross_entropy import token_cross_entropy
 from mlx_vlm.trainer.losses.preference import dpo_objective, orpo_objective
 from mlx_vlm.trainer.vlm.mtp import add_mtp_loss
-from mlx_vlm.trainer.vlm.sft.runtime import forward_vlm_logits, vlm_batch_metrics
+from mlx_vlm.trainer.vlm.cross_entropy.runtime import forward_vlm_logits, vlm_batch_metrics
 
 
 def response_token_logps(

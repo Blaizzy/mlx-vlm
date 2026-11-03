@@ -997,7 +997,7 @@ def test_glm_ocr_trainer_forward_keeps_attention_causal():
     lm = module.LanguageModel(text_config, config)
 
     lm.model_type = "glm_ocr"
-    runtime = importlib.import_module("mlx_vlm.trainer.vlm.sft.runtime")
+    runtime = importlib.import_module("mlx_vlm.trainer.vlm.cross_entropy.runtime")
 
     def forward(input_ids, pixel_values, mask, **kwargs):
         lm._position_ids = None

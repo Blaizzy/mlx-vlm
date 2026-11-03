@@ -7,8 +7,8 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_map
 
-from ..sft.runtime import _completion_mask, vlm_batch_metrics
-from ..sft.trainer import TrainingArgs
+from ..cross_entropy.runtime import _completion_mask, vlm_batch_metrics
+from ..cross_entropy.trainer import TrainingArgs
 
 
 @dataclass
@@ -102,7 +102,7 @@ def _legacy_task(args, loss_fn, train_on_completions, assistant_id):
     """Adapt historical batches and score-based losses to the common engine."""
     from ...common.task import TrainingTask
     from ..mtp import add_mtp_loss
-    from ..sft.runtime import _enable_vlm_gradient_checkpointing, _save_vlm_weights
+    from ..cross_entropy.runtime import _enable_vlm_gradient_checkpointing, _save_vlm_weights
 
     def objective(model, batch):
         chosen, rejected = batch["chosen"], batch["rejected"]

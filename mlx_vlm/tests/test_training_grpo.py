@@ -18,7 +18,8 @@ from mlx.utils import tree_flatten
 from mlx_vlm.train import parse_args, run
 from mlx_vlm.trainer import GRPOTrainingArgs, Trainer
 from mlx_vlm.trainer.vlm.grpo.dataset import GRPOVisionDataset
-from mlx_vlm.trainer.vlm.grpo.loss import completion_logps, grpo_objective
+from mlx_vlm.trainer.losses.grpo import grpo_objective
+from mlx_vlm.trainer.vlm.grpo.loss import completion_logps
 from mlx_vlm.trainer.vlm.grpo.rewards import calculate_rewards_and_advantages
 from mlx_vlm.trainer.vlm.grpo.trainer import generate_grpo
 
@@ -338,7 +339,7 @@ def helper_fixtures():
 
 def test_prompt_preprocessing_custom_columns_and_no_answer_leakage():
     with patch(
-        "mlx_vlm.trainer.vlm.sft.dataset._load_vlm_helpers",
+        "mlx_vlm.trainer.vlm.cross_entropy.dataset._load_vlm_helpers",
         return_value=helper_fixtures(),
     ):
         dataset = GRPOVisionDataset(
@@ -394,7 +395,7 @@ def test_grpo_cli_custom_rewards(tmp_path):
             return_value=[{"prompt": "q", "answer": "yes"}],
         ),
         patch(
-            "mlx_vlm.trainer.vlm.sft.dataset._load_vlm_helpers",
+            "mlx_vlm.trainer.vlm.cross_entropy.dataset._load_vlm_helpers",
             return_value=helper_fixtures(),
         ),
         patch.object(
@@ -427,7 +428,7 @@ def test_notebook_runs_training_evaluation_and_saving(tmp_path):
         patch("mlx_vlm.load", return_value=(notebook_model, Tokenizer())),
         patch("datasets.load_dataset", return_value=DatasetDict(train=rows)),
         patch(
-            "mlx_vlm.trainer.vlm.sft.dataset._load_vlm_helpers",
+            "mlx_vlm.trainer.vlm.cross_entropy.dataset._load_vlm_helpers",
             return_value=helper_fixtures(),
         ),
         patch.object(
@@ -466,7 +467,7 @@ def test_qwen35_chunked_projection_matches_dense_scores_and_gradients(vision, ti
     from mlx_vlm.trainer import prepare_model_for_training
     from mlx_vlm.trainer.losses.cross_entropy import token_cross_entropy
     from mlx_vlm.trainer.vlm.grpo.trainer import _cache_frozen_vision
-    from mlx_vlm.trainer.vlm.sft.runtime import forward_vlm_logits
+    from mlx_vlm.trainer.vlm.cross_entropy.runtime import forward_vlm_logits
 
     model, _ = _qwen_patch_model()
     model.config.image_token_index = model.config.image_token_id = 7
@@ -591,7 +592,7 @@ def test_prompt_length_sorting_reuses_preprocessing_cache(tmp_path):
     helpers = helper_fixtures()
     with (
         patch(
-            "mlx_vlm.trainer.vlm.sft.dataset._load_vlm_helpers", return_value=helpers
+            "mlx_vlm.trainer.vlm.cross_entropy.dataset._load_vlm_helpers", return_value=helpers
         ),
         patch(
             "mlx_vlm.trainer.vlm.grpo.dataset.GRPOVisionDataset.process", wraps=None
@@ -634,7 +635,7 @@ def test_preformatted_grpo_prompts_bypass_template_and_preserve_text():
         return {"input_ids": np.array([[1, 3]], dtype=np.int32)}
 
     with patch(
-        "mlx_vlm.trainer.vlm.sft.dataset._load_vlm_helpers",
+        "mlx_vlm.trainer.vlm.cross_entropy.dataset._load_vlm_helpers",
         return_value=({}, template, prepare, None),
     ):
         dataset = GRPOVisionDataset(

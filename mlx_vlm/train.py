@@ -35,7 +35,7 @@ def build_parser(task="vlm", algorithm=None):
     parser.add_argument(
         "--algorithm",
         "--train-mode",
-        choices=("sft", "orpo", "dpo", "grpo"),
+        choices=("sft", "uft", "orpo", "dpo", "grpo"),
         default=algorithm,
     )
     parser.add_argument("-c", "--config")

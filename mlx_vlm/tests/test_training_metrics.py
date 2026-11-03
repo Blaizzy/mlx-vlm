@@ -22,12 +22,12 @@ from mlx_vlm.trainer.losses.preference import dpo_objective, orpo_objective
 from mlx_vlm.trainer.vlm.orpo.trainer import ORPOTrainingArgs as LegacyORPOTrainingArgs
 from mlx_vlm.trainer.vlm.orpo.trainer import orpo_loss as legacy_orpo_loss
 from mlx_vlm.trainer.vlm.orpo.trainer import train_orpo
-from mlx_vlm.trainer.vlm.sft.runtime import (
+from mlx_vlm.trainer.vlm.cross_entropy.runtime import (
     vlm_batch_metrics,
     vlm_sft_loss,
     vlm_vision_mask,
 )
-from mlx_vlm.trainer.vlm.sft.trainer import vision_language_loss_fn
+from mlx_vlm.trainer.vlm.cross_entropy.trainer import vision_language_loss_fn
 
 
 def test_dynamic_metrics_weighted_means_optional_keys_counts_and_distributed_sum():

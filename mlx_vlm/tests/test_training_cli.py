@@ -194,7 +194,7 @@ def test_cli_raw_rows_prepare_quantize_train_evaluate_and_save(tmp_path):
         ),
         patch("mlx_vlm.train.Trainer", side_effect=build_trainer),
         patch(
-            "mlx_vlm.trainer.vlm.sft.dataset._load_vlm_helpers",
+            "mlx_vlm.trainer.vlm.cross_entropy.dataset._load_vlm_helpers",
             return_value=({}, template, prepare, None),
         ),
     ):

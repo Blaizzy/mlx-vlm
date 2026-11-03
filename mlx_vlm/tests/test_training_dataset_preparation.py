@@ -6,7 +6,7 @@ from unittest.mock import patch
 import mlx.core as mx
 
 from mlx_vlm.trainer.vlm.preference.dataset import PreferenceVisionDataset
-from mlx_vlm.trainer.vlm.sft.dataset import VisionDataset
+from mlx_vlm.trainer.vlm.cross_entropy.dataset import VisionDataset
 
 
 class VisionPreparationTest(unittest.TestCase):
@@ -28,7 +28,7 @@ class VisionPreparationTest(unittest.TestCase):
 
         return {"native": {}}, template, generic, native
 
-    @patch("mlx_vlm.trainer.vlm.sft.dataset._load_vlm_helpers")
+    @patch("mlx_vlm.trainer.vlm.cross_entropy.dataset._load_vlm_helpers")
     def test_media_grouping_is_lazy_and_fallback_preserves_completion_masks(self, load):
         calls = []
         load.return_value = self.helpers(calls)
@@ -69,7 +69,7 @@ class VisionPreparationTest(unittest.TestCase):
         row["picture"] = []
         self.assertEqual(dataset.media_signature(0), ("audio", "video"))
 
-    @patch("mlx_vlm.trainer.vlm.sft.dataset._load_vlm_helpers")
+    @patch("mlx_vlm.trainer.vlm.cross_entropy.dataset._load_vlm_helpers")
     def test_flexible_rows_keep_template_fields_and_tools(self, load):
         rendered = []
 
@@ -112,7 +112,7 @@ class VisionPreparationTest(unittest.TestCase):
         self.assertEqual([m["content"] for m in rendered[1][0]], ["q", "a"])
         self.assertEqual(len(rendered), 2)
 
-    @patch("mlx_vlm.trainer.vlm.sft.dataset._load_vlm_helpers")
+    @patch("mlx_vlm.trainer.vlm.cross_entropy.dataset._load_vlm_helpers")
     def test_preference_default_config_preserves_shared_media_and_response_masks(
         self, load
     ):

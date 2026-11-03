@@ -216,6 +216,18 @@ class EngineTest(unittest.TestCase):
                         mx.isfinite(mx.array(trainer.evaluate()["val_loss"])).item()
                     )
 
+    def test_uft_shares_cross_entropy_runtime_with_full_sequence_targets(self):
+        from mlx_vlm.trainer.api import task_spec
+
+        self.assertEqual(task_spec("vlm", "uft")[1], task_spec("vlm", "sft")[1])
+        with self.assertRaisesRegex(ValueError, "full sequences"):
+            Trainer(
+                nn.Linear(1, 1),
+                VLMTrainingArgs(train_on_completions=True),
+                algorithm="uft",
+                prepared=True,
+            )
+
     def test_reference_cannot_be_policy(self):
         model = TinyLM()
         with self.assertRaisesRegex(ValueError, "separate"):
@@ -270,7 +282,7 @@ class DataAndCLITest(unittest.TestCase):
         helpers = ({}, template, prepare, None)
         processor = SimpleNamespace(pad_token_id=7)
         with mock.patch(
-            "mlx_vlm.trainer.vlm.sft.dataset._load_vlm_helpers", return_value=helpers
+            "mlx_vlm.trainer.vlm.cross_entropy.dataset._load_vlm_helpers", return_value=helpers
         ):
             for mode, cls in (("sft", VLMTrainingArgs), ("orpo", ORPOTrainingArgs)):
                 with self.subTest(mode=mode):
