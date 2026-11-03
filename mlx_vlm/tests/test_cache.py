@@ -3242,31 +3242,31 @@ def embeddings(lm, tokens):
 
 
 @parametrize(
-    "name",
+    "case_id",
     [
         "lfm2",
         "gemma4",
         "mistral_large4",
         "qwen3_5",
         "qwen3_5_moe",
-        "qwen2_vl",
-        "qwen2_5_vl",
-        "qwen3_vl",
-        "qwen3_vl_moe",
+        "TestGetInputEmbeddings.qwen2_vl_input_embeddings",
+        "TestGetInputEmbeddings.qwen2_5_vl_input_embeddings",
+        "TestGetInputEmbeddings.qwen3_vl_input_embeddings",
+        "TestGetInputEmbeddings.qwen3_vl_moe_input_embeddings",
     ],
 )
 @parametrize("tied", [False, True])
 @parametrize("keep", [None, 0, 1, 3, 8])
 @parametrize("dtype", [mx.float32, mx.bfloat16])
-def test_trailing_logits_preserve_cache_and_hidden_states(name, tied, keep, dtype):
+def test_trailing_logits_preserve_cache_and_hidden_states(case_id, tied, keep, dtype):
     from mlx_vlm.models.cache import make_prompt_cache
 
     mx.random.seed(19)
-    if name in ("lfm2", "gemma4"):
-        module, config = apc_config(name)
+    if case_id in ("lfm2", "gemma4"):
+        module, config = apc_config(case_id)
     else:
-        case = next(case for case in DATA["cases"] if case["module"] == name)
-        module = importlib.import_module("mlx_vlm.models." + name)
+        case = next(case for case in DATA["cases"] if case["id"] == case_id)
+        module = importlib.import_module("mlx_vlm.models." + case["module"])
         config = build_config(module, case["config"])
     text = getattr(config, "text_config", config)
     if hasattr(text, "tie_word_embeddings"):
