@@ -1360,6 +1360,19 @@ class TestGlmOcrProcessor:
             assert actual["image_grid_thw"].tolist() == [[1, 2, 4]]
             assert actual["pixel_values"].shape == (8, 1176)
 
+    @pytest.mark.parametrize("layout", ["hwc", "chw"])
+    def test_numpy_layouts_match_pil(self, layout):
+        p = m.glm_ocr.Glm46VImageProcessor(
+            **self.GEOMETRY, min_pixels=784, max_pixels=50176
+        )
+        # Exercise the numpy path even when torch is installed.
+        p._process_with_transformers_backend = lambda images: None
+        hwc = np.random.default_rng(0).integers(0, 256, (28, 56, 3), dtype=np.uint8)
+        expected = p(images=Image.fromarray(hwc))
+        actual = p(images=hwc if layout == "hwc" else hwc.transpose(2, 0, 1))
+        for key in ("pixel_values", "image_grid_thw"):
+            equal(actual[key], expected[key])
+
 
 @pytest.mark.parametrize(
     "module,rows,cols,length", [(m.smolvlm, 3, 4, 81), (m.idefics3, 2, 2, 4)]
