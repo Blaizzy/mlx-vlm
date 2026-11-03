@@ -224,6 +224,9 @@ class VisionTransformer(nn.Module):
                 # PyTorch's bicubic is MLX's "cubic" for 2D input.
                 mode="cubic",
                 align_corners=False,
+                # Match Molmo's reference, including the antialiased cubic kernel
+                # used for both downsampling and upsampling.
+                antialias=True,
             )
             # `Upsample` scales the dimensions between batch and channel, so it expects
             # channels-last while `pos_emb` is channels-first here.
