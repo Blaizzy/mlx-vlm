@@ -1,10 +1,10 @@
+# MLX-VLM
+
 [![Upload Python Package](https://github.com/Blaizzy/mlx-vlm/actions/workflows/python-publish.yml/badge.svg)](https://github.com/Blaizzy/mlx-vlm/actions/workflows/python-publish.yml)
 [![PyPI version](https://img.shields.io/pypi/v/mlx-vlm)](https://pypi.org/project/mlx-vlm/)
 [![Monthly downloads](https://img.shields.io/pypi/dm/mlx-vlm)](https://pypistats.org/packages/mlx-vlm)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://pypi.org/project/mlx-vlm/)
 [![MIT license](https://img.shields.io/github/license/Blaizzy/mlx-vlm)](https://github.com/Blaizzy/mlx-vlm/blob/main/LICENSE)
-
-# MLX-VLM
 
 [![Ask any image anything. Runs locally on your Mac. Install with pip install mlx-vlm or try it in Nativ.](https://raw.githubusercontent.com/Blaizzy/mlx-vlm/6e0fba58459c22d3a64959f6461ce6a247f000a2/docs/assets/mlx-vlm-banner.png)](https://runnativ.ai)
 
