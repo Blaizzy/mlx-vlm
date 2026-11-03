@@ -3972,6 +3972,24 @@ def test_paddleocr_vl_input_embeddings_return_request_positions():
     assert text.rope_deltas.tolist() == [[0]]
 
 
+def test_paddleocr_vl_text_only_rope_deltas_ignore_left_padding():
+    case = next(
+        case
+        for case in DATA["cases"]
+        if case["id"] == "TestGetInputEmbeddings.paddleocr_vl_input_embeddings"
+    )
+    module = importlib.import_module("mlx_vlm.models.paddleocr_vl")
+    model = module.Model(build_config(module, case["config"]))
+    input_ids = mx.array([[0, 0, 1, 2, 3], [1, 2, 3, 4, 5]], dtype=mx.int32)
+    mask = mx.array([[0, 0, 1, 1, 1], [1, 1, 1, 1, 1]], dtype=mx.int32)
+
+    result = model.get_input_embeddings(input_ids=input_ids, mask=mask)
+
+    # BatchKVCache offsets already exclude left padding, so the deltas must too.
+    assert result.position_ids[0, 0, 2:].tolist() == [0, 1, 2]
+    assert result.rope_deltas.tolist() == [[0], [0]]
+
+
 # Patch embedding layouts
 
 
