@@ -1,3 +1,4 @@
+import math
 from functools import lru_cache, partial
 from typing import Any, List, Optional
 
@@ -31,6 +32,7 @@ class Qwen3_5RotaryEmbedding(MRoPERotaryEmbedding):
         max_position_embeddings=2048,
         base=10000,
         mrope_section=[11, 11, 0],
+        rope_parameters=None,
     ):
         super().__init__(
             dim,
@@ -39,7 +41,61 @@ class Qwen3_5RotaryEmbedding(MRoPERotaryEmbedding):
             mrope_section=mrope_section,
             style="interleaved",
         )
+        rope_type = (rope_parameters or {}).get("type") or (rope_parameters or {}).get(
+            "rope_type"
+        )
+        if rope_type == "yarn":
+            self._inv_freq, self.attention_scaling = _yarn_inv_freq(
+                dim, base, rope_parameters, max_position_embeddings
+            )
+            # The fused MRoPE kernel ignores attention_scaling; the cos/sin path
+            # scales only the rotary slice of q and k, as HF does.
+            self.fused_apply = False
+            self._compiled_apply = None
         mx.eval(self.inv_freq)
+
+
+def _yarn_inv_freq(dim, base, rope_parameters, max_position_embeddings):
+    # HF modeling_rope_utils._compute_yarn_parameters (truncate=True default).
+    factor = float(rope_parameters["factor"])
+    original_max = rope_parameters.get(
+        "original_max_position_embeddings", max_position_embeddings
+    )
+    beta_fast = rope_parameters.get("beta_fast") or 32
+    beta_slow = rope_parameters.get("beta_slow") or 1
+
+    def get_mscale(scale, mscale=1):
+        return 1.0 if scale <= 1 else 0.1 * mscale * math.log(scale) + 1.0
+
+    attention_factor = rope_parameters.get("attention_factor")
+    if attention_factor is None:
+        mscale = rope_parameters.get("mscale")
+        mscale_all_dim = rope_parameters.get("mscale_all_dim")
+        if mscale and mscale_all_dim:
+            attention_factor = get_mscale(factor, mscale) / get_mscale(
+                factor, mscale_all_dim
+            )
+        else:
+            attention_factor = get_mscale(factor)
+
+    def correction_dim(num_rotations):
+        return (dim * math.log(original_max / (num_rotations * 2 * math.pi))) / (
+            2 * math.log(base)
+        )
+
+    low, high = correction_dim(beta_fast), correction_dim(beta_slow)
+    if rope_parameters.get("truncate", True):
+        low, high = math.floor(low), math.ceil(high)
+    low, high = max(low, 0), min(high, dim - 1)
+    if low == high:
+        high += 0.001
+    ramp = mx.clip((mx.arange(dim // 2, dtype=mx.float32) - low) / (high - low), 0, 1)
+    extrapolation = 1 - ramp
+    pos_freqs = base ** (mx.arange(0, dim, 2).astype(mx.float32) / dim)
+    inv_freq = (1.0 / (factor * pos_freqs)) * (1 - extrapolation) + (
+        1.0 / pos_freqs
+    ) * extrapolation
+    return inv_freq, float(attention_factor)
 
 
 def apply_multimodal_rotary_pos_emb(q, k, cos, sin, unqueeze_dim=1):
@@ -920,6 +976,7 @@ class Qwen3_5Attention(nn.Module):
             max_position_embeddings=args.max_position_embeddings,
             base=args.rope_parameters["rope_theta"],
             mrope_section=args.rope_parameters["mrope_section"],
+            rope_parameters=args.rope_parameters,
         )
 
     def __call__(
