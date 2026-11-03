@@ -3,9 +3,23 @@
 
 [![Ask any image anything. Runs locally on your Mac. Install with pip install mlx-vlm or try it in Nativ.](https://raw.githubusercontent.com/Blaizzy/mlx-vlm/6e0fba58459c22d3a64959f6461ce6a247f000a2/docs/assets/mlx-vlm-banner.png)](https://runnativ.ai)
 
-MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VLMs) and Omni Models (VLMs with audio and video support) on your Mac using MLX.
+<p align="center">
+  <strong>MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VLMs) and Omni Models</strong> (VLMs with audio and video support) on your Mac using MLX.
+</p>
 
-Built by [Neywa Labs](https://www.neywalabs.ai), the local AI company behind [Nativ](https://runnativ.ai).
+<p align="center">
+  <a href="#installation"><strong>Installation</strong></a> &middot;
+  <a href="https://blaizzy.github.io/mlx-vlm/">Documentation</a> &middot;
+  <a href="https://github.com/Blaizzy/mlx-vlm/releases">Releases</a>
+</p>
+
+<p align="center">
+  macOS &middot; Apple silicon &middot; Powered by <a href="https://github.com/ml-explore/mlx">MLX</a>
+</p>
+
+<p align="center">
+  Built by <a href="https://www.neywalabs.ai">Neywa Labs</a>, the local AI company behind <a href="https://runnativ.ai">Nativ</a>.
+</p>
 
 ## Table of Contents
 - [Installation](#installation)
