@@ -3678,6 +3678,205 @@ def test_anthropic_stream_without_tools_keeps_literal_call_markup(client):
     assert _joined(_deltas(streamed, "messages"), "text") == expected
 
 
+def _anthropic_stream_stop(response):
+    (delta,) = [e["delta"] for e in _data(response) if e.get("type") == "message_delta"]
+    return delta["stop_reason"], delta["stop_sequence"]
+
+
+@pytest.mark.parametrize(
+    "chunks,unread",
+    [
+        (["Hello STOP secret tail"], 0),
+        (["Hello ", "STOP", " secret", " tail"], 2),
+        (["Hello ST", "OP secret", " tail"], 1),
+    ],
+    ids=["one-chunk", "whole-match", "split-match"],
+)
+def test_anthropic_stream_cuts_text_at_stop_sequence(client, chunks, unread):
+    with _endpoint(result=_result("".join(chunks))):
+        ordinary = _post(client, "messages", stop_sequences=["STOP"])
+    tokens = [_token(text) for text in chunks[:-1]]
+    tokens.append(_token(chunks[-1], finish_reason="stop"))
+    remaining = iter(tokens)
+    streamed = _stream_response(
+        client,
+        remaining,
+        "messages",
+        stop_sequences=["NEVER", "STOP"],
+    )
+
+    assert ordinary.json()["content"] == [dict(type="text", text="Hello ")]
+    assert _joined(_deltas(streamed, "messages"), "text") == "Hello "
+    assert _anthropic_stream_stop(streamed) == ("stop_sequence", "STOP")
+    # Generation stops at the match instead of running to the end.
+    assert len(list(remaining)) == unread
+
+
+def test_anthropic_stream_releases_unmatched_stop_prefix(client):
+    tokens = [_token("Hello ST"), _token("AR done", finish_reason="stop")]
+    streamed = _stream_response(client, tokens, "messages", stop_sequences=["STOP"])
+
+    assert _joined(_deltas(streamed, "messages"), "text") == "Hello STAR done"
+    assert _anthropic_stream_stop(streamed) == ("end_turn", None)
+
+
+@pytest.mark.parametrize("previous_call", [False, True])
+@pytest.mark.parametrize("chunking", ["whole", "split-stop", "characters"])
+@pytest.mark.parametrize("finish_reason", [None, "stop"])
+def test_anthropic_stream_discards_tool_calls_after_stop(
+    client, previous_call, chunking, finish_reason
+):
+    before = '<tool_call>{"name":"get_time","arguments":{}}</tool_call>'
+    after = '<tool_call>{"name":"get_weather","arguments":{}}</tool_call>'
+    text = (before if previous_call else "") + "Hello STOP" + after
+    stop_at = text.index("STOP")
+    chunks = {
+        "whole": [text],
+        "split-stop": [text[: stop_at + 2], text[stop_at + 2 :]],
+        "characters": list(text),
+    }[chunking]
+    tokens = [_token(chunk) for chunk in chunks]
+    tokens[-1].finish_reason = finish_reason
+    streamed = _stream_response(
+        client,
+        tokens,
+        "messages",
+        endpoint=dict(parser=_JSON_TOOLS),
+        tools=[_tool(name, "messages") for name in ("get_time", "get_weather")],
+        stop_sequences=["STOP"],
+    )
+
+    assert _joined(_deltas(streamed, "messages"), "text") == "Hello "
+    calls = [
+        event["content_block"]["name"]
+        for event in _data(streamed)
+        if event.get("content_block", {}).get("type") == "tool_use"
+    ]
+    assert calls == (["get_time"] if previous_call else [])
+    assert _anthropic_stream_stop(streamed) == (
+        ("tool_use", None) if previous_call else ("stop_sequence", "STOP")
+    )
+
+
+@pytest.mark.parametrize("reasoning", ["STOP", "STOP <tool_call>example"])
+@pytest.mark.parametrize("previous_call", [False, True])
+def test_anthropic_stream_stop_ignores_thinking_and_tool_arguments(
+    client, reasoning, previous_call
+):
+    before = '<tool_call>{"name":"get_time","arguments":{"text":"STOP"}}</tool_call>'
+    after = '<tool_call>{"name":"get_weather","arguments":{}}</tool_call>'
+    text = (
+        "<think>"
+        + reasoning
+        + "</think>"
+        + (before if previous_call else "")
+        + "Hello STOP"
+        + after
+    )
+    streamed = _stream_response(
+        client,
+        [_token(text, finish_reason="stop")],
+        "messages",
+        endpoint=dict(parser=_JSON_TOOLS),
+        tools=[_tool(name, "messages") for name in ("get_time", "get_weather")],
+        stop_sequences=["STOP"],
+        enable_thinking=True,
+    )
+
+    assert _thinking_text(streamed, "messages") == (reasoning, "Hello ")
+    calls = [
+        event["content_block"]["name"]
+        for event in _data(streamed)
+        if event.get("content_block", {}).get("type") == "tool_use"
+    ]
+    assert calls == (["get_time"] if previous_call else [])
+
+
+@pytest.mark.parametrize(
+    "before,after,sequences,expected",
+    [
+        ("Hello AB", "X", ["ABC", "B"], "Hello A"),
+        ("Hello ST", "OP", ["ST OP"], "Hello "),
+        ("Hello ", "tail", [" "], "Hello"),
+    ],
+)
+def test_anthropic_stream_discards_calls_while_stop_is_buffered(
+    client, before, after, sequences, expected
+):
+    call = '<tool_call>{"name":"get_weather","arguments":{}}</tool_call>'
+    streamed = _stream_response(
+        client,
+        [_token(before), _token(call), _token(after, finish_reason="stop")],
+        "messages",
+        endpoint=dict(parser=_JSON_TOOLS),
+        tools=[_tool(api="messages")],
+        stop_sequences=sequences,
+    )
+
+    assert _joined(_deltas(streamed, "messages"), "text") == expected
+    assert not any(
+        event.get("content_block", {}).get("type") == "tool_use"
+        for event in _data(streamed)
+    )
+    assert _anthropic_stream_stop(streamed) == ("stop_sequence", sequences[-1])
+
+
+def test_anthropic_response_template_discards_tool_calls_after_stop(client):
+    config = NS(model_type="muse_glimmer")
+    call = _MUSE_CALL[_MUSE_CALL.index("<|start|>assistant to=get_weather") :]
+    text = "to=user<|message|>Hello STOP<|eom|>" + call
+    streamed = _stream_response(
+        client,
+        [_token(text, finish_reason="stop")],
+        "messages",
+        endpoint=dict(
+            config=config,
+            processor=NS(config=config, tokenizer=_MuseResponseTemplateTokenizer()),
+            parser=load_tool_module("atem"),
+        ),
+        tools=[_tool(api="messages")],
+        stop_sequences=["STOP"],
+    )
+
+    assert _joined(_deltas(streamed, "messages"), "text") == "Hello "
+    assert not any(
+        event.get("content_block", {}).get("type") == "tool_use"
+        for event in _data(streamed)
+    )
+    assert _anthropic_stream_stop(streamed) == ("stop_sequence", "STOP")
+
+
+@pytest.mark.parametrize("finish_reason", [None, "stop"])
+@pytest.mark.parametrize(
+    "text,sequences,expected,matched",
+    [
+        ("ABCtail", ["ABC", "B"], "", "ABC"),
+        ("ABXtail", ["ABC", "B"], "A", "B"),
+        ("AB", ["ABC", "B"], "A", "B"),
+        ("ABCDtail", ["ABCD", "ABC"], "", "ABCD"),
+        ("ABCXtail", ["ABCD", "ABC"], "", "ABC"),
+        ("ABCDtail", ["ABC", "ABCD"], "", "ABC"),
+        ("Hello ST", ["STOP"], "Hello ST", None),
+    ],
+)
+def test_anthropic_stream_overlapping_stops_are_chunk_independent(
+    client, text, sequences, expected, matched, finish_reason
+):
+    chunkings = [[text], list(text)]
+    chunkings.extend([text[:split], text[split:]] for split in range(1, len(text)))
+    for chunks in chunkings:
+        tokens = [_token(chunk) for chunk in chunks]
+        tokens[-1].finish_reason = finish_reason
+        streamed = _stream_response(
+            client, tokens, "messages", stop_sequences=sequences
+        )
+        assert _joined(_deltas(streamed, "messages"), "text") == expected, chunks
+        assert _anthropic_stream_stop(streamed) == (
+            "stop_sequence" if matched else "end_turn",
+            matched,
+        ), chunks
+
+
 ANTHROPIC_TOOLS = [_tool(name, "messages") for name in ("get_time", "get_weather")]
 
 
