@@ -6,6 +6,7 @@
 import mlx.core as mx
 import mlx.nn as nn
 
+from ...kernels.lfm3_qk_norm_rope import lfm3_qk_norm_rope
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
@@ -14,6 +15,21 @@ from ..base import (
 )
 from ..cache import ArraysCache, KVCache, RotatingKVCache
 from ..lfm2.language import ShortConv
+
+# The fused kernels are Metal-only and take fp16/bf16. Every other build or
+# dtype keeps the plain ops, which the kernels reproduce bit for bit.
+_FUSED_DTYPES = (mx.float16, mx.bfloat16)
+_FUSED = mx.metal.is_available()
+
+
+def set_fused(enabled: bool) -> None:
+    """Force the fused decode path on or off, for benchmarking and tests."""
+    global _FUSED
+    _FUSED = bool(enabled)
+
+
+def _can_fuse(*arrays) -> bool:
+    return _FUSED and all(a.dtype in _FUSED_DTYPES for a in arrays)
 
 
 class RotaryEmbedding(nn.Module):
@@ -28,6 +44,18 @@ class RotaryEmbedding(nn.Module):
         self.angles = int(dim * parameters.get("partial_rotary_factor", 1.0)) // 2
         if not 0 < self.angles <= dim // 2:
             raise ValueError("Invalid partial_rotary_factor")
+        self._inv_freq = None
+
+    def inv_freq(self):
+        """The fp32 frequency table, zero-padded past ``angles`` so the NoPE
+        coordinates rotate by exactly zero. Cached: it does not depend on the
+        sequence. The kernels take it as an input so they never recompute it."""
+        if self._inv_freq is None:
+            inv_freq = self.base ** (
+                -mx.arange(self.angles, dtype=mx.float32) * 2 / self.dim
+            )
+            self._inv_freq = mx.pad(inv_freq, [(0, self.dim // 2 - self.angles)])
+        return self._inv_freq
 
     def __call__(self, x, offset=0, position_ids=None):
         if isinstance(offset, mx.array) and offset.ndim > 0:
@@ -74,20 +102,32 @@ class Attention(nn.Module):
 
     def __call__(self, x, mask=None, cache=None, position_ids=None):
         batch, length, _ = x.shape
-        q = self.q_norm(
-            self.q_proj(x).reshape(batch, length, self.n_heads, self.head_dim)
-        )
-        k = self.k_norm(
-            self.k_proj(x).reshape(batch, length, self.n_kv_heads, self.head_dim)
-        )
+        offset = cache.offset if cache is not None else 0
+        if _can_fuse(x, self.q_norm.weight):
+            q, k = lfm3_qk_norm_rope(
+                self.q_proj(x).reshape(batch, length, self.n_heads, self.head_dim),
+                self.k_proj(x).reshape(batch, length, self.n_kv_heads, self.head_dim),
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.rope.inv_freq(),
+                eps=self.q_norm.eps,
+                position_ids=position_ids,
+                offset=offset,
+            )
+        else:
+            q = self.q_norm(
+                self.q_proj(x).reshape(batch, length, self.n_heads, self.head_dim)
+            )
+            k = self.k_norm(
+                self.k_proj(x).reshape(batch, length, self.n_kv_heads, self.head_dim)
+            )
+            q = self.rope(q.transpose(0, 2, 1, 3), offset, position_ids)
+            k = self.rope(k.transpose(0, 2, 1, 3), offset, position_ids)
         v = (
             self.v_proj(x)
             .reshape(batch, length, self.n_kv_heads, self.head_dim)
             .transpose(0, 2, 1, 3)
         )
-        offset = cache.offset if cache is not None else 0
-        q = self.rope(q.transpose(0, 2, 1, 3), offset, position_ids)
-        k = self.rope(k.transpose(0, 2, 1, 3), offset, position_ids)
         if cache is not None:
             k, v = cache.update_and_fetch(k, v)
         out = scaled_dot_product_attention(
