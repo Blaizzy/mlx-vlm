@@ -425,7 +425,9 @@ class LanguageModel(nn.Module):
                 position_ids = mx.broadcast_to(
                     position_ids[None, :, :], (3, *position_ids.shape)
                 )
-                mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
+                mrope_position_deltas = (
+                    max_position_ids + 1 - attention_mask.sum(axis=-1, keepdims=True)
+                )
             else:
                 position_ids = mx.arange(input_ids.shape[1]).reshape(1, -1)
                 position_ids = mx.broadcast_to(
