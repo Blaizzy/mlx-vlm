@@ -164,7 +164,7 @@ def vlm_sft_loss(
     loss, metrics = cross_entropy(
         logits, targets, loss_mask, vision_mask=vlm_vision_mask(model, batch)
     )
-    from .mtp import add_mtp_loss
+    from ..mtp import add_mtp_loss
 
     return add_mtp_loss(
         model,

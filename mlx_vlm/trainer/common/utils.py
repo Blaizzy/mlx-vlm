@@ -334,10 +334,23 @@ def save_trainable_weights(
     """Save trainable parameters and optionally a numbered training checkpoint.
 
     Call on rank zero. This is a training checkpoint, not a fused model export.
+    An attached MTP head is written to a sibling ``mtp`` drafter directory so the
+    main weights load strictly into the unmodified model.
     """
     destination = Path(adapter_file)
     destination.parent.mkdir(parents=True, exist_ok=True)
     weights = dict(tree_flatten(model.trainable_parameters()))
+    head = getattr(model, "mtp_head", None) if isinstance(model, nn.Module) else None
+    head_weights = {}
+    if head is not None:
+        from mlx_vlm.trainer.vlm.mtp import (
+            mtp_head_dir,
+            save_mtp_head,
+            split_mtp_weights,
+        )
+
+        weights, head_weights = split_mtp_weights(weights)
+        save_mtp_head(head, head_weights, mtp_head_dir(destination))
     mx.save_safetensors(str(destination), weights)
     config = getattr(model, "config", None)
     adapter_config = getattr(model, "_vlm_adapter_config", None)
@@ -356,6 +369,8 @@ def save_trainable_weights(
 
     checkpoint = destination.with_name(f"{iteration:07d}_{destination.name}")
     mx.save_safetensors(str(checkpoint), weights)
+    if head is not None:
+        save_mtp_head(head, head_weights, mtp_head_dir(checkpoint))
     tqdm.write(
         f"Iter {iteration}: saved trainable weights to {destination} and {checkpoint}."
     )

@@ -1,9 +1,47 @@
-"""Optional VLM MTP auxiliary loss; shared cross-entropy stays model agnostic."""
+"""Optional VLM MTP auxiliary loss shared by SFT, DPO, ORPO, and GRPO."""
 
+import json
 from collections.abc import Mapping
+from dataclasses import asdict
+from pathlib import Path
 
 import mlx.core as mx
 from mlx.utils import tree_flatten
+
+MTP_PREFIX = "mtp_head."
+
+
+def mtp_head_dir(weights_file):
+    """Return the drafter directory saved beside a trainable-weights file."""
+    path = Path(weights_file)
+    step, sep, _ = path.name.partition("_")
+    return path.with_name(f"{step}_mtp" if sep and step.isdigit() else "mtp")
+
+
+def split_mtp_weights(weights):
+    """Split flat weights into ``(main, head)`` with the head prefix removed."""
+    main = {k: v for k, v in weights.items() if not k.startswith(MTP_PREFIX)}
+    head = {
+        k.removeprefix(MTP_PREFIX): v
+        for k, v in weights.items()
+        if k.startswith(MTP_PREFIX)
+    }
+    return main, head
+
+
+def save_mtp_head(head, weights, directory):
+    """Write a trained MTP head as a standalone drafter loadable by ``load_drafter``."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    mx.save_safetensors(
+        str(directory / "model.safetensors"), weights, metadata={"format": "mlx"}
+    )
+    config = asdict(head.config)
+    config["text_config"]["mtp_num_hidden_layers"] = len(head.layers)
+    (directory / "config.json").write_text(
+        json.dumps(config, indent=2, sort_keys=True) + "\n"
+    )
+    return directory
 
 
 def attach_mtp_head(model, head, *, checkpoint_path=None):
@@ -47,11 +85,10 @@ def attach_mtp_head(model, head, *, checkpoint_path=None):
         from mlx_vlm.trainer.common.model import _read_checkpoint
 
         path, _ = _read_checkpoint(checkpoint_path, require_config=False)
-        weights = {
-            key.removeprefix("mtp_head."): value
-            for key, value in mx.load(str(path)).items()
-            if key.startswith("mtp_head.")
-        }
+        _, weights = split_mtp_weights(mx.load(str(path)))
+        sidecar = mtp_head_dir(path) / "model.safetensors"
+        if not weights and sidecar.is_file():
+            weights = mx.load(str(sidecar))
         if weights:
             head.load_weights(list(weights.items()), strict=True)
     head.unfreeze()

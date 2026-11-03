@@ -101,7 +101,7 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
 def _legacy_task(args, loss_fn, train_on_completions, assistant_id):
     """Adapt historical batches and score-based losses to the common engine."""
     from ...common.task import TrainingTask
-    from ..sft.mtp import add_mtp_loss
+    from ..mtp import add_mtp_loss
     from ..sft.runtime import _enable_vlm_gradient_checkpointing, _save_vlm_weights
 
     def objective(model, batch):

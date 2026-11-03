@@ -243,7 +243,7 @@ def make_task(
             batch["input_ids"].size - 1 if args.beta else 0
         )
         if args.mtp_loss_weight:
-            from mlx_vlm.trainer.vlm.sft.mtp import add_mtp_loss
+            from mlx_vlm.trainer.vlm.mtp import add_mtp_loss
 
             # Only generated tokens supervise MTP; reference scores and reward
             # advantages continue to use the original GRPO objective.

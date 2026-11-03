@@ -268,6 +268,18 @@ def _load_dataset(args):
     return load(args.data)
 
 
+def _bundles_mtp_head(checkpoint_path):
+    """Return whether a checkpoint stores ``mtp_head.*`` beside the main weights."""
+    if not checkpoint_path:
+        return False
+    import mlx.core as mx
+
+    from .trainer.common.model import _read_checkpoint
+
+    path, _ = _read_checkpoint(checkpoint_path, require_config=False)
+    return any(key.startswith("mtp_head.") for key in mx.load(str(path)))
+
+
 def run(args, settings, training_callback=None):
     """Load resources and call the same Trainer used in notebooks."""
     import mlx.core as mx
@@ -295,16 +307,18 @@ def run(args, settings, training_callback=None):
         if not args.mtp_model:
             raise ValueError("--mtp-loss-weight requires --mtp-model.")
         from .speculative.drafters import load_drafter
-        from .trainer.vlm.sft.mtp import attach_mtp_head
+        from .trainer.vlm.mtp import attach_mtp_head
 
         head, _ = load_drafter(args.mtp_model, kind="mtp")
-        if args.train_type == "full":
-            # Full checkpoints restore strictly, so register the head first.
+        legacy = _bundles_mtp_head(args.resume_adapter_file)
+        if args.train_type == "full" and legacy:
+            # Legacy full checkpoints bundle the head and restore strictly.
             attach_mtp_head(model, head)
+            head = None
     elif getattr(args, "mtp_model", None):
         raise ValueError("--mtp-model requires a positive --mtp-loss-weight.")
     model = _configure_model(model, args)
-    if head is not None and args.train_type != "full":
+    if head is not None:
         attach_mtp_head(model, head, checkpoint_path=args.resume_adapter_file)
     reward_options = {}
     if args.algorithm == "grpo":
