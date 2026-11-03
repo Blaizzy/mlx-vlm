@@ -1,11 +1,5 @@
 # MLX-VLM
 
-[![Upload Python Package](https://github.com/Blaizzy/mlx-vlm/actions/workflows/python-publish.yml/badge.svg)](https://github.com/Blaizzy/mlx-vlm/actions/workflows/python-publish.yml)
-[![PyPI version](https://img.shields.io/pypi/v/mlx-vlm)](https://pypi.org/project/mlx-vlm/)
-[![Monthly downloads](https://img.shields.io/pypi/dm/mlx-vlm)](https://pypistats.org/packages/mlx-vlm)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://pypi.org/project/mlx-vlm/)
-[![MIT license](https://img.shields.io/github/license/Blaizzy/mlx-vlm)](https://github.com/Blaizzy/mlx-vlm/blob/main/LICENSE)
-
 [![Ask any image anything. Runs locally on your Mac. Install with pip install mlx-vlm or try it in Nativ.](https://raw.githubusercontent.com/Blaizzy/mlx-vlm/6e0fba58459c22d3a64959f6461ce6a247f000a2/docs/assets/mlx-vlm-banner.png)](https://runnativ.ai)
 
 <p align="center">
@@ -24,6 +18,14 @@
 
 <p align="center">
   Built by <a href="https://www.neywalabs.ai">Neywa Labs</a>, the local AI company behind <a href="https://runnativ.ai">Nativ</a>.
+</p>
+
+<p align="center">
+  <a href="https://github.com/Blaizzy/mlx-vlm/actions/workflows/python-publish.yml"><img src="https://github.com/Blaizzy/mlx-vlm/actions/workflows/python-publish.yml/badge.svg" alt="Upload Python Package"></a>
+  <a href="https://pypi.org/project/mlx-vlm/"><img src="https://img.shields.io/pypi/v/mlx-vlm" alt="PyPI version"></a>
+  <a href="https://pypistats.org/packages/mlx-vlm"><img src="https://img.shields.io/pypi/dm/mlx-vlm" alt="Monthly downloads"></a>
+  <a href="https://pypi.org/project/mlx-vlm/"><img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python 3.10+"></a>
+  <a href="https://github.com/Blaizzy/mlx-vlm/blob/main/LICENSE"><img src="https://img.shields.io/github/license/Blaizzy/mlx-vlm" alt="MIT license"></a>
 </p>
 
 ## Table of Contents
