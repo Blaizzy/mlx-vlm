@@ -2,7 +2,7 @@ import inspect
 import math
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -59,6 +59,25 @@ class LanguageModelOutput:
     encoder_outputs: Optional[List[mx.array]] = None
     gdn_states: Optional[Any] = None
     shared_kv_states: Optional[Dict[str, tuple]] = None
+
+
+def project_logits(
+    hidden_states: mx.array,
+    projection: Callable[[mx.array], mx.array],
+    logits_to_keep: Optional[int] = 0,
+) -> mx.array:
+    """Project only requested trailing positions; zero/None keeps all logits.
+
+    Call after processing the full sequence and collecting hidden states. The
+    slice applies only to the vocabulary projection, never to caches or features
+    consumed by a drafter. Verification and training retain all positions by
+    leaving ``logits_to_keep`` at its default.
+    """
+    if logits_to_keep:
+        if logits_to_keep < 0:
+            raise ValueError("logits_to_keep must be nonnegative")
+        hidden_states = hidden_states[:, -logits_to_keep:, :]
+    return projection(hidden_states)
 
 
 @dataclass
@@ -260,10 +279,33 @@ def dequantize_kv_state(cache, keys, values):
     return cache.dequantize(keys, values)
 
 
+def cache_position_offset(cache) -> int:
+    """Processed prompt columns, independent of the cache's storage cursor.
+
+    Single-sequence caches keep an absolute Python-int ``offset`` even when
+    their buffer rotates. Batched caches have per-row offsets; use their
+    shared timeline (including padding) when slicing full-prompt metadata.
+    RoPE callers with per-row positions must still use ``cache.offset``.
+    """
+    if cache is None:
+        return 0
+    offset = cache.offset
+    if not isinstance(offset, mx.array):
+        return int(offset)
+    shared_offset = getattr(cache, "_offset", None)
+    if shared_offset is None:
+        shared_offset = getattr(cache, "_idx", None)
+    if shared_offset is not None:
+        return int(shared_offset)
+    return int(offset.max().item()) if offset.size else 0
+
+
 def create_attention_mask(
     h, cache=None, window_size: Optional[int] = None, return_array: bool = False
 ):
     N = h.shape[1]
+    if isinstance(cache, (list, tuple)):
+        cache = cache[0] if cache else None
     if (
         cache is not None
         and not isinstance(cache, mx.array)
@@ -527,6 +569,10 @@ def interpolate(pos_embed, size, mode="cubic", align_corners=False):
     Returns:
         Interpolated array with shape [B, C, H_dst, W_dst] or [C, H_dst, W_dst]
     """
+    # `bicubic` is the PyTorch name for the 2D cubic kernel, which MLX spells "cubic".
+    if mode == "bicubic":
+        mode = "cubic"
+
     # Handle different input shapes
     input_dim = pos_embed.ndim
     original_shape = pos_embed.shape
@@ -548,8 +594,11 @@ def interpolate(pos_embed, size, mode="cubic", align_corners=False):
         scale_factor=(scale_h, scale_w), mode=mode, align_corners=align_corners
     )
 
-    # Apply upsampling
-    result = upsampler(pos_embed)
+    # MLX's `Upsample` interpolates the dimensions between the batch dimension and the channel
+    # dimension, i.e. it expects channels-last (NHWC). `pos_embed` is channels-first (NCHW), like
+    # PyTorch's `F.interpolate`, so the layout has to be converted around the call -- otherwise the
+    # scaling is applied to the channel and height dimensions instead of height and width.
+    result = upsampler(pos_embed.transpose(0, 2, 3, 1)).transpose(0, 3, 1, 2)
 
     # Return in the original dimension format
     if input_dim == 3:

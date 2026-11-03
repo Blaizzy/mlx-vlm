@@ -9,6 +9,7 @@ import math
 from typing import List, Optional, Union
 
 import numpy as np
+from PIL import Image
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_utils import ImageInput
 from transformers.processing_utils import ProcessorMixin
@@ -90,6 +91,12 @@ class NemotronHNanoOmniProcessor(ProcessorMixin):
         self.audio_subsampling_conv_stride = audio_subsampling_conv_stride
 
         super().__init__(image_processor, tokenizer, chat_template=chat_template)
+        # Video uses the same dynamic-resolution preprocessor with its own
+        # patch budget. Expose the component so CLI/server use native video.
+        self.video_processor = image_processor
+
+    def video_sampling_defaults(self):
+        return {"fps": 2.0, "max_frames": 128}
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
@@ -190,6 +197,7 @@ class NemotronHNanoOmniProcessor(ProcessorMixin):
         ] = None,
         videos=None,
         audio: Optional[AudioInput] = None,
+        video_metadata=None,
         **kwargs,
     ) -> BatchFeature:
         if text is None and images is None and videos is None and audio is None:
@@ -199,6 +207,11 @@ class NemotronHNanoOmniProcessor(ProcessorMixin):
 
         images_kwargs = kwargs.pop("images_kwargs", {}) or {}
         videos_kwargs = kwargs.pop("videos_kwargs", {}) or {}
+        if video_metadata is not None:
+            videos_kwargs["video_metadata"] = video_metadata
+        for name in ("video_metadata", "fps"):
+            if name in kwargs:
+                videos_kwargs[name] = kwargs.pop(name)
         audio_kwargs = kwargs.pop("audio_kwargs", {}) or {}
         text_kwargs = kwargs.pop("text_kwargs", {}) or {}
         # Allow flat kwargs (mlx-vlm convention) — fall through to text tokenization.
@@ -211,9 +224,35 @@ class NemotronHNanoOmniProcessor(ProcessorMixin):
             image_num_tokens = image_inputs["num_tokens"]
 
         if videos is not None:
+            if images is not None:
+                raise ValueError(
+                    "Use separate requests for Nemotron image and video inputs."
+                )
+            # prepare_inputs supplies one (frames, channels, height, width)
+            # array per clip; direct calls may supply a list of PIL frames.
+            if (
+                isinstance(videos, (list, tuple))
+                and len(videos)
+                and getattr(videos[0], "ndim", 0) == 4
+            ):
+                if len(videos) != 1:
+                    raise ValueError("Nemotron supports one video per request.")
+                videos = videos[0]
+            frames = []
+            for frame in videos:
+                if not isinstance(frame, Image.Image):
+                    frame = np.asarray(frame)
+                    if frame.ndim == 3 and frame.shape[0] == 3:
+                        frame = frame.transpose(1, 2, 0)
+                    frame = Image.fromarray(frame)
+                frames.append(frame.convert("RGB"))
+            if not frames:
+                raise ValueError(
+                    "Nemotron video inputs must contain at least one frame."
+                )
             self.image_processor._is_video_mode = True
             try:
-                videos_inputs = self.image_processor(images=videos, **images_kwargs)
+                videos_inputs = self.video_processor(images=frames, **images_kwargs)
             finally:
                 self.image_processor._is_video_mode = False
             video_num_patches = [sum(videos_inputs["num_patches"])]
@@ -247,8 +286,11 @@ class NemotronHNanoOmniProcessor(ProcessorMixin):
                 text[i] = text[i].replace("<|placeholder|>", self.image_token)
 
         if videos is not None:
-            assert len(text) == 1, "Video is not supported for batch size > 1"
+            if len(text) != 1:
+                raise ValueError("Nemotron video inputs require batch size 1.")
             video_metadata = videos_kwargs.get("video_metadata", None)
+            if isinstance(video_metadata, (list, tuple)):
+                video_metadata = video_metadata[0]
             i = 0
             index = 0
             if self.video_token in text[i]:
@@ -417,6 +459,6 @@ __all__ = ["NemotronHNanoOmniProcessor"]
 
 
 install_auto_processor_patch(
-    ["nemotronh_nano_omni_reasoning_v3", "nemotron_h_nano_omni"],
+    ["nemotronh_nano_omni_reasoning_v3", "nemotron_h_nano_omni", "nemotron_h_omni"],
     NemotronHNanoOmniProcessor,
 )

@@ -6,7 +6,7 @@ import numpy as np
 
 from mlx_vlm.models.qwen3_omni_moe.audio import AudioModel
 
-from ..base import InputEmbeddingsFeatures
+from ..base import InputEmbeddingsFeatures, cache_position_offset
 from .config import ThinkerConfig
 from .language import LanguageModel, expand_deepstack_visual_embeds
 from .vision import VisionModel
@@ -360,14 +360,7 @@ class Thinker(nn.Module):
 
         c0 = cache[0] if cache else None
         if c0 is not None:
-            offset = getattr(c0, "_idx", None)
-            if offset is None:
-                offset = getattr(c0, "offset", 0)
-            offset = (
-                int(offset.max().item())
-                if isinstance(offset, mx.array)
-                else int(offset)
-            )
+            offset = cache_position_offset(c0)
             if offset > 0:
                 kwargs.pop("position_ids", None)
                 kwargs.pop("rope_deltas", None)

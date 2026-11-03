@@ -8,6 +8,7 @@ import mlx.nn as nn
 from ....models.base import create_attention_mask
 from ....models.cache import BatchKVCache, KVCache
 from ....models.qwen3_5.language import Qwen3_5DecoderLayer
+from ....models.qwen3_5_moe.config import TextConfig as MoeTextConfig
 from ....models.qwen3_5_moe.language import Qwen3_5MoeDecoderLayer
 from ...common import _prepare_ragged_mtp_replay
 from .config import Qwen3_5MTPConfig
@@ -40,7 +41,7 @@ class Qwen3_5MTPDraftModel(nn.Module):
         self.pre_fc_norm_hidden = nn.RMSNorm(hidden_size, eps=text_config.rms_norm_eps)
         layer_cls = (
             Qwen3_5MoeDecoderLayer
-            if "moe" in getattr(text_config, "model_type", "")
+            if isinstance(text_config, MoeTextConfig)
             else Qwen3_5DecoderLayer
         )
         self.layers = [
@@ -157,6 +158,7 @@ class Qwen3_5MTPDraftModel(nn.Module):
         hidden: mx.array,
         cache: Optional[List[KVCache]],
         position_ids: mx.array,
+        attention_mask: Optional[mx.array] = None,
     ) -> mx.array:
         h = mx.concatenate(
             [
@@ -174,8 +176,37 @@ class Qwen3_5MTPDraftModel(nn.Module):
                 if layer_cache is not None
                 else ("causal" if h.shape[1] > 1 else None)
             )
+            if attention_mask is not None:
+                mask = attention_mask
             h = layer(h, mask=mask, cache=layer_cache, position_ids=position_ids)
         return self.norm(h)
+
+    def training_logits(self, tokens, hidden, attention_mask, target_model):
+        """Teacher-forced MTP forward without binding modules or mutating caches.
+
+        Each hidden state precedes its paired ground-truth token by one position;
+        the output predicts the token after that pair. Shared embeddings/head
+        stay owned by the target so checkpoints contain no duplicated weights.
+        """
+        lm = target_model.language_model
+        embedding = lm.model.embed_tokens
+        token_embed = embedding(tokens) * float(getattr(lm.model, "embed_scale", 1.0))
+        positions = mx.arange(tokens.shape[1])
+        causal = positions[:, None] >= positions[None, :]
+        valid = causal[None, None, :, :] & attention_mask[:, None, None, :].astype(
+            mx.bool_
+        )
+        # Finite masking also keeps entirely padded query rows well-defined.
+        mask = mx.where(valid, mx.array(0, hidden.dtype), mx.array(-1e9, hidden.dtype))
+        h = self._forward_hidden(
+            token_embed,
+            hidden,
+            cache=None,
+            position_ids=(positions + 1)[None, :],
+            attention_mask=mask,
+        )
+        head = embedding.as_linear if lm.args.tie_word_embeddings else lm.lm_head
+        return head(h)
 
     def _forward_tokens(
         self,

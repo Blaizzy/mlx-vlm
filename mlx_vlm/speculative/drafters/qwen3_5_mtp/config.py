@@ -11,7 +11,7 @@ class TextConfig:
     @classmethod
     def from_dict(cls, params: dict):
         text_config_cls = (
-            MoeTextConfig if "moe" in params.get("model_type", "") else DenseTextConfig
+            MoeTextConfig if params.get("num_experts", 0) > 0 else DenseTextConfig
         )
         return text_config_cls.from_dict(params)
 
