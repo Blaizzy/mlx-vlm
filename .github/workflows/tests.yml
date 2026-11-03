@@ -127,6 +127,7 @@ jobs:
             tests: >-
               tests/test_gated_delta.py
               tests/test_inkling_kernel_gates.py
+              tests/test_interpolate.py
               tests/test_models.py
               tests/test_mrope_text_only_rope_deltas.py
               tests/test_muse_spark.py
