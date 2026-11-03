@@ -1911,8 +1911,13 @@ class ResponseGenerator:
                 "logprobs",
             )
         )
-        # Speculative iterators own draft state that cannot yet be row-extracted.
-        if self.draft_model is not None and request.session is not None:
+        # DFlash and MTP own extractable per-row state. Other speculative iterators
+        # still require a dedicated group to retain their generator closure.
+        if (
+            self.draft_model is not None
+            and request.session is not None
+            and self.draft_kind not in ("dflash", "mtp")
+        ):
             key += (id(request.session),)
         return key
 
@@ -1924,6 +1929,7 @@ class ResponseGenerator:
                 getattr(checkpoint, "hidden", None),
                 getattr(checkpoint, "shared_kv_states", None),
                 getattr(checkpoint, "prompt_tokens", None),
+                getattr(checkpoint, "_batch_state", None),
                 info.get("gen_kwargs"),
             ]
         )

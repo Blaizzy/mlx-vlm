@@ -29,6 +29,7 @@ from ..sample_utils import (
 )
 from ..speculative.utils import (
     SpeculativePrefill,
+    make_speculative_batch,
     make_speculative_prompt_cache,
     run_speculative_rounds,
     run_speculative_server_rounds,
@@ -1626,10 +1627,8 @@ class SpeculativeGenerationBatch:
         self._finished = [False] * len(uids)
         self._sent_first = False
         self._rounds_iter = None
-        self.can_extend = (
-            draft_kind == "dflash"
-            and callable(getattr(draft_model, "draft_batch", None))
-            and all(callable(getattr(c, "extend", None)) for c in prompt_cache)
+        self.can_extend = draft_kind in ("dflash", "mtp") and all(
+            callable(getattr(c, "extend", None)) for c in prompt_cache
         )
         self._batch_state = None
         self._batch_rows = list(range(len(uids)))
@@ -1661,15 +1660,42 @@ class SpeculativeGenerationBatch:
         self._pending_first = []
         mx.clear_cache()
 
+    def extract(self, uid):
+        """Detach one speculative row without replaying its prompt or tokens."""
+        if not self.can_extend:
+            raise ValueError("This speculative decoder cannot extract individual rows")
+        self._ensure_batch_state()
+        index = self._all_uids.index(uid)
+        row = copy.copy(self)
+        row._batch_state = self._batch_state.snapshot(index)
+        row.prompt_cache = row._batch_state.cache
+        row.hidden = None
+        row.shared_kv_states = None
+        row.prompt_tokens = None
+        for name in (
+            "uids",
+            "_all_uids",
+            "max_tokens",
+            "_num_tokens",
+            "_finished",
+            "thinking_budget_criteria",
+        ):
+            values = getattr(self, name)
+            setattr(row, name, [values[index]] if values else [])
+        row.first_tokens = mx.contiguous(self.first_tokens[index : index + 1])
+        row._batch_rows = [0]
+        row._pending_first = [0] if index in self._pending_first else []
+        self.filter([i for i in range(len(self.uids)) if i != index])
+        return row
+
     def extend(self, other: "SpeculativeGenerationBatch"):
         if len(self) == 0:
             self.__dict__.update(other.__dict__)
             return
         if self.can_extend and other.can_extend:
             self._ensure_batch_state()
-            self._batch_state.extend(
-                other.prompt_cache, other.hidden, other.first_tokens
-            )
+            other._ensure_batch_state()
+            self._batch_state.extend(other._batch_state)
             start = len(self._all_uids)
             incoming = list(range(start, start + len(other._all_uids)))
             self._all_uids.extend(other._all_uids)
@@ -1678,7 +1704,8 @@ class SpeculativeGenerationBatch:
             self._num_tokens.extend(other._num_tokens)
             self._finished.extend(other._finished)
             self._batch_rows.extend(incoming)
-            self._pending_first.extend(incoming)
+            self._pending_first.extend(start + row for row in other._pending_first)
+            self.thinking_budget_criteria.extend(other.thinking_budget_criteria)
             self._refresh_uids()
             return
         raise RuntimeError("Cannot extend an active speculative generation batch.")
@@ -1693,21 +1720,24 @@ class SpeculativeGenerationBatch:
         self._refresh_uids()
 
     def _ensure_batch_state(self):
-        if self._batch_state is None:
-            from ..speculative.dflash import DFlashBatch
-
-            self._batch_state = DFlashBatch(
-                self.model,
-                self.draft_model,
-                self.prompt_cache,
-                self.hidden,
-                self.first_tokens[mx.array(self._batch_rows, mx.int32)],
-                self.draft_block_size,
-                self.sampler,
-                self.token_dtype,
-                self.greedy_sampling,
-            )
-            self.hidden = None
+        if self._batch_state is not None:
+            return
+        self._batch_state = make_speculative_batch(
+            self.model,
+            self.draft_model,
+            self.prompt_cache,
+            self.hidden,
+            draft_kind=self.draft_kind,
+            first_bonus=self.first_tokens,
+            draft_block_size=self.draft_block_size,
+            sampler=self.sampler,
+            token_dtype=self.token_dtype,
+            greedy_sampling=self.greedy_sampling,
+            shared_kv_states=self.shared_kv_states,
+            prompt_tokens=self.prompt_tokens,
+            rope_deltas=getattr(self, "_rope_deltas", None),
+        )
+        self.hidden = self.shared_kv_states = self.prompt_tokens = None
 
     def _prune_batch_state(self):
         keep = [i for i, row in enumerate(self._batch_rows) if not self._finished[row]]
@@ -1719,6 +1749,15 @@ class SpeculativeGenerationBatch:
                 for cache in self.prompt_cache:
                     cache.filter(indices)
                 self.hidden = self.hidden[indices]
+                if self.prompt_tokens is not None:
+                    self.prompt_tokens = self.prompt_tokens[indices]
+                if self.shared_kv_states:
+                    self.shared_kv_states = {
+                        key: (keys[indices], values[indices])
+                        for key, (keys, values) in self.shared_kv_states.items()
+                    }
+                if getattr(self, "_rope_deltas", None) is not None:
+                    self._rope_deltas = self._rope_deltas[indices]
             rows = [self._batch_rows[i] for i in keep]
             pending = set(self._pending_first)
             self._pending_first = [i for i, row in enumerate(rows) if row in pending]
@@ -1726,6 +1765,10 @@ class SpeculativeGenerationBatch:
             self._all_uids = [self._all_uids[row] for row in rows]
             self.max_tokens = [self.max_tokens[row] for row in rows]
             self._num_tokens = [self._num_tokens[row] for row in rows]
+            if self.thinking_budget_criteria:
+                self.thinking_budget_criteria = [
+                    self.thinking_budget_criteria[row] for row in rows
+                ]
             self._finished = [False] * len(rows)
             self._batch_rows = list(range(len(rows)))
 
@@ -1739,12 +1782,20 @@ class SpeculativeGenerationBatch:
                 for row in range(len(self._all_uids))
             ]
             self._append_token_responses(responses, tokens)
+            for row in pending:
+                if (
+                    self.thinking_budget_criteria
+                    and self.thinking_budget_criteria[row] is not None
+                ):
+                    self.thinking_budget_criteria[row](first[row])
         else:
             self._ensure_batch_state()
             rows = self._batch_rows[:]
             budgets = [self.max_tokens[row] - self._num_tokens[row] for row in rows]
             emitted = self._batch_state.step(
-                budgets, [self._num_tokens[row] for row in rows]
+                budgets,
+                [self._num_tokens[row] for row in rows],
+                self.thinking_budget_criteria,
             )
             for position in range(max(map(len, emitted))):
                 tokens = [None] * len(self._all_uids)
@@ -3285,6 +3336,13 @@ class BatchGenerator:
         with mx.stream(self._stream):
             if (
                 isinstance(self._generation_batch, GenerationBatch)
+                and uid in self._generation_batch.uids
+            ):
+                self._resume_inputs.pop(uid, None)
+                return self._generation_batch.extract(uid)
+            if (
+                isinstance(self._generation_batch, SpeculativeGenerationBatch)
+                and self._generation_batch.can_extend
                 and uid in self._generation_batch.uids
             ):
                 self._resume_inputs.pop(uid, None)

@@ -14,6 +14,7 @@ from .common import (
     speculative_stats_snapshot,
 )
 from .dflash import (
+    DFlashBatch,
     _dflash_committed_hidden_segments,
     _dflash_next_block_size,
     _dflash_rounds,
@@ -22,6 +23,7 @@ from .dflash import (
 )
 from .eagle3 import _eagle3_capture_layer_ids, _eagle3_rounds, _eagle3_rounds_batch
 from .mtp import (
+    MTPBatch,
     _buffer_mtp_target_cache,
     _effective_mtp_block_size,
     _mtp_draft_block_active,
@@ -60,6 +62,7 @@ __all__ = [
     "_speculative_walk_deferred_greedy",
     "format_speculative_stats",
     "get_speculative_rounds_batch",
+    "make_speculative_batch",
     "make_speculative_prompt_cache",
     "run_speculative_rounds",
     "run_speculative_server_rounds",
@@ -91,6 +94,47 @@ def get_speculative_rounds_batch(draft_kind: str):
         return _dflash_rounds_batch
     raise ValueError(
         f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'eagle3', 'mtp']"
+    )
+
+
+def make_speculative_batch(
+    model: nn.Module,
+    draft_model: nn.Module,
+    prompt_cache: List[Any],
+    hidden: mx.array,
+    *,
+    draft_kind: str,
+    first_bonus: mx.array,
+    sampler: Callable[[mx.array], mx.array],
+    draft_block_size: Optional[int] = None,
+    token_dtype: mx.Dtype = mx.int32,
+    greedy_sampling: bool = False,
+    shared_kv_states: Optional[dict] = None,
+    prompt_tokens: Optional[mx.array] = None,
+    rope_deltas: Optional[mx.array] = None,
+):
+    """Build a decoder that owns per-request state and supports row changes."""
+    batch_type = {"dflash": DFlashBatch, "mtp": MTPBatch}.get(draft_kind)
+    if batch_type is None:
+        raise ValueError(f"Shared speculative batches do not support {draft_kind!r}")
+    options = {}
+    if draft_kind == "mtp":
+        options = dict(
+            shared_kv_states=shared_kv_states,
+            prompt_tokens=prompt_tokens,
+            rope_deltas=rope_deltas,
+        )
+    return batch_type(
+        model=model,
+        draft=draft_model,
+        cache=prompt_cache,
+        hidden=hidden,
+        bonus=first_bonus,
+        block_size=draft_block_size,
+        sampler=sampler,
+        dtype=token_dtype,
+        greedy=greedy_sampling,
+        **options,
     )
 
 

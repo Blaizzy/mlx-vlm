@@ -1021,6 +1021,18 @@ def test_empty_batch_kv_cache_ignores_unapplied_right_padding():
     assert cache._right_padding is None
 
 
+def test_empty_batch_kv_cache_extracts_unused_composite_layer():
+    cache = BatchKVCache([0, 2])
+    for idx in (0, 1, -1):
+        extracted = cache.extract(idx)
+        assert isinstance(extracted, KVCache)
+        assert extracted.empty()
+        assert extracted.offset == 0
+    for idx in (-3, 2):
+        with pytest.raises(IndexError):
+            cache.extract(idx)
+
+
 @pytest.mark.parametrize(
     "factory", [BatchKVCache, BatchQuantizedKVCache, BatchQSAKVCache]
 )

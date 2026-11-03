@@ -336,6 +336,520 @@ def test_mistral_dspark_admits_requests_while_batch_is_active(cancel, sampling):
         generator.close()
 
 
+@parametrize("family", ["dflash2", "dspark-lfm2", "mistral", "gemma"])
+@parametrize("pause_after", [1, 8])
+@parametrize("sampling", [False, True])
+def test_speculative_row_resume_preserves_state_and_other_requests(
+    family, pause_after, sampling
+):
+    from mlx_vlm.sample_utils import make_sampler
+
+    mx.random.seed(23)
+    if family == "mistral":
+        target, draft = mistral_dspark_case()
+    elif family == "gemma":
+        target, draft = gemma_dflash_case(shared=True)
+    else:
+        target, draft = dflash_target(family).language_model, dflash_drafter(family)
+    generator = BatchGenerator(
+        target,
+        NS(stopping_criteria=StoppingCriteria([])),
+        completion_batch_size=2,
+        prefill_batch_size=2,
+        prefill_step_size=2,
+        draft_model=draft,
+        draft_kind="dflash",
+        draft_block_size=4,
+        sampler=make_sampler(temp=0.7) if sampling else None,
+        greedy_sampling=not sampling,
+        compute_logprobs=False,
+    )
+    prompts = [[1, 3, 5, 7], [2, 4]]
+    outputs = [[], []]
+    generator.insert(
+        prompts,
+        max_tokens=32,
+        resumable=True,
+        prompt_kwargs=[
+            {
+                "inputs_embeds": target.model.embed_tokens(mx.array([p]))
+                * getattr(target.model, "embed_scale", 1)
+            }
+            for p in prompts
+        ],
+    )
+
+    def step():
+        _, responses = generator.next()
+        for response in responses:
+            if response.token is not None:
+                outputs[response.uid].append(response.token)
+
+    try:
+        while len(outputs[0]) < pause_after:
+            step()
+        checkpoint = generator.suspend(0)
+        assert generator._generation_batch.uids == [1]
+        saved = deepcopy(checkpoint._batch_state.state)
+        stopped_count, other_count = map(len, outputs)
+        for _ in range(3):
+            step()
+        assert len(outputs[0]) == stopped_count
+        assert len(outputs[1]) > other_count
+        for (_, before), (_, after) in zip(
+            tree_flatten(saved), tree_flatten(checkpoint._batch_state.state)
+        ):
+            if isinstance(before, mx.array):
+                assert mx.array_equal(before, after).item()
+        draft_cache = checkpoint._batch_state.draft_caches[0]
+        generator.resume(checkpoint)
+        assert generator._generation_batch.uids == [1, 0]
+        assert generator._generation_batch._batch_state.draft_caches[-1] is draft_cache
+        for _ in range(100):
+            if not generator.has_work:
+                break
+            step()
+        assert not generator.has_work
+        assert [len(row) for row in outputs] == [32, 32]
+        if not sampling:
+            for prompt, actual in zip(prompts, outputs):
+                cache = target.make_cache()
+                inputs, expected = mx.array([prompt]), []
+                for _ in range(32):
+                    token = mx.argmax(
+                        target(inputs, cache=cache).logits[:, -1], axis=-1
+                    )
+                    expected.append(token.item())
+                    inputs = token[:, None]
+                assert actual == expected
+    finally:
+        generator.close()
+
+
+def mtp_resume_case(family, *, shared=False):
+    if family != "gemma":
+        target, config = language(family, inference=True)
+        return target, mtp_drafter(family, config)
+    from mlx_vlm.models.gemma4.config import TextConfig
+    from mlx_vlm.models.gemma4.language import LanguageModel
+    from mlx_vlm.speculative.drafters.gemma4_assistant import Model, ModelConfig
+
+    config = TextConfig(
+        hidden_size=32,
+        num_hidden_layers=4 if shared else 2,
+        intermediate_size=64,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        global_head_dim=8,
+        vocab_size=64,
+        vocab_size_per_layer_input=64,
+        hidden_size_per_layer_input=0,
+        num_kv_shared_layers=2 if shared else 0,
+        layer_types=["sliding_attention", "full_attention"] * (2 if shared else 1),
+        sliding_window=8,
+    )
+    return LanguageModel(config), Model(
+        ModelConfig(text_config=deepcopy(config), backbone_hidden_size=32, block_size=4)
+    )
+
+
+def gemma_dflash_case(*, shared=False):
+    from mlx_vlm.speculative.drafters.qwen3_dflash.config import DFlashConfig
+    from mlx_vlm.speculative.drafters.qwen3_dflash.dflash import DFlashDraftModel
+
+    target, _ = mtp_resume_case("gemma", shared=shared)
+    return target, DFlashDraftModel(
+        DFlashConfig(
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            vocab_size=64,
+            mask_token_id=63,
+            block_size=4,
+            num_target_layers=4 if shared else 2,
+            target_layer_ids=[0, 3] if shared else [0, 1],
+        )
+    )
+
+
+def test_gemma_shared_kv_skips_empty_batch_caches():
+    from mlx_vlm.models.cache import BatchRotatingKVCache
+
+    target, _ = mtp_resume_case("gemma", shared=True)
+    caches = [BatchRotatingKVCache(8, [0, 0]), BatchKVCache([0, 0]), None, None]
+    assert target.shared_kv_from_cache(caches) == {}
+
+
+@parametrize("lengths", [[4, 7], [12, 10], [5, 5]])
+@parametrize("steps", [0, 1, 5, 20])
+def test_gemma_shared_kv_views_match_independent_rows(lengths, steps):
+    from mlx_vlm import apc
+
+    target, _ = mtp_resume_case("gemma", shared=True)
+    rows = [target.make_cache() for _ in lengths]
+    for row, length in zip(rows, lengths):
+        target(mx.array([list(range(1, length + 1))]), cache=row)
+    caches, _ = apc.make_warm_batch_exact_cache_multi(rows, lengths)
+    for _ in range(steps):
+        target(mx.array([[1], [2]]), cache=caches)
+    actual = target.shared_kv_from_cache(caches)
+    expected = []
+    for index in range(len(rows)):
+        row = [entry.extract(index) for entry in caches]
+        expected.append(target.shared_kv_from_cache(row))
+    for key, tensors in actual.items():
+        for index, reference in enumerate(expected):
+            for tensor, wanted in zip(tensors, reference[key]):
+                length = wanted.shape[2]
+                assert mx.array_equal(tensor[index : index + 1, :, :length], wanted)
+                assert mx.all(tensor[index, :, length:] == 0)
+
+
+@parametrize("shared", [False, True])
+@parametrize("kind", ["mtp", "dflash"])
+def test_gemma_ragged_speculative_commit_matches_independent_rows(shared, kind):
+    from mlx_vlm import apc
+    from mlx_vlm.speculative.cache_state import SpeculativeCacheTransaction
+
+    mx.random.seed(32)
+    target, draft = mtp_resume_case("gemma", shared=shared)
+    target.eval()
+    references = [target.make_cache(), target.make_cache()]
+    prompts = [list(range(1, 14)), list(range(3, 12))]
+    for prompt, cache in zip(prompts, references):
+        target(mx.array([prompt]), cache=cache)
+    caches, _ = apc.make_warm_batch_exact_cache_multi(
+        deepcopy(references), list(map(len, prompts))
+    )
+    assert caches is not None
+    for round_index, retained in enumerate(([3, 1], [1, 4], None, [4, 2], [2, 3])):
+        tokens = mx.array([[20, 21, 22, 23], [30, 31, 32, 33]]) + round_index
+        if kind == "mtp":
+            hidden, shared_kv, transaction = target.speculative_verify_hidden(
+                tokens, caches
+            )
+        else:
+            output = target(tokens, cache=caches, speculative_verify=True)
+            transaction = output.gdn_states
+        assert isinstance(transaction, SpeculativeCacheTransaction)
+        if retained is None:
+            transaction.abort()
+        else:
+            transaction.commit(retained)
+            committed_shared = target.shared_kv_from_cache(caches)
+            for row, count in enumerate(retained):
+                for i in range(count):
+                    target(tokens[row : row + 1, i : i + 1], cache=references[row])
+                if kind == "mtp":
+                    # The assistant must see the same committed context as a
+                    # standalone request, including after window rotation.
+                    position = references[row][0].offset
+                    draft.reset(target)
+                    mtp.MTPBatch._bind_shared(
+                        NS(draft=draft, position=position),
+                        committed_shared,
+                        row,
+                        None,
+                    )
+                    inputs = mx.concatenate(
+                        [
+                            target.model.embed_tokens(mx.array([[42]]))
+                            * target.model.embed_scale,
+                            target.speculative_draft_hidden(
+                                hidden[row : row + 1, count - 1 : count]
+                            ),
+                        ],
+                        axis=-1,
+                    )
+                    positions = mx.array([[position - 1]])
+                    _, actual_draft = draft(inputs, draft._shared_kv, positions)
+                    reference_kv = mtp._mtp_shared_kv_from_prompt_cache(
+                        NS(
+                            model=NS(layers=target.model.layers[: len(references[row])])
+                        ),
+                        references[row],
+                    )
+                    draft.set_shared_kv(
+                        reference_kv, kv_offset=position, kv_valid_len=position
+                    )
+                    _, expected_draft = draft(inputs, draft._shared_kv, positions)
+                    assert mx.allclose(actual_draft, expected_draft, atol=2e-5).item()
+        probe = mx.array([[42], [43]])
+        actual = target(probe, cache=caches).logits
+        for row in range(2):
+            expected = target(probe[row : row + 1], cache=references[row]).logits
+            assert mx.allclose(actual[row : row + 1], expected, atol=2e-5).item()
+            assert (
+                mx.argmax(actual[row, -1]).item() == mx.argmax(expected[0, -1]).item()
+            )
+            assert caches[0].offset[row].item() == references[row][0].offset
+
+
+def test_mtp_ragged_acceptance_respects_remaining_token_budgets(monkeypatch):
+    target, draft = mtp_resume_case("gemma")
+    verify = mtp._mtp_verify_target
+
+    def accept_all(model, inputs, *args, **kwargs):
+        result = verify(model, inputs, *args, **kwargs)
+        # Guarantee acceptance at the boundary where one row has one token
+        # left and its peer can still emit an entire speculative round.
+        result.target_tokens = mx.concatenate([inputs[:, 1:], inputs[:, :1]], axis=1)
+        return result
+
+    monkeypatch.setattr(mtp, "_mtp_verify_target", accept_all)
+    commits = []
+    commit = mtp.commit_speculative_round
+
+    def observe_commit(model, caches, transaction, accepted, block_size):
+        commits.append(list(accepted))
+        return commit(model, caches, transaction, accepted, block_size)
+
+    monkeypatch.setattr(mtp, "commit_speculative_round", observe_commit)
+    generator = BatchGenerator(
+        target,
+        NS(stopping_criteria=StoppingCriteria([])),
+        completion_batch_size=2,
+        prefill_batch_size=2,
+        draft_model=draft,
+        draft_kind="mtp",
+        draft_block_size=4,
+        greedy_sampling=True,
+        compute_logprobs=False,
+    )
+    prompts = [[1, 3], [2, 4]]
+    generator.insert(
+        prompts,
+        max_tokens=[2, 5],
+        prompt_kwargs=[
+            {
+                "inputs_embeds": target.model.embed_tokens(mx.array([p]))
+                * target.model.embed_scale
+            }
+            for p in prompts
+        ],
+    )
+    counts = [0, 0]
+    try:
+        while generator.has_work:
+            _, responses = generator.next()
+            for response in responses:
+                counts[response.uid] += response.token is not None
+        assert counts == [2, 5]
+        assert [0, 1] in commits
+    finally:
+        generator.close()
+
+
+@parametrize("family", ["qwen", "glm", "deepseek", "gemma"])
+@parametrize("pause_after", [1, 8])
+@parametrize("sampling", [False, True, "positioned"])
+def test_mtp_shared_resume_preserves_rows(family, pause_after, sampling, monkeypatch):
+    from mlx_vlm.models.cache import cache_nbytes
+    from mlx_vlm.sample_utils import make_sampler
+    from mlx_vlm.server.generation import _PositionedTargetSampler
+
+    mx.random.seed(23)
+    target, draft = mtp_resume_case(family)
+    target.eval()
+    draft.eval()
+    widths = []
+    verify = mtp._mtp_verify_target
+
+    def observe(model, inputs, *args, **kwargs):
+        widths.append(inputs.shape[0])
+        return verify(model, inputs, *args, **kwargs)
+
+    monkeypatch.setattr(mtp, "_mtp_verify_target", observe)
+    sampler = make_sampler(temp=0.7) if sampling else None
+    if sampling == "positioned":
+        sampler = _PositionedTargetSampler(temperature=0.7, top_p=1.0, seed=23)
+    generator = BatchGenerator(
+        target,
+        NS(stopping_criteria=StoppingCriteria([])),
+        completion_batch_size=3,
+        prefill_batch_size=2,
+        prefill_step_size=16,
+        draft_model=draft,
+        draft_kind="mtp",
+        draft_block_size=4,
+        sampler=sampler,
+        greedy_sampling=not sampling,
+        compute_logprobs=False,
+    )
+    prompts = [[1, 3, 5, 7], [2, 4, 6, 8] if family == "glm" else [2, 4]]
+    outputs = [[], [], []]
+    generator.insert(
+        prompts,
+        max_tokens=32,
+        resumable=True,
+        prompt_kwargs=[
+            {
+                "inputs_embeds": target.model.embed_tokens(mx.array([p]))
+                * getattr(target.model, "embed_scale", 1)
+            }
+            for p in prompts
+        ],
+    )
+
+    def step():
+        _, responses = generator.next()
+        for response in responses:
+            if response.token is not None:
+                outputs[response.uid].append(response.token)
+
+    try:
+        while len(outputs[0]) < pause_after:
+            step()
+        for _ in range(2):
+            checkpoint = generator.suspend(0)
+            assert generator._generation_batch.uids == [1]
+            state = checkpoint._batch_state
+            saved = deepcopy(state.rows[0].state)
+            row = state.rows[0]
+            assert row.draft is not draft
+            if family != "gemma" and pause_after == 1:
+                position = row.draft._next_position
+                if isinstance(position, mx.array):
+                    position = position.item()
+                assert position == row.position
+            # Session copies share weight arrays, not mutable draft state.
+            weights = dict(tree_flatten(draft.parameters()))
+            for name, array in tree_flatten(row.draft.parameters()):
+                if name in weights and not name.startswith("_"):
+                    assert array is weights[name]
+            assert cache_nbytes(state) >= cache_nbytes(row.state) > 0
+            stopped, other = len(outputs[0]), len(outputs[1])
+            for _ in range(2):
+                step()
+            assert len(outputs[0]) == stopped
+            assert len(outputs[1]) > other
+            for (_, before), (_, after) in zip(
+                tree_flatten(saved), tree_flatten(row.state)
+            ):
+                if isinstance(before, mx.array):
+                    assert mx.array_equal(before, after).item()
+            generator.resume(checkpoint)
+            assert generator._generation_batch.uids == [1, 0]
+            assert generator._generation_batch._batch_state.rows[-1] is row
+            widths.clear()
+            step()
+            assert 2 in widths
+        for _ in range(100):
+            if not generator.has_work:
+                break
+            step()
+        assert not generator.has_work
+        assert [len(row) for row in outputs[:2]] == [32, 32]
+        if not sampling:
+            for prompt, actual in zip(prompts, outputs):
+                cache = target.make_cache()
+                target._rope_deltas = None
+                target._position_ids = None
+                inputs, expected = mx.array([prompt]), []
+                for _ in range(32):
+                    token = mx.argmax(
+                        target(inputs, cache=cache).logits[:, -1], axis=-1
+                    )
+                    expected.append(token.item())
+                    inputs = token[:, None]
+                assert actual == expected
+    finally:
+        generator.close()
+
+
+@parametrize("family", ["qwen", "gemma"])
+def test_mtp_resume_joins_new_requests_after_all_rows_paused(family, monkeypatch):
+    mx.random.seed(23)
+    target, draft = mtp_resume_case(family)
+    target.eval()
+    draft.eval()
+    widths = []
+    verify = mtp._mtp_verify_target
+
+    def observe(model, inputs, *args, **kwargs):
+        widths.append(inputs.shape[0])
+        return verify(model, inputs, *args, **kwargs)
+
+    monkeypatch.setattr(mtp, "_mtp_verify_target", observe)
+    generator = BatchGenerator(
+        target,
+        NS(stopping_criteria=StoppingCriteria([])),
+        completion_batch_size=3,
+        prefill_batch_size=2,
+        prefill_step_size=2,
+        draft_model=draft,
+        draft_kind="mtp",
+        draft_block_size=4,
+        greedy_sampling=True,
+        compute_logprobs=False,
+    )
+    prompts = [[1, 3, 5, 7], [2, 4, 6, 8, 10], [3, 5]]
+    outputs = [[], [], []]
+
+    def insert(rows):
+        generator.insert(
+            rows,
+            max_tokens=24,
+            resumable=True,
+            prompt_kwargs=[
+                {
+                    "inputs_embeds": target.model.embed_tokens(mx.array([p]))
+                    * getattr(target.model, "embed_scale", 1)
+                }
+                for p in rows
+            ],
+        )
+
+    def step():
+        _, responses = generator.next()
+        for response in responses:
+            if response.token is not None:
+                outputs[response.uid].append(response.token)
+
+    try:
+        insert(prompts[:1])
+        while len(outputs[0]) < 4:
+            step()
+        checkpoint = generator.suspend(0)
+        assert not generator.has_work
+        saved = deepcopy(checkpoint._batch_state.rows[0].state)
+        insert(prompts[1:])
+        while min(len(outputs[1]), len(outputs[2])) < 2:
+            step()
+        for (_, before), (_, after) in zip(
+            tree_flatten(saved), tree_flatten(checkpoint._batch_state.rows[0].state)
+        ):
+            if isinstance(before, mx.array):
+                assert mx.array_equal(before, after).item()
+        generator.resume(checkpoint)
+        widths.clear()
+        step()
+        assert 3 in widths
+        assert generator.remove(2)
+        cancelled = len(outputs[2])
+        for _ in range(100):
+            if not generator.has_work:
+                break
+            step()
+        assert not generator.has_work
+        assert list(map(len, outputs)) == [24, 24, cancelled]
+        for prompt, actual in zip(prompts[:2], outputs[:2]):
+            cache = target.make_cache()
+            target._rope_deltas = target._position_ids = None
+            inputs, expected = mx.array([prompt]), []
+            for _ in range(24):
+                token = greedy(target(inputs, cache=cache).logits[:, -1])
+                expected.append(token.item())
+                inputs = token[:, None]
+            assert actual == expected
+    finally:
+        generator.close()
+
+
 @parametrize("dtype", [mx.float16, mx.bfloat16])
 @parametrize(
     "batch,length",
@@ -3148,6 +3662,11 @@ def test_filter_batch_keeps_padding_and_positions():
 def test_speculative_dispatch_errors_and_hidden_state():
     with pytest.raises(ValueError):
         speculative.get_speculative_rounds_batch("nope")
+    for kind in ("eagle3", "nope"):
+        with pytest.raises(ValueError, match="Shared speculative batches"):
+            speculative.make_speculative_batch(
+                None, None, [], None, draft_kind=kind, first_bonus=None, sampler=None
+            )
     hidden = [mx.zeros((1, 1, 4)), mx.ones((1, 1, 4))]
     assert (
         speculative.speculative_hidden_state("mtp", NS(hidden_states=hidden))

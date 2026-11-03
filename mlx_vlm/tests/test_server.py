@@ -589,6 +589,16 @@ class TestInferenceSession:
         second.args.seed = 92
         assert worker._batch_key(first) != worker._batch_key(second)
 
+    @pytest.mark.parametrize(
+        "kind,shared", [("dflash", True), ("mtp", True), ("eagle3", False)]
+    )
+    def test_speculative_resumable_group_requires_row_restore(self, kind, shared):
+        worker = Generator.__new__(Generator)
+        worker.draft_model, worker.draft_kind = object(), kind
+        first = NS(args=Args(temperature=0.7), session=sessions.InferenceSession())
+        second = NS(args=Args(temperature=0.7), session=sessions.InferenceSession())
+        assert (worker._batch_key(first) == worker._batch_key(second)) == shared
+
     def test_standard_sampling_positions_survive_other_random_draws(self):
         sampler = Generator.__new__(Generator)._make_sampler(
             Args(temperature=0.7, seed=91)
