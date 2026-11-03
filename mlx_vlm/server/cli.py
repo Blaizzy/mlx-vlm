@@ -63,6 +63,12 @@ def main():
         help="Pre-load an image generation model at startup.",
     )
     parser.add_argument(
+        "--mesh-model",
+        type=str,
+        default=None,
+        help="Pre-load an image-to-3D model for /v1/meshes.",
+    )
+    parser.add_argument(
         "--tts-model",
         type=str,
         default=None,
@@ -331,6 +337,8 @@ def main():
             os.environ["MLX_VLM_PRELOAD_ADAPTER"] = args.adapter_path
     if args.image_model:
         os.environ["MLX_VLM_PRELOAD_IMAGE_MODEL"] = args.image_model
+    if args.mesh_model:
+        os.environ["MLX_VLM_PRELOAD_MESH_MODEL"] = args.mesh_model
     if args.tts_model:
         os.environ["MLX_VLM_PRELOAD_TTS_MODEL"] = args.tts_model
     if args.stt_model:

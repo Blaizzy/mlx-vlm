@@ -5,7 +5,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from ..base import check_array_shape, interpolate
+from ..base import check_array_shape
 from .config import VisionConfig
 
 
@@ -50,10 +50,14 @@ class Attention(nn.Module):
         return self.out_proj(output)
 
 
+def quick_gelu(x):
+    return x * mx.sigmoid(1.702 * x)
+
+
 class MLP(nn.Module):
     def __init__(self, config: Union[VisionConfig, Dict], bias: bool = True):
         super().__init__()
-        self.activation_fn = nn.GELU()
+        self.activation_fn = quick_gelu
         self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size, bias=bias)
         self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size, bias=bias)
 
@@ -129,7 +133,11 @@ class VisionEmbeddings(nn.Module):
             old_pos_embed = mx.transpose(old_pos_embed, (0, 3, 1, 2))
             old_pos_embed = old_pos_embed.astype(mx.float32)
 
-            new_pos_embed = interpolate(old_pos_embed, (tgt_size_2d, tgt_size_2d))
+            from ..kernels import bicubic_interpolate
+
+            new_pos_embed = bicubic_interpolate(
+                old_pos_embed, size=(tgt_size_2d, tgt_size_2d), antialias=True
+            )
 
             new_pos_embed = new_pos_embed.astype(dtype)
             new_pos_embed = mx.transpose(new_pos_embed, (0, 2, 3, 1))

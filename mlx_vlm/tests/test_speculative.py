@@ -17,7 +17,7 @@ import pytest
 from mlx.utils import tree_flatten
 
 import mlx_vlm.speculative.utils as speculative
-from mlx_vlm.generate.ar import _make_cache, generate_step
+from mlx_vlm.generate.ar import BatchGenerator, _make_cache, generate_step
 from mlx_vlm.models import fast_ops
 from mlx_vlm.models import quantized_verifier as quantized
 from mlx_vlm.models.base import InputEmbeddingsFeatures, LanguageModelOutput
@@ -42,12 +42,1045 @@ from mlx_vlm.tests.test_models import (
     model_case,
     tiny_config,
 )
-from mlx_vlm.utils import get_model_and_args
+from mlx_vlm.utils import StoppingCriteria, ThinkingBudgetCriteria, get_model_and_args
 
 parametrize = pytest.mark.parametrize
 DATA = json.loads(Path(__file__).with_name("model_cases.json").read_text())[
     "speculative"
 ]
+
+
+def mistral_dspark_case():
+    from mlx_vlm.models.mistral_large4.config import TextConfig
+    from mlx_vlm.models.mistral_large4.language import LanguageModel
+    from mlx_vlm.speculative.drafters.mistral_large4_dspark import Model, ModelConfig
+
+    args = TextConfig(
+        hidden_size=32,
+        intermediate_size=64,
+        moe_intermediate_size=32,
+        num_hidden_layers=4,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        vocab_size=64,
+        kv_lora_rank=8,
+        qk_rope_head_dim=8,
+        qk_nope_head_dim=8,
+        v_head_dim=8,
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+        index_topk=4,
+        index_head_dim=8,
+        index_n_heads=2,
+        mtp_config={
+            "n_layers": 2,
+            "depth": 3,
+            "target_activation_layers": "0,2,3",
+            "ragged_attention": "4,4",
+            "norm_strategy": "eagle",
+            "dspark": {
+                "markov_rank": 8,
+                "head_type": "rnn",
+                "draft_input": "position_specific",
+            },
+        },
+    )
+    target = LanguageModel(args)
+    draft = Model(ModelConfig(text_config=args))
+    target.eval()
+    draft.eval()
+    return target, draft
+
+
+@parametrize("sidecar", [False, True])
+def test_mistral_dspark_native_loading(tmp_path, sidecar):
+    target, draft = mistral_dspark_case()
+    settings = {"model_type": "mistral_large4", "text_config": target.args.to_dict()}
+    if sidecar:
+        mtp_config = settings["text_config"].pop("mtp_config")
+        (tmp_path / "params.json").write_text(json.dumps({"mtp": mtp_config}))
+    (tmp_path / "config.json").write_text(json.dumps(settings))
+    weights = {"mtp_dspark." + k: v for k, v in tree_flatten(draft.parameters())}
+    weights["norm.weight"] = mx.ones((32,))
+    mx.save_safetensors(
+        str(tmp_path / "consolidated-00001-of-00001.safetensors"), weights
+    )
+    loaded, kind = load_drafter(str(tmp_path))
+    assert kind == "dflash"
+    assert loaded.config.target_layer_ids == [0, 2, 3]
+    assert loaded.config.block_size == 4
+    expected = dict(tree_flatten(draft.parameters()))
+    actual = dict(tree_flatten(loaded.parameters()))
+    assert actual.keys() == expected.keys()
+    for key in expected:
+        np.testing.assert_array_equal(np.array(actual[key]), np.array(expected[key]))
+    from mlx_vlm.speculative.drafters.mistral_large4_dspark.split import (
+        MistralLarge4DsparkSplitter,
+    )
+
+    separate = MistralLarge4DsparkSplitter().split(
+        str(tmp_path), str(tmp_path / "draft")
+    )
+    extracted, kind = load_drafter(str(separate))
+    assert kind == "dflash"
+    for key, value in tree_flatten(extracted.parameters()):
+        np.testing.assert_array_equal(np.array(value), np.array(expected[key]))
+    del weights["mtp_dspark.backbone.mask_embedding"]
+    mx.save_safetensors(
+        str(tmp_path / "consolidated-00001-of-00001.safetensors"), weights
+    )
+    with pytest.raises(ValueError):
+        load_drafter(str(tmp_path))
+
+
+def test_mistral_dspark_capture_and_latent_rollback():
+    target, draft = mistral_dspark_case()
+    ids = mx.array([[1, 2, 3, 4, 5, 6]])
+    reference, cache = target.make_cache(), target.make_cache()
+    prefix = target(ids[:, :2], cache=cache, capture_layer_ids=[0, 2, 3])
+    target(ids[:, :2], cache=reference)
+    assert len(prefix.hidden_states) == 3
+    captured = []
+    # A tap is the residual stream after the named layer, before final norm.
+    last = target.model.norm
+    probe = target.model(ids[:, :2], capture_layer_ids=[3], capture_sink=captured)
+    np.testing.assert_allclose(np.array(probe), np.array(last(captured[0])), atol=1e-6)
+    output, transaction = common.verify_forward(
+        target, ids[:, 2:], cache, capture_layer_ids=draft.config.target_layer_ids
+    )
+    mx.eval(output.logits, output.hidden_states)
+    transaction.commit(2)
+    target(ids[:, 2:4], cache=reference)
+    assert all(c.offset == 4 for c in cache)
+    a = target(mx.array([[9]]), cache=cache).logits
+    b = target(mx.array([[9]]), cache=reference).logits
+    np.testing.assert_allclose(np.array(a), np.array(b), atol=2e-5, rtol=2e-5)
+
+
+def test_mistral_dspark_context_window_and_short_budget():
+    target, draft = mistral_dspark_case()
+    draft.bind(target)
+    hidden = mx.random.normal((1, 9, 96))
+    c1, c2 = draft.make_cache(), draft.make_cache()
+    sampler = lambda logits: mx.argmax(logits, axis=-1)
+    full = draft.draft_block(3, hidden, c1, 4, sampler)
+    # Incremental context ingestion retains exactly the same last window.
+    draft.draft_block(2, hidden[:, :6], c2, 4, sampler)
+    partial = draft.draft_block(3, hidden[:, 6:], c2, 2, sampler)
+    np.testing.assert_array_equal(np.array(full[:, :1]), np.array(partial))
+    assert [c.offset for c in c1] == [9, 9]
+    assert [c.offset for c in c2] == [9, 9]
+    for a, b in zip(c1, c2):
+        np.testing.assert_allclose(
+            np.array(a._temporal_order(a.keys)[..., -4:, :]),
+            np.array(b._temporal_order(b.keys)[..., -4:, :]),
+            atol=1e-5,
+        )
+
+
+def test_mistral_dspark_recurrent_head_equations():
+    _, draft = mistral_dspark_case()
+    head = draft.autoregressive_head
+    h = mx.random.normal((1, 3, 32))
+    tokens = mx.array([3])
+    state = None
+    reference = np.zeros((1, 8), dtype=np.float32)
+    for i in range(3):
+        bias, state = head.step(tokens, h[:, i], state)
+        embed = np.array(head.embedding.weight)[np.array(tokens)]
+        joined = np.concatenate([reference, embed, np.array(h[:, i])], axis=-1)
+        joined = joined @ np.array(head.joint_proj.weight).T + np.array(
+            head.joint_proj.bias
+        )
+        gate, candidate, out = np.split(joined, 3, axis=-1)
+        gate = 1 / (1 + np.exp(-gate))
+        reference = gate * reference + (1 - gate) * np.tanh(candidate)
+        expected = np.tanh(out) @ np.array(head.output.weight).T
+        np.testing.assert_allclose(np.array(state), reference, atol=1e-6, rtol=1e-5)
+        np.testing.assert_allclose(np.array(bias), expected, atol=1e-6, rtol=1e-5)
+        tokens = mx.argmax(bias, axis=-1)
+
+
+def test_mistral_dspark_batched_drafts_keep_independent_context_positions():
+    mx.random.seed(17)
+    target, draft = mistral_dspark_case()
+    draft.bind(target)
+    batched = [draft.make_cache() for _ in range(2)]
+    separate = [draft.make_cache() for _ in range(2)]
+    sampler = lambda logits: mx.argmax(logits, axis=-1)
+    for lengths in ([9, 3], [1, 3], [4, 2]):
+        hidden = [mx.random.normal((1, length, 96)) for length in lengths]
+        actual = draft.draft_batch([3, 5], hidden, batched, 4, sampler, mx.int32)
+        expected = mx.concatenate(
+            [
+                draft.draft_block(token, h, cache, 4, sampler)
+                for token, h, cache in zip([3, 5], hidden, separate)
+            ]
+        )
+        np.testing.assert_array_equal(np.array(actual), np.array(expected))
+        for actual_row, expected_row in zip(batched, separate):
+            for a, b in zip(actual_row, expected_row):
+                assert a.offset == b.offset
+                np.testing.assert_allclose(
+                    np.array(a.keys), np.array(b.keys), atol=1e-5
+                )
+                np.testing.assert_allclose(
+                    np.array(a.values), np.array(b.values), atol=1e-5
+                )
+
+
+def test_mistral_dspark_ragged_rollback_includes_shared_and_index_only_caches():
+    from mlx_vlm.models.mistral_large4.language import LanguageModel
+
+    mx.random.seed(19)
+    target, _ = mistral_dspark_case()
+    args = target.args
+    args.kv_source_layers = [0, 1, 0, 1]
+    args.no_rope_layers = [1, 1, 1, 1]
+    args.indexer_types = ["full", "full", "full", "shared"]
+    target = LanguageModel(args)
+    target.eval()
+    cache = [c.to_batch([0, 0]) for c in target.make_cache()]
+    mx.eval(target(mx.array([[1, 2, 3, 4], [5, 6, 7, 8]]), cache=cache).logits)
+    reference = [[c.extract(row) for c in cache] for row in range(2)]
+    block = mx.array([[9, 10, 11, 12], [13, 14, 15, 16]])
+    out = target(block, cache=cache, speculative_verify=True)
+    mx.eval(out.logits)
+    out.gdn_states.commit([1, 3])
+    for c in cache:
+        assert c.offset.tolist() == [5, 7]
+        assert c.left_padding.tolist() == [0, 0]
+    cache = [type(c).from_state(c.state, c.meta_state) for c in cache]
+    assert all(c._ragged and c.offset.tolist() == [5, 7] for c in cache)
+    for row, retained in enumerate([1, 3]):
+        for index in range(retained):
+            mx.eval(
+                target(
+                    block[row : row + 1, index : index + 1], cache=reference[row]
+                ).logits
+            )
+        actual = target(mx.array([[17]]), cache=[c.extract(row) for c in cache]).logits
+        expected = target(mx.array([[17]]), cache=reference[row]).logits
+        np.testing.assert_allclose(
+            np.array(actual), np.array(expected), atol=5e-5, rtol=5e-5
+        )
+
+
+@parametrize("cancel", [False, True])
+@parametrize("sampling", ["greedy", "random", "positioned"])
+def test_mistral_dspark_admits_requests_while_batch_is_active(cancel, sampling):
+    from types import SimpleNamespace
+
+    from mlx_vlm.generate.ar import BatchGenerator
+    from mlx_vlm.sample_utils import make_sampler
+    from mlx_vlm.server.generation import _PositionedTargetSampler
+    from mlx_vlm.utils import StoppingCriteria
+
+    mx.random.seed(23)
+    sampler = make_sampler(temp=0.7) if sampling == "random" else None
+    if sampling == "positioned":
+        sampler = _PositionedTargetSampler(temperature=0.7, top_p=1.0, seed=23)
+    target, draft = mistral_dspark_case()
+    generator = BatchGenerator(
+        target,
+        SimpleNamespace(stopping_criteria=StoppingCriteria([])),
+        completion_batch_size=2,
+        prefill_batch_size=2,
+        prefill_step_size=2,
+        draft_model=draft,
+        draft_kind="dflash",
+        draft_block_size=4,
+        sampler=sampler,
+        greedy_sampling=sampling == "greedy",
+        compute_logprobs=False,
+    )
+    prompts = [[1, 3, 5, 7], [2, 4], [11, 12, 13]]
+    outputs = [[], [], []]
+
+    def insert(rows, limits):
+        generator.insert(
+            rows,
+            max_tokens=limits,
+            prompt_kwargs=[
+                {"inputs_embeds": target.model.embed_tokens(mx.array([p]))}
+                for p in rows
+            ],
+        )
+
+    insert(prompts[:2], [40, 3])
+    added = False
+    overlapped = False
+    try:
+        for _ in range(100):
+            if not generator.has_work:
+                break
+            _, responses = generator.next()
+            for response in responses:
+                if response.token is not None:
+                    outputs[response.uid].append(response.token)
+            if not added and len(outputs[0]) >= 2:
+                insert(prompts[2:], [6])
+                added = True
+            if outputs[2] and len(outputs[0]) < 40:
+                overlapped = True
+                if cancel:
+                    assert generator.remove(0)
+                    cancel = False
+            batch = generator._generation_batch
+            assert len(getattr(batch, "_all_uids", batch.uids)) <= 2
+        assert not generator.has_work
+        assert overlapped
+        assert len(outputs[1]) == 3
+        assert len(outputs[2]) == 6
+    finally:
+        generator.close()
+
+
+@parametrize("family", ["dflash2", "dspark-lfm2", "mistral", "gemma"])
+@parametrize("pause_after", [1, 8])
+@parametrize("sampling", [False, True])
+def test_speculative_row_resume_preserves_state_and_other_requests(
+    family, pause_after, sampling
+):
+    from mlx_vlm.sample_utils import make_sampler
+
+    mx.random.seed(23)
+    if family == "mistral":
+        target, draft = mistral_dspark_case()
+    elif family == "gemma":
+        target, draft = gemma_dflash_case(shared=True)
+    else:
+        target, draft = dflash_target(family).language_model, dflash_drafter(family)
+    generator = BatchGenerator(
+        target,
+        NS(stopping_criteria=StoppingCriteria([])),
+        completion_batch_size=2,
+        prefill_batch_size=2,
+        prefill_step_size=2,
+        draft_model=draft,
+        draft_kind="dflash",
+        draft_block_size=4,
+        sampler=make_sampler(temp=0.7) if sampling else None,
+        greedy_sampling=not sampling,
+        compute_logprobs=False,
+    )
+    prompts = [[1, 3, 5, 7], [2, 4]]
+    outputs = [[], []]
+    generator.insert(
+        prompts,
+        max_tokens=32,
+        resumable=True,
+        prompt_kwargs=[
+            {
+                "inputs_embeds": target.model.embed_tokens(mx.array([p]))
+                * getattr(target.model, "embed_scale", 1)
+            }
+            for p in prompts
+        ],
+    )
+
+    def step():
+        _, responses = generator.next()
+        for response in responses:
+            if response.token is not None:
+                outputs[response.uid].append(response.token)
+
+    try:
+        while len(outputs[0]) < pause_after:
+            step()
+        checkpoint = generator.suspend(0)
+        assert generator._generation_batch.uids == [1]
+        saved = deepcopy(checkpoint._batch_state.state)
+        stopped_count, other_count = map(len, outputs)
+        for _ in range(3):
+            step()
+        assert len(outputs[0]) == stopped_count
+        assert len(outputs[1]) > other_count
+        for (_, before), (_, after) in zip(
+            tree_flatten(saved), tree_flatten(checkpoint._batch_state.state)
+        ):
+            if isinstance(before, mx.array):
+                assert mx.array_equal(before, after).item()
+        draft_cache = checkpoint._batch_state.draft_caches[0]
+        generator.resume(checkpoint)
+        assert generator._generation_batch.uids == [1, 0]
+        assert generator._generation_batch._batch_state.draft_caches[-1] is draft_cache
+        for _ in range(100):
+            if not generator.has_work:
+                break
+            step()
+        assert not generator.has_work
+        assert [len(row) for row in outputs] == [32, 32]
+        if not sampling:
+            for prompt, actual in zip(prompts, outputs):
+                cache = target.make_cache()
+                inputs, expected = mx.array([prompt]), []
+                for _ in range(32):
+                    token = mx.argmax(
+                        target(inputs, cache=cache).logits[:, -1], axis=-1
+                    )
+                    expected.append(token.item())
+                    inputs = token[:, None]
+                assert actual == expected
+    finally:
+        generator.close()
+
+
+def mtp_resume_case(family, *, shared=False):
+    if family != "gemma":
+        target, config = language(family, inference=True)
+        return target, mtp_drafter(family, config)
+    from mlx_vlm.models.gemma4.config import TextConfig
+    from mlx_vlm.models.gemma4.language import LanguageModel
+    from mlx_vlm.speculative.drafters.gemma4_assistant import Model, ModelConfig
+
+    config = TextConfig(
+        hidden_size=32,
+        num_hidden_layers=4 if shared else 2,
+        intermediate_size=64,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        global_head_dim=8,
+        vocab_size=64,
+        vocab_size_per_layer_input=64,
+        hidden_size_per_layer_input=0,
+        num_kv_shared_layers=2 if shared else 0,
+        layer_types=["sliding_attention", "full_attention"] * (2 if shared else 1),
+        sliding_window=8,
+    )
+    return LanguageModel(config), Model(
+        ModelConfig(text_config=deepcopy(config), backbone_hidden_size=32, block_size=4)
+    )
+
+
+def gemma_dflash_case(*, shared=False):
+    from mlx_vlm.speculative.drafters.qwen3_dflash.config import DFlashConfig
+    from mlx_vlm.speculative.drafters.qwen3_dflash.dflash import DFlashDraftModel
+
+    target, _ = mtp_resume_case("gemma", shared=shared)
+    return target, DFlashDraftModel(
+        DFlashConfig(
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            vocab_size=64,
+            mask_token_id=63,
+            block_size=4,
+            num_target_layers=4 if shared else 2,
+            target_layer_ids=[0, 3] if shared else [0, 1],
+        )
+    )
+
+
+def test_gemma_shared_kv_skips_empty_batch_caches():
+    from mlx_vlm.models.cache import BatchRotatingKVCache
+
+    target, _ = mtp_resume_case("gemma", shared=True)
+    caches = [BatchRotatingKVCache(8, [0, 0]), BatchKVCache([0, 0]), None, None]
+    assert target.shared_kv_from_cache(caches) == {}
+
+
+@parametrize("lengths", [[4, 7], [12, 10], [5, 5]])
+@parametrize("steps", [0, 1, 5, 20])
+def test_gemma_shared_kv_views_match_independent_rows(lengths, steps):
+    from mlx_vlm import apc
+
+    target, _ = mtp_resume_case("gemma", shared=True)
+    rows = [target.make_cache() for _ in lengths]
+    for row, length in zip(rows, lengths):
+        target(mx.array([list(range(1, length + 1))]), cache=row)
+    caches, _ = apc.make_warm_batch_exact_cache_multi(rows, lengths)
+    for _ in range(steps):
+        target(mx.array([[1], [2]]), cache=caches)
+    actual = target.shared_kv_from_cache(caches)
+    expected = []
+    for index in range(len(rows)):
+        row = [entry.extract(index) for entry in caches]
+        expected.append(target.shared_kv_from_cache(row))
+    for key, tensors in actual.items():
+        for index, reference in enumerate(expected):
+            for tensor, wanted in zip(tensors, reference[key]):
+                length = wanted.shape[2]
+                assert mx.array_equal(tensor[index : index + 1, :, :length], wanted)
+                assert mx.all(tensor[index, :, length:] == 0)
+
+
+@parametrize("shared", [False, True])
+@parametrize("kind", ["mtp", "dflash"])
+def test_gemma_ragged_speculative_commit_matches_independent_rows(shared, kind):
+    from mlx_vlm import apc
+    from mlx_vlm.speculative.cache_state import SpeculativeCacheTransaction
+
+    mx.random.seed(32)
+    target, draft = mtp_resume_case("gemma", shared=shared)
+    target.eval()
+    references = [target.make_cache(), target.make_cache()]
+    prompts = [list(range(1, 14)), list(range(3, 12))]
+    for prompt, cache in zip(prompts, references):
+        target(mx.array([prompt]), cache=cache)
+    caches, _ = apc.make_warm_batch_exact_cache_multi(
+        deepcopy(references), list(map(len, prompts))
+    )
+    assert caches is not None
+    for round_index, retained in enumerate(([3, 1], [1, 4], None, [4, 2], [2, 3])):
+        tokens = mx.array([[20, 21, 22, 23], [30, 31, 32, 33]]) + round_index
+        if kind == "mtp":
+            hidden, shared_kv, transaction = target.speculative_verify_hidden(
+                tokens, caches
+            )
+        else:
+            output = target(tokens, cache=caches, speculative_verify=True)
+            transaction = output.gdn_states
+        assert isinstance(transaction, SpeculativeCacheTransaction)
+        if retained is None:
+            transaction.abort()
+        else:
+            transaction.commit(retained)
+            committed_shared = target.shared_kv_from_cache(caches)
+            for row, count in enumerate(retained):
+                for i in range(count):
+                    target(tokens[row : row + 1, i : i + 1], cache=references[row])
+                if kind == "mtp":
+                    # The assistant must see the same committed context as a
+                    # standalone request, including after window rotation.
+                    position = references[row][0].offset
+                    draft.reset(target)
+                    mtp.MTPBatch._bind_shared(
+                        NS(draft=draft, position=position),
+                        committed_shared,
+                        row,
+                        None,
+                    )
+                    inputs = mx.concatenate(
+                        [
+                            target.model.embed_tokens(mx.array([[42]]))
+                            * target.model.embed_scale,
+                            target.speculative_draft_hidden(
+                                hidden[row : row + 1, count - 1 : count]
+                            ),
+                        ],
+                        axis=-1,
+                    )
+                    positions = mx.array([[position - 1]])
+                    _, actual_draft = draft(inputs, draft._shared_kv, positions)
+                    reference_kv = mtp._mtp_shared_kv_from_prompt_cache(
+                        NS(
+                            model=NS(layers=target.model.layers[: len(references[row])])
+                        ),
+                        references[row],
+                    )
+                    draft.set_shared_kv(
+                        reference_kv, kv_offset=position, kv_valid_len=position
+                    )
+                    _, expected_draft = draft(inputs, draft._shared_kv, positions)
+                    assert mx.allclose(actual_draft, expected_draft, atol=2e-5).item()
+        probe = mx.array([[42], [43]])
+        actual = target(probe, cache=caches).logits
+        for row in range(2):
+            expected = target(probe[row : row + 1], cache=references[row]).logits
+            assert mx.allclose(actual[row : row + 1], expected, atol=2e-5).item()
+            assert (
+                mx.argmax(actual[row, -1]).item() == mx.argmax(expected[0, -1]).item()
+            )
+            assert caches[0].offset[row].item() == references[row][0].offset
+
+
+def test_mtp_ragged_acceptance_respects_remaining_token_budgets(monkeypatch):
+    target, draft = mtp_resume_case("gemma")
+    verify = mtp._mtp_verify_target
+
+    def accept_all(model, inputs, *args, **kwargs):
+        result = verify(model, inputs, *args, **kwargs)
+        # Guarantee acceptance at the boundary where one row has one token
+        # left and its peer can still emit an entire speculative round.
+        result.target_tokens = mx.concatenate([inputs[:, 1:], inputs[:, :1]], axis=1)
+        return result
+
+    monkeypatch.setattr(mtp, "_mtp_verify_target", accept_all)
+    commits = []
+    commit = mtp.commit_speculative_round
+
+    def observe_commit(model, caches, transaction, accepted, block_size):
+        commits.append(list(accepted))
+        return commit(model, caches, transaction, accepted, block_size)
+
+    monkeypatch.setattr(mtp, "commit_speculative_round", observe_commit)
+    generator = BatchGenerator(
+        target,
+        NS(stopping_criteria=StoppingCriteria([])),
+        completion_batch_size=2,
+        prefill_batch_size=2,
+        draft_model=draft,
+        draft_kind="mtp",
+        draft_block_size=4,
+        greedy_sampling=True,
+        compute_logprobs=False,
+    )
+    prompts = [[1, 3], [2, 4]]
+    generator.insert(
+        prompts,
+        max_tokens=[2, 5],
+        prompt_kwargs=[
+            {
+                "inputs_embeds": target.model.embed_tokens(mx.array([p]))
+                * target.model.embed_scale
+            }
+            for p in prompts
+        ],
+    )
+    counts = [0, 0]
+    try:
+        while generator.has_work:
+            _, responses = generator.next()
+            for response in responses:
+                counts[response.uid] += response.token is not None
+        assert counts == [2, 5]
+        assert [0, 1] in commits
+    finally:
+        generator.close()
+
+
+@parametrize("family", ["qwen", "glm", "deepseek", "gemma"])
+@parametrize("pause_after", [1, 8])
+@parametrize("sampling", [False, True, "positioned"])
+def test_mtp_shared_resume_preserves_rows(family, pause_after, sampling, monkeypatch):
+    from mlx_vlm.models.cache import cache_nbytes
+    from mlx_vlm.sample_utils import make_sampler
+    from mlx_vlm.server.generation import _PositionedTargetSampler
+
+    mx.random.seed(23)
+    target, draft = mtp_resume_case(family)
+    target.eval()
+    draft.eval()
+    widths = []
+    verify = mtp._mtp_verify_target
+
+    def observe(model, inputs, *args, **kwargs):
+        widths.append(inputs.shape[0])
+        return verify(model, inputs, *args, **kwargs)
+
+    monkeypatch.setattr(mtp, "_mtp_verify_target", observe)
+    sampler = make_sampler(temp=0.7) if sampling else None
+    if sampling == "positioned":
+        sampler = _PositionedTargetSampler(temperature=0.7, top_p=1.0, seed=23)
+    generator = BatchGenerator(
+        target,
+        NS(stopping_criteria=StoppingCriteria([])),
+        completion_batch_size=3,
+        prefill_batch_size=2,
+        prefill_step_size=16,
+        draft_model=draft,
+        draft_kind="mtp",
+        draft_block_size=4,
+        sampler=sampler,
+        greedy_sampling=not sampling,
+        compute_logprobs=False,
+    )
+    prompts = [[1, 3, 5, 7], [2, 4, 6, 8] if family == "glm" else [2, 4]]
+    outputs = [[], [], []]
+    generator.insert(
+        prompts,
+        max_tokens=32,
+        resumable=True,
+        prompt_kwargs=[
+            {
+                "inputs_embeds": target.model.embed_tokens(mx.array([p]))
+                * getattr(target.model, "embed_scale", 1)
+            }
+            for p in prompts
+        ],
+    )
+
+    def step():
+        _, responses = generator.next()
+        for response in responses:
+            if response.token is not None:
+                outputs[response.uid].append(response.token)
+
+    try:
+        while len(outputs[0]) < pause_after:
+            step()
+        for _ in range(2):
+            checkpoint = generator.suspend(0)
+            assert generator._generation_batch.uids == [1]
+            state = checkpoint._batch_state
+            saved = deepcopy(state.rows[0].state)
+            row = state.rows[0]
+            assert row.draft is not draft
+            if family != "gemma" and pause_after == 1:
+                position = row.draft._next_position
+                if isinstance(position, mx.array):
+                    position = position.item()
+                assert position == row.position
+            # Session copies share weight arrays, not mutable draft state.
+            weights = dict(tree_flatten(draft.parameters()))
+            for name, array in tree_flatten(row.draft.parameters()):
+                if name in weights and not name.startswith("_"):
+                    assert array is weights[name]
+            assert cache_nbytes(state) >= cache_nbytes(row.state) > 0
+            stopped, other = len(outputs[0]), len(outputs[1])
+            for _ in range(2):
+                step()
+            assert len(outputs[0]) == stopped
+            assert len(outputs[1]) > other
+            for (_, before), (_, after) in zip(
+                tree_flatten(saved), tree_flatten(row.state)
+            ):
+                if isinstance(before, mx.array):
+                    assert mx.array_equal(before, after).item()
+            generator.resume(checkpoint)
+            assert generator._generation_batch.uids == [1, 0]
+            assert generator._generation_batch._batch_state.rows[-1] is row
+            widths.clear()
+            step()
+            assert 2 in widths
+        for _ in range(100):
+            if not generator.has_work:
+                break
+            step()
+        assert not generator.has_work
+        assert [len(row) for row in outputs[:2]] == [32, 32]
+        if not sampling:
+            for prompt, actual in zip(prompts, outputs):
+                cache = target.make_cache()
+                target._rope_deltas = None
+                target._position_ids = None
+                inputs, expected = mx.array([prompt]), []
+                for _ in range(32):
+                    token = mx.argmax(
+                        target(inputs, cache=cache).logits[:, -1], axis=-1
+                    )
+                    expected.append(token.item())
+                    inputs = token[:, None]
+                assert actual == expected
+    finally:
+        generator.close()
+
+
+@parametrize("family", ["qwen", "gemma"])
+def test_mtp_resume_joins_new_requests_after_all_rows_paused(family, monkeypatch):
+    mx.random.seed(23)
+    target, draft = mtp_resume_case(family)
+    target.eval()
+    draft.eval()
+    widths = []
+    verify = mtp._mtp_verify_target
+
+    def observe(model, inputs, *args, **kwargs):
+        widths.append(inputs.shape[0])
+        return verify(model, inputs, *args, **kwargs)
+
+    monkeypatch.setattr(mtp, "_mtp_verify_target", observe)
+    generator = BatchGenerator(
+        target,
+        NS(stopping_criteria=StoppingCriteria([])),
+        completion_batch_size=3,
+        prefill_batch_size=2,
+        prefill_step_size=2,
+        draft_model=draft,
+        draft_kind="mtp",
+        draft_block_size=4,
+        greedy_sampling=True,
+        compute_logprobs=False,
+    )
+    prompts = [[1, 3, 5, 7], [2, 4, 6, 8, 10], [3, 5]]
+    outputs = [[], [], []]
+
+    def insert(rows):
+        generator.insert(
+            rows,
+            max_tokens=24,
+            resumable=True,
+            prompt_kwargs=[
+                {
+                    "inputs_embeds": target.model.embed_tokens(mx.array([p]))
+                    * getattr(target.model, "embed_scale", 1)
+                }
+                for p in rows
+            ],
+        )
+
+    def step():
+        _, responses = generator.next()
+        for response in responses:
+            if response.token is not None:
+                outputs[response.uid].append(response.token)
+
+    try:
+        insert(prompts[:1])
+        while len(outputs[0]) < 4:
+            step()
+        checkpoint = generator.suspend(0)
+        assert not generator.has_work
+        saved = deepcopy(checkpoint._batch_state.rows[0].state)
+        insert(prompts[1:])
+        while min(len(outputs[1]), len(outputs[2])) < 2:
+            step()
+        for (_, before), (_, after) in zip(
+            tree_flatten(saved), tree_flatten(checkpoint._batch_state.rows[0].state)
+        ):
+            if isinstance(before, mx.array):
+                assert mx.array_equal(before, after).item()
+        generator.resume(checkpoint)
+        widths.clear()
+        step()
+        assert 3 in widths
+        assert generator.remove(2)
+        cancelled = len(outputs[2])
+        for _ in range(100):
+            if not generator.has_work:
+                break
+            step()
+        assert not generator.has_work
+        assert list(map(len, outputs)) == [24, 24, cancelled]
+        for prompt, actual in zip(prompts[:2], outputs[:2]):
+            cache = target.make_cache()
+            target._rope_deltas = target._position_ids = None
+            inputs, expected = mx.array([prompt]), []
+            for _ in range(24):
+                token = greedy(target(inputs, cache=cache).logits[:, -1])
+                expected.append(token.item())
+                inputs = token[:, None]
+            assert actual == expected
+    finally:
+        generator.close()
+
+
+@parametrize("dtype", [mx.float16, mx.bfloat16])
+@parametrize(
+    "batch,length",
+    [
+        (2, 1),
+        (2, 4),
+        (3, 3),
+        (3, 4),
+        (4, 4),
+        (5, 3),
+        (6, 3),
+        (8, 4),
+        (13, 2),
+        (15, 2),
+        (15, 4),
+    ],
+)
+def test_mistral_dspark_wide_projection_matches_native_decode(dtype, batch, length):
+    from mlx_vlm.models.mistral_large4.verify_kernel import native_wide_linear
+
+    mx.random.seed(71)
+    # Include non-tile-aligned output and input tails as well as a large K.
+    for k, n in [(68, 61), (128, 131), (2048, 256), (512, 6144)]:
+        weight = mx.random.normal((n, k)).astype(dtype)
+        x = mx.random.normal((batch, length, k)).astype(dtype)
+        actual = native_wide_linear(weight, x)
+        if actual is None:
+            pytest.skip("Native wide-GEMV is unavailable on this device")
+        expected = mx.concatenate(
+            [mx.contiguous(x[:, t : t + 1]) @ weight.T for t in range(length)], axis=1
+        )
+        equal(actual, expected)
+        if n == 6144:
+            parts = [native_wide_linear(w, x) for w in mx.split(weight, 2)]
+            equal(mx.concatenate(parts, axis=-1), expected)
+
+
+@parametrize("dtype", [mx.float32, mx.bfloat16])
+@parametrize("batch", [1, 2])
+def test_mistral_dspark_verifier_matches_decode(dtype, batch):
+    target, draft = mistral_dspark_case()
+    target.set_dtype(dtype)
+    prompt = mx.array([[1, 2, 3, 4, 5, 6], [6, 5, 4, 3, 2, 1]][:batch])
+    block = mx.array([[7, 8, 9, 10], [10, 9, 8, 7]][:batch])
+    caches = [target.make_cache(), target.make_cache()]
+    if batch > 1:
+        caches = [[c.to_batch([0] * batch) for c in entries] for entries in caches]
+    for cache in caches:
+        mx.eval(target(prompt, cache=cache).logits)
+    ordinary = [
+        target(block[:, i : i + 1], cache=caches[0], capture_layer_ids=[0, 2, 3])
+        for i in range(4)
+    ]
+    output = target(
+        block, cache=caches[1], capture_layer_ids=[0, 2, 3], speculative_verify=True
+    )
+    expected = mx.concatenate([x.logits for x in ordinary], axis=1)
+    np.testing.assert_allclose(
+        np.array(output.logits.astype(mx.float32)),
+        np.array(expected.astype(mx.float32)),
+        atol=0.04 if dtype == mx.bfloat16 else 2e-5,
+        rtol=0.02 if dtype == mx.bfloat16 else 2e-5,
+    )
+    np.testing.assert_array_equal(
+        np.array(mx.argmax(output.logits, axis=-1)),
+        np.array(mx.argmax(expected, axis=-1)),
+    )
+    output.gdn_states.commit(2)
+    for cache in caches[0]:
+        cache.trim(2)
+    next_token = mx.array([[12], [13]][:batch])
+    actual = target(next_token, cache=caches[1]).logits
+    reference = target(next_token, cache=caches[0]).logits
+    np.testing.assert_allclose(
+        np.array(actual.astype(mx.float32)),
+        np.array(reference.astype(mx.float32)),
+        atol=0.04 if dtype == mx.bfloat16 else 2e-5,
+        rtol=0.02 if dtype == mx.bfloat16 else 2e-5,
+    )
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
+@parametrize("prefix,topk", [(3, 2048), (127, 2048), (255, 2048), (127, 128)])
+@parametrize("batch,length", [(2, 1), (2, 4), (8, 2), (8, 4)])
+@parametrize("ragged", [False, True])
+def test_mistral_dspark_verifier_preserves_hidden_logits_and_cache(
+    prefix, topk, batch, length, ragged
+):
+    from mlx_vlm.models.mistral_large4 import speculative_verifier as verifier
+
+    mx.random.seed(79)
+    model, _ = mistral_dspark_case()
+    model.set_dtype(mx.bfloat16)
+    for layer in model.layers:
+        if layer.attention.indexer is not None:
+            layer.attention.indexer.topk = topk
+    initial = [c.to_batch([i % 3 for i in range(batch)]) for c in model.make_cache()]
+    ids = mx.random.randint(1, 60, (batch, prefix))
+    mx.eval(model(ids, cache=initial).logits)
+    if ragged:
+        for c in initial:
+            c._ragged = True
+            c.offset -= mx.arange(batch) % 3
+    ids = mx.random.randint(1, 60, (batch, length))
+    reference_cache, actual_cache = deepcopy(initial), deepcopy(initial)
+    ordinary = [
+        model(ids[:, t : t + 1], cache=reference_cache, capture_layer_ids=[0, 1, 2, 3])
+        for t in range(length)
+    ]
+    expected_hidden = [
+        mx.concatenate([r.hidden_states[i] for r in ordinary], axis=1) for i in range(4)
+    ]
+    expected_logits = mx.concatenate([r.logits for r in ordinary], axis=1)
+    hidden, norm, transaction = verifier.verify_hidden(
+        model, ids, actual_cache, [0, 1, 2, 3]
+    )
+    logits = verifier.verify_logits(model, norm)
+    equal(hidden, expected_hidden)
+    equal(logits, expected_logits)
+    equal([c.state for c in actual_cache], [c.state for c in reference_cache])
+    transaction.abort()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
+def test_mistral_dspark_expert_scales_refresh_without_serializing_runtime_state():
+    from mlx_vlm.models.mistral_large4 import speculative_verifier as verifier
+    from mlx_vlm.models.mistral_large4.config import TextConfig
+    from mlx_vlm.models.mistral_large4.language import MoE
+    from mlx_vlm.quantization.nvfp4 import ScaledQuantizedSwitchLinear
+
+    model, _ = mistral_dspark_case()
+    ffn = MoE(
+        TextConfig(
+            hidden_size=512,
+            moe_intermediate_size=512,
+            n_routed_experts=8,
+            expert_start=0,
+            expert_end=4,
+            n_shared_experts=0,
+            nvfp4=True,
+        )
+    )
+    for name in ("w1", "w3", "w2"):
+        setattr(
+            ffn.experts,
+            name,
+            ScaledQuantizedSwitchLinear(
+                getattr(ffn.experts, name),
+                mx.array([0.25, 0.5, 1.0, 0.75]),
+                "weight_scale_2",
+            ),
+        )
+    ffn.eval()
+    ffn.group = object()
+    model.layers[0].feed_forward = ffn
+    first = verifier._expert_parameters(model, mx.bfloat16)
+    second = verifier._expert_parameters(model, mx.bfloat16)
+    assert all(a is b for a, b in zip(first[id(ffn)][2], second[id(ffn)][2]))
+    assert "_verification_scales" not in model.parameters()
+    ffn.experts.w1.weight_scale_2 = mx.array([0.5, 1.0, 2.0, 1.5])
+    third = verifier._expert_parameters(model, mx.bfloat16)
+    equal(third[id(ffn)][2][0], first[id(ffn)][2][0] * 2)
+    assert third[id(ffn)][2][0] is not first[id(ffn)][2][0]
+    assert third[id(ffn)][2][1] is first[id(ffn)][2][1]
+    ffn.experts.w1.weight = mx.zeros_like(ffn.experts.w1.weight)
+    fourth = verifier._expert_parameters(model, mx.bfloat16)
+    assert fourth[id(ffn)][0][0] is ffn.experts.w1.weight
+    assert fourth[id(ffn)][2][0] is third[id(ffn)][2][0]
+
+
+def test_mistral_dspark_cpu_verification_uses_portable_fallback():
+    with mx.stream(mx.cpu):
+        model, _ = mistral_dspark_case()
+        cache = [c.to_batch([0, 0]) for c in model.make_cache()]
+        mx.eval(model(mx.array([[1, 2, 3], [3, 2, 1]]), cache=cache).logits)
+        expected_cache = deepcopy(cache)
+        ids = mx.array([[4, 5], [5, 4]])
+        expected = mx.concatenate(
+            [model(ids[:, t : t + 1], cache=expected_cache).logits for t in range(2)],
+            axis=1,
+        )
+        result = model(ids, cache=cache, speculative_verify=True)
+        equal(result.logits, expected, atol=2e-5, rtol=2e-5)
+        result.gdn_states.abort()
+
+
+@parametrize("temperature", [0, 0.7])
+@parametrize("prefill_step_size", [None, 2])
+def test_mistral_dspark_standard_generation(
+    temperature, prefill_step_size, monkeypatch
+):
+    lm, draft = mistral_dspark_case()
+    calls = []
+    forward = type(lm).__call__
+
+    def record(self, inputs, *args, **kwargs):
+        calls.append(inputs.shape[1])
+        return forward(self, inputs, *args, **kwargs)
+
+    monkeypatch.setattr(type(lm), "__call__", record)
+    model = NS(
+        language_model=lm,
+        get_input_embeddings=lambda ids, *args, **kwargs: InputEmbeddingsFeatures(
+            inputs_embeds=lm.model.embed_tokens(ids)
+        ),
+    )
+    options = dict(temperature=temperature, prefill_step_size=prefill_step_size)
+    expected = generated(model, **options)
+    calls.clear()
+    actual = generated(model, draft, **options)
+    # Preserve the ordinary prefill boundary, including the final singleton.
+    prefix = [2, 1, 1] if prefill_step_size else [4]
+    assert calls[: len(prefix)] == prefix
+    assert actual == expected
+    assert draft.draft_lens and sum(draft.draft_lens) > 0
+    assert generated(model, draft, **options) == expected
+
+
+def test_mistral_dspark_greedy_matches_bf16_logprob_ties():
+    target, _ = mistral_dspark_case()
+    target.set_dtype(mx.bfloat16)
+    target.lm_head.weight = mx.zeros_like(target.lm_head.weight)
+    target.lm_head.weight[1, 0] = 1e-4
+    hidden = mx.zeros((1, 4, 32), dtype=mx.bfloat16)
+    hidden[..., 0] = 1
+    from mlx_vlm.models.mistral_large4.speculative_verifier import verify_logits
+
+    logits = verify_logits(target, hidden)
+    assert mx.argmax(logits, axis=-1).tolist() == [[1, 1, 1, 1]]
+    # Subtraction rounds these nearby logits to a BF16 tie in generate_step.
+    assert target.speculative_argmax_from_hidden(hidden).tolist() == [[0, 0, 0, 0]]
 
 
 def module(name):
@@ -236,26 +1269,34 @@ class TransactionDrafter:
 
 
 def equal(actual, expected, **tolerance):
-    if isinstance(actual, dict):
-        assert actual.keys() == expected.keys()
-        for key in actual:
-            equal(actual[key], expected[key], **tolerance)
-    elif isinstance(actual, (list, tuple)):
-        assert len(actual) == len(expected)
-        for a, b in zip(actual, expected):
-            equal(a, b, **tolerance)
-    elif actual is None or expected is None:
-        assert actual is expected
-    else:
-        compare = mx.allclose if tolerance else mx.array_equal
-        assert compare(actual, expected, **tolerance).item()
+    comparisons = []
+
+    def collect(actual, expected):
+        if isinstance(actual, dict):
+            assert actual.keys() == expected.keys()
+            for key in actual:
+                collect(actual[key], expected[key])
+        elif isinstance(actual, (list, tuple)):
+            assert len(actual) == len(expected)
+            for a, b in zip(actual, expected):
+                collect(a, b)
+        elif actual is None or expected is None:
+            assert actual is expected
+        else:
+            compare = mx.allclose if tolerance else mx.array_equal
+            comparisons.append(compare(actual, expected, **tolerance))
+
+    collect(actual, expected)
+    mx.eval(comparisons)
+    for index, comparison in enumerate(comparisons):
+        assert comparison.item(), f"comparison {index}"
 
 
 def greedy(logits):
     return mx.argmax(logits, axis=-1)
 
 
-def generated(target, drafter=None, *, seed=41, temperature=0):
+def generated(target, drafter=None, *, seed=41, temperature=0, prefill_step_size=None):
     if seed is None:
         mx.random.seed(47)
     options = {} if drafter is None else dict(draft_model=drafter, draft_kind="dflash")
@@ -269,7 +1310,7 @@ def generated(target, drafter=None, *, seed=41, temperature=0):
             max_tokens=24 if seed is None else 12,
             temperature=temperature,
             seed=seed,
-            prefill_step_size=None,
+            prefill_step_size=prefill_step_size,
             **options,
         )
     ]
@@ -348,7 +1389,7 @@ def test_mtp_generation(family, failure, monkeypatch):
     assert drafter._round_appended == 0
 
 
-@parametrize("family", list(TINY_MODELS))
+@parametrize("family", ["qwen", "glm", "deepseek"])
 @parametrize("batch", [1, 2, 4])
 @parametrize("dtype", [mx.float32, mx.bfloat16])
 def test_verify_commit_matches_decode(family, batch, dtype):
@@ -387,20 +1428,23 @@ def test_verify_commit_matches_decode(family, batch, dtype):
     for retained in (1, 4, 3):
         tokens = mx.broadcast_to(mx.array([[4, 5, 6, 7]]), (batch, 4))
         oracle = deepcopy(reference)
+        accepted = None
         hidden_steps, logit_steps = [], []
         for i in range(4):
             hidden, logits, transaction = verify(tokens[:, i : i + 1], oracle)
             hidden_steps.append(hidden)
             logit_steps.append(logits)
             transaction.commit([1] * batch)
+            if i + 1 == retained:
+                accepted = deepcopy(oracle)
         hidden, logits, transaction = verify(tokens, actual)
         compare(hidden, mx.concatenate(hidden_steps, 1))
         compare(logits, mx.concatenate(logit_steps, 1))
         equal(greedy(logits), greedy(mx.concatenate(logit_steps, 1)))
         transaction.commit([retained] * batch)
-        for i in range(retained):
-            _, _, transaction = verify(tokens[:, i : i + 1], reference)
-            transaction.commit([1] * batch)
+        # Reuse the independent one-token oracle at the accepted prefix.
+        # Replaying that prefix again would perform the same verifier calls.
+        reference = accepted
         probe = mx.full((batch, 1), 20)
         compare(model(probe, cache=reference).logits, model(probe, cache=actual).logits)
 
@@ -582,6 +1626,221 @@ def test_round_commit_close_and_abort(kind, batch, token, failure):
     offset = caches[1].offset
     equal(mx.array(offset).reshape(-1), mx.array([2 + retained] * batch))
     generator.close()
+
+
+def thinking_criteria(budget, *, enabled=True, preopened=True):
+    tokenizer = NS(
+        encode=lambda text, **kw: [{"<think>": 1, "\n": 2, "</think>": 3}[text]]
+    )
+    return ThinkingBudgetCriteria(
+        tokenizer,
+        budget,
+        thinking_start_token="<think>",
+        enable_thinking=enabled,
+        prompt_preopens_thinking=preopened,
+    )
+
+
+def test_thinking_budget_uniform_truncation_counts_only_retained_tokens():
+    criteria = [thinking_criteria(1), thinking_criteria(5)]
+    assert common._apply_thinking_budget(
+        [7, 7], [list(range(50, 58))] * 2, criteria, [0, 1], uniform=True
+    ) == ([2, 2], [[50, 51, 2], [50, 51, 52]])
+    assert criteria[1].thinking_token_count == 3
+    assert criteria[1].pop_forced_token_id() is None
+
+    # The first row's pending closing token shortens the second row again.
+    assert common._apply_thinking_budget(
+        [4, 4], [list(range(53, 58))] * 2, criteria, [0, 1], uniform=True
+    ) == ([0, 0], [[3], [53]])
+    assert not criteria[0].in_thinking
+    assert criteria[1].thinking_token_count == 4
+    assert criteria[1].pop_forced_token_id() is None
+
+    # The remaining row closes only after spending its own retained budget.
+    assert common._apply_thinking_budget([3], [[54, 55, 56, 57]], criteria, [1]) == (
+        [2],
+        [[54, 55, 2]],
+    )
+    assert common._apply_thinking_budget([1], [[56, 57]], criteria, [1]) == (
+        [0],
+        [[3]],
+    )
+    assert not criteria[1].in_thinking
+
+
+@parametrize("kind", ["mtp", "dflash", "eagle3"])
+@parametrize("batch,uniform", [(1, False), (2, False), (2, True)])
+@parametrize(
+    "budget,token,enabled",
+    [
+        (0, 4, True),
+        (2, 4, True),
+        (20, 4, True),
+        (0, 3, True),
+        (0, 2, True),
+        (0, 4, False),
+    ],
+)
+@parametrize("greedy_sampling", [True, False])
+def test_thinking_budget_rounds(
+    kind, batch, uniform, budget, token, enabled, greedy_sampling
+):
+    target = TransactionTarget(token)
+    target.requires_uniform_batch_acceptance = uniform
+    drafter = TransactionDrafter()
+    drafter.config.block_size = 5
+    caches = [ArraysCache(1), BatchKVCache([0] * batch) if batch > 1 else KVCache()]
+    caches[0][0] = mx.zeros((batch, 1))
+    initial = mx.zeros((batch, 1, 2, 1))
+    caches[1].update_and_fetch(initial, initial)
+    criteria = [
+        thinking_criteria(budget + row * 3, enabled=enabled) for row in range(batch)
+    ]
+    expected = []
+    references = []
+    for row in range(batch):
+        reference = thinking_criteria(budget + row * 3, enabled=enabled)
+        tokens = [token]
+        reference(token)
+        for _ in range(11):
+            forced = reference.pop_forced_token_id()
+            next_token = token if forced is None else forced
+            tokens.append(next_token)
+            reference(next_token)
+        expected.append(tokens)
+        references.append(reference)
+
+    rounds = getattr(speculative, f"_{kind}_rounds" + ("_batch" if batch > 1 else ""))
+    options = dict(
+        first_bonus=token if batch == 1 else mx.full((batch,), token, dtype=mx.int32),
+        max_tokens=12,
+        sampler=greedy,
+        greedy_sampling=greedy_sampling,
+        draft_block_size=5,
+        thinking_budget_criteria=criteria[0] if batch == 1 else criteria,
+    )
+    if kind == "mtp":
+        options["shared_kv_states"] = {}
+    actual = [[token] for _ in range(batch)]
+    iterator = rounds(target, drafter, caches, mx.zeros((batch, 1, 4)), **options)
+    for tokens, _ in iterator:
+        for row, value in enumerate([tokens] if batch == 1 else tokens):
+            if value is not None:
+                actual[row].append(value)
+    assert actual == expected
+    for state, reference in zip(criteria, references):
+        assert state.in_thinking == reference.in_thinking
+        assert state.thinking_token_count == reference.thinking_token_count
+
+
+@parametrize("kind", ["mtp", "dflash", "eagle3"])
+@parametrize("budget", [0, 2])
+def test_thinking_budget_trims_cache_before_forced_bonus(kind, budget):
+    target, drafter = TransactionTarget(4), TransactionDrafter()
+    drafter.config.block_size = 5
+    caches = [ArraysCache(1), KVCache()]
+    caches[0][0] = mx.zeros((1, 1))
+    initial = mx.zeros((1, 1, 2, 1))
+    caches[1].update_and_fetch(initial, initial)
+    options = dict(
+        first_bonus=4,
+        max_tokens=12,
+        sampler=greedy,
+        draft_block_size=5,
+        thinking_budget_criteria=thinking_criteria(budget),
+    )
+    if kind == "mtp":
+        options["shared_kv_states"] = {}
+    iterator = getattr(speculative, f"_{kind}_rounds")(
+        target, drafter, caches, mx.zeros((1, 1, 4)), **options
+    )
+    assert next(iterator)[0] == (2 if budget == 0 else 4)
+    # The forced newline is the uncached bonus. Only the preceding tokens
+    # (including the old bonus) may remain in either cache.
+    assert drafter.accept_lens == [budget]
+    assert caches[1].offset == 2 + budget + 1
+    assert caches[0][0].item() == budget + 1
+    iterator.close()
+
+
+def test_thinking_budget_tracks_generated_opening_and_filtered_rows():
+    states = [
+        thinking_criteria(0, preopened=False),
+        thinking_criteria(1, preopened=False),
+    ]
+    for state, token in zip(states, [4, 1]):
+        state(token)
+    counts, rows = common._apply_thinking_budget([3], [[4, 4, 4, 4]], states, [1])
+    assert counts == [2] and rows == [[4, 4, 2]]
+    assert states[0].thinking_token_count == 0
+    counts, rows = common._apply_thinking_budget([2], [[4, 4, 4]], states, [1])
+    assert counts == [0] and rows == [[3]]
+    assert not states[1].in_thinking
+
+
+@parametrize("batch", [False, True])
+def test_thinking_budget_generation_matches_autoregressive(batch):
+    mx.random.seed(37)
+    target, drafter = dflash_target("dflash2"), dflash_drafter("dflash2")
+    results = []
+    for use_draft in (False, True):
+        options = (
+            dict(draft_model=drafter, draft_kind="dflash", draft_block_size=5)
+            if use_draft
+            else {}
+        )
+        if batch:
+            processor = NS(stopping_criteria=StoppingCriteria([99]))
+            generator = BatchGenerator(
+                target.language_model,
+                processor,
+                max_tokens=16,
+                greedy_sampling=True,
+                **options,
+            )
+            try:
+                prompts = [[4, 5, 6], [7, 8]]
+                uids = generator.insert(
+                    prompts,
+                    prompt_kwargs=[
+                        target.get_input_embeddings(mx.array([ids])).to_dict()
+                        for ids in prompts
+                    ],
+                    thinking_budget_criteria=[
+                        thinking_criteria(0),
+                        thinking_criteria(4),
+                    ],
+                )
+                tokens = {uid: [] for uid in uids}
+                while generator.has_work:
+                    _, responses = generator.next()
+                    for response in responses:
+                        if response.token is not None:
+                            tokens[response.uid].append(response.token)
+                results.append(list(tokens.values()))
+            finally:
+                generator.close()
+        else:
+            criteria = thinking_criteria(2)
+            tokens = []
+            for token, _ in generate_step(
+                mx.array([[4, 5, 6]]),
+                target,
+                None,
+                None,
+                max_tokens=16,
+                temperature=0,
+                thinking_budget_criteria=criteria,
+                **options,
+            ):
+                tokens.append(token)
+                if not use_draft:
+                    criteria(token)
+            results.append([tokens])
+    assert results[0] == results[1]
+    assert all(3 in row for row in results[1])
+    assert drafter.draft_lens
 
 
 def test_acceptance_walk_and_budgets():
@@ -1510,7 +2769,8 @@ def test_padded_prefill_chunks(padding):
         assert caches[1].left_padding.tolist() == expected_padding
 
 
-def test_qwen3_5_cancelled_prefill_row_preserves_survivor_output():
+@parametrize("chunk_size", [1, 3])
+def test_qwen3_5_cancelled_prefill_row_preserves_survivor_output(chunk_size):
     lm, _ = language("qwen")
     model = lm.model
     cache = [ArraysCache(2, left_padding=[5, 0]), BatchKVCache([5, 0])]
@@ -1519,13 +2779,69 @@ def test_qwen3_5_cancelled_prefill_row_preserves_survivor_output():
         layer_cache.filter(mx.array([0]))
 
     singleton_cache = [ArraysCache(2), KVCache()]
-    actual = model(mx.array([[0, 0, 4]]), cache=cache)
+    pending = mx.array([[0, 0, 4]])
+    for start in range(0, pending.shape[1], chunk_size):
+        actual = model(pending[:, start : start + chunk_size], cache=cache)
     expected = model(mx.array([[4]]), cache=singleton_cache)
     assert mx.array_equal(actual[:, -1:], expected).item()
 
     actual = model(mx.array([[5]]), cache=cache)
     expected = model(mx.array([[5]]), cache=singleton_cache)
     assert mx.array_equal(actual, expected).item()
+
+
+def test_mtp_batch_filter_keeps_survivor_rope_deltas():
+    """A finished row's M-RoPE delta must leave the batch with its row: the
+    continuous-batching filter drops the row from the caches and the drafter,
+    and the target's stored per-row deltas are sliced with ``[:batch_size]``
+    on the next verify, so an unfiltered store hands a surviving row the
+    finished row's position offset. The survivor must keep its own delta and
+    match the plain autoregressive continuation."""
+
+    def build():
+        mx.random.seed(23)
+        lm, cfg = language("qwen", inference=True)
+        lm.eval()
+        return lm, cfg
+
+    prompt = mx.array([[1, 5, 2, 7], [1, 5, 2, 7]])
+    model, config = build()
+    drafter = mtp_drafter("qwen", config)
+    drafter.eval()
+    caches = [ArraysCache(2, left_padding=[0, 0]), BatchKVCache([0, 0])]
+    out = model(prompt, cache=caches, return_hidden=True, return_shared_kv=True)
+    first = greedy(out.logits[:, -1])
+    # distinct per-row deltas, as images of different grid sizes would leave
+    model._rope_deltas = mx.array([[0], [1000]], dtype=mx.int32)
+    model._position_ids = None
+    rounds = mtp._mtp_rounds_batch(
+        model,
+        drafter,
+        caches,
+        out.hidden_states[-1],
+        {},
+        prompt_tokens=prompt,
+        first_bonus=first,
+        max_tokens=8,
+        sampler=greedy,
+        draft_block_size=4,
+        greedy_sampling=True,
+        stop_check=lambda row, _token: row == 0,
+    )
+    survivor = [first[1].item()]
+    survivor += [tokens[1] for tokens, _ in rounds if tokens[1] is not None]
+    assert model._rope_deltas.tolist() == [[1000]]
+
+    reference_model, _ = build()
+    cache = reference_model.make_cache()
+    token = greedy(reference_model(prompt[1:2], cache=cache).logits[:, -1])
+    reference_model._rope_deltas = mx.array([[1000]], dtype=mx.int32)
+    reference_model._position_ids = None
+    reference = [token.item()]
+    for _ in range(7):
+        token = greedy(reference_model(token[:, None], cache=cache).logits[:, -1])
+        reference.append(token.item())
+    assert survivor == reference
 
 
 @parametrize(
@@ -2346,6 +3662,11 @@ def test_filter_batch_keeps_padding_and_positions():
 def test_speculative_dispatch_errors_and_hidden_state():
     with pytest.raises(ValueError):
         speculative.get_speculative_rounds_batch("nope")
+    for kind in ("eagle3", "nope"):
+        with pytest.raises(ValueError, match="Shared speculative batches"):
+            speculative.make_speculative_batch(
+                None, None, [], None, draft_kind=kind, first_bonus=None, sampler=None
+            )
     hidden = [mx.zeros((1, 1, 4)), mx.ones((1, 1, 4))]
     assert (
         speculative.speculative_hidden_state("mtp", NS(hidden_states=hidden))

@@ -18,7 +18,7 @@ from transformers.image_utils import (
     ImageInput,
     infer_channel_dimension_format,
 )
-from transformers.processing_utils import ProcessorMixin
+from transformers.processing_utils import ImagesKwargs, ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 from transformers.video_processing_utils import BaseVideoProcessor
 
@@ -286,6 +286,16 @@ def _to_numpy_image(img) -> np.ndarray:
     return arr
 
 
+class Qwen3VLImageProcessorKwargs(ImagesKwargs, total=False):
+    min_pixels: int
+    max_pixels: int
+    patch_size: int
+    temporal_patch_size: int
+    merge_size: int
+    resized_height: int
+    resized_width: int
+
+
 class Qwen3VLImageProcessor(ImageProcessingMixin):
     """Numpy port of Qwen2/3-VL image processor (torch-free).
 
@@ -297,6 +307,11 @@ class Qwen3VLImageProcessor(ImageProcessingMixin):
     """
 
     model_input_names = ["pixel_values", "image_grid_thw"]
+    valid_kwargs = Qwen3VLImageProcessorKwargs
+
+    @property
+    def size(self):
+        return {"shortest_edge": self.min_pixels, "longest_edge": self.max_pixels}
 
     def __init__(
         self,

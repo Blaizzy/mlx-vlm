@@ -335,3 +335,42 @@ def test_existing_orpo_pipeline_prints_train_and_validation_metrics(tmp_path, ca
     assert "train_policy_chosen_logps=" in output
     assert "val_policy_chosen_logps=" in output
     assert (tmp_path / "adapters.safetensors").is_file()
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_public_orpo_trains_both_dataset_formats_through_shared_engine(
+    legacy, tmp_path
+):
+    from mlx_vlm.trainer import ORPOTrainingArgs, train_orpo
+
+    sequence = {
+        "input_ids": mx.array([[1, 2, 3]]),
+        "attention_mask": mx.ones((1, 3)),
+        "completion_mask": mx.array([[0, 1, 1]]),
+    }
+    if legacy:
+        rows = [
+            {
+                f"{candidate}_{key}": value
+                for candidate in ("chosen", "rejected")
+                for key, value in sequence.items()
+            }
+        ]
+    else:
+        rows = [{"chosen": sequence, "rejected": sequence}]
+    config = LegacyORPOTrainingArgs if legacy else ORPOTrainingArgs
+    args = config(
+        iters=1,
+        batch_size=1,
+        steps_per_report=1,
+        steps_per_save=1,
+        steps_per_eval=1,
+        val_batches=1,
+        adapter_file=str(tmp_path / "adapters.safetensors"),
+    )
+    model = TinyLM()
+    before = mx.array(model.projection.weight)
+    metrics = train_orpo(model, optim.Adam(learning_rate=0.01), rows, rows, args=args)
+    assert math.isfinite(metrics["train_loss"])
+    assert (tmp_path / "adapters.safetensors").is_file()
+    assert not mx.array_equal(before, model.projection.weight).item()

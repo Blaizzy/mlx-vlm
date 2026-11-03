@@ -27,8 +27,9 @@ def evaluate_orpo(
     *,
     beta: float = 0.1,
     eps: float = 1e-6,
+    mtp_loss_weight: float = 0.0,
 ) -> float:
-    objective = partial(orpo_loss, beta=beta, eps=eps)
+    objective = partial(orpo_loss, beta=beta, eps=eps, mtp_loss_weight=mtp_loss_weight)
     return evaluate_preference_vlm(
         model,
         dataset,
@@ -84,7 +85,9 @@ def make_task(
     """Bind the ORPO objective to the shared preference task."""
     from mlx_vlm.trainer.vlm.preference.trainer import make_task as preference_task
 
-    objective = partial(orpo_loss, beta=args.beta, eps=args.eps)
+    objective = partial(
+        orpo_loss, beta=args.beta, eps=args.eps, mtp_loss_weight=args.mtp_loss_weight
+    )
 
     return preference_task(
         model, args, processing_class, dataset_config, loss_fn=objective

@@ -1,39 +1,21 @@
 # Copyright © 2026 MLX-VLM
 
-import time
 from dataclasses import dataclass, field
-from functools import partial
 from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
-from mlx.nn.utils import average_gradients
 from mlx.utils import tree_map
-from tqdm import tqdm
 
-from ...common.metrics import (
-    MetricAccumulator,
-    format_metric_report,
-    report_loss_metrics,
-)
-from ...core import Colors, grad_checkpoint, save_adapter
-from ..sft.runtime import vlm_batch_metrics
-from ..sft.trainer import (
-    TrainingArgs,
-    _collate_arrays,
-    _resolve_adapter_file,
-    _squeeze_leading_batch_dim,
-)
+from ..sft.runtime import _completion_mask, vlm_batch_metrics
+from ..sft.trainer import TrainingArgs
 
 
 @dataclass
 class ORPOTrainingArgs(TrainingArgs):
     beta: float = field(
         default=0.1,
-        metadata={
-            "help": "Exponential moving average parameter for reward normalization"
-        },
+        metadata={"help": "Weight of the ORPO preference objective"},
     )
     eps: float = field(
         default=1e-8,
@@ -42,60 +24,18 @@ class ORPOTrainingArgs(TrainingArgs):
 
 
 def get_logps(model, batch, train_on_completions=False, assistant_id=77091):
-    pixel_values = batch["pixel_values"]
-    input_ids = batch["input_ids"]
-    attention_mask = batch["attention_mask"]
+    """Keep the historical scoring signature over shared response scoring."""
+    from ..preference.loss import sequence_logps
 
-    batch_size, seq_length = input_ids.shape
-
-    shifted_input_ids = input_ids[:, :-1]
-    shifted_attention_mask = attention_mask[:, :-1]
-    targets = input_ids[:, 1:]
-
-    kwargs = {
-        k: v
-        for k, v in batch.items()
-        if k not in ["input_ids", "pixel_values", "attention_mask"]
-    }
-
-    outputs = model(shifted_input_ids, pixel_values, shifted_attention_mask, **kwargs)
-    logits = outputs.logits.astype(mx.float32)
-
-    def align_logits_with_targets(logits, targets):
-        if logits.shape[1] < targets.shape[1]:
-            pad_length = targets.shape[1] - logits.shape[1]
-            pad_width = ((0, 0), (0, pad_length), (0, 0))
-            return mx.pad(logits, pad_width, mode="constant", constant_values=-100)
-        if logits.shape[1] > targets.shape[1]:
-            return logits[:, -targets.shape[1] :, :]
-        return logits
-
-    logits = align_logits_with_targets(logits, targets)
-
-    lengths = mx.sum(shifted_attention_mask, axis=1)
-    lengths = mx.minimum(lengths, shifted_input_ids.shape[1])
-    steps = mx.arange(shifted_input_ids.shape[1])[None, :]
-    base_mask = steps < lengths[:, None]
-
-    if train_on_completions:
-        assistant_response_index = np.full((batch_size,), -1, dtype=np.int32)
-        input_ids_np = np.array(input_ids)
-        for row_idx, row in enumerate(input_ids_np):
-            positions = np.where(row == assistant_id)[0]
-            if positions.size > 0:
-                assistant_response_index[row_idx] = positions[0]
-
-        assistant_mask = steps <= mx.array(assistant_response_index).reshape(-1, 1)
-        mask = mx.where(assistant_mask, mx.zeros_like(base_mask), base_mask)
-    else:
-        mask = base_mask
-
-    log_probs = -nn.losses.cross_entropy(logits, targets, reduction="none")
-    mask_f = mask.astype(log_probs.dtype)
-    token_counts = mx.maximum(mask_f.sum(-1), 1)
-    logp_seq_avg = (log_probs * mask_f).sum(-1) / token_counts
-    logits_mean = logits.sum() / mx.maximum(mask_f.sum(), 1)
-    return logp_seq_avg, logits_mean
+    completion = (
+        _completion_mask(batch, assistant_id)
+        if train_on_completions
+        else batch["attention_mask"]
+    )
+    scores, counts, logits = sequence_logps(
+        model, {**batch, "completion_mask": completion}, length_normalize=True
+    )
+    return scores, logits.sum() / mx.maximum(counts.sum(), 1)
 
 
 def orpo_loss(
@@ -105,141 +45,114 @@ def orpo_loss(
     rejected_logits_mean,
     chosen_masks,
     rejected_masks,
-    beta: float = 0.1,
-    eps: float = 1e-8,
+    beta=0.1,
+    eps=1e-8,
 ):
-    # ORPO uses log-odds ratio: log(p/(1-p))_chosen - log(p/(1-p))_rejected.
-    # Clamp to keep exp/log1p numerically stable near probability 1.
-    chosen_logps = mx.minimum(chosen_logps, -eps)
-    rejected_logps = mx.minimum(rejected_logps, -eps)
+    """Adapt the historical score-based API to the shared ORPO objective."""
+    from ...losses.preference import _log1mexp, orpo_objective
 
-    chosen_log_odds = chosen_logps - mx.log1p(-mx.exp(chosen_logps))
-    rejected_log_odds = rejected_logps - mx.log1p(-mx.exp(rejected_logps))
-    log_odds_ratio = chosen_log_odds - rejected_log_odds
-
-    # ORPO objective: chosen NLL anchor + preference odds-ratio term.
-    sft_term = -chosen_logps
-    pref_term = -nn.log_sigmoid(log_odds_ratio)
-    loss = sft_term + beta * pref_term
-
-    # Track rewards from log-odds (higher is better).
-    chosen_reward = beta * chosen_log_odds
-    rejected_reward = beta * rejected_log_odds
-
-    num_tokens = chosen_masks.sum() + rejected_masks.sum()
-
-    metrics = {
-        "accuracies": mx.mean((log_odds_ratio > 0).astype(mx.float32)),
-        "margins": mx.mean(chosen_reward - rejected_reward),
-        "policy_chosen_logps": mx.mean(chosen_logps),
-        "policy_rejected_logps": mx.mean(rejected_logps),
-        "sft_term": mx.mean(sft_term),
-        "orpo_pref_term": mx.mean(pref_term),
-        "chosen_logits_mean": chosen_logits_mean,
-        "rejected_logits_mean": rejected_logits_mean,
-    }
-
+    losses, metrics = orpo_objective(chosen_logps, rejected_logps, beta=beta, eps=eps)
     metrics.update(
-        weight=mx.array(loss.size, dtype=mx.int32),
-        num_pairs=mx.array(loss.size, dtype=mx.int32),
-        num_tokens=num_tokens,
-        chosen_reward=mx.mean(chosen_reward),
-        rejected_reward=mx.mean(rejected_reward),
+        accuracies=metrics["preference_accuracy"],
+        margins=beta * metrics["odds_margin"],
+        sft_term=metrics["chosen_nll"],
+        orpo_pref_term=metrics["preference_loss"],
+        chosen_reward=mx.mean(beta * (chosen_logps - _log1mexp(chosen_logps, eps))),
+        rejected_reward=mx.mean(
+            beta * (rejected_logps - _log1mexp(rejected_logps, eps))
+        ),
+        policy_chosen_logps=metrics["chosen_logps"],
+        policy_rejected_logps=metrics["rejected_logps"],
+        chosen_logits_mean=chosen_logits_mean,
+        rejected_logits_mean=rejected_logits_mean,
+        num_tokens=chosen_masks.sum() + rejected_masks.sum(),
     )
-    return mx.mean(loss), metrics
-
-
-def _pad_and_collate(items, prefix, max_seq_length):
-    """Pad and collate input_ids, attention_mask, pixel_values for a given prefix."""
-    id_key = f"{prefix}_input_ids"
-    mask_key = f"{prefix}_attention_mask"
-    pv_key = f"{prefix}_pixel_values"
-
-    lengths = [
-        min(
-            np.array(_squeeze_leading_batch_dim(x[id_key])).reshape(-1).shape[0],
-            max_seq_length,
-        )
-        for x in items
-    ]
-    max_len = min(max(lengths), max_seq_length)
-    pad_to = 32
-    padded_len = 1 + pad_to * ((max_len + pad_to - 1) // pad_to)
-    padded_len = min(padded_len, max_seq_length)
-
-    input_ids_batch = np.zeros((len(items), padded_len), dtype=np.int32)
-    attention_mask_batch = np.zeros((len(items), padded_len), dtype=np.int32)
-
-    for i, item in enumerate(items):
-        arr = np.array(_squeeze_leading_batch_dim(item[id_key])).reshape(-1)
-        L = min(len(arr), padded_len)
-        input_ids_batch[i, :L] = arr[:L]
-
-        if mask_key in item:
-            mask = np.array(_squeeze_leading_batch_dim(item[mask_key])).reshape(-1)
-            attention_mask_batch[i, :L] = mask[:L]
-        else:
-            attention_mask_batch[i, :L] = 1
-
-    pixel_values_batch = None
-    if pv_key in items[0] and items[0][pv_key] is not None:
-        pixel_values_batch = _collate_arrays(
-            [_squeeze_leading_batch_dim(item[pv_key]) for item in items]
-        )
-
-    result = {
-        "input_ids": mx.array(input_ids_batch),
-        "attention_mask": mx.array(attention_mask_batch),
-        "pixel_values": pixel_values_batch,
-    }
-
-    skip = {id_key, mask_key, pv_key}
-    for k in items[0]:
-        if k.startswith(f"{prefix}_") and k not in skip:
-            vals = [_squeeze_leading_batch_dim(item[k]) for item in items]
-            if isinstance(vals[0], mx.array):
-                try:
-                    result[k.removeprefix(f"{prefix}_")] = _collate_arrays(vals)
-                except Exception:
-                    result[k.removeprefix(f"{prefix}_")] = vals[0]
-            else:
-                result[k.removeprefix(f"{prefix}_")] = vals[0]
-
-    return result
+    return mx.mean(losses), metrics
 
 
 def iterate_batches(dataset, batch_size, max_seq_length, train=False):
-    indices = list(range(len(dataset)))
-    if len(dataset) < batch_size:
-        raise ValueError(f"Dataset must have at least {batch_size} examples")
+    """Adapt historical prefixed rows to the shared paired batch iterator."""
+    from ..preference.dataset import iterate_vlm_preference_batches
 
-    offset, step = mx.distributed.init().rank(), mx.distributed.init().size()
-    if batch_size % step != 0:
-        raise ValueError("Batch size must be divisible by number of workers")
+    class PairedRows:
+        config = getattr(dataset, "config", None)
 
-    batch_indices = [
-        indices[i + offset : i + offset + batch_size : step]
-        for i in range(0, len(indices) - batch_size + 1, batch_size)
-    ]
+        def __len__(self):
+            return len(dataset)
 
-    while True:
-        order = (
-            np.random.permutation(len(batch_indices))
-            if train
-            else range(len(batch_indices))
-        )
-        for b in order:
-            items = [dataset[idx] for idx in batch_indices[b]]
-
-            chosen_batch = _pad_and_collate(items, "chosen", max_seq_length)
-            rejected_batch = _pad_and_collate(items, "rejected", max_seq_length)
-
-            yield {
-                "chosen": chosen_batch,
-                "rejected": rejected_batch,
+        def __getitem__(self, index):
+            row = dataset[index]
+            if "chosen" in row and "rejected" in row:
+                return row
+            return {
+                candidate: {
+                    key.removeprefix(candidate + "_"): value
+                    for key, value in row.items()
+                    if key.startswith(candidate + "_")
+                }
+                for candidate in ("chosen", "rejected")
             }
-        if not train:
-            break
+
+    return iterate_vlm_preference_batches(
+        PairedRows(), batch_size, max_seq_length, train=train
+    )
+
+
+def _legacy_task(args, loss_fn, train_on_completions, assistant_id):
+    """Adapt historical batches and score-based losses to the common engine."""
+    from ...common.task import TrainingTask
+    from ..sft.mtp import add_mtp_loss
+    from ..sft.runtime import _enable_vlm_gradient_checkpointing, _save_vlm_weights
+
+    def objective(model, batch):
+        chosen, rejected = batch["chosen"], batch["rejected"]
+        chosen_logps, chosen_logits = get_logps(
+            model, chosen, train_on_completions, assistant_id
+        )
+        rejected_logps, rejected_logits = get_logps(
+            model, rejected, train_on_completions, assistant_id
+        )
+        loss, metrics = loss_fn(
+            chosen_logps,
+            chosen_logits,
+            rejected_logps,
+            rejected_logits,
+            chosen["attention_mask"],
+            rejected["attention_mask"],
+            beta=args.beta,
+            **({"eps": args.eps} if loss_fn is orpo_loss else {}),
+        )
+        metrics.update(vlm_batch_metrics(batch, model))
+        mask = chosen["attention_mask"][:, 1:]
+        if train_on_completions:
+            mask = mx.logical_and(mask, _completion_mask(chosen, assistant_id)[:, 1:])
+        return add_mtp_loss(
+            model, chosen, loss, metrics, args.mtp_loss_weight, loss_mask=mask
+        )
+
+    return TrainingTask(
+        loss=objective,
+        batches=lambda rows, train=False, seed=None: iterate_batches(
+            rows, args.batch_size, args.max_seq_length, train=train
+        ),
+        checkpoint=_enable_vlm_gradient_checkpointing,
+        save_weights=_save_vlm_weights,
+        unit="preference_pairs",
+    )
+
+
+def _shared_args(args):
+    from dataclasses import fields
+
+    from .config import ORPOTrainingArgs as SharedArgs
+
+    return SharedArgs(
+        **{
+            field.name: getattr(args, field.name)
+            for field in fields(SharedArgs)
+            if hasattr(args, field.name)
+        }
+    )
 
 
 def evaluate_orpo(
@@ -252,68 +165,21 @@ def evaluate_orpo(
     train_on_completions=False,
     assistant_id=77091,
     return_metrics=False,
+    mtp_loss_weight=0.0,
 ):
-    """
-    Evaluate the model on validation dataset.
-    """
-    model.eval()
-    accumulator = MetricAccumulator()
+    """Evaluate historical preference batches with the common engine."""
+    from ...common.engine import evaluate
 
-    index_iterator = iter(range(num_batches)) if num_batches != -1 else iter(int, 1)
-
-    for _, batch in tqdm(
-        zip(
-            index_iterator,
-            iterate_batches(
-                dataset=dataset,
-                batch_size=batch_size,
-                max_seq_length=max_seq_length,
-            ),
-        ),
-        desc="Calculating loss...",
-        total=(
-            min(len(dataset) // batch_size, num_batches)
-            if num_batches != -1
-            else len(dataset) // batch_size
-        ),
-    ):
-        chosen_batch = batch["chosen"]
-        rejected_batch = batch["rejected"]
-
-        chosen_logps, chosen_logits_mean = get_logps(
-            model,
-            chosen_batch,
-            train_on_completions=train_on_completions,
-            assistant_id=assistant_id,
+    args = _shared_args(
+        ORPOTrainingArgs(
+            batch_size=batch_size,
+            val_batches=num_batches,
+            max_seq_length=max_seq_length,
+            mtp_loss_weight=mtp_loss_weight,
         )
-        rejected_logps, rejected_logits_mean = get_logps(
-            model,
-            rejected_batch,
-            train_on_completions=train_on_completions,
-            assistant_id=assistant_id,
-        )
-
-        losses, metrics = loss_fn(
-            chosen_logps,
-            chosen_logits_mean,
-            rejected_logps,
-            rejected_logits_mean,
-            chosen_batch["attention_mask"],
-            rejected_batch["attention_mask"],
-            beta=0.1,
-        )
-
-        metrics.update(vlm_batch_metrics(batch, model))
-        accumulator.add(losses, metrics)
-        mx.eval(accumulator.state())
-
-    values = accumulator.compute()
-    if values["weight"] <= 0:
-        raise ValueError("Evaluation produced no preference pairs.")
-    info = report_loss_metrics(values, "val")
-    mx.clear_cache()
-
-    return info if return_metrics else info["val_loss"]
+    )
+    task = _legacy_task(args, loss_fn, train_on_completions, assistant_id)
+    return evaluate(model, dataset, task, args, return_metrics=return_metrics)
 
 
 def train_orpo(
@@ -321,186 +187,64 @@ def train_orpo(
     optimizer,
     train_dataset,
     val_dataset=None,
-    args: TrainingArgs = TrainingArgs(),
+    args=None,
     loss_fn=orpo_loss,
     train_on_completions=False,
     assistant_id=77091,
+    *,
+    training_callback=None,
+    seed=None,
 ):
+    """Train through the common engine, adapting historical calls when needed.
+
+    Modern ORPOTrainingArgs use paired batches from vlm.preference.dataset.
+    The historical args class retains support for prefixed dataset fields and
+    custom score-based losses.
     """
-    Main training function for vision-language models.
-    """
-    # Set memory limit if using Metal
-    if mx.metal.is_available():
-        mx.set_wired_limit(mx.metal.device_info()["max_recommended_working_set_size"])
+    from ...common.engine import train
+    from .config import ORPOTrainingArgs as SharedArgs
+    from .runtime import train_orpo as train_shared
 
-    print(f"{Colors.HEADER}Starting training..., iterations: {args.iters}{Colors.ENDC}")
-
-    # Initialize distributed training
-    world = mx.distributed.init()
-    world_size = world.size()
-    rank = world.rank()
-    if world_size > 1:
-        print(f"Node {rank} of {world_size}")
-
-    if val_dataset is None and rank == 0:
-        print(
-            f"{Colors.OKBLUE}No validation dataset provided — training will run without validation.{Colors.ENDC}"
+    if args is None or isinstance(args, SharedArgs):
+        if loss_fn is not orpo_loss or train_on_completions or assistant_id != 77091:
+            raise ValueError(
+                "Legacy loss/masking options require legacy ORPOTrainingArgs."
+            )
+        return train_shared(
+            model,
+            optimizer,
+            train_dataset,
+            val_dataset,
+            args,
+            training_callback=training_callback,
+            seed=seed,
         )
+    shared_args = _shared_args(args)
+    task = _legacy_task(shared_args, loss_fn, train_on_completions, assistant_id)
+    if args.grad_clip is not None:
 
-    adapter_file = _resolve_adapter_file(args)
+        def gradients(policy, compile):
+            compute = nn.value_and_grad(policy, task.loss)
 
-    # Enable gradient checkpointing if requested
-    if args.grad_checkpoint:
-        if hasattr(model, "layers"):
-            grad_checkpoint(model.layers[0])
-
-    # Compile the training step (like MLX-LM)
-    state = [model.state, optimizer.state, mx.random.state]
-
-    @partial(mx.compile, inputs=state, outputs=state)
-    def step(chosen_batch, rejected_batch):
-        def loss_fn_wrapper():
-            chosen_logps, chosen_logits_mean = get_logps(
-                model,
-                chosen_batch,
-                train_on_completions=train_on_completions,
-                assistant_id=assistant_id,
-            )
-            rejected_logps, rejected_logits_mean = get_logps(
-                model,
-                rejected_batch,
-                train_on_completions=train_on_completions,
-                assistant_id=assistant_id,
-            )
-            losses, metrics = loss_fn(
-                chosen_logps,
-                chosen_logits_mean,
-                rejected_logps,
-                rejected_logits_mean,
-                chosen_batch["attention_mask"],
-                rejected_batch["attention_mask"],
-                beta=args.beta,
-            )
-            metrics.update(
-                vlm_batch_metrics(
-                    {"chosen": chosen_batch, "rejected": rejected_batch}, model
+            def clipped(*values):
+                result, grad = compute(*values)
+                return result, tree_map(
+                    lambda g: mx.clip(g, -args.grad_clip, args.grad_clip), grad
                 )
-            )
-            return losses, metrics
 
-        (lvalue, metrics), grad = nn.value_and_grad(model, loss_fn_wrapper)()
+            return clipped
 
-        # Gradient clipping
-        if args.grad_clip is not None:
-            grad = tree_map(lambda g: mx.clip(g, -args.grad_clip, args.grad_clip), grad)
-
-        # Average gradients for distributed training
-        grad = average_gradients(grad)
-
-        # Update model
-        optimizer.update(model, grad)
-
-        return lvalue, metrics
-
-    # Training metrics
-    model.train()
-    accumulator = MetricAccumulator()
-    steps = 0
-    trained_tokens = 0
-    train_time = 0
-
-    # Main training loop
-    for it, batch in zip(
-        range(1, args.iters + 1),
-        iterate_batches(
-            dataset=train_dataset,
-            batch_size=args.batch_size,
-            max_seq_length=args.max_seq_length,
-            train=True,
-        ),
-    ):
-        chosen_batch = batch["chosen"]
-        rejected_batch = batch["rejected"]
-        tic = time.perf_counter()
-
-        # Validation (only if a validation dataset is provided)
-        if val_dataset is not None and (
-            it == 1 or it % args.steps_per_eval == 0 or it == args.iters
-        ):
-            tic_val = time.perf_counter()
-            val_info = evaluate_orpo(
-                model=model,
-                dataset=val_dataset,
-                batch_size=args.batch_size,
-                num_batches=args.val_batches,
-                max_seq_length=args.max_seq_length,
-                loss_fn=loss_fn,
-                train_on_completions=train_on_completions,
-                assistant_id=assistant_id,
-                return_metrics=True,
-            )
-            model.train()
-            val_time = time.perf_counter() - tic_val
-
-            if rank == 0:
-                val_info.update(iteration=it, val_time=val_time)
-                print(format_metric_report(val_info, "Validation"), flush=True)
-
-            tic = time.perf_counter()
-
-        # Training step
-        lvalue, metrics = step(chosen_batch, rejected_batch)
-        mx.clear_cache()
-        accumulator.add(lvalue, metrics)
-        steps += 1
-        mx.eval(state, accumulator.state())
-        train_time += time.perf_counter() - tic
-
-        # Report training metrics
-        if it % args.steps_per_report == 0 or it == args.iters:
-            values = accumulator.compute()
-            n_tokens_total = values.get("num_tokens", values["weight"])
-            learning_rate = (
-                optimizer.learning_rate.item()
-                if hasattr(optimizer.learning_rate, "item")
-                else optimizer.learning_rate
-            )
-            trained_tokens += n_tokens_total
-            info = {
-                "iteration": it,
-                **report_loss_metrics(values, "train"),
-                "learning_rate": learning_rate,
-                "iterations_per_second": steps / max(train_time, 1e-8),
-                "tokens_per_second": n_tokens_total / max(train_time, 1e-8),
-                "trained_tokens": trained_tokens,
-                "peak_memory": mx.get_peak_memory() / 1e9,
-            }
-            if "num_processed_tokens" in values:
-                info["processed_tokens_per_second"] = values[
-                    "num_processed_tokens"
-                ] / max(train_time, 1e-8)
-            if rank == 0:
-                print(format_metric_report(info, "Training"), flush=True)
-            accumulator = MetricAccumulator()
-            steps, train_time = 0, 0
-
-        # Save checkpoint
-        if it % args.steps_per_save == 0 and rank == 0:
-            save_adapter(model, adapter_file)
-            checkpoint = adapter_file.parent / f"{it:07d}_adapters.safetensors"
-            save_adapter(model, checkpoint)
-            print(
-                f"{Colors.OKBLUE}Iter {it}: Saved adapter weights to "
-                f"{adapter_file} and {checkpoint}.{Colors.ENDC}",
-                flush=True,
-            )
-
-    # Save final weights
-    if rank == 0:
-        save_adapter(model, adapter_file)
-        print(
-            f"{Colors.OKGREEN}Saved final adapter weights to {adapter_file}.{Colors.ENDC}"
-        )
+        task.value_and_grad_factory = gradients
+    return train(
+        model,
+        optimizer,
+        train_dataset,
+        val_dataset,
+        shared_args,
+        task,
+        training_callback,
+        seed,
+    )
 
 
 @dataclass

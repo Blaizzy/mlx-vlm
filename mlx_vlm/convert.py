@@ -1,5 +1,6 @@
 import argparse
 import glob
+import json
 import shutil
 from pathlib import Path
 from typing import Callable, Optional, Union
@@ -29,6 +30,16 @@ QUANT_RECIPES = [
     "mixed_4_6",
     "mixed_4_8",
 ]
+
+
+def _copy_writable_file(src, dst):
+    """Copy cache contents without carrying read-only permissions into the export."""
+    src, dst = Path(src), Path(dst)
+    if dst.exists() and src.samefile(dst):
+        raise shutil.SameFileError(f"{src!s} and {dst!s} are the same file")
+    # A previous conversion may have left a read-only file at the destination.
+    dst.unlink(missing_ok=True)
+    return shutil.copyfile(src, dst)
 
 
 def _preserve_existing_deepseek_v4_quantization(
@@ -267,6 +278,19 @@ def _apply_awq_calibration(
     print(f"[INFO] AWQ scaling applied: {summary}")
 
 
+def _record_conversion_dtype(config: dict, dtype: str) -> None:
+    """Record the cast dtype without changing quantization declarations."""
+    config["dtype"] = dtype
+    for name, section in config.items():
+        if (
+            name.endswith("_config")
+            and name != "quantization_config"
+            and isinstance(section, dict)
+        ):
+            for key in section.keys() & {"dtype", "torch_dtype"}:
+                section[key] = dtype
+
+
 def convert(
     hf_path: str,
     mlx_path: str = "mlx_model",
@@ -309,21 +333,22 @@ def convert(
     quant_predicate = quant_predicate or base_quant_predicate
 
     if dtype is None:
-        dtype = config.get("torch_dtype", None)
+        dtype = config.get("dtype") or config.get("torch_dtype")
     if dtype is None and (text_config := config.get("text_config", None)):
         dtype = text_config.get("dtype", None)
     if dtype in MODEL_CONVERSION_DTYPES:
         print("[INFO] Using dtype:", dtype)
-        dtype = getattr(mx, dtype)
+        mlx_dtype = getattr(mx, dtype)
         cast_predicate = getattr(model, "cast_predicate", lambda _: True)
 
         def set_dtype(k, v):
             if cast_predicate(k) and mx.issubdtype(v.dtype, mx.floating):
-                return v.astype(dtype)
+                return v.astype(mlx_dtype)
             else:
                 return v
 
         target.update(tree_map_with_path(set_dtype, target.parameters()))
+        _record_conversion_dtype(config, dtype)
 
     if quantize and dequantize:
         raise ValueError("Choose either quantize or dequantize, not both.")
@@ -377,7 +402,7 @@ def convert(
             # Skip the index file - save_weights() already generated the correct one
             if Path(file).name == "model.safetensors.index.json":
                 continue
-            shutil.copy(file, mlx_path)
+            _copy_writable_file(file, mlx_path / Path(file).name)
 
     # Copy folders from the model path to the MLX path
     for item in model_path.iterdir():
@@ -385,7 +410,7 @@ def convert(
             dest = mlx_path / item.name
             if dest.exists():
                 shutil.rmtree(dest)
-            shutil.copytree(item, dest)
+            shutil.copytree(item, dest, copy_function=_copy_writable_file)
 
     # Not every remote-code processor inherits ProcessorMixin — Mage-VL's `MageVLProcessor`
     # deliberately does not ("We deliberately do NOT inherit transformers.ProcessorMixin"), so it
@@ -394,6 +419,31 @@ def convert(
     # files verbatim, which is what save_pretrained would have produced anyway.
     if hasattr(processor, "save_pretrained"):
         processor.save_pretrained(mlx_path)
+        # save_pretrained rebuilds tokenizer.json from the tokenizer class transformers picked,
+        # not from the source file. Qwen3.5-family checkpoints name Qwen2Tokenizer, which swaps in
+        # Qwen2's pre-tokenizer regex (no \p{M}) and decoder flags, so text with combining marks
+        # tokenizes differently from training (#2496). Keep the checkpoint's pipeline,
+        # but retain added tokens from the loaded processor: Transformers 5 stores
+        # them only in the saved tokenizer.json, including config-only added tokens.
+        source_tokenizer = model_path / "tokenizer.json"
+        if source_tokenizer.is_file():
+            destination_tokenizer = mlx_path / "tokenizer.json"
+            added_tokens = None
+            if destination_tokenizer.is_file():
+                added_tokens = json.loads(
+                    destination_tokenizer.read_text(encoding="utf-8")
+                ).get("added_tokens")
+            _copy_writable_file(source_tokenizer, destination_tokenizer)
+            if added_tokens is not None:
+                tokenizer_data = json.loads(
+                    destination_tokenizer.read_text(encoding="utf-8")
+                )
+                if tokenizer_data.get("added_tokens") != added_tokens:
+                    tokenizer_data["added_tokens"] = added_tokens
+                    destination_tokenizer.write_text(
+                        json.dumps(tokenizer_data, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
     else:
         # NOTE: no local `import shutil` here — convert.py already imports it at module scope,
         # and a function-local import would make the name local for the WHOLE function, unbinding
@@ -403,7 +453,7 @@ def convert(
             for pattern in ("*.json", "*.txt", "*.jinja", "*.model"):
                 for f in src.glob(pattern):
                     if f.name not in ("config.json", "model.safetensors.index.json"):
-                        shutil.copy2(f, Path(mlx_path) / f.name)
+                        _copy_writable_file(f, mlx_path / f.name)
         print("[INFO] processor lacks save_pretrained; copied processor files verbatim")
 
     save_config(config, config_path=mlx_path / "config.json")
@@ -511,7 +561,10 @@ def configure_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--dtype",
-        help="Type to save the parameter. Defaults to config.json's `torch_dtype` or the current model weights dtype",
+        help=(
+            "Type to save the parameter. Defaults to config.json's `dtype` or "
+            "`torch_dtype`, then `text_config.dtype`, or the current model weights dtype"
+        ),
         type=str,
         choices=MODEL_CONVERSION_DTYPES,
         default=None,

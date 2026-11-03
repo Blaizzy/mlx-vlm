@@ -48,22 +48,28 @@ without calibration.
 d1 supports `choice`, `score`, and `bool`; `noul` is a Boolean alias. Choice
 criteria map labels to descriptions or list labels; score criteria are an
 ordered list of 2 to 10 levels; Boolean criteria optionally describe `true` and
-`false`. Choice returns a label, score its expected level, and Boolean the
-probability of `true`; `confidence` and the score `legend` are in `metadata`.
+`false`, and other keys raise `ValueError`. Choice returns a label, score its
+expected level, and Boolean the probability of `true`; `confidence` and the
+score `legend` are in `metadata`.
 
 `images` is one image or a list of PIL images, paths, or URLs; files are
 turned upright by their EXIF orientation, PIL images are read as given. Each is
 first downscaled to at most 1024 × 1024 pixels in area, then tiled by the
 LFM2-VL processor. One question runs as a single pass. Several questions read the
 state and its images once: the shared prefix fills a cache that each question
-continues as its own row. `token_budget` (default 65536) bounds the padded
-tokens per batch of questions, prefix included. `usage.input_tokens` counts the
-prefix once plus each question's tokens.
+continues as its own row. A prompt or shared prefix over 2048 tokens is read in
+chunks of 2048 tokens, or of `token_budget` if that is smaller, which bounds the
+memory a long state takes. Questions run in batches of similar length, longest
+first: a batch takes no question under half the length of its longest, so one
+long question does not pad many short ones. `token_budget` (default 65536)
+bounds the padded tokens per batch of questions, prefix included.
+`usage.input_tokens` counts the prefix once plus each question's tokens.
 
 The checkpoint runs in bfloat16, which moves probabilities by up to a few
 hundredths, as in the PyTorch reference. In float32
 (`model.set_dtype(mx.float32)`) they match the reference to about 1e-5 on text;
 with images, the MLX image processor's resize differs slightly from
-torchvision's, which moves probabilities by up to about 1e-3.
-4-bit conversions shift probabilities further, by up to about 0.2 in parity
+torchvision's, which moves probabilities by up to about 5e-3 on yes/no questions
+and 1.6e-2 on questions with many options (POPE images, same top option).
+4-bit conversions shift probabilities further, by up to about 0.32 in parity
 checks.

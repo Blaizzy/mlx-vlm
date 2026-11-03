@@ -42,6 +42,34 @@ class FlexibleBaseModel(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+class ContinuationCheckpoint(BaseModel):
+    """Opaque stream position; clients return this object unchanged to resume."""
+
+    id: str = Field(min_length=1, max_length=64)
+    cursor: int = Field(ge=0, strict=True)
+    content: int = Field(ge=0, strict=True)
+    reasoning: int = Field(ge=0, strict=True)
+    responses: bool
+    idle_timeout_seconds: Optional[float] = Field(
+        None,
+        ge=0,
+        allow_inf_nan=False,
+        description="Idle lifetime after disconnection.",
+    )
+
+
+class ContinuationOptions(FlexibleBaseModel):
+    resumable: bool = Field(
+        False, description="Emit continuation checkpoints during streaming."
+    )
+    continuation: Optional[ContinuationCheckpoint] = Field(
+        None, description="Resume a saved stream on the same endpoint and tenant."
+    )
+    continue_final_message: bool = Field(
+        False, description="Continue the final assistant message as an open prefix."
+    )
+
+
 # OpenAI API Models
 
 
@@ -311,6 +339,15 @@ class ImageProcessingRequest(FlexibleBaseModel):
         description="Resize images before processing. Provide one integer for square or two dimensions.",
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_thinking_alias(cls, values):
+        if isinstance(values, dict) and values.get("enable_thinking") is None:
+            options = values.get("chat_template_kwargs")
+            if isinstance(options, dict) and "enable_thinking" in options:
+                values = {**values, "enable_thinking": options["enable_thinking"]}
+        return values
+
     @field_validator("resize_shape", mode="before")
     @classmethod
     def normalize_resize_shape_field(cls, value):
@@ -393,7 +430,19 @@ class CompactionControl(BaseModel):
     compact_threshold: int = Field(..., gt=0)
 
 
-class OpenAIRequest(ImageProcessingRequest):
+class ToolResultNote(BaseModel):
+    tool_call_id: str = Field(..., min_length=1)
+    text: str = Field(..., max_length=8192)
+
+
+class ToolResultContext(BaseModel):
+    """Exact client excerpts, rendered only when their tool result is absent."""
+
+    entries: List[ToolResultNote] = Field(default_factory=list, max_length=256)
+    max_bytes: int = Field(8192, ge=512, le=8192)
+
+
+class OpenAIRequest(ImageProcessingRequest, ContinuationOptions):
     """
     OpenAI-compatible request structure.
     Using this structure : https://github.com/openai/openai-python/blob/main/src/openai/resources/responses/responses.py
@@ -402,6 +451,11 @@ class OpenAIRequest(ImageProcessingRequest):
     input: Union[str, List[Any]] = Field(
         ..., description="Input text or list of chat messages."
     )
+    transient_context: Optional[str] = Field(
+        None,
+        description="Request-local text appended as user context for generation and token counting, excluded from stored history and compaction summaries. Resend the current value on each request.",
+    )
+    tool_result_context: Optional[ToolResultContext] = None
     model: str = Field(..., description="The model to use for generation.")
     adapter_path: Optional[str] = Field(
         None, description="The path to the adapter weights."
@@ -647,6 +701,7 @@ class OpenAIResponse(BaseModel):
     usage: OpenAIUsage = Field(
         ..., description="Token usage details"
     )  # we need the model to return stats
+    timings: Optional[GenerationTimings] = None
     user: Optional[str] = Field(
         None, description="A unique identifier representing your end-user"
     )
@@ -735,6 +790,7 @@ class ResponseOutputItemDoneEvent(BaseStreamEvent):
 class ResponseCompletedEvent(BaseStreamEvent):
     type: Literal["response.completed"]
     response: OpenAIResponse
+    timings: Optional[GenerationTimings] = None
 
 
 StreamEvent = Union[
@@ -925,8 +981,13 @@ class StreamOptions(BaseModel):
     include_usage: bool = False
 
 
-class ChatRequest(GenerationRequest):
+class ChatRequest(GenerationRequest, ContinuationOptions):
     messages: List[ChatMessage]
+    transient_context: Optional[str] = Field(
+        None,
+        description="Request-local text appended as user context for generation and token counting, excluded from compaction summaries and cached conversation prefixes.",
+    )
+    tool_result_context: Optional[ToolResultContext] = None
     context_management: Optional[List[CompactionControl]] = Field(None, max_length=1)
     stream_options: Optional[StreamOptions] = None
     tools: Optional[List[Any]] = Field(None, description="Tools the model may call.")
@@ -1093,6 +1154,14 @@ class ModelInfo(BaseModel):
     created: int
     loaded: bool = Field(
         default=False, description="Whether the model is loaded in this server process."
+    )
+    reasoning_efforts: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Reasoning effort values explicitly allowed by the active/default chat "
+            "template. Null when the values cannot be determined. Independent of "
+            "the runtime thinking_budget."
+        ),
     )
 
 

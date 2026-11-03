@@ -10,6 +10,7 @@ import threading
 import time
 import traceback
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any, Dict, List, Literal, Optional
 
@@ -60,8 +61,10 @@ class AudioSpeechRequest(FlexibleBaseModel):
 
 class AudioTranscriptionRequest(FlexibleBaseModel):
     model: str
+    task: Optional[str] = None
     language: Optional[str] = None
     prompt: Optional[str] = None
+    system_prompt: Optional[str] = None
     temperature: Optional[float] = None
     response_format: str = "json"
     verbose: bool = False
@@ -97,9 +100,14 @@ class AudioResultChunk:
     error: BaseException | None = None
 
 
+AudioRequestKind = Literal[
+    "tts", "stt", "stt_realtime", "diarization", "speaker_embedding", "diarized_stt"
+]
+
+
 @dataclass
 class AudioInferenceRequest:
-    kind: Literal["tts", "stt"]
+    kind: AudioRequestKind
     model_name: str
     payload: Any
     request_id: str = ""
@@ -112,20 +120,37 @@ class AudioInferenceRequest:
         if not self.request_id:
             self.request_id = uuid.uuid4().hex
         if self.result_queue is None:
-            self.result_queue = queue.Queue()
+            self.result_queue = queue.Queue(
+                maxsize=64 if self.kind in ("stt_realtime", "diarized_stt") else 0
+            )
         if self.cancel_event is None:
             self.cancel_event = threading.Event()
         if self.ready_event is None:
             self.ready_event = threading.Event()
 
+    def check_cancelled(self) -> None:
+        if self.cancel_event.is_set():
+            raise HTTPException(status_code=499, detail="Audio analysis cancelled")
+
     def emit_data(self, payload: Any) -> None:
-        self.result_queue.put(AudioResultChunk(kind="data", payload=payload))
+        self._emit(AudioResultChunk(kind="data", payload=payload))
 
     def emit_error(self, error: BaseException) -> None:
-        self.result_queue.put(AudioResultChunk(kind="error", error=error))
+        self._emit(AudioResultChunk(kind="error", error=error))
 
     def emit_done(self) -> None:
-        self.result_queue.put(AudioResultChunk(kind="done"))
+        self._emit(AudioResultChunk(kind="done"))
+
+    def _emit(self, chunk: AudioResultChunk) -> None:
+        if self.kind not in ("stt_realtime", "diarized_stt"):
+            self.result_queue.put(chunk)
+            return
+        while not self.cancel_event.is_set():
+            try:
+                self.result_queue.put(chunk, timeout=0.1)
+                return
+            except queue.Full:
+                pass
 
     def mark_ready(self, error: BaseException | None = None) -> None:
         self.ready_error = error
@@ -152,6 +177,10 @@ class AudioRequestQueue:
     def __init__(self):
         self._requests: "queue.Queue[AudioInferenceRequest | None]" = queue.Queue()
         self._stop = threading.Event()
+        self._admission = threading.Lock()
+        self._outstanding = 0
+        self._realtime_reserved = False
+        self._active_request = None
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -164,7 +193,7 @@ class AudioRequestQueue:
     def submit(
         self,
         *,
-        kind: Literal["tts", "stt"],
+        kind: AudioRequestKind,
         model_name: str,
         payload: Any,
     ) -> AudioInferenceHandle:
@@ -173,7 +202,16 @@ class AudioRequestQueue:
             model_name=model_name,
             payload=payload,
         )
-        self._requests.put(request)
+        with self._admission:
+            if self._stop.is_set():
+                raise HTTPException(status_code=503, detail="Audio queue is stopping")
+            if self._realtime_reserved or (
+                kind == "stt_realtime" and self._outstanding
+            ):
+                raise HTTPException(status_code=409, detail="Audio worker is busy")
+            self._outstanding += 1
+            self._realtime_reserved = kind == "stt_realtime"
+            self._requests.put(request)
         return AudioInferenceHandle(
             request_id=request.request_id,
             result_queue=request.result_queue,
@@ -183,9 +221,15 @@ class AudioRequestQueue:
         )
 
     def stop_and_join(self, timeout: float = 5.0) -> None:
-        self._stop.set()
-        self._requests.put(None)
+        with self._admission:
+            if not self._stop.is_set():
+                self._stop.set()
+                if self._active_request is not None:
+                    self._active_request.cancel_event.set()
+                self._requests.put(None)
         self._thread.join(timeout=timeout)
+        if self._thread.is_alive():
+            raise RuntimeError("Audio worker did not stop; models must remain loaded")
 
     def _run(self) -> None:
         try:
@@ -194,29 +238,60 @@ class AudioRequestQueue:
             clear_mlx_streams()
 
     def _run_impl(self) -> None:
-        while not self._stop.is_set():
+        while True:
             request = self._requests.get()
             if request is None:
                 break
-            if request.cancel_event.is_set():
-                request.mark_ready()
-                request.emit_done()
-                continue
+            with self._admission:
+                self._active_request = request
+                if self._stop.is_set():
+                    request.cancel_event.set()
+            failed = False
             try:
+                if request.cancel_event.is_set():
+                    continue
                 if request.kind == "tts":
                     _run_tts_request(request)
                 elif request.kind == "stt":
                     _run_stt_request(request)
+                elif request.kind == "stt_realtime":
+                    from .audio_realtime import run_request
+
+                    run_request(request, get_cached_model)
+                elif request.kind in ("diarization", "speaker_embedding"):
+                    from .audio_speakers import run_request
+
+                    run_request(request, get_cached_model)
+                elif request.kind == "diarized_stt":
+                    from .audio_diarized import run_request
+
+                    run_request(request, get_cached_model)
                 else:
                     raise ValueError(f"Unsupported audio request kind: {request.kind}")
             except Exception as exc:
+                failed = True
                 traceback.print_exc()
                 if not request.ready_event.is_set():
                     request.mark_ready(exc)
                 request.emit_error(exc)
             finally:
+                if request.cancel_event.is_set() and not failed:
+                    error = HTTPException(
+                        status_code=503, detail="Audio request cancelled"
+                    )
+                    if not request.ready_event.is_set():
+                        request.mark_ready(error)
+                    request.emit_error(error)
+                if request.kind in ("diarization", "speaker_embedding", "diarized_stt"):
+                    request.payload.close()
                 request.emit_done()
                 mx.clear_cache()
+                with self._admission:
+                    self._outstanding -= 1
+                    self._active_request = None
+                    if request.kind == "stt_realtime":
+                        self._realtime_reserved = False
+                request = None
 
 
 _AUDIO_QUEUE_LOCK = threading.Lock()
@@ -234,6 +309,13 @@ def register_routes(app, deps):
 
     get_cached_model = deps.get_cached_model
     _build_metrics_envelope = deps.build_metrics_envelope
+
+    from .audio_realtime import audio_realtime_endpoint
+    from .audio_speakers import register_routes as register_speaker_routes
+
+    register_speaker_routes(app)
+
+    app.websocket("/v1/audio/transcriptions/realtime")(audio_realtime_endpoint)
 
     app.post("/audio/speech", response_model=None)(audio_speech_endpoint)
     app.post("/v1/audio/speech", response_model=None, include_in_schema=False)(
@@ -324,6 +406,15 @@ async def audio_translations_endpoint(request: Request):
 
 
 async def _audio_transcription_response(request: Request, *, translate: bool):
+    if (await request.form()).get("response_format") == "diarized_json":
+        if translate:
+            raise HTTPException(
+                status_code=400,
+                detail="diarized_json is only supported for transcriptions",
+            )
+        from .audio_diarized import response
+
+        return await response(request)
     endpoint = "/v1/audio/translations" if translate else "/v1/audio/transcriptions"
     request_start = time.perf_counter()
     payload = await _parse_transcription_request(request, translate=translate)
@@ -402,8 +493,10 @@ async def _parse_transcription_request(
 
     payload = AudioTranscriptionRequest(
         model=model,
+        task=_clean_form_value(form.get("task")),
         language=_clean_form_value(form.get("language")),
         prompt=_clean_form_value(form.get("prompt")),
+        system_prompt=_clean_form_value(form.get("system_prompt")),
         temperature=_form_float(form.get("temperature")),
         response_format=_clean_form_value(form.get("response_format")) or "json",
         verbose=_form_bool(form.get("verbose"), default=False),
@@ -573,10 +666,18 @@ def _build_stt_generate_kwargs(
     accepted = _callable_parameters(model.generate)
 
     if prompt:
-        if _accepts_parameter(accepted, "context"):
-            kwargs.setdefault("context", prompt)
-        elif _accepts_parameter(accepted, "text"):
-            kwargs.setdefault("text", prompt)
+        # Prefer a declared parameter over **kwargs, which may silently ignore
+        # aliases (for example a native prompt model also accepting **kwargs).
+        params = accepted.get("params", set()) if accepted else set()
+        for name in ("prompt", "context", "text"):
+            if name in params:
+                kwargs.setdefault(name, prompt)
+                break
+        else:
+            # Preserve the context convention for wrappers with **kwargs only
+            # or callables whose signatures cannot be inspected.
+            if _accepts_parameter(accepted, "context"):
+                kwargs.setdefault("context", prompt)
 
     if translate:
         if _accepts_parameter(accepted, "task"):
@@ -735,6 +836,64 @@ async def _stream_audio_handle(
                 request_start=request_start,
                 audio_count=1 if media_kind == "transcription" else 0,
             )
+
+
+def _audio_analysis_events(
+    request: Request,
+    *,
+    kind: AudioRequestKind,
+    model: str,
+    payload,
+    endpoint: str,
+    stream: bool = False,
+    request_start: float | None = None,
+):
+    """Submit before sending headers; the worker then owns the uploaded file."""
+    started = time.perf_counter() if request_start is None else request_start
+    runtime.metrics.begin_request(endpoint=endpoint, model=model, stream=stream)
+    try:
+        handle = _get_audio_queue().submit(kind=kind, model_name=model, payload=payload)
+    except BaseException as exc:
+        payload.close()
+        _record_audio_failure(endpoint, model, stream, exc)
+        raise
+
+    async def events():
+        while True:
+            if await request.is_disconnected():
+                raise HTTPException(499, "Audio request disconnected")
+            chunk = await asyncio.to_thread(_get_queue_chunk, handle.result_queue, 0.1)
+            if chunk is None:
+                continue
+            if chunk.kind == "error":
+                raise _as_http_exception(chunk.error)
+            if chunk.kind == "done":
+                break
+            yield chunk.payload
+
+    @asynccontextmanager
+    async def consume():
+        source = events()
+        try:
+            # Response validation belongs inside the context so malformed or
+            # incomplete results are recorded as failures, not successes.
+            yield source
+        except (Exception, asyncio.CancelledError, GeneratorExit) as exc:
+            _record_audio_failure(endpoint, model, stream, exc)
+            raise
+        else:
+            _record_audio_success(
+                endpoint=endpoint,
+                model=model,
+                stream=stream,
+                request_start=started,
+                audio_count=1,
+            )
+        finally:
+            handle.cancel()
+            await source.aclose()
+
+    return consume()
 
 
 def _get_queue_chunk(result_queue: "queue.Queue[AudioResultChunk]", timeout: float):

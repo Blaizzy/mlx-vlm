@@ -50,6 +50,11 @@ def as_question(question):
         criteria = list(criteria)
     if kind == "noul" and criteria is not None and not isinstance(criteria, Mapping):
         raise ValueError('noul criteria are optional: {"true": "...", "false": "..."}')
+    if kind == "noul" and criteria and not set(criteria) <= {"true", "false"}:
+        raise ValueError(
+            'bool criteria describe "true" and "false", got keys '
+            + ", ".join(sorted(map(repr, criteria)))
+        )
     return {
         "type": kind,
         "instructions": question["instructions"],

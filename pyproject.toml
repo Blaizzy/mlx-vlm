@@ -49,7 +49,7 @@ version = {attr = "mlx_vlm.version.__version__"}
 dependencies = {file = ["requirements.txt"]}
 
 [project.optional-dependencies]
-test = ["pytest", "httpx2>=2.0.0,<3", "starlette>=1.2.1"]
+test = ["pytest", "pytest-xdist>=3.8,<4", "httpx2>=2.0.0,<3", "starlette>=1.2.1"]
 ui = ["gradio>=5.19.0"]
 cuda = ["mlx-cuda"]
 cpu = ["mlx-cpu"]

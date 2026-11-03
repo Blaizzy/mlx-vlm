@@ -1,0 +1,12 @@
+{
+  "families": {
+    "idol": {
+      "weights_env": "IDOL_WEIGHTS",
+      "image_env": "IDOL_TEST_IMAGE",
+      "generate_kwargs": {"seed": 42, "steps": 2, "num_gaussians": 32768},
+      "image_size": [1024, 1024],
+      "num_gaussians": 32768,
+      "gaussian_attributes": ["xyz", "features_dc", "scaling", "rotation", "opacity"]
+    }
+  }
+}
