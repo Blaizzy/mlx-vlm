@@ -23,7 +23,7 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Blaizzy/mlx-vlm"
+Homepage = "https://www.neywalabs.ai"
 Repository = "https://github.com/Blaizzy/mlx-vlm"
 Issues = "https://github.com/Blaizzy/mlx-vlm/issues"
 
