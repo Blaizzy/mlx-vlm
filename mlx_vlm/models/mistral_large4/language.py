@@ -10,7 +10,8 @@ from functools import partial
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import LanguageModelOutput
+from ...sample_utils import greedy_argmax
+from ..base import LanguageModelOutput, project_logits
 from ..cache import _BaseCache, create_causal_mask, dynamic_roll
 from ..switch_layers import (
     QuantizedSwitchLinear,
@@ -937,7 +938,13 @@ class LanguageModel(nn.Module):
                 raise
         captured = [] if capture_layer_ids is not None else None
         x = self.model(inputs, inputs_embeds, cache, mask, capture_layer_ids, captured)
-        logits = decode_linear(self.lm_head, x, self.group)
+        # Preserve the decode-only reduction when the full forward is a decode.
+        projection = (
+            partial(decode_linear, self.lm_head, group=self.group)
+            if x.shape[1] == 1
+            else self.lm_head
+        )
+        logits = project_logits(x, projection, kwargs.get("logits_to_keep"))
         cap = self.args.final_logit_softcapping
         if cap:
             logits = mx.tanh(logits / cap) * cap
@@ -953,8 +960,7 @@ class LanguageModel(nn.Module):
 
         logits = verify_logits(self, hidden)
         # Match generate_step's BF16 log-probability rounding and tie-breaking.
-        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        return mx.argmax(logprobs, axis=-1)
+        return greedy_argmax(logits)
 
     def rollback_speculative_cache(self, cache, transaction, accepted, block_size):
         from ...speculative.cache_state import rollback_speculative_cache
