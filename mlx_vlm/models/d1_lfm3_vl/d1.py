@@ -10,10 +10,12 @@ this folder); the forward pass and readout are written for MLX.
 """
 
 import os
+from io import BytesIO
 from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
+import requests
 
 from ..cache import create_causal_mask
 from ..lfm3_vl.lfm3_vl import Model as Lfm3VlModel
@@ -273,6 +275,25 @@ def decision_question(question):
     return question
 
 
+def decision_audio(audio):
+    """A clip of the shared decision API as `system_one` reads it, decoded at its own
+    rate: only the Reader's resampler matches the checkpoints' code. Bare samples are
+    16 kHz, as in d1-omni."""
+    if isinstance(audio, np.ndarray):
+        return {"type": "audio", "audio": audio, "sampling_rate": 16000}
+    from mlx_audio.audio_io import read
+
+    if isinstance(audio, str) and audio.startswith(("http://", "https://")):
+        try:
+            response = requests.get(audio, timeout=10)
+            response.raise_for_status()
+        except requests.RequestException as error:
+            raise ValueError(f"Failed to load audio from {audio}: {error}") from error
+        audio = BytesIO(response.content)
+    wave, rate = read(audio, dtype="float32")
+    return {"type": "audio", "audio": wave, "sampling_rate": rate}
+
+
 def decision_answer(answer):
     """A `system_one` answer in the shared decision API's fields. Multiple choice
     and the typed answers have no shared fields and stay as they are."""
@@ -346,15 +367,11 @@ class D1:
     def predict(self, processor, state, questions, images=None, audio=None):
         """`system_one` behind the shared decision API (`mlx_vlm.predict`,
         `/v1/decisions`), with a score's value the expected level as in d1-3B."""
-        from ...utils import decode_audio, load_image
+        from ...utils import load_image
 
         media = [load_image(image) for image in images or ()]
         if audio is not None:
-            # Kept at its own rate: the Reader's resampler matches the checkpoints' code.
-            wave, rate = (
-                (audio, 16000) if isinstance(audio, np.ndarray) else decode_audio(audio)
-            )
-            media.append({"type": "audio", "audio": wave, "sampling_rate": rate})
+            media.append(decision_audio(audio))
         result = self.system_one(
             state,
             {name: decision_question(q) for name, q in questions.items()},

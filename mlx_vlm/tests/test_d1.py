@@ -9,6 +9,7 @@ import math
 import os
 import wave
 from pathlib import Path
+from types import SimpleNamespace
 
 import mlx.core as mx
 import numpy as np
@@ -572,6 +573,18 @@ def test_tiny_omni_decision_api_decodes_audio(tokenizer, monkeypatch):
     predict(model, None, None, {"x": QUESTIONS["refund"]}, audio=samples)
     [item] = seen["media"]
     assert item["sampling_rate"] == 16000 and item["audio"] is samples
+    url = "https://example.test/clip.wav"
+    response = SimpleNamespace(content=clip.getvalue(), raise_for_status=lambda: None)
+    monkeypatch.setattr(d1.requests, "get", lambda *_, **__: response)
+    predict(model, None, None, {"x": QUESTIONS["refund"]}, audio=url)
+    assert seen["media"][0]["sampling_rate"] == 8000
+
+    def unreachable(*_, **__):
+        raise d1.requests.ConnectionError("down")
+
+    monkeypatch.setattr(d1.requests, "get", unreachable)
+    with pytest.raises(ValueError, match="Failed to load audio"):
+        predict(model, None, None, {"x": QUESTIONS["refund"]}, audio=url)
 
 
 def test_tiny_model_serves_decisions_over_http(tiny_model, monkeypatch):

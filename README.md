@@ -569,9 +569,6 @@ Both interfaces return the shared `predict()` result and preserve model-specific
 scoring. Decider, Laya, [d1-3B](mlx_vlm/models/d1/README.md), and
 [d1-omni-600M](mlx_vlm/models/d1_omni/README.md) support `choice`, `bool`, and
 `score`; the two LiquidAI d1 models also read images, and d1-omni reads speech.
-On `/v1/decisions`, [d1-2B and d1-omni-2B](mlx_vlm/models/d1_lfm3_vl/README.md#server)
-answer those types the same way and add typed questions; their `decide` output
-keeps the `model.system_one` fields.
 Consult each model's README for criteria and calibration details.
 
 ### Server (FastAPI)
