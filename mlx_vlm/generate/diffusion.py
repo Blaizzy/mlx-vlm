@@ -4,6 +4,7 @@ import logging
 import os
 import shutil
 import time
+from contextlib import nullcontext
 from typing import Any, Callable, Dict, Generator, List, Optional
 
 import mlx.core as mx
@@ -292,8 +293,14 @@ def _diffusion_initialize_canvas(
     canvas_length: int,
     vocab_size: int,
     dtype,
+    rng=None,
 ) -> mx.array:
-    return mx.random.randint(0, vocab_size, (batch_size, canvas_length)).astype(dtype)
+    return mx.random.randint(
+        0,
+        vocab_size,
+        (batch_size, canvas_length),
+        key=rng() if rng is not None else None,
+    ).astype(dtype)
 
 
 def _normalize_decoder_input_ids(
@@ -324,6 +331,7 @@ def _diffusion_initial_canvas(
     canvas_length: int,
     vocab_size: int,
     dtype,
+    rng=None,
 ) -> mx.array:
     seed_canvas = None
     seed_length = 0
@@ -339,6 +347,7 @@ def _diffusion_initial_canvas(
         canvas_length,
         vocab_size,
         dtype,
+        rng=rng,
     )
     if seed_canvas is None:
         return random_canvas
@@ -363,6 +372,7 @@ def _diffusion_sample_canvas(
     processed_logits: mx.array,
     dtype,
     temperature: float,
+    rng=None,
 ) -> mx.array:
     temperature = clamp_temperature(temperature)
     logits = processed_logits.astype(mx.float32)
@@ -370,7 +380,9 @@ def _diffusion_sample_canvas(
         return mx.argmax(logits, axis=-1).astype(dtype)
     if temperature != 1.0:
         logits = logits / temperature
-    return mx.random.categorical(logits).astype(dtype)
+    return mx.random.categorical(logits, key=rng() if rng is not None else None).astype(
+        dtype
+    )
 
 
 def _diffusion_token_probability(
@@ -565,6 +577,7 @@ def stream_diffusion_generate(
     decoder_input_ids: Optional[mx.array] = None,
     apc_manager: Optional[Any] = None,
     apc_extra_hash: int = 0,
+    rng=None,
 ) -> Generator[GenerationResult, None, None]:
     if input_ids.shape[0] != 1:
         raise ValueError(
@@ -913,6 +926,7 @@ def stream_diffusion_generate(
                 canvas_length,
                 vocab_size,
                 input_ids.dtype,
+                rng=rng,
             )
             draft_reveal_mask = mx.zeros(current_canvas.shape, dtype=mx.bool_)
             draft_canvas = current_canvas
@@ -1007,6 +1021,7 @@ def stream_diffusion_generate(
                         processed_logits,
                         input_ids.dtype,
                         temperature,
+                        rng=rng,
                     )
                 )
 
@@ -1037,6 +1052,7 @@ def stream_diffusion_generate(
                             canvas_length,
                             vocab_size,
                             input_ids.dtype,
+                            rng=rng,
                         ),
                     )
                     draft_reveal_mask = acceptance_mask
@@ -1067,6 +1083,7 @@ def stream_diffusion_generate(
                             canvas_length,
                             vocab_size,
                             input_ids.dtype,
+                            rng=rng,
                         ),
                     )
                     draft_reveal_mask = draft_reveal_mask | acceptance_mask
@@ -1250,7 +1267,9 @@ def _stream_model_diffusion_generate(
 
     top_p_arg = None if top_p is None or top_p >= 1.0 else top_p
     top_k_arg = None if top_k is None or top_k <= 0 else top_k
-    generated = model.language_model.generate(
+    generate_blocks = getattr(model.language_model, "generate_blocks", None)
+    generate = generate_blocks or model.language_model.generate
+    generated = generate(
         input_ids,
         temperature=temperature,
         block_length=block_length,
@@ -1271,6 +1290,19 @@ def _stream_model_diffusion_generate(
         **tuned_kwargs,
         **kwargs,
     )
+    if generate_blocks is not None:
+        blocks = generated
+        try:
+            while True:
+                try:
+                    next(blocks)
+                except StopIteration as done:
+                    generated = done.value
+                    break
+                yield from pending_results
+                pending_results.clear()
+        finally:
+            blocks.close()
     mx.eval(generated)
 
     if generation_stats.get("text_already_printed"):
@@ -1352,7 +1384,10 @@ def stream_diffusion_generate_from_kwargs(
     if stream_strategy is None:
         raise ValueError("Model does not support diffusion generation.")
 
-    with wired_limit(model, [generation_stream]):
+    manage_wired_limit = kwargs.pop("manage_wired_limit", True)
+    with (
+        wired_limit(model, [generation_stream]) if manage_wired_limit else nullcontext()
+    ):
         yield from stream_strategy(
             model,
             processor,

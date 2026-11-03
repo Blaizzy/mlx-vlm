@@ -35,6 +35,31 @@ DEFAULT_DIFFUSION_MAX_DENOISING_STEPS = 48
 generation_stream = mx.new_thread_local_stream(mx.default_device())
 
 
+class DiffusionRNG:
+    """Request-owned PRNG keys using the same split order as MLX's global RNG."""
+
+    def __init__(self, seed=None):
+        if seed is None:
+            seed = int(mx.random.randint(0, 2**31 - 1).item())
+        self.key = mx.random.key(seed)
+
+    def __call__(self):
+        self.key, key = mx.random.split(self.key)
+        return key
+
+
+def consume_generator(iterator):
+    """Drain a generator and return its final value, closing it on failure."""
+    try:
+        while True:
+            try:
+                next(iterator)
+            except StopIteration as done:
+                return done.value
+    finally:
+        iterator.close()
+
+
 def resolve_sampling_defaults(
     config,
     *,
