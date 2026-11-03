@@ -1729,6 +1729,13 @@ class BatchKVCache(_BaseCache):
 
     def extract(self, idx):
         cache = KVCache()
+        batch_size = self.offset.size
+        if idx < 0:
+            idx += batch_size
+        if idx < 0 or idx >= batch_size:
+            raise IndexError("BatchKVCache row index out of range")
+        if self.keys is None:
+            return cache
         padding = self.left_padding[idx].item()
         cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, padding : self._idx])
         cache.values = mx.contiguous(self.values[idx : idx + 1, :, padding : self._idx])

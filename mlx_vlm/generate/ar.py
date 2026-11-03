@@ -1626,7 +1626,7 @@ class SpeculativeGenerationBatch:
         self._finished = [False] * len(uids)
         self._sent_first = False
         self._rounds_iter = None
-        self.can_extend = draft_kind == "dflash" and all(
+        self.can_extend = draft_kind in ("dflash", "mtp") and all(
             callable(getattr(c, "extend", None)) for c in prompt_cache
         )
         self._batch_state = None
@@ -1720,6 +1720,25 @@ class SpeculativeGenerationBatch:
 
     def _ensure_batch_state(self):
         if self._batch_state is None:
+            if self.draft_kind == "mtp":
+                from ..speculative.mtp import MTPBatch
+
+                self._batch_state = MTPBatch(
+                    self.model,
+                    self.draft_model,
+                    self.prompt_cache,
+                    self.hidden,
+                    self.first_tokens,
+                    self.draft_block_size,
+                    self.sampler,
+                    self.token_dtype,
+                    self.greedy_sampling,
+                    shared_kv_states=self.shared_kv_states,
+                    prompt_tokens=self.prompt_tokens,
+                    rope_deltas=getattr(self, "_rope_deltas", None),
+                )
+                self.hidden = self.shared_kv_states = self.prompt_tokens = None
+                return
             from ..speculative.dflash import DFlashBatch
 
             self._batch_state = DFlashBatch(
@@ -1745,6 +1764,15 @@ class SpeculativeGenerationBatch:
                 for cache in self.prompt_cache:
                     cache.filter(indices)
                 self.hidden = self.hidden[indices]
+                if self.prompt_tokens is not None:
+                    self.prompt_tokens = self.prompt_tokens[indices]
+                if self.shared_kv_states:
+                    self.shared_kv_states = {
+                        key: (keys[indices], values[indices])
+                        for key, (keys, values) in self.shared_kv_states.items()
+                    }
+                if getattr(self, "_rope_deltas", None) is not None:
+                    self._rope_deltas = self._rope_deltas[indices]
             rows = [self._batch_rows[i] for i in keep]
             pending = set(self._pending_first)
             self._pending_first = [i for i, row in enumerate(rows) if row in pending]

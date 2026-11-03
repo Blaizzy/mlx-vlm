@@ -751,7 +751,7 @@ class TestBatchGenerator:
         batch = SpeculativeGenerationBatch(
             model=SimpleNamespace(),
             draft_model=SimpleNamespace(),
-            draft_kind="mtp",
+            draft_kind="eagle3",
             uids=[100, 200],
             first_tokens=mx.array([0, 9], dtype=mx.int32),
             prompt_cache=[],

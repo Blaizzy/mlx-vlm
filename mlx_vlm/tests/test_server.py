@@ -590,7 +590,7 @@ class TestInferenceSession:
         assert worker._batch_key(first) != worker._batch_key(second)
 
     @pytest.mark.parametrize(
-        "kind,shared", [("dflash", True), ("mtp", False), ("eagle3", False)]
+        "kind,shared", [("dflash", True), ("mtp", True), ("eagle3", False)]
     )
     def test_speculative_resumable_group_requires_row_restore(self, kind, shared):
         worker = Generator.__new__(Generator)

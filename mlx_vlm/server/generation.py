@@ -1911,12 +1911,12 @@ class ResponseGenerator:
                 "logprobs",
             )
         )
-        # DFlash owns extractable per-row state. Other speculative iterators
+        # DFlash and MTP own extractable per-row state. Other speculative iterators
         # still require a dedicated group to retain their generator closure.
         if (
             self.draft_model is not None
             and request.session is not None
-            and self.draft_kind != "dflash"
+            and self.draft_kind not in ("dflash", "mtp")
         ):
             key += (id(request.session),)
         return key
