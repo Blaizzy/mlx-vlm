@@ -2,8 +2,6 @@ import mlx.core as mx
 from mlx import nn
 from mlx.core.fast import scaled_dot_product_attention
 
-from mlx_vlm.models.flux2.constants import ModelConfig
-
 
 class Flux2AttentionBlock(nn.Module):
     def __init__(self, channels: int, groups: int = 32, eps: float = 1e-6):
@@ -21,7 +19,7 @@ class Flux2AttentionBlock(nn.Module):
         batch, height, width, channels = hidden_states.shape
 
         normed = self.group_norm(hidden_states.astype(mx.float32)).astype(
-            ModelConfig.precision
+            hidden_states.dtype
         )
         q = self.to_q(normed).reshape(batch, height * width, 1, channels)
         k = self.to_k(normed).reshape(batch, height * width, 1, channels)

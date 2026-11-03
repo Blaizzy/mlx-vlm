@@ -13,6 +13,10 @@ from .prompt import (
     suffix_text,
 )
 
+# Longer trunks are read in chunks of this many tokens: one pass over a long trunk
+# keeps every conv layer's full input alive.
+PREFILL_STEP = 2048
+
 
 def _tile(cache, count):
     """Fresh caches holding `count` copies of the trunk's state."""
@@ -23,14 +27,20 @@ def _tile(cache, count):
 
 
 def _chunks(lengths, trunk, budget):
-    """Consecutive branch batches of at most `budget` padded tokens, trunk included."""
-    out, longest = [[]], 0
-    for i, n in enumerate(lengths):
-        if out[-1] and (len(out[-1]) + 1) * (trunk + max(longest, n)) > budget:
-            out.append([])
-            longest = 0
-        out[-1].append(i)
-        longest = max(longest, n)
+    """Branch batches, longest first, each in request order: at most `budget` padded
+    tokens, trunk included, and no branch padded past twice its length."""
+    order = sorted(range(len(lengths)), key=lambda i: -lengths[i])
+    out = []
+    while order:
+        longest, size = lengths[order[0]], 1
+        while (
+            size < len(order)
+            and (size + 1) * (trunk + longest) <= budget
+            and 2 * lengths[order[size]] >= longest
+        ):
+            size += 1
+        out.append(sorted(order[:size]))
+        order = order[size:]
     return out
 
 
@@ -121,23 +131,37 @@ class Model(Lfm2VlModel):
 
     def answer_logprobs(self, trunk, branches, vision=None, token_budget=65536):
         """Log-probabilities at the answer slot: of `trunk` alone when there are no
-        branches, else of every branch continuing the trunk, which is read once."""
+        branches, else of every branch continuing the trunk, which is read once. A
+        trunk longer than 2048 tokens, or than the budget, is read in chunks of
+        that many, which bounds the memory a long state takes."""
+        if token_budget is None or token_budget < 1:
+            raise ValueError(f"token_budget must be at least 1, got {token_budget!r}")
         ids = mx.array([trunk])
         embeds = self.get_input_embeddings(ids, **(vision or {})).inputs_embeds
         model = self.language_model.model
-        if not branches:
+        step = min(PREFILL_STEP, token_budget)
+        if not branches and len(trunk) <= step:
             return list(self._logz(model(ids, input_embeddings=embeds)[:, -1]))
         cache = self.language_model.make_cache()
-        model(ids, cache=cache, input_embeddings=embeds)
+        start = 0
+        while len(trunk) - start > step:
+            end = start + step
+            model(ids[:, start:end], cache=cache, input_embeddings=embeds[:, start:end])
+            mx.eval([c.state for c in cache])
+            start = end
+        hidden = model(ids[:, start:], cache=cache, input_embeddings=embeds[:, start:])
+        if not branches:
+            return list(self._logz(hidden[:, -1]))
         mx.eval([c.state for c in cache])
-        out = []
+        out = [None] * len(branches)
         for chunk in _chunks(list(map(len, branches)), len(trunk), token_budget):
             rows = [branches[j] for j in chunk]
             width = max(map(len, rows))
             padded = mx.array([row + [0] * (width - len(row)) for row in rows])
             hidden = model(padded, cache=_tile(cache, len(rows)))
             last = mx.array([len(row) - 1 for row in rows])
-            out += list(self._logz(hidden[mx.arange(len(rows)), last]))
+            for j, z in zip(chunk, self._logz(hidden[mx.arange(len(rows)), last])):
+                out[j] = z
         return out
 
     def probabilities(

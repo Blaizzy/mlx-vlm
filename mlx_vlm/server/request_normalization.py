@@ -3,11 +3,8 @@
 import json
 from typing import List, Optional, Tuple, Union
 
-from ..generate import (
-    DEFAULT_REPETITION_CONTEXT_SIZE,
-    DEFAULT_TEMPERATURE,
-    DEFAULT_TOP_P,
-)
+from ..generate import DEFAULT_REPETITION_CONTEXT_SIZE
+from ..generate.common import resolve_sampling_defaults
 from ..prompt_utils import extract_text_from_content, normalize_image_content
 from ..structured import build_json_schema_logits_processor
 from .generation import (
@@ -141,13 +138,6 @@ def _standard_reasoning_control(
     return None, None, False
 
 
-def _model_config_field_or_default(processor, field_name: str, default):
-    config = getattr(processor, "config", None) if processor is not None else None
-    if config is None:
-        config = runtime.model_cache.get("config")
-    return getattr(config, field_name, default)
-
-
 def _as_plain_dict(value):
     if value is None:
         return None
@@ -231,20 +221,25 @@ def _build_gen_args(
         # Preserve a model template's native default when the server default is
         # off and the request did not express a reasoning preference.
         template_reasoning = True if server_enable_thinking else None
-    default_temperature = _model_config_field_or_default(
-        processor, "temperature", DEFAULT_TEMPERATURE
+    temperature, top_p, top_k = resolve_sampling_defaults(
+        config if config is not None else runtime.model_cache.get("config"),
+        temperature=_request_field_or_default(request, "temperature", None),
+        top_p=_request_field_or_default(request, "top_p", None),
+        top_k=_request_field_or_default(request, "top_k", None),
     )
-    default_top_p = _model_config_field_or_default(processor, "top_p", DEFAULT_TOP_P)
-    default_top_k = _model_config_field_or_default(processor, "top_k", 0)
-    if _model_config_field_or_default(processor, "do_sample", None) is False:
-        default_temperature = 0.0
+    image_defaults = runtime.config.image_pixel_limits()
     args = GenerationArguments(
         max_tokens=max_tokens,
-        temperature=_request_field_or_default(
-            request, "temperature", default_temperature
+        min_pixels=_request_field_or_default(
+            request, "min_pixels", image_defaults["min_pixels"]
         ),
-        top_p=_request_field_or_default(request, "top_p", default_top_p),
-        top_k=_request_field_or_default(request, "top_k", default_top_k),
+        max_pixels=_request_field_or_default(
+            request, "max_pixels", image_defaults["max_pixels"]
+        ),
+        resize_shape=getattr(request, "resize_shape", None),
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
         min_p=getattr(request, "min_p", 0.0),
         top_n_sigma=getattr(request, "top_n_sigma", 0.0),
         p_less=getattr(request, "p_less", False),

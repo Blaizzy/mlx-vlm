@@ -915,6 +915,7 @@ class LanguageModel(nn.Module):
         temperature: float = 0.0,
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
+        rng=None,
     ):
         if temperature == 0.0:
             token = mx.argmax(logits, axis=-1)
@@ -926,7 +927,9 @@ class LanguageModel(nn.Module):
             logits = logits / temperature
         logits = self._top_k_logits(logits, top_k)
         logits = self._top_p_logits(logits, top_p)
-        token = mx.random.categorical(logits.astype(mx.float32), axis=-1)
+        token = mx.random.categorical(
+            logits.astype(mx.float32), axis=-1, key=rng() if rng is not None else None
+        )
         token_logit = mx.take_along_axis(logits, token[..., None], axis=-1)[..., 0]
         token_prob = mx.exp(token_logit - mx.logsumexp(logits, axis=-1))
         return token, token_prob
@@ -1004,6 +1007,7 @@ class LanguageModel(nn.Module):
         temperature: float = 0.0,
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
+        rng=None,
         return_prob: bool = False,
         chunked_score: bool = False,
     ) -> mx.array | Tuple[mx.array, mx.array]:
@@ -1021,12 +1025,14 @@ class LanguageModel(nn.Module):
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
+                rng=rng,
             )
         return self._sample_tokens(
             logits,
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
+            rng=rng,
         )
 
     def _sample_tokens(
@@ -1035,6 +1041,7 @@ class LanguageModel(nn.Module):
         temperature: float = 0.0,
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
+        rng=None,
     ) -> mx.array:
         if temperature == 0.0:
             return mx.argmax(logits, axis=-1)
@@ -1043,7 +1050,9 @@ class LanguageModel(nn.Module):
             logits = logits / temperature
         logits = self._top_k_logits(logits, top_k)
         logits = self._top_p_logits(logits, top_p)
-        return mx.random.categorical(logits.astype(mx.float32), axis=-1)
+        return mx.random.categorical(
+            logits.astype(mx.float32), axis=-1, key=rng() if rng is not None else None
+        )
 
     @staticmethod
     def _trim_cache(cache, max_length: int) -> None:
@@ -1084,7 +1093,13 @@ class LanguageModel(nn.Module):
             if isinstance(o_proj, DraftLoRALinear):
                 o_proj.enabled = enabled
 
-    def generate(
+    def generate(self, *args, **kwargs):
+        """Generate synchronously, retaining the callback API."""
+        from ...generate.common import consume_generator
+
+        return consume_generator(self.generate_blocks(*args, **kwargs))
+
+    def generate_blocks(
         self,
         inputs: mx.array,
         temperature: float = 0.0,
@@ -1111,7 +1126,13 @@ class LanguageModel(nn.Module):
         on_result: Optional[Callable[[GenerationResult], bool]] = None,
         linear_speculative: bool = False,
         **kwargs,
-    ) -> mx.array:
+    ):
+        """Yield after each committed block; return the final token array.
+
+        Results are delivered through on_result. Closing this iterator releases
+        the unfinished generation without starting another denoising block.
+        """
+        rng = kwargs.pop("_rng", None)
         generation_mode = kwargs.get("generation_mode")
         if generation_mode in ("linear_speculative", "linear_spec"):
             linear_speculative = True
@@ -1383,6 +1404,7 @@ class LanguageModel(nn.Module):
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
+            rng=rng,
         )
         mx.eval(next_token)
         if stats is not None:
@@ -1460,6 +1482,7 @@ class LanguageModel(nn.Module):
                         top_p=top_p,
                         return_prob=True,
                         chunked_score=use_chunked_scoring,
+                        rng=rng,
                     )
                 else:
                     sampled_tokens = self._sample_from_hidden(
@@ -1467,6 +1490,7 @@ class LanguageModel(nn.Module):
                         temperature=temperature,
                         top_k=top_k,
                         top_p=top_p,
+                        rng=rng,
                     )
                     token_probs = None
                 if stats is not None and not recorded_prompt_time:
@@ -1621,6 +1645,8 @@ class LanguageModel(nn.Module):
                 if not emit_result(so_far, diffusion_block_complete=True):
                     callback_stopped = True
                     break
+            # Retain the canvas, caches and loop position until the next block.
+            yield
             if end_length is not None:
                 break
             if total_generated >= gen_length:
@@ -1638,6 +1664,7 @@ class LanguageModel(nn.Module):
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
+                rng=rng,
             )
 
         generated = (

@@ -110,7 +110,6 @@ def _stack_experts(weights: Dict[str, mx.array], text_config: dict) -> None:
 class Glm4MoeLiteMTPSplitter(MTPSplitter):
     output_model_type = "glm4_moe_lite_mtp"
     draft_model_cls = None
-    require_text_config = False
     tie_word_embeddings_default = False
     depth_field = "num_nextn_predict_layers"
     block_size_extra = 1
@@ -125,7 +124,7 @@ class Glm4MoeLiteMTPSplitter(MTPSplitter):
     )
 
     def read_text_config(self, source_config: dict) -> dict:
-        text_config = dict(source_config.get("text_config") or source_config)
+        text_config = super().read_text_config(source_config)
         text_config.pop("quantization", None)
         text_config.pop("quantization_config", None)
         return text_config

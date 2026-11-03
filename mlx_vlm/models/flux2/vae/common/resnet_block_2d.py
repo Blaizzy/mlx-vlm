@@ -1,8 +1,6 @@
 import mlx.core as mx
 from mlx import nn
 
-from mlx_vlm.models.flux2.constants import ModelConfig
-
 
 class Flux2ResnetBlock2D(nn.Module):
     def __init__(
@@ -31,14 +29,11 @@ class Flux2ResnetBlock2D(nn.Module):
         residual = mx.transpose(hidden_states, (0, 2, 3, 1))
 
         hidden_states = mx.transpose(hidden_states, (0, 2, 3, 1))
-        hidden_states = self.norm1(hidden_states.astype(mx.float32)).astype(
-            ModelConfig.precision
-        )
+        dtype = hidden_states.dtype
+        hidden_states = self.norm1(hidden_states.astype(mx.float32)).astype(dtype)
         hidden_states = nn.silu(hidden_states)
         hidden_states = self.conv1(hidden_states)
-        hidden_states = self.norm2(hidden_states.astype(mx.float32)).astype(
-            ModelConfig.precision
-        )
+        hidden_states = self.norm2(hidden_states.astype(mx.float32)).astype(dtype)
         hidden_states = nn.silu(hidden_states)
         hidden_states = self.conv2(hidden_states)
 

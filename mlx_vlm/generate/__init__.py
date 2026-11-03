@@ -45,6 +45,7 @@ from .image import (
     load_image_model,
 )
 from .image_defaults import ImageSamplingDefaults, resolve_image_defaults
+from .three_d import generate_3d, load_3d_model
 from .types import GenerateKwargs, ProcessorLike
 from .video_generation import (
     VideoGenerationModel,
@@ -87,6 +88,7 @@ __all__ = [
     "batch_generate",
     "edit_image",
     "generate",
+    "generate_3d",
     "generate_audio",
     "generate_image",
     "ImageSamplingDefaults",
@@ -103,6 +105,7 @@ __all__ = [
     "is_image_generation_model",
     "is_video_generation_model",
     "load_image_edit_model",
+    "load_3d_model",
     "load_image_generation_model",
     "load_image_model",
     "load_video_generation_model",
