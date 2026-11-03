@@ -1,4 +1,4 @@
-# MLX-VLM
+<h1 align="center">MLX-VLM</h1>
 
 [![Any input. Any output. All local. Runs locally on your Mac. Install with pip install -U mlx-vlm or try it in Nativ.](https://raw.githubusercontent.com/Blaizzy/mlx-vlm/b7fda105064b609fcc2ef243bd628c3dad317564/docs/assets/mlx-vlm-banner.png)](https://runnativ.ai)
 
