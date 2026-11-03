@@ -24,7 +24,9 @@ class LanguageModel(Qwen3_5LanguageModel):
                 attention_mask == 0, mx.ones_like(position_ids), position_ids
             )
             max_position_ids = position_ids.max(axis=-1, keepdims=True)
-            mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
+            mrope_position_deltas = (
+                max_position_ids + 1 - attention_mask.sum(axis=-1, keepdims=True)
+            )
         else:
             position_ids = mx.arange(input_ids.shape[1]).reshape(1, -1)
             position_ids = mx.broadcast_to(
