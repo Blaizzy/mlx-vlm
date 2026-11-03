@@ -1,5 +1,6 @@
 {
   "modules": {
+    "flint": ["flint", "FlintProcessor"],
     "aya_vision": ["aya_vision", "AyaVisionProcessor"],
     "deepseek": ["deepseek_v4", "DeepseekV4Processor"],
     "deepseek41": ["deepseek_v41", "DeepseekV41Processor"],
@@ -33,6 +34,9 @@
     "smolvlm": ["smolvlm", "SmolVLMProcessor"],
     "step3p7": ["step3p7", "Step3VLProcessor"],
     "ocr": ["unlimited_ocr.processing_unlimitedocr", "UnlimitedOCRProcessor"],
+    "nemotron_parse_v3_5": [
+      "nemotron_parse_v3_5.processing_nemotron_parse_v3_5", null
+    ],
     "nemotron": [
       "nemotron_h_nano_omni.processing_nemotron_h_nano_omni",
       "NemotronHNanoOmniProcessor"
@@ -109,6 +113,7 @@
     "ernie4_5_moe_vl": {"class": "Ernie4_5_VLProcessor"}
   },
   "routes": [
+    ["flint", "flint.processing_flint", "FlintProcessor"],
     ["embedding_gemma2", "embedding_gemma2.processing_embedding_gemma2", "EmbeddingGemma2Processor"],
     ["internvl_chat", "internvl_chat", "InternVLChatProcessor"],
     ["molmo", "molmo.processing_molmo", "MolmoProcessor"],

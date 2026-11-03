@@ -15,7 +15,7 @@ from ..base import (
 from ..cache import ArraysCache, KVCache
 from ..gated_delta import gated_delta_update
 from ..mla import MultiLinear, latent_length, max_absorbed_queries
-from ..switch_layers import SwitchGLU
+from ..switch_layers import EXPERT_WEIGHT_SUFFIXES, SwitchGLU
 from .config import TextConfig
 
 
@@ -938,7 +938,7 @@ class LanguageModel(nn.Module):
                         )
                         weights[f"{dst_prefix}.switch_mlp.{dst}.scales"] = scales
                     else:
-                        for suffix in ("weight", "scales", "biases"):
+                        for suffix in EXPERT_WEIGHT_SUFFIXES:
                             if f"{src_prefix}.experts.0.{src}.{suffix}" in weights:
                                 weights[f"{dst_prefix}.switch_mlp.{dst}.{suffix}"] = (
                                     mx.stack(
@@ -963,7 +963,7 @@ class LanguageModel(nn.Module):
                     "switch_mlp.up_proj",
                     "switch_mlp.down_proj",
                 ):
-                    for suffix in ("weight", "scales", "biases"):
+                    for suffix in EXPERT_WEIGHT_SUFFIXES:
                         src_key = f"{src_prefix}.{name}.{suffix}"
                         if src_key in weights:
                             weights[f"{dst_prefix}.{name}.{suffix}"] = weights.pop(

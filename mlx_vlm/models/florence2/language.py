@@ -6,6 +6,7 @@ import mlx.nn as nn
 
 from ..base import (
     LanguageModelOutput,
+    cache_position_offset,
     create_attention_mask,
     scaled_dot_product_attention,
 )
@@ -43,6 +44,9 @@ class Florence2Attention(nn.Module):
         layer_head_mask=None,
     ):
         batch_size, tgt_len, _ = hidden_states.shape
+
+        if self.is_causal and self.is_decoder:
+            attention_mask = create_attention_mask(hidden_states, cache)
 
         q = (
             self.q_proj(hidden_states)
@@ -110,10 +114,6 @@ class Florence2Attention(nn.Module):
                 .reshape(batch_size, src_len, self.num_heads, self.head_dim)
                 .transpose(0, 2, 1, 3)
             )
-
-        if self.is_causal and self.is_decoder:
-            causal_mask = create_attention_mask(hidden_states)
-            attention_mask = causal_mask
 
         attn_output = (
             scaled_dot_product_attention(
@@ -312,8 +312,8 @@ class Florence2Decoder(nn.Module):
         first_cache = cache[0][0]
         if first_cache.keys is not None:
             cache_length = (
-                first_cache._idx
-                if hasattr(first_cache, "_idx")
+                cache_position_offset(first_cache)
+                if hasattr(first_cache, "offset")
                 else first_cache.cache_length
             )
         else:

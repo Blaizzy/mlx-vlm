@@ -11,7 +11,6 @@ from .hy_v4_mtp import HyV4MTPDraftModel
 class HyV4MTPSplitter(MTPSplitter):
     output_model_type = "hy_v4_mtp"
     draft_model_cls = HyV4MTPDraftModel
-    require_text_config = False
     tie_word_embeddings_default = False
     depth_field = "num_nextn_predict_layers"
     block_size_extra = 1
