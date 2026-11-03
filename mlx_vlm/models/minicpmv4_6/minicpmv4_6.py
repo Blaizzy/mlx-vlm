@@ -265,8 +265,8 @@ class Model(nn.Module):
         current = mx.take(target_states, indices_mx, axis=0)
         return target_states.at[indices_mx].add(features - current)
 
-    def get_vision_embedding(self, pixel_values, tgt_sizes):
-        dtype = self.language_model.model.embed_tokens.weight.dtype
+    def get_vision_embedding(self, pixel_values, tgt_sizes, downsample_mode=None):
+        dtype = self.vision_tower.embeddings.patch_embedding.weight.dtype
 
         if pixel_values is None:
             return []
@@ -316,10 +316,10 @@ class Model(nn.Module):
                 grid_h = int(cur_tgt[0, 0].item())
                 grid_w = int(cur_tgt[0, 1].item())
 
-                insert_layer_id = int(getattr(self.config, "insert_layer_id", 6) or 6)
+                insert_layer_id = self.config.insert_layer_id
                 use_vit_merger = (
-                    str(getattr(self.config, "downsample_mode", "16x")) != "4x"
-                )
+                    downsample_mode or self.config.downsample_mode
+                ) != "4x"
                 for layer_index, encoder_layer in enumerate(
                     self.vision_tower.encoder.layers
                 ):
@@ -358,7 +358,9 @@ class Model(nn.Module):
         if cached is not None:
             vision_hidden_states = cached
         elif pixel_values is not None:
-            vision_hidden_states = self.get_vision_embedding(pixel_values, tgt_sizes)
+            vision_hidden_states = self.get_vision_embedding(
+                pixel_values, tgt_sizes, downsample_mode=kwargs.get("downsample_mode")
+            )
         else:
             vision_hidden_states = None
 

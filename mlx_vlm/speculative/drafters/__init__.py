@@ -5,6 +5,7 @@ from typing import Any, Optional, Tuple
 from .dflash2 import DFlash2DraftModel
 from .dspark import DSparkDraftModel
 from .laguna_dflash import LagunaDFlashDraftModel
+from .mtp_split import get_mtp_splitter
 from .muse_glimmer_assistant import MuseGlimmerAssistantDraftModel
 from .qwen3_dflash import DFlashDraftModel
 
@@ -13,8 +14,10 @@ KNOWN_DRAFTER_KINDS = {"dflash", "mtp", "eagle3"}
 # Drafter HF ``model_type`` → required round-loop kind. Anything not listed
 # here falls back to ``DEFAULT_DRAFTER_KIND`` when the caller didn't pass one.
 DRAFTER_KIND_BY_MODEL_TYPE = {
+    "nemotron_h_mtp": "mtp",
     "deepseek_v4_mtp": "mtp",
     "deepseek_v4_dspark": "dflash",
+    "mistral_large4_dspark": "dflash",
     "dspark": "dflash",
     "gemma4_dspark": "dflash",
     "eagle3": "eagle3",
@@ -118,11 +121,6 @@ def _read_drafter_config(model_path) -> dict:
         return {}
 
 
-def _peek_drafter_model_type(model_path) -> Optional[str]:
-    config = _read_drafter_config(model_path)
-    return config.get("model_type") or config.get("speculators_model_type")
-
-
 def _declares_mtp_layers(config: Any) -> bool:
     """True when the config declares next-token-prediction layers, the marker of
     a native checkpoint that carries an embedded ``mtp.*`` head."""
@@ -149,7 +147,9 @@ def _expected_drafter_kind(model_type: Any, config: Any = None) -> Optional[str]
     return None
 
 
-def resolve_drafter_kind(model_path, kind: Optional[str] = None) -> str:
+def resolve_drafter_kind(
+    model_path, kind: Optional[str] = None, *, config: Any = None
+) -> str:
     """Reconcile the caller's ``kind`` with the drafter's actual model type.
 
     When ``kind`` is None, auto-detect from the drafter's HF ``model_type`` or,
@@ -161,9 +161,18 @@ def resolve_drafter_kind(model_path, kind: Optional[str] = None) -> str:
     user points ``--draft-model`` at e.g. a ``gemma4_assistant`` checkpoint
     but forgets ``--draft-kind mtp``: rather than crashing deep inside
     ``draft_block`` with an opaque error, we pick the right kind for them.
+
+    Pass a loaded drafter's ``config`` to resolve its kind without rereading or
+    resolving the source checkpoint.
     """
-    config = _read_drafter_config(model_path)
-    model_type = config.get("model_type") or config.get("speculators_model_type")
+    if config is None:
+        config = _read_drafter_config(model_path)
+        splitter = get_mtp_splitter(source_config=config)
+        if splitter is not None:
+            config = {**config, "model_type": splitter.output_model_type}
+    model_type = _cfg_get(config, "model_type") or _cfg_get(
+        config, "speculators_model_type"
+    )
     expected = _expected_drafter_kind(model_type, config)
 
     if kind is None:
@@ -199,6 +208,9 @@ def load_drafter(
     drafter's HF ``model_type`` (see :func:`resolve_drafter_kind`). Callers
     should use ``resolved_kind`` for downstream dispatch instead of trusting
     their original ``kind`` arg.
+
+    Registered native checkpoints can be passed directly: their bundled drafter
+    tensors are loaded in memory through the shared splitter registry.
     """
     if kind is not None and kind not in KNOWN_DRAFTER_KINDS:
         raise ValueError(
@@ -207,8 +219,13 @@ def load_drafter(
     from ...utils import get_model_path, load_model
 
     path = get_model_path(path_or_repo)
-    resolved = resolve_drafter_kind(path, kind)
-    return load_model(path, **kwargs), resolved
+    config = _read_drafter_config(path)
+    splitter = get_mtp_splitter(source_config=config)
+    if splitter is not None:
+        model = splitter.load(path, source_config=config, **kwargs)
+    else:
+        model = load_model(path, **kwargs)
+    return model, resolve_drafter_kind(path, kind, config=model.config)
 
 
 __all__ = [

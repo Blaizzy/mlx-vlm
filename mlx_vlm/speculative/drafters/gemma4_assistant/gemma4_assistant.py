@@ -149,6 +149,10 @@ class Gemma4AssistantDraftModel(nn.Module):
         else:
             self._position = mx.array(position)
 
+    def release_shared_kv(self):
+        """Drafting is complete; the next round binds fresh committed views."""
+        self._shared_kv = None
+
     def __call__(
         self,
         inputs_embeds: mx.array,

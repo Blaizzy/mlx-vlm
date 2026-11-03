@@ -14,6 +14,11 @@ from ..deepseek_v32.language import (
     DeepseekV32DecoderLayer,
     DeepseekV32Model,
 )
+from ..switch_layers import (
+    EXPERT_WEIGHT_SUFFIXES,
+    expand_expert_scales,
+    stack_expert_projection,
+)
 from .cache import HyV4KVCache
 from .config import ModelConfig
 from .fused_switch_glu import FusedSwitchGLU
@@ -405,7 +410,19 @@ class Model(nn.Module):
                 weights[f"{mlp_prefix}.switch_mlp.gate_up_proj.scales"] = gate_up_scale
 
             switch_prefix = f"{mlp_prefix}.switch_mlp"
-            for suffix in ("weight", "scales", "biases"):
+            for name in ("gate_proj", "up_proj", "down_proj"):
+                stack_expert_projection(
+                    weights,
+                    f"{mlp_prefix}.experts",
+                    name,
+                    f"{switch_prefix}.{name}",
+                    self.args.n_routed_experts,
+                )
+            expand_expert_scales(
+                weights,
+                [f"{switch_prefix}.{name}" for name in ("gate_proj", "up_proj")],
+            )
+            for suffix in EXPERT_WEIGHT_SUFFIXES:
                 gate_key = f"{switch_prefix}.gate_proj.{suffix}"
                 up_key = f"{switch_prefix}.up_proj.{suffix}"
                 if gate_key in weights and up_key in weights:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import copy
+import gc
 import json
 import logging
 import math
@@ -13,6 +14,7 @@ import socket
 import subprocess
 import sys
 import time
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -23,8 +25,10 @@ from queue import Queue
 from threading import Event, Lock, Thread, Timer
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from urllib.request import Request, urlopen
 
-import httpx
+import anyio
+import httpx2
 import mlx.core as mx
 import numpy as np
 import pytest
@@ -39,10 +43,12 @@ import mlx_vlm.server as server
 import mlx_vlm.server.anthropic as anthropic
 import mlx_vlm.server.audio as server_audio
 import mlx_vlm.server.cli as cli
+import mlx_vlm.server.embeddings as embeddings
 import mlx_vlm.server.generation as generation
 import mlx_vlm.server.openai as openai
 import mlx_vlm.server.reranking as reranking
-from mlx_vlm import apc
+import mlx_vlm.server.sessions as sessions
+from mlx_vlm import apc, sample_utils
 from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.generate import GenerationResult
 from mlx_vlm.generate.image import ImageGenerationResult
@@ -54,8 +60,12 @@ from mlx_vlm.models.gpt_oss.processing_gpt_oss import (
 from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.server import GenerationArguments as Args
 from mlx_vlm.server import ResponseGenerator as Generator
-from mlx_vlm.server import compaction, realtime
-from mlx_vlm.server.model_discovery import discover_models, is_model_directory
+from mlx_vlm.server import compaction, continuation, realtime
+from mlx_vlm.server.model_discovery import (
+    discover_models,
+    is_model_directory,
+    model_reasoning_efforts,
+)
 from mlx_vlm.server.responses_state import (
     ToolCallStreamState,
     _response_items_to_chat,
@@ -65,6 +75,107 @@ from mlx_vlm.server.runtime_config import RuntimeConfig
 from mlx_vlm.tests.test_processors import MINICPM_MULTICALL
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
 from mlx_vlm.tools import load_tool_module, process_tool_calls
+
+
+@pytest.mark.parametrize("interval", ["0", "0.001"])
+@pytest.mark.parametrize("fail", [False, True])
+def test_stream_keepalives_preserve_output(monkeypatch, interval, fail):
+    monkeypatch.setenv("MLX_VLM_STREAM_KEEPALIVE_INTERVAL", interval)
+
+    async def check():
+        calls, chunks = [], []
+
+        async def source():
+            calls.append("start")
+            try:
+                await asyncio.sleep(0.02)
+                yield 'data: {"content":"OK"}\n\n'
+                if fail:
+                    raise RuntimeError("generation failed")
+                yield "data: [DONE]\n\n"
+            finally:
+                calls.append("closed")
+
+        async def consume():
+            async for chunk in openai._with_keepalives(source()):
+                chunks.append(chunk)
+
+        if fail:
+            with pytest.raises(RuntimeError, match="generation failed"):
+                await consume()
+        else:
+            await consume()
+        expected = ['data: {"content":"OK"}\n\n']
+        if not fail:
+            expected.append("data: [DONE]\n\n")
+        assert [chunk for chunk in chunks if not chunk.startswith(":")] == expected
+        assert (": keepalive\n\n" in chunks) == (interval != "0")
+        assert calls == ["start", "closed"]
+
+    asyncio.run(check())
+
+
+def test_stream_keepalives_close_on_disconnect(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_STREAM_KEEPALIVE_INTERVAL", "0.001")
+
+    async def check():
+        started, closed = asyncio.Event(), asyncio.Event()
+
+        async def source():
+            try:
+                started.set()
+                await asyncio.Event().wait()
+                yield "unreachable"
+            finally:
+                await asyncio.sleep(0)
+                closed.set()
+
+        async def consume():
+            async for _ in openai._with_keepalives(source()):
+                pass
+
+        async with anyio.create_task_group() as group:
+            group.start_soon(consume)
+            await started.wait()
+            group.cancel_scope.cancel()
+        assert closed.is_set()
+        assert len(asyncio.all_tasks()) == 1
+
+    asyncio.run(check())
+
+
+def test_cancellation_is_acknowledged_only_after_removal():
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen._cancelled = {7}
+    gen._cancel_lock = Lock()
+    rqueue = Queue()
+    active = {7: {"rqueue": rqueue}}
+    batch_gen = NS(remove=MagicMock(side_effect=[False, True]))
+
+    gen._apply_cancellations(batch_gen, active)
+    assert 7 in active
+    assert rqueue.empty()
+    assert gen._cancelled == {7}
+
+    gen._apply_cancellations(batch_gen, active)
+    assert active == {}
+    assert rqueue.get_nowait() is None
+    assert rqueue.empty()
+    assert gen._cancelled == set()
+    assert batch_gen.remove.call_count == 2
+
+
+def test_cancellation_of_finished_request_is_ignored():
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen._cancelled = {7}
+    gen._cancel_lock = Lock()
+    batch_gen = NS(remove=MagicMock())
+
+    gen._apply_cancellations(batch_gen, {})
+
+    batch_gen.remove.assert_not_called()
+    assert gen._cancelled == set()
+
 
 _MUSE_RESPONSE_TEMPLATE = {
     "defaults": {"role": "assistant"},
@@ -201,6 +312,24 @@ def _streaming(chunks, prompt_tokens=3):
     )
 
 
+def _resumable_streaming(chunks, prompt_tokens=3):
+    def generate(*args, session=None, **kwargs):
+        context = server.GenerationContext(uid=1, prompt_tokens=prompt_tokens)
+        if session is None:
+            return context, iter(chunks)
+        session.context = context
+        for chunk in chunks:
+            session.put(chunk)
+        session.put(None)
+        return context, session.reader()
+
+    return NS(
+        tokenizer=NS(decode=lambda tokens: ""),
+        validate_context_budget=MagicMock(),
+        generate=MagicMock(side_effect=generate),
+    )
+
+
 def _tool(name="get_weather", api="chat"):
     if api == "messages":
         return dict(
@@ -288,6 +417,1109 @@ def _chat_events(response, reason):
 
 def _assert_fields(actual, **expected):
     assert {key: actual[key] for key in expected} == expected
+
+
+@pytest.fixture
+def session_clock(monkeypatch):
+    clock = NS(now=100.0)
+    monkeypatch.setattr(
+        sessions,
+        "time",
+        NS(perf_counter=lambda: clock.now, monotonic=time.monotonic),
+    )
+    return clock
+
+
+class TestInferenceSession:
+    def test_decode_metrics_exclude_pauses_replay_and_peer_work(self, session_clock):
+        session = sessions.InferenceSession()
+
+        def emit(count, duration, finish=None):
+            with session.generating():
+                session_clock.now += duration
+                session.put(_token("text", token_count=count, finish_reason=finish))
+
+        emit(2, 20)  # Prefill and the first block are outside decode timing.
+        emit(3, 0.3)  # Produced ahead of the client's acknowledged first block.
+        first = session.reader()
+        assert next(first).decode_progress.rate is None
+        first.close()
+        session_clock.now += 120  # User pause, including work for another request.
+        resumed = session.reader(1, session.claim())
+        metrics = generation.GenerationMetrics()
+        assert metrics.record_chunk(next(resumed)) == pytest.approx(10)
+        assert metrics.rate == pytest.approx(10)
+        session_clock.now += 30  # Reading/replaying does not consume GPU time.
+        emit(1, 0.1)
+        assert metrics.record_chunk(next(resumed)) == pytest.approx(10)
+        resumed.close()
+        session_clock.now += 60
+        resumed = session.reader(3, session.claim())
+        emit(0, 0.5, "stop")  # Text finalization cannot inflate the token count.
+        assert metrics.record_chunk(next(resumed)) is None
+        assert metrics.generated_tokens == 6
+        assert metrics.rate == pytest.approx(10)
+        assert metrics.decode_progress.elapsed == pytest.approx(0.4)
+
+    def test_stop_during_a_step_counts_its_remaining_work(self, session_clock):
+        session = sessions.InferenceSession()
+        with session.generating():
+            session_clock.now += 20
+            session.put(_token("first"))
+        with session.generating():
+            session_clock.now += 0.04
+            session.pause(0)
+            session_clock.now += 0.06
+            session.put(_token("in flight"))
+        session_clock.now += 300
+        token = next(session.reader(1, session.claim()))
+        assert token.decode_progress.elapsed == pytest.approx(0.1)
+        assert token.decode_progress.rate == pytest.approx(10)
+
+    def test_server_ahead_output_is_replayed_before_new_tokens(self):
+        session = continuation.InferenceSession()
+        first = session.reader()
+        for text in ("one", "two", "three", "four"):
+            session.put(_token(text))
+        assert next(first).text == "one"
+        assert next(first).text == "two"
+        first.close()
+        lease = session.claim()
+        resumed = session.reader(2, lease)
+        assert next(resumed).text == "three"
+        assert next(resumed).text == "four"
+        session.put(_token("five", finish_reason="stop"))
+        assert [token.text for token in resumed] == ["five"]
+
+    def test_late_close_and_blocked_reader_cannot_pause_new_lease(self):
+        session = continuation.InferenceSession()
+        first = session.reader()
+        with ThreadPoolExecutor() as pool:
+            pending = pool.submit(lambda: list(first))
+            lease = session.claim()
+            first.close()
+            assert pending.result(timeout=2) == []
+        assert not session.paused
+        session.put(_token("next", finish_reason="stop"))
+        assert [t.text for t in session.reader(0, lease)] == ["next"]
+
+    @pytest.mark.parametrize("cause", ["expired", "evicted", "unloaded"])
+    def test_unavailable_state_fails_instead_of_regenerating(self, cause):
+        session = continuation.InferenceSession(ttl=1)
+        session.pause(0)
+        if cause == "expired":
+            session.touched -= 2
+        elif cause == "evicted":
+            session.dispose()
+        else:
+            session.owner = NS(_stop=True)
+        with pytest.raises(ValueError):
+            session.claim()
+
+    def test_paused_row_releases_slot_and_resume_obeys_capacity(self):
+        worker = Generator.__new__(Generator)
+        paused, peer = sessions.InferenceSession(), sessions.InferenceSession()
+        paused.pause(0)
+        snapshot = NS(prompt_cache=[])
+        engine = NS(
+            suspend=Mock(return_value=snapshot),
+            resume=Mock(),
+            remove=Mock(),
+            apc_manager=None,
+        )
+        active = {10: {"rqueue": paused}, 11: {"rqueue": peer}}
+        groups, suspended = {"same-settings": (engine, active)}, {}
+        worker._schedule_continuations(groups, suspended, 1)
+        assert list(active) == [11]
+        assert suspended[paused][1] is snapshot
+        engine.suspend.assert_called_once_with(10)
+        paused.claim()
+        worker._schedule_continuations(groups, suspended, 1)
+        engine.resume.assert_not_called()
+        assert paused in suspended
+        active.pop(11)
+        worker._schedule_continuations(groups, suspended, 1)
+        engine.resume.assert_called_once_with(snapshot)
+        assert list(active) == [10] and not suspended
+
+    def test_cache_budget_evicts_oldest_paused_row(self, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_CONTINUATION_CACHE_BYTES", "16")
+        worker = Generator.__new__(Generator)
+        old, new = sessions.InferenceSession(), sessions.InferenceSession()
+        old.pause(0)
+        new.pause(0)
+        states = [NS(prompt_cache=[mx.zeros((4,))]) for _ in range(2)]
+        engine = NS(suspend=Mock(side_effect=states), resume=Mock(), remove=Mock())
+        active = {1: {"rqueue": old}, 2: {"rqueue": new}}
+        groups, suspended = {0: (engine, active)}, {}
+        worker._schedule_continuations(groups, suspended, 4)
+        assert old not in suspended and new in suspended
+        assert not active
+        with pytest.raises(ValueError, match="evicted"):
+            old.claim()
+        assert new.error is None
+
+    def test_resume_waits_for_apc_memory_admission(self):
+        worker = Generator.__new__(Generator)
+        session = sessions.InferenceSession()
+        manager = NS(_make_room=Mock(return_value=False))
+        engine = NS(
+            apc_manager=manager,
+            resume=Mock(),
+            _generation_batch=NS(prompt_cache=[mx.zeros((4,))]),
+        )
+        snapshot = NS(prompt_cache=[mx.zeros((4,))])
+        groups = {0: (engine, {})}
+        suspended = {session: (0, snapshot, 1, {"rqueue": session})}
+        worker._schedule_continuations(groups, suspended, 4)
+        engine.resume.assert_not_called()
+        manager._make_room.assert_called_once_with(32)
+        manager._make_room.return_value = True
+        worker._schedule_continuations(groups, suspended, 4)
+        engine.resume.assert_called_once_with(snapshot)
+
+    def test_compatible_resumable_and_regular_requests_share_group(self):
+        worker = Generator.__new__(Generator)
+        worker.draft_model = None
+        first = NS(
+            args=Args(temperature=0.7, seed=91), session=sessions.InferenceSession()
+        )
+        second = NS(args=Args(temperature=0.7, seed=91), session=None)
+        assert worker._batch_key(first) == worker._batch_key(second)
+        second.args.seed = 92
+        assert worker._batch_key(first) != worker._batch_key(second)
+
+    @pytest.mark.parametrize(
+        "kind,shared", [("dflash", True), ("mtp", True), ("eagle3", False)]
+    )
+    def test_speculative_resumable_group_requires_row_restore(self, kind, shared):
+        worker = Generator.__new__(Generator)
+        worker.draft_model, worker.draft_kind = object(), kind
+        first = NS(args=Args(temperature=0.7), session=sessions.InferenceSession())
+        second = NS(args=Args(temperature=0.7), session=sessions.InferenceSession())
+        assert (worker._batch_key(first) == worker._batch_key(second)) == shared
+
+    def test_standard_sampling_positions_survive_other_random_draws(self):
+        sampler = Generator.__new__(Generator)._make_sampler(
+            Args(temperature=0.7, seed=91)
+        )
+        logits = mx.array([[0.4, 0.3, 0.2, 0.1]])
+        expected = [
+            sampler.sample_target(logits, row_ids=[0], positions=[i]).item()
+            for i in range(30)
+        ]
+        actual = []
+        for i in range(30):
+            mx.random.seed(i + 1000)
+            mx.random.uniform(shape=(100,)).tolist()
+            actual.append(
+                sampler.sample_target(logits, row_ids=[0], positions=[i]).item()
+            )
+        assert actual == expected
+
+
+class TestContinuation:
+    @pytest.fixture(autouse=True)
+    def checkpoints(self, monkeypatch):
+        monkeypatch.setattr(continuation, "CHECKPOINTS", continuation.Checkpoints())
+        monkeypatch.delenv("MLX_VLM_SERVER_API_KEY", raising=False)
+
+    @pytest.mark.parametrize("api", ["chat", "responses"])
+    @pytest.mark.parametrize("ttl", [None, 0, 60, 600])
+    def test_checkpoint_advertises_server_idle_timeout(self, client, api, ttl):
+        if ttl is not None:
+            continuation.CHECKPOINTS.ttl = ttl
+        with _endpoint(
+            generator=_resumable_streaming([_token("answer", finish_reason="stop")])
+        ):
+            response = _post(client, api, stream=True, resumable=True)
+        checkpoints = [
+            e["continuation"] for e in _data(response) if "continuation" in e
+        ]
+        assert checkpoints
+        expected_ttl = 120 if ttl is None else ttl
+        assert all(c["idle_timeout_seconds"] == expected_ttl for c in checkpoints)
+
+    def test_client_timeout_metadata_does_not_change_server_retention(self):
+        record = continuation.Generation(
+            {},
+            "tenant",
+            "/responses",
+            prompt="prompt",
+            parts=["raw"],
+            session=sessions.InferenceSession(),
+        )
+        continuation.CHECKPOINTS.add(record)
+        checkpoint = continuation.StreamState(record).checkpoint()
+        checkpoint["idle_timeout_seconds"] = 10_000
+        record.touched -= continuation.CHECKPOINTS.ttl + 1
+        with pytest.raises(ValueError, match="no longer available"):
+            continuation.CHECKPOINTS.resume(checkpoint, "tenant", "/responses")
+
+    @pytest.mark.parametrize("state", ["paused", "completed", "not_started"])
+    def test_prune_releases_expired_request_text_and_decoder(self, state):
+        store = continuation.Checkpoints(ttl=10)
+        source = Mock()
+        session = None
+        if state != "not_started":
+            session = sessions.InferenceSession(source=source)
+            session.put(_token("buffered text"))
+            if state == "completed":
+                session.put(None)
+            session.pause(0)
+        record = continuation.Generation(
+            {"messages": [{"content": "saved request and media"}]},
+            "tenant",
+            "/responses",
+            prompt="rendered prompt",
+            parts=["saved text"],
+            session=session,
+        )
+        record.touched -= 11
+        reference = weakref.ref(record)
+        store.add(record)
+        del record
+        store.prune()
+        assert not store.records
+        assert reference() is None
+        if session is not None:
+            assert session.history == []
+            assert session.source is None
+            source.close.assert_called_once()
+            with pytest.raises(ValueError):
+                session.claim()
+
+    @pytest.mark.parametrize("started", [False, True])
+    def test_active_request_does_not_expire_and_release_starts_idle_timeout(
+        self, started
+    ):
+        store = continuation.Checkpoints(ttl=10)
+        session = sessions.InferenceSession() if started else None
+        record = continuation.Generation(
+            {}, "tenant", "/responses", session=session, active=True
+        )
+        store.add(record)
+        record.touched -= 100
+        store.prune()
+        assert record.id in store.records
+        if session:
+            assert session.error is None
+        store.release(record)
+        assert not record.active
+        assert time.monotonic() - record.touched < 1
+        store.prune()
+        assert record.id in store.records
+        record.touched -= 11
+        store.prune()
+        assert not store.records
+
+    def test_expiring_old_handle_preserves_active_replacement_and_retries(self):
+        store = continuation.Checkpoints(ttl=10)
+        session = sessions.InferenceSession()
+        record = continuation.Generation(
+            {}, "tenant", "/responses", prompt="prompt", parts=["raw"], session=session
+        )
+        store.add(record)
+        checkpoint = {"id": record.id, "cursor": 1, "content": 3, "reasoning": 0}
+        replacement = store.resume(checkpoint, "tenant", "/responses")
+        store.release(record)  # A late close cannot pause the replacement.
+        assert not session.paused
+        store.prune()
+        retry = store.resume(checkpoint, "tenant", "/responses")
+        store.release(replacement)
+        record.touched -= 11
+        replacement.touched -= 11
+        retry.touched -= 100  # Active even before its first output arrives.
+        store.prune()
+        assert list(store.records) == [retry.id]
+        assert session.error is None and not session.paused
+        store.release(retry)
+        retry.touched -= 11
+        store.prune()
+        assert session.error is not None
+
+    def test_cleanup_failure_does_not_prevent_other_sessions_from_closing(self, caplog):
+        store = continuation.Checkpoints(ttl=10)
+        sources = [Mock(), Mock()]
+        sources[0].close.side_effect = RuntimeError("close failed")
+        for source in sources:
+            record = continuation.Generation(
+                {},
+                "tenant",
+                "/responses",
+                session=sessions.InferenceSession(source=source),
+            )
+            record.touched -= 11
+            store.add(record)
+        store.prune()
+        assert not store.records
+        assert "Error releasing an expired inference checkpoint" in caplog.text
+        for source in sources:
+            source.close.assert_called_once()
+
+    @pytest.mark.parametrize("api", ["chat", "responses"])
+    def test_lifespan_sweeps_without_traffic_and_clears_on_shutdown(
+        self, monkeypatch, api
+    ):
+        store = continuation.CHECKPOINTS
+        store.ttl = 10
+        monkeypatch.setattr(
+            server._app_module,
+            "checkpoint_cleanup",
+            lambda: continuation.checkpoint_cleanup(interval=0.01),
+        )
+        _reset_runtime(monkeypatch, audio_queue=None, realtime_engine=None)
+        for key in list(os.environ):
+            if key.startswith("MLX_VLM_PRELOAD_"):
+                monkeypatch.delenv(key)
+        with TestClient(server.app) as client:
+            with _endpoint(
+                generator=_resumable_streaming([_token("answer", finish_reason="stop")])
+            ):
+                response = _post(client, api, stream=True, resumable=True)
+            checkpoint = _data(response)[-1]["continuation"]
+            record = store.records[checkpoint["id"]]
+            reference = weakref.ref(record)
+            session = record.session
+            disposed = Event()
+            original_dispose = session.dispose
+
+            def dispose():
+                original_dispose()
+                disposed.set()
+
+            session.dispose = dispose
+            record.touched -= store.ttl + 1
+            del record
+            # No HTTP call triggers this cleanup: the lifespan task does it.
+            assert disposed.wait(2)
+            gc.collect()
+            assert reference() is None and not store.records
+            with _endpoint() as fake:
+                expired = _post(client, api, stream=True, continuation=checkpoint)
+            assert expired.status_code == 409
+            fake.cache.assert_not_called()
+            source = Mock()
+            active = continuation.Generation(
+                {},
+                "tenant",
+                "/responses",
+                active=True,
+                session=sessions.InferenceSession(source=source),
+            )
+            store.add(active)
+        assert not store.records
+        source.close.assert_called_once()
+
+    @pytest.mark.parametrize("api", ["chat", "responses"])
+    @pytest.mark.parametrize("batched", [False, True])
+    def test_resume_keeps_cumulative_producer_timings(
+        self, client, api, batched, session_clock, monkeypatch
+    ):
+        def chunks():
+            for i, text in enumerate(("one", " two", " three")):
+                session_clock.now += 20 if i == 0 else 0.1
+                finish = "stop" if i == 2 else None
+                yield (
+                    _token(text, finish_reason=finish)
+                    if batched
+                    else _result(text, generation_tokens=i + 1, finish_reason=finish)
+                )
+
+        worker = _resumable_streaming([]) if batched else None
+        if worker:
+
+            def generate(*args, session, **kwargs):
+                context = server.GenerationContext(uid=1, prompt_tokens=8)
+                iterator = chunks()
+                for _ in range(3):
+                    with session.generating():
+                        session.put(next(iterator))
+                return context, session.reader()
+
+            worker.generate.side_effect = generate
+        monkeypatch.setattr(server.runtime, "metrics", server.ServerMetricsStore())
+        options = dict(stream=True, stream_options={"include_usage": True})
+        with _endpoint(generator=worker, chunks=chunks()):
+            original = _post(client, api, resumable=True, **options)
+            checkpoint = next(
+                e["continuation"]
+                for e in _data(original)
+                if e.get("continuation", {}).get("cursor") == 1
+            )
+            session_clock.now += 120
+            resumed = _post(client, api, continuation=checkpoint, **options)
+            # Also resume a finished cursor: replay of the parser prefix alone
+            # must restore counts and rates without measuring delivery speed.
+            terminal = _data(resumed)[-1]["continuation"]
+            finished = _post(client, api, continuation=terminal, **options)
+        for response in (original, resumed, finished):
+            event = _data(response)[-1]
+            timings = event["timings"]
+            assert timings["predicted_n"] == 3
+            assert timings["predicted_per_second"] == pytest.approx(10)
+            usage = event.get("usage") or event["response"]["usage"]
+            assert usage.get("prompt_tokens", usage.get("input_tokens")) == 8
+        latest = server.runtime.metrics.snapshot()["latest"]
+        assert latest["decode_tok_s"] == pytest.approx(10)
+        assert latest["decode_elapsed_s"] == pytest.approx(0.2)
+
+    @pytest.mark.parametrize("api", ["chat", "responses"])
+    @pytest.mark.parametrize("batched", [False, True])
+    @pytest.mark.parametrize("thinking", [False, True])
+    def test_resume_preserves_prompt_settings_and_parser_state(
+        self, client, api, batched, thinking
+    ):
+        first = "<think>why" if thinking else "first"
+        suffix = " next</think>answer" if thinking else " next"
+        chunks = [_token(first), _token(suffix, finish_reason="stop")]
+        worker = _resumable_streaming(chunks) if batched else None
+        fallback = [
+            _result(t.text, generation_tokens=i + 1) for i, t in enumerate(chunks)
+        ]
+        options = {
+            "enable_thinking": thinking,
+            "temperature": 0.3,
+            "max_tokens": 50,
+            "max_output_tokens": 50,
+            "context_management": [],
+        }
+        with _endpoint(generator=worker, chunks=fallback) as original:
+            response = _post(client, api, stream=True, resumable=True, **options)
+        if not batched:
+            assert "sampler" not in original.stream.call_args.kwargs
+        assert response.headers["X-MLX-Continuation"] == "1"
+        checkpoint = next(
+            e["continuation"]
+            for e in _data(response)
+            if e.get("continuation", {}).get("cursor") == 1
+            and e["continuation"]["reasoning" if thinking else "content"]
+        )
+        original_worker = worker
+        worker = (
+            _resumable_streaming([_token("WRONG", finish_reason="stop")])
+            if batched
+            else None
+        )
+        with _endpoint(
+            generator=worker,
+            chunks=[_result(suffix, generation_tokens=1)],
+            template="CHANGED",
+        ) as fake:
+            response = _post(
+                client,
+                api,
+                stream=True,
+                continuation=checkpoint,
+                temperature=1.9,
+                messages=[_msg("RESTART")],
+                input="RESTART",
+            )
+        events = _data(response)
+        assert not any(
+            "error" in e or e.get("type") == "response.failed" for e in events
+        )
+        fake.template.assert_not_called()
+        if worker:
+            worker.generate.assert_not_called()
+            worker.validate_context_budget.assert_not_called()
+            prompt, _, _, args, _ = original_worker.generate.call_args.args
+            assert args.temperature == 0.3 and args.max_tokens == 50
+            assert args.skip_special_tokens is False
+            assert prompt == "prompt"
+        else:
+            fake.stream.assert_not_called()
+        if api == "responses":
+            final = _completed_response(response)
+            assert final["output_text"] == ("answer" if thinking else " next")
+        else:
+            deltas = _deltas(response)
+            assert "".join(d.get("content") or "" for d in deltas) == (
+                "answer" if thinking else " next"
+            )
+            if thinking:
+                assert "".join(d.get("reasoning") or "" for d in deltas) == " next"
+                assert (
+                    "".join(d.get("reasoning_content") or "" for d in deltas) == " next"
+                )
+        final_checkpoint = events[-1]["continuation"]
+        assert final_checkpoint["id"] != checkpoint["id"]
+        assert final_checkpoint["cursor"] == 2
+        assert final_checkpoint["reasoning"] == (len("why next") if thinking else 0)
+
+    @pytest.mark.parametrize("api", ["chat", "responses"])
+    def test_partial_tool_arguments_replay_without_duplicate_prose(self, client, api):
+        prefix = 'checking<tool_call>{"name":"get_weather","arguments":{"city":"'
+        suffix = 'Warsaw"}}</tool_call>'
+        with _endpoint(
+            generator=_resumable_streaming(
+                [_token(prefix), _token(suffix, finish_reason="stop")]
+            ),
+            parser=_JSON_TOOLS,
+        ):
+            events = _data(
+                _post(client, api, stream=True, resumable=True, tools=[_tool()])
+            )
+        checkpoint = next(
+            e["continuation"]
+            for e in events
+            if e.get("continuation", {}).get("cursor") == 1
+            and e["continuation"]["content"]
+        )
+        with _endpoint(
+            generator=_resumable_streaming([_token(suffix, finish_reason="stop")]),
+            parser=_JSON_TOOLS,
+        ):
+            response = _post(client, api, stream=True, continuation=checkpoint)
+        if api == "responses":
+            result = _completed_response(response)
+            calls = [i for i in result["output"] if i["type"] == "function_call"]
+            assert result["output_text"] == ""
+            assert len(calls) == 1
+            assert json.loads(calls[0]["arguments"]) == {"city": "Warsaw"}
+        else:
+            deltas = _deltas(response)
+            assert "".join(d.get("content") or "" for d in deltas) == ""
+            arguments = "".join(
+                c["function"].get("arguments", "")
+                for d in deltas
+                for c in d.get("tool_calls") or []
+            )
+            assert json.loads(arguments) == {"city": "Warsaw"}
+
+    def test_resume_does_not_prepare_or_retokenize_saved_generation(self):
+        record = continuation.Generation({}, "tenant", "/responses", prompt="prompt")
+        state = continuation.StreamState(record, {"content": 0})
+        token = continuation.ACTIVE.set(state)
+        try:
+            with pytest.raises(RuntimeError, match="restore the retained decoder"):
+                continuation.prepare_generation("new", [], [], Args(), [])
+        finally:
+            continuation.ACTIVE.reset(token)
+
+    def test_disconnect_before_worker_dispatch_does_not_start_generation(self):
+        state = continuation.StreamState(
+            continuation.Generation({}, "tenant", "/responses")
+        )
+        state.closed = True
+        token = continuation.ACTIVE.set(state)
+        generate = Mock()
+        try:
+            with pytest.raises(RuntimeError, match="closed before generation"):
+                continuation.start_generation(generate, "prompt", args=Args())
+            generate.assert_not_called()
+            assert state.record.session.error is not None
+        finally:
+            continuation.ACTIVE.reset(token)
+
+    def test_previous_handle_can_retry_without_forking_decoder(self):
+        store = continuation.Checkpoints(capacity=2)
+        session = continuation.InferenceSession()
+        record = continuation.Generation(
+            {}, "tenant", "/responses", prompt="prompt", parts=["raw"], session=session
+        )
+        store.add(record)
+        checkpoint = {"id": record.id, "cursor": 1, "content": 3, "reasoning": 0}
+        first = store.resume(checkpoint, "tenant", "/responses")
+        second = store.resume(checkpoint, "tenant", "/responses")
+        assert first.session is second.session is session
+        assert first.lease < second.lease
+        assert session.error is None
+        store.add(continuation.Generation({}, "tenant", "/responses"))
+        assert session.error is None  # The current handle still owns the state.
+
+    def test_legacy_prefix_does_not_advance_decoder_cursor(self):
+        session = continuation.InferenceSession()
+        session.context = server.GenerationContext(uid=1, prompt_tokens=3)
+        for text in ("new", " tail"):
+            session.put(_token(text))
+        session.put(None)
+        record = continuation.Generation(
+            {},
+            "tenant",
+            "/responses",
+            prompt="prompt",
+            initial_prefix="old ",
+            parts=["new"],
+            session=session,
+        )
+        state = continuation.StreamState(record, {"content": 7, "reasoning": 0})
+        token = continuation.ACTIVE.set(state)
+        try:
+            generate = Mock(side_effect=AssertionError("must not regenerate"))
+            _, reader = continuation.start_generation(generate, "ignored")
+            assert [t.text for t in reader] == ["old new", " tail"]
+        finally:
+            continuation.ACTIVE.reset(token)
+
+    @pytest.mark.parametrize(
+        "failure",
+        ["missing", "tenant", "endpoint", "expired", "evicted", "cursor", "offset"],
+    )
+    def test_invalid_checkpoint_fails_without_generation(self, client, failure):
+        store = continuation.CHECKPOINTS
+        record = continuation.Generation(
+            {}, "tenant", "/v1/responses", prompt="prompt", parts=["raw"]
+        )
+        store.add(record)
+        checkpoint = {
+            "id": record.id,
+            "cursor": 1,
+            "content": 3,
+            "reasoning": 0,
+            "responses": True,
+        }
+        if failure == "missing":
+            checkpoint["id"] = "missing"
+        elif failure == "tenant":
+            record.tenant = "another"
+        elif failure == "endpoint":
+            record.path = "/v1/chat/completions"
+        elif failure == "expired":
+            record.touched -= store.ttl + 1
+        elif failure == "evicted":
+            store.capacity = 1
+            store.add(continuation.Generation({}, "tenant", "/v1/responses"))
+        elif failure == "cursor":
+            checkpoint["cursor"] = 2
+        else:
+            checkpoint["content"] = 4
+        with _endpoint() as fake:
+            response = client.post(
+                "/v1/responses",
+                json={"stream": True, "continuation": checkpoint},
+                headers={"X-APC-Tenant": "tenant"},
+            )
+        assert response.status_code == 409
+        fake.cache.assert_not_called()
+
+    def test_authentication_precedes_checkpoint_lookup(self, client, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_SERVER_API_KEY", "secret")
+        with patch.object(continuation.CHECKPOINTS, "resume") as resume:
+            response = _post(
+                client,
+                "responses",
+                stream=True,
+                continuation={
+                    "id": "missing",
+                    "cursor": 0,
+                    "content": 0,
+                    "reasoning": 0,
+                    "responses": True,
+                },
+            )
+        assert response.status_code == 401
+        resume.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"resumable": True, "stream": False},
+            {"stream": True, "continuation": {"id": "bad", "cursor": -1}},
+            {"stream": True, "continuation": {"id": "bad", "cursor": True}},
+        ],
+    )
+    def test_options_are_validated(self, client, payload):
+        assert _post(client, "responses", **payload).status_code == 400
+
+    def test_normal_stream_has_no_continuation_state(self, client):
+        response = _stream_response(client, [_token("ordinary", finish_reason="stop")])
+        assert "X-MLX-Continuation" not in response.headers
+        assert all("continuation" not in e for e in _data(response))
+        assert not continuation.CHECKPOINTS.records
+
+
+@pytest.mark.skipif(
+    not os.environ.get("MLX_VLM_CONTINUATION_URL"),
+    reason="Set MLX_VLM_CONTINUATION_URL for real-model coverage",
+)
+class TestContinuationLive:
+    """Run against a native server with MLX_VLM_CONTINUATION_MODEL loaded."""
+
+    def stream(self, path, body, stop=None):
+        result = {"content": "", "reasoning": "", "arguments": "", "checkpoint": None}
+        request = Request(
+            os.environ["MLX_VLM_CONTINUATION_URL"] + path,
+            data=json.dumps(body).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "X-APC-Tenant": "resumption-test",
+            },
+        )
+        with urlopen(request, timeout=120) as response:
+            for line in response:
+                if not line.startswith(b"data:") or line[5:].strip() == b"[DONE]":
+                    continue
+                event = json.loads(line[5:])
+                assert (
+                    "error" not in event and event.get("type") != "response.failed"
+                ), event
+                if "continuation" in event:
+                    result["checkpoint"] = event["continuation"]
+                timings = event.get("timings")
+                if timings and "predicted_n" in timings:
+                    result["timings"] = timings
+                for choice in event.get("choices", []):
+                    delta = choice.get("delta", {})
+                    result["content"] += delta.get("content") or ""
+                    result["reasoning"] += (
+                        delta.get("reasoning") or delta.get("reasoning_content") or ""
+                    )
+                    for call in delta.get("tool_calls") or []:
+                        result["arguments"] += (
+                            call.get("function", {}).get("arguments") or ""
+                        )
+                kind = event.get("type")
+                if kind == "response.output_text.delta":
+                    result["content"] += event["delta"]
+                if kind == "response.reasoning_text.delta":
+                    result["reasoning"] += event["delta"]
+                if kind == "response.function_call_arguments.delta":
+                    result["arguments"] += event["delta"]
+                if stop and stop(result):
+                    assert result["checkpoint"] is not None
+                    break
+        return result
+
+    def body(self, path, thinking=False, tools=False):
+        prompt = "Write the numbers from 1 to 40 separated by commas. No other text."
+        if thinking:
+            prompt = "Find the smallest positive integer divisible by 18, 24, and 35. Explain the calculation."
+        if tools:
+            prompt = "Call record_note with exactly this text: The quick brown fox jumps over the lazy dog and then walks home."
+        body = {
+            "model": os.environ.get("MLX_VLM_CONTINUATION_MODEL", "LiquidAI/LFM3-1.7B"),
+            "stream": True,
+            "temperature": 0,
+            "enable_thinking": thinking,
+            "resumable": True,
+        }
+        body["input" if path.endswith("responses") else "messages"] = [
+            {"role": "user", "content": prompt}
+        ]
+        body["max_output_tokens" if path.endswith("responses") else "max_tokens"] = (
+            2048 if thinking else 512
+        )
+        if tools:
+            definition = {
+                "name": "record_note",
+                "description": "Record a note.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                    "required": ["text"],
+                },
+            }
+            body["tools"] = [
+                (
+                    {"type": "function", **definition}
+                    if path.endswith("responses")
+                    else {"type": "function", "function": definition}
+                )
+            ]
+        return body
+
+    @pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/responses"])
+    def test_decode_rate_and_token_count_survive_pause_and_replay(self, path):
+        body = self.body(path)
+        if path.endswith("completions"):
+            body["stream_options"] = {"include_usage": True}
+        baseline = self.stream(path, body)
+        acknowledged = []
+
+        def stop(result):
+            if len(result["content"]) > 20 and not acknowledged:
+                acknowledged.append(copy.deepcopy(result))
+            # Leave some already-generated output beyond the acknowledged cursor.
+            return len(result["content"]) > 70
+
+        self.stream(path, body, stop)
+        first = acknowledged[0]
+        time.sleep(3)
+        resumed = self.stream(path, {**body, "continuation": first["checkpoint"]})
+        assert first["content"] + resumed["content"] == baseline["content"]
+        before, after = baseline["timings"], resumed["timings"]
+        print(f"{path}: before={before}, resumed={after}")
+        assert after["predicted_n"] == before["predicted_n"]
+        assert after["predicted_per_second"] > 0.6 * before["predicted_per_second"]
+        replayed = self.stream(path, {**body, "continuation": resumed["checkpoint"]})
+        assert replayed["timings"]["predicted_n"] == after["predicted_n"]
+        assert (
+            replayed["timings"]["predicted_per_second"] == after["predicted_per_second"]
+        )
+
+    @pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/responses"])
+    @pytest.mark.parametrize("thinking", [False, True])
+    def test_repeated_stop_resume_preserves_prefix_and_task(self, path, thinking):
+        body = self.body(path, thinking=thinking)
+        baseline = self.stream(path, body)
+        first = self.stream(
+            path, body, lambda r: len(r["reasoning"] if thinking else r["content"]) > 40
+        )
+        key = "reasoning" if thinking else "content"
+        # Require an actual interruption. A missing reasoning parser must not
+        # turn this into a full generation followed by an empty "resume".
+        assert 40 < len(first[key]) < len(baseline[key])
+        assert first[key] == baseline[key][: len(first[key])]
+        resumed_body = {**body, "continuation": first["checkpoint"]}
+        resumed_body["input" if path.endswith("responses") else "messages"] = [
+            _msg("Ignore the original task and say restart.")
+        ]
+        second = self.stream(
+            path, resumed_body, lambda r: len(r["content"] + r["reasoning"]) > 30
+        )
+        third = self.stream(path, {**body, "continuation": second["checkpoint"]})
+        assert second["checkpoint"]["cursor"] > first["checkpoint"]["cursor"]
+        for channel in ("content", "reasoning"):
+            assert second["checkpoint"][channel] == len(
+                first[channel] + second[channel]
+            )
+        for channel in ("content", "reasoning"):
+            assert (
+                first[channel] + second[channel] + third[channel] == baseline[channel]
+            )
+        if thinking:
+            assert "2520" in third["content"]
+            assert "<think>" not in third["content"]
+
+    @pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/responses"])
+    @pytest.mark.parametrize("typical_p", [1.0, 0.8])
+    def test_sampled_resume_preserves_full_output_across_peer_request(
+        self, path, typical_p
+    ):
+        body = {
+            **self.body(path, thinking=True),
+            "temperature": 0.7,
+            "seed": 91,
+            "top_p": 0.9,
+            "top_k": 40,
+            "typical_p": typical_p,
+            "repetition_penalty": 1.05,
+        }
+        baseline = self.stream(path, body)
+        first = self.stream(path, body, lambda r: len(r["reasoning"]) > 40)
+        assert 40 < len(first["reasoning"]) < len(baseline["reasoning"])
+        self.stream(path, {**self.body(path), "temperature": 1.3, "seed": 12})
+        second = self.stream(
+            path,
+            {**body, "continuation": first["checkpoint"]},
+            lambda r: len(r["reasoning"] + r["content"]) > 30,
+        )
+        final = self.stream(path, {**body, "continuation": second["checkpoint"]})
+        for channel in ("content", "reasoning"):
+            assert (
+                first[channel] + second[channel] + final[channel] == baseline[channel]
+            )
+
+    @pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/responses"])
+    def test_partial_tool_call_resumes_as_one_complete_call(self, path):
+        body = self.body(path, tools=True)
+        baseline = self.stream(path, body)
+        first = self.stream(path, body, lambda r: len(r["arguments"]) > 15)
+        assert first["arguments"]
+        resumed = self.stream(path, {**body, "continuation": first["checkpoint"]})
+        assert json.loads(resumed["arguments"]) == json.loads(baseline["arguments"])
+
+    @pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/responses"])
+    def test_legacy_open_message_continues_without_a_new_turn(self, path):
+        body = self.body(path)
+        key = "input" if path.endswith("responses") else "messages"
+        body[key].append(_msg("1, 2, 3, 4,", "assistant"))
+        body["continue_final_message"] = True
+        result = self.stream(path, body)
+        assert result["content"].startswith(" 5, 6, 7,"), result
+        first = self.stream(path, body, lambda r: len(r["content"]) > 40)
+        resumed = self.stream(
+            path, {"stream": True, "continuation": first["checkpoint"]}
+        )
+        assert first["content"] + resumed["content"] == result["content"]
+
+    def test_deferred_context_keeps_original_prompt(self):
+        path = "/v1/responses"
+        body = self.body(path)
+        body["context_management"] = [{"type": "compaction", "compact_threshold": 4096}]
+        body["transient_context"] = "Current environment: this is a counting exercise."
+        baseline = self.stream(path, body)
+        first = self.stream(path, body, lambda r: len(r["content"]) > 40)
+        resumed = self.stream(
+            path,
+            {
+                **body,
+                "continuation": first["checkpoint"],
+                "transient_context": "A new instruction: say RESTART instead.",
+            },
+        )
+        assert first["content"] + resumed["content"] == baseline["content"]
+
+
+class TestImageProcessingOptions:
+    @pytest.mark.parametrize("api", ["chat", "responses", "messages"])
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("batched", [False, True])
+    def test_endpoints_forward_options(self, client, api, stream, batched):
+        options = dict(min_pixels=1048576, max_pixels=4194304, resize_shape=[1024])
+        expected = dict(options, resize_shape=(1024, 1024))
+        worker = _streaming([_token("done", finish_reason="stop")]) if batched else None
+        with _endpoint(generator=worker) as fake:
+            response = _post(client, api, stream=stream, **options)
+        assert response.status_code == 200, response.text
+        if worker is not None:
+            call = worker.generate.call_args
+            args = call.kwargs.get("args") or call.args[3]
+            assert args.preprocessing_kwargs() == expected
+            if stream:
+                checked = worker.validate_context_budget.call_args.kwargs["args"]
+                assert checked.preprocessing_kwargs() == expected
+        else:
+            call = fake.stream if stream else fake.generate
+            _assert_fields(call.call_args.kwargs, **expected)
+
+    @pytest.mark.parametrize("api", ["chat", "responses", "messages"])
+    @pytest.mark.parametrize(
+        "options",
+        [dict(min_pixels=0), dict(max_pixels=-1), dict(min_pixels=100, max_pixels=50)],
+    )
+    def test_invalid_pixel_limits(self, client, api, options):
+        with _endpoint() as fake:
+            response = _post(client, api, **options)
+        assert response.status_code in (400, 422), response.text
+        fake.generate.assert_not_called()
+
+    def test_defaults_overrides_and_effective_validation(self, monkeypatch):
+        for key in ("MLX_VLM_MIN_PIXELS", "MLX_VLM_MAX_PIXELS"):
+            monkeypatch.delenv(key, raising=False)
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
+        assert server._build_gen_args(_chat_request()).preprocessing_kwargs() == {}
+        monkeypatch.setenv("MLX_VLM_MIN_PIXELS", "1048576")
+        monkeypatch.setenv("MLX_VLM_MAX_PIXELS", "4194304")
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
+        for options, expected in [
+            ({}, dict(min_pixels=1048576, max_pixels=4194304)),
+            (dict(min_pixels=None), dict(min_pixels=1048576, max_pixels=4194304)),
+            (dict(min_pixels=65536), dict(min_pixels=65536, max_pixels=4194304)),
+        ]:
+            args = server._build_gen_args(_chat_request(**options))
+            assert args.preprocessing_kwargs() == expected
+        with pytest.raises(ValueError, match="min_pixels must not exceed max_pixels"):
+            server._build_gen_args(_chat_request(max_pixels=65536))
+
+    @pytest.mark.parametrize(
+        "options,valid",
+        [
+            (["--min-pixels", "1048576", "--max-pixels", "4194304"], True),
+            (["--min-pixels", "0"], False),
+            (["--min-pixels", "100", "--max-pixels", "50"], False),
+        ],
+    )
+    def test_cli(self, monkeypatch, options, valid):
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
+        monkeypatch.setattr(sys, "argv", ["mlx_vlm.server", *options])
+        with patch.dict(os.environ), patch.object(cli.uvicorn, "run") as run:
+            for key in ("MLX_VLM_MIN_PIXELS", "MLX_VLM_MAX_PIXELS"):
+                os.environ.pop(key, None)
+            if valid:
+                cli.main()
+                assert os.environ["MLX_VLM_MIN_PIXELS"] == "1048576"
+                assert os.environ["MLX_VLM_MAX_PIXELS"] == "4194304"
+                assert server.runtime.config.image_pixel_limits() == dict(
+                    min_pixels=1048576, max_pixels=4194304
+                )
+                server.runtime.config.apply_changes(
+                    dict(min_pixels=None, max_pixels=None)
+                )
+                server.runtime.config.apply_changes({}, op="replace")
+                assert server.runtime.config.image_pixel_limits() == dict(
+                    min_pixels=1048576, max_pixels=4194304
+                )
+                run.assert_called_once()
+            else:
+                with pytest.raises(SystemExit):
+                    cli.main()
+                run.assert_not_called()
+
+    def test_worker_preprocessing_and_context_budget(self, monkeypatch):
+        prepare = Mock(return_value={"input_ids": np.zeros((1, 1024), np.int32)})
+        monkeypatch.setattr(generation, "prepare_inputs", prepare)
+        monkeypatch.setenv("MAX_KV_SIZE", "2048")
+        gen = _ready_generator(
+            model=NS(config=NS(model_type="qwen3_5")), processor=NS()
+        )
+        gen._cpu_preprocess = Generator._cpu_preprocess.__get__(gen)
+        queued = _capture_requests(gen)
+        options = dict(
+            min_pixels=1048576, max_pixels=4194304, resize_shape=(1024, 1024)
+        )
+        args = Args(max_tokens=1, **options)
+        gen.validate_context_budget("prompt", images=["same.png"], args=args)
+        _, tokens = gen.generate("prompt", images=["same.png"], args=args)
+        tokens.close()
+        assert queued[0].prompt_tokens == 1024
+        assert prepare.call_count == 2
+        for call in prepare.call_args_list:
+            _assert_fields(call.kwargs, **options)
+        monkeypatch.setenv("MAX_KV_SIZE", "512")
+        with pytest.raises(server.PromptTooLongError):
+            gen.validate_context_budget("prompt", images=["same.png"], args=args)
+
+    @pytest.mark.parametrize("api", ["responses/input_tokens", "messages/count_tokens"])
+    @pytest.mark.parametrize("batched", [False, True])
+    def test_token_count_options(self, client, api, batched):
+        options = dict(min_pixels=1048576, max_pixels=4194304)
+        prepare = Mock(return_value={"input_ids": np.zeros((1, 1024), np.int32)})
+        worker = NS(_cpu_preprocess=prepare) if batched else None
+        module = openai if api.startswith("responses") else anthropic
+        with (
+            _endpoint(generator=worker),
+            patch.object(module, "prepare_inputs", prepare),
+        ):
+            response = _post(client, "/v1/" + api, **options)
+        assert response.status_code == 200, response.text
+        assert response.json()["input_tokens"] == 1024
+        _assert_fields(prepare.call_args.kwargs, **options)
+
+    @pytest.mark.parametrize(
+        "geometry",
+        [
+            "pixel_values",
+            "image_grid_thw",
+            "image_position_ids",
+            "image_grid_hw",
+            "image_permutations",
+        ],
+    )
+    def test_worker_cache_separates_processed_resolutions(self, geometry):
+        from mlx_vlm.vision_cache import VisionFeatureCache
+
+        cache = VisionFeatureCache()
+        encoded = []
+
+        def embed(ids, pixels, **kwargs):
+            key = kwargs["_image_key"]
+            marker = (
+                pixels.shape[0]
+                if geometry == "pixel_values"
+                else kwargs[geometry].item()
+            )
+            features = cache.get(key)
+            if features is None:
+                features = mx.full((pixels.shape[0], 4), marker)
+                cache.put(key, features)
+                encoded.append(key)
+            assert features.shape[0] == pixels.shape[0]
+            assert features[0, 0].item() == marker
+            return NS(to_dict=lambda: {"inputs_embeds": features})
+
+        gen = _generator(model=NS(get_input_embeddings=embed), vision_cache=cache)
+        for size in (256, 1024, 256):
+            inputs = dict(input_ids=mx.array([[1]]), pixel_values=mx.zeros((256, 3)))
+            inputs[geometry] = (
+                mx.zeros((size, 3)) if geometry == "pixel_values" else mx.array([size])
+            )
+            gen._gpu_embed(
+                inputs,
+                images=["same.png"],
+            )
+        assert len(encoded) == len(cache) == 2
 
 
 def _sse_events(body):
@@ -397,6 +1629,63 @@ def _reset_runtime(monkeypatch, **overrides):
 def client():
     with TestClient(server.app) as test_client:
         yield test_client
+
+
+class TestEmbeddingEncoding:
+    @pytest.mark.parametrize("encoding", ["default", "float", None, "base64"])
+    @pytest.mark.parametrize("kind", ["single", "batch", "mixed"])
+    def test_response_encoding(self, client, encoding, kind):
+        vectors = [[0.0, -0.0, 1.25, -2.5, 1 / 3], [9.0, 8.0, 7.0, 6.0, 5.0]]
+        if kind == "single":
+            inputs = "text"
+            expected = vectors[:1]
+        elif kind == "batch":
+            inputs = ["first", "second"]
+            expected = vectors
+        else:
+            inputs = ["text", {"type": "image_url", "image_url": "image.png"}]
+            expected = vectors
+        body = dict(input=inputs, model="embedding")
+        if encoding != "default":
+            body["encoding_format"] = encoding
+        with (
+            patch.object(server, "get_cached_model", return_value=(None, None)) as load,
+            patch.object(embeddings, "_embed", return_value=(expected, 3)),
+            patch.object(embeddings, "_embed_image", return_value=(vectors[1], 4)),
+        ):
+            response = client.post("/v1/embeddings", json=body)
+        assert response.status_code == 200
+        result = response.json()
+        assert result["object"] == "list" and result["model"] == "embedding"
+        assert result["usage"] == dict(
+            prompt_tokens=7 if kind == "mixed" else 3,
+            total_tokens=7 if kind == "mixed" else 3,
+        )
+        load.assert_called_once_with("embedding", model_kind="embedding")
+        assert len(result["data"]) == len(expected)
+        for index, (item, vector) in enumerate(zip(result["data"], expected)):
+            assert item["object"] == "embedding" and item["index"] == index
+            if encoding == "base64":
+                assert isinstance(item["embedding"], str)
+                raw = base64.b64decode(item["embedding"], validate=True)
+                assert len(raw) == 4 * len(vector)
+                decoded = np.frombuffer(raw, dtype="<f4")
+                np.testing.assert_array_equal(
+                    decoded, np.array(vector, dtype=np.float32)
+                )
+                assert np.signbit(decoded[1]) == np.signbit(vector[1])
+            else:
+                assert item["embedding"] == vector
+
+    @pytest.mark.parametrize("encoding", ["binary", ""])
+    def test_invalid_encoding(self, client, encoding):
+        with patch.object(server, "get_cached_model") as load:
+            response = client.post(
+                "/v1/embeddings",
+                json=dict(input="text", model="embedding", encoding_format=encoding),
+            )
+        assert response.status_code == 422
+        load.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -615,6 +1904,17 @@ def test_unload_model_cache_group_resets_apc_around_generator_shutdown(monkeypat
     assert registry.for_kind("text_generation") == {}
     assert server.runtime.response_generator is None
     assert server.runtime.apc_manager is None
+
+
+def test_load_model_resources_refuses_d1_decision_models(monkeypatch):
+    d1_model = NS(system_one=lambda *_: None, config=None)
+    monkeypatch.setattr(generation, "load", lambda *_, **__: (d1_model, None))
+
+    with pytest.raises(HTTPException) as exc_info:
+        generation.load_model_resources("d1-2B", None)
+
+    assert exc_info.value.status_code == 400
+    assert "system_one" in exc_info.value.detail
 
 
 def test_unsupported_model_request_does_not_crash_server(client, monkeypatch):
@@ -935,6 +2235,144 @@ class TestModelDiscovery:
         (listing.path / "model.safetensors").unlink()
         assert listing.get() == {}
 
+    @pytest.mark.parametrize("endpoint", ["/models", "/v1/models"])
+    @pytest.mark.parametrize("source", ["jinja", "tokenizer", "processor", "loaded"])
+    def test_endpoint_reasoning_efforts(self, model_listing, client, endpoint, source):
+        template = (
+            "{% set effort = reasoning_effort | default('xhigh') %}"
+            "{% if effort not in ('xhigh', 'medium', 'low') %}"
+            "{{ raise_exception('unsupported effort') }}{% endif %}"
+        )
+        if source == "jinja":
+            (model_listing.path / "chat_template.jinja").write_text(template)
+        elif source == "loaded":
+            # The active template takes precedence over stale checkpoint metadata.
+            (model_listing.path / "chat_template.jinja").write_text("{{ messages }}")
+            model_listing.registry.set(
+                "text_generation",
+                dict(model_path="local/vision", processor=NS(chat_template=template)),
+            )
+        else:
+            (model_listing.path / f"{source}_config.json").write_text(
+                json.dumps(dict(chat_template=template))
+            )
+        entry = client.get(endpoint).json()["data"][0]
+        assert entry["reasoning_efforts"] == ["xhigh", "medium", "low"]
+        assert entry["loaded"] is (source == "loaded")
+
+    @pytest.mark.parametrize("endpoint", ["/models", "/v1/models"])
+    @pytest.mark.parametrize("loaded", [False, True])
+    def test_endpoint_none_effort(self, model_listing, client, endpoint, loaded):
+        template = (
+            "{% set reasoning = reasoning if reasoning is defined else "
+            "(false if reasoning_effort is defined and "
+            "reasoning_effort | lower == 'none' else true) %}"
+        )
+        (model_listing.path / "chat_template.jinja").write_text(template)
+        if loaded:
+            model_listing.registry.set(
+                "text_generation",
+                dict(model_path="local/vision", processor=NS(chat_template=template)),
+            )
+        entry = client.get(endpoint).json()["data"][0]
+        assert entry["reasoning_efforts"] == ["none"]
+        assert entry["loaded"] is loaded
+
+    def test_endpoint_unknown_reasoning_efforts(self, model_listing, client):
+        assert client.get("/v1/models").json()["data"][0]["reasoning_efforts"] is None
+        template_file = model_listing.path / "chat_template.jinja"
+        template_file.write_text(
+            "{% if reasoning_effort not in ['low', 'high'] %}"
+            "{{ raise_exception('bad effort') }}{% endif %}"
+        )
+        assert client.get("/v1/models").json()["data"][0]["reasoning_efforts"] == [
+            "low",
+            "high",
+        ]
+        template_file.write_text("{{ reasoning_effort }}")
+        assert client.get("/v1/models").json()["data"][0]["reasoning_efforts"] is None
+
+    @pytest.mark.parametrize(
+        "template, expected",
+        [
+            (
+                "{% if reasoning_strength not in ['low', 'high'] %}"
+                "{{ raise_exception('unsupported') }}{% endif %}",
+                ["low", "high"],
+            ),
+            (
+                "{% set effort = reasoning_effort | default('high') %}"
+                "{% set resolved = effort %}"
+                "{% if resolved not in ['low', 'high'] %}"
+                "{{ raise_exception('unsupported') }}{% endif %}",
+                ["low", "high"],
+            ),
+            (
+                "{% if effort not in ['low', 'high'] %}"
+                "{{ raise_exception('unsupported') }}{% endif %}"
+                "{% set effort = reasoning_effort %}",
+                None,
+            ),
+            (
+                "{% if role not in ['user', 'assistant'] %}"
+                "{{ raise_exception('unsupported') }}{% endif %}",
+                None,
+            ),
+            ("{# reasoning_effort not in ['low', 'high'] #}", None),
+            ("{% if reasoning_effort not in ['low'] %}higher{% endif %}", None),
+            ("{% if reasoning_effort == 'none' %}disabled{% endif %}", ["none"]),
+            ("{# reasoning_effort == 'none' #}", None),
+            (
+                "{% if reasoning_effort == 'none' %}"
+                "{{ raise_exception('unsupported') }}{% endif %}",
+                None,
+            ),
+            (
+                "{% if reasoning_effort == 'none' %}disabled{% endif %}"
+                "{% if reasoning_effort not in ['low', 'high'] %}"
+                "{{ raise_exception('unsupported') }}{% endif %}",
+                ["low", "high"],
+            ),
+            (
+                "{% if reasoning_effort not in levels %}"
+                "{{ raise_exception('unsupported') }}{% endif %}",
+                None,
+            ),
+            (
+                "{% if reasoning_effort not in ['low', dynamic] %}"
+                "{{ raise_exception('unsupported') }}{% endif %}",
+                None,
+            ),
+            (
+                "{% if reasoning_effort not in ['low'] %}{{ raise_exception('bad') }}{% endif %}"
+                "{% if reasoning_effort not in ['high'] %}{{ raise_exception('bad') }}{% endif %}",
+                None,
+            ),
+            ("{% broken template %}", None),
+        ],
+    )
+    def test_reasoning_efforts_require_literal_allowlist(self, template, expected):
+        assert model_reasoning_efforts(processor=NS(chat_template=template)) == expected
+
+    @pytest.mark.parametrize("source", ["processor", "tokenizer", "named", "legacy"])
+    def test_reasoning_efforts_active_template(self, source, tmp_path):
+        template = (
+            "{% if reasoning_effort not in ['low', 'high'] %}"
+            "{{ raise_exception('unsupported') }}{% endif %}"
+        )
+        variants = dict(
+            processor=NS(chat_template=template),
+            tokenizer=NS(tokenizer=NS(chat_template=template)),
+            named=NS(chat_template={"default": template, "tool_use": "{{ messages }}"}),
+            legacy=NS(chat_template=[dict(name="default", template=template)]),
+        )
+        assert model_reasoning_efforts(processor=variants[source]) == ["low", "high"]
+        (tmp_path / "chat_template.jinja").write_text(template)
+        assert (
+            model_reasoning_efforts(tmp_path, NS(chat_template="{{ messages }}"))
+            is None
+        )
+
     @pytest.mark.parametrize("cached", [False, True], ids=["missing-cache", "cached"])
     @pytest.mark.parametrize("source", ["environment", "query"])
     def test_endpoint_custom_paths(self, model_listing, monkeypatch, cached, source):
@@ -972,6 +2410,7 @@ class TestModelDiscovery:
 
     @pytest.mark.parametrize("use_cli_paths", [False, True])
     def test_cli_custom_model_paths(self, monkeypatch, tmp_path, use_cli_paths):
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
         monkeypatch.setattr(os, "environ", dict(os.environ))
         monkeypatch.setenv("MLX_VLM_MODEL_PATHS", "/existing/models")
         paths = [str(tmp_path / "model with spaces"), str(tmp_path / "other")]
@@ -991,7 +2430,7 @@ class TestModelDiscovery:
 
 def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
     gen = _generator(
-        model=NS(),
+        model=NS(language_model=NS()),
         processor=NS(),
         config=NS(eos_token_id=3),
         tokenizer=NS(all_special_ids=[0]),
@@ -1038,7 +2477,7 @@ def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
         min_threshold=0.4,
     )
     queue = Queue()
-    gen._generate_diffusion(
+    iterator = gen._generate_diffusion(
         uid=1,
         rqueue=queue,
         raw_inputs=dict(
@@ -1051,6 +2490,7 @@ def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
         cancelled=set(),
         apc_semantic_hash=73,
     )
+    list(iterator)
     chunk = queue.get(timeout=1)
     assert (
         chunk.text,
@@ -1063,6 +2503,7 @@ def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
     assert kwargs["skip_special_tokens"] is True
     assert args[7] == dict(
         options,
+        manage_wired_limit=False,
         mm_token_type_ids="types",
         prefill_step_size=3072,
         _apc_manager=gen.apc_manager,
@@ -1225,6 +2666,36 @@ def test_image_editing_forwards_model_options(client, monkeypatch, options):
     assert request.extra == options
     assert request.width == request.height == 512
     assert request.steps == 30
+
+
+@pytest.mark.parametrize("method", ["generations", "edits"])
+def test_flux3_prompt_upsampling_options_and_revised_prompt(
+    client, monkeypatch, method
+):
+    options = {
+        "upsample_prompt": False,
+        "prompt_expansion_model": "local-flux3-pup",
+        "boxes": [{"id": "pot", "bbox": [0.1, 0.2, 0.8, 0.9]}],
+    }
+    result = _fake_image_result(seed=7)
+    result.metadata["revised_prompt"] = "A detailed scene caption."
+    generate = Mock(return_value=result)
+    edit = method == "edits"
+    monkeypatch.setattr(openai, "edit_image" if edit else "generate_image", generate)
+    with _endpoint(model_type="flux3"):
+        response = client.post(
+            f"/v1/images/{method}",
+            json={
+                "model": "flux3-klein",
+                "prompt": "a teapot",
+                "seed": 7,
+                **({"image": "reference.png"} if edit else {}),
+                **options,
+            },
+        )
+    assert response.status_code == 200
+    assert generate.call_args.args[1].extra == options
+    assert response.json()["data"][0]["revised_prompt"] == "A detailed scene caption."
 
 
 @pytest.mark.parametrize("api", ["/responses", "/chat/completions"])
@@ -1749,7 +3220,11 @@ def test_responses_native_tool_calls(client, kind, stream):
 
 def _completed_response(response):
     events = _data(response)
-    final = next(e["response"] for e in events if e["type"] == "response.completed")
+    final = next(
+        e["response"]
+        for e in events
+        if e["type"] in ("response.completed", "response.incomplete")
+    )
     output = final["output"]
     for kind in ("added", "done"):
         items = [e for e in events if e["type"] == f"response.output_item.{kind}"]
@@ -1866,6 +3341,8 @@ def test_responses_truncated_preopened_reasoning(client, continuous, stream):
         ),
     ):
         response = _response(client, stream=stream)
+    assert response["status"] == "incomplete"
+    assert response["incomplete_details"] == {"reason": "max_output_tokens"}
     assert response["output_text"] == ""
     assert len(response["output"]) == 1
     item = response["output"][0]
@@ -2037,6 +3514,51 @@ def test_chat_completions_streaming_emits_timings_on_finish(client):
         usage["timings"]["predicted_per_second"]
         == final["timings"]["predicted_per_second"]
     )
+
+
+@pytest.mark.parametrize("continuous", [False, True])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("finish_reason", ["stop", "length"])
+def test_responses_include_generation_timings(
+    client, continuous, stream, finish_reason
+):
+    measurements = dict(
+        prompt_tps=20.0, generation_tps=5.0, peak_memory=1.25, cached_tokens=2
+    )
+    result = _result("Hello", finish_reason=finish_reason, **measurements)
+    tokens = [_token("Hello", finish_reason=finish_reason, **measurements)]
+    with _endpoint(
+        result=result,
+        chunks=[result],
+        generator=_streaming(tokens, prompt_tokens=8) if continuous else None,
+    ):
+        wire = _post(client, "responses", stream=stream)
+    assert wire.status_code == 200, wire.text
+    status = "incomplete" if finish_reason == "length" else "completed"
+    if stream:
+        terminal = next(e for e in _data(wire) if e["type"] == f"response.{status}")
+        response = terminal["response"]
+        assert terminal["timings"] == response["timings"]
+        if status == "completed":
+            parsed = server.ResponseCompletedEvent.model_validate(terminal)
+            assert parsed.timings.model_dump() == terminal["timings"]
+    else:
+        response = wire.json()
+    assert response["status"] == status
+    timings = response["timings"]
+    assert timings["prompt_per_second"] == 15.0
+    assert timings["predicted_per_second"] == 5.0
+    assert timings["peak_memory"] == 1.25
+    assert timings["prompt_n"] == 6
+    assert timings["cache_n"] == 2
+    assert response["usage"]["input_tokens"] == 8
+    assert response["usage"]["input_tokens_details"]["cached_tokens"] == 2
+    assert timings["predicted_n"] == response["usage"]["output_tokens"]
+    retrieved = client.get(f'/v1/responses/{response["id"]}')
+    assert retrieved.status_code == 200
+    assert retrieved.json()["timings"] == {
+        key: value for key, value in timings.items() if value is not None
+    }
 
 
 @pytest.mark.parametrize("api", ["chat", "messages"])
@@ -2243,6 +3765,7 @@ class TestCompaction:
         monkeypatch.setattr(server.runtime.config, "max_kv_size", None)
         server.response_store.clear()
         server.response_store_order.clear()
+        compaction.chat_cache.clear()
 
     @pytest.fixture
     def mocked(self, client):
@@ -2419,17 +3942,124 @@ class TestCompaction:
         )
         mocked.generate.assert_not_called()
 
-    def test_pending_parallel_tools_cannot_be_split(self):
+    @pytest.fixture(params=["chat", "function", "shell", "apply_patch", "tool_result"])
+    def tool_group(self, request):
+        def make(ids, output="recent evidence"):
+            if request.param == "chat":
+                calls = [
+                    dict(
+                        type="message",
+                        role="assistant",
+                        content="",
+                        tool_calls=[
+                            dict(
+                                id=id,
+                                type="function",
+                                function=dict(name="inspect", arguments="{}"),
+                            )
+                            for id in ids
+                        ],
+                    )
+                ]
+                results = [
+                    dict(type="message", role="tool", tool_call_id=id, content=output)
+                    for id in ids
+                ]
+            else:
+                kind = "function" if request.param == "tool_result" else request.param
+                calls = [
+                    dict(
+                        type=f"{kind}_call", call_id=id, name="inspect", arguments="{}"
+                    )
+                    for id in ids
+                ]
+                results = [
+                    dict(
+                        type=(
+                            "tool_result"
+                            if request.param == "tool_result"
+                            else f"{kind}_call_output"
+                        ),
+                        call_id=id,
+                        output=output,
+                    )
+                    for id in ids
+                ]
+            return calls, results
+
+        return make
+
+    def test_pending_parallel_tools_cannot_be_split(self, tool_group):
+        calls, results = tool_group(["a", "b"])
         items = [
             _compaction_message("start"),
-            {"type": "function_call", "call_id": "a"},
-            {"type": "function_call", "call_id": "b"},
-            {"type": "function_call_output", "call_id": "a"},
+            *calls,
+            results[0],
             _compaction_message("steering during tools"),
-            {"type": "function_call_output", "call_id": "b"},
+            results[1],
             _compaction_message("next"),
         ]
-        assert compaction.safe_boundaries(items) == [0, 6]
+        for keep_last_group in (False, True):
+            assert compaction.safe_boundaries(
+                items, keep_last_group=keep_last_group
+            ) == [0, len(items) - 1]
+
+    @pytest.mark.parametrize("pending", [False, True])
+    @pytest.mark.parametrize("retain_tokens", [0, 500])
+    def test_single_turn_tool_compaction_preserves_protected_context(
+        self, tool_group, pending, retain_tokens
+    ):
+        instruction = _compaction_message("Keep the constraints.", "system")
+        request = _compaction_message("Inspect the project; never edit secrets.env.")
+        calls, results = tool_group(["old"], "old evidence " * 1000)
+        head = [instruction, request, *calls, *results]
+        calls, results = tool_group(["recent"])
+        tail = [
+            *calls,
+            *results,
+            _compaction_message("Checking the evidence.", "assistant"),
+        ]
+        if pending:
+            calls, results = tool_group(["a", "b"])
+            tail += [*calls, results[0]]
+        items = head + tail
+        original = copy.deepcopy(items)
+        summarize = AsyncMock(return_value=("Earlier evidence reviewed.", None))
+
+        async def count(items):
+            return len(json.dumps(items))
+
+        compact = partial(
+            compaction.compact,
+            count=count,
+            summarize=summarize,
+            keep_tokens=0,
+            retain_tokens=retain_tokens,
+        )
+        with pytest.raises(
+            compaction.ContextBudgetError, match="no room for a summary"
+        ):
+            asyncio.run(
+                compact(
+                    items,
+                    target_tokens=asyncio.run(count([instruction, request] + tail)),
+                )
+            )
+        summarize.assert_not_called()
+        result = asyncio.run(compact(items, target_tokens=3000))
+        assert summarize.await_count == 1
+        assert summarize.await_args.args[0] == head
+        assert 0 < summarize.await_args.args[1] < 3000
+        assert result.changed and result.after_tokens < 3000
+        assert result.items[:2] == [instruction, request]
+        assert result.items[3:] == tail
+        assert result.items.count(request) == 1 and items == original
+        capsule = _seal_context(result.items, covered=result.covered)
+        assert _resolve_context([request, capsule]) == result.items
+        summarize.reset_mock()
+        unchanged = asyncio.run(compact(result.items, target_tokens=3000))
+        assert not unchanged.changed
+        summarize.assert_not_called()
 
     @pytest.mark.parametrize("api", ["standalone", "trigger", "automatic"])
     @pytest.mark.parametrize("limit", [4096, 16384])
@@ -2504,7 +4134,7 @@ class TestCompaction:
         async def count(items):
             return len(json.dumps(items))
 
-        async def summarize(items):
+        async def summarize(items, max_summary_tokens):
             return "Earlier requirements summarized.", None
 
         result = asyncio.run(
@@ -2518,17 +4148,76 @@ class TestCompaction:
             )
         )
         originals = [x for x in result.items[:-1] if x.get("role") == "user"]
-        assert originals == messages[-2:]
+        assert originals == [messages[0], messages[-1]]
         base = [x for x in result.items if x not in originals]
         assert result.after_tokens - asyncio.run(count(base)) <= 500
         capsule = _seal_context(result.items, covered=result.covered)
         assert _resolve_context(messages + [capsule, latest]) == result.items + [latest]
 
+    def test_compaction_accepts_reduction_that_fits_hard_budget(self):
+        original = [_compaction_message("x" * 2000), _compaction_message("Continue")]
+
+        async def count(items):
+            return len(json.dumps(items))
+
+        summarize = AsyncMock(return_value=("s" * 1500, None))
+        result = asyncio.run(
+            compaction.compact(
+                original,
+                count=count,
+                summarize=summarize,
+                keep_tokens=0,
+                target_tokens=3000,
+            )
+        )
+        assert result.changed
+        assert result.before_tokens * 0.6 < result.after_tokens < result.before_tokens
+        assert result.after_tokens < 3000
+        assert summarize.await_args.args[1] < 3000
+
+    def test_summary_allowance_reserves_protected_tail_and_handoff(
+        self, mocked, monkeypatch
+    ):
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", 8192)
+        latest = _compaction_message("p" * 20000)
+        items = [_compaction_message("x" * 6000), latest]
+        envelope = mocked.count(input=[compaction._handoff(""), latest])["input_tokens"]
+        response = mocked.compact(input=items, keep_tokens=0, max_output_tokens=2048)
+        assert mocked.generate.call_args.kwargs["max_tokens"] == 8192 - 2048 - envelope
+        assert latest in _resolve_context(response["output"])
+
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("api", ["responses", "chat"])
+    @pytest.mark.parametrize("fits", [False, True])
+    def test_early_compaction_budget_failure_preserves_fitting_input(
+        self, mocked, client, monkeypatch, api, stream, fits
+    ):
+        items = [_compaction_message("history " * 100), _compaction_message("Continue")]
+        before = mocked.count(input=items)["input_tokens"]
+        limit = before + 128 if fits else before - 1
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", limit)
+        failure = compaction.ContextBudgetError("summary does not reduce input")
+        monkeypatch.setattr(compaction, "compact", AsyncMock(side_effect=failure))
+        kwargs = dict(
+            stream=stream,
+            context_management=[{"type": "compaction", "compact_threshold": 1}],
+        )
+        kwargs.update({"input": items} if api == "responses" else {"messages": items})
+        response = _post(client, api, **kwargs)
+        if fits:
+            assert response.status_code == 200, response.text
+            answer = mocked.stream.call_args if stream else mocked.generate.call_args
+            assert "Conversation handoff" not in answer.kwargs["prompt"]
+            assert answer.kwargs["max_tokens"] <= limit - before
+        elif stream and api == "responses":
+            assert _data(response)[-1]["type"] == "response.failed"
+        else:
+            assert response.status_code == 400, response.text
+
     @pytest.mark.parametrize(
         "text, tokens, status, detail",
         [
             pytest.param("", 4, 502, "empty summary", id="empty"),
-            pytest.param("partial summary", 256, 502, "output limit", id="length"),
             pytest.param(
                 "huge " * 10000,
                 4,
@@ -2558,6 +4247,333 @@ class TestCompaction:
         compact.assert_awaited_once()
         assert compact.call_args.args[1] == original and not server.response_store
 
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_summary_output_limit_retries_then_preserves_partial_content(
+        self, mocked, client, stream
+    ):
+        monkey_result = _result("Goal: ORCHID. Port: 7319.", generation_tokens=10000)
+        mocked.generate.return_value = monkey_result
+        response = _post(
+            client,
+            "responses",
+            input=_compaction_history(),
+            stream=stream,
+            context_management=[{"type": "compaction", "compact_threshold": 1000}],
+        )
+        assert response.status_code == 200, response.text
+        final = _completed_response(response) if stream else response.json()
+        restored = _resolve_context([final["output"][0]])
+        assert "ORCHID" in json.dumps(restored)
+        assert "output limit" in json.dumps(restored)
+        calls = mocked.generate.call_args_list
+        assert calls[0].kwargs["max_tokens"] == 1024
+        assert calls[1].kwargs["max_tokens"] == 2048
+
+    def test_summary_closes_a_template_preopened_reasoning_suffix(self, mocked):
+        mocked.template.side_effect = (
+            lambda processor, config, messages, **kw: json.dumps(messages) + "<think>\n"
+        )
+        mocked.compact(
+            input=_compaction_history(), keep_tokens=0, max_output_tokens=256
+        )
+        prompt = mocked.generate.call_args.kwargs["prompt"]
+        assert prompt.endswith("<think></think>\n")
+
+    def test_reasoning_only_limit_uses_labelled_evidence_not_reasoning(self, mocked):
+        mocked.generate.return_value = _result(
+            "<think>INVENTED_PASSPORT", generation_tokens=10000
+        )
+        response = mocked.request(
+            input=_compaction_history(),
+            context_management=[{"type": "compaction", "compact_threshold": 1000}],
+        )
+        text = json.dumps(_resolve_context([response["output"][0]]))
+        assert "INVENTED_PASSPORT" not in text
+        assert "Incomplete handoff" in text
+
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_transient_context_is_counted_but_not_compacted_or_replayed(
+        self, mocked, client, stream
+    ):
+        items = _compaction_history()
+        for index in range(3):
+            current = f"CURRENT_ENVIRONMENT_{index} " * 40
+            before = mocked.count(input=items)["input_tokens"]
+            assert (
+                mocked.count(input=items, transient_context=current)["input_tokens"]
+                > before
+            )
+            mocked.template.reset_mock()
+            response = _post(
+                client,
+                "responses",
+                input=items,
+                stream=stream,
+                transient_context=current,
+                context_management=[{"type": "compaction", "compact_threshold": 1000}],
+            )
+            assert response.status_code == 200, response.text
+            data = _completed_response(response) if stream else response.json()
+            capsule = data["output"][0]
+            assert capsule["type"] == "compaction"
+            restored = _resolve_context([capsule])
+            assert "CURRENT_ENVIRONMENT" not in json.dumps(restored)
+            templates = [call.args[2] for call in mocked.template.call_args_list]
+            summaries = [
+                messages
+                for messages in templates
+                if messages[-1].get("content") == compaction.SUMMARY_INSTRUCTION
+            ]
+            assert summaries
+            assert all(
+                "CURRENT_ENVIRONMENT" not in json.dumps(messages)
+                for messages in summaries
+            )
+            answer = mocked.stream.call_args if stream else mocked.generate.call_args
+            generation_messages = json.loads(answer.kwargs["prompt"])
+            assert generation_messages[-1]["content"] == current
+            assert (
+                sum(
+                    current in str(message.get("content"))
+                    for message in generation_messages
+                )
+                == 1
+            )
+            # Stored response chaining also carries only canonical input/output.
+            assert "CURRENT_ENVIRONMENT" not in str(server.response_store)
+            items = [capsule] + [
+                _compaction_message("New evidence " * 200) for _ in range(4)
+            ]
+
+    @pytest.mark.parametrize("recovery", [False, True])
+    def test_changing_transient_context_reuses_chat_summary_but_counts_new_value(
+        self, mocked, client, monkeypatch, recovery
+    ):
+        def context(text):
+            if recovery:
+                return {
+                    "tool_result_context": {
+                        "entries": [{"tool_call_id": "removed", "text": text}]
+                    }
+                }
+            return {"transient_context": text}
+
+        items = [_msg("Earlier evidence " * 100) for _ in range(6)] + [_msg("Continue")]
+        before = mocked.count(input=items)["input_tokens"]
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", before + 300)
+        first = _post(
+            client,
+            "chat",
+            messages=items,
+            max_tokens=64,
+            **context("ENVIRONMENT_OLD"),
+        )
+        assert first.status_code == 200, first.text
+        assert mocked.generate.call_count > 1
+        mocked.generate.reset_mock()
+        new = "ENVIRONMENT_NEW " * 20
+        second = _post(
+            client,
+            "chat",
+            messages=items + [_msg("Answer", "assistant"), _msg("Next")],
+            max_tokens=64,
+            **context(new),
+        )
+        assert second.status_code == 200, second.text
+        assert mocked.generate.call_count == 1
+        prompt = mocked.generate.call_args.kwargs["prompt"]
+        assert "ENVIRONMENT_OLD" not in prompt
+        assert new in "\n".join(m.get("content", "") for m in json.loads(prompt))
+        assert "Conversation handoff" in prompt
+        assert "ENVIRONMENT" not in str(compaction.chat_cache.entries)
+
+    def test_transient_context_cannot_exceed_context_budget(self, mocked, monkeypatch):
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", 2048)
+        response = mocked.request(
+            input=[_compaction_message("Keep this request")],
+            transient_context="oversized environment " * 2000,
+            context_management=[{"type": "compaction", "compact_threshold": 1536}],
+            status=400,
+        )
+        assert "context" in response["detail"].lower()
+        mocked.generate.assert_not_called()
+
+    def test_tool_result_notes_only_recover_missing_receipts(self, mocked):
+        from mlx_vlm.server.schemas import OpenAIRequest
+
+        receipt = {
+            "type": "function_call_output",
+            "call_id": "page1",
+            "output": "Original page",
+        }
+        notes = {
+            "entries": [{"tool_call_id": "page1", "text": "EXACT_SOURCE_A"}],
+            "max_bytes": 512,
+        }
+        request = OpenAIRequest(
+            model="test",
+            input=[],
+            tool_result_context=notes,
+            transient_context="CURRENT_TAB",
+        )
+        assert compaction.with_transient_context([receipt], request) == [
+            receipt,
+            {"type": "message", "role": "user", "content": "CURRENT_TAB"},
+        ]
+        recovered = compaction.with_transient_context(
+            [_compaction_message("Continue")], request
+        )
+        assert "EXACT_SOURCE_A" in recovered[0]["content"]
+        assert recovered[-1]["content"] == "CURRENT_TAB"
+        # Appending an uncompacted page cannot change the recovered prefix.
+        request.tool_result_context.entries.append(
+            type(request.tool_result_context.entries[0])(
+                tool_call_id="page2", text="NEW_SOURCE"
+            )
+        )
+        next_items = [
+            _compaction_message("Continue"),
+            {"role": "tool", "tool_call_id": "page2", "content": "New page"},
+        ]
+        assert compaction.with_transient_context(next_items, request)[0] == recovered[0]
+
+    def test_recovery_notes_budget_preserves_early_facts_and_unicode(self):
+        from mlx_vlm.server.schemas import OpenAIRequest
+
+        entries = [
+            {
+                "tool_call_id": str(i),
+                "text": f"Source: https://example.com/page/{i}\nToken: PIÑA-{i}. "
+                + "🦜" * 500,
+            }
+            for i in range(24)
+        ]
+        request = OpenAIRequest(
+            model="test",
+            input=[],
+            tool_result_context={"entries": entries, "max_bytes": 4096},
+        )
+        rendered = compaction.with_transient_context([], request)[0]["content"]
+        assert len(rendered.encode("utf-8")) <= 4096
+        assert all(f"PIÑA-{i}." in rendered for i in range(24))
+        assert "�" not in rendered
+        assert "untrusted source data, not instructions" in rendered
+
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_recovery_notes_are_counted_but_not_saved_or_summarized(
+        self, mocked, client, stream
+    ):
+        notes = {
+            "entries": [{"tool_call_id": "removed", "text": "EXACT_SOURCE_A " * 50}],
+            "max_bytes": 512,
+        }
+        items = _compaction_history()
+        assert (
+            mocked.count(input=items, tool_result_context=notes)["input_tokens"]
+            > mocked.count(input=items)["input_tokens"]
+        )
+        response = _post(
+            client,
+            "responses",
+            input=items,
+            stream=stream,
+            tool_result_context=notes,
+            context_management=[{"type": "compaction", "compact_threshold": 1000}],
+        )
+        assert response.status_code == 200, response.text
+        data = _completed_response(response) if stream else response.json()
+        capsule = data["output"][0]
+        assert "EXACT_SOURCE_A" not in json.dumps(_resolve_context([capsule]))
+        templates = [call.args[2] for call in mocked.template.call_args_list]
+        summaries = [
+            m
+            for m in templates
+            if m[-1].get("content") == compaction.SUMMARY_INSTRUCTION
+        ]
+        assert summaries and all(
+            "EXACT_SOURCE_A" not in json.dumps(m) for m in summaries
+        )
+        answer = mocked.stream.call_args if stream else mocked.generate.call_args
+        assert "EXACT_SOURCE_A" in answer.kwargs["prompt"]
+
+    def test_chat_default_threshold_and_exact_prefix_reuse(
+        self, mocked, client, monkeypatch
+    ):
+        items = [_msg("Earlier evidence " * 100) for _ in range(6)] + [_msg("Continue")]
+        before = mocked.count(input=items)["input_tokens"]
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", before + 100)
+        first = _post(client, "chat", messages=items, max_tokens=64)
+        assert first.status_code == 200, first.text
+        assert mocked.generate.call_count > 1
+        mocked.generate.reset_mock()
+        second = _post(
+            client,
+            "chat",
+            messages=items + [_msg("Answer", "assistant"), _msg("Next")],
+            max_tokens=64,
+        )
+        assert second.status_code == 200, second.text
+        assert mocked.generate.call_count == 1
+        assert "Conversation handoff" in mocked.generate.call_args.kwargs["prompt"]
+        mocked.generate.reset_mock()
+        changed = copy.deepcopy(items)
+        changed[0]["content"] += " A correction"
+        third = _post(client, "chat", messages=changed, max_tokens=64)
+        assert third.status_code == 200, third.text
+        assert mocked.generate.call_count > 1
+
+    def test_bounded_fold_can_consume_more_than_eight_exchanges(self):
+        items = [_compaction_message("evidence " * 100) for _ in range(12)]
+        original = copy.deepcopy(items)
+
+        async def fits(chunk):
+            return sum(item.get("role") == "user" for item in chunk) <= 1
+
+        async def count(chunk):
+            return len(json.dumps(chunk))
+
+        summarize = AsyncMock(
+            return_value=(
+                "facts",
+                server.OpenAIUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+            )
+        )
+        summary, usage = asyncio.run(
+            compaction._summarize_bounded(
+                items, fits=fits, summarize=summarize, count=count
+            )
+        )
+        assert summary == "facts" and summarize.await_count == 12
+        assert usage.total_tokens == 24 and items == original
+
+    @pytest.mark.parametrize("chat", [False, True])
+    def test_single_oversized_tool_result_is_bounded_and_replayable(
+        self, mocked, client, monkeypatch, chat
+    ):
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", 8192)
+        items = [
+            _compaction_message("Read this page and compare OCR models.")
+        ] + _function_result("page " * 20000, name="read_file", call_id="page")
+        original = copy.deepcopy(items)
+        options = (
+            {"messages": _response_items_to_chat(items)[0]}
+            if chat
+            else {
+                "input": items,
+                "context_management": [
+                    {"type": "compaction", "compact_threshold": 6144}
+                ],
+            }
+        )
+        response = _post(client, "chat" if chat else "responses", **options)
+        assert response.status_code == 200, response.text
+        prompt = mocked.generate.call_args.kwargs["prompt"]
+        assert "Tool output truncated" in prompt and "Read this page" in prompt
+        assert len(prompt) // 4 < 8192
+        assert items == original
+        if not chat:
+            assert response.json()["output"][0]["type"] == "compaction"
+
     def test_short_history_is_a_noop(self, mocked):
         items = [_compaction_message("hello")]
         response = mocked.compact(input=items)
@@ -2583,8 +4599,93 @@ class TestCompaction:
         assert mocked.generate.call_count == 1
 
     @pytest.mark.parametrize("stream", [False, True])
-    @pytest.mark.parametrize("api", ["responses", "chat", "chat-default"])
-    def test_output_budget_overrides_compaction_threshold(
+    @pytest.mark.parametrize("api", ["responses", "chat"])
+    @pytest.mark.parametrize("limit", [2048, 4096, 8192, 128000])
+    @pytest.mark.parametrize("output", [64, 128000, 256000])
+    def test_max_output_is_a_ceiling_for_short_prompts(
+        self, mocked, client, monkeypatch, api, stream, limit, output
+    ):
+        mocked.config.max_position_embeddings = 128000
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", limit)
+        options = dict(
+            stream=stream,
+            context_management=[
+                {"type": "compaction", "compact_threshold": limit * 3 // 4}
+            ],
+        )
+        if api == "chat":
+            options.update(
+                messages=[_msg("Are you ready to help me with some coding?")],
+                max_tokens=output,
+            )
+        else:
+            options.update(
+                input="Are you ready to help me with some coding?",
+                max_output_tokens=output,
+            )
+        original = copy.deepcopy(options)
+        response = _post(client, api, **options)
+        assert response.status_code == 200, response.text
+        assert options == original
+        assert mocked.generate.call_count == (0 if stream else 1)
+        answer = mocked.stream.call_args if stream else mocked.generate.call_args
+        prompt_tokens = len(answer.kwargs["prompt"]) // 4
+        assert answer.kwargs["max_tokens"] == min(output, limit - prompt_tokens)
+        assert "Conversation handoff" not in answer.kwargs["prompt"]
+
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("api", ["responses", "chat"])
+    @pytest.mark.parametrize("offset", [-1, 0, 1])
+    def test_actual_input_triggers_compaction_and_output_uses_compacted_size(
+        self, mocked, client, monkeypatch, api, stream, offset
+    ):
+        items = [_compaction_message("older evidence " * 150) for _ in range(5)]
+        items.append(_compaction_message("Continue"))
+        before = mocked.count(input=items)["input_tokens"]
+        limit = before * 2
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", limit)
+        options = dict(
+            stream=stream,
+            context_management=[
+                {"type": "compaction", "compact_threshold": before + offset}
+            ],
+        )
+        if api == "chat":
+            options.update(messages=items, max_tokens=limit)
+        else:
+            options.update(input=items, max_output_tokens=limit)
+        response = _post(client, api, **options)
+        assert response.status_code == 200, response.text
+        should_compact = offset <= 0
+        assert mocked.generate.call_count == int(should_compact) + int(not stream)
+        answer = mocked.stream.call_args if stream else mocked.generate.call_args
+        after = len(answer.kwargs["prompt"]) // 4
+        assert answer.kwargs["max_tokens"] == limit - after
+        assert ("Conversation handoff" in answer.kwargs["prompt"]) == should_compact
+        if should_compact:
+            assert after < before
+
+    @pytest.mark.parametrize("api", ["responses", "chat"])
+    def test_required_input_must_leave_room_for_generation(
+        self, mocked, api, monkeypatch
+    ):
+        items = [_compaction_message("protected input " * 500)]
+        before = mocked.count(input=items)["input_tokens"]
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", before)
+        options = dict(
+            context_management=[{"type": "compaction", "compact_threshold": 1}]
+        )
+        if api == "chat":
+            options.update(messages=items, max_tokens=before)
+        else:
+            options.update(input=items, max_output_tokens=before)
+        response = mocked.request(api, status=400, **options)
+        assert "Protected conversation" in response["detail"]
+        mocked.generate.assert_not_called()
+
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("api", ["responses", "chat"])
+    def test_unused_output_does_not_override_compaction_threshold(
         self, mocked, client, monkeypatch, api, stream
     ):
         items = [_compaction_message("old evidence " * 150) for _ in range(6)]
@@ -2604,24 +4705,33 @@ class TestCompaction:
             options.update(input=items, max_output_tokens=256)
         response = _post(client, api, **options)
         assert response.status_code == 200, response.text
-        assert mocked.generate.call_count == (1 if stream else 2)
+        assert mocked.generate.call_count == (0 if stream else 1)
         answer_call = mocked.stream.call_args if stream else mocked.generate.call_args
-        assert len(answer_call.kwargs["prompt"]) // 4 + 256 <= before + 32
-        assert "Conversation handoff" in answer_call.kwargs["prompt"]
+        assert answer_call.kwargs["max_tokens"] == 32
+        assert len(answer_call.kwargs["prompt"]) // 4 + 32 == before + 32
+        assert "Conversation handoff" not in answer_call.kwargs["prompt"]
 
+    @pytest.mark.parametrize("single_turn", [False, True])
     @pytest.mark.parametrize("stream", [False, True])
     @pytest.mark.parametrize("mode", ["automatic", "trigger", "chat"])
     def test_oversized_history_uses_bounded_summary_calls(
-        self, mocked, client, monkeypatch, mode, stream
+        self, mocked, client, monkeypatch, mode, stream, single_turn
     ):
         monkeypatch.setattr(server.runtime.config, "max_kv_size", 2048)
         items = [_compaction_message("Keep the constraints.", "system")]
+        if single_turn:
+            items.append(_compaction_message("Inspect all six batches."))
         for index in range(6):
-            items += [
-                _compaction_message(f"batch-{index} " + "evidence " * 200),
-                *_function_result("done", name="read_file", call_id=f"c{index}"),
-            ]
-        items.append(_compaction_message("Continue"))
+            evidence = f"batch-{index} " + "evidence " * 200
+            if not single_turn:
+                items.append(_compaction_message(evidence))
+            items += _function_result(
+                evidence if single_turn else "done",
+                name="read_file",
+                call_id=f"c{index}",
+            )
+        if not single_turn:
+            items.append(_compaction_message("Continue"))
         original = copy.deepcopy(items)
         options = dict(stream=stream)
         api = "responses"
@@ -2630,8 +4740,7 @@ class TestCompaction:
         elif mode == "chat":
             api = "chat"
             options.update(
-                messages=[_compaction_message("old evidence " * 180) for _ in range(10)]
-                + [items[-1]],
+                messages=_response_items_to_chat(items)[0],
                 max_tokens=64,
             )
         else:
@@ -2651,7 +4760,7 @@ class TestCompaction:
             if json.loads(call.kwargs["prompt"])[-1]["content"]
             == compaction.SUMMARY_INSTRUCTION
         ]
-        assert 1 < len(summary_calls) <= compaction.MAX_SUMMARY_PASSES
+        assert 1 < len(summary_calls) <= len(items)
         for call in summary_calls:
             assert len(call.kwargs["prompt"]) // 4 + call.kwargs["max_tokens"] <= 2048
             messages = json.loads(call.kwargs["prompt"])
@@ -2720,15 +4829,12 @@ class TestCompaction:
         )
         assert not server.response_store and items == original
 
-    @pytest.mark.parametrize(
-        "failure", ["oversized-exchange", "nonreducing-summary", "pass-limit"]
-    )
+    @pytest.mark.parametrize("failure", ["oversized-exchange", "nonreducing-summary"])
     def test_bounded_summary_recovery_stops_without_mutating_input(
         self, monkeypatch, failure
     ):
         items = [_compaction_message("old evidence " * 200) for _ in range(4)]
         original = copy.deepcopy(items)
-        monkeypatch.setattr(compaction, "MAX_SUMMARY_PASSES", 2)
 
         async def count(items):
             return len(json.dumps(items))
@@ -2766,7 +4872,7 @@ class TestCompaction:
         messages = [_compaction_message("earlier notes " * 120) for _ in range(4)]
         messages.append(_compaction_message("Continue"))
         before = mocked.count(input=messages)["input_tokens"]
-        monkeypatch.setattr(server.runtime.config, "max_kv_size", before + 64)
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", before * 2)
         response = _post(client, messages=messages, max_tokens=64, **options)
         assert response.status_code == 200
         assert mocked.generate.call_count == 1
@@ -2814,7 +4920,7 @@ class TestCompaction:
             **options,
         )
         assert original == history + recent
-        if outcome in ("summary-fails", "protected-too-large"):
+        if outcome == "summary-fails":
             assert response.status_code == (502 if outcome == "summary-fails" else 400)
             assert response.headers["content-type"] == "application/json"
             assert mocked.generate.call_count == (
@@ -2829,7 +4935,15 @@ class TestCompaction:
         assert messages[0] == original[0]
         for expected, actual in zip(recent, messages[-3:]):
             for key in ("role", "content", "tool_call_id"):
-                assert actual.get(key) == expected.get(key)
+                if (
+                    outcome == "protected-too-large"
+                    and key == "content"
+                    and expected["role"] == "tool"
+                ):
+                    assert "Tool output truncated" in actual[key]
+                    assert len(actual[key]) < len(expected[key])
+                else:
+                    assert actual.get(key) == expected.get(key)
         call = messages[-2]["tool_calls"][0]
         assert call["id"] == messages[-1]["tool_call_id"] == "latest"
         assert call["function"] == {"name": "get_weather", "arguments": {}}
@@ -2840,7 +4954,7 @@ class TestCompaction:
             summaries = mocked.generate.call_args_list
             if not stream:
                 summaries = summaries[:-1]
-            assert 1 <= len(summaries) <= compaction.MAX_SUMMARY_PASSES
+            assert 1 <= len(summaries) <= len(original)
             for call in summaries:
                 assert (
                     json.loads(call.kwargs["prompt"])[-1]["content"]
@@ -2948,8 +5062,8 @@ class TestCompaction:
     @pytest.mark.parametrize(
         "threshold, output_tokens, status",
         [
-            pytest.param(1, 32768, 400, id="budget-above-threshold"),
-            pytest.param(100000, 32768, 400, id="budget-below-threshold"),
+            pytest.param(1, 0, 400, id="zero-output"),
+            pytest.param(100000, -1, 400, id="negative-output"),
             pytest.param(0, 64, 422, id="zero-threshold"),
             pytest.param(-1, 64, 422, id="negative-threshold"),
             pytest.param("bad", 64, 422, id="nonnumeric-threshold"),
@@ -3021,7 +5135,7 @@ class TestCompaction:
         async def count(items):
             return len(json.dumps(items))
 
-        async def summarize(items):
+        async def summarize(items, max_summary_tokens):
             assert items == original[:3]
             return "Prior work completed.", None
 
@@ -3168,7 +5282,7 @@ class TestCompaction:
     @pytest.mark.parametrize("trigger", [False, True])
     @pytest.mark.parametrize(
         "text, tokens, code",
-        [("", 4, 502), ("partial", 1024, 502), ("huge " * 10000, 4, 400)],
+        [("", 4, 502), ("huge " * 10000, 4, 400)],
     )
     def test_failed_streamed_summary_never_completes(
         self, mocked, client, trigger, text, tokens, code
@@ -3183,6 +5297,19 @@ class TestCompaction:
                 {"type": "compaction", "compact_threshold": 1000}
             ]
         events = _data(_post(client, "responses", input=items, stream=True, **options))
+        if not trigger and code == 400:
+            assert [event["type"] for event in events] == [
+                "response.created",
+                "response.in_progress",
+                "mlx.compaction.started",
+                "mlx.compaction.completed",
+                "response.completed",
+            ]
+            assert events[3]["input_tokens_before"] == events[3]["input_tokens_after"]
+            assert (
+                "Conversation handoff" not in mocked.stream.call_args.kwargs["prompt"]
+            )
+            return
         assert [event["type"] for event in events] == [
             "response.created",
             "response.in_progress",
@@ -3286,7 +5413,7 @@ class TestCompaction:
                 "responses",
                 input=_compaction_history(),
                 stream=True,
-                max_output_tokens=32768,
+                max_output_tokens=0,
                 context_management=[{"type": "compaction", "compact_threshold": 1}],
             )
         )
@@ -3344,7 +5471,7 @@ class TestCompaction:
         iterator.close.assert_called_once_with()
 
     @pytest.fixture
-    def real_server(self, tmp_path):
+    def real_server(self, tmp_path, request):
         model = os.environ.get("MLX_VLM_COMPACTION_TEST_MODEL")
         if not model:
             pytest.skip("Set MLX_VLM_COMPACTION_TEST_MODEL for real inference")
@@ -3376,6 +5503,11 @@ class TestCompaction:
                         "127.0.0.1",
                         "--port",
                         str(port),
+                        *(
+                            ["--max-kv-size", str(request.param)]
+                            if hasattr(request, "param")
+                            else []
+                        ),
                     ],
                     env=env,
                     stdout=log,
@@ -3385,7 +5517,7 @@ class TestCompaction:
                     url = f"http://127.0.0.1:{port}"
                     headers = {"X-APC-Tenant": "compaction-test"}
                     with (
-                        httpx.Client(
+                        httpx2.Client(
                             base_url=url, timeout=180, headers=headers
                         ) as client,
                         OpenAI(
@@ -3399,14 +5531,14 @@ class TestCompaction:
                             try:
                                 if client.get("/health", timeout=1).is_success:
                                     break
-                            except httpx.TransportError:
+                            except httpx2.TransportError:
                                 pass
                             time.sleep(0.25)
                         else:
                             pytest.fail(
                                 f"Model server did not become ready:\n{log_path.read_text()}"
                             )
-                        yield NS(http=client, sdk=sdk, model=model)
+                        yield NS(http=client, sdk=sdk, model=model, process=process)
                 finally:
                     process.terminate()
                     try:
@@ -3451,6 +5583,55 @@ class TestCompaction:
                 "What is the project name, deployment port, and file you must never edit? Give all three."
             )
         ]
+
+    @pytest.mark.parametrize("real_server", [4096, 8192], indirect=True)
+    def test_real_oversized_tool_recovery_and_unload(self, real_server):
+        with real_server() as client:
+            messages = [
+                _msg(
+                    "Project ORCHID. Read this tool output and repeat the project code."
+                )
+            ]
+            messages += _response_items_to_chat(
+                _function_result(
+                    "OCR evidence " * 10000, name="get_weather", call_id="page"
+                )
+            )[0]
+            payload = dict(
+                model=client.model,
+                messages=messages,
+                tools=[_tool()],
+                max_tokens=64,
+                temperature=0,
+                chat_template_kwargs={"enable_thinking": False},
+            )
+            for step in range(2):
+                response = client.http.post("/v1/chat/completions", json=payload)
+                assert response.status_code == 200, response.text
+                answer = response.json()["choices"][0]["message"]
+                # This regression checks bounded generation and continued replay;
+                # factual recall is measured by the separate real compaction tests.
+                assert answer.get("content") or answer.get("tool_calls")
+                assert response.json()["usage"]["prompt_tokens"] < 8192
+                messages += [answer, _msg("Repeat the project code.")]
+
+            def rss():
+                return (
+                    int(
+                        subprocess.check_output(
+                            ["ps", "-o", "rss=", "-p", str(client.process.pid)]
+                        )
+                    )
+                    * 1024
+                )
+
+            loaded = rss()
+            response = client.http.post("/unload")
+            assert response.status_code == 200, response.text
+            deadline = time.monotonic() + 5
+            while rss() >= loaded * 0.75 and time.monotonic() < deadline:
+                time.sleep(0.1)
+            assert rss() < loaded * 0.75
 
     def test_real_compaction_replay_and_apc(self, real_client, real_history):
         client = real_client
@@ -3512,7 +5693,7 @@ class TestCompaction:
                     if event.get("type", "").startswith("mlx.compaction."):
                         progress.append((time.perf_counter() - started, event))
         completed = _completed_response(
-            httpx.Response(200, text="\n".join(lines) + "\n")
+            httpx2.Response(200, text="\n".join(lines) + "\n")
         )
         assert completed["output"][0]["type"] == "compaction"
         _assert_recalled(completed["output_text"])
@@ -3662,7 +5843,7 @@ class _Batch:
     def remove(self, uid):
         return self.active.pop(uid, None) is not None
 
-    def next(self, **kwargs):
+    def decode_step(self):
         self.sizes.append(len(self.active))
         responses = []
         for uid, step in sorted(self.active.items()):
@@ -3679,7 +5860,10 @@ class _Batch:
                 del self.active[uid]
             else:
                 self.active[uid] += 1
-        return [], responses
+        return responses
+
+    def prefill_step(self):
+        return []
 
 
 class _IdleBatch(_Batch):
@@ -3797,14 +5981,52 @@ def _step_tokens(tokenizer, responses, *, progress=(), trim_space=True):
             cached_tokens=0,
         )
     }
+    gen._step(NS(decode_step=lambda: [], prefill_step=lambda: progress), active)
     for token, finish in responses:
         row = NS(uid=1, token=token, token_logprob=0.0, finish_reason=finish)
-        gen._step(NS(next=lambda **kw: (progress, [row])), active)
+        gen._step(NS(decode_step=lambda: [row], prefill_step=lambda: []), active)
     return list(queue.queue)
 
 
 class TestResponseGenerator:
     """Tests for the ResponseGenerator continuous batching engine."""
+
+    @pytest.mark.parametrize("draft_kind", ["dflash", "eagle3", "mtp"])
+    def test_speculative_request_accepts_thinking_budget_and_effort(self, draft_kind):
+        tokenizer = NS(
+            encode=lambda text, **kw: [{"<think>": 1, "\n": 2, "</think>": 3}[text]]
+        )
+        gen = _ready_generator(
+            draft_model=object(), draft_kind=draft_kind, tokenizer=tokenizer
+        )
+        gen._preprocess_request = lambda *a, **kw: {"input_ids": mx.array([[1]])}
+        queued = _capture_requests(gen)
+        args = server._build_gen_args(
+            _chat_request(reasoning_effort="low", thinking_budget=2, max_tokens=12)
+        )
+        _, tokens = gen.generate("prompt", args=args)
+        tokens.close()
+        assert args.to_template_kwargs()["reasoning_effort"] == "low"
+        criteria = queued[0].thinking_budget_criteria
+        assert criteria.thinking_budget == 2 and criteria.in_thinking
+
+    @pytest.mark.parametrize("media", [False, True])
+    def test_cache_boundary_matches_tokenized_prefix_and_skips_media(self, media):
+        gen = _ready_generator()
+        gen._preprocess_request = MagicMock(
+            side_effect=[
+                {"input_ids": mx.array([[1, 2, 3, 4, 5]])},
+                {"input_ids": mx.array([[1, 2, 3, 99]])},
+            ]
+        )
+        queued = _capture_requests(gen, prompt_tokens=5)
+        args = Args(max_tokens=1, cache_prefix="stable messages")
+        _, tokens = gen.generate(
+            "full prompt", args=args, images=["image"] if media else None
+        )
+        tokens.close()
+        assert queued[0].args.cache_checkpoint_len == (0 if media else 3)
+        assert gen._preprocess_request.call_count == (1 if media else 2)
 
     def test_context_limit_precedes_image_hashing(self, monkeypatch):
         gen = _ready_generator(apc_manager=object(), apc_mode="block")
@@ -4026,6 +6248,31 @@ class TestResponseGenerator:
         assert not thread.is_alive()
         assert isinstance(result[0], StopIteration)
 
+    def test_step_publishes_completed_response_before_failing_prefill(self):
+        gen, queue = _generator(), Queue()
+        active = {
+            1: dict(
+                rqueue=queue,
+                streamer=NS(advance=lambda *args: "ready"),
+                prompt_tps=10.0,
+                cached_tokens=0,
+            )
+        }
+        response = NS(uid=1, token=7, token_logprob=0.0, finish_reason="length")
+
+        def prefill_step():
+            token = queue.get_nowait()
+            assert token.text == "ready"
+            assert token.token == 7
+            assert token.finish_reason == "length"
+            assert queue.get_nowait() is None
+            assert 1 not in active
+            raise RuntimeError("unrelated prefill failed")
+
+        batch = NS(decode_step=lambda: [response], prefill_step=prefill_step)
+        with pytest.raises(RuntimeError, match="unrelated prefill failed"):
+            gen._step(batch, active)
+
     def test_step_streams_spm_subword_tokens_immediately(self):
         tokenizer = NS(
             vocab={"▁hello": 0, "world": 1, "!": 2},
@@ -4075,6 +6322,44 @@ class TestResponseGenerator:
                 (str(ctx.uid * 10 + 1), "length"),
             ]
 
+    def test_run_mixes_resumable_and_ordinary_requests_in_one_batch(self, monkeypatch):
+        gen, batches = _worker_setup(monkeypatch, steps=3)
+        ordinary = _enqueue(gen, max_tokens=3)
+        session = sessions.InferenceSession()
+        context_queue = Queue()
+        gen.requests.put(
+            generation.QueuedGenerationRequest(
+                rqueue=context_queue,
+                raw_inputs={"request_id": 2},
+                prompt_tokens=1,
+                args=Args(max_tokens=3),
+                session=session,
+            )
+        )
+        with _running(gen):
+            ordinary_context, ordinary_tokens = _drain(ordinary)
+            context = context_queue.get(timeout=1)
+            resumed_tokens = list(session.reader(timeout=1))
+        assert len(batches) == 1 and batches[0].sizes == [2, 2, 2]
+        assert context.uid != ordinary_context.uid
+        assert len(ordinary_tokens) == len(resumed_tokens) == 3
+        assert [t.generation_tokens for t in resumed_tokens] == [1, 2, 3]
+
+    def test_shutdown_drains_active_ordinary_request(self, monkeypatch):
+        gen, batches = _worker_setup(monkeypatch, steps=3)
+        original_step = gen._step
+
+        def step(*args, **kwargs):
+            original_step(*args, **kwargs)
+            gen._stop = True
+            gen.requests.put(None)
+
+        gen._step = step
+        queue = _enqueue(gen, max_tokens=3)
+        with _running(gen):
+            _, tokens = _drain(queue)
+        assert len(tokens) == 3 and tokens[-1].finish_reason == "length"
+
     @pytest.mark.parametrize("draft_kind", ["dflash", "eagle3", "mtp"])
     def test_speculative_batch_options_and_apc(self, monkeypatch, draft_kind):
         gen, batches = _worker_setup(monkeypatch, draft_kind=draft_kind)
@@ -4086,10 +6371,12 @@ class TestResponseGenerator:
             for queue in queues:
                 _, tokens = _drain(queue)
                 assert len(tokens) == 1 and tokens[0].finish_reason == "length"
+            draft_model = gen.draft_model
+        assert gen.draft_model is None
         batch = batches[0]
         _assert_fields(
             batch.kwargs,
-            draft_model=gen.draft_model,
+            draft_model=draft_model,
             draft_kind=draft_kind,
             draft_block_size=6,
             greedy_sampling=True,
@@ -4112,6 +6399,129 @@ class TestResponseGenerator:
                 assert len(tokens) == 1 and tokens[0].finish_reason == "length"
         assert [b.kwargs["sampler"] for b in batches] == ["sampler-0.0", "sampler-0.6"]
         assert batches[0].closed
+
+    @pytest.mark.parametrize("positioned", [False, True])
+    @pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {},
+            {"top_k": 2},
+            {"top_n_sigma": 1.5},
+            {"top_n_sigma": 1.5, "top_k": 2},
+            {"p_less": True},
+            {"typical_p": 0.95, "top_p": 0.6},
+            {"typical_p": 0.95, "top_k": 2},
+            {"top_n_sigma": 1.5, "p_less": True, "top_p": 1.0},
+            {"p_less": True, "typical_p": 0.3},
+            {"top_n_sigma": 1.5, "p_less": True, "typical_p": 0.3},
+        ],
+    )
+    def test_positioned_sampler_preserves_standard_filtering(
+        self, monkeypatch, options, dtype, positioned
+    ):
+        from mlx_vlm.generate.ar import _sample_with_positions
+
+        args = Args(**({"temperature": 0.5, "top_p": 0.7, "seed": 91} | options))
+        gen = _generator()
+        reference = gen._make_sampler(args)
+        sampler = generation._PositionedTargetSampler(
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            seed=args.seed,
+            top_n_sigma=args.top_n_sigma,
+            p_less=args.p_less,
+            typical_p=args.typical_p,
+        )
+        logprobs = mx.log(
+            mx.array([[0.5, 0.3, 0.2], [0.2, 0.5, 0.3], [0.3, 0.2, 0.5]] * 128)
+        ).astype(dtype)
+        if positioned:
+            row_ids = [0] * len(logprobs)
+            positions = list(range(len(logprobs)))
+            keys = generation._position_keys(args.seed, row_ids, positions)
+
+            # Supply the same draws to main's standard sampler without
+            # duplicating its filtering logic in this compatibility test.
+            def categorical(logits, temperature):
+                return mx.vmap(
+                    lambda row, key: mx.random.categorical(
+                        row * (1 / temperature), key=key
+                    )
+                )(logits, keys)
+
+            monkeypatch.setattr(sample_utils, "categorical_sampling", categorical)
+            expected = _sample_with_positions(
+                reference, logprobs, row_ids=row_ids, positions=positions
+            )
+            actual = _sample_with_positions(
+                sampler, logprobs, row_ids=row_ids, positions=positions
+            )
+        else:
+            mx.random.seed(21)
+            expected = reference(logprobs)
+            mx.eval(expected)
+            mx.random.seed(21)
+            actual = sampler(logprobs)
+        assert actual.tolist() == expected.tolist()
+
+    @pytest.mark.parametrize("resumable", [False, True])
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {},
+            {"top_k": 2},
+            {"top_n_sigma": 1.5},
+            {"p_less": True},
+            {"typical_p": 0.95},
+            {"top_n_sigma": 1.5, "p_less": True, "typical_p": 0.3},
+        ],
+    )
+    def test_batch_sampler_preserves_standard_rng(
+        self, monkeypatch, resumable, options
+    ):
+        from mlx_vlm.generate.ar import _sample_with_positions
+
+        gen, batches = _worker_setup(monkeypatch)
+        args = Args(max_tokens=1, temperature=0.5, top_p=0.7, seed=91, **options)
+        session = sessions.InferenceSession() if resumable else None
+        queue = Queue()
+        gen.requests.put(
+            generation.QueuedGenerationRequest(
+                rqueue=queue,
+                raw_inputs={"request_id": 1},
+                prompt_tokens=1,
+                args=args,
+                session=session,
+            )
+        )
+        with _running(gen):
+            if resumable:
+                queue.get(timeout=1)
+                assert len(list(session.reader(timeout=1))) == 1
+            else:
+                assert len(_drain(queue)[1]) == 1
+
+        logprobs = mx.log(mx.array([[0.5, 0.3, 0.2]] * 128))
+
+        def draws(sampler):
+            mx.random.seed(21)
+            result = []
+            for position in range(3):
+                result.append(
+                    _sample_with_positions(
+                        sampler,
+                        logprobs,
+                        row_ids=[0] * len(logprobs),
+                        positions=[position] * len(logprobs),
+                    ).tolist()
+                )
+                # Interleaved work must consume the same shared RNG stream.
+                result.append(mx.random.uniform(shape=(8,)).tolist())
+            return result
+
+        assert draws(batches[0].kwargs["sampler"]) == draws(gen._make_sampler(args))
 
     @pytest.mark.parametrize("temperature", [0.0, 1e-300, 1e-5, 0.009, 0.01, 0.1])
     @pytest.mark.parametrize(
@@ -4250,9 +6660,11 @@ class TestResponseGenerator:
             _assert_fields(vars(server._build_gen_args(legacy)), **expected)
 
     def test_server_cli_sets_thinking_defaults(self, monkeypatch):
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
         flags = [
             ("model", "PRELOAD_MODEL", "demo"),
             ("image-model", "PRELOAD_IMAGE_MODEL", "image-demo"),
+            ("mesh-model", "PRELOAD_MESH_MODEL", "mesh-demo"),
             ("tts-model", "PRELOAD_TTS_MODEL", "tts-demo"),
             ("stt-model", "PRELOAD_STT_MODEL", "stt-demo"),
             ("decision-model", "PRELOAD_DECISION_MODEL", "decision-demo"),
@@ -4293,6 +6705,7 @@ class TestResponseGenerator:
     def test_lifespan_continues_when_optional_preload_fails(self, monkeypatch):
         kinds = dict(
             MODEL="text_generation",
+            MESH_MODEL="mesh_generation",
             TTS_MODEL="audio_tts",
             STT_MODEL="audio_stt",
             EMBEDDING_MODEL="embedding",
@@ -4483,6 +6896,80 @@ def test_thinking_stream_markers(family, enabled):
     tokens, options, expected = _THINKING_CASES[family]
     state = server.ThinkingStreamState(enable_thinking=enabled, **options)
     assert _thoughts(_feed_thinking(state, [t.text for t in tokens])) == expected
+
+
+@pytest.mark.parametrize(
+    "prefix,text,expected",
+    [
+        ("<think>", "Think.</think>\nAnswer.", ("Think.", "Answer.")),
+        ("<think></think>", "Answer.", ("", "Answer.")),
+        ("<think>", "Unfinished", ("Unfinished", "")),
+        ("", "<think>Think.</think>Answer.", ("Think.", "Answer.")),
+    ],
+)
+def test_response_template_prefilled_thinking(prefix, text, expected):
+    tokenizer = _MuseResponseTemplateTokenizer()
+    tokenizer.response_template = {
+        "start_anchor_pattern": r"<\|im_start\|>assistant\n",
+        "fields": {
+            "reasoning_content": {
+                "open_pattern": r"<think>\n?",
+                "close_pattern": r"</think>\s*",
+                "content": "text",
+            },
+            "content": {"close_pattern": r"<\|im_end\|>\s*", "content": "text"},
+        },
+    }
+    prompt = (
+        "<|im_start|>assistant\n<think>Old.</think>Old answer.<|im_end|>\n"
+        "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n" + prefix
+    )
+    processor = NS(tokenizer=tokenizer)
+    state = server.make_response_stream_state(processor, prompt=prompt)
+    assert _thoughts(_feed_thinking(state, list(text), last=True)) == expected
+    assert server._split_thinking(text, processor=processor, prompt=prompt) == (
+        expected[0] or None,
+        expected[1],
+    )
+
+
+@pytest.mark.parametrize("api", ["chat", "responses", "messages"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize(
+    "anchor",
+    [
+        {"start_anchor": "<|im_start|>assistant\n"},
+        {"start_anchor": ["<|im_start|>assistant\n", "<|tool_response|>"]},
+        {"start_anchor_pattern": r"<\|im_start\|>assistant\n"},
+    ],
+)
+def test_response_template_missing_anchor(client, api, stream, batched, anchor):
+    tokenizer = _MuseResponseTemplateTokenizer()
+    tokenizer.response_template = {**anchor, "fields": {"content": {"content": "text"}}}
+    result = _result("4.", finish_reason="stop")
+    worker = _streaming([_token("4.", finish_reason="stop")]) if batched else None
+    with _endpoint(
+        processor=NS(tokenizer=tokenizer),
+        template="user: Hello\nAssistant:",
+        result=result,
+        chunks=[result],
+        generator=worker,
+    ):
+        response = _post(client, api, stream=stream)
+    assert response.status_code == 200, response.text
+    if stream:
+        assert _thinking_text(response, api) == ("", "4.")
+        if api == "responses":
+            assert _completed_response(response)["output_text"] == "4."
+    else:
+        body = response.json()
+        if api == "chat":
+            assert body["choices"][0]["message"]["content"] == "4."
+        elif api == "responses":
+            assert body["output_text"] == "4."
+        else:
+            assert _joined(body["content"], "text") == "4."
 
 
 def test_response_template_thinking_stream():
@@ -4797,18 +7284,51 @@ class TestReranking:
             model, hidden, padding, tokenizer
         ) == pytest.approx([1 / (1 + math.exp(-4)), 1 / (1 + math.exp(6))])
 
-    @pytest.mark.parametrize(
-        "value",
-        [
-            [1, 2, 3],
-            {"input_ids": [1, 2, 3]},
-            NS(input_ids=[1, 2, 3]),
-            NS(input_ids=[[1, 2, 3]]),
-            mx.array([1, 2, 3]),
-        ],
-    )
-    def test_input_ids(self, value):
-        assert reranking._input_ids(value) == [1, 2, 3]
+    def test_text_prompt_built_without_chat_template(self, monkeypatch):
+        # The text reranker prompt must not depend on the tokenizer's chat
+        # template: it is prefix + "<Instruct>: i\n<Query>: q\n<Document>: d"
+        # + suffix, all tokenized with add_special_tokens=False.
+        encoded = {}
+
+        def encode(text, add_special_tokens=False):
+            assert not add_special_tokens
+            if text not in encoded:
+                encoded[text] = list(range(len(encoded) * 10, len(encoded) * 10 + 2))
+            return encoded[text]
+
+        # No apply_chat_template attribute: using it would raise.
+        tokenizer = NS(
+            encode=encode,
+            pad_token_id=0,
+            eos_token_id=0,
+            unk_token_id=None,
+            convert_tokens_to_ids=lambda token: 0,
+        )
+        captured = []
+
+        def padded(tokenizer, sequences):
+            captured.extend(sequences)
+            return (
+                mx.zeros((len(sequences), 4), mx.int32),
+                mx.ones((len(sequences), 4), mx.int32),
+            )
+
+        monkeypatch.setattr(reranking, "_padded_tokens", padded)
+        inner = NS(
+            embed_tokens=lambda ids: mx.zeros((ids.shape[0], ids.shape[1], 1)),
+            layers=[],
+            norm=lambda hidden: hidden,
+        )
+        model = NS(language_model=NS(model=inner, lm_head=lambda hidden: hidden))
+        query = reranking.RerankItem(text="query")
+        document = reranking.RerankItem(text="document")
+        reranking._score_text_batch(model, tokenizer, query, [document], "instruct")
+        body = "<Instruct>: instruct\n<Query>: query\n<Document>: document"
+        assert captured == [
+            encoded[reranking.TEXT_PREFIX]
+            + encoded[body]
+            + encoded[reranking.TEXT_SUFFIX]
+        ]
 
     def test_packaged_template(self, tmp_path, monkeypatch):
         (tmp_path / "chat_template.jinja").write_text("template", encoding="utf-8")
@@ -5049,6 +7569,89 @@ def test_apc_patch_reaches_next_model_request(settings_client, tmp_path):
     server.get_cached_model("demo")
     assert server.runtime.apc_manager is None
     assert client.get("/v1/cache/stats").json() == {"enabled": False}
+
+
+def test_live_image_limits_preserve_loaded_model_and_request_snapshot(
+    settings_client, monkeypatch
+):
+    client, generators = settings_client
+    monkeypatch.setenv("MLX_VLM_MIN_PIXELS", "1048576")
+    monkeypatch.setenv("MLX_VLM_MAX_PIXELS", "4194304")
+    monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
+    before_env = dict(os.environ)
+    loaded = server.get_cached_model("demo")
+    before = client.get("/v1/settings").json()
+    for name in ("min_pixels", "max_pixels"):
+        knob = next(k for k in before["schema"] if k["name"] == name)
+        assert knob["reload_kinds"] == []
+    queued_args = server._build_gen_args(_chat_request())
+
+    low = dict(min_pixels=65536, max_pixels=262144)
+    body = client.patch("/v1/settings", json=low).json()
+    assert body["applied"] == low and body["rejected"] == []
+    assert body["reload_kinds"] == []
+    assert body["fingerprint"] == before["fingerprint"]
+    assert server.get_cached_model("demo") == loaded
+    assert len(generators) == 1 and not generators[0].stopped
+    assert server._build_gen_args(_chat_request()).preprocessing_kwargs() == low
+    assert queued_args.preprocessing_kwargs() == dict(
+        min_pixels=1048576, max_pixels=4194304
+    )
+    override = dict(min_pixels=32768, max_pixels=131072)
+    assert (
+        server._build_gen_args(_chat_request(**override)).preprocessing_kwargs()
+        == override
+    )
+
+    # Clearing runtime settings must not fall back to the startup environment.
+    client.patch("/v1/settings", json=dict(min_pixels=None, max_pixels=None))
+    assert server._build_gen_args(_chat_request()).preprocessing_kwargs() == {}
+    restored = client.patch("/v1/settings", json={"op": "replace", "values": {}}).json()
+    assert restored["current"] == before["current"]
+    assert restored["reload_kinds"] == []
+    assert dict(os.environ) == before_env
+
+
+@pytest.mark.parametrize("api", ["chat", "responses", "messages"])
+def test_live_image_defaults_reach_inference_endpoints(client, monkeypatch, api):
+    monkeypatch.setattr(server.runtime, "config", RuntimeConfig())
+    options = dict(min_pixels=1048576, max_pixels=4194304)
+    assert client.patch("/v1/settings", json=options).json()["applied"] == options
+    worker = _streaming([_token("done", finish_reason="stop")])
+    with _endpoint(generator=worker):
+        response = _post(client, api)
+    assert response.status_code == 200, response.text
+    call = worker.generate.call_args
+    args = call.kwargs.get("args") or call.args[3]
+    assert args.preprocessing_kwargs() == options
+
+
+@pytest.mark.parametrize("op", ["merge", "replace"])
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"min_pixels": 0},
+        {"max_pixels": -1},
+        {"min_pixels": True},
+        {"max_pixels": 1024.5},
+        {"min_pixels": "bad", "max_pixels": 2097152},
+        {"min_pixels": 8388608},
+        {"max_pixels": 262144},
+        {"min_pixels": 2097152, "max_pixels": 1048576},
+    ],
+)
+def test_invalid_live_image_limits_keep_pair(settings_client, monkeypatch, op, values):
+    client, _ = settings_client
+    monkeypatch.setenv("MLX_VLM_MIN_PIXELS", "1048576")
+    monkeypatch.setenv("MLX_VLM_MAX_PIXELS", "4194304")
+    monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
+    before = client.get("/v1/settings").json()
+    body = client.patch("/v1/settings", json={"op": op, "values": values}).json()
+    assert body["applied"] == {}
+    assert {r["name"] for r in body["rejected"]} == set(values)
+    assert body["current"] == before["current"]
+    assert body["fingerprint"] == before["fingerprint"]
+    assert body["reload_kinds"] == []
 
 
 def _apc_budget(manager, memory, reserve, disk, queue):
@@ -5720,6 +8323,120 @@ def test_audio_transcription_request(
     loader.assert_called_once_with("fake-stt", model_kind="audio_stt")
 
 
+@pytest.mark.parametrize(
+    "endpoint, options, expected",
+    [
+        ("transcriptions", {}, {"task": "asr"}),
+        (
+            "transcriptions",
+            {"task": "qa", "prompt": "What time is the meeting?"},
+            {"task": "qa", "prompt": "What time is the meeting?"},
+        ),
+        (
+            "transcriptions",
+            {"task": "qa", "system_prompt": "Answer the spoken question."},
+            {"task": "qa", "system_prompt": "Answer the spoken question."},
+        ),
+        ("transcriptions", {"task": "saa"}, {"task": "saa"}),
+        ("transcriptions", {"task": "rich"}, {"task": "rich"}),
+        (
+            "translations",
+            {"task": "saa", "language": "German"},
+            {"task": "translate", "language": "German"},
+        ),
+    ],
+    ids=[
+        "default",
+        "audio-question",
+        "spoken-request",
+        "speakers",
+        "rich",
+        "translate",
+    ],
+)
+@pytest.mark.parametrize("stream", [False, True], ids=["json", "stream"])
+def test_audio_native_task_and_prompt(
+    audio_client, monkeypatch, endpoint, options, expected, stream
+):
+    fake, _ = _audio_backend(monkeypatch, {"text": "answer"})
+    calls = []
+
+    def generate(
+        audio,
+        *,
+        task="asr",
+        prompt=None,
+        system_prompt=None,
+        language=None,
+        stream=False,
+        **kwargs,
+    ):
+        assert Path(audio).exists()
+        calls.append(
+            dict(
+                task=task, prompt=prompt, system_prompt=system_prompt, language=language
+            )
+        )
+        assert "context" not in kwargs
+        result = {"text": "answer"}
+        return iter([result]) if stream else result
+
+    monkeypatch.setattr(fake, "generate", generate)
+    monkeypatch.setattr(
+        server_audio,
+        "audio_read",
+        lambda buffer, always_2d=False: (np.zeros(160, dtype=np.float32), 16000),
+    )
+    response = _upload(audio_client, endpoint, stream=str(stream).lower(), **options)
+    assert response.status_code == 200, response.text
+    assert response.json() == {"text": "answer"}
+    assert len(calls) == 1
+    assert {
+        key: value for key, value in calls[0].items() if value is not None
+    } == expected
+
+
+@pytest.mark.parametrize(
+    "generate, options, expected",
+    [
+        (
+            lambda audio, *, prompt=None, context=None, **kwargs: (prompt, context),
+            {"context": "existing context"},
+            ("instruction", "existing context"),
+        ),
+        (lambda audio, *, context=None, **kwargs: context, {}, "instruction"),
+        (lambda audio, *, text=None, **kwargs: text, {}, "instruction"),
+        (
+            lambda audio, *, context=None, **kwargs: context,
+            {"context": "existing context"},
+            "existing context",
+        ),
+        (
+            lambda audio, *, text=None, **kwargs: text,
+            {"text": "existing text"},
+            "existing text",
+        ),
+        (lambda audio, **kwargs: kwargs["context"], {}, "instruction"),
+    ],
+    ids=[
+        "native-prompt",
+        "context",
+        "text",
+        "keep-context",
+        "keep-text",
+        "kwargs-only",
+    ],
+)
+def test_audio_prompt_uses_explicit_parameter(generate, options, expected):
+    request = server_audio.AudioTranscriptionRequest(
+        model="test", prompt="instruction", **options
+    )
+    kwargs = server_audio._build_stt_generate_kwargs(
+        NS(generate=generate), request, translate=False
+    )
+    assert generate("audio.wav", **kwargs) == expected
+
+
 @pytest.mark.usefixtures("reset_audio_runtime")
 def test_audio_tts_and_stt_caches_are_independent(monkeypatch):
     fake_tts = NS(model_type="fake_tts")
@@ -5758,6 +8475,430 @@ def test_audio_transcriptions_undecodable_upload_returns_400(audio_client, monke
 
     assert response.status_code == 400
     assert "Invalid audio file" in response.json()["detail"]
+
+
+# Speaker analysis uses the same queue and model registry as other audio work.
+
+
+def _speaker_upload(client, kind, samples=None, **fields):
+    if samples is None:
+        samples = np.full(3 * 16000, 0.1, dtype="<f4")
+    return client.post(
+        f"/v1/audio/{kind}",
+        files={"file": ("audio.f32", samples.tobytes(), "application/octet-stream")},
+        data={"input_format": "pcm_f32le", **fields},
+    )
+
+
+@pytest.mark.parametrize("endpoint", ["diarizations", "speaker_embeddings"])
+def test_speaker_endpoints_require_configured_api_key(
+    audio_client, monkeypatch, endpoint
+):
+    monkeypatch.setenv("MLX_VLM_SERVER_API_KEY", "secret-test-key")
+    response = audio_client.post(f"/v1/audio/{endpoint}")
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+
+
+def test_diarization_one_session_per_recording_keeps_global_ids(
+    audio_client, monkeypatch
+):
+    from mlx_vlm.server import audio_speakers as speakers
+
+    calls = []
+
+    def stream(chunks, sample_rate):
+        seen = []
+        calls.append(seen)
+        for chunk, turns in zip(
+            chunks,
+            [[(0, 30, 7)], [(30, 40, 2), (40, 60, 7)], [(60, 61, 7)]],
+            strict=True,
+        ):
+            seen.append(len(chunk))
+            yield NS(segments=[NS(start=a, end=b, speaker=c) for a, b, c in turns])
+
+    loader = Mock(return_value=(NS(generate_stream=stream), None, None))
+    monkeypatch.setattr(server, "get_cached_model", loader)
+    for _ in range(2):
+        response = _speaker_upload(
+            audio_client, "diarizations", np.zeros(61 * 16000, dtype="<f4")
+        )
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "model": speakers.DIARIZATION_MODEL,
+            "revision": None,
+            "segments": [
+                {"start": 0, "end": 30, "speaker": 7},
+                {"start": 30, "end": 40, "speaker": 2},
+                {"start": 40, "end": 61, "speaker": 7},
+            ],
+        }
+    assert calls == [[480000, 480000, 16000]] * 2
+    loader.assert_called_with(
+        speakers.DIARIZATION_MODEL,
+        model_kind="audio_diarization",
+        revision=None,
+    )
+    assert (
+        audio_client.get("/metrics").json()["latest"]["endpoint"]
+        == "/v1/audio/diarizations"
+    )
+
+
+def test_diarization_decodes_and_resamples_wav(audio_client, monkeypatch):
+    import io
+
+    from mlx_audio.audio_io import write
+
+    source = io.BytesIO()
+    write(source, np.full((8000, 2), 0.1, dtype=np.float32), 8000, format="wav")
+    observed = []
+
+    def stream(chunks, sample_rate):
+        observed.extend((len(chunk), sample_rate) for chunk in chunks)
+        yield NS(segments=[NS(start=0, end=1, speaker=4)])
+
+    monkeypatch.setattr(
+        server,
+        "get_cached_model",
+        Mock(return_value=(NS(generate_stream=stream), None, None)),
+    )
+    response = audio_client.post(
+        "/audio/diarizations",
+        files={"file": ("clip.wav", source.getvalue(), "audio/wav")},
+    )
+    assert response.status_code == 200, response.text
+    assert observed == [(16000, 16000)]
+    assert response.json()["segments"] == [{"start": 0, "end": 1, "speaker": 4}]
+
+
+def test_speaker_invalid_encoded_file_returns_400(audio_client, monkeypatch):
+    loader = Mock()
+    monkeypatch.setattr(server, "get_cached_model", loader)
+    response = audio_client.post(
+        "/audio/diarizations", files={"file": ("broken.wav", b"bad", "audio/wav")}
+    )
+    assert response.status_code == 400
+    loader.assert_not_called()
+
+
+def test_speaker_embedding_keeps_window_boundaries_and_weighted_normalization(
+    audio_client, monkeypatch
+):
+    calls = []
+
+    def encode(samples, sample_rate):
+        calls.append((samples.copy(), sample_rate))
+        result = np.zeros(192, dtype=np.float32)
+        result[len(calls) - 1] = 4
+        return result
+
+    monkeypatch.setattr(
+        server, "get_cached_model", Mock(return_value=(NS(encode=encode), None, None))
+    )
+    samples = np.linspace(0.1, 0.9, 7 * 16000, dtype="<f4")
+    response = _speaker_upload(
+        audio_client,
+        "speaker_embeddings",
+        samples,
+        windows='[{"start":0,"end":3},{"start":3,"end":7}]',
+    )
+    assert response.status_code == 200, response.text
+    assert [(len(window), rate) for window, rate in calls] == [
+        (48000, 16000),
+        (64000, 16000),
+    ]
+    np.testing.assert_array_equal(calls[0][0], samples[:48000])
+    np.testing.assert_array_equal(calls[1][0], samples[48000:])
+    result = response.json()
+    assert result["model"] == "nativ-community/SpeechBrain-ECAPA-VoxCeleb-20M"
+    assert result["revision"] is None
+    np.testing.assert_allclose(result["embedding"][:2], [0.6, 0.8], rtol=1e-6)
+    assert len(result["embedding"]) == 192 and result["duration"] == 7
+
+
+@pytest.mark.parametrize(
+    "windows",
+    [
+        "[]",
+        '[{"start":0,"end":2.9}]',
+        '[{"start":0,"end":10.01}]',
+        '[{"start":false,"end":3}]',
+        '[{"start":0,"end":NaN}]',
+        '[{"start":0,"end":3},{"start":2,"end":5}]',
+        '[{"start":0,"end":3.1}]',
+        "null",
+        "not-json",
+    ],
+)
+def test_speaker_bad_windows_never_load_model(audio_client, monkeypatch, windows):
+    loader = Mock()
+    monkeypatch.setattr(server, "get_cached_model", loader)
+    response = _speaker_upload(audio_client, "speaker_embeddings", windows=windows)
+    assert response.status_code == 400, response.text
+    loader.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "kind,samples,fields",
+    [
+        ("diarizations", np.array([], dtype="<f4"), {}),
+        ("diarizations", np.array([0] * 480000 + [np.nan], dtype="<f4"), {}),
+        ("diarizations", np.ones(16000, dtype="<f4"), {"sample_rate": "8000"}),
+        (
+            "speaker_embeddings",
+            np.zeros(48000, dtype="<f4"),
+            {"windows": '[{"start":0,"end":3}]'},
+        ),
+    ],
+)
+def test_speaker_bad_audio_never_loads_model(
+    audio_client, monkeypatch, kind, samples, fields
+):
+    loader = Mock()
+    monkeypatch.setattr(server, "get_cached_model", loader)
+    response = _speaker_upload(audio_client, kind, samples, **fields)
+    assert response.status_code == 400, response.text
+    loader.assert_not_called()
+
+
+@pytest.mark.usefixtures("reset_audio_runtime")
+def test_speaker_cache_distinguishes_model_kind_and_revision(monkeypatch):
+    from mlx_vlm.server import audio_speakers as speakers
+
+    loader = Mock(side_effect=lambda *_: object())
+    monkeypatch.setattr(speakers, "load_speaker_model", loader)
+    first = server.get_cached_model(
+        "speaker", model_kind="audio_speaker_embedding", revision="one"
+    )[0]
+    assert (
+        server.get_cached_model(
+            "speaker", model_kind="audio_speaker_embedding", revision="one"
+        )[0]
+        is first
+    )
+    second = server.get_cached_model(
+        "speaker", model_kind="audio_speaker_embedding", revision="two"
+    )[0]
+    assert second is not first
+    third = server.get_cached_model(
+        "speaker", model_kind="audio_diarization", revision="two"
+    )[0]
+    assert third is not second
+    assert loader.call_count == 3
+    assert server.unload_model_sync()
+    assert not server.runtime.model_cache
+
+
+def test_speaker_cancellation_closes_stream_without_emitting_partial_output():
+    from tempfile import TemporaryFile
+
+    from mlx_vlm.server import audio_speakers as speakers
+
+    with TemporaryFile() as audio:
+        audio.write(np.zeros(61 * 16000, dtype="<f4").tobytes())
+        request = server_audio.AudioInferenceRequest(
+            kind="diarization",
+            model_name="test",
+            payload=speakers.SpeakerTaskPayload(audio, 61 * 16000, "test"),
+        )
+        closed = []
+
+        def stream(chunks, sample_rate):
+            try:
+                for _ in chunks:
+                    request.cancel_event.set()
+                    yield NS(segments=[NS(start=0, end=1, speaker=0)])
+            finally:
+                closed.append(True)
+
+        with pytest.raises(HTTPException, match="cancelled"):
+            speakers.run_request(
+                request, lambda *a, **k: (NS(generate_stream=stream), None, None)
+            )
+        assert closed == [True]
+        assert request.result_queue.empty()
+
+
+@pytest.mark.parametrize("kind", ["diarization", "speaker_embedding", "diarized_stt"])
+@pytest.mark.parametrize("queued", [False, True])
+@pytest.mark.usefixtures("reset_audio_runtime")
+def test_cancelled_speaker_job_closes_owned_upload(monkeypatch, kind, queued):
+    from tempfile import TemporaryFile
+
+    from mlx_vlm.server import audio_diarized, audio_speakers
+
+    entered, release = Event(), Event()
+
+    def block(*args):
+        entered.set()
+        assert release.wait(5)
+
+    monkeypatch.setattr(server_audio, "_run_tts_request", block)
+    monkeypatch.setattr(audio_speakers, "run_request", block)
+    monkeypatch.setattr(audio_diarized, "run_request", block)
+    worker = server_audio._get_audio_queue()
+    with TemporaryFile() as audio:
+        try:
+            if queued:
+                worker.submit(kind="tts", model_name="test", payload=None)
+                assert entered.wait(5)
+            handle = worker.submit(
+                kind=kind,
+                model_name="test",
+                payload=audio_speakers.SpeakerTaskPayload(audio, 512, None),
+            )
+            if not queued:
+                assert entered.wait(5)
+            handle.cancel()
+        finally:
+            release.set()
+            worker.stop_and_join()
+        assert audio.closed
+
+
+_ANALYSIS_RESPONSES = [
+    ("diarization", False),
+    ("speaker_embedding", False),
+    ("diarized_stt", False),
+    ("diarized_stt", True),
+]
+
+
+@pytest.fixture(params=_ANALYSIS_RESPONSES)
+def analysis_response(request, monkeypatch, reset_audio_runtime):
+    from tempfile import TemporaryFile
+
+    from starlette.datastructures import FormData
+
+    from mlx_vlm.server import audio_diarized, audio_speakers
+
+    kind, stream = request.param
+    module = audio_diarized if kind == "diarized_stt" else audio_speakers
+    with TemporaryFile() as audio:
+        payload = audio_speakers.SpeakerTaskPayload(audio, 512, None)
+        monkeypatch.setattr(
+            module, "parse_speaker_request", AsyncMock(return_value=("test", payload))
+        )
+        http_request = NS(
+            form=AsyncMock(
+                return_value=FormData({"model": "test", "stream": str(stream).lower()})
+            ),
+            is_disconnected=AsyncMock(return_value=False),
+        )
+        job = server_audio.AudioInferenceRequest(
+            kind=kind, model_name="test", payload=payload
+        )
+        handle = server_audio.AudioInferenceHandle(
+            job.request_id, job.result_queue, job.cancel_event, job.ready_event, job
+        )
+        queue = NS(submit=Mock(return_value=handle))
+        monkeypatch.setattr(server_audio, "_get_audio_queue", lambda: queue)
+        metrics = server.runtime.metrics
+        monkeypatch.setattr(
+            metrics, "record_success", Mock(wraps=metrics.record_success)
+        )
+        monkeypatch.setattr(
+            metrics, "record_failure", Mock(wraps=metrics.record_failure)
+        )
+
+        async def respond():
+            if kind == "diarized_stt":
+                return await audio_diarized.response(http_request)
+            return await audio_speakers._response(http_request, kind)
+
+        yield NS(
+            audio=audio,
+            job=job,
+            http=http_request,
+            queue=queue,
+            metrics=metrics,
+            stream=stream,
+            respond=respond,
+        )
+
+
+@pytest.mark.parametrize("failure", ["disconnect", "worker"])
+def test_analysis_response_failure_cancels_job_but_worker_owns_file(
+    analysis_response, failure
+):
+    case = analysis_response
+    if failure == "disconnect":
+        case.http.is_disconnected.return_value = True
+    else:
+        case.job.emit_error(HTTPException(499, "Audio request disconnected"))
+
+    async def invoke():
+        if case.stream:
+            response = await case.respond()
+            events = [json.loads(value[6:]) async for value in response.body_iterator]
+            assert events == [
+                {"type": "error", "error": {"message": "Audio request disconnected"}}
+            ]
+        else:
+            with pytest.raises(HTTPException) as error:
+                await case.respond()
+            assert error.value.status_code == 499
+
+    asyncio.run(invoke())
+    assert case.job.cancel_event.is_set()
+    assert not case.audio.closed
+    case.metrics.record_failure.assert_called_once()
+    case.metrics.record_success.assert_not_called()
+
+
+def test_analysis_admission_failure_closes_upload_before_stream_headers(
+    analysis_response,
+):
+    case = analysis_response
+    case.queue.submit.side_effect = HTTPException(409, "Audio worker is busy")
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(case.respond())
+    assert error.value.status_code == 409
+    assert case.audio.closed
+    case.metrics.record_failure.assert_called_once()
+    case.metrics.record_success.assert_not_called()
+
+
+@pytest.mark.parametrize("analysis_response", _ANALYSIS_RESPONSES[:3], indirect=True)
+def test_analysis_missing_result_is_recorded_as_failure(analysis_response):
+    case = analysis_response
+    case.job.emit_done()
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(case.respond())
+    assert error.value.status_code == 500
+    assert case.job.cancel_event.is_set()
+    assert not case.audio.closed
+    case.metrics.record_failure.assert_called_once()
+    case.metrics.record_success.assert_not_called()
+
+
+@pytest.mark.parametrize("analysis_response", [_ANALYSIS_RESPONSES[-1]], indirect=True)
+def test_closing_diarized_stream_cancels_job(analysis_response):
+    case = analysis_response
+    case.job.emit_data({"type": "diarization.completed"})
+
+    async def invoke():
+        response = await case.respond()
+        await anext(response.body_iterator)
+        await response.body_iterator.aclose()
+
+    asyncio.run(invoke())
+    assert case.job.cancel_event.is_set()
+    assert not case.audio.closed
+    case.metrics.record_failure.assert_called_once()
+    case.metrics.record_success.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "value", [np.zeros(192), np.ones(2048), np.full(192, np.nan), np.full(192, np.inf)]
+)
+def test_speaker_encoder_rejects_invalid_vectors(value):
+    from mlx_vlm.server.audio_speakers import normalized
+
+    with pytest.raises(ValueError):
+        normalized(value)
 
 
 # Realtime voice sessions
@@ -6255,3 +9396,1128 @@ def test_decisions_leave_mixed_media_to_the_model(client):
     model.predict.assert_called_once_with(
         None, None, questions, images=["cat.png"], audio="meow.wav"
     )
+
+
+@pytest.mark.parametrize("api", ["chat", "responses"])
+@pytest.mark.parametrize("batching", [False, True])
+@pytest.mark.parametrize("truncated", [False, True])
+@pytest.mark.parametrize("response_template", [False, True])
+def test_tool_arguments_stream_incrementally(
+    client, api, batching, truncated, response_template
+):
+    chunks = [
+        '<tool_call>{"name":"get_weather","arguments":{"city":"',
+        "War",
+        "saw",
+        '"}}</tool_call>',
+    ]
+    if truncated:
+        chunks = chunks[:-1]
+    tokens = [
+        _token(text, finish_reason="stop" if i == len(chunks) - 1 else None)
+        for i, text in enumerate(chunks)
+    ]
+    template = {
+        "defaults": {"role": "assistant"},
+        "fields": {
+            "content": {"content": "text"},
+            "tool_calls": {
+                "open": "<tool_call>",
+                "close": "</tool_call>",
+                "content": "json",
+                "repeats": True,
+            },
+        },
+    }
+    processor = (
+        NS(
+            response_template=template,
+            get_response_parser=lambda prefix: ResponseParser(template, prefix=prefix),
+            parse_response=lambda text, prefix: parse_response(
+                text, template, prefix=prefix
+            ),
+        )
+        if response_template
+        else None
+    )
+    with _endpoint(
+        generator=_streaming(tokens) if batching else None,
+        chunks=[
+            _result(token.text, finish_reason=token.finish_reason) for token in tokens
+        ],
+        parser=load_tool_module("json_tools"),
+        processor=processor,
+    ):
+        response = _post(client, api, stream=True, tools=[_tool()])
+    events = _data(response)
+    if api == "responses":
+        deltas = [
+            event
+            for event in events
+            if event.get("type") == "response.function_call_arguments.delta"
+        ]
+        assert len(deltas) >= 3
+        assert deltas[0]["delta"] == '{"city":"'
+        added = next(
+            event
+            for event in events
+            if event.get("type") == "response.output_item.added"
+        )
+        assert added["item"]["arguments"] == ""
+        assert all(
+            event["item_id"] == added["item"]["id"]
+            and event["output_index"] == added["output_index"]
+            for event in deltas
+        )
+        completed = [
+            event for event in events if event.get("type") == "response.completed"
+        ]
+        if truncated:
+            assert not completed and any(
+                event.get("type") in ("error", "response.failed") for event in events
+            )
+        else:
+            final = completed[0]["response"]["output"][0]
+            assert final["arguments"] == _joined(deltas, "delta") == '{"city":"Warsaw"}'
+            assert final["id"] == added["item"]["id"]
+            assert final["call_id"] == added["item"]["call_id"]
+    else:
+        choices = [event["choices"][0] for event in events if event.get("choices")]
+        calls = [
+            call
+            for choice in choices
+            for call in choice["delta"].get("tool_calls") or []
+        ]
+        assert len(calls) >= 3
+        assert calls[0]["function"]["name"] == "get_weather"
+        assert calls[0]["function"]["arguments"] == '{"city":"'
+        finishes = [
+            choice["finish_reason"] for choice in choices if choice.get("finish_reason")
+        ]
+        if truncated:
+            assert not finishes and any("error" in event for event in events)
+        else:
+            assert finishes == ["tool_calls"]
+            assert (
+                "".join(call["function"].get("arguments", "") for call in calls)
+                == '{"city":"Warsaw"}'
+            )
+
+
+@pytest.mark.parametrize("api", ["chat", "responses"])
+@pytest.mark.parametrize("batching", [False, True])
+@pytest.mark.parametrize(
+    "parser,text,expected",
+    [
+        (
+            "cohere2_moe",
+            '<|START_ACTION|>[{"tool_name":"get_time"},'
+            '{"tool_name":"write_file","parameters":{"content":"x"}}]'
+            "<|END_ACTION|>",
+            [("get_time", {}), ("write_file", {"content": "x"})],
+        ),
+        (
+            "json_tools",
+            '<tool_call>["oops",{"name":"write_file","arguments":{"path":"x"}},'
+            '5,{"name":"get_time","arguments":{}}]</tool_call>',
+            [("write_file", {"path": "x"}), ("get_time", {})],
+        ),
+    ],
+)
+def test_tool_streaming_filters_calls_consistently(
+    client, api, batching, parser, text, expected
+):
+    chunks = [text[offset : offset + 7] for offset in range(0, len(text), 7)]
+    tokens = [
+        _token(chunk, finish_reason="stop" if i == len(chunks) - 1 else None)
+        for i, chunk in enumerate(chunks)
+    ]
+    with _endpoint(
+        generator=_streaming(tokens) if batching else None,
+        chunks=[
+            _result(token.text, finish_reason=token.finish_reason) for token in tokens
+        ],
+        parser=load_tool_module(parser),
+    ):
+        response = _post(
+            client, api, stream=True, tools=[_tool("get_time"), _tool("write_file")]
+        )
+    events = _data(response)
+    assert not any(
+        "error" in event or event.get("type") in ("error", "response.failed")
+        for event in events
+    )
+    if api == "responses":
+        completed = [
+            event for event in events if event.get("type") == "response.completed"
+        ]
+        assert len(completed) == 1
+        calls = completed[0]["response"]["output"]
+        assert all(call["type"] == "function_call" for call in calls)
+        actual = [(call["name"], json.loads(call["arguments"])) for call in calls]
+    else:
+        choices = [event["choices"][0] for event in events if event.get("choices")]
+        assert [
+            choice["finish_reason"] for choice in choices if choice.get("finish_reason")
+        ] == ["tool_calls"]
+        received = {}
+        for choice in choices:
+            for delta in choice["delta"].get("tool_calls") or []:
+                call = received.setdefault(delta["index"], {"arguments": ""})
+                function = delta["function"]
+                if "name" in function:
+                    call["name"] = function["name"]
+                call["arguments"] += function.get("arguments", "")
+        assert list(received) == list(range(len(expected)))
+        actual = [
+            (call["name"], json.loads(call["arguments"])) for call in received.values()
+        ]
+    assert actual == expected
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_diarized_transcription_openai_contract_and_global_speakers(
+    audio_client, monkeypatch, stream
+):
+    from scipy.io.wavfile import read
+
+    calls, windows = [], []
+    samples = np.linspace(0.1, 0.9, 61 * 16000, dtype="<f4")
+
+    def diarize(chunks, sample_rate):
+        assert sum(len(c) for c in chunks) == 61 * 16000
+        calls.append("diarization")
+        yield NS(
+            segments=[
+                NS(start=0, end=30, speaker=7),
+                NS(start=30, end=40, speaker=2),
+                NS(start=40, end=61, speaker=7),
+            ]
+        )
+
+    def transcribe(path, **kwargs):
+        calls.append("transcription")
+        assert calls[0] == "diarization"
+        rate, window = read(path)
+        assert rate == 16000
+        windows.append(window)
+        return {
+            "text": "Hello world.",
+            "words": [
+                {"word": "Hello", "start": 3.0, "end": 4.0},
+                {"word": "world.", "start": 5.0, "end": 6.0},
+            ],
+        }
+
+    monkeypatch.setattr(
+        server,
+        "get_cached_model",
+        lambda name, **kw: (
+            (
+                NS(generate_stream=diarize)
+                if kw["model_kind"] == "audio_diarization"
+                else NS(generate=transcribe)
+            ),
+            None,
+            None,
+        ),
+    )
+    response = _speaker_upload(
+        audio_client,
+        "transcriptions",
+        samples,
+        model="test-stt",
+        response_format="diarized_json",
+        stream=str(stream).lower(),
+        chunking_strategy="auto",
+        **{"include[]": "diarization"},
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        assert response.headers["content-type"].startswith("text/event-stream")
+        events = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        assert events[0]["type"] == "diarization.completed"
+        result = events[-1]
+        assert result["type"] == "transcript.text.done"
+        segments = [e for e in events if e["type"] == "transcript.text.segment"]
+    else:
+        result = response.json()
+        segments = result["segments"]
+    assert result["task"] == "transcribe" and result["duration"] == 61
+    assert result["diarization"]["speaker_ids"] == {"A": 2, "B": 7}
+    assert result["diarization"]["model"] == "nativ-community/Nemotron-3-Diarization"
+    assert result["diarization"]["revision"] is None
+    assert [s["speaker"] for s in segments] == ["B", "B", "B"]
+    assert len({s["id"] for s in segments}) == 3
+    assert all(s["type"] == "transcript.text.segment" for s in segments)
+    assert result["text"] == "Hello world. Hello world. Hello world."
+    assert calls == ["diarization", "transcription", "transcription", "transcription"]
+
+    for actual, (start, end) in zip(
+        windows, [(0, 28), (24, 45.5), (41.5, 61)], strict=True
+    ):
+        np.testing.assert_array_equal(
+            actual, samples[round(start * 16000) : round(end * 16000)]
+        )
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"known_speaker_names[]": "person"},
+        {"chunking_strategy": "{}"},
+        {"timestamp_granularities[]": "word"},
+        {"include[]": "logprobs"},
+    ],
+)
+def test_diarized_unsupported_options_are_explicit(audio_client, monkeypatch, fields):
+    loader = Mock()
+    monkeypatch.setattr(server, "get_cached_model", loader)
+    response = _speaker_upload(
+        audio_client,
+        "transcriptions",
+        model="test",
+        response_format="diarized_json",
+        **fields,
+    )
+    assert response.status_code == 400
+    loader.assert_not_called()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("include", [False, True])
+def test_diarized_text_only_model_uses_speaker_timing(
+    audio_client, monkeypatch, stream, include
+):
+    calls = []
+
+    def loader(name, **kwargs):
+        calls.append((name, kwargs["model_kind"]))
+        if kwargs["model_kind"] == "audio_diarization":
+            return (
+                NS(
+                    generate_stream=lambda *a, **k: (
+                        v for v in [NS(segments=[NS(start=0, end=3, speaker=0)])]
+                    )
+                ),
+                None,
+                None,
+            )
+        assert name == "selected-text-model"
+        return (
+            NS(generate=lambda *a, **k: {"text": "untimed words", "tokens": [1, 2]}),
+            None,
+            None,
+        )
+
+    monkeypatch.setattr(server, "get_cached_model", loader)
+    response = _speaker_upload(
+        audio_client,
+        "transcriptions",
+        model="selected-text-model",
+        response_format="diarized_json",
+        stream=str(stream).lower(),
+        **({"include[]": "diarization"} if include else {}),
+    )
+    assert response.status_code == 200
+    if stream:
+        events = [
+            json.loads(s[6:])
+            for s in response.text.splitlines()
+            if s.startswith("data: ")
+        ]
+        assert not any(e["type"] == "error" for e in events)
+        result = events[-1]
+        assert result["type"] == "transcript.text.done"
+        turns = [e for e in events if e["type"] == "transcript.text.segment"]
+        if include:
+            assert events[0]["type"] == "diarization.completed"
+    else:
+        result = response.json()
+        turns = result["segments"]
+    assert result["text"] == "untimed words"
+    assert len(turns) == 1
+    assert (turns[0]["start"], turns[0]["end"], turns[0]["speaker"]) == (0, 3, "A")
+    assert ("diarization" in result) == include
+    assert ("speakers" in turns[0]) == include
+    assert [kind for _, kind in calls] == ["audio_diarization", "audio_stt"]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_diarized_text_windows_preserve_pcm_context_speakers_and_options(
+    audio_client, monkeypatch, stream
+):
+    from scipy.io.wavfile import read
+
+    samples = np.linspace(0.1, 0.9, 40 * 16000, dtype="<f4")
+    intervals = [(0, 3, 7), (3.3, 8, 7), (4, 4.2, 2), (10, 33, 7), (38, 39, 2)]
+    actual, diarizations = [], []
+
+    def diarize(chunks, sample_rate):
+        diarizations.append(sum(len(chunk) for chunk in chunks))
+        yield NS(segments=[NS(start=s, end=e, speaker=p) for s, e, p in intervals])
+
+    def transcribe(path, **kwargs):
+        rate, pcm = read(path)
+        assert rate == 16000
+        assert kwargs["language"] == "en" and kwargs["context"] == "names"
+        actual.append(pcm)
+        return {"text": f"window {len(actual)}"}
+
+    def loader(name, **kwargs):
+        if kwargs["model_kind"] == "audio_diarization":
+            return NS(generate_stream=diarize), None, None
+        assert name == "selected-text-model"
+        return NS(generate=transcribe), None, None
+
+    monkeypatch.setattr(server, "get_cached_model", loader)
+    response = _speaker_upload(
+        audio_client,
+        "transcriptions",
+        samples,
+        model="selected-text-model",
+        response_format="diarized_json",
+        language="en",
+        prompt="names",
+        stream=str(stream).lower(),
+        **{"include[]": "diarization"},
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        events = [
+            json.loads(s[6:])
+            for s in response.text.splitlines()
+            if s.startswith("data: ")
+        ]
+        result = events[-1]
+        assert result["type"] == "transcript.text.done"
+        turns = [e for e in events if e["type"] == "transcript.text.segment"]
+    else:
+        result = response.json()
+        turns = result["segments"]
+    assert diarizations == [len(samples)]
+    assert [(t["start"], t["end"], t["speakers"]) for t in turns] == [
+        (0, 8, ["A", "B"]),
+        (10, 33, ["B"]),
+        (38, 39, ["A"]),
+    ]
+    assert result["text"] == "window 2 window 3 window 4"
+    for pcm, turn in zip(actual[1:], turns, strict=True):
+        np.testing.assert_array_equal(
+            pcm, samples[round(turn["start"] * 16000) : round(turn["end"] * 16000)]
+        )
+    assert result["diarization"]["segments"] == [
+        dict(start=s, end=e, speaker=p) for s, e, p in intervals
+    ]
+
+
+@pytest.mark.parametrize(
+    "intervals, expected",
+    [
+        (
+            [(0, 1.5, 0), (1.8, 2.3, 0), (3, 5, 0), (5.2, 29, 0), (29.3, 34, 0)],
+            [(0, 29, [0]), (29.3, 34, [0])],
+        ),
+        (
+            [(0, 30, 0), (30, 30.2, 1), (30.2, 33, 0), (40, 40.5, 1)],
+            [(0, 30, [0]), (30, 33, [0, 1]), (40, 40.5, [1])],
+        ),
+    ],
+)
+def test_diarized_speaker_windows_keep_context_without_crossing_limits(
+    intervals, expected
+):
+    from mlx_vlm.server.audio_diarized import speaker_windows
+
+    windows = speaker_windows(
+        [dict(start=s, end=e, speaker=p) for s, e, p in intervals]
+    )
+    assert [(w.start, w.end, w.speakers) for w in windows] == expected
+
+
+@pytest.mark.parametrize("outcome", ["empty", "cancelled", "failed"])
+def test_diarized_text_only_windows_skip_empty_and_propagate_failure(
+    monkeypatch, outcome
+):
+    from mlx_vlm.server import audio_diarized as pipeline
+
+    monkeypatch.setattr(
+        pipeline,
+        "diarize_segments",
+        lambda *args: [
+            {"start": 1, "end": 3, "speaker": 0},
+            {"start": 7, "end": 9, "speaker": 1},
+        ],
+    )
+    request = server_audio.AudioInferenceRequest(
+        kind="diarized_stt",
+        model_name="test-stt",
+        payload=NS(
+            sample_count=10 * 16000,
+            revision=None,
+            diarization_model="test-diarization",
+            include_diarization=True,
+            transcription=server_audio.AudioTranscriptionRequest(model="test-stt"),
+            chunks=lambda check: [],
+            read_window=lambda start, end: np.zeros(end - start, dtype="<f4"),
+        ),
+    )
+    events, calls = [], []
+    request.emit_data = events.append
+
+    def transcribe(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            if outcome == "cancelled":
+                request.cancel_event.set()
+            if outcome == "failed":
+                raise RuntimeError("ASR failed")
+            return {"text": "  "}
+        return {"text": "Hello"}
+
+    def run():
+        pipeline.run_request(
+            request, lambda *a, **kw: (NS(generate=transcribe), None, None)
+        )
+
+    if outcome == "empty":
+        run()
+        assert events[-1]["type"] == "transcript.text.done"
+        assert events[-1]["text"] == "Hello"
+        segments = [e for e in events if e["type"] == "transcript.text.segment"]
+        assert [(s["start"], s["end"]) for s in segments] == [(7, 9)]
+    else:
+        with pytest.raises(Exception, match="cancelled|ASR failed"):
+            run()
+        assert [e["type"] for e in events] == ["diarization.completed"]
+        assert len(calls) == 2
+
+
+def test_diarized_empty_recording_skips_asr(audio_client, monkeypatch):
+    loader = Mock(
+        return_value=(NS(generate_stream=lambda *a, **k: (v for v in [])), None, None)
+    )
+    monkeypatch.setattr(server, "get_cached_model", loader)
+    response = _speaker_upload(
+        audio_client, "transcriptions", model="test", response_format="diarized_json"
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "task": "transcribe",
+        "duration": 3.0,
+        "text": "",
+        "segments": [],
+    }
+    assert loader.call_count == 1
+
+
+def test_diarized_windows_preserve_context_and_silence():
+    from mlx_vlm.server.audio_diarized import transcription_windows
+
+    windows = transcription_windows(
+        [
+            {"start": 0, "end": 65, "speaker": 0},
+            {"start": 100, "end": 102, "speaker": 0},
+        ],
+        102,
+    )
+    assert len(windows) == 4
+    assert all(w.audio_end - w.audio_start <= 30 for w in windows)
+    assert windows[0].end == windows[1].start
+    assert windows[1].audio_start == windows[0].end - 2
+    assert windows[-1].audio_start == 99.75
+    assert windows[-1].audio_end == 102
+
+
+def test_diarized_overlap_keeps_repeated_words_and_immutable_prefix():
+    from mlx_vlm.server.audio_diarized import Window, Word, stitch
+
+    prior = [
+        Word("go", 23, 23.2),
+        Word("go", 24, 24.2),
+        Word("home", 25, 25.2),
+        Word("old", 26, 26.2),
+    ]
+    stable = prior[0]
+    stitch(
+        prior,
+        [Word("go", 24.1, 24.3), Word("home", 25.1, 25.3), Word("now", 26.1, 26.3)],
+        Window(26, 52, 24, 54),
+        Window(0, 26, 0, 28),
+    )
+    assert [w.text for w in prior] == ["go", "go", "home", "now"]
+    assert prior[0] is stable
+
+
+def test_diarized_worker_releases_published_words_without_changing_segments(
+    monkeypatch,
+):
+    from mlx_vlm.server import audio_diarized as pipeline
+
+    windows = [
+        pipeline.Window(0, 26, 0, 28),
+        pipeline.Window(26, 52, 24, 54),
+        pipeline.Window(52, 78, 50, 78),
+        pipeline.Window(90, 92, 90, 92),
+    ]
+    chunks = iter(
+        [
+            [("Hello", 1), ("go", 23), ("go", 24), ("home", 25), ("old", 26)],
+            [("go", 0.1), ("home", 1.1), ("now", 2.1), ("old", 26), ("stale", 29)],
+            [("unmatched", 0.1), ("overlap", 1.1), ("here", 2.1), ("!", 2.3)],
+            [("Bye", 0.25)],
+        ]
+    )
+
+    def transcribe(*args, **kwargs):
+        words = [
+            {"word": text, "start": start, "end": start + (0 if text == "!" else 0.2)}
+            for text, start in next(chunks)
+        ]
+        return {
+            "text": " ".join(w["word"] for w in words).replace(" !", "!"),
+            "words": words,
+        }
+
+    monkeypatch.setattr(pipeline, "transcription_windows", lambda *args: windows)
+    monkeypatch.setattr(
+        pipeline,
+        "diarize_segments",
+        lambda *args: [
+            {"start": 0, "end": 78, "speaker": 7},
+            {"start": 90, "end": 92, "speaker": 2},
+        ],
+    )
+    stitch, retained = pipeline.stitch, []
+
+    def check_pending(words, incoming, window, previous):
+        retained.append(len(words))
+        assert all(w.midpoint >= window.audio_start for w in words)
+        stitch(words, incoming, window, previous)
+
+    monkeypatch.setattr(pipeline, "stitch", check_pending)
+    request = server_audio.AudioInferenceRequest(
+        kind="diarized_stt",
+        model_name="test-stt",
+        payload=NS(
+            sample_count=92 * 16000,
+            revision=None,
+            diarization_model="test-diarization",
+            include_diarization=True,
+            transcription=server_audio.AudioTranscriptionRequest(model="test-stt"),
+            chunks=lambda check: [],
+            read_window=lambda start, end: np.zeros(512, dtype="<f4"),
+        ),
+    )
+    events = []
+    request.emit_data = events.append
+    pipeline.run_request(
+        request, lambda *a, **kw: (NS(generate=transcribe), None, None)
+    )
+    segments = events[1:-1]
+    assert retained == [0, 3, 2, 0]
+    assert [s["text"] for s in segments] == [
+        "Hello",
+        "go",
+        "go home now",
+        "old",
+        "here!",
+        "Bye",
+    ]
+    assert [s["id"] for s in segments] == [f"seg_{i:06d}" for i in range(6)]
+    assert [s["speaker"] for s in segments] == ["B"] * 5 + ["A"]
+    assert [s["start"] for s in segments] == pytest.approx([1, 23, 24, 50, 52.1, 90.25])
+    assert [s["end"] for s in segments] == pytest.approx(
+        [1.2, 23.2, 26.3, 50.2, 52.3, 90.45]
+    )
+    assert events[-1]["text"] == "Hello go go home now old here! Bye"
+
+
+def test_diarized_aligned_tokens_keep_punctuation_and_no_space_languages():
+    from mlx_vlm.server.audio_diarized import aligned_words
+
+    words = aligned_words(
+        {
+            "text": "Hello, 世界",
+            "tokens": [
+                {"text": " Hello", "start": 0, "duration": 0.3},
+                {"text": ",", "start": 0.3, "duration": 0.1},
+                {"text": " 世", "start": 0.5, "duration": 0.2},
+                {"text": "界", "start": 0.7, "duration": 0.2},
+            ],
+        },
+        1,
+    )
+    assert [w.text for w in words] == ["Hello,", "世界"]
+    with pytest.raises(ValueError, match="timestamps"):
+        aligned_words(
+            {
+                "text": "Bad",
+                "words": [{"word": "Bad", "start": float("nan"), "end": 1}],
+            },
+            2,
+        )
+
+
+def test_diarized_overlap_and_unknown_speaker_assignment():
+    from mlx_vlm.server.audio_diarized import Word, speakers_for_word
+
+    spans = [{"start": 0, "end": 2, "speaker": 1}, {"start": 1, "end": 3, "speaker": 2}]
+    assert speakers_for_word(Word("both", 1.1, 1.5), spans) == [1, 2]
+    assert speakers_for_word(Word("unknown", 10, 11), spans) == []
+
+
+def test_diarized_slow_consumer_cancellation_does_not_block_worker():
+    import threading
+
+    request = server_audio.AudioInferenceRequest(
+        kind="diarized_stt", model_name="test", payload=None
+    )
+    for i in range(64):
+        request.emit_data(i)
+    finished = threading.Event()
+    thread = threading.Thread(target=lambda: (request.emit_data(65), finished.set()))
+    thread.start()
+    request.cancel_event.set()
+    thread.join(timeout=2)
+    assert finished.is_set()
+
+
+def test_diarized_whisper_nested_word_timing():
+    from mlx_vlm.server.audio_diarized import aligned_words
+
+    assert (
+        aligned_words(
+            {
+                "text": "Hello world",
+                "segments": [
+                    {
+                        "words": [
+                            {"word": "Hello", "start": 0, "end": 1},
+                            {"word": "world", "start": 1, "end": 2},
+                        ]
+                    }
+                ],
+            },
+            3,
+        )[1].text
+        == "world"
+    )
+
+
+@pytest.mark.parametrize(
+    "request_type, payload",
+    [
+        (server.ChatRequest, {"messages": [{"role": "user", "content": "Hello"}]}),
+        (server.OpenAIRequest, {"input": "Hello"}),
+    ],
+)
+@pytest.mark.parametrize("top_level", [None, True, False])
+def test_thinking_template_alias(request_type, payload, top_level):
+    values = dict(
+        model="demo", chat_template_kwargs={"enable_thinking": False}, **payload
+    )
+    if top_level is not None:
+        values["enable_thinking"] = top_level
+    request = request_type.model_validate(values)
+    assert request.enable_thinking is (top_level if top_level is not None else False)
+
+
+def test_chat_compaction_cache_is_bounded_expiring_and_scope_isolated(monkeypatch):
+    cache = compaction.ChatCompactionCache(capacity=1, ttl=10)
+    items = [_compaction_message("secret")]
+    fingerprints = cache.fingerprints(items)
+    cache.store("tenant-a/model/tools", fingerprints, [_compaction_message("summary")])
+    assert cache.restore("tenant-b/model/tools", fingerprints) == (0, [])
+    assert cache.restore("tenant-a/other-model/tools", fingerprints) == (0, [])
+    assert cache.restore("tenant-a/model/tools", fingerprints)[0] == 1
+    cache.store("other", fingerprints, items)
+    assert cache.restore("tenant-a/model/tools", fingerprints) == (0, [])
+    now = time.monotonic()
+    monkeypatch.setattr(compaction.time, "monotonic", lambda: now + 11)
+    assert cache.restore("other", fingerprints) == (0, [])
+
+
+def test_unload_releases_model_before_allocator_clear(monkeypatch):
+    import weakref
+
+    class Model:
+        pass
+
+    registry = server.ModelCacheRegistry()
+    model = Model()
+    ref = weakref.ref(model)
+    registry.set("text_generation", {"model": model, "model_path": "demo"})
+    del model
+    _reset_runtime(monkeypatch, model_cache=registry)
+    observations = []
+    monkeypatch.setattr(
+        server._app_module.mx, "clear_cache", lambda: observations.append(ref() is None)
+    )
+    assert server.unload_model_sync()
+    assert observations and all(observations)
+
+
+@pytest.mark.parametrize("api", ["chat", "responses", "messages"])
+@pytest.mark.parametrize("batching", [False, True])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("real_call", [False, True])
+@pytest.mark.parametrize("syntax", ["gemma4", "json_tools", "preopened-custom"])
+def test_tool_examples_in_reasoning_are_not_executed(
+    client, api, batching, stream, real_call, syntax
+):
+    # A missing end marker in the reasoning example used to swallow the actual
+    # call, making final parsing disagree with the already streamed arguments.
+    gemma = syntax == "gemma4"
+    parser = load_tool_module("gemma4" if gemma else "json_tools")
+    call = (
+        '<|tool_call>call:get_weather{city:<|"|>Warsaw<|"|>}<tool_call|>'
+        if gemma
+        else '<tool_call>{"name":"get_weather","arguments":{"city":"Warsaw"}}</tool_call>'
+    )
+    old_call = call.replace("Warsaw", "Berlin")
+    start, end = (
+        ("<|channel>thought", "<channel|>") if gemma else ("<think>", "</think>")
+    )
+    options, prompt = {}, "prompt"
+    if syntax == "preopened-custom":
+        start, end = "<reason>", "</reason>"
+        options = dict(
+            thinking_start_token=start, thinking_end_token=end, enable_thinking=True
+        )
+        prompt += start
+    parts = [
+        "" if syntax == "preopened-custom" else start,
+        "Previous example: "
+        + (old_call.removesuffix(parser.tool_call_end) if gemma else old_call),
+        end,
+        call if real_call else "Done.",
+    ]
+    text = "".join(parts)
+    tokens = [
+        _token(part, finish_reason="stop" if i == len(parts) - 1 else None)
+        for i, part in enumerate(parts)
+    ]
+    with _endpoint(
+        parser=parser,
+        template=prompt,
+        result=_result(text, finish_reason="stop"),
+        chunks=[_result(t.text, finish_reason=t.finish_reason) for t in tokens],
+        generator=_streaming(tokens) if batching else None,
+    ):
+        response = _post(client, api, tools=[_tool(api=api)], stream=stream, **options)
+    assert response.status_code == 200, response.text
+    if api == "responses":
+        body = _completed_response(response) if stream else response.json()
+        calls = [
+            (c["name"], json.loads(c["arguments"]))
+            for c in body["output"]
+            if c["type"] == "function_call"
+        ]
+    elif api == "chat":
+        if stream:
+            events = _data(response)
+            choices = [e["choices"][0] for e in events if e.get("choices")]
+            assert choices[-1]["finish_reason"] == (
+                "tool_calls" if real_call else "stop"
+            )
+            fragments = [
+                c for choice in choices for c in choice["delta"].get("tool_calls") or []
+            ]
+            assert all(c["index"] == 0 for c in fragments)
+            calls = (
+                [
+                    (
+                        fragments[0]["function"]["name"],
+                        json.loads(
+                            "".join(
+                                c["function"].get("arguments", "") for c in fragments
+                            )
+                        ),
+                    )
+                ]
+                if fragments
+                else []
+            )
+        else:
+            calls = [
+                (c["function"]["name"], json.loads(c["function"]["arguments"]))
+                for c in response.json()["choices"][0]["message"].get("tool_calls")
+                or []
+            ]
+    elif stream:
+        events = _data(response)
+        assert events[-1]["type"] == "message_stop"
+        blocks = [
+            e["content_block"]
+            for e in events
+            if e["type"] == "content_block_start"
+            and e["content_block"]["type"] == "tool_use"
+        ]
+        arguments = "".join(
+            e["delta"].get("partial_json", "")
+            for e in events
+            if e["type"] == "content_block_delta"
+        )
+        calls = [(b["name"], json.loads(arguments)) for b in blocks]
+    else:
+        calls = [
+            (b["name"], b["input"])
+            for b in response.json()["content"]
+            if b["type"] == "tool_use"
+        ]
+    assert calls == ([("get_weather", {"city": "Warsaw"})] if real_call else [])
+
+
+def test_prefill_memory_error_only_fails_the_refused_request():
+    from queue import Queue
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from mlx_vlm.apc import APCAdmissionError
+    from mlx_vlm.server.generation import ResponseGenerator
+
+    refused, peer = Queue(), Queue()
+    active = {10: {"rqueue": refused}, 11: {"rqueue": peer}}
+    error = APCAdmissionError("Cannot fit prefill", uid=10)
+    engine = SimpleNamespace(
+        decode_step=lambda: [], prefill_step=Mock(side_effect=error), remove=Mock()
+    )
+    generator = ResponseGenerator.__new__(ResponseGenerator)
+    generator._step(engine, active)
+    assert list(active) == [11]
+    assert refused.get_nowait() is error
+    assert refused.get_nowait() is None
+    assert peer.empty()
+    engine.remove.assert_called_once_with(10)
+
+
+@pytest.fixture(
+    params=[
+        "llada2_moe",
+        "nemotron_labs_diffusion",
+        "diffusion_gemma",
+        "diffusion_gemma_apc",
+    ]
+)
+def diffusion_worker(request, monkeypatch):
+    from mlx_vlm.models import llada2_moe, nemotron_labs_diffusion
+    from mlx_vlm.tests.test_diffusion_models import (
+        FakeProcessor,
+        _llada_config,
+        make_diffusion_model,
+    )
+
+    mx.random.seed(0)
+    if request.param.startswith("diffusion_gemma"):
+        model = make_diffusion_model()
+        model.config.eos_token_id = 999999
+    elif request.param == "llada2_moe":
+        model = llada2_moe.Model(_llada_config(eos_token_id=999999))
+    else:
+        config = nemotron_labs_diffusion.ModelConfig(
+            model_type="nemotron_labs_diffusion",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            max_position_embeddings=128,
+            eos_token_id=999999,
+            mask_token_id=127,
+            default_generation_mode="diffusion",
+            rope_parameters={
+                "rope_type": "default",
+                "rope_theta": 1000000.0,
+                "llama_4_scaling_beta": 0.1,
+                "original_max_position_embeddings": 64,
+            },
+        )
+        model = nemotron_labs_diffusion.Model(config)
+    # Cross-thread lazy parameter initialization is invalid on MLX.
+    mx.eval(model.parameters())
+    processor = FakeProcessor()
+    manager = None
+    tokens = [4, 5]
+    if request.param.endswith("_apc"):
+        tokens = list(range(2, 13))
+        manager = apc.APCManager(
+            num_blocks=64,
+            block_size=2,
+            overrides={"checkpoint_interval_tokens": 4, "reserve_gb": 0},
+        )
+        manager.exact_cache_min_tokens = 1
+    monkeypatch.setattr(
+        generation,
+        "load_model_resources",
+        lambda *a, **k: (model, processor, model.config),
+    )
+    monkeypatch.setattr(
+        Generator,
+        "_preprocess_request",
+        lambda *a, **k: {"input_ids": mx.array([tokens], mx.int32)},
+    )
+    monkeypatch.setattr(
+        Generator, "_make_thinking_budget_criteria", lambda *a, **k: None
+    )
+    worker = Generator("tiny-diffusion-resume", apc_manager=manager)
+    worker.wait_until_ready(timeout=10)
+    try:
+        yield worker
+    finally:
+        worker.stop_and_join()
+
+
+@pytest.mark.parametrize("temperature", [0.0, 0.7])
+def test_diffusion_resume_preserves_blocks_and_serves_other_requests(
+    diffusion_worker, temperature
+):
+    worker = diffusion_worker
+    args = Args(
+        max_tokens=12,
+        block_length=4,
+        max_denoising_steps=4,
+        temperature=temperature,
+        seed=47,
+    )
+    _, baseline_reader = worker.generate("prompt", args=args)
+    baseline = list(baseline_reader)
+
+    class PausingSession(sessions.InferenceSession):
+        def put(self, token):
+            super().put(token)
+            if len(self.history) in (1, 2) and token is not None:
+                self.pause(self.lease)
+
+    session = PausingSession()
+    _, reader = worker.generate("prompt", args=args, session=session)
+    resumed = []
+    for cursor in (0, 1):
+        resumed.append(next(reader))
+        reader.close()
+        assert session.paused
+        count = len(session.history)
+        elapsed = session.generation_time
+        # Same worker and model, different random sequence. It must complete
+        # while the first generation remains paused at its committed block.
+        _, other_reader = worker.generate(
+            "other",
+            args=Args(
+                max_tokens=5,
+                block_length=4,
+                max_denoising_steps=4,
+                temperature=0.7,
+                seed=81,
+            ),
+        )
+        other = list(other_reader)
+        assert other[-1].finish_reason == "length"
+        assert len(session.history) == count
+        assert session.generation_time == elapsed
+        lease = session.claim()
+        reader = session.reader(cursor=cursor + 1, lease=lease, timeout=10)
+    resumed.extend(reader)
+    assert [(t.text, t.token, t.token_count, t.finish_reason) for t in resumed] == [
+        (t.text, t.token, t.token_count, t.finish_reason) for t in baseline
+    ]
+    assert resumed[-1].generation_tokens == 12
+    assert session.finished
+    if worker.apc_manager is not None:
+        assert resumed[0].cached_tokens == 10
+        assert worker.apc_manager.stats.hits > 0
+
+
+@pytest.mark.parametrize("action", ["expire", "dispose", "unload", "cancel"])
+def test_diffusion_releases_stopped_generator(diffusion_worker, monkeypatch, action):
+    worker = diffusion_worker
+    closed = Event()
+    first_block = Event()
+    original = worker.model.language_model.generate_blocks
+
+    def tracked(*args, **kwargs):
+        try:
+            return (yield from original(*args, **kwargs))
+        finally:
+            closed.set()
+
+    monkeypatch.setattr(worker.model.language_model, "generate_blocks", tracked)
+
+    class PausingSession(sessions.InferenceSession):
+        def put(self, token):
+            super().put(token)
+            if self.history:
+                self.pause(self.lease)
+                first_block.set()
+
+    session = PausingSession()
+    ctx, reader = worker.generate(
+        "prompt",
+        args=Args(
+            max_tokens=12,
+            block_length=4,
+            max_denoising_steps=4,
+            seed=47,
+        ),
+        session=session,
+    )
+    assert first_block.wait(10)
+    assert next(reader).token_count > 0
+    reader.close()
+    if action == "expire":
+        session.touched -= session.ttl + 1
+    elif action == "dispose":
+        session.dispose()
+    elif action == "unload":
+        worker.stop_and_join()
+    else:
+        worker._cancel(ctx.uid)
+    assert closed.wait(5)
+    assert session.finished or session.error is not None
+    if action != "cancel":
+        with pytest.raises(ValueError):
+            session.claim()
+
+
+@pytest.mark.parametrize("api", ["chat", "responses"])
+def test_diffusion_http_checkpoint_replays_without_regeneration(
+    diffusion_worker, client, monkeypatch, api
+):
+    worker = diffusion_worker
+    monkeypatch.setattr(continuation, "CHECKPOINTS", continuation.Checkpoints())
+    options = dict(
+        stream=True,
+        max_tokens=12,
+        max_output_tokens=12,
+        block_length=4,
+        max_denoising_steps=4,
+        temperature=0.7,
+        seed=47,
+    )
+
+    def text(response):
+        if api == "responses":
+            return _data(response)[-1]["response"]["output_text"]
+        return "".join(d.get("content") or "" for d in _deltas(response))
+
+    with _endpoint(generator=worker):
+        original = _post(client, api, resumable=True, **options)
+        assert original.status_code == 200
+        checkpoint = next(
+            e["continuation"]
+            for e in _data(original)
+            if e.get("continuation", {}).get("cursor") == 1
+            and e["continuation"]["content"] > 0
+        )
+        monkeypatch.setattr(
+            worker, "generate", Mock(side_effect=AssertionError("restarted generation"))
+        )
+        resumed = _post(client, api, continuation=checkpoint, **options)
+        assert resumed.status_code == 200
+        assert text(original)[: checkpoint["content"]] + text(resumed) == text(original)
+        worker.generate.assert_not_called()

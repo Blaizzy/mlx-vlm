@@ -1,10 +1,12 @@
 import asyncio
+import base64
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import mlx.core as mx
+import numpy as np
 from fastapi import HTTPException
 from pydantic import BaseModel
 
@@ -20,7 +22,7 @@ InputItem = Union[str, Dict[str, Any]]
 class EmbeddingsRequest(BaseModel):
     input: Union[str, Dict[str, Any], List[InputItem]]
     model: Optional[str] = None
-    encoding_format: Optional[str] = "float"
+    encoding_format: Optional[Literal["float", "base64"]] = "float"
 
 
 def _default_embedding_model() -> Optional[str]:
@@ -156,6 +158,13 @@ def register_routes(app, deps):
                 return _embed_items(model, processor, items)
 
             vectors, prompt_tokens = await asyncio.to_thread(_work)
+            if body.encoding_format == "base64":
+                vectors = [
+                    base64.b64encode(np.asarray(vector, dtype="<f4").tobytes()).decode(
+                        "ascii"
+                    )
+                    for vector in vectors
+                ]
         except ValueError as exc:
             runtime.metrics.record_failure(
                 endpoint="/v1/embeddings", model=model_id, stream=False, error=str(exc)

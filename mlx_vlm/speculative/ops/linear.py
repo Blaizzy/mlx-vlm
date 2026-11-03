@@ -26,6 +26,7 @@ from ...models.quantized_verifier import (
     singleton_quantized_linear as _target_verify_singleton_quantized_linear,
 )
 from ...models.quantized_verifier import supports_quantization
+from ...quantization.nvfp4 import ScaledQuantizedLinear
 
 
 def _use_target_verify_dense(linear, x: mx.array) -> bool:
@@ -33,7 +34,7 @@ def _use_target_verify_dense(linear, x: mx.array) -> bool:
         exact_speculative_verify_dense_available()
         and x.ndim == 3
         and (x.shape[0] > 1 or x.shape[1] > 1)
-        and isinstance(linear, (nn.Linear, nn.QuantizedLinear))
+        and isinstance(linear, (nn.Linear, nn.QuantizedLinear, ScaledQuantizedLinear))
     )
 
 
@@ -95,6 +96,8 @@ def _target_verify_linear(linear, x: mx.array) -> mx.array:
         if out is not None:
             return out
 
+    # Scaled NVFP4 wrappers must retain their FP32 projection and global scale
+    # before rounding to the input dtype, with the same reduction as decode.
     return _target_verify_singletons(linear, x)
 
 
@@ -103,7 +106,8 @@ def _target_verify_linears(linears, x: mx.array):
         x.ndim == 3
         and (x.shape[0] > 1 or x.shape[1] > 1)
         and all(
-            isinstance(linear, (nn.Linear, nn.QuantizedLinear)) for linear in linears
+            isinstance(linear, (nn.Linear, nn.QuantizedLinear, ScaledQuantizedLinear))
+            for linear in linears
         )
     ):
         out = _decode_quantized_linears_fused(linears, x)
