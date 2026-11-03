@@ -702,6 +702,47 @@ def test_glm_ocr_rope_index_handles_fully_masked_rows():
     assert rope_deltas.tolist()[0] == [0]
 
 
+def test_glm_ocr_trainer_forward_keeps_attention_causal():
+    module = importlib.import_module("mlx_vlm.models.glm_ocr.language")
+    config_module = importlib.import_module("mlx_vlm.models.glm_ocr.config")
+    text_config = config_module.TextConfig(
+        vocab_size=64,
+        hidden_size=64,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        num_hidden_layers=2,
+    )
+    config = SimpleNamespace(
+        vision_config=SimpleNamespace(spatial_merge_size=2),
+        image_token_id=62,
+        video_token_id=63,
+    )
+    mx.random.seed(0)
+    lm = module.LanguageModel(text_config, config)
+
+    lm.model_type = "glm_ocr"
+    runtime = importlib.import_module("mlx_vlm.trainer.vlm.sft.runtime")
+
+    def forward(input_ids, pixel_values, mask, **kwargs):
+        lm._position_ids = None
+        lm._rope_deltas = None
+        return lm(input_ids, mask=mask)
+
+    forward.model_type = "glm_ocr"
+
+    def prefix_logits(last_token):
+        input_ids = mx.array([[1, 2, 3, 4, last_token]], dtype=mx.int32)
+        batch = {"input_ids": input_ids, "attention_mask": mx.ones_like(input_ids)}
+        logits = runtime.forward_vlm_logits(
+            forward, input_ids, batch["attention_mask"], batch
+        )
+        return logits[:, :-1]
+
+    assert mx.allclose(prefix_logits(5), prefix_logits(40), atol=1e-5)
+
+
 def test_ernie_mrope_rope_index_handles_empty_rows():
     module = importlib.import_module("mlx_vlm.models.ernie4_5_moe_vl.language")
     lm = module.LanguageModel.__new__(module.LanguageModel)

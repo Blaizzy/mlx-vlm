@@ -4,8 +4,8 @@ from dataclasses import dataclass, field
 
 
 @dataclass
-class CoreTrainingArgs:
-    """Common settings inherited by pipeline-specific training arguments."""
+class BaseTrainConfig:
+    """Settings every trainer has; algorithm configs subclass this."""
 
     batch_size: int = field(default=1, metadata={"help": "Global minibatch size."})
     iters: int = field(default=100, metadata={"help": "Number of training iterations."})
@@ -59,3 +59,7 @@ class CoreTrainingArgs:
             raise ValueError(
                 "cache_size must be nonnegative or None for unlimited caching."
             )
+
+
+# Backwards-compatible name.
+CoreTrainingArgs = BaseTrainConfig
