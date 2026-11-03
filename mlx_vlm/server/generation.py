@@ -2008,7 +2008,7 @@ class ResponseGenerator:
             self._step(engine, active)
 
     def _run_impl(self):
-        """Single GPU thread: owns BatchGenerator, runs tight next() loop."""
+        """Own batch scheduling and publish each decode phase before prefill."""
         try:
             self._initialize_model()
         except Exception as e:
@@ -2309,10 +2309,10 @@ class ResponseGenerator:
             results.close()
 
     def _step(self, batch_gen, active, gen_kwargs=None):
-        """One batch generation step: prefill + decode."""
-        kwargs = gen_kwargs or {}
+        """Publish ready decode tokens before advancing bounded prompt work."""
         try:
-            prompt_responses, responses = batch_gen.next(**kwargs)
+            self._emit_responses(batch_gen.decode_step(), active)
+            prompt_responses = batch_gen.prefill_step()
         except _apc.APCAdmissionError as error:
             if error.uid not in active:
                 raise
@@ -2330,9 +2330,8 @@ class ResponseGenerator:
                 # Decode caches now own the context. Do not retain the full
                 # prompt embedding tensor in every paused continuation.
                 info["gen_kwargs"] = None
-        if not responses:
-            return
 
+    def _emit_responses(self, responses, active):
         for r in responses:
             if r.uid not in active:
                 continue

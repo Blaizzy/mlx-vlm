@@ -524,6 +524,86 @@ def _generation_batch(model, inputs=(5, 6), uids=None, **options):
 class TestBatchGenerator:
     """Tests for BatchGenerator class."""
 
+    @pytest.mark.parametrize("phased", [False, True])
+    @pytest.mark.parametrize("budget", [1, 2, 7, None])
+    @pytest.mark.parametrize("capacity", [1, 3])
+    def test_prefill_budget_and_partial_admission(
+        self, mock_processor, budget, capacity, phased
+    ):
+        import mlx.nn as nn
+
+        calls = []
+
+        class Model(nn.Module):
+            def make_cache(self):
+                return [KVCache()]
+
+            def __call__(self, ids, cache=None, inputs_embeds=None, **kwargs):
+                calls.append((inputs_embeds is not None, ids.shape))
+                kv = mx.zeros((ids.shape[0], 1, ids.shape[1], 4))
+                cache[0].update_and_fetch(kv, kv)
+                return SimpleNamespace(
+                    logits=mx.broadcast_to(mx.array([0.0, 10.0, 0.0]), (*ids.shape, 3))
+                )
+
+        gen = BatchGenerator(
+            Model(),
+            mock_processor,
+            completion_batch_size=capacity,
+            prefill_batch_size=8,
+            prefill_step_size=budget,
+            compute_logprobs=False,
+        )
+
+        def step():
+            if not phased:
+                return gen.next()
+            responses = gen.decode_step()
+            return gen.prefill_step(), responses
+
+        def insert(prompts, max_tokens):
+            return gen.insert(
+                prompts,
+                max_tokens=max_tokens,
+                prompt_kwargs=[
+                    {"inputs_embeds": mx.zeros((1, len(ids), 4))} for ids in prompts
+                ],
+            )
+
+        (first,) = insert([[4, 5]], 32)
+        for _ in range(3):
+            step()
+            if len(gen._generation_batch):
+                break
+        assert gen._generation_batch.uids == [first]
+
+        # Requests arriving during decoding can use the remaining slots even
+        # when fewer than prefill_batch_size are available.
+        late = insert([[6] * 7, [7] * 5, [8] * 9], 2)
+        calls.clear()
+        _, responses = step()
+        assert [r.uid for r in responses] == [first]
+        assert calls[0] == (False, (1, 1))
+        if capacity > 1:
+            assert any(is_prompt for is_prompt, _ in calls)
+
+        finished = {r.uid for r in responses if r.finish_reason}
+        for _ in range(120):
+            if not gen.has_work:
+                break
+            _, responses = step()
+            finished.update(r.uid for r in responses if r.finish_reason)
+            assert len(gen._generation_batch) + len(gen._prompt_batch or []) <= capacity
+
+        assert not gen.has_work
+        assert finished == {first, *late}
+        assert gen.stats().prompt_tokens == 23
+        if budget is not None:
+            assert all(b * n <= budget for is_prompt, (b, n) in calls if is_prompt)
+        if capacity > 1 and budget != 1:
+            assert any(is_prompt and b > 1 for is_prompt, (b, _) in calls)
+        gen.close()
+
     def test_suspend_queued_prompt_readmits_same_request(
         self, mock_model, mock_processor
     ):
@@ -638,7 +718,10 @@ class TestBatchGenerator:
         )
         prompt_tokens = 5
         gen._prompt_batch = SimpleNamespace(
-            needs_processing=lambda: True, prompt_step=lambda: 2, prefill_step_size=2
+            uids=[0],
+            needs_processing=lambda: True,
+            prompt_step=lambda: 2,
+            prefill_step_size=2,
         )
         gen._prompt_tokens_counter = prompt_tokens
 
@@ -911,7 +994,7 @@ class TestBatchGenerator:
                 mock_model.language_model,
                 mock_processor,
                 prefill_batch_size=2,
-                prefill_step_size=3,
+                prefill_step_size=6,
                 max_tokens=2,
             )
         ) as gen:
@@ -1704,7 +1787,7 @@ def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
     bg._steps_counter = 0
     bg.completion_batch_size = 4
     bg.prefill_batch_size = 4
-    bg.prefill_step_size = 1
+    bg.prefill_step_size = 4
     bg.kv_bits = None
     bg.kv_group_size = 64
     bg.kv_quant_scheme = "affine"
@@ -1744,6 +1827,7 @@ def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
     def fake_prompt_batch(**kwargs):
         captured.update(kwargs)
         return SimpleNamespace(
+            uids=kwargs["uids"],
             total_prompt_tokens=sum(len(ids) for ids in kwargs["input_ids"]),
             prefill_step_size=kwargs["prefill_step_size"],
             needs_processing=lambda: True,
@@ -1751,7 +1835,7 @@ def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
         )
 
     with patch.object(generate_module, "PromptProcessingBatch", fake_prompt_batch):
-        bg._next()
+        bg._prefill_step()
 
     prompt_kwargs = captured["prompt_kwargs"]
     assert captured["inputs_embeds"].shape == (4, 4, 3)
@@ -1803,11 +1887,12 @@ def test_prompt_processing_batch_slices_native_mrope_position_ids():
     assert step_kwargs["position_ids"].tolist() == position_ids[:, :, :2].tolist()
 
 
-def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
+@pytest.mark.parametrize("budget,chunk_size", [(None, None), (8, 4)])
+def test_mixed_apc_batch_strips_private_kwargs_before_prefill(budget, chunk_size):
     bg = object.__new__(BatchGenerator)
     bg.apc_manager = object()
     bg.model = SimpleNamespace(layers=[object()])
-    bg.prefill_step_size = None
+    bg.prefill_step_size = budget
     bg.kv_bits = None
     bg.kv_group_size = 64
     bg.kv_quant_scheme = "affine"
@@ -1868,6 +1953,7 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
         batch = bg._build_mixed_prompt_batch(sequences)
 
     assert batch is not None
+    assert captured["prefill_step_size"] == chunk_size
     assert "_apc_tenant" not in captured["prompt_kwargs"]
     assert "_apc_image_hash" not in captured["prompt_kwargs"]
     assert "_apc_semantic_hash" not in captured["prompt_kwargs"]
@@ -2890,7 +2976,9 @@ def test_apc_refused_restore_stays_queued_while_peer_decodes(
 ):
     with patch.object(ar_module, "wired_limit", return_value=contextlib.nullcontext()):
         gen = BatchGenerator(mock_model, mock_processor, completion_batch_size=2)
-    gen.apc = SimpleNamespace(prepare_prefill=lambda *a, **kw: True)
+    gen.apc = SimpleNamespace(
+        prepare_prefill=lambda *a, **kw: True, finish_prefill=lambda: None
+    )
     gen.apc_manager = MagicMock()
     gen._apc_pick_for = MagicMock(side_effect=apc_module.APCAdmissionError())
     uid = gen.insert([[1, 2, 3]])[0]
@@ -2902,7 +2990,7 @@ def test_apc_refused_restore_stays_queued_while_peer_decodes(
     gen._generation_batch.logits_processors = []
     gen._generation_batch.next.return_value = [SimpleNamespace(uid=99)]
     for _ in range(3):
-        _, responses = gen._next()
+        _, responses = gen.next()
         assert [r.uid for r in responses] == [99]
         assert gen.unprocessed_prompts[0][0] == uid
         assert gen._prompt_batch is None
@@ -2910,7 +2998,7 @@ def test_apc_refused_restore_stays_queued_while_peer_decodes(
     gen._generation_batch.__len__.return_value = 0
     gen._generation_batch.uids = []
     with pytest.raises(apc_module.APCAdmissionError) as error:
-        gen._next()
+        gen.next()
     assert error.value.uid == uid
 
 
@@ -2996,25 +3084,95 @@ def test_apc_native_checkpoint_reuses_repeated_request(
 def test_prefill_chunk_bounds_work_with_decoding_peers():
     gen = object.__new__(BatchGenerator)
     gen._wire_stack = None
+    gen._prompt_time_counter = 0
     gen.prefill_step_size = 2048
     gen._generation_batch = [99]
     gen._prompt_batch = SimpleNamespace(
-        uids=[0, 1], prefill_step_size=2048, prompt_step=lambda: 1
+        uids=[0, 1],
+        prefill_step_size=2048,
+        needs_processing=lambda: True,
+        prompt_step=lambda: 1,
     )
-    gen._step_prompt_batch()
+    gen._advance_prompt_batch()
     assert gen._prompt_batch.prefill_step_size == 128
     gen._generation_batch = []
-    gen._step_prompt_batch()
-    assert gen._prompt_batch.prefill_step_size == 2048
+    gen._advance_prompt_batch()
+    assert gen._prompt_batch.prefill_step_size == 1024
 
 
 def test_prefill_chunk_limit_respects_model_disabling_chunking():
     gen = object.__new__(BatchGenerator)
     gen._wire_stack = None
+    gen._prompt_time_counter = 0
     gen.prefill_step_size = 2048
     gen._generation_batch = [99]
     gen._prompt_batch = SimpleNamespace(
-        uids=[0], prefill_step_size=None, prompt_step=lambda: 1
+        uids=[0],
+        prefill_step_size=None,
+        needs_processing=lambda: True,
+        prompt_step=lambda: 1,
     )
-    assert gen._step_prompt_batch() == 1
+    assert gen._advance_prompt_batch() == []
     assert gen._prompt_batch.prefill_step_size is None
+
+
+@pytest.mark.parametrize("phased", [False, True])
+def test_oldest_prompt_is_admitted_before_new_short_arrivals(
+    mock_model, mock_processor, phased
+):
+    with contextlib.closing(
+        BatchGenerator(
+            mock_model.language_model,
+            mock_processor,
+            completion_batch_size=3,
+            prefill_batch_size=3,
+            prefill_step_size=16,
+        )
+    ) as gen:
+
+        def insert(prompts):
+            return gen.insert(
+                prompts,
+                prompt_kwargs=[
+                    {"inputs_embeds": mx.zeros((1, len(p), 4))} for p in prompts
+                ],
+            )
+
+        first, peer, short = insert([[1] * 1024, [1] * 900, [1] * 4])
+        if phased:
+            gen.prefill_step()
+        else:
+            gen.next()
+        assert gen._prompt_batch.uids == [first, peer]
+        insert([[1] * 4] * 8)
+        gen.remove(first)
+        gen.remove(peer)
+        gen.prefill_step()
+        assert gen._prompt_batch.uids[0] == short
+
+
+@pytest.mark.parametrize("phased", [False, True])
+def test_prefill_failure_releases_reservation_after_delivering_last_decode(
+    mock_processor, phased
+):
+    with contextlib.closing(BatchGenerator(FixedLogitModel(), mock_processor)) as gen:
+        gen._generation_batch = _generation_batch(
+            FixedLogitModel(), inputs=(1,), max_tokens=[1]
+        )
+        gen._resume_inputs[0] = object()
+        gen.uid_count = 1
+        refused = gen.insert([[1, 2, 3]])[0]
+        gen.apc = SimpleNamespace(finish_prefill=MagicMock())
+        gen._admit_prefill = lambda sequences: ([], [])
+        if phased:
+            responses = gen.decode_step()
+        else:
+            _, responses = gen.next()
+        assert [r.uid for r in responses] == [0]
+        assert responses[0].finish_reason == "length"
+        assert not gen._resume_inputs
+        with pytest.raises(apc_module.APCAdmissionError) as error:
+            gen.prefill_step() if phased else gen.next()
+        assert error.value.uid == refused
+        assert gen.apc.finish_prefill.called
+        assert gen.unprocessed_prompts[0][0] == refused
