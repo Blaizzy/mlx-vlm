@@ -1,7 +1,31 @@
-[![Upload Python Package](https://github.com/Blaizzy/mlx-vlm/actions/workflows/python-publish.yml/badge.svg)](https://github.com/Blaizzy/mlx-vlm/actions/workflows/python-publish.yml)
-# MLX-VLM
+<h1 align="center">MLX-VLM</h1>
 
-MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VLMs) and Omni Models (VLMs with audio and video support) on your Mac using MLX.
+[![Any input. Any output. All local. Runs locally on your Mac. Install with pip install -U mlx-vlm or try it in Nativ.](https://raw.githubusercontent.com/Blaizzy/mlx-vlm/b7fda105064b609fcc2ef243bd628c3dad317564/docs/assets/mlx-vlm-banner.png)](https://runnativ.ai)
+
+<p align="center">
+  <strong>Run and fine-tune multimodal models on Apple Silicon.</strong> Text, images, video, and audio in — any out. Built on MLX.
+</p>
+
+<p align="center">
+  <a href="#installation"><strong>Installation</strong></a> &middot;
+  <a href="https://blaizzy.github.io/mlx-vlm/">Documentation</a> &middot;
+  <a href="https://github.com/Blaizzy/mlx-vlm/releases">Releases</a>
+</p>
+
+<p align="center">
+  macOS &middot; Apple silicon
+</p>
+
+<p align="center">
+  Built by <a href="https://www.neywalabs.ai">Neywa Labs</a>, the local AI company behind <a href="https://runnativ.ai">Nativ</a>.
+</p>
+
+<p align="center">
+  <a href="https://github.com/Blaizzy/mlx-vlm/actions/workflows/python-publish.yml"><img src="https://github.com/Blaizzy/mlx-vlm/actions/workflows/python-publish.yml/badge.svg" alt="Upload Python Package"></a>
+  <a href="https://pypi.org/project/mlx-vlm/"><img src="https://img.shields.io/pypi/v/mlx-vlm" alt="PyPI version"></a>
+  <a href="https://pypi.org/project/mlx-vlm/"><img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python 3.10+"></a>
+  <a href="https://github.com/Blaizzy/mlx-vlm/blob/main/LICENSE"><img src="https://img.shields.io/github/license/Blaizzy/mlx-vlm" alt="MIT license"></a>
+</p>
 
 ## Table of Contents
 - [Installation](#installation)
