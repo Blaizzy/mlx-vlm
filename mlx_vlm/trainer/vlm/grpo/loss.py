@@ -3,7 +3,10 @@
 import mlx.core as mx
 
 from mlx_vlm.trainer.losses.cross_entropy import token_cross_entropy
-from mlx_vlm.trainer.vlm.cross_entropy.runtime import _model_type, forward_vlm_logits
+from mlx_vlm.trainer.vlm.cross_entropy.runtime import (
+    _model_type,
+    forward_vlm_logits,
+)
 
 
 def completion_logps(model, batch, start, chunk_size=128):

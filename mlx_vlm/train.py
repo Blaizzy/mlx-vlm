@@ -10,6 +10,11 @@ from pathlib import Path
 from typing import get_args
 
 from .trainer.api import Trainer, task_spec
+from .trainer.common.schedule import (
+    build_schedule,
+    resolve_schedule_config,
+    total_optimizer_updates,
+)
 
 
 def _read_config(path):
@@ -25,6 +30,13 @@ def _read_config(path):
     if not isinstance(values, dict):
         raise ValueError("Training config must contain a mapping.")
     return values
+
+
+def _parse_schedule(value):
+    if not isinstance(value, str):
+        return value
+    value = value.strip()
+    return json.loads(value) if value.startswith("{") else value
 
 
 def build_parser(task="vlm", algorithm=None):
@@ -64,6 +76,34 @@ def build_parser(task="vlm", algorithm=None):
     )
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--beta1", type=float, default=0.9, help="Adam/AdamW beta1.")
+    parser.add_argument("--beta2", type=float, default=0.999, help="Adam/AdamW beta2.")
+    parser.add_argument("--optimizer-eps", type=float, default=1e-8, help="Adam/AdamW epsilon.")
+    parser.add_argument(
+        "--bias-correction",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Adam/AdamW bias correction.",
+    )
+    parser.add_argument(
+        "--lr-schedule",
+        type=_parse_schedule,
+        help="Schedule name (cosine_decay) or JSON/YAML object with name, "
+        "arguments, warmup, warmup_init. Steps count optimizer updates.",
+    )
+    parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=0,
+        help="Linear warmup optimizer updates (applies to --lr-schedule).",
+    )
+    parser.add_argument("--warmup-init", type=float, default=0.0)
+    parser.add_argument(
+        "--min-learning-rate",
+        type=float,
+        default=0.0,
+        help="Final rate for a bare cosine_decay schedule.",
+    )
     parser.add_argument(
         "--train-type", choices=("lora", "dora", "full"), default="lora"
     )
@@ -204,6 +244,33 @@ def parse_args(argv=None, *, task="vlm"):
         parser.error(
             "learning_rate must be positive and weight_decay nonnegative and finite."
         )
+    if not (math.isfinite(args.optimizer_eps) and args.optimizer_eps > 0):
+        parser.error("optimizer_eps must be positive and finite.")
+    for name in ("beta1", "beta2"):
+        if not 0 <= getattr(args, name) < 1:
+            parser.error(f"{name} must be in [0, 1).")
+    if args.warmup_steps < 0 or not math.isfinite(args.warmup_init) or args.warmup_init < 0:
+        parser.error("warmup_steps and warmup_init must be nonnegative.")
+    if not math.isfinite(args.min_learning_rate) or args.min_learning_rate < 0:
+        parser.error("min_learning_rate must be nonnegative and finite.")
+    if args.optimizer not in {"adam", "adamw"} and (
+        (args.beta1, args.beta2, args.optimizer_eps, args.bias_correction)
+        != (0.9, 0.999, 1e-8, False)
+    ):
+        parser.error("beta1, beta2, optimizer_eps and bias_correction need adam or adamw.")
+    try:
+        config = resolve_schedule_config(
+            args.lr_schedule,
+            learning_rate=args.learning_rate,
+            total_updates=10**9,
+            warmup_steps=args.warmup_steps,
+            warmup_init=args.warmup_init,
+            min_learning_rate=args.min_learning_rate,
+        )
+        if config is not None:
+            build_schedule(config)
+    except (ValueError, TypeError) as error:
+        parser.error(str(error))
     _, (_, config_type) = task_spec(args.task, args.algorithm)
     settings = {item.name: getattr(args, item.name) for item in fields(config_type)}
     if args.epochs is not None:
@@ -280,6 +347,39 @@ def _bundles_mtp_head(checkpoint_path):
     return any(key.startswith("mtp_head.") for key in mx.load(str(path)))
 
 
+def build_optimizer(args, iters, accumulation_steps=1):
+    """Create the optimizer; schedules count updates, not microsteps."""
+    import mlx.optimizers as optim
+
+    optimizer_type = {
+        "adam": optim.Adam,
+        "adamw": optim.AdamW,
+        "sgd": optim.SGD,
+        "muon": optim.Muon,
+    }[args.optimizer]
+    options = {}
+    if args.optimizer in {"adam", "adamw"}:
+        options.update(
+            betas=[args.beta1, args.beta2],
+            eps=args.optimizer_eps,
+            bias_correction=args.bias_correction,
+        )
+    if args.optimizer in {"adamw", "muon"}:
+        options["weight_decay"] = args.weight_decay
+    learning_rate = args.learning_rate
+    config = resolve_schedule_config(
+        args.lr_schedule,
+        learning_rate=args.learning_rate,
+        total_updates=total_optimizer_updates(iters, accumulation_steps),
+        warmup_steps=args.warmup_steps,
+        warmup_init=args.warmup_init,
+        min_learning_rate=args.min_learning_rate,
+    )
+    if config is not None:
+        learning_rate = build_schedule(config)
+    return optimizer_type(learning_rate=learning_rate, **options)
+
+
 def run(args, settings, training_callback=None):
     """Load resources and call the same Trainer used in notebooks."""
     import mlx.core as mx
@@ -339,18 +439,7 @@ def run(args, settings, training_callback=None):
             ],
             "reward_weights": args.reward_weights,
         }
-    optimizer_type = {
-        "adam": optim.Adam,
-        "adamw": optim.AdamW,
-        "sgd": optim.SGD,
-        "muon": optim.Muon,
-    }[args.optimizer]
-    optimizer_options = (
-        {"weight_decay": args.weight_decay}
-        if args.optimizer in {"adamw", "muon"}
-        else {}
-    )
-    optimizer = optimizer_type(learning_rate=args.learning_rate, **optimizer_options)
+    optimizer = build_optimizer(args, settings.iters, settings.gradient_accumulation_steps)
     trainer = Trainer(
         model,
         settings,
@@ -378,6 +467,10 @@ def run(args, settings, training_callback=None):
         if not batches:
             raise ValueError("No complete batches fit the dataset; reduce batch_size.")
         trainer.args.iters = args.epochs * batches
+        # Rebuild so schedules see the final epoch-derived update count.
+        trainer.optimizer = build_optimizer(
+            args, trainer.args.iters, settings.gradient_accumulation_steps
+        )
     callback = None
     try:
         if args.wandb and mx.distributed.init().rank() == 0:

@@ -255,3 +255,69 @@ def test_cli_qat_export_runs_after_training(tmp_path, qat, force):
     )
     with pytest.raises(SystemExit):
         parse_args(["--model", "unused", "--export-quantize"])
+
+
+def test_schedule_warmup_and_updates_count():
+    from mlx_vlm.trainer.common.schedule import build_schedule
+
+    schedule = build_schedule(
+        {
+            "name": "cosine_decay",
+            "warmup": 10,
+            "warmup_init": 1e-7,
+            "arguments": [2e-4, 100, 2e-6],
+        }
+    )
+    assert float(schedule(0)) == pytest.approx(1e-7)
+    assert float(schedule(10)) == pytest.approx(2e-4, rel=1e-3)
+    assert float(schedule(200)) == pytest.approx(2e-6, rel=1e-3)
+    for bad in (
+        {"name": "nope", "arguments": [1e-3]},
+        {"name": "cosine_decay"},
+        {"name": "cosine_decay", "arguments": [1e-3, 10, 0], "warmup": -1},
+    ):
+        with pytest.raises(ValueError):
+            build_schedule(bad)
+
+
+def test_cli_builds_scheduled_adamw_over_updates():
+    from mlx_vlm.train import build_optimizer
+
+    args, settings = parse_args(
+        [
+            "--model", "m", "--warmup-steps", "2", "--lr-schedule", "cosine_decay",
+            "--learning-rate", "1e-3", "--beta2", "0.95", "--optimizer-eps", "1e-6",
+            "--bias-correction", "--grad-clip", "1.0", "--gradient-accumulation-steps", "2",
+        ]
+    )
+    assert settings.grad_clip == 1.0
+    optimizer = build_optimizer(args, 8, 2)  # 4 updates
+    assert isinstance(optimizer, optim.AdamW)
+    assert optimizer.betas == [0.9, 0.95] and optimizer.eps == 1e-6
+    lr = optimizer._schedulers["learning_rate"]
+    assert float(lr(0)) == 0.0 and float(lr(2)) == pytest.approx(1e-3, rel=1e-2)
+    assert float(lr(4)) < 1e-3
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--grad-clip", "0"],
+        ["--lr-schedule", "bogus"],
+        ["--warmup-steps", "-1"],
+        ["--optimizer", "sgd", "--beta2", "0.9"],
+    ],
+)
+def test_cli_rejects_bad_schedule_settings(argv):
+    with pytest.raises(SystemExit):
+        parse_args(["--model", "m", *argv])
+
+
+def test_grad_clip_applies_global_norm():
+    from mlx_vlm.trainer.common.utils import apply_accumulated_gradients
+
+    model = nn.Linear(2, 1, bias=False)
+    model.weight = mx.zeros((1, 2))
+    grads = {"weight": mx.array([[30.0, 40.0]])}
+    apply_accumulated_gradients(model, optim.SGD(learning_rate=1.0), grads, 1, 5.0)
+    assert np.allclose(np.array(model.weight), [[-3.0, -4.0]], atol=1e-4)

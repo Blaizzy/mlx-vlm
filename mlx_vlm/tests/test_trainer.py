@@ -225,7 +225,7 @@ def test_completion_mask_is_used_without_passing_to_model():
         pixel_values=None,
     )
     vision_language_loss_fn(model, batch, train_on_completions=True, assistant_id=999)
-    assert model.mask.tolist() == [[1, 1, 1]]
+    assert model.mask is None  # 2D padding mask must not replace causal masking
     assert "completion_mask" not in model.kwargs
 
 

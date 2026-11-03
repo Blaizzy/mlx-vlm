@@ -23,7 +23,7 @@ from ...common.metrics import (
 from ...core import Colors, TrainingArgs, grad_checkpoint, save_adapter
 from ...losses.cross_entropy import cross_entropy
 from .runtime import (
-    NO_PADDING_MASK_MODEL_TYPES,
+    model_uses_padding_mask,
     vlm_batch_metrics,
     vlm_vision_mask,
 )
@@ -89,17 +89,6 @@ def _resolve_adapter_file(args: TrainingArgs) -> Path:
     return Path(TrainingArgs.__dataclass_fields__["adapter_file"].default)
 
 
-def _model_type(model):
-    model_type = getattr(model, "model_type", None)
-    if model_type is not None:
-        return model_type
-
-    config = getattr(model, "config", None)
-    if isinstance(config, dict):
-        return config.get("model_type")
-    return getattr(config, "model_type", None)
-
-
 def vision_language_loss_fn(
     model, batch, train_on_completions=False, assistant_id=77091, mtp_loss_weight=0.0
 ):
@@ -133,7 +122,7 @@ def vision_language_loss_fn(
     }
 
     model_attention_mask = (
-        None if _model_type(model) in NO_PADDING_MASK_MODEL_TYPES else attention_mask
+        attention_mask if model_uses_padding_mask(model) else None
     )
     outputs = model(input_ids, pixel_values, model_attention_mask, **kwargs)
     logits = outputs.logits.astype(mx.float32)

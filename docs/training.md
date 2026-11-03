@@ -309,6 +309,23 @@ The CLI constructs the optimizer separately using `--optimizer` (default
 `adamw`), `--learning-rate` (default `1e-5`), and `--weight-decay` (default
 `0.0`). These CLI options are not fields of the training argument dataclasses.
 
+Adam/AdamW are tuned with `--beta1`, `--beta2`, `--optimizer-eps` and
+`--bias-correction`. `--grad-clip N` (a training argument) clips the global
+gradient norm after accumulation and averaging, just before each update.
+
+`--lr-schedule` takes a name or a JSON/YAML object and `--warmup-steps` adds a
+linear ramp from `--warmup-init`:
+
+```bash
+--lr-schedule '{"name": "cosine_decay", "warmup": 10, "warmup_init": 1e-7, "arguments": [2e-4, 800, 2e-6]}'
+--lr-schedule cosine_decay --warmup-steps 10 --min-learning-rate 2e-6
+```
+
+A bare `cosine_decay` decays from `--learning-rate` to `--min-learning-rate`
+over the updates left after warmup. Schedule steps count optimizer updates,
+not microsteps (`iters / gradient_accumulation_steps`, rounded up), including
+`--epochs`-derived `iters`. Reported `learning_rate` follows the schedule.
+
 ## Row formats
 
 SFT rows contain chat messages and optional images:

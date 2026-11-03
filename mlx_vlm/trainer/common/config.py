@@ -1,5 +1,6 @@
 """Training loop settings shared by all modalities."""
 
+import math
 from dataclasses import dataclass, field
 
 
@@ -33,6 +34,10 @@ class BaseTrainConfig:
         default=False,
         metadata={"help": "Checkpoint model layers to reduce memory use."},
     )
+    grad_clip: float | None = field(
+        default=None,
+        metadata={"help": "Global gradient-norm clip applied before each update."},
+    )
     compile: bool = False
     clear_cache_threshold: int = 0
     cache_size: int | None = 32
@@ -53,6 +58,10 @@ class BaseTrainConfig:
             raise ValueError("steps_per_eval must be at least 1 or None.")
         if self.val_batches != -1 and self.val_batches < 1:
             raise ValueError("val_batches must be at least 1 or -1.")
+        if self.grad_clip is not None and not (
+            math.isfinite(self.grad_clip) and self.grad_clip > 0
+        ):
+            raise ValueError("grad_clip must be positive and finite or None.")
         if self.clear_cache_threshold < 0:
             raise ValueError("clear_cache_threshold must be nonnegative (bytes).")
         if self.cache_size is not None and self.cache_size < 0:
