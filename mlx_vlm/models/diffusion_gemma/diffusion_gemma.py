@@ -52,6 +52,9 @@ class _LanguageModelView:
     def generate(self, input_ids: mx.array, **kwargs):
         return self._parent.generate(input_ids, **kwargs)
 
+    def generate_blocks(self, input_ids: mx.array, **kwargs):
+        return self._parent.generate_blocks(input_ids, **kwargs)
+
     @property
     def quant_predicate(self):
         def predicate(path, m):
@@ -206,7 +209,13 @@ class Model(nn.Module):
         logits = self.model.decoder.embed_tokens.as_linear(hidden_states)
         return self._softcap(logits)
 
-    def generate(
+    def generate(self, *args, **kwargs):
+        """Generate synchronously, retaining the callback API."""
+        from ...generate.common import consume_generator
+
+        return consume_generator(self.generate_blocks(*args, **kwargs))
+
+    def generate_blocks(
         self,
         input_ids: mx.array,
         temperature: float = 0.0,
@@ -228,7 +237,8 @@ class Model(nn.Module):
         on_block=None,
         on_result=None,
         **kwargs,
-    ) -> mx.array:
+    ):
+        """Yield after each committed canvas; return the final token array."""
         del top_p, top_k, eos_early_stop
         from ...generate.diffusion import stream_diffusion_generate
 
@@ -285,6 +295,7 @@ class Model(nn.Module):
             decoder_input_ids=kwargs.pop("decoder_input_ids", None),
             apc_manager=kwargs.pop("_apc_manager", None),
             apc_extra_hash=kwargs.pop("_apc_semantic_hash", 0),
+            rng=kwargs.pop("_rng", None),
         )
 
         generated_tokens = []
@@ -308,6 +319,8 @@ class Model(nn.Module):
                 ):
                     if not on_block(generated_tokens):
                         break
+                if result.diffusion_block_complete:
+                    yield
         finally:
             results.close()
 

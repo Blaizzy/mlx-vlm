@@ -2430,7 +2430,7 @@ class TestModelDiscovery:
 
 def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
     gen = _generator(
-        model=NS(),
+        model=NS(language_model=NS()),
         processor=NS(),
         config=NS(eos_token_id=3),
         tokenizer=NS(all_special_ids=[0]),
@@ -2477,7 +2477,7 @@ def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
         min_threshold=0.4,
     )
     queue = Queue()
-    gen._generate_diffusion(
+    iterator = gen._generate_diffusion(
         uid=1,
         rqueue=queue,
         raw_inputs=dict(
@@ -2490,6 +2490,7 @@ def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
         cancelled=set(),
         apc_semantic_hash=73,
     )
+    list(iterator)
     chunk = queue.get(timeout=1)
     assert (
         chunk.text,
@@ -2502,6 +2503,7 @@ def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
     assert kwargs["skip_special_tokens"] is True
     assert args[7] == dict(
         options,
+        manage_wired_limit=False,
         mm_token_type_ids="types",
         prefill_step_size=3072,
         _apc_manager=gen.apc_manager,
@@ -10239,3 +10241,230 @@ def test_prefill_memory_error_only_fails_the_refused_request():
     assert refused.get_nowait() is None
     assert peer.empty()
     engine.remove.assert_called_once_with(10)
+
+
+@pytest.fixture(
+    params=[
+        "llada2_moe",
+        "nemotron_labs_diffusion",
+        "diffusion_gemma",
+        "diffusion_gemma_apc",
+    ]
+)
+def diffusion_worker(request, monkeypatch):
+    from mlx_vlm.models import llada2_moe, nemotron_labs_diffusion
+    from mlx_vlm.tests.test_diffusion_models import (
+        FakeProcessor,
+        _llada_config,
+        make_diffusion_model,
+    )
+
+    mx.random.seed(0)
+    if request.param.startswith("diffusion_gemma"):
+        model = make_diffusion_model()
+        model.config.eos_token_id = 999999
+    elif request.param == "llada2_moe":
+        model = llada2_moe.Model(_llada_config(eos_token_id=999999))
+    else:
+        config = nemotron_labs_diffusion.ModelConfig(
+            model_type="nemotron_labs_diffusion",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            max_position_embeddings=128,
+            eos_token_id=999999,
+            mask_token_id=127,
+            default_generation_mode="diffusion",
+            rope_parameters={
+                "rope_type": "default",
+                "rope_theta": 1000000.0,
+                "llama_4_scaling_beta": 0.1,
+                "original_max_position_embeddings": 64,
+            },
+        )
+        model = nemotron_labs_diffusion.Model(config)
+    # Cross-thread lazy parameter initialization is invalid on MLX.
+    mx.eval(model.parameters())
+    processor = FakeProcessor()
+    manager = None
+    tokens = [4, 5]
+    if request.param.endswith("_apc"):
+        tokens = list(range(2, 13))
+        manager = apc.APCManager(
+            num_blocks=64,
+            block_size=2,
+            overrides={"checkpoint_interval_tokens": 4, "reserve_gb": 0},
+        )
+        manager.exact_cache_min_tokens = 1
+    monkeypatch.setattr(
+        generation,
+        "load_model_resources",
+        lambda *a, **k: (model, processor, model.config),
+    )
+    monkeypatch.setattr(
+        Generator,
+        "_preprocess_request",
+        lambda *a, **k: {"input_ids": mx.array([tokens], mx.int32)},
+    )
+    monkeypatch.setattr(
+        Generator, "_make_thinking_budget_criteria", lambda *a, **k: None
+    )
+    worker = Generator("tiny-diffusion-resume", apc_manager=manager)
+    worker.wait_until_ready(timeout=10)
+    try:
+        yield worker
+    finally:
+        worker.stop_and_join()
+
+
+@pytest.mark.parametrize("temperature", [0.0, 0.7])
+def test_diffusion_resume_preserves_blocks_and_serves_other_requests(
+    diffusion_worker, temperature
+):
+    worker = diffusion_worker
+    args = Args(
+        max_tokens=12,
+        block_length=4,
+        max_denoising_steps=4,
+        temperature=temperature,
+        seed=47,
+    )
+    _, baseline_reader = worker.generate("prompt", args=args)
+    baseline = list(baseline_reader)
+
+    class PausingSession(sessions.InferenceSession):
+        def put(self, token):
+            super().put(token)
+            if len(self.history) in (1, 2) and token is not None:
+                self.pause(self.lease)
+
+    session = PausingSession()
+    _, reader = worker.generate("prompt", args=args, session=session)
+    resumed = []
+    for cursor in (0, 1):
+        resumed.append(next(reader))
+        reader.close()
+        assert session.paused
+        count = len(session.history)
+        elapsed = session.generation_time
+        # Same worker and model, different random sequence. It must complete
+        # while the first generation remains paused at its committed block.
+        _, other_reader = worker.generate(
+            "other",
+            args=Args(
+                max_tokens=5,
+                block_length=4,
+                max_denoising_steps=4,
+                temperature=0.7,
+                seed=81,
+            ),
+        )
+        other = list(other_reader)
+        assert other[-1].finish_reason == "length"
+        assert len(session.history) == count
+        assert session.generation_time == elapsed
+        lease = session.claim()
+        reader = session.reader(cursor=cursor + 1, lease=lease, timeout=10)
+    resumed.extend(reader)
+    assert [(t.text, t.token, t.token_count, t.finish_reason) for t in resumed] == [
+        (t.text, t.token, t.token_count, t.finish_reason) for t in baseline
+    ]
+    assert resumed[-1].generation_tokens == 12
+    assert session.finished
+    if worker.apc_manager is not None:
+        assert resumed[0].cached_tokens == 10
+        assert worker.apc_manager.stats.hits > 0
+
+
+@pytest.mark.parametrize("action", ["expire", "dispose", "unload", "cancel"])
+def test_diffusion_releases_stopped_generator(diffusion_worker, monkeypatch, action):
+    worker = diffusion_worker
+    closed = Event()
+    first_block = Event()
+    original = worker.model.language_model.generate_blocks
+
+    def tracked(*args, **kwargs):
+        try:
+            return (yield from original(*args, **kwargs))
+        finally:
+            closed.set()
+
+    monkeypatch.setattr(worker.model.language_model, "generate_blocks", tracked)
+
+    class PausingSession(sessions.InferenceSession):
+        def put(self, token):
+            super().put(token)
+            if self.history:
+                self.pause(self.lease)
+                first_block.set()
+
+    session = PausingSession()
+    ctx, reader = worker.generate(
+        "prompt",
+        args=Args(
+            max_tokens=12,
+            block_length=4,
+            max_denoising_steps=4,
+            seed=47,
+        ),
+        session=session,
+    )
+    assert first_block.wait(10)
+    assert next(reader).token_count > 0
+    reader.close()
+    if action == "expire":
+        session.touched -= session.ttl + 1
+    elif action == "dispose":
+        session.dispose()
+    elif action == "unload":
+        worker.stop_and_join()
+    else:
+        worker._cancel(ctx.uid)
+    assert closed.wait(5)
+    assert session.finished or session.error is not None
+    if action != "cancel":
+        with pytest.raises(ValueError):
+            session.claim()
+
+
+@pytest.mark.parametrize("api", ["chat", "responses"])
+def test_diffusion_http_checkpoint_replays_without_regeneration(
+    diffusion_worker, client, monkeypatch, api
+):
+    worker = diffusion_worker
+    monkeypatch.setattr(continuation, "CHECKPOINTS", continuation.Checkpoints())
+    options = dict(
+        stream=True,
+        max_tokens=12,
+        max_output_tokens=12,
+        block_length=4,
+        max_denoising_steps=4,
+        temperature=0.7,
+        seed=47,
+    )
+
+    def text(response):
+        if api == "responses":
+            return _data(response)[-1]["response"]["output_text"]
+        return "".join(d.get("content") or "" for d in _deltas(response))
+
+    with _endpoint(generator=worker):
+        original = _post(client, api, resumable=True, **options)
+        assert original.status_code == 200
+        checkpoint = next(
+            e["continuation"]
+            for e in _data(original)
+            if e.get("continuation", {}).get("cursor") == 1
+            and e["continuation"]["content"] > 0
+        )
+        monkeypatch.setattr(
+            worker, "generate", Mock(side_effect=AssertionError("restarted generation"))
+        )
+        resumed = _post(client, api, continuation=checkpoint, **options)
+        assert resumed.status_code == 200
+        assert text(original)[: checkpoint["content"]] + text(resumed) == text(original)
+        worker.generate.assert_not_called()
