@@ -3,7 +3,7 @@
 [![Ask any image anything. Runs locally on your Mac. Install with pip install mlx-vlm or try it in Nativ.](https://raw.githubusercontent.com/Blaizzy/mlx-vlm/6e0fba58459c22d3a64959f6461ce6a247f000a2/docs/assets/mlx-vlm-banner.png)](https://runnativ.ai)
 
 <p align="center">
-  <strong>MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VLMs) and Omni Models</strong> (VLMs with audio and video support) on your Mac using MLX.
+  <strong>Run and fine-tune multimodal models on Apple Silicon.</strong> Text, images, video, and audio in — any out. Built on MLX.
 </p>
 
 <p align="center">
