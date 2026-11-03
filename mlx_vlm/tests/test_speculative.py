@@ -931,9 +931,72 @@ def test_mistral_dspark_verifier_matches_decode(dtype, batch):
     )
 
 
+@parametrize("dtype", [mx.float16, mx.bfloat16, mx.float32])
+@parametrize("batch", [2, 5])
+def test_mistral_dspark_projection_preserves_singleton_row(dtype, batch):
+    from mlx_vlm.models.mistral_large4 import speculative_verifier as verifier
+    from mlx_vlm.models.mistral_large4.language import decode_linear
+
+    mx.random.seed(83)
+    for k, n in [(6144, 512), (512, 6144)]:
+        module = nn.Linear(k, n, bias=False)
+        module.weight = mx.random.normal((n, k)).astype(dtype)
+        module.eval()
+        inputs = mx.random.normal((batch, 4, k)).astype(dtype)
+        if verifier.native_wide_linear(module.weight, inputs) is None:
+            pytest.skip("Native wide-GEMV is unavailable on this device")
+        equal(
+            verifier.linear(module, inputs[-1:]), verifier.linear(module, inputs)[-1:]
+        )
+        ordinary = mx.concatenate(
+            [decode_linear(module, inputs[-1:, t : t + 1]) for t in range(4)], axis=1
+        )
+        equal(verifier.linear(module, inputs[-1:]), ordinary)
+
+
 @pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
 @parametrize("prefix,topk", [(3, 2048), (127, 2048), (255, 2048), (127, 128)])
-@parametrize("batch,length", [(2, 1), (2, 4), (8, 2), (8, 4)])
+@parametrize("padding", [0, 3])
+def test_mistral_dspark_verifier_preserves_singleton_row(prefix, topk, padding):
+    from mlx_vlm.models.mistral_large4 import speculative_verifier as verifier
+
+    mx.random.seed(79)
+    model, _ = mistral_dspark_case()
+    model.set_dtype(mx.bfloat16)
+    if (
+        verifier.native_wide_linear(
+            model.lm_head.weight, mx.zeros((2, 1, model.args.hidden_size), mx.bfloat16)
+        )
+        is None
+    ):
+        pytest.skip("Native wide-GEMV is unavailable on this device")
+    for layer in model.layers:
+        if layer.attention.indexer is not None:
+            layer.attention.indexer.topk = topk
+    batched = [c.to_batch([0, padding]) for c in model.make_cache()]
+    mx.eval(model(mx.random.randint(1, 60, (2, prefix)), cache=batched).logits)
+    single = deepcopy(batched)
+    for c in single:
+        c.filter(mx.array([1], mx.int32))
+
+    # Compare the same inputs and evolving accepted cache, not free-running text.
+    for _ in range(3):
+        inputs = mx.random.randint(1, 60, (2, 4))
+        bh, bn, bt = verifier.verify_hidden(model, inputs, batched, [0, 1, 2, 3])
+        sh, sn, st = verifier.verify_hidden(model, inputs[1:], single, [0, 1, 2, 3])
+        equal(sh, [h[1:] for h in bh])
+        equal(verifier.verify_logits(model, sn), verifier.verify_logits(model, bn)[1:])
+        bt.commit([2, 2])
+        st.commit([2])
+        for b, s in zip(batched, single):
+            b, s = b.extract(1), s.extract(0)
+            equal(b.state, s.state)
+            assert b.meta_state == s.meta_state
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
+@parametrize("prefix,topk", [(3, 2048), (127, 2048), (255, 2048), (127, 128)])
+@parametrize("batch,length", [(1, 1), (1, 4), (2, 1), (2, 4), (8, 2), (8, 4)])
 @parametrize("ragged", [False, True])
 def test_mistral_dspark_verifier_preserves_hidden_logits_and_cache(
     prefix, topk, batch, length, ragged
