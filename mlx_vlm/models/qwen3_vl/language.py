@@ -463,10 +463,10 @@ class LanguageModel(nn.Module):
         else:
             if attention_mask is not None:
                 position_ids = mx.cumsum(attention_mask.astype(mx.int64), axis=-1) - 1
+                max_position_ids = position_ids.max(axis=-1, keepdims=True)
                 position_ids = mx.where(
                     attention_mask == 0, mx.ones_like(position_ids), position_ids
                 )
-                max_position_ids = position_ids.max(axis=-1, keepdims=True)
                 # Offset against each row's unpadded length: BatchKVCache offsets
                 # already exclude left padding.
                 mrope_position_deltas = (

@@ -7,25 +7,27 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from mlx_vlm.models.qwen3_vl.config import TextConfig
-from mlx_vlm.models.qwen3_vl.language import LanguageModel
+from mlx_vlm.models.cache import BatchKVCache, KVCache
 from mlx_vlm.tests.test_models import build_config, model_case
 
 
-def _language_model():
-    args = TextConfig(
-        model_type="qwen3_vl",
-        num_hidden_layers=1,
-        hidden_size=32,
-        intermediate_size=64,
-        num_attention_heads=2,
-        rms_norm_eps=1e-6,
-        vocab_size=16,
-        num_key_value_heads=2,
-        head_dim=16,
-        rope_theta=10000.0,
-        max_position_embeddings=128,
-        rope_scaling={"type": "default", "mrope_section": [2, 3, 3]},
+def _language_model(model_type="qwen3_vl"):
+    module = importlib.import_module(f"mlx_vlm.models.{model_type}")
+    args = module.TextConfig.from_dict(
+        dict(
+            model_type=model_type,
+            num_hidden_layers=1,
+            hidden_size=32,
+            intermediate_size=64,
+            num_attention_heads=2,
+            rms_norm_eps=1e-6,
+            vocab_size=16,
+            num_key_value_heads=2,
+            head_dim=16,
+            rope_theta=10000.0,
+            max_position_embeddings=128,
+            rope_scaling={"type": "default", "mrope_section": [2, 3, 3]},
+        )
     )
     config = SimpleNamespace(
         vision_config=SimpleNamespace(spatial_merge_size=2),
@@ -33,14 +35,14 @@ def _language_model():
         video_token_id=101,
         vision_start_token_id=102,
     )
-    return LanguageModel(args, config)
+    return module.LanguageModel(args, config)
 
 
-def test_text_only_rope_deltas_ignore_left_padding():
+@pytest.mark.parametrize("length,width", [(2, 5), (1, 2), (1, 5)])
+def test_text_only_rope_deltas_ignore_left_padding(length, width):
     lm = _language_model()
-    # Row 0 is left-padded by 3 tokens, row 1 has no padding.
-    ids = mx.ones((2, 5), dtype=mx.int32)
-    mask = mx.array([[0, 0, 0, 1, 1], [1, 1, 1, 1, 1]])
+    ids = mx.ones((2, width), dtype=mx.int32)
+    mask = mx.array([[0] * (width - length) + [1] * length, [1] * width])
 
     _, deltas = lm.get_rope_index(ids, attention_mask=mask)
 
@@ -64,7 +66,8 @@ MODULES = [
 
 
 @pytest.mark.parametrize("module_name", MODULES)
-def test_sibling_text_only_rope_deltas_ignore_left_padding(module_name):
+@pytest.mark.parametrize("length,width", [(2, 5), (1, 2), (1, 5)])
+def test_sibling_text_only_rope_deltas_ignore_left_padding(module_name, length, width):
     module = importlib.import_module(module_name)
     lm = module.LanguageModel.__new__(module.LanguageModel)
     lm.config = SimpleNamespace(
@@ -73,9 +76,8 @@ def test_sibling_text_only_rope_deltas_ignore_left_padding(module_name):
         video_token_id=102,
         vision_start_token_id=100,
     )
-    # Row 0 is left-padded by 3 tokens, row 1 has no padding.
-    ids = mx.ones((2, 5), dtype=mx.int32)
-    mask = mx.array([[0, 0, 0, 1, 1], [1, 1, 1, 1, 1]])
+    ids = mx.ones((2, width), dtype=mx.int32)
+    mask = mx.array([[0] * (width - length) + [1] * length, [1] * width])
 
     _, deltas = lm.get_rope_index(ids, attention_mask=mask)
 
@@ -84,16 +86,36 @@ def test_sibling_text_only_rope_deltas_ignore_left_padding(module_name):
     assert deltas.tolist() == [[0], [0]]
 
 
+@pytest.mark.parametrize("padding", [1, 4])
+@pytest.mark.parametrize("model_type", ["qwen2_vl", "qwen2_5_vl", "qwen3_vl"])
+def test_padded_one_token_decode_matches_standalone(model_type, padding):
+    mx.random.seed(17)
+    lm = _language_model(model_type)
+    cache = [BatchKVCache([padding, 0]) for _ in lm.layers]
+    ids = mx.array([[0] * padding + [3], [4] * padding + [5]])
+    mask = mx.array([[0] * padding + [1], [1] * (padding + 1)])
+    lm(ids, mask=mask, cache=cache)
+    actual = lm(mx.array([[2], [2]]), cache=cache).logits[0, -1]
+
+    lm._position_ids = lm._rope_deltas = None
+    cache = [KVCache() for _ in lm.layers]
+    lm(mx.array([[3]]), cache=cache)
+    expected = lm(mx.array([[2]]), cache=cache).logits[0, -1]
+
+    np.testing.assert_allclose(actual, expected, atol=1e-6, rtol=1e-5)
+
+
 def _minicpmv47_model():
     module = importlib.import_module("mlx_vlm.models.minicpmv4_7")
     case = model_case("minicpmv4_7")
     return module.Model(build_config(module, case["config"]))
 
 
-def test_minicpmv47_text_only_rope_deltas_ignore_left_padding():
+@pytest.mark.parametrize("length,width", [(2, 5), (1, 2), (1, 5)])
+def test_minicpmv47_text_only_rope_deltas_ignore_left_padding(length, width):
     model = _minicpmv47_model()
-    ids = mx.array([[0, 0, 0, 3, 4], [3, 4, 5, 6, 7]], dtype=mx.int32)
-    mask = mx.array([[0, 0, 0, 1, 1], [1, 1, 1, 1, 1]])
+    ids = mx.array([[0] * (width - length) + [3] * length, [4] * width])
+    mask = mx.array([[0] * (width - length) + [1] * length, [1] * width])
 
     features = model.get_input_embeddings(ids, mask=mask)
 
