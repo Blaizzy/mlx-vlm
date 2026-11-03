@@ -294,4 +294,4 @@ class MageVLProcessor(ProcessorMixin):
 
 __all__ = ["MageVLProcessor"]
 
-install_auto_processor_patch("mage_vl", MageVLProcessor)
+install_auto_processor_patch(["mage_vl", "llava_onevision2"], MageVLProcessor)

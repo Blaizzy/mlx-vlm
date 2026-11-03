@@ -21,6 +21,7 @@ import numpy as np
 import pytest
 
 from mlx_vlm import load
+from mlx_vlm.apc_coordinator import PrefillMemoryPlan
 from mlx_vlm.generate import AudioGenerationResult, ar
 from mlx_vlm.generate import audio as audio_module
 from mlx_vlm.generate import dispatch, generate_audio, save_audio
@@ -1528,6 +1529,24 @@ def test_load_audio_downmixes_stereo_before_resampling(monkeypatch):
     np.testing.assert_allclose(audio, expected, rtol=1e-5, atol=1e-6)
 
 
+def test_load_audio_rejects_files_that_decode_to_no_samples(monkeypatch, tmp_path):
+    from mlx_audio import audio_io
+
+    path = tmp_path / "empty.wav"
+    with wave.open(str(path), "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(16000)
+    with pytest.raises(ValueError, match="empty.wav returned no samples"):
+        load_audio(str(path), sr=16000)
+    # ffmpeg returns nothing for some inputs it reads from a pipe.
+    monkeypatch.setattr(audio_io, "read", lambda file, dtype: (np.zeros((0, 2)), 44100))
+    with pytest.raises(ValueError, match="the audio data returned no samples"):
+        load_audio(BytesIO(b"audio"), sr=16000)
+    # Arrays are the caller's samples, even when empty.
+    assert load_audio(np.zeros(0, np.float32), sr=16000).shape == (0,)
+
+
 def _host(a):
     return np.array(a.astype(mx.float32))
 
@@ -1679,25 +1698,26 @@ def test_cold_batch_merge_keeps_features_when_text_row_is_first():
     assert result._next_tokens[1:].tolist() == mx.argmax(reference, axis=-1).tolist()
 
 
-def _mixed_batch(model, rows, prompts, prefix, warm_cache=None):
+def _mixed_batch(model, rows, prompts, prefix, warm_cache=None, *, prefill_budget=2):
     bg = object.__new__(ar.BatchGenerator)
     bg.model = model
     bg.apc_manager = object()
     bg.apc = SimpleNamespace(
+        manager=SimpleNamespace(memory_plan=PrefillMemoryPlan()),
         prepare_prefill=lambda *a, **k: None,
         observe_cache=lambda *a, **k: None,
-        merge_rows=lambda *a, **k: (
-            ar._apc.make_warm_batch_exact_cache_multi(
+        _merge_and_release_cache_rows=lambda *a, **k: (
+            ar._apc._merge_and_release_cache_rows(
                 [warm_cache, make_prompt_cache(model)], [prefix, 0]
             )
             if warm_cache is not None
             else ([], prefix)
         ),
         checkpoint_len=lambda *a: 0,
-        checkpoint_lengths=lambda *a: [],
+        checkpoint_lengths=lambda *a, **kw: [],
     )
     bg.apc_mode = "exact"
-    bg.prefill_step_size = 2
+    bg.prefill_step_size = prefill_budget
     bg.kv_bits = None
     bg.kv_group_size = 64
     bg.kv_quant_scheme = "affine"
@@ -1715,12 +1735,17 @@ def _mixed_batch(model, rows, prompts, prefix, warm_cache=None):
     return batch
 
 
-def test_mixed_cached_prefix_slices_visual_features_before_merging():
+@pytest.mark.parametrize("prefill_budget", [2, 4, 8])
+def test_mixed_cached_prefix_slices_visual_features_before_merging(prefill_budget):
     # The warm row's cached prefix contains one visual token; the cold row
     # contains two visual tokens.
     calls = []
 
     def model(ids, **kwargs):
+        # The token budget covers both rows, including padding. Visual features
+        # must stay aligned with the token columns in every forward pass.
+        assert ids.size <= prefill_budget
+        assert kwargs["deepstack_visual_embeds"].shape[:2] == ids.shape
         calls.append(kwargs)
         return SimpleNamespace(logits=mx.zeros((*ids.shape, 4)))
 
@@ -1736,7 +1761,13 @@ def test_mixed_cached_prefix_slices_visual_features_before_merging():
             "deepstack_visual_embeds": mx.array([20, 0, 21, 0]).reshape(1, 4, 1, 1),
         },
     ]
-    batch = _mixed_batch(model, rows, [list(range(6)), list(range(4))], 3)
+    batch = _mixed_batch(
+        model,
+        rows,
+        [list(range(6)), list(range(4))],
+        3,
+        prefill_budget=prefill_budget,
+    )
     assert batch._prompt_kwargs["deepstack_visual_embeds"][:, :, 0, 0].tolist() == [
         [11, 12, 0, 0],
         [20, 0, 21, 0],
@@ -1744,10 +1775,13 @@ def test_mixed_cached_prefix_slices_visual_features_before_merging():
     while batch.needs_processing():
         batch.prompt_step()
     batch.generate(lambda x: mx.argmax(x, axis=-1), lambda _: False)
-    assert [c["deepstack_visual_embeds"][:, :, 0, 0].tolist() for c in calls] == [
-        [[11, 12], [20, 0]],
-        [[0], [21]],
-        [[0], [0]],
+    # Concatenating the calls must reproduce the uncached visual suffix exactly,
+    # regardless of chunk boundaries: no cached feature, lost column, or repeat.
+    assert mx.concatenate(
+        [c["deepstack_visual_embeds"][:, :, 0, 0] for c in calls], axis=1
+    ).tolist() == [
+        [11, 12, 0, 0],
+        [20, 0, 21, 0],
     ]
 
 

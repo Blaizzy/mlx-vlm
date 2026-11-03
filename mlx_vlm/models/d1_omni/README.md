@@ -48,10 +48,10 @@ base64 data URI) the same way.
 d1-omni supports `choice`, `score`, and `bool`; `noul` is an alias for `bool`.
 A `choice` takes `{label: description}` or a list of labels, a `score` an
 ordered list of 2 to 10 levels, and a `bool` optional `{"false": ..., "true":
-...}` descriptions. Choice and score answers include `probabilities` and
-`metadata.confidence`; scores also carry the level `legend`. Boolean answers
-include `probability`, the probability of true, and use 0.5 to select their
-value.
+...}` descriptions (or `no` and `yes`; other keys raise `ValueError`). Choice
+and score answers include `probabilities` and `metadata.confidence`; scores
+also carry the level `legend`. Boolean answers include `probability`, the
+probability of true, and use 0.5 to select their value.
 
 A state is a string, any JSON value, or `None` when images or audio are the
 whole state. `images` is one image or a list of PIL images, paths, or URLs,
@@ -61,7 +61,8 @@ a thumbnail. `audio` is one clip: 16 kHz mono samples (a NumPy array, list, or
 `mx.array`; int16 PCM is scaled by 1/32768, floats are read as is), or a path,
 URL, or binary file object of an audio file, which is downmixed and resampled
 to 16 kHz; a file that fails to decode or holds no samples raises `ValueError`.
-Clips are cut to 30 s and padded with silence to 0.5 s, and every 80 ms is one
+The model only listens to the first 30 s of a clip: longer clips are cut to
+30 s, and shorter ones are padded with silence to 0.5 s; every 80 ms is one
 prefix position. A request carries images or audio, not both.
 
 Text answers are calibrated with the per-type temperatures in `config.json`.
@@ -74,16 +75,23 @@ and 16384 minus the prefix in every case. The instructions keep up to B =
 max(96, min(24 × options + 32, cap / 2)) tokens, the options share another B,
 and the state is cut on the right to the room that is left. After audio, as in
 training, a missing state reads as `{}`, choices are written as numbered
-options, and Boolean criteria are ignored. `usage.input_tokens` counts every
-position the trunk reads, so each question counts the media prefix again. The
-questions of a request run in length-sorted batches; `token_budget` (default
-65536) bounds the padded positions per batch, media prefix included.
+options, and Boolean criteria are ignored. The trunk runs a request's media
+prefix once and every question's text row reads it from there, which matches
+running the prefix in each row, as the reference does, to float32 rounding.
+`usage.input_tokens` still counts the prefix once per question. The
+questions of a request run in batches of similar length, longest first: a batch
+takes no row under half the length of its longest (of its text, after a shared
+prefix), so one long question does not pad many short ones. `token_budget`
+(default 16384) bounds the padded positions per batch, media prefix included.
+Peak memory grows with the budget: in float32, a full batch takes about 5.8 GB
+above the weights at 65536 and about 2.2 GB at 16384, which is no slower.
 
 The checkpoint is float32 and runs in float32 by default, matching the PyTorch
-reference to about 1e-5 in probability on text, images, and speech. For images
-this holds against torchvision's native uint8 resize, which the reference uses on
-Apple Silicon from torchvision 0.27 and on x86 with AVX2; on older or GPU setups
-it resizes in float and its own answers move by up to about 0.08.
+reference to about 1e-5 in probability on text, 5e-5 on images, and 1e-3 on
+speech. For images this holds against torchvision's native uint8 resize, which
+the reference uses on Apple Silicon from torchvision 0.27 and on x86 with AVX2;
+on older or GPU setups it resizes in float and its own answers move by up to
+about 0.08.
 `--dtype float16` conversions keep the answers apart from near ties.
 Four-bit quantization changes a noticeable share of answers, so prefer 8-bit
 (`-q --q-bits 8`) or float16; the vision tower and the decision scorer stay
@@ -91,4 +99,7 @@ unquantized. The audio encoder is quantized with the trunk: keeping it in full
 precision measured no gain at 4 or 8 bits, where the trunk dominates the drift,
 and adds about 300 MB. Digital silence (all-zero samples) is numerically
 ill-conditioned in the log-mel front end; the reference itself answers it
-differently on CPU and GPU.
+differently on CPU and GPU. So is speech with almost nothing above 4 kHz, such
+as audio recorded at 8 kHz: on 200 MINDS-14 clips read from their 8 kHz files,
+MLX and the CPU reference differ by up to 0.35 and in 6 top answers, and the
+reference's own CPU and GPU runs by up to 0.52 and in 4.

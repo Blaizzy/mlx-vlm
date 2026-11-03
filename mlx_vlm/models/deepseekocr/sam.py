@@ -428,7 +428,9 @@ def get_rel_pos(q_size: int, k_size: int, rel_pos: mx.array) -> mx.array:
 
         # Linear interpolation
         scale = rel_pos_resized.shape[2] / max_rel_dist
-        indices = mx.arange(max_rel_dist, dtype=mx.float32) * scale
+        indices = mx.maximum(
+            (mx.arange(max_rel_dist, dtype=mx.float32) + 0.5) * scale - 0.5, 0
+        )
         idx_floor = mx.floor(indices).astype(mx.int32)
         idx_ceil = mx.minimum(idx_floor + 1, rel_pos_resized.shape[2] - 1)
         weight = indices - idx_floor.astype(mx.float32)

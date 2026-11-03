@@ -2,6 +2,11 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import InputEmbeddingsFeatures, LanguageModelOutput
+from ..switch_layers import (
+    EXPERT_WEIGHT_SUFFIXES,
+    expand_expert_scales,
+    stack_expert_projection,
+)
 from .config import ModelConfig
 from .language import DiffusionGemma4Backbone, make_compiled_softcap
 from .visualizer import make_unmasking_visualizer
@@ -46,6 +51,9 @@ class _LanguageModelView:
 
     def generate(self, input_ids: mx.array, **kwargs):
         return self._parent.generate(input_ids, **kwargs)
+
+    def generate_blocks(self, input_ids: mx.array, **kwargs):
+        return self._parent.generate_blocks(input_ids, **kwargs)
 
     @property
     def quant_predicate(self):
@@ -201,7 +209,13 @@ class Model(nn.Module):
         logits = self.model.decoder.embed_tokens.as_linear(hidden_states)
         return self._softcap(logits)
 
-    def generate(
+    def generate(self, *args, **kwargs):
+        """Generate synchronously, retaining the callback API."""
+        from ...generate.common import consume_generator
+
+        return consume_generator(self.generate_blocks(*args, **kwargs))
+
+    def generate_blocks(
         self,
         input_ids: mx.array,
         temperature: float = 0.0,
@@ -223,7 +237,8 @@ class Model(nn.Module):
         on_block=None,
         on_result=None,
         **kwargs,
-    ) -> mx.array:
+    ):
+        """Yield after each committed canvas; return the final token array."""
         del top_p, top_k, eos_early_stop
         from ...generate.diffusion import stream_diffusion_generate
 
@@ -280,6 +295,7 @@ class Model(nn.Module):
             decoder_input_ids=kwargs.pop("decoder_input_ids", None),
             apc_manager=kwargs.pop("_apc_manager", None),
             apc_extra_hash=kwargs.pop("_apc_semantic_hash", 0),
+            rng=kwargs.pop("_rng", None),
         )
 
         generated_tokens = []
@@ -303,6 +319,8 @@ class Model(nn.Module):
                 ):
                     if not on_block(generated_tokens):
                         break
+                if result.diffusion_block_complete:
+                    yield
         finally:
             results.close()
 
@@ -346,6 +364,25 @@ class Model(nn.Module):
         )
 
     def sanitize(self, weights):
+        weights = dict(weights)
+        for layer in range(self.config.text_config.num_hidden_layers):
+            prefix = f"model.decoder.layers.{layer}.experts"
+            for name in ("gate_proj", "up_proj", "down_proj"):
+                stack_expert_projection(
+                    weights,
+                    prefix,
+                    name,
+                    f"{prefix}.{name}",
+                    self.config.text_config.num_experts,
+                )
+            expand_expert_scales(weights, [f"{prefix}.gate_proj", f"{prefix}.up_proj"])
+            for suffix in EXPERT_WEIGHT_SUFFIXES:
+                gate = f"{prefix}.gate_proj.{suffix}"
+                up = f"{prefix}.up_proj.{suffix}"
+                if gate in weights and up in weights:
+                    weights[f"{prefix}.gate_up_proj.{suffix}"] = mx.concatenate(
+                        [weights.pop(gate), weights.pop(up)], axis=1
+                    )
         has_vision_tower = self.model.encoder.vision_tower is not None
         use_clipped = (
             getattr(self.config.vision_config, "use_clipped_linears", False)

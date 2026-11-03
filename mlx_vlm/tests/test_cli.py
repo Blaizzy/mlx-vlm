@@ -104,6 +104,40 @@ def test_cli_boolean_and_thinking_flags(entrypoint, default):
     assert error.value.code == 2
 
 
+def test_cli_reasoning_effort_parsing():
+    parser = _capture_parser(dispatch.parse_arguments)
+    assert parser.parse_args([]).reasoning_effort is None
+    for effort in ("low", "medium", "high"):
+        parsed = parser.parse_args(["--reasoning-effort", effort])
+        assert parsed.reasoning_effort == effort
+    # Matches the server's case-insensitive handling of reasoning_effort.
+    assert parser.parse_args(["--reasoning-effort", "Medium"]).reasoning_effort == (
+        "medium"
+    )
+
+
+@pytest.mark.parametrize("effort", [None, "medium"])
+def test_text_cli_forwards_reasoning_effort_to_template(effort):
+    args = _args(
+        image=["image.png"],
+        prompt=["Describe this input."],
+        reasoning_effort=effort,
+    )
+    with _text_cli(args) as mocks:
+        dispatch.main()
+    template_kwargs = mocks.apply_chat_template.call_args.kwargs
+    if effort is None:
+        # The template default must stay untouched when the flag is omitted.
+        assert "reasoning_effort" not in template_kwargs
+        assert "reasoning_strength" not in template_kwargs
+    else:
+        # Same mapping as the server: the raw key plus the
+        # reasoning_strength alias read by Muse Glimmer's template.
+        _assert_fields(
+            template_kwargs, reasoning_effort=effort, reasoning_strength=effort
+        )
+
+
 def test_cli_and_library_agree_on_shared_defaults():
     cli = vars(_args())
     library = {
@@ -347,7 +381,7 @@ def test_text_cli_media_and_arguments(capsys, mode):
         assert output.strip() == "done"
 
 
-@pytest.mark.parametrize("modality", ["image", "video"])
+@pytest.mark.parametrize("modality", ["image", "video", "3d"])
 def test_modality_routing_precedes_vlm_load(modality):
     args = NS(output_modality=modality)
     with (
@@ -365,7 +399,10 @@ def test_image_cli_request_and_output(tmp_path, task):
     edit = task == "edit"
     output = tmp_path / "image.png"
     extras = (
-        {}
+        {
+            "gen_kwargs": {"upsample_prompt": False},
+            "prompt_expansion_model": "local-pup",
+        }
         if edit
         else dict(
             gen_kwargs={"sampler_preset": "V4_TURBO_12"},
@@ -400,6 +437,10 @@ def test_image_cli_request_and_output(tmp_path, task):
         assert request.prompt == "add sunglasses"
         assert request.image_paths == ("reference.png",)
         assert (request.width, request.height) == (256, 512)
+        assert request.extra == {
+            "upsample_prompt": False,
+            "prompt_expansion_model": "local-pup",
+        }
     else:
         assert request.extra == dict(
             sampler_preset="V4_TURBO_12", prompt_expansion_model="tiny-text-model"

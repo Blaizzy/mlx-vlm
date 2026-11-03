@@ -5,6 +5,7 @@ import logging
 import time
 import traceback
 import uuid
+from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
@@ -17,7 +18,6 @@ from ..tools import (
     _infer_tool_parser_from_processor,
     _prepare_chat_tool_choice,
     load_tool_module,
-    process_tool_calls,
 )
 from ..utils import prepare_inputs
 from .generation import (
@@ -27,9 +27,11 @@ from .generation import (
     _count_prompt_tokens,
 )
 from .responses_state import (
+    ThinkingStreamState,
     ToolCallStreamState,
     finish_content_streams,
     make_response_stream_state,
+    parse_assistant_tool_calls,
     prompt_has_open_thinking,
     strip_protocol_markers,
 )
@@ -579,6 +581,21 @@ async def anthropic_messages_endpoint(http_request: Request):
             **template_kwargs,
         )
 
+        starts_in_thinking = prompt_has_open_thinking(
+            formatted_prompt,
+            gen_args.enable_thinking,
+            gen_args.thinking_start_token,
+            gen_args.thinking_end_token,
+        )
+        parse_tools = partial(
+            parse_assistant_tool_calls,
+            tool_module=tool_module,
+            tools=tools,
+            starts_in_thinking=starts_in_thinking,
+            thinking_start_token=gen_args.thinking_start_token,
+            thinking_end_token=gen_args.thinking_end_token,
+        )
+
         logger.debug(
             "anthropic messages request: model=%s images=%d max_tokens=%s "
             "temp=%s stream=%s tools=%d",
@@ -622,14 +639,10 @@ async def anthropic_messages_endpoint(http_request: Request):
                 def make_thinking_state():
                     return make_response_stream_state(
                         processor,
-                        prompt_has_open_thinking(
-                            formatted_prompt,
-                            gen_args.enable_thinking,
-                            gen_args.thinking_start_token,
-                            gen_args.thinking_end_token,
-                        ),
+                        starts_in_thinking,
                         gen_args.thinking_start_token,
                         gen_args.thinking_end_token,
+                        prompt=formatted_prompt,
                     )
 
                 thinking_state = make_thinking_state()
@@ -704,6 +717,19 @@ async def anthropic_messages_endpoint(http_request: Request):
                         return full_output
                     call_start = full_output.find(tc_start)
                     while call_start >= 0:
+                        thinking_prefix = ThinkingStreamState(
+                            starts_in_thinking,
+                            gen_args.thinking_start_token,
+                            gen_args.thinking_end_token,
+                        )
+                        thinking_prefix.feed(full_output[:call_start])
+                        if thinking_prefix.in_thinking:
+                            # An unclosed example in reasoning must not span
+                            # an executable call after the stop marker.
+                            call_start = full_output.find(
+                                tc_start, call_start + len(tc_start)
+                            )
+                            continue
                         # Match the extractor's non-overlapping call spans,
                         # including parsers whose calls end at a newline/EOF.
                         marker = tc_end or "\n"
@@ -885,9 +911,7 @@ async def anthropic_messages_endpoint(http_request: Request):
 
                     parsed_tool_calls = None
                     if tool_module is not None and tools:
-                        tc = process_tool_calls(
-                            tool_output_before_stop(), tool_module, tools
-                        )
+                        tc = parse_tools(tool_output_before_stop())
                         if tc.calls:
                             parsed_tool_calls = tc.calls
 
@@ -1097,18 +1121,25 @@ async def anthropic_messages_endpoint(http_request: Request):
                 gen_args.thinking_start_token,
                 gen_args.thinking_end_token,
                 processor=processor,
+                prompt=formatted_prompt,
             )
             parsed_tool_calls = None
             if tool_module is not None and tools:
-                tc = process_tool_calls(full_text, tool_module, tools)
+                tc = parse_tools(full_text)
                 if tc.calls:
                     parsed_tool_calls = tc.calls
-                    _, content = _split_thinking(
-                        tc.remaining_text or "",
-                        gen_args.thinking_start_token,
-                        gen_args.thinking_end_token,
-                        processor=processor,
-                    )
+                    # Structured templates already removed tool/routing regions
+                    # from the content parsed above. Otherwise use the delimiter
+                    # parser's remainder (reasoning has already been excluded).
+                    if not (
+                        getattr(processor, "response_template", None)
+                        or getattr(
+                            getattr(processor, "tokenizer", None),
+                            "response_template",
+                            None,
+                        )
+                    ):
+                        content = tc.remaining_text or ""
                     content = strip_protocol_markers(
                         content,
                         tool_module,
@@ -1242,6 +1273,7 @@ async def anthropic_count_tokens_endpoint(http_request: Request):
                 formatted_prompt,
                 images if images else None,
                 None,
+                **gen_args.preprocessing_kwargs(),
             )
         else:
             image_token_index = getattr(config, "image_token_index", None)
@@ -1250,6 +1282,7 @@ async def anthropic_count_tokens_endpoint(http_request: Request):
                 images=images if images else None,
                 prompts=formatted_prompt,
                 image_token_index=image_token_index,
+                **gen_args.preprocessing_kwargs(),
             )
         return {"input_tokens": _count_prompt_tokens(raw_inputs)}
     except Exception as e:

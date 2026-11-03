@@ -78,19 +78,32 @@ def _taps(n_in, n_out):
     return np.minimum(lo[:, None] + j, n_in - 1), weights, bits
 
 
+@mx.compile
+def _add_tap(acc, src, weight):
+    # One fused kernel, so no int32 copy of the source or product is kept.
+    return acc + src.astype(mx.int32) * weight
+
+
 def resize(x, height, width):
-    """torchvision ``resize(uint8, BILINEAR, antialias=True)``: width pass, then height."""
+    """torchvision ``resize(uint8, BILINEAR, antialias=True)`` of an (H, W, C) uint8
+    array: width pass, then height, in int32 on the GPU. The sums stay below 2**31:
+    at most 255 * (2**22 + taps) + 2**21."""
+    y = mx.array(x)
     for axis, n in ((1, width), (0, height)):
-        if x.shape[axis] == n:
+        if y.shape[axis] == n:
             continue
-        index, weights, bits = _taps(x.shape[axis], n)
+        index, weights, bits = _taps(y.shape[axis], n)
         shape = (1, -1, 1) if axis == 1 else (-1, 1, 1)
-        acc = np.int64(1 << (bits - 1))
+        index, weights = mx.array(index, mx.int32), mx.array(weights, mx.int32)
+        acc = mx.array(1 << (bits - 1), mx.int32)
         for k in range(index.shape[1]):
-            src = np.take(x, index[:, k], axis=axis).astype(np.int64)
-            acc = acc + src * weights[:, k].reshape(shape)
-        x = np.clip(acc >> bits, 0, 255).astype(np.uint8)
-    return x
+            src = mx.take(y, index[:, k], axis=axis)
+            acc = _add_tap(acc, src, weights[:, k].reshape(shape))
+            if k % 4 == 3:
+                mx.eval(acc)  # bounds the temporaries a long lazy sum keeps
+        y = mx.clip(acc >> bits, 0, 255).astype(mx.uint8)
+        mx.eval(y)
+    return np.array(y)
 
 
 def preprocess(image):
@@ -107,6 +120,7 @@ def preprocess(image):
             for c in range(gw)
         ]
     crops.append(resize(image, *plan["thumbnail"]))
+    mx.clear_cache()  # the resize buffers fit only this image size
     pixels = np.zeros((len(crops), MAX_PATCHES, 3 * PATCH * PATCH), np.float32)
     shapes, masks = [], np.zeros((len(crops), MAX_PATCHES), np.int32)
     for i, crop in enumerate(crops):
