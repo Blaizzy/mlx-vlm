@@ -23,15 +23,29 @@ from fastapi.responses import (
     Response,
     StreamingResponse,
 )
-from mlx_audio.audio_io import read as audio_read
-from mlx_audio.audio_io import write as audio_write
 from pydantic import Field
 
 from .._stream_cleanup import clear_mlx_streams
 from .runtime import runtime
 from .schemas import FlexibleBaseModel
 
+try:
+    from mlx_audio.audio_io import read as audio_read
+    from mlx_audio.audio_io import write as audio_write
+except ModuleNotFoundError:  # optional 'audio' extra
+    audio_read = audio_write = None
+
 logger = logging.getLogger("mlx_vlm.server")
+
+
+def _require_mlx_audio() -> None:
+    if audio_read is None:
+        raise HTTPException(
+            status_code=501,
+            detail="Audio endpoints require the 'audio' extra: "
+            "pip install 'mlx-vlm[audio]'",
+        )
+
 
 get_cached_model = None
 _build_metrics_envelope = None
@@ -338,6 +352,7 @@ def register_routes(app, deps):
 
 
 async def audio_speech_endpoint(payload: AudioSpeechRequest, request: Request):
+    _require_mlx_audio()
     endpoint = "/v1/audio/speech"
     request_start = time.perf_counter()
     runtime.metrics.begin_request(
@@ -406,6 +421,7 @@ async def audio_translations_endpoint(request: Request):
 
 
 async def _audio_transcription_response(request: Request, *, translate: bool):
+    _require_mlx_audio()
     if (await request.form()).get("response_format") == "diarized_json":
         if translate:
             raise HTTPException(

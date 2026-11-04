@@ -8442,6 +8442,29 @@ def _upload(client, endpoint="transcriptions", **options):
     )
 
 
+def test_server_imports_without_optional_extras():
+    code = (
+        "import sys\n"
+        "sys.modules['mlx_audio'] = None\n"
+        "sys.modules['datasets'] = None\n"
+        "import mlx_vlm.server\n"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_audio_endpoints_report_missing_audio_extra(audio_client, monkeypatch):
+    monkeypatch.setattr(server_audio, "audio_read", None)
+
+    speech = audio_client.post(
+        "/v1/audio/speech", json={"model": "fake-tts", "input": "hi"}
+    )
+    transcription = _upload(audio_client)
+
+    for response in (speech, transcription):
+        assert response.status_code == 501
+        assert "mlx-vlm[audio]" in response.json()["detail"]
+
+
 def test_audio_speech_returns_audio_bytes(audio_client, monkeypatch):
     fake_model, loader = _audio_backend(monkeypatch)
 

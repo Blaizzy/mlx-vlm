@@ -49,9 +49,17 @@ version = {attr = "mlx_vlm.version.__version__"}
 dependencies = {file = ["requirements.txt"]}
 
 [project.optional-dependencies]
-test = ["pytest", "pytest-xdist>=3.8,<4", "httpx2>=2.0.0,<3", "starlette>=1.2.1"]
+test = [
+    "pytest",
+    "pytest-xdist>=3.8,<4",
+    "httpx2>=2.0.0,<3",
+    "starlette>=1.2.1",
+    "datasets>=4.0.0",
+    "mlx-audio>=0.6.2",
+]
 ui = ["gradio>=5.19.0"]
 cuda = ["mlx-cuda"]
 cpu = ["mlx-cpu"]
-train = ["datasets>=2.19.1", "PyYAML>=6.0"]
+train = ["datasets>=4.0.0", "PyYAML>=6.0"]
+audio = ["mlx-audio>=0.6.2"]
 realtime = ["sounddevice>=0.5.0"]

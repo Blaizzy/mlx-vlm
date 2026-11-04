@@ -1534,8 +1534,13 @@ def load_audio(
         audio = file.astype(np.float32, copy=False)
         return audio.mean(axis=1) if audio.ndim > 1 else audio
 
-    from mlx_audio.audio_io import read as read_audio
-    from mlx_audio.utils import resample_audio
+    try:
+        from mlx_audio.audio_io import read as read_audio
+        from mlx_audio.utils import resample_audio
+    except ModuleNotFoundError as e:  # optional 'audio' extra
+        raise ImportError(
+            "Audio input requires the 'audio' extra: pip install 'mlx-vlm[audio]'"
+        ) from e
 
     if isinstance(file, Path):
         file = str(file)

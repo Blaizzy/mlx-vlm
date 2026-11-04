@@ -240,7 +240,12 @@ def _configure_model(model, args):
 
 def _load_dataset(args):
     if args.dataset:
-        from datasets import load_dataset
+        try:
+            from datasets import load_dataset
+        except ModuleNotFoundError as e:  # optional 'train' extra
+            raise ImportError(
+                "--dataset requires the 'train' extra: pip install 'mlx-vlm[train]'"
+            ) from e
 
         return load_dataset(args.dataset, args.hf_dataset_config)
     from .trainer.datasets.loading import load

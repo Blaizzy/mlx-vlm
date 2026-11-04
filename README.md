@@ -118,6 +118,14 @@ part of the base install:
 pip install -U 'mlx-vlm[ui]'
 ```
 
+Audio input, omni models and the `/v1/audio/*` server endpoints need
+`mlx-audio`, and training/evaluation needs `datasets`:
+
+```sh
+pip install -U 'mlx-vlm[audio]'
+pip install -U 'mlx-vlm[train]'
+```
+
 Quote the package name so that shells which expand square brackets, such as
 `zsh`, do not treat `[ui]` as a glob pattern.
 
