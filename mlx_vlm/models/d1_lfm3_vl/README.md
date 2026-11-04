@@ -19,7 +19,8 @@ without PyTorch.
 
 d1 checkpoints do not generate text: `generate`, `stream_generate` and
 `python -m mlx_vlm.generate` (text or audio) refuse them, and `mlx_vlm.server`
-refuses to load them (HTTP 400; a preloaded `--model` stops at startup).
+refuses them as chat models (HTTP 400; a preloaded `--model` stops at startup).
+They serve decisions over HTTP instead (see [Server](#server)).
 
 ## Python
 
@@ -97,6 +98,30 @@ python -m mlx_vlm.decide --model path/to/d1-omni-2B --audio call.wav \
 `--questions` JSON, `--questions-file` a JSON file. `--image`, `--audio` and
 `--video` repeat; the state's media are the pictures, then the clips, then the
 videos. The answers print as JSON.
+
+## Server
+
+```bash
+python -m mlx_vlm server --decision-model path/to/d1-2B
+
+curl http://localhost:8080/v1/decisions -H 'Content-Type: application/json' -d '{
+  "state": "I was charged twice. Please refund one charge.",
+  "questions": {"refund": {"type": "noul", "instructions": "Is it a refund request?"}}
+}'
+```
+
+`POST /v1/decisions` takes the same questions, plus `bool` for `noul` and a list
+of labels as a `choice`'s `criteria`. A request can add `images`, and on omni
+`audio`. It answers in the fields the other decision models share:
+
+| Question | Answer |
+|---|---|
+| `noul`, `bool` | `{"type": "bool", "value", "probability"}` |
+| `choice` | `{"type": "choice", "value", "probabilities", "metadata": {"confidence"}}` |
+| `score` | `{"type": "score", "value": expected_level, "probabilities", "metadata": {"confidence", "legend"}}` |
+
+Multiple choice and the typed answers keep the fields above. Values are rounded
+to 4 decimals where the shared fields apply.
 
 ## How it runs
 
