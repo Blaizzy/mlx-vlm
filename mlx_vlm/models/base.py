@@ -2,7 +2,7 @@ import inspect
 import math
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -59,6 +59,25 @@ class LanguageModelOutput:
     encoder_outputs: Optional[List[mx.array]] = None
     gdn_states: Optional[Any] = None
     shared_kv_states: Optional[Dict[str, tuple]] = None
+
+
+def project_logits(
+    hidden_states: mx.array,
+    projection: Callable[[mx.array], mx.array],
+    logits_to_keep: Optional[int] = 0,
+) -> mx.array:
+    """Project only requested trailing positions; zero/None keeps all logits.
+
+    Call after processing the full sequence and collecting hidden states. The
+    slice applies only to the vocabulary projection, never to caches or features
+    consumed by a drafter. Verification and training retain all positions by
+    leaving ``logits_to_keep`` at its default.
+    """
+    if logits_to_keep:
+        if logits_to_keep < 0:
+            raise ValueError("logits_to_keep must be nonnegative")
+        hidden_states = hidden_states[:, -logits_to_keep:, :]
+    return projection(hidden_states)
 
 
 @dataclass

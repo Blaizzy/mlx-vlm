@@ -14,7 +14,7 @@ Then check if the model has weights in the
 convert it.
 
 After that, add the model file to the
-[`mlx_vlm/models`](https://github.com/Blaizzy/mlx-vlm/tree/main/src/models)
+[`mlx_vlm/models`](https://github.com/Neywa-Labs/mlx-vlm/tree/main/mlx_vlm/models)
 directory. You can see other examples there. We recommend starting from a model
 that is similar to the model you are porting.
 

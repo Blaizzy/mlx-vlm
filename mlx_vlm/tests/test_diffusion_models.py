@@ -240,6 +240,7 @@ def _record_generation(model, tokens):
         return mx.array([tokens], mx.int32)
 
     model.language_model.generate = generate
+    model.language_model.generate_blocks = None
     return calls
 
 

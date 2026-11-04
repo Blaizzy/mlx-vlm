@@ -25,4 +25,4 @@ python -m mlx_vlm generate --help
 Each command accepts `--help` for full usage information.
 
 Decision CLI and HTTP examples, including `--decision-model` preloading, are in
-the [decision models guide](https://github.com/Blaizzy/mlx-vlm#decision-models).
+the [decision models guide](https://github.com/Neywa-Labs/mlx-vlm#decision-models).

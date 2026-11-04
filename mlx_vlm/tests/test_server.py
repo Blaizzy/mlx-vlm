@@ -2430,7 +2430,7 @@ class TestModelDiscovery:
 
 def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
     gen = _generator(
-        model=NS(),
+        model=NS(language_model=NS()),
         processor=NS(),
         config=NS(eos_token_id=3),
         tokenizer=NS(all_special_ids=[0]),
@@ -2477,7 +2477,7 @@ def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
         min_threshold=0.4,
     )
     queue = Queue()
-    gen._generate_diffusion(
+    iterator = gen._generate_diffusion(
         uid=1,
         rqueue=queue,
         raw_inputs=dict(
@@ -2490,6 +2490,7 @@ def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
         cancelled=set(),
         apc_semantic_hash=73,
     )
+    list(iterator)
     chunk = queue.get(timeout=1)
     assert (
         chunk.text,
@@ -2502,6 +2503,7 @@ def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
     assert kwargs["skip_special_tokens"] is True
     assert args[7] == dict(
         options,
+        manage_wired_limit=False,
         mm_token_type_ids="types",
         prefill_step_size=3072,
         _apc_manager=gen.apc_manager,
@@ -3443,6 +3445,19 @@ def test_v1_stream_endpoints_reject_over_context_before_sse(
         generator.generate.assert_not_called()
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_chat_completions_honours_max_completion_tokens(client, stream):
+    generator = _streaming([_token("ok", finish_reason="stop")])
+    with _endpoint(generator=generator if stream else None) as endpoint:
+        response = _post(client, stream=stream, max_completion_tokens=5)
+    assert response.status_code == 200
+    if stream:
+        max_tokens = generator.generate.call_args.kwargs["args"].max_tokens
+    else:
+        max_tokens = endpoint.generate.call_args.kwargs["max_tokens"]
+    assert max_tokens == 5
+
+
 @pytest.mark.parametrize("encoding", ["base64", "data-uri", "path"])
 def test_chat_completions_decodes_input_audio_base64(client, encoding):
     raw = b"RIFF$\x00\x00\x00WAVEfmt "
@@ -3661,6 +3676,205 @@ def test_anthropic_stream_without_tools_keeps_literal_call_markup(client):
     expected = ordinary.json()["content"][0]["text"]
     assert expected == text
     assert _joined(_deltas(streamed, "messages"), "text") == expected
+
+
+def _anthropic_stream_stop(response):
+    (delta,) = [e["delta"] for e in _data(response) if e.get("type") == "message_delta"]
+    return delta["stop_reason"], delta["stop_sequence"]
+
+
+@pytest.mark.parametrize(
+    "chunks,unread",
+    [
+        (["Hello STOP secret tail"], 0),
+        (["Hello ", "STOP", " secret", " tail"], 2),
+        (["Hello ST", "OP secret", " tail"], 1),
+    ],
+    ids=["one-chunk", "whole-match", "split-match"],
+)
+def test_anthropic_stream_cuts_text_at_stop_sequence(client, chunks, unread):
+    with _endpoint(result=_result("".join(chunks))):
+        ordinary = _post(client, "messages", stop_sequences=["STOP"])
+    tokens = [_token(text) for text in chunks[:-1]]
+    tokens.append(_token(chunks[-1], finish_reason="stop"))
+    remaining = iter(tokens)
+    streamed = _stream_response(
+        client,
+        remaining,
+        "messages",
+        stop_sequences=["NEVER", "STOP"],
+    )
+
+    assert ordinary.json()["content"] == [dict(type="text", text="Hello ")]
+    assert _joined(_deltas(streamed, "messages"), "text") == "Hello "
+    assert _anthropic_stream_stop(streamed) == ("stop_sequence", "STOP")
+    # Generation stops at the match instead of running to the end.
+    assert len(list(remaining)) == unread
+
+
+def test_anthropic_stream_releases_unmatched_stop_prefix(client):
+    tokens = [_token("Hello ST"), _token("AR done", finish_reason="stop")]
+    streamed = _stream_response(client, tokens, "messages", stop_sequences=["STOP"])
+
+    assert _joined(_deltas(streamed, "messages"), "text") == "Hello STAR done"
+    assert _anthropic_stream_stop(streamed) == ("end_turn", None)
+
+
+@pytest.mark.parametrize("previous_call", [False, True])
+@pytest.mark.parametrize("chunking", ["whole", "split-stop", "characters"])
+@pytest.mark.parametrize("finish_reason", [None, "stop"])
+def test_anthropic_stream_discards_tool_calls_after_stop(
+    client, previous_call, chunking, finish_reason
+):
+    before = '<tool_call>{"name":"get_time","arguments":{}}</tool_call>'
+    after = '<tool_call>{"name":"get_weather","arguments":{}}</tool_call>'
+    text = (before if previous_call else "") + "Hello STOP" + after
+    stop_at = text.index("STOP")
+    chunks = {
+        "whole": [text],
+        "split-stop": [text[: stop_at + 2], text[stop_at + 2 :]],
+        "characters": list(text),
+    }[chunking]
+    tokens = [_token(chunk) for chunk in chunks]
+    tokens[-1].finish_reason = finish_reason
+    streamed = _stream_response(
+        client,
+        tokens,
+        "messages",
+        endpoint=dict(parser=_JSON_TOOLS),
+        tools=[_tool(name, "messages") for name in ("get_time", "get_weather")],
+        stop_sequences=["STOP"],
+    )
+
+    assert _joined(_deltas(streamed, "messages"), "text") == "Hello "
+    calls = [
+        event["content_block"]["name"]
+        for event in _data(streamed)
+        if event.get("content_block", {}).get("type") == "tool_use"
+    ]
+    assert calls == (["get_time"] if previous_call else [])
+    assert _anthropic_stream_stop(streamed) == (
+        ("tool_use", None) if previous_call else ("stop_sequence", "STOP")
+    )
+
+
+@pytest.mark.parametrize("reasoning", ["STOP", "STOP <tool_call>example"])
+@pytest.mark.parametrize("previous_call", [False, True])
+def test_anthropic_stream_stop_ignores_thinking_and_tool_arguments(
+    client, reasoning, previous_call
+):
+    before = '<tool_call>{"name":"get_time","arguments":{"text":"STOP"}}</tool_call>'
+    after = '<tool_call>{"name":"get_weather","arguments":{}}</tool_call>'
+    text = (
+        "<think>"
+        + reasoning
+        + "</think>"
+        + (before if previous_call else "")
+        + "Hello STOP"
+        + after
+    )
+    streamed = _stream_response(
+        client,
+        [_token(text, finish_reason="stop")],
+        "messages",
+        endpoint=dict(parser=_JSON_TOOLS),
+        tools=[_tool(name, "messages") for name in ("get_time", "get_weather")],
+        stop_sequences=["STOP"],
+        enable_thinking=True,
+    )
+
+    assert _thinking_text(streamed, "messages") == (reasoning, "Hello ")
+    calls = [
+        event["content_block"]["name"]
+        for event in _data(streamed)
+        if event.get("content_block", {}).get("type") == "tool_use"
+    ]
+    assert calls == (["get_time"] if previous_call else [])
+
+
+@pytest.mark.parametrize(
+    "before,after,sequences,expected",
+    [
+        ("Hello AB", "X", ["ABC", "B"], "Hello A"),
+        ("Hello ST", "OP", ["ST OP"], "Hello "),
+        ("Hello ", "tail", [" "], "Hello"),
+    ],
+)
+def test_anthropic_stream_discards_calls_while_stop_is_buffered(
+    client, before, after, sequences, expected
+):
+    call = '<tool_call>{"name":"get_weather","arguments":{}}</tool_call>'
+    streamed = _stream_response(
+        client,
+        [_token(before), _token(call), _token(after, finish_reason="stop")],
+        "messages",
+        endpoint=dict(parser=_JSON_TOOLS),
+        tools=[_tool(api="messages")],
+        stop_sequences=sequences,
+    )
+
+    assert _joined(_deltas(streamed, "messages"), "text") == expected
+    assert not any(
+        event.get("content_block", {}).get("type") == "tool_use"
+        for event in _data(streamed)
+    )
+    assert _anthropic_stream_stop(streamed) == ("stop_sequence", sequences[-1])
+
+
+def test_anthropic_response_template_discards_tool_calls_after_stop(client):
+    config = NS(model_type="muse_glimmer")
+    call = _MUSE_CALL[_MUSE_CALL.index("<|start|>assistant to=get_weather") :]
+    text = "to=user<|message|>Hello STOP<|eom|>" + call
+    streamed = _stream_response(
+        client,
+        [_token(text, finish_reason="stop")],
+        "messages",
+        endpoint=dict(
+            config=config,
+            processor=NS(config=config, tokenizer=_MuseResponseTemplateTokenizer()),
+            parser=load_tool_module("atem"),
+        ),
+        tools=[_tool(api="messages")],
+        stop_sequences=["STOP"],
+    )
+
+    assert _joined(_deltas(streamed, "messages"), "text") == "Hello "
+    assert not any(
+        event.get("content_block", {}).get("type") == "tool_use"
+        for event in _data(streamed)
+    )
+    assert _anthropic_stream_stop(streamed) == ("stop_sequence", "STOP")
+
+
+@pytest.mark.parametrize("finish_reason", [None, "stop"])
+@pytest.mark.parametrize(
+    "text,sequences,expected,matched",
+    [
+        ("ABCtail", ["ABC", "B"], "", "ABC"),
+        ("ABXtail", ["ABC", "B"], "A", "B"),
+        ("AB", ["ABC", "B"], "A", "B"),
+        ("ABCDtail", ["ABCD", "ABC"], "", "ABCD"),
+        ("ABCXtail", ["ABCD", "ABC"], "", "ABC"),
+        ("ABCDtail", ["ABC", "ABCD"], "", "ABC"),
+        ("Hello ST", ["STOP"], "Hello ST", None),
+    ],
+)
+def test_anthropic_stream_overlapping_stops_are_chunk_independent(
+    client, text, sequences, expected, matched, finish_reason
+):
+    chunkings = [[text], list(text)]
+    chunkings.extend([text[:split], text[split:]] for split in range(1, len(text)))
+    for chunks in chunkings:
+        tokens = [_token(chunk) for chunk in chunks]
+        tokens[-1].finish_reason = finish_reason
+        streamed = _stream_response(
+            client, tokens, "messages", stop_sequences=sequences
+        )
+        assert _joined(_deltas(streamed, "messages"), "text") == expected, chunks
+        assert _anthropic_stream_stop(streamed) == (
+            "stop_sequence" if matched else "end_turn",
+            matched,
+        ), chunks
 
 
 ANTHROPIC_TOOLS = [_tool(name, "messages") for name in ("get_time", "get_weather")]
@@ -5828,7 +6042,7 @@ class _Batch:
     def remove(self, uid):
         return self.active.pop(uid, None) is not None
 
-    def next(self, **kwargs):
+    def decode_step(self):
         self.sizes.append(len(self.active))
         responses = []
         for uid, step in sorted(self.active.items()):
@@ -5845,7 +6059,10 @@ class _Batch:
                 del self.active[uid]
             else:
                 self.active[uid] += 1
-        return [], responses
+        return responses
+
+    def prefill_step(self):
+        return []
 
 
 class _IdleBatch(_Batch):
@@ -5963,9 +6180,10 @@ def _step_tokens(tokenizer, responses, *, progress=(), trim_space=True):
             cached_tokens=0,
         )
     }
+    gen._step(NS(decode_step=lambda: [], prefill_step=lambda: progress), active)
     for token, finish in responses:
         row = NS(uid=1, token=token, token_logprob=0.0, finish_reason=finish)
-        gen._step(NS(next=lambda **kw: (progress, [row])), active)
+        gen._step(NS(decode_step=lambda: [row], prefill_step=lambda: []), active)
     return list(queue.queue)
 
 
@@ -6228,6 +6446,31 @@ class TestResponseGenerator:
         thread.join(timeout=1.0)
         assert not thread.is_alive()
         assert isinstance(result[0], StopIteration)
+
+    def test_step_publishes_completed_response_before_failing_prefill(self):
+        gen, queue = _generator(), Queue()
+        active = {
+            1: dict(
+                rqueue=queue,
+                streamer=NS(advance=lambda *args: "ready"),
+                prompt_tps=10.0,
+                cached_tokens=0,
+            )
+        }
+        response = NS(uid=1, token=7, token_logprob=0.0, finish_reason="length")
+
+        def prefill_step():
+            token = queue.get_nowait()
+            assert token.text == "ready"
+            assert token.token == 7
+            assert token.finish_reason == "length"
+            assert queue.get_nowait() is None
+            assert 1 not in active
+            raise RuntimeError("unrelated prefill failed")
+
+        batch = NS(decode_step=lambda: [response], prefill_step=prefill_step)
+        with pytest.raises(RuntimeError, match="unrelated prefill failed"):
+            gen._step(batch, active)
 
     def test_step_streams_spm_subword_tokens_immediately(self):
         tokenizer = NS(
@@ -6591,8 +6834,17 @@ class TestResponseGenerator:
             ),
             ({}, "1", dict(enable_thinking=True)),
             ({}, "0", dict(enable_thinking=False)),
+            (dict(max_completion_tokens=5), "0", dict(max_tokens=5)),
+            (dict(max_tokens=256, max_completion_tokens=5), "0", dict(max_tokens=5)),
         ],
-        ids=["explicit", "effort", "default-on", "default-off"],
+        ids=[
+            "explicit",
+            "effort",
+            "default-on",
+            "default-off",
+            "max-completion-tokens",
+            "max-completion-tokens-wins",
+        ],
     )
     def test_build_generation_arguments(self, monkeypatch, options, env, expected):
         monkeypatch.setenv("MLX_VLM_ENABLE_THINKING", env)
@@ -10231,7 +10483,9 @@ def test_prefill_memory_error_only_fails_the_refused_request():
     refused, peer = Queue(), Queue()
     active = {10: {"rqueue": refused}, 11: {"rqueue": peer}}
     error = APCAdmissionError("Cannot fit prefill", uid=10)
-    engine = SimpleNamespace(next=Mock(side_effect=error), remove=Mock())
+    engine = SimpleNamespace(
+        decode_step=lambda: [], prefill_step=Mock(side_effect=error), remove=Mock()
+    )
     generator = ResponseGenerator.__new__(ResponseGenerator)
     generator._step(engine, active)
     assert list(active) == [11]
@@ -10239,3 +10493,230 @@ def test_prefill_memory_error_only_fails_the_refused_request():
     assert refused.get_nowait() is None
     assert peer.empty()
     engine.remove.assert_called_once_with(10)
+
+
+@pytest.fixture(
+    params=[
+        "llada2_moe",
+        "nemotron_labs_diffusion",
+        "diffusion_gemma",
+        "diffusion_gemma_apc",
+    ]
+)
+def diffusion_worker(request, monkeypatch):
+    from mlx_vlm.models import llada2_moe, nemotron_labs_diffusion
+    from mlx_vlm.tests.test_diffusion_models import (
+        FakeProcessor,
+        _llada_config,
+        make_diffusion_model,
+    )
+
+    mx.random.seed(0)
+    if request.param.startswith("diffusion_gemma"):
+        model = make_diffusion_model()
+        model.config.eos_token_id = 999999
+    elif request.param == "llada2_moe":
+        model = llada2_moe.Model(_llada_config(eos_token_id=999999))
+    else:
+        config = nemotron_labs_diffusion.ModelConfig(
+            model_type="nemotron_labs_diffusion",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            max_position_embeddings=128,
+            eos_token_id=999999,
+            mask_token_id=127,
+            default_generation_mode="diffusion",
+            rope_parameters={
+                "rope_type": "default",
+                "rope_theta": 1000000.0,
+                "llama_4_scaling_beta": 0.1,
+                "original_max_position_embeddings": 64,
+            },
+        )
+        model = nemotron_labs_diffusion.Model(config)
+    # Cross-thread lazy parameter initialization is invalid on MLX.
+    mx.eval(model.parameters())
+    processor = FakeProcessor()
+    manager = None
+    tokens = [4, 5]
+    if request.param.endswith("_apc"):
+        tokens = list(range(2, 13))
+        manager = apc.APCManager(
+            num_blocks=64,
+            block_size=2,
+            overrides={"checkpoint_interval_tokens": 4, "reserve_gb": 0},
+        )
+        manager.exact_cache_min_tokens = 1
+    monkeypatch.setattr(
+        generation,
+        "load_model_resources",
+        lambda *a, **k: (model, processor, model.config),
+    )
+    monkeypatch.setattr(
+        Generator,
+        "_preprocess_request",
+        lambda *a, **k: {"input_ids": mx.array([tokens], mx.int32)},
+    )
+    monkeypatch.setattr(
+        Generator, "_make_thinking_budget_criteria", lambda *a, **k: None
+    )
+    worker = Generator("tiny-diffusion-resume", apc_manager=manager)
+    worker.wait_until_ready(timeout=10)
+    try:
+        yield worker
+    finally:
+        worker.stop_and_join()
+
+
+@pytest.mark.parametrize("temperature", [0.0, 0.7])
+def test_diffusion_resume_preserves_blocks_and_serves_other_requests(
+    diffusion_worker, temperature
+):
+    worker = diffusion_worker
+    args = Args(
+        max_tokens=12,
+        block_length=4,
+        max_denoising_steps=4,
+        temperature=temperature,
+        seed=47,
+    )
+    _, baseline_reader = worker.generate("prompt", args=args)
+    baseline = list(baseline_reader)
+
+    class PausingSession(sessions.InferenceSession):
+        def put(self, token):
+            super().put(token)
+            if len(self.history) in (1, 2) and token is not None:
+                self.pause(self.lease)
+
+    session = PausingSession()
+    _, reader = worker.generate("prompt", args=args, session=session)
+    resumed = []
+    for cursor in (0, 1):
+        resumed.append(next(reader))
+        reader.close()
+        assert session.paused
+        count = len(session.history)
+        elapsed = session.generation_time
+        # Same worker and model, different random sequence. It must complete
+        # while the first generation remains paused at its committed block.
+        _, other_reader = worker.generate(
+            "other",
+            args=Args(
+                max_tokens=5,
+                block_length=4,
+                max_denoising_steps=4,
+                temperature=0.7,
+                seed=81,
+            ),
+        )
+        other = list(other_reader)
+        assert other[-1].finish_reason == "length"
+        assert len(session.history) == count
+        assert session.generation_time == elapsed
+        lease = session.claim()
+        reader = session.reader(cursor=cursor + 1, lease=lease, timeout=10)
+    resumed.extend(reader)
+    assert [(t.text, t.token, t.token_count, t.finish_reason) for t in resumed] == [
+        (t.text, t.token, t.token_count, t.finish_reason) for t in baseline
+    ]
+    assert resumed[-1].generation_tokens == 12
+    assert session.finished
+    if worker.apc_manager is not None:
+        assert resumed[0].cached_tokens == 10
+        assert worker.apc_manager.stats.hits > 0
+
+
+@pytest.mark.parametrize("action", ["expire", "dispose", "unload", "cancel"])
+def test_diffusion_releases_stopped_generator(diffusion_worker, monkeypatch, action):
+    worker = diffusion_worker
+    closed = Event()
+    first_block = Event()
+    original = worker.model.language_model.generate_blocks
+
+    def tracked(*args, **kwargs):
+        try:
+            return (yield from original(*args, **kwargs))
+        finally:
+            closed.set()
+
+    monkeypatch.setattr(worker.model.language_model, "generate_blocks", tracked)
+
+    class PausingSession(sessions.InferenceSession):
+        def put(self, token):
+            super().put(token)
+            if self.history:
+                self.pause(self.lease)
+                first_block.set()
+
+    session = PausingSession()
+    ctx, reader = worker.generate(
+        "prompt",
+        args=Args(
+            max_tokens=12,
+            block_length=4,
+            max_denoising_steps=4,
+            seed=47,
+        ),
+        session=session,
+    )
+    assert first_block.wait(10)
+    assert next(reader).token_count > 0
+    reader.close()
+    if action == "expire":
+        session.touched -= session.ttl + 1
+    elif action == "dispose":
+        session.dispose()
+    elif action == "unload":
+        worker.stop_and_join()
+    else:
+        worker._cancel(ctx.uid)
+    assert closed.wait(5)
+    assert session.finished or session.error is not None
+    if action != "cancel":
+        with pytest.raises(ValueError):
+            session.claim()
+
+
+@pytest.mark.parametrize("api", ["chat", "responses"])
+def test_diffusion_http_checkpoint_replays_without_regeneration(
+    diffusion_worker, client, monkeypatch, api
+):
+    worker = diffusion_worker
+    monkeypatch.setattr(continuation, "CHECKPOINTS", continuation.Checkpoints())
+    options = dict(
+        stream=True,
+        max_tokens=12,
+        max_output_tokens=12,
+        block_length=4,
+        max_denoising_steps=4,
+        temperature=0.7,
+        seed=47,
+    )
+
+    def text(response):
+        if api == "responses":
+            return _data(response)[-1]["response"]["output_text"]
+        return "".join(d.get("content") or "" for d in _deltas(response))
+
+    with _endpoint(generator=worker):
+        original = _post(client, api, resumable=True, **options)
+        assert original.status_code == 200
+        checkpoint = next(
+            e["continuation"]
+            for e in _data(original)
+            if e.get("continuation", {}).get("cursor") == 1
+            and e["continuation"]["content"] > 0
+        )
+        monkeypatch.setattr(
+            worker, "generate", Mock(side_effect=AssertionError("restarted generation"))
+        )
+        resumed = _post(client, api, continuation=checkpoint, **options)
+        assert resumed.status_code == 200
+        assert text(original)[: checkpoint["content"]] + text(resumed) == text(original)
+        worker.generate.assert_not_called()

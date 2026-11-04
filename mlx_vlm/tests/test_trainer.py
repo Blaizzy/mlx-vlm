@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, Mock, patch
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
+from mlx.utils import tree_flatten
 
 from mlx_vlm.tests.test_models import tiny_config
 from mlx_vlm.trainer.datasets.next_token import VisionDataset
@@ -19,6 +20,7 @@ from mlx_vlm.trainer.peft.lora_layers import LoRALinear
 from mlx_vlm.trainer.peft.utils import (
     apply_lora_layers,
     find_all_linear_names,
+    freeze_model,
     get_peft_model,
 )
 from mlx_vlm.trainer.vlm.sft.trainer import (
@@ -266,6 +268,16 @@ def test_get_peft_model(monkeypatch):
         "language_model.layer1",
         "language_model.layer2",
     }
+
+
+@pytest.mark.parametrize("encoder", ["visual", "vision", "vision_encoder"])
+def test_freeze_model_freezes_encoder(encoder):
+    # e.g. PaddleOCR-VL keeps its vision tower in `visual`
+    model = nn.Module()
+    model.language_model = nn.Linear(4, 4)
+    setattr(model, encoder, nn.Linear(4, 4))
+    freeze_model(model)
+    assert tree_flatten(model.trainable_parameters()) == []
 
 
 def test_find_all_linear_names():

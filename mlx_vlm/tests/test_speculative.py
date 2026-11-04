@@ -268,7 +268,8 @@ def test_mistral_dspark_ragged_rollback_includes_shared_and_index_only_caches():
 
 @parametrize("cancel", [False, True])
 @parametrize("sampling", ["greedy", "random", "positioned"])
-def test_mistral_dspark_admits_requests_while_batch_is_active(cancel, sampling):
+@parametrize("phased", [False, True])
+def test_mistral_dspark_admits_requests_while_batch_is_active(cancel, sampling, phased):
     from types import SimpleNamespace
 
     from mlx_vlm.generate.ar import BatchGenerator
@@ -314,7 +315,9 @@ def test_mistral_dspark_admits_requests_while_batch_is_active(cancel, sampling):
         for _ in range(100):
             if not generator.has_work:
                 break
-            _, responses = generator.next()
+            responses = generator.decode_step() if phased else generator.next()[1]
+            if phased:
+                generator.prefill_step()
             for response in responses:
                 if response.token is not None:
                     outputs[response.uid].append(response.token)
@@ -339,8 +342,9 @@ def test_mistral_dspark_admits_requests_while_batch_is_active(cancel, sampling):
 @parametrize("family", ["dflash2", "dspark-lfm2", "mistral", "gemma"])
 @parametrize("pause_after", [1, 8])
 @parametrize("sampling", [False, True])
+@parametrize("phased", [False, True])
 def test_speculative_row_resume_preserves_state_and_other_requests(
-    family, pause_after, sampling
+    family, pause_after, sampling, phased
 ):
     from mlx_vlm.sample_utils import make_sampler
 
@@ -380,7 +384,9 @@ def test_speculative_row_resume_preserves_state_and_other_requests(
     )
 
     def step():
-        _, responses = generator.next()
+        responses = generator.decode_step() if phased else generator.next()[1]
+        if phased:
+            generator.prefill_step()
         for response in responses:
             if response.token is not None:
                 outputs[response.uid].append(response.token)
@@ -647,7 +653,10 @@ def test_mtp_ragged_acceptance_respects_remaining_token_budgets(monkeypatch):
 @parametrize("family", ["qwen", "glm", "deepseek", "gemma"])
 @parametrize("pause_after", [1, 8])
 @parametrize("sampling", [False, True, "positioned"])
-def test_mtp_shared_resume_preserves_rows(family, pause_after, sampling, monkeypatch):
+@parametrize("phased", [False, True])
+def test_mtp_shared_resume_preserves_rows(
+    family, pause_after, sampling, monkeypatch, phased
+):
     from mlx_vlm.models.cache import cache_nbytes
     from mlx_vlm.sample_utils import make_sampler
     from mlx_vlm.server.generation import _PositionedTargetSampler
@@ -696,7 +705,9 @@ def test_mtp_shared_resume_preserves_rows(family, pause_after, sampling, monkeyp
     )
 
     def step():
-        _, responses = generator.next()
+        responses = generator.decode_step() if phased else generator.next()[1]
+        if phased:
+            generator.prefill_step()
         for response in responses:
             if response.token is not None:
                 outputs[response.uid].append(response.token)
@@ -931,9 +942,72 @@ def test_mistral_dspark_verifier_matches_decode(dtype, batch):
     )
 
 
+@parametrize("dtype", [mx.float16, mx.bfloat16, mx.float32])
+@parametrize("batch", [2, 5])
+def test_mistral_dspark_projection_preserves_singleton_row(dtype, batch):
+    from mlx_vlm.models.mistral_large4 import speculative_verifier as verifier
+    from mlx_vlm.models.mistral_large4.language import decode_linear
+
+    mx.random.seed(83)
+    for k, n in [(6144, 512), (512, 6144)]:
+        module = nn.Linear(k, n, bias=False)
+        module.weight = mx.random.normal((n, k)).astype(dtype)
+        module.eval()
+        inputs = mx.random.normal((batch, 4, k)).astype(dtype)
+        if verifier.native_wide_linear(module.weight, inputs) is None:
+            pytest.skip("Native wide-GEMV is unavailable on this device")
+        equal(
+            verifier.linear(module, inputs[-1:]), verifier.linear(module, inputs)[-1:]
+        )
+        ordinary = mx.concatenate(
+            [decode_linear(module, inputs[-1:, t : t + 1]) for t in range(4)], axis=1
+        )
+        equal(verifier.linear(module, inputs[-1:]), ordinary)
+
+
 @pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
 @parametrize("prefix,topk", [(3, 2048), (127, 2048), (255, 2048), (127, 128)])
-@parametrize("batch,length", [(2, 1), (2, 4), (8, 2), (8, 4)])
+@parametrize("padding", [0, 3])
+def test_mistral_dspark_verifier_preserves_singleton_row(prefix, topk, padding):
+    from mlx_vlm.models.mistral_large4 import speculative_verifier as verifier
+
+    mx.random.seed(79)
+    model, _ = mistral_dspark_case()
+    model.set_dtype(mx.bfloat16)
+    if (
+        verifier.native_wide_linear(
+            model.lm_head.weight, mx.zeros((2, 1, model.args.hidden_size), mx.bfloat16)
+        )
+        is None
+    ):
+        pytest.skip("Native wide-GEMV is unavailable on this device")
+    for layer in model.layers:
+        if layer.attention.indexer is not None:
+            layer.attention.indexer.topk = topk
+    batched = [c.to_batch([0, padding]) for c in model.make_cache()]
+    mx.eval(model(mx.random.randint(1, 60, (2, prefix)), cache=batched).logits)
+    single = deepcopy(batched)
+    for c in single:
+        c.filter(mx.array([1], mx.int32))
+
+    # Compare the same inputs and evolving accepted cache, not free-running text.
+    for _ in range(3):
+        inputs = mx.random.randint(1, 60, (2, 4))
+        bh, bn, bt = verifier.verify_hidden(model, inputs, batched, [0, 1, 2, 3])
+        sh, sn, st = verifier.verify_hidden(model, inputs[1:], single, [0, 1, 2, 3])
+        equal(sh, [h[1:] for h in bh])
+        equal(verifier.verify_logits(model, sn), verifier.verify_logits(model, bn)[1:])
+        bt.commit([2, 2])
+        st.commit([2])
+        for b, s in zip(batched, single):
+            b, s = b.extract(1), s.extract(0)
+            equal(b.state, s.state)
+            assert b.meta_state == s.meta_state
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
+@parametrize("prefix,topk", [(3, 2048), (127, 2048), (255, 2048), (127, 128)])
+@parametrize("batch,length", [(1, 1), (1, 4), (2, 1), (2, 4), (8, 2), (8, 4)])
 @parametrize("ragged", [False, True])
 def test_mistral_dspark_verifier_preserves_hidden_logits_and_cache(
     prefix, topk, batch, length, ragged
@@ -2690,6 +2764,42 @@ def test_eagle3_draft_replay(accepted):
     assert drafter._draft_to_target(mx.array([[0, 1, 3]]), mx.int32).tolist() == [
         [0, 2, 6]
     ]
+
+
+def eagle3_drafter(hidden_size=16):
+    arch = module("speculative.drafters.eagle3")
+    cfg = arch.ModelConfig(
+        transformer_layer_config=values(
+            intermediate_size=32, head_dim=8, hidden_size=hidden_size
+        ),
+        **DATA["eagle3"],
+    )
+    return arch.Model(cfg)
+
+
+def test_eagle3_bind_without_embed_tokens():
+    # SGLang EAGLE-3 drafters ship no embedding; load_model sets it to None.
+    drafter = eagle3_drafter()
+    drafter.embed_tokens = None
+    target_embed = nn.Embedding(32, 16)
+    drafter.bind(NS(model=NS(embed_tokens=target_embed)))
+    assert drafter.embed_tokens is target_embed
+
+    drafter.embed_tokens = None
+    with pytest.raises(AttributeError, match="embed_tokens"):
+        drafter.bind(NS())
+
+
+def test_eagle3_bind_quantized_target_embedding():
+    drafter = eagle3_drafter(hidden_size=64)
+    target_embed = nn.QuantizedEmbedding(32, 64)
+    drafter.bind(NS(embed_tokens=target_embed))
+    assert drafter.embed_tokens is target_embed
+
+    # A target embedding with a different vocab is not shared.
+    own_embed = drafter.embed_tokens = nn.Embedding(32, 64)
+    drafter.bind(NS(embed_tokens=nn.QuantizedEmbedding(48, 64)))
+    assert drafter.embed_tokens is own_embed
 
 
 @parametrize("offsets,length", [([128], 8), ([10], 6), ([5, 8], 8), ([128, 10], 8)])

@@ -8,6 +8,7 @@ from ..base import (
     cache_position_offset,
     create_attention_mask,
     kv_sequence_length,
+    project_logits,
     scaled_dot_product_attention,
 )
 from ..cache import KVCache
@@ -514,10 +515,12 @@ class LanguageModel(nn.Module):
         out = self.model(
             inputs, cache=cache, inputs_embeds=inputs_embeds, position_ids=position_ids
         )
-        if self.args.tie_word_embeddings:
-            out = self.model.embed_tokens.as_linear(out)
-        else:
-            out = self.lm_head(out)
+        projection = (
+            self.model.embed_tokens.as_linear
+            if self.args.tie_word_embeddings
+            else self.lm_head
+        )
+        out = project_logits(out, projection, kwargs.get("logits_to_keep"))
         return LanguageModelOutput(logits=out)
 
     @property
