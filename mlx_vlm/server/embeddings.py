@@ -153,9 +153,13 @@ def register_routes(app, deps):
                 model, processor, *_ = get_cached_model(
                     model_id, model_kind="embedding"
                 )
-                if all(kind == "text" for kind, _ in items):
-                    return _embed(model, processor, [value for _, value in items])
-                return _embed_items(model, processor, items)
+                try:
+                    if all(kind == "text" for kind, _ in items):
+                        return _embed(model, processor, [value for _, value in items])
+                    return _embed_items(model, processor, items)
+                finally:
+                    # Embeddings keep no KV state; free buffers of varying sizes.
+                    mx.clear_cache()
 
             vectors, prompt_tokens = await asyncio.to_thread(_work)
             if body.encoding_format == "base64":
