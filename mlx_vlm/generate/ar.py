@@ -806,6 +806,19 @@ def _concat_prompt_kwarg_rows(key: str, rows: List[mx.array]) -> mx.array:
     return mx.concatenate(rows, axis=0)
 
 
+# Sequence-aligned kwargs where an all-zero row means "text only".
+_ZERO_FILL_PROMPT_KWARGS = {"mm_token_type_ids", "token_type_ids", "visual_pos_masks"}
+
+
+def _stack_prompt_kwarg_rows(key: str, rows: dict, batch_size: int) -> mx.array:
+    """Stack ``{row_idx: row}`` kwargs, zero-filling rows that lack a mask key."""
+    if key in _ZERO_FILL_PROMPT_KWARGS and len(rows) < batch_size:
+        ref = next(iter(rows.values()))
+        filler = mx.zeros(ref.shape, dtype=ref.dtype)
+        rows = {i: rows.get(i, filler) for i in range(batch_size)}
+    return _concat_prompt_kwarg_rows(key, [rows[i] for i in sorted(rows)])
+
+
 def _merge_prefill_prompt_kwargs(
     prompt_kwargs_list: List[Optional[dict]],
     input_ids: List[List[int]],
@@ -847,11 +860,11 @@ def _merge_prefill_prompt_kwargs(
                     row_v = _pad_sequence_aligned_prompt_kwarg(
                         k, row_v, max_length, left=True
                     )
-                per_row_keys.setdefault(k, []).append(row_v)
+                per_row_keys.setdefault(k, {})[i] = row_v
             elif k not in merged_kwargs:
                 merged_kwargs[k] = v
     for k, vs in per_row_keys.items():
-        merged_kwargs[k] = _concat_prompt_kwarg_rows(k, vs)
+        merged_kwargs[k] = _stack_prompt_kwarg_rows(k, vs, batch_size)
 
     return inputs_embeds, merged_kwargs
 
@@ -3127,11 +3140,11 @@ class BatchGenerator:
                             max_suffix_len,
                             left=False,
                         )
-                    per_row_keys.setdefault(k, []).append(row_v)
+                    per_row_keys.setdefault(k, {})[i] = row_v
                 elif k not in merged_kwargs:
                     merged_kwargs[k] = v
         for k, vs in per_row_keys.items():
-            merged_kwargs[k] = _concat_prompt_kwarg_rows(k, vs)
+            merged_kwargs[k] = _stack_prompt_kwarg_rows(k, vs, batch_size)
 
         apc_mode = getattr(self, "apc_mode", "block")
         # bits + group_size + scheme so warm restore matches live _make_cache
