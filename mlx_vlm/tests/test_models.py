@@ -3990,6 +3990,133 @@ def test_paddleocr_vl_text_only_rope_deltas_ignore_left_padding():
     assert result.rope_deltas.tolist() == [[0], [0]]
 
 
+@pytest.fixture(params=["text", "image"])
+def paddleocr_vl_generation_case(request):
+    module = importlib.import_module("mlx_vlm.models.paddleocr_vl")
+    case = model_case("TestGetInputEmbeddings.paddleocr_vl_input_embeddings")
+    config = build_config(module, case["config"])
+    config.text_config.rope_scaling = {"type": "default", "mrope_section": [1, 1, 2]}
+    config.text_config.use_bias = False
+    config.image_token_id = 29
+    config.vision_start_token_id = 28
+    mx.random.seed(17)
+    model = module.Model(config)
+    model.eval()
+    mx.eval(model.parameters())
+    ids = mx.array([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]], mx.int32)
+    media = {}
+    if request.param == "image":
+        ids = mx.array([[1, 28, 29, 29, 29, 29, 2, 3, 4, 5]], mx.int32)
+        vision = config.vision_config
+        media = {
+            "image_grid_thw": mx.array([[1, 4, 4]]),
+            "pixel_values": mx.zeros(
+                (1, 16, vision.num_channels, vision.patch_size, vision.patch_size)
+            ),
+            "cached_image_features": mx.arange(64).reshape(4, 16) / 100.0,
+        }
+    return model, ids, media
+
+
+@pytest.mark.parametrize("prefill_step_size", [3, 2048])
+@pytest.mark.parametrize("eager_rope", [False, True])
+def test_paddleocr_vl_chunked_generation_positions(
+    paddleocr_vl_generation_case, prefill_step_size, eager_rope, monkeypatch
+):
+    from mlx_vlm.generate import generate_step
+    from mlx_vlm.models import rope_utils
+
+    model, ids, media = paddleocr_vl_generation_case
+    if eager_rope:
+        monkeypatch.setattr(rope_utils, "_HAS_METAL", False)
+    positions, _ = model.language_model.get_rope_index(
+        ids, image_grid_thw=media.get("image_grid_thw")
+    )
+    observed = []
+    rope_type = type(model.language_model.model.rotary_emb)
+    original = rope_type.__call__
+
+    def record_positions(self, hidden, position_ids):
+        # The Metal kernel can silently accept a too-long position table.
+        assert position_ids.shape[-1] == hidden.shape[1]
+        observed.append(position_ids)
+        return original(self, hidden, position_ids)
+
+    monkeypatch.setattr(rope_type, "__call__", record_positions)
+
+    def generate(step):
+        return list(
+            generate_step(
+                ids,
+                model,
+                mask=None,
+                max_tokens=1,
+                temperature=0,
+                prefill_step_size=step,
+                **{"pixel_values": None, **media},
+            )
+        )
+
+    actual = generate(prefill_step_size)
+    # Concatenate the positions used by every prefill chunk, including the
+    # final one-token forward, and check the first subsequent decode position.
+    used = mx.concatenate(observed, axis=-1)
+    np.testing.assert_array_equal(used[..., : ids.shape[1]], positions)
+    np.testing.assert_array_equal(used[..., ids.shape[1]], positions.max() + 1)
+    expected = generate(None)
+    assert actual[0][0] == expected[0][0]
+    ModelChecks().assert_close(actual[0][1], expected[0][1], logits=True)
+
+
+def test_paddleocr_vl_interleaved_prefill_positions(paddleocr_vl_generation_case):
+    from mlx_vlm.generate import PromptProcessingBatch
+
+    model, ids, media = paddleocr_vl_generation_case
+
+    def prompt(size):
+        batch_ids = mx.repeat(ids, size, axis=0)
+        features = model.get_input_embeddings(
+            batch_ids,
+            **{k: mx.concatenate([v] * size, axis=0) for k, v in media.items()},
+        )
+        return PromptProcessingBatch(
+            model=model.language_model,
+            uids=list(range(size)),
+            input_ids=batch_ids.tolist(),
+            max_tokens=[3] * size,
+            inputs_embeds=features.inputs_embeds,
+            prompt_kwargs={
+                k: v
+                for k, v in features.to_dict().items()
+                if k != "inputs_embeds" and v is not None
+            },
+            prefill_step_size=3,
+        )
+
+    def finish(batch):
+        while batch.needs_processing():
+            batch.prompt_step()
+        return batch.generate(
+            sampler=lambda logits: mx.argmax(logits, axis=-1),
+            stop_criteria=[lambda _: False] * len(batch.uids),
+            compute_logprobs=False,
+        )
+
+    expected = finish(prompt(3))
+    decoding = finish(prompt(2))
+    prefill = prompt(3)
+    prefill.prompt_step()
+    # Decode writes two rows of shared RoPE state between three-row chunks.
+    decoding._step()
+    actual = finish(prefill)
+    np.testing.assert_array_equal(actual._rope_deltas, expected._rope_deltas)
+    for actual_cache, expected_cache in zip(actual.prompt_cache, expected.prompt_cache):
+        np.testing.assert_allclose(actual_cache.keys, expected_cache.keys, atol=1e-6)
+        np.testing.assert_allclose(
+            actual_cache.values, expected_cache.values, atol=1e-6
+        )
+
+
 # Patch embedding layouts
 
 
