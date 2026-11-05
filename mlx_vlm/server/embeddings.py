@@ -153,9 +153,14 @@ def register_routes(app, deps):
                 model, processor, *_ = get_cached_model(
                     model_id, model_kind="embedding"
                 )
-                if all(kind == "text" for kind, _ in items):
-                    return _embed(model, processor, [value for _, value in items])
-                return _embed_items(model, processor, items)
+                try:
+                    if all(kind == "text" for kind, _ in items):
+                        return _embed(model, processor, [value for _, value in items])
+                    return _embed_items(model, processor, items)
+                finally:
+                    # Variable-length inputs leave buffers that are rarely
+                    # reusable, so the MLX cache would otherwise grow unbounded.
+                    mx.clear_cache()
 
             vectors, prompt_tokens = await asyncio.to_thread(_work)
             if body.encoding_format == "base64":

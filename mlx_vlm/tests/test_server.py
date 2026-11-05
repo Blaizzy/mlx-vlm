@@ -1677,6 +1677,24 @@ class TestEmbeddingEncoding:
             else:
                 assert item["embedding"] == vector
 
+    @pytest.mark.parametrize("fails", [False, True])
+    def test_clears_mlx_cache(self, client, fails):
+        kwargs = (
+            dict(side_effect=ValueError("boom"))
+            if fails
+            else dict(return_value=([[1.0]], 1))
+        )
+        with (
+            patch.object(server, "get_cached_model", return_value=(None, None)),
+            patch.object(embeddings, "_embed", **kwargs),
+            patch.object(embeddings.mx, "clear_cache") as clear_cache,
+        ):
+            response = client.post(
+                "/v1/embeddings", json=dict(input="text", model="embedding")
+            )
+        assert response.status_code == (400 if fails else 200)
+        clear_cache.assert_called_once_with()
+
     @pytest.mark.parametrize("encoding", ["binary", ""])
     def test_invalid_encoding(self, client, encoding):
         with patch.object(server, "get_cached_model") as load:
