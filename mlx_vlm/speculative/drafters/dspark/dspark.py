@@ -82,6 +82,8 @@ class DSparkDraftModel(DFlashDraftModel):
 
     def __init__(self, config: DSparkConfig):
         super().__init__(config)
+        self._proposal_head_cache = None
+        self._shared_embed_tokens = None
         self.prefer_requested_block_size = config.block_size_policy == "fixed"
         self.dflash_initial_block_size = config.dflash_initial_block_size
         self.markov_head = VanillaMarkov(config.vocab_size, config.markov_rank)
@@ -118,7 +120,53 @@ class DSparkDraftModel(DFlashDraftModel):
 
     def bind(self, target_model) -> "DSparkDraftModel":
         self.validate_target_compatibility(target_model)
+        shared_embeddings = (
+            self.embed_tokens is None or self.embed_tokens is self._shared_embed_tokens
+        )
+        if shared_embeddings:
+            self.embed_tokens = None
         super().bind(target_model)
+        if shared_embeddings:
+            self._shared_embed_tokens = self.embed_tokens
+        bits, group_size = (
+            self.config.proposal_head_bits,
+            self.config.proposal_head_group_size,
+        )
+        if bits is None:
+            self._proposal_head_cache = None
+            return self
+        head = self.lm_head
+        if type(head) is not nn.Linear:
+            raise ValueError(
+                "DSpark proposal-head quantization requires an nn.Linear target head."
+            )
+        bias = getattr(head, "bias", None)
+        cached = self._proposal_head_cache
+        if (
+            cached is None
+            or cached[0] is not head.weight
+            or cached[1] is not bias
+            or cached[2:4] != (bits, group_size)
+        ):
+            # Binding may happen after sampling is seeded. Avoid random weights
+            # from QuantizedLinear.__init__ while preparing this derived head.
+            proposal = nn.QuantizedLinear.__new__(nn.QuantizedLinear)
+            nn.Module.__init__(proposal)
+            proposal.group_size, proposal.bits, proposal.mode = (
+                group_size,
+                bits,
+                "affine",
+            )
+            proposal.weight, proposal.scales, proposal.biases = mx.quantize(
+                head.weight, group_size=group_size, bits=bits
+            )
+            if bias is not None:
+                proposal.bias = bias
+            proposal.freeze()
+            mx.eval(proposal.parameters())
+            cached = (head.weight, bias, bits, group_size, proposal)
+            self._proposal_head_cache = cached
+        self.lm_head = cached[4]
         return self
 
     def confidence(

@@ -83,6 +83,7 @@ class TextConfig(BaseModelConfig):
     attention_bias: bool = False
     hidden_act: str = "silu"
     full_attention_interval: int = 4
+    use_simd_verifier: bool = False
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
@@ -174,6 +175,7 @@ class ModelConfig(BaseModelConfig):
                 "linear_value_head_dim",
                 "linear_conv_kernel_dim",
                 "full_attention_interval",
+                "use_simd_verifier",
                 "rope_scaling",
                 "rope_parameters",
                 "tie_word_embeddings",

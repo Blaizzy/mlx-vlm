@@ -114,6 +114,7 @@ class LanguageModel(Qwen3_5LanguageModel):
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         nn.Module.__init__(self)
         self.args = args
+        self.use_simd_verifier = getattr(args, "use_simd_verifier", False)
         self.config = config
         self.model_type = args.model_type
         self.model = Qwen3_5MoeModel(args)

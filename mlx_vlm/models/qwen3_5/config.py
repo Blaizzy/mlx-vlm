@@ -87,6 +87,7 @@ class TextConfig(BaseModelConfig):
         }
     )
     full_attention_interval: int = 4
+    use_simd_verifier: bool = False
 
     def __post_init__(self):
         if self.rope_parameters:
