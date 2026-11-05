@@ -42,7 +42,7 @@ include = ["mlx_vlm*"]
 exclude = ["mlx_vlm.tests*"]
 
 [tool.setuptools.package-data]
-mlx_vlm = ["py.typed"]
+mlx_vlm = ["py.typed", "models/gemma4/chat_template.jinja"]
 
 [tool.setuptools.dynamic]
 version = {attr = "mlx_vlm.version.__version__"}
