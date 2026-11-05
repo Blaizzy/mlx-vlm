@@ -1499,6 +1499,25 @@ def test_model_contract(case):
         getattr(checks, kind)(*args, **kwargs)
 
 
+@pytest.mark.parametrize("name", ["qwen3_vl", "qwen3_vl_moe"])
+def test_qwen3_vl_deepstack_eval_skipped_while_training(name):
+    # Forcing DeepStack features inside value_and_grad keeps the vision graph live.
+    case = model_case(f"TestGetInputEmbeddings.{name}_input_embeddings")
+    module = importlib.import_module("mlx_vlm.models." + case["module"])
+    model = module.Model(build_config(module, case["config"]))
+    vc = model.config.vision_config
+    count = 16 // vc.spatial_merge_size**2
+    ids = mx.array([[1] + [model.config.image_token_id] * count + [2]])
+    pixels = mx.zeros((16, vc.in_channels * vc.temporal_patch_size * vc.patch_size**2))
+    media = {"pixel_values": pixels, "image_grid_thw": mx.array([[1, 4, 4]])}
+    for training, expected in ((True, 0), (False, 1)):
+        model.train(training)
+        with patch.object(mx, "eval", wraps=mx.eval) as evaluate:
+            features = model.get_input_embeddings(ids, **media)
+        assert features.deepstack_visual_embeds is not None
+        assert evaluate.call_count == expected, (name, training)
+
+
 @pytest.fixture
 def mistral_large4_case():
     case = model_case("mistral_large4")

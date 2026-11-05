@@ -117,7 +117,7 @@ class Model(nn.Module):
         visual_pos_masks = (input_ids == self.config.image_token_index) | (
             input_ids == self.config.video_token_index
         )
-        if deepstack_visual_embeds is not None:
+        if deepstack_visual_embeds is not None and not self.training:
             mx.eval(deepstack_visual_embeds)
 
         position_ids, rope_deltas = self.language_model.get_rope_index(
