@@ -18,6 +18,8 @@ from transformers.image_utils import (
 )
 from transformers.processing_utils import ProcessorMixin
 
+from ..chat_template import render_chat_template
+
 logger = logging.getLogger(__name__)
 
 # Special tokens
@@ -647,12 +649,8 @@ class Molmo2Processor(ProcessorMixin):
                 "{% if add_generation_prompt %}Assistant: {% endif %}"
             )
 
-        from jinja2 import Environment
-
-        # Use Environment with loopcontrols extension to support {% continue %} and {% break %}
-        env = Environment(extensions=["jinja2.ext.loopcontrols"])
-        template = env.from_string(chat_template)
-        rendered = template.render(
+        rendered = render_chat_template(
+            chat_template,
             messages=conversation,
             add_generation_prompt=add_generation_prompt,
             **kwargs,

@@ -30,6 +30,8 @@ from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils import PreTrainedTokenizer
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
+from ..chat_template import render_chat_template
+
 
 class Ernie4_5_VLTokenizer(PreTrainedTokenizer):
     """Tokenizer for ERNIE 4.5 VL model using SentencePiece."""
@@ -627,14 +629,8 @@ class Ernie4_5_VLProcessor(ProcessorMixin):
                 "or ensure the tokenizer has a chat_template attribute."
             )
 
-        # Use jinja2 to render the template
-        try:
-            from jinja2 import Template
-        except ImportError:
-            raise ImportError("jinja2 is required for apply_chat_template")
-
-        template = Template(chat_template)
-        rendered = template.render(
+        rendered = render_chat_template(
+            chat_template,
             messages=conversation,
             add_generation_prompt=add_generation_prompt,
             **kwargs,

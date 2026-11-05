@@ -15,6 +15,8 @@ from transformers.image_processing_utils import BaseImageProcessor
 from transformers.image_utils import ImageInput, make_list_of_images
 from transformers.processing_utils import ProcessorMixin
 
+from ..chat_template import render_chat_template
+
 # CLIP normalization constants
 OPENAI_CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 OPENAI_CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
@@ -621,12 +623,8 @@ class MolmoProcessor(ProcessorMixin):
                 "{% if add_generation_prompt %}Assistant: {% endif %}"
             )
 
-        from jinja2 import Environment
-
-        # Use Environment with loopcontrols extension to support {% continue %} and {% break %}
-        env = Environment(extensions=["jinja2.ext.loopcontrols"])
-        template = env.from_string(chat_template)
-        rendered = template.render(
+        rendered = render_chat_template(
+            chat_template,
             messages=conversation,
             add_generation_prompt=add_generation_prompt,
             **kwargs,
