@@ -635,6 +635,8 @@ class ExpertStore:
         self._misses = 0
         self._evictions = 0
         self._metadata_reloads = 0
+        # {layer_id: lazy handle dict from the last mx.load of that layer}
+        self._fresh: dict = {}
 
     def experts_present(self, layer_id: int) -> bool:
         return layer_id in self._maps
@@ -656,8 +658,16 @@ class ExpertStore:
         missing = [j for j in needed if f"e{j}.gate_proj.weight" not in m]
         if not missing:
             return
-        fresh = mx.load(self._paths[layer_id])
-        self._metadata_reloads += 1
+        # ``mx.load`` is lazy but re-parses the whole layer header (thousands
+        # of tensors) on every call: ~1.65 ms for a 256-expert layer, which
+        # dominates the miss cost. Keep the lazy handle dict and reload only
+        # when a needed handle was dropped by eviction (eviction removes it
+        # here too, so an evicted expert's buffer is really freed).
+        fresh = self._fresh.get(layer_id)
+        if fresh is None or any(f"e{j}.gate_proj.weight" not in fresh for j in missing):
+            fresh = mx.load(self._paths[layer_id])
+            self._fresh[layer_id] = fresh
+            self._metadata_reloads += 1
         for j in missing:
             for k in _PROJ_KEYS:
                 name = f"e{j}.{k}"
@@ -673,8 +683,11 @@ class ExpertStore:
         while self._lru and self._resident_bytes + incoming_bytes > self._budget:
             (lid, j), nbytes = self._lru.popitem(last=False)
             m = self._maps[lid]
+            fresh = self._fresh.get(lid)
             for k in _PROJ_KEYS:
                 m.pop(f"e{j}.{k}", None)
+                if fresh is not None:
+                    fresh.pop(f"e{j}.{k}", None)
             self._resident_bytes -= nbytes
             self._evictions += 1
             evicted = True
