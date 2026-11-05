@@ -132,10 +132,12 @@ class SPMStreamingDetokenizer(StreamingDetokenizer):
     def __init__(self, tokenizer, trim_space=True):
         self.trim_space = trim_space
 
-        # Extract the tokens in a list from id to text
-        self.tokenmap = [None] * len(tokenizer.vocab)
-        self.is_byte_token = [False] * len(tokenizer.vocab)
-        self.byte_value = [0] * len(tokenizer.vocab)
+        # Extract the tokens in a list from id to text. The ids can be sparse, so
+        # size the lists by the largest id, as the BPE detokenizer does.
+        size = max(tokenizer.vocab.values(), default=-1) + 1
+        self.tokenmap = [None] * size
+        self.is_byte_token = [False] * size
+        self.byte_value = [0] * size
 
         for value, tokenid in tokenizer.vocab.items():
             self.tokenmap[tokenid] = value
@@ -166,6 +168,10 @@ class SPMStreamingDetokenizer(StreamingDetokenizer):
 
     def add_token(self, token, skip_special_token_ids: List[int] = []):
         if token in skip_special_token_ids:
+            return
+        # Skip ids the vocabulary doesn't map, like padded model outputs, keeping
+        # any pending byte tokens, as the BPE detokenizer does.
+        if not 0 <= token < len(self.tokenmap) or self.tokenmap[token] is None:
             return
 
         if self.is_byte_token[token]:
