@@ -11,10 +11,9 @@ import mlx.core as mx
 
 from .models.cache import CacheMemory, cache_nbytes
 
-# v4 invalidates v3 hybrid checkpoints captured with the old 16-token guard.
-# Reusing those 4,080-token snapshots would bypass the new prompt_length - 1
-# replay boundary and reintroduce batch-shape and mRoPE parity drift.
-ADAPTER_SCHEMA_VERSION = 4
+# v5 also invalidates GLM-Next checkpoints that included transient projected KV.
+# v4 invalidated v3 hybrid checkpoints captured with the old 16-token guard.
+ADAPTER_SCHEMA_VERSION = 5
 
 
 class Capability(str, Enum):
