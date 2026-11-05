@@ -2006,6 +2006,85 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill(budget, chunk_size
     assert captured["prompt_kwargs"]["keep_tensor"].shape == (2, 1)
 
 
+def test_cold_batch_zero_fills_mm_token_type_ids_for_text_only_row():
+    inputs_embeds, prompt_kwargs = ar_module._merge_prefill_prompt_kwargs(
+        [
+            {
+                "inputs_embeds": mx.ones((1, 3, 2)),
+                "mm_token_type_ids": mx.array([[0, 1, 1]], dtype=mx.int32),
+            },
+            {"inputs_embeds": mx.ones((1, 2, 2))},
+            {
+                "inputs_embeds": mx.ones((1, 2, 2)),
+                "mm_token_type_ids": mx.array([[1, 0]], dtype=mx.int32),
+            },
+        ],
+        [[1, 2, 3], [4, 5], [6, 7]],
+    )
+
+    assert inputs_embeds.shape == (3, 3, 2)
+    assert prompt_kwargs["mm_token_type_ids"].tolist() == [
+        [0, 1, 1],
+        [0, 0, 0],
+        [0, 1, 0],
+    ]
+
+
+def test_mixed_apc_batch_zero_fills_mm_token_type_ids_for_text_only_row():
+    bg = object.__new__(BatchGenerator)
+    bg.apc_manager = object()
+    bg.model = SimpleNamespace(layers=[object()])
+    bg.prefill_step_size = None
+    bg.kv_bits = None
+    bg.kv_group_size = 64
+    bg.kv_quant_scheme = "affine"
+    bg._wire_stack = None
+
+    captured = {}
+
+    def fake_prompt_batch(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    sequences = [
+        (1, list(range(6)), 1, {"inputs_embeds": mx.ones((1, 6, 4))}, [], None),
+        (
+            2,
+            list(range(4)),
+            1,
+            {
+                "inputs_embeds": mx.ones((1, 4, 4)),
+                "mm_token_type_ids": mx.array([[0, 1, 1, 0]], dtype=mx.int32),
+            },
+            [],
+            None,
+        ),
+    ]
+    picks = [
+        {
+            "matched_blocks": [],
+            "prefix_len": 4,
+            "extra_hash": 7,
+            "full_input_ids": list(range(6)),
+        },
+        None,
+    ]
+
+    with (
+        patch.object(BatchGenerator, "_apc_pick_for", side_effect=picks),
+        patch.object(
+            ar_module._apc, "make_warm_batch_kv_cache_multi", return_value=([], 4)
+        ),
+        patch.object(generate_module, "PromptProcessingBatch", fake_prompt_batch),
+    ):
+        bg._build_mixed_prompt_batch(sequences)
+
+    assert captured["prompt_kwargs"]["mm_token_type_ids"].tolist() == [
+        [0, 0, 0, 0],
+        [0, 1, 1, 0],
+    ]
+
+
 def test_apc_pick_rejects_image_tokens_and_releases_blocks():
     block_size = 4
     image_token_id = 99
