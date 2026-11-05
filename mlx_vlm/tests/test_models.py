@@ -1499,6 +1499,20 @@ def test_model_contract(case):
         getattr(checks, kind)(*args, **kwargs)
 
 
+def test_qwen3_vl_embedding_ignores_previous_position_ids():
+    case = model_case("TestGetInputEmbeddings.qwen3_vl_input_embeddings")
+    module = importlib.import_module("mlx_vlm.models.qwen3_vl_embedding")
+    model = module.Model(build_config(module, case["config"]))
+    ids = mx.array([[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]])
+    expected = model(ids).text_embeds
+    # A longer, left-padded call leaves position IDs that do not fit `ids`.
+    model(
+        mx.array([[0, 0, 0, 1, 2, 3, 4, 5]]),
+        attention_mask=mx.array([[0, 0, 0, 1, 1, 1, 1, 1]]),
+    )
+    ModelChecks().assert_close(model(ids).text_embeds, expected)
+
+
 @pytest.fixture
 def mistral_large4_case():
     case = model_case("mistral_large4")
