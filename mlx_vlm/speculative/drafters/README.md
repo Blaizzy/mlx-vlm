@@ -14,6 +14,23 @@ The draft kind is inferred from the loaded drafter config, including native
 DSpark heads. No separate checkpoint is written. See the
 [Qwen MTP examples](qwen3_5_mtp/README.md).
 
+## Batch lifecycle contract
+
+External serving integrations may inspect two literal Boolean capabilities:
+`supports_continuous_batching` declares support for batched calls;
+`requires_verified_token_reconciliation` declares owned speculative state.
+`AutoregressiveMTPDraftModel` declares both as true and owns
+`accept_verified_tokens_batch` and `filter_batch`; Qwen4 and DeepSeek inherit
+that contract rather than redeclaring it. Gemma4's shared-KV assistant declares
+batch support true and reconciliation false because it owns no draft cache.
+
+These flags describe the existing lifecycle; they do not enable a scheduler
+or change native decoding admission. Callers must reconcile verified rounds,
+apply identical target/drafter row filters, and honor the separate
+`requires_uniform_batch_acceptance` constraint. A missing or non-Boolean flag
+is unknown, not proof of compatibility. Downstream consumers include vllm-mlx
+PRs #754 and #755; these declarations alone do not qualify a serving stack.
+
 ## Extract a drafter
 
 Standalone — auto-detects the family from the source config:

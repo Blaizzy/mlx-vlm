@@ -7,6 +7,8 @@ import mlx.nn as nn
 
 
 class AutoregressiveMTPDraftModel(nn.Module):
+    supports_continuous_batching = True
+    requires_verified_token_reconciliation = True
     supports_greedy_draft_argmax = True
     prefer_requested_block_size = True
     requires_uniform_batch_acceptance = True
