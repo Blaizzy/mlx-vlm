@@ -219,6 +219,12 @@ class MuseGlimmerProcessor(ProcessorMixin):
         """
         return _extract_final_channel(text)
 
+    def to_dict(self):
+        output = super().to_dict()
+        # The model config is not part of the processor config.
+        output.pop("config", None)
+        return output
+
     @property
     def model_input_names(self):
         return list(
