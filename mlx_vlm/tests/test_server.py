@@ -6775,6 +6775,25 @@ class TestResponseGenerator:
                 assert sampler.temperature == effective
                 assert set(actual.tolist()) == {1, 2}
 
+    @pytest.mark.parametrize(
+        "options", [{}, {"top_n_sigma": 1.0}, {"p_less": True}, {"typical_p": 0.99}]
+    )
+    def test_min_p_reaches_batch_sampler(self, options):
+        sampler = _generator()._make_sampler(
+            Args(temperature=1.0, min_p=0.9, **options)
+        )
+        # Only the top token has at least 0.9 times the top probability.
+        logprobs = mx.log(mx.array([[0.4, 0.35, 0.25]] * 256))
+        mx.random.seed(0)
+        assert set(sampler(logprobs).tolist()) == {0}
+
+    def test_min_p_separates_batch_groups(self):
+        worker = Generator.__new__(Generator)
+        worker.draft_model = None
+        first = NS(args=Args(temperature=0.7), session=None)
+        second = NS(args=Args(temperature=0.7, min_p=0.1), session=None)
+        assert worker._batch_key(first) != worker._batch_key(second)
+
     def test_generate_arguments_to_generate_kwargs(self):
         args = Args()
         _assert_fields(
@@ -6804,7 +6823,9 @@ class TestResponseGenerator:
         )
         args = Args(**options, tenant_id="tenant-a")
         _assert_fields(args.to_generate_kwargs(), **options, apc_tenant="tenant-a")
-        assert _generator()._make_sampler(args).top_k == options["top_k"]
+        # min_p moves sampling to make_sampler, which has no top_k attribute.
+        positioned = Args(**{**options, "min_p": 0.0})
+        assert _generator()._make_sampler(positioned).top_k == options["top_k"]
 
     @pytest.mark.parametrize(
         "ids,wrapped",

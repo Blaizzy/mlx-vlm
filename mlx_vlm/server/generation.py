@@ -1558,6 +1558,7 @@ class ResponseGenerator:
                 temp=args.temperature,
                 top_p=args.top_p,
                 top_k=args.top_k,
+                min_p=args.min_p,
                 top_n_sigma=args.top_n_sigma,
             )
         if args.p_less:
@@ -1565,6 +1566,7 @@ class ResponseGenerator:
                 temp=args.temperature,
                 top_p=args.top_p,
                 top_k=args.top_k,
+                min_p=args.min_p,
                 p_less=True,
             )
         if args.typical_p < 1.0:
@@ -1572,7 +1574,17 @@ class ResponseGenerator:
                 temp=args.temperature,
                 top_p=args.top_p,
                 top_k=args.top_k,
+                min_p=args.min_p,
                 typical_p=args.typical_p,
+            )
+        # The positioned sampler has no min-p filter, so min-p uses
+        # make_sampler, as generate() does.
+        if args.min_p != 0:
+            return make_sampler(
+                temp=args.temperature,
+                top_p=args.top_p,
+                top_k=args.top_k,
+                min_p=args.min_p,
             )
         return _PositionedTargetSampler(
             temperature=args.temperature,
@@ -1908,6 +1920,7 @@ class ResponseGenerator:
                 "temperature",
                 "top_p",
                 "top_k",
+                "min_p",
                 "seed",
                 "top_n_sigma",
                 "p_less",
