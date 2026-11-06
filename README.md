@@ -27,6 +27,8 @@
   <a href="https://github.com/Neywa-Labs/mlx-vlm/blob/main/LICENSE"><img src="https://img.shields.io/github/license/Neywa-Labs/mlx-vlm" alt="MIT license"></a>
 </p>
 
+[![Open it in Nativ. Download for macOS](assets/open-in-nativ.png)](https://blaizzy.github.io/nativ/)
+
 ## Table of Contents
 - [Installation](#installation)
 - [Usage](#usage)
