@@ -114,6 +114,36 @@ def test_sam3_tracker_rope_matches_reference(height, width, theta):
         np.testing.assert_allclose(np.asarray(actual), expected, atol=1e-5)
 
 
+def test_sam3_rope_keeps_the_input_dtype():
+    from mlx_vlm.models.sam3.position import (
+        apply_rotary_enc,
+        apply_rotary_enc_1d,
+        compute_axial_cis,
+        init_2d_freqs,
+    )
+
+    # The cos/sin tables are float32. Rotated bf16 queries and keys must stay bf16,
+    # or every later layer of a bf16 model silently runs in float32.
+    rng = np.random.default_rng(0)
+    q = mx.array(rng.normal(size=(1, 2, 16, 32)).astype(np.float32))
+    k = mx.array(rng.normal(size=(1, 2, 16, 32)).astype(np.float32))
+    cos, sin = compute_axial_cis(32, 4, 4)
+    ref_q, ref_k = apply_rotary_enc(q, k, cos, sin)
+    out_q, out_k = apply_rotary_enc(
+        q.astype(mx.bfloat16), k.astype(mx.bfloat16), cos, sin
+    )
+    assert out_q.dtype == out_k.dtype == mx.bfloat16
+    np.testing.assert_allclose(
+        np.asarray(out_q.astype(mx.float32)), np.asarray(ref_q), atol=0.05
+    )
+    assert ref_q.dtype == mx.float32  # float32 inputs are unchanged
+
+    cos2, sin2 = init_2d_freqs(32, 4, 4)
+    q1 = q.transpose(0, 2, 1, 3).astype(mx.bfloat16)
+    out = apply_rotary_enc_1d(q1, q1, cos2, sin2, False)
+    assert out[0].dtype == out[1].dtype == mx.bfloat16
+
+
 def test_sam3_pixel_decoder_group_norm_matches_reference():
     from mlx_vlm.models.sam3.segmentation import PixelDecoder
 
