@@ -49,10 +49,8 @@ class VisionConfig(BaseModelConfig):
             self.hidden_size = 1152
 
         if self.num_attention_heads is None:
-            if self.hidden_size % 64 == 0:
-                self.num_attention_heads = self.hidden_size // 64
-            else:
-                self.num_attention_heads = 16
+            # Match the Transformers SmolVLMVisionConfig checkpoint default.
+            self.num_attention_heads = 16
 
         if self.num_hidden_layers is None:
             # SmolVLM2 variants use either the 12-layer (500M) or 27-layer (2.2B) vision tower.
