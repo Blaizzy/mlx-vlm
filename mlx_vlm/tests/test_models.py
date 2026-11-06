@@ -6474,3 +6474,35 @@ def test_qwen3_5_attention_forwards_rope_parameters(omit_original_max):
         QWEN3_5_YARN_HF_ATTENTION_FACTOR, rel=1e-6
     )
     assert not rotary.fused_apply
+
+
+class TestPoolByConfig:
+    tokens = mx.arange(2 * 3 * 2, dtype=mx.float32).reshape(2, 3, 2)
+    mask = mx.array([[1, 1, 1], [1, 1, 0]])
+
+    @pytest.mark.parametrize(
+        "config,expected",
+        [
+            (dict(pooling_mode_cls_token=True), [[0, 1], [6, 7]]),
+            (dict(pooling_mode_lasttoken=True), [[4, 5], [8, 9]]),
+        ],
+        ids=["cls", "lasttoken"],
+    )
+    def test_include_prompt_false_allows_single_token_modes(self, config, expected):
+        from mlx_vlm.models.pooling import pool_by_config
+
+        pooled = pool_by_config(
+            self.tokens, self.mask, dict(config, include_prompt=False)
+        )
+        assert pooled.tolist() == expected
+
+    @pytest.mark.parametrize(
+        "config",
+        [dict(pooling_mode_mean_tokens=True), dict(pooling_mode_max_tokens=True)],
+        ids=["mean", "max"],
+    )
+    def test_include_prompt_false_still_rejected_for_token_averages(self, config):
+        from mlx_vlm.models.pooling import pool_by_config
+
+        with pytest.raises(NotImplementedError, match="include_prompt=False"):
+            pool_by_config(self.tokens, self.mask, dict(config, include_prompt=False))

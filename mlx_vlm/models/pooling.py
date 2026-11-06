@@ -102,10 +102,12 @@ def pool_by_config(
 ) -> mx.array:
     cfg = _normalize_pooling_config(pooling_config)
     mode = cfg["pooling_mode"]
-    if not cfg.get("include_prompt", True):
+    # include_prompt=False drops the prompt's tokens from the pooled average.
+    # cls and lasttoken read a single token, so the flag does not change them.
+    if not cfg.get("include_prompt", True) and mode not in ("cls", "lasttoken"):
         raise NotImplementedError(
-            "Prompt-aware pooling (include_prompt=False) is not supported. "
-            "This affects INSTRUCTOR-style models."
+            "Prompt-aware pooling (include_prompt=False) is not supported "
+            f"for pooling mode {mode!r}. This affects INSTRUCTOR-style models."
         )
     if isinstance(mode, (tuple, list)):
         raise NotImplementedError(
