@@ -24,3 +24,4 @@ class ModelConfig(BaseModelConfig):
     sliding_window: int
     layer_types: List[str]
     rope_parameters: Dict[str, Any] = field(default_factory=dict)
+    num_nextn_predict_layers: int = 0

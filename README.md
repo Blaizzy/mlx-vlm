@@ -34,6 +34,7 @@
     - [Thinking Budget](#thinking-budget)
   - [Speculative Decoding](#speculative-decoding)
     - [DFlash, DFlash2, and DSpark](#dflash-dflash2-and-dspark)
+    - [Bundled native heads](#bundled-native-heads)
     - [Gemma 4 MTP](#gemma-4-mtp)
     - [Gemma 4 EAGLE-3](#gemma-4-eagle-3)
     - [MiniMax M3 EAGLE-3](#minimax-m3-eagle-3)
@@ -357,6 +358,19 @@ result = generate(
     draft_kind=draft_kind,
 )
 ```
+
+#### Bundled native heads
+
+Bundled native heads are detected when the same original checkpoint is passed
+as the target and drafter. For example:
+
+```sh
+mlx_vlm.generate --model JetBrains/Mellum2.1-12B-A2.5B-Thinking-MTP \
+  --draft-model JetBrains/Mellum2.1-12B-A2.5B-Thinking-MTP \
+  --prompt "Write a Python function that adds two integers." --temperature 0
+```
+
+Use `mlx_vlm.convert --mtp` to extract a native head alongside a converted target.
 
 #### Gemma 4 MTP
 

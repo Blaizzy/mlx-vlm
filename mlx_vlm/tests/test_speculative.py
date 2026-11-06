@@ -33,6 +33,7 @@ from mlx_vlm.speculative.drafters import (
     validate_drafter_compatibility,
 )
 from mlx_vlm.speculative.drafters.compatibility import validate_dflash_target
+from mlx_vlm.speculative.drafters.mtp_split import get_mtp_splitter
 from mlx_vlm.speculative.ops import linear as verifier_linear
 from mlx_vlm.speculative.utils import _mtp_verify_target, _speculative_walk_batch
 from mlx_vlm.split_mtp import split_mtp
@@ -42,6 +43,7 @@ from mlx_vlm.tests.test_models import (
     build_config,
     model_case,
     tiny_config,
+    tiny_language_model,
 )
 from mlx_vlm.utils import (
     StoppingCriteria,
@@ -3901,3 +3903,57 @@ def test_speculators_sliding_attention_causality(non_causal):
 
         difference = mx.max(mx.abs(forward(x) - forward(changed))).item()
         assert (difference < 1e-6) == (i == 0 and not non_causal)
+
+
+@parametrize("family", ["mellum"])
+def test_native_split_load_and_greedy_generation(family, tmp_path):
+    mx.random.seed(7)
+    target = tiny_language_model(family)
+    raw = target.config.to_dict()
+    arch = module(f"speculative.drafters.{family}_mtp")
+    draft = arch.Model(arch.ModelConfig(text_config=raw))
+    source = {}
+    for key, value in tree_flatten(draft.parameters()):
+        key = f"mtp.{key}"
+        if ".switch_mlp." in key:
+            for index, tensor in enumerate(value):
+                stem = key.replace(".switch_mlp.", f".experts.{index}.")
+                source[stem] = tensor
+        else:
+            source[key] = value
+    config, weights, path = split_checkpoint(tmp_path, raw, source, separate=True)
+    loaded, kind = load_drafter(str(path))
+    bundled, bundled_kind = load_drafter(str(tmp_path))
+    assert kind == bundled_kind == "mtp"
+    equal(
+        dict(tree_flatten(loaded.parameters())),
+        dict(tree_flatten(bundled.parameters())),
+    )
+    ids = mx.array([[1, 2, 3, 4, 5, 6, 7]])
+    embedding = getattr(target, "model", target).embed_tokens
+    outer = NS(
+        language_model=target,
+        config=target.config,
+        get_input_embeddings=lambda ids, *args, **kwargs: InputEmbeddingsFeatures(
+            inputs_embeds=embedding(ids)
+        ),
+    )
+
+    def run(**kwargs):
+        return [
+            int(token)
+            for token, _ in generate_step(
+                ids, outer, None, None, max_tokens=8, temperature=0, **kwargs
+            )
+        ]
+
+    assert run() == run(draft_model=loaded, draft_kind=kind, num_draft_tokens=3)
+    assert loaded.draft_lens
+
+
+@parametrize("name", ["qwen3_5_text", "qwen3_5_moe_text"])
+def test_qwen_text_aliases_share_native_splitter(name):
+    splitter = get_mtp_splitter(
+        source_config={"model_type": name, "mtp_num_hidden_layers": 1}
+    )
+    assert splitter.output_model_type == "qwen3_5_mtp"

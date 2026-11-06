@@ -210,9 +210,14 @@ class LanguageModel(nn.Module):
             logits = self.model.embed_tokens.as_linear(hidden_states)
         else:
             logits = self.lm_head(hidden_states)
-        return LanguageModelOutput(logits=logits)
+        return LanguageModelOutput(
+            logits=logits,
+            hidden_states=[hidden_states] if kwargs.get("return_hidden") else None,
+            shared_kv_states={} if kwargs.get("return_shared_kv") else None,
+        )
 
     def sanitize(self, weights):
+        weights = {k: v for k, v in weights.items() if not k.startswith("mtp.")}
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
         if "model.layers.0.mlp.experts.0.up_proj.weight" not in weights:

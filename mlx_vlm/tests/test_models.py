@@ -2814,6 +2814,15 @@ def tiny_language_model(family):
     return model
 
 
+@pytest.mark.parametrize("family", ["mellum"])
+def test_native_speculative_hidden_states(family):
+    ids = mx.array([[1, 2, 3]])
+    model = tiny_language_model(family)
+    hidden = model(ids, return_hidden=True).hidden_states[-1]
+    expected = model.model(ids)
+    assert mx.array_equal(hidden, expected).item()
+
+
 def _prepare_minimax_distributed(model, dtype):
     from mlx_vlm.quantization.nvfp4 import ScaledQuantizedSwitchLinear
 
