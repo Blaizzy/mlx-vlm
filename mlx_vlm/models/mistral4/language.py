@@ -248,6 +248,8 @@ class Mistral4Model(nn.Module):
         inputs: mx.array,
         cache=None,
         inputs_embeds: Optional[mx.array] = None,
+        capture_layer_ids=None,
+        hidden_sink=None,
     ):
         if inputs_embeds is not None:
             h = inputs_embeds
@@ -278,7 +280,10 @@ class Mistral4Model(nn.Module):
             self.config.rope_parameters["original_max_position_embeddings"],
         ).astype(h.dtype)
 
-        for layer, c in zip(self.layers, cache):
+        capture = set(capture_layer_ids or [])
+        for index, (layer, c) in enumerate(zip(self.layers, cache)):
             h = layer(h, attn_scale, mask, cache=c)
+            if index in capture:
+                hidden_sink.append(h)
 
         return self.norm(h)

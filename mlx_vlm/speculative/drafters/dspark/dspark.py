@@ -11,10 +11,10 @@ from .config import DSparkConfig
 class VanillaMarkov(nn.Module):
     """Low-rank token-transition correction used by DSpark proposals."""
 
-    def __init__(self, vocab_size: int, rank: int):
+    def __init__(self, vocab_size: int, rank: int, draft_vocab_size: int | None = None):
         super().__init__()
         self.markov_w1 = nn.Embedding(vocab_size, rank)
-        self.markov_w2 = nn.Linear(rank, vocab_size, bias=False)
+        self.markov_w2 = nn.Linear(rank, draft_vocab_size or vocab_size, bias=False)
 
     def get_prev_embeddings(self, token_ids: mx.array) -> mx.array:
         return self.markov_w1(token_ids)
@@ -84,7 +84,14 @@ class DSparkDraftModel(DFlashDraftModel):
         super().__init__(config)
         self.prefer_requested_block_size = config.block_size_policy == "fixed"
         self.dflash_initial_block_size = config.dflash_initial_block_size
-        self.markov_head = VanillaMarkov(config.vocab_size, config.markov_rank)
+        self.markov_head = VanillaMarkov(
+            config.vocab_size, config.markov_rank, config.draft_vocab_size
+        )
+        self.d2t = (
+            mx.zeros((config.draft_vocab_size,), dtype=mx.int32)
+            if config.draft_vocab_size != config.vocab_size
+            else None
+        )
         self.confidence_head: DSparkConfidenceHead | None = (
             DSparkConfidenceHead(
                 config.hidden_size,
@@ -94,6 +101,12 @@ class DSparkDraftModel(DFlashDraftModel):
             if config.enable_confidence_head
             else None
         )
+        self._has_own_lm_head = False
+        if self.d2t is not None:
+            self.lm_head = nn.Linear(
+                config.hidden_size, config.draft_vocab_size, bias=False
+            )
+            self._has_own_lm_head = True
 
     def validate_target_compatibility(self, target_model) -> None:
         validate_dspark_target(self.config, target_model)
@@ -118,7 +131,10 @@ class DSparkDraftModel(DFlashDraftModel):
 
     def bind(self, target_model) -> "DSparkDraftModel":
         self.validate_target_compatibility(target_model)
+        head = self.lm_head
         super().bind(target_model)
+        if self._has_own_lm_head:
+            self.lm_head = head
         return self
 
     def confidence(
@@ -165,10 +181,15 @@ class DSparkDraftModel(DFlashDraftModel):
         if not self.config.sample_from_anchor:
             draft_hidden = draft_hidden[:, 1:]
         base_logits = self._logits(draft_hidden)
+
+        def sample_target_ids(logits):
+            tokens = sampler(logits)
+            return tokens if self.d2t is None else tokens + self.d2t[tokens]
+
         return self.markov_head.sample_block(
             base_logits,
             first_prev_tokens=anchor,
-            sampler=sampler,
+            sampler=sample_target_ids,
         ).astype(token_dtype)
 
     def draft_block_greedy(
@@ -193,6 +214,10 @@ class DSparkDraftModel(DFlashDraftModel):
         normalized = {}
         for key, value in weights.items():
             key = key.removeprefix("model.")
+            if key == "t2d":
+                continue
+            if key == "d2t":
+                value = value.astype(mx.int32)
             if key in normalized:
                 raise ValueError(
                     f"Duplicate DSpark weight key after sanitization: {key}"
@@ -202,6 +227,11 @@ class DSparkDraftModel(DFlashDraftModel):
             self.embed_tokens = nn.Embedding(
                 self.config.vocab_size, self.config.hidden_size
             )
+        if "lm_head.weight" in normalized:
+            self.lm_head = nn.Linear(
+                self.config.hidden_size, self.config.draft_vocab_size, bias=False
+            )
+            self._has_own_lm_head = True
         return normalized
 
 

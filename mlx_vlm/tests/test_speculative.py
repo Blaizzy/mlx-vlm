@@ -32,6 +32,7 @@ from mlx_vlm.speculative.drafters import (
     resolve_drafter_kind,
     validate_drafter_compatibility,
 )
+from mlx_vlm.speculative.drafters.compatibility import validate_dflash_target
 from mlx_vlm.speculative.ops import linear as verifier_linear
 from mlx_vlm.speculative.utils import _mtp_verify_target, _speculative_walk_batch
 from mlx_vlm.split_mtp import split_mtp
@@ -42,7 +43,12 @@ from mlx_vlm.tests.test_models import (
     model_case,
     tiny_config,
 )
-from mlx_vlm.utils import StoppingCriteria, ThinkingBudgetCriteria, get_model_and_args
+from mlx_vlm.utils import (
+    StoppingCriteria,
+    ThinkingBudgetCriteria,
+    get_model_and_args,
+    get_model_type,
+)
 
 parametrize = pytest.mark.parametrize
 DATA = json.loads(Path(__file__).with_name("model_cases.json").read_text())[
@@ -3796,3 +3802,102 @@ def test_speculative_lifetime_counters_survive_reset():
     snapshot = common.speculative_stats_snapshot(drafter)
     common._record_speculative_round(drafter, 2, 7)
     assert common.speculative_stats_since(drafter, snapshot) == (1, 2, 7)
+
+
+def official_dspark_config(layout="speculators", **overrides):
+    params = deepcopy(DATA["official_dspark"])
+    if layout == "speculators":
+        params["speculators_model_type"] = "dspark"
+        params["aux_hidden_state_layer_ids"] = params.pop("target_layer_ids")
+        del params["num_target_layers"]
+    else:
+        params.update(params.pop("transformer_layer_config"))
+        params.update(model_type="qwen3", architectures=["Qwen3DSparkModel"])
+    return params | overrides
+
+
+@parametrize("layout", ["speculators", "openbmb"])
+@parametrize("anchor", [True, False])
+def test_official_dspark_config(layout, anchor):
+    arch = module("speculative.drafters.dspark")
+    raw = official_dspark_config(layout, sample_from_anchor=anchor)
+    assert get_model_type(raw) == "dspark"
+    cfg = arch.ModelConfig.from_dict(raw)
+    assert cfg.hidden_size == 32 and cfg.target_layer_ids == [0, 1]
+    assert cfg.block_size == (4 if layout == "speculators" and not anchor else 5)
+    assert cfg.num_target_layers == (None if layout == "speculators" else 4)
+    target = NS(
+        config=NS(hidden_size=32, vocab_size=64),
+        model=NS(layers=[None] * 4),
+        supports_speculative_decoding=True,
+    )
+    validate_dflash_target(cfg, target, "DSpark")
+    target.model.layers = [None]
+    with pytest.raises(ValueError, match="layer"):
+        validate_dflash_target(cfg, target, "DSpark")
+
+
+def test_dspark_keeps_checkpoint_output_head():
+    arch = module("speculative.drafters.dspark")
+    cfg = arch.ModelConfig.from_dict(official_dspark_config())
+    draft = arch.Model(cfg)
+    weights = dict(tree_flatten(draft.parameters()))
+    weights["lm_head.weight"] = mx.random.normal((64, 32))
+    draft.load_weights(list(draft.sanitize(weights).items()), strict=True)
+    target = NS(
+        config=NS(hidden_size=32, vocab_size=64),
+        model=NS(layers=[None] * 4, embed_tokens=nn.Embedding(64, 32)),
+        lm_head=nn.Linear(32, 64, bias=False),
+        supports_speculative_decoding=True,
+    )
+    draft.bind(target)
+    equal(draft.lm_head.weight, weights["lm_head.weight"])
+    assert draft.lm_head is not target.lm_head
+
+
+def test_dspark_reduced_vocabulary_conditions_on_target_ids(monkeypatch):
+    arch = module("speculative.drafters.dspark")
+    draft = arch.Model(
+        arch.ModelConfig.from_dict(official_dspark_config(draft_vocab_size=4))
+    )
+    weights = dict(tree_flatten(draft.parameters()))
+    weights.update(
+        d2t=mx.array([6, 8, 10, 12], dtype=mx.int64),
+        t2d=mx.zeros((64,), dtype=mx.bool_),
+    )
+    weights["lm_head.weight"] = mx.zeros((4, 32))
+    weights["markov_head.markov_w1.weight"] = mx.zeros((64, 8))
+    for row, column in zip([63, 6, 9, 12], range(4)):
+        weights["markov_head.markov_w1.weight"][row, column] = 1
+    weights["markov_head.markov_w2.weight"] = mx.concatenate(
+        [mx.eye(4), mx.zeros((4, 4))], axis=1
+    )
+    draft.load_weights(list(draft.sanitize(weights).items()), strict=True)
+    monkeypatch.setattr(
+        draft, "_hidden", lambda inputs, *args: mx.zeros((*inputs.shape, 32))
+    )
+    tokens = draft.draft_block(
+        63, None, None, 5, lambda logits: mx.argmax(logits, axis=-1)
+    )
+    assert tokens.tolist() == [[6, 9, 12, 15]]
+
+
+@parametrize("non_causal", [False, True])
+def test_speculators_sliding_attention_causality(non_causal):
+    arch = module("speculative.drafters.dspark")
+    raw = official_dspark_config(sliding_window_non_causal=non_causal)
+    raw["transformer_layer_config"].update(
+        layer_types=["sliding_attention", "full_attention"], sliding_window=8
+    )
+    draft = arch.Model(arch.ModelConfig.from_dict(raw))
+    x, context = mx.random.normal((1, 3, 32)), mx.random.normal((1, 3, 32))
+    changed = mx.concatenate([x[:, :2], x[:, 2:] + 10], axis=1)
+    for i, layer in enumerate(draft.layers):
+
+        def forward(value):
+            return layer.self_attn(value, context, draft.rope, draft.make_cache()[i])[
+                :, 0
+            ]
+
+        difference = mx.max(mx.abs(forward(x) - forward(changed))).item()
+        assert (difference < 1e-6) == (i == 0 and not non_causal)

@@ -202,6 +202,10 @@ class Ministral3(nn.Module):
 
 
 class LanguageModel(nn.Module):
+    @property
+    def supports_speculative_decoding(self):
+        return self.model_type == "mistral4"
+
     def __init__(self, config: TextConfig):
         super().__init__()
         self.config = config
@@ -223,12 +227,21 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         **kwargs,
     ):
-        out = self.model(inputs=inputs, cache=cache, inputs_embeds=inputs_embeds)
+        capture_layer_ids = kwargs.get("capture_layer_ids")
+        hidden = [] if capture_layer_ids is not None else None
+        capture = (
+            dict(capture_layer_ids=capture_layer_ids, hidden_sink=hidden)
+            if capture_layer_ids is not None
+            else {}
+        )
+        out = self.model(
+            inputs=inputs, cache=cache, inputs_embeds=inputs_embeds, **capture
+        )
         if self.config.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
             out = self.lm_head(out)
-        return LanguageModelOutput(logits=out)
+        return LanguageModelOutput(logits=out, hidden_states=hidden)
 
     def sanitize(self, weights):
         # Remove unused precomputed rotary freqs

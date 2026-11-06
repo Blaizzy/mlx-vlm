@@ -235,6 +235,11 @@ def get_model_type(config: dict) -> Optional[str]:
         model_type = "dflash2"
     elif "Gemma4DSparkModel" in architectures:
         model_type = "gemma4_dspark"
+    elif (
+        "Qwen3DSparkModel" in architectures
+        or config.get("speculators_model_type") == "dspark"
+    ):
+        model_type = "dspark"
     elif model_type == "lfm2_vl" and str(
         (config.get("auto_map") or {}).get("AutoModel", "")
     ).endswith("D1Model"):

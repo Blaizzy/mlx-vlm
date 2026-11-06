@@ -41,7 +41,12 @@ class DFlashAttention(nn.Module):
         )
         self.is_sliding = layer_types[layer_idx] == "sliding_attention"
         self.sliding_window = config.sliding_window if self.is_sliding else None
-        self.is_causal = bool(getattr(config, "is_causal", self.is_sliding))
+        causal = getattr(config, "is_causal", None)
+        self.is_causal = (
+            self.is_sliding and not getattr(config, "sliding_window_non_causal", False)
+            if causal is None
+            else bool(causal)
+        )
         self.attention_sink_bias = (
             mx.zeros((self.n_heads,))
             if getattr(config, "attention_sink_bias", False)
