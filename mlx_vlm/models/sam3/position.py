@@ -130,7 +130,9 @@ def apply_rotary_enc(
     """
     xq_out = xq * cos + rotate_pairwise(xq) * sin
     xk_out = xk * cos + rotate_pairwise(xk) * sin
-    return xq_out, xk_out
+    # cos/sin are float32: without the cast, bf16 queries and keys come out float32 and
+    # promote the rest of the block (and every later one, via the residual) to float32.
+    return xq_out.astype(xq.dtype), xk_out.astype(xk.dtype)
 
 
 def apply_rotary_enc_1d(
@@ -177,7 +179,8 @@ def apply_rotary_enc_1d(
     xq_out = mx.stack([xq_out_r, xq_out_i], axis=-1).reshape(xq.shape)
     xk_out = mx.stack([xk_out_r, xk_out_i], axis=-1).reshape(xk.shape)
 
-    return xq_out, xk_out
+    # Keep the caller's dtype; the float32 tables would otherwise promote bf16 inputs.
+    return xq_out.astype(xq.dtype), xk_out.astype(xk.dtype)
 
 
 def init_2d_freqs(
