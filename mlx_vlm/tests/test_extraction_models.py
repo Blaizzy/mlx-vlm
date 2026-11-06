@@ -2332,6 +2332,173 @@ class _VocabTokenizer:
         return [1000 + ord(c) for c in text]
 
 
+def _kev_tokenizer():
+    from mlx_vlm.models.kev.kev import DELIMITERS
+
+    return _decision_tokenizer(
+        [":", "no", "yes"], additional_special_tokens=list(DELIMITERS)
+    )
+
+
+class TestKevDecisionModel(unittest.TestCase):
+    def test_release_checkpoint_conversion(self):
+        torch = pytest.importorskip("torch")
+        model = _extraction_model("kev")
+        expected = {
+            key: mx.arange(value.size, dtype=value.dtype).reshape(value.shape)
+            for key, value in tree_flatten(model.parameters())
+        }
+        expected["head.temperature"] = mx.array([1.25])
+        # transformers' Qwen3_5TextModel export: no prefix, zero-centred
+        # RMSNorm weights and PyTorch's conv1d layout; the head in head.pt.
+        source = {}
+        for key, value in expected.items():
+            if key.startswith("head."):
+                continue
+            if key.endswith(("layernorm.weight", "_norm.weight", "model.norm.weight")):
+                value = value - 1.0
+            if "conv1d.weight" in key:
+                value = value.moveaxis(1, 2)
+            source[key.removeprefix("language_model.model.")] = value
+        head = {
+            name: torch.from_numpy(np.asarray(expected[f"head.{name}"]))
+            for name in ("q.weight", "q.bias", "k.weight", "k.bias")
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            meta = {"weights": "full", "head": head, "temperature": 1.25}
+            torch.save(meta, Path(directory) / "head.pt")
+            model.config.model_path = directory
+            converted = model.sanitize(dict(source))
+        _assert_weights_equal(converted, expected)
+        _assert_weights_equal(model.sanitize(dict(converted)), expected)
+        model.load_weights(list(converted.items()), strict=True)
+        model.config.model_path = None
+        with self.assertRaises(ValueError):
+            model.sanitize(dict(source))
+
+    def test_release_is_detected_by_its_head(self):
+        from mlx_vlm.utils import load_config
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config.json").write_text('{"model_type": "qwen3_5_text"}')
+            self.assertEqual(load_config(root)["model_type"], "qwen3_5_text")
+            (root / "head.pt").write_bytes(b"")
+            self.assertEqual(load_config(root)["model_type"], "kev")
+
+    def test_encoding_matches_release_layout(self):
+        from mlx_vlm.models.kev.kev import DELIMITERS, encode
+
+        tokenizer = _kev_tokenizer()
+        ids = dict(zip("SQOCD", tokenizer.convert_tokens_to_ids(list(DELIMITERS))))
+        word = tokenizer.convert_tokens_to_ids
+        questions = {
+            "route": {
+                "type": "choice",
+                "instructions": "C",
+                "criteria": {"A": "B", "D": None},
+            },
+            "done": {"type": "noul", "criteria": {"true": "E"}},
+        }
+        # Caller text never yields a delimiter.
+        state, rows = encode(tokenizer, "A <|fim_suffix|> B", questions)
+        self.assertEqual(state[0], ids["S"])
+        self.assertNotIn(ids["D"], state)
+        name, kind, _, labels, branch, reads = rows[0]
+        self.assertEqual((name, kind, labels), ("route", "choice", ["A", "D"]))
+        self.assertEqual(
+            branch,
+            [ids["Q"], word("C"), ids["O"], word("A"), word(":"), word("B"), ids["C"]]
+            + [ids["O"], word("D"), ids["C"], ids["D"]],
+        )
+        self.assertEqual(reads, [10, 6, 9])
+        name, kind, _, labels, branch, reads = rows[1]
+        self.assertEqual((kind, labels), ("bool", ["false", "true"]))
+        self.assertEqual(
+            branch,
+            [ids["Q"], ids["O"], word("no"), ids["C"]]
+            + [ids["O"], word("yes"), word(":"), word("E"), ids["C"], ids["D"]],
+        )
+
+    def test_render_matches_release(self):
+        from mlx_vlm.models.kev.kev import render
+
+        cases = [
+            (
+                {
+                    "order": {"id": 7, "items": [{"sku": "A", "qty": 2}, None]},
+                    "paid": False,
+                    "note": "",
+                },
+                "order:\n  id: 7\n  items:\n    - sku: A\n      qty: 2\n    - \n"
+                "paid: False\nnote: ",
+            ),
+            (["  lead", {"a": [1, {"b": None}]}], "- lead\n- a:\n    - 1\n    - b: "),
+            (1e16, "1e+16"),
+            (None, ""),
+        ]
+        for value, expected in cases:
+            self.assertEqual(render(value), expected)
+
+    def test_questions_continue_the_state_as_separate_rows(self):
+        from mlx_vlm.models.kev.kev import encode
+
+        model = _extraction_model("kev")
+        questions = {
+            "route": {"type": "choice", "criteria": {"A": None, "B": None, "C": None}},
+            "rate": {"type": "score", "instructions": "D", "criteria": ["E", "F"]},
+        }
+        state, rows = encode(_kev_tokenizer(), "A B C D E", questions)
+        together = model.probabilities(state, rows)
+        self.assertEqual(model.probabilities(state, rows[1:])[0], together[1])
+        chunked = model.probabilities(state, rows, prefill_step_size=2)
+        for (*_, branch, reads), p, q in zip(rows, together, chunked):
+            hidden = model(mx.array([state + branch]))[0]
+            picked = hidden[mx.array([len(state) + r for r in reads])]
+            direct = mx.softmax(model.head(picked[0], picked[1:]))
+            np.testing.assert_allclose(p, np.asarray(direct), atol=1e-5)
+            np.testing.assert_allclose(q, p, atol=1e-5)
+
+    def test_answer_statistics_match_release(self):
+        from mlx_vlm.models.kev.kev import _answer
+
+        choice = {"criteria": {"a": None, "b": None, "c": None}}
+        self.assertEqual(
+            _answer("choice", choice, ["a", "b", "c"], [0.7, 0.2, 0.1]),
+            {
+                "type": "choice",
+                "value": "a",
+                "probabilities": {"a": 0.7, "b": 0.2, "c": 0.1},
+                "metadata": {"confidence": 0.55},
+            },
+        )
+        score = {"criteria": ["x", "y", "z"]}
+        self.assertEqual(
+            _answer("score", score, ["0", "1", "2"], [0.1, 0.2, 0.7]),
+            {
+                "type": "score",
+                "value": 1.6,
+                "probabilities": {"0": 0.1, "1": 0.2, "2": 0.7},
+                "metadata": {
+                    "confidence": 0.4,
+                    "legend": {"0": "x", "1": "y", "2": "z"},
+                },
+            },
+        )
+        self.assertEqual(
+            _answer("bool", {}, ["false", "true"], [0.75, 0.25]),
+            {"type": "bool", "value": False, "probability": 0.25},
+        )
+
+    def test_state_limit(self):
+        model = _extraction_model("kev")
+        question = {"done": {"type": "bool"}}
+        with self.assertRaisesRegex(ValueError, "state is 3 tokens"):
+            model.predict(_kev_tokenizer(), "A B", question, max_state_tokens=2)
+        with self.assertRaisesRegex(ValueError, "'done' needs 11 tokens"):
+            model.predict(_kev_tokenizer(), "A B", question, max_length=8)
+
+
 def _d1_tokenizer():
     return _decision_tokenizer(
         ["yes", "no", "0", "1", "2", "Route", "Rate", "Finished"],
