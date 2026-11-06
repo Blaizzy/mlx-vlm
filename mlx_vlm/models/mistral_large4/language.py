@@ -10,7 +10,8 @@ from functools import partial
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import LanguageModelOutput
+from ...sample_utils import greedy_argmax
+from ..base import LanguageModelOutput, project_logits
 from ..cache import _BaseCache, create_causal_mask, dynamic_roll
 from ..switch_layers import (
     QuantizedSwitchLinear,
@@ -21,6 +22,31 @@ from ..switch_layers import (
 from .config import TextConfig
 from .mla_kernel import sparse_mla
 from .moe_kernel import masked_qmv, supports_masked_qmv
+from .verify_kernel import native_wide_linear
+
+
+def decode_linear(module, x, group=None):
+    """Use stable decode reductions, sharing complete output rows across ranks."""
+    if (
+        not module.training
+        and isinstance(module, nn.Linear)
+        and "bias" not in module
+        and x.ndim == 3
+        and x.shape[1] == 1
+    ):
+        output = native_wide_linear(module.weight, x, group)
+        if output is not None:
+            return output
+    return module(x)
+
+
+def router_logits(x, weight):
+    x, weight = x.astype(mx.float32), weight.astype(mx.float32)
+    if x.ndim == 3 and x.shape[1] == 1:
+        output = native_wide_linear(weight, x)
+        if output is not None:
+            return output
+    return x @ weight.T
 
 
 class LatentCache(_BaseCache):
@@ -440,7 +466,9 @@ class Indexer(nn.Module):
         self.weights_proj = nn.Linear(hidden_size, self.heads, bias=False)
 
     def _project(self, x, need_weights):
-        return self.wk(x), self.weights_proj(x) if need_weights else None
+        return decode_linear(self.wk, x), (
+            decode_linear(self.weights_proj, x) if need_weights else None
+        )
 
     def __call__(self, x, positions, cos, sin, cache, causal):
         b, t, _ = x.shape
@@ -457,7 +485,7 @@ class Indexer(nn.Module):
         if k.shape[1] <= self.topk:
             return None  # All causal tokens are selected; retain keys for later chunks.
         q = (
-            self.wq_b(self.q_input_norm(x))
+            decode_linear(self.wq_b, self.q_input_norm(x))
             .reshape(b, t, self.heads, self.dim)
             .transpose(0, 2, 1, 3)
         )
@@ -484,15 +512,20 @@ class PackedIndexer(Indexer):
         projection = self.wk_weights_proj
         if isinstance(projection, nn.Linear) and (x.shape[1] != 1 or not need_weights):
             # Preserve prefill GEMM shapes and avoid unused short-prefix work.
+            if not self.training and x.shape[1] == 1:
+                k = native_wide_linear(projection.weight[: self.dim], x)
+                if k is not None:
+                    return k, None
             k = x @ projection.weight[: self.dim].T
             weights = x @ projection.weight[self.dim :].T if need_weights else None
             return k, weights
-        return mx.split(projection(x), [self.dim], axis=-1)
+        return mx.split(decode_linear(projection, x), [self.dim], axis=-1)
 
 
 class Attention(nn.Module):
     def __init__(self, args, idx):
         super().__init__()
+        self.group = None
         self.idx = idx
         self.source = args.kv_source_layers[idx]
         self.heads = args.num_attention_heads
@@ -546,7 +579,7 @@ class Attention(nn.Module):
                 indices,
                 mask,
                 scale,
-                chunk=64 if q.shape[0] == 1 else 128,
+                chunk=128,
             ).astype(q.dtype)
         else:
             if indices is not None:
@@ -568,7 +601,11 @@ class Attention(nn.Module):
 
     def __call__(self, x, positions, cos, sin, cache, shared, previous, mask):
         b, t, _ = x.shape
-        q = self.wq(x).reshape(b, t, self.heads, self.head_dim).transpose(0, 2, 1, 3)
+        q = (
+            decode_linear(self.wq, x, self.group)
+            .reshape(b, t, self.heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
         if self.rope_dim:
             q = mx.concatenate(
                 [
@@ -578,7 +615,7 @@ class Attention(nn.Module):
                 axis=-1,
             )
         if self.source == self.idx:
-            kv = self.wkv_a_with_mqa(x)
+            kv = decode_linear(self.wkv_a_with_mqa, x)
             latent = self.kv_a_norm(kv[..., : self.latent])[:, None]
             kr = kv[..., self.latent :][:, None]
             if self.rope_dim:
@@ -640,7 +677,7 @@ class Attention(nn.Module):
         out = out.transpose(0, 2, 1, 3).reshape(b, t, -1)
         if cache is not None:
             cache.advance(t)
-        return self.wo(out), topk
+        return decode_linear(self.wo, out, self.group), topk
 
 
 class Experts(nn.Module):
@@ -697,17 +734,24 @@ class Experts(nn.Module):
 class MLP(nn.Module):
     def __init__(self, dim, hidden):
         super().__init__()
+        self.group = None
         self.w1 = nn.Linear(dim, hidden, bias=False)
         self.w3 = nn.Linear(dim, hidden, bias=False)
         self.w2 = nn.Linear(hidden, dim, bias=False)
 
     def __call__(self, x):
-        return self.w2(nn.silu(self.w1(x)) * self.w3(x))
+        return decode_linear(
+            self.w2,
+            nn.silu(decode_linear(self.w1, x, self.group))
+            * decode_linear(self.w3, x, self.group),
+            self.group,
+        )
 
 
 class PackedMLP(nn.Module):
     def __init__(self, dim, hidden):
         super().__init__()
+        self.group = None
         self.gate_up_proj = nn.Linear(dim, 2 * hidden, bias=False)
         self.w2 = nn.Linear(hidden, dim, bias=False)
 
@@ -718,8 +762,8 @@ class PackedMLP(nn.Module):
             w1, w3 = mx.split(projection.weight, 2, axis=0)
             gate, up = x @ w1.T, x @ w3.T
         else:
-            gate, up = mx.split(projection(x), 2, axis=-1)
-        return self.w2(nn.silu(gate) * up)
+            gate, up = mx.split(decode_linear(projection, x, self.group), 2, axis=-1)
+        return decode_linear(self.w2, nn.silu(gate) * up, self.group)
 
 
 class MoE(nn.Module):
@@ -739,7 +783,11 @@ class MoE(nn.Module):
     def route(self, x):
         a = self.args
         scores = mx.softmax(
-            x.astype(mx.float32) @ self.gate.weight.T.astype(mx.float32),
+            (
+                x.astype(mx.float32) @ self.gate.weight.T.astype(mx.float32)
+                if self.training
+                else router_logits(x, self.gate.weight)
+            ),
             axis=-1,
             precise=True,
         )
@@ -857,6 +905,7 @@ class TextModel(nn.Module):
 class LanguageModel(nn.Module):
     def __init__(self, args: TextConfig):
         super().__init__()
+        self.group = None
         self.args = args
         self.model_type = args.model_type
         self.model = TextModel(args)
@@ -889,7 +938,13 @@ class LanguageModel(nn.Module):
                 raise
         captured = [] if capture_layer_ids is not None else None
         x = self.model(inputs, inputs_embeds, cache, mask, capture_layer_ids, captured)
-        logits = self.lm_head(x)
+        # Preserve the decode-only reduction when the full forward is a decode.
+        projection = (
+            partial(decode_linear, self.lm_head, group=self.group)
+            if x.shape[1] == 1
+            else self.lm_head
+        )
+        logits = project_logits(x, projection, kwargs.get("logits_to_keep"))
         cap = self.args.final_logit_softcapping
         if cap:
             logits = mx.tanh(logits / cap) * cap
@@ -905,8 +960,7 @@ class LanguageModel(nn.Module):
 
         logits = verify_logits(self, hidden)
         # Match generate_step's BF16 log-probability rounding and tie-breaking.
-        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        return mx.argmax(logprobs, axis=-1)
+        return greedy_argmax(logits)
 
     def rollback_speculative_cache(self, cache, transaction, accepted, block_size):
         from ...speculative.cache_state import rollback_speculative_cache
@@ -944,3 +998,12 @@ class LanguageModel(nn.Module):
                         if isinstance(value, mx.array) and value.shape[0] == n:
                             linear[key] = value[start:end]
             moe.start, moe.end, moe.group = start, end, group
+        # Dense decode shares output rows; prefill retains native GEMMs.
+        self.group = group
+        for layer in self.layers:
+            layer.attention.group = group
+            mlp = layer.feed_forward
+            if isinstance(mlp, MoE):
+                mlp = mlp.shared_experts
+            if mlp is not None:
+                mlp.group = group

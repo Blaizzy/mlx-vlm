@@ -26,8 +26,9 @@ def _wide_kernel():
 
 
 def native_wide_linear(weight, x, group=None):
-    """Reuse weights across positions while retaining decode's K reductions.
+    """Reuse weights across positions with the small-batch K reduction.
 
+    Singleton verification uses the same reduction as batches of two to five.
     Large replicated projections split complete output rows across the expert
     group, then gather them in order. Each scalar dot stays on one device.
     """
@@ -35,8 +36,8 @@ def native_wide_linear(weight, x, group=None):
         not mx.metal.is_available()
         or mx.default_device() != mx.gpu
         or x.ndim != 3
-        or not 2 <= x.shape[0] <= 15
-        or x.dtype not in (mx.bfloat16, mx.float16)
+        or not 1 <= x.shape[0] <= 15
+        or x.dtype not in (mx.bfloat16, mx.float16, mx.float32)
         or weight.dtype != x.dtype
         or x.shape[-1] % 4
         or weight.shape[0] <= 1
@@ -61,7 +62,7 @@ def native_wide_linear(weight, x, group=None):
     lanes = 32 if b <= 5 or n <= 64 else 16
     # Change tile occupancy, never the original batch's reduction geometry.
     if x.shape[1] == 1:
-        v, c, sg = 4, 1, lanes // 8
+        v, c, sg = (1 if b == 1 else 4), 1, lanes // 8
     elif n >= 49152:
         v, c, sg = (8, 2, lanes // 8) if b >= 6 else (8, 1, lanes // 8)
     elif b >= 6:

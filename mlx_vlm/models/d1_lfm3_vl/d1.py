@@ -10,10 +10,12 @@ this folder); the forward pass and readout are written for MLX.
 """
 
 import os
+from io import BytesIO
 from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
+import requests
 
 from ..cache import create_causal_mask
 from ..lfm3_vl.lfm3_vl import Model as Lfm3VlModel
@@ -24,6 +26,7 @@ from .pointer import SPAN_CAPS, position_logits, spans, state_positions
 from .prompt import (
     DEFAULT_STATE_STYLE,
     DEFAULT_SYSTEM,
+    QUESTION_TYPES,
     Box,
     Boxes,
     Choice,
@@ -261,9 +264,62 @@ class SystemOne(SystemOneApi):
         }
 
 
+def decision_question(question):
+    """A question of the shared decision API as `system_one` reads it: `bool` is a
+    noul, and a choice's list of labels names options without descriptions."""
+    kind, criteria = question.get("type"), question.get("criteria")
+    if kind == "bool":
+        return {**question, "type": "noul"}
+    if kind == "choice" and isinstance(criteria, list):
+        return {**question, "criteria": dict.fromkeys(criteria)}
+    return question
+
+
+def decision_audio(audio):
+    """A clip of the shared decision API as `system_one` reads it, decoded at its own
+    rate: only the Reader's resampler matches the checkpoints' code. Bare samples are
+    16 kHz, as in d1-omni."""
+    if isinstance(audio, np.ndarray):
+        return {"type": "audio", "audio": audio, "sampling_rate": 16000}
+    from mlx_audio.audio_io import read
+
+    if isinstance(audio, str) and audio.startswith(("http://", "https://")):
+        try:
+            response = requests.get(audio, timeout=10)
+            response.raise_for_status()
+        except requests.RequestException as error:
+            raise ValueError(f"Failed to load audio from {audio}: {error}") from error
+        audio = BytesIO(response.content)
+    wave, rate = read(audio, dtype="float32")
+    return {"type": "audio", "audio": wave, "sampling_rate": rate}
+
+
+def decision_answer(answer):
+    """A `system_one` answer in the shared decision API's fields. Multiple choice
+    and the typed answers have no shared fields and stay as they are."""
+    kind = answer["type"]
+    if kind == "noul":
+        probability = round(answer["noul"], 4)
+        return {"type": "bool", "value": probability >= 0.5, "probability": probability}
+    if kind not in ("choice", "score") or "choices" in answer:
+        return answer
+    metadata = {"confidence": round(answer["confidence"], 4)}
+    if kind == "score":
+        metadata["legend"] = answer["legend"]
+    return {
+        "type": kind,
+        "value": answer[kind] if kind == "choice" else round(answer[kind], 4),
+        "probabilities": {k: round(p, 4) for k, p in answer["probabilities"].items()},
+        "metadata": metadata,
+    }
+
+
 class D1:
     """What a d1 checkpoint adds to its LFM3 backbone: `system_one` over set
     attention, and no text generation."""
+
+    decision_types = (*QUESTION_TYPES, "bool")
+    decision_media = ("images",)
 
     def __call__(self, *args, **kwargs):
         raise ValueError(REFUSAL)
@@ -307,6 +363,26 @@ class D1:
     def system_one_batch(self, requests, score_readout=SCORE_READOUT, set_size=None):
         """`(state, questions)` or `(state, questions, media)` requests, one response each."""
         return self.engine.system_one_batch(requests, score_readout, set_size=set_size)
+
+    def predict(self, processor, state, questions, images=None, audio=None):
+        """`system_one` behind the shared decision API (`mlx_vlm.predict`,
+        `/v1/decisions`), with a score's value the expected level as in d1-3B."""
+        from ...utils import load_image
+
+        media = [load_image(image) for image in images or ()]
+        if audio is not None:
+            media.append(decision_audio(audio))
+        result = self.system_one(
+            state,
+            {name: decision_question(q) for name, q in questions.items()},
+            media or None,
+            score_readout="mean",
+        )
+        return {
+            "model": str(getattr(self, "model_path", "d1")),
+            "answers": {n: decision_answer(a) for n, a in result["answers"].items()},
+            "usage": result["usage"],
+        }
 
     def d1_features(self, part):
         """One media item's encoder features and the placeholder token they fill."""

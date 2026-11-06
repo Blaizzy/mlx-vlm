@@ -8,6 +8,7 @@ from ..base import (
     LanguageModelOutput,
     create_attention_mask,
     create_ssm_mask,
+    project_logits,
     scaled_dot_product_attention,
 )
 from ..cache import ArraysCache, KVCache
@@ -355,6 +356,7 @@ class LanguageModel(nn.Module):
         cache=None,
         input_embeddings: Optional[mx.array] = None,
         inputs_embeds: Optional[mx.array] = None,
+        logits_to_keep: int = 0,
         **kwargs,
     ) -> LanguageModelOutput:
         if inputs is None:
@@ -384,10 +386,12 @@ class LanguageModel(nn.Module):
             capture_layer_ids=capture_layer_ids,
             hidden_sink=hidden_sink,
         )
-        if self.args.tie_word_embeddings:
-            out = self.model.embed_tokens.as_linear(out)
-        else:
-            out = self.lm_head(out)
+        projection = (
+            self.model.embed_tokens.as_linear
+            if self.args.tie_word_embeddings
+            else self.lm_head
+        )
+        out = project_logits(out, projection, logits_to_keep)
         return LanguageModelOutput(
             logits=out,
             hidden_states=hidden_sink,

@@ -1,4 +1,3 @@
-import gc
 import logging
 import os
 import time
@@ -31,6 +30,7 @@ from ..generate import (  # noqa: F401 - compatibility re-exported by server.__i
     _make_cache,
     wired_limit,
 )
+from ..generate.common import DiffusionRNG, generation_stream
 from ..generate.diffusion import (
     is_diffusion_model,
     stream_diffusion_generate_from_kwargs,
@@ -1234,10 +1234,14 @@ class ResponseGenerator:
     ) -> Tuple[GenerationContext, "_TokenIterator"]:
         self.wait_until_ready()
         args = args or GenerationArguments(max_tokens=get_server_max_tokens())
-        if session is not None and is_diffusion_model(self.model):
-            raise ValueError(
-                "Inference checkpoints currently require an autoregressive model."
+        if (
+            session is not None
+            and is_diffusion_model(self.model)
+            and not callable(
+                getattr(self.model.language_model, "generate_blocks", None)
             )
+        ):
+            raise ValueError("This diffusion model does not expose resumable blocks.")
         if self.draft_model is not None and args.logits_processors is not None:
             raise ValueError(
                 "Structured response_format is not supported with speculative decoding."
@@ -1911,8 +1915,13 @@ class ResponseGenerator:
                 "logprobs",
             )
         )
-        # Speculative iterators own draft state that cannot yet be row-extracted.
-        if self.draft_model is not None and request.session is not None:
+        # DFlash and MTP own extractable per-row state. Other speculative iterators
+        # still require a dedicated group to retain their generator closure.
+        if (
+            self.draft_model is not None
+            and request.session is not None
+            and self.draft_kind not in ("dflash", "mtp")
+        ):
             key += (id(request.session),)
         return key
 
@@ -1924,6 +1933,7 @@ class ResponseGenerator:
                 getattr(checkpoint, "hidden", None),
                 getattr(checkpoint, "shared_kv_states", None),
                 getattr(checkpoint, "prompt_tokens", None),
+                getattr(checkpoint, "_batch_state", None),
                 info.get("gen_kwargs"),
             ]
         )
@@ -1998,7 +2008,7 @@ class ResponseGenerator:
             self._step(engine, active)
 
     def _run_impl(self):
-        """Single GPU thread: owns BatchGenerator, runs tight next() loop."""
+        """Own batch scheduling and publish each decode phase before prefill."""
         try:
             self._initialize_model()
         except Exception as e:
@@ -2095,53 +2105,103 @@ class ResponseGenerator:
                 engine.close()
 
     def _run_diffusion(self):
-        """GPU thread loop for diffusion models.
+        """Run diffusion requests, retaining paused iterators at block boundaries.
 
-        Diffusion generation runs one request at a time (batch size 1).
-        Output streams back block-by-block: one queue item per denoised
-        block, plus a final item carrying the finish reason. Non-streaming
-        endpoints aggregate the same items into a single response.
+        Only one request executes on the GPU at a time. A paused session keeps
+        its model-owned canvas/cache and yields the worker to another request.
         """
         uid_counter = 0
+        active = {}
         cancelled: set = set()
-        while not self._stop:
-            try:
-                new_items, should_stop = self._collect_pending_requests(active=False)
+        self._wire_context = wired_limit(self.model, [generation_stream])
+        self._wire_context.__enter__()
+
+        def release(uid, error=None):
+            output, iterator = active.pop(uid)
+            with mx.stream(generation_stream):
+                iterator.close()
+            if error is not None:
+                if isinstance(output, InferenceSession):
+                    output.dispose(str(error))
+                else:
+                    output.put(error)
+            output.put(None)
+
+        try:
+            while not self._stop:
+                cancelled.update(self._drain_cancellations())
+                for uid, (output, _) in list(active.items()):
+                    try:
+                        if isinstance(output, InferenceSession):
+                            output.check()
+                        if uid in cancelled:
+                            release(uid)
+                    except Exception as error:
+                        release(uid, error)
+                cancelled.clear()
+
+                runnable = [
+                    uid
+                    for uid, (output, _) in active.items()
+                    if not isinstance(output, InferenceSession) or not output.paused
+                ]
+                limit = get_max_num_seqs()
+                new_items, should_stop = self._collect_pending_requests(
+                    active=bool(runnable),
+                    capacity=None if limit is None else max(0, limit - len(runnable)),
+                )
                 if should_stop:
                     break
-                cancelled |= self._drain_cancellations()
                 for request in new_items:
-                    rqueue = request.rqueue
-                    raw_inputs = request.raw_inputs
-                    prompt_tokens = request.prompt_tokens
-                    args = request.args
-                    log_state = self._log_prefill_started(request, backend="diffusion")
                     uid_counter += 1
                     uid = uid_counter
-                    rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
-                    try:
+                    output = request.session or request.rqueue
+                    context = GenerationContext(
+                        uid=uid, prompt_tokens=request.prompt_tokens
+                    )
+                    if request.session is not None:
+                        request.session.owner = self
+                        request.session.context = context
+                    active[uid] = (
+                        output,
                         self._generate_diffusion(
                             uid,
-                            rqueue,
-                            raw_inputs,
-                            args,
+                            output,
+                            request.raw_inputs,
+                            request.args,
                             cancelled,
-                            log_state,
+                            self._log_prefill_started(request, backend="diffusion"),
                             apc_semantic_hash=request.apc_semantic_hash,
+                        ),
+                    )
+                    request.rqueue.put(context)
+
+                # Preserve serial scheduling for ordinary requests; paused ones
+                # no longer block the queue. Re-check pause after admission.
+                for uid, (output, iterator) in list(active.items()):
+                    if isinstance(output, InferenceSession) and output.paused:
+                        continue
+                    try:
+                        timing = (
+                            output.generating()
+                            if isinstance(output, InferenceSession)
+                            else nullcontext()
                         )
-                        rqueue.put(None)
-                    except Exception as e:
+                        with timing, mx.stream(generation_stream):
+                            next(iterator)
+                    except StopIteration:
+                        release(uid)
+                        mx.clear_cache()
+                    except Exception as error:
                         logger.exception("Error in diffusion generation")
-                        try:
-                            rqueue.put(e)
-                            rqueue.put(None)
-                        except Exception:
-                            pass
-                    mx.clear_cache()
-            except Exception:
-                logger.exception("Error in diffusion generation thread")
-                mx.clear_cache()
-                gc.collect()
+                        release(uid, error)
+                        mx.clear_cache()
+                    break
+        finally:
+            for uid in list(active):
+                release(
+                    uid, ValueError("The model was unloaded. Regenerate the response.")
+                )
 
     def _generate_diffusion(
         self,
@@ -2176,8 +2236,11 @@ class ResponseGenerator:
         prefill_step_size = self._effective_prefill_step_size()
         if prefill_step_size > 0:
             stream_kwargs["prefill_step_size"] = prefill_step_size
-        if args.seed is not None:
+        if isinstance(rqueue, InferenceSession):
+            stream_kwargs["_rng"] = DiffusionRNG(args.seed)
+        elif args.seed is not None:
             stream_kwargs["seed"] = args.seed
+        stream_kwargs["manage_wired_limit"] = False
         if args.logits_processors is not None:
             stream_kwargs["logits_processors"] = args.logits_processors
         stream_kwargs.update(args.diffusion_kwargs())
@@ -2221,6 +2284,9 @@ class ResponseGenerator:
                 return False
             return True
 
+        incremental = callable(
+            getattr(self.model.language_model, "generate_blocks", None)
+        )
         results = stream_diffusion_generate_from_kwargs(
             self.model,
             self.processor,
@@ -2231,19 +2297,22 @@ class ResponseGenerator:
             skip_special_token_ids,
             stream_kwargs,
             skip_special_tokens=args.skip_special_tokens,
-            on_result=on_result,
+            on_result=None if incremental else on_result,
         )
         try:
-            for _ in results:
-                pass
+            for result in results:
+                if not on_result(result):
+                    return
+                if result.diffusion_block_complete:
+                    yield
         finally:
             results.close()
 
     def _step(self, batch_gen, active, gen_kwargs=None):
-        """One batch generation step: prefill + decode."""
-        kwargs = gen_kwargs or {}
+        """Publish ready decode tokens before advancing bounded prompt work."""
         try:
-            prompt_responses, responses = batch_gen.next(**kwargs)
+            self._emit_responses(batch_gen.decode_step(), active)
+            prompt_responses = batch_gen.prefill_step()
         except _apc.APCAdmissionError as error:
             if error.uid not in active:
                 raise
@@ -2261,9 +2330,8 @@ class ResponseGenerator:
                 # Decode caches now own the context. Do not retain the full
                 # prompt embedding tensor in every paused continuation.
                 info["gen_kwargs"] = None
-        if not responses:
-            return
 
+    def _emit_responses(self, responses, active):
         for r in responses:
             if r.uid not in active:
                 continue

@@ -1,4 +1,4 @@
-"""Verify speculative blocks with decode-equivalent reductions and cache visibility."""
+"""Verify speculative blocks with small-batch reductions and causal cache visibility."""
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -8,7 +8,7 @@ from ...speculative.ops.linear import _target_verify_linear
 from ..linear import native_batch_linear, tokenwise
 from . import moe_kernel as mk
 from .block_mla_kernel import block_sparse_mla, project_queries, project_values
-from .language import MoE, PackedIndexer, PackedMLP, rotate
+from .language import MoE, PackedIndexer, PackedMLP, rotate, router_logits
 from .moe_kernel import masked_qmv, supports_masked_qmv
 from .verify_kernel import native_wide_linear
 
@@ -50,8 +50,7 @@ def local_experts(x, gate_weight, packed, scales, factors, start, routed_scaling
     all_weights = []
     for t in range(x.shape[1]):
         scores = mx.softmax(
-            mx.contiguous(x[:, t : t + 1]).astype(mx.float32)
-            @ gate_weight.T.astype(mx.float32),
+            router_logits(mx.contiguous(x[:, t : t + 1]), gate_weight),
             axis=-1,
             precise=True,
         )
@@ -152,12 +151,12 @@ def _expert_parameters(language_model, dtype):
 
 
 def linear(module, x, group=None):
-    # Batched decode uses B-by-1 reductions, which differ from singleton GEMV.
+    # Use the small-batch reduction even for a singleton verifier.
+    if isinstance(module, nn.Linear) and "bias" not in module:
+        output = native_wide_linear(module.weight, x, group)
+        if output is not None:
+            return output
     if x.shape[0] > 1:
-        if isinstance(module, nn.Linear) and "bias" not in module:
-            output = native_wide_linear(module.weight, x, group)
-            if output is not None:
-                return output
         return native_batch_linear(module, x)
     return _target_verify_linear(module, x)
 
@@ -374,7 +373,7 @@ def _sparse_attention_block(
         mask,
         attention.head_dim**-0.5,
         counts,
-        chunk=64 if batch == 1 else 128,
+        chunk=128,
     )
     out = project_values(out, weight, attention.nope_dim)
     return linear(
@@ -466,7 +465,7 @@ def attention_block(attention, x, positions, cos, sin, cache, shared, topk, grou
         mask,
         attention.head_dim**-0.5,
         counts,
-        chunk=64 if batch == 1 else 128,
+        chunk=128,
     )
     out = project_values(out, weight, attention.nope_dim)
     return linear(
@@ -495,7 +494,7 @@ def verify_hidden(language_model, inputs, cache, capture_layer_ids):
         captured = {}
         for i, (layer, entry) in enumerate(zip(model.layers, cache)):
             normalized = layer.attention_norm(x)
-            if b > 1 and isinstance(layer.attention.wkv_b, nn.Linear):
+            if isinstance(layer.attention.wkv_b, nn.Linear):
                 attended = attention_block(
                     layer.attention,
                     normalized,

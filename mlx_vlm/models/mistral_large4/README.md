@@ -27,6 +27,8 @@ the same checkout, environment, model, and image paths on each Mac:
 ```sh
 mlx.launch \
   --hostfile /path/to/hosts.json \
+  --env MLX_METAL_FAST_SYNCH=1 \
+  --env MLX_METAL_RESIDENCY_REFRESH_INTERVAL_MS=100 \
   --cwd /path/to/mlx-vlm \
   --python /path/to/venv/bin/python \
   /path/to/mlx-vlm/examples/sharded_generate.py \
@@ -36,6 +38,10 @@ mlx.launch \
   --image /path/to/image.png \
   --max-tokens 128
 ```
+
+Use an MLX build with residency-refresh support. The 100 ms refresh avoids the
+idle-related prefill stalls observed with this model by periodically renewing
+Metal residency. The launcher passes both environment settings to every rank.
 
 The runner uses `sharded_load`, which calls `model.shard(group)`, followed by
 `stream_generate`. For deterministic distributed decoding, set `do_sample` to

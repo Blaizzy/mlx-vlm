@@ -335,6 +335,7 @@ class LanguageModel(nn.Module):
         temperature: float = 0.0,
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
+        rng=None,
     ):
         if temperature == 0.0:
             token = mx.argmax(logits, axis=-1)
@@ -346,12 +347,20 @@ class LanguageModel(nn.Module):
             logits = logits / temperature
         logits = self._top_k_logits(logits, top_k)
         logits = self._top_p_logits(logits, top_p)
-        token = mx.random.categorical(logits.astype(mx.float32), axis=-1)
+        token = mx.random.categorical(
+            logits.astype(mx.float32), axis=-1, key=rng() if rng is not None else None
+        )
         probs = mx.softmax(logits.astype(mx.float32), axis=-1, precise=True)
         token_prob = mx.take_along_axis(probs, token[..., None], axis=-1)[..., 0]
         return token, token_prob
 
-    def generate(
+    def generate(self, *args, **kwargs):
+        """Generate synchronously, retaining the callback API."""
+        from ...generate.common import consume_generator
+
+        return consume_generator(self.generate_blocks(*args, **kwargs))
+
+    def generate_blocks(
         self,
         inputs: mx.array,
         temperature: float = 0.0,
@@ -379,7 +388,13 @@ class LanguageModel(nn.Module):
         on_block: Optional[Callable[[List[int]], bool]] = None,
         on_result: Optional[Callable[[GenerationResult], bool]] = None,
         **kwargs,
-    ) -> mx.array:
+    ):
+        """Yield after each committed block; return the final token array.
+
+        Results are delivered through on_result. Closing this iterator releases
+        the unfinished generation without starting another denoising block.
+        """
+        rng = kwargs.pop("_rng", None)
         generation_mode = kwargs.pop("generation_mode", None)
         if generation_mode in ("linear_speculative", "linear_spec") or kwargs.pop(
             "linear_speculative", False
@@ -578,6 +593,7 @@ class LanguageModel(nn.Module):
                     temperature=temperature,
                     top_k=top_k,
                     top_p=top_p,
+                    rng=rng,
                 )
                 if stats is not None and not recorded_prompt_time:
                     mx.eval(x0, x0_p)
@@ -667,6 +683,8 @@ class LanguageModel(nn.Module):
                 if not keep_going:
                     callback_stopped = True
                     break
+            # Retain the canvas, caches and loop position until the next block.
+            yield
             if eos_early_stop:
                 generated = x[0, prompt_length:current_window_end]
                 if not bool((generated == mask_id).any().item()):

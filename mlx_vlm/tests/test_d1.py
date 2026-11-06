@@ -3,10 +3,13 @@ readouts, and a tiny random-weight model end to end. Real checkpoints run when
 D1_PATH (d1-2B) or D1_OMNI_PATH (d1-omni-2B) name a local copy."""
 
 import copy
+import io
 import json
 import math
 import os
+import wave
 from pathlib import Path
+from types import SimpleNamespace
 
 import mlx.core as mx
 import numpy as np
@@ -461,6 +464,153 @@ def test_tiny_omni_answers_text(tokenizer):
     assert out["answers"]["team"]["choice"] in QUESTIONS["team"]["criteria"]
     with pytest.raises(ValueError, match="system_one"):
         model.generate_audio([1, 2])
+
+
+def test_tiny_model_answers_the_shared_decision_api(tiny_model, tmp_path):
+    from PIL import Image
+
+    from mlx_vlm import predict
+
+    asked = {
+        **QUESTIONS,
+        **VALUES,
+        "paid": {"type": "bool", "instructions": "Is it paid?"},
+        "queue": {
+            "type": "choice",
+            "instructions": "Which queue?",
+            "criteria": ["billing", "shipping"],
+        },
+    }
+    out = predict(tiny_model, None, INVOICE, asked)
+    native = tiny_model.system_one(
+        INVOICE,
+        {
+            **asked,
+            "paid": {**asked["paid"], "type": "noul"},
+            "queue": {
+                **asked["queue"],
+                "criteria": dict.fromkeys(["billing", "shipping"]),
+            },
+        },
+        score_readout="mean",
+    )
+    answers, own = out["answers"], native["answers"]
+    assert out["usage"] == native["usage"]
+    for name in ("refund", "paid"):
+        p = round(own[name]["noul"], 4)
+        assert answers[name] == {"type": "bool", "value": p >= 0.5, "probability": p}
+    for name in ("team", "queue"):
+        assert answers[name] == {
+            "type": "choice",
+            "value": own[name]["choice"],
+            "probabilities": {
+                k: round(v, 4) for k, v in own[name]["probabilities"].items()
+            },
+            "metadata": {"confidence": round(own[name]["confidence"], 4)},
+        }
+    assert answers["urgency"] == {
+        "type": "score",
+        "value": round(own["urgency"]["score"], 4),
+        "probabilities": {
+            k: round(v, 4) for k, v in own["urgency"]["probabilities"].items()
+        },
+        "metadata": {
+            "confidence": round(own["urgency"]["confidence"], 4),
+            "legend": own["urgency"]["legend"],
+        },
+    }
+    for name in ("topics", *VALUES):
+        assert answers[name] == own[name]
+
+    path = tmp_path / "p.png"
+    Image.fromarray(
+        np.random.default_rng(0).integers(0, 255, (20, 28, 3), np.uint8)
+    ).save(path)
+    refund = {"refund": QUESTIONS["refund"]}
+    seen = predict(tiny_model, None, None, refund, images=[str(path)])
+    alone = tiny_model.system_one(None, refund, [Image.open(path).convert("RGB")])
+    assert seen["answers"]["refund"]["probability"] == round(
+        alone["answers"]["refund"]["noul"], 4
+    )
+    with pytest.raises(ValueError, match="'multi_label' decisions"):
+        predict(
+            tiny_model,
+            None,
+            TICKET,
+            {"x": {"type": "multi_label", "instructions": "?", "criteria": ["a"]}},
+        )
+    with pytest.raises(ValueError, match="audio input"):
+        predict(tiny_model, None, None, refund, audio="clip.wav")
+
+
+def test_tiny_omni_decision_api_decodes_audio(tokenizer, monkeypatch):
+    from mlx_vlm import predict
+    from mlx_vlm.models import d1_lfm3_omni
+
+    config = tiny_case("lfm3_omni", tokenizer)
+    config["audio_token_id"] = config["video_token_id"] + 1
+    config["audio_out_token_id"] = config["video_token_id"] + 2
+    model = d1_lfm3_omni.Model(d1_lfm3_omni.ModelConfig.from_dict(config))
+    seen = {}
+
+    def system_one(state, questions, media=None, **_):
+        seen["media"] = media
+        return {"answers": {}, "usage": {"input_tokens": 0, "output_tokens": 0}}
+
+    monkeypatch.setattr(model, "system_one", system_one)
+    clip = io.BytesIO()
+    with wave.open(clip, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(8000)
+        w.writeframes(np.zeros(8000, "<i2").tobytes())
+    clip.seek(0)
+    predict(model, None, None, {"x": QUESTIONS["refund"]}, audio=clip)
+    [item] = seen["media"]
+    assert item["type"] == "audio" and item["sampling_rate"] == 8000
+    assert item["audio"].shape == (8000,)
+    samples = np.zeros(4000, np.float32)
+    predict(model, None, None, {"x": QUESTIONS["refund"]}, audio=samples)
+    [item] = seen["media"]
+    assert item["sampling_rate"] == 16000 and item["audio"] is samples
+    url = "https://example.test/clip.wav"
+    response = SimpleNamespace(content=clip.getvalue(), raise_for_status=lambda: None)
+    monkeypatch.setattr(d1.requests, "get", lambda *_, **__: response)
+    predict(model, None, None, {"x": QUESTIONS["refund"]}, audio=url)
+    assert seen["media"][0]["sampling_rate"] == 8000
+
+    def unreachable(*_, **__):
+        raise d1.requests.ConnectionError("down")
+
+    monkeypatch.setattr(d1.requests, "get", unreachable)
+    with pytest.raises(ValueError, match="Failed to load audio"):
+        predict(model, None, None, {"x": QUESTIONS["refund"]}, audio=url)
+
+
+def test_tiny_model_serves_decisions_over_http(tiny_model, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import mlx_vlm.server as server
+
+    monkeypatch.setattr(server.runtime, "model_cache", server.ModelCacheRegistry())
+    monkeypatch.setattr("mlx_vlm.utils.load", lambda _: (tiny_model, None))
+    monkeypatch.setenv("MLX_VLM_PRELOAD_DECISION_MODEL", "d1-2B")
+    with TestClient(server.app) as client:
+        answered = client.post(
+            "/v1/decisions", json={"state": TICKET, "questions": QUESTIONS}
+        )
+        refused = client.post(
+            "/v1/decisions",
+            json={"state": TICKET, "questions": {"x": {"type": "nope"}}},
+        )
+    assert answered.status_code == 200
+    body = answered.json()
+    assert body["model"] == "d1-2B"
+    assert body["answers"]["refund"]["type"] == "bool"
+    assert body["answers"]["team"]["value"] in QUESTIONS["team"]["criteria"]
+    assert body["usage"]["output_tokens"] == 0
+    assert refused.status_code == 400
+    assert refused.json()["detail"] == "This model does not support 'nope' decisions"
 
 
 def test_config_defaults_and_checks(tokenizer):

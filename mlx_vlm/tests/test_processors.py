@@ -1634,6 +1634,28 @@ def test_locate_anything_save_pretrained_round_trips_custom_config(tmp_path):
     assert loaded.chat_template == loaded.tokenizer.chat_template == template
 
 
+def test_muse_glimmer_save_pretrained_round_trips_without_model_config(tmp_path):
+    from mlx_vlm.models.muse_glimmer import ModelConfig
+
+    tokens = ("[UNK]", "[PAD]", "hello", "<|patch|>")
+    p = c.muse_glimmer(
+        image_processor=m.muse_glimmer.MuseGlimmerImageProcessor(max_image_tokens=1234),
+        tokenizer=fast_tokenizer(tokens),
+        config=ModelConfig(),
+    )
+    p.save_pretrained(tmp_path)
+    saved = json.loads((tmp_path / "processor_config.json").read_text())
+    assert "config" not in saved
+    with patch(
+        "transformers.AutoTokenizer.from_pretrained",
+        return_value=fast_tokenizer(tokens),
+    ):
+        loaded = c.muse_glimmer.from_pretrained(
+            tmp_path, config={"model_type": "muse_glimmer"}
+        )
+    assert loaded.image_processor.max_image_tokens == 1234
+
+
 def test_qwen3_vl_video_timestamp_video_prompt_falls_back_to_processor_fps():
     p = _make_processor("qwen3_vl")
     p.tokenizer = ProcessorTokenizer(
@@ -2272,6 +2294,64 @@ class TestApplyChatTemplateIntegration:
         types = [item["type"] for item in result[0]["content"]]
         assert types == ["image", "audio", "text"]
 
+    @pytest.mark.parametrize("num_images", [1, 2])
+    def test_lfm3_media_only_turn_keeps_audio_after_image(self, num_images):
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        # A user turn carrying an image but no trailing text part (e.g. an
+        # image plus a spoken question). Audio must still follow the image to
+        # match the reference image -> audio -> text order.
+        result = apply_chat_template(
+            None,
+            {"model_type": "lfm3_omni"},
+            [{"role": "user", "content": [{"type": "image"}] * num_images}],
+            return_messages=True,
+            num_images=num_images,
+            num_audios=1,
+        )
+        types = [item["type"] for item in result[0]["content"]]
+        assert types == ["image"] * num_images + ["audio"]
+
+    @pytest.mark.parametrize(
+        "content,expected_types",
+        [
+            (
+                [
+                    {"type": "text", "text": "Here is the image:"},
+                    {"type": "image"},
+                    {"type": "text", "text": "Answer the spoken question."},
+                ],
+                ["text", "image", "audio", "text"],
+            ),
+            (
+                [
+                    {"type": "image"},
+                    {"type": "text", "text": "Compare with this image:"},
+                    {"type": "image"},
+                    {"type": "text", "text": "Answer the spoken question."},
+                ],
+                ["image", "text", "image", "audio", "text"],
+            ),
+            (
+                [
+                    {"type": "image"},
+                    {"type": "text", "text": "Compare with this image:"},
+                    {"type": "image"},
+                ],
+                ["image", "text", "image", "audio"],
+            ),
+        ],
+    )
+    def test_lfm3_interleaved_images_stay_before_audio(self, content, expected_types):
+        result = apply_chat_template(
+            None,
+            {"model_type": "lfm3_omni"},
+            [{"role": "user", "content": content}],
+            return_messages=True,
+            num_audios=1,
+        )
+        assert [item["type"] for item in result[0]["content"]] == expected_types
+
     def test_assistant_reasoning_content_is_preserved(self):
         messages = [
             {"role": "user", "content": "What is 17 + 25?"},
@@ -2420,6 +2500,45 @@ class TestApplyChatTemplateIntegration:
             "text",
         ]
         assert parts[2]["text"] == "before" and parts[4]["text"] == "after"
+
+    @pytest.mark.parametrize("family", ["phi3_v", "phi4mm"])
+    @pytest.mark.parametrize("explicit_last", [True, False])
+    def test_numbered_images_continue_across_turns(self, family, explicit_last):
+        last = (
+            [dict(type="image"), dict(type="text", text="And this one?")]
+            if explicit_last
+            else "And this one?"
+        )
+        messages = [
+            dict(
+                role="user", content=[dict(type="image"), dict(type="text", text="A?")]
+            ),
+            dict(role="assistant", content="A cat."),
+            dict(role="user", content=last),
+        ]
+        rendered = apply_chat_template(
+            None, dict(model_type=family), messages, num_images=2
+        )
+        assert rendered.count("<|image_1|>") == 1
+        assert rendered.count("<|image_2|>") == 1
+        assert (
+            rendered.index("<|image_1|>")
+            < rendered.index("A cat.")
+            < rendered.index("<|image_2|>")
+        )
+
+    def test_num_videos_warns_and_video_adds_placeholder(self):
+        config = dict(model_type="qwen2_5_vl")
+        with pytest.warns(UserWarning, match="video="):
+            result = apply_chat_template(
+                None, config, "Describe this.", num_videos=1, return_messages=True
+            )
+        assert "video" not in str(result)
+
+        result = apply_chat_template(
+            None, config, "Describe this.", video="clip.mp4", return_messages=True
+        )
+        assert [part["type"] for part in result[0]["content"]] == ["video", "text"]
 
     def test_explicit_images_do_not_bypass_single_image_limit(self):
         message = dict(role="user", content=[dict(type="image"), dict(type="image")])

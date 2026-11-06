@@ -110,8 +110,6 @@ class Model(MiniCPMVModel):
         embeddings = super().get_input_embeddings(
             input_ids, pixel_values=pixel_values, **kwargs
         )
-        # The language cache counts padded tokens, so subtract the padded width.
-        deltas = positions.max(axis=(0, 2))[:, None] + 1 - ids.shape[1]
         positions, deltas = mx.array(positions), mx.array(deltas, dtype=mx.int32)
         self.language_model._position_ids = positions
         self.language_model._rope_deltas = deltas

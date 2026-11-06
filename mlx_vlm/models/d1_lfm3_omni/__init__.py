@@ -15,6 +15,8 @@ class ModelConfig(D1Config, Lfm3OmniConfig):
 
 
 class Model(D1, Lfm3OmniModel):
+    decision_media = ("images", "audio")
+
     def generate_audio(self, *args, **kwargs):
         raise ValueError(REFUSAL)
 
