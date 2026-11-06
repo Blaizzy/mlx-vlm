@@ -368,10 +368,13 @@ def test_text_cli_media_and_arguments(capsys, mode):
         _assert_fields(
             generated.kwargs, max_tokens=12, temperature=0.7, prefill_step_size=128
         )
-    elif mode == "video":
+    else:
+        # Without --enable-thinking the template keeps its own default.
+        assert "enable_thinking" not in template.kwargs
+    if mode == "video":
         for kwargs in (template.kwargs, generated.kwargs):
             _assert_fields(kwargs, video=["clip.mp4"], fps=1.0)
-    else:
+    elif mode == "frames":
         assert template.kwargs["num_images"] == 4 and "video" not in template.kwargs
         assert len(generated.kwargs["image"]) == 4 and generated.kwargs["video"] is None
     output = capsys.readouterr().out

@@ -1507,7 +1507,11 @@ def main():
     num_images = len(args.image) if args.image is not None else 0
     num_audios = len(args.audio) if args.audio is not None else 0
 
-    chat_template_kwargs = {"enable_thinking": args.enable_thinking}
+    # Without --enable-thinking, leave the choice to apply_chat_template, which
+    # keeps each template's default (e.g. Qwen3-Omni Instruct).
+    chat_template_kwargs = {}
+    if args.enable_thinking:
+        chat_template_kwargs["enable_thinking"] = True
     if output_modality == "audio":
         chat_template_kwargs["use_tts_template"] = True
     if args.thinking_mode is not None:
