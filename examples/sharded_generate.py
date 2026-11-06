@@ -4,9 +4,9 @@ Run with:
 ```
 mlx.launch \
     --backend jaccl \
-    --env MLX_METAL_FAST_SYNCH=1 \
     --hostfile /path/to/hosts.json \
-    /path/to/sharded_generate.py \
+    -- python /path/to/sharded_generate.py \
+    --backend jaccl \
     --prompt 'Describe this image.' --image /path/to/image.jpg
 ```
 
