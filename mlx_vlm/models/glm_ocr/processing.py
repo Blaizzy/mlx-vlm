@@ -4,6 +4,7 @@ from typing import List, Optional, Tuple, Union
 import numpy as np
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_processing_utils import ImageProcessingMixin
+from transformers.image_utils import ChannelDimension, infer_channel_dimension_format
 from transformers.processing_utils import ProcessorMixin
 
 from ..base import install_auto_processor_patch
@@ -192,7 +193,12 @@ class Glm46VImageProcessor(ImageProcessingMixin):
         all_patches = []
         all_thw = []
         for image in images:
-            if not (isinstance(image, np.ndarray) and image.ndim == 3):
+            if isinstance(image, np.ndarray) and image.ndim == 3:
+                # numpy images may arrive channels-last (HF convention); only treat
+                # them as CHW when the layout inference says so.
+                if infer_channel_dimension_format(image) == ChannelDimension.LAST:
+                    image = np.transpose(image, (2, 0, 1))
+            else:
                 image = _to_numpy_image(image)
             patches, thw = self._process_one(image)
             all_patches.append(patches)
