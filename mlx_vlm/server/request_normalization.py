@@ -6,9 +6,13 @@ from typing import List, Optional, Tuple, Union
 from ..generate import DEFAULT_REPETITION_CONTEXT_SIZE
 from ..generate.common import resolve_sampling_defaults
 from ..prompt_utils import extract_text_from_content, normalize_image_content
-from ..structured import build_json_schema_logits_processor
+from ..structured import (
+    build_json_schema_logits_processor,
+    build_tool_call_logits_processor,
+)
 from .generation import (
     GenerationArguments,
+    get_server_constrain_tool_calls,
     get_server_enable_thinking,
     get_server_max_tokens,
     get_server_thinking_budget,
@@ -188,6 +192,38 @@ def _build_structured_logits_processors(
 
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
     return [logits_processor_factory(tokenizer, schema)]
+
+
+def _build_tool_call_logits_processors(
+    gen_args,
+    processor,
+    tool_parser_type,
+    tools,
+    tool_choice=None,
+    logits_processor_factory=build_tool_call_logits_processor,
+):
+    """Constrain tool calls to the request's schemas when the server opts in.
+
+    A response_format processor keeps priority, and tool_choice="none" or an
+    unsupported tool format leaves generation unconstrained.
+    """
+    if (
+        not tools
+        or gen_args.logits_processors is not None
+        or tool_choice == "none"
+        or not get_server_constrain_tool_calls()
+    ):
+        return None
+    if isinstance(tool_choice, dict):
+        name = (tool_choice.get("function") or {}).get("name") or tool_choice.get(
+            "name"
+        )
+        if name:
+            tools = [
+                t for t in tools if (t.get("function") or t).get("name") == name
+            ] or tools
+    processor = logits_processor_factory(processor, tool_parser_type, tools)
+    return [processor] if processor is not None else None
 
 
 def _build_gen_args(
