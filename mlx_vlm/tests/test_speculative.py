@@ -3905,26 +3905,42 @@ def test_speculators_sliding_attention_causality(non_causal):
         assert (difference < 1e-6) == (i == 0 and not non_causal)
 
 
-@parametrize("family", ["mellum"])
+@parametrize("family", ["mellum", "deepseek_v41"])
 def test_native_split_load_and_greedy_generation(family, tmp_path):
     mx.random.seed(7)
     target = tiny_language_model(family)
     raw = target.config.to_dict()
-    arch = module(f"speculative.drafters.{family}_mtp")
-    draft = arch.Model(arch.ModelConfig(text_config=raw))
+    arch = module(
+        f"speculative.drafters.{family}_{'mtp' if family == 'mellum' else 'dspark'}"
+    )
+    opts = {} if family == "mellum" else dict(n_mtp_layers=2, markov_rank=8)
+    draft = arch.Model(arch.ModelConfig(text_config=raw, **opts))
     source = {}
     for key, value in tree_flatten(draft.parameters()):
-        key = f"mtp.{key}"
+        if family == "mellum":
+            key = f"mtp.{key}"
+        elif key.startswith("markov_head."):
+            key = f"mtp.1.{key.replace('markov_w1', 'embed').replace('markov_w2', 'head')}"
+        else:
+            key = key.replace("stages.", "mtp.", 1)
         if ".switch_mlp." in key:
             for index, tensor in enumerate(value):
                 stem = key.replace(".switch_mlp.", f".experts.{index}.")
+                if family == "deepseek_v41":
+                    stem = (
+                        stem.replace("gate_proj", "w1")
+                        .replace("down_proj", "w2")
+                        .replace("up_proj", "w3")
+                    )
                 source[stem] = tensor
+        elif ".attn.wo_a.weight" in key:
+            source[key] = value.flatten(0, 1)
         else:
             source[key] = value
     config, weights, path = split_checkpoint(tmp_path, raw, source, separate=True)
     loaded, kind = load_drafter(str(path))
     bundled, bundled_kind = load_drafter(str(tmp_path))
-    assert kind == bundled_kind == "mtp"
+    assert kind == bundled_kind == ("mtp" if family == "mellum" else "dflash")
     equal(
         dict(tree_flatten(loaded.parameters())),
         dict(tree_flatten(bundled.parameters())),
@@ -3957,3 +3973,28 @@ def test_qwen_text_aliases_share_native_splitter(name):
         source_config={"model_type": name, "mtp_num_hidden_layers": 1}
     )
     assert splitter.output_model_type == "qwen3_5_mtp"
+
+
+@parametrize("bits", [4, 8])
+def test_deepseek_v41_native_packed_weights(bits):
+    split = get_mtp_splitter("deepseek_v41")
+    raw = tiny_language_model("deepseek_v41").config.to_dict()
+    mode = f"mxfp{bits}"
+    original = mx.random.normal((32, 32))
+    packed, scales = mx.quantize(original, group_size=32, bits=bits, mode=mode)
+    prefix = "mtp.0.main_proj" if bits == 8 else "mtp.0.ffn.experts.0.w1"
+    source = {f"{prefix}.weight": packed.view(mx.uint8), f"{prefix}.scale": scales}
+    if bits == 4:
+        source.update(
+            {k.replace("experts.0", "experts.1"): v for k, v in list(source.items())}
+        )
+    converted = split.transform(source, raw, False)
+    name = "stages.0.main_proj" if bits == 8 else "stages.0.ffn.switch_mlp.gate_proj"
+    weight, scale = converted[f"{name}.weight"], converted[f"{name}.scales"]
+    if bits == 4:
+        weight, scale = weight[0], scale[0]
+    equal(
+        mx.dequantize(weight, scale, group_size=32, bits=bits, mode=mode),
+        mx.dequantize(packed, scales, group_size=32, bits=bits, mode=mode),
+    )
+    assert split.quantization_from_source(converted, {})[name]["mode"] == mode

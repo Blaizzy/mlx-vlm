@@ -1007,6 +1007,58 @@ class DeepseekV41Cache:
 
     def advance(self, width):
         self.offset += width
+        if self.is_speculating:
+            if width not in (0, 1):
+                raise ValueError(
+                    "DeepSeek V4.1 verification must advance one token at a time."
+                )
+            self._speculation["history"].append(self._snapshot())
+
+    @property
+    def batch_size(self):
+        return next((value.shape[0] for value in self.window if value is not None), 1)
+
+    @property
+    def is_speculating(self):
+        return getattr(self, "_speculation", None) is not None
+
+    def _snapshot(self):
+        # Copies are lazy, but detach published views from subsequent buffer writes.
+        return [mx.array(value) for value in self.state], self.meta_state
+
+    def start_speculation(self, length):
+        if self.is_speculating:
+            raise RuntimeError("A DeepSeek V4.1 cache transaction is already active.")
+        if length < 1:
+            raise ValueError("Speculative cache length must be positive.")
+        self._generation = getattr(self, "_generation", 0) + 1
+        self._speculation = {"length": length, "history": [self._snapshot()]}
+        return self._generation
+
+    def validate_speculation(self, lengths, generation=None):
+        if not self.is_speculating or generation not in (None, self._generation):
+            raise RuntimeError("No matching DeepSeek V4.1 cache transaction is active.")
+        if len(lengths) != self.batch_size or len(set(lengths)) != 1:
+            raise ValueError("Use BatchDeepseekV41Cache for per-row acceptance.")
+        total = self._speculation["length"]
+        if not 0 <= lengths[0] <= total:
+            raise ValueError("Acceptance is outside the speculative window.")
+        if len(self._speculation["history"]) != total + 1:
+            raise RuntimeError("Cache history does not cover the speculative window.")
+
+    def _restore_speculation(self, length):
+        self.state, self.meta_state = self._speculation["history"][length]
+        self._speculation = None
+
+    def commit_speculation(self, lengths, generation=None):
+        self.validate_speculation(lengths, generation)
+        self._restore_speculation(lengths[0])
+
+    def abort_speculation(self, generation=None):
+        if self.is_speculating:
+            if generation not in (None, self._generation):
+                raise RuntimeError("Attempted to abort a stale cache transaction.")
+            self._restore_speculation(0)
 
     def reset_handoff(self):
         """Clear the cross-layer handoff.
@@ -1187,10 +1239,66 @@ class BatchDeepseekV41Cache:
     def advance(self, width):
         for index, row in enumerate(self.rows):
             start, stop = self._bounds(index, width)
-            row.offset += stop - start
+            row.advance(stop - start)
             self.left_padding[index] = max(0, self.left_padding[index] - width)
             if self._lengths[index] is not None:
                 self._lengths[index] -= stop - start
+        if self.is_speculating:
+            self._speculative_metadata.append((self.left_padding[:], self._lengths[:]))
+
+    @property
+    def batch_size(self):
+        return len(self.rows)
+
+    @property
+    def is_speculating(self):
+        return getattr(self, "_speculative_metadata", None) is not None
+
+    def start_speculation(self, length):
+        if self.is_speculating:
+            raise RuntimeError("A DeepSeek V4.1 cache transaction is already active.")
+        generations = []
+        try:
+            for row in self.rows:
+                generations.append(row.start_speculation(length))
+        except BaseException:
+            for row, generation in zip(self.rows, generations):
+                row.abort_speculation(generation)
+            raise
+        self._speculative_metadata = [(self.left_padding[:], self._lengths[:])]
+        self._generations = tuple(generations)
+        return self._generations
+
+    def validate_speculation(self, lengths, generation=None):
+        if not self.is_speculating or generation not in (None, self._generations):
+            raise RuntimeError("No matching DeepSeek V4.1 cache transaction is active.")
+        if len(lengths) != len(self.rows):
+            raise ValueError("Expected one acceptance length per cache row.")
+        for row, count, token in zip(self.rows, lengths, self._generations):
+            row.validate_speculation([count], token)
+
+    def _restore_metadata(self, lengths):
+        self.left_padding = [
+            self._speculative_metadata[n][0][i] for i, n in enumerate(lengths)
+        ]
+        self._lengths = [
+            self._speculative_metadata[n][1][i] for i, n in enumerate(lengths)
+        ]
+        self._speculative_metadata = None
+
+    def commit_speculation(self, lengths, generation=None):
+        self.validate_speculation(lengths, generation)
+        for row, count, token in zip(self.rows, lengths, self._generations):
+            row.commit_speculation([count], token)
+        self._restore_metadata(lengths)
+
+    def abort_speculation(self, generation=None):
+        if self.is_speculating:
+            if generation not in (None, self._generations):
+                raise RuntimeError("Attempted to abort a stale cache transaction.")
+            for row, token in zip(self.rows, self._generations):
+                row.abort_speculation(token)
+            self._restore_metadata([0] * len(self.rows))
 
     def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
         if left_padding is not None:
@@ -1238,6 +1346,8 @@ class BatchDeepseekV41Cache:
 
 class LanguageModel(nn.Module):
     """Embed, expand to hc copies, run the blocks, collapse, project to logits."""
+
+    supports_speculative_decoding = True
 
     def __init__(self, config: ModelConfig, tokenizer=None):
         super().__init__()
@@ -1313,6 +1423,37 @@ class LanguageModel(nn.Module):
         entry = cache[0] if cache else DeepseekV41Cache(len(self.layers))
         if input_ids is None:
             input_ids = inputs
+        length = (
+            inputs_embeds.shape[1] if inputs_embeds is not None else input_ids.shape[1]
+        )
+        if entry.is_speculating and length > 1:
+            # Compression, window eviction and Engram all have token boundaries.
+            # Record ordinary decode transitions so every accepted prefix is exact.
+            def at(value, index):
+                return None if value is None else value[:, index : index + 1]
+
+            outputs = [
+                self(
+                    at(input_ids, i),
+                    inputs_embeds=at(inputs_embeds, i),
+                    cache=cache,
+                    image_mask=at(image_mask, i),
+                    engram_hashes=at(engram_hashes, i),
+                    **kwargs,
+                )
+                for i in range(length)
+            ]
+            return LanguageModelOutput(
+                logits=mx.concatenate([out.logits for out in outputs], axis=1),
+                hidden_states=(
+                    None
+                    if outputs[0].hidden_states is None
+                    else [
+                        mx.concatenate(parts, axis=1)
+                        for parts in zip(*(out.hidden_states for out in outputs))
+                    ]
+                ),
+            )
         if image_mask is None and input_ids is not None:
             # Expanded image spans retain image_token_id, including delimiters.
             image_mask = input_ids == self.config.image_token_id
@@ -1337,15 +1478,19 @@ class LanguageModel(nn.Module):
                     engram_mask,
                 )
         pre_mix = make_identity_pre_mix(batch, seqlen, self.config.hc_mult)
-        for layer in self.layers:
+        capture = kwargs.get("capture_layer_ids")
+        hidden = [] if capture is not None else None
+        for index, layer in enumerate(self.layers):
             if layer.engram is not None and engram_hashes is not None:
                 h = layer.engram(
                     h,
                     engram_hashes[:, :, layer.engram.layer_hash_index, :],
                     engram_mask,
                 )
+            if capture is not None and index in capture:
+                hidden.append(h.mean(axis=2))
             h, pre_mix = layer(h, pre_mix, image_mask, entry)
         h = DeepseekV41Block.hc_pre(h, pre_mix)
         logits = self.head(self.norm(h))
         entry.advance(seqlen)
-        return LanguageModelOutput(logits=logits)
+        return LanguageModelOutput(logits=logits, hidden_states=hidden)

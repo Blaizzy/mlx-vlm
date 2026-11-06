@@ -62,6 +62,13 @@ class ModelConfig(BaseModelConfig):
     engram_compressed_vocab_size: int = 99092
     image_token_id: int = 129264
     tie_word_embeddings: bool = False
+    num_nextn_predict_layers: int = 0
+    dspark_block_size: int = 5
+    dspark_noise_token_id: int = 128799
+    dspark_target_layer_ids: List[int] = field(default_factory=list)
+    dspark_markov_rank: int = 256
+    dspark_n_routed_experts: Optional[int] = None
+    dspark_num_experts_per_tok: Optional[int] = None
     bos_token_id: Optional[int] = None
     eos_token_id: Optional[int] = None
     pad_token_id: Optional[int] = None
