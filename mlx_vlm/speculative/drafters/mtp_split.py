@@ -325,12 +325,15 @@ class MTPSplitter:
 
 # base model_type -> "module_path:ClassName" (lazy so importing this module is cheap)
 MTP_SPLITTERS: Dict[str, str] = {
+    "mellum": "mlx_vlm.speculative.drafters.mellum_mtp.split:MellumMTPSplitter",
     "mistral_large4": "mlx_vlm.speculative.drafters.mistral_large4_dspark.split:MistralLarge4DsparkSplitter",
     "mistral_large4_text": "mlx_vlm.speculative.drafters.mistral_large4_dspark.split:MistralLarge4DsparkSplitter",
     "nemotron_h": "mlx_vlm.speculative.drafters.nemotron_h_mtp.split:NemotronHMTPSplitter",
     "nemotron_h_nano_omni": "mlx_vlm.speculative.drafters.nemotron_h_mtp.split:NemotronHMTPSplitter",
     "qwen3_5": "mlx_vlm.speculative.drafters.qwen3_5_mtp.split:Qwen3_5MTPSplitter",
     "qwen3_5_moe": "mlx_vlm.speculative.drafters.qwen3_5_mtp.split:Qwen3_5MTPSplitter",
+    "qwen3_5_text": "mlx_vlm.speculative.drafters.qwen3_5_mtp.split:Qwen3_5MTPSplitter",
+    "qwen3_5_moe_text": "mlx_vlm.speculative.drafters.qwen3_5_mtp.split:Qwen3_5MTPSplitter",
     "qwen3_next": "mlx_vlm.speculative.drafters.qwen3_5_mtp.split:Qwen3NextMTPSplitter",
     "qwen4_exp": "mlx_vlm.speculative.drafters.qwen4_exp_mtp.split:Qwen4ExpMTPSplitter",
     "qwen4_exp_text": "mlx_vlm.speculative.drafters.qwen4_exp_mtp.split:Qwen4ExpMTPSplitter",
