@@ -77,7 +77,7 @@ def test_mtp_notebook_trains_reloads_and_exports(tmp_path, train_type):
         patch("mlx_vlm.speculative.drafters.load_drafter", side_effect=drafter),
         patch("mlx_vlm.prompt_utils.apply_chat_template", side_effect=template),
         patch(
-            "mlx_vlm.trainer.vlm.sft.dataset._load_vlm_helpers",
+            "mlx_vlm.trainer.vlm.cross_entropy.dataset._load_vlm_helpers",
             return_value=({}, template, prepare, None),
         ),
     ):

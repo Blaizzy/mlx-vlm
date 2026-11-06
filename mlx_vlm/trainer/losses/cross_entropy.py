@@ -162,7 +162,7 @@ def _transcript_mask(
     )
 
 
-def stt_cross_entropy(
+def asr_cross_entropy(
     model: nn.Module,
     batch: dict[str, mx.array],
 ) -> tuple[mx.array, dict[str, mx.array]]:

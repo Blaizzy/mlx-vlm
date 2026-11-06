@@ -1,11 +1,12 @@
 """Training loop settings shared by all modalities."""
 
+import math
 from dataclasses import dataclass, field
 
 
 @dataclass
-class CoreTrainingArgs:
-    """Common settings inherited by pipeline-specific training arguments."""
+class BaseTrainConfig:
+    """Settings every trainer has; algorithm configs subclass this."""
 
     batch_size: int = field(default=1, metadata={"help": "Global minibatch size."})
     iters: int = field(default=100, metadata={"help": "Number of training iterations."})
@@ -33,6 +34,10 @@ class CoreTrainingArgs:
         default=False,
         metadata={"help": "Checkpoint model layers to reduce memory use."},
     )
+    grad_clip: float | None = field(
+        default=None,
+        metadata={"help": "Global gradient-norm clip applied before each update."},
+    )
     compile: bool = False
     clear_cache_threshold: int = 0
     cache_size: int | None = 32
@@ -53,9 +58,17 @@ class CoreTrainingArgs:
             raise ValueError("steps_per_eval must be at least 1 or None.")
         if self.val_batches != -1 and self.val_batches < 1:
             raise ValueError("val_batches must be at least 1 or -1.")
+        if self.grad_clip is not None and not (
+            math.isfinite(self.grad_clip) and self.grad_clip > 0
+        ):
+            raise ValueError("grad_clip must be positive and finite or None.")
         if self.clear_cache_threshold < 0:
             raise ValueError("clear_cache_threshold must be nonnegative (bytes).")
         if self.cache_size is not None and self.cache_size < 0:
             raise ValueError(
                 "cache_size must be nonnegative or None for unlimited caching."
             )
+
+
+# Backwards-compatible name.
+CoreTrainingArgs = BaseTrainConfig

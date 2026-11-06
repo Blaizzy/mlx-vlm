@@ -309,6 +309,23 @@ The CLI constructs the optimizer separately using `--optimizer` (default
 `adamw`), `--learning-rate` (default `1e-5`), and `--weight-decay` (default
 `0.0`). These CLI options are not fields of the training argument dataclasses.
 
+Adam/AdamW are tuned with `--beta1`, `--beta2`, `--optimizer-eps` and
+`--bias-correction`. `--grad-clip N` (a training argument) clips the global
+gradient norm after accumulation and averaging, just before each update.
+
+`--lr-schedule` takes a name or a JSON/YAML object and `--warmup-steps` adds a
+linear ramp from `--warmup-init`:
+
+```bash
+--lr-schedule '{"name": "cosine_decay", "warmup": 10, "warmup_init": 1e-7, "arguments": [2e-4, 800, 2e-6]}'
+--lr-schedule cosine_decay --warmup-steps 10 --min-learning-rate 2e-6
+```
+
+A bare `cosine_decay` decays from `--learning-rate` to `--min-learning-rate`
+over the updates left after warmup. Schedule steps count optimizer updates,
+not microsteps (`iters / gradient_accumulation_steps`, rounded up), including
+`--epochs`-derived `iters`. Reported `learning_rate` follows the schedule.
+
 ## Row formats
 
 SFT rows contain chat messages and optional images:
@@ -484,3 +501,59 @@ Custom callbacks can be defined in `--reward-functions-file rewards.py`, selecte
 with `--reward-functions first_reward,second_reward`, and weighted with
 `--reward-weights '[0.8, 0.2]'`. The CLI loads a separate base reference when
 `--beta` is positive; override it with `--reference-model` if needed.
+
+### Quantization-aware full training
+
+Use weight-only affine QAT through the same preparation and Trainer path:
+
+```python
+model = prepare_model_for_training(
+    model, train_type="full", qat=True, quantization_bits=4,
+    quantization_group_size=64,
+)
+```
+
+The equivalent CLI options are `--train-type full --qat --quantization-bits 4`.
+QAT simulates quantization on eligible standard Linear weights with straight-through
+gradients; embeddings and Linear layers whose input width is incompatible with
+the group size remain floating point. It supports 4/8 bits and groups of 32/64/128.
+Checkpoints contain floating-point master weights in the existing full checkpoint
+format. Resume with `qat=True` (or `--qat`). This uses full-training memory.
+
+Export packed inference weights after training with one call:
+
+```python
+from mlx_vlm import export_model
+
+export_model(model, processor, "qat-inference", model_path=MODEL_ID)
+# Load directly for inference:
+model, processor = load("qat-inference")
+```
+
+The output must be a new directory. `export_model` automatically packs QAT layers
+at their trained bit/group settings, preserves other layers, fuses LoRA/DoRA
+adapters when present, and saves the config and processor assets. It derives
+quantization metadata from the exported layers. The live training model is
+restored after saving. The result is a standalone inference model.
+
+For non-QAT training the same function keeps the current float/packed layout.
+Force quantization of compatible float layers with:
+
+```python
+export_model(
+    model, processor, "quantized-inference", model_path=MODEL_ID,
+    quantize=True, bits=4, group_size=64,
+)
+```
+
+With `quantize=True`, ordinary float layers default to 4 bits/group 64; QAT layers
+keep their trained settings unless `bits`/`group_size` are explicitly supplied.
+`quantize=False` saves QAT master weights without adding quantization; existing
+packed layers remain packed. Forced quantization skips incompatible float layers.
+Full QAT checkpoints now record their QAT settings, so preparation restores them
+automatically on resume. Older checkpoints need explicit QAT settings.
+
+All QAT notebooks end with `export_model(...)`. CLI training supports
+`--export-model-path inference` (the old `--export-qat-path` remains an alias).
+Add `--export-quantize` to force quantization. Float training checkpoints remain
+separate for resuming. `export_qat_model` remains a compatibility wrapper.

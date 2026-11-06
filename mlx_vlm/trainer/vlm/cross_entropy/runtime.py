@@ -34,6 +34,29 @@ _AUDIO_VIDEO_FIELDS = (
 _SIGNATURE_FIELDS = ("pixel_values", "image_embeds", *_AUDIO_VIDEO_FIELDS)
 
 
+# A 2D (B, T) integer padding mask is forwarded by most models straight into
+# the decoder as ``mask``, where scaled_dot_product_attention treats it as an
+# additive/non-causal mask (wrong at B=1, an error at B>1). Padding is on the
+# right, which cannot affect earlier real-token logits under causal attention,
+# so the default is to pass no mask and let the model build its causal mask.
+# Only models that read the 2D mask themselves (rope/position ids) and turn it
+# into a proper causal+padding mask keep it.
+PADDING_MASK_MODEL_TYPES = frozenset(
+    {
+        "qwen2_vl",
+        "qwen2_5_vl",
+        "qwen3_vl",
+        "qwen3_vl_moe",
+        "qwen3_5",
+        "qwen3_5_moe",
+    }
+)
+
+
+def model_uses_padding_mask(model: nn.Module) -> bool:
+    return _model_type(model) in PADDING_MASK_MODEL_TYPES
+
+
 def _model_type(model: nn.Module) -> str | None:
     model_type = getattr(model, "model_type", None)
     if model_type is not None:
@@ -74,7 +97,7 @@ def _forward_vlm(model, input_ids, attention_mask, batch, **kwargs):
         key: value for key, value in batch.items() if key not in _TEXT_FIELDS
     }
     pixel_values = model_inputs.pop("pixel_values", None)
-    if _model_type(model) == "gemma4_unified":
+    if not model_uses_padding_mask(model):
         attention_mask = None
     model_inputs.update(kwargs)
     return model(input_ids, pixel_values, attention_mask, **model_inputs)
@@ -158,7 +181,7 @@ def vlm_sft_loss(
     loss, metrics = cross_entropy(
         logits, targets, loss_mask, vision_mask=vlm_vision_mask(model, batch)
     )
-    from .mtp import add_mtp_loss
+    from ..mtp import add_mtp_loss
 
     return add_mtp_loss(
         model,
@@ -574,7 +597,7 @@ def make_task(
     iterate_batches=iterate_vlm_batches,
 ):
     """Bind VLM preprocessing and supervised cross-entropy."""
-    from mlx_vlm.trainer.vlm.sft.dataset import VisionDataset
+    from mlx_vlm.trainer.vlm.cross_entropy.dataset import VisionDataset
 
     loss_options = dict(
         train_on_completions=args.train_on_completions,

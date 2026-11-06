@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from functools import partial
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -171,6 +172,15 @@ class VisionDataset:
         )
         self.base_path = Path(configured_base) if configured_base is not None else None
         self.message_feature = _get_option(config, "message_feature")
+        self.prompt_feature = _get_option(config, "prompt_feature") or "prompt"
+        self.completion_feature = (
+            _get_option(config, "completion_feature") or "completion"
+        )
+        self.text_feature = _get_option(config, "text_feature") or "text"
+        self.tools_feature = _get_option(config, "tools_feature") or "tools"
+        self.chat_template_kwargs = dict(
+            _get_option(config, "chat_template_kwargs") or {}
+        )
         self.image_feature = _get_option(config, "image_feature")
         self.audio_feature = _get_option(config, "audio_feature")
         self.video_feature = _get_option(config, "video_feature")
@@ -206,59 +216,85 @@ class VisionDataset:
         keys = ((self.message_feature,) if self.message_feature else ()) + (
             "messages",
             "conversations",
+            "conversation",
         )
         conversation = next((row[key] for key in keys if key in row), None)
-        if conversation is None and "question" in row and "answer" in row:
-            conversation = [
-                {"role": "user", "content": row["question"]},
-                {"role": "assistant", "content": row["answer"]},
-            ]
-        if isinstance(conversation, str):
-            try:
-                conversation = json.loads(conversation)
-            except json.JSONDecodeError:
-                raise ValueError(
-                    "VLM conversation strings must contain JSON message arrays."
-                ) from None
+        if conversation is None:
+            conversation = self._pair_conversation(row)
+        conversation = _maybe_json(conversation, "VLM conversation strings")
         if not isinstance(conversation, list) or not conversation:
             raise ValueError(
                 "Each VLM row must contain a non-empty `messages` or "
-                "`conversations` list."
+                "`conversations` list, or a prompt/completion pair."
             )
         if isinstance(conversation[0], list):
             raise ValueError(
                 "A dataset row contains multiple conversations. Split them into "
                 "separate rows so each conversation retains its media alignment."
             )
-        if self.config.get("model_type") == "pixtral":
-            try:
+        try:
+            conversation = [
+                json.loads(message) if isinstance(message, str) else message
+                for message in conversation
+            ]
+        except json.JSONDecodeError as error:
+            raise ValueError("String messages must be valid JSON.") from error
+        return [_normalize_message(message) for message in conversation]
+
+    def _pair_conversation(self, row: Mapping[str, Any]) -> list[dict[str, Any]] | None:
+        """Build a two-turn chat from prompt/completion style columns."""
+        pairs = (
+            (self.prompt_feature, self.completion_feature),
+            ("question", "answer"),
+            ("instruction", "output"),
+            ("input", "output"),
+        )
+        for prompt_key, completion_key in pairs:
+            if prompt_key in row and completion_key in row:
+                prompt = row[prompt_key]
+                if prompt_key == "instruction" and row.get("input"):
+                    prompt = f"{prompt}\n\n{row['input']}"
                 conversation = [
-                    json.loads(message) if isinstance(message, str) else message
-                    for message in conversation
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": row[completion_key]},
                 ]
-            except json.JSONDecodeError as error:
-                raise ValueError("Pixtral message rows must be valid JSON.") from error
-        normalized = []
-        role_aliases = {
-            "human": "user",
-            "gpt": "assistant",
-            "bot": "assistant",
-        }
-        for message in conversation:
-            if not isinstance(message, Mapping):
-                raise ValueError("Conversation messages must be role/content mappings.")
-            message = dict(message)
-            role = message.get("role", message.get("from", message.get("speaker")))
-            content = message.get("content", message.get("value"))
-            if role is None or content is None:
-                raise ValueError(
-                    "Each conversation message must provide role/content (or "
-                    "from/value) fields."
+                system = row.get("system")
+                return ([{"role": "system", "content": system}] if system else []) + (
+                    conversation
                 )
-            message["role"] = role_aliases.get(str(role).lower(), role)
-            message["content"] = content
-            normalized.append(message)
-        return normalized
+        return None
+
+    def _template_kwargs(self, row: Mapping[str, Any]) -> dict[str, Any]:
+        kwargs = dict(self.chat_template_kwargs)
+        tools = _maybe_json(row.get(self.tools_feature), "Tool definitions")
+        if tools:
+            kwargs["tools"] = tools
+        return kwargs
+
+    def _render(self, conversation, add_generation_prompt, images, audio, kwargs):
+        render = partial(
+            self._apply_chat_template,
+            self.processor,
+            self.config,
+            conversation,
+            add_generation_prompt=add_generation_prompt,
+            num_images=len(images),
+            num_audios=len(audio),
+            **kwargs,
+        )
+        has_extra_fields = any(set(row) - {"role", "content"} for row in conversation)
+        if (
+            not has_extra_fields
+            or self.config.get("model_type") in _LAST_MESSAGE_MODEL_TYPES
+        ):
+            return render()
+        return _render_with_row_fields(
+            self.processor,
+            conversation,
+            render(return_messages=True),
+            add_generation_prompt,
+            kwargs,
+        )
 
     def _prepare(
         self,
@@ -354,7 +390,18 @@ class VisionDataset:
     def process(self, row: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(row, Mapping):
             raise TypeError("VLM dataset rows must be mappings.")
-        conversation = self._conversation(row)
+        conversation = None
+        if self.text_feature not in row or any(
+            key in row
+            for key in (
+                self.message_feature,
+                "messages",
+                "conversations",
+                "conversation",
+            )
+            if key
+        ):
+            conversation = self._conversation(row)
         images, audio, videos = (
             [
                 _resolve_media(item, self.base_path, image=name == "image")
@@ -362,14 +409,16 @@ class VisionDataset:
             ]
             for name, key, alternatives in self._media_fields
         )
-        prompt = self._apply_chat_template(
-            self.processor,
-            self.config,
-            conversation,
-            add_generation_prompt=False,
-            num_images=len(images),
-            num_audios=len(audio),
-        )
+        if conversation is None:
+            # Pre-rendered text is used as-is, bypassing the chat template.
+            if self.train_on_completions:
+                raise ValueError(
+                    "train_on_completions needs chat or prompt/completion rows, "
+                    f"not pre-rendered `{self.text_feature}` rows."
+                )
+            return self._prepare(row[self.text_feature], images, audio, videos)
+        template_kwargs = self._template_kwargs(row)
+        prompt = self._render(conversation, False, images, audio, template_kwargs)
         inputs = self._prepare(prompt, images, audio, videos)
 
         if self.train_on_completions:
@@ -381,13 +430,8 @@ class VisionDataset:
                     "train_on_completions requires the last message in every "
                     "conversation to have role='assistant'."
                 )
-            prefix = self._apply_chat_template(
-                self.processor,
-                self.config,
-                conversation[:-1],
-                add_generation_prompt=True,
-                num_images=len(images),
-                num_audios=len(audio),
+            prefix = self._render(
+                conversation[:-1], True, images, audio, template_kwargs
             )
             prefix_inputs = self._prepare(prefix, images, audio, videos)
             prefix_length = int(prefix_inputs["attention_mask"].sum().item())
@@ -413,6 +457,70 @@ class VisionDataset:
             inputs["completion_mask"] = completion_mask.astype(mx.int32)
 
         return inputs
+
+
+# mlx-vlm renders only the last message for these models.
+_LAST_MESSAGE_MODEL_TYPES = {"paligemma", "florence2", "falcon_ocr"}
+_ROLE_KEYS = ("role", "from", "speaker", "author")
+_CONTENT_KEYS = ("content", "value", "text", "message")
+_ROLE_ALIASES = {
+    "human": "user",
+    "gpt": "assistant",
+    "bot": "assistant",
+    "model": "assistant",
+}
+
+
+def _normalize_message(message: Any) -> dict[str, Any]:
+    """Add canonical role/content while keeping every original field.
+
+    Custom chat templates may read ShareGPT keys (``from``/``value``) or extra
+    fields such as ``reasoning_content``; those stay untouched.
+    """
+    if not isinstance(message, Mapping):
+        raise ValueError("Conversation messages must be mappings.")
+    message = dict(message)
+    role = next((message[k] for k in _ROLE_KEYS if message.get(k) is not None), None)
+    content = next(
+        (message[k] for k in _CONTENT_KEYS if message.get(k) is not None), None
+    )
+    if content is None and (
+        message.get("tool_calls") or message.get("function_call") or role == "tool"
+    ):
+        content = ""
+    if role is None or content is None:
+        raise ValueError(
+            "Each conversation message needs a role (one of "
+            f"{', '.join(_ROLE_KEYS)}) and content (one of "
+            f"{', '.join(_CONTENT_KEYS)}); got fields {sorted(message)}."
+        )
+    message["role"] = _ROLE_ALIASES.get(str(role).lower(), role)
+    message["content"] = content
+    return message
+
+
+def _render_with_row_fields(processor, rows, messages, add_generation_prompt, kwargs):
+    """Render mlx-vlm formatted messages with each row's extra fields restored.
+
+    mlx-vlm rebuilds VLM messages from role/content, so fields that custom chat
+    templates read (``from``, ``reasoning_content``, ...) are merged back first.
+    """
+    from mlx_vlm.prompt_utils import get_chat_template
+
+    messages = [
+        {**row, **message} if isinstance(message, Mapping) else message
+        for row, message in zip(rows, messages)
+    ]
+    return get_chat_template(processor, messages, add_generation_prompt, **kwargs)
+
+
+def _maybe_json(value: Any, name: str) -> Any:
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        raise ValueError(f"{name} must be valid JSON.") from None
 
 
 def _get_option(config: Any, name: str, default: Any = None) -> Any:

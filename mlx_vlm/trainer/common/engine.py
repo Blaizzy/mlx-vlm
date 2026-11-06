@@ -113,6 +113,7 @@ def train(
             update=update,
             accumulation_steps=args.gradient_accumulation_steps,
             loss_args=extra,
+            grad_clip=args.grad_clip,
         )
 
     if args.compile and task.value_and_grad_factory is None:
@@ -143,7 +144,12 @@ def train(
         report_steps += 1
         if iteration == args.iters:
             partial = apply_final_accumulated_gradients(
-                model, optimizer, gradients, iteration, args.gradient_accumulation_steps
+                model,
+                optimizer,
+                gradients,
+                iteration,
+                args.gradient_accumulation_steps,
+                args.grad_clip,
             )
             optimizer_step += int(partial > 0)
             gradients = None

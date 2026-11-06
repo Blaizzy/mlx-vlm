@@ -7,7 +7,7 @@ import mlx.core as mx
 import numpy as np
 
 from mlx_vlm.trainer.vlm.dpo.trainer import make_task
-from mlx_vlm.trainer.vlm.sft.runtime import collate_vlm_batch, forward_vlm_logits
+from mlx_vlm.trainer.vlm.cross_entropy.runtime import collate_vlm_batch, forward_vlm_logits
 
 
 class VLMBatchingTest(unittest.TestCase):

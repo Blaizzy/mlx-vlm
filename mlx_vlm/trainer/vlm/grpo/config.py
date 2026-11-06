@@ -3,11 +3,11 @@
 import math
 from dataclasses import dataclass
 
-from mlx_vlm.trainer.vlm.config import VLMTrainingArgs
+from mlx_vlm.trainer.vlm.config import VLMTrainConfig
 
 
 @dataclass
-class GRPOTrainingArgs(VLMTrainingArgs):
+class GRPOTrainConfig(VLMTrainConfig):
     group_size: int = 4
     beta: float = 0.0
     epsilon: float = 1e-4
@@ -50,3 +50,7 @@ class GRPOTrainingArgs(VLMTrainingArgs):
             raise ValueError("grpo_loss_type must be grpo, bnpo, or dr_grpo.")
         if self.importance_sampling_level not in {"token", "sequence"}:
             raise ValueError("importance_sampling_level must be token or sequence.")
+
+
+# Backwards-compatible name.
+GRPOTrainingArgs = GRPOTrainConfig

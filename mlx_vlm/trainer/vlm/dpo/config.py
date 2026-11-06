@@ -2,11 +2,11 @@
 
 from dataclasses import dataclass
 
-from mlx_vlm.trainer.vlm.config import VLMTrainingArgs
+from mlx_vlm.trainer.vlm.config import VLMTrainConfig
 
 
 @dataclass
-class DPOTrainingArgs(VLMTrainingArgs):
+class DPOTrainConfig(VLMTrainConfig):
     """VLM training settings for reference-based DPO."""
 
     beta: float = 0.1
@@ -21,3 +21,7 @@ class DPOTrainingArgs(VLMTrainingArgs):
             raise ValueError("DPO loss_type must be sigmoid, hinge, ipo, or dpop.")
         if self.delta < 0:
             raise ValueError("DPO delta must be nonnegative.")
+
+
+# Backwards-compatible name.
+DPOTrainingArgs = DPOTrainConfig

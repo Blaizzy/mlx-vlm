@@ -21,7 +21,7 @@ from mlx_vlm.trainer import (
 )
 from mlx_vlm.trainer.common.utils import save_trainable_weights
 from mlx_vlm.trainer.losses.cross_entropy import cross_entropy
-from mlx_vlm.trainer.vlm.sft.runtime import vlm_sft_loss
+from mlx_vlm.trainer.vlm.cross_entropy.runtime import vlm_sft_loss
 
 
 def tiny_model(moe=False, tied=False):
@@ -143,7 +143,8 @@ def test_mtp_gradients_reach_native_head_and_base_adapters(tmp_path):
     path = tmp_path / "weights.safetensors"
     save_trainable_weights(model, path)
     saved = mx.load(str(path))
-    assert "mtp_head.fc.weight" in saved
+    assert not any(key.startswith("mtp_head.") for key in saved)
+    assert "fc.weight" in mx.load(str(tmp_path / "mtp" / "model.safetensors"))
     restored = prepare_tiny_model(checkpoint_path=path)
     np.testing.assert_allclose(
         loss_fn(model, batch())[0].item(),
@@ -204,9 +205,43 @@ def test_full_checkpoint_restores_head_with_base(tmp_path):
     model = prepare_model_for_training(tiny_model(), train_type="full", verbose=False)
     path = tmp_path / "weights.safetensors"
     save_trainable_weights(model, path)
-    restored = prepare_model_for_training(
-        tiny_model(), train_type="full", checkpoint_path=path, verbose=False
+    restored = prepare_tiny_model(train_type="full", checkpoint_path=path)
+    np.testing.assert_array_equal(
+        np.array(model.mtp_head.fc.weight), np.array(restored.mtp_head.fc.weight)
     )
+
+
+def test_full_export_loads_strictly_and_head_is_a_drafter(tmp_path):
+    from mlx_vlm.utils import load_model
+
+    model = prepare_model_for_training(tiny_model(), train_type="full", verbose=False)
+    model.mtp_head.fc.weight = model.mtp_head.fc.weight + 1
+    path = tmp_path / "weights.safetensors"
+    save_trainable_weights(model, path, iteration=5)
+
+    base = tiny_model()
+    del base["mtp_head"]
+    for name in ("weights.safetensors", "0000005_weights.safetensors"):
+        base.load_weights(str(tmp_path / name), strict=True)
+    for name in ("mtp", "0000005_mtp"):
+        drafter = load_model(tmp_path / name, strict=True)
+        assert isinstance(drafter, Qwen3_5MTPDraftModel)
+        np.testing.assert_array_equal(
+            np.array(model.mtp_head.fc.weight), np.array(drafter.fc.weight)
+        )
+
+
+def test_legacy_bundled_checkpoint_still_restores_head(tmp_path):
+    model = prepare_tiny_model(lora_rank=2)
+    path = tmp_path / "weights.safetensors"
+    save_trainable_weights(model, path)
+    (tmp_path / "mtp" / "model.safetensors").unlink()
+    legacy = dict(mx.load(str(path)))
+    legacy.update(
+        {f"mtp_head.{k}": v for k, v in tree_flatten(model.mtp_head.parameters())}
+    )
+    mx.save_safetensors(str(path), legacy)
+    restored = prepare_tiny_model(checkpoint_path=path)
     np.testing.assert_array_equal(
         np.array(model.mtp_head.fc.weight), np.array(restored.mtp_head.fc.weight)
     )
@@ -216,7 +251,7 @@ def test_full_checkpoint_restores_head_with_base(tmp_path):
 def test_full_mtp_gradients_update_target_and_head(moe, tied):
     import mlx.optimizers as optim
 
-    from mlx_vlm.trainer.vlm.sft.mtp import vlm_mtp_loss
+    from mlx_vlm.trainer.vlm.mtp import vlm_mtp_loss
 
     model = prepare_model_for_training(
         tiny_model(moe=moe, tied=tied), train_type="full", verbose=False
@@ -244,7 +279,7 @@ def test_full_mtp_gradients_update_target_and_head(moe, tied):
 
 
 def test_legacy_loss_uses_same_mtp_objective():
-    from mlx_vlm.trainer.vlm.sft.trainer import vision_language_loss_fn
+    from mlx_vlm.trainer.vlm.cross_entropy.trainer import vision_language_loss_fn
 
     model = tiny_model()
     expected, _ = vlm_sft_loss(model, batch(), mtp_loss_weight=0.3)
@@ -281,7 +316,7 @@ def test_cli_exposes_mtp_options():
 @pytest.mark.parametrize("algorithm", ["dpo", "orpo"])
 def test_preference_mtp_supervises_only_chosen_policy(algorithm, monkeypatch):
     from mlx_vlm.trainer.vlm.preference.loss import dpo_vlm_loss, orpo_vlm_loss
-    from mlx_vlm.trainer.vlm.sft.mtp import vlm_mtp_loss
+    from mlx_vlm.trainer.vlm.mtp import vlm_mtp_loss
 
     model = tiny_model()
     pairs = {
@@ -330,7 +365,7 @@ def test_preference_mtp_supervises_only_chosen_policy(algorithm, monkeypatch):
 def test_grpo_mtp_uses_generated_tokens_only(loss_type):
     from mlx_vlm.trainer import GRPOTrainingArgs
     from mlx_vlm.trainer.vlm.grpo.trainer import make_task
-    from mlx_vlm.trainer.vlm.sft.mtp import vlm_mtp_loss
+    from mlx_vlm.trainer.vlm.mtp import vlm_mtp_loss
 
     model = tiny_model()
     model.config.model_type = "qwen3_5_text"

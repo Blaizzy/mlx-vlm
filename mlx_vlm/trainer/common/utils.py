@@ -15,6 +15,7 @@ from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+import mlx.optimizers as optim
 import numpy as np
 from mlx.nn.utils import average_gradients
 from mlx.utils import tree_flatten, tree_map
@@ -255,7 +256,11 @@ def accumulate_gradients(gradients, previous=None):
 
 
 def apply_accumulated_gradients(
-    model: nn.Module, optimizer, gradients, steps: int
+    model: nn.Module,
+    optimizer,
+    gradients,
+    steps: int,
+    grad_clip: float | None = None,
 ) -> None:
     """Average across workers and actual microsteps, then update the model."""
     if steps < 1:
@@ -263,6 +268,8 @@ def apply_accumulated_gradients(
     gradients = average_gradients(gradients)
     if steps > 1:
         gradients = tree_map(lambda value: value / steps, gradients)
+    if grad_clip is not None:
+        gradients, _ = optim.clip_grad_norm(gradients, grad_clip)
     apply_optimizer_update(model, optimizer, gradients)
 
 
@@ -276,6 +283,7 @@ def apply_gradient_step(
     update: bool,
     accumulation_steps: int,
     loss_args: Sequence[Any] = (),
+    grad_clip: float | None = None,
 ) -> tuple[Any, Any, Any]:
     """Evaluate one batch, accumulate its gradient, and optionally update.
 
@@ -287,7 +295,9 @@ def apply_gradient_step(
     loss_value, metrics = normalize_loss_output(output)
     gradients = accumulate_gradients(gradients, previous_gradients)
     if update:
-        apply_accumulated_gradients(model, optimizer, gradients, accumulation_steps)
+        apply_accumulated_gradients(
+            model, optimizer, gradients, accumulation_steps, grad_clip
+        )
         gradients = None
     return loss_value, metrics, gradients
 
@@ -298,6 +308,7 @@ def apply_final_accumulated_gradients(
     gradients: Any,
     total_steps: int,
     accumulation_steps: int,
+    grad_clip: float | None = None,
 ) -> int:
     """Apply a final incomplete accumulation and return its microstep count."""
     if total_steps < 0:
@@ -309,7 +320,9 @@ def apply_final_accumulated_gradients(
     if gradients is None or partial_steps == 0:
         return 0
 
-    apply_accumulated_gradients(model, optimizer, gradients, partial_steps)
+    apply_accumulated_gradients(
+        model, optimizer, gradients, partial_steps, grad_clip
+    )
     mx.eval(model.state, optimizer.state)
     return partial_steps
 
@@ -334,10 +347,23 @@ def save_trainable_weights(
     """Save trainable parameters and optionally a numbered training checkpoint.
 
     Call on rank zero. This is a training checkpoint, not a fused model export.
+    An attached MTP head is written to a sibling ``mtp`` drafter directory so the
+    main weights load strictly into the unmodified model.
     """
     destination = Path(adapter_file)
     destination.parent.mkdir(parents=True, exist_ok=True)
     weights = dict(tree_flatten(model.trainable_parameters()))
+    head = getattr(model, "mtp_head", None) if isinstance(model, nn.Module) else None
+    head_weights = {}
+    if head is not None:
+        from mlx_vlm.trainer.common.mtp import (
+            mtp_head_dir,
+            save_mtp_head,
+            split_mtp_weights,
+        )
+
+        weights, head_weights = split_mtp_weights(weights)
+        save_mtp_head(head, head_weights, mtp_head_dir(destination))
     mx.save_safetensors(str(destination), weights)
     config = getattr(model, "config", None)
     adapter_config = getattr(model, "_vlm_adapter_config", None)
@@ -356,6 +382,8 @@ def save_trainable_weights(
 
     checkpoint = destination.with_name(f"{iteration:07d}_{destination.name}")
     mx.save_safetensors(str(checkpoint), weights)
+    if head is not None:
+        save_mtp_head(head, head_weights, mtp_head_dir(checkpoint))
     tqdm.write(
         f"Iter {iteration}: saved trainable weights to {destination} and {checkpoint}."
     )

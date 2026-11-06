@@ -23,7 +23,7 @@ from mlx_vlm.trainer.peft.utils import (
     freeze_model,
     get_peft_model,
 )
-from mlx_vlm.trainer.vlm.sft.trainer import (
+from mlx_vlm.trainer.vlm.cross_entropy.trainer import (
     TrainingArgs,
     iterate_batches,
     train,
@@ -187,9 +187,9 @@ def test_training_updates_and_saves(monkeypatch, missing_adapter):
         labels=mx.array([[0, 1, 2]] * 4),
     )
     save, optimizer = Mock(), MagicMock(learning_rate=1e-4)
-    monkeypatch.setattr("mlx_vlm.trainer.vlm.sft.trainer.mx.save_safetensors", save)
+    monkeypatch.setattr("mlx_vlm.trainer.vlm.cross_entropy.trainer.mx.save_safetensors", save)
     monkeypatch.setattr(
-        "mlx_vlm.trainer.vlm.sft.trainer.iterate_batches",
+        "mlx_vlm.trainer.vlm.cross_entropy.trainer.iterate_batches",
         Mock(return_value=iter([batch])),
     )
     options = dict(steps_per_save=1, adapter_file=None) if missing_adapter else {}
@@ -227,7 +227,7 @@ def test_completion_mask_is_used_without_passing_to_model():
         pixel_values=None,
     )
     vision_language_loss_fn(model, batch, train_on_completions=True, assistant_id=999)
-    assert model.mask.tolist() == [[1, 1, 1]]
+    assert model.mask is None  # 2D padding mask must not replace causal masking
     assert "completion_mask" not in model.kwargs
 
 

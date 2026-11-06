@@ -21,6 +21,9 @@ and the same public API as
 | [dpo.ipynb](dpo.ipynb) | Preference optimization with a separate frozen reference |
 | [grpo_vision.ipynb](grpo_vision.ipynb) | Qwen3.5-2B-4bit image-conditioned GRPO on LaTeX OCR with custom rewards |
 | [grpo_text_only.ipynb](grpo_text_only.ipynb) | Qwen3.5-2B-4bit arithmetic GRPO on simple-grpo with correctness/format rewards |
+| [qat_sft_text_only.ipynb](qat_sft_text_only.ipynb) | Four-step full QAT with Qwen3.5-2B-4bit on text instructions |
+| [qat_sft_vision.ipynb](qat_sft_vision.ipynb) | Four-step full QAT with Qwen3.5-2B-4bit on LaTeX OCR images |
+| [qat_grpo_text_only.ipynb](qat_grpo_text_only.ipynb) | Four-step full QAT with Qwen3.5-2B-4bit on arithmetic GRPO |
 | [custom_loss.ipynb](custom_loss.ipynb) | Notebook-defined chunked cross-entropy |
 
 Edit the model and training settings near the top. The text-only notebook
@@ -75,3 +78,14 @@ loading and shorten training; the default Hub model runs are not covered.
 
 See [the training guide](../../docs/training.md) for CLI examples, dataset
 schemas, checkpoint handling, callbacks, and compatibility details.
+
+The `qat_*` notebooks start from `mlx-community/Qwen3.5-2B-4bit`, dequantize to
+float master weights, and apply weight-only affine QAT to compatible standard
+Linear layers. They use full fine-tuning and its memory costs. Defaults select
+four microsteps and small data subsets; GRPO disables W&B and reference KL by
+default. Saved weights are full floating-point checkpoints. Reapply the same
+QAT bit/group settings when reloading older training checkpoints; new checkpoints
+record and restore these settings automatically. Each QAT notebook ends with
+`export_model(...)`, saving a standalone packed inference model to
+`EXPORT_DIR` using the exact trained quantization settings. Load that directory
+directly with `mlx_vlm.load`; the float training checkpoint remains separate.

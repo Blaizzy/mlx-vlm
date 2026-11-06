@@ -7,14 +7,17 @@ from types import SimpleNamespace
 
 from mlx_vlm.trainer.common.config import CoreTrainingArgs
 from mlx_vlm.trainer.common.task import TrainingTask
-from mlx_vlm.trainer.vlm.config import VLMTrainingArgs
+from mlx_vlm.trainer.vlm.config import SFTTrainConfig, VLMTrainConfig
 from mlx_vlm.trainer.vlm.dpo.config import DPOTrainingArgs
 from mlx_vlm.trainer.vlm.grpo.config import GRPOTrainingArgs
 from mlx_vlm.trainer.vlm.orpo.config import ORPOTrainingArgs
 
 # Explicit supported combinations, without importing optional modality libraries.
 TASKS = {
-    ("vlm", "sft"): ("vlm.sft.runtime", VLMTrainingArgs),
+    # SFT and UFT (unsupervised fine-tuning/pretraining) share one CE runtime;
+    # train_on_completions selects completion-only or full-sequence targets.
+    ("vlm", "sft"): ("vlm.cross_entropy.runtime", SFTTrainConfig),
+    ("vlm", "uft"): ("vlm.cross_entropy.runtime", SFTTrainConfig),
     ("vlm", "dpo"): ("vlm.dpo.trainer", DPOTrainingArgs),
     ("vlm", "orpo"): ("vlm.orpo.runtime", ORPOTrainingArgs),
     ("vlm", "grpo"): ("vlm.grpo.trainer", GRPOTrainingArgs),
@@ -76,9 +79,13 @@ class Trainer:
                     algorithm = "grpo"
             algorithm, (module_name, config_type) = task_spec(task, algorithm)
             args = args or config_type()
-            if not isinstance(args, config_type):
+            # SFT also accepts the shared VLM config (formerly VLMTrainingArgs).
+            accepted = VLMTrainConfig if config_type is SFTTrainConfig else config_type
+            if not isinstance(args, accepted):
                 raise TypeError(f"{task}/{algorithm} expects {config_type.__name__}.")
             args.validate()
+            if algorithm == "uft" and args.train_on_completions:
+                raise ValueError("UFT trains on full sequences; use algorithm='sft'.")
             if not prepared and processing_class is None:
                 raise ValueError(f"{task} raw datasets require processing_class.")
             options = {}

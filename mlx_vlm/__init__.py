@@ -7,6 +7,7 @@ os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 from ._stream_cleanup import clear_mlx_streams
 from .convert import convert
 from .decision import predict
+from .export import export_model
 from .generate import (
     AudioGenerationResult,
     BatchResponse,

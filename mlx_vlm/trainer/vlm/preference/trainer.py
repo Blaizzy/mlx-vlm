@@ -9,7 +9,7 @@ import mlx.nn as nn
 
 from mlx_vlm.trainer.common.utils import evaluate_weighted_batches
 from mlx_vlm.trainer.vlm.preference.dataset import iterate_vlm_preference_batches
-from mlx_vlm.trainer.vlm.sft.runtime import _make_vlm_task
+from mlx_vlm.trainer.vlm.cross_entropy.runtime import _make_vlm_task
 
 
 def evaluate_preference_vlm(

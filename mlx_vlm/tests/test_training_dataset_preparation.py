@@ -6,7 +6,7 @@ from unittest.mock import patch
 import mlx.core as mx
 
 from mlx_vlm.trainer.vlm.preference.dataset import PreferenceVisionDataset
-from mlx_vlm.trainer.vlm.sft.dataset import VisionDataset
+from mlx_vlm.trainer.vlm.cross_entropy.dataset import VisionDataset
 
 
 class VisionPreparationTest(unittest.TestCase):
@@ -28,7 +28,7 @@ class VisionPreparationTest(unittest.TestCase):
 
         return {"native": {}}, template, generic, native
 
-    @patch("mlx_vlm.trainer.vlm.sft.dataset._load_vlm_helpers")
+    @patch("mlx_vlm.trainer.vlm.cross_entropy.dataset._load_vlm_helpers")
     def test_media_grouping_is_lazy_and_fallback_preserves_completion_masks(self, load):
         calls = []
         load.return_value = self.helpers(calls)
@@ -69,7 +69,50 @@ class VisionPreparationTest(unittest.TestCase):
         row["picture"] = []
         self.assertEqual(dataset.media_signature(0), ("audio", "video"))
 
-    @patch("mlx_vlm.trainer.vlm.sft.dataset._load_vlm_helpers")
+    @patch("mlx_vlm.trainer.vlm.cross_entropy.dataset._load_vlm_helpers")
+    def test_flexible_rows_keep_template_fields_and_tools(self, load):
+        rendered = []
+
+        def template(processor, config, messages, **kwargs):
+            rendered.append((messages, kwargs))
+            return "full"
+
+        def generic(**kwargs):
+            return {"input_ids": [[1, 2, 3]]}
+
+        load.return_value = ({}, template, generic, None)
+        rows = [
+            {
+                "conversations": [
+                    {"from": "human", "value": "hi"},
+                    {"from": "gpt", "value": "yo", "reasoning_content": "think"},
+                    {"role": "assistant", "tool_calls": [{"id": "1"}]},
+                ],
+                "tools": '[{"type": "function"}]',
+            },
+            {"prompt": "q", "completion": "a"},
+            {"text": "<raw>"},
+        ]
+        dataset = VisionDataset(
+            rows,
+            {"model_type": "other"},
+            object(),
+            config={"chat_template_kwargs": {"enable_thinking": True}},
+        )
+        for i in range(3):
+            dataset[i]
+
+        messages, kwargs = rendered[0]
+        self.assertEqual([m["role"] for m in messages], ["user", "assistant", "assistant"])
+        self.assertEqual(messages[0]["from"], "human")
+        self.assertEqual(messages[1]["reasoning_content"], "think")
+        self.assertEqual(messages[2]["content"], "")
+        self.assertEqual(kwargs["tools"], [{"type": "function"}])
+        self.assertTrue(kwargs["enable_thinking"])
+        self.assertEqual([m["content"] for m in rendered[1][0]], ["q", "a"])
+        self.assertEqual(len(rendered), 2)
+
+    @patch("mlx_vlm.trainer.vlm.cross_entropy.dataset._load_vlm_helpers")
     def test_preference_default_config_preserves_shared_media_and_response_masks(
         self, load
     ):

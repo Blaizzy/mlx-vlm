@@ -3,12 +3,12 @@
 import math
 from dataclasses import dataclass, field
 
-from mlx_vlm.trainer.common.config import CoreTrainingArgs
+from mlx_vlm.trainer.common.config import BaseTrainConfig
 
 
 @dataclass
-class VLMTrainingArgs(CoreTrainingArgs):
-    """Common training options and VLM sequence/batching settings."""
+class VLMTrainConfig(BaseTrainConfig):
+    """Sequence, batching and supervision settings shared by VLM algorithms."""
 
     batch_size: int = field(default=1, metadata={"help": "Global minibatch size."})
     max_seq_length: int = 2048
@@ -30,3 +30,12 @@ class VLMTrainingArgs(CoreTrainingArgs):
             raise ValueError("max_seq_length must be at least 2 for next-token loss.")
         if self.pad_to_multiple < 1:
             raise ValueError("pad_to_multiple must be at least 1.")
+
+
+@dataclass
+class SFTTrainConfig(VLMTrainConfig):
+    """Supervised fine-tuning settings."""
+
+
+# Backwards-compatible name.
+VLMTrainingArgs = VLMTrainConfig

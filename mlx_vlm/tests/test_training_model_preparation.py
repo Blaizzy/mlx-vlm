@@ -115,6 +115,39 @@ class ModelPreparationTest(unittest.TestCase):
                         mx.array_equal(base_before, model.embedding.weight).item()
                     )
 
+    def test_qat_float_weights_receive_gradients_and_checkpoint_roundtrips(self):
+        from mlx_vlm.trainer.common.qat import QATLinear
+
+        model = prepare_model_for_training(
+            TinyModel(), train_type="full", qat=True, verbose=False
+        )
+        self.assertIsInstance(model.projection, QATLinear)
+        ids = mx.array([[1, 2, 3]])
+        weight = model.projection.weight
+        packed, scales, biases = mx.quantize(weight, group_size=64, bits=4)
+        expected_weight = mx.dequantize(packed, scales, biases, group_size=64, bits=4)
+        inputs = model.embedding(ids).mean(axis=1)
+        self.assertTrue(
+            mx.allclose(
+                model(ids), inputs @ expected_weight.T + model.projection.bias
+            ).item()
+        )
+        loss, grads = nn.value_and_grad(model, lambda m: m(ids).sum())(model)
+        mx.eval(loss, grads)
+        self.assertGreater(mx.abs(grads["projection"]["weight"]).sum().item(), 0)
+        optim.SGD(learning_rate=0.01).update(model, grads)
+        self.assertFalse(mx.array_equal(weight, model.projection.weight).item())
+        with tempfile.TemporaryDirectory() as folder:
+            save_adapter(model, Path(folder) / "weights.safetensors")
+            restored = prepare_model_for_training(
+                TinyModel(),
+                train_type="full",
+                qat=True,
+                checkpoint_path=folder,
+                verbose=False,
+            )
+            self.assertTrue(mx.allclose(model(ids), restored(ids)).item())
+
     def test_quantized_adapter_reload_reproduces_outputs_and_metadata(self):
         for mode in ("lora", "dora"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as folder:
@@ -219,6 +252,7 @@ class ModelPreparationTest(unittest.TestCase):
     def test_invalid_options_do_not_mutate_model(self):
         for options in (
             {"train_type": "unknown"},
+            {"qat": True},
             {"train_type": "full", "quantization_bits": 4},
             {"quantization_bits": 5},
             {"quantization_bits": 4, "lora_rank": 0},

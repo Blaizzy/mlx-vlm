@@ -1,10 +1,12 @@
-"""Optional VLM MTP auxiliary loss; shared cross-entropy stays model agnostic."""
+"""VLM MTP head attachment and auxiliary loss shared by SFT, DPO, ORPO, and GRPO."""
 
 from collections.abc import Mapping
 
 import mlx.core as mx
 from mlx.utils import tree_flatten
 
+from mlx_vlm.trainer.common.mtp import mtp_head_dir, split_mtp_weights
+from mlx_vlm.trainer.losses.mtp import mtp_objective
 
 def attach_mtp_head(model, head, *, checkpoint_path=None):
     """Attach an unbound Qwen3.5 dense/MoE MTP head after base training setup.
@@ -47,11 +49,10 @@ def attach_mtp_head(model, head, *, checkpoint_path=None):
         from mlx_vlm.trainer.common.model import _read_checkpoint
 
         path, _ = _read_checkpoint(checkpoint_path, require_config=False)
-        weights = {
-            key.removeprefix("mtp_head."): value
-            for key, value in mx.load(str(path)).items()
-            if key.startswith("mtp_head.")
-        }
+        _, weights = split_mtp_weights(mx.load(str(path)))
+        sidecar = mtp_head_dir(path) / "model.safetensors"
+        if not weights and sidecar.is_file():
+            weights = mx.load(str(sidecar))
         if weights:
             head.load_weights(list(weights.items()), strict=True)
     head.unfreeze()
@@ -66,8 +67,7 @@ def vlm_mtp_loss(model, batch, *, output=None, loss_mask=None):
     Forwarding and causal shifting belong here, outside shared cross-entropy.
     An existing policy output/mask avoids another forward during SFT.
     """
-    from mlx_vlm.trainer.losses.cross_entropy import cross_entropy
-    from mlx_vlm.trainer.vlm.sft.runtime import _forward_vlm
+    from mlx_vlm.trainer.vlm.cross_entropy.runtime import _forward_vlm
 
     if not hasattr(model, "mtp_head"):
         raise ValueError(
@@ -101,12 +101,7 @@ def vlm_mtp_loss(model, batch, *, output=None, loss_mask=None):
     logits = model.mtp_head.training_logits(
         ids[:, 1:-1], hidden[-1][:, :-1], context_mask, model
     )
-    loss, metrics = cross_entropy(
-        logits.astype(mx.float32),
-        ids[:, 2:],
-        mx.logical_and(loss_mask[:, 1:], context_mask),
-    )
-    return loss, {"mtp_loss": loss, "num_mtp_tokens": metrics["num_tokens"]}
+    return mtp_objective(logits, ids, loss_mask, context_mask)
 
 
 def add_mtp_loss(model, batch, loss, metrics, weight, *, output=None, loss_mask=None):
