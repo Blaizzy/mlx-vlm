@@ -845,6 +845,47 @@ class Glm5NextTextModel(nn.Module):
         return h
 
 
+def shard_layer(attn, mlp, group: mx.distributed.Group):
+    """Shard one attention or KDA layer and its MLP or MoE in place."""
+    N = group.size()
+    rank = group.rank()
+    if isinstance(attn, Glm5NextLinearAttention):
+        shard_inplace(attn.qkv_proj, "all-to-sharded", segments=3, group=group)
+        shard_inplace(attn.qkv_conv.conv, lambda p, w: (0, 3), group=group)
+        attn.qkv_conv.conv.groups //= N
+        # Of the fused [f_a | b | g_a] rows only b is per head.
+        split = (attn.head_dim, attn.head_dim + attn.num_heads)
+
+        def shard_b(w):
+            f_a, b, g_a = mx.split(w, split)
+            return mx.concatenate([f_a, mx.split(b, N)[rank], g_a])
+
+        attn.fbg_a_proj.apply(shard_b)
+        shard_inplace(attn.f_b_proj, "all-to-sharded", group=group)
+        shard_inplace(attn.g_b_proj, "all-to-sharded", group=group)
+        attn.A_log = mx.split(attn.A_log, N)[rank]
+        attn.dt_bias = mx.split(attn.dt_bias, N)[rank]
+        attn.num_heads //= N
+        attn.projection_dim //= N
+    else:
+        shard_inplace(attn.q_b_proj, "all-to-sharded", group=group)
+        shard_inplace(attn.embed_q, lambda p, w: 0, group=group)
+        shard_inplace(attn.unembed_out, lambda p, w: 0, group=group)
+        attn.num_heads //= N
+    shard_inplace(attn.o_proj, "sharded-to-all", group=group)
+    attn.sharding_group = group
+
+    mlp.sharding_group = group
+    if isinstance(mlp, Glm5NextMoE):
+        shard_inplace(mlp.switch_mlp.gate_proj, "all-to-sharded", group=group)
+        shard_inplace(mlp.switch_mlp.up_proj, "all-to-sharded", group=group)
+        shard_inplace(mlp.switch_mlp.down_proj, "sharded-to-all", group=group)
+        # The MoE sums its routed and shared experts in one collective.
+        mlp = mlp.shared_experts
+    shard_inplace(mlp.gate_up_proj, "all-to-sharded", segments=2, group=group)
+    shard_inplace(mlp.down_proj, "sharded-to-all", group=group)
+
+
 class LanguageModel(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
@@ -1126,43 +1167,5 @@ class LanguageModel(nn.Module):
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
-        N = group.size()
-        rank = group.rank()
         for layer in self.layers:
-            attn = layer.self_attn
-            if layer.is_linear:
-                shard_inplace(attn.qkv_proj, "all-to-sharded", segments=3, group=group)
-                shard_inplace(attn.qkv_conv.conv, lambda p, w: (0, 3), group=group)
-                attn.qkv_conv.conv.groups //= N
-                # Of the fused [f_a | b | g_a] rows only b is per head.
-                split = (attn.head_dim, attn.head_dim + attn.num_heads)
-
-                def shard_b(w):
-                    f_a, b, g_a = mx.split(w, split)
-                    return mx.concatenate([f_a, mx.split(b, N)[rank], g_a])
-
-                attn.fbg_a_proj.apply(shard_b)
-                shard_inplace(attn.f_b_proj, "all-to-sharded", group=group)
-                shard_inplace(attn.g_b_proj, "all-to-sharded", group=group)
-                attn.A_log = mx.split(attn.A_log, N)[rank]
-                attn.dt_bias = mx.split(attn.dt_bias, N)[rank]
-                attn.num_heads //= N
-                attn.projection_dim //= N
-            else:
-                shard_inplace(attn.q_b_proj, "all-to-sharded", group=group)
-                shard_inplace(attn.embed_q, lambda p, w: 0, group=group)
-                shard_inplace(attn.unembed_out, lambda p, w: 0, group=group)
-                attn.num_heads //= N
-            shard_inplace(attn.o_proj, "sharded-to-all", group=group)
-            attn.sharding_group = group
-
-            mlp = layer.mlp
-            mlp.sharding_group = group
-            if isinstance(mlp, Glm5NextMoE):
-                shard_inplace(mlp.switch_mlp.gate_proj, "all-to-sharded", group=group)
-                shard_inplace(mlp.switch_mlp.up_proj, "all-to-sharded", group=group)
-                shard_inplace(mlp.switch_mlp.down_proj, "sharded-to-all", group=group)
-                # The MoE sums its routed and shared experts in one collective.
-                mlp = mlp.shared_experts
-            shard_inplace(mlp.gate_up_proj, "all-to-sharded", segments=2, group=group)
-            shard_inplace(mlp.down_proj, "sharded-to-all", group=group)
+            shard_layer(layer.self_attn, layer.mlp, group)

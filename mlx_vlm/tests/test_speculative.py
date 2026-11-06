@@ -3331,6 +3331,18 @@ def test_scaled_quantized_verifier(batch, length, dtype):
     equal(verifier_linear._target_verify_linears(linears, inputs), expected)
 
 
+def test_glm_mtp_drafter_shards_its_block():
+    drafter = mtp_drafter("glm", tiny_config("glm", "distributed"))
+    attn = drafter.mtp_block.self_attn
+    heads, o_proj = attn.num_heads, attn.o_proj.weight
+    group = NS(size=lambda: 2, rank=lambda: 1)
+    drafter.shard(group)
+    assert attn.num_heads * 2 == heads
+    equal(attn.o_proj.weight, o_proj[:, o_proj.shape[1] // 2 :])
+    assert attn.sharding_group is group
+    assert drafter.mtp_block.mlp.sharding_group is group
+
+
 def test_glm_mtp_native_weight_fusion():
     cfg = tiny_config("glm")
     arch = module("speculative.drafters.glm5_next_mtp")
