@@ -370,7 +370,8 @@ mlx_vlm.generate --model JetBrains/Mellum2.1-12B-A2.5B-Thinking-MTP \
   --prompt "Write a Python function that adds two integers." --temperature 0
 ```
 
-Use `mlx_vlm.convert --mtp` to extract a native head alongside a converted target.
+This also applies to DeepSeek V4.1's bundled DSpark stages. Use
+`mlx_vlm.convert --mtp` to extract a native head alongside a converted target.
 
 #### Gemma 4 MTP
 

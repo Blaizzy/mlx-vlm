@@ -140,6 +140,8 @@ class DSparkStage(nn.Module):
 
 
 class DeepseekV4DsparkDraftModel(nn.Module):
+    stage_class = DSparkStage
+
     def __init__(self, config: DeepseekV4DsparkConfig):
         super().__init__()
         self.config = config
@@ -150,7 +152,8 @@ class DeepseekV4DsparkDraftModel(nn.Module):
         self.hc_mult = text_config.hc_mult
 
         self.stages = [
-            DSparkStage(config, stage_id) for stage_id in range(config.n_mtp_layers)
+            self.stage_class(config, stage_id)
+            for stage_id in range(config.n_mtp_layers)
         ]
         self.markov_head = VanillaMarkov(config.vocab_size, config.markov_rank)
 

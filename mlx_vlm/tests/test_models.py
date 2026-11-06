@@ -2810,16 +2810,32 @@ def tiny_language_model(family):
     name = TINY_MODELS[family]["module"]
     module = importlib.import_module(f"mlx_vlm.models.{name}.language")
     model = module.LanguageModel(config)
+    if family == "deepseek_v41":
+        from mlx_vlm.models.deepseek_v41.engram import NgramHashState
+
+        model.engram_hash = NgramHashState(
+            config,
+            model.layout,
+            token_map=[
+                i % config.engram_compressed_vocab_size
+                for i in range(config.vocab_size)
+            ],
+        )
     model.eval()
     return model
 
 
-@pytest.mark.parametrize("family", ["mellum"])
+@pytest.mark.parametrize("family", ["mellum", "deepseek_v41"])
 def test_native_speculative_hidden_states(family):
     ids = mx.array([[1, 2, 3]])
     model = tiny_language_model(family)
-    hidden = model(ids, return_hidden=True).hidden_states[-1]
-    expected = model.model(ids)
+    if family == "deepseek_v41":
+        # V4.1 taps precede the block; the first tap is the token embedding.
+        hidden = model(ids, capture_layer_ids=[0]).hidden_states[0]
+        expected = model.embed_tokens(ids)
+    else:
+        hidden = model(ids, return_hidden=True).hidden_states[-1]
+        expected = model.model(ids)
     assert mx.array_equal(hidden, expected).item()
 
 
