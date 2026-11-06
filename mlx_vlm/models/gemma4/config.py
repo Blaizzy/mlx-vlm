@@ -123,7 +123,7 @@ class TextConfig(BaseModelConfig):
 @dataclass
 class ModelConfig(BaseModelConfig):
     text_config: TextConfig = field(default_factory=TextConfig)
-    vision_config: VisionConfig = field(default_factory=VisionConfig)
+    vision_config: Optional[VisionConfig] = field(default_factory=VisionConfig)
     audio_config: Optional[AudioConfig] = None
     model_type: str = "gemma4"
     vocab_size: int = 262144
