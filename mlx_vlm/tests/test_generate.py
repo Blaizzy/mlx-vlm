@@ -2262,8 +2262,12 @@ def reference_masks(pattern, consumed, drafts):
 
 
 def start_grammar(processor, first_token):
-    """Sample ``first_token`` from the prompt step; it stays pending."""
-    mx.eval(processor(mx.array([20]), mx.zeros((1, 32))))
+    """Sample ``first_token`` from the prompt step; it stays pending.
+
+    ``prepare_next_token_mask`` advances the matcher as ``__call__`` does,
+    without the Metal mask kernel, so these tests also run on CPU-only MLX.
+    """
+    processor.prepare_next_token_mask(None)
     return first_token
 
 
@@ -2279,10 +2283,10 @@ def test_speculative_masks_cut_at_rejected_draft_and_roll_back():
     # The verifier accepted 6, then picked 3 instead of 2: 6 is consumed and 3
     # stays pending until the next step consumes it.
     processor.speculative_accept([6])
-    out = processor(mx.array([20, 1, 6, 3]), mx.zeros((1, 32)))
-    expected = reference_masks(pattern, [1, 6, 3], [])[0, 0]
-    allowed = [i for i in range(32) if (int(expected) >> i) & 1]
-    assert [i for i, x in enumerate(out[0].tolist()) if x == 0] == allowed
+    mask = np.array(processor.prepare_next_token_mask(3))
+    expected = reference_masks(pattern, [1, 6, 3], [])
+    np.testing.assert_array_equal(mask, expected)
+    allowed = [i for i in range(32) if (int(expected[0, 0]) >> i) & 1]
     assert allowed == [5, 6, 7, 8, 9]
 
 
