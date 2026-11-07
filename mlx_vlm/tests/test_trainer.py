@@ -351,6 +351,48 @@ def test_chunked_update_allows_value_and_grad():
     assert grad.shape == q.shape
 
 
+def test_chunked_update_matches_sequential_values_and_grads():
+    from mlx_vlm.models.qwen3_5.gated_delta import gated_delta_chunked, gated_delta_ops
+
+    # T=13 with C=4 spans several chunks and pads the last; 2 key / 4 value heads.
+    B, T, Hk, Hv, D = 1, 13, 2, 4, 8
+    names = ("q", "k", "v", "g", "beta", "state")
+    with mx.stream(mx.cpu):
+        mx.random.seed(0)
+        k = mx.random.normal((B, T, Hk, D))
+        inputs = (
+            mx.random.normal((B, T, Hk, D)) * D**-0.5,
+            k / mx.linalg.norm(k, axis=-1, keepdims=True),
+            mx.random.normal((B, T, Hv, D)),
+            mx.random.uniform(0.5, 1.0, (B, T, Hv)),
+            mx.random.uniform(0.0, 1.0, (B, T, Hv)),
+            mx.random.normal((B, Hv, D, D)) * 0.1,
+        )
+        y_weight = mx.random.normal((B, T, Hv, D))
+        state_weight = mx.random.normal((B, Hv, D, D))
+
+        def run(fn):
+            def loss(*args):
+                y, state = fn(*args)
+                return (y * y_weight).sum() + (state * state_weight).sum()
+
+            grad_fn = mx.value_and_grad(loss, argnums=tuple(range(len(names))))
+            outputs, (value, grads) = fn(*inputs), grad_fn(*inputs)
+            mx.eval(outputs, value, grads)
+            return outputs, value, grads
+
+        expected = run(gated_delta_ops)
+        actual = run(lambda *args: gated_delta_chunked(*args, C=4))
+
+    pairs = [("y", actual[0][0], expected[0][0])]
+    pairs += [("state_out", actual[0][1], expected[0][1])]
+    pairs += [("loss", actual[1], expected[1])]
+    pairs += [(f"d{n}", a, e) for n, a, e in zip(names, actual[2], expected[2])]
+    for name, a, e in pairs:
+        assert a.shape == e.shape, name
+        assert mx.allclose(a, e, rtol=1e-4, atol=1e-4).item(), name
+
+
 @pytest.mark.parametrize(
     "kind,style,pos_ndim",
     [("fused", style, ndim) for style in ("interleaved", "chunked") for ndim in (2, 3)]
