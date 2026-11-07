@@ -2001,6 +2001,8 @@ class Qwen4ExpBatchInvariantForward(Qwen3_5BatchInvariantForward):
         cache,
         inputs_embeds,
         position_ids,
+        capture_layer_ids=None,
+        hidden_sink=None,
     ):
         hidden = model.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
         hidden = mx.tile(hidden, (1, 1, model.args.hc_count))
@@ -2008,7 +2010,8 @@ class Qwen4ExpBatchInvariantForward(Qwen3_5BatchInvariantForward):
             cache = [None] * len(model.layers)
         fa_mask = _create_qwen3_5_attention_mask(hidden, cache[model.fa_idx])
         ssm_mask = _create_qwen3_5_ssm_mask(hidden, cache[model.ssm_idx])
-        for layer, layer_cache in zip(model.layers, cache):
+        capture = set(capture_layer_ids or [])
+        for index, (layer, layer_cache) in enumerate(zip(model.layers, cache)):
             layer_mask = ssm_mask if layer.is_linear else fa_mask
             hidden = self._layer(
                 layer,
@@ -2019,6 +2022,12 @@ class Qwen4ExpBatchInvariantForward(Qwen3_5BatchInvariantForward):
                 position_ids,
             )
             mx.async_eval(hidden)
+            if hidden_sink is not None and index in capture:
+                # Same public contract as Qwen4ExpModel: layer captures are the
+                # mixed hidden state, not the hyper-connection streams.
+                hidden_sink.append(
+                    self._hyper_connection(model.hyper_connection_mixer, hidden)
+                )
         return hidden
 
     def __call__(
@@ -2029,15 +2038,31 @@ class Qwen4ExpBatchInvariantForward(Qwen3_5BatchInvariantForward):
         cache=None,
         inputs_embeds=None,
         position_ids=None,
+        capture_layer_ids=None,
+        return_hidden=False,
+        return_shared_kv=False,
         skip_logits=False,
     ):
+        hidden_sink = [] if capture_layer_ids is not None else None
         hidden = self._model(
             language_model.model,
             inputs,
             cache,
             inputs_embeds,
             position_ids,
+            capture_layer_ids,
+            hidden_sink,
         )
+        if hidden_sink is not None and capture_layer_ids == []:
+            # An explicit empty capture list is reserved for the final
+            # pre-mixer hyper-connection state (the native MTP contract).
+            hidden_sink.append(hidden)
+        if return_hidden:
+            if hidden_sink is None:
+                hidden_sink = []
+            # The final pre-mixer state; _mtp_logits_hidden mixes it before
+            # the head, so argmax-from-hidden sees the true model output.
+            hidden_sink.append(hidden)
         logits_hidden = self._hyper_connection(
             language_model.model.hyper_connection_mixer, hidden
         )
@@ -2051,7 +2076,7 @@ class Qwen4ExpBatchInvariantForward(Qwen3_5BatchInvariantForward):
             logits = self._linear(language_model.lm_head, logits_hidden)
         return LanguageModelOutput(
             logits=logits,
-            hidden_states=[hidden],
+            hidden_states=hidden_sink if hidden_sink is not None else [hidden],
             shared_kv_states={},
         )
 
@@ -2075,15 +2100,34 @@ class LanguageModel(Qwen3_5LanguageModel):
 
     def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, **kwargs):
         return_hidden = bool(kwargs.get("return_hidden", False))
-        if return_hidden and kwargs.get("capture_layer_ids") is None:
+        forced_capture = return_hidden and kwargs.get("capture_layer_ids") is None
+        if forced_capture:
             # Force Qwen4ExpModel to capture its final pre-mixer HC state.  The
             # inherited wrapper also appends the mixed output; keep only the
             # first entry so MTP always sees [B, L, hc_count * hidden_size].
             kwargs["capture_layer_ids"] = []
         output = super().__call__(inputs, inputs_embeds, mask, cache, **kwargs)
-        if return_hidden and output.hidden_states:
+        if forced_capture and output.hidden_states:
+            # Trim only the forced capture: callers that asked for specific
+            # layers (e.g. a DFlash verify) need every captured state back.
             output.hidden_states = [output.hidden_states[0]]
         return output
+
+    def _speculative_verifier(self):
+        return _QWEN4_BATCH_INVARIANT_FORWARD
+
+    def speculative_verify_dflash_hidden(
+        self, inputs: mx.array, cache, capture_layer_ids: list[int]
+    ):
+        output = self(
+            inputs,
+            cache=cache,
+            capture_layer_ids=list(capture_layer_ids),
+            speculative_verify=True,
+            return_hidden=True,
+            skip_logits=True,
+        )
+        return output.hidden_states[:-1], output.hidden_states[-1], output.gdn_states
 
     def _batch_invariant_decode(
         self,
