@@ -11,7 +11,7 @@ from ....models.cache import (
     KVCache,
     PoolingCache,
 )
-from ....models.glm5_next.language import Glm5NextAttention, Glm5NextMoE
+from ....models.glm5_next.language import Glm5NextAttention, Glm5NextMoE, shard_layer
 from ...cache_state import start_speculative_cache
 from ...common import _prepare_ragged_mtp_replay
 from ..mtp_base import AutoregressiveMTPDraftModel
@@ -83,6 +83,13 @@ class Glm5NextMTPDraftModel(AutoregressiveMTPDraftModel):
     @property
     def quant_predicate(self):
         return lambda _path, _module: True
+
+    def shard(self, group: Optional[mx.distributed.Group] = None):
+        shard_layer(
+            self.mtp_block.self_attn,
+            self.mtp_block.mlp,
+            group or mx.distributed.init(),
+        )
 
     def make_cache(self, left_padding: Optional[List[int]] = None) -> List[CacheList]:
         indexer = self.mtp_block.self_attn.indexer

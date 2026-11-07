@@ -2,6 +2,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.layers.distributed import shard_inplace
 
 from ..base import LanguageModelOutput, create_ssm_mask, scaled_dot_product_attention
 from ..cache import ArraysCache, CacheList, KVCache, PoolingCache
@@ -39,10 +40,14 @@ class Glm5NextMLP(nn.Module):
         )
         self.down_proj = nn.Linear(intermediate_size, config.hidden_size, bias=False)
         self.swiglu_limit = config.swiglu_limit
+        self.sharding_group = None
 
     def __call__(self, x):
         gate, up = mx.split(linear(self.gate_up_proj, x), 2, axis=-1)
-        return linear(self.down_proj, _limited_swiglu(gate, up, self.swiglu_limit))
+        out = linear(self.down_proj, _limited_swiglu(gate, up, self.swiglu_limit))
+        if self.sharding_group is not None:
+            out = mx.distributed.all_sum(out, group=self.sharding_group)
+        return out
 
 
 @mx.compile
@@ -182,6 +187,7 @@ class Glm5NextLinearAttention(nn.Module):
         self.dt_bias = mx.zeros((self.projection_dim,), dtype=mx.float32)
         self.o_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.o_proj = nn.Linear(self.projection_dim, config.hidden_size, bias=False)
+        self.sharding_group = None
 
     def __call__(self, x, mask=None, cache=None):
         batch, length, _ = x.shape
@@ -217,7 +223,10 @@ class Glm5NextLinearAttention(nn.Module):
             cache.advance(q.shape[1])
         gate = linear(self.g_b_proj, g_a).reshape(shape)
         output = (self.o_norm(output) * mx.sigmoid(gate)).reshape(batch, length, -1)
-        return linear(self.o_proj, output)
+        output = linear(self.o_proj, output)
+        if self.sharding_group is not None:
+            output = mx.distributed.all_sum(output, group=self.sharding_group)
+        return output
 
 
 def _batch_gather(values: mx.array, indices: mx.array) -> mx.array:
@@ -624,6 +633,7 @@ class Glm5NextAttention(nn.Module):
             bias=config.attention_bias,
         )
         self.indexer = None if self.skip_topk else Glm5NextIndexer(config, layer_idx)
+        self.sharding_group = None
 
     def __call__(
         self,
@@ -680,7 +690,10 @@ class Glm5NextAttention(nn.Module):
         out, topk = self._attend(
             q, latent, new_latent, topk, kv_cache, projected_cache, last_only
         )
-        return linear(self.o_proj, out), topk
+        out = linear(self.o_proj, out)
+        if self.sharding_group is not None:
+            out = mx.distributed.all_sum(out, group=self.sharding_group)
+        return out, topk
 
     def _attend(
         self, q, latent, new_latent, topk, kv_cache, projected_cache, last_only=False
@@ -830,6 +843,47 @@ class Glm5NextTextModel(nn.Module):
         if hidden_sink is not None:
             hidden_sink.append(h)
         return h
+
+
+def shard_layer(attn, mlp, group: mx.distributed.Group):
+    """Shard one attention or KDA layer and its MLP or MoE in place."""
+    N = group.size()
+    rank = group.rank()
+    if isinstance(attn, Glm5NextLinearAttention):
+        shard_inplace(attn.qkv_proj, "all-to-sharded", segments=3, group=group)
+        shard_inplace(attn.qkv_conv.conv, lambda p, w: (0, 3), group=group)
+        attn.qkv_conv.conv.groups //= N
+        # Of the fused [f_a | b | g_a] rows only b is per head.
+        split = (attn.head_dim, attn.head_dim + attn.num_heads)
+
+        def shard_b(w):
+            f_a, b, g_a = mx.split(w, split)
+            return mx.concatenate([f_a, mx.split(b, N)[rank], g_a])
+
+        attn.fbg_a_proj.apply(shard_b)
+        shard_inplace(attn.f_b_proj, "all-to-sharded", group=group)
+        shard_inplace(attn.g_b_proj, "all-to-sharded", group=group)
+        attn.A_log = mx.split(attn.A_log, N)[rank]
+        attn.dt_bias = mx.split(attn.dt_bias, N)[rank]
+        attn.num_heads //= N
+        attn.projection_dim //= N
+    else:
+        shard_inplace(attn.q_b_proj, "all-to-sharded", group=group)
+        shard_inplace(attn.embed_q, lambda p, w: 0, group=group)
+        shard_inplace(attn.unembed_out, lambda p, w: 0, group=group)
+        attn.num_heads //= N
+    shard_inplace(attn.o_proj, "sharded-to-all", group=group)
+    attn.sharding_group = group
+
+    mlp.sharding_group = group
+    if isinstance(mlp, Glm5NextMoE):
+        shard_inplace(mlp.switch_mlp.gate_proj, "all-to-sharded", group=group)
+        shard_inplace(mlp.switch_mlp.up_proj, "all-to-sharded", group=group)
+        shard_inplace(mlp.switch_mlp.down_proj, "sharded-to-all", group=group)
+        # The MoE sums its routed and shared experts in one collective.
+        mlp = mlp.shared_experts
+    shard_inplace(mlp.gate_up_proj, "all-to-sharded", segments=2, group=group)
+    shard_inplace(mlp.down_proj, "sharded-to-all", group=group)
 
 
 class LanguageModel(nn.Module):
@@ -1110,3 +1164,8 @@ class LanguageModel(nn.Module):
                 weights[f"{attn_prefix}.embed_q.weight"] = wk
                 weights[f"{attn_prefix}.unembed_out.weight"] = wv
         return weights
+
+    def shard(self, group: Optional[mx.distributed.Group] = None):
+        group = group or mx.distributed.init()
+        for layer in self.layers:
+            shard_layer(layer.self_attn, layer.mlp, group)
