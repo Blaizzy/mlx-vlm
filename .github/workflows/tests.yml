@@ -4,9 +4,8 @@ on:
   push:
     branches:
       - main
+  # Stacked PRs also target feature branches.
   pull_request:
-    branches:
-      - main
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -95,7 +94,7 @@ jobs:
               tests/test_tool_streaming.py
           - group: training-ops
             suite: Training, cache, offloading & model operations
-            os: macos-14
+            os: macos-15
             extras: test
             # Keep cache pressure checks away from the larger model contracts.
             # Run the training API first so its compilation starts early.
@@ -117,27 +116,33 @@ jobs:
               tests/test_training_helpers.py
               tests/test_training_metrics.py
               tests/test_training_model_preparation.py
+              tests/test_training_mtp.py
+              tests/test_training_mtp_notebook.py
               tests/test_training_notebooks.py
               tests/test_training_vlm.py
           - group: models
             suite: Models, processors & speculation
-            os: macos-14
+            os: macos-15
             extras: test
             tests: >-
               tests/test_gated_delta.py
               tests/test_inkling_kernel_gates.py
+              tests/test_interpolate.py
               tests/test_models.py
+              tests/test_mrope_text_only_rope_deltas.py
               tests/test_muse_spark.py
               tests/test_muse_spark_kernels.py
               tests/test_oxr.py
+              tests/test_position_embedding_resize.py
               tests/test_processors.py
               tests/test_speculative.py
           - group: media
             suite: Diffusion, audio, images, video & extraction
-            os: macos-14
+            os: macos-15
             extras: test
             tests: >-
               tests/test_audio_models.py
+              tests/test_d1.py
               tests/test_diffusion_models.py
               tests/test_extraction_models.py
               tests/test_flux3.py
@@ -146,6 +151,7 @@ jobs:
               tests/test_llada_image.py
               tests/test_moss_image.py
               tests/test_muse_spark_video.py
+              tests/test_three_d.py
               tests/test_video_generation_models.py
     steps:
       - name: Checkout code
@@ -188,6 +194,9 @@ jobs:
         working-directory: mlx_vlm
         env:
           TEST_FILES: ${{ matrix.tests }}
+          PYTEST_ADDOPTS: >-
+            -vvv --max-worker-restart=0
+            -o faulthandler_timeout=120 -o faulthandler_exit_on_timeout=true
         run: |
           read -r -a tests <<< "$TEST_FILES"
           python -m pytest -q -n 3 --dist=worksteal --durations=30 \
@@ -200,7 +209,7 @@ jobs:
         if: matrix.group == 'models'
         working-directory: mlx_vlm
         run: |
-          python -m pytest -q tests/test_models.py -k test_distributed_model \
+          python -m pytest -v -s tests/test_models.py -k test_distributed_model \
             --durations=12 --junitxml=../test-results/models-distributed.xml
 
       - name: Upload test timings

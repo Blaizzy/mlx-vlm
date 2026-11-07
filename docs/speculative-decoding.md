@@ -5,6 +5,12 @@ several tokens, the target verifies the whole block, and MLX-VLM accepts the
 matching prefix plus one target token. Rejected cache entries are then removed
 before the next round.
 
+`thinking_budget` is enforced during verification, including per-request budgets
+in server batches. If a forced thinking-closing token differs from the verified
+path, it becomes the next bonus token and the rest of the block is discarded
+before cache commit. `reasoning_effort` remains a model chat-template option;
+it is not automatically converted into a token budget.
+
 ```text
 target prefill and hidden capture
               ↓

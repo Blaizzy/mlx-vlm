@@ -23,9 +23,9 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Blaizzy/mlx-vlm"
-Repository = "https://github.com/Blaizzy/mlx-vlm"
-Issues = "https://github.com/Blaizzy/mlx-vlm/issues"
+Homepage = "https://www.neywalabs.ai"
+Repository = "https://github.com/Neywa-Labs/mlx-vlm"
+Issues = "https://github.com/Neywa-Labs/mlx-vlm/issues"
 
 [project.scripts]
 "mlx_vlm.decide" = "mlx_vlm.decide:main"

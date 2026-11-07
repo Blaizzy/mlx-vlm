@@ -3338,3 +3338,88 @@ class TestD1OmniDecisionModel(unittest.TestCase):
             predict(model, tok, None, questions, images=[image], audio=clip)
         with self.assertRaisesRegex(ValueError, "mono"):
             predict(model, tok, None, questions, audio=np.zeros((2, 8000), np.int16))
+
+
+class TestMiniCPMOcrJev:
+    def test_checkpoint_dispatch_and_no_lm_head(self):
+        from mlx_vlm.models.minicpm_ocr_jev import Model
+
+        cfg = _extraction_config("minicpm_ocr_jev")
+        cfg.update(
+            model_type="qwen3_5",
+            architectures=["Qwen3_5ForConditionalGeneration"],
+            problem_type="single_label_classification",
+        )
+        module, name = get_model_and_args(cfg)
+        assert name == "minicpm_ocr_jev"
+        model = module.Model(module.ModelConfig.from_dict(cfg))
+        assert isinstance(model, Model)
+        assert not hasattr(model.language_model, "lm_head")
+        assert model.score.weight.shape == (2, model.config.text_config.hidden_size)
+        assert not model.quant_predicate("score", model.score)
+        cfg.pop("problem_type")
+        assert get_model_and_args(cfg)[1] == "qwen3_5"
+        cfg["architectures"] = ["Qwen3_5ForSequenceClassification"]
+        assert get_model_and_args(cfg)[1] == "minicpm_ocr_jev"
+
+    def test_pooling_padding_and_reload(self, tmp_path):
+        from dataclasses import asdict
+
+        from mlx_vlm.models.minicpm_ocr_jev import Model, ModelConfig
+        from mlx_vlm.utils import load_model
+
+        mx.random.seed(7)
+        model = Model(ModelConfig.from_dict(_extraction_config("minicpm_ocr_jev")))
+        model.eval()
+        ids = mx.array([[1, 2, 3]])
+        expected = model(ids).logits
+        assert expected.shape == (1, 2)
+        for padded in [[[0, 0, 1, 2, 3]], [[1, 2, 3, 0, 0]]]:
+            padded = mx.array(padded)
+            actual = model(padded, attention_mask=padded != 0).logits
+            np.testing.assert_allclose(actual, expected, atol=1e-5)
+        with pytest.raises(ValueError, match="all-padding"):
+            model(mx.zeros((1, 3), dtype=mx.int32))
+        (tmp_path / "config.json").write_text(json.dumps(asdict(model.config)))
+        weights = dict(tree_flatten(model.parameters()))
+        mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+        reloaded = load_model(tmp_path)
+        np.testing.assert_array_equal(reloaded(ids).logits, expected)
+        # A nonuniform score head is retained on both sanitize passes.
+        source = {
+            "score.weight": mx.arange(model.score.weight.size).reshape(
+                model.score.weight.shape
+            )
+        }
+        once = model.sanitize(source)
+        _assert_weights_equal(model.sanitize(once), source)
+
+    def test_prompt_image_order_and_aspect_ratio(self):
+        from PIL import Image
+
+        from mlx_vlm.models.minicpm_ocr_jev import build_prompt, score
+        from mlx_vlm.models.minicpm_ocr_jev.scoring import load_image
+
+        text = "A\n  B "
+        prompt = build_prompt(text)
+        assert prompt.count("<|image_pad|>") == 2
+        assert f"<|vision_end|>OCR文本：\n{text}\n" in prompt
+        assert "<|vision_end|>第一张图是原图" in prompt
+        assert prompt.endswith("<|im_end|>\n")
+        assert "assistant" not in prompt and "<think>" not in prompt
+        original = Image.new("RGB", (400, 1), "black")
+        rendering = Image.new("RGB", (10, 10), "red")
+        padded = load_image(original)
+        assert padded.size == (400, 3)
+        assert padded.getpixel((0, 0)) == (255, 255, 255)
+        inputs = {"input_ids": mx.array([[1, 2, 3]])}
+        with patch("mlx_vlm.utils.prepare_inputs", return_value=inputs) as prepare:
+            model = MagicMock(
+                return_value=SimpleNamespace(logits=mx.array([[0.0, 2.0]]))
+            )
+            result = score(model, object(), original, rendering, text)
+        assert prepare.call_args.kwargs["prompts"] == prompt
+        images = prepare.call_args.kwargs["images"]
+        assert images[0].size == (400, 3) and images[1].getpixel((0, 0)) == (255, 0, 0)
+        assert result["prob_1"] == pytest.approx(1 / (1 + math.exp(-2)))
+        assert result["n_tokens"] == 3

@@ -16,6 +16,36 @@ from mlx_vlm.tests.test_diffusion_models import FakeProcessor
 from mlx_vlm.utils import apply_generation_config_defaults, load_config
 
 
+@pytest.mark.parametrize(
+    "dtype,delta",
+    [
+        (mx.bfloat16, 0.015625),
+        (mx.float16, 0.001),
+        (mx.float32, 1e-7),
+    ],
+)
+@pytest.mark.parametrize("shape", [(1, 131072), (3, 131072), (2, 4, 131072)])
+def test_greedy_argmax_preserves_normalized_ties(dtype, delta, shape):
+    from mlx_vlm.sample_utils import greedy_argmax
+
+    logits = mx.zeros(shape, dtype)
+    logits[..., 1] = delta
+    reference = mx.argmax(
+        logits - mx.logsumexp(logits, axis=-1, keepdims=True), axis=-1
+    )
+    assert mx.all(mx.argmax(logits, axis=-1) == 1).item()
+    assert mx.all(reference == 0).item()
+    assert mx.array_equal(greedy_argmax(logits), reference).item()
+
+    mx.random.seed(9)
+    logits = mx.random.normal(shape).astype(dtype)
+    logits[..., :7] = -float("inf")
+    reference = mx.argmax(
+        logits - mx.logsumexp(logits, axis=-1, keepdims=True), axis=-1
+    )
+    assert mx.array_equal(greedy_argmax(logits), reference).item()
+
+
 @pytest.fixture(
     params=[
         ({}, {}, (0.0, 1.0, 0)),

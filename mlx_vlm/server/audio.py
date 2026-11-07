@@ -10,6 +10,7 @@ import threading
 import time
 import traceback
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any, Dict, List, Literal, Optional
 
@@ -60,12 +61,14 @@ class AudioSpeechRequest(FlexibleBaseModel):
 
 class AudioTranscriptionRequest(FlexibleBaseModel):
     model: str
+    task: Optional[str] = None
     language: Optional[str] = None
     prompt: Optional[str] = None
+    system_prompt: Optional[str] = None
     temperature: Optional[float] = None
     response_format: str = "json"
     verbose: bool = False
-    max_tokens: int = 1024
+    max_tokens: Optional[int] = None
     chunk_duration: float = 30.0
     frame_threshold: int = 25
     stream: bool = False
@@ -97,9 +100,14 @@ class AudioResultChunk:
     error: BaseException | None = None
 
 
+AudioRequestKind = Literal[
+    "tts", "stt", "stt_realtime", "diarization", "speaker_embedding", "diarized_stt"
+]
+
+
 @dataclass
 class AudioInferenceRequest:
-    kind: Literal["tts", "stt", "stt_realtime"]
+    kind: AudioRequestKind
     model_name: str
     payload: Any
     request_id: str = ""
@@ -107,18 +115,23 @@ class AudioInferenceRequest:
     cancel_event: threading.Event = None
     ready_event: threading.Event = None
     ready_error: BaseException | None = None
+    finish_reason: Literal["stop", "length"] | None = None
 
     def __post_init__(self):
         if not self.request_id:
             self.request_id = uuid.uuid4().hex
         if self.result_queue is None:
             self.result_queue = queue.Queue(
-                maxsize=64 if self.kind == "stt_realtime" else 0
+                maxsize=64 if self.kind in ("stt_realtime", "diarized_stt") else 0
             )
         if self.cancel_event is None:
             self.cancel_event = threading.Event()
         if self.ready_event is None:
             self.ready_event = threading.Event()
+
+    def check_cancelled(self) -> None:
+        if self.cancel_event.is_set():
+            raise HTTPException(status_code=499, detail="Audio analysis cancelled")
 
     def emit_data(self, payload: Any) -> None:
         self._emit(AudioResultChunk(kind="data", payload=payload))
@@ -130,7 +143,7 @@ class AudioInferenceRequest:
         self._emit(AudioResultChunk(kind="done"))
 
     def _emit(self, chunk: AudioResultChunk) -> None:
-        if self.kind != "stt_realtime":
+        if self.kind not in ("stt_realtime", "diarized_stt"):
             self.result_queue.put(chunk)
             return
         while not self.cancel_event.is_set():
@@ -181,7 +194,7 @@ class AudioRequestQueue:
     def submit(
         self,
         *,
-        kind: Literal["tts", "stt", "stt_realtime"],
+        kind: AudioRequestKind,
         model_name: str,
         payload: Any,
     ) -> AudioInferenceHandle:
@@ -246,6 +259,14 @@ class AudioRequestQueue:
                     from .audio_realtime import run_request
 
                     run_request(request, get_cached_model)
+                elif request.kind in ("diarization", "speaker_embedding"):
+                    from .audio_speakers import run_request
+
+                    run_request(request, get_cached_model)
+                elif request.kind == "diarized_stt":
+                    from .audio_diarized import run_request
+
+                    run_request(request, get_cached_model)
                 else:
                     raise ValueError(f"Unsupported audio request kind: {request.kind}")
             except Exception as exc:
@@ -262,6 +283,8 @@ class AudioRequestQueue:
                     if not request.ready_event.is_set():
                         request.mark_ready(error)
                     request.emit_error(error)
+                if request.kind in ("diarization", "speaker_embedding", "diarized_stt"):
+                    request.payload.close()
                 request.emit_done()
                 mx.clear_cache()
                 with self._admission:
@@ -289,6 +312,9 @@ def register_routes(app, deps):
     _build_metrics_envelope = deps.build_metrics_envelope
 
     from .audio_realtime import audio_realtime_endpoint
+    from .audio_speakers import register_routes as register_speaker_routes
+
+    register_speaker_routes(app)
 
     app.websocket("/v1/audio/transcriptions/realtime")(audio_realtime_endpoint)
 
@@ -381,6 +407,15 @@ async def audio_translations_endpoint(request: Request):
 
 
 async def _audio_transcription_response(request: Request, *, translate: bool):
+    if (await request.form()).get("response_format") == "diarized_json":
+        if translate:
+            raise HTTPException(
+                status_code=400,
+                detail="diarized_json is only supported for transcriptions",
+            )
+        from .audio_diarized import response
+
+        return await response(request)
     endpoint = "/v1/audio/translations" if translate else "/v1/audio/transcriptions"
     request_start = time.perf_counter()
     payload = await _parse_transcription_request(request, translate=translate)
@@ -415,14 +450,23 @@ async def _audio_transcription_response(request: Request, *, translate: bool):
 
         chunks = await _collect_audio_handle(handle)
         result = _transcription_result_from_chunks(chunks)
+        finish_reason = handle.request.finish_reason
+        if finish_reason is not None:
+            result["finish_reason"] = finish_reason
+        response = _format_transcription_response(
+            result, payload.request.response_format
+        )
+        if finish_reason is not None:
+            response.headers["X-MLX-Finish-Reason"] = finish_reason
         _record_audio_success(
             endpoint=endpoint,
             model=payload.request.model,
             stream=False,
             request_start=request_start,
             audio_count=1,
+            finish_reason=finish_reason,
         )
-        return _format_transcription_response(result, payload.request.response_format)
+        return response
     except HTTPException as exc:
         _record_audio_failure(endpoint, payload.request.model, stream_response, exc)
         raise
@@ -459,12 +503,14 @@ async def _parse_transcription_request(
 
     payload = AudioTranscriptionRequest(
         model=model,
+        task=_clean_form_value(form.get("task")),
         language=_clean_form_value(form.get("language")),
         prompt=_clean_form_value(form.get("prompt")),
+        system_prompt=_clean_form_value(form.get("system_prompt")),
         temperature=_form_float(form.get("temperature")),
         response_format=_clean_form_value(form.get("response_format")) or "json",
         verbose=_form_bool(form.get("verbose"), default=False),
-        max_tokens=_form_int(form.get("max_tokens"), default=1024),
+        max_tokens=_form_int(form.get("max_tokens")),
         chunk_duration=_form_float(form.get("chunk_duration"), default=30.0),
         frame_threshold=_form_int(form.get("frame_threshold"), default=25),
         stream=_form_bool(form.get("stream"), default=False),
@@ -605,6 +651,9 @@ def _run_stt_request(request: AudioInferenceRequest) -> None:
             if request.cancel_event.is_set():
                 return
             chunk = _stt_item_to_dict(item)
+            finish_reason = chunk.get("finish_reason")
+            if finish_reason in ("stop", "length"):
+                request.finish_reason = finish_reason
             if not request.ready_event.is_set():
                 request.mark_ready()
             request.emit_data(json.dumps(_sanitize_for_json(chunk)) + "\n")
@@ -628,12 +677,26 @@ def _build_stt_generate_kwargs(
     )
     prompt = request.prompt
     accepted = _callable_parameters(model.generate)
+    params = accepted["params"] if accepted is not None else {}
+
+    # Omit the argument when the backend declares a default (including None).
+    # Keep the server fallback for required parameters and **kwargs wrappers.
+    budget = params.get("max_tokens")
+    if budget is None or budget.default is inspect.Parameter.empty:
+        kwargs.setdefault("max_tokens", 1024)
 
     if prompt:
-        if _accepts_parameter(accepted, "context"):
-            kwargs.setdefault("context", prompt)
-        elif _accepts_parameter(accepted, "text"):
-            kwargs.setdefault("text", prompt)
+        # Prefer a declared parameter over **kwargs, which may silently ignore
+        # aliases (for example a native prompt model also accepting **kwargs).
+        for name in ("prompt", "context", "text"):
+            if name in params:
+                kwargs.setdefault(name, prompt)
+                break
+        else:
+            # Preserve the context convention for wrappers with **kwargs only
+            # or callables whose signatures cannot be inspected.
+            if _accepts_parameter(accepted, "context"):
+                kwargs.setdefault("context", prompt)
 
     if translate:
         if _accepts_parameter(accepted, "task"):
@@ -714,7 +777,7 @@ def _stt_item_base_dict(item) -> Dict[str, Any]:
         return item.model_dump(exclude_none=True)
 
     data = {}
-    for attr in ("text", "language", "segments"):
+    for attr in ("text", "language", "segments", "finish_reason"):
         if hasattr(item, attr):
             data[attr] = getattr(item, attr)
     if hasattr(item, "start_time"):
@@ -791,7 +854,70 @@ async def _stream_audio_handle(
                 stream=stream,
                 request_start=request_start,
                 audio_count=1 if media_kind == "transcription" else 0,
+                finish_reason=(
+                    handle.request.finish_reason
+                    if media_kind == "transcription"
+                    else "stop"
+                ),
             )
+
+
+def _audio_analysis_events(
+    request: Request,
+    *,
+    kind: AudioRequestKind,
+    model: str,
+    payload,
+    endpoint: str,
+    stream: bool = False,
+    request_start: float | None = None,
+):
+    """Submit before sending headers; the worker then owns the uploaded file."""
+    started = time.perf_counter() if request_start is None else request_start
+    runtime.metrics.begin_request(endpoint=endpoint, model=model, stream=stream)
+    try:
+        handle = _get_audio_queue().submit(kind=kind, model_name=model, payload=payload)
+    except BaseException as exc:
+        payload.close()
+        _record_audio_failure(endpoint, model, stream, exc)
+        raise
+
+    async def events():
+        while True:
+            if await request.is_disconnected():
+                raise HTTPException(499, "Audio request disconnected")
+            chunk = await asyncio.to_thread(_get_queue_chunk, handle.result_queue, 0.1)
+            if chunk is None:
+                continue
+            if chunk.kind == "error":
+                raise _as_http_exception(chunk.error)
+            if chunk.kind == "done":
+                break
+            yield chunk.payload
+
+    @asynccontextmanager
+    async def consume():
+        source = events()
+        try:
+            # Response validation belongs inside the context so malformed or
+            # incomplete results are recorded as failures, not successes.
+            yield source
+        except (Exception, asyncio.CancelledError, GeneratorExit) as exc:
+            _record_audio_failure(endpoint, model, stream, exc)
+            raise
+        else:
+            _record_audio_success(
+                endpoint=endpoint,
+                model=model,
+                stream=stream,
+                request_start=started,
+                audio_count=1,
+            )
+        finally:
+            handle.cancel()
+            await source.aclose()
+
+    return consume()
 
 
 def _get_queue_chunk(result_queue: "queue.Queue[AudioResultChunk]", timeout: float):
@@ -836,7 +962,10 @@ def _format_transcription_response(result: Dict[str, Any], response_format: str)
     response_format = response_format or "json"
     text = (result.get("text") or "").strip()
     if response_format == "json":
-        return JSONResponse({"text": text})
+        body = {"text": text}
+        if "finish_reason" in result:
+            body["finish_reason"] = result["finish_reason"]
+        return JSONResponse(body)
     if response_format == "text":
         return PlainTextResponse(text)
     if response_format == "verbose_json":
@@ -937,13 +1066,13 @@ def _callable_parameters(fn):
         signature = inspect.signature(fn)
     except (TypeError, ValueError):
         return None
-    params = set()
+    params = {}
     has_var_kwargs = False
     for name, parameter in signature.parameters.items():
         if parameter.kind == inspect.Parameter.VAR_KEYWORD:
             has_var_kwargs = True
         else:
-            params.add(name)
+            params[name] = parameter
     return {"params": params, "**kwargs": has_var_kwargs}
 
 
@@ -981,6 +1110,7 @@ def _record_audio_success(
     stream: bool,
     request_start: float,
     audio_count: int,
+    finish_reason: Optional[str] = "stop",
 ) -> None:
     elapsed = time.perf_counter() - request_start
     envelope = _build_metrics_envelope(
@@ -993,7 +1123,7 @@ def _record_audio_success(
         generated_tokens=0,
         request_elapsed_s=elapsed,
         request_started_s=request_start,
-        finish_reason="stop",
+        finish_reason=finish_reason,
         audio_count=audio_count,
     )
     runtime.metrics.record_success(envelope)
@@ -1037,7 +1167,7 @@ def _form_bool(value, *, default: bool) -> bool:
     return value.lower() in ("1", "true", "yes", "on")
 
 
-def _form_int(value, *, default: int) -> int:
+def _form_int(value, *, default: Optional[int] = None) -> Optional[int]:
     value = _clean_form_value(value)
     return default if value is None else int(value)
 

@@ -1,7 +1,31 @@
-[![Upload Python Package](https://github.com/Blaizzy/mlx-vlm/actions/workflows/python-publish.yml/badge.svg)](https://github.com/Blaizzy/mlx-vlm/actions/workflows/python-publish.yml)
-# MLX-VLM
+<h1 align="center">MLX-VLM</h1>
 
-MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VLMs) and Omni Models (VLMs with audio and video support) on your Mac using MLX.
+[![Any input. Any output. All local. Runs locally on your Mac. Install with pip install -U mlx-vlm or try it in Nativ.](https://raw.githubusercontent.com/Neywa-Labs/mlx-vlm/b7fda105064b609fcc2ef243bd628c3dad317564/docs/assets/mlx-vlm-banner.png)](https://runnativ.ai)
+
+<p align="center">
+  <strong>Run and fine-tune multimodal models on Apple Silicon.</strong> Text, images, video, and audio in — any out. Built on MLX.
+</p>
+
+<p align="center">
+  <a href="#installation"><strong>Installation</strong></a> &middot;
+  <a href="https://neywa-labs.github.io/mlx-vlm/">Documentation</a> &middot;
+  <a href="https://github.com/Neywa-Labs/mlx-vlm/releases">Releases</a>
+</p>
+
+<p align="center">
+  macOS &middot; Apple silicon
+</p>
+
+<p align="center">
+  Built by <a href="https://www.neywalabs.ai">Neywa Labs</a>, the local AI company behind <a href="https://runnativ.ai">Nativ</a>.
+</p>
+
+<p align="center">
+  <a href="https://github.com/Neywa-Labs/mlx-vlm/actions/workflows/python-publish.yml"><img src="https://github.com/Neywa-Labs/mlx-vlm/actions/workflows/python-publish.yml/badge.svg" alt="Upload Python Package"></a>
+  <a href="https://pypi.org/project/mlx-vlm/"><img src="https://img.shields.io/pypi/v/mlx-vlm" alt="PyPI version"></a>
+  <a href="https://pypi.org/project/mlx-vlm/"><img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python 3.10+"></a>
+  <a href="https://github.com/Neywa-Labs/mlx-vlm/blob/main/LICENSE"><img src="https://img.shields.io/github/license/Neywa-Labs/mlx-vlm" alt="MIT license"></a>
+</p>
 
 ## Table of Contents
 - [Installation](#installation)
@@ -36,42 +60,48 @@ Some models have detailed documentation with prompt formats, examples, and best 
 
 | Model | Documentation |
 |-------|---------------|
-| DeepSeek-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr/README.md) |
-| DeepSeek-OCR-2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr_2/README.md) |
-| Unlimited-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/unlimited_ocr/README.md) |
-| DOTS-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/dots_ocr/README.md) |
-| DOTS-MOCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/dots_ocr/README.md) |
-| ERNIE 4.5 VL | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/ernie4_5_moe_vl/README.md) |
-| GLM-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/glm_ocr/README.md) |
-| Phi-4 Reasoning Vision | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/phi4_siglip/README.md) |
-| MiniCPM-o | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minicpmo/README.md) |
-| PaddleOCR-VL | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/paddleocr_vl/README.md) |
-| OXR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/oxr/README.md) |
-| Phi-4 Multimodal | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/phi4mm/README.md) |
-| MolmoPoint | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/molmo_point/README.md) |
-| LocateAnything | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/locateanything/README.md) |
-| Moondream2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/moondream2/README.md) |
-| Moondream3 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/moondream3/README.md) |
-| EmbeddingGemma 2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/embedding_gemma2/README.md) |
-| Gemma 4 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/gemma4/README.md) |
+| LFM3 / LFM3-VL | [Docs](mlx_vlm/models/lfm3/README.md) |
+| LFM3-Audio | [Docs](mlx_vlm/models/lfm3_audio/README.md) |
+| LFM3-Omni | [Docs](mlx_vlm/models/lfm3_omni/README.md) |
+| DeepSeek-OCR | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr/README.md) |
+| DeepSeek-OCR-2 | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr_2/README.md) |
+| Unlimited-OCR | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/unlimited_ocr/README.md) |
+| DOTS-OCR | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/dots_ocr/README.md) |
+| DOTS-MOCR | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/dots_ocr/README.md) |
+| ERNIE 4.5 VL | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/ernie4_5_moe_vl/README.md) |
+| GLM-OCR | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/glm_ocr/README.md) |
+| Phi-4 Reasoning Vision | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/phi4_siglip/README.md) |
+| MiniCPM-o | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/minicpmo/README.md) |
+| PaddleOCR-VL | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/paddleocr_vl/README.md) |
+| OXR | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/oxr/README.md) |
+| Phi-4 Multimodal | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/phi4mm/README.md) |
+| MolmoPoint | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/molmo_point/README.md) |
+| LocateAnything | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/locateanything/README.md) |
+| Moondream2 | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/moondream2/README.md) |
+| Moondream3 | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/moondream3/README.md) |
+| EmbeddingGemma 2 | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/embedding_gemma2/README.md) |
+| Gemma 4 | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/gemma4/README.md) |
 | Muse Spark Open | [Docs](mlx_vlm/models/muse_spark/README.md) |
-| MiniMax M3 / M3.1 Flash | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minimax_m3_vl/README.md) |
-| Falcon-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/falcon_ocr/README.md) |
-| IndicOCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/indic_ocr/README.md) |
-| PP-DocLayoutV3 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/pp_doclayout_v3/README.md) |
-| Granite Vision 3.2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite_vision/README.md) |
-| Granite 4.0 Vision | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite4_vision/README.md) |
-| MiniCPM-V 4.7 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minicpmv4_7/README.md) |
-| MiniCPM-V 4.6 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minicpmv4_6/README.md) |
-| GLiNER2.5 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/gliner2_5/README.md) |
-| BERT | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/bert/README.md) |
-| LLaVA-OneVision | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/llava_onevision/README.md) |
-| K2-Horizon | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/k2_horizon/README.md) |
-| Z1T-0 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/z1t/README.md) |
-| Spark-X2.5 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/spark2_5/README.md) |
+| MiniMax M3 / M3.1 Flash | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/minimax_m3_vl/README.md) |
+| Falcon-OCR | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/falcon_ocr/README.md) |
+| IndicOCR | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/indic_ocr/README.md) |
+| PP-DocLayoutV3 | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/pp_doclayout_v3/README.md) |
+| Granite Vision 3.2 | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/granite_vision/README.md) |
+| Granite Vision (4.0, 4.1) | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/granite4_vision/README.md) |
+| MiniCPM-OCR 1.0 | [Docs](mlx_vlm/models/minicpm_ocr/README.md) |
+| MiniCPM-OCR Jev | [Docs](mlx_vlm/models/minicpm_ocr_jev/README.md) |
+| MiniCPM-V 4.7 | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/minicpmv4_7/README.md) |
+| MiniCPM-V 4.6 | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/minicpmv4_6/README.md) |
+| GLiNER2.5 | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/gliner2_5/README.md) |
+| BERT | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/bert/README.md) |
+| LLaVA-OneVision | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/llava_onevision/README.md) |
+| K2-Horizon | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/k2_horizon/README.md) |
+| Z1T-0 | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/z1t/README.md) |
+| Spark-X2.5 | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/spark2_5/README.md) |
 | Ternary Bonsai 2 | [Docs](mlx_vlm/models/prism_hadamard_qwen35/README.md) |
 | Flint | [Docs](mlx_vlm/models/flint/README.md) |
 | Nemotron 3.5 Super VL / Bolt / Nano Omni | [Docs](mlx_vlm/models/nemotron_h_nano_omni/README.md) |
+| Idol (image to 3D Gaussian splats) | [Docs](mlx_vlm/models/idol/README.md) |
 
 ## Installation
 
@@ -148,6 +178,9 @@ mlx_vlm.generate --model mlx-community/gemma-3n-E2B-it-4bit --max-tokens 100 --p
 
 # Speech generation
 mlx_vlm.generate --model openbmb/MiniCPM-o-4_5 --output-modality audio --prompt "Say hello." --ref-audio /path/to/voice.wav --output speech.wav --max-tokens 256
+
+# Image to 3D Gaussian splats
+mlx_vlm.generate --model speridlabs/idol --output-modality 3d --image object.png --output object.ply
 ```
 
 #### Thinking Budget
@@ -188,7 +221,7 @@ mlx_vlm.server --model Qwen/Qwen3.5-4B \
   --thinking-end-token "</think>"
 ```
 
-Requests can override the server defaults with `enable_thinking`, `thinking_budget`, `thinking_start_token`, or `thinking_end_token`.
+Requests can override the server defaults with `enable_thinking`, `thinking_budget`, `thinking_start_token`, or `thinking_end_token`. `chat_template_kwargs.enable_thinking` is also accepted; an explicit top-level `enable_thinking` takes precedence.
 
 ### Speculative Decoding
 
@@ -604,6 +637,7 @@ mlx_vlm.server --model-dir /Volumes/Models --model-dir ~/my-custom-model
 
 - `--model`: Preload a language model at server startup, accepts a Hugging Face repo ID or local path (optional, loads lazily on first request if omitted)
 - `--image-model`: Preload an image generation model at server startup
+- `--mesh-model`: Preload an image-to-3D model for asynchronous PLY generation
 - `--tts-model`: Preload a text-to-speech model at server startup
 - `--stt-model`: Preload a speech-to-text model at server startup
 - `--embedding-model`: Preload an embedding model at server startup
@@ -632,6 +666,11 @@ mlx_vlm.server --model-dir /Volumes/Models --model-dir ~/my-custom-model
 - `--log-progress-interval`: Decoded tokens between progress log messages; `0` disables periodic decode progress (default: `10`)
 - `--api-key`: Bearer token required for inference, model discovery, and management endpoints
 - `--log-level`: Logging level — `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (default: `INFO`)
+
+Streaming `/v1/chat/completions` and `/v1/responses` send invisible SSE comments
+every 15 seconds while idle, keeping connections alive during queueing and long
+prefills. Set `MLX_VLM_STREAM_KEEPALIVE_INTERVAL` to a different interval in seconds
+or `0` to disable it. This does not change model output or generation timeouts.
 
 For higher-resolution image input, including OCR with Bonsai 2, set pixel-area
 defaults at startup:
@@ -697,6 +736,20 @@ The server provides multiple endpoints for different use cases and supports dyna
 ### Continuous Batching
 
 The server supports continuous batching for higher throughput when handling multiple concurrent requests. New requests join the active batch immediately without waiting for existing requests to finish, and mixed batches of image and text-only requests are supported.
+
+Prompt processing and decoding are interleaved, with decoding taking priority. The
+server's `--prefill-step-size` (default: 2048) is a shared prompt-token budget per
+step, including padding, so increasing the batch size does not multiply the prompt
+work between decode steps. While peers decode, the scheduler also caps prompt
+work at 256 tokens per step. Lower the configured budget to reduce pauses further.
+Models that require unchunked prefill do not use this budget.
+
+Ready decode tokens are published before the next prefill step. Pending prompts
+are grouped by comparable length within the oldest candidate window to limit
+padding without starving long prompts. APC retains its cached-suffix grouping and
+memory admission checks. Python streaming integrations can
+use `BatchGenerator.decode_step()` and `prefill_step()` separately; `next()`
+continues to advance both phases for existing callers.
 
 Continuous batching is enabled automatically when the server loads a model. You can pre-load a model at startup so it's ready to serve immediately:
 
@@ -1099,7 +1152,7 @@ Common APC environment variables:
 | `APC_BLOCK_SIZE` | `16` | Tokens per APC block |
 | `APC_CHECKPOINT_ENTRIES` | `2` | In-memory checkpoint entries; also bounds snapshots captured per hybrid prompt (disk-only mode captures two) |
 | `APC_CHECKPOINT_GUARD_TOKENS` | `1` | Tokens retained after a reusable hybrid checkpoint boundary; the default preserves the normal final-token prefill boundary |
-| `APC_CHECKPOINT_INTERVAL_TOKENS` | `2048` | Spacing of intermediate hybrid checkpoints, rounded up to a multiple of `APC_BLOCK_SIZE`; `0` keeps only the final checkpoint |
+| `APC_CHECKPOINT_INTERVAL_TOKENS` | `2048` | Spacing of intermediate hybrid checkpoints, rounded up to a multiple of `APC_BLOCK_SIZE`; observed prompt divergence takes priority within the entry budget; `0` keeps only the final checkpoint |
 | `APC_MEMORY_MAX_GB` | auto | Resident block and checkpoint budget in GiB: 10% of Metal's recommended working set, capped at 8 GiB; `0` retains caches only on disk |
 | `APC_MEMORY_RESERVE_GB` | auto | Additional memory headroom in GiB: 10% of Metal's recommended working set, at least 1 GiB |
 | `APC_DISK_ENABLED` | `1` | Set to `0` to disable disk persistence |
@@ -1124,8 +1177,11 @@ state cannot be rolled back by slicing K/V tensors.
 
 Hybrid prefill now captures intermediate checkpoints as well as the final guard
 checkpoint, in streaming, continuous batching and DiffusionGemma generation.
-With the defaults, each prompt stores its latest 2,048-token boundary before the
-final checkpoint and the final checkpoint itself. For example, a 30,000-token
+For text API requests with `transient_context`, the server verifies and prioritizes
+the token boundary before that mutable suffix. Otherwise, observed divergence
+from resident prompts takes priority. With neither hint, each prompt stores its
+latest 2,048-token boundary before the final checkpoint and the final checkpoint
+itself. For example, a 30,000-token
 document followed by 20 instruction tokens can reuse 28,672 tokens when the
 instructions change. The same checkpoints persist across server restarts when
 the disk tier is enabled.
@@ -1348,10 +1404,13 @@ grammar masks every verified position. Other drafter kinds reject
 - `/responses/compact` and `/v1/responses/compact` - Compact conversation history into replayable state; see [compaction and APC](docs/usage.md#conversation-compaction-and-apc)
 - `/embeddings` and `/v1/embeddings` - OpenAI-compatible embeddings endpoint backed by native MLX embedding models
 - `/v1/decisions` - Predict named typed decisions using the shared decision API
+- `/v1/meshes` - Asynchronous image-to-3D jobs, with polling and downloads at `/v1/meshes/{id}` and `/v1/meshes/{id}/content`; see [3D serving](mlx_vlm/models/idol/README.md#server)
 - `/v1/rerank` - Rank text or multimodal documents by relevance to a query
 - `/audio/speech` and `/v1/audio/speech` - OpenAI-compatible text-to-speech endpoint backed by `mlx-audio` TTS models
 - `/audio/transcriptions` and `/v1/audio/transcriptions` - OpenAI-compatible speech-to-text endpoint backed by `mlx-audio` STT models
 - `/audio/translations` and `/v1/audio/translations` - OpenAI-compatible audio translation endpoint for STT models that expose a translation task
+- `/audio/diarizations` and `/v1/audio/diarizations` - Recording-wide speaker turns using MLX-Audio Nemotron diarization
+- `/audio/speaker_embeddings` and `/v1/audio/speaker_embeddings` - Normalized ECAPA speaker vectors from separate speech windows
 - `/v1/realtime` - WebSocket-based realtime full-duplex speech. See the [Nemotron VoiceChat guide](mlx_vlm/models/nemotron_voicechat/README.md#realtime-websocket-api) for supported models and usage.
 - `/health` - Check server status
 - `/metrics` and `/v1/metrics` - Inspect rolling request metrics, throughput, and runtime counters
@@ -1521,6 +1580,27 @@ curl -X POST "http://localhost:8080/v1/audio/transcriptions" \
   -F file=@/path/to/audio.mp3 \
   -F response_format=json
 ```
+
+Models with instruction-based audio tasks can also receive `task`, `prompt`, and
+`system_prompt` as multipart fields. For example, with Nemotron Transcribe support
+installed in `mlx-audio`:
+
+```sh
+curl -X POST "http://localhost:8080/v1/audio/transcriptions" \
+  -F model=/path/to/nemotron-transcribe \
+  -F file=@/path/to/meeting.wav \
+  -F task=qa \
+  -F 'prompt=What time is the meeting?'
+```
+
+Nemotron supports `asr`, `qa`, `saa` (speaker attribution), `rich`, and `translate`.
+For a spoken request, use `task=qa` with `system_prompt=Answer the spoken question.`
+and omit `prompt`. Translation requires a target `language`, such as `German`;
+`/v1/audio/translations` selects `task=translate` regardless of the supplied task.
+Task values and system instructions depend on the selected model. The server
+forwards `prompt` to the model's declared `prompt`, `context`, or `text` parameter,
+preserving an explicitly supplied `context` or `text` value. `stream=true` returns
+NDJSON text chunks; Nemotron encodes the complete audio before emitting text.
 
 ##### Multi-Modal (Image + Audio)
 
@@ -1708,7 +1788,29 @@ With more coming soon.
 mlx_vlm.generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 100 --prompt "Describe this video" --video path/to/video.mp4 --fps 1.0
 ```
 
-These examples demonstrate how to use multiple images with MLX-VLM for more complex visual reasoning tasks.
+#### Python
+
+Pass the video to `apply_chat_template` with `video=` (and optionally `fps=`) so the prompt gets a video placeholder, then pass the same path to `generate`. There is no `num_videos` argument.
+
+```python
+from mlx_vlm import load, generate
+from mlx_vlm.prompt_utils import apply_chat_template
+from mlx_vlm.utils import load_config
+
+model_path = "mlx-community/Qwen2-VL-2B-Instruct-4bit"
+model, processor = load(model_path)
+config = load_config(model_path)
+
+video = "path/to/video.mp4"
+formatted_prompt = apply_chat_template(
+    processor, config, "Describe this video.", video=video, fps=1.0
+)
+
+output = generate(
+    model, processor, formatted_prompt, video=video, fps=1.0, max_tokens=100
+)
+print(output)
+```
 
 ## Vision Feature Caching
 
@@ -1869,7 +1971,7 @@ mlx-vlm supports distributed inference across multiple computers. It works by sh
 
 The parallel implementation is compatible with [mlx-lm](https://github.com/ml-explore/mlx-lm) sharding primitives.
 
-See [docs/usage.md](https://github.com/Blaizzy/mlx-vlm/blob/main/docs/usage.md#distributed-inference) for command-line examples.
+See [docs/usage.md](https://github.com/Neywa-Labs/mlx-vlm/blob/main/docs/usage.md#distributed-inference) for command-line examples.
 
 # Fine-tuning
 

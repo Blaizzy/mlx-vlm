@@ -1,3 +1,4 @@
+from copy import copy
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Generator, List, Optional, Sequence, Tuple
 
@@ -5,6 +6,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from .. import apc
 from ..models import cache
 from ..models.linear import native_batch_linear
 from ..models.quantized_verifier import decode_quantized_argmax
@@ -15,8 +17,10 @@ from .cache_state import (
     iter_leaf_caches,
 )
 from .common import (
+    _apply_thinking_budget,
     _batch_cache_left_padding,
     _dflash_block_total,
+    _filter_rope_deltas,
     _record_speculative_round,
     _requires_uniform_batch_acceptance,
     _speculative_walk,
@@ -34,14 +38,28 @@ class _MTPVerifyResult:
     shared_kv_states: dict
     target_tokens: Optional[mx.array] = None
     rollback_state: Any = None
+    committed_shared_kv: Optional[dict] = None
 
     def abort(self):
         abort_speculative_round(self.rollback_state)
 
     def commit(self, model, caches, accepted, block_size):
+        shared_kv = getattr(model, "shared_kv_from_cache", None)
+        if callable(shared_kv):
+            # This model rebuilds its assistant view from committed caches.
+            # Do not pin the rejected verification window during rollback.
+            self.shared_kv_states = {}
         commit_speculative_round(
             model, caches, self.rollback_state, accepted, block_size
         )
+        if callable(shared_kv):
+            self.committed_shared_kv = shared_kv(caches)
+
+
+def _release_shared_kv(draft):
+    release = getattr(draft, "release_shared_kv", None)
+    if callable(release):
+        release()
 
 
 class _MTPGrammar:
@@ -702,6 +720,338 @@ def _buffer_mtp_target_cache(
         prompt_cache[idx] = buffer_entry(entry)
 
 
+@dataclass
+class _MTPRow:
+    draft: nn.Module
+    rng: _SpeculativeSamplerRNG
+    hidden: mx.array
+    bonus: int
+    position: int
+
+    @property
+    def state(self):
+        draft_state = getattr(self.draft, "draft_eval_state", lambda: [])()
+        return (
+            self.hidden,
+            draft_state,
+            getattr(self.draft, "_shared_kv", None),
+            self.rng._target_rng_state,
+            self.rng._draft_rng_state,
+        )
+
+
+class MTPBatch:
+    """Request-owned MTP drafters sharing one target verification batch.
+
+    Model weights are shared; resettable drafter fields and caches belong to
+    individual rows. Every step commits both target and draft state before
+    returning, so rows can leave or rejoin at a verification boundary.
+    """
+
+    def __init__(
+        self,
+        model,
+        draft,
+        cache,
+        hidden,
+        bonus,
+        block_size,
+        sampler,
+        dtype,
+        greedy,
+        *,
+        shared_kv_states=None,
+        prompt_tokens=None,
+        rope_deltas=None,
+    ):
+        self.model = getattr(model, "language_model", model)
+        self.draft = draft
+        self.cache = cache
+        self.sampler, self.dtype, self.greedy = sampler, dtype, greedy
+        self.block_size = _dflash_block_total(draft, block_size)
+        self.requested_block_size = block_size
+        self.configured_block_size = int(
+            getattr(draft.config, "block_size", self.block_size)
+        )
+        self.positioned = _sampler_supports_positioned_target(sampler)
+        self.rope_deltas = rope_deltas
+        _, positions = _mtp_cache_positions(cache, len(bonus))
+        padding = _batch_cache_left_padding(cache)
+        shared_kv = getattr(self.model, "shared_kv_from_cache", None)
+        if callable(shared_kv):
+            shared_kv_states = shared_kv(cache)
+            padding = None
+        self.rows = []
+        for i, (token, position) in enumerate(zip(bonus.tolist(), positions)):
+            # nn.Module's shallow copy shares weight modules, while reset
+            # replaces the request's mutable caches, seeds and counters.
+            row_draft = copy(draft)
+            row_draft.reset(model)
+            rng = _SpeculativeSamplerRNG(
+                row_draft, enabled=not greedy and not self.positioned
+            )
+            length = min(position, hidden.shape[1])
+            row_hidden = hidden[i : i + 1, -length:]
+            prefill = getattr(row_draft, "prefill_from_target_hidden", None)
+            # Chunked/APC prefill can supply only the suffix. Draft-prefilling
+            # it as a whole prompt would reset positions to zero. Start from
+            # the final target hidden state at its actual cache position instead.
+            if (
+                callable(prefill)
+                and prompt_tokens is not None
+                and length == position
+                and prompt_tokens.shape[1] >= position
+            ):
+                rng.draft_call(
+                    prefill,
+                    prompt_tokens[i : i + 1, -length:],
+                    row_hidden,
+                    token,
+                    sampler,
+                    dtype,
+                    **_mtp_draft_kwargs(row_draft, greedy, sampler),
+                )
+            row = _MTPRow(
+                row_draft,
+                rng,
+                _mtp_draft_hidden(self.model, row_hidden[:, -1:]),
+                token,
+                position,
+            )
+            self._bind_shared(row, shared_kv_states or {}, i, padding)
+            self.rows.append(row)
+
+    @property
+    def state(self):
+        return self.cache, self.rope_deltas, [row.state for row in self.rows]
+
+    @staticmethod
+    def _bind_shared(row, shared, index, padding, rejected=0):
+        shared = _slice_shared_kv_after_reject(
+            {
+                key: (k[index : index + 1], v[index : index + 1])
+                for key, (k, v) in shared.items()
+            },
+            rejected,
+        )
+        row.draft.set_shared_kv(
+            shared,
+            kv_offset=row.position,
+            position=_mtp_draft_position(row.position),
+            kv_valid_len=row.position,
+            left_padding=None if padding is None else padding[index : index + 1],
+        )
+
+    def snapshot(self, index):
+        caches = apc.snapshot_prompt_cache_row(self.cache, index)
+        if caches is None:
+            raise ValueError("This model does not support continuation cache snapshots")
+        caches, _ = apc.make_warm_batch_exact_cache_multi(
+            [caches], [self.rows[index].position]
+        )
+        if caches is None:
+            raise ValueError("This model does not support continuation cache merging")
+        result = copy(self)
+        result.cache = caches
+        # Transfer the row's private drafter, including its pending seed and
+        # sampler state; the caller immediately removes it from this batch.
+        result.rows = [self.rows[index]]
+        row = result.rows[0]
+        row.hidden = mx.contiguous(row.hidden)
+        shared = getattr(row.draft, "_shared_kv", None)
+        if shared:
+            row.draft._shared_kv = {
+                key: (mx.contiguous(keys), mx.contiguous(values))
+                for key, (keys, values) in shared.items()
+            }
+        result.rope_deltas = (
+            None
+            if self.rope_deltas is None
+            else mx.contiguous(self.rope_deltas[index : index + 1])
+        )
+        mx.eval([c.state for c in result.cache], [r.state for r in result.rows])
+        return result
+
+    def extend(self, other):
+        mx.eval([c.state for c in self.cache], [c.state for c in other.cache])
+        for current, incoming in zip(self.cache, other.cache):
+            current.extend(incoming)
+        if self.rope_deltas is not None or other.rope_deltas is not None:
+            left = self.rope_deltas
+            right = other.rope_deltas
+            if left is None:
+                left = mx.zeros((len(self.rows), *right.shape[1:]), right.dtype)
+            if right is None:
+                right = mx.zeros((len(other.rows), *left.shape[1:]), left.dtype)
+            self.rope_deltas = mx.concatenate([left, right])
+        self.rows.extend(other.rows)
+
+    def filter(self, keep):
+        if len(keep) == len(self.rows):
+            return
+        if keep:
+            mx.eval([c.state for c in self.cache])
+            indices = mx.array(keep, mx.int32)
+            for entry in self.cache:
+                entry.filter(indices)
+            if self.rope_deltas is not None:
+                self.rope_deltas = self.rope_deltas[indices]
+        else:
+            self.cache.clear()
+            self.rope_deltas = None
+        self.rows = [self.rows[i] for i in keep]
+
+    def step(self, budgets, positions, thinking_budget_criteria=None):
+        if not budgets or min(budgets) <= 0:
+            raise ValueError("Only live requests with remaining tokens can decode")
+        ceiling = self.block_size
+        if (
+            len(self.rows) > 1
+            and not self.greedy
+            and self.requested_block_size is None
+            and getattr(self.draft.config, "runtime_block_size", None) is None
+        ):
+            ceiling = min(
+                ceiling,
+                getattr(self.draft, "default_batched_sampling_block_size", ceiling),
+            )
+        block_size = min(
+            _mtp_next_block_size(
+                row.draft, ceiling, self.configured_block_size, min(budgets) + 1
+            )
+            for row in self.rows
+        )
+        if self.rope_deltas is not None:
+            self.model._rope_deltas = self.rope_deltas
+            self.model._position_ids = None
+        padding = _batch_cache_left_padding(self.cache)
+        verify = None
+        try:
+            proposals = mx.concatenate(
+                [
+                    row.rng.draft_tokens(
+                        row.draft.draft_block,
+                        row.bonus,
+                        row.hidden,
+                        None,
+                        block_size,
+                        self.sampler,
+                        self.dtype,
+                        **_mtp_draft_kwargs(row.draft, self.greedy, self.sampler),
+                    )
+                    for row in self.rows
+                ]
+            )
+            for row in self.rows:
+                _release_shared_kv(row.draft)
+            inputs = mx.concatenate(
+                [
+                    mx.array([row.bonus for row in self.rows], self.dtype)[:, None],
+                    proposals,
+                ],
+                axis=1,
+            )
+            verify = _mtp_verify_target(
+                self.model,
+                inputs,
+                self.cache,
+                self.sampler,
+                sample_target_tokens=self.greedy,
+            )
+            self.rows[0].rng.target_eval(verify.hidden, verify.target_tokens)
+            uniform = _mtp_use_uniform_deferred_walk(
+                self.draft,
+                n_active=len(self.rows),
+                greedy_sampling=self.greedy,
+                sampler=self.sampler,
+                target_model=self.model,
+            )
+            if verify.target_tokens is not None:
+                accepted, tokens = _speculative_walk_batch(
+                    proposals, verify.target_tokens, budgets
+                )
+                if uniform and len(set(accepted)) > 1:
+                    accepted, tokens = _speculative_walk_batch_uniform_acceptance(
+                        proposals, verify.target_tokens, accepted, budgets
+                    )
+            else:
+                walk = (
+                    _speculative_walk_batch_deferred_uniform
+                    if uniform
+                    else _speculative_walk_batch_deferred_greedy
+                )
+                accepted, tokens = walk(
+                    self.model,
+                    verify.hidden,
+                    proposals,
+                    self.sampler,
+                    budgets,
+                    row_ids=[0] * len(self.rows),
+                    base_positions=positions,
+                )
+            accepted = [
+                min(count, len(values) - 1) for count, values in zip(accepted, tokens)
+            ]
+            if uniform:
+                # A nearly finished row can emit less than the common accepted
+                # prefix. Keep every cache at that shorter commit boundary.
+                retained = min(accepted)
+                accepted = [retained] * len(accepted)
+                tokens = [values[: retained + 1] for values in tokens]
+            accepted, tokens = _apply_thinking_budget(
+                accepted,
+                tokens,
+                thinking_budget_criteria,
+                list(range(len(self.rows))),
+                uniform=uniform,
+            )
+            for i, (row, count, values) in enumerate(zip(self.rows, accepted, tokens)):
+                row.rng.target_sampled(sync_draft=not self.positioned)
+                commit = getattr(row.draft, "accept_verified_tokens", None)
+                if callable(commit):
+                    row.rng.draft_call(
+                        commit,
+                        verify.hidden[i : i + 1],
+                        proposals[i : i + 1],
+                        count,
+                        values,
+                        self.sampler,
+                        self.dtype,
+                        **_mtp_draft_kwargs(row.draft, self.greedy, self.sampler),
+                    )
+            verify.commit(self.model, self.cache, accepted, block_size)
+        except BaseException:
+            if verify is not None:
+                verify.abort()
+            for row in self.rows:
+                abort = getattr(row.draft, "abort_draft_round", None)
+                if callable(abort):
+                    abort()
+            raise
+        for i, (row, count, values) in enumerate(zip(self.rows, accepted, tokens)):
+            row.hidden = _mtp_draft_hidden(
+                self.model, verify.hidden[i : i + 1, count : count + 1]
+            )
+            row.bonus = values[-1]
+            row.position += count + 1
+            self._bind_shared(
+                row,
+                (
+                    verify.shared_kv_states
+                    if verify.committed_shared_kv is None
+                    else verify.committed_shared_kv
+                ),
+                i,
+                padding if verify.committed_shared_kv is None else None,
+                block_size - count - 1 if verify.committed_shared_kv is None else 0,
+            )
+            _record_speculative_round(row.draft, count, block_size - 1)
+        _record_speculative_round(
+            self.draft, sum(accepted) / len(accepted), block_size - 1
+        )
+        return tokens
+
+
 def _mtp_rounds(
     model: nn.Module,
     draft_model: nn.Module,
@@ -717,6 +1067,7 @@ def _mtp_rounds(
     token_dtype: mx.Dtype = mx.int32,
     greedy_sampling: bool = False,
     constraint: Optional[Any] = None,
+    thinking_budget_criteria: Optional[Any] = None,
 ) -> Generator[Tuple[int, None], None, None]:
     """Verify autoregressive MTP drafts and commit accepted state before emission.
 
@@ -760,13 +1111,19 @@ def _mtp_rounds(
     hidden = _mtp_draft_hidden(lm, hidden)
 
     kv_offset = _mtp_cache_offset_max(prompt_cache)
+    shared_kv = getattr(lm, "shared_kv_from_cache", None)
+    if callable(shared_kv):
+        shared_kv_states = shared_kv(prompt_cache)
     draft_model.set_shared_kv(
         shared_kv_states,
         kv_offset,
         position=_mtp_draft_position(kv_offset),
         kv_valid_len=kv_offset,
     )
+    shared_kv_states = None
 
+    if thinking_budget_criteria is not None:
+        thinking_budget_criteria(first_bonus)
     b = first_bonus
     emitted = 1  # caller already yielded the first bonus
 
@@ -792,6 +1149,7 @@ def _mtp_rounds(
                 token_dtype,
                 **_mtp_draft_kwargs(draft_model, greedy_sampling, sampler),
             )
+            _release_shared_kv(draft_model)
 
             with mx.stream(generation_stream):
                 verify_input = mx.concatenate(
@@ -829,6 +1187,9 @@ def _mtp_rounds(
             sampler_rng.target_sampled(
                 sync_draft=not _sampler_supports_positioned_target(sampler)
             )
+            [accepted], [new_tokens] = _apply_thinking_budget(
+                [accepted], [new_tokens], [thinking_budget_criteria], [0]
+            )
             _record_speculative_round(draft_model, accepted, bs - 1)
 
             accept_verified = getattr(draft_model, "accept_verified_tokens", None)
@@ -865,9 +1226,11 @@ def _mtp_rounds(
         hidden = _mtp_draft_hidden(lm, verify.hidden[:, accepted : accepted + 1, :])
         b = new_tokens[-1] if new_tokens else b
 
-        next_shared_kv = _slice_shared_kv_after_reject(
-            verify.shared_kv_states, bs - (accepted + 1)
-        )
+        next_shared_kv = verify.committed_shared_kv
+        if next_shared_kv is None:
+            next_shared_kv = _slice_shared_kv_after_reject(
+                verify.shared_kv_states, bs - (accepted + 1)
+            )
         kv_offset += accepted + 1
         draft_model.set_shared_kv(
             next_shared_kv,
@@ -875,6 +1238,7 @@ def _mtp_rounds(
             position=_mtp_draft_position(kv_offset),
             kv_valid_len=kv_offset,
         )
+        next_shared_kv = None
 
         if emitted % 256 == 0:
             mx.clear_cache()
@@ -1025,6 +1389,7 @@ def _mtp_rounds_batch(
     greedy_sampling: bool = False,
     row_ids: Optional[List[int]] = None,
     constraints: Optional[Sequence[Any]] = None,
+    thinking_budget_criteria: Optional[List[Any]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     """Batched Gemma 4 MTP round loop (B >= 1).
 
@@ -1098,15 +1463,24 @@ def _mtp_rounds_batch(
     # Per-row state. ``positions`` stores each row's valid target-KV length.
     # All rows start at ``L_prefill`` and advance by ``accepted_i + 1`` per
     # round.
+    shared_kv = getattr(lm, "shared_kv_from_cache", None)
+    shared_padding = _batch_cache_left_padding(prompt_cache)
+    if callable(shared_kv):
+        shared_kv_states = shared_kv(prompt_cache)
+        shared_padding = None
     draft_model.set_shared_kv(
         shared_kv_states,
         kv_offset=L_prefill,
         position=_mtp_draft_position(mx.array(positions)),
         kv_valid_len=mx.array(positions),
-        left_padding=_batch_cache_left_padding(prompt_cache),
+        left_padding=shared_padding,
     )
+    shared_kv_states = None
 
     b = first_bonus.tolist()
+    for state, token in zip(thinking_budget_criteria or [], b):
+        if state is not None:
+            state(token)
     emitted = [1] * B
     finished = [False] * B
     active_idx = list(range(B))
@@ -1145,6 +1519,7 @@ def _mtp_rounds_batch(
                 positions_active,
                 greedy_sampling=greedy_sampling,
             )
+            _release_shared_kv(draft_model)
 
             # Verify
             with mx.stream(generation_stream):
@@ -1220,6 +1595,13 @@ def _mtp_rounds_batch(
                 sampler_rng.target_sampled(
                     sync_draft=not _sampler_supports_positioned_target(sampler)
                 )
+            accepted_list, new_tokens_list = _apply_thinking_budget(
+                accepted_list,
+                new_tokens_list,
+                thinking_budget_criteria,
+                active_idx,
+                uniform=_requires_uniform_batch_acceptance(draft_model, lm),
+            )
             # Keep the adaptive block-size history on a per-round basis so
             # batched MTP reacts like the singleton loop instead of letting
             # batch size change the controller signal.
@@ -1292,43 +1674,49 @@ def _mtp_rounds_batch(
                 b[orig] = new_tokens_list[j][-1]
             positions[orig] = positions[orig] + accepted_list[j] + 1
 
-        # Slice + tail-zero ``verify.shared_kv_states`` to match the
-        # post-rollback target cache. ``set_shared_kv()`` will normalize the
-        # resulting hybrid layout back into a prefix-valid drafter view.
-        rejected_global = bs - (max_a + 1)
-        next_shared_kv = {}
-        for k, kv in verify.shared_kv_states.items():
-            K, V = kv
-            valid = K.shape[-2] - rejected_global
-            if valid >= K.shape[-2]:
-                K_next, V_next = K, V
-            elif valid <= 0:
-                K_next = K[..., :1, :]
-                V_next = V[..., :1, :]
-            else:
-                K_next = K[..., :valid, :]
-                V_next = V[..., :valid, :]
-            # Per-row tail-zero on rows that accepted less than max_a.
-            if any(a < max_a for a in accepted_list):
-                # K_next/V_next shape: [B_active, H, valid, D]
-                # For row i, zero positions [valid - max_a + accepted_i, valid).
-                # (verify_start = valid - (max_a + 1), and tail begins at
-                # verify_start + accepted_i + 1 = valid - max_a + accepted_i.)
-                K_arr = mx.array(K_next)  # ensure materialized for slicing
-                V_arr = mx.array(V_next)
-                K_arr = mx.array(K_arr)
-                V_arr = mx.array(V_arr)
-                mask_rows = mx.arange(K_next.shape[-2])  # [valid]
-                # Build per-row mask: True where position should be kept.
-                # Shape [B_active, valid]. Row i keeps positions [0, valid - max_a + accepted_i).
-                keep_lens = mx.array(
-                    [valid - max_a + a for a in accepted_list], dtype=mx.int32
-                )  # [B_active]
-                keep_mask = mask_rows[None, :] < keep_lens[:, None]  # [B_active, valid]
-                keep_f = keep_mask.astype(K_next.dtype)[:, None, :, None]  # broadcast
-                K_next = K_next * keep_f
-                V_next = V_next * keep_f
-            next_shared_kv[k] = (K_next, V_next)
+        next_shared_kv = verify.committed_shared_kv
+        if next_shared_kv is None:
+            # Slice + tail-zero ``verify.shared_kv_states`` to match the
+            # post-rollback target cache. ``set_shared_kv()`` will normalize the
+            # resulting hybrid layout back into a prefix-valid drafter view.
+            rejected_global = bs - (max_a + 1)
+            next_shared_kv = {}
+            for k, kv in verify.shared_kv_states.items():
+                K, V = kv
+                valid = K.shape[-2] - rejected_global
+                if valid >= K.shape[-2]:
+                    K_next, V_next = K, V
+                elif valid <= 0:
+                    K_next = K[..., :1, :]
+                    V_next = V[..., :1, :]
+                else:
+                    K_next = K[..., :valid, :]
+                    V_next = V[..., :valid, :]
+                # Per-row tail-zero on rows that accepted less than max_a.
+                if any(a < max_a for a in accepted_list):
+                    # K_next/V_next shape: [B_active, H, valid, D]
+                    # For row i, zero positions [valid - max_a + accepted_i, valid).
+                    # (verify_start = valid - (max_a + 1), and tail begins at
+                    # verify_start + accepted_i + 1 = valid - max_a + accepted_i.)
+                    K_arr = mx.array(K_next)  # ensure materialized for slicing
+                    V_arr = mx.array(V_next)
+                    K_arr = mx.array(K_arr)
+                    V_arr = mx.array(V_arr)
+                    mask_rows = mx.arange(K_next.shape[-2])  # [valid]
+                    # Build per-row mask: True where position should be kept.
+                    # Shape [B_active, valid]. Row i keeps positions [0, valid - max_a + accepted_i).
+                    keep_lens = mx.array(
+                        [valid - max_a + a for a in accepted_list], dtype=mx.int32
+                    )  # [B_active]
+                    keep_mask = (
+                        mask_rows[None, :] < keep_lens[:, None]
+                    )  # [B_active, valid]
+                    keep_f = keep_mask.astype(K_next.dtype)[
+                        :, None, :, None
+                    ]  # broadcast
+                    K_next = K_next * keep_f
+                    V_next = V_next * keep_f
+                next_shared_kv[k] = (K_next, V_next)
 
         # Continuous batching: filter finished sequences. Only safe when
         # the caches expose a .filter() method (e.g. BatchKVCache); the
@@ -1347,6 +1735,7 @@ def _mtp_rounds_batch(
                 filter_drafter = getattr(draft_model, "filter_batch", None)
                 if callable(filter_drafter):
                     filter_drafter(keep_mx)
+                _filter_rope_deltas(lm, keep_mx, n_active)
                 hidden = hidden[keep_mx]
                 for k in next_shared_kv:
                     K_next, V_next = next_shared_kv[k]
@@ -1361,8 +1750,13 @@ def _mtp_rounds_batch(
             kv_offset=new_kv_offset,
             position=_mtp_draft_position(mx.array(positions_active)),
             kv_valid_len=mx.array(positions_active),
-            left_padding=_batch_cache_left_padding(prompt_cache),
+            left_padding=(
+                _batch_cache_left_padding(prompt_cache)
+                if verify.committed_shared_kv is None
+                else None
+            ),
         )
+        next_shared_kv = None
 
         if sum(emitted) % 256 == 0:
             mx.clear_cache()

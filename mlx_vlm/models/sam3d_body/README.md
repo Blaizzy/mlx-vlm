@@ -240,4 +240,4 @@ This package follows mlx-vlm model conventions:
 
 ## License
 
-The original SAM 3D Body model weights are released by Meta. The MLX port code follows the same license as [mlx-vlm](https://github.com/Blaizzy/mlx-vlm). See the upstream repository for model weight license details.
+The original SAM 3D Body model weights are released by Meta. The MLX port code follows the same license as [mlx-vlm](https://github.com/Neywa-Labs/mlx-vlm). See the upstream repository for model weight license details.

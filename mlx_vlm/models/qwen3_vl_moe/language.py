@@ -9,6 +9,7 @@ from ..base import (
     LanguageModelOutput,
     cache_position_offset,
     create_attention_mask,
+    project_logits,
     scaled_dot_product_attention,
 )
 from ..cache import KVCache
@@ -501,11 +502,13 @@ class LanguageModel(nn.Module):
         else:
             if attention_mask is not None:
                 position_ids = mx.cumsum(attention_mask.astype(mx.int64), axis=-1) - 1
+                max_position_ids = position_ids.max(axis=-1, keepdims=True)
                 position_ids = mx.where(
                     attention_mask == 0, mx.ones_like(position_ids), position_ids
                 )
-                max_position_ids = position_ids.max(axis=-1, keepdims=True)
-                mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
+                mrope_position_deltas = (
+                    max_position_ids + 1 - attention_mask.sum(axis=-1, keepdims=True)
+                )
             else:
                 position_ids = mx.arange(input_ids.shape[1]).reshape(1, -1)
                 position_ids = mx.broadcast_to(
@@ -678,10 +681,12 @@ class LanguageModel(nn.Module):
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
         )
-        if self.args.tie_word_embeddings:
-            out = self.model.embed_tokens.as_linear(out)
-        else:
-            out = self.lm_head(out)
+        projection = (
+            self.model.embed_tokens.as_linear
+            if self.args.tie_word_embeddings
+            else self.lm_head
+        )
+        out = project_logits(out, projection, kwargs.get("logits_to_keep"))
         return LanguageModelOutput(logits=out)
 
     def sanitize(self, weights):

@@ -41,6 +41,7 @@ ACTIVATION_QUANTIZATION_MODES = {"nvfp4", "mxfp8"}
 
 # Constants
 MODEL_REMAPPING = {
+    "llava_onevision2": "mage_vl",
     "muse_spark_open": "muse_spark",
     "nemotron_h_puzzle": "nemotron_h",
     "moondream1": "moondream2",
@@ -80,6 +81,9 @@ MAX_FILE_SIZE_GB = 5
 MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
 
 SAFETENSORS_DTYPE_FALLBACKS = {"F8_E8M0": "U8"}
+
+# LiquidAI d1 decision checkpoints (D1Model) by their backbone's model_type
+D1_MODEL_TYPES = {"lfm3_vl": "d1_lfm3_vl", "lfm3_omni": "d1_lfm3_omni"}
 
 GENERATION_CONFIG_DEFAULT_KEYS = (
     "eos_token_id",
@@ -205,6 +209,13 @@ def get_model_type(config: dict) -> Optional[str]:
 
     model_type = MODEL_REMAPPING.get(model_type, model_type)
 
+    auto_model = str((config.get("auto_map") or {}).get("AutoModel", ""))
+    if model_type in {"lfm3_vl", "lfm3_omni"} and (
+        "D1Model" in (config.get("architectures") or ())
+        or auto_model.endswith("D1Model")
+    ):
+        model_type = D1_MODEL_TYPES[model_type]
+
     architectures = set(config.get("architectures") or ())
     dflash_config = config.get("dflash_config")
     if "Lfm2BidirectionalForMaskedLM" in architectures:
@@ -213,6 +224,13 @@ def get_model_type(config: dict) -> Optional[str]:
         model_type = "nemotron_parse_v3_5"
     elif "BoundaryExtractor" in architectures:
         model_type = "gliner2_5"
+    elif model_type == "qwen3_5" and (
+        "Qwen3_5ForSequenceClassification" in architectures
+        or config.get("problem_type") == "single_label_classification"
+    ):
+        # Jev's source checkpoint declares a causal architecture despite having
+        # a two-class score head. Preserve the classification task when loading.
+        model_type = "minicpm_ocr_jev"
     elif "DFlash2DraftModel" in architectures:
         model_type = "dflash2"
     elif "Gemma4DSparkModel" in architectures:
@@ -328,6 +346,7 @@ def get_model_path(
     revision: Optional[str] = None,
     force_download: bool = False,
     allow_patterns: Optional[List[str]] = None,
+    local_files_only: bool = False,
 ) -> Path:
     """
     Ensures the model is available locally. If the path does not exist locally,
@@ -358,6 +377,7 @@ def get_model_path(
                     "*.jinja",
                 ],
                 force_download=force_download,
+                local_files_only=local_files_only,
             )
         )
     return model_path
@@ -857,6 +877,9 @@ def load(
     if image_processor is not None:
         processor.image_processor = image_processor
 
+    if hasattr(model, "attach_processor"):
+        model.attach_processor(processor)
+
     return model, processor
 
 
@@ -1250,10 +1273,15 @@ def save_config(
         json.dump(config, fid, indent=4)
 
 
-def load_image(image_source: Union[str, Path, BytesIO, Image.Image], timeout: int = 10):
+def load_image(
+    image_source: Union[str, Path, BytesIO, Image.Image],
+    timeout: int = 10,
+    *,
+    mode: str = "RGB",
+):
     """
     Helper function to load an image from either a URL, file path, data URI,
-    or BytesIO object.
+    or BytesIO object. Use mode="RGBA" to preserve transparency.
     """
     import base64
 
@@ -1289,7 +1317,7 @@ def load_image(image_source: Union[str, Path, BytesIO, Image.Image], timeout: in
         raise ValueError(f"Failed to load image from {original_source}: {e}") from e
 
     image = ImageOps.exif_transpose(image)
-    return image.convert("RGB")
+    return image.convert(mode)
 
 
 def resize_image(img, max_size):
@@ -1876,7 +1904,9 @@ def prepare_inputs(
     has_videos = videos is not None and (
         not hasattr(videos, "__len__") or len(videos) > 0
     )
-    if not has_images and not has_audio and not has_videos:
+    # prior speech given as codes still needs the processor to expand its placeholders
+    has_audio_out = kwargs.get("audio_out_codes") is not None
+    if not has_images and not has_audio and not has_videos and not has_audio_out:
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
@@ -1919,9 +1949,8 @@ def prepare_inputs(
         )
         images = [process_image(img, resize_shape, image_processor) for img in images]
 
-        # For batching, we need uniform image sizes. Instead of padding to the
-        # largest image (which adds white borders that hurt accuracy), we resize
-        # all images to the model's expected input size.
+        # Use a fixed input size only when the processor declares dimensions.
+        # Otherwise pad to the largest image and let the processor size it.
         if len(images) > 1 and pad_to_uniform_size:
             # Get target size from image processor if available
             target_size = None
@@ -1930,7 +1959,9 @@ def prepare_inputs(
                 if isinstance(size, tuple):
                     target_size = size
                 elif isinstance(size, dict):
-                    target_size = (size.get("height", 384), size.get("width", 384))
+                    # Edge and pixel-area bounds are not fixed dimensions.
+                    if "height" in size and "width" in size:
+                        target_size = (size["height"], size["width"])
                 elif isinstance(size, int):
                     target_size = (size, size)
 

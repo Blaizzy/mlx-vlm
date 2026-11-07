@@ -4,15 +4,19 @@ import binascii
 import gc
 import json
 import logging
+import math
+import os
 import random
 import time
 import uuid
-from contextlib import aclosing
+from contextlib import aclosing, suppress
 from datetime import datetime
+from functools import partial
 from io import BytesIO
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
+import anyio
 import mlx.core as mx
 from fastapi import HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -29,11 +33,10 @@ from ..tools import (
     _infer_tool_parser_from_processor,
     _prepare_chat_tool_choice,
     load_tool_module,
-    process_tool_calls,
 )
 from ..tools.streaming import ToolCallDeltaState
 from ..utils import prepare_inputs
-from . import compaction
+from . import compaction, continuation
 from .generation import (
     GenerationMetrics,
     PromptTooLongError,
@@ -58,6 +61,7 @@ from .responses_state import (
     _store_response,
     finish_content_streams,
     make_response_stream_state,
+    parse_assistant_tool_calls,
     prompt_has_open_thinking,
     response_store,
     response_store_lock,
@@ -109,6 +113,37 @@ _AUDIO_REFERENCE_SUFFIXES = (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".
 _MISSING_INPUT_DETAIL = (
     "Request must include at least one non-empty message content or media input."
 )
+
+
+async def _with_keepalives(source):
+    """Send idle SSE comments while keeping the same pending producer read."""
+    interval = float(os.environ.get("MLX_VLM_STREAM_KEEPALIVE_INTERVAL", "15"))
+    if not math.isfinite(interval) or interval < 0:
+        raise ValueError("MLX_VLM_STREAM_KEEPALIVE_INTERVAL must be finite and >= 0")
+    pending = None
+    try:
+        while True:
+            if pending is None:
+                pending = asyncio.create_task(anext(source))
+            ready, _ = await asyncio.wait({pending}, timeout=interval or None)
+            if not ready:
+                yield ": keepalive\n\n"
+                continue
+            task, pending = pending, None
+            try:
+                yield task.result()
+            except StopAsyncIteration:
+                break
+    finally:
+        # Let the existing stream cleanup run even in Starlette's cancel scope.
+        with anyio.CancelScope(shield=True):
+            try:
+                if pending is not None:
+                    pending.cancel()
+                    with suppress(asyncio.CancelledError, StopAsyncIteration):
+                        await pending
+            finally:
+                await source.aclose()
 
 
 def _has_non_empty_text(value: Any) -> bool:
@@ -720,7 +755,9 @@ async def responses_input_tokens_endpoint(request: Request):
             prompt_items, model=openai_request.model, tenant=_read_tenant_id(request)
         )
         prompt_items, _ = compaction.split_trigger(prompt_items)
-        chat_messages, images = _response_items_to_chat(prompt_items)
+        chat_messages, images = _response_items_to_chat(
+            compaction.with_transient_context(prompt_items, openai_request)
+        )
         _normalize_instruction_messages(
             chat_messages,
             openai_request.instructions,
@@ -1092,7 +1129,9 @@ async def responses_endpoint(request: Request):
                     *compaction_args, **compaction_options
                 )
             )
-        chat_messages, images = _response_items_to_chat(prompt_items)
+        chat_messages, images = _response_items_to_chat(
+            compaction.with_transient_context(prompt_items, openai_request)
+        )
         instructions = _normalize_instruction_messages(
             chat_messages,
             openai_request.instructions,
@@ -1126,10 +1165,13 @@ async def responses_endpoint(request: Request):
             template_kwargs["tool_choice"] = openai_request.tool_choice
 
         def render_prompt(items):
-            messages, images = _response_items_to_chat(items)
+            messages, images = _response_items_to_chat(
+                compaction.with_transient_context(items, openai_request)
+            )
             _normalize_instruction_messages(messages, openai_request.instructions)
             _ensure_effective_input(messages, images=images)
-            prompt = apply_chat_template(
+            prompt = continuation.render_prompt(
+                apply_chat_template,
                 processor,
                 config,
                 messages,
@@ -1137,6 +1179,24 @@ async def responses_endpoint(request: Request):
                 tools=chat_tools or None,
                 **template_kwargs,
             )
+            gen_args.cache_prefix = None
+            if openai_request.transient_context and not images:
+                stable_messages, _ = _response_items_to_chat(
+                    compaction.with_transient_context(
+                        items, openai_request, include_suffix=False
+                    )
+                )
+                _normalize_instruction_messages(
+                    stable_messages, openai_request.instructions
+                )
+                gen_args.cache_prefix = apply_chat_template(
+                    processor,
+                    config,
+                    stable_messages,
+                    add_generation_prompt=False,
+                    tools=chat_tools or None,
+                    **template_kwargs,
+                )
             thinking = prompt_has_open_thinking(
                 prompt,
                 gen_args.enable_thinking,
@@ -1386,6 +1446,7 @@ async def responses_endpoint(request: Request):
                         starts_in_thinking,
                         gen_args.thinking_start_token,
                         gen_args.thinking_end_token,
+                        prompt=formatted_prompt,
                     )
                     reasoning_item_id = f"rs_{uuid.uuid4().hex}"
                     streamed_reasoning = ""
@@ -1394,6 +1455,7 @@ async def responses_endpoint(request: Request):
                         # generate() blocks on _cpu_preprocess + queue.get;
                         # offload so concurrent handlers preprocess in parallel.
                         ctx, token_iter = await asyncio.to_thread(
+                            continuation.start_generation,
                             runtime.response_generator.generate,
                             formatted_prompt,
                             images if images else None,
@@ -1414,10 +1476,10 @@ async def responses_endpoint(request: Request):
                             token = await asyncio.to_thread(_next_token_resp_stream)
                             if token is None:
                                 break
-                            output_tokens += getattr(token, "token_count", 1)
                             raw_delta = token.text
                             full_text += raw_delta
                             chunk_rate = metrics.record_chunk(token)
+                            output_tokens = metrics.generated_tokens
                             thinking_delta = thinking_state.feed(
                                 raw_delta, last=bool(token.finish_reason)
                             )
@@ -1452,14 +1514,15 @@ async def responses_endpoint(request: Request):
                                 break
                     else:
                         # Fallback to stream_generate
-                        token_iterator = stream_generate(
+                        token_iterator = continuation.stream_generation(
+                            stream_generate,
                             model=model,
                             processor=processor,
                             prompt=formatted_prompt,
                             image=images,
                             vision_cache=runtime.model_cache.get("vision_cache"),
                             apc_manager=runtime.apc_manager,
-                            **gen_args.to_generate_kwargs(),
+                            args=gen_args,
                             **kwargs,
                         )
 
@@ -1526,6 +1589,7 @@ async def responses_endpoint(request: Request):
                             processor=processor,
                             starts_in_thinking=starts_in_thinking,
                             tool_delta_state=tool_delta_state,
+                            prompt=formatted_prompt,
                         )
                     )
                     for item in output_items:
@@ -1626,6 +1690,11 @@ async def responses_endpoint(request: Request):
                         token_times=metrics.token_times,
                         prompt_tps=metrics.prompt_tps,
                         generation_tps=metrics.generation_tps,
+                        decode_elapsed_s=(
+                            metrics.decode_progress.elapsed
+                            if metrics.decode_progress is not None
+                            else None
+                        ),
                         peak_memory_gb=metrics.peak_memory or None,
                         finish_reason=finish_reason,
                         image_count=len(images),
@@ -1704,7 +1773,7 @@ async def responses_endpoint(request: Request):
                     logger.debug("Responses stream closed.")
 
             return StreamingResponse(
-                stream_generator(),
+                _with_keepalives(stream_generator()),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -1791,6 +1860,7 @@ async def responses_endpoint(request: Request):
                         gen_args.thinking_end_token,
                         processor=processor,
                         starts_in_thinking=starts_in_thinking,
+                        prompt=formatted_prompt,
                     )
                 )
                 if finish_reason != "length" and output_finish_reason == "tool_calls":
@@ -1987,6 +2057,13 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 _chat_message_to_prompt(message.model_dump(exclude_none=True))
             )
 
+        stable_messages = compaction.with_transient_context(
+            processed_messages, request, include_suffix=False
+        )
+        processed_messages = compaction.with_transient_context(
+            processed_messages, request
+        )
+
         _normalize_instruction_messages(processed_messages)
         _ensure_effective_input(processed_messages, images=images, audio=audio)
 
@@ -2038,7 +2115,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
         if tool_choice is not None:
             template_kwargs["tool_choice"] = tool_choice
 
-        formatted_prompt = apply_chat_template(
+        formatted_prompt = continuation.render_prompt(
+            apply_chat_template,
             processor,
             config,
             processed_messages,
@@ -2047,6 +2125,30 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             video=videos or None,
             tools=tools,
             **template_kwargs,
+        )
+        if request.transient_context and not (images or audio or videos):
+            _normalize_instruction_messages(stable_messages)
+            gen_args.cache_prefix = apply_chat_template(
+                processor,
+                config,
+                stable_messages,
+                add_generation_prompt=False,
+                tools=tools,
+                **template_kwargs,
+            )
+
+        parse_tools = partial(
+            parse_assistant_tool_calls,
+            tool_module=tool_module,
+            tools=tools,
+            starts_in_thinking=prompt_has_open_thinking(
+                formatted_prompt,
+                gen_args.enable_thinking,
+                gen_args.thinking_start_token,
+                gen_args.thinking_end_token,
+            ),
+            thinking_start_token=gen_args.thinking_start_token,
+            thinking_end_token=gen_args.thinking_end_token,
         )
 
         logger.debug(
@@ -2114,6 +2216,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         if videos:
                             generate_kwargs["videos"] = videos
                         ctx, token_iter = await asyncio.to_thread(
+                            continuation.start_generation,
                             runtime.response_generator.generate,
                             formatted_prompt,
                             images if images else None,
@@ -2133,6 +2236,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             ),
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
+                            prompt=formatted_prompt,
                         )
                         full_output = ""  # raw output for tool call parsing
                         # Track tool-call state to suppress markup from content
@@ -2150,9 +2254,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             token = await asyncio.to_thread(_next_token)
                             if token is None:
                                 break
-                            output_tokens += getattr(token, "token_count", 1)
                             full_output += token.text
                             chunk_rate = metrics.record_chunk(token)
+                            output_tokens = metrics.generated_tokens
 
                             # Detect thinking boundaries
                             thinking_delta = thinking_state.feed(
@@ -2247,7 +2351,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         # Parse tool calls from full output and emit final chunk
                         terminal_emitted = False
                         if tool_module is not None:
-                            tc = process_tool_calls(full_output, tool_module, tools)
+                            tc = parse_tools(full_output)
                             remaining_calls = tool_delta_state.finish(tc.calls)
                             if tc.calls:
                                 tool_calls_made = True
@@ -2292,7 +2396,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             yield f"data: {chunk_data.model_dump_json()}\n\n"
                     else:
                         # Fallback to stream_generate
-                        token_iterator = stream_generate(
+                        token_iterator = continuation.stream_generation(
+                            stream_generate,
                             model=model,
                             processor=processor,
                             prompt=formatted_prompt,
@@ -2301,7 +2406,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             video=videos,
                             vision_cache=runtime.model_cache.get("vision_cache"),
                             apc_manager=runtime.apc_manager,
-                            **gen_args.to_generate_kwargs(),
+                            args=gen_args,
                             **kwargs,
                         )
 
@@ -2317,6 +2422,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             ),
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
+                            prompt=formatted_prompt,
                         )
                         tool_call_state = ToolCallStreamState(
                             tool_module.tool_call_start if tool_module else None,
@@ -2393,7 +2499,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             yield f"data: {chunk_data.model_dump_json()}\n\n"
 
                         tc = (
-                            process_tool_calls(output_text, tool_module, tools)
+                            parse_tools(output_text)
                             if tool_module is not None
                             else None
                         )
@@ -2470,6 +2576,11 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         token_times=metrics.token_times,
                         prompt_tps=metrics.prompt_tps,
                         generation_tps=metrics.generation_tps,
+                        decode_elapsed_s=(
+                            metrics.decode_progress.elapsed
+                            if metrics.decode_progress is not None
+                            else None
+                        ),
                         peak_memory_gb=metrics.peak_memory or None,
                         finish_reason=finish_reason,
                         image_count=len(images),
@@ -2522,7 +2633,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     logger.debug("Chat completion stream closed.")
 
             return StreamingResponse(
-                stream_generator(),
+                _with_keepalives(stream_generator()),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -2626,6 +2737,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         gen_args.thinking_end_token,
                     ),
                     processor=processor,
+                    prompt=formatted_prompt,
                 )
 
                 # Count raw generated tokens minus thinking tag tokens
@@ -2642,19 +2754,11 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 # Parse tool calls from generated output
                 parsed_tool_calls = None
                 if tool_module is not None:
-                    tc = process_tool_calls(
-                        model_output=full_text,
-                        tool_module=tool_module,
-                        tools=tools,
-                    )
+                    tc = parse_tools(full_text)
                     if tc.calls:
                         parsed_tool_calls = tc.calls
-                        # Clean thinking tags and control tokens from remaining text
-                        _, clean_remaining = _split_thinking(
-                            tc.remaining_text or "",
-                            gen_args.thinking_start_token,
-                            gen_args.thinking_end_token,
-                        )
+                        # Reasoning was already removed before tool parsing.
+                        clean_remaining = tc.remaining_text or ""
                         content = (
                             strip_protocol_markers(
                                 clean_remaining,
