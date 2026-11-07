@@ -187,6 +187,22 @@ def test_spm_byte_tokens(vocab, trim, expected):
         assert REPLACEMENT_CHAR in detokenizer.text
 
 
+@pytest.mark.parametrize("stride", [1, 2], ids=["dense-vocab", "sparse-vocab"])
+def test_spm_streaming_skips_unmapped_ids(stride):
+    pieces = ["\u2581hello", "<0xC3>", "<0xA9>", "\u2581world"]
+    vocab = {piece: i * stride for i, piece in enumerate(pieces)}
+    unmapped = [i for i in range(max(vocab.values()) + 2) if i not in vocab.values()]
+    unmapped.append(2**32 - 1)
+
+    detokenizer = SPMStreamingDetokenizer(MockTokenizer(vocab), trim_space=True)
+    for piece in pieces:
+        detokenizer.add_token(vocab[piece])
+        for token in unmapped:
+            detokenizer.add_token(token)
+    detokenizer.finalize()
+    assert detokenizer.text == "hello\u00e9 world"
+
+
 def test_last_segment_basic():
     vocab = {"▁hello": 0, "▁world": 1}
     tokenizer = MockTokenizer(vocab)
