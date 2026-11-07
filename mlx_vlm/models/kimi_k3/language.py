@@ -459,6 +459,9 @@ class KimiK3DeltaAttention(nn.Module):
             y, conv_state, ssm_state = self._step(x, conv_state, ssm_state)
             cache[0] = conv_state
             cache[1] = ssm_state
+            if cache.is_speculating:
+                cache.record_speculative_states(0, None, conv_state)
+                cache.record_speculative_states(1, None, ssm_state)
             cache.advance(1)
             return y
 
@@ -500,6 +503,9 @@ class KimiK3DeltaAttention(nn.Module):
 
         if cache is not None:
             cache[1] = ssm_state
+            if cache.is_speculating:
+                cache.record_speculative_states(0, None, conv_state)
+                cache.record_speculative_states(1, None, ssm_state)
             cache.advance(T)
 
         if self.use_full_rank_gate:
@@ -800,6 +806,8 @@ class KimiK3TextModel(nn.Module):
         inputs: mx.array,
         cache: Optional[List[Any]] = None,
         inputs_embeds: Optional[mx.array] = None,
+        capture_layer_ids=None,
+        hidden_sink=None,
     ) -> mx.array:
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
@@ -821,9 +829,12 @@ class KimiK3TextModel(nn.Module):
             attn_mask = None
 
         blocks = ResidualBlocks(self.args.rms_norm_eps) if self.use_attn_res else None
-        for layer, layer_cache in zip(self.layers, cache):
+        capture = set(capture_layer_ids or [])
+        for index, (layer, layer_cache) in enumerate(zip(self.layers, cache)):
             mask = ssm_mask if layer.is_linear else attn_mask
             h, blocks = layer(h, mask=mask, cache=layer_cache, blocks=blocks)
+            if index in capture:
+                hidden_sink.append(h)
 
         if blocks is not None:
             if self.training or self._output_res_w_eff is None:
@@ -841,6 +852,8 @@ class KimiK3TextModel(nn.Module):
 
 
 class LanguageModel(nn.Module):
+    supports_speculative_decoding = True
+
     def __init__(self, config: TextConfig):
         super().__init__()
         self.config = config
@@ -860,12 +873,50 @@ class LanguageModel(nn.Module):
         mask: Optional[mx.array] = None,
         **kwargs,
     ):
-        out = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds)
+        length = inputs.shape[1] if inputs_embeds is None else inputs_embeds.shape[1]
+        # Record each recurrent state using the normal decode path; committing a
+        # rejected block must restore both the convolution and delta-rule state.
+        if (
+            length > 1
+            and cache
+            and any(isinstance(c, ArraysCache) and c.is_speculating for c in cache)
+        ):
+            results = [
+                self(
+                    None if inputs is None else inputs[:, i : i + 1],
+                    inputs_embeds=(
+                        None if inputs_embeds is None else inputs_embeds[:, i : i + 1]
+                    ),
+                    cache=cache,
+                    **kwargs,
+                )
+                for i in range(length)
+            ]
+            return LanguageModelOutput(
+                logits=mx.concatenate([r.logits for r in results], axis=1),
+                hidden_states=(
+                    None
+                    if results[0].hidden_states is None
+                    else [
+                        mx.concatenate(parts, axis=1)
+                        for parts in zip(*(r.hidden_states for r in results))
+                    ]
+                ),
+            )
+        capture_layer_ids = kwargs.get("capture_layer_ids")
+        hidden = [] if capture_layer_ids is not None else None
+        out = self.model(
+            inputs,
+            cache=cache,
+            inputs_embeds=inputs_embeds,
+            capture_layer_ids=capture_layer_ids,
+            hidden_sink=hidden,
+        )
         if self.lm_head is None:
             out = self.model.embed_tokens.as_linear(out)
         else:
             out = self.lm_head(out)
-        return LanguageModelOutput(logits=out)
+        return LanguageModelOutput(logits=out, hidden_states=hidden)
 
     def embed_tokens(self, x):
         return self.model.embed_tokens(x)

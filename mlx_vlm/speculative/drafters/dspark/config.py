@@ -33,6 +33,7 @@ class DSparkConfig(BaseModelConfig):
     hidden_act: str = "silu"
     rms_norm_eps: float = 1e-5
     vocab_size: int = 128000
+    draft_vocab_size: int | None = None
     max_position_embeddings: int = 128000
     rope_theta: float = 10000000.0
     rope_scaling: dict[str, Any] | None = None
@@ -42,7 +43,8 @@ class DSparkConfig(BaseModelConfig):
     final_logit_softcapping: float | None = None
     layer_types: list[str] = field(default_factory=list)
     sliding_window: int | None = None
-    is_causal: bool = False
+    is_causal: bool | None = False
+    sliding_window_non_causal: bool = False
     attention_sink_bias: bool = False
     sample_from_anchor: bool = True
 
@@ -52,7 +54,7 @@ class DSparkConfig(BaseModelConfig):
     proposal_length: int = 0
     mask_token_id: int = -1
     target_layer_ids: list[int] = field(default_factory=list)
-    num_target_layers: int = 0
+    num_target_layers: int | None = None
 
     runtime_block_size: int | None = None
     draft_window_size: int | None = None
@@ -65,6 +67,8 @@ class DSparkConfig(BaseModelConfig):
     confidence_head_with_markov: bool = True
 
     def __post_init__(self) -> None:
+        if self.draft_vocab_size is None:
+            self.draft_vocab_size = self.vocab_size
         if not self.layer_types:
             self.layer_types = ["full_attention"] * self.num_hidden_layers
         self.validate()
@@ -86,13 +90,23 @@ class DSparkConfig(BaseModelConfig):
             "max_position_embeddings",
             "block_size",
             "proposal_length",
-            "num_target_layers",
             "markov_rank",
         )
         for key in positive_fields:
             value = getattr(self, key)
             if not isinstance(value, int) or value <= 0:
                 raise ValueError(f"DSpark requires a positive integer {key}.")
+        if (
+            not isinstance(self.draft_vocab_size, int)
+            or not 0 < self.draft_vocab_size <= self.vocab_size
+        ):
+            raise ValueError(
+                "DSpark draft_vocab_size must fit inside the target vocabulary."
+            )
+        if self.num_target_layers is not None and (
+            not isinstance(self.num_target_layers, int) or self.num_target_layers <= 0
+        ):
+            raise ValueError("DSpark requires a positive integer num_target_layers.")
         if self.block_size != self.proposal_length + 1:
             raise ValueError(
                 "DSpark verification block_size must equal proposal_length + 1."
@@ -134,7 +148,11 @@ class DSparkConfig(BaseModelConfig):
             not self.target_layer_ids
             or not _is_strictly_increasing_ints(self.target_layer_ids)
             or any(
-                layer_id < 0 or layer_id >= self.num_target_layers
+                layer_id < 0
+                or (
+                    self.num_target_layers is not None
+                    and layer_id >= self.num_target_layers
+                )
                 for layer_id in self.target_layer_ids
             )
         ):
@@ -145,8 +163,19 @@ class DSparkConfig(BaseModelConfig):
 
     @classmethod
     def from_dict(cls, params: dict) -> "DSparkConfig":
-        flat = dict(params)
+        # Speculators stores its backbone separately; OpenBMB stores the same
+        # draft metadata at the root, and SpecForge uses dflash_config.
+        flat = {**(params.get("transformer_layer_config") or {}), **params}
         dflash = flat.pop("dflash_config", None)
+        if dflash is None and (
+            params.get("speculators_model_type") == "dspark"
+            or "Qwen3DSparkModel" in (params.get("architectures") or [])
+        ):
+            dflash = {"projector_type": "dspark"}
+            if "aux_hidden_state_layer_ids" in flat:
+                flat["target_layer_ids"] = flat["aux_hidden_state_layer_ids"]
+            if params.get("speculators_model_type") == "dspark":
+                flat.setdefault("is_causal", None)
         if not isinstance(dflash, Mapping):
             raise TypeError("DSpark requires a dflash_config object.")
 
@@ -179,8 +208,8 @@ class DSparkConfig(BaseModelConfig):
             if key in dflash:
                 flat[key] = dflash[key]
 
-        if "num_target_layers" not in flat and flat.get("target_layer_ids"):
-            flat["num_target_layers"] = max(flat["target_layer_ids"]) + 1
+        # The last tapped layer need not be the last target layer. When the
+        # checkpoint omits depth, validate the taps against the bound target.
         if "causal" in dflash:
             flat["is_causal"] = bool(dflash["causal"])
         elif "dflash_query_causal" in flat:
@@ -202,7 +231,10 @@ class DSparkConfig(BaseModelConfig):
         raw_block_size = dflash.get("block_size", flat.get("block_size"))
         if raw_block_size is None:
             raise ValueError("DSpark requires a checkpoint block_size.")
-        includes_anchor = bool(flat.pop("dspark_bonus_anchor", False))
+        includes_anchor = bool(flat.pop("dspark_bonus_anchor", False)) or (
+            params.get("speculators_model_type") == "dspark"
+            and not flat.get("sample_from_anchor", True)
+        )
         flat["block_size"] = int(raw_block_size) + (0 if includes_anchor else 1)
         flat["proposal_length"] = flat["block_size"] - 1
 

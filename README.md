@@ -299,6 +299,22 @@ with `--draft-block-size 10`. The checkpoint's confidence head is loaded for
 parity, and DSpark decoding currently requires greedy sampling
 (`temperature=0`).
 
+Official OpenBMB and Red Hat Speculators checkpoints can also be loaded directly:
+
+```sh
+mlx_vlm.generate --model openbmb/MiniCPM5-2B \
+  --draft-model openbmb/MiniCPM5-2B-DSpark \
+  --prompt "Write a Python function that adds two integers." --temperature 0
+
+mlx_vlm.generate --model Qwen/Qwen3-4B \
+  --draft-model RedHatAI/Qwen3-4B-speculator.dspark \
+  --prompt "Explain speculative decoding." --temperature 0
+```
+
+The loader handles nested Speculators configs, reduced draft vocabularies,
+checkpoint-owned output heads, and each checkpoint's anchor convention.
+See [official checkpoint support](docs/speculative-decoding.md#official-checkpoint-support).
+
 Muse Glimmer's published assistant checkpoint is auto-detected as DFlash:
 
 ```sh

@@ -25,6 +25,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import pytest
+from mlx.utils import tree_flatten
 
 import mlx_vlm.models as models
 import mlx_vlm.turboquant as tq
@@ -84,7 +85,13 @@ from mlx_vlm.models.qwen4_exp.language import (
 )
 from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
 from mlx_vlm.models.z1t.language import AFTConv, Z1TCache
-from mlx_vlm.tests.test_models import DATA, build_config, model_case
+from mlx_vlm.speculative.common import verify_forward
+from mlx_vlm.tests.test_models import (
+    DATA,
+    build_config,
+    model_case,
+    tiny_language_model,
+)
 from mlx_vlm.turboquant import (
     BatchTurboQuantKVCache,
     TurboQuantKVCache,
@@ -4384,3 +4391,63 @@ def test_warm_rows_decode_while_cold_row_prefills(prefix_manager, model_name):
     assert manager._prefill_reserve_bytes == 0
     assert manager.memory_plan.lengths == []
     gen.close()
+
+
+def assert_cache_state_close(actual, expected, *, atol=0, rtol=0):
+    actual, expected = dict(tree_flatten(actual)), dict(tree_flatten(expected))
+    assert actual.keys() == expected.keys()
+    for key, value in actual.items():
+        reference = expected[key]
+        if value is None or reference is None:
+            assert value is reference, key
+        else:
+            assert value.shape == reference.shape, key
+            np.testing.assert_allclose(
+                np.array(value),
+                np.array(reference),
+                atol=atol,
+                rtol=rtol,
+                equal_nan=False,
+                err_msg=key,
+            )
+
+
+@pytest.mark.parametrize("family", ["qwen3", "llama", "mistral4", "kimi_k3"])
+@pytest.mark.parametrize("keep", [0, 1, 3])
+def test_target_hidden_capture_and_rejected_prefix(family, keep):
+    mx.random.seed(5)
+    model = tiny_language_model(family)
+    ordinary, speculative = C.make_prompt_cache(model), C.make_prompt_cache(model)
+    prompt, block = mx.array([[1, 2, 3, 4, 5, 6, 7]]), mx.array([[8, 9, 10]])
+    taps = [0, 1]
+    first = model(prompt, cache=ordinary, capture_layer_ids=taps)
+    assert_cache_state_close(first.logits, model(prompt, cache=speculative).logits)
+    assert len(first.hidden_states) == len(taps)
+    output, transaction = verify_forward(
+        model, block, speculative, capture_layer_ids=taps
+    )
+    expected = [
+        model(block[:, i : i + 1], cache=ordinary, capture_layer_ids=taps)
+        for i in range(keep)
+    ]
+    mx.eval(output.logits)
+    transaction.commit([keep])
+    if keep:
+        assert_cache_state_close(
+            output.logits[:, :keep],
+            mx.concatenate([out.logits for out in expected], axis=1),
+            atol=1e-4,
+            rtol=1e-4,
+        )
+    assert_cache_state_close(
+        [c.state for c in speculative],
+        [c.state for c in ordinary],
+        atol=1e-4,
+        rtol=1e-4,
+    )
+    assert_cache_state_close(
+        model(mx.array([[11]]), cache=speculative).logits,
+        model(mx.array([[11]]), cache=ordinary).logits,
+        atol=1e-4,
+        rtol=1e-4,
+    )
