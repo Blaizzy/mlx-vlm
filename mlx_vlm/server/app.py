@@ -538,7 +538,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["X-MLX-Continuation"],
+    expose_headers=["X-MLX-Continuation", "X-MLX-Finish-Reason"],
 )
 app.add_middleware(
     ContinuationMiddleware,
