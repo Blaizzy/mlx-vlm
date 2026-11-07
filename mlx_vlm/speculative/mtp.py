@@ -1,14 +1,16 @@
 from copy import copy
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Generator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Generator, List, Optional, Sequence, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 from .. import apc
 from ..models import cache
 from ..models.linear import native_batch_linear
 from ..models.quantized_verifier import decode_quantized_argmax
+from ..structured import _apply_llguidance_mask
 from .cache_state import (
     abort_speculative_round,
     commit_speculative_round,
@@ -58,6 +60,111 @@ def _release_shared_kv(draft):
     release = getattr(draft, "release_shared_kv", None)
     if callable(release):
         release()
+
+
+class _MTPGrammar:
+    """Structured-output masks for the verify blocks of constrained rows.
+
+    ``constraints`` holds one processor per row, or None for an unconstrained
+    row. A processor implements ``speculative_masks`` and
+    ``speculative_accept`` (see ``mlx_vlm.structured``): its grammar decides
+    how many drafts it allows and masks each verify position, and its matcher
+    only ever holds emitted tokens.
+    """
+
+    def __init__(self, constraints: Sequence[Any]):
+        self.constraints = list(constraints)
+
+    def verify_masks(
+        self,
+        verify: _MTPVerifyResult,
+        last_tokens: Sequence[int],
+        draft_tokens: mx.array,
+        rows: Optional[Sequence[int]] = None,
+        skip: Optional[Sequence[bool]] = None,
+    ) -> Optional[mx.array]:
+        """Masks shaped [rows, block, words], or None when no row is masked."""
+        # The target verify runs on the GPU while the CPU walks the drafts.
+        mx.async_eval(verify.hidden)
+        drafts = draft_tokens.tolist()
+        rows = range(len(drafts)) if rows is None else rows
+        blocks = []
+        for j, row in enumerate(rows):
+            constraint = self.constraints[row]
+            if constraint is None or (skip is not None and skip[row]):
+                blocks.append(None)
+            else:
+                blocks.append(
+                    constraint.speculative_masks(int(last_tokens[j]), drafts[j])
+                )
+        present = [block for block in blocks if block is not None]
+        if not present:
+            return None
+        masks = np.full(
+            (len(blocks), len(drafts[0]) + 1, present[0].shape[1]), -1, np.int32
+        )
+        for j, block in enumerate(blocks):
+            if block is not None:
+                masks[j] = block
+        return mx.array(masks)
+
+    def accept(
+        self,
+        new_tokens: Sequence[List[int]],
+        rows: Optional[Sequence[int]] = None,
+        skip: Optional[Sequence[bool]] = None,
+    ) -> None:
+        """Advance each matcher past the drafts its row accepted."""
+        rows = range(len(new_tokens)) if rows is None else rows
+        for j, row in enumerate(rows):
+            constraint = self.constraints[row]
+            if constraint is None or (skip is not None and skip[row]):
+                continue
+            constraint.speculative_accept(list(new_tokens[j][:-1]))
+
+
+def _mtp_masked_target_tokens(
+    lm: nn.Module,
+    hidden: mx.array,
+    masks: Optional[mx.array],
+    sampler: Callable[[mx.array], mx.array],
+    *,
+    greedy_sampling: bool,
+    row_ids: List[int],
+    base_positions: List[int],
+) -> Optional[mx.array]:
+    """Target tokens [rows, block] of a verify block under grammar masks.
+
+    Returns None for a sampler without positioned draws: its single RNG
+    stream must advance one emitted token at a time, so the deferred walk
+    samples position by position instead.
+    """
+    if not greedy_sampling and not _sampler_supports_positioned_target(sampler):
+        return None
+    with mx.stream(generation_stream):
+        if masks is None and greedy_sampling:
+            argmax_from_hidden = getattr(lm, "speculative_argmax_from_hidden", None)
+            if callable(argmax_from_hidden):
+                tokens = argmax_from_hidden(hidden)
+                if tokens is not None:
+                    return tokens
+        logits = _mtp_logits_from_hidden(lm, hidden)
+        B, L, V = logits.shape
+        logits = logits.reshape(B * L, V)
+        if masks is not None:
+            logits = _apply_llguidance_mask(logits, masks.reshape(B * L, -1))
+        if greedy_sampling:
+            tokens = mx.argmax(logits, axis=-1)
+        else:
+            logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+            tokens = sampler.sample_target(
+                logprobs,
+                row_ids=[int(row) for row in row_ids for _ in range(L)],
+                positions=[
+                    int(base) + pos for base in base_positions for pos in range(L)
+                ],
+            )
+    return tokens.reshape(B, L)
 
 
 def _mtp_shared_kv_from_prompt_cache(
@@ -266,6 +373,7 @@ def _speculative_walk_deferred_greedy(
     budget: int,
     row_id: int = 0,
     base_position: Optional[int] = None,
+    masks: Optional[mx.array] = None,
 ) -> Tuple[int, List[int]]:
     """Greedy MTP walk that projects target logits only until rejection."""
     n_draft = draft_tokens.shape[1]
@@ -278,6 +386,8 @@ def _speculative_walk_deferred_greedy(
             logits = _mtp_logits_from_hidden(lm, target_hidden[:, pos : pos + 1, :])
             if logits.ndim == 3 and logits.shape[1] == 1:
                 logits = logits[:, 0, :]
+            if masks is not None:
+                logits = _apply_llguidance_mask(logits, masks[:, pos])
             logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
             sample_target = getattr(sampler, "sample_target", None)
             if callable(sample_target) and base_position is not None:
@@ -354,6 +464,7 @@ def _speculative_walk_batch_deferred_greedy(
     budgets: List[int],
     row_ids: Optional[List[int]] = None,
     base_positions: Optional[List[int]] = None,
+    masks: Optional[mx.array] = None,
 ) -> Tuple[List[int], List[List[int]]]:
     """Batched greedy walk that projects target logits only until all rows stop."""
     B = draft_tokens.shape[0]
@@ -371,6 +482,8 @@ def _speculative_walk_batch_deferred_greedy(
             logits = _mtp_logits_from_hidden(lm, target_hidden[:, pos : pos + 1, :])
             if logits.ndim == 3 and logits.shape[1] == 1:
                 logits = logits[:, 0, :]
+            if masks is not None:
+                logits = _apply_llguidance_mask(logits, masks[:, pos])
             logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
             target_tokens = _sample_mtp_target(
                 sampler, logprobs, row_ids, base_positions, pos
@@ -402,6 +515,7 @@ def _speculative_walk_batch_deferred_uniform(
     budgets: List[int],
     row_ids: Optional[List[int]] = None,
     base_positions: Optional[List[int]] = None,
+    masks: Optional[mx.array] = None,
 ) -> Tuple[List[int], List[List[int]]]:
     """Deferred walk for models whose batched drafter cache needs lockstep rows.
 
@@ -419,6 +533,8 @@ def _speculative_walk_batch_deferred_uniform(
             logits = _mtp_logits_from_hidden(lm, target_hidden[:, pos : pos + 1, :])
             if logits.ndim == 3 and logits.shape[1] == 1:
                 logits = logits[:, 0, :]
+            if masks is not None:
+                logits = _apply_llguidance_mask(logits, masks[:, pos])
             logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
             target_tokens = _sample_mtp_target(
                 sampler, logprobs, row_ids, base_positions, pos
@@ -480,12 +596,13 @@ def _mtp_acceptance_walk(
     budget: int,
     row_id: int = 0,
     base_position: Optional[int] = None,
+    masks: Optional[mx.array] = None,
 ) -> Tuple[int, List[int]]:
     if verify.target_tokens is not None:
         mx.async_eval(verify.target_tokens, verify.hidden)
         return _speculative_walk(draft_tokens, verify.target_tokens, budget)
 
-    if base_position is not None:
+    if base_position is not None and masks is None:
         target_tokens = _positioned_target_tokens(
             lm,
             verify.hidden,
@@ -506,6 +623,7 @@ def _mtp_acceptance_walk(
         budget,
         row_id=row_id,
         base_position=base_position,
+        masks=masks,
     )
 
 
@@ -783,9 +901,19 @@ class MTPBatch:
             self.rope_deltas = None
         self.rows = [self.rows[i] for i in keep]
 
-    def step(self, budgets, positions, thinking_budget_criteria=None):
+    def step(self, budgets, positions, thinking_budget_criteria=None, constraints=None):
+        """Decode one verify round for every row.
+
+        ``constraints`` holds each row's structured-output processor, or None;
+        its grammar masks every verify position of that row.
+        """
         if not budgets or min(budgets) <= 0:
             raise ValueError("Only live requests with remaining tokens can decode")
+        grammar = (
+            _MTPGrammar(constraints)
+            if constraints is not None and any(c is not None for c in constraints)
+            else None
+        )
         ceiling = self.block_size
         if (
             len(self.rows) > 1
@@ -838,8 +966,22 @@ class MTPBatch:
                 inputs,
                 self.cache,
                 self.sampler,
-                sample_target_tokens=self.greedy,
+                sample_target_tokens=self.greedy and grammar is None,
             )
+            masks = None
+            if grammar is not None:
+                masks = grammar.verify_masks(
+                    verify, [row.bonus for row in self.rows], proposals
+                )
+                verify.target_tokens = _mtp_masked_target_tokens(
+                    self.model,
+                    verify.hidden,
+                    masks,
+                    self.sampler,
+                    greedy_sampling=self.greedy,
+                    row_ids=[0] * len(self.rows),
+                    base_positions=positions,
+                )
             self.rows[0].rng.target_eval(verify.hidden, verify.target_tokens)
             uniform = _mtp_use_uniform_deferred_walk(
                 self.draft,
@@ -870,6 +1012,7 @@ class MTPBatch:
                     budgets,
                     row_ids=[0] * len(self.rows),
                     base_positions=positions,
+                    masks=masks,
                 )
             accepted = [
                 min(count, len(values) - 1) for count, values in zip(accepted, tokens)
@@ -901,6 +1044,8 @@ class MTPBatch:
                         self.dtype,
                         **_mtp_draft_kwargs(row.draft, self.greedy, self.sampler),
                     )
+            if grammar is not None:
+                grammar.accept(tokens)
             verify.commit(self.model, self.cache, accepted, block_size)
         except BaseException:
             if verify is not None:
@@ -948,10 +1093,16 @@ def _mtp_rounds(
     draft_block_size: Optional[int] = None,
     token_dtype: mx.Dtype = mx.int32,
     greedy_sampling: bool = False,
+    constraint: Optional[Any] = None,
     thinking_budget_criteria: Optional[Any] = None,
 ) -> Generator[Tuple[int, None], None, None]:
-    """Verify autoregressive MTP drafts and commit accepted state before emission."""
+    """Verify autoregressive MTP drafts and commit accepted state before emission.
+
+    ``constraint`` is a structured-output processor (``mlx_vlm.structured``)
+    whose grammar masks every verify position.
+    """
     lm = model.language_model if hasattr(model, "language_model") else model
+    grammar = _MTPGrammar([constraint]) if constraint is not None else None
 
     block_total = _dflash_block_total(draft_model, draft_block_size)
     configured_block_total = int(getattr(draft_model.config, "block_size", block_total))
@@ -1036,7 +1187,19 @@ def _mtp_rounds(
                     verify_input,
                     prompt_cache,
                     sampler,
-                    sample_target_tokens=greedy_sampling,
+                    sample_target_tokens=greedy_sampling and grammar is None,
+                )
+            masks = None
+            if grammar is not None:
+                masks = grammar.verify_masks(verify, [b], draft_tokens)
+                verify.target_tokens = _mtp_masked_target_tokens(
+                    lm,
+                    verify.hidden,
+                    masks,
+                    sampler,
+                    greedy_sampling=greedy_sampling,
+                    row_ids=[0],
+                    base_positions=[emitted],
                 )
             accepted, new_tokens = _mtp_acceptance_walk(
                 lm,
@@ -1046,6 +1209,7 @@ def _mtp_rounds(
                 max_tokens - emitted,
                 row_id=0,
                 base_position=emitted,
+                masks=masks,
             )
             sampler_rng.target_sampled(
                 sync_draft=not _sampler_supports_positioned_target(sampler)
@@ -1068,6 +1232,8 @@ def _mtp_rounds(
                     **_mtp_draft_kwargs(draft_model, greedy_sampling, sampler),
                 )
 
+            if grammar is not None:
+                grammar.accept([new_tokens])
             verify.commit(lm, prompt_cache, accepted, bs)
         except BaseException:
             if verify is not None:
@@ -1249,6 +1415,7 @@ def _mtp_rounds_batch(
     eos_token_ids: Optional[set] = None,
     greedy_sampling: bool = False,
     row_ids: Optional[List[int]] = None,
+    constraints: Optional[Sequence[Any]] = None,
     thinking_budget_criteria: Optional[List[Any]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     """Batched Gemma 4 MTP round loop (B >= 1).
@@ -1259,11 +1426,17 @@ def _mtp_rounds_batch(
     snapshot) instead of multi-layer hidden capture, ``draft_block`` is
     autoregressive, and the per-round ``shared_kv`` snapshot is normalized
     back to the unbatched prefix-valid layout before each drafter rebind.
+    ``constraints`` holds each row's structured-output processor, or None.
     """
     lm = model.language_model if hasattr(model, "language_model") else model
 
     B = first_bonus.shape[0]
     row_ids = list(range(B)) if row_ids is None else list(row_ids)
+    grammar = (
+        _MTPGrammar(constraints)
+        if constraints is not None and any(c is not None for c in constraints)
+        else None
+    )
     block_total = _dflash_block_total(draft_model, draft_block_size)
     if (
         B > 1
@@ -1383,9 +1556,24 @@ def _mtp_rounds_batch(
                     verify_input,
                     prompt_cache,
                     sampler,
-                    sample_target_tokens=greedy_sampling,
+                    sample_target_tokens=greedy_sampling and grammar is None,
                 )
                 hidden_full = verify.hidden  # [B_active, bs, H]
+
+            masks = None
+            if grammar is not None:
+                masks = grammar.verify_masks(
+                    verify, b_active, draft_tokens, rows=active_idx, skip=finished
+                )
+                verify.target_tokens = _mtp_masked_target_tokens(
+                    lm,
+                    hidden_full,
+                    masks,
+                    sampler,
+                    greedy_sampling=greedy_sampling,
+                    row_ids=[row_ids[active_idx[j]] for j in range(n_active)],
+                    base_positions=[emitted[active_idx[j]] for j in range(n_active)],
+                )
 
             # Walk per-row
             budgets = [max_tokens - emitted[active_idx[j]] for j in range(n_active)]
@@ -1429,6 +1617,7 @@ def _mtp_rounds_batch(
                     budgets,
                     row_ids=[row_ids[active_idx[j]] for j in range(n_active)],
                     base_positions=[emitted[active_idx[j]] for j in range(n_active)],
+                    masks=masks,
                 )
                 sampler_rng.target_sampled(
                     sync_draft=not _sampler_supports_positioned_target(sampler)
@@ -1464,6 +1653,8 @@ def _mtp_rounds_batch(
                     **_mtp_draft_kwargs(draft_model, greedy_sampling, sampler),
                 )
 
+            if grammar is not None:
+                grammar.accept(new_tokens_list, rows=active_idx, skip=finished)
             verify.commit(lm, prompt_cache, accepted_list, bs)
         except BaseException:
             if verify is not None:

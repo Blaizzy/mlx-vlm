@@ -48,7 +48,7 @@ from ..sample_utils import (
     top_p_sampling,
 )
 from ..speculative.utils import speculative_stats_since, speculative_stats_snapshot
-from ..structured import ThinkingAwareLogitsProcessor
+from ..structured import ThinkingAwareLogitsProcessor, supports_speculative_masks
 from ..tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
 from ..utils import ThinkingBudgetCriteria, load, prepare_inputs, resolve_eos_token_ids
 from ..vision_cache import processed_image_key
@@ -1242,9 +1242,17 @@ class ResponseGenerator:
             )
         ):
             raise ValueError("This diffusion model does not expose resumable blocks.")
-        if self.draft_model is not None and args.logits_processors is not None:
+        if (
+            self.draft_model is not None
+            and args.logits_processors is not None
+            and not (
+                self.draft_kind == "mtp"
+                and all(supports_speculative_masks(p) for p in args.logits_processors)
+            )
+        ):
             raise ValueError(
-                "Structured response_format is not supported with speculative decoding."
+                "Structured response_format with speculative decoding requires "
+                "an MTP drafter."
             )
         rqueue: Queue = Queue()
         request_started_at = time.perf_counter()
