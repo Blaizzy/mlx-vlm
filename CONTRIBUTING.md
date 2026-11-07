@@ -85,7 +85,10 @@ python -m pytest -q mlx_vlm/tests
 1. Fork and submit pull requests to the repo.
 2. If you've added code that should be tested, add tests.
 3. Every PR should have passing tests and at least one review.
-4. For code formatting install `pre-commit` using something like `pip install pre-commit` and run `pre-commit install`.
+4. Sign your commits (GPG or SSH) so GitHub marks them **Verified** — see
+   [GitHub's commit-signing guide](https://docs.github.com/en/authentication/managing-commit-signature-verification/signing-commits).
+   PRs with unsigned commits get an automated reminder.
+5. For code formatting install `pre-commit` using something like `pip install pre-commit` and run `pre-commit install`.
    This should install hooks for running `black` and `clang-format` to ensure
    consistent style for C++ and python code.
 
