@@ -81,6 +81,20 @@ class Attention(nn.Module):
         return self.o_proj(out.transpose(0, 2, 1, 3).reshape(batch, length, -1))
 
 
+@mx.compile
+def route_experts(gates, expert_bias, top_k):
+    # The reference computes the projection in the activation dtype, then
+    # sigmoid and normalization in FP32. Bias affects selection only.
+    scores = mx.sigmoid(gates.astype(mx.float32))
+    choice = scores + expert_bias.astype(mx.float32)
+    indices = mx.stop_gradient(
+        mx.argpartition(choice, kth=-top_k, axis=-1)[..., -top_k:]
+    )
+    weights = mx.take_along_axis(scores, indices, axis=-1)
+    weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
+    return indices, weights
+
+
 class SparseMoeBlock(nn.Module):
     def __init__(self, args: ModelConfig):
         super().__init__()
@@ -97,16 +111,7 @@ class SparseMoeBlock(nn.Module):
         )
 
     def route(self, x):
-        # The reference computes the projection in the activation dtype, then
-        # sigmoid and normalization in FP32. Bias affects selection only.
-        scores = mx.sigmoid(self.gate(x).astype(mx.float32))
-        choice = scores + self.expert_bias.astype(mx.float32)
-        indices = mx.stop_gradient(
-            mx.argpartition(choice, kth=-self.top_k, axis=-1)[..., -self.top_k :]
-        )
-        weights = mx.take_along_axis(scores, indices, axis=-1)
-        weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
-        return indices, weights
+        return route_experts(self.gate(x), self.expert_bias, self.top_k)
 
     def __call__(self, x):
         indices, weights = self.route(x)
