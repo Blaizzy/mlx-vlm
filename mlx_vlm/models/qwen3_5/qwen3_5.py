@@ -61,15 +61,12 @@ class Model(Qwen3VLModel):
         pixel_values: Optional[mx.array] = None,
         **kwargs,
     ):
-        if pixel_values is None:
-            pixel_values = kwargs.get("pixel_values_videos", None)
-
+        pixel_values_videos = kwargs.get("pixel_values_videos", None)
         image_grid_thw = kwargs.get("image_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
         mask = kwargs.get("mask", None)
-        grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
-        if pixel_values is None:
+        if pixel_values is None and pixel_values_videos is None:
             position_ids, rope_deltas = self.language_model.get_rope_index(
                 input_ids, attention_mask=mask
             )
@@ -79,33 +76,57 @@ class Model(Qwen3VLModel):
                 rope_deltas=rope_deltas,
             )
 
-        dtype = self.vision_tower.patch_embed.proj.weight.dtype
-        pixel_values = pixel_values.astype(dtype)
-
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
+        dtype = self.vision_tower.patch_embed.proj.weight.dtype
 
-        vision_cache = kwargs.get("vision_cache", None)
         cached = kwargs.get("cached_image_features", None)
-        if cached is None and vision_cache is not None:
-            cached = vision_cache.get(kwargs.get("_image_key"))
         if cached is not None:
-            hidden_states = cached
+            # Precomputed features cover every image and video placeholder, in
+            # token order.
+            inputs_embeds, _ = self.merge_input_ids_with_image_features(
+                cached,
+                inputs_embeds,
+                input_ids,
+                self.config.image_token_index,
+                self.config.video_token_index,
+            )
         else:
-            # Get the ouptut hidden states from the vision model
-            hidden_states, _ = self.vision_tower(pixel_values, grid_thw)
-            if vision_cache is not None and kwargs.get("_image_key") is not None:
-                mx.eval(hidden_states)
-                vision_cache.put(kwargs["_image_key"], hidden_states)
+            # Images and videos go through the vision tower separately, each
+            # with its own grid, and fill their own placeholder tokens.
+            media = []
+            if pixel_values is not None:
+                media.append(
+                    (pixel_values, image_grid_thw, self.config.image_token_index)
+                )
+            if pixel_values_videos is not None:
+                media.append(
+                    (pixel_values_videos, video_grid_thw, self.config.video_token_index)
+                )
+            # The vision cache key only covers image inputs, so the cache holds
+            # the image features, or the video features of a video-only request.
+            vision_cache = kwargs.get("vision_cache", None)
+            image_key = kwargs.get("_image_key")
+            for i, (pixels, grid_thw, token_index) in enumerate(media):
+                use_cache = (
+                    i == 0 and vision_cache is not None and image_key is not None
+                )
+                hidden_states = vision_cache.get(image_key) if use_cache else None
+                if hidden_states is None:
+                    # Get the output hidden states from the vision model
+                    hidden_states, _ = self.vision_tower(pixels.astype(dtype), grid_thw)
+                    if use_cache:
+                        mx.eval(hidden_states)
+                        vision_cache.put(image_key, hidden_states)
 
-        # Insert special image tokens in the input_ids
-        inputs_embeds, _ = self.merge_input_ids_with_image_features(
-            hidden_states,
-            inputs_embeds,
-            input_ids,
-            self.config.image_token_index,
-            self.config.video_token_index,
-        )
+                # Insert the features at this modality's placeholder tokens
+                inputs_embeds, _ = self.merge_input_ids_with_image_features(
+                    hidden_states,
+                    inputs_embeds,
+                    input_ids,
+                    token_index,
+                    token_index,
+                )
 
         position_ids, rope_deltas = self.language_model.get_rope_index(
             input_ids, image_grid_thw, video_grid_thw, mask
