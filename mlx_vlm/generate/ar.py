@@ -30,6 +30,7 @@ from ..sample_utils import (
 )
 from ..speculative.utils import (
     SpeculativePrefill,
+    _speculative_constraints,
     make_speculative_batch,
     make_speculative_prompt_cache,
     run_speculative_rounds,
@@ -1700,6 +1701,7 @@ class SpeculativeGenerationBatch:
             "_num_tokens",
             "_finished",
             "thinking_budget_criteria",
+            "logits_processors",
         ):
             values = getattr(self, name)
             setattr(row, name, [values[index]] if values else [])
@@ -1727,6 +1729,10 @@ class SpeculativeGenerationBatch:
             self._batch_rows.extend(incoming)
             self._pending_first.extend(start + row for row in other._pending_first)
             self.thinking_budget_criteria.extend(other.thinking_budget_criteria)
+            processors = self.logits_processors or [None] * start
+            self.logits_processors = processors + (
+                other.logits_processors or [None] * len(other._all_uids)
+            )
             self._refresh_uids()
             return
         raise RuntimeError("Cannot extend an active speculative generation batch.")
@@ -1790,6 +1796,8 @@ class SpeculativeGenerationBatch:
                 self.thinking_budget_criteria = [
                     self.thinking_budget_criteria[row] for row in rows
                 ]
+            if self.logits_processors:
+                self.logits_processors = [self.logits_processors[row] for row in rows]
             self._finished = [False] * len(rows)
             self._batch_rows = list(range(len(rows)))
 
@@ -1813,10 +1821,15 @@ class SpeculativeGenerationBatch:
             self._ensure_batch_state()
             rows = self._batch_rows[:]
             budgets = [self.max_tokens[row] - self._num_tokens[row] for row in rows]
+            constraints = _speculative_constraints(
+                self.draft_kind, self.logits_processors
+            )
+            options = {} if constraints is None else {"constraints": constraints}
             emitted = self._batch_state.step(
                 budgets,
                 [self._num_tokens[row] for row in rows],
                 self.thinking_budget_criteria,
+                **options,
             )
             for position in range(max(map(len, emitted))):
                 tokens = [None] * len(self._all_uids)

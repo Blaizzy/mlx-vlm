@@ -901,9 +901,19 @@ class MTPBatch:
             self.rope_deltas = None
         self.rows = [self.rows[i] for i in keep]
 
-    def step(self, budgets, positions, thinking_budget_criteria=None):
+    def step(self, budgets, positions, thinking_budget_criteria=None, constraints=None):
+        """Decode one verify round for every row.
+
+        ``constraints`` holds each row's structured-output processor, or None;
+        its grammar masks every verify position of that row.
+        """
         if not budgets or min(budgets) <= 0:
             raise ValueError("Only live requests with remaining tokens can decode")
+        grammar = (
+            _MTPGrammar(constraints)
+            if constraints is not None and any(c is not None for c in constraints)
+            else None
+        )
         ceiling = self.block_size
         if (
             len(self.rows) > 1
@@ -956,8 +966,22 @@ class MTPBatch:
                 inputs,
                 self.cache,
                 self.sampler,
-                sample_target_tokens=self.greedy,
+                sample_target_tokens=self.greedy and grammar is None,
             )
+            masks = None
+            if grammar is not None:
+                masks = grammar.verify_masks(
+                    verify, [row.bonus for row in self.rows], proposals
+                )
+                verify.target_tokens = _mtp_masked_target_tokens(
+                    self.model,
+                    verify.hidden,
+                    masks,
+                    self.sampler,
+                    greedy_sampling=self.greedy,
+                    row_ids=[0] * len(self.rows),
+                    base_positions=positions,
+                )
             self.rows[0].rng.target_eval(verify.hidden, verify.target_tokens)
             uniform = _mtp_use_uniform_deferred_walk(
                 self.draft,
@@ -988,6 +1012,7 @@ class MTPBatch:
                     budgets,
                     row_ids=[0] * len(self.rows),
                     base_positions=positions,
+                    masks=masks,
                 )
             accepted = [
                 min(count, len(values) - 1) for count, values in zip(accepted, tokens)
@@ -1019,6 +1044,8 @@ class MTPBatch:
                         self.dtype,
                         **_mtp_draft_kwargs(row.draft, self.greedy, self.sampler),
                     )
+            if grammar is not None:
+                grammar.accept(tokens)
             verify.commit(self.model, self.cache, accepted, block_size)
         except BaseException:
             if verify is not None:

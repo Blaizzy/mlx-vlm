@@ -1467,19 +1467,26 @@ class ScriptedMTPDrafter:
     """Proposes each row's next tokens of a known reply.
 
     ``wrong`` replaces the draft at a reply position, so rounds mix accepted
-    drafts, drafts the target rejects and drafts the grammar rejects.
+    drafts, drafts the target rejects and drafts the grammar rejects. With
+    ``prompts``, a drafter finds its rows' replies from the prompts it
+    prefills, so a per-request copy (``MTPBatch``) drafts its own reply.
     """
 
     prefer_requested_block_size = True
 
-    def __init__(self, replies, wrong):
+    def __init__(self, replies, wrong, prompts=None):
         self.config = NS(block_size=4)
         self.accept_lens, self.draft_lens = [], []
         self.replies, self.wrong, self.prompt_lens = replies, wrong, None
+        self.prompts, self.rows = prompts, None
 
     def reset(self, model, left_padding=None):
-        self.prompt_lens = None
+        self.prompt_lens, self.rows = None, None
         return []
+
+    def prefill_from_target_hidden(self, prompt_tokens, *args, **kwargs):
+        if self.prompts is not None:
+            self.rows = [self.prompts.index(p) for p in prompt_tokens.tolist()]
 
     def set_shared_kv(self, shared_kv, kv_offset, position=None, **kwargs):
         valid = kwargs.get("kv_valid_len")
@@ -1491,7 +1498,10 @@ class ScriptedMTPDrafter:
         self, bonus, hidden, cache, block_size, sampler, token_dtype, **kwargs
     ):
         rows = []
-        for reply, valid, prompt_len in zip(self.replies, self.valid, self.prompt_lens):
+        replies = self.replies
+        if self.rows is not None:
+            replies = [self.replies[row] for row in self.rows]
+        for reply, valid, prompt_len in zip(replies, self.valid, self.prompt_lens):
             start = valid - prompt_len + 1  # reply position of the first draft
             rows.append(
                 [
@@ -1568,21 +1578,23 @@ def test_mtp_generation_under_grammar(sampling):
     assert processor.ll_matchers[0].is_accepting()
 
 
-def test_mtp_batch_under_grammar_matches_batch_without_drafter():
+@parametrize("mode", ["rounds", "continuous", "joined"])
+def test_mtp_batch_under_grammar_matches_batch_without_drafter(mode):
     from mlx_vlm.tests.test_generate import regex_processor
 
     mx.random.seed(2127)
     model, _ = language("qwen", inference=True)
     model.eval()
     prompts = [[1, 2, 3], [4, 5, 6]]
+    max_tokens = [6, 13]  # row 0 leaves first, so row 1 moves up a slot
 
-    def run(draft_model=None, processors=None):
-        prompt = mx.array(prompts)
+    def prefill(uids, processors, draft_model=None):
+        prompt = mx.array([prompts[uid] for uid in uids])
         processing = module("generate.ar").PromptProcessingBatch(
             model=model,
-            uids=[0, 1],
-            input_ids=prompts,
-            max_tokens=[13, 13],
+            uids=uids,
+            input_ids=prompt.tolist(),
+            max_tokens=[max_tokens[uid] for uid in uids],
             inputs_embeds=model.model.embed_tokens(prompt),
             prompt_kwargs={},
             logits_processors=processors,
@@ -1592,7 +1604,9 @@ def test_mtp_batch_under_grammar_matches_batch_without_drafter():
             draft_block_size=4,
             greedy_sampling=True,
         )
-        batch = processing.generate(greedy, lambda token: False, compute_logprobs=False)
+        return processing.generate(greedy, lambda token: False, compute_logprobs=False)
+
+    def decode(batch):
         tokens = {0: [], 1: []}
         while len(batch):
             for response in batch.next():
@@ -1600,12 +1614,22 @@ def test_mtp_batch_under_grammar_matches_batch_without_drafter():
                     tokens[response.uid].append(response.token)
         return [tokens[0], tokens[1]]
 
-    # Row 0 follows the grammar, row 1 is unconstrained.
-    expected = run(processors=[[regex_processor(GRAMMAR)], None])
-    assert expected[0][-1] == 31 and expected[0] != expected[1]
-    drafter = ScriptedMTPDrafter(expected, {2: 20, 5: 20})
+    # Row 0 is unconstrained, row 1 follows the grammar.
+    expected = decode(prefill([0, 1], [None, [regex_processor(GRAMMAR)]]))
+    assert expected[1][-1] == 31 and len(expected[0]) == 6
+    drafter = ScriptedMTPDrafter(expected, {2: 20, 5: 20}, prompts)
     processor = regex_processor(GRAMMAR)
-    assert run(drafter, [[processor], None]) == expected
+    if mode == "joined":
+        # The constrained request joins a running batch (MTPBatch.extend).
+        batch = prefill([0], [None], drafter)
+        batch.extend(prefill([1], [[processor]], drafter))
+    else:
+        batch = prefill([0, 1], [None, [processor]], drafter)
+        # Continuous batches decode through MTPBatch, others through
+        # _mtp_rounds_batch.
+        assert batch.can_extend
+        batch.can_extend = mode == "continuous"
+    assert decode(batch) == expected
     assert any(0 < accepted < 3 for accepted in drafter.accept_lens)
     assert processor.ll_matchers[0].is_accepting()
 
