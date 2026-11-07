@@ -414,6 +414,31 @@ def _compute_g_beta(A_log, a, b, dt_bias):
     return compute_g(A_log, a, dt_bias), mx.sigmoid(b)
 
 
+def _unstack(axis: int):
+    """Split an array into its slices along ``axis`` with a single-stack VJP.
+
+    Indexing slice ``c`` inside a Python loop gives each slice its own VJP,
+    which scatters the cotangent into a full-size zeros array; the backward
+    pass then allocates and sums ``n`` full-size arrays. Here the cotangents
+    are stacked once instead."""
+
+    @mx.custom_function
+    def unstack(x):
+        return [mx.take(x, i, axis=axis) for i in range(x.shape[axis])]
+
+    @unstack.vjp
+    def unstack_vjp(primals, cotangents, outputs):
+        return mx.stack(
+            [
+                mx.zeros(o.shape, o.dtype) if c is None else c
+                for c, o in zip(cotangents, outputs)
+            ],
+            axis=axis,
+        )
+
+    return unstack
+
+
 def _invert_unit_lower(Tmat: mx.array, C: int) -> mx.array:
     """Inverse of a batched unit lower-triangular matrix ``Tmat`` (``[..., C, C]``,
     unit diagonal) via forward substitution, batched over all chunks/heads.
@@ -423,9 +448,10 @@ def _invert_unit_lower(Tmat: mx.array, C: int) -> mx.array:
     O(1) entries — exactly the regime here, since correlated keys give KK
     off-diagonals ~1."""
     X = mx.broadcast_to(mx.eye(C, dtype=mx.float32), Tmat.shape) + mx.zeros_like(Tmat)
+    T_rows = _unstack(-2)(Tmat)
     rows = [X[..., 0:1, :]]
     for i in range(1, C):
-        Tij = Tmat[..., i : i + 1, :i]
+        Tij = T_rows[i][..., None, :i]
         Xj = mx.concatenate(rows, axis=-2)
         rows.append(X[..., i : i + 1, :] - Tij @ Xj)
     return mx.concatenate(rows, axis=-2)
@@ -499,16 +525,17 @@ def gated_delta_chunked(q, k, v, g, beta, state, mask=None, C: int = 64):
         if state is not None
         else mx.zeros((B, Hv, Dv, Dk), mx.float32)
     )
+    unstack_chunks = _unstack(2)
+    MU0, Qeff, U0, Kt, k, ratio_last, cumg_last = (
+        unstack_chunks(x) for x in (MU0, Qeff, U0, Kt, k, ratio_last, cumg_last)
+    )
     ys = []
     for c in range(nC):
         St = mx.swapaxes(S, -1, -2)  # [B,Hv,Dk,Dv]
-        ys.append(MU0[:, :, c] + Qeff[:, :, c] @ St)  # [B,Hv,C,Dv]
-        Uc = U0[:, :, c] - Kt[:, :, c] @ St
-        Uscaled = ratio_last[:, :, c][..., None] * Uc
-        S = (
-            cumg_last[:, :, c][..., None, None] * S
-            + mx.swapaxes(Uscaled, -1, -2) @ k[:, :, c]
-        )
+        ys.append(MU0[c] + Qeff[c] @ St)  # [B,Hv,C,Dv]
+        Uc = U0[c] - Kt[c] @ St
+        Uscaled = ratio_last[c][..., None] * Uc
+        S = cumg_last[c][..., None, None] * S + mx.swapaxes(Uscaled, -1, -2) @ k[c]
     Y = mx.stack(ys, axis=2).transpose(0, 2, 3, 1, 4).reshape(B, Tp, Hv, Dv)[:, :T]
     Y = Y.astype(in_dtype)
     # Schedule this (large, dynamically-shaped) prefill subgraph for evaluation
