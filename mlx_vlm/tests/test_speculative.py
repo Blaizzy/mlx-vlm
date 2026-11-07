@@ -1917,6 +1917,53 @@ def test_thinking_budget_generation_matches_autoregressive(batch):
     assert drafter.draft_lens
 
 
+def test_dflash2_greedy_routes_through_candidate_selector(monkeypatch):
+    # Greedy (temperature=0) drafting must still run the DFlash2 candidate
+    # selector. Without an override, DFlash2 inherits DFlash's greedy shortcut,
+    # which argmaxes per-position logits and silently bypasses the selector —
+    # the drafter's whole mechanism — collapsing acceptance.
+    from mlx_vlm.speculative.drafters.dflash2.dflash2 import CandidateSelector
+
+    calls = {"select": 0}
+    original_select = CandidateSelector.select
+
+    def counting_select(self, *args, **kwargs):
+        calls["select"] += 1
+        return original_select(self, *args, **kwargs)
+
+    monkeypatch.setattr(CandidateSelector, "select", counting_select)
+
+    def decode(use_draft):
+        mx.random.seed(37)
+        target, drafter = dflash_target("dflash2"), dflash_drafter("dflash2")
+        options = (
+            dict(draft_model=drafter, draft_kind="dflash", draft_block_size=5)
+            if use_draft
+            else {}
+        )
+        tokens = [
+            token
+            for token, _ in generate_step(
+                mx.array([[4, 5, 6]]),
+                target,
+                None,
+                None,
+                max_tokens=16,
+                temperature=0,
+                **options,
+            )
+        ]
+        return tokens, drafter if use_draft else None
+
+    reference, _ = decode(use_draft=False)
+    calls["select"] = 0
+    drafted, drafter = decode(use_draft=True)
+
+    assert drafter.draft_lens  # the drafter actually proposed blocks
+    assert calls["select"] > 0  # greedy decoding exercised the selector
+    assert drafted == reference  # speculative decoding stayed lossless
+
+
 def test_acceptance_walk_and_budgets():
     drafts = mx.array([[1, 2, 3], [4, 5, 6]], dtype=mx.int32)
     for retained, budget in product(range(4), (0, 1, 4)):

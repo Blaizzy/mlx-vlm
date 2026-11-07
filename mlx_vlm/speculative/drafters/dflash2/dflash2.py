@@ -192,6 +192,27 @@ class DFlash2DraftModel(DFlashDraftModel):
             sampler,
         ).astype(token_dtype)
 
+    def draft_block_greedy(
+        self,
+        last_bonus,
+        hidden: mx.array,
+        cache,
+        block_size: int,
+        sampler: Callable[[mx.array], mx.array],
+        token_dtype: mx.Dtype = mx.int32,
+    ) -> mx.array:
+        # The candidate selector is the drafter; its codebook-scored path must
+        # run under greedy decoding too. The inherited DFlash greedy shortcut
+        # argmaxes per-position logits and would bypass the selector entirely.
+        return self.draft_block(
+            last_bonus,
+            hidden,
+            cache,
+            block_size,
+            sampler,
+            token_dtype,
+        )
+
     def sanitize(self, weights: Mapping[str, mx.array]) -> dict[str, mx.array]:
         normalized = {}
         codebooks = {
