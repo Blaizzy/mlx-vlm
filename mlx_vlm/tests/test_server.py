@@ -8537,7 +8537,82 @@ def test_audio_transcription_request(
     else:
         assert response.json() == {"text": text}
     assert {key: fake.calls[0][key] for key in forwarded} == forwarded
+    assert fake.calls[0]["max_tokens"] == 1024
     loader.assert_called_once_with("fake-stt", model_kind="audio_stt")
+
+
+@pytest.mark.parametrize(
+    "generate, options, expected",
+    [
+        (lambda audio, *, max_tokens=16384: max_tokens, {}, None),
+        (lambda audio, *, max_tokens=None: max_tokens, {}, None),
+        (lambda audio, *, max_tokens=16384: max_tokens, {"max_tokens": 0}, 0),
+        (lambda audio, *, max_tokens: max_tokens, {}, 1024),
+        (lambda audio: None, {"max_tokens": 3}, None),
+    ],
+    ids=["model-default", "none-default", "explicit-cap", "required", "unsupported"],
+)
+def test_audio_transcription_budget(generate, options, expected):
+    request = server_audio.AudioTranscriptionRequest(model="test", **options)
+    kwargs = server_audio._build_stt_generate_kwargs(
+        NS(generate=generate), request, translate=False
+    )
+    assert kwargs.get("max_tokens") == expected
+
+
+def test_transcription_token_count_does_not_imply_truncation(audio_client, monkeypatch):
+    fake, _ = _audio_backend(
+        monkeypatch, {"text": "Transcript", "generation_tokens": 64}
+    )
+    monkeypatch.setattr(
+        server_audio, "audio_read", lambda *a, **kw: (np.zeros(160), 16000)
+    )
+    response = _upload(audio_client, max_tokens="64")
+    assert response.status_code == 200
+    assert fake.calls[0]["max_tokens"] == 64
+    assert response.json() == {"text": "Transcript"}
+    assert "x-mlx-finish-reason" not in response.headers
+    assert audio_client.get("/metrics").json()["latest"]["finish_reason"] is None
+
+
+@pytest.mark.parametrize("response_format", ["json", "text", "ndjson"])
+def test_transcription_reports_backend_finish_reason(
+    audio_client, monkeypatch, response_format
+):
+    fake, _ = _audio_backend(monkeypatch)
+    monkeypatch.setattr(
+        server_audio, "audio_read", lambda *a, **kw: (np.zeros(160), 16000)
+    )
+
+    def generate(audio, *, stream=False, **kwargs):
+        if stream:
+            return iter(
+                [
+                    {"text": "Partial"},
+                    {"text": "", "is_final": True, "finish_reason": "length"},
+                ]
+            )
+        return NS(text="Partial", finish_reason="length")
+
+    monkeypatch.setattr(fake, "generate", generate)
+    response = _upload(
+        audio_client,
+        response_format=response_format,
+        stream=str(response_format == "ndjson").lower(),
+    )
+    assert response.status_code == 200
+    if response_format == "ndjson":
+        first, final = map(json.loads, response.text.splitlines())
+        assert first["text"] == "Partial"
+        assert "finish_reason" not in first
+        assert final["is_final"]
+        assert final["finish_reason"] == "length"
+    elif response_format == "text":
+        assert response.text == "Partial"
+        assert response.headers["x-mlx-finish-reason"] == "length"
+    else:
+        assert response.json() == {"text": "Partial", "finish_reason": "length"}
+    assert audio_client.get("/metrics").json()["latest"]["finish_reason"] == "length"
 
 
 @pytest.mark.parametrize(

@@ -68,7 +68,7 @@ class AudioTranscriptionRequest(FlexibleBaseModel):
     temperature: Optional[float] = None
     response_format: str = "json"
     verbose: bool = False
-    max_tokens: int = 1024
+    max_tokens: Optional[int] = None
     chunk_duration: float = 30.0
     frame_threshold: int = 25
     stream: bool = False
@@ -115,6 +115,7 @@ class AudioInferenceRequest:
     cancel_event: threading.Event = None
     ready_event: threading.Event = None
     ready_error: BaseException | None = None
+    finish_reason: Literal["stop", "length"] | None = None
 
     def __post_init__(self):
         if not self.request_id:
@@ -449,14 +450,23 @@ async def _audio_transcription_response(request: Request, *, translate: bool):
 
         chunks = await _collect_audio_handle(handle)
         result = _transcription_result_from_chunks(chunks)
+        finish_reason = handle.request.finish_reason
+        if finish_reason is not None:
+            result["finish_reason"] = finish_reason
+        response = _format_transcription_response(
+            result, payload.request.response_format
+        )
+        if finish_reason is not None:
+            response.headers["X-MLX-Finish-Reason"] = finish_reason
         _record_audio_success(
             endpoint=endpoint,
             model=payload.request.model,
             stream=False,
             request_start=request_start,
             audio_count=1,
+            finish_reason=finish_reason,
         )
-        return _format_transcription_response(result, payload.request.response_format)
+        return response
     except HTTPException as exc:
         _record_audio_failure(endpoint, payload.request.model, stream_response, exc)
         raise
@@ -500,7 +510,7 @@ async def _parse_transcription_request(
         temperature=_form_float(form.get("temperature")),
         response_format=_clean_form_value(form.get("response_format")) or "json",
         verbose=_form_bool(form.get("verbose"), default=False),
-        max_tokens=_form_int(form.get("max_tokens"), default=1024),
+        max_tokens=_form_int(form.get("max_tokens")),
         chunk_duration=_form_float(form.get("chunk_duration"), default=30.0),
         frame_threshold=_form_int(form.get("frame_threshold"), default=25),
         stream=_form_bool(form.get("stream"), default=False),
@@ -641,6 +651,9 @@ def _run_stt_request(request: AudioInferenceRequest) -> None:
             if request.cancel_event.is_set():
                 return
             chunk = _stt_item_to_dict(item)
+            finish_reason = chunk.get("finish_reason")
+            if finish_reason in ("stop", "length"):
+                request.finish_reason = finish_reason
             if not request.ready_event.is_set():
                 request.mark_ready()
             request.emit_data(json.dumps(_sanitize_for_json(chunk)) + "\n")
@@ -664,11 +677,17 @@ def _build_stt_generate_kwargs(
     )
     prompt = request.prompt
     accepted = _callable_parameters(model.generate)
+    params = accepted["params"] if accepted is not None else {}
+
+    # Omit the argument when the backend declares a default (including None).
+    # Keep the server fallback for required parameters and **kwargs wrappers.
+    budget = params.get("max_tokens")
+    if budget is None or budget.default is inspect.Parameter.empty:
+        kwargs.setdefault("max_tokens", 1024)
 
     if prompt:
         # Prefer a declared parameter over **kwargs, which may silently ignore
         # aliases (for example a native prompt model also accepting **kwargs).
-        params = accepted.get("params", set()) if accepted else set()
         for name in ("prompt", "context", "text"):
             if name in params:
                 kwargs.setdefault(name, prompt)
@@ -758,7 +777,7 @@ def _stt_item_base_dict(item) -> Dict[str, Any]:
         return item.model_dump(exclude_none=True)
 
     data = {}
-    for attr in ("text", "language", "segments"):
+    for attr in ("text", "language", "segments", "finish_reason"):
         if hasattr(item, attr):
             data[attr] = getattr(item, attr)
     if hasattr(item, "start_time"):
@@ -835,6 +854,11 @@ async def _stream_audio_handle(
                 stream=stream,
                 request_start=request_start,
                 audio_count=1 if media_kind == "transcription" else 0,
+                finish_reason=(
+                    handle.request.finish_reason
+                    if media_kind == "transcription"
+                    else "stop"
+                ),
             )
 
 
@@ -938,7 +962,10 @@ def _format_transcription_response(result: Dict[str, Any], response_format: str)
     response_format = response_format or "json"
     text = (result.get("text") or "").strip()
     if response_format == "json":
-        return JSONResponse({"text": text})
+        body = {"text": text}
+        if "finish_reason" in result:
+            body["finish_reason"] = result["finish_reason"]
+        return JSONResponse(body)
     if response_format == "text":
         return PlainTextResponse(text)
     if response_format == "verbose_json":
@@ -1039,13 +1066,13 @@ def _callable_parameters(fn):
         signature = inspect.signature(fn)
     except (TypeError, ValueError):
         return None
-    params = set()
+    params = {}
     has_var_kwargs = False
     for name, parameter in signature.parameters.items():
         if parameter.kind == inspect.Parameter.VAR_KEYWORD:
             has_var_kwargs = True
         else:
-            params.add(name)
+            params[name] = parameter
     return {"params": params, "**kwargs": has_var_kwargs}
 
 
@@ -1083,6 +1110,7 @@ def _record_audio_success(
     stream: bool,
     request_start: float,
     audio_count: int,
+    finish_reason: Optional[str] = "stop",
 ) -> None:
     elapsed = time.perf_counter() - request_start
     envelope = _build_metrics_envelope(
@@ -1095,7 +1123,7 @@ def _record_audio_success(
         generated_tokens=0,
         request_elapsed_s=elapsed,
         request_started_s=request_start,
-        finish_reason="stop",
+        finish_reason=finish_reason,
         audio_count=audio_count,
     )
     runtime.metrics.record_success(envelope)
@@ -1139,7 +1167,7 @@ def _form_bool(value, *, default: bool) -> bool:
     return value.lower() in ("1", "true", "yes", "on")
 
 
-def _form_int(value, *, default: int) -> int:
+def _form_int(value, *, default: Optional[int] = None) -> Optional[int]:
     value = _clean_form_value(value)
     return default if value is None else int(value)
 
